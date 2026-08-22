@@ -1012,6 +1012,13 @@ struct Shared {
     /// had — an empty channel armed plays nothing, so five loaded instruments
     /// still layer, and switching a channel to AUDIO is what sets its bit.
     midi_off: AtomicU32,
+    /// Which channels are ARMED — live to the room. Bits over the eight
+    /// generals; an unarmed AUDIO channel's input still drains and still
+    /// reaches a take, but contributes nothing to the monitor mix. The MIDI
+    /// half of arm rides `midi_off`, computed host-side. Starts ALL ARMED so
+    /// a fresh engine behaves as every engine did until the host's first
+    /// push says otherwise.
+    armed: AtomicU32,
     /// The master, as a LINEAR gain. The last thing on the instrument bus,
     /// after the limiter, reaching both the device mix and the take — the same
     /// rule the effects follow.
@@ -1147,6 +1154,7 @@ impl Shared {
             monitor_slip: AtomicU64::new(0),
             monitor_backlog: AtomicU32::new(0),
             midi_off: AtomicU32::new(0),
+            armed: AtomicU32::new(u32::MAX),
             master_gain: AtomicU32::new(1.0f32.to_bits()),
             // The first channel — the desk's default instrument — sends
             // everything and nothing else sends anything, which is the same
@@ -2511,7 +2519,14 @@ impl Renderer {
                 self.monitor_gain[input] = 0.0;
                 continue;
             };
-            let heard = strip_is_heard(strip, muted, soloed);
+            // **Arm is the live switch.** An unarmed audio channel's input
+            // still drains (the ring must keep moving) and still reaches a
+            // take — mute decides the take, and arm is not mute — but the
+            // ROOM gets none of it: a project must open without headphones.
+            let live = self.shared.armed.load(Ordering::Relaxed)
+                & (1 << strip.index().min(31))
+                != 0;
+            let heard = live && strip_is_heard(strip, muted, soloed);
             let target = if heard {
                 Shared::f32_of(&self.shared.channel_gains[strip.index()]).clamp(0.0, 8.0)
             } else {
@@ -3778,6 +3793,11 @@ impl Engine {
     /// Zero is every channel armed, which is the desk as it has always been.
     pub fn set_midi_off(&self, mask: u32) {
         self.shared.midi_off.store(mask, Ordering::Relaxed);
+    }
+
+    /// Which channels are armed — live to the room. See `Shared::armed`.
+    pub fn set_armed(&self, mask: u32) {
+        self.shared.armed.store(mask, Ordering::Relaxed);
     }
 
     /// One insert's current state, for persisting. `None` for an empty bay —
