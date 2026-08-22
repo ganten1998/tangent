@@ -315,6 +315,9 @@ struct Layout {
     /// dialog when there is not. Layout state rather than a view lookup so
     /// [`Layout::targets`] stays a pure function of `self`.
     timeline_loaded: bool,
+    /// The × in the timeline's top-right corner that unloads the file. The
+    /// BACKING strip that used to carry the remove gesture retired at v13.
+    timeline_close: Rect,
 
     /// The master column: the output meter, the limiter's gain reduction
     /// beside it, and the master knob under both.
@@ -442,6 +445,7 @@ impl Layout {
             timecode: Rect::NOTHING,
             timeline: Rect::NOTHING,
             timeline_loaded: false,
+            timeline_close: Rect::NOTHING,
             master_scale: [Rect::NOTHING; 2],
             master_bars: Rect::NOTHING,
             master_knob: Rect::NOTHING,
@@ -676,6 +680,16 @@ impl Layout {
         // face of the arrangement, drawn as one lane of a thing that will one
         // day show several.
         self.timeline = slice_v(col, 0.02, 0.66);
+        // The × that unloads the file, in the timeline's own corner. Placed
+        // beside the timeline so the glyph and the target cannot drift.
+        let side = (self.timeline.height() * 0.16).clamp(10.0, 15.0);
+        self.timeline_close = Rect::from_min_size(
+            Pos2::new(
+                self.timeline.right() - side - 2.0,
+                self.timeline.top() + 2.0,
+            ),
+            Vec2::splat(side),
+        );
         // The hairline between the timeline and the meters, centred in the
         // gap `fill_transport` leaves — placed here because this function
         // runs for BOTH layouts, so the rule cannot move when a take starts.
@@ -1146,6 +1160,9 @@ pub enum Hit {
     /// writing. The app turns the fraction into seconds, because the file's
     /// length is the host's fact, not the painter's.
     SeekTimeline(f32),
+    /// Unload the backing file: the × in the timeline's corner. The BACKING
+    /// strip that used to carry this gesture retired at v13.
+    ClearTrack,
     /// Put every clip latch out. **The VU face is the target.**
     ///
     /// A latch that clears itself is one the performer never sees, because
@@ -1207,7 +1224,7 @@ impl Hit {
     ///
     /// The four per-slot controls appear once per slot, because "reachable" is
     /// a question about slot 2 that slot 0 cannot answer for it.
-    pub const ALL: [Hit; 26] = [
+    pub const ALL: [Hit; 27] = [
         Hit::Play,
         Hit::Record,
         Hit::Stop,
@@ -1224,6 +1241,7 @@ impl Hit {
         Hit::SetMaster(Hit::MIDWAY),
         Hit::ImportTrack,
         Hit::SeekTimeline(Hit::MIDWAY),
+        Hit::ClearTrack,
         Hit::Type(NumField::Tempo),
         Hit::DismissClip,
         Hit::SetFx(Fx::Reverb, Hit::MIDWAY),
@@ -1263,6 +1281,7 @@ impl Hit {
             Hit::Type(_) => "Click to type a number",
             Hit::ImportTrack => "Backing track  -  click to choose a file",
             Hit::SeekTimeline(_) => "Backing track  -  click to set the playhead",
+            Hit::ClearTrack => "Backing track  -  remove the file",
             Hit::SetTempo(_) => "Tempo",
             Hit::EditTimeSignature => "Time signature",
         }
@@ -1613,8 +1632,18 @@ pub fn hit_test(rect: Rect, view: &RecorderView<'_>, pos: Pos2) -> Option<Hit> {
     if !rect.contains(pos) {
         return None;
     }
-    Layout::new(rect, view)
-        .targets()
+    let l = Layout::new(rect, view);
+    // **The timeline's × first — the mixer palette's rule.** It sits ON the
+    // seek surface, and the seek's fraction is measured against the whole
+    // timeline, so the × cannot be carved out of the target without bending
+    // the mapping ("click at 1:24 and something READS 1:24"). A pre-pass
+    // keeps the no-overlap invariant on `targets` absolute and still lets
+    // the corner mean remove rather than locate. Same gates as the seek:
+    // a file loaded, and never while rolling.
+    if !l.rolling && l.timeline_loaded && l.timeline_close.contains(pos) {
+        return Some(Hit::ClearTrack);
+    }
+    l.targets()
         .into_iter()
         .find(|(r, _)| r.contains(pos))
         .map(|(r, k)| k.hit(r, pos))
@@ -1944,6 +1973,21 @@ fn draw_monitor(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Pale
     // backing track are channels there, each with a real fader. What this
     // band shows instead is WHEN.
     draw_timeline(painter, l.timeline, view, p);
+    // The ×, only when it can be pressed: a file loaded and no take rolling.
+    if l.timeline_close.is_positive() && l.timeline_loaded && !l.rolling {
+        let c = l.timeline_close.center();
+        let arm = l.timeline_close.width().min(l.timeline_close.height()) * 0.24;
+        let ink = Color32::from_rgba_unmultiplied(0xff, 0xf4, 0xe0, 140);
+        let w = (arm * 0.5).clamp(1.0, 1.8);
+        painter.line_segment(
+            [Pos2::new(c.x - arm, c.y - arm), Pos2::new(c.x + arm, c.y + arm)],
+            Stroke::new(w, ink),
+        );
+        painter.line_segment(
+            [Pos2::new(c.x - arm, c.y + arm), Pos2::new(c.x + arm, c.y - arm)],
+            Stroke::new(w, ink),
+        );
+    }
     // The master: what leaves, what the limiter is taking off, and the one
     // control that changes it.
     draw_master(painter, l, view, p);
@@ -2058,7 +2102,10 @@ fn draw_timeline(painter: &Painter, r: Rect, view: &RecorderView<'_>, p: &Palett
             p.faint,
         );
         painter.text(
-            Pos2::new(r.right() - 4.0, r.top() + 2.0),
+            // Short of the corner: the × that unloads the file lives there
+            // (drawn by the caller, from the layout's own rect), and a clock
+            // that moved when a take started would be worse than the gap.
+            Pos2::new(r.right() - 20.0, r.top() + 2.0),
             Align2::RIGHT_TOP,
             &clock,
             font(size),
@@ -4849,6 +4896,22 @@ mod tests {
                     assert!(rect.is_positive(), "no import box while empty");
                     continue;
                 }
+                // The × is a hit-test PRE-PASS, not a target: it sits on the
+                // seek surface, whose fraction is measured against the whole
+                // timeline, so it cannot be carved out of `targets` without
+                // bending the mapping. Reachability is proved directly.
+                if want.is_same_control(Hit::ClearTrack) {
+                    assert!(
+                        l.timeline_close.is_positive(),
+                        "the loaded timeline has no × to press"
+                    );
+                    assert_eq!(
+                        hit_test(r, &v, l.timeline_close.center()),
+                        Some(Hit::ClearTrack),
+                        "the timeline's × is not clickable at its own centre"
+                    );
+                    continue;
+                }
                 if IN_THE_MENU.iter().any(|m| m.is_same_control(want))
                     || want == Hit::ToggleMetronomeInTake
                 {
@@ -5084,6 +5147,30 @@ mod tests {
             hit_test(r, &furnished_rolling(), l.timeline.center()),
             None,
             "the timeline is clickable mid-take"
+        );
+
+        // **The × in the corner: remove, not locate.** Only with a file
+        // loaded, and never mid-take — a press on the corner while empty is
+        // the import like everywhere else on the box.
+        assert!(l.timeline_close.is_positive(), "the loaded box has no ×");
+        assert!(
+            l.timeline.contains(l.timeline_close.center()),
+            "the × wandered off its own timeline"
+        );
+        assert_eq!(
+            hit_test(r, &v, l.timeline_close.center()),
+            Some(Hit::ClearTrack),
+            "the corner does not remove the file"
+        );
+        assert_eq!(
+            hit_test(r, &empty, le.timeline_close.center()),
+            Some(Hit::ImportTrack),
+            "an empty timeline's corner should still be the import"
+        );
+        assert_eq!(
+            hit_test(r, &furnished_rolling(), l.timeline_close.center()),
+            None,
+            "the × is pressable mid-take"
         );
     }
 

@@ -2586,11 +2586,8 @@ impl DesktopApp {
                 lost.push(strip);
             }
         }
-        if engine.is_some_and(crate::instrument::Engine::track_loaded)
-            && !desk.heard(Strip::Track)
-        {
-            lost.push(Strip::Track);
-        }
+        // The backing track has no strip to mute since v13 retired BACKING —
+        // it plays whenever it is loaded, so it can never be "lost".
         ivory_ui::recorder::missing_from_take(&lost)
     }
 
@@ -2899,7 +2896,37 @@ impl DesktopApp {
         #[cfg(feature = "recorder")]
         me.load_cartridge_at_launch();
         me.load_track_at_launch();
+        // The one-launch sidecar shuffle, BEFORE any engine exists to load a
+        // bay: the settings just crossed the v13 desk change and the
+        // insert-state files are named by indices that moved.
+        #[cfg(feature = "recorder")]
+        if me.app.take_desk_state_shift() {
+            shift_insert_states_for_v13();
+        }
         me
+    }
+}
+
+/// v12 → v13: the BACKING strip retired, and every insert-state sidecar named
+/// by a desk index above it moved down one — the click's 9 → 8, the bus's
+/// 10 → 9, the master's 11 → 10 — while the track's own are deleted. Numbers
+/// FROZEN as literals, the historical-migration rule: reading today's
+/// constants would re-break this the next time the desk changes shape.
+///
+/// Ascending on purpose: 8 is deleted before 9 moves into it, and each rename
+/// vacates the slot the next one wants. Failures are ignored — the sidecars
+/// carry an owner check on read, so a file that could not move is ignored,
+/// not misapplied; the cost is one plugin's saved knobs, once.
+#[cfg(feature = "recorder")]
+fn shift_insert_states_for_v13() {
+    for bay in 0..3 {
+        let _ = std::fs::remove_file(insert_state_path(8, bay));
+        for old in 9..=11 {
+            let from = insert_state_path(old, bay);
+            if from.exists() {
+                let _ = std::fs::rename(&from, insert_state_path(old - 1, bay));
+            }
+        }
     }
 }
 

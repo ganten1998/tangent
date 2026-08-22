@@ -372,8 +372,12 @@ pub enum Strip {
     /// bays take any plugin either way. The kind lives in the settings, NOT
     /// in this enum, so cycling a channel between MIDI and AUDIO keeps its
     /// fader, its send, its colour, its name and its inserts.
+    ///
+    /// **`Track` used to sit here and is retired.** The backing track was a
+    /// strip of its own with one hardwired job; the arrangement makes that
+    /// job "an audio clip on any lane", so the column went back to being an
+    /// ordinary channel. See `docs/ARRANGEMENT.md` and the v13 migration.
     Channel(usize),
-    Track,
     Click,
     /// The return from the effects bus. It has no send of its own: a bus that
     /// could feed itself is a bus that howls.
@@ -449,7 +453,7 @@ pub const INSERTS: usize = 3;
 pub const INPUTS: usize = 4;
 
 /// How many channels the desk has, master aside.
-pub const STRIPS: usize = CHANNELS + 3;
+pub const STRIPS: usize = CHANNELS + 2;
 
 /// A mixer COLUMN, which is not a desk index and may never be used as one.
 ///
@@ -496,23 +500,22 @@ impl Column {
 /// Re-exported from `mixer_panel::COLUMNS` would be the other direction and
 /// this crate's panels do not depend on each other, so it is stated here and
 /// `a_column_and_a_strip_agree_about_the_desk` holds the two together.
-pub const COLUMNS_FOR_TEST: usize = CHANNELS + 3;
+pub const COLUMNS_FOR_TEST: usize = CHANNELS + 2;
 
 impl Strip {
-    /// The channels the MIXER draws, in order: the eight, the backing track,
-    /// and — for the first time — the CLICK, between BACKING and MASTER.
+    /// The channels the MIXER draws, in order: the eight, then the CLICK,
+    /// before MASTER.
     ///
     /// The click's fader used to live in the band; the band's fader rows are
-    /// going, so the click is a column like everything else. The effects
+    /// gone, so the click is a column like everything else. The effects
     /// return still has no column: its three knobs are the band's, and a bus
     /// that could be soloed against its own sources is a desk with a feedback
-    /// question in it.
-    pub fn shown() -> [Strip; CHANNELS + 2] {
+    /// question in it. BACKING had a column here and is retired — the
+    /// arrangement's lanes carry audio now.
+    pub fn shown() -> [Strip; CHANNELS + 1] {
         std::array::from_fn(|i| {
             if i < CHANNELS {
                 Strip::Channel(i)
-            } else if i == CHANNELS {
-                Strip::Track
             } else {
                 Strip::Click
             }
@@ -525,7 +528,7 @@ impl Strip {
             if i < CHANNELS {
                 Strip::Channel(i)
             } else {
-                [Strip::Track, Strip::Click, Strip::Fx][i - CHANNELS]
+                [Strip::Click, Strip::Fx][i - CHANNELS]
             }
         })
     }
@@ -540,9 +543,8 @@ impl Strip {
     pub const fn index(self) -> usize {
         match self {
             Strip::Channel(i) => i,
-            Strip::Track => CHANNELS,
-            Strip::Click => CHANNELS + 1,
-            Strip::Fx => CHANNELS + 2,
+            Strip::Click => CHANNELS,
+            Strip::Fx => CHANNELS + 1,
         }
     }
 
@@ -566,7 +568,6 @@ impl Strip {
             // Numbered because there are eight of them and "the channel is
             // muted" is not something anybody can act on.
             Strip::Channel(i) => format!("channel {}", i + 1),
-            Strip::Track => "the backing track".to_owned(),
             Strip::Click => "the click".to_owned(),
             Strip::Fx => "the effects bus".to_owned(),
         }
@@ -3217,10 +3218,10 @@ mod missing_tests {
         // A list anybody would say out loud, and the verb agreeing with it.
         // "instrument 2 are muted" is the kind of thing that makes a person
         // trust the rest of the line less.
-        let many = missing_from_take(&[Strip::Channel(1), Strip::Channel(0), Strip::Track])
+        let many = missing_from_take(&[Strip::Channel(1), Strip::Channel(0), Strip::Channel(4)])
             .expect("three of them is still news");
         assert!(
-            many.contains("channel 2, channel 1 and the backing track"),
+            many.contains("channel 2, channel 1 and channel 5"),
             "{many}"
         );
         assert!(many.contains("are muted") && many.contains("have them"), "{many}");

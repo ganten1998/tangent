@@ -470,9 +470,10 @@ fn is_pedal(status: u8, data1: u8) -> bool {
 pub enum Strip {
     /// One general channel, MIDI or AUDIO by the desk's choice. See the UI's
     /// own `Strip` — the kind is not in the enum there either, and for the
-    /// same reason: cycling a channel must not renumber it.
+    /// same reason: cycling a channel must not renumber it. `Track` sat here
+    /// until v13 retired the BACKING strip; the clip plays under the master
+    /// alone now.
     Channel(usize),
-    Track,
     Click,
     Fx,
 }
@@ -491,16 +492,15 @@ pub const CHANNELS: usize = ivory_ui::recorder::CHANNELS;
 pub const INPUTS: usize = ivory_ui::recorder::INPUTS;
 
 /// How many channels the desk has, master aside.
-pub const STRIPS: usize = CHANNELS + 3;
+pub const STRIPS: usize = CHANNELS + 2;
 
 impl Strip {
     /// Its place in the arrays, and the bit it owns.
     pub const fn index(self) -> usize {
         match self {
             Strip::Channel(i) => i,
-            Strip::Track => CHANNELS,
-            Strip::Click => CHANNELS + 1,
-            Strip::Fx => CHANNELS + 2,
+            Strip::Click => CHANNELS,
+            Strip::Fx => CHANNELS + 1,
         }
     }
 
@@ -518,7 +518,6 @@ impl From<ivory_ui::recorder::Strip> for Strip {
         use ivory_ui::recorder::Strip as Ui;
         match ui {
             Ui::Channel(i) => Strip::Channel(i),
-            Ui::Track => Strip::Track,
             Ui::Click => Strip::Click,
             Ui::Fx => Strip::Fx,
         }
@@ -2049,7 +2048,7 @@ impl Renderer {
                 self.sounding = 0;
             }
             self.was_rolling = rolling;
-            self.mix_track(at, rolling, n, muted, soloed);
+            self.mix_track(at, rolling, n);
             self.mix_monitor(n, muted, soloed);
             // ── the click, and what it sends ───────────────────────────
             //
@@ -2640,7 +2639,7 @@ impl Renderer {
     /// The clip is stereo at the device's rate — `decode` guarantees both — so
     /// there is no resampling and no channel mapping here, which is the whole
     /// reason it is guaranteed there.
-    fn mix_track(&mut self, at: u64, rolling: bool, frames: usize, muted: u32, soloed: u32) {
+    fn mix_track(&mut self, at: u64, rolling: bool, frames: usize) {
         // A clip arriving — and the displaced one going BACK, by the racks'
         // own protocol: no room to return it, no swap this block. Dropping it
         // here would free a hundred megabytes inside the callback.
@@ -2661,25 +2660,15 @@ impl Renderer {
         };
         let clip = &placed.clip;
         let total = clip.frames() as u64;
-        let target = if strip_is_heard(Strip::Track, muted, soloed) {
-            Shared::f32_of(&self.shared.track_gain).clamp(0.0, 8.0)
-        } else {
-            0.0
-        };
-        let send = Shared::f32_of(&self.shared.send[Strip::Track.index()]).clamp(0.0, 1.0);
+        // **No strip since v13 retired BACKING.** The clip plays at its own
+        // gain, under the master alone — no mute, no solo, no rack, no send.
+        // The arrangement's per-lane schedules are what replace all of that;
+        // until they land, this is the one honest reading of "a file playing".
+        let target = Shared::f32_of(&self.shared.track_gain).clamp(0.0, 8.0);
         let coeff = self.gain_coeff;
-        // Both at once, and they are different fields — which is the only
-        // reason the loop below can write to the mix and the bus together.
-        let (Some(mix), Some(aux)) = (
-            self.mix.get_mut(..frames * TAP_CHANNELS),
-            self.aux.get_mut(..frames * TAP_CHANNELS),
-        ) else {
+        let Some(mix) = self.mix.get_mut(..frames * TAP_CHANNELS) else {
             return;
         };
-        let mut peak = [0.0f32; 2];
-        // **The clip at its fader, then its rack, then the fold.** Same shape
-        // as every other channel: the values are what they always were, and
-        // what the buffer buys is somewhere for an insert to stand.
         for f in 0..frames {
             self.track_gain += (target - self.track_gain) * coeff;
             // Project frame -> clip frame. The u64 compare comes BEFORE any
@@ -2699,42 +2688,9 @@ impl Renderer {
                 }
                 _ => (0.0, 0.0),
             };
-            if let Some(dst) = self.fx_in.get_mut(0) {
-                dst[f] = l;
-            }
-            if let Some(dst) = self.fx_in.get_mut(1) {
-                dst[f] = r;
-            }
-        }
-        {
-            let armed = self.shared.midi_off.load(Ordering::Relaxed)
-                & (1 << Strip::Track.index().min(31))
-                == 0;
-            let notes: &[ivory_host::Note] = if armed { &self.notes } else { &[] };
-            let controls: &[ivory_host::Control] = if armed { &self.controls } else { &[] };
-            run_rack(
-                &mut self.racks[Strip::Track.index()],
-                &mut self.fx_in,
-                frames,
-                &mut self.fx_out,
-                notes,
-                controls,
-            );
-        }
-        for f in 0..frames {
-            let l = self.fx_in.first().map_or(0.0, |b| b[f]);
-            let r = self.fx_in.get(1).map_or(0.0, |b| b[f]);
-            peak[0] = peak[0].max(l.abs());
-            peak[1] = peak[1].max(r.abs());
             mix[f * TAP_CHANNELS] += l;
             mix[f * TAP_CHANNELS + 1] += r;
-            // Post-fader, like every other send here. A backing track arrives
-            // finished and usually wants none of the room the piano is in,
-            // which is why this defaults to zero.
-            aux[f * TAP_CHANNELS] += l * send;
-            aux[f * TAP_CHANNELS + 1] += r * send;
         }
-        self.shared.note_strip_peak(Strip::Track, peak);
     }
 
     /// The eight general channels: the built-in, the bay voices, and their
@@ -5597,7 +5553,7 @@ mod tests {
             panic!("no VST3 matching Pro-R; this test needs one installed");
         };
         let mut engine = Engine::start(None).expect("an audio output");
-        let at = Strip::Track.index();
+        let at = Strip::Channel(5).index();
         engine
             .load_insert(at, 0, Some(&bundle), None)
             .expect("an effect must load");
@@ -5721,7 +5677,7 @@ mod tests {
             panic!("no VST3 matching Pro-R; this test needs one installed");
         };
         let mut engine = Engine::start(None).expect("an audio output");
-        let at = Strip::Track.index();
+        let at = Strip::Channel(5).index();
         engine
             .load_insert(at, 0, Some(&bundle), None)
             .expect("an effect must load on an insert");
@@ -5869,20 +5825,20 @@ mod tests {
         // One muted: it alone is silent.
         let m = Channel(0).bit();
         assert!(!strip_is_heard(Channel(0), m, none));
-        assert!(strip_is_heard(Track, m, none));
+        assert!(strip_is_heard(Channel(7), m, none));
         // One soloed: it alone is heard, and mute does not enter into it.
-        let so = Track.bit();
-        assert!(strip_is_heard(Track, none, so));
+        let so = Channel(7).bit();
+        assert!(strip_is_heard(Channel(7), none, so));
         assert!(!strip_is_heard(Channel(0), none, so));
         assert!(!strip_is_heard(Channel(4), none, so));
         // Soloed AND muted: heard, because pressing solo asked for it.
         assert!(
-            strip_is_heard(Track, Track.bit(), Track.bit()),
+            strip_is_heard(Channel(7), Channel(7).bit(), Channel(7).bit()),
             "a soloed channel was silenced by its own mute"
         );
         // Two soloed: both, and nothing else.
-        let two = Track.bit() | Fx.bit();
-        assert!(strip_is_heard(Track, none, two) && strip_is_heard(Fx, none, two));
+        let two = Channel(7).bit() | Fx.bit();
+        assert!(strip_is_heard(Channel(7), none, two) && strip_is_heard(Fx, none, two));
         assert!(!strip_is_heard(Click, none, two));
         // **Each channel is its own strip.** Muting one must not take its
         // neighbour with it, which is the whole reason the lumped instrument
