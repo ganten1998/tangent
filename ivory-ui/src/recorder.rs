@@ -206,6 +206,9 @@ pub struct RecorderView<'a> {
     pub position_s: f64,
     /// The green button's audition is running.
     pub playing: bool,
+    /// Armed lanes are being recorded into the arrangement — the red
+    /// button's lit state. Not the capture-take's `state`.
+    pub arr_recording: bool,
     pub meters: Meters,
     /// The OUTPUT's levels — after the effects, after the limiter, after the
     /// master, click included. Not the same signal as `meters`, which is what
@@ -319,6 +322,7 @@ impl RecorderView<'_> {
             elapsed_s: 0.0,
             position_s: 0.0,
             playing: false,
+            arr_recording: false,
             meters: Meters::SILENT,
             master: Meters::SILENT,
             gr_db: 0.0,
@@ -748,6 +752,9 @@ pub struct RecorderState {
     /// Whether the green button's audition is running. Distinct from
     /// `state`, which is the TAKE's machine — play is the transport's.
     pub playing: bool,
+    /// The red button's OWN machine: armed lanes are being recorded into the
+    /// arrangement. Independent of `state`, which is the capture-take's.
+    pub arr_recording: bool,
     pub state: RecordState,
     pub elapsed_s: f64,
     /// The loudest thing each strip made since the last frame, in
@@ -820,6 +827,7 @@ impl RecorderState {
             elapsed_s: self.elapsed_s,
             position_s: self.position_s,
             playing: self.playing,
+            arr_recording: self.arr_recording,
             meters: self.meters,
             master: self.master,
             gr_db: self.gr_db,
@@ -944,6 +952,11 @@ pub enum RecorderRequest {
     /// The one button. Start a pre-roll, start a take, or stop one — the
     /// session decides which, because only it knows what state it is in.
     Toggle,
+    /// The cassette beside the cog: start or stop a CAPTURE — the whole-take
+    /// machinery (window video, all audio, the `.mid`), completely separate
+    /// from the arrangement. `Toggle` is the arrangement's red button now;
+    /// this is where the old take toggle lives.
+    Capture,
     /// Stop, unconditionally. Separate from `Toggle` because the band draws a
     /// distinct Stop control and "the button that stops it" must not also be
     /// able to start one.

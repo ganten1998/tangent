@@ -255,7 +255,7 @@ fn describe(a: KeyAction) -> &'static str {
         KeyAction::ManageTaughtChords => "chords you have taught",
         KeyAction::ToggleChordLearning => "chord learning",
         KeyAction::ToggleNotePreference => "sharps or flats",
-        KeyAction::StartRecording => "start recording",
+        KeyAction::StartRecording => "record the arrangement",
         KeyAction::StopRecording => "stop recording",
         KeyAction::ToggleRecorder => "the recorder",
         KeyAction::ToggleFullscreen => "fill the screen",

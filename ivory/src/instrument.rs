@@ -1019,6 +1019,13 @@ struct Shared {
     /// a fresh engine behaves as every engine did until the host's first
     /// push says otherwise.
     armed: AtomicU32,
+    /// Which input picks tee into the arrangement's capture rings — a bit
+    /// per INPUT (not per channel). Zero is off. The host sets it when
+    /// arrangement record starts and clears it on stop.
+    arr_capture: AtomicU32,
+    /// Frames the capture tee had to drop because a ring was full — the host
+    /// stalled for seconds. Climbing means a take with a hole in it.
+    cap_dropped: AtomicU64,
     /// The master, as a LINEAR gain. The last thing on the instrument bus,
     /// after the limiter, reaching both the device mix and the take — the same
     /// rule the effects follow.
@@ -1155,6 +1162,8 @@ impl Shared {
             monitor_backlog: AtomicU32::new(0),
             midi_off: AtomicU32::new(0),
             armed: AtomicU32::new(u32::MAX),
+            arr_capture: AtomicU32::new(0),
+            cap_dropped: AtomicU64::new(0),
             master_gain: AtomicU32::new(1.0f32.to_bits()),
             // The first channel — the desk's default instrument — sends
             // everything and nothing else sends anything, which is the same
@@ -1420,6 +1429,36 @@ impl Placed {
     }
 }
 
+/// One MIDI clip, placed: its lane, its span, and its notes — sorted by
+/// `at`, clip-relative frames, durations pre-clamped by the HOST so the
+/// audio thread takes only literal numbers.
+#[derive(Clone)]
+pub struct PlacedMidi {
+    pub strip: usize,
+    /// The timeline frame where the clip begins.
+    pub start: u64,
+    /// Frames the clip runs; nothing past this sounds.
+    pub len: u64,
+    pub notes: Arc<Vec<ClipNote>>,
+}
+
+/// One note of a MIDI clip, in frames from the clip's start.
+#[derive(Clone, Copy)]
+pub struct ClipNote {
+    pub at: u64,
+    pub dur: u64,
+    pub key: u8,
+    pub vel: u8,
+}
+
+/// A clip note that is SOUNDING: where its off falls, and on which lane.
+#[derive(Clone, Copy)]
+struct ActiveClipNote {
+    lane: u8,
+    key: u8,
+    off: u64,
+}
+
 /// How many effect inserts a channel has room for. See the UI's own copy.
 pub const INSERTS: usize = ivory_ui::recorder::INSERTS;
 
@@ -1584,6 +1623,16 @@ struct Renderer {
     /// free one, so it arrives behind an `Arc` through `pending_track` and the
     /// old one is dropped by whoever pushed the new one.
     clips: Vec<Placed>,
+    /// The MIDI half of the schedule, and a cursor per clip — advanced while
+    /// the transport rolls, re-sought on a jump.
+    midi_clips: Vec<PlacedMidi>,
+    midi_cursor: Vec<usize>,
+    /// Clip notes sounding right now, so their offs land on time — and land
+    /// AT ALL on a stop or a jump.
+    active_clip: Vec<ActiveClipNote>,
+    /// Per-lane note scratch for one block: the live events (armed) and the
+    /// clips' both, copied — the rack takes one slice.
+    lane_notes: Vec<Note>,
     /// The transport's position in frames, advanced by `run_transport` and
     /// nothing else. Project frames, not clip frames: a clip positions itself
     /// as `pos - placed.start`.
@@ -1604,6 +1653,8 @@ struct Renderer {
     /// from. The pair IS the routing, exactly as a plugin's is.
     track_incoming: Consumer<Vec<Placed>>,
     track_retiring: Producer<Vec<Placed>>,
+    midi_incoming: Consumer<Vec<PlacedMidi>>,
+    midi_retiring: Producer<Vec<PlacedMidi>>,
     builtin: crate::dx7::Dx7,
     /// The built-in's own output, before its slot gain.
     ///
@@ -1748,6 +1799,10 @@ struct Renderer {
     /// allowed to hold before the surplus is stale rather than in flight.
     monitor_block: usize,
     monitor_scratch: Vec<f32>,
+    /// The arrangement's capture tee, one ring per input pick: raw frames go
+    /// in here while `arr_capture` has the pick's bit, and the host drains
+    /// them into the project's WAV files.
+    cap_tx: Vec<Producer<f32>>,
 }
 
 impl Renderer {
@@ -2010,7 +2065,34 @@ impl Renderer {
             if let Some(mix) = self.mix.get_mut(..n * TAP_CHANNELS) {
                 mix.fill(0.0);
             }
-            self.mix_channels(n, muted, soloed);
+            // **The transport first, before ANY notes are consumed.** A
+            // locate or a falling edge strands whatever is sounding — the
+            // keys did not come up just because the timeline moved — so the
+            // strands are ENDED: the built-in by its own switch, every
+            // hosted voice by note-offs appended to this block's list. Run
+            // BEFORE `mix_channels` so the offs land the same block, and so
+            // the channels know where the timeline stands — the MIDI clips
+            // play from here.
+            let (at, rolling, jumped) = self.run_transport(n);
+            let flush = jumped || (self.was_rolling && !rolling);
+            if flush && self.sounding != 0 {
+                self.builtin.all_notes_off();
+                for pitch in 0..128u8 {
+                    if self.sounding & (1 << pitch) != 0
+                        && self.notes.len() < MAX_EVENTS_PER_BLOCK
+                    {
+                        self.notes.push(ivory_host::Note {
+                            offset: 0,
+                            pitch: i16::from(pitch),
+                            velocity: 0.0,
+                            on: false,
+                        });
+                    }
+                }
+                self.sounding = 0;
+            }
+            self.was_rolling = rolling;
+            self.mix_channels(n, muted, soloed, at, rolling, flush);
 
             // A parameter change, if one is waiting and the lock is free this
             // block. Same shape as the DX7's pending voice, and for the same
@@ -2067,30 +2149,6 @@ impl Renderer {
             // and to the bus in one pass. Both were downstream of the effects
             // before and reached neither.
             //
-            // **The transport first, once per chunk.** A locate or a falling
-            // edge strands whatever notes are sounding — the keys did not come
-            // up just because the timeline moved — so the strands are ENDED:
-            // the built-in by its own switch, every hosted voice by note-offs
-            // appended to this block's list, which is the same list they were
-            // struck from.
-            let (at, rolling, jumped) = self.run_transport(n);
-            if (jumped || (self.was_rolling && !rolling)) && self.sounding != 0 {
-                self.builtin.all_notes_off();
-                for pitch in 0..128u8 {
-                    if self.sounding & (1 << pitch) != 0
-                        && self.notes.len() < MAX_EVENTS_PER_BLOCK
-                    {
-                        self.notes.push(ivory_host::Note {
-                            offset: 0,
-                            pitch: i16::from(pitch),
-                            velocity: 0.0,
-                            on: false,
-                        });
-                    }
-                }
-                self.sounding = 0;
-            }
-            self.was_rolling = rolling;
             self.mix_clips(at, rolling, n, muted, soloed);
             self.mix_monitor(n, muted, soloed);
             // ── the click, and what it sends ───────────────────────────
@@ -2539,6 +2597,7 @@ impl Renderer {
         // other end of that: which columns of the interleaved frame belong to
         // which strip.
         let mut offset = 0usize;
+        let capturing = self.shared.arr_capture.load(Ordering::Relaxed);
         for input in 0..INPUTS {
             let width = self.monitor_widths[input].min(ch_in.saturating_sub(offset));
             if width == 0 {
@@ -2546,6 +2605,26 @@ impl Renderer {
             }
             let at_ch = offset;
             offset += width;
+            // ── the arrangement's tee: RAW frames, folded to stereo exactly
+            // as the monitor folds (a mono input to both sides) — pre-fader,
+            // pre-rack, pre-arm. The take is the signal at the jack, not the
+            // room's opinion of it. ──
+            if capturing & (1 << input.min(31)) != 0 {
+                if let Some(tx) = self.cap_tx.get_mut(input) {
+                    if tx.slots() >= n * 2 {
+                        for i in 0..n {
+                            for c in 0..2 {
+                                let col = at_ch + c.min(width - 1);
+                                let _ = tx.push(scratch[i * ch_in + col]);
+                            }
+                        }
+                    } else {
+                        self.shared
+                            .cap_dropped
+                            .fetch_add(n as u64, Ordering::Relaxed);
+                    }
+                }
+            }
             // **Which CHANNEL this pick feeds**, mapped by the host: the k-th
             // AUDIO channel takes pick k. An unbound pick still drains — the
             // ring has to keep moving — but is nobody's audio.
@@ -2795,43 +2874,57 @@ impl Renderer {
     /// Replaces `render_builtin`, and generalises exactly what that function
     /// already did for one synth: render into a private buffer, run the
     /// channel's rack, fold at the channel's fader and send, note the peak.
-    fn mix_channels(&mut self, frames: usize, muted: u32, soloed: u32) {
+    fn mix_channels(
+        &mut self,
+        frames: usize,
+        muted: u32,
+        soloed: u32,
+        at: u64,
+        rolling: bool,
+        flush: bool,
+    ) {
         // A patch change, if one is waiting and the lock is free this block.
         if let Ok(mut g) = self.shared.pending_voice.try_lock() {
             if let Some(v) = g.take() {
                 self.builtin.set_voice(v);
             }
         }
+        // A MIDI schedule arriving, by the racks' own swap protocol; its
+        // cursors start over, and fast-forward past what is behind the
+        // playhead without sounding it.
+        if self.midi_retiring.slots() > 0 {
+            if let Ok(next) = self.midi_incoming.pop() {
+                let old = std::mem::replace(&mut self.midi_clips, next);
+                let _ = self.midi_retiring.push(old);
+                self.midi_cursor.clear();
+                self.midi_cursor.resize(self.midi_clips.len(), 0);
+            }
+        }
+        // A jump rewinds every cursor: each fast-forwards to the playhead on
+        // its next pass, skipping without sounding.
+        if flush {
+            for c in &mut self.midi_cursor {
+                *c = 0;
+            }
+        }
         let wanted = self.shared.builtin_strip.load(Ordering::Relaxed);
         let builtin_at = (wanted >= 0).then_some(wanted as usize);
         let midi_off = self.shared.midi_off.load(Ordering::Relaxed);
-        // The built-in's notes, fed once — not per channel, it is one synth.
-        // Only while its channel is MIDI and armed: a channel cycled to AUDIO
-        // has its bit set, and the keys must come up rather than hold.
         let builtin_armed =
             builtin_at.is_some_and(|ch| midi_off & (1 << ch.min(31)) == 0);
+        // CC 64 is the damper, live input only. Half scale is the switch
+        // point every synth uses.
         if builtin_armed {
-            for n in &self.notes {
-                let Ok(pitch) = u8::try_from(n.pitch) else {
-                    continue;
-                };
-                if n.on {
-                    self.builtin.note_on(pitch, n.velocity);
-                } else {
-                    self.builtin.note_off(pitch);
-                }
-            }
-            // CC 64 is the damper. Half scale is the switch point every synth
-            // uses, and what a half-pedalled continuous controller means.
             for c in &self.controls {
                 if c.controller == 64 {
                     self.builtin.set_pedal(c.value >= 64);
                 }
             }
-        } else if self.builtin.active() {
-            self.builtin.all_notes_off();
         }
 
+        // The per-lane note list, taken out of `self` so the loop below can
+        // read the live list and the clips while filling it.
+        let mut lane_notes = std::mem::take(&mut self.lane_notes);
         let coeff = self.gain_coeff;
         for ch in 0..CHANNELS {
             let is_builtin = builtin_at == Some(ch);
@@ -2840,7 +2933,141 @@ impl Renderer {
             // `mix_monitor`, over its input — running it here too would fold
             // its effect tails twice.
             let armed = midi_off & (1 << ch.min(31)) == 0;
-            if !armed || (!is_builtin && !rack_live) {
+
+            // ── this lane's notes: the LIVE list while armed, the CLIPS'
+            // whenever the transport stands on them — playback does not ask
+            // the arm, which is the whole point of the arm ──
+            lane_notes.clear();
+            if armed {
+                lane_notes.extend_from_slice(&self.notes);
+            }
+            if flush {
+                // The strands the jump or the stop left on THIS lane — swept
+                // as their offs are emitted, entry by entry, never wholesale:
+                // a note the jump LANDS ON registers later this same block,
+                // and a clear at the end would strand it instead.
+                let mut i = 0;
+                while i < self.active_clip.len() {
+                    let a = self.active_clip[i];
+                    if usize::from(a.lane) == ch {
+                        if lane_notes.len() < lane_notes.capacity() {
+                            lane_notes.push(Note {
+                                offset: 0,
+                                pitch: i16::from(a.key),
+                                velocity: 0.0,
+                                on: false,
+                            });
+                        }
+                        if a.key < 128 {
+                            self.sounding &= !(1u128 << a.key);
+                        }
+                        self.active_clip.swap_remove(i);
+                        continue;
+                    }
+                    i += 1;
+                }
+            }
+            let mut lane_has_clips = false;
+            if rolling {
+                let end = at + frames as u64;
+                for idx in 0..self.midi_clips.len() {
+                    if self.midi_clips[idx].strip.min(CHANNELS - 1) != ch {
+                        continue;
+                    }
+                    lane_has_clips = true;
+                    let mc = &self.midi_clips[idx];
+                    let mut cur = self.midi_cursor.get(idx).copied().unwrap_or(0);
+                    while cur < mc.notes.len() {
+                        let nt = mc.notes[cur];
+                        let on_f = mc.start + nt.at;
+                        if on_f >= end {
+                            break;
+                        }
+                        cur += 1;
+                        // Behind the playhead (a jump landed past it), or
+                        // past the clip's trimmed end: skipped, not sounded.
+                        if on_f < at || nt.at >= mc.len {
+                            continue;
+                        }
+                        if lane_notes.len() >= lane_notes.capacity()
+                            || self.active_clip.len() >= 256
+                        {
+                            break;
+                        }
+                        lane_notes.push(Note {
+                            offset: (on_f - at) as i32,
+                            pitch: i16::from(nt.key),
+                            velocity: f32::from(nt.vel) / 127.0,
+                            on: true,
+                        });
+                        let end_rel = (nt.at + nt.dur.max(1)).min(mc.len);
+                        self.active_clip.push(ActiveClipNote {
+                            lane: ch as u8,
+                            key: nt.key,
+                            off: mc.start + end_rel,
+                        });
+                        if nt.key < 128 {
+                            self.sounding |= 1u128 << nt.key;
+                        }
+                    }
+                    self.midi_cursor[idx] = cur;
+                }
+                // The offs that fall due inside this block, on this lane.
+                let mut i = 0;
+                while i < self.active_clip.len() {
+                    let a = self.active_clip[i];
+                    if usize::from(a.lane) == ch && a.off < end {
+                        if lane_notes.len() < lane_notes.capacity() {
+                            lane_notes.push(Note {
+                                offset: a.off.saturating_sub(at) as i32,
+                                pitch: i16::from(a.key),
+                                velocity: 0.0,
+                                on: false,
+                            });
+                        }
+                        if a.key < 128 {
+                            self.sounding &= !(1u128 << a.key);
+                        }
+                        self.active_clip.swap_remove(i);
+                        continue;
+                    }
+                    i += 1;
+                }
+            } else {
+                lane_has_clips = self
+                    .midi_clips
+                    .iter()
+                    .any(|m| m.strip.min(CHANNELS - 1) == ch);
+            }
+
+            // The built-in is one synth: its lane's notes — live and clip
+            // both — feed it here, and it goes quiet only when neither is
+            // speaking for it.
+            if is_builtin {
+                if lane_notes.is_empty()
+                    && !builtin_armed
+                    && !lane_has_clips
+                    && self.builtin.active()
+                {
+                    self.builtin.all_notes_off();
+                } else {
+                    for n in &lane_notes {
+                        let Ok(pitch) = u8::try_from(n.pitch) else {
+                            continue;
+                        };
+                        if n.on {
+                            self.builtin.note_on(pitch, n.velocity);
+                        } else {
+                            self.builtin.note_off(pitch);
+                        }
+                    }
+                }
+            }
+
+            // A lane renders when something can SOUND on it: its own live
+            // arm, or clips standing on it — through the built-in or a rack.
+            let feeds = armed || lane_has_clips || !lane_notes.is_empty();
+            if !feeds || (!is_builtin && !rack_live) {
                 // **The gain is advanced whether or not anything renders.** A
                 // fader moved during a rest has to have arrived by the next
                 // note, or it comes in at the old level and slides.
@@ -2881,13 +3108,15 @@ impl Renderer {
                 }
             }
             if rack_live {
+                let controls: &[ivory_host::Control] =
+                    if armed { &self.controls } else { &[] };
                 run_rack(
                     &mut self.racks[ch],
                     &mut self.fx_in,
                     frames,
                     &mut self.fx_out,
-                    &self.notes,
-                    &self.controls,
+                    &lane_notes,
+                    controls,
                 );
             }
             // The fold: fader, send, peak — the channel's own, exactly as
@@ -2923,6 +3152,7 @@ impl Renderer {
             }
             self.shared.note_strip_peak(Strip::Channel(ch), peak);
         }
+        self.lane_notes = lane_notes;
     }
 
     /// Push the recorder's mix, whole frames only.
@@ -3165,6 +3395,9 @@ pub struct Engine {
     /// thread that sent its replacement.
     track_to_audio: Producer<Vec<Placed>>,
     track_from_audio: Consumer<Vec<Placed>>,
+    midi_to_audio: Producer<Vec<PlacedMidi>>,
+    midi_from_audio: Consumer<Vec<PlacedMidi>>,
+    cap_rx: Vec<Consumer<f32>>,
     /// What is in each of them, for the desk to name.
     inserts_loaded: [[Option<Loaded>; INSERTS]; STRIPS + 1],
 
@@ -3354,6 +3587,18 @@ impl Engine {
         // lets the swap check for room, exactly as a slot's.
         let (track_to_audio, track_incoming) = RingBuffer::<Vec<Placed>>::new(2);
         let (track_retiring, track_from_audio) = RingBuffer::<Vec<Placed>>::new(2);
+        let (midi_to_audio, midi_incoming) = RingBuffer::<Vec<PlacedMidi>>::new(2);
+        let (midi_retiring, midi_from_audio) = RingBuffer::<Vec<PlacedMidi>>::new(2);
+        // The capture rings: four seconds each, stereo. The host drains every
+        // UI frame and would have to stall for seconds to lose a sample; a
+        // full ring drops and says so in `cap_dropped`.
+        let mut cap_tx = Vec::with_capacity(INPUTS);
+        let mut cap_rx = Vec::with_capacity(INPUTS);
+        for _ in 0..INPUTS {
+            let (tx, rx) = RingBuffer::<f32>::new(rate as usize * 2 * 4);
+            cap_tx.push(tx);
+            cap_rx.push(rx);
+        }
         let renderer = Renderer {
             shared: Arc::clone(&shared),
             timebase,
@@ -3367,6 +3612,10 @@ impl Engine {
             pending: None,
             notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK),
             clips: Vec::new(),
+            midi_clips: Vec::new(),
+            midi_cursor: Vec::new(),
+            active_clip: Vec::with_capacity(256),
+            lane_notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK * 2),
             pos: 0,
             lane_gain: [1.0; CHANNELS],
             seen_req: 0,
@@ -3374,6 +3623,8 @@ impl Engine {
             sounding: 0,
             track_incoming,
             track_retiring,
+            midi_incoming,
+            midi_retiring,
             builtin: crate::dx7::Dx7::new(rate as f32),
             builtin_scratch: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             channel_gain: [1.0; CHANNELS],
@@ -3409,6 +3660,7 @@ impl Engine {
             monitor_widths: [0; INPUTS],
             monitor_block: 0,
             monitor_scratch: vec![0.0; widest * 4096],
+            cap_tx,
         };
 
         let config = cpal::StreamConfig {
@@ -3443,6 +3695,9 @@ impl Engine {
             insert_handoff,
             track_to_audio,
             track_from_audio,
+            midi_to_audio,
+            midi_from_audio,
+            cap_rx,
             inserts_loaded: std::array::from_fn(|_| std::array::from_fn(|_| None)),
             tap: Some(RecorderTap {
                 rx: tap_rx,
@@ -4062,6 +4317,40 @@ impl Engine {
                 return;
             }
             std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Hand the audio thread the arrangement's MIDI schedule, whole — the
+    /// same swap protocol as `set_clips`, so the old list drops HERE, never
+    /// in the callback.
+    pub fn set_midi_clips(&mut self, clips: Vec<PlacedMidi>) {
+        while self.midi_from_audio.pop().is_ok() {}
+        if self.midi_to_audio.push(clips).is_err() {
+            return;
+        }
+        let deadline = Instant::now() + RETIRE_TIMEOUT;
+        while Instant::now() < deadline {
+            if let Ok(old) = self.midi_from_audio.pop() {
+                drop(old);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Which input picks tee into the capture rings — a bit per input, zero
+    /// off. Flipped on when arrangement record starts, off when it stops.
+    pub fn set_arr_capture(&self, mask: u32) {
+        self.shared.arr_capture.store(mask, Ordering::Relaxed);
+    }
+
+    /// Drain one input's captured frames (interleaved stereo) into `out`.
+    pub fn drain_capture(&mut self, input: usize, out: &mut Vec<f32>) {
+        let Some(rx) = self.cap_rx.get_mut(input) else {
+            return;
+        };
+        while let Ok(v) = rx.pop() {
+            out.push(v);
         }
     }
 
@@ -5522,6 +5811,16 @@ mod tests {
             self.track_retiring = retiring;
             (to, from)
         }
+
+        fn hijack_midi_rings(
+            &mut self,
+        ) -> (Producer<Vec<PlacedMidi>>, Consumer<Vec<PlacedMidi>>) {
+            let (to, incoming) = RingBuffer::<Vec<PlacedMidi>>::new(2);
+            let (retiring, from) = RingBuffer::<Vec<PlacedMidi>>::new(2);
+            self.midi_incoming = incoming;
+            self.midi_retiring = retiring;
+            (to, from)
+        }
     }
 
     fn test_renderer(shared: Arc<Shared>, tap: Producer<f32>, dev_ch: usize) -> Renderer {
@@ -5555,6 +5854,7 @@ mod tests {
             monitor_widths: [0; INPUTS],
             monitor_block: 0,
             monitor_scratch: Vec::new(),
+            cap_tx: Vec::new(),
             racks,
             fx_in: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             fx_out: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
@@ -5569,6 +5869,10 @@ mod tests {
             click_taped: vec![0.0; MAX_BLOCK as usize],
             fx_return_gain: 1.0,
             clips: Vec::new(),
+            midi_clips: Vec::new(),
+            midi_cursor: Vec::new(),
+            active_clip: Vec::with_capacity(256),
+            lane_notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK * 2),
             pos: 0,
             lane_gain: [1.0; CHANNELS],
             seen_req: 0,
@@ -5578,6 +5882,8 @@ mod tests {
             // and push fills to capacity, which is all a test needs.
             track_incoming: RingBuffer::<Vec<Placed>>::new(2).1,
             track_retiring: RingBuffer::<Vec<Placed>>::new(2).0,
+            midi_incoming: RingBuffer::<Vec<PlacedMidi>>::new(2).1,
+            midi_retiring: RingBuffer::<Vec<PlacedMidi>>::new(2).0,
             shared,
             timebase: Timebase::new(),
             rate: RATE,
@@ -6109,6 +6415,103 @@ mod tests {
         close(650, 0.49, "B halfway down its fade-out");
         close(699, 0.0, "B's LAST frame is exactly silent");
         close(720, 0.0, "past everything");
+    }
+
+    /// **A MIDI clip sounds with its lane UNARMED — playback never asks the
+    /// arm.** The arm is the LIVE switch: it decides whether the keyboard
+    /// reaches the lane, and nothing else. A project must open silent to the
+    /// touch and still PLAY — that is the whole "no headphones blast" rule,
+    /// and this is the half of it that could regress silently: the gate that
+    /// mutes live input sits one condition away from muting the document.
+    ///
+    /// Stopped first (a rolling transport is the clip's other gate), then
+    /// rolling — same desk, same clip, arm off throughout.
+    #[test]
+    fn a_midi_clip_sounds_on_an_unarmed_lane() {
+        use std::sync::Arc;
+        let (mut r, _tx, shared) = renderer_with_midi(2);
+        let (mut to_audio, _from) = r.hijack_midi_rings();
+        // One long C4, forte, from the top of the timeline, on the
+        // built-in's lane.
+        to_audio
+            .push(vec![PlacedMidi {
+                strip: 0,
+                start: 0,
+                len: 96_000,
+                notes: Arc::new(vec![ClipNote {
+                    at: 0,
+                    dur: 48_000,
+                    key: 60,
+                    vel: 100,
+                }]),
+            }])
+            .expect("room");
+        // Lane 0 UNARMED: the bit set is the arm off, exactly what the host
+        // pushes when the R goes dark.
+        shared.midi_off.store(1, Ordering::Relaxed);
+        shared.armed.store(!1u32, Ordering::Relaxed);
+
+        let level = |r: &mut Renderer| -> f32 {
+            let mut out = vec![0.0_f32; 2 * 1024];
+            let mut peak = 0.0f32;
+            for _ in 0..8 {
+                out.fill(0.0);
+                r.render(&mut out, 0, 0);
+                peak = out.iter().fold(peak, |a, v| a.max(v.abs()));
+            }
+            peak
+        };
+        assert!(
+            level(&mut r) < 1.0e-6,
+            "a stopped transport must keep the clip silent"
+        );
+        shared.transport_at.store(0, Ordering::Relaxed);
+        shared.transport_req.store(1, Ordering::Release);
+        shared.rolling.store(true, Ordering::Relaxed);
+        assert!(
+            level(&mut r) > 1.0e-3,
+            "the clip must SOUND while rolling, arm or no arm"
+        );
+    }
+
+    /// **A jump that lands ON a note does not strand it.** The flush sweeps
+    /// what was sounding BEFORE the jump; a note whose on is emitted in the
+    /// very block that flushed must keep its ledger entry, or its off is
+    /// never owed and the key hangs until the next flush.
+    #[test]
+    fn a_jump_landing_on_a_note_keeps_its_off_owed() {
+        use std::sync::Arc;
+        let (mut r, _tx, shared) = renderer_with_midi(2);
+        let (mut to_audio, _from) = r.hijack_midi_rings();
+        to_audio
+            .push(vec![PlacedMidi {
+                strip: 0,
+                start: 0,
+                len: 96_000,
+                notes: Arc::new(vec![ClipNote {
+                    at: 48_000,
+                    dur: 24_000,
+                    key: 64,
+                    vel: 90,
+                }]),
+            }])
+            .expect("room");
+        shared.transport_at.store(0, Ordering::Relaxed);
+        shared.transport_req.store(1, Ordering::Release);
+        shared.rolling.store(true, Ordering::Relaxed);
+        let mut out = vec![0.0_f32; 2 * 1024];
+        r.render(&mut out, 0, 0);
+        assert!(r.active_clip.is_empty(), "nothing is due at the top");
+        // The jump, straight onto the note's own frame: the same block
+        // flushes the strands AND starts the note.
+        shared.transport_at.store(48_000, Ordering::Relaxed);
+        shared.transport_req.store(2, Ordering::Release);
+        r.render(&mut out, 0, 0);
+        assert_eq!(
+            r.active_clip.len(),
+            1,
+            "the flush swept the note the jump landed on — its off is lost"
+        );
     }
 
     /// **A clip plays through its LANE: mute silences it, solo isolates

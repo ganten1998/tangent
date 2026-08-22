@@ -174,6 +174,31 @@ channels play back their clips and nothing else. "Ready to play" and
   input binding is the follow-up that would make the flip safe.
 - Deferred within phase 3: cross-lane clip drag (a clip stays on its lane),
   viewport edge-stretch zoom, grid snapping, lane rename in the header.
+  (Snapping has since SHIPPED with the toolbar: magnet + gridbox, `g` and
+  the wheel over the gridbox.)
+- **Phase 4 SHIPPED (4.46.0)**: the RECORDING SPLIT. The red button records
+  ARMED lanes into the arrangement: MIDI lanes collect the note stream —
+  one identical note clip per armed MIDI lane, stamped on the tap's own
+  clock against the press — and AUDIO lanes tee their input picks RAW
+  (pre-fader, pre-rack, pre-arm) off `mix_monitor` into per-input rings the
+  host drains every frame and writes as Float32 WAVs into the project's
+  `media/`. Stop, the red button again, or the band closing all finalise
+  the same way: clips into the document, one save, and `reload_clips`
+  pushes the new schedule so the take SOUNDS immediately. The CAPTURE —
+  the whole-take machinery untouched, count-in included — moved to its own
+  control: a tape-amber cassette right of the cog, lit while writing, and
+  Enter during a count-in still cancels (the cancel follows the count to
+  the cassette). And MIDI clips PLAY: `PlacedMidi` schedules swap into the
+  render thread by the audio clips' own protocol, `mix_channels` assembles
+  each lane's notes per block — the live stream while armed, the clips'
+  whenever the transport stands on them, because playback never asks the
+  arm — and note-offs ride an active ledger that survives a jump landing
+  exactly on a note.
+- Known slack in phase 4, written down on purpose: capture start is
+  block-quantised (no input-latency compensation yet); the sustain pedal is
+  not written into recorded MIDI clips (it rides the live path only); and a
+  recorded WAV's tail can be one device buffer short, because the tee
+  drains what has arrived when the record ends rather than waiting.
 
 ## Order of work
 

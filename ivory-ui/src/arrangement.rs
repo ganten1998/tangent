@@ -64,10 +64,39 @@ pub enum ClipKind {
     Midi,
 }
 
+/// One note inside a MIDI clip, clip-relative and in seconds — the same
+/// unit everything else in the document speaks.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArrNote {
+    pub at_s: f64,
+    pub dur_s: f64,
+    pub key: u8,
+    pub vel: u8,
+}
+
+/// What one lane RECORDED, handed over by the host when arrangement record
+/// stops. The host owns the files — it wrote the WAVs into `media/` — and
+/// the document work (the clip row, the save) is the app's.
+#[derive(Debug, Clone)]
+pub struct RecordedClip {
+    pub lane: usize,
+    /// Where the record began, seconds from 0:00. Every clip of one press
+    /// starts together.
+    pub start_s: f64,
+    pub len_s: f64,
+    /// `media/<file>` for audio; `None` is a MIDI clip.
+    pub path: Option<String>,
+    /// Clip-relative notes; empty on audio.
+    pub notes: Vec<ArrNote>,
+}
+
 /// One piece of audio or MIDI standing on the timeline.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ArrClip {
     pub kind: ClipKind,
+    /// A MIDI clip's notes. Empty on audio clips, and on a MIDI item that
+    /// was drawn but not yet played into.
+    pub notes: Vec<ArrNote>,
     /// Which lane it stands on. Lane 0 is the backing track's.
     pub lane: usize,
     /// The file it came from — `media/<file>` inside a project, or absolute.
@@ -245,8 +274,30 @@ impl Arrangement {
                             .map(|s| s.to_string_lossy().into_owned())
                             .unwrap_or_default()
                     });
+                let mut notes = Vec::new();
+                if let Some(Value::Array(list)) = c.get("notes") {
+                    for n in list {
+                        let Value::Object(n) = n else { continue };
+                        let num = |key: &str| n.get(key).and_then(Value::as_f64);
+                        let (Some(at_s), Some(dur_s)) = (num("at_s"), num("dur_s")) else {
+                            continue;
+                        };
+                        let key = n.get("key").and_then(Value::as_u64).unwrap_or(0);
+                        if !(at_s.is_finite() && dur_s.is_finite()) || key > 127 {
+                            continue;
+                        }
+                        notes.push(ArrNote {
+                            at_s: at_s.max(0.0),
+                            dur_s: dur_s.max(0.0),
+                            key: key as u8,
+                            vel: n.get("vel").and_then(Value::as_u64).unwrap_or(100).min(127)
+                                as u8,
+                        });
+                    }
+                }
                 clips.push(ArrClip {
                     kind,
+                    notes,
                     lane,
                     path: path.to_owned(),
                     start_s: secs(&c, "start_s"),
@@ -314,6 +365,37 @@ impl Arrangement {
                         m.insert("lane".into(), Value::Number((c.lane as u64).into()));
                         m.insert("path".into(), Value::String(c.path.clone()));
                         m.insert("name".into(), Value::String(c.name.clone()));
+                        if !c.notes.is_empty() {
+                            m.insert(
+                                "notes".into(),
+                                Value::Array(
+                                    c.notes
+                                        .iter()
+                                        .map(|n| {
+                                            let mut o = Map::new();
+                                            for (k, v) in
+                                                [("at_s", n.at_s), ("dur_s", n.dur_s)]
+                                            {
+                                                if let Some(x) =
+                                                    serde_json::Number::from_f64(v)
+                                                {
+                                                    o.insert(k.into(), Value::Number(x));
+                                                }
+                                            }
+                                            o.insert(
+                                                "key".into(),
+                                                Value::Number(u64::from(n.key).into()),
+                                            );
+                                            o.insert(
+                                                "vel".into(),
+                                                Value::Number(u64::from(n.vel).into()),
+                                            );
+                                            Value::Object(o)
+                                        })
+                                        .collect(),
+                                ),
+                            );
+                        }
                         m.insert("id".into(), Value::Number(c.id.into()));
                         for (key, v) in [
                             ("start_s", c.start_s),
@@ -356,6 +438,7 @@ mod tests {
     fn a_clip(lane: usize, path: &str, start_s: f64) -> ArrClip {
         ArrClip {
             kind: ClipKind::Audio,
+            notes: Vec::new(),
             lane,
             path: path.to_owned(),
             start_s,
@@ -385,6 +468,19 @@ mod tests {
             ..a_clip(3, "/x/solo.wav", 84.5)
         };
         a.add_clip(solo);
+        let mut midi = ArrClip {
+            kind: ClipKind::Midi,
+            path: String::new(),
+            len_s: 8.0,
+            name: "MIDI".into(),
+            notes: vec![
+                ArrNote { at_s: 0.0, dur_s: 0.5, key: 60, vel: 100 },
+                ArrNote { at_s: 1.25, dur_s: 2.0, key: 67, vel: 88 },
+            ],
+            ..a_clip(1, "", 4.0)
+        };
+        midi.kind = ClipKind::Midi;
+        a.add_clip(midi);
         let back = Arrangement::from_json(&a.to_json());
         assert_eq!(back, a, "the document did not survive its own round trip");
     }
