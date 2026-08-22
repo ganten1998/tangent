@@ -1384,7 +1384,34 @@ unsafe impl Send for PluginBox {}
 #[derive(Clone)]
 pub struct Placed {
     pub clip: Arc<ivory_record::decode::Clip>,
+    /// The timeline frame where the clip begins.
     pub start: u64,
+    /// Frames into the FILE where playback starts — the left trim.
+    pub offset: u64,
+    /// Frames the clip runs on the timeline. **The HOST resolves the doc's
+    /// zero-means-whole-file sentinel before pushing**: the audio thread
+    /// takes only literal numbers.
+    pub len: u64,
+    /// Frames of ramp up from silence at the head. Zero for none.
+    pub fade_in: u64,
+    /// Frames of ramp down to silence at the tail. Zero for none.
+    pub fade_out: u64,
+}
+
+impl Placed {
+    /// A clip that plays a whole file from 0:00, edges bare — what the old
+    /// single backing track was, and what most callers still mean.
+    pub fn whole(clip: Arc<ivory_record::decode::Clip>, start: u64) -> Self {
+        let len = clip.frames() as u64;
+        Self {
+            clip,
+            start,
+            offset: 0,
+            len,
+            fade_in: 0,
+            fade_out: 0,
+        }
+    }
 }
 
 /// How many effect inserts a channel has room for. See the UI's own copy.
@@ -1550,7 +1577,7 @@ struct Renderer {
     /// megabytes of `Vec<f32>` and the audio thread must never allocate or
     /// free one, so it arrives behind an `Arc` through `pending_track` and the
     /// old one is dropped by whoever pushed the new one.
-    track: Option<Placed>,
+    clips: Vec<Placed>,
     /// The transport's position in frames, advanced by `run_transport` and
     /// nothing else. Project frames, not clip frames: a clip positions itself
     /// as `pos - placed.start`.
@@ -1567,8 +1594,8 @@ struct Renderer {
     sounding: u128,
     /// The clip arriving, and the one going back to be dropped where it came
     /// from. The pair IS the routing, exactly as a plugin's is.
-    track_incoming: Consumer<Option<Placed>>,
-    track_retiring: Producer<Option<Placed>>,
+    track_incoming: Consumer<Vec<Placed>>,
+    track_retiring: Producer<Vec<Placed>>,
     builtin: crate::dx7::Dx7,
     /// The built-in's own output, before its slot gain.
     ///
@@ -2056,7 +2083,7 @@ impl Renderer {
                 self.sounding = 0;
             }
             self.was_rolling = rolling;
-            self.mix_track(at, rolling, n);
+            self.mix_clips(at, rolling, n);
             self.mix_monitor(n, muted, soloed);
             // ── the click, and what it sends ───────────────────────────
             //
@@ -2654,31 +2681,27 @@ impl Renderer {
     /// The clip is stereo at the device's rate — `decode` guarantees both — so
     /// there is no resampling and no channel mapping here, which is the whole
     /// reason it is guaranteed there.
-    fn mix_track(&mut self, at: u64, rolling: bool, frames: usize) {
-        // A clip arriving — and the displaced one going BACK, by the racks'
-        // own protocol: no room to return it, no swap this block. Dropping it
-        // here would free a hundred megabytes inside the callback.
+    fn mix_clips(&mut self, at: u64, rolling: bool, frames: usize) {
+        // A clip LIST arriving — and the displaced one going BACK, by the
+        // racks' own protocol: no room to return it, no swap this block.
+        // Dropping it here would free a hundred megabytes inside the
+        // callback.
         if self.track_retiring.slots() > 0 {
             if let Ok(next) = self.track_incoming.pop() {
-                let old = std::mem::replace(&mut self.track, next);
+                let old = std::mem::replace(&mut self.clips, next);
                 let _ = self.track_retiring.push(old);
             }
         }
         // **Stopped means silent, exactly as it always has.** Without this the
-        // parked position is re-read every callback and the clip buzzes one
-        // block of itself under a readout that says nothing is moving.
-        if !rolling {
+        // parked position is re-read every callback and the clips buzz one
+        // block of themselves under a readout that says nothing is moving.
+        if !rolling || self.clips.is_empty() {
             return;
         }
-        let Some(placed) = self.track.clone() else {
-            return;
-        };
-        let clip = &placed.clip;
-        let total = clip.frames() as u64;
-        // **No strip since v13 retired BACKING.** The clip plays at its own
-        // gain, under the master alone — no mute, no solo, no rack, no send.
-        // The arrangement's per-lane schedules are what replace all of that;
-        // until they land, this is the one honest reading of "a file playing".
+        // **The whole bed at one gain, under the master alone.** Per-LANE
+        // routing — a clip through its channel's fader, rack and send — is
+        // the arrangement view's phase; what plays today is the document's
+        // audio, placed and faded, at the gain the backing track always had.
         let target = Shared::f32_of(&self.shared.track_gain).clamp(0.0, 8.0);
         let coeff = self.gain_coeff;
         let Some(mix) = self.mix.get_mut(..frames * TAP_CHANNELS) else {
@@ -2686,25 +2709,48 @@ impl Renderer {
         };
         for f in 0..frames {
             self.track_gain += (target - self.track_gain) * coeff;
-            // Project frame -> clip frame. The u64 compare comes BEFORE any
-            // cast, because `p` grows without bound; before the clip and past
-            // its end are both silence, and both are ordinary.
+            // Project frame. The u64 compares come BEFORE any cast, because
+            // `p` grows without bound; before a clip and past its end are
+            // both silence, and both are ordinary.
             let p = at + f as u64;
-            let (l, r) = match p.checked_sub(placed.start) {
-                Some(k) if k < total => {
-                    let i = (k as usize) * 2;
-                    // Bounds-checked rather than trusted: `k < total` is the
-                    // clamp, and this is the line that would panic on the
-                    // audio thread if that ever stopped being true.
-                    match (clip.samples.get(i), clip.samples.get(i + 1)) {
-                        (Some(l), Some(r)) => (l * self.track_gain, r * self.track_gain),
-                        _ => (0.0, 0.0),
-                    }
+            let (mut l, mut r) = (0.0f32, 0.0f32);
+            for placed in &self.clips {
+                let Some(k) = p.checked_sub(placed.start) else {
+                    continue;
+                };
+                if k >= placed.len {
+                    continue;
                 }
-                _ => (0.0, 0.0),
-            };
-            mix[f * TAP_CHANNELS] += l;
-            mix[f * TAP_CHANNELS + 1] += r;
+                let i = match usize::try_from(placed.offset + k) {
+                    Ok(frame) => frame * 2,
+                    Err(_) => continue,
+                };
+                // Bounds-checked rather than trusted: `k < len` is the
+                // clamp, and this is the line that would panic on the audio
+                // thread if the host ever pushed a len past the file.
+                let (cl, cr) = match (placed.clip.samples.get(i), placed.clip.samples.get(i + 1))
+                {
+                    (Some(a), Some(b)) => (*a, *b),
+                    _ => continue,
+                };
+                // The fades: linear ramps in frames, computed from the u64
+                // distances so a four-minute clip cannot lose precision.
+                // The head ramp rises 0 -> 1 over `fade_in`; the tail falls
+                // to exactly 0 ON the last frame, so a faded clip cannot
+                // click shut.
+                let mut env = 1.0f32;
+                if placed.fade_in > 0 && k < placed.fade_in {
+                    env *= k as f32 / placed.fade_in as f32;
+                }
+                let left = placed.len - k;
+                if placed.fade_out > 0 && left <= placed.fade_out {
+                    env *= (left - 1) as f32 / placed.fade_out as f32;
+                }
+                l += cl * env;
+                r += cr * env;
+            }
+            mix[f * TAP_CHANNELS] += l * self.track_gain;
+            mix[f * TAP_CHANNELS + 1] += r * self.track_gain;
         }
     }
 
@@ -3083,8 +3129,8 @@ pub struct Engine {
     /// exact reason: the audio thread must never free a hundred megabytes of
     /// samples, so the displaced clip comes BACK here and is dropped by the
     /// thread that sent its replacement.
-    track_to_audio: Producer<Option<Placed>>,
-    track_from_audio: Consumer<Option<Placed>>,
+    track_to_audio: Producer<Vec<Placed>>,
+    track_from_audio: Consumer<Vec<Placed>>,
     /// What is in each of them, for the desk to name.
     inserts_loaded: [[Option<Loaded>; INSERTS]; STRIPS + 1],
 
@@ -3272,8 +3318,8 @@ impl Engine {
         let widest = dev_ch.max(TAP_CHANNELS);
         // The clip's pair: capacity two, one in flight plus the spare that
         // lets the swap check for room, exactly as a slot's.
-        let (track_to_audio, track_incoming) = RingBuffer::<Option<Placed>>::new(2);
-        let (track_retiring, track_from_audio) = RingBuffer::<Option<Placed>>::new(2);
+        let (track_to_audio, track_incoming) = RingBuffer::<Vec<Placed>>::new(2);
+        let (track_retiring, track_from_audio) = RingBuffer::<Vec<Placed>>::new(2);
         let renderer = Renderer {
             shared: Arc::clone(&shared),
             timebase,
@@ -3286,7 +3332,7 @@ impl Engine {
             midi: midi_rx,
             pending: None,
             notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK),
-            track: None,
+            clips: Vec::new(),
             pos: 0,
             track_gain: 1.0,
             seen_req: 0,
@@ -3965,14 +4011,14 @@ impl Engine {
     /// comes back on `track_from_audio` and is dropped by the caller that sent
     /// its replacement — never by the audio thread, whose `drop` of a
     /// hundred-megabyte `Vec` was a measured, reachable stall.
-    pub fn set_track(&mut self, placed: Option<Placed>) {
+    pub fn set_clips(&mut self, clips: Vec<Placed>) {
         // Whatever came back earlier is dropped first, so the ring always has
         // room and two rapid loads cannot wedge.
         while self.track_from_audio.pop().is_ok() {}
         self.shared
             .track_loaded
-            .store(placed.is_some(), Ordering::Relaxed);
-        if self.track_to_audio.push(placed).is_err() {
+            .store(!clips.is_empty(), Ordering::Relaxed);
+        if self.track_to_audio.push(clips).is_err() {
             return;
         }
         let deadline = Instant::now() + RETIRE_TIMEOUT;
@@ -5435,9 +5481,9 @@ mod tests {
         /// the same two-way trip the engine makes.
         fn hijack_track_rings(
             &mut self,
-        ) -> (Producer<Option<Placed>>, Consumer<Option<Placed>>) {
-            let (to, incoming) = RingBuffer::<Option<Placed>>::new(2);
-            let (retiring, from) = RingBuffer::<Option<Placed>>::new(2);
+        ) -> (Producer<Vec<Placed>>, Consumer<Vec<Placed>>) {
+            let (to, incoming) = RingBuffer::<Vec<Placed>>::new(2);
+            let (retiring, from) = RingBuffer::<Vec<Placed>>::new(2);
             self.track_incoming = incoming;
             self.track_retiring = retiring;
             (to, from)
@@ -5488,7 +5534,7 @@ mod tests {
             click_out: vec![0.0; MAX_BLOCK as usize],
             click_taped: vec![0.0; MAX_BLOCK as usize],
             fx_return_gain: 1.0,
-            track: None,
+            clips: Vec::new(),
             pos: 0,
             track_gain: 1.0,
             seen_req: 0,
@@ -5496,8 +5542,8 @@ mod tests {
             sounding: 0,
             // Abandoned peers, like the MIDI ring above: pop reports empty
             // and push fills to capacity, which is all a test needs.
-            track_incoming: RingBuffer::<Option<Placed>>::new(2).1,
-            track_retiring: RingBuffer::<Option<Placed>>::new(2).0,
+            track_incoming: RingBuffer::<Vec<Placed>>::new(2).1,
+            track_retiring: RingBuffer::<Vec<Placed>>::new(2).0,
             shared,
             timebase: Timebase::new(),
             rate: RATE,
@@ -5961,6 +6007,76 @@ mod tests {
         assert!(peak <= 1.0, "the built-in clipped the device at {peak}");
     }
 
+    /// **An arrangement of clips plays placed, trimmed, and faded.**
+    ///
+    /// The document's promises, heard: a clip stands where `start` says, a
+    /// trim starts the FILE where `offset` says, `len` is the clamp, two
+    /// clips overlapping SUM, a fade-in ramps from silence, and a fade-out
+    /// reaches exactly zero on the last frame so a faded clip cannot click
+    /// shut.
+    #[test]
+    fn an_arrangement_of_clips_plays_placed_trimmed_and_faded() {
+        use std::sync::Arc;
+        let constant = |v: f32| {
+            Arc::new(ivory_record::decode::Clip {
+                samples: vec![v; 2000],
+                rate: 48_000,
+                source: std::path::PathBuf::from("c.wav"),
+            })
+        };
+        let a = constant(0.5);
+        let b = constant(1.0);
+
+        let (mut r, _tx, shared) = renderer_with_midi(2);
+        let (mut to_audio, _from_audio) = r.hijack_track_rings();
+        to_audio
+            .push(vec![
+                // A: the first 500 frames of the timeline, bare.
+                Placed {
+                    clip: Arc::clone(&a),
+                    start: 0,
+                    offset: 0,
+                    len: 500,
+                    fade_in: 0,
+                    fade_out: 0,
+                },
+                // B: trimmed 100 frames into its file, 300 long, standing at
+                // 400 — so 400..500 overlaps A — with 100-frame ramps.
+                Placed {
+                    clip: Arc::clone(&b),
+                    start: 400,
+                    offset: 100,
+                    len: 300,
+                    fade_in: 100,
+                    fade_out: 100,
+                },
+            ])
+            .expect("room");
+        shared.set_track_gain(1.0);
+        r.track_gain = 1.0;
+        shared.transport_at.store(0, Ordering::Relaxed);
+        shared.transport_req.store(1, Ordering::Release);
+        shared.rolling.store(true, Ordering::Relaxed);
+
+        let mut out = vec![0.0_f32; 2 * 1024];
+        r.render(&mut out, 0, 0);
+        let left = |f: usize| out[2 * f];
+        let close = |f: usize, want: f32, what: &str| {
+            assert!(
+                (left(f) - want).abs() < 1.0e-3,
+                "frame {f} ({what}): heard {}, wanted {want}",
+                left(f)
+            );
+        };
+        close(10, 0.5, "A alone");
+        close(450, 0.5 + 0.5, "A plus B halfway up its fade-in");
+        close(550, 1.0, "B alone, past its fade");
+        // B's tail: at k=250, 50 frames remain of a 100-frame fade-out.
+        close(650, 0.49, "B halfway down its fade-out");
+        close(699, 0.0, "B's LAST frame is exactly silent");
+        close(720, 0.0, "past everything");
+    }
+
     /// **A patch you pick has to be the patch you hear.** The picker is a list
     /// of names and a list of names is easy to get right while the voice behind
     /// it never reaches the audio thread — the whole chain is a `Mutex` the
@@ -5995,7 +6111,7 @@ mod tests {
         let (mut r, mut tx, shared) = renderer_with_midi(2);
         let (mut to_audio, mut from_audio) = r.hijack_track_rings();
         to_audio
-            .push(Some(Placed { clip: Arc::clone(&clip), start: 0 }))
+            .push(vec![Placed::whole(Arc::clone(&clip), 0)])
             .expect("room");
         shared.set_track_gain(1.0);
         r.track_gain = 1.0;
@@ -6064,7 +6180,7 @@ mod tests {
         // 4. A clip PLACED at 300, located to 250: fifty frames of silence,
         // then the clip from its own first sample.
         to_audio
-            .push(Some(Placed { clip: Arc::clone(&clip), start: 300 }))
+            .push(vec![Placed::whole(Arc::clone(&clip), 300)])
             .expect("room");
         shared.transport_at.store(250, Ordering::Relaxed);
         shared.transport_req.store(3, Ordering::Release);
@@ -6087,7 +6203,7 @@ mod tests {
         // what returns.
         let mut came_back = false;
         while let Ok(returned) = from_audio.pop() {
-            if returned.is_some_and(|p| Arc::ptr_eq(&p.clip, &clip)) {
+            if returned.first().is_some_and(|p| Arc::ptr_eq(&p.clip, &clip)) {
                 came_back = true;
             }
         }

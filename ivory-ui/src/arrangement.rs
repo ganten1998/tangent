@@ -25,32 +25,84 @@
 //! transport follows. Unknown keys ride in `extra` and survive a round trip,
 //! so a newer build's arrangement opened by this one is not stripped.
 //!
-//! No tempo map, no clip trims, no per-clip gain, no MIDI clips YET — each of
-//! those is a real subsystem, and a schema that names them before they exist
-//! is a promise this build cannot keep. `version` is what lets them arrive.
+//! No tempo map, no per-clip gain, no MIDI clips YET — each of those is a
+//! real subsystem, and a schema that names them before they exist is a
+//! promise this build cannot keep. `version` is what lets them arrive.
+//!
+//! # Version 2: the clip grows edges
+//!
+//! Trims (`offset_s`/`len_s`), fades, a display name and an id — the fields
+//! the arrangement view's five operations act on, added when the engine
+//! learned to play a LIST of clips rather than one backing file. A `len_s`
+//! of zero means "to the end of the file": the length is the FILE's fact,
+//! filled in by the host after the decode and saved so the scrubber can draw
+//! without one.
+//!
+//! # Paths are relative to the document
+//!
+//! A clip inside the project's own `media/` is stored as `media/<file>`, so
+//! a project directory is self-contained: move it, zip it, hand it to
+//! somebody, it opens. Absolute paths still parse — a dev document may point
+//! anywhere — and [`Arrangement::resolve`] is the one place the rule lives.
 
 use serde_json::{Map, Value};
 use std::path::PathBuf;
 
 /// The document's schema version. Bump WITH a migration arm in
 /// [`Arrangement::from_map`], never without one.
-pub const ARRANGEMENT_VERSION: u64 = 1;
+pub const ARRANGEMENT_VERSION: u64 = 2;
 
 /// One piece of audio standing on the timeline.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ArrClip {
     /// Which lane it stands on. Lane 0 is the backing track's.
     pub lane: usize,
-    /// The file it came from, absolute.
+    /// The file it came from — `media/<file>` inside a project, or absolute.
+    /// See [`Arrangement::resolve`].
     pub path: String,
     /// Where it begins on the timeline, in seconds from 0:00.
     pub start_s: f64,
+    /// How far into the FILE the clip starts — the left trim. Zero untrimmed.
+    pub offset_s: f64,
+    /// How long the clip runs on the timeline. **Zero means "to the end of
+    /// the file"** — the file's length is the host's fact, filled in after
+    /// the decode and saved, so a document written by hand still plays.
+    pub len_s: f64,
+    /// Seconds of ramp up from silence at the clip's head. Zero for none.
+    pub fade_in_s: f64,
+    /// Seconds of ramp down to silence at the clip's tail. Zero for none.
+    pub fade_out_s: f64,
+    /// What the clip is called on the lane. The file's stem until renamed.
+    pub name: String,
+    /// Stable identity for edits — selection, undo one day. Assigned from
+    /// [`Arrangement::next_id`], never reused within a document.
+    pub id: u64,
+}
+
+impl ArrClip {
+    /// Where the clip ENDS on the timeline, given the file length the host
+    /// knows. `len_s == 0.0` reads to the end of the file, minus the trim.
+    pub fn end_s(&self, file_s: f64) -> f64 {
+        self.start_s + self.play_len_s(file_s)
+    }
+
+    /// How long the clip actually plays, resolving the zero sentinel.
+    pub fn play_len_s(&self, file_s: f64) -> f64 {
+        if self.len_s > 0.0 {
+            self.len_s
+        } else {
+            (file_s - self.offset_s).max(0.0)
+        }
+    }
 }
 
 /// The whole document.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Arrangement {
     pub clips: Vec<ArrClip>,
+    /// The next clip id to hand out. Monotonic within the document, never
+    /// reused — what lets an edit name the clip it means.
+    pub next_id: u64,
     /// Keys this build does not know, kept so a newer build's document
     /// survives being opened here — the settings file's own bargain.
     pub extra: Map<String, Value>,
@@ -69,7 +121,12 @@ impl Arrangement {
     }
 
     pub fn load() -> Self {
-        match std::fs::read_to_string(Self::path()) {
+        Self::load_from(&Self::path())
+    }
+
+    /// Load a document from anywhere — the PROJECT system's road in.
+    pub fn load_from(path: &std::path::Path) -> Self {
+        match std::fs::read_to_string(path) {
             Ok(text) => Self::from_json(&text),
             Err(_) => Self::default(),
         }
@@ -78,14 +135,55 @@ impl Arrangement {
     /// Write-then-rename, the settings file's own shape: a crash or a full
     /// disk mid-write must not leave half a song where a whole one was.
     pub fn save(&self) {
-        let path = Self::path();
+        self.save_to(&Self::path());
+    }
+
+    /// Save a document anywhere — the PROJECT system's road out.
+    pub fn save_to(&self, path: &std::path::Path) {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let tmp = path.with_extension("json.tmp");
+        let tmp = path.with_extension("tangent.tmp");
         if std::fs::write(&tmp, self.to_json()).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
+            let _ = std::fs::rename(&tmp, path);
         }
+    }
+
+    /// A clip's path against the document's own directory.
+    ///
+    /// The one place the relative-path rule lives: `media/<file>` inside a
+    /// project resolves beside the document, an absolute path is itself.
+    pub fn resolve(doc_path: &std::path::Path, clip_path: &str) -> PathBuf {
+        let p = std::path::Path::new(clip_path);
+        if p.is_absolute() {
+            return p.to_path_buf();
+        }
+        doc_path.parent().map_or_else(|| p.to_path_buf(), |d| d.join(p))
+    }
+
+    /// Add a clip, assigning its id. Returns the id.
+    pub fn add_clip(&mut self, mut clip: ArrClip) -> u64 {
+        // Ids start at 1: zero is the wire's "the file did not say", and a
+        // real clip must never wear the sentinel.
+        if self.next_id == 0 {
+            self.next_id = 1;
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        clip.id = id;
+        self.clips.push(clip);
+        id
+    }
+
+    /// The last second anything stands on, given a file length per clip.
+    ///
+    /// `file_s` answers a clip's PATH with the file's length in seconds —
+    /// the host's fact — and zero for a file it has not met.
+    pub fn span_s(&self, file_s: impl Fn(&str) -> f64) -> f64 {
+        self.clips
+            .iter()
+            .map(|c| c.end_s(file_s(&c.path)))
+            .fold(0.0, f64::max)
     }
 
     pub fn from_json(text: &str) -> Self {
@@ -96,13 +194,19 @@ impl Arrangement {
     }
 
     fn from_map(mut map: Map<String, Value>) -> Self {
-        // Read and discarded for now — version 1 is the first version, so
-        // there is nothing to migrate FROM. The arm structure below is the
-        // settings file's: consume what is known, keep the rest.
+        // Version 1 documents simply lack the v2 fields, and every one of
+        // them has an honest default — no trim, no fade, name from the file,
+        // ids assigned below — so the "migration" is the defaults.
         let _version = map
             .shift_remove("arrangement_version")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
+        let secs = |c: &Map<String, Value>, key: &str| {
+            c.get(key)
+                .and_then(Value::as_f64)
+                .filter(|s| s.is_finite() && *s >= 0.0)
+                .unwrap_or(0.0)
+        };
         let mut clips = Vec::new();
         if let Some(Value::Array(list)) = map.shift_remove("clips") {
             for item in list {
@@ -111,19 +215,52 @@ impl Arrangement {
                 let Some(path) = c.get("path").and_then(Value::as_str) else {
                     continue;
                 };
-                let start_s = c
-                    .get("start_s")
-                    .and_then(Value::as_f64)
-                    .filter(|s| s.is_finite() && *s >= 0.0)
-                    .unwrap_or(0.0);
+                let name = c
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| {
+                        std::path::Path::new(path)
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_default()
+                    });
                 clips.push(ArrClip {
                     lane,
                     path: path.to_owned(),
-                    start_s,
+                    start_s: secs(&c, "start_s"),
+                    offset_s: secs(&c, "offset_s"),
+                    len_s: secs(&c, "len_s"),
+                    fade_in_s: secs(&c, "fade_in_s"),
+                    fade_out_s: secs(&c, "fade_out_s"),
+                    name,
+                    id: c.get("id").and_then(Value::as_u64).unwrap_or(0),
                 });
             }
         }
-        Self { clips, extra: map }
+        // Ids: keep what the file says where it is usable, hand out fresh
+        // ones where it is not — duplicates included, because two clips with
+        // one id is a selection that edits the wrong clip.
+        let stored_next = map
+            .shift_remove("next_clip_id")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let mut next_id = stored_next
+            .max(clips.iter().map(|c| c.id + 1).max().unwrap_or(0))
+            .max(1);
+        let mut seen = Vec::with_capacity(clips.len());
+        for clip in &mut clips {
+            if clip.id == 0 || seen.contains(&clip.id) {
+                clip.id = next_id;
+                next_id += 1;
+            }
+            seen.push(clip.id);
+        }
+        Self {
+            clips,
+            next_id,
+            extra: map,
+        }
     }
 
     pub fn to_json(&self) -> String {
@@ -131,6 +268,10 @@ impl Arrangement {
         map.insert(
             "arrangement_version".into(),
             Value::Number(ARRANGEMENT_VERSION.into()),
+        );
+        map.insert(
+            "next_clip_id".into(),
+            Value::Number(self.next_id.into()),
         );
         map.insert(
             "clips".into(),
@@ -141,8 +282,18 @@ impl Arrangement {
                         let mut m = Map::new();
                         m.insert("lane".into(), Value::Number((c.lane as u64).into()));
                         m.insert("path".into(), Value::String(c.path.clone()));
-                        if let Some(n) = serde_json::Number::from_f64(c.start_s) {
-                            m.insert("start_s".into(), Value::Number(n));
+                        m.insert("name".into(), Value::String(c.name.clone()));
+                        m.insert("id".into(), Value::Number(c.id.into()));
+                        for (key, v) in [
+                            ("start_s", c.start_s),
+                            ("offset_s", c.offset_s),
+                            ("len_s", c.len_s),
+                            ("fade_in_s", c.fade_in_s),
+                            ("fade_out_s", c.fade_out_s),
+                        ] {
+                            if let Some(n) = serde_json::Number::from_f64(v) {
+                                m.insert(key.into(), Value::Number(n));
+                            }
                         }
                         Value::Object(m)
                     })
@@ -171,18 +322,94 @@ fn Settings_dir() -> PathBuf {
 mod tests {
     use super::*;
 
-    /// A document survives its own round trip, clips, order and all.
+    fn a_clip(lane: usize, path: &str, start_s: f64) -> ArrClip {
+        ArrClip {
+            lane,
+            path: path.to_owned(),
+            start_s,
+            offset_s: 0.0,
+            len_s: 0.0,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name: std::path::Path::new(path)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            id: 0,
+        }
+    }
+
+    /// A document survives its own round trip, clips, edges and all.
     #[test]
     fn an_arrangement_round_trips() {
-        let a = Arrangement {
-            clips: vec![
-                ArrClip { lane: 0, path: "/x/backing.mp3".into(), start_s: 0.0 },
-                ArrClip { lane: 3, path: "/x/solo.wav".into(), start_s: 84.5 },
-            ],
-            extra: Map::new(),
+        let mut a = Arrangement::default();
+        a.add_clip(a_clip(0, "media/backing.mp3", 0.0));
+        let solo = ArrClip {
+            offset_s: 1.25,
+            len_s: 30.0,
+            fade_in_s: 0.5,
+            fade_out_s: 2.0,
+            name: "the solo".into(),
+            ..a_clip(3, "/x/solo.wav", 84.5)
         };
+        a.add_clip(solo);
         let back = Arrangement::from_json(&a.to_json());
         assert_eq!(back, a, "the document did not survive its own round trip");
+    }
+
+    /// A version-1 document — bare lane/path/start clips — opens whole: no
+    /// trims, no fades, names from the files, and every clip gets an id.
+    #[test]
+    fn a_v1_document_opens_with_honest_defaults() {
+        let a = Arrangement::from_json(
+            r#"{"arrangement_version": 1, "clips": [
+                {"lane": 0, "path": "/x/Blue Bossa - backing.mp3", "start_s": 0.0},
+                {"lane": 2, "path": "media/solo.wav", "start_s": 12.0}]}"#,
+        );
+        assert_eq!(a.clips.len(), 2);
+        assert_eq!(a.clips[0].name, "Blue Bossa - backing");
+        assert_eq!(a.clips[0].len_s, 0.0, "a v1 clip runs to the end of its file");
+        assert_ne!(a.clips[0].id, a.clips[1].id, "two clips share an id");
+        assert!(a.next_id > a.clips[1].id, "the next id would collide");
+        // And ids survive a round trip rather than being re-dealt.
+        let back = Arrangement::from_json(&a.to_json());
+        assert_eq!(back, a);
+    }
+
+    /// The relative-path rule, in its one home: `media/<file>` resolves
+    /// beside the document; an absolute path is itself.
+    #[test]
+    fn a_clips_path_resolves_beside_the_document() {
+        let doc = std::path::Path::new("/songs/nocturne/project.tangent");
+        assert_eq!(
+            Arrangement::resolve(doc, "media/backing.mp3"),
+            std::path::Path::new("/songs/nocturne/media/backing.mp3")
+        );
+        assert_eq!(
+            Arrangement::resolve(doc, "/elsewhere/x.wav"),
+            std::path::Path::new("/elsewhere/x.wav")
+        );
+    }
+
+    /// The span is the furthest clip end, trims and the zero sentinel both
+    /// honoured — it is what the scrubber draws against.
+    #[test]
+    fn the_span_is_the_furthest_clip_end() {
+        let mut a = Arrangement::default();
+        a.add_clip(a_clip(0, "/x/a.wav", 0.0)); // whole 100 s file
+        a.add_clip(ArrClip {
+            len_s: 10.0,
+            ..a_clip(1, "/x/b.wav", 95.0) // ends at 105
+        });
+        a.add_clip(ArrClip {
+            offset_s: 40.0,
+            ..a_clip(2, "/x/a.wav", 30.0) // 100-40=60 long, ends at 90
+        });
+        let span = a.span_s(|_| 100.0);
+        assert!((span - 105.0).abs() < 1e-9, "span was {span}");
+        // A file the host has not met counts as zero-length, never a NaN.
+        let none = a.span_s(|_| 0.0);
+        assert!((none - 105.0).abs() < 1e-9, "the trimmed b.wav still ends at 105");
     }
 
     /// Keys this build does not know come back out unchanged — a newer

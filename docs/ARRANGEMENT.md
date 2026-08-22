@@ -140,6 +140,21 @@ channels play back their clips and nothing else. "Ready to play" and
   `RecorderRequest::ClearTrack` and the TrackInfo plumbing retire with the
   BACKING strip.
 
+## Where it stands
+
+- **Phase 1 SHIPPED (4.43.0)**: BACKING retired, settings v13, M S R,
+  arm-as-live.
+- **Phase 2 SHIPPED (4.44.0)**: projects (directory + `media/` auto-copy,
+  reopen-last, v12 backing seeded as the first clip, New / Open / Duplicate
+  in the menu under a PROJECT subject), the doc at v2 (trims, fades, names,
+  ids, relative paths), and the engine playing a LIST of placed, trimmed,
+  faded clips through the old track player's swap protocol. The band's
+  timeline now draws FROM the document (one clip's wave + the project span),
+  gained a drag-to-scrub, and its × empties the timeline. Deliberately
+  deferred: the lanes-and-viewport look of the scrubber arrives WITH the
+  arrangement view (there is no viewport to steer until the view exists),
+  and MIDI clip schedules arrive when something can create MIDI clips.
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index

@@ -327,6 +327,28 @@ pub enum FilePurpose {
     Cartridge,
     /// An audio file to play along to.
     BackingTrack,
+    /// A project document (`project.tangent`) to open.
+    Project,
+}
+
+/// A place the app has asked the host to raise a SAVE panel for.
+///
+/// The same request pattern as [`FileRequest`]; the answer comes back
+/// through `IvoryApp::finish_save_choice`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaveRequest {
+    pub title: String,
+    /// The name the panel opens with.
+    pub suggested: String,
+    pub purpose: SavePurpose,
+}
+
+/// Why a save location is being asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SavePurpose {
+    /// Duplicate the whole open project — document and media — to the
+    /// chosen place, and open the copy.
+    ProjectCopy,
 }
 
 /// Why a folder is being asked for.

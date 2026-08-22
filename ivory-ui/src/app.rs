@@ -292,6 +292,20 @@ pub struct IvoryApp {
     /// headphones, so every launch starts with only the default instrument
     /// live. See `default_armed` and docs/ARRANGEMENT.md.
     armed: u32,
+    /// The open project's DOCUMENT — the arrangement, in memory. Loaded by
+    /// `bootstrap_project`, saved atomically on every edit.
+    arrangement: crate::arrangement::Arrangement,
+    /// Where the document lives (`…/project.tangent`). Empty until the host
+    /// bootstraps; every clip path resolves against it.
+    project_doc: std::path::PathBuf,
+    /// The document's clips changed: the host should re-decode, re-push the
+    /// engine's schedule, and rebuild the band's picture. Taken once.
+    clips_dirty: bool,
+    /// A file the app wants the host to raise a SAVE panel for.
+    save_request: Option<crate::ports::SaveRequest>,
+    /// A press landed on the timeline and the button is still down: the
+    /// locate follows the hand. See `recorder_panel::timeline_fraction`.
+    timeline_scrub: bool,
     /// Where the mixer was last drawn, so a press can be tested against it.
     mixer_rect: Option<Rect>,
     /// The OS's own file panel is on screen right now.
@@ -541,6 +555,81 @@ struct Grab {
 ///
 /// A slot holds a PATH, and a bundle path under a channel is the sort of detail
 /// that makes an app look like it is showing you its insides.
+/// `base`, or `base 2`, `base 3`… — the first directory name not taken.
+///
+/// Counted rather than timestamped: "Untitled 3" is a name a person can say
+/// out loud, and the count restarts per root the way every desktop's does.
+fn unique_dir(root: &std::path::Path, base: &str) -> std::path::PathBuf {
+    let first = root.join(base);
+    if !first.exists() {
+        return first;
+    }
+    for n in 2..10_000 {
+        let candidate = root.join(format!("{base} {n}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    first
+}
+
+/// Copy `src` into the project's `media/`, deduplicating the file name, and
+/// answer the RELATIVE path the document stores — `media/<name>`. `None`
+/// when the copy failed, which the caller turns into one honest sentence.
+fn copy_into_media(doc: &std::path::Path, src: &std::path::Path) -> Option<String> {
+    let media = doc.parent()?.join("media");
+    std::fs::create_dir_all(&media).ok()?;
+    let name = src.file_name()?.to_string_lossy().into_owned();
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) => (s.to_owned(), format!(".{e}")),
+        None => (name.clone(), String::new()),
+    };
+    let mut chosen = name;
+    let mut n = 2;
+    while media.join(&chosen).exists() {
+        // The same file already inside media/ is not copied again — an
+        // import repeated is one file, not a "backing 7.mp3" collection.
+        if same_file(&media.join(&chosen), src) {
+            return Some(format!("media/{chosen}"));
+        }
+        chosen = format!("{stem} {n}{ext}");
+        n += 1;
+        if n > 10_000 {
+            return None;
+        }
+    }
+    std::fs::copy(src, media.join(&chosen)).ok()?;
+    Some(format!("media/{chosen}"))
+}
+
+/// Cheap same-file check for the dedup above: same length is close enough
+/// for "the user imported the same file twice", and a false negative only
+/// costs a numbered copy.
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(x), Ok(y)) => x.len() == y.len(),
+        _ => false,
+    }
+}
+
+/// A bare clip standing at `start_s` on `lane`, named after its file.
+fn clip_at(rel_path: &str, lane: usize, start_s: f64) -> crate::arrangement::ArrClip {
+    crate::arrangement::ArrClip {
+        lane,
+        path: rel_path.to_owned(),
+        start_s,
+        offset_s: 0.0,
+        len_s: 0.0,
+        fade_in_s: 0.0,
+        fade_out_s: 0.0,
+        name: std::path::Path::new(rel_path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        id: 0,
+    }
+}
+
 /// Which channel a session opens with ARMED — record-ready and live.
 ///
 /// **All arms off, save one**, by the owner's rule: a project must be
@@ -792,6 +881,11 @@ impl IvoryApp {
             mixer_fx_menu: None,
             mixer_add_ask: None,
             armed,
+            arrangement: crate::arrangement::Arrangement::default(),
+            project_doc: std::path::PathBuf::new(),
+            clips_dirty: false,
+            save_request: None,
+            timeline_scrub: false,
             open_insert_on_load: None,
             mixer_rect: None,
             native_panel_up: false,
@@ -2527,6 +2621,20 @@ impl IvoryApp {
         // release is what ends the gesture, not where it happened.
         if pointer_released {
             self.clicked.clear();
+            self.timeline_scrub = false;
+        }
+        // The scrub: the locate follows the hand for as long as the press
+        // that landed on the timeline is held. X only, clamped at the ends —
+        // see `timeline_fraction`. Cheap to repeat: a locate is one
+        // generation-stamped store the engine reconciles.
+        if self.timeline_scrub && pointer_down {
+            if let (Some(r), Some(pos)) = (recorder_rect, pointer) {
+                if let Some(t) =
+                    recorder_panel::timeline_fraction(r, &self.recorder_layout_view(), pos)
+                {
+                    self.apply_recorder_hit(recorder_panel::Hit::SeekTimeline(t));
+                }
+            }
         }
 
         // The effect panel, on the same terms as the take settings below it.
@@ -2616,6 +2724,10 @@ impl IvoryApp {
                         if !recorder_panel::Hit::is_draggable(&hit) {
                             self.apply_recorder_hit(hit);
                         }
+                        // A press that landed as a LOCATE keeps following
+                        // the hand until the button comes up — the scrub.
+                        self.timeline_scrub =
+                            matches!(hit, recorder_panel::Hit::SeekTimeline(_));
                     }
                     // **Setup opens the menu, here, on the press that asked
                     // for it.** The hit handler cannot: opening a menu needs
@@ -3386,6 +3498,209 @@ impl IvoryApp {
         self.armed
     }
 
+    // ── the project ────────────────────────────────────────────────────────
+    //
+    // A project is a DIRECTORY: the arrangement document and a `media/`
+    // folder every referenced file is copied into, so the directory is
+    // self-contained — move it, zip it, hand it to somebody, it opens. The
+    // app owns the document and its saves; decoding and native panels stay
+    // the host's. See docs/ARRANGEMENT.md.
+
+    /// Open the remembered project, or make the first one — called by the
+    /// host once at launch, never in `new` (a test constructing an app must
+    /// not create directories in anybody's real music folder).
+    ///
+    /// The first project of the project era carries the v12 world across:
+    /// a remembered backing file becomes the document's first clip, copied
+    /// into `media/`, and `track_path` retires — the document owns it now.
+    pub fn bootstrap_project(&mut self, projects_root: &std::path::Path) {
+        // The dev hook: an explicit document, no settings touched.
+        if let Some(p) = std::env::var_os("IVORY_ARRANGEMENT_PATH") {
+            self.project_doc = std::path::PathBuf::from(p);
+            self.arrangement = crate::arrangement::Arrangement::load_from(&self.project_doc);
+            self.clips_dirty = true;
+            return;
+        }
+        if !self.settings.project_path.is_empty() {
+            let doc = std::path::PathBuf::from(&self.settings.project_path);
+            if doc.is_file() {
+                self.project_doc = doc.clone();
+                self.arrangement = crate::arrangement::Arrangement::load_from(&doc);
+                self.clips_dirty = true;
+                return;
+            }
+            // A remembered project that is GONE falls through to a fresh
+            // one rather than an error at launch — the settings file's own
+            // manner with missing files.
+        }
+        let dir = unique_dir(projects_root, "Untitled");
+        let doc = dir.join("project.tangent");
+        let _ = std::fs::create_dir_all(dir.join("media"));
+        let mut arr = crate::arrangement::Arrangement::default();
+        let track = std::mem::take(&mut self.settings.track_path);
+        if !track.is_empty() {
+            let src = std::path::PathBuf::from(&track);
+            if src.is_file() {
+                if let Some(rel) = copy_into_media(&doc, &src) {
+                    arr.add_clip(clip_at(&rel, 0, 0.0));
+                }
+            }
+        }
+        arr.save_to(&doc);
+        self.arrangement = arr;
+        self.project_doc = doc.clone();
+        self.settings.project_path = doc.to_string_lossy().into_owned();
+        self.save_settings();
+        self.clips_dirty = true;
+    }
+
+    /// The open document's path, for the host to resolve clip paths against.
+    pub fn project_doc(&self) -> Option<&std::path::Path> {
+        (!self.project_doc.as_os_str().is_empty()).then_some(self.project_doc.as_path())
+    }
+
+    /// What the project is called: its directory's name.
+    pub fn project_name(&self) -> String {
+        self.project_doc
+            .parent()
+            .and_then(|d| d.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    pub fn arrangement(&self) -> &crate::arrangement::Arrangement {
+        &self.arrangement
+    }
+
+    /// Whether the document's clips changed since the host last asked.
+    pub fn take_clips_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.clips_dirty)
+    }
+
+    /// Copy `file` into the project's `media/` and stand it on the timeline.
+    ///
+    /// The one road audio takes into a project — the import button today,
+    /// the drop-on-a-lane in the view's phase — and the copy is what keeps
+    /// the directory self-contained.
+    pub fn import_audio_file(&mut self, file: &std::path::Path) -> Result<(), String> {
+        let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) else {
+            return Err("no project is open".to_owned());
+        };
+        let Some(rel) = copy_into_media(&doc, file) else {
+            return Err(format!(
+                "could not copy {} into the project",
+                file.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
+            ));
+        };
+        self.arrangement.add_clip(clip_at(&rel, 0, 0.0));
+        self.arrangement.save_to(&doc);
+        self.clips_dirty = true;
+        Ok(())
+    }
+
+    /// Empty the timeline — the × in the band's corner. The copies in
+    /// `media/` stay: a project keeps its material, the timeline merely
+    /// stops standing on it.
+    pub fn clear_arrangement(&mut self) {
+        if self.arrangement.clips.is_empty() {
+            return;
+        }
+        self.arrangement.clips.clear();
+        if let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) {
+            self.arrangement.save_to(&doc);
+        }
+        self.clips_dirty = true;
+    }
+
+    /// The host met the clip's file and knows its length — write it down,
+    /// so the scrubber can draw without a decode next time. Deliberately
+    /// does NOT mark the clips dirty: this annotates the schedule the host
+    /// is already holding, and marking would reload for ever.
+    pub fn note_clip_len(&mut self, id: u64, len_s: f64) {
+        let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
+            return;
+        };
+        if clip.len_s != 0.0 || !(len_s > 0.0) {
+            return;
+        }
+        clip.len_s = len_s;
+        if let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) {
+            self.arrangement.save_to(&doc);
+        }
+    }
+
+    /// A fresh, empty project beside the others, opened immediately.
+    pub fn new_project(&mut self) {
+        let root = self.record_root().join("Projects");
+        let dir = unique_dir(&root, "Untitled");
+        let doc = dir.join("project.tangent");
+        let _ = std::fs::create_dir_all(dir.join("media"));
+        let arr = crate::arrangement::Arrangement::default();
+        arr.save_to(&doc);
+        self.open_project(&doc);
+    }
+
+    /// Open a document and make it the remembered project.
+    pub fn open_project(&mut self, doc: &std::path::Path) {
+        self.arrangement = crate::arrangement::Arrangement::load_from(doc);
+        self.project_doc = doc.to_path_buf();
+        self.settings.project_path = doc.to_string_lossy().into_owned();
+        self.save_settings();
+        self.clips_dirty = true;
+    }
+
+    /// Copy the WHOLE project — document and `media/` — to `target` and
+    /// open the copy. `target` is what the save panel answered; with or
+    /// without the `.tangent` the panel's filter appended, it names the new
+    /// project DIRECTORY.
+    pub fn save_project_as(&mut self, target: &std::path::Path) {
+        let dir = if target.extension().is_some_and(|e| e == "tangent") {
+            target.with_extension("")
+        } else {
+            target.to_path_buf()
+        };
+        let Some(src_dir) = self.project_doc().and_then(std::path::Path::parent) else {
+            return;
+        };
+        let src_dir = src_dir.to_path_buf();
+        if std::fs::create_dir_all(dir.join("media")).is_err() {
+            return;
+        }
+        // The media copies first, the document last — a copy interrupted
+        // halfway is a directory that opens with silent lanes, not a
+        // document pointing at files that never arrived.
+        if let Ok(entries) = std::fs::read_dir(src_dir.join("media")) {
+            for entry in entries.flatten() {
+                let from = entry.path();
+                if from.is_file() {
+                    let _ = std::fs::copy(&from, dir.join("media").join(entry.file_name()));
+                }
+            }
+        }
+        let doc = dir.join("project.tangent");
+        self.arrangement.save_to(&doc);
+        self.project_doc = doc.clone();
+        self.settings.project_path = doc.to_string_lossy().into_owned();
+        self.save_settings();
+        // The engine's schedule is unchanged — same clips, new home — but
+        // the paths the host resolves against moved with the document.
+        self.clips_dirty = true;
+    }
+
+    /// The save panel the app is waiting on, if any. Same drain-once pattern
+    /// as the file request; a plugin refuses by never draining.
+    pub fn take_save_request(&mut self) -> Option<crate::ports::SaveRequest> {
+        self.save_request.take()
+    }
+
+    /// The host's answer to a save panel.
+    pub fn finish_save_choice(&mut self, purpose: crate::ports::SavePurpose, path: &std::path::Path) {
+        self.native_panel_up = false;
+        match purpose {
+            crate::ports::SavePurpose::ProjectCopy => self.save_project_as(path),
+        }
+    }
+
     /// The backing track's level, for the host to push at the engine.
     pub fn track_playback(&self) -> f32 {
         self.settings.track_gain as f32
@@ -3851,9 +4166,14 @@ impl IvoryApp {
             // pressed mid-audition it stops and the playhead goes home to
             // 0:00, which is `Transport::toggle_play`'s half of the rule.
             Hit::Play => self.request_recorder(R::Play),
-            // The × in the timeline's corner: unload the file. The strip
-            // that used to carry this retired at v13.
-            Hit::ClearTrack => self.request_recorder(R::ClearTrack),
+            // The × in the timeline's corner: empty the timeline. The
+            // document is the app's own now — the edit happens here — and
+            // Stop sends the playhead home rather than leaving it ticking
+            // over an empty song.
+            Hit::ClearTrack => {
+                self.clear_arrangement();
+                self.request_recorder(R::Stop);
+            }
             Hit::Stop => self.request_recorder(R::Stop),
             Hit::DismissClip => self.request_recorder(R::DismissClip),
             // Opens the menu, led by the Recorder's own categories, at the
@@ -4852,6 +5172,35 @@ impl IvoryApp {
 
     fn apply_menu_action(&mut self, ctx: &egui::Context, action: MenuAction) {
         match action {
+            // ── the project ────────────────────────────────────────────────
+            MenuAction::NewProject => self.new_project(),
+            MenuAction::OpenProject => {
+                self.native_panel_up = true;
+                self.file_request = Some(crate::ports::FileRequest {
+                    start_at: self
+                        .project_doc()
+                        .and_then(std::path::Path::parent)
+                        .and_then(std::path::Path::parent)
+                        .map(std::path::Path::to_path_buf),
+                    title: "Open a project".to_owned(),
+                    extensions: vec!["tangent".to_owned()],
+                    extension_label: "Tangent project".to_owned(),
+                    purpose: crate::ports::FilePurpose::Project,
+                });
+            }
+            MenuAction::DuplicateProject => {
+                self.native_panel_up = true;
+                let name = self.project_name();
+                self.save_request = Some(crate::ports::SaveRequest {
+                    title: "Duplicate this project".to_owned(),
+                    suggested: if name.is_empty() {
+                        "Untitled".to_owned()
+                    } else {
+                        format!("{name} copy")
+                    },
+                    purpose: crate::ports::SavePurpose::ProjectCopy,
+                });
+            }
             MenuAction::SetSizePercent(p) => {
                 self.settings.window_size_percent = p;
                 self.save_settings();
@@ -8399,6 +8748,142 @@ mod tests {
             !app.take_open_insert_on_load(1, 2),
             "an unload has no window to show"
         );
+    }
+
+    /// A scratch directory of this test's own, cleaned before and after.
+    fn project_scratch(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-projtest-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("a temp dir");
+        root
+    }
+
+    /// **The first launch of the project era founds a project and carries
+    /// the backing file in** — copied under `media/`, standing at 0:00 —
+    /// and the next launch reopens the SAME project rather than founding
+    /// another. The owner's ruling: the arrangement you had open is the one
+    /// you get back.
+    #[test]
+    fn the_first_launch_founds_a_project_and_carries_the_backing_in() {
+        use crate::arrangement::Arrangement;
+        let root = project_scratch("found");
+        let backing = root.join("Blue Bossa - backing.mp3");
+        std::fs::write(&backing, b"not really audio").expect("write");
+
+        let mut settings = Settings::default();
+        settings.track_path = backing.to_string_lossy().into_owned();
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, settings);
+        app.bootstrap_project(&root.join("Projects"));
+
+        let doc = app.project_doc().expect("a project exists").to_path_buf();
+        assert!(doc.ends_with("project.tangent"), "{doc:?}");
+        assert!(doc.starts_with(root.join("Projects")), "{doc:?}");
+        assert_eq!(app.project_name(), "Untitled");
+        assert_eq!(app.arrangement().clips.len(), 1, "the backing did not board");
+        let clip = app.arrangement().clips[0].clone();
+        assert_eq!(clip.path, "media/Blue Bossa - backing.mp3");
+        assert!((clip.start_s - 0.0).abs() < 1e-9);
+        assert!(
+            Arrangement::resolve(&doc, &clip.path).is_file(),
+            "the media copy did not land"
+        );
+        assert!(
+            app.settings.track_path.is_empty(),
+            "track_path survived; the document owns the file now"
+        );
+        assert_eq!(app.settings.project_path, doc.to_string_lossy());
+        assert!(app.take_clips_dirty(), "the host was not told to reload");
+        assert!(!app.take_clips_dirty(), "dirty answers once");
+
+        // The next launch: same project, not a second Untitled.
+        let mut again = Settings::default();
+        again.project_path = doc.to_string_lossy().into_owned();
+        let (_c2, mut app2) = headless_with(Caps::DESKTOP, again);
+        app2.bootstrap_project(&root.join("Projects"));
+        assert_eq!(app2.project_doc(), Some(doc.as_path()));
+        assert_eq!(app2.arrangement().clips.len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Import copies into `media/` — once per file — and the × empties the
+    /// timeline without taking the material.** A project keeps what it was
+    /// handed; the timeline merely stops standing on it.
+    #[test]
+    fn import_copies_into_media_and_the_x_empties_the_timeline() {
+        use crate::arrangement::Arrangement;
+        use crate::recorder_panel::Hit;
+        let root = project_scratch("import");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        let doc = app.project_doc().expect("a project").to_path_buf();
+        let _ = app.take_clips_dirty();
+
+        let file = root.join("solo.wav");
+        std::fs::write(&file, b"pcm, allegedly").expect("write");
+        app.import_audio_file(&file).expect("import");
+        assert_eq!(app.arrangement().clips.len(), 1);
+        assert_eq!(app.arrangement().clips[0].path, "media/solo.wav");
+        assert!(app.take_clips_dirty());
+
+        // The same file imported again is one COPY, not "solo 2.wav".
+        app.import_audio_file(&file).expect("import");
+        let media: Vec<_> = std::fs::read_dir(doc.parent().unwrap().join("media"))
+            .expect("media dir")
+            .flatten()
+            .collect();
+        assert_eq!(media.len(), 1, "the same file was copied twice");
+        assert_eq!(app.arrangement().clips.len(), 2);
+
+        // The ×: timeline empty, document saved that way, material kept.
+        app.apply_recorder_hit(Hit::ClearTrack);
+        assert!(app.arrangement().clips.is_empty());
+        assert!(
+            Arrangement::load_from(&doc).clips.is_empty(),
+            "the cleared timeline was not saved"
+        );
+        assert!(
+            doc.parent().unwrap().join("media/solo.wav").is_file(),
+            "clearing the timeline deleted the material"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Duplicate copies the WHOLE directory and works there; New founds a
+    /// numbered sibling.** "Save As" for a document that autosaves.
+    #[test]
+    fn duplicate_copies_everything_and_new_founds_a_sibling() {
+        let root = project_scratch("dup");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.set_record_dir(root.clone());
+        app.bootstrap_project(&root.join("Projects"));
+        let file = root.join("solo.wav");
+        std::fs::write(&file, b"pcm, allegedly").expect("write");
+        app.import_audio_file(&file).expect("import");
+
+        // The save panel answered with a name (the filter's extension rides
+        // along and is stripped).
+        app.finish_save_choice(
+            crate::ports::SavePurpose::ProjectCopy,
+            &root.join("Projects").join("Nocturne.tangent"),
+        );
+        assert_eq!(app.project_name(), "Nocturne");
+        let doc = app.project_doc().expect("the copy is open").to_path_buf();
+        assert!(doc.starts_with(root.join("Projects").join("Nocturne")));
+        assert!(
+            doc.parent().unwrap().join("media/solo.wav").is_file(),
+            "the media did not travel with the copy"
+        );
+        assert_eq!(app.arrangement().clips.len(), 1);
+
+        // New: a fresh, empty, numbered sibling, opened immediately.
+        app.new_project();
+        assert!(app.project_name().starts_with("Untitled"));
+        assert_ne!(app.project_name(), "Nocturne");
+        assert!(app.arrangement().clips.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// **Arm is the live switch, and a session opens with one arm up: the
