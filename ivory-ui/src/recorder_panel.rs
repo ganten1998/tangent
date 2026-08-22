@@ -519,10 +519,34 @@ impl Layout {
             Pos2::new(whole_status.right() - close_w, whole_status.top()),
             whole_status.max,
         );
-        let status = Rect::from_min_max(
+        let mut status = Rect::from_min_max(
             whole_status.min,
             Pos2::new(status_close.left() - 4.0, whole_status.bottom()),
         );
+        // **The heart lives in the status row now, beside the ×.** It used to
+        // claim a strip along the bottom of the whole middle group, and every
+        // column — the meters, the dials, the master — stopped a heart's
+        // height above the band's edge for a credit fourteen points wide. The
+        // status row is one line that is usually empty; the credit fits inside
+        // it and the columns get the strip back. The text's rect gives up the
+        // width so a long warning can never run under it.
+        let heart = {
+            let h = (status_h * 0.85).max(6.0);
+            let w = h * crate::chord_strip::HEART_ASPECT;
+            if w > whole_status.width() * 0.1 || !status.is_positive() {
+                Rect::NOTHING
+            } else {
+                let r = Rect::from_min_size(
+                    Pos2::new(status.right() - w, whole_status.center().y - h * 0.5),
+                    Vec2::new(w, h),
+                );
+                status = Rect::from_min_max(
+                    status.min,
+                    Pos2::new(r.left() - 4.0, status.bottom()),
+                );
+                r
+            }
+        };
         let body = Rect::from_min_max(
             rest.min,
             Pos2::new(rest.right(), status.top() - gap * 0.5),
@@ -541,6 +565,7 @@ impl Layout {
             // watching levels is already looking.
             status,
             status_close,
+            heart,
             ..Self::empty(rolling)
         };
 
@@ -550,39 +575,6 @@ impl Layout {
             l.fill_idle(body, gap, view);
         }
         l
-    }
-
-    /// Sit the heart at the bottom-right, inside the band's own margin.
-    ///
-    /// Sized off the strip it was given rather than off the band, so it stays
-    /// the same weight relative to the chrome around it at every window size,
-    /// and pushed hard into the corner: it is a credit, not a control, and it
-    /// earns its place by staying out of the way.
-    fn fill_heart(&mut self, body: Rect) {
-        let h = (Self::heart_h(body) * 0.85).max(6.0);
-        let w = h * crate::chord_strip::HEART_ASPECT;
-        self.heart = Rect::from_min_size(
-            Pos2::new(body.right() - w, body.bottom() - h),
-            Vec2::new(w, h),
-        );
-        // A band too narrow for even that is one where the heart would be a
-        // smudge over the master knob, so it is simply not placed.
-        if w > body.width() * 0.1 {
-            self.heart = Rect::NOTHING;
-        }
-    }
-
-    /// The strip along the bottom of the instrument column that the heart sits
-    /// in. Taken off the slots rather than overlaid on them, because the slots
-    /// are a list that grows and anything drawn on top of a list is something
-    /// the list will eventually reach.
-    fn heart_h(body: Rect) -> f32 {
-        // **Capped lower than it was.** The strip is a credit at the foot of
-        // the instrument column, and at 24 points it stopped the fifth slot a
-        // row's height above every other section's bottom edge. The heart is
-        // drawn at 85% of it and is a picture of a heart; it does not need a
-        // slot's worth of column.
-        (body.height() * 0.13).clamp(9.0, 17.0)
     }
 
     /// Idle: preview, transport, destination, monitor.
@@ -613,7 +605,6 @@ impl Layout {
         // fighting over the same points and both lost.
 
         let _ = view;
-        self.fill_heart(body);
 
         // One source for the middle, shared with the rolling layout and with
         // `fill_faders`, so the timeline cannot drift from the meters beside
@@ -645,12 +636,12 @@ impl Layout {
     fn middle_of(body: Rect, _gap: f32) -> Rect {
         // **There is no instrument column any more.** The desk's insert bays
         // are the instrument rack now, so the third of the band the slot
-        // selector was using is width the timeline and the meters have. All
-        // that stays out of the middle is the heart's strip along the bottom.
-        Rect::from_min_max(
-            body.min,
-            Pos2::new(body.right(), body.bottom() - Self::heart_h(body)),
-        )
+        // selector was using is width the timeline and the meters have. And
+        // nothing is held back at the bottom either: the heart's strip used
+        // to be carved off here, which stopped every column — the meters, the
+        // dials, the MASTER — a credit's height above the band's edge. The
+        // credit lives in the status row now and the columns run to the foot.
+        body
     }
 
 
@@ -912,7 +903,6 @@ impl Layout {
         // will carry now, so the moment a take starts is the moment it matters
         // most — and the band does not rearrange itself under the eye either
         // way.
-        self.fill_heart(body);
 
         // **The at-rest middle, not the one the narrower preview leaves.** The
         // preview collapses when a take starts; the transport group may not
