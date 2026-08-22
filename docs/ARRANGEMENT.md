@@ -154,6 +154,26 @@ channels play back their clips and nothing else. "Ready to play" and
   deferred: the lanes-and-viewport look of the scrubber arrives WITH the
   arrangement view (there is no viewport to steer until the view exists),
   and MIDI clip schedules arrive when something can create MIDI clips.
+- **Phase 3 SHIPPED (4.45.0)**: the VIEW. `arrangement_panel.rs` — lanes,
+  REAPER-style headers (number, arm, name, knob, meter, M/S, delegating to
+  the mixer's own hits), bars ruler, clips with waves, fades and selection;
+  Tab cycles piano / mixer / arrangement. All five clip operations with the
+  owner's gestures (mouse move/trim, corner-drag fades, Delete, S — which
+  the arrangement owns while open; the supporter card keeps it elsewhere).
+  Zoom three ways (wheel pan, Cmd/Ctrl-wheel and ruler-drag zoom), file
+  drag-drop onto lanes (the MIDI-lane refusal lives in `import_audio_at`),
+  and the band scrubber became the Ableton overview: lane blocks, lit/dim
+  playhead, and a viewport rectangle that pans the arrangement when picked
+  up. The engine plays clips PER LANE — fader, mute, solo, send, peaks —
+  with the rack unification still owed (one rack must run once per block
+  for live input AND clips). AMENDED against the draft: a drop does NOT
+  flip an empty lane to AUDIO — audio-kind lanes bind interface picks by
+  ordinal, and the flip would have silently re-bound real inputs (the
+  owner's second Scarlett input among them). A lane with clips and no kind
+  is a CLIP lane: used, waveform icon, no live source. Explicit per-channel
+  input binding is the follow-up that would make the flip safe.
+- Deferred within phase 3: cross-lane clip drag (a clip stays on its lane),
+  viewport edge-stretch zoom, grid snapping, lane rename in the header.
 
 ## Order of work
 
