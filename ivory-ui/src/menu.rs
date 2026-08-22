@@ -93,6 +93,13 @@ pub enum MenuAction {
     SetStaffKey(i32),
     /// Letter names inside the noteheads.
     ToggleNoteNames,
+    /// A fresh, empty project beside the others, opened immediately.
+    NewProject,
+    /// Raise the picker for a `project.tangent` to open.
+    OpenProject,
+    /// Copy the whole project — document and media — somewhere, and open
+    /// the copy. What Save As means for a document that autosaves.
+    DuplicateProject,
     /// Look for VST3 bundles again, now.
     RescanPlugins,
     /// Add another folder to the list of places that are looked in.
@@ -1072,6 +1079,23 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
     // answer is a rescan, another folder, or starting over — so it stays a
     // menu, and it stays with the band whose slots it fills.
     let mut band: Vec<Entry> = Vec::new();
+    // **The PROJECT, above the plugin folders.** The app grew documents:
+    // self-contained directories a song lives in (docs/ARRANGEMENT.md), and
+    // a document must be creatable, openable and duplicable from the one
+    // menu the app has. "Duplicate As" rather than "Save As" because the
+    // document autosaves on every edit — the only thing left for Save As to
+    // mean is "copy everything, media included, and work there".
+    if view.caps.capture_devices && view.recorder_on {
+        push_category(
+            &mut band,
+            "Project",
+            vec![
+                row("New Project", MenuAction::NewProject),
+                row("Open Project...", MenuAction::OpenProject),
+                row("Duplicate Project As...", MenuAction::DuplicateProject),
+            ],
+        );
+    }
     if view.caps.capture_devices && view.recorder_on {
         let mut plugins = vec![
             row("Rescan for Plugins", MenuAction::RescanPlugins),
@@ -1202,7 +1226,7 @@ fn move_recorder_to_the_front(e: &mut Vec<Entry>) {
     // and Count-in all left the menu — show/hide is `V` and the rest are behind
     // the cog — so the band's business up here is the one category that could
     // not become either: where its instruments are found.
-    const OURS: [&str; 1] = ["Plugin folders"];
+    const OURS: [&str; 2] = ["Project", "Plugin folders"];
     let mut moved: Vec<Entry> = Vec::new();
     // Kept in the order OURS lists, which is the order they already appear in —
     // so this is a move, not a re-sort, and adding a fifth category to the
@@ -2337,8 +2361,12 @@ mod tests {
         // Raise this only for a reason that can be written down in the same
         // breath. Nine rows left in one release and none of them was missed;
         // the next nine will be added one reasonable row at a time.
+        //
+        // 19: the app grew DOCUMENTS — self-contained project directories a
+        // song lives in — and a document must be creatable, openable and
+        // duplicable from the one menu the app has. One subject row.
         assert!(
-            count(fullest()) <= 18,
+            count(fullest()) <= 19,
             "the fullest menu is back to {} top-level rows",
             count(fullest())
         );
@@ -2742,10 +2770,18 @@ mod tests {
             recorder_first: true,
             ..view()
         };
+        // The PROJECT leads — the document the whole surface works in —
+        // then where the instruments are found.
         assert_eq!(
             category_names(v.clone()).first().map(String::as_str),
+            Some("Project"),
+            "the band's categories do not lead: {:?}",
+            category_names(v.clone())
+        );
+        assert_eq!(
+            category_names(v.clone()).get(1).map(String::as_str),
             Some("Plugin folders"),
-            "the band's category does not lead: {:?}",
+            "the band's categories do not lead: {:?}",
             category_names(v.clone())
         );
 

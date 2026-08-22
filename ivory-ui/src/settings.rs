@@ -883,6 +883,11 @@ pub struct Settings {
     /// megabytes of decoded track would be a settings file nobody could sync,
     /// and the file on disk is the thing the user thinks they chose.
     pub track_path: String,
+    /// The open PROJECT's document (`…/project.tangent`). Empty until the
+    /// host bootstraps the first one; the app reopens it at every launch —
+    /// with every record arm off but the default instrument's, which is the
+    /// arm rule, not this field's. See docs/ARRANGEMENT.md.
+    pub project_path: String,
     /// Transpose, in semitones, applied to every note the display and the
     /// chord detector see.
     ///
@@ -1121,6 +1126,7 @@ impl Default for Settings {
             strip_soloed: 0,
             show_take_summary: true,
             track_path: String::new(),
+            project_path: String::new(),
             transpose: 0,
             show_transpose: true,
             metronome_on: false,
@@ -1827,6 +1833,9 @@ impl Settings {
         take_gain(&mut map, "track_gain", &mut s.track_gain);
         take_gain(&mut map, "fx_return_gain", &mut s.fx_return_gain);
         take_bool(&mut map, "guitar_intervals", &mut s.guitar_intervals);
+        if let Some(Value::String(path)) = map.shift_remove("project_path") {
+            s.project_path = path;
+        }
         if let Some(Value::String(path)) = map.shift_remove("track_path") {
             s.track_path = path;
         }
@@ -2411,6 +2420,10 @@ impl Settings {
         );
         map.insert("dx7_patch".into(), Value::Number(self.dx7_patch.into()));
         map.insert("track_path".into(), Value::String(self.track_path.clone()));
+        map.insert(
+            "project_path".into(),
+            Value::String(self.project_path.clone()),
+        );
         for (key, gain) in [
             ("metronome_gain", self.metronome_gain),
             ("master_gain", self.master_gain),

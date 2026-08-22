@@ -293,6 +293,9 @@ pub struct DesktopApp {
     deferred_file: Option<ivory_ui::ports::FileRequest>,
     #[cfg(feature = "recorder")]
     deferred_dir: Option<ivory_ui::ports::DirRequest>,
+    /// A save panel waiting for the window to leave fullscreen first.
+    #[cfg(feature = "recorder")]
+    deferred_save: Option<ivory_ui::ports::SaveRequest>,
     /// The take report already shown, so it is raised once rather than every
     /// frame until the next take.
     #[cfg(feature = "recorder")]
@@ -301,10 +304,12 @@ pub struct DesktopApp {
     /// into is listed the same way the first one was.
     #[cfg(feature = "recorder")]
     browse_extensions: Vec<String>,
-    /// The decoded backing track, kept so the engine's `Arc` has an owner here
-    /// and the file is not decoded again on every settings push.
+    /// The document's decoded audio, by resolved path — so an edit does not
+    /// re-decode a hundred megabytes, and the engine's `Arc`s have an owner
+    /// here. Cleared when the engine restarts: the cache is keyed to one
+    /// sample rate. Entries no clip references leave with the edit.
     #[cfg(feature = "recorder")]
-    track: Option<Arc<ivory_record::decode::Clip>>,
+    track_cache: std::collections::HashMap<std::path::PathBuf, Arc<ivory_record::decode::Clip>>,
 }
 
 /// How many columns the backing track's waveform is drawn from.
@@ -1317,6 +1322,8 @@ impl DesktopApp {
             self.restore_fullscreen(ctx);
         }
         self.take_cartridge_request(ctx, frame);
+        #[cfg(feature = "recorder")]
+        self.take_save_panel(ctx, frame);
         // Scanning reads directories, so it belongs out here with the other
         // things the UI is not allowed to do — and it runs AFTER the folder
         // picker above, so a folder added this frame is in the list this frame
@@ -1399,6 +1406,13 @@ impl DesktopApp {
                     }
                 }
             }
+        }
+
+        // **The document's clips, whenever an edit touched them.** The app
+        // marks; this decodes, pushes the engine's schedule, and rebuilds
+        // the band's picture — after the frame, like every other slow thing.
+        if self.app.take_clips_dirty() {
+            self.reload_clips();
         }
 
         // **The shipped bank, put back.** The same call a first launch makes,
@@ -1493,20 +1507,6 @@ impl DesktopApp {
                 }
                 R::Locate(seconds) => {
                     self.recorder.transport.locate(seconds);
-                }
-                // The × on the BACKING strip. Everything about the file goes:
-                // the engine's copy, the decoded samples, the waveform, and
-                // the remembered path — or next launch would quietly load the
-                // track somebody just removed. The transport goes home too: a
-                // playhead at 2:31 of nothing is not a position.
-                R::ClearTrack => {
-                    if let Some(e) = self.recorder.engine.as_mut() {
-                        e.set_track(None);
-                    }
-                    self.track = None;
-                    self.app.set_track_info(ivory_ui::ports::TrackInfo::default());
-                    self.app.set_track_path(String::new());
-                    self.recorder.transport.stop();
                 }
                 R::Toggle => {
                     // **Whatever the last take had to say, it is not about
@@ -1885,23 +1885,56 @@ impl DesktopApp {
         self.finish_file_choice(purpose, &file);
     }
 
+    /// Raise the SAVE panel the app asked for, and answer it.
+    ///
+    /// The same nested-run-loop rule as the pickers: never inside an egui
+    /// frame. The fullscreen dance is the pickers' too — see
+    /// `picker_needs_windowed`.
+    #[cfg(feature = "recorder")]
+    fn take_save_panel(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        let Some(request) = self
+            .app
+            .take_save_request()
+            .or_else(|| self.deferred_save.take())
+        else {
+            return;
+        };
+        if Self::picker_needs_windowed(ctx) {
+            self.deferred_save = Some(request);
+            self.refullscreen = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            return;
+        }
+        if !Self::native_dialogs_work() {
+            // No portal, no zenity: the in-app browser only picks files that
+            // EXIST, and a save panel that silently never appears is worse
+            // than the row doing nothing. Duplicate-project on such a rig
+            // waits for the browser to learn to save.
+            self.app.native_panel_closed();
+            return;
+        }
+        let mut dialog = rfd::FileDialog::new()
+            .set_title(&request.title)
+            .set_file_name(&request.suggested);
+        dialog = dialog.set_parent(frame);
+        let file = dialog.save_file();
+        self.app.native_panel_closed();
+        self.restore_fullscreen(ctx);
+        let Some(file) = file else { return };
+        self.app.finish_save_choice(request.purpose, &file);
+    }
+
     /// Reload last session's backing track, if the file is still there.
     ///
-    /// **Quietly when it is not.** A file that has been moved or is on a drive
-    /// that is not plugged in is the ordinary case for a path remembered
-    /// across launches; an error dialog on startup about a backing track
-    /// nobody has asked for yet is not.
+    /// The project system's road in: reopen the remembered project, or make
+    /// the first one — which is also where a v12 backing file becomes the
+    /// document's first clip. The app owns all of that; this call is here
+    /// because a TEST constructing an app must not create directories in
+    /// anybody's real music folder, so only the host bootstraps.
     #[cfg(feature = "recorder")]
-    fn load_track_at_launch(&mut self) {
-        let path = self.app.track_settings();
-        if path.is_empty() {
-            return;
-        }
-        let path = std::path::PathBuf::from(path);
-        if !path.is_file() {
-            return;
-        }
-        self.load_track(&path);
+    fn open_project_at_launch(&mut self) {
+        let root = self.app.record_root().join("Projects");
+        self.app.bootstrap_project(&root);
     }
 
     /// What to do with a chosen folder, whichever picker chose it.
@@ -1921,7 +1954,19 @@ impl DesktopApp {
         file: &std::path::Path,
     ) {
         if purpose == ivory_ui::ports::FilePurpose::BackingTrack {
-            self.load_track(file);
+            // Into the PROJECT: copied under media/, stood on the timeline.
+            // The document edit marks the clips dirty and the reload below
+            // this frame decodes and pushes the schedule.
+            if let Err(error) = self.app.import_audio_file(file) {
+                self.app.set_track_info(ivory_ui::ports::TrackInfo {
+                    error,
+                    ..Default::default()
+                });
+            }
+            return;
+        }
+        if purpose == ivory_ui::ports::FilePurpose::Project {
+            self.app.open_project(file);
             return;
         }
         match crate::dx7::Cartridge::load(file) {
@@ -2162,77 +2207,95 @@ impl DesktopApp {
         (out, String::new())
     }
 
-    /// Decode an audio file and hand it to the engine.
+    /// The document's clips, decoded and handed to the engine.
     ///
-    /// **Decoded once, here, and held as one `Arc`.** The renderer must never
-    /// allocate, and a hundred megabytes of `Vec<f32>` is the largest thing
-    /// this app ever holds — so it is built on this thread, handed over behind
-    /// a pointer, and the old one is dropped here when the new one lands.
-    #[cfg(feature = "recorder")]
-    fn load_track(&mut self, file: &std::path::Path) {
-        let rate = self
-            .recorder
-            .engine
-            .as_ref()
-            .map_or(48_000, |e| e.output().sample_rate);
-        match ivory_record::decode::decode(file, rate) {
-            Ok(clip) => {
-                let clip = Arc::new(clip);
-                self.app.set_track_info(ivory_ui::ports::TrackInfo {
-                    name: clip.label(),
-                    seconds: clip.seconds(),
-                    wave: clip.envelope(TRACK_WAVE_BUCKETS),
-                    error: String::new(),
-                });
-                self.app
-                    .set_track_path(file.to_string_lossy().into_owned());
-                if let Some(e) = self.recorder.engine.as_mut() {
-                    e.set_track(Some(crate::instrument::Placed {
-                        clip: Arc::clone(&clip),
-                        start: 0,
-                    }));
-                }
-                self.track = Some(clip);
-            }
-            // The name is kept out of the info on purpose: a row that says a
-            // file name next to an error reads as "this is loaded but broken",
-            // and nothing is loaded.
-            Err(error) => {
-                self.app.set_track_info(ivory_ui::ports::TrackInfo {
-                    error,
-                    ..Default::default()
-                });
-            }
-        }
-    }
-
-    /// Hand the decoded backing track to the engine that exists NOW.
+    /// **Decoded once per file, here, and held as one `Arc` each.** The
+    /// renderer must never allocate, and the decoded audio is the largest
+    /// thing this app ever holds — so it is built on this thread, cached by
+    /// path so an edit does not re-decode a hundred megabytes, and pushed
+    /// behind pointers. The cache is cleared when the engine restarts: a new
+    /// device may run at a new rate, and the cache is keyed to exactly one.
     ///
-    /// A fresh engine starts with no track whatever the last one held, and the
-    /// launch-time decode ran before any engine existed at all. The clip is
-    /// decoded at a fixed rate; an engine running at a different one gets a
-    /// re-decode from the remembered path rather than samples at the wrong
-    /// pitch.
+    /// The band's picture is synthesized here too: the first clip's wave and
+    /// name, the SPAN as the length — with one clip, exactly the backing
+    /// track's old face; the lanes come with the arrangement view's phase.
     #[cfg(feature = "recorder")]
-    fn push_track_to_engine(&mut self) {
-        let Some(clip) = self.track.clone() else {
+    fn reload_clips(&mut self) {
+        let Some(doc_path) = self.app.project_doc().map(std::path::Path::to_path_buf) else {
             return;
         };
         let rate = self
             .recorder
             .engine
             .as_ref()
-            .map(|e| e.output().sample_rate);
-        if rate == Some(clip.rate) {
-            if let Some(e) = self.recorder.engine.as_mut() {
-                e.set_track(Some(crate::instrument::Placed { clip, start: 0 }));
+            .map_or(48_000, |e| e.output().sample_rate);
+        let doc = self.app.arrangement().clone();
+        let mut placed = Vec::new();
+        let mut info: Option<ivory_ui::ports::TrackInfo> = None;
+        let mut span = 0.0f64;
+        let mut error = String::new();
+        let mut fill_len: Vec<(u64, f64)> = Vec::new();
+        for clip in &doc.clips {
+            let path = ivory_ui::arrangement::Arrangement::resolve(&doc_path, &clip.path);
+            let decoded = match self.track_cache.get(&path) {
+                Some(c) => Arc::clone(c),
+                None => match ivory_record::decode::decode(&path, rate) {
+                    Ok(c) => {
+                        let c = Arc::new(c);
+                        self.track_cache.insert(path.clone(), Arc::clone(&c));
+                        c
+                    }
+                    Err(e) => {
+                        // The name is kept out of the info on purpose: a row
+                        // that says a file name next to an error reads as
+                        // "loaded but broken", and nothing is loaded.
+                        error = e;
+                        continue;
+                    }
+                },
+            };
+            let file_s = decoded.seconds();
+            if clip.len_s == 0.0 {
+                fill_len.push((clip.id, (file_s - clip.offset_s).max(0.0)));
             }
-            return;
+            let len_s = clip.play_len_s(file_s);
+            span = span.max(clip.start_s + len_s);
+            let frames = |s: f64| (s.max(0.0) * f64::from(rate)).round() as u64;
+            placed.push(crate::instrument::Placed {
+                clip: Arc::clone(&decoded),
+                start: frames(clip.start_s),
+                offset: frames(clip.offset_s),
+                len: frames(len_s),
+                fade_in: frames(clip.fade_in_s),
+                fade_out: frames(clip.fade_out_s),
+            });
+            if info.is_none() {
+                info = Some(ivory_ui::ports::TrackInfo {
+                    name: clip.name.clone(),
+                    seconds: 0.0,
+                    wave: decoded.envelope(TRACK_WAVE_BUCKETS),
+                    error: String::new(),
+                });
+            }
         }
-        let path = self.app.track_settings();
-        if !path.is_empty() {
-            self.load_track(std::path::Path::new(&path));
+        // Lengths the decode just established, written down so the scrubber
+        // can draw next launch without one. Never marks the clips dirty.
+        for (id, len_s) in fill_len {
+            self.app.note_clip_len(id, len_s);
         }
+        // Files no clip references any more leave the cache with the edit.
+        self.track_cache.retain(|path, _| {
+            doc.clips.iter().any(|c| {
+                ivory_ui::arrangement::Arrangement::resolve(&doc_path, &c.path) == *path
+            })
+        });
+        if let Some(e) = self.recorder.engine.as_mut() {
+            e.set_clips(placed);
+        }
+        let mut info = info.unwrap_or_default();
+        info.seconds = span;
+        info.error = error;
+        self.app.set_track_info(info);
     }
 
     /// Write every loaded bay's plugin state beside the settings.
@@ -2374,14 +2437,12 @@ impl DesktopApp {
                         e.set_builtin_voice(v);
                     }
                 }
-                // **The backing track, now that there is an engine to hold
-                // it.** The launch-time load runs before the band has opened a
-                // device, so `load_track` had no engine to hand the clip to —
-                // and a rebuilt engine starts empty whatever the old one held.
-                // Without this, a track remembered across sessions drew its
-                // waveform on the timeline and played nothing: the one owner
-                // of the samples was `self.track`, and no engine ever saw it.
-                self.push_track_to_engine();
+                // **The document's clips, now that there is an engine to
+                // hold them.** A rebuilt engine starts empty whatever the old
+                // one held, and the decode cache is keyed to one sample rate
+                // — the device that just opened may run another.
+                self.track_cache.clear();
+                self.reload_clips();
             }
             Err(e) => {
                 self.recorder.engine_error = Some(format!("no audio output: {e}"));
@@ -2573,7 +2634,6 @@ impl DesktopApp {
         }
         use ivory_ui::recorder::Strip;
         let desk = self.app.desk();
-        let engine = self.recorder.engine.as_ref();
         let mut lost: Vec<Strip> = Vec::new();
         // Every channel with something ON it, by name: a MIDI channel with an
         // instrument in bay 1, an AUDIO channel whose pick is open. An unused
@@ -2886,11 +2946,13 @@ impl DesktopApp {
             #[cfg(feature = "recorder")]
             deferred_dir: None,
             #[cfg(feature = "recorder")]
+            deferred_save: None,
+            #[cfg(feature = "recorder")]
             reported_take: None,
             #[cfg(feature = "recorder")]
             browse_extensions: Vec::new(),
             #[cfg(feature = "recorder")]
-            track: None,
+            track_cache: std::collections::HashMap::new(),
         };
         // What the effects ship as, so the panel can draw a slider for a
         // parameter nobody has moved. See `ports::EffectDefaults`: the DSP owns
@@ -2904,7 +2966,7 @@ impl DesktopApp {
         // patch, which is what a fresh install plays anyway.
         #[cfg(feature = "recorder")]
         me.load_cartridge_at_launch();
-        me.load_track_at_launch();
+        me.open_project_at_launch();
         // The one-launch sidecar shuffle, BEFORE any engine exists to load a
         // bay: the settings just crossed the v13 desk change and the
         // insert-state files are named by indices that moved.

@@ -1649,6 +1649,21 @@ pub fn hit_test(rect: Rect, view: &RecorderView<'_>, pos: Pos2) -> Option<Hit> {
         .map(|(r, k)| k.hit(r, pos))
 }
 
+/// The seek fraction a pointer at `pos` means, X ONLY.
+///
+/// The scrub: once a press has landed on the timeline, the locate follows
+/// the HAND — Ableton's gesture — and following in X alone is what forgives
+/// the vertical slop a hand dragging sideways always has. Clamped, so a
+/// drag off either end holds at the end rather than letting go. `None` on
+/// the faces where the timeline is not seekable: empty, or mid-take.
+pub fn timeline_fraction(rect: Rect, view: &RecorderView<'_>, pos: Pos2) -> Option<f32> {
+    let l = Layout::new(rect, view);
+    if l.rolling || !l.timeline_loaded || !l.timeline.is_positive() {
+        return None;
+    }
+    Some(((pos.x - l.timeline.left()) / l.timeline.width()).clamp(0.0, 1.0))
+}
+
 /// The next count-in length in the cycle, in beats.
 ///
 /// Here rather than in the app so that the control's label and the effect of
