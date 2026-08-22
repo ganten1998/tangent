@@ -661,6 +661,7 @@ fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
 fn clip_at(rel_path: &str, lane: usize, start_s: f64) -> crate::arrangement::ArrClip {
     crate::arrangement::ArrClip {
         kind: crate::arrangement::ClipKind::Audio,
+        notes: Vec::new(),
         lane,
         path: rel_path.to_owned(),
         start_s,
@@ -2145,6 +2146,7 @@ impl IvoryApp {
         let mut arr = crate::arrangement::Arrangement::default();
         let backing = arr.add_clip(crate::arrangement::ArrClip {
             kind: crate::arrangement::ClipKind::Audio,
+            notes: Vec::new(),
             lane: 3,
             path: "media/Blue Bossa - backing.mp3".to_owned(),
             start_s: 0.0,
@@ -2157,6 +2159,7 @@ impl IvoryApp {
         });
         let take = arr.add_clip(crate::arrangement::ArrClip {
             kind: crate::arrangement::ClipKind::Audio,
+            notes: Vec::new(),
             lane: 2,
             path: "media/take 3.wav".to_owned(),
             start_s: 16.0,
@@ -2169,6 +2172,7 @@ impl IvoryApp {
         });
         let solo = arr.add_clip(crate::arrangement::ArrClip {
             kind: crate::arrangement::ClipKind::Audio,
+            notes: Vec::new(),
             lane: 2,
             path: "media/solo.wav".to_owned(),
             start_s: 48.0,
@@ -2182,6 +2186,7 @@ impl IvoryApp {
         // And a MIDI item drawn by hand, so its face is in the picture.
         arr.add_clip(crate::arrangement::ArrClip {
             kind: crate::arrangement::ClipKind::Midi,
+            notes: Vec::new(),
             lane: 1,
             path: String::new(),
             start_s: 32.0,
@@ -3821,6 +3826,53 @@ impl IvoryApp {
         Ok(())
     }
 
+    /// What arrangement record produced, one entry per armed lane. The host
+    /// already wrote the WAVs into `media/`; this adds the rows, selects the
+    /// last one and saves — one press, one save, however many lanes.
+    pub fn add_recorded_clips(&mut self, recorded: Vec<crate::arrangement::RecordedClip>) {
+        let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) else {
+            return;
+        };
+        let mut added = None;
+        for r in recorded {
+            if r.len_s < 0.05 {
+                continue;
+            }
+            let kind = if r.path.is_some() {
+                crate::arrangement::ClipKind::Audio
+            } else {
+                crate::arrangement::ClipKind::Midi
+            };
+            if kind == crate::arrangement::ClipKind::Midi && r.notes.is_empty() {
+                continue;
+            }
+            let name = r
+                .path
+                .as_deref()
+                .and_then(|p| std::path::Path::new(p).file_stem().map(|n| n.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| "take".to_owned());
+            let id = self.arrangement.add_clip(crate::arrangement::ArrClip {
+                kind,
+                notes: r.notes,
+                lane: r.lane.min(crate::recorder::CHANNELS - 1),
+                path: r.path.unwrap_or_default(),
+                start_s: r.start_s.max(0.0),
+                offset_s: 0.0,
+                len_s: r.len_s,
+                fade_in_s: 0.0,
+                fade_out_s: 0.0,
+                name,
+                id: 0,
+            });
+            added = Some(id);
+        }
+        if let Some(id) = added {
+            self.arr_selected = Some(id);
+            self.arrangement.save_to(&doc);
+            self.clips_dirty = true;
+        }
+    }
+
     /// Empty the timeline — the × in the band's corner. The copies in
     /// `media/` stay: a project keeps its material, the timeline merely
     /// stops standing on it.
@@ -4216,8 +4268,25 @@ impl IvoryApp {
             c.len_s = head;
             c.fade_in_s = c.fade_in_s.min(head);
             c.fade_out_s = 0.0;
+            // A MIDI clip's notes divide at the cut: the tail's move to its
+            // own zero, and a note the blade passes through is clamped to
+            // the head — a note cannot sound across two clips.
+            let tail_notes: Vec<crate::arrangement::ArrNote> = c
+                .notes
+                .iter()
+                .filter(|n| n.at_s >= head)
+                .map(|n| crate::arrangement::ArrNote {
+                    at_s: n.at_s - head,
+                    ..n.clone()
+                })
+                .collect();
+            c.notes.retain(|n| n.at_s < head);
+            for n in &mut c.notes {
+                n.dur_s = n.dur_s.min(head - n.at_s);
+            }
             tails.push(crate::arrangement::ArrClip {
                 kind: c.kind,
+                notes: tail_notes,
                 lane: c.lane,
                 path: c.path.clone(),
                 start_s: t,
@@ -4485,6 +4554,7 @@ impl IvoryApp {
                     }
                     self.arrangement.add_clip(crate::arrangement::ArrClip {
                         kind: crate::arrangement::ClipKind::Midi,
+                        notes: Vec::new(),
                         lane,
                         path: String::new(),
                         start_s: t0,
@@ -5091,6 +5161,7 @@ impl IvoryApp {
         use recorder::RecorderRequest as R;
         match hit {
             Hit::Record => self.request_recorder(R::Toggle),
+            Hit::Capture => self.request_recorder(R::Capture),
             // The audition. The host ignores it while a take is writing;
             // pressed mid-audition it stops and the playhead goes home to
             // 0:00, which is `Transport::toggle_play`'s half of the rule.
@@ -6038,7 +6109,11 @@ impl IvoryApp {
             // Pressing it while a take is ROLLING does nothing, because Space
             // is the key that ends a performance.
             K::StartRecording => {
-                if !self.recorder.state.is_writing() {
+                if self.recorder.state.is_active() && !self.recorder.state.is_writing() {
+                    // The count-in is the CAPTURE's now, so the cancel goes
+                    // to the cassette — Enter during the count still bails.
+                    self.request_recorder(recorder::RecorderRequest::Capture);
+                } else if !self.recorder.state.is_writing() {
                     self.request_recorder(recorder::RecorderRequest::Toggle);
                 }
             }
@@ -9378,6 +9453,60 @@ mod tests {
                 app.voicing_tick(true);
             }
         }
+    }
+
+    /// **One press, one save, both kinds.** What arrangement record hands
+    /// over lands as document rows — the MIDI lanes' notes as a note clip
+    /// each, the audio standing on its file — and the empty and the blink
+    /// are quietly not clips at all. The host reloads off the dirty flag,
+    /// and a fresh read of the doc holds everything: the save happened.
+    #[test]
+    fn recorded_clips_land_in_the_document_and_save() {
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        let dir = std::env::temp_dir().join(format!("tangent-arrec-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        app.project_doc = dir.join("project.tangent");
+        let note = |at_s: f64| crate::arrangement::ArrNote {
+            at_s,
+            dur_s: 0.5,
+            key: 60,
+            vel: 96,
+        };
+        let rec = |lane: usize, len_s: f64, path: Option<&str>, notes: Vec<crate::arrangement::ArrNote>| {
+            crate::arrangement::RecordedClip {
+                lane,
+                start_s: 4.0,
+                len_s,
+                path: path.map(str::to_owned),
+                notes,
+            }
+        };
+        app.add_recorded_clips(vec![
+            rec(0, 8.0, None, vec![note(0.0), note(2.0)]),
+            rec(2, 8.0, Some("media/rec-3-1.wav"), Vec::new()),
+            // Refused: a MIDI record nobody played into, and a blink.
+            rec(1, 8.0, None, Vec::new()),
+            rec(3, 0.01, Some("media/x.wav"), Vec::new()),
+        ]);
+        assert_eq!(app.arrangement.clips.len(), 2);
+        let (midi_kind, midi_lane, midi_notes) = {
+            let c = &app.arrangement.clips[0];
+            (c.kind, c.lane, c.notes.len())
+        };
+        assert_eq!(midi_kind, crate::arrangement::ClipKind::Midi);
+        assert_eq!(midi_lane, 0);
+        assert_eq!(midi_notes, 2);
+        let (audio_kind, audio_path, audio_id) = {
+            let c = &app.arrangement.clips[1];
+            (c.kind, c.path.clone(), c.id)
+        };
+        assert_eq!(audio_kind, crate::arrangement::ClipKind::Audio);
+        assert_eq!(audio_path, "media/rec-3-1.wav");
+        assert_eq!(app.arr_selected, Some(audio_id));
+        assert!(app.take_clips_dirty(), "the host reloads from this flag");
+        let read = crate::arrangement::Arrangement::load_from(&app.project_doc);
+        assert_eq!(read.clips.len(), 2, "the press did not SAVE");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn headless_with(caps: Caps, settings: Settings) -> (egui::Context, IvoryApp) {

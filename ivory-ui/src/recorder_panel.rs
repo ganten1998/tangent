@@ -358,6 +358,8 @@ struct Layout {
     /// only a right-click, because a control nobody can find is a control that
     /// was removed.
     setup: Rect,
+    /// The cassette: capture the whole session, apart from the arrangement.
+    capture: Rect,
     dest: Rect,
     /// The button that shows the folder in the file manager.
     ///
@@ -452,6 +454,7 @@ impl Layout {
             fx: [Rect::NOTHING; Fx::ALL.len()],
             tempo_entry: Rect::NOTHING,
             setup: Rect::NOTHING,
+            capture: Rect::NOTHING,
             dest: Rect::NOTHING,
             reveal: Rect::NOTHING,
                 name: Rect::NOTHING,
@@ -753,12 +756,15 @@ impl Layout {
         });
         let side = from_knob
             .map_or(buttons.height() * TRANSPORT_SIDE, |d| d * TRANSPORT_SIDE)
-            .min(buttons.width() * 0.26);
-        // Four slots now that PLAY exists. Eighths rather than sixths, and
+            // Five slots at a pitch of a fifth of the row: the cap keeps a
+            // gap between neighbours at the narrowest band, where 0.26 (the
+            // four-slot cap) made play and record shake hands.
+            .min(buttons.width() * 0.18);
+        // Five slots now that CAPTURE exists. Tenths rather than eighths, and
         // BOTH layouts use them, so stop stands exactly where it stood when
         // the take starts — the rule this row has always kept.
         let icon = |i: usize| {
-            let cx = buttons.left() + buttons.width() * (i as f32 * 2.0 + 1.0) / 8.0;
+            let cx = buttons.left() + buttons.width() * (i as f32 * 2.0 + 1.0) / 10.0;
             Rect::from_center_size(Pos2::new(cx, line), Vec2::splat(side))
         };
         // The typing box, under the knob and only ever drawn while somebody is
@@ -774,14 +780,17 @@ impl Layout {
             // mean nothing, and a dead control is worse than no control. The
             // steady dot stands where the record button stood, the stop where
             // it always stands. No cog either: none of what it opens can be
-            // changed with an encoder running.
+            // changed with an encoder running. The CASSETTE stays — it is
+            // the control that started this take, and the one that ends it.
             self.dot = icon(1);
             self.stop = icon(2);
+            self.capture = icon(4);
         } else {
             self.play = icon(0);
             self.record = icon(1);
             self.stop = icon(2);
             self.setup = icon(3);
+            self.capture = icon(4);
         }
     }
 
@@ -963,7 +972,7 @@ impl Layout {
     /// [`hit_test`] reads this and so does the test that proves no two of them
     /// overlap, so a control that moves onto another one fails a test rather
     /// than quietly swallowing its clicks.
-    fn targets(&self) -> [(Rect, Produces); 30] {
+    fn targets(&self) -> [(Rect, Produces); 31] {
         use Produces::{Along, AlongV, Fixed};
         // The word over a knob, which is the same thing for a dial.
         // **Nothing when there is no word.** Below a certain height the label
@@ -1021,6 +1030,7 @@ impl Layout {
             (self.play, Fixed(Hit::Play)),
             (self.record, Fixed(Hit::Record)),
             (self.stop, Fixed(Hit::Stop)),
+            (self.capture, Fixed(Hit::Capture)),
             (self.setup, Fixed(Hit::OpenSetup)),
             // The timeline. Loaded, a click is a LOCATE — the fraction along
             // the box, which is the fraction into the file, because the box
@@ -1104,6 +1114,10 @@ pub fn fit_preview(into: Rect, source_px: Vec2) -> Rect {
 /// one, and that is [`Hit::is_same_control`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Hit {
+    /// The cassette: start or stop a CAPTURE of the whole session — the
+    /// take machinery, apart from the arrangement. See
+    /// `RecorderRequest::Capture`.
+    Capture,
     /// Open the menu the take's settings moved into.
     OpenSetup,
     /// The take-settings popup's DONE button. It only ever closes the popup,
@@ -1230,10 +1244,11 @@ impl Hit {
     ///
     /// The four per-slot controls appear once per slot, because "reachable" is
     /// a question about slot 2 that slot 0 cannot answer for it.
-    pub const ALL: [Hit; 27] = [
+    pub const ALL: [Hit; 28] = [
         Hit::Play,
         Hit::Record,
         Hit::Stop,
+        Hit::Capture,
         Hit::OpenSetup,
         Hit::ChooseFolder,
         Hit::RevealFolder,
@@ -1262,7 +1277,8 @@ impl Hit {
 
     pub fn label(self) -> &'static str {
         match self {
-            Hit::Record => "Record",
+            Hit::Record => "Record armed channels into the arrangement",
+            Hit::Capture => "Capture the session — video, audio, MIDI — apart from the arrangement",
             Hit::OpenSetup => "Take settings",
             Hit::CloseSetup => "Done",
             Hit::DismissMessage => "Dismiss",
@@ -1702,7 +1718,8 @@ pub fn draw(painter: &Painter, rect: Rect, view: &RecorderView<'_>, s: &Settings
     let l = Layout::new(rect, view);
 
     draw_preview(painter, &l, view, &p);
-    draw_transport(painter, &l, view.playing, &p);
+    draw_transport(painter, &l, view, &p);
+    draw_capture(painter, l.capture, view.state.is_active(), &p);
     draw_meter(painter, l.meter, view.meters, &p);
     draw_readout(painter, &l, view, &p);
     draw_monitor(painter, &l, view, &p);
@@ -1904,7 +1921,8 @@ fn draw_camera(
     painter.rect_stroke(r, 0.0, Stroke::new(1.0_f32, p.line), StrokeKind::Inside);
 }
 
-fn draw_transport(painter: &Painter, l: &Layout, playing: bool, p: &Palette) {
+fn draw_transport(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Palette) {
+    let playing = view.playing;
     if l.play.is_positive() {
         // **The same kind of thing as record and stop**: a filled shape with a
         // hairline, at the transport's own size — not a labelled row. A
@@ -1946,7 +1964,15 @@ fn draw_transport(painter: &Painter, l: &Layout, playing: bool, p: &Palette) {
     if l.record.is_positive() {
         let c = l.record.center();
         let rad = l.record.width() * 0.5;
-        painter.circle_filled(c, rad, p.rec);
+        // Dimmed at rest and full red while the arrangement RECORDS — the
+        // same grammar as the play triangle, which is how one row says
+        // which of its machines is live.
+        let fill = if view.arr_recording {
+            p.rec
+        } else {
+            toward(p.rec, p.bg, 0.35)
+        };
+        painter.circle_filled(c, rad, fill);
         painter.circle_stroke(c, rad, Stroke::new(1.5_f32, p.line));
     }
     // The two glyphs sit in rects of the SAME size — and that alone did not
@@ -1983,6 +2009,35 @@ fn draw_transport(painter: &Painter, l: &Layout, playing: bool, p: &Palette) {
             Stroke::new(1.5_f32, p.line),
             StrokeKind::Inside,
         );
+    }
+}
+
+/// Tape amber — the capture control's OWN colour, so it can never be
+/// mistaken for the arrangement's red.
+const TAPE_AMBER: Color32 = Color32::from_rgb(0xC9, 0x8B, 0x3D);
+
+/// The cassette. Body, two hubs — filled while a capture is writing, dimmed
+/// at rest, exactly the play triangle's grammar.
+fn draw_capture(painter: &Painter, r: Rect, active: bool, p: &Palette) {
+    if !r.is_positive() {
+        return;
+    }
+    let body = Rect::from_center_size(
+        r.center(),
+        Vec2::new(r.width() * 0.98, r.height() * 0.62),
+    );
+    let col = if active {
+        TAPE_AMBER
+    } else {
+        toward(TAPE_AMBER, p.bg, 0.4)
+    };
+    painter.rect_filled(body, 2.0, col);
+    painter.rect_stroke(body, 2.0, Stroke::new(1.5_f32, p.line), StrokeKind::Inside);
+    let hub = body.height() * 0.22;
+    for side in [-1.0_f32, 1.0] {
+        let c = Pos2::new(body.center().x + side * body.width() * 0.24, body.center().y);
+        painter.circle_filled(c, hub, p.bg);
+        painter.circle_stroke(c, hub, Stroke::new(1.0_f32, p.line));
     }
 }
 
@@ -4565,6 +4620,7 @@ mod tests {
         for (name, other) in [
             ("status", l.status),
             ("setup", l.setup),
+            ("capture", l.capture),
             ("name", l.name),
             ("tempo", l.tempo),
             ("meter", l.meter),
@@ -4590,8 +4646,12 @@ mod tests {
     /// putting an indicator away. The pickers and the import do not, because
     /// each one opens a dialog over the one gesture that matters mid-take,
     /// which is Stop.
-    const SURVIVORS: [Hit; 17] = [
+    const SURVIVORS: [Hit; 18] = [
         Hit::Stop,
+        // The cassette started this take, and pressing it again is how a
+        // count-in is cancelled — the one control whose whole job is
+        // mid-take.
+        Hit::Capture,
         // The master most of all: it is the level control somebody reaches
         // for at 0:47, and a take is exactly when.
         Hit::SetMaster(0.0),
@@ -5690,6 +5750,7 @@ mod tests {
                             let v = RecorderView {
                                 position_s: 0.0,
                                 playing: false,
+                                arr_recording: false,
                                 input_monitor: false,
                                 scrub: crate::recorder::ScrubView::default(),
                                 state,

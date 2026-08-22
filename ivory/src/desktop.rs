@@ -250,12 +250,66 @@ struct Recorder {
     /// `IVORY_OPEN_EDITOR=1` bookkeeping. See `after_frame`.
     dev_editor_at: Option<std::time::Instant>,
     dev_editor_done: bool,
+    /// The red button is DOWN: armed lanes are being recorded into the
+    /// arrangement. `None` the rest of the time.
+    arr_rec: Option<ArrRec>,
 }
 
 /// How long `IVORY_OPEN_EDITOR` waits before opening, so the plugin has
 /// finished loading and the window has drawn at least one ordinary frame.
 #[cfg(feature = "recorder")]
 const DEV_EDITOR_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// One press of the red button: what has been collected since, and where it
+/// lands. `finish_arr_record` is the only way out, and it always hands the
+/// document its clips.
+#[cfg(feature = "recorder")]
+struct ArrRec {
+    /// The playhead second the record began at.
+    start_s: f64,
+    /// The same instant on the MIDI tap's clock, for stamping notes.
+    start_ns: i64,
+    /// Armed MIDI lanes at the press. Each gets an identical note clip — the
+    /// live stream feeds every armed MIDI lane, so the record says what the
+    /// room heard.
+    midi_lanes: Vec<usize>,
+    /// Armed AUDIO lanes at the press: (input pick, lane, frames so far).
+    audio: Vec<(usize, usize, Vec<f32>)>,
+    /// Finished notes, clip-relative seconds.
+    notes: Vec<ivory_ui::arrangement::ArrNote>,
+    /// Keys currently down: when they landed, and how hard.
+    open: std::collections::HashMap<u8, (f64, u8)>,
+}
+
+#[cfg(feature = "recorder")]
+impl ArrRec {
+    /// One raw MIDI event off the tap, stamped against the record's T0 on
+    /// the same clock the engine hears. Note edges only; the pedal rides the
+    /// live path and is not written down yet.
+    fn note_event(&mut self, t: i64, bytes: &[u8]) {
+        let [status, data1, data2] = *bytes else {
+            return;
+        };
+        let rel = ((t - self.start_ns) as f64 / 1e9).max(0.0);
+        let key = data1 & 0x7F;
+        match status & 0xF0 {
+            0x90 if data2 > 0 => {
+                self.open.insert(key, (rel, data2 & 0x7F));
+            }
+            0x80 | 0x90 => {
+                if let Some((at, vel)) = self.open.remove(&key) {
+                    self.notes.push(ivory_ui::arrangement::ArrNote {
+                        at_s: at,
+                        dur_s: (rel - at).max(0.05),
+                        key,
+                        vel,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+}
 
 /// The standalone app: `IvoryApp`, plus the eframe trait impl it cannot carry.
 pub struct DesktopApp {
@@ -1201,11 +1255,28 @@ impl DesktopApp {
         // queue, so two independent drains would give each message to one
         // consumer and starve the other.
         let engine = self.recorder.engine.as_ref();
+        let mut arr = self.recorder.arr_rec.as_mut();
         self.recorder.session.pump_midi(|t, bytes| {
             if let Some(e) = engine {
                 e.send_midi(t, bytes);
             }
+            // The arrangement's own collection: raw note edges, stamped
+            // against the record's T0, on the clock the engine hears.
+            if let Some(rec) = arr.as_deref_mut() {
+                rec.note_event(t, bytes);
+            }
         });
+        // The capture rings, drained every frame a record is running — four
+        // seconds of room in the engine, emptied sixty times a second.
+        if let Some(rec) = self.recorder.arr_rec.as_mut() {
+            if let Some(e) = self.recorder.engine.as_mut() {
+                for (input, _lane, buf) in &mut rec.audio {
+                    e.drain_capture(*input, buf);
+                }
+            }
+        }
+        // The red button's state, where the band can draw it.
+        self.app.recorder_state_mut().arr_recording = self.recorder.arr_rec.is_some();
 
         // Opening the BAND opens the input, not pressing Record — the meter
         // has to be live before arming, which is what kills the "I recorded
@@ -1217,6 +1288,9 @@ impl DesktopApp {
                 self.open_audio_path(ctx);
                 self.reconcile_camera(true, ctx);
             } else {
+                // A record cannot outlive its engine — the capture rings
+                // live in it. Finished, not dropped: the clips land.
+                self.finish_arr_record();
                 self.recorder.session.close_input();
                 self.recorder.session.close_camera();
                 self.recorder.camera_opening = false;
@@ -1536,15 +1610,30 @@ impl DesktopApp {
                 R::Play => {
                     // Record owns the transport while a take is writing — a
                     // green button that could stop the backing track mid-take
-                    // would be a second stop button with worse manners.
-                    if !self.recorder.session.is_recording() {
+                    // would be a second stop button with worse manners. The
+                    // arrangement's record owns it the same way: a pause
+                    // mid-record would let the capture run past the playhead.
+                    if !self.recorder.session.is_recording()
+                        && self.recorder.arr_rec.is_none()
+                    {
                         self.recorder.transport.toggle_play();
                     }
                 }
                 R::Locate(seconds) => {
                     self.recorder.transport.locate(seconds);
                 }
+                // **The red button is the ARRANGEMENT's.** Armed lanes in,
+                // clips out; the take machinery does not stir. The capture —
+                // the cassette — is where the old take toggle lives now.
                 R::Toggle => {
+                    self.recorder.take_note = None;
+                    if self.recorder.arr_rec.is_some() {
+                        self.finish_arr_record();
+                    } else {
+                        self.start_arr_record();
+                    }
+                }
+                R::Capture => {
                     // **Whatever the last take had to say, it is not about
                     // this one.** Stale post-take advice that outlives the
                     // take it describes is how a line about dropped frames sat
@@ -1589,6 +1678,9 @@ impl DesktopApp {
                 // sends the playhead home. Play's own second press is a PAUSE
                 // now, so this is the only button that returns to 0:00.
                 R::Stop => {
+                    // The arrangement record first, while the playhead still
+                    // says where the take ended — `Transport::stop` rewinds.
+                    self.finish_arr_record();
                     self.recorder.session.stop();
                     self.recorder.transport.stop();
                 }
@@ -2256,6 +2348,169 @@ impl DesktopApp {
     /// name, the SPAN as the length — with one clip, exactly the backing
     /// track's old face; the lanes come with the arrangement view's phase.
     #[cfg(feature = "recorder")]
+    /// The red button going DOWN: snapshot what is armed, open the capture
+    /// tee, roll the transport. Refusals go to the band's status line — a
+    /// press that does nothing silently is a broken button.
+    fn start_arr_record(&mut self) {
+        if self.recorder.arr_rec.is_some() {
+            return;
+        }
+        let Some(e) = self.recorder.engine.as_ref() else {
+            self.recorder.take_note =
+                Some("Open the band to record — the audio path is closed.".to_owned());
+            return;
+        };
+        if self.app.project_doc().is_none() {
+            self.recorder.take_note = Some("No project is open.".to_owned());
+            return;
+        }
+        // The armed lanes, split by what they record: a MIDI lane takes the
+        // note stream, an AUDIO lane its input pick — the k-th audio channel
+        // rides pick k, the same walk `after_frame` pushes to the engine.
+        let armed = self.app.armed_mask();
+        let mut midi_lanes = Vec::new();
+        let mut audio = Vec::new();
+        let mut mask = 0u32;
+        let mut pick = 0usize;
+        for ch in 0..ivory_ui::recorder::CHANNELS {
+            match self.app.channel_kind(ch) {
+                Some(ivory_ui::recorder::ChannelKind::Midi) => {
+                    if armed & (1 << ch) != 0 {
+                        midi_lanes.push(ch);
+                    }
+                }
+                Some(ivory_ui::recorder::ChannelKind::Audio) => {
+                    if pick < ivory_ui::recorder::INPUTS {
+                        if armed & (1 << ch) != 0 {
+                            mask |= 1 << pick;
+                            audio.push((pick, ch, Vec::new()));
+                        }
+                        pick += 1;
+                    }
+                }
+                None => {}
+            }
+        }
+        if midi_lanes.is_empty() && audio.is_empty() {
+            self.recorder.take_note =
+                Some("Nothing is armed — R on a channel is what records it.".to_owned());
+            return;
+        }
+        let rate = f64::from(e.output().sample_rate).max(1.0);
+        let start_s = self.recorder.transport.position_s(Some(e), rate);
+        let start_ns = e.timebase().now();
+        e.set_arr_capture(mask);
+        if !self.recorder.transport.playing() {
+            self.recorder.transport.toggle_play();
+        }
+        self.recorder.arr_rec = Some(ArrRec {
+            start_s,
+            start_ns,
+            midi_lanes,
+            audio,
+            notes: Vec::new(),
+            open: std::collections::HashMap::new(),
+        });
+    }
+
+    /// The record ending, by whichever door: the red button again, Stop, or
+    /// the band closing. Tee off, one last drain, files into the project's
+    /// `media/`, and the clips into the document. Reads the playhead, so it
+    /// must run BEFORE anything rewinds the transport.
+    fn finish_arr_record(&mut self) {
+        let Some(mut rec) = self.recorder.arr_rec.take() else {
+            return;
+        };
+        let rate = if let Some(e) = self.recorder.engine.as_mut() {
+            e.set_arr_capture(0);
+            // What was in flight when the tee closed. The block the device
+            // is filling right now is not here yet and is let go: a tail a
+            // buffer short, not a file that arrives late.
+            for (input, _lane, buf) in &mut rec.audio {
+                e.drain_capture(*input, buf);
+            }
+            f64::from(e.output().sample_rate).max(1.0)
+        } else {
+            48_000.0
+        };
+        let end_s = self
+            .recorder
+            .transport
+            .position_s(self.recorder.engine.as_ref(), rate);
+        let len_s = (end_s - rec.start_s).max(0.0);
+        // The keys still down end where the record does.
+        for (key, (at, vel)) in rec.open.drain() {
+            rec.notes.push(ivory_ui::arrangement::ArrNote {
+                at_s: at,
+                dur_s: (len_s - at).max(0.05),
+                key,
+                vel,
+            });
+        }
+        rec.notes.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
+        let mut out: Vec<ivory_ui::arrangement::RecordedClip> = Vec::new();
+        if !rec.notes.is_empty() && len_s >= 0.05 {
+            for lane in &rec.midi_lanes {
+                out.push(ivory_ui::arrangement::RecordedClip {
+                    lane: *lane,
+                    start_s: rec.start_s,
+                    len_s,
+                    path: None,
+                    notes: rec.notes.clone(),
+                });
+            }
+        }
+        // The WAVs, one per armed input, into the project's own media/.
+        if let Some(media) = self
+            .app
+            .project_doc()
+            .and_then(|d| d.parent().map(|p| p.join("media")))
+        {
+            let _ = std::fs::create_dir_all(&media);
+            for (_input, lane, frames) in &rec.audio {
+                let seconds = frames.len() as f64 / 2.0 / rate;
+                if seconds < 0.05 {
+                    continue;
+                }
+                let mut n = 1usize;
+                let name = loop {
+                    let cand = format!("rec-{}-{n}.wav", lane + 1);
+                    if !media.join(&cand).exists() {
+                        break cand;
+                    }
+                    n += 1;
+                };
+                let spec = ivory_record::wav::WavSpec {
+                    sample_rate: rate as u32,
+                    channels: 2,
+                    format: ivory_record::wav::SampleFormat::Float32,
+                };
+                let bext =
+                    ivory_record::wav::Bext::new(ivory_record::wav::Wallclock::now_utc(), spec);
+                let write = ivory_record::wav::WavWriter::create(&media.join(&name), spec, &bext)
+                    .and_then(|mut w| {
+                        w.write_interleaved(frames)?;
+                        w.finish()
+                    });
+                match write {
+                    Ok(()) => out.push(ivory_ui::arrangement::RecordedClip {
+                        lane: *lane,
+                        start_s: rec.start_s,
+                        len_s: seconds,
+                        path: Some(format!("media/{name}")),
+                        notes: Vec::new(),
+                    }),
+                    Err(e) => {
+                        self.recorder.take_note = Some(format!("could not write {name}: {e}"));
+                    }
+                }
+            }
+        }
+        // The app adds the rows, saves, and marks the clips dirty — which is
+        // what makes `reload_clips` push the new schedule and the new sound.
+        self.app.add_recorded_clips(out);
+    }
+
     fn reload_clips(&mut self) {
         let Some(doc_path) = self.app.project_doc().map(std::path::Path::to_path_buf) else {
             return;
@@ -2267,17 +2522,45 @@ impl DesktopApp {
             .map_or(48_000, |e| e.output().sample_rate);
         let doc = self.app.arrangement().clone();
         let mut placed = Vec::new();
+        let mut midi_placed = Vec::new();
         let mut info: Option<ivory_ui::ports::TrackInfo> = None;
         let mut span = 0.0f64;
         let mut error = String::new();
         let mut fill_len: Vec<(u64, f64)> = Vec::new();
         let mut clip_infos: Vec<(u64, Vec<f32>, f64)> = Vec::new();
         for clip in &doc.clips {
-            // A MIDI item has no audio to schedule — its notes are the
-            // editor's, its playback a later phase's. It still holds the
-            // SPAN: the band's fractions must cover everything drawn.
+            // A MIDI item is a schedule of its own: notes in frames from
+            // the clip's drawn left edge — the trim (`offset_s`) already
+            // paid, a note the trim cut the head off SKIPPED rather than
+            // re-attacked, and the walk in `mix_channels` needs them sorted.
             if clip.kind == ivory_ui::arrangement::ClipKind::Midi {
                 span = span.max(clip.start_s + clip.len_s);
+                let frames = |s: f64| (s.max(0.0) * f64::from(rate)).round() as u64;
+                let mut notes: Vec<crate::instrument::ClipNote> = clip
+                    .notes
+                    .iter()
+                    .filter_map(|n| {
+                        let at = n.at_s - clip.offset_s;
+                        if at < -1.0e-9 {
+                            return None;
+                        }
+                        Some(crate::instrument::ClipNote {
+                            at: frames(at),
+                            dur: frames(n.dur_s).max(1),
+                            key: n.key.min(127),
+                            vel: n.vel.min(127),
+                        })
+                    })
+                    .collect();
+                notes.sort_by_key(|n| n.at);
+                if !notes.is_empty() {
+                    midi_placed.push(crate::instrument::PlacedMidi {
+                        strip: clip.lane.min(ivory_ui::recorder::CHANNELS - 1),
+                        start: frames(clip.start_s),
+                        len: frames(clip.len_s),
+                        notes: Arc::new(notes),
+                    });
+                }
                 continue;
             }
             let path = ivory_ui::arrangement::Arrangement::resolve(&doc_path, &clip.path);
@@ -2349,6 +2632,7 @@ impl DesktopApp {
         });
         if let Some(e) = self.recorder.engine.as_mut() {
             e.set_clips(placed);
+            e.set_midi_clips(midi_placed);
         }
         let mut info = info.unwrap_or_default();
         info.seconds = span;
@@ -2949,6 +3233,7 @@ impl DesktopApp {
                 pending_monitor: None,
                 input_names: std::array::from_fn(|_| String::new()),
                 take_note: None,
+                arr_rec: None,
                 session: crate::record::Session::new(tap, timebase),
                 audio,
                 camera,
