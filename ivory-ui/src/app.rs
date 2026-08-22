@@ -306,6 +306,26 @@ pub struct IvoryApp {
     /// A press landed on the timeline and the button is still down: the
     /// locate follows the hand. See `recorder_panel::timeline_fraction`.
     timeline_scrub: bool,
+    /// A press picked up the arrangement's VIEWPORT on the timeline: the
+    /// pointer's distance from its left edge, so it rides under the hand.
+    viewport_pan: Option<f32>,
+    /// The ARRANGEMENT stands where the piano does, like the mixer. Tab
+    /// cycles piano, mixer, arrangement; the two views are never both open.
+    arrangement_open: bool,
+    /// The zoom window (start_s, len_s). `None` fits the whole song until
+    /// the first wheel, ruler drag or viewport steer.
+    arr_window: Option<(f64, f64)>,
+    /// The selected clip, by document id.
+    arr_selected: Option<u64>,
+    /// The gesture in flight on the arrangement, if any.
+    arr_drag: Option<ArrDrag>,
+    /// A clip edit happened during the current gesture: save on release.
+    arr_gesture_dirty: bool,
+    /// Where the arrangement was last drawn, for hit tests.
+    arrangement_rect: Option<Rect>,
+    /// Per-clip pictures the host pushed after decoding: the PLAYED span's
+    /// wave and the file's length in seconds, by clip id.
+    clip_infos: std::collections::HashMap<u64, (Vec<f32>, f64)>,
     /// Where the mixer was last drawn, so a press can be tested against it.
     mixer_rect: Option<Rect>,
     /// The OS's own file panel is on screen right now.
@@ -555,6 +575,24 @@ struct Grab {
 ///
 /// A slot holds a PATH, and a bundle path under a channel is the sort of detail
 /// that makes an app look like it is showing you its insides.
+/// A gesture in flight on the arrangement. What the press grabbed, and the
+/// figures the drag needs to stay relative — the band's own rule: a press
+/// never makes the thing jump to the pointer.
+#[derive(Debug, Clone, Copy)]
+enum ArrDrag {
+    /// The pointer's distance from the clip's start at the press, so the
+    /// clip rides under the SAME point of the hand all the way.
+    Move { id: u64, dt: f64 },
+    TrimLeft { id: u64 },
+    TrimRight { id: u64 },
+    FadeIn { id: u64 },
+    FadeOut { id: u64 },
+    /// The header knob: relative and vertical, the mixer fader's feel.
+    Gain { lane: usize, from_y: f32, from: f32 },
+    /// The ruler's vertical zoom, anchored at the second under the press.
+    Zoom { anchor_s: f64, last_y: f32 },
+}
+
 /// `base`, or `base 2`, `base 3`… — the first directory name not taken.
 ///
 /// Counted rather than timestamped: "Untitled 3" is a name a person can say
@@ -886,6 +924,14 @@ impl IvoryApp {
             clips_dirty: false,
             save_request: None,
             timeline_scrub: false,
+            viewport_pan: None,
+            arrangement_open: false,
+            arr_window: None,
+            arr_selected: None,
+            arr_drag: None,
+            arr_gesture_dirty: false,
+            arrangement_rect: None,
+            clip_infos: std::collections::HashMap::new(),
             open_insert_on_load: None,
             mixer_rect: None,
             native_panel_up: false,
@@ -2018,6 +2064,13 @@ impl IvoryApp {
         self.settings.strip_muted &= !(1 << at);
         self.settings.strip_soloed &= !(1 << at);
         self.armed &= !(1 << n);
+        // And the lane's CLIPS: a removed channel that kept invisible clips
+        // would keep playing them. The media copies stay in the project.
+        let had = self.arrangement.clips.iter().any(|c| c.lane == n);
+        if had {
+            self.arrangement.clips.retain(|c| c.lane != n);
+            self.arr_save_edits();
+        }
         // The bays last, through `set_insert` so the host's reconcile unloads
         // whatever was running in them.
         for bay in 0..crate::recorder::INSERTS {
@@ -2073,6 +2126,80 @@ impl IvoryApp {
         self.mixer_view()
     }
 
+    /// The arrangement, furnished for `shot::arrange`: a clip lane with the
+    /// backing, takes on an audio lane, trims, fades, a selection and the
+    /// playhead mid-song — so the picture answers "does this read".
+    pub fn open_arrangement_for_shot(&mut self) {
+        self.open_mixer_for_shot();
+        self.mixer_open = false;
+        self.arrangement_open = true;
+        let mut arr = crate::arrangement::Arrangement::default();
+        let backing = arr.add_clip(crate::arrangement::ArrClip {
+            lane: 3,
+            path: "media/Blue Bossa - backing.mp3".to_owned(),
+            start_s: 0.0,
+            offset_s: 0.0,
+            len_s: 95.0,
+            fade_in_s: 1.5,
+            fade_out_s: 6.0,
+            name: "Blue Bossa - backing".to_owned(),
+            id: 0,
+        });
+        let take = arr.add_clip(crate::arrangement::ArrClip {
+            lane: 2,
+            path: "media/take 3.wav".to_owned(),
+            start_s: 16.0,
+            offset_s: 2.0,
+            len_s: 21.0,
+            fade_in_s: 0.4,
+            fade_out_s: 0.4,
+            name: "take 3".to_owned(),
+            id: 0,
+        });
+        let solo = arr.add_clip(crate::arrangement::ArrClip {
+            lane: 2,
+            path: "media/solo.wav".to_owned(),
+            start_s: 48.0,
+            offset_s: 0.0,
+            len_s: 30.0,
+            fade_in_s: 0.0,
+            fade_out_s: 2.5,
+            name: "solo".to_owned(),
+            id: 0,
+        });
+        self.arrangement = arr;
+        let wave = |n: usize, seed: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let s = (i as f32 * seed).sin().abs();
+                    let swell = (i as f32 / 37.0).sin().abs();
+                    (0.15 + 0.8 * s * swell).min(1.0)
+                })
+                .collect()
+        };
+        self.set_clip_infos(vec![
+            (backing, wave(600, 0.7), 95.0),
+            (take, wave(300, 1.3), 23.0),
+            (solo, wave(300, 2.1), 30.0),
+        ]);
+        self.arr_selected = Some(take);
+        self.recorder.position_s = 22.0;
+        // A PART of the song, so the band's viewport rectangle is visible
+        // as the thing it is.
+        self.arr_window = Some((10.0, 45.0));
+    }
+
+    pub fn arrange_clips_for_shot(&self) -> Vec<crate::arrangement_panel::ClipView<'_>> {
+        self.arr_clip_views()
+    }
+
+    pub fn arrange_view_for_shot<'a>(
+        &'a self,
+        clips: &'a [crate::arrangement_panel::ClipView<'a>],
+    ) -> crate::arrangement_panel::ArrangeView<'a> {
+        self.arrange_view(clips)
+    }
+
     fn mixer_view(&self) -> crate::mixer_panel::MixerView<'_> {
         use crate::recorder::Strip;
         let g = self.settings.knobs().gains;
@@ -2096,28 +2223,16 @@ impl IvoryApp {
                 // bay-1 instrument on MIDI, the input's label on AUDIO, the
                 // kind's own word before either is chosen. A typed name still
                 // wins, below.
-                Strip::Channel(n) => {
-                    let default = match kind {
-                        None => "",
-                        Some(recorder::ChannelKind::Midi) => self
-                            .insert(s.index(), 0)
-                            .map(plugin_display_name)
-                            .filter(|d| !d.is_empty())
-                            .unwrap_or("MIDI"),
-                        Some(recorder::ChannelKind::Audio) => self
-                            .audio_ordinal(n)
-                            .and_then(|k| self.recorder.inputs.get(k))
-                            .map(|st| st.label.as_str())
-                            .filter(|l| !l.is_empty())
-                            .unwrap_or("AUDIO"),
-                    };
-                    (
-                        default,
-                        "",
-                        g.channels.get(n).copied().unwrap_or(1.0),
-                        kind.is_none(),
-                    )
-                }
+                // The name is `channel_display_name` — one function with
+                // the arrangement header, so the two cannot drift. And a
+                // lane with clips and no kind is a CLIP lane: a used strip
+                // that merely has no live source, not an empty one.
+                Strip::Channel(n) => (
+                    self.channel_display_name(n),
+                    "",
+                    g.channels.get(n).copied().unwrap_or(1.0),
+                    kind.is_none() && !self.lane_has_clips(n),
+                ),
                 Strip::Click => ("CLICK", "", g.metronome, false),
                 Strip::Fx => ("FX BUS", "reverb · delay · chorus", g.fx_return, false),
             };
@@ -2162,7 +2277,9 @@ impl IvoryApp {
                 // What the × means, where it means anything: a used general
                 // channel goes back to being an empty slot. The click and
                 // the bus are the desk's own and stay.
-                removable: matches!(s, Strip::Channel(_)) && kind.is_some(),
+                removable: matches!(s, Strip::Channel(_))
+                    && (kind.is_some()
+                        || matches!(s, Strip::Channel(n) if self.lane_has_clips(n))),
                 armed: match s {
                     Strip::Channel(n) => self.armed & (1 << n) != 0,
                     _ => false,
@@ -2233,6 +2350,7 @@ impl IvoryApp {
         recorder::RecorderView {
             fx_units: self.fx_units(),
             track: &self.track,
+            scrub: self.scrub_view(),
             input_monitor: self.input_monitor,
             ..self.recorder.view(
             self.settings.record_take_name.as_deref().unwrap_or_default(),
@@ -2510,6 +2628,13 @@ impl IvoryApp {
                     return;
                 }
             }
+            // And the arrangement, for the same reason: while it is up it is
+            // the only thing on that spot taking presses.
+            if let Some(rect) = self.arrangement_rect {
+                if pointer.is_some_and(|p| rect.contains(p)) {
+                    return;
+                }
+            }
             if let Some(pos) = pointer {
                 let global = self.main_inner_origin + pos.to_vec2();
                 // A right-click ON the Recorder band opens the menu with the
@@ -2622,6 +2747,7 @@ impl IvoryApp {
         if pointer_released {
             self.clicked.clear();
             self.timeline_scrub = false;
+            self.viewport_pan = None;
         }
         // The scrub: the locate follows the hand for as long as the press
         // that landed on the timeline is held. X only, clamped at the ends —
@@ -2633,6 +2759,21 @@ impl IvoryApp {
                     recorder_panel::timeline_fraction(r, &self.recorder_layout_view(), pos)
                 {
                     self.apply_recorder_hit(recorder_panel::Hit::SeekTimeline(t));
+                }
+            }
+        }
+        // The viewport, ridden: its left edge follows the hand at the offset
+        // the press took hold at, and the arrangement follows the rectangle.
+        if let Some(grab_px) = self.viewport_pan {
+            if pointer_down {
+                if let (Some(r), Some(pos)) = (recorder_rect, pointer) {
+                    let tl = recorder_panel::timeline_rect(r, &self.recorder_layout_view());
+                    if tl.is_positive() {
+                        let f0 = f64::from(((pos.x - grab_px) - tl.left()) / tl.width());
+                        let span = self.arr_span();
+                        let (_, len) = self.arr_window_now();
+                        self.arr_steer(f0.max(0.0) * span, len);
+                    }
                 }
             }
         }
@@ -2714,6 +2855,28 @@ impl IvoryApp {
                     // field people learn not to trust.
                     self.commit_number_unless(hit);
                     if let Some(hit) = hit {
+                        // A press ON the arrangement's viewport picks it up
+                        // — a thing you slide, not a locate. Checked before
+                        // the hit applies, from the same function that drew
+                        // the rectangle, so the grab and the picture cannot
+                        // drift; the locate and the scrub both stand down.
+                        let on_viewport = matches!(hit, recorder_panel::Hit::SeekTimeline(_))
+                            && {
+                                let vp = recorder_panel::timeline_viewport_rect(
+                                    r,
+                                    &self.recorder_layout_view(),
+                                );
+                                vp.is_positive() && vp.contains(pos)
+                            };
+                        if on_viewport {
+                            let vp = recorder_panel::timeline_viewport_rect(
+                                r,
+                                &self.recorder_layout_view(),
+                            );
+                            self.viewport_pan = Some(pos.x - vp.left());
+                            self.timeline_scrub = false;
+                            return;
+                        }
                         // A value control is NOT applied on press. It is applied
                         // once the gesture has moved far enough to be a drag —
                         // see the drag block — which is what leaves the tap free
@@ -3542,7 +3705,11 @@ impl IvoryApp {
             let src = std::path::PathBuf::from(&track);
             if src.is_file() {
                 if let Some(rel) = copy_into_media(&doc, &src) {
-                    arr.add_clip(clip_at(&rel, 0, 0.0));
+                    // On a lane that can hold audio — never the DX7's. The
+                    // first unused lane on the shipped desk, which is where
+                    // the BACKING column used to stand.
+                    let lane = self.lane_for_audio().unwrap_or(crate::recorder::CHANNELS - 1);
+                    arr.add_clip(clip_at(&rel, lane, 0.0));
                 }
             }
         }
@@ -3583,6 +3750,36 @@ impl IvoryApp {
     /// the drop-on-a-lane in the view's phase — and the copy is what keeps
     /// the directory self-contained.
     pub fn import_audio_file(&mut self, file: &std::path::Path) -> Result<(), String> {
+        let Some(lane) = self.lane_for_audio() else {
+            return Err("every lane is MIDI; make room for audio first".to_owned());
+        };
+        self.import_audio_at(file, lane, 0.0)
+    }
+
+    /// Where un-aimed audio lands: the first unused lane, else the first
+    /// AUDIO lane. `None` on a desk that is wall-to-wall MIDI.
+    fn lane_for_audio(&self) -> Option<usize> {
+        (0..crate::recorder::CHANNELS)
+            .find(|n| self.channel_kind(*n).is_none())
+            .or_else(|| {
+                (0..crate::recorder::CHANNELS)
+                    .find(|n| self.channel_kind(*n) == Some(recorder::ChannelKind::Audio))
+            })
+    }
+
+    /// The same import, aimed: the lane it was dropped on, at the second it
+    /// was dropped at.
+    pub fn import_audio_at(
+        &mut self,
+        file: &std::path::Path,
+        lane: usize,
+        start_s: f64,
+    ) -> Result<(), String> {
+        // A MIDI lane cannot take audio — the one refusal, in the one
+        // place, whichever gesture asked.
+        if self.channel_kind(lane) == Some(recorder::ChannelKind::Midi) {
+            return Err("a MIDI lane cannot take an audio file".to_owned());
+        }
         let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) else {
             return Err("no project is open".to_owned());
         };
@@ -3592,7 +3789,8 @@ impl IvoryApp {
                 file.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
             ));
         };
-        self.arrangement.add_clip(clip_at(&rel, 0, 0.0));
+        self.arrangement
+            .add_clip(clip_at(&rel, lane.min(crate::recorder::CHANNELS - 1), start_s.max(0.0)));
         self.arrangement.save_to(&doc);
         self.clips_dirty = true;
         Ok(())
@@ -3691,6 +3889,568 @@ impl IvoryApp {
     /// as the file request; a plugin refuses by never draining.
     pub fn take_save_request(&mut self) -> Option<crate::ports::SaveRequest> {
         self.save_request.take()
+    }
+
+    // ── the arrangement view's data ────────────────────────────────────────
+
+    /// Whether any clip stands on lane `n`. A lane with clips and no kind is
+    /// a CLIP lane: a used strip that merely has no live source.
+    pub fn lane_has_clips(&self, n: usize) -> bool {
+        self.arrangement.clips.iter().any(|c| c.lane == n)
+    }
+
+    /// The pictures the host made of each clip after decoding: the played
+    /// span's wave, and the file's length in seconds.
+    pub fn set_clip_infos(&mut self, infos: Vec<(u64, Vec<f32>, f64)>) {
+        self.clip_infos = infos.into_iter().map(|(id, w, s)| (id, (w, s))).collect();
+    }
+
+    /// A channel's display name: the typed one wins, then the default its
+    /// kind earns — the bay-1 instrument on MIDI, the input's label on
+    /// AUDIO, and plain AUDIO for a clip lane. One function for the mixer
+    /// strip and the arrangement header, so the two can never disagree.
+    fn channel_display_name(&self, n: usize) -> &str {
+        if let Some(name) = self
+            .settings
+            .strip_names
+            .get(n)
+            .filter(|s| !s.is_empty())
+        {
+            return name;
+        }
+        match self.channel_kind(n) {
+            Some(recorder::ChannelKind::Midi) => self
+                .insert(n, 0)
+                .map(plugin_display_name)
+                .filter(|d| !d.is_empty())
+                .unwrap_or("MIDI"),
+            Some(recorder::ChannelKind::Audio) => self
+                .audio_ordinal(n)
+                .and_then(|k| self.recorder.inputs.get(k))
+                .map(|st| st.label.as_str())
+                .filter(|l| !l.is_empty())
+                .unwrap_or("AUDIO"),
+            None => {
+                if self.lane_has_clips(n) {
+                    "AUDIO"
+                } else {
+                    ""
+                }
+            }
+        }
+    }
+
+    /// A clip's PLAYING length, resolved against what the host knows of its
+    /// file. Half a second when nothing is known yet, so an undecoded clip
+    /// is still visible and selectable rather than a zero-width nothing.
+    fn clip_len_resolved(&self, c: &crate::arrangement::ArrClip) -> f64 {
+        if c.len_s > 0.0 {
+            return c.len_s;
+        }
+        match self.clip_infos.get(&c.id) {
+            Some((_, file_s)) if *file_s > 0.0 => (file_s - c.offset_s).max(0.05),
+            _ => 0.5,
+        }
+    }
+
+    /// The last second anything stands on, as drawn.
+    fn arr_span(&self) -> f64 {
+        self.arrangement
+            .clips
+            .iter()
+            .map(|c| c.start_s + self.clip_len_resolved(c))
+            .fold(0.0, f64::max)
+    }
+
+    /// The zoom window: steered, or fitted to the whole song.
+    fn arr_window_now(&self) -> (f64, f64) {
+        self.arr_window
+            .unwrap_or_else(|| (0.0, (self.arr_span() * 1.05).max(30.0)))
+    }
+
+    /// Clamp a steered window into the song's neighbourhood and keep it.
+    fn arr_steer(&mut self, start: f64, len: f64) {
+        let len = len.clamp(1.0, (self.arr_span() * 4.0).max(120.0));
+        let max_start = (self.arr_span() * 2.0).max(60.0);
+        self.arr_window = Some((start.clamp(0.0, max_start), len));
+    }
+
+    fn arr_clip_views(&self) -> Vec<crate::arrangement_panel::ClipView<'_>> {
+        self.arrangement
+            .clips
+            .iter()
+            .map(|c| {
+                let (wave, file_s) = self
+                    .clip_infos
+                    .get(&c.id)
+                    .map(|(w, s)| (w.as_slice(), *s))
+                    .unwrap_or((&[][..], 0.0));
+                crate::arrangement_panel::ClipView {
+                    id: c.id,
+                    lane: c.lane.min(crate::recorder::CHANNELS - 1),
+                    start_s: c.start_s,
+                    len_s: self.clip_len_resolved(c),
+                    max_len_s: if file_s > 0.0 {
+                        (file_s - c.offset_s).max(0.05)
+                    } else {
+                        f64::INFINITY
+                    },
+                    fade_in_s: c.fade_in_s,
+                    fade_out_s: c.fade_out_s,
+                    name: &c.name,
+                    wave,
+                    selected: self.arr_selected == Some(c.id),
+                }
+            })
+            .collect()
+    }
+
+    /// The clip, mutable, by document id.
+    fn arr_clip_mut(&mut self, id: u64) -> Option<&mut crate::arrangement::ArrClip> {
+        self.arrangement.clips.iter_mut().find(|c| c.id == id)
+    }
+
+    /// Resolve the whole-file sentinel the moment a hand lands on a clip:
+    /// every edit below does arithmetic against a literal length.
+    fn arr_resolve_len(&mut self, id: u64) {
+        let len = self
+            .arrangement
+            .clips
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| self.clip_len_resolved(c));
+        if let (Some(len), Some(c)) = (len, self.arr_clip_mut(id)) {
+            if c.len_s == 0.0 {
+                c.len_s = len;
+            }
+        }
+    }
+
+    /// MOVE: the clip rides under the same point of the hand — `dt` is the
+    /// pointer's distance from its start at the press.
+    fn arr_move(&mut self, id: u64, t_at: f64, dt: f64) {
+        if let Some(c) = self.arr_clip_mut(id) {
+            let to = (t_at - dt).max(0.0);
+            if (c.start_s - to).abs() > 1e-9 {
+                c.start_s = to;
+                self.arr_gesture_dirty = true;
+            }
+        }
+    }
+
+    /// TRIM the head: start, offset and length move together, and the head
+    /// cannot reveal audio the file does not have — offset zero is as far
+    /// left as there is.
+    fn arr_trim_left(&mut self, id: u64, t_at: f64) {
+        const MIN: f64 = 0.05;
+        if let Some(c) = self.arr_clip_mut(id) {
+            let end = c.start_s + c.len_s;
+            let new_start = t_at.clamp((c.start_s - c.offset_s).max(0.0), end - MIN);
+            let d = new_start - c.start_s;
+            if d.abs() > 1e-9 {
+                c.start_s = new_start;
+                c.offset_s = (c.offset_s + d).max(0.0);
+                c.len_s = end - new_start;
+                c.fade_in_s = c.fade_in_s.min(c.len_s);
+                c.fade_out_s = c.fade_out_s.min(c.len_s);
+                self.arr_gesture_dirty = true;
+            }
+        }
+    }
+
+    /// TRIM the tail: the length follows the hand, clamped at the file's
+    /// end where the file is known.
+    fn arr_trim_right(&mut self, id: u64, t_at: f64) {
+        const MIN: f64 = 0.05;
+        let max_len = self
+            .arrangement
+            .clips
+            .iter()
+            .find(|c| c.id == id)
+            .and_then(|c| {
+                self.clip_infos
+                    .get(&c.id)
+                    .map(|(_, file_s)| (file_s - c.offset_s).max(MIN))
+            })
+            .unwrap_or(f64::INFINITY);
+        if let Some(c) = self.arr_clip_mut(id) {
+            let to = (t_at - c.start_s).clamp(MIN, max_len);
+            if (c.len_s - to).abs() > 1e-9 {
+                c.len_s = to;
+                c.fade_in_s = c.fade_in_s.min(c.len_s);
+                c.fade_out_s = c.fade_out_s.min(c.len_s);
+                self.arr_gesture_dirty = true;
+            }
+        }
+    }
+
+    /// The fade handles: the head's ramp ends at the hand, the tail's
+    /// begins there. Clamped to the clip.
+    fn arr_fade_in(&mut self, id: u64, t_at: f64) {
+        if let Some(c) = self.arr_clip_mut(id) {
+            let to = (t_at - c.start_s).clamp(0.0, c.len_s);
+            if (c.fade_in_s - to).abs() > 1e-9 {
+                c.fade_in_s = to;
+                self.arr_gesture_dirty = true;
+            }
+        }
+    }
+
+    fn arr_fade_out(&mut self, id: u64, t_at: f64) {
+        if let Some(c) = self.arr_clip_mut(id) {
+            let to = (c.start_s + c.len_s - t_at).clamp(0.0, c.len_s);
+            if (c.fade_out_s - to).abs() > 1e-9 {
+                c.fade_out_s = to;
+                self.arr_gesture_dirty = true;
+            }
+        }
+    }
+
+    /// A gesture's edits, written down: the document saved atomically, the
+    /// host told to rebuild the schedule.
+    fn arr_save_edits(&mut self) {
+        if let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) {
+            self.arrangement.save_to(&doc);
+        }
+        self.clips_dirty = true;
+    }
+
+    /// The Delete key: the SELECTED clip leaves the timeline. The media copy
+    /// stays in the project, the way the × keeps material.
+    fn arr_delete_selected(&mut self) {
+        let Some(id) = self.arr_selected.take() else {
+            return;
+        };
+        let before = self.arrangement.clips.len();
+        self.arrangement.clips.retain(|c| c.id != id);
+        if self.arrangement.clips.len() != before {
+            self.arr_save_edits();
+        }
+    }
+
+    /// The S key: cut at the playhead — the selected clip, or every clip
+    /// standing under the line when nothing is selected. The head keeps its
+    /// fade-in, the tail keeps the fade-out, and the seam is clean: two
+    /// clips whose samples abut exactly.
+    fn arr_split_at_playhead(&mut self) {
+        const MIN: f64 = 0.05;
+        let t = self.recorder.position_s;
+        let targets: Vec<u64> = match self.arr_selected {
+            Some(id) => vec![id],
+            None => self
+                .arrangement
+                .clips
+                .iter()
+                .filter(|c| {
+                    let len = self.clip_len_resolved(c);
+                    t > c.start_s + MIN && t < c.start_s + len - MIN
+                })
+                .map(|c| c.id)
+                .collect(),
+        };
+        let mut tails = Vec::new();
+        for id in targets {
+            let len = match self.arrangement.clips.iter().find(|c| c.id == id) {
+                Some(c) => self.clip_len_resolved(c),
+                None => continue,
+            };
+            let Some(c) = self.arr_clip_mut(id) else { continue };
+            if !(t > c.start_s + MIN && t < c.start_s + len - MIN) {
+                continue;
+            }
+            let head = t - c.start_s;
+            let tail_fade = c.fade_out_s.min(len - head);
+            c.len_s = head;
+            c.fade_in_s = c.fade_in_s.min(head);
+            c.fade_out_s = 0.0;
+            tails.push(crate::arrangement::ArrClip {
+                lane: c.lane,
+                path: c.path.clone(),
+                start_s: t,
+                offset_s: c.offset_s + head,
+                len_s: len - head,
+                fade_in_s: 0.0,
+                fade_out_s: tail_fade,
+                name: c.name.clone(),
+                id: 0,
+            });
+        }
+        if tails.is_empty() {
+            return;
+        }
+        for tail in tails {
+            self.arrangement.add_clip(tail);
+        }
+        self.arr_save_edits();
+    }
+
+    /// Everything a frame of pointer, wheel, key and file-drop input means
+    /// to the arrangement. Runs only while the view is on screen, right
+    /// after the mixer's own block and on the same terms.
+    fn arrangement_input(&mut self, ctx: &egui::Context) {
+        const MIN: f64 = 0.05;
+        let Some(rect) = self.arrangement_rect else {
+            return;
+        };
+        let (pressed, pointer_down, released, pointer) = ctx.input(|i| {
+            (
+                i.pointer.primary_pressed(),
+                i.pointer.primary_down(),
+                i.pointer.any_released(),
+                i.pointer.interact_pos(),
+            )
+        });
+
+        // ── the wheel: pan, and Cmd/Ctrl-wheel zoom around the pointer ────
+        let (scroll, zoom_mod, shift) = ctx.input(|i| {
+            (
+                i.raw_scroll_delta,
+                i.modifiers.command || i.modifiers.ctrl,
+                i.modifiers.shift,
+            )
+        });
+        if scroll != egui::Vec2::ZERO {
+            if let Some(p) = pointer.filter(|p| rect.contains(*p)) {
+                let (anchor, s_per_px, start, len) = {
+                    let clips = self.arr_clip_views();
+                    let view = self.arrange_view(&clips);
+                    let a = crate::arrangement_panel::time_at(rect, &view, p.x);
+                    let s = crate::arrangement_panel::time_at(rect, &view, p.x + 1.0) - a;
+                    (a, s, view.view_start_s, view.view_len_s)
+                };
+                if zoom_mod {
+                    // Wheel up zooms IN around the second under the pointer.
+                    let factor = f64::from((-scroll.y * 0.005).exp());
+                    self.arr_steer(anchor - (anchor - start) * factor, len * factor);
+                } else {
+                    // Either axis pans: a mouse wheel gives Y, a trackpad
+                    // dragging sideways gives X, and both mean "along time".
+                    let d = f64::from(scroll.x + scroll.y) * s_per_px;
+                    self.arr_steer(start - d, len);
+                }
+            }
+        }
+
+        // ── presses ───────────────────────────────────────────────────────
+        if pressed {
+            if let Some(p) = pointer.filter(|p| rect.contains(*p)) {
+                let (hit, t_at) = {
+                    let clips = self.arr_clip_views();
+                    let view = self.arrange_view(&clips);
+                    (
+                        crate::arrangement_panel::hit_test(rect, &view, p),
+                        crate::arrangement_panel::time_at(rect, &view, p.x),
+                    )
+                };
+                use crate::arrangement_panel::Hit as A;
+                use crate::mixer_panel::Hit as M;
+                use crate::recorder::Column;
+                match hit {
+                    // The header's switches are the mixer strip's own, by
+                    // the same hits, so the two surfaces cannot drift.
+                    Some(A::Arm(n)) => self.apply_mixer_hit(M::Arm(Column(n)), 0.0),
+                    Some(A::Mute(n)) => self.apply_mixer_hit(M::Mute(Column(n)), 0.0),
+                    Some(A::Solo(n)) => self.apply_mixer_hit(M::Solo(Column(n)), 0.0),
+                    Some(A::Gain(n)) => {
+                        self.arr_drag = Some(ArrDrag::Gain {
+                            lane: n,
+                            from_y: p.y,
+                            from: self.mixer_value(M::Fader(Column(n))),
+                        });
+                    }
+                    Some(A::ClipBody(id)) => {
+                        self.arr_selected = Some(id);
+                        self.arr_resolve_len(id);
+                        if let Some(c) = self.arrangement.clips.iter().find(|c| c.id == id) {
+                            let dt = t_at - c.start_s;
+                            self.arr_drag = Some(ArrDrag::Move { id, dt });
+                        }
+                    }
+                    Some(A::ClipLeft(id)) | Some(A::ClipRight(id)) | Some(A::FadeIn(id))
+                    | Some(A::FadeOut(id)) => {
+                        self.arr_selected = Some(id);
+                        self.arr_resolve_len(id);
+                        self.arr_drag = Some(match hit {
+                            Some(A::ClipLeft(_)) => ArrDrag::TrimLeft { id },
+                            Some(A::ClipRight(_)) => ArrDrag::TrimRight { id },
+                            Some(A::FadeIn(_)) => ArrDrag::FadeIn { id },
+                            _ => ArrDrag::FadeOut { id },
+                        });
+                    }
+                    // Empty room: the playhead goes HERE and the selection
+                    // clears — the gesture Ableton taught everyone.
+                    Some(A::Lane(_, t)) => {
+                        self.arr_selected = None;
+                        self.request_recorder(recorder::RecorderRequest::Locate(t.max(0.0)));
+                    }
+                    // The ruler: locate on the press, zoom on the drag.
+                    Some(A::Ruler(t)) => {
+                        self.request_recorder(recorder::RecorderRequest::Locate(t.max(0.0)));
+                        self.arr_drag = Some(ArrDrag::Zoom {
+                            anchor_s: t,
+                            last_y: p.y,
+                        });
+                    }
+                    None => {}
+                }
+            }
+        }
+
+        // ── the drag in flight ────────────────────────────────────────────
+        if let (Some(drag), Some(p), true) = (self.arr_drag, pointer, pointer_down) {
+            let t_at = {
+                let clips = self.arr_clip_views();
+                let view = self.arrange_view(&clips);
+                crate::arrangement_panel::time_at(rect, &view, p.x)
+            };
+            match drag {
+                ArrDrag::Move { id, dt } => self.arr_move(id, t_at, dt),
+                ArrDrag::TrimLeft { id } => self.arr_trim_left(id, t_at),
+                ArrDrag::TrimRight { id } => self.arr_trim_right(id, t_at),
+                ArrDrag::FadeIn { id } => self.arr_fade_in(id, t_at),
+                ArrDrag::FadeOut { id } => self.arr_fade_out(id, t_at),
+                ArrDrag::Gain { lane, from_y, from } => {
+                    let fine = if shift { recorder_panel::FINE_DRAG } else { 1.0 };
+                    let v = (from + (from_y - p.y) / 420.0 * fine).clamp(0.0, 1.0);
+                    self.apply_mixer_hit(
+                        crate::mixer_panel::Hit::Fader(crate::recorder::Column(lane)),
+                        v,
+                    );
+                }
+                ArrDrag::Zoom { anchor_s, last_y } => {
+                    let dy = p.y - last_y;
+                    if dy.abs() > 0.5 {
+                        let (start, len) = self.arr_window_now();
+                        // Down zooms IN — Ableton's ruler — around the
+                        // second the press landed on.
+                        let factor = f64::from((-dy * 0.01).exp());
+                        self.arr_steer(anchor_s - (anchor_s - start) * factor, len * factor);
+                        self.arr_drag = Some(ArrDrag::Zoom {
+                            anchor_s,
+                            last_y: p.y,
+                        });
+                    }
+                }
+            }
+        }
+        if released {
+            if self.arr_gesture_dirty {
+                self.arr_gesture_dirty = false;
+                self.arr_save_edits();
+            }
+            self.arr_drag = None;
+        }
+
+        // ── the keys the view owns ────────────────────────────────────────
+        // S is handled beside the shortcut table, where it collides with the
+        // supporter card; Delete has no other meaning here.
+        let keys_ok = self.dialog.is_none()
+            && self.menu_state.is_none()
+            && !self.name_focused
+            && self.num_edit.is_none();
+        if keys_ok
+            && ctx.input(|i| {
+                i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)
+            })
+        {
+            self.arr_delete_selected();
+        }
+
+        // ── files dropped from the outside world ──────────────────────────
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        if !dropped.is_empty() {
+            let at = pointer
+                .or_else(|| ctx.input(|i| i.pointer.hover_pos()))
+                .filter(|p| rect.contains(*p));
+            let (lane, t) = match at {
+                Some(p) => {
+                    let clips = self.arr_clip_views();
+                    let view = self.arrange_view(&clips);
+                    let l = crate::arrangement_panel::Layout::new(rect, &view);
+                    let lane = l
+                        .lane_rows
+                        .iter()
+                        .position(|r| r.is_positive() && r.contains(p))
+                        .unwrap_or(0);
+                    (lane, crate::arrangement_panel::time_at(rect, &view, p.x).max(0.0))
+                }
+                None => (0, 0.0),
+            };
+            for file in dropped {
+                let Some(path) = file.path else { continue };
+                // The refusal is the import's own; one sentence into the
+                // status line, cleared by the next successful reload.
+                if let Err(e) = self.import_audio_at(&path, lane, t) {
+                    self.track.error = e;
+                }
+            }
+        }
+    }
+
+    /// The band timeline's overview of the document — every clip a block
+    /// in its lane's colour against the whole span, and the arrangement's
+    /// window when that view is open to steer.
+    fn scrub_view(&self) -> recorder::ScrubView {
+        let span = self.arr_span();
+        if span <= 0.0 {
+            return recorder::ScrubView::default();
+        }
+        let blocks = self
+            .arrangement
+            .clips
+            .iter()
+            .map(|c| {
+                (
+                    c.lane.min(crate::recorder::CHANNELS - 1),
+                    (c.start_s / span) as f32,
+                    (self.clip_len_resolved(c) / span) as f32,
+                    self.settings.strip_colors.get(c.lane).copied().unwrap_or(0) as usize,
+                )
+            })
+            .collect();
+        let viewport = self.arrangement_open.then(|| {
+            let (s, l) = self.arr_window_now();
+            ((s / span) as f32, (l / span) as f32)
+        });
+        recorder::ScrubView { blocks, viewport }
+    }
+
+    fn arrange_view<'a>(
+        &'a self,
+        clips: &'a [crate::arrangement_panel::ClipView<'a>],
+    ) -> crate::arrangement_panel::ArrangeView<'a> {
+        let g = self.settings.knobs().gains;
+        let desk = self.desk();
+        let peaks = self.recorder.strip_peaks;
+        let (view_start_s, view_len_s) = self.arr_window_now();
+        crate::arrangement_panel::ArrangeView {
+            lanes: std::array::from_fn(|n| {
+                let kind = self.channel_kind(n);
+                crate::arrangement_panel::LaneView {
+                    name: self.channel_display_name(n),
+                    color: self.settings.strip_colors.get(n).copied().unwrap_or(0) as usize,
+                    kind,
+                    used: kind.is_some() || self.lane_has_clips(n),
+                    armed: self.armed & (1 << n) != 0,
+                    muted: desk.muted[n],
+                    soloed: desk.soloed[n],
+                    gain: g.channels.get(n).copied().unwrap_or(1.0),
+                    peak: peaks[n],
+                }
+            }),
+            clips,
+            view_start_s,
+            view_len_s,
+            playhead_s: self.recorder.position_s,
+            bpm: f64::from(self.tempo_bpm()),
+            sig_top: u32::from(self.time_signature().beats),
+            sig_bottom: u32::from(self.time_signature().unit),
+            dark_mode: self.settings.dark_mode,
+            wood: {
+                let c = self.settings.recorder_bg_color;
+                (c.r, c.g, c.b)
+            },
+        }
     }
 
     /// The host's answer to a save panel.
@@ -5133,8 +5893,17 @@ impl IvoryApp {
             // so the transport never moves. A half-finished drag does not
             // survive the swap, because the control it was on is gone.
             K::ToggleMixer => {
-                self.mixer_open = !self.mixer_open;
+                // **Tab CYCLES now: piano, mixer, arrangement.** Three
+                // surfaces on one spot; the band above never moves.
+                let (mixer, arrangement) = match (self.mixer_open, self.arrangement_open) {
+                    (false, false) => (true, false),
+                    (true, _) => (false, true),
+                    (false, true) => (false, false),
+                };
+                self.arrangement_open = arrangement;
+                self.mixer_open = mixer;
                 self.mixer_grab = None;
+                self.arr_drag = None;
             }
             K::TransposeUp => self.transpose_by(1),
             K::TransposeDown => self.transpose_by(-1),
@@ -6635,6 +7404,9 @@ impl IvoryApp {
                     editing: None,
                     fx_units: self.fx_units(),
                     track: &self.track,
+                    // The overview too: the video's band shows the same
+                    // arrangement the window's does.
+                    scrub: self.scrub_view(),
                     // The composite's own copy: nothing is focused, nothing
                     // is being typed into and no hand is on a knob, because
                     // there is no pointer in a video frame.
@@ -6919,7 +7691,15 @@ impl IvoryApp {
             && self.num_edit.is_none()
         {
             if let Some(action) = keys::pressed(&ctx, self.key_gates()) {
-                self.apply_key_action(&ctx, action);
+                // **The arrangement owns S while it is open.** S is the
+                // supporter card everywhere else; in the arrangement it is
+                // SPLIT — the owner's binding — and a card rising over a cut
+                // would be two meanings on one key at one moment.
+                if self.arrangement_open && action == keys::KeyAction::ShowSupporterKey {
+                    self.arr_split_at_playhead();
+                } else {
+                    self.apply_key_action(&ctx, action);
+                }
             }
         }
         // Every frame, gated or not: the audition is a HOLD, and its release
@@ -7111,6 +7891,15 @@ impl IvoryApp {
             // The control being dragged is not on screen any more.
             self.mixer_grab = None;
         }
+        // The ARRANGEMENT takes the same spot on its turn of the Tab cycle.
+        let arrangement_rect = self
+            .arrangement_open
+            .then(|| band_at(recorder_h, (target.y - recorder_h).max(0.0)))
+            .filter(Rect::is_positive);
+        self.arrangement_rect = arrangement_rect;
+        if arrangement_rect.is_none() {
+            self.arr_drag = None;
+        }
         let piano_rect = band_at(recorder_h + theory_h + chord_h, piano_h);
         let mut chord_rect_for_hit: Option<Rect> = None;
         // Where the thanks card hangs from, once the heart has been drawn.
@@ -7239,6 +8028,10 @@ impl IvoryApp {
         if let Some(rect) = mixer_rect {
             let view = self.mixer_view();
             crate::mixer_panel::draw(ui.painter(), rect, &view);
+        } else if let Some(rect) = arrangement_rect {
+            let clips = self.arr_clip_views();
+            let view = self.arrange_view(&clips);
+            crate::arrangement_panel::draw(ui.painter(), rect, &view);
         } else {
             piano::draw(
                 ui.painter(),
@@ -7592,6 +8385,9 @@ impl IvoryApp {
                 }
             }
         }
+
+        // The arrangement's own frame of input, on the mixer's terms.
+        self.arrangement_input(&ctx);
 
         // The take-name field, edited from raw input rather than with an egui
         // widget. The band is a pure painter — that is what will let the
@@ -8883,6 +9679,88 @@ mod tests {
         assert!(app.project_name().starts_with("Untitled"));
         assert_ne!(app.project_name(), "Nocturne");
         assert!(app.arrangement().clips.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The five clip operations edit the document** — move, trim both
+    /// ends, fades, split at the playhead, delete — with their clamps: a
+    /// head trim cannot reveal audio before the file, a tail trim stops at
+    /// the file's end, fades stay inside the clip, and a split's halves
+    /// keep the outer fades and abut exactly.
+    #[test]
+    fn the_clip_operations_edit_the_document() {
+        use crate::arrangement::Arrangement;
+        let root = project_scratch("ops");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        let file = root.join("solo.wav");
+        std::fs::write(&file, b"pcm, allegedly").expect("write");
+        app.import_audio_at(&file, 4, 10.0).expect("import");
+        let id = app.arrangement().clips[0].id;
+        // The host met the file: 60 seconds long.
+        app.set_clip_infos(vec![(id, vec![0.5; 10], 60.0)]);
+        app.arr_resolve_len(id);
+        assert!((app.arrangement().clips[0].len_s - 60.0).abs() < 1e-9);
+
+        app.arr_move(id, 25.0, 5.0); // the hand was 5 s into the clip
+        assert!((app.arrangement().clips[0].start_s - 20.0).abs() < 1e-9);
+
+        app.arr_trim_left(id, 26.0);
+        let c = app.arrangement().clips[0].clone();
+        assert!((c.start_s - 26.0).abs() < 1e-9);
+        assert!((c.offset_s - 6.0).abs() < 1e-9, "the trim did not eat file head");
+        assert!((c.len_s - 54.0).abs() < 1e-9);
+        // And it cannot reveal audio before the file: offset floors at zero.
+        app.arr_trim_left(id, 0.0);
+        let c = app.arrangement().clips[0].clone();
+        assert!((c.start_s - 20.0).abs() < 1e-9, "revealed before the file");
+        assert!((c.offset_s - 0.0).abs() < 1e-9);
+        app.arr_trim_left(id, 26.0); // back to the trimmed shape
+
+        app.arr_trim_right(id, 26.0 + 80.0);
+        let c = app.arrangement().clips[0].clone();
+        assert!(
+            (c.len_s - 54.0).abs() < 1e-9,
+            "the tail trim ran past the file: {}",
+            c.len_s
+        );
+        app.arr_trim_right(id, 26.0 + 30.0);
+        assert!((app.arrangement().clips[0].len_s - 30.0).abs() < 1e-9);
+
+        app.arr_fade_in(id, 28.0);
+        app.arr_fade_out(id, 51.0);
+        let c = app.arrangement().clips[0].clone();
+        assert!((c.fade_in_s - 2.0).abs() < 1e-9);
+        assert!((c.fade_out_s - 5.0).abs() < 1e-9);
+
+        // Split at 40: the head keeps the fade-in, the tail the fade-out,
+        // and the seam is sample-exact.
+        app.recorder.position_s = 40.0;
+        app.arr_selected = None;
+        app.arr_split_at_playhead();
+        let clips = app.arrangement().clips.clone();
+        assert_eq!(clips.len(), 2, "the split did not cut");
+        let (head, tail) = (&clips[0], &clips[1]);
+        assert!((head.start_s - 26.0).abs() < 1e-9);
+        assert!((head.len_s - 14.0).abs() < 1e-9);
+        assert!((head.fade_in_s - 2.0).abs() < 1e-9);
+        assert!((head.fade_out_s - 0.0).abs() < 1e-9);
+        assert!((tail.start_s - 40.0).abs() < 1e-9);
+        assert!((tail.len_s - 16.0).abs() < 1e-9);
+        assert!((tail.offset_s - 20.0).abs() < 1e-9, "the seam is not sample-exact");
+        assert!((tail.fade_out_s - 5.0).abs() < 1e-9);
+        assert_ne!(head.id, tail.id);
+
+        // Delete the tail; the document on disk keeps up.
+        app.arr_selected = Some(tail.id);
+        app.arr_delete_selected();
+        assert_eq!(app.arrangement().clips.len(), 1);
+        let doc = app.project_doc().unwrap().to_path_buf();
+        assert_eq!(Arrangement::load_from(&doc).clips.len(), 1);
+
+        // And a MIDI lane refuses audio, in the one place the rule lives.
+        let err = app.import_audio_at(&file, 0, 0.0).unwrap_err();
+        assert!(err.contains("MIDI lane"), "{err}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

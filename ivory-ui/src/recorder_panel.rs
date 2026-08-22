@@ -2071,6 +2071,76 @@ fn draw_timeline(painter: &Painter, r: Rect, view: &RecorderView<'_>, p: &Palett
         }
         return;
     }
+    // **The ARRANGEMENT overview, when there is a document to show.** Eight
+    // thin lanes, every clip a block in its channel's colour, the played
+    // half of the strip carrying the same lit/dim boundary the wave mode
+    // has always had. This is Ableton's overview strip on Tangent's desk;
+    // the single wave below remains the face for hosts with no document.
+    if !view.scrub.blocks.is_empty() {
+        let lanes = crate::recorder::CHANNELS as f32;
+        let row_h = r.height() / lanes;
+        // Faint stripes, so eight rows read as eight even where no clip
+        // stands — the arrangement's own lane field in miniature.
+        for i in 0..crate::recorder::CHANNELS {
+            if i % 2 == 1 {
+                let y = r.top() + row_h * i as f32;
+                painter.rect_filled(
+                    Rect::from_min_max(
+                        Pos2::new(r.left(), y),
+                        Pos2::new(r.right(), y + row_h),
+                    ),
+                    0.0,
+                    Color32::from_rgba_unmultiplied(0xff, 0xf4, 0xe0, 8),
+                );
+            }
+        }
+        let played = fraction_of(track.seconds, view.position_s).unwrap_or(0.0);
+        for (lane, f0, fl, color) in &view.scrub.blocks {
+            let y0 = r.top() + row_h * (*lane).min(crate::recorder::CHANNELS - 1) as f32;
+            let x0 = r.left() + r.width() * f0.clamp(0.0, 1.0);
+            let x1 = r.left() + r.width() * (f0 + fl).clamp(0.0, 1.0);
+            let block = Rect::from_min_max(
+                Pos2::new(x0, y0 + 1.0),
+                Pos2::new(x1.max(x0 + 1.5), y0 + row_h - 1.0),
+            );
+            if !block.is_positive() {
+                continue;
+            }
+            let fill = if *color != 0 {
+                let (cr, cg, cb) = crate::mixer_panel::STRIP_COLORS
+                    [(*color).min(crate::mixer_panel::STRIP_COLORS.len() - 1)];
+                Color32::from_rgb(cr, cg, cb)
+            } else {
+                Color32::from_rgb(0x2E, 0x6B, 0x46)
+            };
+            painter.rect_filled(block, 1.5, fill);
+        }
+        // The unplayed half dims, so the strip carries the position the way
+        // the wave always did.
+        let px = r.left() + r.width() * played.clamp(0.0, 1.0);
+        painter.rect_filled(
+            Rect::from_min_max(Pos2::new(px, r.top()), r.max),
+            0.0,
+            Color32::from_black_alpha(70),
+        );
+        // The arrangement's window, where a hand can pick it up. Drawn from
+        // the same helper the app's pan gesture reads, so the grab and the
+        // picture cannot drift.
+        if view.scrub.viewport.is_some() {
+            let vr = viewport_in(r, view);
+            if vr.is_positive() {
+                painter.rect_stroke(
+                    vr,
+                    2.0,
+                    Stroke::new(1.5, Color32::from_rgba_unmultiplied(0xff, 0xf4, 0xe0, 200)),
+                    StrokeKind::Inside,
+                );
+            }
+        }
+        draw_timeline_captions(painter, r, view, p);
+        draw_timeline_playhead(painter, r, view);
+        return;
+    }
     let mid = r.center().y;
     let half = r.height() * 0.40;
     // One column per point, sampled from the envelope — a decimation, not a
@@ -2095,12 +2165,19 @@ fn draw_timeline(painter: &Painter, r: Rect, view: &RecorderView<'_>, p: &Palett
             ink,
         );
     }
-    // The file's name, small over the top-left of the recess, and **the
-    // playhead against the length over the top-right** — the number the
-    // popup's clock used to carry, kept because it is the whole promise of
-    // the locate: click at 1:24 and something READS 1:24 before anything is
-    // pressed. Captions on the picture, not rows of their own — the rows are
-    // gone.
+    draw_timeline_captions(painter, r, view, p);
+    draw_timeline_playhead(painter, r, view);
+}
+
+/// The file's name, small over the top-left of the recess, and **the
+/// playhead against the length over the top-right** — the number the
+/// popup's clock used to carry, kept because it is the whole promise of
+/// the locate: click at 1:24 and something READS 1:24 before anything is
+/// pressed. Captions on the picture, not rows of their own. Shared by the
+/// wave face and the arrangement overview, so the clock cannot move when
+/// the picture changes mode.
+fn draw_timeline_captions(painter: &Painter, r: Rect, view: &RecorderView<'_>, p: &Palette) {
+    let track = view.track;
     let cap_h = (r.height() * 0.18).min(14.0);
     let clock = format!("{} / {}", time_text(view.position_s), time_text(track.seconds));
     let size = fit_text(
@@ -2128,10 +2205,13 @@ fn draw_timeline(painter: &Painter, r: Rect, view: &RecorderView<'_>, p: &Palett
             p.ink,
         );
     }
-    // The playhead, over the top: ivory at rest, the record button's own red
-    // while the transport moves, with a small cap so it reads as a marker
-    // rather than a scratch on the picture.
-    if let Some(t) = fraction_of(track.seconds, view.position_s) {
+}
+
+/// The playhead, over the top: ivory at rest, the record button's own red
+/// while the transport moves, with a small cap so it reads as a marker
+/// rather than a scratch on the picture.
+fn draw_timeline_playhead(painter: &Painter, r: Rect, view: &RecorderView<'_>) {
+    if let Some(t) = fraction_of(view.track.seconds, view.position_s) {
         let x = r.left() + t * r.width();
         let ink = if view.playing || view.state.is_active() {
             Color32::from_rgb(0xE8, 0x3A, 0x4E)
@@ -2153,6 +2233,39 @@ fn draw_timeline(painter: &Painter, r: Rect, view: &RecorderView<'_>, p: &Palett
             Stroke::NONE,
         ));
     }
+}
+
+/// Where the arrangement's viewport stands ON the timeline, for the panel's
+/// own drawing and the app's pan gesture — one function, so the grab and
+/// the picture cannot drift. `NOTHING` when there is no viewport to steer.
+fn viewport_in(r: Rect, view: &RecorderView<'_>) -> Rect {
+    let Some((f0, fl)) = view.scrub.viewport else {
+        return Rect::NOTHING;
+    };
+    if !r.is_positive() || fl <= 0.0 {
+        return Rect::NOTHING;
+    }
+    Rect::from_min_max(
+        Pos2::new(r.left() + r.width() * f0.clamp(0.0, 1.0), r.top()),
+        Pos2::new(
+            r.left() + r.width() * (f0 + fl).clamp(0.0, 1.0),
+            r.bottom(),
+        ),
+    )
+}
+
+/// The viewport against the LAID-OUT timeline, for the app.
+pub fn timeline_viewport_rect(rect: Rect, view: &RecorderView<'_>) -> Rect {
+    let l = Layout::new(rect, view);
+    if l.rolling || !l.timeline.is_positive() {
+        return Rect::NOTHING;
+    }
+    viewport_in(l.timeline, view)
+}
+
+/// The timeline's own rectangle, for gestures that map a pointer to it.
+pub fn timeline_rect(rect: Rect, view: &RecorderView<'_>) -> Rect {
+    Layout::new(rect, view).timeline
 }
 
 // ── the instrument slots ───────────────────────────────────────────────────
@@ -5547,6 +5660,7 @@ mod tests {
                                 position_s: 0.0,
                                 playing: false,
                                 input_monitor: false,
+                                scrub: crate::recorder::ScrubView::default(),
                                 state,
                                 elapsed_s: 3725.0,
                                 meters: Meters {

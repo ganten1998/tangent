@@ -238,6 +238,10 @@ pub struct RecorderView<'a> {
     /// owned — the outline is a thousand floats and the view is built every
     /// frame.
     pub track: &'a crate::ports::TrackInfo,
+    /// The arrangement overview the timeline draws. Empty means "draw the
+    /// single wave the track info carries" — the plugin's face, and any
+    /// host that has not pushed a document.
+    pub scrub: ScrubView,
     /// The control a hand is on right now, if any. A knob shows its number
     /// while it is being turned and its name the rest of the time: there is
     /// nowhere on a knob to keep both, and the number is only wanted while it
@@ -285,6 +289,21 @@ pub struct RecorderView<'a> {
     pub clip_warning: bool,
 }
 
+/// The band timeline's overview of the ARRANGEMENT: every clip as a block
+/// against the whole song — Ableton's overview strip at Tangent density —
+/// and the arrangement view's window when it is open to steer.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ScrubView {
+    /// `(lane, start_frac, len_frac, colour)` per clip, fractions of the
+    /// SPAN — the same axis the seek and the playhead already run on. The
+    /// colour indexes `mixer_panel::STRIP_COLORS`; zero is the desk's wood
+    /// and draws as the timeline's own green.
+    pub blocks: Vec<(usize, f32, f32, usize)>,
+    /// The arrangement view's window as fractions of the span. Drawn as a
+    /// rectangle a hand can pick up and slide.
+    pub viewport: Option<(f32, f32)>,
+}
+
 impl RecorderView<'_> {
     /// Whether the clip warning is on screen — and therefore whether it is
     /// something a press can land on.
@@ -312,6 +331,7 @@ impl RecorderView<'_> {
             fx: FxSends { reverb: 0.0, delay: 0.0, chorus: 0.0, hpf: 0.0, lpf: 0.0, limiter: 0.0 },
             fx_units: [crate::ports::KnobUnit::Percent; 6],
             track: crate::ports::TrackInfo::NONE,
+            scrub: ScrubView::default(),
             turning: None,
             metronome_on: false,
             metronome_in_take: false,
@@ -795,6 +815,7 @@ impl RecorderState {
         };
         RecorderView {
             input_monitor: false,
+            scrub: ScrubView::default(),
             state: self.state,
             elapsed_s: self.elapsed_s,
             position_s: self.position_s,

@@ -1384,6 +1384,11 @@ unsafe impl Send for PluginBox {}
 #[derive(Clone)]
 pub struct Placed {
     pub clip: Arc<ivory_record::decode::Clip>,
+    /// Which general channel — which LANE — the clip plays through: its
+    /// fader, its mute and solo, its send. Not its rack yet: a rack also
+    /// runs for the lane's LIVE input, and one rack must run once per block,
+    /// which is the unification a later phase owes.
+    pub strip: usize,
     /// The timeline frame where the clip begins.
     pub start: u64,
     /// Frames into the FILE where playback starts — the left trim.
@@ -1405,6 +1410,7 @@ impl Placed {
         let len = clip.frames() as u64;
         Self {
             clip,
+            strip: 0,
             start,
             offset: 0,
             len,
@@ -1582,7 +1588,9 @@ struct Renderer {
     /// nothing else. Project frames, not clip frames: a clip positions itself
     /// as `pos - placed.start`.
     pos: u64,
-    track_gain: f32,
+    /// One slewed gain per lane, for the clips standing on it. The lane's
+    /// fader by way of `strip_is_heard`, advanced once per frame per lane.
+    lane_gain: [f32; CHANNELS],
     /// The transport generation this callback has applied. See `run_transport`.
     seen_req: u64,
     /// Whether the last chunk rolled, for the note flush on a falling edge —
@@ -2083,7 +2091,7 @@ impl Renderer {
                 self.sounding = 0;
             }
             self.was_rolling = rolling;
-            self.mix_clips(at, rolling, n);
+            self.mix_clips(at, rolling, n, muted, soloed);
             self.mix_monitor(n, muted, soloed);
             // ── the click, and what it sends ───────────────────────────
             //
@@ -2681,7 +2689,7 @@ impl Renderer {
     /// The clip is stereo at the device's rate — `decode` guarantees both — so
     /// there is no resampling and no channel mapping here, which is the whole
     /// reason it is guaranteed there.
-    fn mix_clips(&mut self, at: u64, rolling: bool, frames: usize) {
+    fn mix_clips(&mut self, at: u64, rolling: bool, frames: usize, muted: u32, soloed: u32) {
         // A clip LIST arriving — and the displaced one going BACK, by the
         // racks' own protocol: no room to return it, no swap this block.
         // Dropping it here would free a hundred megabytes inside the
@@ -2698,22 +2706,38 @@ impl Renderer {
         if !rolling || self.clips.is_empty() {
             return;
         }
-        // **The whole bed at one gain, under the master alone.** Per-LANE
-        // routing — a clip through its channel's fader, rack and send — is
-        // the arrangement view's phase; what plays today is the document's
-        // audio, placed and faded, at the gain the backing track always had.
-        let target = Shared::f32_of(&self.shared.track_gain).clamp(0.0, 8.0);
+        // **Per LANE: the clip plays through its channel.** Its fader, its
+        // mute and solo, its post-fader send — the strip's own facts, read
+        // the way every other source reads them. Not its rack yet: the rack
+        // also runs for the lane's live input, one rack must run once per
+        // block, and that unification is a later phase's.
         let coeff = self.gain_coeff;
-        let Some(mix) = self.mix.get_mut(..frames * TAP_CHANNELS) else {
+        let mut target = [0.0f32; CHANNELS];
+        let mut send = [0.0f32; CHANNELS];
+        for lane in 0..CHANNELS {
+            let strip = Strip::Channel(lane);
+            target[lane] = if strip_is_heard(strip, muted, soloed) {
+                Shared::f32_of(&self.shared.channel_gains[lane]).clamp(0.0, 8.0)
+            } else {
+                0.0
+            };
+            send[lane] = Shared::f32_of(&self.shared.send[strip.index()]).clamp(0.0, 1.0);
+        }
+        let (Some(mix), Some(aux)) = (
+            self.mix.get_mut(..frames * TAP_CHANNELS),
+            self.aux.get_mut(..frames * TAP_CHANNELS),
+        ) else {
             return;
         };
+        let mut peak = [[0.0f32; 2]; CHANNELS];
         for f in 0..frames {
-            self.track_gain += (target - self.track_gain) * coeff;
+            for lane in 0..CHANNELS {
+                self.lane_gain[lane] += (target[lane] - self.lane_gain[lane]) * coeff;
+            }
             // Project frame. The u64 compares come BEFORE any cast, because
             // `p` grows without bound; before a clip and past its end are
             // both silence, and both are ordinary.
             let p = at + f as u64;
-            let (mut l, mut r) = (0.0f32, 0.0f32);
             for placed in &self.clips {
                 let Some(k) = p.checked_sub(placed.start) else {
                     continue;
@@ -2746,11 +2770,21 @@ impl Renderer {
                 if placed.fade_out > 0 && left <= placed.fade_out {
                     env *= (left - 1) as f32 / placed.fade_out as f32;
                 }
-                l += cl * env;
-                r += cr * env;
+                let lane = placed.strip.min(CHANNELS - 1);
+                let g = self.lane_gain[lane];
+                let (l, r) = (cl * env * g, cr * env * g);
+                peak[lane][0] = peak[lane][0].max(l.abs());
+                peak[lane][1] = peak[lane][1].max(r.abs());
+                mix[f * TAP_CHANNELS] += l;
+                mix[f * TAP_CHANNELS + 1] += r;
+                aux[f * TAP_CHANNELS] += l * send[lane];
+                aux[f * TAP_CHANNELS + 1] += r * send[lane];
             }
-            mix[f * TAP_CHANNELS] += l * self.track_gain;
-            mix[f * TAP_CHANNELS + 1] += r * self.track_gain;
+        }
+        for (lane, pk) in peak.iter().enumerate() {
+            if pk[0] > 0.0 || pk[1] > 0.0 {
+                self.shared.note_strip_peak(Strip::Channel(lane), *pk);
+            }
         }
     }
 
@@ -3334,7 +3368,7 @@ impl Engine {
             notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK),
             clips: Vec::new(),
             pos: 0,
-            track_gain: 1.0,
+            lane_gain: [1.0; CHANNELS],
             seen_req: 0,
             was_rolling: false,
             sounding: 0,
@@ -5536,7 +5570,7 @@ mod tests {
             fx_return_gain: 1.0,
             clips: Vec::new(),
             pos: 0,
-            track_gain: 1.0,
+            lane_gain: [1.0; CHANNELS],
             seen_req: 0,
             was_rolling: false,
             sounding: 0,
@@ -6034,6 +6068,7 @@ mod tests {
                 // A: the first 500 frames of the timeline, bare.
                 Placed {
                     clip: Arc::clone(&a),
+                    strip: 0,
                     start: 0,
                     offset: 0,
                     len: 500,
@@ -6044,6 +6079,7 @@ mod tests {
                 // 400 — so 400..500 overlaps A — with 100-frame ramps.
                 Placed {
                     clip: Arc::clone(&b),
+                    strip: 0,
                     start: 400,
                     offset: 100,
                     len: 300,
@@ -6052,8 +6088,6 @@ mod tests {
                 },
             ])
             .expect("room");
-        shared.set_track_gain(1.0);
-        r.track_gain = 1.0;
         shared.transport_at.store(0, Ordering::Relaxed);
         shared.transport_req.store(1, Ordering::Release);
         shared.rolling.store(true, Ordering::Relaxed);
@@ -6075,6 +6109,57 @@ mod tests {
         close(650, 0.49, "B halfway down its fade-out");
         close(699, 0.0, "B's LAST frame is exactly silent");
         close(720, 0.0, "past everything");
+    }
+
+    /// **A clip plays through its LANE: mute silences it, solo isolates
+    /// it.** The strip's own rules, applied to the document's audio — the
+    /// difference between "a bed under the master" and an arrangement.
+    #[test]
+    fn a_lanes_mute_and_solo_govern_its_clips() {
+        use std::sync::Arc;
+        let constant = |v: f32| {
+            Arc::new(ivory_record::decode::Clip {
+                samples: vec![v; 4000],
+                rate: 48_000,
+                source: std::path::PathBuf::from("c.wav"),
+            })
+        };
+        let clip_on = |lane: usize, level: f32| Placed {
+            clip: constant(level),
+            strip: lane,
+            start: 0,
+            offset: 0,
+            len: 2000,
+            fade_in: 0,
+            fade_out: 0,
+        };
+        let run = |muted: u32, soloed: u32| -> f32 {
+            let (mut r, _tx, shared) = renderer_with_midi(2);
+            let (mut to_audio, _from) = r.hijack_track_rings();
+            to_audio
+                .push(vec![clip_on(0, 0.5), clip_on(2, 1.0)])
+                .expect("room");
+            shared.transport_at.store(0, Ordering::Relaxed);
+            shared.transport_req.store(1, Ordering::Release);
+            shared.rolling.store(true, Ordering::Relaxed);
+            shared.muted.store(muted, Ordering::Relaxed);
+            shared.soloed.store(soloed, Ordering::Relaxed);
+            let mut out = vec![0.0_f32; 2 * 1024];
+            // Two renders: the first lets the lane gains slew to their
+            // targets, the second is what is measured.
+            r.render(&mut out, 0, 0);
+            r.render(&mut out, 0, 0);
+            out[2 * 512]
+        };
+        assert!((run(0, 0) - 1.5).abs() < 0.01, "both lanes should sum");
+        assert!(
+            (run(1 << 2, 0) - 0.5).abs() < 0.01,
+            "muting lane 3 should leave lane 1 alone"
+        );
+        assert!(
+            (run(0, 1 << 2) - 1.0).abs() < 0.01,
+            "soloing lane 3 should silence lane 1"
+        );
     }
 
     /// **A patch you pick has to be the patch you hear.** The picker is a list
@@ -6113,8 +6198,6 @@ mod tests {
         to_audio
             .push(vec![Placed::whole(Arc::clone(&clip), 0)])
             .expect("room");
-        shared.set_track_gain(1.0);
-        r.track_gain = 1.0;
 
         // 1. Stopped: silence, and the clock does not move.
         let mut out = vec![0.0_f32; 2 * 256];

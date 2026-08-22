@@ -960,6 +960,11 @@ fn strip(
             crate::recorder_panel::draw_metronome_on(painter, l.icon, ink, face);
             true
         }
+        // A CLIP lane: used, no live source — the waveform is what is on it.
+        (Some(Strip::Channel(_)), None) => {
+            crate::recorder_panel::draw_waveform_icon(painter, l.icon, ink);
+            true
+        }
         _ => false,
     };
     let _ = named;

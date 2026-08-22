@@ -20,6 +20,7 @@ pub mod recorder;
 pub mod mixer_panel;
 pub mod recorder_panel;
 pub mod arrangement;
+pub mod arrangement_panel;
 pub mod settings;
 pub mod splash;
 pub mod staff;

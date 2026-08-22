@@ -321,6 +321,42 @@ pub struct DesktopApp {
 #[cfg(feature = "recorder")]
 const TRACK_WAVE_BUCKETS: usize = 1000;
 
+/// Buckets per CLIP picture in the arrangement. Smaller than the band's:
+/// a clip is one of many and redrawn on every trim.
+const CLIP_WAVE_BUCKETS: usize = 600;
+
+/// A peak envelope of `len` frames starting `offset` frames into `clip`,
+/// interleaved stereo folded to one magnitude per bucket — the played
+/// span's picture, where `Clip::envelope` is the whole file's.
+#[cfg(feature = "recorder")]
+fn span_envelope(
+    clip: &ivory_record::decode::Clip,
+    offset: usize,
+    len: usize,
+    buckets: usize,
+) -> Vec<f32> {
+    let total = clip.samples.len() / 2;
+    let start = offset.min(total);
+    let end = (offset + len).min(total);
+    let frames = end.saturating_sub(start);
+    if frames == 0 || buckets == 0 {
+        return Vec::new();
+    }
+    let mut out = vec![0.0f32; buckets];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let a = start + i * frames / buckets;
+        let b = (start + (i + 1) * frames / buckets).max(a + 1).min(end);
+        let mut peak = 0.0f32;
+        for f in a..b {
+            let l = clip.samples.get(f * 2).copied().unwrap_or(0.0).abs();
+            let r = clip.samples.get(f * 2 + 1).copied().unwrap_or(0.0).abs();
+            peak = peak.max(l).max(r);
+        }
+        *slot = peak.min(1.0);
+    }
+    out
+}
+
 /// **Every stepped row has a list to step through.**
 ///
 /// The panel decides which rows are named-value rows ([`FxRow::step`]) and the
@@ -2235,6 +2271,7 @@ impl DesktopApp {
         let mut span = 0.0f64;
         let mut error = String::new();
         let mut fill_len: Vec<(u64, f64)> = Vec::new();
+        let mut clip_infos: Vec<(u64, Vec<f32>, f64)> = Vec::new();
         for clip in &doc.clips {
             let path = ivory_ui::arrangement::Arrangement::resolve(&doc_path, &clip.path);
             let decoded = match self.track_cache.get(&path) {
@@ -2263,6 +2300,7 @@ impl DesktopApp {
             let frames = |s: f64| (s.max(0.0) * f64::from(rate)).round() as u64;
             placed.push(crate::instrument::Placed {
                 clip: Arc::clone(&decoded),
+                strip: clip.lane.min(ivory_ui::recorder::CHANNELS - 1),
                 start: frames(clip.start_s),
                 offset: frames(clip.offset_s),
                 len: frames(len_s),
@@ -2277,7 +2315,20 @@ impl DesktopApp {
                     error: String::new(),
                 });
             }
+            // The clip's own picture: the PLAYED span's envelope, so a
+            // trimmed clip shows the audio it will actually make.
+            clip_infos.push((
+                clip.id,
+                span_envelope(
+                    &decoded,
+                    frames(clip.offset_s) as usize,
+                    frames(len_s) as usize,
+                    CLIP_WAVE_BUCKETS,
+                ),
+                file_s,
+            ));
         }
+        self.app.set_clip_infos(clip_infos);
         // Lengths the decode just established, written down so the scrubber
         // can draw next launch without one. Never marks the clips dirty.
         for (id, len_s) in fill_len {

@@ -1741,6 +1741,13 @@ mod shot {
         if std::env::var("IVORY_SHOT_MIXER").is_ok() {
             app.open_mixer_for_shot();
         }
+        // The arrangement's document, for the band's overview scrubber —
+        // the window shot cannot draw the arrangement panel itself (the
+        // compositor paints the piano), but the band it paints reads the
+        // document, viewport included.
+        if std::env::var("IVORY_SHOT_ARRANGE").is_ok() {
+            app.open_arrangement_for_shot();
+        }
         let mut shoot = |app: &IvoryApp| {
             c.frame(app, Layout::default(), DisplayShows::default(), false, true, None, 0)
                 .and_then(|_| c.flush())
@@ -1814,6 +1821,69 @@ mod shot {
     ///
     ///   IVORY_SHOT=/tmp/desk.png cargo test -p ivory --bins shot::mixer \
     ///     -- --ignored --nocapture
+    /// The arrangement view, alone at panel size.
+    ///
+    ///   IVORY_SHOT=/tmp/arr.png cargo test -p ivory --bins shot::arrange \
+    ///     -- --ignored --nocapture
+    #[test]
+    #[ignore = "writes a picture for a person to look at"]
+    fn arrange() {
+        let Ok(out) = std::env::var("IVORY_SHOT") else {
+            eprintln!("IVORY_SHOT not set");
+            return;
+        };
+        // SAFETY: single-threaded test setup, before any app exists.
+        unsafe {
+            std::env::set_var(
+                "IVORY_SETTINGS_PATH",
+                std::env::temp_dir().join("tangent-shot-settings.json"),
+            );
+        }
+        let (w, h) = (1220u32, 500u32);
+        let mut c = match Compositor::standalone(w, h) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("no GPU here: {e}");
+                return;
+            }
+        };
+        let mut settings = ivory_ui::settings::Settings::default();
+        settings.show_recorder = true;
+        let mut app = IvoryApp::new(c.context(), settings, ivory_ui::host::Caps::DESKTOP);
+        app.open_arrangement_for_shot();
+        let mut shoot = |app: &IvoryApp| {
+            let draw = |painter: &egui::Painter, rect: egui::Rect| {
+                let clips = app.arrange_clips_for_shot();
+                let view = app.arrange_view_for_shot(&clips);
+                ivory_ui::arrangement_panel::draw(painter, rect, &view);
+            };
+            c.frame_painting(
+                app,
+                Layout::default(),
+                DisplayShows::default(),
+                false,
+                true,
+                None,
+                0,
+                Some(&draw),
+            )
+            .and_then(|_| c.flush())
+            .map(|_| ())
+        };
+        for _ in 0..2 {
+            if let Err(e) = shoot(&app) {
+                eprintln!("frame: {e}");
+                return;
+            }
+        }
+        let Some(px) = c.last_frame() else {
+            eprintln!("nothing came back");
+            return;
+        };
+        write_png(std::path::Path::new(&out), &px[..(h * w * 4) as usize], w, h);
+        println!("wrote {out}");
+    }
+
     #[test]
     #[ignore = "writes a picture for a person to look at"]
     fn mixer() {
