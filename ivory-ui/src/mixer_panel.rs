@@ -58,10 +58,14 @@ pub struct StripView<'a> {
     pub muted: bool,
     pub soloed: bool,
     /// Whether the channel can be taken off the desk — a used general
-    /// channel, or the backing track while a file is loaded. Decided by the
-    /// APP, because "is there a track" is app state a painter cannot know.
-    /// A removable channel wears a small × at its top right.
+    /// channel. Decided by the APP; a removable channel wears a small × at
+    /// its top right.
     pub removable: bool,
+    /// Whether the channel is ARMED — record-ready and LIVE: an armed MIDI
+    /// channel sounds when the keys are played, an armed AUDIO channel
+    /// monitors its input. Session state, never saved: a project must be
+    /// openable without headphones. See docs/ARRANGEMENT.md.
+    pub armed: bool,
 }
 
 impl StripView<'_> {
@@ -161,6 +165,9 @@ pub enum Hit {
     Name(Column),
     /// The × at the top right of a removable channel: take it off the desk.
     Remove(Column),
+    /// The R switch: arm the channel — record-ready, and LIVE. The third of
+    /// the M S R row, on general channels alone.
+    Arm(Column),
     /// One of the two rows of an open insert menu — or, with
     /// [`FxAction::Dismiss`], a press anywhere else while it is up.
     FxMenu(Column, usize, FxAction),
@@ -194,6 +201,7 @@ impl Hit {
             | Hit::Db(i)
             | Hit::Name(i)
             | Hit::Remove(i)
+            | Hit::Arm(i)
             | Hit::FxMenu(i, ..)
             | Hit::AddKind(i, _)
             | Hit::Paint(i, _) => i,
@@ -210,7 +218,7 @@ impl Hit {
             Hit::Fader(_) => Some(DragAxis::Vertical),
             Hit::Send(_) => Some(DragAxis::Vertical),
             Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(..) | Hit::Paint(..)
-            | Hit::Palette(_) | Hit::Db(_) | Hit::Name(_) | Hit::Remove(_)
+            | Hit::Palette(_) | Hit::Db(_) | Hit::Name(_) | Hit::Remove(_) | Hit::Arm(_)
             | Hit::FxMenu(..) | Hit::AddKind(..) => None,
         }
     }
@@ -221,7 +229,7 @@ impl Hit {
             Hit::Fader(_) => Some(FADER_TRAVEL),
             Hit::Send(_) => Some(SEND_TRAVEL),
             Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(..) | Hit::Paint(..)
-            | Hit::Palette(_) | Hit::Db(_) | Hit::Name(_) | Hit::Remove(_)
+            | Hit::Palette(_) | Hit::Db(_) | Hit::Name(_) | Hit::Remove(_) | Hit::Arm(_)
             | Hit::FxMenu(..) | Hit::AddKind(..) => None,
         }
     }
@@ -329,6 +337,8 @@ pub struct StripStrip {
     pub db: Rect,
     pub mute: Rect,
     pub solo: Rect,
+    /// The R switch. `NOTHING` on everything but a general channel.
+    pub arm: Rect,
     /// A user effect plugin across this strip. Only the bus has one today.
     pub inserts: [Rect; INSERTS],
     /// The plus on an empty slot.
@@ -353,6 +363,7 @@ impl StripStrip {
         db: Rect::NOTHING,
         mute: Rect::NOTHING,
         solo: Rect::NOTHING,
+        arm: Rect::NOTHING,
         inserts: [Rect::NOTHING; INSERTS],
         add: Rect::NOTHING,
         close: Rect::NOTHING,
@@ -488,14 +499,30 @@ impl Layout {
             )
         });
         let switches = if switchable { cut(0.902, 0.975) } else { Rect::NOTHING };
-        let (mute, solo) = if switchable {
+        // **M S R on a general channel; M S on the click.** Arm is
+        // record-ready AND live — a thing only a channel can be. Three
+        // switches share the row the pair had; the letters carry them at the
+        // width that leaves.
+        let has_arm = matches!(view.strip, Some(Strip::Channel(_)));
+        let (mute, solo, arm) = if switchable && has_arm {
+            let w = ((switches.width() - 8.0) / 3.0).max(1.0);
+            let cell = |k: f32| {
+                let left = switches.left() + k * (w + 4.0);
+                Rect::from_min_max(
+                    Pos2::new(left, switches.top()),
+                    Pos2::new(left + w, switches.bottom()),
+                )
+            };
+            (cell(0.0), cell(1.0), cell(2.0))
+        } else if switchable {
             let mid = switches.center().x;
             (
                 Rect::from_min_max(switches.min, Pos2::new(mid - 3.0, switches.max.y)),
                 Rect::from_min_max(Pos2::new(mid + 3.0, switches.min.y), switches.max),
+                Rect::NOTHING,
             )
         } else {
-            (Rect::NOTHING, Rect::NOTHING)
+            (Rect::NOTHING, Rect::NOTHING, Rect::NOTHING)
         };
         // A strip with no send starts its fader where the send would have been,
         // rather than leaving a hole: a hole reads as a control that failed to
@@ -578,6 +605,7 @@ impl Layout {
             db: cut(0.83, 0.888),
             mute,
             solo,
+            arm,
             inserts,
             // **The same target as the plus on an empty one**, because it is
             // the same question: what is on this channel. An empty slot draws
@@ -602,6 +630,7 @@ impl Layout {
                 (s.send, Hit::Send(i)),
                 (s.mute, Hit::Mute(i)),
                 (s.solo, Hit::Solo(i)),
+                (s.arm, Hit::Arm(i)),
                 (s.add, Hit::Add(i)),
                 (s.inserts[0], Hit::Insert(i, 0)),
                 (s.inserts[1], Hit::Insert(i, 1)),
@@ -706,6 +735,8 @@ struct Ink {
     lit: Color32,
     mute: Color32,
     solo: Color32,
+    /// The R switch's light: record red, brighter than the solo's crimson.
+    arm: Color32,
     meter_lo: Color32,
     gr: Color32,
     meter_hi: Color32,
@@ -739,6 +770,7 @@ fn ink(view: &MixerView<'_>) -> Ink {
         lit: Color32::from_rgb(0x1C, 0x6F, 0xD6),
         mute: Color32::from_rgb(0xE0, 0xA8, 0x22),
         solo: Color32::from_rgb(0xE8, 0x3A, 0x4E),
+        arm: Color32::from_rgb(0xE0, 0x22, 0x22),
         meter_lo: Color32::from_rgb(0x3D, 0xC0, 0x5A),
         gr: Color32::from_rgb(0xE8, 0x8C, 0x2A),
         meter_hi: Color32::from_rgb(0xE0, 0xA8, 0x22),
@@ -1084,6 +1116,9 @@ fn strip(
     if l.mute.is_positive() {
         switch(painter, l.mute, "M", v.muted, p.mute, p);
         switch(painter, l.solo, "S", v.soloed, p.solo, p);
+    }
+    if l.arm.is_positive() {
+        switch(painter, l.arm, "R", v.armed, p.arm, p);
     }
 }
 
@@ -1631,6 +1666,7 @@ mod tests {
             soloed: false,
             // What the app decides: a used general channel can be removed.
             removable: !empty && matches!(strip, Some(Strip::Channel(_))),
+            armed: false,
         }
     }
 
@@ -2256,6 +2292,41 @@ mod tests {
             hit_test(r, &with_track, l.strips[track_col].close.center()),
             Some(Hit::Remove(Column(track_col)))
         );
+    }
+
+    /// **M S R on a general channel; M S on the click; nothing armable
+    /// anywhere else.** Arm is record-ready AND live — a thing only a
+    /// channel can be — and all three switches have to be pressable where
+    /// they are drawn.
+    #[test]
+    fn the_switch_row_is_m_s_r_on_channels_and_m_s_on_the_click() {
+        let v = a_view();
+        let r = rect();
+        let l = Layout::new(r, &v);
+        for n in 0..crate::recorder::CHANNELS {
+            let s = &l.strips[n];
+            assert!(s.arm.is_positive(), "channel {n} has no R switch");
+            assert_eq!(
+                hit_test(r, &v, s.arm.center()),
+                Some(Hit::Arm(Column(n))),
+                "channel {n}'s R cannot be pressed"
+            );
+            assert_eq!(hit_test(r, &v, s.mute.center()), Some(Hit::Mute(Column(n))));
+            assert_eq!(hit_test(r, &v, s.solo.center()), Some(Hit::Solo(Column(n))));
+        }
+        assert!(
+            !l.strips[CLICK].arm.is_positive(),
+            "the click grew an arm switch; a metronome cannot be recorded"
+        );
+        assert!(l.strips[CLICK].mute.is_positive());
+        assert!(
+            !l.strips[MASTER].arm.is_positive(),
+            "the master grew an arm switch"
+        );
+        // An empty slot has no switches at all — its one control is the plus.
+        let mut empty = a_view();
+        empty.strips[0] = a_strip(Some(Strip::Channel(0)), true);
+        assert!(!Layout::new(r, &empty).strips[0].arm.is_positive());
     }
 
     /// Everything that travels does so vertically, and knows how far.

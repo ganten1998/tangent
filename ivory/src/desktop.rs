@@ -2478,10 +2478,18 @@ impl DesktopApp {
             [None; ivory_ui::recorder::INPUTS];
         let mut next_pick = 0usize;
         let mut builtin: Option<usize> = None;
+        let armed = self.app.armed_mask();
         for ch in 0..ivory_ui::recorder::CHANNELS {
             e.set_channel_gain(ch, gains.channels[ch]);
             match self.app.channel_kind(ch) {
                 Some(ivory_ui::recorder::ChannelKind::Midi) => {
+                    // **Arm is the live switch.** An unarmed MIDI channel
+                    // takes no live notes — riding `midi_off` on purpose,
+                    // because that mask's edge is what releases the keys a
+                    // disarm would otherwise leave sounding.
+                    if armed & (1 << ch) == 0 {
+                        midi_off |= 1 << ch;
+                    }
                     if builtin.is_none()
                         && self.app.insert(ch, 0)
                             == Some(ivory_ui::dialogs::BUILTIN_PATH)
@@ -2500,6 +2508,7 @@ impl DesktopApp {
             }
         }
         e.set_midi_off(midi_off);
+        e.set_armed(armed);
         e.set_pick_strips(picks);
         e.set_builtin_strip(builtin);
         // Never read from a settings file — see `IvoryApp::input_monitor`. It

@@ -287,6 +287,11 @@ pub struct IvoryApp {
     open_insert_on_load: Option<(usize, usize)>,
     /// The empty channel being asked MIDI or AUDIO, if any.
     mixer_add_ask: Option<crate::recorder::Column>,
+    /// Which channels are ARMED — record-ready and LIVE — as a bitmask.
+    /// Session state, never saved: a project must be openable without
+    /// headphones, so every launch starts with only the default instrument
+    /// live. See `default_armed` and docs/ARRANGEMENT.md.
+    armed: u32,
     /// Where the mixer was last drawn, so a press can be tested against it.
     mixer_rect: Option<Rect>,
     /// The OS's own file panel is on screen right now.
@@ -536,6 +541,28 @@ struct Grab {
 ///
 /// A slot holds a PATH, and a bundle path under a channel is the sort of detail
 /// that makes an app look like it is showing you its insides.
+/// Which channel a session opens with ARMED — record-ready and live.
+///
+/// **All arms off, save one**, by the owner's rule: a project must be
+/// openable without headphones and without being blasted, and the one
+/// exception is the channel that makes the piano sound — the one whose
+/// first bay holds the built-in DX7, or failing that the first MIDI channel
+/// carrying any instrument at all. A desk with neither opens silent, which
+/// is the honest reading of a desk with nothing to play.
+fn default_armed(settings: &crate::settings::Settings) -> u32 {
+    let kind = |n: usize| settings.channel_kinds.get(n).copied().unwrap_or(0);
+    let bay0 = |n: usize| {
+        settings
+            .strip_inserts
+            .get(n * crate::recorder::INSERTS)
+            .map_or("", String::as_str)
+    };
+    (0..crate::recorder::CHANNELS)
+        .find(|n| kind(*n) == 1 && bay0(*n) == dialogs::BUILTIN_PATH)
+        .or_else(|| (0..crate::recorder::CHANNELS).find(|n| kind(*n) == 1 && !bay0(*n).is_empty()))
+        .map_or(0, |n| 1 << n)
+}
+
 fn plugin_display_name(path: &str) -> &str {
     if path == dialogs::BUILTIN_PATH {
         return "TANGENT DX7";
@@ -701,6 +728,8 @@ impl IvoryApp {
         let startup_recorder_detach_at = (settings.recorder_detached && settings.show_recorder)
             .then(|| Instant::now() + DEBOUNCE_100MS);
 
+        // Computed BEFORE the literal takes `settings`. See `default_armed`.
+        let armed = default_armed(&settings);
         Self {
             settings,
             detector,
@@ -762,6 +791,7 @@ impl IvoryApp {
             mixer_naming: None,
             mixer_fx_menu: None,
             mixer_add_ask: None,
+            armed,
             open_insert_on_load: None,
             mixer_rect: None,
             native_panel_up: false,
@@ -1627,8 +1657,8 @@ impl IvoryApp {
                 .map_or(0.0, |s| recorder::gain_to_fader(s.gain)),
             H::Send(i) => view.strips.get(i.0).map_or(0.0, |s| s.send),
             H::Mute(_) | H::Solo(_) | H::Add(_) | H::Insert(..) | H::Paint(..)
-            | H::Palette(_) | H::Db(_) | H::Name(_) | H::Remove(_) | H::FxMenu(..)
-            | H::AddKind(..) => 0.0,
+            | H::Palette(_) | H::Db(_) | H::Name(_) | H::Remove(_) | H::Arm(_)
+            | H::FxMenu(..) | H::AddKind(..) => 0.0,
         }
     }
 
@@ -1819,6 +1849,14 @@ impl IvoryApp {
                 }
                 return;
             }
+            // The R switch: arm is record-ready AND live, and it is session
+            // state — deliberately unsaved, so no project can open loud.
+            H::Arm(i) => {
+                if let Some(Strip::Channel(n)) = i.strip() {
+                    self.armed ^= 1 << n;
+                }
+                return;
+            }
             // A row of the insert menu, or a press anywhere else while it is
             // up. Either way the menu closes: it answers one press.
             H::FxMenu(i, n, action) => {
@@ -1846,6 +1884,9 @@ impl IvoryApp {
                     {
                         *send = 1.0;
                     }
+                    // A track somebody just added is a track they are about
+                    // to play: it opens ARMED, which is what makes it live.
+                    self.armed |= 1 << n;
                     self.save_settings();
                 }
                 return;
@@ -1882,6 +1923,7 @@ impl IvoryApp {
         }
         self.settings.strip_muted &= !(1 << at);
         self.settings.strip_soloed &= !(1 << at);
+        self.armed &= !(1 << n);
         // The bays last, through `set_insert` so the host's reconcile unloads
         // whatever was running in them.
         for bay in 0..crate::recorder::INSERTS {
@@ -2027,6 +2069,10 @@ impl IvoryApp {
                 // channel goes back to being an empty slot. The click and
                 // the bus are the desk's own and stay.
                 removable: matches!(s, Strip::Channel(_)) && kind.is_some(),
+                armed: match s {
+                    Strip::Channel(n) => self.armed & (1 << n) != 0,
+                    _ => false,
+                },
             }
         };
         let channels = Strip::shown();
@@ -2066,6 +2112,7 @@ impl IvoryApp {
                     muted: false,
                     soloed: false,
                     removable: false,
+                    armed: false,
                 },
             }),
             any_solo: desk.any_solo(),
@@ -3331,6 +3378,12 @@ impl IvoryApp {
     /// desk indices. Taken, so asking twice answers once.
     pub fn take_desk_state_shift(&mut self) -> bool {
         std::mem::take(&mut self.settings.desk_state_shift_v13)
+    }
+
+    /// Which channels are armed — record-ready and LIVE — for the host to
+    /// push at the engine every frame.
+    pub fn armed_mask(&self) -> u32 {
+        self.armed
     }
 
     /// The backing track's level, for the host to push at the engine.
@@ -7144,6 +7197,7 @@ impl IvoryApp {
                         | crate::mixer_panel::Hit::Paint(..)
                         | crate::mixer_panel::Hit::Palette(_)
                         | crate::mixer_panel::Hit::Remove(_)
+                        | crate::mixer_panel::Hit::Arm(_)
                         | crate::mixer_panel::Hit::FxMenu(..)
                         | crate::mixer_panel::Hit::AddKind(..)
                         | crate::mixer_panel::Hit::Db(_))) => {
@@ -8344,6 +8398,41 @@ mod tests {
         assert!(
             !app.take_open_insert_on_load(1, 2),
             "an unload has no window to show"
+        );
+    }
+
+    /// **Arm is the live switch, and a session opens with one arm up: the
+    /// DX7's.** All others off — the owner's no-headphones rule — and the R
+    /// switch toggles it, a fresh track opens armed, and a removed channel
+    /// gives its arm back. Session state: nothing here touches settings.
+    #[test]
+    fn arm_opens_on_the_dx7_alone_and_follows_the_desk() {
+        use crate::mixer_panel::Hit;
+        use crate::recorder::{ChannelKind, Column};
+        let (_, mut app) = headless(Caps::DESKTOP);
+        // The shipped desk: the DX7 on channel 0 opens LIVE, nothing else.
+        assert_eq!(app.armed_mask(), 1, "a fresh desk should open with the DX7 armed");
+
+        app.apply_mixer_hit(Hit::Arm(Column(0)), 0.0);
+        assert_eq!(app.armed_mask(), 0, "R did not disarm");
+        app.apply_mixer_hit(Hit::Arm(Column(0)), 0.0);
+        assert_eq!(app.armed_mask(), 1, "R did not arm again");
+
+        // A track somebody just added is about to be played: it opens armed.
+        let n = (1..crate::recorder::CHANNELS)
+            .find(|n| app.channel_kind(*n).is_none())
+            .expect("an unused channel");
+        app.apply_mixer_hit(Hit::AddKind(Column(n), Some(ChannelKind::Midi)), 0.0);
+        assert_ne!(app.armed_mask() & (1 << n), 0, "a fresh track opened dead");
+
+        // And the × takes the arm with the channel.
+        app.apply_mixer_hit(Hit::Remove(Column(n)), 0.0);
+        assert_eq!(app.armed_mask() & (1 << n), 0, "a removed channel stayed armed");
+
+        // Session state only: none of that wrote an "armed" key.
+        assert!(
+            !app.settings.to_json().contains("armed"),
+            "arm leaked into the settings file"
         );
     }
 
