@@ -10,7 +10,7 @@
 //! [`Layout::targets`] is the single source of truth both are derived from. No
 //! state, no `egui::Ui`, and nothing here can open a device or read a file.
 
-use crate::recorder::{gain_text, gain_to_fader, ChannelKind, Column, Strip, INSERTS, SLOTS};
+use crate::recorder::{gain_text, gain_to_fader, ChannelKind, Column, Strip, INSERTS};
 use egui::{Color32, FontId, Painter, Pos2, Rect, Stroke, Vec2};
 
 /// One channel, as the painter sees it.
@@ -308,8 +308,9 @@ const SEND_TRAVEL: f32 = 420.0;
 /// Every instrument slot, every input of the interface, the backing track and
 /// the master. The click and the effects return keep their place on the desk
 /// and are not drawn — their controls are the band's.
-// Eight general channels, the backing track, the click, and the master.
-pub const COLUMNS: usize = crate::recorder::CHANNELS + 3;
+// Eight general channels, the click, and the master. BACKING had a column
+// here and is retired: the arrangement's lanes carry audio now.
+pub const COLUMNS: usize = crate::recorder::CHANNELS + 2;
 
 pub struct Layout {
     pub strips: [StripStrip; COLUMNS],
@@ -525,10 +526,7 @@ impl Layout {
         // is their KIND, and clicking it cycles the kind), the backing track,
         // and now the click. The bus and the master have nothing to pick and
         // keep the room for their names.
-        let has_icon = matches!(
-            view.strip,
-            Some(Strip::Channel(_) | Strip::Track | Strip::Click)
-        );
+        let has_icon = matches!(view.strip, Some(Strip::Channel(_) | Strip::Click));
         // **The way OFF the desk, where every window puts it.** Subtle — a
         // small mark in faded ink, drawn by `strip` — but a real target, and
         // only on a channel there is something to remove from. The name band
@@ -924,10 +922,6 @@ fn strip(
         }
         (Some(Strip::Channel(_)), Some(crate::recorder::ChannelKind::Audio)) => {
             crate::recorder_panel::draw_microphone(painter, l.icon, ink);
-            true
-        }
-        (Some(Strip::Track), _) => {
-            crate::recorder_panel::draw_waveform_icon(painter, l.icon, ink);
             true
         }
         (Some(Strip::Click), _) => {
@@ -1917,15 +1911,16 @@ mod tests {
         for n in 0..CHANNELS {
             assert_eq!(channels[n], Strip::Channel(n), "channel {n} has no column");
         }
-        // **Drawn: the eight, the track, and — new — the click.** Only the
-        // effects return keeps its off-desk life: its three knobs are the
-        // band's, and a soloable bus is a feedback question.
+        // **Drawn: the eight and the click.** BACKING retired with v13 — the
+        // arrangement's lanes carry audio now. Only the effects return keeps
+        // its off-desk life: its three knobs are the band's, and a soloable
+        // bus is a feedback question.
         assert_eq!(
             COLUMNS,
-            crate::recorder::CHANNELS + 3,
+            crate::recorder::CHANNELS + 2,
             "a drawn channel went missing"
         );
-        assert_eq!(channels.len(), crate::recorder::CHANNELS + 2);
+        assert_eq!(channels.len(), crate::recorder::CHANNELS + 1);
         assert!(channels.contains(&Strip::Click), "the click lost its column");
         assert!(!channels.contains(&Strip::Fx), "the bus is drawn twice");
         // Every strip owns a distinct place in the arrays, or two of them

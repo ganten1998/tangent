@@ -1650,7 +1650,6 @@ impl IvoryApp {
             H::Fader(i) => {
                 let to = match i.strip() {
                     Some(Strip::Channel(n)) => d.channel_gains.get(n).copied().unwrap_or(1.0),
-                    Some(Strip::Track) => d.track_gain,
                     Some(Strip::Click) => d.metronome_gain,
                     Some(Strip::Fx) => d.fx_return_gain,
                     None => d.master_gain,
@@ -1691,7 +1690,6 @@ impl IvoryApp {
                         *g = gain;
                     }
                 }
-                Some(Strip::Track) => self.settings.track_gain = gain,
                 Some(Strip::Click) => self.settings.metronome_gain = gain,
                 Some(Strip::Fx) => self.settings.fx_return_gain = gain,
                 // Past the channels is the master, which is the last column —
@@ -1736,9 +1734,6 @@ impl IvoryApp {
                             self.set_channel_kind(n, Some(kind.cycled()));
                         }
                     },
-                    // The waveform above BACKING. Same question as ever: what
-                    // is playing on this channel.
-                    Some(Strip::Track) => self.ask_for_track(),
                     // The metronome IS the click switch, here as in the band.
                     Some(Strip::Click) => {
                         self.settings.metronome_on = !self.settings.metronome_on;
@@ -1815,16 +1810,12 @@ impl IvoryApp {
                 }
                 return;
             }
-            // The × at the top right: take the channel off the desk. A
-            // general channel goes back to being an empty slot; the backing
-            // track unloads its file, which is the host's to do.
+            // The × at the top right: take the channel off the desk. The
+            // backing file's × lives on the band's timeline now — the strip
+            // it used to ride retired with the BACKING column.
             H::Remove(i) => {
-                match i.strip() {
-                    Some(Strip::Channel(n)) => self.remove_channel(n),
-                    Some(Strip::Track) => {
-                        self.request_recorder(recorder::RecorderRequest::ClearTrack);
-                    }
-                    _ => {}
+                if let Some(Strip::Channel(n)) = i.strip() {
+                    self.remove_channel(n);
                 }
                 return;
             }
@@ -1991,12 +1982,6 @@ impl IvoryApp {
                         kind.is_none(),
                     )
                 }
-                // **No file name.** A track is called
-                // "Blue Bossa - backing (final 2).mp3" and a mixer strip is a
-                // hundred points wide: it never fitted, and a name cut to
-                // "Blue Bo…" tells nobody anything the waveform panel does not
-                // already say in full.
-                Strip::Track => ("BACKING", "", g.track, false),
                 Strip::Click => ("CLICK", "", g.metronome, false),
                 Strip::Fx => ("FX BUS", "reverb · delay · chorus", g.fx_return, false),
             };
@@ -2039,14 +2024,9 @@ impl IvoryApp {
                 muted: desk.muted[i],
                 soloed: desk.soloed[i],
                 // What the × means, where it means anything: a used general
-                // channel goes back to being an empty slot, and the backing
-                // track unloads its file. The click and the bus are the
-                // desk's own and stay.
-                removable: match s {
-                    Strip::Channel(_) => kind.is_some(),
-                    Strip::Track => !self.track.name.is_empty(),
-                    Strip::Click | Strip::Fx => false,
-                },
+                // channel goes back to being an empty slot. The click and
+                // the bus are the desk's own and stay.
+                removable: matches!(s, Strip::Channel(_)) && kind.is_some(),
             }
         };
         let channels = Strip::shown();
@@ -3346,6 +3326,13 @@ impl IvoryApp {
         self.settings.track_path.clone()
     }
 
+    /// One launch only: the settings just crossed the v13 desk change, so
+    /// the host must shuffle the insert-state sidecars whose names carry
+    /// desk indices. Taken, so asking twice answers once.
+    pub fn take_desk_state_shift(&mut self) -> bool {
+        std::mem::take(&mut self.settings.desk_state_shift_v13)
+    }
+
     /// The backing track's level, for the host to push at the engine.
     pub fn track_playback(&self) -> f32 {
         self.settings.track_gain as f32
@@ -3811,6 +3798,9 @@ impl IvoryApp {
             // pressed mid-audition it stops and the playhead goes home to
             // 0:00, which is `Transport::toggle_play`'s half of the rule.
             Hit::Play => self.request_recorder(R::Play),
+            // The × in the timeline's corner: unload the file. The strip
+            // that used to carry this retired at v13.
+            Hit::ClearTrack => self.request_recorder(R::ClearTrack),
             Hit::Stop => self.request_recorder(R::Stop),
             Hit::DismissClip => self.request_recorder(R::DismissClip),
             // Opens the menu, led by the Recorder's own categories, at the
@@ -4093,7 +4083,7 @@ impl IvoryApp {
             (crate::recorder::Strip::Channel(1).index(), 0, "/x/FabFilter Pro-R 2.vst3"),
             (crate::recorder::Strip::Channel(1).index(), 2, "/x/Pro-Q 4.vst3"),
             (crate::recorder::Strip::Channel(2).index(), 0, "/x/Pro-C 3.vst3"),
-            (crate::recorder::Strip::Track.index(), 1, "/x/Saturn 2.vst3"),
+            (crate::recorder::Strip::Channel(4).index(), 1, "/x/Saturn 2.vst3"),
             (strips, 0, "/x/Pro-L 2.vst3"),
         ] {
             self.set_insert(strip, slot, Some(path));
@@ -7638,18 +7628,18 @@ mod tests {
                 .map(crate::recorder::Column)
                 .expect("that strip has no column")
         };
-        app.apply_mixer_hit(Hit::Fader(column(Strip::Track)), 0.25);
-        let quiet = app.settings.knobs().gains.track;
-        app.apply_mixer_hit(Hit::Fader(column(Strip::Track)), 0.75);
-        let loud = app.settings.knobs().gains.track;
+        app.apply_mixer_hit(Hit::Fader(column(Strip::Channel(2))), 0.25);
+        let quiet = app.settings.knobs().gains.channels[2];
+        app.apply_mixer_hit(Hit::Fader(column(Strip::Channel(2))), 0.75);
+        let loud = app.settings.knobs().gains.channels[2];
         assert!(loud > quiet, "the mixer's fader moved nothing: {quiet} then {loud}");
-        // And the metronome, which has a fader in the band and none here, is
+        // And the metronome, which has a column right next to the master, is
         // untouched by either of those.
         assert!(
             (app.settings.knobs().gains.metronome - Settings::default().metronome_gain as f32)
                 .abs()
                 < 1.0e-6,
-            "the backing track's fader moved the click"
+            "a channel's fader moved the click"
         );
 
         // A send is a percentage and lands where the host reads it.
@@ -7665,12 +7655,12 @@ mod tests {
         // Mute and solo toggle, and they are separate switches. Pressed by
         // COLUMN, read back by desk index — which is the whole conversion
         // under test.
-        let track = Strip::Track.column_of().expect("the track has a column");
-        app.apply_mixer_hit(Hit::Mute(track), 0.0);
-        assert!(app.desk().muted[Strip::Track.index()]);
-        assert!(!app.desk().soloed[Strip::Track.index()]);
-        app.apply_mixer_hit(Hit::Mute(track), 0.0);
-        assert!(!app.desk().muted[Strip::Track.index()], "mute did not toggle back");
+        let click = Strip::Click.column_of().expect("the click has a column");
+        app.apply_mixer_hit(Hit::Mute(click), 0.0);
+        assert!(app.desk().muted[Strip::Click.index()]);
+        assert!(!app.desk().soloed[Strip::Click.index()]);
+        app.apply_mixer_hit(Hit::Mute(click), 0.0);
+        assert!(!app.desk().muted[Strip::Click.index()], "mute did not toggle back");
     }
 
     /// **The way back to the shipped bank exists at all.**
@@ -8021,7 +8011,6 @@ mod tests {
         use crate::recorder::{Strip, COLUMNS_FOR_TEST};
         let snapshot = |s: &Settings| {
             let mut v: Vec<f64> = s.channel_gains.to_vec();
-            v.push(s.track_gain);
             v.push(s.metronome_gain);
             v.push(s.fx_return_gain);
             v.push(s.master_gain);
@@ -8039,9 +8028,8 @@ mod tests {
             // Which slot in the snapshot this column owns.
             let want = match col.strip() {
                 Some(Strip::Channel(n)) => n,
-                Some(Strip::Track) => crate::recorder::CHANNELS,
-                Some(Strip::Click) => crate::recorder::CHANNELS + 1,
-                Some(Strip::Fx) => crate::recorder::CHANNELS + 2,
+                Some(Strip::Click) => crate::recorder::CHANNELS,
+                Some(Strip::Fx) => crate::recorder::CHANNELS + 1,
                 None => before.len() - 1,
             };
             assert_eq!(
@@ -8163,7 +8151,7 @@ mod tests {
     #[test]
     fn the_other_button_empties_an_insert() {
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
-        let at = crate::recorder::Strip::Track.index();
+        let at = crate::recorder::Strip::Channel(5).index();
         app.set_insert(at, 1, Some("/x/Pro-R 2.vst3"));
         assert!(app.insert(at, 1).is_some(), "nothing was loaded to remove");
         app.set_insert(at, 1, None);
@@ -8461,13 +8449,12 @@ mod tests {
         assert_eq!(app.settings.strip_colors[0], 0, "the colour survived");
         assert_eq!(app.settings.strip_muted & 1, 0, "the mute survived");
 
+        // A column that is NOT a removable channel — the click's — answers a
+        // Remove with nothing at all. (The backing file's × lives on the
+        // band's timeline now; its strip retired at v13.)
         while app.take_recorder_request().is_some() {}
         app.apply_mixer_hit(Hit::Remove(Column(crate::recorder::CHANNELS)), 0.0);
-        assert_eq!(
-            app.take_recorder_request(),
-            Some(recorder::RecorderRequest::ClearTrack),
-            "the track's × did not ask the host to unload"
-        );
+        assert_eq!(app.take_recorder_request(), None);
     }
 
     /// A cartridge arriving updates the OPEN picker rather than replacing it,

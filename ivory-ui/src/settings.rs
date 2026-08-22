@@ -35,7 +35,7 @@ pub struct Rgb {
 /// the migration runs ONCE against a file written before the change, and after
 /// that the same value chosen deliberately is never touched again. A file with
 /// no stamp is version 0 — every file every previous build wrote.
-const SETTINGS_VERSION: u64 = 12;
+const SETTINGS_VERSION: u64 = 13;
 
 /// Where a desk channel written before the INPUT STRIPS ended up.
 ///
@@ -276,6 +276,46 @@ fn migrate_split_desk(s: &mut Settings, desk: &mut LegacyDesk) {
     desk.inserts = inserts;
     s.channel_kinds = kinds;
     s.channel_gains = gains;
+}
+
+/// v13: **the BACKING strip retires.** The arrangement's lanes carry audio
+/// now (see `docs/ARRANGEMENT.md`), so row 8 — the track — leaves every desk
+/// array and the click, the bus and the master each step down one. The
+/// track's own colour, name, send and inserts go with it; `track_path` and
+/// `track_gain` stay as plain settings, because the band's timeline keeps
+/// playing the remembered file until the scrubber replaces it.
+///
+/// Numbers frozen as [`V12_CHANNELS`]/[`V11_INSERTS`], per the rule the test
+/// `the_historical_migrations_do_not_read_todays_constants` enforces.
+fn migrate_retire_track(s: &mut Settings, desk: &mut LegacyDesk) {
+    const TRACK: usize = V12_CHANNELS; // row 8, at v12
+    if desk.colors.len() > TRACK {
+        desk.colors.remove(TRACK);
+    }
+    if desk.names.len() > TRACK {
+        desk.names.remove(TRACK);
+    }
+    if desk.sends.len() > TRACK {
+        desk.sends.remove(TRACK);
+    }
+    if desk.inserts.len() > TRACK * V11_INSERTS {
+        let end = ((TRACK + 1) * V11_INSERTS).min(desk.inserts.len());
+        desk.inserts.drain(TRACK * V11_INSERTS..end);
+    }
+    // The masks, by the same move: bits below the track keep their place,
+    // the track's own bit is dropped, everything above steps down one.
+    let move_mask = |mask: u32| -> u32 {
+        let keep = mask & ((1 << TRACK) - 1);
+        let above = mask >> (TRACK + 1);
+        keep | (above << TRACK)
+    };
+    s.strip_muted = move_mask(s.strip_muted);
+    s.strip_soloed = move_mask(s.strip_soloed);
+    // The HOST must shuffle the insert-state sidecar files once — they are
+    // named by desk index, and the click's, the bus's and the master's all
+    // just moved. A flag rather than doing it here: this crate does not
+    // touch the filesystem. Not serialized; it lives exactly one launch.
+    s.desk_state_shift_v13 = true;
 }
 
 fn migrate_desk_channels(s: &mut Settings, desk: &mut LegacyDesk) {
@@ -873,6 +913,12 @@ pub struct Settings {
     pub record_export: crate::recorder::ExportSpec,
     /// Unknown keys from the file, preserved verbatim on save (file order).
     pub extra: Map<String, Value>,
+    /// **This launch crossed the v13 desk change**, so the insert-state
+    /// sidecar files — named by desk index — need their one-time shuffle:
+    /// the track's deleted, the click's, the bus's and the master's each
+    /// down one. Set by `migrate_retire_track`, read by the host at startup,
+    /// NEVER serialized: it lives exactly one launch.
+    pub desk_state_shift_v13: bool,
 }
 
 /// Where `Settings::path()` points during tests.
@@ -925,6 +971,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             dark_mode: false,
+            desk_state_shift_v13: false,
             white_key_idle_color: Rgb::new(0xE8, 0xDC, 0xC0),
             black_key_idle_color: Rgb::new(0x1a, 0x1a, 0x1a),
             white_key_active_color: Rgb::new(0x6C, 0x9B, 0xD2),
@@ -1042,13 +1089,11 @@ impl Default for Settings {
             master_gain: 1.0,
             track_gain: 1.0,
             strip_colors: {
-                // **The two that are not instruments come coloured.** Five
-                // slots and two sources in one rack read as seven of the same
-                // thing; the microphone and the backing track are neither
-                // instruments nor each other, and a colour each says so before
-                // the labels are read.
+                // **The one that is not an instrument comes coloured.** The
+                // click is neither a channel nor the master, and a colour
+                // says so before the label is read. (BACKING shipped violet
+                // here until its strip retired with the arrangement.)
                 let mut c = [0; crate::recorder::STRIPS + 1];
-                c[crate::recorder::Strip::Track.index()] = 23; // violet
                 c[crate::recorder::Strip::Click.index()] = 8; // amber
                 c[crate::recorder::STRIPS] = crate::mixer_panel::MASTER_COLOR as i64;
                 c
@@ -1901,6 +1946,12 @@ impl Settings {
         }
         if was < 12 {
             migrate_split_desk(self, desk);
+        }
+        if was < 13 {
+            // After the split: `migrate_split_desk` produces the v12 shape
+            // this one retires the track from, so an ancient file walks both
+            // steps in order.
+            migrate_retire_track(self, desk);
         }
         if was < 9 {
             // **The limiter's dial turned round.** It used to be off at zero
@@ -2893,10 +2944,13 @@ mod tests {
         );
         let s = Settings::from_json(&json);
 
-        assert_eq!(
-            s.strip_colors[Strip::Track.index()] as usize,
-            crate::mixer_panel::PALETTE_V1_TO_V2[6],
-            "the backing track's colour landed on another channel"
+        // The backing track's violet is DROPPED with its strip — v13 retired
+        // BACKING — and must not land on anybody else's column.
+        assert!(
+            !s.strip_colors
+                .iter()
+                .any(|c| *c as usize == crate::mixer_panel::PALETTE_V1_TO_V2[6]),
+            "the retired backing track's colour leaked onto another strip"
         );
         // The one input there was is OCCUPIED by definition, so the v12
         // occupancy pass gives it the first channel.
@@ -2941,6 +2995,80 @@ mod tests {
         );
     }
 
+    /// **A v12 desk comes back aligned after BACKING retires.**
+    ///
+    /// This is the file every real user has: eight channels, the track at
+    /// row 8, the click at 9, the bus at 10, the master at 11. v13 removes
+    /// row 8 and everything above steps down — colours, names, sends, bays,
+    /// and the mute/solo BITS, which are the ones that go quietly wrong.
+    #[test]
+    fn a_v12_desk_survives_the_backing_strips_retirement() {
+        use crate::recorder::Strip;
+        let mut colors = vec![0i64; 12];
+        colors[3] = 14; // a painted channel
+        colors[8] = 23; // BACKING's violet, retired with it
+        colors[9] = 8; // the click's amber
+        colors[11] = 5; // the master's red
+        let mut sends = vec![0.0f64; 11];
+        sends[0] = 1.0;
+        sends[8] = 0.3; // BACKING's send, dropped
+        let mut inserts = vec![String::new(); 36];
+        inserts[0] = "@tangent-dx7".to_owned();
+        inserts[8 * 3] = "/x/Pro-G.vst3".to_owned(); // BACKING's gate, dropped
+        inserts[9 * 3] = "/x/Click-EQ.vst3".to_owned(); // the click's, to row 8
+        inserts[11 * 3] = "/x/Pro-L 2.vst3".to_owned(); // the master's, to row 10
+        let mut names = vec![String::new(); 12];
+        names[9] = "TICK".to_owned();
+        names[11] = "OUT".to_owned();
+        let json = format!(
+            r#"{{"settings_version": 12, "strip_colors_v2": {colors:?},
+                 "strip_sends": {sends:?}, "strip_inserts": {inserts:?},
+                 "strip_names": {names:?},
+                 "strip_muted": {}, "strip_soloed": {}}}"#,
+            1u32 << 9,
+            1u32 << 3
+        );
+        let s = Settings::from_json(&json);
+        assert_eq!(s.strip_colors[3], 14, "a channel's paint moved");
+        assert_eq!(
+            s.strip_colors[Strip::Click.index()],
+            8,
+            "the click lost its amber"
+        );
+        assert_eq!(
+            s.strip_colors[crate::recorder::STRIPS],
+            5,
+            "the master lost its red"
+        );
+        assert!(!s.strip_colors.contains(&23), "BACKING's violet leaked");
+        assert!((s.strip_sends[0] - 1.0).abs() < 1e-9);
+        assert!(
+            !s.strip_sends.iter().any(|v| (*v - 0.3).abs() < 1e-9),
+            "BACKING's send leaked"
+        );
+        assert_eq!(s.strip_names[Strip::Click.index()], "TICK");
+        assert_eq!(s.strip_names[crate::recorder::STRIPS], "OUT");
+        assert_eq!(
+            s.strip_muted,
+            1 << Strip::Click.index(),
+            "the muted click drifted"
+        );
+        assert_eq!(s.strip_soloed, 1 << 3, "a solo below the track moved");
+        let bay = |strip: usize| s.strip_inserts[strip * crate::recorder::INSERTS].as_str();
+        assert_eq!(bay(0), crate::dialogs::BUILTIN_PATH);
+        assert_eq!(bay(Strip::Click.index()), "/x/Click-EQ.vst3");
+        assert_eq!(bay(crate::recorder::STRIPS), "/x/Pro-L 2.vst3");
+        assert!(
+            !s.strip_inserts.iter().any(|p| p == "/x/Pro-G.vst3"),
+            "BACKING's gate leaked into another bay"
+        );
+        // The one-launch flag that asks the host to shuffle the insert-state
+        // sidecar files — and only a crossing raises it.
+        assert!(s.desk_state_shift_v13, "the host was not told to shuffle");
+        let v13 = Settings::from_json(r#"{"settings_version": 13}"#);
+        assert!(!v13.desk_state_shift_v13);
+    }
+
     /// **A palette is a set of indices somebody has already saved.**
     ///
     /// Growing the table from eight colours to twenty-seven renumbered every
@@ -2955,14 +3083,16 @@ mod tests {
         // The old defaults: 4 was teal and 6 was violet.
         let old = Settings::from_json(r#"{"strip_colors": [0, 0, 0, 0, 0, 4, 6, 0, 0, 1]}"#);
         let teal = old.strip_colors[Strip::Channel(0).index()] as usize;
-        let violet = old.strip_colors[Strip::Track.index()] as usize;
+        let red = old.strip_colors[crate::recorder::STRIPS] as usize;
         assert_eq!(teal, PALETTE_V1_TO_V2[4], "the microphone changed colour");
-        assert_eq!(violet, PALETTE_V1_TO_V2[6], "the backing track changed colour");
-        // And they are still a teal and a violet, not merely different numbers.
+        assert_eq!(red, PALETTE_V1_TO_V2[1], "the master changed colour");
+        // And they are still a teal and a red, not merely different numbers.
+        // (The violet at old index 6 was the BACKING track's, whose strip
+        // v13 retired — its colour goes with it.)
         let (r, g, b) = STRIP_COLORS[teal];
         assert!(b > r && g > r, "index {teal} is not a teal: {r:02X}{g:02X}{b:02X}");
-        let (r, g, b) = STRIP_COLORS[violet];
-        assert!(b > g && r > g, "index {violet} is not a violet: {r:02X}{g:02X}{b:02X}");
+        let (r, g, b) = STRIP_COLORS[red];
+        assert!(r > g && r > b, "index {red} is not a red: {r:02X}{g:02X}{b:02X}");
 
         // A file already written by this build is taken at face value.
         let new = Settings::from_json(r#"{"strip_colors_v2": [0, 0, 0, 0, 0, 26, 0, 0, 0, 5]}"#);
@@ -3903,13 +4033,13 @@ mod tests {
             "the master lost its name in the shrink - the LegacyDesk bug again"
         );
 
-        // Sends: the piano's 1.0, the lead's 0.4, and the track's 0.1 now at
-        // the track's NEW index.
+        // Sends: the piano's 1.0, the lead's 0.4. The track's 0.1 is
+        // DROPPED with its strip — v13 retired BACKING — and lands nowhere.
         assert!((s.strip_sends[0] - 1.0).abs() < 1e-9);
         assert!((s.strip_sends[1] - 0.4).abs() < 1e-9);
         assert!(
-            (s.strip_sends[Strip::Track.index()] - 0.1).abs() < 1e-9,
-            "the backing track's send did not move down with it"
+            !s.strip_sends.iter().any(|v| (*v - 0.1).abs() < 1e-9),
+            "the retired backing track's send leaked onto another strip"
         );
         // The click's send is DELETED, whatever the file said.
         // (Old click send was 0.0 here; the rule is structural: Strip::sends.)
@@ -3929,11 +4059,10 @@ mod tests {
             "/x/Pro-L 2.vst3",
             "the master's limiter vanished"
         );
-        // The track's own insert moved with the track.
-        assert_eq!(
-            s.strip_inserts[Strip::Track.index() * INSERTS].as_str(),
-            "/x/Pro-G.vst3",
-            "the track's gate vanished"
+        // The track's own insert retires WITH the track — into no bay at all.
+        assert!(
+            !s.strip_inserts.iter().any(|p| p == "/x/Pro-G.vst3"),
+            "the retired backing track's gate leaked into another bay"
         );
         // And the master's rack is at the master's row, not a bay adrift.
         assert_eq!(
