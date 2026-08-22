@@ -69,19 +69,44 @@ header (the header's arm dot and the strip's R are one state).
 **Import.** Drag a file from Finder and DROP IT ON A LANE — the clip lands
 where it was dropped. That is the one way in; no picker, no menu row.
 
+## Projects (owner's answer to the migration question — the bigger, right thing)
+
+- **A project is a directory** holding the arrangement doc and a `media/`
+  folder into which ALL referenced media is auto-copied — imported files
+  and recorded clips alike. A project folder is self-contained: move it,
+  zip it, hand it to someone, it opens.
+- **The app reopens the arrangement you last had open**, exactly as it
+  was — **except every record arm is OFF, save one: the default Tangent
+  DX7 channel**. Arm is what makes a channel LIVE (see below), and a
+  project must be openable without headphones and without being blasted.
+  Arm state is therefore session state, never saved into the project.
+- **Recorded and imported clip media lands in the current project's
+  `media/`** (supersedes the earlier `record_root/arrangement/` call).
+- First v13 launch with no project yet: a default project is created, and
+  a remembered v12 `track_path` becomes an audio clip at 0:00 on the first
+  unused channel (named BACKING, old track gain kept) inside it — nobody's
+  backing track vanishes.
+- New / Open / Save As / Recent live under a PROJECT subject in the menu
+  (the 18-row top-level budget holds; these are rows *under* a subject).
+
+## Arm = live (decided by the "no headphones blast" rule)
+
+Record-arm is also the LIVE switch: an armed MIDI channel sounds when the
+keyboard is played, an armed AUDIO channel monitors its input. Unarmed
+channels play back their clips and nothing else. "Ready to play" and
+"ready to record" are one light — the R switch.
+
 ## Proposed (draft's own calls — veto anything)
 
 - **Dropping audio on an EMPTY lane makes that channel AUDIO** and lands
   the clip. Dropping on a MIDI lane refuses with one status-line sentence.
-- **v12 → v13 migration**: a remembered `track_path` becomes an audio clip
-  at 0:00 on the first unused channel, which becomes AUDIO, named BACKING,
-  carrying the old track gain. Nobody's backing track vanishes at launch.
-- **Arm is persisted** in settings (like mute/solo), not session-only.
-- **Recorded clip files** land under `record_root/arrangement/` (WAV per
-  clip; MIDI clips serialize into the arrangement doc itself).
+  *(Approved by the owner.)*
 - **What an armed lane records**: an AUDIO channel records its input pick;
   a MIDI channel records the notes played into it (same routing the
   monitor already uses).
+- **Which channel opens armed**: the one whose bay holds the built-in DX7;
+  if none does, the first MIDI channel carrying any instrument; if none,
+  nothing opens armed.
 - **Click in empty lane space = locate the playhead there** (and clear the
   selection). Clicking a clip selects it.
 - **Clip drawing**: body in the channel's colour, waveform (audio) or note
@@ -117,10 +142,15 @@ where it was dropped. That is the one way in; no picker, no menu row.
 
 ## Order of work
 
-1. **Desk change**: retire `Strip::Track`, settings v13 (+ migration),
-   M S R on the mixer, arm state end to end.
-2. **Doc + playback**: clip schedules in the engine (audio, then MIDI),
-   fades, and the band scrubber reading the doc (locate/scrub live here).
+1. **Desk change**: retire `Strip::Track`, settings v13 (+ index
+   migration), M S R on the mixer, arm-as-live end to end (engine gates
+   live input by arm; DX7 channel armed at launch). The band's timeline
+   keeps playing the remembered backing file untouched until phase 2's
+   scrubber replaces it.
+2. **Projects + playback**: the project directory (doc + `media/`,
+   auto-copy on import/record/save, reopen-last-at-launch, v12 backing →
+   clip in the default project), clip schedules in the engine (audio,
+   then MIDI), fades, and the band scrubber reading the doc.
 3. **The view**: lanes, headers, ruler, zoom/scroll, selection, the five
    clip operations, drag-and-drop import.
 4. **Recording split**: arrangement record on the red button; capture as
