@@ -321,6 +321,8 @@ pub struct IvoryApp {
     arr_drag: Option<ArrDrag>,
     /// A clip edit happened during the current gesture: save on release.
     arr_gesture_dirty: bool,
+    /// The MIDI item being drawn by shift-drag: lane, from, to (ordered).
+    arr_pending: Option<(usize, f64, f64)>,
     /// Where the arrangement was last drawn, for hit tests.
     arrangement_rect: Option<Rect>,
     /// Per-clip pictures the host pushed after decoding: the PLAYED span's
@@ -589,6 +591,11 @@ enum ArrDrag {
     FadeOut { id: u64 },
     /// The header knob: relative and vertical, the mixer fader's feel.
     Gain { lane: usize, from_y: f32, from: f32 },
+    /// The header's send dial, on the same terms.
+    Send { lane: usize, from_y: f32, from: f32 },
+    /// Shift-drag: a MIDI item being drawn on a lane, anchored where the
+    /// press landed (snapped).
+    CreateMidi { lane: usize, anchor: f64 },
     /// The ruler's vertical zoom, anchored at the second under the press.
     Zoom { anchor_s: f64, last_y: f32 },
 }
@@ -653,6 +660,7 @@ fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
 /// A bare clip standing at `start_s` on `lane`, named after its file.
 fn clip_at(rel_path: &str, lane: usize, start_s: f64) -> crate::arrangement::ArrClip {
     crate::arrangement::ArrClip {
+        kind: crate::arrangement::ClipKind::Audio,
         lane,
         path: rel_path.to_owned(),
         start_s,
@@ -930,6 +938,7 @@ impl IvoryApp {
             arr_selected: None,
             arr_drag: None,
             arr_gesture_dirty: false,
+            arr_pending: None,
             arrangement_rect: None,
             clip_infos: std::collections::HashMap::new(),
             open_insert_on_load: None,
@@ -2135,6 +2144,7 @@ impl IvoryApp {
         self.arrangement_open = true;
         let mut arr = crate::arrangement::Arrangement::default();
         let backing = arr.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Audio,
             lane: 3,
             path: "media/Blue Bossa - backing.mp3".to_owned(),
             start_s: 0.0,
@@ -2146,6 +2156,7 @@ impl IvoryApp {
             id: 0,
         });
         let take = arr.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Audio,
             lane: 2,
             path: "media/take 3.wav".to_owned(),
             start_s: 16.0,
@@ -2157,6 +2168,7 @@ impl IvoryApp {
             id: 0,
         });
         let solo = arr.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Audio,
             lane: 2,
             path: "media/solo.wav".to_owned(),
             start_s: 48.0,
@@ -2165,6 +2177,19 @@ impl IvoryApp {
             fade_in_s: 0.0,
             fade_out_s: 2.5,
             name: "solo".to_owned(),
+            id: 0,
+        });
+        // And a MIDI item drawn by hand, so its face is in the picture.
+        arr.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            lane: 1,
+            path: String::new(),
+            start_s: 32.0,
+            offset_s: 0.0,
+            len_s: 16.0,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name: "MIDI".to_owned(),
             id: 0,
         });
         self.arrangement = arr;
@@ -3968,6 +3993,31 @@ impl IvoryApp {
             .unwrap_or_else(|| (0.0, (self.arr_span() * 1.05).max(30.0)))
     }
 
+    /// One bar in seconds, from the band's own tempo and signature.
+    fn arr_bar_s(&self) -> f64 {
+        let bpm = f64::from(self.tempo_bpm()).clamp(20.0, 400.0);
+        let sig = self.time_signature();
+        f64::from(sig.beats) * (60.0 / bpm) * (4.0 / f64::from(sig.unit))
+    }
+
+    /// The grid in seconds — the gridbox's bars-as-a-power-of-two.
+    fn arr_grid_s(&self) -> f64 {
+        let exp = self.settings.arr_grid_exp.clamp(-5, 3) as i32;
+        self.arr_bar_s() * 2.0f64.powi(exp)
+    }
+
+    /// `t`, magnetised: to the nearest grid line while the magnet is on.
+    fn arr_snap_t(&self, t: f64) -> f64 {
+        if !self.settings.arr_snap {
+            return t.max(0.0);
+        }
+        let g = self.arr_grid_s();
+        if g <= 0.0 {
+            return t.max(0.0);
+        }
+        ((t / g).round() * g).max(0.0)
+    }
+
     /// Clamp a steered window into the song's neighbourhood and keep it.
     fn arr_steer(&mut self, start: f64, len: f64) {
         let len = len.clamp(1.0, (self.arr_span() * 4.0).max(120.0));
@@ -4000,6 +4050,7 @@ impl IvoryApp {
                     name: &c.name,
                     wave,
                     selected: self.arr_selected == Some(c.id),
+                    midi: c.kind == crate::arrangement::ClipKind::Midi,
                 }
             })
             .collect()
@@ -4029,8 +4080,8 @@ impl IvoryApp {
     /// MOVE: the clip rides under the same point of the hand — `dt` is the
     /// pointer's distance from its start at the press.
     fn arr_move(&mut self, id: u64, t_at: f64, dt: f64) {
+        let to = self.arr_snap_t(t_at - dt);
         if let Some(c) = self.arr_clip_mut(id) {
-            let to = (t_at - dt).max(0.0);
             if (c.start_s - to).abs() > 1e-9 {
                 c.start_s = to;
                 self.arr_gesture_dirty = true;
@@ -4043,6 +4094,7 @@ impl IvoryApp {
     /// left as there is.
     fn arr_trim_left(&mut self, id: u64, t_at: f64) {
         const MIN: f64 = 0.05;
+        let t_at = self.arr_snap_t(t_at);
         if let Some(c) = self.arr_clip_mut(id) {
             let end = c.start_s + c.len_s;
             let new_start = t_at.clamp((c.start_s - c.offset_s).max(0.0), end - MIN);
@@ -4062,6 +4114,7 @@ impl IvoryApp {
     /// end where the file is known.
     fn arr_trim_right(&mut self, id: u64, t_at: f64) {
         const MIN: f64 = 0.05;
+        let t_at = self.arr_snap_t(t_at);
         let max_len = self
             .arrangement
             .clips
@@ -4164,6 +4217,7 @@ impl IvoryApp {
             c.fade_in_s = c.fade_in_s.min(head);
             c.fade_out_s = 0.0;
             tails.push(crate::arrangement::ArrClip {
+                kind: c.kind,
                 lane: c.lane,
                 path: c.path.clone(),
                 start_s: t,
@@ -4202,31 +4256,66 @@ impl IvoryApp {
         });
 
         // ── the wheel: pan, and Cmd/Ctrl-wheel zoom around the pointer ────
-        let (scroll, zoom_mod, shift) = ctx.input(|i| {
+        let (scroll, pan_mod, shift, alt) = ctx.input(|i| {
             (
                 i.raw_scroll_delta,
-                i.modifiers.command || i.modifiers.ctrl,
+                i.modifiers.command || i.modifiers.ctrl || i.modifiers.shift,
                 i.modifiers.shift,
+                i.modifiers.alt,
             )
         });
         if scroll != egui::Vec2::ZERO {
             if let Some(p) = pointer.filter(|p| rect.contains(*p)) {
-                let (anchor, s_per_px, start, len) = {
+                let (anchor, s_per_px, start, len, over_grid) = {
                     let clips = self.arr_clip_views();
                     let view = self.arrange_view(&clips);
                     let a = crate::arrangement_panel::time_at(rect, &view, p.x);
                     let s = crate::arrangement_panel::time_at(rect, &view, p.x + 1.0) - a;
-                    (a, s, view.view_start_s, view.view_len_s)
+                    let over = matches!(
+                        crate::arrangement_panel::hit_test(rect, &view, p),
+                        Some(crate::arrangement_panel::Hit::ToolGrid)
+                    );
+                    (a, s, view.view_start_s, view.view_len_s, over)
                 };
-                if zoom_mod {
-                    // Wheel up zooms IN around the second under the pointer.
-                    let factor = f64::from((-scroll.y * 0.005).exp());
-                    self.arr_steer(anchor - (anchor - start) * factor, len * factor);
-                } else {
-                    // Either axis pans: a mouse wheel gives Y, a trackpad
-                    // dragging sideways gives X, and both mean "along time".
+                if over_grid {
+                    // **The gridbox is turned by the wheel** — up for
+                    // coarser bars, down for finer fractions, the owner's
+                    // gridbox.lua brought home.
+                    let step = if scroll.y > 0.5 {
+                        1
+                    } else if scroll.y < -0.5 {
+                        -1
+                    } else {
+                        0
+                    };
+                    if step != 0 {
+                        self.settings.arr_grid_exp =
+                            (self.settings.arr_grid_exp + step).clamp(-5, 3);
+                        self.save_settings();
+                    }
+                } else if alt {
+                    // **Alt-wheel SCRUBS**: the playhead steps a grid line
+                    // per notch, which is what stepping through a song at a
+                    // musical grain means.
+                    let step = f64::from(scroll.y.signum());
+                    if step != 0.0 {
+                        let to = (self.recorder.position_s - step * self.arr_grid_s()).max(0.0);
+                        self.request_recorder(recorder::RecorderRequest::Locate(to));
+                    }
+                } else if pan_mod {
                     let d = f64::from(scroll.x + scroll.y) * s_per_px;
                     self.arr_steer(start - d, len);
+                } else {
+                    // **The plain wheel ZOOMS**, around the second under the
+                    // pointer — the owner's ruling. A trackpad's sideways
+                    // component still pans, because sideways means along.
+                    if scroll.x.abs() > 0.0 {
+                        self.arr_steer(start - f64::from(scroll.x) * s_per_px, len);
+                    }
+                    if scroll.y.abs() > 0.0 {
+                        let factor = f64::from((-scroll.y * 0.005).exp());
+                        self.arr_steer(anchor - (anchor - start) * factor, len * factor);
+                    }
                 }
             }
         }
@@ -4258,6 +4347,30 @@ impl IvoryApp {
                             from: self.mixer_value(M::Fader(Column(n))),
                         });
                     }
+                    Some(A::Send(n)) => {
+                        self.arr_drag = Some(ArrDrag::Send {
+                            lane: n,
+                            from_y: p.y,
+                            from: self.mixer_value(M::Send(Column(n))),
+                        });
+                    }
+                    // The toolbar. The click's switch is the settings' own;
+                    // the magnet and the grid live beside it.
+                    Some(A::ToolMetronome) => {
+                        self.settings.metronome_on = !self.settings.metronome_on;
+                        self.save_settings();
+                    }
+                    Some(A::ToolSnap) => {
+                        self.settings.arr_snap = !self.settings.arr_snap;
+                        self.save_settings();
+                    }
+                    Some(A::ToolGrid) => {
+                        // A press steps FINER; the wheel over the box is the
+                        // real control and goes both ways.
+                        self.settings.arr_grid_exp =
+                            (self.settings.arr_grid_exp - 1).clamp(-5, 3);
+                        self.save_settings();
+                    }
                     Some(A::ClipBody(id)) => {
                         self.arr_selected = Some(id);
                         self.arr_resolve_len(id);
@@ -4278,10 +4391,26 @@ impl IvoryApp {
                         });
                     }
                     // Empty room: the playhead goes HERE and the selection
-                    // clears — the gesture Ableton taught everyone.
-                    Some(A::Lane(_, t)) => {
-                        self.arr_selected = None;
-                        self.request_recorder(recorder::RecorderRequest::Locate(t.max(0.0)));
+                    // clears — the gesture Ableton taught everyone. WITH
+                    // SHIFT held, the press starts drawing a MIDI item
+                    // instead: on a MIDI lane, or an empty one, which
+                    // becomes MIDI on commit (safe — unlike audio, a MIDI
+                    // kind re-binds no interface input). An audio lane
+                    // refuses with one sentence.
+                    Some(A::Lane(lane, t)) => {
+                        if shift {
+                            if self.channel_kind(lane) == Some(recorder::ChannelKind::Audio) {
+                                self.track.error =
+                                    "an audio lane cannot take a MIDI item".to_owned();
+                            } else {
+                                let anchor = self.arr_snap_t(t);
+                                self.arr_pending = Some((lane, anchor, anchor));
+                                self.arr_drag = Some(ArrDrag::CreateMidi { lane, anchor });
+                            }
+                        } else {
+                            self.arr_selected = None;
+                            self.request_recorder(recorder::RecorderRequest::Locate(t.max(0.0)));
+                        }
                     }
                     // The ruler: locate on the press, zoom on the drag.
                     Some(A::Ruler(t)) => {
@@ -4317,6 +4446,18 @@ impl IvoryApp {
                         v,
                     );
                 }
+                ArrDrag::Send { lane, from_y, from } => {
+                    let fine = if shift { recorder_panel::FINE_DRAG } else { 1.0 };
+                    let v = (from + (from_y - p.y) / 420.0 * fine).clamp(0.0, 1.0);
+                    self.apply_mixer_hit(
+                        crate::mixer_panel::Hit::Send(crate::recorder::Column(lane)),
+                        v,
+                    );
+                }
+                ArrDrag::CreateMidi { lane, anchor } => {
+                    let to = self.arr_snap_t(t_at);
+                    self.arr_pending = Some((lane, anchor.min(to), anchor.max(to)));
+                }
                 ArrDrag::Zoom { anchor_s, last_y } => {
                     let dy = p.y - last_y;
                     if dy.abs() > 0.5 {
@@ -4334,6 +4475,29 @@ impl IvoryApp {
             }
         }
         if released {
+            // The MIDI item the shift-drag drew, taken into the document —
+            // and the lane with it, if it was nobody's yet.
+            if let Some((lane, t0, t1)) = self.arr_pending.take() {
+                let min_len = (self.arr_grid_s() * 0.5).max(0.05);
+                if t1 - t0 >= min_len {
+                    if self.channel_kind(lane).is_none() {
+                        self.set_channel_kind(lane, Some(recorder::ChannelKind::Midi));
+                    }
+                    self.arrangement.add_clip(crate::arrangement::ArrClip {
+                        kind: crate::arrangement::ClipKind::Midi,
+                        lane,
+                        path: String::new(),
+                        start_s: t0,
+                        offset_s: 0.0,
+                        len_s: t1 - t0,
+                        fade_in_s: 0.0,
+                        fade_out_s: 0.0,
+                        name: "MIDI".to_owned(),
+                        id: 0,
+                    });
+                    self.arr_save_edits();
+                }
+            }
             if self.arr_gesture_dirty {
                 self.arr_gesture_dirty = false;
                 self.arr_save_edits();
@@ -4435,10 +4599,15 @@ impl IvoryApp {
                     muted: desk.muted[n],
                     soloed: desk.soloed[n],
                     gain: g.channels.get(n).copied().unwrap_or(1.0),
+                    send: desk.send[n],
                     peak: peaks[n],
                 }
             }),
             clips,
+            metronome_on: self.settings.metronome_on,
+            snap_on: self.settings.arr_snap,
+            grid_exp: self.settings.arr_grid_exp as i8,
+            pending: self.arr_pending,
             view_start_s,
             view_len_s,
             playhead_s: self.recorder.position_s,
@@ -7691,12 +7860,23 @@ impl IvoryApp {
             && self.num_edit.is_none()
         {
             if let Some(action) = keys::pressed(&ctx, self.key_gates()) {
-                // **The arrangement owns S while it is open.** S is the
-                // supporter card everywhere else; in the arrangement it is
-                // SPLIT — the owner's binding — and a card rising over a cut
-                // would be two meanings on one key at one moment.
+                // **The arrangement owns S, G and M while it is open.**
+                // Elsewhere they are the supporter card, the guitar and the
+                // taught chords; here they are SPLIT, the magnet and the
+                // click — the owner's bindings — and a card rising over a
+                // cut would be two meanings on one key at one moment.
                 if self.arrangement_open && action == keys::KeyAction::ShowSupporterKey {
                     self.arr_split_at_playhead();
+                } else if self.arrangement_open
+                    && action == keys::KeyAction::ToggleFretboard
+                {
+                    self.settings.arr_snap = !self.settings.arr_snap;
+                    self.save_settings();
+                } else if self.arrangement_open
+                    && action == keys::KeyAction::ManageTaughtChords
+                {
+                    self.settings.metronome_on = !self.settings.metronome_on;
+                    self.save_settings();
                 } else {
                     self.apply_key_action(&ctx, action);
                 }
@@ -7904,8 +8084,12 @@ impl IvoryApp {
         let mut chord_rect_for_hit: Option<Rect> = None;
         // Where the thanks card hangs from, once the heart has been drawn.
         let mut heart_rect_for_card: Option<Rect> = None;
-        let fret_rect_for_hit: Option<Rect> = (fret_h > 0.0)
-            .then(|| band_at(recorder_h + theory_h + chord_h + piano_h, fret_h));
+        // **Never under an open view.** The mixer and the arrangement own
+        // everything below the band while they are up; a neck drawn over
+        // the last lanes was the first thing the owner saw.
+        let fret_rect_for_hit: Option<Rect> =
+            (fret_h > 0.0 && !self.mixer_open && !self.arrangement_open)
+                .then(|| band_at(recorder_h + theory_h + chord_h + piano_h, fret_h));
         // The row, then the two halves of it. The camera pane is not a hit
         // target — there is nothing to click on a picture of yourself — so only
         // the diagrams' half goes to the hit test.
@@ -8416,6 +8600,16 @@ impl IvoryApp {
                 self.settings.dark_mode,
                 help,
                 self.key_gates(),
+                // **The card describes the surface you are on.** The keys a
+                // view steals say what they do THERE, and the gestures with
+                // no key at all get rows of their own.
+                if self.arrangement_open {
+                    keys::HelpView::Arrange
+                } else if self.mixer_open {
+                    keys::HelpView::Mixer
+                } else {
+                    keys::HelpView::Piano
+                },
             );
         }
 

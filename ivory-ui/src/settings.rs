@@ -888,6 +888,10 @@ pub struct Settings {
     /// with every record arm off but the default instrument's, which is the
     /// arm rule, not this field's. See docs/ARRANGEMENT.md.
     pub project_path: String,
+    /// The arrangement's magnet: edits snap to the grid. ON out of the box.
+    pub arr_snap: bool,
+    /// The grid, in bars as a power of two: 3 = 8 bars … 0 = 1 … -5 = 1/32.
+    pub arr_grid_exp: i64,
     /// Transpose, in semitones, applied to every note the display and the
     /// chord detector see.
     ///
@@ -1127,6 +1131,8 @@ impl Default for Settings {
             show_take_summary: true,
             track_path: String::new(),
             project_path: String::new(),
+            arr_snap: true,
+            arr_grid_exp: 0,
             transpose: 0,
             show_transpose: true,
             metronome_on: false,
@@ -1836,6 +1842,10 @@ impl Settings {
         if let Some(Value::String(path)) = map.shift_remove("project_path") {
             s.project_path = path;
         }
+        take_bool(&mut map, "arr_snap", &mut s.arr_snap);
+        if let Some(n) = map.shift_remove("arr_grid_exp").and_then(|v| v.as_i64()) {
+            s.arr_grid_exp = n.clamp(-5, 3);
+        }
         if let Some(Value::String(path)) = map.shift_remove("track_path") {
             s.track_path = path;
         }
@@ -2424,6 +2434,8 @@ impl Settings {
             "project_path".into(),
             Value::String(self.project_path.clone()),
         );
+        map.insert("arr_snap".into(), Value::Bool(self.arr_snap));
+        map.insert("arr_grid_exp".into(), Value::from(self.arr_grid_exp));
         for (key, gain) in [
             ("metronome_gain", self.metronome_gain),
             ("master_gain", self.master_gain),

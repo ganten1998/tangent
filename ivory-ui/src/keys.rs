@@ -270,12 +270,48 @@ fn describe(a: KeyAction) -> &'static str {
 /// Shared with `pressed` through `available`, which is what makes "listed but
 /// dead" and "live but unlisted" the same impossible thing rather than two
 /// separate bugs to remember.
-fn card_rows(gates: Gates) -> Vec<(&'static str, &'static str)> {
-    BINDINGS
+/// Which surface the card describes. **The keys change with the view**: a
+/// key the arrangement steals (S, G, M) is described by what it does THERE,
+/// and each view appends the gestures that have no key at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelpView {
+    Piano,
+    Mixer,
+    Arrange,
+}
+
+fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> {
+    let mut rows: Vec<(&'static str, &'static str)> = BINDINGS
         .iter()
         .filter(|&&(_, _, a, shown)| shown && available(a, gates))
-        .map(|&(_, label, action, _)| (label, describe(action)))
-        .collect()
+        .map(|&(_, label, action, _)| {
+            let desc = match (view, action) {
+                (HelpView::Arrange, KeyAction::ShowSupporterKey) => {
+                    "split the clip at the playhead"
+                }
+                (HelpView::Arrange, KeyAction::ToggleFretboard) => "snap to grid (the magnet)",
+                (HelpView::Arrange, KeyAction::ManageTaughtChords) => "metronome on/off",
+                _ => describe(action),
+            };
+            (label, desc)
+        })
+        .collect();
+    match view {
+        HelpView::Piano => {}
+        HelpView::Mixer => rows.extend([
+            ("R-CLK", "loaded insert: delete / replace · panel: paint"),
+            ("2-CLK", "rename a channel · reset a fader"),
+        ]),
+        HelpView::Arrange => rows.extend([
+            ("DRAG", "move a clip · edges trim · corners fade"),
+            ("S-DRG", "shift-drag: draw a MIDI item"),
+            ("DEL", "delete the selected clip"),
+            ("WHEEL", "zoom around the pointer"),
+            ("A-WHL", "alt: scrub the playhead by grid"),
+            ("C-WHL", "cmd: pan along the song"),
+        ]),
+    }
+    rows
 }
 
 /// Which action a frame's keypresses ask for, if any.
@@ -420,7 +456,10 @@ fn layout(rect: Rect, rows: usize, widest: usize, widest_key: usize) -> (Rect, f
     let measure = |cols: usize| measure_card(rect, rows, widest, widest_key, cols);
 
     let mut best: Option<(usize, f32, f32, f32)> = None;
-    for cols in 1..=3usize {
+    // Up to FOUR columns now: the arrangement's card carries the gesture
+    // rows, and thirty-plus rows in three columns cannot fit a short window
+    // at any legible size.
+    for cols in 1..=4usize {
         let (size, w, h) = measure(cols);
         if w <= rect.width() * 0.94 && h <= rect.height() {
             if best.is_none_or(|(_, bs, ..)| size > bs) {
@@ -432,8 +471,8 @@ fn layout(rect: Rect, rows: usize, widest: usize, widest_key: usize) -> (Rect, f
     // widest arrangement and let the clamp below trim it, which clips inside
     // the window rather than painting outside it.
     let (cols, size, w, h) = best.unwrap_or_else(|| {
-        let (size, w, h) = measure(3);
-        (3, size, w, h)
+        let (size, w, h) = measure(4);
+        (4, size, w, h)
     });
     // Never flush against the window edges: a card touching them reads as
     // clipped even when it is not, and exact-equality containment is a float
@@ -455,8 +494,8 @@ fn layout(rect: Rect, rows: usize, widest: usize, widest_key: usize) -> (Rect, f
 /// `gates` reaches the card for one reason only: a shortcut the app would
 /// ignore must not be advertised. It goes through the same `available` the
 /// keyboard does, so the card and the binding cannot disagree about Space.
-pub fn draw_help(painter: &Painter, rect: Rect, dark: bool, t: f32, gates: Gates) {
-    let rows = card_rows(gates);
+pub fn draw_help(painter: &Painter, rect: Rect, dark: bool, t: f32, gates: Gates, view: HelpView) {
+    let rows = card_rows(gates, view);
     let widest = rows.iter().map(|(_, d)| d.len()).max().unwrap_or(20);
     // Counted in `chars`, not bytes: the labels are ASCII today and a "⌫" one
     // day would otherwise be measured as three characters wide.
@@ -731,17 +770,20 @@ mod tests {
             recorder_available: true,
             window_sizing: true,
         };
-        let hidden = card_rows(can_record);
+        let hidden = card_rows(can_record, HelpView::Piano);
         for gone in ["Space", "Enter"] {
             assert!(
                 !hidden.iter().any(|(label, _)| *label == gone),
                 "the card offers {gone}, a shortcut the app would ignore"
             );
         }
-        let shown = card_rows(Gates {
-            recorder_shown: true,
-            ..can_record
-        });
+        let shown = card_rows(
+            Gates {
+                recorder_shown: true,
+                ..can_record
+            },
+            HelpView::Piano,
+        );
         // TWO rows now, not one: starting and stopping are separate keys, so
         // that the key which begins a performance is not the key that ends it.
         assert_eq!(
@@ -756,7 +798,7 @@ mod tests {
         );
         // And every listed row is a live binding, in both states.
         for gates in [Gates::default(), Gates { recorder_shown: true, recorder_available: true, window_sizing: true }] {
-            for (label, _) in card_rows(gates) {
+            for (label, _) in card_rows(gates, HelpView::Piano) {
                 let (_, _, action, _) = BINDINGS
                     .iter()
                     .find(|(_, l, ..)| *l == label)
@@ -775,7 +817,10 @@ mod tests {
         let size = 14.0_f32;
         // ~0.62 em per glyph is what the card's own column maths assumes.
         let glyph = size * 0.62;
-        for label in card_rows(Gates { recorder_shown: true, recorder_available: true, window_sizing: true })
+        for label in card_rows(
+            Gates { recorder_shown: true, recorder_available: true, window_sizing: true },
+            HelpView::Arrange,
+        )
             .iter()
             .map(|(l, _)| *l)
         {
@@ -800,7 +845,11 @@ mod tests {
     fn the_card_fits_the_window_at_every_size_and_row_count() {
         // The real maximum, taken through the gate rather than off the table:
         // the card is longest with every binding live.
-        let shown = card_rows(Gates { recorder_shown: true, recorder_available: true, window_sizing: true }).len();
+        let shown = card_rows(
+            Gates { recorder_shown: true, recorder_available: true, window_sizing: true },
+            HelpView::Arrange,
+        )
+        .len();
         for w in [650.0_f32, 975.0, 1300.0, 1950.0, 2600.0] {
             for h in [w / 8.667, w / 8.667 + 50.0, w / 8.667 + 182.0, 90.0] {
                 let rect = Rect::from_min_size(Pos2::new(7.0, 11.0), Vec2::new(w, h));
@@ -866,13 +915,15 @@ mod tests {
                     // Both gate states: they are two different row counts, and
                     // the shorter one is the card most users will ever see.
                     for gates in [Gates::default(), Gates { recorder_shown: true, recorder_available: true, window_sizing: true }] {
-                        for t in [0.0, 0.01, 0.5, 0.999, 1.0] {
-                            draw_help(ui.painter(), rect, false, t, gates);
-                            draw_help(ui.painter(), rect, true, t, gates);
+                        for view in [HelpView::Piano, HelpView::Mixer, HelpView::Arrange] {
+                            for t in [0.0, 0.01, 0.5, 0.999, 1.0] {
+                                draw_help(ui.painter(), rect, false, t, gates, view);
+                                draw_help(ui.painter(), rect, true, t, gates, view);
+                            }
                         }
                         // Out of range must not escape the window either.
-                        draw_help(ui.painter(), rect, false, -1.0, gates);
-                        draw_help(ui.painter(), rect, true, 2.0, gates);
+                        draw_help(ui.painter(), rect, false, -1.0, gates, HelpView::Piano);
+                        draw_help(ui.painter(), rect, true, 2.0, gates, HelpView::Piano);
                     }
                 });
             });

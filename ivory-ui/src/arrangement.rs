@@ -50,11 +50,24 @@ use std::path::PathBuf;
 
 /// The document's schema version. Bump WITH a migration arm in
 /// [`Arrangement::from_map`], never without one.
-pub const ARRANGEMENT_VERSION: u64 = 2;
+pub const ARRANGEMENT_VERSION: u64 = 3;
 
-/// One piece of audio standing on the timeline.
+/// What a clip is made of.
+///
+/// Version 3: MIDI arrived — an empty item drawn by hand, notes to follow
+/// with the editor. An audio clip has a file; a MIDI clip has none (its
+/// `path` is empty) and its notes will live in the document itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClipKind {
+    #[default]
+    Audio,
+    Midi,
+}
+
+/// One piece of audio or MIDI standing on the timeline.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ArrClip {
+    pub kind: ClipKind,
     /// Which lane it stands on. Lane 0 is the backing track's.
     pub lane: usize,
     /// The file it came from — `media/<file>` inside a project, or absolute.
@@ -212,9 +225,16 @@ impl Arrangement {
             for item in list {
                 let Value::Object(c) = item else { continue };
                 let lane = c.get("lane").and_then(Value::as_u64).unwrap_or(0) as usize;
-                let Some(path) = c.get("path").and_then(Value::as_str) else {
-                    continue;
+                let kind = match c.get("kind").and_then(Value::as_str) {
+                    Some("midi") => ClipKind::Midi,
+                    _ => ClipKind::Audio,
                 };
+                // An AUDIO clip without a file is nothing; a MIDI clip has
+                // no file to name.
+                let path = c.get("path").and_then(Value::as_str).unwrap_or("");
+                if kind == ClipKind::Audio && path.is_empty() {
+                    continue;
+                }
                 let name = c
                     .get("name")
                     .and_then(Value::as_str)
@@ -226,6 +246,7 @@ impl Arrangement {
                             .unwrap_or_default()
                     });
                 clips.push(ArrClip {
+                    kind,
                     lane,
                     path: path.to_owned(),
                     start_s: secs(&c, "start_s"),
@@ -280,6 +301,16 @@ impl Arrangement {
                     .iter()
                     .map(|c| {
                         let mut m = Map::new();
+                        m.insert(
+                            "kind".into(),
+                            Value::String(
+                                match c.kind {
+                                    ClipKind::Audio => "audio",
+                                    ClipKind::Midi => "midi",
+                                }
+                                .to_owned(),
+                            ),
+                        );
                         m.insert("lane".into(), Value::Number((c.lane as u64).into()));
                         m.insert("path".into(), Value::String(c.path.clone()));
                         m.insert("name".into(), Value::String(c.name.clone()));
@@ -324,6 +355,7 @@ mod tests {
 
     fn a_clip(lane: usize, path: &str, start_s: f64) -> ArrClip {
         ArrClip {
+            kind: ClipKind::Audio,
             lane,
             path: path.to_owned(),
             start_s,
