@@ -523,32 +523,24 @@ impl Layout {
             Pos2::new(whole_status.right() - close_w, whole_status.top()),
             whole_status.max,
         );
-        let mut status = Rect::from_min_max(
+        let status = Rect::from_min_max(
             whole_status.min,
             Pos2::new(status_close.left() - 4.0, whole_status.bottom()),
         );
-        // **The heart lives in the status row now, beside the ×.** It used to
-        // claim a strip along the bottom of the whole middle group, and every
-        // column — the meters, the dials, the master — stopped a heart's
-        // height above the band's edge for a credit fourteen points wide. The
-        // status row is one line that is usually empty; the credit fits inside
-        // it and the columns get the strip back. The text's rect gives up the
-        // width so a long warning can never run under it.
+        // **The heart sits in the band's very top-right corner** — the
+        // owner's spot for it. A credit, floating over the band's own
+        // margin, out of every column's way; too-narrow bands simply skip
+        // it rather than draw a smudge.
         let heart = {
-            let h = (status_h * 0.85).max(6.0);
+            let h = (inner.height() * 0.055).clamp(7.0, 12.0);
             let w = h * crate::chord_strip::HEART_ASPECT;
-            if w > whole_status.width() * 0.1 || !status.is_positive() {
+            if w > inner.width() * 0.05 {
                 Rect::NOTHING
             } else {
-                let r = Rect::from_min_size(
-                    Pos2::new(status.right() - w, whole_status.center().y - h * 0.5),
+                Rect::from_min_size(
+                    Pos2::new(inner.right() - w, inner.top()),
                     Vec2::new(w, h),
-                );
-                status = Rect::from_min_max(
-                    status.min,
-                    Pos2::new(r.left() - 4.0, status.bottom()),
-                );
-                r
+                )
             }
         };
         let body = Rect::from_min_max(
@@ -800,6 +792,20 @@ impl Layout {
     /// being grabbable long before a meter stops being readable.
     fn fill_master(&mut self, m: Rect, knob_size: Vec2) {
         if !m.is_positive() || !(knob_size.x > 0.0 && knob_size.y > 0.0) {
+            return;
+        }
+        // **The heart holds the very corner** — the owner's spot — and the
+        // master column alone starts under it: a scale number with a heart
+        // on it is a number nobody can read.
+        let m = if self.heart.is_positive() && self.heart.right() > m.left() {
+            Rect::from_min_max(
+                Pos2::new(m.left(), m.top().max(self.heart.bottom() + 2.0)),
+                m.max,
+            )
+        } else {
+            m
+        };
+        if !m.is_positive() {
             return;
         }
         // The knob sits at the foot of the column, the same size as an effect
@@ -5239,6 +5245,31 @@ mod tests {
     /// import button, loaded it is a locate whose fraction is the fraction
     /// into the file — and while a take rolls it is neither, because moving
     /// the playhead under a running take would tear the file.
+    /// **The heart's corner is nobody else's.** It floats at the band's
+    /// very top right and must not sit on the master ladder's numbers or
+    /// bars.
+    #[test]
+    fn the_heart_keeps_out_of_the_masters_scale() {
+        for w in [900.0_f32, 1300.0, 2600.0] {
+            let v = furnished();
+            let l = Layout::new(band(w), &v);
+            if !l.heart.is_positive() {
+                continue;
+            }
+            for (what, r) in [
+                ("the master's right scale", l.master_scale[1]),
+                ("the master's bars", l.master_bars),
+                ("the master knob", l.master_knob),
+            ] {
+                assert!(
+                    !l.heart.intersects(r),
+                    "at {w}: the heart sits on {what}: {:?} vs {r:?}",
+                    l.heart
+                );
+            }
+        }
+    }
+
     #[test]
     fn the_timeline_imports_empty_and_locates_loaded() {
         let r = band(1300.0);

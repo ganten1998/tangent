@@ -2273,6 +2273,13 @@ impl DesktopApp {
         let mut fill_len: Vec<(u64, f64)> = Vec::new();
         let mut clip_infos: Vec<(u64, Vec<f32>, f64)> = Vec::new();
         for clip in &doc.clips {
+            // A MIDI item has no audio to schedule — its notes are the
+            // editor's, its playback a later phase's. It still holds the
+            // SPAN: the band's fractions must cover everything drawn.
+            if clip.kind == ivory_ui::arrangement::ClipKind::Midi {
+                span = span.max(clip.start_s + clip.len_s);
+                continue;
+            }
             let path = ivory_ui::arrangement::Arrangement::resolve(&doc_path, &clip.path);
             let decoded = match self.track_cache.get(&path) {
                 Some(c) => Arc::clone(c),

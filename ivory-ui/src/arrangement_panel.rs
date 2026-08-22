@@ -48,6 +48,8 @@ pub struct LaneView<'a> {
     pub soloed: bool,
     /// Linear, as the mixer fader sits. The header knob is the same value.
     pub gain: f32,
+    /// 0..=1, the strip's send — the second dial.
+    pub send: f32,
     pub peak: [f32; 2],
 }
 
@@ -67,12 +69,22 @@ pub struct ClipView<'a> {
     /// A peak envelope of the PLAYED span, 0..=1. May be empty.
     pub wave: &'a [f32],
     pub selected: bool,
+    /// A MIDI item: no file, no wave — drawn with its own face.
+    pub midi: bool,
 }
 
 /// Everything the arrangement draws, pushed in.
 pub struct ArrangeView<'a> {
     pub lanes: [LaneView<'a>; CHANNELS],
     pub clips: &'a [ClipView<'a>],
+    /// The toolbar's three facts: the click, the magnet, and the grid as a
+    /// power of two in bars (3 = 8 bars … 0 = 1 bar … -5 = 1/32).
+    pub metronome_on: bool,
+    pub snap_on: bool,
+    pub grid_exp: i8,
+    /// A MIDI item being drawn by shift-drag right now: lane, from, to —
+    /// ghosted until the button comes up and the document takes it.
+    pub pending: Option<(usize, f64, f64)>,
     /// The zoom window, in seconds of song.
     pub view_start_s: f64,
     pub view_len_s: f64,
@@ -112,6 +124,15 @@ pub enum Hit {
     /// The bars ruler: a locate on press; a vertical drag is the zoom, which
     /// the app runs through [`time_at`] against the press's anchor.
     Ruler(f64),
+    /// The header's send dial — draggable and vertical, like the gain.
+    Send(usize),
+    /// The toolbar: the click on and off.
+    ToolMetronome,
+    /// The toolbar: the magnet.
+    ToolSnap,
+    /// The toolbar's grid box. A press steps FINER; the wheel over it is
+    /// the real control, handled by the app from this same rectangle.
+    ToolGrid,
 }
 
 impl Hit {
@@ -147,6 +168,10 @@ const FADE_W: f32 = 11.0;
 pub struct Layout {
     pub header: Rect,
     pub ruler: Rect,
+    /// The corner cell's toolbar: metronome, magnet, grid box.
+    pub tool_met: Rect,
+    pub tool_snap: Rect,
+    pub tool_grid: Rect,
     pub lanes_area: Rect,
     pub lane_rows: [Rect; CHANNELS],
     pub header_rows: [HeaderRow; CHANNELS],
@@ -160,6 +185,11 @@ pub struct HeaderRow {
     pub arm: Rect,
     pub name: Rect,
     pub knob: Rect,
+    pub send: Rect,
+    /// The readouts under the two dials: dB under the volume, % under the
+    /// send. Text, not targets — the dials above them are the controls.
+    pub knob_readout: Rect,
+    pub send_readout: Rect,
     pub meter: Rect,
     pub mute: Rect,
     pub solo: Rect,
@@ -172,6 +202,9 @@ impl HeaderRow {
         arm: Rect::NOTHING,
         name: Rect::NOTHING,
         knob: Rect::NOTHING,
+        send: Rect::NOTHING,
+        knob_readout: Rect::NOTHING,
+        send_readout: Rect::NOTHING,
         meter: Rect::NOTHING,
         mute: Rect::NOTHING,
         solo: Rect::NOTHING,
@@ -184,6 +217,9 @@ impl Layout {
             return Self {
                 header: Rect::NOTHING,
                 ruler: Rect::NOTHING,
+                tool_met: Rect::NOTHING,
+                tool_snap: Rect::NOTHING,
+                tool_grid: Rect::NOTHING,
                 lanes_area: Rect::NOTHING,
                 lane_rows: [Rect::NOTHING; CHANNELS],
                 header_rows: [HeaderRow::NONE; CHANNELS],
@@ -227,9 +263,35 @@ impl Layout {
             };
             Self::header_row(row, lane.used)
         });
+        // **The toolbar, in the corner cell** — the room above the track
+        // list, before the ruler's first tick. Three small controls: the
+        // click, the magnet, and the grid box the wheel turns.
+        let corner = Rect::from_min_max(
+            rect.min,
+            Pos2::new(rect.left() + header_w, rect.top() + ruler_h),
+        )
+        .shrink2(Vec2::new(3.0, 2.0));
+        let side = (corner.height()).clamp(1.0, 20.0);
+        let cell = |k: f32| {
+            Rect::from_min_size(
+                Pos2::new(corner.left() + k * (side + 3.0), corner.top()),
+                Vec2::splat(side),
+            )
+        };
+        let (tool_met, tool_snap) = (cell(0.0), cell(1.0));
+        let tool_grid = Rect::from_min_max(
+            Pos2::new(tool_snap.right() + 3.0, corner.top()),
+            Pos2::new(
+                (tool_snap.right() + 3.0 + side * 2.4).min(corner.right()),
+                corner.bottom(),
+            ),
+        );
         Self {
             header,
             ruler,
+            tool_met,
+            tool_snap,
+            tool_grid,
             lanes_area,
             lane_rows,
             header_rows,
@@ -271,14 +333,28 @@ impl Layout {
             Pos2::new(mute.left() - 8.0, r.top() + h * 0.15),
             Pos2::new(mute.left() - 3.0, r.bottom() - h * 0.15),
         );
-        let kd = (h * 0.66).clamp(14.0, 26.0);
-        let knob = Rect::from_center_size(
-            Pos2::new(meter.left() - 4.0 - kd * 0.5, r.center().y),
+        // **Two dials now — volume, then send — a shade smaller than the
+        // one was**, each with a readout under it: the number is the other
+        // half of a dial this size.
+        let kd = (h * 0.52).clamp(12.0, 20.0);
+        let dial_top = r.top() + h * 0.08;
+        let send = Rect::from_min_size(
+            Pos2::new(meter.left() - 5.0 - kd, dial_top),
             Vec2::splat(kd),
         );
+        let knob = Rect::from_min_size(
+            Pos2::new(send.left() - 4.0 - kd, dial_top),
+            Vec2::splat(kd),
+        );
+        let readout = |dial: Rect| {
+            Rect::from_min_max(
+                Pos2::new(dial.left() - 1.0, dial.bottom() + 1.0),
+                Pos2::new(dial.right() + 1.0, r.bottom() - 1.0),
+            )
+        };
         let name = Rect::from_min_max(
             Pos2::new(arm.right() + 4.0, r.top()),
-            Pos2::new(knob.left() - 4.0, r.bottom()),
+            Pos2::new(knob.left() - 6.0, r.bottom()),
         );
         HeaderRow {
             panel: row,
@@ -286,6 +362,9 @@ impl Layout {
             arm,
             name,
             knob,
+            send,
+            knob_readout: readout(knob),
+            send_readout: readout(send),
             meter,
             mute,
             solo,
@@ -337,12 +416,22 @@ pub fn clip_rect(rect: Rect, view: &ArrangeView<'_>, clip: &ClipView<'_>) -> Rec
 /// ones where they overlap, because later is what was added on top.
 pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
     let l = Layout::new(rect, view);
+    for (r, hit) in [
+        (l.tool_met, Hit::ToolMetronome),
+        (l.tool_snap, Hit::ToolSnap),
+        (l.tool_grid, Hit::ToolGrid),
+    ] {
+        if r.is_positive() && r.contains(pos) {
+            return Some(hit);
+        }
+    }
     for (i, row) in l.header_rows.iter().enumerate() {
         for (r, hit) in [
             (row.arm, Hit::Arm(i)),
             (row.mute, Hit::Mute(i)),
             (row.solo, Hit::Solo(i)),
             (row.knob, Hit::Gain(i)),
+            (row.send, Hit::Send(i)),
         ] {
             if r.is_positive() && r.contains(pos) {
                 return Some(hit);
@@ -433,6 +522,15 @@ fn ink(view: &ArrangeView<'_>) -> Ink {
     }
 }
 
+/// What the grid box SAYS: bars as a power of two — "8", "1", "1/16".
+pub fn grid_label(exp: i8) -> String {
+    if exp >= 0 {
+        format!("{}", 1u32 << exp.min(6) as u32)
+    } else {
+        format!("1/{}", 1u32 << (-exp).min(6) as u32)
+    }
+}
+
 /// Seconds per bar, from the band's own tempo and signature.
 fn bar_s(view: &ArrangeView<'_>) -> f64 {
     let bpm = view.bpm.clamp(20.0, 400.0);
@@ -517,6 +615,19 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             // like.
             .unwrap_or(Color32::from_rgb(0x2E, 0x6B, 0x46));
         painter.rect_filled(r, 3.0, color);
+        // A MIDI item wears a dashed midline where audio wears its wave —
+        // the empty staff the editor will fill.
+        if clip.midi && r.width() >= 8.0 {
+            let mid = r.center().y;
+            let mut x = r.left() + 3.0;
+            while x < r.right() - 3.0 {
+                painter.line_segment(
+                    [Pos2::new(x, mid), Pos2::new((x + 4.0).min(r.right() - 3.0), mid)],
+                    Stroke::new(1.0, p.clip_ink.gamma_multiply(0.5)),
+                );
+                x += 8.0;
+            }
+        }
         // The wave, drawn inside at the clip's own resolution.
         if !clip.wave.is_empty() && r.width() >= 8.0 {
             let mid = r.center().y;
@@ -678,20 +789,61 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 ink_on,
             );
         }
-        // The knob: the mixer fader as a dial, at header scale.
-        if row.knob.is_positive() {
-            let kc = row.knob.center();
-            let kr = row.knob.width() * 0.5;
+        // The two dials: VOLUME (the mixer fader as a dial) and SEND, each
+        // with its number under it — a dial this small needs the readout to
+        // be a control you can trust.
+        let dial = |painter: &Painter, cell: Rect, t: f32, cap: Color32| {
+            if !cell.is_positive() {
+                return;
+            }
+            let kc = cell.center();
+            let kr = cell.width() * 0.5;
             painter.circle_filled(kc, kr, p.lane);
-            painter.circle_filled(kc, kr * 0.82, Color32::from_rgb(0x1C, 0x6F, 0xD6));
-            let t = crate::recorder::gain_to_fader(lane.gain).clamp(0.0, 1.0);
+            painter.circle_filled(kc, kr * 0.82, cap);
             let sweep = std::f32::consts::PI * 1.5;
-            let a = std::f32::consts::PI * 0.75 + sweep * t;
+            let a = std::f32::consts::PI * 0.75 + sweep * t.clamp(0.0, 1.0);
             painter.line_segment(
                 [kc, Pos2::new(kc.x + a.cos() * kr * 0.8, kc.y + a.sin() * kr * 0.8)],
                 Stroke::new((kr * 0.22).max(1.5), p.clip_ink),
             );
-        }
+        };
+        let readout = |painter: &Painter, cell: Rect, text: String| {
+            if !cell.is_positive() || cell.height() < 7.0 {
+                return;
+            }
+            painter.text(
+                cell.center(),
+                Align2::CENTER_CENTER,
+                text,
+                FontId::new(cell.height().clamp(7.0, 9.0), crate::fonts::courier()),
+                ink_on.gamma_multiply(0.8),
+            );
+        };
+        dial(
+            painter,
+            row.knob,
+            crate::recorder::gain_to_fader(lane.gain),
+            Color32::from_rgb(0x1C, 0x6F, 0xD6),
+        );
+        // Compact: the unit has no room at this size, and a number under a
+        // VOLUME dial needs none.
+        let db = if lane.gain <= 0.001 {
+            "-inf".to_owned()
+        } else {
+            format!("{:+.1}", 20.0 * lane.gain.log10())
+        };
+        readout(painter, row.knob_readout, db);
+        dial(
+            painter,
+            row.send,
+            lane.send,
+            Color32::from_rgb(0x2f, 0x8f, 0x5c),
+        );
+        readout(
+            painter,
+            row.send_readout,
+            format!("{:.0}%", f64::from(lane.send.clamp(0.0, 1.0)) * 100.0),
+        );
         // The meter: one slim bar, the loudest of the pair.
         if row.meter.is_positive() {
             painter.rect_filled(row.meter, 1.0, p.lane);
@@ -725,12 +877,102 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             );
         }
     }
-    // The corner cell over the header, where the ruler has no numbers.
+    // **A MIDI item being drawn right now**: a ghost until the button comes
+    // up and the document takes it.
+    if let Some((lane, t0, t1)) = view.pending {
+        if let Some(row) = l.lane_rows.get(lane).copied().filter(|r| r.is_positive()) {
+            let x0 = x_of(rect, view, t0).max(l.lanes_area.left());
+            let x1 = x_of(rect, view, t1).min(l.lanes_area.right());
+            if x1 > x0 {
+                let ghost = Rect::from_min_max(
+                    Pos2::new(x0, row.top() + 1.5),
+                    Pos2::new(x1, row.bottom() - 1.5),
+                );
+                painter.rect_filled(ghost, 3.0, Color32::from_white_alpha(24));
+                painter.rect_stroke(
+                    ghost,
+                    3.0,
+                    Stroke::new(1.5, p.select),
+                    egui::StrokeKind::Inside,
+                );
+            }
+        }
+    }
+
+    // The corner cell over the header, where the ruler has no numbers —
+    // and the TOOLBAR standing in it: the click, the magnet, the grid.
     painter.rect_filled(
         Rect::from_min_max(rect.min, Pos2::new(l.header.right(), l.ruler.bottom())),
         0.0,
         p.wood,
     );
+    let tool = |painter: &Painter, r: Rect, on: bool| {
+        if !r.is_positive() {
+            return false;
+        }
+        painter.rect_filled(r, 2.0, if on { p.face } else { p.lane });
+        true
+    };
+    if tool(painter, l.tool_met, view.metronome_on) {
+        crate::recorder_panel::draw_metronome_on(
+            painter,
+            l.tool_met.shrink(2.0),
+            if view.metronome_on { p.engrave } else { p.face.gamma_multiply(0.7) },
+            if view.metronome_on { p.face } else { p.lane },
+        );
+    }
+    if tool(painter, l.tool_snap, view.snap_on) {
+        // The magnet: a U with its two poles, the sign every DAW uses.
+        let m = l.tool_snap.shrink(3.5);
+        let ink = if view.snap_on { p.engrave } else { p.face.gamma_multiply(0.7) };
+        let w = (m.width() * 0.18).clamp(1.5, 3.0);
+        let cx = m.center().x;
+        let radius = m.width() * 0.5 - w * 0.5;
+        // The bend, drawn as an arc of segments over the top.
+        let steps = 10;
+        let mut last: Option<Pos2> = None;
+        for i in 0..=steps {
+            let a = std::f32::consts::PI * (1.0 + i as f32 / steps as f32);
+            let pt = Pos2::new(
+                cx + a.cos() * radius,
+                m.top() + radius + a.sin() * radius,
+            );
+            if let Some(prev) = last {
+                painter.line_segment([prev, pt], Stroke::new(w, ink));
+            }
+            last = Some(pt);
+        }
+        // The legs and their pole tips.
+        for side in [-1.0f32, 1.0] {
+            let x = cx + side * radius;
+            painter.line_segment(
+                [
+                    Pos2::new(x, m.top() + radius),
+                    Pos2::new(x, m.bottom() - m.height() * 0.22),
+                ],
+                Stroke::new(w, ink),
+            );
+            painter.line_segment(
+                [
+                    Pos2::new(x, m.bottom() - m.height() * 0.2),
+                    Pos2::new(x, m.bottom()),
+                ],
+                Stroke::new(w, if view.snap_on { p.solo } else { ink }),
+            );
+        }
+    }
+    if tool(painter, l.tool_grid, true) {
+        painter.text(
+            l.tool_grid.center(),
+            Align2::CENTER_CENTER,
+            grid_label(view.grid_exp),
+            FontId::new(
+                (l.tool_grid.height() * 0.55).clamp(8.0, 11.0),
+                crate::fonts::courier_bold(),
+            ),
+            p.engrave,
+        );
+    }
 }
 
 fn luma(c: Color32) -> f32 {
@@ -775,6 +1017,7 @@ mod tests {
             muted: false,
             soloed: false,
             gain: 1.0,
+            send: 0.0,
             peak: [0.0; 2],
         }
     }
@@ -792,6 +1035,7 @@ mod tests {
                 name: "backing",
                 wave: &[],
                 selected: false,
+                midi: false,
             },
             ClipView {
                 id: 2,
@@ -804,6 +1048,7 @@ mod tests {
                 name: "solo",
                 wave: &[],
                 selected: true,
+                midi: false,
             },
         ]
     }
@@ -812,6 +1057,10 @@ mod tests {
         ArrangeView {
             lanes: std::array::from_fn(|i| a_lane(i < 3)),
             clips,
+            metronome_on: true,
+            snap_on: true,
+            grid_exp: 0,
+            pending: None,
             view_start_s: 0.0,
             view_len_s: 120.0,
             playhead_s: 15.0,
@@ -935,7 +1184,18 @@ mod tests {
         let v = a_view(&c);
         let l = Layout::new(rect(), &v);
         for (i, row) in l.header_rows.iter().enumerate() {
-            let cells = [row.number, row.arm, row.name, row.knob, row.meter, row.mute, row.solo];
+            let cells = [
+                row.number,
+                row.arm,
+                row.name,
+                row.knob,
+                row.send,
+                row.knob_readout,
+                row.send_readout,
+                row.meter,
+                row.mute,
+                row.solo,
+            ];
             for (a, ra) in cells.iter().enumerate() {
                 for (b, rb) in cells.iter().enumerate().skip(a + 1) {
                     if ra.is_positive() && rb.is_positive() {
@@ -947,6 +1207,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// **The toolbar and the second dial can be pressed**, and the gridbox
+    /// says its bars the way a musician does.
+    #[test]
+    fn the_toolbar_and_the_send_dial_can_be_pressed() {
+        let c = clips();
+        let v = a_view(&c);
+        let r = rect();
+        let l = Layout::new(r, &v);
+        for (cell, want) in [
+            (l.tool_met, Hit::ToolMetronome),
+            (l.tool_snap, Hit::ToolSnap),
+            (l.tool_grid, Hit::ToolGrid),
+        ] {
+            assert!(cell.is_positive(), "{want:?} has no room in the corner");
+            assert_eq!(hit_test(r, &v, cell.center()), Some(want));
+        }
+        let row = l.header_rows[0];
+        assert_eq!(hit_test(r, &v, row.knob.center()), Some(Hit::Gain(0)));
+        assert_eq!(hit_test(r, &v, row.send.center()), Some(Hit::Send(0)));
+        assert!(row.knob_readout.is_positive(), "the volume lost its readout");
+        assert!(row.send_readout.is_positive(), "the send lost its readout");
+        assert_eq!(grid_label(0), "1");
+        assert_eq!(grid_label(3), "8");
+        assert_eq!(grid_label(-4), "1/16");
+        assert_eq!(grid_label(-5), "1/32");
     }
 
     /// It survives a rect far too small to be useful, and clips off-window
