@@ -27,6 +27,9 @@ use ivory_core::patterns::{NOTE_NAMES, NOTE_NAMES_FLAT};
 use ivory_core::OverrideInfo;
 
 pub enum Dialog {
+    /// The project menu behind the band's folder button: the session's
+    /// name, and the five things you do with sessions.
+    Project { name: String },
     MidiPicker {
         ports: Vec<String>,
         selected: Option<usize>,
@@ -368,6 +371,20 @@ pub struct LearningStatus {
 }
 
 pub enum DialogAction {
+    /// New session from the `default` template.
+    ProjectNew,
+    /// Open the project picker.
+    ProjectOpen,
+    /// Write the session down now — desk, document, plugin states.
+    ProjectSave,
+    /// Duplicate the whole session somewhere and open the copy.
+    ProjectSaveAs,
+    /// Save the session as a template under `Projects/Templates`.
+    ProjectTemplate,
+    /// Bounce the arrangement to one WAV.
+    ProjectExportTrack,
+    /// Bounce every used lane to its own WAV.
+    ProjectExportStems,
     ConnectPort(String),
     /// List this directory and hand the rows back. The host reads the disk;
     /// the dialog draws what it is given, the same division the plugin picker
@@ -3900,6 +3917,91 @@ pub fn show(
             )
         }
 
+        Dialog::Project { name } => {
+            let t = theme(dark_mode);
+            show_dialog_viewport(
+                ctx,
+                placement,
+                "Project",
+                Vec2::new(340.0, 356.0),
+                Vec2::new(340.0, 316.0),
+                |ui, result| {
+                    apply_theme(ui.style_mut(), &t);
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
+                    let bold = |size: f32| FontId::new(size, fonts::courier_bold());
+                    let plain = |size: f32| FontId::new(size, fonts::courier());
+                    let dim = t.text.gamma_multiply(0.62);
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::same(14))
+                        .show(ui, |ui| {
+                            ui.label(RichText::new(name.as_str()).font(bold(13.0)).color(t.text));
+                            ui.label(
+                                RichText::new("the open session - saved as you work")
+                                    .font(plain(9.0))
+                                    .color(dim),
+                            );
+                            ui.add_space(8.0);
+                            let mut row = |ui: &mut egui::Ui, word: &str, hint: &str| -> bool {
+                                let clicked = ui
+                                    .add_sized(
+                                        Vec2::new(ui.available_width(), 24.0),
+                                        Button::new(
+                                            RichText::new(word).font(plain(11.0)).color(t.text),
+                                        ),
+                                    )
+                                    .clicked();
+                                if !hint.is_empty() {
+                                    ui.label(RichText::new(hint).font(plain(8.5)).color(dim));
+                                }
+                                ui.add_space(4.0);
+                                clicked
+                            };
+                            if row(ui, "New", "a fresh session from the default template") {
+                                action = Some(DialogAction::ProjectNew);
+                            }
+                            if row(ui, "Open...", "") {
+                                action = Some(DialogAction::ProjectOpen);
+                            }
+                            if row(ui, "Save", "desk, document and plugin settings, now") {
+                                action = Some(DialogAction::ProjectSave);
+                            }
+                            if row(ui, "Save As...", "copy the whole session and open the copy") {
+                                action = Some(DialogAction::ProjectSaveAs);
+                            }
+                            if row(
+                                ui,
+                                "Save As Template...",
+                                "under Projects/Templates - name it default to replace the default",
+                            ) {
+                                action = Some(DialogAction::ProjectTemplate);
+                            }
+                            ui.add_space(4.0);
+                            if row(
+                                ui,
+                                "Export Track",
+                                "one WAV of the whole arrangement - a real pass, racks and limiter included",
+                            ) {
+                                action = Some(DialogAction::ProjectExportTrack);
+                            }
+                            if row(
+                                ui,
+                                "Export Stems",
+                                "one WAV per used lane, under export/stems - one real pass",
+                            ) {
+                                action = Some(DialogAction::ProjectExportStems);
+                            }
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui
+                                    .add(Button::new(RichText::new("Done").color(t.text)))
+                                    .clicked()
+                                {
+                                    result.close = true;
+                                }
+                            });
+                        });
+                },
+            )
+        }
         Dialog::About => {
             let t = theme(dark_mode);
             show_dialog_viewport(

@@ -1202,6 +1202,9 @@ struct Shared {
     /// Frames the capture tee had to drop because a ring was full — the host
     /// stalled for seconds. Climbing means a take with a hole in it.
     cap_dropped: AtomicU64,
+    /// The per-lane STEM tap is running — set by the host for an export
+    /// pass, cleared when it ends.
+    stems_on: AtomicBool,
     /// The master, as a LINEAR gain. The last thing on the instrument bus,
     /// after the limiter, reaching both the device mix and the take — the same
     /// rule the effects follow.
@@ -1352,6 +1355,7 @@ impl Shared {
             armed: AtomicU32::new(u32::MAX),
             arr_capture: AtomicU32::new(0),
             cap_dropped: AtomicU64::new(0),
+            stems_on: AtomicBool::new(false),
             master_gain: AtomicU32::new(1.0f32.to_bits()),
             // The first channel — the desk's default instrument — sends
             // everything and nothing else sends anything, which is the same
@@ -2008,6 +2012,13 @@ struct Renderer {
     /// in here while `arr_capture` has the pick's bit, and the host drains
     /// them into the project's WAV files.
     cap_tx: Vec<Producer<f32>>,
+    /// The STEM tap: every lane's post-fader stereo, interleaved
+    /// `CHANNELS * 2` wide, while `stems_on`. The export's second ear.
+    stem_tx: Producer<f32>,
+    /// One block of stems, accumulated by the three mixers and pushed once.
+    stem_scratch: Vec<f32>,
+    /// `stems_on`, read once a block so the three mixers agree.
+    stems_live: bool,
 }
 
 impl Renderer {
@@ -2331,6 +2342,14 @@ impl Renderer {
                 self.sounding = 0;
             }
             self.was_rolling = rolling;
+            // The stem tap's block: the flag read once, the scratch
+            // zeroed once, all three mixers write, one push at the end.
+            self.stems_live = self.shared.stems_on.load(Ordering::Relaxed);
+            if self.stems_live {
+                if let Some(st) = self.stem_scratch.get_mut(..n * CHANNELS * 2) {
+                    st.fill(0.0);
+                }
+            }
             self.mix_channels(n, muted, soloed, at, rolling, flush);
 
             // A parameter change, if one is waiting and the lock is free this
@@ -2394,6 +2413,14 @@ impl Renderer {
             // the master — so the pads are limited, mastered, heard and
             // taped exactly like every other source.
             self.mix_pads(n);
+            if self.stems_live {
+                let want = n * CHANNELS * 2;
+                let room = (self.stem_tx.slots() / (CHANNELS * 2)) * (CHANNELS * 2);
+                let take = want.min(room);
+                if take > 0 {
+                    let _ = self.stem_tx.push_entire_slice(&self.stem_scratch[..take]);
+                }
+            }
             // ── the click, and what it sends ───────────────────────────
             //
             // **Its own pass, because the bus has to be finished before the
@@ -2952,6 +2979,16 @@ impl Renderer {
                     if let Some(v) = self.mix.get_mut(at + c) {
                         *v += src;
                     }
+                    // The stem tap hears the lane's LIVE input too — a
+                    // bounced stem is everything the lane put on the bus.
+                    if self.stems_live {
+                        if let Some(sv) = self
+                            .stem_scratch
+                            .get_mut(i * CHANNELS * 2 + strip.index() * 2 + c.min(1))
+                        {
+                            *sv += src;
+                        }
+                    }
                     // The room's subtrahend, ADDED to rather than written:
                     // four inputs share one buffer and the last one to run
                     // would otherwise be the only one the speakers were spared.
@@ -3045,9 +3082,11 @@ impl Renderer {
             };
             send[lane] = Shared::f32_of(&self.shared.send[strip.index()]).clamp(0.0, 1.0);
         }
-        let (Some(mix), Some(aux)) = (
+        let stems = self.stems_live;
+        let (Some(mix), Some(aux), Some(stem)) = (
             self.mix.get_mut(..frames * TAP_CHANNELS),
             self.aux.get_mut(..frames * TAP_CHANNELS),
+            self.stem_scratch.get_mut(..frames * CHANNELS * 2),
         ) else {
             return;
         };
@@ -3101,6 +3140,10 @@ impl Renderer {
                 mix[f * TAP_CHANNELS + 1] += r;
                 aux[f * TAP_CHANNELS] += l * send[lane];
                 aux[f * TAP_CHANNELS + 1] += r * send[lane];
+                if stems {
+                    stem[f * CHANNELS * 2 + lane * 2] += l;
+                    stem[f * CHANNELS * 2 + lane * 2 + 1] += r;
+                }
             }
         }
         for (lane, pk) in peak.iter().enumerate() {
@@ -3474,9 +3517,11 @@ impl Renderer {
             )
             .clamp(0.0, 1.0);
             let want = frames * TAP_CHANNELS;
-            let (Some(mix), Some(aux)) = (
+            let stems = self.stems_live;
+            let (Some(mix), Some(aux), Some(stem)) = (
                 self.mix.get_mut(..want),
                 self.aux.get_mut(..want),
+                self.stem_scratch.get_mut(..frames * CHANNELS * 2),
             ) else {
                 continue;
             };
@@ -3492,6 +3537,10 @@ impl Renderer {
                 mix[f * TAP_CHANNELS + 1] += r;
                 aux[f * TAP_CHANNELS] += l * send;
                 aux[f * TAP_CHANNELS + 1] += r * send;
+                if stems {
+                    stem[f * CHANNELS * 2 + ch * 2] += l;
+                    stem[f * CHANNELS * 2 + ch * 2 + 1] += r;
+                }
             }
             self.shared.note_strip_peak(Strip::Channel(ch), peak);
         }
@@ -3743,6 +3792,7 @@ pub struct Engine {
     pad_to_audio: Producer<PadKit>,
     pad_from_audio: Consumer<PadKit>,
     cap_rx: Vec<Consumer<f32>>,
+    stem_rx: Consumer<f32>,
     /// What is in each of them, for the desk to name.
     inserts_loaded: [[Option<Loaded>; INSERTS]; STRIPS + 1],
 
@@ -3947,6 +3997,9 @@ impl Engine {
             cap_tx.push(tx);
             cap_rx.push(rx);
         }
+        // The stem tap: four seconds of every lane in stereo. Idle it costs
+        // a ring nobody fills.
+        let (stem_tx, stem_rx) = RingBuffer::<f32>::new(rate as usize * CHANNELS * 2 * 4);
         let renderer = Renderer {
             shared: Arc::clone(&shared),
             timebase,
@@ -4015,6 +4068,9 @@ impl Engine {
             monitor_block: 0,
             monitor_scratch: vec![0.0; widest * 4096],
             cap_tx,
+            stem_tx,
+            stem_scratch: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
+            stems_live: false,
         };
 
         let config = cpal::StreamConfig {
@@ -4054,6 +4110,7 @@ impl Engine {
             pad_to_audio,
             pad_from_audio,
             cap_rx,
+            stem_rx,
             inserts_loaded: std::array::from_fn(|_| std::array::from_fn(|_| None)),
             tap: Some(RecorderTap {
                 rx: tap_rx,
@@ -4752,6 +4809,19 @@ impl Engine {
             return;
         };
         while let Ok(v) = rx.pop() {
+            out.push(v);
+        }
+    }
+
+    /// The stem tap's switch: on for an export pass, off after.
+    pub fn set_stems(&self, on: bool) {
+        self.shared.stems_on.store(on, Ordering::Relaxed);
+    }
+
+    /// Drain the stem tap — interleaved `CHANNELS * 2` floats per frame —
+    /// into `out`.
+    pub fn drain_stems(&mut self, out: &mut Vec<f32>) {
+        while let Ok(v) = self.stem_rx.pop() {
             out.push(v);
         }
     }
@@ -6257,6 +6327,9 @@ mod tests {
             monitor_block: 0,
             monitor_scratch: Vec::new(),
             cap_tx: Vec::new(),
+            stem_tx: RingBuffer::<f32>::new(1 << 16).0,
+            stem_scratch: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
+            stems_live: false,
             racks,
             fx_in: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             fx_out: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],

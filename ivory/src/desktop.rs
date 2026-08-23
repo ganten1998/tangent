@@ -253,6 +253,25 @@ struct Recorder {
     /// The red button is DOWN: armed lanes are being recorded into the
     /// arrangement. `None` the rest of the time.
     arr_rec: Option<ArrRec>,
+    /// An EXPORT in flight: the arrangement playing start-to-end into an
+    /// audio-only take that lands in the project's `export/`.
+    bounce: Option<Bounce>,
+}
+
+/// One bounce: where it stops, what it writes, and whether it is waiting
+/// for the files to close.
+struct Bounce {
+    /// Stop when the playhead passes this — the span plus a tail for the
+    /// reverbs to ring out.
+    until_s: f64,
+    finishing: bool,
+    /// Stems too. (The per-lane tap arrives with them.)
+    stems: bool,
+    /// One WAV per used lane, fed from the engine's stem tap as the pass
+    /// runs — never buffered whole: a long song is a lot of floats.
+    stem_writers: Vec<(usize, ivory_record::wav::WavWriter)>,
+    /// The drain buffer, reused.
+    stem_scratch: Vec<f32>,
 }
 
 /// How long `IVORY_OPEN_EDITOR` waits before opening, so the plugin has
@@ -1498,6 +1517,7 @@ impl DesktopApp {
         self.take_cartridge_request(ctx, frame);
         #[cfg(feature = "recorder")]
         self.take_save_panel(ctx, frame);
+        self.run_project_request();
         // Scanning reads directories, so it belongs out here with the other
         // things the UI is not allowed to do — and it runs AFTER the folder
         // picker above, so a folder added this frame is in the list this frame
@@ -1641,6 +1661,7 @@ impl DesktopApp {
         // The automatic one, at most once per finished take. The marker is
         // updated whether or not the tick is on, so turning it on after a take
         // does not immediately open a window for a recording already made.
+        self.tick_bounce();
         if !self.recorder.session.is_recording() {
             if let Some(folder) = self
                 .recorder
@@ -1678,13 +1699,20 @@ impl DesktopApp {
                 // deeper: `Transport` is plain state, and the reconcile in
                 // `push_transport` is what carries it to the engine.
                 R::Play => {
-                    // Record owns the transport while a take is writing — a
-                    // green button that could stop the backing track mid-take
-                    // would be a second stop button with worse manners. The
-                    // arrangement's record owns it the same way: a pause
-                    // mid-record would let the capture run past the playhead.
+                    // PLAY only — pausing is the pause button's job now.
+                    // Record owns the transport while a take is writing, and
+                    // the arrangement's record owns it the same way.
                     if !self.recorder.session.is_recording()
                         && self.recorder.arr_rec.is_none()
+                        && !self.recorder.transport.playing()
+                    {
+                        self.recorder.transport.toggle_play();
+                    }
+                }
+                R::Pause => {
+                    if !self.recorder.session.is_recording()
+                        && self.recorder.arr_rec.is_none()
+                        && self.recorder.transport.playing()
                     {
                         self.recorder.transport.toggle_play();
                     }
@@ -2156,6 +2184,9 @@ impl DesktopApp {
     fn open_project_at_launch(&mut self) {
         let root = self.app.record_root().join("Projects");
         self.app.bootstrap_project(&root);
+        // The default template exists from the start — the folder New
+        // clones, and the one "Save As Template" named `default` replaces.
+        self.app.seed_template(&self.templates_dir().join("default"));
     }
 
     /// What to do with a chosen folder, whichever picker chose it.
@@ -2187,7 +2218,7 @@ impl DesktopApp {
             return;
         }
         if purpose == ivory_ui::ports::FilePurpose::Project {
-            self.app.open_project(file);
+            self.switch_project(file);
             return;
         }
         match crate::dx7::Cartridge::load(file) {
@@ -2602,6 +2633,370 @@ impl DesktopApp {
         // The app adds the rows, saves, and marks the clips dirty — which is
         // what makes `reload_clips` push the new schedule and the new sound.
         self.app.add_recorded_clips(out);
+    }
+
+    /// Start an export: the whole arrangement, played from the top through
+    /// the real engine — racks, limiter, master — into an audio-only take
+    /// the finish copies into the project's `export/`.
+    fn start_bounce(&mut self, stems: bool) {
+        if self.recorder.bounce.is_some()
+            || self.recorder.session.is_recording()
+            || self.recorder.arr_rec.is_some()
+        {
+            return;
+        }
+        if self.recorder.engine.is_none() {
+            self.recorder.take_note =
+                Some("Open the band to export — the audio path is closed.".to_owned());
+            return;
+        }
+        let span = self.app.arr_span_s();
+        if span <= 0.0 {
+            self.recorder.take_note =
+                Some("Nothing to export — the timeline is empty.".to_owned());
+            return;
+        }
+        let root = self.app.record_root();
+        // From the very top, rolling before the take opens — the same
+        // press-order the transport itself keeps.
+        self.recorder.transport.stop();
+        self.recorder.transport.toggle_play();
+        let spec = ivory_ui::recorder::ExportSpec {
+            audio: true,
+            midi: false,
+            video: ivory_ui::recorder::VideoMode::None,
+            ..self.app.export_spec()
+        };
+        self.recorder.take_note = Some("Exporting — a real pass from the top…".to_owned());
+        self.recorder.session.toggle(&root, Some("bounce"), 0, spec);
+        // The stems: one writer per USED lane — clips on it, or a kind —
+        // fed live from the engine's tap so nothing is buffered whole.
+        let mut stem_writers = Vec::new();
+        if stems {
+            if let (Some(e), Some(dir)) = (
+                self.recorder.engine.as_ref(),
+                self.app
+                    .project_doc()
+                    .and_then(|d| d.parent().map(|p| p.join("export").join("stems"))),
+            ) {
+                let _ = std::fs::create_dir_all(&dir);
+                let rate = e.output().sample_rate;
+                let spec = ivory_record::wav::WavSpec {
+                    sample_rate: rate,
+                    channels: 2,
+                    format: ivory_record::wav::SampleFormat::Float32,
+                };
+                let doc = self.app.arrangement().clone();
+                for lane in 0..ivory_ui::recorder::CHANNELS {
+                    let used = self.app.channel_kind(lane).is_some()
+                        || doc.clips.iter().any(|c| c.lane == lane);
+                    if !used {
+                        continue;
+                    }
+                    let name: String = self
+                        .app
+                        .channel_display_name(lane)
+                        .chars()
+                        .map(|c| if std::path::is_separator(c) { '-' } else { c })
+                        .collect();
+                    let path = dir.join(format!("{:02}-{}.wav", lane + 1, name.trim()));
+                    let _ = std::fs::remove_file(&path);
+                    let bext = ivory_record::wav::Bext::new(
+                        ivory_record::wav::Wallclock::now_utc(),
+                        spec,
+                    );
+                    if let Ok(w) = ivory_record::wav::WavWriter::create(&path, spec, &bext) {
+                        stem_writers.push((lane, w));
+                    }
+                }
+                e.set_stems(true);
+            }
+        }
+        self.recorder.bounce = Some(Bounce {
+            // Two seconds of tail: the reverbs' ring-out is part of the
+            // track.
+            until_s: span + 2.0,
+            finishing: false,
+            stems,
+            stem_writers,
+            stem_scratch: Vec::new(),
+        });
+    }
+
+    /// Feed the stem writers whatever the tap has — every frame a bounce
+    /// with stems runs, and once more at the finish.
+    fn drain_stem_tap(&mut self) {
+        let Some(b) = self.recorder.bounce.as_mut() else {
+            return;
+        };
+        if b.stem_writers.is_empty() {
+            return;
+        }
+        let Some(e) = self.recorder.engine.as_mut() else {
+            return;
+        };
+        b.stem_scratch.clear();
+        e.drain_stems(&mut b.stem_scratch);
+        let wide = ivory_ui::recorder::CHANNELS * 2;
+        let frames = b.stem_scratch.len() / wide;
+        if frames == 0 {
+            return;
+        }
+        let mut lane_buf = Vec::with_capacity(frames * 2);
+        for (lane, w) in &mut b.stem_writers {
+            lane_buf.clear();
+            for f in 0..frames {
+                lane_buf.push(b.stem_scratch[f * wide + *lane * 2]);
+                lane_buf.push(b.stem_scratch[f * wide + *lane * 2 + 1]);
+            }
+            let _ = w.write_interleaved(&lane_buf);
+        }
+    }
+
+    /// Drive a bounce: stop at the end, wait for the files, file the WAV.
+    fn tick_bounce(&mut self) {
+        self.drain_stem_tap();
+        let Some(b) = self.recorder.bounce.as_mut() else {
+            return;
+        };
+        if !b.finishing {
+            let rate = self
+                .recorder
+                .engine
+                .as_ref()
+                .map_or(48_000.0, |e| f64::from(e.output().sample_rate).max(1.0));
+            let pos = self
+                .recorder
+                .transport
+                .position_s(self.recorder.engine.as_ref(), rate);
+            // Past the end — or somebody pressed Stop, which ends the pass
+            // early and exports what there is.
+            if pos >= b.until_s || !self.recorder.session.is_recording() {
+                self.recorder.session.stop();
+                self.recorder.transport.stop();
+                b.finishing = true;
+            }
+        } else if !self.recorder.session.is_recording() {
+            if let Some(sum) = self.recorder.session.last_summary() {
+                let folder = sum.folder.clone();
+                let problem = sum.problem.clone();
+                if let Some(e) = self.recorder.engine.as_ref() {
+                    e.set_stems(false);
+                }
+                self.drain_stem_tap();
+                let Some(b) = self.recorder.bounce.take() else {
+                    return;
+                };
+                let stems = b.stems;
+                let mut wrote = 0usize;
+                for (_, w) in b.stem_writers {
+                    if w.finish().is_ok() {
+                        wrote += 1;
+                    }
+                }
+                self.finish_bounce(&folder, problem, stems);
+                if stems && wrote > 0 {
+                    self.recorder.take_note = Some(format!(
+                        "exported  export/track + {wrote} stems in export/stems/"
+                    ));
+                }
+            }
+        }
+    }
+
+    /// The pass is done: the take's WAV becomes `export/track.wav` (counted
+    /// up past what exists), and the band's status line says where.
+    fn finish_bounce(&mut self, folder: &str, problem: Option<String>, _stems: bool) {
+        // The reveal-when-done watcher must not open a Finder window for a
+        // bounce — the export note says where the real file went.
+        self.recorder.seen_take = Some(folder.to_owned());
+        if let Some(p) = problem {
+            self.recorder.take_note = Some(format!("export failed: {p}"));
+            return;
+        }
+        let take_dir = self.app.record_root().join(folder);
+        let Some(export_dir) = self
+            .app
+            .project_doc()
+            .and_then(|d| d.parent().map(|p| p.join("export")))
+        else {
+            return;
+        };
+        let _ = std::fs::create_dir_all(&export_dir);
+        let wav = std::fs::read_dir(&take_dir).ok().and_then(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .find(|p| p.extension().is_some_and(|e| e == "wav"))
+        });
+        let Some(wav) = wav else {
+            self.recorder.take_note =
+                Some("export: the take produced no audio file".to_owned());
+            return;
+        };
+        let mut n = 1usize;
+        let name = loop {
+            let cand = if n == 1 {
+                "track.wav".to_owned()
+            } else {
+                format!("track {n}.wav")
+            };
+            if !export_dir.join(&cand).exists() {
+                break cand;
+            }
+            n += 1;
+        };
+        match std::fs::copy(&wav, export_dir.join(&name)) {
+            Ok(_) => {
+                self.recorder.take_note = Some(format!("exported  export/{name}"));
+            }
+            Err(e) => {
+                self.recorder.take_note = Some(format!("export failed: {e}"));
+            }
+        }
+    }
+
+    /// The template shelf: `<record_root>/Projects/Templates`.
+    fn templates_dir(&self) -> std::path::PathBuf {
+        self.app.record_root().join("Projects").join("Templates")
+    }
+
+    /// Run whatever project action the app asked for this frame. The host
+    /// runs these whole because it owns the plugin states and the shelf.
+    fn run_project_request(&mut self) {
+        let Some(req) = self.app.take_project_request() else {
+            return;
+        };
+        match req {
+            ivory_ui::ports::ProjectRequest::Save => {
+                self.save_plugin_states();
+                self.copy_states_to_project();
+                self.app.save_project_doc();
+            }
+            ivory_ui::ports::ProjectRequest::Template(name) => {
+                // Everything written down first, so the copy IS the session.
+                self.save_plugin_states();
+                self.copy_states_to_project();
+                self.app.save_project_doc();
+                let Some(src) = self
+                    .app
+                    .project_doc()
+                    .and_then(std::path::Path::parent)
+                    .map(std::path::Path::to_path_buf)
+                else {
+                    return;
+                };
+                // The NAME only — a template has one home, and a name with a
+                // separator in it is a path pretending to be one.
+                let name: String = name
+                    .chars()
+                    .filter(|c| !std::path::is_separator(*c))
+                    .collect();
+                if name.is_empty() {
+                    return;
+                }
+                let dst = self.templates_dir().join(&name);
+                let _ = std::fs::remove_dir_all(&dst);
+                let _ = copy_dir_all(&src, &dst);
+            }
+            ivory_ui::ports::ProjectRequest::ExportTrack => self.start_bounce(false),
+            ivory_ui::ports::ProjectRequest::ExportStems => self.start_bounce(true),
+            ivory_ui::ports::ProjectRequest::New => {
+                // The default template exists from the start: seeded here if
+                // nothing ever saved over it.
+                let template = self.templates_dir().join("default");
+                self.app.seed_template(&template);
+                let root = self.app.record_root().join("Projects");
+                let mut n = 0u32;
+                let dir = loop {
+                    n += 1;
+                    let cand = if n == 1 {
+                        root.join("Untitled")
+                    } else {
+                        root.join(format!("Untitled {n}"))
+                    };
+                    if !cand.exists() {
+                        break cand;
+                    }
+                    if n > 10_000 {
+                        return;
+                    }
+                };
+                if copy_dir_all(&template, &dir).is_err() {
+                    return;
+                }
+                self.switch_project(&dir.join("project.tangent"));
+            }
+        }
+    }
+
+    /// The project's own plugin-state shelf: `<project>/state/`.
+    fn project_state_dir(&self) -> Option<std::path::PathBuf> {
+        Some(self.app.project_doc()?.parent()?.join("state"))
+    }
+
+    /// Copy the live plugin-state sidecars INTO the project, so the folder
+    /// carries its instruments' knobs as well as their names.
+    fn copy_states_to_project(&self) {
+        let Some(dir) = self.project_state_dir() else {
+            return;
+        };
+        let _ = std::fs::create_dir_all(&dir);
+        for strip in 0..=ivory_ui::recorder::STRIPS {
+            for bay in 0..ivory_ui::recorder::INSERTS {
+                let global = insert_state_path(strip, bay);
+                let mine = dir.join(format!("insert-state-{strip}-{bay}.bin"));
+                if global.is_file() {
+                    let _ = std::fs::copy(&global, &mine);
+                } else {
+                    let _ = std::fs::remove_file(&mine);
+                }
+            }
+        }
+    }
+
+    /// Bring a project's plugin states OUT to the live sidecars. A bay the
+    /// project has no state for loses its global sidecar too — the last
+    /// session's reverb tail must not leak into this one's fresh plugin.
+    fn copy_states_from_project(&self) {
+        let Some(dir) = self.project_state_dir() else {
+            return;
+        };
+        for strip in 0..=ivory_ui::recorder::STRIPS {
+            for bay in 0..ivory_ui::recorder::INSERTS {
+                let global = insert_state_path(strip, bay);
+                let mine = dir.join(format!("insert-state-{strip}-{bay}.bin"));
+                if mine.is_file() {
+                    let _ = std::fs::copy(&mine, &global);
+                } else {
+                    let _ = std::fs::remove_file(&global);
+                }
+            }
+        }
+    }
+
+    /// Make the insert reconcile revisit EVERY bay — load, reload with new
+    /// state, or unload, one per frame as it always works. The sentinel can
+    /// never equal a real path or an empty bay, so every slot mismatches.
+    fn force_insert_reload(&mut self) {
+        for slot in &mut self.recorder.inserts_loaded {
+            *slot = Some("\u{1f}reload".to_owned());
+        }
+    }
+
+    /// Switch sessions WHOLE: the old one keeps its desk and its plugin
+    /// states, the new one arrives with its own — instruments included.
+    fn switch_project(&mut self, doc: &std::path::Path) {
+        // The old session first, while it is still the one on the desk.
+        self.save_plugin_states();
+        self.copy_states_to_project();
+        self.app.save_project_doc();
+        self.app.open_project(doc);
+        // `open_project` applied the document's desk when it carried one;
+        // the flag says so, and the states follow the desk.
+        if self.app.take_desk_reload() {
+            self.copy_states_from_project();
+            self.force_insert_reload();
+        }
     }
 
     fn reload_clips(&mut self) {
@@ -3261,6 +3656,21 @@ impl DesktopApp {
 /// slot files are — the wrong plugin's state is not a preset, it is arbitrary
 /// bytes to a `setState` that will believe them.
 #[cfg(feature = "recorder")]
+/// Copy a directory tree, best effort — the project system's clone.
+fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let to = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&entry.path(), &to)?;
+        } else {
+            std::fs::copy(entry.path(), &to)?;
+        }
+    }
+    Ok(())
+}
+
 fn insert_state_path(strip: usize, bay: usize) -> std::path::PathBuf {
     let dir = Settings::path()
         .parent()
@@ -3393,6 +3803,7 @@ impl DesktopApp {
                 input_names: std::array::from_fn(|_| String::new()),
                 take_note: None,
                 arr_rec: None,
+                bounce: None,
                 session: crate::record::Session::new(tap, timebase),
                 audio,
                 camera,
@@ -3540,6 +3951,10 @@ impl eframe::App for DesktopApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.recorder.session.stop();
         self.save_plugin_states();
+        // The session folder keeps everything it had: the desk into the
+        // document, the plugins' knobs into its own state shelf.
+        self.copy_states_to_project();
+        self.app.save_project_doc();
     }
 }
 

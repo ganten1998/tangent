@@ -50,7 +50,7 @@ use std::path::PathBuf;
 
 /// The document's schema version. Bump WITH a migration arm in
 /// [`Arrangement::from_map`], never without one.
-pub const ARRANGEMENT_VERSION: u64 = 3;
+pub const ARRANGEMENT_VERSION: u64 = 4;
 
 /// What a clip is made of.
 ///
@@ -138,10 +138,124 @@ impl ArrClip {
     }
 }
 
+/// The DESK a session carries — what makes a project a SESSION rather
+/// than a clip list: which channels are what, what stands in their bays,
+/// their names, colours, faders and sends, and the transport's musical
+/// facts. Captured into the document on every save; APPLIED only on an
+/// explicit open (launch reopens the last project against the settings
+/// that are already its live desk).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct DeskSnap {
+    pub kinds: Vec<u8>,
+    pub names: Vec<String>,
+    pub colors: Vec<i64>,
+    pub inserts: Vec<String>,
+    pub sends: Vec<f64>,
+    pub muted: u32,
+    pub soloed: u32,
+    pub gains: Vec<f64>,
+    pub metronome_gain: f64,
+    pub master_gain: f64,
+    pub fx_return: f64,
+    pub tempo_bpm: f64,
+    pub sig_beats: u8,
+    pub sig_unit: u8,
+    pub metronome_on: bool,
+}
+
+impl DeskSnap {
+    fn to_value(&self) -> Value {
+        let mut m = Map::new();
+        let nums = |v: &[f64]| {
+            Value::Array(v.iter().map(|x| serde_json::json!(x)).collect())
+        };
+        m.insert(
+            "kinds".into(),
+            Value::Array(self.kinds.iter().map(|k| Value::Number((*k as u64).into())).collect()),
+        );
+        m.insert(
+            "names".into(),
+            Value::Array(self.names.iter().map(|n| Value::String(n.clone())).collect()),
+        );
+        m.insert(
+            "colors".into(),
+            Value::Array(self.colors.iter().map(|c| Value::Number((*c).into())).collect()),
+        );
+        m.insert(
+            "inserts".into(),
+            Value::Array(self.inserts.iter().map(|i| Value::String(i.clone())).collect()),
+        );
+        m.insert("sends".into(), nums(&self.sends));
+        m.insert("muted".into(), Value::Number(u64::from(self.muted).into()));
+        m.insert("soloed".into(), Value::Number(u64::from(self.soloed).into()));
+        m.insert("gains".into(), nums(&self.gains));
+        m.insert("metronome_gain".into(), serde_json::json!(self.metronome_gain));
+        m.insert("master_gain".into(), serde_json::json!(self.master_gain));
+        m.insert("fx_return".into(), serde_json::json!(self.fx_return));
+        m.insert("tempo_bpm".into(), serde_json::json!(self.tempo_bpm));
+        m.insert("sig_beats".into(), Value::Number(u64::from(self.sig_beats).into()));
+        m.insert("sig_unit".into(), Value::Number(u64::from(self.sig_unit).into()));
+        m.insert("metronome_on".into(), Value::Bool(self.metronome_on));
+        Value::Object(m)
+    }
+
+    fn from_value(v: &Value) -> Option<Self> {
+        let m = v.as_object()?;
+        let f = |k: &str, d: f64| m.get(k).and_then(Value::as_f64).unwrap_or(d);
+        let strings = |k: &str| -> Vec<String> {
+            m.get(k)
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .map(|x| x.as_str().unwrap_or_default().to_owned())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let floats = |k: &str| -> Vec<f64> {
+            m.get(k)
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_f64).collect())
+                .unwrap_or_default()
+        };
+        Some(Self {
+            kinds: m
+                .get("kinds")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n as u8)).collect())
+                .unwrap_or_default(),
+            names: strings("names"),
+            colors: m
+                .get("colors")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_i64).collect())
+                .unwrap_or_default(),
+            inserts: strings("inserts"),
+            sends: floats("sends"),
+            muted: m.get("muted").and_then(Value::as_u64).unwrap_or(0) as u32,
+            soloed: m.get("soloed").and_then(Value::as_u64).unwrap_or(0) as u32,
+            gains: floats("gains"),
+            metronome_gain: f("metronome_gain", 0.7),
+            master_gain: f("master_gain", 1.0),
+            fx_return: f("fx_return", 1.0),
+            tempo_bpm: f("tempo_bpm", 120.0),
+            sig_beats: m.get("sig_beats").and_then(Value::as_u64).unwrap_or(4) as u8,
+            sig_unit: m.get("sig_unit").and_then(Value::as_u64).unwrap_or(4) as u8,
+            metronome_on: m
+                .get("metronome_on")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        })
+    }
+}
+
 /// The whole document.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Arrangement {
     pub clips: Vec<ArrClip>,
+    /// The desk this session was saved with. `None` in documents older
+    /// than v4 — opening one keeps whatever desk is live.
+    pub desk: Option<DeskSnap>,
     /// The next clip id to hand out. Monotonic within the document, never
     /// reused — what lets an edit name the clip it means.
     pub next_id: u64,
@@ -249,6 +363,7 @@ impl Arrangement {
                 .filter(|s| s.is_finite() && *s >= 0.0)
                 .unwrap_or(0.0)
         };
+        let desk = map.shift_remove("desk").as_ref().and_then(DeskSnap::from_value);
         let mut clips = Vec::new();
         if let Some(Value::Array(list)) = map.shift_remove("clips") {
             for item in list {
@@ -330,6 +445,7 @@ impl Arrangement {
         }
         Self {
             clips,
+            desk,
             next_id,
             extra: map,
         }
@@ -345,6 +461,9 @@ impl Arrangement {
             "next_clip_id".into(),
             Value::Number(self.next_id.into()),
         );
+        if let Some(desk) = &self.desk {
+            map.insert("desk".into(), desk.to_value());
+        }
         map.insert(
             "clips".into(),
             Value::Array(
