@@ -2139,6 +2139,37 @@ pub fn open_input(
         }
     })?;
 
+    // **On macOS the input runs SMALLER than the output, on purpose.**
+    //
+    // Two AudioUnits stand between the microphone and the speaker here, so
+    // the round trip pays the input buffer, the output buffer, AND whatever
+    // sits in the monitor ring between them — a duplex host like Live pays
+    // two buffers, which is the whole of the tester's 18.7 ms vs 6.6 ms.
+    // The one term this side can shrink is the INPUT: its callback only
+    // copies into a ring — no DSP — so it runs at a QUARTER of the chosen
+    // buffer (floor 64, clamped to what the device will admit to) without
+    // earning dropouts, and the ring's in-flight allowance shrinks with it
+    // (`in_block` follows this very value). The un-picked case used to open
+    // at `BufferSize::Default` — 512 on Sonoma, and counted as 1024 by the
+    // in-flight math — which is why "no choice" was the worst choice.
+    //
+    // macOS only: WASAPI's `Fixed` is the TOTAL shared-mode buffer (see
+    // BUFFER_PERIODS) and ASIO ties both sides to one driver setting, and
+    // small ALSA periods overrun — those keep the symmetric mapping below.
+    #[cfg(target_os = "macos")]
+    let buffer_size = {
+        const INPUT_DEFAULT_FRAMES: u32 = 256;
+        let quarter = (wish.buffer_frames.unwrap_or(INPUT_DEFAULT_FRAMES) / 4).max(64);
+        match chosen.buffer_size() {
+            cpal::SupportedBufferSize::Range { min, max } => {
+                BufferSize::Fixed(quarter.clamp(*min, (*max).max(*min)))
+            }
+            // A device that will not even name a range: the quarter wish,
+            // unclamped, beats gambling on a 512-frame Default.
+            cpal::SupportedBufferSize::Unknown => BufferSize::Fixed(quarter),
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
     let buffer_size = match wish.buffer_frames {
         Some(frames) => BufferSize::Fixed(frames),
         None => BufferSize::Default,

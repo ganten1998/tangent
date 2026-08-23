@@ -292,6 +292,10 @@ pub struct IvoryApp {
     /// headphones, so every launch starts with only the default instrument
     /// live. See `default_armed` and docs/ARRANGEMENT.md.
     armed: u32,
+    /// Whether SHIFT is down this frame — the arm button's ADDITIVE
+    /// modifier. Refreshed at the top of `paint`, read where the hit
+    /// handlers no longer have a `ctx` in reach.
+    shift_down: bool,
     /// The open project's DOCUMENT — the arrangement, in memory. Loaded by
     /// `bootstrap_project`, saved atomically on every edit.
     arrangement: crate::arrangement::Arrangement,
@@ -1267,6 +1271,7 @@ impl IvoryApp {
             swing_menu: None,
             mixer_fx_menu: None,
             armed,
+            shift_down: false,
             arrangement: crate::arrangement::Arrangement::default(),
             project_doc: std::path::PathBuf::new(),
             clips_dirty: false,
@@ -2414,7 +2419,19 @@ impl IvoryApp {
             // state — deliberately unsaved, so no project can open loud.
             H::Arm(i) => {
                 if let Some(Strip::Channel(n)) = i.strip() {
-                    self.armed ^= 1 << n;
+                    // **One arm at a time.** A plain press makes this lane
+                    // THE armed lane — every stale arm left over from a
+                    // track's birth or first bind stands down, which is how
+                    // "arming one midi track" stops recording three.
+                    // Shift+press keeps the old additive toggle for anyone
+                    // who really wants a multi-lane take.
+                    if self.shift_down {
+                        self.armed ^= 1 << n;
+                    } else if self.armed == 1 << n {
+                        self.armed = 0;
+                    } else {
+                        self.armed = 1 << n;
+                    }
                 }
                 return;
             }
@@ -5159,7 +5176,10 @@ impl IvoryApp {
             {
                 *send = 1.0;
             }
-            self.armed |= 1 << ch;
+            // Exclusive, not additive: binding an input is "I record HERE
+            // now", and any lane still armed from its own birth would
+            // otherwise ride along into every take.
+            self.armed = 1 << ch;
         }
         self.save_settings();
         self.undo_commit();
@@ -5335,7 +5355,7 @@ impl IvoryApp {
         {
             *send = 1.0;
         }
-        self.armed |= 1 << n;
+        self.armed = 1 << n;
         self.save_settings();
     }
 
@@ -6948,6 +6968,52 @@ impl IvoryApp {
             }
             if roots.is_empty() {
                 roots.push("/".to_owned());
+                // External drives do not hang off "/" where anyone will
+                // find them: macOS mounts under /Volumes, Linux under
+                // /media/<user>, /run/media/<user>, or /mnt. Probe them
+                // all — a base that does not exist simply answers nothing.
+                // The boot volume's own alias (canonicalizes back to "/")
+                // is skipped rather than listed twice.
+                let mut mounts: Vec<String> = Vec::new();
+                let mut sweep = |base: &std::path::Path| {
+                    if let Ok(rd) = std::fs::read_dir(base) {
+                        for e in rd.flatten() {
+                            let name = e.file_name().to_string_lossy().into_owned();
+                            if name.starts_with('.') {
+                                continue;
+                            }
+                            let p = base.join(&name);
+                            if !e.metadata().map(|m| m.is_dir()).unwrap_or(false)
+                                && !p.is_dir()
+                            {
+                                continue;
+                            }
+                            if std::fs::canonicalize(&p)
+                                .is_ok_and(|c| c == std::path::Path::new("/"))
+                            {
+                                continue;
+                            }
+                            mounts.push(p.to_string_lossy().into_owned());
+                        }
+                    }
+                };
+                for base in ["/Volumes", "/mnt"] {
+                    sweep(std::path::Path::new(base));
+                }
+                for base in ["/media", "/run/media"] {
+                    // One level of per-user nesting on Linux.
+                    if let Ok(rd) = std::fs::read_dir(base) {
+                        for e in rd.flatten() {
+                            let p = e.path();
+                            if p.is_dir() {
+                                sweep(&p);
+                            }
+                        }
+                    }
+                }
+                mounts.sort();
+                mounts.dedup();
+                roots.extend(mounts);
             }
             self.media_entries = roots
                 .into_iter()
@@ -12892,6 +12958,7 @@ impl IvoryApp {
 
     fn paint(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        self.shift_down = ctx.input(|i| i.modifiers.shift);
 
         // **The Welcome card waits for the splash.** It is a separate OS
         // window and the splash is a layer inside this one, so the layer
@@ -16332,6 +16399,39 @@ mod tests {
             !app.settings.to_json().contains("armed"),
             "arm leaked into the settings file"
         );
+    }
+
+    /// **A plain arm is EXCLUSIVE; Shift adds.** The Sonoma tester armed one
+    /// midi track and recorded three — every lane still armed from its own
+    /// birth or first bind rode along. A plain press now stands the others
+    /// down; Shift+press keeps the additive toggle for a deliberate
+    /// multi-lane take; and binding an input arms that lane ALONE.
+    #[test]
+    fn a_plain_arm_stands_the_other_lanes_down() {
+        use crate::mixer_panel::Hit;
+        use crate::recorder::Column;
+        let (_, mut app) = headless(Caps::DESKTOP);
+        assert_eq!(app.armed_mask(), 1, "the desk opens with the DX7 armed");
+
+        // Two fresh tracks, bound one after the other: each bind is "I
+        // record HERE now", so only the LAST one holds the arm.
+        app.set_channel_input_spec(2, "midi:all");
+        app.set_channel_input_spec(3, "midi:all");
+        assert_eq!(app.armed_mask(), 1 << 3, "a bind left stale arms standing");
+
+        // A plain press on another lane takes the arm with it…
+        app.apply_mixer_hit(Hit::Arm(Column(2)), 0.0);
+        assert_eq!(app.armed_mask(), 1 << 2, "a plain arm was not exclusive");
+
+        // …Shift+press adds instead…
+        app.shift_down = true;
+        app.apply_mixer_hit(Hit::Arm(Column(3)), 0.0);
+        assert_eq!(app.armed_mask(), (1 << 2) | (1 << 3), "shift did not add");
+        app.shift_down = false;
+
+        // …and a plain press on a THIRD lane clears the whole pile.
+        app.apply_mixer_hit(Hit::Arm(Column(0)), 0.0);
+        assert_eq!(app.armed_mask(), 1, "a plain arm left the pile standing");
     }
 
     /// **The insert menu: delete deletes, replace opens the picker, and a
