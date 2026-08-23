@@ -321,6 +321,12 @@ pub struct IvoryApp {
     /// An LCD part being dragged: `(row, part, ratchet y)` — Start/End/
     /// Length by bars, beats or thousandths, whichever cell the hand took.
     lcd_drag: Option<(u8, u8, f32)>,
+    /// The channel INPUT menu: which channel, and which page of the
+    /// drill-down is open.
+    input_menu: Option<(usize, InputMenuPage)>,
+    /// The chips' words, refreshed each frame so the borrowed view can
+    /// point at them.
+    input_chip_texts: Vec<String>,
     /// The MIDI editor popup, while one is open.
     midi_edit: Option<MidiEdit>,
     /// Where it drew last frame, for the input to hit against.
@@ -638,6 +644,8 @@ enum ArrDrag {
     Gain { lane: usize, from_y: f32, from: f32 },
     /// The header's send dial, on the same terms.
     Send { lane: usize, from_y: f32, from: f32 },
+    /// The header's pan dial, ditto — the value is the mixer's 0..1.
+    HdrPan { lane: usize, from_y: f32, from: f32 },
     /// Shift-drag: a MIDI item being drawn on a lane, anchored where the
     /// press landed (snapped).
     CreateMidi { lane: usize, anchor: f64 },
@@ -649,6 +657,16 @@ enum ArrDrag {
     /// once. `px_w` is the box's width at the press, so the whole song
     /// maps across the whole box for the gesture's life.
     Nav { last: egui::Pos2, px_w: f32 },
+}
+
+/// Which page of a channel's input menu is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputMenuPage {
+    Top,
+    Device,
+    Mono,
+    Stereo,
+    Midi,
 }
 
 /// The MIDI editor's session on one clip: its window, its selection, and
@@ -1023,6 +1041,8 @@ impl IvoryApp {
             desk_reload: false,
             project_request: None,
             lcd_drag: None,
+            input_menu: None,
+            input_chip_texts: Vec::new(),
             midi_edit: None,
             midi_edit_rect: None,
             drumpad_open: false,
@@ -1909,9 +1929,10 @@ impl IvoryApp {
                 .get(i.0)
                 .map_or(0.0, |s| recorder::gain_to_fader(s.gain)),
             H::Send(i) => view.strips.get(i.0).map_or(0.0, |s| s.send),
+            H::Pan(i) => view.strips.get(i.0).map_or(0.5, |s| (s.pan + 1.0) * 0.5),
             H::Mute(_) | H::Solo(_) | H::Add(_) | H::Insert(..) | H::Paint(..)
             | H::Palette(_) | H::Db(_) | H::Name(_) | H::Remove(_) | H::Arm(_)
-            | H::FxMenu(..) | H::AddKind(..) => 0.0,
+            | H::FxMenu(..) | H::AddKind(..) | H::InputChip(_) | H::InputRow(..) => 0.0,
         }
     }
 
@@ -1933,6 +1954,7 @@ impl IvoryApp {
             H::Fader(i) => {
                 let to = match i.strip() {
                     Some(Strip::Channel(n)) => d.channel_gains.get(n).copied().unwrap_or(1.0),
+                    Some(Strip::Drums) => d.drums_gain,
                     Some(Strip::Click) => d.metronome_gain,
                     Some(Strip::Fx) => d.fx_return_gain,
                     None => d.master_gain,
@@ -1944,6 +1966,18 @@ impl IvoryApp {
                 let to = d.strip_sends.get(at).copied().unwrap_or(0.0);
                 if let Some(slot) = self.settings.strip_sends.get_mut(at) {
                     *slot = to;
+                }
+                self.save_settings();
+            }
+            H::Pan(i) => {
+                match i.strip() {
+                    Some(crate::recorder::Strip::Channel(n)) => {
+                        if let Some(slot) = self.settings.channel_pans.get_mut(n) {
+                            *slot = 0.0;
+                        }
+                    }
+                    Some(crate::recorder::Strip::Drums) => self.settings.drums_pan = 0.0,
+                    _ => {}
                 }
                 self.save_settings();
             }
@@ -1973,6 +2007,7 @@ impl IvoryApp {
                         *g = gain;
                     }
                 }
+                Some(Strip::Drums) => self.settings.drums_gain = gain,
                 Some(Strip::Click) => self.settings.metronome_gain = gain,
                 Some(Strip::Fx) => self.settings.fx_return_gain = gain,
                 // Past the channels is the master, which is the last column —
@@ -1986,8 +2021,32 @@ impl IvoryApp {
                     *slot = f64::from(v);
                 }
             }
+            H::Pan(i) => {
+                let p = f64::from(v).mul_add(2.0, -1.0).clamp(-1.0, 1.0);
+                match i.strip() {
+                    Some(crate::recorder::Strip::Channel(n)) => {
+                        if let Some(slot) = self.settings.channel_pans.get_mut(n) {
+                            *slot = p;
+                        }
+                    }
+                    Some(crate::recorder::Strip::Drums) => self.settings.drums_pan = p,
+                    _ => {}
+                }
+            }
             // **A press, not a drag**, so it acts on the way down and the
             // value is ignored.
+            H::InputChip(i) => {
+                if let Some(crate::recorder::Strip::Channel(n)) = i.strip() {
+                    self.input_menu = Some((n, InputMenuPage::Top));
+                }
+            }
+            H::InputRow(i, row) => {
+                if let Some(crate::recorder::Strip::Channel(n)) = i.strip() {
+                    self.apply_input_row(n, row);
+                } else {
+                    self.input_menu = None;
+                }
+            }
             H::Mute(i) => self.settings.strip_muted ^= 1 << i.desk_index(),
             H::Solo(i) => self.settings.strip_soloed ^= 1 << i.desk_index(),
             // **The icon, and the plus that stands where it will be.**
@@ -2486,10 +2545,16 @@ impl IvoryApp {
                 // that merely has no live source, not an empty one.
                 Strip::Channel(n) => (
                     self.channel_display_name(n),
-                    "",
+                    // The detail row is the INPUT CHIP now: what feeds the
+                    // channel, and the way to change it.
+                    self.input_chip_texts
+                        .get(n)
+                        .map(String::as_str)
+                        .unwrap_or(""),
                     g.channels.get(n).copied().unwrap_or(1.0),
                     kind.is_none() && !self.lane_has_clips(n),
                 ),
+                Strip::Drums => ("DRUMS", "the pads' bus", self.settings.drums_gain as f32, false),
                 Strip::Click => ("CLICK", "", g.metronome, false),
                 Strip::Fx => ("FX BUS", "reverb · delay · chorus", g.fx_return, false),
             };
@@ -2528,6 +2593,16 @@ impl IvoryApp {
                 empty,
                 gain,
                 send: desk.send[i],
+                pan: match s {
+                    Strip::Channel(n) => self
+                        .settings
+                        .channel_pans
+                        .get(n)
+                        .map(|p| *p as f32)
+                        .unwrap_or(0.0),
+                    Strip::Drums => self.settings.drums_pan as f32,
+                    _ => 0.0,
+                },
                 peak: peaks[i],
                 muted: desk.muted[i],
                 soloed: desk.soloed[i],
@@ -2545,6 +2620,7 @@ impl IvoryApp {
         };
         let channels = Strip::shown();
         crate::mixer_panel::MixerView {
+            input_menu: self.input_menu_rows(),
             strips: std::array::from_fn(|i| match channels.get(i) {
                 Some(s) => strip(*s),
                 None => crate::mixer_panel::StripView {
@@ -2567,6 +2643,7 @@ impl IvoryApp {
                     }),
                     kind: None,
                     empty: false,
+                    pan: 0.0,
                     gain: g.master,
                     send: 0.0,
                     // The master's own meter, which the band already has: the
@@ -3929,6 +4006,10 @@ impl IvoryApp {
         std::mem::take(&mut self.settings.desk_state_shift_v13)
     }
 
+    pub fn take_desk_state_shift_v14(&mut self) -> bool {
+        std::mem::take(&mut self.settings.desk_state_shift_v14)
+    }
+
     /// Which channels are armed — record-ready and LIVE — for the host to
     /// push at the engine every frame.
     pub fn armed_mask(&self) -> u32 {
@@ -4264,6 +4345,10 @@ impl IvoryApp {
             muted: self.settings.strip_muted,
             soloed: self.settings.strip_soloed,
             gains: self.settings.channel_gains.to_vec(),
+            pans: self.settings.channel_pans.to_vec(),
+            inputs: self.settings.channel_inputs.clone(),
+            drums_gain: self.settings.drums_gain,
+            drums_pan: self.settings.drums_pan,
             metronome_gain: self.settings.metronome_gain,
             master_gain: self.settings.master_gain,
             fx_return: self.settings.fx_return_gain,
@@ -4278,6 +4363,38 @@ impl IvoryApp {
     /// way every settings read is. The host is told to reload the bays with
     /// the states the project carries.
     fn apply_desk_snapshot(&mut self, d: &crate::arrangement::DeskSnap) {
+        // A document saved before the DRUM BUS carries ten-strip arrays:
+        // its click, bus and master rows would land one seat early. Grown
+        // here, in a copy, so an old session opens with its desk intact
+        // and the drums at their defaults.
+        let d = &{
+            let mut d = d.clone();
+            if d.sends.len() == crate::recorder::STRIPS - 1 {
+                d.sends.insert(crate::recorder::CHANNELS, 0.0);
+                if d.colors.len() == crate::recorder::STRIPS {
+                    d.colors.insert(crate::recorder::CHANNELS, 0);
+                }
+                if d.names.len() == crate::recorder::STRIPS {
+                    d.names.insert(crate::recorder::CHANNELS, String::new());
+                }
+                if d.inserts.len() == crate::recorder::STRIPS * crate::recorder::INSERTS {
+                    for _ in 0..crate::recorder::INSERTS {
+                        d.inserts.insert(
+                            crate::recorder::CHANNELS * crate::recorder::INSERTS,
+                            String::new(),
+                        );
+                    }
+                }
+                let move_mask = |mask: u32| -> u32 {
+                    let keep = mask & ((1 << crate::recorder::CHANNELS) - 1);
+                    let above = mask >> crate::recorder::CHANNELS;
+                    keep | (above << (crate::recorder::CHANNELS + 1))
+                };
+                d.muted = move_mask(d.muted);
+                d.soloed = move_mask(d.soloed);
+            }
+            d
+        };
         for (i, k) in d.kinds.iter().take(crate::recorder::CHANNELS).enumerate() {
             self.settings.channel_kinds[i] = (*k).min(2);
         }
@@ -4294,6 +4411,12 @@ impl IvoryApp {
         for (i, v) in d.gains.iter().take(crate::recorder::CHANNELS).enumerate() {
             self.settings.channel_gains[i] = v.clamp(0.0, 8.0);
         }
+        for (i, v) in d.pans.iter().take(crate::recorder::CHANNELS).enumerate() {
+            self.settings.channel_pans[i] = v.clamp(-1.0, 1.0);
+        }
+        self.settings.channel_inputs = d.inputs.clone();
+        self.settings.drums_gain = d.drums_gain.clamp(0.0, 8.0);
+        self.settings.drums_pan = d.drums_pan.clamp(-1.0, 1.0);
         self.settings.metronome_gain = d.metronome_gain.clamp(0.0, 2.0);
         self.settings.master_gain = d.master_gain.clamp(0.0, 8.0);
         self.settings.fx_return_gain = d.fx_return.clamp(0.0, 2.0);
@@ -4305,6 +4428,166 @@ impl IvoryApp {
         self.settings.metronome_on = d.metronome_on;
         self.save_settings();
         self.desk_reload = true;
+    }
+
+    /// The open input menu's rows, for the mixer to draw.
+    fn input_menu_rows(&self) -> Option<(crate::recorder::Column, Vec<String>)> {
+        let (ch, page) = self.input_menu?;
+        let width = self
+            .audio_setup
+            .as_ref()
+            .map(|s| usize::from(s.input_channels()))
+            .unwrap_or(0);
+        let rows = match page {
+            InputMenuPage::Top => vec!["NONE".to_owned(), "DEVICE".to_owned(), "MIDI".to_owned()],
+            InputMenuPage::Device => vec!["MONO".to_owned(), "STEREO".to_owned()],
+            InputMenuPage::Mono => {
+                if width == 0 {
+                    vec!["no interface open".to_owned()]
+                } else {
+                    (0..width).map(|c| format!("IN {}", c + 1)).collect()
+                }
+            }
+            InputMenuPage::Stereo => {
+                if width < 2 {
+                    vec!["no stereo pair".to_owned()]
+                } else {
+                    (0..width - 1).map(|c| format!("IN {}/{}", c + 1, c + 2)).collect()
+                }
+            }
+            InputMenuPage::Midi => {
+                let mut rows = vec!["ALL".to_owned()];
+                if let Some(src) = self.ports.as_ref() {
+                    rows.extend(src.list());
+                }
+                rows
+            }
+        };
+        Some((crate::recorder::Column(ch), rows))
+    }
+
+    /// A press on the open input menu. `row` is `None` off the rows.
+    fn apply_input_row(&mut self, ch: usize, row: Option<usize>) {
+        let Some((menu_ch, page)) = self.input_menu else {
+            return;
+        };
+        if menu_ch != ch {
+            self.input_menu = None;
+            return;
+        }
+        let Some(i) = row else {
+            self.input_menu = None;
+            return;
+        };
+        let width = self
+            .audio_setup
+            .as_ref()
+            .map(|s| usize::from(s.input_channels()))
+            .unwrap_or(0);
+        match page {
+            InputMenuPage::Top => match i {
+                0 => {
+                    self.set_channel_input_spec(ch, "");
+                    self.input_menu = None;
+                }
+                1 => self.input_menu = Some((ch, InputMenuPage::Device)),
+                _ => self.input_menu = Some((ch, InputMenuPage::Midi)),
+            },
+            InputMenuPage::Device => match i {
+                0 => self.input_menu = Some((ch, InputMenuPage::Mono)),
+                _ => self.input_menu = Some((ch, InputMenuPage::Stereo)),
+            },
+            InputMenuPage::Mono => {
+                if i < width {
+                    // Choosing a device input MAKES the channel audio — the
+                    // menu is the kind switch with the question answered.
+                    self.set_channel_kind(ch, Some(recorder::ChannelKind::Audio));
+                    self.set_channel_input_spec(ch, &format!("{i}"));
+                }
+                self.input_menu = None;
+            }
+            InputMenuPage::Stereo => {
+                if width >= 2 && i < width - 1 {
+                    self.set_channel_kind(ch, Some(recorder::ChannelKind::Audio));
+                    self.set_channel_input_spec(ch, &format!("{i}+{}", i + 1));
+                }
+                self.input_menu = None;
+            }
+            InputMenuPage::Midi => {
+                self.set_channel_kind(ch, Some(recorder::ChannelKind::Midi));
+                if i == 0 {
+                    self.set_channel_input_spec(ch, "midi:all");
+                } else if let Some(port) = self
+                    .ports
+                    .as_ref()
+                    .and_then(|src| src.list().into_iter().nth(i - 1))
+                {
+                    self.set_channel_input_spec(ch, &format!("midi:{port}"));
+                }
+                self.input_menu = None;
+            }
+        }
+    }
+
+    /// What the input chip SAYS: the channel's current source, short.
+    fn input_chip_text(&self, ch: usize) -> String {
+        let spec = self.channel_input_spec(ch);
+        match self.channel_kind(ch) {
+            Some(recorder::ChannelKind::Midi) => match spec.strip_prefix("midi:") {
+                Some("all") | None => "MIDI: ALL".to_owned(),
+                Some(port) => format!("MIDI: {port}"),
+            },
+            Some(recorder::ChannelKind::Audio) => match Self::parse_input_spec(spec) {
+                Some((a, None)) => format!("IN {}", a + 1),
+                Some((a, Some(b))) => format!("IN {}/{}", a + 1, b + 1),
+                None => "IN: \u{2014}".to_owned(),
+            },
+            None => String::new(),
+        }
+    }
+
+    /// One channel's INPUT spec — see `Settings::channel_inputs`.
+    pub fn channel_input_spec(&self, ch: usize) -> &str {
+        self.settings
+            .channel_inputs
+            .get(ch)
+            .map(String::as_str)
+            .unwrap_or("")
+    }
+
+    fn set_channel_input_spec(&mut self, ch: usize, spec: &str) {
+        while self.settings.channel_inputs.len() < crate::recorder::CHANNELS {
+            self.settings.channel_inputs.push(String::new());
+        }
+        if let Some(slot) = self.settings.channel_inputs.get_mut(ch) {
+            *slot = spec.to_owned();
+        }
+        self.save_settings();
+    }
+
+    /// "3" or "1+2", zero-based, into the pick it names. The one parser.
+    pub fn parse_input_spec(spec: &str) -> Option<(u16, Option<u16>)> {
+        if spec.is_empty() || spec.starts_with("midi") {
+            return None;
+        }
+        match spec.split_once('+') {
+            Some((a, b)) => Some((a.parse().ok()?, Some(b.parse().ok()?))),
+            None => Some((spec.parse().ok()?, None)),
+        }
+    }
+
+    /// The drum bus's fader and pan, for the host.
+    pub fn drums_gain(&self) -> f32 {
+        self.settings.drums_gain as f32
+    }
+
+    pub fn drums_pan(&self) -> f32 {
+        self.settings.drums_pan as f32
+    }
+
+    /// One channel's pan, -1..1, for the host to push at the engine.
+    pub fn channel_pan(&self, ch: usize) -> f32 {
+        self.settings.channel_pans.get(ch).map(|p| *p as f32).unwrap_or(0.0)
     }
 
     /// The song's span in seconds, for the host's bounce to know where the
@@ -5806,6 +6089,13 @@ impl IvoryApp {
                             from: self.mixer_value(M::Send(Column(n))),
                         });
                     }
+                    Some(A::Pan(n)) => {
+                        self.arr_drag = Some(ArrDrag::HdrPan {
+                            lane: n,
+                            from_y: p.y,
+                            from: self.mixer_value(M::Pan(Column(n))),
+                        });
+                    }
                     // The toolbar. The click's switch is the settings' own;
                     // the magnet and the grid live beside it.
                     Some(A::ToolMetronome) => {
@@ -5933,6 +6223,14 @@ impl IvoryApp {
                     let v = (from + (from_y - p.y) / 420.0 * fine).clamp(0.0, 1.0);
                     self.apply_mixer_hit(
                         crate::mixer_panel::Hit::Fader(crate::recorder::Column(lane)),
+                        v,
+                    );
+                }
+                ArrDrag::HdrPan { lane, from_y, from } => {
+                    let fine = if shift { recorder_panel::FINE_DRAG } else { 1.0 };
+                    let v = (from + (from_y - p.y) / 420.0 * fine).clamp(0.0, 1.0);
+                    self.apply_mixer_hit(
+                        crate::mixer_panel::Hit::Pan(crate::recorder::Column(lane)),
                         v,
                     );
                 }
@@ -6151,6 +6449,7 @@ impl IvoryApp {
                     soloed: desk.soloed[n],
                     gain: g.channels.get(n).copied().unwrap_or(1.0),
                     send: desk.send[n],
+                    pan: self.channel_pan(n),
                     peak: peaks[n],
                 }
             }),
@@ -9075,6 +9374,10 @@ impl IvoryApp {
     /// the shape they share. `shell::viewport_ui` is the one bridge, and its
     /// test is what proves the central panel never grew a margin.
     pub fn frame(&mut self, ctx: &egui::Context) {
+        // The input chips' words, refreshed before anything borrows a view.
+        self.input_chip_texts = (0..crate::recorder::CHANNELS)
+            .map(|ch| self.input_chip_text(ch))
+            .collect();
         crate::shell::viewport_ui(ctx, |ui| self.paint(ui));
     }
 
@@ -11159,6 +11462,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **The input menu drills down and lands.** Top -> Device -> Mono ->
+    /// input 3 makes the channel AUDIO on input 3; MIDI -> All makes it
+    /// MIDI on every port; None clears; and the chip says each of them the
+    /// short way. The parser round-trips the specs the menu writes.
+    #[test]
+    fn the_input_menu_binds_a_channel_and_the_chip_says_so() {
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        // No audio_setup in a headless test: width reads 0, so the DEVICE
+        // pages offer their "no interface" row — but MIDI and None work,
+        // and the spec plumbing is what this proves. Write the specs the
+        // pages would write.
+        app.input_menu = Some((2, InputMenuPage::Top));
+        app.apply_input_row(2, Some(2)); // MIDI page
+        assert_eq!(app.input_menu, Some((2, InputMenuPage::Midi)));
+        app.apply_input_row(2, Some(0)); // ALL
+        assert_eq!(app.channel_kind(2), Some(recorder::ChannelKind::Midi));
+        assert_eq!(app.channel_input_spec(2), "midi:all");
+        assert_eq!(app.input_menu, None, "choosing closes the menu");
+        assert_eq!(app.input_chip_text(2), "MIDI: ALL");
+
+        // The audio specs, as the Mono/Stereo pages write them.
+        app.set_channel_kind(3, Some(recorder::ChannelKind::Audio));
+        app.set_channel_input_spec(3, "2");
+        assert_eq!(app.input_chip_text(3), "IN 3");
+        app.set_channel_input_spec(3, "0+1");
+        assert_eq!(app.input_chip_text(3), "IN 1/2");
+        assert_eq!(IvoryApp::parse_input_spec("2"), Some((2, None)));
+        assert_eq!(IvoryApp::parse_input_spec("0+1"), Some((0, Some(1))));
+        assert_eq!(IvoryApp::parse_input_spec("midi:all"), None);
+        assert_eq!(IvoryApp::parse_input_spec(""), None);
+
+        // None clears, from the top page.
+        app.input_menu = Some((3, InputMenuPage::Top));
+        app.apply_input_row(3, Some(0));
+        assert_eq!(app.channel_input_spec(3), "");
+        // A press off the rows dismisses without choosing.
+        app.input_menu = Some((3, InputMenuPage::Top));
+        app.apply_input_row(3, None);
+        assert_eq!(app.input_menu, None);
+        assert_eq!(app.channel_input_spec(3), "");
+    }
+
     /// **A record PUNCHES.** What the take covers on its lane, it owns:
     /// swallowed clips are removed, overlapped edges trimmed, a spanning
     /// clip is split around the punch — and the tail's trim rides in its
@@ -11462,6 +11807,7 @@ mod tests {
         use crate::recorder::{Strip, COLUMNS_FOR_TEST};
         let snapshot = |s: &Settings| {
             let mut v: Vec<f64> = s.channel_gains.to_vec();
+            v.push(s.drums_gain);
             v.push(s.metronome_gain);
             v.push(s.fx_return_gain);
             v.push(s.master_gain);
@@ -11479,8 +11825,9 @@ mod tests {
             // Which slot in the snapshot this column owns.
             let want = match col.strip() {
                 Some(Strip::Channel(n)) => n,
-                Some(Strip::Click) => crate::recorder::CHANNELS,
-                Some(Strip::Fx) => crate::recorder::CHANNELS + 1,
+                Some(Strip::Drums) => crate::recorder::CHANNELS,
+                Some(Strip::Click) => crate::recorder::CHANNELS + 1,
+                Some(Strip::Fx) => crate::recorder::CHANNELS + 2,
                 None => before.len() - 1,
             };
             assert_eq!(

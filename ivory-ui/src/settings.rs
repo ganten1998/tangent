@@ -35,7 +35,7 @@ pub struct Rgb {
 /// the migration runs ONCE against a file written before the change, and after
 /// that the same value chosen deliberately is never touched again. A file with
 /// no stamp is version 0 — every file every previous build wrote.
-const SETTINGS_VERSION: u64 = 13;
+const SETTINGS_VERSION: u64 = 14;
 
 /// Where a desk channel written before the INPUT STRIPS ended up.
 ///
@@ -316,6 +316,37 @@ fn migrate_retire_track(s: &mut Settings, desk: &mut LegacyDesk) {
     // just moved. A flag rather than doing it here: this crate does not
     // touch the filesystem. Not serialized; it lives exactly one launch.
     s.desk_state_shift_v13 = true;
+}
+
+/// v13 -> v14: the DRUM BUS arrives, left of the click — a new row at
+/// index 8, so the click, the bus and the master each step UP one. The new
+/// row gets defaults; nothing anybody set moves anywhere but up.
+fn migrate_add_drums(s: &mut Settings, desk: &mut LegacyDesk) {
+    const AT: usize = 8;
+    if desk.colors.len() >= AT {
+        desk.colors.insert(AT, 0);
+    }
+    if desk.names.len() >= AT {
+        desk.names.insert(AT, String::new());
+    }
+    if desk.sends.len() >= AT {
+        desk.sends.insert(AT, 0.0);
+    }
+    if desk.inserts.len() >= AT * V11_INSERTS {
+        for _ in 0..V11_INSERTS {
+            desk.inserts.insert(AT * V11_INSERTS, String::new());
+        }
+    }
+    let move_mask = |mask: u32| -> u32 {
+        let keep = mask & ((1 << AT) - 1);
+        let above = mask >> AT;
+        keep | (above << (AT + 1))
+    };
+    s.strip_muted = move_mask(s.strip_muted);
+    s.strip_soloed = move_mask(s.strip_soloed);
+    // The sidecars named 8, 9, 10 are the click's, the bus's and the
+    // master's; the host walks them up one, once.
+    s.desk_state_shift_v14 = true;
 }
 
 fn migrate_desk_channels(s: &mut Settings, desk: &mut LegacyDesk) {
@@ -771,6 +802,19 @@ pub struct Settings {
     /// gain arrays above are the legacy rack's; the v12 migration folds them
     /// in here and they die with the rack.
     pub channel_gains: [f64; crate::recorder::CHANNELS],
+    /// Each channel's pan, -1..1, centre 0 — every strip has a pan knob
+    /// now, the owner's rule.
+    pub channel_pans: [f64; crate::recorder::CHANNELS],
+    /// The DRUM BUS: its fader and its pan. The pads sum through this
+    /// strip — see `Strip::Drums`.
+    pub drums_gain: f64,
+    pub drums_pan: f64,
+    /// Each channel's INPUT, chosen from the strip's own menu. The grammar
+    /// is the app's: "" none (a MIDI channel reads it as All), "3" mono
+    /// input 4 (zero-based), "0+1" the 1/2 pair, "midi:all" or
+    /// "midi:<port>" for MIDI. Audio channels with every spec empty fall
+    /// back to the old ordinal picks, so nothing anybody set up breaks.
+    pub channel_inputs: Vec<String>,
     /// What feeds each general channel: 0 unused, 1 MIDI, 2 AUDIO. See
     /// `recorder::ChannelKind` — kept as bytes so a hand-edited file cannot
     /// hold a kind this build has no picture for.
@@ -937,6 +981,8 @@ pub struct Settings {
     /// down one. Set by `migrate_retire_track`, read by the host at startup,
     /// NEVER serialized: it lives exactly one launch.
     pub desk_state_shift_v13: bool,
+    /// v14's own shuffle: the drum bus pushed indices 8.. up one.
+    pub desk_state_shift_v14: bool,
 }
 
 /// Where `Settings::path()` points during tests.
@@ -990,6 +1036,7 @@ impl Default for Settings {
         Self {
             dark_mode: false,
             desk_state_shift_v13: false,
+            desk_state_shift_v14: false,
             white_key_idle_color: Rgb::new(0xE8, 0xDC, 0xC0),
             black_key_idle_color: Rgb::new(0x1a, 0x1a, 0x1a),
             white_key_active_color: Rgb::new(0x6C, 0x9B, 0xD2),
@@ -1086,6 +1133,10 @@ impl Default for Settings {
             audio_system: String::new(),
             video_defaults_lowered: false,
             channel_gains: [1.0; crate::recorder::CHANNELS],
+            channel_pans: [0.0; crate::recorder::CHANNELS],
+            channel_inputs: Vec::new(),
+            drums_gain: 1.0,
+            drums_pan: 0.0,
             // **Channel 0 ships as the DX7.** The default sound lives in a
             // pre-added MIDI channel with the built-in in bay 1 — see
             // `Default::default`'s `strip_inserts` — so a fresh install makes
@@ -1793,6 +1844,31 @@ impl Settings {
                 }
             }
         }
+        if let Some(n) = map.shift_remove("drums_gain").and_then(|v| v.as_f64()) {
+            if n.is_finite() && (0.0..=MAX_GAIN).contains(&n) {
+                s.drums_gain = n;
+            }
+        }
+        if let Some(n) = map.shift_remove("drums_pan").and_then(|v| v.as_f64()) {
+            if n.is_finite() && (-1.0..=1.0).contains(&n) {
+                s.drums_pan = n;
+            }
+        }
+        if let Some(Value::Array(v)) = map.shift_remove("channel_inputs") {
+            s.channel_inputs = v
+                .into_iter()
+                .map(|x| x.as_str().unwrap_or_default().to_owned())
+                .collect();
+        }
+        if let Some(Value::Array(items)) = map.shift_remove("channel_pans") {
+            for (pan, item) in s.channel_pans.iter_mut().zip(items) {
+                if let Some(v) = item.as_f64() {
+                    if v.is_finite() && (-1.0..=1.0).contains(&v) {
+                        *pan = v;
+                    }
+                }
+            }
+        }
         if let Some(Value::Array(items)) = map.shift_remove("channel_kinds") {
             for (kind, item) in s.channel_kinds.iter_mut().zip(items) {
                 if let Some(k) = item.as_u64() {
@@ -1998,6 +2074,11 @@ impl Settings {
             // this one retires the track from, so an ancient file walks both
             // steps in order.
             migrate_retire_track(self, desk);
+        }
+        if was < 14 {
+            // And after the retire: the v13 shape is what the drum bus
+            // moves into.
+            migrate_add_drums(self, desk);
         }
         if was < 9 {
             // **The limiter's dial turned round.** It used to be off at zero
@@ -2429,6 +2510,27 @@ impl Settings {
             "channel_gains".into(),
             Value::Array(
                 self.channel_gains
+                    .iter()
+                    .filter_map(|g| serde_json::Number::from_f64(*g))
+                    .map(Value::Number)
+                    .collect(),
+            ),
+        );
+        map.insert("drums_gain".into(), serde_json::json!(self.drums_gain));
+        map.insert("drums_pan".into(), serde_json::json!(self.drums_pan));
+        map.insert(
+            "channel_inputs".into(),
+            Value::Array(
+                self.channel_inputs
+                    .iter()
+                    .map(|u| Value::String(u.clone()))
+                    .collect(),
+            ),
+        );
+        map.insert(
+            "channel_pans".into(),
+            Value::Array(
+                self.channel_pans
                     .iter()
                     .filter_map(|g| serde_json::Number::from_f64(*g))
                     .map(Value::Number)

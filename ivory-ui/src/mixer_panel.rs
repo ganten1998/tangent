@@ -48,6 +48,8 @@ pub struct StripView<'a> {
     pub gain: f32,
     /// 0..=1, how much of it reaches the effects bus.
     pub send: f32,
+    /// The channel's pan, -1..1, centre 0.
+    pub pan: f32,
     /// The loudest thing it made since the last frame, left and right.
     pub peak: [f32; 2],
     /// Whether it is a stereo source. A mono one draws ONE bar, because two
@@ -111,6 +113,9 @@ pub struct MixerView<'a> {
     /// The menu is the palette's own pattern: drawn over the strip in the
     /// same frame, hit-tested first, dismissed by a press anywhere else.
     pub fx_menu: Option<(Column, usize)>,
+    /// The INPUT menu, modal on one strip: the column and the rows the app
+    /// built for the current page (None/Device/MIDI, then the drill-down).
+    pub input_menu: Option<(Column, Vec<String>)>,
     /// The empty channel being asked what it should become: MIDI or AUDIO.
     /// Same overlay pattern as [`MixerView::fx_menu`].
     pub add_ask: Option<Column>,
@@ -139,6 +144,13 @@ pub enum Hit {
     Fader(Column),
     /// The send knob of the strip drawn in this column.
     Send(Column),
+    /// The pan knob — general channels only, -1..1 carried as 0..1.
+    Pan(Column),
+    /// The input chip under the icon: open the channel's INPUT menu.
+    InputChip(Column),
+    /// A row of the open input menu — `None` is a press anywhere else,
+    /// which closes it and chooses nothing.
+    InputRow(Column, Option<usize>),
     Mute(Column),
     Solo(Column),
     /// **What is on this channel**: the plus on an empty slot, and the icon
@@ -193,6 +205,7 @@ impl Hit {
         match self {
             Hit::Fader(i)
             | Hit::Send(i)
+            | Hit::Pan(i)
             | Hit::Mute(i)
             | Hit::Solo(i)
             | Hit::Add(i)
@@ -204,6 +217,8 @@ impl Hit {
             | Hit::Arm(i)
             | Hit::FxMenu(i, ..)
             | Hit::AddKind(i, _)
+            | Hit::InputChip(i)
+            | Hit::InputRow(i, _)
             | Hit::Paint(i, _) => i,
         }
     }
@@ -217,9 +232,10 @@ impl Hit {
         match self {
             Hit::Fader(_) => Some(DragAxis::Vertical),
             Hit::Send(_) => Some(DragAxis::Vertical),
+            Hit::Pan(_) => Some(DragAxis::Vertical),
             Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(..) | Hit::Paint(..)
             | Hit::Palette(_) | Hit::Db(_) | Hit::Name(_) | Hit::Remove(_) | Hit::Arm(_)
-            | Hit::FxMenu(..) | Hit::AddKind(..) => None,
+            | Hit::FxMenu(..) | Hit::AddKind(..) | Hit::InputChip(_) | Hit::InputRow(..) => None,
         }
     }
 
@@ -228,9 +244,10 @@ impl Hit {
         match self {
             Hit::Fader(_) => Some(FADER_TRAVEL),
             Hit::Send(_) => Some(SEND_TRAVEL),
+            Hit::Pan(_) => Some(SEND_TRAVEL),
             Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(..) | Hit::Paint(..)
             | Hit::Palette(_) | Hit::Db(_) | Hit::Name(_) | Hit::Remove(_) | Hit::Arm(_)
-            | Hit::FxMenu(..) | Hit::AddKind(..) => None,
+            | Hit::FxMenu(..) | Hit::AddKind(..) | Hit::InputChip(_) | Hit::InputRow(..) => None,
         }
     }
 }
@@ -318,7 +335,7 @@ const SEND_TRAVEL: f32 = 420.0;
 /// and are not drawn — their controls are the band's.
 // Eight general channels, the click, and the master. BACKING had a column
 // here and is retired: the arrangement's lanes carry audio now.
-pub const COLUMNS: usize = crate::recorder::CHANNELS + 2;
+pub const COLUMNS: usize = crate::recorder::CHANNELS + 3;
 
 pub struct Layout {
     pub strips: [StripStrip; COLUMNS],
@@ -333,6 +350,10 @@ pub struct StripStrip {
     pub detail: Rect,
     pub meter: Rect,
     pub send: Rect,
+    /// The pan knob, sharing the send's band on general channels.
+    pub pan: Rect,
+    /// The input chip — the detail row, pressable on general channels.
+    pub input_chip: Rect,
     pub fader: Rect,
     pub db: Rect,
     pub mute: Rect,
@@ -359,6 +380,8 @@ impl StripStrip {
         detail: Rect::NOTHING,
         meter: Rect::NOTHING,
         send: Rect::NOTHING,
+        pan: Rect::NOTHING,
+        input_chip: Rect::NOTHING,
         fader: Rect::NOTHING,
         db: Rect::NOTHING,
         mute: Rect::NOTHING,
@@ -463,7 +486,28 @@ impl Layout {
         // BELOW the insert row, which every channel has now. The two shared a
         // band for one build and the guard test found it before anybody could
         // press a send and get an effect picker.
-        let send = if sends { cut(0.41, 0.53) } else { Rect::NOTHING };
+        // The knob band: a channel splits it — send LEFT, pan RIGHT, the
+        // owner's rule that every channel has a pan knob. The click and the
+        // bus keep the whole band for their send.
+        let (send, pan) = if sends {
+            let band = cut(0.41, 0.53);
+            if matches!(view.strip, Some(Strip::Channel(_) | Strip::Drums)) {
+                (
+                    Rect::from_min_max(
+                        band.min,
+                        Pos2::new(band.center().x - 1.0, band.bottom()),
+                    ),
+                    Rect::from_min_max(
+                        Pos2::new(band.center().x + 1.0, band.top()),
+                        band.max,
+                    ),
+                )
+            } else {
+                (band, Rect::NOTHING)
+            }
+        } else {
+            (Rect::NOTHING, Rect::NOTHING)
+        };
         // Short of the bottom edge: a switch flush against the frame reads as
         // something that has been cut off rather than as the end of the strip.
         // **Three inserts, on every channel, and the number never changes.**
@@ -599,8 +643,16 @@ impl Layout {
                 }
             },
             detail: if has_icon { cut(0.152, 0.19) } else { cut(0.086, 0.128) },
+            // **The input chip is the detail row on a general channel** —
+            // the row already NAMES the input; now pressing it chooses one.
+            input_chip: if matches!(view.strip, Some(Strip::Channel(_))) && !view.empty {
+                cut(0.152, 0.19)
+            } else {
+                Rect::NOTHING
+            },
             meter: Rect::from_min_max(travel.min, Pos2::new(split, travel.max.y)),
             send,
+            pan,
             fader: Rect::from_min_max(Pos2::new(split, travel.min.y), travel.max),
             db: cut(0.83, 0.888),
             mute,
@@ -628,6 +680,8 @@ impl Layout {
             for (r, hit) in [
                 (s.fader, Hit::Fader(i)),
                 (s.send, Hit::Send(i)),
+                (s.pan, Hit::Pan(i)),
+                (s.input_chip, Hit::InputChip(i)),
                 (s.mute, Hit::Mute(i)),
                 (s.solo, Hit::Solo(i)),
                 (s.arm, Hit::Arm(i)),
@@ -673,6 +727,16 @@ pub fn hit_test(rect: Rect, view: &MixerView<'_>, pos: Pos2) -> Option<Hit> {
     // DELETE is different: while it is up, everything that is not one of its
     // two rows is a dismissal and nothing else, because the mis-click this
     // exists to prevent is exactly a press that lands somewhere it should not.
+    if let Some((at, rows)) = &view.input_menu {
+        if let Some(s) = l.strips.get(at.0) {
+            for (i, r) in input_menu_rows(s, rows.len()).iter().enumerate() {
+                if r.contains(pos) {
+                    return Some(Hit::InputRow(*at, Some(i)));
+                }
+            }
+        }
+        return Some(Hit::InputRow(*at, None));
+    }
     if let Some((at, bay)) = view.fx_menu {
         if let Some(s) = l.strips.get(at.0) {
             let rows = fx_menu_over(s, bay);
@@ -852,6 +916,35 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MixerView<'_>) {
             two_rows(s, ask_over(s), ["MIDI", "AUDIO"]);
         }
     }
+    // The INPUT menu: the same modal grammar, however many rows the page
+    // holds — None/Device/MIDI, then the drill-down the app built.
+    if let Some((at, rows)) = &view.input_menu {
+        if let Some(sl) = l.strips.get(at.0) {
+            painter.rect_filled(sl.panel, 3.0, Color32::from_black_alpha(180));
+            for (r, label) in input_menu_rows(sl, rows.len()).iter().zip(rows.iter()) {
+                if !r.is_positive() {
+                    continue;
+                }
+                painter.rect_filled(*r, 2.0, p.face);
+                painter.rect_stroke(
+                    *r,
+                    2.0,
+                    Stroke::new(1.0, p.engrave.gamma_multiply(0.4)),
+                    egui::StrokeKind::Inside,
+                );
+                centred(
+                    painter,
+                    *r,
+                    label,
+                    FontId::new(
+                        (r.height() * 0.5).clamp(7.5, 11.0),
+                        crate::fonts::courier_bold(),
+                    ),
+                    p.engrave,
+                );
+            }
+        }
+    }
 }
 
 fn strip(
@@ -1026,6 +1119,7 @@ fn strip(
 
     if l.send.is_positive() {
         send_knob(painter, l.send, v.send, p);
+        pan_knob(painter, l.pan, v.pan, p);
     }
     // **A rack: an ivory field with three strips down it.**
     //
@@ -1132,6 +1226,30 @@ fn strip(
 /// Anchored at the bay the right-click landed on, as wide as the strip, and
 /// clamped inside the panel — the palette's rule: a row that overhung the
 /// neighbour would be a menu whose press can land on someone else's fader.
+/// The input menu's rows, hung under the chip and clamped into the strip.
+pub fn input_menu_rows(l: &StripStrip, n: usize) -> Vec<Rect> {
+    let panel = l.panel;
+    if !panel.is_positive() || n == 0 {
+        return Vec::new();
+    }
+    let anchor = if l.input_chip.is_positive() { l.input_chip } else { panel };
+    let gap = 2.0;
+    let h = (anchor.height() * 1.5).clamp(15.0, 22.0);
+    let w = panel.width() - 8.0;
+    let x = panel.left() + 4.0;
+    let mut top = anchor.bottom() + 3.0;
+    // Never off the strip's foot: the list walks back UP if it must.
+    let need = n as f32 * (h + gap);
+    if top + need > panel.bottom() - 4.0 {
+        top = (panel.bottom() - 4.0 - need).max(panel.top() + 4.0);
+    }
+    (0..n)
+        .map(|i| {
+            Rect::from_min_size(Pos2::new(x, top + i as f32 * (h + gap)), Vec2::new(w, h))
+        })
+        .collect()
+}
+
 fn fx_menu_over(l: &StripStrip, bay: usize) -> [Rect; 2] {
     let panel = l.panel;
     if !panel.is_positive() {
@@ -1406,6 +1524,29 @@ fn send_knob(painter: &Painter, r: Rect, amount: f32, p: &Ink) {
     );
 }
 
+/// The pan knob: the send's twin, its pointer straight up at centre.
+fn pan_knob(painter: &Painter, r: Rect, pan: f32, p: &Ink) {
+    let d = r.height().min(r.width() * 0.72) * 0.78;
+    if d <= 2.0 || !r.is_positive() {
+        return;
+    }
+    let c = Pos2::new(r.center().x, r.center().y);
+    painter.circle_filled(c, d * 0.5, p.track);
+    let t = (pan.clamp(-1.0, 1.0) + 1.0) * 0.5;
+    // Straight UP at centre; three-quarters of a turn lock to lock.
+    let sweep = std::f32::consts::PI * 1.5;
+    let angle = -std::f32::consts::FRAC_PI_2 - sweep * 0.5 + sweep * t;
+    let tip = Pos2::new(c.x + angle.cos() * d * 0.42, c.y + angle.sin() * d * 0.42);
+    painter.circle_filled(c, d * 0.42, p.cap);
+    painter.line_segment(
+        [c, tip],
+        Stroke::new(
+            (d * 0.09).max(1.0),
+            if pan.abs() > 0.01 { p.lit } else { p.faint },
+        ),
+    );
+}
+
 /// A vertical fader: a track, and a cap on it.
 /// A fader: an ivory cap, ribbed, riding in a black slot.
 ///
@@ -1666,6 +1807,7 @@ mod tests {
             empty,
             gain: 1.0,
             send: 0.0,
+            pan: 0.0,
             peak: [0.0; 2],
             muted: false,
             soloed: false,
@@ -1679,6 +1821,7 @@ mod tests {
     fn a_view() -> MixerView<'static> {
         let channels = Strip::shown();
         MixerView {
+            input_menu: None,
             strips: std::array::from_fn(|i| {
                 a_strip(channels.get(i).copied(), false)
             }),
@@ -1952,16 +2095,17 @@ mod tests {
         for n in 0..CHANNELS {
             assert_eq!(channels[n], Strip::Channel(n), "channel {n} has no column");
         }
-        // **Drawn: the eight and the click.** BACKING retired with v13 — the
-        // arrangement's lanes carry audio now. Only the effects return keeps
-        // its off-desk life: its three knobs are the band's, and a soloable
-        // bus is a feedback question.
+        // **Drawn: the eight, the DRUM BUS and the click.** BACKING retired
+        // with v13; the drum bus arrived with v14, left of the click. Only
+        // the effects return keeps its off-desk life: its three knobs are
+        // the band's, and a soloable bus is a feedback question.
         assert_eq!(
             COLUMNS,
-            crate::recorder::CHANNELS + 2,
+            crate::recorder::CHANNELS + 3,
             "a drawn channel went missing"
         );
-        assert_eq!(channels.len(), crate::recorder::CHANNELS + 1);
+        assert_eq!(channels.len(), crate::recorder::CHANNELS + 2);
+        assert!(channels.contains(&Strip::Drums), "the drums lost their column");
         assert!(channels.contains(&Strip::Click), "the click lost its column");
         assert!(!channels.contains(&Strip::Fx), "the bus is drawn twice");
         // Every strip owns a distinct place in the arrays, or two of them

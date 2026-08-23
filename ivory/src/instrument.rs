@@ -500,6 +500,8 @@ pub enum Strip {
     /// until v13 retired the BACKING strip; the clip plays under the master
     /// alone now.
     Channel(usize),
+    /// The drum bus: the pads' own strip, left of the click.
+    Drums,
     Click,
     Fx,
 }
@@ -518,15 +520,16 @@ pub const CHANNELS: usize = ivory_ui::recorder::CHANNELS;
 pub const INPUTS: usize = ivory_ui::recorder::INPUTS;
 
 /// How many channels the desk has, master aside.
-pub const STRIPS: usize = CHANNELS + 2;
+pub const STRIPS: usize = CHANNELS + 3;
 
 impl Strip {
     /// Its place in the arrays, and the bit it owns.
     pub const fn index(self) -> usize {
         match self {
             Strip::Channel(i) => i,
-            Strip::Click => CHANNELS,
-            Strip::Fx => CHANNELS + 1,
+            Strip::Drums => CHANNELS,
+            Strip::Click => CHANNELS + 1,
+            Strip::Fx => CHANNELS + 2,
         }
     }
 
@@ -544,6 +547,7 @@ impl From<ivory_ui::recorder::Strip> for Strip {
         use ivory_ui::recorder::Strip as Ui;
         match ui {
             Ui::Channel(i) => Strip::Channel(i),
+            Ui::Drums => Strip::Drums,
             Ui::Click => Strip::Click,
             Ui::Fx => Strip::Fx,
         }
@@ -1104,6 +1108,10 @@ impl PadVoice {
 struct Shared {
     /// One fader per general channel, whatever the channel's kind.
     channel_gains: [AtomicU32; CHANNELS],
+    /// Each channel's PAN, -1 (left) .. 1 (right), f32 bits. Centre is 0 dB
+    /// — the equal-power law is normalised so nothing gets quieter for
+    /// having a pan knob it never touched.
+    channel_pans: [AtomicU32; CHANNELS],
     /// Which general channel the built-in DX7 belongs to: a DESK INDEX, or -1
     /// for none. It stopped being a slot when the slots stopped existing on
     /// the desk; the migration guarantees a desk with no instrument anywhere
@@ -1205,6 +1213,9 @@ struct Shared {
     /// The per-lane STEM tap is running — set by the host for an export
     /// pass, cleared when it ends.
     stems_on: AtomicBool,
+    /// The DRUM BUS fader and pan — the pads sum through this strip.
+    drums_gain: AtomicU32,
+    drums_pan: AtomicU32,
     /// The master, as a LINEAR gain. The last thing on the instrument bus,
     /// after the limiter, reaching both the device mix and the take — the same
     /// rule the effects follow.
@@ -1334,6 +1345,7 @@ impl Shared {
     fn new() -> Self {
         Self {
             channel_gains: std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
+            channel_pans: std::array::from_fn(|_| AtomicU32::new(0.0f32.to_bits())),
             builtin_strip: AtomicI64::new(-1),
             pick_strip: std::array::from_fn(|_| AtomicI64::new(-1)),
             metro_gain: AtomicU32::new(0.7f32.to_bits()),
@@ -1356,6 +1368,8 @@ impl Shared {
             arr_capture: AtomicU32::new(0),
             cap_dropped: AtomicU64::new(0),
             stems_on: AtomicBool::new(false),
+            drums_gain: AtomicU32::new(1.0f32.to_bits()),
+            drums_pan: AtomicU32::new(0.0f32.to_bits()),
             master_gain: AtomicU32::new(1.0f32.to_bits()),
             // The first channel — the desk's default instrument — sends
             // everything and nothing else sends anything, which is the same
@@ -1430,6 +1444,13 @@ impl Shared {
     fn set_channel_gain(&self, ch: usize, linear: f32) {
         if let Some(cell) = self.channel_gains.get(ch) {
             cell.store(sane_gain(linear).to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    fn set_channel_pan(&self, ch: usize, pan: f32) {
+        if let Some(cell) = self.channel_pans.get(ch) {
+            let p = if pan.is_finite() { pan.clamp(-1.0, 1.0) } else { 0.0 };
+            cell.store(p.to_bits(), Ordering::Relaxed);
         }
     }
 
@@ -2412,7 +2433,7 @@ impl Renderer {
             // The drumpad, upstream of the bus return, the room split and
             // the master — so the pads are limited, mastered, heard and
             // taped exactly like every other source.
-            self.mix_pads(n);
+            self.mix_pads(n, muted, soloed);
             if self.stems_live {
                 let want = n * CHANNELS * 2;
                 let room = (self.stem_tx.slots() / (CHANNELS * 2)) * (CHANNELS * 2);
@@ -2923,6 +2944,8 @@ impl Renderer {
                 continue;
             }
             let send = Shared::f32_of(&self.shared.send[strip.index()]).clamp(0.0, 1.0);
+            let (pan_l, pan_r) =
+                pan_gains(Shared::f32_of(&self.shared.channel_pans[strip.index().min(CHANNELS - 1)]));
             let mut peak = [0.0f32; 2];
             // **This strip's own audio first, then its rack, then the fold.**
             //
@@ -2974,7 +2997,8 @@ impl Renderer {
                 withheld = withheld.max(keep_out);
                 let at = i * TAP_CHANNELS;
                 for c in 0..TAP_CHANNELS {
-                    let src = self.fx_in.get(c).map_or(0.0, |b| b[i]);
+                    let src = self.fx_in.get(c).map_or(0.0, |b| b[i])
+                        * if c == 0 { pan_l } else { pan_r };
                     peak[c.min(1)] = peak[c.min(1)].max(src.abs());
                     if let Some(v) = self.mix.get_mut(at + c) {
                         *v += src;
@@ -3073,6 +3097,7 @@ impl Renderer {
         let coeff = self.gain_coeff;
         let mut target = [0.0f32; CHANNELS];
         let mut send = [0.0f32; CHANNELS];
+        let mut pan = [(1.0f32, 1.0f32); CHANNELS];
         for lane in 0..CHANNELS {
             let strip = Strip::Channel(lane);
             target[lane] = if strip_is_heard(strip, muted, soloed) {
@@ -3081,6 +3106,7 @@ impl Renderer {
                 0.0
             };
             send[lane] = Shared::f32_of(&self.shared.send[strip.index()]).clamp(0.0, 1.0);
+            pan[lane] = pan_gains(Shared::f32_of(&self.shared.channel_pans[lane]));
         }
         let stems = self.stems_live;
         let (Some(mix), Some(aux), Some(stem)) = (
@@ -3133,7 +3159,7 @@ impl Renderer {
                 }
                 let lane = placed.strip.min(CHANNELS - 1);
                 let g = self.lane_gain[lane];
-                let (l, r) = (cl * env * g, cr * env * g);
+                let (l, r) = (cl * env * g * pan[lane].0, cr * env * g * pan[lane].1);
                 peak[lane][0] = peak[lane][0].max(l.abs());
                 peak[lane][1] = peak[lane][1].max(r.abs());
                 mix[f * TAP_CHANNELS] += l;
@@ -3161,7 +3187,7 @@ impl Renderer {
     /// speakers and the take all treat them like everything else. Runs
     /// whether or not the transport rolls: a drum machine that only sounds
     /// while the timeline moves is broken.
-    fn mix_pads(&mut self, frames: usize) {
+    fn mix_pads(&mut self, frames: usize, muted: u32, soloed: u32) {
         // A kit arriving — and the displaced one going BACK, by the racks'
         // own protocol: no room to return it, no swap this block. The voices
         // are silenced across a swap; see `PadVoice::silence`.
@@ -3178,7 +3204,17 @@ impl Renderer {
             return;
         }
         let coeff = self.gain_coeff;
-        let master = Shared::f32_of(&self.shared.pad_master).clamp(0.0, 8.0);
+        // **The DRUM BUS is the pads' strip now**: its fader, pan, mute,
+        // solo and send govern the summed kit, and its rack runs over it —
+        // bus-wide effects live on the DRUMS channel, exactly as the owner
+        // ruled. The old in-panel master is gone.
+        let master = if strip_is_heard(Strip::Drums, muted, soloed) {
+            Shared::f32_of(&self.shared.drums_gain).clamp(0.0, 8.0)
+        } else {
+            0.0
+        };
+        let (bus_l, bus_r) = pan_gains(Shared::f32_of(&self.shared.drums_pan));
+        let bus_send = Shared::f32_of(&self.shared.send[Strip::Drums.index()]).clamp(0.0, 1.0);
         // The knobs, read once per chunk like the channel gains: they are
         // published at human speed. The clamps are the audio thread refusing
         // to trust numbers it did not make; the setter sanitised them too.
@@ -3198,9 +3234,11 @@ impl Renderer {
             let tune = f64::from(Shared::f32_of(&self.shared.pad_tune[i]).clamp(-12.0, 12.0));
             step[i] = (tune / 12.0).exp2();
         }
-        let Some(mix) = self.mix.get_mut(..frames * TAP_CHANNELS) else {
-            return;
-        };
+        for c in 0..TAP_CHANNELS {
+            if let Some(dst) = self.fx_in.get_mut(c) {
+                dst[..frames].fill(0.0);
+            }
+        }
         let mut peak = [0.0f32; PADS];
         for f in 0..frames {
             // The strikes that land on this frame: whoever shares the choke
@@ -3221,8 +3259,6 @@ impl Renderer {
                     v.trigger(h.velocity, step[h.pad]);
                 }
             }
-            self.pad_gain += (master - self.pad_gain) * coeff;
-            let at = f * TAP_CHANNELS;
             for (i, v) in self.pad_voices.iter_mut().enumerate() {
                 if !v.active() {
                     continue;
@@ -3234,15 +3270,15 @@ impl Renderer {
                 };
                 let (ml, mr) = v.main.next(clip);
                 let (dl, dr) = v.dying.next(clip);
-                let g = gain[i] * self.pad_gain;
+                let g = gain[i];
                 let l = (ml + dl) * g * pan_l[i];
                 let r = (mr + dr) * g * pan_r[i];
                 peak[i] = peak[i].max(l.abs()).max(r.abs());
-                if let Some(s) = mix.get_mut(at) {
-                    *s += l;
+                if let Some(dst) = self.fx_in.first_mut() {
+                    dst[f] += l;
                 }
-                if let Some(s) = mix.get_mut(at + 1) {
-                    *s += r;
+                if let Some(dst) = self.fx_in.get_mut(1) {
+                    dst[f] += r;
                 }
             }
         }
@@ -3251,6 +3287,38 @@ impl Renderer {
                 self.shared.pad_peak[i].fetch_max(pk.to_bits(), Ordering::Relaxed);
             }
         }
+        // The bus's own rack, over the summed kit.
+        if !self.racks[Strip::Drums.index()].is_empty() {
+            run_rack(
+                &mut self.racks[Strip::Drums.index()],
+                &mut self.fx_in,
+                frames,
+                &mut self.fx_out,
+                &[],
+                &[],
+            );
+        }
+        // The fold: the DRUMS strip's fader, pan, send and peak, exactly as
+        // every other strip does it.
+        let want = frames * TAP_CHANNELS;
+        let (Some(mix), Some(aux)) = (self.mix.get_mut(..want), self.aux.get_mut(..want))
+        else {
+            return;
+        };
+        let mut bus_peak = [0.0f32; 2];
+        for f in 0..frames {
+            self.pad_gain += (master - self.pad_gain) * coeff;
+            let g = self.pad_gain;
+            let l = self.fx_in.first().map_or(0.0, |b| b[f]) * g * bus_l;
+            let r = self.fx_in.get(1).map_or(0.0, |b| b[f]) * g * bus_r;
+            bus_peak[0] = bus_peak[0].max(l.abs());
+            bus_peak[1] = bus_peak[1].max(r.abs());
+            mix[f * TAP_CHANNELS] += l;
+            mix[f * TAP_CHANNELS + 1] += r;
+            aux[f * TAP_CHANNELS] += l * bus_send;
+            aux[f * TAP_CHANNELS + 1] += r * bus_send;
+        }
+        self.shared.note_strip_peak(Strip::Drums, bus_peak);
     }
 
     /// The eight general channels: the built-in, the bay voices, and their
@@ -3516,6 +3584,8 @@ impl Renderer {
                 self.shared.send[Strip::Channel(ch).index()].load(Ordering::Relaxed),
             )
             .clamp(0.0, 1.0);
+            let (pan_l, pan_r) =
+                pan_gains(Shared::f32_of(&self.shared.channel_pans[ch]));
             let want = frames * TAP_CHANNELS;
             let stems = self.stems_live;
             let (Some(mix), Some(aux), Some(stem)) = (
@@ -3529,8 +3599,8 @@ impl Renderer {
             for f in 0..frames {
                 self.channel_gain[ch] += (target - self.channel_gain[ch]) * coeff;
                 let g = self.channel_gain[ch];
-                let l = self.fx_in.first().map_or(0.0, |b| b[f]) * g;
-                let r = self.fx_in.get(1).map_or(0.0, |b| b[f]) * g;
+                let l = self.fx_in.first().map_or(0.0, |b| b[f]) * g * pan_l;
+                let r = self.fx_in.get(1).map_or(0.0, |b| b[f]) * g * pan_r;
                 peak[0] = peak[0].max(l.abs());
                 peak[1] = peak[1].max(r.abs());
                 mix[f * TAP_CHANNELS] += l;
@@ -4813,6 +4883,21 @@ impl Engine {
         }
     }
 
+    /// One channel's pan, -1..1, centre unity. Pushed each frame with the
+    /// gains, by the same rule.
+    pub fn set_channel_pan(&self, ch: usize, pan: f32) {
+        self.shared.set_channel_pan(ch, pan);
+    }
+
+    /// The drum bus's fader and pan, pushed each frame with the gains.
+    pub fn set_drums(&self, gain: f32, pan: f32) {
+        self.shared
+            .drums_gain
+            .store(sane_gain(gain).to_bits(), Ordering::Relaxed);
+        let p = if pan.is_finite() { pan.clamp(-1.0, 1.0) } else { 0.0 };
+        self.shared.drums_pan.store(p.to_bits(), Ordering::Relaxed);
+    }
+
     /// The stem tap's switch: on for an export pass, off after.
     pub fn set_stems(&self, on: bool) {
         self.shared.stems_on.store(on, Ordering::Relaxed);
@@ -5132,6 +5217,15 @@ fn sane_gain(linear: f32) -> f32 {
 }
 
 /// One-pole coefficient for [`GAIN_TAU_SECONDS`] at `rate`.
+/// The pan law: equal power, normalised so CENTRE is unity — a knob at
+/// rest changes nothing, hard sides ride ~3 dB up on the loud side, the
+/// way every desk marked "0 dB centre" does it. `pan` is -1..1.
+fn pan_gains(pan: f32) -> (f32, f32) {
+    let t = (pan.clamp(-1.0, 1.0) + 1.0) * (std::f32::consts::PI / 4.0);
+    let root2 = std::f32::consts::SQRT_2;
+    (t.cos() * root2, t.sin() * root2)
+}
+
 fn gain_coefficient(rate: f64) -> f32 {
     if !(rate.is_finite() && rate > 0.0) {
         return 1.0;
@@ -7019,6 +7113,51 @@ mod tests {
         close(650, 0.49, "B halfway down its fade-out");
         close(699, 0.0, "B's LAST frame is exactly silent");
         close(720, 0.0, "past everything");
+    }
+
+    /// **The pan law: centre is unity, a hard side is alone.** A clip on a
+    /// lane panned hard left leaves the right bus empty and rides the left
+    /// at the law's +3 dB; at centre both sides carry exactly what they
+    /// carried before pan knobs existed.
+    #[test]
+    fn a_lanes_pan_places_its_clips() {
+        use std::sync::Arc;
+        let clip = Arc::new(ivory_record::decode::Clip {
+            samples: vec![0.5; 4000],
+            rate: 48_000,
+            source: std::path::PathBuf::from("c.wav"),
+        });
+        let run = |pan: f32| -> (f32, f32) {
+            let (mut r, _tx, shared) = renderer_with_midi(2);
+            let (mut to_audio, _from) = r.hijack_track_rings();
+            to_audio
+                .push(vec![Placed {
+                    clip: Arc::clone(&clip),
+                    strip: 0,
+                    start: 0,
+                    offset: 0,
+                    len: 2000,
+                    fade_in: 0,
+                    fade_out: 0,
+                }])
+                .expect("room");
+            shared.set_channel_pan(0, pan);
+            shared.transport_at.store(0, Ordering::Relaxed);
+            shared.transport_req.store(1, Ordering::Release);
+            shared.rolling.store(true, Ordering::Relaxed);
+            let mut out = vec![0.0_f32; 2 * 1024];
+            r.render(&mut out, 0, 0);
+            r.render(&mut out, 0, 0);
+            (out[2 * 512], out[2 * 512 + 1])
+        };
+        let (l, r) = run(0.0);
+        assert!((l - 0.5).abs() < 0.01 && (r - 0.5).abs() < 0.01, "centre is not unity: {l} {r}");
+        let (l, r) = run(-1.0);
+        assert!(r.abs() < 1.0e-3, "hard left leaks right: {r}");
+        assert!((l - 0.5 * std::f32::consts::SQRT_2).abs() < 0.01, "hard left is not +3dB: {l}");
+        let (l, r) = run(1.0);
+        assert!(l.abs() < 1.0e-3, "hard right leaks left: {l}");
+        assert!((r - 0.5 * std::f32::consts::SQRT_2).abs() < 0.01);
     }
 
     /// **A MIDI clip sounds with its lane UNARMED — playback never asks the
