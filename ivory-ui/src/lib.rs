@@ -7,6 +7,8 @@
 pub mod app;
 pub mod chord_strip;
 pub mod dialogs;
+/// The drumpad: sixteen sample pads in a popup that floats over any view.
+pub mod drumpad_panel;
 pub mod fonts;
 pub mod fretboard_panel;
 pub mod host;
