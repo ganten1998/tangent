@@ -321,6 +321,32 @@ const RETIRE_TIMEOUT: Duration = Duration::from_millis(250);
 /// Peak-hold fall rate, matching `ivory-record`'s meter so the two read the same.
 const HOLD_DECAY_DB_PER_SEC: f32 = 20.0;
 
+/// How many pads the drumpad has. The UI's number, mirrored the way
+/// [`CHANNELS`] is.
+pub const PADS: usize = ivory_ui::recorder::DRUM_PADS;
+
+/// Pad 0's MIDI note; pad `n` answers `PAD_BASE + n`. See the UI's
+/// `DRUM_PAD_BASE` — one constant, declared there, read here.
+const PAD_BASE: u8 = ivory_ui::recorder::DRUM_PAD_BASE;
+
+/// The channel nibble the pads own: 9, which the wire calls channel 10 — the
+/// General MIDI drum channel. `collect_notes` diverts channel-10 notes to the
+/// pads while a kit is loaded, so a drum controller that transmits on the
+/// drum channel plays the drums, which is the least surprising thing a note
+/// on channel 10 can do.
+const PAD_CHANNEL: u8 = 9;
+
+/// Frames a stolen pad voice takes to fade out. A retrigger or a choke that
+/// truncated a waveform mid-sample would be a click — the exact click the
+/// gain slew exists to prevent — so the cut voice rides this short ramp to
+/// zero while its replacement starts clean. ~5 ms at 48 kHz.
+const PAD_STEAL_FRAMES: f32 = 256.0;
+
+/// Pad strikes carried into one chunk. Sixteen pads struck twice inside one
+/// 512-frame block is flams on every pad at once; more than this is a MIDI
+/// file being dumped, and the surplus lands at the top of the next chunk.
+const MAX_PAD_HITS_PER_BLOCK: usize = 32;
+
 // ───────────────────────────────────────────────────────────────────────────
 // What the caller sees
 // ───────────────────────────────────────────────────────────────────────────
@@ -915,6 +941,156 @@ fn period_frames(rate: f64, bpm: f64, unit: u32) -> f64 {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// The drum pads
+// ───────────────────────────────────────────────────────────────────────────
+
+/// The pads' samples: what the drumpad is loaded with.
+///
+/// Decoded by the host at the device's rate — stereo interleaved, exactly the
+/// clips' contract, so there is no resampling and no channel mapping down
+/// here — and swapped in WHOLE behind the racks' own protocol. The audio
+/// thread never allocates a kit and never frees one.
+#[derive(Debug, Default)]
+pub struct PadKit {
+    pub pads: [Option<Arc<ivory_record::decode::Clip>>; PADS],
+}
+
+impl PadKit {
+    /// Whether any pad is loaded — what decides if channel 10 belongs to the
+    /// drums this block. An empty drumpad must not eat a channel-10 note
+    /// that some other rig was using: with no kit, the diversion never
+    /// happens and the note reaches the lanes exactly as it always did.
+    fn live(&self) -> bool {
+        self.pads.iter().any(Option::is_some)
+    }
+}
+
+/// One strike, placed inside a chunk by `collect_notes`.
+#[derive(Debug, Clone, Copy)]
+struct PadHit {
+    offset: i32,
+    pad: usize,
+    velocity: f32,
+}
+
+/// One pad voice sounding: a position, a rate and a fade.
+#[derive(Debug, Clone, Copy, Default)]
+struct PadPlay {
+    playing: bool,
+    /// Fractional frame position into the clip. Fractional because `step` is:
+    /// the tune knob plays the sample faster or slower, varispeed-style.
+    pos: f64,
+    step: f64,
+    /// The strike's velocity, as a gain.
+    velocity: f32,
+    /// 1.0 while sounding; a stolen voice ramps to 0 by `fade_step` a frame.
+    fade: f32,
+    fade_step: f32,
+}
+
+impl PadPlay {
+    fn start(velocity: f32, step: f64) -> Self {
+        Self {
+            playing: true,
+            pos: 0.0,
+            step,
+            velocity,
+            fade: 1.0,
+            fade_step: 0.0,
+        }
+    }
+
+    /// Begin the stealing fade. Idempotent: a voice already dying keeps the
+    /// ramp it has.
+    fn cut(&mut self) {
+        if self.playing && self.fade_step == 0.0 {
+            self.fade_step = 1.0 / PAD_STEAL_FRAMES;
+        }
+    }
+
+    /// The next frame of this voice, or silence once it has ended.
+    ///
+    /// Linear interpolation, by the metronome's own argument: one-shot
+    /// percussion is transient material and the tune knob's ± octave stays
+    /// well inside where linear is honest for it. Bounds-checked with `get`,
+    /// never indexed — this runs on the audio thread.
+    fn next(&mut self, clip: &ivory_record::decode::Clip) -> (f32, f32) {
+        if !self.playing {
+            return (0.0, 0.0);
+        }
+        let frames = clip.frames();
+        let idx = self.pos as usize;
+        if frames == 0 || idx + 1 >= frames {
+            self.playing = false;
+            return (0.0, 0.0);
+        }
+        let i = idx * 2;
+        let (Some(&l0), Some(&r0), Some(&l1), Some(&r1)) = (
+            clip.samples.get(i),
+            clip.samples.get(i + 1),
+            clip.samples.get(i + 2),
+            clip.samples.get(i + 3),
+        ) else {
+            self.playing = false;
+            return (0.0, 0.0);
+        };
+        let frac = (self.pos - idx as f64) as f32;
+        let g = self.velocity * self.fade;
+        let out = ((l0 + (l1 - l0) * frac) * g, (r0 + (r1 - r0) * frac) * g);
+        self.pos += self.step;
+        if self.fade_step > 0.0 {
+            self.fade -= self.fade_step;
+            if self.fade <= 0.0 {
+                self.playing = false;
+            }
+        }
+        out
+    }
+}
+
+/// One pad's voices: the strike sounding now and the one it displaced.
+///
+/// Two, not a pool: a pad self-chokes on retrigger — the RS5k manager
+/// default this drumpad is modelled on, and the behaviour that keeps a
+/// rolled snare from turning into mush — so at most one voice is wanted and
+/// one is dying. A third strike inside the ~5 ms steal window hard-replaces
+/// the dying voice, which is a truncation nobody has heard under a flam.
+#[derive(Debug, Clone, Copy, Default)]
+struct PadVoice {
+    main: PadPlay,
+    dying: PadPlay,
+}
+
+impl PadVoice {
+    fn trigger(&mut self, velocity: f32, step: f64) {
+        if self.main.playing {
+            let mut old = self.main;
+            old.cut();
+            self.dying = old;
+        }
+        self.main = PadPlay::start(velocity, step);
+    }
+
+    /// Choked by another pad: fade what is sounding, start nothing.
+    fn cut(&mut self) {
+        self.main.cut();
+        self.dying.cut();
+    }
+
+    /// Hard stop, for a kit swap: these voices index into samples that just
+    /// left, and a voice resumed inside a different waveform is a sound
+    /// nobody asked for.
+    fn silence(&mut self) {
+        self.main = PadPlay::default();
+        self.dying = PadPlay::default();
+    }
+
+    fn active(&self) -> bool {
+        self.main.playing || self.dying.playing
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // The state both threads can see
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -1055,6 +1231,18 @@ struct Shared {
     /// a peak is a transient and an average would read as almost nothing on
     /// exactly the material a meter is there for.
     strip_peak: [[AtomicU32; 2]; STRIPS],
+    /// The drumpad's knobs — per-pad gain, pan and tune as f32 bits, the
+    /// choke group as a small integer — and the kit's own fader. Plain
+    /// stores read once per chunk, exactly the channel gains' shape.
+    pad_gain: [AtomicU32; PADS],
+    pad_pan: [AtomicU32; PADS],
+    pad_tune: [AtomicU32; PADS],
+    pad_choke: [AtomicU32; PADS],
+    pad_master: AtomicU32,
+    /// The loudest sample each pad made since the UI last looked, f32 bits,
+    /// read-and-reset like `strip_peak` above — it is what lights a pad from
+    /// the audio rather than from the gesture, so a MIDI strike shows too.
+    pad_peak: [AtomicU32; PADS],
     /// One bit per strip. See [`Strip`].
     ///
     /// **Two masks rather than a flag each**, because solo is a question about
@@ -1174,6 +1362,12 @@ impl Shared {
             }),
             fx_return: AtomicU32::new(1.0f32.to_bits()),
             strip_peak: std::array::from_fn(|_| [AtomicU32::new(0), AtomicU32::new(0)]),
+            pad_gain: std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
+            pad_pan: std::array::from_fn(|_| AtomicU32::new(0.0f32.to_bits())),
+            pad_tune: std::array::from_fn(|_| AtomicU32::new(0.0f32.to_bits())),
+            pad_choke: std::array::from_fn(|_| AtomicU32::new(0)),
+            pad_master: AtomicU32::new(1.0f32.to_bits()),
+            pad_peak: std::array::from_fn(|_| AtomicU32::new(0)),
             muted: AtomicU32::new(0),
             soloed: AtomicU32::new(0),
             gr_db: AtomicU32::new(0),
@@ -1655,6 +1849,17 @@ struct Renderer {
     track_retiring: Producer<Vec<Placed>>,
     midi_incoming: Consumer<Vec<PlacedMidi>>,
     midi_retiring: Producer<Vec<PlacedMidi>>,
+    /// The drumpad. The kit swaps in whole — `pad_incoming`/`pad_retiring`
+    /// are the clips' protocol exactly — and the voices are fixed and
+    /// reused, like the metronome's.
+    pad_kit: PadKit,
+    pad_incoming: Consumer<PadKit>,
+    pad_retiring: Producer<PadKit>,
+    pad_voices: [PadVoice; PADS],
+    /// This chunk's strikes, filled by `collect_notes` beside the note list.
+    pad_hits: Vec<PadHit>,
+    /// The kit's fader, slewed one-pole like every fader.
+    pad_gain: f32,
     builtin: crate::dx7::Dx7,
     /// The built-in's own output, before its slot gain.
     ///
@@ -1891,6 +2096,11 @@ impl Renderer {
     fn collect_notes(&mut self, block_start: Nanos, frames: usize) {
         self.notes.clear();
         self.controls.clear();
+        self.pad_hits.clear();
+        // Whether channel 10 belongs to the drums this block. Read once: a
+        // kit swap lands in `mix_pads`, so this answers for the PREVIOUS
+        // chunk's kit — one chunk of grace on a load, never a torn read.
+        let pads_live = self.pad_kit.live();
         loop {
             let event = match self.pending.take() {
                 Some(e) => e,
@@ -1906,6 +2116,35 @@ impl Renderer {
                 }
                 Placement::At(offset) => offset,
             };
+            // ── channel 10: the drum channel ───────────────────────────────
+            // While a kit is loaded, a channel-10 note is a pad strike and
+            // nothing else — it never reaches the lanes, because a kick that
+            // also plays a C on the piano is a surprise, not a layer. Offs
+            // are consumed too: pads are one-shots and ignore them, and so
+            // is a note outside the rack's sixteen.
+            if pads_live
+                && event.status & 0x0F == PAD_CHANNEL
+                && matches!(event.status & 0xF0, 0x80 | 0x90)
+            {
+                let velocity = event.data2 & 0x7F;
+                if event.status & 0xF0 == 0x90 && velocity != 0 {
+                    if self.pad_hits.len() == self.pad_hits.capacity() {
+                        // Full. Hold it for the next chunk, exactly as the
+                        // note list does two branches down.
+                        self.pending = Some(event);
+                        break;
+                    }
+                    let pad = usize::from((event.data1 & 0x7F).wrapping_sub(PAD_BASE));
+                    if event.data1 & 0x7F >= PAD_BASE && pad < PADS {
+                        self.pad_hits.push(PadHit {
+                            offset,
+                            pad,
+                            velocity: f32::from(velocity) / 127.0,
+                        });
+                    }
+                }
+                continue;
+            }
             if self.notes.len() == self.notes.capacity() {
                 // Full. Hold this one for the next block rather than pushing
                 // (which reallocates on the audio thread) or dropping it (which
@@ -2151,6 +2390,10 @@ impl Renderer {
             //
             self.mix_clips(at, rolling, n, muted, soloed);
             self.mix_monitor(n, muted, soloed);
+            // The drumpad, upstream of the bus return, the room split and
+            // the master — so the pads are limited, mastered, heard and
+            // taped exactly like every other source.
+            self.mix_pads(n);
             // ── the click, and what it sends ───────────────────────────
             //
             // **Its own pass, because the bus has to be finished before the
@@ -2867,6 +3110,106 @@ impl Renderer {
         }
     }
 
+    /// The drumpad: sixteen one-shot voices, summed straight onto the bus.
+    ///
+    /// Not a strip: the pads have no lane, no arm and no M/S bit — they are
+    /// a performance surface like the keyboard, and their sum joins `mix`
+    /// upstream of the room split and the master insert, so the limiter, the
+    /// speakers and the take all treat them like everything else. Runs
+    /// whether or not the transport rolls: a drum machine that only sounds
+    /// while the timeline moves is broken.
+    fn mix_pads(&mut self, frames: usize) {
+        // A kit arriving — and the displaced one going BACK, by the racks'
+        // own protocol: no room to return it, no swap this block. The voices
+        // are silenced across a swap; see `PadVoice::silence`.
+        if self.pad_retiring.slots() > 0 {
+            if let Ok(next) = self.pad_incoming.pop() {
+                let old = std::mem::replace(&mut self.pad_kit, next);
+                let _ = self.pad_retiring.push(old);
+                for v in &mut self.pad_voices {
+                    v.silence();
+                }
+            }
+        }
+        if self.pad_hits.is_empty() && !self.pad_voices.iter().any(PadVoice::active) {
+            return;
+        }
+        let coeff = self.gain_coeff;
+        let master = Shared::f32_of(&self.shared.pad_master).clamp(0.0, 8.0);
+        // The knobs, read once per chunk like the channel gains: they are
+        // published at human speed. The clamps are the audio thread refusing
+        // to trust numbers it did not make; the setter sanitised them too.
+        let mut gain = [0.0f32; PADS];
+        let mut choke = [0u8; PADS];
+        let mut pan_l = [1.0f32; PADS];
+        let mut pan_r = [1.0f32; PADS];
+        let mut step = [1.0f64; PADS];
+        for i in 0..PADS {
+            gain[i] = Shared::f32_of(&self.shared.pad_gain[i]).clamp(0.0, 2.0);
+            choke[i] = self.shared.pad_choke[i].load(Ordering::Relaxed).min(255) as u8;
+            let pan = Shared::f32_of(&self.shared.pad_pan[i]).clamp(-1.0, 1.0);
+            // The linear law, not constant-power: a drum sits still, and
+            // linear keeps a centred pad at exactly unity.
+            pan_l[i] = (1.0 - pan).min(1.0);
+            pan_r[i] = (1.0 + pan).min(1.0);
+            let tune = f64::from(Shared::f32_of(&self.shared.pad_tune[i]).clamp(-12.0, 12.0));
+            step[i] = (tune / 12.0).exp2();
+        }
+        let Some(mix) = self.mix.get_mut(..frames * TAP_CHANNELS) else {
+            return;
+        };
+        let mut peak = [0.0f32; PADS];
+        for f in 0..frames {
+            // The strikes that land on this frame: whoever shares the choke
+            // group fades, the struck pad starts clean. The group is read at
+            // the strike, so moving a knob never cuts a voice already gone.
+            for h in &self.pad_hits {
+                if h.offset != f as i32 {
+                    continue;
+                }
+                if choke[h.pad] != 0 {
+                    for (q, v) in self.pad_voices.iter_mut().enumerate() {
+                        if q != h.pad && choke[q] == choke[h.pad] {
+                            v.cut();
+                        }
+                    }
+                }
+                if let Some(v) = self.pad_voices.get_mut(h.pad) {
+                    v.trigger(h.velocity, step[h.pad]);
+                }
+            }
+            self.pad_gain += (master - self.pad_gain) * coeff;
+            let at = f * TAP_CHANNELS;
+            for (i, v) in self.pad_voices.iter_mut().enumerate() {
+                if !v.active() {
+                    continue;
+                }
+                let Some(clip) = self.pad_kit.pads[i].as_deref() else {
+                    // A voice with no sample is a swap artefact; end it.
+                    v.silence();
+                    continue;
+                };
+                let (ml, mr) = v.main.next(clip);
+                let (dl, dr) = v.dying.next(clip);
+                let g = gain[i] * self.pad_gain;
+                let l = (ml + dl) * g * pan_l[i];
+                let r = (mr + dr) * g * pan_r[i];
+                peak[i] = peak[i].max(l.abs()).max(r.abs());
+                if let Some(s) = mix.get_mut(at) {
+                    *s += l;
+                }
+                if let Some(s) = mix.get_mut(at + 1) {
+                    *s += r;
+                }
+            }
+        }
+        for (i, pk) in peak.iter().enumerate() {
+            if *pk > 0.0 {
+                self.shared.pad_peak[i].fetch_max(pk.to_bits(), Ordering::Relaxed);
+            }
+        }
+    }
+
     /// The eight general channels: the built-in, the bay voices, and their
     /// effect bays — everything except AUDIO channels, whose racks run where
     /// their input arrives (see `mix_monitor`).
@@ -3397,6 +3740,8 @@ pub struct Engine {
     track_from_audio: Consumer<Vec<Placed>>,
     midi_to_audio: Producer<Vec<PlacedMidi>>,
     midi_from_audio: Consumer<Vec<PlacedMidi>>,
+    pad_to_audio: Producer<PadKit>,
+    pad_from_audio: Consumer<PadKit>,
     cap_rx: Vec<Consumer<f32>>,
     /// What is in each of them, for the desk to name.
     inserts_loaded: [[Option<Loaded>; INSERTS]; STRIPS + 1],
@@ -3589,6 +3934,9 @@ impl Engine {
         let (track_retiring, track_from_audio) = RingBuffer::<Vec<Placed>>::new(2);
         let (midi_to_audio, midi_incoming) = RingBuffer::<Vec<PlacedMidi>>::new(2);
         let (midi_retiring, midi_from_audio) = RingBuffer::<Vec<PlacedMidi>>::new(2);
+        // The drumpad kit's pair, same capacity, same reason.
+        let (pad_to_audio, pad_incoming) = RingBuffer::<PadKit>::new(2);
+        let (pad_retiring, pad_from_audio) = RingBuffer::<PadKit>::new(2);
         // The capture rings: four seconds each, stereo. The host drains every
         // UI frame and would have to stall for seconds to lose a sample; a
         // full ring drops and says so in `cap_dropped`.
@@ -3625,6 +3973,12 @@ impl Engine {
             track_retiring,
             midi_incoming,
             midi_retiring,
+            pad_kit: PadKit::default(),
+            pad_incoming,
+            pad_retiring,
+            pad_voices: [PadVoice::default(); PADS],
+            pad_hits: Vec::with_capacity(MAX_PAD_HITS_PER_BLOCK),
+            pad_gain: 1.0,
             builtin: crate::dx7::Dx7::new(rate as f32),
             builtin_scratch: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             channel_gain: [1.0; CHANNELS],
@@ -3697,6 +4051,8 @@ impl Engine {
             track_from_audio,
             midi_to_audio,
             midi_from_audio,
+            pad_to_audio,
+            pad_from_audio,
             cap_rx,
             inserts_loaded: std::array::from_fn(|_| std::array::from_fn(|_| None)),
             tap: Some(RecorderTap {
@@ -4336,6 +4692,52 @@ impl Engine {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    /// Hand the audio thread the drumpad's samples, whole — the clips' own
+    /// swap protocol, so the displaced kit drops HERE, never in the callback.
+    pub fn set_pad_kit(&mut self, kit: PadKit) {
+        while self.pad_from_audio.pop().is_ok() {}
+        if self.pad_to_audio.push(kit).is_err() {
+            return;
+        }
+        let deadline = Instant::now() + RETIRE_TIMEOUT;
+        while Instant::now() < deadline {
+            if let Ok(old) = self.pad_from_audio.pop() {
+                drop(old);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// The drumpad's knobs, pushed whole every frame like the desk.
+    /// Sanitised here, on the way in: a NaN survives `clamp` and a NaN in a
+    /// gain does not stay in one sample.
+    pub fn set_pad_params(&self, kit: &ivory_ui::recorder::DrumKitParams) {
+        let sane = |v: f32, lo: f32, hi: f32, or: f32| {
+            if v.is_finite() {
+                v.clamp(lo, hi)
+            } else {
+                or
+            }
+        };
+        let sh = &self.shared;
+        for (i, p) in kit.pads.iter().enumerate().take(PADS) {
+            sh.pad_gain[i].store(sane(p.gain, 0.0, 2.0, 1.0).to_bits(), Ordering::Relaxed);
+            sh.pad_pan[i].store(sane(p.pan, -1.0, 1.0, 0.0).to_bits(), Ordering::Relaxed);
+            sh.pad_tune[i].store(sane(p.tune, -12.0, 12.0, 0.0).to_bits(), Ordering::Relaxed);
+            sh.pad_choke[i].store(u32::from(p.choke), Ordering::Relaxed);
+        }
+        sh.pad_master
+            .store(sane_gain(kit.master).to_bits(), Ordering::Relaxed);
+    }
+
+    /// The loudest sample each pad has made since this was last asked —
+    /// read-and-reset, the strips' own idiom. What lights a pad from the
+    /// audio rather than from the gesture, so a hardware strike shows too.
+    pub fn pad_peaks(&self) -> [f32; PADS] {
+        std::array::from_fn(|i| f32::from_bits(self.shared.pad_peak[i].swap(0, Ordering::Relaxed)))
     }
 
     /// Which input picks tee into the capture rings — a bit per input, zero

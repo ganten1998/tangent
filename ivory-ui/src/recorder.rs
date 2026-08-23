@@ -483,6 +483,68 @@ pub const INPUTS: usize = 4;
 /// How many channels the desk has, master aside.
 pub const STRIPS: usize = CHANNELS + 2;
 
+// ── The drumpad ─────────────────────────────────────────────────────────────
+
+/// How many pads the drumpad has. Sixteen in a 4×4 grid, the shape every
+/// hardware drum machine since the MPC has taught hands to expect. The engine
+/// mirrors this the way it mirrors [`CHANNELS`]; nothing may bake the grid's
+/// SIDES in so deep that another layout is a rewrite.
+pub const DRUM_PADS: usize = 16;
+
+/// The MIDI note of pad 0. C1 — the General MIDI kick — with the pads counting
+/// up from the BOTTOM-LEFT corner, which is where every drum machine puts its
+/// first pad. Pad `n` answers note `DRUM_PAD_BASE + n`.
+pub const DRUM_PAD_BASE: u8 = 36;
+
+/// How hard a mouse-struck pad hits. Firm — a pad tapped with a pointer is a
+/// performance gesture, not an audition — but short of the top, for the same
+/// reason [`AUDITION_VELOCITY`] stops short of it.
+pub const DRUM_PAD_VELOCITY: u8 = 112;
+
+/// One pad's knobs, as the engine wants them: plain numbers, pushed whole.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DrumPadParams {
+    /// Linear gain, 0..=2. 1.0 is the sample as it came.
+    pub gain: f32,
+    /// -1 (hard left) ..= 1 (hard right), 0 centre.
+    pub pan: f32,
+    /// Semitones, -12..=12, applied when a hit starts. Fractional is legal.
+    pub tune: f32,
+    /// 0 = no choke; pads sharing a non-zero group cut each other, which is
+    /// what lets a closed hat end an open one.
+    pub choke: u8,
+}
+
+impl Default for DrumPadParams {
+    fn default() -> Self {
+        Self {
+            gain: 1.0,
+            pan: 0.0,
+            tune: 0.0,
+            choke: 0,
+        }
+    }
+}
+
+/// The whole kit's controls, pushed to the engine every frame like the desk:
+/// writing an unchanged value costs nothing, and a change-detection cache
+/// would be a second copy to get out of step.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DrumKitParams {
+    pub pads: [DrumPadParams; DRUM_PADS],
+    /// The kit's own fader, applied to the pads' sum.
+    pub master: f32,
+}
+
+impl Default for DrumKitParams {
+    fn default() -> Self {
+        Self {
+            pads: [DrumPadParams::default(); DRUM_PADS],
+            master: 1.0,
+        }
+    }
+}
+
 /// A mixer COLUMN, which is not a desk index and may never be used as one.
 ///
 /// **This exact aliasing has shipped three times.** Columns and desk indices
@@ -1041,6 +1103,16 @@ pub enum RecorderRequest {
     /// counts as letting go, so there is no state in which the key is up and
     /// the note is still sounding.
     Audition { notes: Vec<u8>, on: bool },
+    /// **Strike one drumpad.** The same door as `Audition` — the host turns it
+    /// into a note on MIDI channel 10, the drum channel, stamped now — but its
+    /// own variant, because a pad is not the loaded instrument: the engine
+    /// keeps channel 10 for the pads and the piano never hears it.
+    ///
+    /// The same held-gesture contract as `Audition`: `on` is the edge, and the
+    /// sender guarantees the release. Pads are one-shots today and ignore the
+    /// off; the off is sent anyway, so obey-note-off pads can exist without a
+    /// protocol change.
+    PadHit { pad: u8, on: bool },
 }
 
 /// How hard an auditioned note is struck.
