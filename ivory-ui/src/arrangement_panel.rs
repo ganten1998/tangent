@@ -46,6 +46,9 @@ pub struct LaneView<'a> {
     /// it. An unused lane draws faint and offers no header controls.
     pub used: bool,
     pub armed: bool,
+    /// Whether the SOURCE is stereo — two meter bars — or mono, one. The
+    /// mixer strip's own claim, made here too.
+    pub stereo: bool,
     /// The three bays' short names — empty for an empty slot.
     pub inserts: [&'a str; crate::recorder::INSERTS],
     pub muted: bool,
@@ -470,37 +473,33 @@ impl Layout {
                 Pos2::new(dial.right() + 1.0, dial.top() - 1.0),
             )
         };
-        // The name keeps the row's top half; the INPUT CHIP takes the
-        // bottom, under it — the mixer strip's own order.
-        let name = Rect::from_min_max(
+        // **Top-down: LABEL, then INPUT, then the THREE BAYS** — the
+        // owner's order. Each row takes the column's whole width, so the
+        // input strip and the slots are both WIDER; a short window trades
+        // legibility for it, and that trade was accepted out loud.
+        let col = Rect::from_min_max(
             Pos2::new(arm.right() + 4.0, r.top()),
-            Pos2::new(pan.left() - 6.0, r.center().y - 1.0),
-        );
-        // The bottom half: a SMALL input chip, then the THREE BAYS — the
-        // mixer's insert slots, exposed here because a session reaches for
-        // its instruments from the arrangement too, the owner's word.
-        let bottom = Rect::from_min_max(
-            Pos2::new(arm.right() + 4.0, r.center().y + 1.0),
             Pos2::new(pan.left() - 6.0, r.bottom() - 1.0),
         );
-        let input = Rect::from_min_max(
-            bottom.min,
-            Pos2::new(
-                bottom.left() + (bottom.width() * 0.26).min(74.0),
-                bottom.bottom(),
-            ),
-        );
+        let slice = |a: f32, b: f32| {
+            Rect::from_min_max(
+                Pos2::new(col.left(), col.top() + col.height() * a),
+                Pos2::new(col.right(), col.top() + col.height() * b),
+            )
+        };
+        let name = slice(0.0, 0.34);
+        let input = slice(0.36, 0.64);
+        let bays_row = slice(0.66, 1.0);
         let bays = std::array::from_fn(|b| {
-            let w = (bottom.right() - input.right() - 4.0
-                - 3.0 * (crate::recorder::INSERTS as f32 - 1.0))
+            let w = (bays_row.width() - 3.0 * (crate::recorder::INSERTS as f32 - 1.0))
                 / crate::recorder::INSERTS as f32;
-            if w < 16.0 {
+            if w < 16.0 || !bays_row.is_positive() {
                 return Rect::NOTHING;
             }
-            let x0 = input.right() + 4.0 + b as f32 * (w + 3.0);
+            let x0 = bays_row.left() + b as f32 * (w + 3.0);
             Rect::from_min_max(
-                Pos2::new(x0, bottom.top()),
-                Pos2::new(x0 + w, bottom.bottom()),
+                Pos2::new(x0, bays_row.top()),
+                Pos2::new(x0 + w, bays_row.bottom()),
             )
         });
         HeaderRow {
@@ -961,11 +960,22 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         }
     }
 
-    // ── empty lanes are SLOTS: an etched seam around each, drawn over the
-    // grid so the boundary survives the lines running through it ──────────
+    // ── empty lanes are SLOTS: full-width separators at every empty
+    // row's edges — header and field in one line, drawn over the grid so
+    // the boundary survives the lines running through it ─────────────────
     for (i, row) in l.lane_rows.iter().enumerate() {
         if view.lanes.get(i).is_some_and(|lane| lane.used) {
             continue;
+        }
+        let left = l
+            .header_rows
+            .get(i)
+            .map_or(row.left(), |h| h.panel.left());
+        for y in [row.top(), row.bottom()] {
+            painter.line_segment(
+                [Pos2::new(left, y), Pos2::new(row.right(), y)],
+                Stroke::new(1.5, p.seam.gamma_multiply(1.6)),
+            );
         }
         painter.rect_stroke(*row, 0.0, Stroke::new(1.0, p.seam), egui::StrokeKind::Inside);
     }
@@ -1399,20 +1409,40 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 );
             }
         }
-        // The meter: one slim bar, the loudest of the pair.
+        // The meter: a PAIR of slim bars on a stereo source, one on mono —
+        // the mixer's own claim, kept here.
         if row.meter.is_positive() {
-            painter.rect_filled(row.meter, 1.0, p.lane);
-            let v = lane.peak[0].max(lane.peak[1]);
-            if v > 0.0 {
-                let t = crate::recorder::gain_to_fader(v).clamp(0.0, 1.0);
-                painter.rect_filled(
-                    Rect::from_min_max(
-                        Pos2::new(row.meter.left(), row.meter.bottom() - row.meter.height() * t),
-                        row.meter.max,
+            let lanes_n = if lane.stereo { 2 } else { 1 };
+            let gap = 1.0;
+            let w = ((row.meter.width() - gap * (lanes_n as f32 - 1.0))
+                / lanes_n as f32)
+                .max(1.5);
+            for b in 0..lanes_n {
+                let cell = Rect::from_min_max(
+                    Pos2::new(row.meter.left() + b as f32 * (w + gap), row.meter.top()),
+                    Pos2::new(
+                        (row.meter.left() + b as f32 * (w + gap) + w)
+                            .min(row.meter.right()),
+                        row.meter.bottom(),
                     ),
-                    1.0,
-                    p.meter,
                 );
+                painter.rect_filled(cell, 1.0, p.lane);
+                let v = if lane.stereo {
+                    lane.peak[b.min(1)]
+                } else {
+                    lane.peak[0].max(lane.peak[1])
+                };
+                if v > 0.0 {
+                    let t = crate::recorder::gain_to_fader(v).clamp(0.0, 1.0);
+                    painter.rect_filled(
+                        Rect::from_min_max(
+                            Pos2::new(cell.left(), cell.bottom() - cell.height() * t),
+                            cell.max,
+                        ),
+                        1.0,
+                        p.meter,
+                    );
+                }
             }
         }
         for (r, label, on, lit) in [
@@ -1589,6 +1619,7 @@ mod tests {
 
     fn a_lane(used: bool) -> LaneView<'static> {
         LaneView {
+            stereo: true,
             inserts: [""; crate::recorder::INSERTS],
             name: "KEYS",
             input: String::new(),

@@ -381,6 +381,8 @@ pub struct IvoryApp {
     pad_menu: Option<usize>,
     /// A trim handle mid-drag in the pad menu: `false` = start, `true` = end.
     pad_trim_drag: Option<bool>,
+    /// The pad's NAME being typed in its menu.
+    pad_name_typing: Option<String>,
     /// A pad being CARRIED to another pad: `(from, origin, active)`.
     pad_carry: Option<(usize, egui::Pos2, bool)>,
     /// A drumpad knob value being typed, single-click's own door.
@@ -1000,7 +1002,10 @@ const PAD_MENU_ROW_H: f32 = 22.0;
 /// Where the pad's context menu stands: beside its pad, held inside the
 /// drumpad panel.
 fn pad_menu_rect(pad: egui::Rect, panel: egui::Rect) -> egui::Rect {
-    let size = egui::Vec2::new(PAD_MENU_W, PAD_MENU_WAVE_H + PAD_MENU_ROW_H + 12.0);
+    let size = egui::Vec2::new(
+        PAD_MENU_W,
+        PAD_MENU_ROW_H + PAD_MENU_WAVE_H + PAD_MENU_ROW_H + 16.0,
+    );
     let mut min = egui::Pos2::new(pad.right() + 6.0, pad.top());
     if min.x + size.x > panel.right() - 4.0 {
         min.x = (pad.left() - size.x - 6.0).max(panel.left() + 4.0);
@@ -1009,16 +1014,26 @@ fn pad_menu_rect(pad: egui::Rect, panel: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_size(min, size)
 }
 
-/// The menu's wave strip (the trimmer) and its OBEY row.
+/// The menu's rows: the NAME (editable), the wave strip (the trimmer),
+/// then the OBEY switch.
+fn pad_menu_name(menu: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::Pos2::new(menu.left() + 6.0, menu.top() + 5.0),
+        egui::Vec2::new(menu.width() - 12.0, PAD_MENU_ROW_H),
+    )
+}
 fn pad_menu_wave(menu: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_size(
-        egui::Pos2::new(menu.left() + 6.0, menu.top() + 6.0),
+        egui::Pos2::new(menu.left() + 6.0, menu.top() + PAD_MENU_ROW_H + 8.0),
         egui::Vec2::new(menu.width() - 12.0, PAD_MENU_WAVE_H - 6.0),
     )
 }
 fn pad_menu_obey(menu: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_size(
-        egui::Pos2::new(menu.left() + 6.0, menu.top() + PAD_MENU_WAVE_H + 4.0),
+        egui::Pos2::new(
+            menu.left() + 6.0,
+            menu.top() + PAD_MENU_ROW_H + PAD_MENU_WAVE_H + 6.0,
+        ),
         egui::Vec2::new(menu.width() - 12.0, PAD_MENU_ROW_H),
     )
 }
@@ -1279,6 +1294,7 @@ impl IvoryApp {
             arr_selected: None,
             pad_menu: None,
             pad_trim_drag: None,
+            pad_name_typing: None,
             pad_carry: None,
             drumpad_num: None,
             media_sel: None,
@@ -2669,6 +2685,7 @@ impl IvoryApp {
         for (i, (path, gain, pan, tune, choke)) in kit.into_iter().enumerate() {
             self.drumpad.pads[i] = crate::drumpad::PadSlot {
                 path: path.to_owned(),
+                name: String::new(),
                 params: recorder::DrumPadParams {
                     obey: false,
                     trim_start: 0.0,
@@ -2697,6 +2714,7 @@ impl IvoryApp {
         // The pad whose file a tidy-up moved: the red dress.
         self.drumpad.pads[11] = crate::drumpad::PadSlot {
             path: "media/Cowbell.wav".to_owned(),
+            name: String::new(),
             params: recorder::DrumPadParams::default(),
         };
         self.drumpad_status[11] = crate::ports::PadStatus {
@@ -6245,11 +6263,13 @@ impl IvoryApp {
             }
         }
         if moved {
-            // **The ear follows EVERY note in the hand** — a transposed
-            // chord retriggers whole, the owner's rule, not just the note
-            // under the pointer.
+            // **The ear follows ONE CHORD — the one under the hand.** The
+            // grabbed note's start time names it; a selection of forty
+            // notes retriggering whole scaled awfully, the owner's word.
             let mut fresh: Vec<u8> = orig
                 .iter()
+                .filter(|&&(_, t0, _)| (t0 - g_t0).abs() < 1.0e-6)
+                .take(12)
                 .map(|&(_, _, k0)| (i32::from(k0) + dk_all).clamp(0, 127) as u8)
                 .collect();
             fresh.sort_unstable();
@@ -6794,6 +6814,7 @@ impl IvoryApp {
         self.pad_trim_drag = None;
         self.pad_carry = None;
         self.drumpad_num = None;
+        self.pad_name_typing = None;
         // And whatever the explorer was auditioning goes quiet.
         self.request_recorder(recorder::RecorderRequest::PreviewStop);
         self.drumpad_hover = None;
@@ -6830,10 +6851,14 @@ impl IvoryApp {
             let slot = &self.drumpad.pads[i];
             let status = &self.drumpad_status[i];
             crate::drumpad_panel::PadView {
-                label: std::path::Path::new(&slot.path)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(""),
+                label: if slot.name.is_empty() {
+                    std::path::Path::new(&slot.path)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                } else {
+                    slot.name.as_str()
+                },
                 loaded: !slot.path.is_empty() && !status.missing,
                 missing: status.missing,
                 wave: &status.wave,
@@ -6842,6 +6867,9 @@ impl IvoryApp {
         });
         crate::drumpad_panel::DrumpadView {
             media_sel: self.media_sel,
+            def_lit: !self.settings.media_default_dir.is_empty()
+                && std::path::Path::new(&self.settings.media_default_dir)
+                    == self.media_dir.as_path(),
             typing: self
                 .drumpad_num
                 .as_ref()
@@ -6950,6 +6978,7 @@ impl IvoryApp {
             ));
         };
         self.drumpad.pads[pad].path = rel;
+        self.drumpad.pads[pad].name.clear();
         self.drumpad_status[pad] = crate::ports::PadStatus::default();
         self.drumpad_sel = pad;
         self.drumpad.save_beside(&doc);
@@ -6989,6 +7018,11 @@ impl IvoryApp {
 
     /// A pad's short name: the sample's file stem, or nothing.
     fn pad_label(&self, pad: usize) -> &str {
+        if let Some(slot) = self.drumpad.pads.get(pad) {
+            if !slot.name.is_empty() {
+                return slot.name.as_str();
+            }
+        }
         let path = self
             .drumpad
             .pads
@@ -7024,6 +7058,9 @@ impl IvoryApp {
         // Esc peels ONE layer: the typed field, then the pad menu, then
         // the panel itself.
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if self.pad_name_typing.take().is_some() {
+                return;
+            }
             if self.drumpad_num.take().is_some() {
                 return;
             }
@@ -7182,11 +7219,61 @@ impl IvoryApp {
             }
         }
 
-        // ── the pad MENU, while it hangs: trimmer and the obey switch ────
+        // ── the pad MENU, while it hangs: name, trimmer, obey ────────────
         if let Some(pad) = self.pad_menu {
             let menu = crate::drumpad_panel::Layout::new(rect).pads[pad.min(recorder::DRUM_PADS - 1)];
             let menu = pad_menu_rect(menu, rect);
             let wave = pad_menu_wave(menu);
+            // The NAME being typed owns the keys.
+            if let Some(mut buf) = self.pad_name_typing.clone() {
+                let events = ctx.input(|i| i.events.clone());
+                let mut commit = false;
+                let mut cancel = false;
+                for e in events {
+                    match e {
+                        egui::Event::Text(t) => {
+                            for ch in t.chars() {
+                                if !ch.is_control() && buf.chars().count() < 24 {
+                                    buf.push(ch);
+                                }
+                            }
+                        }
+                        egui::Event::Key {
+                            key: egui::Key::Backspace,
+                            pressed: true,
+                            ..
+                        } => {
+                            buf.pop();
+                        }
+                        egui::Event::Key {
+                            key: egui::Key::Enter,
+                            pressed: true,
+                            ..
+                        } => commit = true,
+                        egui::Event::Key {
+                            key: egui::Key::Escape,
+                            pressed: true,
+                            ..
+                        } => cancel = true,
+                        _ => {}
+                    }
+                }
+                if pressed {
+                    commit = true;
+                }
+                if commit || cancel {
+                    if commit {
+                        self.drumpad.pads[pad].name = buf.trim().to_owned();
+                        self.drumpad_save();
+                    }
+                    self.pad_name_typing = None;
+                } else {
+                    self.pad_name_typing = Some(buf);
+                }
+                if !pressed {
+                    return;
+                }
+            }
             // A trim handle mid-drag follows the hand.
             if let Some(end) = self.pad_trim_drag {
                 if pointer_down {
@@ -7211,6 +7298,12 @@ impl IvoryApp {
                 if !menu.contains(p) {
                     // A press outside puts the menu away — and is SWALLOWED.
                     self.pad_menu = None;
+                    return;
+                }
+                if pad_menu_name(menu).contains(p) {
+                    // The name row: a press begins renaming, seeded with
+                    // what the pad already says.
+                    self.pad_name_typing = Some(self.pad_label(pad).to_owned());
                     return;
                 }
                 if wave.contains(p) {
@@ -7369,6 +7462,13 @@ impl IvoryApp {
         match hit {
             Some(H::Close) => self.close_drumpad(),
             Some(H::Midi) => self.drumpad_midi = !self.drumpad_midi,
+            Some(H::Def) => {
+                // The CURRENT folder becomes the remembered one — every
+                // fresh open of this window lands here, across launches.
+                self.settings.media_default_dir =
+                    self.media_dir.to_string_lossy().into_owned();
+                self.save_settings();
+            }
             // The selected pad's bays: the same door every bay opens —
             // picker when empty, the plugin's own window when loaded.
             Some(H::PadInsert(bay)) => {
@@ -7684,6 +7784,22 @@ impl IvoryApp {
             egui::Stroke::new(1.2, ink.gamma_multiply(0.5)),
             egui::StrokeKind::Inside,
         );
+        // The NAME row: the pad's word, editable — a caret while typing.
+        {
+            let row = pad_menu_name(menu);
+            painter.rect_filled(row, 2.0, egui::Color32::from_black_alpha(90));
+            let shown = match self.pad_name_typing.as_ref() {
+                Some(t) => format!("{t}_"),
+                None => self.pad_label(pad).to_owned(),
+            };
+            painter.text(
+                egui::Pos2::new(row.left() + 6.0, row.center().y),
+                egui::Align2::LEFT_CENTER,
+                if shown.is_empty() { "(name)".to_owned() } else { shown },
+                egui::FontId::monospace(10.5),
+                ink,
+            );
+        }
         let wave = pad_menu_wave(menu);
         painter.rect_filled(wave, 2.0, egui::Color32::from_black_alpha(120));
         // The sample's envelope across the strip.
@@ -7914,12 +8030,28 @@ impl IvoryApp {
             if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::D)) {
                 self.me_duplicate();
             }
-            // The system's own chord: Cmd here, Ctrl on the other desks —
-            // egui's `command` is that abstraction.
-            if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::C)) {
+            // The system's own chord — which arrives as an EVENT, not a
+            // keypress: the winit layer turns Cmd/Ctrl+C into
+            // `Event::Copy` before `key_pressed` ever sees the letter.
+            let (copy_ev, paste_ev) = ctx.input(|i| {
+                let mut c = false;
+                let mut v = false;
+                for e in &i.events {
+                    match e {
+                        egui::Event::Copy => c = true,
+                        egui::Event::Paste(_) => v = true,
+                        _ => {}
+                    }
+                }
+                (
+                    c || (i.modifiers.command && i.key_pressed(egui::Key::C)),
+                    v || (i.modifiers.command && i.key_pressed(egui::Key::V)),
+                )
+            });
+            if copy_ev {
                 self.me_copy();
             }
-            if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::V)) {
+            if paste_ev {
                 self.me_paste();
             }
             if ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::ArrowLeft)) {
@@ -9022,13 +9154,29 @@ impl IvoryApp {
         {
             self.arr_delete_selected();
         }
-        // **Copy and paste, the system's own chord** — Cmd on the Mac,
-        // Ctrl on the other desks (egui's `command`). Clips of any kind.
+        // **Copy and paste, the system's own chord** — which the winit
+        // layer delivers as `Event::Copy` / `Event::Paste`, never as a
+        // C or V keypress. Clips of any kind.
         if keys_ok && self.midi_edit.is_none() {
-            if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::C)) {
+            let (copy_ev, paste_ev) = ctx.input(|i| {
+                let mut c = false;
+                let mut v = false;
+                for e in &i.events {
+                    match e {
+                        egui::Event::Copy => c = true,
+                        egui::Event::Paste(_) => v = true,
+                        _ => {}
+                    }
+                }
+                (
+                    c || (i.modifiers.command && i.key_pressed(egui::Key::C)),
+                    v || (i.modifiers.command && i.key_pressed(egui::Key::V)),
+                )
+            });
+            if copy_ev {
                 self.arr_copy();
             }
-            if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::V)) {
+            if paste_ev {
                 self.arr_paste();
             }
         }
@@ -9168,6 +9316,13 @@ impl IvoryApp {
                 crate::arrangement_panel::LaneView {
                     name: self.channel_display_name(n),
                     input: self.input_chip_text(n),
+                    stereo: match kind {
+                        Some(recorder::ChannelKind::Audio) => self
+                            .audio_ordinal(n)
+                            .and_then(|k| self.recorder.inputs.get(k))
+                            .is_none_or(|st| st.label.is_empty() || st.stereo),
+                        _ => true,
+                    },
                     inserts: std::array::from_fn(|b| {
                         self.insert(n, b).map_or("", plugin_display_name)
                     }),
@@ -9517,7 +9672,16 @@ impl IvoryApp {
     /// load all come through here so the media list is never stale.
     fn open_drumpad(&mut self) {
         self.drumpad_open = true;
-        if !self.media_fresh {
+        // A remembered default folder is where a fresh open LANDS.
+        let def = std::path::PathBuf::from(&self.settings.media_default_dir);
+        if !self.settings.media_default_dir.is_empty()
+            && def.is_dir()
+            && def != self.media_dir
+        {
+            self.media_dir = def;
+            self.media_sel = None;
+            self.refresh_media();
+        } else if !self.media_fresh {
             self.refresh_media();
         }
     }
@@ -10829,12 +10993,12 @@ impl IvoryApp {
             // so the transport never moves. A half-finished drag does not
             // survive the swap, because the control it was on is gone.
             K::ToggleMixer => {
-                // **Tab CYCLES now: piano, mixer, arrangement.** Three
-                // surfaces on one spot; the band above never moves.
+                // **Tab CYCLES: theory, ARRANGE, mixer** — the owner's
+                // order. Three surfaces on one spot; the band never moves.
                 let (mixer, arrangement) = match (self.mixer_open, self.arrangement_open) {
-                    (false, false) => (true, false),
-                    (true, _) => (false, true),
-                    (false, true) => (false, false),
+                    (false, false) => (false, true),
+                    (false, true) => (true, false),
+                    (true, _) => (false, false),
                 };
                 self.arrangement_open = arrangement;
                 self.mixer_open = mixer;
@@ -12773,6 +12937,7 @@ impl IvoryApp {
             && self.input_menu.is_none()
             && self.swing_menu.is_none()
             && self.drumpad_num.is_none()
+            && self.pad_name_typing.is_none()
         {
             if let Some(action) = keys::pressed(&ctx, self.key_gates()) {
                 // The GUITAR toggle answers nowhere but the piano view: on
@@ -13352,26 +13517,27 @@ impl IvoryApp {
         // the thanks card and the help card. It floats wherever you are —
         // that is its whole point — so it is drawn here rather than inside
         // one view's branch the way the MIDI editor is.
+        // The strip meters' fall — EVERY frame, whatever is open. It
+        // shipped inside the drumpad's branch by accident, which is why
+        // the desk's meters were dead unless the pads were up.
+        for (hold, fresh) in self
+            .meter_hold
+            .iter_mut()
+            .zip(self.recorder.strip_peaks.iter())
+        {
+            for c in 0..2 {
+                hold[c] = (hold[c] * 0.94).max(fresh[c]);
+                if hold[c] < 1.0e-4 {
+                    hold[c] = 0.0;
+                }
+            }
+        }
         if self.drumpad_open {
             // The flash fades HERE, where the frames are: the engine's
             // peaks arrive through `note_drumpad_peaks` as maxima, and this
             // is the decay that turns them into a strike you can see.
             for p in &mut self.drumpad_peaks {
                 *p = if *p > 0.02 { *p * 0.78 } else { 0.0 };
-            }
-            // The strip meters' fall, beside the pads': ~0.94 a frame is a
-            // reading a human can follow; the rise stays instant.
-            for (hold, fresh) in self
-                .meter_hold
-                .iter_mut()
-                .zip(self.recorder.strip_peaks.iter())
-            {
-                for c in 0..2 {
-                    hold[c] = (hold[c] * 0.94).max(fresh[c]);
-                    if hold[c] < 1.0e-4 {
-                        hold[c] = 0.0;
-                    }
-                }
             }
             let r = crate::drumpad_panel::place(ui.max_rect(), self.drumpad_pos);
             if r.is_positive() {
@@ -13807,15 +13973,18 @@ impl IvoryApp {
             } else if redo_key {
                 self.redo();
             }
+            // **Shift+1/2/3: theory, arrange, mixer** — the ctrl chords
+            // retired because Windows' Ctrl+V is PASTE and a view key on
+            // top of it was a fight nobody wins.
             let view_key = ctx.input(|i| {
-                if !i.modifiers.ctrl || i.modifiers.command {
+                if !i.modifiers.shift || i.modifiers.command || i.modifiers.ctrl {
                     None
-                } else if i.key_pressed(egui::Key::A) {
-                    Some((false, true))
-                } else if i.key_pressed(egui::Key::M) {
-                    Some((true, false))
-                } else if i.key_pressed(egui::Key::V) {
+                } else if i.key_pressed(egui::Key::Num1) {
                     Some((false, false))
+                } else if i.key_pressed(egui::Key::Num2) {
+                    Some((false, true))
+                } else if i.key_pressed(egui::Key::Num3) {
+                    Some((true, false))
                 } else {
                     None
                 }
@@ -14231,6 +14400,8 @@ mod tests {
         run(&ctx, &mut app);
         assert!(app.mixer_rect.is_none(), "the mixer was up before it was asked for");
 
+        // Tab walks theory → arrange → MIXER now, the owner's order.
+        app.apply_key_action(&ctx, keys::KeyAction::ToggleMixer);
         app.apply_key_action(&ctx, keys::KeyAction::ToggleMixer);
         run(&ctx, &mut app);
         let rect = app.mixer_rect.expect("the mixer was not drawn");
@@ -14253,6 +14424,7 @@ mod tests {
         app.apply_key_action(&ctx, keys::KeyAction::ToggleMixer);
         run(&ctx, &mut app);
         assert!(app.mixer_rect.is_none(), "the mixer stayed up");
+        assert!(!app.arrangement_open, "Tab from the mixer must land on theory");
         assert!(
             app.mixer_grab.is_none(),
             "a drag survived the control it was on going away"

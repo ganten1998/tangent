@@ -15,7 +15,9 @@ use crate::mixer_panel::STRIP_COLORS;
 /// The top strip's height: title, the grid tools, the ×.
 pub const STRIP_H: f32 = 26.0;
 /// The piano column on the left.
-pub const KEYS_W: f32 = 46.0;
+// 66, up from 46: the drum lane writes its pad NAMES on the keys now,
+// and they need the room to say a word.
+pub const KEYS_W: f32 = 66.0;
 /// Keys visible at once — the roll's vertical span.
 pub const KEYS_SHOWN: f32 = 36.0;
 /// The swing presets the SWG menu offers, exactly as the owner listed

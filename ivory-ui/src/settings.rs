@@ -965,6 +965,9 @@ pub struct Settings {
     /// whichever view is open.
     pub arr_dark: bool,
     pub me_dark: bool,
+    /// The media explorer's DEFAULT folder — the DEF chip writes it, and
+    /// every fresh drumpad open starts there, across launches too.
+    pub media_default_dir: String,
     /// Where the swung off-beat sits, percent of its pair: 66.7 is the
     /// standard shuffle, 50 is straight. One decimal, the SWG menu's rule.
     pub midi_swing_pct: f64,
@@ -1246,6 +1249,7 @@ impl Default for Settings {
             midi_grid_exp: -4,
             midi_swing: false,
             arr_dark: false,
+            media_default_dir: String::new(),
             // The editor SHIPPED dark — its warm browns are the dark face
             // now, and its light face is the arrange view's greys.
             me_dark: true,
@@ -2035,6 +2039,9 @@ impl Settings {
         }
         take_bool(&mut map, "midi_swing", &mut s.midi_swing);
         take_bool(&mut map, "arr_dark", &mut s.arr_dark);
+        if let Some(Value::String(v)) = map.shift_remove("media_default_dir") {
+            s.media_default_dir = v;
+        }
         take_bool(&mut map, "me_dark", &mut s.me_dark);
         if let Some(Value::Number(n)) = map.shift_remove("midi_swing_pct") {
             if let Some(f) = n.as_f64() {
@@ -2742,6 +2749,10 @@ impl Settings {
         map.insert("midi_grid_exp".into(), Value::from(self.midi_grid_exp));
         map.insert("midi_swing".into(), Value::Bool(self.midi_swing));
         map.insert("arr_dark".into(), Value::Bool(self.arr_dark));
+        map.insert(
+            "media_default_dir".into(),
+            Value::String(self.media_default_dir.clone()),
+        );
         map.insert("me_dark".into(), Value::Bool(self.me_dark));
         map.insert(
             "midi_swing_pct".into(),
