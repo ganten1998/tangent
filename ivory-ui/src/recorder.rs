@@ -342,7 +342,7 @@ impl RecorderView<'_> {
             editing: None,
             folder_preview: "",
             gains: Gains::default(),
-            fx: FxSends { reverb: 0.0, delay: 0.0, chorus: 0.0, hpf: 0.0, lpf: 0.0, limiter: 0.0 },
+            fx: FxSends { reverb: 0.0, delay: 0.0, chorus: 0.0, hpf: 0.0, lpf: 1.0, limiter: 0.0 },
             fx_units: [crate::ports::KnobUnit::Percent; 6],
             track: crate::ports::TrackInfo::NONE,
             scrub: ScrubView::default(),
@@ -979,7 +979,8 @@ pub struct FxSends {
     pub chorus: f32,
     /// The high-pass corner. 0 is out of the way.
     pub hpf: f32,
-    /// The low-pass corner. **Up is darker** — see the binary's `Sends::lpf`.
+    /// The low-pass corner. **1.0 is out of the way** — see the binary's
+    /// `Sends::lpf`.
     pub lpf: f32,
     /// How hard the limiter is driven. 0 is bypass.
     pub limiter: f32,
@@ -2122,7 +2123,18 @@ impl NumEdit {
             // anyway. They stop the field from showing something it will then
             // silently refuse to accept.
             || (ch == '.' && !self.text.contains('.'))
-            || (ch == '-' && self.text.is_empty() && self.caret == 0);
+            || (ch == '-' && self.text.is_empty() && self.caret == 0)
+            // The filters read in hertz and "20k" is how anybody writes
+            // twenty thousand of them. Only there: a percent field showing a
+            // k it will refuse is the trap the filter exists to stop.
+            || (matches!(ch, 'k' | 'K')
+                && matches!(
+                    self.field,
+                    NumField::Fx(
+                        crate::recorder_panel::Fx::Hpf | crate::recorder_panel::Fx::Lpf
+                    )
+                )
+                && !self.text.to_ascii_lowercase().contains('k'));
         if ok && self.text.len() < MAX {
             let at = self.caret.min(self.text.len());
             self.text.insert(at, ch);

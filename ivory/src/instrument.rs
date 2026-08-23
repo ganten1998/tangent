@@ -1402,7 +1402,9 @@ impl Shared {
             gr_db: AtomicU32::new(0),
             reverb_mix: AtomicU32::new(0.0f32.to_bits()),
             hpf_mix: AtomicU32::new(0.0f32.to_bits()),
-            lpf_mix: AtomicU32::new(0.0f32.to_bits()),
+            // The low-pass rests at the TOP of its travel, limiter-style:
+            // zero here is a 200 Hz filter on an engine nobody touched.
+            lpf_mix: AtomicU32::new(1.0f32.to_bits()),
             // **One, not zero.** The limiter's dial is a threshold and its
             // resting position is fully clockwise; starting this at zero is a
             // -48 dB threshold on an engine nobody has touched yet.
@@ -2578,10 +2580,10 @@ impl Renderer {
                 delay: Shared::f32_of(&self.shared.delay_mix),
                 chorus: Shared::f32_of(&self.shared.chorus_mix),
                 // Not on the bus. See the comment above the desk — and note
-                // that the limiter's "off" is the TOP of its travel, so this
-                // is 1.0 rather than the 0.0 the others use.
+                // that the limiter's AND the low-pass's "off" is the TOP of
+                // their travel, so those are 1.0 where the others use 0.0.
                 hpf: 0.0,
-                lpf: 0.0,
+                lpf: 1.0,
                 limiter: 1.0,
             };
             if let Some(aux) = self.aux.get_mut(..n * TAP_CHANNELS) {

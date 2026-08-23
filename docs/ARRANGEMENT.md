@@ -303,6 +303,30 @@ channels play back their clips and nothing else. "Ready to play" and
     LABEL on the bottom, always visible. Click-to-type opens PREFILLED
     with the current readout, caret at the end, arrows/click move it.
 
+- **4.51.0 — the owner's morning-after list**: the TRACK menu answers a
+  right-click ANYWHERE on a strip (the strip was wall-to-wall controls, so
+  "empty space" never existed; a loaded insert bay keeps delete/replace;
+  the old in-mixer swatch overlay retired outright — `Hit::Paint`/
+  `Palette`, `palette_open`, `palette_over` all gone). DRUMS → **DRUM
+  BUS**, dark violet by authority (`DRUMS_COLOR = 21`, no palette uses
+  it), subtitle dropped. The input chip is a bone PANEL now and its press
+  actually opens the menu (`InputChip`/`InputRow` were missing from the
+  act-on-press list); the Device page lists THE INTERFACES when none is
+  open (the recovery door: a lost device selection could previously only
+  be repaired through Audio Setup); the auto-expose marker is versioned
+  ("2|key") so devices seeded under the 4.48 natural-pairs rule re-seed
+  once with every adjacent pair. The **LPF turned round**: ascending
+  hertz, 20 kHz fully clockwise and OUT OF THE WAY (limiter-style top-
+  rest; `LPF_HZ` flipped, `Sends`/`Shared` rest at 1.0, settings v15
+  flips stored positions); "20k" types as twenty thousand (NumEdit
+  accepts k on the filter fields, the seed sieve keeps it). The cog is
+  the LAST transport slot and opens a two-tier SETTINGS panel — AUDIO
+  above TAKE. Root cause of "input monitoring dead since 4.49": the
+  owner's `record_audio_device` key had vanished from settings.json (a
+  save while the field was empty — writer unidentified; the malformed-
+  load guard was already in place and unfired), so no input stream ever
+  opened; the menu's device rows are the fix and the recovery.
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index

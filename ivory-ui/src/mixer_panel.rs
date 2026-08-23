@@ -95,8 +95,6 @@ pub struct MixerView<'a> {
     pub dark_mode: bool,
     /// The band's own wood, so the two surfaces are one instrument.
     pub wood: (u8, u8, u8),
-    /// The strip whose colour palette is open, if any.
-    pub palette_open: Option<Column>,
     /// A decibel figure being typed, and into which strip.
     ///
     /// **A fader is a bad way to ask for exactly -6.0.** Its whole range is
@@ -161,10 +159,6 @@ pub enum Hit {
     /// One of the three insert chips: put an effect in it, or take one out.
     /// The second field is the BAY, which is not a channel of anything.
     Insert(Column, usize),
-    /// A swatch in the open palette: paint this column's strip colour `c`.
-    Paint(Column, usize),
-    /// A right-click anywhere on a strip: open its palette.
-    Palette(Column),
     /// The decibel readout: type a number into it.
     Db(Column),
     /// The channel's name: type a new one.
@@ -210,7 +204,6 @@ impl Hit {
             | Hit::Solo(i)
             | Hit::Add(i)
             | Hit::Insert(i, _)
-            | Hit::Palette(i)
             | Hit::Db(i)
             | Hit::Name(i)
             | Hit::Remove(i)
@@ -218,8 +211,7 @@ impl Hit {
             | Hit::FxMenu(i, ..)
             | Hit::AddKind(i, _)
             | Hit::InputChip(i)
-            | Hit::InputRow(i, _)
-            | Hit::Paint(i, _) => i,
+            | Hit::InputRow(i, _) => i,
         }
     }
 
@@ -233,8 +225,8 @@ impl Hit {
             Hit::Fader(_) => Some(DragAxis::Vertical),
             Hit::Send(_) => Some(DragAxis::Vertical),
             Hit::Pan(_) => Some(DragAxis::Vertical),
-            Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(..) | Hit::Paint(..)
-            | Hit::Palette(_) | Hit::Db(_) | Hit::Name(_) | Hit::Remove(_) | Hit::Arm(_)
+            Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(..)
+            | Hit::Db(_) | Hit::Name(_) | Hit::Remove(_) | Hit::Arm(_)
             | Hit::FxMenu(..) | Hit::AddKind(..) | Hit::InputChip(_) | Hit::InputRow(..) => None,
         }
     }
@@ -245,8 +237,8 @@ impl Hit {
             Hit::Fader(_) => Some(FADER_TRAVEL),
             Hit::Send(_) => Some(SEND_TRAVEL),
             Hit::Pan(_) => Some(SEND_TRAVEL),
-            Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(..) | Hit::Paint(..)
-            | Hit::Palette(_) | Hit::Db(_) | Hit::Name(_) | Hit::Remove(_) | Hit::Arm(_)
+            Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(..)
+            | Hit::Db(_) | Hit::Name(_) | Hit::Remove(_) | Hit::Arm(_)
             | Hit::FxMenu(..) | Hit::AddKind(..) | Hit::InputChip(_) | Hit::InputRow(..) => None,
         }
     }
@@ -295,6 +287,10 @@ pub const PALETTES: [(&str, [i64; 8]); 5] = [
     ("MOSS", [10, 13, 7, 12, 9, 6, 16, 11]),
     ("NEON", [5, 8, 11, 14, 17, 20, 23, 26]),
 ];
+
+/// The drum bus's colour everywhere: dark violet, no palette uses it, so
+/// the bus can never dress like one of the eight.
+pub const DRUMS_COLOR: usize = 21;
 
 /// The master's colour on a fresh install. Red, because it is the one channel
 /// you look for — the top tone of it, which is the one that reads as RED
@@ -711,22 +707,6 @@ impl Layout {
 /// What a press at `pos` means, or nothing.
 pub fn hit_test(rect: Rect, view: &MixerView<'_>, pos: Pos2) -> Option<Hit> {
     let l = Layout::new(rect, view);
-    // **The palette first, and it swallows the strip under it.** A swatch over
-    // a fader that also moved the fader would be a colour you cannot pick
-    // without changing a level.
-    if let Some(at) = view.palette_open {
-        if let Some(s) = l.strips.get(at.0) {
-            for (c, r) in palette_over(s).into_iter().enumerate() {
-                if r.contains(pos) {
-                    return Some(Hit::Paint(at, c));
-                }
-            }
-            if s.panel.contains(pos) {
-                // Anywhere else on the strip closes it without painting.
-                return Some(Hit::Paint(at, usize::MAX));
-            }
-        }
-    }
     // **The insert menu, and it is MODAL across the whole mixer.** The
     // palette only swallows its own strip, which is right for a colour — a
     // press on the next fader is somebody done choosing. A menu offering
@@ -863,28 +843,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MixerView<'_>) {
         let naming = view.naming.filter(|(at, _)| at.0 == i).map(|(_, b)| b);
         strip(painter, s, v, &p, heard, typed, naming);
     }
-    // The palette last, over whatever it belongs to.
-    if let Some(at) = view.palette_open {
-        if let Some(s) = l.strips.get(at.0) {
-            painter.rect_filled(s.panel, 3.0, Color32::from_black_alpha(180));
-            for (c, r) in palette_over(s).into_iter().enumerate() {
-                let (cr, cg, cb) = STRIP_COLORS[c];
-                let fill = if c == 0 {
-                    p.wood
-                } else {
-                    Color32::from_rgb(cr, cg, cb)
-                };
-                painter.rect_filled(r, 2.0, fill);
-                painter.rect_stroke(
-                    r,
-                    2.0,
-                    Stroke::new(1.0, p.face.gamma_multiply(0.5)),
-                    egui::StrokeKind::Inside,
-                );
-            }
-        }
-    }
-    // The insert menu and the kind ask, on the palette's terms: a veil over
+    // The insert menu and the kind ask: a veil over
     // the strip they belong to, then their rows on top. `two_rows` because
     // they are the same drawing with different words on it.
     let two_rows = |anchor: &StripStrip, rows: [Rect; 2], labels: [&str; 2]| {
@@ -1087,7 +1046,27 @@ fn strip(
             Stroke::new(w, ink),
         );
     }
-    if !v.detail.is_empty() {
+    // **The input chip is a PANEL, like the name plate above it** — bone
+    // ground, an edge, dark ink — so the one pressable row under the icon
+    // looks pressable on any colour a channel is painted. A channel with
+    // no input yet says so; the press is how one is chosen.
+    if l.input_chip.is_positive() {
+        painter.rect_filled(l.input_chip, 2.0, p.face);
+        painter.rect_stroke(
+            l.input_chip,
+            2.0,
+            Stroke::new(1.0, p.engrave.gamma_multiply(0.4)),
+            egui::StrokeKind::Inside,
+        );
+        let word = if v.detail.is_empty() { "NO INPUT" } else { v.detail };
+        centred(
+            painter,
+            l.input_chip,
+            word,
+            plain((h * 0.024).clamp(7.0, 11.0)),
+            p.engrave.gamma_multiply(if v.detail.is_empty() { 0.55 } else { 0.85 }),
+        );
+    } else if !v.detail.is_empty() {
         centred(
             painter,
             l.detail,
@@ -1347,43 +1326,6 @@ fn ask_over(l: &StripStrip) -> [Rect; 2] {
         )
     };
     [row(0.0), row(1.0)]
-}
-
-/// The swatches, over the strip whose colour is being chosen.
-///
-/// Drawn last and hit-tested first, like every other transient thing in this
-/// app: while it is up it is the only thing on that strip that can be pressed.
-fn palette_over(l: &StripStrip) -> Vec<Rect> {
-    if !l.panel.is_positive() {
-        return Vec::new();
-    }
-    let n = STRIP_COLORS.len();
-    let cols = PALETTE_COLUMNS;
-    let rows = n.div_ceil(cols);
-    // **Square, and inside the strip.** It could be wider than the channel it
-    // belongs to and the swatches would be bigger — but then a press in the
-    // overhang would fall through to the NEIGHBOUR's fader, and a colour
-    // picker that sometimes moves the channel beside it is worse than a small
-    // one. Whichever of the two axes runs out first decides the size.
-    let side = ((l.panel.width() - 8.0) / cols as f32)
-        .min((l.panel.height() - 8.0) / rows as f32)
-        .max(1.0);
-    let w = side * cols as f32;
-    let h = side * rows as f32;
-    let left = l.panel.center().x - w * 0.5;
-    let top = l.panel.center().y - h * 0.5;
-    (0..n)
-        .map(|i| {
-            Rect::from_min_size(
-                Pos2::new(
-                    left + (i % cols) as f32 * side,
-                    top + (i / cols) as f32 * side,
-                ),
-                Vec2::splat(side),
-            )
-            .shrink(1.5)
-        })
-        .collect()
 }
 
 /// Somewhere to put an instrument: an outline and a plus.
@@ -1872,7 +1814,6 @@ mod tests {
                 a_strip(channels.get(i).copied(), false)
             }),
             any_solo: false,
-            palette_open: None,
             typing: None,
             naming: None,
             fx_menu: None,
@@ -2291,57 +2232,11 @@ mod tests {
         );
     }
 
-    /// **A colour you cannot pick without moving the channel beside it.**
-    ///
-    /// The palette could be wider than the strip it belongs to and the
-    /// swatches would be easier to hit — but a press in the overhang falls
-    /// through to the NEIGHBOUR's fader, which is a colour picker that
-    /// sometimes changes a level. So every swatch stays inside its own
-    /// channel, and every one of them is reachable.
+    /// **The decibel readout is a target.** The thing the first version had
+    /// no room for, and now the difference between a fader you fight and one
+    /// you tell.
     #[test]
-    fn every_swatch_is_inside_its_own_channel_and_can_be_pressed() {
-        let mut v = a_view();
-        v.palette_open = Some(Column(0));
-        let r = rect();
-        let l = Layout::new(r, &v);
-        let panel = l.strips[0].panel;
-        let swatches = palette_over(&l.strips[0]);
-        assert_eq!(swatches.len(), STRIP_COLORS.len(), "a colour is unreachable");
-        for (i, sw) in swatches.iter().enumerate() {
-            assert!(
-                panel.contains(sw.min) && panel.contains(sw.max),
-                "swatch {i} hangs outside the channel it belongs to"
-            );
-            assert!(sw.is_positive(), "swatch {i} has no area");
-            assert_eq!(
-                hit_test(r, &v, sw.center()),
-                Some(Hit::Paint(Column(0), i)),
-                "swatch {i} cannot be pressed"
-            );
-            for (j, other) in swatches.iter().enumerate().take(i) {
-                assert!(
-                    !other.intersects(*sw),
-                    "swatches {j} and {i} overlap, so one of them wins twice"
-                );
-            }
-        }
-        // Hues down, tones across: the grid is what makes twenty-seven
-        // swatches pickable without reading every one of them.
-        assert_eq!(
-            (STRIP_COLORS.len() - PALETTE_COLUMNS) % PALETTE_COLUMNS,
-            0,
-            "the neutrals and the hues do not line up into rows"
-        );
-        // The master's default has to BE in the table it indexes.
-        assert!(MASTER_COLOR < STRIP_COLORS.len());
-    }
-
-    /// **The decibel readout is a target, and the palette swallows the strip.**
-    ///
-    /// Both are things the first version had no room for and both are now the
-    /// difference between a fader you fight and one you tell.
-    #[test]
-    fn a_number_can_be_typed_and_a_palette_covers_what_is_under_it() {
+    fn a_number_can_be_typed() {
         let v = a_view();
         let r = rect();
         let l = Layout::new(r, &v);
@@ -2350,26 +2245,13 @@ mod tests {
             Some(Hit::Db(Column(0))),
             "the number could not be clicked"
         );
-
-        // With a palette open, everything under it is a swatch or a dismissal
-        // — a swatch over a fader that also moved the fader would be a colour
-        // you cannot pick without changing a level.
-        let mut open = a_view();
-        open.palette_open = Some(Column(0));
-        let swatches = palette_over(&l.strips[0]);
-        assert_eq!(swatches.len(), STRIP_COLORS.len());
-        for (c, s) in swatches.iter().enumerate() {
-            assert_eq!(hit_test(r, &open, s.center()), Some(Hit::Paint(Column(0), c)));
-        }
-        // The fader is under it and cannot be reached.
-        assert!(matches!(
-            hit_test(r, &open, l.strips[0].fader.center()),
-            Some(Hit::Paint(Column(0), _))
-        ));
-        // And a strip that is NOT the open one is untouched.
+        // The swatch grid moved into the TRACK dialog; the master's default
+        // still has to BE in the table it indexes.
+        assert!(MASTER_COLOR < STRIP_COLORS.len());
         assert_eq!(
-            hit_test(r, &open, l.strips[1].fader.center()),
-            Some(Hit::Fader(Column(1)))
+            (STRIP_COLORS.len() - PALETTE_COLUMNS) % PALETTE_COLUMNS,
+            0,
+            "the neutrals and the hues do not line up into rows"
         );
     }
 

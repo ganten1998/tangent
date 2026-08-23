@@ -795,15 +795,17 @@ impl Layout {
             // the control that started this take, and the one that ends it.
             self.dot = icon(0);
             self.stop = icon(2);
-            self.capture = icon(5);
+            self.capture = icon(4);
         } else {
             self.record = icon(0);
             self.play = icon(1);
             self.stop = icon(2);
             self.pause = icon(3);
-            self.setup = icon(4);
-            self.capture = icon(5);
-            self.project = icon(6);
+            self.capture = icon(4);
+            self.project = icon(5);
+            // The cog LAST, by the owner's word: transport first, then the
+            // session, then the place you go to change how it all works.
+            self.setup = icon(6);
         }
     }
 
@@ -4301,6 +4303,31 @@ mod tests {
         }
     }
 
+    /// **AUDIO above TAKE**, the owner's order: the tier headings exist,
+    /// the audio row sits under its heading, and everything about the take
+    /// sits under the TAKE heading — below all of the audio tier.
+    #[test]
+    fn the_settings_tiers_read_audio_then_take() {
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
+        let anchor = Rect::from_min_size(Pos2::new(40.0, 300.0), Vec2::new(20.0, 20.0));
+        let l = SetupLayout::new(screen, anchor);
+        for (name, r) in [("AUDIO heading", l.audio_head), ("TAKE heading", l.take_head)] {
+            assert!(r.is_positive(), "{name} has no band");
+        }
+        assert!(
+            l.audio_head.bottom() <= l.audio.top(),
+            "the audio row is not under its heading"
+        );
+        assert!(
+            l.audio.bottom() <= l.take_head.top() && l.hear_input.bottom() <= l.take_head.top(),
+            "the AUDIO tier does not end before TAKE begins"
+        );
+        assert!(
+            l.take_head.bottom() <= l.name.top(),
+            "the take rows do not start under their heading"
+        );
+    }
+
     /// No two controls in the panel share a pixel.
     ///
     /// Seven rows where there were six: the row that was added is the row most
@@ -4698,14 +4725,18 @@ mod tests {
         assert_eq!(knob_reading(th, 0.5), "-15.0 dB");
         assert_eq!(knob_reading(th, 1.0), "-30.0 dB");
 
-        // The low-pass runs backwards - up is darker - and still reads right.
+        // The low-pass ascends like every dial now: the top of the travel
+        // is 20 kHz and OUT OF THE WAY.
         let lp = KnobUnit::Hertz {
-            low: 20_000.0,
-            high: 200.0,
+            low: 200.0,
+            high: 20_000.0,
         };
-        assert_eq!(knob_reading(lp, 0.0), "20 kHz");
-        assert_eq!(knob_reading(lp, 1.0), "200 Hz");
+        assert_eq!(knob_reading(lp, 1.0), "20 kHz");
+        assert_eq!(knob_reading(lp, 0.0), "200 Hz");
         assert_eq!(knob_reading(lp, 0.5), "2 kHz");
+        // And "20k" is how anybody writes the top of it.
+        assert_eq!(knob_typed(lp, "20k"), Some(1.0));
+        assert_eq!(knob_typed(lp, "200"), Some(0.0));
     }
 
     /// Typing into a filter is typing a frequency, and it lands there.
@@ -6018,7 +6049,7 @@ mod tests {
                                     KnobUnit::Percent,
                                     KnobUnit::Percent,
                                     KnobUnit::Hertz { low: 20.0, high: 1_200.0 },
-                                    KnobUnit::Hertz { low: 20_000.0, high: 200.0 },
+                                    KnobUnit::Hertz { low: 200.0, high: 20_000.0 },
                                     KnobUnit::Decibels { low: 0.0, high: -30.0 },
                                 ],
                                 // A knob mid-turn, so the sweep also covers a
@@ -6099,8 +6130,9 @@ mod tests {
 /// wants to be readable and out of the way, at about the weight of the boxes
 /// it was summoned from.
 const SETUP_W: (f32, f32, f32) = (0.24, 290.0, 430.0);
-/// Its height over its width.
-const SETUP_ASPECT: f32 = 0.80;
+/// Its height over its width. Grew with the section headers: the same
+/// seven rows of controls, plus the two bands that name their tiers.
+const SETUP_ASPECT: f32 = 0.94;
 /// Rows of controls under the title.
 ///
 /// **Seven: six about the take, and Setup.** The camera and the audio input
@@ -6114,6 +6146,8 @@ const SETUP_ASPECT: f32 = 0.80;
 /// — the one that exists because a silent 44.1-against-48 mismatch makes takes
 /// drift — became unreachable from anywhere in the app. It is back, as the last
 /// row, and it is the one row here that is not about a take.
+/// (Kept as the unit the row pitch is derived from; the two section
+/// headers take about half a row each on top of these.)
 const SETUP_ROWS: usize = 7;
 
 /// Every rectangle in the popup.
@@ -6140,6 +6174,9 @@ struct SetupLayout {
     hear_input: Rect,
     /// The way to Setup: the audio system, the devices, the rate, the buffer.
     audio: Rect,
+    /// The two tier headings: AUDIO above, TAKE below — the owner's order.
+    audio_head: Rect,
+    take_head: Rect,
 }
 
 impl SetupLayout {
@@ -6161,6 +6198,8 @@ impl SetupLayout {
         count_in_in_take: Rect::NOTHING,
         hear_input: Rect::NOTHING,
         audio: Rect::NOTHING,
+        audio_head: Rect::NOTHING,
+        take_head: Rect::NOTHING,
     };
 
     /// Hung off `anchor` — the cog — and pulled back onto `screen`.
@@ -6207,25 +6246,36 @@ impl SetupLayout {
             title.max,
         );
         let rows = Rect::from_min_max(Pos2::new(body.left(), title.bottom()), body.max);
-        // A real gap between rows: `Rect::contains` is inclusive at both edges,
-        // so two rows that merely touch share a line of pixels and every
-        // overlap test in this file fails there.
-        let row = |i: usize| {
-            let pitch = 1.0 / SETUP_ROWS as f32;
-            let top = i as f32 * pitch;
-            slice_v(rows, top + pitch * 0.10, top + pitch * 0.92)
+        // **Two tiers: AUDIO on top, TAKE below** — the owner's order. The
+        // same seven rows of controls, walked by a cursor now, with a
+        // half-height heading band opening each tier. A real gap between
+        // rows: `Rect::contains` is inclusive at both edges, so two rows that
+        // merely touch share a line of pixels and every overlap test in this
+        // file fails there.
+        const HEAD: f32 = 0.55;
+        let units = HEAD * 2.0 + SETUP_ROWS as f32;
+        let pitch = rows.height() / units;
+        let mut y = rows.top();
+        let mut band = |u: f32| {
+            let r = Rect::from_min_max(
+                Pos2::new(rows.left(), y + pitch * u * 0.10),
+                Pos2::new(rows.right(), y + pitch * u * 0.92),
+            );
+            y += pitch * u;
+            r
         };
-
-        let r0 = row(0);
-        let r1 = row(1);
+        let audio_head = band(HEAD);
+        let r6 = band(1.0);
+        let take_head = band(HEAD);
+        let r0 = band(1.0);
+        let r1 = band(1.0);
         let note = {
-            let r = row(2);
+            let r = band(1.0);
             Rect::from_center_size(r.center(), Vec2::new(r.width(), r.height() * 0.60))
         };
-        let r3 = row(3);
-        let r4 = row(4);
-        let r5 = row(5);
-        let r6 = row(6);
+        let r3 = band(1.0);
+        let r4 = band(1.0);
+        let r5 = band(1.0);
         Self {
             panel,
             title,
@@ -6260,12 +6310,14 @@ impl SetupLayout {
             click_in_take: slice_h(r4, 0.51, 1.00),
             count_in_in_take: slice_h(r5, 0.00, 0.49),
             hide_elapsed: slice_h(r5, 0.51, 1.00),
-            // **The last row is about the PATH rather than the take**: the
-            // audio system the sound comes through, and whether you hear it.
-            // The monitor tick lost its icon when the desk took the inputs,
-            // and this is the row that is about the same subject.
+            // **The AUDIO tier's one row**: the audio system the sound
+            // comes through, and whether you hear it. The monitor tick lost
+            // its icon when the desk took the inputs, and this is the row
+            // that is about the same subject.
             audio: slice_h(r6, 0.00, 0.60),
             hear_input: slice_h(r6, 0.63, 1.00),
+            audio_head,
+            take_head,
         }
     }
 
@@ -6852,15 +6904,43 @@ pub fn draw_setup(
     painter.rect_stroke(l.panel, 4.0, Stroke::new(1.0_f32, p.ink), StrokeKind::Inside);
 
     if l.title.is_positive() {
-        let size = fit_text(l.title, "TAKE SETTINGS", l.title.height() * 0.50);
+        let size = fit_text(l.title, "SETTINGS", l.title.height() * 0.50);
         if size >= MIN_TEXT {
             painter.text(
                 Pos2::new(l.title.left(), l.title.center().y),
                 Align2::LEFT_CENTER,
-                "TAKE SETTINGS",
+                "SETTINGS",
                 font(size),
                 p.ink,
             );
+        }
+    }
+    // The tier headings: a word and a hairline running out to the right,
+    // so AUDIO and TAKE read as sections rather than as two more rows.
+    for (band, word) in [(l.audio_head, "AUDIO"), (l.take_head, "TAKE")] {
+        if !band.is_positive() {
+            continue;
+        }
+        let size = fit_text(band, word, band.height() * 0.62);
+        if size >= MIN_TEXT {
+            painter.text(
+                Pos2::new(band.left(), band.center().y),
+                Align2::LEFT_CENTER,
+                word,
+                font(size),
+                p.faint,
+            );
+            let text_w = size * 0.62 * word.len() as f32;
+            let x0 = band.left() + text_w + 8.0;
+            if x0 < band.right() - 4.0 {
+                painter.line_segment(
+                    [
+                        Pos2::new(x0, band.center().y),
+                        Pos2::new(band.right(), band.center().y),
+                    ],
+                    Stroke::new(1.0_f32, p.faint.gamma_multiply(0.5)),
+                );
+            }
         }
     }
     draw_word_button(painter, l.close, &["DONE", "OK"], &p);

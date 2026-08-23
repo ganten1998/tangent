@@ -35,7 +35,7 @@ pub struct Rgb {
 /// the migration runs ONCE against a file written before the change, and after
 /// that the same value chosen deliberately is never touched again. A file with
 /// no stamp is version 0 — every file every previous build wrote.
-const SETTINGS_VERSION: u64 = 14;
+const SETTINGS_VERSION: u64 = 15;
 
 /// Where a desk channel written before the INPUT STRIPS ended up.
 ///
@@ -1156,7 +1156,7 @@ impl Default for Settings {
             delay_mix: 0.0,
             chorus_mix: 0.0,
             hpf_mix: 0.0,
-            lpf_mix: 0.0,
+            lpf_mix: 1.0,
             limiter_mix: 1.0,
             effect_params: Map::new(),
             dx7_cartridge: String::new(),
@@ -2096,6 +2096,13 @@ impl Settings {
             // And after the retire: the v13 shape is what the drum bus
             // moves into.
             migrate_add_drums(self, desk);
+        }
+        if was < 15 {
+            // **The low-pass dial turned round**, the limiter's story again:
+            // it used to be off at zero and darker upward; it reads in hertz
+            // ascending now, off at the top. The position flips so the sound
+            // a file describes does not change.
+            self.lpf_mix = (1.0 - self.lpf_mix).clamp(0.0, 1.0);
         }
         if was < 9 {
             // **The limiter's dial turned round.** It used to be off at zero
