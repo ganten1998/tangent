@@ -154,6 +154,10 @@ pub struct DeskSnap {
     pub muted: u32,
     pub soloed: u32,
     pub gains: Vec<f64>,
+    pub pans: Vec<f64>,
+    pub inputs: Vec<String>,
+    pub drums_gain: f64,
+    pub drums_pan: f64,
     pub metronome_gain: f64,
     pub master_gain: f64,
     pub fx_return: f64,
@@ -189,6 +193,13 @@ impl DeskSnap {
         m.insert("muted".into(), Value::Number(u64::from(self.muted).into()));
         m.insert("soloed".into(), Value::Number(u64::from(self.soloed).into()));
         m.insert("gains".into(), nums(&self.gains));
+        m.insert("pans".into(), nums(&self.pans));
+        m.insert(
+            "inputs".into(),
+            Value::Array(self.inputs.iter().map(|i| Value::String(i.clone())).collect()),
+        );
+        m.insert("drums_gain".into(), serde_json::json!(self.drums_gain));
+        m.insert("drums_pan".into(), serde_json::json!(self.drums_pan));
         m.insert("metronome_gain".into(), serde_json::json!(self.metronome_gain));
         m.insert("master_gain".into(), serde_json::json!(self.master_gain));
         m.insert("fx_return".into(), serde_json::json!(self.fx_return));
@@ -235,6 +246,10 @@ impl DeskSnap {
             muted: m.get("muted").and_then(Value::as_u64).unwrap_or(0) as u32,
             soloed: m.get("soloed").and_then(Value::as_u64).unwrap_or(0) as u32,
             gains: floats("gains"),
+            pans: floats("pans"),
+            inputs: strings("inputs"),
+            drums_gain: f("drums_gain", 1.0),
+            drums_pan: f("drums_pan", 0.0),
             metronome_gain: f("metronome_gain", 0.7),
             master_gain: f("master_gain", 1.0),
             fx_return: f("fx_return", 1.0),

@@ -3403,6 +3403,7 @@ impl DesktopApp {
         };
         let gains = self.app.gains();
         e.set_metronome_gain(gains.metronome);
+        e.set_drums(self.app.drums_gain(), self.app.drums_pan());
         e.set_master_gain(gains.master);
         // **The channel that had no fader before there was a mixer**, and the
         // routing that decides what reaches the effects bus. Pushed whole
@@ -3428,8 +3429,21 @@ impl DesktopApp {
         let mut next_pick = 0usize;
         let mut builtin: Option<usize> = None;
         let armed = self.app.armed_mask();
+        // **The desk's EXPLICIT input bindings, when any channel has one.**
+        // The strip's own menu names inputs now; the moment one channel
+        // does, the whole desk routes explicitly — bound channels take
+        // their named input, unbound audio channels take NOTHING. With no
+        // bindings anywhere the old ordinal walk stands, so nothing anyone
+        // set up before the menu existed changes under them.
+        let any_explicit = (0..ivory_ui::recorder::CHANNELS).any(|ch| {
+            self.app.channel_kind(ch) == Some(ivory_ui::recorder::ChannelKind::Audio)
+                && IvoryApp::parse_input_spec(self.app.channel_input_spec(ch))
+                    .is_some()
+        });
+        let mut explicit: Vec<ivory_record::audio::ChannelPick> = Vec::new();
         for ch in 0..ivory_ui::recorder::CHANNELS {
             e.set_channel_gain(ch, gains.channels[ch]);
+            e.set_channel_pan(ch, self.app.channel_pan(ch));
             match self.app.channel_kind(ch) {
                 Some(ivory_ui::recorder::ChannelKind::Midi) => {
                     // **Arm is the live switch.** An unarmed MIDI channel
@@ -3448,7 +3462,20 @@ impl DesktopApp {
                 }
                 Some(ivory_ui::recorder::ChannelKind::Audio) => {
                     midi_off |= 1 << ch;
-                    if next_pick < picks.len() {
+                    if any_explicit {
+                        if let Some((a, b)) = IvoryApp::parse_input_spec(
+                            self.app.channel_input_spec(ch),
+                        ) {
+                            if next_pick < picks.len() {
+                                picks[next_pick] = Some(ch);
+                                explicit.push(match b {
+                                    Some(b) => ivory_record::audio::ChannelPick::Stereo(a, b),
+                                    None => ivory_record::audio::ChannelPick::Mono(a),
+                                });
+                                next_pick += 1;
+                            }
+                        }
+                    } else if next_pick < picks.len() {
                         picks[next_pick] = Some(ch);
                         next_pick += 1;
                     }
@@ -3456,6 +3483,7 @@ impl DesktopApp {
                 None => midi_off |= 1 << ch,
             }
         }
+        crate::devices::set_channel_picks(&self.recorder.audio, explicit);
         e.set_midi_off(midi_off);
         e.set_armed(armed);
         e.set_pick_strips(picks);
@@ -3889,6 +3917,9 @@ impl DesktopApp {
         if me.app.take_desk_state_shift() {
             shift_insert_states_for_v13();
         }
+        if me.app.take_desk_state_shift_v14() {
+            shift_insert_states_for_v14();
+        }
         me
     }
 }
@@ -3911,6 +3942,19 @@ fn shift_insert_states_for_v13() {
             let from = insert_state_path(old, bay);
             if from.exists() {
                 let _ = std::fs::rename(&from, insert_state_path(old - 1, bay));
+            }
+        }
+    }
+}
+
+/// v13 -> v14: the drum bus took seat 8, so the click's, the bus's and the
+/// master's sidecars walk UP one — highest first, or the move eats itself.
+fn shift_insert_states_for_v14() {
+    for bay in 0..3 {
+        for old in (8..=10).rev() {
+            let from = insert_state_path(old, bay);
+            if from.exists() {
+                let _ = std::fs::rename(&from, insert_state_path(old + 1, bay));
             }
         }
     }

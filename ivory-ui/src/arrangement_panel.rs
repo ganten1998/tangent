@@ -50,6 +50,8 @@ pub struct LaneView<'a> {
     pub gain: f32,
     /// 0..=1, the strip's send — the second dial.
     pub send: f32,
+    /// -1..1, the strip's pan — the third.
+    pub pan: f32,
     pub peak: [f32; 2],
 }
 
@@ -136,6 +138,8 @@ pub enum Hit {
     Ruler(f64),
     /// The header's send dial — draggable and vertical, like the gain.
     Send(usize),
+    /// The header's pan dial — third of the set, every channel carries one.
+    Pan(usize),
     /// The toolbar: the click on and off.
     ToolMetronome,
     /// The toolbar: the magnet.
@@ -201,10 +205,12 @@ pub struct HeaderRow {
     pub name: Rect,
     pub knob: Rect,
     pub send: Rect,
+    pub pan: Rect,
     /// The readouts under the two dials: dB under the volume, % under the
     /// send. Text, not targets — the dials above them are the controls.
     pub knob_readout: Rect,
     pub send_readout: Rect,
+    pub pan_readout: Rect,
     pub meter: Rect,
     pub mute: Rect,
     pub solo: Rect,
@@ -220,6 +226,8 @@ impl HeaderRow {
         send: Rect::NOTHING,
         knob_readout: Rect::NOTHING,
         send_readout: Rect::NOTHING,
+        pan: Rect::NOTHING,
+        pan_readout: Rect::NOTHING,
         meter: Rect::NOTHING,
         mute: Rect::NOTHING,
         solo: Rect::NOTHING,
@@ -376,6 +384,12 @@ impl Layout {
             Pos2::new(send.left() - 4.0 - kd, dial_top),
             Vec2::splat(kd),
         );
+        // The PAN, third of the set — every representation of a channel
+        // carries one, the owner's rule.
+        let pan = Rect::from_min_size(
+            Pos2::new(knob.left() - 4.0 - kd, dial_top),
+            Vec2::splat(kd),
+        );
         let readout = |dial: Rect| {
             Rect::from_min_max(
                 Pos2::new(dial.left() - 1.0, dial.bottom() + 1.0),
@@ -384,7 +398,7 @@ impl Layout {
         };
         let name = Rect::from_min_max(
             Pos2::new(arm.right() + 4.0, r.top()),
-            Pos2::new(knob.left() - 6.0, r.bottom()),
+            Pos2::new(pan.left() - 6.0, r.bottom()),
         );
         HeaderRow {
             panel: row,
@@ -393,8 +407,10 @@ impl Layout {
             name,
             knob,
             send,
+            pan,
             knob_readout: readout(knob),
             send_readout: readout(send),
+            pan_readout: readout(pan),
             meter,
             mute,
             solo,
@@ -508,6 +524,7 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
             (row.solo, Hit::Solo(i)),
             (row.knob, Hit::Gain(i)),
             (row.send, Hit::Send(i)),
+            (row.pan, Hit::Pan(i)),
         ] {
             if r.is_positive() && r.contains(pos) {
                 return Some(hit);
@@ -1001,6 +1018,23 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             row.send_readout,
             format!("{:.0}%", f64::from(lane.send.clamp(0.0, 1.0)) * 100.0),
         );
+        dial(
+            painter,
+            row.pan,
+            (lane.pan.clamp(-1.0, 1.0) + 1.0) * 0.5,
+            Color32::from_rgb(0xB0, 0x62, 0xC8),
+        );
+        let pan_word = {
+            let v = (lane.pan.clamp(-1.0, 1.0) * 50.0).round() as i32;
+            if v == 0 {
+                "C".to_owned()
+            } else if v < 0 {
+                format!("L{}", -v)
+            } else {
+                format!("R{v}")
+            }
+        };
+        readout(painter, row.pan_readout, pan_word);
         // The meter: one slim bar, the loudest of the pair.
         if row.meter.is_positive() {
             painter.rect_filled(row.meter, 1.0, p.lane);
@@ -1200,6 +1234,7 @@ mod tests {
             soloed: false,
             gain: 1.0,
             send: 0.0,
+            pan: 0.0,
             peak: [0.0; 2],
         }
     }

@@ -68,6 +68,11 @@ pub struct Selection {
     /// the settled result of choosing None, and only the second one means "the
     /// camera has already been closed, do not close it again".
     pub settled: bool,
+    /// EXPLICIT per-channel picks, in desk-channel order — the owner's
+    /// input menu. When non-empty this REPLACES the wanted+extra pick
+    /// derivation entirely: the desk says which inputs open, the picker
+    /// only says which BOX.
+    pub channel_picks: Vec<ChannelPick>,
     /// Inputs the picker offers as rows of their own, as channel uids.
     ///
     /// **A set, not a choice, and that is the whole design.** An interface's
@@ -357,8 +362,15 @@ pub fn audio_selection(shared: &Shared) -> Option<AudioChoice> {
             // another device is not a second interface this app can open; it
             // is a leftover, and obeying it would open a channel number
             // against hardware that never had it.
-            let mut picks: Vec<ChannelPick> = channel.into_iter().collect();
-            if !picks.is_empty() {
+            let mut picks: Vec<ChannelPick> = if sel.channel_picks.is_empty() {
+                channel.into_iter().collect()
+            } else {
+                // The desk's own bindings, verbatim and in channel order —
+                // duplicates INCLUDED: two channels on input 1 are two
+                // strips of the same microphone, which is a real desk.
+                sel.channel_picks.clone()
+            };
+            if sel.channel_picks.is_empty() && !picks.is_empty() {
                 for uid in &sel.extra {
                     let (k, pick) = split_channel(uid);
                     if k != key {
@@ -684,6 +696,7 @@ pub fn set_extra_inputs(shared: &Shared, uids: Vec<String>) {
 pub fn selection(shared: &Shared) -> Selection {
     let sel = lock(shared);
     Selection {
+        channel_picks: Vec::new(),
         wanted: sel.wanted.clone(),
         extra: sel.extra.clone(),
         explicit: sel.explicit,
@@ -703,6 +716,17 @@ pub fn selection(shared: &Shared) -> Selection {
 /// because the reconciler only ever acts on a difference and `wanted` would
 /// start empty — so the app would silently fall back to the system default and
 /// look like it had forgotten the choice.
+/// The desk's explicit per-channel picks. A CHANGE marks the selection
+/// stale, so the stream reopens with the new channel set — the same edge
+/// a device change rides.
+pub fn set_channel_picks(shared: &Shared, picks: Vec<ChannelPick>) {
+    let mut sel = lock(shared);
+    if sel.channel_picks != picks {
+        sel.channel_picks = picks;
+        sel.settled = false;
+    }
+}
+
 pub fn restore(
     shared: &Shared,
     uid: Option<&str>,
@@ -737,10 +761,10 @@ fn seed_rows(key: &str, width: usize) -> Vec<String> {
     for c in 0..width.min(usize::from(u16::MAX)) as u16 {
         rows.push(channel_uid(key, ChannelPick::Mono(c)));
     }
-    let mut c = 0u16;
-    while usize::from(c) + 1 < width {
+    // EVERY adjacent pair, overlapping ones included — 2/3 is as real as
+    // 1/2, the owner's ruling, and the input menu lists exactly this set.
+    for c in 0..width.saturating_sub(1) as u16 {
         rows.push(channel_uid(key, ChannelPick::Stereo(c, c + 1)));
-        c += 2;
     }
     rows
 }
@@ -797,7 +821,7 @@ pub fn auto_expose(shared: &Shared, seeded: &[String]) -> Option<(String, Vec<St
     }
     // Enumeration outside the lock: it can block on a slow backend.
     let width = device_width(&key);
-    if width <= 2 {
+    if width < 2 {
         return None;
     }
     let rows = seed_rows(&key, width);
@@ -832,22 +856,18 @@ mod tests {
                 channel_label(p.expect("a seeded row names an input"))
             })
             .collect();
-        assert_eq!(labels, vec!["1", "2", "3", "4", "1/2", "3/4"]);
-        // An odd-width box: the last input has no partner and gets none.
-        let rows5 = seed_rows(key, 5);
-        let pairs: Vec<String> = rows5
-            .iter()
-            .filter_map(|u| split_channel(u).1)
-            .filter(|p| p.channels() == 2)
-            .map(channel_label)
-            .collect();
-        assert_eq!(pairs, vec!["1/2", "3/4"]);
+        // EVERY mono and EVERY adjacent pair, overlapping ones included —
+        // the input menu lists exactly this set.
+        assert_eq!(labels, vec!["1", "2", "3", "4", "1/2", "2/3", "3/4"]);
+        // A plain stereo box seeds too: two monos and the pair.
+        let rows2 = seed_rows(key, 2);
+        assert_eq!(rows2.len(), 3);
 
         // The merge keeps the other interface exactly as it was.
         let other = channel_uid("UMC404HD#0", ChannelPick::Mono(2));
         let merged = merge_exposed(&[other.clone()], key, rows);
         assert!(merged.contains(&other), "the seed ate another device's row");
-        assert_eq!(merged.len(), 7);
+        assert_eq!(merged.len(), 8);
     }
 
     /// **Every ticked input is a row of its own, and they coexist.**

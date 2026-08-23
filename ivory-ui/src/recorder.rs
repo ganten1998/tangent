@@ -412,6 +412,11 @@ pub enum Strip {
     /// job "an audio clip on any lane", so the column went back to being an
     /// ordinary channel. See `docs/ARRANGEMENT.md` and the v13 migration.
     Channel(usize),
+    /// **The DRUM BUS** — the drumpad's own channel, persistent, left of
+    /// the click. The pads sum through it: its fader, pan, mute/solo, send
+    /// and three bays govern the whole kit, and bus-wide effects go HERE,
+    /// not in the pad window.
+    Drums,
     Click,
     /// The return from the effects bus. It has no send of its own: a bus that
     /// could feed itself is a bus that howls.
@@ -487,7 +492,7 @@ pub const INSERTS: usize = 3;
 pub const INPUTS: usize = 4;
 
 /// How many channels the desk has, master aside.
-pub const STRIPS: usize = CHANNELS + 2;
+pub const STRIPS: usize = CHANNELS + 3;
 
 // ── The drumpad ─────────────────────────────────────────────────────────────
 
@@ -596,7 +601,7 @@ impl Column {
 /// Re-exported from `mixer_panel::COLUMNS` would be the other direction and
 /// this crate's panels do not depend on each other, so it is stated here and
 /// `a_column_and_a_strip_agree_about_the_desk` holds the two together.
-pub const COLUMNS_FOR_TEST: usize = CHANNELS + 2;
+pub const COLUMNS_FOR_TEST: usize = CHANNELS + 3;
 
 impl Strip {
     /// The channels the MIXER draws, in order: the eight, then the CLICK,
@@ -608,12 +613,12 @@ impl Strip {
     /// that could be soloed against its own sources is a desk with a feedback
     /// question in it. BACKING had a column here and is retired — the
     /// arrangement's lanes carry audio now.
-    pub fn shown() -> [Strip; CHANNELS + 1] {
+    pub fn shown() -> [Strip; CHANNELS + 2] {
         std::array::from_fn(|i| {
             if i < CHANNELS {
                 Strip::Channel(i)
             } else {
-                Strip::Click
+                [Strip::Drums, Strip::Click][i - CHANNELS]
             }
         })
     }
@@ -624,7 +629,7 @@ impl Strip {
             if i < CHANNELS {
                 Strip::Channel(i)
             } else {
-                [Strip::Click, Strip::Fx][i - CHANNELS]
+                [Strip::Drums, Strip::Click, Strip::Fx][i - CHANNELS]
             }
         })
     }
@@ -639,8 +644,9 @@ impl Strip {
     pub const fn index(self) -> usize {
         match self {
             Strip::Channel(i) => i,
-            Strip::Click => CHANNELS,
-            Strip::Fx => CHANNELS + 1,
+            Strip::Drums => CHANNELS,
+            Strip::Click => CHANNELS + 1,
+            Strip::Fx => CHANNELS + 2,
         }
     }
 
@@ -664,6 +670,7 @@ impl Strip {
             // Numbered because there are eight of them and "the channel is
             // muted" is not something anybody can act on.
             Strip::Channel(i) => format!("channel {}", i + 1),
+            Strip::Drums => "the drum bus".to_owned(),
             Strip::Click => "the click".to_owned(),
             Strip::Fx => "the effects bus".to_owned(),
         }
