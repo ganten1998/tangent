@@ -412,6 +412,7 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
         HelpView::Mixer => rows.extend([
             ("R-CLK", "channel: the track menu · loaded insert: delete / replace"),
             ("2-CLK", "rename a channel · reset a fader"),
+            ("S-ARM", "shift+arm: add a lane instead of switching to it"),
             ("C-T", "ctrl+T: a new track"),
             ("S-1", "shift+1: the theory view"),
             ("S-2", "shift+2: the arrangement"),
@@ -426,6 +427,7 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             ("A-DRG", "alt-drag empty room: move the viewport"),
             ("CA-WHL", "ctrl+alt: grid finer or coarser"),
             ("NAV", "corner box: drag left/right scrolls · up/down zooms"),
+            ("S-ARM", "shift+arm: add a lane instead of switching to it"),
             ("C-T", "ctrl+T: a new track"),
             ("S-1", "shift+1: the theory view"),
             ("S-3", "shift+3: the mixer"),

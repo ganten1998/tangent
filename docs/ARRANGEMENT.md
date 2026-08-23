@@ -587,6 +587,26 @@ channels play back their clips and nothing else. "Ready to play" and
   climbs above a drive root into a drives view. mp3 stays a feature
   the Windows leg goes without, honestly.
 
+- **4.64.0 — the Sonoma round: latency, one arm, and the drives**:
+  the 18.7 ms round trip against Live's 6.6 was two AudioUnits paying
+  three buffers where a duplex host pays two — and the un-picked
+  input opening at the DEVICE's default (512 on Sonoma, counted as
+  1024 by the ring's in-flight math). On macOS the input now runs at
+  a QUARTER of the chosen buffer (floor 64, clamped to what the
+  device admits): its callback only copies into a ring, so the small
+  block costs nothing and the monitor backlog shrinks with it —
+  ~9 ms at 256, and 128 lands under Live. Windows (WASAPI total-
+  buffer, ASIO single-setting) and ALSA keep symmetric buffers. ONE
+  ARM AT A TIME: arming one midi track recorded three — every lane
+  still armed from its birth or first bind rode into the take. A
+  plain press on an arm is EXCLUSIVE now (the pile stands down),
+  Shift+arm keeps the additive toggle for a deliberate multi-lane
+  take, and binding an input arms that lane alone; both help cards
+  say so. AND THE DRIVES: off Windows the roots view was one bare
+  "/" — external disks sat three levels down where nobody looks. The
+  roots view now lists every mount it can find (/Volumes, /media,
+  /run/media, /mnt), skipping the boot volume's own alias.
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index
