@@ -728,6 +728,84 @@ pub fn restore(
 }
 
 
+/// The rows a fresh multichannel interface should arrive wearing: every
+/// mono input, and the natural stereo pairs — 1/2, 3/4, onward. The
+/// overlapping pairs (2/3 and friends) stay a chooser affair: they are
+/// real patch bays, not defaults.
+fn seed_rows(key: &str, width: usize) -> Vec<String> {
+    let mut rows = Vec::new();
+    for c in 0..width.min(usize::from(u16::MAX)) as u16 {
+        rows.push(channel_uid(key, ChannelPick::Mono(c)));
+    }
+    let mut c = 0u16;
+    while usize::from(c) + 1 < width {
+        rows.push(channel_uid(key, ChannelPick::Stereo(c, c + 1)));
+        c += 2;
+    }
+    rows
+}
+
+/// How many inputs the device behind `key` has right now. Zero when it
+/// cannot be seen — a seed from a guess would be a seed to undo.
+fn device_width(key: &str) -> usize {
+    if let Some(node) = key.strip_prefix(PIPEWIRE_UID) {
+        return ivory_record::audio::pipewire_sources()
+            .into_iter()
+            .find(|s| s.node == node)
+            .and_then(|s| s.channels)
+            .unwrap_or(0) as usize;
+    }
+    let dk = ivory_record::audio::DeviceKey::from_setting(key);
+    ivory_record::audio::input_devices()
+        .ok()
+        .into_iter()
+        .flatten()
+        .find(|d| d.key == dk)
+        .and_then(|d| d.channels)
+        .unwrap_or(0) as usize
+}
+
+/// Replace `key`'s rows in `exposed` with `rows`, keeping every other
+/// device's exactly as it was. The merge `set_exposed` already does, as a
+/// function the seed and the tests can share.
+fn merge_exposed(exposed: &[String], key: &str, rows: Vec<String>) -> Vec<String> {
+    let mut all: Vec<String> = exposed
+        .iter()
+        .filter(|u| split_channel(u).0 != key)
+        .cloned()
+        .collect();
+    all.extend(rows);
+    all
+}
+
+/// **A multichannel interface arrives fully exposed.** The first time a
+/// device with more than two inputs is selected, every mono input and the
+/// natural stereo pairs are ticked for it, so the picker offers the whole
+/// box without a trip through the chooser. Answers `(device key, the full
+/// exposed list to persist)` when it seeded; `None` when there was nothing
+/// to do. `seeded` is the keys already seeded once — a device somebody has
+/// since pruned by hand must stay pruned, so the seed never runs twice.
+pub fn auto_expose(shared: &Shared, seeded: &[String]) -> Option<(String, Vec<String>)> {
+    let key = {
+        let sel = lock(shared);
+        let uid = sel.wanted.clone()?;
+        let (key, _) = split_channel(&uid);
+        key.to_owned()
+    };
+    if seeded.iter().any(|k| k == &key) {
+        return None;
+    }
+    // Enumeration outside the lock: it can block on a slow backend.
+    let width = device_width(&key);
+    if width <= 2 {
+        return None;
+    }
+    let rows = seed_rows(&key, width);
+    let mut sel = lock(shared);
+    sel.exposed = merge_exposed(&sel.exposed, &key, rows);
+    Some((key, sel.exposed.clone()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -738,6 +816,38 @@ mod tests {
             name: name.to_owned(),
             default: false,
         }
+    }
+
+    /// **A fresh multichannel box arrives fully ticked**: every mono, and
+    /// the natural pairs — never the overlapping ones — and seeding one
+    /// device leaves every other device's rows alone.
+    #[test]
+    fn a_multichannel_seed_ticks_every_mono_and_natural_pair() {
+        let key = "Scarlett 18i20#0";
+        let rows = seed_rows(key, 4);
+        let labels: Vec<String> = rows
+            .iter()
+            .map(|u| {
+                let (_, p) = split_channel(u);
+                channel_label(p.expect("a seeded row names an input"))
+            })
+            .collect();
+        assert_eq!(labels, vec!["1", "2", "3", "4", "1/2", "3/4"]);
+        // An odd-width box: the last input has no partner and gets none.
+        let rows5 = seed_rows(key, 5);
+        let pairs: Vec<String> = rows5
+            .iter()
+            .filter_map(|u| split_channel(u).1)
+            .filter(|p| p.channels() == 2)
+            .map(channel_label)
+            .collect();
+        assert_eq!(pairs, vec!["1/2", "3/4"]);
+
+        // The merge keeps the other interface exactly as it was.
+        let other = channel_uid("UMC404HD#0", ChannelPick::Mono(2));
+        let merged = merge_exposed(&[other.clone()], key, rows);
+        assert!(merged.contains(&other), "the seed ate another device's row");
+        assert_eq!(merged.len(), 7);
     }
 
     /// **Every ticked input is a row of its own, and they coexist.**

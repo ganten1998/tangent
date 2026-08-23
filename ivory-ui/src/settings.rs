@@ -678,6 +678,8 @@ pub struct Settings {
     /// — so these are stored verbatim and handed straight back at startup. See
     /// `ports::AudioSetup::set_exposed`.
     pub record_input_channels: Vec<String>,
+    /// Device keys the multichannel auto-expose has seeded, once each.
+    pub auto_exposed: Vec<String>,
     /// The inputs open BESIDE the first, as the host's own opaque uids.
     ///
     /// **Opaque here for the same reason `record_audio_device` is**: the
@@ -1072,6 +1074,7 @@ impl Default for Settings {
             record_camera_uid: None,
             record_audio_device: None,
             record_input_channels: Vec::new(),
+            auto_exposed: Vec::new(),
             record_extra_inputs: Vec::new(),
             record_input_off: false,
             record_count_in_beats: 4,
@@ -1684,6 +1687,13 @@ impl Settings {
         }
         if let Some(Value::Array(v)) = map.shift_remove("record_input_channels") {
             s.record_input_channels = v
+                .into_iter()
+                .filter_map(|x| x.as_str().map(str::to_owned))
+                .filter(|x| !x.trim().is_empty())
+                .collect();
+        }
+        if let Some(Value::Array(v)) = map.shift_remove("auto_exposed") {
+            s.auto_exposed = v
                 .into_iter()
                 .filter_map(|x| x.as_str().map(str::to_owned))
                 .filter(|x| !x.trim().is_empty())
@@ -2348,6 +2358,15 @@ impl Settings {
             "record_input_channels".into(),
             Value::Array(
                 self.record_input_channels
+                    .iter()
+                    .map(|u| Value::String(u.clone()))
+                    .collect(),
+            ),
+        );
+        map.insert(
+            "auto_exposed".into(),
+            Value::Array(
+                self.auto_exposed
                     .iter()
                     .map(|u| Value::String(u.clone()))
                     .collect(),

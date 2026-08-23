@@ -6177,6 +6177,22 @@ impl IvoryApp {
 
     /// The inputs of an interface the picker should offer as rows of their
     /// own, as the host's own opaque uids. Handed back verbatim at startup.
+    /// The devices the multichannel seed has already run for — once each,
+    /// so a hand-pruned setup stays pruned.
+    pub fn auto_exposed_devices(&self) -> &[String] {
+        &self.settings.auto_exposed
+    }
+
+    /// The host seeded a fresh multichannel interface: keep the exposed
+    /// list, and remember the device so the seed never runs again.
+    pub fn note_auto_exposed(&mut self, key: String, exposed: Vec<String>) {
+        self.settings.record_input_channels = exposed;
+        if !self.settings.auto_exposed.contains(&key) {
+            self.settings.auto_exposed.push(key);
+        }
+        self.save_settings();
+    }
+
     pub fn exposed_input_channels(&self) -> &[String] {
         &self.settings.record_input_channels
     }
