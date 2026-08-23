@@ -960,6 +960,11 @@ pub struct Settings {
     pub midi_snap: bool,
     pub midi_grid_exp: i64,
     pub midi_swing: bool,
+    /// Dark mode, PER VIEW — the arrange field and the editor each hold
+    /// their own, beside `dark_mode` (the theory surfaces'). D toggles
+    /// whichever view is open.
+    pub arr_dark: bool,
+    pub me_dark: bool,
     /// Where the swung off-beat sits, percent of its pair: 66.7 is the
     /// standard shuffle, 50 is straight. One decimal, the SWG menu's rule.
     pub midi_swing_pct: f64,
@@ -1078,10 +1083,11 @@ impl Default for Settings {
             // photograph is lit and the mean carries the lamp. The ivory ink is
             // chosen against it at better than 6:1, so the band is comfortable
             // and not merely legible. See `SUPERSEDED_RECORDER_BG`.
+            // 97, 55, 58 — the owner's wine, shipped and reset to.
             recorder_bg_color: Rgb {
-                r: 0x62,
-                g: 0x3A,
-                b: 0x38,
+                r: 97,
+                g: 55,
+                b: 58,
             },
             chord_text_color: Rgb {
                 r: 0xE8,
@@ -1239,6 +1245,10 @@ impl Default for Settings {
             midi_snap: true,
             midi_grid_exp: -4,
             midi_swing: false,
+            arr_dark: false,
+            // The editor SHIPPED dark — its warm browns are the dark face
+            // now, and its light face is the arrange view's greys.
+            me_dark: true,
             midi_swing_pct: 66.7,
             midi_triplet: false,
             transpose: 0,
@@ -1916,10 +1926,23 @@ impl Settings {
                 }
             }
         }
-        if let Some(Value::Array(items)) = map.shift_remove("channel_icons") {
-            for (icon, item) in s.channel_icons.iter_mut().zip(items) {
-                if let Some(v) = item.as_u64() {
-                    *icon = v.min(3) as u8;
+        match map.shift_remove("channel_icons") {
+            Some(Value::Array(items)) => {
+                for (icon, item) in s.channel_icons.iter_mut().zip(items) {
+                    if let Some(v) = item.as_u64() {
+                        *icon = v.min(3) as u8;
+                    }
+                }
+            }
+            _ => {
+                // A file from before the badges: DERIVE them rather than
+                // defaulting a drum onto whatever the user made of track 8.
+                for i in 0..crate::recorder::CHANNELS {
+                    s.channel_icons[i] = u8::from(
+                        s.strip_inserts
+                            .get(i * crate::recorder::INSERTS)
+                            .is_some_and(|p| p == crate::dialogs::DRUMPAD_PATH),
+                    );
                 }
             }
         }
@@ -2011,6 +2034,8 @@ impl Settings {
             s.midi_grid_exp = n.clamp(-6, 3);
         }
         take_bool(&mut map, "midi_swing", &mut s.midi_swing);
+        take_bool(&mut map, "arr_dark", &mut s.arr_dark);
+        take_bool(&mut map, "me_dark", &mut s.me_dark);
         if let Some(Value::Number(n)) = map.shift_remove("midi_swing_pct") {
             if let Some(f) = n.as_f64() {
                 s.midi_swing_pct = (f.clamp(50.0, 95.0) * 10.0).round() / 10.0;
@@ -2716,6 +2741,8 @@ impl Settings {
         map.insert("midi_snap".into(), Value::Bool(self.midi_snap));
         map.insert("midi_grid_exp".into(), Value::from(self.midi_grid_exp));
         map.insert("midi_swing".into(), Value::Bool(self.midi_swing));
+        map.insert("arr_dark".into(), Value::Bool(self.arr_dark));
+        map.insert("me_dark".into(), Value::Bool(self.me_dark));
         map.insert(
             "midi_swing_pct".into(),
             serde_json::Number::from_f64((self.midi_swing_pct * 10.0).round() / 10.0)

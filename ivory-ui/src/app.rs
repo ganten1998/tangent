@@ -400,6 +400,21 @@ pub struct IvoryApp {
     arr_multi: Vec<u64>,
     /// A selection band in flight, both corners in screen space.
     arr_band: Option<(egui::Pos2, egui::Pos2)>,
+    /// A GROUP move's snapshot: `(id, start_s, lane)` for every selected
+    /// clip when a member was grabbed — the whole set rides the drag.
+    arr_move_orig: Vec<(u64, f64, usize)>,
+    /// The meters' held picture: rise instant, fall exponential — the
+    /// engine hands raw per-frame maxima, and raw maxima flicker.
+    meter_hold: [[f32; 2]; crate::recorder::STRIPS],
+    /// The UNDO history: whole document states (clips + desk baked in),
+    /// shared by the editor, the arrangement and the mixer — one line of
+    /// time, whichever surface wrote it. `hist_at` is where NOW stands.
+    history: Vec<String>,
+    hist_at: usize,
+    /// The NOTE clipboard: times relative to the earliest copied note.
+    note_clipboard: Vec<crate::arrangement::ArrNote>,
+    /// The CLIP clipboard: starts relative to the earliest copied clip.
+    clip_clipboard: Vec<crate::arrangement::ArrClip>,
     /// The gesture in flight on the arrangement, if any.
     arr_drag: Option<ArrDrag>,
     /// A clip edit happened during the current gesture: save on release.
@@ -767,7 +782,7 @@ struct MidiEdit {
     /// A piano-column key held down, sounding through the audition.
     down_key: Option<u8>,
     /// The pitch a move is previewing, so the ear follows the drag.
-    preview_key: Option<u8>,
+    preview_keys: Vec<u8>,
     /// The velocity new notes are born with — the last one anybody set.
     last_vel: u8,
     /// A marquee in flight, both corners in screen space.
@@ -978,8 +993,8 @@ fn swing_menu_row(menu: egui::Rect, i: usize) -> egui::Rect {
 }
 
 /// One row of the pad menu is this tall; the wave strip is taller.
-const PAD_MENU_W: f32 = 216.0;
-const PAD_MENU_WAVE_H: f32 = 46.0;
+const PAD_MENU_W: f32 = 340.0;
+const PAD_MENU_WAVE_H: f32 = 96.0;
 const PAD_MENU_ROW_H: f32 = 22.0;
 
 /// Where the pad's context menu stands: beside its pad, held inside the
@@ -1271,6 +1286,12 @@ impl IvoryApp {
             desk_state_perm: None,
             arr_multi: Vec::new(),
             arr_band: None,
+            arr_move_orig: Vec::new(),
+            meter_hold: [[0.0; 2]; crate::recorder::STRIPS],
+            history: Vec::new(),
+            hist_at: 0,
+            note_clipboard: Vec::new(),
+            clip_clipboard: Vec::new(),
             arr_drag: None,
             arr_gesture_dirty: false,
             arr_pending: None,
@@ -2055,6 +2076,7 @@ impl IvoryApp {
                     recorder::gain_to_fader(gain),
                 );
             }
+            self.undo_commit();
             return;
         }
         self.mixer_typing = Some((at, buf));
@@ -2105,6 +2127,7 @@ impl IvoryApp {
         }
         if commit {
             self.commit_mixer_name(at, buf);
+            self.undo_commit();
             return;
         }
         self.mixer_naming = Some((at, buf));
@@ -2710,7 +2733,7 @@ impl IvoryApp {
         use crate::recorder::Strip;
         let g = self.settings.knobs().gains;
         let desk = self.desk();
-        let peaks = self.recorder.strip_peaks;
+        let peaks = self.meter_hold;
         // **The inputs that are open, and one spare to add to.** Four empty
         // microphone columns is not a rack with room in it, it is a desk that
         // is mostly plus signs. The first is always drawn — it is the band's
@@ -4282,6 +4305,7 @@ impl IvoryApp {
         self.save_settings();
         self.clips_dirty = true;
         self.load_drumpad_doc();
+        self.undo_reset();
     }
 
     /// The open document's path, for the host to resolve clip paths against.
@@ -4354,8 +4378,10 @@ impl IvoryApp {
         };
         self.arrangement
             .add_clip(clip_at(&rel, lane.min(crate::recorder::CHANNELS - 1), start_s.max(0.0)));
-        self.arrangement.save_to(&doc);
-        self.clips_dirty = true;
+        // Through the one save that also makes this a MOMENT undo can
+        // reach; the desk rides along as everywhere else.
+        let _ = doc;
+        self.arr_save_edits();
         Ok(())
     }
 
@@ -4398,8 +4424,8 @@ impl IvoryApp {
             name,
             id: 0,
         });
-        self.arrangement.save_to(&doc);
-        self.clips_dirty = true;
+        let _ = doc;
+        self.arr_save_edits();
         Ok(())
     }
 
@@ -4677,8 +4703,19 @@ impl IvoryApp {
             }
             d
         };
-        for (i, ic) in d.icons.iter().take(crate::recorder::CHANNELS).enumerate() {
-            self.settings.channel_icons[i] = (*ic).min(3);
+        if d.icons.is_empty() {
+            // A document from before the badges: derive them — the drum
+            // where the drumpad stands, auto everywhere else — instead of
+            // leaving the LAST project's badges on this one's tracks.
+            for i in 0..crate::recorder::CHANNELS {
+                let bay0 = d.inserts.get(i * crate::recorder::INSERTS);
+                self.settings.channel_icons[i] =
+                    u8::from(bay0.is_some_and(|p| p == dialogs::DRUMPAD_PATH));
+            }
+        } else {
+            for (i, ic) in d.icons.iter().take(crate::recorder::CHANNELS).enumerate() {
+                self.settings.channel_icons[i] = (*ic).min(3);
+            }
         }
         for (i, k) in d.kinds.iter().take(crate::recorder::CHANNELS).enumerate() {
             self.settings.channel_kinds[i] = (*k).min(2);
@@ -5084,6 +5121,7 @@ impl IvoryApp {
             self.armed |= 1 << ch;
         }
         self.save_settings();
+        self.undo_commit();
     }
 
     /// "3" or "1+2", zero-based, into the pick it names. The one parser.
@@ -5126,8 +5164,11 @@ impl IvoryApp {
         if from >= CHANNELS || to >= CHANNELS || from == to {
             return;
         }
-        // Not under a live take: the host's recording lanes are indices.
-        if self.recorder.state.is_active() {
+        // Not under a live take OR an arrangement record: the host's
+        // recording lanes are indices, and a reorder mid-take would carve
+        // the wrong lane. `state.is_active` is the CAPTURE machine alone —
+        // the red button's arrangement record is its own flag.
+        if self.recorder.state.is_active() || self.recorder.arr_recording {
             return;
         }
         // `order[new] = old` — a rotation of the span between.
@@ -5366,6 +5407,7 @@ impl IvoryApp {
         // The kit rides the project: whatever drumpad this directory
         // carries replaces the one in memory.
         self.load_drumpad_doc();
+        self.undo_reset();
     }
 
     /// Copy the WHOLE project — document and `media/` — to `target` and
@@ -5411,6 +5453,7 @@ impl IvoryApp {
         // the paths the host resolves against moved with the document.
         self.clips_dirty = true;
         self.drumpad_dirty = true;
+        self.undo_reset();
     }
 
     /// The save panel the app is waiting on, if any. Same drain-once pattern
@@ -5650,6 +5693,63 @@ impl IvoryApp {
     /// pointer's distance from its start at the press.
     fn arr_move(&mut self, id: u64, t_at: f64, dt: f64, lane_at: Option<usize>) {
         let to = self.arr_snap_t(t_at - dt);
+        // A GROUP under the hand: every snapshotted clip moves by the
+        // grabbed one's deltas — time always, lane relatively, each clip
+        // clamped and kind-checked on its own.
+        if self.arr_move_orig.len() > 1 {
+            let Some(&(_, g_start, g_lane)) = self
+                .arr_move_orig
+                .iter()
+                .find(|(cid, ..)| *cid == id)
+            else {
+                return;
+            };
+            let mut dt_all = to - g_start;
+            for &(_, start, _) in &self.arr_move_orig {
+                dt_all = dt_all.max(-start);
+            }
+            let lane_d = lane_at.map_or(0, |l| {
+                l.min(crate::recorder::CHANNELS - 1) as i64 - g_lane as i64
+            });
+            let orig = std::mem::take(&mut self.arr_move_orig);
+            let mut dirty = false;
+            for &(cid, start, lane0) in &orig {
+                let kind = self
+                    .arrangement
+                    .clips
+                    .iter()
+                    .find(|c| c.id == cid)
+                    .map(|c| c.kind);
+                let lane_to = (lane0 as i64 + lane_d)
+                    .clamp(0, crate::recorder::CHANNELS as i64 - 1)
+                    as usize;
+                let lane_ok = match kind {
+                    Some(crate::arrangement::ClipKind::Midi) => {
+                        self.channel_kind(lane_to) != Some(recorder::ChannelKind::Audio)
+                    }
+                    Some(crate::arrangement::ClipKind::Audio) => {
+                        self.channel_kind(lane_to) != Some(recorder::ChannelKind::Midi)
+                    }
+                    None => false,
+                };
+                if let Some(c) = self.arrangement.clips.iter_mut().find(|c| c.id == cid) {
+                    let ns = (start + dt_all).max(0.0);
+                    if (c.start_s - ns).abs() > 1e-9 {
+                        c.start_s = ns;
+                        dirty = true;
+                    }
+                    if lane_ok && c.lane != lane_to {
+                        c.lane = lane_to;
+                        dirty = true;
+                    }
+                }
+            }
+            self.arr_move_orig = orig;
+            if dirty {
+                self.arr_gesture_dirty = true;
+            }
+            return;
+        }
         // The lane rules mirror the imports': MIDI never lands on an AUDIO
         // channel, audio never on a MIDI one, and an unused lane takes
         // either — it becomes a clip lane, as a drop would make it.
@@ -5762,6 +5862,103 @@ impl IvoryApp {
             self.arrangement.save_to(&doc);
         }
         self.clips_dirty = true;
+        self.undo_commit();
+    }
+
+    /// The document as UNDO stores it: clips with the desk baked in — one
+    /// string, one moment.
+    fn undo_state(&self) -> String {
+        let mut arr = self.arrangement.clone();
+        arr.desk = Some(self.desk_snapshot());
+        arr.to_json()
+    }
+
+    /// A moment worth keeping: pushed unless it IS the standing moment.
+    /// Anything ahead of NOW (the redo tail) dies — the timeline forked.
+    fn undo_commit(&mut self) {
+        let state = self.undo_state();
+        if self
+            .history
+            .get(self.hist_at)
+            .is_some_and(|top| *top == state)
+        {
+            return;
+        }
+        self.history.truncate(self.hist_at.saturating_add(1));
+        self.history.push(state);
+        // A hundred moments is minutes of work; older ones age out.
+        const CAP: usize = 100;
+        if self.history.len() > CAP {
+            let overflow = self.history.len() - CAP;
+            self.history.drain(..overflow);
+        }
+        self.hist_at = self.history.len() - 1;
+    }
+
+    /// A fresh project starts a fresh line of time.
+    fn undo_reset(&mut self) {
+        self.history.clear();
+        self.hist_at = 0;
+        self.undo_commit();
+    }
+
+    /// Stand at `at`: the document and the desk become that moment.
+    fn undo_apply(&mut self, at: usize) {
+        let Some(json) = self.history.get(at).cloned() else {
+            return;
+        };
+        self.hist_at = at;
+        let arr = crate::arrangement::Arrangement::from_json(&json);
+        if let Some(desk) = arr.desk.clone() {
+            self.apply_desk_snapshot(&desk);
+        }
+        self.arrangement = arr;
+        if let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) {
+            self.arrangement.save_to(&doc);
+        }
+        self.clips_dirty = true;
+        // Everything that NAMES what may no longer exist stands down.
+        self.arr_selected = None;
+        self.arr_multi.clear();
+        self.arr_drag = None;
+        self.arr_move_orig.clear();
+        self.arr_band = None;
+        if let Some(st) = self.midi_edit.as_mut() {
+            st.selected.clear();
+            st.drag = None;
+            st.marquee = None;
+        }
+        if self
+            .midi_edit
+            .as_ref()
+            .is_some_and(|st| !self.arrangement.clips.iter().any(|c| c.id == st.id))
+        {
+            self.close_midi_editor();
+        }
+    }
+
+    /// UNDO: commit whatever stands (so redo can return to it), then step
+    /// back one moment. Refused mid-take — the recorder owns those frames.
+    fn undo(&mut self) {
+        if self.recorder.state.is_active() || self.recorder.arr_recording {
+            return;
+        }
+        self.undo_commit();
+        if self.hist_at == 0 {
+            return;
+        }
+        self.undo_apply(self.hist_at - 1);
+    }
+
+    /// REDO: forward along the same line, while there is one.
+    fn redo(&mut self) {
+        if self.recorder.state.is_active() || self.recorder.arr_recording {
+            return;
+        }
+        if self.hist_at + 1 >= self.history.len() {
+            return;
+        }
+        self.undo_apply(self.hist_at + 1);
     }
 
     /// Write the document down with the desk in it — the quit path's save,
@@ -5776,6 +5973,51 @@ impl IvoryApp {
 
     /// The Delete key: the SELECTED clip leaves the timeline. The media copy
     /// stays in the project, the way the × keeps material.
+    /// COPY the selected clips — the band's set and the single selection
+    /// both — starts rebased to the earliest, notes and paths intact.
+    fn arr_copy(&mut self) {
+        let mut ids = self.arr_multi.clone();
+        if let Some(id) = self.arr_selected {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        let mut clips: Vec<crate::arrangement::ArrClip> = self
+            .arrangement
+            .clips
+            .iter()
+            .filter(|c| ids.contains(&c.id))
+            .cloned()
+            .collect();
+        if clips.is_empty() {
+            return;
+        }
+        let t0 = clips.iter().map(|c| c.start_s).fold(f64::MAX, f64::min);
+        for c in &mut clips {
+            c.start_s -= t0;
+        }
+        self.clip_clipboard = clips;
+    }
+
+    /// PASTE at the playhead, snapped — each clip lands on its own lane,
+    /// fresh ids, the new set selected.
+    fn arr_paste(&mut self) {
+        if self.clip_clipboard.is_empty() {
+            return;
+        }
+        let at = self.arr_snap_t(self.recorder.position_s.max(0.0));
+        let pasted = self.clip_clipboard.clone();
+        let mut fresh = Vec::new();
+        for mut c in pasted {
+            c.start_s += at;
+            c.id = 0;
+            fresh.push(self.arrangement.add_clip(c));
+        }
+        self.arr_multi = fresh;
+        self.arr_selected = None;
+        self.arr_save_edits();
+    }
+
     fn arr_delete_selected(&mut self) {
         let mut doomed = std::mem::take(&mut self.arr_multi);
         if let Some(id) = self.arr_selected.take() {
@@ -5949,14 +6191,11 @@ impl IvoryApp {
             vel,
         });
         let i = clip.notes.len() - 1;
-        self.request_recorder(recorder::RecorderRequest::Audition {
-            notes: vec![key.min(127)],
-            on: true,
-        });
+        self.me_audition(vec![key.min(127)], true);
         if let Some(st) = self.midi_edit.as_mut() {
             st.selected = vec![i];
             st.drag = Some(MeDrag::Create { i });
-            st.preview_key = Some(key.min(127));
+            st.preview_keys = vec![key.min(127)];
             st.dirty = true;
         }
     }
@@ -6006,22 +6245,27 @@ impl IvoryApp {
             }
         }
         if moved {
-            // The ear follows the grabbed note's pitch as it moves.
-            let new_key = (i32::from(g_k0) + dk_all).clamp(0, 127) as u8;
-            let old = self.midi_edit.as_ref().and_then(|m| m.preview_key);
-            if old != Some(new_key) {
-                if let Some(k) = old {
-                    self.request_recorder(recorder::RecorderRequest::Audition {
-                        notes: vec![k],
-                        on: false,
-                    });
+            // **The ear follows EVERY note in the hand** — a transposed
+            // chord retriggers whole, the owner's rule, not just the note
+            // under the pointer.
+            let mut fresh: Vec<u8> = orig
+                .iter()
+                .map(|&(_, _, k0)| (i32::from(k0) + dk_all).clamp(0, 127) as u8)
+                .collect();
+            fresh.sort_unstable();
+            fresh.dedup();
+            let old = self
+                .midi_edit
+                .as_ref()
+                .map(|m| m.preview_keys.clone())
+                .unwrap_or_default();
+            if old != fresh {
+                if !old.is_empty() {
+                    self.me_audition(old, false);
                 }
-                self.request_recorder(recorder::RecorderRequest::Audition {
-                    notes: vec![new_key],
-                    on: true,
-                });
+                self.me_audition(fresh.clone(), true);
                 if let Some(st) = self.midi_edit.as_mut() {
-                    st.preview_key = Some(new_key);
+                    st.preview_keys = fresh;
                 }
             }
             if let Some(st) = self.midi_edit.as_mut() {
@@ -6224,6 +6468,83 @@ impl IvoryApp {
         self.arr_save_edits();
     }
 
+    /// COPY the selection: notes leave with their times rebased to the
+    /// earliest, so the paste's anchor is the phrase's own downbeat.
+    fn me_copy(&mut self) {
+        let Some(st) = self.midi_edit.as_ref() else {
+            return;
+        };
+        let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == st.id) else {
+            return;
+        };
+        let mut notes: Vec<crate::arrangement::ArrNote> = st
+            .selected
+            .iter()
+            .filter_map(|&i| clip.notes.get(i).cloned())
+            .collect();
+        if notes.is_empty() {
+            return;
+        }
+        let t0 = notes.iter().map(|n| n.at_s).fold(f64::MAX, f64::min);
+        for n in &mut notes {
+            n.at_s -= t0;
+        }
+        notes.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
+        self.note_clipboard = notes;
+    }
+
+    /// PASTE at the playhead when it stands inside the clip, else at the
+    /// clip's head — snapped to the grid's own floor, pitches kept, the
+    /// fresh notes selected so the next gesture works on them.
+    fn me_paste(&mut self) {
+        if self.note_clipboard.is_empty() {
+            return;
+        }
+        let Some(st) = self.midi_edit.as_ref() else {
+            return;
+        };
+        let id = st.id;
+        let play = self.recorder.position_s;
+        let (anchor_abs, c0, c1, offset) = {
+            let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == id) else {
+                return;
+            };
+            let inside = play >= clip.start_s && play < clip.start_s + clip.len_s;
+            let raw = if inside { play } else { clip.start_s };
+            (
+                self.me_snap_floor(raw),
+                clip.start_s,
+                clip.start_s + clip.len_s,
+                clip.offset_s,
+            )
+        };
+        let pasted = self.note_clipboard.clone();
+        let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
+            return;
+        };
+        let first = clip.notes.len();
+        for n in &pasted {
+            let abs = anchor_abs + n.at_s;
+            if abs < c0 - 1.0e-9 || abs >= c1 - 1.0e-9 {
+                continue;
+            }
+            clip.notes.push(crate::arrangement::ArrNote {
+                at_s: offset + (abs - c0),
+                dur_s: n.dur_s.min(c1 - abs).max(0.02),
+                key: n.key,
+                vel: n.vel,
+            });
+        }
+        let count = clip.notes.len() - first;
+        if count == 0 {
+            return;
+        }
+        if let Some(st) = self.midi_edit.as_mut() {
+            st.selected = (first..first + count).collect();
+        }
+        self.arr_save_edits();
+    }
+
     /// NUDGE the selection a grid step along, or a semitone up or down.
     fn me_nudge(&mut self, steps_t: f64, dk: i32) {
         let Some(st) = self.midi_edit.as_ref() else {
@@ -6409,6 +6730,15 @@ impl IvoryApp {
             sig_top: u32::from(sig.beats),
             sig_bottom: u32::from(sig.unit),
             playhead_s: self.recorder.position_s,
+            dark: self.settings.me_dark,
+            pad_names: {
+                let drum_lane = (0..crate::recorder::CHANNELS).find(|n| {
+                    self.insert(*n, 0) == Some(dialogs::DRUMPAD_PATH)
+                });
+                (Some(clip.lane) == drum_lane).then(|| {
+                    std::array::from_fn(|i| self.pad_label(i))
+                })
+            },
             color: self.strip_color(clip.lane),
         }
     }
@@ -6439,7 +6769,7 @@ impl IvoryApp {
             drag: None,
             dirty: false,
             down_key: None,
-            preview_key: None,
+            preview_keys: Vec::new(),
             last_vel: 100,
             marquee: None,
         });
@@ -6657,6 +6987,17 @@ impl IvoryApp {
         }
     }
 
+    /// A pad's short name: the sample's file stem, or nothing.
+    fn pad_label(&self, pad: usize) -> &str {
+        let path = self
+            .drumpad
+            .pads
+            .get(pad)
+            .map_or("", |p| p.path.as_str());
+        let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+        name.rfind('.').map_or(name, |dot| &name[..dot])
+    }
+
     /// Move one knob. The engine reads the document whole every frame
     /// through [`IvoryApp::drum_kit_params`], so there is nothing to push;
     /// the sidecar saves when the gesture ENDS, not sixty times through it.
@@ -6680,8 +7021,16 @@ impl IvoryApp {
         if !self.drumpad_open {
             return;
         }
-        // Esc closes from anywhere; the rest wants the pointer on the panel.
+        // Esc peels ONE layer: the typed field, then the pad menu, then
+        // the panel itself.
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if self.drumpad_num.take().is_some() {
+                return;
+            }
+            if self.pad_menu.take().is_some() {
+                self.pad_trim_drag = None;
+                return;
+            }
             self.close_drumpad();
             return;
         }
@@ -7001,6 +7350,16 @@ impl IvoryApp {
                     if !self.drumpad.pads[i].path.is_empty() {
                         self.drumpad_sel = i;
                         self.pad_menu = Some(i);
+                        // The strike and the carry a held press left in
+                        // flight both end here — the menu is modal, and a
+                        // release it swallows must not fire them later.
+                        self.pad_carry = None;
+                        if let Some(pad) = self.drumpad_down.take() {
+                            self.request_recorder(recorder::RecorderRequest::PadHit {
+                                pad: pad as u8,
+                                on: false,
+                            });
+                        }
                     }
                 }
                 _ => {}
@@ -7389,15 +7748,46 @@ impl IvoryApp {
         );
     }
 
+    /// The editor's EAR: on the DRUM LANE the keys are PADS, and every
+    /// audition strikes the kit — one that reached the DX7 while editing
+    /// drums was the owner's bug. Everywhere else, the ordinary audition.
+    fn me_audition(&mut self, notes: Vec<u8>, on: bool) {
+        let drum_lane = (0..crate::recorder::CHANNELS)
+            .find(|n| self.insert(*n, 0) == Some(dialogs::DRUMPAD_PATH));
+        let lane = self
+            .midi_edit
+            .as_ref()
+            .and_then(|st| self.arrangement.clips.iter().find(|c| c.id == st.id))
+            .map(|c| c.lane);
+        if lane.is_some() && lane == drum_lane {
+            for k in notes {
+                let pad = k.wrapping_sub(crate::recorder::DRUM_PAD_BASE);
+                if k >= crate::recorder::DRUM_PAD_BASE
+                    && usize::from(pad) < crate::recorder::DRUM_PADS
+                {
+                    self.request_recorder(recorder::RecorderRequest::PadHit {
+                        pad,
+                        on,
+                    });
+                }
+            }
+        } else {
+            self.request_recorder(recorder::RecorderRequest::Audition { notes, on });
+        }
+    }
+
     fn close_midi_editor(&mut self) {
         self.swing_menu = None;
-        if let Some(st) = self.midi_edit.take() {
+        if let Some(st) = self.midi_edit.as_ref() {
+            let mut quiet = st.preview_keys.clone();
             if let Some(key) = st.down_key {
-                self.request_recorder(recorder::RecorderRequest::Audition {
-                    notes: vec![key],
-                    on: false,
-                });
+                quiet.push(key);
             }
+            if !quiet.is_empty() {
+                self.me_audition(quiet, false);
+            }
+        }
+        if let Some(st) = self.midi_edit.take() {
             if st.dirty {
                 self.arr_save_edits();
             }
@@ -7441,7 +7831,10 @@ impl IvoryApp {
         // A drag that STARTED on the roll keeps its pointer across the
         // drumpad; only fresh presses stand down.
         if self.drumpad_claims_pointer(ctx)
-            && self.midi_edit.as_ref().is_none_or(|st| st.drag.is_none())
+            && self
+                .midi_edit
+                .as_ref()
+                .is_none_or(|st| st.drag.is_none() && st.down_key.is_none())
         {
             return;
         }
@@ -7496,7 +7889,8 @@ impl IvoryApp {
             && self.menu_state.is_none()
             && !self.name_focused
             && self.num_edit.is_none()
-            && self.swing_menu.is_none();
+            && self.swing_menu.is_none()
+            && self.drumpad_num.is_none();
         if keys_ok && over {
             if ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::O)) {
                 self.settings.midi_swing = !self.settings.midi_swing;
@@ -7519,6 +7913,14 @@ impl IvoryApp {
             }
             if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::D)) {
                 self.me_duplicate();
+            }
+            // The system's own chord: Cmd here, Ctrl on the other desks —
+            // egui's `command` is that abstraction.
+            if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::C)) {
+                self.me_copy();
+            }
+            if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::V)) {
+                self.me_paste();
             }
             if ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::ArrowLeft)) {
                 self.me_nudge(-1.0, 0);
@@ -7598,8 +8000,18 @@ impl IvoryApp {
         }
 
         // ── presses ──────────────────────────────────────────────────────
-        if (pressed || secondary) && !over && pointer.is_some() {
+        // A press on the BAND is the band's own — the transport, the LCD's
+        // draggable timecode, the knobs — and must neither close the editor
+        // nor be swallowed by it. Only a press on the world below dismisses.
+        let on_band = pointer.is_some_and(|p| {
+            self.last_band.is_positive() && self.last_band.contains(p)
+        });
+        if (pressed || secondary) && !over && !on_band && pointer.is_some() {
             self.close_midi_editor();
+            return;
+        }
+        if on_band && self.midi_edit.as_ref().is_none_or(|m| m.drag.is_none()) {
+            // The band's machinery takes it from here.
             return;
         }
         if pressed || secondary {
@@ -7676,10 +8088,7 @@ impl IvoryApp {
                         self.me_set_vel(t, vel);
                     }
                     Some(H::Key(key)) if pressed => {
-                        self.request_recorder(recorder::RecorderRequest::Audition {
-                            notes: vec![key],
-                            on: true,
-                        });
+                        self.me_audition(vec![key], true);
                         if let Some(st) = self.midi_edit.as_mut() {
                             st.down_key = Some(key);
                         }
@@ -7729,15 +8138,11 @@ impl IvoryApp {
                                     .map(|(_, t, _)| *t)
                                     .unwrap_or(t_at);
                                 if let Some(k) = key0 {
-                                    self.request_recorder(
-                                        recorder::RecorderRequest::Audition {
-                                            notes: vec![k],
-                                            on: true,
-                                        },
-                                    );
+                                    self.me_audition(vec![k], true);
                                 }
                                 if let Some(st) = self.midi_edit.as_mut() {
-                                    st.preview_key = key0;
+                                    st.preview_keys =
+                                        key0.map(|k| vec![k]).unwrap_or_default();
                                     st.drag = Some(MeDrag::Move {
                                         i,
                                         dt: t_at - note_t0,
@@ -7924,21 +8329,20 @@ impl IvoryApp {
                 }
             }
             // Every sounding preview lets go.
-            for k in [
-                self.midi_edit.as_ref().and_then(|m| m.down_key),
-                self.midi_edit.as_ref().and_then(|m| m.preview_key),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                self.request_recorder(recorder::RecorderRequest::Audition {
-                    notes: vec![k],
-                    on: false,
-                });
+            let mut quiet: Vec<u8> = self
+                .midi_edit
+                .as_ref()
+                .map(|m| m.preview_keys.clone())
+                .unwrap_or_default();
+            if let Some(k) = self.midi_edit.as_ref().and_then(|m| m.down_key) {
+                quiet.push(k);
+            }
+            if !quiet.is_empty() {
+                self.me_audition(quiet, false);
             }
             if let Some(st) = self.midi_edit.as_mut() {
                 st.down_key = None;
-                st.preview_key = None;
+                st.preview_keys.clear();
             }
             let dirty = self
                 .midi_edit
@@ -7980,7 +8384,9 @@ impl IvoryApp {
         // The MIDI editor's ground: while the hand is on the popup — or a
         // note gesture is in flight — the lanes under it stand down. The
         // drumpad floats over both, on the same rule.
-        if self.midi_edit_owns(pointer) || self.drumpad_owns(pointer) {
+        if self.midi_edit_owns(pointer)
+            || (self.drumpad_owns(pointer) && self.arr_drag.is_none())
+        {
             return;
         }
         // **A right-click on a lane HEADER opens the TRACK menu** — remove,
@@ -8184,6 +8590,13 @@ impl IvoryApp {
                     // The rename is the double-click, handled above on the
                     // release edge; a single press does nothing.
                     Some(A::HdrName(_)) => {}
+                    Some(A::HdrBay(n, bay)) => {
+                        // The mixer's own door, from here: picker when
+                        // empty, the plugin's face when loaded, the patch
+                        // picker for the DX7, the drumpad for the kit.
+                        self.selected_channel = Some(n);
+                        self.open_insert_face(n, bay);
+                    }
                     // **The NUMBER is the handle**: press and carry the
                     // track to another row. Empty rows have nothing to
                     // carry, but any row can be carried TO.
@@ -8249,6 +8662,12 @@ impl IvoryApp {
                         self.arr_drag = Some(ArrDrag::Nav { last: p, px_w });
                     }
                     Some(A::ClipBody(id)) => {
+                        // Grabbing a member of the SELECTED SET carries the
+                        // whole set; anything else moves alone and clears
+                        // the band's leftovers.
+                        if !self.arr_multi.contains(&id) {
+                            self.arr_multi.clear();
+                        }
                         self.arr_selected = Some(id);
                         self.arr_resolve_len(id);
                         // The second click of a double-click OPENS a MIDI
@@ -8261,6 +8680,15 @@ impl IvoryApp {
                             self.arrangement.clips.iter().find(|c| c.id == id)
                         {
                             let dt = t_at - c.start_s;
+                            self.arr_move_orig = self
+                                .arrangement
+                                .clips
+                                .iter()
+                                .filter(|c| {
+                                    c.id == id || self.arr_multi.contains(&c.id)
+                                })
+                                .map(|c| (c.id, c.start_s, c.lane))
+                                .collect();
                             self.arr_drag = Some(ArrDrag::Move { id, dt });
                         }
                     }
@@ -8316,7 +8744,23 @@ impl IvoryApp {
                         // hit's own time: t_at carries the zero-edge clamp.
                         self.arr_drag = Some(ArrDrag::RulerPress { t0: t_at, from: p });
                     }
-                    None => {}
+                    None => {
+                        // **Bare header ground is a reorder handle too** —
+                        // the number cell alone was too small a target to
+                        // discover, the owner's word.
+                        let row = {
+                            let clips = self.arr_clip_views();
+                            let view = self.arrange_view(&clips);
+                            let l = crate::arrangement_panel::Layout::new(rect, &view);
+                            l.header_rows.iter().position(|row| {
+                                row.panel.is_positive() && row.panel.contains(p)
+                            })
+                        };
+                        if let Some(n) = row.filter(|n| self.channel_used(*n)) {
+                            self.selected_channel = Some(n);
+                            self.arr_drag = Some(ArrDrag::ReorderLane { from: n });
+                        }
+                    }
                 }
             }
         }
@@ -8559,6 +9003,7 @@ impl IvoryApp {
                 ));
             }
             self.arr_drag = None;
+            self.arr_move_orig.clear();
         }
 
         // ── the keys the view owns ────────────────────────────────────────
@@ -8567,7 +9012,8 @@ impl IvoryApp {
         let keys_ok = self.dialog.is_none()
             && self.menu_state.is_none()
             && !self.name_focused
-            && self.num_edit.is_none();
+            && self.num_edit.is_none()
+            && self.drumpad_num.is_none();
         if keys_ok
             && self.midi_edit.is_none()
             && ctx.input(|i| {
@@ -8575,6 +9021,16 @@ impl IvoryApp {
             })
         {
             self.arr_delete_selected();
+        }
+        // **Copy and paste, the system's own chord** — Cmd on the Mac,
+        // Ctrl on the other desks (egui's `command`). Clips of any kind.
+        if keys_ok && self.midi_edit.is_none() {
+            if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::C)) {
+                self.arr_copy();
+            }
+            if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::V)) {
+                self.arr_paste();
+            }
         }
         // **Ctrl/Cmd+T: a new track**, bare, on the first free slot — the
         // owner's keyboard twin of the + circle.
@@ -8704,7 +9160,7 @@ impl IvoryApp {
     ) -> crate::arrangement_panel::ArrangeView<'a> {
         let g = self.settings.knobs().gains;
         let desk = self.desk();
-        let peaks = self.recorder.strip_peaks;
+        let peaks = self.meter_hold;
         let (view_start_s, view_len_s) = self.arr_window_now();
         crate::arrangement_panel::ArrangeView {
             lanes: std::array::from_fn(|n| {
@@ -8712,6 +9168,9 @@ impl IvoryApp {
                 crate::arrangement_panel::LaneView {
                     name: self.channel_display_name(n),
                     input: self.input_chip_text(n),
+                    inserts: std::array::from_fn(|b| {
+                        self.insert(n, b).map_or("", plugin_display_name)
+                    }),
                     color: self.strip_color(n),
                     kind,
                     used: self.channel_used(n),
@@ -8760,7 +9219,7 @@ impl IvoryApp {
             bpm: f64::from(self.tempo_bpm()),
             sig_top: u32::from(self.time_signature().beats),
             sig_bottom: u32::from(self.time_signature().unit),
-            dark_mode: self.settings.dark_mode,
+            dark_mode: self.settings.arr_dark,
             wood: {
                 let c = self.settings.recorder_bg_color;
                 (c.r, c.g, c.b)
@@ -9643,6 +10102,7 @@ impl IvoryApp {
             *cell = path.unwrap_or_default().to_owned();
         }
         self.save_settings();
+        self.undo_commit();
     }
 
     /// A short name for the audio interface, used on every one of its inputs.
@@ -10392,7 +10852,20 @@ impl IvoryApp {
             }
             K::TransposeUp => self.transpose_by(1),
             K::TransposeDown => self.transpose_by(-1),
-            K::ToggleDarkMode => self.apply_menu_action(ctx, MenuAction::ToggleDarkMode),
+            // **Per-view, the owner's rule**: the editor's flag when the
+            // editor is up, the arrange field's on that view, the theory
+            // surfaces' everywhere else — three stored values, one key.
+            K::ToggleDarkMode => {
+                if self.midi_edit.is_some() {
+                    self.settings.me_dark = !self.settings.me_dark;
+                    self.save_settings();
+                } else if self.arrangement_open {
+                    self.settings.arr_dark = !self.settings.arr_dark;
+                    self.save_settings();
+                } else {
+                    self.apply_menu_action(ctx, MenuAction::ToggleDarkMode);
+                }
+            }
             K::ToggleDetection => self.apply_menu_action(ctx, MenuAction::ToggleChordDetection),
             K::ToggleBorderless => self.apply_menu_action(ctx, MenuAction::ToggleBorderless),
             K::CycleFont => self.apply_menu_action(ctx, MenuAction::CycleFont),
@@ -11131,6 +11604,7 @@ impl IvoryApp {
                     *slot = icon.min(3);
                 }
                 self.save_settings();
+                self.undo_commit();
                 // The open dialog's lit slot follows the choice at once.
                 if let Some(dialogs::Dialog::Track { icon: cur, .. }) = self.dialog.as_mut() {
                     *cur = icon.min(3);
@@ -11141,6 +11615,7 @@ impl IvoryApp {
                     *c = idx.clamp(0, 26);
                 }
                 self.save_settings();
+                self.undo_commit();
             }
             DialogAction::TrackPalette(i) => {
                 self.settings.auto_palette = true;
@@ -12884,6 +13359,20 @@ impl IvoryApp {
             for p in &mut self.drumpad_peaks {
                 *p = if *p > 0.02 { *p * 0.78 } else { 0.0 };
             }
+            // The strip meters' fall, beside the pads': ~0.94 a frame is a
+            // reading a human can follow; the rise stays instant.
+            for (hold, fresh) in self
+                .meter_hold
+                .iter_mut()
+                .zip(self.recorder.strip_peaks.iter())
+            {
+                for c in 0..2 {
+                    hold[c] = (hold[c] * 0.94).max(fresh[c]);
+                    if hold[c] < 1.0e-4 {
+                        hold[c] = 0.0;
+                    }
+                }
+            }
             let r = crate::drumpad_panel::place(ui.max_rect(), self.drumpad_pos);
             if r.is_positive() {
                 let view = self.drumpad_view();
@@ -13037,7 +13526,12 @@ impl IvoryApp {
         let drumpad_owns = self.drumpad_claims_pointer(&ctx);
         if let Some(rect) = self
             .mixer_rect
-            .filter(|_| !input_menu_owns && (!drumpad_owns || self.mixer_grab.is_some()))
+            .filter(|_| {
+                !input_menu_owns
+                    && (!drumpad_owns
+                        || self.mixer_grab.is_some()
+                        || self.mixer_reorder.is_some())
+            })
         {
             // **Ctrl/Cmd+T: a new track**, here as in the arrangement.
             if self.dialog.is_none()
@@ -13217,7 +13711,18 @@ impl IvoryApp {
                                 from_value: self.mixer_value(hit),
                             });
                         }
-                        None => {}
+                        None => {
+                            // Bare strip paint: the carry's other handle —
+                            // the name plate alone was too small to find.
+                            if let Some(crate::recorder::Strip::Channel(n)) =
+                                crate::mixer_panel::strip_at(rect, &view, pos)
+                                    .and_then(crate::recorder::Column::strip)
+                            {
+                                if self.channel_used(n) {
+                                    self.mixer_reorder = Some((n, pos, false));
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -13247,7 +13752,11 @@ impl IvoryApp {
                 }
             }
             if released {
-                self.mixer_grab = None;
+                if self.mixer_grab.take().is_some() {
+                    // A fader let go is a moment: one line of time for the
+                    // desk and the document both.
+                    self.undo_commit();
+                }
             }
             if let (Some(grab), Some(pos)) = (self.mixer_grab, pos) {
                 if !grab.moved && (pos - grab.from).length() > TAP_SLOP {
@@ -13284,6 +13793,20 @@ impl IvoryApp {
             && self.mixer_typing.is_none()
             && self.mixer_naming.is_none()
         {
+            // **Ctrl+Z / Ctrl+Shift+Z — one line of time**, whatever view
+            // wrote the moment (Cmd works too, for the muscle that has it).
+            let (undo_key, redo_key) = ctx.input(|i| {
+                let chord = i.modifiers.ctrl || i.modifiers.command;
+                (
+                    chord && !i.modifiers.shift && i.key_pressed(egui::Key::Z),
+                    chord && i.modifiers.shift && i.key_pressed(egui::Key::Z),
+                )
+            });
+            if undo_key {
+                self.undo();
+            } else if redo_key {
+                self.redo();
+            }
             let view_key = ctx.input(|i| {
                 if !i.modifiers.ctrl || i.modifiers.command {
                     None
@@ -15182,6 +15705,77 @@ mod tests {
         let perm = app.take_desk_state_perm().expect("no perm for the host");
         assert_eq!(perm, vec![1, 2, 3, 0, 4, 5, 6, 7]);
         assert!(app.take_desk_state_perm().is_none(), "taken twice");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **One line of time, shared by every surface.** A clip import and a
+    /// desk edit both become moments; undo walks back through BOTH, redo
+    /// returns, and a fresh edit forks the future away.
+    #[test]
+    fn undo_walks_documents_and_desk_alike() {
+        let root = project_scratch("undo");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        let file = root.join("u.wav");
+        std::fs::write(&file, b"pcm, allegedly").expect("write");
+
+        // Moment 1: a clip arrives (arr_save_edits commits).
+        app.import_audio_at(&file, 4, 10.0).expect("import");
+        assert_eq!(app.arrangement().clips.len(), 1);
+        // Moment 2: a desk edit — the track gets a bay.
+        app.set_insert(2, 0, Some(dialogs::BUILTIN_PATH));
+        assert_eq!(app.insert(2, 0), Some(dialogs::BUILTIN_PATH));
+
+        // Undo the bay, then the clip.
+        app.undo();
+        assert_eq!(app.insert(2, 0), None, "the bay survived its undo");
+        assert_eq!(app.arrangement().clips.len(), 1);
+        app.undo();
+        assert_eq!(app.arrangement().clips.len(), 0, "the clip survived");
+
+        // Redo brings them back in order.
+        app.redo();
+        assert_eq!(app.arrangement().clips.len(), 1);
+        app.redo();
+        assert_eq!(app.insert(2, 0), Some(dialogs::BUILTIN_PATH));
+
+        // A fresh edit after an undo forks: the old future is gone.
+        app.undo();
+        app.import_audio_at(&file, 5, 2.0).expect("import 2");
+        app.redo();
+        assert_eq!(
+            app.insert(2, 0),
+            None,
+            "a dead future came back through redo"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Copy lands where the playhead stands** — clips rebased to the
+    /// earliest, fresh ids, the pasted set selected; and the note
+    /// clipboard round-trips inside the editor's clip.
+    #[test]
+    fn copy_paste_clips_and_notes() {
+        let root = project_scratch("copypaste");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        let file = root.join("a.wav");
+        std::fs::write(&file, b"pcm, allegedly").expect("write");
+        app.import_audio_at(&file, 4, 10.0).expect("import");
+        let id = app.arrangement().clips[0].id;
+        app.set_clip_infos(vec![(id, vec![0.5; 10], 8.0)]);
+        app.arr_resolve_len(id);
+
+        app.arr_selected = Some(id);
+        app.arr_copy();
+        app.recorder.position_s = 30.0;
+        app.arr_paste();
+        assert_eq!(app.arrangement().clips.len(), 2, "the paste left nothing");
+        let pasted = app.arrangement().clips.last().unwrap().clone();
+        assert!((pasted.start_s - 30.0).abs() < 1e-9, "landed at {}", pasted.start_s);
+        assert_eq!(pasted.lane, 4);
+        assert_ne!(pasted.id, id, "the copy stole the original's identity");
+        assert_eq!(app.arr_multi, vec![pasted.id], "the fresh set is not selected");
         let _ = std::fs::remove_dir_all(&root);
     }
 

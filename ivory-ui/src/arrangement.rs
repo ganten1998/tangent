@@ -179,15 +179,15 @@ impl DeskSnap {
             "kinds".into(),
             Value::Array(self.kinds.iter().map(|k| Value::Number((*k as u64).into())).collect()),
         );
-        // Written only when set: older documents stay byte-identical.
-        if self.icons.iter().any(|i| *i != 0) {
-            m.insert(
-                "icons".into(),
-                Value::Array(
-                    self.icons.iter().map(|k| Value::Number((*k as u64).into())).collect(),
-                ),
-            );
-        }
+        // Always written: an all-zero row is an OPINION (every badge
+        // auto), and omitting it let the previous project's badges bleed
+        // into a document that carried none.
+        m.insert(
+            "icons".into(),
+            Value::Array(
+                self.icons.iter().map(|k| Value::Number((*k as u64).into())).collect(),
+            ),
+        );
         m.insert(
             "names".into(),
             Value::Array(self.names.iter().map(|n| Value::String(n.clone())).collect()),

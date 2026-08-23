@@ -1587,7 +1587,7 @@ impl DesktopApp {
         // rows' knobs. Live states written down first, so what moves is
         // what was sounding.
         if let Some(order) = self.app.take_desk_state_perm() {
-            self.save_plugin_states();
+            self.save_plugin_states_as_loaded();
             permute_insert_states_in(
                 insert_state_path(0, 0).parent().map(std::path::Path::to_path_buf),
                 &order,
@@ -1960,17 +1960,15 @@ impl DesktopApp {
                     // holds anything that has been dropped on a pad.
                     if let Some(e) = self.recorder.engine.as_mut() {
                         let rate = e.output().sample_rate.max(8_000);
+                        // Reuse a pad's decode when one exists, but never
+                        // CACHE an audition: browsing a folder of songs
+                        // would otherwise hold every one of them in memory
+                        // for the rest of the session.
                         let clip = match self.pad_cache.get(&path) {
                             Some(c) => Some(std::sync::Arc::clone(c)),
-                            None => match ivory_record::decode::decode(&path, rate) {
-                                Ok(c) => {
-                                    let c = std::sync::Arc::new(c);
-                                    self.pad_cache
-                                        .insert(path.clone(), std::sync::Arc::clone(&c));
-                                    Some(c)
-                                }
-                                Err(_) => None,
-                            },
+                            None => ivory_record::decode::decode(&path, rate)
+                                .ok()
+                                .map(std::sync::Arc::new),
                         };
                         if clip.is_some() {
                             e.set_preview(clip);
@@ -3710,7 +3708,9 @@ impl DesktopApp {
     fn reload_pads(&mut self) {
         /// Columns in a pad's waveform ghost. A pad is fifty-odd points
         /// wide at most; forty-eight columns is under a point each.
-        const PAD_WAVE_BUCKETS: usize = 48;
+        // 240 buckets: the trimmer draws the sample's real shape now, and the
+// pad ghost decimates for free.
+const PAD_WAVE_BUCKETS: usize = 240;
         let rate = self
             .recorder
             .engine
@@ -3775,6 +3775,36 @@ impl DesktopApp {
                 {
                     write_insert_state(strip, bay, &bundle, &state);
                 }
+            }
+        }
+    }
+
+    /// As [`Self::save_plugin_states`], but each sidecar's OWNER is what is
+    /// really LOADED in the engine's slot — `inserts_loaded`'s truth — not
+    /// what the settings say should be there. The reorder path needs this:
+    /// the settings are already the NEW layout when it saves, and a state
+    /// tagged with the new occupant's name is a state its own plugin
+    /// rejects after the files move.
+    fn save_plugin_states_as_loaded(&mut self) {
+        let bays = ivory_ui::recorder::INSERTS;
+        for i in 0..self.recorder.inserts_loaded.len() {
+            let Some(bundle) = self
+                .recorder
+                .inserts_loaded
+                .get(i)
+                .and_then(|b| b.clone())
+                .filter(|b| !b.starts_with('\u{1f}') && !b.starts_with('@'))
+            else {
+                continue;
+            };
+            let (strip, bay) = (i / bays, i % bays);
+            if let Some(state) = self
+                .recorder
+                .engine
+                .as_ref()
+                .and_then(|e| e.save_insert_state(strip, bay))
+            {
+                write_insert_state(strip, bay, &bundle, &state);
             }
         }
     }
@@ -4337,11 +4367,18 @@ fn permute_insert_states_in(dir: Option<std::path::PathBuf>, order: &[usize]) {
     let mut held: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
     for new in 0..order.len() {
         let old = order[new];
-        held.push(
-            (0..bays)
-                .map(|b| std::fs::read(name(old, b)).ok())
-                .collect(),
-        );
+        let mut row = Vec::with_capacity(bays);
+        for b in 0..bays {
+            match std::fs::read(name(old, b)) {
+                Ok(bytes) => row.push(Some(bytes)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => row.push(None),
+                // A file that EXISTS but cannot be read (EIO, a dataless
+                // Dropbox placeholder): abort whole — a permutation that
+                // deletes what it could not carry is data loss.
+                Err(_) => return,
+            }
+        }
+        held.push(row);
     }
     for (new, row) in held.into_iter().enumerate() {
         for (b, data) in row.into_iter().enumerate() {

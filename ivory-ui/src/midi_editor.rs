@@ -64,6 +64,12 @@ pub struct MidiEditView<'a> {
     /// The lane's colour index into [`STRIP_COLORS`]; 0 draws the desk
     /// green, exactly as the arrangement does.
     pub color: usize,
+    /// The editor's own DARK flag: warm browns on, the arrange greys off.
+    pub dark: bool,
+    /// On the DRUM LANE: the sixteen pads' sample names, keyed 36..=51 —
+    /// written on the keys, because a kit whose keys are anonymous is not
+    /// an instrument. `None` everywhere else.
+    pub pad_names: Option<[&'a str; 16]>,
 }
 
 /// What a press on the editor means.
@@ -383,10 +389,18 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
     if !l.panel.is_positive() {
         return;
     }
+    // **Two faces, the owner's pair**: dark keeps the editor's shipped
+    // warm browns; light borrows the arrangement's greys, so the two
+    // views share one wardrobe and D swaps it per view.
+    let face = if view.dark {
+        FACE
+    } else {
+        Color32::from_rgb(0x46, 0x46, 0x46)
+    };
     // A popup over the arrangement: its own face, a firm border, and a
     // clip so nothing leaks onto the lanes below.
     let painter = &painter.with_clip_rect(l.panel.expand(1.0));
-    painter.rect_filled(l.panel, 4.0, FACE);
+    painter.rect_filled(l.panel, 4.0, face);
     painter.rect_stroke(
         l.panel,
         4.0,
@@ -422,7 +436,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
             Align2::CENTER_CENTER,
             word,
             font(r.height() * 0.55),
-            if lit { FACE } else { INK.gamma_multiply(0.7) },
+            if lit { face } else { INK.gamma_multiply(0.7) },
         );
     };
     chip(painter, l.tool_swing, "SWG", view.swing);
@@ -499,6 +513,24 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
                     font((kh * 0.7).min(10.0)),
                     if is_black(key) { INK } else { FACE },
                 );
+            }
+            // **The kit's own names on its keys** — inverse ink, so a
+            // white key reads dark and a black key reads light. This is
+            // what makes the drum lane an instrument you can SEE.
+            if let Some(names) = view.pad_names.as_ref() {
+                let base = crate::recorder::DRUM_PAD_BASE;
+                if key >= base && key < base + 16 && kh >= 6.0 {
+                    let name = names[usize::from(key - base)];
+                    if !name.is_empty() {
+                        painter.text(
+                            Pos2::new(row_keys.left() + 3.0, row_keys.center().y),
+                            Align2::LEFT_CENTER,
+                            name,
+                            font((kh * 0.62).clamp(6.0, 9.5)),
+                            if is_black(key) { INK } else { FACE },
+                        );
+                    }
+                }
             }
         }
         if row_roll.is_positive() {
@@ -762,12 +794,21 @@ pub fn hit_test(rect: Rect, view: &MidiEditView<'_>, pos: Pos2) -> Option<Hit> {
         if !r.is_positive() || !r.contains(pos) {
             continue;
         }
-        let edge = EDGE_W.min(r.width() * 0.4);
-        if pos.x >= r.right() - edge {
-            return Some(Hit::NoteRight(i));
-        }
-        if pos.x <= r.left() + edge.min(r.width() * 0.3) {
-            return Some(Hit::NoteLeft(i));
+        // Edges only claim a hand when the BODY keeps a real share: on a
+        // narrow note the whole face is the body, or a chord's grab turned
+        // into a one-note resize — the owner's "only the top note moved".
+        let edge = if r.width() >= 14.0 {
+            EDGE_W.min(r.width() * 0.3)
+        } else {
+            0.0
+        };
+        if edge > 0.0 {
+            if pos.x >= r.right() - edge {
+                return Some(Hit::NoteRight(i));
+            }
+            if pos.x <= r.left() + edge {
+                return Some(Hit::NoteLeft(i));
+            }
         }
         return Some(Hit::NoteBody(i));
     }
@@ -804,6 +845,8 @@ mod tests {
             sig_bottom: 4,
             playhead_s: 10.0,
             color: 0,
+            dark: true,
+            pad_names: None,
         }
     }
 

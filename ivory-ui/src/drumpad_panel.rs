@@ -264,8 +264,11 @@ impl Layout {
         // chip, CLEAR — and the kit fader alone on the right end.
         let ins = inspector.shrink2(Vec2::new(GAP, 5.0));
         // The name is gone from the inspector — the pads say their own
-        // names — and the three sliders grew into its room.
-        let knob_w = (ins.width() * 0.165).clamp(44.0, 96.0);
+        // names — and the three sliders grew into its room, sized so the
+        // whole row still FITS: three knobs, five chips, eight gaps.
+        let chip_w_probe = (ins.width() * 0.09).clamp(30.0, 52.0);
+        let free = (ins.width() - 5.0 * chip_w_probe - 8.0 * GAP).max(90.0);
+        let knob_w = (free / 3.0).clamp(36.0, 78.0);
         let chip_w = (ins.width() * 0.09).clamp(30.0, 52.0);
         let mut right = ins.right();
         let mut rcell = |w: f32| {

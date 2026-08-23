@@ -2004,6 +2004,9 @@ struct Renderer {
     /// meant to carry it. Two buffers rather than a flag, so the pass that
     /// writes the take does not re-derive a per-frame condition.
     click_out: Vec<f32>,
+    /// The preview's frames for this chunk, stereo — added AFTER the tap,
+    /// beside the click, so an audition is never printed into a take.
+    preview_out: Vec<f32>,
     click_taped: Vec<f32>,
     /// A user effect ACROSS the effects bus, if one is loaded.
     ///
@@ -2539,7 +2542,11 @@ impl Renderer {
 
                 let counting_in = self.count_in_tail > 0;
                 self.count_in_tail = self.count_in_tail.saturating_sub(1);
-                if let Some(beat) = self.beats.tick(metro_on, bpb) {
+                // **The click only speaks while the transport does** — armed
+                // by M, HEARD under play or record (the count-in rides its
+                // own gate inside `tick`). A practice click that started at
+                // the keypress was the owner's complaint.
+                if let Some(beat) = self.beats.tick(metro_on && rolling, bpb) {
                     self.voice.trigger(beat.accent);
                     if beat.count_in > 0 || beat.downbeat {
                         // A whole beat, so the sample has room to decay, and
@@ -2778,7 +2785,9 @@ impl Renderer {
                 let at = frame_index * dev_ch;
                 map_frame(src, &mut self.frame[..dev_ch]);
                 for c in 0..dev_ch {
-                    let s = self.frame[c] + self.click_out[i];
+                    let s = self.frame[c]
+                        + self.click_out[i]
+                        + self.preview_out[i * 2 + c.min(1)];
                     out[at + c] = s;
                     let mag = s.abs();
                     if mag >= CLIP_LEVEL {
@@ -3279,9 +3288,14 @@ impl Renderer {
     /// speakers and the take all treat them like everything else. Runs
     /// whether or not the transport rolls: a drum machine that only sounds
     /// while the timeline moves is broken.
-    /// The media explorer's audition: swap, play once, sum into the mix.
-    /// No strip, no sends — a preview is the file itself, at a polite level.
+    /// The media explorer's audition: swap, play once, and fill the
+    /// PREVIEW buffer the out-pass adds AFTER the take's tap — the click's
+    /// own road. An audition clicked over a rolling take must never be
+    /// printed into the recording; it is for the ears alone.
     fn mix_preview(&mut self, frames: usize) {
+        if let Some(po) = self.preview_out.get_mut(..frames * 2) {
+            po.fill(0.0);
+        }
         if self.preview_retiring.slots() > 0 {
             if let Ok(next) = self.preview_incoming.pop() {
                 let old = std::mem::replace(&mut self.preview, next);
@@ -3296,9 +3310,6 @@ impl Renderer {
         if self.preview_pos >= total {
             return;
         }
-        let Some(mix) = self.mix.get_mut(..frames * TAP_CHANNELS) else {
-            return;
-        };
         const PREVIEW_GAIN: f32 = 0.8;
         for f in 0..frames {
             let at = self.preview_pos + f;
@@ -3307,8 +3318,12 @@ impl Renderer {
             }
             let l = clip.samples.get(at * 2).copied().unwrap_or(0.0);
             let r = clip.samples.get(at * 2 + 1).copied().unwrap_or(0.0);
-            mix[f * TAP_CHANNELS] += l * PREVIEW_GAIN;
-            mix[f * TAP_CHANNELS + 1] += r * PREVIEW_GAIN;
+            if let Some(v) = self.preview_out.get_mut(f * 2) {
+                *v += l * PREVIEW_GAIN;
+            }
+            if let Some(v) = self.preview_out.get_mut(f * 2 + 1) {
+                *v += r * PREVIEW_GAIN;
+            }
         }
         self.preview_pos += frames;
     }
@@ -3407,6 +3422,18 @@ impl Renderer {
         let mut sounded = [false; PADS];
         let mut peak = [0.0f32; PADS];
         for f in 0..frames {
+            // **Offs FIRST** — the lane walk's own rule, held here too: a
+            // release sharing a frame with the next strike must fade the
+            // voice that ENDED, never the one just born. The hits ran
+            // first once, and every legato note on an obeying pad choked.
+            for h in &self.pad_offs {
+                if h.offset != f as i32 {
+                    continue;
+                }
+                if let Some(v) = self.pad_voices.get_mut(h.pad) {
+                    v.cut();
+                }
+            }
             // The strikes that land on this frame: whoever shares the choke
             // group fades, the struck pad starts clean. The group is read at
             // the strike, so moving a knob never cuts a voice already gone.
@@ -3431,16 +3458,6 @@ impl Renderer {
                         f64::from(trim0[h.pad]) * frames,
                         f64::from(trim1[h.pad]) * frames,
                     );
-                }
-            }
-            // The releases pads chose to hear: the same graceful fade a
-            // choke uses, at the note-off's own frame.
-            for h in &self.pad_offs {
-                if h.offset != f as i32 {
-                    continue;
-                }
-                if let Some(v) = self.pad_voices.get_mut(h.pad) {
-                    v.cut();
                 }
             }
             for (i, v) in self.pad_voices.iter_mut().enumerate() {
@@ -4478,7 +4495,7 @@ impl Engine {
             preview_pos: 0,
             pad_voices: [PadVoice::default(); PADS],
             pad_hits: Vec::with_capacity(MAX_PAD_HITS_PER_BLOCK),
-            pad_offs: Vec::with_capacity(MAX_PAD_HITS_PER_BLOCK),
+            pad_offs: Vec::with_capacity(MAX_PAD_HITS_PER_BLOCK * 2),
             pad_gain: 1.0,
             builtin: crate::dx7::Dx7::new(rate as f32),
             builtin_scratch: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
@@ -4495,6 +4512,7 @@ impl Engine {
             fx_in: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             fx_out: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             click_out: vec![0.0; MAX_BLOCK as usize],
+            preview_out: vec![0.0; MAX_BLOCK as usize * 2],
             click_taped: vec![0.0; MAX_BLOCK as usize],
             fx_return_gain: 1.0,
             effect_params: crate::effects::Params::default(),
@@ -6883,6 +6901,7 @@ mod tests {
             room_gain: 0.0,
             aux: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             click_out: vec![0.0; MAX_BLOCK as usize],
+            preview_out: vec![0.0; MAX_BLOCK as usize * 2],
             click_taped: vec![0.0; MAX_BLOCK as usize],
             fx_return_gain: 1.0,
             clips: Vec::new(),
@@ -6912,7 +6931,7 @@ mod tests {
             preview_pos: 0,
             pad_voices: [PadVoice::default(); PADS],
             pad_hits: Vec::with_capacity(MAX_PAD_HITS_PER_BLOCK),
-            pad_offs: Vec::with_capacity(MAX_PAD_HITS_PER_BLOCK),
+            pad_offs: Vec::with_capacity(MAX_PAD_HITS_PER_BLOCK * 2),
             pad_gain: 1.0,
             shared,
             timebase: Timebase::new(),
@@ -8799,6 +8818,10 @@ mod tests {
         shared.metro_on.store(true, Ordering::Relaxed);
         shared.metro_in_take.store(true, Ordering::Relaxed);
         shared.metro_gain.store(1.0f32.to_bits(), Ordering::Relaxed);
+        // The click only speaks while the transport does, since the owner's
+        // rule — so this take ROLLS.
+        shared.rolling.store(true, Ordering::Relaxed);
+        shared.transport_req.store(1, Ordering::Release);
         r.beats.was_on = true;
         r.beats.restart(0);
 

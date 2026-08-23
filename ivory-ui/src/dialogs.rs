@@ -4004,6 +4004,12 @@ pub fn show(
                             // session should be called, and Save saves that
                             // name — nobody has to meet a panel to name a
                             // song.
+                            // The field's WELL is pinned dark so the white
+                            // ink reads in every theme — the inherited well
+                            // was light under system-light and the name
+                            // typed white-on-white.
+                            ui.style_mut().visuals.extreme_bg_color =
+                                egui::Color32::from_rgb(0x1A, 0x16, 0x12);
                             ui.add(
                                 egui::TextEdit::singleline(name)
                                     .font(bold(13.0))
@@ -4235,6 +4241,8 @@ pub fn show(
                                         RichText::new("FILE NAME").font(bold(9.5)).color(dim),
                                     ),
                                 );
+                                ui.style_mut().visuals.extreme_bg_color =
+                                    egui::Color32::from_rgb(0x1A, 0x16, 0x12);
                                 ui.add(
                                     egui::TextEdit::singleline(&mut spec.name)
                                         .font(plain(10.5))
