@@ -1129,6 +1129,10 @@ struct Shared {
     /// gets one channel seeded with the built-in, so there is no silent
     /// fallback left to need.
     builtin_strip: AtomicI64,
+    /// Which general channel is the DRUMPAD's — its notes are pad strikes,
+    /// not pitches. `-1` is nobody's. The host computes it from bay 1's
+    /// sentinel, exactly as `builtin_strip`.
+    drum_strip: AtomicI64,
     /// Which general channel each capture PICK feeds: desk indices, -1 for an
     /// unbound pick. The k-th AUDIO channel takes pick k — the HOST computes
     /// the order, the callback only reads it, which is the same trust split
@@ -1365,6 +1369,7 @@ impl Shared {
             channel_gains: std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
             channel_pans: std::array::from_fn(|_| AtomicU32::new(0.0f32.to_bits())),
             builtin_strip: AtomicI64::new(-1),
+            drum_strip: AtomicI64::new(-1),
             pick_strip: std::array::from_fn(|_| AtomicI64::new(-1)),
             punch: std::array::from_fn(|_| AtomicU64::new(u64::MAX)),
             metro_gain: AtomicU32::new(0.7f32.to_bits()),
@@ -3468,6 +3473,8 @@ impl Renderer {
         }
         let wanted = self.shared.builtin_strip.load(Ordering::Relaxed);
         let builtin_at = (wanted >= 0).then_some(wanted as usize);
+        let drum_wanted = self.shared.drum_strip.load(Ordering::Relaxed);
+        let drum_at = (drum_wanted >= 0).then_some(drum_wanted as usize);
         let midi_off = self.shared.midi_off.load(Ordering::Relaxed);
         let builtin_armed =
             builtin_at.is_some_and(|ch| midi_off & (1 << ch.min(31)) == 0);
@@ -3529,6 +3536,32 @@ impl Renderer {
             let mut lane_has_clips = false;
             if rolling {
                 let end = at + frames as u64;
+                // **Offs FIRST.** Two notes on one key back to back — the
+                // owner's tied chords — put the first's off and the
+                // second's on in the same block, and ons pushed first got
+                // silenced by the off behind them: only the first chord
+                // ever sounded. The drain runs again after the walk for
+                // notes that both start and end inside this block.
+                let mut i = 0;
+                while i < self.active_clip.len() {
+                    let a = self.active_clip[i];
+                    if usize::from(a.lane) == ch && a.off < end {
+                        if lane_notes.len() < lane_notes.capacity() {
+                            lane_notes.push(Note {
+                                offset: a.off.saturating_sub(at) as i32,
+                                pitch: i16::from(a.key),
+                                velocity: 0.0,
+                                on: false,
+                            });
+                        }
+                        if a.key < 128 {
+                            self.sounding &= !(1u128 << a.key);
+                        }
+                        self.active_clip.swap_remove(i);
+                        continue;
+                    }
+                    i += 1;
+                }
                 for idx in 0..self.midi_clips.len() {
                     if self.midi_clips[idx].strip.min(CHANNELS - 1) != ch {
                         continue;
@@ -3601,6 +3634,43 @@ impl Renderer {
                     .midi_clips
                     .iter()
                     .any(|m| m.strip.min(CHANNELS - 1) == ch);
+            }
+
+            // The DRUMPAD lane: every note here is a pad strike — the same
+            // sixteen one-shots the drumpad window plays, so the editor's
+            // roll and a MIDI keyboard trigger exactly what a finger does.
+            // The strikes render in `mix_pads`, on the DRUMS bus; this lane
+            // itself carries no signal, but its fader still has to advance
+            // so a later un-assignment starts at the written level.
+            if drum_at == Some(ch) && !is_builtin {
+                for n in &lane_notes {
+                    if !n.on {
+                        continue; // pads are one-shots; offs mean nothing
+                    }
+                    if self.pad_hits.len() == self.pad_hits.capacity() {
+                        break;
+                    }
+                    let Ok(key) = u8::try_from(n.pitch) else {
+                        continue;
+                    };
+                    let pad = usize::from(key.wrapping_sub(PAD_BASE));
+                    if key >= PAD_BASE && pad < PADS {
+                        self.pad_hits.push(PadHit {
+                            offset: n.offset,
+                            pad,
+                            velocity: n.velocity,
+                        });
+                    }
+                }
+                let target = if strip_is_heard(Strip::Channel(ch), muted, soloed) {
+                    Shared::f32_of(&self.shared.channel_gains[ch]).clamp(0.0, 8.0)
+                } else {
+                    0.0
+                };
+                for _ in 0..frames {
+                    self.channel_gain[ch] += (target - self.channel_gain[ch]) * coeff;
+                }
+                continue;
             }
 
             // The built-in is one synth: its lane's notes — live and clip
@@ -4733,6 +4803,15 @@ impl Engine {
     pub fn set_builtin_strip(&self, strip: Option<usize>) {
         self.shared
             .builtin_strip
+            .store(strip.map_or(-1, |s| s as i64), Ordering::Relaxed);
+    }
+
+    /// Which general CHANNEL the drumpad belongs to. Its lane's notes —
+    /// live and clip both — strike the sixteen pads instead of sounding a
+    /// pitch, and the kit renders on the DRUMS bus as it always has.
+    pub fn set_drum_strip(&self, strip: Option<usize>) {
+        self.shared
+            .drum_strip
             .store(strip.map_or(-1, |s| s as i64), Ordering::Relaxed);
     }
 
@@ -7442,9 +7521,110 @@ mod tests {
         );
     }
 
-    /// **A clip plays through its LANE: mute silences it, solo isolates
-    /// it.** The strip's own rules, applied to the document's audio — the
-    /// difference between "a bed under the master" and an arrangement.
+    /// **The drumpad is a lane's instrument now.** A MIDI clip on the drum
+    /// strip strikes the pads — the editor's roll plays the kit — and a
+    /// lane NOT assigned stays a pitch lane.
+    #[test]
+    fn a_drum_lane_strikes_the_pads() {
+        use std::sync::Arc;
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        e.set_pad_kit(test_kit(&[0], 4_800, 0.5));
+        e.set_midi_clips(vec![PlacedMidi {
+            strip: 7,
+            start: 0,
+            len: 48_000,
+            notes: Arc::new(vec![ClipNote {
+                at: 0,
+                dur: 2_400,
+                key: PAD_BASE, // pad 0
+                vel: 100,
+            }]),
+        }]);
+        e.set_drum_strip(Some(7));
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        let mut out = vec![0.0f32; 1024 * 2];
+        let mut peak = 0.0f32;
+        for _ in 0..4 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            peak = peak.max(out.iter().fold(0.0f32, |a, b| a.max(b.abs())));
+        }
+        assert!(peak > 0.05, "the drum lane's note struck no pad: {peak}");
+
+        // Un-assign the lane: the same clip now feeds nothing (no builtin,
+        // no rack) and the render is silence — the strike path really was
+        // the assignment, not some default.
+        let mut quiet = Engine::offline(48_000, Timebase::new()).expect("offline");
+        quiet.set_pad_kit(test_kit(&[0], 4_800, 0.5));
+        quiet.set_midi_clips(vec![PlacedMidi {
+            strip: 7,
+            start: 0,
+            len: 48_000,
+            notes: Arc::new(vec![ClipNote {
+                at: 0,
+                dur: 2_400,
+                key: PAD_BASE,
+                vel: 100,
+            }]),
+        }]);
+        quiet.set_transport(1, 0);
+        quiet.set_rolling(true);
+        let mut still = 0.0f32;
+        for _ in 0..4 {
+            out.fill(0.0);
+            quiet.render_offline(&mut out);
+            still = still.max(out.iter().fold(0.0f32, |a, b| a.max(b.abs())));
+        }
+        assert!(
+            still < 1.0e-6,
+            "an unassigned lane still struck the pads: {still}"
+        );
+    }
+
+    #[test]
+    fn a_tied_note_on_one_key_sounds_again() {
+        use std::sync::Arc;
+        // Two notes on the SAME key, back to back: the second must arrive
+        // as a fresh on AFTER the first's off — the owner's tied chords
+        // played once and went quiet.
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        e.set_midi_clips(vec![PlacedMidi {
+            strip: 0,
+            start: 0,
+            len: 96_000,
+            notes: Arc::new(vec![
+                ClipNote { at: 0, dur: 4_800, key: 60, vel: 100 },
+                ClipNote { at: 4_800, dur: 4_800, key: 60, vel: 100 },
+            ]),
+        }]);
+        e.set_builtin_strip(Some(0));
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        let mut out = vec![0.0f32; 1024 * 2];
+        // Roll through both notes; the tie lands mid-way.
+        let mut heard_first = 0.0f32;
+        let mut heard_after_tie = 0.0f32;
+        for block in 0..12 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            // Blocks 6..9 sit inside the SECOND note (4800+ frames in).
+            if (1..4).contains(&block) {
+                heard_first =
+                    heard_first.max(out.iter().fold(0.0f32, |a, b| a.max(b.abs())));
+            }
+            if (6..9).contains(&block) {
+                heard_after_tie = heard_after_tie
+                    .max(out.iter().fold(0.0f32, |a, b| a.max(b.abs())));
+            }
+        }
+        assert!(heard_first > 0.01, "the FIRST note never sounded: {heard_first}");
+        assert!(
+            heard_after_tie > 0.005,
+            "the second note of the tie never sounded: {heard_after_tie}"
+        );
+    }
+
     #[test]
     fn an_offline_engine_taps_stems_too() {
         use std::sync::Arc;

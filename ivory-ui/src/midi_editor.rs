@@ -18,8 +18,17 @@ pub const STRIP_H: f32 = 26.0;
 pub const KEYS_W: f32 = 46.0;
 /// Keys visible at once — the roll's vertical span.
 pub const KEYS_SHOWN: f32 = 36.0;
-/// MPC swing: the off-beat line sits at 58% of its pair.
-pub const SWING: f64 = 0.58;
+/// The swing presets the SWG menu offers, exactly as the owner listed
+/// them: the word name, the ratio in parentheses, and where the off-beat
+/// line sits as a percentage of its pair.
+pub const SWING_PRESETS: [(&str, &str, f64); 6] = [
+    ("Straight", "1:1", 50.0),
+    ("Septuplet", "4:3", 57.1),
+    ("Quintuplet", "3:2", 60.0),
+    ("Golden Ratio", "1 : 0.618", 61.8),
+    ("Triplet (Shuffle)", "2:1", 66.7),
+    ("Dotted (Hard)", "3:1", 75.0),
+];
 /// The right-edge grab zone of a note, in points.
 const EDGE_W: f32 = 6.0;
 
@@ -44,6 +53,9 @@ pub struct MidiEditView<'a> {
     pub snap_on: bool,
     pub grid_exp: i8,
     pub swing: bool,
+    /// Where the off-beat line sits, as a fraction of its pair — 0.667 is
+    /// the shuffle everybody means by "swing". Only read while `swing`.
+    pub swing_pct: f64,
     pub triplet: bool,
     pub bpm: f64,
     pub sig_top: u32,
@@ -230,7 +242,7 @@ pub fn snap_t(view: &MidiEditView<'_>, t: f64) -> f64 {
         let pair = step * 2.0;
         let base = (t / pair).floor() * pair;
         let mut best = base;
-        for c in [base, base + pair * SWING, base + pair] {
+        for c in [base, base + pair * view.swing_pct.clamp(0.5, 0.95), base + pair] {
             if (t - c).abs() < (t - best).abs() {
                 best = c;
             }
@@ -238,6 +250,60 @@ pub fn snap_t(view: &MidiEditView<'_>, t: f64) -> f64 {
         best.max(0.0)
     } else {
         ((t / step).round() * step).max(0.0)
+    }
+}
+
+/// As [`snap_t`], but FLOOR: the grid line at or before `t`. Note
+/// CREATION uses it — a click lands in the cell under the hand, never the
+/// next one, however close to the boundary. Swing floors to the last
+/// candidate at or before `t`.
+pub fn snap_floor_t(view: &MidiEditView<'_>, t: f64) -> f64 {
+    if !view.snap_on {
+        return t.max(0.0);
+    }
+    let step = grid_step_s(view);
+    if step <= 0.0 {
+        return t.max(0.0);
+    }
+    if view.swing && !view.triplet {
+        let pair = step * 2.0;
+        let base = (t / pair).floor() * pair;
+        let mut best = base;
+        for c in [base, base + pair * view.swing_pct.clamp(0.5, 0.95), base + pair] {
+            if c <= t + 1.0e-9 && c > best {
+                best = c;
+            }
+        }
+        best.max(0.0)
+    } else {
+        ((t / step).floor() * step).max(0.0)
+    }
+}
+
+/// The first grid line STRICTLY after `t` — shape-aware, so a note drawn
+/// on the on-beat of a swung pair runs long to the off-beat line and one
+/// drawn on the off-beat runs short to the next pair. Durations and
+/// nudges walk the same lines the magnet lands on.
+pub fn snap_next_t(view: &MidiEditView<'_>, t: f64) -> f64 {
+    let step = grid_step_s(view);
+    if step <= 0.0 {
+        return t;
+    }
+    if view.snap_on && view.swing && !view.triplet {
+        let pair = step * 2.0;
+        let base = (t / pair).floor() * pair;
+        for c in [
+            base + pair * view.swing_pct.clamp(0.5, 0.95),
+            base + pair,
+            base + pair + pair * view.swing_pct.clamp(0.5, 0.95),
+        ] {
+            if c > t + 1.0e-9 {
+                return c;
+            }
+        }
+        base + pair * 2.0
+    } else {
+        ((t / step).floor() + 1.0) * step
     }
 }
 
@@ -264,7 +330,7 @@ pub fn grid_lines(view: &MidiEditView<'_>, from: f64, to: f64, mut f: impl FnMut
         while n * pair <= to {
             let base = n * pair;
             f(base, (base / bar).round() * bar == base || base.rem_euclid(bar) < 1.0e-9);
-            f(base + pair * SWING, false);
+            f(base + pair * view.swing_pct.clamp(0.5, 0.95), false);
             n += 1.0;
         }
     } else {
@@ -692,6 +758,7 @@ mod tests {
             snap_on: true,
             grid_exp: -3,
             swing: false,
+            swing_pct: 0.58,
             triplet: false,
             bpm: 120.0,
             sig_top: 4,
@@ -824,6 +891,30 @@ mod tests {
             let _ = Layout::new(r);
             let _ = hit_test(r, &v, r.center());
         }
+    }
+
+    /// **The swing fraction is the view's, not a constant** — the SWG menu
+    /// writes it, and every line, magnet and duration follows. And the next
+    /// line after an on-beat is the off-beat, however hard the swing.
+    #[test]
+    fn the_swing_fraction_moves_the_lines_and_next_walks_them() {
+        let n: [ArrNote; 0] = [];
+        let mut v = view(&n);
+        v.swing = true;
+        v.swing_pct = 0.667;
+        // Pairs of 0.5 s: the off-beat line now sits at 0.3335.
+        assert!((snap_t(&v, 0.30) - 0.3335).abs() < 1.0e-9);
+        // Creation on the on-beat runs LONG to the swung line; on the
+        // swung line it runs SHORT to the next pair.
+        assert!((snap_next_t(&v, 0.0) - 0.3335).abs() < 1.0e-9);
+        assert!((snap_next_t(&v, 0.3335) - 0.5).abs() < 1.0e-9);
+        // Straight, next is simply the following step.
+        v.swing = false;
+        assert!((snap_next_t(&v, 0.25) - 0.5).abs() < 1.0e-9);
+        // The presets are exactly the owner's six, shuffle standard.
+        assert_eq!(SWING_PRESETS[0], ("Straight", "1:1", 50.0));
+        assert_eq!(SWING_PRESETS[4], ("Triplet (Shuffle)", "2:1", 66.7));
+        assert_eq!(SWING_PRESETS[5], ("Dotted (Hard)", "3:1", 75.0));
     }
 
     /// The grid word says the shape, not just the size.

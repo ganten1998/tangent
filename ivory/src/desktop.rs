@@ -258,6 +258,9 @@ struct Recorder {
     bounce: Option<Bounce>,
     /// A FULL-SPEED export in flight, on its own offline engine.
     offline_bounce: Option<OfflineBounce>,
+    /// The red button pressed, the COUNT-IN still clicking: the record
+    /// begins on the downbeat.
+    arr_rec_wait: bool,
     /// The realtime pass's delivery instructions, applied at the finish.
     pending_delivery: Option<ivory_ui::ports::ProjectExportSpec>,
 }
@@ -1499,8 +1502,13 @@ impl DesktopApp {
             self.finish_dir_choice(purpose, dir);
         }
 
-        if let Some(request) = self.app.take_directory_request().or_else(|| self.deferred_dir.take())
-        {
+        if let Some(request) = self.app.take_directory_request() {
+            // The same one-frame settle the save panel keeps — see there.
+            self.deferred_dir = Some(request);
+            ctx.request_repaint();
+            return;
+        }
+        if let Some(request) = self.deferred_dir.take() {
             if Self::picker_needs_windowed(ctx) {
                 self.deferred_dir = Some(request);
                 self.refullscreen = true;
@@ -1593,7 +1601,10 @@ impl DesktopApp {
                 // handed nothing. See `set_builtin_strip`, pushed each frame.
                 let engine_want = want
                     .as_deref()
-                    .filter(|p| *p != ivory_ui::dialogs::BUILTIN_PATH);
+                    .filter(|p| {
+                        *p != ivory_ui::dialogs::BUILTIN_PATH
+                            && *p != ivory_ui::dialogs::DRUMPAD_PATH
+                    });
                 let path = engine_want.map(std::path::Path::new);
                 // **With the bay's saved preset, when one belongs to this
                 // plugin.** The same bargain the instrument slots have had for
@@ -1698,6 +1709,17 @@ impl DesktopApp {
         // does not immediately open a window for a recording already made.
         self.tick_bounce();
         self.tick_offline_bounce();
+        // The arrangement's count-in reaching its downbeat: begin.
+        if self.recorder.arr_rec_wait
+            && self
+                .recorder
+                .engine
+                .as_ref()
+                .is_some_and(crate::instrument::Engine::count_in_done)
+        {
+            self.recorder.arr_rec_wait = false;
+            self.start_arr_record();
+        }
         if !self.recorder.session.is_recording() {
             if let Some(folder) = self
                 .recorder
@@ -1761,10 +1783,30 @@ impl DesktopApp {
                 // the cassette — is where the old take toggle lives now.
                 R::Toggle => {
                     self.recorder.take_note = None;
-                    if self.recorder.arr_rec.is_some() {
+                    if self.recorder.arr_rec_wait {
+                        // Pressed again mid-count: the count stops, nothing
+                        // records.
+                        self.recorder.arr_rec_wait = false;
+                        if let Some(e) = self.recorder.engine.as_ref() {
+                            e.cancel_count_in();
+                        }
+                    } else if self.recorder.arr_rec.is_some() {
                         self.finish_arr_record();
                     } else {
-                        self.start_arr_record();
+                        // **The count-in counts the ARRANGEMENT in too** —
+                        // the owner's ask: the bars from the settings click
+                        // first, and the record begins on the downbeat.
+                        let beats = self.app.count_in_beats();
+                        if beats > 0 && !self.recorder.transport.playing() {
+                            if let Some(e) = self.recorder.engine.as_ref() {
+                                e.start_count_in(beats, self.app.tempo_bpm());
+                                self.recorder.arr_rec_wait = true;
+                            } else {
+                                self.start_arr_record();
+                            }
+                        } else {
+                            self.start_arr_record();
+                        }
                     }
                 }
                 R::Capture => {
@@ -1812,6 +1854,13 @@ impl DesktopApp {
                 // sends the playhead home. Play's own second press is a PAUSE
                 // now, so this is the only button that returns to 0:00.
                 R::Stop => {
+                    // A count-in still clicking dies quietly with the rest.
+                    if self.recorder.arr_rec_wait {
+                        self.recorder.arr_rec_wait = false;
+                        if let Some(e) = self.recorder.engine.as_ref() {
+                            e.cancel_count_in();
+                        }
+                    }
                     // The arrangement record first, while the playhead still
                     // says where the take ended — `Transport::stop` rewinds.
                     self.finish_arr_record();
@@ -2086,11 +2135,13 @@ impl DesktopApp {
     /// nested run loop, and raising one inside an egui frame re-enters the
     /// frame already on the stack.
     fn take_cartridge_request(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
-        let Some(request) = self
-            .app
-            .take_file_request()
-            .or_else(|| self.deferred_file.take())
-        else {
+        // The same one-frame settle the save panel keeps — see there.
+        if let Some(request) = self.app.take_file_request() {
+            self.deferred_file = Some(request);
+            ctx.request_repaint();
+            return;
+        }
+        let Some(request) = self.deferred_file.take() else {
             self.restore_fullscreen(ctx);
             return;
         };
@@ -2177,11 +2228,16 @@ impl DesktopApp {
     /// `picker_needs_windowed`.
     #[cfg(feature = "recorder")]
     fn take_save_panel(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
-        let Some(request) = self
-            .app
-            .take_save_request()
-            .or_else(|| self.deferred_save.take())
-        else {
+        // **One frame of settle, always.** The request arrives on the frame
+        // a project-dialog row was pressed; its viewport is destroyed a
+        // frame later, and a native panel opened before that lands BEHIND
+        // the project window — the owner watched all three do it.
+        if let Some(request) = self.app.take_save_request() {
+            self.deferred_save = Some(request);
+            ctx.request_repaint();
+            return;
+        }
+        let Some(request) = self.deferred_save.take() else {
             return;
         };
         if Self::picker_needs_windowed(ctx) {
@@ -3032,6 +3088,9 @@ impl DesktopApp {
             self.app.insert(*ch, 0) == Some(ivory_ui::dialogs::BUILTIN_PATH)
         });
         e.set_builtin_strip(builtin);
+        e.set_drum_strip((0..ivory_ui::recorder::CHANNELS).find(|ch| {
+            self.app.insert(*ch, 0) == Some(ivory_ui::dialogs::DRUMPAD_PATH)
+        }));
         // The DX7's sound is the SESSION's cartridge — the live engine
         // already carries it, so the export borrows the loaded copy.
         if builtin.is_some() {
@@ -3053,7 +3112,10 @@ impl DesktopApp {
             let want = self.app.insert(seat, bay).map(str::to_owned);
             let engine_want = want
                 .as_deref()
-                .filter(|p| *p != ivory_ui::dialogs::BUILTIN_PATH);
+                .filter(|p| {
+                        *p != ivory_ui::dialogs::BUILTIN_PATH
+                            && *p != ivory_ui::dialogs::DRUMPAD_PATH
+                    });
             let Some(path) = engine_want else { continue };
             let state = saved_insert_state(seat, bay, path);
             if let Err(err) =
@@ -3382,21 +3444,9 @@ impl DesktopApp {
                 let template = self.templates_dir().join("default");
                 self.app.seed_template(&template);
                 let root = self.app.record_root().join("Projects");
-                let mut n = 0u32;
-                let dir = loop {
-                    n += 1;
-                    let cand = if n == 1 {
-                        root.join("Untitled")
-                    } else {
-                        root.join(format!("Untitled {n}"))
-                    };
-                    if !cand.exists() {
-                        break cand;
-                    }
-                    if n > 10_000 {
-                        return;
-                    }
-                };
+                // The scratch rule: an Untitled nobody SAVED is reclaimed,
+                // so New lands on "Untitled" instead of minting a pile.
+                let dir = ivory_ui::app::fresh_project_dir(&root);
                 if copy_dir_all(&template, &dir).is_err() {
                     return;
                 }
@@ -3987,6 +4037,11 @@ impl DesktopApp {
             e.set_punches(punches);
         }
         e.set_builtin_strip(builtin);
+        // The drumpad's lane, by the same bay-1 sentinel rule — any kind of
+        // channel counts, because playback does not ask the arm.
+        e.set_drum_strip((0..ivory_ui::recorder::CHANNELS).find(|ch| {
+            self.app.insert(*ch, 0) == Some(ivory_ui::dialogs::DRUMPAD_PATH)
+        }));
         // Never read from a settings file — see `IvoryApp::input_monitor`. It
         // is pushed every frame like every other monitor setting, and its value
         // at launch is false because the field it comes from starts false.
@@ -4476,6 +4531,7 @@ impl DesktopApp {
                 arr_rec: None,
                 bounce: None,
                 offline_bounce: None,
+                arr_rec_wait: false,
                 pending_delivery: None,
                 session: crate::record::Session::new(tap, timebase),
                 audio,

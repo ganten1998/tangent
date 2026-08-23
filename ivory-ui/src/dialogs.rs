@@ -386,7 +386,11 @@ pub enum DialogAction {
     /// Open the project picker.
     ProjectOpen,
     /// Write the session down now — desk, document, plugin states.
-    ProjectSave,
+    ProjectSave {
+        /// The name the dialog's field is staging: Save saves THIS name,
+        /// renaming the session if it differs — no panel in between.
+        name: String,
+    },
     /// Duplicate the whole session somewhere and open the copy.
     ProjectSaveAs,
     /// Save the session as a template under `Projects/Templates`.
@@ -1582,6 +1586,12 @@ pub const BUILTIN_PATH: &str = "@tangent-dx7";
 
 /// What the built-in calls itself in the picker.
 pub const BUILTIN_NAME: &str = "Tangent DX7";
+/// The drumpad's sentinel path: the sixteen-pad sampler as a bay-1
+/// instrument. Like [`BUILTIN_PATH`] it rides the bay so it can be picked,
+/// saved and named by the same code, but the ENGINE strikes the pads in
+/// `mix_channels` — the bay itself is handed nothing.
+pub const DRUMPAD_PATH: &str = "@tangent-drums";
+pub const DRUMPAD_NAME: &str = "Tangent Drums";
 
 /// Said under the list, every time, in full-strength text rather than the faint
 /// grey the other note gets.
@@ -1857,6 +1867,16 @@ impl Dialog {
                 path: BUILTIN_PATH.to_owned(),
                 name: BUILTIN_NAME.to_owned(),
                 vendor: "built in, six-operator FM".to_owned(),
+            },
+        );
+        // And the drumpad right under it: the kit is the other instrument
+        // every install carries.
+        plugins.insert(
+            1,
+            PluginEntry {
+                path: DRUMPAD_PATH.to_owned(),
+                name: DRUMPAD_NAME.to_owned(),
+                vendor: "built in, sixteen-pad sampler".to_owned(),
             },
         );
         let selected = current
@@ -3182,8 +3202,12 @@ pub fn show(
                             // built-in is always a row, so counting rows would
                             // hide the note telling somebody where to put a
                             // VST3 from exactly the person who has none.
-                            let installed =
-                                plugins.iter().filter(|p| p.path != BUILTIN_PATH).count();
+                            let installed = plugins
+                                .iter()
+                                .filter(|p| {
+                                    p.path != BUILTIN_PATH && p.path != DRUMPAD_PATH
+                                })
+                                .count();
                             if installed == 0 {
                                 // Not an empty box with a greyed button: an
                                 // empty list cannot be told apart from a picker
@@ -3968,11 +3992,22 @@ pub fn show(
                     egui::Frame::NONE
                         .inner_margin(egui::Margin::same(14))
                         .show(ui, |ui| {
-                            ui.label(RichText::new(name.as_str()).font(bold(13.0)).color(t.text));
+                            // The name is a FIELD: it stages what the
+                            // session should be called, and Save saves that
+                            // name — nobody has to meet a panel to name a
+                            // song.
+                            ui.add(
+                                egui::TextEdit::singleline(name)
+                                    .font(bold(13.0))
+                                    .text_color(t.text)
+                                    .desired_width(f32::INFINITY),
+                            );
                             ui.label(
-                                RichText::new("the open session - saved as you work")
-                                    .font(plain(9.0))
-                                    .color(dim),
+                                RichText::new(
+                                    "the open session - saved as you work; Save keeps this name",
+                                )
+                                .font(plain(9.0))
+                                .color(dim),
                             );
                             ui.add_space(8.0);
                             let mut row = |ui: &mut egui::Ui, word: &str, hint: &str| -> bool {
@@ -3997,7 +4032,9 @@ pub fn show(
                                 action = Some(DialogAction::ProjectOpen);
                             }
                             if row(ui, "Save", "desk, document and plugin settings, now") {
-                                action = Some(DialogAction::ProjectSave);
+                                action = Some(DialogAction::ProjectSave {
+                                    name: name.clone(),
+                                });
                             }
                             if row(ui, "Save As...", "copy the whole session and open the copy") {
                                 action = Some(DialogAction::ProjectSaveAs);
@@ -7021,7 +7058,7 @@ mod tests {
                     // The built-in leads, above the sort: it is what a fresh
                     // install plays, and the one entry somebody with no VST3s
                     // installed can still choose.
-                    [BUILTIN_NAME, "analog lab v", "the modelled piano", "Vital"],
+                    [BUILTIN_NAME, DRUMPAD_NAME, "analog lab v", "the modelled piano", "Vital"],
                     "sorted the way a byte comparison sorts, not the way a person reads"
                 );
                 // The name is the stem: nobody wants to read ".vst3" 112 times.
@@ -7032,23 +7069,23 @@ mod tests {
                 // in, and it is the one entry that can describe itself.
                 assert!(plugins
                     .iter()
-                    .filter(|p| p.path != BUILTIN_PATH)
+                    .filter(|p| p.path != BUILTIN_PATH && p.path != DRUMPAD_PATH)
                     .all(|p| p.vendor.is_empty()));
-                // Two, not one: the built-in took the first row.
-                assert_eq!(*selected, Some(2), "it did not open on what is loaded");
+                // Three, not one: the built-ins took the first two rows.
+                assert_eq!(*selected, Some(3), "it did not open on what is loaded");
                 assert_eq!(current.as_deref(), Some(loaded.as_str()));
                 assert!(filter.is_empty() && *focus);
                 assert!(
-                    plugin_row(&plugins[2], Some(&loaded)).starts_with('\u{2022}'),
+                    plugin_row(&plugins[3], Some(&loaded)).starts_with('\u{2022}'),
                     "the loaded plugin is not marked"
                 );
                 assert!(
-                    plugin_row(&plugins[1], Some(&loaded)).starts_with(' '),
+                    plugin_row(&plugins[2], Some(&loaded)).starts_with(' '),
                     "a plugin that is not loaded was marked as if it were"
                 );
                 // A blank vendor leaves no empty brackets behind; a known one
                 // is shown, which is the only reason the field exists.
-                assert_eq!(plugin_row(&plugins[3], None), "  Vital");
+                assert_eq!(plugin_row(&plugins[4], None), "  Vital");
                 // And the built-in describes itself, which is the one row that
                 // can: nothing was opened to find out.
                 assert_eq!(

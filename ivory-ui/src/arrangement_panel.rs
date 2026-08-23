@@ -190,7 +190,7 @@ impl Hit {
 /// Measured against the REAPER header this is modelled on: number, arm,
 /// name, knob, meter, M/S want about 180 points and stop being readable
 /// under 120.
-const HEADER_W: (f32, f32, f32) = (0.16, 120.0, 220.0);
+const HEADER_W: (f32, f32, f32) = (0.16, 150.0, 220.0);
 
 /// The ruler's height in points. Short — it is a scale, not a band.
 const RULER_H: (f32, f32, f32) = (0.06, 16.0, 24.0);
@@ -691,17 +691,17 @@ fn ink(view: &ArrangeView<'_>) -> Ink {
         hdr_wood: Color32::from_rgb(hr, hg, hb),
         hdr_face: Color32::from_rgb(0xE3, 0xD9, 0xBD),
         hdr_lane: Color32::from_rgb(0x20, 0x1C, 0x16),
-        ruler: Color32::from_rgb(0x4A, 0x4A, 0x4A),
-        wood: Color32::from_rgb(0x30, 0x30, 0x30),
-        face: Color32::from_rgb(0xB4, 0xB4, 0xB0),
+        ruler: Color32::from_rgb(0x50, 0x50, 0x50),
+        wood: Color32::from_rgb(0x38, 0x38, 0x38),
+        face: Color32::from_rgb(0xC8, 0xC8, 0xC2),
         engrave: Color32::from_rgb(0x24, 0x20, 0x1A),
-        faint: Color32::from_rgb(0xB4, 0xB4, 0xB0).gamma_multiply(0.5),
-        lane: Color32::from_rgb(0x37, 0x37, 0x37),
-        lane_alt: Color32::from_rgb(0x3B, 0x3B, 0x3B),
+        faint: Color32::from_rgb(0xC8, 0xC8, 0xC2).gamma_multiply(0.72),
+        lane: Color32::from_rgb(0x41, 0x41, 0x41),
+        lane_alt: Color32::from_rgb(0x46, 0x46, 0x46),
         // The GRID base: the draw derives the strong line by DARKENING it
         // and the subdivisions stay at base — dark lines on a grey field,
-        // the reference shot's own grammar.
-        grid: Color32::from_rgb(0x2A, 0x2A, 0x2A),
+        // STARK enough to read against the raised lanes.
+        grid: Color32::from_rgb(0x23, 0x23, 0x23),
         clip_ink: Color32::from_rgb(0xE8, 0xDC, 0xC0),
         playhead: Color32::from_rgb(0xE8, 0x3A, 0x4E),
         arm: Color32::from_rgb(0xE0, 0x22, 0x22),
@@ -809,7 +809,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     Align2::LEFT_BOTTOM,
                     word,
                     font.clone(),
-                    p.face.gamma_multiply(0.55),
+                    p.face.gamma_multiply(0.8),
                 );
             }
             n += 1.0;
@@ -1100,15 +1100,10 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 );
             }
         } else {
-            // The empty slot's own ground — the owner's near-black grey —
-            // under the circled plus and everything else on it.
-            painter.rect_filled(plate, 2.0, Color32::from_rgb(0x2E, 0x2E, 0x2E));
-            painter.rect_stroke(
-                plate,
-                2.0,
-                Stroke::new(1.0, p.hdr_face.gamma_multiply(0.18)),
-                egui::StrokeKind::Inside,
-            );
+            // The empty slot's own ground fills the WHOLE panel — the wood
+            // margin around a dark plate read as two surfaces, the owner's
+            // "my bad" screenshot.
+            painter.rect_filled(row.panel, 0.0, Color32::from_rgb(0x2E, 0x2E, 0x2E));
         }
         let ink_on = if luma(face) > 140.0 { p.engrave } else { p.hdr_face };
         painter.text(
@@ -1119,8 +1114,8 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             if lane.used {
                 ink_on.gamma_multiply(0.7)
             } else {
-                // On the header wood, whatever the field theme says.
-                p.hdr_face.gamma_multiply(0.45)
+                // Tucked faint on the dark ground, clear of the + circle.
+                p.hdr_face.gamma_multiply(0.30)
             },
         );
         // The input chip draws on EVERY lane — binding an input is how a

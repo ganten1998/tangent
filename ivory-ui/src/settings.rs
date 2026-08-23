@@ -35,7 +35,7 @@ pub struct Rgb {
 /// the migration runs ONCE against a file written before the change, and after
 /// that the same value chosen deliberately is never touched again. A file with
 /// no stamp is version 0 — every file every previous build wrote.
-const SETTINGS_VERSION: u64 = 16;
+const SETTINGS_VERSION: u64 = 17;
 
 /// Where a desk channel written before the INPUT STRIPS ended up.
 ///
@@ -956,6 +956,9 @@ pub struct Settings {
     pub midi_snap: bool,
     pub midi_grid_exp: i64,
     pub midi_swing: bool,
+    /// Where the swung off-beat sits, percent of its pair: 66.7 is the
+    /// standard shuffle, 50 is straight. One decimal, the SWG menu's rule.
+    pub midi_swing_pct: f64,
     pub midi_triplet: bool,
     /// Transpose, in semitones, applied to every note the display and the
     /// chord detector see.
@@ -1155,9 +1158,13 @@ impl Default for Settings {
             // pre-added MIDI channel with the built-in in bay 1 — see
             // `Default::default`'s `strip_inserts` — so a fresh install makes
             // a sound and the desk shows why.
+            // **And channel 7 ships as the DRUMPAD.** Track 8 carries the
+            // sixteen-pad sampler out of the box, so the kit has a lane the
+            // editor can write for and the desk shows both instruments.
             channel_kinds: {
                 let mut k = [0u8; crate::recorder::CHANNELS];
                 k[0] = 1;
+                k[7] = 1;
                 k
             },
             reverb_mix: 0.0,
@@ -1202,6 +1209,9 @@ impl Default for Settings {
                             * crate::recorder::INSERTS
                     ];
                 v[0] = crate::dialogs::BUILTIN_PATH.to_owned();
+                // And track 8's bay 1 is the drumpad — see `channel_kinds`.
+                v[7 * crate::recorder::INSERTS] =
+                    crate::dialogs::DRUMPAD_PATH.to_owned();
                 v
             },
             input_alias: String::new(),
@@ -1218,6 +1228,7 @@ impl Default for Settings {
             midi_snap: true,
             midi_grid_exp: -4,
             midi_swing: false,
+            midi_swing_pct: 66.7,
             midi_triplet: false,
             transpose: 0,
             show_transpose: true,
@@ -1982,6 +1993,11 @@ impl Settings {
             s.midi_grid_exp = n.clamp(-6, 3);
         }
         take_bool(&mut map, "midi_swing", &mut s.midi_swing);
+        if let Some(Value::Number(n)) = map.shift_remove("midi_swing_pct") {
+            if let Some(f) = n.as_f64() {
+                s.midi_swing_pct = (f.clamp(50.0, 95.0) * 10.0).round() / 10.0;
+            }
+        }
         take_bool(&mut map, "midi_triplet", &mut s.midi_triplet);
         if let Some(Value::String(path)) = map.shift_remove("track_path") {
             s.track_path = path;
@@ -2123,6 +2139,31 @@ impl Settings {
             // ascending now, off at the top. The position flips so the sound
             // a file describes does not change.
             self.lpf_mix = (1.0 - self.lpf_mix).clamp(0.0, 1.0);
+        }
+        if was < 17 {
+            // **Track 8 becomes the drumpad's lane** — but only where track 8
+            // is still empty ground. Anybody already using the channel keeps
+            // exactly what they built.
+            let bay0 = 7 * crate::recorder::INSERTS;
+            let untouched = self.channel_kinds.get(7).copied() == Some(0)
+                && self
+                    .strip_inserts
+                    .get(bay0..bay0 + crate::recorder::INSERTS)
+                    .is_none_or(|bays| bays.iter().all(String::is_empty))
+                && (self.tracks_added >> 7) & 1 == 0;
+            if untouched {
+                self.channel_kinds[7] = 1;
+                while self.strip_inserts.len() <= bay0 {
+                    self.strip_inserts.push(String::new());
+                }
+                self.strip_inserts[bay0] = crate::dialogs::DRUMPAD_PATH.to_owned();
+                while self.channel_inputs.len() < crate::recorder::CHANNELS {
+                    self.channel_inputs.push(String::new());
+                }
+                if self.channel_inputs[7].is_empty() {
+                    self.channel_inputs[7] = "midi:all".to_owned();
+                }
+            }
         }
         if was < 16 {
             // **The input IS the kind now** — the owner retired the
@@ -2648,6 +2689,11 @@ impl Settings {
         map.insert("midi_snap".into(), Value::Bool(self.midi_snap));
         map.insert("midi_grid_exp".into(), Value::from(self.midi_grid_exp));
         map.insert("midi_swing".into(), Value::Bool(self.midi_swing));
+        map.insert(
+            "midi_swing_pct".into(),
+            serde_json::Number::from_f64((self.midi_swing_pct * 10.0).round() / 10.0)
+                .map_or(Value::Null, Value::Number),
+        );
         map.insert("midi_triplet".into(), Value::Bool(self.midi_triplet));
         for (key, gain) in [
             ("metronome_gain", self.metronome_gain),
