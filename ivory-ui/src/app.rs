@@ -270,7 +270,6 @@ pub struct IvoryApp {
     /// The mixer control being dragged, and where the hand started.
     mixer_grab: Option<MixerGrab>,
     /// The strip whose colour palette is open, if any.
-    mixer_palette: Option<crate::recorder::Column>,
     /// A decibel figure being typed into a strip, and which.
     mixer_typing: Option<(crate::recorder::Column, String)>,
     /// The channel whose NAME is being typed, and what is in the field.
@@ -1057,7 +1056,6 @@ impl IvoryApp {
             dismiss_message: false,
             mixer_open: false,
             mixer_grab: None,
-            mixer_palette: None,
             mixer_typing: None,
             mixer_naming: None,
             mixer_fx_menu: None,
@@ -1967,8 +1965,8 @@ impl IvoryApp {
                 .map_or(0.0, |s| recorder::gain_to_fader(s.gain)),
             H::Send(i) => view.strips.get(i.0).map_or(0.0, |s| s.send),
             H::Pan(i) => view.strips.get(i.0).map_or(0.5, |s| (s.pan + 1.0) * 0.5),
-            H::Mute(_) | H::Solo(_) | H::Add(_) | H::Insert(..) | H::Paint(..)
-            | H::Palette(_) | H::Db(_) | H::Name(_) | H::Remove(_) | H::Arm(_)
+            H::Mute(_) | H::Solo(_) | H::Add(_) | H::Insert(..)
+            | H::Db(_) | H::Name(_) | H::Remove(_) | H::Arm(_)
             | H::FxMenu(..) | H::AddKind(..) | H::InputChip(_) | H::InputRow(..) => 0.0,
         }
     }
@@ -2133,20 +2131,6 @@ impl IvoryApp {
                 self.open_insert_face(i.desk_index(), n);
                 return;
             }
-            // **Not the master.** Its colour is the one thing on the desk
-            // that means something on sight: red is where the output is, and a
-            // master somebody painted teal is a desk with no landmark on it.
-            H::Palette(i) => {
-                // The right-click menu replaced the bare palette: remove,
-                // choose a colour, or choose the auto-palette — one home.
-                if let Some(strip) = i.strip() {
-                    self.dialog = Some(dialogs::Dialog::Track {
-                        lane: strip.index(),
-                        removable: matches!(strip, crate::recorder::Strip::Channel(_)),
-                    });
-                }
-                return;
-            }
             // Click the number and edit it: the field opens saying exactly
             // what the readout says — the owner's rule for every dial.
             H::Db(i) => {
@@ -2190,20 +2174,6 @@ impl IvoryApp {
                         .map_or(String::new(), |v| v.name.to_owned()),
                 };
                 self.mixer_naming = Some((i, seed));
-                return;
-            }
-            // `usize::MAX` is "anywhere but a swatch", which closes it without
-            // painting — the same sentinel the patch picker uses for its own
-            // "none of these" row.
-            H::Paint(i, c) => {
-                self.mixer_palette = None;
-                if c != usize::MAX {
-                    let i = i.desk_index();
-                    if let Some(slot) = self.settings.strip_colors.get_mut(i) {
-                        *slot = c as i64;
-                        self.save_settings();
-                    }
-                }
                 return;
             }
             // The × at the top right: take the channel off the desk. The
@@ -2608,7 +2578,7 @@ impl IvoryApp {
                     g.channels.get(n).copied().unwrap_or(1.0),
                     kind.is_none() && !self.lane_has_clips(n),
                 ),
-                Strip::Drums => ("DRUMS", "the pads' bus", self.settings.drums_gain as f32, false),
+                Strip::Drums => ("DRUM BUS", "", self.settings.drums_gain as f32, false),
                 Strip::Click => ("CLICK", "", g.metronome, false),
                 Strip::Fx => ("FX BUS", "reverb · delay · chorus", g.fx_return, false),
             };
@@ -2715,7 +2685,6 @@ impl IvoryApp {
                 },
             }),
             any_solo: desk.any_solo(),
-            palette_open: self.mixer_palette,
             fx_menu: self.mixer_fx_menu,
             add_ask: self.mixer_add_ask,
             typing: self
@@ -4494,7 +4463,23 @@ impl IvoryApp {
             .unwrap_or(0);
         let rows = match page {
             InputMenuPage::Top => vec!["NONE".to_owned(), "DEVICE".to_owned(), "MIDI".to_owned()],
-            InputMenuPage::Device => vec!["MONO".to_owned(), "STEREO".to_owned()],
+            InputMenuPage::Device => {
+                if width == 0 {
+                    // **No interface open: the menu offers the interfaces.**
+                    // This is the door a wiped or fresh install walks through
+                    // — the owner lost their device selection and had NO
+                    // in-app way to get sound back, because Mono and Stereo
+                    // both need an open box to count the inputs of.
+                    let list = self.audio_device_list();
+                    if list.is_empty() {
+                        vec!["no interfaces found".to_owned()]
+                    } else {
+                        list.into_iter().map(|d| d.name).collect()
+                    }
+                } else {
+                    vec!["MONO".to_owned(), "STEREO".to_owned()]
+                }
+            }
             InputMenuPage::Mono => {
                 if width == 0 {
                     vec!["no interface open".to_owned()]
@@ -4547,10 +4532,26 @@ impl IvoryApp {
                 1 => self.input_menu = Some((ch, InputMenuPage::Device)),
                 _ => self.input_menu = Some((ch, InputMenuPage::Midi)),
             },
-            InputMenuPage::Device => match i {
-                0 => self.input_menu = Some((ch, InputMenuPage::Mono)),
-                _ => self.input_menu = Some((ch, InputMenuPage::Stereo)),
-            },
+            InputMenuPage::Device => {
+                if width == 0 {
+                    // Choosing the interface itself: remember it, open it,
+                    // and STAY here — the row set becomes MONO/STEREO as
+                    // soon as the box reports how many inputs it has.
+                    if let Some(d) = self.audio_device_list().into_iter().nth(i) {
+                        self.settings.record_input_off = false;
+                        self.settings.record_audio_device = Some(d.uid.clone());
+                        self.save_settings();
+                        if let Some(dev) = self.audio_devices.as_mut() {
+                            let _ = dev.open(&d.uid);
+                        }
+                    }
+                } else {
+                    match i {
+                        0 => self.input_menu = Some((ch, InputMenuPage::Mono)),
+                        _ => self.input_menu = Some((ch, InputMenuPage::Stereo)),
+                    }
+                }
+            }
             InputMenuPage::Mono => {
                 if i < width {
                     // Choosing a device input MAKES the channel audio — the
@@ -4637,6 +4638,13 @@ impl IvoryApp {
         let manual = self.settings.strip_colors.get(i).copied().unwrap_or(0);
         if manual != 0 {
             return manual as usize;
+        }
+        // The drum bus comes coloured, like the click: a bus that reads as
+        // a bare channel is a bus somebody records onto by mistake. From
+        // the AUTHORITY rather than the settings default, so desks that
+        // migrated through v14 (which inserted a 0) get it too.
+        if i == crate::recorder::Strip::Drums.index() {
+            return crate::mixer_panel::DRUMS_COLOR;
         }
         if self.settings.auto_palette && i < crate::recorder::CHANNELS {
             let choice = self.settings.palette_choice.clamp(0, 4) as usize;
@@ -7881,6 +7889,12 @@ impl IvoryApp {
     ///
     /// Names, inserts and colours go through the ordinary setters, so what the
     /// picture shows is what a saved settings file would produce.
+    /// The settings popup, open, for the shot harness — `IVORY_INLINE`
+    /// only works in the running app.
+    pub fn open_setup_for_shot(&mut self) {
+        self.setup_open = true;
+    }
+
     pub fn open_mixer_for_shot(&mut self) {
         self.mixer_open = true;
         let strips = crate::recorder::STRIPS;
@@ -8270,7 +8284,11 @@ impl IvoryApp {
             }
         };
         raw.chars()
-            .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == '/')
+            // 'k' survives the sieve: an open low-pass reads "20 kHz" and a
+            // seed of "20" would commit as twenty HERTZ. The 'H' and 'z' go.
+            .filter(|c| {
+                c.is_ascii_digit() || matches!(c, '.' | '-' | '/' | 'k')
+            })
             .collect()
     }
 
@@ -10397,22 +10415,9 @@ impl IvoryApp {
         // somewhere else.
         //   IVORY_INLINE=mixer /Applications/Tangent.app/Contents/MacOS/tangent
         //
-        // **And `palette` opens the swatches on a channel**, which cannot be
-        // photographed any other way: it is dismissed by a press anywhere
-        // outside it, and taking a screenshot with the mouse is a press
-        // somewhere outside it. Twenty-seven colours in a strip a hundred
-        // points wide is exactly the kind of thing that has to be LOOKED at.
-        if !self.demo_menu_done
-            && matches!(
-                std::env::var("IVORY_INLINE").as_deref(),
-                Ok("mixer" | "palette")
-            )
-        {
+        if !self.demo_menu_done && std::env::var("IVORY_INLINE").as_deref() == Ok("mixer") {
             self.demo_menu_done = true;
             self.mixer_open = true;
-            if std::env::var("IVORY_INLINE").as_deref() == Ok("palette") {
-                self.mixer_palette = Some(crate::recorder::Column(1));
-            }
         }
         // And the input chooser, which needs hardware nobody developing this
         // has: it only offers itself on an interface with more than two
@@ -11148,18 +11153,14 @@ impl IvoryApp {
             if self.mixer_naming.is_some() {
                 self.name_in_mixer(&ctx);
             }
-            // **A right-click paints, but only on the paint.**
-            //
-            // It used to open the palette from anywhere on a channel, on the
-            // reasoning that it is the one gesture that is not a control and
-            // so cannot collide with one. That stopped being true the moment
-            // anything else wanted a right-click: an effect you meant to throw
-            // away answered with twenty-seven swatches over the rack.
-            //
-            // So the rule is now what it looks like — right-click the coloured
-            // surface of a channel and you get its colours; right-click a
-            // control and you get whatever that control does, which for an
-            // insert is "take it out" and for everything else is nothing.
+            // **A right-click ANYWHERE on a channel opens its TRACK menu** —
+            // remove, colour, auto-palette — the owner's rule. The strip is
+            // wall-to-wall controls, so "right-click the empty paint" was a
+            // menu nobody could summon; the gesture answers on the whole
+            // strip now. The one control with a right-click meaning of its
+            // own keeps it: a LOADED insert bay answers with delete/replace.
+            // While any overlay menu is up, the button does nothing — the
+            // overlay owns the surface.
             if ctx.input(|i| i.pointer.secondary_pressed()) {
                 if let Some(pos) = ctx.pointer_interact_pos().filter(|p| rect.contains(*p)) {
                     let view = self.mixer_view();
@@ -11170,36 +11171,39 @@ impl IvoryApp {
                         // points tall — which is how an evening of dialled-in
                         // settings went away by accident. The menu offers the
                         // deed and its gentler sibling: delete, or replace.
-                        // An EMPTY bay has nothing to delete and stays quiet.
                         Some(crate::mixer_panel::Hit::Insert(i, n)) => {
                             if self.insert(i.desk_index(), n).is_some() {
                                 self.mixer_fx_menu = Some((i, n));
+                            } else if let Some(strip) = i.strip() {
+                                self.dialog = Some(dialogs::Dialog::Track {
+                                    lane: strip.index(),
+                                    removable: matches!(
+                                        strip,
+                                        crate::recorder::Strip::Channel(_)
+                                    ),
+                                });
                             }
                         }
-                        // **The icon on an AUDIO channel: choose its input.**
-                        // Left-click cycles the kind; the other button picks
-                        // WHICH input feeds it. Ordered by pick: the k-th
-                        // audio channel takes pick k, so the first opens the
-                        // interface's own picker and the rest add extras.
-                        Some(crate::mixer_panel::Hit::Add(col)) => {
-                            if let Some(crate::recorder::Strip::Channel(n)) = col.strip() {
-                                if let Some(k) = self.audio_ordinal(n) {
-                                    self.open_device_picker(if k == 0 {
-                                        dialogs::DeviceKind::AudioInput
-                                    } else {
-                                        dialogs::DeviceKind::ExtraInput(k)
-                                    });
-                                }
+                        // An open overlay owns the surface; the button waits.
+                        Some(crate::mixer_panel::Hit::FxMenu(..))
+                        | Some(crate::mixer_panel::Hit::AddKind(..))
+                        | Some(crate::mixer_panel::Hit::InputRow(..)) => {}
+                        // Anywhere else on a strip — control or paint — is
+                        // the strip itself: the TRACK menu. Not the master:
+                        // its colour is the one landmark on the desk, and
+                        // `Column::strip` is None there.
+                        _ => {
+                            if let Some(strip) = crate::mixer_panel::strip_at(rect, &view, pos)
+                                .and_then(|i| i.strip())
+                            {
+                                self.dialog = Some(dialogs::Dialog::Track {
+                                    lane: strip.index(),
+                                    removable: matches!(
+                                        strip,
+                                        crate::recorder::Strip::Channel(_)
+                                    ),
+                                });
                             }
-                        }
-                        // A control, and not one that answers this button.
-                        Some(_) => {}
-                        // Bare panel: the paint. Not the master — see
-                        // `Hit::Palette`.
-                        None => {
-                            self.mixer_palette =
-                                crate::mixer_panel::strip_at(rect, &view, pos)
-                                    .filter(|i| i.strip().is_some());
                         }
                     }
                 }
@@ -11256,12 +11260,12 @@ impl IvoryApp {
                         | crate::mixer_panel::Hit::Solo(_)
                         | crate::mixer_panel::Hit::Add(_)
                         | crate::mixer_panel::Hit::Insert(..)
-                        | crate::mixer_panel::Hit::Paint(..)
-                        | crate::mixer_panel::Hit::Palette(_)
                         | crate::mixer_panel::Hit::Remove(_)
                         | crate::mixer_panel::Hit::Arm(_)
                         | crate::mixer_panel::Hit::FxMenu(..)
                         | crate::mixer_panel::Hit::AddKind(..)
+                        | crate::mixer_panel::Hit::InputChip(_)
+                        | crate::mixer_panel::Hit::InputRow(..)
                         | crate::mixer_panel::Hit::Db(_))) => {
                             self.apply_mixer_hit(hit, 0.0);
                         }
@@ -13770,6 +13774,97 @@ mod tests {
     /// on an arrangement lane used to fall through to the invisible
     /// keyboard underneath and sound a note. Not painting a surface is not
     /// enough — its INPUT has to stand down too.
+    #[test]
+    fn a_press_on_the_input_chip_opens_the_input_menu() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.keytoggle_enabled = false;
+        let _ = run_frame(&ctx, &mut app);
+        app.mixer_open = true;
+        let _ = run_frame(&ctx, &mut app);
+        let rect = app.mixer_rect.expect("mixer did not open");
+        let p = {
+            let v = app.mixer_view();
+            let l = crate::mixer_panel::Layout::new(rect, &v);
+            let chip = l.strips[0].input_chip;
+            assert!(chip.is_positive(), "the first channel wears no input chip");
+            chip.center()
+        };
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                events: vec![
+                    egui::Event::PointerMoved(p),
+                    egui::Event::PointerButton {
+                        pos: p,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| app.frame(ctx),
+        );
+        assert_eq!(
+            app.input_menu,
+            Some((0, InputMenuPage::Top)),
+            "the chip did not open the input menu"
+        );
+    }
+
+    #[test]
+    fn a_right_click_on_a_channel_summons_the_track_menu() {
+        for view in ["mixer", "arrangement"] {
+            let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+            app.settings.keytoggle_enabled = false;
+            let _ = run_frame(&ctx, &mut app);
+            match view {
+                "mixer" => app.mixer_open = true,
+                _ => app.arrangement_open = true,
+            }
+            let _ = run_frame(&ctx, &mut app);
+            let p = match view {
+                "mixer" => {
+                    let rect = app.mixer_rect.expect("mixer did not open");
+                    let v = app.mixer_view();
+                    let l = crate::mixer_panel::Layout::new(rect, &v);
+                    // The middle of the first strip's FADER: a control, and
+                    // exactly where a hand lands when it right-clicks "the
+                    // channel".
+                    l.strips[0].fader.center()
+                }
+                _ => {
+                    let rect = app.arrangement_rect.expect("arrangement did not open");
+                    let clips = app.arr_clip_views();
+                    let v = app.arrange_view(&clips);
+                    let l = crate::arrangement_panel::Layout::new(rect, &v);
+                    l.header_rows[0].panel.center()
+                }
+            };
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                    events: vec![
+                        egui::Event::PointerMoved(p),
+                        egui::Event::PointerButton {
+                            pos: p,
+                            button: egui::PointerButton::Secondary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| app.frame(ctx),
+            );
+            assert!(
+                matches!(app.dialog, Some(dialogs::Dialog::Track { .. })),
+                "{view:?}: right-click did not summon the track menu (dialog = {:?})",
+                app.dialog.as_ref().map(std::mem::discriminant)
+            );
+        }
+    }
+
     #[test]
     fn a_press_on_an_open_view_never_reaches_the_piano_underneath() {
         for view in ["mixer", "arrangement"] {

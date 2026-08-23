@@ -816,7 +816,12 @@ pub fn auto_expose(shared: &Shared, seeded: &[String]) -> Option<(String, Vec<St
         let (key, _) = split_channel(&uid);
         key.to_owned()
     };
-    if seeded.iter().any(|k| k == &key) {
+    // The marker is VERSIONED: "2|" is the every-adjacent-pair rule. A
+    // device seeded under the old natural-pairs rule wears the bare key,
+    // which no longer matches — so it is seeded once more with the full
+    // set, which is what the owner asked for twice.
+    let marker = format!("2|{key}");
+    if seeded.iter().any(|k| k == &marker) {
         return None;
     }
     // Enumeration outside the lock: it can block on a slow backend.
@@ -827,7 +832,7 @@ pub fn auto_expose(shared: &Shared, seeded: &[String]) -> Option<(String, Vec<St
     let rows = seed_rows(&key, width);
     let mut sel = lock(shared);
     sel.exposed = merge_exposed(&sel.exposed, &key, rows);
-    Some((key, sel.exposed.clone()))
+    Some((format!("2|{key}"), sel.exposed.clone()))
 }
 
 #[cfg(test)]

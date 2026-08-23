@@ -1741,6 +1741,11 @@ mod shot {
         if std::env::var("IVORY_SHOT_MIXER").is_ok() {
             app.open_mixer_for_shot();
         }
+        // The settings popup over the band.
+        //   IVORY_SHOT_SETUP=1 ...
+        if std::env::var("IVORY_SHOT_SETUP").is_ok() {
+            app.open_setup_for_shot();
+        }
         // The arrangement's document, for the band's overview scrubber —
         // the window shot cannot draw the arrangement panel itself (the
         // compositor paints the piano), but the band it paints reads the

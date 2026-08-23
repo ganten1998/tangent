@@ -704,9 +704,10 @@ impl Chorus {
 /// effect, and this is the knob people reach for to do the first thing.
 pub const HPF_HZ: (f32, f32) = (20.0, 1_200.0);
 
-/// Where the low-pass knob sweeps, in Hz — **backwards**: knob up is down in
-/// frequency. See [`Sends::lpf`].
-pub const LPF_HZ: (f32, f32) = (20_000.0, 200.0);
+/// Where the low-pass knob sweeps, in Hz — ascending like every other dial
+/// now, by the owner's word: fully clockwise is 20 kHz and OUT OF THE WAY,
+/// turning it down darkens. See [`Sends::lpf`].
+pub const LPF_HZ: (f32, f32) = (200.0, 20_000.0);
 
 /// How much the resonance row can lift the corner, in dB of Q.
 ///
@@ -1097,9 +1098,9 @@ pub struct Sends {
     pub chorus: f32,
     /// Corner frequency, across [`HPF_HZ`]. 0 is out of the way.
     pub hpf: f32,
-    /// Corner frequency, across [`LPF_HZ`] — **up is darker**, because up is
-    /// more of the effect on every other knob here and a filter knob that
-    /// alone ran backwards would be the one everybody got wrong.
+    /// Corner frequency, across [`LPF_HZ`] — **1.0 is out of the way**, like
+    /// the limiter: the dial reads in hertz now and a frequency dial where
+    /// right meant LOWER was the one everybody got wrong.
     pub lpf: f32,
     /// The limiter's threshold, across [`LIMITER_DB`]. **1.0 is bypass**, not
     /// 0.0: see the constant. This is the one field here whose resting value
@@ -1115,7 +1116,7 @@ impl Default for Sends {
             delay: 0.0,
             chorus: 0.0,
             hpf: 0.0,
-            lpf: 0.0,
+            lpf: 1.0,
             limiter: 1.0,
         }
     }
@@ -1251,7 +1252,8 @@ impl Effects {
                 && m.delay < OFF
                 && m.chorus < OFF
                 && m.hpf < OFF
-                && m.lpf < OFF
+                // The low-pass rests at the TOP of its travel, limiter-style.
+                && m.lpf > 1.0 - OFF
                 && Sends::threshold_db(m.limiter) >= LIMITER_IN_AT_DB
         };
         if quiet(&want) && quiet(&self.mix) {
@@ -1324,7 +1326,7 @@ impl Effects {
         // dropped to zero glides its corner back out of the way before the
         // filter stops rather than being switched out from under the signal.
         let hpf_on = want.hpf > OFF || self.mix.hpf > OFF;
-        let lpf_on = want.lpf > OFF || self.mix.lpf > OFF;
+        let lpf_on = want.lpf < 1.0 - OFF || self.mix.lpf < 1.0 - OFF;
         // **The limiter's delay line is emptied while it is not in use.**
         //
         // A guard rather than a fix, and it is worth being exact about which:
