@@ -316,6 +316,38 @@ pub struct IvoryApp {
     midi_edit: Option<MidiEdit>,
     /// Where it drew last frame, for the input to hit against.
     midi_edit_rect: Option<Rect>,
+    /// The drumpad popup is showing, floating over whichever view is open.
+    /// Session state, like the mixer: a popup that reopened itself every
+    /// launch would be a surprise.
+    drumpad_open: bool,
+    /// Where it drew last frame, for the input to hit against.
+    drumpad_rect: Option<Rect>,
+    /// Where its strip drag left it. `None` centres it.
+    drumpad_pos: Option<Pos2>,
+    /// The kit document: paths and knobs, saved beside the arrangement.
+    drumpad: crate::drumpad::DrumpadDoc,
+    /// The pad the inspector describes.
+    drumpad_sel: usize,
+    /// The pad the mouse is holding down — the release owes a `PadHit off`.
+    drumpad_down: Option<usize>,
+    /// A knob drag in flight.
+    drumpad_grab: Option<DrumpadGrab>,
+    /// The strip drag in flight: the pointer's offset from the panel's
+    /// top-left, so the panel rides under the hand.
+    drumpad_move: Option<Vec2>,
+    /// The pad a file drag is standing over, drawn as the drop target.
+    drumpad_hover: Option<usize>,
+    /// What the host learned decoding each slot, pushed after each reload.
+    drumpad_status: [crate::ports::PadStatus; recorder::DRUM_PADS],
+    /// Engine peaks per pad, decayed here each frame for the flash.
+    drumpad_peaks: [f32; recorder::DRUM_PADS],
+    /// Live MIDI notes in the pads' range mirror onto the pads while open.
+    /// Session state, and ON by default: opening the drumpad says "I want
+    /// to play drums", and a controller is how drums are played.
+    drumpad_midi: bool,
+    /// The kit's contents changed: the host should re-decode and re-push
+    /// the engine's samples. Taken once, like `clips_dirty`.
+    drumpad_dirty: bool,
     /// The zoom window (start_s, len_s). `None` fits the whole song until
     /// the first wheel, ruler drag or viewport steer.
     arr_window: Option<(f64, f64)>,
@@ -750,6 +782,16 @@ struct MixerGrab {
     from_value: f32,
 }
 
+/// A drumpad knob being dragged: the same relative-drag contract, against
+/// the drumpad's own travel constant.
+#[derive(Clone, Copy)]
+struct DrumpadGrab {
+    param: crate::drumpad_panel::Param,
+    from: Pos2,
+    /// The value when grabbed, in the param's own units.
+    from_value: f32,
+}
+
 /// Points of travel for a knob's whole sweep. See the panel's own constant.
 use crate::recorder_panel::KNOB_TRAVEL;
 
@@ -967,6 +1009,19 @@ impl IvoryApp {
             arrangement_open: false,
             midi_edit: None,
             midi_edit_rect: None,
+            drumpad_open: false,
+            drumpad_rect: None,
+            drumpad_pos: None,
+            drumpad: crate::drumpad::DrumpadDoc::default(),
+            drumpad_sel: 0,
+            drumpad_down: None,
+            drumpad_grab: None,
+            drumpad_move: None,
+            drumpad_hover: None,
+            drumpad_status: std::array::from_fn(|_| crate::ports::PadStatus::default()),
+            drumpad_peaks: [0.0; recorder::DRUM_PADS],
+            drumpad_midi: true,
+            drumpad_dirty: false,
             arr_window: None,
             arr_selected: None,
             arr_drag: None,
@@ -2311,6 +2366,70 @@ impl IvoryApp {
         }
     }
 
+    /// The drumpad, populated for a photograph: a kit half-loaded the way a
+    /// real one is — names, waves, a choked hat pair, a knob off default, a
+    /// missing file, and one pad lit as if just struck.
+    pub fn open_drumpad_for_shot(&mut self) {
+        let kit: [(&str, f32, f32, f32, u8); 9] = [
+            ("media/Kick.wav", 1.2, 0.0, 0.0, 0),
+            ("media/Snare.wav", 1.0, 0.0, 0.0, 0),
+            ("media/Rim.wav", 0.8, -0.4, 0.0, 0),
+            ("media/Clap 909.wav", 1.0, 0.3, -2.0, 0),
+            ("media/Closed Hat.wav", 0.9, 0.25, 0.0, 1),
+            ("media/Open Hat.wav", 0.9, 0.25, 0.0, 1),
+            ("media/Shaker.wav", 0.7, -0.3, 3.0, 0),
+            ("media/Tom Low.wav", 1.0, -0.2, -5.0, 0),
+            ("media/Ride Bell.wav", 0.85, 0.5, 0.0, 0),
+        ];
+        for (i, (path, gain, pan, tune, choke)) in kit.into_iter().enumerate() {
+            self.drumpad.pads[i] = crate::drumpad::PadSlot {
+                path: path.to_owned(),
+                params: recorder::DrumPadParams {
+                    gain,
+                    pan,
+                    tune,
+                    choke,
+                },
+            };
+            let wave: Vec<f32> = (0..48)
+                .map(|b| {
+                    let t = b as f32 / 48.0;
+                    // A drum's shape: a fast attack and a decay whose length
+                    // varies by pad, so the ghosts read as different files.
+                    let decay = (-(t * (2.5 + i as f32 * 0.8))).exp();
+                    (0.15 + 0.85 * decay) * (1.0 - t * 0.2)
+                })
+                .collect();
+            self.drumpad_status[i] = crate::ports::PadStatus {
+                loaded: true,
+                missing: false,
+                wave,
+            };
+        }
+        // The pad whose file a tidy-up moved: the red dress.
+        self.drumpad.pads[11] = crate::drumpad::PadSlot {
+            path: "media/Cowbell.wav".to_owned(),
+            params: recorder::DrumPadParams::default(),
+        };
+        self.drumpad_status[11] = crate::ports::PadStatus {
+            loaded: false,
+            missing: true,
+            wave: Vec::new(),
+        };
+        // The kick, mid-strike.
+        self.drumpad_peaks[0] = 0.9;
+        self.drumpad_sel = 4;
+        self.drumpad_open = true;
+    }
+
+    /// Paint the drumpad exactly as the frame does, for the harness.
+    pub fn draw_drumpad_for_shot(&self, painter: &egui::Painter, rect: egui::Rect) {
+        let r = crate::drumpad_panel::place(rect, None);
+        if r.is_positive() {
+            crate::drumpad_panel::draw(painter, r, &self.drumpad_view());
+        }
+    }
+
     pub fn arrange_clips_for_shot(&self) -> Vec<crate::arrangement_panel::ClipView<'_>> {
         self.arr_clip_views()
     }
@@ -2732,6 +2851,13 @@ impl IvoryApp {
                 i.modifiers.ctrl,
             )
         });
+        // The drumpad floats over every surface this function serves: while
+        // the hand is on it — or one of its gestures is in flight — nothing
+        // under it may read the pointer. Its own input runs later this
+        // frame and takes what this refused.
+        if self.drumpad_owns(pointer) {
+            return;
+        }
         let ctrl_as_context = cfg!(target_os = "macos") && ctrl;
 
         // Right-click (or ctrl-click on macOS, Qt default) opens the menu.
@@ -3780,6 +3906,7 @@ impl IvoryApp {
             self.project_doc = std::path::PathBuf::from(p);
             self.arrangement = crate::arrangement::Arrangement::load_from(&self.project_doc);
             self.clips_dirty = true;
+            self.load_drumpad_doc();
             return;
         }
         if !self.settings.project_path.is_empty() {
@@ -3788,6 +3915,7 @@ impl IvoryApp {
                 self.project_doc = doc.clone();
                 self.arrangement = crate::arrangement::Arrangement::load_from(&doc);
                 self.clips_dirty = true;
+                self.load_drumpad_doc();
                 return;
             }
             // A remembered project that is GONE falls through to a fresh
@@ -3817,6 +3945,7 @@ impl IvoryApp {
         self.settings.project_path = doc.to_string_lossy().into_owned();
         self.save_settings();
         self.clips_dirty = true;
+        self.load_drumpad_doc();
     }
 
     /// The open document's path, for the host to resolve clip paths against.
@@ -3990,6 +4119,9 @@ impl IvoryApp {
         self.settings.project_path = doc.to_string_lossy().into_owned();
         self.save_settings();
         self.clips_dirty = true;
+        // The kit rides the project: whatever drumpad this directory
+        // carries replaces the one in memory.
+        self.load_drumpad_doc();
     }
 
     /// Copy the WHOLE project — document and `media/` — to `target` and
@@ -4025,9 +4157,13 @@ impl IvoryApp {
         self.project_doc = doc.clone();
         self.settings.project_path = doc.to_string_lossy().into_owned();
         self.save_settings();
+        // The kit's sidecar is part of the project and copies with it — its
+        // samples already came along inside `media/`.
+        self.drumpad.save_beside(&doc);
         // The engine's schedule is unchanged — same clips, new home — but
         // the paths the host resolves against moved with the document.
         self.clips_dirty = true;
+        self.drumpad_dirty = true;
     }
 
     /// The save panel the app is waiting on, if any. Same drain-once pattern
@@ -4610,6 +4746,377 @@ impl IvoryApp {
     }
 
     /// Close it, saving whatever the session touched.
+    // ── the drumpad ──────────────────────────────────────────────────────
+
+    /// Put the drumpad away, releasing whatever it holds: the pressed pad's
+    /// note-off, the gestures, the hover. Esc, the ×, a press outside and
+    /// the toggle key all come through here, so no path can strand a note.
+    fn close_drumpad(&mut self) {
+        if let Some(pad) = self.drumpad_down.take() {
+            self.request_recorder(recorder::RecorderRequest::PadHit {
+                pad: pad as u8,
+                on: false,
+            });
+        }
+        self.drumpad_grab = None;
+        self.drumpad_move = None;
+        self.drumpad_hover = None;
+        self.drumpad_open = false;
+        self.drumpad_rect = None;
+    }
+
+    /// Whether the drumpad owns the pointer right now: over its panel, or
+    /// mid-gesture — the MIDI editor's exact rule, so the surfaces beneath
+    /// stand down while the hand is on it.
+    fn drumpad_owns(&self, pointer: Option<Pos2>) -> bool {
+        if !self.drumpad_open {
+            return false;
+        }
+        if self.drumpad_grab.is_some()
+            || self.drumpad_move.is_some()
+            || self.drumpad_down.is_some()
+        {
+            return true;
+        }
+        match (pointer, self.drumpad_rect) {
+            (Some(p), Some(r)) => r.contains(p),
+            _ => false,
+        }
+    }
+
+    /// The panel's picture of the kit, borrowed from the document and the
+    /// host's status pushes. A slot with a path is drawn loaded before the
+    /// host confirms it — the decode is a frame away, and a pad that
+    /// blinked empty on every drop would look broken — and flips to the
+    /// red MISSING dress only when the host says so.
+    fn drumpad_view(&self) -> crate::drumpad_panel::DrumpadView<'_> {
+        let pads = std::array::from_fn(|i| {
+            let slot = &self.drumpad.pads[i];
+            let status = &self.drumpad_status[i];
+            crate::drumpad_panel::PadView {
+                label: std::path::Path::new(&slot.path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(""),
+                loaded: !slot.path.is_empty() && !status.missing,
+                missing: status.missing,
+                wave: &status.wave,
+                params: slot.params,
+            }
+        });
+        crate::drumpad_panel::DrumpadView {
+            pads,
+            peaks: self.drumpad_peaks,
+            selected: self.drumpad_sel,
+            down: self.drumpad_down,
+            midi_on: self.drumpad_midi,
+            drop_hover: self.drumpad_hover,
+            master: self.drumpad.master,
+        }
+    }
+
+    /// Load the drumpad document standing beside the open project. Called
+    /// wherever the arrangement itself loads, so the two can never describe
+    /// different projects.
+    fn load_drumpad_doc(&mut self) {
+        self.drumpad = match self.project_doc() {
+            Some(doc) => crate::drumpad::DrumpadDoc::load_beside(doc),
+            None => crate::drumpad::DrumpadDoc::default(),
+        };
+        self.drumpad_status = std::array::from_fn(|_| crate::ports::PadStatus::default());
+        self.drumpad_sel = 0;
+        self.drumpad_dirty = true;
+    }
+
+    /// Put `file` on pad `pad`: copy it into `media/`, point the slot at
+    /// it, save the sidecar, and ask the host to decode. The copy is the
+    /// same one every import pays — it is what keeps a project folder
+    /// self-contained.
+    fn drumpad_load(&mut self, pad: usize, file: &std::path::Path) -> Result<(), String> {
+        if pad >= recorder::DRUM_PADS {
+            return Err("no such pad".to_owned());
+        }
+        let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) else {
+            return Err("no project is open".to_owned());
+        };
+        let Some(rel) = copy_into_media(&doc, file) else {
+            return Err(format!(
+                "could not copy {} into the project",
+                file.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            ));
+        };
+        self.drumpad.pads[pad].path = rel;
+        self.drumpad_status[pad] = crate::ports::PadStatus::default();
+        self.drumpad_sel = pad;
+        self.drumpad.save_beside(&doc);
+        self.drumpad_dirty = true;
+        Ok(())
+    }
+
+    /// Empty the selected pad. Its file stays in `media/`: clearing a pad
+    /// must never delete something a clip may also be standing on.
+    fn drumpad_clear_selected(&mut self) {
+        let pad = self.drumpad_sel.min(recorder::DRUM_PADS - 1);
+        if self.drumpad.pads[pad].path.is_empty() {
+            return;
+        }
+        self.drumpad.pads[pad] = crate::drumpad::PadSlot::default();
+        self.drumpad_status[pad] = crate::ports::PadStatus::default();
+        self.drumpad_save();
+        self.drumpad_dirty = true;
+    }
+
+    fn drumpad_save(&mut self) {
+        if let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) {
+            self.drumpad.save_beside(&doc);
+        }
+    }
+
+    /// One knob's current value, in its own units.
+    fn drumpad_get(&self, p: crate::drumpad_panel::Param) -> f32 {
+        use crate::drumpad_panel::Param as P;
+        let sel = &self.drumpad.pads[self.drumpad_sel.min(recorder::DRUM_PADS - 1)].params;
+        match p {
+            P::Gain => sel.gain,
+            P::Pan => sel.pan,
+            P::Tune => sel.tune,
+            P::Master => self.drumpad.master,
+        }
+    }
+
+    /// Move one knob. The engine reads the document whole every frame
+    /// through [`IvoryApp::drum_kit_params`], so there is nothing to push;
+    /// the sidecar saves when the gesture ENDS, not sixty times through it.
+    fn drumpad_set(&mut self, p: crate::drumpad_panel::Param, v: f32) {
+        use crate::drumpad_panel::Param as P;
+        let (lo, hi) = p.range();
+        let v = if v.is_finite() { v.clamp(lo, hi) } else { p.default_value() };
+        let sel = self.drumpad_sel.min(recorder::DRUM_PADS - 1);
+        match p {
+            P::Gain => self.drumpad.pads[sel].params.gain = v,
+            P::Pan => self.drumpad.pads[sel].params.pan = v,
+            P::Tune => self.drumpad.pads[sel].params.tune = v,
+            P::Master => self.drumpad.master = v,
+        }
+    }
+
+    /// All of the drumpad's input: drops from both worlds, pad strikes,
+    /// knob drags, the strip drag, and the ways out. Runs BEFORE the
+    /// editor's and the arrangement's frame of input, because the drumpad
+    /// floats over both.
+    fn drumpad_input(&mut self, ctx: &egui::Context) {
+        if !self.drumpad_open {
+            return;
+        }
+        // Esc closes from anywhere; the rest wants the pointer on the panel.
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.close_drumpad();
+            return;
+        }
+        let Some(rect) = self.drumpad_rect else {
+            return;
+        };
+        let (pressed, pointer_down, released, pointer, shift) = ctx.input(|i| {
+            (
+                i.pointer.primary_pressed(),
+                i.pointer.primary_down(),
+                i.pointer.any_released(),
+                i.pointer.interact_pos(),
+                i.modifiers.shift,
+            )
+        });
+
+        // ── files, from both worlds ──────────────────────────────────────
+        // The OS drag hovers and drops through `raw`; the media manager's
+        // drag rides `egui::DragAndDrop` carrying a [`DraggedMedia`]. One
+        // hover picture and one landing for both.
+        let hover_pos = pointer.or_else(|| ctx.input(|i| i.pointer.hover_pos()));
+        let os_dragging = ctx.input(|i| !i.raw.hovered_files.is_empty());
+        let app_dragging =
+            egui::DragAndDrop::payload::<crate::drumpad_panel::DraggedMedia>(ctx).is_some();
+        self.drumpad_hover = if os_dragging || app_dragging {
+            hover_pos.and_then(|p| crate::drumpad_panel::pad_at(rect, p))
+        } else {
+            None
+        };
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        if !dropped.is_empty() {
+            if let Some(pad) = hover_pos.and_then(|p| crate::drumpad_panel::pad_at(rect, p)) {
+                // N files land on N consecutive pads, the RS5k rack's rule.
+                for (n, file) in dropped.into_iter().enumerate() {
+                    let Some(path) = file.path else { continue };
+                    let at = pad + n;
+                    if at >= recorder::DRUM_PADS {
+                        break;
+                    }
+                    if let Err(e) = self.drumpad_load(at, &path) {
+                        self.track.error = e;
+                    }
+                }
+            }
+        }
+        if app_dragging && released {
+            if let Some(pad) = hover_pos.and_then(|p| crate::drumpad_panel::pad_at(rect, p)) {
+                if let Some(media) =
+                    egui::DragAndDrop::take_payload::<crate::drumpad_panel::DraggedMedia>(ctx)
+                {
+                    if let Err(e) = self.drumpad_load(pad, &media.0) {
+                        self.track.error = e;
+                    }
+                }
+            }
+        }
+
+        // ── gestures in flight ───────────────────────────────────────────
+        if let Some(off) = self.drumpad_move {
+            if pointer_down {
+                if let Some(p) = pointer {
+                    self.drumpad_pos = Some(p - off);
+                }
+            } else {
+                self.drumpad_move = None;
+            }
+            return;
+        }
+        if let Some(grab) = self.drumpad_grab {
+            if pointer_down {
+                if let Some(p) = pointer {
+                    let (lo, hi) = grab.param.range();
+                    // Up is more, and Shift is the fine grip — the faders'
+                    // own grammar.
+                    let fine = if shift { 0.1 } else { 1.0 };
+                    let v = grab.from_value
+                        + (grab.from.y - p.y) / crate::drumpad_panel::KNOB_TRAVEL
+                            * (hi - lo)
+                            * fine;
+                    self.drumpad_set(grab.param, v);
+                }
+            } else {
+                self.drumpad_grab = None;
+                self.drumpad_save();
+            }
+            return;
+        }
+        if released {
+            if let Some(pad) = self.drumpad_down.take() {
+                self.request_recorder(recorder::RecorderRequest::PadHit {
+                    pad: pad as u8,
+                    on: false,
+                });
+            }
+        }
+
+        // ── presses ──────────────────────────────────────────────────────
+        if !pressed {
+            return;
+        }
+        let Some(p) = pointer else { return };
+        if !rect.contains(p) {
+            // A press on the world outside puts the popup away; the press
+            // still lands where it fell — the editor's own manner.
+            self.close_drumpad();
+            return;
+        }
+        let hit = {
+            let view = self.drumpad_view();
+            crate::drumpad_panel::hit_test(rect, &view, p)
+        };
+        use crate::drumpad_panel::Hit as H;
+        match hit {
+            Some(H::Close) => self.close_drumpad(),
+            Some(H::Midi) => self.drumpad_midi = !self.drumpad_midi,
+            Some(H::Pad(i)) => {
+                self.drumpad_sel = i;
+                // Strike on the press; the off rides the release above. An
+                // empty pad only selects — there is nothing to sound.
+                if !self.drumpad.pads[i].path.is_empty() {
+                    self.drumpad_down = Some(i);
+                    self.request_recorder(recorder::RecorderRequest::PadHit {
+                        pad: i as u8,
+                        on: true,
+                    });
+                }
+            }
+            Some(H::Knob(param)) => {
+                let double = ctx
+                    .input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
+                if double {
+                    // One rule for every control that travels: a double
+                    // click puts it back.
+                    self.drumpad_set(param, param.default_value());
+                    self.drumpad_save();
+                } else {
+                    self.drumpad_grab = Some(DrumpadGrab {
+                        param,
+                        from: p,
+                        from_value: self.drumpad_get(param),
+                    });
+                }
+            }
+            Some(H::Choke) => {
+                let sel = self.drumpad_sel.min(recorder::DRUM_PADS - 1);
+                let g = &mut self.drumpad.pads[sel].params.choke;
+                *g = (*g + 1) % (crate::drumpad_panel::CHOKE_GROUPS + 1);
+                self.drumpad_save();
+            }
+            Some(H::Clear) => self.drumpad_clear_selected(),
+            Some(H::Strip) => self.drumpad_move = Some(p - rect.min),
+            None => {}
+        }
+    }
+
+    // ── the drumpad, as the host sees it ─────────────────────────────────
+
+    /// The kit's contents changed since the host last asked. Taken once,
+    /// like `take_clips_dirty`: the host answers by re-decoding the paths
+    /// and pushing the engine a fresh kit.
+    pub fn take_drumpad_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.drumpad_dirty)
+    }
+
+    /// Every pad's file, resolved against the open project. `None` for an
+    /// empty pad.
+    pub fn drumpad_paths(&self) -> [Option<std::path::PathBuf>; recorder::DRUM_PADS] {
+        std::array::from_fn(|i| {
+            let slot = &self.drumpad.pads[i];
+            if slot.path.is_empty() {
+                return None;
+            }
+            self.project_doc()
+                .map(|doc| crate::drumpad::resolve(doc, &slot.path))
+        })
+    }
+
+    /// The kit's knobs, whole, for the engine's every-frame push.
+    pub fn drum_kit_params(&self) -> recorder::DrumKitParams {
+        self.drumpad.params()
+    }
+
+    /// Whether live MIDI notes in the pads' range should mirror onto the
+    /// pads: the panel is up and its MIDI chip is lit.
+    pub fn drumpad_live(&self) -> bool {
+        self.drumpad_open && self.drumpad_midi
+    }
+
+    /// What the host learned decoding each slot, pushed after each reload.
+    pub fn set_drumpad_status(
+        &mut self,
+        status: [crate::ports::PadStatus; recorder::DRUM_PADS],
+    ) {
+        self.drumpad_status = status;
+    }
+
+    /// The engine's read-and-reset pad peaks, merged in. The flash keeps
+    /// the loudest strike since it last faded; the fade itself runs in
+    /// `paint`, where the frames are.
+    pub fn note_drumpad_peaks(&mut self, peaks: [f32; recorder::DRUM_PADS]) {
+        for (have, new) in self.drumpad_peaks.iter_mut().zip(peaks) {
+            *have = have.max(new.min(1.5));
+        }
+    }
+
     fn close_midi_editor(&mut self) {
         if let Some(st) = self.midi_edit.take() {
             if let Some(key) = st.down_key {
@@ -4646,14 +5153,21 @@ impl IvoryApp {
         if self.midi_edit.is_none() {
             return;
         }
-        // Esc closes from anywhere; the rest wants the pointer on the panel.
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        // Esc closes from anywhere — unless the drumpad floats above this
+        // popup, in which case this frame's Esc was the drumpad's and one
+        // press must not put both away.
+        if !self.drumpad_open && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.close_midi_editor();
             return;
         }
         let Some(rect) = self.midi_edit_rect else {
             return;
         };
+        // The drumpad floats above: while the hand is on it, or one of its
+        // gestures is in flight, the editor stands down like the lanes do.
+        if self.drumpad_owns(ctx.input(|i| i.pointer.interact_pos())) {
+            return;
+        }
         // The clip can vanish under the editor (Delete in the arrangement,
         // a project switch): the popup must not outlive its subject.
         if !self
@@ -4928,8 +5442,9 @@ impl IvoryApp {
             )
         });
         // The MIDI editor's ground: while the hand is on the popup — or a
-        // note gesture is in flight — the lanes under it stand down.
-        if self.midi_edit_owns(pointer) {
+        // note gesture is in flight — the lanes under it stand down. The
+        // drumpad floats over both, on the same rule.
+        if self.midi_edit_owns(pointer) || self.drumpad_owns(pointer) {
             return;
         }
 
@@ -5237,10 +5752,17 @@ impl IvoryApp {
 
         // ── files dropped from the outside world ──────────────────────────
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
-        if !dropped.is_empty() {
-            let at = pointer
-                .or_else(|| ctx.input(|i| i.pointer.hover_pos()))
-                .filter(|p| rect.contains(*p));
+        // A drop inside the floating drumpad is the drumpad's own — its
+        // input took it this frame — and must not ALSO land on a lane. Its
+        // own check rather than the stand-down above, because a drop can
+        // arrive with no interact position at all.
+        let drop_pos = pointer.or_else(|| ctx.input(|i| i.pointer.hover_pos()));
+        let pad_claims = self.drumpad_open
+            && drop_pos
+                .zip(self.drumpad_rect)
+                .is_some_and(|(p, r)| r.contains(p));
+        if !dropped.is_empty() && !pad_claims {
+            let at = drop_pos.filter(|p| rect.contains(*p));
             let (lane, t) = match at {
                 Some(p) => {
                     let clips = self.arr_clip_views();
@@ -6808,6 +7330,15 @@ impl IvoryApp {
                 self.mixer_open = mixer;
                 self.mixer_grab = None;
                 self.arr_drag = None;
+            }
+            // A popup, not a Tab stop: it rises over whichever view is up
+            // and goes away by the same key, Esc, its ×, or a press outside.
+            K::ToggleDrumpad => {
+                if self.drumpad_open {
+                    self.close_drumpad();
+                } else {
+                    self.drumpad_open = true;
+                }
             }
             K::TransposeUp => self.transpose_by(1),
             K::TransposeDown => self.transpose_by(-1),
@@ -9062,6 +9593,26 @@ impl IvoryApp {
                 self.setup_open = false;
             }
         }
+        // **The drumpad, over every view and both popup planes**, under only
+        // the thanks card and the help card. It floats wherever you are —
+        // that is its whole point — so it is drawn here rather than inside
+        // one view's branch the way the MIDI editor is.
+        if self.drumpad_open {
+            // The flash fades HERE, where the frames are: the engine's
+            // peaks arrive through `note_drumpad_peaks` as maxima, and this
+            // is the decay that turns them into a strike you can see.
+            for p in &mut self.drumpad_peaks {
+                *p = if *p > 0.02 { *p * 0.78 } else { 0.0 };
+            }
+            let r = crate::drumpad_panel::place(ui.max_rect(), self.drumpad_pos);
+            if r.is_positive() {
+                let view = self.drumpad_view();
+                crate::drumpad_panel::draw(ui.painter(), r, &view);
+            }
+            self.drumpad_rect = r.is_positive().then_some(r);
+        } else {
+            self.drumpad_rect = None;
+        }
         if let Some(hr) = heart_rect_for_card {
             if ctx.pointer_latest_pos().is_some_and(|p| hr.contains(p)) {
                 chord_strip::draw_thanks(ui.painter(), hr, ui.max_rect(), self.settings.dark_mode);
@@ -9345,6 +9896,7 @@ impl IvoryApp {
         if !self.arrangement_open && self.midi_edit.is_some() {
             self.close_midi_editor();
         }
+        self.drumpad_input(&ctx);
         self.midi_editor_input(&ctx);
         self.arrangement_input(&ctx);
 

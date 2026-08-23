@@ -161,6 +161,18 @@ pub struct FileRequest {
 /// `ivory-ui` gets an outline it can draw and a length it can label; what a
 /// peak envelope is, and how many megabytes it came from, is the recorder's
 /// business.
+/// What the host learned decoding one drumpad slot, pushed after every kit
+/// reload — the pad's picture of itself, from the side that can read files.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PadStatus {
+    /// Decoded and handed to the engine: this pad will sound.
+    pub loaded: bool,
+    /// The document names a file the host could not read.
+    pub missing: bool,
+    /// A peak envelope, 0..=1, left to right across the sample.
+    pub wave: Vec<f32>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TrackInfo {
     /// The file's name, or empty when nothing is loaded.

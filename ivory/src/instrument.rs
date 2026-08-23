@@ -6286,6 +6286,12 @@ mod tests {
             track_retiring: RingBuffer::<Vec<Placed>>::new(2).0,
             midi_incoming: RingBuffer::<Vec<PlacedMidi>>::new(2).1,
             midi_retiring: RingBuffer::<Vec<PlacedMidi>>::new(2).0,
+            pad_kit: PadKit::default(),
+            pad_incoming: RingBuffer::<PadKit>::new(2).1,
+            pad_retiring: RingBuffer::<PadKit>::new(2).0,
+            pad_voices: [PadVoice::default(); PADS],
+            pad_hits: Vec::with_capacity(MAX_PAD_HITS_PER_BLOCK),
+            pad_gain: 1.0,
             shared,
             timebase: Timebase::new(),
             rate: RATE,
@@ -6747,6 +6753,129 @@ mod tests {
             "a note with no plugin loaded produced {peak}, which is silence"
         );
         assert!(peak <= 1.0, "the built-in clipped the device at {peak}");
+    }
+
+    /// A kit whose pads hold one constant-value stereo sample, for asserting
+    /// exact levels through the real render path.
+    fn test_kit(pads: &[usize], frames: usize, value: f32) -> PadKit {
+        let mut kit = PadKit::default();
+        let clip = Arc::new(ivory_record::decode::Clip {
+            samples: vec![value; frames * 2],
+            rate: RATE as u32,
+            source: std::path::PathBuf::new(),
+        });
+        for &p in pads {
+            kit.pads[p] = Some(Arc::clone(&clip));
+        }
+        kit
+    }
+
+    /// **A channel-10 note strikes the pad and spares the piano.**
+    ///
+    /// End to end through the real renderer: the diversion happens in
+    /// `collect_notes` and the sound in `mix_pads`, and a unit test of
+    /// either would pass with the other unwired. The level is exact —
+    /// constant sample × velocity — because nothing else is running.
+    #[test]
+    fn a_channel_ten_note_strikes_the_pad_and_spares_the_piano() {
+        let (mut r, mut tx, _shared) = renderer_with_midi(2);
+        r.pad_kit = test_kit(&[0], 48_000, 0.5);
+
+        queue(&mut tx, 0, [0x99, 36, 100]);
+        let mut out = vec![0.0_f32; 2 * 2048];
+        r.render(&mut out, 0, 0);
+        let peak = out.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+        let want = 0.5 * 100.0 / 127.0;
+        assert!(
+            (peak - want).abs() < 0.01,
+            "the pad struck at {peak}, wanted {want}"
+        );
+        assert!(
+            !r.builtin.active(),
+            "a drum-channel note reached the piano through a loaded kit"
+        );
+    }
+
+    /// **With no kit, channel 10 reaches the lanes exactly as it always
+    /// did** — an empty drumpad must not eat somebody's channel-10 rig.
+    #[test]
+    fn an_empty_kit_lets_channel_ten_reach_the_lanes() {
+        let (mut r, mut tx, _shared) = renderer_with_midi(2);
+        queue(&mut tx, 0, [0x99, 60, 100]);
+        let mut out = vec![0.0_f32; 2 * 2048];
+        r.render(&mut out, 0, 0);
+        let peak = out.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+        assert!(
+            peak > 0.01,
+            "a channel-10 note with no kit loaded produced {peak}"
+        );
+        assert!(r.builtin.active(), "the built-in never saw the note");
+    }
+
+    /// **A shared choke group: the second pad ends the first.** The steal
+    /// fade is ~5 ms, so past it the buffer carries ONE pad's level, not
+    /// two — which is the hat pattern the groups exist for. And the same
+    /// arithmetic pins the self-choke: a retriggered pad never doubles.
+    #[test]
+    fn a_choke_group_cuts_the_other_pad_and_a_retrigger_never_doubles() {
+        let (mut r, mut tx, shared) = renderer_with_midi(2);
+        r.pad_kit = test_kit(&[0, 1], 480_000, 0.5);
+        shared.pad_choke[0].store(1, Ordering::Relaxed);
+        shared.pad_choke[1].store(1, Ordering::Relaxed);
+        let one = 0.5 * 100.0 / 127.0;
+
+        let mut out = vec![0.0_f32; 2 * 2048];
+        queue(&mut tx, 0, [0x99, 36, 100]);
+        r.render(&mut out, 0, 0);
+
+        queue(&mut tx, 0, [0x99, 37, 100]);
+        r.render(&mut out, 0, 0);
+        // The tail of the buffer is well past the steal fade: pad 37 alone.
+        let tail = &out[out.len() / 2..];
+        let peak = tail.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+        assert!(
+            (peak - one).abs() < 0.01,
+            "after the choke the tail held {peak}, wanted one pad's {one}"
+        );
+
+        // And the self-choke: strike 37 again — still one voice's worth.
+        queue(&mut tx, 0, [0x99, 37, 100]);
+        r.render(&mut out, 0, 0);
+        let tail = &out[out.len() / 2..];
+        let peak = tail.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+        assert!(
+            (peak - one).abs() < 0.01,
+            "a retrigger doubled the pad to {peak}"
+        );
+    }
+
+    /// **A kit swap silences the voices and returns the old kit** — the
+    /// clips' protocol, held to on the pads: the displaced samples come
+    /// back whole to be dropped off the audio thread, and no voice plays
+    /// on into a waveform that just left.
+    #[test]
+    fn a_kit_swap_silences_the_voices_and_returns_the_old_kit() {
+        let (mut r, mut tx, _shared) = renderer_with_midi(2);
+        r.pad_kit = test_kit(&[0], 480_000, 0.5);
+        let mut out = vec![0.0_f32; 2 * 2048];
+        queue(&mut tx, 0, [0x99, 36, 100]);
+        r.render(&mut out, 0, 0);
+        assert!(out.iter().any(|s| s.abs() > 0.01), "the pad never sounded");
+
+        let (mut to, incoming) = RingBuffer::<PadKit>::new(2);
+        let (retiring, mut from) = RingBuffer::<PadKit>::new(2);
+        r.pad_incoming = incoming;
+        r.pad_retiring = retiring;
+        to.push(test_kit(&[1], 4800, 0.25)).expect("room for the kit");
+
+        r.render(&mut out, 0, 0);
+        let peak = out.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+        assert!(
+            peak < 1.0e-4,
+            "a voice survived the swap into a different kit at {peak}"
+        );
+        let old = from.pop().expect("the displaced kit came back");
+        assert!(old.pads[0].is_some(), "the wrong kit was returned");
     }
 
     /// **An arrangement of clips plays placed, trimmed, and faded.**

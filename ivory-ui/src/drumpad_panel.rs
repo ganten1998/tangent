@@ -364,12 +364,12 @@ fn knob(painter: &Painter, r: Rect, label: &str, word: &str, frac: f32, active: 
     let line_y = r.bottom() - 3.0;
     painter.line_segment(
         [Pos2::new(r.left(), line_y), Pos2::new(r.right(), line_y)],
-        Stroke::new(1.0, ink.gamma_multiply(0.25)),
+        Stroke::new(1.0_f32, ink.gamma_multiply(0.25)),
     );
     let x = r.left() + r.width() * frac.clamp(0.0, 1.0);
     painter.line_segment(
         [Pos2::new(x, line_y - 3.0), Pos2::new(x, line_y + 2.0)],
-        Stroke::new(2.0, ink),
+        Stroke::new(2.0_f32, ink),
     );
 }
 
@@ -384,16 +384,19 @@ fn chip(painter: &Painter, r: Rect, word: &str, lit: bool, lit_ink: Color32) {
     painter.rect_stroke(
         r,
         3.0,
-        Stroke::new(1.0, lit_ink.gamma_multiply(if lit { 0.9 } else { 0.4 })),
+        Stroke::new(1.0_f32, lit_ink.gamma_multiply(if lit { 0.9 } else { 0.4 })),
         egui::StrokeKind::Inside,
     );
-    painter.text(
-        r.center(),
-        Align2::CENTER_CENTER,
-        word,
-        font(r.height() * 0.55),
-        if lit { FACE } else { lit_ink.gamma_multiply(0.7) },
-    );
+    let size = fit_text(r.shrink2(Vec2::new(3.0, 0.0)), word, r.height() * 0.55);
+    if size >= MIN_TEXT {
+        painter.text(
+            r.center(),
+            Align2::CENTER_CENTER,
+            word,
+            font(size),
+            if lit { FACE } else { lit_ink.gamma_multiply(0.7) },
+        );
+    }
 }
 
 pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
@@ -408,7 +411,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
     painter.rect_stroke(
         l.panel,
         4.0,
-        Stroke::new(1.5, INK.gamma_multiply(0.5)),
+        Stroke::new(1.5_f32, INK.gamma_multiply(0.5)),
         egui::StrokeKind::Inside,
     );
 
@@ -428,7 +431,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
         for s in [-1.0f32, 1.0] {
             painter.line_segment(
                 [Pos2::new(c.x - a, c.y - a * s), Pos2::new(c.x + a, c.y + a * s)],
-                Stroke::new(1.5, INK.gamma_multiply(0.7)),
+                Stroke::new(1.5_f32, INK.gamma_multiply(0.7)),
             );
         }
     }
@@ -447,7 +450,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
         if pad.loaded || pad.missing {
             painter.rect_filled(r, 3.0, Color32::from_rgba_premultiplied(0, 0, 0, 110));
         } else {
-            painter.rect_filled(r, 3.0, Color32::from_rgba_premultiplied(255, 255, 255, 5));
+            painter.rect_filled(r, 3.0, Color32::from_white_alpha(6));
         }
 
         // The waveform ghost, faint, across the pad's middle.
@@ -479,19 +482,19 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
         // A file drag standing over this pad.
         if view.drop_hover == Some(i) {
             painter.rect_filled(r, 3.0, Color32::from_white_alpha(24));
-            painter.rect_stroke(r, 3.0, Stroke::new(2.0, INK), egui::StrokeKind::Inside);
+            painter.rect_stroke(r, 3.0, Stroke::new(2.0_f32, INK), egui::StrokeKind::Inside);
         } else if view.selected == i {
             painter.rect_stroke(
                 r,
                 3.0,
-                Stroke::new(1.5, INK.gamma_multiply(0.9)),
+                Stroke::new(1.5_f32, INK.gamma_multiply(0.9)),
                 egui::StrokeKind::Inside,
             );
         } else {
             painter.rect_stroke(
                 r,
                 3.0,
-                Stroke::new(1.0, Color32::from_black_alpha(140)),
+                Stroke::new(1.0_f32, Color32::from_black_alpha(140)),
                 egui::StrokeKind::Inside,
             );
         }
@@ -564,7 +567,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
             Pos2::new(l.panel.left() + GAP, l.inspector.top()),
             Pos2::new(l.panel.right() - GAP, l.inspector.top()),
         ],
-        Stroke::new(1.0, INK.gamma_multiply(0.2)),
+        Stroke::new(1.0_f32, INK.gamma_multiply(0.2)),
     );
     let sel = &view.pads[view.selected.min(DRUM_PADS - 1)];
     let has = sel.loaded || sel.missing;
