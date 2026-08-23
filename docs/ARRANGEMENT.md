@@ -514,6 +514,26 @@ channels play back their clips and nothing else. "Ready to play" and
   warm browns dark), D toggles the open view's own stored flag
   (dark_mode / arr_dark / me_dark). Band default colour 97,55,58.
 
+- **4.61.0 — the closing items before the release audit**: COPY/PASTE
+  actually fires now (the winit layer delivers the platform chord as
+  `Event::Copy`/`Event::Paste`, never as a C/V keypress — the binds
+  listen for the events). View navigation reworked for Windows' sake:
+  Ctrl+A/M/V retired (Ctrl+V is paste there); Tab cycles THEORY →
+  ARRANGE → MIXER; Shift+1/2/3 jumps straight to each; help cards
+  updated. Arrange headers stack TOP-DOWN: label, INPUT strip, then
+  the THREE BAYS — both full column width. Empty slots wear full-width
+  separators (header through field). Drumpad: the DEF chip (left of
+  MIDI) remembers the CURRENT folder as the explorer's default across
+  launches; the pad menu grew an editable NAME row (falls back to the
+  file stem; a new file clears it); the editor's keys column widened
+  66pt so those names fit. Arrange meters LIVE (the ballistics update
+  had shipped inside the drumpad's branch — meters only moved with the
+  pads open) and draw a stereo PAIR on stereo sources, one bar on
+  mono. Drag-retrigger capped to ONE CHORD (the grabbed note's start
+  names it — forty notes retriggering scaled awfully). The Track
+  dialog's Done sits in an ABSOLUTE seat at the frame's corner with
+  the content scrolling above it — no arithmetic left to clip it.
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index

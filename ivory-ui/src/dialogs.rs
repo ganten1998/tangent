@@ -4323,6 +4323,25 @@ pub fn show(
                     egui::Frame::NONE
                         .inner_margin(egui::Margin::same(12))
                         .show(ui, |ui| {
+                            // **Done owns a fixed seat at the frame's own
+                            // corner** — computed from the window, not from
+                            // however tall the content ran — and the content
+                            // SCROLLS above it. There is no arithmetic left
+                            // to get wrong: the button cannot leave.
+                            let done_rect = {
+                                let full = ui.max_rect();
+                                egui::Rect::from_min_size(
+                                    egui::Pos2::new(
+                                        full.right() - 58.0,
+                                        full.bottom() - 24.0,
+                                    ),
+                                    Vec2::new(56.0, 22.0),
+                                )
+                            };
+                            egui::ScrollArea::vertical()
+                                .max_height((ui.available_height() - 32.0).max(60.0))
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
                             if removable {
                                 if ui
                                     .add_sized(
@@ -4483,28 +4502,16 @@ pub fn show(
                                     }
                                 });
                             }
-                            // The stretch pins Done to the BOTTOM of
-                            // whatever height the window really has — the
-                            // About dialog's own idiom, which has never
-                            // clipped.
-                            ui.add_space((ui.available_height() - 34.0).max(4.0));
-                            ui.horizontal(|ui| {
-                                let pad = (ui.available_width()
-                                    - 56.0
-                                    - ui.spacing().item_spacing.x
-                                    - 2.0)
-                                    .max(0.0);
-                                ui.add_space(pad);
-                                if ui
-                                    .add_sized(
-                                        Vec2::new(56.0, 22.0),
-                                        Button::new(RichText::new("Done").color(t.text)),
-                                    )
-                                    .clicked()
-                                {
-                                    result.close = true;
-                                }
                             });
+                            if ui
+                                .put(
+                                    done_rect,
+                                    Button::new(RichText::new("Done").color(t.text)),
+                                )
+                                .clicked()
+                            {
+                                result.close = true;
+                            }
                         });
                 },
             )

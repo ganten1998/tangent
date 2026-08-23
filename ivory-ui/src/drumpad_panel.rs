@@ -103,6 +103,8 @@ pub struct DrumpadView<'a> {
     pub media_scroll: usize,
     /// The highlighted media row — the click's own selection.
     pub media_sel: Option<usize>,
+    /// Whether the OPEN folder is the remembered default — the DEF lamp.
+    pub def_lit: bool,
     /// A knob value being TYPED: which knob, and the digits so far.
     pub typing: Option<(Param, &'a str)>,
 }
@@ -113,6 +115,9 @@ pub enum Hit {
     Close,
     /// The MIDI chip: toggle the live-note mirror.
     Midi,
+    /// The DEF chip: remember the CURRENT media folder as the default —
+    /// where every fresh open of this window lands, across launches.
+    Def,
     /// A pad: strike it, and select it for the inspector.
     Pad(usize),
     /// A knob in the inspector — a horizontal drag target, because the
@@ -166,6 +171,7 @@ pub struct Layout {
     pub strip: Rect,
     pub close: Rect,
     pub midi: Rect,
+    pub def: Rect,
     pub grid: Rect,
     pub pads: [Rect; DRUM_PADS],
     pub inspector: Rect,
@@ -190,6 +196,7 @@ impl Layout {
             strip: Rect::NOTHING,
             close: Rect::NOTHING,
             midi: Rect::NOTHING,
+            def: Rect::NOTHING,
             grid: Rect::NOTHING,
             pads: [Rect::NOTHING; DRUM_PADS],
             inspector: Rect::NOTHING,
@@ -223,6 +230,7 @@ impl Layout {
         };
         let close = cell(side);
         let midi = cell(side * 2.2);
+        let def = cell(side * 2.2);
 
         // **The panel is twice the machine now**: pads and inspector on
         // the LEFT half, the media explorer on the right — browse, then
@@ -293,6 +301,7 @@ impl Layout {
             strip,
             close,
             midi,
+            def,
             grid,
             pads,
             inspector,
@@ -504,6 +513,8 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
         INK,
     );
     chip(painter, l.midi, "MIDI", view.midi_on, INK);
+    // DEF: the current folder IS the remembered one while lit.
+    chip(painter, l.def, "DEF", view.def_lit, AMBER);
     if l.close.is_positive() {
         let c = l.close.center();
         let a = l.close.width() * 0.28;
@@ -809,7 +820,11 @@ pub fn hit_test(rect: Rect, view: &DrumpadView<'_>, pos: Pos2) -> Option<Hit> {
     if !l.panel.is_positive() || !l.panel.contains(pos) {
         return None;
     }
-    for (r, hit) in [(l.close, Hit::Close), (l.midi, Hit::Midi)] {
+    for (r, hit) in [
+        (l.close, Hit::Close),
+        (l.midi, Hit::Midi),
+        (l.def, Hit::Def),
+    ] {
         if r.is_positive() && r.contains(pos) {
             return Some(hit);
         }
@@ -883,6 +898,7 @@ mod tests {
         };
         DrumpadView {
             media_sel: None,
+            def_lit: false,
             typing: None,
             pads,
             peaks: [0.0; DRUM_PADS],

@@ -25,6 +25,9 @@ pub struct PadSlot {
     /// `media/<file>` against the project directory — [`resolve`] pays the
     /// rule — or empty for an empty pad.
     pub path: String,
+    /// What the pad CALLS its clip — the menu's editable field. Empty
+    /// falls back to the file's stem.
+    pub name: String,
     pub params: DrumPadParams,
 }
 
@@ -112,6 +115,9 @@ impl DrumpadDoc {
             if let Some(path) = p.get("path").and_then(Value::as_str) {
                 slot.path = path.to_owned();
             }
+            if let Some(name) = p.get("name").and_then(Value::as_str) {
+                slot.name = name.to_owned();
+            }
             let f = |key: &str, lo: f32, hi: f32, or: f32| {
                 p.get(key)
                     .and_then(Value::as_f64)
@@ -145,6 +151,7 @@ impl DrumpadDoc {
             .map(|slot| {
                 let mut p = Map::new();
                 p.insert("path".into(), Value::from(slot.path.clone()));
+                p.insert("name".into(), Value::from(slot.name.clone()));
                 p.insert("gain".into(), Value::from(f64::from(slot.params.gain)));
                 p.insert("pan".into(), Value::from(f64::from(slot.params.pan)));
                 p.insert("tune".into(), Value::from(f64::from(slot.params.tune)));

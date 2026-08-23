@@ -246,7 +246,7 @@ fn describe(a: KeyAction) -> &'static str {
         KeyAction::ToggleKeytoggle => "keytoggle: click the piano or the neck to place notes",
         KeyAction::ClearNotes => "clear every note you placed",
         KeyAction::ToggleFretboard => "guitar view",
-        KeyAction::ToggleMixer => "cycle piano / mixer / arrangement",
+        KeyAction::ToggleMixer => "cycle theory / arrange / mixer",
         KeyAction::ToggleCameraPane => "camera",
         KeyAction::CycleClef => "clef",
         KeyAction::ToggleNoteNames => "note names",
@@ -406,15 +406,15 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
     match view {
         // The view keys, each card naming only the OTHER surfaces.
         HelpView::Piano => rows.extend([
-            ("C-M", "ctrl+M: the mixer"),
-            ("C-A", "ctrl+A: the arrangement"),
+            ("S-2", "shift+2: the arrangement"),
+            ("S-3", "shift+3: the mixer"),
         ]),
         HelpView::Mixer => rows.extend([
             ("R-CLK", "channel: the track menu · loaded insert: delete / replace"),
             ("2-CLK", "rename a channel · reset a fader"),
             ("C-T", "ctrl+T: a new track"),
-            ("C-A", "ctrl+A: the arrangement"),
-            ("C-V", "ctrl+V: the visualizer"),
+            ("S-1", "shift+1: the theory view"),
+            ("S-2", "shift+2: the arrangement"),
         ]),
         HelpView::Arrange => rows.extend([
             ("DRAG", "move a clip · edges trim · corners fade"),
@@ -427,8 +427,8 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             ("CA-WHL", "ctrl+alt: grid finer or coarser"),
             ("NAV", "corner box: drag left/right scrolls · up/down zooms"),
             ("C-T", "ctrl+T: a new track"),
-            ("C-M", "ctrl+M: the mixer"),
-            ("C-V", "ctrl+V: the visualizer"),
+            ("S-1", "shift+1: the theory view"),
+            ("S-3", "shift+3: the mixer"),
         ]),
         HelpView::MidiEdit => rows.extend([
             ("DRAG", "draw a note · body moves the selection · edge stretches"),
@@ -1022,7 +1022,7 @@ mod tests {
         for gates in [Gates::default(), Gates { recorder_shown: true, recorder_available: true, window_sizing: true }] {
             for (label, _) in card_rows(gates, HelpView::Piano) {
                 // The view-key gesture rows are card prose, not bindings.
-                if matches!(label, "C-M" | "C-A") || label.is_empty() {
+                if matches!(label, "S-1" | "S-2" | "S-3") || label.is_empty() {
                     // The view-key gesture rows and the section headings
                     // have no table entry to cross-check.
                     continue;
