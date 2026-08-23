@@ -8622,6 +8622,10 @@ mod tests {
         let mut r = test_renderer(Arc::clone(&shared), tap_tx, 2);
         shared.metro_on.store(true, Ordering::Relaxed);
         shared.metro_gain.store(1.0f32.to_bits(), Ordering::Relaxed);
+        // The click only speaks while the transport does — the owner's
+        // rule — so this render ROLLS.
+        shared.rolling.store(true, Ordering::Relaxed);
+        shared.transport_req.store(1, Ordering::Release);
         r.beats.was_on = true;
         r.beats.restart(0);
 
