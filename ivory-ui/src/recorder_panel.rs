@@ -2661,6 +2661,72 @@ fn toward(c: Color32, bg: Color32, t: f32) -> Color32 {
 /// The metronome with the pendulum cut out in an EXPLICIT background — the
 /// mixer's strips have faces of their own, and a pendulum cut in the band's
 /// leather would print the wrong panel through the icon.
+/// A guitar leaning to the right: the waisted body as two lapped discs,
+/// the neck up at an angle, a squared headstock — the icon picker's second
+/// voice.
+pub(crate) fn draw_guitar(painter: &Painter, b: Rect, ink: Color32, bg: Color32) {
+    let s = b.width();
+    let c = b.center();
+    // The body, low-left: two overlapping discs make the waist.
+    let lower = Pos2::new(c.x - s * 0.18, c.y + s * 0.20);
+    let upper = Pos2::new(c.x - s * 0.02, c.y + s * 0.06);
+    painter.circle_filled(lower, s * 0.24, ink);
+    painter.circle_filled(upper, s * 0.17, ink);
+    // The sound hole, printed in the panel's own face.
+    painter.circle_filled(Pos2::new(c.x - s * 0.10, c.y + s * 0.13), s * 0.07, bg);
+    // The neck, up-right, and its headstock.
+    let w = (s * 0.09).max(1.2);
+    let nock = Pos2::new(c.x + s * 0.30, c.y - s * 0.26);
+    painter.line_segment(
+        [Pos2::new(upper.x + s * 0.06, upper.y - s * 0.08), nock],
+        Stroke::new(w, ink),
+    );
+    painter.rect_filled(
+        Rect::from_center_size(
+            Pos2::new(nock.x + s * 0.04, nock.y - s * 0.05),
+            Vec2::new(s * 0.14, s * 0.11),
+        ),
+        1.0,
+        ink,
+    );
+}
+
+/// A bass: one slim oblong body and a LONGER neck at a shallower angle —
+/// at sixteen pixels the silhouette difference from the guitar is the
+/// reach of that neck, and two fat string seams say the rest.
+pub(crate) fn draw_bass(painter: &Painter, b: Rect, ink: Color32, bg: Color32) {
+    let s = b.width();
+    let c = b.center();
+    let body = Pos2::new(c.x - s * 0.22, c.y + s * 0.22);
+    painter.circle_filled(body, s * 0.20, ink);
+    painter.circle_filled(Pos2::new(body.x + s * 0.10, body.y - s * 0.10), s * 0.14, ink);
+    // Two strings across the body, in the face colour.
+    for dy in [-0.02f32, 0.05] {
+        painter.line_segment(
+            [
+                Pos2::new(body.x - s * 0.14, body.y + s * dy),
+                Pos2::new(body.x + s * 0.16, body.y + s * dy - s * 0.08),
+            ],
+            Stroke::new((s * 0.035).max(1.0), bg),
+        );
+    }
+    // The long neck to the far corner, and a small square head.
+    let w = (s * 0.085).max(1.2);
+    let nock = Pos2::new(c.x + s * 0.38, c.y - s * 0.32);
+    painter.line_segment(
+        [Pos2::new(body.x + s * 0.12, body.y - s * 0.12), nock],
+        Stroke::new(w, ink),
+    );
+    painter.rect_filled(
+        Rect::from_center_size(
+            Pos2::new(nock.x + s * 0.02, nock.y - s * 0.04),
+            Vec2::new(s * 0.11, s * 0.11),
+        ),
+        1.0,
+        ink,
+    );
+}
+
 /// A drum from the side, seen a little from above — the shell as a squat
 /// ellipse pair — with two sticks crossed over it. The DRUM BUS's badge.
 pub(crate) fn draw_drum(painter: &Painter, b: Rect, ink: Color32, bg: Color32) {

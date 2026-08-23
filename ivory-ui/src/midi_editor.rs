@@ -79,8 +79,10 @@ pub enum Hit {
     ToolTriplet,
     /// A note's body — select and move. The index into the clip's notes.
     NoteBody(usize),
-    /// A note's right edge — resize.
+    /// A note's right edge — resize the tail.
     NoteRight(usize),
+    /// A note's LEFT edge — resize the head, snapped like the tail.
+    NoteLeft(usize),
     /// A piano key in the left column — audition.
     Key(u8),
     /// Empty roll: `(absolute seconds, key)`.
@@ -608,6 +610,39 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
                         INK.gamma_multiply(0.55),
                     );
                 }
+                // **The beats between the numbers, as decimals** — 16, then
+                // smaller: 16.2, 16.3, 16.4, until 17 — whenever a beat has
+                // the room. Only at step 1: a decimated ruler has no beats.
+                if step == 1 {
+                    let beats = u64::from(view.sig_top.clamp(1, 32));
+                    let beat_px = bar * px_per_s / beats as f64;
+                    if beat_px >= 26.0 {
+                        for b in 1..beats {
+                            let tb = t + bar * b as f64 / beats as f64;
+                            if tb > view.view_start_s + view.view_len_s {
+                                break;
+                            }
+                            let xb = x_of(&l, view, tb);
+                            if xb < l.roll.left() - 0.5 || xb > l.roll.right() + 0.5 {
+                                continue;
+                            }
+                            painter.line_segment(
+                                [
+                                    Pos2::new(xb, l.ruler.bottom() - 2.5),
+                                    Pos2::new(xb, l.ruler.bottom()),
+                                ],
+                                Stroke::new(1.0, INK.gamma_multiply(0.35)),
+                            );
+                            painter.text(
+                                Pos2::new(xb + 2.0, l.ruler.top() + 2.5),
+                                Align2::LEFT_TOP,
+                                format!("{}.{}", n + 1, b + 1),
+                                font(7.0),
+                                INK.gamma_multiply(0.38),
+                            );
+                        }
+                    }
+                }
                 n += 1;
             }
         }
@@ -727,8 +762,12 @@ pub fn hit_test(rect: Rect, view: &MidiEditView<'_>, pos: Pos2) -> Option<Hit> {
         if !r.is_positive() || !r.contains(pos) {
             continue;
         }
-        if pos.x >= r.right() - EDGE_W.min(r.width() * 0.4) {
+        let edge = EDGE_W.min(r.width() * 0.4);
+        if pos.x >= r.right() - edge {
             return Some(Hit::NoteRight(i));
+        }
+        if pos.x <= r.left() + edge.min(r.width() * 0.3) {
+            return Some(Hit::NoteLeft(i));
         }
         return Some(Hit::NoteBody(i));
     }
@@ -850,6 +889,11 @@ mod tests {
         assert!(r.is_positive(), "the note is off screen");
         assert_eq!(
             hit_test(rect(), &v, Pos2::new(r.left() + 2.0, r.center().y)),
+            Some(Hit::NoteLeft(0)),
+            "the head's grab zone answers the left edge"
+        );
+        assert_eq!(
+            hit_test(rect(), &v, Pos2::new(r.center().x, r.center().y)),
             Some(Hit::NoteBody(0))
         );
         assert_eq!(

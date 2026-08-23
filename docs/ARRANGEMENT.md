@@ -457,6 +457,33 @@ channels play back their clips and nothing else. "Ready to play" and
   notes inline in the document, nothing copied to `media/`. Audio
   drops keep their existing road.
 
+- **4.59.0 — the drum bus retires, the pads grow up**: the DRUM BUS
+  column is GONE from the mixer (the kit renders through ITS LANE's
+  strip — fader, pan, mute, solo, send, meter and STEM; the hidden bus
+  rows remain as engine fallback); silent lanes get NO stem (clips or
+  a loaded bay = a voice, else skipped). Tracks REORDER by drag: the
+  arrange header's number cell and the mixer strip's name both carry
+  the track to a new row/column, everything riding along (kind, input,
+  icon, colour, name, fader, send, arm, bays with their saved states —
+  the host permutes the sidecars — and every clip). The Track menu
+  grew a 4-slot ICON picker (auto/drum/guitar/bass, new glyphs) and
+  finally fits itself. Arrange: empty lanes are etched SLOTS on a
+  raised ground; gridline weights were INVERTED all along — strong
+  lines now full-ink and wide. Right-drag = marquee select (notes AND
+  clips; Delete takes the set), notes resize from BOTH edges snapped
+  to the grid, and the editor ruler shows beat decimals (16, 16.2,
+  16.3...). The drumpad: right-click an occupied pad for its MENU —
+  waveform TRIMMER (start/end handles) and OBEY NOTE-OFFS (per pad,
+  default off, releases fade the voice); pads DRAG to other pads
+  (slots swap whole); the media explorer AUDITIONS on click (engine
+  preview voice, lit row); the inspector lost the name and grew the
+  sliders — click to TYPE a value, double-click resets, drag moves;
+  and the open window finally SWALLOWS its clicks (the mixer under it
+  was adding tracks). Help cards split into GENERAL vs <VIEW> PANEL
+  sections; stale V/W binds retired (the band's toggle returned to the
+  menu); the welcome card says how help works now. Project/export name
+  fields type in WHITE. And the heart's mother is lowercase, as asked.
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index

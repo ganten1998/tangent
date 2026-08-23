@@ -377,6 +377,29 @@ pub struct IvoryApp {
     arr_window: Option<(f64, f64)>,
     /// The selected clip, by document id.
     arr_selected: Option<u64>,
+    /// The pad context menu: which pad it hangs beside, when open.
+    pad_menu: Option<usize>,
+    /// A trim handle mid-drag in the pad menu: `false` = start, `true` = end.
+    pad_trim_drag: Option<bool>,
+    /// A pad being CARRIED to another pad: `(from, origin, active)`.
+    pad_carry: Option<(usize, egui::Pos2, bool)>,
+    /// A drumpad knob value being typed, single-click's own door.
+    drumpad_num: Option<(crate::drumpad_panel::Param, String)>,
+    /// The clicked media row — highlighted, auditioned.
+    media_sel: Option<usize>,
+    /// A strip being carried across the mixer: `(from, origin, active)` —
+    /// active once the hand has really moved, so a rename's double-click
+    /// never turns into a shuffle.
+    mixer_reorder: Option<(usize, egui::Pos2, bool)>,
+    /// A track reorder's permutation, waiting for the HOST to move the
+    /// plugin-state sidecars and reload the racks: `order[new] = old`,
+    /// channel space. Taken once.
+    desk_state_perm: Option<Vec<usize>>,
+    /// The marquee'd SET of clips, beside the single selection — the
+    /// right-drag band fills it, Delete empties it with the clips.
+    arr_multi: Vec<u64>,
+    /// A selection band in flight, both corners in screen space.
+    arr_band: Option<(egui::Pos2, egui::Pos2)>,
     /// The gesture in flight on the arrangement, if any.
     arr_drag: Option<ArrDrag>,
     /// A clip edit happened during the current gesture: save on release.
@@ -667,6 +690,10 @@ struct Grab {
 /// never makes the thing jump to the pointer.
 #[derive(Debug, Clone, Copy)]
 enum ArrDrag {
+    /// The right button's selection band over the lanes.
+    ClipBand,
+    /// A track being carried to another row, by its number.
+    ReorderLane { from: usize },
     /// The seam between headers and lanes: the pointer's x IS the width.
     HeaderGrip,
     /// The pointer's distance from the clip's start at the press, so the
@@ -758,6 +785,8 @@ enum MeDrag {
         orig: Vec<(usize, f64, u8)>,
     },
     Resize { i: usize },
+    /// The head: start and duration move together, the end stands still.
+    ResizeLeft { i: usize },
     /// A note being drawn: created at press, its tail follows the hand.
     Create { i: usize },
     /// The velocity lane: the bar under the hand follows it vertically.
@@ -948,6 +977,37 @@ fn swing_menu_row(menu: egui::Rect, i: usize) -> egui::Rect {
     )
 }
 
+/// One row of the pad menu is this tall; the wave strip is taller.
+const PAD_MENU_W: f32 = 216.0;
+const PAD_MENU_WAVE_H: f32 = 46.0;
+const PAD_MENU_ROW_H: f32 = 22.0;
+
+/// Where the pad's context menu stands: beside its pad, held inside the
+/// drumpad panel.
+fn pad_menu_rect(pad: egui::Rect, panel: egui::Rect) -> egui::Rect {
+    let size = egui::Vec2::new(PAD_MENU_W, PAD_MENU_WAVE_H + PAD_MENU_ROW_H + 12.0);
+    let mut min = egui::Pos2::new(pad.right() + 6.0, pad.top());
+    if min.x + size.x > panel.right() - 4.0 {
+        min.x = (pad.left() - size.x - 6.0).max(panel.left() + 4.0);
+    }
+    min.y = min.y.min(panel.bottom() - size.y - 4.0).max(panel.top() + 4.0);
+    egui::Rect::from_min_size(min, size)
+}
+
+/// The menu's wave strip (the trimmer) and its OBEY row.
+fn pad_menu_wave(menu: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::Pos2::new(menu.left() + 6.0, menu.top() + 6.0),
+        egui::Vec2::new(menu.width() - 12.0, PAD_MENU_WAVE_H - 6.0),
+    )
+}
+fn pad_menu_obey(menu: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::Pos2::new(menu.left() + 6.0, menu.top() + PAD_MENU_WAVE_H + 4.0),
+        egui::Vec2::new(menu.width() - 12.0, PAD_MENU_ROW_H),
+    )
+}
+
 /// A drumpad knob being dragged: the same relative-drag contract, against
 /// the drumpad's own travel constant.
 #[derive(Clone, Copy)]
@@ -956,6 +1016,9 @@ struct DrumpadGrab {
     from: Pos2,
     /// The value when grabbed, in the param's own units.
     from_value: f32,
+    /// Whether the hand really travelled — a motionless press-and-release
+    /// is a CLICK, which opens the typed-value field instead.
+    moved: bool,
 }
 
 /// Points of travel for a knob's whole sweep. See the panel's own constant.
@@ -1199,6 +1262,15 @@ impl IvoryApp {
             drumpad_dirty: false,
             arr_window: None,
             arr_selected: None,
+            pad_menu: None,
+            pad_trim_drag: None,
+            pad_carry: None,
+            drumpad_num: None,
+            media_sel: None,
+            mixer_reorder: None,
+            desk_state_perm: None,
+            arr_multi: Vec::new(),
+            arr_band: None,
             arr_drag: None,
             arr_gesture_dirty: false,
             arr_pending: None,
@@ -2575,6 +2647,9 @@ impl IvoryApp {
             self.drumpad.pads[i] = crate::drumpad::PadSlot {
                 path: path.to_owned(),
                 params: recorder::DrumPadParams {
+                    obey: false,
+                    trim_start: 0.0,
+                    trim_end: 1.0,
                     gain,
                     pan,
                     tune,
@@ -2647,6 +2722,12 @@ impl IvoryApp {
                 Strip::Channel(n) => self.channel_kind(n),
                 _ => None,
             };
+            let icon = match s {
+                Strip::Channel(n) => {
+                    self.settings.channel_icons.get(n).copied().unwrap_or(0)
+                }
+                _ => 0,
+            };
             let (name, detail, gain, empty) = match s {
                 // **A channel is a strip whether or not it is used.** An
                 // unused one is drawn as a plus, so the desk never changes
@@ -2705,6 +2786,7 @@ impl IvoryApp {
                     self.insert(i, n).map_or("", plugin_display_name)
                 }),
                 kind,
+                icon,
                 empty,
                 gain,
                 send: desk.send[i],
@@ -2739,6 +2821,7 @@ impl IvoryApp {
                 Some(s) => strip(*s),
                 None => crate::mixer_panel::StripView {
                     strip: None,
+                    icon: 0,
                     name: self
                         .settings
                         .strip_names
@@ -4536,6 +4619,7 @@ impl IvoryApp {
         let sig = self.time_signature();
         crate::arrangement::DeskSnap {
             kinds: self.settings.channel_kinds.to_vec(),
+            icons: self.settings.channel_icons.to_vec(),
             names: self.settings.strip_names.clone(),
             colors: self.settings.strip_colors.to_vec(),
             inserts: self.settings.strip_inserts.clone(),
@@ -4593,6 +4677,9 @@ impl IvoryApp {
             }
             d
         };
+        for (i, ic) in d.icons.iter().take(crate::recorder::CHANNELS).enumerate() {
+            self.settings.channel_icons[i] = (*ic).min(3);
+        }
         for (i, k) in d.kinds.iter().take(crate::recorder::CHANNELS).enumerate() {
             self.settings.channel_kinds[i] = (*k).min(2);
         }
@@ -5023,6 +5110,137 @@ impl IvoryApp {
 
     /// Add a BARE track on channel `n`: it exists, armed with its send up,
     /// and says NO INPUT until the chip binds one — the owner's flow.
+    /// The host's cue that a reorder moved the channels: `order[new] = old`.
+    /// The host saves live plugin states, renames the sidecars to follow,
+    /// and reloads the racks.
+    pub fn take_desk_state_perm(&mut self) -> Option<Vec<usize>> {
+        self.desk_state_perm.take()
+    }
+
+    /// MOVE channel `from` to position `to` — the drag-reorder, both views.
+    /// Everything a channel is follows it: kind, input, icon, colour, name,
+    /// fader, pan, send, mute, solo, arm, bays (the host moves their saved
+    /// states), and every clip on its lane. The rows between shift by one.
+    pub fn move_channel(&mut self, from: usize, to: usize) {
+        use crate::recorder::{CHANNELS, INSERTS, STRIPS};
+        if from >= CHANNELS || to >= CHANNELS || from == to {
+            return;
+        }
+        // Not under a live take: the host's recording lanes are indices.
+        if self.recorder.state.is_active() {
+            return;
+        }
+        // `order[new] = old` — a rotation of the span between.
+        let mut order: Vec<usize> = (0..CHANNELS).collect();
+        let ch = order.remove(from);
+        order.insert(to, ch);
+        // And the inverse, for everything that NAMES a lane.
+        let mut inv = [0usize; crate::recorder::CHANNELS];
+        for (new, old) in order.iter().enumerate() {
+            inv[*old] = new;
+        }
+
+        // ── channel space ────────────────────────────────────────────────
+        self.settings.channel_gains =
+            std::array::from_fn(|n| self.settings.channel_gains[order[n]]);
+        self.settings.channel_pans =
+            std::array::from_fn(|n| self.settings.channel_pans[order[n]]);
+        self.settings.channel_kinds =
+            std::array::from_fn(|n| self.settings.channel_kinds[order[n]]);
+        self.settings.channel_icons =
+            std::array::from_fn(|n| self.settings.channel_icons[order[n]]);
+        while self.settings.channel_inputs.len() < CHANNELS {
+            self.settings.channel_inputs.push(String::new());
+        }
+        let inputs = self.settings.channel_inputs.clone();
+        for n in 0..CHANNELS {
+            self.settings.channel_inputs[n] = inputs[order[n]].clone();
+        }
+        let move_bits_u32 = |mask: u32| -> u32 {
+            let mut out = mask & !((1u32 << CHANNELS) - 1);
+            for n in 0..CHANNELS {
+                if mask & (1 << order[n]) != 0 {
+                    out |= 1 << n;
+                }
+            }
+            out
+        };
+        self.armed = move_bits_u32(self.armed);
+        self.settings.strip_muted = move_bits_u32(self.settings.strip_muted);
+        self.settings.strip_soloed = move_bits_u32(self.settings.strip_soloed);
+        {
+            let mask = self.settings.tracks_added;
+            let mut out = mask & !((1i64 << CHANNELS) - 1);
+            for n in 0..CHANNELS {
+                if mask & (1 << order[n]) != 0 {
+                    out |= 1 << n;
+                }
+            }
+            self.settings.tracks_added = out;
+        }
+
+        // ── strip space, identity above the channels ─────────────────────
+        let colors = self.settings.strip_colors;
+        for n in 0..CHANNELS {
+            self.settings.strip_colors[n] = colors[order[n]];
+        }
+        while self.settings.strip_names.len() < STRIPS + 1 {
+            self.settings.strip_names.push(String::new());
+        }
+        let names = self.settings.strip_names.clone();
+        for n in 0..CHANNELS {
+            self.settings.strip_names[n] = names[order[n]].clone();
+        }
+        let sends = self.settings.strip_sends;
+        for n in 0..CHANNELS {
+            self.settings.strip_sends[n] = sends[order[n]];
+        }
+        let full = (STRIPS + 1 + crate::recorder::DRUM_PADS) * INSERTS;
+        while self.settings.strip_inserts.len() < full {
+            self.settings.strip_inserts.push(String::new());
+        }
+        let inserts = self.settings.strip_inserts.clone();
+        for n in 0..CHANNELS {
+            for b in 0..INSERTS {
+                self.settings.strip_inserts[n * INSERTS + b] =
+                    inserts[order[n] * INSERTS + b].clone();
+            }
+        }
+
+        // ── the document: every clip follows its lane ────────────────────
+        for c in &mut self.arrangement.clips {
+            if c.lane < CHANNELS {
+                c.lane = inv[c.lane];
+            }
+        }
+
+        // ── session state that names a lane ──────────────────────────────
+        self.selected_channel = self.selected_channel.map(|n| {
+            if n < CHANNELS { inv[n] } else { n }
+        });
+        self.input_menu = None;
+        self.mixer_naming = None;
+        self.mixer_typing = None;
+        self.mixer_fx_menu = None;
+        self.mixer_grab = None;
+        self.arr_drag = None;
+        self.arr_pending = None;
+        if let Some((strip, _)) = self.open_insert_on_load.as_mut() {
+            if *strip < CHANNELS {
+                *strip = inv[*strip];
+            }
+        }
+        if let Some((strip, _)) = self.picker_insert.as_mut() {
+            if *strip < CHANNELS {
+                *strip = inv[*strip];
+            }
+        }
+
+        self.desk_state_perm = Some(order);
+        self.save_settings();
+        self.arr_save_edits();
+    }
+
     fn add_bare_track(&mut self, n: usize) {
         if n >= crate::recorder::CHANNELS {
             return;
@@ -5371,7 +5589,8 @@ impl IvoryApp {
                     fade_out_s: c.fade_out_s,
                     name: &c.name,
                     wave,
-                    selected: self.arr_selected == Some(c.id),
+                    selected: self.arr_selected == Some(c.id)
+                        || self.arr_multi.contains(&c.id),
                     midi: c.kind == crate::arrangement::ClipKind::Midi,
                 }
             })
@@ -5558,11 +5777,17 @@ impl IvoryApp {
     /// The Delete key: the SELECTED clip leaves the timeline. The media copy
     /// stays in the project, the way the × keeps material.
     fn arr_delete_selected(&mut self) {
-        let Some(id) = self.arr_selected.take() else {
+        let mut doomed = std::mem::take(&mut self.arr_multi);
+        if let Some(id) = self.arr_selected.take() {
+            if !doomed.contains(&id) {
+                doomed.push(id);
+            }
+        }
+        if doomed.is_empty() {
             return;
-        };
+        }
         let before = self.arrangement.clips.len();
-        self.arrangement.clips.retain(|c| c.id != id);
+        self.arrangement.clips.retain(|c| !doomed.contains(&c.id));
         if self.arrangement.clips.len() != before {
             self.arr_save_edits();
         }
@@ -5809,6 +6034,34 @@ impl IvoryApp {
     /// twentieth and never past the clip's end.
     fn me_resize_note(&mut self, i: usize, t: f64) {
         self.me_resize_note_min(i, t, 0.05);
+    }
+
+    /// RESIZE from the HEAD: the start follows the hand — snapped by the
+    /// grid's own state exactly as the tail is — and the END stands still,
+    /// so lengthening one side never moves the other.
+    fn me_resize_note_left(&mut self, i: usize, t: f64) {
+        let Some(st) = self.midi_edit.as_ref() else {
+            return;
+        };
+        let id = st.id;
+        let t1 = self.me_snap(t);
+        let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
+            return;
+        };
+        let (c0, offset) = (clip.start_s, clip.offset_s);
+        let Some(n) = clip.notes.get_mut(i) else {
+            return;
+        };
+        let abs0 = c0 + (n.at_s - offset);
+        let end = abs0 + n.dur_s.max(0.02);
+        let ns = t1.clamp(c0, end - 0.02);
+        if (ns - abs0).abs() > 1.0e-9 {
+            n.at_s += ns - abs0;
+            n.dur_s = end - ns;
+            if let Some(st) = self.midi_edit.as_mut() {
+                st.dirty = true;
+            }
+        }
     }
 
     /// As [`Self::me_resize_note`], with a floor. The CREATE drag floors at
@@ -6207,6 +6460,12 @@ impl IvoryApp {
         }
         self.drumpad_grab = None;
         self.drumpad_move = None;
+        self.pad_menu = None;
+        self.pad_trim_drag = None;
+        self.pad_carry = None;
+        self.drumpad_num = None;
+        // And whatever the explorer was auditioning goes quiet.
+        self.request_recorder(recorder::RecorderRequest::PreviewStop);
         self.drumpad_hover = None;
         self.drumpad_open = false;
         self.drumpad_rect = None;
@@ -6252,6 +6511,11 @@ impl IvoryApp {
             }
         });
         crate::drumpad_panel::DrumpadView {
+            media_sel: self.media_sel,
+            typing: self
+                .drumpad_num
+                .as_ref()
+                .map(|(p, t)| (*p, t.as_str())),
             pads,
             peaks: self.drumpad_peaks,
             selected: self.drumpad_sel,
@@ -6510,6 +6774,119 @@ impl IvoryApp {
             }
         }
 
+        // ── a knob value being TYPED owns the keys and the next press ────
+        if let Some((param, mut buf)) = self.drumpad_num.clone() {
+            let events = ctx.input(|i| i.events.clone());
+            let mut commit = false;
+            let mut cancel = false;
+            for e in events {
+                match e {
+                    egui::Event::Text(t) => {
+                        for ch in t.chars() {
+                            let dots = buf.matches('.').count();
+                            if (ch.is_ascii_digit() && buf.len() < 7)
+                                || (ch == '.' && dots == 0)
+                                || (ch == '-' && buf.is_empty())
+                            {
+                                buf.push(ch);
+                            }
+                        }
+                    }
+                    egui::Event::Key {
+                        key: egui::Key::Backspace,
+                        pressed: true,
+                        ..
+                    } => {
+                        buf.pop();
+                    }
+                    egui::Event::Key {
+                        key: egui::Key::Enter,
+                        pressed: true,
+                        ..
+                    } => commit = true,
+                    egui::Event::Key {
+                        key: egui::Key::Escape,
+                        pressed: true,
+                        ..
+                    } => cancel = true,
+                    _ => {}
+                }
+            }
+            // A press anywhere commits too — a half-typed figure that
+            // vanishes when you look away is a field nobody trusts.
+            if pressed {
+                commit = true;
+            }
+            if commit || cancel {
+                if commit {
+                    if let Ok(v) = buf.parse::<f32>() {
+                        self.drumpad_set(param, v);
+                        self.drumpad_save();
+                    }
+                }
+                self.drumpad_num = None;
+            } else if let Some(slot) = self.drumpad_num.as_mut() {
+                slot.1 = buf;
+            }
+            if !pressed {
+                return;
+            }
+        }
+
+        // ── the pad MENU, while it hangs: trimmer and the obey switch ────
+        if let Some(pad) = self.pad_menu {
+            let menu = crate::drumpad_panel::Layout::new(rect).pads[pad.min(recorder::DRUM_PADS - 1)];
+            let menu = pad_menu_rect(menu, rect);
+            let wave = pad_menu_wave(menu);
+            // A trim handle mid-drag follows the hand.
+            if let Some(end) = self.pad_trim_drag {
+                if pointer_down {
+                    if let Some(p) = pointer {
+                        let f = ((p.x - wave.left()) / wave.width().max(1.0))
+                            .clamp(0.0, 1.0);
+                        let params = &mut self.drumpad.pads[pad].params;
+                        if end {
+                            params.trim_end = f.max(params.trim_start + 0.02);
+                        } else {
+                            params.trim_start = f.min(params.trim_end - 0.02);
+                        }
+                    }
+                } else {
+                    self.pad_trim_drag = None;
+                    self.drumpad_save();
+                }
+                return;
+            }
+            if pressed {
+                let Some(p) = pointer else { return };
+                if !menu.contains(p) {
+                    // A press outside puts the menu away — and is SWALLOWED.
+                    self.pad_menu = None;
+                    return;
+                }
+                if wave.contains(p) {
+                    // The nearer handle takes the hand.
+                    let params = &self.drumpad.pads[pad].params;
+                    let x0 = wave.left() + wave.width() * params.trim_start;
+                    let x1 = wave.left() + wave.width() * params.trim_end;
+                    self.pad_trim_drag = Some((p.x - x1).abs() < (p.x - x0).abs());
+                    return;
+                }
+                if pad_menu_obey(menu).contains(p) {
+                    let params = &mut self.drumpad.pads[pad].params;
+                    params.obey = !params.obey;
+                    self.drumpad_save();
+                    return;
+                }
+                return;
+            }
+            // While the menu is up nothing below hears the pointer.
+            if ctx.input(|i| i.pointer.secondary_pressed()) {
+                self.pad_menu = None;
+            }
+            return;
+        }
+
         // ── gestures in flight ───────────────────────────────────────────
         if let Some(off) = self.drumpad_move {
             if pointer_down {
@@ -6524,23 +6901,65 @@ impl IvoryApp {
         if let Some(grab) = self.drumpad_grab {
             if pointer_down {
                 if let Some(p) = pointer {
-                    let (lo, hi) = grab.param.range();
-                    // RIGHT is more: the control draws a horizontal travel
-                    // line, and a horizontal control that answered vertical
-                    // motion was the owner's first drumpad complaint.
-                    // Shift is the fine grip, the faders' own grammar.
-                    let fine = if shift { 0.1 } else { 1.0 };
-                    let v = grab.from_value
-                        + (p.x - grab.from.x) / crate::drumpad_panel::KNOB_TRAVEL
-                            * (hi - lo)
-                            * fine;
-                    self.drumpad_set(grab.param, v);
+                    if !grab.moved && (p - grab.from).length() > 3.0 {
+                        if let Some(g) = self.drumpad_grab.as_mut() {
+                            g.moved = true;
+                        }
+                    }
+                    if self.drumpad_grab.is_some_and(|g| g.moved) {
+                        let (lo, hi) = grab.param.range();
+                        // RIGHT is more: the control draws a horizontal travel
+                        // line, and a horizontal control that answered vertical
+                        // motion was the owner's first drumpad complaint.
+                        // Shift is the fine grip, the faders' own grammar.
+                        let fine = if shift { 0.1 } else { 1.0 };
+                        let v = grab.from_value
+                            + (p.x - grab.from.x) / crate::drumpad_panel::KNOB_TRAVEL
+                                * (hi - lo)
+                                * fine;
+                        self.drumpad_set(grab.param, v);
+                    }
                 }
             } else {
+                // **A click, not a drag, TYPES the number** — the sliders'
+                // one language: single click for the field, double for the
+                // default, drag for the hand.
+                let typed = !grab.moved;
                 self.drumpad_grab = None;
-                self.drumpad_save();
+                if typed {
+                    self.drumpad_num = Some((grab.param, String::new()));
+                } else {
+                    self.drumpad_save();
+                }
             }
             return;
+        }
+        // ── a pad being CARRIED to another pad ───────────────────────────
+        if let Some((from, origin, active)) = self.pad_carry {
+            if pointer_down {
+                if let Some(p) = pointer {
+                    if !active && (p - origin).length() > 8.0 {
+                        self.pad_carry = Some((from, origin, true));
+                    }
+                }
+            } else {
+                if active {
+                    if let Some(to) = pointer
+                        .and_then(|p| crate::drumpad_panel::pad_at(rect, p))
+                        .filter(|to| *to != from)
+                    {
+                        // The whole slot rides: path AND knobs, and the
+                        // two pads trade places — nothing is lost either way.
+                        self.drumpad.pads.swap(from, to);
+                        self.drumpad_status.swap(from, to);
+                        self.drumpad_peaks.swap(from, to);
+                        self.drumpad_sel = to;
+                        self.drumpad_save();
+                        self.drumpad_dirty = true;
+                    }
+                }
+                self.pad_carry = None;
+            }
         }
         if released {
             if let Some(pad) = self.drumpad_down.take() {
@@ -6571,9 +6990,20 @@ impl IvoryApp {
         // The right button is the bay's eraser, exactly as the arrangement's
         // notes have it.
         if secondary {
-            if let Some(H::PadInsert(bay)) = hit {
-                let sel = self.drumpad_sel.min(recorder::DRUM_PADS - 1);
-                self.set_insert(recorder::pad_insert_index(sel), bay, None);
+            match hit {
+                Some(H::PadInsert(bay)) => {
+                    let sel = self.drumpad_sel.min(recorder::DRUM_PADS - 1);
+                    self.set_insert(recorder::pad_insert_index(sel), bay, None);
+                }
+                // **An occupied pad answers with its MENU**: the trimmer
+                // and the obey-note-offs switch.
+                Some(H::Pad(i)) => {
+                    if !self.drumpad.pads[i].path.is_empty() {
+                        self.drumpad_sel = i;
+                        self.pad_menu = Some(i);
+                    }
+                }
+                _ => {}
             }
             return;
         }
@@ -6600,16 +7030,25 @@ impl IvoryApp {
                     } else {
                         // A FILE row is a drag source: the press arms it,
                         // and the drag block below carries the payload.
+                        // And the click ITSELF is the audition — the row
+                        // lights, the file plays once.
                         self.media_drag = Some(i);
+                        self.media_sel = Some(i);
+                        self.request_recorder(recorder::RecorderRequest::PreviewFile(
+                            self.media_dir.join(&e.name),
+                        ));
                     }
                 }
             }
             Some(H::Pad(i)) => {
                 self.drumpad_sel = i;
                 // Strike on the press; the off rides the release above. An
-                // empty pad only selects — there is nothing to sound.
+                // empty pad only selects — there is nothing to sound. The
+                // press also ARMS the carry: really moving the hand drags
+                // the clip to another pad.
                 if !self.drumpad.pads[i].path.is_empty() {
                     self.drumpad_down = Some(i);
+                    self.pad_carry = Some((i, p, false));
                     self.request_recorder(recorder::RecorderRequest::PadHit {
                         pad: i as u8,
                         on: true,
@@ -6629,6 +7068,7 @@ impl IvoryApp {
                         param,
                         from: p,
                         from_value: self.drumpad_get(param),
+                        moved: false,
                     });
                 }
             }
@@ -6862,6 +7302,93 @@ impl IvoryApp {
         }
     }
 
+    /// Paint the pad's context menu: the trimmer over the wave, then the
+    /// OBEY NOTE-OFFS switch. Pure; the frame's state was settled in
+    /// `drumpad_input`.
+    fn draw_pad_menu(&self, painter: &egui::Painter, panel: egui::Rect) {
+        let Some(pad) = self.pad_menu else {
+            return;
+        };
+        let pad = pad.min(recorder::DRUM_PADS - 1);
+        let l = crate::drumpad_panel::Layout::new(panel);
+        let Some(anchor) = l.pads.get(pad).copied().filter(|r| r.is_positive()) else {
+            return;
+        };
+        let menu = pad_menu_rect(anchor, panel);
+        let face = egui::Color32::from_rgb(0x24, 0x1B, 0x15);
+        let ink = egui::Color32::from_rgb(0xFF, 0xF4, 0xE0);
+        let green = egui::Color32::from_rgb(0x3D, 0xC0, 0x5A);
+        painter.rect_filled(menu, 4.0, face);
+        painter.rect_stroke(
+            menu,
+            4.0,
+            egui::Stroke::new(1.2, ink.gamma_multiply(0.5)),
+            egui::StrokeKind::Inside,
+        );
+        let wave = pad_menu_wave(menu);
+        painter.rect_filled(wave, 2.0, egui::Color32::from_black_alpha(120));
+        // The sample's envelope across the strip.
+        let env = &self.drumpad_status[pad].wave;
+        if !env.is_empty() {
+            let step = wave.width() / env.len() as f32;
+            for (i, v) in env.iter().enumerate() {
+                let x = wave.left() + (i as f32 + 0.5) * step;
+                let h = (wave.height() * 0.5 * v.clamp(0.0, 1.0)).max(0.5);
+                painter.line_segment(
+                    [
+                        egui::Pos2::new(x, wave.center().y - h),
+                        egui::Pos2::new(x, wave.center().y + h),
+                    ],
+                    egui::Stroke::new(step.max(1.0), green.gamma_multiply(0.5)),
+                );
+            }
+        }
+        // The trim: the kept span bright, the cut ends veiled, two handles.
+        let params = &self.drumpad.pads[pad].params;
+        let x0 = wave.left() + wave.width() * params.trim_start;
+        let x1 = wave.left() + wave.width() * params.trim_end;
+        for (a, b) in [(wave.left(), x0), (x1, wave.right())] {
+            if b > a + 0.5 {
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::Pos2::new(a, wave.top()),
+                        egui::Pos2::new(b, wave.bottom()),
+                    ),
+                    0.0,
+                    egui::Color32::from_black_alpha(130),
+                );
+            }
+        }
+        for x in [x0, x1] {
+            painter.line_segment(
+                [egui::Pos2::new(x, wave.top()), egui::Pos2::new(x, wave.bottom())],
+                egui::Stroke::new(2.0, ink),
+            );
+        }
+        // OBEY NOTE-OFFS, with its little lamp.
+        let row = pad_menu_obey(menu);
+        let lamp = egui::Rect::from_center_size(
+            egui::Pos2::new(row.left() + 8.0, row.center().y),
+            egui::Vec2::splat(9.0),
+        );
+        painter.rect_stroke(
+            lamp,
+            2.0,
+            egui::Stroke::new(1.2, ink.gamma_multiply(0.7)),
+            egui::StrokeKind::Inside,
+        );
+        if params.obey {
+            painter.rect_filled(lamp.shrink(2.0), 1.0, green);
+        }
+        painter.text(
+            egui::Pos2::new(lamp.right() + 6.0, row.center().y),
+            egui::Align2::LEFT_CENTER,
+            "OBEY NOTE-OFFS",
+            egui::FontId::monospace(10.0),
+            ink.gamma_multiply(if params.obey { 0.95 } else { 0.6 }),
+        );
+    }
+
     fn close_midi_editor(&mut self) {
         self.swing_menu = None;
         if let Some(st) = self.midi_edit.take() {
@@ -6895,8 +7422,27 @@ impl IvoryApp {
     }
 
     /// All of the editor's input: wheel grammar, presses, drags, keys.
+    /// Whether the open drumpad owns the pointer this frame — every other
+    /// surface stands down inside its rectangle. The owner clicked a pad
+    /// and watched the MIXER under it add a track: a floating window that
+    /// lets presses fall through it is not a window.
+    fn drumpad_claims_pointer(&self, ctx: &egui::Context) -> bool {
+        self.drumpad_open
+            && ctx
+                .input(|i| i.pointer.interact_pos().or_else(|| i.pointer.hover_pos()))
+                .zip(self.drumpad_rect)
+                .is_some_and(|(p, r)| r.contains(p))
+    }
+
     fn midi_editor_input(&mut self, ctx: &egui::Context) {
         if self.midi_edit.is_none() {
+            return;
+        }
+        // A drag that STARTED on the roll keeps its pointer across the
+        // drumpad; only fresh presses stand down.
+        if self.drumpad_claims_pointer(ctx)
+            && self.midi_edit.as_ref().is_none_or(|st| st.drag.is_none())
+        {
             return;
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -6927,6 +7473,7 @@ impl IvoryApp {
                 i.pointer.interact_pos(),
             )
         });
+        let secondary_down = ctx.input(|i| i.pointer.secondary_down());
         let (scroll, cmd, shift, alt) = ctx.input(|i| {
             (
                 i.raw_scroll_delta,
@@ -7210,6 +7757,28 @@ impl IvoryApp {
                             }
                         }
                     }
+                    Some(H::NoteLeft(i)) => {
+                        if secondary {
+                            self.me_delete_note(i);
+                        } else {
+                            self.me_select(i, false);
+                            if let Some(st) = self.midi_edit.as_mut() {
+                                st.drag = Some(MeDrag::ResizeLeft { i });
+                            }
+                        }
+                    }
+                    Some(H::Cell(..)) if secondary => {
+                        // **The right button draws the box**: press on empty
+                        // roll and drag selects — the owner's gesture, no
+                        // modifier to remember. Shift keeps what stands.
+                        if let Some(st) = self.midi_edit.as_mut() {
+                            st.marquee = Some((p, p));
+                            st.drag = Some(MeDrag::Marquee);
+                            if !shift {
+                                st.selected.clear();
+                            }
+                        }
+                    }
                     Some(H::Cell(t, key)) if pressed => {
                         if cmd {
                             // The rubber band: Cmd holds the pen back and
@@ -7237,17 +7806,21 @@ impl IvoryApp {
         }
 
         // ── the drag in flight ───────────────────────────────────────────
-        if let (Some(drag), Some(p), true) = (
-            self.midi_edit.as_ref().and_then(|m| m.drag.clone()),
-            pointer,
-            pointer_down,
-        ) {
+        let drag_now = self.midi_edit.as_ref().and_then(|m| m.drag.clone());
+        // The right button carries its own marquee: while one is in flight
+        // the right-down keeps it alive exactly as the left would.
+        let holding = pointer_down
+            || (secondary_down && matches!(drag_now, Some(MeDrag::Marquee)));
+        if let (Some(drag), Some(p), true) = (drag_now, pointer, holding) {
             // **Past the roll's edge, the window CRAWLS** — the owner's
             // ask: dragging a note off either side pans the view slowly,
             // and the note lands on the grid the magnet keeps.
             if matches!(
                 drag,
-                MeDrag::Move { .. } | MeDrag::Resize { .. } | MeDrag::Create { .. }
+                MeDrag::Move { .. }
+                    | MeDrag::Resize { .. }
+                    | MeDrag::ResizeLeft { .. }
+                    | MeDrag::Create { .. }
             ) {
                 let l = crate::midi_editor::Layout::new(rect);
                 if l.roll.is_positive() {
@@ -7276,6 +7849,7 @@ impl IvoryApp {
                     self.me_move_selection(i, t_at, key_at, dt, &orig);
                 }
                 MeDrag::Resize { i } => self.me_resize_note(i, t_at),
+                MeDrag::ResizeLeft { i } => self.me_resize_note_left(i, t_at),
                 MeDrag::Create { i } => {
                     let step = self
                         .midi_edit
@@ -7383,6 +7957,9 @@ impl IvoryApp {
     }
 
     fn arrangement_input(&mut self, ctx: &egui::Context) {
+        if self.drumpad_claims_pointer(ctx) && self.arr_drag.is_none() {
+            return;
+        }
         const MIN: f64 = 0.05;
         let Some(rect) = self.arrangement_rect else {
             return;
@@ -7422,8 +7999,25 @@ impl IvoryApp {
                     self.dialog = Some(dialogs::Dialog::Track {
                         lane,
                         removable: true,
+                        icon: self.settings.channel_icons.get(lane).copied().unwrap_or(0),
                     });
                     return;
+                }
+                // **The right button draws the box over the LANES** — the
+                // editor's gesture, on clips: drag selects everything the
+                // band crosses. Shift keeps what stands.
+                let on_lanes = {
+                    let clips = self.arr_clip_views();
+                    let view = self.arrange_view(&clips);
+                    let l = crate::arrangement_panel::Layout::new(rect, &view);
+                    l.lane_rows.iter().any(|r| r.is_positive() && r.contains(p))
+                };
+                if on_lanes {
+                    if !ctx.input(|i| i.modifiers.shift) {
+                        self.arr_multi.clear();
+                    }
+                    self.arr_band = Some((p, p));
+                    self.arr_drag = Some(ArrDrag::ClipBand);
                 }
             }
         }
@@ -7590,6 +8184,15 @@ impl IvoryApp {
                     // The rename is the double-click, handled above on the
                     // release edge; a single press does nothing.
                     Some(A::HdrName(_)) => {}
+                    // **The NUMBER is the handle**: press and carry the
+                    // track to another row. Empty rows have nothing to
+                    // carry, but any row can be carried TO.
+                    Some(A::HdrNumber(n)) => {
+                        if self.channel_used(n) {
+                            self.selected_channel = Some(n);
+                            self.arr_drag = Some(ArrDrag::ReorderLane { from: n });
+                        }
+                    }
                     // The seam: drag to resize the header column.
                     Some(A::HeaderGrip) => {
                         self.arr_drag = Some(ArrDrag::HeaderGrip);
@@ -7697,6 +8300,7 @@ impl IvoryApp {
                             // The magnet holds the playhead too: next to
                             // the bar line IS the bar line while it is on.
                             self.arr_selected = None;
+                            self.arr_multi.clear();
                             self.request_recorder(recorder::RecorderRequest::Locate(
                                 self.arr_snap_t(t),
                             ));
@@ -7718,13 +8322,22 @@ impl IvoryApp {
         }
 
         // ── the drag in flight ────────────────────────────────────────────
-        if let (Some(drag), Some(p), true) = (self.arr_drag, pointer, pointer_down) {
+        let arr_secondary_down = ctx.input(|i| i.pointer.secondary_down());
+        let arr_holding = pointer_down
+            || (arr_secondary_down && matches!(self.arr_drag, Some(ArrDrag::ClipBand)));
+        if let (Some(drag), Some(p), true) = (self.arr_drag, pointer, arr_holding) {
             let t_at = {
                 let clips = self.arr_clip_views();
                 let view = self.arrange_view(&clips);
                 crate::arrangement_panel::time_at(rect, &view, p.x)
             };
             match drag {
+                ArrDrag::ReorderLane { .. } => {}
+                ArrDrag::ClipBand => {
+                    if let Some((a, _)) = self.arr_band {
+                        self.arr_band = Some((a, p));
+                    }
+                }
                 ArrDrag::HeaderGrip => {
                     // The pointer's x IS the width, clamped where the
                     // layout clamps. Persisted: a column somebody sized is
@@ -7849,6 +8462,64 @@ impl IvoryApp {
             }
         }
         if released {
+            // **The carried track lands** on the row under the hand.
+            if let Some(ArrDrag::ReorderLane { from }) = self.arr_drag {
+                if let Some(p) = pointer {
+                    let target = {
+                        let clips = self.arr_clip_views();
+                        let view = self.arrange_view(&clips);
+                        let l = crate::arrangement_panel::Layout::new(rect, &view);
+                        l.header_rows
+                            .iter()
+                            .position(|row| {
+                                row.panel.is_positive()
+                                    && (row.panel.top()..=row.panel.bottom())
+                                        .contains(&p.y)
+                            })
+                    };
+                    if let Some(to) = target.filter(|t| *t != from) {
+                        self.move_channel(from, to);
+                    }
+                }
+            }
+            // **The band lands**: every clip it crosses joins the set.
+            if matches!(self.arr_drag, Some(ArrDrag::ClipBand)) {
+                if let Some((a, b)) = self.arr_band.take() {
+                    let band = egui::Rect::from_two_pos(a, b);
+                    let picked: Vec<u64> = {
+                        let clips = self.arr_clip_views();
+                        let view = self.arrange_view(&clips);
+                        let l = crate::arrangement_panel::Layout::new(rect, &view);
+                        self.arrangement
+                            .clips
+                            .iter()
+                            .filter_map(|c| {
+                                let row = l
+                                    .lane_rows
+                                    .get(c.lane.min(crate::recorder::CHANNELS - 1))?;
+                                let x0 = crate::arrangement_panel::x_of(
+                                    rect, &view, c.start_s,
+                                );
+                                let x1 = crate::arrangement_panel::x_of(
+                                    rect,
+                                    &view,
+                                    c.start_s + self.clip_len_resolved(c),
+                                );
+                                let r = egui::Rect::from_min_max(
+                                    egui::Pos2::new(x0, row.top()),
+                                    egui::Pos2::new(x1.max(x0 + 2.0), row.bottom()),
+                                );
+                                (r.is_positive() && r.intersects(band)).then_some(c.id)
+                            })
+                            .collect()
+                    };
+                    for id in picked {
+                        if !self.arr_multi.contains(&id) {
+                            self.arr_multi.push(id);
+                        }
+                    }
+                }
+            }
             // The MIDI item the shift-drag drew, taken into the document —
             // and the lane with it, if it was nobody's yet.
             if let Some((lane, t0, t1)) = self.arr_pending.take() {
@@ -10455,6 +11126,16 @@ impl IvoryApp {
                 self.dialog = None;
                 self.remove_channel(lane);
             }
+            DialogAction::TrackIcon(lane, icon) => {
+                if let Some(slot) = self.settings.channel_icons.get_mut(lane) {
+                    *slot = icon.min(3);
+                }
+                self.save_settings();
+                // The open dialog's lit slot follows the choice at once.
+                if let Some(dialogs::Dialog::Track { icon: cur, .. }) = self.dialog.as_mut() {
+                    *cur = icon.min(3);
+                }
+            }
             DialogAction::TrackColor(lane, idx) => {
                 if let Some(c) = self.settings.strip_colors.get_mut(lane) {
                     *c = idx.clamp(0, 26);
@@ -11616,6 +12297,7 @@ impl IvoryApp {
             && self.mixer_typing.is_none()
             && self.input_menu.is_none()
             && self.swing_menu.is_none()
+            && self.drumpad_num.is_none()
         {
             if let Some(action) = keys::pressed(&ctx, self.key_gates()) {
                 // The GUITAR toggle answers nowhere but the piano view: on
@@ -12000,10 +12682,94 @@ impl IvoryApp {
         if let Some(rect) = mixer_rect {
             let view = self.mixer_view();
             crate::mixer_panel::draw(ui.painter(), rect, &view);
+            // A strip mid-carry: the source dims, the target column lights.
+            if let Some((from, _, true)) = self.mixer_reorder {
+                let l = crate::mixer_panel::Layout::new(rect, &view);
+                if let Some(src) = l.strips.get(from) {
+                    ui.painter().rect_filled(
+                        src.panel,
+                        4.0,
+                        egui::Color32::from_black_alpha(70),
+                    );
+                }
+                let at = ui.ctx().input(|i| i.pointer.interact_pos());
+                if let Some(col) = at.and_then(|p| {
+                    crate::mixer_panel::strip_at(rect, &view, p)
+                }) {
+                    if let (Some(crate::recorder::Strip::Channel(n)), true) =
+                        (col.strip(), col.0 != from)
+                    {
+                        if let Some(dst) = l.strips.get(n) {
+                            ui.painter().rect_stroke(
+                                dst.panel,
+                                4.0,
+                                egui::Stroke::new(
+                                    2.0,
+                                    egui::Color32::from_rgb(0xC9, 0x8B, 0x3D),
+                                ),
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                    }
+                }
+            }
         } else if let Some(rect) = arrangement_rect {
             let clips = self.arr_clip_views();
             let view = self.arrange_view(&clips);
             crate::arrangement_panel::draw(ui.painter(), rect, &view);
+            // A track mid-carry: the target row lights under the hand.
+            if let Some(ArrDrag::ReorderLane { from }) = self.arr_drag {
+                let l = crate::arrangement_panel::Layout::new(rect, &view);
+                if let Some(src) = l.header_rows.get(from) {
+                    ui.painter().rect_filled(
+                        src.panel,
+                        0.0,
+                        egui::Color32::from_black_alpha(60),
+                    );
+                }
+                let at = ui.ctx().input(|i| i.pointer.interact_pos());
+                if let Some(t) = at.and_then(|p| {
+                    l.header_rows.iter().position(|row| {
+                        row.panel.is_positive()
+                            && (row.panel.top()..=row.panel.bottom()).contains(&p.y)
+                    })
+                }) {
+                    if t != from {
+                        if let Some(row) = l.header_rows.get(t) {
+                            ui.painter().line_segment(
+                                [
+                                    egui::Pos2::new(rect.left(), row.panel.top()),
+                                    egui::Pos2::new(rect.right(), row.panel.top()),
+                                ],
+                                egui::Stroke::new(
+                                    2.0,
+                                    egui::Color32::from_rgb(0xC9, 0x8B, 0x3D),
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+            // The right-drag selection band, while a hand draws one.
+            if matches!(self.arr_drag, Some(ArrDrag::ClipBand)) {
+                if let Some((a, b)) = self.arr_band {
+                    let r = egui::Rect::from_two_pos(a, b);
+                    ui.painter().rect_stroke(
+                        r,
+                        0.0,
+                        egui::Stroke::new(
+                            1.0,
+                            egui::Color32::from_rgb(0xF2, 0xE9, 0xD2).gamma_multiply(0.8),
+                        ),
+                        egui::StrokeKind::Inside,
+                    );
+                    ui.painter().rect_filled(
+                        r,
+                        0.0,
+                        egui::Color32::from_rgba_premultiplied(0xF2, 0xE9, 0xD2, 10),
+                    );
+                }
+            }
             // The MIDI editor floats over the lanes, leaving a rim of the
             // arrangement visible around it — a popup, not a view.
             self.midi_edit_rect = None;
@@ -12122,6 +12888,36 @@ impl IvoryApp {
             if r.is_positive() {
                 let view = self.drumpad_view();
                 crate::drumpad_panel::draw(ui.painter(), r, &view);
+                self.draw_pad_menu(ui.painter(), r);
+                // A pad mid-carry: the target lights under the hand.
+                if let Some((from, _, true)) = self.pad_carry {
+                    let l = crate::drumpad_panel::Layout::new(r);
+                    if let Some(src) = l.pads.get(from) {
+                        ui.painter().rect_stroke(
+                            *src,
+                            3.0,
+                            egui::Stroke::new(1.5, egui::Color32::from_black_alpha(140)),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    let at = ui.ctx().input(|i| i.pointer.interact_pos());
+                    if let Some(to) = at
+                        .and_then(|p| crate::drumpad_panel::pad_at(r, p))
+                        .filter(|t| *t != from)
+                    {
+                        if let Some(dst) = l.pads.get(to) {
+                            ui.painter().rect_stroke(
+                                *dst,
+                                3.0,
+                                egui::Stroke::new(
+                                    2.0,
+                                    egui::Color32::from_rgb(0xC9, 0x8B, 0x3D),
+                                ),
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                    }
+                }
             }
             self.drumpad_rect = r.is_positive().then_some(r);
         } else {
@@ -12238,7 +13034,11 @@ impl IvoryApp {
         // **The input menu first, and while it is up it owns the pointer**
         // — every surface below stands down for the frame.
         let input_menu_owns = self.input_menu_frame(&ctx);
-        if let Some(rect) = self.mixer_rect.filter(|_| !input_menu_owns) {
+        let drumpad_owns = self.drumpad_claims_pointer(&ctx);
+        if let Some(rect) = self
+            .mixer_rect
+            .filter(|_| !input_menu_owns && (!drumpad_owns || self.mixer_grab.is_some()))
+        {
             // **Ctrl/Cmd+T: a new track**, here as in the arrangement.
             if self.dialog.is_none()
                 && self.mixer_typing.is_none()
@@ -12291,6 +13091,12 @@ impl IvoryApp {
                                         strip,
                                         crate::recorder::Strip::Channel(_)
                                     ),
+                                    icon: self
+                                        .settings
+                                        .channel_icons
+                                        .get(strip.index())
+                                        .copied()
+                                        .unwrap_or(0),
                                 });
                             }
                         }
@@ -12311,6 +13117,12 @@ impl IvoryApp {
                                         strip,
                                         crate::recorder::Strip::Channel(_)
                                     ),
+                                    icon: self
+                                        .settings
+                                        .channel_icons
+                                        .get(strip.index())
+                                        .copied()
+                                        .unwrap_or(0),
                                 });
                             }
                         }
@@ -12345,6 +13157,7 @@ impl IvoryApp {
             let pressed = ctx.input(|i| i.pointer.primary_pressed());
             let released = ctx.input(|i| i.pointer.any_released());
             let pos = ctx.pointer_interact_pos();
+            let pointer_down = ctx.input(|i| i.pointer.primary_down());
             if pressed {
                 // A press anywhere else finishes the figure being typed.
                 if self.mixer_typing.is_some() {
@@ -12385,10 +13198,17 @@ impl IvoryApp {
                         | crate::mixer_panel::Hit::Db(_))) => {
                             self.apply_mixer_hit(hit, 0.0);
                         }
-                        // A single press on a NAME does nothing: rename is a
-                        // double-click now, and the half-open field a single
-                        // press used to leave was the collision.
-                        Some(crate::mixer_panel::Hit::Name(_)) => {}
+                        // A single press on a NAME arms the CARRY — the
+                        // strip rides the hand to another column once it
+                        // really moves; a motionless press stays nothing,
+                        // so the rename's double-click is untouched.
+                        Some(crate::mixer_panel::Hit::Name(col)) => {
+                            if let Some(crate::recorder::Strip::Channel(n)) = col.strip() {
+                                if self.channel_used(n) {
+                                    self.mixer_reorder = Some((n, pos, false));
+                                }
+                            }
+                        }
                         Some(hit) => {
                             self.mixer_grab = Some(MixerGrab {
                                 hit,
@@ -12399,6 +13219,31 @@ impl IvoryApp {
                         }
                         None => {}
                     }
+                }
+            }
+            if let (Some((from, origin, active)), Some(p)) =
+                (self.mixer_reorder, pos)
+            {
+                if pointer_down {
+                    if !active && (p - origin).length() > 8.0 {
+                        self.mixer_reorder = Some((from, origin, true));
+                    }
+                } else {
+                    // The release: an ACTIVE carry lands on the column
+                    // under the hand; a motionless one was just a press.
+                    if active {
+                        let target = {
+                            let view = self.mixer_view();
+                            crate::mixer_panel::strip_at(rect, &view, p)
+                                .and_then(crate::recorder::Column::strip)
+                        };
+                        if let Some(crate::recorder::Strip::Channel(to)) = target {
+                            if to != from {
+                                self.move_channel(from, to);
+                            }
+                        }
+                    }
+                    self.mixer_reorder = None;
                 }
             }
             if released {
@@ -14278,6 +15123,65 @@ mod tests {
             0,
             "a MIDI clip landed on an audio channel"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A track carries its whole identity to a new row** — kind, input,
+    /// icon, colour, name, fader, send, arm, bays, clips — and the rows
+    /// between shift by one. The host gets the permutation to move the
+    /// plugin-state sidecars.
+    #[test]
+    fn a_reordered_track_takes_everything_with_it() {
+        let root = project_scratch("reorder");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        // Dress channel 0 (the DX7) distinctly.
+        app.settings
+            .strip_names
+            .resize(crate::recorder::STRIPS + 1, String::new());
+        app.settings.strip_names[0] = "LEAD".to_owned();
+        app.settings.channel_icons[0] = 2; // guitar badge
+        app.settings.strip_colors[0] = 7;
+        app.settings.channel_gains[0] = 0.42;
+        // A clip on its lane.
+        let mid = root.join("r.mid");
+        let mut b: Vec<u8> = Vec::new();
+        b.extend_from_slice(b"MThd");
+        b.extend_from_slice(&6u32.to_be_bytes());
+        b.extend_from_slice(&[0, 1, 0, 1]);
+        b.extend_from_slice(&480u16.to_be_bytes());
+        let track = [0x00, 0x90, 60, 100, 0x83, 0x60, 60, 0, 0x00, 0xFF, 0x2F, 0x00];
+        b.extend_from_slice(b"MTrk");
+        b.extend_from_slice(&(track.len() as u32).to_be_bytes());
+        b.extend_from_slice(&track);
+        std::fs::write(&mid, &b).unwrap();
+        app.import_midi_at(&mid, 0, 0.0).expect("midi in");
+
+        // Move the DX7 from row 0 to row 3.
+        app.move_channel(0, 3);
+
+        assert_eq!(app.settings.strip_names[3], "LEAD");
+        assert_eq!(app.settings.channel_icons[3], 2);
+        assert_eq!(app.settings.strip_colors[3], 7);
+        assert!((app.settings.channel_gains[3] - 0.42).abs() < 1e-9);
+        assert_eq!(app.settings.channel_kinds[3], 1);
+        assert_eq!(
+            app.insert(3, 0),
+            Some(dialogs::BUILTIN_PATH),
+            "the DX7 did not ride to row 4"
+        );
+        assert_eq!(app.insert(0, 0), None, "row 1 still holds the old bay");
+        assert_eq!(
+            app.arrangement().clips[0].lane,
+            3,
+            "the clip stayed behind"
+        );
+        // The drumpad on 7 never moved; rows 1..3 stepped down one.
+        assert_eq!(app.insert(7, 0), Some(dialogs::DRUMPAD_PATH));
+        // And the host is told exactly what happened: order[new] = old.
+        let perm = app.take_desk_state_perm().expect("no perm for the host");
+        assert_eq!(perm, vec![1, 2, 3, 0, 4, 5, 6, 7]);
+        assert!(app.take_desk_state_perm().is_none(), "taken twice");
         let _ = std::fs::remove_dir_all(&root);
     }
 

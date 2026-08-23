@@ -34,6 +34,9 @@ pub struct StripView<'a> {
     /// What feeds a general channel, for its icon. `None` on everything else
     /// and on an unused channel.
     pub kind: Option<crate::recorder::ChannelKind>,
+    /// The channel's CHOSEN badge: 0 follows the kind, 1 drum, 2 guitar,
+    /// 3 bass — the Track menu's icon picker.
+    pub icon: u8,
     /// Index into [`STRIP_COLORS`]. Zero is the desk's own wood.
     pub color: usize,
     /// An instrument slot with nothing in it.
@@ -331,7 +334,7 @@ const SEND_TRAVEL: f32 = 420.0;
 /// and are not drawn — their controls are the band's.
 // Eight general channels, the click, and the master. BACKING had a column
 // here and is retired: the arrangement's lanes carry audio now.
-pub const COLUMNS: usize = crate::recorder::CHANNELS + 3;
+pub const COLUMNS: usize = crate::recorder::CHANNELS + 2;
 
 pub struct Layout {
     pub strips: [StripStrip; COLUMNS],
@@ -958,7 +961,16 @@ fn strip(
             p.engrave,
         );
     }
-    let named = match (v.strip, v.kind) {
+    // A chosen badge beats the kind's own icon on a channel strip.
+    let named = if v.icon != 0 && matches!(v.strip, Some(Strip::Channel(_))) {
+        match v.icon {
+            1 => crate::recorder_panel::draw_drum(painter, l.icon, ink, face),
+            2 => crate::recorder_panel::draw_guitar(painter, l.icon, ink, face),
+            _ => crate::recorder_panel::draw_bass(painter, l.icon, ink, face),
+        }
+        true
+    } else {
+        match (v.strip, v.kind) {
         // A general channel's icon IS its kind, which is why clicking it
         // cycles: the keyboard says MIDI, the microphone says AUDIO.
         (Some(Strip::Channel(_)), Some(crate::recorder::ChannelKind::Midi)) => {
@@ -983,6 +995,7 @@ fn strip(
             true
         }
         _ => false,
+        }
     };
     let _ = named;
     if naming.is_none() {
@@ -1706,6 +1719,7 @@ mod tests {
 
     fn a_strip(strip: Option<Strip>, empty: bool) -> StripView<'static> {
         StripView {
+            icon: 0,
             strip,
             name: "CHANNEL",
             detail: "",
@@ -2011,17 +2025,19 @@ mod tests {
         for n in 0..CHANNELS {
             assert_eq!(channels[n], Strip::Channel(n), "channel {n} has no column");
         }
-        // **Drawn: the eight, the DRUM BUS and the click.** BACKING retired
-        // with v13; the drum bus arrived with v14, left of the click. Only
-        // the effects return keeps its off-desk life: its three knobs are
-        // the band's, and a soloable bus is a feedback question.
+        // **Drawn: the eight and the click.** BACKING retired with v13;
+        // the drum bus column retired when the drumpad became a lane's
+        // instrument — the kit answers to its lane's strip now, and the
+        // bus row survives only as hidden desk plumbing. Only the effects
+        // return keeps its off-desk life: its three knobs are the band's,
+        // and a soloable bus is a feedback question.
         assert_eq!(
             COLUMNS,
-            crate::recorder::CHANNELS + 3,
+            crate::recorder::CHANNELS + 2,
             "a drawn channel went missing"
         );
-        assert_eq!(channels.len(), crate::recorder::CHANNELS + 2);
-        assert!(channels.contains(&Strip::Drums), "the drums lost their column");
+        assert_eq!(channels.len(), crate::recorder::CHANNELS + 1);
+        assert!(!channels.contains(&Strip::Drums), "the retired drum bus came back");
         assert!(channels.contains(&Strip::Click), "the click lost its column");
         assert!(!channels.contains(&Strip::Fx), "the bus is drawn twice");
         // Every strip owns a distinct place in the arrays, or two of them

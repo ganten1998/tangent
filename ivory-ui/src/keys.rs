@@ -213,17 +213,11 @@ const BINDINGS: &[(Key, &str, KeyAction, bool)] = &[
     (Key::F11, "F11", KeyAction::ToggleFullscreen, false),
     (Key::ArrowUp, "Up", KeyAction::TransposeUp, true),
     (Key::ArrowDown, "Down", KeyAction::TransposeDown, true),
-    (Key::V, "V", KeyAction::ToggleRecorder, true),
     // **Tab, and it was free.** Nothing in this app cycled a view before the
     // mixer, because every surface was a band you turn on; the mixer is a
     // place you go, and Tab is what a program with more than one screen uses
     // to go there.
     (Key::Tab, "Tab", KeyAction::ToggleMixer, true),
-    // `W` was freed when the camera pane lost its key (see the note at the
-    // top of the table), and the drumpad takes it: a single reachable
-    // letter for a surface you raise and put away mid-performance. Gated
-    // like the transport keys, so it clusters here at the table's end.
-    (Key::W, "W", KeyAction::ToggleDrumpad, true),
     (Key::Enter, "Enter", KeyAction::StartRecording, true),
     (Key::Space, "Space", KeyAction::StopRecording, true),
     // Escape only closes the card; it is not worth a row of its own.
@@ -339,11 +333,37 @@ fn on_card(view: HelpView, a: KeyAction) -> bool {
         }
 }
 
+/// The binds that mean the same thing on EVERY surface — the card's
+/// GENERAL section. Everything else is the view's own.
+fn is_general(a: KeyAction) -> bool {
+    use KeyAction as K;
+    matches!(
+        a,
+        K::ToggleHelp
+            | K::ToggleDarkMode
+            | K::ToggleBorderless
+            | K::CycleFont
+            | K::ShowAbout
+            | K::ToggleFullscreen
+            | K::ToggleMixer
+            | K::StartRecording
+            | K::StopRecording
+    )
+}
+
+/// A section heading row: an empty key column, drawn bold by the card.
+fn heading(word: &'static str) -> (&'static str, &'static str) {
+    ("", word)
+}
+
 fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> {
-    let mut rows: Vec<(&'static str, &'static str)> = BINDINGS
-        .iter()
-        .filter(|&&(_, _, a, shown)| shown && available(a, gates) && on_card(view, a))
-        .map(|&(_, label, action, _)| {
+    let describe_on = |&(_, label, action, _): &(
+        egui::Key,
+        &'static str,
+        KeyAction,
+        bool,
+    )|
+     -> (&'static str, &'static str) {
             let desc = match (view, action) {
                 (HelpView::Arrange, KeyAction::ShowSupporterKey) => {
                     "split the clip at the playhead"
@@ -357,8 +377,32 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
                 _ => describe(action),
             };
             (label, desc)
-        })
-        .collect();
+        };
+    // GENERAL first — the binds that work everywhere — then the view's
+    // own panel, delineated, the owner's rule.
+    let mut rows: Vec<(&'static str, &'static str)> = vec![heading("GENERAL")];
+    rows.extend(
+        BINDINGS
+            .iter()
+            .filter(|&&(_, _, a, shown)| {
+                shown && available(a, gates) && is_general(a)
+            })
+            .map(describe_on),
+    );
+    rows.push(heading(match view {
+        HelpView::Piano => "PIANO PANEL",
+        HelpView::Mixer => "MIXER PANEL",
+        HelpView::Arrange => "ARRANGE PANEL",
+        HelpView::MidiEdit => "MIDI EDITOR PANEL",
+    }));
+    rows.extend(
+        BINDINGS
+            .iter()
+            .filter(|&&(_, _, a, shown)| {
+                shown && available(a, gates) && !is_general(a) && on_card(view, a)
+            })
+            .map(describe_on),
+    );
     match view {
         // The view keys, each card naming only the OTHER surfaces.
         HelpView::Piano => rows.extend([
@@ -641,6 +685,19 @@ pub fn draw_help(painter: &Painter, rect: Rect, dark: bool, t: f32, gates: Gates
     for (i, (label, desc)) in rows.iter().enumerate() {
         let x = card_rect.left() + pad + (i / per_col) as f32 * col_w;
         let y = card_rect.top() + pad * 1.2 + (i % per_col) as f32 * row_h;
+        if label.is_empty() {
+            // A SECTION heading: bold, full ink, no key column — the
+            // delineation between the general binds and the view's own.
+            painter.text(Pos2::new(x, y), Align2::LEFT_TOP, desc, bold.clone(), fg);
+            painter.line_segment(
+                [
+                    Pos2::new(x, y + row_h * 0.78),
+                    Pos2::new(x + col_w - pad, y + row_h * 0.78),
+                ],
+                Stroke::new(1.0_f32, edge),
+            );
+            continue;
+        }
         painter.text(Pos2::new(x, y), Align2::LEFT_TOP, label, bold.clone(), fg);
         painter.text(
             Pos2::new(x + key_w, y),
@@ -784,8 +841,9 @@ mod tests {
             .iter()
             .filter(|&&(_, _, a, s)| s && available(a, gates))
             .count();
-        // Plus the two view-key gesture rows the piano card now carries.
-        assert_eq!(piano.len(), shown + 2, "the piano card dropped a live key");
+        // Plus the two view-key gesture rows the piano card now carries,
+        // and the TWO section headings (GENERAL / PIANO PANEL).
+        assert_eq!(piano.len(), shown + 4, "the piano card dropped a live key");
 
         for (view, name) in [
             (HelpView::Mixer, "mixer"),
@@ -802,7 +860,7 @@ mod tests {
                 );
             }
             // The window's own switches stay everywhere.
-            for live in ["H", "D", "F", "Z", "Tab", "V", "W", "Enter", "Space"] {
+            for live in ["H", "D", "F", "Z", "Tab", "Enter", "Space"] {
                 assert!(has(&rows, live), "{name}: `{live}` went missing");
             }
         }
@@ -946,14 +1004,13 @@ mod tests {
             },
             HelpView::Piano,
         );
-        // THREE rows now: starting and stopping are separate keys — the key
-        // which begins a performance is not the key that ends it — and the
-        // drumpad rides the same gate, because it is silent without the
-        // band's engine.
+        // TWO rows now: starting and stopping are separate keys — the key
+        // which begins a performance is not the key that ends it. (The
+        // drumpad's W retired with the recorder's V as unused clutter.)
         assert_eq!(
             shown.len(),
-            hidden.len() + 3,
-            "opening the band added something other than W, Enter and Space"
+            hidden.len() + 2,
+            "opening the band added something other than Enter and Space"
         );
         assert!(
             shown
@@ -965,7 +1022,9 @@ mod tests {
         for gates in [Gates::default(), Gates { recorder_shown: true, recorder_available: true, window_sizing: true }] {
             for (label, _) in card_rows(gates, HelpView::Piano) {
                 // The view-key gesture rows are card prose, not bindings.
-                if matches!(label, "C-M" | "C-A") {
+                if matches!(label, "C-M" | "C-A") || label.is_empty() {
+                    // The view-key gesture rows and the section headings
+                    // have no table entry to cross-check.
                     continue;
                 }
                 let (_, _, action, _) = BINDINGS

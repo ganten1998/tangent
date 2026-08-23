@@ -1141,6 +1141,19 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
         ));
     }
     tail.push(Entry::Separator);
+    // **The band's own door.** Its key (V) retired as unused clutter, and
+    // the rule stands: a feature whose key leaves gets its row back. Gated
+    // like every recorder row — a plugin editor has no band to show.
+    if view.caps.capture_devices {
+        tail.push(item(
+            if view.recorder_on {
+                "Hide Recorder Band"
+            } else {
+                "Show Recorder Band"
+            },
+            MenuAction::ToggleRecorder,
+        ));
+    }
     tail.push(item("About", MenuAction::ShowAbout));
     tail.push(item("Reset Settings to Default", MenuAction::ResetSettings));
 
@@ -2096,7 +2109,6 @@ mod tests {
             (MenuAction::ToggleKeytoggle, KeyAction::ToggleKeytoggle),
             (MenuAction::ToggleNotePreference, KeyAction::ToggleNotePreference),
             (MenuAction::ToggleNoteNames, KeyAction::ToggleNoteNames),
-            (MenuAction::ToggleRecorder, KeyAction::ToggleRecorder),
             (MenuAction::ShowAllTheory, KeyAction::CycleTheory),
             (
                 MenuAction::ToggleTheoryView(crate::theory_panel::View::Circle),
@@ -2365,14 +2377,20 @@ mod tests {
         // 19: the app grew DOCUMENTS — self-contained project directories a
         // song lives in — and a document must be creatable, openable and
         // duplicable from the one menu the app has. One subject row.
+        //
+        // 20: the recorder band's toggle came BACK when its key (V)
+        // retired as unused clutter — the rule that a feature whose key
+        // leaves regains its row, written down in
+        // `no_menu_row_does_what_a_key_already_does`.
         assert!(
-            count(fullest()) <= 19,
+            count(fullest()) <= 20,
             "the fullest menu is back to {} top-level rows",
             count(fullest())
         );
-        // The everyday menu: a piano, the notation and no guitar.
+        // The everyday menu: a piano, the notation and no guitar — plus
+        // the recorder band's returned toggle (see above).
         assert!(
-            count(view()) <= 12,
+            count(view()) <= 13,
             "the everyday menu is {} top-level rows",
             count(view())
         );

@@ -33,7 +33,12 @@ pub enum Dialog {
     /// The TRACK menu behind a right-click on a strip or a lane header:
     /// remove it, paint it, or choose the auto-palette everybody unpainted
     /// wears.
-    Track { lane: usize, removable: bool },
+    Track {
+        lane: usize,
+        removable: bool,
+        /// The lane's current badge, 0..=3 — the picker's lit slot.
+        icon: u8,
+    },
     /// The project export: sources, rate, shape, formats, speed — and the
     /// arrange view's time selection, if one stands.
     ExportProject {
@@ -399,6 +404,8 @@ pub enum DialogAction {
     TrackRemove(usize),
     /// Paint one channel by hand — index into `STRIP_COLORS`.
     TrackColor(usize, i64),
+    /// The lane's badge: 0 auto, 1 drum, 2 guitar, 3 bass.
+    TrackIcon(usize, u8),
     /// Choose the auto-palette every unpainted slot wears.
     TrackPalette(i64),
     /// Bounce the arrangement to one WAV.
@@ -946,7 +953,7 @@ pub const VIDEO_EXPORT_READY: bool = true;
 /// strings: a card whose text overflows its own window is a first impression
 /// nobody recovers from, and it is exactly the sort of thing that breaks when
 /// somebody adds a line.
-const WELCOME_LINES: [&str; 13] = [
+const WELCOME_LINES: [&str; 14] = [
     "Tangent is free, and it stays free.",
     "",
     "It is made for the love of it. There are no",
@@ -957,9 +964,10 @@ const WELCOME_LINES: [&str; 13] = [
     "is welcome and genuinely helps - but it buys",
     "you nothing you do not already have.",
     "",
-    "Everything lives in the right-click menu.",
-    "",
-    "Press and hold  H  for every keyboard shortcut.",
+    "Hold 'H' to display every keybind in the",
+    "current view. Tab cycles views, and what",
+    "can't be found there lives in the",
+    "right-click menu.",
 ];
 
 /// The Audio Status window. Two device blocks, a round-trip line, and a row of
@@ -994,7 +1002,7 @@ const AUDIO_H: f32 = 580.0;
 /// `the_welcome_card_fits_its_own_text` now demands [`WELCOME_SLACK`] on top of
 /// what it can measure.
 const WELCOME_W: f32 = 470.0;
-const WELCOME_H: f32 = 372.0;
+const WELCOME_H: f32 = 396.0;
 /// How much more than the measurable text the Welcome card must have.
 ///
 /// The chrome this test cannot see: a checkbox's real height against the 22 it
@@ -3999,7 +4007,7 @@ pub fn show(
                             ui.add(
                                 egui::TextEdit::singleline(name)
                                     .font(bold(13.0))
-                                    .text_color(t.text)
+                                    .text_color(egui::Color32::WHITE)
                                     .desired_width(f32::INFINITY),
                             );
                             ui.label(
@@ -4230,6 +4238,7 @@ pub fn show(
                                 ui.add(
                                     egui::TextEdit::singleline(&mut spec.name)
                                         .font(plain(10.5))
+                                        .text_color(egui::Color32::WHITE)
                                         .desired_width(180.0),
                                 );
                             });
@@ -4282,20 +4291,21 @@ pub fn show(
                 },
             )
         }
-        Dialog::Track { lane, removable } => {
+        Dialog::Track { lane, removable, icon } => {
             let t = theme(dark_mode);
             let lane = *lane;
             let removable = *removable;
+            let current_icon = *icon;
             show_dialog_viewport(
                 ctx,
                 placement,
                 "Track",
-                // Sized for everything it holds — measured against the
-                // owner's screenshot TWICE now: the remove button, three
-                // swatch rows, five palette rows and the Done button, with
-                // egui's own item spacing between all of them.
-                Vec2::new(300.0, 480.0),
-                Vec2::new(300.0, 460.0),
+                // Sized for everything it holds, with the ICON row now in
+                // the stack — and the Done row pins to the BOTTOM via a
+                // height stretch, so a resize can never push it past the
+                // frame again.
+                Vec2::new(300.0, 434.0),
+                Vec2::new(300.0, 434.0),
                 |ui, result| {
                     apply_theme(ui.style_mut(), &t);
                     ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
@@ -4320,6 +4330,65 @@ pub fn show(
                                     action = Some(DialogAction::TrackRemove(lane));
                                 }
                                 ui.add_space(6.0);
+                            }
+                            if lane < crate::recorder::CHANNELS {
+                                ui.label(
+                                    RichText::new("ICON").font(bold(10.0)).color(dim),
+                                );
+                                ui.horizontal(|ui| {
+                                    for (i, word) in
+                                        ["auto", "drum", "guitar", "bass"].iter().enumerate()
+                                    {
+                                        let chosen = current_icon == i as u8;
+                                        let (rect, resp) = ui.allocate_exact_size(
+                                            Vec2::new(34.0, 26.0),
+                                            egui::Sense::click(),
+                                        );
+                                        ui.painter().rect_filled(
+                                            rect,
+                                            3.0,
+                                            if chosen {
+                                                t.text
+                                            } else {
+                                                egui::Color32::from_black_alpha(40)
+                                            },
+                                        );
+                                        let ink = if chosen { t.bg } else { t.text };
+                                        let b = egui::Rect::from_center_size(
+                                            rect.center(),
+                                            Vec2::splat(20.0),
+                                        );
+                                        match i {
+                                            1 => crate::recorder_panel::draw_drum(
+                                                ui.painter(), b, ink,
+                                                if chosen { t.text } else { t.bg },
+                                            ),
+                                            2 => crate::recorder_panel::draw_guitar(
+                                                ui.painter(), b, ink,
+                                                if chosen { t.text } else { t.bg },
+                                            ),
+                                            3 => crate::recorder_panel::draw_bass(
+                                                ui.painter(), b, ink,
+                                                if chosen { t.text } else { t.bg },
+                                            ),
+                                            _ => {
+                                                ui.painter().text(
+                                                    rect.center(),
+                                                    egui::Align2::CENTER_CENTER,
+                                                    *word,
+                                                    plain(8.0),
+                                                    ink,
+                                                );
+                                            }
+                                        }
+                                        if resp.clicked() {
+                                            action = Some(DialogAction::TrackIcon(
+                                                lane, i as u8,
+                                            ));
+                                        }
+                                    }
+                                });
+                                ui.add_space(8.0);
                             }
                             ui.label(RichText::new("COLOUR").font(bold(10.0)).color(dim));
                             // The swatch grid: hues down, tones across —
@@ -4406,14 +4475,17 @@ pub fn show(
                                     }
                                 });
                             }
-                            ui.add_space(6.0);
-                            // Measured placement: the right-to-left layout
-                            // kept walking the button past the viewport's
-                            // right edge on the owner's screen. A fixed
-                            // width, padded in from the right by hand,
-                            // cannot leave.
+                            // The stretch pins Done to the BOTTOM of
+                            // whatever height the window really has — the
+                            // About dialog's own idiom, which has never
+                            // clipped.
+                            ui.add_space((ui.available_height() - 34.0).max(4.0));
                             ui.horizontal(|ui| {
-                                let pad = (ui.available_width() - 64.0).max(0.0);
+                                let pad = (ui.available_width()
+                                    - 56.0
+                                    - ui.spacing().item_spacing.x
+                                    - 2.0)
+                                    .max(0.0);
                                 ui.add_space(pad);
                                 if ui
                                     .add_sized(
@@ -6603,7 +6675,7 @@ mod tests {
         );
         // And the hint it exists for is actually in it.
         assert!(
-            WELCOME_LINES.iter().any(|l| l.contains(" H ")),
+            WELCOME_LINES.iter().any(|l| l.contains("'H'")),
             "the welcome card no longer tells anybody about the help key"
         );
     }

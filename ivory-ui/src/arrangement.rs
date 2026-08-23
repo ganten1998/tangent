@@ -147,6 +147,8 @@ impl ArrClip {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct DeskSnap {
     pub kinds: Vec<u8>,
+    /// Channel badges, `Settings::channel_icons` — empty in older docs.
+    pub icons: Vec<u8>,
     pub names: Vec<String>,
     pub colors: Vec<i64>,
     pub inserts: Vec<String>,
@@ -177,6 +179,15 @@ impl DeskSnap {
             "kinds".into(),
             Value::Array(self.kinds.iter().map(|k| Value::Number((*k as u64).into())).collect()),
         );
+        // Written only when set: older documents stay byte-identical.
+        if self.icons.iter().any(|i| *i != 0) {
+            m.insert(
+                "icons".into(),
+                Value::Array(
+                    self.icons.iter().map(|k| Value::Number((*k as u64).into())).collect(),
+                ),
+            );
+        }
         m.insert(
             "names".into(),
             Value::Array(self.names.iter().map(|n| Value::String(n.clone())).collect()),
@@ -234,6 +245,11 @@ impl DeskSnap {
                 .get("kinds")
                 .and_then(Value::as_array)
                 .map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n as u8)).collect())
+                .unwrap_or_default(),
+            icons: m
+                .get("icons")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n.min(3) as u8)).collect())
                 .unwrap_or_default(),
             names: strings("names"),
             colors: m

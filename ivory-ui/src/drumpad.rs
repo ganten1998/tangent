@@ -124,6 +124,13 @@ impl DrumpadDoc {
                 .get("choke")
                 .and_then(Value::as_u64)
                 .map_or(0, |v| v.min(255) as u8);
+            slot.params.obey = p.get("obey").and_then(Value::as_bool).unwrap_or(false);
+            slot.params.trim_start = f("trim_start", 0.0, 1.0, 0.0);
+            slot.params.trim_end = f("trim_end", 0.0, 1.0, 1.0);
+            if slot.params.trim_end <= slot.params.trim_start + 0.005 {
+                slot.params.trim_start = 0.0;
+                slot.params.trim_end = 1.0;
+            }
         }
         out
     }
@@ -142,6 +149,15 @@ impl DrumpadDoc {
                 p.insert("pan".into(), Value::from(f64::from(slot.params.pan)));
                 p.insert("tune".into(), Value::from(f64::from(slot.params.tune)));
                 p.insert("choke".into(), Value::from(slot.params.choke));
+                p.insert("obey".into(), Value::from(slot.params.obey));
+                p.insert(
+                    "trim_start".into(),
+                    Value::from(f64::from(slot.params.trim_start)),
+                );
+                p.insert(
+                    "trim_end".into(),
+                    Value::from(f64::from(slot.params.trim_end)),
+                );
                 Value::Object(p)
             })
             .collect();

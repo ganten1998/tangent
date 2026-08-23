@@ -124,6 +124,8 @@ pub struct ArrangeView<'a> {
 /// What a press on the arrangement means.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Hit {
+    /// The NUMBER cell: the reorder handle — drag a track to another row.
+    HdrNumber(usize),
     /// The R dot on a lane's header.
     Arm(usize),
     Mute(usize),
@@ -604,6 +606,7 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
             (row.input, Hit::HdrInput(i)),
             (row.add, Hit::HdrAdd(i)),
             (row.name, Hit::HdrName(i)),
+            (row.number, Hit::HdrNumber(i)),
         ] {
             if r.is_positive() && r.contains(pos) {
                 return Some(hit);
@@ -701,7 +704,7 @@ fn ink(view: &ArrangeView<'_>) -> Ink {
         // The GRID base: the draw derives the strong line by DARKENING it
         // and the subdivisions stay at base — dark lines on a grey field,
         // STARK enough to read against the raised lanes.
-        grid: Color32::from_rgb(0x23, 0x23, 0x23),
+        grid: Color32::from_rgb(0x1A, 0x1A, 0x1A),
         clip_ink: Color32::from_rgb(0xE8, 0xDC, 0xC0),
         playhead: Color32::from_rgb(0xE8, 0x3A, 0x4E),
         arm: Color32::from_rgb(0xE0, 0x22, 0x22),
@@ -836,7 +839,13 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                         Pos2::new(x, l.lanes_area.top()),
                         Pos2::new(x, l.lanes_area.bottom()),
                     ],
-                    Stroke::new(1.0, p.grid.gamma_multiply(w)),
+                    // The STRONG line is wider as well as darker — the
+                    // owner asked twice for starker, and weight is what
+                    // reads at a glance where shade alone blurs. `w = 1.0`
+                    // is the strong line (full ink); below it FADES — the
+                    // old comment had it backwards, which is why "stark"
+                    // never arrived however the base colour moved.
+                    Stroke::new(if w >= 1.0 { 1.6 } else { 1.0 }, p.grid.gamma_multiply(w)),
                 );
             }
         };
@@ -849,7 +858,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             if grid_px >= 5.0 {
                 let mut n = (view.view_start_s / g).floor().max(0.0);
                 while n * g <= t1 {
-                    line(n * g, 0.45);
+                    line(n * g, 1.0);
                     n += 1.0;
                 }
             }
@@ -859,7 +868,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     let t = n * bar;
                     let on_grid = (t / g - (t / g).round()).abs() < 1.0e-6;
                     if !on_grid {
-                        line(t, 1.0);
+                        line(t, 0.55);
                     }
                     n += 1.0;
                 }
@@ -870,7 +879,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             if bar_px >= 5.0 {
                 let mut n = (view.view_start_s / bar).floor().max(0.0);
                 while n * bar <= t1 {
-                    line(n * bar, 0.45);
+                    line(n * bar, 1.0);
                     n += 1.0;
                 }
             }
@@ -880,12 +889,26 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     let t = n * g;
                     let on_bar = (t / bar - (t / bar).round()).abs() < 1.0e-6;
                     if !on_bar {
-                        line(t, 1.0);
+                        line(t, 0.55);
                     }
                     n += 1.0;
                 }
             }
         }
+    }
+
+    // ── empty lanes are SLOTS: an etched seam around each, drawn over the
+    // grid so the boundary survives the lines running through it ──────────
+    for (i, row) in l.lane_rows.iter().enumerate() {
+        if view.lanes.get(i).is_some_and(|lane| lane.used) {
+            continue;
+        }
+        painter.rect_stroke(
+            *row,
+            0.0,
+            Stroke::new(1.0, Color32::from_rgb(0x2C, 0x2C, 0x2C)),
+            egui::StrokeKind::Inside,
+        );
     }
 
     // ── the TIME SELECTION: a veil over the span, on ruler and lanes ──────
@@ -1103,7 +1126,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             // The empty slot's own ground fills the WHOLE panel — the wood
             // margin around a dark plate read as two surfaces, the owner's
             // "my bad" screenshot.
-            painter.rect_filled(row.panel, 0.0, Color32::from_rgb(0x2E, 0x2E, 0x2E));
+            painter.rect_filled(row.panel, 0.0, Color32::from_rgb(0x36, 0x36, 0x36));
         }
         let ink_on = if luma(face) > 140.0 { p.engrave } else { p.hdr_face };
         painter.text(

@@ -823,6 +823,10 @@ pub struct Settings {
     /// `recorder::ChannelKind` — kept as bytes so a hand-edited file cannot
     /// hold a kind this build has no picture for.
     pub channel_kinds: [u8; crate::recorder::CHANNELS],
+    /// Each channel's chosen BADGE: 0 follows the kind (instrument, mic,
+    /// waveform), 1 is the drum, 2 the guitar, 3 the bass — the Track
+    /// menu's icon picker writes it.
+    pub channel_icons: [u8; crate::recorder::CHANNELS],
     /// The three effect knobs, 0..=1. All off by default: a first launch has to
     /// sound like the instrument, not like a room.
     pub reverb_mix: f64,
@@ -1166,6 +1170,13 @@ impl Default for Settings {
                 k[0] = 1;
                 k[7] = 1;
                 k
+            },
+            // Track 8's drumpad wears the drum out of the box; everything
+            // else follows its kind.
+            channel_icons: {
+                let mut c = [0u8; crate::recorder::CHANNELS];
+                c[7] = 1;
+                c
             },
             reverb_mix: 0.0,
             delay_mix: 0.0,
@@ -1902,6 +1913,13 @@ impl Settings {
                     if v.is_finite() && (-1.0..=1.0).contains(&v) {
                         *pan = v;
                     }
+                }
+            }
+        }
+        if let Some(Value::Array(items)) = map.shift_remove("channel_icons") {
+            for (icon, item) in s.channel_icons.iter_mut().zip(items) {
+                if let Some(v) = item.as_u64() {
+                    *icon = v.min(3) as u8;
                 }
             }
         }
@@ -2647,6 +2665,15 @@ impl Settings {
             "channel_kinds".into(),
             Value::Array(
                 self.channel_kinds
+                    .iter()
+                    .map(|k| Value::Number((*k as u64).into()))
+                    .collect(),
+            ),
+        );
+        map.insert(
+            "channel_icons".into(),
+            Value::Array(
+                self.channel_icons
                     .iter()
                     .map(|k| Value::Number((*k as u64).into()))
                     .collect(),
