@@ -557,6 +557,36 @@ channels play back their clips and nothing else. "Ready to play" and
   (LAME's autotools cannot cross under xwin) — the Windows leg ships
   without it and the export delivery says so instead of failing.
 
+- **4.63.0 — hardened for Windows, with ASIO**: the tester's round,
+  every item run to its root by a six-way investigation. SILENT
+  RECORDINGS: Windows never auto-opened an input — WASAPI names the
+  two ends "Speakers (X)" / "Microphone (X)" and the exact-name match
+  could never fire; the match reads the hardware inside the
+  parentheses now. PADS STRUCK THE DX7: the kit was dropped on the
+  floor when the audio ring was full (or the engine absent) while the
+  ghosts drew anyway — set_pad_kit reports delivery and reload_pads
+  retries every frame until the kit lands; pads only light when it
+  HAS. NO PLUGINS FOUND: the scan already took single-file .vst3s;
+  what it lacked was a mouth — discover_reported says per root what
+  happened, the band note counts the finds, and when it finds 0 but
+  sees .dll files it says the words VST2 out loud (the reaplugs
+  trap). Roots grew W6432/x86/literal/exe-relative; bundle binaries
+  are picked by NAME never directory order; LoadLibraryExW with the
+  altered search path loads plugins whose dependencies sit beside
+  them; scan paths stay unprefixed (no \\?\ line noise). SHOW
+  SUMMONED THE PICKER: the setup panel's press leaked into the mixer
+  pass that runs after it — inline band popups own the whole frame
+  now. BREAKUP AT 44.1k/256: denormals flushed (FTZ+DAZ) on both
+  audio threads, and Windows gets an ASIO-style double buffer —
+  Fixed(256) had been landing as a 5.8 ms TOTAL WASAPI buffer,
+  smaller than one engine period. AND ASIO ITSELF: cpal's backend
+  compiled in (SDK bridged through cargo-xwin with VCINSTALLDIR +
+  bindgen args), preferred automatically when a driver is present,
+  WASAPI the fallback, Steinberg's notice in the zip. Paths: names
+  split on both separators, home via `dirs`, the media explorer
+  climbs above a drive root into a drives view. mp3 stays a feature
+  the Windows leg goes without, honestly.
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index

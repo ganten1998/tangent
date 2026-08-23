@@ -382,13 +382,38 @@ package_linux aarch64-unknown-linux-gnu aarch64 || { LINUX_OK=0; echo "!! Linux 
 echo "==> Tangent $VERSION — Windows x86_64"
 # No mp3 on the Windows leg: LAME's autotools build cannot run under
 # xwin. The app copes — the delivery falls back to WAV with a note.
-cargo xwin build --release --target x86_64-pc-windows-msvc -p ivory --no-default-features --features recorder
+#
+# ASIO rides in when the Steinberg SDK is present (vendor/asiosdk_*,
+# fetched separately — its licence forbids committing it). The owner's
+# ruling: ASIO is the standard and the testers have interfaces.
+WIN_FEATURES="recorder"
+ASIO_DIR="$(ls -d "$ROOT"/vendor/asiosdk_* 2>/dev/null | head -1 || true)"
+if [ -n "$ASIO_DIR" ]; then
+  export CPAL_ASIO_DIR="$ASIO_DIR"
+  WIN_FEATURES="recorder,asio"
+  # asio-sys assumes a native Windows host and hunts for vcvarsall.bat;
+  # VCINSTALLDIR set to anything makes it trust the env instead — and the
+  # env IS the toolchain here: cargo-xwin's clang-cl + the xwin headers.
+  export VCINSTALLDIR="${VCINSTALLDIR:-/}"
+  XWIN="$HOME/Library/Caches/cargo-xwin/xwin"
+  if [ -d "$XWIN" ]; then
+    export BINDGEN_EXTRA_CLANG_ARGS="--target=x86_64-pc-windows-msvc -I$XWIN/crt/include -I$XWIN/sdk/include/ucrt -I$XWIN/sdk/include/um -I$XWIN/sdk/include/shared"
+  fi
+  echo "==> ASIO backend in (SDK at $ASIO_DIR)"
+else
+  echo "==> ASIO SDK not found under vendor/ — Windows build is WASAPI-only"
+fi
+cargo xwin build --release --target x86_64-pc-windows-msvc -p ivory --no-default-features --features "$WIN_FEATURES"
 WINSTAGE="dist/tangent-${VERSION}-windows-x86_64"
 WINZIP="${WINSTAGE}.zip"
 rm -rf "$WINSTAGE" "$WINZIP"
 mkdir -p "$WINSTAGE"
 cp target/x86_64-pc-windows-msvc/release/tangent.exe "$WINSTAGE/"
 sign_windows_exe "$WINSTAGE/tangent.exe"
+# Steinberg's required notice, when the ASIO backend rode in.
+if [ -n "${CPAL_ASIO_DIR:-}" ]; then
+  printf '%s\n' "ASIO is a trademark and software of Steinberg Media Technologies GmbH." > "$WINSTAGE/ASIO-NOTICE.txt"
+fi
 cp LICENSE THIRD-PARTY-LICENSES "$WINSTAGE/"
 cp assets/fonts/OFL.txt "$WINSTAGE/"
 # Licences for the four fonts eframe's `default_fonts` embeds in ivory.exe.

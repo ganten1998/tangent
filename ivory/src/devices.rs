@@ -417,10 +417,25 @@ pub fn audio_selection(shared: &Shared) -> Option<AudioChoice> {
             let out_name = ivory_record::audio::host()
                 .default_output_device()
                 .and_then(|d| d.name().ok())?;
+            // **The HARDWARE inside the endpoint name.** CoreAudio names a
+            // duplex interface identically on both sides; WASAPI wraps it —
+            // "Speakers (Scarlett 2i2 USB)" vs "Microphone (Scarlett 2i2
+            // USB)" — so exact equality NEVER matched on Windows and no
+            // input ever opened: the tester's takes recorded silence. The
+            // core is what sits inside the parentheses when there are any.
+            fn core(name: &str) -> &str {
+                match (name.find('('), name.rfind(')')) {
+                    (Some(a), Some(b)) if b > a + 1 => &name[a + 1..b],
+                    _ => name,
+                }
+            }
             let matched = ivory_record::audio::input_devices()
                 .ok()?
                 .into_iter()
-                .find(|d| d.key.name == out_name)?;
+                .find(|d| {
+                    d.key.name == out_name
+                        || core(&d.key.name) == core(&out_name)
+                })?;
             // **The match BECOMES the wanted device.** Leaving `wanted` at
             // None while the session opens the match kept the selection
             // stale for ever — `wanted != open` — so every frame paid a

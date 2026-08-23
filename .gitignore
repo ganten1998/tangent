@@ -30,3 +30,4 @@ build/*
 # file was untracked from the day it was written, because it happened to land
 # under a directory ignored for a completely unrelated reason.
 !build/macos/
+/vendor/

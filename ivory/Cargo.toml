@@ -33,6 +33,9 @@ default = ["recorder", "mp3"]
 # MP3 export via static LAME. Off on the Windows cross build — see the
 # dependency note — and the export delivery says so instead of failing.
 mp3 = ["dep:mp3lame-encoder"]
+# Steinberg ASIO for the Windows build: the industry's low-latency door.
+# Needs CPAL_ASIO_DIR pointing at the SDK at build time.
+asio = ["cpal/asio", "ivory-record?/asio"]
 recorder = ["dep:ivory-record", "dep:ivory-host", "dep:cpal", "dep:rtrb"]
 
 [dependencies]

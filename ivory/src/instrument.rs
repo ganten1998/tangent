@@ -980,6 +980,20 @@ impl PadKit {
     }
 }
 
+/// FTZ + DAZ on this thread (x86 only; a no-op elsewhere). Bit 15 is
+/// flush-to-zero, bit 6 denormals-are-zero — a tail decaying into
+/// subnormals runs orders of magnitude slower on x86 without them.
+#[inline]
+fn flush_denormals() {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: MXCSR is per-thread state and these two bits only change
+    // how this thread rounds subnormals — which is the point.
+    unsafe {
+        use core::arch::x86_64::{_mm_getcsr, _mm_setcsr};
+        _mm_setcsr(_mm_getcsr() | 0x8040);
+    }
+}
+
 /// One strike, placed inside a chunk by `collect_notes`.
 #[derive(Debug, Clone, Copy)]
 struct PadHit {
@@ -5250,19 +5264,26 @@ impl Engine {
 
     /// Hand the audio thread the drumpad's samples, whole — the clips' own
     /// swap protocol, so the displaced kit drops HERE, never in the callback.
-    pub fn set_pad_kit(&mut self, kit: PadKit) {
+    /// `true` when the kit was HANDED to the audio thread — the swap
+    /// itself happens on its next block. `false` means the ring was full
+    /// (a stalled callback) and the kit was NOT delivered: the caller must
+    /// retry, or the pads light up over an engine that never got them —
+    /// the Windows tester's pads striking the DX7.
+    pub fn set_pad_kit(&mut self, kit: PadKit) -> bool {
         while self.pad_from_audio.pop().is_ok() {}
         if self.pad_to_audio.push(kit).is_err() {
-            return;
+            return false;
         }
         let deadline = Instant::now() + RETIRE_TIMEOUT;
         while Instant::now() < deadline {
             if let Ok(old) = self.pad_from_audio.pop() {
                 drop(old);
-                return;
+                return true;
             }
             std::thread::sleep(Duration::from_millis(1));
         }
+        // The push landed; the retiree is merely late. Delivered.
+        true
     }
 
     /// AUDITION a decoded file: it replaces whatever preview is playing
@@ -5749,7 +5770,19 @@ fn resolve_output(host: &cpal::Host, want: Option<&str>) -> Result<cpal::Device,
 /// the plugin's own data loop already runs at RT 83 and a client at FIFO 70
 /// inverts priority against its non-RT IPC thread. See
 /// `docs/LINUX-4.16-FINDINGS.md`.
-const BUFFER_PERIODS: u32 = if cfg!(target_os = "linux") { 4 } else { 1 };
+const BUFFER_PERIODS: u32 = if cfg!(target_os = "linux") {
+    4
+} else if cfg!(target_os = "windows") {
+    // WASAPI treats `Fixed(n)` as the TOTAL shared-mode buffer capacity,
+    // and the engine mixes in ~10 ms periods regardless: a 256-frame
+    // request is 5.8 ms — LESS than one period, zero jitter budget, and
+    // the tester's "incredible breakup" at 44.1k/256. Two periods is the
+    // ASIO-style double buffer: 256 → 11.6 ms, the same maths REAPER
+    // wears at the same setting.
+    2
+} else {
+    1
+};
 
 /// Ask for [`WANT_BUFFER_FRAMES`], inside whatever the device will accept.
 ///
@@ -5842,6 +5875,13 @@ where
         .build_output_stream::<T, _, _>(
             config,
             move |data: &mut [T], info: &cpal::OutputCallbackInfo| {
+                // **Denormals flushed, every callback.** On x86 a reverb or
+                // limiter tail decaying into denormal floats runs orders of
+                // magnitude slower — fine on this Mac's ARM, breakup and
+                // static on the Windows tester's box at small buffers. Set
+                // per callback because WASAPI owns the thread and may move
+                // us; the two MXCSR ops cost nothing against one block.
+                flush_denormals();
                 let now = timebase.now();
                 let heard = now + output_delay_ns(info);
                 let mut done = 0usize;

@@ -188,3 +188,9 @@ zune-jpeg = "0.5"
 
 [lints]
 workspace = true
+
+[features]
+# The Steinberg ASIO backend, Windows only in practice. Off by default:
+# building it needs the ASIO SDK on disk (CPAL_ASIO_DIR) and the SDK's
+# licence accepted — see docs/RELEASE.md.
+asio = ["cpal/asio"]
