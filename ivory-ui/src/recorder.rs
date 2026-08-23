@@ -308,6 +308,11 @@ pub struct ScrubView {
     /// The arrangement view's window as fractions of the span. Drawn as a
     /// rectangle a hand can pick up and slide.
     pub viewport: Option<(f32, f32)>,
+    /// The overview's whole width in SECONDS: the song, or the viewport's
+    /// end when the arrangement looks past the last clip — whichever is
+    /// longer, so the rectangle is always telling the truth. Zero means
+    /// "no document": the wave face falls back to the track's own length.
+    pub domain_s: f64,
 }
 
 impl RecorderView<'_> {

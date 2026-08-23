@@ -636,6 +636,10 @@ enum ArrDrag {
     Zoom { anchor_s: f64, last_y: f32 },
     /// Alt-drag: the hand holds the VIEW and slides it along the song.
     Pan { last_x: f32 },
+    /// The toolbar navigator: horizontal scrolls, vertical zooms, both at
+    /// once. `px_w` is the box's width at the press, so the whole song
+    /// maps across the whole box for the gesture's life.
+    Nav { last: egui::Pos2, px_w: f32 },
 }
 
 /// The MIDI editor's session on one clip: its window, its selection, and
@@ -3019,9 +3023,9 @@ impl IvoryApp {
                     let tl = recorder_panel::timeline_rect(r, &self.recorder_layout_view());
                     if tl.is_positive() {
                         let f0 = f64::from(((pos.x - grab_px) - tl.left()) / tl.width());
-                        let span = self.arr_span();
+                        let domain = self.scrub_domain_s();
                         let (_, len) = self.arr_window_now();
-                        self.arr_steer(f0.max(0.0) * span, len);
+                        self.arr_steer(f0.max(0.0) * domain, len);
                     }
                 }
             }
@@ -3154,6 +3158,20 @@ impl IvoryApp {
                 // next letter typed at the piano would go into the take name.
                 self.name_focused = false;
                 self.commit_number_unless(None);
+                // **The mixer and the arrangement cover everything below the
+                // band while they are up — and the piano is still THERE.**
+                // `piano_rect` is computed every frame whichever view is
+                // drawn, so a primary press on a lane also landed on the
+                // invisible keyboard underneath and sounded a note. The
+                // right-click half has refused this since the palette; the
+                // primary press refuses it the same way. Their own input
+                // runs elsewhere (`arrangement_input`, the mixer's grab) —
+                // this only stops the surfaces UNDER them from answering.
+                if self.mixer_rect.is_some_and(|r| r.contains(pos))
+                    || self.arrangement_rect.is_some_and(|r| r.contains(pos))
+                {
+                    return;
+                }
                 // The supporter heart cycles colour on click. Checked before the
                 // keytoggle hit-test because it sits in the chord strip, not the
                 // keyboard, so the two can never contend.
@@ -5563,6 +5581,17 @@ impl IvoryApp {
                             (self.settings.arr_grid_exp - 1).clamp(-5, 3);
                         self.save_settings();
                     }
+                    Some(A::ToolNav) => {
+                        let px_w = {
+                            let clips = self.arr_clip_views();
+                            let view = self.arrange_view(&clips);
+                            crate::arrangement_panel::Layout::new(rect, &view)
+                                .tool_nav
+                                .width()
+                                .max(1.0)
+                        };
+                        self.arr_drag = Some(ArrDrag::Nav { last: p, px_w });
+                    }
                     Some(A::ClipBody(id)) => {
                         self.arr_selected = Some(id);
                         self.arr_resolve_len(id);
@@ -5700,6 +5729,24 @@ impl IvoryApp {
                         self.arr_drag = Some(ArrDrag::Pan { last_x: p.x });
                     }
                 }
+                ArrDrag::Nav { last, px_w } => {
+                    let dx = p.x - last.x;
+                    let dy = p.y - last.y;
+                    if dx.abs() > 0.0 || dy.abs() > 0.0 {
+                        let (start, len) = self.arr_window_now();
+                        // The box IS the song: a hand moving across it moves
+                        // the window by the same fraction of the whole.
+                        let song = self.scrub_domain_s().max(len);
+                        let d = f64::from(dx / px_w) * song;
+                        // And UP zooms IN, around the window's centre —
+                        // left-and-up is "closer, and earlier", one motion.
+                        let factor = f64::from((dy * 0.01).exp());
+                        let centre = start + d + len * 0.5;
+                        let new_len = (len * factor).clamp(1.0, (song * 4.0).max(120.0));
+                        self.arr_steer(centre - new_len * 0.5, new_len);
+                        self.arr_drag = Some(ArrDrag::Nav { last: p, px_w });
+                    }
+                }
             }
         }
         if released {
@@ -5791,9 +5838,22 @@ impl IvoryApp {
     /// The band timeline's overview of the document — every clip a block
     /// in its lane's colour against the whole span, and the arrangement's
     /// window when that view is open to steer.
-    fn scrub_view(&self) -> recorder::ScrubView {
+    /// The overview's whole width in seconds — the owner's rule: it
+    /// reflects the VIEWPORT, not merely the longest clip, so the window
+    /// rectangle always fits inside the picture.
+    fn scrub_domain_s(&self) -> f64 {
         let span = self.arr_span();
-        if span <= 0.0 {
+        if self.arrangement_open {
+            let (s, l) = self.arr_window_now();
+            span.max(s + l)
+        } else {
+            span
+        }
+    }
+
+    fn scrub_view(&self) -> recorder::ScrubView {
+        let domain = self.scrub_domain_s();
+        if domain <= 0.0 {
             return recorder::ScrubView::default();
         }
         let blocks = self
@@ -5803,17 +5863,21 @@ impl IvoryApp {
             .map(|c| {
                 (
                     c.lane.min(crate::recorder::CHANNELS - 1),
-                    (c.start_s / span) as f32,
-                    (self.clip_len_resolved(c) / span) as f32,
+                    (c.start_s / domain) as f32,
+                    (self.clip_len_resolved(c) / domain) as f32,
                     self.settings.strip_colors.get(c.lane).copied().unwrap_or(0) as usize,
                 )
             })
             .collect();
         let viewport = self.arrangement_open.then(|| {
             let (s, l) = self.arr_window_now();
-            ((s / span) as f32, (l / span) as f32)
+            ((s / domain) as f32, (l / domain) as f32)
         });
-        recorder::ScrubView { blocks, viewport }
+        recorder::ScrubView {
+            blocks,
+            viewport,
+            domain_s: domain,
+        }
     }
 
     fn arrange_view<'a>(
@@ -5847,6 +5911,7 @@ impl IvoryApp {
             pending: self.arr_pending,
             view_start_s,
             view_len_s,
+            song_s: self.scrub_domain_s(),
             playhead_s: self.recorder.position_s,
             bpm: f64::from(self.tempo_bpm()),
             sig_top: u32::from(self.time_signature().beats),
@@ -6421,8 +6486,11 @@ impl IvoryApp {
             // is the fraction into the file, because the box is the time
             // axis. The transport goes there, playing or parked.
             Hit::SeekTimeline(t) => {
-                if self.track.seconds > 0.0 {
-                    let seconds = f64::from(t.clamp(0.0, 1.0)) * self.track.seconds;
+                // The fraction maps over the overview's DOMAIN — the song,
+                // or the viewport past it — never just the file's length.
+                let domain = self.scrub_domain_s().max(self.track.seconds);
+                if domain > 0.0 {
+                    let seconds = f64::from(t.clamp(0.0, 1.0)) * domain;
                     self.request_recorder(recorder::RecorderRequest::Locate(seconds));
                 }
             }
@@ -12050,6 +12118,59 @@ mod tests {
         assert!(run_frame(&ctx, &mut app).is_none());
         app.manual_notes.clear();
         assert!(run_frame(&ctx, &mut app).is_none());
+    }
+
+    /// **An open view is the only thing on its spot taking presses.** The
+    /// piano is computed every frame whichever view is drawn, and a press
+    /// on an arrangement lane used to fall through to the invisible
+    /// keyboard underneath and sound a note. Not painting a surface is not
+    /// enough — its INPUT has to stand down too.
+    #[test]
+    fn a_press_on_an_open_view_never_reaches_the_piano_underneath() {
+        for view in ["mixer", "arrangement"] {
+            let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+            app.settings.keytoggle_enabled = false;
+            let _ = run_frame(&ctx, &mut app);
+            match view {
+                "mixer" => app.mixer_open = true,
+                _ => app.arrangement_open = true,
+            }
+            let _ = run_frame(&ctx, &mut app);
+            let covered = app
+                .mixer_rect
+                .or(app.arrangement_rect)
+                .expect("the view did not open");
+            // A press in the covered area, where piano keys live underneath.
+            let p = Pos2::new(covered.center().x, covered.bottom() - 10.0);
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                    events: vec![
+                        egui::Event::PointerMoved(p),
+                        egui::Event::PointerButton {
+                            pos: p,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| app.frame(ctx),
+            );
+            // Whatever the view itself did with the press, no NOTE sounded:
+            // the invisible piano stayed out of it.
+            while let Some(req) = app.take_recorder_request() {
+                assert!(
+                    !matches!(req, recorder::RecorderRequest::Audition { on: true, .. }),
+                    "{view:?}: the hidden piano answered a press on the open view"
+                );
+            }
+            assert!(
+                app.clicked.is_empty(),
+                "{view:?}: the hidden piano is holding a note"
+            );
+        }
     }
 
     /// **A click sounds in both modes, and stops when the button comes up.**

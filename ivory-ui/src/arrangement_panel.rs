@@ -95,6 +95,9 @@ pub struct ArrangeView<'a> {
     /// The zoom window, in seconds of song.
     pub view_start_s: f64,
     pub view_len_s: f64,
+    /// The whole song's length (or the window's end past it): the nav
+    /// box's outer rectangle, and never shorter than the window.
+    pub song_s: f64,
     pub playhead_s: f64,
     /// The ruler's grid: bars from the band's own tempo and signature.
     pub bpm: f64,
@@ -140,6 +143,8 @@ pub enum Hit {
     /// The toolbar's grid box. A press steps FINER; the wheel over it is
     /// the real control, handled by the app from this same rectangle.
     ToolGrid,
+    /// The navigator beside it: drag scrolls, vertical zooms, both at once.
+    ToolNav,
 }
 
 impl Hit {
@@ -179,6 +184,9 @@ pub struct Layout {
     pub tool_met: Rect,
     pub tool_snap: Rect,
     pub tool_grid: Rect,
+    /// The little navigator: outer = the whole song, inner = the window.
+    /// Drag it to scroll; drag UP to zoom in at the same time.
+    pub tool_nav: Rect,
     pub lanes_area: Rect,
     pub lane_rows: [Rect; CHANNELS],
     pub header_rows: [HeaderRow; CHANNELS],
@@ -227,6 +235,7 @@ impl Layout {
                 tool_met: Rect::NOTHING,
                 tool_snap: Rect::NOTHING,
                 tool_grid: Rect::NOTHING,
+                tool_nav: Rect::NOTHING,
                 lanes_area: Rect::NOTHING,
                 lane_rows: [Rect::NOTHING; CHANNELS],
                 header_rows: [HeaderRow::NONE; CHANNELS],
@@ -293,12 +302,26 @@ impl Layout {
                 corner.bottom(),
             ),
         );
+        // The NAVIGATOR takes whatever the corner has left — longer than
+        // the gridbox, as asked: a rectangle inside a rectangle, and a
+        // hand on it steers the whole view.
+        let tool_nav = Rect::from_min_max(
+            Pos2::new(tool_grid.right() + 3.0, corner.top()),
+            corner.max,
+        )
+        .intersect(corner);
+        let tool_nav = if tool_nav.width() >= side * 1.5 {
+            tool_nav
+        } else {
+            Rect::NOTHING
+        };
         Self {
             header,
             ruler,
             tool_met,
             tool_snap,
             tool_grid,
+            tool_nav,
             lanes_area,
             lane_rows,
             header_rows,
@@ -472,6 +495,7 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
         (l.tool_met, Hit::ToolMetronome),
         (l.tool_snap, Hit::ToolSnap),
         (l.tool_grid, Hit::ToolGrid),
+        (l.tool_nav, Hit::ToolNav),
     ] {
         if r.is_positive() && r.contains(pos) {
             return Some(hit);
@@ -630,13 +654,6 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         }
         painter.line_segment(
             [
-                Pos2::new(x, l.lanes_area.top()),
-                Pos2::new(x, l.lanes_area.bottom()),
-            ],
-            Stroke::new(1.0, p.grid),
-        );
-        painter.line_segment(
-            [
                 Pos2::new(x, l.ruler.bottom() - 4.0),
                 Pos2::new(x, l.ruler.bottom()),
             ],
@@ -650,6 +667,74 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             font.clone(),
             p.faint,
         );
+    }
+    // **The grid the MAGNET snaps to is the grid the eye gets** — the
+    // owner's complaint was exactly this line's absence: the lanes drew
+    // only the labelled bars, whatever the gridbox said. Every bar gets a
+    // line while bars are wide enough to tell apart, and the gridbox's own
+    // subdivision draws between them, fainter but VISIBLE.
+    {
+        let g = bar * 2.0f64.powi(i32::from(view.grid_exp.clamp(-6, 6)));
+        let bar_px = bar * px_per_s;
+        let sub_px = g * px_per_s;
+        let t1 = view.view_start_s + view.view_len_s;
+        // Bar lines, every bar that has room.
+        if bar_px >= 5.0 {
+            let mut n = (view.view_start_s / bar).floor().max(0.0);
+            while n * bar <= t1 {
+                let x = x_of(rect, view, n * bar);
+                if x >= l.lanes_area.left() - 0.5 && x <= l.lanes_area.right() + 0.5 {
+                    painter.line_segment(
+                        [
+                            Pos2::new(x, l.lanes_area.top()),
+                            Pos2::new(x, l.lanes_area.bottom()),
+                        ],
+                        Stroke::new(1.0, p.grid.gamma_multiply(2.2)),
+                    );
+                }
+                n += 1.0;
+            }
+        }
+        // Subdivision lines, skipping the bars they coincide with. Only
+        // when the grid is FINER than a bar — a multi-bar grid draws its
+        // own (sparser) lines instead below.
+        if g < bar - 1.0e-9 && sub_px >= 5.0 {
+            let mut n = (view.view_start_s / g).floor().max(0.0);
+            while n * g <= t1 {
+                let t = n * g;
+                let on_bar = (t / bar - (t / bar).round()).abs() < 1.0e-6;
+                if !on_bar {
+                    let x = x_of(rect, view, t);
+                    if x >= l.lanes_area.left() - 0.5 && x <= l.lanes_area.right() + 0.5 {
+                        painter.line_segment(
+                            [
+                                Pos2::new(x, l.lanes_area.top()),
+                                Pos2::new(x, l.lanes_area.bottom()),
+                            ],
+                            Stroke::new(1.0, p.grid.gamma_multiply(1.1)),
+                        );
+                    }
+                }
+                n += 1.0;
+            }
+        } else if g > bar + 1.0e-9 && bar_px < 5.0 && sub_px >= 5.0 {
+            // Zoomed far out with a coarse grid: the multi-bar lines are
+            // all the eye can hold, so they are what it gets.
+            let mut n = (view.view_start_s / g).floor().max(0.0);
+            while n * g <= t1 {
+                let x = x_of(rect, view, n * g);
+                if x >= l.lanes_area.left() - 0.5 && x <= l.lanes_area.right() + 0.5 {
+                    painter.line_segment(
+                        [
+                            Pos2::new(x, l.lanes_area.top()),
+                            Pos2::new(x, l.lanes_area.bottom()),
+                        ],
+                        Stroke::new(1.0, p.grid.gamma_multiply(2.2)),
+                    );
+                }
+                n += 1.0;
+            }
+        }
     }
 
     // ── the clips ─────────────────────────────────────────────────────────
@@ -1045,6 +1130,31 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             p.engrave,
         );
     }
+    // The NAVIGATOR: the whole song as a recessed box, the window as a lit
+    // rectangle inside it. A hand on it scrolls; up and down zoom.
+    if l.tool_nav.is_positive() {
+        painter.rect_filled(l.tool_nav, 2.0, p.lane);
+        painter.rect_stroke(
+            l.tool_nav,
+            2.0,
+            Stroke::new(1.0, p.grid.gamma_multiply(2.0)),
+            egui::StrokeKind::Inside,
+        );
+        let song = view.song_s.max(view.view_start_s + view.view_len_s).max(1.0e-9);
+        let f0 = (view.view_start_s / song).clamp(0.0, 1.0) as f32;
+        let f1 = ((view.view_start_s + view.view_len_s) / song).clamp(0.0, 1.0) as f32;
+        let inner = Rect::from_min_max(
+            Pos2::new(l.tool_nav.left() + l.tool_nav.width() * f0, l.tool_nav.top() + 1.5),
+            Pos2::new(
+                (l.tool_nav.left() + l.tool_nav.width() * f1)
+                    .max(l.tool_nav.left() + l.tool_nav.width() * f0 + 3.0),
+                l.tool_nav.bottom() - 1.5,
+            ),
+        );
+        if inner.is_positive() {
+            painter.rect_filled(inner, 1.5, p.face.gamma_multiply(0.8));
+        }
+    }
 }
 
 fn luma(c: Color32) -> f32 {
@@ -1141,6 +1251,7 @@ mod tests {
             pending: None,
             view_start_s: 0.0,
             view_len_s: 120.0,
+            song_s: 120.0,
             playhead_s: 15.0,
             bpm: 120.0,
             sig_top: 4,

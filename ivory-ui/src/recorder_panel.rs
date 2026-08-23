@@ -684,7 +684,7 @@ impl Layout {
         // beside it, the owner's REAPER transport brought over. The
         // scrubber keeps the rest. Wide enough to read its digits, never
         // more than a third of the box.
-        let lcd_w = (tl_box.height() * 2.3).min(tl_box.width() * 0.34);
+        let lcd_w = (tl_box.height() * 3.4).min(tl_box.width() * 0.48);
         self.lcd = Rect::from_min_size(tl_box.min, Vec2::new(lcd_w, tl_box.height()));
         self.timeline = Rect::from_min_max(
             Pos2::new(self.lcd.right() + tl_box.width() * 0.012, tl_box.top()),
@@ -2132,7 +2132,7 @@ fn draw_timeline(painter: &Painter, r: Rect, view: &RecorderView<'_>, p: &Palett
     }
     let track = view.track;
     painter.rect_filled(r, 2.0, METER_FACE);
-    if track.wave.is_empty() && view.scrub.blocks.is_empty() {
+    if track.wave.is_empty() && view.scrub.blocks.is_empty() && view.scrub.viewport.is_none() {
         // **The arrangement's empty field.** Eight faint lanes with nothing
         // standing on them — the same face the overview wears, minus the
         // clips. The import invitation died with the backing track: audio
@@ -2173,7 +2173,7 @@ fn draw_timeline(painter: &Painter, r: Rect, view: &RecorderView<'_>, p: &Palett
     // half of the strip carrying the same lit/dim boundary the wave mode
     // has always had. This is Ableton's overview strip on Tangent's desk;
     // the single wave below remains the face for hosts with no document.
-    if !view.scrub.blocks.is_empty() {
+    if !view.scrub.blocks.is_empty() || view.scrub.viewport.is_some() {
         let lanes = crate::recorder::CHANNELS as f32;
         let row_h = r.height() / lanes;
         // Faint stripes, so eight rows read as eight even where no clip
@@ -2191,7 +2191,12 @@ fn draw_timeline(painter: &Painter, r: Rect, view: &RecorderView<'_>, p: &Palett
                 );
             }
         }
-        let played = fraction_of(track.seconds, view.position_s).unwrap_or(0.0);
+        let total = if view.scrub.domain_s > 0.0 {
+            view.scrub.domain_s
+        } else {
+            track.seconds
+        };
+        let played = fraction_of(total, view.position_s).unwrap_or(0.0);
         for (lane, f0, fl, color) in &view.scrub.blocks {
             let y0 = r.top() + row_h * (*lane).min(crate::recorder::CHANNELS - 1) as f32;
             let x0 = r.left() + r.width() * f0.clamp(0.0, 1.0);
@@ -2308,7 +2313,12 @@ fn draw_timeline_captions(painter: &Painter, r: Rect, view: &RecorderView<'_>, p
 /// while the transport moves, with a small cap so it reads as a marker
 /// rather than a scratch on the picture.
 fn draw_timeline_playhead(painter: &Painter, r: Rect, view: &RecorderView<'_>) {
-    if let Some(t) = fraction_of(view.track.seconds, view.position_s) {
+    let total = if view.scrub.domain_s > 0.0 {
+        view.scrub.domain_s
+    } else {
+        view.track.seconds
+    };
+    if let Some(t) = fraction_of(total, view.position_s) {
         let x = r.left() + t * r.width();
         let ink = if view.playing || view.state.is_active() {
             Color32::from_rgb(0xE8, 0x3A, 0x4E)
@@ -2393,13 +2403,14 @@ fn draw_timecode_cluster(painter: &Painter, r: Rect, view: &RecorderView<'_>, p:
     }
     painter.rect_filled(r, 2.0, LCD_FACE);
     painter.rect_stroke(r, 2.0, Stroke::new(1.0_f32, p.line), StrokeKind::Inside);
-    let main = slice_h(r, 0.02, 0.55);
-    let side = slice_h(r, 0.57, 0.99);
-    painter.rect_filled(rule_x(r, r.left() + r.width() * 0.56), 0.0, p.line.gamma_multiply(0.5));
-    // The big number: where the playhead stands, musically.
+    let main = slice_h(r, 0.02, 0.56);
+    let side = slice_h(r, 0.58, 0.99);
+    painter.rect_filled(rule_x(r, r.left() + r.width() * 0.57), 0.0, p.line.gamma_multiply(0.5));
+    // The big number: where the playhead stands, musically. As large as
+    // the face allows — the number somebody reads from the bench.
     let big = bars_beats(view.position_s, view.tempo_bpm, view.time_signature);
-    let big_box = slice_v(main, 0.10, 0.68);
-    let size = fit_text(big_box, &big, big_box.height() * 0.62);
+    let big_box = slice_v(main, 0.06, 0.66);
+    let size = fit_text(big_box, &big, big_box.height() * 0.72);
     if size >= MIN_TEXT {
         painter.text(
             big_box.center(),
@@ -2410,9 +2421,9 @@ fn draw_timecode_cluster(painter: &Painter, r: Rect, view: &RecorderView<'_>, p:
         );
         // And the wall clock under it, dimmer: the doc promised the readout
         // still says minutes:seconds somewhere a glance finds it.
-        let small_box = slice_v(main, 0.66, 0.95);
+        let small_box = slice_v(main, 0.66, 0.97);
         let clock = time_text(view.position_s);
-        let ssize = fit_text(small_box, &clock, small_box.height() * 0.55);
+        let ssize = fit_text(small_box, &clock, small_box.height() * 0.62);
         if ssize >= MIN_TEXT {
             painter.text(
                 small_box.center(),
@@ -2431,13 +2442,13 @@ fn draw_timecode_cluster(painter: &Painter, r: Rect, view: &RecorderView<'_>, p:
         ("Length", len),
     ];
     for (i, (label, secs)) in rows.iter().enumerate() {
-        let row = slice_v(side, 0.08 + 0.28 * i as f32, 0.08 + 0.28 * (i as f32 + 1.0));
+        let row = slice_v(side, 0.05 + 0.30 * i as f32, 0.05 + 0.30 * (i as f32 + 1.0));
         let value = if view.sel_clip.is_some() {
             bars_beats(*secs, view.tempo_bpm, view.time_signature)
         } else {
             "0| 0| 000".to_owned()
         };
-        let size = fit_text(row, &format!("{label}  {value}"), row.height() * 0.62);
+        let size = fit_text(row, &format!("{label}  {value}"), row.height() * 0.66);
         if size >= MIN_TEXT {
             painter.text(
                 Pos2::new(row.left(), row.center().y),
