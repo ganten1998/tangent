@@ -960,10 +960,21 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         }
     }
 
-    // ── empty lanes are SLOTS: full-width separators at every empty
-    // row's edges — header and field in one line, drawn over the grid so
-    // the boundary survives the lines running through it ─────────────────
+    // ── every channel boundary wears a SEAM — header through field, one
+    // line, drawn over the grid so it survives the lines running through
+    // it. Empty lanes keep the stronger slot treatment below. ─────────────
     for (i, row) in l.lane_rows.iter().enumerate() {
+        let left = l
+            .header_rows
+            .get(i)
+            .map_or(row.left(), |h| h.panel.left());
+        painter.line_segment(
+            [
+                Pos2::new(left, row.bottom()),
+                Pos2::new(row.right(), row.bottom()),
+            ],
+            Stroke::new(1.0, p.seam.gamma_multiply(1.25)),
+        );
         if view.lanes.get(i).is_some_and(|lane| lane.used) {
             continue;
         }
