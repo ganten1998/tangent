@@ -447,6 +447,16 @@ channels play back their clips and nothing else. "Ready to play" and
   window's title is a FIELD: type a name, press Save, the session is
   renamed and saved as that, no panel in between.
 
+- **4.58.0 — clips travel**: a clip DRAGS ACROSS LANES as well as
+  along them (the row under the hand retargets it; the import rules
+  hold — MIDI never lands on an audio channel, audio never on a MIDI
+  one, an unused lane takes either), and `.mid`/`.midi`/`.smf` files
+  DROP IN from the outside world as MIDI clips — a hand-rolled SMF
+  reader in `ivory-ui/src/smf_read.rs` (format 0/1, running status,
+  tempo map, metrical division only; the firewall keeps `midly` out),
+  notes inline in the document, nothing copied to `media/`. Audio
+  drops keep their existing road.
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index
