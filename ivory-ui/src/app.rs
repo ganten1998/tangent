@@ -4276,6 +4276,50 @@ impl IvoryApp {
         Ok(())
     }
 
+    /// Import a `.mid` FILE as a MIDI clip on `lane` — the drop's other
+    /// half. The notes come inline into the document; the file itself is
+    /// not needed again, so nothing is copied into `media/`.
+    pub fn import_midi_at(
+        &mut self,
+        file: &std::path::Path,
+        lane: usize,
+        start_s: f64,
+    ) -> Result<(), String> {
+        if self.channel_kind(lane) == Some(recorder::ChannelKind::Audio) {
+            return Err("an audio lane cannot take a MIDI file".to_owned());
+        }
+        let name = file
+            .file_stem()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let Some(import) = std::fs::read(file)
+            .ok()
+            .as_deref()
+            .and_then(crate::smf_read::read)
+        else {
+            return Err(format!("could not read {name} as MIDI"));
+        };
+        let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) else {
+            return Err("no project is open".to_owned());
+        };
+        self.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            notes: import.notes,
+            lane: lane.min(crate::recorder::CHANNELS - 1),
+            path: String::new(),
+            start_s: start_s.max(0.0),
+            offset_s: 0.0,
+            len_s: import.len_s.max(0.05),
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name,
+            id: 0,
+        });
+        self.arrangement.save_to(&doc);
+        self.clips_dirty = true;
+        Ok(())
+    }
+
     /// **Recording over material is DESTRUCTIVE — the owner's rule.** The
     /// recorded region carves every clip it overlaps on the lane: a clip
     /// swallowed whole is removed, an overlapped head or tail is trimmed,
@@ -5385,11 +5429,36 @@ impl IvoryApp {
 
     /// MOVE: the clip rides under the same point of the hand — `dt` is the
     /// pointer's distance from its start at the press.
-    fn arr_move(&mut self, id: u64, t_at: f64, dt: f64) {
+    fn arr_move(&mut self, id: u64, t_at: f64, dt: f64, lane_at: Option<usize>) {
         let to = self.arr_snap_t(t_at - dt);
+        // The lane rules mirror the imports': MIDI never lands on an AUDIO
+        // channel, audio never on a MIDI one, and an unused lane takes
+        // either — it becomes a clip lane, as a drop would make it.
+        let retarget = lane_at.filter(|l| *l < crate::recorder::CHANNELS).filter(|l| {
+            let kind = self.channel_kind(*l);
+            match self.arrangement.clips.iter().find(|c| c.id == id).map(|c| c.kind) {
+                Some(crate::arrangement::ClipKind::Midi) => {
+                    kind != Some(recorder::ChannelKind::Audio)
+                }
+                Some(crate::arrangement::ClipKind::Audio) => {
+                    kind != Some(recorder::ChannelKind::Midi)
+                }
+                None => false,
+            }
+        });
         if let Some(c) = self.arr_clip_mut(id) {
+            let mut dirty = false;
             if (c.start_s - to).abs() > 1e-9 {
                 c.start_s = to;
+                dirty = true;
+            }
+            if let Some(lane) = retarget {
+                if c.lane != lane {
+                    c.lane = lane;
+                    dirty = true;
+                }
+            }
+            if dirty {
                 self.arr_gesture_dirty = true;
             }
         }
@@ -7664,7 +7733,21 @@ impl IvoryApp {
                     self.settings.arr_header_w = w;
                     self.save_settings_soon();
                 }
-                ArrDrag::Move { id, dt } => self.arr_move(id, t_at, dt),
+                ArrDrag::Move { id, dt } => {
+                    // The row under the hand: a clip drags ACROSS lanes as
+                    // well as along them — a MIDI item moves to another
+                    // MIDI channel, an audio one to any lane that takes
+                    // audio.
+                    let lane_at = {
+                        let clips = self.arr_clip_views();
+                        let view = self.arrange_view(&clips);
+                        let l = crate::arrangement_panel::Layout::new(rect, &view);
+                        l.lane_rows
+                            .iter()
+                            .position(|r| r.is_positive() && r.contains(p))
+                    };
+                    self.arr_move(id, t_at, dt, lane_at);
+                }
                 ArrDrag::TrimLeft { id } => self.arr_trim_left(id, t_at),
                 ArrDrag::TrimRight { id } => self.arr_trim_right(id, t_at),
                 ArrDrag::FadeIn { id } => self.arr_fade_in(id, t_at),
@@ -7862,9 +7945,20 @@ impl IvoryApp {
             };
             for file in dropped {
                 let Some(path) = file.path else { continue };
+                let is_midi = path
+                    .extension()
+                    .is_some_and(|e| {
+                        let e = e.to_ascii_lowercase();
+                        e == "mid" || e == "midi" || e == "smf"
+                    });
                 // The refusal is the import's own; one sentence into the
                 // status line, cleared by the next successful reload.
-                if let Err(e) = self.import_audio_at(&path, lane, t) {
+                let landed = if is_midi {
+                    self.import_midi_at(&path, lane, t)
+                } else {
+                    self.import_audio_at(&path, lane, t)
+                };
+                if let Err(e) = landed {
                     self.track.error = e;
                 }
             }
@@ -14129,6 +14223,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// **A clip drags ACROSS lanes, by the import rules**: MIDI to
+    /// another MIDI (or unused) channel, audio anywhere audio goes —
+    /// never MIDI onto an audio channel or audio onto a MIDI one. And a
+    /// `.mid` from the outside world lands as a MIDI clip whole.
+    #[test]
+    fn clips_change_lanes_and_midi_files_drop_in() {
+        let root = project_scratch("crosslane");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+
+        // A .mid on disk: two quarter notes, built by hand.
+        let mid = root.join("riff.mid");
+        let mut b: Vec<u8> = Vec::new();
+        b.extend_from_slice(b"MThd");
+        b.extend_from_slice(&6u32.to_be_bytes());
+        b.extend_from_slice(&[0, 1, 0, 1]);
+        b.extend_from_slice(&480u16.to_be_bytes());
+        let track = [
+            0x00, 0x90, 60, 100, 0x83, 0x60, 60, 0, // C4, 480 ticks
+            0x00, 0x90, 64, 100, 0x83, 0x60, 64, 0, // E4, 480 ticks
+            0x00, 0xFF, 0x2F, 0x00,
+        ];
+        b.extend_from_slice(b"MTrk");
+        b.extend_from_slice(&(track.len() as u32).to_be_bytes());
+        b.extend_from_slice(&track);
+        std::fs::write(&mid, &b).expect("write mid");
+
+        // Lane 4 is unused ground on the default desk: the drop takes it.
+        app.import_midi_at(&mid, 4, 8.0).expect("midi import");
+        let c = app.arrangement().clips[0].clone();
+        assert_eq!(c.kind, crate::arrangement::ClipKind::Midi);
+        assert_eq!(c.notes.len(), 2);
+        assert_eq!(c.name, "riff");
+        assert!((c.start_s - 8.0).abs() < 1e-9);
+        // But the DX7's own audio-import refusal has a MIDI mirror.
+        assert!(
+            app.import_midi_at(&mid, 4, 0.0).is_ok(),
+            "a lane with a MIDI clip refused another"
+        );
+
+        // Cross-lane: to another usable lane it GOES...
+        let id = c.id;
+        app.arr_move(id, 8.0, 0.0, Some(5));
+        assert_eq!(app.arrangement().clips[0].lane, 5);
+        // ...onto the DX7's MIDI channel it also goes...
+        app.arr_move(id, 8.0, 0.0, Some(0));
+        assert_eq!(app.arrangement().clips[0].lane, 0);
+        // ...but an AUDIO channel refuses it, and the clip stays put.
+        app.set_channel_input_spec(3, "in:0");
+        app.arr_move(id, 8.0, 0.0, Some(3));
+        assert_eq!(
+            app.arrangement().clips[0].lane,
+            0,
+            "a MIDI clip landed on an audio channel"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// **The five clip operations edit the document** — move, trim both
     /// ends, fades, split at the playhead, delete — with their clamps: a
     /// head trim cannot reveal audio before the file, a tail trim stops at
@@ -14149,7 +14301,7 @@ mod tests {
         app.arr_resolve_len(id);
         assert!((app.arrangement().clips[0].len_s - 60.0).abs() < 1e-9);
 
-        app.arr_move(id, 25.0, 5.0); // the hand was 5 s into the clip
+        app.arr_move(id, 25.0, 5.0, None); // the hand was 5 s into the clip
         assert!((app.arrangement().clips[0].start_s - 20.0).abs() < 1e-9);
 
         app.arr_trim_left(id, 26.0);
