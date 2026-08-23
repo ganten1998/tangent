@@ -333,6 +333,7 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             ("A-DRG", "alt-drag empty room: move the viewport"),
             ("C-WHL", "cmd: pan along the song"),
             ("CA-WHL", "ctrl+alt: grid finer or coarser"),
+            ("NAV", "corner box: drag scrolls · up zooms in"),
         ]),
         HelpView::MidiEdit => rows.extend([
             ("DRAG", "draw a note · body moves · right edge stretches"),
@@ -491,10 +492,10 @@ fn layout(rect: Rect, rows: usize, widest: usize, widest_key: usize) -> (Rect, f
     let measure = |cols: usize| measure_card(rect, rows, widest, widest_key, cols);
 
     let mut best: Option<(usize, f32, f32, f32)> = None;
-    // Up to FOUR columns now: the arrangement's card carries the gesture
-    // rows, and thirty-plus rows in three columns cannot fit a short window
-    // at any legible size.
-    for cols in 1..=4usize {
+    // Up to FIVE columns now: the arrangement's card carries the gesture
+    // rows — forty-plus of them with the navigator — and a short window
+    // cannot hold them any other way at a legible size.
+    for cols in 1..=5usize {
         let (size, w, h) = measure(cols);
         if w <= rect.width() * 0.94 && h <= rect.height() {
             if best.is_none_or(|(_, bs, ..)| size > bs) {
@@ -506,8 +507,8 @@ fn layout(rect: Rect, rows: usize, widest: usize, widest_key: usize) -> (Rect, f
     // widest arrangement and let the clamp below trim it, which clips inside
     // the window rather than painting outside it.
     let (cols, size, w, h) = best.unwrap_or_else(|| {
-        let (size, w, h) = measure(4);
-        (4, size, w, h)
+        let (size, w, h) = measure(5);
+        (5, size, w, h)
     });
     // Never flush against the window edges: a card touching them reads as
     // clipped even when it is not, and exact-equality containment is a float
