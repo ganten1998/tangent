@@ -3487,6 +3487,29 @@ impl DesktopApp {
         e.set_midi_off(midi_off);
         e.set_armed(armed);
         e.set_pick_strips(picks);
+        // **The live punch**: while the arrangement records over a lane,
+        // everything scheduled on it from the record start is being
+        // replaced and must not sound. Pushed every frame like the arms;
+        // cleared the same way when the take ends and the carve is real.
+        {
+            let mut punches: [Option<u64>; ivory_ui::recorder::CHANNELS] =
+                [None; ivory_ui::recorder::CHANNELS];
+            if let Some(rec) = self.recorder.arr_rec.as_ref() {
+                let rate = f64::from(e.output().sample_rate).max(1.0);
+                let at = (rec.start_s.max(0.0) * rate).round() as u64;
+                for l in &rec.midi_lanes {
+                    if *l < punches.len() {
+                        punches[*l] = Some(at);
+                    }
+                }
+                for (_, l, _) in &rec.audio {
+                    if *l < punches.len() {
+                        punches[*l] = Some(at);
+                    }
+                }
+            }
+            e.set_punches(punches);
+        }
         e.set_builtin_strip(builtin);
         // Never read from a settings file — see `IvoryApp::input_monitor`. It
         // is pushed every frame like every other monitor setting, and its value
@@ -3621,6 +3644,21 @@ impl DesktopApp {
 
     /// Open the audio input the user asked for, if it is not already open.
     fn reconcile_audio(&mut self, force: bool) {
+        // **The session's device IS the settings' device, always.** The
+        // owner's interface selection has now been lost from the file twice
+        // while a session that could record kept running — some path opened
+        // the box without persisting the choice. Whatever opened it, the
+        // moment a device is wanted it is written down; a file that
+        // disagrees with a working session is how "input monitoring is
+        // broken" happens a day later.
+        {
+            let wanted = crate::devices::selection(&self.recorder.audio).wanted;
+            if let Some(uid) = wanted {
+                if self.app.chosen_audio_uid() != Some(uid.as_str()) {
+                    self.app.remember_audio_device(&uid);
+                }
+            }
+        }
         // **The extras, pushed before the staleness check reads it.** Choosing
         // a second input changes how many channels the stream carries and
         // which ones, so it is a reopen — `set_extra_inputs` marks the

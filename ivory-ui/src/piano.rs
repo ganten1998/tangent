@@ -38,15 +38,13 @@ pub fn white_keys_before(note: u8) -> Option<usize> {
     Some(2 + 7 * (note as usize / 12 - 2) + offset)
 }
 
-/// Idle fill for a key, honoring the dark-mode swap (idle colors ONLY swap).
+/// Idle fill for a key. Dark mode is scoped to the theory window and the
+/// arrange view now, by the owner's word — the piano keeps its one look.
 fn idle_colors(s: &Settings) -> (Color32, Color32) {
-    let white_idle = s.white_key_idle_color.to_color32();
-    let black_idle = s.black_key_idle_color.to_color32();
-    if s.dark_mode {
-        (black_idle, white_idle) // (white keys, black keys) swapped
-    } else {
-        (white_idle, black_idle)
-    }
+    (
+        s.white_key_idle_color.to_color32(),
+        s.black_key_idle_color.to_color32(),
+    )
 }
 
 pub fn bg_color(dark_mode: bool) -> Color32 {
@@ -73,7 +71,7 @@ pub fn draw(
     let top = rect.top();
 
     // 1. Background fill (visible only through truncation slivers).
-    painter.rect_filled(rect, 0.0, bg_color(s.dark_mode));
+    painter.rect_filled(rect, 0.0, bg_color(false));
 
     let white_key_w = w / WHITE_KEYS as f64;
     let black_key_w = white_key_w * 0.7;
@@ -84,16 +82,8 @@ pub fn draw(
     let white_active = s.white_key_active_color.to_color32();
     let black_active = s.black_key_active_color.to_color32();
 
-    let separator = if s.dark_mode {
-        Color32::from_rgb(153, 153, 153)
-    } else {
-        Color32::from_rgb(92, 63, 31)
-    };
-    let outline = if s.dark_mode {
-        Color32::from_rgb(204, 204, 204)
-    } else {
-        Color32::from_rgb(139, 115, 85)
-    };
+    let separator = Color32::from_rgb(92, 63, 31);
+    let outline = Color32::from_rgb(139, 115, 85);
 
     // 2. White keys, left to right (int truncation per key, like Qt fillRect).
     // Fill every white key FIRST, then draw the separators on top — otherwise each
