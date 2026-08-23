@@ -51,6 +51,8 @@ pub struct ProjectExportSpec {
     pub secondary: Option<ExportFormat>,
     /// A realtime pass through the live engine instead of the offline one.
     pub realtime: bool,
+    /// The span to render, in song seconds. `None` is the whole project.
+    pub span: Option<(f64, f64)>,
 }
 
 impl Default for ProjectExportSpec {
@@ -65,6 +67,7 @@ impl Default for ProjectExportSpec {
             primary: ExportFormat::Wav,
             secondary: None,
             realtime: false,
+            span: None,
         }
     }
 }

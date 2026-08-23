@@ -2675,7 +2675,7 @@ impl DesktopApp {
     /// Start an export: the whole arrangement, played from the top through
     /// the real engine — racks, limiter, master — into an audio-only take
     /// the finish copies into the project's `export/`.
-    fn start_bounce(&mut self, stems: bool) {
+    fn start_bounce(&mut self, stems: bool, span: Option<(f64, f64)>) {
         if self.recorder.bounce.is_some()
             || self.recorder.session.is_recording()
             || self.recorder.arr_rec.is_some()
@@ -2687,16 +2687,20 @@ impl DesktopApp {
                 Some("Open the band to export — the audio path is closed.".to_owned());
             return;
         }
-        let span = self.app.arr_span_s();
-        if span <= 0.0 {
+        let (from_s, until_s) = match span {
+            Some((a, b)) if b > a => (a.max(0.0), b + 2.0),
+            _ => (0.0, self.app.arr_span_s() + 2.0),
+        };
+        if until_s <= from_s + 2.0 && self.app.arr_span_s() <= 0.0 {
             self.recorder.take_note =
                 Some("Nothing to export — the timeline is empty.".to_owned());
             return;
         }
         let root = self.app.record_root();
-        // From the very top, rolling before the take opens — the same
+        // From the span's head, rolling before the take opens — the same
         // press-order the transport itself keeps.
         self.recorder.transport.stop();
+        self.recorder.transport.locate(from_s);
         self.recorder.transport.toggle_play();
         let spec = ivory_ui::recorder::ExportSpec {
             audio: true,
@@ -2752,7 +2756,7 @@ impl DesktopApp {
         self.recorder.bounce = Some(Bounce {
             // Two seconds of tail: the reverbs' ring-out is part of the
             // track.
-            until_s: span + 2.0,
+            until_s,
             finishing: false,
             stems,
             stem_writers,
@@ -2962,7 +2966,11 @@ impl DesktopApp {
         {
             return;
         }
-        let span = self.app.arr_span_s();
+        // The whole project, or the arrange view's TIME SELECTION.
+        let (from_s, span) = match spec.span {
+            Some((a, b)) if b > a => (a.max(0.0), b - a),
+            _ => (0.0, self.app.arr_span_s()),
+        };
         if span <= 0.0 {
             self.recorder.take_note =
                 Some("Nothing to export — the timeline is empty.".to_owned());
@@ -3133,7 +3141,7 @@ impl DesktopApp {
             e.set_pad_params(&self.app.drum_kit_params());
         }
         e.set_stems(spec.stems);
-        e.set_transport(1, 0);
+        e.set_transport(1, (from_s * f64::from(rate)).round() as u64);
         e.set_rolling(true);
         // ── the files ──
         let wav_spec = ivory_record::wav::WavSpec {
@@ -3337,13 +3345,13 @@ impl DesktopApp {
                     // spec's shaping (name, dir, formats, mono) is applied
                     // when the pass lands — see `finish_bounce`.
                     self.recorder.pending_delivery = Some(spec.clone());
-                    self.start_bounce(spec.stems);
+                    self.start_bounce(spec.stems, spec.span);
                 } else {
                     self.start_offline_bounce(spec);
                 }
             }
-            ivory_ui::ports::ProjectRequest::ExportTrack => self.start_bounce(false),
-            ivory_ui::ports::ProjectRequest::ExportStems => self.start_bounce(true),
+            ivory_ui::ports::ProjectRequest::ExportTrack => self.start_bounce(false, None),
+            ivory_ui::ports::ProjectRequest::ExportStems => self.start_bounce(true, None),
             ivory_ui::ports::ProjectRequest::New => {
                 // The default template exists from the start: seeded here if
                 // nothing ever saved over it.
