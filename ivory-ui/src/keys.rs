@@ -252,7 +252,7 @@ fn describe(a: KeyAction) -> &'static str {
         KeyAction::ToggleKeytoggle => "keytoggle: click the piano or the neck to place notes",
         KeyAction::ClearNotes => "clear every note you placed",
         KeyAction::ToggleFretboard => "guitar view",
-        KeyAction::ToggleMixer => "mixer view",
+        KeyAction::ToggleMixer => "cycle piano / mixer / arrangement",
         KeyAction::ToggleCameraPane => "camera",
         KeyAction::CycleClef => "clef",
         KeyAction::ToggleNoteNames => "note names",
@@ -297,10 +297,52 @@ pub enum HelpView {
     MidiEdit,
 }
 
+/// Whether a binding belongs on `view`'s card — the owner's rule: each
+/// view's H lists only the keys that DO something on that page. The piano
+/// is the app's home and keeps every binding; the other surfaces keep the
+/// window's own switches, the transport, the popups, and whatever they
+/// stole for themselves. A key that only changes something the view is
+/// covering — keytoggle, the staff, the theory band, the teach block —
+/// is not on their cards, because pressing it there shows you nothing.
+fn on_card(view: HelpView, a: KeyAction) -> bool {
+    use KeyAction as K;
+    if matches!(view, HelpView::Piano) {
+        return true;
+    }
+    let global = matches!(
+        a,
+        K::ToggleHelp
+            | K::ToggleDarkMode
+            | K::ToggleBorderless
+            | K::CycleFont
+            | K::ShowAbout
+            | K::ToggleFullscreen
+            | K::ToggleRecorder
+            | K::ToggleMixer
+            | K::ToggleDrumpad
+            | K::StartRecording
+            | K::StopRecording
+    );
+    global
+        || match view {
+            HelpView::Piano => true,
+            // The supporter card rises over the mixer exactly as it does
+            // over the piano; everything else on this card is gestures.
+            HelpView::Mixer => matches!(a, K::ShowSupporterKey),
+            // The three the arrangement stole, wearing their meanings HERE.
+            HelpView::Arrange => matches!(
+                a,
+                K::ShowSupporterKey | K::ToggleFretboard | K::ManageTaughtChords
+            ),
+            // The editor's magnet and its triplet grid.
+            HelpView::MidiEdit => matches!(a, K::ToggleFretboard | K::ToggleNotePreference),
+        }
+}
+
 fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> {
     let mut rows: Vec<(&'static str, &'static str)> = BINDINGS
         .iter()
-        .filter(|&&(_, _, a, shown)| shown && available(a, gates))
+        .filter(|&&(_, _, a, shown)| shown && available(a, gates) && on_card(view, a))
         .map(|&(_, label, action, _)| {
             let desc = match (view, action) {
                 (HelpView::Arrange, KeyAction::ShowSupporterKey) => {
@@ -698,6 +740,73 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **Each view's card lists only the keys that work on that page.** A
+    /// card that advertises the clef cycle over the mixer is teaching a key
+    /// that shows you nothing there — and the overlapping letters (S, G, M,
+    /// P) must wear the meaning they have THERE, not the piano's.
+    #[test]
+    fn each_views_card_is_its_own_page() {
+        let gates = Gates {
+            recorder_shown: true,
+            recorder_available: true,
+            window_sizing: true,
+        };
+        let card = |view: HelpView| card_rows(gates, view);
+        let has = |rows: &[(&str, &str)], key: &str| rows.iter().any(|(k, _)| *k == key);
+        fn desc<'a>(rows: &[(&'a str, &'a str)], key: &str) -> &'a str {
+            rows.iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, d)| *d)
+                .unwrap_or_default()
+        }
+
+        // The piano is the home: every shown, live binding is on its card.
+        let piano = card(HelpView::Piano);
+        let shown = BINDINGS
+            .iter()
+            .filter(|&&(_, _, a, s)| s && available(a, gates))
+            .count();
+        assert_eq!(piano.len(), shown, "the piano card dropped a live key");
+
+        for (view, name) in [
+            (HelpView::Mixer, "mixer"),
+            (HelpView::Arrange, "arrange"),
+            (HelpView::MidiEdit, "editor"),
+        ] {
+            let rows = card(view);
+            // The piano-only keys are gone: keytoggle, the staff pair, the
+            // theory row, transpose, clear, and the teach block.
+            for dead in ["K", "U", "I", "1-4", "T", "C", "Up", "Down", "R", "N", "E", "L"] {
+                assert!(
+                    !has(&rows, dead),
+                    "{name}: `{dead}` is on the card but does nothing there"
+                );
+            }
+            // The window's own switches stay everywhere.
+            for live in ["H", "D", "F", "Z", "Tab", "V", "W", "Enter", "Space"] {
+                assert!(has(&rows, live), "{name}: `{live}` went missing");
+            }
+        }
+
+        // The overlapping letters wear their local meanings.
+        let arrange = card(HelpView::Arrange);
+        assert!(desc(&arrange, "S").contains("split"), "S on arrange: {:?}", desc(&arrange, "S"));
+        assert!(desc(&arrange, "G").contains("snap"));
+        assert!(desc(&arrange, "M").contains("metronome"));
+        assert!(!has(&arrange, "P"), "P does nothing on the arrangement");
+
+        let editor = card(HelpView::MidiEdit);
+        assert!(desc(&editor, "G").contains("snap"));
+        assert!(desc(&editor, "P").contains("triplet"));
+        assert!(!has(&editor, "S"), "S is the arrangement's split, not the editor's");
+        assert!(!has(&editor, "M"), "M is not an editor key");
+
+        let mixer = card(HelpView::Mixer);
+        assert!(desc(&mixer, "S").contains("supporter"), "S on the mixer is the supporter card");
+        assert!(!has(&mixer, "G"), "G's guitar band is hidden under the mixer");
+        assert!(!has(&mixer, "M"), "M's dialog belongs to the piano's card");
     }
 
     /// Letters that are ordinary shortcuts must not fire with a modifier held.
