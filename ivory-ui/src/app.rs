@@ -9215,6 +9215,10 @@ impl IvoryApp {
                         self.settings.midi_swing = false;
                     }
                     self.save_settings();
+                } else if editor_focus && action == keys::KeyAction::ShowSupporterKey {
+                    // S is the arrangement's SPLIT — cutting a clip you
+                    // cannot see, under the editor, is a footgun; the key
+                    // waits until the hand leaves the popup.
                 } else if self.arrangement_open
                     && action == keys::KeyAction::ShowSupporterKey
                 {
