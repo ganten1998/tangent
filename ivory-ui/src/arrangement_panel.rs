@@ -165,6 +165,8 @@ pub enum Hit {
     /// The seam between the headers and the lanes: drag to resize the
     /// header column.
     HeaderGrip,
+    /// The circled plus on an EMPTY lane's header: add a bare track here.
+    HdrAdd(usize),
 }
 
 impl Hit {
@@ -235,6 +237,8 @@ pub struct HeaderRow {
     /// The input chip, under the name — every lane wears one now: binding
     /// an input is how a bare lane BECOMES a track.
     pub input: Rect,
+    /// The circled plus, on empty lanes alone.
+    pub add: Rect,
 }
 
 impl HeaderRow {
@@ -253,6 +257,7 @@ impl HeaderRow {
         mute: Rect::NOTHING,
         solo: Rect::NOTHING,
         input: Rect::NOTHING,
+        add: Rect::NOTHING,
     };
 }
 
@@ -380,12 +385,19 @@ impl Layout {
         // An unused lane is a place, not a channel — but it DOES wear the
         // input chip: binding an input is how a bare lane becomes a track.
         if !used {
+            // The + circle first — pressing it makes the track — then the
+            // chip beside it for binding straight away.
+            let d = (r.height() * 0.44).clamp(16.0, 26.0);
+            let add = Rect::from_center_size(
+                Pos2::new(r.left() + r.width() * 0.10, r.center().y),
+                Vec2::splat(d),
+            );
             let ch_h = (r.height() * 0.30).clamp(12.0, 16.0);
             let input = Rect::from_min_size(
-                Pos2::new(r.left() + r.width() * 0.10, r.center().y - ch_h * 0.5),
-                Vec2::new(r.width() * 0.42, ch_h),
+                Pos2::new(add.right() + 6.0, r.center().y - ch_h * 0.5),
+                Vec2::new(r.width() * 0.40, ch_h),
             );
-            return HeaderRow { panel: row, input, ..HeaderRow::NONE };
+            return HeaderRow { panel: row, input, add, ..HeaderRow::NONE };
         }
         let h = r.height();
         let cut = |a: f32, b: f32| {
@@ -463,6 +475,7 @@ impl Layout {
             mute,
             solo,
             input,
+            add: Rect::NOTHING,
         }
     }
 }
@@ -578,6 +591,7 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
             (row.send, Hit::Send(i)),
             (row.pan, Hit::Pan(i)),
             (row.input, Hit::HdrInput(i)),
+            (row.add, Hit::HdrAdd(i)),
             (row.name, Hit::HdrName(i)),
         ] {
             if r.is_positive() && r.contains(pos) {
@@ -1098,6 +1112,22 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             );
         };
         if !lane.used {
+            if row.add.is_positive() {
+                let c = row.add.center();
+                let ink = p.hdr_face.gamma_multiply(0.55);
+                let radius = row.add.width().min(row.add.height()) * 0.5 - 1.0;
+                let w = (radius * 0.12).clamp(1.2, 2.2);
+                painter.circle_stroke(c, radius, Stroke::new(w, ink));
+                let arm = radius * 0.45;
+                painter.line_segment(
+                    [Pos2::new(c.x - arm, c.y), Pos2::new(c.x + arm, c.y)],
+                    Stroke::new(w, ink),
+                );
+                painter.line_segment(
+                    [Pos2::new(c.x, c.y - arm), Pos2::new(c.x, c.y + arm)],
+                    Stroke::new(w, ink),
+                );
+            }
             chip(painter, row.input, "NO INPUT", false);
             continue;
         }
