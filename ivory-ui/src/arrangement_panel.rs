@@ -374,8 +374,10 @@ impl Layout {
         // **Two dials now — volume, then send — a shade smaller than the
         // one was**, each with a readout under it: the number is the other
         // half of a dial this size.
-        let kd = (h * 0.52).clamp(12.0, 20.0);
-        let dial_top = r.top() + h * 0.08;
+        let kd = (h * 0.46).clamp(11.0, 18.0);
+        // The dial standard: the VALUE reads above the knob, the LABEL
+        // under it — so the dials drop to make room for the numbers.
+        let dial_top = r.top() + h * 0.26;
         let send = Rect::from_min_size(
             Pos2::new(meter.left() - 5.0 - kd, dial_top),
             Vec2::splat(kd),
@@ -392,8 +394,8 @@ impl Layout {
         );
         let readout = |dial: Rect| {
             Rect::from_min_max(
-                Pos2::new(dial.left() - 1.0, dial.bottom() + 1.0),
-                Pos2::new(dial.right() + 1.0, r.bottom() - 1.0),
+                Pos2::new(dial.left() - 1.0, r.top() + 1.0),
+                Pos2::new(dial.right() + 1.0, dial.top() - 1.0),
             )
         };
         let name = Rect::from_min_max(
@@ -985,11 +987,18 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             if !cell.is_positive() || cell.height() < 7.0 {
                 return;
             }
+            // Sized to the CELL, width included: three readouts sit shoulder
+            // to shoulder up here, and a figure that overflows its dial runs
+            // into the next figure and reads as one number.
+            let fit = cell.width() / (text.chars().count().max(1) as f32 * 0.64);
             painter.text(
                 cell.center(),
                 Align2::CENTER_CENTER,
                 text,
-                FontId::new(cell.height().clamp(7.0, 9.0), crate::fonts::courier()),
+                FontId::new(
+                    cell.height().clamp(7.0, 9.0).min(fit).max(5.5),
+                    crate::fonts::courier(),
+                ),
                 ink_on.gamma_multiply(0.8),
             );
         };
@@ -1035,6 +1044,25 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             }
         };
         readout(painter, row.pan_readout, pan_word);
+        // The labels, under their dials — always visible, the standard.
+        for (dial, word) in [(row.pan, "PAN"), (row.knob, "VOL"), (row.send, "SND")] {
+            if !dial.is_positive() {
+                continue;
+            }
+            let band = Rect::from_min_max(
+                Pos2::new(dial.left() - 2.0, dial.bottom()),
+                Pos2::new(dial.right() + 2.0, row.panel.bottom() - 1.0),
+            );
+            if band.height() >= 6.0 {
+                painter.text(
+                    Pos2::new(band.center().x, band.top()),
+                    Align2::CENTER_TOP,
+                    word,
+                    FontId::new(band.height().clamp(6.0, 8.0), crate::fonts::courier()),
+                    ink_on.gamma_multiply(0.5),
+                );
+            }
+        }
         // The meter: one slim bar, the loudest of the pair.
         if row.meter.is_positive() {
             painter.rect_filled(row.meter, 1.0, p.lane);

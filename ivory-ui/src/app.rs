@@ -327,6 +327,13 @@ pub struct IvoryApp {
     /// The chips' words, refreshed each frame so the borrowed view can
     /// point at them.
     input_chip_texts: Vec<String>,
+    /// The media explorer: where it stands, what it lists, and the scroll.
+    media_dir: std::path::PathBuf,
+    media_entries: Vec<crate::drumpad_panel::MediaEntry>,
+    media_scroll: usize,
+    media_fresh: bool,
+    /// A media row a drag is in flight from, until the button comes up.
+    media_drag: Option<usize>,
     /// The MIDI editor popup, while one is open.
     midi_edit: Option<MidiEdit>,
     /// Where it drew last frame, for the input to hit against.
@@ -677,20 +684,45 @@ struct MidiEdit {
     view_len_s: f64,
     /// The (fractional) key at the roll's top edge.
     top_key: f32,
-    selected: Option<usize>,
+    /// The SELECTED notes — sorted indices, because the editor works on
+    /// sets now: move together, quantise together, go together.
+    selected: Vec<usize>,
     drag: Option<MeDrag>,
     dirty: bool,
     /// A piano-column key held down, sounding through the audition.
     down_key: Option<u8>,
+    /// The pitch a move is previewing, so the ear follows the drag.
+    preview_key: Option<u8>,
+    /// The velocity new notes are born with — the last one anybody set.
+    last_vel: u8,
+    /// A marquee in flight, both corners in screen space.
+    marquee: Option<(egui::Pos2, egui::Pos2)>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum MeDrag {
-    /// The grabbed note rides under the same point of the hand.
-    Move { i: usize, dt: f64 },
+    /// The grabbed note rides under the same point of the hand — and the
+    /// whole selection rides WITH it: `orig` is every selected note's
+    /// position at the press, applied as one delta.
+    Move {
+        i: usize,
+        dt: f64,
+        orig: Vec<(usize, f64, u8)>,
+    },
     Resize { i: usize },
     /// A note being drawn: created at press, its tail follows the hand.
     Create { i: usize },
+    /// The velocity lane: the bar under the hand follows it vertically.
+    Vel,
+    /// Cmd-drag on empty roll: the rubber band.
+    Marquee,
+}
+
+/// Where the media explorer wakes up: the user's home, or the root.
+fn dirs_home() -> std::path::PathBuf {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/"))
 }
 
 /// `base`, or `base 2`, `base 3`… — the first directory name not taken.
@@ -1043,6 +1075,11 @@ impl IvoryApp {
             lcd_drag: None,
             input_menu: None,
             input_chip_texts: Vec::new(),
+            media_dir: dirs_home(),
+            media_entries: Vec::new(),
+            media_scroll: 0,
+            media_fresh: false,
+            media_drag: None,
             midi_edit: None,
             midi_edit_rect: None,
             drumpad_open: false,
@@ -2100,16 +2137,33 @@ impl IvoryApp {
             // that means something on sight: red is where the output is, and a
             // master somebody painted teal is a desk with no landmark on it.
             H::Palette(i) => {
-                if i.strip().is_some() {
-                    self.mixer_palette = Some(i);
+                // The right-click menu replaced the bare palette: remove,
+                // choose a colour, or choose the auto-palette — one home.
+                if let Some(strip) = i.strip() {
+                    self.dialog = Some(dialogs::Dialog::Track {
+                        lane: strip.index(),
+                        removable: matches!(strip, crate::recorder::Strip::Channel(_)),
+                    });
                 }
                 return;
             }
-            // Click the number and say it. Seeded EMPTY rather than with what
-            // is there: somebody who clicked it wants to type a figure, not to
-            // edit one character of the old one.
+            // Click the number and edit it: the field opens saying exactly
+            // what the readout says — the owner's rule for every dial.
             H::Db(i) => {
-                self.mixer_typing = Some((i, String::new()));
+                let seed = {
+                    let view = self.mixer_view();
+                    view.strips
+                        .get(i.0)
+                        .map(|st| {
+                            if st.gain <= 0.001 {
+                                "-60".to_owned()
+                            } else {
+                                format!("{:.1}", 20.0 * st.gain.log10())
+                            }
+                        })
+                        .unwrap_or_default()
+                };
+                self.mixer_typing = Some((i, seed));
                 return;
             }
             // **Seeded with what is there**, unlike the decibel field. A name
@@ -2569,7 +2623,7 @@ impl IvoryApp {
                     .get(i)
                     .map_or(name, |n| if n.is_empty() { name } else { n.as_str() }),
                 detail,
-                color: self.settings.strip_colors.get(i).copied().unwrap_or(0) as usize,
+                color: self.strip_color(i),
                 // **What the SOURCE is, not what the samples happen to be.**
                 // A mono microphone whose two bars are identical is a meter
                 // claiming a stereo signal; the input knows its own width and
@@ -4576,6 +4630,21 @@ impl IvoryApp {
         }
     }
 
+    /// A strip's colour, the ONE authority: a hand-painted choice wins;
+    /// otherwise the AUTO-PALETTE names a colour per slot; everything else
+    /// wears the wood.
+    pub fn strip_color(&self, i: usize) -> usize {
+        let manual = self.settings.strip_colors.get(i).copied().unwrap_or(0);
+        if manual != 0 {
+            return manual as usize;
+        }
+        if self.settings.auto_palette && i < crate::recorder::CHANNELS {
+            let choice = self.settings.palette_choice.clamp(0, 4) as usize;
+            return crate::mixer_panel::PALETTES[choice].1[i] as usize;
+        }
+        0
+    }
+
     /// The drum bus's fader and pan, for the host.
     pub fn drums_gain(&self) -> f32 {
         self.settings.drums_gain as f32
@@ -5108,13 +5177,31 @@ impl IvoryApp {
         crate::midi_editor::snap_t(&self.midi_edit_view(st, clip), t)
     }
 
-    /// A new note under the pen: snapped, one grid step long, clamped into
-    /// the clip. The drag that follows stretches its tail.
+    /// Keep `i` in the sorted selection; answer whether it was new.
+    fn me_select(&mut self, i: usize, extend: bool) {
+        let Some(st) = self.midi_edit.as_mut() else {
+            return;
+        };
+        if extend {
+            match st.selected.binary_search(&i) {
+                Ok(at) => {
+                    st.selected.remove(at);
+                }
+                Err(at) => st.selected.insert(at, i),
+            }
+        } else if st.selected.binary_search(&i).is_err() {
+            st.selected = vec![i];
+        }
+    }
+
+    /// A new note under the pen: snapped, one grid step long, born at the
+    /// last velocity anybody set — and heard, so drawing is playing.
     fn me_create_note(&mut self, t: f64, key: u8) {
         let Some(st) = self.midi_edit.as_ref() else {
             return;
         };
         let id = st.id;
+        let vel = st.last_vel.clamp(1, 127);
         let t0 = self.me_snap(t);
         let (step, span) = {
             let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == id) else {
@@ -5138,37 +5225,84 @@ impl IvoryApp {
             at_s: offset + (t0 - c0),
             dur_s: dur,
             key: key.min(127),
-            vel: 100,
+            vel,
         });
         let i = clip.notes.len() - 1;
+        self.request_recorder(recorder::RecorderRequest::Audition {
+            notes: vec![key.min(127)],
+            on: true,
+        });
         if let Some(st) = self.midi_edit.as_mut() {
-            st.selected = Some(i);
+            st.selected = vec![i];
             st.drag = Some(MeDrag::Create { i });
+            st.preview_key = Some(key.min(127));
             st.dirty = true;
         }
     }
 
-    /// MOVE: start snapped, pitch to the row under the hand, both clamped
-    /// into the clip.
-    fn me_move_note(&mut self, i: usize, t: f64, key_f: f32) {
+    /// MOVE the whole selection by the grabbed note's delta — every note
+    /// keeps its distance from the hand, and the CLIP's edges clamp the
+    /// set as one, so a chord cannot shear against its own notes.
+    fn me_move_selection(
+        &mut self,
+        grabbed: usize,
+        t_at: f64,
+        key_f: f32,
+        dt: f64,
+        orig: &[(usize, f64, u8)],
+    ) {
         let Some(st) = self.midi_edit.as_ref() else {
             return;
         };
         let id = st.id;
-        let t0 = self.me_snap(t);
+        let target = self.me_snap(t_at - dt);
         let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
             return;
         };
         let (c0, c1, offset) = (clip.start_s, clip.start_s + clip.len_s, clip.offset_s);
-        let Some(n) = clip.notes.get_mut(i) else {
+        let Some(&(_, g_t0, g_k0)) = orig.iter().find(|(i, ..)| *i == grabbed) else {
             return;
         };
-        let dur = n.dur_s.max(0.05);
-        let at = offset + (t0.clamp(c0, (c1 - dur).max(c0)) - c0);
-        let key = key_f.clamp(0.0, 127.0) as u8;
-        if (n.at_s - at).abs() > 1.0e-9 || n.key != key {
-            n.at_s = at;
-            n.key = key;
+        let mut dt_all = target - g_t0;
+        let mut dk_all = i32::from(key_f.clamp(0.0, 127.0) as u8) - i32::from(g_k0);
+        // The set's own clamps: no note before the clip, none past its end,
+        // none off the keyboard.
+        for &(i, t0, k0) in orig {
+            let Some(n) = clip.notes.get(i) else { continue };
+            let dur = n.dur_s.max(0.05);
+            dt_all = dt_all.clamp(c0 - t0, (c1 - dur - t0).max(c0 - t0));
+            dk_all = dk_all.clamp(-i32::from(k0), 127 - i32::from(k0));
+        }
+        let mut moved = false;
+        for &(i, t0, k0) in orig {
+            let Some(n) = clip.notes.get_mut(i) else { continue };
+            let at = offset + (t0 + dt_all - c0);
+            let key = (i32::from(k0) + dk_all).clamp(0, 127) as u8;
+            if (n.at_s - at).abs() > 1.0e-9 || n.key != key {
+                n.at_s = at;
+                n.key = key;
+                moved = true;
+            }
+        }
+        if moved {
+            // The ear follows the grabbed note's pitch as it moves.
+            let new_key = (i32::from(g_k0) + dk_all).clamp(0, 127) as u8;
+            let old = self.midi_edit.as_ref().and_then(|m| m.preview_key);
+            if old != Some(new_key) {
+                if let Some(k) = old {
+                    self.request_recorder(recorder::RecorderRequest::Audition {
+                        notes: vec![k],
+                        on: false,
+                    });
+                }
+                self.request_recorder(recorder::RecorderRequest::Audition {
+                    notes: vec![new_key],
+                    on: true,
+                });
+                if let Some(st) = self.midi_edit.as_mut() {
+                    st.preview_key = Some(new_key);
+                }
+            }
             if let Some(st) = self.midi_edit.as_mut() {
                 st.dirty = true;
             }
@@ -5200,6 +5334,207 @@ impl IvoryApp {
         }
     }
 
+    /// The velocity lane: the bar nearest `t` — or the whole selection, if
+    /// that bar is in it — follows the hand's height.
+    fn me_set_vel(&mut self, t: f64, vel: u8) {
+        let Some(st) = self.midi_edit.as_ref() else {
+            return;
+        };
+        let id = st.id;
+        let sel = st.selected.clone();
+        let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
+            return;
+        };
+        let (c0, offset) = (clip.start_s, clip.offset_s);
+        // The nearest bar, within a grabbable reach.
+        let mut best: Option<(usize, f64)> = None;
+        for (i, n) in clip.notes.iter().enumerate() {
+            let d = (c0 + (n.at_s - offset) - t).abs();
+            if best.is_none_or(|(_, bd)| d < bd) {
+                best = Some((i, d));
+            }
+        }
+        let Some((i, d)) = best else { return };
+        if d > 0.5 {
+            return;
+        }
+        let vel = vel.clamp(1, 127);
+        let targets: Vec<usize> = if sel.binary_search(&i).is_ok() {
+            sel
+        } else {
+            vec![i]
+        };
+        let mut changed = false;
+        for i in targets {
+            if let Some(n) = clip.notes.get_mut(i) {
+                if n.vel != vel {
+                    n.vel = vel;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            if let Some(st) = self.midi_edit.as_mut() {
+                st.last_vel = vel;
+                st.dirty = true;
+            }
+        }
+    }
+
+    /// QUANTISE the selection: starts to the grid, held durations kept.
+    fn me_quantise(&mut self) {
+        let Some(st) = self.midi_edit.as_ref() else {
+            return;
+        };
+        let id = st.id;
+        let sel = st.selected.clone();
+        if sel.is_empty() {
+            return;
+        }
+        // Snap in absolute time, through the one authority.
+        let mut moves: Vec<(usize, f64)> = Vec::new();
+        {
+            let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == id) else {
+                return;
+            };
+            for &i in &sel {
+                let Some(n) = clip.notes.get(i) else { continue };
+                let abs = clip.start_s + (n.at_s - clip.offset_s);
+                let to = self.me_snap(abs).clamp(
+                    clip.start_s,
+                    (clip.start_s + clip.len_s - n.dur_s.max(0.05)).max(clip.start_s),
+                );
+                moves.push((i, clip.offset_s + (to - clip.start_s)));
+            }
+        }
+        if let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) {
+            for (i, at) in moves {
+                if let Some(n) = clip.notes.get_mut(i) {
+                    n.at_s = at;
+                }
+            }
+        }
+        self.arr_save_edits();
+    }
+
+    /// DUPLICATE the selection one grid step later; the copies become the
+    /// selection, ready to ride.
+    fn me_duplicate(&mut self) {
+        let Some(st) = self.midi_edit.as_ref() else {
+            return;
+        };
+        let id = st.id;
+        let sel = st.selected.clone();
+        if sel.is_empty() {
+            return;
+        }
+        let step = {
+            let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == id) else {
+                return;
+            };
+            crate::midi_editor::grid_step_s(&self.midi_edit_view(st, clip)).max(0.05)
+        };
+        let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
+            return;
+        };
+        let end = clip.offset_s + clip.len_s;
+        let mut fresh = Vec::new();
+        for &i in &sel {
+            let Some(n) = clip.notes.get(i) else { continue };
+            let mut c = n.clone();
+            c.at_s += step;
+            if c.at_s < end - 1.0e-9 {
+                fresh.push(c);
+            }
+        }
+        if fresh.is_empty() {
+            return;
+        }
+        let first = clip.notes.len();
+        let count = fresh.len();
+        clip.notes.extend(fresh);
+        if let Some(st) = self.midi_edit.as_mut() {
+            st.selected = (first..first + count).collect();
+        }
+        self.arr_save_edits();
+    }
+
+    /// NUDGE the selection a grid step along, or a semitone up or down.
+    fn me_nudge(&mut self, steps_t: f64, dk: i32) {
+        let Some(st) = self.midi_edit.as_ref() else {
+            return;
+        };
+        let id = st.id;
+        let sel = st.selected.clone();
+        if sel.is_empty() {
+            return;
+        }
+        let step = {
+            let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == id) else {
+                return;
+            };
+            crate::midi_editor::grid_step_s(&self.midi_edit_view(st, clip)).max(0.01)
+        };
+        let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
+            return;
+        };
+        let end = clip.offset_s + clip.len_s;
+        let dt = steps_t * step;
+        // The set's clamps, exactly as a drag's.
+        let mut dt_all = dt;
+        let mut dk_all = dk;
+        for &i in &sel {
+            let Some(n) = clip.notes.get(i) else { continue };
+            dt_all = dt_all.clamp(-n.at_s + clip.offset_s, (end - n.dur_s.max(0.05) - n.at_s).max(0.0));
+            dk_all = dk_all.clamp(-i32::from(n.key), 127 - i32::from(n.key));
+        }
+        for &i in &sel {
+            if let Some(n) = clip.notes.get_mut(i) {
+                n.at_s += dt_all;
+                n.key = (i32::from(n.key) + dk_all).clamp(0, 127) as u8;
+            }
+        }
+        self.arr_save_edits();
+    }
+
+    fn me_select_all(&mut self) {
+        let Some(st) = self.midi_edit.as_ref() else {
+            return;
+        };
+        let id = st.id;
+        let n = self
+            .arrangement
+            .clips
+            .iter()
+            .find(|c| c.id == id)
+            .map_or(0, |c| c.notes.len());
+        if let Some(st) = self.midi_edit.as_mut() {
+            st.selected = (0..n).collect();
+        }
+    }
+
+    /// Fit the window back around the clip — the way it opened.
+    fn me_fit_clip(&mut self) {
+        let Some(st) = self.midi_edit.as_ref() else {
+            return;
+        };
+        let id = st.id;
+        let Some((start, len)) = self
+            .arrangement
+            .clips
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| (c.start_s, c.len_s))
+        else {
+            return;
+        };
+        let pad = (len * 0.08).max(self.arr_bar_s() * 0.5);
+        if let Some(st) = self.midi_edit.as_mut() {
+            st.view_start_s = (start - pad).max(0.0);
+            st.view_len_s = (len + pad * 2.0).max(1.0);
+        }
+    }
+
     fn me_delete_note(&mut self, i: usize) {
         let Some(st) = self.midi_edit.as_ref() else {
             return;
@@ -5213,22 +5548,43 @@ impl IvoryApp {
         }
         clip.notes.remove(i);
         if let Some(st) = self.midi_edit.as_mut() {
-            st.selected = None;
+            st.selected.clear();
             st.drag = None;
         }
         self.arr_save_edits();
     }
 
+    /// DELETE the whole selection, highest index first so nothing slides
+    /// under the knife.
     fn me_delete_selected(&mut self) {
-        if let Some(i) = self.midi_edit.as_ref().and_then(|m| m.selected) {
-            self.me_delete_note(i);
+        let Some(st) = self.midi_edit.as_ref() else {
+            return;
+        };
+        let id = st.id;
+        let mut sel = st.selected.clone();
+        if sel.is_empty() {
+            return;
         }
+        sel.sort_unstable();
+        let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
+            return;
+        };
+        for &i in sel.iter().rev() {
+            if i < clip.notes.len() {
+                clip.notes.remove(i);
+            }
+        }
+        if let Some(st) = self.midi_edit.as_mut() {
+            st.selected.clear();
+            st.drag = None;
+        }
+        self.arr_save_edits();
     }
 
     /// The editor's view over one clip, borrowed straight from the doc.
     fn midi_edit_view<'a>(
         &'a self,
-        st: &MidiEdit,
+        st: &'a MidiEdit,
         clip: &'a crate::arrangement::ArrClip,
     ) -> crate::midi_editor::MidiEditView<'a> {
         let sig = self.time_signature();
@@ -5238,7 +5594,8 @@ impl IvoryApp {
             clip_len_s: clip.len_s,
             offset_s: clip.offset_s,
             notes: &clip.notes,
-            selected: st.selected,
+            selected: &st.selected,
+            marquee: st.marquee,
             view_start_s: st.view_start_s,
             view_len_s: st.view_len_s,
             top_key: st.top_key,
@@ -5250,12 +5607,7 @@ impl IvoryApp {
             sig_top: u32::from(sig.beats),
             sig_bottom: u32::from(sig.unit),
             playhead_s: self.recorder.position_s,
-            color: self
-                .settings
-                .strip_colors
-                .get(clip.lane)
-                .copied()
-                .unwrap_or(0) as usize,
+            color: self.strip_color(clip.lane),
         }
     }
 
@@ -5281,10 +5633,13 @@ impl IvoryApp {
             view_len_s: (clip.len_s + pad * 2.0).max(1.0),
             top_key: (centre as f32 + crate::midi_editor::KEYS_SHOWN * 0.5)
                 .clamp(crate::midi_editor::KEYS_SHOWN, 128.0),
-            selected: None,
+            selected: Vec::new(),
             drag: None,
             dirty: false,
             down_key: None,
+            preview_key: None,
+            last_vel: 100,
+            marquee: None,
         });
     }
 
@@ -5354,8 +5709,63 @@ impl IvoryApp {
             down: self.drumpad_down,
             midi_on: self.drumpad_midi,
             drop_hover: self.drumpad_hover,
-            master: self.drumpad.master,
+            fx: {
+                let sel = self.drumpad_sel.min(recorder::DRUM_PADS - 1);
+                std::array::from_fn(|bay| {
+                    self.insert(recorder::pad_insert_index(sel), bay)
+                        .map_or("", plugin_display_name)
+                })
+            },
+            media_dir: self.media_dir.to_str().unwrap_or(""),
+            media: &self.media_entries,
+            media_scroll: self.media_scroll,
         }
+    }
+
+    /// Re-list the explorer's directory: folders first, then audio files,
+    /// both sorted, dotfiles skipped.
+    fn refresh_media(&mut self) {
+        const AUDIO: [&str; 11] = [
+            "wav", "aiff", "aif", "mp3", "m4a", "aac", "flac", "ogg", "opus", "caf", "wma",
+        ];
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&self.media_dir) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') {
+                    continue;
+                }
+                match e.file_type() {
+                    Ok(t) if t.is_dir() => dirs.push(name),
+                    Ok(t) if t.is_file() => {
+                        let audio = std::path::Path::new(&name)
+                            .extension()
+                            .and_then(|x| x.to_str())
+                            .is_some_and(|x| {
+                                AUDIO.contains(&x.to_ascii_lowercase().as_str())
+                            });
+                        if audio {
+                            files.push(name);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        dirs.sort_by_key(|n| n.to_lowercase());
+        files.sort_by_key(|n| n.to_lowercase());
+        self.media_entries = dirs
+            .into_iter()
+            .map(|name| crate::drumpad_panel::MediaEntry { name, dir: true })
+            .chain(
+                files
+                    .into_iter()
+                    .map(|name| crate::drumpad_panel::MediaEntry { name, dir: false }),
+            )
+            .collect();
+        self.media_scroll = 0;
+        self.media_fresh = true;
     }
 
     /// Load the drumpad document standing beside the open project. Called
@@ -5425,7 +5835,6 @@ impl IvoryApp {
             P::Gain => sel.gain,
             P::Pan => sel.pan,
             P::Tune => sel.tune,
-            P::Master => self.drumpad.master,
         }
     }
 
@@ -5441,7 +5850,6 @@ impl IvoryApp {
             P::Gain => self.drumpad.pads[sel].params.gain = v,
             P::Pan => self.drumpad.pads[sel].params.pan = v,
             P::Tune => self.drumpad.pads[sel].params.tune = v,
-            P::Master => self.drumpad.master = v,
         }
     }
 
@@ -5484,6 +5892,41 @@ impl IvoryApp {
         } else {
             None
         };
+        // ── the explorer's own gestures ──────────────────────────────────
+        // A FILE row pressed and then MOVED becomes the payload the pads
+        // take — the same `DraggedMedia` contract the media manager was
+        // promised, grown its first sender.
+        if let Some(i) = self.media_drag {
+            if pointer_down {
+                let dragging = ctx.input(|x| x.pointer.is_decidedly_dragging());
+                if dragging
+                    && egui::DragAndDrop::payload::<crate::drumpad_panel::DraggedMedia>(ctx)
+                        .is_none()
+                {
+                    if let Some(e) = self.media_entries.get(i).filter(|e| !e.dir) {
+                        egui::DragAndDrop::set_payload(
+                            ctx,
+                            crate::drumpad_panel::DraggedMedia(self.media_dir.join(&e.name)),
+                        );
+                    }
+                }
+            } else {
+                self.media_drag = None;
+            }
+        }
+        // The wheel walks the listing, three rows a notch, over its pane.
+        let scroll_y = ctx.input(|i| i.raw_scroll_delta.y);
+        if scroll_y.abs() > 0.5 {
+            if let Some(p) = hover_pos {
+                let l = crate::drumpad_panel::Layout::new(rect);
+                if l.media.is_positive() && l.media.contains(p) {
+                    let step = if scroll_y < 0.0 { 3isize } else { -3 };
+                    let max = self.media_entries.len().saturating_sub(1);
+                    self.media_scroll =
+                        (self.media_scroll as isize + step).clamp(0, max as isize) as usize;
+                }
+            }
+        }
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         if !dropped.is_empty() {
             if let Some(pad) = hover_pos.and_then(|p| crate::drumpad_panel::pad_at(rect, p)) {
@@ -5527,11 +5970,13 @@ impl IvoryApp {
             if pointer_down {
                 if let Some(p) = pointer {
                     let (lo, hi) = grab.param.range();
-                    // Up is more, and Shift is the fine grip — the faders'
-                    // own grammar.
+                    // RIGHT is more: the control draws a horizontal travel
+                    // line, and a horizontal control that answered vertical
+                    // motion was the owner's first drumpad complaint.
+                    // Shift is the fine grip, the faders' own grammar.
                     let fine = if shift { 0.1 } else { 1.0 };
                     let v = grab.from_value
-                        + (grab.from.y - p.y) / crate::drumpad_panel::KNOB_TRAVEL
+                        + (p.x - grab.from.x) / crate::drumpad_panel::KNOB_TRAVEL
                             * (hi - lo)
                             * fine;
                     self.drumpad_set(grab.param, v);
@@ -5552,7 +5997,8 @@ impl IvoryApp {
         }
 
         // ── presses ──────────────────────────────────────────────────────
-        if !pressed {
+        let secondary = ctx.input(|i| i.pointer.secondary_pressed());
+        if !pressed && !secondary {
             return;
         }
         let Some(p) = pointer else { return };
@@ -5567,9 +6013,42 @@ impl IvoryApp {
             crate::drumpad_panel::hit_test(rect, &view, p)
         };
         use crate::drumpad_panel::Hit as H;
+        // The right button is the bay's eraser, exactly as the arrangement's
+        // notes have it.
+        if secondary {
+            if let Some(H::PadInsert(bay)) = hit {
+                let sel = self.drumpad_sel.min(recorder::DRUM_PADS - 1);
+                self.set_insert(recorder::pad_insert_index(sel), bay, None);
+            }
+            return;
+        }
         match hit {
             Some(H::Close) => self.close_drumpad(),
             Some(H::Midi) => self.drumpad_midi = !self.drumpad_midi,
+            // The selected pad's bays: the same door every bay opens —
+            // picker when empty, the plugin's own window when loaded.
+            Some(H::PadInsert(bay)) => {
+                let sel = self.drumpad_sel.min(recorder::DRUM_PADS - 1);
+                self.open_insert_face(recorder::pad_insert_index(sel), bay);
+            }
+            Some(H::MediaUp) => {
+                if let Some(up) = self.media_dir.parent().map(|p| p.to_path_buf()) {
+                    self.media_dir = up;
+                    self.refresh_media();
+                }
+            }
+            Some(H::MediaRow(i)) => {
+                if let Some(e) = self.media_entries.get(i).cloned() {
+                    if e.dir {
+                        self.media_dir = self.media_dir.join(&e.name);
+                        self.refresh_media();
+                    } else {
+                        // A FILE row is a drag source: the press arms it,
+                        // and the drag block below carries the payload.
+                        self.media_drag = Some(i);
+                    }
+                }
+            }
             Some(H::Pad(i)) => {
                 self.drumpad_sel = i;
                 // Strike on the press; the off rides the release above. An
@@ -5696,23 +6175,13 @@ impl IvoryApp {
         if self.midi_edit.is_none() {
             return;
         }
-        // Esc closes from anywhere — unless the drumpad floats above this
-        // popup, in which case this frame's Esc was the drumpad's and one
-        // press must not put both away.
-        if !self.drumpad_open && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.close_midi_editor();
             return;
         }
         let Some(rect) = self.midi_edit_rect else {
             return;
         };
-        // The drumpad floats above: while the hand is on it, or one of its
-        // gestures is in flight, the editor stands down like the lanes do.
-        if self.drumpad_owns(ctx.input(|i| i.pointer.interact_pos())) {
-            return;
-        }
-        // The clip can vanish under the editor (Delete in the arrangement,
-        // a project switch): the popup must not outlive its subject.
         if !self
             .arrangement
             .clips
@@ -5748,14 +6217,39 @@ impl IvoryApp {
             && !self.name_focused
             && self.num_edit.is_none();
         if keys_ok && over {
-            // O and P: the grid's two shapes, exclusive — a swung triplet
-            // is not a grid anybody counts.
             if ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::O)) {
                 self.settings.midi_swing = !self.settings.midi_swing;
                 if self.settings.midi_swing {
                     self.settings.midi_triplet = false;
                 }
                 self.save_settings();
+            }
+            // Q puts the selection on the grid; Z fits the clip back in
+            // the window; Cmd+A takes everything; Cmd+D lays a copy one
+            // step later. The arrows nudge — a step along, a semitone up.
+            if ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::Q)) {
+                self.me_quantise();
+            }
+            if ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::Z)) {
+                self.me_fit_clip();
+            }
+            if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::A)) {
+                self.me_select_all();
+            }
+            if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::D)) {
+                self.me_duplicate();
+            }
+            if ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::ArrowLeft)) {
+                self.me_nudge(-1.0, 0);
+            }
+            if ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::ArrowRight)) {
+                self.me_nudge(1.0, 0);
+            }
+            if ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::ArrowUp)) {
+                self.me_nudge(0.0, 1);
+            }
+            if ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::ArrowDown)) {
+                self.me_nudge(0.0, -1);
             }
             if ctx.input(|i| {
                 i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)
@@ -5767,7 +6261,7 @@ impl IvoryApp {
         // ── the wheel, by the arrange view's own grammar ─────────────────
         if scroll != egui::Vec2::ZERO && over {
             if let Some(p) = pointer {
-                let (l, anchor, s_per_px, over_grid) = {
+                let (anchor, s_per_px, over_grid) = {
                     let st = self.midi_edit.as_ref().unwrap();
                     let clip = self.arrangement.clips.iter().find(|c| c.id == id).unwrap();
                     let view = self.midi_edit_view(st, clip);
@@ -5778,9 +6272,8 @@ impl IvoryApp {
                         crate::midi_editor::hit_test(rect, &view, p),
                         Some(crate::midi_editor::Hit::ToolGrid)
                     );
-                    (l, a, s, over_grid)
+                    (a, s, over_grid)
                 };
-                let _ = l;
                 let step = if scroll.y > 0.5 {
                     1
                 } else if scroll.y < -0.5 {
@@ -5795,21 +6288,17 @@ impl IvoryApp {
                         self.save_settings();
                     }
                 } else if alt {
-                    // Alt moves the viewport, here as everywhere.
                     let d = f64::from(scroll.x + scroll.y) * s_per_px;
                     if let Some(st) = self.midi_edit.as_mut() {
                         st.view_start_s = (st.view_start_s - d).max(0.0);
                     }
                 } else if cmd || shift {
-                    // Ctrl-wheel walks the piano roll up and down.
                     if let Some(st) = self.midi_edit.as_mut() {
                         let kh = rect.height().max(1.0) / crate::midi_editor::KEYS_SHOWN;
                         st.top_key = (st.top_key + scroll.y / kh)
                             .clamp(crate::midi_editor::KEYS_SHOWN, 128.0);
                     }
                 } else {
-                    // The plain wheel ZOOMS time around the pointer;
-                    // sideways still pans, because sideways means along.
                     if let Some(st) = self.midi_edit.as_mut() {
                         if scroll.x.abs() > 0.0 {
                             st.view_start_s =
@@ -5829,8 +6318,6 @@ impl IvoryApp {
 
         // ── presses ──────────────────────────────────────────────────────
         if (pressed || secondary) && !over && pointer.is_some() {
-            // A press on the world outside puts the popup away; the press
-            // still lands where it fell — the arrangement reads it too.
             self.close_midi_editor();
             return;
         }
@@ -5868,6 +6355,23 @@ impl IvoryApp {
                             (self.settings.midi_grid_exp - 1).clamp(-6, 3);
                         self.save_settings();
                     }
+                    Some(H::Ruler(t)) if pressed => {
+                        // The magnet holds here too, exactly as the
+                        // arrangement's ruler does.
+                        let to = self.me_snap(t);
+                        self.request_recorder(recorder::RecorderRequest::Locate(to));
+                    }
+                    Some(H::Vel(t)) if pressed => {
+                        if let Some(st) = self.midi_edit.as_mut() {
+                            st.drag = Some(MeDrag::Vel);
+                        }
+                        let vel = {
+                            let l = crate::midi_editor::Layout::new(rect);
+                            let h = l.vel.height().max(1.0);
+                            (((l.vel.bottom() - p.y) / h) * 127.0).clamp(1.0, 127.0) as u8
+                        };
+                        self.me_set_vel(t, vel);
+                    }
                     Some(H::Key(key)) if pressed => {
                         self.request_recorder(recorder::RecorderRequest::Audition {
                             notes: vec![key],
@@ -5879,47 +6383,96 @@ impl IvoryApp {
                     }
                     Some(H::NoteBody(i)) => {
                         if secondary {
-                            // The right button is the eraser.
                             self.me_delete_note(i);
-                        } else if let Some(st) = self.midi_edit.as_mut() {
-                            st.selected = Some(i);
-                            let (t_at, note_t0) = {
-                                let st = self.midi_edit.as_ref().unwrap();
-                                let clip = self
-                                    .arrangement
-                                    .clips
+                        } else {
+                            self.me_select(i, shift);
+                            let in_sel = self
+                                .midi_edit
+                                .as_ref()
+                                .is_some_and(|m| m.selected.binary_search(&i).is_ok());
+                            if in_sel && !shift {
+                                // The grab: the note under the hand, and
+                                // everything selected with it.
+                                let (t_at, orig, key0) = {
+                                    let st = self.midi_edit.as_ref().unwrap();
+                                    let clip = self
+                                        .arrangement
+                                        .clips
+                                        .iter()
+                                        .find(|c| c.id == id)
+                                        .unwrap();
+                                    let view = self.midi_edit_view(st, clip);
+                                    let l = crate::midi_editor::Layout::new(rect);
+                                    let t = crate::midi_editor::time_at(&l, &view, p.x);
+                                    let orig: Vec<(usize, f64, u8)> = st
+                                        .selected
+                                        .iter()
+                                        .filter_map(|&i| {
+                                            clip.notes.get(i).map(|n| {
+                                                (
+                                                    i,
+                                                    clip.start_s + (n.at_s - clip.offset_s),
+                                                    n.key,
+                                                )
+                                            })
+                                        })
+                                        .collect();
+                                    let key0 = clip.notes.get(i).map(|n| n.key);
+                                    (t, orig, key0)
+                                };
+                                let note_t0 = orig
                                     .iter()
-                                    .find(|c| c.id == id)
-                                    .unwrap();
-                                let view = self.midi_edit_view(st, clip);
-                                let l = crate::midi_editor::Layout::new(rect);
-                                let t = crate::midi_editor::time_at(&l, &view, p.x);
-                                let n = &clip.notes[i];
-                                (t, clip.start_s + (n.at_s - clip.offset_s))
-                            };
-                            if let Some(st) = self.midi_edit.as_mut() {
-                                st.drag = Some(MeDrag::Move { i, dt: t_at - note_t0 });
+                                    .find(|(j, ..)| *j == i)
+                                    .map(|(_, t, _)| *t)
+                                    .unwrap_or(t_at);
+                                if let Some(k) = key0 {
+                                    self.request_recorder(
+                                        recorder::RecorderRequest::Audition {
+                                            notes: vec![k],
+                                            on: true,
+                                        },
+                                    );
+                                }
+                                if let Some(st) = self.midi_edit.as_mut() {
+                                    st.preview_key = key0;
+                                    st.drag = Some(MeDrag::Move {
+                                        i,
+                                        dt: t_at - note_t0,
+                                        orig,
+                                    });
+                                }
                             }
                         }
                     }
                     Some(H::NoteRight(i)) => {
                         if secondary {
                             self.me_delete_note(i);
-                        } else if let Some(st) = self.midi_edit.as_mut() {
-                            st.selected = Some(i);
-                            st.drag = Some(MeDrag::Resize { i });
+                        } else {
+                            self.me_select(i, false);
+                            if let Some(st) = self.midi_edit.as_mut() {
+                                st.drag = Some(MeDrag::Resize { i });
+                            }
                         }
                     }
                     Some(H::Cell(t, key)) if pressed => {
-                        // A note is BORN under the pen: one grid step long,
-                        // snapped, inside the clip — and the drag that
-                        // follows stretches it.
-                        self.me_create_note(t, key);
+                        if cmd {
+                            // The rubber band: Cmd holds the pen back and
+                            // draws a box instead.
+                            if let Some(st) = self.midi_edit.as_mut() {
+                                st.marquee = Some((p, p));
+                                st.drag = Some(MeDrag::Marquee);
+                                if !shift {
+                                    st.selected.clear();
+                                }
+                            }
+                        } else {
+                            self.me_create_note(t, key);
+                        }
                     }
                     _ => {
                         if pressed {
                             if let Some(st) = self.midi_edit.as_mut() {
-                                st.selected = None;
+                                st.selected.clear();
                             }
                         }
                     }
@@ -5929,7 +6482,7 @@ impl IvoryApp {
 
         // ── the drag in flight ───────────────────────────────────────────
         if let (Some(drag), Some(p), true) = (
-            self.midi_edit.as_ref().and_then(|m| m.drag),
+            self.midi_edit.as_ref().and_then(|m| m.drag.clone()),
             pointer,
             pointer_down,
         ) {
@@ -5944,21 +6497,90 @@ impl IvoryApp {
                 )
             };
             match drag {
-                MeDrag::Move { i, dt } => self.me_move_note(i, t_at - dt, key_at),
+                MeDrag::Move { i, dt, orig } => {
+                    self.me_move_selection(i, t_at, key_at, dt, &orig);
+                }
                 MeDrag::Resize { i } | MeDrag::Create { i } => self.me_resize_note(i, t_at),
+                MeDrag::Vel => {
+                    let vel = {
+                        let l = crate::midi_editor::Layout::new(rect);
+                        let h = l.vel.height().max(1.0);
+                        (((l.vel.bottom() - p.y) / h) * 127.0).clamp(1.0, 127.0) as u8
+                    };
+                    self.me_set_vel(t_at, vel);
+                }
+                MeDrag::Marquee => {
+                    if let Some(st) = self.midi_edit.as_mut() {
+                        if let Some((a, _)) = st.marquee {
+                            st.marquee = Some((a, p));
+                        }
+                    }
+                }
             }
         }
         if released {
-            if let Some(key) = self.midi_edit.as_ref().and_then(|m| m.down_key) {
-                self.request_recorder(recorder::RecorderRequest::Audition {
-                    notes: vec![key],
-                    on: false,
-                });
+            // The marquee lands: every note its box crosses joins the
+            // selection.
+            let took_marquee = self
+                .midi_edit
+                .as_ref()
+                .is_some_and(|m| matches!(m.drag, Some(MeDrag::Marquee)));
+            if took_marquee {
+                let picked: Vec<usize> = {
+                    let st = self.midi_edit.as_ref().unwrap();
+                    let Some((a, b)) = st.marquee else {
+                        Vec::new().into_iter().collect::<Vec<usize>>();
+                        return;
+                    };
+                    let band = Rect::from_two_pos(a, b);
+                    let clip = self.arrangement.clips.iter().find(|c| c.id == id);
+                    match clip {
+                        Some(clip) => {
+                            let view = self.midi_edit_view(st, clip);
+                            let l = crate::midi_editor::Layout::new(rect);
+                            clip.notes
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, n)| {
+                                    let r = crate::midi_editor::note_rect(&l, &view, n);
+                                    r.is_positive() && r.intersects(band)
+                                })
+                                .map(|(i, _)| i)
+                                .collect()
+                        }
+                        None => Vec::new(),
+                    }
+                };
                 if let Some(st) = self.midi_edit.as_mut() {
-                    st.down_key = None;
+                    for i in picked {
+                        if let Err(at) = st.selected.binary_search(&i) {
+                            st.selected.insert(at, i);
+                        }
+                    }
+                    st.marquee = None;
                 }
             }
-            let dirty = self.midi_edit.as_ref().is_some_and(|m| m.dirty && m.drag.is_some());
+            // Every sounding preview lets go.
+            for k in [
+                self.midi_edit.as_ref().and_then(|m| m.down_key),
+                self.midi_edit.as_ref().and_then(|m| m.preview_key),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                self.request_recorder(recorder::RecorderRequest::Audition {
+                    notes: vec![k],
+                    on: false,
+                });
+            }
+            if let Some(st) = self.midi_edit.as_mut() {
+                st.down_key = None;
+                st.preview_key = None;
+            }
+            let dirty = self
+                .midi_edit
+                .as_ref()
+                .is_some_and(|m| m.dirty && m.drag.is_some());
             if let Some(st) = self.midi_edit.as_mut() {
                 st.drag = None;
             }
@@ -5989,6 +6611,27 @@ impl IvoryApp {
         // drumpad floats over both, on the same rule.
         if self.midi_edit_owns(pointer) || self.drumpad_owns(pointer) {
             return;
+        }
+        // **A right-click on a lane HEADER opens the TRACK menu** — remove,
+        // colour, auto-palette — the same menu the mixer strip answers.
+        if ctx.input(|i| i.pointer.secondary_pressed()) {
+            if let Some(p) = pointer.filter(|p| rect.contains(*p)) {
+                let lane = {
+                    let clips = self.arr_clip_views();
+                    let view = self.arrange_view(&clips);
+                    let l = crate::arrangement_panel::Layout::new(rect, &view);
+                    l.header_rows
+                        .iter()
+                        .position(|row| row.panel.is_positive() && row.panel.contains(p))
+                };
+                if let Some(lane) = lane {
+                    self.dialog = Some(dialogs::Dialog::Track {
+                        lane,
+                        removable: true,
+                    });
+                    return;
+                }
+            }
         }
 
         // ── the wheel: pan, and Cmd/Ctrl-wheel zoom around the pointer ────
@@ -6413,7 +7056,7 @@ impl IvoryApp {
                     c.lane.min(crate::recorder::CHANNELS - 1),
                     (c.start_s / domain) as f32,
                     (self.clip_len_resolved(c) / domain) as f32,
-                    self.settings.strip_colors.get(c.lane).copied().unwrap_or(0) as usize,
+                    self.strip_color(c.lane),
                 )
             })
             .collect();
@@ -6441,7 +7084,7 @@ impl IvoryApp {
                 let kind = self.channel_kind(n);
                 crate::arrangement_panel::LaneView {
                     name: self.channel_display_name(n),
-                    color: self.settings.strip_colors.get(n).copied().unwrap_or(0) as usize,
+                    color: self.strip_color(n),
                     kind,
                     used: kind.is_some() || self.lane_has_clips(n),
                     armed: self.armed & (1 << n) != 0,
@@ -7009,7 +7652,10 @@ impl IvoryApp {
             // A click OPENS it for typing — there is nothing to drag, so the
             // tap-versus-drag gesture the faders use does not apply.
             Hit::EditTimeSignature => {
-                self.num_edit = Some(recorder::NumEdit::new(recorder::NumField::Meter));
+                self.num_edit = Some(recorder::NumEdit::prefilled(
+                    recorder::NumField::Meter,
+                    self.field_seed(recorder::NumField::Meter),
+                ));
                 self.name_focused = false;
             }
             Hit::CycleCountIn => {
@@ -7061,7 +7707,11 @@ impl IvoryApp {
                 }
             }
             Hit::Type(field) => {
-                self.num_edit = Some(recorder::NumEdit::new(field));
+                // **Opens looking exactly like the readout** — the owner's
+                // rule — with the caret at the end and the arrows walking
+                // the digits.
+                let seed = self.field_seed(field);
+                self.num_edit = Some(recorder::NumEdit::prefilled(field, seed));
                 self.name_focused = false;
             }
             Hit::SetTempo(bpm) => {
@@ -7305,7 +7955,8 @@ impl IvoryApp {
     }
 
     pub fn set_insert(&mut self, strip: usize, slot: usize, path: Option<&str>) {
-        let need = (crate::recorder::STRIPS + 1) * crate::recorder::INSERTS;
+        let need = (crate::recorder::STRIPS + 1 + crate::recorder::DRUM_PADS)
+            * crate::recorder::INSERTS;
         if self.settings.strip_inserts.len() < need {
             self.settings.strip_inserts.resize(need, String::new());
         }
@@ -7595,6 +8246,34 @@ impl IvoryApp {
         }
     }
 
+    /// The seed a numeric field opens with: the current reading, trimmed
+    /// to the characters the parser will take back — "15%" opens as "15".
+    fn field_seed(&self, field: recorder::NumField) -> String {
+        use recorder::NumField as F;
+        let raw = match field {
+            F::Tempo => format!("{:.0}", self.tempo_bpm()),
+            F::Meter => {
+                let sig = self.time_signature();
+                format!("{}/{}", sig.beats, sig.unit)
+            }
+            F::Master => {
+                let g = self.settings.master_gain;
+                if g <= 0.001 {
+                    "-60".to_owned()
+                } else {
+                    format!("{:.1}", 20.0 * g.log10())
+                }
+            }
+            F::Fx(fx) => {
+                let v = self.fx_value(fx);
+                recorder_panel::knob_reading(self.fx_units()[fx.index()], v)
+            }
+        };
+        raw.chars()
+            .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == '/')
+            .collect()
+    }
+
     /// The numeric field, driven from raw input, exactly as the name field is
     /// and for the same reason: the band is a pure painter and cannot own a
     /// `TextEdit`.
@@ -7616,6 +8295,24 @@ impl IvoryApp {
                 } => {
                     if let Some(edit) = self.num_edit.as_mut() {
                         edit.pop();
+                    }
+                }
+                egui::Event::Key {
+                    key: egui::Key::ArrowLeft,
+                    pressed: true,
+                    ..
+                } => {
+                    if let Some(edit) = self.num_edit.as_mut() {
+                        edit.left();
+                    }
+                }
+                egui::Event::Key {
+                    key: egui::Key::ArrowRight,
+                    pressed: true,
+                    ..
+                } => {
+                    if let Some(edit) = self.num_edit.as_mut() {
+                        edit.right();
                     }
                 }
                 egui::Event::Key {
@@ -7978,6 +8675,9 @@ impl IvoryApp {
                     self.close_drumpad();
                 } else {
                     self.drumpad_open = true;
+                    if !self.media_fresh {
+                        self.refresh_media();
+                    }
                 }
             }
             K::TransposeUp => self.transpose_by(1),
@@ -8707,6 +9407,21 @@ impl IvoryApp {
                     suggested: "default".to_owned(),
                     purpose: crate::ports::SavePurpose::Template,
                 });
+            }
+            DialogAction::TrackRemove(lane) => {
+                self.dialog = None;
+                self.remove_channel(lane);
+            }
+            DialogAction::TrackColor(lane, idx) => {
+                if let Some(c) = self.settings.strip_colors.get_mut(lane) {
+                    *c = idx.clamp(0, 26);
+                }
+                self.save_settings();
+            }
+            DialogAction::TrackPalette(i) => {
+                self.settings.auto_palette = true;
+                self.settings.palette_choice = i.clamp(0, 4);
+                self.save_settings();
             }
             DialogAction::ProjectExportTrack => {
                 self.dialog = None;
@@ -11462,6 +12177,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **The editor works on SETS now.** Select-all takes every note;
+    /// quantise puts their starts on the grid; duplicate lays the copies
+    /// one step later and hands them the selection; a nudge moves the set
+    /// together inside the clip's walls; delete takes them all at once.
+    #[test]
+    fn the_editor_selection_ops_work_as_a_set() {
+        let root = project_scratch("me-v2");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        let note = |at: f64, key: u8| crate::arrangement::ArrNote {
+            at_s: at,
+            dur_s: 0.3,
+            key,
+            vel: 90,
+        };
+        let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            notes: vec![note(0.06, 60), note(1.02, 64), note(2.10, 67)],
+            lane: 1,
+            path: String::new(),
+            start_s: 8.0,
+            offset_s: 0.0,
+            len_s: 16.0,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name: "MIDI".to_owned(),
+            id: 0,
+        });
+        app.open_midi_editor(id);
+        app.me_select_all();
+        assert_eq!(app.midi_edit.as_ref().unwrap().selected, vec![0, 1, 2]);
+
+        // Quantise: default grid 1/16 of a 2 s bar = 0.125 s.
+        app.me_quantise();
+        let ats: Vec<f64> = app.arrangement.clips[0].notes.iter().map(|n| n.at_s).collect();
+        assert!((ats[0] - 0.0).abs() < 1e-9, "{ats:?}");
+        assert!((ats[1] - 1.0).abs() < 1e-9);
+        assert!((ats[2] - 2.125).abs() < 1e-9);
+
+        // Duplicate: three copies one step later, now the selection.
+        app.me_duplicate();
+        assert_eq!(app.arrangement.clips[0].notes.len(), 6);
+        assert_eq!(app.midi_edit.as_ref().unwrap().selected, vec![3, 4, 5]);
+        assert!((app.arrangement.clips[0].notes[3].at_s - 0.125).abs() < 1e-9);
+
+        // Nudge the copies one step right, and one semitone up.
+        app.me_nudge(1.0, 0);
+        app.me_nudge(0.0, 1);
+        assert!((app.arrangement.clips[0].notes[3].at_s - 0.25).abs() < 1e-9);
+        assert_eq!(app.arrangement.clips[0].notes[3].key, 61);
+
+        // The walls hold: a huge nudge stops at the clip's end as one set.
+        app.me_nudge(1000.0, 0);
+        let n3 = &app.arrangement.clips[0].notes[3];
+        let n5 = &app.arrangement.clips[0].notes[5];
+        assert!(n5.at_s + n5.dur_s <= 16.0 + 1e-6, "past the clip: {}", n5.at_s);
+        assert!(
+            (n5.at_s - n3.at_s - 2.125).abs() < 1e-6,
+            "the set sheared: {} vs {}",
+            n3.at_s,
+            n5.at_s
+        );
+
+        // Velocity through the lane: the whole selection follows.
+        app.me_set_vel(8.0 + app.arrangement.clips[0].notes[3].at_s, 42);
+        assert_eq!(app.arrangement.clips[0].notes[3].vel, 42);
+        assert_eq!(app.arrangement.clips[0].notes[5].vel, 42);
+        assert_eq!(app.arrangement.clips[0].notes[0].vel, 90, "unselected moved");
+
+        // Delete the selection whole.
+        app.me_delete_selected();
+        assert_eq!(app.arrangement.clips[0].notes.len(), 3);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// **The input menu drills down and lands.** Top -> Device -> Mono ->
     /// input 3 makes the channel AUDIO on input 3; MIDI -> All makes it
     /// MIDI on every port; None clears; and the chip says each of them the
@@ -11713,11 +12503,13 @@ mod tests {
         assert!((note.at_s - 2.125).abs() < 1e-9, "created at {}", note.at_s);
         assert!((note.dur_s - 0.125).abs() < 1e-9);
         assert_eq!((note.key, note.vel), (64, 100));
-        assert_eq!(app.midi_edit.as_ref().unwrap().selected, Some(0));
+        assert_eq!(app.midi_edit.as_ref().unwrap().selected, vec![0]);
         assert!(app.midi_edit.as_ref().unwrap().dirty);
 
-        // Moved to 9.06: the magnet says 9.0; the hand's row says A#4.
-        app.me_move_note(0, 9.06, 70.0);
+        // Moved to 9.06: the magnet says 9.0; the hand's row says A#4 —
+        // through the SELECTION move, which is what a drag does now.
+        let orig = vec![(0usize, 8.0 + 2.125, 64u8)];
+        app.me_move_selection(0, 9.06, 70.0, 0.0, &orig);
         let note = app.arrangement.clips[0].notes[0].clone();
         assert!((note.at_s - 1.0).abs() < 1e-9, "moved to {}", note.at_s);
         assert_eq!(note.key, 70);
@@ -14900,6 +15692,7 @@ mod tests {
             app.num_edit = Some(recorder::NumEdit {
                 field,
                 text: "-6".to_owned(),
+                caret: 0,
             });
             app.commit_number();
             assert!(app.num_edit.is_none(), "{field:?} stayed open");
@@ -14917,6 +15710,7 @@ mod tests {
         app.num_edit = Some(recorder::NumEdit {
             field: recorder::NumField::Tempo,
             text: "132".to_owned(),
+            caret: 0,
         });
         app.commit_number();
         assert!((app.settings.record_export.tempo_bpm - 132.0).abs() < 1e-9);
@@ -14935,6 +15729,7 @@ mod tests {
             app.num_edit = Some(recorder::NumEdit {
                 field: recorder::NumField::Tempo,
                 text: junk.to_owned(),
+                caret: 0,
             });
             app.commit_number();
             assert!(app.num_edit.is_none(), "{junk:?} left the field open");
@@ -14956,6 +15751,7 @@ mod tests {
         let typed = || recorder::NumEdit {
             field: recorder::NumField::Tempo,
             text: "144".to_owned(),
+            caret: 0,
         };
 
         app.num_edit = Some(typed());

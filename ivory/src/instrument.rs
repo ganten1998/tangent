@@ -325,6 +325,17 @@ const HOLD_DECAY_DB_PER_SEC: f32 = 20.0;
 /// [`CHANNELS`] is.
 pub const PADS: usize = ivory_ui::recorder::DRUM_PADS;
 
+/// Every rack the engine owns: the strips, the master, and one per PAD —
+/// the pads' bays ride the same index space as everything else, seats
+/// `STRIPS + 1 ..`, so loading, editors and state sidecars need no second
+/// machinery. See `pad_rack_index`.
+pub const RACK_SEATS: usize = STRIPS + 1 + PADS;
+
+/// Where pad `i`'s bays live in the insert space.
+pub const fn pad_rack_index(pad: usize) -> usize {
+    STRIPS + 1 + pad
+}
+
 /// Pad 0's MIDI note; pad `n` answers `PAD_BASE + n`. See the UI's
 /// `DRUM_PAD_BASE` — one constant, declared there, read here.
 const PAD_BASE: u8 = ivory_ui::recorder::DRUM_PAD_BASE;
@@ -1967,7 +1978,7 @@ struct Renderer {
     /// with its own hand-off and its own function; a bus is a channel with a
     /// send instead of a fader, and one mechanism that every channel uses is
     /// worth more than a special case that only the bus understands.
-    racks: [Rack; STRIPS + 1],
+    racks: [Rack; RACK_SEATS],
     /// Deinterleaved in and out for it. Preallocated, like everything else the
     /// audio thread touches.
     fx_in: Vec<Vec<f32>>,
@@ -2038,6 +2049,11 @@ struct Renderer {
     stem_tx: Producer<f32>,
     /// One block of stems, accumulated by the three mixers and pushed once.
     stem_scratch: Vec<f32>,
+    /// Each PAD's own block, interleaved stereo — rendered here first so a
+    /// pad's rack can run over its voice alone before the bus sums it.
+    pad_out: Vec<f32>,
+    /// The io pair a pad's rack processes in place.
+    pad_io: Vec<Vec<f32>>,
     /// `stems_on`, read once a block so the three mixers agree.
     stems_live: bool,
 }
@@ -3200,7 +3216,14 @@ impl Renderer {
                 }
             }
         }
-        if self.pad_hits.is_empty() && !self.pad_voices.iter().any(PadVoice::active) {
+        // Silence still flows through LIVE racks — a reverb tail on the
+        // bus or a pad outlives the voice that fed it.
+        let any_rack = !self.racks[Strip::Drums.index()].is_empty()
+            || (0..PADS).any(|i| !self.racks[pad_rack_index(i)].is_empty());
+        if self.pad_hits.is_empty()
+            && !self.pad_voices.iter().any(PadVoice::active)
+            && !any_rack
+        {
             return;
         }
         let coeff = self.gain_coeff;
@@ -3239,6 +3262,10 @@ impl Renderer {
                 dst[..frames].fill(0.0);
             }
         }
+        if let Some(po) = self.pad_out.get_mut(..frames * PADS * 2) {
+            po.fill(0.0);
+        }
+        let mut sounded = [false; PADS];
         let mut peak = [0.0f32; PADS];
         for f in 0..frames {
             // The strikes that land on this frame: whoever shares the choke
@@ -3274,11 +3301,56 @@ impl Renderer {
                 let l = (ml + dl) * g * pan_l[i];
                 let r = (mr + dr) * g * pan_r[i];
                 peak[i] = peak[i].max(l.abs()).max(r.abs());
-                if let Some(dst) = self.fx_in.first_mut() {
-                    dst[f] += l;
+                sounded[i] = true;
+                let at = (f * PADS + i) * 2;
+                if let Some(v) = self.pad_out.get_mut(at) {
+                    *v += l;
                 }
-                if let Some(dst) = self.fx_in.get_mut(1) {
-                    dst[f] += r;
+                if let Some(v) = self.pad_out.get_mut(at + 1) {
+                    *v += r;
+                }
+            }
+        }
+        // **Each pad's own bays, over its voice alone** — then the bus sum.
+        // A pad with an empty rack skips the copy and sums straight across.
+        for i in 0..PADS {
+            let rack_at = pad_rack_index(i);
+            let rack_live = !self.racks[rack_at].is_empty();
+            // A live rack processes even silence — its tail is its own.
+            if !sounded[i] && !rack_live {
+                continue;
+            }
+            if rack_live {
+                for c in 0..TAP_CHANNELS.min(2) {
+                    if let Some(dst) = self.pad_io.get_mut(c) {
+                        for f in 0..frames {
+                            dst[f] = self.pad_out[(f * PADS + i) * 2 + c];
+                        }
+                    }
+                }
+                run_rack(
+                    &mut self.racks[rack_at],
+                    &mut self.pad_io,
+                    frames,
+                    &mut self.fx_out,
+                    &[],
+                    &[],
+                );
+                for c in 0..TAP_CHANNELS.min(2) {
+                    let src = &self.pad_io[c];
+                    if let Some(dst) = self.fx_in.get_mut(c) {
+                        for f in 0..frames {
+                            dst[f] += src[f];
+                        }
+                    }
+                }
+            } else {
+                for c in 0..TAP_CHANNELS.min(2) {
+                    if let Some(dst) = self.fx_in.get_mut(c) {
+                        for f in 0..frames {
+                            dst[f] += self.pad_out[(f * PADS + i) * 2 + c];
+                        }
+                    }
                 }
             }
         }
@@ -3850,7 +3922,7 @@ pub struct Engine {
     midi: RefCell<Producer<MidiEvent>>,
 
     /// The UI thread's ends of every rack's hand-offs. See `Rack`.
-    insert_handoff: [[Handoff; INSERTS]; STRIPS + 1],
+    insert_handoff: [[Handoff; INSERTS]; RACK_SEATS],
     /// The clip's two rings, in the plugin handoff's exact shape and for its
     /// exact reason: the audio thread must never free a hundred megabytes of
     /// samples, so the displaced clip comes BACK here and is dropped by the
@@ -3864,7 +3936,7 @@ pub struct Engine {
     cap_rx: Vec<Consumer<f32>>,
     stem_rx: Consumer<f32>,
     /// What is in each of them, for the desk to name.
-    inserts_loaded: [[Option<Loaded>; INSERTS]; STRIPS + 1],
+    inserts_loaded: [[Option<Loaded>; INSERTS]; RACK_SEATS],
 
     tap: Option<RecorderTap>,
     fault: Arc<Mutex<Option<String>>>,
@@ -3880,17 +3952,17 @@ pub struct Engine {
     /// controller built its view. Declared **before** `insert_editor_handles`
     /// so that even a plain `drop(engine)` releases every window and its
     /// `IPlugView` before the controller references that made them.
-    insert_editors: [[Option<ivory_host::Editor>; INSERTS]; STRIPS + 1],
+    insert_editors: [[Option<ivory_host::Editor>; INSERTS]; RACK_SEATS],
     /// Each loaded insert's edit controller, taken in [`Engine::load_insert`]
     /// **before** the instance leaves for the audio thread — the one moment
     /// there is an `&Instance` on this thread. See [`Engine::open_editor`].
-    insert_editor_handles: [[Option<ivory_host::EditorHandle>; INSERTS]; STRIPS + 1],
+    insert_editor_handles: [[Option<ivory_host::EditorHandle>; INSERTS]; RACK_SEATS],
     /// Each loaded insert's processor reference, taken beside the editor's and
     /// for the same reason: after the handoff there is no `&Instance` to ask.
     /// This is what lets a bay's settings survive a relaunch — no insert has
     /// ever had one before, so every effect's knobs and every bay instrument's
     /// preset died with the process.
-    insert_state_handles: [[Option<ivory_host::StateHandle>; INSERTS]; STRIPS + 1],
+    insert_state_handles: [[Option<ivory_host::StateHandle>; INSERTS]; RACK_SEATS],
     /// Why a bay's saved state was not restored, if it was not.
     ///
     /// A stale or hand-edited blob must not stop the plugin loading — the
@@ -3899,7 +3971,7 @@ pub struct Engine {
     /// [`Engine::insert_state_error`] can put it in front of someone.
     /// Silently ignoring it is how "it keeps forgetting my piano" becomes
     /// unreportable.
-    insert_state_errors: [[Option<String>; INSERTS]; STRIPS + 1],
+    insert_state_errors: [[Option<String>; INSERTS]; RACK_SEATS],
 
     /// Meter hold, decayed on the UI thread because that is where it is read.
     hold: Cell<(f32, f32)>,
@@ -4011,8 +4083,8 @@ impl Engine {
         // most one handoff per bay is ever in flight — `hand_off_insert`
         // waits for the return before it starts another — and the spare
         // element is what lets `Rack::swap` check for room before it commits.
-        let mut rack_ends: Vec<[Handoff; INSERTS]> = Vec::with_capacity(STRIPS + 1);
-        let racks: [Rack; STRIPS + 1] = std::array::from_fn(|_| {
+        let mut rack_ends: Vec<[Handoff; INSERTS]> = Vec::with_capacity(RACK_SEATS);
+        let racks: [Rack; RACK_SEATS] = std::array::from_fn(|_| {
             let mut ends: Vec<Handoff> = Vec::with_capacity(INSERTS);
             let mut incoming = Vec::with_capacity(INSERTS);
             let mut retiring = Vec::with_capacity(INSERTS);
@@ -4039,7 +4111,7 @@ impl Engine {
             }
         });
         let mut rack_ends = rack_ends.into_iter();
-        let insert_handoff: [[Handoff; INSERTS]; STRIPS + 1] =
+        let insert_handoff: [[Handoff; INSERTS]; RACK_SEATS] =
             std::array::from_fn(|_| rack_ends.next().expect("one set per channel"));
         // The effect across the bus used to have a pair of its own here. It
         // does not any more: the bus is a channel like the others and its
@@ -4140,6 +4212,8 @@ impl Engine {
             cap_tx,
             stem_tx,
             stem_scratch: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
+            pad_out: vec![0.0; MAX_BLOCK as usize * PADS * 2],
+            pad_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             stems_live: false,
         };
 
@@ -6255,7 +6329,7 @@ mod tests {
         // shared rather than moved. cpal requires this of the closure it takes,
         // so it is checked here rather than discovered at the call site.
         assert_send::<Rack>();
-        assert_send::<[Rack; STRIPS + 1]>();
+        assert_send::<[Rack; RACK_SEATS]>();
         assert_send::<Renderer>();
     }
 
@@ -6396,7 +6470,7 @@ mod tests {
         let (_, midi) = RingBuffer::<MidiEvent>::new(1024);
         // Empty racks: every test here is about the mixing, and an empty rack
         // is the path every channel takes until somebody loads something.
-        let racks: [Rack; STRIPS + 1] = std::array::from_fn(|_| {
+        let racks: [Rack; RACK_SEATS] = std::array::from_fn(|_| {
             let mut inc = Vec::new();
             let mut ret = Vec::new();
             for _ in 0..INSERTS {
@@ -6423,6 +6497,8 @@ mod tests {
             cap_tx: Vec::new(),
             stem_tx: RingBuffer::<f32>::new(1 << 16).0,
             stem_scratch: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
+            pad_out: vec![0.0; MAX_BLOCK as usize * PADS * 2],
+            pad_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             stems_live: false,
             racks,
             fx_in: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],

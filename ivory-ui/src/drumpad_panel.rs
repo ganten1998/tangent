@@ -30,6 +30,14 @@ use crate::recorder::{DrumPadParams, DRUM_PADS, DRUM_PAD_BASE};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DraggedMedia(pub std::path::PathBuf);
 
+/// One row of the media explorer: a folder to walk into, or an audio file
+/// a hand can drag onto a pad.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaEntry {
+    pub name: String,
+    pub dir: bool,
+}
+
 /// The top strip's height: title, the MIDI chip, the ×. The MIDI editor's
 /// own number — the two popups are siblings and should measure alike.
 pub const STRIP_H: f32 = 26.0;
@@ -86,8 +94,13 @@ pub struct DrumpadView<'a> {
     pub midi_on: bool,
     /// The pad under a file drag — OS or in-app — if one is in flight.
     pub drop_hover: Option<usize>,
-    /// The kit's own fader, linear.
-    pub master: f32,
+    /// The selected pad's three bays, by short name. Empty for empty.
+    pub fx: [&'a str; 3],
+    /// The media explorer: where it stands, and what it lists.
+    pub media_dir: &'a str,
+    pub media: &'a [MediaEntry],
+    /// The first row shown — the wheel's scroll, clamped by the app.
+    pub media_scroll: usize,
 }
 
 /// What a press on the drumpad means.
@@ -98,10 +111,19 @@ pub enum Hit {
     Midi,
     /// A pad: strike it, and select it for the inspector.
     Pad(usize),
-    /// A knob in the inspector — a vertical drag target.
+    /// A knob in the inspector — a horizontal drag target, because the
+    /// control draws a horizontal travel line.
     Knob(Param),
     /// The choke chip: cycle the selected pad's group –, A, B, C, D.
     Choke,
+    /// One of the selected pad's three bays: empty opens the picker,
+    /// loaded opens the plugin's window; right-click clears it.
+    PadInsert(usize),
+    /// The media explorer: up one directory.
+    MediaUp,
+    /// A row of the media explorer: a folder walks in; a file is a drag
+    /// SOURCE, not a press.
+    MediaRow(usize),
     /// Clear the selected pad.
     Clear,
     /// The title strip's empty run: pick the panel up and move it.
@@ -114,15 +136,13 @@ pub enum Param {
     Gain,
     Pan,
     Tune,
-    /// The kit fader, on the right end of the inspector.
-    Master,
 }
 
 impl Param {
     /// `(low, high)` of the value the drag moves.
     pub fn range(self) -> (f32, f32) {
         match self {
-            Param::Gain | Param::Master => (0.0, 2.0),
+            Param::Gain => (0.0, 2.0),
             Param::Pan => (-1.0, 1.0),
             Param::Tune => (-12.0, 12.0),
         }
@@ -131,7 +151,7 @@ impl Param {
     /// Where the knob rests when double-clicked back to default.
     pub fn default_value(self) -> f32 {
         match self {
-            Param::Gain | Param::Master => 1.0,
+            Param::Gain => 1.0,
             Param::Pan | Param::Tune => 0.0,
         }
     }
@@ -151,7 +171,12 @@ pub struct Layout {
     pub knob_tune: Rect,
     pub choke: Rect,
     pub clear: Rect,
-    pub knob_master: Rect,
+    /// The selected pad's three bays, on the inspector's right end.
+    pub fx: [Rect; 3],
+    /// The media explorer: the pane, its header label, and the UP chip.
+    pub media: Rect,
+    pub media_head: Rect,
+    pub media_up: Rect,
 }
 
 impl Layout {
@@ -170,7 +195,10 @@ impl Layout {
             knob_tune: Rect::NOTHING,
             choke: Rect::NOTHING,
             clear: Rect::NOTHING,
-            knob_master: Rect::NOTHING,
+            fx: [Rect::NOTHING; 3],
+            media: Rect::NOTHING,
+            media_head: Rect::NOTHING,
+            media_up: Rect::NOTHING,
         };
         if !rect.is_positive() || rect.width() < 120.0 || rect.height() < 120.0 {
             return nothing;
@@ -192,14 +220,27 @@ impl Layout {
         let close = cell(side);
         let midi = cell(side * 2.2);
 
+        // **The panel is twice the machine now**: pads and inspector on
+        // the LEFT half, the media explorer on the right — browse, then
+        // drag a file straight onto a pad.
+        let split = rect.left() + rect.width() * 0.52;
         let inspector = Rect::from_min_max(
             Pos2::new(rect.left(), rect.bottom() - INSPECTOR_H),
-            rect.max,
+            Pos2::new(split, rect.bottom()),
         );
         let grid = Rect::from_min_max(
             Pos2::new(rect.left() + GAP, strip.bottom() + GAP),
-            Pos2::new(rect.right() - GAP, inspector.top() - GAP),
+            Pos2::new(split - GAP, inspector.top() - GAP),
         );
+        let media = Rect::from_min_max(
+            Pos2::new(split + GAP * 0.5, strip.bottom() + GAP),
+            Pos2::new(rect.right() - GAP, rect.bottom() - GAP),
+        );
+        let media_head = Rect::from_min_size(
+            media.min,
+            Vec2::new(media.width(), 20.0_f32.min(media.height())),
+        );
+        let media_up = Rect::from_min_size(media_head.min, Vec2::new(24.0, media_head.height()));
         if !grid.is_positive() {
             return nothing;
         }
@@ -226,7 +267,11 @@ impl Layout {
             right -= w + GAP;
             r
         };
-        let knob_master = rcell(knob_w);
+        // The three bays where the master stood — the DRUMS channel is the
+        // master now.
+        let fx2 = rcell(chip_w);
+        let fx1 = rcell(chip_w);
+        let fx0 = rcell(chip_w);
         let clear = rcell(chip_w);
         let choke = rcell(chip_w);
         let knob_tune = rcell(knob_w);
@@ -248,8 +293,30 @@ impl Layout {
             knob_tune,
             choke,
             clear,
-            knob_master,
+            fx: [fx0, fx1, fx2],
+            media,
+            media_head,
+            media_up,
         }
+    }
+
+    /// The media rows below the header — however many fit; the app scrolls
+    /// the WINDOW, so row 0 here is entry `media_scroll` there.
+    pub fn media_rows(&self) -> Vec<Rect> {
+        if !self.media.is_positive() {
+            return Vec::new();
+        }
+        let top = self.media_head.bottom() + 2.0;
+        let h = 17.0;
+        let n = (((self.media.bottom() - top) / (h + 1.0)).floor() as usize).min(64);
+        (0..n)
+            .map(|i| {
+                Rect::from_min_size(
+                    Pos2::new(self.media.left(), top + i as f32 * (h + 1.0)),
+                    Vec2::new(self.media.width(), h),
+                )
+            })
+            .collect()
     }
 
     /// Every knob and the value it shows, for the app's drag handler.
@@ -258,7 +325,6 @@ impl Layout {
             Param::Gain => self.knob_gain,
             Param::Pan => self.knob_pan,
             Param::Tune => self.knob_tune,
-            Param::Master => self.knob_master,
         }
     }
 }
@@ -266,9 +332,11 @@ impl Layout {
 /// Where the panel stands: `at` is the strip's remembered top-left from a
 /// drag, clamped back onto the screen; `None` centres it over the pane.
 pub fn place(screen: Rect, at: Option<Pos2>) -> Rect {
-    let w = (screen.width() * 0.44).clamp(340.0, 560.0).min(screen.width());
-    // The grid wants square-ish pads: strip + inspector + 4 rows.
-    let h = (STRIP_H + INSPECTOR_H + w * 0.82).min(screen.height() * 0.92);
+    // Twice the width it was: the left half is the machine, the right the
+    // media explorer.
+    let w = (screen.width() * 0.8).clamp(560.0, 1080.0).min(screen.width());
+    // The grid wants square-ish pads on ITS half: strip + inspector + rows.
+    let h = (STRIP_H + INSPECTOR_H + w * 0.52 * 0.82).min(screen.height() * 0.92);
     let mut panel = match at {
         Some(p) => Rect::from_min_size(p, Vec2::new(w, h)),
         None => Rect::from_center_size(screen.center(), Vec2::new(w, h)),
@@ -340,8 +408,9 @@ pub fn choke_word(group: u8) -> &'static str {
     }
 }
 
-/// One inspector knob: a label, the value, and a thin travel line under
-/// them showing where in its range the value stands.
+/// One inspector knob to the desk standard: the VALUE on top, the label
+/// on the bottom, and a thin travel line between them showing where in
+/// its range the value stands.
 fn knob(painter: &Painter, r: Rect, label: &str, word: &str, frac: f32, active: bool) {
     if !r.is_positive() {
         return;
@@ -350,18 +419,18 @@ fn knob(painter: &Painter, r: Rect, label: &str, word: &str, frac: f32, active: 
     painter.text(
         Pos2::new(r.center().x, r.top() + 1.0),
         Align2::CENTER_TOP,
-        label,
-        font((r.height() * 0.30).clamp(7.0, 10.0)),
-        ink.gamma_multiply(0.6),
-    );
-    painter.text(
-        Pos2::new(r.center().x, r.center().y + 3.0),
-        Align2::CENTER_CENTER,
         word,
         font(fit_text(r, word, (r.height() * 0.36).clamp(8.0, 12.0))),
         ink,
     );
-    let line_y = r.bottom() - 3.0;
+    painter.text(
+        Pos2::new(r.center().x, r.bottom() + 1.0),
+        Align2::CENTER_BOTTOM,
+        label,
+        font((r.height() * 0.30).clamp(7.0, 10.0)),
+        ink.gamma_multiply(0.6),
+    );
+    let line_y = r.center().y + 2.0;
     painter.line_segment(
         [Pos2::new(r.left(), line_y), Pos2::new(r.right(), line_y)],
         Stroke::new(1.0_f32, ink.gamma_multiply(0.25)),
@@ -634,14 +703,103 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
         false,
         if has { REC_RED } else { REC_RED.gamma_multiply(0.4) },
     );
-    knob(
-        painter,
-        l.knob_master,
-        "KIT",
-        &db_word(view.master),
-        frac(view.master, Param::Master),
-        true,
-    );
+    // The selected pad's three bays — the master left for the DRUMS
+    // channel on the desk, which is where bus-wide effects live now.
+    for (i, r) in l.fx.iter().enumerate() {
+        if !r.is_positive() {
+            continue;
+        }
+        let word = view.fx[i];
+        let filled = !word.is_empty();
+        chip(
+            painter,
+            *r,
+            if filled { word } else { "+" },
+            false,
+            if filled { AMBER } else { INK.gamma_multiply(0.35) },
+        );
+    }
+
+    // ── the media explorer ───────────────────────────────────────────────
+    if l.media.is_positive() {
+        painter.rect_filled(l.media, 2.0, Color32::from_rgba_premultiplied(0, 0, 0, 60));
+        // The header: UP, then where we stand.
+        if l.media_up.is_positive() {
+            chip(painter, l.media_up, "..", false, INK.gamma_multiply(0.6));
+        }
+        let label = Rect::from_min_max(
+            Pos2::new(l.media_up.right() + 4.0, l.media_head.top()),
+            l.media_head.max,
+        );
+        if label.is_positive() {
+            painter.text(
+                Pos2::new(label.left(), label.center().y),
+                Align2::LEFT_CENTER,
+                cut_text(painter, label.width(), view.media_dir, &font(9.0)),
+                font(9.0),
+                INK.gamma_multiply(0.55),
+            );
+        }
+        let rows = l.media_rows();
+        for (row, r) in rows.iter().enumerate() {
+            let Some(e) = view.media.get(view.media_scroll + row) else {
+                break;
+            };
+            painter.rect_filled(
+                *r,
+                1.5,
+                if row % 2 == 0 {
+                    Color32::from_rgba_premultiplied(0, 0, 0, 40)
+                } else {
+                    Color32::TRANSPARENT
+                },
+            );
+            let word = if e.dir {
+                format!("\u{25B8} {}", e.name)
+            } else {
+                e.name.clone()
+            };
+            painter.text(
+                Pos2::new(r.left() + 5.0, r.center().y),
+                Align2::LEFT_CENTER,
+                cut_text(painter, r.width() - 10.0, &word, &font(9.5)),
+                font(9.5),
+                if e.dir { INK.gamma_multiply(0.85) } else { METER_GREEN.gamma_multiply(0.9) },
+            );
+        }
+        // More below? A quiet count, so a long folder says so.
+        if view.media.len() > view.media_scroll + rows.len() {
+            painter.text(
+                Pos2::new(l.media.right() - 4.0, l.media.bottom() - 3.0),
+                Align2::RIGHT_BOTTOM,
+                format!("+{}", view.media.len() - view.media_scroll - rows.len()),
+                font(8.0),
+                INK.gamma_multiply(0.4),
+            );
+        }
+    }
+}
+
+/// `text`, cut with an ellipsis to fit `width`.
+fn cut_text(painter: &Painter, width: f32, text: &str, f: &FontId) -> String {
+    let measure = |t: &str| {
+        painter
+            .layout_no_wrap(t.to_owned(), f.clone(), Color32::WHITE)
+            .rect
+            .width()
+    };
+    if measure(text) <= width {
+        return text.to_owned();
+    }
+    let mut out = String::new();
+    for ch in text.chars() {
+        out.push(ch);
+        if measure(&format!("{out}\u{2026}")) > width {
+            out.pop();
+            break;
+        }
+    }
+    format!("{out}\u{2026}")
 }
 
 /// What a press at `pos` means. Chips beat pads, pads beat the strip, and
@@ -672,10 +830,21 @@ pub fn hit_test(rect: Rect, view: &DrumpadView<'_>, pos: Pos2) -> Option<Hit> {
         (l.knob_tune, Hit::Knob(Param::Tune), has),
         (l.choke, Hit::Choke, has),
         (l.clear, Hit::Clear, has),
-        (l.knob_master, Hit::Knob(Param::Master), true),
+        (l.fx[0], Hit::PadInsert(0), has),
+        (l.fx[1], Hit::PadInsert(1), has),
+        (l.fx[2], Hit::PadInsert(2), has),
+        (l.media_up, Hit::MediaUp, true),
     ] {
         if want && r.is_positive() && r.contains(pos) {
             return Some(hit);
+        }
+    }
+    for (row, r) in l.media_rows().iter().enumerate() {
+        if r.is_positive()
+            && r.contains(pos)
+            && view.media.get(view.media_scroll + row).is_some()
+        {
+            return Some(Hit::MediaRow(view.media_scroll + row));
         }
     }
     None
@@ -719,12 +888,23 @@ mod tests {
             down: None,
             midi_on: true,
             drop_hover: None,
-            master: 1.0,
+            fx: ["Pro-R 2", "", ""],
+            media_dir: "/Users/x/Samples",
+            media: MEDIA.get_or_init(|| {
+                vec![
+                    MediaEntry { name: "Kicks".to_owned(), dir: true },
+                    MediaEntry { name: "kick 01.wav".to_owned(), dir: false },
+                    MediaEntry { name: "snare tight.wav".to_owned(), dir: false },
+                ]
+            }),
+            media_scroll: 0,
         }
     }
 
+    static MEDIA: std::sync::OnceLock<Vec<MediaEntry>> = std::sync::OnceLock::new();
+
     fn rect() -> Rect {
-        Rect::from_min_size(Pos2::new(20.0, 20.0), Vec2::new(440.0, 460.0))
+        Rect::from_min_size(Pos2::new(20.0, 20.0), Vec2::new(880.0, 460.0))
     }
 
     /// Pad 0 stands bottom-left and pad 15 top-right — the MPC's reading
@@ -769,9 +949,18 @@ mod tests {
             hit_test(rect(), &v, l.knob_gain.center()),
             Some(Hit::Knob(Param::Gain))
         );
+        // The selected pad's bays answer, and the explorer's rows do too:
+        // a folder to walk into, a file to drag.
+        assert_eq!(hit_test(rect(), &v, l.fx[0].center()), Some(Hit::PadInsert(0)));
+        assert_eq!(hit_test(rect(), &v, l.media_up.center()), Some(Hit::MediaUp));
+        let rows = l.media_rows();
+        assert!(rows.len() >= 3, "the explorer holds too few rows");
+        assert_eq!(hit_test(rect(), &v, rows[0].center()), Some(Hit::MediaRow(0)));
+        assert_eq!(hit_test(rect(), &v, rows[1].center()), Some(Hit::MediaRow(1)));
         assert_eq!(
-            hit_test(rect(), &v, l.knob_master.center()),
-            Some(Hit::Knob(Param::Master))
+            hit_test(rect(), &v, rows[rows.len() - 1].center()),
+            None,
+            "a row past the listing answered"
         );
         assert_eq!(hit_test(rect(), &v, Pos2::new(2.0, 2.0)), None);
     }
@@ -785,10 +974,7 @@ mod tests {
         let l = Layout::new(rect());
         assert_eq!(hit_test(rect(), &v, l.knob_gain.center()), None);
         assert_eq!(hit_test(rect(), &v, l.clear.center()), None);
-        assert_eq!(
-            hit_test(rect(), &v, l.knob_master.center()),
-            Some(Hit::Knob(Param::Master))
-        );
+        assert_eq!(hit_test(rect(), &v, l.fx[0].center()), None);
     }
 
     /// The pads speak the drum map: 36 is C2 and the grid counts up from it.

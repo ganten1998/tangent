@@ -111,3 +111,18 @@ crate-wide currency for "a media file being dragged".
 - A kit swap silences all sixteen voices for one block (documented and
   tested); a replace-one-pad load therefore cuts a ringing crash. Nobody
   will notice while loading samples, but a per-pad swap would fix it.
+
+## v2 (4.50.0)
+
+The pad window doubled in width for a MEDIA EXPLORER pane on the right:
+browse the filesystem (`..` walks up), drag an audio row straight onto a
+pad (`DraggedMedia`, the same drop contract). The inspector row gained
+three FX bays and a pan per pad — the bays ride the desk's insert space
+at `pad_rack_index(pad) = STRIPS+1+pad`, so loading, editors and state
+sidecars are the desk's own machinery; each pad renders through its rack
+(live racks keep processing silence so tails ring out), the sixteen sum
+through the DRUM BUS rack and fold with `drums_gain/drums_pan`. The bus
+itself is a desk strip now (`Strip::Drums`, settings v14, left of the
+click) — its fader, pan, mutes and inserts live on the desk, not here.
+The volume slider answers horizontal drag (it is horizontal); the
+inspector knobs read value-top/label-bottom like every dial in the app.

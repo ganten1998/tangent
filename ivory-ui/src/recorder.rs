@@ -502,6 +502,12 @@ pub const STRIPS: usize = CHANNELS + 3;
 /// SIDES in so deep that another layout is a rewrite.
 pub const DRUM_PADS: usize = 16;
 
+/// Where pad `i`'s insert bays live in the strip-indexed insert space:
+/// after every strip and the master. One seat map, mirrored by the engine.
+pub const fn pad_insert_index(pad: usize) -> usize {
+    STRIPS + 1 + pad
+}
+
 /// The MIDI note of pad 0. C1 — the General MIDI kick — with the pads counting
 /// up from the BOTTOM-LEFT corner, which is where every drum machine puts its
 /// first pad. Pad `n` answers note `DRUM_PAD_BASE + n`.
@@ -2050,6 +2056,9 @@ pub fn parse_percent(text: &str) -> Option<f32> {
 pub struct NumEdit {
     pub field: NumField,
     pub text: String,
+    /// Where the next character lands — chars, not bytes; the field only
+    /// ever holds ASCII digits and punctuation.
+    pub caret: usize,
 }
 
 impl NumEdit {
@@ -2063,7 +2072,30 @@ impl NumEdit {
         Self {
             field,
             text: String::new(),
+            caret: 0,
         }
+    }
+
+    /// Start editing SEEDED with the current reading, the caret at its end
+    /// — the owner's rule: the field opens looking exactly like the
+    /// readout, and the arrows walk the digits.
+    pub fn prefilled(field: NumField, seed: String) -> Self {
+        let caret = seed.len();
+        Self { field, text: seed, caret }
+    }
+
+    pub fn left(&mut self) {
+        self.caret = self.caret.saturating_sub(1);
+    }
+
+    pub fn right(&mut self) {
+        self.caret = (self.caret + 1).min(self.text.len());
+    }
+
+    /// The text with the caret drawn into it, for the band to paint.
+    pub fn display(&self) -> String {
+        let at = self.caret.min(self.text.len());
+        format!("{}\u{2502}{}", &self.text[..at], &self.text[at..])
     }
 
     /// Accept a typed character, or ignore it.
@@ -2078,7 +2110,9 @@ impl NumEdit {
         if self.field == NumField::Meter {
             let ok = ch.is_ascii_digit() || (ch == '/' && !self.text.contains('/'));
             if ok && self.text.len() < MAX {
-                self.text.push(ch);
+                let at = self.caret.min(self.text.len());
+                self.text.insert(at, ch);
+                self.caret = at + 1;
             }
             return;
         }
@@ -2088,14 +2122,20 @@ impl NumEdit {
             // anyway. They stop the field from showing something it will then
             // silently refuse to accept.
             || (ch == '.' && !self.text.contains('.'))
-            || (ch == '-' && self.text.is_empty());
+            || (ch == '-' && self.text.is_empty() && self.caret == 0);
         if ok && self.text.len() < MAX {
-            self.text.push(ch);
+            let at = self.caret.min(self.text.len());
+            self.text.insert(at, ch);
+            self.caret = at + 1;
         }
     }
 
     pub fn pop(&mut self) {
-        self.text.pop();
+        let at = self.caret.min(self.text.len());
+        if at > 0 {
+            self.text.remove(at - 1);
+            self.caret = at - 1;
+        }
     }
 }
 
