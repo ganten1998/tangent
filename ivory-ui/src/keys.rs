@@ -55,6 +55,14 @@ pub enum KeyAction {
     ToggleRecorder,
     /// Swap the piano and the bands under it for the mixer, and back.
     ToggleMixer,
+    /// The drumpad, floating over whichever view is open.
+    ///
+    /// A POPUP, not a Tab stop: the pads are an instrument you raise over
+    /// the surface you are working on, exactly as the MIDI editor rises
+    /// over the arrangement. Gated on the band being open, because the
+    /// engine lives and dies with the band and a drumpad with no engine is
+    /// sixteen buttons that do nothing.
+    ToggleDrumpad,
     /// Fill the screen, and come back.
     ///
     /// Gated on [`Gates::window_sizing`] for the same reason every other
@@ -114,7 +122,9 @@ pub struct Gates {
 /// card cannot advertise a dead key and a live key cannot go unlisted.
 fn available(action: KeyAction, gates: Gates) -> bool {
     match action {
-        KeyAction::StartRecording | KeyAction::StopRecording => gates.recorder_shown,
+        KeyAction::StartRecording | KeyAction::StopRecording | KeyAction::ToggleDrumpad => {
+            gates.recorder_shown
+        }
         KeyAction::ToggleRecorder => gates.recorder_available,
         KeyAction::ToggleFullscreen => gates.window_sizing,
         _ => true,
@@ -209,6 +219,11 @@ const BINDINGS: &[(Key, &str, KeyAction, bool)] = &[
     // place you go, and Tab is what a program with more than one screen uses
     // to go there.
     (Key::Tab, "Tab", KeyAction::ToggleMixer, true),
+    // `W` was freed when the camera pane lost its key (see the note at the
+    // top of the table), and the drumpad takes it: a single reachable
+    // letter for a surface you raise and put away mid-performance. Gated
+    // like the transport keys, so it clusters here at the table's end.
+    (Key::W, "W", KeyAction::ToggleDrumpad, true),
     (Key::Enter, "Enter", KeyAction::StartRecording, true),
     (Key::Space, "Space", KeyAction::StopRecording, true),
     // Escape only closes the card; it is not worth a row of its own.
@@ -255,6 +270,7 @@ fn describe(a: KeyAction) -> &'static str {
         KeyAction::ManageTaughtChords => "chords you have taught",
         KeyAction::ToggleChordLearning => "chord learning",
         KeyAction::ToggleNotePreference => "sharps or flats",
+        KeyAction::ToggleDrumpad => "the drumpad",
         KeyAction::StartRecording => "record the arrangement",
         KeyAction::StopRecording => "stop recording",
         KeyAction::ToggleRecorder => "the recorder",
@@ -790,7 +806,7 @@ mod tests {
             window_sizing: true,
         };
         let hidden = card_rows(can_record, HelpView::Piano);
-        for gone in ["Space", "Enter"] {
+        for gone in ["Space", "Enter", "W"] {
             assert!(
                 !hidden.iter().any(|(label, _)| *label == gone),
                 "the card offers {gone}, a shortcut the app would ignore"
@@ -803,12 +819,14 @@ mod tests {
             },
             HelpView::Piano,
         );
-        // TWO rows now, not one: starting and stopping are separate keys, so
-        // that the key which begins a performance is not the key that ends it.
+        // THREE rows now: starting and stopping are separate keys — the key
+        // which begins a performance is not the key that ends it — and the
+        // drumpad rides the same gate, because it is silent without the
+        // band's engine.
         assert_eq!(
             shown.len(),
-            hidden.len() + 2,
-            "opening the band added something other than Enter and Space"
+            hidden.len() + 3,
+            "opening the band added something other than W, Enter and Space"
         );
         assert_eq!(
             shown.last().map(|(l, d)| (*l, *d)),

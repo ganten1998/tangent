@@ -364,6 +364,12 @@ pub struct DesktopApp {
     /// sample rate. Entries no clip references leave with the edit.
     #[cfg(feature = "recorder")]
     track_cache: std::collections::HashMap<std::path::PathBuf, Arc<ivory_record::decode::Clip>>,
+    /// The drumpad's decoded samples, by resolved path — its own cache,
+    /// because `track_cache` evicts by what the ARRANGEMENT references and
+    /// a kit is not the arrangement's business. Same rate-keying, same
+    /// clear on an engine restart.
+    #[cfg(feature = "recorder")]
+    pad_cache: std::collections::HashMap<std::path::PathBuf, Arc<ivory_record::decode::Clip>>,
 }
 
 /// How many columns the backing track's waveform is drawn from.
@@ -1039,6 +1045,12 @@ impl DesktopApp {
                 self.app.report_take(message, problem);
             }
         }
+        // The drumpad's peaks, read-and-reset like the strips' — exactly
+        // once a frame, and pushed before the state borrow below takes the
+        // app for the rest of this function.
+        if let Some(e) = self.recorder.engine.as_ref() {
+            self.app.note_drumpad_peaks(e.pad_peaks());
+        }
         // **The alias replaces the interface's name, once, for all of it.**
         // Read BEFORE the state borrow, like everything else here: the app is
         // borrowed mutably for the rest of this function.
@@ -1256,9 +1268,30 @@ impl DesktopApp {
         // consumer and starve the other.
         let engine = self.recorder.engine.as_ref();
         let mut arr = self.recorder.arr_rec.as_mut();
+        let pads_live = self.app.drumpad_live();
         self.recorder.session.pump_midi(|t, bytes| {
             if let Some(e) = engine {
                 e.send_midi(t, bytes);
+                // **The drumpad's mirror.** While the panel is up with its
+                // MIDI chip lit, a live note inside the pads' sixteen ALSO
+                // strikes its pad: a copy on channel 10, the pads' own
+                // address, so the engine's one rule stays one rule. A note
+                // already on channel 10 reached the pads with the send
+                // above and is not doubled.
+                if pads_live {
+                    if let (Some(&status), Some(&note)) = (bytes.first(), bytes.get(1)) {
+                        let kind = status & 0xF0;
+                        let base = ivory_ui::recorder::DRUM_PAD_BASE;
+                        let top = base + ivory_ui::recorder::DRUM_PADS as u8;
+                        if (kind == 0x90 || kind == 0x80)
+                            && status & 0x0F != 9
+                            && (base..top).contains(&(note & 0x7F))
+                        {
+                            let vel = bytes.get(2).copied().unwrap_or(0);
+                            e.send_midi(t, &[kind | 9, note, vel]);
+                        }
+                    }
+                }
             }
             // The arrangement's own collection: raw note edges, stamped
             // against the record's T0, on the clock the engine hears.
@@ -1556,6 +1589,12 @@ impl DesktopApp {
             self.reload_clips();
         }
 
+        // **The drumpad's kit, on the same bargain**: a drop, a clear or a
+        // project switch marks; this decodes and pushes the samples whole.
+        if self.app.take_drumpad_dirty() {
+            self.reload_pads();
+        }
+
         // **The shipped bank, put back.** The same call a first launch makes,
         // which is the point: there is one definition of "the cartridge that
         // ships" and both paths read it.
@@ -1764,6 +1803,29 @@ impl DesktopApp {
                         for ev in events {
                             self.recorder.session.capture_app_midi(at, ev);
                         }
+                    }
+                }
+                R::PadHit { pad, on } => {
+                    // The pads' own audition: one note on channel 10, the
+                    // drum channel, which `collect_notes` keeps for the kit.
+                    // Through `send_midi` like `Audition` above, and into
+                    // the take's `.mid` on the same stamp — a pad tapped
+                    // over a rolling take is a performance.
+                    let note = ivory_ui::recorder::DRUM_PAD_BASE.saturating_add(pad);
+                    let sent = self.recorder.engine.as_ref().map(|e| {
+                        let at = e.timebase().now();
+                        let status = if on { 0x99 } else { 0x89 };
+                        let vel = if on {
+                            ivory_ui::recorder::DRUM_PAD_VELOCITY
+                        } else {
+                            64
+                        };
+                        let ev = [status, note, vel];
+                        e.send_midi(at, &ev);
+                        (at, ev)
+                    });
+                    if let Some((at, ev)) = sent {
+                        self.recorder.session.capture_app_midi(at, ev);
                     }
                 }
                 R::EditPatch { slot: _ } => {
@@ -2671,6 +2733,57 @@ impl DesktopApp {
         self.app.set_track_info(info);
     }
 
+    /// The drumpad's samples: decode every slot at the engine's rate, push
+    /// the kit whole, and tell the app what each pad turned out to be.
+    /// `reload_clips`'s little sibling, with its own cache — see `pad_cache`.
+    fn reload_pads(&mut self) {
+        /// Columns in a pad's waveform ghost. A pad is fifty-odd points
+        /// wide at most; forty-eight columns is under a point each.
+        const PAD_WAVE_BUCKETS: usize = 48;
+        let rate = self
+            .recorder
+            .engine
+            .as_ref()
+            .map_or(48_000, |e| e.output().sample_rate);
+        let paths = self.app.drumpad_paths();
+        let mut kit = crate::instrument::PadKit::default();
+        let mut status: [ivory_ui::ports::PadStatus; crate::instrument::PADS] =
+            std::array::from_fn(|_| ivory_ui::ports::PadStatus::default());
+        for (i, path) in paths.iter().enumerate() {
+            let Some(path) = path else { continue };
+            let decoded = match self.pad_cache.get(path) {
+                Some(c) => Some(Arc::clone(c)),
+                None => match ivory_record::decode::decode(path, rate) {
+                    Ok(c) => {
+                        let c = Arc::new(c);
+                        self.pad_cache.insert(path.clone(), Arc::clone(&c));
+                        Some(c)
+                    }
+                    // The pad wears its file's name in red; there is no row
+                    // to carry the decoder's sentence, and a moved folder
+                    // is what this almost always is.
+                    Err(_) => None,
+                },
+            };
+            match (decoded, kit.pads.get_mut(i), status.get_mut(i)) {
+                (Some(c), Some(slot), Some(st)) => {
+                    st.loaded = true;
+                    st.wave = c.envelope(PAD_WAVE_BUCKETS);
+                    *slot = Some(c);
+                }
+                (None, _, Some(st)) => st.missing = true,
+                _ => {}
+            }
+        }
+        // Files no pad references any more leave the cache with the edit.
+        self.pad_cache
+            .retain(|path, _| paths.iter().flatten().any(|p| p == path));
+        if let Some(e) = self.recorder.engine.as_mut() {
+            e.set_pad_kit(kit);
+        }
+        self.app.set_drumpad_status(status);
+    }
+
     /// Write every loaded bay's plugin state beside the settings.
     ///
     /// Called on quit and whenever an editor closes — the second matters more
@@ -2816,6 +2929,10 @@ impl DesktopApp {
                 // — the device that just opened may run another.
                 self.track_cache.clear();
                 self.reload_clips();
+                // And the kit, on the same reasoning: the pad cache is
+                // keyed to a rate this device may not run.
+                self.pad_cache.clear();
+                self.reload_pads();
             }
             Err(e) => {
                 self.recorder.engine_error = Some(format!("no audio output: {e}"));
@@ -2897,6 +3014,9 @@ impl DesktopApp {
         // every frame, like the gains above and for the same reason.
         e.set_fx_return(gains.fx_return);
         e.set_desk(&self.app.desk());
+        // The drumpad's knobs, whole, on the desk's own bargain: atomic
+        // stores of numbers that only move when a hand is on them.
+        e.set_pad_params(&self.app.drum_kit_params());
         // **The microphone fader, and it goes to ONE place now.** It used to
         // go to two — the session's writer thread and the engine — because the
         // writer was where the dry capture became the take. The take is the
@@ -3335,6 +3455,8 @@ impl DesktopApp {
             browse_extensions: Vec::new(),
             #[cfg(feature = "recorder")]
             track_cache: std::collections::HashMap::new(),
+            #[cfg(feature = "recorder")]
+            pad_cache: std::collections::HashMap::new(),
         };
         // What the effects ship as, so the panel can draw a slider for a
         // parameter nobody has moved. See `ports::EffectDefaults`: the DSP owns
