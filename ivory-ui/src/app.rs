@@ -312,6 +312,15 @@ pub struct IvoryApp {
     /// The ARRANGEMENT stands where the piano does, like the mixer. Tab
     /// cycles piano, mixer, arrangement; the two views are never both open.
     arrangement_open: bool,
+    /// The host must reload every insert with the state the project
+    /// carries — set by an explicit project open, drained once.
+    desk_reload: bool,
+    /// A project action for the HOST to run whole (it owns plugin states
+    /// and the template shelf). Drained once a frame.
+    project_request: Option<crate::ports::ProjectRequest>,
+    /// An LCD part being dragged: `(row, part, ratchet y)` — Start/End/
+    /// Length by bars, beats or thousandths, whichever cell the hand took.
+    lcd_drag: Option<(u8, u8, f32)>,
     /// The MIDI editor popup, while one is open.
     midi_edit: Option<MidiEdit>,
     /// Where it drew last frame, for the input to hit against.
@@ -1011,6 +1020,9 @@ impl IvoryApp {
             timeline_scrub: false,
             viewport_pan: None,
             arrangement_open: false,
+            desk_reload: false,
+            project_request: None,
+            lcd_drag: None,
             midi_edit: None,
             midi_edit_rect: None,
             drumpad_open: false,
@@ -2594,7 +2606,7 @@ impl IvoryApp {
     fn recorder_layout_view(&self) -> recorder::RecorderView<'_> {
         recorder::RecorderView {
             fx_units: self.fx_units(),
-            sel_clip: self.arr_sel_span(),
+            view_window: self.arr_window_now(),
             track: &self.track,
             scrub: self.scrub_view(),
             input_monitor: self.input_monitor,
@@ -3001,6 +3013,18 @@ impl IvoryApp {
             self.clicked.clear();
             self.timeline_scrub = false;
             self.viewport_pan = None;
+            self.lcd_drag = None;
+        }
+        // An LCD number, ridden: every eight points of travel is one unit
+        // of whatever cell the press took — up for more, the knobs' rule.
+        if let (Some((row, part, from_y)), Some(pos), true) =
+            (self.lcd_drag, pointer, pointer_down)
+        {
+            let steps = f64::from(((from_y - pos.y) / 8.0).trunc());
+            if steps.abs() >= 1.0 {
+                self.lcd_adjust(row, part, steps);
+                self.lcd_drag = Some((row, part, from_y - steps as f32 * 8.0));
+            }
         }
         // The scrub: the locate follows the hand for as long as the press
         // that landed on the timeline is held. X only, clamped at the ends —
@@ -3082,6 +3106,14 @@ impl IvoryApp {
                     {
                         self.settings.heart_color = self.settings.heart_color.wrapping_add(1);
                         self.save_settings();
+                        return;
+                    }
+                    // The LCD's part cells: a press takes the number by
+                    // the unit under the hand, and the drag below turns it.
+                    if let Some((row, part)) =
+                        recorder_panel::lcd_part_at(r, &self.recorder_layout_view(), pos)
+                    {
+                        self.lcd_drag = Some((row, part, pos.y));
                         return;
                     }
                     let hit = recorder_panel::hit_test(
@@ -4041,6 +4073,87 @@ impl IvoryApp {
         Ok(())
     }
 
+    /// **Recording over material is DESTRUCTIVE — the owner's rule.** The
+    /// recorded region carves every clip it overlaps on the lane: a clip
+    /// swallowed whole is removed, an overlapped head or tail is trimmed,
+    /// and a clip the region lands inside is split around it. No overlap
+    /// survives a record.
+    fn arr_carve(&mut self, lane: usize, t0: f64, t1: f64) {
+        if t1 <= t0 {
+            return;
+        }
+        // Read first, edit after: the resolved length needs `&self`.
+        enum Op {
+            Remove(u64),
+            TrimRight(u64, f64),
+            TrimLeft(u64, f64),
+            Split(u64, f64, f64),
+        }
+        let mut ops = Vec::new();
+        for c in self.arrangement.clips.iter().filter(|c| c.lane == lane) {
+            let c0 = c.start_s;
+            let c1 = c0 + self.clip_len_resolved(c);
+            if c0 >= t1 - 1.0e-9 || c1 <= t0 + 1.0e-9 {
+                continue;
+            }
+            if t0 <= c0 + 1.0e-9 && t1 >= c1 - 1.0e-9 {
+                ops.push(Op::Remove(c.id));
+            } else if c0 < t0 && c1 <= t1 + 1.0e-9 {
+                ops.push(Op::TrimRight(c.id, t0));
+            } else if c0 >= t0 - 1.0e-9 && c1 > t1 {
+                ops.push(Op::TrimLeft(c.id, t1));
+            } else {
+                ops.push(Op::Split(c.id, t0, t1));
+            }
+        }
+        let mut tails = Vec::new();
+        for op in ops {
+            match op {
+                Op::Remove(id) => self.arrangement.clips.retain(|c| c.id != id),
+                Op::TrimRight(id, at) => {
+                    if let Some(c) = self.arrangement.clips.iter_mut().find(|c| c.id == id) {
+                        c.len_s = (at - c.start_s).max(0.05);
+                        c.fade_out_s = c.fade_out_s.min(c.len_s);
+                        c.fade_in_s = c.fade_in_s.min(c.len_s);
+                    }
+                }
+                Op::TrimLeft(id, at) => {
+                    if let Some(c) = self.arrangement.clips.iter_mut().find(|c| c.id == id) {
+                        let end = c.start_s + c.len_s;
+                        let d = at - c.start_s;
+                        c.start_s = at;
+                        c.offset_s += d;
+                        c.len_s = (end - at).max(0.05);
+                        c.fade_in_s = c.fade_in_s.min(c.len_s);
+                        c.fade_out_s = c.fade_out_s.min(c.len_s);
+                    }
+                }
+                Op::Split(id, at0, at1) => {
+                    if let Some(c) = self.arrangement.clips.iter_mut().find(|c| c.id == id) {
+                        let end = c.start_s + c.len_s;
+                        let mut tail = c.clone();
+                        // The head keeps its fade-in and stops at the punch.
+                        c.len_s = (at0 - c.start_s).max(0.05);
+                        c.fade_out_s = 0.0;
+                        c.fade_in_s = c.fade_in_s.min(c.len_s);
+                        // The tail starts past it, its trim paid in offset —
+                        // MIDI notes are source-relative, so they follow.
+                        tail.start_s = at1;
+                        tail.offset_s = c.offset_s + (at1 - c.start_s);
+                        tail.len_s = (end - at1).max(0.05);
+                        tail.fade_in_s = 0.0;
+                        tail.fade_out_s = tail.fade_out_s.min(tail.len_s);
+                        tail.id = 0;
+                        tails.push(tail);
+                    }
+                }
+            }
+        }
+        for tail in tails {
+            self.arrangement.add_clip(tail);
+        }
+    }
+
     /// What arrangement record produced, one entry per armed lane. The host
     /// already wrote the WAVs into `media/`; this adds the rows, selects the
     /// last one and saves — one press, one save, however many lanes.
@@ -4066,6 +4179,12 @@ impl IvoryApp {
                 .as_deref()
                 .and_then(|p| std::path::Path::new(p).file_stem().map(|n| n.to_string_lossy().into_owned()))
                 .unwrap_or_else(|| "take".to_owned());
+            // The punch: what this take covers on its lane, it OWNS.
+            self.arr_carve(
+                r.lane.min(crate::recorder::CHANNELS - 1),
+                r.start_s.max(0.0),
+                r.start_s.max(0.0) + r.len_s,
+            );
             let id = self.arrangement.add_clip(crate::arrangement::ArrClip {
                 kind,
                 notes: r.notes,
@@ -4131,12 +4250,107 @@ impl IvoryApp {
     }
 
     /// Open a document and make it the remembered project.
+    /// The desk as the document stores it — everything `apply_desk_snapshot`
+    /// puts back. Captured on every save, so a session folder always knows
+    /// its own instruments.
+    fn desk_snapshot(&self) -> crate::arrangement::DeskSnap {
+        let sig = self.time_signature();
+        crate::arrangement::DeskSnap {
+            kinds: self.settings.channel_kinds.to_vec(),
+            names: self.settings.strip_names.clone(),
+            colors: self.settings.strip_colors.to_vec(),
+            inserts: self.settings.strip_inserts.clone(),
+            sends: self.settings.strip_sends.to_vec(),
+            muted: self.settings.strip_muted,
+            soloed: self.settings.strip_soloed,
+            gains: self.settings.channel_gains.to_vec(),
+            metronome_gain: self.settings.metronome_gain,
+            master_gain: self.settings.master_gain,
+            fx_return: self.settings.fx_return_gain,
+            tempo_bpm: f64::from(self.settings.record_export.tempo_bpm),
+            sig_beats: sig.beats,
+            sig_unit: sig.unit,
+            metronome_on: self.settings.metronome_on,
+        }
+    }
+
+    /// Put a document's desk on the settings — the live desk — clamped the
+    /// way every settings read is. The host is told to reload the bays with
+    /// the states the project carries.
+    fn apply_desk_snapshot(&mut self, d: &crate::arrangement::DeskSnap) {
+        for (i, k) in d.kinds.iter().take(crate::recorder::CHANNELS).enumerate() {
+            self.settings.channel_kinds[i] = (*k).min(2);
+        }
+        self.settings.strip_names = d.names.clone();
+        for (i, c) in d.colors.iter().take(self.settings.strip_colors.len()).enumerate() {
+            self.settings.strip_colors[i] = *c;
+        }
+        self.settings.strip_inserts = d.inserts.clone();
+        for (i, v) in d.sends.iter().take(crate::recorder::STRIPS).enumerate() {
+            self.settings.strip_sends[i] = v.clamp(0.0, 1.0);
+        }
+        self.settings.strip_muted = d.muted;
+        self.settings.strip_soloed = d.soloed;
+        for (i, v) in d.gains.iter().take(crate::recorder::CHANNELS).enumerate() {
+            self.settings.channel_gains[i] = v.clamp(0.0, 8.0);
+        }
+        self.settings.metronome_gain = d.metronome_gain.clamp(0.0, 2.0);
+        self.settings.master_gain = d.master_gain.clamp(0.0, 8.0);
+        self.settings.fx_return_gain = d.fx_return.clamp(0.0, 2.0);
+        self.settings.record_export.tempo_bpm = d
+            .tempo_bpm
+            .clamp(f64::from(recorder::MIN_BPM), f64::from(recorder::MAX_BPM));
+        self.settings.record_time_signature =
+            format!("{}/{}", d.sig_beats.clamp(1, 32), d.sig_unit.clamp(1, 32));
+        self.settings.metronome_on = d.metronome_on;
+        self.save_settings();
+        self.desk_reload = true;
+    }
+
+    /// The song's span in seconds, for the host's bounce to know where the
+    /// end is.
+    pub fn arr_span_s(&self) -> f64 {
+        self.arr_span()
+    }
+
+    /// The project action the host should run, if one was asked for.
+    pub fn take_project_request(&mut self) -> Option<crate::ports::ProjectRequest> {
+        self.project_request.take()
+    }
+
+    /// Found a template shelf with no `default` on it: write one, carrying
+    /// THIS desk — at first launch that is the stock desk, which is what a
+    /// default should be until the owner saves their own over it.
+    pub fn seed_template(&self, dir: &std::path::Path) {
+        let doc = dir.join("project.tangent");
+        if doc.is_file() {
+            return;
+        }
+        let _ = std::fs::create_dir_all(dir.join("media"));
+        let mut arr = crate::arrangement::Arrangement::default();
+        arr.desk = Some(self.desk_snapshot());
+        arr.save_to(&doc);
+    }
+
+    /// The host's cue to reload every insert with the project's own states.
+    pub fn take_desk_reload(&mut self) -> bool {
+        std::mem::take(&mut self.desk_reload)
+    }
+
     pub fn open_project(&mut self, doc: &std::path::Path) {
         self.arrangement = crate::arrangement::Arrangement::load_from(doc);
         self.project_doc = doc.to_path_buf();
         self.settings.project_path = doc.to_string_lossy().into_owned();
         self.save_settings();
         self.clips_dirty = true;
+        // **The session's DESK arrives with it** — kinds, bays, names,
+        // faders, tempo. Explicit opens only: the launch reopen goes
+        // through `bootstrap_project`, where the settings already ARE this
+        // project's live desk and applying a snapshot could only roll back
+        // whatever was touched after the last document save.
+        if let Some(desk) = self.arrangement.desk.clone() {
+            self.apply_desk_snapshot(&desk);
+        }
         // The kit rides the project: whatever drumpad this directory
         // carries replaces the one in memory.
         self.load_drumpad_doc();
@@ -4208,7 +4422,7 @@ impl IvoryApp {
     /// kind earns — the bay-1 instrument on MIDI, the input's label on
     /// AUDIO, and plain AUDIO for a clip lane. One function for the mixer
     /// strip and the arrangement header, so the two can never disagree.
-    fn channel_display_name(&self, n: usize) -> &str {
+    pub fn channel_display_name(&self, n: usize) -> &str {
         if let Some(name) = self
             .settings
             .strip_names
@@ -4268,11 +4482,27 @@ impl IvoryApp {
     }
 
     /// One bar in seconds, from the band's own tempo and signature.
-    /// The selected clip's `(start_s, len_s)`, for the LCD cluster.
-    fn arr_sel_span(&self) -> Option<(f64, f64)> {
-        let id = self.arr_selected?;
-        let c = self.arrangement.clips.iter().find(|c| c.id == id)?;
-        Some((c.start_s, self.clip_len_resolved(c)))
+    /// One LCD drag step: `row` is Start/End/Length, `part` the unit —
+    /// a bar, a beat, or a hundredth of one. Start PANS the viewport, End
+    /// moves its far edge, Length zooms around its centre.
+    fn lcd_adjust(&mut self, row: u8, part: u8, steps: f64) {
+        let bar = self.arr_bar_s();
+        let beat = bar / f64::from(self.time_signature().beats.max(1));
+        let unit = match part {
+            0 => bar,
+            1 => beat,
+            _ => beat / 100.0,
+        };
+        let d = steps * unit;
+        let (s, l) = self.arr_window_now();
+        match row {
+            0 => self.arr_steer(s + d, l),
+            1 => self.arr_steer(s, (l + d).max(0.25)),
+            _ => {
+                let nl = (l + d).max(0.25);
+                self.arr_steer(s - (nl - l) * 0.5, nl);
+            }
+        }
     }
 
     fn arr_bar_s(&self) -> f64 {
@@ -4475,10 +4705,22 @@ impl IvoryApp {
     /// A gesture's edits, written down: the document saved atomically, the
     /// host told to rebuild the schedule.
     fn arr_save_edits(&mut self) {
+        // The desk rides along on every save, so the folder is a SESSION.
+        self.arrangement.desk = Some(self.desk_snapshot());
         if let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) {
             self.arrangement.save_to(&doc);
         }
         self.clips_dirty = true;
+    }
+
+    /// Write the document down with the desk in it — the quit path's save,
+    /// and any explicit one. Does not touch the clips-dirty flag: nothing
+    /// changed that the engine needs re-pushed.
+    pub fn save_project_doc(&mut self) {
+        self.arrangement.desk = Some(self.desk_snapshot());
+        if let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) {
+            self.arrangement.save_to(&doc);
+        }
     }
 
     /// The Delete key: the SELECTED clip leaves the timeline. The media copy
@@ -5736,7 +5978,7 @@ impl IvoryApp {
                         let (start, len) = self.arr_window_now();
                         // The box IS the song: a hand moving across it moves
                         // the window by the same fraction of the whole.
-                        let song = self.scrub_domain_s().max(len);
+                        let song = self.nav_domain_s().max(len);
                         let d = f64::from(dx / px_w) * song;
                         // And UP zooms IN, around the window's centre —
                         // left-and-up is "closer, and earlier", one motion.
@@ -5841,6 +6083,14 @@ impl IvoryApp {
     /// The overview's whole width in seconds — the owner's rule: it
     /// reflects the VIEWPORT, not merely the longest clip, so the window
     /// rectangle always fits inside the picture.
+    /// The navigator's outer rectangle, in seconds: the song or the
+    /// window's end, PLUS a quarter-window of air — so the inner rectangle
+    /// always has somewhere to go and a drag always shows.
+    fn nav_domain_s(&self) -> f64 {
+        let (s, l) = self.arr_window_now();
+        self.arr_span().max(s + l) + l * 0.25
+    }
+
     fn scrub_domain_s(&self) -> f64 {
         let span = self.arr_span();
         if self.arrangement_open {
@@ -5911,7 +6161,7 @@ impl IvoryApp {
             pending: self.arr_pending,
             view_start_s,
             view_len_s,
-            song_s: self.scrub_domain_s(),
+            song_s: self.nav_domain_s(),
             playhead_s: self.recorder.position_s,
             bpm: f64::from(self.tempo_bpm()),
             sig_top: u32::from(self.time_signature().beats),
@@ -5929,6 +6179,17 @@ impl IvoryApp {
         self.native_panel_up = false;
         match purpose {
             crate::ports::SavePurpose::ProjectCopy => self.save_project_as(path),
+            crate::ports::SavePurpose::Template => {
+                // Only the NAME is honoured — templates have one home.
+                let name = path
+                    .file_stem()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if !name.is_empty() {
+                    self.project_request =
+                        Some(crate::ports::ProjectRequest::Template(name));
+                }
+            }
         }
     }
 
@@ -6394,6 +6655,7 @@ impl IvoryApp {
         match hit {
             Hit::Record => self.request_recorder(R::Toggle),
             Hit::Capture => self.request_recorder(R::Capture),
+            Hit::Pause => self.request_recorder(R::Pause),
             // The audition. The host ignores it while a take is writing;
             // pressed mid-audition it stops and the playhead goes home to
             // 0:00, which is `Transport::toggle_play`'s half of the rule.
@@ -6417,6 +6679,11 @@ impl IvoryApp {
             // "(not connected)", four ticks whose current state is the whole
             // question — and a menu row can show none of that.
             Hit::OpenSetup => self.setup_open = true,
+            Hit::ProjectMenu => {
+                self.dialog = Some(dialogs::Dialog::Project {
+                    name: self.project_name(),
+                });
+            }
             Hit::CloseSetup => self.setup_open = false,
             // **Requested, not done here.** The message belongs to the host —
             // it is the one that knows a take dropped frames — and this crate
@@ -7376,7 +7643,13 @@ impl IvoryApp {
             // driven per frame by `audition_tick`, because a press repeats and
             // a held chord must not.
             K::StopRecording => {
-                if self.recorder.state.is_active() {
+                // ANY recording — the take's machine OR the arrangement's
+                // red button — and the rolling transport besides: Space is
+                // the wide key every DAW binds to stop.
+                if self.recorder.state.is_active()
+                    || self.recorder.arr_recording
+                    || self.recorder.playing
+                {
                     self.request_recorder(recorder::RecorderRequest::Stop);
                 }
             }
@@ -7445,7 +7718,9 @@ impl IvoryApp {
     fn apply_menu_action(&mut self, ctx: &egui::Context, action: MenuAction) {
         match action {
             // ── the project ────────────────────────────────────────────────
-            MenuAction::NewProject => self.new_project(),
+            MenuAction::NewProject => {
+                self.project_request = Some(crate::ports::ProjectRequest::New);
+            }
             MenuAction::OpenProject => {
                 self.native_panel_up = true;
                 self.file_request = Some(crate::ports::FileRequest {
@@ -8093,6 +8368,55 @@ impl IvoryApp {
         match action {
             // The browser asks; the host reads the disk and hands the rows
             // back through `set_browser`.
+            DialogAction::ProjectNew => {
+                self.dialog = None;
+                self.project_request = Some(crate::ports::ProjectRequest::New);
+            }
+            DialogAction::ProjectOpen => {
+                self.dialog = None;
+                self.native_panel_up = true;
+                self.file_request = Some(crate::ports::FileRequest {
+                    start_at: self
+                        .project_doc()
+                        .and_then(std::path::Path::parent)
+                        .and_then(std::path::Path::parent)
+                        .map(std::path::Path::to_path_buf),
+                    title: "Open a project".to_owned(),
+                    extensions: vec!["tangent".to_owned()],
+                    extension_label: "Tangent project".to_owned(),
+                    purpose: crate::ports::FilePurpose::Project,
+                });
+            }
+            DialogAction::ProjectSave => {
+                self.dialog = None;
+                self.project_request = Some(crate::ports::ProjectRequest::Save);
+            }
+            DialogAction::ProjectSaveAs => {
+                self.dialog = None;
+                self.native_panel_up = true;
+                self.save_request = Some(crate::ports::SaveRequest {
+                    title: "Save the project as".to_owned(),
+                    suggested: format!("{} copy", self.project_name()),
+                    purpose: crate::ports::SavePurpose::ProjectCopy,
+                });
+            }
+            DialogAction::ProjectTemplate => {
+                self.dialog = None;
+                self.native_panel_up = true;
+                self.save_request = Some(crate::ports::SaveRequest {
+                    title: "Save as a template".to_owned(),
+                    suggested: "default".to_owned(),
+                    purpose: crate::ports::SavePurpose::Template,
+                });
+            }
+            DialogAction::ProjectExportTrack => {
+                self.dialog = None;
+                self.project_request = Some(crate::ports::ProjectRequest::ExportTrack);
+            }
+            DialogAction::ProjectExportStems => {
+                self.dialog = None;
+                self.project_request = Some(crate::ports::ProjectRequest::ExportStems);
+            }
             DialogAction::SetShowTakeSummary(v) => {
                 self.settings.show_take_summary = v;
                 self.save_settings();
@@ -10833,6 +11157,184 @@ mod tests {
         let read = crate::arrangement::Arrangement::load_from(&app.project_doc);
         assert_eq!(read.clips.len(), 2, "the press did not SAVE");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A record PUNCHES.** What the take covers on its lane, it owns:
+    /// swallowed clips are removed, overlapped edges trimmed, a spanning
+    /// clip is split around the punch — and the tail's trim rides in its
+    /// offset, so MIDI notes and audio alike keep their alignment.
+    #[test]
+    fn a_record_punches_out_what_it_covers() {
+        let root = project_scratch("punch");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        let clip = |lane: usize, start: f64, len: f64| crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Audio,
+            notes: Vec::new(),
+            lane,
+            path: "media/x.wav".to_owned(),
+            start_s: start,
+            offset_s: 0.0,
+            len_s: len,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name: "x".to_owned(),
+            id: 0,
+        };
+        // One spanning clip 0..20, one swallowed 22..24, one tail-side 25..35.
+        app.arrangement.add_clip(clip(1, 0.0, 20.0));
+        app.arrangement.add_clip(clip(1, 22.0, 2.0));
+        app.arrangement.add_clip(clip(1, 25.0, 10.0));
+        // And a bystander on ANOTHER lane, untouched.
+        app.arrangement.add_clip(clip(2, 0.0, 30.0));
+
+        app.add_recorded_clips(vec![crate::arrangement::RecordedClip {
+            lane: 1,
+            start_s: 5.0,
+            len_s: 22.0, // covers 5..27
+            path: Some("media/rec-2-1.wav".to_owned()),
+            notes: Vec::new(),
+        }]);
+
+        let mut lane1: Vec<(f64, f64, f64)> = app
+            .arrangement
+            .clips
+            .iter()
+            .filter(|c| c.lane == 1)
+            .map(|c| (c.start_s, c.len_s, c.offset_s))
+            .collect();
+        lane1.sort_by(|a, b| a.0.total_cmp(&b.0));
+        // Head of the spanning clip: 0..5. The swallowed one: gone. The
+        // tail-side clip: trimmed to 27..35 with 2 s paid into its offset.
+        // And the new take itself: 5..27.
+        assert_eq!(lane1.len(), 3, "lane 1 holds head, take, tail: {lane1:?}");
+        assert!((lane1[0].0 - 0.0).abs() < 1e-9 && (lane1[0].1 - 5.0).abs() < 1e-9);
+        assert!((lane1[1].0 - 5.0).abs() < 1e-9 && (lane1[1].1 - 22.0).abs() < 1e-9);
+        assert!((lane1[2].0 - 27.0).abs() < 1e-9 && (lane1[2].1 - 8.0).abs() < 1e-9);
+        assert!((lane1[2].2 - 2.0).abs() < 1e-9, "the tail trim must ride in offset");
+        assert_eq!(
+            app.arrangement.clips.iter().filter(|c| c.lane == 2).count(),
+            1,
+            "the bystander lane was touched"
+        );
+
+        // And the SPLIT: a punch strictly inside the tail clip (27..35)
+        // leaves its two sides, the far one's trim paid into offset.
+        app.add_recorded_clips(vec![crate::arrangement::RecordedClip {
+            lane: 1,
+            start_s: 30.0,
+            len_s: 2.0,
+            path: Some("media/rec-2-2.wav".to_owned()),
+            notes: Vec::new(),
+        }]);
+        let mut lane1: Vec<(f64, f64, f64)> = app
+            .arrangement
+            .clips
+            .iter()
+            .filter(|c| c.lane == 1)
+            .map(|c| (c.start_s, c.len_s, c.offset_s))
+            .collect();
+        lane1.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert_eq!(lane1.len(), 5, "the split did not leave two sides: {lane1:?}");
+        assert!((lane1[2].0 - 27.0).abs() < 1e-9 && (lane1[2].1 - 3.0).abs() < 1e-9);
+        assert!((lane1[3].0 - 30.0).abs() < 1e-9 && (lane1[3].1 - 2.0).abs() < 1e-9);
+        assert!((lane1[4].0 - 32.0).abs() < 1e-9 && (lane1[4].1 - 3.0).abs() < 1e-9);
+        assert!(
+            (lane1[4].2 - 7.0).abs() < 1e-9,
+            "the split tail's offset must carry both trims: {lane1:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Templates have one home, and only the NAME travels.** The save
+    /// panel can be pointed anywhere; the template still lands under the
+    /// shelf by name — and the seeded default carries the desk.
+    #[test]
+    fn a_template_request_keeps_the_name_and_the_seed_carries_the_desk() {
+        let root = project_scratch("template");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        // Wherever the panel pointed, only the stem survives.
+        app.finish_save_choice(
+            crate::ports::SavePurpose::Template,
+            std::path::Path::new("/somewhere/else/My Rig.tangent"),
+        );
+        assert_eq!(
+            app.take_project_request(),
+            Some(crate::ports::ProjectRequest::Template("My Rig".to_owned()))
+        );
+        // The seed writes a document with THIS desk on it, once.
+        app.set_channel_kind(3, Some(recorder::ChannelKind::Audio));
+        let shelf = root.join("Projects/Templates/default");
+        app.seed_template(&shelf);
+        let doc = crate::arrangement::Arrangement::load_from(&shelf.join("project.tangent"));
+        let desk = doc.desk.expect("the seed left the desk out");
+        assert_eq!(desk.kinds[3], app.settings.channel_kinds[3]);
+        // Seeding again does not overwrite a template that exists.
+        app.set_channel_kind(3, None);
+        app.seed_template(&shelf);
+        let again = crate::arrangement::Arrangement::load_from(&shelf.join("project.tangent"));
+        assert_eq!(
+            again.desk.unwrap().kinds[3],
+            desk.kinds[3],
+            "the seed clobbered a saved template"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A session folder knows its own desk, and an explicit open puts it
+    /// back.** Kinds, bays, names, colours, faders, tempo — captured on
+    /// every save, applied on open (with the host told to reload states),
+    /// and NEVER applied by the launch reopen, which already lives on this
+    /// desk.
+    #[test]
+    fn a_session_carries_its_desk_and_an_open_restores_it() {
+        let root = project_scratch("desksnap");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        // Furnish the desk: a channel kind, a name, a plugin, a fader.
+        app.set_channel_kind(2, Some(recorder::ChannelKind::Midi));
+        app.commit_mixer_name(crate::recorder::Column(2), "Rhodes".to_owned());
+        app.set_insert(2, 0, Some("/x/EP.vst3"));
+        app.settings.channel_gains[2] = 0.42;
+        app.settings.record_export.tempo_bpm = 93.0;
+        app.arr_save_edits();
+        let doc = app.project_doc().unwrap().to_path_buf();
+
+        // The document on disk carries it.
+        let read = crate::arrangement::Arrangement::load_from(&doc);
+        let desk = read.desk.expect("the save left the desk out");
+        assert_eq!(desk.kinds[2], app.settings.channel_kinds[2]);
+        assert_eq!(desk.inserts[2 * crate::recorder::INSERTS], "/x/EP.vst3");
+        assert!((desk.gains[2] - 0.42).abs() < 1e-9);
+        assert!((desk.tempo_bpm - 93.0).abs() < 1e-9);
+
+        // A DIFFERENT app (fresh settings) opens it: the desk arrives.
+        let (_ctx2, mut other) = headless_with(Caps::DESKTOP, Settings::default());
+        other.open_project(&doc);
+        assert_eq!(other.settings.channel_kinds[2], app.settings.channel_kinds[2]);
+        assert_eq!(other.insert(2, 0), Some("/x/EP.vst3"));
+        assert!((other.settings.channel_gains[2] - 0.42).abs() < 1e-9);
+        assert!((other.settings.record_export.tempo_bpm - 93.0).abs() < 1e-9);
+        assert!(
+            other.take_desk_reload(),
+            "the host was not told to reload the bays"
+        );
+        assert!(!other.take_desk_reload(), "the flag answers once");
+
+        // The launch reopen does NOT apply the snapshot: these settings are
+        // already the project's live desk, possibly newer than its save.
+        let mut s3 = Settings::default();
+        s3.project_path = doc.to_string_lossy().into_owned();
+        let (_ctx3, mut third) = headless_with(Caps::DESKTOP, s3);
+        third.settings.channel_gains[2] = 0.9; // "newer than the doc"
+        third.bootstrap_project(&root.join("Projects"));
+        assert!(
+            (third.settings.channel_gains[2] - 0.9).abs() < 1e-9,
+            "the launch reopen rolled the live desk back"
+        );
+        assert!(!third.take_desk_reload());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// **The editor's gestures edit the document, snapped and clamped.**

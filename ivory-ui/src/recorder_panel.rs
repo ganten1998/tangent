@@ -363,6 +363,11 @@ struct Layout {
     setup: Rect,
     /// The cassette: capture the whole session, apart from the arrangement.
     capture: Rect,
+    /// The project button: the session menu — open, save, save as, template.
+    project: Rect,
+    /// PAUSE: hold the playhead where it stands. Stop is the one that goes
+    /// home; two buttons, two meanings, the owner's order.
+    pause: Rect,
     dest: Rect,
     /// The button that shows the folder in the file manager.
     ///
@@ -459,6 +464,8 @@ impl Layout {
             tempo_entry: Rect::NOTHING,
             setup: Rect::NOTHING,
             capture: Rect::NOTHING,
+            project: Rect::NOTHING,
+            pause: Rect::NOTHING,
             dest: Rect::NOTHING,
             reveal: Rect::NOTHING,
                 name: Rect::NOTHING,
@@ -679,27 +686,16 @@ impl Layout {
         // face of the arrangement, drawn as one lane of a thing that will one
         // day show several.
         let tl_box = slice_v(col, 0.02, 0.66);
-        // **The LCD cluster first, off the box's left** — the big
-        // bars|beats|thousandths readout with the Start/End/Length panel
-        // beside it, the owner's REAPER transport brought over. The
-        // scrubber keeps the rest. Wide enough to read its digits, never
-        // more than a third of the box.
-        let lcd_w = (tl_box.height() * 3.4).min(tl_box.width() * 0.48);
-        self.lcd = Rect::from_min_size(tl_box.min, Vec2::new(lcd_w, tl_box.height()));
-        self.timeline = Rect::from_min_max(
-            Pos2::new(self.lcd.right() + tl_box.width() * 0.012, tl_box.top()),
-            tl_box.max,
-        );
-        // The × that unloads the file, in the timeline's own corner. Placed
-        // beside the timeline so the glyph and the target cannot drift.
-        let side = (self.timeline.height() * 0.16).clamp(10.0, 15.0);
-        self.timeline_close = Rect::from_min_size(
-            Pos2::new(
-                self.timeline.right() - side - 2.0,
-                self.timeline.top() + 2.0,
-            ),
-            Vec2::splat(side),
-        );
+        // **The whole box is the LCD now** — the owner retired the overview
+        // strip for the moment: a longer timecode with bigger digits, and
+        // the Start/End/Length of the arrangement's VIEWPORT beside it,
+        // every part of every number draggable. The overview's machinery
+        // stays below, dormant, for the day it earns its room back.
+        self.lcd = tl_box;
+        self.timeline = Rect::NOTHING;
+        // The × went with the overview: the timeline empties from the
+        // arrangement now (select and Delete).
+        self.timeline_close = Rect::NOTHING;
         // The hairline between the timeline and the meters, centred in the
         // gap `fill_transport` leaves — placed here because this function
         // runs for BOTH layouts, so the rule cannot move when a take starts.
@@ -771,15 +767,15 @@ impl Layout {
         });
         let side = from_knob
             .map_or(buttons.height() * TRANSPORT_SIDE, |d| d * TRANSPORT_SIDE)
-            // Five slots at a pitch of a fifth of the row: the cap keeps a
-            // gap between neighbours at the narrowest band, where 0.26 (the
-            // four-slot cap) made play and record shake hands.
-            .min(buttons.width() * 0.18);
-        // Five slots now that CAPTURE exists. Tenths rather than eighths, and
-        // BOTH layouts use them, so stop stands exactly where it stood when
-        // the take starts — the rule this row has always kept.
+            // Seven slots at a pitch of a seventh of the row: the cap
+            // keeps a gap between neighbours at the narrowest band.
+            .min(buttons.width() * 0.125);
+        // Seven slots: the owner's order — Rec, Play, Stop, Pause — then
+        // the cog, the cassette and the folder. Fourteenths, and BOTH
+        // layouts use them, so stop stands exactly where it stood when the
+        // take starts — the rule this row has always kept.
         let icon = |i: usize| {
-            let cx = buttons.left() + buttons.width() * (i as f32 * 2.0 + 1.0) / 10.0;
+            let cx = buttons.left() + buttons.width() * (i as f32 * 2.0 + 1.0) / 14.0;
             Rect::from_center_size(Pos2::new(cx, line), Vec2::splat(side))
         };
         // The typing box, under the knob and only ever drawn while somebody is
@@ -797,15 +793,17 @@ impl Layout {
             // it always stands. No cog either: none of what it opens can be
             // changed with an encoder running. The CASSETTE stays — it is
             // the control that started this take, and the one that ends it.
-            self.dot = icon(1);
+            self.dot = icon(0);
             self.stop = icon(2);
-            self.capture = icon(4);
+            self.capture = icon(5);
         } else {
-            self.play = icon(0);
-            self.record = icon(1);
+            self.record = icon(0);
+            self.play = icon(1);
             self.stop = icon(2);
-            self.setup = icon(3);
-            self.capture = icon(4);
+            self.pause = icon(3);
+            self.setup = icon(4);
+            self.capture = icon(5);
+            self.project = icon(6);
         }
     }
 
@@ -987,7 +985,7 @@ impl Layout {
     /// [`hit_test`] reads this and so does the test that proves no two of them
     /// overlap, so a control that moves onto another one fails a test rather
     /// than quietly swallowing its clicks.
-    fn targets(&self) -> [(Rect, Produces); 31] {
+    fn targets(&self) -> [(Rect, Produces); 32] {
         use Produces::{Along, AlongV, Fixed};
         // The word over a knob, which is the same thing for a dial.
         // **Nothing when there is no word.** Below a certain height the label
@@ -1046,23 +1044,9 @@ impl Layout {
             (self.record, Fixed(Hit::Record)),
             (self.stop, Fixed(Hit::Stop)),
             (self.capture, Fixed(Hit::Capture)),
+            (self.pause, Fixed(Hit::Pause)),
+            (self.project, Fixed(Hit::ProjectMenu)),
             (self.setup, Fixed(Hit::OpenSetup)),
-            // The timeline. Loaded, a click is a LOCATE — the fraction along
-            // the box, which is the fraction into the file, because the box
-            // IS the time axis. Empty it is nobody's button: the import
-            // invitation retired with the backing track, and audio arrives
-            // by DROPPING it on a lane.
-            //
-            // **Not while a take is rolling.** Moving the playhead under a
-            // running take would tear the file.
-            (
-                if self.rolling || !self.timeline_loaded {
-                    Rect::NOTHING
-                } else {
-                    self.timeline
-                },
-                Along(Hit::SeekTimeline),
-            ),
             // Up the cell for more, which is the direction every knob in every
             // studio turns and the direction the two faders beside them move.
             (dial(self.master_knob), AlongV(Hit::SetMaster)),
@@ -1134,6 +1118,10 @@ pub enum Hit {
     /// take machinery, apart from the arrangement. See
     /// `RecorderRequest::Capture`.
     Capture,
+    /// The folder: the PROJECT menu — new, open, save, save as, template.
+    ProjectMenu,
+    /// PAUSE: the playhead holds where it stands. Stop goes home.
+    Pause,
     /// Open the menu the take's settings moved into.
     OpenSetup,
     /// The take-settings popup's DONE button. It only ever closes the popup,
@@ -1263,7 +1251,9 @@ impl Hit {
         Hit::Play,
         Hit::Record,
         Hit::Stop,
+        Hit::Pause,
         Hit::Capture,
+        Hit::ProjectMenu,
         Hit::OpenSetup,
         Hit::ChooseFolder,
         Hit::RevealFolder,
@@ -1275,8 +1265,6 @@ impl Hit {
         Hit::Export,
         Hit::ToggleMetronomeInTake,
         Hit::SetMaster(Hit::MIDWAY),
-        Hit::SeekTimeline(Hit::MIDWAY),
-        Hit::ClearTrack,
         Hit::Type(NumField::Tempo),
         Hit::DismissClip,
         Hit::SetFx(Fx::Reverb, Hit::MIDWAY),
@@ -1293,6 +1281,8 @@ impl Hit {
         match self {
             Hit::Record => "Record armed channels into the arrangement",
             Hit::Capture => "Capture the session — video, audio, MIDI — apart from the arrangement",
+            Hit::ProjectMenu => "Project — new, open, save, save as, template",
+            Hit::Pause => "Pause — hold the playhead here; Stop goes home",
             Hit::OpenSetup => "Take settings",
             Hit::CloseSetup => "Done",
             Hit::DismissMessage => "Dismiss",
@@ -1733,6 +1723,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &RecorderView<'_>, s: &Settings
     draw_preview(painter, &l, view, &p);
     draw_transport(painter, &l, view, &p);
     draw_capture(painter, l.capture, view.state.is_active(), &p);
+    draw_folder(painter, l.project, &p);
     draw_meter(painter, l.meter, view.meters, &p);
     draw_readout(painter, &l, view, &p);
     draw_monitor(painter, &l, view, &p);
@@ -1946,33 +1937,21 @@ fn draw_transport(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Pa
         let c = r.center();
         let h = r.height() * 0.5;
         let w = r.width() * 0.44;
-        if playing {
-            // **The button says what pressing it DOES now, not what it did.**
-            // While the audition rolls a second press pauses, so the glyph is
-            // the pause bars — lit, because the transport is live. Two bars of
-            // together the triangle's weight, each a stroke wide enough to
-            // read from the bench.
-            let bw = w * 0.55;
-            let gap = bw * 0.6;
-            for side in [-1.0_f32, 1.0] {
-                let x = c.x + side * (gap + bw) * 0.5;
-                painter.rect_filled(
-                    Rect::from_center_size(Pos2::new(x, c.y), Vec2::new(bw, h * 2.0)),
-                    1.0,
-                    PLAY_GREEN,
-                );
-            }
-        } else {
-            painter.add(egui::Shape::convex_polygon(
-                vec![
-                    Pos2::new(c.x - w * 0.7, c.y - h),
-                    Pos2::new(c.x - w * 0.7, c.y + h),
-                    Pos2::new(c.x + w * 1.1, c.y),
-                ],
-                toward(PLAY_GREEN, p.bg, 0.35),
-                Stroke::new(1.5_f32, p.line),
-            ));
-        }
+        // The triangle, lit while the transport rolls — PAUSE is its own
+        // button now, so this one never changes shape.
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                Pos2::new(c.x - w * 0.7, c.y - h),
+                Pos2::new(c.x - w * 0.7, c.y + h),
+                Pos2::new(c.x + w * 1.1, c.y),
+            ],
+            if playing {
+                PLAY_GREEN
+            } else {
+                toward(PLAY_GREEN, p.bg, 0.35)
+            },
+            Stroke::new(1.5_f32, p.line),
+        ));
     }
     if l.record.is_positive() {
         let c = l.record.center();
@@ -1998,6 +1977,25 @@ fn draw_transport(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Pa
     // 0.886 D, which is the inset used below.
     if l.dot.is_positive() {
         painter.circle_filled(l.dot.center(), l.dot.width() * 0.5, p.rec);
+    }
+    if l.pause.is_positive() {
+        // Two bars, the sign everything uses — dimmed like the resting
+        // triangle, in its green so the pair read as one machine.
+        let r = l.pause;
+        let c = r.center();
+        let bw = r.width() * 0.24;
+        let gap = bw * 0.7;
+        let col = toward(PLAY_GREEN, p.bg, if view.playing { 0.0 } else { 0.35 });
+        for side in [-1.0_f32, 1.0] {
+            painter.rect_filled(
+                Rect::from_center_size(
+                    Pos2::new(c.x + side * (gap + bw) * 0.5, c.y),
+                    Vec2::new(bw, r.height() * 0.86),
+                ),
+                1.0,
+                col,
+            );
+        }
     }
     if l.stop.is_positive() {
         // Present in BOTH layouts, in the same place. A stop button that only
@@ -2052,6 +2050,26 @@ fn draw_capture(painter: &Painter, r: Rect, active: bool, p: &Palette) {
         painter.circle_filled(c, hub, p.bg);
         painter.circle_stroke(c, hub, Stroke::new(1.0_f32, p.line));
     }
+}
+
+/// The folder: a tab and a body, the sign every file manager uses —
+/// dimmed like the resting transport, in the band's own ink.
+fn draw_folder(painter: &Painter, r: Rect, p: &Palette) {
+    if !r.is_positive() {
+        return;
+    }
+    let body = Rect::from_min_max(
+        Pos2::new(r.left() + r.width() * 0.06, r.top() + r.height() * 0.30),
+        Pos2::new(r.right() - r.width() * 0.06, r.bottom() - r.height() * 0.14),
+    );
+    let tab = Rect::from_min_max(
+        Pos2::new(body.left(), r.top() + r.height() * 0.16),
+        Pos2::new(body.left() + body.width() * 0.45, body.top() + 1.0),
+    );
+    let col = toward(p.ink, p.bg, 0.35);
+    painter.rect_filled(tab, 1.0, col);
+    painter.rect_filled(body, 1.5, col);
+    painter.rect_stroke(body, 1.5, Stroke::new(1.2_f32, p.line), egui::StrokeKind::Inside);
 }
 
 // ── the monitor ────────────────────────────────────────────────────────────
@@ -2379,9 +2397,19 @@ pub fn timeline_rect(rect: Rect, view: &RecorderView<'_>) -> Rect {
 const LCD_GREEN: Color32 = Color32::from_rgb(0xA3, 0xE0, 0x48);
 const LCD_FACE: Color32 = Color32::from_rgb(0x0B, 0x0E, 0x0A);
 
-/// `seconds` as `bars| beats| thousandths`, counted from the band's tempo
-/// and time signature — the transport's own musical clock.
+/// `seconds` as `bars| beats| thousandths` — the parts, joined.
 pub fn bars_beats(seconds: f64, bpm: f64, sig: crate::recorder::TimeSignature) -> String {
+    let (b, bt, th) = bars_beats_parts(seconds, bpm, sig);
+    format!("{b}| {bt}| {th:03}")
+}
+
+/// `seconds` as its three musical parts: bar, beat (both from one), and
+/// thousandths of a beat.
+pub fn bars_beats_parts(
+    seconds: f64,
+    bpm: f64,
+    sig: crate::recorder::TimeSignature,
+) -> (u64, u64, u64) {
     let unit = f64::from(sig.unit.max(1));
     let per_beat = (60.0 / bpm.clamp(20.0, 400.0)) * (4.0 / unit);
     let beats = seconds.max(0.0) / per_beat.max(1.0e-9);
@@ -2390,40 +2418,64 @@ pub fn bars_beats(seconds: f64, bpm: f64, sig: crate::recorder::TimeSignature) -
     let in_bar = beats - bar as f64 * per_bar;
     let beat = (in_bar as u64).min(sig.beats.max(1) as u64 - 1);
     let thou = (((in_bar - beat as f64) * 1000.0) as u64).min(999);
-    format!("{}| {}| {:03}", bar + 1, beat + 1, thou)
+    (bar + 1, beat + 1, thou)
 }
 
-/// The REAPER cluster: the big musical position, minutes:seconds under it,
-/// and the Start / End / Length of the SELECTED clip on the right — zeros
-/// when nothing is selected, exactly as the owner's transport shows an
-/// empty time selection.
+/// The rows and the PART CELLS of the LCD's right half: three rows —
+/// Start, End, Length of the arrangement's viewport — each value in three
+/// draggable cells (bars, beats, thousandths). One function for drawing
+/// and hit-testing, so the hand and the picture cannot drift.
+pub fn lcd_part_cells(lcd: Rect) -> [[Rect; 3]; 3] {
+    let side = slice_h(lcd, 0.50, 0.99);
+    std::array::from_fn(|row| {
+        let r = slice_v(side, 0.06 + 0.30 * row as f32, 0.06 + 0.30 * (row as f32 + 1.0));
+        // The label owns the left third; the value cells the rest.
+        let v = slice_h(r, 0.30, 1.0);
+        let cuts = [0.0, 0.42, 0.66, 1.0];
+        std::array::from_fn(|part| slice_h(v, cuts[part], cuts[part + 1]))
+    })
+}
+
+/// Which LCD part a press landed on: `(row, part)`, rows Start/End/Length.
+pub fn lcd_part_at(rect: Rect, view: &RecorderView<'_>, pos: Pos2) -> Option<(u8, u8)> {
+    let l = Layout::new(rect, view);
+    if !l.lcd.is_positive() || !l.lcd.contains(pos) {
+        return None;
+    }
+    for (row, cells) in lcd_part_cells(l.lcd).iter().enumerate() {
+        for (part, cell) in cells.iter().enumerate() {
+            if cell.is_positive() && cell.contains(pos) {
+                return Some((row as u8, part as u8));
+            }
+        }
+    }
+    None
+}
+
+/// The REAPER cluster, whole-box edition: the big musical position with
+/// minutes:seconds under it on the left, and the VIEWPORT's Start / End /
+/// Length on the right — live numbers whether or not a single clip
+/// exists, every part draggable by the unit it shows.
 fn draw_timecode_cluster(painter: &Painter, r: Rect, view: &RecorderView<'_>, p: &Palette) {
     if !r.is_positive() {
         return;
     }
     painter.rect_filled(r, 2.0, LCD_FACE);
-    painter.rect_stroke(r, 2.0, Stroke::new(1.0_f32, p.line), StrokeKind::Inside);
-    let main = slice_h(r, 0.02, 0.56);
-    let side = slice_h(r, 0.58, 0.99);
-    painter.rect_filled(rule_x(r, r.left() + r.width() * 0.57), 0.0, p.line.gamma_multiply(0.5));
-    // The big number: where the playhead stands, musically. As large as
-    // the face allows — the number somebody reads from the bench.
-    let big = bars_beats(view.position_s, view.tempo_bpm, view.time_signature);
-    let big_box = slice_v(main, 0.06, 0.66);
-    let size = fit_text(big_box, &big, big_box.height() * 0.72);
+    painter.rect_stroke(r, 2.0, Stroke::new(1.0_f32, p.line), egui::StrokeKind::Inside);
+    let main = slice_h(r, 0.02, 0.48);
+    painter.rect_filled(rule_x(r, r.left() + r.width() * 0.49), 0.0, p.line.gamma_multiply(0.5));
+    let font = |size: f32| FontId::monospace(size);
+    // The big number: where the playhead stands, musically — as large as
+    // the face allows, the number somebody reads from the bench.
+    let (b, bt, th) = bars_beats_parts(view.position_s, view.tempo_bpm, view.time_signature);
+    let big = format!("{b}| {bt}| {th:03}");
+    let big_box = slice_v(main, 0.05, 0.68);
+    let size = fit_text(big_box, &big, big_box.height() * 0.78);
     if size >= MIN_TEXT {
-        painter.text(
-            big_box.center(),
-            Align2::CENTER_CENTER,
-            &big,
-            font(size),
-            LCD_GREEN,
-        );
-        // And the wall clock under it, dimmer: the doc promised the readout
-        // still says minutes:seconds somewhere a glance finds it.
-        let small_box = slice_v(main, 0.66, 0.97);
+        painter.text(big_box.center(), Align2::CENTER_CENTER, &big, font(size), LCD_GREEN);
+        let small_box = slice_v(main, 0.68, 0.98);
         let clock = time_text(view.position_s);
-        let ssize = fit_text(small_box, &clock, small_box.height() * 0.62);
+        let ssize = fit_text(small_box, &clock, small_box.height() * 0.6);
         if ssize >= MIN_TEXT {
             painter.text(
                 small_box.center(),
@@ -2434,36 +2486,53 @@ fn draw_timecode_cluster(painter: &Painter, r: Rect, view: &RecorderView<'_>, p:
             );
         }
     }
-    // Start / End / Length, of the selected clip.
-    let (start, len) = view.sel_clip.unwrap_or((0.0, 0.0));
-    let rows = [
-        ("Start", start),
-        ("End", start + len),
-        ("Length", len),
-    ];
+    // Start / End / Length of the VIEWPORT — the timeline's own numbers,
+    // never a clip's, live even over an empty song.
+    let (win_s, win_l) = view.view_window;
+    let rows = [("Start", win_s), ("End", win_s + win_l), ("Length", win_l)];
+    let side = slice_h(r, 0.50, 0.99);
+    let cells = lcd_part_cells(r);
     for (i, (label, secs)) in rows.iter().enumerate() {
-        let row = slice_v(side, 0.05 + 0.30 * i as f32, 0.05 + 0.30 * (i as f32 + 1.0));
-        let value = if view.sel_clip.is_some() {
-            bars_beats(*secs, view.tempo_bpm, view.time_signature)
-        } else {
-            "0| 0| 000".to_owned()
-        };
-        let size = fit_text(row, &format!("{label}  {value}"), row.height() * 0.66);
-        if size >= MIN_TEXT {
+        let row = slice_v(side, 0.06 + 0.30 * i as f32, 0.06 + 0.30 * (i as f32 + 1.0));
+        let lab = slice_h(row, 0.0, 0.30);
+        let lsize = fit_text(lab, label, row.height() * 0.5);
+        if lsize >= MIN_TEXT {
             painter.text(
-                Pos2::new(row.left(), row.center().y),
+                Pos2::new(lab.left() + 2.0, lab.center().y),
                 Align2::LEFT_CENTER,
                 *label,
-                font(size),
+                font(lsize),
                 LCD_GREEN.gamma_multiply(0.45),
             );
-            painter.text(
-                Pos2::new(row.right(), row.center().y),
-                Align2::RIGHT_CENTER,
-                &value,
-                font(size),
-                LCD_GREEN,
-            );
+        }
+        // Start and End are POSITIONS and count from one; Length is a
+        // DURATION and counts from zero — thirty bars long is 30, not 31.
+        let (b, bt, th) = bars_beats_parts(*secs, view.tempo_bpm, view.time_signature);
+        let (b, bt) = if i == 2 { (b - 1, bt - 1) } else { (b, bt) };
+        let words = [format!("{b}"), format!("{bt}"), format!("{th:03}")];
+        for (part, cell) in cells[i].iter().enumerate() {
+            if !cell.is_positive() {
+                continue;
+            }
+            let csize = fit_text(*cell, &words[part], cell.height() * 0.58);
+            if csize >= MIN_TEXT {
+                painter.text(
+                    Pos2::new(cell.right() - 3.0, cell.center().y),
+                    Align2::RIGHT_CENTER,
+                    &words[part],
+                    font(csize),
+                    LCD_GREEN,
+                );
+            }
+            if part < 2 {
+                painter.text(
+                    Pos2::new(cell.right() - 0.5, cell.center().y),
+                    Align2::LEFT_CENTER,
+                    "|",
+                    font(csize.max(8.0) * 0.9),
+                    LCD_GREEN.gamma_multiply(0.4),
+                );
+            }
         }
     }
 }
@@ -5455,73 +5524,42 @@ mod tests {
     }
 
     #[test]
-    fn the_timeline_locates_loaded_and_is_nobodys_button_empty() {
+    fn the_lcd_owns_the_box_and_every_part_is_under_a_hand() {
         let r = band(1300.0);
-        let empty = idle();
-        let le = Layout::new(r, &empty);
-        assert!(le.timeline.is_positive(), "the timeline has no box");
-        assert!(le.lcd.is_positive(), "the LCD cluster has no box");
-        assert!(
-            le.lcd.right() <= le.timeline.left(),
-            "the cluster stands ON the scrubber"
-        );
-        // Empty is QUIET. The import invitation retired with the backing
-        // track — audio arrives by dropping it on a lane — so a click on
-        // the empty box must do nothing at all.
-        assert_eq!(
-            hit_test(r, &empty, le.timeline.center()),
-            None,
-            "an empty timeline still answers a click"
-        );
-
-        let v = furnished();
+        let v = idle();
         let l = Layout::new(r, &v);
-        assert_eq!(le.timeline, l.timeline, "loading a file moved the box");
-        match hit_test(r, &v, l.timeline.center()) {
-            Some(Hit::SeekTimeline(t)) => {
-                assert!((t - 0.5).abs() < 0.01, "the middle read as {t}");
+        // The overview stands down: the whole box is the LCD, and the old
+        // seek surface answers nothing.
+        assert!(l.lcd.is_positive(), "the LCD has no box");
+        assert!(!l.timeline.is_positive(), "the overview is still laid out");
+        assert_eq!(
+            hit_test(r, &v, l.lcd.center()),
+            None,
+            "the LCD is drag cells, not a band hit"
+        );
+        // Nine cells — Start/End/Length by bars/beats/thousandths — each
+        // resolvable at its own centre, none overlapping another.
+        let cells = lcd_part_cells(l.lcd);
+        let mut seen: Vec<Rect> = Vec::new();
+        for (row, parts) in cells.iter().enumerate() {
+            for (part, cell) in parts.iter().enumerate() {
+                assert!(cell.is_positive(), "cell {row}/{part} has no room");
+                assert_eq!(
+                    lcd_part_at(r, &v, cell.center()),
+                    Some((row as u8, part as u8)),
+                    "cell {row}/{part} does not answer at its own centre"
+                );
+                for other in &seen {
+                    assert!(
+                        other.intersect(*cell).area() < 1.0,
+                        "cell {row}/{part} overlaps a neighbour"
+                    );
+                }
+                seen.push(*cell);
             }
-            other => panic!("a click on the loaded timeline answered {other:?}"),
         }
-        // Both ends are reachable: the first second and the last.
-        match hit_test(r, &v, Pos2::new(l.timeline.left(), l.timeline.center().y)) {
-            Some(Hit::SeekTimeline(t)) => assert!(t.abs() < 1.0e-6),
-            other => panic!("the left edge answered {other:?}"),
-        }
-        match hit_test(r, &v, Pos2::new(l.timeline.right(), l.timeline.center().y)) {
-            Some(Hit::SeekTimeline(t)) => assert!((t - 1.0).abs() < 1.0e-6),
-            other => panic!("the right edge answered {other:?}"),
-        }
-
-        // Rolling: dead, both faces.
-        assert_eq!(
-            hit_test(r, &furnished_rolling(), l.timeline.center()),
-            None,
-            "the timeline is clickable mid-take"
-        );
-
-        // **The × in the corner: remove, not locate.** Only with a file
-        // loaded, and never mid-take.
-        assert!(l.timeline_close.is_positive(), "the loaded box has no ×");
-        assert!(
-            l.timeline.contains(l.timeline_close.center()),
-            "the × wandered off its own timeline"
-        );
-        assert_eq!(
-            hit_test(r, &v, l.timeline_close.center()),
-            Some(Hit::ClearTrack),
-            "the corner does not remove the file"
-        );
-        assert_eq!(
-            hit_test(r, &empty, le.timeline_close.center()),
-            None,
-            "an empty timeline's corner should answer nothing"
-        );
-        assert_eq!(
-            hit_test(r, &furnished_rolling(), l.timeline_close.center()),
-            None,
-            "the × is pressable mid-take"
-        );
+        // And outside the LCD, no part answers.
+        assert_eq!(lcd_part_at(r, &v, Pos2::new(r.left() + 1.0, r.top() + 1.0)), None);
     }
 
     /// **The musical clock counts the way a musician does.** Bar and beat
@@ -5648,10 +5686,7 @@ mod tests {
             );
             assert!(l.meter.is_positive(), "the meter went away in {state:?}");
             assert!(l.stop.is_positive(), "the transport went away in {state:?}");
-            assert!(
-                l.timeline.is_positive(),
-                "the timeline went away in {state:?}"
-            );
+            assert!(l.lcd.is_positive(), "the LCD went away in {state:?}");
         }
     }
 
@@ -5902,7 +5937,7 @@ mod tests {
                                 position_s: 0.0,
                                 playing: false,
                                 arr_recording: false,
-                                sel_clip: None,
+                                view_window: (0.0, 60.0),
                                 input_monitor: false,
                                 scrub: crate::recorder::ScrubView::default(),
                                 state,

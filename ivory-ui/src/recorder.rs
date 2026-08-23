@@ -209,9 +209,10 @@ pub struct RecorderView<'a> {
     /// Armed lanes are being recorded into the arrangement — the red
     /// button's lit state. Not the capture-take's `state`.
     pub arr_recording: bool,
-    /// The selected clip's `(start_s, len_s)`, for the LCD cluster's
-    /// Start/End/Length rows. `None` draws as zeros.
-    pub sel_clip: Option<(f64, f64)>,
+    /// The arrangement viewport's `(start_s, len_s)` — the LCD's
+    /// Start/End/Length rows are the TIMELINE's, never a clip's, and they
+    /// are live whether or not a single clip exists.
+    pub view_window: (f64, f64),
     pub meters: Meters,
     /// The OUTPUT's levels — after the effects, after the limiter, after the
     /// master, click included. Not the same signal as `meters`, which is what
@@ -331,7 +332,7 @@ impl RecorderView<'_> {
             position_s: 0.0,
             playing: false,
             arr_recording: false,
-            sel_clip: None,
+            view_window: (0.0, 60.0),
             meters: Meters::SILENT,
             master: Meters::SILENT,
             gr_db: 0.0,
@@ -914,7 +915,7 @@ impl RecorderState {
             position_s: self.position_s,
             playing: self.playing,
             arr_recording: self.arr_recording,
-            sel_clip: None,
+            view_window: (0.0, 60.0),
             meters: self.meters,
             master: self.master,
             gr_db: self.gr_db,
@@ -1048,6 +1049,10 @@ pub enum RecorderRequest {
     /// distinct Stop control and "the button that stops it" must not also be
     /// able to start one.
     Stop,
+    /// PAUSE: hold the playhead where it stands. Ignored while any record
+    /// owns the transport — a pause mid-record would let the capture run
+    /// past the playhead.
+    Pause,
     /// Put out every clip latch: the user has seen it.
     DismissClip,
     /// Open one insert's OWN editor — the plugin's window, with its presets

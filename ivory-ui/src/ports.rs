@@ -361,6 +361,31 @@ pub enum SavePurpose {
     /// Duplicate the whole open project — document and media — to the
     /// chosen place, and open the copy.
     ProjectCopy,
+    /// Save the open project as a TEMPLATE. Only the NAME is honoured:
+    /// templates live under `Projects/Templates/<name>` wherever the panel
+    /// was pointed, and saving one called `default` replaces the session
+    /// every New Project clones.
+    Template,
+}
+
+/// A project action the HOST must run whole — it owns the plugin states
+/// and the template shelf, so the app only asks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectRequest {
+    /// Clone the `default` template into a fresh Untitled and open it.
+    New,
+    /// Write everything down now: plugin states to the project's shelf,
+    /// the desk into the document.
+    Save,
+    /// `Save`, then copy the whole session folder to
+    /// `Projects/Templates/<name>`, replacing what was there.
+    Template(String),
+    /// Bounce the arrangement to one WAV in `<project>/export/` — a real
+    /// pass through the engine, racks and limiter included.
+    ExportTrack,
+    /// The same pass, but every used lane lands in its own WAV under
+    /// `<project>/export/stems/`.
+    ExportStems,
 }
 
 /// Why a folder is being asked for.

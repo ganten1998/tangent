@@ -375,7 +375,7 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             ("A-DRG", "alt-drag empty room: move the viewport"),
             ("C-WHL", "cmd: pan along the song"),
             ("CA-WHL", "ctrl+alt: grid finer or coarser"),
-            ("NAV", "corner box: drag scrolls · up zooms in"),
+            ("NAV", "corner box: drag left/right scrolls · up/down zooms"),
         ]),
         HelpView::MidiEdit => rows.extend([
             ("DRAG", "draw a note · body moves · right edge stretches"),
