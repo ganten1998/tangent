@@ -892,6 +892,13 @@ pub struct Settings {
     pub arr_snap: bool,
     /// The grid, in bars as a power of two: 3 = 8 bars … 0 = 1 … -5 = 1/32.
     pub arr_grid_exp: i64,
+    /// The MIDI editor's own magnet, grid size and grid shape. Separate
+    /// from the arrangement's on purpose: note grids run finer than clip
+    /// grids, and toggling one surface must not surprise the other.
+    pub midi_snap: bool,
+    pub midi_grid_exp: i64,
+    pub midi_swing: bool,
+    pub midi_triplet: bool,
     /// Transpose, in semitones, applied to every note the display and the
     /// chord detector see.
     ///
@@ -1133,6 +1140,10 @@ impl Default for Settings {
             project_path: String::new(),
             arr_snap: true,
             arr_grid_exp: 0,
+            midi_snap: true,
+            midi_grid_exp: -4,
+            midi_swing: false,
+            midi_triplet: false,
             transpose: 0,
             show_transpose: true,
             metronome_on: false,
@@ -1846,6 +1857,12 @@ impl Settings {
         if let Some(n) = map.shift_remove("arr_grid_exp").and_then(|v| v.as_i64()) {
             s.arr_grid_exp = n.clamp(-5, 3);
         }
+        take_bool(&mut map, "midi_snap", &mut s.midi_snap);
+        if let Some(n) = map.shift_remove("midi_grid_exp").and_then(|v| v.as_i64()) {
+            s.midi_grid_exp = n.clamp(-6, 3);
+        }
+        take_bool(&mut map, "midi_swing", &mut s.midi_swing);
+        take_bool(&mut map, "midi_triplet", &mut s.midi_triplet);
         if let Some(Value::String(path)) = map.shift_remove("track_path") {
             s.track_path = path;
         }
@@ -2436,6 +2453,10 @@ impl Settings {
         );
         map.insert("arr_snap".into(), Value::Bool(self.arr_snap));
         map.insert("arr_grid_exp".into(), Value::from(self.arr_grid_exp));
+        map.insert("midi_snap".into(), Value::Bool(self.midi_snap));
+        map.insert("midi_grid_exp".into(), Value::from(self.midi_grid_exp));
+        map.insert("midi_swing".into(), Value::Bool(self.midi_swing));
+        map.insert("midi_triplet".into(), Value::Bool(self.midi_triplet));
         for (key, gain) in [
             ("metronome_gain", self.metronome_gain),
             ("master_gain", self.master_gain),

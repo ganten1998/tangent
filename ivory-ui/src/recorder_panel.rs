@@ -310,6 +310,9 @@ struct Layout {
     /// to import. It is the first face of the arrangement, so it is drawn as
     /// one lane of a thing that will one day show several.
     timeline: Rect,
+    /// The LCD cluster on the timeline's left: the big bars|beats readout
+    /// and the Start/End/Length panel — the owner's REAPER transport.
+    lcd: Rect,
     /// Whether a file is loaded, which decides what a click on the timeline
     /// MEANS: a locate when there is something to locate in, the import
     /// dialog when there is not. Layout state rather than a view lookup so
@@ -446,6 +449,7 @@ impl Layout {
             meter: Rect::NOTHING,
             timecode: Rect::NOTHING,
             timeline: Rect::NOTHING,
+            lcd: Rect::NOTHING,
             timeline_loaded: false,
             timeline_close: Rect::NOTHING,
             master_scale: [Rect::NOTHING; 2],
@@ -674,7 +678,18 @@ impl Layout {
         // band. Click it to locate; click it empty to import. It is the first
         // face of the arrangement, drawn as one lane of a thing that will one
         // day show several.
-        self.timeline = slice_v(col, 0.02, 0.66);
+        let tl_box = slice_v(col, 0.02, 0.66);
+        // **The LCD cluster first, off the box's left** — the big
+        // bars|beats|thousandths readout with the Start/End/Length panel
+        // beside it, the owner's REAPER transport brought over. The
+        // scrubber keeps the rest. Wide enough to read its digits, never
+        // more than a third of the box.
+        let lcd_w = (tl_box.height() * 2.3).min(tl_box.width() * 0.34);
+        self.lcd = Rect::from_min_size(tl_box.min, Vec2::new(lcd_w, tl_box.height()));
+        self.timeline = Rect::from_min_max(
+            Pos2::new(self.lcd.right() + tl_box.width() * 0.012, tl_box.top()),
+            tl_box.max,
+        );
         // The × that unloads the file, in the timeline's own corner. Placed
         // beside the timeline so the glyph and the target cannot drift.
         let side = (self.timeline.height() * 0.16).clamp(10.0, 15.0);
@@ -1034,18 +1049,19 @@ impl Layout {
             (self.setup, Fixed(Hit::OpenSetup)),
             // The timeline. Loaded, a click is a LOCATE — the fraction along
             // the box, which is the fraction into the file, because the box
-            // IS the time axis. Empty, the whole box is the import button.
+            // IS the time axis. Empty it is nobody's button: the import
+            // invitation retired with the backing track, and audio arrives
+            // by DROPPING it on a lane.
             //
             // **Not while a take is rolling.** Moving the playhead under a
-            // running take would tear the file, and the import dialog is
-            // modal over the one gesture that matters then, which is Stop.
+            // running take would tear the file.
             (
-                if self.rolling { Rect::NOTHING } else { self.timeline },
-                if self.timeline_loaded {
-                    Along(Hit::SeekTimeline)
+                if self.rolling || !self.timeline_loaded {
+                    Rect::NOTHING
                 } else {
-                    Fixed(Hit::ImportTrack)
+                    self.timeline
                 },
+                Along(Hit::SeekTimeline),
             ),
             // Up the cell for more, which is the direction every knob in every
             // studio turns and the direction the two faders beside them move.
@@ -1173,7 +1189,6 @@ pub enum Hit {
     Type(NumField),
     /// Choose an audio file to play along to. The empty timeline is the
     /// button: a box that says what a click will do, where the file will show.
-    ImportTrack,
     /// Put the playhead HERE — how far along the timeline the press landed,
     /// 0..=1 of the file's length. A click on the waveform is a locate: where
     /// you point is where play auditions from and where record starts
@@ -1244,7 +1259,7 @@ impl Hit {
     ///
     /// The four per-slot controls appear once per slot, because "reachable" is
     /// a question about slot 2 that slot 0 cannot answer for it.
-    pub const ALL: [Hit; 28] = [
+    pub const ALL: [Hit; 27] = [
         Hit::Play,
         Hit::Record,
         Hit::Stop,
@@ -1260,7 +1275,6 @@ impl Hit {
         Hit::Export,
         Hit::ToggleMetronomeInTake,
         Hit::SetMaster(Hit::MIDWAY),
-        Hit::ImportTrack,
         Hit::SeekTimeline(Hit::MIDWAY),
         Hit::ClearTrack,
         Hit::Type(NumField::Tempo),
@@ -1301,7 +1315,6 @@ impl Hit {
             Hit::SetMaster(_) => "Master  -  right-click to type, double-click for 0 dB",
             Hit::DismissClip => "Levels  -  click to clear the clip lamp",
             Hit::Type(_) => "Click to type a number",
-            Hit::ImportTrack => "Backing track  -  click to choose a file",
             Hit::SeekTimeline(_) => "Backing track  -  click to set the playhead",
             Hit::ClearTrack => "Backing track  -  remove the file",
             Hit::SetTempo(_) => "Tempo",
@@ -2048,6 +2061,7 @@ fn draw_monitor(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Pale
     // instruments live on the desk now and the click, the input and the
     // backing track are channels there, each with a real fader. What this
     // band shows instead is WHEN.
+    draw_timecode_cluster(painter, l.lcd, view, p);
     draw_timeline(painter, l.timeline, view, p);
     // The ×, only when it can be pressed: a file loaded and no take rolling.
     if l.timeline_close.is_positive() && l.timeline_loaded && !l.rolling {
@@ -2118,17 +2132,39 @@ fn draw_timeline(painter: &Painter, r: Rect, view: &RecorderView<'_>, p: &Palett
     }
     let track = view.track;
     painter.rect_filled(r, 2.0, METER_FACE);
-    if track.wave.is_empty() {
-        let msg = if track.is_empty() {
-            "click to import a backing track"
-        } else {
-            // Imported but unreadable — `TrackInfo::error` says why in the
-            // status line; this box only says it is not showing a wave.
-            &track.name
-        };
-        let size = fit_text(r, msg, r.height() * 0.16);
-        if size >= MIN_TEXT {
-            painter.text(r.center(), Align2::CENTER_CENTER, msg, font(size), p.faint);
+    if track.wave.is_empty() && view.scrub.blocks.is_empty() {
+        // **The arrangement's empty field.** Eight faint lanes with nothing
+        // standing on them — the same face the overview wears, minus the
+        // clips. The import invitation died with the backing track: audio
+        // arrives by dropping it on a lane, and an empty box that begs for
+        // a file it can no longer mean is worse than a quiet one.
+        let row_h = r.height() / crate::recorder::CHANNELS as f32;
+        for i in 0..crate::recorder::CHANNELS {
+            if i % 2 == 1 {
+                let y = r.top() + row_h * i as f32;
+                painter.rect_filled(
+                    Rect::from_min_max(
+                        Pos2::new(r.left(), y),
+                        Pos2::new(r.right(), y + row_h),
+                    ),
+                    0.0,
+                    Color32::from_rgba_unmultiplied(0xff, 0xf4, 0xe0, 8),
+                );
+            }
+        }
+        // A file that imported but would not decode still says its name —
+        // `TrackInfo::error` carries the why in the status line.
+        if !track.is_empty() {
+            let size = fit_text(r, &track.name, r.height() * 0.14);
+            if size >= MIN_TEXT {
+                painter.text(
+                    r.center(),
+                    Align2::CENTER_CENTER,
+                    &track.name,
+                    font(size),
+                    p.faint,
+                );
+            }
         }
         return;
     }
@@ -2327,6 +2363,98 @@ pub fn timeline_viewport_rect(rect: Rect, view: &RecorderView<'_>) -> Rect {
 /// The timeline's own rectangle, for gestures that map a pointer to it.
 pub fn timeline_rect(rect: Rect, view: &RecorderView<'_>) -> Rect {
     Layout::new(rect, view).timeline
+}
+
+/// The LCD's green — the one colour on the cluster's black face.
+const LCD_GREEN: Color32 = Color32::from_rgb(0xA3, 0xE0, 0x48);
+const LCD_FACE: Color32 = Color32::from_rgb(0x0B, 0x0E, 0x0A);
+
+/// `seconds` as `bars| beats| thousandths`, counted from the band's tempo
+/// and time signature — the transport's own musical clock.
+pub fn bars_beats(seconds: f64, bpm: f64, sig: crate::recorder::TimeSignature) -> String {
+    let unit = f64::from(sig.unit.max(1));
+    let per_beat = (60.0 / bpm.clamp(20.0, 400.0)) * (4.0 / unit);
+    let beats = seconds.max(0.0) / per_beat.max(1.0e-9);
+    let per_bar = f64::from(sig.beats.max(1));
+    let bar = (beats / per_bar) as u64;
+    let in_bar = beats - bar as f64 * per_bar;
+    let beat = (in_bar as u64).min(sig.beats.max(1) as u64 - 1);
+    let thou = (((in_bar - beat as f64) * 1000.0) as u64).min(999);
+    format!("{}| {}| {:03}", bar + 1, beat + 1, thou)
+}
+
+/// The REAPER cluster: the big musical position, minutes:seconds under it,
+/// and the Start / End / Length of the SELECTED clip on the right — zeros
+/// when nothing is selected, exactly as the owner's transport shows an
+/// empty time selection.
+fn draw_timecode_cluster(painter: &Painter, r: Rect, view: &RecorderView<'_>, p: &Palette) {
+    if !r.is_positive() {
+        return;
+    }
+    painter.rect_filled(r, 2.0, LCD_FACE);
+    painter.rect_stroke(r, 2.0, Stroke::new(1.0_f32, p.line), StrokeKind::Inside);
+    let main = slice_h(r, 0.02, 0.55);
+    let side = slice_h(r, 0.57, 0.99);
+    painter.rect_filled(rule_x(r, r.left() + r.width() * 0.56), 0.0, p.line.gamma_multiply(0.5));
+    // The big number: where the playhead stands, musically.
+    let big = bars_beats(view.position_s, view.tempo_bpm, view.time_signature);
+    let big_box = slice_v(main, 0.10, 0.68);
+    let size = fit_text(big_box, &big, big_box.height() * 0.62);
+    if size >= MIN_TEXT {
+        painter.text(
+            big_box.center(),
+            Align2::CENTER_CENTER,
+            &big,
+            font(size),
+            LCD_GREEN,
+        );
+        // And the wall clock under it, dimmer: the doc promised the readout
+        // still says minutes:seconds somewhere a glance finds it.
+        let small_box = slice_v(main, 0.66, 0.95);
+        let clock = time_text(view.position_s);
+        let ssize = fit_text(small_box, &clock, small_box.height() * 0.55);
+        if ssize >= MIN_TEXT {
+            painter.text(
+                small_box.center(),
+                Align2::CENTER_CENTER,
+                &clock,
+                font(ssize),
+                LCD_GREEN.gamma_multiply(0.55),
+            );
+        }
+    }
+    // Start / End / Length, of the selected clip.
+    let (start, len) = view.sel_clip.unwrap_or((0.0, 0.0));
+    let rows = [
+        ("Start", start),
+        ("End", start + len),
+        ("Length", len),
+    ];
+    for (i, (label, secs)) in rows.iter().enumerate() {
+        let row = slice_v(side, 0.08 + 0.28 * i as f32, 0.08 + 0.28 * (i as f32 + 1.0));
+        let value = if view.sel_clip.is_some() {
+            bars_beats(*secs, view.tempo_bpm, view.time_signature)
+        } else {
+            "0| 0| 000".to_owned()
+        };
+        let size = fit_text(row, &format!("{label}  {value}"), row.height() * 0.62);
+        if size >= MIN_TEXT {
+            painter.text(
+                Pos2::new(row.left(), row.center().y),
+                Align2::LEFT_CENTER,
+                *label,
+                font(size),
+                LCD_GREEN.gamma_multiply(0.45),
+            );
+            painter.text(
+                Pos2::new(row.right(), row.center().y),
+                Align2::RIGHT_CENTER,
+                &value,
+                font(size),
+                LCD_GREEN,
+            );
+        }
+    }
 }
 
 // ── the instrument slots ───────────────────────────────────────────────────
@@ -5075,21 +5203,6 @@ mod tests {
                 if matches!(want, Hit::Type(_)) {
                     continue;
                 }
-                // The timeline is ONE rectangle wearing two hits: the import
-                // when nothing is loaded, the locate when something is. The
-                // fixture here is furnished, so the import has no row in it;
-                // `the_timeline_imports_empty_and_locates_loaded` proves the
-                // empty half.
-                if want.is_same_control(Hit::ImportTrack) {
-                    let empty = Layout::new(r, &idle());
-                    let (rect, _) = empty
-                        .targets()
-                        .into_iter()
-                        .find(|(_, k)| k.control().is_same_control(want))
-                        .expect("the import is in the empty layout's targets");
-                    assert!(rect.is_positive(), "no import box while empty");
-                    continue;
-                }
                 // The × is a hit-test PRE-PASS, not a target: it sits on the
                 // seek surface, whose fraction is measured against the whole
                 // timeline, so it cannot be carved out of `targets` without
@@ -5331,15 +5444,23 @@ mod tests {
     }
 
     #[test]
-    fn the_timeline_imports_empty_and_locates_loaded() {
+    fn the_timeline_locates_loaded_and_is_nobodys_button_empty() {
         let r = band(1300.0);
         let empty = idle();
         let le = Layout::new(r, &empty);
         assert!(le.timeline.is_positive(), "the timeline has no box");
+        assert!(le.lcd.is_positive(), "the LCD cluster has no box");
+        assert!(
+            le.lcd.right() <= le.timeline.left(),
+            "the cluster stands ON the scrubber"
+        );
+        // Empty is QUIET. The import invitation retired with the backing
+        // track — audio arrives by dropping it on a lane — so a click on
+        // the empty box must do nothing at all.
         assert_eq!(
             hit_test(r, &empty, le.timeline.center()),
-            Some(Hit::ImportTrack),
-            "an empty timeline is not the import button"
+            None,
+            "an empty timeline still answers a click"
         );
 
         let v = furnished();
@@ -5369,8 +5490,7 @@ mod tests {
         );
 
         // **The × in the corner: remove, not locate.** Only with a file
-        // loaded, and never mid-take — a press on the corner while empty is
-        // the import like everywhere else on the box.
+        // loaded, and never mid-take.
         assert!(l.timeline_close.is_positive(), "the loaded box has no ×");
         assert!(
             l.timeline.contains(l.timeline_close.center()),
@@ -5383,14 +5503,34 @@ mod tests {
         );
         assert_eq!(
             hit_test(r, &empty, le.timeline_close.center()),
-            Some(Hit::ImportTrack),
-            "an empty timeline's corner should still be the import"
+            None,
+            "an empty timeline's corner should answer nothing"
         );
         assert_eq!(
             hit_test(r, &furnished_rolling(), l.timeline_close.center()),
             None,
             "the × is pressable mid-take"
         );
+    }
+
+    /// **The musical clock counts the way a musician does.** Bar and beat
+    /// from one, thousandths of a beat, honouring the time signature's
+    /// bottom number — and never a beat past the bar.
+    #[test]
+    fn bars_beats_counts_from_one_and_honours_the_signature() {
+        use crate::recorder::TimeSignature;
+        let common = TimeSignature { beats: 4, unit: 4 };
+        // 120 bpm: a beat is half a second, a bar two seconds.
+        assert_eq!(bars_beats(0.0, 120.0, common), "1| 1| 000");
+        assert_eq!(bars_beats(0.5, 120.0, common), "1| 2| 000");
+        assert_eq!(bars_beats(2.0, 120.0, common), "2| 1| 000");
+        assert_eq!(bars_beats(2.25, 120.0, common), "2| 1| 500");
+        // 6/8 at 120: the beat is an EIGHTH, a quarter second.
+        let six8 = TimeSignature { beats: 6, unit: 8 };
+        assert_eq!(bars_beats(0.25, 120.0, six8), "1| 2| 000");
+        assert_eq!(bars_beats(1.5, 120.0, six8), "2| 1| 000");
+        // Never negative, never a beat out of range.
+        assert_eq!(bars_beats(-3.0, 120.0, common), "1| 1| 000");
     }
 
     /// The clock the setting hides is a CLOCK. The count-in beat is the number
@@ -5751,6 +5891,7 @@ mod tests {
                                 position_s: 0.0,
                                 playing: false,
                                 arr_recording: false,
+                                sel_clip: None,
                                 input_monitor: false,
                                 scrub: crate::recorder::ScrubView::default(),
                                 state,
