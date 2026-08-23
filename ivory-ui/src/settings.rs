@@ -35,7 +35,7 @@ pub struct Rgb {
 /// the migration runs ONCE against a file written before the change, and after
 /// that the same value chosen deliberately is never touched again. A file with
 /// no stamp is version 0 — every file every previous build wrote.
-const SETTINGS_VERSION: u64 = 15;
+const SETTINGS_VERSION: u64 = 16;
 
 /// Where a desk channel written before the INPUT STRIPS ended up.
 ///
@@ -942,6 +942,8 @@ pub struct Settings {
     pub arr_snap: bool,
     /// The grid, in bars as a power of two: 3 = 8 bars … 0 = 1 … -5 = 1/32.
     pub arr_grid_exp: i64,
+    /// The arrangement header column's width in points; 0 = automatic.
+    pub arr_header_w: f64,
     /// The MIDI editor's own magnet, grid size and grid shape. Separate
     /// from the arrangement's on purpose: note grids run finer than clip
     /// grids, and toggling one surface must not surprise the other.
@@ -1204,6 +1206,7 @@ impl Default for Settings {
             project_path: String::new(),
             arr_snap: true,
             arr_grid_exp: 0,
+            arr_header_w: 0.0,
             midi_snap: true,
             midi_grid_exp: -4,
             midi_swing: false,
@@ -1957,6 +1960,9 @@ impl Settings {
         if let Some(n) = map.shift_remove("arr_grid_exp").and_then(|v| v.as_i64()) {
             s.arr_grid_exp = n.clamp(-5, 3);
         }
+        if let Some(n) = map.shift_remove("arr_header_w").and_then(|v| v.as_f64()) {
+            s.arr_header_w = n.clamp(0.0, 1000.0);
+        }
         take_bool(&mut map, "midi_snap", &mut s.midi_snap);
         if let Some(n) = map.shift_remove("midi_grid_exp").and_then(|v| v.as_i64()) {
             s.midi_grid_exp = n.clamp(-6, 3);
@@ -2103,6 +2109,25 @@ impl Settings {
             // ascending now, off at the top. The position flips so the sound
             // a file describes does not change.
             self.lpf_mix = (1.0 - self.lpf_mix).clamp(0.0, 1.0);
+        }
+        if was < 16 {
+            // **The input IS the kind now** — the owner retired the
+            // MIDI-or-AUDIO split; a track is what its input makes it, the
+            // REAPER way. A MIDI channel with no named source was implicitly
+            // "all ports", so that is what it says. An AUDIO channel with no
+            // named input rode the ordinal walk, whose guess this migration
+            // must not freeze into a binding — it keeps its kind and shows
+            // NO INPUT until somebody names one in the menu.
+            while self.channel_inputs.len() < crate::recorder::CHANNELS {
+                self.channel_inputs.push(String::new());
+            }
+            for ch in 0..crate::recorder::CHANNELS {
+                if self.channel_kinds.get(ch).copied() == Some(1)
+                    && self.channel_inputs[ch].is_empty()
+                {
+                    self.channel_inputs[ch] = "midi:all".to_owned();
+                }
+            }
         }
         if was < 9 {
             // **The limiter's dial turned round.** It used to be off at zero
@@ -2600,6 +2625,7 @@ impl Settings {
         );
         map.insert("arr_snap".into(), Value::Bool(self.arr_snap));
         map.insert("arr_grid_exp".into(), Value::from(self.arr_grid_exp));
+        map.insert("arr_header_w".into(), Value::from(self.arr_header_w));
         map.insert("midi_snap".into(), Value::Bool(self.midi_snap));
         map.insert("midi_grid_exp".into(), Value::from(self.midi_grid_exp));
         map.insert("midi_swing".into(), Value::Bool(self.midi_swing));

@@ -557,10 +557,13 @@ impl Layout {
                 )
             }
         };
-        let body = Rect::from_min_max(
-            rest.min,
-            Pos2::new(rest.right(), status.top() - gap * 0.5),
-        );
+        // **To the same bottom line as the camera.** The columns used to
+        // stop a status row short of the band's edge while the preview ran
+        // all the way down — the owner asked why the camera goes lower than
+        // everything else. The status is an OVERLAY now: the columns take
+        // the full height, and a message (rare) draws on a plate over the
+        // bottom sliver for as long as it exists.
+        let body = rest;
         if !body.is_positive() {
             return Self::empty(rolling);
         }
@@ -4042,6 +4045,15 @@ fn draw_close_glyph(painter: &Painter, r: Rect, colour: Color32) {
 
 fn draw_status(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Palette) {
     if let Some(m) = view.message {
+        // The plate under the message: the row overlays live columns now,
+        // and small ink straight over a fader's travel is unreadable.
+        let plate = Rect::from_min_max(
+            Pos2::new(l.status.left() - 4.0, l.status.top() - 2.0),
+            Pos2::new(l.status_close.right() + 4.0, l.status.bottom() + 2.0),
+        );
+        if plate.is_positive() {
+            painter.rect_filled(plate, 3.0, p.bg.gamma_multiply(0.92));
+        }
         text_line(painter, l.status, m, p.ink, false);
         // And the way out of it. Only while there is something to dismiss —
         // an × over an empty row is a control for nothing.
@@ -4056,11 +4068,9 @@ fn draw_status(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Palet
 /// One-pixel top edge so the band reads as its own, matching the fretboard's.
 /// Drawn by the caller, which knows what is above it.
 pub fn draw_top_edge(painter: &Painter, rect: Rect, s: &Settings) {
-    let c = if s.dark_mode {
-        Color32::from_rgb(60, 60, 60)
-    } else {
-        Color32::from_rgb(120, 100, 78)
-    };
+    // Dark mode no longer reaches the band edge — one look everywhere
+    // but the theory window and the arrangement.
+    let c = Color32::from_rgb(120, 100, 78);
     painter.rect_stroke(
         Rect::from_min_size(rect.min, Vec2::new(rect.width(), 1.0)),
         0.0,

@@ -35,6 +35,8 @@ use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, Vec2};
 /// colour, kind, arm, mute and solo are the mixer strip's own facts.
 pub struct LaneView<'a> {
     pub name: &'a str,
+    /// What the input chip says: "IN 3", "MIDI: ALL", or "" for none.
+    pub input: String,
     /// Index into [`STRIP_COLORS`]. Zero is the desk's own wood.
     pub color: usize,
     /// What feeds the lane live: keys, a microphone, or nothing. A lane with
@@ -106,6 +108,11 @@ pub struct ArrangeView<'a> {
     pub sig_top: u32,
     pub sig_bottom: u32,
     pub dark_mode: bool,
+    /// The header column's width in points, when somebody has dragged the
+    /// grip. `None` is the automatic share.
+    pub header_w: Option<f32>,
+    /// A lane NAME being typed, and what is in the field so far.
+    pub naming: Option<(usize, &'a str)>,
     /// The band's own wood, so the two surfaces are one instrument.
     pub wood: (u8, u8, u8),
 }
@@ -149,6 +156,13 @@ pub enum Hit {
     ToolGrid,
     /// The navigator beside it: drag scrolls, vertical zooms, both at once.
     ToolNav,
+    /// The header's INPUT chip: open the channel input menu.
+    HdrInput(usize),
+    /// The header's NAME: a double-click renames the lane.
+    HdrName(usize),
+    /// The seam between the headers and the lanes: drag to resize the
+    /// header column.
+    HeaderGrip,
 }
 
 impl Hit {
@@ -192,6 +206,8 @@ pub struct Layout {
     /// Drag it to scroll; drag UP to zoom in at the same time.
     pub tool_nav: Rect,
     pub lanes_area: Rect,
+    /// The draggable seam between headers and lanes.
+    pub grip: Rect,
     pub lane_rows: [Rect; CHANNELS],
     pub header_rows: [HeaderRow; CHANNELS],
 }
@@ -214,6 +230,9 @@ pub struct HeaderRow {
     pub meter: Rect,
     pub mute: Rect,
     pub solo: Rect,
+    /// The input chip, under the name — every lane wears one now: binding
+    /// an input is how a bare lane BECOMES a track.
+    pub input: Rect,
 }
 
 impl HeaderRow {
@@ -231,6 +250,7 @@ impl HeaderRow {
         meter: Rect::NOTHING,
         mute: Rect::NOTHING,
         solo: Rect::NOTHING,
+        input: Rect::NOTHING,
     };
 }
 
@@ -245,6 +265,7 @@ impl Layout {
                 tool_grid: Rect::NOTHING,
                 tool_nav: Rect::NOTHING,
                 lanes_area: Rect::NOTHING,
+                grip: Rect::NOTHING,
                 lane_rows: [Rect::NOTHING; CHANNELS],
                 header_rows: [HeaderRow::NONE; CHANNELS],
             };
@@ -252,7 +273,14 @@ impl Layout {
         let (share, lo, hi) = HEADER_W;
         // Chained rather than clamp(): a rect narrower than the floor would
         // hand clamp a min above its max, which is a panic in a painter.
-        let header_w = (rect.width() * share).max(lo).min(hi).min(rect.width() * 0.5);
+        // A dragged width wins over the automatic share, inside the same
+        // sanity bounds.
+        let header_w = view
+            .header_w
+            .unwrap_or(rect.width() * share)
+            .max(lo)
+            .min(hi.max(400.0))
+            .min(rect.width() * 0.5);
         let (rshare, rlo, rhi) = RULER_H;
         let ruler_h = (rect.height() * rshare).clamp(rlo, rhi);
         let header = Rect::from_min_max(
@@ -331,6 +359,10 @@ impl Layout {
             tool_grid,
             tool_nav,
             lanes_area,
+            grip: Rect::from_min_max(
+                Pos2::new(rect.left() + header_w - 3.0, rect.top() + ruler_h),
+                Pos2::new(rect.left() + header_w + 3.0, rect.bottom()),
+            ),
             lane_rows,
             header_rows,
         }
@@ -343,9 +375,15 @@ impl Layout {
         if !r.is_positive() {
             return HeaderRow { panel: row, ..HeaderRow::NONE };
         }
-        // An unused lane is a place, not a channel: no controls to press.
+        // An unused lane is a place, not a channel — but it DOES wear the
+        // input chip: binding an input is how a bare lane becomes a track.
         if !used {
-            return HeaderRow { panel: row, ..HeaderRow::NONE };
+            let ch_h = (r.height() * 0.30).clamp(12.0, 16.0);
+            let input = Rect::from_min_size(
+                Pos2::new(r.left() + r.width() * 0.10, r.center().y - ch_h * 0.5),
+                Vec2::new(r.width() * 0.42, ch_h),
+            );
+            return HeaderRow { panel: row, input, ..HeaderRow::NONE };
         }
         let h = r.height();
         let cut = |a: f32, b: f32| {
@@ -398,9 +436,15 @@ impl Layout {
                 Pos2::new(dial.right() + 1.0, dial.top() - 1.0),
             )
         };
+        // The name keeps the row's top half; the INPUT CHIP takes the
+        // bottom, under it — the mixer strip's own order.
         let name = Rect::from_min_max(
             Pos2::new(arm.right() + 4.0, r.top()),
-            Pos2::new(pan.left() - 6.0, r.bottom()),
+            Pos2::new(pan.left() - 6.0, r.center().y - 1.0),
+        );
+        let input = Rect::from_min_max(
+            Pos2::new(arm.right() + 4.0, r.center().y + 1.0),
+            Pos2::new(pan.left() - 6.0, r.bottom() - 1.0),
         );
         HeaderRow {
             panel: row,
@@ -416,6 +460,7 @@ impl Layout {
             meter,
             mute,
             solo,
+            input,
         }
     }
 }
@@ -519,6 +564,9 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
             return Some(hit);
         }
     }
+    if l.grip.is_positive() && l.grip.contains(pos) {
+        return Some(Hit::HeaderGrip);
+    }
     for (i, row) in l.header_rows.iter().enumerate() {
         for (r, hit) in [
             (row.arm, Hit::Arm(i)),
@@ -527,6 +575,8 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
             (row.knob, Hit::Gain(i)),
             (row.send, Hit::Send(i)),
             (row.pan, Hit::Pan(i)),
+            (row.input, Hit::HdrInput(i)),
+            (row.name, Hit::HdrName(i)),
         ] {
             if r.is_positive() && r.contains(pos) {
                 return Some(hit);
@@ -596,29 +646,47 @@ struct Ink {
 }
 
 fn ink(view: &ArrangeView<'_>) -> Ink {
-    let (r, g, b) = view.wood;
-    let wood = Color32::from_rgb(r, g, b);
-    let face = if view.dark_mode {
-        Color32::from_rgb(0xC9, 0xC0, 0xA6)
-    } else {
-        Color32::from_rgb(0xE3, 0xD9, 0xBD)
-    };
+    // **Dark mode lives HERE (and in the theory window) — nowhere else.**
+    // The default is a grey-ivory field now, the owner's ask; dark mode is
+    // the near-black look the view used to wear all the time.
+    if view.dark_mode {
+        let face = Color32::from_rgb(0xC9, 0xC0, 0xA6);
+        let (r, g, b) = view.wood;
+        return Ink {
+            wood: Color32::from_rgb(r, g, b),
+            face,
+            engrave: Color32::from_rgb(0x24, 0x20, 0x1A),
+            faint: face.gamma_multiply(0.4),
+            lane: Color32::from_rgb(0x20, 0x1C, 0x16),
+            lane_alt: Color32::from_rgb(0x25, 0x20, 0x19),
+            grid: face.gamma_multiply(0.13),
+            clip_ink: Color32::from_rgb(0xE8, 0xDC, 0xC0),
+            playhead: Color32::from_rgb(0xE8, 0x3A, 0x4E),
+            arm: Color32::from_rgb(0xE0, 0x22, 0x22),
+            mute: Color32::from_rgb(0xE0, 0xA8, 0x22),
+            solo: Color32::from_rgb(0xE8, 0x3A, 0x4E),
+            meter: Color32::from_rgb(0x3D, 0xC0, 0x5A),
+            select: Color32::from_rgb(0xFF, 0xF4, 0xE0),
+        };
+    }
+    let face = Color32::from_rgb(0x3A, 0x34, 0x2A);
     Ink {
-        wood,
+        // Grey-ivory ground; the lanes a shade deeper so they still read
+        // as the recessed field the clips sit in.
+        wood: Color32::from_rgb(0xD3, 0xCD, 0xBE),
         face,
         engrave: Color32::from_rgb(0x24, 0x20, 0x1A),
-        faint: face.gamma_multiply(0.4),
-        // The lanes are a recessed field, the way the timeline's box is.
-        lane: Color32::from_rgb(0x20, 0x1C, 0x16),
-        lane_alt: Color32::from_rgb(0x25, 0x20, 0x19),
-        grid: face.gamma_multiply(0.13),
+        faint: face.gamma_multiply(0.55),
+        lane: Color32::from_rgb(0xC3, 0xBD, 0xAC),
+        lane_alt: Color32::from_rgb(0xBB, 0xB5, 0xA4),
+        grid: face.gamma_multiply(0.30),
         clip_ink: Color32::from_rgb(0xE8, 0xDC, 0xC0),
-        playhead: Color32::from_rgb(0xE8, 0x3A, 0x4E),
-        arm: Color32::from_rgb(0xE0, 0x22, 0x22),
-        mute: Color32::from_rgb(0xE0, 0xA8, 0x22),
-        solo: Color32::from_rgb(0xE8, 0x3A, 0x4E),
-        meter: Color32::from_rgb(0x3D, 0xC0, 0x5A),
-        select: Color32::from_rgb(0xFF, 0xF4, 0xE0),
+        playhead: Color32::from_rgb(0xD8, 0x2A, 0x3E),
+        arm: Color32::from_rgb(0xC8, 0x1A, 0x1A),
+        mute: Color32::from_rgb(0xA8, 0x7A, 0x10),
+        solo: Color32::from_rgb(0xD8, 0x2A, 0x3E),
+        meter: Color32::from_rgb(0x2A, 0x8C, 0x42),
+        select: Color32::from_rgb(0x20, 0x1C, 0x16),
     }
 }
 
@@ -695,63 +763,64 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     {
         let g = bar * 2.0f64.powi(i32::from(view.grid_exp.clamp(-6, 6)));
         let bar_px = bar * px_per_s;
-        let sub_px = g * px_per_s;
+        let grid_px = g * px_per_s;
         let t1 = view.view_start_s + view.view_len_s;
-        // Bar lines, every bar that has room.
-        if bar_px >= 5.0 {
-            let mut n = (view.view_start_s / bar).floor().max(0.0);
-            while n * bar <= t1 {
-                let x = x_of(rect, view, n * bar);
-                if x >= l.lanes_area.left() - 0.5 && x <= l.lanes_area.right() + 0.5 {
-                    painter.line_segment(
-                        [
-                            Pos2::new(x, l.lanes_area.top()),
-                            Pos2::new(x, l.lanes_area.bottom()),
-                        ],
-                        Stroke::new(1.0, p.grid.gamma_multiply(2.2)),
-                    );
-                }
-                n += 1.0;
+        let line = |t: f64, w: f32| {
+            let x = x_of(rect, view, t);
+            if x >= l.lanes_area.left() - 0.5 && x <= l.lanes_area.right() + 0.5 {
+                painter.line_segment(
+                    [
+                        Pos2::new(x, l.lanes_area.top()),
+                        Pos2::new(x, l.lanes_area.bottom()),
+                    ],
+                    Stroke::new(1.0, p.grid.gamma_multiply(w)),
+                );
             }
-        }
-        // Subdivision lines, skipping the bars they coincide with. Only
-        // when the grid is FINER than a bar — a multi-bar grid draws its
-        // own (sparser) lines instead below.
-        if g < bar - 1.0e-9 && sub_px >= 5.0 {
-            let mut n = (view.view_start_s / g).floor().max(0.0);
-            while n * g <= t1 {
-                let t = n * g;
-                let on_bar = (t / bar - (t / bar).round()).abs() < 1.0e-6;
-                if !on_bar {
-                    let x = x_of(rect, view, t);
-                    if x >= l.lanes_area.left() - 0.5 && x <= l.lanes_area.right() + 0.5 {
-                        painter.line_segment(
-                            [
-                                Pos2::new(x, l.lanes_area.top()),
-                                Pos2::new(x, l.lanes_area.bottom()),
-                            ],
-                            Stroke::new(1.0, p.grid.gamma_multiply(1.1)),
-                        );
+        };
+        if g >= bar - 1.0e-9 {
+            // **A multi-bar grid draws COARSER, visibly** — the owner
+            // turned the box to "4" and saw no change, because every bar
+            // drew at full weight whatever the grid said. The grid step
+            // gets the strong line; the bars inside it drop to the faint
+            // weight the subdivisions use.
+            if grid_px >= 5.0 {
+                let mut n = (view.view_start_s / g).floor().max(0.0);
+                while n * g <= t1 {
+                    line(n * g, 2.2);
+                    n += 1.0;
+                }
+            }
+            if g > bar + 1.0e-9 && bar_px >= 5.0 {
+                let mut n = (view.view_start_s / bar).floor().max(0.0);
+                while n * bar <= t1 {
+                    let t = n * bar;
+                    let on_grid = (t / g - (t / g).round()).abs() < 1.0e-6;
+                    if !on_grid {
+                        line(t, 1.1);
                     }
+                    n += 1.0;
                 }
-                n += 1.0;
             }
-        } else if g > bar + 1.0e-9 && bar_px < 5.0 && sub_px >= 5.0 {
-            // Zoomed far out with a coarse grid: the multi-bar lines are
-            // all the eye can hold, so they are what it gets.
-            let mut n = (view.view_start_s / g).floor().max(0.0);
-            while n * g <= t1 {
-                let x = x_of(rect, view, n * g);
-                if x >= l.lanes_area.left() - 0.5 && x <= l.lanes_area.right() + 0.5 {
-                    painter.line_segment(
-                        [
-                            Pos2::new(x, l.lanes_area.top()),
-                            Pos2::new(x, l.lanes_area.bottom()),
-                        ],
-                        Stroke::new(1.0, p.grid.gamma_multiply(2.2)),
-                    );
+        } else {
+            // A sub-bar grid: bars strong, subdivisions between them
+            // fainter but visible — the rule since the owner asked for it.
+            if bar_px >= 5.0 {
+                let mut n = (view.view_start_s / bar).floor().max(0.0);
+                while n * bar <= t1 {
+                    line(n * bar, 2.2);
+                    n += 1.0;
                 }
-                n += 1.0;
+            }
+            if grid_px >= 5.0 {
+                let mut n = (view.view_start_s / g).floor().max(0.0);
+                while n * g <= t1 {
+                    let t = n * g;
+                    let on_bar = (t / bar - (t / bar).round()).abs() < 1.0e-6;
+                    if !on_bar {
+                        line(t, 1.1);
+                    }
+                    n += 1.0;
+                }
             }
         }
     }
@@ -941,7 +1010,33 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             num_font.clone(),
             if lane.used { ink_on.gamma_multiply(0.7) } else { p.faint },
         );
+        // The input chip draws on EVERY lane — binding an input is how a
+        // bare lane becomes a track — in bone whatever the theme, so the
+        // words read on a painted header and on the grey field alike.
+        let chip = |painter: &Painter, r: Rect, word: &str, has: bool| {
+            if !r.is_positive() {
+                return;
+            }
+            let bone = Color32::from_rgb(0xE3, 0xD9, 0xBD);
+            let ink = Color32::from_rgb(0x24, 0x20, 0x1A);
+            painter.rect_filled(r, 2.0, bone);
+            painter.rect_stroke(
+                r,
+                2.0,
+                Stroke::new(1.0, ink.gamma_multiply(0.4)),
+                egui::StrokeKind::Inside,
+            );
+            let font = FontId::new((r.height() * 0.62).clamp(7.0, 10.0), crate::fonts::courier());
+            painter.text(
+                r.center(),
+                Align2::CENTER_CENTER,
+                cut_to(painter, r.width() - 4.0, word, &font),
+                font,
+                ink.gamma_multiply(if has { 0.85 } else { 0.55 }),
+            );
+        };
         if !lane.used {
+            chip(painter, row.input, "NO INPUT", false);
             continue;
         }
         // The arm dot: REAPER's record circle, lit when live.
@@ -951,20 +1046,41 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             painter.circle_filled(c, rad, p.arm);
         }
         painter.circle_stroke(c, rad, Stroke::new(1.5, ink_on.gamma_multiply(0.8)));
-        // The name, on its plate.
+        // The name, on its plate — or the rename field mid-typing.
         if row.name.is_positive() {
             let font = FontId::new(
-                (row.name.height() * 0.32).clamp(8.5, 12.0),
+                (row.name.height() * 0.56).clamp(8.5, 12.0),
                 crate::fonts::courier_bold(),
             );
-            painter.text(
-                Pos2::new(row.name.left() + 2.0, row.name.center().y),
-                Align2::LEFT_CENTER,
-                cut_to(painter, row.name.width() - 4.0, lane.name, &font),
-                font,
-                ink_on,
-            );
+            let naming = view.naming.filter(|(at, _)| *at == i).map(|(_, b)| b);
+            if let Some(buf) = naming {
+                painter.rect_filled(row.name, 2.0, p.face);
+                painter.rect_stroke(
+                    row.name,
+                    2.0,
+                    Stroke::new(1.0, p.select),
+                    egui::StrokeKind::Inside,
+                );
+                painter.text(
+                    Pos2::new(row.name.left() + 2.0, row.name.center().y),
+                    Align2::LEFT_CENTER,
+                    format!("{buf}_"),
+                    font,
+                    p.engrave,
+                );
+            } else {
+                painter.text(
+                    Pos2::new(row.name.left() + 2.0, row.name.center().y),
+                    Align2::LEFT_CENTER,
+                    cut_to(painter, row.name.width() - 4.0, lane.name, &font),
+                    font,
+                    ink_on,
+                );
+            }
         }
+        // The INPUT CHIP under the name, the mixer strip's own idiom.
+        let word = if lane.input.is_empty() { "NO INPUT" } else { lane.input.as_str() };
+        chip(painter, row.input, word, !lane.input.is_empty());
         // The two dials: VOLUME (the mixer fader as a dial) and SEND, each
         // with its number under it — a dial this small needs the readout to
         // be a control you can trust.
@@ -1254,6 +1370,7 @@ mod tests {
     fn a_lane(used: bool) -> LaneView<'static> {
         LaneView {
             name: "KEYS",
+            input: String::new(),
             color: 0,
             kind: used.then_some(ChannelKind::Midi),
             used,
@@ -1306,6 +1423,8 @@ mod tests {
 
     fn a_view<'a>(clips: &'a [ClipView<'a>]) -> ArrangeView<'a> {
         ArrangeView {
+            header_w: None,
+            naming: None,
             lanes: std::array::from_fn(|i| a_lane(i < 3)),
             clips,
             metronome_on: true,

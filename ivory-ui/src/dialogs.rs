@@ -4020,8 +4020,11 @@ pub fn show(
                 ctx,
                 placement,
                 "Track",
-                Vec2::new(300.0, 316.0),
-                Vec2::new(300.0, 276.0),
+                // Sized for everything it holds — the remove button, three
+                // swatch rows, five palette rows AND the Done button; at 316
+                // the Done was cut off at the bottom on the owner's screen.
+                Vec2::new(300.0, 408.0),
+                Vec2::new(300.0, 388.0),
                 |ui, result| {
                     apply_theme(ui.style_mut(), &t);
                     ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);

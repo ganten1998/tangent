@@ -77,11 +77,12 @@ impl Transport {
         self.playing = !self.playing;
     }
 
-    /// The square. Ends the audition if one is running and sends the playhead
-    /// home — from a pause as well, because "stop" from anywhere means 0:00.
+    /// The square. Ends the audition if one is running and STAYS AT THE
+    /// PLAYHEAD — the owner's second ruling, reversing the first: pressing
+    /// play again carries on from where the music stopped, every time.
+    /// Going home is what clicking the ruler at 1|1|000 is for.
     pub fn stop(&mut self) {
         self.playing = false;
-        self.locate(0.0);
     }
 
     /// Whether the audition is running.
@@ -115,18 +116,9 @@ impl Transport {
     /// block rolls at zero on the way down).
     pub fn push(&mut self, engine: Option<&Engine>, session_rolling: bool) {
         let rolling = session_rolling || self.playing;
-        // The falling edge of a TAKE returns the playhead to 0:00. Only a
-        // take's: the audition's own falling edge is a pause and keeps its
-        // place — see `toggle_play`. And not even a take's when the audition
-        // is still running through it, or stopping a take somebody recorded
-        // over a rolling audition would yank the music back to the top.
-        //
-        // Before the engine is even unwrapped: the playhead is this struct's,
-        // and a take that ends in the gap while an engine is being rebuilt
-        // still ended.
-        if self.session_was_rolling && !session_rolling && !self.playing {
-            self.locate(0.0);
-        }
+        // A TAKE's falling edge used to return the playhead to 0:00; it
+        // keeps its place now, the same rule as `stop` — what was recorded
+        // is under the playhead, and play carries on from there.
         self.session_was_rolling = session_rolling;
         let Some(e) = engine else {
             return;
@@ -176,21 +168,21 @@ mod tests {
         );
         t.stop();
         assert!(
-            t.position_s(None, 0.0).abs() < 1e-9,
-            "stop did not send the playhead home"
+            (t.position_s(None, 0.0) - 83.0).abs() < 1e-9,
+            "stop moved the playhead away from where the music stopped"
         );
     }
 
-    /// A take that ends still returns to 0:00 — that rule kept its half.
+    /// A take that ends KEEPS its place now — stop means stay, everywhere.
     #[test]
-    fn a_take_ending_still_returns_to_zero() {
+    fn a_take_ending_keeps_its_place() {
         let mut t = Transport::new();
         t.locate(10.0);
         t.push(None, true);
         t.push(None, false);
         assert!(
-            t.position_s(None, 0.0).abs() < 1e-9,
-            "a finished take left the playhead at {}",
+            (t.position_s(None, 0.0) - 10.0).abs() < 1e-9,
+            "a finished take yanked the playhead to {}",
             t.position_s(None, 0.0)
         );
     }

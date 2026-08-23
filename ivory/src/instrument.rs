@@ -1134,6 +1134,13 @@ struct Shared {
     /// the order, the callback only reads it, which is the same trust split
     /// every other mask here follows.
     pick_strip: [AtomicI64; INPUTS],
+    /// **The live punch, per lane, in project frames.** While the
+    /// arrangement records over a lane, everything scheduled on it from
+    /// this frame on is being REPLACED and must not sound — the owner
+    /// heard the old clip all the way through the overdub. `u64::MAX` is
+    /// "no punch"; the host sets the record start while rolling and
+    /// clears it when the take ends and the carve makes it permanent.
+    punch: [AtomicU64; CHANNELS],
     metro_gain: AtomicU32,
     /// The backing track's level, linear.
     track_gain: AtomicU32,
@@ -1359,6 +1366,7 @@ impl Shared {
             channel_pans: std::array::from_fn(|_| AtomicU32::new(0.0f32.to_bits())),
             builtin_strip: AtomicI64::new(-1),
             pick_strip: std::array::from_fn(|_| AtomicI64::new(-1)),
+            punch: std::array::from_fn(|_| AtomicU64::new(u64::MAX)),
             metro_gain: AtomicU32::new(0.7f32.to_bits()),
             // Both effects OFF by default. A first launch has to sound like the
             // instrument and not like a room, and `Effects::process` skips its
@@ -3116,6 +3124,7 @@ impl Renderer {
         let mut target = [0.0f32; CHANNELS];
         let mut send = [0.0f32; CHANNELS];
         let mut pan = [(1.0f32, 1.0f32); CHANNELS];
+        let mut punch = [u64::MAX; CHANNELS];
         for lane in 0..CHANNELS {
             let strip = Strip::Channel(lane);
             target[lane] = if strip_is_heard(strip, muted, soloed) {
@@ -3125,6 +3134,7 @@ impl Renderer {
             };
             send[lane] = Shared::f32_of(&self.shared.send[strip.index()]).clamp(0.0, 1.0);
             pan[lane] = pan_gains(Shared::f32_of(&self.shared.channel_pans[lane]));
+            punch[lane] = self.shared.punch[lane].load(Ordering::Relaxed);
         }
         let stems = self.stems_live;
         let (Some(mix), Some(aux), Some(stem)) = (
@@ -3148,6 +3158,12 @@ impl Renderer {
                     continue;
                 };
                 if k >= placed.len {
+                    continue;
+                }
+                // **Being recorded over, right now**: from the punch frame
+                // on, this lane's clips are the material the take is
+                // replacing, and the take must not be heard against them.
+                if p >= punch[placed.strip.min(CHANNELS - 1)] {
                     continue;
                 }
                 let i = match usize::try_from(placed.offset + k) {
@@ -3512,9 +3528,13 @@ impl Renderer {
                             break;
                         }
                         cur += 1;
-                        // Behind the playhead (a jump landed past it), or
-                        // past the clip's trimmed end: skipped, not sounded.
-                        if on_f < at || nt.at >= mc.len {
+                        // Behind the playhead (a jump landed past it), past
+                        // the clip's trimmed end — or inside the region a
+                        // rolling record is REPLACING: skipped, not sounded.
+                        if on_f < at
+                            || nt.at >= mc.len
+                            || on_f >= self.shared.punch[ch].load(Ordering::Relaxed)
+                        {
                             continue;
                         }
                         if lane_notes.len() >= lane_notes.capacity()
@@ -4652,6 +4672,13 @@ impl Engine {
     }
 
     /// Which channel each capture pick feeds: desk indices, `None` unbound.
+    /// The live punch: `Some(frame)` while lane records over its clips.
+    pub fn set_punches(&self, punches: [Option<u64>; CHANNELS]) {
+        for (cell, p) in self.shared.punch.iter().zip(punches) {
+            cell.store(p.unwrap_or(u64::MAX), Ordering::Relaxed);
+        }
+    }
+
     pub fn set_pick_strips(&self, strips: [Option<usize>; INPUTS]) {
         for (cell, strip) in self.shared.pick_strip.iter().zip(strips) {
             cell.store(strip.map_or(-1, |s| s as i64), Ordering::Relaxed);
@@ -7338,6 +7365,56 @@ mod tests {
     /// **A clip plays through its LANE: mute silences it, solo isolates
     /// it.** The strip's own rules, applied to the document's audio — the
     /// difference between "a bed under the master" and an arrangement.
+    #[test]
+    fn a_punched_lane_goes_quiet_from_the_punch_frame_on() {
+        use std::sync::Arc;
+        let clip = Placed {
+            clip: Arc::new(ivory_record::decode::Clip {
+                samples: vec![1.0; 8000],
+                rate: 48_000,
+                source: std::path::PathBuf::from("c.wav"),
+            }),
+            strip: 0,
+            start: 0,
+            offset: 0,
+            len: 4000,
+            fade_in: 0,
+            fade_out: 0,
+        };
+        let (mut r, _tx, shared) = renderer_with_midi(2);
+        let (mut to_audio, _from) = r.hijack_track_rings();
+        to_audio.push(vec![clip]).expect("room");
+        shared.transport_at.store(0, Ordering::Relaxed);
+        shared.transport_req.store(1, Ordering::Release);
+        shared.rolling.store(true, Ordering::Relaxed);
+        // The punch lands at frame 1024: the first block sounds, the
+        // second is the material being recorded over and must not.
+        shared.punch[0].store(1024, Ordering::Relaxed);
+        let mut out = vec![0.0_f32; 2 * 1024];
+        r.render(&mut out, 0, 0);
+        assert!(
+            out[2 * 1000].abs() > 0.1,
+            "the clip before the punch went missing: {}",
+            out[2 * 1000]
+        );
+        out.fill(0.0);
+        r.render(&mut out, 0, 0);
+        assert!(
+            out[2 * 512].abs() < 1.0e-6,
+            "the punched region still sounds: {}",
+            out[2 * 512]
+        );
+        // And clearing the punch brings the lane back — the take ended,
+        // the carve owns the truth now.
+        shared.punch[0].store(u64::MAX, Ordering::Relaxed);
+        out.fill(0.0);
+        r.render(&mut out, 0, 0);
+        assert!(
+            out[2 * 512].abs() > 0.1,
+            "the lane stayed quiet after the punch lifted"
+        );
+    }
+
     #[test]
     fn a_lanes_mute_and_solo_govern_its_clips() {
         use std::sync::Arc;

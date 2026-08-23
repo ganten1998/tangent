@@ -111,12 +111,6 @@ pub struct MixerView<'a> {
     /// The menu is the palette's own pattern: drawn over the strip in the
     /// same frame, hit-tested first, dismissed by a press anywhere else.
     pub fx_menu: Option<(Column, usize)>,
-    /// The INPUT menu, modal on one strip: the column and the rows the app
-    /// built for the current page (None/Device/MIDI, then the drill-down).
-    pub input_menu: Option<(Column, Vec<String>)>,
-    /// The empty channel being asked what it should become: MIDI or AUDIO.
-    /// Same overlay pattern as [`MixerView::fx_menu`].
-    pub add_ask: Option<Column>,
 }
 
 impl MixerView<'_> {
@@ -146,9 +140,6 @@ pub enum Hit {
     Pan(Column),
     /// The input chip under the icon: open the channel's INPUT menu.
     InputChip(Column),
-    /// A row of the open input menu — `None` is a press anywhere else,
-    /// which closes it and chooses nothing.
-    InputRow(Column, Option<usize>),
     Mute(Column),
     Solo(Column),
     /// **What is on this channel**: the plus on an empty slot, and the icon
@@ -177,9 +168,6 @@ pub enum Hit {
     /// One of the two rows of an open insert menu — or, with
     /// [`FxAction::Dismiss`], a press anywhere else while it is up.
     FxMenu(Column, usize, FxAction),
-    /// One of the two rows of the MIDI-or-AUDIO ask on an empty channel.
-    /// `None` is a press anywhere else, which closes it without adding.
-    AddKind(Column, Option<ChannelKind>),
 }
 
 /// What a press on an open insert menu means.
@@ -209,9 +197,8 @@ impl Hit {
             | Hit::Remove(i)
             | Hit::Arm(i)
             | Hit::FxMenu(i, ..)
-            | Hit::AddKind(i, _)
             | Hit::InputChip(i)
-            | Hit::InputRow(i, _) => i,
+            | Hit::InputChip(i) => i,
         }
     }
 
@@ -227,7 +214,7 @@ impl Hit {
             Hit::Pan(_) => Some(DragAxis::Vertical),
             Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(..)
             | Hit::Db(_) | Hit::Name(_) | Hit::Remove(_) | Hit::Arm(_)
-            | Hit::FxMenu(..) | Hit::AddKind(..) | Hit::InputChip(_) | Hit::InputRow(..) => None,
+            | Hit::FxMenu(..) | Hit::InputChip(_) => None,
         }
     }
 
@@ -239,7 +226,7 @@ impl Hit {
             Hit::Pan(_) => Some(SEND_TRAVEL),
             Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(..)
             | Hit::Db(_) | Hit::Name(_) | Hit::Remove(_) | Hit::Arm(_)
-            | Hit::FxMenu(..) | Hit::AddKind(..) | Hit::InputChip(_) | Hit::InputRow(..) => None,
+            | Hit::FxMenu(..) | Hit::InputChip(_) => None,
         }
     }
 }
@@ -713,16 +700,6 @@ pub fn hit_test(rect: Rect, view: &MixerView<'_>, pos: Pos2) -> Option<Hit> {
     // DELETE is different: while it is up, everything that is not one of its
     // two rows is a dismissal and nothing else, because the mis-click this
     // exists to prevent is exactly a press that lands somewhere it should not.
-    if let Some((at, rows)) = &view.input_menu {
-        if let Some(s) = l.strips.get(at.0) {
-            for (i, r) in input_menu_rows(s, rows.len()).iter().enumerate() {
-                if r.contains(pos) {
-                    return Some(Hit::InputRow(*at, Some(i)));
-                }
-            }
-        }
-        return Some(Hit::InputRow(*at, None));
-    }
     if let Some((at, bay)) = view.fx_menu {
         if let Some(s) = l.strips.get(at.0) {
             let rows = fx_menu_over(s, bay);
@@ -734,19 +711,6 @@ pub fn hit_test(rect: Rect, view: &MixerView<'_>, pos: Pos2) -> Option<Hit> {
             }
         }
         return Some(Hit::FxMenu(at, bay, FxAction::Dismiss));
-    }
-    // The MIDI-or-AUDIO ask, on the same modal terms.
-    if let Some(at) = view.add_ask {
-        if let Some(s) = l.strips.get(at.0) {
-            let rows = ask_over(s);
-            if rows[0].contains(pos) {
-                return Some(Hit::AddKind(at, Some(ChannelKind::Midi)));
-            }
-            if rows[1].contains(pos) {
-                return Some(Hit::AddKind(at, Some(ChannelKind::Audio)));
-            }
-        }
-        return Some(Hit::AddKind(at, None));
     }
     l.targets()
         .into_iter()
@@ -874,40 +838,6 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MixerView<'_>) {
     if let Some((at, bay)) = view.fx_menu {
         if let Some(s) = l.strips.get(at.0) {
             two_rows(s, fx_menu_over(s, bay), ["DELETE FX", "REPLACE FX"]);
-        }
-    }
-    if let Some(at) = view.add_ask {
-        if let Some(s) = l.strips.get(at.0) {
-            two_rows(s, ask_over(s), ["MIDI", "AUDIO"]);
-        }
-    }
-    // The INPUT menu: the same modal grammar, however many rows the page
-    // holds — None/Device/MIDI, then the drill-down the app built.
-    if let Some((at, rows)) = &view.input_menu {
-        if let Some(sl) = l.strips.get(at.0) {
-            painter.rect_filled(sl.panel, 3.0, Color32::from_black_alpha(180));
-            for (r, label) in input_menu_rows(sl, rows.len()).iter().zip(rows.iter()) {
-                if !r.is_positive() {
-                    continue;
-                }
-                painter.rect_filled(*r, 2.0, p.face);
-                painter.rect_stroke(
-                    *r,
-                    2.0,
-                    Stroke::new(1.0, p.engrave.gamma_multiply(0.4)),
-                    egui::StrokeKind::Inside,
-                );
-                centred(
-                    painter,
-                    *r,
-                    label,
-                    FontId::new(
-                        (r.height() * 0.5).clamp(7.5, 11.0),
-                        crate::fonts::courier_bold(),
-                    ),
-                    p.engrave,
-                );
-            }
         }
     }
 }
@@ -1103,47 +1033,53 @@ fn strip(
     );
 
     if l.send.is_positive() {
-        send_knob(painter, l.send, v.send, p);
-        pan_knob(painter, l.pan, v.pan, p);
-        // The dial standard: values above, labels below, always.
+        // **Value, knob, label — all INSIDE the band.** The caps used to
+        // hang above the cells and the rack clipped them to illegibility
+        // on the owner's screen; the cell now carries its own three rows.
+        let carve = |r: Rect| {
+            let vh = (r.height() * 0.26).clamp(8.0, 12.0);
+            let lh = (r.height() * 0.22).clamp(7.0, 10.0);
+            let value = Rect::from_min_max(r.min, Pos2::new(r.right(), r.top() + vh));
+            let label = Rect::from_min_max(Pos2::new(r.left(), r.bottom() - lh), r.max);
+            let knob = Rect::from_min_max(
+                Pos2::new(r.left(), value.bottom()),
+                Pos2::new(r.right(), label.top()),
+            );
+            (value, knob, label)
+        };
         let cap_ink = ink;
-        let cap = move |painter: &Painter, r: Rect, above: String, below: &str| {
-            if !r.is_positive() || r.height() < 18.0 {
+        let word = |painter: &Painter, band: Rect, text: &str, main: bool| {
+            if !band.is_positive() {
                 return;
             }
             painter.text(
-                Pos2::new(r.center().x, r.top() - 1.0),
-                egui::Align2::CENTER_BOTTOM,
-                above,
-                FontId::new(7.5, crate::fonts::courier()),
-                cap_ink.gamma_multiply(0.9),
-            );
-            painter.text(
-                Pos2::new(r.center().x, r.bottom() + 1.0),
-                egui::Align2::CENTER_TOP,
-                below,
-                FontId::new(6.5, crate::fonts::courier()),
-                cap_ink.gamma_multiply(0.55),
+                band.center(),
+                egui::Align2::CENTER_CENTER,
+                text,
+                FontId::new(
+                    (band.height() * 0.92).clamp(6.5, 9.5),
+                    crate::fonts::courier(),
+                ),
+                cap_ink.gamma_multiply(if main { 0.9 } else { 0.55 }),
             );
         };
-        if l.send.is_positive() {
-            cap(
-                painter,
-                l.send,
-                format!("{:.0}%", v.send.clamp(0.0, 1.0) * 100.0),
-                "SEND",
-            );
-        }
+        let (sv, sk, sl) = carve(l.send);
+        send_knob(painter, sk, v.send, p);
+        word(painter, sv, &format!("{:.0}%", v.send.clamp(0.0, 1.0) * 100.0), true);
+        word(painter, sl, "SEND", false);
         if l.pan.is_positive() {
+            let (pv, pk, pl) = carve(l.pan);
+            pan_knob(painter, pk, v.pan, p);
             let w = (v.pan.clamp(-1.0, 1.0) * 50.0).round() as i32;
-            let word = if w == 0 {
+            let pw = if w == 0 {
                 "C".to_owned()
             } else if w < 0 {
                 format!("L{}", -w)
             } else {
                 format!("R{w}")
             };
-            cap(painter, l.pan, word, "PAN");
+            word(painter, pv, &pw, true);
+            word(painter, pl, "PAN", false);
         }
     }
     // **A rack: an ivory field with three strips down it.**
@@ -1251,30 +1187,6 @@ fn strip(
 /// Anchored at the bay the right-click landed on, as wide as the strip, and
 /// clamped inside the panel — the palette's rule: a row that overhung the
 /// neighbour would be a menu whose press can land on someone else's fader.
-/// The input menu's rows, hung under the chip and clamped into the strip.
-pub fn input_menu_rows(l: &StripStrip, n: usize) -> Vec<Rect> {
-    let panel = l.panel;
-    if !panel.is_positive() || n == 0 {
-        return Vec::new();
-    }
-    let anchor = if l.input_chip.is_positive() { l.input_chip } else { panel };
-    let gap = 2.0;
-    let h = (anchor.height() * 1.5).clamp(15.0, 22.0);
-    let w = panel.width() - 8.0;
-    let x = panel.left() + 4.0;
-    let mut top = anchor.bottom() + 3.0;
-    // Never off the strip's foot: the list walks back UP if it must.
-    let need = n as f32 * (h + gap);
-    if top + need > panel.bottom() - 4.0 {
-        top = (panel.bottom() - 4.0 - need).max(panel.top() + 4.0);
-    }
-    (0..n)
-        .map(|i| {
-            Rect::from_min_size(Pos2::new(x, top + i as f32 * (h + gap)), Vec2::new(w, h))
-        })
-        .collect()
-}
-
 fn fx_menu_over(l: &StripStrip, bay: usize) -> [Rect; 2] {
     let panel = l.panel;
     if !panel.is_positive() {
@@ -1306,27 +1218,7 @@ fn fx_menu_over(l: &StripStrip, bay: usize) -> [Rect; 2] {
     [row(0.0), row(1.0)]
 }
 
-/// The two rows of the MIDI-or-AUDIO ask, centred on the empty strip.
-fn ask_over(l: &StripStrip) -> [Rect; 2] {
-    let panel = l.panel;
-    if !panel.is_positive() {
-        return [Rect::NOTHING; 2];
-    }
-    let gap = 6.0;
-    let h = (panel.height() * 0.09)
-        .clamp(16.0, 30.0)
-        .min((panel.height() - 8.0 - gap).max(2.0) * 0.5);
-    let w = (panel.width() - 12.0).max(1.0);
-    let c = panel.center();
-    let top = c.y - h - gap * 0.5;
-    let row = |i: f32| {
-        Rect::from_min_size(
-            Pos2::new(c.x - w * 0.5, top + (h + gap) * i),
-            Vec2::new(w, h),
-        )
-    };
-    [row(0.0), row(1.0)]
-}
+
 
 /// Somewhere to put an instrument: an outline and a plus.
 ///
@@ -1809,7 +1701,6 @@ mod tests {
     fn a_view() -> MixerView<'static> {
         let channels = Strip::shown();
         MixerView {
-            input_menu: None,
             strips: std::array::from_fn(|i| {
                 a_strip(channels.get(i).copied(), false)
             }),
@@ -1817,7 +1708,6 @@ mod tests {
             typing: None,
             naming: None,
             fx_menu: None,
-            add_ask: None,
             dark_mode: true,
             wood: (0x4A, 0x3B, 0x2C),
         }
@@ -2292,37 +2182,6 @@ mod tests {
         assert_eq!(
             hit_test(r, &a_view(), l.strips[3].fader.center()),
             Some(Hit::Fader(Column(3)))
-        );
-    }
-
-    /// **An empty channel asks MIDI or AUDIO before it becomes anything.**
-    #[test]
-    fn the_kind_ask_offers_midi_and_audio_and_dismisses_elsewhere() {
-        let mut v = a_view();
-        v.strips[2] = a_strip(Some(Strip::Channel(2)), true);
-        v.add_ask = Some(Column(2));
-        let r = rect();
-        let l = Layout::new(r, &v);
-        let rows = ask_over(&l.strips[2]);
-        for (i, row) in rows.iter().enumerate() {
-            assert!(row.is_positive(), "row {i} has no area");
-            assert!(
-                l.strips[2].panel.contains(row.min) && l.strips[2].panel.contains(row.max),
-                "row {i} hangs outside its own strip"
-            );
-        }
-        assert_eq!(
-            hit_test(r, &v, rows[0].center()),
-            Some(Hit::AddKind(Column(2), Some(ChannelKind::Midi)))
-        );
-        assert_eq!(
-            hit_test(r, &v, rows[1].center()),
-            Some(Hit::AddKind(Column(2), Some(ChannelKind::Audio)))
-        );
-        assert_eq!(
-            hit_test(r, &v, l.strips[0].fader.center()),
-            Some(Hit::AddKind(Column(2), None)),
-            "a press elsewhere should dismiss the ask and do nothing"
         );
     }
 
