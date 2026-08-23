@@ -956,7 +956,7 @@ impl DesktopApp {
             // frames, announced as usual.
             self.recorder.engine = None;
             self.recorder.inserts_loaded =
-                vec![None; (ivory_ui::recorder::STRIPS + 1) * ivory_ui::recorder::INSERTS];
+                vec![None; (ivory_ui::recorder::STRIPS + 1 + ivory_ui::recorder::DRUM_PADS) * ivory_ui::recorder::INSERTS];
             self.open_audio_path(ctx);
         }
 
@@ -1382,7 +1382,7 @@ impl DesktopApp {
                 // held, no third-party code resident.
                 self.recorder.engine = None;
                 self.recorder.inserts_loaded =
-                    vec![None; (ivory_ui::recorder::STRIPS + 1) * ivory_ui::recorder::INSERTS];
+                    vec![None; (ivory_ui::recorder::STRIPS + 1 + ivory_ui::recorder::DRUM_PADS) * ivory_ui::recorder::INSERTS];
             }
         } else if open {
             self.reconcile_audio(false);
@@ -2941,7 +2941,7 @@ impl DesktopApp {
             return;
         };
         let _ = std::fs::create_dir_all(&dir);
-        for strip in 0..=ivory_ui::recorder::STRIPS {
+        for strip in 0..ivory_ui::recorder::STRIPS + 1 + ivory_ui::recorder::DRUM_PADS {
             for bay in 0..ivory_ui::recorder::INSERTS {
                 let global = insert_state_path(strip, bay);
                 let mine = dir.join(format!("insert-state-{strip}-{bay}.bin"));
@@ -2961,7 +2961,7 @@ impl DesktopApp {
         let Some(dir) = self.project_state_dir() else {
             return;
         };
-        for strip in 0..=ivory_ui::recorder::STRIPS {
+        for strip in 0..ivory_ui::recorder::STRIPS + 1 + ivory_ui::recorder::DRUM_PADS {
             for bay in 0..ivory_ui::recorder::INSERTS {
                 let global = insert_state_path(strip, bay);
                 let mine = dir.join(format!("insert-state-{strip}-{bay}.bin"));
@@ -3186,7 +3186,7 @@ impl DesktopApp {
     /// somebody chose a preset, and it is also the moment they are most likely
     /// to then force-quit or unplug something.
     fn save_plugin_states(&mut self) {
-        for strip in 0..=ivory_ui::recorder::STRIPS {
+        for strip in 0..ivory_ui::recorder::STRIPS + 1 + ivory_ui::recorder::DRUM_PADS {
             for bay in 0..ivory_ui::recorder::INSERTS {
                 let Some(bundle) = self.app.insert(strip, bay).map(str::to_owned) else {
                     continue;
@@ -3270,7 +3270,7 @@ impl DesktopApp {
                 // the one it replaces — forgetting that here is what asks the
                 // reconcile below to fill the bays again.
                 self.recorder.inserts_loaded =
-                    vec![None; (ivory_ui::recorder::STRIPS + 1) * ivory_ui::recorder::INSERTS];
+                    vec![None; (ivory_ui::recorder::STRIPS + 1 + ivory_ui::recorder::DRUM_PADS) * ivory_ui::recorder::INSERTS];
                 // **The tap belongs to the ENGINE, so it is taken when the
                 // engine starts.**
                 //
@@ -3840,7 +3840,7 @@ impl DesktopApp {
                 engine_error: None,
                 inserts_loaded: vec![
                     None;
-                    (ivory_ui::recorder::STRIPS + 1) * ivory_ui::recorder::INSERTS
+                    (ivory_ui::recorder::STRIPS + 1 + ivory_ui::recorder::DRUM_PADS) * ivory_ui::recorder::INSERTS
                 ],
                 camera_opening: false,
                 camera_silent_since: None,

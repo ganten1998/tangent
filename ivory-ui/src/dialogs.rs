@@ -30,6 +30,10 @@ pub enum Dialog {
     /// The project menu behind the band's folder button: the session's
     /// name, and the five things you do with sessions.
     Project { name: String },
+    /// The TRACK menu behind a right-click on a strip or a lane header:
+    /// remove it, paint it, or choose the auto-palette everybody unpainted
+    /// wears.
+    Track { lane: usize, removable: bool },
     MidiPicker {
         ports: Vec<String>,
         selected: Option<usize>,
@@ -381,6 +385,12 @@ pub enum DialogAction {
     ProjectSaveAs,
     /// Save the session as a template under `Projects/Templates`.
     ProjectTemplate,
+    /// Take the channel off the desk.
+    TrackRemove(usize),
+    /// Paint one channel by hand — index into `STRIP_COLORS`.
+    TrackColor(usize, i64),
+    /// Choose the auto-palette every unpainted slot wears.
+    TrackPalette(i64),
     /// Bounce the arrangement to one WAV.
     ProjectExportTrack,
     /// Bounce every used lane to its own WAV.
@@ -3989,6 +3999,138 @@ pub fn show(
                                 "one WAV per used lane, under export/stems - one real pass",
                             ) {
                                 action = Some(DialogAction::ProjectExportStems);
+                            }
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui
+                                    .add(Button::new(RichText::new("Done").color(t.text)))
+                                    .clicked()
+                                {
+                                    result.close = true;
+                                }
+                            });
+                        });
+                },
+            )
+        }
+        Dialog::Track { lane, removable } => {
+            let t = theme(dark_mode);
+            let lane = *lane;
+            let removable = *removable;
+            show_dialog_viewport(
+                ctx,
+                placement,
+                "Track",
+                Vec2::new(300.0, 316.0),
+                Vec2::new(300.0, 276.0),
+                |ui, result| {
+                    apply_theme(ui.style_mut(), &t);
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
+                    let bold = |size: f32| FontId::new(size, fonts::courier_bold());
+                    let plain = |size: f32| FontId::new(size, fonts::courier());
+                    let dim = t.text.gamma_multiply(0.62);
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::same(12))
+                        .show(ui, |ui| {
+                            if removable {
+                                if ui
+                                    .add_sized(
+                                        Vec2::new(ui.available_width(), 22.0),
+                                        Button::new(
+                                            RichText::new("Remove Track")
+                                                .font(plain(11.0))
+                                                .color(t.text),
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    action = Some(DialogAction::TrackRemove(lane));
+                                }
+                                ui.add_space(6.0);
+                            }
+                            ui.label(RichText::new("COLOUR").font(bold(10.0)).color(dim));
+                            // The swatch grid: hues down, tones across —
+                            // the palette overlay's own table.
+                            let cols = 9usize;
+                            let sw = (ui.available_width() - (cols as f32 - 1.0) * 3.0)
+                                / cols as f32;
+                            for row in 0..3 {
+                                ui.horizontal(|ui| {
+                                    for col in 0..cols {
+                                        let idx = match (row, col) {
+                                            (0, 0) => 0,
+                                            (1, 0) => 1,
+                                            (2, 0) => 2,
+                                            (r, c) if c >= 1 => 3 + (c - 1) * 3 + r,
+                                            _ => 0,
+                                        };
+                                        let (cr, cg, cb) =
+                                            crate::mixer_panel::STRIP_COLORS
+                                                [idx.min(26)];
+                                        let color = if idx == 0 {
+                                            egui::Color32::from_rgb(0x6B, 0x4A, 0x3A)
+                                        } else {
+                                            egui::Color32::from_rgb(cr, cg, cb)
+                                        };
+                                        let (rect, resp) = ui.allocate_exact_size(
+                                            Vec2::new(sw, 16.0),
+                                            egui::Sense::click(),
+                                        );
+                                        ui.painter().rect_filled(rect, 2.0, color);
+                                        if idx == 0 {
+                                            ui.painter().text(
+                                                rect.center(),
+                                                egui::Align2::CENTER_CENTER,
+                                                "auto",
+                                                plain(7.0),
+                                                t.text,
+                                            );
+                                        }
+                                        if resp.clicked() {
+                                            action = Some(DialogAction::TrackColor(
+                                                lane, idx as i64,
+                                            ));
+                                        }
+                                    }
+                                });
+                            }
+                            ui.add_space(8.0);
+                            ui.label(
+                                RichText::new("AUTO-PALETTE — every unpainted slot")
+                                    .font(bold(10.0))
+                                    .color(dim),
+                            );
+                            for (i, (name, set)) in
+                                crate::mixer_panel::PALETTES.iter().enumerate()
+                            {
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add_sized(
+                                            Vec2::new(64.0, 18.0),
+                                            Button::new(
+                                                RichText::new(*name)
+                                                    .font(plain(10.0))
+                                                    .color(t.text),
+                                            ),
+                                        )
+                                        .clicked()
+                                    {
+                                        action =
+                                            Some(DialogAction::TrackPalette(i as i64));
+                                    }
+                                    for idx in set {
+                                        let (cr, cg, cb) = crate::mixer_panel::STRIP_COLORS
+                                            [(*idx as usize).min(26)];
+                                        let (rect, _) = ui.allocate_exact_size(
+                                            Vec2::new(14.0, 14.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        ui.painter().rect_filled(
+                                            rect,
+                                            2.0,
+                                            egui::Color32::from_rgb(cr, cg, cb),
+                                        );
+                                    }
+                                });
                             }
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if ui

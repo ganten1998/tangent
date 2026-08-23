@@ -237,6 +237,72 @@ channels play back their clips and nothing else. "Ready to play" and
     ruler inside the popup, quantise-existing, and the arrangement-ruler
     numbers reflecting inside the roll.
 
+- **Input exposure (4.48.0)**: ANY device wider than one channel — two
+  included — offers per-channel exposure; a fresh device auto-checks
+  every mono and every ADJACENT stereo pair; an audio channel's menu
+  offers only the chosen device's inputs.
+- **4.49.0**: the `drumpad` branch merged (docs/DRUMPAD.md); the hidden
+  piano no longer takes primary presses under an open mixer/arrangement
+  (stand-down + regression test — painting was always exclusive, only
+  the hit-test leaked); each view's `h` card lists ONLY keys that exist
+  on that page; tool-nav corner (outer=song, inner=viewport, drag to
+  zoom+scroll); gridlines follow the gridbox.
+- **The DAW-session batch (4.50.0)**, owner-directed, built while they
+  were away:
+  - **Sessions carry the desk** (doc v4 `DeskSnap`): kinds, names,
+    colors, inserts (with per-seat state sidecars copied through the
+    project dir), sends, gains, pans, inputs, tempo/sig, metronome,
+    master — captured on every save, applied on explicit open only.
+  - **Project opener**: seventh transport slot (folder) → New / Open /
+    Save / Save As / Save As Template / Export. Templates live at
+    `Projects/Templates/<name>`; `default` is seeded at launch and New
+    clones it; naming a template "default" replaces it.
+  - **Export**: the whole track (realtime master bounce to
+    `export/track.wav`) or per-lane stems in ONE pass (`stems_on` +
+    `stem_scratch` tap in all three folds → per-used-lane WAVs at
+    `export/stems/NN-name.wav`). The drum bus is not yet a stem.
+  - **The band is one LCD**: the whole box is the REAPER-style cluster —
+    bars|beats|thousandths + min:sec left, Start/End/Length of the
+    TIMELINE (the viewport, accurate with no clips) right, every part a
+    draggable field (8px/unit ratchet; Start pans, End resizes, Length
+    zooms around centre and counts duration from zero). The overview
+    scrubber retired. Transport: Rec → Play → Stop → Pause (its own
+    button), and Space stops ANY recording — take, arrangement record,
+    or rolling transport.
+  - **Recording over material is DESTRUCTIVE** (`arr_carve`): the new
+    clip punches out whatever it overlaps — remove, trim either edge, or
+    split with the tail's offset advanced — so behind the playhead is
+    the new take, ahead the old.
+  - **The drum bus is a desk strip** (settings v14, `Strip::Drums` left
+    of the click, its own colour; sidecars shifted 8..10 → 9..11 on
+    migration). Pads each carry THREE insert bays + pan riding the
+    strip-indexed insert space (`RACK_SEATS = STRIPS+1+16`), summed
+    through the bus rack, folded with `drums_gain/drums_pan`.
+  - **Drumpad v2**: twice the width; a real media explorer (browse the
+    filesystem, drag audio straight onto pads); per-pad FX chips and
+    pan; the bus controls live on the desk strip, not the pad window.
+  - **Pan everywhere**: equal-power `pan_gains` (unity centre) applied in
+    every fold and the stem tap; knobs on every mixer strip AND every
+    arrangement header.
+  - **In-app input menu**: the rectangle under a channel's icon opens a
+    GUI menu — None / Device → Mono & Stereo (every exposed pick, all
+    pairs of any ≥2-channel device) / MIDI (All + each port). Explicit
+    binding (`channel_inputs` specs, `channel_picks` verbatim in
+    `audio_selection`); no more system dialogs.
+  - **MIDI editor v2**: bar ruler, velocity lane (drag to set; nearest
+    note or the whole selection), multi-select (shift-click, cmd-drag
+    marquee), move/resize the selection as a set, Q quantise, Cmd+D
+    duplicate a grid step ahead, arrows nudge (alt = fine), Cmd+A, Z fit
+    clip, Delete; draw previews audition through the live path.
+  - **Right-click a channel** (either view) → Remove Track / colour
+    swatches / auto-palette. Auto-palette is ON by default (five staged:
+    IVORY, EMBER, TIDE, MOSS, NEON), colours are per SLOT, and manual
+    paint overrides per strip. The mixer × retired with it.
+  - **The dial standard**: every dial in the program — band, mixer
+    strips, arrange headers, drumpad inspector — reads VALUE on top,
+    LABEL on the bottom, always visible. Click-to-type opens PREFILLED
+    with the current readout, caret at the end, arrows/click move it.
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index

@@ -32,7 +32,10 @@ pub struct MidiEditView<'a> {
     pub clip_len_s: f64,
     pub offset_s: f64,
     pub notes: &'a [ArrNote],
-    pub selected: Option<usize>,
+    /// The SELECTED notes, sorted indices — the editor works on sets now.
+    pub selected: &'a [usize],
+    /// A marquee in flight, in screen space, drawn as a dashed box.
+    pub marquee: Option<(Pos2, Pos2)>,
     /// The window, absolute seconds.
     pub view_start_s: f64,
     pub view_len_s: f64,
@@ -67,11 +70,19 @@ pub enum Hit {
     Key(u8),
     /// Empty roll: `(absolute seconds, key)`.
     Cell(f64, u8),
+    /// The bar ruler: locate the playhead here.
+    Ruler(f64),
+    /// The velocity lane at `absolute seconds` — the app finds the note.
+    Vel(f64),
 }
 
 pub struct Layout {
     pub panel: Rect,
     pub strip: Rect,
+    /// The bar ruler under the strip: numbers, ticks, and a click locates.
+    pub ruler: Rect,
+    /// The velocity lane along the foot: one bar per note.
+    pub vel: Rect,
     pub close: Rect,
     pub tool_snap: Rect,
     pub tool_grid: Rect,
@@ -87,6 +98,8 @@ impl Layout {
             return Self {
                 panel: Rect::NOTHING,
                 strip: Rect::NOTHING,
+                ruler: Rect::NOTHING,
+                vel: Rect::NOTHING,
                 close: Rect::NOTHING,
                 tool_snap: Rect::NOTHING,
                 tool_grid: Rect::NOTHING,
@@ -115,12 +128,27 @@ impl Layout {
         let tool_snap = cell(side * 1.9);
         let tool_triplet = cell(side * 1.6);
         let tool_swing = cell(side * 1.6);
-        let body = Rect::from_min_max(Pos2::new(rect.left(), strip.bottom()), rect.max);
+        // Strip, then the RULER, then keys+roll, then the VELOCITY lane.
+        let ruler = Rect::from_min_size(
+            Pos2::new(rect.left(), strip.bottom()),
+            Vec2::new(rect.width(), 15.0),
+        );
+        let vel_h = (rect.height() * 0.16).clamp(24.0, 64.0);
+        let body = Rect::from_min_max(
+            Pos2::new(rect.left(), ruler.bottom()),
+            Pos2::new(rect.right(), rect.bottom() - vel_h),
+        );
         let keys = Rect::from_min_size(body.min, Vec2::new(KEYS_W.min(body.width() * 0.2), body.height()));
         let roll = Rect::from_min_max(Pos2::new(keys.right(), body.top()), body.max);
+        let vel = Rect::from_min_max(
+            Pos2::new(roll.left(), body.bottom() + 1.0),
+            Pos2::new(roll.right(), rect.bottom() - 2.0),
+        );
         Self {
             panel: rect,
             strip,
+            ruler,
+            vel,
             close,
             tool_snap,
             tool_grid,
@@ -446,13 +474,87 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
         painter.rect_stroke(
             r,
             2.0,
-            if view.selected == Some(i) {
+            if view.selected.binary_search(&i).is_ok() {
                 Stroke::new(2.0, INK)
             } else {
                 Stroke::new(1.0, Color32::from_black_alpha(140))
             },
             egui::StrokeKind::Inside,
         );
+    }
+
+    // ── the ruler: bars numbered, beats ticked, one press a locate ──────
+    if l.ruler.is_positive() {
+        painter.rect_filled(l.ruler, 0.0, Color32::from_rgba_premultiplied(0, 0, 0, 70));
+        let bar = {
+            let bpm = view.bpm.clamp(20.0, 400.0);
+            f64::from(view.sig_top.clamp(1, 32)) * (60.0 / bpm)
+                * (4.0 / f64::from(view.sig_bottom.clamp(1, 32)))
+        };
+        if bar > 0.0 {
+            let px_per_s = f64::from(l.roll.width()) / view.view_len_s.max(1.0e-9);
+            let mut step = 1u64;
+            while bar * step as f64 * px_per_s < 44.0 && step < 1 << 16 {
+                step *= 2;
+            }
+            let mut n = (view.view_start_s / (bar * step as f64)).floor().max(0.0) as u64;
+            loop {
+                let t = n as f64 * bar * step as f64;
+                if t > view.view_start_s + view.view_len_s {
+                    break;
+                }
+                let x = x_of(&l, view, t);
+                if x >= l.roll.left() - 0.5 && x <= l.roll.right() + 0.5 {
+                    painter.line_segment(
+                        [Pos2::new(x, l.ruler.bottom() - 4.0), Pos2::new(x, l.ruler.bottom())],
+                        Stroke::new(1.0, INK.gamma_multiply(0.6)),
+                    );
+                    painter.text(
+                        Pos2::new(x + 3.0, l.ruler.top() + 1.0),
+                        Align2::LEFT_TOP,
+                        format!("{}", n * step + 1),
+                        font(9.0),
+                        INK.gamma_multiply(0.55),
+                    );
+                }
+                n += 1;
+            }
+        }
+    }
+
+    // ── the velocity lane: one bar per note, selected ones lit ──────────
+    if l.vel.is_positive() {
+        painter.rect_filled(l.vel, 0.0, Color32::from_rgba_premultiplied(0, 0, 0, 70));
+        let color = lane_color(view);
+        for (i, n) in view.notes.iter().enumerate() {
+            let t0 = view.clip_start_s + (n.at_s - view.offset_s);
+            let x = x_of(&l, view, t0);
+            if x < l.vel.left() || x > l.vel.right() {
+                continue;
+            }
+            let h = l.vel.height() * (f32::from(n.vel.min(127)) / 127.0);
+            let selected = view.selected.binary_search(&i).is_ok();
+            painter.rect_filled(
+                Rect::from_min_max(
+                    Pos2::new(x - 1.5, l.vel.bottom() - h),
+                    Pos2::new(x + 1.5, l.vel.bottom()),
+                ),
+                0.5,
+                if selected { INK } else { color },
+            );
+        }
+    }
+
+    // ── the marquee, while a hand draws one ──────────────────────────────
+    if let Some((a, b)) = view.marquee {
+        let r = Rect::from_two_pos(a, b);
+        painter.rect_stroke(
+            r,
+            0.0,
+            Stroke::new(1.0, INK.gamma_multiply(0.8)),
+            egui::StrokeKind::Inside,
+        );
+        painter.rect_filled(r, 0.0, Color32::from_rgba_premultiplied(0xff, 0xf4, 0xe0, 10));
     }
 
     // ── the playhead ─────────────────────────────────────────────────────
@@ -510,6 +612,12 @@ pub fn hit_test(rect: Rect, view: &MidiEditView<'_>, pos: Pos2) -> Option<Hit> {
     if l.strip.contains(pos) {
         return None;
     }
+    if l.ruler.is_positive() && l.ruler.contains(pos) {
+        return Some(Hit::Ruler(time_at(&l, view, pos.x)));
+    }
+    if l.vel.is_positive() && l.vel.contains(pos) {
+        return Some(Hit::Vel(time_at(&l, view, pos.x)));
+    }
     if l.keys.is_positive() && l.keys.contains(pos) {
         // Within key k's row, `key_at` runs (k-1, k] — the CEILING names
         // the row, not the floor.
@@ -550,7 +658,8 @@ mod tests {
             clip_len_s: 16.0,
             offset_s: 0.0,
             notes,
-            selected: None,
+            selected: &[],
+            marquee: None,
             view_start_s: 6.0,
             view_len_s: 20.0,
             top_key: 72.0,

@@ -805,6 +805,10 @@ pub struct Settings {
     /// Each channel's pan, -1..1, centre 0 — every strip has a pan knob
     /// now, the owner's rule.
     pub channel_pans: [f64; crate::recorder::CHANNELS],
+    /// The AUTO-PALETTE: on by default, a colour per slot from the chosen
+    /// set — hand-painted channels keep their own.
+    pub auto_palette: bool,
+    pub palette_choice: i64,
     /// The DRUM BUS: its fader and its pan. The pads sum through this
     /// strip — see `Strip::Drums`.
     pub drums_gain: f64,
@@ -1137,6 +1141,8 @@ impl Default for Settings {
             channel_inputs: Vec::new(),
             drums_gain: 1.0,
             drums_pan: 0.0,
+            auto_palette: true,
+            palette_choice: 0,
             // **Channel 0 ships as the DX7.** The default sound lives in a
             // pre-added MIDI channel with the built-in in bay 1 — see
             // `Default::default`'s `strip_inserts` — so a fresh install makes
@@ -1182,7 +1188,11 @@ impl Default for Settings {
             // is a fresh install's sound. See `channel_kinds` above.
             strip_inserts: {
                 let mut v =
-                    vec![String::new(); (crate::recorder::STRIPS + 1) * crate::recorder::INSERTS];
+                    vec![
+                        String::new();
+                        (crate::recorder::STRIPS + 1 + crate::recorder::DRUM_PADS)
+                            * crate::recorder::INSERTS
+                    ];
                 v[0] = crate::dialogs::BUILTIN_PATH.to_owned();
                 v
             },
@@ -1844,6 +1854,10 @@ impl Settings {
                 }
             }
         }
+        take_bool(&mut map, "auto_palette", &mut s.auto_palette);
+        if let Some(n) = map.shift_remove("palette_choice").and_then(|v| v.as_i64()) {
+            s.palette_choice = n.clamp(0, 4);
+        }
         if let Some(n) = map.shift_remove("drums_gain").and_then(|v| v.as_f64()) {
             if n.is_finite() && (0.0..=MAX_GAIN).contains(&n) {
                 s.drums_gain = n;
@@ -2007,7 +2021,10 @@ impl Settings {
         if !desk.inserts.is_empty() {
             self.strip_inserts = desk.inserts;
             self.strip_inserts
-                .truncate((crate::recorder::STRIPS + 1) * crate::recorder::INSERTS);
+                .truncate(
+                    (crate::recorder::STRIPS + 1 + crate::recorder::DRUM_PADS)
+                        * crate::recorder::INSERTS,
+                );
         }
         if !desk.names.is_empty() {
             self.strip_names = desk.names;
@@ -2516,6 +2533,8 @@ impl Settings {
                     .collect(),
             ),
         );
+        map.insert("auto_palette".into(), Value::Bool(self.auto_palette));
+        map.insert("palette_choice".into(), Value::from(self.palette_choice));
         map.insert("drums_gain".into(), serde_json::json!(self.drums_gain));
         map.insert("drums_pan".into(), serde_json::json!(self.drums_pan));
         map.insert(
@@ -4072,8 +4091,14 @@ mod tests {
                 "channel {i}'s colour moved"
             );
         }
-        assert_eq!(s.strip_inserts.len(), (STRIPS + 1) * INSERTS);
-        for i in 0..(STRIPS + 1) * INSERTS {
+        // The insert space carries the PAD seats past the master now, so
+        // the clamp is wider than the strips — what matters is the FRONT
+        // never slid.
+        assert!(
+            s.strip_inserts.len()
+                <= (STRIPS + 1 + crate::recorder::DRUM_PADS) * INSERTS
+        );
+        for i in 0..((STRIPS + 1) * INSERTS).min(s.strip_inserts.len()) {
             assert_eq!(s.strip_inserts[i], format!("/x/p{i}.vst3"), "bay {i} moved");
         }
     }

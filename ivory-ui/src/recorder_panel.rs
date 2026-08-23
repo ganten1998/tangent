@@ -2737,10 +2737,10 @@ pub(crate) fn draw_instrument_icon(painter: &Painter, b: Rect, ink: Color32) {
 /// A borrow out of the view rather than a flag, so that the panel draws the
 /// text the app is actually holding — a copy would be a second place for the
 /// caret and the characters to disagree.
-fn typing_for<'a>(view: &RecorderView<'a>, field: NumField) -> Option<&'a str> {
+fn typing_for(view: &RecorderView<'_>, field: NumField) -> Option<String> {
     view.editing
         .filter(|e| e.field == field)
-        .map(|e| e.text.as_str())
+        .map(crate::recorder::NumEdit::display)
 }
 
 /// The caret inside a caption+value box, after `typed_chars` characters of the
@@ -3701,10 +3701,16 @@ fn knob_face(cell: Rect) -> Option<KnobFace> {
     let (share, lo, hi) = KNOB_LABEL;
     let wanted = cell.height() * share;
     let label_h = if wanted >= lo { wanted.min(hi) } else { 0.0 };
+    // **Two strips now — the owner's dial standard**: the VALUE always
+    // above the knob, the LABEL always below it. The face takes what is
+    // left between them.
     let face = Rect::from_min_max(
         Pos2::new(cell.left(), cell.top() + label_h),
-        Pos2::new(cell.right(), cell.bottom()),
+        Pos2::new(cell.right(), cell.bottom() - label_h),
     );
+    if !face.is_positive() {
+        return None;
+    }
     let radius = face.width().min(face.height()) * 0.5;
     (radius >= KNOB_MIN_R).then_some(KnobFace {
         face,
@@ -3745,8 +3751,8 @@ struct Knob<'a> {
     value: f32,
     /// The word over it.
     label: &'a str,
-    /// What is being typed into it, if anything.
-    typing: Option<&'a str>,
+    /// What is being typed into it, if anything — caret drawn in.
+    typing: Option<String>,
     /// A hand is on it right now, so show the reading rather than the name.
     turning: bool,
     /// What the reading SAYS. A send is a percent and a tempo is a number of
@@ -3758,7 +3764,7 @@ struct Knob<'a> {
 }
 
 fn draw_knob(painter: &Painter, cell: Rect, k: &Knob<'_>, p: &Palette) {
-    let (value, label, typing, turning) = (k.value, k.label, k.typing, k.turning);
+    let (value, label, typing, turning) = (k.value, k.label, k.typing.as_deref(), k.turning);
     if !cell.is_positive() {
         return;
     }
@@ -3774,38 +3780,44 @@ fn draw_knob(painter: &Painter, cell: Rect, k: &Knob<'_>, p: &Palette) {
     else {
         return;
     };
-    // **The name gives way to the number while a hand is on it.** There is
-    // nowhere else on a knob to put characters, and a knob with no readout is
-    // one you set by ear and then cannot repeat. Whole percent: a knob is not
-    // a control anybody lands on a tenth of one, and the extra digits are
-    // noise moving under a moving hand.
-    let (text, ink) = match (typing, turning) {
-        (Some(typed), _) => (Some(format!("{typed}_")), p.ink),
-        (None, true) => (Some(k.reading.clone()), p.ink),
-        // The name only when there is a strip to put it in. See `knob_face`:
-        // the word is what gives way in a short band, not the control.
-        (None, false) => ((label_h > 0.0).then(|| label.to_owned()), p.faint),
+    // **The owner's dial standard: the VALUE always on top, the LABEL
+    // always on the bottom.** Typing replaces the value, in place, with the
+    // caret where the hand put it — never a box somewhere else.
+    let strip = label_h.max(KNOB_LABEL.1);
+    let top_band = Rect::from_min_max(
+        Pos2::new(cell.left(), cell.top()),
+        Pos2::new(cell.right(), cell.top() + strip),
+    );
+    let (top_text, top_ink) = match typing {
+        Some(typed) => (typed.to_owned(), p.ink),
+        None => (
+            k.reading.clone(),
+            if turning { p.ink } else { p.ink.gamma_multiply(0.8) },
+        ),
     };
-    if let Some(text) = text {
-        // A reading has to be drawn even when there is no label strip — it is
-        // the whole point of the gesture — so it borrows the top of the face.
-        let strip = label_h.max(KNOB_LABEL.1);
-        // **Fitted to the cell, not just to the strip.** The row's cells are
-        // wide and short; sizing the word off the strip alone leaves it far
-        // smaller than the space it has, and "CHORUS" is six characters that
-        // have somewhere to go.
-        let band = Rect::from_min_max(
-            Pos2::new(cell.left(), cell.top()),
-            Pos2::new(cell.right(), cell.top() + strip),
+    let size = fit_text(top_band, &top_text, strip * 0.96);
+    if size >= MIN_TEXT {
+        painter.text(
+            Pos2::new(cell.center().x, cell.top()),
+            Align2::CENTER_TOP,
+            &top_text,
+            font(size),
+            top_ink,
         );
-        let size = fit_text(band, &text, strip * 0.96);
+    }
+    if label_h > 0.0 {
+        let bottom = Rect::from_min_max(
+            Pos2::new(cell.left(), cell.bottom() - label_h),
+            cell.max,
+        );
+        let size = fit_text(bottom, label, label_h * 0.9);
         if size >= MIN_TEXT {
             painter.text(
-                Pos2::new(cell.center().x, cell.top()),
-                Align2::CENTER_TOP,
-                &text,
+                Pos2::new(cell.center().x, cell.bottom()),
+                Align2::CENTER_BOTTOM,
+                label,
                 font(size),
-                ink,
+                p.faint,
             );
         }
     }
@@ -3858,7 +3870,7 @@ fn draw_tempo(
     painter: &Painter,
     l: &Layout,
     bpm: f64,
-    typing: Option<&str>,
+    typing: Option<String>,
     turning: bool,
     p: &Palette,
 ) {
@@ -6057,6 +6069,7 @@ mod tests {
                 v.push(Some(crate::recorder::NumEdit {
                     field,
                     text: text.to_owned(),
+                    caret: 0,
                 }));
             }
         }
@@ -6943,7 +6956,9 @@ pub fn draw_setup(
     );
     {
         let typing = typing_for(view, NumField::Meter);
-        let shown = typing.map_or_else(|| view.time_signature.label(), str::to_owned);
+        let shown = typing
+            .clone()
+            .unwrap_or_else(|| view.time_signature.label());
         labelled(painter, l.time_sig, "SIG", &shown, p.ink, &p);
         if let Some(typed) = typing {
             draw_caption_caret(painter, l.time_sig, "SIG", &shown, typed.chars().count(), &p);

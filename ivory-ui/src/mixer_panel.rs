@@ -285,6 +285,17 @@ pub const STRIP_COLORS: [(u8, u8, u8); 27] = [
 /// Three, because the table is hues down and tones across.
 pub const PALETTE_COLUMNS: usize = 3;
 
+/// The AUTO-PALETTES: a colour per SLOT, worn by every channel nobody has
+/// painted by hand. Five staged sets — the default complements the wood
+/// and the dark lane field — and no custom ones yet, by the owner's word.
+pub const PALETTES: [(&str, [i64; 8]); 5] = [
+    ("IVORY", [4, 7, 10, 13, 16, 19, 22, 25]),
+    ("EMBER", [5, 8, 4, 7, 26, 25, 11, 3]),
+    ("TIDE", [17, 20, 14, 16, 19, 13, 23, 15]),
+    ("MOSS", [10, 13, 7, 12, 9, 6, 16, 11]),
+    ("NEON", [5, 8, 11, 14, 17, 20, 23, 26]),
+];
+
 /// The master's colour on a fresh install. Red, because it is the one channel
 /// you look for — the top tone of it, which is the one that reads as RED
 /// rather than as maroon.
@@ -602,15 +613,10 @@ impl Layout {
         // small mark in faded ink, drawn by `strip` — but a real target, and
         // only on a channel there is something to remove from. The name band
         // gives up its right end so the two can never contend.
-        let close = if view.removable {
-            let side = (panel.height() * 0.052).clamp(9.0, 15.0).min(panel.width() * 0.4);
-            Rect::from_min_size(
-                Pos2::new(panel.right() - 4.0 - side, panel.top() + 4.0),
-                Vec2::splat(side),
-            )
-        } else {
-            Rect::NOTHING
-        };
+        // The × retired: removing a track lives in the right-click menu
+        // now, where a destructive act belongs behind a named row.
+        let close = Rect::NOTHING;
+        let _ = view.removable;
         // **Under the name, not over it.** The master has no source to choose
         // and so no icon, and with the icon on top every other channel's name
         // sat a band lower than the master's — twelve labels at one height and
@@ -1120,6 +1126,46 @@ fn strip(
     if l.send.is_positive() {
         send_knob(painter, l.send, v.send, p);
         pan_knob(painter, l.pan, v.pan, p);
+        // The dial standard: values above, labels below, always.
+        let cap_ink = ink;
+        let cap = move |painter: &Painter, r: Rect, above: String, below: &str| {
+            if !r.is_positive() || r.height() < 18.0 {
+                return;
+            }
+            painter.text(
+                Pos2::new(r.center().x, r.top() - 1.0),
+                egui::Align2::CENTER_BOTTOM,
+                above,
+                FontId::new(7.5, crate::fonts::courier()),
+                cap_ink.gamma_multiply(0.9),
+            );
+            painter.text(
+                Pos2::new(r.center().x, r.bottom() + 1.0),
+                egui::Align2::CENTER_TOP,
+                below,
+                FontId::new(6.5, crate::fonts::courier()),
+                cap_ink.gamma_multiply(0.55),
+            );
+        };
+        if l.send.is_positive() {
+            cap(
+                painter,
+                l.send,
+                format!("{:.0}%", v.send.clamp(0.0, 1.0) * 100.0),
+                "SEND",
+            );
+        }
+        if l.pan.is_positive() {
+            let w = (v.pan.clamp(-1.0, 1.0) * 50.0).round() as i32;
+            let word = if w == 0 {
+                "C".to_owned()
+            } else if w < 0 {
+                format!("L{}", -w)
+            } else {
+                format!("R{w}")
+            };
+            cap(painter, l.pan, word, "PAN");
+        }
     }
     // **A rack: an ivory field with three strips down it.**
     //
@@ -2405,42 +2451,16 @@ mod tests {
     /// a channel that wears one, the name gives up the corner rather than
     /// sharing it.
     #[test]
-    fn only_a_removable_channel_wears_the_x() {
-        let v = a_view();
-        let r = rect();
-        let l = Layout::new(r, &v);
+    fn no_strip_wears_an_x_any_more() {
+        // The × retired: removal lives behind the right-click TRACK menu,
+        // where a destructive act has a named row. No strip lays one out
+        // and no press can find one.
+        let mut v = a_view();
+        v.strips[1].removable = true;
+        let l = Layout::new(rect(), &v);
         for (i, s) in l.strips.iter().enumerate() {
-            let want = v.strips[i].removable;
-            assert_eq!(
-                s.close.is_positive(),
-                want,
-                "column {i}: removable={want} but the × disagrees"
-            );
-            if want {
-                assert_eq!(
-                    hit_test(r, &v, s.close.center()),
-                    Some(Hit::Remove(Column(i))),
-                    "column {i}'s × cannot be pressed"
-                );
-                assert!(
-                    s.close.left() >= s.name.right(),
-                    "column {i}'s × sits on its own name field"
-                );
-            }
+            assert!(!s.close.is_positive(), "column {i} still wears an ×");
         }
-        // The master never wears one.
-        assert!(!l.strips[MASTER].close.is_positive());
-        // The backing track wears one exactly when the app says there is a
-        // track to remove.
-        let mut with_track = a_view();
-        let track_col = CLICK - 1;
-        with_track.strips[track_col].removable = true;
-        let l = Layout::new(r, &with_track);
-        assert!(l.strips[track_col].close.is_positive());
-        assert_eq!(
-            hit_test(r, &with_track, l.strips[track_col].close.center()),
-            Some(Hit::Remove(Column(track_col)))
-        );
     }
 
     /// **M S R on a general channel; M S on the click; nothing armable
