@@ -3124,6 +3124,14 @@ impl DesktopApp {
             self.recorder.session.audio_device_name().map(str::to_owned),
             self.recorder.session.audio_error().map(str::to_owned),
         );
+        // **A multichannel interface arrives fully exposed** — every mono
+        // input and the natural pairs, ticked the first time the device is
+        // met. Once per device: the chooser can prune, and pruning sticks.
+        if let Some((key, exposed)) =
+            crate::devices::auto_expose(&self.recorder.audio, self.app.auto_exposed_devices())
+        {
+            self.app.note_auto_exposed(key, exposed);
+        }
     }
 }
 

@@ -3661,11 +3661,13 @@ pub fn show(
                                     .color(t.text),
                                 );
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    // Offered only where there is a choice to
-                                    // make. A two-in device has one sensible
-                                    // answer and a button that opens a chooser
-                                    // holding it is furniture.
-                                    let can = *input_channels >= 3;
+                                    // Offered wherever there is more than one
+                                    // input — the owner's ruling: even a plain
+                                    // stereo interface must expose its two
+                                    // channels one at a time, because a mono
+                                    // microphone on input 2 of a two-in box is
+                                    // as real as one on input 6 of a rack.
+                                    let can = *input_channels >= 2;
                                     if ui
                                         .add_enabled(
                                             can,
