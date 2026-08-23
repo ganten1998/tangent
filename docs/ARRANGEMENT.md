@@ -366,6 +366,25 @@ channels play back their clips and nothing else. "Ready to play" and
   SYSTEM OUTPUT's own box (name-matched input side; explicit choices
   and "MIDI only" still win; the bare system mic is still never taken).
 
+- **4.54.0 — the 5 AM batch**: THE MIDI EDITOR WAS UNREACHABLE — the
+  double-click check ran in the press branch while egui fires the flag on
+  the second RELEASE; it (and the lane rename) moved to a release-edge
+  handler, proven by an input-simulation test. The input menu's rows are
+  cached the moment the DEVICE arrives (`tend_menu_cache`, key = uid +
+  width, 5 s TTL for hot-plug) and submenu rows light under the pointer.
+  The pre-scope CLUSTER lives in the LCD's LEFT half again — big
+  position + clock, Start/End/Length rows, every cell draggable
+  (`lcd_part_cells` stacked layout) — the scope keeps the right. The +
+  is a CIRCLE and the circle alone adds a BARE track (armed, send up,
+  kind None, NO INPUT chip; `tracks_added` bitmask; Ctrl/Cmd+T = first
+  free slot; both views wear the circle) — the chip binds later; the
+  rest of an empty strip is quiet ground for the right-click menu.
+  Knob tick skirts joined the size budget (labels never overdraw);
+  the master ladder runs to the VU tops and stepped left for the heart;
+  cmd/ctrl+wheel no longer duplicates alt-pan; the navigator's inner box
+  keeps one size wherever the viewport stands; the Track dialog is 480
+  tall so Done exists.
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index

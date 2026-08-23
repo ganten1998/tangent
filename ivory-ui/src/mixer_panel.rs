@@ -452,14 +452,15 @@ impl Layout {
         // dead fader on it would be five controls that do nothing, which is
         // the thing the plugin rack was already doing wrong.
         if view.empty {
+            // **The CIRCLE alone is the button now** — the owner's ruling:
+            // pressing it adds a bare track on the spot, and the rest of
+            // the empty panel is quiet ground where the right-click menu
+            // lives. A whole-column button was one mis-aimed press away
+            // from a track nobody meant to add.
+            let d = (panel.width() * 0.42).clamp(18.0, 40.0);
             return StripStrip {
                 panel,
-                // **The whole column, not the plus in the middle of it.** The
-                // plus is a picture of what pressing here does; a hundred
-                // points of empty channel that ignores a press is a column
-                // that looks dead until you find the one spot that is not.
-                // Nothing else is on an empty strip, so nothing can collide.
-                add: panel,
+                add: Rect::from_center_size(panel.center(), Vec2::splat(d)),
                 ..StripStrip::NONE
             };
         }
@@ -1237,15 +1238,16 @@ fn empty_slot(painter: &Painter, l: &StripStrip, p: &Ink) {
     if !r.is_positive() {
         return;
     }
-    // **A plus the size of a plus, on a target the size of the channel.** The
-    // whole panel is pressable now — see `Layout::one` — but drawing the mark
-    // at the size of the target gives a cross from corner to corner, which
-    // reads as a channel that has been struck out rather than one waiting to
-    // be filled.
-    let arm = r.width().min(r.height()) * 0.17;
+    // **A circled plus, and the circle IS the button**: press it and a
+    // bare track exists — no menu, no icon, a NO INPUT chip. The ring is
+    // what says "this much is pressable" on a panel that otherwise only
+    // answers the right-click.
     let c = r.center();
     let ink = p.face.gamma_multiply(0.55);
-    let w = (arm * 0.16).clamp(1.5, 4.0);
+    let radius = r.width().min(r.height()) * 0.5 - 1.0;
+    let w = (radius * 0.11).clamp(1.2, 2.5);
+    painter.circle_stroke(c, radius, Stroke::new(w, ink));
+    let arm = radius * 0.45;
     painter.line_segment(
         [Pos2::new(c.x - arm, c.y), Pos2::new(c.x + arm, c.y)],
         Stroke::new(w, ink),
@@ -1869,23 +1871,28 @@ mod tests {
     /// A hundred points of empty column that ignores a press is a channel that
     /// looks dead until you find the one spot in the middle that is not.
     #[test]
-    fn an_empty_channel_is_pressable_anywhere_on_it() {
+    fn an_empty_channels_circle_adds_and_the_rest_is_quiet_ground() {
         let mut v = a_view();
         v.strips[0].empty = true;
         let r = rect();
         let l = Layout::new(r, &v);
         let panel = l.strips[0].panel;
+        // The circle answers with ADD…
+        assert_eq!(
+            hit_test(r, &v, l.strips[0].add.center()),
+            Some(Hit::Add(Column(0))),
+            "the circled plus cannot be pressed"
+        );
+        // …and the rest of the panel is quiet ground — where the
+        // right-click menu lives, and where a mis-aimed press adds nothing.
         for (what, at) in [
-            ("the middle", panel.center()),
             ("the top-left", Pos2::new(panel.left() + 3.0, panel.top() + 3.0)),
             ("the bottom-right", Pos2::new(panel.right() - 3.0, panel.bottom() - 3.0)),
-            ("the top edge", Pos2::new(panel.center().x, panel.top() + 1.0)),
-            ("the bottom edge", Pos2::new(panel.center().x, panel.bottom() - 1.0)),
         ] {
             assert_eq!(
                 hit_test(r, &v, at),
-                Some(Hit::Add(Column(0))),
-                "{what} of an empty channel does nothing"
+                None,
+                "{what} of an empty channel is not quiet ground"
             );
         }
     }

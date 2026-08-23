@@ -821,20 +821,9 @@ impl Layout {
         if !m.is_positive() || !(knob_size.x > 0.0 && knob_size.y > 0.0) {
             return;
         }
-        // **The heart holds the very corner** — the owner's spot — and the
-        // master column alone starts under it: a scale number with a heart
-        // on it is a number nobody can read.
-        let m = if self.heart.is_positive() && self.heart.right() > m.left() {
-            Rect::from_min_max(
-                Pos2::new(m.left(), m.top().max(self.heart.bottom() + 2.0)),
-                m.max,
-            )
-        } else {
-            m
-        };
-        if !m.is_positive() {
-            return;
-        }
+        // **The heart holds the very corner** and the ladder now runs past
+        // it to the VU faces' top line — the column moved LEFT instead, so
+        // the two share the height without sharing any pixels.
         // The knob sits at the foot of the column, the same size as an effect
         // knob, **centred between the two ladders rather than on the column**.
         // The column carries the scale down its left-hand side, so its centre
@@ -892,7 +881,10 @@ impl Layout {
         // sized by this column's width, and the margin was twice what the
         // rule between them needs.
         let right = slice_h(t, FADER_COL + 0.02, MASTER_COL);
-        let master_col = slice_h(t, MASTER_COL + 0.02, 1.00);
+        // A touch LEFT of where it was, and no longer stopped under the
+        // heart: the ladder runs to the VU faces' own top line, and the
+        // heart keeps the corner with room to breathe beside the ladder.
+        let master_col = slice_h(t, MASTER_COL + 0.005, 0.985);
         self.meter = slice_v(right, 0.0, METER_SHARE);
         let knobs = slice_v(right, METER_SHARE + 0.03, 1.0);
         // Side by side, one third each, with the gap inside the cell: the
@@ -2437,20 +2429,25 @@ fn draw_timecode_cluster(painter: &Painter, r: Rect, view: &RecorderView<'_>, p:
     }
     painter.rect_filled(r, 2.0, LCD_FACE);
     painter.rect_stroke(r, 2.0, Stroke::new(1.0_f32, p.line), egui::StrokeKind::Inside);
-    let main = slice_h(r, 0.02, 0.48);
+    // The LEFT HALF carries the whole pre-scope cluster now, STACKED: the
+    // big musical position with the clock beside it on top, the viewport's
+    // Start/End/Length rows under them — every part still draggable. The
+    // scope keeps the right half.
+    let half = slice_h(r, 0.02, 0.475);
+    let main = slice_v(half, 0.02, 0.52);
     painter.rect_filled(rule_x(r, r.left() + r.width() * 0.49), 0.0, p.line.gamma_multiply(0.5));
     let font = |size: f32| FontId::monospace(size);
     // The big number: where the playhead stands, musically — as large as
     // the face allows, the number somebody reads from the bench.
     let (b, bt, th) = bars_beats_parts(view.position_s, view.tempo_bpm, view.time_signature);
     let big = format!("{b}| {bt}| {th:03}");
-    let big_box = slice_v(main, 0.05, 0.68);
-    let size = fit_text(big_box, &big, big_box.height() * 0.78);
+    let big_box = slice_h(main, 0.0, 0.66);
+    let size = fit_text(big_box, &big, big_box.height() * 0.62);
     if size >= MIN_TEXT {
         painter.text(big_box.center(), Align2::CENTER_CENTER, &big, font(size), LCD_GREEN);
-        let small_box = slice_v(main, 0.68, 0.98);
+        let small_box = slice_h(main, 0.66, 1.0);
         let clock = time_text(view.position_s);
-        let ssize = fit_text(small_box, &clock, small_box.height() * 0.6);
+        let ssize = fit_text(small_box, &clock, small_box.height() * 0.34);
         if ssize >= MIN_TEXT {
             painter.text(
                 small_box.center(),
@@ -2461,14 +2458,92 @@ fn draw_timecode_cluster(painter: &Painter, r: Rect, view: &RecorderView<'_>, p:
             );
         }
     }
-    // **The right half is the OSCILLOSCOPE now** — the sibling session's
+    // Start / End / Length of the VIEWPORT — the timeline's own numbers,
+    // never a clip's, live even over an empty song — compressed beside the
+    // clock at the owner's word, every part draggable by the unit it shows.
+    let (win_s, win_l) = view.view_window;
+    let rows = [("Start", win_s), ("End", win_s + win_l), ("Length", win_l)];
+    let side = slice_v(half, 0.54, 0.98);
+    let cells = lcd_part_cells(r);
+    for (i, (label, secs)) in rows.iter().enumerate() {
+        let row = slice_v(side, i as f32 / 3.0, (i as f32 + 1.0) / 3.0);
+        let lab = slice_h(row, 0.0, 0.22);
+        let lsize = fit_text(lab, label, row.height() * 0.5);
+        if lsize >= MIN_TEXT {
+            painter.text(
+                Pos2::new(lab.left() + 2.0, lab.center().y),
+                Align2::LEFT_CENTER,
+                *label,
+                font(lsize),
+                LCD_GREEN.gamma_multiply(0.45),
+            );
+        }
+        // Start and End are POSITIONS and count from one; Length is a
+        // DURATION and counts from zero — thirty bars long is 30, not 31.
+        let (b, bt, th) = bars_beats_parts(*secs, view.tempo_bpm, view.time_signature);
+        let (b, bt) = if i == 2 { (b - 1, bt - 1) } else { (b, bt) };
+        let words = [format!("{b}"), format!("{bt}"), format!("{th:03}")];
+        for (part, cell) in cells[i].iter().enumerate() {
+            if !cell.is_positive() {
+                continue;
+            }
+            let csize = fit_text(*cell, &words[part], cell.height() * 0.58);
+            if csize >= MIN_TEXT {
+                painter.text(
+                    Pos2::new(cell.right() - 3.0, cell.center().y),
+                    Align2::RIGHT_CENTER,
+                    &words[part],
+                    font(csize),
+                    LCD_GREEN,
+                );
+            }
+            if part < 2 {
+                painter.text(
+                    Pos2::new(cell.right() - 0.5, cell.center().y),
+                    Align2::LEFT_CENTER,
+                    "|",
+                    font(csize.max(8.0) * 0.9),
+                    LCD_GREEN.gamma_multiply(0.4),
+                );
+            }
+        }
+    }
+    // **The right half is the OSCILLOSCOPE** — the sibling session's
     // widget, the owner's pick: the speakers' mix without the click, on
-    // the same black glass the timecode is behind. Start/End/Length and
-    // their draggable cells retired with it; the viewport still answers
-    // to the navigator, the wheel and the ruler.
-    let side = slice_h(r, 0.50, 0.99);
-    let scope_r = slice_v(side, 0.07, 0.93).shrink2(egui::vec2(2.0, 0.0));
+    // the same black glass the timecode is behind.
+    let scope_side = slice_h(r, 0.50, 0.99);
+    let scope_r = slice_v(scope_side, 0.07, 0.93).shrink2(egui::vec2(2.0, 0.0));
     view.scope.draw(painter, scope_r, &crate::scope::ScopeStyle::lcd());
+}
+
+/// Start, End, Length of the arrangement's viewport — each value in three
+/// draggable cells, in the CLUSTER's left half beside the clock.
+pub fn lcd_part_cells(lcd: Rect) -> [[Rect; 3]; 3] {
+    let half = slice_h(lcd, 0.02, 0.475);
+    let side = slice_v(half, 0.54, 0.98);
+    std::array::from_fn(|row| {
+        let r = slice_v(side, row as f32 / 3.0, (row as f32 + 1.0) / 3.0);
+        // The label owns the left fifth; the value cells the rest.
+        let v = slice_h(r, 0.22, 1.0);
+        let cuts = [0.0, 0.42, 0.66, 1.0];
+        std::array::from_fn(|part| slice_h(v, cuts[part], cuts[part + 1]))
+    })
+}
+
+/// Which LCD part a press landed on: `(row, part)`, rows Start/End/Length.
+pub fn lcd_part_at(rect: Rect, view: &RecorderView<'_>, pos: Pos2) -> Option<(u8, u8)> {
+    let l = Layout::new(rect, view);
+    if !l.lcd.is_positive() || !l.lcd.contains(pos) {
+        return None;
+    }
+    for (row, cells) in lcd_part_cells(l.lcd).iter().enumerate() {
+        for (part, cell) in cells.iter().enumerate() {
+            if cell.is_positive() && cell.contains(pos) {
+                return Some((row as u8, part as u8));
+            }
+        }
+    }
+    None
 }
 // ── the instrument slots ───────────────────────────────────────────────────
 
@@ -3591,8 +3666,10 @@ const MASTER_SCALE_W: f32 = 0.26;
 /// The smallest knob face worth drawing, as a radius.
 ///
 /// Below this the body, the cap and the slot land inside a few points of each
-/// other and it is three grey rings, not a control.
-const KNOB_MIN_R: f32 = 7.0;
+/// other and it is three grey rings, not a control. 5.5 since the tick
+/// skirt joined the size budget — the same on-screen threshold as the old
+/// 7.0 was against the un-budgeted radius.
+const KNOB_MIN_R: f32 = 5.5;
 
 /// The label's share of a knob cell, and its bounds in points.
 ///
@@ -3644,7 +3721,11 @@ fn knob_face(cell: Rect) -> Option<KnobFace> {
     if !face.is_positive() {
         return None;
     }
-    let radius = face.width().min(face.height()) * 0.5;
+    // The SKIRT is part of the budget: ticks stand out to 1.26 of the
+    // radius, and a face sized to the strip put its lower ticks under the
+    // label — the owner watched REVERB overdraw them. The whole drawing,
+    // ticks included, now fits the band between the value and the label.
+    let radius = face.width().min(face.height()) * 0.5 / 1.26;
     (radius >= KNOB_MIN_R).then_some(KnobFace {
         face,
         radius,
@@ -5524,6 +5605,22 @@ mod tests {
                 None,
                 "the LCD answered a press at {frac} of its width"
             );
+        }
+        // And the REVIVED cluster: every Start/End/Length cell stands in
+        // the LEFT half and answers the part pre-pass at its own centre.
+        for (row, cells) in lcd_part_cells(l.lcd).iter().enumerate() {
+            for (part, cell) in cells.iter().enumerate() {
+                assert!(cell.is_positive(), "cell {row}/{part} has no room");
+                assert!(
+                    cell.center().x < l.lcd.left() + l.lcd.width() * 0.5,
+                    "cell {row}/{part} strayed into the scope half"
+                );
+                assert_eq!(
+                    lcd_part_at(r, &v, cell.center()),
+                    Some((row as u8, part as u8)),
+                    "cell {row}/{part} does not answer at its own centre"
+                );
+            }
         }
     }
 

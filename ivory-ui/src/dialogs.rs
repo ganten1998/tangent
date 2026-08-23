@@ -4227,11 +4227,12 @@ pub fn show(
                 ctx,
                 placement,
                 "Track",
-                // Sized for everything it holds — the remove button, three
-                // swatch rows, five palette rows AND the Done button; at 316
-                // the Done was cut off at the bottom on the owner's screen.
-                Vec2::new(300.0, 408.0),
-                Vec2::new(300.0, 388.0),
+                // Sized for everything it holds — measured against the
+                // owner's screenshot TWICE now: the remove button, three
+                // swatch rows, five palette rows and the Done button, with
+                // egui's own item spacing between all of them.
+                Vec2::new(300.0, 480.0),
+                Vec2::new(300.0, 460.0),
                 |ui, result| {
                     apply_theme(ui.style_mut(), &t);
                     ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);

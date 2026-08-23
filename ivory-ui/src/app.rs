@@ -412,6 +412,17 @@ pub struct IvoryApp {
     /// The TIME SELECTION, in song seconds: drawn over the lanes, offered
     /// to the export. A ruler click clears it.
     time_sel: Option<(f64, f64)>,
+    /// The input menu's submenu rows, built when the DEVICE arRIVES and
+    /// refreshed only when it changes (or a 5 s TTL passes for MIDI
+    /// hot-plug) — the menu itself never waits on an OS enumeration.
+    menu_rows_cache: Option<[Vec<String>; 3]>,
+    menu_cache_key: (String, usize),
+    menu_cache_at: Option<std::time::Instant>,
+    /// The submenu row under the pointer, for the hover light.
+    menu_hover_row: Option<usize>,
+    /// An LCD Start/End/Length cell being ridden: row, part, and the y the
+    /// current step was measured from.
+    lcd_drag: Option<(u8, u8, f32)>,
     /// Patch names of the cartridge the host has loaded, for the picker. The
     /// app never reads a `.syx`: this is pushed in after the host parses one.
     cartridge: crate::ports::CartridgeInfo,
@@ -1137,6 +1148,11 @@ impl IvoryApp {
             export_project_spec: crate::ports::ProjectExportSpec::default(),
             scope: crate::scope::Scope::new(48_000.0),
             time_sel: None,
+            menu_rows_cache: None,
+            menu_cache_key: (String::new(), 0),
+            menu_cache_at: None,
+            menu_hover_row: None,
+            lcd_drag: None,
             cartridge: crate::ports::CartridgeInfo::default(),
             plugin_rescan: false,
             reveal_request: None,
@@ -2120,13 +2136,16 @@ impl IvoryApp {
             // channel rather than in it.
             H::Add(i) => {
                 match i.strip() {
-                    // **The icon IS the input now.** The MIDI-or-AUDIO ask
-                    // and the kind cycle both retired with the owner's
-                    // ruling: a track is what its input makes it, so the
-                    // press — on an empty channel's plus or a used one's
-                    // icon — opens the one menu that answers the question.
+                    // **The + circle ADDS, the chip BINDS.** An empty
+                    // slot's circled plus makes a bare track on the spot —
+                    // no menu, no icon, a NO INPUT chip; a used channel's
+                    // icon opens the input menu that answers what feeds it.
                     Some(Strip::Channel(n)) => {
-                        self.open_input_menu(n);
+                        if self.channel_used(n) {
+                            self.open_input_menu(n);
+                        } else {
+                            self.add_bare_track(n);
+                        }
                     }
                     // The metronome IS the click switch, here as in the band.
                     Some(Strip::Click) => {
@@ -2241,6 +2260,7 @@ impl IvoryApp {
     /// a stranger's settings, which is worse than either keeping the channel
     /// or losing it.
     fn remove_channel(&mut self, n: usize) {
+        self.settings.tracks_added &= !(1 << n);
         use crate::recorder::Strip;
         let d = Settings::default();
         let at = Strip::Channel(n).index();
@@ -2578,7 +2598,7 @@ impl IvoryApp {
                         .map(String::as_str)
                         .unwrap_or(""),
                     g.channels.get(n).copied().unwrap_or(1.0),
-                    kind.is_none() && !self.lane_has_clips(n),
+                    !self.channel_used(n),
                 ),
                 Strip::Drums => ("DRUM BUS", "", self.settings.drums_gain as f32, false),
                 Strip::Click => ("CLICK", "", g.metronome, false),
@@ -3117,6 +3137,18 @@ impl IvoryApp {
             self.clicked.clear();
             self.timeline_scrub = false;
             self.viewport_pan = None;
+            self.lcd_drag = None;
+        }
+        // An LCD number, ridden: every eight points of travel is one unit
+        // of whatever cell the press took — up for more, the knobs' rule.
+        if let (Some((row, part, from_y)), Some(pos), true) =
+            (self.lcd_drag, pointer, pointer_down)
+        {
+            let steps = f64::from(((from_y - pos.y) / 8.0).trunc());
+            if steps.abs() >= 1.0 {
+                self.lcd_adjust(row, part, steps);
+                self.lcd_drag = Some((row, part, from_y - steps as f32 * 8.0));
+            }
         }
         // The scrub: the locate follows the hand for as long as the press
         // that landed on the timeline is held. X only, clamped at the ends —
@@ -3198,6 +3230,14 @@ impl IvoryApp {
                     {
                         self.settings.heart_color = self.settings.heart_color.wrapping_add(1);
                         self.save_settings();
+                        return;
+                    }
+                    // The LCD's part cells: a press takes the number by
+                    // the unit under the hand, and the drag below turns it.
+                    if let Some((row, part)) =
+                        recorder_panel::lcd_part_at(r, &self.recorder_layout_view(), pos)
+                    {
+                        self.lcd_drag = Some((row, part, pos.y));
                         return;
                     }
                     let hit = recorder_panel::hit_test(
@@ -4442,18 +4482,56 @@ impl IvoryApp {
         self.desk_reload = true;
     }
 
-    /// Open the input menu for channel `ch`, hung from the last press.
-    fn open_input_menu(&mut self, ch: usize) {
-        let rows = [
-            self.input_menu_sub(0),
-            self.input_menu_sub(1),
-            self.input_menu_sub(2),
-        ];
+    /// The submenu cache's identity: which interface, how wide. A change
+    /// means the rows are about a different box.
+    fn menu_cache_key_now(&self) -> (String, usize) {
+        let name = self
+            .settings
+            .record_audio_device
+            .clone()
+            .unwrap_or_default();
         let width = self
             .audio_setup
             .as_ref()
             .map(|s| usize::from(s.input_channels()))
             .unwrap_or(0);
+        (name, width)
+    }
+
+    /// (Re)build the submenu rows. Called when the device arrives or
+    /// changes — never from the menu's own frame.
+    fn refresh_menu_rows(&mut self) {
+        self.menu_rows_cache = Some([
+            self.input_menu_sub(0),
+            self.input_menu_sub(1),
+            self.input_menu_sub(2),
+        ]);
+        self.menu_cache_key = self.menu_cache_key_now();
+        self.menu_cache_at = Some(std::time::Instant::now());
+    }
+
+    /// Keep the cache warm: the moment the interface reports (or changes),
+    /// the rows are rebuilt — so the first open of the menu is as instant
+    /// as every other. Runs once a frame; rebuilds only on a real change.
+    fn tend_menu_cache(&mut self) {
+        let key = self.menu_cache_key_now();
+        if self.menu_rows_cache.is_none() || key != self.menu_cache_key {
+            self.refresh_menu_rows();
+        }
+    }
+
+    /// Open the input menu for channel `ch`, hung from the last press —
+    /// from the CACHE, instantly. A 5 s TTL catches MIDI hot-plug.
+    fn open_input_menu(&mut self, ch: usize) {
+        let stale = self
+            .menu_cache_at
+            .is_none_or(|at| at.elapsed() > std::time::Duration::from_secs(5));
+        if stale || self.menu_cache_key != self.menu_cache_key_now() {
+            self.refresh_menu_rows();
+        }
+        let rows = self.menu_rows_cache.clone().unwrap_or_default();
+        let width = self.menu_cache_key.1;
+        self.menu_hover_row = None;
         self.input_menu = Some(InputMenu {
             ch,
             at: self.menu_anchor,
@@ -4615,22 +4693,23 @@ impl IvoryApp {
                 .map(|s| usize::from(s.input_channels()))
                 .unwrap_or(0);
             if width > 0 {
-                m.rows = [
-                    self.input_menu_sub(0),
-                    self.input_menu_sub(1),
-                    self.input_menu_sub(2),
-                ];
+                self.refresh_menu_rows();
+                m.rows = self.menu_rows_cache.clone().unwrap_or_default();
                 m.devices_offered = false;
             }
         }
         let (tops, subs) = self.input_menu_rects(&m);
         let pointer = ctx.pointer_latest_pos().or(ctx.pointer_interact_pos());
+        self.menu_hover_row = None;
         if let Some(pos) = pointer {
             if let Some(i) = tops.iter().position(|r| r.contains(pos)) {
                 if i < 3 {
                     m.hover = Some(i);
                 }
             }
+            // The row under the hand lights — the feedback the owner asked
+            // for when "input 2" is hovered.
+            self.menu_hover_row = subs.iter().position(|r| r.contains(pos));
             // Off both columns the submenu STAYS: the diagonal path a hand
             // takes to reach it leaves the top row for a moment.
         }
@@ -4714,7 +4793,10 @@ impl IvoryApp {
         if let Some(top) = m.hover {
             let rows = &m.rows[top.min(2)];
             column(painter, &subs);
-            for (r, label) in subs.iter().zip(rows) {
+            for (i, (r, label)) in subs.iter().zip(rows).enumerate() {
+                if self.menu_hover_row == Some(i) {
+                    painter.rect_filled(r.shrink(1.0), 2.0, lit);
+                }
                 painter.text(
                     egui::Pos2::new(r.left() + 8.0, r.center().y),
                     egui::Align2::LEFT_CENTER,
@@ -4801,6 +4883,39 @@ impl IvoryApp {
     /// A strip's colour, the ONE authority: a hand-painted choice wins;
     /// otherwise the AUTO-PALETTE names a colour per slot; everything else
     /// wears the wood.
+    /// Whether channel `n` IS a track: an input bound, clips standing on
+    /// it, or added bare by the + circle / Ctrl+T.
+    pub fn channel_used(&self, n: usize) -> bool {
+        self.channel_kind(n).is_some()
+            || self.lane_has_clips(n)
+            || (self.settings.tracks_added >> n) & 1 == 1
+    }
+
+    /// Add a BARE track on channel `n`: it exists, armed with its send up,
+    /// and says NO INPUT until the chip binds one — the owner's flow.
+    fn add_bare_track(&mut self, n: usize) {
+        if n >= crate::recorder::CHANNELS {
+            return;
+        }
+        self.settings.tracks_added |= 1 << n;
+        if let Some(send) = self
+            .settings
+            .strip_sends
+            .get_mut(crate::recorder::Strip::Channel(n).index())
+        {
+            *send = 1.0;
+        }
+        self.armed |= 1 << n;
+        self.save_settings();
+    }
+
+    /// Ctrl+T's landing place: the first channel that is not a track yet.
+    fn add_track_first_free(&mut self) {
+        if let Some(n) = (0..crate::recorder::CHANNELS).find(|n| !self.channel_used(*n)) {
+            self.add_bare_track(n);
+        }
+    }
+
     pub fn strip_color(&self, i: usize) -> usize {
         let manual = self.settings.strip_colors.get(i).copied().unwrap_or(0);
         if manual != 0 {
@@ -5009,6 +5124,29 @@ impl IvoryApp {
     }
 
     /// One bar in seconds, from the band's own tempo and signature.
+    /// One LCD drag step: `row` is Start/End/Length, `part` the unit —
+    /// a bar, a beat, or a hundredth of one. Start PANS the viewport, End
+    /// moves its far edge, Length zooms around its centre.
+    fn lcd_adjust(&mut self, row: u8, part: u8, steps: f64) {
+        let bar = self.arr_bar_s();
+        let beat = bar / f64::from(self.time_signature().beats.max(1));
+        let unit = match part {
+            0 => bar,
+            1 => beat,
+            _ => beat / 100.0,
+        };
+        let d = steps * unit;
+        let (s, l) = self.arr_window_now();
+        match row {
+            0 => self.arr_steer(s + d, l),
+            1 => self.arr_steer(s, (l + d).max(0.25)),
+            _ => {
+                let nl = (l + d).max(0.25);
+                self.arr_steer(s - (nl - l) * 0.5, nl);
+            }
+        }
+    }
+
     fn arr_bar_s(&self) -> f64 {
         let bpm = f64::from(self.tempo_bpm()).clamp(20.0, 400.0);
         let sig = self.time_signature();
@@ -6804,7 +6942,10 @@ impl IvoryApp {
         let (scroll, pan_mod, shift, alt) = ctx.input(|i| {
             (
                 i.raw_scroll_delta,
-                i.modifiers.command || i.modifiers.ctrl || i.modifiers.shift,
+                // **Shift alone.** Cmd/Ctrl+wheel used to pan too — the
+                // same gesture as Alt+wheel under a different finger, and
+                // the owner asked for one spelling. Alt is the pan.
+                i.modifiers.shift,
                 i.modifiers.shift,
                 i.modifiers.alt,
             )
@@ -6865,6 +7006,51 @@ impl IvoryApp {
         }
 
         // ── presses ───────────────────────────────────────────────────────
+        // **Double-clicks first, on egui's own terms**: the flag fires on
+        // the second RELEASE, which the press branch below never sees — the
+        // MIDI editor was unreachable and the lane rename with it, checked
+        // inside `if pressed`. The mixer has always handled its doubles out
+        // here for exactly this reason.
+        if ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary)) {
+            if let Some(p) = pointer.filter(|p| rect.contains(*p)) {
+                let hit = {
+                    let clips = self.arr_clip_views();
+                    let view = self.arrange_view(&clips);
+                    crate::arrangement_panel::hit_test(rect, &view, p)
+                };
+                use crate::arrangement_panel::Hit as A;
+                match hit {
+                    Some(A::ClipBody(id)) => {
+                        let is_midi = self
+                            .arrangement
+                            .clips
+                            .iter()
+                            .find(|c| c.id == id)
+                            .is_some_and(|c| {
+                                c.kind == crate::arrangement::ClipKind::Midi
+                            });
+                        if is_midi {
+                            self.arr_drag = None;
+                            self.open_midi_editor(id);
+                            return;
+                        }
+                    }
+                    Some(A::HdrName(n)) => {
+                        let seed = self
+                            .settings
+                            .strip_names
+                            .get(n)
+                            .filter(|s| !s.is_empty())
+                            .cloned()
+                            .unwrap_or_else(|| self.channel_display_name(n).to_owned());
+                        self.mixer_naming = Some((crate::recorder::Column(n), seed));
+                        self.arr_drag = None;
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
         if pressed {
             if let Some(p) = pointer.filter(|p| rect.contains(*p)) {
                 let (hit, t_at) = {
@@ -6887,23 +7073,15 @@ impl IvoryApp {
                         self.menu_anchor = p;
                         self.open_input_menu(n);
                     }
+                    // The circled plus: a bare track, on the spot.
+                    Some(A::HdrAdd(n)) => {
+                        self.add_bare_track(n);
+                    }
                     // A single press on the NAME does nothing; the rename is
                     // the double-click, the mixer's own rule.
-                    Some(A::HdrName(n)) => {
-                        let double = ctx.input(|i| {
-                            i.pointer.button_double_clicked(egui::PointerButton::Primary)
-                        });
-                        if double {
-                            let seed = self
-                                .settings
-                                .strip_names
-                                .get(n)
-                                .filter(|s| !s.is_empty())
-                                .cloned()
-                                .unwrap_or_else(|| self.channel_display_name(n).to_owned());
-                            self.mixer_naming = Some((Column(n), seed));
-                        }
-                    }
+                    // The rename is the double-click, handled above on the
+                    // release edge; a single press does nothing.
+                    Some(A::HdrName(_)) => {}
                     // The seam: drag to resize the header column.
                     Some(A::HeaderGrip) => {
                         self.arr_drag = Some(ArrDrag::HeaderGrip);
@@ -6967,15 +7145,8 @@ impl IvoryApp {
                         let double = ctx.input(|i| {
                             i.pointer.button_double_clicked(egui::PointerButton::Primary)
                         });
-                        let is_midi = self
-                            .arrangement
-                            .clips
-                            .iter()
-                            .find(|c| c.id == id)
-                            .is_some_and(|c| c.kind == crate::arrangement::ClipKind::Midi);
-                        if double && is_midi {
-                            self.open_midi_editor(id);
-                        } else if let Some(c) =
+                        let _ = double;
+                        if let Some(c) =
                             self.arrangement.clips.iter().find(|c| c.id == id)
                         {
                             let dt = t_at - c.start_s;
@@ -7211,6 +7382,16 @@ impl IvoryApp {
         {
             self.arr_delete_selected();
         }
+        // **Ctrl/Cmd+T: a new track**, bare, on the first free slot — the
+        // owner's keyboard twin of the + circle.
+        if keys_ok
+            && self.midi_edit.is_none()
+            && ctx.input(|i| {
+                (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::T)
+            })
+        {
+            self.add_track_first_free();
+        }
 
         // ── files dropped from the outside world ──────────────────────────
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
@@ -7260,8 +7441,14 @@ impl IvoryApp {
     /// window's end, PLUS a quarter-window of air — so the inner rectangle
     /// always has somewhere to go and a drag always shows.
     fn nav_domain_s(&self) -> f64 {
+        // **Stable while you pan.** The domain used to chase the viewport
+        // end, so the inner box SWELLED as you scrolled left and shrank as
+        // you scrolled right — the owner watched it not match. The world is
+        // the song (or one viewport, whichever is longer); it only stretches
+        // when the window is genuinely past the end, because then there is
+        // more world to show.
         let (s, l) = self.arr_window_now();
-        self.arr_span().max(s + l) + l * 0.25
+        self.arr_span().max(l).max(s + l)
     }
 
     fn scrub_domain_s(&self) -> f64 {
@@ -7319,7 +7506,7 @@ impl IvoryApp {
                     input: self.input_chip_text(n),
                     color: self.strip_color(n),
                     kind,
-                    used: kind.is_some() || self.lane_has_clips(n),
+                    used: self.channel_used(n),
                     armed: self.armed & (1 << n) != 0,
                     muted: desk.muted[n],
                     soloed: desk.soloed[n],
@@ -10416,6 +10603,9 @@ impl IvoryApp {
         self.input_chip_texts = (0..crate::recorder::CHANNELS)
             .map(|ch| self.input_chip_text(ch))
             .collect();
+        // The input menu's rows, kept warm: rebuilt the frame the device
+        // arrives or changes, so the menu never opens against a cold cache.
+        self.tend_menu_cache();
         crate::shell::viewport_ui(ctx, |ui| self.paint(ui));
     }
 
@@ -11451,6 +11641,16 @@ impl IvoryApp {
         // — every surface below stands down for the frame.
         let input_menu_owns = self.input_menu_frame(&ctx);
         if let Some(rect) = self.mixer_rect.filter(|_| !input_menu_owns) {
+            // **Ctrl/Cmd+T: a new track**, here as in the arrangement.
+            if self.dialog.is_none()
+                && self.mixer_typing.is_none()
+                && self.mixer_naming.is_none()
+                && ctx.input(|i| {
+                    (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::T)
+                })
+            {
+                self.add_track_first_free();
+            }
             // **What is being typed into a decibel field.**
             //
             // Read from raw events rather than through an egui widget, for the
@@ -13549,37 +13749,47 @@ mod tests {
         assert_eq!(app.mixer_fx_menu, None);
     }
 
-    /// **A press on an empty channel opens the INPUT menu**, and choosing
-    /// an input is what adds the track — the MIDI-or-AUDIO ask retired
-    /// with the owner's REAPER ruling: the input IS the kind.
+    /// **The + circle ADDS a bare track on the spot** — armed, send up, no
+    /// icon, NO INPUT on the chip — and the icon of a track that exists
+    /// opens the input menu. Ctrl+T lands on the first free slot the same
+    /// way. The MIDI-or-AUDIO ask stays gone.
     #[test]
-    fn an_empty_channel_opens_the_input_menu_and_binding_adds_the_track() {
+    fn the_plus_circle_adds_a_bare_track_and_the_icon_opens_the_menu() {
         use crate::mixer_panel::Hit;
-        use crate::recorder::{ChannelKind, Column, Strip};
+        use crate::recorder::{Column, Strip};
         let (_, mut app) = headless(Caps::DESKTOP);
         let n = (0..crate::recorder::CHANNELS)
-            .find(|n| app.channel_kind(*n).is_none())
+            .find(|n| !app.channel_used(*n))
             .expect("a fresh desk has an unused channel");
 
         app.apply_mixer_hit(Hit::Add(Column(n)), 0.0);
-        assert!(
-            matches!(app.input_menu, Some(InputMenu { ch, .. }) if ch == n),
-            "the press did not open the input menu"
-        );
-        assert_eq!(app.channel_kind(n), None, "opening must not add yet");
-
-        // MIDI -> ALL through the menu is what adds the track.
-        if let Some(m) = app.input_menu.as_mut() {
-            m.hover = Some(2);
-        }
-        app.apply_input_pick(2, 0);
-        assert_eq!(app.channel_kind(n), Some(ChannelKind::Midi));
+        assert!(app.channel_used(n), "the circle did not add the track");
+        assert_eq!(app.channel_kind(n), None, "a bare track has no kind yet");
+        assert!(app.input_menu.is_none(), "adding must not open a menu");
         let at = Strip::Channel(n).index();
         assert!(
             (app.settings.strip_sends[at] - 1.0).abs() < 1e-9,
             "a fresh track's send should come up at 1.0"
         );
-        assert_eq!(app.input_menu, None, "choosing closes the menu");
+        assert_ne!(app.armed & (1 << n), 0, "a fresh track opened dead");
+
+        // The same press on the now-EXISTING track opens the input menu.
+        app.apply_mixer_hit(Hit::Add(Column(n)), 0.0);
+        assert!(
+            matches!(app.input_menu, Some(InputMenu { ch, .. }) if ch == n),
+            "the icon of a bare track did not open the input menu"
+        );
+
+        // Ctrl+T's twin lands on the next free slot.
+        let free = (0..crate::recorder::CHANNELS)
+            .find(|m| !app.channel_used(*m))
+            .expect("a slot left");
+        app.add_track_first_free();
+        assert!(app.channel_used(free), "Ctrl+T did not add a track");
+
+        // And Remove Track takes the bare bit with it.
+        app.remove_channel(n);
+        assert!(!app.channel_used(n), "removal left the bare track standing");
     }
 
     /// **The × empties the channel completely.** Kind, bays, name, colour,
@@ -14120,6 +14330,69 @@ mod tests {
             app.input_menu.as_ref().map(|m| m.ch),
             Some(0),
             "the chip did not open the input menu"
+        );
+    }
+
+    #[test]
+    fn a_double_click_on_a_midi_clip_opens_the_editor() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.keytoggle_enabled = false;
+        let _ = run_frame(&ctx, &mut app);
+        app.arrangement_open = true;
+        let _ = run_frame(&ctx, &mut app);
+        let rect = app.arrangement_rect.expect("arrangement did not open");
+        // A MIDI item on lane 0, squarely in view.
+        app.set_channel_input_spec(0, "midi:all");
+        app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            notes: Vec::new(),
+            lane: 0,
+            path: String::new(),
+            start_s: 1.0,
+            offset_s: 0.0,
+            len_s: 8.0,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name: "MIDI".to_owned(),
+            id: 0,
+        });
+        let id = app.arrangement.clips[0].id;
+        let _ = run_frame(&ctx, &mut app);
+        let p = {
+            let clips = app.arr_clip_views();
+            let view = app.arrange_view(&clips);
+            let r = crate::arrangement_panel::clip_rect(rect, &view, &clips[0]);
+            assert!(r.is_positive(), "the clip drew nowhere");
+            r.center()
+        };
+        // Two quick clicks: egui fires the double on the second press.
+        for _ in 0..2 {
+            for pressed in [true, false] {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            Pos2::ZERO,
+                            Vec2::new(1300.0, 900.0),
+                        )),
+                        events: vec![
+                            egui::Event::PointerMoved(p),
+                            egui::Event::PointerButton {
+                                pos: p,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    |ctx| app.frame(ctx),
+                );
+            }
+        }
+        assert!(
+            app.midi_edit.as_ref().is_some_and(|m| m.id == id),
+            "the double-click did not open the editor (midi_edit = {:?})",
+            app.midi_edit.as_ref().map(|m| m.id)
         );
     }
 
