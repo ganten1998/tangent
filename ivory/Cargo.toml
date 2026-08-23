@@ -90,6 +90,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 dirs = "6"
 fd-lock = "4"
+mp3lame-encoder = "0.2.5"
 
 [dev-dependencies]
 ttf-parser = "0.25"

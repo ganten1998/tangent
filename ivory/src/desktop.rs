@@ -256,10 +256,31 @@ struct Recorder {
     /// An EXPORT in flight: the arrangement playing start-to-end into an
     /// audio-only take that lands in the project's `export/`.
     bounce: Option<Bounce>,
+    /// A FULL-SPEED export in flight, on its own offline engine.
+    offline_bounce: Option<OfflineBounce>,
+    /// The realtime pass's delivery instructions, applied at the finish.
+    pending_delivery: Option<ivory_ui::ports::ProjectExportSpec>,
 }
 
 /// One bounce: where it stops, what it writes, and whether it is waiting
 /// for the files to close.
+/// A FULL-SPEED export: its own engine with no device, pulled by hand a
+/// slice of a second per UI frame — the machine renders as fast as it can
+/// while the window stays alive. The owner's default; realtime is the
+/// option now.
+struct OfflineBounce {
+    e: crate::instrument::Engine,
+    spec: ivory_ui::ports::ProjectExportSpec,
+    /// Frames to render, and how many have been.
+    until: u64,
+    done: u64,
+    block: Vec<f32>,
+    master: Option<(std::path::PathBuf, ivory_record::wav::WavWriter)>,
+    stems: Vec<(usize, std::path::PathBuf, ivory_record::wav::WavWriter)>,
+    stem_scratch: Vec<f32>,
+    out_dir: std::path::PathBuf,
+}
+
 struct Bounce {
     /// Stop when the playhead passes this — the span plus a tail for the
     /// reverbs to ring out.
@@ -389,6 +410,8 @@ pub struct DesktopApp {
     /// clear on an engine restart.
     #[cfg(feature = "recorder")]
     pad_cache: std::collections::HashMap<std::path::PathBuf, Arc<ivory_record::decode::Clip>>,
+    /// The scope drain's reusable buffer.
+    scope_buf: Vec<f32>,
 }
 
 /// How many columns the backing track's waveform is drawn from.
@@ -1074,6 +1097,18 @@ impl DesktopApp {
         // Read BEFORE the state borrow, like everything else here: the app is
         // borrowed mutably for the rest of this function.
         let alias = self.app.input_alias().trim().to_owned();
+        // **The scope's tap, drained dry once a frame** — the speakers' mix
+        // without the click, straight to the widget. `dt` is the audio time
+        // the batch spans, which is what the auto-gain release wants.
+        if let Some(e) = self.recorder.engine.as_mut() {
+            self.scope_buf.clear();
+            e.drain_scope(&mut self.scope_buf);
+            let rate = e.output().sample_rate as f32;
+            if !self.scope_buf.is_empty() {
+                let dt = self.scope_buf.len() as f32 / 2.0 / rate.max(1.0);
+                self.app.scope_feed(&self.scope_buf, dt, rate);
+            }
+        }
         let state = self.app.recorder_state_mut();
         state.preview = preview;
         state.camera_name = self
@@ -1662,6 +1697,7 @@ impl DesktopApp {
         // updated whether or not the tick is on, so turning it on after a take
         // does not immediately open a window for a recording already made.
         self.tick_bounce();
+        self.tick_offline_bounce();
         if !self.recorder.session.is_recording() {
             if let Some(folder) = self
                 .recorder
@@ -2194,6 +2230,7 @@ impl DesktopApp {
     fn finish_dir_choice(&mut self, purpose: ivory_ui::ports::DirPurpose, dir: std::path::PathBuf) {
         match purpose {
             ivory_ui::ports::DirPurpose::RecordRoot => self.app.set_record_dir(dir),
+            ivory_ui::ports::DirPurpose::ExportDir => self.app.set_export_dir(dir),
             ivory_ui::ports::DirPurpose::PluginFolder => self.app.add_plugin_folder(dir),
         }
     }
@@ -2853,6 +2890,402 @@ impl DesktopApp {
                 self.recorder.take_note = Some(format!("export failed: {e}"));
             }
         }
+        // A realtime EXPORT-dialog pass: deliver into the chosen folder in
+        // the chosen shapes. The engine's rate rules a realtime pass; the
+        // spec's rate only steers the offline one.
+        if let Some(mut spec) = self.recorder.pending_delivery.take() {
+            spec.rate = self
+                .recorder
+                .engine
+                .as_ref()
+                .map_or(spec.rate, |e| e.output().sample_rate);
+            let Some(out_dir) = self.export_out_dir(&spec) else {
+                return;
+            };
+            let _ = std::fs::create_dir_all(&out_dir);
+            let stem_name = sanitize_file_stem(&spec.name);
+            let mut paths = Vec::new();
+            if spec.master {
+                let dst = out_dir.join(format!("{stem_name}.wav"));
+                if std::fs::copy(export_dir.join(&name), &dst).is_ok() {
+                    paths.push(dst);
+                }
+            }
+            if spec.stems {
+                let src = export_dir.join("stems");
+                let dst_dir = out_dir.join("stems");
+                let _ = std::fs::create_dir_all(&dst_dir);
+                if let Ok(rd) = std::fs::read_dir(&src) {
+                    for f in rd.flatten() {
+                        let dst = dst_dir.join(f.file_name());
+                        if std::fs::copy(f.path(), &dst).is_ok() {
+                            paths.push(dst);
+                        }
+                    }
+                }
+            }
+            match deliver_formats(&paths, &spec) {
+                Ok(()) => {
+                    self.recorder.take_note =
+                        Some(format!("Exported  {}", out_dir.display()));
+                }
+                Err(e) => {
+                    self.recorder.take_note = Some(format!("export: {e}"));
+                }
+            }
+        }
+    }
+
+    // ── the FULL-SPEED export ──────────────────────────────────────────────
+
+    /// Where an export lands: the spec's directory, or the project's own
+    /// `export/` folder.
+    fn export_out_dir(&self, spec: &ivory_ui::ports::ProjectExportSpec) -> Option<std::path::PathBuf> {
+        if !spec.dir.trim().is_empty() {
+            return Some(std::path::PathBuf::from(spec.dir.trim()));
+        }
+        self.app
+            .project_doc()
+            .and_then(|d| d.parent().map(|p| p.join("export")))
+    }
+
+    /// Start a full-speed export: an OFFLINE engine, furnished exactly like
+    /// the live one — desk, racks with their saved states, clips, pads —
+    /// and pulled by hand a slice of a second per frame. The click stays
+    /// out; nothing live reaches it.
+    fn start_offline_bounce(&mut self, spec: ivory_ui::ports::ProjectExportSpec) {
+        use ivory_ui::ports::ExportFormat;
+        if self.recorder.offline_bounce.is_some()
+            || self.recorder.bounce.is_some()
+            || self.recorder.session.is_recording()
+            || self.recorder.arr_rec.is_some()
+        {
+            return;
+        }
+        let span = self.app.arr_span_s();
+        if span <= 0.0 {
+            self.recorder.take_note =
+                Some("Nothing to export — the timeline is empty.".to_owned());
+            return;
+        }
+        let Some(out_dir) = self.export_out_dir(&spec) else {
+            self.recorder.take_note = Some("export: no project open".to_owned());
+            return;
+        };
+        if let Err(e) = std::fs::create_dir_all(&out_dir) {
+            self.recorder.take_note = Some(format!("export: {e}"));
+            return;
+        }
+        let rate = spec.rate.clamp(8_000, 192_000);
+        let mut e = match crate::instrument::Engine::offline(rate, ivory_record::audio::Timebase::new()) {
+            Ok(e) => e,
+            Err(err) => {
+                self.recorder.take_note = Some(format!("export: {err}"));
+                return;
+            }
+        };
+        // ── the desk, exactly as the live walk pushes it ──
+        e.set_desk(&self.app.desk());
+        let gains = self.app.gains();
+        for ch in 0..ivory_ui::recorder::CHANNELS {
+            e.set_channel_gain(ch, gains.channels[ch]);
+            e.set_channel_pan(ch, self.app.channel_pan(ch));
+        }
+        // No live input of any kind: every arm down, every port silent.
+        e.set_midi_off(u32::MAX);
+        e.set_armed(0);
+        e.set_monitor_on(false);
+        e.set_drums(self.app.drums_gain(), self.app.drums_pan());
+        e.set_master_gain(gains.master);
+        e.set_fx_return(gains.fx_return);
+        let [reverb, delay, chorus, hpf, lpf, limiter] = self.app.effect_sends();
+        e.set_effects(crate::effects::Sends {
+            reverb,
+            delay,
+            chorus,
+            hpf,
+            lpf,
+            limiter,
+        });
+        e.set_effect_params(effect_params_from(self.app.effect_params()));
+        // **The click stays out of the file**, whatever the band says.
+        e.set_metronome_enabled(false);
+        e.set_tempo(self.app.tempo_bpm());
+        {
+            let sig = self.app.time_signature();
+            e.set_meter(u32::from(sig.beats), u32::from(sig.unit));
+        }
+        // The built-in: rendered by the engine itself when a channel's
+        // first bay names it — the live walk's own rule.
+        let builtin = (0..ivory_ui::recorder::CHANNELS).find(|ch| {
+            self.app.insert(*ch, 0) == Some(ivory_ui::dialogs::BUILTIN_PATH)
+        });
+        e.set_builtin_strip(builtin);
+        // The DX7's sound is the SESSION's cartridge — the live engine
+        // already carries it, so the export borrows the loaded copy.
+        if builtin.is_some() {
+            let (_, patch) = self.app.dx7_choice();
+            let voice = self
+                .cartridge
+                .as_ref()
+                .and_then(|c| c.voices.get(patch).or_else(|| c.voices.first()))
+                .copied();
+            if let Some(v) = voice {
+                e.set_builtin_voice(v);
+            }
+        }
+        // ── every configured rack seat, saved state included ──
+        let inserts = ivory_ui::recorder::INSERTS;
+        for i in 0..(crate::instrument::RACK_SEATS * inserts) {
+            let seat = i / inserts;
+            let bay = i % inserts;
+            let want = self.app.insert(seat, bay).map(str::to_owned);
+            let engine_want = want
+                .as_deref()
+                .filter(|p| *p != ivory_ui::dialogs::BUILTIN_PATH);
+            let Some(path) = engine_want else { continue };
+            let state = saved_insert_state(seat, bay, path);
+            if let Err(err) =
+                e.load_insert(seat, bay, Some(std::path::Path::new(path)), state.as_deref())
+            {
+                self.recorder.take_note =
+                    Some(format!("export: a rack refused to load: {err}"));
+            }
+        }
+        // ── the clips, decoded at the EXPORT rate with a cache of their
+        // own, so the live engine's cache never learns a wrong-rate clip ──
+        if let Some(doc_path) = self.app.project_doc().map(std::path::Path::to_path_buf) {
+            let doc = self.app.arrangement().clone();
+            let mut placed = Vec::new();
+            let mut midi_placed = Vec::new();
+            let mut cache: std::collections::HashMap<
+                std::path::PathBuf,
+                Arc<ivory_record::decode::Clip>,
+            > = std::collections::HashMap::new();
+            let frames = |sec: f64| (sec.max(0.0) * f64::from(rate)).round() as u64;
+            for clip in &doc.clips {
+                if clip.kind == ivory_ui::arrangement::ClipKind::Midi {
+                    let mut notes: Vec<crate::instrument::ClipNote> = clip
+                        .notes
+                        .iter()
+                        .filter_map(|n| {
+                            let at = n.at_s - clip.offset_s;
+                            if at < -1.0e-9 {
+                                return None;
+                            }
+                            Some(crate::instrument::ClipNote {
+                                at: frames(at),
+                                dur: frames(n.dur_s).max(1),
+                                key: n.key.min(127),
+                                vel: n.vel.min(127),
+                            })
+                        })
+                        .collect();
+                    notes.sort_by_key(|n| n.at);
+                    if !notes.is_empty() {
+                        midi_placed.push(crate::instrument::PlacedMidi {
+                            strip: clip.lane.min(ivory_ui::recorder::CHANNELS - 1),
+                            start: frames(clip.start_s),
+                            len: frames(clip.len_s),
+                            notes: Arc::new(notes),
+                        });
+                    }
+                    continue;
+                }
+                let path = ivory_ui::arrangement::Arrangement::resolve(&doc_path, &clip.path);
+                let decoded = match cache.get(&path) {
+                    Some(c) => Arc::clone(c),
+                    None => match ivory_record::decode::decode(&path, rate) {
+                        Ok(c) => {
+                            let c = Arc::new(c);
+                            cache.insert(path.clone(), Arc::clone(&c));
+                            c
+                        }
+                        Err(_) => continue,
+                    },
+                };
+                let len_s = clip.play_len_s(decoded.seconds());
+                placed.push(crate::instrument::Placed {
+                    clip: Arc::clone(&decoded),
+                    strip: clip.lane.min(ivory_ui::recorder::CHANNELS - 1),
+                    start: frames(clip.start_s),
+                    offset: frames(clip.offset_s),
+                    len: frames(len_s),
+                    fade_in: frames(clip.fade_in_s),
+                    fade_out: frames(clip.fade_out_s),
+                });
+            }
+            e.set_clips(placed);
+            e.set_midi_clips(midi_placed);
+        }
+        // ── the pads, decoded at the export rate ──
+        {
+            let mut kit = crate::instrument::PadKit::default();
+            for (i, path) in self.app.drumpad_paths().iter().enumerate() {
+                let Some(path) = path else { continue };
+                if let (Ok(c), Some(slot)) =
+                    (ivory_record::decode::decode(path, rate), kit.pads.get_mut(i))
+                {
+                    *slot = Some(Arc::new(c));
+                }
+            }
+            e.set_pad_kit(kit);
+            e.set_pad_params(&self.app.drum_kit_params());
+        }
+        e.set_stems(spec.stems);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        // ── the files ──
+        let wav_spec = ivory_record::wav::WavSpec {
+            sample_rate: rate,
+            channels: if spec.mono { 1 } else { 2 },
+            format: ivory_record::wav::SampleFormat::Float32,
+        };
+        let bext = ivory_record::wav::Bext::new(ivory_record::wav::Wallclock::now_utc(), wav_spec);
+        let stem_name = sanitize_file_stem(&spec.name);
+        let master = if spec.master {
+            let path = out_dir.join(format!("{stem_name}.wav"));
+            let _ = std::fs::remove_file(&path);
+            match ivory_record::wav::WavWriter::create(&path, wav_spec, &bext) {
+                Ok(w) => Some((path, w)),
+                Err(err) => {
+                    self.recorder.take_note = Some(format!("export: {err}"));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let mut stems = Vec::new();
+        if spec.stems {
+            let dir = out_dir.join("stems");
+            let _ = std::fs::create_dir_all(&dir);
+            let doc = self.app.arrangement().clone();
+            for lane in 0..ivory_ui::recorder::CHANNELS {
+                let used = self.app.channel_kind(lane).is_some()
+                    || doc.clips.iter().any(|c| c.lane == lane);
+                if !used {
+                    continue;
+                }
+                let name: String = self
+                    .app
+                    .channel_display_name(lane)
+                    .chars()
+                    .map(|c| if std::path::is_separator(c) { '-' } else { c })
+                    .collect();
+                let path = dir.join(format!("{:02}-{}.wav", lane + 1, name.trim()));
+                let _ = std::fs::remove_file(&path);
+                if let Ok(w) = ivory_record::wav::WavWriter::create(&path, wav_spec, &bext) {
+                    stems.push((lane, path, w));
+                }
+            }
+        }
+        let until = ((span + 2.0) * f64::from(rate)).ceil() as u64;
+        self.recorder.take_note = Some("Rendering at full speed…".to_owned());
+        self.recorder.offline_bounce = Some(OfflineBounce {
+            e,
+            spec,
+            until,
+            done: 0,
+            block: vec![0.0; 1024 * 2],
+            master,
+            stems,
+            stem_scratch: Vec::new(),
+            out_dir,
+        });
+    }
+
+    /// Drive the full-speed export: as many blocks as ~80 ms allows, every
+    /// UI frame, until the span (plus a two-second tail) has rendered.
+    fn tick_offline_bounce(&mut self) {
+        let Some(mut b) = self.recorder.offline_bounce.take() else {
+            return;
+        };
+        let budget = std::time::Instant::now();
+        let wide = ivory_ui::recorder::CHANNELS * 2;
+        let mut fold = Vec::new();
+        while b.done < b.until {
+            let n = 1024usize.min((b.until - b.done) as usize);
+            let out = &mut b.block[..n * 2];
+            out.fill(0.0);
+            b.e.render_offline(out);
+            if let Some((_, w)) = b.master.as_mut() {
+                if b.spec.mono {
+                    fold.clear();
+                    for f in 0..n {
+                        fold.push((out[f * 2] + out[f * 2 + 1]) * 0.5);
+                    }
+                    let _ = w.write_interleaved(&fold);
+                } else {
+                    let _ = w.write_interleaved(out);
+                }
+            }
+            if !b.stems.is_empty() {
+                b.stem_scratch.clear();
+                b.e.drain_stems(&mut b.stem_scratch);
+                let frames = b.stem_scratch.len() / wide;
+                for (lane, _, w) in &mut b.stems {
+                    fold.clear();
+                    for f in 0..frames {
+                        let l = b.stem_scratch[f * wide + *lane * 2];
+                        let r = b.stem_scratch[f * wide + *lane * 2 + 1];
+                        if b.spec.mono {
+                            fold.push((l + r) * 0.5);
+                        } else {
+                            fold.push(l);
+                            fold.push(r);
+                        }
+                    }
+                    let _ = w.write_interleaved(&fold);
+                }
+            }
+            b.done += n as u64;
+            if budget.elapsed() > std::time::Duration::from_millis(80) {
+                break;
+            }
+        }
+        if b.done < b.until {
+            let pct = (b.done as f64 / b.until as f64 * 100.0) as u32;
+            self.recorder.take_note = Some(format!("Rendering at full speed… {pct}%"));
+            self.recorder.offline_bounce = Some(b);
+            return;
+        }
+        // ── done: close the files, then the format pass ──
+        let OfflineBounce {
+            spec,
+            master,
+            stems,
+            out_dir,
+            ..
+        } = b;
+        let mut problem: Option<String> = None;
+        let mut master_path = None;
+        if let Some((path, w)) = master {
+            if let Err(e) = w.finish() {
+                problem = Some(e.to_string());
+            }
+            master_path = Some(path);
+        }
+        let mut stem_paths = Vec::new();
+        for (_, path, w) in stems {
+            if let Err(e) = w.finish() {
+                problem = Some(e.to_string());
+            }
+            stem_paths.push(path);
+        }
+        if let Some(p) = problem {
+            self.recorder.take_note = Some(format!("export failed: {p}"));
+            return;
+        }
+        let mut paths = stem_paths;
+        if let Some(m) = master_path {
+            paths.push(m);
+        }
+        if let Err(e) = deliver_formats(&paths, &spec) {
+            self.recorder.take_note = Some(format!("export: {e}"));
+            return;
+        }
+        self.recorder.take_note = Some(format!("Exported  {}", out_dir.display()));
     }
 
     /// The template shelf: `<record_root>/Projects/Templates`.
@@ -2897,6 +3330,17 @@ impl DesktopApp {
                 let dst = self.templates_dir().join(&name);
                 let _ = std::fs::remove_dir_all(&dst);
                 let _ = copy_dir_all(&src, &dst);
+            }
+            ivory_ui::ports::ProjectRequest::Export(spec) => {
+                if spec.realtime {
+                    // The realtime pass: the live engine, the live rate. The
+                    // spec's shaping (name, dir, formats, mono) is applied
+                    // when the pass lands — see `finish_bounce`.
+                    self.recorder.pending_delivery = Some(spec.clone());
+                    self.start_bounce(spec.stems);
+                } else {
+                    self.start_offline_bounce(spec);
+                }
             }
             ivory_ui::ports::ProjectRequest::ExportTrack => self.start_bounce(false),
             ivory_ui::ports::ProjectRequest::ExportStems => self.start_bounce(true),
@@ -3746,6 +4190,92 @@ fn insert_state_path(strip: usize, bay: usize) -> std::path::PathBuf {
 }
 
 #[cfg(feature = "recorder")]
+/// A file stem the filesystem will take: separators out, trimmed, never
+/// empty.
+#[cfg(feature = "recorder")]
+fn sanitize_file_stem(name: &str) -> String {
+    let s: String = name
+        .chars()
+        .map(|c| if std::path::is_separator(c) || c == ':' { '-' } else { c })
+        .collect();
+    let s = s.trim();
+    if s.is_empty() { "mix".to_owned() } else { s.to_owned() }
+}
+
+/// The format pass over freshly written WAVs: encode an MP3 beside each
+/// where the spec asks for one, and remove the WAV where it does not.
+#[cfg(feature = "recorder")]
+fn deliver_formats(
+    paths: &[std::path::PathBuf],
+    spec: &ivory_ui::ports::ProjectExportSpec,
+) -> Result<(), String> {
+    use ivory_ui::ports::ExportFormat;
+    let want_wav = spec.primary == ExportFormat::Wav
+        || spec.secondary == Some(ExportFormat::Wav);
+    let want_mp3 = spec.primary == ExportFormat::Mp3
+        || spec.secondary == Some(ExportFormat::Mp3);
+    for path in paths {
+        if want_mp3 {
+            let decoded = ivory_record::decode::decode(path, spec.rate)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            encode_mp3(
+                &decoded.samples,
+                spec.rate,
+                spec.mono,
+                &path.with_extension("mp3"),
+            )?;
+        }
+        if !want_wav {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    Ok(())
+}
+
+/// Interleaved stereo f32 in, a finished MP3 on disk out. 320 kbps, best
+/// quality — an export is the one place nobody wants a knob for this.
+#[cfg(feature = "recorder")]
+fn encode_mp3(
+    stereo: &[f32],
+    rate: u32,
+    mono: bool,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    use mp3lame_encoder::{Bitrate, Builder, DualPcm, FlushNoGap, MonoPcm, Quality};
+    let mut b = Builder::new().ok_or("mp3: the encoder would not initialise")?;
+    b.set_num_channels(if mono { 1 } else { 2 })
+        .map_err(|e| format!("mp3: {e}"))?;
+    b.set_sample_rate(rate).map_err(|e| format!("mp3: {e}"))?;
+    b.set_brate(Bitrate::Kbps320).map_err(|e| format!("mp3: {e}"))?;
+    b.set_quality(Quality::Best).map_err(|e| format!("mp3: {e}"))?;
+    let mut enc = b.build().map_err(|e| format!("mp3: {e}"))?;
+    let frames = stereo.len() / 2;
+    let mut out: Vec<u8> =
+        Vec::with_capacity(mp3lame_encoder::max_required_buffer_size(frames));
+    if mono {
+        let folded: Vec<f32> = (0..frames)
+            .map(|f| (stereo[f * 2] + stereo[f * 2 + 1]) * 0.5)
+            .collect();
+        enc.encode_to_vec(MonoPcm(&folded), &mut out)
+            .map_err(|e| format!("mp3: {e}"))?;
+    } else {
+        let left: Vec<f32> = (0..frames).map(|f| stereo[f * 2]).collect();
+        let right: Vec<f32> = (0..frames).map(|f| stereo[f * 2 + 1]).collect();
+        enc.encode_to_vec(
+            DualPcm {
+                left: &left,
+                right: &right,
+            },
+            &mut out,
+        )
+        .map_err(|e| format!("mp3: {e}"))?;
+    }
+    enc.flush_to_vec::<FlushNoGap>(&mut out)
+        .map_err(|e| format!("mp3: {e}"))?;
+    std::fs::write(path, &out).map_err(|e| format!("mp3: {e}"))?;
+    Ok(())
+}
+
 fn saved_insert_state(strip: usize, bay: usize, bundle: &str) -> Option<Vec<u8>> {
     let raw = std::fs::read(insert_state_path(strip, bay)).ok()?;
     let split = raw.iter().position(|b| *b == 0)?;
@@ -3870,6 +4400,8 @@ impl DesktopApp {
                 take_note: None,
                 arr_rec: None,
                 bounce: None,
+                offline_bounce: None,
+                pending_delivery: None,
                 session: crate::record::Session::new(tap, timebase),
                 audio,
                 camera,
@@ -3934,6 +4466,7 @@ impl DesktopApp {
             track_cache: std::collections::HashMap::new(),
             #[cfg(feature = "recorder")]
             pad_cache: std::collections::HashMap::new(),
+            scope_buf: Vec::new(),
         };
         // What the effects ship as, so the panel can draw a slider for a
         // parameter nobody has moved. See `ports::EffectDefaults`: the DSP owns
@@ -4621,3 +5154,34 @@ impl DesktopApp {
     }
 }
 
+#[cfg(all(test, feature = "recorder"))]
+mod tests {
+    use super::*;
+
+    /// **The MP3 pass writes a real MPEG stream.** A sine goes in, a file
+    /// the app's own decoder accepts comes out — encode and decode meeting
+    /// proves the delivery path, not just LAME's return code.
+    #[test]
+    fn an_mp3_export_round_trips_through_the_decoder() {
+        let dir = std::env::temp_dir().join("tangent-mp3-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("probe.mp3");
+        let rate = 44_100u32;
+        let stereo: Vec<f32> = (0..rate as usize)
+            .flat_map(|i| {
+                let v = (i as f32 * 440.0 * std::f32::consts::TAU / rate as f32).sin() * 0.5;
+                [v, v]
+            })
+            .collect();
+        encode_mp3(&stereo, rate, false, &path).expect("encode");
+        let decoded = ivory_record::decode::decode(&path, rate).expect("decode");
+        assert!(
+            decoded.seconds() > 0.8 && decoded.seconds() < 1.4,
+            "a second in, {} seconds out",
+            decoded.seconds()
+        );
+        let peak = decoded.samples.iter().fold(0.0f32, |a, b| a.max(b.abs()));
+        assert!(peak > 0.3 && peak < 0.8, "the sine came back at {peak}");
+        let _ = std::fs::remove_file(&path);
+    }
+}

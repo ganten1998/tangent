@@ -2427,36 +2427,6 @@ pub fn bars_beats_parts(
 }
 
 /// The rows and the PART CELLS of the LCD's right half: three rows —
-/// Start, End, Length of the arrangement's viewport — each value in three
-/// draggable cells (bars, beats, thousandths). One function for drawing
-/// and hit-testing, so the hand and the picture cannot drift.
-pub fn lcd_part_cells(lcd: Rect) -> [[Rect; 3]; 3] {
-    let side = slice_h(lcd, 0.50, 0.99);
-    std::array::from_fn(|row| {
-        let r = slice_v(side, 0.06 + 0.30 * row as f32, 0.06 + 0.30 * (row as f32 + 1.0));
-        // The label owns the left third; the value cells the rest.
-        let v = slice_h(r, 0.30, 1.0);
-        let cuts = [0.0, 0.42, 0.66, 1.0];
-        std::array::from_fn(|part| slice_h(v, cuts[part], cuts[part + 1]))
-    })
-}
-
-/// Which LCD part a press landed on: `(row, part)`, rows Start/End/Length.
-pub fn lcd_part_at(rect: Rect, view: &RecorderView<'_>, pos: Pos2) -> Option<(u8, u8)> {
-    let l = Layout::new(rect, view);
-    if !l.lcd.is_positive() || !l.lcd.contains(pos) {
-        return None;
-    }
-    for (row, cells) in lcd_part_cells(l.lcd).iter().enumerate() {
-        for (part, cell) in cells.iter().enumerate() {
-            if cell.is_positive() && cell.contains(pos) {
-                return Some((row as u8, part as u8));
-            }
-        }
-    }
-    None
-}
-
 /// The REAPER cluster, whole-box edition: the big musical position with
 /// minutes:seconds under it on the left, and the VIEWPORT's Start / End /
 /// Length on the right — live numbers whether or not a single clip
@@ -2491,57 +2461,15 @@ fn draw_timecode_cluster(painter: &Painter, r: Rect, view: &RecorderView<'_>, p:
             );
         }
     }
-    // Start / End / Length of the VIEWPORT — the timeline's own numbers,
-    // never a clip's, live even over an empty song.
-    let (win_s, win_l) = view.view_window;
-    let rows = [("Start", win_s), ("End", win_s + win_l), ("Length", win_l)];
+    // **The right half is the OSCILLOSCOPE now** — the sibling session's
+    // widget, the owner's pick: the speakers' mix without the click, on
+    // the same black glass the timecode is behind. Start/End/Length and
+    // their draggable cells retired with it; the viewport still answers
+    // to the navigator, the wheel and the ruler.
     let side = slice_h(r, 0.50, 0.99);
-    let cells = lcd_part_cells(r);
-    for (i, (label, secs)) in rows.iter().enumerate() {
-        let row = slice_v(side, 0.06 + 0.30 * i as f32, 0.06 + 0.30 * (i as f32 + 1.0));
-        let lab = slice_h(row, 0.0, 0.30);
-        let lsize = fit_text(lab, label, row.height() * 0.5);
-        if lsize >= MIN_TEXT {
-            painter.text(
-                Pos2::new(lab.left() + 2.0, lab.center().y),
-                Align2::LEFT_CENTER,
-                *label,
-                font(lsize),
-                LCD_GREEN.gamma_multiply(0.45),
-            );
-        }
-        // Start and End are POSITIONS and count from one; Length is a
-        // DURATION and counts from zero — thirty bars long is 30, not 31.
-        let (b, bt, th) = bars_beats_parts(*secs, view.tempo_bpm, view.time_signature);
-        let (b, bt) = if i == 2 { (b - 1, bt - 1) } else { (b, bt) };
-        let words = [format!("{b}"), format!("{bt}"), format!("{th:03}")];
-        for (part, cell) in cells[i].iter().enumerate() {
-            if !cell.is_positive() {
-                continue;
-            }
-            let csize = fit_text(*cell, &words[part], cell.height() * 0.58);
-            if csize >= MIN_TEXT {
-                painter.text(
-                    Pos2::new(cell.right() - 3.0, cell.center().y),
-                    Align2::RIGHT_CENTER,
-                    &words[part],
-                    font(csize),
-                    LCD_GREEN,
-                );
-            }
-            if part < 2 {
-                painter.text(
-                    Pos2::new(cell.right() - 0.5, cell.center().y),
-                    Align2::LEFT_CENTER,
-                    "|",
-                    font(csize.max(8.0) * 0.9),
-                    LCD_GREEN.gamma_multiply(0.4),
-                );
-            }
-        }
-    }
+    let scope_r = slice_v(side, 0.07, 0.93).shrink2(egui::vec2(2.0, 0.0));
+    view.scope.draw(painter, scope_r, &crate::scope::ScopeStyle::lcd());
 }
-
 // ── the instrument slots ───────────────────────────────────────────────────
 
 /// A plain word in a button-shaped box.
@@ -5577,42 +5505,26 @@ mod tests {
     }
 
     #[test]
-    fn the_lcd_owns_the_box_and_every_part_is_under_a_hand() {
+    fn the_lcd_owns_the_box_and_the_scope_is_passive_glass() {
         let r = band(1300.0);
         let v = idle();
         let l = Layout::new(r, &v);
-        // The overview stands down: the whole box is the LCD, and the old
-        // seek surface answers nothing.
+        // The whole box is still the LCD; the old seek surface answers
+        // nothing, and the RIGHT half — the oscilloscope now — is glass:
+        // no band hit anywhere on it.
         assert!(l.lcd.is_positive(), "the LCD has no box");
         assert!(!l.timeline.is_positive(), "the overview is still laid out");
-        assert_eq!(
-            hit_test(r, &v, l.lcd.center()),
-            None,
-            "the LCD is drag cells, not a band hit"
-        );
-        // Nine cells — Start/End/Length by bars/beats/thousandths — each
-        // resolvable at its own centre, none overlapping another.
-        let cells = lcd_part_cells(l.lcd);
-        let mut seen: Vec<Rect> = Vec::new();
-        for (row, parts) in cells.iter().enumerate() {
-            for (part, cell) in parts.iter().enumerate() {
-                assert!(cell.is_positive(), "cell {row}/{part} has no room");
-                assert_eq!(
-                    lcd_part_at(r, &v, cell.center()),
-                    Some((row as u8, part as u8)),
-                    "cell {row}/{part} does not answer at its own centre"
-                );
-                for other in &seen {
-                    assert!(
-                        other.intersect(*cell).area() < 1.0,
-                        "cell {row}/{part} overlaps a neighbour"
-                    );
-                }
-                seen.push(*cell);
-            }
+        for frac in [0.30f32, 0.55, 0.75, 0.95] {
+            let p = Pos2::new(
+                l.lcd.left() + l.lcd.width() * frac,
+                l.lcd.center().y,
+            );
+            assert_eq!(
+                hit_test(r, &v, p),
+                None,
+                "the LCD answered a press at {frac} of its width"
+            );
         }
-        // And outside the LCD, no part answers.
-        assert_eq!(lcd_part_at(r, &v, Pos2::new(r.left() + 1.0, r.top() + 1.0)), None);
     }
 
     /// **The musical clock counts the way a musician does.** Bar and beat
@@ -5987,6 +5899,7 @@ mod tests {
                         // the caret's own rectangle is what would go negative.
                         for edit in typing_states() {
                             let v = RecorderView {
+                                scope: RecorderView::empty().scope,
                                 position_s: 0.0,
                                 playing: false,
                                 arr_recording: false,

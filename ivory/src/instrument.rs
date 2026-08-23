@@ -2057,6 +2057,12 @@ struct Renderer {
     /// The STEM tap: every lane's post-fader stereo, interleaved
     /// `CHANNELS * 2` wide, while `stems_on`. The export's second ear.
     stem_tx: Producer<f32>,
+    /// **The scope's tap: the SPEAKERS' mix, before the click joins it.**
+    /// "Everything the app is doing, minus the metronome" exists as a
+    /// buffer at exactly one point in the block — this is it. A full ring
+    /// drops the block, which is the policy: the scope is a picture.
+    scope_tx: Producer<f32>,
+    scope_scratch: Vec<f32>,
     /// One block of stems, accumulated by the three mixers and pushed once.
     stem_scratch: Vec<f32>,
     /// Each PAD's own block, interleaved stereo — rendered here first so a
@@ -2720,6 +2726,12 @@ impl Renderer {
                 } else {
                     &self.mix[at2..at2 + TAP_CHANNELS]
                 };
+                // The scope reads the speakers' pair BEFORE the click joins
+                // — minus-the-click falls out of the tap point, no
+                // subtraction anywhere.
+                let scope_at = (tap_frames - 1) * TAP_CHANNELS;
+                self.scope_scratch[scope_at] = src[0];
+                self.scope_scratch[scope_at + 1] = src.get(1).copied().unwrap_or(src[0]);
                 let at = frame_index * dev_ch;
                 map_frame(src, &mut self.frame[..dev_ch]);
                 for c in 0..dev_ch {
@@ -2742,6 +2754,9 @@ impl Renderer {
         }
 
         self.push_tap(tap_frames);
+        let _ = self
+            .scope_tx
+            .push_entire_slice(&self.scope_scratch[..tap_frames * TAP_CHANNELS]);
         self.publish_meters(frames, peak_l, peak_r, sumsq_l, sumsq_r, clipped);
     }
 
@@ -3932,7 +3947,13 @@ pub struct Engine {
     // anything it might still be reading goes away. Held, never read — the
     // whole value of this field is its `Drop`.
     #[allow(dead_code, reason = "held so the stream lives; dropping it stops audio")]
-    stream: cpal::Stream,
+    stream: Option<cpal::Stream>,
+    /// **The OFFLINE renderer, when this engine has no device at all.** An
+    /// export engine: the same rings, the same racks, the same push surface
+    /// — `load_insert`, `set_clips`, everything — but the render is PULLED
+    /// by [`Engine::render_offline`] as fast as the machine goes instead of
+    /// being pulled by a callback at the speed of sound.
+    offline: Option<Box<Renderer>>,
     output: OutputInfo,
     shared: Arc<Shared>,
     timebase: Timebase,
@@ -3957,6 +3978,7 @@ pub struct Engine {
     pad_from_audio: Consumer<PadKit>,
     cap_rx: Vec<Consumer<f32>>,
     stem_rx: Consumer<f32>,
+    scope_rx: Consumer<f32>,
     /// What is in each of them, for the desk to name.
     inserts_loaded: [[Option<Loaded>; INSERTS]; RACK_SEATS],
 
@@ -4016,7 +4038,7 @@ impl Engine {
         buffer_frames: Option<u32>,
         sample_rate: Option<u32>,
     ) -> Result<Self, String> {
-        Self::start_inner(out_device, timebase, buffer_frames, sample_rate)
+        Self::start_inner(out_device, timebase, buffer_frames, sample_rate, false)
     }
 
     /// As [`Engine::start`], sharing the recorder's timebase.
@@ -4026,7 +4048,21 @@ impl Engine {
     /// on the downbeat the player actually heard rather than on the UI frame
     /// that noticed.
     pub fn start_with(out_device: Option<&str>, timebase: Timebase) -> Result<Self, String> {
-        Self::start_inner(out_device, timebase, None, None)
+        Self::start_inner(out_device, timebase, None, None, false)
+    }
+
+    /// An engine with NO device: everything an [`Engine`] is — racks,
+    /// clips, pads, desk — pulled by hand for a full-speed export.
+    pub fn offline(rate: u32, timebase: Timebase) -> Result<Self, String> {
+        Self::start_inner(None, timebase, None, Some(rate.max(8_000)), true)
+    }
+
+    /// One rendered block of an OFFLINE engine, `out` interleaved stereo.
+    /// Does nothing on a live engine — the callback owns that render.
+    pub fn render_offline(&mut self, out: &mut [f32]) {
+        if let Some(r) = self.offline.as_mut() {
+            r.render(out, 0, 0);
+        }
     }
 
     fn start_inner(
@@ -4034,22 +4070,29 @@ impl Engine {
         timebase: Timebase,
         asked_buffer: Option<u32>,
         asked_rate: Option<u32>,
+        offline: bool,
     ) -> Result<Self, String> {
-        // The system the user chose, not whatever the platform hands out. One
-        // process, one driver stack: `ivory_record::audio` owns the choice
-        // because that is where the input opens, and the two sides opening
-        // through different hosts is a configuration nobody asked for and
-        // nothing would report.
-        let host = ivory_record::audio::host();
-        let device = resolve_output(&host, out_device)?;
-        let name = device
-            .name()
-            .unwrap_or_else(|_| "unnamed output device".to_string());
-        let supported = device
-            .default_output_config()
-            .map_err(|e| format!("{name}: no default output config ({e})"))?;
-
-        let channels = supported.channels();
+        // OFFLINE: no host, no device, no stream — two channels at the
+        // asked rate, and the render is pulled by hand.
+        let dev = if offline {
+            None
+        } else {
+            // The system the user chose, not whatever the platform hands
+            // out. One process, one driver stack: `ivory_record::audio`
+            // owns the choice because that is where the input opens, and
+            // the two sides opening through different hosts is a
+            // configuration nobody asked for and nothing would report.
+            let host = ivory_record::audio::host();
+            let device = resolve_output(&host, out_device)?;
+            let name = device
+                .name()
+                .unwrap_or_else(|_| "unnamed output device".to_string());
+            let supported = device
+                .default_output_config()
+                .map_err(|e| format!("{name}: no default output config ({e})"))?;
+            Some((device, name, supported))
+        };
+        let channels = dev.as_ref().map_or(2, |(_, _, c)| c.channels());
         // **The rate is asked for, not imposed.** Setup offers only what the
         // INPUT device supports, and this is the output — a different device
         // with its own ranges — so the request is honoured when this device can
@@ -4061,32 +4104,46 @@ impl Engine {
         // warning with no fix otherwise: the writer drains the instrument's
         // ring at the input's rate while the engine fills it at the output's,
         // and the take drifts.
-        let supported = match asked_rate {
-            // Narrowed through a RANGE rather than rebuilt: `with_sample_rate`
-            // belongs to the range, and taking it from one the device actually
-            // reported is what makes the result a configuration the device has
-            // agreed to rather than one assembled from three numbers that each
-            // looked right.
-            Some(want) => device
-                .supported_output_configs()
-                .ok()
-                .and_then(|mut cs| {
-                    cs.find(|c| {
-                        c.channels() == channels
-                            && c.sample_format() == supported.sample_format()
-                            && c.min_sample_rate().0 <= want
-                            && want <= c.max_sample_rate().0
+        let dev = dev.map(|(device, name, supported)| {
+            let supported = match asked_rate {
+                // Narrowed through a RANGE rather than rebuilt:
+                // `with_sample_rate` belongs to the range, and taking it
+                // from one the device actually reported is what makes the
+                // result a configuration the device has agreed to rather
+                // than one assembled from three numbers that each looked
+                // right.
+                Some(want) => device
+                    .supported_output_configs()
+                    .ok()
+                    .and_then(|mut cs| {
+                        cs.find(|c| {
+                            c.channels() == channels
+                                && c.sample_format() == supported.sample_format()
+                                && c.min_sample_rate().0 <= want
+                                && want <= c.max_sample_rate().0
+                        })
                     })
-                })
-                .map(|c| c.with_sample_rate(cpal::SampleRate(want)))
-                .unwrap_or(supported),
-            None => supported,
-        };
-        let rate = supported.sample_rate().0;
+                    .map(|c| c.with_sample_rate(cpal::SampleRate(want)))
+                    .unwrap_or(supported),
+                None => supported,
+            };
+            (device, name, supported)
+        });
+        let rate = dev.as_ref().map_or_else(
+            || asked_rate.unwrap_or(48_000),
+            |(_, _, s)| s.sample_rate().0,
+        );
+        let name = dev
+            .as_ref()
+            .map_or_else(|| "offline".to_owned(), |(_, n, _)| n.clone());
         if channels == 0 || rate == 0 {
             return Err(format!("{name} reports {channels} channels at {rate} Hz"));
         }
-        let (buffer_size, buffer_frames) = pick_buffer(supported.buffer_size(), asked_buffer);
+        let (buffer_size, buffer_frames) = match dev.as_ref() {
+            Some((_, _, supported)) => pick_buffer(supported.buffer_size(), asked_buffer),
+            // Offline renders in MAX_BLOCK bites; the "buffer" is a label.
+            None => (cpal::BufferSize::Default, None),
+        };
 
         let shared = Arc::new(Shared::new());
         let fault = Arc::new(Mutex::new(None));
@@ -4164,6 +4221,8 @@ impl Engine {
         // The stem tap: four seconds of every lane in stereo. Idle it costs
         // a ring nobody fills.
         let (stem_tx, stem_rx) = RingBuffer::<f32>::new(rate as usize * CHANNELS * 2 * 4);
+        // The scope's third of a second of stereo.
+        let (scope_tx, scope_rx) = RingBuffer::<f32>::new(1 << 15);
         let renderer = Renderer {
             shared: Arc::clone(&shared),
             timebase,
@@ -4234,31 +4293,41 @@ impl Engine {
             cap_tx,
             stem_tx,
             stem_scratch: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
+            scope_tx,
+            scope_scratch: vec![0.0; MAX_CALLBACK_FRAMES * TAP_CHANNELS],
             pad_out: vec![0.0; MAX_BLOCK as usize * PADS * 2],
             pad_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             stems_live: false,
         };
 
-        let config = cpal::StreamConfig {
-            channels,
-            sample_rate: supported.sample_rate(),
-            buffer_size,
+        let (stream, offline_renderer) = match dev {
+            Some((device, name, supported)) => {
+                let config = cpal::StreamConfig {
+                    channels,
+                    sample_rate: supported.sample_rate(),
+                    buffer_size,
+                };
+                let stream = build_stream(
+                    &device,
+                    &config,
+                    supported.sample_format(),
+                    renderer,
+                    Arc::clone(&shared),
+                    Arc::clone(&fault),
+                )?;
+                stream
+                    .play()
+                    .map_err(|e| format!("{name}: could not start the output stream ({e})"))?;
+                (Some(stream), None)
+            }
+            // Offline: the renderer stays HERE, pulled by hand.
+            None => (None, Some(Box::new(renderer))),
         };
-        let stream = build_stream(
-            &device,
-            &config,
-            supported.sample_format(),
-            renderer,
-            Arc::clone(&shared),
-            Arc::clone(&fault),
-        )?;
-        stream
-            .play()
-            .map_err(|e| format!("{name}: could not start the output stream ({e})"))?;
         shared.running.store(true, Ordering::Relaxed);
 
         Ok(Self {
             stream,
+            offline: offline_renderer,
             output: OutputInfo {
                 device: name,
                 channels,
@@ -4277,6 +4346,7 @@ impl Engine {
             pad_from_audio,
             cap_rx,
             stem_rx,
+            scope_rx,
             inserts_loaded: std::array::from_fn(|_| std::array::from_fn(|_| None)),
             tap: Some(RecorderTap {
                 rx: tap_rx,
@@ -5010,6 +5080,14 @@ impl Engine {
     /// into `out`.
     pub fn drain_stems(&mut self, out: &mut Vec<f32>) {
         while let Ok(v) = self.stem_rx.pop() {
+            out.push(v);
+        }
+    }
+
+    /// Everything the scope tap delivered since the last frame —
+    /// interleaved stereo, the speakers' mix without the click.
+    pub fn drain_scope(&mut self, out: &mut Vec<f32>) {
+        while let Ok(v) = self.scope_rx.pop() {
             out.push(v);
         }
     }
@@ -6526,6 +6604,8 @@ mod tests {
             cap_tx: Vec::new(),
             stem_tx: RingBuffer::<f32>::new(1 << 16).0,
             stem_scratch: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
+            scope_tx: RingBuffer::<f32>::new(1 << 15).0,
+            scope_scratch: vec![0.0; MAX_CALLBACK_FRAMES * TAP_CHANNELS],
             pad_out: vec![0.0; MAX_BLOCK as usize * PADS * 2],
             pad_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             stems_live: false,
@@ -7365,6 +7445,47 @@ mod tests {
     /// **A clip plays through its LANE: mute silences it, solo isolates
     /// it.** The strip's own rules, applied to the document's audio — the
     /// difference between "a bed under the master" and an arrangement.
+    #[test]
+    fn an_offline_engine_renders_the_song_by_hand() {
+        use std::sync::Arc;
+        // No device anywhere near this: the offline door.
+        let mut e = match Engine::offline(48_000, Timebase::new()) {
+            Ok(e) => e,
+            Err(err) => panic!("the offline engine refused to build: {err}"),
+        };
+        e.set_clips(vec![Placed {
+            clip: Arc::new(ivory_record::decode::Clip {
+                samples: vec![0.5; 96_000],
+                rate: 48_000,
+                source: std::path::PathBuf::from("c.wav"),
+            }),
+            strip: 0,
+            start: 0,
+            offset: 0,
+            len: 48_000,
+            fade_in: 0,
+            fade_out: 0,
+        }]);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        let mut out = vec![0.0f32; 1024 * 2];
+        let mut heard = 0.0f32;
+        // A couple of blocks so the clip swap lands and the lane gain slews.
+        for _ in 0..8 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            heard = heard.max(out[2 * 512].abs());
+        }
+        assert!(heard > 0.1, "the offline engine rendered silence: {heard}");
+        // And the transport really advanced — this is a pull, not a loop
+        // over the same block.
+        assert!(
+            e.transport_position() >= 8 * 1024,
+            "the playhead did not move: {}",
+            e.transport_position()
+        );
+    }
+
     #[test]
     fn a_punched_lane_goes_quiet_from_the_punch_frame_on() {
         use std::sync::Arc;

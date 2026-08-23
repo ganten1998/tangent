@@ -318,7 +318,6 @@ pub struct IvoryApp {
     project_request: Option<crate::ports::ProjectRequest>,
     /// An LCD part being dragged: `(row, part, ratchet y)` — Start/End/
     /// Length by bars, beats or thousandths, whichever cell the hand took.
-    lcd_drag: Option<(u8, u8, f32)>,
     /// The channel INPUT menu: which channel, and which page of the
     /// drill-down is open.
     input_menu: Option<InputMenu>,
@@ -406,6 +405,10 @@ pub struct IvoryApp {
     browse_request: Option<std::path::PathBuf>,
     browsed_file: Option<(crate::ports::FilePurpose, std::path::PathBuf)>,
     browsed_dir: Option<(crate::ports::DirPurpose, std::path::PathBuf)>,
+    /// The export dialog's remembered spec, for the session.
+    export_project_spec: crate::ports::ProjectExportSpec,
+    /// The band's oscilloscope: the speakers' mix without the click.
+    scope: crate::scope::Scope,
     /// Patch names of the cartridge the host has loaded, for the picker. The
     /// app never reads a `.syx`: this is pushed in after the host parses one.
     cartridge: crate::ports::CartridgeInfo,
@@ -1078,7 +1081,6 @@ impl IvoryApp {
             arrangement_open: false,
             desk_reload: false,
             project_request: None,
-            lcd_drag: None,
             input_menu: None,
             menu_anchor: egui::Pos2::ZERO,
             input_chip_texts: Vec::new(),
@@ -1117,6 +1119,8 @@ impl IvoryApp {
             browse_request: None,
             browsed_file: None,
             browsed_dir: None,
+            export_project_spec: crate::ports::ProjectExportSpec::default(),
+            scope: crate::scope::Scope::new(48_000.0),
             cartridge: crate::ports::CartridgeInfo::default(),
             plugin_rescan: false,
             reveal_request: None,
@@ -2692,6 +2696,7 @@ impl IvoryApp {
             track: &self.track,
             scrub: self.scrub_view(),
             input_monitor: self.input_monitor,
+            scope: &self.scope,
             ..self.recorder.view(
             self.settings.record_take_name.as_deref().unwrap_or_default(),
             self.name_focused,
@@ -3096,18 +3101,6 @@ impl IvoryApp {
             self.clicked.clear();
             self.timeline_scrub = false;
             self.viewport_pan = None;
-            self.lcd_drag = None;
-        }
-        // An LCD number, ridden: every eight points of travel is one unit
-        // of whatever cell the press took — up for more, the knobs' rule.
-        if let (Some((row, part, from_y)), Some(pos), true) =
-            (self.lcd_drag, pointer, pointer_down)
-        {
-            let steps = f64::from(((from_y - pos.y) / 8.0).trunc());
-            if steps.abs() >= 1.0 {
-                self.lcd_adjust(row, part, steps);
-                self.lcd_drag = Some((row, part, from_y - steps as f32 * 8.0));
-            }
         }
         // The scrub: the locate follows the hand for as long as the press
         // that landed on the timeline is held. X only, clamped at the ends —
@@ -3189,14 +3182,6 @@ impl IvoryApp {
                     {
                         self.settings.heart_color = self.settings.heart_color.wrapping_add(1);
                         self.save_settings();
-                        return;
-                    }
-                    // The LCD's part cells: a press takes the number by
-                    // the unit under the hand, and the drag below turns it.
-                    if let Some((row, part)) =
-                        recorder_panel::lcd_part_at(r, &self.recorder_layout_view(), pos)
-                    {
-                        self.lcd_drag = Some((row, part, pos.y));
                         return;
                     }
                     let hit = recorder_panel::hit_test(
@@ -4971,29 +4956,6 @@ impl IvoryApp {
     }
 
     /// One bar in seconds, from the band's own tempo and signature.
-    /// One LCD drag step: `row` is Start/End/Length, `part` the unit —
-    /// a bar, a beat, or a hundredth of one. Start PANS the viewport, End
-    /// moves its far edge, Length zooms around its centre.
-    fn lcd_adjust(&mut self, row: u8, part: u8, steps: f64) {
-        let bar = self.arr_bar_s();
-        let beat = bar / f64::from(self.time_signature().beats.max(1));
-        let unit = match part {
-            0 => bar,
-            1 => beat,
-            _ => beat / 100.0,
-        };
-        let d = steps * unit;
-        let (s, l) = self.arr_window_now();
-        match row {
-            0 => self.arr_steer(s + d, l),
-            1 => self.arr_steer(s, (l + d).max(0.25)),
-            _ => {
-                let nl = (l + d).max(0.25);
-                self.arr_steer(s - (nl - l) * 0.5, nl);
-            }
-        }
-    }
-
     fn arr_bar_s(&self) -> f64 {
         let bpm = f64::from(self.tempo_bpm()).clamp(20.0, 400.0);
         let sig = self.time_signature();
@@ -5876,7 +5838,13 @@ impl IvoryApp {
                 if name.starts_with('.') {
                     continue;
                 }
-                match e.file_type() {
+                // `metadata`, never `file_type`: the entry's own type calls
+                // a SYMLINK neither a dir nor a file, and the owner's
+                // ~/Dropbox is exactly that — a CloudStorage symlink the
+                // explorer silently dropped. Following it also fires the
+                // macOS folder-permission prompt on first use, which is the
+                // prompt the owner asked for.
+                match std::fs::metadata(e.path()) {
                     Ok(t) if t.is_dir() => dirs.push(name),
                     Ok(t) if t.is_file() => {
                         let audio = std::path::Path::new(&name)
@@ -8193,6 +8161,24 @@ impl IvoryApp {
         &self.settings.auto_exposed
     }
 
+    /// The engine's scope tap, drained by the host once a frame:
+    /// interleaved stereo of the speakers' mix, click excluded. `dt` in
+    /// seconds advances the auto-gain release.
+    pub fn scope_feed(&mut self, samples: &[f32], dt: f32, rate: f32) {
+        self.scope.set_rate(rate);
+        self.scope.tick(samples, dt);
+    }
+
+    /// The export destination the native chooser picked: into the OPEN
+    /// dialog (so the row updates under the hand) and the session memory.
+    pub fn set_export_dir(&mut self, dir: std::path::PathBuf) {
+        let dir = dir.to_string_lossy().into_owned();
+        self.export_project_spec.dir = dir.clone();
+        if let Some(dialogs::Dialog::ExportProject { spec }) = self.dialog.as_mut() {
+            spec.dir = dir;
+        }
+    }
+
     /// The host seeded a fresh multichannel interface: keep the exposed
     /// list, and remember the device so the seed never runs again.
     pub fn note_auto_exposed(&mut self, key: String, exposed: Vec<String>) {
@@ -9630,6 +9616,25 @@ impl IvoryApp {
                 self.settings.palette_choice = i.clamp(0, 4);
                 self.save_settings();
             }
+            DialogAction::ProjectExportOpen => {
+                self.dialog = Some(dialogs::Dialog::ExportProject {
+                    spec: self.export_project_spec.clone(),
+                });
+            }
+            DialogAction::ProjectExportRun(spec) => {
+                // Remembered for the session: an export is run a dozen
+                // times an evening with one field changed.
+                self.export_project_spec = spec.clone();
+                self.project_request = Some(crate::ports::ProjectRequest::Export(spec));
+            }
+            DialogAction::ProjectExportBrowse => {
+                self.native_panel_up = true;
+                self.dir_request = Some(crate::ports::DirRequest {
+                    start_at: None,
+                    title: "Where should the export land?".to_owned(),
+                    purpose: crate::ports::DirPurpose::ExportDir,
+                });
+            }
             DialogAction::ProjectExportTrack => {
                 self.dialog = None;
                 self.project_request = Some(crate::ports::ProjectRequest::ExportTrack);
@@ -10477,6 +10482,7 @@ impl IvoryApp {
                     // The composite's own copy: nothing is focused, nothing
                     // is being typed into and no hand is on a knob, because
                     // there is no pointer in a video frame.
+                    scope: &self.scope,
                     ..self.recorder.view(
                         s.record_take_name.as_deref().unwrap_or_default(),
                         false,
