@@ -101,6 +101,10 @@ pub struct DrumpadView<'a> {
     pub media: &'a [MediaEntry],
     /// The first row shown — the wheel's scroll, clamped by the app.
     pub media_scroll: usize,
+    /// The highlighted media row — the click's own selection.
+    pub media_sel: Option<usize>,
+    /// A knob value being TYPED: which knob, and the digits so far.
+    pub typing: Option<(Param, &'a str)>,
 }
 
 /// What a press on the drumpad means.
@@ -259,7 +263,9 @@ impl Layout {
         // The inspector, left to right: the name, three knobs, the choke
         // chip, CLEAR — and the kit fader alone on the right end.
         let ins = inspector.shrink2(Vec2::new(GAP, 5.0));
-        let knob_w = (ins.width() * 0.11).clamp(34.0, 64.0);
+        // The name is gone from the inspector — the pads say their own
+        // names — and the three sliders grew into its room.
+        let knob_w = (ins.width() * 0.165).clamp(44.0, 96.0);
         let chip_w = (ins.width() * 0.09).clamp(30.0, 52.0);
         let mut right = ins.right();
         let mut rcell = |w: f32| {
@@ -277,7 +283,7 @@ impl Layout {
         let knob_tune = rcell(knob_w);
         let knob_pan = rcell(knob_w);
         let knob_gain = rcell(knob_w);
-        let name = Rect::from_min_max(ins.min, Pos2::new((right - GAP).max(ins.left()), ins.bottom()));
+        let name = Rect::NOTHING;
 
         Self {
             panel: rect,
@@ -641,36 +647,23 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
     );
     let sel = &view.pads[view.selected.min(DRUM_PADS - 1)];
     let has = sel.loaded || sel.missing;
-    if l.name.is_positive() {
-        let word = if has {
-            format!("{}  {}", note_name(pad_note(view.selected)), sel.label)
-        } else {
-            "drop samples onto the pads".to_owned()
-        };
-        let size = fit_text(l.name, &word, 12.0);
-        if size >= MIN_TEXT {
-            painter.text(
-                Pos2::new(l.name.left() + 2.0, l.name.center().y),
-                Align2::LEFT_CENTER,
-                word,
-                font(size),
-                if has {
-                    INK.gamma_multiply(0.85)
-                } else {
-                    INK.gamma_multiply(0.35)
-                },
-            );
-        }
-    }
     let frac = |v: f32, p: Param| {
         let (lo, hi) = p.range();
         ((v - lo) / (hi - lo)).clamp(0.0, 1.0)
+    };
+    // A knob being TYPED shows the digits with a caret in its readout —
+    // single click to type, Enter lands it, the slider language everywhere.
+    let word_for = |p: Param, own: String| -> String {
+        match view.typing {
+            Some((tp, digits)) if tp == p => format!("{digits}_"),
+            _ => own,
+        }
     };
     knob(
         painter,
         l.knob_gain,
         "GAIN",
-        &db_word(sel.params.gain),
+        &word_for(Param::Gain, db_word(sel.params.gain)),
         frac(sel.params.gain, Param::Gain),
         has,
     );
@@ -678,7 +671,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
         painter,
         l.knob_pan,
         "PAN",
-        &pan_word(sel.params.pan),
+        &word_for(Param::Pan, pan_word(sel.params.pan)),
         frac(sel.params.pan, Param::Pan),
         has,
     );
@@ -686,7 +679,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
         painter,
         l.knob_tune,
         "TUNE",
-        &tune_word(sel.params.tune),
+        &word_for(Param::Tune, tune_word(sel.params.tune)),
         frac(sel.params.tune, Param::Tune),
         has,
     );
@@ -749,7 +742,10 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
             painter.rect_filled(
                 *r,
                 1.5,
-                if row % 2 == 0 {
+                if view.media_sel == Some(view.media_scroll + row) {
+                    // The clicked file: lit, so the audition has a face.
+                    Color32::from_rgba_premultiplied(0x3D, 0x50, 0x2A, 120)
+                } else if row % 2 == 0 {
                     Color32::from_rgba_premultiplied(0, 0, 0, 40)
                 } else {
                     Color32::TRANSPARENT
@@ -883,6 +879,8 @@ mod tests {
             params: DrumPadParams::default(),
         };
         DrumpadView {
+            media_sel: None,
+            typing: None,
             pads,
             peaks: [0.0; DRUM_PADS],
             selected: 0,

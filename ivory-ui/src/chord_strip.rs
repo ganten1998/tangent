@@ -152,7 +152,7 @@ pub const THANKS: &[&str] = &[
     "Omer",
     "Hatsu",
     "Joanne",
-    "My wonderful Mother",
+    "My wonderful mother",
 ];
 
 /// The thanks card, anchored under the heart and kept inside `screen`.
@@ -231,7 +231,7 @@ mod thanks_tests {
     #[test]
     fn the_thanks_card_names_everyone_and_stays_on_screen() {
         assert_eq!(THANKS.len(), 6);
-        assert_eq!(THANKS.last(), Some(&"My wonderful Mother"));
+        assert_eq!(THANKS.last(), Some(&"My wonderful mother"));
         // Nobody twice, and nobody blank.
         for (i, n) in THANKS.iter().enumerate() {
             assert!(!n.trim().is_empty());

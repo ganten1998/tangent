@@ -1582,6 +1582,19 @@ impl DesktopApp {
         // frame would be a window that stopped for a minute. Each is
         // remembered whether or not it worked, so a plugin that will not load
         // is not retried sixty times a second.
+        // **A track reorder moves the plugin-state sidecars with it** —
+        // BEFORE the reconcile below, or the racks reload against the old
+        // rows' knobs. Live states written down first, so what moves is
+        // what was sounding.
+        if let Some(order) = self.app.take_desk_state_perm() {
+            self.save_plugin_states();
+            permute_insert_states_in(
+                insert_state_path(0, 0).parent().map(std::path::Path::to_path_buf),
+                &order,
+            );
+            permute_insert_states_in(self.project_state_dir(), &order);
+            self.force_insert_reload();
+        }
         let inserts = ivory_ui::recorder::INSERTS;
         let want_at = |i: usize| {
             self.app
@@ -1939,6 +1952,34 @@ impl DesktopApp {
                     });
                     if let Some((at, ev)) = sent {
                         self.recorder.session.capture_app_midi(at, ev);
+                    }
+                }
+                R::PreviewFile(path) => {
+                    // The media explorer's audition: decode at the engine's
+                    // rate and hand it over whole. The pad cache already
+                    // holds anything that has been dropped on a pad.
+                    if let Some(e) = self.recorder.engine.as_mut() {
+                        let rate = e.output().sample_rate.max(8_000);
+                        let clip = match self.pad_cache.get(&path) {
+                            Some(c) => Some(std::sync::Arc::clone(c)),
+                            None => match ivory_record::decode::decode(&path, rate) {
+                                Ok(c) => {
+                                    let c = std::sync::Arc::new(c);
+                                    self.pad_cache
+                                        .insert(path.clone(), std::sync::Arc::clone(&c));
+                                    Some(c)
+                                }
+                                Err(_) => None,
+                            },
+                        };
+                        if clip.is_some() {
+                            e.set_preview(clip);
+                        }
+                    }
+                }
+                R::PreviewStop => {
+                    if let Some(e) = self.recorder.engine.as_mut() {
+                        e.set_preview(None);
                     }
                 }
                 R::EditPatch { slot: _ } => {
@@ -2788,9 +2829,12 @@ impl DesktopApp {
                 };
                 let doc = self.app.arrangement().clone();
                 for lane in 0..ivory_ui::recorder::CHANNELS {
-                    let used = self.app.channel_kind(lane).is_some()
-                        || doc.clips.iter().any(|c| c.lane == lane);
-                    if !used {
+                    // Only lanes with something to say — see the offline
+                    // twin below for the reasoning.
+                    let sounds = doc.clips.iter().any(|c| c.lane == lane)
+                        || (0..ivory_ui::recorder::INSERTS)
+                            .any(|b| self.app.insert(lane, b).is_some());
+                    if !sounds {
                         continue;
                     }
                     let name: String = self
@@ -3243,9 +3287,15 @@ impl DesktopApp {
             }
             let doc = self.app.arrangement().clone();
             for lane in 0..ivory_ui::recorder::CHANNELS {
-                let used = self.app.channel_kind(lane).is_some()
-                    || doc.clips.iter().any(|c| c.lane == lane);
-                if !used {
+                // **Only lanes with something to SAY get a stem** — clips,
+                // or an instrument in a bay (the DX7, the drumpad, an SD3
+                // following the transport). A kind with neither is an armed
+                // input that renders silence offline, and a folder of
+                // silent WAVs reads as a bug.
+                let sounds = doc.clips.iter().any(|c| c.lane == lane)
+                    || (0..ivory_ui::recorder::INSERTS)
+                        .any(|b| self.app.insert(lane, b).is_some());
+                if !sounds {
                     continue;
                 }
                 let name: String = self
@@ -4273,6 +4323,38 @@ fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result
         }
     }
     Ok(())
+}
+
+/// Rename the channel rows' `insert-state-<strip>-<bay>.bin` files in `dir`
+/// to follow a reorder: `order[new] = old`. Read whole, then write whole —
+/// a rename chain would eat itself on any rotation.
+fn permute_insert_states_in(dir: Option<std::path::PathBuf>, order: &[usize]) {
+    let Some(dir) = dir else {
+        return;
+    };
+    let name = |strip: usize, bay: usize| dir.join(format!("insert-state-{strip}-{bay}.bin"));
+    let bays = ivory_ui::recorder::INSERTS;
+    let mut held: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
+    for new in 0..order.len() {
+        let old = order[new];
+        held.push(
+            (0..bays)
+                .map(|b| std::fs::read(name(old, b)).ok())
+                .collect(),
+        );
+    }
+    for (new, row) in held.into_iter().enumerate() {
+        for (b, data) in row.into_iter().enumerate() {
+            match data {
+                Some(bytes) => {
+                    let _ = std::fs::write(name(new, b), bytes);
+                }
+                None => {
+                    let _ = std::fs::remove_file(name(new, b));
+                }
+            }
+        }
+    }
 }
 
 fn insert_state_path(strip: usize, bay: usize) -> std::path::PathBuf {

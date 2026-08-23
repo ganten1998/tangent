@@ -536,6 +536,12 @@ pub struct DrumPadParams {
     /// 0 = no choke; pads sharing a non-zero group cut each other, which is
     /// what lets a closed hat end an open one.
     pub choke: u8,
+    /// Whether the pad OBEYS NOTE-OFFS: on, a release fades the voice out
+    /// instead of letting the one-shot ring. Off by default, per the owner.
+    pub obey: bool,
+    /// The sample's playable window, fractions of its length. 0..1 whole.
+    pub trim_start: f32,
+    pub trim_end: f32,
 }
 
 impl Default for DrumPadParams {
@@ -545,6 +551,9 @@ impl Default for DrumPadParams {
             pan: 0.0,
             tune: 0.0,
             choke: 0,
+            obey: false,
+            trim_start: 0.0,
+            trim_end: 1.0,
         }
     }
 }
@@ -613,7 +622,7 @@ impl Column {
 /// Re-exported from `mixer_panel::COLUMNS` would be the other direction and
 /// this crate's panels do not depend on each other, so it is stated here and
 /// `a_column_and_a_strip_agree_about_the_desk` holds the two together.
-pub const COLUMNS_FOR_TEST: usize = CHANNELS + 3;
+pub const COLUMNS_FOR_TEST: usize = CHANNELS + 2;
 
 impl Strip {
     /// The channels the MIXER draws, in order: the eight, then the CLICK,
@@ -625,12 +634,16 @@ impl Strip {
     /// that could be soloed against its own sources is a desk with a feedback
     /// question in it. BACKING had a column here and is retired — the
     /// arrangement's lanes carry audio now.
-    pub fn shown() -> [Strip; CHANNELS + 2] {
+    pub fn shown() -> [Strip; CHANNELS + 1] {
+        // **The drum bus strip is retired from the desk** — the drumpad is
+        // a lane's instrument now and answers to that lane's own strip.
+        // `Strip::Drums` keeps its desk index for the arrays and the
+        // engine's fallback; it simply owns no column any more.
         std::array::from_fn(|i| {
             if i < CHANNELS {
                 Strip::Channel(i)
             } else {
-                [Strip::Drums, Strip::Click][i - CHANNELS]
+                Strip::Click
             }
         })
     }
@@ -1144,6 +1157,11 @@ pub enum RecorderRequest {
     /// off; the off is sent anyway, so obey-note-off pads can exist without a
     /// protocol change.
     PadHit { pad: u8, on: bool },
+    /// AUDITION a media file: decode and play it once, replacing any
+    /// preview already sounding. The media explorer's click.
+    PreviewFile(std::path::PathBuf),
+    /// Silence the preview — the explorer closed.
+    PreviewStop,
 }
 
 /// How hard an auditioned note is struck.
