@@ -7446,6 +7446,45 @@ mod tests {
     /// it.** The strip's own rules, applied to the document's audio — the
     /// difference between "a bed under the master" and an arrangement.
     #[test]
+    fn an_offline_engine_taps_stems_too() {
+        use std::sync::Arc;
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        e.set_clips(vec![Placed {
+            clip: Arc::new(ivory_record::decode::Clip {
+                samples: vec![0.5; 96_000],
+                rate: 48_000,
+                source: std::path::PathBuf::from("c.wav"),
+            }),
+            strip: 2,
+            start: 0,
+            offset: 0,
+            len: 48_000,
+            fade_in: 0,
+            fade_out: 0,
+        }]);
+        e.set_stems(true);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        let mut out = vec![0.0f32; 1024 * 2];
+        let mut drained: Vec<f32> = Vec::new();
+        for _ in 0..8 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            e.drain_stems(&mut drained);
+        }
+        assert!(!drained.is_empty(), "the stem tap delivered nothing");
+        let wide = CHANNELS * 2;
+        let frames = drained.len() / wide;
+        let lane2_peak = (0..frames)
+            .map(|f| drained[f * wide + 2 * 2].abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            lane2_peak > 0.1,
+            "lane 2's stem is silent: {lane2_peak} over {frames} frames"
+        );
+    }
+
+    #[test]
     fn an_offline_engine_renders_the_song_by_hand() {
         use std::sync::Arc;
         // No device anywhere near this: the offline door.

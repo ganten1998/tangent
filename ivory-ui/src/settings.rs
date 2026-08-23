@@ -947,6 +947,9 @@ pub struct Settings {
     /// Channels added as BARE tracks (bitmask): a strip that exists before
     /// any input is bound — the + circle's work. Cleared by Remove Track.
     pub tracks_added: i64,
+    /// The MIDI editor FLOATS over the lanes instead of filling the view.
+    /// Off by default — the owner wants the whole area below the band.
+    pub midi_editor_floating: bool,
     /// The MIDI editor's own magnet, grid size and grid shape. Separate
     /// from the arrangement's on purpose: note grids run finer than clip
     /// grids, and toggling one surface must not surprise the other.
@@ -1211,6 +1214,7 @@ impl Default for Settings {
             arr_grid_exp: 0,
             arr_header_w: 0.0,
             tracks_added: 0,
+            midi_editor_floating: false,
             midi_snap: true,
             midi_grid_exp: -4,
             midi_swing: false,
@@ -1970,6 +1974,9 @@ impl Settings {
         if let Some(n) = map.shift_remove("tracks_added").and_then(|v| v.as_i64()) {
             s.tracks_added = n;
         }
+        if let Some(b) = map.shift_remove("midi_editor_floating").and_then(|v| v.as_bool()) {
+            s.midi_editor_floating = b;
+        }
         take_bool(&mut map, "midi_snap", &mut s.midi_snap);
         if let Some(n) = map.shift_remove("midi_grid_exp").and_then(|v| v.as_i64()) {
             s.midi_grid_exp = n.clamp(-6, 3);
@@ -2634,6 +2641,10 @@ impl Settings {
         map.insert("arr_grid_exp".into(), Value::from(self.arr_grid_exp));
         map.insert("arr_header_w".into(), Value::from(self.arr_header_w));
         map.insert("tracks_added".into(), Value::from(self.tracks_added));
+        map.insert(
+            "midi_editor_floating".into(),
+            Value::from(self.midi_editor_floating),
+        );
         map.insert("midi_snap".into(), Value::Bool(self.midi_snap));
         map.insert("midi_grid_exp".into(), Value::from(self.midi_grid_exp));
         map.insert("midi_swing".into(), Value::Bool(self.midi_swing));
