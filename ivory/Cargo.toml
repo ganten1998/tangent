@@ -29,7 +29,10 @@ path = "src/main.rs"
 # pin exists to prevent. The GUI compiles the Recorder band in every build and
 # switches it off through `Caps::MINIMAL`, exactly as the plugin already
 # switches off everything it cannot do.
-default = ["recorder"]
+default = ["recorder", "mp3"]
+# MP3 export via static LAME. Off on the Windows cross build — see the
+# dependency note — and the export delivery says so instead of failing.
+mp3 = ["dep:mp3lame-encoder"]
 recorder = ["dep:ivory-record", "dep:ivory-host", "dep:cpal", "dep:rtrb"]
 
 [dependencies]
@@ -90,7 +93,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 dirs = "6"
 fd-lock = "4"
-mp3lame-encoder = "0.2.5"
+# Optional: the LAME C build cannot cross-compile to Windows under xwin
+# (autotools), so the Windows leg builds without `mp3` and the delivery
+# falls back to WAV with an honest note.
+mp3lame-encoder = { version = "0.2.5", optional = true }
 
 [dev-dependencies]
 ttf-parser = "0.25"

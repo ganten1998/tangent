@@ -711,6 +711,8 @@ enum ArrDrag {
     ClipBand,
     /// A track being carried to another row, by its number.
     ReorderLane { from: usize },
+    /// The GRIDBOX being dragged: up is finer, one step a notch.
+    GridStep { from_y: f32, start: i64 },
     /// The seam between headers and lanes: the pointer's x IS the width.
     HeaderGrip,
     /// The pointer's distance from the clip's start at the press, so the
@@ -804,6 +806,8 @@ enum MeDrag {
     Resize { i: usize },
     /// The head: start and duration move together, the end stands still.
     ResizeLeft { i: usize },
+    /// The GRIDBOX being dragged: up is finer, one step a notch.
+    GridStep { from_y: f32, start: i64 },
     /// A note being drawn: created at press, its tail follows the hand.
     Create { i: usize },
     /// The velocity lane: the bar under the hand follows it vertically.
@@ -4412,9 +4416,6 @@ impl IvoryApp {
         lane: usize,
         start_s: f64,
     ) -> Result<(), String> {
-        if self.channel_kind(lane) == Some(recorder::ChannelKind::Audio) {
-            return Err("an audio lane cannot take a MIDI file".to_owned());
-        }
         let name = file
             .file_stem()
             .map(|n| n.to_string_lossy().into_owned())
@@ -4429,6 +4430,15 @@ impl IvoryApp {
         let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) else {
             return Err("no project is open".to_owned());
         };
+        // A .mid landing on a BARE lane makes it a MIDI track — the
+        // shift-draw's own ritual, so the lane arms and records like one.
+        // A lane that already IS something keeps its kind.
+        if self.channel_kind(lane.min(crate::recorder::CHANNELS - 1)).is_none() {
+            self.set_channel_input_spec(
+                lane.min(crate::recorder::CHANNELS - 1),
+                "midi:all",
+            );
+        }
         self.arrangement.add_clip(crate::arrangement::ArrClip {
             kind: crate::arrangement::ClipKind::Midi,
             notes: import.notes,
@@ -4536,6 +4546,7 @@ impl IvoryApp {
             return;
         };
         let mut added = None;
+        let mut carved = false;
         for r in recorded {
             if r.len_s < 0.05 {
                 continue;
@@ -4545,6 +4556,16 @@ impl IvoryApp {
             } else {
                 crate::arrangement::ClipKind::Midi
             };
+            // **The punch FIRST, whatever was played.** Recording over
+            // material is destructive — a take of silence is an erase, and
+            // skipping the carve because no notes landed left the old clip
+            // standing, the owner's bug.
+            self.arr_carve(
+                r.lane.min(crate::recorder::CHANNELS - 1),
+                r.start_s.max(0.0),
+                r.start_s.max(0.0) + r.len_s,
+            );
+            carved = true;
             if kind == crate::arrangement::ClipKind::Midi && r.notes.is_empty() {
                 continue;
             }
@@ -4553,12 +4574,6 @@ impl IvoryApp {
                 .as_deref()
                 .and_then(|p| std::path::Path::new(p).file_stem().map(|n| n.to_string_lossy().into_owned()))
                 .unwrap_or_else(|| "take".to_owned());
-            // The punch: what this take covers on its lane, it OWNS.
-            self.arr_carve(
-                r.lane.min(crate::recorder::CHANNELS - 1),
-                r.start_s.max(0.0),
-                r.start_s.max(0.0) + r.len_s,
-            );
             let id = self.arrangement.add_clip(crate::arrangement::ArrClip {
                 kind,
                 notes: r.notes,
@@ -4576,8 +4591,11 @@ impl IvoryApp {
         }
         if let Some(id) = added {
             self.arr_selected = Some(id);
+        }
+        if added.is_some() || carved {
             self.arrangement.save_to(&doc);
             self.clips_dirty = true;
+            self.undo_commit();
         }
     }
 
@@ -5742,9 +5760,7 @@ impl IvoryApp {
                     .clamp(0, crate::recorder::CHANNELS as i64 - 1)
                     as usize;
                 let lane_ok = match kind {
-                    Some(crate::arrangement::ClipKind::Midi) => {
-                        self.channel_kind(lane_to) != Some(recorder::ChannelKind::Audio)
-                    }
+                    Some(crate::arrangement::ClipKind::Midi) => true,
                     Some(crate::arrangement::ClipKind::Audio) => {
                         self.channel_kind(lane_to) != Some(recorder::ChannelKind::Midi)
                     }
@@ -5774,9 +5790,9 @@ impl IvoryApp {
         let retarget = lane_at.filter(|l| *l < crate::recorder::CHANNELS).filter(|l| {
             let kind = self.channel_kind(*l);
             match self.arrangement.clips.iter().find(|c| c.id == id).map(|c| c.kind) {
-                Some(crate::arrangement::ClipKind::Midi) => {
-                    kind != Some(recorder::ChannelKind::Audio)
-                }
+                // A MIDI clip goes ANYWHERE — on an audio channel it just
+                // does not sound. Audio still refuses a MIDI lane.
+                Some(crate::arrangement::ClipKind::Midi) => true,
                 Some(crate::arrangement::ClipKind::Audio) => {
                     kind != Some(recorder::ChannelKind::Midi)
                 }
@@ -6017,17 +6033,32 @@ impl IvoryApp {
         self.clip_clipboard = clips;
     }
 
-    /// PASTE at the playhead, snapped — each clip lands on its own lane,
-    /// fresh ids, the new set selected.
+    /// PASTE at the playhead, snapped — and on the SELECTED track when one
+    /// is: the earliest copied clip lands on it and the rest keep their
+    /// relative lanes, clamped. Anywhere goes — a MIDI clip on an audio
+    /// channel simply does not sound, which is the neat kind of nothing.
     fn arr_paste(&mut self) {
         if self.clip_clipboard.is_empty() {
             return;
         }
         let at = self.arr_snap_t(self.recorder.position_s.max(0.0));
         let pasted = self.clip_clipboard.clone();
+        let lane_d = match self.selected_channel {
+            Some(target) => {
+                let base = pasted
+                    .iter()
+                    .min_by(|a, b| a.start_s.total_cmp(&b.start_s))
+                    .map_or(0, |c| c.lane);
+                target.min(crate::recorder::CHANNELS - 1) as i64 - base as i64
+            }
+            None => 0,
+        };
         let mut fresh = Vec::new();
         for mut c in pasted {
             c.start_s += at;
+            c.lane = (c.lane as i64 + lane_d)
+                .clamp(0, crate::recorder::CHANNELS as i64 - 1)
+                as usize;
             c.id = 0;
             fresh.push(self.arrangement.add_clip(c));
         }
@@ -8197,10 +8228,23 @@ impl IvoryApp {
                         }
                         self.save_settings();
                     }
-                    // The gridbox is a READOUT: a press does nothing, by
-                    // the owner's word — the wheel over it still walks the
-                    // sizes, and the hit only exists to keep the press off
-                    // the roll behind it.
+                    // The gridbox: click then DRAG, up is finer — wheels
+                    // proved fragile on the Linux box. The RIGHT button
+                    // steps one COARSER on its own; a motionless left
+                    // click still changes nothing.
+                    Some(H::ToolGrid) if secondary => {
+                        self.settings.midi_grid_exp =
+                            (self.settings.midi_grid_exp + 1).clamp(-6, 3);
+                        self.save_settings();
+                    }
+                    Some(H::ToolGrid) if pressed => {
+                        if let Some(st) = self.midi_edit.as_mut() {
+                            st.drag = Some(MeDrag::GridStep {
+                                from_y: p.y,
+                                start: self.settings.midi_grid_exp,
+                            });
+                        }
+                    }
                     Some(H::ToolGrid) => {}
                     Some(H::Ruler(t)) if pressed => {
                         // The magnet holds here too, exactly as the
@@ -8387,6 +8431,14 @@ impl IvoryApp {
                 }
                 MeDrag::Resize { i } => self.me_resize_note(i, t_at),
                 MeDrag::ResizeLeft { i } => self.me_resize_note_left(i, t_at),
+                MeDrag::GridStep { from_y, start } => {
+                    let steps = f64::from((from_y - p.y) / 14.0).round() as i64;
+                    let to = (start - steps).clamp(-6, 3);
+                    if to != self.settings.midi_grid_exp {
+                        self.settings.midi_grid_exp = to;
+                        self.save_settings_soon();
+                    }
+                }
                 MeDrag::Create { i } => {
                     let step = self
                         .midi_edit
@@ -8523,8 +8575,23 @@ impl IvoryApp {
         }
         // **A right-click on a lane HEADER opens the TRACK menu** — remove,
         // colour, auto-palette — the same menu the mixer strip answers.
+        // On the GRIDBOX it steps one coarser, the drag's cheap sibling.
         if ctx.input(|i| i.pointer.secondary_pressed()) {
             if let Some(p) = pointer.filter(|p| rect.contains(*p)) {
+                let on_gridbox = {
+                    let clips = self.arr_clip_views();
+                    let view = self.arrange_view(&clips);
+                    matches!(
+                        crate::arrangement_panel::hit_test(rect, &view, p),
+                        Some(crate::arrangement_panel::Hit::ToolGrid)
+                    )
+                };
+                if on_gridbox {
+                    self.settings.arr_grid_exp =
+                        (self.settings.arr_grid_exp + 1).clamp(-5, 3);
+                    self.save_settings();
+                    return;
+                }
                 let lane = {
                     let clips = self.arr_clip_views();
                     let view = self.arrange_view(&clips);
@@ -8641,6 +8708,20 @@ impl IvoryApp {
                     crate::arrangement_panel::hit_test(rect, &view, p)
                 };
                 use crate::arrangement_panel::Hit as A;
+                // **A double-click puts a dial back** — the desk's one rule,
+                // finally honoured on this view's three as well.
+                if let Some(A::Gain(n) | A::Send(n) | A::Pan(n)) = hit {
+                    let col = crate::recorder::Column(n);
+                    let mixer_hit = match hit {
+                        Some(A::Gain(_)) => crate::mixer_panel::Hit::Fader(col),
+                        Some(A::Send(_)) => crate::mixer_panel::Hit::Send(col),
+                        _ => crate::mixer_panel::Hit::Pan(col),
+                    };
+                    self.reset_mixer_hit(mixer_hit);
+                    self.undo_commit();
+                    self.arr_drag = None;
+                    return;
+                }
                 match hit {
                     Some(A::ClipBody(id)) => {
                         let is_midi = self
@@ -8776,11 +8857,14 @@ impl IvoryApp {
                         self.save_settings();
                     }
                     Some(A::ToolGrid) => {
-                        // A press steps FINER; the wheel over the box is the
-                        // real control and goes both ways.
-                        self.settings.arr_grid_exp =
-                            (self.settings.arr_grid_exp - 1).clamp(-5, 3);
-                        self.save_settings();
+                        // **Click, then DRAG up and down** — up is finer.
+                        // Wheels proved fragile on the Linux box, the
+                        // owner's word; the wheel still works for those
+                        // whose wheels do.
+                        self.arr_drag = Some(ArrDrag::GridStep {
+                            from_y: p.y,
+                            start: self.settings.arr_grid_exp,
+                        });
                     }
                     Some(A::ToolNav) => {
                         let px_w = {
@@ -8844,14 +8928,12 @@ impl IvoryApp {
                     // refuses with one sentence.
                     Some(A::Lane(lane, t)) => {
                         if shift {
-                            if self.channel_kind(lane) == Some(recorder::ChannelKind::Audio) {
-                                self.track.error =
-                                    "an audio lane cannot take a MIDI item".to_owned();
-                            } else {
-                                let anchor = self.arr_snap_t(t);
-                                self.arr_pending = Some((lane, anchor, anchor));
-                                self.arr_drag = Some(ArrDrag::CreateMidi { lane, anchor });
-                            }
+                            // ANY lane takes a MIDI item now — on an audio
+                            // channel it simply does not sound, which is
+                            // the neat kind of nothing, the owner's word.
+                            let anchor = self.arr_snap_t(t);
+                            self.arr_pending = Some((lane, anchor, anchor));
+                            self.arr_drag = Some(ArrDrag::CreateMidi { lane, anchor });
                         } else if alt {
                             // Alt-drag GRABS the view: the hand moves the
                             // window, the song stays put.
@@ -8908,6 +8990,14 @@ impl IvoryApp {
                 crate::arrangement_panel::time_at(rect, &view, p.x)
             };
             match drag {
+                ArrDrag::GridStep { from_y, start } => {
+                    let steps = f64::from((from_y - p.y) / 14.0).round() as i64;
+                    let to = (start - steps).clamp(-5, 3);
+                    if to != self.settings.arr_grid_exp {
+                        self.settings.arr_grid_exp = to;
+                        self.save_settings_soon();
+                    }
+                }
                 ArrDrag::ReorderLane { .. } => {}
                 ArrDrag::ClipBand => {
                     if let Some((a, _)) = self.arr_band {
@@ -13263,7 +13353,11 @@ impl IvoryApp {
                 let hr = recorder_panel::heart_rect(rect, &self.recorder_layout_view());
                 if hr.is_positive() {
                     chord_strip::draw_heart(ui.painter(), hr, c);
-                    heart_rect_for_card = Some(hr);
+                    // The hover rect is the GLYPH's own pixels — the drawn
+                    // sprite, not the layout cell it was carved from. Every
+                    // pixel you can see answers the hand now.
+                    heart_rect_for_card =
+                        Some(chord_strip::heart_rect(hr).expand(3.0));
                 }
             }
         }
@@ -13979,7 +14073,12 @@ impl IvoryApp {
             let view_key = ctx.input(|i| {
                 if !i.modifiers.shift || i.modifiers.command || i.modifiers.ctrl {
                     None
-                } else if i.key_pressed(egui::Key::Num1) {
+                } else if i.key_pressed(egui::Key::Num1)
+                    || i.key_pressed(egui::Key::Exclamationmark)
+                {
+                    // Shift+1 arrives as `!` — a key egui NAMES, so the
+                    // digit fallback the other two ride never happens.
+                    // Both spellings answer.
                     Some((false, false))
                 } else if i.key_pressed(egui::Key::Num2) {
                     Some((false, true))
@@ -14878,6 +14977,8 @@ mod tests {
         let root = project_scratch("me-v2");
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
         app.bootstrap_project(&root.join("Projects"));
+        // Pinned: these figures were written against the old 1/16 default.
+        app.settings.midi_grid_exp = -4;
         let note = |at: f64, key: u8| crate::arrangement::ArrNote {
             at_s: at,
             dur_s: 0.3,
@@ -14988,6 +15089,109 @@ mod tests {
     /// swallowed clips are removed, overlapped edges trimmed, a spanning
     /// clip is split around the punch — and the tail's trim rides in its
     /// offset, so MIDI notes and audio alike keep their alignment.
+    #[test]
+    fn a_midi_take_carves_the_midi_clip_it_covers() {
+        // The owner's exact flow on 4.61: an existing MIDI clip on an armed
+        // MIDI lane, a new MIDI take recorded OVER it — the covered span
+        // must be carved and the take must land. "It simply keeps the old
+        // clip" was the report.
+        let root = project_scratch("midipunch");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        let note = |at: f64| crate::arrangement::ArrNote {
+            at_s: at,
+            dur_s: 0.5,
+            key: 60,
+            vel: 100,
+        };
+        app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            notes: vec![note(0.0), note(4.0), note(9.0)],
+            lane: 0,
+            path: String::new(),
+            start_s: 0.0,
+            offset_s: 0.0,
+            len_s: 10.0,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name: "old".to_owned(),
+            id: 0,
+        });
+        app.add_recorded_clips(vec![crate::arrangement::RecordedClip {
+            lane: 0,
+            start_s: 3.0,
+            len_s: 4.0, // covers 3..7
+            path: None,
+            notes: vec![note(0.5)],
+        }]);
+        let mut lane0: Vec<(f64, f64, String)> = app
+            .arrangement
+            .clips
+            .iter()
+            .filter(|c| c.lane == 0)
+            .map(|c| (c.start_s, c.len_s, c.name.clone()))
+            .collect();
+        lane0.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert_eq!(
+            lane0.len(),
+            3,
+            "head, take, tail — the old clip was not carved: {lane0:?}"
+        );
+        assert!((lane0[0].0 - 0.0).abs() < 1e-9 && (lane0[0].1 - 3.0).abs() < 1e-9);
+        assert_eq!(lane0[1].2, "take", "the new take never landed");
+        assert!((lane0[1].0 - 3.0).abs() < 1e-9 && (lane0[1].1 - 4.0).abs() < 1e-9);
+        assert!((lane0[2].0 - 7.0).abs() < 1e-9, "the tail did not move to 7");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_empty_take_still_erases_what_it_covered() {
+        // Recording over a clip and playing NOTHING is an erase: the punch
+        // promised destruction, and the empty-notes skip used to leave the
+        // old clip standing — the owner's "non destructive" half.
+        let root = project_scratch("erase");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            notes: vec![crate::arrangement::ArrNote {
+                at_s: 1.0,
+                dur_s: 0.5,
+                key: 60,
+                vel: 100,
+            }],
+            lane: 0,
+            path: String::new(),
+            start_s: 0.0,
+            offset_s: 0.0,
+            len_s: 10.0,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name: "old".to_owned(),
+            id: 0,
+        });
+        app.add_recorded_clips(vec![crate::arrangement::RecordedClip {
+            lane: 0,
+            start_s: 2.0,
+            len_s: 6.0, // covers 2..8, no notes played
+            path: None,
+            notes: Vec::new(),
+        }]);
+        let lane0: Vec<(f64, f64)> = app
+            .arrangement
+            .clips
+            .iter()
+            .filter(|c| c.lane == 0)
+            .map(|c| (c.start_s, c.len_s))
+            .collect();
+        assert_eq!(lane0.len(), 2, "head and tail, nothing landed: {lane0:?}");
+        assert!(
+            lane0.iter().all(|(s, l)| *s + *l <= 2.0 + 1e-9 || *s >= 8.0 - 1e-9),
+            "the erased span still holds material: {lane0:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn a_record_punches_out_what_it_covers() {
         let root = project_scratch("punch");
@@ -15170,6 +15374,8 @@ mod tests {
         let root = project_scratch("midiedit");
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
         app.bootstrap_project(&root.join("Projects"));
+        // Pinned: these figures were written against the old 1/16 default.
+        app.settings.midi_grid_exp = -4;
         let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
             kind: crate::arrangement::ClipKind::Midi,
             notes: Vec::new(),
@@ -15810,13 +16016,15 @@ mod tests {
         // ...onto the DX7's MIDI channel it also goes...
         app.arr_move(id, 8.0, 0.0, Some(0));
         assert_eq!(app.arrangement().clips[0].lane, 0);
-        // ...but an AUDIO channel refuses it, and the clip stays put.
+        // ...and an AUDIO channel takes it too now — it simply will not
+        // sound there, the owner's rule. Audio clips still refuse MIDI
+        // lanes; the asymmetry is deliberate.
         app.set_channel_input_spec(3, "in:0");
         app.arr_move(id, 8.0, 0.0, Some(3));
         assert_eq!(
             app.arrangement().clips[0].lane,
-            0,
-            "a MIDI clip landed on an audio channel"
+            3,
+            "a MIDI clip was refused an audio channel"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -15941,6 +16149,7 @@ mod tests {
         app.arr_selected = Some(id);
         app.arr_copy();
         app.recorder.position_s = 30.0;
+        app.selected_channel = None;
         app.arr_paste();
         assert_eq!(app.arrangement().clips.len(), 2, "the paste left nothing");
         let pasted = app.arrangement().clips.last().unwrap().clone();
@@ -15948,6 +16157,15 @@ mod tests {
         assert_eq!(pasted.lane, 4);
         assert_ne!(pasted.id, id, "the copy stole the original's identity");
         assert_eq!(app.arr_multi, vec![pasted.id], "the fresh set is not selected");
+        // **The SELECTED track takes the next paste** — nobody wants every
+        // copy stuck on the lane it came from.
+        app.selected_channel = Some(6);
+        app.arr_paste();
+        assert_eq!(
+            app.arrangement().clips.last().unwrap().lane,
+            6,
+            "the paste ignored the selected channel"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

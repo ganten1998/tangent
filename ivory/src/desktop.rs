@@ -1928,6 +1928,15 @@ impl DesktopApp {
                     if let Some((at, events)) = sent {
                         for ev in events {
                             self.recorder.session.capture_app_midi(at, ev);
+                            // **The arrangement's collection hears the app's
+                            // own surfaces too** — the on-screen piano, the
+                            // key rows, the chord lattice. Only hardware
+                            // MIDI reached `note_event`, so a performer
+                            // with no cable recorded silence on every
+                            // platform without one.
+                            if let Some(rec) = self.recorder.arr_rec.as_mut() {
+                                rec.note_event(at, &ev);
+                            }
                         }
                     }
                 }
@@ -1952,6 +1961,14 @@ impl DesktopApp {
                     });
                     if let Some((at, ev)) = sent {
                         self.recorder.session.capture_app_midi(at, ev);
+                        // **A pad tapped over a rolling ARRANGEMENT record
+                        // is a performance too** — the take's .mid already
+                        // knew; the arrangement's own collection now hears
+                        // the app-injected strike as well, or pads played
+                        // by hand never landed in the recorded clip.
+                        if let Some(rec) = self.recorder.arr_rec.as_mut() {
+                            rec.note_event(at, &ev);
+                        }
                     }
                 }
                 R::PreviewFile(path) => {
@@ -2638,6 +2655,12 @@ impl DesktopApp {
                         midi_lanes.push(ch);
                     }
                 }
+                // A CLIP lane — used, no live source — arms in the UI like
+                // any other; its R lit and the record ignoring it was the
+                // owner's "non functional". It takes the note stream.
+                None if armed & (1 << ch) != 0 => {
+                    midi_lanes.push(ch);
+                }
                 Some(ivory_ui::recorder::ChannelKind::Audio) => {
                     if pick < ivory_ui::recorder::INPUTS {
                         if armed & (1 << ch) != 0 {
@@ -2708,7 +2731,10 @@ impl DesktopApp {
         }
         rec.notes.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
         let mut out: Vec<ivory_ui::arrangement::RecordedClip> = Vec::new();
-        if !rec.notes.is_empty() && len_s >= 0.05 {
+        // Delivered even with NO notes: the punch promised destruction,
+        // and a take of silence over a clip is an erase — the app carves
+        // and simply lands nothing.
+        if len_s >= 0.05 {
             for lane in &rec.midi_lanes {
                 out.push(ivory_ui::arrangement::RecordedClip {
                     lane: *lane,
@@ -4484,6 +4510,7 @@ fn deliver_formats_inner(
 /// Interleaved stereo f32 in, a finished MP3 on disk out. 320 kbps, best
 /// quality — an export is the one place nobody wants a knob for this.
 #[cfg(feature = "recorder")]
+#[cfg(feature = "mp3")]
 fn encode_mp3(
     stereo: &[f32],
     rate: u32,
@@ -4523,6 +4550,17 @@ fn encode_mp3(
         .map_err(|e| format!("mp3: {e}"))?;
     std::fs::write(path, &out).map_err(|e| format!("mp3: {e}"))?;
     Ok(())
+}
+
+#[cfg(feature = "recorder")]
+#[cfg(not(feature = "mp3"))]
+fn encode_mp3(
+    _interleaved: &[f32],
+    _rate: u32,
+    _mono: bool,
+    _path: &std::path::Path,
+) -> Result<(), String> {
+    Err("mp3 export is not in this build".to_owned())
 }
 
 fn saved_insert_state(strip: usize, bay: usize, bundle: &str) -> Option<Vec<u8>> {
@@ -5411,6 +5449,7 @@ mod tests {
     /// **The MP3 pass writes a real MPEG stream.** A sine goes in, a file
     /// the app's own decoder accepts comes out — encode and decode meeting
     /// proves the delivery path, not just LAME's return code.
+    #[cfg(feature = "mp3")]
     #[test]
     fn an_mp3_export_round_trips_through_the_decoder() {
         let dir = std::env::temp_dir().join("tangent-mp3-test");

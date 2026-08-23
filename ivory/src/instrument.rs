@@ -7906,6 +7906,35 @@ mod tests {
         );
     }
 
+    /// **The count-in still delivers its downbeat while the transport
+    /// stands still** — the arrangement record WAITS on it, and the
+    /// metronome's rolling gate must not strangle it.
+    #[test]
+    fn a_count_in_finishes_without_the_transport_rolling() {
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        // The owner's shape: metronome armed, transport STOPPED, count-in
+        // requested by the red button.
+        e.set_metronome_enabled(true);
+        e.set_tempo(120.0);
+        e.start_count_in(2, 120.0);
+        assert!(!e.count_in_done(), "done before a single click");
+        let mut out = vec![0.0f32; 1024 * 2];
+        // Two beats at 120 bpm = 1 s = ~47 blocks; give it 80.
+        let mut done_at = None;
+        for block in 0..80 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            if e.count_in_done() {
+                done_at = Some(block);
+                break;
+            }
+        }
+        assert!(
+            done_at.is_some(),
+            "the count-in never finished — the record waits forever"
+        );
+    }
+
     #[test]
     fn a_tied_note_on_one_key_sounds_again() {
         use std::sync::Arc;

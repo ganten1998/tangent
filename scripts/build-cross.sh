@@ -380,7 +380,9 @@ echo "==> Tangent $VERSION — Linux aarch64"
 package_linux aarch64-unknown-linux-gnu aarch64 || { LINUX_OK=0; echo "!! Linux aarch64 build failed (ALSA sysroot? see docs/RELEASE.md)"; }
 
 echo "==> Tangent $VERSION — Windows x86_64"
-cargo xwin build --release --target x86_64-pc-windows-msvc -p ivory
+# No mp3 on the Windows leg: LAME's autotools build cannot run under
+# xwin. The app copes — the delivery falls back to WAV with a note.
+cargo xwin build --release --target x86_64-pc-windows-msvc -p ivory --no-default-features --features recorder
 WINSTAGE="dist/tangent-${VERSION}-windows-x86_64"
 WINZIP="${WINSTAGE}.zip"
 rm -rf "$WINSTAGE" "$WINZIP"

@@ -534,6 +534,29 @@ channels play back their clips and nothing else. "Ready to play" and
   dialog's Done sits in an ABSOLUTE seat at the frame's corner with
   the content scrolling above it — no arithmetic left to clip it.
 
+- **4.62.0 — the record works again, everywhere you play**: the
+  arrangement record was DEAF to the app's own surfaces — only
+  hardware MIDI ever reached it, so the on-screen piano, the key rows
+  and the pads recorded silence on every platform (the void box has no
+  cable at all). Every app-sounded note the cassette hears now feeds
+  the arrangement too; an ARMED clip-lane (kind None — pasted or
+  dropped .mid) records instead of being silently skipped; an EMPTY
+  take still CARVES what it covered (recording silence over a clip is
+  an erase — the punch promised destruction); and a .mid landing on a
+  bare lane binds it midi:all, the shift-draw's own ritual. The
+  gridboxes are CLICK-THEN-DRAG steppers now (up = finer, ~14 px a
+  notch; right-click steps coarser; wheels — fragile on the Linux
+  box — still work). Defaults: 1/4 grid in both views, DARK arrange
+  and editor (theory stays light), band colour 97,55,58 from last
+  time. MIDI clips go ANYWHERE — draw, drop, drag, paste — an audio
+  channel just doesn't sound them. Arrange dials reset on
+  double-click like the desk's; paste lands on the SELECTED channel;
+  Shift+1 works (the chord arrives as `!`, a key egui names); the
+  heart answers on every drawn pixel; a seam at every channel
+  boundary. And the WINDOWS BUILD EXISTS: mp3 became a cargo feature
+  (LAME's autotools cannot cross under xwin) — the Windows leg ships
+  without it and the export delivery says so instead of failing.
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index

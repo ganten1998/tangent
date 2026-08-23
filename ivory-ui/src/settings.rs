@@ -1241,14 +1241,18 @@ impl Default for Settings {
             track_path: String::new(),
             project_path: String::new(),
             arr_snap: true,
-            arr_grid_exp: 0,
+            // 1/4 out of the box, both grids — the owner's default.
+            arr_grid_exp: -2,
             arr_header_w: 0.0,
             tracks_added: 0,
             midi_editor_floating: false,
             midi_snap: true,
-            midi_grid_exp: -4,
+            // 1/4, matching the arrange grid's own default.
+            midi_grid_exp: -2,
             midi_swing: false,
-            arr_dark: false,
+            // DARK ships as the default for the arrange field and the
+            // editor; the theory surfaces stay light.
+            arr_dark: true,
             media_default_dir: String::new(),
             // The editor SHIPPED dark — its warm browns are the dark face
             // now, and its light face is the arrange view's greys.
