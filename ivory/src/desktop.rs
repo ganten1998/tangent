@@ -4157,6 +4157,13 @@ impl DesktopApp {
             self.recorder.session.audio_device_name().map(str::to_owned),
             self.recorder.session.audio_error().map(str::to_owned),
         );
+        // **The device's width, measured HERE — on the reconcile edge — and
+        // pushed once.** The UI reads the stored number every frame; asking
+        // `AudioSetup::input_channels` per frame enumerates every device
+        // through CoreAudio (cpal builds an AudioUnit per query) and buried
+        // the app under blocked IPC — the owner's "ludicrous" lag.
+        self.app
+            .set_input_width(crate::devices::wanted_device_width(&self.recorder.audio));
         // **A multichannel interface arrives fully exposed** — every mono
         // input and the natural pairs, ticked the first time the device is
         // met. Once per device: the chooser can prune, and pruning sticks.

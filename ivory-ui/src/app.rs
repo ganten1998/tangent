@@ -423,6 +423,12 @@ pub struct IvoryApp {
     /// An LCD Start/End/Length cell being ridden: row, part, and the y the
     /// current step was measured from.
     lcd_drag: Option<(u8, u8, f32)>,
+    /// The OPEN input stream's channel count, pushed by the host when the
+    /// stream opens or closes. **The one width the UI may read per frame**
+    /// — asking `AudioSetup::input_channels` enumerates devices through
+    /// CoreAudio, and doing that every frame is what buried the app under
+    /// a second of blocked IPC per query on the owner's desk.
+    input_width: u16,
     /// Patch names of the cartridge the host has loaded, for the picker. The
     /// app never reads a `.syx`: this is pushed in after the host parses one.
     cartridge: crate::ports::CartridgeInfo,
@@ -1153,6 +1159,7 @@ impl IvoryApp {
             menu_cache_at: None,
             menu_hover_row: None,
             lcd_drag: None,
+            input_width: 0,
             cartridge: crate::ports::CartridgeInfo::default(),
             plugin_rescan: false,
             reveal_request: None,
@@ -4490,11 +4497,7 @@ impl IvoryApp {
             .record_audio_device
             .clone()
             .unwrap_or_default();
-        let width = self
-            .audio_setup
-            .as_ref()
-            .map(|s| usize::from(s.input_channels()))
-            .unwrap_or(0);
+        let width = usize::from(self.input_width);
         (name, width)
     }
 
@@ -4547,11 +4550,7 @@ impl IvoryApp {
     /// with no interface open yet, the interfaces themselves, which is the
     /// recovery door.
     fn input_menu_sub(&self, top: usize) -> Vec<String> {
-        let width = self
-            .audio_setup
-            .as_ref()
-            .map(|s| usize::from(s.input_channels()))
-            .unwrap_or(0);
+        let width = usize::from(self.input_width);
         match top {
             0 | 1 if width == 0 => {
                 let list = self.audio_device_list();
@@ -4587,11 +4586,7 @@ impl IvoryApp {
             return;
         };
         let ch = menu.ch;
-        let width = self
-            .audio_setup
-            .as_ref()
-            .map(|s| usize::from(s.input_channels()))
-            .unwrap_or(0);
+        let width = usize::from(self.input_width);
         match top {
             0 | 1 if width == 0 => {
                 // Choosing the interface itself: remember it, open it, and
@@ -4687,11 +4682,7 @@ impl IvoryApp {
         // the interface reports its width, the interface list becomes the
         // input list — one re-snapshot, not one per frame.
         if m.devices_offered {
-            let width = self
-                .audio_setup
-                .as_ref()
-                .map(|s| usize::from(s.input_channels()))
-                .unwrap_or(0);
+            let width = usize::from(self.input_width);
             if width > 0 {
                 self.refresh_menu_rows();
                 m.rows = self.menu_rows_cache.clone().unwrap_or_default();
@@ -8430,6 +8421,12 @@ impl IvoryApp {
     /// so a hand-pruned setup stays pruned.
     pub fn auto_exposed_devices(&self) -> &[String] {
         &self.settings.auto_exposed
+    }
+
+    /// The open input stream's width, from the host on the open/close
+    /// edge. A changed width re-warms the input menu's cache by key.
+    pub fn set_input_width(&mut self, w: u16) {
+        self.input_width = w;
     }
 
     /// The engine's scope tap, drained by the host once a frame:

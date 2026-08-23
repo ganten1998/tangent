@@ -385,6 +385,20 @@ channels play back their clips and nothing else. "Ready to play" and
   keeps one size wherever the viewport stands; the Track dialog is 480
   tall so Done exists.
 
+- **4.55.0 — the lag, measured and killed**: `sample` on the live app
+  showed the main thread blocked in coreaudiod IPC — `tend_menu_cache`
+  read `AudioSetup::input_channels()` EVERY FRAME, and that call
+  enumerates every input device through cpal, which **builds a whole
+  AudioUnit per device per query** (`audio_unit_from_device` inside
+  `default_input_config`). Hundreds of ms of blocked mach IPC per frame.
+  The UI now reads a stored width (`app.input_width`) pushed ONCE on the
+  reconcile edge (`devices::wanted_device_width` — the DEVICE's width,
+  not the open stream's, so a one-pick stream still lists every input);
+  the menu's open-frame check reads the same field. Also: the default
+  output-match now PROMOTES the matched uid into `sel.wanted`, so the
+  selection settles like any chosen device instead of comparing
+  `None != open` forever.
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index
