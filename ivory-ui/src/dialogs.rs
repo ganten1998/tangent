@@ -4124,6 +4124,32 @@ pub fn show(
                             ) {
                                 spec.mono = i == 1;
                             }
+                            {
+                                use crate::ports::ExportDepth as D;
+                                let at = match spec.depth {
+                                    D::Pcm16 => 0,
+                                    D::Pcm24 => 1,
+                                    D::Float32 => 2,
+                                };
+                                if let Some(i) = choice(
+                                    ui,
+                                    "DEPTH",
+                                    &["16-bit", "24-bit", "32-float"],
+                                    at,
+                                ) {
+                                    spec.depth = [D::Pcm16, D::Pcm24, D::Float32][i];
+                                }
+                                ui.label(
+                                    RichText::new(match spec.depth {
+                                        D::Pcm24 => "the standard: mixes, collaborators, mastering hand-offs",
+                                        D::Float32 => "keeps headroom above 0 dB - stems and heavy bounces",
+                                        D::Pcm16 => "CD burns and the platforms that ask for it",
+                                    })
+                                    .font(plain(8.0))
+                                    .color(dim),
+                                );
+                                ui.add_space(2.0);
+                            }
                             if let Some(i) = choice(
                                 ui,
                                 "RENDER",
@@ -4343,9 +4369,20 @@ pub fn show(
                                     }
                                 });
                             }
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.add_space(6.0);
+                            // Measured placement: the right-to-left layout
+                            // kept walking the button past the viewport's
+                            // right edge on the owner's screen. A fixed
+                            // width, padded in from the right by hand,
+                            // cannot leave.
+                            ui.horizontal(|ui| {
+                                let pad = (ui.available_width() - 64.0).max(0.0);
+                                ui.add_space(pad);
                                 if ui
-                                    .add(Button::new(RichText::new("Done").color(t.text)))
+                                    .add_sized(
+                                        Vec2::new(56.0, 22.0),
+                                        Button::new(RichText::new("Done").color(t.text)),
+                                    )
                                     .clicked()
                                 {
                                     result.close = true;

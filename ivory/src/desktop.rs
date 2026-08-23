@@ -2200,7 +2200,10 @@ impl DesktopApp {
         }
         let mut dialog = rfd::FileDialog::new()
             .set_title(&request.title)
-            .set_file_name(&request.suggested);
+            .set_file_name(&request.suggested)
+            // **Start in the Projects folder** — the owner's word — and
+            // let the panel wander anywhere from there.
+            .set_directory(self.app.record_root().join("Projects"));
         dialog = dialog.set_parent(frame);
         let file = dialog.save_file();
         self.app.native_panel_closed();
@@ -2928,7 +2931,7 @@ impl DesktopApp {
                     }
                 }
             }
-            match deliver_formats(&paths, &spec) {
+            match deliver_formats_inner(&paths, &spec, true) {
                 Ok(()) => {
                     self.recorder.take_note =
                         Some(format!("Exported  {}", out_dir.display()));
@@ -3147,7 +3150,13 @@ impl DesktopApp {
         let wav_spec = ivory_record::wav::WavSpec {
             sample_rate: rate,
             channels: if spec.mono { 1 } else { 2 },
-            format: ivory_record::wav::SampleFormat::Float32,
+            format: match spec.depth {
+                ivory_ui::ports::ExportDepth::Pcm16 => ivory_record::wav::SampleFormat::Int16,
+                ivory_ui::ports::ExportDepth::Pcm24 => ivory_record::wav::SampleFormat::Int24,
+                ivory_ui::ports::ExportDepth::Float32 => {
+                    ivory_record::wav::SampleFormat::Float32
+                }
+            },
         };
         let bext = ivory_record::wav::Bext::new(ivory_record::wav::Wallclock::now_utc(), wav_spec);
         let stem_name = sanitize_file_stem(&spec.name);
@@ -3167,7 +3176,9 @@ impl DesktopApp {
         let mut stems = Vec::new();
         if spec.stems {
             let dir = out_dir.join("stems");
-            let _ = std::fs::create_dir_all(&dir);
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                self.recorder.take_note = Some(format!("export: stems dir: {e}"));
+            }
             let doc = self.app.arrangement().clone();
             for lane in 0..ivory_ui::recorder::CHANNELS {
                 let used = self.app.channel_kind(lane).is_some()
@@ -3189,7 +3200,10 @@ impl DesktopApp {
             }
         }
         let until = ((span + 2.0) * f64::from(rate)).ceil() as u64;
-        self.recorder.take_note = Some("Rendering at full speed…".to_owned());
+        self.recorder.take_note = Some(format!(
+            "Rendering at full speed… ({} stem writers)",
+            stems.len()
+        ));
         self.recorder.offline_bounce = Some(OfflineBounce {
             e,
             spec,
@@ -3340,6 +3354,16 @@ impl DesktopApp {
                 let _ = copy_dir_all(&src, &dst);
             }
             ivory_ui::ports::ProjectRequest::Export(spec) => {
+                self.recorder.take_note = Some(format!(
+                    "export: {} {} → {}…",
+                    if spec.realtime { "realtime" } else { "full-speed" },
+                    match (spec.master, spec.stems) {
+                        (true, false) => "master",
+                        (false, true) => "stems",
+                        _ => "master+stems",
+                    },
+                    if spec.dir.trim().is_empty() { "project/export" } else { spec.dir.trim() },
+                ));
                 if spec.realtime {
                     // The realtime pass: the live engine, the live rate. The
                     // spec's shaping (name, dir, formats, mono) is applied
@@ -4224,12 +4248,48 @@ fn deliver_formats(
     paths: &[std::path::PathBuf],
     spec: &ivory_ui::ports::ProjectExportSpec,
 ) -> Result<(), String> {
+    deliver_formats_inner(paths, spec, false)
+}
+
+/// As [`deliver_formats`]; `rewrite_depth` re-encodes the WAVs at the
+/// spec's word size — the REALTIME pass records float and delivers copies,
+/// where the offline writers already wrote the asked depth directly.
+fn deliver_formats_inner(
+    paths: &[std::path::PathBuf],
+    spec: &ivory_ui::ports::ProjectExportSpec,
+    rewrite_depth: bool,
+) -> Result<(), String> {
     use ivory_ui::ports::ExportFormat;
     let want_wav = spec.primary == ExportFormat::Wav
         || spec.secondary == Some(ExportFormat::Wav);
     let want_mp3 = spec.primary == ExportFormat::Mp3
         || spec.secondary == Some(ExportFormat::Mp3);
     for path in paths {
+        if rewrite_depth
+            && want_wav
+            && spec.depth != ivory_ui::ports::ExportDepth::Float32
+        {
+            let decoded = ivory_record::decode::decode(path, spec.rate)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            let wav_spec = ivory_record::wav::WavSpec {
+                sample_rate: spec.rate,
+                channels: 2,
+                format: match spec.depth {
+                    ivory_ui::ports::ExportDepth::Pcm16 => {
+                        ivory_record::wav::SampleFormat::Int16
+                    }
+                    _ => ivory_record::wav::SampleFormat::Int24,
+                },
+            };
+            let bext =
+                ivory_record::wav::Bext::new(ivory_record::wav::Wallclock::now_utc(), wav_spec);
+            let tmp = path.with_extension("depth.tmp.wav");
+            let mut w = ivory_record::wav::WavWriter::create(&tmp, wav_spec, &bext)
+                .map_err(|e| format!("{}: {e}", tmp.display()))?;
+            let _ = w.write_interleaved(&decoded.samples);
+            w.finish().map_err(|e| e.to_string())?;
+            std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+        }
         if want_mp3 {
             let decoded = ivory_record::decode::decode(path, spec.rate)
                 .map_err(|e| format!("{}: {e}", path.display()))?;

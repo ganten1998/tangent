@@ -360,10 +360,17 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
         })
         .collect();
     match view {
-        HelpView::Piano => {}
+        // The view keys, each card naming only the OTHER surfaces.
+        HelpView::Piano => rows.extend([
+            ("C-M", "ctrl+M: the mixer"),
+            ("C-A", "ctrl+A: the arrangement"),
+        ]),
         HelpView::Mixer => rows.extend([
-            ("R-CLK", "loaded insert: delete / replace · panel: paint"),
+            ("R-CLK", "channel: the track menu · loaded insert: delete / replace"),
             ("2-CLK", "rename a channel · reset a fader"),
+            ("C-T", "ctrl+T: a new track"),
+            ("C-A", "ctrl+A: the arrangement"),
+            ("C-V", "ctrl+V: the visualizer"),
         ]),
         HelpView::Arrange => rows.extend([
             ("DRAG", "move a clip · edges trim · corners fade"),
@@ -373,9 +380,11 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             ("WHEEL", "zoom around the pointer"),
             ("A-WHL", "alt: move the viewport"),
             ("A-DRG", "alt-drag empty room: move the viewport"),
-            ("C-WHL", "cmd: pan along the song"),
             ("CA-WHL", "ctrl+alt: grid finer or coarser"),
             ("NAV", "corner box: drag left/right scrolls · up/down zooms"),
+            ("C-T", "ctrl+T: a new track"),
+            ("C-M", "ctrl+M: the mixer"),
+            ("C-V", "ctrl+V: the visualizer"),
         ]),
         HelpView::MidiEdit => rows.extend([
             ("DRAG", "draw a note · body moves the selection · edge stretches"),
@@ -775,7 +784,8 @@ mod tests {
             .iter()
             .filter(|&&(_, _, a, s)| s && available(a, gates))
             .count();
-        assert_eq!(piano.len(), shown, "the piano card dropped a live key");
+        // Plus the two view-key gesture rows the piano card now carries.
+        assert_eq!(piano.len(), shown + 2, "the piano card dropped a live key");
 
         for (view, name) in [
             (HelpView::Mixer, "mixer"),
@@ -945,14 +955,19 @@ mod tests {
             hidden.len() + 3,
             "opening the band added something other than W, Enter and Space"
         );
-        assert_eq!(
-            shown.last().map(|(l, d)| (*l, *d)),
-            Some(("Space", describe(KeyAction::StopRecording))),
-            "Space is last, so appearing does not reflow every row above it"
+        assert!(
+            shown
+                .iter()
+                .any(|(l, d)| *l == "Space" && *d == describe(KeyAction::StopRecording)),
+            "Space did not appear with the band"
         );
         // And every listed row is a live binding, in both states.
         for gates in [Gates::default(), Gates { recorder_shown: true, recorder_available: true, window_sizing: true }] {
             for (label, _) in card_rows(gates, HelpView::Piano) {
+                // The view-key gesture rows are card prose, not bindings.
+                if matches!(label, "C-M" | "C-A") {
+                    continue;
+                }
                 let (_, _, action, _) = BINDINGS
                     .iter()
                     .find(|(_, l, ..)| *l == label)

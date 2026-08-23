@@ -420,6 +420,9 @@ pub struct IvoryApp {
     menu_cache_at: Option<std::time::Instant>,
     /// The submenu row under the pointer, for the hover light.
     menu_hover_row: Option<usize>,
+    /// The SELECTED channel — a left-click on a strip or header lights it
+    /// slightly. Groundwork the owner asked for; nothing routes off it yet.
+    selected_channel: Option<usize>,
     /// An LCD Start/End/Length cell being ridden: row, part, and the y the
     /// current step was measured from.
     lcd_drag: Option<(u8, u8, f32)>,
@@ -1158,6 +1161,7 @@ impl IvoryApp {
             menu_cache_key: (String::new(), 0),
             menu_cache_at: None,
             menu_hover_row: None,
+            selected_channel: None,
             lcd_drag: None,
             input_width: 0,
             cartridge: crate::ports::CartridgeInfo::default(),
@@ -2713,6 +2717,7 @@ impl IvoryApp {
                 },
             }),
             any_solo: desk.any_solo(),
+            selected: self.selected_channel,
             fx_menu: self.mixer_fx_menu,
             typing: self
                 .mixer_typing
@@ -5127,6 +5132,13 @@ impl IvoryApp {
             _ => beat / 100.0,
         };
         let d = steps * unit;
+        // Row 3 is the PLAYHEAD: the drag IS a locate, by the unit under
+        // the hand.
+        if row == 3 {
+            let to = (self.recorder.position_s + d).max(0.0);
+            self.request_recorder(recorder::RecorderRequest::Locate(to));
+            return;
+        }
         let (s, l) = self.arr_window_now();
         match row {
             0 => self.arr_steer(s + d, l),
@@ -5596,6 +5608,14 @@ impl IvoryApp {
     /// RESIZE: the tail follows the hand, snapped, never shorter than a
     /// twentieth and never past the clip's end.
     fn me_resize_note(&mut self, i: usize, t: f64) {
+        self.me_resize_note_min(i, t, 0.05);
+    }
+
+    /// As [`Self::me_resize_note`], with a floor. The CREATE drag floors at
+    /// one grid step: a plain click used to route through resize and shrink
+    /// the fresh note to 0.05 s — the owner set the grid to 1/4 and watched
+    /// a sixteenth appear.
+    fn me_resize_note_min(&mut self, i: usize, t: f64, min_dur: f64) {
         let Some(st) = self.midi_edit.as_ref() else {
             return;
         };
@@ -5609,7 +5629,7 @@ impl IvoryApp {
             return;
         };
         let abs0 = c0 + (n.at_s - offset);
-        let dur = (t1 - abs0).clamp(0.05, (c1 - abs0).max(0.05));
+        let dur = (t1 - abs0).clamp(min_dur, (c1 - abs0).max(min_dur));
         if (n.dur_s - dur).abs() > 1.0e-9 {
             n.dur_s = dur;
             if let Some(st) = self.midi_edit.as_mut() {
@@ -6620,8 +6640,27 @@ impl IvoryApp {
                     crate::midi_editor::hit_test(rect, &view, p)
                 };
                 use crate::midi_editor::Hit as H;
+                // **A double-click REMOVES the note** — beside the
+                // right-click erase. On the release edge, where egui
+                // raises the flag.
+                if ctx.input(|i| {
+                    i.pointer.button_double_clicked(egui::PointerButton::Primary)
+                }) {
+                    if let Some(H::NoteBody(i)) = hit {
+                        self.me_delete_note(i);
+                        if let Some(st) = self.midi_edit.as_mut() {
+                            st.drag = None;
+                        }
+                        return;
+                    }
+                }
                 match hit {
                     Some(H::Close) if pressed => self.close_midi_editor(),
+                    Some(H::Detach) if pressed => {
+                        self.settings.midi_editor_floating =
+                            !self.settings.midi_editor_floating;
+                        self.save_settings();
+                    }
                     Some(H::ToolSnap) if pressed => {
                         self.settings.midi_snap = !self.settings.midi_snap;
                         self.save_settings();
@@ -6776,6 +6815,25 @@ impl IvoryApp {
             pointer,
             pointer_down,
         ) {
+            // **Past the roll's edge, the window CRAWLS** — the owner's
+            // ask: dragging a note off either side pans the view slowly,
+            // and the note lands on the grid the magnet keeps.
+            if matches!(
+                drag,
+                MeDrag::Move { .. } | MeDrag::Resize { .. } | MeDrag::Create { .. }
+            ) {
+                let l = crate::midi_editor::Layout::new(rect);
+                if l.roll.is_positive() {
+                    if let Some(st) = self.midi_edit.as_mut() {
+                        let crawl = st.view_len_s * 0.010;
+                        if p.x > l.roll.right() {
+                            st.view_start_s += crawl;
+                        } else if p.x < l.roll.left() {
+                            st.view_start_s = (st.view_start_s - crawl).max(0.0);
+                        }
+                    }
+                }
+            }
             let (t_at, key_at) = {
                 let st = self.midi_edit.as_ref().unwrap();
                 let clip = self.arrangement.clips.iter().find(|c| c.id == id).unwrap();
@@ -6790,7 +6848,21 @@ impl IvoryApp {
                 MeDrag::Move { i, dt, orig } => {
                     self.me_move_selection(i, t_at, key_at, dt, &orig);
                 }
-                MeDrag::Resize { i } | MeDrag::Create { i } => self.me_resize_note(i, t_at),
+                MeDrag::Resize { i } => self.me_resize_note(i, t_at),
+                MeDrag::Create { i } => {
+                    let step = self
+                        .midi_edit
+                        .as_ref()
+                        .and_then(|st| {
+                            let clip =
+                                self.arrangement.clips.iter().find(|c| c.id == st.id)?;
+                            let view = self.midi_edit_view(st, clip);
+                            Some(crate::midi_editor::grid_step_s(&view))
+                        })
+                        .unwrap_or(0.05)
+                        .max(0.05);
+                    self.me_resize_note_min(i, t_at, step);
+                }
                 MeDrag::Vel => {
                     let vel = {
                         let l = crate::midi_editor::Layout::new(rect);
@@ -7047,14 +7119,32 @@ impl IvoryApp {
                 let (hit, t_at) = {
                     let clips = self.arr_clip_views();
                     let view = self.arrange_view(&clips);
-                    (
-                        crate::arrangement_panel::hit_test(rect, &view, p),
-                        crate::arrangement_panel::time_at(rect, &view, p.x),
-                    )
+                    let l = crate::arrangement_panel::Layout::new(rect, &view);
+                    let mut t = crate::arrangement_panel::time_at(rect, &view, p.x);
+                    // **The left edge IS 1|1|000.** Zoomed far out, the
+                    // first pixel already stands half a bar in, and the
+                    // snap then refused the owner the top of the song. A
+                    // press against the edge with the window at zero is
+                    // zero, before any magnet sees it.
+                    if view.view_start_s <= 1.0e-9
+                        && l.lanes_area.is_positive()
+                        && p.x <= l.lanes_area.left() + 4.0
+                    {
+                        t = 0.0;
+                    }
+                    (crate::arrangement_panel::hit_test(rect, &view, p), t)
                 };
                 use crate::arrangement_panel::Hit as A;
                 use crate::mixer_panel::Hit as M;
                 use crate::recorder::Column;
+                if let Some(
+                    A::Arm(n) | A::Mute(n) | A::Solo(n) | A::Gain(n) | A::Send(n)
+                    | A::Pan(n) | A::HdrInput(n) | A::HdrName(n) | A::HdrAdd(n)
+                    | A::Lane(n, _),
+                ) = hit
+                {
+                    self.selected_channel = Some(n);
+                }
                 match hit {
                     // The header's switches are the mixer strip's own, by
                     // the same hits, so the two surfaces cannot drift.
@@ -7188,11 +7278,12 @@ impl IvoryApp {
                     // The ruler: locate on the press (snapped, like the
                     // lanes), zoom on the drag — the zoom anchor stays on
                     // the finger, unsnapped, or the zoom would jump.
-                    Some(A::Ruler(t)) => {
+                    Some(A::Ruler(_)) => {
                         // Fate decided by the first real movement — see
                         // `ArrDrag::RulerPress`. A plain click locates and
-                        // clears any selection on release.
-                        self.arr_drag = Some(ArrDrag::RulerPress { t0: t, from: p });
+                        // clears any selection on release. `t_at`, not the
+                        // hit's own time: t_at carries the zero-edge clamp.
+                        self.arr_drag = Some(ArrDrag::RulerPress { t0: t_at, from: p });
                     }
                     None => {}
                 }
@@ -7439,7 +7530,10 @@ impl IvoryApp {
         // when the window is genuinely past the end, because then there is
         // more world to show.
         let (s, l) = self.arr_window_now();
-        self.arr_span().max(l).max(s + l)
+        // Four viewports of world at minimum: an EMPTY song made the inner
+        // box fill the outer at bar 1 and position never showed — the
+        // owner lined up two screenshots to prove it.
+        self.arr_span().max(s + l).max(l * 4.0)
     }
 
     fn scrub_domain_s(&self) -> f64 {
@@ -7511,6 +7605,7 @@ impl IvoryApp {
             header_w: (self.settings.arr_header_w > 0.0)
                 .then_some(self.settings.arr_header_w as f32),
             time_sel: self.time_sel,
+            selected_channel: self.selected_channel,
             naming: self
                 .mixer_naming
                 .as_ref()
@@ -11032,8 +11127,21 @@ impl IvoryApp {
             && self.menu_state.is_none()
             && !self.name_focused
             && self.num_edit.is_none()
+            // **Every text field swallows the frame's keys** — the owner
+            // typed "tangent" into a track name and watched T open the
+            // about menu, G resize the window and E raise the chord
+            // corrector, one letter at a time.
+            && self.mixer_naming.is_none()
+            && self.mixer_typing.is_none()
+            && self.input_menu.is_none()
         {
             if let Some(action) = keys::pressed(&ctx, self.key_gates()) {
+                // The GUITAR toggle answers nowhere but the piano view: on
+                // the desk surfaces the band is not even drawn, and the
+                // window resizing under a mixer was the owner's complaint.
+                let g_on_mixer = self.mixer_open
+                    && !self.arrangement_open
+                    && action == keys::KeyAction::ToggleFretboard;
                 // **The arrangement owns S, G and M while it is open.**
                 // Elsewhere they are the supporter card, the guitar and the
                 // taught chords; here they are SPLIT, the magnet and the
@@ -11044,7 +11152,9 @@ impl IvoryApp {
                 // gives the arrangement its three.
                 let editor_focus =
                     self.midi_edit_owns(ctx.input(|i| i.pointer.hover_pos()));
-                if editor_focus && action == keys::KeyAction::ToggleFretboard {
+                if g_on_mixer {
+                    // Swallowed whole: no band on screen, no toggle.
+                } else if editor_focus && action == keys::KeyAction::ToggleFretboard {
                     self.settings.midi_snap = !self.settings.midi_snap;
                     self.save_settings();
                 } else if editor_focus
@@ -11419,10 +11529,17 @@ impl IvoryApp {
                 if let Some(clip) =
                     self.arrangement.clips.iter().find(|c| c.id == st.id)
                 {
-                    let r = rect.shrink2(egui::Vec2::new(
-                        rect.width() * 0.05,
-                        rect.height() * 0.06,
-                    ));
+                    // **The whole view below the band by default** — the
+                    // owner's word; the pop-out button floats it back over
+                    // the lanes with the old rim.
+                    let r = if self.settings.midi_editor_floating {
+                        rect.shrink2(egui::Vec2::new(
+                            rect.width() * 0.05,
+                            rect.height() * 0.06,
+                        ))
+                    } else {
+                        rect
+                    };
                     if r.is_positive() {
                         let mev = self.midi_edit_view(st, clip);
                         crate::midi_editor::draw(ui.painter(), r, &mev);
@@ -11764,6 +11881,14 @@ impl IvoryApp {
                 if let Some(pos) = pos.filter(|p| rect.contains(*p)) {
                     self.menu_anchor = pos;
                     let view = self.mixer_view();
+                    // Any press on a channel SELECTS it — the slight light
+                    // the owner asked for, useful later.
+                    let pressed_strip = crate::mixer_panel::strip_at(rect, &view, pos)
+                        .and_then(|c| c.strip());
+                    if let Some(crate::recorder::Strip::Channel(n)) = pressed_strip {
+                        self.selected_channel = Some(n);
+                    }
+                    let view = self.mixer_view();
                     match crate::mixer_panel::hit_test(rect, &view, pos) {
                         Some(hit @ (crate::mixer_panel::Hit::Mute(_)
                         | crate::mixer_panel::Hit::Solo(_)
@@ -11820,6 +11945,35 @@ impl IvoryApp {
         // The arrangement's own frame of input, on the mixer's terms.
         if !self.arrangement_open && self.midi_edit.is_some() {
             self.close_midi_editor();
+        }
+        // **The view keys: ctrl+A / ctrl+M / ctrl+V** — arrange, mixer,
+        // visualizer, from anywhere a letter is not being typed. CTRL
+        // proper, not command: the editor's own Cmd+A keeps select-all.
+        if self.dialog.is_none()
+            && !self.name_focused
+            && self.num_edit.is_none()
+            && self.mixer_typing.is_none()
+            && self.mixer_naming.is_none()
+        {
+            let view_key = ctx.input(|i| {
+                if !i.modifiers.ctrl || i.modifiers.command {
+                    None
+                } else if i.key_pressed(egui::Key::A) {
+                    Some((false, true))
+                } else if i.key_pressed(egui::Key::M) {
+                    Some((true, false))
+                } else if i.key_pressed(egui::Key::V) {
+                    Some((false, false))
+                } else {
+                    None
+                }
+            });
+            if let Some((mixer, arrangement)) = view_key {
+                self.mixer_open = mixer;
+                self.arrangement_open = arrangement;
+                self.mixer_grab = None;
+                self.arr_drag = None;
+            }
         }
         if !input_menu_owns {
             self.drumpad_input(&ctx);

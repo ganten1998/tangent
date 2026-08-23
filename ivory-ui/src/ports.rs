@@ -53,6 +53,8 @@ pub struct ProjectExportSpec {
     pub realtime: bool,
     /// The span to render, in song seconds. `None` is the whole project.
     pub span: Option<(f64, f64)>,
+    /// The WAV word size.
+    pub depth: ExportDepth,
 }
 
 impl Default for ProjectExportSpec {
@@ -68,6 +70,7 @@ impl Default for ProjectExportSpec {
             secondary: None,
             realtime: false,
             span: None,
+            depth: ExportDepth::Pcm24,
         }
     }
 }
@@ -76,6 +79,16 @@ impl Default for ProjectExportSpec {
 pub enum ExportFormat {
     Wav,
     Mp3,
+}
+
+/// WAV word size. 24-bit PCM is the go-to for mixing and mastering hand-
+/// offs; 32-float keeps headroom above 0 dB for stems and heavy bounces;
+/// 16-bit exists for CD burns and the platforms that demand it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportDepth {
+    Pcm16,
+    Pcm24,
+    Float32,
 }
 
 impl ExportFormat {

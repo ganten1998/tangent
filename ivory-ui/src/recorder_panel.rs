@@ -2530,7 +2530,18 @@ pub fn lcd_part_cells(lcd: Rect) -> [[Rect; 3]; 3] {
     })
 }
 
-/// Which LCD part a press landed on: `(row, part)`, rows Start/End/Length.
+/// The PLAYHEAD's own three cells over the big number — bars, beats,
+/// thousandths — draggable like everything else on this glass.
+pub fn lcd_playhead_cells(lcd: Rect) -> [Rect; 3] {
+    let half = slice_h(lcd, 0.02, 0.475);
+    let main = slice_v(half, 0.02, 0.52);
+    let big = slice_h(main, 0.0, 0.66);
+    let cuts = [0.0, 0.44, 0.68, 1.0];
+    std::array::from_fn(|part| slice_h(big, cuts[part], cuts[part + 1]))
+}
+
+/// Which LCD part a press landed on: `(row, part)` — rows 0..=2 are
+/// Start/End/Length, row 3 is the PLAYHEAD itself.
 pub fn lcd_part_at(rect: Rect, view: &RecorderView<'_>, pos: Pos2) -> Option<(u8, u8)> {
     let l = Layout::new(rect, view);
     if !l.lcd.is_positive() || !l.lcd.contains(pos) {
@@ -2541,6 +2552,11 @@ pub fn lcd_part_at(rect: Rect, view: &RecorderView<'_>, pos: Pos2) -> Option<(u8
             if cell.is_positive() && cell.contains(pos) {
                 return Some((row as u8, part as u8));
             }
+        }
+    }
+    for (part, cell) in lcd_playhead_cells(l.lcd).iter().enumerate() {
+        if cell.is_positive() && cell.contains(pos) {
+            return Some((3, part as u8));
         }
     }
     None
@@ -2639,6 +2655,54 @@ fn toward(c: Color32, bg: Color32, t: f32) -> Color32 {
 /// The metronome with the pendulum cut out in an EXPLICIT background — the
 /// mixer's strips have faces of their own, and a pendulum cut in the band's
 /// leather would print the wrong panel through the icon.
+/// A drum from the side, seen a little from above — the shell as a squat
+/// ellipse pair — with two sticks crossed over it. The DRUM BUS's badge.
+pub(crate) fn draw_drum(painter: &Painter, b: Rect, ink: Color32, bg: Color32) {
+    let s = b.width();
+    let c = b.center();
+    // The shell: a rounded body with an elliptical head hinted by a bg
+    // seam near the top — a side view tipped slightly toward the eye.
+    let body = Rect::from_center_size(
+        Pos2::new(c.x, c.y + s * 0.10),
+        Vec2::new(s * 0.72, s * 0.42),
+    );
+    painter.rect_filled(body, s * 0.10, ink);
+    // The head's rim, as a lighter seam across the upper body.
+    painter.line_segment(
+        [
+            Pos2::new(body.left() + s * 0.05, body.top() + s * 0.09),
+            Pos2::new(body.right() - s * 0.05, body.top() + s * 0.09),
+        ],
+        Stroke::new((s * 0.05).max(1.0), bg),
+    );
+    // Two lugs, as the drum's jewellery.
+    for fx in [0.22f32, 0.78] {
+        painter.line_segment(
+            [
+                Pos2::new(body.left() + body.width() * fx, body.top() + s * 0.13),
+                Pos2::new(body.left() + body.width() * fx, body.bottom() - s * 0.05),
+            ],
+            Stroke::new((s * 0.04).max(1.0), bg),
+        );
+    }
+    // The crossed sticks over it, tips high.
+    let w = (s * 0.07).max(1.0);
+    painter.line_segment(
+        [
+            Pos2::new(c.x - s * 0.34, b.top() + s * 0.02),
+            Pos2::new(c.x + s * 0.22, body.top() + s * 0.10),
+        ],
+        Stroke::new(w, ink),
+    );
+    painter.line_segment(
+        [
+            Pos2::new(c.x + s * 0.34, b.top() + s * 0.02),
+            Pos2::new(c.x - s * 0.22, body.top() + s * 0.10),
+        ],
+        Stroke::new(w, ink),
+    );
+}
+
 pub(crate) fn draw_metronome_on(painter: &Painter, b: Rect, ink: Color32, bg: Color32) {
     let s = b.width();
     let (cx, top, bottom) = (b.center().x, b.top() + s * 0.06, b.bottom() - s * 0.06);

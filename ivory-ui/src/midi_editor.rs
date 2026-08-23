@@ -58,6 +58,9 @@ pub struct MidiEditView<'a> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Hit {
     Close,
+    /// The pop-out beside the ×: float the editor over the lanes, or give
+    /// it the whole view back.
+    Detach,
     ToolSnap,
     ToolGrid,
     ToolSwing,
@@ -84,6 +87,7 @@ pub struct Layout {
     /// The velocity lane along the foot: one bar per note.
     pub vel: Rect,
     pub close: Rect,
+    pub detach: Rect,
     pub tool_snap: Rect,
     pub tool_grid: Rect,
     pub tool_swing: Rect,
@@ -98,6 +102,7 @@ impl Layout {
             return Self {
                 panel: Rect::NOTHING,
                 strip: Rect::NOTHING,
+                detach: Rect::NOTHING,
                 ruler: Rect::NOTHING,
                 vel: Rect::NOTHING,
                 close: Rect::NOTHING,
@@ -124,6 +129,7 @@ impl Layout {
             r
         };
         let close = cell(side);
+        let detach = cell(side);
         let tool_grid = cell(side * 2.2);
         let tool_snap = cell(side * 1.9);
         let tool_triplet = cell(side * 1.6);
@@ -150,6 +156,7 @@ impl Layout {
             ruler,
             vel,
             close,
+            detach,
             tool_snap,
             tool_grid,
             tool_swing,
@@ -285,7 +292,7 @@ pub fn grid_word(view: &MidiEditView<'_>) -> String {
 
 // ── drawing ────────────────────────────────────────────────────────────────
 
-const FACE: Color32 = Color32::from_rgb(0x18, 0x12, 0x0F);
+const FACE: Color32 = Color32::from_rgb(0x2A, 0x26, 0x21);
 const FACE_ROW_DARK: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 60);
 const INK: Color32 = Color32::from_rgb(0xFF, 0xF4, 0xE0);
 const OUTSIDE_VEIL: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 90);
@@ -365,6 +372,24 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
                 Stroke::new(1.5, INK.gamma_multiply(0.7)),
             );
         }
+    }
+    // The pop-out beside the ×: two offset squares, the universal sign.
+    if l.detach.is_positive() {
+        let a = l.detach.width() * 0.26;
+        let c = l.detach.center();
+        let ink = INK.gamma_multiply(0.7);
+        painter.rect_stroke(
+            Rect::from_min_size(Pos2::new(c.x - a, c.y - a * 0.4), Vec2::splat(a * 1.3)),
+            1.0,
+            Stroke::new(1.2, ink),
+            egui::StrokeKind::Inside,
+        );
+        painter.rect_stroke(
+            Rect::from_min_size(Pos2::new(c.x - a * 0.3, c.y - a), Vec2::splat(a * 1.3)),
+            1.0,
+            Stroke::new(1.2, ink),
+            egui::StrokeKind::Inside,
+        );
     }
 
     if !l.roll.is_positive() || !l.keys.is_positive() {
@@ -600,6 +625,7 @@ pub fn hit_test(rect: Rect, view: &MidiEditView<'_>, pos: Pos2) -> Option<Hit> {
     }
     for (r, hit) in [
         (l.close, Hit::Close),
+        (l.detach, Hit::Detach),
         (l.tool_snap, Hit::ToolSnap),
         (l.tool_grid, Hit::ToolGrid),
         (l.tool_swing, Hit::ToolSwing),

@@ -399,6 +399,31 @@ channels play back their clips and nothing else. "Ready to play" and
   selection settles like any chosen device instead of comparing
   `None != open` forever.
 
+- **4.56.0 — the seven-AM pass, seventeen items**: DRUM BUS badge (side
+  drum, crossed sticks) and the click's metronome DROP AND CENTRE (no
+  input chip below them); the arrange field is ONE grey palette (rows
+  ~#37/#3b, gridlines darker than the field, ruler strip #4a; dark mode
+  does not toggle it for now); empty slots in both views sit on their
+  own #2e2e2e ground under the circled plus; the Track dialog's Done is
+  measured inside; DRUMS_COLOR brightened (22); the MIDI editor's face
+  lifted, fills the WHOLE view under the band (pop-out button beside ×
+  floats it, `midi_editor_floating`), a plain click draws exactly ONE
+  GRID STEP (the create drag floored at 0.05 s — the "16th" bug),
+  double-click removes a note, and edge drags CRAWL the window; clicks
+  at the left edge land exactly 1|1|000 at any zoom; the ruler carries
+  an h:mm:ss row; channels SELECT on click (faint rim, groundwork);
+  Ctrl+A/M/V jump views (cards name only the others); the playhead
+  timecode drags by part (row 3 = locate); the nav domain floors at
+  four viewports so POSITION shows on short songs; the arm dot keeps a
+  fixed seat off the title. Export grew DEPTH (24-bit PCM default,
+  32-float, 16-bit; offline writes it directly, realtime re-encodes on
+  delivery) and Save As starts its native panel in Projects. ⚠️ TEXT
+  FIELDS SWALLOW KEYS now — typing "tangent" into a rename fired
+  T/A/G/E as global binds; and G answers nowhere but the piano view.
+  Stems: engine-level offline tap PROVEN by test; the owner's silent
+  run left no artifacts anywhere — stage breadcrumbs added to name the
+  break on the next run.
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index

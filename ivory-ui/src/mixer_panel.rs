@@ -111,6 +111,8 @@ pub struct MixerView<'a> {
     /// The menu is the palette's own pattern: drawn over the strip in the
     /// same frame, hit-tested first, dismissed by a press anywhere else.
     pub fx_menu: Option<(Column, usize)>,
+    /// The selected channel: its strip wears a faint light rim.
+    pub selected: Option<usize>,
 }
 
 impl MixerView<'_> {
@@ -277,7 +279,7 @@ pub const PALETTES: [(&str, [i64; 8]); 5] = [
 
 /// The drum bus's colour everywhere: dark violet, no palette uses it, so
 /// the bus can never dress like one of the eight.
-pub const DRUMS_COLOR: usize = 21;
+pub const DRUMS_COLOR: usize = 22;
 
 /// The master's colour on a fresh install. Red, because it is the one channel
 /// you look for — the top tone of it, which is the one that reads as RED
@@ -592,7 +594,10 @@ impl Layout {
         // is their KIND, and clicking it cycles the kind), the backing track,
         // and now the click. The bus and the master have nothing to pick and
         // keep the room for their names.
-        let has_icon = matches!(view.strip, Some(Strip::Channel(_) | Strip::Click));
+        let has_icon = matches!(
+            view.strip,
+            Some(Strip::Channel(_) | Strip::Click | Strip::Drums)
+        );
         // **The way OFF the desk, where every window puts it.** Subtle — a
         // small mark in faded ink, drawn by `strip` — but a real target, and
         // only on a channel there is something to remove from. The name band
@@ -607,7 +612,14 @@ impl Layout {
         // one at another, which reads as the master being a different kind of
         // object rather than the same strip with nothing to pick.
         let icon = if has_icon {
-            let r = cut(0.088, 0.145);
+            // The click and the drum bus have no input chip under them, so
+            // their badges drop and CENTRE in the room between the name
+            // and the rack — the owner watched them float high.
+            let r = if matches!(view.strip, Some(Strip::Channel(_))) {
+                cut(0.088, 0.145)
+            } else {
+                cut(0.105, 0.180)
+            };
             Rect::from_center_size(r.center(), Vec2::splat(r.height().min(r.width())))
         } else {
             Rect::NOTHING
@@ -807,6 +819,18 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MixerView<'_>) {
         let typed = view.typing.filter(|(at, _)| at.0 == i).map(|(_, b)| b);
         let naming = view.naming.filter(|(at, _)| at.0 == i).map(|(_, b)| b);
         strip(painter, s, v, &p, heard, typed, naming);
+        // The selected channel's faint rim — the owner's slight light.
+        if view
+            .selected
+            .is_some_and(|n| v.strip == Some(Strip::Channel(n)))
+        {
+            painter.rect_stroke(
+                s.panel,
+                3.0,
+                Stroke::new(1.2, Color32::from_rgba_unmultiplied(0xFF, 0xF4, 0xE0, 80)),
+                egui::StrokeKind::Inside,
+            );
+        }
     }
     // The insert menu and the kind ask: a veil over
     // the strip they belong to, then their rows on top. `two_rows` because
@@ -943,6 +967,10 @@ fn strip(
         }
         (Some(Strip::Channel(_)), Some(crate::recorder::ChannelKind::Audio)) => {
             crate::recorder_panel::draw_microphone(painter, l.icon, ink);
+            true
+        }
+        (Some(Strip::Drums), _) => {
+            crate::recorder_panel::draw_drum(painter, l.icon, ink, face);
             true
         }
         (Some(Strip::Click), _) => {
@@ -1228,10 +1256,13 @@ fn fx_menu_over(l: &StripStrip, bay: usize) -> [Rect; 2] {
 /// the right of the band says "empty (click to load)"; this says the same
 /// thing in the shape a mixer says it in.
 fn empty_slot(painter: &Painter, l: &StripStrip, p: &Ink) {
+    // The empty slot's own ground — the owner's near-black grey — under
+    // the circled plus and the quiet space around it.
+    painter.rect_filled(l.panel, 3.0, Color32::from_rgb(0x2E, 0x2E, 0x2E));
     painter.rect_stroke(
         l.panel,
         3.0,
-        Stroke::new(1.0, p.face.gamma_multiply(0.34)),
+        Stroke::new(1.0, p.face.gamma_multiply(0.22)),
         egui::StrokeKind::Inside,
     );
     let r = l.add;
@@ -1707,6 +1738,7 @@ mod tests {
                 a_strip(channels.get(i).copied(), false)
             }),
             any_solo: false,
+            selected: None,
             typing: None,
             naming: None,
             fx_menu: None,

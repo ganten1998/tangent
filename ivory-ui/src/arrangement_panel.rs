@@ -115,6 +115,8 @@ pub struct ArrangeView<'a> {
     pub naming: Option<(usize, &'a str)>,
     /// The time selection, drawn over lanes and ruler.
     pub time_sel: Option<(f64, f64)>,
+    /// The selected channel: its header lights slightly.
+    pub selected_channel: Option<usize>,
     /// The band's own wood, so the two surfaces are one instrument.
     pub wood: (u8, u8, u8),
 }
@@ -407,8 +409,17 @@ impl Layout {
             )
         };
         let square = |cell: Rect, s: f32| Rect::from_center_size(cell.center(), Vec2::splat(s));
-        let number = cut(0.0, 0.08);
-        let arm = square(cut(0.08, 0.18), (h * 0.42).clamp(9.0, 15.0));
+        // The number and the arm keep FIXED seats at the left — the
+        // proportional cuts walked the dot into the track title whenever
+        // the header widened.
+        let number = Rect::from_min_max(r.min, Pos2::new(r.left() + 12.0, r.bottom()));
+        let arm = {
+            let d = (h * 0.42).clamp(9.0, 15.0);
+            Rect::from_center_size(
+                Pos2::new(number.right() + 4.0 + d * 0.5, r.center().y),
+                Vec2::splat(d),
+            )
+        };
         // The switches keep the right end; the meter stands inside them.
         let sw = (h * 0.44).clamp(11.0, 17.0);
         let solo = Rect::from_min_size(
@@ -670,60 +681,34 @@ struct Ink {
 }
 
 fn ink(view: &ArrangeView<'_>) -> Ink {
-    // **Dark mode lives HERE (and in the theory window) — nowhere else.**
-    // The default is a grey-ivory field now, the owner's ask; dark mode is
-    // the near-black look the view used to wear all the time.
+    // **One palette, for now — dark mode does not toggle the field.** The
+    // owner's reference: soft grey rows, gridlines DARKER than the field,
+    // a lighter strip for the ruler. The headers and toolbar keep the
+    // desk's fixed wood and bone beside it.
+    let _ = view.dark_mode;
     let (hr, hg, hb) = view.wood;
-    let hdr_wood = Color32::from_rgb(hr, hg, hb);
-    let hdr_face = Color32::from_rgb(0xE3, 0xD9, 0xBD);
-    let hdr_lane = Color32::from_rgb(0x20, 0x1C, 0x16);
-    if view.dark_mode {
-        let face = Color32::from_rgb(0xC9, 0xC0, 0xA6);
-        return Ink {
-            hdr_wood,
-            hdr_face,
-            hdr_lane,
-            // The dark ruler gets a strip of its own, the light view's
-            // grammar: the numbers stand on a band, not on the void.
-            ruler: Color32::from_rgb(0x2E, 0x29, 0x22),
-            wood: Color32::from_rgb(0x17, 0x14, 0x10),
-            face,
-            engrave: Color32::from_rgb(0x24, 0x20, 0x1A),
-            faint: face.gamma_multiply(0.4),
-            lane: Color32::from_rgb(0x20, 0x1C, 0x16),
-            lane_alt: Color32::from_rgb(0x25, 0x20, 0x19),
-            grid: face.gamma_multiply(0.13),
-            clip_ink: Color32::from_rgb(0xE8, 0xDC, 0xC0),
-            playhead: Color32::from_rgb(0xE8, 0x3A, 0x4E),
-            arm: Color32::from_rgb(0xE0, 0x22, 0x22),
-            mute: Color32::from_rgb(0xE0, 0xA8, 0x22),
-            solo: Color32::from_rgb(0xE8, 0x3A, 0x4E),
-            meter: Color32::from_rgb(0x3D, 0xC0, 0x5A),
-            select: Color32::from_rgb(0xFF, 0xF4, 0xE0),
-        };
-    }
-    let face = Color32::from_rgb(0x34, 0x2E, 0x25);
     Ink {
-        hdr_wood,
-        hdr_face,
-        hdr_lane,
-        ruler: Color32::from_rgb(0xC6, 0xC1, 0xB1),
-        // Grey-ivory ground, DARKENED a step at the owner's ask; the lanes
-        // a shade deeper so they still read as the recessed field.
-        wood: Color32::from_rgb(0xC2, 0xBC, 0xAC),
-        face,
+        hdr_wood: Color32::from_rgb(hr, hg, hb),
+        hdr_face: Color32::from_rgb(0xE3, 0xD9, 0xBD),
+        hdr_lane: Color32::from_rgb(0x20, 0x1C, 0x16),
+        ruler: Color32::from_rgb(0x4A, 0x4A, 0x4A),
+        wood: Color32::from_rgb(0x30, 0x30, 0x30),
+        face: Color32::from_rgb(0xB4, 0xB4, 0xB0),
         engrave: Color32::from_rgb(0x24, 0x20, 0x1A),
-        faint: face.gamma_multiply(0.55),
-        lane: Color32::from_rgb(0xB2, 0xAC, 0x9C),
-        lane_alt: Color32::from_rgb(0xA9, 0xA3, 0x93),
-        grid: face.gamma_multiply(0.30),
+        faint: Color32::from_rgb(0xB4, 0xB4, 0xB0).gamma_multiply(0.5),
+        lane: Color32::from_rgb(0x37, 0x37, 0x37),
+        lane_alt: Color32::from_rgb(0x3B, 0x3B, 0x3B),
+        // The GRID base: the draw derives the strong line by DARKENING it
+        // and the subdivisions stay at base — dark lines on a grey field,
+        // the reference shot's own grammar.
+        grid: Color32::from_rgb(0x2A, 0x2A, 0x2A),
         clip_ink: Color32::from_rgb(0xE8, 0xDC, 0xC0),
-        playhead: Color32::from_rgb(0xD8, 0x2A, 0x3E),
-        arm: Color32::from_rgb(0xC8, 0x1A, 0x1A),
-        mute: Color32::from_rgb(0xA8, 0x7A, 0x10),
-        solo: Color32::from_rgb(0xD8, 0x2A, 0x3E),
-        meter: Color32::from_rgb(0x2A, 0x8C, 0x42),
-        select: Color32::from_rgb(0x20, 0x1C, 0x16),
+        playhead: Color32::from_rgb(0xE8, 0x3A, 0x4E),
+        arm: Color32::from_rgb(0xE0, 0x22, 0x22),
+        mute: Color32::from_rgb(0xE0, 0xA8, 0x22),
+        solo: Color32::from_rgb(0xE8, 0x3A, 0x4E),
+        meter: Color32::from_rgb(0x3D, 0xC0, 0x5A),
+        select: Color32::from_rgb(0xF2, 0xE9, 0xD2),
     }
 }
 
@@ -792,6 +777,45 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             p.faint,
         );
     }
+    // **The clock row: h:mm:ss along the ruler's foot** — the owner's
+    // ask: bars answer "where in the music", this answers "where in the
+    // afternoon". The interval widens as the view does.
+    {
+        let font = FontId::new(
+            (l.ruler.height() * 0.34).clamp(7.0, 9.5),
+            crate::fonts::courier(),
+        );
+        let steps: [f64; 12] = [
+            1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, 3600.0,
+        ];
+        let want = steps
+            .iter()
+            .copied()
+            .find(|st| st * px_per_s >= 70.0)
+            .unwrap_or(3600.0);
+        let mut n = (view.view_start_s / want).floor().max(0.0);
+        while n * want <= view.view_start_s + view.view_len_s {
+            let t = n * want;
+            let x = x_of(rect, view, t);
+            if x >= l.lanes_area.left() - 0.5 && x <= l.lanes_area.right() - 30.0 {
+                let secs = t.round() as u64;
+                let word = if secs >= 3600 {
+                    format!("{}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+                } else {
+                    format!("{}:{:02}", secs / 60, secs % 60)
+                };
+                painter.text(
+                    Pos2::new(x + 3.0, l.ruler.bottom() - 1.0),
+                    Align2::LEFT_BOTTOM,
+                    word,
+                    font.clone(),
+                    p.face.gamma_multiply(0.55),
+                );
+            }
+            n += 1.0;
+        }
+    }
+
     // **The grid the MAGNET snaps to is the grid the eye gets** — the
     // owner's complaint was exactly this line's absence: the lanes drew
     // only the labelled bars, whatever the gridbox said. Every bar gets a
@@ -802,6 +826,8 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         let bar_px = bar * px_per_s;
         let grid_px = g * px_per_s;
         let t1 = view.view_start_s + view.view_len_s;
+        // `w` < 1 DARKENS: the strong line (the snap grid) is the darker
+        // one on this grey field, the reference shot's own look.
         let line = |t: f64, w: f32| {
             let x = x_of(rect, view, t);
             if x >= l.lanes_area.left() - 0.5 && x <= l.lanes_area.right() + 0.5 {
@@ -823,7 +849,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             if grid_px >= 5.0 {
                 let mut n = (view.view_start_s / g).floor().max(0.0);
                 while n * g <= t1 {
-                    line(n * g, 2.2);
+                    line(n * g, 0.45);
                     n += 1.0;
                 }
             }
@@ -833,7 +859,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     let t = n * bar;
                     let on_grid = (t / g - (t / g).round()).abs() < 1.0e-6;
                     if !on_grid {
-                        line(t, 1.1);
+                        line(t, 1.0);
                     }
                     n += 1.0;
                 }
@@ -844,7 +870,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             if bar_px >= 5.0 {
                 let mut n = (view.view_start_s / bar).floor().max(0.0);
                 while n * bar <= t1 {
-                    line(n * bar, 2.2);
+                    line(n * bar, 0.45);
                     n += 1.0;
                 }
             }
@@ -854,7 +880,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     let t = n * g;
                     let on_bar = (t / bar - (t / bar).round()).abs() < 1.0e-6;
                     if !on_bar {
-                        line(t, 1.1);
+                        line(t, 1.0);
                     }
                     n += 1.0;
                 }
@@ -1065,11 +1091,22 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         }
         if lane.used {
             painter.rect_filled(plate, 2.0, face);
+            if view.selected_channel == Some(i) {
+                painter.rect_stroke(
+                    plate,
+                    2.0,
+                    Stroke::new(1.2, Color32::from_rgba_unmultiplied(0xFF, 0xF4, 0xE0, 90)),
+                    egui::StrokeKind::Inside,
+                );
+            }
         } else {
+            // The empty slot's own ground — the owner's near-black grey —
+            // under the circled plus and everything else on it.
+            painter.rect_filled(plate, 2.0, Color32::from_rgb(0x2E, 0x2E, 0x2E));
             painter.rect_stroke(
                 plate,
                 2.0,
-                Stroke::new(1.0, p.hdr_face.gamma_multiply(0.3)),
+                Stroke::new(1.0, p.hdr_face.gamma_multiply(0.18)),
                 egui::StrokeKind::Inside,
             );
         }
@@ -1518,6 +1555,7 @@ mod tests {
             header_w: None,
             naming: None,
             time_sel: None,
+            selected_channel: None,
             lanes: std::array::from_fn(|i| a_lane(i < 3)),
             clips,
             metronome_on: true,
