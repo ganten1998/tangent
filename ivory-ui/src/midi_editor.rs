@@ -1,0 +1,706 @@
+//! The MIDI editor: a piano roll in a popup over the arrangement.
+//!
+//! A pure painter with a layout and a hit test, like every panel — the app
+//! owns the document and the gestures; this file owns where things are and
+//! what a press means. The one piece of real machinery is the GRID, which
+//! has three shapes — straight, swing, triplet — and [`snap_t`] is the one
+//! authority for all three: the drawn lines and the magnet come from the
+//! same arithmetic, so what you see is exactly what a note lands on.
+
+use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, Vec2};
+
+use crate::arrangement::ArrNote;
+use crate::mixer_panel::STRIP_COLORS;
+
+/// The top strip's height: title, the grid tools, the ×.
+pub const STRIP_H: f32 = 26.0;
+/// The piano column on the left.
+pub const KEYS_W: f32 = 46.0;
+/// Keys visible at once — the roll's vertical span.
+pub const KEYS_SHOWN: f32 = 36.0;
+/// MPC swing: the off-beat line sits at 58% of its pair.
+pub const SWING: f64 = 0.58;
+/// The right-edge grab zone of a note, in points.
+const EDGE_W: f32 = 6.0;
+
+/// Everything the editor draws, pushed in. Times are ABSOLUTE timeline
+/// seconds — the clip's own trim (`offset_s`) is paid at the boundary, so
+/// the roll and the arrangement agree where a bar stands.
+pub struct MidiEditView<'a> {
+    pub name: &'a str,
+    pub clip_start_s: f64,
+    pub clip_len_s: f64,
+    pub offset_s: f64,
+    pub notes: &'a [ArrNote],
+    pub selected: Option<usize>,
+    /// The window, absolute seconds.
+    pub view_start_s: f64,
+    pub view_len_s: f64,
+    /// The (fractional) key whose row TOP sits at the roll's top edge.
+    pub top_key: f32,
+    pub snap_on: bool,
+    pub grid_exp: i8,
+    pub swing: bool,
+    pub triplet: bool,
+    pub bpm: f64,
+    pub sig_top: u32,
+    pub sig_bottom: u32,
+    pub playhead_s: f64,
+    /// The lane's colour index into [`STRIP_COLORS`]; 0 draws the desk
+    /// green, exactly as the arrangement does.
+    pub color: usize,
+}
+
+/// What a press on the editor means.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Hit {
+    Close,
+    ToolSnap,
+    ToolGrid,
+    ToolSwing,
+    ToolTriplet,
+    /// A note's body — select and move. The index into the clip's notes.
+    NoteBody(usize),
+    /// A note's right edge — resize.
+    NoteRight(usize),
+    /// A piano key in the left column — audition.
+    Key(u8),
+    /// Empty roll: `(absolute seconds, key)`.
+    Cell(f64, u8),
+}
+
+pub struct Layout {
+    pub panel: Rect,
+    pub strip: Rect,
+    pub close: Rect,
+    pub tool_snap: Rect,
+    pub tool_grid: Rect,
+    pub tool_swing: Rect,
+    pub tool_triplet: Rect,
+    pub keys: Rect,
+    pub roll: Rect,
+}
+
+impl Layout {
+    pub fn new(rect: Rect) -> Self {
+        if !rect.is_positive() || rect.width() < 60.0 || rect.height() < 40.0 {
+            return Self {
+                panel: Rect::NOTHING,
+                strip: Rect::NOTHING,
+                close: Rect::NOTHING,
+                tool_snap: Rect::NOTHING,
+                tool_grid: Rect::NOTHING,
+                tool_swing: Rect::NOTHING,
+                tool_triplet: Rect::NOTHING,
+                keys: Rect::NOTHING,
+                roll: Rect::NOTHING,
+            };
+        }
+        let strip = Rect::from_min_size(rect.min, Vec2::new(rect.width(), STRIP_H));
+        // The tools hang on the strip's right: × at the very edge, then the
+        // gridbox, the magnet, and the two grid-shape chips walking left.
+        let pad = 4.0;
+        let side = STRIP_H - pad * 2.0;
+        let mut x = strip.right() - pad;
+        let mut cell = |w: f32| {
+            let r = Rect::from_min_max(
+                Pos2::new(x - w, strip.top() + pad),
+                Pos2::new(x, strip.bottom() - pad),
+            );
+            x -= w + pad;
+            r
+        };
+        let close = cell(side);
+        let tool_grid = cell(side * 2.2);
+        let tool_snap = cell(side * 1.9);
+        let tool_triplet = cell(side * 1.6);
+        let tool_swing = cell(side * 1.6);
+        let body = Rect::from_min_max(Pos2::new(rect.left(), strip.bottom()), rect.max);
+        let keys = Rect::from_min_size(body.min, Vec2::new(KEYS_W.min(body.width() * 0.2), body.height()));
+        let roll = Rect::from_min_max(Pos2::new(keys.right(), body.top()), body.max);
+        Self {
+            panel: rect,
+            strip,
+            close,
+            tool_snap,
+            tool_grid,
+            tool_swing,
+            tool_triplet,
+            keys,
+            roll,
+        }
+    }
+}
+
+// ── the axes ───────────────────────────────────────────────────────────────
+
+pub fn time_at(l: &Layout, view: &MidiEditView<'_>, x: f32) -> f64 {
+    let w = f64::from(l.roll.width().max(1.0));
+    view.view_start_s + f64::from(x - l.roll.left()) / w * view.view_len_s.max(1.0e-9)
+}
+
+pub fn x_of(l: &Layout, view: &MidiEditView<'_>, t: f64) -> f32 {
+    let f = (t - view.view_start_s) / view.view_len_s.max(1.0e-9);
+    l.roll.left() + l.roll.width() * f as f32
+}
+
+/// The key row height in points.
+pub fn key_h(l: &Layout) -> f32 {
+    l.roll.height().max(1.0) / KEYS_SHOWN
+}
+
+/// The (fractional) key under `y` — floor it for the row.
+pub fn key_at(l: &Layout, view: &MidiEditView<'_>, y: f32) -> f32 {
+    view.top_key - (y - l.roll.top()) / key_h(l)
+}
+
+/// The TOP edge of `key`'s row.
+pub fn y_of(l: &Layout, view: &MidiEditView<'_>, key: f32) -> f32 {
+    l.roll.top() + (view.top_key - key) * key_h(l)
+}
+
+// ── the grid ───────────────────────────────────────────────────────────────
+
+fn bar_s(view: &MidiEditView<'_>) -> f64 {
+    let bpm = view.bpm.clamp(20.0, 400.0);
+    let top = view.sig_top.clamp(1, 32) as f64;
+    let bottom = view.sig_bottom.clamp(1, 32) as f64;
+    top * (60.0 / bpm) * (4.0 / bottom)
+}
+
+/// One grid step in seconds. Triplet divides the next size UP into three —
+/// an eighth-triplet is a third of a quarter — which is the 2/3 here.
+pub fn grid_step_s(view: &MidiEditView<'_>) -> f64 {
+    let g = bar_s(view) * 2.0f64.powi(i32::from(view.grid_exp.clamp(-6, 3)));
+    if view.triplet {
+        g * 2.0 / 3.0
+    } else {
+        g
+    }
+}
+
+/// `t`, magnetised to the grid's own lines — straight, triplet or swung.
+/// The ONE authority: the drawn lines call the same maths.
+pub fn snap_t(view: &MidiEditView<'_>, t: f64) -> f64 {
+    if !view.snap_on {
+        return t.max(0.0);
+    }
+    let step = grid_step_s(view);
+    if step <= 0.0 {
+        return t.max(0.0);
+    }
+    if view.swing && !view.triplet {
+        // Pairs of steps: the on-beat at the pair's head, the off-beat
+        // pushed late to SWING of the pair. Candidates straddle `t`.
+        let pair = step * 2.0;
+        let base = (t / pair).floor() * pair;
+        let mut best = base;
+        for c in [base, base + pair * SWING, base + pair] {
+            if (t - c).abs() < (t - best).abs() {
+                best = c;
+            }
+        }
+        best.max(0.0)
+    } else {
+        ((t / step).round() * step).max(0.0)
+    }
+}
+
+/// Every grid line in `[from, to]`: `f(t, is_bar)`. Bounded, so a zoomed-out
+/// window cannot ask for ten thousand lines.
+pub fn grid_lines(view: &MidiEditView<'_>, from: f64, to: f64, mut f: impl FnMut(f64, bool)) {
+    let bar = bar_s(view);
+    let step = grid_step_s(view);
+    if bar <= 0.0 || step <= 0.0 || to <= from {
+        return;
+    }
+    if (to - from) / step > 2000.0 {
+        // Too fine to see anyway: bars only.
+        let mut n = (from / bar).floor().max(0.0);
+        while n * bar <= to && n < 100_000.0 {
+            f(n * bar, true);
+            n += 1.0;
+        }
+        return;
+    }
+    if view.swing && !view.triplet {
+        let pair = step * 2.0;
+        let mut n = (from / pair).floor().max(0.0);
+        while n * pair <= to {
+            let base = n * pair;
+            f(base, (base / bar).round() * bar == base || base.rem_euclid(bar) < 1.0e-9);
+            f(base + pair * SWING, false);
+            n += 1.0;
+        }
+    } else {
+        let mut n = (from / step).floor().max(0.0);
+        while n * step <= to {
+            let t = n * step;
+            f(t, t.rem_euclid(bar) < 1.0e-6 || bar - t.rem_euclid(bar) < 1.0e-6);
+            n += 1.0;
+        }
+    }
+}
+
+/// The gridbox's word: the arrangement's bars-as-a-power-of-two, with the
+/// grid's shape appended — `1/8T`, `1/8 sw`.
+pub fn grid_word(view: &MidiEditView<'_>) -> String {
+    let base = crate::arrangement_panel::grid_label(view.grid_exp);
+    if view.triplet {
+        format!("{base}T")
+    } else if view.swing {
+        format!("{base} sw")
+    } else {
+        base
+    }
+}
+
+// ── drawing ────────────────────────────────────────────────────────────────
+
+const FACE: Color32 = Color32::from_rgb(0x18, 0x12, 0x0F);
+const FACE_ROW_DARK: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 60);
+const INK: Color32 = Color32::from_rgb(0xFF, 0xF4, 0xE0);
+const OUTSIDE_VEIL: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 90);
+
+fn is_black(key: u8) -> bool {
+    matches!(key % 12, 1 | 3 | 6 | 8 | 10)
+}
+
+fn lane_color(view: &MidiEditView<'_>) -> Color32 {
+    if view.color != 0 {
+        let (r, g, b) = STRIP_COLORS[view.color.min(STRIP_COLORS.len() - 1)];
+        Color32::from_rgb(r, g, b)
+    } else {
+        Color32::from_rgb(0x2E, 0x6B, 0x46)
+    }
+}
+
+pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
+    let l = Layout::new(rect);
+    if !l.panel.is_positive() {
+        return;
+    }
+    // A popup over the arrangement: its own face, a firm border, and a
+    // clip so nothing leaks onto the lanes below.
+    let painter = &painter.with_clip_rect(l.panel.expand(1.0));
+    painter.rect_filled(l.panel, 4.0, FACE);
+    painter.rect_stroke(
+        l.panel,
+        4.0,
+        Stroke::new(1.5, INK.gamma_multiply(0.5)),
+        egui::StrokeKind::Inside,
+    );
+
+    // ── the strip ─────────────────────────────────────────────────────────
+    let font = |size: f32| FontId::monospace(size);
+    painter.rect_filled(l.strip, 4.0, Color32::from_rgba_premultiplied(0, 0, 0, 60));
+    painter.text(
+        Pos2::new(l.strip.left() + 8.0, l.strip.center().y),
+        Align2::LEFT_CENTER,
+        view.name,
+        font(STRIP_H * 0.45),
+        INK,
+    );
+    let chip = |painter: &Painter, r: Rect, word: &str, lit: bool| {
+        if !r.is_positive() {
+            return;
+        }
+        if lit {
+            painter.rect_filled(r, 3.0, INK.gamma_multiply(0.85));
+        }
+        painter.rect_stroke(
+            r,
+            3.0,
+            Stroke::new(1.0, INK.gamma_multiply(if lit { 0.9 } else { 0.4 })),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            r.center(),
+            Align2::CENTER_CENTER,
+            word,
+            font(r.height() * 0.55),
+            if lit { FACE } else { INK.gamma_multiply(0.7) },
+        );
+    };
+    chip(painter, l.tool_swing, "SWG", view.swing);
+    chip(painter, l.tool_triplet, "TRP", view.triplet);
+    // The magnet, as a word — the strip is text-first, and a lit chip
+    // says ON just as loudly as a glyph would.
+    chip(painter, l.tool_snap, "SNAP", view.snap_on);
+    chip(painter, l.tool_grid, &grid_word(view), false);
+    if l.close.is_positive() {
+        let c = l.close.center();
+        let a = l.close.width() * 0.28;
+        for s in [-1.0f32, 1.0] {
+            painter.line_segment(
+                [Pos2::new(c.x - a, c.y - a * s), Pos2::new(c.x + a, c.y + a * s)],
+                Stroke::new(1.5, INK.gamma_multiply(0.7)),
+            );
+        }
+    }
+
+    if !l.roll.is_positive() || !l.keys.is_positive() {
+        return;
+    }
+    let kh = key_h(&l);
+
+    // ── rows: the piano column and the roll's shading, one loop ──────────
+    let top = view.top_key.ceil() as i32;
+    for k in (top - KEYS_SHOWN as i32 - 1)..=top {
+        if !(0..=127).contains(&k) {
+            continue;
+        }
+        let key = k as u8;
+        let y0 = y_of(&l, view, k as f32);
+        let row_keys = Rect::from_min_max(
+            Pos2::new(l.keys.left(), y0.max(l.keys.top())),
+            Pos2::new(l.keys.right(), (y0 + kh).min(l.keys.bottom())),
+        );
+        let row_roll = Rect::from_min_max(
+            Pos2::new(l.roll.left(), y0.max(l.roll.top())),
+            Pos2::new(l.roll.right(), (y0 + kh).min(l.roll.bottom())),
+        );
+        if row_keys.is_positive() {
+            painter.rect_filled(
+                row_keys,
+                0.0,
+                if is_black(key) {
+                    Color32::from_rgb(0x1A, 0x16, 0x12)
+                } else {
+                    INK.gamma_multiply(0.85)
+                },
+            );
+            if key % 12 == 0 && kh >= 7.0 {
+                painter.text(
+                    Pos2::new(row_keys.right() - 3.0, row_keys.center().y),
+                    Align2::RIGHT_CENTER,
+                    format!("C{}", i32::from(key / 12) - 1),
+                    font((kh * 0.7).min(10.0)),
+                    if is_black(key) { INK } else { FACE },
+                );
+            }
+        }
+        if row_roll.is_positive() {
+            if is_black(key) {
+                painter.rect_filled(row_roll, 0.0, FACE_ROW_DARK);
+            }
+            // Every C draws its line: the octave is the roll's ruler.
+            if key % 12 == 0 {
+                painter.line_segment(
+                    [
+                        Pos2::new(row_roll.left(), row_roll.bottom()),
+                        Pos2::new(row_roll.right(), row_roll.bottom()),
+                    ],
+                    Stroke::new(1.0, INK.gamma_multiply(0.16)),
+                );
+            }
+        }
+    }
+    painter.line_segment(
+        [l.keys.right_top(), l.keys.right_bottom()],
+        Stroke::new(1.0, INK.gamma_multiply(0.4)),
+    );
+
+    // ── the grid ─────────────────────────────────────────────────────────
+    let t1 = view.view_start_s + view.view_len_s;
+    grid_lines(view, view.view_start_s.max(0.0), t1, |t, is_bar| {
+        let x = x_of(&l, view, t);
+        if x < l.roll.left() - 1.0 || x > l.roll.right() + 1.0 {
+            return;
+        }
+        painter.line_segment(
+            [Pos2::new(x, l.roll.top()), Pos2::new(x, l.roll.bottom())],
+            Stroke::new(
+                1.0,
+                INK.gamma_multiply(if is_bar { 0.30 } else { 0.10 }),
+            ),
+        );
+    });
+
+    // ── the clip's own span: everything outside it is not this clip ──────
+    let cx0 = x_of(&l, view, view.clip_start_s);
+    let cx1 = x_of(&l, view, view.clip_start_s + view.clip_len_s);
+    if cx0 > l.roll.left() {
+        painter.rect_filled(
+            Rect::from_min_max(l.roll.min, Pos2::new(cx0.min(l.roll.right()), l.roll.bottom())),
+            0.0,
+            OUTSIDE_VEIL,
+        );
+    }
+    if cx1 < l.roll.right() {
+        painter.rect_filled(
+            Rect::from_min_max(Pos2::new(cx1.max(l.roll.left()), l.roll.top()), l.roll.max),
+            0.0,
+            OUTSIDE_VEIL,
+        );
+    }
+
+    // ── the notes ────────────────────────────────────────────────────────
+    let color = lane_color(view);
+    for (i, n) in view.notes.iter().enumerate() {
+        let r = note_rect(&l, view, n);
+        if !r.is_positive() {
+            continue;
+        }
+        painter.rect_filled(r, 2.0, color);
+        painter.rect_stroke(
+            r,
+            2.0,
+            if view.selected == Some(i) {
+                Stroke::new(2.0, INK)
+            } else {
+                Stroke::new(1.0, Color32::from_black_alpha(140))
+            },
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    // ── the playhead ─────────────────────────────────────────────────────
+    let px = x_of(&l, view, view.playhead_s);
+    if px >= l.roll.left() && px <= l.roll.right() {
+        painter.line_segment(
+            [Pos2::new(px, l.roll.top()), Pos2::new(px, l.roll.bottom())],
+            Stroke::new(1.5, Color32::from_rgb(0xE8, 0x3A, 0x4E)),
+        );
+    }
+}
+
+/// A note's rectangle on the roll, clamped into it. `NOTHING` off screen.
+pub fn note_rect(l: &Layout, view: &MidiEditView<'_>, n: &ArrNote) -> Rect {
+    let t0 = view.clip_start_s + (n.at_s - view.offset_s);
+    let t1 = t0 + n.dur_s.max(0.02);
+    let x0 = x_of(l, view, t0);
+    let x1 = x_of(l, view, t1);
+    if x1 < l.roll.left() || x0 > l.roll.right() {
+        return Rect::NOTHING;
+    }
+    let y0 = y_of(l, view, f32::from(n.key));
+    let r = Rect::from_min_max(
+        Pos2::new(x0.max(l.roll.left()), y0.max(l.roll.top())),
+        Pos2::new(
+            x1.min(l.roll.right()).max(x0 + 2.0),
+            (y0 + key_h(l)).min(l.roll.bottom()),
+        ),
+    );
+    if r.is_positive() {
+        r.shrink2(Vec2::new(0.0, 0.5))
+    } else {
+        Rect::NOTHING
+    }
+}
+
+/// What a press at `pos` means. Notes beat cells; late clips beat early
+/// ones, like the arrangement.
+pub fn hit_test(rect: Rect, view: &MidiEditView<'_>, pos: Pos2) -> Option<Hit> {
+    let l = Layout::new(rect);
+    if !l.panel.is_positive() || !l.panel.contains(pos) {
+        return None;
+    }
+    for (r, hit) in [
+        (l.close, Hit::Close),
+        (l.tool_snap, Hit::ToolSnap),
+        (l.tool_grid, Hit::ToolGrid),
+        (l.tool_swing, Hit::ToolSwing),
+        (l.tool_triplet, Hit::ToolTriplet),
+    ] {
+        if r.is_positive() && r.contains(pos) {
+            return Some(hit);
+        }
+    }
+    if l.strip.contains(pos) {
+        return None;
+    }
+    if l.keys.is_positive() && l.keys.contains(pos) {
+        // Within key k's row, `key_at` runs (k-1, k] — the CEILING names
+        // the row, not the floor.
+        let key = key_at(&l, view, pos.y).ceil();
+        if (0.0..=127.0).contains(&key) {
+            return Some(Hit::Key(key as u8));
+        }
+        return None;
+    }
+    if !l.roll.is_positive() || !l.roll.contains(pos) {
+        return None;
+    }
+    for (i, n) in view.notes.iter().enumerate().rev() {
+        let r = note_rect(&l, view, n);
+        if !r.is_positive() || !r.contains(pos) {
+            continue;
+        }
+        if pos.x >= r.right() - EDGE_W.min(r.width() * 0.4) {
+            return Some(Hit::NoteRight(i));
+        }
+        return Some(Hit::NoteBody(i));
+    }
+    let key = key_at(&l, view, pos.y).ceil();
+    if !(0.0..=127.0).contains(&key) {
+        return None;
+    }
+    Some(Hit::Cell(time_at(&l, view, pos.x), key as u8))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn view<'a>(notes: &'a [ArrNote]) -> MidiEditView<'a> {
+        MidiEditView {
+            name: "MIDI",
+            clip_start_s: 8.0,
+            clip_len_s: 16.0,
+            offset_s: 0.0,
+            notes,
+            selected: None,
+            view_start_s: 6.0,
+            view_len_s: 20.0,
+            top_key: 72.0,
+            snap_on: true,
+            grid_exp: -3,
+            swing: false,
+            triplet: false,
+            bpm: 120.0,
+            sig_top: 4,
+            sig_bottom: 4,
+            playhead_s: 10.0,
+            color: 0,
+        }
+    }
+
+    fn rect() -> Rect {
+        Rect::from_min_size(Pos2::new(10.0, 10.0), Vec2::new(900.0, 380.0))
+    }
+
+    /// The axes are inverses, and the vertical one puts higher pitch higher.
+    #[test]
+    fn the_axes_round_trip_and_pitch_rises() {
+        let n: [ArrNote; 0] = [];
+        let v = view(&n);
+        let l = Layout::new(rect());
+        for t in [6.0, 8.0, 17.5, 26.0] {
+            let x = x_of(&l, &v, t);
+            assert!((time_at(&l, &v, x) - t).abs() < 1.0e-6);
+        }
+        assert!(
+            y_of(&l, &v, 72.0) < y_of(&l, &v, 60.0),
+            "C5 drew below C4"
+        );
+        let y = y_of(&l, &v, 60.0);
+        assert!((key_at(&l, &v, y) - 60.0).abs() < 1.0e-4);
+    }
+
+    /// **The magnet's three shapes.** Straight rounds to the step; triplet
+    /// divides the doubled step into three; swing pushes the off-beat line
+    /// late — and every snapped value is one the grid actually draws.
+    #[test]
+    fn the_grid_snaps_straight_triplet_and_swung() {
+        let n: [ArrNote; 0] = [];
+        // 120 bpm, 4/4: bar 2 s; exp -3 → an eighth of a bar = 0.25 s.
+        let mut v = view(&n);
+        assert!((grid_step_s(&v) - 0.25).abs() < 1.0e-9);
+        assert!((snap_t(&v, 0.13) - 0.25).abs() < 1.0e-9);
+        assert!((snap_t(&v, 0.11) - 0.0).abs() < 1.0e-9);
+
+        v.triplet = true;
+        let t_step = 0.25 * 2.0 / 3.0;
+        assert!((grid_step_s(&v) - t_step).abs() < 1.0e-9);
+        assert!((snap_t(&v, 0.17) - t_step).abs() < 1.0e-9);
+
+        v.triplet = false;
+        v.swing = true;
+        // Pairs of 0.5 s: lines at 0.0 and 0.29 (58% of the pair).
+        assert!((snap_t(&v, 0.20) - 0.29).abs() < 1.0e-9);
+        assert!((snap_t(&v, 0.05) - 0.0).abs() < 1.0e-9);
+        assert!((snap_t(&v, 0.45) - 0.5).abs() < 1.0e-9);
+
+        // Off, the magnet lets go entirely.
+        v.snap_on = false;
+        assert!((snap_t(&v, 0.1234) - 0.1234).abs() < 1.0e-12);
+
+        // And whatever snapped is a line the grid draws.
+        v.snap_on = true;
+        for shape in [(false, false), (true, false), (false, true)] {
+            v.swing = shape.0;
+            v.triplet = shape.1;
+            let snapped = snap_t(&v, 1.1);
+            let mut found = false;
+            grid_lines(&v, 0.0, 4.0, |t, _| {
+                if (t - snapped).abs() < 1.0e-6 {
+                    found = true;
+                }
+            });
+            assert!(found, "snap answered {snapped} but no line stands there");
+        }
+    }
+
+    /// A note beats the cell under it, its right edge beats its body, the
+    /// keys column answers pitches, and the strip's tools are pressable.
+    #[test]
+    fn hits_rank_notes_edges_keys_and_tools() {
+        let notes = [ArrNote {
+            at_s: 2.0,
+            dur_s: 1.0,
+            key: 60,
+            vel: 96,
+        }];
+        let v = view(&notes);
+        let l = Layout::new(rect());
+        let r = note_rect(&l, &v, &notes[0]);
+        assert!(r.is_positive(), "the note is off screen");
+        assert_eq!(
+            hit_test(rect(), &v, Pos2::new(r.left() + 2.0, r.center().y)),
+            Some(Hit::NoteBody(0))
+        );
+        assert_eq!(
+            hit_test(rect(), &v, Pos2::new(r.right() - 1.0, r.center().y)),
+            Some(Hit::NoteRight(0))
+        );
+        match hit_test(rect(), &v, Pos2::new(r.center().x, r.center().y - key_h(&l) * 2.0)) {
+            Some(Hit::Cell(t, key)) => {
+                assert_eq!(key, 62, "two rows up from C4 is D4");
+                assert!((t - 10.5).abs() < 0.2, "the cell's second read as {t}");
+            }
+            other => panic!("empty roll answered {other:?}"),
+        }
+        match hit_test(rect(), &v, Pos2::new(l.keys.center().x, r.center().y)) {
+            Some(Hit::Key(60)) => {}
+            other => panic!("the C4 key answered {other:?}"),
+        }
+        for (r, want) in [
+            (l.close, Hit::Close),
+            (l.tool_snap, Hit::ToolSnap),
+            (l.tool_grid, Hit::ToolGrid),
+            (l.tool_swing, Hit::ToolSwing),
+            (l.tool_triplet, Hit::ToolTriplet),
+        ] {
+            assert!(r.is_positive());
+            assert_eq!(hit_test(rect(), &v, r.center()), Some(want));
+        }
+        // Outside the panel: nobody's.
+        assert_eq!(hit_test(rect(), &v, Pos2::new(2.0, 2.0)), None);
+    }
+
+    /// Degenerate rects neither panic nor answer presses.
+    #[test]
+    fn it_survives_small_rects() {
+        let n: [ArrNote; 0] = [];
+        let v = view(&n);
+        for size in [Vec2::ZERO, Vec2::new(20.0, 8.0), Vec2::new(2000.0, 900.0)] {
+            let r = Rect::from_min_size(Pos2::new(3.0, 5.0), size);
+            let _ = Layout::new(r);
+            let _ = hit_test(r, &v, r.center());
+        }
+    }
+
+    /// The grid word says the shape, not just the size.
+    #[test]
+    fn the_gridbox_word_carries_the_shape() {
+        let n: [ArrNote; 0] = [];
+        let mut v = view(&n);
+        assert_eq!(grid_word(&v), "1/8");
+        v.triplet = true;
+        assert_eq!(grid_word(&v), "1/8T");
+        v.triplet = false;
+        v.swing = true;
+        assert_eq!(grid_word(&v), "1/8 sw");
+    }
+}

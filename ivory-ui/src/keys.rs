@@ -278,6 +278,7 @@ pub enum HelpView {
     Piano,
     Mixer,
     Arrange,
+    MidiEdit,
 }
 
 fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> {
@@ -291,6 +292,10 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
                 }
                 (HelpView::Arrange, KeyAction::ToggleFretboard) => "snap to grid (the magnet)",
                 (HelpView::Arrange, KeyAction::ManageTaughtChords) => "metronome on/off",
+                (HelpView::MidiEdit, KeyAction::ToggleFretboard) => {
+                    "snap to grid (the editor's magnet)"
+                }
+                (HelpView::MidiEdit, KeyAction::ToggleNotePreference) => "triplet grid on/off",
                 _ => describe(action),
             };
             (label, desc)
@@ -305,10 +310,24 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
         HelpView::Arrange => rows.extend([
             ("DRAG", "move a clip · edges trim · corners fade"),
             ("S-DRG", "shift-drag: draw a MIDI item"),
+            ("2-CLK", "double-click a MIDI item: open its editor"),
             ("DEL", "delete the selected clip"),
             ("WHEEL", "zoom around the pointer"),
-            ("A-WHL", "alt: scrub the playhead by grid"),
+            ("A-WHL", "alt: move the viewport"),
+            ("A-DRG", "alt-drag empty room: move the viewport"),
             ("C-WHL", "cmd: pan along the song"),
+            ("CA-WHL", "ctrl+alt: grid finer or coarser"),
+        ]),
+        HelpView::MidiEdit => rows.extend([
+            ("DRAG", "draw a note · body moves · right edge stretches"),
+            ("R-CLK", "erase a note"),
+            ("DEL", "delete the selected note"),
+            ("O", "swing grid on/off"),
+            ("ESC", "close the editor"),
+            ("WHEEL", "zoom around the pointer"),
+            ("A-WHL", "alt: move the viewport (the editor's own)"),
+            ("C-WHL", "ctrl: walk the piano roll up and down"),
+            ("CA-WHL", "ctrl+alt: grid finer or coarser"),
         ]),
     }
     rows

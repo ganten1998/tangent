@@ -209,6 +209,9 @@ pub struct RecorderView<'a> {
     /// Armed lanes are being recorded into the arrangement — the red
     /// button's lit state. Not the capture-take's `state`.
     pub arr_recording: bool,
+    /// The selected clip's `(start_s, len_s)`, for the LCD cluster's
+    /// Start/End/Length rows. `None` draws as zeros.
+    pub sel_clip: Option<(f64, f64)>,
     pub meters: Meters,
     /// The OUTPUT's levels — after the effects, after the limiter, after the
     /// master, click included. Not the same signal as `meters`, which is what
@@ -323,6 +326,7 @@ impl RecorderView<'_> {
             position_s: 0.0,
             playing: false,
             arr_recording: false,
+            sel_clip: None,
             meters: Meters::SILENT,
             master: Meters::SILENT,
             gr_db: 0.0,
@@ -743,6 +747,19 @@ pub struct InputState {
     pub stereo: bool,
 }
 
+/// What arrangement record has collected SO FAR, pushed by the host each
+/// frame so the view can draw the take growing behind the playhead.
+#[derive(Debug, Clone, Default)]
+pub struct ArrRecView {
+    /// The playhead second the record began at.
+    pub start_s: f64,
+    /// The lanes being recorded: `(lane, is_midi)`.
+    pub lanes: Vec<(usize, bool)>,
+    /// The notes so far, clip-relative — keys still down included, sounding
+    /// to now.
+    pub notes: Vec<crate::arrangement::ArrNote>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RecorderState {
     /// The playhead, in seconds from 0:00 — what the readout and the waveform
@@ -755,6 +772,8 @@ pub struct RecorderState {
     /// The red button's OWN machine: armed lanes are being recorded into the
     /// arrangement. Independent of `state`, which is the capture-take's.
     pub arr_recording: bool,
+    /// The record's progress, for the growing ghost clips. `None` idle.
+    pub arr_rec: Option<ArrRecView>,
     pub state: RecordState,
     pub elapsed_s: f64,
     /// The loudest thing each strip made since the last frame, in
@@ -828,6 +847,7 @@ impl RecorderState {
             position_s: self.position_s,
             playing: self.playing,
             arr_recording: self.arr_recording,
+            sel_clip: None,
             meters: self.meters,
             master: self.master,
             gr_db: self.gr_db,

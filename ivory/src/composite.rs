@@ -1884,6 +1884,70 @@ mod shot {
         println!("wrote {out}");
     }
 
+    /// The MIDI editor over the arrangement:
+    ///
+    ///   IVORY_SHOT=/tmp/me.png cargo test -p ivory --bins shot::midiedit \
+    ///     -- --ignored --nocapture
+    #[test]
+    #[ignore = "writes a picture for a person to look at"]
+    fn midiedit() {
+        let Ok(out) = std::env::var("IVORY_SHOT") else {
+            eprintln!("IVORY_SHOT not set");
+            return;
+        };
+        // SAFETY: single-threaded test setup, before any app exists.
+        unsafe {
+            std::env::set_var(
+                "IVORY_SETTINGS_PATH",
+                std::env::temp_dir().join("tangent-shot-settings.json"),
+            );
+        }
+        let (w, h) = (1220u32, 500u32);
+        let mut c = match Compositor::standalone(w, h) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("no GPU here: {e}");
+                return;
+            }
+        };
+        let mut settings = ivory_ui::settings::Settings::default();
+        settings.show_recorder = true;
+        let mut app = IvoryApp::new(c.context(), settings, ivory_ui::host::Caps::DESKTOP);
+        app.open_midi_editor_for_shot();
+        let mut shoot = |app: &IvoryApp| {
+            let draw = |painter: &egui::Painter, rect: egui::Rect| {
+                let clips = app.arrange_clips_for_shot();
+                let view = app.arrange_view_for_shot(&clips);
+                ivory_ui::arrangement_panel::draw(painter, rect, &view);
+                app.draw_midi_editor_for_shot(painter, rect);
+            };
+            c.frame_painting(
+                app,
+                Layout::default(),
+                DisplayShows::default(),
+                false,
+                true,
+                None,
+                0,
+                Some(&draw),
+            )
+            .and_then(|_| c.flush())
+            .map(|_| ())
+        };
+        for _ in 0..2 {
+            if let Err(e) = shoot(&app) {
+                eprintln!("frame: {e}");
+                return;
+            }
+        }
+        let Some(px) = c.last_frame() else {
+            eprintln!("nothing came back");
+            return;
+        };
+        write_png(std::path::Path::new(&out), &px[..(h * w * 4) as usize], w, h);
+        println!("wrote {out}");
+    }
+
     #[test]
     #[ignore = "writes a picture for a person to look at"]
     fn mixer() {

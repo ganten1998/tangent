@@ -68,9 +68,16 @@ pub struct ClipView<'a> {
     pub name: &'a str,
     /// A peak envelope of the PLAYED span, 0..=1. May be empty.
     pub wave: &'a [f32],
+    /// The clip's notes, source-relative like the document's. Drawn as a
+    /// miniature where audio draws its wave; empty draws the dashed staff.
+    pub notes: &'a [crate::arrangement::ArrNote],
+    /// The left trim, for placing the miniature under the drawn span.
+    pub offset_s: f64,
     pub selected: bool,
     /// A MIDI item: no file, no wave — drawn with its own face.
     pub midi: bool,
+    /// Being RECORDED right now: drawn hot, and no gesture lands on it.
+    pub recording: bool,
 }
 
 /// Everything the arrangement draws, pushed in.
@@ -414,6 +421,51 @@ pub fn clip_rect(rect: Rect, view: &ArrangeView<'_>, clip: &ClipView<'_>) -> Rec
 /// Clips first, smallest target first — fade corner, then edge, then body —
 /// then the ruler and the lane's empty room. Later clips win over earlier
 /// ones where they overlap, because later is what was added on top.
+/// The clip's notes as a miniature: pitch spread across the clip's height
+/// (padded to at least an octave so one note does not fill the box), each
+/// note a small bar over its own span of the drawn length.
+fn draw_note_miniature(painter: &Painter, r: Rect, clip: &ClipView<'_>, p: &Ink) {
+    let len = clip.len_s.max(1.0e-9);
+    let (mut lo, mut hi) = (127u8, 0u8);
+    for n in clip.notes {
+        lo = lo.min(n.key);
+        hi = hi.max(n.key);
+    }
+    if lo > hi {
+        return;
+    }
+    // At least an octave of spread, centred on what was played.
+    while u16::from(hi) - u16::from(lo) < 12 {
+        lo = lo.saturating_sub(1);
+        hi = (hi + 1).min(127);
+        if lo == 0 && hi == 127 {
+            break;
+        }
+    }
+    let span = f32::from(hi - lo).max(1.0);
+    let inner = r.shrink(2.0);
+    if !inner.is_positive() {
+        return;
+    }
+    let bar_h = (inner.height() / span).clamp(1.5, 4.0);
+    for n in clip.notes {
+        let a = (n.at_s - clip.offset_s) / len;
+        let b = (n.at_s + n.dur_s.max(0.02) - clip.offset_s) / len;
+        if b <= 0.0 || a >= 1.0 {
+            continue;
+        }
+        let x0 = inner.left() + inner.width() * (a.max(0.0) as f32);
+        let x1 = inner.left() + inner.width() * (b.min(1.0) as f32);
+        let f = 1.0 - (f32::from(n.key.clamp(lo, hi) - lo) / span);
+        let y = inner.top() + (inner.height() - bar_h) * f;
+        painter.rect_filled(
+            Rect::from_min_max(Pos2::new(x0, y), Pos2::new(x1.max(x0 + 1.5), y + bar_h)),
+            1.0,
+            p.clip_ink.gamma_multiply(0.8),
+        );
+    }
+}
+
 pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
     let l = Layout::new(rect, view);
     for (r, hit) in [
@@ -442,6 +494,11 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
         return Some(Hit::Ruler(time_at(rect, view, pos.x)));
     }
     for clip in view.clips.iter().rev() {
+        // A clip being RECORDED is a picture, not a control — the document
+        // row it becomes does not exist yet.
+        if clip.recording {
+            continue;
+        }
         let r = clip_rect(rect, view, clip);
         if !r.is_positive() || !r.contains(pos) {
             continue;
@@ -615,17 +672,22 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             // like.
             .unwrap_or(Color32::from_rgb(0x2E, 0x6B, 0x46));
         painter.rect_filled(r, 3.0, color);
-        // A MIDI item wears a dashed midline where audio wears its wave —
-        // the empty staff the editor will fill.
+        // A MIDI item draws its NOTES in miniature — the arrangement can
+        // read what the editor will say. An empty item keeps the dashed
+        // staff that says "MIDI, nothing played yet".
         if clip.midi && r.width() >= 8.0 {
-            let mid = r.center().y;
-            let mut x = r.left() + 3.0;
-            while x < r.right() - 3.0 {
-                painter.line_segment(
-                    [Pos2::new(x, mid), Pos2::new((x + 4.0).min(r.right() - 3.0), mid)],
-                    Stroke::new(1.0, p.clip_ink.gamma_multiply(0.5)),
-                );
-                x += 8.0;
+            if clip.notes.is_empty() {
+                let mid = r.center().y;
+                let mut x = r.left() + 3.0;
+                while x < r.right() - 3.0 {
+                    painter.line_segment(
+                        [Pos2::new(x, mid), Pos2::new((x + 4.0).min(r.right() - 3.0), mid)],
+                        Stroke::new(1.0, p.clip_ink.gamma_multiply(0.5)),
+                    );
+                    x += 8.0;
+                }
+            } else {
+                draw_note_miniature(painter, r, clip, &p);
             }
         }
         // The wave, drawn inside at the clip's own resolution.
@@ -672,8 +734,18 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 Stroke::new(1.0, p.clip_ink),
             );
         }
+        // A clip being recorded wears the record's own red, and no handles:
+        // its edges are the take's business until the take ends.
+        if clip.recording {
+            painter.rect_stroke(
+                r,
+                3.0,
+                Stroke::new(1.5, Color32::from_rgb(0xE8, 0x3A, 0x4E)),
+                egui::StrokeKind::Inside,
+            );
+        }
         // The fade HANDLES, only at a size where they are grabbable.
-        if r.width() >= FADE_W * 3.0 {
+        if !clip.recording && r.width() >= FADE_W * 3.0 {
             for x in [r.left() + FADE_W * 0.5, r.right() - FADE_W * 0.5] {
                 painter.circle_filled(Pos2::new(x, r.top() + FADE_W * 0.4), 2.0, p.clip_ink);
             }
@@ -1036,6 +1108,9 @@ mod tests {
                 wave: &[],
                 selected: false,
                 midi: false,
+                notes: &[],
+                offset_s: 0.0,
+                recording: false,
             },
             ClipView {
                 id: 2,
@@ -1049,6 +1124,9 @@ mod tests {
                 wave: &[],
                 selected: true,
                 midi: false,
+                notes: &[],
+                offset_s: 0.0,
+                recording: false,
             },
         ]
     }

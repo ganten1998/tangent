@@ -199,6 +199,43 @@ channels play back their clips and nothing else. "Ready to play" and
   not written into recorded MIDI clips (it rides the live path only); and a
   recorded WAV's tail can be one device buffer short, because the tee
   drains what has arrived when the record ends rather than waiting.
+- **Post-phase-4 batch SHIPPED (4.47.0)**, all owner-directed:
+  - **Snap holds the playhead too**: clicking a lane or the ruler with the
+    magnet on lands the locate exactly on the grid line.
+  - **Alt = move the viewport** (the owner's correction of the earlier
+    "alt-wheel scrubs"): alt+wheel pans, alt-drag on empty room grabs the
+    view. Ctrl+Alt+wheel turns the gridbox from anywhere. Help card
+    updated per view.
+  - **The take is visible while it happens**: every recorded lane wears a
+    growing ghost from the press to the playhead — red-rimmed, untouchable
+    (id 0), the MIDI ones with their notes so far (keys still down sound
+    to now). MIDI clips in the arrangement draw real NOTE MINIATURES now;
+    the dashed staff remains only for empty items.
+  - **The band's backing-track box retired**: the empty timeline is quiet
+    (audio arrives by dropping it on a lane) and the box's left is the
+    REAPER-style LCD cluster from the owner's screenshot — big
+    bars|beats|thousandths playhead, min:sec under it, Start/End/Length of
+    the selected clip beside it, all in tape-green on black.
+  - **THE MIDI EDITOR, v1** (`ivory-ui/src/midi_editor.rs`): double-click
+    a MIDI item opens a piano-roll popup over the arrangement (a rim of
+    lanes stays visible; a press outside, Esc or the × closes it, saving).
+    Notes: click/drag draws (one grid step, snapped, vel 100), body-drag
+    moves in time AND pitch, right-edge stretches, right-click erases,
+    Delete removes the selected. The keys column auditions through the
+    live path. Wheel grammar mirrors the arrangement: wheel zooms around
+    the pointer, alt+wheel moves the editor's own viewport (pointer-over
+    decides which surface answers), ctrl+wheel walks the roll up and down,
+    ctrl+alt+wheel turns the grid. Keys while the hand is on it: `g` the
+    editor's own magnet, `o` swing grid, `p` triplet grid — swing and
+    triplet are exclusive, drawn AND snapped by one authority
+    (`snap_t`/`grid_lines`, swing at 58% of the pair, triplet 2/3 of the
+    step), with the shape in the gridbox word (`1/8T`, `1/8 sw`). Top
+    strip: name, SWG/TRP/SNAP chips, gridbox, ×. Separate settings
+    (`midi_snap/midi_grid_exp/midi_swing/midi_triplet`) so note grids and
+    clip grids never surprise each other.
+  - Editor still owed: velocity editing, note selection in bulk, a bar
+    ruler inside the popup, quantise-existing, and the arrangement-ruler
+    numbers reflecting inside the roll.
 
 ## Order of work
 

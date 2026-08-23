@@ -1275,8 +1275,39 @@ impl DesktopApp {
                 }
             }
         }
-        // The red button's state, where the band can draw it.
-        self.app.recorder_state_mut().arr_recording = self.recorder.arr_rec.is_some();
+        // The red button's state, where the band can draw it — and the
+        // record's PROGRESS, so the arrangement draws the take growing
+        // behind the playhead: lanes, notes so far, keys still down
+        // sounding to now.
+        let progress = self.recorder.arr_rec.as_ref().map(|rec| {
+            let now = self
+                .recorder
+                .engine
+                .as_ref()
+                .map_or(0.0, |e| (e.timebase().now() - rec.start_ns) as f64 / 1e9);
+            let mut notes = rec.notes.clone();
+            for (key, (at, vel)) in &rec.open {
+                notes.push(ivory_ui::arrangement::ArrNote {
+                    at_s: *at,
+                    dur_s: (now - at).max(0.05),
+                    key: *key,
+                    vel: *vel,
+                });
+            }
+            ivory_ui::recorder::ArrRecView {
+                start_s: rec.start_s,
+                lanes: rec
+                    .midi_lanes
+                    .iter()
+                    .map(|l| (*l, true))
+                    .chain(rec.audio.iter().map(|(_, l, _)| (*l, false)))
+                    .collect(),
+                notes,
+            }
+        });
+        let state = self.app.recorder_state_mut();
+        state.arr_recording = progress.is_some();
+        state.arr_rec = progress;
 
         // Opening the BAND opens the input, not pressing Record — the meter
         // has to be live before arming, which is what kills the "I recorded
