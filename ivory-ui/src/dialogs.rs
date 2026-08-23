@@ -34,6 +34,8 @@ pub enum Dialog {
     /// remove it, paint it, or choose the auto-palette everybody unpainted
     /// wears.
     Track { lane: usize, removable: bool },
+    /// The project export: sources, rate, shape, formats, speed.
+    ExportProject { spec: crate::ports::ProjectExportSpec },
     MidiPicker {
         ports: Vec<String>,
         selected: Option<usize>,
@@ -393,6 +395,12 @@ pub enum DialogAction {
     TrackPalette(i64),
     /// Bounce the arrangement to one WAV.
     ProjectExportTrack,
+    /// Open the export dialog.
+    ProjectExportOpen,
+    /// Run the export the dialog assembled.
+    ProjectExportRun(crate::ports::ProjectExportSpec),
+    /// Pick the export directory with the native chooser.
+    ProjectExportBrowse,
     /// Bounce every used lane to its own WAV.
     ProjectExportStems,
     ConnectPort(String),
@@ -2327,6 +2335,18 @@ fn show_dialog_viewport(
 
 /// Render the active dialog. Returns an action for the app to apply;
 /// `dialog_opt` becomes None when the dialog closes.
+/// An ellipsis in the middle of a long path, keeping both ends readable.
+fn shorten_middle(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_owned();
+    }
+    let keep = max.saturating_sub(1) / 2;
+    let head: String = s.chars().take(keep).collect();
+    let tail: String = s.chars().skip(n - keep).collect();
+    format!("{head}\u{2026}{tail}")
+}
+
 pub fn show(
     ctx: &egui::Context,
     dialog_opt: &mut Option<Dialog>,
@@ -3988,21 +4008,191 @@ pub fn show(
                             ui.add_space(4.0);
                             if row(
                                 ui,
-                                "Export Track",
-                                "one WAV of the whole arrangement - a real pass, racks and limiter included",
+                                "Export...",
+                                "master and/or stems - full-speed render by default",
                             ) {
-                                action = Some(DialogAction::ProjectExportTrack);
-                            }
-                            if row(
-                                ui,
-                                "Export Stems",
-                                "one WAV per used lane, under export/stems - one real pass",
-                            ) {
-                                action = Some(DialogAction::ProjectExportStems);
+                                action = Some(DialogAction::ProjectExportOpen);
                             }
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if ui
                                     .add(Button::new(RichText::new("Done").color(t.text)))
+                                    .clicked()
+                                {
+                                    result.close = true;
+                                }
+                            });
+                        });
+                },
+            )
+        }
+        Dialog::ExportProject { spec } => {
+            let t = theme(dark_mode);
+            show_dialog_viewport(
+                ctx,
+                placement,
+                "Export",
+                Vec2::new(380.0, 396.0),
+                Vec2::new(380.0, 376.0),
+                |ui, result| {
+                    apply_theme(ui.style_mut(), &t);
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
+                    let bold = |size: f32| FontId::new(size, fonts::courier_bold());
+                    let plain = |size: f32| FontId::new(size, fonts::courier());
+                    let dim = t.text.gamma_multiply(0.62);
+                    // One row idiom: a label, then choice chips; the chosen
+                    // one is filled.
+                    let choice = |ui: &mut egui::Ui,
+                                  label: &str,
+                                  options: &[&str],
+                                  chosen: usize|
+                     -> Option<usize> {
+                        let mut picked = None;
+                        ui.horizontal(|ui| {
+                            ui.add_sized(
+                                Vec2::new(96.0, 18.0),
+                                egui::Label::new(
+                                    RichText::new(label).font(bold(9.5)).color(dim),
+                                ),
+                            );
+                            for (i, o) in options.iter().enumerate() {
+                                let text = RichText::new(*o).font(plain(9.5)).color(
+                                    if i == chosen { t.bg } else { t.text },
+                                );
+                                let b = Button::new(text).fill(if i == chosen {
+                                    t.text
+                                } else {
+                                    t.bg
+                                });
+                                if ui.add(b).clicked() {
+                                    picked = Some(i);
+                                }
+                            }
+                        });
+                        ui.add_space(2.0);
+                        picked
+                    };
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::same(12))
+                        .show(ui, |ui| {
+                            let src = match (spec.master, spec.stems) {
+                                (true, false) => 0,
+                                (false, true) => 1,
+                                _ => 2,
+                            };
+                            if let Some(i) =
+                                choice(ui, "SOURCE", &["Master mix", "Stems", "Both"], src)
+                            {
+                                spec.master = i != 1;
+                                spec.stems = i != 0;
+                            }
+                            // Time selection arrives with the arrange-view
+                            // selection; until then the whole project is the
+                            // one honest answer.
+                            let _ = choice(ui, "TIME", &["Entire project"], 0);
+                            let rates: [u32; 4] = [44_100, 48_000, 88_200, 96_000];
+                            let at = rates.iter().position(|r| *r == spec.rate).unwrap_or(1);
+                            if let Some(i) = choice(
+                                ui,
+                                "SAMPLE RATE",
+                                &["44.1k", "48k", "88.2k", "96k"],
+                                at,
+                            ) {
+                                spec.rate = rates[i];
+                            }
+                            if let Some(i) = choice(
+                                ui,
+                                "CHANNELS",
+                                &["Stereo", "Mono"],
+                                usize::from(spec.mono),
+                            ) {
+                                spec.mono = i == 1;
+                            }
+                            if let Some(i) = choice(
+                                ui,
+                                "RENDER",
+                                &["Full speed", "Realtime"],
+                                usize::from(spec.realtime),
+                            ) {
+                                spec.realtime = i == 1;
+                            }
+                            let prim = matches!(spec.primary, crate::ports::ExportFormat::Mp3);
+                            if let Some(i) =
+                                choice(ui, "PRIMARY", &["wav", "mp3"], usize::from(prim))
+                            {
+                                spec.primary = if i == 1 {
+                                    crate::ports::ExportFormat::Mp3
+                                } else {
+                                    crate::ports::ExportFormat::Wav
+                                };
+                            }
+                            let sec = match spec.secondary {
+                                None => 0,
+                                Some(crate::ports::ExportFormat::Wav) => 1,
+                                Some(crate::ports::ExportFormat::Mp3) => 2,
+                            };
+                            if let Some(i) =
+                                choice(ui, "SECONDARY", &["off", "wav", "mp3"], sec)
+                            {
+                                spec.secondary = match i {
+                                    1 => Some(crate::ports::ExportFormat::Wav),
+                                    2 => Some(crate::ports::ExportFormat::Mp3),
+                                    _ => None,
+                                };
+                            }
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    Vec2::new(96.0, 18.0),
+                                    egui::Label::new(
+                                        RichText::new("FILE NAME").font(bold(9.5)).color(dim),
+                                    ),
+                                );
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut spec.name)
+                                        .font(plain(10.5))
+                                        .desired_width(180.0),
+                                );
+                            });
+                            ui.add_space(2.0);
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    Vec2::new(96.0, 18.0),
+                                    egui::Label::new(
+                                        RichText::new("DIRECTORY").font(bold(9.5)).color(dim),
+                                    ),
+                                );
+                                let shown = if spec.dir.is_empty() {
+                                    "(project's export folder)"
+                                } else {
+                                    spec.dir.as_str()
+                                };
+                                ui.label(
+                                    RichText::new(shorten_middle(shown, 30))
+                                        .font(plain(9.0))
+                                        .color(t.text),
+                                );
+                                if ui
+                                    .add(Button::new(
+                                        RichText::new("Browse...").font(plain(9.5)).color(t.text),
+                                    ))
+                                    .clicked()
+                                {
+                                    action = Some(DialogAction::ProjectExportBrowse);
+                                }
+                            });
+                            ui.add_space(8.0);
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui
+                                    .add(Button::new(
+                                        RichText::new("Export").font(bold(11.0)).color(t.text),
+                                    ))
+                                    .clicked()
+                                {
+                                    action = Some(DialogAction::ProjectExportRun(spec.clone()));
+                                    result.close = true;
+                                }
+                                if ui
+                                    .add(Button::new(RichText::new("Cancel").color(t.text)))
                                     .clicked()
                                 {
                                     result.close = true;

@@ -196,6 +196,9 @@ impl<'a> DeviceLabel<'a> {
 /// whatever is true, so there is no second copy of the recorder's state to get
 /// out of step with the first.
 pub struct RecorderView<'a> {
+    /// The band's oscilloscope — session state owned by the app; the view
+    /// borrows it the way it borrows every string here.
+    pub scope: &'a crate::scope::Scope,
     pub state: RecordState,
     /// Seconds since the take started writing. Zero in `Idle` and during
     /// pre-roll.
@@ -324,8 +327,11 @@ impl RecorderView<'_> {
     }
 
     /// A view with nothing configured, for tests and for the first frame.
+    /// (The resting scope beside it: one static, silent instance for every
+    /// view that has no live app to borrow from.)
     pub fn empty() -> RecorderView<'static> {
         RecorderView {
+            scope: resting_scope(),
             input_monitor: false,
             state: RecordState::Idle,
             elapsed_s: 0.0,
@@ -921,6 +927,7 @@ impl RecorderState {
             Some(n) => DeviceLabel::Open(n),
         };
         RecorderView {
+            scope: resting_scope(),
             input_monitor: false,
             scrub: ScrubView::default(),
             state: self.state,
@@ -3427,4 +3434,11 @@ mod missing_tests {
             assert_eq!(said, format!("channel {}", i + 1));
         }
     }
+}
+
+/// A silent scope for views with no app behind them — `RecorderView::empty`
+/// and the base the app's struct-update overrides.
+fn resting_scope() -> &'static crate::scope::Scope {
+    static SCOPE: std::sync::OnceLock<crate::scope::Scope> = std::sync::OnceLock::new();
+    SCOPE.get_or_init(|| crate::scope::Scope::new(48_000.0))
 }

@@ -20,6 +20,7 @@ pub mod midi_event;
 pub mod piano;
 pub mod ports;
 pub mod recorder;
+pub mod scope;
 /// The mixer view: every source in the app, drawn as a channel strip.
 pub mod mixer_panel;
 pub mod recorder_panel;

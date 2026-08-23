@@ -327,6 +327,31 @@ channels play back their clips and nothing else. "Ready to play" and
   load guard was already in place and unfired), so no input stream ever
   opened; the menu's device rows are the fix and the recovery.
 
+- **4.52.0 — the morning-after batch, whole**: stop STAYS at the
+  playhead (takes too; play resumes there); viewport length ceiling an
+  hour; multi-bar grids draw coarser (strong line = the snap grid);
+  live PUNCH (`Shared::punch` — a recording lane's clips fall silent
+  from the record start, so the overdub is never heard against what it
+  replaces); input monitoring ON by default (arm-off carries the
+  feedback guard) and the open device mirrors back into settings every
+  reconcile; THE INPUT MENU is a floating hover tree (Mono/Stereo/MIDI
+  submenus right, None; the input IS the kind — REAPER model — binding
+  adds the track, instruments bind midi:all, the kind ask and cycle are
+  gone, v16 migrates); arrange headers wear the chip on every lane,
+  double-click renames, the header seam drags (persisted); dark mode
+  scoped to THEORY+ARRANGE (arrange defaults grey-ivory); the band's
+  columns reach the camera's line; mixer knob caps live inside their
+  band; drumpad explorer follows symlinks (~/Dropbox!) at a readable
+  size; **EXPORT**: one dialog (source master/stems/both, rate,
+  stereo/mono, dir+browse, name, wav+mp3 primary/secondary) rendering
+  FULL SPEED by default on an OFFLINE ENGINE — `Engine::offline`, no
+  device, same racks/clips/pads/desk, pulled ~80 ms per UI frame —
+  with realtime as the option (mp3 = LAME at 320k, round-trip tested);
+  **THE OSCILLOSCOPE** (sibling session's widget): the LCD's right half
+  shows the speakers' mix WITHOUT the click (pre-click tap mirrors the
+  stems tap), LCD glass both modes; Start/End/Length cells and their
+  drag retired (navigator/wheel/ruler carry the viewport).
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index

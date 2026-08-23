@@ -25,6 +25,65 @@ use std::sync::mpsc;
 /// the name would break for two identical webcams — which is not a hypothetical,
 /// it is what happens the moment somebody adds a second camera for a side angle
 /// — and again when the OS language changes and "Built-in Microphone" comes
+/// What a project export writes, in which shape, and how fast.
+///
+/// Assembled by the export dialog, carried whole to the host. FULL SPEED is
+/// the default by the owner's word: an offline engine renders the song as
+/// fast as the machine goes; realtime is the option for the day a plugin
+/// misbehaves offline.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectExportSpec {
+    /// The master mix lands in a file.
+    pub master: bool,
+    /// Every used lane lands in a stems folder.
+    pub stems: bool,
+    /// Sample rate of the rendered files (offline). A realtime pass runs at
+    /// the interface's rate whatever this says.
+    pub rate: u32,
+    /// Fold to one channel.
+    pub mono: bool,
+    /// Where the files land. Empty = the project's own export folder.
+    pub dir: String,
+    /// The file stem — "mix" makes mix.wav / mix.mp3.
+    pub name: String,
+    /// The formats: a primary, and an optional second copy.
+    pub primary: ExportFormat,
+    pub secondary: Option<ExportFormat>,
+    /// A realtime pass through the live engine instead of the offline one.
+    pub realtime: bool,
+}
+
+impl Default for ProjectExportSpec {
+    fn default() -> Self {
+        Self {
+            master: true,
+            stems: false,
+            rate: 48_000,
+            mono: false,
+            dir: String::new(),
+            name: "mix".to_owned(),
+            primary: ExportFormat::Wav,
+            secondary: None,
+            realtime: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportFormat {
+    Wav,
+    Mp3,
+}
+
+impl ExportFormat {
+    pub fn ext(self) -> &'static str {
+        match self {
+            ExportFormat::Wav => "wav",
+            ExportFormat::Mp3 => "mp3",
+        }
+    }
+}
+
 /// back as "Micrófono integrado".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceInfo {
@@ -370,7 +429,7 @@ pub enum SavePurpose {
 
 /// A project action the HOST must run whole — it owns the plugin states
 /// and the template shelf, so the app only asks.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ProjectRequest {
     /// Clone the `default` template into a fresh Untitled and open it.
     New,
@@ -380,6 +439,9 @@ pub enum ProjectRequest {
     /// `Save`, then copy the whole session folder to
     /// `Projects/Templates/<name>`, replacing what was there.
     Template(String),
+    /// A full export by SPEC: sources, rate, formats, and whether it runs
+    /// offline (default) or as a realtime pass.
+    Export(ProjectExportSpec),
     /// Bounce the arrangement to one WAV in `<project>/export/` — a real
     /// pass through the engine, racks and limiter included.
     ExportTrack,
@@ -391,6 +453,8 @@ pub enum ProjectRequest {
 /// Why a folder is being asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirPurpose {
+    /// The export dialog's destination folder.
+    ExportDir,
     /// Where takes are written.
     RecordRoot,
     /// Another place to look for VST3 bundles.

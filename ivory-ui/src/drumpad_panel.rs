@@ -307,7 +307,8 @@ impl Layout {
             return Vec::new();
         }
         let top = self.media_head.bottom() + 2.0;
-        let h = 17.0;
+        // A fifth taller than the first cut — the owner squinted at 17.
+        let h = 20.0;
         let n = (((self.media.bottom() - top) / (h + 1.0)).floor() as usize).min(64);
         (0..n)
             .map(|i| {
@@ -735,8 +736,8 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
             painter.text(
                 Pos2::new(label.left(), label.center().y),
                 Align2::LEFT_CENTER,
-                cut_text(painter, label.width(), view.media_dir, &font(9.0)),
-                font(9.0),
+                cut_text(painter, label.width(), view.media_dir, &font(10.5)),
+                font(10.5),
                 INK.gamma_multiply(0.55),
             );
         }
@@ -762,8 +763,8 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
             painter.text(
                 Pos2::new(r.left() + 5.0, r.center().y),
                 Align2::LEFT_CENTER,
-                cut_text(painter, r.width() - 10.0, &word, &font(9.5)),
-                font(9.5),
+                cut_text(painter, r.width() - 10.0, &word, &font(11.0)),
+                font(11.0),
                 if e.dir { INK.gamma_multiply(0.85) } else { METER_GREEN.gamma_multiply(0.9) },
             );
         }
