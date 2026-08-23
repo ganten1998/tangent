@@ -278,6 +278,8 @@ pub struct IvoryApp {
     /// different characters, commit to different places and are drawn in
     /// different rows, and a shared one would need a tag at every use.
     mixer_naming: Option<(crate::recorder::Column, String)>,
+    /// The SWG menu, while it hangs under its chip.
+    swing_menu: Option<SwingMenu>,
     /// The loaded insert bay whose Delete/Replace menu is open, if any.
     mixer_fx_menu: Option<(crate::recorder::Column, usize)>,
     /// The bay whose editor should open the moment its plugin loads — the
@@ -771,6 +773,26 @@ fn dirs_home() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("/"))
 }
 
+/// Where a FRESH session lives: `Untitled`, unless somebody literally
+/// SAVED a project by that name — an auto-saved scratch is reclaimed, a
+/// kept one is stepped past to `Untitled 2` and so on.
+pub fn fresh_project_dir(root: &std::path::Path) -> std::path::PathBuf {
+    let keeps = |dir: &std::path::Path| {
+        crate::arrangement::Arrangement::load_from(&dir.join("project.tangent")).named
+    };
+    let first = root.join("Untitled");
+    if !first.exists() || !keeps(&first) {
+        return first;
+    }
+    for n in 2..10_000 {
+        let candidate = root.join(format!("Untitled {n}"));
+        if !candidate.exists() || !keeps(&candidate) {
+            return candidate;
+        }
+    }
+    first
+}
+
 /// `base`, or `base 2`, `base 3`… — the first directory name not taken.
 ///
 /// Counted rather than timestamped: "Untitled 3" is a name a person can say
@@ -874,6 +896,9 @@ fn plugin_display_name(path: &str) -> &str {
     if path == dialogs::BUILTIN_PATH {
         return "TANGENT DX7";
     }
+    if path == dialogs::DRUMPAD_PATH {
+        return "TANGENT DRUMS";
+    }
     path.rsplit('/')
         .next()
         .unwrap_or(path)
@@ -889,6 +914,38 @@ struct MixerGrab {
     /// What it read when it was grabbed, 0..=1 — the same relative-drag
     /// contract the band uses, so the two surfaces feel like one instrument.
     from_value: f32,
+}
+
+/// The SWG menu over the MIDI editor: a percent field on top, the six
+/// named ratios under it. Modal over the editor while open.
+#[derive(Clone)]
+struct SwingMenu {
+    /// The whole menu's rectangle, laid out when the chip was pressed.
+    rect: egui::Rect,
+    /// The percent being typed, when the field is live.
+    typing: Option<String>,
+}
+
+/// One row of the SWG menu is this tall.
+const SWING_ROW_H: f32 = 24.0;
+
+/// Where the SWG menu stands: hanging under its chip, held inside the
+/// editor's panel.
+fn swing_menu_rect(anchor: egui::Rect, panel: egui::Rect) -> egui::Rect {
+    let rows = 1 + crate::midi_editor::SWING_PRESETS.len();
+    let size = egui::Vec2::new(238.0, SWING_ROW_H * rows as f32 + 8.0);
+    let mut min = egui::Pos2::new(anchor.right() - size.x, anchor.bottom() + 4.0);
+    min.x = min.x.max(panel.left() + 4.0);
+    min.y = min.y.min(panel.bottom() - size.y - 4.0).max(panel.top());
+    egui::Rect::from_min_size(min, size)
+}
+
+/// Row `i` of the SWG menu: 0 is the percent field, 1.. the presets.
+fn swing_menu_row(menu: egui::Rect, i: usize) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::Pos2::new(menu.left() + 4.0, menu.top() + 4.0 + SWING_ROW_H * i as f32),
+        egui::Vec2::new(menu.width() - 8.0, SWING_ROW_H),
+    )
 }
 
 /// A drumpad knob being dragged: the same relative-drag contract, against
@@ -1105,6 +1162,7 @@ impl IvoryApp {
             mixer_grab: None,
             mixer_typing: None,
             mixer_naming: None,
+            swing_menu: None,
             mixer_fx_menu: None,
             armed,
             arrangement: crate::arrangement::Arrangement::default(),
@@ -4117,7 +4175,7 @@ impl IvoryApp {
             // one rather than an error at launch — the settings file's own
             // manner with missing files.
         }
-        let dir = unique_dir(projects_root, "Untitled");
+        let dir = fresh_project_dir(projects_root);
         let doc = dir.join("project.tangent");
         let _ = std::fs::create_dir_all(dir.join("media"));
         let mut arr = crate::arrangement::Arrangement::default();
@@ -4383,10 +4441,42 @@ impl IvoryApp {
         }
     }
 
+    /// Move the open session to `name` — the Project window's field, at
+    /// its Save. A no-op on an empty or unchanged name; a collision steps
+    /// to `name 2` rather than eating somebody else's session.
+    fn rename_project(&mut self, name: &str) {
+        let clean: String = name
+            .chars()
+            .filter(|c| !c.is_control() && *c != '/' && *c != ':')
+            .collect::<String>()
+            .trim()
+            .to_owned();
+        if clean.is_empty() || clean == self.project_name() {
+            return;
+        }
+        let Some(src) = self
+            .project_doc()
+            .and_then(std::path::Path::parent)
+            .map(std::path::Path::to_path_buf)
+        else {
+            return;
+        };
+        let Some(root) = src.parent().map(std::path::Path::to_path_buf) else {
+            return;
+        };
+        let target = unique_dir(&root, &clean);
+        if std::fs::rename(&src, &target).is_err() {
+            return;
+        }
+        self.project_doc = target.join("project.tangent");
+        self.settings.project_path = self.project_doc.to_string_lossy().into_owned();
+        self.save_settings();
+    }
+
     /// A fresh, empty project beside the others, opened immediately.
     pub fn new_project(&mut self) {
         let root = self.record_root().join("Projects");
-        let dir = unique_dir(&root, "Untitled");
+        let dir = fresh_project_dir(&root);
         let doc = dir.join("project.tangent");
         let _ = std::fs::create_dir_all(dir.join("media"));
         let arr = crate::arrangement::Arrangement::default();
@@ -4962,7 +5052,29 @@ impl IvoryApp {
     pub fn seed_template(&self, dir: &std::path::Path) {
         let doc = dir.join("project.tangent");
         if doc.is_file() {
-            return;
+            // A template somebody touched stands. But an UNTOUCHED stock
+            // seed — no clips, no names, the desk exactly as an older
+            // default wrote it — is re-seeded, so the drumpad's arrival on
+            // track 8 reaches templates minted before it shipped.
+            let old = crate::arrangement::Arrangement::load_from(&doc);
+            let stock = old.clips.is_empty()
+                && old.next_id <= 1
+                && old.desk.as_ref().is_some_and(|d| {
+                    d.names.iter().all(String::is_empty)
+                        && d.kinds.iter().enumerate().all(|(n, k)| {
+                            *k == u8::from(n == 0)
+                        })
+                        && d.inserts.iter().enumerate().all(|(n, p)| {
+                            if n == 0 {
+                                p == crate::dialogs::BUILTIN_PATH
+                            } else {
+                                p.is_empty()
+                            }
+                        })
+                });
+            if !stock {
+                return;
+            }
         }
         let _ = std::fs::create_dir_all(dir.join("media"));
         let mut arr = crate::arrangement::Arrangement::default();
@@ -5023,6 +5135,9 @@ impl IvoryApp {
             }
         }
         let doc = dir.join("project.tangent");
+        // A Save As is a name somebody CHOSE: the copy is a kept project,
+        // never a scratch a new session may reclaim.
+        self.arrangement.named = true;
         self.arrangement.save_to(&doc);
         self.project_doc = doc.clone();
         self.settings.project_path = doc.to_string_lossy().into_owned();
@@ -5473,6 +5588,18 @@ impl IvoryApp {
         crate::midi_editor::snap_t(&self.midi_edit_view(st, clip), t)
     }
 
+    /// The CREATE snap: the grid line at or before the click — a note
+    /// lands in the cell under the hand, never the next one.
+    fn me_snap_floor(&self, t: f64) -> f64 {
+        let Some(st) = self.midi_edit.as_ref() else {
+            return t.max(0.0);
+        };
+        let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == st.id) else {
+            return t.max(0.0);
+        };
+        crate::midi_editor::snap_floor_t(&self.midi_edit_view(st, clip), t)
+    }
+
     /// Keep `i` in the sorted selection; answer whether it was new.
     fn me_select(&mut self, i: usize, extend: bool) {
         let Some(st) = self.midi_edit.as_mut() else {
@@ -5498,16 +5625,20 @@ impl IvoryApp {
         };
         let id = st.id;
         let vel = st.last_vel.clamp(1, 127);
-        let t0 = self.me_snap(t);
+        let t0 = self.me_snap_floor(t);
         let (step, span) = {
             let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == id) else {
                 return;
             };
             let view = self.midi_edit_view(self.midi_edit.as_ref().unwrap(), clip);
-            (
-                crate::midi_editor::grid_step_s(&view).max(0.05),
-                (clip.start_s, clip.start_s + clip.len_s, clip.offset_s),
-            )
+            // To the NEXT line the grid actually draws — under swing that
+            // is long on the beat and short off it, which is the sound.
+            let dur = if view.snap_on {
+                (crate::midi_editor::snap_next_t(&view, t0) - t0).max(0.02)
+            } else {
+                crate::midi_editor::grid_step_s(&view).max(0.05)
+            };
+            (dur, (clip.start_s, clip.start_s + clip.len_s, clip.offset_s))
         };
         let (c0, c1, offset) = span;
         if t0 < c0 - 1.0e-9 || t0 >= c1 - 1.0e-9 {
@@ -5736,7 +5867,15 @@ impl IvoryApp {
             let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == id) else {
                 return;
             };
-            crate::midi_editor::grid_step_s(&self.midi_edit_view(st, clip)).max(0.05)
+            let view = self.midi_edit_view(st, clip);
+            let g = crate::midi_editor::grid_step_s(&view).max(0.05);
+            // A swung phrase copied one straight step later lands its long
+            // notes in the short slots: the copy moves by the PAIR.
+            if view.snap_on && view.swing && !view.triplet {
+                g * 2.0
+            } else {
+                g
+            }
         };
         let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
             return;
@@ -5773,16 +5912,52 @@ impl IvoryApp {
         if sel.is_empty() {
             return;
         }
-        let step = {
+        let (step, walked) = {
             let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == id) else {
                 return;
             };
-            crate::midi_editor::grid_step_s(&self.midi_edit_view(st, clip)).max(0.01)
+            let view = self.midi_edit_view(st, clip);
+            // Under a swung grid a uniform hop breaks the lines for half
+            // the notes: each one walks to ITS OWN next or previous line.
+            let walked = (view.snap_on
+                && view.swing
+                && !view.triplet
+                && dk == 0
+                && steps_t.abs() > 0.5)
+                .then(|| {
+                    sel.iter()
+                        .filter_map(|&i| {
+                            let n = clip.notes.get(i)?;
+                            let abs = clip.start_s + (n.at_s - clip.offset_s);
+                            let to = if steps_t > 0.0 {
+                                crate::midi_editor::snap_next_t(&view, abs)
+                            } else {
+                                crate::midi_editor::snap_floor_t(&view, abs - 1.0e-6)
+                            };
+                            Some(to - abs)
+                        })
+                        .collect::<Vec<f64>>()
+                });
+            (
+                crate::midi_editor::grid_step_s(&view).max(0.01),
+                walked,
+            )
         };
         let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
             return;
         };
         let end = clip.offset_s + clip.len_s;
+        if let Some(deltas) = walked {
+            for (&i, d) in sel.iter().zip(deltas) {
+                if let Some(n) = clip.notes.get_mut(i) {
+                    let lo = clip.offset_s - n.at_s;
+                    let hi = (end - n.dur_s.max(0.05) - n.at_s).max(0.0);
+                    n.at_s += d.clamp(lo, hi);
+                }
+            }
+            self.arr_save_edits();
+            return;
+        }
         let dt = steps_t * step;
         // The set's clamps, exactly as a drag's.
         let mut dt_all = dt;
@@ -5906,6 +6081,7 @@ impl IvoryApp {
             snap_on: self.settings.midi_snap,
             grid_exp: self.settings.midi_grid_exp.clamp(-6, 3) as i8,
             swing: self.settings.midi_swing,
+            swing_pct: self.settings.midi_swing_pct.clamp(50.0, 95.0) / 100.0,
             triplet: self.settings.midi_triplet,
             bpm: f64::from(self.tempo_bpm()),
             sig_top: u32::from(sig.beats),
@@ -6449,7 +6625,176 @@ impl IvoryApp {
         }
     }
 
+    /// Apply a chosen swing percentage: 50 IS straight, so the flag
+    /// follows the number, and a swung grid retires the triplet the same
+    /// way the old toggle did.
+    fn set_swing_pct(&mut self, pct: f64) {
+        let pct = (pct.clamp(50.0, 95.0) * 10.0).round() / 10.0;
+        self.settings.midi_swing_pct = pct;
+        self.settings.midi_swing = pct > 50.05;
+        if self.settings.midi_swing {
+            self.settings.midi_triplet = false;
+        }
+        self.save_settings();
+    }
+
+    /// One frame of the open SWG menu: modal, so every press is either a
+    /// row's or closes it, and the keyboard belongs to the percent field.
+    fn swing_menu_frame(&mut self, ctx: &egui::Context, pressed: bool, pointer: Option<egui::Pos2>) {
+        ctx.request_repaint();
+        let Some(menu) = self.swing_menu.clone() else {
+            return;
+        };
+        // The keyboard, while the field is live.
+        if let Some(mut buf) = menu.typing.clone() {
+            let events = ctx.input(|i| i.events.clone());
+            let mut commit = false;
+            for e in events {
+                match e {
+                    egui::Event::Text(t) => {
+                        for ch in t.chars() {
+                            let dots = buf.matches('.').count();
+                            if (ch.is_ascii_digit() && buf.len() < 4)
+                                || (ch == '.' && dots == 0 && !buf.is_empty())
+                            {
+                                buf.push(ch);
+                            }
+                        }
+                    }
+                    egui::Event::Key {
+                        key: egui::Key::Backspace,
+                        pressed: true,
+                        ..
+                    } => {
+                        buf.pop();
+                    }
+                    egui::Event::Key {
+                        key: egui::Key::Enter,
+                        pressed: true,
+                        ..
+                    } => commit = true,
+                    _ => {}
+                }
+            }
+            if commit {
+                if let Ok(pct) = buf.parse::<f64>() {
+                    self.set_swing_pct(pct);
+                }
+                self.swing_menu = None;
+                return;
+            }
+            if let Some(m) = self.swing_menu.as_mut() {
+                m.typing = Some(buf);
+            }
+        }
+        if !pressed {
+            return;
+        }
+        let Some(p) = pointer else {
+            return;
+        };
+        if !menu.rect.contains(p) {
+            // A press outside commits nothing and closes — and is SWALLOWED,
+            // so closing the menu never also draws a note under it.
+            self.swing_menu = None;
+            return;
+        }
+        if swing_menu_row(menu.rect, 0).contains(p) {
+            // The percent field: a press begins typing it fresh.
+            if let Some(m) = self.swing_menu.as_mut() {
+                m.typing = Some(String::new());
+            }
+            return;
+        }
+        for (i, (_, _, pct)) in crate::midi_editor::SWING_PRESETS.iter().enumerate() {
+            if swing_menu_row(menu.rect, 1 + i).contains(p) {
+                self.set_swing_pct(*pct);
+                self.swing_menu = None;
+                return;
+            }
+        }
+    }
+
+    /// Paint the open SWG menu. Pure: the frame's own state was settled in
+    /// [`Self::swing_menu_frame`].
+    fn draw_swing_menu(&self, painter: &egui::Painter, pointer: Option<egui::Pos2>) {
+        let Some(menu) = self.swing_menu.as_ref() else {
+            return;
+        };
+        let face = egui::Color32::from_rgb(0x24, 0x20, 0x1C);
+        let ink = egui::Color32::from_rgb(0xFF, 0xF4, 0xE0);
+        painter.rect_filled(menu.rect, 4.0, face);
+        painter.rect_stroke(
+            menu.rect,
+            4.0,
+            egui::Stroke::new(1.2, ink.gamma_multiply(0.5)),
+            egui::StrokeKind::Inside,
+        );
+        let current = if self.settings.midi_swing {
+            self.settings.midi_swing_pct
+        } else {
+            50.0
+        };
+        let font = egui::FontId::monospace(11.0);
+        // Row 0: the percent field.
+        {
+            let r = swing_menu_row(menu.rect, 0);
+            painter.text(
+                egui::Pos2::new(r.left() + 6.0, r.center().y),
+                egui::Align2::LEFT_CENTER,
+                "SWING",
+                font.clone(),
+                ink.gamma_multiply(0.55),
+            );
+            let shown = match &menu.typing {
+                Some(t) => format!("{t}_"),
+                None => format!("{current:.1}%"),
+            };
+            painter.text(
+                egui::Pos2::new(r.right() - 6.0, r.center().y),
+                egui::Align2::RIGHT_CENTER,
+                shown,
+                font.clone(),
+                ink,
+            );
+            painter.line_segment(
+                [
+                    egui::Pos2::new(r.left() + 2.0, r.bottom()),
+                    egui::Pos2::new(r.right() - 2.0, r.bottom()),
+                ],
+                egui::Stroke::new(1.0, ink.gamma_multiply(0.25)),
+            );
+        }
+        for (i, (name, ratio, pct)) in
+            crate::midi_editor::SWING_PRESETS.iter().enumerate()
+        {
+            let r = swing_menu_row(menu.rect, 1 + i);
+            if pointer.is_some_and(|p| r.contains(p)) {
+                painter.rect_filled(r, 3.0, ink.gamma_multiply(0.12));
+            }
+            let chosen = (current - pct).abs() < 0.05;
+            painter.text(
+                egui::Pos2::new(r.left() + 6.0, r.center().y),
+                egui::Align2::LEFT_CENTER,
+                format!(
+                    "{} {name} ({ratio})",
+                    if chosen { "\u{2022}" } else { " " }
+                ),
+                font.clone(),
+                if chosen { ink } else { ink.gamma_multiply(0.75) },
+            );
+            painter.text(
+                egui::Pos2::new(r.right() - 6.0, r.center().y),
+                egui::Align2::RIGHT_CENTER,
+                format!("{pct:.1}%"),
+                font.clone(),
+                ink.gamma_multiply(if chosen { 1.0 } else { 0.6 }),
+            );
+        }
+    }
+
     fn close_midi_editor(&mut self) {
+        self.swing_menu = None;
         if let Some(st) = self.midi_edit.take() {
             if let Some(key) = st.down_key {
                 self.request_recorder(recorder::RecorderRequest::Audition {
@@ -6486,6 +6831,9 @@ impl IvoryApp {
             return;
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if self.swing_menu.take().is_some() {
+                return;
+            }
             self.close_midi_editor();
             return;
         }
@@ -6521,11 +6869,18 @@ impl IvoryApp {
         let over = pointer.is_some_and(|p| rect.contains(p));
         let id = self.midi_edit.as_ref().map_or(0, |m| m.id);
 
+        // ── the SWG menu, while it hangs: modal over the editor ──────────
+        if self.swing_menu.is_some() {
+            self.swing_menu_frame(ctx, pressed, pointer);
+            return;
+        }
+
         // ── the keys the editor owns while the hand is on it ─────────────
         let keys_ok = self.dialog.is_none()
             && self.menu_state.is_none()
             && !self.name_focused
-            && self.num_edit.is_none();
+            && self.num_edit.is_none()
+            && self.swing_menu.is_none();
         if keys_ok && over {
             if ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::O)) {
                 self.settings.midi_swing = !self.settings.midi_swing;
@@ -6666,11 +7021,14 @@ impl IvoryApp {
                         self.save_settings();
                     }
                     Some(H::ToolSwing) if pressed => {
-                        self.settings.midi_swing = !self.settings.midi_swing;
-                        if self.settings.midi_swing {
-                            self.settings.midi_triplet = false;
-                        }
-                        self.save_settings();
+                        // A press opens the MENU — percent plus the six
+                        // named ratios. The O key still flips swing on
+                        // and off at the standing percentage.
+                        let l = crate::midi_editor::Layout::new(rect);
+                        self.swing_menu = Some(SwingMenu {
+                            rect: swing_menu_rect(l.tool_swing, l.panel),
+                            typing: None,
+                        });
                     }
                     Some(H::ToolTriplet) if pressed => {
                         self.settings.midi_triplet = !self.settings.midi_triplet;
@@ -6679,11 +7037,11 @@ impl IvoryApp {
                         }
                         self.save_settings();
                     }
-                    Some(H::ToolGrid) if pressed => {
-                        self.settings.midi_grid_exp =
-                            (self.settings.midi_grid_exp - 1).clamp(-6, 3);
-                        self.save_settings();
-                    }
+                    // The gridbox is a READOUT: a press does nothing, by
+                    // the owner's word — the wheel over it still walks the
+                    // sizes, and the hit only exists to keep the press off
+                    // the roll behind it.
+                    Some(H::ToolGrid) => {}
                     Some(H::Ruler(t)) if pressed => {
                         // The magnet holds here too, exactly as the
                         // arrangement's ruler does.
@@ -7302,7 +7660,7 @@ impl IvoryApp {
                     // The pointer's x IS the width, clamped where the
                     // layout clamps. Persisted: a column somebody sized is
                     // a decision, not a session whim.
-                    let w = f64::from((p.x - rect.left()).clamp(120.0, rect.width() * 0.5));
+                    let w = f64::from((p.x - rect.left()).clamp(150.0, rect.width() * 0.5));
                     self.settings.arr_header_w = w;
                     self.save_settings_soon();
                 }
@@ -7602,8 +7960,23 @@ impl IvoryApp {
                 }
             }),
             clips,
-            header_w: (self.settings.arr_header_w > 0.0)
-                .then_some(self.settings.arr_header_w as f32),
+            header_w: if self.settings.arr_header_w > 0.0 {
+                Some(self.settings.arr_header_w as f32)
+            } else if self.last_band.is_positive() {
+                // The default lines the header's right edge up with the
+                // band's camera/timecode separator — one vertical, two
+                // surfaces, the owner's word.
+                Some(
+                    (crate::recorder_panel::camera_split_x(
+                        self.last_band,
+                        &self.recorder_layout_view(),
+                    ) - self.last_band.left()
+                        + 6.0)
+                        .max(150.0),
+                )
+            } else {
+                None
+            },
             time_sel: self.time_sel,
             selected_channel: self.selected_channel,
             naming: self
@@ -7916,9 +8289,21 @@ impl IvoryApp {
     ///
     /// Public because the host's `IVORY_OPEN_EDITOR` hook drives it too, and a
     /// dev hook that took a different path would exercise a path no user has.
+    /// Raise the drumpad window — the key, the bay's face and a fresh
+    /// load all come through here so the media list is never stale.
+    fn open_drumpad(&mut self) {
+        self.drumpad_open = true;
+        if !self.media_fresh {
+            self.refresh_media();
+        }
+    }
+
     pub fn open_insert_face(&mut self, strip: usize, bay: usize) {
         match self.insert(strip, bay) {
             Some(dialogs::BUILTIN_PATH) => self.open_patch_picker(strip),
+            // The drumpad's face is the drumpad: pads, kit and browser in
+            // one window, same as its key opens.
+            Some(dialogs::DRUMPAD_PATH) => self.open_drumpad(),
             Some(_) => {
                 self.request_recorder(recorder::RecorderRequest::OpenInsertEditor(strip, bay));
             }
@@ -9237,10 +9622,7 @@ impl IvoryApp {
                 if self.drumpad_open {
                     self.close_drumpad();
                 } else {
-                    self.drumpad_open = true;
-                    if !self.media_fresh {
-                        self.refresh_media();
-                    }
+                    self.open_drumpad();
                 }
             }
             K::TransposeUp => self.transpose_by(1),
@@ -9949,8 +10331,12 @@ impl IvoryApp {
                     purpose: crate::ports::FilePurpose::Project,
                 });
             }
-            DialogAction::ProjectSave => {
+            DialogAction::ProjectSave { name } => {
                 self.dialog = None;
+                self.rename_project(&name);
+                // A save a hand asked for is the session being KEPT: the
+                // name — staged or standing — is one somebody chose.
+                self.arrangement.named = true;
                 self.project_request = Some(crate::ports::ProjectRequest::Save);
             }
             DialogAction::ProjectSaveAs => {
@@ -10100,6 +10486,7 @@ impl IvoryApp {
                     // the moment the load lands. See `take_open_insert_on_load`.
                     match path.as_deref() {
                         Some(dialogs::BUILTIN_PATH) => self.open_patch_picker(strip),
+                        Some(dialogs::DRUMPAD_PATH) => self.open_drumpad(),
                         Some(_) => self.open_insert_on_load = Some((strip, at)),
                         None => {}
                     }
@@ -11134,6 +11521,7 @@ impl IvoryApp {
             && self.mixer_naming.is_none()
             && self.mixer_typing.is_none()
             && self.input_menu.is_none()
+            && self.swing_menu.is_none()
         {
             if let Some(action) = keys::pressed(&ctx, self.key_gates()) {
                 // The GUITAR toggle answers nowhere but the piano view: on
@@ -11544,6 +11932,8 @@ impl IvoryApp {
                         let mev = self.midi_edit_view(st, clip);
                         crate::midi_editor::draw(ui.painter(), r, &mev);
                         self.midi_edit_rect = Some(r);
+                        let at = ui.ctx().input(|i| i.pointer.interact_pos());
+                        self.draw_swing_menu(ui.painter(), at);
                     }
                 }
             }
@@ -16460,18 +16850,58 @@ mod tests {
             .filter(|p| !p.is_empty())
     }
 
+    /// **A new session reclaims an Untitled nobody kept.** Only a project
+    /// somebody SAVED on purpose blocks the name and steps the next
+    /// session to "Untitled 2".
+    #[test]
+    fn a_new_session_reclaims_an_unsaved_untitled() {
+        let root = std::env::temp_dir().join(format!(
+            "ivory-fresh-dir-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Nothing there: the first name.
+        assert_eq!(fresh_project_dir(&root), root.join("Untitled"));
+
+        // An auto-saved scratch stands there: reclaimed, not stepped past.
+        let scratch = root.join("Untitled");
+        let mut arr = crate::arrangement::Arrangement::default();
+        arr.save_to(&scratch.join("project.tangent"));
+        assert_eq!(fresh_project_dir(&root), scratch);
+
+        // Somebody SAVED it: the name is taken now.
+        arr.named = true;
+        arr.save_to(&scratch.join("project.tangent"));
+        assert_eq!(fresh_project_dir(&root), root.join("Untitled 2"));
+
+        // And the flag round-trips the document.
+        assert!(
+            crate::arrangement::Arrangement::load_from(
+                &scratch.join("project.tangent")
+            )
+            .named
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A fresh install lands in the same place, which is the whole point of
     /// `first_launch` being what a reset resets to.
     #[test]
     fn a_fresh_install_has_the_built_in_loaded() {
         let s = crate::settings::Settings::first_launch();
         assert_eq!(bay_of(&s, 0, 0), Some(dialogs::BUILTIN_PATH));
-        // And nothing else: one channel with the instrument, not eight of
+        // Track 8 carries the drumpad — the other out-of-the-box instrument.
+        assert_eq!(bay_of(&s, 7, 0), Some(dialogs::DRUMPAD_PATH));
+        // And nothing else: two channels with instruments, not eight of
         // something.
         assert!(
             (1..=crate::recorder::STRIPS)
-                .all(|st| (0..crate::recorder::INSERTS).all(|b| bay_of(&s, st, b).is_none())),
-            "a fresh install loaded more than the one instrument"
+                .filter(|st| *st != 7)
+                .all(|st| (0..crate::recorder::INSERTS).all(|b| bay_of(&s, st, b).is_none()))
+                && (1..crate::recorder::INSERTS).all(|b| bay_of(&s, 7, b).is_none()),
+            "a fresh install loaded more than the two instruments"
         );
         // No cartridge chosen means the one that ships. See `dx7::factory`.
         assert!(s.dx7_cartridge.is_empty());

@@ -115,6 +115,12 @@ pub const BAND_H_AT_1300: f64 = 190.0;
 /// because somebody unplugged a device, which is `docs/RECORDER-PLAN.md` §0's
 /// named failure. The camera's aspect is dealt with entirely inside
 /// [`fit_preview`], where it belongs.
+/// Where the camera preview ends — the separator the arrange header's
+/// default width lines up with, by the owner's word.
+pub fn camera_split_x(rect: Rect, view: &RecorderView<'_>) -> f32 {
+    Layout::new(rect, view).preview.right()
+}
+
 pub fn band_height(w: f32) -> f32 {
     (BAND_H_AT_1300 * w as f64 / 1300.0).trunc() as f32
 }
@@ -6216,7 +6222,7 @@ mod tests {
 const SETUP_W: (f32, f32, f32) = (0.24, 290.0, 430.0);
 /// Its height over its width. Grew with the section headers: the same
 /// seven rows of controls, plus the two bands that name their tiers.
-const SETUP_ASPECT: f32 = 0.94;
+const SETUP_ASPECT: f32 = 1.06;
 /// Rows of controls under the title.
 ///
 /// **Seven: six about the take, and Setup.** The camera and the audio input
@@ -6261,6 +6267,11 @@ struct SetupLayout {
     /// The two tier headings: AUDIO above, TAKE below — the owner's order.
     audio_head: Rect,
     take_head: Rect,
+    /// The AUDIO tier's own count-in and signature — the same settings as
+    /// the take's copies, standing where the ARRANGEMENT's rules read as
+    /// the arrangement's.
+    audio_count_in: Rect,
+    audio_sig: Rect,
 }
 
 impl SetupLayout {
@@ -6284,6 +6295,8 @@ impl SetupLayout {
         audio: Rect::NOTHING,
         audio_head: Rect::NOTHING,
         take_head: Rect::NOTHING,
+        audio_count_in: Rect::NOTHING,
+        audio_sig: Rect::NOTHING,
     };
 
     /// Hung off `anchor` — the cog — and pulled back onto `screen`.
@@ -6337,7 +6350,7 @@ impl SetupLayout {
         // merely touch share a line of pixels and every overlap test in this
         // file fails there.
         const HEAD: f32 = 0.55;
-        let units = HEAD * 2.0 + SETUP_ROWS as f32;
+        let units = HEAD * 2.0 + SETUP_ROWS as f32 + 1.0;
         let pitch = rows.height() / units;
         let mut y = rows.top();
         let mut band = |u: f32| {
@@ -6350,6 +6363,7 @@ impl SetupLayout {
         };
         let audio_head = band(HEAD);
         let r6 = band(1.0);
+        let ra2 = band(1.0);
         let take_head = band(HEAD);
         let r0 = band(1.0);
         let r1 = band(1.0);
@@ -6402,12 +6416,16 @@ impl SetupLayout {
             hear_input: slice_h(r6, 0.63, 1.00),
             audio_head,
             take_head,
+            audio_count_in: slice_h(ra2, 0.00, 0.30),
+            audio_sig: slice_h(ra2, 0.33, 0.55),
         }
     }
 
     /// Every clickable region and what it means. The popup's [`Layout::targets`].
-    fn targets(&self) -> [(Rect, Hit); 11] {
+    fn targets(&self) -> [(Rect, Hit); 13] {
         [
+            (self.audio_count_in, Hit::CycleCountIn),
+            (self.audio_sig, Hit::EditTimeSignature),
             (self.name, Hit::NameField),
             (self.close, Hit::CloseSetup),
             (self.dest, Hit::ChooseFolder),
@@ -7118,6 +7136,24 @@ pub fn draw_setup(
         p.ink,
         &p,
     );
+    // The AUDIO tier's own pair — the same two settings, standing where
+    // the ARRANGEMENT's rules read as the arrangement's: the red button
+    // counts in by this, and the signature rules the grid and the click.
+    labelled(
+        painter,
+        l.audio_count_in,
+        "COUNT-IN",
+        &count_in_text(view.count_in_bars),
+        p.ink,
+        &p,
+    );
+    {
+        let typing = typing_for(view, NumField::Meter);
+        let shown = typing
+            .clone()
+            .unwrap_or_else(|| view.time_signature.label());
+        labelled(painter, l.audio_sig, "SIG", &shown, p.ink, &p);
+    }
     {
         let typing = typing_for(view, NumField::Meter);
         let shown = typing

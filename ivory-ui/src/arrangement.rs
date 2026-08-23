@@ -274,6 +274,10 @@ pub struct Arrangement {
     /// The next clip id to hand out. Monotonic within the document, never
     /// reused — what lets an edit name the clip it means.
     pub next_id: u64,
+    /// Whether somebody SAVED this project on purpose — the Project
+    /// window's Save, or a Save As. An auto-saved scratch stays `false`,
+    /// which is what lets a new session reclaim an Untitled nobody kept.
+    pub named: bool,
     /// Keys this build does not know, kept so a newer build's document
     /// survives being opened here — the settings file's own bargain.
     pub extra: Map<String, Value>,
@@ -458,10 +462,15 @@ impl Arrangement {
             }
             seen.push(clip.id);
         }
+        let named = map
+            .shift_remove("named")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         Self {
             clips,
             desk,
             next_id,
+            named,
             extra: map,
         }
     }
@@ -478,6 +487,10 @@ impl Arrangement {
         );
         if let Some(desk) = &self.desk {
             map.insert("desk".into(), desk.to_value());
+        }
+        // Written only once true: older documents stay byte-identical.
+        if self.named {
+            map.insert("named".into(), Value::Bool(true));
         }
         map.insert(
             "clips".into(),

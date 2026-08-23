@@ -424,6 +424,29 @@ channels play back their clips and nothing else. "Ready to play" and
   run left no artifacts anywhere — stage breadcrumbs added to name the
   break on the next run.
 
+- **4.57.0 — drums on the desk, swing with a number**: the DRUMPAD is a
+  BUILT-IN PLUGIN now (`@tangent-drums`, second row of the picker) and
+  TRACK 8 ships with it loaded — a MIDI clip on its lane strikes the
+  pads (keys 36–51, the editor's roll plays the kit), the bay's face
+  opens the drumpad window, and both the fresh-install desk and an
+  untouched default template carry it (settings v17 reclaims an empty
+  track 8; a stock-seeded template heals itself). COUNT-IN and SIG sit
+  in the settings panel's AUDIO tier too, and the red button honours
+  the count-in for arrangement records (mid-count press cancels).
+  Chord ties FIXED: same-key back-to-back clip notes drain their offs
+  before the ons, so the second chord sounds. The editor's SWG chip
+  opens a MENU — Swing Percentage (one decimal, 66.7 default) plus
+  Straight (1:1) 50%, Septuplet (4:3) 57.1%, Quintuplet (3:2) 60.0%,
+  Golden Ratio (1 : 0.618) 61.8%, Triplet (Shuffle) (2:1) 66.7%,
+  Dotted (Hard) (3:1) 75.0% — the percentage IS the grid: lines,
+  magnet, note creation (long-short durations), per-note nudges and
+  pair-wide duplicates all follow it. The gridbox is a READOUT (wheel
+  still walks it; a click does nothing). New sessions land on
+  "Untitled" and RECLAIM a scratch nobody kept — only a project saved
+  on purpose (doc flag `named`) blocks the name — and the Project
+  window's title is a FIELD: type a name, press Save, the session is
+  renamed and saved as that, no panel in between.
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index
