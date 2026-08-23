@@ -49,6 +49,11 @@ pub struct Transport {
     /// that returns the playhead to 0:00 when a take ends. The audition's own
     /// falling edge is a PAUSE and deliberately not part of this.
     session_was_rolling: bool,
+    /// **The EDIT CURSOR: the position the last explicit locate chose** —
+    /// a ruler click, a lane click, a seek. Play rolls from it; STOP
+    /// returns to it, the owner's third and final ruling on the pair: the
+    /// music always starts again from where the hand last pointed.
+    cursor_s: f64,
 }
 
 impl Transport {
@@ -58,6 +63,7 @@ impl Transport {
             generation: 1,
             playing: false,
             session_was_rolling: false,
+            cursor_s: 0.0,
         }
     }
 
@@ -66,7 +72,20 @@ impl Transport {
     /// waits to be published.
     pub fn locate(&mut self, seconds: f64) {
         self.pos_s = seconds.max(0.0);
+        self.cursor_s = self.pos_s;
         self.generation += 1;
+    }
+
+    /// Move the playhead WITHOUT moving the edit cursor — the return-to-
+    /// cursor stop uses it, or stopping twice would walk the cursor.
+    fn locate_playhead(&mut self, seconds: f64) {
+        self.pos_s = seconds.max(0.0);
+        self.generation += 1;
+    }
+
+    /// Where stop returns to.
+    pub fn cursor_s(&self) -> f64 {
+        self.cursor_s
     }
 
     /// The green button. Starts the audition from the playhead; pressed while
@@ -77,12 +96,13 @@ impl Transport {
         self.playing = !self.playing;
     }
 
-    /// The square. Ends the audition if one is running and STAYS AT THE
-    /// PLAYHEAD — the owner's second ruling, reversing the first: pressing
-    /// play again carries on from where the music stopped, every time.
-    /// Going home is what clicking the ruler at 1|1|000 is for.
+    /// The square. Ends the audition and RETURNS TO THE EDIT CURSOR —
+    /// wherever the hand last pointed the playhead. Play from bar 9, stop
+    /// at bar 12: the playhead is back at 9, and play plays 9 again. Pause
+    /// is the button that stays put.
     pub fn stop(&mut self) {
         self.playing = false;
+        self.locate_playhead(self.cursor_s);
     }
 
     /// Whether the audition is running.

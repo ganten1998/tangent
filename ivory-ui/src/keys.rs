@@ -272,7 +272,7 @@ fn describe(a: KeyAction) -> &'static str {
         KeyAction::ToggleNotePreference => "sharps or flats",
         KeyAction::ToggleDrumpad => "the drumpad",
         KeyAction::StartRecording => "record the arrangement",
-        KeyAction::StopRecording => "stop recording",
+        KeyAction::StopRecording => "play / stop (to cursor)",
         KeyAction::ToggleRecorder => "the recorder",
         KeyAction::ToggleFullscreen => "fill the screen",
         KeyAction::TransposeUp => "transpose up a semitone",

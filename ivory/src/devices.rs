@@ -402,7 +402,29 @@ pub fn audio_selection(shared: &Shared) -> Option<AudioChoice> {
         // An app should not open your microphone until you say which one. The
         // band already says "no audio input selected", which is a prompt rather
         // than a fault, and a plugin-only take needs no input at all.
-        None => None,
+        None => {
+            // **Nothing chosen opens the SYSTEM OUTPUT's own box** — the
+            // owner's rule: input and output matched by default. The input
+            // side of whatever device the OS is playing through (a Scarlett
+            // both ways on their desk); no matching input, nothing opens —
+            // the bare system microphone is still never taken uninvited,
+            // and an explicit "None - record MIDI only" still stands.
+            if sel.explicit {
+                return None;
+            }
+            use cpal::traits::{DeviceTrait, HostTrait};
+            let out_name = ivory_record::audio::host()
+                .default_output_device()
+                .and_then(|d| d.name().ok())?;
+            let matched = ivory_record::audio::input_devices()
+                .ok()?
+                .into_iter()
+                .find(|d| d.key.name == out_name)?;
+            Some(AudioChoice {
+                selection: ivory_record::audio::InputSelection::Key(matched.key),
+                channels: ivory_record::audio::Picks::from_slice(&[]),
+            })
+        }
     }
 }
 
@@ -1065,28 +1087,45 @@ mod tests {
     /// So all three cases below agree now, and that is the point: absent is
     /// absent, however it got that way.
     #[test]
-    fn no_chosen_input_means_no_input_is_ever_opened() {
+    fn no_chosen_input_means_only_the_outputs_own_box_may_open() {
         use ivory_record::audio::InputSelection;
         let (mut a, shared) = AudioInputs::new();
 
-        assert_eq!(
-            audio_selection(&shared),
-            None,
-            "never asked must not open a microphone"
+        // **Never-asked opens ONLY the system output's own device** — the
+        // owner's rule: input and output matched by default. Anything else
+        // — the bare system microphone above all — stays closed.
+        let out_name = {
+            use cpal::traits::{DeviceTrait, HostTrait};
+            ivory_record::audio::host()
+                .default_output_device()
+                .and_then(|d| d.name().ok())
+        };
+        let allowed = |choice: &Option<AudioChoice>| match choice {
+            None => true,
+            Some(AudioChoice {
+                selection: InputSelection::Key(k),
+                ..
+            }) => Some(&k.name) == out_name.as_ref(),
+            Some(_) => false,
+        };
+        let first = audio_selection(&shared);
+        assert!(
+            allowed(&first),
+            "never asked opened something that is not the output's box: {first:?}"
         );
 
         a.open("").expect("ok");
-        assert_eq!(audio_selection(&shared), None, "no device means no device");
+        assert!(allowed(&audio_selection(&shared)));
 
-        // Seeded from settings, both ways round: an explicit "None"...
+        // An explicit "None - record MIDI only" still opens NOTHING.
         let (_b, restarted) = AudioInputs::new();
         restore(&restarted, None, true, &[], &[]);
         assert_eq!(audio_selection(&restarted), None);
 
-        // ...and a file from somebody who never chose. Same answer.
+        // A file from somebody who never chose follows the matching rule.
         let (_c, fresh) = AudioInputs::new();
         restore(&fresh, None, false, &[], &[]);
-        assert_eq!(audio_selection(&fresh), None);
+        assert!(allowed(&audio_selection(&fresh)));
 
         // A chosen device is still opened, which is the half that must not
         // regress while fixing the other one.

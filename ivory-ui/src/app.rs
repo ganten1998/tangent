@@ -409,6 +409,9 @@ pub struct IvoryApp {
     export_project_spec: crate::ports::ProjectExportSpec,
     /// The band's oscilloscope: the speakers' mix without the click.
     scope: crate::scope::Scope,
+    /// The TIME SELECTION, in song seconds: drawn over the lanes, offered
+    /// to the export. A ruler click clears it.
+    time_sel: Option<(f64, f64)>,
     /// Patch names of the cartridge the host has loaded, for the picker. The
     /// app never reads a `.syx`: this is pushed in after the host parses one.
     cartridge: crate::ports::CartridgeInfo,
@@ -662,6 +665,11 @@ enum ArrDrag {
     CreateMidi { lane: usize, anchor: f64 },
     /// The ruler's vertical zoom, anchored at the second under the press.
     Zoom { anchor_s: f64, last_y: f32 },
+    /// A press on the ruler, fate undecided: sideways becomes a TIME
+    /// SELECTION, up-and-down becomes the zoom, a plain release locates.
+    RulerPress { t0: f64, from: egui::Pos2 },
+    /// The selection in flight: `t0` is the anchor end.
+    TimeSel { t0: f64 },
     /// Alt-drag: the hand holds the VIEW and slides it along the song.
     Pan { last_x: f32 },
     /// The toolbar navigator: horizontal scrolls, vertical zooms, both at
@@ -681,6 +689,13 @@ struct InputMenu {
     at: egui::Pos2,
     /// Which top row's submenu is open. Hover decides; a click confirms.
     hover: Option<usize>,
+    /// The three submenus' rows, SNAPSHOTTED when the menu opens — device
+    /// and MIDI-port enumeration go through the OS and were being asked
+    /// several times a frame, which is what the owner's "VERY laggy" was.
+    rows: [Vec<String>; 3],
+    /// True while the rows list interfaces rather than inputs (no device
+    /// open at snapshot time): a device pick re-snapshots.
+    devices_offered: bool,
 }
 
 /// The menu's four top rows, in the owner's order. NONE closes the story;
@@ -1121,6 +1136,7 @@ impl IvoryApp {
             browsed_dir: None,
             export_project_spec: crate::ports::ProjectExportSpec::default(),
             scope: crate::scope::Scope::new(48_000.0),
+            time_sel: None,
             cartridge: crate::ports::CartridgeInfo::default(),
             plugin_rescan: false,
             reveal_request: None,
@@ -3609,6 +3625,11 @@ impl IvoryApp {
             && self.num_edit.is_none()
             && self.dialog.is_none()
             && !self.recorder.state.is_active()
+            // On the desk's surfaces Space belongs to the TRANSPORT; an
+            // invisible piano auditioning under the mixer was the same
+            // class of leak as the press-through the stand-down fixed.
+            && !self.mixer_open
+            && !self.arrangement_open
             && ctx.input(|i| !i.modifiers.any() && i.key_down(egui::Key::Space));
 
         if down == self.audition_held {
@@ -4423,16 +4444,30 @@ impl IvoryApp {
 
     /// Open the input menu for channel `ch`, hung from the last press.
     fn open_input_menu(&mut self, ch: usize) {
+        let rows = [
+            self.input_menu_sub(0),
+            self.input_menu_sub(1),
+            self.input_menu_sub(2),
+        ];
+        let width = self
+            .audio_setup
+            .as_ref()
+            .map(|s| usize::from(s.input_channels()))
+            .unwrap_or(0);
         self.input_menu = Some(InputMenu {
             ch,
             at: self.menu_anchor,
             hover: None,
+            rows,
+            devices_offered: width == 0,
         });
     }
 
-    /// One top row's submenu content. Mono and Stereo list the OPEN
-    /// interface's inputs — every one of them — or, with no interface
-    /// open yet, the interfaces themselves, which is the recovery door.
+    /// One top row's submenu content — called at SNAPSHOT time only, never
+    /// per frame: device and port enumeration are OS round-trips. Mono and
+    /// Stereo list the OPEN interface's inputs — every one of them — or,
+    /// with no interface open yet, the interfaces themselves, which is the
+    /// recovery door.
     fn input_menu_sub(&self, top: usize) -> Vec<String> {
         let width = self
             .audio_setup
@@ -4543,7 +4578,7 @@ impl IvoryApp {
             .collect();
         let subs = match m.hover {
             Some(top) if top < 3 => {
-                let rows = self.input_menu_sub(top);
+                let rows = &m.rows[top];
                 let sub_h = ROW * rows.len() as f32;
                 let sy = (y + ROW * top as f32).min((pane.y - sub_h).max(0.0));
                 (0..rows.len())
@@ -4570,6 +4605,24 @@ impl IvoryApp {
         // Hover must track the pointer at frame rate, not at the idle tick
         // — "VERY laggy" was the owner's word for the old menu.
         ctx.request_repaint();
+        // A device picked THROUGH the menu opens asynchronously; the moment
+        // the interface reports its width, the interface list becomes the
+        // input list — one re-snapshot, not one per frame.
+        if m.devices_offered {
+            let width = self
+                .audio_setup
+                .as_ref()
+                .map(|s| usize::from(s.input_channels()))
+                .unwrap_or(0);
+            if width > 0 {
+                m.rows = [
+                    self.input_menu_sub(0),
+                    self.input_menu_sub(1),
+                    self.input_menu_sub(2),
+                ];
+                m.devices_offered = false;
+            }
+        }
         let (tops, subs) = self.input_menu_rects(&m);
         let pointer = ctx.pointer_latest_pos().or(ctx.pointer_interact_pos());
         if let Some(pos) = pointer {
@@ -4659,9 +4712,9 @@ impl IvoryApp {
             }
         }
         if let Some(top) = m.hover {
-            let rows = self.input_menu_sub(top);
+            let rows = &m.rows[top.min(2)];
             column(painter, &subs);
-            for (r, label) in subs.iter().zip(&rows) {
+            for (r, label) in subs.iter().zip(rows) {
                 painter.text(
                     egui::Pos2::new(r.left() + 8.0, r.center().y),
                     egui::Align2::LEFT_CENTER,
@@ -6974,13 +7027,10 @@ impl IvoryApp {
                     // lanes), zoom on the drag — the zoom anchor stays on
                     // the finger, unsnapped, or the zoom would jump.
                     Some(A::Ruler(t)) => {
-                        self.request_recorder(recorder::RecorderRequest::Locate(
-                            self.arr_snap_t(t),
-                        ));
-                        self.arr_drag = Some(ArrDrag::Zoom {
-                            anchor_s: t,
-                            last_y: p.y,
-                        });
+                        // Fate decided by the first real movement — see
+                        // `ArrDrag::RulerPress`. A plain click locates and
+                        // clears any selection on release.
+                        self.arr_drag = Some(ArrDrag::RulerPress { t0: t, from: p });
                     }
                     None => {}
                 }
@@ -7035,6 +7085,31 @@ impl IvoryApp {
                 ArrDrag::CreateMidi { lane, anchor } => {
                     let to = self.arr_snap_t(t_at);
                     self.arr_pending = Some((lane, anchor.min(to), anchor.max(to)));
+                }
+                ArrDrag::RulerPress { t0, from } => {
+                    let dx = (p.x - from.x).abs();
+                    let dy = (p.y - from.y).abs();
+                    if dx > 4.0 && dx >= dy {
+                        // Sideways: the TIME SELECTION the owner asked for.
+                        let a = self.arr_snap_t(t0);
+                        let b = self.arr_snap_t(t_at);
+                        self.time_sel = Some((a.min(b), a.max(b)));
+                        self.arr_drag = Some(ArrDrag::TimeSel { t0 });
+                    } else if dy > 4.0 {
+                        // Up and down: the zoom the ruler has always had.
+                        self.request_recorder(recorder::RecorderRequest::Locate(
+                            self.arr_snap_t(t0),
+                        ));
+                        self.arr_drag = Some(ArrDrag::Zoom {
+                            anchor_s: t0,
+                            last_y: p.y,
+                        });
+                    }
+                }
+                ArrDrag::TimeSel { t0 } => {
+                    let a = self.arr_snap_t(t0);
+                    let b = self.arr_snap_t(t_at);
+                    self.time_sel = Some((a.min(b), a.max(b)));
                 }
                 ArrDrag::Zoom { anchor_s, last_y } => {
                     let dy = p.y - last_y;
@@ -7109,6 +7184,14 @@ impl IvoryApp {
             if self.arr_gesture_dirty {
                 self.arr_gesture_dirty = false;
                 self.arr_save_edits();
+            }
+            // A ruler press that never became a drag: a plain CLICK —
+            // locate there, and the old selection clears with it.
+            if let Some(ArrDrag::RulerPress { t0, .. }) = self.arr_drag {
+                self.time_sel = None;
+                self.request_recorder(recorder::RecorderRequest::Locate(
+                    self.arr_snap_t(t0),
+                ));
             }
             self.arr_drag = None;
         }
@@ -7249,6 +7332,7 @@ impl IvoryApp {
             clips,
             header_w: (self.settings.arr_header_w > 0.0)
                 .then_some(self.settings.arr_header_w as f32),
+            time_sel: self.time_sel,
             naming: self
                 .mixer_naming
                 .as_ref()
@@ -8174,7 +8258,7 @@ impl IvoryApp {
     pub fn set_export_dir(&mut self, dir: std::path::PathBuf) {
         let dir = dir.to_string_lossy().into_owned();
         self.export_project_spec.dir = dir.clone();
-        if let Some(dialogs::Dialog::ExportProject { spec }) = self.dialog.as_mut() {
+        if let Some(dialogs::Dialog::ExportProject { spec, .. }) = self.dialog.as_mut() {
             spec.dir = dir;
         }
     }
@@ -8834,12 +8918,19 @@ impl IvoryApp {
             K::StopRecording => {
                 // ANY recording — the take's machine OR the arrangement's
                 // red button — and the rolling transport besides: Space is
-                // the wide key every DAW binds to stop.
+                // the wide key every DAW binds to stop, and stop returns
+                // the playhead to the EDIT CURSOR.
                 if self.recorder.state.is_active()
                     || self.recorder.arr_recording
                     || self.recorder.playing
                 {
                     self.request_recorder(recorder::RecorderRequest::Stop);
+                } else if self.mixer_open || self.arrangement_open {
+                    // **And on the desk's surfaces, Space is PLAY too** —
+                    // idle, it rolls from the edit cursor; rolling, the arm
+                    // above stops it back there. On the piano view Space
+                    // stays the chord audition it has always been.
+                    self.request_recorder(recorder::RecorderRequest::Play);
                 }
             }
             K::ToggleRecorder => self.apply_menu_action(ctx, MenuAction::ToggleRecorder),
@@ -9617,8 +9708,13 @@ impl IvoryApp {
                 self.save_settings();
             }
             DialogAction::ProjectExportOpen => {
+                let mut spec = self.export_project_spec.clone();
+                // A stale span from an earlier session of the dialog must
+                // not outlive the selection it named.
+                spec.span = None;
                 self.dialog = Some(dialogs::Dialog::ExportProject {
-                    spec: self.export_project_spec.clone(),
+                    spec,
+                    sel: self.time_sel.filter(|(a, b)| b > a),
                 });
             }
             DialogAction::ProjectExportRun(spec) => {
@@ -12480,7 +12576,13 @@ mod tests {
     #[test]
     fn the_input_menu_binds_a_channel_and_the_chip_says_so() {
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
-        app.input_menu = Some(InputMenu { ch: 2, at: egui::Pos2::ZERO, hover: Some(2) });
+        app.input_menu = Some(InputMenu {
+            ch: 2,
+            at: egui::Pos2::ZERO,
+            hover: Some(2),
+            rows: [Vec::new(), Vec::new(), vec!["ALL".to_owned()]],
+            devices_offered: false,
+        });
         app.apply_input_pick(2, 0); // MIDI -> ALL
         assert_eq!(app.channel_kind(2), Some(recorder::ChannelKind::Midi));
         assert_eq!(app.channel_input_spec(2), "midi:all");

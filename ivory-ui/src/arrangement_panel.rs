@@ -113,6 +113,8 @@ pub struct ArrangeView<'a> {
     pub header_w: Option<f32>,
     /// A lane NAME being typed, and what is in the field so far.
     pub naming: Option<(usize, &'a str)>,
+    /// The time selection, drawn over lanes and ruler.
+    pub time_sel: Option<(f64, f64)>,
     /// The band's own wood, so the two surfaces are one instrument.
     pub wood: (u8, u8, u8),
 }
@@ -629,6 +631,14 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
 // ── painting ───────────────────────────────────────────────────────────────
 
 struct Ink {
+    /// The HEADER column and toolbar's fixed look — the desk's wood and
+    /// bone, WHATEVER the theme: the owner scoped light/dark to the lane
+    /// field and the ruler alone.
+    hdr_wood: Color32,
+    hdr_face: Color32,
+    hdr_lane: Color32,
+    /// The ruler's own strip, themed.
+    ruler: Color32,
     wood: Color32,
     face: Color32,
     engrave: Color32,
@@ -649,11 +659,20 @@ fn ink(view: &ArrangeView<'_>) -> Ink {
     // **Dark mode lives HERE (and in the theory window) — nowhere else.**
     // The default is a grey-ivory field now, the owner's ask; dark mode is
     // the near-black look the view used to wear all the time.
+    let (hr, hg, hb) = view.wood;
+    let hdr_wood = Color32::from_rgb(hr, hg, hb);
+    let hdr_face = Color32::from_rgb(0xE3, 0xD9, 0xBD);
+    let hdr_lane = Color32::from_rgb(0x20, 0x1C, 0x16);
     if view.dark_mode {
         let face = Color32::from_rgb(0xC9, 0xC0, 0xA6);
-        let (r, g, b) = view.wood;
         return Ink {
-            wood: Color32::from_rgb(r, g, b),
+            hdr_wood,
+            hdr_face,
+            hdr_lane,
+            // The dark ruler gets a strip of its own, the light view's
+            // grammar: the numbers stand on a band, not on the void.
+            ruler: Color32::from_rgb(0x2E, 0x29, 0x22),
+            wood: Color32::from_rgb(0x17, 0x14, 0x10),
             face,
             engrave: Color32::from_rgb(0x24, 0x20, 0x1A),
             faint: face.gamma_multiply(0.4),
@@ -669,16 +688,20 @@ fn ink(view: &ArrangeView<'_>) -> Ink {
             select: Color32::from_rgb(0xFF, 0xF4, 0xE0),
         };
     }
-    let face = Color32::from_rgb(0x3A, 0x34, 0x2A);
+    let face = Color32::from_rgb(0x34, 0x2E, 0x25);
     Ink {
-        // Grey-ivory ground; the lanes a shade deeper so they still read
-        // as the recessed field the clips sit in.
-        wood: Color32::from_rgb(0xD3, 0xCD, 0xBE),
+        hdr_wood,
+        hdr_face,
+        hdr_lane,
+        ruler: Color32::from_rgb(0xC6, 0xC1, 0xB1),
+        // Grey-ivory ground, DARKENED a step at the owner's ask; the lanes
+        // a shade deeper so they still read as the recessed field.
+        wood: Color32::from_rgb(0xC2, 0xBC, 0xAC),
         face,
         engrave: Color32::from_rgb(0x24, 0x20, 0x1A),
         faint: face.gamma_multiply(0.55),
-        lane: Color32::from_rgb(0xC3, 0xBD, 0xAC),
-        lane_alt: Color32::from_rgb(0xBB, 0xB5, 0xA4),
+        lane: Color32::from_rgb(0xB2, 0xAC, 0x9C),
+        lane_alt: Color32::from_rgb(0xA9, 0xA3, 0x93),
         grid: face.gamma_multiply(0.30),
         clip_ink: Color32::from_rgb(0xE8, 0xDC, 0xC0),
         playhead: Color32::from_rgb(0xD8, 0x2A, 0x3E),
@@ -729,7 +752,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     while (bar * step as f64) * px_per_s < 64.0 && step < 1 << 20 {
         step *= 2;
     }
-    painter.rect_filled(l.ruler, 0.0, p.wood);
+    painter.rect_filled(l.ruler, 0.0, p.ruler);
     let first = (view.view_start_s / (bar * step as f64)).floor().max(0.0) as u64;
     let last = ((view.view_start_s + view.view_len_s) / (bar * step as f64)).ceil() as u64;
     let font = FontId::new((l.ruler.height() * 0.55).clamp(8.0, 12.0), crate::fonts::courier());
@@ -821,6 +844,40 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     }
                     n += 1.0;
                 }
+            }
+        }
+    }
+
+    // ── the TIME SELECTION: a veil over the span, on ruler and lanes ──────
+    if let Some((t0, t1)) = view.time_sel.filter(|(a, b)| b > a) {
+        let x0 = x_of(rect, view, t0).max(l.lanes_area.left());
+        let x1 = x_of(rect, view, t1).min(l.lanes_area.right());
+        if x1 > x0 {
+            let sel = Color32::from_rgb(0xC9, 0x8B, 0x3D);
+            painter.rect_filled(
+                Rect::from_min_max(
+                    Pos2::new(x0, l.lanes_area.top()),
+                    Pos2::new(x1, l.lanes_area.bottom()),
+                ),
+                0.0,
+                Color32::from_rgba_unmultiplied(sel.r(), sel.g(), sel.b(), 26),
+            );
+            painter.rect_filled(
+                Rect::from_min_max(
+                    Pos2::new(x0, l.ruler.top()),
+                    Pos2::new(x1, l.ruler.bottom()),
+                ),
+                0.0,
+                Color32::from_rgba_unmultiplied(sel.r(), sel.g(), sel.b(), 84),
+            );
+            for x in [x0, x1] {
+                painter.line_segment(
+                    [
+                        Pos2::new(x, l.ruler.top()),
+                        Pos2::new(x, l.lanes_area.bottom()),
+                    ],
+                    Stroke::new(1.0, sel.gamma_multiply(0.8)),
+                );
             }
         }
     }
@@ -964,11 +1021,11 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         ));
     }
 
-    // ── the headers, over their own wood ──────────────────────────────────
+    // ── the headers, over their own wood — the FIXED look, both themes ────
     painter.rect_filled(
         Rect::from_min_max(rect.min, Pos2::new(l.header.right(), rect.bottom())),
         0.0,
-        p.wood,
+        p.hdr_wood,
     );
     painter.line_segment(
         [
@@ -986,7 +1043,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             let (cr, cg, cb) = STRIP_COLORS[lane.color.min(STRIP_COLORS.len() - 1)];
             Color32::from_rgb(cr, cg, cb)
         } else {
-            p.face
+            p.hdr_face
         };
         let plate = row.panel.shrink2(Vec2::new(2.0, 1.5));
         if !plate.is_positive() {
@@ -998,17 +1055,22 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             painter.rect_stroke(
                 plate,
                 2.0,
-                Stroke::new(1.0, p.face.gamma_multiply(0.3)),
+                Stroke::new(1.0, p.hdr_face.gamma_multiply(0.3)),
                 egui::StrokeKind::Inside,
             );
         }
-        let ink_on = if luma(face) > 140.0 { p.engrave } else { p.face };
+        let ink_on = if luma(face) > 140.0 { p.engrave } else { p.hdr_face };
         painter.text(
             Pos2::new(plate.left() + 4.0, plate.center().y),
             Align2::LEFT_CENTER,
             format!("{}", i + 1),
             num_font.clone(),
-            if lane.used { ink_on.gamma_multiply(0.7) } else { p.faint },
+            if lane.used {
+                ink_on.gamma_multiply(0.7)
+            } else {
+                // On the header wood, whatever the field theme says.
+                p.hdr_face.gamma_multiply(0.45)
+            },
         );
         // The input chip draws on EVERY lane — binding an input is how a
         // bare lane becomes a track — in bone whatever the theme, so the
@@ -1054,7 +1116,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             );
             let naming = view.naming.filter(|(at, _)| *at == i).map(|(_, b)| b);
             if let Some(buf) = naming {
-                painter.rect_filled(row.name, 2.0, p.face);
+                painter.rect_filled(row.name, 2.0, p.hdr_face);
                 painter.rect_stroke(
                     row.name,
                     2.0,
@@ -1202,13 +1264,13 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             if !r.is_positive() {
                 continue;
             }
-            painter.rect_filled(r, 2.0, if on { lit } else { p.lane });
+            painter.rect_filled(r, 2.0, if on { lit } else { p.hdr_lane });
             painter.text(
                 r.center(),
                 Align2::CENTER_CENTER,
                 label,
                 FontId::new((r.height() * 0.6).clamp(8.0, 12.0), crate::fonts::courier_bold()),
-                if on { p.engrave } else { p.face.gamma_multiply(0.75) },
+                if on { p.engrave } else { p.hdr_face.gamma_multiply(0.75) },
             );
         }
     }
@@ -1239,27 +1301,27 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     painter.rect_filled(
         Rect::from_min_max(rect.min, Pos2::new(l.header.right(), l.ruler.bottom())),
         0.0,
-        p.wood,
+        p.hdr_wood,
     );
     let tool = |painter: &Painter, r: Rect, on: bool| {
         if !r.is_positive() {
             return false;
         }
-        painter.rect_filled(r, 2.0, if on { p.face } else { p.lane });
+        painter.rect_filled(r, 2.0, if on { p.hdr_face } else { p.hdr_lane });
         true
     };
     if tool(painter, l.tool_met, view.metronome_on) {
         crate::recorder_panel::draw_metronome_on(
             painter,
             l.tool_met.shrink(2.0),
-            if view.metronome_on { p.engrave } else { p.face.gamma_multiply(0.7) },
-            if view.metronome_on { p.face } else { p.lane },
+            if view.metronome_on { p.engrave } else { p.hdr_face.gamma_multiply(0.7) },
+            if view.metronome_on { p.hdr_face } else { p.hdr_lane },
         );
     }
     if tool(painter, l.tool_snap, view.snap_on) {
         // The magnet: a U with its two poles, the sign every DAW uses.
         let m = l.tool_snap.shrink(3.5);
-        let ink = if view.snap_on { p.engrave } else { p.face.gamma_multiply(0.7) };
+        let ink = if view.snap_on { p.engrave } else { p.hdr_face.gamma_multiply(0.7) };
         let w = (m.width() * 0.18).clamp(1.5, 3.0);
         let cx = m.center().x;
         let radius = m.width() * 0.5 - w * 0.5;
@@ -1330,7 +1392,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             ),
         );
         if inner.is_positive() {
-            painter.rect_filled(inner, 1.5, p.face.gamma_multiply(0.8));
+            painter.rect_filled(inner, 1.5, p.hdr_face.gamma_multiply(0.8));
         }
     }
 }
@@ -1425,6 +1487,7 @@ mod tests {
         ArrangeView {
             header_w: None,
             naming: None,
+            time_sel: None,
             lanes: std::array::from_fn(|i| a_lane(i < 3)),
             clips,
             metronome_on: true,

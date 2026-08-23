@@ -352,6 +352,20 @@ channels play back their clips and nothing else. "Ready to play" and
   stems tap), LCD glass both modes; Start/End/Length cells and their
   drag retired (navigator/wheel/ruler carry the viewport).
 
+- **4.53.0 — the 4 AM five**: the input menu SNAPSHOTS its rows at open
+  (device/port enumeration was running up to three times a frame — the
+  lag); Space is PLAY on the desk surfaces and stop everywhere, and STOP
+  RETURNS TO THE EDIT CURSOR (`Transport::cursor_s` = the last explicit
+  locate; play from 9, stop at 12, the playhead is back at 9); the
+  arrange THEME is scoped to the lane field + ruler alone (headers and
+  toolbar keep the desk's fixed wood/bone; light shades darkened; dark
+  mode gets its own ruler strip); TIME SELECTION — drag sideways on the
+  ruler (vertical still zooms, a click still locates and clears), drawn
+  as an amber veil, offered in the export dialog's TIME row and honored
+  by both render paths; and with nothing chosen the input opens the
+  SYSTEM OUTPUT's own box (name-matched input side; explicit choices
+  and "MIDI only" still win; the bare system mic is still never taken).
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index

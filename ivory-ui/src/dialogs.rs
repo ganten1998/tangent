@@ -34,8 +34,12 @@ pub enum Dialog {
     /// remove it, paint it, or choose the auto-palette everybody unpainted
     /// wears.
     Track { lane: usize, removable: bool },
-    /// The project export: sources, rate, shape, formats, speed.
-    ExportProject { spec: crate::ports::ProjectExportSpec },
+    /// The project export: sources, rate, shape, formats, speed — and the
+    /// arrange view's time selection, if one stands.
+    ExportProject {
+        spec: crate::ports::ProjectExportSpec,
+        sel: Option<(f64, f64)>,
+    },
     MidiPicker {
         ports: Vec<String>,
         selected: Option<usize>,
@@ -4025,7 +4029,8 @@ pub fn show(
                 },
             )
         }
-        Dialog::ExportProject { spec } => {
+        Dialog::ExportProject { spec, sel } => {
+            let sel = *sel;
             let t = theme(dark_mode);
             show_dialog_viewport(
                 ctx,
@@ -4085,10 +4090,22 @@ pub fn show(
                                 spec.master = i != 1;
                                 spec.stems = i != 0;
                             }
-                            // Time selection arrives with the arrange-view
-                            // selection; until then the whole project is the
-                            // one honest answer.
-                            let _ = choice(ui, "TIME", &["Entire project"], 0);
+                            if let Some(range) = sel {
+                                let at = usize::from(spec.span.is_some());
+                                if let Some(i) = choice(
+                                    ui,
+                                    "TIME",
+                                    &["Entire project", "Time selection"],
+                                    at,
+                                ) {
+                                    spec.span = (i == 1).then_some(range);
+                                }
+                            } else {
+                                // No selection standing in the arrange view:
+                                // the whole project is the one honest answer.
+                                let _ = choice(ui, "TIME", &["Entire project"], 0);
+                                spec.span = None;
+                            }
                             let rates: [u32; 4] = [44_100, 48_000, 88_200, 96_000];
                             let at = rates.iter().position(|r| *r == spec.rate).unwrap_or(1);
                             if let Some(i) = choice(
