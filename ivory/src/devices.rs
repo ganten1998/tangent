@@ -412,6 +412,7 @@ pub fn audio_selection(shared: &Shared) -> Option<AudioChoice> {
             if sel.explicit {
                 return None;
             }
+            drop(sel);
             use cpal::traits::{DeviceTrait, HostTrait};
             let out_name = ivory_record::audio::host()
                 .default_output_device()
@@ -420,6 +421,16 @@ pub fn audio_selection(shared: &Shared) -> Option<AudioChoice> {
                 .ok()?
                 .into_iter()
                 .find(|d| d.key.name == out_name)?;
+            // **The match BECOMES the wanted device.** Leaving `wanted` at
+            // None while the session opens the match kept the selection
+            // stale for ever — `wanted != open` — so every frame paid a
+            // full device enumeration AND re-opened the input: the
+            // "ludicrous" lag the owner measured with their own hands.
+            // Promoted, the reconciler settles like any chosen device, the
+            // host mirrors it into settings, and the pick survives.
+            let uid = matched.key.to_setting();
+            let mut sel = lock(shared);
+            sel.wanted = Some(uid);
             Some(AudioChoice {
                 selection: ivory_record::audio::InputSelection::Key(matched.key),
                 channels: ivory_record::audio::Picks::from_slice(&[]),
@@ -822,6 +833,21 @@ fn merge_exposed(exposed: &[String], key: &str, rows: Vec<String>) -> Vec<String
         .collect();
     all.extend(rows);
     all
+}
+
+/// The DEVICE the selection wants, measured once: how many inputs its
+/// hardware carries. One enumeration — callers cache it on the reconcile
+/// edge; asking per frame is the lag the owner measured.
+pub fn wanted_device_width(shared: &Shared) -> u16 {
+    let key = {
+        let sel = lock(shared);
+        let Some(uid) = sel.wanted.clone() else {
+            return 0;
+        };
+        let (key, _) = split_channel(&uid);
+        key.to_owned()
+    };
+    device_width(&key).min(usize::from(u16::MAX)) as u16
 }
 
 /// **A multichannel interface arrives fully exposed.** The first time a
