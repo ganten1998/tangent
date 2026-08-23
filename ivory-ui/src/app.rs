@@ -818,8 +818,10 @@ enum MeDrag {
 
 /// Where the media explorer wakes up: the user's home, or the root.
 fn dirs_home() -> std::path::PathBuf {
-    std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
+    // `dirs` knows every platform's answer — HOME alone left the Windows
+    // tester's explorer starting at the drive root.
+    dirs::home_dir()
+        .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
         .unwrap_or_else(|| std::path::PathBuf::from("/"))
 }
 
@@ -949,10 +951,13 @@ fn plugin_display_name(path: &str) -> &str {
     if path == dialogs::DRUMPAD_PATH {
         return "TANGENT DRUMS";
     }
-    path.rsplit('/')
+    // Both separators: a Windows path split on '/' alone came back WHOLE,
+    // and the tester's bays read like a registry dump.
+    path.rsplit(['/', '\\'])
         .next()
         .unwrap_or(path)
         .trim_end_matches(".vst3")
+        .trim_end_matches(".VST3")
 }
 
 /// A mixer control being dragged. The band's [`Grab`], for the other surface.
@@ -6930,6 +6935,28 @@ impl IvoryApp {
         const AUDIO: [&str; 11] = [
             "wav", "aiff", "aif", "mp3", "m4a", "aac", "flac", "ogg", "opus", "caf", "wma",
         ];
+        // An EMPTY media_dir is the ROOTS view: every drive letter that
+        // answers, or the one root everything else has. Portable — the
+        // probe simply finds nothing but "/" off Windows.
+        if self.media_dir.as_os_str().is_empty() {
+            let mut roots = Vec::new();
+            for c in b'A'..=b'Z' {
+                let p = format!("{}:\\", c as char);
+                if std::path::Path::new(&p).is_dir() {
+                    roots.push(p);
+                }
+            }
+            if roots.is_empty() {
+                roots.push("/".to_owned());
+            }
+            self.media_entries = roots
+                .into_iter()
+                .map(|name| crate::drumpad_panel::MediaEntry { name, dir: true })
+                .collect();
+            self.media_scroll = 0;
+            self.media_fresh = true;
+            return;
+        }
         let mut dirs = Vec::new();
         let mut files = Vec::new();
         if let Ok(rd) = std::fs::read_dir(&self.media_dir) {
@@ -7509,6 +7536,15 @@ impl IvoryApp {
             Some(H::MediaUp) => {
                 if let Some(up) = self.media_dir.parent().map(|p| p.to_path_buf()) {
                     self.media_dir = up;
+                    self.media_sel = None;
+                    self.refresh_media();
+                } else if !self.media_dir.as_os_str().is_empty() {
+                    // Above a ROOT stands the list of roots — the tester
+                    // with a D: drive was locked inside C:. An empty
+                    // media_dir is the drives view; on one-root systems it
+                    // simply shows that root again.
+                    self.media_dir = std::path::PathBuf::new();
+                    self.media_sel = None;
                     self.refresh_media();
                 }
             }
@@ -7959,6 +7995,15 @@ impl IvoryApp {
     }
 
     /// All of the editor's input: wheel grammar, presses, drags, keys.
+    /// Whether one of the band's INLINE popups — the setup panel or an
+    /// effect's parameters — is up. They eat their presses inside
+    /// `handle_main_interaction`, but the mixer and the view passes run
+    /// AFTER it and re-read the SAME frame's click: the Windows tester
+    /// pressed SHOW and got the plugin picker from the bay underneath.
+    fn band_popup_owns(&self) -> bool {
+        self.setup_open || self.fx_open.is_some()
+    }
+
     /// Whether the open drumpad owns the pointer this frame — every other
     /// surface stands down inside its rectangle. The owner clicked a pad
     /// and watched the MIXER under it add a track: a floating window that
@@ -13788,6 +13833,7 @@ impl IvoryApp {
             .mixer_rect
             .filter(|_| {
                 !input_menu_owns
+                    && !self.band_popup_owns()
                     && (!drumpad_owns
                         || self.mixer_grab.is_some()
                         || self.mixer_reorder.is_some())
@@ -14095,7 +14141,7 @@ impl IvoryApp {
                 self.arr_drag = None;
             }
         }
-        if !input_menu_owns {
+        if !input_menu_owns && !self.band_popup_owns() {
             self.drumpad_input(&ctx);
             self.midi_editor_input(&ctx);
             self.arrangement_input(&ctx);

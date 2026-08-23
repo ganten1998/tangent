@@ -6,7 +6,7 @@
 //!
 //! # The bundle shape, which is not obvious
 //!
-//! A `.vst3` is a **directory**, not a file, on every platform since VST 3.6.10
+//! A `.vst3` is a directory bundle on macOS and often on Windows/Linux — and a PLAIN FILE for many Windows/Linux builds (reaplugs); both forms are scanned and loaded since VST 3.6.10
 //! — Steinberg made the Windows and Linux layouts match macOS's. The binary
 //! lives at:
 //!
@@ -85,6 +85,21 @@ pub fn search_paths() -> Vec<PathBuf> {
         if let Some(pf) = std::env::var_os("CommonProgramFiles") {
             out.push(PathBuf::from(pf).join("VST3"));
         }
+        // The 64-bit view from a 32-bit-shaped environment, the x86 shelf,
+        // and the literal spelling for an environment with no variables at
+        // all — plus the folder beside the exe, the portable convention.
+        if let Some(pf) = std::env::var_os("CommonProgramW6432") {
+            out.push(PathBuf::from(pf).join("VST3"));
+        }
+        if let Some(pf) = std::env::var_os("CommonProgramFiles(x86)") {
+            out.push(PathBuf::from(pf).join("VST3"));
+        }
+        out.push(PathBuf::from("C:\\Program Files\\Common Files\\VST3"));
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                out.push(dir.join("VST3"));
+            }
+        }
     }
     #[cfg(target_os = "linux")]
     {
@@ -127,50 +142,101 @@ const MAX_DIRS: usize = 4_000;
 /// folder reachable two ways (a symlink into the system directory is the common
 /// one) is walked once and listed once.
 pub fn discover_in(extra: &[PathBuf]) -> Vec<PathBuf> {
+    discover_reported(extra).found
+}
+
+/// What one scan actually did — the picker prints this when it found
+/// nothing, because "no plugins" and "the scan never looked" were
+/// pixel-identical and the Windows tester could not tell which they had.
+#[derive(Debug, Default, Clone)]
+pub struct ScanReport {
+    /// Every root tried: the path and what became of it — a count, or the
+    /// reason it was skipped.
+    pub roots: Vec<(PathBuf, Result<usize, String>)>,
+    pub found: Vec<PathBuf>,
+    /// VST2-shaped `.dll` files seen along the way. Not plugins this host
+    /// can load — but the one honest explanation for a folder somebody
+    /// SWEARS has plugins in it.
+    pub vst2_seen: usize,
+}
+
+pub fn discover_reported(extra: &[PathBuf]) -> ScanReport {
     // The user's own folders first, so a plugin they pointed at deliberately
     // shadows a copy of the same thing in a system directory.
     let mut roots: Vec<PathBuf> = extra.to_vec();
     roots.extend(search_paths());
 
+    let mut report = ScanReport::default();
     let mut out = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut opened = 0_usize;
-    let mut queue: Vec<(PathBuf, usize)> = roots.into_iter().map(|d| (d, 0)).collect();
-
-    while let Some((dir, depth)) = queue.pop() {
-        if opened >= MAX_DIRS {
-            break;
-        }
-        // Canonicalised, so a symlink loop terminates and a directory reachable
-        // by two names is not scanned twice. A path that will not canonicalise
-        // does not exist, which is the normal case for a search path on a
-        // machine that has never had that vendor's installer run.
-        let Ok(real) = dir.canonicalize() else {
-            continue;
-        };
-        if !seen.insert(real.clone()) {
-            continue;
-        }
-        let Ok(entries) = std::fs::read_dir(&real) else {
-            continue;
-        };
-        opened += 1;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension() == Some(OsStr::new("vst3")) {
-                // A bundle is a directory and is NOT descended into: the
-                // binary inside it is not another plugin, and some bundles
-                // carry a `Resources` tree deep enough to matter.
-                out.push(path);
+    let is_vst3 = |p: &Path| {
+        p.extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("vst3"))
+    };
+    let is_dll = |p: &Path| {
+        p.extension().is_some_and(|e| e.eq_ignore_ascii_case("dll"))
+    };
+    for root in roots {
+        let mut found_here = 0usize;
+        let mut fate: Option<String> = None;
+        let mut queue: Vec<(PathBuf, usize)> = vec![(root.clone(), 0)];
+        while let Some((dir, depth)) = queue.pop() {
+            if opened >= MAX_DIRS {
+                fate = Some("scan budget spent".to_owned());
+                break;
+            }
+            // Canonicalised, so a symlink loop terminates and a directory
+            // reachable by two names is not scanned twice.
+            let real = match dir.canonicalize() {
+                Ok(r) => r,
+                Err(e) => {
+                    if depth == 0 {
+                        fate = Some(format!("not found ({e})"));
+                    }
+                    continue;
+                }
+            };
+            if !seen.insert(real.clone()) {
+                if depth == 0 {
+                    fate = Some("already covered by an earlier root".to_owned());
+                }
                 continue;
             }
-            // `is_dir` follows symlinks, which is what we want: people symlink
-            // their plugin folders, and refusing to follow one would be the
-            // same bug this whole change is about.
-            if depth + 1 <= MAX_DEPTH && path.is_dir() {
-                queue.push((path, depth + 1));
+            let entries = match std::fs::read_dir(&real) {
+                Ok(e) => e,
+                Err(e) => {
+                    if depth == 0 {
+                        fate = Some(format!("unreadable ({e})"));
+                    }
+                    continue;
+                }
+            };
+            opened += 1;
+            for entry in entries.flatten() {
+                // The ORIGINAL spelling, not the canonical one: Windows'
+                // canonicalise answers verbatim `\\?\` paths, which load
+                // fine but read like line noise everywhere they are shown
+                // or saved.
+                let path = dir.join(entry.file_name());
+                if is_vst3(&path) {
+                    // A bundle is a directory and is NOT descended into.
+                    out.push(path);
+                    found_here += 1;
+                    continue;
+                }
+                if is_dll(&path) {
+                    report.vst2_seen += 1;
+                }
+                // `is_dir` follows symlinks, which is what we want.
+                if depth + 1 <= MAX_DEPTH && path.is_dir() {
+                    queue.push((path, depth + 1));
+                }
             }
         }
+        report
+            .roots
+            .push((root, fate.map_or(Ok(found_here), Err)));
     }
 
     // By canonical path, so the same bundle reached through a symlinked folder
@@ -178,7 +244,8 @@ pub fn discover_in(extra: &[PathBuf]) -> Vec<PathBuf> {
     let mut unique: HashSet<PathBuf> = HashSet::new();
     out.retain(|p| unique.insert(p.canonicalize().unwrap_or_else(|_| p.clone())));
     out.sort();
-    out
+    report.found = out;
+    report
 }
 
 /// Every `.vst3` bundle under the standard paths.
@@ -194,13 +261,43 @@ pub fn binary_in_bundle(bundle: &Path) -> Option<PathBuf> {
     }
     let dir = bundle.join("Contents").join(CONTENTS_SUBDIR);
     let entries = std::fs::read_dir(dir).ok()?;
-    // The executable is named after the bundle but not reliably so — some
-    // plugins ship a differently-cased or renamed binary. Take the first real
-    // file and ignore the `_CodeSignature` and `Resources` siblings.
-    entries
+    // Windows bundles ship resource DLLs, `.pdb`s and `moduleinfo.json`
+    // BESIDE the plugin, and `read_dir` order picked whichever came first.
+    // Ordered preference instead: the bundle's own name, then any `.vst3`,
+    // then any shared library; junk never wins.
+    let files: Vec<PathBuf> = entries
         .flatten()
         .map(|e| e.path())
-        .find(|p| p.is_file() && !p.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.')))
+        .filter(|p| {
+            p.is_file()
+                && !p
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+                && !p.extension().is_some_and(|e| {
+                    e.eq_ignore_ascii_case("pdb")
+                        || e.eq_ignore_ascii_case("json")
+                        || e.eq_ignore_ascii_case("txt")
+                })
+        })
+        .collect();
+    let own = bundle.file_name();
+    files
+        .iter()
+        .find(|p| p.file_name() == own)
+        .or_else(|| {
+            files.iter().find(|p| {
+                p.extension().is_some_and(|e| e.eq_ignore_ascii_case("vst3"))
+            })
+        })
+        .or_else(|| {
+            files.iter().find(|p| {
+                p.extension().is_some_and(|e| {
+                    e.eq_ignore_ascii_case("dll") || e.eq_ignore_ascii_case("so")
+                })
+            })
+        })
+        .or_else(|| files.first())
+        .cloned()
 }
 
 /// What a plugin class advertises about itself.
@@ -617,9 +714,18 @@ fn load(_c_path: &CString, binary: &Path) -> Result<*mut c_void, String> {
     use std::os::windows::ffi::OsStrExt;
 
     extern "system" {
-        fn LoadLibraryW(path: *const u16) -> *mut c_void;
+        fn LoadLibraryExW(
+            path: *const u16,
+            file: *mut c_void,
+            flags: u32,
+        ) -> *mut c_void;
         fn GetLastError() -> u32;
     }
+    /// The plugin's own folder joins the DLL search: bundle-form plugins
+    /// ship their dependencies BESIDE the binary, and the default search
+    /// path never looks there — ERROR_MOD_NOT_FOUND on a file that
+    /// plainly exists.
+    const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x0000_0008;
 
     let mut wide: Vec<u16> = binary.as_os_str().encode_wide().collect();
     if wide.contains(&0) {
@@ -627,7 +733,13 @@ fn load(_c_path: &CString, binary: &Path) -> Result<*mut c_void, String> {
     }
     wide.push(0);
     // SAFETY: `wide` is NUL-terminated and outlives the call.
-    let handle = unsafe { LoadLibraryW(wide.as_ptr()) };
+    let handle = unsafe {
+        LoadLibraryExW(
+            wide.as_ptr(),
+            std::ptr::null_mut(),
+            LOAD_WITH_ALTERED_SEARCH_PATH,
+        )
+    };
     if handle.is_null() {
         // SAFETY: no FFI call happens between the failure and this read.
         let code = unsafe { GetLastError() };
@@ -864,6 +976,58 @@ mod tests {
     /// Also pins the three things that make a recursive scan safe: it stops at
     /// `MAX_DEPTH`, it does not walk INTO a bundle, and a folder reachable two
     /// ways is listed once.
+    #[test]
+    fn a_single_file_vst3_is_found_and_is_its_own_binary() {
+        // Windows reaplugs ship PLAIN .vst3 DLLs, no bundle folder. The
+        // walk and the loader both take that form.
+        let dir = std::env::temp_dir().join(format!("ivory-flat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("reaeq.vst3"), b"not really a dll").unwrap();
+        std::fs::write(dir.join("REACOMP.VST3"), b"loud case").unwrap();
+        std::fs::write(dir.join("readme.txt"), b"noise").unwrap();
+        let report = discover_reported(&[dir.clone()]);
+        // Only OUR root's finds: the report also walks this machine's real
+        // plugin folders, which is the point of the report and noise here.
+        let ours: Vec<_> = report
+            .found
+            .iter()
+            .filter(|f| f.starts_with(&dir))
+            .cloned()
+            .collect();
+        assert_eq!(ours.len(), 2, "flat .vst3 files missed: {ours:?}");
+        for f in &ours {
+            assert_eq!(
+                binary_in_bundle(f).as_deref(),
+                Some(f.as_path()),
+                "a plain file is its own binary"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The bundle's binary is chosen by NAME, never by directory order —
+    /// Windows bundles ship .pdb and resource DLLs beside the plugin.
+    #[test]
+    fn the_bundle_binary_beats_its_neighbours() {
+        let dir = std::env::temp_dir().join(format!("ivory-bundle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bundle = dir.join("Foo.vst3");
+        let inner = bundle.join("Contents").join(super::CONTENTS_SUBDIR);
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("aaa-helper.dll"), b"x").unwrap();
+        std::fs::write(inner.join("Foo.pdb"), b"x").unwrap();
+        std::fs::write(inner.join("moduleinfo.json"), b"x").unwrap();
+        std::fs::write(inner.join("Foo.vst3"), b"x").unwrap();
+        let got = binary_in_bundle(&bundle).expect("no binary found");
+        assert_eq!(
+            got.file_name().and_then(|n| n.to_str()),
+            Some("Foo.vst3"),
+            "picked {got:?} over the bundle's own name"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_scan_finds_nested_bundles_without_walking_the_whole_disk() {
         let root = std::env::temp_dir().join("tangent-scan-test");

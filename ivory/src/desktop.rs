@@ -131,6 +131,9 @@ struct Recorder {
     /// asked once — `load_insert` blocks for seconds on a sampler, and a
     /// plugin that refuses must not be retried sixty times a second.
     inserts_loaded: Vec<Option<String>>,
+    /// The drumpad kit could not be handed to the audio thread last frame
+    /// (stalled callback, absent engine) — try again this one.
+    pads_retry: bool,
     audio: crate::devices::Shared,
     camera: crate::devices::Shared,
     /// Why enumeration failed last time, so the band can say "permission" and
@@ -1567,7 +1570,26 @@ impl DesktopApp {
         // rather than one frame later.
         if self.app.take_plugin_rescan() {
             let extra = self.app.plugin_folders();
-            self.app.set_plugin_list(ivory_host::discover_in(&extra));
+            let report = ivory_host::scan::discover_reported(&extra);
+            // One line per root on stderr — visible from a console launch —
+            // and one honest sentence in the band. A rescan that found 0
+            // was pixel-identical to one that never ran, and the Windows
+            // tester could not tell which they had.
+            for (root, fate) in &report.roots {
+                match fate {
+                    Ok(n) => eprintln!("vst3 scan: {} -> {n}", root.display()),
+                    Err(e) => eprintln!("vst3 scan: {} -> {e}", root.display()),
+                }
+            }
+            let mut note = format!("scan: {} VST3 found", report.found.len());
+            if report.found.is_empty() && report.vst2_seen > 0 {
+                note = format!(
+                    "scan: 0 VST3 found — {} .dll files seen are VST2, which                      Tangent does not host; ReaPlugs' VST3 build installs to                      Common Files\\VST3",
+                    report.vst2_seen
+                );
+            }
+            self.recorder.take_note = Some(note);
+            self.app.set_plugin_list(report.found);
         }
         // **The user's effect, across the effects bus.**
         //
@@ -1649,7 +1671,7 @@ impl DesktopApp {
                         let _ = self.app.take_open_insert_on_load(i / inserts, i % inserts);
                         let which = want
                             .as_deref()
-                            .and_then(|p| p.rsplit('/').next())
+                            .and_then(|p| p.rsplit(['/', '\\']).next())
                             .unwrap_or("that plugin");
                         let channel = ivory_ui::recorder::Strip::all()
                             .get(i / inserts)
@@ -1670,7 +1692,7 @@ impl DesktopApp {
 
         // **The drumpad's kit, on the same bargain**: a drop, a clear or a
         // project switch marks; this decodes and pushes the samples whole.
-        if self.app.take_drumpad_dirty() {
+        if std::mem::take(&mut self.recorder.pads_retry) || self.app.take_drumpad_dirty() {
             self.reload_pads();
         }
 
@@ -3775,10 +3797,21 @@ const PAD_WAVE_BUCKETS: usize = 240;
         // Files no pad references any more leave the cache with the edit.
         self.pad_cache
             .retain(|path, _| paths.iter().flatten().any(|p| p == path));
-        if let Some(e) = self.recorder.engine.as_mut() {
-            e.set_pad_kit(kit);
+        // **The pads only LIGHT once the kit actually LANDED.** A full ring
+        // under a stalled callback — or no engine at all — used to drop the
+        // kit silently while the ghosts drew anyway, and the Windows
+        // tester's pads struck the DX7. Undelivered = try again next frame,
+        // until the audio thread really has it.
+        let delivered = self
+            .recorder
+            .engine
+            .as_mut()
+            .is_some_and(|e| e.set_pad_kit(kit));
+        if delivered {
+            self.app.set_drumpad_status(status);
+        } else {
+            self.recorder.pads_retry = true;
         }
-        self.app.set_drumpad_status(status);
     }
 
     /// Write every loaded bay's plugin state beside the settings.
@@ -4696,6 +4729,7 @@ impl DesktopApp {
                 camera_denied,
                 engine: None,
                 engine_error: None,
+                pads_retry: false,
                 inserts_loaded: vec![
                     None;
                     (ivory_ui::recorder::STRIPS + 1 + ivory_ui::recorder::DRUM_PADS) * ivory_ui::recorder::INSERTS

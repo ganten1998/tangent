@@ -1816,8 +1816,9 @@ fn vst3_locations() -> &'static str {
          and took the default put nothing in either."
     } else if cfg!(target_os = "windows") {
         "No VST3 instruments found. Windows keeps them in %COMMONPROGRAMFILES%\\VST3 - usually \
-         C:\\Program Files\\Common Files\\VST3. An installer that offered you VST2 and took the \
-         default put nothing there."
+         C:\\Program Files\\Common Files\\VST3. A folder of .dll plug-ins is VST2, which \
+         Tangent does not host - ReaPlugs and friends ship separate VST3 installers that put \
+         .vst3 files there. Rescan from the right-click menu after installing."
     } else {
         "No VST3 instruments found. Linux keeps them in ~/.vst3 for one user and /usr/lib/vst3 for \
          everybody."

@@ -581,12 +581,34 @@ pub fn system() -> Option<String> {
 /// alternative is refusing to open any audio at all over a preference.
 pub fn host() -> cpal::Host {
     let want = system();
-    let Some(want) = want else {
-        return cpal::default_host();
-    };
-    cpal::available_hosts()
-        .into_iter()
-        .find(|id| id.name() == want)
+    if let Some(want) = want {
+        return cpal::available_hosts()
+            .into_iter()
+            .find(|id| id.name() == want)
+            .and_then(|id| cpal::host_from_id(id).ok())
+            .unwrap_or_else(cpal::default_host);
+    }
+    // **No stated preference: ASIO first where it exists.** It is the
+    // low-latency door on Windows and every tester with an interface has
+    // its driver. Decided ONCE — probing instantiates ASIO drivers, and a
+    // per-lookup probe would load them sixty times a second.
+    static PREFERRED: std::sync::OnceLock<Option<cpal::HostId>> =
+        std::sync::OnceLock::new();
+    let preferred = *PREFERRED.get_or_init(|| {
+        if !cfg!(target_os = "windows") {
+            return None;
+        }
+        let id = cpal::available_hosts()
+            .into_iter()
+            .find(|id| id.name() == "ASIO")?;
+        let h = cpal::host_from_id(id).ok()?;
+        let has = h
+            .output_devices()
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false);
+        has.then_some(id)
+    });
+    preferred
         .and_then(|id| cpal::host_from_id(id).ok())
         .unwrap_or_else(cpal::default_host)
 }
@@ -860,6 +882,20 @@ pub struct ConfigWish {
 ///
 /// `None` means "cannot read it", and that has to be a real branch rather than a
 /// fallback, because `SampleFormat` is `#[non_exhaustive]` and picking a format
+/// FTZ + DAZ on this thread (x86 only; a no-op elsewhere) — bit 15 is
+/// flush-to-zero, bit 6 denormals-are-zero. A tail decaying into
+/// subnormals runs orders of magnitude slower on x86 without them.
+#[inline]
+fn flush_denormals() {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: MXCSR is per-thread state; these bits only change how this
+    // thread rounds subnormals, which is the point.
+    unsafe {
+        use core::arch::x86_64::{_mm_getcsr, _mm_setcsr};
+        _mm_setcsr(_mm_getcsr() | 0x8040);
+    }
+}
+
 /// we cannot convert would fail at `build_input_stream` with cpal's own
 /// `expect("host supplied incorrect sample type")` — a panic inside the audio
 /// callback, on the user's machine, with no take.
@@ -2227,6 +2263,9 @@ where
         .build_input_stream::<T, _, _>(
             config,
             move |data: &[T], info: &cpal::InputCallbackInfo| {
+                // Denormals flushed here too — the monitor racks run on
+                // this thread's floats. See the output callback's twin.
+                flush_denormals();
                 let host_ns = timebase.now();
                 let device_ns = stream_instant_nanos(info.timestamp().capture);
                 source.accept(data, device_ns, host_ns);
