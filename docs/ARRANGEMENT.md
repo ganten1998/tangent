@@ -484,6 +484,36 @@ channels play back their clips and nothing else. "Ready to play" and
   menu); the welcome card says how help works now. Project/export name
   fields type in WHITE. And the heart's mother is lowercase, as asked.
 
+- **4.60.0 — the trust release**: UNDO/REDO — one shared line of time
+  across editor, arrange and mixer (whole-document moments with the
+  desk baked in, committed on saves and gesture ends; Ctrl+Z back,
+  Ctrl+Shift+Z forward, Cmd works too; refused mid-take; caps at 100).
+  COPY/PASTE for notes and clips (system chord via egui `command`;
+  paste lands at the playhead, rebased to the earliest, fresh set
+  selected). The adversarial review's 21 confirmed findings are FIXED:
+  pad offs run before hits (legato on an obeying pad no longer chokes),
+  reorder saves plugin states under the LOADED bundle and aborts on
+  unreadable sidecars (no more factory-reset plugins), auditions join
+  AFTER the take tap (never printed into a recording, and no longer
+  cached unboundedly), stale carries/marquees can't fire over the
+  drumpad, Escape peels one layer, Backspace while typing a knob value
+  no longer deletes clips, icons persist honestly (derived for old
+  docs/settings), and the name fields' wells are pinned dark under
+  their white ink. Editor: dragging a selection retriggers EVERY note,
+  narrow notes are all body (the "only the top note moved" trap),
+  arrange group-move carries the whole banded set, and the band's LCD
+  timecode drags work with the editor open. Arrange headers expose the
+  THREE BAYS (small input chip, same doors as the mixer); reorder
+  grabs any bare header/strip ground. Drumpad: pad names on the
+  editor's KEYS (inverse ink), drum-lane auditions strike the PADS
+  (the DX7 leak), the trimmer menu is big and high-res (240 buckets),
+  sliders fit, metronome only sounds under play/record (count-in
+  keeps its own voice). Meters grew ballistics (instant rise, ~0.94/
+  frame fall). Tempo types inline like every other dial. DARK MODE is
+  PER-VIEW: arrange and the editor share one wardrobe (greys light,
+  warm browns dark), D toggles the open view's own stored flag
+  (dark_mode / arr_dark / me_dark). Band default colour 97,55,58.
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index

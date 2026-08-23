@@ -4024,34 +4024,22 @@ fn draw_tempo(
     turning: bool,
     p: &Palette,
 ) {
+    // The typed digits ride the knob's OWN strip — the same entry every
+    // other dial wears. The box below was the odd one out on the desk,
+    // and the owner asked for one language.
     draw_knob(
         painter,
         l.tempo,
         &Knob {
             value: tempo_to_knob(bpm),
             label: "TEMPO",
-            // Never in the knob's own strip: the typed number gets a box of
-            // its own below, where there is room for digits and a caret.
-            typing: None,
-            turning: turning || typing.is_some(),
+            typing,
+            turning,
             reading: tempo_text(bpm),
             cap: TEMPO_CAP,
         },
         p,
     );
-    // The typing box, only while somebody is typing into it. A box that was
-    // always there would be a second tempo readout under the first.
-    let Some(typed) = typing else { return };
-    let r = l.tempo_entry;
-    if !r.is_positive() {
-        return;
-    }
-    control(painter, r, p);
-    let shown = format!("{typed}_");
-    let size = fit_text(r.shrink(r.width() * 0.08), &shown, r.height() * 0.72);
-    if size >= MIN_TEXT {
-        painter.text(r.center(), Align2::CENTER_CENTER, &shown, font(size), p.ink);
-    }
 }
 
 /// Where `bpm` sits on the knob, 0..=1.

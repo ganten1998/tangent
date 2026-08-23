@@ -46,6 +46,8 @@ pub struct LaneView<'a> {
     /// it. An unused lane draws faint and offers no header controls.
     pub used: bool,
     pub armed: bool,
+    /// The three bays' short names — empty for an empty slot.
+    pub inserts: [&'a str; crate::recorder::INSERTS],
     pub muted: bool,
     pub soloed: bool,
     /// Linear, as the mixer fader sits. The header knob is the same value.
@@ -126,6 +128,8 @@ pub struct ArrangeView<'a> {
 pub enum Hit {
     /// The NUMBER cell: the reorder handle — drag a track to another row.
     HdrNumber(usize),
+    /// One of a track's three insert BAYS — the mixer's own door, here.
+    HdrBay(usize, usize),
     /// The R dot on a lane's header.
     Arm(usize),
     Mute(usize),
@@ -241,6 +245,8 @@ pub struct HeaderRow {
     /// The input chip, under the name — every lane wears one now: binding
     /// an input is how a bare lane BECOMES a track.
     pub input: Rect,
+    /// The three insert BAYS — the mixer's slots, reachable from here.
+    pub bays: [Rect; crate::recorder::INSERTS],
     /// The circled plus, on empty lanes alone.
     pub add: Rect,
 }
@@ -261,6 +267,7 @@ impl HeaderRow {
         mute: Rect::NOTHING,
         solo: Rect::NOTHING,
         input: Rect::NOTHING,
+        bays: [Rect::NOTHING; crate::recorder::INSERTS],
         add: Rect::NOTHING,
     };
 }
@@ -469,10 +476,33 @@ impl Layout {
             Pos2::new(arm.right() + 4.0, r.top()),
             Pos2::new(pan.left() - 6.0, r.center().y - 1.0),
         );
-        let input = Rect::from_min_max(
+        // The bottom half: a SMALL input chip, then the THREE BAYS — the
+        // mixer's insert slots, exposed here because a session reaches for
+        // its instruments from the arrangement too, the owner's word.
+        let bottom = Rect::from_min_max(
             Pos2::new(arm.right() + 4.0, r.center().y + 1.0),
             Pos2::new(pan.left() - 6.0, r.bottom() - 1.0),
         );
+        let input = Rect::from_min_max(
+            bottom.min,
+            Pos2::new(
+                bottom.left() + (bottom.width() * 0.26).min(74.0),
+                bottom.bottom(),
+            ),
+        );
+        let bays = std::array::from_fn(|b| {
+            let w = (bottom.right() - input.right() - 4.0
+                - 3.0 * (crate::recorder::INSERTS as f32 - 1.0))
+                / crate::recorder::INSERTS as f32;
+            if w < 16.0 {
+                return Rect::NOTHING;
+            }
+            let x0 = input.right() + 4.0 + b as f32 * (w + 3.0);
+            Rect::from_min_max(
+                Pos2::new(x0, bottom.top()),
+                Pos2::new(x0 + w, bottom.bottom()),
+            )
+        });
         HeaderRow {
             panel: row,
             number,
@@ -488,6 +518,7 @@ impl Layout {
             mute,
             solo,
             input,
+            bays,
             add: Rect::NOTHING,
         }
     }
@@ -612,6 +643,11 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
                 return Some(hit);
             }
         }
+        for (b, r) in row.bays.iter().enumerate() {
+            if r.is_positive() && r.contains(pos) {
+                return Some(Hit::HdrBay(i, b));
+            }
+        }
     }
     if l.ruler.is_positive() && l.ruler.contains(pos) {
         return Some(Hit::Ruler(time_at(rect, view, pos.x)));
@@ -674,6 +710,9 @@ struct Ink {
     lane: Color32,
     lane_alt: Color32,
     grid: Color32,
+    /// The empty slots' ground and their etched seam.
+    empty_ground: Color32,
+    seam: Color32,
     clip_ink: Color32,
     playhead: Color32,
     arm: Color32,
@@ -684,12 +723,35 @@ struct Ink {
 }
 
 fn ink(view: &ArrangeView<'_>) -> Ink {
-    // **One palette, for now — dark mode does not toggle the field.** The
-    // owner's reference: soft grey rows, gridlines DARKER than the field,
-    // a lighter strip for the ruler. The headers and toolbar keep the
-    // desk's fixed wood and bone beside it.
-    let _ = view.dark_mode;
+    // **Two faces now, per the owner**: the greys are the LIGHT field, and
+    // dark wears the editor's warm browns — the same wardrobe the editor
+    // shares, toggled per view by D. The headers and toolbar keep the
+    // desk's fixed wood and bone beside either.
     let (hr, hg, hb) = view.wood;
+    if view.dark_mode {
+        return Ink {
+            hdr_wood: Color32::from_rgb(hr, hg, hb),
+            hdr_face: Color32::from_rgb(0xE3, 0xD9, 0xBD),
+            hdr_lane: Color32::from_rgb(0x20, 0x1C, 0x16),
+            ruler: Color32::from_rgb(0x3A, 0x33, 0x2B),
+            wood: Color32::from_rgb(0x24, 0x1F, 0x1A),
+            face: Color32::from_rgb(0xE8, 0xDC, 0xC0),
+            engrave: Color32::from_rgb(0x18, 0x14, 0x10),
+            faint: Color32::from_rgb(0xE8, 0xDC, 0xC0).gamma_multiply(0.66),
+            lane: Color32::from_rgb(0x2A, 0x26, 0x21),
+            lane_alt: Color32::from_rgb(0x2F, 0x2A, 0x24),
+            grid: Color32::from_rgb(0x12, 0x0F, 0x0C),
+            empty_ground: Color32::from_rgb(0x22, 0x1E, 0x19),
+            seam: Color32::from_rgb(0x1B, 0x17, 0x13),
+            clip_ink: Color32::from_rgb(0xE8, 0xDC, 0xC0),
+            playhead: Color32::from_rgb(0xE8, 0x3A, 0x4E),
+            arm: Color32::from_rgb(0xE0, 0x22, 0x22),
+            mute: Color32::from_rgb(0xE0, 0xA8, 0x22),
+            solo: Color32::from_rgb(0xE8, 0x3A, 0x4E),
+            meter: Color32::from_rgb(0x3D, 0xC0, 0x5A),
+            select: Color32::from_rgb(0xF2, 0xE9, 0xD2),
+        };
+    }
     Ink {
         hdr_wood: Color32::from_rgb(hr, hg, hb),
         hdr_face: Color32::from_rgb(0xE3, 0xD9, 0xBD),
@@ -705,6 +767,8 @@ fn ink(view: &ArrangeView<'_>) -> Ink {
         // and the subdivisions stay at base — dark lines on a grey field,
         // STARK enough to read against the raised lanes.
         grid: Color32::from_rgb(0x1A, 0x1A, 0x1A),
+        empty_ground: Color32::from_rgb(0x36, 0x36, 0x36),
+        seam: Color32::from_rgb(0x2C, 0x2C, 0x2C),
         clip_ink: Color32::from_rgb(0xE8, 0xDC, 0xC0),
         playhead: Color32::from_rgb(0xE8, 0x3A, 0x4E),
         arm: Color32::from_rgb(0xE0, 0x22, 0x22),
@@ -903,12 +967,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         if view.lanes.get(i).is_some_and(|lane| lane.used) {
             continue;
         }
-        painter.rect_stroke(
-            *row,
-            0.0,
-            Stroke::new(1.0, Color32::from_rgb(0x2C, 0x2C, 0x2C)),
-            egui::StrokeKind::Inside,
-        );
+        painter.rect_stroke(*row, 0.0, Stroke::new(1.0, p.seam), egui::StrokeKind::Inside);
     }
 
     // ── the TIME SELECTION: a veil over the span, on ruler and lanes ──────
@@ -1126,7 +1185,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             // The empty slot's own ground fills the WHOLE panel — the wood
             // margin around a dark plate read as two surfaces, the owner's
             // "my bad" screenshot.
-            painter.rect_filled(row.panel, 0.0, Color32::from_rgb(0x36, 0x36, 0x36));
+            painter.rect_filled(row.panel, 0.0, p.empty_ground);
         }
         let ink_on = if luma(face) > 140.0 { p.engrave } else { p.hdr_face };
         painter.text(
@@ -1228,6 +1287,20 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         // The INPUT CHIP under the name, the mixer strip's own idiom.
         let word = if lane.input.is_empty() { "NO INPUT" } else { lane.input.as_str() };
         chip(painter, row.input, word, !lane.input.is_empty());
+        // The three bays beside it — the mixer's insert slots, worded the
+        // same: the plugin's short name, or a plus for an empty seat.
+        for (b, r) in row.bays.iter().enumerate() {
+            if !r.is_positive() {
+                continue;
+            }
+            let bay_word = lane.inserts.get(b).copied().unwrap_or("");
+            chip(
+                painter,
+                *r,
+                if bay_word.is_empty() { "+" } else { bay_word },
+                !bay_word.is_empty(),
+            );
+        }
         // The two dials: VOLUME (the mixer fader as a dial) and SEND, each
         // with its number under it — a dial this small needs the readout to
         // be a control you can trust.
@@ -1516,6 +1589,7 @@ mod tests {
 
     fn a_lane(used: bool) -> LaneView<'static> {
         LaneView {
+            inserts: [""; crate::recorder::INSERTS],
             name: "KEYS",
             input: String::new(),
             color: 0,
