@@ -2827,16 +2827,24 @@ impl Renderer {
                     };
                     let s = self.frame[c] + cue;
                     out[at + c] = s;
-                    let mag = s.abs();
+                    // **The meter and the clip lamp read the PROGRAM, not
+                    // the cue.** The click and the audition join AFTER the
+                    // limiter and the master on purpose — which meant a
+                    // click atop a correctly limited mix lit the clip lamp
+                    // and the owner rightly asked why the limiter "was not
+                    // working". The lamp now answers for the mix the
+                    // limiter actually guarantees; the cue rides above it,
+                    // unmetered, on its own road.
+                    let mag = self.frame[c].abs();
                     if mag >= CLIP_LEVEL {
                         clipped = true;
                     }
                     if c == 0 {
                         peak_l = peak_l.max(mag);
-                        sumsq_l += f64::from(s) * f64::from(s);
+                        sumsq_l += f64::from(mag) * f64::from(mag);
                     } else if c == 1 {
                         peak_r = peak_r.max(mag);
-                        sumsq_r += f64::from(s) * f64::from(s);
+                        sumsq_r += f64::from(mag) * f64::from(mag);
                     }
                 }
             }
@@ -5182,8 +5190,10 @@ impl Engine {
 
     // ── metering ────────────────────────────────────────────────────────────
 
-    /// Levels for the band's meter, measured on the **device mix** — what the
-    /// player is hearing, click included.
+    /// Levels for the band's meter, measured on the **program mix** — the mix
+    /// the limiter guarantees. The click and the audition ride above it on
+    /// the cue road, unmetered, so a metronome can never light the clip lamp
+    /// over a correctly limited master.
     ///
     /// The peak is read-and-cleared, so a transient between two UI frames is
     /// never missed; the hold decays here rather than in the callback, at the

@@ -412,7 +412,7 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
         HelpView::Mixer => rows.extend([
             ("R-CLK", "channel: the track menu · loaded insert: delete / replace"),
             ("2-CLK", "rename a channel · reset a fader"),
-            ("S-ARM", "shift+arm: add a lane instead of switching to it"),
+            ("S-ARM", "shift+arm: this lane alone - every other arm stands down"),
             ("C-T", "ctrl+T: a new track"),
             ("S-1", "shift+1: the theory view"),
             ("S-2", "shift+2: the arrangement"),
@@ -420,6 +420,7 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
         HelpView::Arrange => rows.extend([
             ("DRAG", "move a clip · edges trim · corners fade"),
             ("S-DRG", "shift-drag: draw a MIDI item"),
+            ("S-EDG", "shift-drag a MIDI clip's edge: stretch it, notes and all"),
             ("2-CLK", "double-click a MIDI item: open its editor"),
             ("DEL", "delete the selected clip"),
             ("WHEEL", "zoom around the pointer"),
@@ -427,13 +428,14 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             ("A-DRG", "alt-drag empty room: move the viewport"),
             ("CA-WHL", "ctrl+alt: grid finer or coarser"),
             ("NAV", "corner box: drag left/right scrolls · up/down zooms"),
-            ("S-ARM", "shift+arm: add a lane instead of switching to it"),
+            ("S-ARM", "shift+arm: this lane alone - every other arm stands down"),
             ("C-T", "ctrl+T: a new track"),
             ("S-1", "shift+1: the theory view"),
             ("S-3", "shift+3: the mixer"),
         ]),
         HelpView::MidiEdit => rows.extend([
-            ("DRAG", "draw a note · body moves the selection · edge stretches"),
+            ("DRAG", "draw a note · body moves the selection · edge resizes"),
+            ("S-EDG", "shift-drag a note's edge: stretch the selection to the grid"),
             ("S-CLK", "shift-click: add to the selection"),
             ("C-DRG", "cmd-drag empty room: rubber-band select"),
             ("R-CLK", "erase a note"),

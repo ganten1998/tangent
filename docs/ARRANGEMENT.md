@@ -628,6 +628,31 @@ channels play back their clips and nothing else. "Ready to play" and
   fader and the master like a loaded pad would (mute/solo ignored:
   clicking a file is a question). Daniel joined the thanks card.
 
+- **4.66.0 — time bends: the document follows the tempo**: a MIDI
+  clip written at 120 was "made unusable at 180" — its seconds stood
+  still while the bars shrank. A tempo change now rescales every
+  MIDI clip (start, length, trim, notes) by old/new and re-seats
+  every audio clip's bar position (start only — audio itself cannot
+  stretch); mid-drag the knob rescales tick by tick and the doc goes
+  to disk once at release. TAP: a small chip beside the tempo knob —
+  each press one beat, the reading from the run of taps since the
+  last 2.5 s silence, capped at eight. STRETCH: shift-drag from a
+  note's edge scales the whole editor selection around its fixed far
+  end (seven notes into the space of four, the dragged edge landing
+  on the grid); shift-drag from a MIDI clip's edge in the arrange
+  view stretches the selected MIDI clips the same way, notes, trims
+  and fades riding along — audio clips stay out. ARM, the correction:
+  a plain press TOGGLES again (the exclusive default lasted one
+  build); the silent birth/bind arms stay exclusive — they were the
+  phantom multi-record — and Shift+arm is "this lane alone". VU
+  honesty: the clip lamp and the band meter read the PROGRAM mix —
+  the click and audition join after the limiter by design and used to
+  light the lamp over a correctly limited master. Strip-meter fall is
+  time-based now (32 dB/s at any frame rate; it rode the repaint
+  clock before). Empty arrange slots wear a visible channel-shaped
+  border in both palettes (the etched seam was darker than the dark
+  header wood — invisible exactly where it was needed).
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index
