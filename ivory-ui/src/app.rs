@@ -296,6 +296,9 @@ pub struct IvoryApp {
     /// modifier. Refreshed at the top of `paint`, read where the hit
     /// handlers no longer have a `ctx` in reach.
     shift_down: bool,
+    /// Whether ALT is down this frame — the insert bays' ERASER. Same
+    /// refresh, same reason.
+    alt_down: bool,
     /// The open project's DOCUMENT — the arrangement, in memory. Loaded by
     /// `bootstrap_project`, saved atomically on every edit.
     arrangement: crate::arrangement::Arrangement,
@@ -1290,6 +1293,7 @@ impl IvoryApp {
             mixer_fx_menu: None,
             armed,
             shift_down: false,
+            alt_down: false,
             arrangement: crate::arrangement::Arrangement::default(),
             project_doc: std::path::PathBuf::new(),
             clips_dirty: false,
@@ -3113,6 +3117,7 @@ impl IvoryApp {
             fret_note_names: self.settings.show_fret_note_names,
             guitar_intervals: self.settings.guitar_intervals,
             recorder_first: self.menu_over_recorder && self.settings.show_recorder,
+            global_only: false,
             staff_first: self.menu_over_staff,
             staff_key: self.settings.staff_key,
             metronome_on: self.settings.metronome_on,
@@ -3140,6 +3145,15 @@ impl IvoryApp {
             global_pos,
             self.monitor_size,
         ));
+    }
+
+    /// The GLOBAL cut of the menu — what a right-click on the arrangement
+    /// or the MIDI editor opens: Project, Plugin folders, MIDI input,
+    /// Window, Colors, and the tail. See `MenuView::global_only`.
+    fn open_global_menu_at(&mut self, ctx: &egui::Context, global_pos: Pos2) {
+        let mut view = self.menu_view();
+        view.global_only = true;
+        self.menu_state = Some(MenuState::open(ctx, view, global_pos, self.monitor_size));
     }
 
     /// Colour of the supporter heart, or None when it should not be drawn.
@@ -8198,6 +8212,10 @@ impl IvoryApp {
         if self.midi_edit.is_none() {
             return;
         }
+        if self.menu_state.is_some() {
+            // The menu owns the pointer, exactly as on the arrangement.
+            return;
+        }
         // A drag that STARTED on the roll keeps its pointer across the
         // drumpad; only fresh presses stand down.
         if self.drumpad_claims_pointer(ctx)
@@ -8711,6 +8729,28 @@ impl IvoryApp {
                 .midi_edit
                 .as_ref()
                 .is_some_and(|m| matches!(m.drag, Some(MeDrag::Marquee)));
+            // A marquee that never moved was a right CLICK on empty roll:
+            // the GLOBAL menu answers, the selection stands untouched.
+            if took_marquee {
+                let still = self
+                    .midi_edit
+                    .as_ref()
+                    .and_then(|m| m.marquee)
+                    .is_some_and(|(a, b)| (b - a).length() < 4.0);
+                // The RIGHT button only: a motionless cmd-click (the other
+                // marquee) keeps meaning "clear the selection".
+                let sec_rel = ctx.input(|i| i.pointer.secondary_released());
+                if still && sec_rel {
+                    if let Some(st) = self.midi_edit.as_mut() {
+                        st.marquee = None;
+                        st.drag = None;
+                    }
+                    if let Some(p) = pointer {
+                        self.open_global_menu_at(ctx, p);
+                    }
+                    return;
+                }
+            }
             if took_marquee {
                 let picked: Vec<usize> = {
                     let st = self.midi_edit.as_ref().unwrap();
@@ -8746,6 +8786,21 @@ impl IvoryApp {
                     st.marquee = None;
                 }
             }
+            // **A motionless click on the GRIDBOX steps one finer** — the
+            // counterpart of the right button's coarser. The drag is the
+            // ranging gesture; the click is the notch.
+            if let Some(MeDrag::GridStep { from_y, start }) = self
+                .midi_edit
+                .as_ref()
+                .and_then(|m| m.drag.clone())
+            {
+                let unmoved = self.settings.midi_grid_exp == start
+                    && pointer.is_some_and(|p| (p.y - from_y).abs() < 4.0);
+                if unmoved {
+                    self.settings.midi_grid_exp = (start - 1).clamp(-6, 3);
+                    self.save_settings_soon();
+                }
+            }
             // Every sounding preview lets go.
             let mut quiet: Vec<u8> = self
                 .midi_edit
@@ -8779,6 +8834,11 @@ impl IvoryApp {
     }
 
     fn arrangement_input(&mut self, ctx: &egui::Context) {
+        if self.menu_state.is_some() {
+            // The menu owns the pointer; a press elsewhere dismisses it in
+            // `menu::show` without also locating the playhead underneath.
+            return;
+        }
         if self.drumpad_claims_pointer(ctx) && self.arr_drag.is_none() {
             return;
         }
@@ -8857,6 +8917,12 @@ impl IvoryApp {
                     }
                     self.arr_band = Some((p, p));
                     self.arr_drag = Some(ArrDrag::ClipBand);
+                } else {
+                    // Nothing claims this press — the ruler, the toolbar's
+                    // quiet ground, the margins. The GLOBAL menu answers,
+                    // exactly as it does over the piano, minus every row
+                    // that is about some other surface.
+                    self.open_global_menu_at(ctx, p);
                 }
             }
         }
@@ -9425,6 +9491,14 @@ impl IvoryApp {
             // **The band lands**: every clip it crosses joins the set.
             if matches!(self.arr_drag, Some(ArrDrag::ClipBand)) {
                 if let Some((a, b)) = self.arr_band.take() {
+                    // Never moved: that was a right CLICK on the lanes, and
+                    // a click asks for the menu — the band gesture is the
+                    // DRAG.
+                    if (b - a).length() < 4.0 {
+                        self.arr_drag = None;
+                        self.open_global_menu_at(ctx, b);
+                        return;
+                    }
                     let band = egui::Rect::from_two_pos(a, b);
                     let picked: Vec<u64> = {
                         let clips = self.arr_clip_views();
@@ -9486,6 +9560,16 @@ impl IvoryApp {
                     self.arr_save_edits();
                 }
             }
+            // A motionless click on the gridbox: one step FINER, the right
+            // button's mirror.
+            if let Some(ArrDrag::GridStep { from_y, start }) = self.arr_drag {
+                let unmoved = self.settings.arr_grid_exp == start
+                    && pointer.is_some_and(|p| (p.y - from_y).abs() < 4.0);
+                if unmoved {
+                    self.settings.arr_grid_exp = (start - 1).clamp(-5, 3);
+                    self.save_settings_soon();
+                }
+            }
             if self.arr_gesture_dirty {
                 self.arr_gesture_dirty = false;
                 self.arr_save_edits();
@@ -9517,7 +9601,17 @@ impl IvoryApp {
                 i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)
             })
         {
-            self.arr_delete_selected();
+            // Clips first — they are the finer selection. With no clip
+            // standing, the SELECTED TRACK answers Delete: the owner's
+            // ask, same as the Track menu's Remove.
+            if self.arr_selected.is_none() && self.arr_multi.is_empty() {
+                if let Some(n) = self.selected_channel.filter(|n| self.channel_used(*n)) {
+                    self.remove_channel(n);
+                    self.selected_channel = None;
+                }
+            } else {
+                self.arr_delete_selected();
+            }
         }
         // **Copy and paste, the system's own chord** — which the winit
         // layer delivers as `Event::Copy` / `Event::Paste`, never as a
@@ -10052,6 +10146,17 @@ impl IvoryApp {
     }
 
     pub fn open_insert_face(&mut self, strip: usize, bay: usize) {
+        // **Alt+click EMPTIES the bay.** One gesture, both views (and the
+        // pads' chips, which come through this same door): the loaded
+        // insert leaves and the slot is free — the FX menu's Delete without
+        // the menu. An empty bay under Alt does nothing at all: an eraser
+        // that opened pickers would be worse than no eraser.
+        if self.alt_down {
+            if self.insert(strip, bay).is_some() {
+                self.set_insert(strip, bay, None);
+            }
+            return;
+        }
         match self.insert(strip, bay) {
             Some(dialogs::BUILTIN_PATH) => self.open_patch_picker(strip),
             // The drumpad's face is the drumpad: pads, kit and browser in
@@ -10277,6 +10382,19 @@ impl IvoryApp {
                 self.dialog = Some(dialogs::Dialog::Project {
                     name: self.project_name(),
                 });
+            }
+            Hit::PluginFolders => {
+                // The menu's "Add a Folder...", from the cog. The pick
+                // lands through the same DirRequest door and the scan
+                // follows it.
+                if self.caps.native_file_dialogs {
+                    self.native_panel_up = true;
+                    self.dir_request = Some(crate::ports::DirRequest {
+                        start_at: None,
+                        title: "Where else should Tangent look for VST3 plugins?".to_owned(),
+                        purpose: crate::ports::DirPurpose::PluginFolder,
+                    });
+                }
             }
             Hit::CloseSetup => self.setup_open = false,
             // **Requested, not done here.** The message belongs to the host —
@@ -13238,6 +13356,7 @@ impl IvoryApp {
     fn paint(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.shift_down = ctx.input(|i| i.modifiers.shift);
+        self.alt_down = ctx.input(|i| i.modifiers.alt);
 
         // **The Welcome card waits for the splash.** It is a separate OS
         // window and the splash is a layer inside this one, so the layer
@@ -14211,6 +14330,23 @@ impl IvoryApp {
                 })
             {
                 self.add_track_first_free();
+            }
+            // **Delete: the SELECTED CHANNEL leaves the desk** — the Track
+            // menu's Remove, on the key, as in the arrangement.
+            if self.dialog.is_none()
+                && self.menu_state.is_none()
+                && self.mixer_typing.is_none()
+                && self.mixer_naming.is_none()
+                && self.num_edit.is_none()
+                && !self.name_focused
+                && ctx.input(|i| {
+                    i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)
+                })
+            {
+                if let Some(n) = self.selected_channel.filter(|n| self.channel_used(*n)) {
+                    self.remove_channel(n);
+                    self.selected_channel = None;
+                }
             }
             // **What is being typed into a decibel field.**
             //

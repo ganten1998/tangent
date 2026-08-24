@@ -666,6 +666,23 @@ channels play back their clips and nothing else. "Ready to play" and
   (fh≥40) and vanished under full window size — it has its own floor
   now, a face worth naming.
 
+- **4.68.0 — the checklist round**: RIGHT-CLICK ON THE ARRANGEMENT
+  (and the MIDI editor) opens the GLOBAL cut of the app menu —
+  Project, Plugin folders, MIDI input, Window, Colors and the tail;
+  nothing about the piano, the theory band or the neck. A motionless
+  right click on the lanes or the empty roll asks for it; the drag
+  gestures (marquee, erase) are untouched, and a menu-content test
+  pins the cut. DELETE takes the SELECTED TRACK in arrange (when no
+  clip is selected) and in the mixer — the Track menu's Remove, on
+  the key. ALT+CLICK on any insert bay EMPTIES it — mixer, arrange
+  headers, and the pads' chips, one gesture through the one door
+  (`open_insert_face`). The GRIDBOX answers a plain left CLICK with
+  one step finer (right click coarser, drag still ranges) in both
+  views. The empty-slot borders slimmed to a half-point hairline. The
+  settings cog's AUDIO tier carries two new doors on the count-in
+  row's free half: PROJECT (the project dialog) and PLUGINS
+  (add-a-folder picker).
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index

@@ -1180,6 +1180,9 @@ pub enum Hit {
     /// band, and a control that exists in exactly one place needs no rule about
     /// which place wins.
     ShowAudioStatus,
+    /// The AUDIO tier's door to the plugin-folder picker — the menu's
+    /// "Add a Folder...", one click from the cog.
+    PluginFolders,
     ToggleCountInInTake,
     ToggleHideElapsed,
     /// Hear the live input through the monitors. **Session-only, never
@@ -1331,6 +1334,7 @@ impl Hit {
             Hit::CloseSetup => "Done",
             Hit::DismissMessage => "Dismiss",
             Hit::ShowAudioStatus => "Setup: the audio system, devices, rate and buffer",
+            Hit::PluginFolders => "Add a VST3 folder - Tangent rescans on the pick",
             Hit::ToggleCountInInTake => "Record the count-in into the take",
             Hit::ToggleHideElapsed => "Hide the elapsed time",
             Hit::ToggleInputMonitor => "Hear the live input",
@@ -6392,6 +6396,10 @@ struct SetupLayout {
     /// the arrangement's.
     audio_count_in: Rect,
     audio_sig: Rect,
+    /// The AUDIO tier's two doors, on the same row's free half: the
+    /// PROJECT dialog and the plugin folders — the owner's cog additions.
+    project_row: Rect,
+    plugin_folders: Rect,
 }
 
 impl SetupLayout {
@@ -6417,6 +6425,8 @@ impl SetupLayout {
         take_head: Rect::NOTHING,
         audio_count_in: Rect::NOTHING,
         audio_sig: Rect::NOTHING,
+        project_row: Rect::NOTHING,
+        plugin_folders: Rect::NOTHING,
     };
 
     /// Hung off `anchor` — the cog — and pulled back onto `screen`.
@@ -6538,14 +6548,20 @@ impl SetupLayout {
             take_head,
             audio_count_in: slice_h(ra2, 0.00, 0.30),
             audio_sig: slice_h(ra2, 0.33, 0.55),
+            // The row's free half: the two doors the owner asked the cog
+            // to carry — the Project dialog and the plugin folders.
+            project_row: slice_h(ra2, 0.58, 0.77),
+            plugin_folders: slice_h(ra2, 0.80, 1.00),
         }
     }
 
     /// Every clickable region and what it means. The popup's [`Layout::targets`].
-    fn targets(&self) -> [(Rect, Hit); 13] {
+    fn targets(&self) -> [(Rect, Hit); 15] {
         [
             (self.audio_count_in, Hit::CycleCountIn),
             (self.audio_sig, Hit::EditTimeSignature),
+            (self.project_row, Hit::ProjectMenu),
+            (self.plugin_folders, Hit::PluginFolders),
             (self.name, Hit::NameField),
             (self.close, Hit::CloseSetup),
             (self.dest, Hit::ChooseFolder),
@@ -7274,6 +7290,10 @@ pub fn draw_setup(
             .unwrap_or_else(|| view.time_signature.label());
         labelled(painter, l.audio_sig, "SIG", &shown, p.ink, &p);
     }
+    // The two doors the cog carries now: the Project dialog and the
+    // plugin folders — the menu's rows, reachable without the menu.
+    labelled(painter, l.project_row, "PROJECT", "Open...", p.ink, &p);
+    labelled(painter, l.plugin_folders, "PLUGINS", "Folders...", p.ink, &p);
     {
         let typing = typing_for(view, NumField::Meter);
         let shown = typing
