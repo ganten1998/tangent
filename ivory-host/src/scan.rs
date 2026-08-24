@@ -150,6 +150,12 @@ const MAX_DIRS: usize = 4_000;
 /// the plugin in the unlabelled group at the bottom — the same place a
 /// pre-3.7 plugin with no moduleinfo at all lands.
 pub fn vendor_of(bundle: &Path) -> Option<String> {
+    vendor_from_moduleinfo(bundle)
+        .or_else(|| vendor_from_parent_dir(bundle))
+        .or_else(|| vendor_from_plist(bundle))
+}
+
+fn vendor_from_moduleinfo(bundle: &Path) -> Option<String> {
     let text = ["Contents/Resources/moduleinfo.json", "Contents/moduleinfo.json"]
         .iter()
         .find_map(|rel| std::fs::read_to_string(bundle.join(rel)).ok())?;
@@ -161,6 +167,44 @@ pub fn vendor_of(bundle: &Path) -> Option<String> {
     let close = rest[open..].find('"')?;
     let vendor = rest[open..open + close].trim();
     (!vendor.is_empty()).then(|| vendor.to_owned())
+}
+
+/// The SDK's own layout convention: `VST3/Vendor/Thing.vst3` (with an
+/// optional category level handled by the walk). A bundle whose parent is
+/// not the VST3 root itself, while its grandparent IS, sits in a folder
+/// somebody named after the maker — "Applied Acoustics Systems" on the
+/// owner's disk. Measured there: 48 of 161 bundles answer this way.
+fn vendor_from_parent_dir(bundle: &Path) -> Option<String> {
+    let parent = bundle.parent()?;
+    let name = parent.file_name()?.to_str()?;
+    let grandparent = parent.parent()?.file_name()?.to_str()?;
+    (!name.eq_ignore_ascii_case("vst3") && grandparent.eq_ignore_ascii_case("vst3"))
+        .then(|| name.to_owned())
+}
+
+/// The macOS bundle identifier's second segment — `com.arturia.acidv` says
+/// Arturia. XML plists only: a binary plist would need a real parser, and
+/// this feeds a GROUPING, not a fact anybody acts on. Measured on the
+/// owner's disk this catches the hundred bundles the first two miss.
+fn vendor_from_plist(bundle: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(bundle.join("Contents/Info.plist")).ok()?;
+    let key = text.find("<key>CFBundleIdentifier</key>")?;
+    let after = &text[key..];
+    let open = after.find("<string>")? + "<string>".len();
+    let close = after[open..].find("</string>")?;
+    let ident = &after[open..open + close];
+    let mut parts = ident.split('.');
+    let tld = parts.next()?;
+    if !matches!(tld, "com" | "org" | "net" | "de" | "uk" | "se" | "jp" | "co" | "io") {
+        return None;
+    }
+    let raw = parts.next()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let mut c = raw.chars();
+    let first = c.next()?;
+    Some(first.to_uppercase().collect::<String>() + c.as_str())
 }
 
 pub fn discover_in(extra: &[PathBuf]) -> Vec<PathBuf> {
@@ -1109,3 +1153,4 @@ mod tests {
         assert_eq!(found, discover());
     }
 }
+

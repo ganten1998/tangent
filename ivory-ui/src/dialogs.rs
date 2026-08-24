@@ -1799,7 +1799,10 @@ fn plugin_row(entry: &PluginEntry, current: Option<&str>) -> String {
     } else {
         ' '
     };
-    if entry.vendor.trim().is_empty() {
+    let builtin = entry.path == BUILTIN_PATH || entry.path == DRUMPAD_PATH;
+    if !builtin || entry.vendor.trim().is_empty() {
+        // The vendor is the FOLDER heading now, not a suffix on every row
+        // under it — the owner's ruling.
         format!("{mark} {}", entry.name)
     } else {
         format!("{mark} {}   ({})", entry.name, entry.vendor)
@@ -3283,10 +3286,39 @@ pub fn show(
                                     {
                                         *selected = None;
                                     }
+                                    let mut open_folder: Option<&str> = None;
                                     for &i in &visible {
                                         let Some(entry) = plugins.get(i) else {
                                             continue;
                                         };
+                                        // **The vendor is a FOLDER.** The list
+                                        // is sorted by vendor, so a heading at
+                                        // every change of group reads as the
+                                        // directory tree the owner asked for;
+                                        // the unnamed tail gathers under
+                                        // "Other". The two built-ins stand
+                                        // above every folder, unlabelled.
+                                        let builtin = entry.path == BUILTIN_PATH
+                                            || entry.path == DRUMPAD_PATH;
+                                        if !builtin {
+                                            let folder: &str = if entry.vendor.trim().is_empty()
+                                            {
+                                                "Other"
+                                            } else {
+                                                entry.vendor.as_str()
+                                            };
+                                            if open_folder != Some(folder) {
+                                                open_folder = Some(folder);
+                                                ui.add_space(5.0);
+                                                ui.label(
+                                                    RichText::new(format!(
+                                                        "\u{25BE} {folder}"
+                                                    ))
+                                                    .font(bold(11.0))
+                                                    .color(faint),
+                                                );
+                                            }
+                                        }
                                         let resp = ui.selectable_label(
                                             *selected == Some(i),
                                             RichText::new(plugin_row(entry, current.as_deref()))
@@ -7195,9 +7227,11 @@ mod tests {
                     plugin_row(&plugins[0], None),
                     format!("  {BUILTIN_NAME}   (built in, six-operator FM)")
                 );
+                // The vendor is a FOLDER heading now, never a row suffix —
+                // the owner's ruling. A scanned plugin's row is bare.
                 assert_eq!(
                     plugin_row(&entry("/x/A.vst3", "A", "Arturia"), None),
-                    "  A   (Arturia)"
+                    "  A"
                 );
             }
             _ => panic!("plugin_picker built some other dialog"),

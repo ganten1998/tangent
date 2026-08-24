@@ -767,6 +767,21 @@ channels play back their clips and nothing else. "Ready to play" and
   `.metadata_never_index` so Spotlight leaves it alone (2.x-era
   artifacts archived to ~/Dropbox/Archive/tangent-dist-legacy/).
 
+- **4.74.0 — folders, and the take on screen whole**: while a take
+  rolls the window GROWS to hold all of it — the viewport and the
+  growing clip scale together, engaging only when the take crosses
+  the right edge. Closing the MIDI editor spends the click on EVERY
+  path now (the latch moved into `close_midi_editor` — the X button
+  sits over the lanes and its press was still landing as a locate).
+  The plugin picker draws real VENDOR FOLDERS: a heading per maker,
+  plugin rows bare underneath, the unnamed gathered under "Other" —
+  and `vendor_of` grew a composite: moduleinfo.json, then the
+  SDK's own `VST3/Vendor/…` folder convention, then the macOS bundle
+  identifier — measured 161 of 161 named on the owner's disk. The
+  detection COUNT is the format, not a bug: the scan finds every
+  VST3 on the machine; REAPER's longer list is its AU (93 here) and
+  VST2 (91) backends, which a VST3-only host cannot load.
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index
