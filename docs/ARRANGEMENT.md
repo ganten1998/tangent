@@ -789,6 +789,19 @@ channels play back their clips and nothing else. "Ready to play" and
   filter overrides the collapse: a search that found things inside
   closed folders must not read as a search that found nothing.
 
+- **4.76.0 — leave without running anyone else's destructors**: the
+  owner's machine-wide audio wedge, root-caused from the crash logs:
+  quitting Tangent with Kontakt 8 loaded ran Kontakt's Qt static
+  destructors in the atexit phase, which SEGFAULT (`~QApplication` →
+  `qAccessibleCleanup`) — the process died mid-teardown, coreaudiod
+  saw a force-killed client holding the interface, and every app's
+  audio wedged until `killall coreaudiod`. Tangent's own teardown was
+  already clean (engine dropped, streams released, everything saved
+  before `run_native` returns) — so `main` now flushes stdio and
+  leaves via `_exit(0)`, skipping the atexit chain where loaded
+  plugins' static destructors detonate. Every serious host does the
+  same, for the same reason.
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index
