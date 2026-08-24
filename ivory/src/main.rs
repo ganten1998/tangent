@@ -370,5 +370,20 @@ fn main() {
     use std::io::Write as _;
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
-    unsafe { libc::_exit(0) }
+    #[cfg(unix)]
+    unsafe {
+        libc::_exit(0)
+    }
+    // Windows: `TerminateProcess`, which skips even the per-DLL detach
+    // routines where a plugin's CRT would run its statics. (`libc` does
+    // not expose `_exit` on Windows targets, and `ExitProcess` still
+    // walks DllMain detach.)
+    #[cfg(windows)]
+    unsafe {
+        windows_sys::Win32::System::Threading::TerminateProcess(
+            windows_sys::Win32::System::Threading::GetCurrentProcess(),
+            0,
+        );
+        std::process::exit(0)
+    }
 }
