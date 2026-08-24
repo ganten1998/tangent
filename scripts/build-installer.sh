@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Package Tangent — the app and the plugin — into one installer per platform,
-# with the two as separately selectable components.
+# Package Tangent — the STANDALONE, one installer per platform. The VST3
+# plugin is RETIRED (2026-08-24, the owner's ruling): Tangent is a DAW and
+# does not load through another; there is one option and it is the app.
 #
 #   scripts/build-installer.sh macos      # dist/Tangent-<ver>-macos.pkg
 #   scripts/build-installer.sh windows    # dist/Tangent-<ver>-windows-setup.exe
@@ -10,10 +11,8 @@
 # It CONSUMES artifacts, it does not build them. Run these first:
 #
 #   scripts/build-macos.sh                 -> dist/Tangent.app        (signed, notarized)
-#   scripts/build-plugin.sh macos          -> dist/plugin/macos/Tangent.vst3
 #   scripts/build-cross.sh                 -> dist/tangent-<ver>-windows-x86_64/
-#   scripts/build-plugin.sh windows        -> dist/plugin/windows/Tangent.vst3
-#   scripts/build-linux-remote.sh <host>   -> both Linux artifacts
+#   scripts/build-linux-remote.sh <host>   -> the Linux tarball
 #
 # Consuming rather than building is deliberate: the macOS app is signed AND
 # notarized by its own script, and rebuilding it here would either duplicate
@@ -60,14 +59,11 @@ need() {
 # ── macOS ───────────────────────────────────────────────────────────────────
 build_macos() {
   local app="dist/$NAME.app"
-  local vst3="dist/plugin/macos/$NAME.vst3"
   need "$app"  "run scripts/build-macos.sh first"
-  need "$vst3" "run scripts/build-plugin.sh macos first"
 
   echo "==> $NAME $VERSION — macOS installer"
   rm -rf "$WORK/macos"
-  mkdir -p "$WORK/macos/pkgs" "$WORK/macos/root-app" "$WORK/macos/root-vst3" \
-           "$WORK/macos/resources"
+  mkdir -p "$WORK/macos/pkgs" "$WORK/macos/root-app" "$WORK/macos/resources"
 
   # `ditto` rather than `cp -R`, and STRIPPED rather than faithful.
   #
@@ -86,14 +82,13 @@ build_macos() {
   # extracts a tree with zero of them, which is what the installer writes.
   # Verified, because they look exactly like litter until you check.)
   ditto --norsrc --noextattr --noacl "$app"  "$WORK/macos/root-app/$NAME.app"
-  ditto --norsrc --noextattr --noacl "$vst3" "$WORK/macos/root-vst3/$NAME.vst3"
+
   find "$WORK/macos" \( -name '._*' -o -name '.DS_Store' \) -delete
 
   # ...and prove it, because a broken signature inside a package is invisible
   # until someone downloads it. `spctl` is the one that would catch a lost
   # staple, which `codesign` alone would not.
   codesign --verify --strict "$WORK/macos/root-app/$NAME.app"
-  codesign --verify --strict "$WORK/macos/root-vst3/$NAME.vst3"
   if ! spctl --assess --type execute "$WORK/macos/root-app/$NAME.app" >/dev/null 2>&1; then
     echo "!!  the staged app is not accepted by Gatekeeper — did build-macos.sh notarize?"
   fi
@@ -116,24 +111,11 @@ build_macos() {
     --install-location /Applications \
     "$WORK/macos/pkgs/Tangent-app.pkg" >/dev/null
 
-  # The VST3 is a BNDL bundle, and pkgbuild does NOT add BundleIsRelocatable
-  # to those, so it needs no component plist. Verified by --analyze: the key
-  # is simply absent, and PlistBuddy refuses to set it.
-  pkgbuild --root "$WORK/macos/root-vst3" \
-    --identifier com.ganten.tangent.vst3 \
-    --version "$VERSION" \
-    --install-location "/Library/Audio/Plug-Ins/VST3" \
-    "$WORK/macos/pkgs/Tangent-vst3.pkg" >/dev/null
-
   cp installer/macos/welcome.html installer/macos/conclusion.html "$WORK/macos/resources/"
-  # MIT for the app, GPLv3 for the plugin, and the installer offers both — so
-  # the licence page has to be the document that explains which is which.
   {
     cat LICENSING.md
     printf '\n\n%s\n\n' "$(printf '=%.0s' {1..70})"
     cat LICENSE
-    printf '\n\n%s\n\n' "$(printf '=%.0s' {1..70})"
-    cat LICENSE-GPL-3.0
   } > "$WORK/macos/resources/LICENSE.txt"
 
   sed -e "s/@VERSION@/$VERSION/g" -e "s/@TITLE@/$NAME $VERSION/g" \
@@ -217,9 +199,7 @@ build_windows() {
   # the portable build receives — so the installed files and the unzipped
   # files cannot drift apart.
   local zip="dist/tangent-$VERSION-windows-x86_64.zip"
-  local vst3="dist/plugin/windows/$NAME.vst3"
   need "$zip"  "run scripts/build-cross.sh first"
-  need "$vst3" "run scripts/build-plugin.sh windows first"
   command -v makensis >/dev/null || {
     echo "makensis not found. Install it with: brew install makensis" >&2
     exit 1
@@ -230,7 +210,6 @@ build_windows() {
   mkdir -p "$WORK/windows/app"
   unzip -q "$zip" -d "$WORK/windows/app"
   need "$WORK/windows/app/tangent.exe" "the zip has no tangent.exe in it"
-  cp -R "$vst3" "$WORK/windows/Tangent.vst3"
   cp LICENSING.md "$WORK/windows/LICENSE.txt"
 
   local out="dist/$NAME-$VERSION-windows-setup.exe"
@@ -254,9 +233,7 @@ build_windows() {
 # want to do anyway.
 build_linux() {
   local tarball="dist/tangent-$VERSION-linux-x86_64.tar.gz"
-  local vst3="dist/plugin/linux/$NAME.vst3"
   need "$tarball" "run scripts/build-linux-remote.sh <host> first"
-  need "$vst3"    "run scripts/build-linux-remote.sh <host> first (it builds both)"
 
   echo "==> $NAME $VERSION — Linux tarball with an installer"
   rm -rf "$WORK/linux"
@@ -272,8 +249,9 @@ build_linux() {
   # producing `Tangent.vst3/Tangent.vst3`. The result installs, loads, and
   # quietly ships a second complete copy of a 10 MB plugin inside the first.
   # Found on the third run, by looking at what actually landed on disk.
+  # The scrub stays though the plugin is retired: a re-run over an old
+  # tree must not re-ship last year's bundle.
   rm -rf "$dir/$NAME.vst3"
-  cp -R "$vst3" "$dir/$NAME.vst3"
   cp installer/linux/install.sh "$dir/install.sh"
   chmod +x "$dir/install.sh"
   cp LICENSING.md LICENSE-GPL-3.0 "$dir/"

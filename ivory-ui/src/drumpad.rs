@@ -110,7 +110,13 @@ impl DrumpadDoc {
         let Some(Value::Array(pads)) = map.get("pads") else {
             return out;
         };
-        for (slot, v) in out.pads.iter_mut().zip(pads) {
+        // **The sixteen-pad era loads at its old home.** Before the pads
+        // covered the whole keyboard, the sidecar held exactly sixteen
+        // slots and they WERE keys 36..51 — so a sixteen-entry file lands
+        // at offset 36, and every old kit keeps striking the pads it
+        // always struck. Full-width files map straight through.
+        let offset = if pads.len() == 16 { 36 } else { 0 };
+        for (slot, v) in out.pads.iter_mut().skip(offset).zip(pads) {
             let Value::Object(p) = v else { continue };
             if let Some(path) = p.get("path").and_then(Value::as_str) {
                 slot.path = path.to_owned();

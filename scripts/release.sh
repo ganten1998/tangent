@@ -127,18 +127,13 @@ for a in "${ARTIFACTS[@]}"; do
       exp="$(mktemp -d)"
       if pkgutil --expand "$a" "$exp/x" 2>/dev/null; then
         [ -d "$exp/x/Tangent-app.pkg" ]  || note "$a: no application component"
-        [ -d "$exp/x/Tangent-vst3.pkg" ] || note "$a: no VST3 component"
+        [ ! -d "$exp/x/Tangent-vst3.pkg" ] || note "$a: carries the RETIRED VST3 component"
         grep -q 'choice.standalone' "$exp/x/Distribution" 2>/dev/null \
           || note "$a: the installer offers no standalone choice"
-        grep -q 'choice.vst3' "$exp/x/Distribution" 2>/dev/null \
-          || note "$a: the installer offers no plugin choice"
         # relocatable="true" would let a stray copy elsewhere on the disk
         # receive the update instead of /Applications.
         grep -q 'relocatable="false"' "$exp/x/Tangent-app.pkg/PackageInfo" 2>/dev/null \
           || note "$a: the app component is RELOCATABLE (it must not be)"
-        grep -q 'install-location="/Library/Audio/Plug-Ins/VST3"' \
-          "$exp/x/Tangent-vst3.pkg/PackageInfo" 2>/dev/null \
-          || note "$a: the plugin does not install to the VST3 folder"
         pkgutil --check-signature "$a" 2>/dev/null | grep -q 'Status: signed' \
           || note "$a: UNSIGNED (needs a Developer ID Installer certificate)"
       else
@@ -152,8 +147,8 @@ for a in "${ARTIFACTS[@]}"; do
         wl="$(7zz l "$a" 2>/dev/null)"
         printf '%s\n' "$wl" | grep -q 'tangent\.exe' \
           || note "$a: no tangent.exe"
-        printf '%s\n' "$wl" | grep -q 'VST3/Tangent\.vst3/Contents/x86_64-win/Tangent\.vst3' \
-          || note "$a: no VST3 payload, or it is not going to the VST3 folder"
+        printf '%s\n' "$wl" | grep -q 'VST3/Tangent\.vst3' \
+          && note "$a: carries the RETIRED VST3 payload"
         printf '%s\n' "$wl" | grep -q 'Uninstall\.exe' \
           || note "$a: no uninstaller"
       else

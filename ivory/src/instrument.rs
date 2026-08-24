@@ -965,9 +965,17 @@ fn period_frames(rate: f64, bpm: f64, unit: u32) -> f64 {
 /// clips' contract, so there is no resampling and no channel mapping down
 /// here — and swapped in WHOLE behind the racks' own protocol. The audio
 /// thread never allocates a kit and never frees one.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct PadKit {
     pub pads: [Option<Arc<ivory_record::decode::Clip>>; PADS],
+}
+
+impl Default for PadKit {
+    fn default() -> Self {
+        Self {
+            pads: std::array::from_fn(|_| None),
+        }
+    }
 }
 
 impl PadKit {
@@ -1299,7 +1307,9 @@ struct Shared {
     pad_tune: [AtomicU32; PADS],
     pad_choke: [AtomicU32; PADS],
     /// Bit `i`: pad `i` OBEYS NOTE-OFFS — a release fades the voice.
-    pad_obey: AtomicU32,
+    /// One bit per pad, two words for the 128 of them: word `pad >> 6`,
+    /// bit `pad & 63`.
+    pad_obey: [AtomicU64; 2],
     /// The playable window, fractions of the sample, f32 bits each.
     pad_trim_start: [AtomicU32; PADS],
     pad_trim_end: [AtomicU32; PADS],
@@ -1434,7 +1444,7 @@ impl Shared {
             fx_return: AtomicU32::new(1.0f32.to_bits()),
             strip_peak: std::array::from_fn(|_| [AtomicU32::new(0), AtomicU32::new(0)]),
             pad_gain: std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
-            pad_obey: AtomicU32::new(0),
+            pad_obey: [AtomicU64::new(0), AtomicU64::new(0)],
             pad_trim_start: std::array::from_fn(|_| AtomicU32::new(0.0f32.to_bits())),
             pad_trim_end: std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
             pad_pan: std::array::from_fn(|_| AtomicU32::new(0.0f32.to_bits())),
@@ -2260,7 +2270,9 @@ impl Renderer {
                     let pad = usize::from((event.data1 & 0x7F).wrapping_sub(PAD_BASE));
                     if event.data1 & 0x7F >= PAD_BASE
                         && pad < PADS
-                        && self.shared.pad_obey.load(Ordering::Relaxed) & (1 << pad) != 0
+                        && self.shared.pad_obey[pad >> 6].load(Ordering::Relaxed)
+                            & (1u64 << (pad & 63))
+                            != 0
                         && self.pad_offs.len() < self.pad_offs.capacity()
                     {
                         self.pad_offs.push(PadHit { offset, pad, velocity: 0.0 });
@@ -3853,7 +3865,10 @@ impl Renderer {
             // itself carries no signal, but its fader still has to advance
             // so a later un-assignment starts at the written level.
             if drum_at == Some(ch) && !is_builtin {
-                let obey = self.shared.pad_obey.load(Ordering::Relaxed);
+                let obey = [
+                    self.shared.pad_obey[0].load(Ordering::Relaxed),
+                    self.shared.pad_obey[1].load(Ordering::Relaxed),
+                ];
                 for n in &lane_notes {
                     let Ok(key) = u8::try_from(n.pitch) else {
                         continue;
@@ -3865,7 +3880,7 @@ impl Renderer {
                     if !n.on {
                         // Pads are one-shots — unless this one OBEYS
                         // note-offs, where the release fades the voice.
-                        if obey & (1 << pad) != 0
+                        if obey[pad >> 6] & (1u64 << (pad & 63)) != 0
                             && self.pad_offs.len() < self.pad_offs.capacity()
                         {
                             self.pad_offs.push(PadHit {
@@ -5382,21 +5397,22 @@ impl Engine {
             }
         };
         let sh = &self.shared;
-        let mut obey = 0u32;
+        let mut obey = [0u64; 2];
         for (i, p) in kit.pads.iter().enumerate().take(PADS) {
             sh.pad_gain[i].store(sane(p.gain, 0.0, 2.0, 1.0).to_bits(), Ordering::Relaxed);
             sh.pad_pan[i].store(sane(p.pan, -1.0, 1.0, 0.0).to_bits(), Ordering::Relaxed);
             sh.pad_tune[i].store(sane(p.tune, -12.0, 12.0, 0.0).to_bits(), Ordering::Relaxed);
             sh.pad_choke[i].store(u32::from(p.choke), Ordering::Relaxed);
             if p.obey {
-                obey |= 1 << i;
+                obey[i >> 6] |= 1u64 << (i & 63);
             }
             sh.pad_trim_start[i]
                 .store(sane(p.trim_start, 0.0, 1.0, 0.0).to_bits(), Ordering::Relaxed);
             sh.pad_trim_end[i]
                 .store(sane(p.trim_end, 0.0, 1.0, 1.0).to_bits(), Ordering::Relaxed);
         }
-        sh.pad_obey.store(obey, Ordering::Relaxed);
+        sh.pad_obey[0].store(obey[0], Ordering::Relaxed);
+        sh.pad_obey[1].store(obey[1], Ordering::Relaxed);
         sh.pad_master
             .store(sane_gain(kit.master).to_bits(), Ordering::Relaxed);
     }
@@ -7603,7 +7619,7 @@ mod tests {
     #[test]
     fn a_channel_ten_note_strikes_the_pad_and_spares_the_piano() {
         let (mut r, mut tx, _shared) = renderer_with_midi(2);
-        r.pad_kit = test_kit(&[0], 48_000, 0.5);
+        r.pad_kit = test_kit(&[36], 48_000, 0.5);
 
         queue(&mut tx, 0, [0x99, 36, 100]);
         let mut out = vec![0.0_f32; 2 * 2048];
@@ -7643,9 +7659,9 @@ mod tests {
     #[test]
     fn a_choke_group_cuts_the_other_pad_and_a_retrigger_never_doubles() {
         let (mut r, mut tx, shared) = renderer_with_midi(2);
-        r.pad_kit = test_kit(&[0, 1], 480_000, 0.5);
-        shared.pad_choke[0].store(1, Ordering::Relaxed);
-        shared.pad_choke[1].store(1, Ordering::Relaxed);
+        r.pad_kit = test_kit(&[36, 37], 480_000, 0.5);
+        shared.pad_choke[36].store(1, Ordering::Relaxed);
+        shared.pad_choke[37].store(1, Ordering::Relaxed);
         let one = 0.5 * 100.0 / 127.0;
 
         let mut out = vec![0.0_f32; 2 * 2048];
@@ -7680,7 +7696,7 @@ mod tests {
     #[test]
     fn a_kit_swap_silences_the_voices_and_returns_the_old_kit() {
         let (mut r, mut tx, _shared) = renderer_with_midi(2);
-        r.pad_kit = test_kit(&[0], 480_000, 0.5);
+        r.pad_kit = test_kit(&[36], 480_000, 0.5);
         let mut out = vec![0.0_f32; 2 * 2048];
         queue(&mut tx, 0, [0x99, 36, 100]);
         r.render(&mut out, 0, 0);
@@ -7699,7 +7715,7 @@ mod tests {
             "a voice survived the swap into a different kit at {peak}"
         );
         let old = from.pop().expect("the displaced kit came back");
-        assert!(old.pads[0].is_some(), "the wrong kit was returned");
+        assert!(old.pads[36].is_some(), "the wrong kit was returned");
     }
 
     /// **An arrangement of clips plays placed, trimmed, and faded.**

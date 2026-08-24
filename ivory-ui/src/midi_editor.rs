@@ -71,7 +71,7 @@ pub struct MidiEditView<'a> {
     /// On the DRUM LANE: the sixteen pads' sample names, keyed 36..=51 —
     /// written on the keys, because a kit whose keys are anonymous is not
     /// an instrument. `None` everywhere else.
-    pub pad_names: Option<[&'a str; 16]>,
+    pub pad_names: Option<[&'a str; 128]>,
 }
 
 /// What a press on the editor means.
@@ -520,9 +520,8 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
             // white key reads dark and a black key reads light. This is
             // what makes the drum lane an instrument you can SEE.
             if let Some(names) = view.pad_names.as_ref() {
-                let base = crate::recorder::DRUM_PAD_BASE;
-                if key >= base && key < base + 16 && kh >= 6.0 {
-                    let name = names[usize::from(key - base)];
+                if kh >= 6.0 {
+                    let name = names[usize::from(key.min(127))];
                     if !name.is_empty() {
                         painter.text(
                             Pos2::new(row_keys.left() + 3.0, row_keys.center().y),

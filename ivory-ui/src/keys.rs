@@ -426,7 +426,7 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             ("2-CLK", "double-click a MIDI item: open its editor"),
             ("DEL", "delete the selected clip - or the selected track"),
             ("A-CLK", "alt-click an insert: empty the bay"),
-            ("R-CLK", "empty room: the app menu · header: the track menu"),
+            ("R-CLK", "empty room: the app menu · header: the track menu · loaded insert: delete / replace"),
             ("WHEEL", "zoom at the playhead - click a bar, wheel zooms there"),
             ("A-WHL", "alt: move the viewport"),
             ("A-DRG", "alt-drag empty room: move the viewport"),

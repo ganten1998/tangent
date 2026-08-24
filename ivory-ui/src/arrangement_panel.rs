@@ -98,6 +98,9 @@ pub struct ArrangeView<'a> {
     pub metronome_on: bool,
     pub snap_on: bool,
     pub grid_exp: i8,
+    /// The header resize strip is under the pointer (or being dragged):
+    /// it lights, and the app swaps the cursor to the resize arrows.
+    pub grip_lit: bool,
     /// A MIDI item being drawn by shift-drag right now: lane, from, to —
     /// ghosted until the button comes up and the document takes it.
     pub pending: Option<(usize, f64, f64)>,
@@ -221,6 +224,9 @@ pub struct Layout {
     /// Drag it to scroll; drag UP to zoom in at the same time.
     pub tool_nav: Rect,
     pub lanes_area: Rect,
+    /// The dead strip between the resize grip and time zero — a click
+    /// here IS a click on the start.
+    pub gutter: Rect,
     /// The draggable seam between headers and lanes.
     pub grip: Rect,
     pub lane_rows: [Rect; CHANNELS],
@@ -286,6 +292,7 @@ impl Layout {
                 tool_grid: Rect::NOTHING,
                 tool_nav: Rect::NOTHING,
                 lanes_area: Rect::NOTHING,
+                gutter: Rect::NOTHING,
                 grip: Rect::NOTHING,
                 lane_rows: [Rect::NOTHING; CHANNELS],
                 header_rows: [HeaderRow::NONE; CHANNELS],
@@ -308,12 +315,20 @@ impl Layout {
             Pos2::new(rect.left(), rect.top() + ruler_h),
             Pos2::new(rect.left() + header_w, rect.bottom()),
         );
+        // **REAPER's answer to "click back to bar one", copied whole**:
+        // between the header's resize strip and TIME ZERO stands a tiny
+        // strip of NOTHING, painted the recorder's wood so the lanes read
+        // as outlined by it. Overshooting a click at the first bar lands
+        // in the strip, and the strip means "the start" — the near-pixel-
+        // perfect aim the owner had to use is gone.
+        const GUTTER: f32 = 8.0;
+        let field_x = rect.left() + header_w + GRIP_W + GUTTER;
         let ruler = Rect::from_min_max(
-            Pos2::new(rect.left() + header_w, rect.top()),
+            Pos2::new(field_x, rect.top()),
             Pos2::new(rect.right(), rect.top() + ruler_h),
         );
         let lanes_area = Rect::from_min_max(
-            Pos2::new(rect.left() + header_w, rect.top() + ruler_h),
+            Pos2::new(field_x, rect.top() + ruler_h),
             rect.max,
         );
         let lane_h = lanes_area.height() / CHANNELS as f32;
@@ -381,8 +396,12 @@ impl Layout {
             tool_nav,
             lanes_area,
             grip: Rect::from_min_max(
-                Pos2::new(rect.left() + header_w - 3.0, rect.top() + ruler_h),
-                Pos2::new(rect.left() + header_w + 3.0, rect.bottom()),
+                Pos2::new(rect.left() + header_w, rect.top()),
+                Pos2::new(rect.left() + header_w + GRIP_W, rect.bottom()),
+            ),
+            gutter: Rect::from_min_max(
+                Pos2::new(rect.left() + header_w + GRIP_W, rect.top()),
+                Pos2::new(field_x, rect.bottom()),
             ),
             lane_rows,
             header_rows,
@@ -626,8 +645,25 @@ fn draw_note_miniature(
     }
 }
 
+/// The resize strip's width — REAPER's splitter, hover-lit, its own cursor.
+const GRIP_W: f32 = 5.0;
+
 pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
     let l = Layout::new(rect, view);
+    // The GUTTER before anything territorial: a press there is a press on
+    // the start — the ruler's meaning in its ruler band, the lane's below.
+    if l.gutter.is_positive() && l.gutter.contains(pos) {
+        if pos.y <= l.ruler.bottom() {
+            return Some(Hit::Ruler(time_at(rect, view, pos.x)));
+        }
+        if let Some(i) = l
+            .lane_rows
+            .iter()
+            .position(|r| r.is_positive() && (r.top()..=r.bottom()).contains(&pos.y))
+        {
+            return Some(Hit::Lane(i, time_at(rect, view, pos.x)));
+        }
+    }
     for (r, hit) in [
         (l.tool_met, Hit::ToolMetronome),
         (l.tool_snap, Hit::ToolSnap),
@@ -1182,6 +1218,32 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         0.0,
         p.hdr_wood,
     );
+    // **The dead strip and the resize grip**, REAPER's pair: the gutter
+    // wears the recorder's wood — the lanes read as OUTLINED by it — and
+    // the grip lights under the hand that can drag it.
+    if l.gutter.is_positive() {
+        painter.rect_filled(l.gutter, 0.0, p.hdr_wood);
+    }
+    if l.grip.is_positive() {
+        painter.rect_filled(
+            l.grip,
+            0.0,
+            if view.grip_lit {
+                p.hdr_face.gamma_multiply(0.45)
+            } else {
+                p.hdr_wood
+            },
+        );
+        // The handle's own seam, so the strip reads as a control even
+        // unlit.
+        painter.line_segment(
+            [
+                Pos2::new(l.grip.center().x, l.grip.top() + 6.0),
+                Pos2::new(l.grip.center().x, l.grip.bottom() - 6.0),
+            ],
+            Stroke::new(1.0, p.engrave.gamma_multiply(if view.grip_lit { 1.0 } else { 0.55 })),
+        );
+    }
     painter.line_segment(
         [
             Pos2::new(l.header.right(), rect.top()),
@@ -1732,6 +1794,7 @@ mod tests {
             clips,
             metronome_on: true,
             snap_on: true,
+            grip_lit: false,
             grid_exp: 0,
             pending: None,
             view_start_s: 0.0,

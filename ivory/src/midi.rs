@@ -584,10 +584,13 @@ mod tests {
         assert!(rx.pop().is_ok());
         assert!(rx.pop().is_err(), "a channel-10 note was mirrored onto itself");
 
-        // Outside the pads' sixteen: no mirror either.
+        // EVERY key is a pad now: high notes mirror too.
         lane.play(&[0x90, 72, 90]);
         assert!(rx.pop().is_ok());
-        assert!(rx.pop().is_err(), "a note outside the pads was mirrored");
+        assert!(
+            rx.pop().is_ok_and(|e| e.status == 0x99),
+            "a high note stopped mirroring - the pads cover the keyboard now"
+        );
     }
 
     #[test]

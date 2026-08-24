@@ -802,6 +802,31 @@ channels play back their clips and nothing else. "Ready to play" and
   plugins' static destructors detonate. Every serious host does the
   same, for the same reason.
 
+- **4.77.0 — REAPER's dead strip, and the bays' own menu**: between
+  the header's resize grip and TIME ZERO now stands a tiny strip of
+  nothing, painted the recorder's wood — the lanes read as outlined
+  by it, and overshooting a click at bar one lands in the strip,
+  which MEANS the start (the owner had to aim near-pixel-perfect to
+  return the playhead to 1). The grip itself is REAPER's splitter:
+  hover-lit, with the resize cursor. And the arrange headers' loaded
+  insert bays answer right-click with their own two-row menu —
+  Delete FX / Replace FX, the mixer's offer — dismissal spending the
+  press as every overlay does. THE PADS COVER THE KEYBOARD: pad `n`
+  IS note `n` (128 of them, racks and knobs and all), the window
+  shows one 4×4 PAGE, and a bank band on its left steps whole pages
+  — never rows — with the current page outlined and each pad wearing
+  its note name. Pages anchor at 4+16k so the classic kit (36..51)
+  sits whole on its page, the default; the last page pads out past
+  127 with dead cells for neatness. Old sixteen-slot sidecars load
+  at offset 36 (they WERE keys 36..51); settings v18 relocates the
+  pad insert seats (+36) and the host renames their state files
+  once; project docs relocate by LENGTH. And THE PLUGIN IS RETIRED:
+  Tangent is a DAW and does not load through another — nothing
+  builds, stages, or offers the VST3 (installers are one-option
+  standalone on all three platforms; release checks now FAIL a
+  build that still carries it; the plugin workspace stays in-tree
+  for a possible visualizer-only return).
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index
