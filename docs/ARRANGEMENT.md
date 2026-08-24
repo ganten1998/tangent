@@ -607,6 +607,27 @@ channels play back their clips and nothing else. "Ready to play" and
   roots view now lists every mount it can find (/Volumes, /media,
   /run/media, /mnt), skipping the boot volume's own alias.
 
+- **4.65.0 — the MIDI fast lane, and the audition tamed**: a hardware
+  note used to take the scenic route — midir thread → RawMidiTap →
+  a once-per-UI-frame drain at the END of the egui pass →
+  Engine::send_midi → audio callback: 3-10 ms typical, a whole
+  repaint interval worst, stacked on the audio buffer, and worse for
+  pitch bend (which never woke the UI at all). The midir callback now
+  plays straight into the audio callback through `midi::MidiFastLane`
+  — an app-lifetime slot each fresh engine seats its ring in, pads'
+  channel-10 mirror included, past-stamped so every event lands at
+  the block's first frame. The UI drain keeps only what needs the UI
+  thread: the arrangement's record and the take's .mid. All
+  platforms benefit; the "DX7 has more" perception had no code basis
+  — it renders inline in the same block. THE DEAFENING AUDITION: the
+  out-pass added the media-explorer preview (and the metronome click)
+  to EVERY device output channel while the mix occupies only the
+  first pair — all twelve Babyface outputs lit at once — and the
+  preview joined after the master had already scaled the mix, raw at
+  unity. The pair is gated now, and the audition rides the drum bus
+  fader and the master like a loaded pad would (mute/solo ignored:
+  clicking a file is a question). Daniel joined the thanks card.
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index

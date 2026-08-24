@@ -131,6 +131,123 @@ impl RawMidiTap {
     }
 }
 
+/// The HARDWARE FAST LANE: the midir callback's direct line to the audio
+/// callback, with no UI frame in between.
+///
+/// For every release before this one, a hardware note took the scenic route:
+/// midir thread -> [`RawMidiTap`] -> a once-per-UI-frame drain at the END of
+/// the egui pass -> `Engine::send_midi` -> the audio callback. Typical cost
+/// 3-10 ms, worst a whole repaint interval — stacked on top of the audio
+/// buffer, and the reason a keyboard felt slower than the audio round trip.
+/// The engine's own module docs named this defect and this fix.
+///
+/// The lane is created ONCE PER APP (like the tap, and for the same reason:
+/// midir seals its callback's captured state when the port opens, so the
+/// closure must hold something app-lifetime it can look through). Each engine
+/// seats its ring's write end here at start via [`MidiFastLane::install`];
+/// a dead engine's producer just goes nowhere until the next one replaces it.
+///
+/// Events are pushed with **stamp 0 — the far past — on purpose**: `place()`
+/// puts a past stamp at the block's first frame, which for live input is the
+/// soonest anything can sound. A device stamp converted naively could land in
+/// the future and be HELD for a block; the recording path still gets real
+/// stamps from the tap, which is unchanged.
+///
+/// The pads' channel-10 mirror lives here too (it used to ride the UI drain):
+/// while the drumpad is up with its MIDI chip lit, a note inside the pads'
+/// sixteen also strikes its pad, as a copy on channel 10. A note already on
+/// channel 10 reached the pads with the original push and is not doubled.
+pub struct MidiFastLane {
+    /// A `Mutex`, not a lock-free cell, for the tap's own reason: this is
+    /// midir's thread, not an audio callback, and the only contention is the
+    /// desktop seating a new producer at engine start. `try_lock` on the push
+    /// side so a mid-install collision drops one event instead of blocking.
+    #[cfg(feature = "recorder")]
+    slot: std::sync::Mutex<Option<rtrb::Producer<crate::instrument::MidiEvent>>>,
+    /// Whether the drumpad is up with MIDI live — pushed by the desktop each
+    /// frame. Frame-stale by nature; so was the UI-drain mirror it replaces.
+    pads_live: std::sync::atomic::AtomicBool,
+}
+
+impl MidiFastLane {
+    pub fn new() -> Self {
+        Self {
+            #[cfg(feature = "recorder")]
+            slot: std::sync::Mutex::new(None),
+            pads_live: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Seat a fresh engine's ring. The old producer is dropped here, on the
+    /// UI thread, never in a callback.
+    #[cfg(feature = "recorder")]
+    pub fn install(&self, tx: rtrb::Producer<crate::instrument::MidiEvent>) {
+        if let Ok(mut g) = self.slot.lock() {
+            *g = Some(tx);
+        }
+    }
+
+    pub fn set_pads_live(&self, live: bool) {
+        self.pads_live.store(live, Ordering::Relaxed);
+    }
+
+    /// From the midir callback thread: sound this message NOW.
+    ///
+    /// Channel messages only — SysEx and realtime have nothing to sound and
+    /// would bloat the ring. A full ring or a mid-install collision sheds the
+    /// event silently: the tap still has it, so the RECORD is whole either
+    /// way, and a shed here only costs the monitor one note.
+    pub fn play(&self, bytes: &[u8]) {
+        #[cfg(feature = "recorder")]
+        {
+            let Some(&status) = bytes.first() else {
+                return;
+            };
+            if status >= 0xF0 {
+                return;
+            }
+            let event = crate::instrument::MidiEvent {
+                stamp: 0,
+                status,
+                data1: bytes.get(1).copied().unwrap_or(0),
+                data2: bytes.get(2).copied().unwrap_or(0),
+            };
+            let Ok(mut g) = self.slot.try_lock() else {
+                return;
+            };
+            let Some(tx) = g.as_mut() else {
+                return;
+            };
+            let _ = tx.push(event);
+            // The pads' mirror. Bounds and channel checks exactly as the UI
+            // drain did them; DRUM_PAD_BASE..+DRUM_PADS is keys 36..52.
+            let kind = status & 0xF0;
+            let base = ivory_ui::recorder::DRUM_PAD_BASE;
+            let top = base + ivory_ui::recorder::DRUM_PADS as u8;
+            if self.pads_live.load(Ordering::Relaxed)
+                && (kind == 0x90 || kind == 0x80)
+                && status & 0x0F != 9
+                && (base..top).contains(&(event.data1 & 0x7F))
+            {
+                let _ = tx.push(crate::instrument::MidiEvent {
+                    stamp: 0,
+                    status: kind | 9,
+                    data1: event.data1,
+                    data2: event.data2,
+                });
+            }
+        }
+        #[cfg(not(feature = "recorder"))]
+        let _ = bytes;
+    }
+}
+
+impl Default for MidiFastLane {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Holds the open connection; dropping it closes the port.
 pub struct MidiConnection {
     _conn: midir::MidiInputConnection<()>,
@@ -196,6 +313,7 @@ pub fn connect_by_name(
     tx: mpsc::Sender<MidiEvent>,
     ctx: egui::Context,
     tap: Arc<RawMidiTap>,
+    lane: Arc<MidiFastLane>,
 ) -> Result<MidiConnection, String> {
     let input = listening_input("ivory").ok_or_else(|| "MIDI system unavailable".to_string())?;
     let port = input
@@ -220,6 +338,9 @@ pub fn connect_by_name(
                 // callback is arrival time, which carries OS delivery latency
                 // and its jitter, and on ALSA the sequencer queue's own
                 // scheduling on top.
+                // SOUND before bookkeeping: the fast lane is why the note is
+                // audible this block instead of after the next UI frame.
+                lane.play(message);
                 tap.push(stamp_us, message);
                 if let Some(event) = parse_message(message) {
                     let _ = tx.send(event);
@@ -241,10 +362,11 @@ pub fn auto_connect(
     tx: mpsc::Sender<MidiEvent>,
     ctx: egui::Context,
     tap: Arc<RawMidiTap>,
+    lane: Arc<MidiFastLane>,
 ) -> Option<MidiConnection> {
     let names = list_port_names();
     let chosen = pick_auto_port(&names)?;
-    connect_by_name(&chosen, tx, ctx, tap).ok()
+    connect_by_name(&chosen, tx, ctx, tap, lane).ok()
 }
 
 /// Developer probe: open a port and print the raw tap until interrupted.
@@ -277,7 +399,8 @@ pub fn dump_raw(port: Option<String>) {
 
     let tap = Arc::new(RawMidiTap::new(100_000));
     let (tx, _rx) = mpsc::channel();
-    let conn = match connect_by_name(&chosen, tx, egui::Context::default(), Arc::clone(&tap)) {
+    let lane = Arc::new(MidiFastLane::new());
+    let conn = match connect_by_name(&chosen, tx, egui::Context::default(), Arc::clone(&tap), lane) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("could not open {chosen:?}: {e}");
@@ -418,6 +541,53 @@ mod tests {
         tap.push(1, &[0x90, 60, 1]);
         assert_eq!(tap.dropped(), 0);
         assert_eq!(tap.drain().len(), 1);
+    }
+
+    /// **The fast lane delivers, mirrors the pads, and never panics bare.**
+    ///
+    /// The seated ring gets every channel message; with the drumpad live, a
+    /// pad-range note also arrives as its channel-10 copy (but a note already
+    /// on channel 10 is not doubled); realtime/SysEx stay out; and playing
+    /// into a lane no engine has seated is a quiet no-op.
+    #[cfg(feature = "recorder")]
+    #[test]
+    fn the_fast_lane_delivers_and_mirrors_the_pads() {
+        let lane = MidiFastLane::new();
+        // Bare: no producer seated. Must simply do nothing.
+        lane.play(&[0x90, 60, 100]);
+
+        let (tx, mut rx) = rtrb::RingBuffer::<crate::instrument::MidiEvent>::new(16);
+        lane.install(tx);
+
+        // A plain note, pads down: one event, stamp 0 (the far past).
+        lane.play(&[0x90, 60, 100]);
+        let e = rx.pop().expect("the note was not delivered");
+        assert_eq!((e.stamp, e.status, e.data1, e.data2), (0, 0x90, 60, 100));
+        assert!(rx.pop().is_err(), "a note was doubled with pads down");
+
+        // Realtime never sounds.
+        lane.play(&[0xF8]);
+        assert!(rx.pop().is_err(), "a realtime byte reached the ring");
+
+        // Pads live: a note inside 36..52 arrives twice — itself, then its
+        // channel-10 copy.
+        lane.set_pads_live(true);
+        lane.play(&[0x90, 40, 90]);
+        let a = rx.pop().expect("the original vanished");
+        let b = rx.pop().expect("the pad mirror vanished");
+        assert_eq!(a.status, 0x90);
+        assert_eq!(b.status, 0x99, "the mirror is not on channel 10");
+        assert_eq!((b.data1, b.data2), (40, 90));
+
+        // Already channel 10: no double.
+        lane.play(&[0x99, 40, 90]);
+        assert!(rx.pop().is_ok());
+        assert!(rx.pop().is_err(), "a channel-10 note was mirrored onto itself");
+
+        // Outside the pads' sixteen: no mirror either.
+        lane.play(&[0x90, 72, 90]);
+        assert!(rx.pop().is_ok());
+        assert!(rx.pop().is_err(), "a note outside the pads was mirrored");
     }
 
     #[test]
