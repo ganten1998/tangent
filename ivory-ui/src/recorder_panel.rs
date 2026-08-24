@@ -3246,11 +3246,17 @@ fn draw_vu(painter: &Painter, face: Rect, lv: Level, clipped: bool, p: &Palette)
                 colour,
             );
         }
+    }
+    // **The nameplate outlives the numbers.** "VU" is what says what the
+    // face IS, and it fits long after ten digits along the arc stop
+    // fitting — the owner watched it vanish the moment the window came
+    // under full size. Its own floor is only "a face worth naming".
+    if fh >= 16.0 {
         painter.text(
             Pos2::new(pivot.x, pivot.y - radius * 0.30),
             Align2::CENTER_CENTER,
             "VU",
-            font_light(fh * 0.16),
+            font_light((fh * 0.16).max(7.0)),
             VU_PRINT,
         );
     }

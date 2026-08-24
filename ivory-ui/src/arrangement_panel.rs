@@ -975,28 +975,6 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             ],
             Stroke::new(1.0, p.seam.gamma_multiply(1.25)),
         );
-        if view.lanes.get(i).is_some_and(|lane| lane.used) {
-            continue;
-        }
-        let left = l
-            .header_rows
-            .get(i)
-            .map_or(row.left(), |h| h.panel.left());
-        // **A visible BORDER, not an etching.** The seam ink is DARKER
-        // than the header wood in the dark wardrobe, so the etched
-        // treatment vanished exactly where the owner looked: the header
-        // column read as bare air between channels. Every unoccupied slot
-        // now wears one channel-shaped box — header through field — in
-        // the face ink, faded far enough to sit behind the real channels
-        // around it but never below legibility on either palette.
-        let border = Stroke::new(1.0, p.face.gamma_multiply(0.28));
-        painter.rect_stroke(
-            Rect::from_min_max(Pos2::new(left, row.top()), row.right_bottom()),
-            0.0,
-            border,
-            egui::StrokeKind::Inside,
-        );
-        painter.rect_stroke(*row, 0.0, Stroke::new(1.0, p.seam), egui::StrokeKind::Inside);
     }
 
     // ── the TIME SELECTION: a veil over the span, on ruler and lanes ──────
@@ -1600,6 +1578,30 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         );
         if inner.is_positive() {
             painter.rect_filled(inner, 1.5, p.hdr_face.gamma_multiply(0.8));
+        }
+    }
+
+    // ── the EMPTY SLOTS' borders, LAST — nothing may paint over them ──────
+    // Third round on these, and the lesson was paint ORDER, not ink: the
+    // header section begins by filling its whole column with wood, and the
+    // empty slot's own panel is filled again inside the header loop — every
+    // earlier border, etched or boxed, was buried the same frame it was
+    // drawn. Painted here, on top of everything, each unoccupied slot is
+    // one channel-shaped box — header through field — in faded face ink
+    // that reads on both palettes.
+    for (i, row) in l.lane_rows.iter().enumerate() {
+        if view.lanes.get(i).is_some_and(|lane| lane.used) {
+            continue;
+        }
+        let left = l.header_rows.get(i).map_or(row.left(), |h| h.panel.left());
+        let slot = Rect::from_min_max(Pos2::new(left, row.top()), row.right_bottom());
+        if slot.is_positive() {
+            painter.rect_stroke(
+                slot,
+                0.0,
+                Stroke::new(1.0, p.face.gamma_multiply(0.35)),
+                egui::StrokeKind::Inside,
+            );
         }
     }
 }

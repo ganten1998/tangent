@@ -653,6 +653,19 @@ channels play back their clips and nothing else. "Ready to play" and
   border in both palettes (the etched seam was darker than the dark
   header wood — invisible exactly where it was needed).
 
+- **4.67.0 — the round of being believed**: the empty-slot borders
+  really draw now — the cause was PAINT ORDER, not ink: the header
+  section fills its whole column with wood and each empty panel
+  again, burying every earlier border the frame it was drawn; the
+  boxes paint LAST now, and a test walks a real frame's shape list
+  asserting no opaque fill lands on them after. Adding a track
+  touches NOBODY's arms — not the standing ones (the exclusive birth
+  arm silently disarmed whatever was up) and not its own (no self-arm
+  at birth or first bind; R is one click away). The VU nameplate
+  outlives the numbers: "VU" drew only above the ten-digit gate
+  (fh≥40) and vanished under full window size — it has its own floor
+  now, a face worth naming.
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index
