@@ -438,11 +438,11 @@ impl OutputInfo {
 /// whole file is arranged around. Three bytes covers every channel message; a
 /// SysEx dump is not something an instrument monitor needs to forward.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct MidiEvent {
-    stamp: Nanos,
-    status: u8,
-    data1: u8,
-    data2: u8,
+pub(crate) struct MidiEvent {
+    pub(crate) stamp: Nanos,
+    pub(crate) status: u8,
+    pub(crate) data1: u8,
+    pub(crate) data2: u8,
 }
 
 /// Raw MIDI bytes to a VST3 note, or `None` for anything that is not one.
@@ -1882,6 +1882,13 @@ struct Renderer {
     mix: Vec<f32>,
 
     midi: Consumer<MidiEvent>,
+    /// The HARDWARE fast lane: filled from the midir callback thread through
+    /// `midi::MidiFastLane`, never from the UI. Its events are stamped in the
+    /// far past on purpose, so every one lands at the current block's first
+    /// frame — the soonest a block engine can sound anything. This is the
+    /// ring that took the UI frame out of the player's hands; see the module
+    /// docs on live latency.
+    hw_midi: Consumer<MidiEvent>,
     /// One event popped but not yet due. `rtrb` has no peek, so an event that
     /// belongs to a later block lives here rather than being pushed back.
     pending: Option<MidiEvent>,
@@ -2217,9 +2224,17 @@ impl Renderer {
         loop {
             let event = match self.pending.take() {
                 Some(e) => e,
-                None => match self.midi.pop() {
+                // The HARDWARE ring first: its events are past-stamped and
+                // always due, so nothing from it can park in `pending` as
+                // Later and stall the other ring. (A future-stamped APP
+                // event held in `pending` does briefly gate this pop — only
+                // `plugin_test` schedules ahead, and it has no keyboard.)
+                None => match self.hw_midi.pop() {
                     Ok(e) => e,
-                    Err(_) => break,
+                    Err(_) => match self.midi.pop() {
+                        Ok(e) => e,
+                        Err(_) => break,
+                    },
                 },
             };
             let offset = match place(event.stamp, block_start, self.rate, frames) {
@@ -2799,9 +2814,18 @@ impl Renderer {
                 let at = frame_index * dev_ch;
                 map_frame(src, &mut self.frame[..dev_ch]);
                 for c in 0..dev_ch {
-                    let s = self.frame[c]
-                        + self.click_out[i]
-                        + self.preview_out[i * 2 + c.min(1)];
+                    // **The click and the preview live on the MAIN PAIR
+                    // only** — the same two channels `map_frame` gives the
+                    // mix; everything past them is zero-filled. Adding them
+                    // on every channel lit all twelve outputs of the
+                    // tester's Babyface at once — phones, ADAT, the lot —
+                    // which is where "deafeningly loud" auditions came from.
+                    let cue = if c < 2 {
+                        self.click_out[i] + self.preview_out[i * 2 + c]
+                    } else {
+                        0.0
+                    };
+                    let s = self.frame[c] + cue;
                     out[at + c] = s;
                     let mag = s.abs();
                     if mag >= CLIP_LEVEL {
@@ -3325,6 +3349,22 @@ impl Renderer {
             return;
         }
         const PREVIEW_GAIN: f32 = 0.8;
+        // **The audition rides the faders a LOADED pad would.** The preview
+        // joins the out-pass AFTER the master multiplied the mix, so without
+        // these it played the raw file at unity into a desk everyone else
+        // obeys. The drum bus fader (the pads' own strip law) and the master
+        // scale it; mute and solo are deliberately ignored — clicking a file
+        // is a question, and a muted bus should not eat the answer.
+        let drum_wanted = self.shared.drum_strip.load(Ordering::Relaxed);
+        let drum_lane = (drum_wanted >= 0)
+            .then_some(drum_wanted as usize)
+            .filter(|ch| *ch < CHANNELS);
+        let bus = match drum_lane {
+            Some(ch) => Shared::f32_of(&self.shared.channel_gains[ch]).clamp(0.0, 8.0),
+            None => Shared::f32_of(&self.shared.drums_gain).clamp(0.0, 8.0),
+        };
+        let master = Shared::f32_of(&self.shared.master_gain);
+        let level = PREVIEW_GAIN * bus * master;
         for f in 0..frames {
             let at = self.preview_pos + f;
             if at >= total {
@@ -3333,10 +3373,10 @@ impl Renderer {
             let l = clip.samples.get(at * 2).copied().unwrap_or(0.0);
             let r = clip.samples.get(at * 2 + 1).copied().unwrap_or(0.0);
             if let Some(v) = self.preview_out.get_mut(f * 2) {
-                *v += l * PREVIEW_GAIN;
+                *v += l * level;
             }
             if let Some(v) = self.preview_out.get_mut(f * 2 + 1) {
-                *v += r * PREVIEW_GAIN;
+                *v += r * level;
             }
         }
         self.preview_pos += frames;
@@ -4208,6 +4248,9 @@ pub struct Engine {
     /// `send_midi` must not block. A `RefCell` borrow is a counter check with no
     /// atomics and no waiting.
     midi: RefCell<Producer<MidiEvent>>,
+    /// The hardware fast lane's write end, waiting for the desktop to move it
+    /// into the app-lifetime `midi::MidiFastLane` (once, at engine start).
+    hw_midi_tx: Option<Producer<MidiEvent>>,
 
     /// The UI thread's ends of every rack's hand-offs. See `Rack`.
     insert_handoff: [[Handoff; INSERTS]; RACK_SEATS],
@@ -4398,6 +4441,7 @@ impl Engine {
 
         // Every ring is allocated here and never again.
         let (midi_tx, midi_rx) = RingBuffer::<MidiEvent>::new(1024);
+        let (hw_midi_tx, hw_midi_rx) = RingBuffer::<MidiEvent>::new(1024);
         let tap_frames = (DEFAULT_RING_SECONDS * rate as f32) as usize;
         let (tap_tx, tap_rx) = RingBuffer::<f32>::new(tap_frames.max(4096) * TAP_CHANNELS);
 
@@ -4484,6 +4528,7 @@ impl Engine {
             // its channels fill up now or in an hour.
             mix: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             midi: midi_rx,
+            hw_midi: hw_midi_rx,
             pending: None,
             notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK),
             clips: Vec::new(),
@@ -4594,6 +4639,7 @@ impl Engine {
             shared: Arc::clone(&shared),
             timebase,
             midi: RefCell::new(midi_tx),
+            hw_midi_tx: Some(hw_midi_tx),
             insert_handoff,
             track_to_audio,
             track_from_audio,
@@ -5122,6 +5168,16 @@ impl Engine {
     /// Take the recorder's read end. `None` if it has already been taken.
     pub fn take_recorder_tap(&mut self) -> Option<RecorderTap> {
         self.tap.take()
+    }
+
+    /// Take the hardware fast lane's write end, for `midi::MidiFastLane`.
+    ///
+    /// Once-only, like the recorder tap: the desktop seats it in the
+    /// app-lifetime lane when the engine starts, and from then on the midir
+    /// callback thread feeds the audio callback directly — no UI frame in
+    /// the loop. `None` if it has already been taken.
+    pub fn take_hw_midi(&mut self) -> Option<Producer<MidiEvent>> {
+        self.hw_midi_tx.take()
     }
 
     // ── metering ────────────────────────────────────────────────────────────
@@ -6896,6 +6952,7 @@ mod tests {
         // abandoned peer (`pop` reports empty, `push` fills to capacity), so a
         // renderer under test needs no partner threads at all.
         let (_, midi) = RingBuffer::<MidiEvent>::new(1024);
+        let (_, hw_midi) = RingBuffer::<MidiEvent>::new(1024);
         // Empty racks: every test here is about the mixing, and an empty rack
         // is the path every channel takes until somebody loads something.
         let racks: [Rack; RACK_SEATS] = std::array::from_fn(|_| {
@@ -6981,6 +7038,7 @@ mod tests {
             builtin_scratch: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             channel_gain: [1.0; CHANNELS],
             midi,
+            hw_midi,
             pending: None,
             notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK),
             builtin: crate::dx7::Dx7::new(RATE as f32),
@@ -7406,6 +7464,53 @@ mod tests {
         }
     }
 
+    /// **An audition stays on the main pair and obeys the faders.**
+    ///
+    /// The tester's Babyface lit all twelve outputs when a media-explorer
+    /// clip was clicked: the out-pass added the preview (and the click) to
+    /// EVERY device channel, while `map_frame` gives the mix only the first
+    /// two — and the preview also joined after the master had already
+    /// multiplied the mix, so it played the raw file at unity into a desk
+    /// running below it. Channels past the pair must stay silent, and the
+    /// pair must carry the file scaled by the master and the drum bus fader.
+    #[test]
+    fn an_audition_keeps_to_the_main_pair_and_obeys_the_faders() {
+        let (mut r, _tx, shared) = renderer_with_midi(8);
+        shared
+            .master_gain
+            .store(0.5f32.to_bits(), Ordering::Relaxed);
+        // No drum lane assigned: the hidden Drums internals rule and rest at
+        // unity, so the expected level is file * PREVIEW_GAIN(0.8) * 0.5.
+        r.preview = Some(std::sync::Arc::new(ivory_record::decode::Clip {
+            samples: vec![0.25_f32; 2 * 4096],
+            rate: RATE as u32,
+            source: std::path::PathBuf::from("audition.wav"),
+        }));
+        r.preview_pos = 0;
+
+        let frames = 512;
+        let mut out = vec![0.0_f32; 8 * frames];
+        r.render(&mut out, 0, 0);
+
+        let expected = 0.25 * 0.8 * 0.5;
+        for f in 0..frames {
+            for c in 0..8 {
+                let s = out[f * 8 + c];
+                if c < 2 {
+                    assert!(
+                        (s - expected).abs() < 1.0e-4,
+                        "channel {c} frame {f}: {s} instead of {expected}"
+                    );
+                } else {
+                    assert!(
+                        s.abs() < 1.0e-6,
+                        "the audition leaked onto device channel {c}: {s}"
+                    );
+                }
+            }
+        }
+    }
+
     /// **A fresh install makes a sound.**
     ///
     /// The whole point of the built-in: no plugin loaded, a note arrives, and
@@ -7434,6 +7539,34 @@ mod tests {
             "a note with no plugin loaded produced {peak}, which is silence"
         );
         assert!(peak <= 1.0, "the built-in clipped the device at {peak}");
+    }
+
+    /// **The hardware fast lane sounds without the UI.**
+    ///
+    /// The midir callback pushes into `hw_midi` through `midi::MidiFastLane`;
+    /// no UI frame, no `send_midi`. The renderer must treat that ring exactly
+    /// like the app's — a note-on in it comes out of the device on the very
+    /// next render, past-stamped to the block's first frame.
+    #[test]
+    fn a_hardware_note_sounds_without_the_ui_in_the_loop() {
+        let (mut r, _tx, _) = renderer_with_midi(2);
+        let (mut hw_tx, hw_rx) = RingBuffer::<MidiEvent>::new(64);
+        r.hw_midi = hw_rx;
+
+        let mut out = vec![0.0_f32; 2 * 2048];
+        r.render(&mut out, 0, 0);
+        assert!(out.iter().all(|s| *s == 0.0), "not silent before the note");
+
+        hw_tx
+            .push(MidiEvent { stamp: 0, status: 0x90, data1: 60, data2: 100 })
+            .expect("the test ring holds one note");
+        let mut heard = vec![0.0_f32; 2 * 2048];
+        r.render(&mut heard, 0, 0);
+        let peak = heard.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+        assert!(
+            peak > 0.01,
+            "a hardware-lane note produced {peak}, which is silence"
+        );
     }
 
     /// A kit whose pads hold one constant-value stereo sample, for asserting

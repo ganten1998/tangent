@@ -37,6 +37,10 @@ pub struct DeviceMidi {
     /// `midi::RawMidiTap`. Every connection gets a clone of this `Arc`, so
     /// switching ports keeps the history the tick-0 controller snapshot needs.
     tap: Arc<midi::RawMidiTap>,
+    /// The hardware fast lane — the midir callback's direct line to the
+    /// audio callback. App-lifetime for the tap's own sealed-closure reason;
+    /// each engine seats its ring here at start. See `midi::MidiFastLane`.
+    lane: Arc<midi::MidiFastLane>,
     /// The app's single time origin. See [`DeviceMidi::timebase`].
     #[cfg(feature = "recorder")]
     timebase: ivory_record::audio::Timebase,
@@ -50,6 +54,7 @@ impl DeviceMidi {
             // ~10 minutes of dense playing before anything is shed, which is
             // far more than the pre-roll needs and cheap: a few hundred KB.
             tap: Arc::new(midi::RawMidiTap::new(60_000)),
+            lane: Arc::new(midi::MidiFastLane::new()),
             #[cfg(feature = "recorder")]
             timebase: ivory_record::audio::Timebase::new(),
         }
@@ -58,7 +63,17 @@ impl DeviceMidi {
     /// The startup priority chain (spec §10). Silent on failure by design: the
     /// app runs without MIDI rather than opening a dialog nobody asked for.
     pub fn auto_connect(&mut self, tx: mpsc::Sender<MidiEvent>) {
-        self.conn = midi::auto_connect(tx, self.ctx.clone(), Arc::clone(&self.tap));
+        self.conn = midi::auto_connect(
+            tx,
+            self.ctx.clone(),
+            Arc::clone(&self.tap),
+            Arc::clone(&self.lane),
+        );
+    }
+
+    /// The fast lane, for the desktop to seat each engine's ring in.
+    pub fn lane(&self) -> Arc<midi::MidiFastLane> {
+        Arc::clone(&self.lane)
     }
 
     /// The raw feed, for the recorder.
@@ -95,6 +110,7 @@ impl MidiPorts for DeviceMidi {
             tx,
             self.ctx.clone(),
             Arc::clone(&self.tap),
+            Arc::clone(&self.lane),
         )?);
         Ok(())
     }
@@ -360,6 +376,10 @@ impl ArrRec {
 /// The standalone app: `IvoryApp`, plus the eframe trait impl it cannot carry.
 pub struct DesktopApp {
     app: IvoryApp,
+    /// The hardware MIDI fast lane, cloned out of `DeviceMidi` before the
+    /// ports box swallows it. `start_engine` seats each fresh engine's ring
+    /// here; the midir callback plays through it. See `midi::MidiFastLane`.
+    midi_lane: Arc<midi::MidiFastLane>,
     #[cfg(feature = "recorder")]
     recorder: Recorder,
     /// The launch splash, until it has been earned and faded. `None` after.
@@ -1322,37 +1342,20 @@ impl DesktopApp {
             }
         }
 
-        // The always-on MIDI tap, drained whether or not a take is running, and
-        // fanned out to the monitor engine in the SAME drain — the tap is a
-        // queue, so two independent drains would give each message to one
-        // consumer and starve the other.
-        let engine = self.recorder.engine.as_ref();
+        // The always-on MIDI tap, drained whether or not a take is running.
+        //
+        // **This drain no longer SOUNDS anything.** For every release before
+        // this one it forwarded each message to the engine — once per UI
+        // frame, at the end of the egui pass, which put a whole repaint
+        // interval between a key and its sound. The midir callback now plays
+        // through `midi::MidiFastLane` straight into the audio callback
+        // (drumpad mirror included), and this drain keeps only what actually
+        // needs the UI thread: the arrangement's record and the take's .mid
+        // (inside `pump_midi` itself). The lane learns the drumpad's state
+        // here, at frame rate — exactly as fresh as the old mirror was.
+        self.midi_lane.set_pads_live(self.app.drumpad_live());
         let mut arr = self.recorder.arr_rec.as_mut();
-        let pads_live = self.app.drumpad_live();
         self.recorder.session.pump_midi(|t, bytes| {
-            if let Some(e) = engine {
-                e.send_midi(t, bytes);
-                // **The drumpad's mirror.** While the panel is up with its
-                // MIDI chip lit, a live note inside the pads' sixteen ALSO
-                // strikes its pad: a copy on channel 10, the pads' own
-                // address, so the engine's one rule stays one rule. A note
-                // already on channel 10 reached the pads with the send
-                // above and is not doubled.
-                if pads_live {
-                    if let (Some(&status), Some(&note)) = (bytes.first(), bytes.get(1)) {
-                        let kind = status & 0xF0;
-                        let base = ivory_ui::recorder::DRUM_PAD_BASE;
-                        let top = base + ivory_ui::recorder::DRUM_PADS as u8;
-                        if (kind == 0x90 || kind == 0x80)
-                            && status & 0x0F != 9
-                            && (base..top).contains(&(note & 0x7F))
-                        {
-                            let vel = bytes.get(2).copied().unwrap_or(0);
-                            e.send_midi(t, &[kind | 9, note, vel]);
-                        }
-                    }
-                }
-            }
             // The arrangement's own collection: raw note edges, stamped
             // against the record's T0, on the clock the engine hears.
             if let Some(rec) = arr.as_deref_mut() {
@@ -3959,6 +3962,15 @@ const PAD_WAVE_BUCKETS: usize = 240;
                 {
                     self.recorder.session.set_plugin_tap(Some(tap));
                 }
+                // **The fast lane gets this engine's ring.** From here the
+                // midir callback feeds the audio callback directly; the old
+                // producer (a dead engine's) is dropped inside, on this
+                // thread. See `midi::MidiFastLane`.
+                if let Some(tx) =
+                    self.recorder.engine.as_mut().and_then(|e| e.take_hw_midi())
+                {
+                    self.midi_lane.install(tx);
+                }
                 self.push_monitor_settings();
                 // **Video defaults for a machine with no GPU driver.**
                 //
@@ -4675,6 +4687,7 @@ impl DesktopApp {
             }
             None => device.auto_connect(app.midi_sender()),
         }
+        let midi_lane = device.lane();
         app.set_ports(Some(Box::new(device)));
 
         #[cfg(feature = "recorder")]
@@ -4760,6 +4773,7 @@ impl DesktopApp {
         };
 
         let mut me = Self {
+            midi_lane,
             app,
             #[cfg(feature = "recorder")]
             recorder,
