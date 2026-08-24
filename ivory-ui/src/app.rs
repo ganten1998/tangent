@@ -425,6 +425,9 @@ pub struct IvoryApp {
     arr_stretch_orig: Vec<crate::arrangement::ArrClip>,
     /// Tap-tempo presses, newest last. Cleared by a 2.5 s silence.
     tap_times: Vec<std::time::Instant>,
+    /// The CLIP's own right-click menu: (clip id, where it hangs). Two rows
+    /// — delete the take, copy the take — the owner's words on both.
+    arr_clip_menu: Option<(u64, egui::Pos2)>,
     /// The meters' held picture: rise instant, fall exponential — the
     /// engine hands raw per-frame maxima, and raw maxima flicker.
     meter_hold: [[f32; 2]; crate::recorder::STRIPS],
@@ -525,7 +528,7 @@ pub struct IvoryApp {
     /// reach `ivory-host`, and it is a directory listing rather than a scan —
     /// nothing is LOADED to build this list, which matters when there are 112
     /// of them and any one could crash the process on open.
-    plugin_list: Vec<std::path::PathBuf>,
+    plugin_list: Vec<(std::path::PathBuf, Option<String>)>,
     /// The band control the pointer grabbed, and where it grabbed it.
     ///
     /// The faders and the tempo are DRAGGED, and `recorder_panel::hit_test` is
@@ -1354,6 +1357,7 @@ impl IvoryApp {
             arr_move_orig: Vec::new(),
             arr_stretch_orig: Vec::new(),
             tap_times: Vec::new(),
+            arr_clip_menu: None,
             meter_hold: [[0.0; 2]; crate::recorder::STRIPS],
             history: Vec::new(),
             hist_at: 0,
@@ -3122,6 +3126,7 @@ impl IvoryApp {
                 .custom_staff_set
                 .as_ref()
                 .map(|k| staff::StaffSet::from_key(k).label()),
+            stave_key: self.settings.staff_set().key(),
             staff_clefs: self
                 .settings
                 .staff_set()
@@ -6141,6 +6146,51 @@ impl IvoryApp {
     /// stays in the project, the way the × keeps material.
     /// COPY the selected clips — the band's set and the single selection
     /// both — starts rebased to the earliest, notes and paths intact.
+    /// The clip menu's two row rects, from where it hangs. Fixed geometry:
+    /// the same math draws it and hit-tests it, so they cannot disagree.
+    fn clip_menu_rows(at: Pos2) -> [Rect; 2] {
+        const W: f32 = 118.0;
+        const ROW: f32 = 24.0;
+        [0, 1].map(|i| {
+            Rect::from_min_size(
+                Pos2::new(at.x, at.y + ROW * i as f32),
+                egui::vec2(W, ROW),
+            )
+        })
+    }
+
+    /// Draw the clip menu over the arrangement, if one is up.
+    fn draw_clip_menu(&self, painter: &egui::Painter) {
+        let Some((_, at)) = self.arr_clip_menu else {
+            return;
+        };
+        let rows = Self::clip_menu_rows(at);
+        let frame = rows[0].union(rows[1]).expand(1.0);
+        painter.rect_filled(frame, 3.0, egui::Color32::from_rgb(0xEE, 0xE6, 0xCE));
+        painter.rect_stroke(
+            frame,
+            3.0,
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(0x24, 0x20, 0x1A)),
+            egui::StrokeKind::Inside,
+        );
+        for (r, label) in rows.iter().zip(["Delete take", "Copy take"]) {
+            painter.text(
+                Pos2::new(r.left() + 8.0, r.center().y),
+                egui::Align2::LEFT_CENTER,
+                label,
+                egui::FontId::new(11.0, crate::fonts::courier_bold()),
+                egui::Color32::from_rgb(0x24, 0x20, 0x1A),
+            );
+        }
+        painter.line_segment(
+            [
+                Pos2::new(frame.left() + 4.0, rows[1].top()),
+                Pos2::new(frame.right() - 4.0, rows[1].top()),
+            ],
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(0x24, 0x20, 0x1A).gamma_multiply(0.25)),
+        );
+    }
+
     fn arr_copy(&mut self) {
         let mut ids = self.arr_multi.clone();
         if let Some(id) = self.arr_selected {
@@ -8533,6 +8583,11 @@ impl IvoryApp {
         });
         if (pressed || secondary) && !over && !on_band && pointer.is_some() {
             self.close_midi_editor();
+            // **The dismissing press is SPENT** — the same latch the menu
+            // uses: the arrangement's input runs later this frame, and
+            // without this the click that closed the editor also landed as
+            // a locate on the lanes underneath, yanking the playhead.
+            self.menu_ate_press = true;
             return;
         }
         if on_band && self.midi_edit.as_ref().is_none_or(|m| m.drag.is_none()) {
@@ -8955,6 +9010,38 @@ impl IvoryApp {
     }
 
     fn arrangement_input(&mut self, ctx: &egui::Context) {
+        // The CLIP menu first: while it is up it owns every press.
+        if let Some((id, at)) = self.arr_clip_menu {
+            let (pressed, sec, pointer) = ctx.input(|i| {
+                (
+                    i.pointer.primary_pressed(),
+                    i.pointer.secondary_pressed(),
+                    i.pointer.interact_pos(),
+                )
+            });
+            if pressed || sec {
+                self.arr_clip_menu = None;
+                let rows = Self::clip_menu_rows(at);
+                match pointer {
+                    Some(p) if pressed && rows[0].contains(p) => {
+                        self.arr_selected = Some(id);
+                        self.arr_multi.clear();
+                        self.arr_delete_selected();
+                    }
+                    Some(p) if pressed && rows[1].contains(p) => {
+                        self.arr_selected = Some(id);
+                        self.arr_multi.clear();
+                        self.arr_copy();
+                    }
+                    _ => {
+                        // Dismissed: the press is SPENT, the same rule as
+                        // every overlay — it must not land underneath.
+                        self.menu_ate_press = true;
+                    }
+                }
+            }
+            return;
+        }
         if self.menu_state.is_some() || self.menu_ate_press {
             // The menu owns the pointer; a press elsewhere dismisses it in
             // `menu::show` without also locating the playhead underneath.
@@ -9032,6 +9119,27 @@ impl IvoryApp {
                     } else {
                         self.open_global_menu_at(ctx, p);
                     }
+                    return;
+                }
+                // **A right-press ON A CLIP opens its own menu** — delete
+                // or copy the take, the owner's two rows.
+                let on_clip = {
+                    let clips = self.arr_clip_views();
+                    let view = self.arrange_view(&clips);
+                    match crate::arrangement_panel::hit_test(rect, &view, p) {
+                        Some(
+                            crate::arrangement_panel::Hit::ClipBody(id)
+                            | crate::arrangement_panel::Hit::ClipLeft(id)
+                            | crate::arrangement_panel::Hit::ClipRight(id)
+                            | crate::arrangement_panel::Hit::FadeIn(id)
+                            | crate::arrangement_panel::Hit::FadeOut(id),
+                        ) => Some(id),
+                        _ => None,
+                    }
+                };
+                if let Some(id) = on_clip {
+                    self.arr_selected = Some(id);
+                    self.arr_clip_menu = Some((id, p));
                     return;
                 }
                 // **The right button draws the box over the LANES** — the
@@ -11158,7 +11266,7 @@ impl IvoryApp {
     ///
     /// Called once at startup by the host. Paths and names only — building it
     /// opens nothing.
-    pub fn set_plugin_list(&mut self, bundles: Vec<std::path::PathBuf>) {
+    pub fn set_plugin_list(&mut self, bundles: Vec<(std::path::PathBuf, Option<String>)>) {
         self.plugin_list = bundles;
     }
 
@@ -12026,6 +12134,12 @@ impl IvoryApp {
                 self.show_the_staff();
                 self.save_settings();
                 self.request_natural_size();
+            }
+            MenuAction::SetStave(key) => {
+                // Exclusive by construction: the whole set is REPLACED.
+                self.settings
+                    .set_staff_set(&crate::staff::StaffSet::from_key(key));
+                self.save_settings();
             }
             MenuAction::ToggleCustomClef(key) => {
                 if let Some(clef) = staff::Clef::from_key(key) {
@@ -14130,6 +14244,7 @@ impl IvoryApp {
             let clips = self.arr_clip_views();
             let view = self.arrange_view(&clips);
             crate::arrangement_panel::draw(ui.painter(), rect, &view);
+            self.draw_clip_menu(ui.painter());
             // A track mid-carry: the target row lights under the hand.
             if let Some(ArrDrag::ReorderLane { from }) = self.arr_drag {
                 let l = crate::arrangement_panel::Layout::new(rect, &view);

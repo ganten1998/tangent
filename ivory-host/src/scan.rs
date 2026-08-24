@@ -141,6 +141,28 @@ const MAX_DIRS: usize = 4_000;
 /// [`MAX_DIRS`], and the `seen` set, which holds canonical paths so that a
 /// folder reachable two ways (a symlink into the system directory is the common
 /// one) is walked once and listed once.
+/// The vendor a bundle NAMES, without loading a byte of its code.
+///
+/// VST3 3.7+ ships `moduleinfo.json` (in `Contents/Resources/` per the spec,
+/// `Contents/` in the wild) whose "Factory Info" object carries "Vendor".
+/// Read with a tolerant scan rather than a JSON crate: the answer feeds a
+/// GROUPING in the picker, and a file this scanner cannot read simply lands
+/// the plugin in the unlabelled group at the bottom — the same place a
+/// pre-3.7 plugin with no moduleinfo at all lands.
+pub fn vendor_of(bundle: &Path) -> Option<String> {
+    let text = ["Contents/Resources/moduleinfo.json", "Contents/moduleinfo.json"]
+        .iter()
+        .find_map(|rel| std::fs::read_to_string(bundle.join(rel)).ok())?;
+    let factory = text.find("\"Factory Info\"")?;
+    let after = &text[factory..];
+    let vkey = after.find("\"Vendor\"")?;
+    let rest = &after[vkey + "\"Vendor\"".len()..];
+    let open = rest.find('"')? + 1;
+    let close = rest[open..].find('"')?;
+    let vendor = rest[open..open + close].trim();
+    (!vendor.is_empty()).then(|| vendor.to_owned())
+}
+
 pub fn discover_in(extra: &[PathBuf]) -> Vec<PathBuf> {
     discover_reported(extra).found
 }

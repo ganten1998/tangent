@@ -1662,6 +1662,12 @@ impl PluginEntry {
     pub const OWN_PLUGIN_STEM: &'static str = "Tangent";
 
     pub fn from_bundle(path: &Path) -> PluginEntry {
+        Self::from_bundle_with_vendor(path, None)
+    }
+
+    /// The picker's own builder: the vendor rides in from the scan, and an
+    /// unnamed one stays empty — the bottom group, per the owner.
+    pub fn from_bundle_with_vendor(path: &Path, vendor: Option<&str>) -> PluginEntry {
         let stem = path
             .file_stem()
             .map(|s| s.to_string_lossy().trim().to_owned())
@@ -1674,7 +1680,7 @@ impl PluginEntry {
         let vendor = if name == Self::OWN_PLUGIN_STEM {
             "this app's own display plugin - for a DAW, not for here".to_owned()
         } else {
-            String::new()
+            vendor.unwrap_or("").to_owned()
         };
         PluginEntry {
             name,
@@ -1851,15 +1857,24 @@ impl Dialog {
     /// before "arturia", which in a list of 112 is indistinguishable from
     /// unsorted. And the loaded plugin is preselected, so the dialog opens on
     /// the answer to "what am I playing through", not on row one.
-    pub fn plugin_picker(bundles: &[PathBuf], current: Option<String>) -> Dialog {
+    pub fn plugin_picker(
+        bundles: &[(PathBuf, Option<String>)],
+        current: Option<String>,
+    ) -> Dialog {
         let mut plugins: Vec<PluginEntry> = bundles
             .iter()
-            .map(|p| PluginEntry::from_bundle(p))
+            .map(|(p, v)| PluginEntry::from_bundle_with_vendor(p, v.as_deref()))
             .collect();
+        // **By DEVELOPER, the owner's ruling**: the named vendors in
+        // alphabetical order, each one's plugins alphabetical inside it, and
+        // everything that names no vendor together at the BOTTOM. The row
+        // prints the vendor, so the grouping reads as sections.
         plugins.sort_by(|a, b| {
-            a.name
-                .to_lowercase()
-                .cmp(&b.name.to_lowercase())
+            a.vendor
+                .is_empty()
+                .cmp(&b.vendor.is_empty())
+                .then_with(|| a.vendor.to_lowercase().cmp(&b.vendor.to_lowercase()))
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
                 // Two bundles can share a name — the user's copy and the system
                 // one — and a comparator that called them equal would order
                 // them differently on different runs.
@@ -7119,7 +7134,7 @@ mod tests {
     /// also does. This runs the frame inline, the way a plugin editor draws it.
     #[test]
     fn the_loaded_plugin_opens_preselected_and_marked() {
-        let bundles: Vec<PathBuf> = [
+        let bundles: Vec<(PathBuf, Option<String>)> = [
             "/Library/Audio/Plug-Ins/VST3/Vital.vst3",
             // Lower case on purpose: `discover` sorts paths, so a byte sort
             // would file this after "Vital" and a user would call the list
@@ -7128,7 +7143,7 @@ mod tests {
             "/Users/x/Library/Audio/Plug-Ins/VST3/Pianoteq 8.vst3",
         ]
         .iter()
-        .map(PathBuf::from)
+        .map(|p| (PathBuf::from(p), None))
         .collect();
         let loaded = "/Users/x/Library/Audio/Plug-Ins/VST3/Pianoteq 8.vst3".to_owned();
 
@@ -7234,8 +7249,8 @@ mod tests {
         let loaded = "/Users/x/Library/Audio/Plug-Ins/VST3/Pianoteq 8.vst3".to_owned();
         let mut dialog = Some(Dialog::plugin_picker(
             &[
-                PathBuf::from("/Library/Audio/Plug-Ins/VST3/Vital.vst3"),
-                PathBuf::from(&loaded),
+                (PathBuf::from("/Library/Audio/Plug-Ins/VST3/Vital.vst3"), None),
+                (PathBuf::from(&loaded), None),
             ],
             Some(loaded.clone()),
         ));

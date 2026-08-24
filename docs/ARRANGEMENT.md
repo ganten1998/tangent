@@ -748,6 +748,25 @@ channels play back their clips and nothing else. "Ready to play" and
   decision reads only the piano and neck flags now; the staff still
   follows.
 
+- **4.73.0 — the tester round, part two**: the RECORDING GHOST kept
+  its shape — the notes miniature (and the audio wave) mapped time
+  onto the viewport-CLAMPED rect, so a take crossing the right edge
+  watched its own notes slide leftward; both map through the clip's
+  full pixel span now. Closing the MIDI editor with a click SPENDS
+  the click (the menu's own latch) — it no longer also locates the
+  playhead underneath. The PLUGIN PICKER lists by DEVELOPER: vendor
+  read from moduleinfo.json without loading a byte of plugin code
+  (`vendor_of` in the scan), named vendors alphabetical, unnamed at
+  the bottom — and the filter box already searched vendors. ONE
+  STAVE AT A TIME: the "Staves" category became "Stave", an
+  exclusive pick — Grand Staff at the top and default, then each
+  single clef; the multi-staff stack returns as a later feature.
+  CLIPS carry their own right-click menu: Delete take / Copy take,
+  and dismissing it spends the press. And dist/ went from 10 GB /
+  371 items to the current release + build inputs, stamped
+  `.metadata_never_index` so Spotlight leaves it alone (2.x-era
+  artifacts archived to ~/Dropbox/Archive/tangent-dist-legacy/).
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index

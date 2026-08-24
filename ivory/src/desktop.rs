@@ -1592,7 +1592,16 @@ impl DesktopApp {
                 );
             }
             self.recorder.take_note = Some(note);
-            self.app.set_plugin_list(report.found);
+            self.app.set_plugin_list(
+                report
+                    .found
+                    .into_iter()
+                    .map(|p| {
+                        let v = ivory_host::vendor_of(&p);
+                        (p, v)
+                    })
+                    .collect(),
+            );
         }
         // **The user's effect, across the effects bus.**
         //
@@ -4725,7 +4734,15 @@ impl DesktopApp {
             // process before the window has appeared. A bundle is opened only
             // when the user picks it.
             let extra = app.plugin_folders();
-            app.set_plugin_list(ivory_host::discover_in(&extra));
+            app.set_plugin_list(
+                ivory_host::discover_in(&extra)
+                    .into_iter()
+                    .map(|p| {
+                        let v = ivory_host::vendor_of(&p);
+                        (p, v)
+                    })
+                    .collect(),
+            );
             Recorder {
                 transport: crate::transport::Transport::new(),
                 pending_monitor: None,
