@@ -716,6 +716,27 @@ channels play back their clips and nothing else. "Ready to play" and
   EMPTY slot in either view (arrange falls through to the app menu,
   the mixer does nothing).
 
+- **4.71.0 — fine that integrates**: every dial AND slider drag
+  (band knobs, mixer faders and dials, arrange header dials, drumpad
+  sliders) prices each frame's MOTION at that frame's Shift state and
+  re-anchors — the old math scaled the whole accumulated distance,
+  so pressing or releasing Shift mid-drag re-priced everything the
+  hand had done (the tempo dial flew to an extreme when Shift let
+  go). Shift now works in either order, engages and releases cleanly
+  mid-drag, and FINE_DRAG went from a sixth to a TENTH: approximate
+  at full speed, land the exact number. Empty mixer slots answer
+  right-click with the app menu (room, no track), and the mixer
+  stands down while a menu is up or just dismissed. THE ZOOM TRIO,
+  both views: `-` out and `=` in, in steps; `W` fits the biggest
+  clip (arrange; the shipped zoom when empty) or the clip (editor);
+  and the WHEEL zooms AT THE PLAYHEAD now, not the pointer — click
+  bar five, the wheel zooms there. Help cards carry all of it. AND
+  THE FLASH OF TWO CHORDS: transposing a Space-held chord drew old
+  and new notes together for a beat — `display_notes` is the lit set
+  union `sounding`, and `sounding` waited for the frame's end. The
+  transpose reconciles the sound immediately now: every old note is
+  OFF before the picture shows the new ones.
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index

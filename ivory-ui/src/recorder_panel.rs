@@ -1617,7 +1617,10 @@ pub const FADER_TRAVEL: f32 =
 /// tenths of a decibel per point, so half the numbers it can display cannot be
 /// landed on. Six times finer puts every one of them within reach without
 /// making the ordinary gesture sluggish.
-pub const FINE_DRAG: f32 = 1.0 / 6.0;
+// A tenth, was a sixth: with the drags INTEGRATING now (fine scales each
+// frame's motion, never the accumulated distance), the factor can afford to
+// be truly fine — approximate at full speed, then land the exact number.
+pub const FINE_DRAG: f32 = 0.1;
 
 /// How far UP `r` the point `pos` fell, 0..=1 from its bottom edge to its top.
 ///
