@@ -136,6 +136,10 @@ pub enum Dialog {
         selected: Option<usize>,
         /// The bundle path currently loaded, if any.
         current: Option<String>,
+        /// Vendor folders currently EXPANDED. Empty at open — every folder
+        /// collapsed, the owner's ruling — except the one holding the
+        /// loaded plugin, so the preselected row is not invisible.
+        open_folders: Vec<String>,
         /// Free-text filter. There are 112 VST3s on the owner's machine and
         /// scrolling a list that long to find "piano" is the difference
         /// between a usable picker and a bad one, so this is the primary
@@ -1793,6 +1797,17 @@ fn plugin_choice<'a>(
 /// devices and you can see them all; ninety rows down a list of 112 a trailing
 /// bullet is invisible, and the dialog's font is monospace, so a one-character
 /// gutter lines every row up into a column you can run an eye down.
+/// The folder a scanned plugin files under. One rule, used by the
+/// builder (to pre-open the loaded plugin's folder) and the draw (to
+/// interleave the headings), so the two cannot disagree.
+fn plugin_folder(entry: &PluginEntry) -> &str {
+    if entry.vendor.trim().is_empty() {
+        "Other"
+    } else {
+        entry.vendor.as_str()
+    }
+}
+
 fn plugin_row(entry: &PluginEntry, current: Option<&str>) -> String {
     let mark = if current == Some(entry.path.as_str()) {
         '\u{2022}'
@@ -1909,10 +1924,18 @@ impl Dialog {
         let selected = current
             .as_deref()
             .and_then(|c| plugins.iter().position(|p| p.path == c));
+        // Every folder closed at open — except the loaded plugin's, so the
+        // preselected, marked row has somewhere to be seen.
+        let open_folders = selected
+            .and_then(|i| plugins.get(i))
+            .filter(|e| e.path != BUILTIN_PATH && e.path != DRUMPAD_PATH)
+            .map(|e| vec![plugin_folder(e).to_owned()])
+            .unwrap_or_default();
         Dialog::PluginPicker {
             plugins,
             selected,
             current,
+            open_folders,
             filter: String::new(),
             focus: true,
         }
@@ -3165,6 +3188,7 @@ pub fn show(
             plugins,
             selected,
             current,
+            open_folders,
             filter,
             focus,
         } => {
@@ -3286,37 +3310,57 @@ pub fn show(
                                     {
                                         *selected = None;
                                     }
-                                    let mut open_folder: Option<&str> = None;
+                                    let filtering = !filter.trim().is_empty();
+                                    let mut seen_folder: Option<String> = None;
+                                    let mut folder_open = true;
                                     for &i in &visible {
                                         let Some(entry) = plugins.get(i) else {
                                             continue;
                                         };
-                                        // **The vendor is a FOLDER.** The list
-                                        // is sorted by vendor, so a heading at
-                                        // every change of group reads as the
-                                        // directory tree the owner asked for;
-                                        // the unnamed tail gathers under
-                                        // "Other". The two built-ins stand
-                                        // above every folder, unlabelled.
+                                        // **The vendor is a DROPDOWN.** Every
+                                        // folder closed by default — the
+                                        // owner's ruling — the heading a
+                                        // click toggles, and an active filter
+                                        // overrides the collapse: a search
+                                        // that found things inside closed
+                                        // folders must not read as a search
+                                        // that found nothing. The built-ins
+                                        // stand above every folder.
                                         let builtin = entry.path == BUILTIN_PATH
                                             || entry.path == DRUMPAD_PATH;
                                         if !builtin {
-                                            let folder: &str = if entry.vendor.trim().is_empty()
-                                            {
-                                                "Other"
-                                            } else {
-                                                entry.vendor.as_str()
-                                            };
-                                            if open_folder != Some(folder) {
-                                                open_folder = Some(folder);
+                                            let folder = plugin_folder(entry).to_owned();
+                                            if seen_folder.as_deref() != Some(folder.as_str()) {
+                                                folder_open = filtering
+                                                    || open_folders.contains(&folder);
                                                 ui.add_space(5.0);
-                                                ui.label(
+                                                let head = ui.selectable_label(
+                                                    false,
                                                     RichText::new(format!(
-                                                        "\u{25BE} {folder}"
+                                                        "{} {folder}",
+                                                        if folder_open {
+                                                            '\u{25BE}'
+                                                        } else {
+                                                            '\u{25B8}'
+                                                        }
                                                     ))
                                                     .font(bold(11.0))
                                                     .color(faint),
                                                 );
+                                                if head.clicked() {
+                                                    if let Some(at) = open_folders
+                                                        .iter()
+                                                        .position(|f| *f == folder)
+                                                    {
+                                                        open_folders.remove(at);
+                                                    } else {
+                                                        open_folders.push(folder.clone());
+                                                    }
+                                                }
+                                                seen_folder = Some(folder);
+                                            }
+                                            if !folder_open {
+                                                continue;
                                             }
                                         }
                                         let resp = ui.selectable_label(
@@ -7185,6 +7229,7 @@ mod tests {
                 plugins,
                 selected,
                 current,
+                open_folders: _,
                 filter,
                 focus,
             } => {

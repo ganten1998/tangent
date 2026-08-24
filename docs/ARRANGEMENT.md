@@ -782,6 +782,13 @@ channels play back their clips and nothing else. "Ready to play" and
   VST3 on the machine; REAPER's longer list is its AU (93 here) and
   VST2 (91) backends, which a VST3-only host cannot load.
 
+- **4.75.0 — the folders close**: the picker's vendor folders are
+  DROPDOWNS now, every one collapsed at open — except the folder
+  holding the loaded plugin, so the preselected row has somewhere to
+  be seen. A click on the heading toggles it (▸/▾), and an active
+  filter overrides the collapse: a search that found things inside
+  closed folders must not read as a search that found nothing.
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index
