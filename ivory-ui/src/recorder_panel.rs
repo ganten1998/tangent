@@ -4553,6 +4553,10 @@ mod tests {
             let l = SetupLayout::new(screen, anchor);
             let zones: Vec<(&str, Rect)> = vec![
                 ("name", l.name),
+                ("project", l.project_row),
+                ("plugin folders", l.plugin_folders),
+                ("audio count-in", l.audio_count_in),
+                ("audio sig", l.audio_sig),
                 ("dest", l.dest),
                 ("reveal", l.reveal),
                 ("folder", l.folder),
@@ -6343,10 +6347,13 @@ mod tests {
 /// the band's own — a settings panel that shouts. It is a utility panel: it
 /// wants to be readable and out of the way, at about the weight of the boxes
 /// it was summoned from.
-const SETUP_W: (f32, f32, f32) = (0.24, 290.0, 430.0);
+// A third of the screen, and never under 380 points: the owner called the
+// old 290-430 card "too small and a pain to use", and the fix is ROOM —
+// every row's text sizes itself to its rectangle, so width IS legibility.
+const SETUP_W: (f32, f32, f32) = (0.34, 380.0, 580.0);
 /// Its height over its width. Grew with the section headers: the same
 /// seven rows of controls, plus the two bands that name their tiers.
-const SETUP_ASPECT: f32 = 1.06;
+const SETUP_ASPECT: f32 = 1.16;
 /// Rows of controls under the title.
 ///
 /// **Seven: six about the take, and Setup.** The camera and the audio input
@@ -6480,7 +6487,7 @@ impl SetupLayout {
         // merely touch share a line of pixels and every overlap test in this
         // file fails there.
         const HEAD: f32 = 0.55;
-        let units = HEAD * 2.0 + SETUP_ROWS as f32 + 1.0;
+        let units = HEAD * 2.0 + SETUP_ROWS as f32 + 2.0;
         let pitch = rows.height() / units;
         let mut y = rows.top();
         let mut band = |u: f32| {
@@ -6494,6 +6501,7 @@ impl SetupLayout {
         let audio_head = band(HEAD);
         let r6 = band(1.0);
         let ra2 = band(1.0);
+        let ra3 = band(1.0);
         let take_head = band(HEAD);
         let r0 = band(1.0);
         let r1 = band(1.0);
@@ -6548,10 +6556,10 @@ impl SetupLayout {
             take_head,
             audio_count_in: slice_h(ra2, 0.00, 0.30),
             audio_sig: slice_h(ra2, 0.33, 0.55),
-            // The row's free half: the two doors the owner asked the cog
-            // to carry — the Project dialog and the plugin folders.
-            project_row: slice_h(ra2, 0.58, 0.77),
-            plugin_folders: slice_h(ra2, 0.80, 1.00),
+            // A row of their own: crammed onto the count-in row's free
+            // half they were the least legible thing on the card.
+            project_row: slice_h(ra3, 0.00, 0.48),
+            plugin_folders: slice_h(ra3, 0.52, 1.00),
         }
     }
 
@@ -7292,8 +7300,8 @@ pub fn draw_setup(
     }
     // The two doors the cog carries now: the Project dialog and the
     // plugin folders — the menu's rows, reachable without the menu.
-    labelled(painter, l.project_row, "PROJECT", "Open...", p.ink, &p);
-    labelled(painter, l.plugin_folders, "PLUGINS", "Folders...", p.ink, &p);
+    labelled(painter, l.project_row, "PROJECT", "New / Open / Save...", p.ink, &p);
+    labelled(painter, l.plugin_folders, "PLUGINS", "Add a folder...", p.ink, &p);
     {
         let typing = typing_for(view, NumField::Meter);
         let shown = typing
