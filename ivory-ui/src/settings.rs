@@ -1216,7 +1216,10 @@ impl Default for Settings {
             // Every instrument slot sends everything; nothing else sends
             // anything. See `recorder::Desk::default`.
             strip_sends: std::array::from_fn(|i| {
-                if i < crate::recorder::SLOTS { 1.0 } else { 0.0 }
+                // Only the shipped DX7 (strip 0) arrives wired to the
+                // reverb — the owner's ruling. Every other row, the drum
+                // track included, rests DRY until somebody turns it up.
+                if i == 0 { 1.0 } else { 0.0 }
             }),
             strip_names: Vec::new(),
             // Channel 0's bay 1 holds the built-in — the pre-added DX7 that

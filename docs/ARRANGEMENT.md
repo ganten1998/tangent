@@ -697,6 +697,25 @@ channels play back their clips and nothing else. "Ready to play" and
   default — a motionless click on the track means nothing now, and a
   double on the number is just a hasty click into the field.
 
+- **4.70.0 — the dismissal is spent, the sliders reset, the sends
+  rest dry**: closing a context menu EATS the click — either button
+  dismisses, and the press never reaches the surface underneath (a
+  left-click out of the editor's menu was also drawing a note under
+  the pointer; `menu_ate_press` latch, cleared each frame, honoured
+  by the arrange/editor/drumpad inputs). The drumpad slider's
+  double-click-to-reset moved to the RELEASE — `button_double_clicked`
+  fires on the second release (the 4.54 landmine), so the press-site
+  check could never see it. The SETTINGS headline and OK shrank
+  (0.34 title share, the button smaller than its band). NEW SENDS
+  REST AT ZERO: only the shipped DX7 arrives wired to the reverb —
+  fresh binds and bare births set 0%, and the shipped default itself
+  is 1.0 on strip 0 alone. RIGHT-CLICK ZONES scoped: a knob's
+  right-click answers on the DIAL ITSELF (circle + tick skirt, via
+  `on_knob_circle`) — the cell is mostly margin and it was eating
+  every press near a knob; and the TRACK menu no longer opens on an
+  EMPTY slot in either view (arrange falls through to the app menu,
+  the mixer does nothing).
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index
