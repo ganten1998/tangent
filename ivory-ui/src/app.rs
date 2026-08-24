@@ -409,6 +409,12 @@ pub struct IvoryApp {
     /// A GROUP move's snapshot: `(id, start_s, lane)` for every selected
     /// clip when a member was grabbed — the whole set rides the drag.
     arr_move_orig: Vec<(u64, f64, usize)>,
+    /// The stretch gesture's press-time snapshot — whole clips, notes and
+    /// all, because every value scales from its ORIGINAL, never from the
+    /// last tick's (which would compound rounding into drift).
+    arr_stretch_orig: Vec<crate::arrangement::ArrClip>,
+    /// Tap-tempo presses, newest last. Cleared by a 2.5 s silence.
+    tap_times: Vec<std::time::Instant>,
     /// The meters' held picture: rise instant, fall exponential — the
     /// engine hands raw per-frame maxima, and raw maxima flicker.
     meter_hold: [[f32; 2]; crate::recorder::STRIPS],
@@ -724,6 +730,10 @@ enum ArrDrag {
     Move { id: u64, dt: f64 },
     TrimLeft { id: u64 },
     TrimRight { id: u64 },
+    /// Shift-drag from a MIDI clip's edge: the selected MIDI clips stretch
+    /// in time. The snapshot lives in `arr_stretch_orig` (this enum is
+    /// `Copy`); `anchor` is the group's fixed end.
+    Stretch { id: u64, from_left: bool, anchor: f64 },
     FadeIn { id: u64 },
     FadeOut { id: u64 },
     /// The header knob: relative and vertical, the mixer fader's feel.
@@ -818,6 +828,14 @@ enum MeDrag {
     Vel,
     /// Cmd-drag on empty roll: the rubber band.
     Marquee,
+    /// Shift-drag from a note's edge: the SELECTION stretches in time.
+    /// `orig` is (index, at, dur) at the press; `anchor` is the fixed end.
+    Stretch {
+        i: usize,
+        from_left: bool,
+        anchor: f64,
+        orig: Vec<(usize, f64, f64)>,
+    },
 }
 
 /// Where the media explorer wakes up: the user's home, or the root.
@@ -1317,6 +1335,8 @@ impl IvoryApp {
             arr_multi: Vec::new(),
             arr_band: None,
             arr_move_orig: Vec::new(),
+            arr_stretch_orig: Vec::new(),
+            tap_times: Vec::new(),
             meter_hold: [[0.0; 2]; crate::recorder::STRIPS],
             history: Vec::new(),
             hist_at: 0,
@@ -2419,18 +2439,18 @@ impl IvoryApp {
             // state — deliberately unsaved, so no project can open loud.
             H::Arm(i) => {
                 if let Some(Strip::Channel(n)) = i.strip() {
-                    // **One arm at a time.** A plain press makes this lane
-                    // THE armed lane — every stale arm left over from a
-                    // track's birth or first bind stands down, which is how
-                    // "arming one midi track" stops recording three.
-                    // Shift+press keeps the old additive toggle for anyone
-                    // who really wants a multi-lane take.
+                    // **A plain press TOGGLES, the way it always did** — the
+                    // owner vetoed the exclusive default the moment it
+                    // shipped ("I can now only arm one track at a time").
+                    // What stays exclusive is the SILENT arms: a track's
+                    // birth and its first bind stand the others down — that
+                    // invisible pile-up was the phantom multi-record, not
+                    // anybody's deliberate clicks. Shift+press is the
+                    // one-lane gesture: THIS lane alone, the rest disarmed.
                     if self.shift_down {
-                        self.armed ^= 1 << n;
-                    } else if self.armed == 1 << n {
-                        self.armed = 0;
-                    } else {
                         self.armed = 1 << n;
+                    } else {
+                        self.armed ^= 1 << n;
                     }
                 }
                 return;
@@ -6356,6 +6376,98 @@ impl IvoryApp {
         self.me_resize_note_min(i, t, 0.05);
     }
 
+    /// Arm the STRETCH: shift-drag from an edge scales the whole selection
+    /// in time — the owner's "seven notes in the space of four". The set is
+    /// the selection when the grabbed note is in it, the note alone when
+    /// not; the anchor is the set's far end, so the dragged edge lands on
+    /// the grid (via `me_snap`) and everything between scales to fit.
+    fn me_begin_stretch(&mut self, i: usize, from_left: bool) {
+        let Some(st) = self.midi_edit.as_ref() else {
+            return;
+        };
+        let id = st.id;
+        let set: Vec<usize> = if st.selected.contains(&i) && st.selected.len() > 1 {
+            st.selected.clone()
+        } else {
+            vec![i]
+        };
+        let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == id) else {
+            return;
+        };
+        let orig: Vec<(usize, f64, f64)> = set
+            .iter()
+            .filter_map(|&j| clip.notes.get(j).map(|n| (j, n.at_s, n.dur_s)))
+            .collect();
+        if orig.is_empty() {
+            return;
+        }
+        let anchor = if from_left {
+            orig.iter().map(|(_, a, d)| a + d).fold(f64::MIN, f64::max)
+        } else {
+            orig.iter().map(|(_, a, _)| *a).fold(f64::MAX, f64::min)
+        };
+        if let Some(st) = self.midi_edit.as_mut() {
+            if !st.selected.contains(&i) {
+                st.selected.clear();
+                st.selected.push(i);
+            }
+            st.drag = Some(MeDrag::Stretch { i, from_left, anchor, orig });
+        }
+    }
+
+    /// One stretch tick: the grabbed note's ORIGINAL edge and the snapped
+    /// hand give the factor; every note in the set scales from its
+    /// press-time values, so the gesture never compounds its own rounding.
+    fn me_stretch(&mut self, i: usize, from_left: bool, anchor: f64, orig: &[(usize, f64, f64)], t: f64) {
+        let Some(st) = self.midi_edit.as_ref() else {
+            return;
+        };
+        let id = st.id;
+        // Snap in ABSOLUTE time — the grid lives on the timeline — then step
+        // into the notes' own space: clip-source-relative, trim included,
+        // exactly as `me_resize_note_left` reads it the other way round.
+        let t = self.me_snap(t);
+        let Some((c0, off)) = self
+            .arrangement
+            .clips
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| (c.start_s, c.offset_s))
+        else {
+            return;
+        };
+        let t = (t - c0) + off;
+        let Some(&(_, ga, gd)) = orig.iter().find(|(j, ..)| *j == i) else {
+            return;
+        };
+        let denom = if from_left { anchor - ga } else { (ga + gd) - anchor };
+        if denom <= 1.0e-9 {
+            return;
+        }
+        let num = if from_left { anchor - t } else { t - anchor };
+        let k = (num / denom).clamp(0.02, 64.0);
+        let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
+            return;
+        };
+        for &(j, a0, d0) in orig {
+            let Some(n) = clip.notes.get_mut(j) else {
+                continue;
+            };
+            if from_left {
+                let end = anchor - (anchor - (a0 + d0)) * k;
+                n.dur_s = (d0 * k).max(0.01);
+                n.at_s = (end - n.dur_s).max(0.0);
+            } else {
+                n.at_s = anchor + (a0 - anchor) * k;
+                n.dur_s = (d0 * k).max(0.01);
+            }
+        }
+        self.clips_dirty = true;
+        if let Some(st) = self.midi_edit.as_mut() {
+            st.dirty = true;
+        }
+    }
+
     /// RESIZE from the HEAD: the start follows the hand — snapped by the
     /// grid's own state exactly as the tail is — and the END stands still,
     /// so lengthening one side never moves the other.
@@ -8442,6 +8554,10 @@ impl IvoryApp {
                     Some(H::NoteRight(i)) => {
                         if secondary {
                             self.me_delete_note(i);
+                        } else if shift {
+                            // Shift from the TAIL: the selection STRETCHES,
+                            // the head end standing still.
+                            self.me_begin_stretch(i, false);
                         } else {
                             self.me_select(i, false);
                             if let Some(st) = self.midi_edit.as_mut() {
@@ -8452,6 +8568,10 @@ impl IvoryApp {
                     Some(H::NoteLeft(i)) => {
                         if secondary {
                             self.me_delete_note(i);
+                        } else if shift {
+                            // Shift from the HEAD: the stretch anchored at
+                            // the selection's far end.
+                            self.me_begin_stretch(i, true);
                         } else {
                             self.me_select(i, false);
                             if let Some(st) = self.midi_edit.as_mut() {
@@ -8541,6 +8661,9 @@ impl IvoryApp {
                     self.me_move_selection(i, t_at, key_at, dt, &orig);
                 }
                 MeDrag::Resize { i } => self.me_resize_note(i, t_at),
+                MeDrag::Stretch { i, from_left, anchor, orig } => {
+                    self.me_stretch(i, from_left, anchor, &orig, t_at);
+                }
                 MeDrag::ResizeLeft { i } => self.me_resize_note_left(i, t_at),
                 MeDrag::GridStep { from_y, start } => {
                     let steps = f64::from((from_y - p.y) / 14.0).round() as i64;
@@ -9023,12 +9146,49 @@ impl IvoryApp {
                     | Some(A::FadeOut(id)) => {
                         self.arr_selected = Some(id);
                         self.arr_resolve_len(id);
-                        self.arr_drag = Some(match hit {
-                            Some(A::ClipLeft(_)) => ArrDrag::TrimLeft { id },
-                            Some(A::ClipRight(_)) => ArrDrag::TrimRight { id },
-                            Some(A::FadeIn(_)) => ArrDrag::FadeIn { id },
-                            _ => ArrDrag::FadeOut { id },
+                        let edge_left = matches!(hit, Some(A::ClipLeft(_)));
+                        let on_edge =
+                            matches!(hit, Some(A::ClipLeft(_)) | Some(A::ClipRight(_)));
+                        let grabbed_midi = self.arrangement.clips.iter().any(|c| {
+                            c.id == id && c.kind == crate::arrangement::ClipKind::Midi
                         });
+                        if shift && on_edge && grabbed_midi {
+                            // **Shift from a MIDI clip's edge STRETCHES.**
+                            // The set is the multi-selection's MIDI clips
+                            // (the grabbed one included); audio cannot
+                            // stretch and stays out. Snapshot at the press
+                            // — every tick scales from these originals.
+                            let orig: Vec<crate::arrangement::ArrClip> = self
+                                .arrangement
+                                .clips
+                                .iter()
+                                .filter(|c| {
+                                    (c.id == id || self.arr_multi.contains(&c.id))
+                                        && c.kind == crate::arrangement::ClipKind::Midi
+                                })
+                                .cloned()
+                                .collect();
+                            let anchor = if edge_left {
+                                orig.iter()
+                                    .map(|c| c.start_s + c.len_s)
+                                    .fold(f64::MIN, f64::max)
+                            } else {
+                                orig.iter().map(|c| c.start_s).fold(f64::MAX, f64::min)
+                            };
+                            self.arr_stretch_orig = orig;
+                            self.arr_drag = Some(ArrDrag::Stretch {
+                                id,
+                                from_left: edge_left,
+                                anchor,
+                            });
+                        } else {
+                            self.arr_drag = Some(match hit {
+                                Some(A::ClipLeft(_)) => ArrDrag::TrimLeft { id },
+                                Some(A::ClipRight(_)) => ArrDrag::TrimRight { id },
+                                Some(A::FadeIn(_)) => ArrDrag::FadeIn { id },
+                                _ => ArrDrag::FadeOut { id },
+                            });
+                        }
                     }
                     // Empty room: the playhead goes HERE and the selection
                     // clears — the gesture Ableton taught everyone. WITH
@@ -9140,6 +9300,9 @@ impl IvoryApp {
                 }
                 ArrDrag::TrimLeft { id } => self.arr_trim_left(id, t_at),
                 ArrDrag::TrimRight { id } => self.arr_trim_right(id, t_at),
+                ArrDrag::Stretch { id, from_left, anchor } => {
+                    self.arr_stretch(id, from_left, anchor, t_at);
+                }
                 ArrDrag::FadeIn { id } => self.arr_fade_in(id, t_at),
                 ArrDrag::FadeOut { id } => self.arr_fade_out(id, t_at),
                 ArrDrag::Gain { lane, from_y, from } => {
@@ -9337,6 +9500,7 @@ impl IvoryApp {
             }
             self.arr_drag = None;
             self.arr_move_orig.clear();
+            self.arr_stretch_orig.clear();
         }
 
         // ── the keys the view owns ────────────────────────────────────────
@@ -10203,11 +10367,126 @@ impl IvoryApp {
                 self.name_focused = false;
             }
             Hit::SetTempo(bpm) => {
-                self.settings.record_export.tempo_bpm =
-                    bpm.clamp(recorder::MIN_BPM, recorder::MAX_BPM);
+                let old = self.settings.record_export.tempo_bpm;
+                let new = bpm.clamp(recorder::MIN_BPM, recorder::MAX_BPM);
+                self.settings.record_export.tempo_bpm = new;
+                self.retime_arrangement(old, new);
                 self.save_settings_soon();
             }
+            Hit::TapTempo => {
+                // **Tap your rhythm, the tempo follows.** The window is the
+                // run of taps since the last 2.5 s silence, capped at eight;
+                // the reading is total-span over taps-minus-one, which
+                // weighs every interval equally and settles fast.
+                let now = std::time::Instant::now();
+                if self
+                    .tap_times
+                    .last()
+                    .is_some_and(|t| now.duration_since(*t).as_secs_f64() > 2.5)
+                {
+                    self.tap_times.clear();
+                }
+                self.tap_times.push(now);
+                if self.tap_times.len() > 8 {
+                    let cut = self.tap_times.len() - 8;
+                    self.tap_times.drain(..cut);
+                }
+                if self.tap_times.len() >= 2 {
+                    let span = now
+                        .duration_since(self.tap_times[0])
+                        .as_secs_f64()
+                        .max(1.0e-3);
+                    let beats = (self.tap_times.len() - 1) as f64;
+                    let old = self.settings.record_export.tempo_bpm;
+                    let bpm =
+                        (60.0 * beats / span).clamp(recorder::MIN_BPM, recorder::MAX_BPM);
+                    self.settings.record_export.tempo_bpm = bpm;
+                    self.retime_arrangement(old, bpm);
+                    self.save_settings_soon();
+                }
+            }
         }
+    }
+
+    /// **The document FOLLOWS the tempo.** A MIDI clip is beats, and beats
+    /// are what the player wrote — storing seconds is an encoding, not a
+    /// meaning. So when the tempo moves, every MIDI clip's start, length,
+    /// trim and notes are rescaled by `old/new`, and every AUDIO clip keeps
+    /// its bar seat (start only — audio itself cannot stretch). Before this,
+    /// a clip written at 120 was, in the owner's words, "made unusable at
+    /// 180". Mid-drag the doc save waits for the knob's release (the release
+    /// path calls `arr_save_edits`); a typed or tapped tempo saves at once.
+    fn retime_arrangement(&mut self, old_bpm: f64, new_bpm: f64) {
+        if old_bpm <= 0.0 || new_bpm <= 0.0 {
+            return;
+        }
+        let r = old_bpm / new_bpm;
+        if (r - 1.0).abs() < 1.0e-12 || self.arrangement.clips.is_empty() {
+            return;
+        }
+        for c in &mut self.arrangement.clips {
+            c.start_s *= r;
+            if c.kind == crate::arrangement::ClipKind::Midi {
+                c.len_s *= r;
+                c.offset_s *= r;
+                for n in &mut c.notes {
+                    n.at_s *= r;
+                    n.dur_s *= r;
+                }
+            }
+        }
+        self.clips_dirty = true;
+        let mid_drag = self
+            .grabbed
+            .is_some_and(|g| g.hit.is_same_control(recorder_panel::Hit::SetTempo(0.0)));
+        if !mid_drag {
+            self.arr_save_edits();
+        }
+    }
+
+    /// One arrange-stretch tick. The grabbed clip's ORIGINAL edge and the
+    /// snapped hand give the factor; every MIDI clip in the press-time
+    /// snapshot scales from its originals — starts and lengths around the
+    /// group's fixed end, trims, fades and every note with them. "Shrink
+    /// them to half size", exactly, when the edge lands a half-span in.
+    fn arr_stretch(&mut self, id: u64, from_left: bool, anchor: f64, t_raw: f64) {
+        let t = self.arr_snap_t(t_raw);
+        let Some(g0) = self.arr_stretch_orig.iter().find(|c| c.id == id) else {
+            return;
+        };
+        let denom = if from_left {
+            anchor - g0.start_s
+        } else {
+            (g0.start_s + g0.len_s) - anchor
+        };
+        if denom <= 1.0e-9 {
+            return;
+        }
+        let num = if from_left { anchor - t } else { t - anchor };
+        let k = (num / denom).clamp(0.02, 64.0);
+        let orig = self.arr_stretch_orig.clone();
+        for o in &orig {
+            let Some(c) = self.arrangement.clips.iter_mut().find(|c| c.id == o.id) else {
+                continue;
+            };
+            if from_left {
+                let end = anchor - (anchor - (o.start_s + o.len_s)) * k;
+                c.len_s = (o.len_s * k).max(0.05);
+                c.start_s = (end - c.len_s).max(0.0);
+            } else {
+                c.start_s = anchor + (o.start_s - anchor) * k;
+                c.len_s = (o.len_s * k).max(0.05);
+            }
+            c.offset_s = o.offset_s * k;
+            c.fade_in_s = o.fade_in_s * k;
+            c.fade_out_s = o.fade_out_s * k;
+            for (n, n0) in c.notes.iter_mut().zip(o.notes.iter()) {
+                n.at_s = n0.at_s * k;
+                n.dur_s = (n0.dur_s * k).max(0.01);
+            }
+        }
+        self.clips_dirty = true;
+        self.arr_gesture_dirty = true;
     }
 
     // ── What the host needs to read and write ──────────────────────────────
@@ -13726,13 +14005,23 @@ impl IvoryApp {
         // The strip meters' fall — EVERY frame, whatever is open. It
         // shipped inside the drumpad's branch by accident, which is why
         // the desk's meters were dead unless the pads were up.
+        //
+        // **32 dB/s, measured in TIME.** The old ×0.94-per-frame decay rode
+        // the repaint rate: ~32 dB/s while rolling at 60 fps, a third of
+        // that on the idle tick — the "barely move, sometimes radical"
+        // complaint was the frame clock leaking into the ballistics. The
+        // rise stays instant, one UI frame at most.
+        let fall = {
+            let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.25);
+            (-3.685 * dt).exp()
+        };
         for (hold, fresh) in self
             .meter_hold
             .iter_mut()
             .zip(self.recorder.strip_peaks.iter())
         {
             for c in 0..2 {
-                hold[c] = (hold[c] * 0.94).max(fresh[c]);
+                hold[c] = (hold[c] * fall).max(fresh[c]);
                 if hold[c] < 1.0e-4 {
                     hold[c] = 0.0;
                 }
@@ -13820,6 +14109,13 @@ impl IvoryApp {
             let (down, pos) = ctx.input(|i| (i.pointer.primary_down(), i.pointer.interact_pos()));
             if !down {
                 self.grabbed = None;
+                // A tempo drag rescaled the document tick by tick; the
+                // RELEASE is when the doc goes to disk and history, once.
+                if grab.moved
+                    && grab.hit.is_same_control(recorder_panel::Hit::SetTempo(0.0))
+                {
+                    self.arr_save_edits();
+                }
                 // Released without ever moving: a TAP, which opens the control
                 // for typing rather than setting it to wherever the pointer is.
                 if !grab.moved {
@@ -16401,13 +16697,14 @@ mod tests {
         );
     }
 
-    /// **A plain arm is EXCLUSIVE; Shift adds.** The Sonoma tester armed one
-    /// midi track and recorded three — every lane still armed from its own
-    /// birth or first bind rode along. A plain press now stands the others
-    /// down; Shift+press keeps the additive toggle for a deliberate
-    /// multi-lane take; and binding an input arms that lane ALONE.
+    /// **A plain arm TOGGLES; Shift arms one lane alone; the SILENT arms
+    /// are exclusive.** The phantom multi-record was tracks arming
+    /// themselves at birth and at first bind and nobody noticing the
+    /// pile — so THOSE stand the others down. Deliberate clicks stack the
+    /// way they always did (the owner vetoed an exclusive default the day
+    /// it shipped), and Shift+press is the one-gesture "this lane alone".
     #[test]
-    fn a_plain_arm_stands_the_other_lanes_down() {
+    fn arms_stack_by_hand_and_never_by_accident() {
         use crate::mixer_panel::Hit;
         use crate::recorder::Column;
         let (_, mut app) = headless(Caps::DESKTOP);
@@ -16419,19 +16716,25 @@ mod tests {
         app.set_channel_input_spec(3, "midi:all");
         assert_eq!(app.armed_mask(), 1 << 3, "a bind left stale arms standing");
 
-        // A plain press on another lane takes the arm with it…
+        // Plain presses STACK — a deliberate multi-lane take…
         app.apply_mixer_hit(Hit::Arm(Column(2)), 0.0);
-        assert_eq!(app.armed_mask(), 1 << 2, "a plain arm was not exclusive");
-
-        // …Shift+press adds instead…
-        app.shift_down = true;
-        app.apply_mixer_hit(Hit::Arm(Column(3)), 0.0);
-        assert_eq!(app.armed_mask(), (1 << 2) | (1 << 3), "shift did not add");
-        app.shift_down = false;
-
-        // …and a plain press on a THIRD lane clears the whole pile.
+        assert_eq!(app.armed_mask(), (1 << 2) | (1 << 3), "a plain arm did not add");
         app.apply_mixer_hit(Hit::Arm(Column(0)), 0.0);
-        assert_eq!(app.armed_mask(), 1, "a plain arm left the pile standing");
+        assert_eq!(
+            app.armed_mask(),
+            1 | (1 << 2) | (1 << 3),
+            "three lanes armed by hand should stay armed"
+        );
+
+        // …a plain press on an armed lane disarms just that lane…
+        app.apply_mixer_hit(Hit::Arm(Column(3)), 0.0);
+        assert_eq!(app.armed_mask(), 1 | (1 << 2), "the toggle took the wrong lanes");
+
+        // …and Shift+press is THIS LANE ALONE.
+        app.shift_down = true;
+        app.apply_mixer_hit(Hit::Arm(Column(2)), 0.0);
+        assert_eq!(app.armed_mask(), 1 << 2, "shift+arm did not stand the rest down");
+        app.shift_down = false;
     }
 
     /// **The insert menu: delete deletes, replace opens the picker, and a
@@ -17489,6 +17792,128 @@ mod tests {
             "a full travel's drag reached only {}",
             app.settings.master_gain
         );
+    }
+
+    /// **The document follows the tempo, and the stretch follows the hand.**
+    ///
+    /// A MIDI clip written at 120 was, in the owner's words, "made unusable
+    /// at 180" — its seconds stood still while the bars shrank. Now a tempo
+    /// change rescales every MIDI clip (start, length, trim, notes) by
+    /// old/new and re-seats every audio clip's bar position (start only:
+    /// audio itself cannot stretch).
+    #[test]
+    fn the_document_follows_the_tempo() {
+        use crate::arrangement::{ArrClip, ArrNote, ClipKind};
+        let (_, mut app) = headless(Caps::DESKTOP);
+        app.settings.record_export.tempo_bpm = 120.0;
+        app.arrangement.add_clip(ArrClip {
+            kind: ClipKind::Midi,
+            notes: vec![ArrNote { at_s: 0.5, dur_s: 0.5, key: 60, vel: 100 }],
+            lane: 0,
+            path: String::new(),
+            start_s: 2.0,
+            offset_s: 0.25,
+            len_s: 4.0,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name: "m".into(),
+            id: 0,
+        });
+        app.arrangement.add_clip(ArrClip {
+            kind: ClipKind::Audio,
+            notes: Vec::new(),
+            lane: 1,
+            path: "a.wav".into(),
+            start_s: 8.0,
+            offset_s: 1.0,
+            len_s: 3.0,
+            fade_in_s: 0.1,
+            fade_out_s: 0.1,
+            name: "a".into(),
+            id: 0,
+        });
+        app.apply_recorder_hit(recorder_panel::Hit::SetTempo(180.0));
+        let r = 120.0 / 180.0;
+        let m = &app.arrangement.clips[0];
+        assert!((m.start_s - 2.0 * r).abs() < 1e-9, "midi start did not follow");
+        assert!((m.len_s - 4.0 * r).abs() < 1e-9, "midi length did not follow");
+        assert!((m.offset_s - 0.25 * r).abs() < 1e-9, "midi trim did not follow");
+        assert!((m.notes[0].at_s - 0.5 * r).abs() < 1e-9, "a note did not follow");
+        assert!((m.notes[0].dur_s - 0.5 * r).abs() < 1e-9, "a duration did not follow");
+        let a = &app.arrangement.clips[1];
+        assert!((a.start_s - 8.0 * r).abs() < 1e-9, "audio lost its bar seat");
+        assert!((a.len_s - 3.0).abs() < 1e-9, "audio length must NOT stretch");
+        assert!((a.offset_s - 1.0).abs() < 1e-9, "audio trim must NOT stretch");
+    }
+
+    /// **Seven notes into the space of four.** The editor's shift-drag
+    /// stretch scales the whole selection from its press-time values around
+    /// the fixed end; the arrangement's does the same for whole MIDI clips.
+    /// Exercised at the function level with snap off, so the factors are
+    /// exact.
+    #[test]
+    fn a_stretch_scales_the_selection_and_the_clip() {
+        use crate::arrangement::{ArrClip, ArrNote, ClipKind};
+        let (_, mut app) = headless(Caps::DESKTOP);
+        app.settings.midi_snap = false;
+        app.settings.arr_snap = false;
+        // Seven quarter-second notes starting at 0, selected whole.
+        let notes: Vec<ArrNote> = (0..7)
+            .map(|i| ArrNote {
+                at_s: f64::from(i) * 0.25,
+                dur_s: 0.25,
+                key: 60 + i as u8,
+                vel: 100,
+            })
+            .collect();
+        app.arrangement.add_clip(ArrClip {
+            kind: ClipKind::Midi,
+            notes,
+            lane: 0,
+            path: String::new(),
+            start_s: 2.0,
+            offset_s: 0.0,
+            len_s: 2.0,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name: "m".into(),
+            id: 0,
+        });
+        let id = app.arrangement.clips[0].id;
+        app.open_midi_editor(id);
+        if let Some(st) = app.midi_edit.as_mut() {
+            st.selected = (0..7).collect();
+        }
+        // Grab the LAST note's tail and put the whole span (1.75 s) into
+        // one second: the seven land in the space of four.
+        app.me_begin_stretch(6, false);
+        let orig: Vec<(usize, f64, f64)> =
+            (0..7).map(|i| (i, f64::from(i as u32) * 0.25, 0.25)).collect();
+        app.me_stretch(6, false, 0.0, &orig, 3.0);
+        let k = 1.0 / 1.75;
+        let c = &app.arrangement.clips[0];
+        for (i, n) in c.notes.iter().enumerate() {
+            assert!(
+                (n.at_s - f64::from(i as u32) * 0.25 * k).abs() < 1e-9,
+                "note {i} did not scale: {}",
+                n.at_s
+            );
+            assert!((n.dur_s - 0.25 * k).abs() < 1e-9, "duration {i} did not scale");
+        }
+
+        // The ARRANGE stretch: halve the clip from its right edge. Its
+        // notes ride along.
+        app.arr_stretch_orig = vec![app.arrangement.clips[0].clone()];
+        app.arr_stretch(id, false, 2.0, 3.0);
+        let c = &app.arrangement.clips[0];
+        assert!((c.len_s - 1.0).abs() < 1e-9, "the clip did not halve: {}", c.len_s);
+        assert!((c.start_s - 2.0).abs() < 1e-9, "the anchored start moved");
+        for (i, n) in c.notes.iter().enumerate() {
+            assert!(
+                (n.at_s - f64::from(i as u32) * 0.25 * k * 0.5).abs() < 1e-9,
+                "clip note {i} did not follow the clip stretch"
+            );
+        }
     }
 
     /// The tempo is a knob now, turned like the sends, and typed into on a

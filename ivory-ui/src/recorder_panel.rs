@@ -352,6 +352,10 @@ struct Layout {
     /// Where a typed tempo goes: a small box under the knob, drawn only while
     /// one is being typed.
     tempo_entry: Rect,
+    /// The TAP chip, in the tempo cell's slack beside the knob's circle.
+    /// `NOTHING` when the band is too narrow to seat it, and while a take
+    /// rolls (the knob itself yields to the clock then).
+    pub tempo_tap: Rect,
 
 
     /// The supporter heart, bottom-right of the band.
@@ -468,6 +472,7 @@ impl Layout {
             master_knob: Rect::NOTHING,
             fx: [Rect::NOTHING; Fx::ALL.len()],
             tempo_entry: Rect::NOTHING,
+            tempo_tap: Rect::NOTHING,
             setup: Rect::NOTHING,
             capture: Rect::NOTHING,
             project: Rect::NOTHING,
@@ -751,8 +756,26 @@ impl Layout {
         };
         if rolling {
             self.timecode = head;
+            self.tempo_tap = Rect::NOTHING;
         } else {
             self.tempo = head;
+            // **The TAP chip lives in the knob cell's slack.** The circle is
+            // budgeted from the face's SHORTER side, so a wide cell leaves
+            // room beside the skirt; the chip takes the right-hand slack
+            // when there is enough of it and stands down when there is not
+            // — a control that would overlap the ticks is worse than none.
+            self.tempo_tap = knob_face(head).map_or(Rect::NOTHING, |f| {
+                let slack = f.face.width() * 0.5 - f.radius * 1.26;
+                if slack < 26.0 {
+                    return Rect::NOTHING;
+                }
+                let w = (slack - 6.0).min(34.0);
+                let h = (f.radius * 0.9).clamp(11.0, 16.0);
+                Rect::from_center_size(
+                    Pos2::new(f.face.right() - w * 0.5 - 2.0, f.face.center().y),
+                    Vec2::new(w, h),
+                )
+            });
         }
         // **The buttons start where the knob's CELL ends**, not at a fraction
         // of the row. The knob's ticks stand outside its body but inside its
@@ -988,7 +1011,7 @@ impl Layout {
     /// [`hit_test`] reads this and so does the test that proves no two of them
     /// overlap, so a control that moves onto another one fails a test rather
     /// than quietly swallowing its clicks.
-    fn targets(&self) -> [(Rect, Produces); 32] {
+    fn targets(&self) -> [(Rect, Produces); 33] {
         use Produces::{Along, AlongV, Fixed};
         // The word over a knob, which is the same thing for a dial.
         // **Nothing when there is no word.** Below a certain height the label
@@ -1022,6 +1045,7 @@ impl Layout {
         // more specific target wins.
         [
             (cap(self.tempo), Fixed(Hit::Type(NumField::Tempo))),
+            (self.tempo_tap, Fixed(Hit::TapTempo)),
             (cap(self.master_knob), Fixed(Hit::Type(NumField::Master))),
             (cap(self.fx[0]), Fixed(Hit::Type(NumField::Fx(Fx::Reverb)))),
             (cap(self.fx[1]), Fixed(Hit::Type(NumField::Fx(Fx::Delay)))),
@@ -1066,7 +1090,21 @@ impl Layout {
             // Turned like the sends, and typed into on a DOUBLE click — see
             // `draw_tempo`. `SetTempo` carries beats rather than 0..=1, so the
             // producer converts on the way out.
-            (dial(self.tempo), AlongV(|t| Hit::SetTempo(knob_to_tempo(t)))),
+            // The tempo dial yields the chip's column — the panel's
+            // no-overlap rule is load-bearing, and the knob's circle
+            // never lived in that slack anyway.
+            (
+                if self.tempo_tap.is_positive() {
+                    let d = dial(self.tempo);
+                    Rect::from_min_max(
+                        d.min,
+                        Pos2::new(self.tempo_tap.left() - 2.0, d.bottom()),
+                    )
+                } else {
+                    dial(self.tempo)
+                },
+                AlongV(|t| Hit::SetTempo(knob_to_tempo(t))),
+            ),
             (self.time_sig, Fixed(Hit::EditTimeSignature)),
             (self.export, Fixed(Hit::Export)),
         ]
@@ -1206,6 +1244,9 @@ pub enum Hit {
     SetFx(Fx, f32),
     /// Tempo dragged, already clamped to `MIN_BPM..=MAX_BPM`.
     SetTempo(f64),
+    /// The little TAP chip beside the tempo knob: each press is one beat
+    /// of the player's own count, and the tempo follows the run of them.
+    TapTempo,
     /// Type a time signature into the band. A CLICK opens it, because unlike
     /// every other numeric cell there is nothing to drag: "6/8" is two numbers
     /// and a slash, not a point on a continuum.
@@ -1311,6 +1352,7 @@ impl Hit {
             Hit::SeekTimeline(_) => "Backing track  -  click to set the playhead",
             Hit::ClearTrack => "Backing track  -  remove the file",
             Hit::SetTempo(_) => "Tempo",
+            Hit::TapTempo => "Tap the tempo - each press is one beat",
             Hit::EditTimeSignature => "Time signature",
         }
     }
@@ -4040,6 +4082,24 @@ fn draw_tempo(
         },
         p,
     );
+    // The TAP chip, wearing the tempo's own orange so the pair reads as
+    // one control. Absent when the layout could not seat it.
+    if l.tempo_tap.is_positive() {
+        painter.rect_filled(l.tempo_tap, 3.0, Color32::from_black_alpha(70));
+        painter.rect_stroke(
+            l.tempo_tap,
+            3.0,
+            Stroke::new(1.0, TEMPO_CAP),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            l.tempo_tap.center(),
+            egui::Align2::CENTER_CENTER,
+            "TAP",
+            FontId::monospace((l.tempo_tap.height() * 0.62).clamp(7.0, 10.0)),
+            TEMPO_CAP,
+        );
+    }
 }
 
 /// Where `bpm` sits on the knob, 0..=1.

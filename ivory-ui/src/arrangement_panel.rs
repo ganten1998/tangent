@@ -982,12 +982,20 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             .header_rows
             .get(i)
             .map_or(row.left(), |h| h.panel.left());
-        for y in [row.top(), row.bottom()] {
-            painter.line_segment(
-                [Pos2::new(left, y), Pos2::new(row.right(), y)],
-                Stroke::new(1.5, p.seam.gamma_multiply(1.6)),
-            );
-        }
+        // **A visible BORDER, not an etching.** The seam ink is DARKER
+        // than the header wood in the dark wardrobe, so the etched
+        // treatment vanished exactly where the owner looked: the header
+        // column read as bare air between channels. Every unoccupied slot
+        // now wears one channel-shaped box — header through field — in
+        // the face ink, faded far enough to sit behind the real channels
+        // around it but never below legibility on either palette.
+        let border = Stroke::new(1.0, p.face.gamma_multiply(0.28));
+        painter.rect_stroke(
+            Rect::from_min_max(Pos2::new(left, row.top()), row.right_bottom()),
+            0.0,
+            border,
+            egui::StrokeKind::Inside,
+        );
         painter.rect_stroke(*row, 0.0, Stroke::new(1.0, p.seam), egui::StrokeKind::Inside);
     }
 
