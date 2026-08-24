@@ -119,6 +119,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Console",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Storage_FileSystem",
+    # TerminateProcess/GetCurrentProcess — the exit that skips every
+    # loaded plugin's static destructors; see main's closing comment.
+    "Win32_System_Threading",
 ] }
 
 # **wgpu on every platform, for the video compositor and nothing else.**
