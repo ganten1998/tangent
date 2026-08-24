@@ -89,6 +89,10 @@ pub enum MenuAction {
     SetStaffSet(&'static str),
     /// Add or remove one clef from the user's own stack.
     ToggleCustomClef(&'static str),
+    /// Choose THE stave — exclusive, one at a time: "grand" or a single
+    /// clef's key. The multi-staff stack is a later feature; see the
+    /// "Stave" category.
+    SetStave(&'static str),
     /// The key signature, as a count of sharps (positive) or flats (negative).
     SetStaffKey(i32),
     /// Letter names inside the noteheads.
@@ -264,6 +268,9 @@ pub struct MenuView {
     pub staff_set: String,
     /// The user's own stack of clefs, if they have one, ready to be listed.
     pub staff_custom_label: Option<String>,
+    /// The staff set's own key ("grand", a clef key, or custom:...), for
+    /// the exclusive Stave list's bullet.
+    pub stave_key: String,
     /// Which clefs are on screen right now, by key, for the Staves list.
     pub staff_clefs: Vec<String>,
     /// The right-click landed on the sheet music panel.
@@ -944,26 +951,28 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
         );
     }
     if view.staff_on {
-        // **A staff each, for a room with more than one instrument in it.**
-        // Ticking a second clef here stacks it under the first and every staff
-        // shows every note — so a violist reads alto while the pianist reads
-        // the grand staff, off the same chord.
-        push_category(
-            &mut theory,
-            "Staves",
-            Clef::ALL
-                .into_iter()
-                .map(|c| SubItem {
-                    label: if view.staff_clefs.contains(&c.key().to_owned()) {
-                        format!("{}  \u{2022}", c.label())
-                    } else {
-                        c.label().to_owned()
-                    },
-                    action: MenuAction::ToggleCustomClef(c.key()),
-                    enabled: true,
-                })
-                .collect(),
-        );
+        // **ONE stave at a time — the owner's ruling.** The multi-staff
+        // stack (a clef each for a room of instruments) is a later feature;
+        // until then this is an exclusive pick: the grand staff first and
+        // default, then each single clef.
+        let mark = |label: &str, key: &str| {
+            if view.stave_key == key {
+                format!("{label}  \u{2022}")
+            } else {
+                label.to_owned()
+            }
+        };
+        let mut rows = vec![SubItem {
+            label: mark("Grand Staff", "grand"),
+            action: MenuAction::SetStave("grand"),
+            enabled: true,
+        }];
+        rows.extend(Clef::ALL.into_iter().map(|c| SubItem {
+            label: mark(c.label(), c.key()),
+            action: MenuAction::SetStave(c.key()),
+            enabled: true,
+        }));
+        push_category(&mut theory, "Stave", rows);
     }
     // The one theory row that is not a list of choices and has no key of its
     // own. It stays because without it there is no way at all to stop the band
@@ -1235,7 +1244,7 @@ pub const STAFF_PRESETS: &[(&str, &str)] = &[
 /// landed on it. Same rule and same reasons as `move_recorder_to_the_front`:
 /// reorder, never filter.
 fn move_staff_to_the_front(e: &mut Vec<Entry>) {
-    const OURS: [&str; 3] = ["Clef", "Key", "Staves"];
+    const OURS: [&str; 3] = ["Clef", "Key", "Stave"];
     let mut moved: Vec<Entry> = Vec::new();
     for name in OURS {
         if let Some(i) = e.iter().position(|x| match x {
@@ -1862,6 +1871,7 @@ mod tests {
             staff_custom_label: None,
             staff_clefs: Vec::new(),
             staff_first: false,
+            stave_key: "grand".to_owned(),
             staff_key: 0,
             recorder_detached: false,
             count_in_beats: 4,
@@ -2218,7 +2228,7 @@ mod tests {
         );
         assert_eq!(
             category_names(v.clone()),
-            vec!["Window", "Colors", "Chords", "Clef", "Key", "Staves"],
+            vec!["Window", "Colors", "Chords", "Clef", "Key", "Stave"],
             "no fretboard hovers while the fretboard is off"
         );
 
@@ -2234,7 +2244,7 @@ mod tests {
         assert_eq!(
             category_names(v.clone()),
             vec![
-                "Window", "Colors", "Chords", "Clef", "Key", "Staves", "Fretboard", "Wood",
+                "Window", "Colors", "Chords", "Clef", "Key", "Stave", "Fretboard", "Wood",
                 "Tuning", "Capo"
             ]
         );
@@ -2641,7 +2651,7 @@ mod tests {
         assert_eq!(
             category_names(v.clone()),
             vec![
-                "Window", "Colors", "Chords", "Clef", "Key", "Staves", "Fretboard", "Wood",
+                "Window", "Colors", "Chords", "Clef", "Key", "Stave", "Fretboard", "Wood",
                 "Tuning", "Capo"
             ]
         );
@@ -2659,7 +2669,7 @@ mod tests {
         let v = view();
         let names = category_names(v.clone());
         let at = |want: &str| names.iter().position(|n| n == want);
-        assert!(at("Clef") < at("Key") && at("Key") < at("Staves"));
+        assert!(at("Clef") < at("Key") && at("Key") < at("Stave"));
         // The follow row is the one theory toggle with no key of its own, so it
         // is the one that had to stay.
         assert_eq!(

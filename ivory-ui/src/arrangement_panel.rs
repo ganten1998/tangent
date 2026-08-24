@@ -568,7 +568,18 @@ pub fn clip_rect(rect: Rect, view: &ArrangeView<'_>, clip: &ClipView<'_>) -> Rec
 /// The clip's notes as a miniature: pitch spread across the clip's height
 /// (padded to at least an octave so one note does not fill the box), each
 /// note a small bar over its own span of the drawn length.
-fn draw_note_miniature(painter: &Painter, r: Rect, clip: &ClipView<'_>, p: &Ink) {
+/// `full_x` is the clip's UNCLAMPED pixel span. The drawn rect is cut to
+/// the viewport, and mapping time onto the CUT width compressed the
+/// picture: a recording that crossed the right edge watched its own notes
+/// slide leftward as the take grew — the owner's "clip begins shrinking".
+/// Time maps onto the full span; each bar is then clipped to what shows.
+fn draw_note_miniature(
+    painter: &Painter,
+    r: Rect,
+    full_x: (f32, f32),
+    clip: &ClipView<'_>,
+    p: &Ink,
+) {
     let len = clip.len_s.max(1.0e-9);
     let (mut lo, mut hi) = (127u8, 0u8);
     for n in clip.notes {
@@ -592,14 +603,19 @@ fn draw_note_miniature(painter: &Painter, r: Rect, clip: &ClipView<'_>, p: &Ink)
         return;
     }
     let bar_h = (inner.height() / span).clamp(1.5, 4.0);
+    let (fx0, fx1) = full_x;
+    let fw = (fx1 - fx0).max(1.0);
     for n in clip.notes {
         let a = (n.at_s - clip.offset_s) / len;
         let b = (n.at_s + n.dur_s.max(0.02) - clip.offset_s) / len;
         if b <= 0.0 || a >= 1.0 {
             continue;
         }
-        let x0 = inner.left() + inner.width() * (a.max(0.0) as f32);
-        let x1 = inner.left() + inner.width() * (b.min(1.0) as f32);
+        let x0 = (fx0 + fw * (a.max(0.0) as f32)).max(inner.left());
+        let x1 = (fx0 + fw * (b.min(1.0) as f32)).min(inner.right());
+        if x1 <= x0 {
+            continue;
+        }
         let f = 1.0 - (f32::from(n.key.clamp(lo, hi) - lo) / span);
         let y = inner.top() + (inner.height() - bar_h) * f;
         painter.rect_filled(
@@ -1046,16 +1062,26 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     x += 8.0;
                 }
             } else {
-                draw_note_miniature(painter, r, clip, &p);
+                let full_x = (
+                    x_of(rect, view, clip.start_s),
+                    x_of(rect, view, clip.start_s + clip.len_s),
+                );
+                draw_note_miniature(painter, r, full_x, clip, &p);
             }
         }
-        // The wave, drawn inside at the clip's own resolution.
+        // The wave, drawn inside at the clip's own resolution — sampled
+        // through the clip's FULL pixel span, so a clip cut by the
+        // viewport shows the right piece of itself rather than the whole
+        // wave squeezed into what is visible.
         if !clip.wave.is_empty() && r.width() >= 8.0 {
             let mid = r.center().y;
             let half = r.height() * 0.38;
             let cols = r.width() as usize;
+            let fx0 = x_of(rect, view, clip.start_s);
+            let fw = (x_of(rect, view, clip.start_s + clip.len_s) - fx0).max(1.0);
             for i in 0..cols {
-                let f = i as f32 / cols as f32;
+                let x_at = r.left() + i as f32;
+                let f = ((x_at - fx0) / fw).clamp(0.0, 1.0);
                 let v = clip.wave[(f * clip.wave.len() as f32) as usize % clip.wave.len()];
                 let x = r.left() + i as f32;
                 let h = (v * half).max(0.5);
