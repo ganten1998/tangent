@@ -8293,6 +8293,11 @@ impl IvoryApp {
     }
 
     fn close_midi_editor(&mut self) {
+        // Whatever closed the editor, any press in THIS frame is spent —
+        // the X button sits over the lanes, and the click that pressed it
+        // was reaching the arrangement as a locate. Keyboard closes set
+        // this too, harmlessly: there is no press for it to spend.
+        self.menu_ate_press = true;
         self.swing_menu = None;
         if let Some(st) = self.midi_edit.as_ref() {
             let mut quiet = st.preview_keys.clone();
@@ -9010,6 +9015,19 @@ impl IvoryApp {
     }
 
     fn arrangement_input(&mut self, ctx: &egui::Context) {
+        // **While a take rolls, the window holds the WHOLE of it** — the
+        // owner's ruling: the viewport and the growing clip scale together,
+        // so the recording is never running blind off the right edge. Only
+        // when the take actually crosses the edge, so a hand panning
+        // elsewhere mid-take is not fought for the wheel.
+        if let Some(rec) = &self.recorder.arr_rec {
+            let end = self.recorder.position_s;
+            let (start, len) = self.arr_window_now();
+            let s0 = rec.start_s.min(start);
+            if end > start + len * 0.98 {
+                self.arr_steer(s0, ((end - s0) * 1.10).max(len));
+            }
+        }
         // The CLIP menu first: while it is up it owns every press.
         if let Some((id, at)) = self.arr_clip_menu {
             let (pressed, sec, pointer) = ctx.input(|i| {
