@@ -3078,6 +3078,13 @@ impl IvoryApp {
         // rebuilt from the new ones rather than left showing the old shape.
         self.rebuild_voicing();
         self.detection_tick(true);
+        // **Reconciled NOW, not at frame's end.** `display_notes` is the lit
+        // set UNION `sounding`, and `sounding` still held the old chord for
+        // the rest of this frame — so a Space-held chord drew old and new
+        // together for a beat on every arrow press. Settling the diff here
+        // (offs queued before ons, as ever) means every note of the old
+        // chord is OFF before the picture shows the new one.
+        self.reconcile_sound();
     }
 
     fn menu_view(&self) -> MenuView {
@@ -5666,6 +5673,33 @@ impl IvoryApp {
     }
 
     /// The zoom window: steered, or fitted to the whole song.
+    /// One INCREMENT of keyboard zoom, around the playhead — `-` widens,
+    /// `=` narrows, the wheel's own anchor rule on keys.
+    fn arr_zoom_step(&mut self, factor: f64) {
+        let anchor = self.recorder.position_s;
+        let (start, len) = self.arr_window_now();
+        self.arr_steer(anchor - (anchor - start) * factor, len * factor);
+    }
+
+    /// `W`: FIT the view to the biggest clip — the largest thing on the
+    /// timeline is what you are working on. With nothing standing, the
+    /// window forgets itself and the shipped default answers again.
+    fn arr_fit_view(&mut self) {
+        let best = self
+            .arrangement
+            .clips
+            .iter()
+            .map(|c| (c.start_s, self.clip_len_resolved(c)))
+            .max_by(|a, b| a.1.total_cmp(&b.1));
+        match best {
+            Some((start, len)) if len > 0.0 => {
+                let pad = (len * 0.08).max(0.5);
+                self.arr_steer((start - pad).max(0.0), len + pad * 2.0);
+            }
+            _ => self.arr_window = None,
+        }
+    }
+
     fn arr_window_now(&self) -> (f64, f64) {
         self.arr_window
             .unwrap_or_else(|| (0.0, (self.arr_span() * 1.05).max(30.0)))
@@ -7643,13 +7677,20 @@ impl IvoryApp {
                         // RIGHT is more: the control draws a horizontal travel
                         // line, and a horizontal control that answered vertical
                         // motion was the owner's first drumpad complaint.
-                        // Shift is the fine grip, the faders' own grammar.
+                        // Shift is the fine grip — integrated per frame, so
+                        // either order of click-and-shift only slows what
+                        // comes next, never re-prices the distance done.
                         let fine = if shift { 0.1 } else { 1.0 };
                         let v = grab.from_value
                             + (p.x - grab.from.x) / crate::drumpad_panel::KNOB_TRAVEL
                                 * (hi - lo)
                                 * fine;
                         self.drumpad_set(grab.param, v);
+                        let landed = self.drumpad_get(grab.param);
+                        if let Some(g) = self.drumpad_grab.as_mut() {
+                            g.from = p;
+                            g.from_value = landed;
+                        }
                     }
                 }
             } else {
@@ -8345,6 +8386,31 @@ impl IvoryApp {
             if ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::Z)) {
                 self.me_fit_clip();
             }
+            // `-` out, `=` in — increments around the playhead — and `W`
+            // fits the clip, the arrangement's own trio on this roll.
+            {
+                let (minus, equals, fit) = ctx.input(|i| {
+                    let bare = !i.modifiers.any();
+                    (
+                        bare && i.key_pressed(egui::Key::Minus),
+                        bare && i.key_pressed(egui::Key::Equals),
+                        bare && i.key_pressed(egui::Key::W),
+                    )
+                });
+                if minus || equals {
+                    let factor = if minus { 1.3 } else { 1.0 / 1.3 };
+                    let anchor = self.recorder.position_s;
+                    if let Some(st) = self.midi_edit.as_mut() {
+                        let len = (st.view_len_s * factor).clamp(0.25, 600.0);
+                        st.view_start_s =
+                            (anchor - (anchor - st.view_start_s) * factor).max(0.0);
+                        st.view_len_s = len;
+                    }
+                }
+                if fit {
+                    self.me_fit_clip();
+                }
+            }
             if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::A)) {
                 self.me_select_all();
             }
@@ -8435,6 +8501,10 @@ impl IvoryApp {
                             .clamp(crate::midi_editor::KEYS_SHOWN, 128.0);
                     }
                 } else {
+                    // Zoom at the PLAYHEAD, as the arrangement does now —
+                    // the pointer anchor left with the owner's ruling.
+                    let _ = anchor;
+                    let anchor = self.recorder.position_s;
                     if let Some(st) = self.midi_edit.as_mut() {
                         if scroll.x.abs() > 0.0 {
                             st.view_start_s =
@@ -9040,9 +9110,13 @@ impl IvoryApp {
                     let d = f64::from(scroll.x + scroll.y) * s_per_px;
                     self.arr_steer(start - d, len);
                 } else {
-                    // **The plain wheel ZOOMS**, around the second under the
-                    // pointer — the owner's ruling. A trackpad's sideways
-                    // component still pans, because sideways means along.
+                    // **The plain wheel ZOOMS, at the PLAYHEAD** — the
+                    // owner's ruling replaced the pointer anchor: click bar
+                    // five, and the wheel zooms THERE, wherever the hand
+                    // rests. A trackpad's sideways component still pans,
+                    // because sideways means along.
+                    let _ = anchor;
+                    let anchor = self.recorder.position_s;
                     if scroll.x.abs() > 0.0 {
                         self.arr_steer(start - f64::from(scroll.x) * s_per_px, len);
                     }
@@ -9431,6 +9505,9 @@ impl IvoryApp {
                 }
                 ArrDrag::FadeIn { id } => self.arr_fade_in(id, t_at),
                 ArrDrag::FadeOut { id } => self.arr_fade_out(id, t_at),
+                // The three header dials all INTEGRATE: each frame prices
+                // its own motion at that frame's fine factor and re-anchors
+                // — Shift in either order only slows what comes next.
                 ArrDrag::Gain { lane, from_y, from } => {
                     let fine = if shift { recorder_panel::FINE_DRAG } else { 1.0 };
                     let v = (from + (from_y - p.y) / 420.0 * fine).clamp(0.0, 1.0);
@@ -9438,6 +9515,7 @@ impl IvoryApp {
                         crate::mixer_panel::Hit::Fader(crate::recorder::Column(lane)),
                         v,
                     );
+                    self.arr_drag = Some(ArrDrag::Gain { lane, from_y: p.y, from: v });
                 }
                 ArrDrag::HdrPan { lane, from_y, from } => {
                     let fine = if shift { recorder_panel::FINE_DRAG } else { 1.0 };
@@ -9446,6 +9524,7 @@ impl IvoryApp {
                         crate::mixer_panel::Hit::Pan(crate::recorder::Column(lane)),
                         v,
                     );
+                    self.arr_drag = Some(ArrDrag::HdrPan { lane, from_y: p.y, from: v });
                 }
                 ArrDrag::Send { lane, from_y, from } => {
                     let fine = if shift { recorder_panel::FINE_DRAG } else { 1.0 };
@@ -9454,6 +9533,7 @@ impl IvoryApp {
                         crate::mixer_panel::Hit::Send(crate::recorder::Column(lane)),
                         v,
                     );
+                    self.arr_drag = Some(ArrDrag::Send { lane, from_y: p.y, from: v });
                 }
                 ArrDrag::CreateMidi { lane, anchor } => {
                     let to = self.arr_snap_t(t_at);
@@ -9655,6 +9735,27 @@ impl IvoryApp {
             && !self.name_focused
             && self.num_edit.is_none()
             && self.drumpad_num.is_none();
+        // **The zoom keys: `-` out, `=` in, `W` fits the biggest clip** —
+        // each increment around the playhead, the wheel's own anchor.
+        if keys_ok && self.midi_edit.is_none() {
+            let (minus, equals, fit) = ctx.input(|i| {
+                let bare = !i.modifiers.any();
+                (
+                    bare && i.key_pressed(egui::Key::Minus),
+                    bare && i.key_pressed(egui::Key::Equals),
+                    bare && i.key_pressed(egui::Key::W),
+                )
+            });
+            if minus {
+                self.arr_zoom_step(1.3);
+            }
+            if equals {
+                self.arr_zoom_step(1.0 / 1.3);
+            }
+            if fit {
+                self.arr_fit_view();
+            }
+        }
         if keys_ok
             && self.midi_edit.is_none()
             && ctx.input(|i| {
@@ -14356,6 +14457,17 @@ impl IvoryApp {
                         };
                         let v = (grab.from_value + moved / travel * fine).clamp(0.0, 1.0);
                         self.apply_recorder_hit(grab.hit.with_value(v));
+                        // **Re-anchor every frame** — the fine factor scales
+                        // MOTION, never the accumulated distance. Scaling the
+                        // whole displacement meant pressing or releasing
+                        // Shift mid-drag re-priced everything the hand had
+                        // already done: the owner watched the tempo dial fly
+                        // to an extreme the moment Shift let go. Integrated,
+                        // Shift in either order only slows what comes next.
+                        if let Some(g) = self.grabbed.as_mut() {
+                            g.from = pos;
+                            g.from_value = v;
+                        }
                     }
                 }
             }
@@ -14377,6 +14489,10 @@ impl IvoryApp {
             .filter(|_| {
                 !input_menu_owns
                     && !self.band_popup_owns()
+                    // The context menu can open OVER the mixer now, so the
+                    // mixer honours it — and the press that dismissed it.
+                    && self.menu_state.is_none()
+                    && !self.menu_ate_press
                     && (!drumpad_owns
                         || self.mixer_grab.is_some()
                         || self.mixer_reorder.is_some())
@@ -14444,12 +14560,14 @@ impl IvoryApp {
                         Some(crate::mixer_panel::Hit::Insert(i, n)) => {
                             if self.insert(i.desk_index(), n).is_some() {
                                 self.mixer_fx_menu = Some((i, n));
-                            } else if let Some(strip) = i.strip().filter(|s| {
-                                !matches!(
-                                    s,
-                                    crate::recorder::Strip::Channel(n) if !self.channel_used(*n)
-                                )
-                            }) {
+                            } else if i.strip().is_some_and(|s| matches!(
+                                s,
+                                crate::recorder::Strip::Channel(n) if !self.channel_used(n)
+                            )) {
+                                // An empty slot has no track — but it has
+                                // ROOM: the app menu answers there.
+                                self.open_global_menu_at(&ctx, pos);
+                            } else if let Some(strip) = i.strip() {
                                 self.dialog = Some(dialogs::Dialog::Track {
                                     lane: strip.index(),
                                     removable: matches!(
@@ -14473,18 +14591,16 @@ impl IvoryApp {
                         // its colour is the one landmark on the desk, and
                         // `Column::strip` is None there.
                         _ => {
-                            if let Some(strip) = crate::mixer_panel::strip_at(rect, &view, pos)
-                                .and_then(|i| i.strip())
-                                .filter(|s| {
-                                    // An empty channel slot has no track to
-                                    // have a menu about.
-                                    !matches!(
-                                        s,
-                                        crate::recorder::Strip::Channel(n)
-                                            if !self.channel_used(*n)
-                                    )
-                                })
-                            {
+                            let at = crate::mixer_panel::strip_at(rect, &view, pos)
+                                .and_then(|i| i.strip());
+                            if at.is_some_and(|s| matches!(
+                                s,
+                                crate::recorder::Strip::Channel(n) if !self.channel_used(n)
+                            )) {
+                                // An empty slot has no track — but it has
+                                // ROOM: the app menu answers there.
+                                self.open_global_menu_at(&ctx, pos);
+                            } else if let Some(strip) = at {
                                 self.dialog = Some(dialogs::Dialog::Track {
                                     lane: strip.index(),
                                     removable: matches!(
@@ -14655,6 +14771,12 @@ impl IvoryApp {
                         };
                         let v = (grab.from_value + moved / travel * fine).clamp(0.0, 1.0);
                         self.apply_mixer_hit(grab.hit, v);
+                        // Re-anchored — see the band's own comment: fine
+                        // scales motion, never history.
+                        if let Some(g) = self.mixer_grab.as_mut() {
+                            g.from = pos;
+                            g.from_value = v;
+                        }
                     }
                 }
             }
