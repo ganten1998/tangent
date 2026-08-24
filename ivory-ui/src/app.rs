@@ -299,6 +299,13 @@ pub struct IvoryApp {
     /// Whether ALT is down this frame — the insert bays' ERASER. Same
     /// refresh, same reason.
     alt_down: bool,
+    /// The press that CLOSED the context menu this frame — eaten whole.
+    /// `handle_main_interaction` closes the menu early in the frame; the
+    /// surface inputs run after it and would otherwise act on the very
+    /// same press (the owner right-clicked the editor, left-clicked to
+    /// dismiss, and got a note under the dismissal). Cleared at the top
+    /// of every paint.
+    menu_ate_press: bool,
     /// The open project's DOCUMENT — the arrangement, in memory. Loaded by
     /// `bootstrap_project`, saved atomically on every edit.
     arrangement: crate::arrangement::Arrangement,
@@ -1299,6 +1306,7 @@ impl IvoryApp {
             armed,
             shift_down: false,
             alt_down: false,
+            menu_ate_press: false,
             arrangement: crate::arrangement::Arrangement::default(),
             project_doc: std::path::PathBuf::new(),
             clips_dirty: false,
@@ -3364,8 +3372,15 @@ impl IvoryApp {
             // plugin was dead for exactly this reason. `menu::show` closes it
             // on a press outside its own rect instead, which it can tell and
             // this cannot.
-            if primary_pressed && self.caps.child_windows {
+            //
+            // EITHER button closes — and the press is EATEN for the whole
+            // frame: the surface inputs run after this handler, and without
+            // the latch the dismissal also landed wherever the pointer
+            // stood (a note in the editor, a locate on the lanes).
+            let secondary_pressed = ctx.input(|i| i.pointer.secondary_pressed());
+            if (primary_pressed || secondary_pressed) && self.caps.child_windows {
                 self.menu_state = None;
+                self.menu_ate_press = true;
             }
             // Either way the click stops here rather than reaching a piano key.
             return;
@@ -4084,7 +4099,11 @@ impl IvoryApp {
     fn knob_under(&self, band: Option<Rect>, pos: Pos2) -> Option<recorder_panel::Hit> {
         let r = band.filter(|r| r.contains(pos))?;
         let view = self.recorder_layout_view();
-        recorder_panel::hit_test(r, &view, pos).filter(|h| h.is_knob())
+        let h = recorder_panel::hit_test(r, &view, pos).filter(|h| h.is_knob())?;
+        // The DIAL itself, not its cell: the cell is mostly margin, and a
+        // right-click two ticks into the paint was eaten as the knob's.
+        let cell = recorder_panel::knob_rect(r, &view, h)?;
+        recorder_panel::on_knob_circle(cell, pos).then_some(h)
     }
 
     /// Whether `pos` is on a fader — its track, its icon or its number.
@@ -4103,7 +4122,8 @@ impl IvoryApp {
         let band = band.filter(|r| r.contains(pos))?;
         let view = self.recorder_layout_view();
         recorder_panel::Fx::ALL.into_iter().find(|fx| {
-            recorder_panel::knob_rect(band, &view, fx.hit()).is_some_and(|r| r.contains(pos))
+            recorder_panel::knob_rect(band, &view, fx.hit())
+                .is_some_and(|cell| recorder_panel::on_knob_circle(cell, pos))
         })
     }
 
@@ -5215,12 +5235,15 @@ impl IvoryApp {
             *slot = recorder::ChannelKind::as_u8(kind);
         }
         if was.is_none() && kind.is_some() {
+            // **A fresh binding's send rests at ZERO** — the owner's ruling:
+            // only the shipped DX7 track arrives wired to the reverb; every
+            // track anybody adds starts dry until they turn it up.
             if let Some(send) = self
                 .settings
                 .strip_sends
                 .get_mut(crate::recorder::Strip::Channel(ch).index())
             {
-                *send = 1.0;
+                *send = 0.0;
             }
             // **No arm.** A fresh binding used to arm itself — first
             // additively (the phantom multi-record), then exclusively
@@ -5395,12 +5418,14 @@ impl IvoryApp {
             return;
         }
         self.settings.tracks_added |= 1 << n;
+        // Dry at birth — see the bind's own comment: only the shipped DX7
+        // comes wired to the reverb.
         if let Some(send) = self
             .settings
             .strip_sends
             .get_mut(crate::recorder::Strip::Channel(n).index())
         {
-            *send = 1.0;
+            *send = 0.0;
         }
         self.save_settings();
     }
@@ -7314,6 +7339,9 @@ impl IvoryApp {
     /// editor's and the arrangement's frame of input, because the drumpad
     /// floats over both.
     fn drumpad_input(&mut self, ctx: &egui::Context) {
+        if self.menu_state.is_some() || self.menu_ate_press {
+            return;
+        }
         if !self.drumpad_open {
             return;
         }
@@ -7625,12 +7653,17 @@ impl IvoryApp {
                     }
                 }
             } else {
-                // **A click on the NUMBER types it** — a click on the track
-                // is nothing at all (the track answers drags, and its
-                // double-click answers with the default).
-                let typed = !grab.moved && grab.on_number;
+                // **A click on the NUMBER types it; a DOUBLE on the track
+                // resets it** — judged HERE because `button_double_clicked`
+                // fires on the second release, never at a press. A single
+                // motionless click on the track means nothing at all.
+                let double = ctx
+                    .input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
                 self.drumpad_grab = None;
-                if typed {
+                if !grab.moved && !grab.on_number && double {
+                    self.drumpad_set(grab.param, grab.param.default_value());
+                    self.drumpad_save();
+                } else if !grab.moved && grab.on_number {
                     self.drumpad_num = Some((grab.param, String::new()));
                 } else if grab.moved {
                     self.drumpad_save();
@@ -7793,25 +7826,17 @@ impl IvoryApp {
                     let r = l.knob_of(param);
                     r.is_positive() && p.y < r.top() + r.height() * 0.45
                 };
-                let double = ctx
-                    .input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
-                if double && !on_number {
-                    // A double on the TRACK puts it back — and only there:
-                    // a double on the number is just a hasty click, and it
-                    // opens the field like one.
-                    self.drumpad_set(param, param.default_value());
-                    self.drumpad_save();
-                } else if double && on_number {
-                    self.drumpad_num = Some((param, String::new()));
-                } else {
-                    self.drumpad_grab = Some(DrumpadGrab {
-                        param,
-                        from: p,
-                        from_value: self.drumpad_get(param),
-                        moved: false,
-                        on_number,
-                    });
-                }
+                // No double-click check HERE: `button_double_clicked`
+                // fires on the second RELEASE (the 4.54 landmine), so a
+                // press-site check can never see it. The grab's release
+                // branch answers it instead.
+                self.drumpad_grab = Some(DrumpadGrab {
+                    param,
+                    from: p,
+                    from_value: self.drumpad_get(param),
+                    moved: false,
+                    on_number,
+                });
             }
             Some(H::Choke) => {
                 let sel = self.drumpad_sel.min(recorder::DRUM_PADS - 1);
@@ -8235,8 +8260,9 @@ impl IvoryApp {
         if self.midi_edit.is_none() {
             return;
         }
-        if self.menu_state.is_some() {
-            // The menu owns the pointer, exactly as on the arrangement.
+        if self.menu_state.is_some() || self.menu_ate_press {
+            // The menu owns the pointer — and the press that dismissed it
+            // is spent, exactly as on the arrangement.
             return;
         }
         // A drag that STARTED on the roll keeps its pointer across the
@@ -8857,7 +8883,7 @@ impl IvoryApp {
     }
 
     fn arrangement_input(&mut self, ctx: &egui::Context) {
-        if self.menu_state.is_some() {
+        if self.menu_state.is_some() || self.menu_ate_press {
             // The menu owns the pointer; a press elsewhere dismisses it in
             // `menu::show` without also locating the playhead underneath.
             return;
@@ -8918,11 +8944,22 @@ impl IvoryApp {
                         .position(|row| row.panel.is_positive() && row.panel.contains(p))
                 };
                 if let Some(lane) = lane {
-                    self.dialog = Some(dialogs::Dialog::Track {
-                        lane,
-                        removable: true,
-                        icon: self.settings.channel_icons.get(lane).copied().unwrap_or(0),
-                    });
+                    // An EMPTY slot has no track to have a menu about — the
+                    // press falls through to the app menu instead.
+                    if self.channel_used(lane) {
+                        self.dialog = Some(dialogs::Dialog::Track {
+                            lane,
+                            removable: true,
+                            icon: self
+                                .settings
+                                .channel_icons
+                                .get(lane)
+                                .copied()
+                                .unwrap_or(0),
+                        });
+                    } else {
+                        self.open_global_menu_at(ctx, p);
+                    }
                     return;
                 }
                 // **The right button draws the box over the LANES** — the
@@ -13380,6 +13417,7 @@ impl IvoryApp {
         let ctx = ui.ctx().clone();
         self.shift_down = ctx.input(|i| i.modifiers.shift);
         self.alt_down = ctx.input(|i| i.modifiers.alt);
+        self.menu_ate_press = false;
 
         // **The Welcome card waits for the splash.** It is a separate OS
         // window and the splash is a layer inside this one, so the layer
@@ -14406,7 +14444,12 @@ impl IvoryApp {
                         Some(crate::mixer_panel::Hit::Insert(i, n)) => {
                             if self.insert(i.desk_index(), n).is_some() {
                                 self.mixer_fx_menu = Some((i, n));
-                            } else if let Some(strip) = i.strip() {
+                            } else if let Some(strip) = i.strip().filter(|s| {
+                                !matches!(
+                                    s,
+                                    crate::recorder::Strip::Channel(n) if !self.channel_used(*n)
+                                )
+                            }) {
                                 self.dialog = Some(dialogs::Dialog::Track {
                                     lane: strip.index(),
                                     removable: matches!(
@@ -14432,6 +14475,15 @@ impl IvoryApp {
                         _ => {
                             if let Some(strip) = crate::mixer_panel::strip_at(rect, &view, pos)
                                 .and_then(|i| i.strip())
+                                .filter(|s| {
+                                    // An empty channel slot has no track to
+                                    // have a menu about.
+                                    !matches!(
+                                        s,
+                                        crate::recorder::Strip::Channel(n)
+                                            if !self.channel_used(*n)
+                                    )
+                                })
                             {
                                 self.dialog = Some(dialogs::Dialog::Track {
                                     lane: strip.index(),
@@ -16964,8 +17016,8 @@ mod tests {
         assert!(app.input_menu.is_none(), "adding must not open a menu");
         let at = Strip::Channel(n).index();
         assert!(
-            (app.settings.strip_sends[at] - 1.0).abs() < 1e-9,
-            "a fresh track's send should come up at 1.0"
+            app.settings.strip_sends[at].abs() < 1e-9,
+            "a fresh track's send should rest at ZERO - only the shipped DX7 is wired"
         );
         assert_eq!(app.armed & (1 << n), 0, "a fresh track armed itself");
 

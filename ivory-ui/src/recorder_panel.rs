@@ -3921,6 +3921,17 @@ fn knob_face(cell: Rect) -> Option<KnobFace> {
     })
 }
 
+/// Whether `pos` lands on the DIAL ITSELF — the circle and its tick skirt —
+/// rather than anywhere in the knob's cell. The right-click gestures ask
+/// this: a cell is mostly margin, and "right-click the dial" answering a
+/// press two ticks into the empty paint ate the menu everywhere near a knob.
+pub fn on_knob_circle(cell: Rect, pos: Pos2) -> bool {
+    match (knob_centre(cell), knob_face(cell)) {
+        (Some(c), Some(f)) => (pos - c).length() <= f.radius * 1.26 + 2.0,
+        _ => false,
+    }
+}
+
 /// Where a knob's circle sits, for anything that has to line up with it.
 ///
 /// **The centre of the FACE, both ways.** The circle used to hang from the top
@@ -6474,10 +6485,12 @@ impl SetupLayout {
             body.min,
             Pos2::new(body.right(), body.top() + title_h),
         );
-        let close_w = (title.height() * 1.1).min(body.width() * 0.16);
-        let close = Rect::from_min_max(
-            Pos2::new(title.right() - close_w, title.top()),
-            title.max,
+        // Smaller than the band it sits in — a full-height OK block beside
+        // the headline was the second half of the owner's "too loud".
+        let close_w = (title.height() * 0.9).min(body.width() * 0.13);
+        let close = Rect::from_center_size(
+            Pos2::new(title.right() - close_w * 0.5, title.center().y),
+            Vec2::new(close_w, title.height() * 0.62),
         );
         let rows = Rect::from_min_max(Pos2::new(body.left(), title.bottom()), body.max);
         // **Two tiers: AUDIO on top, TAKE below** — the owner's order. The
@@ -7150,7 +7163,9 @@ pub fn draw_setup(
     painter.rect_stroke(l.panel, 4.0, Stroke::new(1.0_f32, p.ink), StrokeKind::Inside);
 
     if l.title.is_positive() {
-        let size = fit_text(l.title, "SETTINGS", l.title.height() * 0.50);
+        // 0.34, was 0.50: at the grown card the headline read as SHOUTING —
+        // the owner asked for both the word and the button beside it smaller.
+        let size = fit_text(l.title, "SETTINGS", l.title.height() * 0.34);
         if size >= MIN_TEXT {
             painter.text(
                 Pos2::new(l.title.left(), l.title.center().y),
