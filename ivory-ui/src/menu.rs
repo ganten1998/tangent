@@ -291,6 +291,12 @@ pub struct MenuView {
     /// click — dark mode, the fretboard — would stop working depending on
     /// where they clicked.
     pub recorder_first: bool,
+    /// The GLOBAL cut of the menu: Project, Plugin folders, MIDI input,
+    /// Window, Colors and the tail — nothing about the piano, the theory
+    /// band or the neck. What a right-click on the ARRANGEMENT or the MIDI
+    /// editor opens: those surfaces have their own gestures for their own
+    /// things, and a menu full of another surface's rows there is noise.
+    pub global_only: bool,
     /// §5: the live count-in, in beats. Comes from `Settings::count_in_beats()`,
     /// which has already clamped a stray value from a later build's file to
     /// something this menu can mark.
@@ -844,7 +850,9 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
         },
         MenuAction::ToggleChordLearning,
     ));
-    push_category(&mut everywhere, "Chords", chords);
+    if !view.global_only {
+        push_category(&mut everywhere, "Chords", chords);
+    }
 
     // ── The piano's own ────────────────────────────────────────────────────
     // One row, and it is here rather than under Chords because it is a BAND:
@@ -1165,7 +1173,14 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
     // separator behind: a menu whose gaps move around as bands open and close
     // reads as a rendering bug.
     let mut e: Vec<Entry> = Vec::new();
-    for block in [everywhere, piano, theory, guitar, band, tail] {
+    // The GLOBAL cut leads with the Project — the screenshotted order the
+    // owner asked for — and drops every surface-specific block whole.
+    let blocks: Vec<Vec<Entry>> = if view.global_only {
+        vec![band, everywhere, tail]
+    } else {
+        vec![everywhere, piano, theory, guitar, band, tail]
+    };
+    for block in blocks {
         if block.is_empty() {
             continue;
         }
@@ -1175,7 +1190,7 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
         e.extend(block);
     }
 
-    if view.recorder_first {
+    if view.recorder_first && !view.global_only {
         move_recorder_to_the_front(&mut e);
     }
     // Checked AFTER the recorder, so a click that is somehow both lands on the
@@ -1854,6 +1869,7 @@ mod tests {
             count_in_bars: 1,
             count_in_in_take: false,
             recorder_first: false,
+            global_only: false,
             metronome_on: false,
             metronome_in_take: false,
             hide_elapsed: false,
@@ -2774,6 +2790,41 @@ mod tests {
     }
 
 
+    /// **The GLOBAL cut: the arrangement's and the editor's right-click.**
+    ///
+    /// Leads with the Project, keeps the plugin folders, MIDI input, Window,
+    /// Colors and the tail — and carries NOTHING about the piano, the
+    /// theory band or the neck: those surfaces are not under the pointer.
+    #[test]
+    fn the_global_cut_holds_the_world_and_nothing_of_the_surfaces() {
+        let v = MenuView {
+            recorder_on: true,
+            global_only: true,
+            ..view()
+        };
+        let cats = category_names(v.clone());
+        assert_eq!(
+            cats.first().map(String::as_str),
+            Some("Project"),
+            "the global cut does not lead with the Project: {cats:?}"
+        );
+        assert_eq!(cats.get(1).map(String::as_str), Some("Plugin folders"));
+        for wanted in ["Window", "Colors"] {
+            assert!(cats.iter().any(|c| c == wanted), "{wanted} left the global cut");
+        }
+        for banned in ["Chords", "Theory", "Clef", "Tuning", "Capo", "Wood"] {
+            assert!(
+                !cats.iter().any(|c| c == banned),
+                "{banned} does not belong on the arrangement's menu: {cats:?}"
+            );
+        }
+        // The tail survives whole.
+        let rows = all_rows(v);
+        for wanted in ["About", "Reset Settings to Default"] {
+            assert!(rows.iter().any(|(l, ..)| l == wanted), "{wanted} left the tail");
+        }
+    }
+
     /// **Right-clicking the band leads with the band's own category.**
     ///
     /// One category, where there were five: show/hide is `V`, and the take's
@@ -2786,6 +2837,7 @@ mod tests {
         let v = MenuView {
             recorder_on: true,
             recorder_first: true,
+            global_only: false,
             ..view()
         };
         // The PROJECT leads — the document the whole surface works in —
@@ -2809,6 +2861,7 @@ mod tests {
         let elsewhere = MenuView {
             recorder_on: true,
             recorder_first: false,
+            global_only: false,
             ..view()
         };
         let mut a = category_names(v);
@@ -2820,6 +2873,7 @@ mod tests {
             all_rows(elsewhere.clone()).len(),
             all_rows(MenuView {
                 recorder_first: true,
+            global_only: false,
                 ..elsewhere
             })
             .len(),

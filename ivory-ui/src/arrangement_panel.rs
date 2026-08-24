@@ -1599,7 +1599,9 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             painter.rect_stroke(
                 slot,
                 0.0,
-                Stroke::new(1.0, p.face.gamma_multiply(0.35)),
+                // Half a point: the owner wants them THIN — present, not
+                // loud — and the full-width run makes even a hairline read.
+                Stroke::new(0.5, p.face.gamma_multiply(0.35)),
                 egui::StrokeKind::Inside,
             );
         }
