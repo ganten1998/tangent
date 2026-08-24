@@ -351,4 +351,24 @@ fn main() {
             .show();
         std::process::exit(1);
     }
+
+    // **Leave without running anyone else's destructors.**
+    //
+    // By this line the app is DOWN: `run_native` returned, eframe dropped
+    // `DesktopApp`, and that drop closed the engine — streams released,
+    // devices handed back, settings and the document long since saved. What
+    // remains in the process is other people's code: every loaded VST3's
+    // static destructors, queued on atexit. Kontakt 8's Qt teardown
+    // SEGFAULTS there (measured on the owner's machine, 2026-08-24,
+    // `~QApplication` -> `qAccessibleCleanup`), and a crash at that point is
+    // indistinguishable from a force-kill to coreaudiod — which wedges audio
+    // MACHINE-WIDE until the daemon is restarted. Discord and REAPER died
+    // with it. `_exit` skips the atexit chain entirely; a normal `exit()`
+    // (or falling off `main`) is precisely what detonates.
+    //
+    // Every serious host does this, for this exact reason.
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    unsafe { libc::_exit(0) }
 }
