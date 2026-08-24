@@ -35,7 +35,7 @@ pub struct Rgb {
 /// the migration runs ONCE against a file written before the change, and after
 /// that the same value chosen deliberately is never touched again. A file with
 /// no stamp is version 0 — every file every previous build wrote.
-const SETTINGS_VERSION: u64 = 17;
+const SETTINGS_VERSION: u64 = 18;
 
 /// Where a desk channel written before the INPUT STRIPS ended up.
 ///
@@ -968,6 +968,10 @@ pub struct Settings {
     /// The media explorer's DEFAULT folder — the DEF chip writes it, and
     /// every fresh drumpad open starts there, across launches too.
     pub media_default_dir: String,
+    /// Which PAGE of the pads the drumpad window shows — the bank band's
+    /// lit cell. Defaults to the page holding the classic kit (keys
+    /// 36..51).
+    pub drumpad_page: u8,
     /// Where the swung off-beat sits, percent of its pair: 66.7 is the
     /// standard shuffle, 50 is straight. One decimal, the SWG menu's rule.
     pub midi_swing_pct: f64,
@@ -1010,6 +1014,9 @@ pub struct Settings {
     pub desk_state_shift_v13: bool,
     /// v14's own shuffle: the drum bus pushed indices 8.. up one.
     pub desk_state_shift_v14: bool,
+    /// v17 -> v18: the pad seats moved (+36); the host renames their
+    /// insert-state sidecars once. Not serialized.
+    pub pad_state_shift_v18: bool,
 }
 
 /// Where `Settings::path()` points during tests.
@@ -1064,6 +1071,7 @@ impl Default for Settings {
             dark_mode: false,
             desk_state_shift_v13: false,
             desk_state_shift_v14: false,
+            pad_state_shift_v18: false,
             white_key_idle_color: Rgb::new(0xE8, 0xDC, 0xC0),
             black_key_idle_color: Rgb::new(0x1a, 0x1a, 0x1a),
             white_key_active_color: Rgb::new(0x6C, 0x9B, 0xD2),
@@ -1257,6 +1265,7 @@ impl Default for Settings {
             // editor; the theory surfaces stay light.
             arr_dark: true,
             media_default_dir: String::new(),
+            drumpad_page: 2,
             // The editor SHIPPED dark — its warm browns are the dark face
             // now, and its light face is the arrange view's greys.
             me_dark: true,
@@ -1773,7 +1782,12 @@ impl Settings {
             desk.inserts = v
                 .into_iter()
                 .map(|x| x.as_str().unwrap_or_default().to_owned())
-                .take((LEGACY_MAX_STRIPS + 1) * crate::recorder::INSERTS)
+                // The cap covers the PADS too — 128 of them since v18; the
+                // old (65*3) ceiling silently ate the pad seats on load.
+                .take(
+                    (LEGACY_MAX_STRIPS + 1 + crate::recorder::DRUM_PADS)
+                        * crate::recorder::INSERTS,
+                )
                 .collect();
         }
         if let Some(Value::Array(v)) = map.shift_remove("strip_names") {
@@ -2046,6 +2060,9 @@ impl Settings {
         }
         take_bool(&mut map, "midi_swing", &mut s.midi_swing);
         take_bool(&mut map, "arr_dark", &mut s.arr_dark);
+        if let Some(v) = map.shift_remove("drumpad_page").and_then(|v| v.as_u64()) {
+            s.drumpad_page = (v as u8).min(crate::recorder::DRUM_PAGES as u8 - 1);
+        }
         if let Some(Value::String(v)) = map.shift_remove("media_default_dir") {
             s.media_default_dir = v;
         }
@@ -2113,6 +2130,22 @@ impl Settings {
         }
         if !desk.inserts.is_empty() {
             self.strip_inserts = desk.inserts;
+            // A PROJECT written in the sixteen-pad era carries exactly
+            // (12+16)*3 insert seats, and its pads were keys 36..51: the
+            // same relocation the v18 settings migration makes, decided by
+            // LENGTH because a document has no settings version.
+            if self.strip_inserts.len() == (12 + 16) * 3 {
+                self.strip_inserts
+                    .resize((12 + 128) * 3, String::new());
+                for pad in (0..16usize).rev() {
+                    for bay in 0..3 {
+                        let from = (12 + pad) * 3 + bay;
+                        let to = (12 + 36 + pad) * 3 + bay;
+                        let v = std::mem::take(&mut self.strip_inserts[from]);
+                        self.strip_inserts[to] = v;
+                    }
+                }
+            }
             self.strip_inserts
                 .truncate(
                     (crate::recorder::STRIPS + 1 + crate::recorder::DRUM_PADS)
@@ -2196,6 +2229,27 @@ impl Settings {
             // ascending now, off at the top. The position flips so the sound
             // a file describes does not change.
             self.lpf_mix = (1.0 - self.lpf_mix).clamp(0.0, 1.0);
+        }
+        if was < 18 {
+            // **The pads grew from sixteen to the whole keyboard.** The old
+            // sixteen WERE keys 36..51, so their insert seats move from
+            // 12..27 (STRIPS+1+pad at v17's shape, frozen as literals) to
+            // 48..63 — key 36's seat onward. Highest first, or the move
+            // eats itself; the vacated seats (new pads 0..15) are cleared.
+            let per = 3usize;
+            let new_len = (12 + 128) * per;
+            if self.strip_inserts.len() < new_len {
+                self.strip_inserts.resize(new_len, String::new());
+            }
+            for pad in (0..16usize).rev() {
+                for bay in 0..per {
+                    let from = (12 + pad) * per + bay;
+                    let to = (12 + 36 + pad) * per + bay;
+                    let v = std::mem::take(&mut self.strip_inserts[from]);
+                    self.strip_inserts[to] = v;
+                }
+            }
+            self.pad_state_shift_v18 = true;
         }
         if was < 17 {
             // **Track 8 becomes the drumpad's lane** — but only where track 8
@@ -2759,6 +2813,10 @@ impl Settings {
         map.insert(
             "media_default_dir".into(),
             Value::String(self.media_default_dir.clone()),
+        );
+        map.insert(
+            "drumpad_page".into(),
+            Value::Number(self.drumpad_page.into()),
         );
         map.insert("me_dark".into(), Value::Bool(self.me_dark));
         map.insert(

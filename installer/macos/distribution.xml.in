@@ -2,14 +2,9 @@
 <!--
   The macOS installer's own UI.
 
-  `customize="always"` is the whole reason this file exists rather than a bare
-  single-component productbuild: it puts the Custom Install page in front of
-  the user by default, so choosing "just the plugin" or "just the app" is one
-  click rather than a hidden button. Both start selected, because someone who
-  downloaded Tangent almost certainly wants Tangent.
-
-  Neither choice is `required`. A user who unticks both gets an installer that
-  installs nothing, which is a legitimate thing to want to find out.
+  ONE choice now: the VST3 plugin is RETIRED (2026-08-24, the owner's
+  ruling — Tangent is a DAW and does not load through another). The
+  standalone is the product, and the installer says so plainly.
 
   @VERSION@ and @TITLE@ are substituted by scripts/build-installer.sh; this
   file is not valid XML input to productbuild until it has been.
@@ -46,7 +41,6 @@
 
     <choices-outline>
         <line choice="choice.standalone"/>
-        <line choice="choice.vst3"/>
     </choices-outline>
 
     <choice id="choice.standalone"
@@ -57,14 +51,5 @@
         <pkg-ref id="com.ganten.tangent.app"/>
     </choice>
 
-    <choice id="choice.vst3"
-            title="Tangent (VST3 plugin)"
-            description="The plugin, installed to /Library/Audio/Plug-Ins/VST3. Runs inside a DAW and reads the notes on the track it is on. It produces no audio."
-            start_selected="true"
-            visible="true">
-        <pkg-ref id="com.ganten.tangent.vst3"/>
-    </choice>
-
     <pkg-ref id="com.ganten.tangent.app" version="@VERSION@">Tangent-app.pkg</pkg-ref>
-    <pkg-ref id="com.ganten.tangent.vst3" version="@VERSION@">Tangent-vst3.pkg</pkg-ref>
 </installer-gui-script>

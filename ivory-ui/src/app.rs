@@ -419,6 +419,9 @@ pub struct IvoryApp {
     /// A GROUP move's snapshot: `(id, start_s, lane)` for every selected
     /// clip when a member was grabbed — the whole set rides the drag.
     arr_move_orig: Vec<(u64, f64, usize)>,
+    /// The header resize strip is hovered or dragged this frame — lights
+    /// the grip and swaps the cursor.
+    arr_grip_lit: bool,
     /// The stretch gesture's press-time snapshot — whole clips, notes and
     /// all, because every value scales from its ORIGINAL, never from the
     /// last tick's (which would compound rounding into drift).
@@ -428,6 +431,9 @@ pub struct IvoryApp {
     /// The CLIP's own right-click menu: (clip id, where it hangs). Two rows
     /// — delete the take, copy the take — the owner's words on both.
     arr_clip_menu: Option<(u64, egui::Pos2)>,
+    /// The arrange header BAY's right-click menu: (lane, bay, where).
+    /// Two rows — Delete FX, Replace FX — the mixer's insert menu, here.
+    arr_fx_menu: Option<(usize, usize, egui::Pos2)>,
     /// The meters' held picture: rise instant, fall exponential — the
     /// engine hands raw per-frame maxima, and raw maxima flicker.
     meter_hold: [[f32; 2]; crate::recorder::STRIPS],
@@ -1333,7 +1339,7 @@ impl IvoryApp {
             drumpad_rect: None,
             drumpad_pos: None,
             drumpad: crate::drumpad::DrumpadDoc::default(),
-            drumpad_sel: 0,
+            drumpad_sel: 36,
             drumpad_down: None,
             drumpad_grab: None,
             drumpad_move: None,
@@ -1355,9 +1361,11 @@ impl IvoryApp {
             arr_multi: Vec::new(),
             arr_band: None,
             arr_move_orig: Vec::new(),
+            arr_grip_lit: false,
             arr_stretch_orig: Vec::new(),
             tap_times: Vec::new(),
             arr_clip_menu: None,
+            arr_fx_menu: None,
             meter_hold: [[0.0; 2]; crate::recorder::STRIPS],
             history: Vec::new(),
             hist_at: 0,
@@ -4358,6 +4366,10 @@ impl IvoryApp {
         std::mem::take(&mut self.settings.desk_state_shift_v13)
     }
 
+    pub fn take_pad_state_shift_v18(&mut self) -> bool {
+        std::mem::take(&mut self.settings.pad_state_shift_v18)
+    }
+
     pub fn take_desk_state_shift_v14(&mut self) -> bool {
         std::mem::take(&mut self.settings.desk_state_shift_v14)
     }
@@ -6159,9 +6171,13 @@ impl IvoryApp {
         })
     }
 
-    /// Draw the clip menu over the arrangement, if one is up.
+    /// Draw the clip menu — or the bay's FX menu — over the arrangement.
     fn draw_clip_menu(&self, painter: &egui::Painter) {
-        let Some((_, at)) = self.arr_clip_menu else {
+        let (at, labels) = if let Some((_, at)) = self.arr_clip_menu {
+            (at, ["Delete take", "Copy take"])
+        } else if let Some((.., at)) = self.arr_fx_menu {
+            (at, ["Delete FX", "Replace FX"])
+        } else {
             return;
         };
         let rows = Self::clip_menu_rows(at);
@@ -6173,7 +6189,7 @@ impl IvoryApp {
             egui::Stroke::new(1.0, egui::Color32::from_rgb(0x24, 0x20, 0x1A)),
             egui::StrokeKind::Inside,
         );
-        for (r, label) in rows.iter().zip(["Delete take", "Copy take"]) {
+        for (r, label) in rows.iter().zip(labels) {
             painter.text(
                 Pos2::new(r.left() + 8.0, r.center().y),
                 egui::Align2::LEFT_CENTER,
@@ -7151,10 +7167,35 @@ impl IvoryApp {
     /// host confirms it — the decode is a frame away, and a pad that
     /// blinked empty on every drop would look broken — and flips to the
     /// red MISSING dress only when the host says so.
+    /// The drumpad's visible page, clamped to what exists.
+    fn drumpad_page(&self) -> usize {
+        usize::from(self.settings.drumpad_page).min(recorder::DRUM_PAGES - 1)
+    }
+
+    /// The KEY a visible slot means on the current page; `None` past the
+    /// keyboard's end (the last page's neatness padding).
+    fn drumpad_key_of(&self, slot: usize) -> Option<usize> {
+        let key = crate::drumpad_panel::page_base(self.drumpad_page()) + slot;
+        (key < recorder::DRUM_PADS).then_some(key)
+    }
+
     fn drumpad_view(&self) -> crate::drumpad_panel::DrumpadView<'_> {
+        let base = crate::drumpad_panel::page_base(self.drumpad_page());
         let pads = std::array::from_fn(|i| {
-            let slot = &self.drumpad.pads[i];
-            let status = &self.drumpad_status[i];
+            let key = base + i;
+            if key >= recorder::DRUM_PADS {
+                // The last page's tail: blanks past 127, the neatness the
+                // owner allowed for.
+                return crate::drumpad_panel::PadView {
+                    label: "",
+                    loaded: false,
+                    missing: false,
+                    wave: &[],
+                    params: recorder::DrumPadParams::default(),
+                };
+            }
+            let slot = &self.drumpad.pads[key];
+            let status = &self.drumpad_status[key];
             crate::drumpad_panel::PadView {
                 label: if slot.name.is_empty() {
                     std::path::Path::new(&slot.path)
@@ -7180,11 +7221,18 @@ impl IvoryApp {
                 .as_ref()
                 .map(|(p, t)| (*p, t.as_str())),
             pads,
-            peaks: self.drumpad_peaks,
-            selected: self.drumpad_sel,
-            down: self.drumpad_down,
+            peaks: std::array::from_fn(|i| {
+                self.drumpad_peaks.get(base + i).copied().unwrap_or(0.0)
+            }),
+            page: self.drumpad_page(),
+            selected: self.drumpad_sel.saturating_sub(base).min(recorder::DRUM_PAGE - 1),
+            down: self
+                .drumpad_down
+                .and_then(|k| (k >= base && k < base + recorder::DRUM_PAGE).then(|| k - base)),
             midi_on: self.drumpad_midi,
-            drop_hover: self.drumpad_hover,
+            drop_hover: self
+                .drumpad_hover
+                .and_then(|k| (k >= base && k < base + recorder::DRUM_PAGE).then(|| k - base)),
             fx: {
                 let sel = self.drumpad_sel.min(recorder::DRUM_PADS - 1);
                 std::array::from_fn(|bay| {
@@ -7469,7 +7517,9 @@ impl IvoryApp {
         let app_dragging =
             egui::DragAndDrop::payload::<crate::drumpad_panel::DraggedMedia>(ctx).is_some();
         self.drumpad_hover = if os_dragging || app_dragging {
-            hover_pos.and_then(|p| crate::drumpad_panel::pad_at(rect, p))
+            hover_pos
+                .and_then(|p| crate::drumpad_panel::pad_at(rect, p))
+                .and_then(|slot| self.drumpad_key_of(slot))
         } else {
             None
         };
@@ -7827,7 +7877,10 @@ impl IvoryApp {
                 }
                 // **An occupied pad answers with its MENU**: the trimmer
                 // and the obey-note-offs switch.
-                Some(H::Pad(i)) => {
+                Some(H::Pad(slot)) => {
+                    let Some(i) = self.drumpad_key_of(slot) else {
+                        return;
+                    };
                     if !self.drumpad.pads[i].path.is_empty() {
                         self.drumpad_sel = i;
                         self.pad_menu = Some(i);
@@ -7896,7 +7949,20 @@ impl IvoryApp {
                     }
                 }
             }
-            Some(H::Pad(i)) => {
+            Some(H::Bank(k)) => {
+                // The page steps as a WHOLE — never a row — and the
+                // selection follows to the same slot on the new page.
+                let old = crate::drumpad_panel::page_base(self.drumpad_page());
+                let slot = self.drumpad_sel.saturating_sub(old).min(recorder::DRUM_PAGE - 1);
+                self.settings.drumpad_page = k.min(recorder::DRUM_PAGES - 1) as u8;
+                let base = crate::drumpad_panel::page_base(self.drumpad_page());
+                self.drumpad_sel = (base + slot).min(recorder::DRUM_PADS - 1);
+                self.save_settings_soon();
+            }
+            Some(H::Pad(slot)) => {
+                let Some(i) = self.drumpad_key_of(slot) else {
+                    return;
+                };
                 self.drumpad_sel = i;
                 // Strike on the press; the off rides the release above. An
                 // empty pad only selects — there is nothing to sound. The
@@ -9028,6 +9094,52 @@ impl IvoryApp {
                 self.arr_steer(s0, ((end - s0) * 1.10).max(len));
             }
         }
+        // **The resize grip lights under the hand, and the cursor says
+        // what it does** — every frame, hover or drag.
+        {
+            let dragging = matches!(self.arr_drag, Some(ArrDrag::HeaderGrip));
+            let hovering = !dragging
+                && self.arr_drag.is_none()
+                && ctx
+                    .input(|i| i.pointer.hover_pos())
+                    .zip(self.arrangement_rect)
+                    .is_some_and(|(p, rect)| {
+                        let clips = self.arr_clip_views();
+                        let view = self.arrange_view(&clips);
+                        let l = crate::arrangement_panel::Layout::new(rect, &view);
+                        l.grip.is_positive() && l.grip.contains(p)
+                    });
+            self.arr_grip_lit = dragging || hovering;
+            if self.arr_grip_lit {
+                ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal);
+            }
+        }
+        // The BAY's FX menu: while it is up it owns every press.
+        if let Some((lane, bay, at)) = self.arr_fx_menu {
+            let (pressed, sec, pointer) = ctx.input(|i| {
+                (
+                    i.pointer.primary_pressed(),
+                    i.pointer.secondary_pressed(),
+                    i.pointer.interact_pos(),
+                )
+            });
+            if pressed || sec {
+                self.arr_fx_menu = None;
+                let rows = Self::clip_menu_rows(at);
+                match pointer {
+                    Some(p) if pressed && rows[0].contains(p) => {
+                        self.set_insert(lane, bay, None);
+                    }
+                    Some(p) if pressed && rows[1].contains(p) => {
+                        self.open_insert_picker(lane, bay);
+                    }
+                    _ => {
+                        self.menu_ate_press = true;
+                    }
+                }
+            }
+            return;
+        }
         // The CLIP menu first: while it is up it owns every press.
         if let Some((id, at)) = self.arr_clip_menu {
             let (pressed, sec, pointer) = ctx.input(|i| {
@@ -9111,6 +9223,24 @@ impl IvoryApp {
                         (self.settings.arr_grid_exp + 1).clamp(-5, 3);
                     self.save_settings();
                     return;
+                }
+                // A LOADED bay answers with its own menu — Delete FX or
+                // Replace FX, the mixer's offer — before the header's
+                // track menu can claim the press. An empty bay stays the
+                // header's.
+                let bay_hit = {
+                    let clips = self.arr_clip_views();
+                    let view = self.arrange_view(&clips);
+                    match crate::arrangement_panel::hit_test(rect, &view, p) {
+                        Some(crate::arrangement_panel::Hit::HdrBay(n, b)) => Some((n, b)),
+                        _ => None,
+                    }
+                };
+                if let Some((n, b)) = bay_hit {
+                    if self.insert(n, b).is_some() {
+                        self.arr_fx_menu = Some((n, b, p));
+                        return;
+                    }
                 }
                 let lane = {
                     let clips = self.arr_clip_views();
@@ -10113,6 +10243,7 @@ impl IvoryApp {
                 .filter(|(i, _)| *i < crate::recorder::CHANNELS),
             metronome_on: self.settings.metronome_on,
             snap_on: self.settings.arr_snap,
+            grip_lit: self.arr_grip_lit,
             grid_exp: self.settings.arr_grid_exp as i8,
             pending: self.arr_pending,
             view_start_s,

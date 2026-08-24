@@ -17,7 +17,9 @@
 use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, Vec2};
 
 use crate::fonts;
-use crate::recorder::{DrumPadParams, DRUM_PADS, DRUM_PAD_BASE};
+use crate::recorder::{
+    DrumPadParams, DRUM_PADS, DRUM_PAD_BASE, DRUM_PAGE, DRUM_PAGES, DRUM_PAGE_ANCHOR,
+};
 
 /// What an in-app drag of a media file carries.
 ///
@@ -48,7 +50,24 @@ const GAP: f32 = 6.0;
 /// The grid's sides. [`DRUM_PADS`] is the count; nothing below bakes in a
 /// shape beyond "columns × rows fills it".
 const COLS: usize = 4;
-const ROWS: usize = DRUM_PADS / COLS;
+const ROWS: usize = DRUM_PAGE / COLS;
+
+/// The bank band's width, on the grid's left — one mini 4×4 per PAGE,
+/// the current one outlined; a click steps the whole page, never a row.
+const BANK_W: f32 = 26.0;
+
+/// The first MIDI key of page `k`.
+pub fn page_base(page: usize) -> usize {
+    DRUM_PAGE_ANCHOR + page.min(DRUM_PAGES - 1) * DRUM_PAGE
+}
+
+/// C-1-based note name for a key — the pads' own captions, REAPER's read.
+pub fn key_name(key: usize) -> String {
+    const N: [&str; 12] = [
+        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+    ];
+    format!("{}{}", N[key % 12], (key / 12) as i32 - 1)
+}
 /// Vertical drag distance for a knob's full travel, in points. The RS5k
 /// manager's own feel.
 pub const KNOB_TRAVEL: f32 = 150.0;
@@ -83,10 +102,13 @@ pub struct PadView<'a> {
 
 /// Everything the drumpad draws, pushed in.
 pub struct DrumpadView<'a> {
-    pub pads: [PadView<'a>; DRUM_PADS],
-    /// The loudest recent sample per pad, 0..≈1, decayed by the app — what
-    /// lights a pad and drives its little meter.
-    pub peaks: [f32; DRUM_PADS],
+    /// The visible PAGE's sixteen, slot-indexed; the app slices the 128.
+    pub pads: [PadView<'a>; DRUM_PAGE],
+    /// The loudest recent sample per visible pad, 0..≈1.
+    pub peaks: [f32; DRUM_PAGE],
+    /// Which page the window shows — the bank band's lit cell.
+    pub page: usize,
+    /// The selected SLOT on this page (selection follows the page).
     pub selected: usize,
     /// The pad the mouse is holding down, for the pressed look.
     pub down: Option<usize>,
@@ -118,8 +140,12 @@ pub enum Hit {
     /// The DEF chip: remember the CURRENT media folder as the default —
     /// where every fresh open of this window lands, across launches.
     Def,
-    /// A pad: strike it, and select it for the inspector.
+    /// A pad: strike it, and select it for the inspector. The index is the
+    /// visible SLOT on the current page; the app maps it to its key.
     Pad(usize),
+    /// A cell of the bank band: show that PAGE. Whole pages only — the
+    /// band cannot step by rows.
+    Bank(usize),
     /// A knob in the inspector — a horizontal drag target, because the
     /// control draws a horizontal travel line.
     Knob(Param),
@@ -173,7 +199,9 @@ pub struct Layout {
     pub midi: Rect,
     pub def: Rect,
     pub grid: Rect,
-    pub pads: [Rect; DRUM_PADS],
+    pub pads: [Rect; DRUM_PAGE],
+    /// The bank band's cells, one per page, top page first.
+    pub banks: [Rect; DRUM_PAGES],
     pub inspector: Rect,
     pub name: Rect,
     pub knob_gain: Rect,
@@ -198,7 +226,8 @@ impl Layout {
             midi: Rect::NOTHING,
             def: Rect::NOTHING,
             grid: Rect::NOTHING,
-            pads: [Rect::NOTHING; DRUM_PADS],
+            pads: [Rect::NOTHING; DRUM_PAGE],
+            banks: [Rect::NOTHING; DRUM_PAGES],
             inspector: Rect::NOTHING,
             name: Rect::NOTHING,
             knob_gain: Rect::NOTHING,
@@ -240,8 +269,12 @@ impl Layout {
             Pos2::new(rect.left(), rect.bottom() - INSPECTOR_H),
             Pos2::new(split, rect.bottom()),
         );
-        let grid = Rect::from_min_max(
+        let band = Rect::from_min_max(
             Pos2::new(rect.left() + GAP, strip.bottom() + GAP),
+            Pos2::new(rect.left() + GAP + BANK_W, inspector.top() - GAP),
+        );
+        let grid = Rect::from_min_max(
+            Pos2::new(band.right() + GAP, strip.bottom() + GAP),
             Pos2::new(split - GAP, inspector.top() - GAP),
         );
         let media = Rect::from_min_max(
@@ -266,6 +299,17 @@ impl Layout {
             let x0 = grid.left() + col as f32 * (cw + GAP);
             let y0 = grid.bottom() - ch - row as f32 * (ch + GAP);
             Rect::from_min_size(Pos2::new(x0, y0), Vec2::new(cw, ch))
+        });
+
+        // The bank band: DRUM_PAGES cells stacked, HIGHEST page on top —
+        // up the band is up in pitch, exactly as up the grid is.
+        let bh = (band.height() - GAP * (DRUM_PAGES as f32 - 1.0)) / DRUM_PAGES as f32;
+        let banks = std::array::from_fn(|k| {
+            let from_top = (DRUM_PAGES - 1 - k) as f32;
+            Rect::from_min_size(
+                Pos2::new(band.left(), band.top() + from_top * (bh + GAP)),
+                Vec2::new(band.width(), bh),
+            )
         });
 
         // The inspector, left to right: the name, three knobs, the choke
@@ -304,6 +348,7 @@ impl Layout {
             def,
             grid,
             pads,
+            banks,
             inspector,
             name,
             knob_gain,
@@ -526,9 +571,49 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
         }
     }
 
+    // ── the bank band: one mini-grid per PAGE, the shown one outlined ────
+    for (k, cell) in l.banks.iter().copied().enumerate() {
+        if !cell.is_positive() {
+            continue;
+        }
+        let inner = cell.shrink(2.0);
+        // Sixteen dots, the page in miniature.
+        let dw = inner.width() / 4.0;
+        let dh = inner.height() / 4.0;
+        for d in 0..16usize {
+            let (dc, dr) = (d % 4, d / 4);
+            let dot = Rect::from_min_size(
+                Pos2::new(
+                    inner.left() + dc as f32 * dw,
+                    inner.bottom() - (dr as f32 + 1.0) * dh,
+                ),
+                Vec2::new((dw - 1.0).max(1.0), (dh - 1.0).max(1.0)),
+            );
+            let key = page_base(k) + d;
+            let alpha = if key >= DRUM_PADS { 4 } else { 14 };
+            painter.rect_filled(dot, 1.0, Color32::from_white_alpha(alpha));
+        }
+        if view.page == k {
+            painter.rect_stroke(
+                cell,
+                2.0,
+                Stroke::new(1.5_f32, METER_GREEN),
+                egui::StrokeKind::Inside,
+            );
+        }
+    }
+
     // ── the pads ──────────────────────────────────────────────────────────
+    let base = page_base(view.page);
     for (i, r) in l.pads.iter().copied().enumerate() {
         if !r.is_positive() {
+            continue;
+        }
+        // Past the keyboard's last key: a dead cell, the last page's
+        // neatness padding. Drawn, not skipped — a hole in the grid reads
+        // as a bug.
+        if base + i >= DRUM_PADS {
+            painter.rect_filled(r, 3.0, Color32::from_white_alpha(3));
             continue;
         }
         let pad = &view.pads[i];
@@ -541,6 +626,19 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
             painter.rect_filled(r, 3.0, Color32::from_rgba_premultiplied(0, 0, 0, 110));
         } else {
             painter.rect_filled(r, 3.0, Color32::from_white_alpha(6));
+        }
+
+        // The pad's NOTE NAME, top-left and faint — the reference image's
+        // own captions: with eight pages the name is what says where in
+        // the keyboard the hand is.
+        if r.width() > 30.0 {
+            painter.text(
+                Pos2::new(r.left() + 4.0, r.top() + 3.0),
+                egui::Align2::LEFT_TOP,
+                key_name(base + i),
+                font((r.height() * 0.16).clamp(7.0, 10.0)),
+                INK.gamma_multiply(0.45),
+            );
         }
 
         // The waveform ghost, faint, across the pad's middle.
@@ -659,7 +757,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
         ],
         Stroke::new(1.0_f32, INK.gamma_multiply(0.2)),
     );
-    let sel = &view.pads[view.selected.min(DRUM_PADS - 1)];
+    let sel = &view.pads[view.selected.min(DRUM_PAGE - 1)];
     let has = sel.loaded || sel.missing;
     let frac = |v: f32, p: Param| {
         let (lo, hi) = p.range();
@@ -837,7 +935,12 @@ pub fn hit_test(rect: Rect, view: &DrumpadView<'_>, pos: Pos2) -> Option<Hit> {
             return Some(Hit::Pad(i));
         }
     }
-    let sel = &view.pads[view.selected.min(DRUM_PADS - 1)];
+    for (k, r) in l.banks.iter().enumerate() {
+        if r.is_positive() && r.contains(pos) {
+            return Some(Hit::Bank(k));
+        }
+    }
+    let sel = &view.pads[view.selected.min(DRUM_PAGE - 1)];
     let has = sel.loaded || sel.missing;
     for (r, hit, want) in [
         (l.knob_gain, Hit::Knob(Param::Gain), has),
@@ -888,7 +991,7 @@ mod tests {
             wave: &[],
             params: DrumPadParams::default(),
         };
-        let mut pads = [empty; DRUM_PADS];
+        let mut pads = [empty; DRUM_PAGE];
         pads[0] = PadView {
             label: "Kick",
             loaded: true,
@@ -901,7 +1004,8 @@ mod tests {
             def_lit: false,
             typing: None,
             pads,
-            peaks: [0.0; DRUM_PADS],
+            peaks: [0.0; DRUM_PAGE],
+            page: 2,
             selected: 0,
             down: None,
             midi_on: true,
@@ -932,7 +1036,7 @@ mod tests {
         let l = Layout::new(rect());
         assert!(l.panel.is_positive());
         let first = l.pads[0];
-        let last = l.pads[DRUM_PADS - 1];
+        let last = l.pads[DRUM_PAGE - 1];
         assert!(first.left() < last.left(), "pad 0 is not left of pad 15");
         assert!(first.top() > last.top(), "pad 0 is not below pad 15");
         for (i, a) in l.pads.iter().enumerate() {
@@ -953,9 +1057,13 @@ mod tests {
     fn hits_land_where_they_look() {
         let v = view();
         let l = Layout::new(rect());
-        for i in 0..DRUM_PADS {
+        for i in 0..DRUM_PAGE {
             assert_eq!(hit_test(rect(), &v, l.pads[i].center()), Some(Hit::Pad(i)));
             assert_eq!(pad_at(rect(), l.pads[i].center()), Some(i));
+        }
+        // The bank band answers with whole PAGES.
+        for k in 0..DRUM_PAGES {
+            assert_eq!(hit_test(rect(), &v, l.banks[k].center()), Some(Hit::Bank(k)));
         }
         assert_eq!(hit_test(rect(), &v, l.close.center()), Some(Hit::Close));
         assert_eq!(hit_test(rect(), &v, l.midi.center()), Some(Hit::Midi));
@@ -998,11 +1106,17 @@ mod tests {
     /// The pads speak the drum map: 36 is C2 and the grid counts up from it.
     #[test]
     fn the_notes_read_like_the_drum_map() {
-        assert_eq!(pad_note(0), 36);
+        // Pad n IS note n now; the classic sixteen live on PAGE 2, whose
+        // base is the old kit's C2 home.
+        assert_eq!(pad_note(0), 0);
+        assert_eq!(page_base(2), 36);
         assert_eq!(note_name(36), "C2");
         assert_eq!(note_name(37), "C#2");
-        assert_eq!(pad_note(DRUM_PADS - 1), 51);
+        assert_eq!(key_name(36), "C2");
+        assert_eq!(pad_note(DRUM_PADS - 1), 127);
         assert_eq!(note_name(60), "C4");
+        // The last page pads out past the keyboard, by design.
+        assert!(page_base(DRUM_PAGES - 1) + DRUM_PAGE > DRUM_PADS);
     }
 
     /// Degenerate rects neither panic nor answer presses.

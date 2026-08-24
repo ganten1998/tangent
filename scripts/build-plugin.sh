@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# RETIRED (2026-08-24): nothing builds or ships the VST3 any more — Tangent
+# is a DAW and does not load through another. Kept for a possible
+# visualizer-only return.
 # Build Tangent.vst3 and lay it out as a real VST3 bundle.
 #
 #   scripts/build-plugin.sh                 # host platform

@@ -4844,6 +4844,9 @@ impl DesktopApp {
         if me.app.take_desk_state_shift_v14() {
             shift_insert_states_for_v14();
         }
+        if me.app.take_pad_state_shift_v18() {
+            shift_insert_states_for_v18();
+        }
         me
     }
 }
@@ -4866,6 +4869,21 @@ fn shift_insert_states_for_v13() {
             let from = insert_state_path(old, bay);
             if from.exists() {
                 let _ = std::fs::rename(&from, insert_state_path(old - 1, bay));
+            }
+        }
+    }
+}
+
+/// v17 -> v18: the pads grew to the whole keyboard; the old sixteen were
+/// keys 36..51, so their seats moved from 12..27 to 48..63. Highest first,
+/// same rule as every shuffle before it; numbers frozen as literals.
+#[cfg(feature = "recorder")]
+fn shift_insert_states_for_v18() {
+    for bay in 0..3 {
+        for pad in (0..16usize).rev() {
+            let from = insert_state_path(12 + pad, bay);
+            if from.exists() {
+                let _ = std::fs::rename(&from, insert_state_path(12 + 36 + pad, bay));
             }
         }
     }

@@ -502,11 +502,24 @@ pub const STRIPS: usize = CHANNELS + 3;
 
 // ── The drumpad ─────────────────────────────────────────────────────────────
 
-/// How many pads the drumpad has. Sixteen in a 4×4 grid, the shape every
-/// hardware drum machine since the MPC has taught hands to expect. The engine
-/// mirrors this the way it mirrors [`CHANNELS`]; nothing may bake the grid's
-/// SIDES in so deep that another layout is a rewrite.
-pub const DRUM_PADS: usize = 16;
+/// How many pads the drumpad addresses: EVERY MIDI key. Pad `n` IS note
+/// `n` — the 4×4 window the panel shows is a PAGE over this space, stepped
+/// by the bank band on its left. The engine mirrors this the way it
+/// mirrors [`CHANNELS`].
+pub const DRUM_PADS: usize = 128;
+
+/// One visible PAGE of the pads: the 4×4 the hands know.
+pub const DRUM_PAGE: usize = 16;
+
+/// Where the pages anchor. Pages start at `4 + 16k`, so the classic kit
+/// range (36..51, the old sixteen) sits WHOLE on one page — the owner's
+/// reference screenshot, exactly. Keys 0..3 (C-1..D#-1) fall before the
+/// first page and stay reachable by MIDI alone; the last page pads out
+/// past 127 with blanks to keep the graph neat.
+pub const DRUM_PAGE_ANCHOR: usize = 4;
+
+/// How many pages the band offers: bases 4, 20, …, 116.
+pub const DRUM_PAGES: usize = 8;
 
 /// Where pad `i`'s insert bays live in the strip-indexed insert space:
 /// after every strip and the master. One seat map, mirrored by the engine.
@@ -514,10 +527,10 @@ pub const fn pad_insert_index(pad: usize) -> usize {
     STRIPS + 1 + pad
 }
 
-/// The MIDI note of pad 0. C1 — the General MIDI kick — with the pads counting
-/// up from the BOTTOM-LEFT corner, which is where every drum machine puts its
-/// first pad. Pad `n` answers note `DRUM_PAD_BASE + n`.
-pub const DRUM_PAD_BASE: u8 = 36;
+/// The MIDI note of pad 0. ZERO now — pad `n` answers note `n`, the whole
+/// keyboard. The classic kit's C1 home (36) is where the default PAGE
+/// opens instead; see [`DRUM_PAGE_ANCHOR`].
+pub const DRUM_PAD_BASE: u8 = 0;
 
 /// How hard a mouse-struck pad hits. Firm — a pad tapped with a pointer is a
 /// performance gesture, not an audition — but short of the top, for the same
