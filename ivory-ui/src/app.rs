@@ -1083,6 +1083,11 @@ struct DrumpadGrab {
     /// Whether the hand really travelled — a motionless press-and-release
     /// is a CLICK, which opens the typed-value field instead.
     moved: bool,
+    /// The press landed on the NUMBER (the value word above the track).
+    /// A motionless click there types; on the track it does nothing —
+    /// the owner's split: numbers are for entering, the track is for
+    /// dragging and its double-click for the default.
+    on_number: bool,
 }
 
 /// Points of travel for a knob's whole sweep. See the panel's own constant.
@@ -3150,10 +3155,17 @@ impl IvoryApp {
     /// The GLOBAL cut of the menu — what a right-click on the arrangement
     /// or the MIDI editor opens: Project, Plugin folders, MIDI input,
     /// Window, Colors, and the tail. See `MenuView::global_only`.
-    fn open_global_menu_at(&mut self, ctx: &egui::Context, global_pos: Pos2) {
+    fn open_global_menu_at(&mut self, ctx: &egui::Context, at: Pos2) {
+        // `at` is WINDOW-LOCAL — every caller reads the pointer straight
+        // from the egui context. The menu is its own OS window on the
+        // desktop, so the anchor must be SCREEN coordinates, exactly as
+        // the piano's path converts them (`main_inner_origin + pos`).
+        // Passing the local point put the menu at the screen's top-left
+        // corner — or clean off the display, from the editor.
+        let global = self.main_inner_origin + at.to_vec2();
         let mut view = self.menu_view();
         view.global_only = true;
-        self.menu_state = Some(MenuState::open(ctx, view, global_pos, self.monitor_size));
+        self.menu_state = Some(MenuState::open(ctx, view, global, self.monitor_size));
     }
 
     /// Colour of the supporter heart, or None when it should not be drawn.
@@ -7613,14 +7625,14 @@ impl IvoryApp {
                     }
                 }
             } else {
-                // **A click, not a drag, TYPES the number** — the sliders'
-                // one language: single click for the field, double for the
-                // default, drag for the hand.
-                let typed = !grab.moved;
+                // **A click on the NUMBER types it** — a click on the track
+                // is nothing at all (the track answers drags, and its
+                // double-click answers with the default).
+                let typed = !grab.moved && grab.on_number;
                 self.drumpad_grab = None;
                 if typed {
                     self.drumpad_num = Some((grab.param, String::new()));
-                } else {
+                } else if grab.moved {
                     self.drumpad_save();
                 }
             }
@@ -7774,19 +7786,30 @@ impl IvoryApp {
                 }
             }
             Some(H::Knob(param)) => {
+                // The control's two halves: the NUMBER above, the TRACK
+                // below. The split sits just over the travel line.
+                let on_number = {
+                    let l = crate::drumpad_panel::Layout::new(rect);
+                    let r = l.knob_of(param);
+                    r.is_positive() && p.y < r.top() + r.height() * 0.45
+                };
                 let double = ctx
                     .input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
-                if double {
-                    // One rule for every control that travels: a double
-                    // click puts it back.
+                if double && !on_number {
+                    // A double on the TRACK puts it back — and only there:
+                    // a double on the number is just a hasty click, and it
+                    // opens the field like one.
                     self.drumpad_set(param, param.default_value());
                     self.drumpad_save();
+                } else if double && on_number {
+                    self.drumpad_num = Some((param, String::new()));
                 } else {
                     self.drumpad_grab = Some(DrumpadGrab {
                         param,
                         from: p,
                         from_value: self.drumpad_get(param),
                         moved: false,
+                        on_number,
                     });
                 }
             }

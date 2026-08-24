@@ -683,6 +683,20 @@ channels play back their clips and nothing else. "Ready to play" and
   row's free half: PROJECT (the project dialog) and PLUGINS
   (add-a-folder picker).
 
+- **4.69.0 — the menu lands where you clicked, and the card grew**:
+  the arrange/editor right-click menu opened at the screen's top-left
+  (or clean off the display) — the menu is its own OS window and the
+  opener was handed WINDOW-local coordinates; it converts through
+  `main_inner_origin` now, the piano path's own arithmetic. The
+  SETTINGS card was "too small and a pain": width grew from 24%
+  clamp 290-430 to 34% clamp 380-580 (row text sizes itself to its
+  rectangle, so width IS legibility), and the PROJECT/PLUGINS doors
+  moved off the count-in row's crammed half onto a full row of their
+  own. The DRUMPAD SLIDERS split their halves: click the NUMBER to
+  type, drag the track to slide, double-click the TRACK for the
+  default — a motionless click on the track means nothing now, and a
+  double on the number is just a hasty click into the field.
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index
