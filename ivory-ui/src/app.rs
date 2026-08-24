@@ -3074,17 +3074,19 @@ impl IvoryApp {
             .map(|(n, p)| (shift(n), *p))
             .collect();
         self.save_settings();
+        // **Reconciled FIRST — before anything reads `display_notes`.**
+        // `display_notes` is the lit set UNION `sounding`, and `sounding`
+        // holds the OLD chord until the diff settles. The first fix put
+        // this call after `rebuild_voicing`, and the solver had already
+        // been handed old-union-new by then: the neck drew both chords at
+        // once until the next voicing tick, exactly the flash the owner
+        // kept seeing. Offs queue before ons, as ever — every note of the
+        // old chord is OFF before one pixel of the new one is computed.
+        self.reconcile_sound();
         // The neck and the theory band read the same notes, so they have to be
         // rebuilt from the new ones rather than left showing the old shape.
         self.rebuild_voicing();
         self.detection_tick(true);
-        // **Reconciled NOW, not at frame's end.** `display_notes` is the lit
-        // set UNION `sounding`, and `sounding` still held the old chord for
-        // the rest of this frame — so a Space-held chord drew old and new
-        // together for a beat on every arrow press. Settling the diff here
-        // (offs queued before ons, as ever) means every note of the old
-        // chord is OFF before the picture shows the new one.
-        self.reconcile_sound();
     }
 
     fn menu_view(&self) -> MenuView {
@@ -11679,8 +11681,13 @@ impl IvoryApp {
             // key does is turn them all on together and all off together, from
             // whatever they were.
             K::ToggleNoteNames => {
-                let any = self.settings.staff_note_names
-                    || self.settings.show_piano_note_names
+                // The DECISION reads only the two surfaces the key visibly
+                // rules — the piano and the neck. The staff flag still
+                // FOLLOWS, but it no longer votes: it ships true while the
+                // others ship false, so counting it meant the first press of
+                // a fresh install "turned off" a label nobody could see and
+                // the second press did the work — the owner's two-press U.
+                let any = self.settings.show_piano_note_names
                     || self.settings.show_fret_note_names;
                 let want = !any;
                 self.settings.staff_note_names = want;
@@ -18182,6 +18189,39 @@ mod tests {
                     "an opaque fill (shape {fi}, {fr:?}) paints over the                      empty-slot border (shape {bi}, {br:?}) again"
                 );
             }
+        }
+    }
+
+    /// **A transposed Space-chord never draws both chords.** The flash the
+    /// owner saw twice: `display_notes` is lit-union-`sounding`, `sounding`
+    /// settles in `reconcile_sound`, and the voicing solver snapshots the
+    /// union at `rebuild_voicing` — so the reconcile must run FIRST inside
+    /// `transpose_by`, or the neck holds old-plus-new until the next tick.
+    /// Pinned on both surfaces: the display set and the solved voicing.
+    #[test]
+    fn a_transposed_space_chord_never_draws_both() {
+        let (_, mut app) = headless(Caps::DESKTOP);
+        app.settings.keytoggle_enabled = true;
+        app.manual_notes = [60u8, 64, 67].into_iter().collect();
+        app.audition_held = true;
+        app.reconcile_sound();
+        app.transpose_by(2);
+        let display = app.display_notes();
+        for old in [60u8, 64, 67] {
+            assert!(
+                !display.contains(&old),
+                "old note {old} still displayed after the transpose"
+            );
+        }
+        for new in [62u8, 66, 69] {
+            assert!(display.contains(&new), "new note {new} missing");
+        }
+        let placed: Vec<u8> = app.voicing.current().notes.iter().map(|n| n.pitch).collect();
+        for old in [60u8, 64, 67] {
+            assert!(
+                !placed.contains(&old),
+                "the NECK still places old note {old} - the solver was handed the union"
+            );
         }
     }
 

@@ -737,6 +737,17 @@ channels play back their clips and nothing else. "Ready to play" and
   transpose reconciles the sound immediately now: every old note is
   OFF before the picture shows the new ones.
 
+- **4.72.0 — the flash for real, and one press of U**: the 4.71
+  reconcile ran AFTER `rebuild_voicing`, so the neck's solver had
+  already been handed old-union-new and held both chords until the
+  next voicing tick — the reconcile runs FIRST now, pinned by a test
+  on the display set AND the solved voicing. And U took two presses
+  on every fresh launch because the group toggle counted the STAFF
+  names flag, which ships true while the visible pair ships false:
+  the first press "turned off" a label nobody could see. The
+  decision reads only the piano and neck flags now; the staff still
+  follows.
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index
