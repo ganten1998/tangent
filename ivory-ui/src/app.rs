@@ -5196,10 +5196,11 @@ impl IvoryApp {
             {
                 *send = 1.0;
             }
-            // Exclusive, not additive: binding an input is "I record HERE
-            // now", and any lane still armed from its own birth would
-            // otherwise ride along into every take.
-            self.armed = 1 << ch;
+            // **No arm.** A fresh binding used to arm itself — first
+            // additively (the phantom multi-record), then exclusively
+            // (which silently DISARMED whatever the player had up, the
+            // worse theft). The owner's ruling: adding a track touches
+            // nobody's arms, its own included. R is one click away.
         }
         self.save_settings();
         self.undo_commit();
@@ -5375,7 +5376,6 @@ impl IvoryApp {
         {
             *send = 1.0;
         }
-        self.armed = 1 << n;
         self.save_settings();
     }
 
@@ -15478,9 +15478,9 @@ mod tests {
         app.set_channel_input_spec(3, "2");
         assert_eq!(app.channel_kind(3), Some(recorder::ChannelKind::Audio));
         assert_eq!(app.input_chip_text(3), "IN 3");
-        // And binding a fresh track arms it with its send up, which is
-        // what the retired MIDI-or-AUDIO ask used to do.
-        assert_ne!(app.armed & (1 << 3), 0, "a new track did not arm");
+        // Binding a fresh track raises its send and touches NO arms —
+        // the self-arm stole the player's standing arms twice over.
+        assert_eq!(app.armed & (1 << 3), 0, "a new track armed itself");
         app.set_channel_input_spec(3, "0+1");
         assert_eq!(app.input_chip_text(3), "IN 1/2");
         assert_eq!(IvoryApp::parse_input_spec("2"), Some((2, None)));
@@ -16677,14 +16677,22 @@ mod tests {
         app.apply_mixer_hit(Hit::Arm(Column(0)), 0.0);
         assert_eq!(app.armed_mask(), 1, "R did not arm again");
 
-        // A track somebody just added is about to be played: it opens
-        // armed. Adding = binding an input, the REAPER model.
+        // A track somebody just added touches NOBODY's arms — its own
+        // included. It armed itself for a while (first additively, then
+        // exclusively) and each version stole something from the player.
         let n = (1..crate::recorder::CHANNELS)
             .find(|n| app.channel_kind(*n).is_none())
             .expect("an unused channel");
+        assert_eq!(app.armed_mask(), 1, "the DX7 should stand armed here");
         app.set_channel_input_spec(n, "midi:all");
         assert_eq!(app.channel_kind(n), Some(ChannelKind::Midi));
-        assert_ne!(app.armed_mask() & (1 << n), 0, "a fresh track opened dead");
+        assert_eq!(
+            app.armed_mask(),
+            1,
+            "adding a track changed the arms (its own or another's)"
+        );
+        app.apply_mixer_hit(Hit::Arm(Column(n)), 0.0);
+        assert_ne!(app.armed_mask() & (1 << n), 0, "R would not arm the new track");
 
         // And the × takes the arm with the channel.
         app.apply_mixer_hit(Hit::Remove(Column(n)), 0.0);
@@ -16710,16 +16718,15 @@ mod tests {
         let (_, mut app) = headless(Caps::DESKTOP);
         assert_eq!(app.armed_mask(), 1, "the desk opens with the DX7 armed");
 
-        // Two fresh tracks, bound one after the other: each bind is "I
-        // record HERE now", so only the LAST one holds the arm.
+        // Two fresh tracks, bound one after the other: binds touch NO
+        // arms — the DX7's stays the only one standing.
         app.set_channel_input_spec(2, "midi:all");
         app.set_channel_input_spec(3, "midi:all");
-        assert_eq!(app.armed_mask(), 1 << 3, "a bind left stale arms standing");
+        assert_eq!(app.armed_mask(), 1, "a bind changed the arms");
 
         // Plain presses STACK — a deliberate multi-lane take…
         app.apply_mixer_hit(Hit::Arm(Column(2)), 0.0);
-        assert_eq!(app.armed_mask(), (1 << 2) | (1 << 3), "a plain arm did not add");
-        app.apply_mixer_hit(Hit::Arm(Column(0)), 0.0);
+        app.apply_mixer_hit(Hit::Arm(Column(3)), 0.0);
         assert_eq!(
             app.armed_mask(),
             1 | (1 << 2) | (1 << 3),
@@ -16801,7 +16808,7 @@ mod tests {
             (app.settings.strip_sends[at] - 1.0).abs() < 1e-9,
             "a fresh track's send should come up at 1.0"
         );
-        assert_ne!(app.armed & (1 << n), 0, "a fresh track opened dead");
+        assert_eq!(app.armed & (1 << n), 0, "a fresh track armed itself");
 
         // The same press on the now-EXISTING track opens the input menu.
         app.apply_mixer_hit(Hit::Add(Column(n)), 0.0);
@@ -17792,6 +17799,57 @@ mod tests {
             "a full travel's drag reached only {}",
             app.settings.master_gain
         );
+    }
+
+    /// **The empty slots' borders survive the whole paint.** Three rounds
+    /// of "the separators don't draw" and the cause was ORDER, not ink: the
+    /// header section fills its whole column with wood after the borders
+    /// were painted, then fills each empty panel again. This walks the real
+    /// shape list of a real frame and asserts (a) the border strokes exist,
+    /// and (b) no opaque fill painted after any of them touches it.
+    #[test]
+    fn the_empty_slot_borders_are_painted_over_nothing() {
+        let (ctx, mut app) = headless(Caps::DESKTOP);
+        let expected = {
+            // The dark wardrobe's face ink at the border's own fade.
+            egui::Color32::from_rgb(0xE8, 0xDC, 0xC0).gamma_multiply(0.35)
+        };
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1300.0, 800.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = ui.max_rect();
+                let clips = app.arr_clip_views();
+                let view = app.arrange_view(&clips);
+                crate::arrangement_panel::draw(ui.painter(), rect, &view);
+            });
+        });
+        let mut borders: Vec<(usize, Rect)> = Vec::new();
+        let mut fills: Vec<(usize, Rect)> = Vec::new();
+        for (i, cs) in out.shapes.iter().enumerate() {
+            if let egui::epaint::Shape::Rect(r) = &cs.shape {
+                if r.stroke.color == expected {
+                    borders.push((i, r.rect));
+                }
+                if r.fill.a() == 255 && r.rect.area() > 1.0 {
+                    fills.push((i, r.rect));
+                }
+            }
+        }
+        assert!(
+            !borders.is_empty(),
+            "no empty-slot border stroke was painted at all"
+        );
+        for (bi, br) in &borders {
+            for (fi, fr) in &fills {
+                assert!(
+                    fi < bi || !fr.intersects(br.shrink(0.5)),
+                    "an opaque fill (shape {fi}, {fr:?}) paints over the                      empty-slot border (shape {bi}, {br:?}) again"
+                );
+            }
+        }
     }
 
     /// **The document follows the tempo, and the stretch follows the hand.**
