@@ -950,6 +950,21 @@ channels play back their clips and nothing else. "Ready to play" and
   grow test that carries a pad's FX across, and by mixer/arrange
   layout tests for the window and the pinned master.
 
+- **4.83.0 — Windows carries its own runtime, and the installer wears
+  the logo**: a fresh Windows 11 box (no dev tools, no VC++ redist)
+  refused to launch `tangent.exe` — "VCRUNTIME140.dll was not found".
+  The msvc target links the C runtime dynamically by default, so every
+  cross-built release to date carried a latent dependency on a redist
+  most machines happen to have and a clean one does not. The Windows
+  target links the CRT STATICALLY now (`+crt-static`, scoped to
+  `x86_64-pc-windows-msvc` alone) — the runtime rides inside the exe,
+  no redist, no app-local DLLs, no installer step. The bundled
+  `tangent-ffmpeg.exe` is BtbN's mingw-static build and needs no
+  redist either. And the NSIS installer wears the app's own logo now:
+  `MUI_ICON`/`MUI_UNICON` point at the same `ivory.ico` build.rs
+  embeds into the exe, so the setup, the app, and the Add/Remove
+  entry are one mark instead of NSIS's placeholder.
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index

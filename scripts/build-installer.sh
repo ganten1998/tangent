@@ -212,11 +212,15 @@ build_windows() {
   need "$WORK/windows/app/tangent.exe" "the zip has no tangent.exe in it"
   cp LICENSING.md "$WORK/windows/LICENSE.txt"
 
+  # The installer wears the app's logo. Same icon build.rs embeds into the
+  # exe; the setup, the app, and the Add/Remove entry are one mark.
+  need "$ROOT/assets/ivory.ico" "the app icon is missing"
   local out="dist/$NAME-$VERSION-windows-setup.exe"
   makensis -NOCD \
     "-DVERSION=$VERSION" \
     "-DNUMVERSION=${VERSION%%-*}" \
     "-DSRCDIR=$WORK/windows" \
+    "-DICON=$ROOT/assets/ivory.ico" \
     "-DOUTFILE=$ROOT/$out" \
     installer/windows/tangent.nsi | sed 's/^/    /'
 

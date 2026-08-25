@@ -59,6 +59,17 @@ VIAddVersionKey "FileDescription" "Tangent installer"
 VIAddVersionKey "FileVersion" "${VERSION}"
 VIAddVersionKey "LegalCopyright" "MIT"
 
+; **The installer and uninstaller wear the app's own logo**, not NSIS's
+; default. The caller passes the icon (`-DICON=…/assets/ivory.ico`); the
+; same `ivory.ico` build.rs embeds into `tangent.exe`, so the setup, the app
+; and the Add/Remove entry are one mark. Falls back to the app icon staged
+; beside the binary if the caller says nothing.
+!ifndef ICON
+  !define ICON "${SRCDIR}/app/ivory.ico"
+!endif
+!define MUI_ICON "${ICON}"
+!define MUI_UNICON "${ICON}"
+
 !define MUI_ABORTWARNING
 !define MUI_COMPONENTS_TEXT_TOP "Tangent comes in two pieces. Install either, or both."
 !define MUI_FINISHPAGE_RUN "$INSTDIR\tangent.exe"
