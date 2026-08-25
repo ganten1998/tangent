@@ -224,9 +224,6 @@ pub struct Layout {
     /// Drag it to scroll; drag UP to zoom in at the same time.
     pub tool_nav: Rect,
     pub lanes_area: Rect,
-    /// The dead strip between the resize grip and time zero — a click
-    /// here IS a click on the start.
-    pub gutter: Rect,
     /// The draggable seam between headers and lanes.
     pub grip: Rect,
     pub lane_rows: [Rect; CHANNELS],
@@ -292,7 +289,6 @@ impl Layout {
                 tool_grid: Rect::NOTHING,
                 tool_nav: Rect::NOTHING,
                 lanes_area: Rect::NOTHING,
-                gutter: Rect::NOTHING,
                 grip: Rect::NOTHING,
                 lane_rows: [Rect::NOTHING; CHANNELS],
                 header_rows: [HeaderRow::NONE; CHANNELS],
@@ -315,14 +311,13 @@ impl Layout {
             Pos2::new(rect.left(), rect.top() + ruler_h),
             Pos2::new(rect.left() + header_w, rect.bottom()),
         );
-        // **REAPER's answer to "click back to bar one", copied whole**:
-        // between the header's resize strip and TIME ZERO stands a tiny
-        // strip of NOTHING, painted the recorder's wood so the lanes read
-        // as outlined by it. Overshooting a click at the first bar lands
-        // in the strip, and the strip means "the start" — the near-pixel-
-        // perfect aim the owner had to use is gone.
-        const GUTTER: f32 = 8.0;
-        let field_x = rect.left() + header_w + GRIP_W + GUTTER;
+        // **The resize STRIP is the only thing between the tracks and the
+        // window** — the owner checked REAPER's and struck the extra dead
+        // gutter. The strip is a real strip, not a hairline: wood-faced,
+        // hover-lit, its own cursor — and a motionless CLICK on it returns
+        // the playhead to the start, which keeps the generous
+        // back-to-bar-one target the gutter used to provide.
+        let field_x = rect.left() + header_w + GRIP_W;
         let ruler = Rect::from_min_max(
             Pos2::new(field_x, rect.top()),
             Pos2::new(rect.right(), rect.top() + ruler_h),
@@ -399,10 +394,7 @@ impl Layout {
                 Pos2::new(rect.left() + header_w, rect.top()),
                 Pos2::new(rect.left() + header_w + GRIP_W, rect.bottom()),
             ),
-            gutter: Rect::from_min_max(
-                Pos2::new(rect.left() + header_w + GRIP_W, rect.top()),
-                Pos2::new(field_x, rect.bottom()),
-            ),
+
             lane_rows,
             header_rows,
         }
@@ -646,24 +638,11 @@ fn draw_note_miniature(
 }
 
 /// The resize strip's width — REAPER's splitter, hover-lit, its own cursor.
-const GRIP_W: f32 = 5.0;
+const GRIP_W: f32 = 7.0;
 
 pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
     let l = Layout::new(rect, view);
-    // The GUTTER before anything territorial: a press there is a press on
-    // the start — the ruler's meaning in its ruler band, the lane's below.
-    if l.gutter.is_positive() && l.gutter.contains(pos) {
-        if pos.y <= l.ruler.bottom() {
-            return Some(Hit::Ruler(time_at(rect, view, pos.x)));
-        }
-        if let Some(i) = l
-            .lane_rows
-            .iter()
-            .position(|r| r.is_positive() && (r.top()..=r.bottom()).contains(&pos.y))
-        {
-            return Some(Hit::Lane(i, time_at(rect, view, pos.x)));
-        }
-    }
+
     for (r, hit) in [
         (l.tool_met, Hit::ToolMetronome),
         (l.tool_snap, Hit::ToolSnap),
@@ -1218,12 +1197,8 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         0.0,
         p.hdr_wood,
     );
-    // **The dead strip and the resize grip**, REAPER's pair: the gutter
-    // wears the recorder's wood — the lanes read as OUTLINED by it — and
-    // the grip lights under the hand that can drag it.
-    if l.gutter.is_positive() {
-        painter.rect_filled(l.gutter, 0.0, p.hdr_wood);
-    }
+    // **The resize STRIP**, REAPER's splitter: wood-faced, hover-lit,
+    // a real strip rather than a hairline.
     if l.grip.is_positive() {
         painter.rect_filled(
             l.grip,

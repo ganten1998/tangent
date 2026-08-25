@@ -52,10 +52,6 @@ const GAP: f32 = 6.0;
 const COLS: usize = 4;
 const ROWS: usize = DRUM_PAGE / COLS;
 
-/// The bank band's width, on the grid's left — one mini 4×4 per PAGE,
-/// the current one outlined; a click steps the whole page, never a row.
-const BANK_W: f32 = 26.0;
-
 /// The first MIDI key of page `k`.
 pub fn page_base(page: usize) -> usize {
     DRUM_PAGE_ANCHOR + page.min(DRUM_PAGES - 1) * DRUM_PAGE
@@ -76,7 +72,10 @@ pub const CHOKE_GROUPS: u8 = 4;
 
 // The popup family's face and ink — the MIDI editor's exact pair, because
 // two popups in two palettes would read as two apps.
-const FACE: Color32 = Color32::from_rgb(0x18, 0x12, 0x0F);
+// Lifted from 0x18120F: the owner called the old shades "too dark to be
+// legibly discerned" — the face, the pads and the explorer all sat within
+// a few sRGB steps of each other.
+const FACE: Color32 = Color32::from_rgb(0x24, 0x1C, 0x16);
 const INK: Color32 = Color32::from_rgb(0xFF, 0xF4, 0xE0);
 /// The app's one red, for CLEAR and for a pad whose file went missing.
 const REC_RED: Color32 = Color32::from_rgb(0xE8, 0x3A, 0x4E);
@@ -269,9 +268,14 @@ impl Layout {
             Pos2::new(rect.left(), rect.bottom() - INSPECTOR_H),
             Pos2::new(split, rect.bottom()),
         );
+        // **Each page cell is a SQUARE** — the owner's ruling: the band's
+        // width follows from stacking eight squares in the height it has.
+        let avail_h = (inspector.top() - GAP) - (strip.bottom() + GAP);
+        let side = ((avail_h - GAP * (DRUM_PAGES as f32 - 1.0)) / DRUM_PAGES as f32)
+            .clamp(16.0, 46.0);
         let band = Rect::from_min_max(
             Pos2::new(rect.left() + GAP, strip.bottom() + GAP),
-            Pos2::new(rect.left() + GAP + BANK_W, inspector.top() - GAP),
+            Pos2::new(rect.left() + GAP + side, inspector.top() - GAP),
         );
         let grid = Rect::from_min_max(
             Pos2::new(band.right() + GAP, strip.bottom() + GAP),
@@ -303,12 +307,12 @@ impl Layout {
 
         // The bank band: DRUM_PAGES cells stacked, HIGHEST page on top —
         // up the band is up in pitch, exactly as up the grid is.
-        let bh = (band.height() - GAP * (DRUM_PAGES as f32 - 1.0)) / DRUM_PAGES as f32;
+        let bh = band.width();
         let banks = std::array::from_fn(|k| {
             let from_top = (DRUM_PAGES - 1 - k) as f32;
             Rect::from_min_size(
                 Pos2::new(band.left(), band.top() + from_top * (bh + GAP)),
-                Vec2::new(band.width(), bh),
+                Vec2::splat(bh),
             )
         });
 
@@ -398,7 +402,7 @@ impl Layout {
 pub fn place(screen: Rect, at: Option<Pos2>) -> Rect {
     // Twice the width it was: the left half is the machine, the right the
     // media explorer.
-    let w = (screen.width() * 0.8).clamp(560.0, 1080.0).min(screen.width());
+    let w = (screen.width() * 0.8).clamp(600.0, 1160.0).min(screen.width());
     // The grid wants square-ish pads on ITS half: strip + inspector + rows.
     let h = (STRIP_H + INSPECTOR_H + w * 0.52 * 0.82).min(screen.height() * 0.92);
     let mut panel = match at {
@@ -590,7 +594,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
                 Vec2::new((dw - 1.0).max(1.0), (dh - 1.0).max(1.0)),
             );
             let key = page_base(k) + d;
-            let alpha = if key >= DRUM_PADS { 4 } else { 14 };
+            let alpha = if key >= DRUM_PADS { 8 } else { 26 };
             painter.rect_filled(dot, 1.0, Color32::from_white_alpha(alpha));
         }
         if view.page == k {
@@ -613,7 +617,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
         // neatness padding. Drawn, not skipped — a hole in the grid reads
         // as a bug.
         if base + i >= DRUM_PADS {
-            painter.rect_filled(r, 3.0, Color32::from_white_alpha(3));
+            painter.rect_filled(r, 3.0, Color32::from_white_alpha(7));
             continue;
         }
         let pad = &view.pads[i];
@@ -623,9 +627,9 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
         // A loaded pad is a solid key; an empty one is an outline you can
         // see through — the RS5k rack's own honesty about where work is.
         if pad.loaded || pad.missing {
-            painter.rect_filled(r, 3.0, Color32::from_rgba_premultiplied(0, 0, 0, 110));
+            painter.rect_filled(r, 3.0, Color32::from_rgba_premultiplied(0, 0, 0, 70));
         } else {
-            painter.rect_filled(r, 3.0, Color32::from_white_alpha(6));
+            painter.rect_filled(r, 3.0, Color32::from_white_alpha(14));
         }
 
         // The pad's NOTE NAME, top-left and faint — the reference image's
@@ -687,17 +691,6 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
             );
         }
 
-        // The note name, small, top-left — the pad's address.
-        let note = pad_note(i);
-        if r.height() > 30.0 {
-            painter.text(
-                Pos2::new(r.left() + 4.0, r.top() + 3.0),
-                Align2::LEFT_TOP,
-                note_name(note),
-                font((r.height() * 0.16).clamp(7.0, 10.0)),
-                INK.gamma_multiply(0.4),
-            );
-        }
         // The choke badge, top-right, amber — the RS5k LED, as a letter.
         if pad.params.choke != 0 && r.height() > 30.0 {
             painter.text(
