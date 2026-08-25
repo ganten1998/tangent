@@ -1950,6 +1950,14 @@ struct Renderer {
     /// renderer-local, because nothing OUTSIDE the callback keys off edges any
     /// more; this one exists so a stop can end the notes it strands.
     was_rolling: bool,
+    /// A loop just wrapped `pos` backward; the NEXT block must flush so the
+    /// MIDI clip cursors rewind. Set on the wrap block, consumed on the one
+    /// after — and it MUST be the one after, because the wrap block returns
+    /// the PRE-wrap `at` (still near the loop's end) and flushing there would
+    /// fast-forward every cursor to the end again, leaving the head of the
+    /// loop silent. Audio clips read straight off `at` and never needed this;
+    /// the note scheduler is cursor-based and does.
+    pending_flush: bool,
     /// Every pitch currently sounding, from the note stream this renderer
     /// itself handed out. What a stop or a jump has to end.
     sounding: u128,
@@ -3212,12 +3220,16 @@ impl Renderer {
     /// ends the notes the move strands; see the flush at the call site.
     fn run_transport(&mut self, frames: usize) -> (u64, bool, bool) {
         let req = self.shared.transport_req.load(Ordering::Acquire);
-        let jumped = req != self.seen_req;
-        if jumped {
+        let seek = req != self.seen_req;
+        if seek {
             self.seen_req = req;
             self.pos = self.shared.transport_at.load(Ordering::Relaxed);
             self.shared.transport_ack.store(req, Ordering::Release);
         }
+        // The wrap's flush, armed on the PREVIOUS block — consumed now, when
+        // `at` is the wrapped position and rewinding the cursors lands them
+        // at the loop's head. See `pending_flush`.
+        let flush = seek || std::mem::take(&mut self.pending_flush);
         let rolling = self.shared.rolling.load(Ordering::Relaxed);
         let at = self.pos;
         if rolling {
@@ -3232,10 +3244,14 @@ impl Renderer {
             let b = self.shared.loop_b.load(Ordering::Relaxed);
             if b > a && at < b && self.pos >= b {
                 self.pos = a + (self.pos - b) % (b - a);
+                // Arm the flush for the NEXT block, not this one — see the
+                // field. The MIDI cursors must rewind against the wrapped
+                // `at`, which is what the next block carries.
+                self.pending_flush = true;
             }
         }
         self.shared.transport_pos.store(self.pos, Ordering::Relaxed);
-        (at, rolling, jumped)
+        (at, rolling, flush)
     }
 
     /// Add the backing track to the bus, if one is loaded and the transport is
@@ -4584,6 +4600,7 @@ impl Engine {
             lane_gain: [1.0; CHANNELS],
             seen_req: 0,
             was_rolling: false,
+            pending_flush: false,
             sounding: 0,
             track_incoming,
             track_retiring,
@@ -4760,7 +4777,13 @@ impl Engine {
         bundle: Option<&Path>,
         state: Option<&[u8]>,
     ) -> Result<Option<Loaded>, String> {
-        if strip > STRIPS || slot >= INSERTS {
+        // **The whole seat map, pads included.** This capped at `STRIPS`,
+        // which is the channels + master + click/fx — every PAD seat lives
+        // at `STRIPS + 1 + pad` and was silently refused here, so a pad's
+        // FX bay stored a plugin, the host dispatched it, and the engine
+        // dropped it on the floor: "drum FX slots do nothing". `mix_pads`
+        // already runs each pad's rack; they just never got filled.
+        if strip >= RACK_SEATS || slot >= INSERTS {
             return Ok(None);
         }
         let Some(bundle) = bundle else {
@@ -7073,6 +7096,7 @@ mod tests {
             lane_gain: [1.0; CHANNELS],
             seen_req: 0,
             was_rolling: false,
+            pending_flush: false,
             sounding: 0,
             // Abandoned peers, like the MIDI ring above: pop reports empty
             // and push fills to capacity, which is all a test needs.
@@ -8211,6 +8235,63 @@ mod tests {
         assert!(
             heard_after_tie > 0.005,
             "the second note of the tie never sounded: {heard_after_tie}"
+        );
+    }
+
+    /// **Every pad seat is inside the rack space `load_insert` admits.** The
+    /// guard capped at `STRIPS`, so pad FX (seats `STRIPS+1..`) were refused
+    /// and did nothing; this pins that the whole seat map fits `RACK_SEATS`.
+    #[test]
+    fn pad_seats_are_loadable_rack_indices() {
+        for pad in [0, 1, PADS / 2, PADS - 1] {
+            let seat = pad_rack_index(pad);
+            assert!(
+                seat > STRIPS && seat < RACK_SEATS,
+                "pad {pad} seat {seat} is outside the loadable range 0..{RACK_SEATS}"
+            );
+        }
+    }
+
+    /// **A looped MIDI clip keeps sounding past the first wrap.** The note
+    /// scheduler is cursor-based and forward-only; a loop moves `pos`
+    /// backward without a locate, so without the wrap's flush the cursor
+    /// sits at the clip's end and every pass after the first is silent —
+    /// exactly the regression the owner heard (audio clips survived, MIDI
+    /// did not). A short loop over one repeating note; sound must be heard
+    /// well after the first wrap.
+    #[test]
+    fn a_looped_midi_clip_survives_the_wrap() {
+        use std::sync::Arc;
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        // A note every 2400 frames across a 24000-frame clip.
+        let notes: Vec<ClipNote> = (0..10)
+            .map(|i| ClipNote { at: i * 2_400, dur: 1_200, key: 60, vel: 100 })
+            .collect();
+        e.set_midi_clips(vec![PlacedMidi {
+            strip: 0,
+            start: 0,
+            len: 24_000,
+            notes: Arc::new(notes),
+        }]);
+        e.set_builtin_strip(Some(0));
+        // Loop the whole clip: [0, 24000). At 512 frames/block that wraps
+        // about every 47 blocks.
+        e.set_loop(0, 24_000);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        let mut out = vec![0.0f32; 512 * 2];
+        let mut heard_late = 0.0f32;
+        // 200 blocks ≈ 4 wraps; sample loudness only AFTER the second wrap.
+        for block in 0..200 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            if block > 100 {
+                heard_late = heard_late.max(out.iter().fold(0.0f32, |a, b| a.max(b.abs())));
+            }
+        }
+        assert!(
+            heard_late > 0.005,
+            "the looped MIDI clip went silent after wrapping: {heard_late}"
         );
     }
 

@@ -107,6 +107,10 @@ pub struct DrumpadView<'a> {
     pub peaks: [f32; DRUM_PAGE],
     /// Which page the window shows — the bank band's lit cell.
     pub page: usize,
+    /// Which of the 128 keys carry a loaded sample, one bit each. The bank
+    /// band lights a page's occupied cells from this, so the strip shows at
+    /// a glance where in the whole keyboard the kit's work sits.
+    pub loaded_keys: u128,
     /// The selected SLOT on this page (selection follows the page).
     pub selected: usize,
     /// The pad the mouse is holding down, for the pressed look.
@@ -594,7 +598,17 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
                 Vec2::new((dw - 1.0).max(1.0), (dh - 1.0).max(1.0)),
             );
             let key = page_base(k) + d;
-            let alpha = if key >= DRUM_PADS { 8 } else { 26 };
+            // An OCCUPIED pad reads bright; an empty one stays dim; past the
+            // keyboard's last key, dimmer still. This is the strip's whole
+            // job — showing which 4×4 group holds the kit's loaded pads.
+            let occupied = key < DRUM_PADS && view.loaded_keys & (1u128 << key) != 0;
+            let alpha = if key >= DRUM_PADS {
+                8
+            } else if occupied {
+                150
+            } else {
+                26
+            };
             painter.rect_filled(dot, 1.0, Color32::from_white_alpha(alpha));
         }
         if view.page == k {
@@ -999,6 +1013,7 @@ mod tests {
             pads,
             peaks: [0.0; DRUM_PAGE],
             page: 2,
+            loaded_keys: 0,
             selected: 0,
             down: None,
             midi_on: true,

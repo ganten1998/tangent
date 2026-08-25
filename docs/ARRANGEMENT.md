@@ -907,6 +907,30 @@ channels play back their clips and nothing else. "Ready to play" and
   Windows camera picker's message lost its garbled runs of literal
   spaces.
 
+- **4.81.0 — the macOS tester's round**: five from the 4.80 test
+  pass, all cross-platform. THE LOOP KEEPS SOUNDING: a looped MIDI
+  clip went silent after the first wrap — the note scheduler's
+  cursor is forward-only and rewinds only on a jump, and the loop
+  moved the clock back without flagging one, so audio clips survived
+  (they read straight off the block position) while MIDI/DX7 clips
+  did not. The wrap now arms a flush for the NEXT block (where the
+  wrapped position is what the cursors rewind against). NEW SESSION
+  IS EMPTY: New reclaimed the current unsaved Untitled, and
+  `switch_project` then saved the session being discarded back over
+  the fresh template — resurrecting its clips — while the stale
+  `drumpad.json` was never cleared. New now empties the reclaimed
+  folder and, when it is discarding the open session, opens without
+  the save-back. DRUM FX WORK: a pad's insert bays stored a plugin
+  and the host dispatched it, but `load_insert` capped at `STRIPS`
+  and silently refused every pad seat (they live above it) — the
+  engine's `mix_pads` was already wired to run per-pad racks; they
+  just never got filled. RIGHT-CLICK ON A PAD no longer crashes: the
+  pad menu stored a KEY and indexed the 16-slot layout array with it
+  ("len is 16 but the index is 40"); it maps to the current-page
+  slot now, and closes when its pad scrolls off-page. And the BANK
+  STRIP lights each page's occupied 4×4 cells brighter, so the whole
+  keyboard's loaded pads read at a glance.
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index
