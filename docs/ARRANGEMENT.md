@@ -1110,6 +1110,33 @@ channels play back their clips and nothing else. "Ready to play" and
   outside the range is a build error). The wins the crash proved are
   kept: the failure was LOUD (dialog + stderr, no silent silence) and
   the cached host loaded the driver once, cleanly.
+- **4.92.0 — the device comes back on its own**: the USB-yank test
+  passed the loud-failure bar and flunked the recovery one, twice
+  over. FIRST, the freeze: a yank froze the UI "Not Responding" for
+  10-30 seconds, because the watchdog's timed retries ran
+  `Engine::start` against dead hardware ON THE UI THREAD, and five
+  driver timeouts stack to exactly that range. SECOND, the dead end:
+  by the time the owner replugged, the five retries were long spent
+  and nothing re-armed them — only a manual buffer-size nudge brought
+  audio back. The owner's word: "an auto recheck would be nice." So: a
+  watchdog-declared death now takes NO timed retries; a background
+  `Reprobe` thread watches for the hardware's return — probing the
+  PLATFORM DEFAULT host only, never ASIO, because loading ASIO
+  drivers from a second thread is the teardown bug and a half-dead
+  driver can hang a probe for ten seconds, all of which is fine on a
+  thread nobody joins and fatal on the UI thread — and the one
+  UI-thread reopen happens the frame the device is seen. A transient
+  stall passes its first probe immediately, so the harmless case
+  recovers as fast as the old retries did. The reprobe also picks up
+  after the timed loop exhausts, so a replug always recovers. Also:
+  the band's message chain now puts the ENGINE's story ahead of the
+  input's (a dead output is the whole app silent; the yank test
+  showed the sticky input note masking it), and the owner's two
+  stream-UI rulings land — the ReaStream dialog is ALWAYS the light
+  theme ("keep the obs stream menu light"), and its door moved from
+  the Project menu to the settings cog's AUDIO tier ("move it to the
+  settings cog in audio section"): a STREAM row beside PROJECT and
+  PLUGINS that reads out on/off and opens the dialog.
 
 ## Order of work
 

@@ -11252,6 +11252,16 @@ impl IvoryApp {
                     name: self.project_name(),
                 });
             }
+            Hit::StreamToObs => {
+                // The cog's STREAM door: same dialog the Project menu used
+                // to open, now living in the AUDIO tier by the owner's word.
+                self.dialog = Some(dialogs::Dialog::ReaStream {
+                    enabled: self.settings.reastream_enabled,
+                    identifier: self.settings.reastream_identifier.clone(),
+                    host: self.settings.reastream_host.clone(),
+                    focus: true,
+                });
+            }
             Hit::PluginFolders => {
                 // The menu's "Add a Folder...", from the cog. The pick
                 // lands through the same DirRequest door and the scan
@@ -19645,6 +19655,34 @@ mod tests {
             let back = recorder::parse_time(&shown)
                 .unwrap_or_else(|| panic!("{shown} is printed and not accepted"));
             assert!((back - t).abs() < 0.06, "{shown} came back as {back}");
+        }
+    }
+
+    /// **The cog's STREAM door opens the ReaStream dialog, seeded from the
+    /// settings.** The door moved here from the Project menu by the owner's
+    /// word; a door that opened a stale copy of the settings would save
+    /// whatever it showed back over the real ones on Done.
+    #[test]
+    fn the_stream_door_opens_the_reastream_dialog_on_the_saved_settings() {
+        let (_, mut app) = headless_with_fx(Caps::DESKTOP);
+        app.settings.reastream_enabled = true;
+        app.settings.reastream_identifier = "stage-left".to_owned();
+        app.settings.reastream_host = "192.168.0.42".to_owned();
+        app.apply_recorder_hit(recorder_panel::Hit::StreamToObs);
+        match app.dialog {
+            Some(dialogs::Dialog::ReaStream {
+                enabled,
+                ref identifier,
+                ref host,
+                focus,
+            }) => {
+                assert!(enabled);
+                assert_eq!(identifier, "stage-left");
+                assert_eq!(host, "192.168.0.42");
+                assert!(focus, "the identifier field should focus on open");
+            }
+            Some(_) => panic!("the STREAM door opened a different dialog"),
+            None => panic!("the STREAM door opened nothing"),
         }
     }
 

@@ -145,6 +145,9 @@ struct Recorder {
     /// Notices the output going quiet without an error — the ASIO
     /// dead-driver case. Reset whenever the engine is (re)made.
     engine_watch: crate::instrument::StallWatch,
+    /// The auto recheck — the owner's ask after the yank test. Alive only
+    /// while the engine is down; see `Reprobe`.
+    reprobe: Option<Reprobe>,
     /// The ReaStream sender, alive while the engine is and streaming while the
     /// setting is on. Dropped when the engine restarts so the next one hands it
     /// a fresh tap; see `reconcile_reastream`.
@@ -865,6 +868,84 @@ const ENGINE_RETRY_AFTER: std::time::Duration = std::time::Duration::from_millis
 #[cfg(feature = "recorder")]
 const ENGINE_TRIES: u8 = 5;
 
+/// A background watch for the audio device coming back — "an auto recheck
+/// would be nice", the owner's word after the USB-yank test, where a replug
+/// recovered nothing because the timed retries had burnt out seconds earlier.
+///
+/// A thread rather than more timed retries, because the retries were also the
+/// FREEZE: `Engine::start` against yanked hardware blocks inside the driver's
+/// own timeouts, and five of those on the UI thread stacked to the owner's
+/// 10-30 seconds of "Not Responding". This thread probes THE PLATFORM DEFAULT
+/// host — never the chosen system: probing ASIO means loading drivers, loading
+/// drivers from a second thread is the teardown bug all over again, and a
+/// half-dead driver can hang a probe for ten seconds. All of that is fine on
+/// this thread and fatal on the UI thread; the hardware's return is visible
+/// through WASAPI/CoreAudio regardless of which system the engine reopens on.
+///
+/// One-shot: sets `live` and exits. The UI thread never joins it — `Drop`
+/// signals `stop` and detaches, so a probe wedged inside a dying driver can
+/// never wedge the app with it.
+#[cfg(feature = "recorder")]
+struct Reprobe {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    live: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(feature = "recorder")]
+impl Reprobe {
+    fn spawn() -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = Arc::new(AtomicBool::new(false));
+        let live = Arc::new(AtomicBool::new(false));
+        let stop_t = Arc::clone(&stop);
+        let live_t = Arc::clone(&live);
+        let spawned = std::thread::Builder::new()
+            .name("audio-reprobe".to_owned())
+            .spawn(move || {
+                use cpal::traits::{DeviceTrait, HostTrait};
+                loop {
+                    if stop_t.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let alive = cpal::default_host()
+                        .default_output_device()
+                        .and_then(|d| d.default_output_config().ok())
+                        .is_some_and(|c| c.channels() > 0);
+                    if alive {
+                        live_t.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                    // 2 s between probes, checked in slices so a stop signal
+                    // lands within a tenth of a second.
+                    for _ in 0..20 {
+                        if stop_t.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                }
+            });
+        if spawned.is_err() {
+            // A machine that cannot spawn a thread: mark live so the UI
+            // falls back to trying the open directly rather than waiting
+            // for a watcher that does not exist.
+            live.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Self { stop, live }
+    }
+
+    fn device_back(&self) -> bool {
+        self.live.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[cfg(feature = "recorder")]
+impl Drop for Reprobe {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 #[cfg(feature = "recorder")]
 impl DesktopApp {
     /// Everything the band shows, refreshed from what is actually true.
@@ -1023,9 +1104,9 @@ impl DesktopApp {
                     .note(running, callbacks, std::time::Instant::now());
             if fault.is_some() || stalled {
                 let why = match fault {
-                    Some(f) => format!("audio output failed: {f} - reopening"),
+                    Some(f) => format!("audio output failed: {f} - will reopen when the device is back"),
                     None => "the audio output went quiet (device stopped serving \
-                             audio) - reopening"
+                             audio) - will reopen when the device is back"
                         .to_owned(),
                 };
                 log::warn!("{why}");
@@ -1036,8 +1117,17 @@ impl DesktopApp {
                     (ivory_ui::recorder::STRIPS + 1 + ivory_ui::recorder::DRUM_PADS)
                         * ivory_ui::recorder::INSERTS
                 ];
-                self.recorder.engine_retry =
-                    Some((std::time::Instant::now(), ENGINE_TRIES.saturating_sub(1)));
+                // **No timed retries here — the reprobe thread owns recovery.**
+                // The yank test proved why: a watchdog-declared death is
+                // usually GONE HARDWARE, and `Engine::start` against a dead
+                // ASIO driver blocks the UI thread for however long the
+                // driver's own timeouts take. Five timed tries stacked to the
+                // owner's 10-30 seconds of "Not Responding". The reprobe
+                // watches from a thread that can afford to wait, and the one
+                // UI-thread open happens only once hardware is actually there;
+                // a transient stall passes its first probe immediately, so
+                // recovery is still ~a frame away in the harmless case.
+                self.recorder.engine_retry = None;
             }
         }
 
@@ -1048,6 +1138,26 @@ impl DesktopApp {
                     self.open_audio_path(ctx);
                 }
             }
+        }
+        // **The auto recheck.** While the engine is down with its retries
+        // spent — the watchdog skips them entirely, the timed loop burns
+        // through them — a background probe watches for the hardware's
+        // return, and the one UI-thread reopen happens the frame it is seen.
+        // The probe flag flips between frames, so ask for a wakeup rather
+        // than trusting the next paint to somebody moving the mouse.
+        if self.recorder.engine.is_some() {
+            self.recorder.reprobe = None;
+        } else if self.recorder.reprobe.as_ref().is_some_and(Reprobe::device_back) {
+            self.recorder.reprobe = None;
+            self.open_audio_path(ctx);
+        } else if self.recorder.reprobe.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        } else if self.app.recorder_band_open()
+            && self.recorder.engine_error.is_some()
+            && self.recorder.engine_retry.is_none()
+        {
+            self.recorder.reprobe = Some(Reprobe::spawn());
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
 
         // Whether a multichannel interface lists its inputs one by one. Pushed
@@ -1102,8 +1212,13 @@ impl DesktopApp {
                  webcam"
                     .to_owned()
             })
-            .or_else(|| self.recorder.session.audio_error().map(str::to_owned))
+            // The ENGINE's story outranks the input's: a dead OUTPUT is the
+            // whole app silent, where a missing input is one source quiet.
+            // The yank test proved the old order backwards — the sticky
+            // input-fallback note sat in front of "the audio output went
+            // quiet", which was the news that mattered.
             .or_else(|| self.recorder.engine_error.clone())
+            .or_else(|| self.recorder.session.audio_error().map(str::to_owned))
             .or_else(|| self.recorder.session.camera_error().map(str::to_owned))
             .or_else(|| {
                 // Only once it has had a moment: every camera delivers nothing
@@ -4978,6 +5093,7 @@ impl DesktopApp {
                 engine: None,
                 engine_error: None,
                 engine_watch: crate::instrument::StallWatch::new(),
+                reprobe: None,
                 reastream: None,
                 pads_retry: false,
                 inserts_loaded: vec![

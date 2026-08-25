@@ -1183,6 +1183,9 @@ pub enum Hit {
     /// The AUDIO tier's door to the plugin-folder picker — the menu's
     /// "Add a Folder...", one click from the cog.
     PluginFolders,
+    /// The cog's STREAM door: the ReaStream send settings, in the AUDIO tier
+    /// by the owner's word ("move it to the settings cog in audio section").
+    StreamToObs,
     ToggleCountInInTake,
     ToggleHideElapsed,
     /// Hear the live input through the monitors. **Session-only, never
@@ -1294,13 +1297,14 @@ impl Hit {
     ///
     /// The four per-slot controls appear once per slot, because "reachable" is
     /// a question about slot 2 that slot 0 cannot answer for it.
-    pub const ALL: [Hit; 27] = [
+    pub const ALL: [Hit; 28] = [
         Hit::Play,
         Hit::Record,
         Hit::Stop,
         Hit::Pause,
         Hit::Capture,
         Hit::ProjectMenu,
+        Hit::StreamToObs,
         Hit::OpenSetup,
         Hit::ChooseFolder,
         Hit::RevealFolder,
@@ -1335,6 +1339,7 @@ impl Hit {
             Hit::DismissMessage => "Dismiss",
             Hit::ShowAudioStatus => "Setup: the audio system, devices, rate and buffer",
             Hit::PluginFolders => "Add a VST3 folder - Tangent rescans on the pick",
+            Hit::StreamToObs => "Stream the master out to OBS over ReaStream",
             Hit::ToggleCountInInTake => "Record the count-in into the take",
             Hit::ToggleHideElapsed => "Hide the elapsed time",
             Hit::ToggleInputMonitor => "Hear the live input",
@@ -4574,6 +4579,7 @@ mod tests {
                 ("name", l.name),
                 ("project", l.project_row),
                 ("plugin folders", l.plugin_folders),
+                ("stream", l.stream_row),
                 ("audio count-in", l.audio_count_in),
                 ("audio sig", l.audio_sig),
                 ("dest", l.dest),
@@ -5540,7 +5546,7 @@ mod tests {
                 // `PickAudio` joined when the microphone icon left with the
                 // input fader: the desk's audio channels pick their inputs
                 // now, and the menu keeps the row for the interface itself.
-                const IN_THE_MENU: [Hit; 8] = [
+                const IN_THE_MENU: [Hit; 9] = [
                     Hit::ChooseFolder,
                     Hit::RevealFolder,
                     Hit::ToggleOpenWhenDone,
@@ -5549,6 +5555,9 @@ mod tests {
                     Hit::EditTimeSignature,
                     Hit::NameField,
                     Hit::PickAudio,
+                    // The STREAM door lives in the cog's AUDIO tier — the
+                    // owner's placement — and nowhere in the band.
+                    Hit::StreamToObs,
                 ];
                 // `DismissClip` is a target only while the warning is on
                 // screen, which the idle fixture is not — see
@@ -6430,6 +6439,9 @@ struct SetupLayout {
     /// PROJECT dialog and the plugin folders — the owner's cog additions.
     project_row: Rect,
     plugin_folders: Rect,
+    /// The STREAM door, on the count-in row's free half — the ReaStream send
+    /// settings, moved here from the Project menu by the owner's word.
+    stream_row: Rect,
 }
 
 impl SetupLayout {
@@ -6457,6 +6469,7 @@ impl SetupLayout {
         audio_sig: Rect::NOTHING,
         project_row: Rect::NOTHING,
         plugin_folders: Rect::NOTHING,
+        stream_row: Rect::NOTHING,
     };
 
     /// Hung off `anchor` — the cog — and pulled back onto `screen`.
@@ -6585,16 +6598,20 @@ impl SetupLayout {
             // half they were the least legible thing on the card.
             project_row: slice_h(ra3, 0.00, 0.48),
             plugin_folders: slice_h(ra3, 0.52, 1.00),
+            // The AUDIO count-in row's free half, which the doors above
+            // vacated for legibility; one door fits a half-row fine.
+            stream_row: slice_h(ra2, 0.58, 1.00),
         }
     }
 
     /// Every clickable region and what it means. The popup's [`Layout::targets`].
-    fn targets(&self) -> [(Rect, Hit); 15] {
+    fn targets(&self) -> [(Rect, Hit); 16] {
         [
             (self.audio_count_in, Hit::CycleCountIn),
             (self.audio_sig, Hit::EditTimeSignature),
             (self.project_row, Hit::ProjectMenu),
             (self.plugin_folders, Hit::PluginFolders),
+            (self.stream_row, Hit::StreamToObs),
             (self.name, Hit::NameField),
             (self.close, Hit::CloseSetup),
             (self.dest, Hit::ChooseFolder),
@@ -7329,6 +7346,16 @@ pub fn draw_setup(
     // plugin folders — the menu's rows, reachable without the menu.
     labelled(painter, l.project_row, "PROJECT", "New / Open / Save...", p.ink, &p);
     labelled(painter, l.plugin_folders, "PLUGINS", "Add a folder...", p.ink, &p);
+    // A readout as well as a way in, like AUDIO SETUP: whether the master is
+    // going out over ReaStream right now.
+    labelled(
+        painter,
+        l.stream_row,
+        "STREAM",
+        if s.reastream_enabled { "To OBS: on" } else { "To OBS: off" },
+        p.ink,
+        &p,
+    );
     {
         let typing = typing_for(view, NumField::Meter);
         let shown = typing
