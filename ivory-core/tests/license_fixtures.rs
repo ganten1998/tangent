@@ -11,7 +11,7 @@
 //! Requires the `license` feature (the GUI always enables it).
 #![cfg(feature = "license")]
 
-use ivory_core::license::{verify_key, License, LicenseError, TIER_SUPPORTER};
+use ivory_core::license::{verify_key, License, LicenseError, LicenseStore, TIER_SUPPORTER};
 
 /// Minted 2026-08-11, k1, name "Ganten".
 const FIXTURE_KEY: &str = "\
@@ -53,6 +53,39 @@ fn one_altered_character_is_rejected() {
         matches!(verify_key(&tampered), Err(LicenseError::Checksum | LicenseError::BadSignature)),
         "a mutated key must never verify"
     );
+}
+
+#[test]
+fn an_installed_key_survives_a_reload() {
+    let dir = std::env::temp_dir().join(format!("ivory-lic-install-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("license.key");
+    let mut s = LicenseStore::load_from(&p);
+    let l = s.install(FIXTURE_KEY).expect("a genuine key on a writable path installs");
+    assert_eq!(l.name.as_deref(), Some("Ganten"));
+    assert!(p.exists(), "Ok from install means the key reached disk");
+    assert!(!p.with_extension("key.tmp").exists(), "no temp debris");
+    assert!(LicenseStore::load_from(&p).is_supporter());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_genuine_key_that_cannot_be_saved_is_honored_this_run_and_says_so() {
+    // The store's parent "directory" is a regular FILE, so the temp-file write
+    // fails deterministically on every platform — no permission games.
+    let blocker = std::env::temp_dir().join(format!("ivory-lic-blocker-{}", std::process::id()));
+    std::fs::write(&blocker, "not a directory").unwrap();
+    let mut s = LicenseStore::load_from(blocker.join("license.key"));
+    assert_eq!(s.install(FIXTURE_KEY).unwrap_err(), LicenseError::Unsaved);
+    // The session honors the key — a disk problem must never turn a supporter
+    // away…
+    assert!(s.is_supporter());
+    assert_eq!(s.display_name(), Some("Ganten"));
+    // …but nothing reached disk, so the next "launch" comes up free. `install`
+    // used to answer plain Ok here, and this restart was the first anyone
+    // heard of it.
+    assert!(!LicenseStore::load_from(blocker.join("license.key")).is_supporter());
+    std::fs::remove_file(&blocker).ok();
 }
 
 #[test]

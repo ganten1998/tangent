@@ -346,16 +346,33 @@ const REVERB_TRIM_AT: f32 = 0.62;
 struct Comb {
     buf: Vec<f32>,
     at: usize,
+    /// The delay actually in use, in samples: the width control moves THIS,
+    /// inside a buffer allocated once for the widest it can ask. See
+    /// [`ReverbChannel::set_offset`] for why the allocation never moves.
+    len: usize,
     /// The lowpass's state: the running average that damps the loop.
     store: f32,
 }
 
 impl Comb {
-    fn new(len: usize) -> Self {
+    fn new(cap: usize) -> Self {
         Self {
-            buf: vec![0.0; len.max(1)],
+            buf: vec![0.0; cap.max(1)],
             at: 0,
+            len: cap.max(1),
             store: 0.0,
+        }
+    }
+
+    /// Change the delay without touching the allocation. A line whose length
+    /// moves is cleared: a delay that shrinks and grows back would otherwise
+    /// replay whatever it was holding beyond the old wrap point.
+    fn set_len(&mut self, len: usize) {
+        let len = len.clamp(1, self.buf.len());
+        if len != self.len {
+            self.len = len;
+            self.at = 0;
+            self.clear();
         }
     }
 
@@ -364,7 +381,7 @@ impl Comb {
         let out = self.buf[self.at];
         self.store = flush(out * (1.0 - damp) + self.store * damp);
         self.buf[self.at] = flush(input + self.store * feedback);
-        self.at = (self.at + 1) % self.buf.len();
+        self.at = (self.at + 1) % self.len;
         out
     }
 
@@ -380,13 +397,26 @@ impl Comb {
 struct Allpass {
     buf: Vec<f32>,
     at: usize,
+    /// As in [`Comb`]: the delay in use, inside a fixed allocation.
+    len: usize,
 }
 
 impl Allpass {
-    fn new(len: usize) -> Self {
+    fn new(cap: usize) -> Self {
         Self {
-            buf: vec![0.0; len.max(1)],
+            buf: vec![0.0; cap.max(1)],
             at: 0,
+            len: cap.max(1),
+        }
+    }
+
+    /// See [`Comb::set_len`].
+    fn set_len(&mut self, len: usize) {
+        let len = len.clamp(1, self.buf.len());
+        if len != self.len {
+            self.len = len;
+            self.at = 0;
+            self.clear();
         }
     }
 
@@ -394,7 +424,7 @@ impl Allpass {
     fn process(&mut self, input: f32) -> f32 {
         let buffered = self.buf[self.at];
         self.buf[self.at] = flush(input + buffered * ALLPASS_FEEDBACK);
-        self.at = (self.at + 1) % self.buf.len();
+        self.at = (self.at + 1) % self.len;
         buffered - input
     }
 
@@ -410,15 +440,46 @@ struct ReverbChannel {
 }
 
 impl ReverbChannel {
-    /// `offset` is [`STEREO_SPREAD`] for the right channel and 0 for the left.
+    /// `offset` is the stereo spread this channel starts at: 0 for the left,
+    /// up to [`STEREO_SPREAD`] for the right, wherever the width knob sits.
+    ///
+    /// The buffers are allocated once, sized for the FULL spread; the offset
+    /// only decides how much of each is in use. See [`set_offset`].
+    ///
+    /// [`set_offset`]: ReverbChannel::set_offset
     fn new(sample_rate: f32, offset: usize) -> Self {
         // The lengths are in samples at 44.1k, so at 96k the same room needs
         // twice as many. A reverb that ignored this would be half as long and
         // an octave brighter on half the interfaces people own.
+        let cap = |len: usize| ((len + STEREO_SPREAD) as f32 * sample_rate / DESIGN_RATE) as usize;
+        let mut ch = Self {
+            combs: std::array::from_fn(|i| Comb::new(cap(COMB_LEN[i]))),
+            allpasses: std::array::from_fn(|i| Allpass::new(cap(ALLPASS_LEN[i]))),
+        };
+        ch.set_offset(sample_rate, offset);
+        ch
+    }
+
+    /// Move every delay length to a new spread, WITHOUT allocating.
+    ///
+    /// **This runs on the audio thread.** The width knob is the one reverb
+    /// parameter that is a buffer length rather than a coefficient, and the
+    /// first version rebuilt both channels from fresh `Vec`s whenever it
+    /// moved — on the theory that "a person moves it, which is never in
+    /// audio terms". A person DRAGS it, the UI reposts it every frame of the
+    /// drag, and that theory became malloc and free on the callback, block
+    /// after block, in up to three `Effects` at once. Now the buffers stand
+    /// at full size from construction and the knob only moves the wrap
+    /// points: the lines whose length changed are cleared — a memset, not an
+    /// allocator — so the tail restarts there exactly as it did when they
+    /// were rebuilt, and the lines that did not move keep ringing.
+    fn set_offset(&mut self, sample_rate: f32, offset: usize) {
         let scale = |len: usize| ((len + offset) as f32 * sample_rate / DESIGN_RATE) as usize;
-        Self {
-            combs: std::array::from_fn(|i| Comb::new(scale(COMB_LEN[i]))),
-            allpasses: std::array::from_fn(|i| Allpass::new(scale(ALLPASS_LEN[i]))),
+        for (c, len) in self.combs.iter_mut().zip(COMB_LEN) {
+            c.set_len(scale(len));
+        }
+        for (a, len) in self.allpasses.iter_mut().zip(ALLPASS_LEN) {
+            a.set_len(scale(len));
         }
     }
 
@@ -1139,11 +1200,13 @@ pub struct Effects {
     limiter: Limiter,
     /// Where the wet mixes actually are, chasing where the knobs say.
     mix: Sends,
-    /// The width the reverb's BUFFER LENGTHS were built from.
+    /// The width the reverb's delay lengths were last set from.
     ///
-    /// The one parameter that cannot be swept: it is a delay length, so
-    /// changing it means new buffers. Compared each block so a menu change
-    /// takes effect, against a value only a person can move.
+    /// The one parameter that is a delay LENGTH rather than a coefficient.
+    /// Compared each block so a change takes effect — and applied by moving
+    /// wrap points inside preallocated buffers, never by rebuilding them,
+    /// because a knob drag lands here every block and this is the audio
+    /// thread. See [`ReverbChannel::set_offset`].
     built_width: f32,
     sample_rate: f32,
     /// Everything was off last block, so the tails are already flushed and do
@@ -1280,9 +1343,13 @@ impl Effects {
             return;
         }
         // The one parameter that is a buffer length rather than a coefficient.
-        // Rebuilt when a person moves it, which is never in audio terms.
+        // Only the RIGHT channel carries the spread, and moving it is a
+        // memset inside buffers that were allocated at construction — never
+        // an allocation, because a drag of the width knob lands here every
+        // block. See `ReverbChannel::set_offset` for the war story.
         if (p.reverb_width - self.built_width).abs() > 1.0e-4 {
-            self.reverb = Self::build_reverb(self.sample_rate, p.reverb_width);
+            let spread = (STEREO_SPREAD as f32 * p.reverb_width.clamp(0.0, 1.0)) as usize;
+            self.reverb[1].set_offset(self.sample_rate, spread);
             self.built_width = p.reverb_width;
         }
         let target = self.delay.target(bpm, p);
@@ -1535,6 +1602,57 @@ mod tests {
         // And it did something: silence would mean the chain never ran.
         let peak = buf.iter().fold(0.0_f32, |m, v| m.max(v.abs()));
         assert!(peak > 1.0e-6, "the send produced nothing at all");
+    }
+
+    /// **A width move must not restart the whole room.** The width knob is a
+    /// buffer length, and this code used to rebuild BOTH reverb channels
+    /// from fresh `Vec`s whenever it moved — an allocation on the audio
+    /// thread for every block of a knob drag, and a tail wiped from both
+    /// sides. Now the buffers are allocated once and the knob moves the wrap
+    /// points; only the right channel, which carries the spread, restarts.
+    /// The left tail riding through a width change is the observable proof
+    /// that nothing was rebuilt.
+    #[test]
+    fn a_width_change_does_not_silence_the_left_tail() {
+        const FRAMES: usize = 2048;
+        let mut fx = Effects::new_send(SR);
+        let mut p = Params::default();
+        let sends = Sends {
+            reverb: 1.0,
+            limiter: 1.0,
+            ..Sends::default()
+        };
+
+        // Ring the room with a burst.
+        let mut buf = vec![0.5_f32; FRAMES * 2];
+        fx.process(&mut buf, FRAMES, 2, sends, &p, 120.0);
+
+        // Move the knob well past its epsilon and hand the chain silence:
+        // the LEFT channel keeps ringing, because its lengths never moved.
+        p.reverb_width = 0.2;
+        let mut tail = vec![0.0_f32; FRAMES * 2];
+        fx.process(&mut tail, FRAMES, 2, sends, &p, 120.0);
+        let left = tail
+            .chunks_exact(2)
+            .map(|f| f[0].abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            left > 1.0e-5,
+            "the width change silenced the left tail: peak {left}"
+        );
+
+        // And a full sweep, a step per block — a drag, as the UI delivers
+        // one — stays on the rails at every position.
+        for i in 0..=100 {
+            p.reverb_width = i as f32 / 100.0;
+            let mut b = vec![0.0_f32; 256 * 2];
+            fx.process(&mut b, 256, 2, sends, &p, 120.0);
+            assert!(
+                b.iter().all(|v| v.is_finite()),
+                "the width sweep went non-finite at {}",
+                p.reverb_width
+            );
+        }
     }
 
 

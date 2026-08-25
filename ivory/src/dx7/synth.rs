@@ -298,12 +298,25 @@ impl Dx7 {
         // until the pool ran out and stealing chopped ringing voices — the
         // owner's "many note glitches". Retriggering the held voice keeps one
         // voice per pitch, which is what a real damper does.
+        // **A slot is free when EVERY operator is silent, not when OP1 is.**
+        // This used to ask `eg[0].finished()` alone, and a patch with a fast
+        // OP1 release beside a slower-ringing carrier — an ordinary electric
+        // piano — had eg[0] done milliseconds after the key came up while OP3
+        // still rang. Slot 0 then looked free, the very next note-on
+        // hard-overwrote the audible tail with fifteen genuinely silent slots
+        // sitting right there, and the `sounding` ledger below counted the
+        // stolen slot as newly occupied: one phantom voice per steal, and
+        // `active()` never false again until a flush.
         let damper_held = |n: &Note| !n.on && n.age & (1 << 63) != 0;
         let slot = self
             .notes
             .iter()
             .position(|n| n.pitch == pitch && (n.on || damper_held(n)))
-            .or_else(|| self.notes.iter().position(|n| n.eg[0].finished() && !n.on))
+            .or_else(|| {
+                self.notes
+                    .iter()
+                    .position(|n| !n.on && n.eg.iter().all(Eg::finished))
+            })
             .unwrap_or_else(|| {
                 let mut best = 0;
                 for (i, n) in self.notes.iter().enumerate() {
@@ -353,7 +366,12 @@ impl Dx7 {
         }
         n.pitch_eg = Eg::pitch(v.pitch_rate, v.pitch_level, sr);
 
-        if !self.notes[slot].on && self.notes[slot].eg[0].finished() {
+        // The ledger counts occupied SLOTS. A retired slot is `Note::SILENT`,
+        // whose age is 0 — the retire loop in `render` is the only decrement,
+        // and it only fires on slots it resets to exactly that. Taking one of
+        // those is a new voice; overwriting anything else destroys a note that
+        // is still counted, so its count transfers to the note replacing it.
+        if self.notes[slot].age == 0 {
             self.sounding += 1;
         }
         self.notes[slot] = n;
@@ -923,6 +941,52 @@ mod tests {
             let live = d.notes.iter().any(|n| n.pitch == p && n.on);
             assert!(live, "pitch {p} found no voice — the pool was clogged by repeats");
         }
+    }
+
+    /// **A ringing release tail is not stolen while silent voices sit free,
+    /// and the `sounding` ledger comes back to zero.** OP1's envelope alone
+    /// used to decide whether a slot was free: with a fast OP1 release beside
+    /// a slow-ringing OP3, eg[0] was done milliseconds after the key came up,
+    /// the next note-on hard-overwrote the still-audible tail in slot 0 with
+    /// an otherwise empty pool — and counted the stolen slot as new, so
+    /// `sounding` crept up by one and `active()` stayed true for the rest of
+    /// the session.
+    #[test]
+    fn a_release_tail_is_not_stolen_while_silent_voices_sit_free() {
+        const SR: f32 = 48_000.0;
+        let mut v = organ();
+        v.ops[0].rate[3] = 99; // OP1 dies within milliseconds of release…
+        v.ops[2].rate[3] = 40; // …while OP3 rings on for about a second.
+        let mut d = Dx7::new(SR);
+        d.set_voice(v);
+
+        d.note_on(60, 0.9);
+        // Let the attack arrive before the key comes up: a release that
+        // starts from silence is over before it begins, and proves nothing.
+        let mut b = vec![0.0_f32; 2 * 2048];
+        d.render(&mut b, 2048, 2);
+        d.note_off(60);
+        // Long enough for OP1's release to finish; OP3 is still ringing.
+        let mut b = vec![0.0_f32; 2 * 2048];
+        d.render(&mut b, 2048, 2);
+        let ringing =
+            |d: &Dx7| d.notes.iter().any(|n| n.pitch == 60 && !n.eg.iter().all(Eg::finished));
+        assert!(ringing(&d), "the tail died before the test could threaten it");
+
+        // A new note must take one of the fifteen silent slots, not the tail.
+        d.note_on(62, 0.9);
+        assert!(
+            ringing(&d),
+            "the new note stole the ringing tail with an empty pool"
+        );
+
+        // And once everything ends, the ledger has to say so.
+        d.note_off(62);
+        for _ in 0..400 {
+            let mut b = vec![0.0_f32; 2 * 2048];
+            d.render(&mut b, 2048, 2);
+        }
+        assert!(!d.active(), "`sounding` leaked: active() with nothing ringing");
     }
 
     /// **The default patch has to still be sounding when the note is.** A patch

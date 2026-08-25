@@ -1524,9 +1524,13 @@ impl Settings {
         let mut saw_order = false;
         // Absent means version 0 — every file every build before this one
         // wrote. Removed from the map like every other known key, so it does
-        // not also survive in `extra` and get written twice.
+        // not also survive in `extra` and get written twice. `shift_remove`
+        // like every other known key too: this one sits right before the
+        // preserved extras in a file this build wrote, so a swap_remove
+        // rotated the LAST extra into its slot on every load — the exact
+        // churn the rule below exists to prevent.
         let was = map
-            .remove("settings_version")
+            .shift_remove("settings_version")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
 
@@ -2015,6 +2019,7 @@ impl Settings {
                 }
             }
         }
+        let mut derive_icons = false;
         match map.shift_remove("channel_icons") {
             Some(Value::Array(items)) => {
                 for (icon, item) in s.channel_icons.iter_mut().zip(items) {
@@ -2026,13 +2031,12 @@ impl Settings {
             _ => {
                 // A file from before the badges: DERIVE them rather than
                 // defaulting a drum onto whatever the user made of track 8.
-                for i in 0..crate::recorder::CHANNELS {
-                    s.channel_icons[i] = u8::from(
-                        s.strip_inserts
-                            .get(i * crate::recorder::INSERTS)
-                            .is_some_and(|p| p == crate::dialogs::DRUMPAD_PATH),
-                    );
-                }
+                // Deferred to after `adopt_desk` — at this point
+                // `s.strip_inserts` is still the DEFAULT desk (the file's
+                // is staged in `LegacyDesk`), and deriving from it painted
+                // the default's drum badge onto whatever the file keeps on
+                // channel 2 while the file's real drumpad went unbadged.
+                derive_icons = true;
             }
         }
         if let Some(Value::Array(items)) = map.shift_remove("channel_kinds") {
@@ -2186,6 +2190,17 @@ impl Settings {
         // the file had; from here on the desk is this build's shape. See
         // `LegacyDesk`.
         s.adopt_desk(desk);
+        if derive_icons {
+            // Now the desk is the FILE's, migrations included — the badge
+            // lands on the channel that really holds the drumpad.
+            for i in 0..crate::recorder::CHANNELS {
+                s.channel_icons[i] = u8::from(
+                    s.strip_inserts
+                        .get(i * crate::recorder::INSERTS)
+                        .is_some_and(|p| p == crate::dialogs::DRUMPAD_PATH),
+                );
+            }
+        }
         s
     }
 
@@ -2370,19 +2385,30 @@ impl Settings {
             // **Track 8 becomes the drumpad's lane** — but only where track 8
             // is still empty ground. Anybody already using the channel keeps
             // exactly what they built.
-            let bay0 = 7 * crate::recorder::INSERTS;
+            //
+            // On `desk` when the file staged one — the v11 rule: `adopt_desk`
+            // replaces `self.strip_inserts` WHOLESALE with the staging, so a
+            // seat written on `self` here was silently thrown away, and every
+            // pre-v17 upgrader got a MIDI-all channel 8 with three empty
+            // bays and nothing to play. Channel 7's seats keep their index
+            // through adoption (the pad rescale and the v19 widening both
+            // move seats ABOVE them), so the staged write lands.
+            let (seats, bay0): (&mut Vec<String>, usize) = if desk.inserts.is_empty() {
+                (&mut self.strip_inserts, 7 * crate::recorder::INSERTS)
+            } else {
+                (&mut desk.inserts, 7 * V11_INSERTS)
+            };
             let untouched = self.channel_kinds.get(7).copied() == Some(0)
-                && self
-                    .strip_inserts
-                    .get(bay0..bay0 + crate::recorder::INSERTS)
+                && seats
+                    .get(bay0..bay0 + V11_INSERTS)
                     .is_none_or(|bays| bays.iter().all(String::is_empty))
                 && (self.tracks_added >> 7) & 1 == 0;
             if untouched {
                 self.channel_kinds[7] = 1;
-                while self.strip_inserts.len() <= bay0 {
-                    self.strip_inserts.push(String::new());
+                while seats.len() <= bay0 {
+                    seats.push(String::new());
                 }
-                self.strip_inserts[bay0] = crate::dialogs::DRUMPAD_PATH.to_owned();
+                seats[bay0] = crate::dialogs::DRUMPAD_PATH.to_owned();
                 while self.channel_inputs.len() < crate::recorder::CHANNELS {
                     self.channel_inputs.push(String::new());
                 }
@@ -4774,4 +4800,65 @@ mod tests {
         );
     }
 
+    /// **The v17 drumpad seat survives a staged desk.** Every real file
+    /// carries `strip_inserts`, which stages into `LegacyDesk` and REPLACES
+    /// `self.strip_inserts` at adoption — so the migration's seat, written
+    /// on `self`, was thrown away: upgraders got a MIDI-all channel 8 with
+    /// three empty bays and nothing to play.
+    #[test]
+    fn v17_drumpad_seat_survives_a_staged_desk() {
+        use crate::recorder::INSERTS;
+        let json = serde_json::json!({
+            "settings_version": 16,
+            "strip_inserts": vec![""; 84],
+            "channel_kinds": [0, 0, 0, 0, 0, 0, 0, 0],
+        })
+        .to_string();
+        let s = Settings::from_json(&json);
+        assert_eq!(s.channel_kinds[7], 1, "track 8 did not become MIDI");
+        assert_eq!(s.channel_inputs[7], "midi:all");
+        assert_eq!(
+            s.strip_inserts[7 * INSERTS].as_str(),
+            crate::dialogs::DRUMPAD_PATH,
+            "the drumpad seat was clobbered by the staged desk"
+        );
+    }
+
+    /// **Pre-badge icons derive from the FILE's desk, not the default.**
+    /// The derivation used to run before `adopt_desk`, when
+    /// `strip_inserts` still held the default — a drum badge landed on
+    /// whatever the file kept on channel 2, and the file's real drumpad
+    /// channel went unbadged.
+    #[test]
+    fn pre_badge_icons_derive_from_the_files_own_desk() {
+        use crate::recorder::INSERTS;
+        let mut inserts = vec![String::new(); 84];
+        inserts[INSERTS] = "/x/Pianoteq 8.vst3".to_owned();
+        inserts[7 * INSERTS] = crate::dialogs::DRUMPAD_PATH.to_owned();
+        let json = serde_json::json!({
+            "settings_version": 19,
+            "strip_inserts": inserts,
+        })
+        .to_string();
+        let s = Settings::from_json(&json);
+        assert_eq!(s.channel_icons[1], 0, "the piano wears a drum badge");
+        assert_eq!(s.channel_icons[7], 1, "the drumpad lost its badge");
+    }
+
+    /// **Unknown keys keep the FILE's order.** `settings_version` sits
+    /// right before the extras in a file this build wrote, and removing it
+    /// with `remove` (= swap_remove under preserve_order) rotated the last
+    /// extra into its slot on every single load.
+    #[test]
+    fn extras_keep_their_file_order_past_the_version_stamp() {
+        let s = Settings::from_json(
+            r#"{"settings_version": 19, "zz_future_a": 1, "zz_future_b": 2, "zz_future_c": 3}"#,
+        );
+        let keys: Vec<&str> = s.extra.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            ["zz_future_a", "zz_future_b", "zz_future_c"],
+            "removing the version stamp shuffled the preserved extras"
+        );
+    }
 }

@@ -1148,8 +1148,18 @@ impl DesktopApp {
         if self.recorder.engine.is_some() {
             self.recorder.reprobe = None;
         } else if self.recorder.reprobe.as_ref().is_some_and(Reprobe::device_back) {
-            self.recorder.reprobe = None;
-            self.open_audio_path(ctx);
+            // **Only while the band is open.** Without this gate the replug
+            // fired `open_audio_path` regardless: device dies with the band
+            // open, the user closes the band, plugs the device back in — and
+            // the probe restarted the engine AND reopened the microphone with
+            // nothing on screen saying so, exactly the "no device held" promise
+            // the band-close edge makes. The close edge also drops the probe
+            // now; this guard covers the one frame where the close and the
+            // replug land together.
+            if self.app.recorder_band_open() {
+                self.recorder.reprobe = None;
+                self.open_audio_path(ctx);
+            }
         } else if self.recorder.reprobe.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
         } else if self.app.recorder_band_open()
@@ -1617,6 +1627,12 @@ impl DesktopApp {
                 // which is what "the band is closed" should mean: no device
                 // held, no third-party code resident.
                 self.recorder.engine = None;
+                // The reprobe goes with it. It only exists because the engine
+                // died while the band was OPEN; left alive past this edge it
+                // kept polling for the lost device — and the replug then
+                // reopened the engine and the microphone behind a closed band.
+                // Recovery restarts from the open edge like everything else.
+                self.recorder.reprobe = None;
                 self.recorder.inserts_loaded =
                     vec![None; (ivory_ui::recorder::STRIPS + 1 + ivory_ui::recorder::DRUM_PADS) * ivory_ui::recorder::INSERTS];
             }
@@ -2725,9 +2741,17 @@ impl DesktopApp {
             return;
         }
         // Still something on screen, or still something waiting to be shown.
+        // **The save panel counts too.** It arrived after the pickers, with
+        // its own deferred slot, and was missed here: `take_save_panel` runs
+        // AFTER `take_cartridge_request` in `after_frame`, so on the frame
+        // after a fullscreen Save As deferred itself this put fullscreen
+        // straight back while the save was still waiting — the blocking rfd
+        // panel then opened under the fullscreen window, which is the buried
+        // modal the 4.18.0 note above calls force-quit territory.
         if self.app.open_dialog().is_some()
             || self.deferred_file.is_some()
             || self.deferred_dir.is_some()
+            || self.deferred_save.is_some()
         {
             return;
         }
@@ -2913,13 +2937,29 @@ impl DesktopApp {
             return;
         }
         // The armed lanes, split by what they record: a MIDI lane takes the
-        // note stream, an AUDIO lane its input pick — the k-th audio channel
-        // rides pick k, the same walk `after_frame` pushes to the engine.
+        // note stream, an AUDIO lane its input pick. **The pick walk is
+        // `push_monitor_settings`' walk, exactly.** The moment any channel
+        // names its input, picks belong to the BOUND channels only — an
+        // unbound audio channel monitors nothing and consumes no pick. This
+        // walk used to stay ordinal, counting every audio channel bound or
+        // not, so on a desk mixing bound and NO INPUT lanes (a state the
+        // settings migration deliberately preserves) the red button asked
+        // the engine to tee a ring it never opened — the take came back
+        // empty and the performance was silently gone — or drained another
+        // channel's microphone onto the wrong lane.
         let armed = self.app.armed_mask();
         let mut midi_lanes = Vec::new();
         let mut audio = Vec::new();
         let mut mask = 0u32;
         let mut pick = 0usize;
+        // An armed audio lane the walk had to pass over: R is lit but there
+        // is no input behind it, and a press that does nothing silently is a
+        // broken button.
+        let mut armed_unbound = false;
+        let any_explicit = (0..ivory_ui::recorder::CHANNELS).any(|ch| {
+            self.app.channel_kind(ch) == Some(ivory_ui::recorder::ChannelKind::Audio)
+                && IvoryApp::parse_input_spec(self.app.channel_input_spec(ch)).is_some()
+        });
         for ch in 0..ivory_ui::recorder::CHANNELS {
             match self.app.channel_kind(ch) {
                 Some(ivory_ui::recorder::ChannelKind::Midi) => {
@@ -2934,7 +2974,16 @@ impl DesktopApp {
                     midi_lanes.push(ch);
                 }
                 Some(ivory_ui::recorder::ChannelKind::Audio) => {
-                    if pick < ivory_ui::recorder::INPUTS {
+                    if any_explicit
+                        && IvoryApp::parse_input_spec(self.app.channel_input_spec(ch))
+                            .is_none()
+                    {
+                        // NO INPUT on an explicit desk: the engine opened no
+                        // ring for this lane, so there is nothing to tee.
+                        if armed & (1 << ch) != 0 {
+                            armed_unbound = true;
+                        }
+                    } else if pick < ivory_ui::recorder::INPUTS {
                         if armed & (1 << ch) != 0 {
                             mask |= 1 << pick;
                             audio.push((pick, ch, Vec::new()));
@@ -2946,8 +2995,13 @@ impl DesktopApp {
             }
         }
         if midi_lanes.is_empty() && audio.is_empty() {
-            self.recorder.take_note =
-                Some("Nothing is armed — R on a channel is what records it.".to_owned());
+            self.recorder.take_note = Some(if armed_unbound {
+                "The armed channel has NO INPUT — its strip's input menu names \
+                 what it records."
+                    .to_owned()
+            } else {
+                "Nothing is armed — R on a channel is what records it.".to_owned()
+            });
             return;
         }
         let rate = f64::from(e.output().sample_rate).max(1.0);

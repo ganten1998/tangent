@@ -76,6 +76,43 @@ fn render_root(pc: u8, prefer_flats: bool) -> &'static str {
     if prefer_flats { NOTE_NAMES_FLAT[idx] } else { NOTE_NAMES[idx] }
 }
 
+/// Chord-quality words a taught name may glue straight onto its root letter.
+/// Case-insensitive, and an optional leading minor-'m' peels off first, so
+/// "madd9" and "mMaj7" pass as m+add / m+maj.
+const QUALITY_WORDS: &[&str] = &[
+    "m", "maj", "major", "min", "minor", "dim", "diminished", "aug",
+    "augmented", "sus", "add", "alt", "altered", "dom", "dominant", "no",
+    "omit",
+];
+
+/// Does the text after a parsed root read as a chord *quality*, rather than
+/// the rest of an English word?
+///
+/// `teach` used to trust `parse_root` alone, and `parse_root` is honest but
+/// promiscuous: any name whose first letter is A-G "has a root". Teaching
+/// **"Great voicing"** with apply-in-all-keys stored the suffix "reat voicing"
+/// against a root of G, and the same shape played from a D bass came back as
+/// **"Areat voicing"**. So: the run of letters glued to the root ("maj7" →
+/// "maj", "reat voicing" → "reat", "7(#9)" → nothing) must be empty or a
+/// known quality word. Misjudging in the strict direction is safe — the name
+/// falls back to literal and merely stops transposing; the old behavior
+/// garbled it in eleven keys out of twelve.
+fn reads_as_quality(suffix: &str) -> bool {
+    let end = suffix
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(suffix.len());
+    let run = &suffix[..end];
+    if run.is_empty() {
+        // "C", "C7", "C(add9)", "C/E", "C major" — nothing glued to the root.
+        return true;
+    }
+    let known = |w: &str| QUALITY_WORDS.iter().any(|q| w.eq_ignore_ascii_case(q));
+    known(run)
+        || (run.len() > 1
+            && matches!(run.as_bytes()[0], b'm' | b'M')
+            && known(&run[1..]))
+}
+
 // ── entries ────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -309,11 +346,14 @@ impl OverrideStore {
         }
     }
 
-    /// Teach a name for the given held voicing. When `apply_all_keys` is set and
-    /// `taught_name` begins with a note name, the name is stored
+    /// Teach a name for the given held voicing. When `apply_all_keys` is set
+    /// and `taught_name` begins with a note name whose continuation reads as a
+    /// chord quality (see `reads_as_quality` above), the name is stored
     /// transposition-invariantly (root stripped, re-rendered on lookup);
-    /// otherwise it is stored literally. Replaces any existing entry for the
-    /// same shape. Saves immediately.
+    /// otherwise it is stored literally — a descriptive name that merely
+    /// *starts* with A-G ("Fanfare", "Dark chord") must never lose its first
+    /// letter to the root parser. Replaces any existing entry for the same
+    /// shape. Saves immediately.
     pub fn teach(&mut self, notes: &HashSet<u8>, taught_name: &str, apply_all_keys: bool) {
         let (bass_pc, ivs) = Self::interval_set_from_bass(notes);
         if ivs.is_empty() {
@@ -321,7 +361,7 @@ impl OverrideStore {
         }
         let taught = taught_name.trim();
         let entry = match (apply_all_keys, parse_root(taught)) {
-            (true, Some((root_pc, suffix))) => Entry::Transposed {
+            (true, Some((root_pc, suffix))) if reads_as_quality(suffix) => Entry::Transposed {
                 suffix: suffix.to_owned(),
                 root_offset: (root_pc + 12 - bass_pc) % 12,
             },
@@ -706,6 +746,46 @@ mod tests {
         // Same shape a whole tone up (bass F#): root = F# + 8 = D → "D9".
         assert_eq!(s.lookup(&notes(&[66, 72, 76]), true), Some("D9".into()));
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_descriptive_name_is_not_mistaken_for_a_rooted_chord() {
+        // The Teach dialog's checkbox defaults to ON, so "Great voicing"
+        // arrived with apply_all_keys and was stored as root G + suffix
+        // "reat voicing" — played from a D bass it displayed "Areat voicing".
+        let p = tmp("descriptive");
+        {
+            let mut s = OverrideStore::load_from(&p);
+            s.teach(&notes(&[48, 55, 64]), "Great voicing", true);
+        }
+        let s = OverrideStore::load_from(&p);
+        assert_eq!(s.lookup(&notes(&[48, 55, 64]), true), Some("Great voicing".into()));
+        // The same shape a whole tone up: verbatim, not garbled.
+        assert_eq!(s.lookup(&notes(&[50, 57, 66]), true), Some("Great voicing".into()));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn quality_detection_separates_chords_from_words() {
+        // Real spellings keep transposing; A-G-initial words fall back to
+        // literal. The strict direction is the safe one — a missed chord name
+        // merely stops transposing, a missed word was garbled in every key
+        // but the one it was taught in.
+        for chord in [
+            "C", "Cm", "CM7", "Cmaj7", "Amin", "Bbdim7", "F#7(#9)", "Ab(add9)",
+            "Emadd9", "CmMaj7", "Dsus4", "C6/9", "C/E", "C13(#11)", "Galt",
+            "C major", "D minor",
+        ] {
+            let (_, suffix) = parse_root(chord).expect(chord);
+            assert!(reads_as_quality(suffix), "{chord} should transpose");
+        }
+        for word in [
+            "Great voicing", "Dark chord", "Fanfare", "Big open shape",
+            "Amazing", "Caddy", "Emo pad", "DARK",
+        ] {
+            let (_, suffix) = parse_root(word).expect(word);
+            assert!(!reads_as_quality(suffix), "{word} must stay literal");
+        }
     }
 
     #[test]

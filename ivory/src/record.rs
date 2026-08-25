@@ -1846,7 +1846,9 @@ impl Session {
         // case left is the real one: nothing to record from at all.
         if self.spec.audio && !self.can_record_audio() {
             self.pending_note = Some(
-                "no audio input is open and no instrument is loaded, so the                  take is MIDI only. Choose an input, or load an instrument, in                  the Recorder band."
+                "no audio input is open and no instrument is loaded, so the \
+                 take is MIDI only. Choose an input, or load an instrument, in \
+                 the Recorder band."
                     .to_owned(),
             );
         }
@@ -1949,7 +1951,8 @@ impl Session {
                 Ok(r) => report = Some(r),
                 Err(_) => {
                     problem = Some(
-                        "the instrument's recording thread did not finish in                          time; the audio file may be incomplete"
+                        "the instrument's recording thread did not finish in \
+                         time; the audio file may be incomplete"
                             .to_owned(),
                     );
                 }
@@ -2525,6 +2528,64 @@ mod tests {
         assert!(
             size >= (FRAMES * CH * 3) as u64,
             "a {size}-byte file cannot hold {FRAMES} frames"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The manifest's `instrument` source reports the fit that MEASURED
+    /// the take.** Struct fields evaluate in the order they are written, and
+    /// `finish` moved the fit into the report BEFORE building the source
+    /// entry from `self.fit` — which by then was the freshly-constructed
+    /// empty one. Every plugin-only take.json swore the clock was never
+    /// measured (`fitted_rate_hz: null`, `observations: 0`) while
+    /// `audio.true_rate` in the same file came from hundreds of points.
+    #[test]
+    fn the_instrument_source_reports_the_fit_that_measured_the_take() {
+        let dir = std::env::temp_dir().join("tangent-plugin-fit");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        const CH: usize = 2;
+        const FRAMES: usize = 4096;
+        let (mut w, mut tx, _note) = plugin_writer(CH, FRAMES * CH * 2);
+        let spec = WavSpec {
+            sample_rate: 48_000,
+            channels: CH as u16,
+            format: TAKE_FORMAT,
+        };
+        w.begin(StartArgs {
+            path: dir.join("t.wav"),
+            spec,
+            bext: Bext::new(WallTime::from_unix(1_786_804_327, 0), spec),
+            audio_tx: None,
+        });
+        for i in 0..FRAMES {
+            for _ in 0..CH {
+                let _ = tx.push(0.25);
+            }
+            // Pump periodically, as the thread does — each pump with audio in
+            // the ring is one point on the fit.
+            if i % 512 == 511 {
+                w.pump();
+            }
+        }
+        let report = w.finish();
+
+        assert!(
+            report.fit.observations() > 0,
+            "the take ran and pumped, so the fit measured SOMETHING"
+        );
+        assert_eq!(
+            report.source.observations,
+            report.fit.observations(),
+            "the source entry must describe the fit that rode the take, \
+             not the fresh one `finish` leaves behind"
+        );
+        assert_eq!(
+            report.source.fitted_rate,
+            report.fit.true_rate(),
+            "take.json's fitted_rate_hz contradicted audio.true_rate in the \
+             same file"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3778,6 +3839,15 @@ impl PluginWriter {
             Ok(m) => (m.clipped_samples, m.loudest_take_peak()),
             Err(_) => (0, 0.0),
         };
+        // **Read the fit BEFORE it is moved.** Struct fields evaluate in the
+        // order they are written, and the `fit:` line below replaces
+        // `self.fit` with a fresh one — so the `source` lines under it used
+        // to read the EMPTY fit, and every plugin-only take's manifest swore
+        // the clock was never measured (`observations: 0`) while
+        // `audio.true_rate` in the same file said otherwise. A diagnostic lie
+        // in the one file that exists to explain bad takes.
+        let fitted_rate = self.fit.true_rate();
+        let observations = self.fit.observations();
         AudioReport {
             frames: self.frames,
             sample_rate: self.sample_rate,
@@ -3801,10 +3871,10 @@ impl PluginWriter {
             source: take::SourceReport {
                 name: "instrument".to_owned(),
                 anchor_ns: self.first_frame_ns,
-                fitted_rate: self.fit.true_rate(),
+                fitted_rate,
                 latency_ns: 0,
                 latency_source: take::LatencySource::AssumedZero,
-                observations: self.fit.observations(),
+                observations,
                 jitter_ns: None,
             },
             error: self.error.take(),

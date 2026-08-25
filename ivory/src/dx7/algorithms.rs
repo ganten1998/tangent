@@ -66,10 +66,10 @@ pub const DEST: [[u8; 6]; 32] = [
     [OUT, 1, 1, 1, 4, 5],
     // 19: 6→5 and 6→4 into two carriers, plus 3→2→1.
     [OUT, 1, 2, OUT, OUT, 4],
-    // 20: 3→1 and 3→2, with 4 and 5 into 3.
-    [OUT, OUT, 1, 3, 3, OUT],
-    // 21: two stacks feeding four carriers.
-    [OUT, OUT, 1, 3, 3, OUT],
+    // 20: 3 into 1 and 2, with 4 taken by 5 and 6.
+    [OUT, OUT, 1, OUT, 4, 4],
+    // 21: 3 into 1 and 2, and 6 into 4 and 5. Four carriers.
+    [OUT, OUT, 1, OUT, OUT, 4],
     // 22: 6 into three carriers, 2→1.
     [OUT, 1, OUT, OUT, OUT, 3],
     // 23: 6→5, 4→3, and 2→1 with 1 and 2 both carriers.
@@ -82,12 +82,12 @@ pub const DEST: [[u8; 6]; 32] = [
     [OUT, OUT, 2, OUT, 4, 5],
     // 27: as 26, feedback on 3.
     [OUT, OUT, 2, OUT, 4, 5],
-    // 28: 5 feeds 4, 3 feeds nothing, 6 feeds 5.
-    [OUT, OUT, OUT, 3, 4, OUT],
+    // 28: 2→1 and the stack 5→4→3, with 6 standing alone.
+    [OUT, 1, OUT, 3, 4, OUT],
     // 29: four carriers, 6→5 and 4→3.
-    [OUT, OUT, OUT, OUT, OUT, 5],
-    // 30: five carriers with one three-deep stack.
-    [OUT, OUT, OUT, OUT, 4, OUT],
+    [OUT, OUT, OUT, 3, OUT, 5],
+    // 30: the stack 5→4→3, with 1, 2 and 6 standing alone.
+    [OUT, OUT, OUT, 3, 4, OUT],
     // 31: five carriers, 6→5.
     [OUT, OUT, OUT, OUT, OUT, 5],
     // 32: all six are carriers.
@@ -100,10 +100,17 @@ pub const DEST: [[u8; 6]; 32] = [
 /// and two operators respectively; both are approximated here as a self-loop on
 /// the same operator, which is the same amount of feedback entering the same
 /// place and differs only in the colour of the result.
+///
+/// **Transcribed against the chart a second time, entry by entry.** The first
+/// pass left seven loops on operator 6 that the chart puts on 3 (algorithms
+/// 10, 18, 20, 21), on 2 (12), or on 5 (28, 30) — and the row comments above
+/// gave it away: "11: as 10, feedback on 6" is only a sentence if 10's loop
+/// sits somewhere ELSE. A wrong entry here does not fail; it plays a
+/// cartridge patch with the growl on the wrong operator.
 pub const FEEDBACK_OP: [u8; 32] = [
-    6, 2, 6, 6, 6, 6, 6, 4, 2, 6, // 1-10
-    6, 6, 6, 6, 2, 6, 2, 6, 6, 6, // 11-20
-    6, 6, 6, 6, 6, 6, 3, 6, 6, 6, // 21-30
+    6, 2, 6, 6, 6, 6, 6, 4, 2, 3, // 1-10
+    6, 2, 6, 6, 2, 6, 2, 3, 6, 3, // 11-20
+    3, 6, 6, 6, 6, 6, 3, 5, 6, 5, // 21-30
     6, 6, // 31-32
 ];
 
@@ -171,5 +178,49 @@ mod tests {
     #[test]
     fn algorithm_thirty_two_is_six_carriers() {
         assert!(DEST[31].iter().all(|d| *d == OUT));
+    }
+
+    /// **The feedback operator is nobody's destination.** The renderer
+    /// replaces the feedback operator's modulation input with its own
+    /// history, so an edge aimed at it would be computed and then thrown
+    /// away — an operator that plays on the hardware and is silent here. On
+    /// the chart the loop always sits at the top of its stack, and the two
+    /// tables have to agree about that.
+    #[test]
+    fn nothing_modulates_the_feedback_operator() {
+        for a in 0..32 {
+            for (i, d) in DEST[a].iter().enumerate() {
+                assert_ne!(
+                    *d,
+                    FEEDBACK_OP[a],
+                    "algorithm {} has operator {} modulating the feedback \
+                     operator",
+                    a + 1,
+                    i + 1
+                );
+            }
+        }
+    }
+
+    /// **The entries the first transcription got wrong, pinned.** Feedback
+    /// for algorithms 10, 18, 20 and 21 belongs on operator 3, for 12 on 2,
+    /// and for 28 and 30 on 5 — all were left on 6, which played every
+    /// cartridge patch on those algorithms with the growl in the wrong
+    /// place. Rows 28-30 of `DEST` had each also dropped a modulation edge
+    /// the chart draws. These are the values off the chart, so the same slip
+    /// cannot come back.
+    #[test]
+    fn the_entries_that_were_once_mistranscribed_match_the_chart() {
+        for (alg, op) in [(10, 3u8), (12, 2), (18, 3), (20, 3), (21, 3), (28, 5), (30, 5)] {
+            assert_eq!(
+                FEEDBACK_OP[alg - 1],
+                op,
+                "algorithm {alg} takes feedback from operator {op} on the chart"
+            );
+        }
+        // 28: 2→1 beside the 5→4→3 stack; 29: 4→3; 30: the stack again.
+        assert_eq!(DEST[27], [OUT, 1, OUT, 3, 4, OUT]);
+        assert_eq!(DEST[28], [OUT, OUT, OUT, 3, OUT, 5]);
+        assert_eq!(DEST[29], [OUT, OUT, OUT, 3, 4, OUT]);
     }
 }
