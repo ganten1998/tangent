@@ -1488,9 +1488,10 @@ impl DeviceKind {
     fn nothing_found(self) -> &'static str {
         match self {
             DeviceKind::Camera => {
-                "Camera recording is not available on Windows yet - it is not \
-                 a permission problem and there is nothing to grant. Takes \
-                 still record the window, the audio and the MIDI."
+                "No camera found. Check that a webcam is connected and that \
+                 Camera access is on under Settings > Privacy & security > \
+                 Camera (Tangent uses the system camera through its own \
+                 bundled encoder)."
             }
             DeviceKind::AudioInput => {
                 "No audio inputs found. If an interface is connected, check \
