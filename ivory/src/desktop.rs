@@ -410,6 +410,14 @@ pub struct DesktopApp {
     /// A request held back for one frame so the dialogs above it can stand
     /// down first. See `IvoryApp::native_panel_up`.
     panel_armed: bool,
+    /// The SAVE panel's own copy of `panel_armed`. The project menu is a child
+    /// viewport, and closing it (`dialog = None`) does not destroy its window
+    /// the same frame — a save panel opened before that window is gone lands
+    /// BEHIND it, which is "Save As loads below the menu". One extra frame, as
+    /// the pickers take. Its own flag so a load armed in the same `after_frame`
+    /// cannot clear it.
+    #[cfg(feature = "recorder")]
+    save_armed: bool,
     deferred_file: Option<ivory_ui::ports::FileRequest>,
     #[cfg(feature = "recorder")]
     deferred_dir: Option<ivory_ui::ports::DirRequest>,
@@ -2380,6 +2388,25 @@ impl DesktopApp {
             self.deferred_save = Some(request);
             self.refullscreen = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            return;
+        }
+        // **One more frame so the project menu's window is actually gone.**
+        //
+        // The one settle above is for the MAIN window leaving fullscreen; it is
+        // not enough for the menu. The row that asked for this closed the menu
+        // (`dialog = None`) on the frame the request arrived, but a child
+        // viewport is not destroyed until the frame AFTER it stops being drawn,
+        // and this runs inside `after_frame` — before the menu-less frame has
+        // even been presented. Open the blocking panel now and it lands behind
+        // the menu window that is still on screen and still always-on-top. So
+        // hold one more frame, exactly as `arm_panel` does for the pickers,
+        // and let that window go first.
+        if self.save_armed {
+            self.save_armed = false;
+        } else if self.app.native_panel_up() {
+            self.save_armed = true;
+            self.deferred_save = Some(request);
+            ctx.request_repaint();
             return;
         }
         if !Self::native_dialogs_work() {
@@ -4889,6 +4916,8 @@ impl DesktopApp {
             refullscreen: false,
             #[cfg(feature = "recorder")]
             panel_armed: false,
+            #[cfg(feature = "recorder")]
+            save_armed: false,
             deferred_file: None,
             #[cfg(feature = "recorder")]
             deferred_dir: None,

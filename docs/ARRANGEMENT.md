@@ -1040,6 +1040,16 @@ channels play back their clips and nothing else. "Ready to play" and
   during the Windows camera validation — the camera itself passed end
   to end on a clean box: live preview, correct colors, a video take
   with the camera embedded.)
+- **4.89.0 — Save As no longer opens under the menu**: the project
+  menu is a child viewport, and clicking Save As or Save As Template
+  closes it (`dialog = None`) but does not destroy its window the same
+  frame — a child viewport dies the frame AFTER it stops being drawn.
+  The save panel opened inside `after_frame`, before that menu-less
+  frame was even on screen, so the OS panel landed BEHIND the still-up,
+  still-always-on-top menu window: "the dialog loads below the menu",
+  on macOS and Windows alike. The save panel now takes the same one
+  extra frame the file pickers take (`arm_panel`) and lets the menu
+  window go first. Both save panels, both platforms.
 
 ## Order of work
 
