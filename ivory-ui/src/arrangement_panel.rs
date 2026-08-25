@@ -92,10 +92,11 @@ pub struct ClipView<'a> {
 /// Everything the arrangement draws, pushed in.
 pub struct ArrangeView<'a> {
     pub lanes: [LaneView<'a>; CHANNELS],
-    /// The first lane shown — the arrangement has more lanes than fit, so
-    /// eight show at a time (see `VISIBLE_LANES`) and this says which eight.
-    /// Clamped by the app to `[0, CHANNELS - VISIBLE_LANES]`.
+    /// The first lane shown — the arrangement has more lanes than fit, so a
+    /// window of them shows and this says which. Clamped by the app.
     pub lane_scroll: usize,
+    /// How many lanes show at once — Shift+wheel over the headers zooms it.
+    pub visible_lanes: usize,
     pub clips: &'a [ClipView<'a>],
     /// The toolbar's three facts: the click, the magnet, and the grid as a
     /// power of two in bars (3 = 8 bars … 0 = 1 bar … -5 = 1/32).
@@ -337,7 +338,7 @@ impl Layout {
         // and `view.lane_scroll` chooses which window shows. A lane outside
         // the window is `NOTHING` — not drawn, not hit, and clips on it
         // resolve to nothing through `clip_rect`'s `is_positive` filter.
-        let visible = VISIBLE_LANES.min(CHANNELS);
+        let visible = view.visible_lanes.clamp(1, CHANNELS);
         let lane_h = lanes_area.height() / visible as f32;
         let first = view.lane_scroll.min(CHANNELS.saturating_sub(visible));
         let row_at = |top: f32, left: f32, right: f32, i: usize| -> Rect {
@@ -509,9 +510,23 @@ impl Layout {
                 Pos2::new(col.right(), col.top() + col.height() * b),
             )
         };
-        let name = slice(0.0, 0.34);
-        let input = slice(0.36, 0.64);
-        let bays_row = slice(0.66, 1.0);
+        // **What a short header sheds, and in what order.** The lane count
+        // is adjustable now (Shift+wheel), so a header can be as tall as a
+        // third of the view or as short as a strip. When it cannot hold all
+        // three stacked rows legibly, the owner's rule is: drop the INSERT
+        // BAYS first, then the INPUT selector only if it is still too tight,
+        // and never the NAME. Each surviving row takes an equal share.
+        const ROW_MIN: f32 = 15.0;
+        let rows_h = col.height();
+        let (name, input, bays_row) = if rows_h >= 3.0 * ROW_MIN {
+            (slice(0.0, 0.30), slice(0.34, 0.63), slice(0.67, 1.0))
+        } else if rows_h >= 2.0 * ROW_MIN {
+            // Bays gone; the name and the input split the column.
+            (slice(0.0, 0.46), slice(0.50, 1.0), Rect::NOTHING)
+        } else {
+            // Only the name survives — the last thing a track cannot do without.
+            (slice(0.0, 1.0), Rect::NOTHING, Rect::NOTHING)
+        };
         let bays = std::array::from_fn(|b| {
             let w = (bays_row.width() - 3.0 * (crate::recorder::INSERTS as f32 - 1.0))
                 / crate::recorder::INSERTS as f32;
@@ -1778,6 +1793,7 @@ mod tests {
             selected_channel: None,
             lanes: std::array::from_fn(|i| a_lane(i < 3)),
             lane_scroll: 0,
+            visible_lanes: VISIBLE_LANES,
             clips,
             metronome_on: true,
             snap_on: true,

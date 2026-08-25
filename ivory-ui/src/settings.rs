@@ -956,6 +956,15 @@ pub struct Settings {
     pub arr_grid_exp: i64,
     /// The arrangement header column's width in points; 0 = automatic.
     pub arr_header_w: f64,
+    /// How many channels the MIXER shows at once, and how many LANES the
+    /// arrangement shows — Shift+wheel over each surface zooms the count, one
+    /// per tick. Persisted, because how dense a desk you want is a taste, not
+    /// a scroll position. Clamped to `[1, CHANNELS]` on load.
+    pub mixer_visible: u8,
+    pub arr_visible: u8,
+    /// How many KEYS the MIDI editor shows at once (semitones); Shift+wheel
+    /// over the roll zooms it. Clamped to a legible band on load.
+    pub midi_keys_visible: u8,
     /// Channels added as BARE tracks (bitmask): a strip that exists before
     /// any input is bound — the + circle's work. Cleared by Remove Track.
     pub tracks_added: i64,
@@ -1193,24 +1202,24 @@ impl Default for Settings {
             drums_pan: 0.0,
             auto_palette: true,
             palette_choice: 0,
-            // **Channel 0 ships as the DX7.** The default sound lives in a
-            // pre-added MIDI channel with the built-in in bay 1 — see
-            // `Default::default`'s `strip_inserts` — so a fresh install makes
-            // a sound and the desk shows why.
-            // **And channel 7 ships as the DRUMPAD.** Track 8 carries the
-            // sixteen-pad sampler out of the box, so the kit has a lane the
-            // editor can write for and the desk shows both instruments.
+            // **Channel 0 ships as the DX7, channel 1 as the DRUMPAD.** The
+            // two built-in instruments sit side by side in the first two
+            // slots — so a fresh install makes a sound, has a kit the editor
+            // can write for, and the desk shows both. The drumpad used to
+            // sit on channel 7 (the last of eight); with sixteen channels
+            // there is no sense stranding it in the middle, so it moves up
+            // to the second slot.
             channel_kinds: {
                 let mut k = [0u8; crate::recorder::CHANNELS];
                 k[0] = 1;
-                k[7] = 1;
+                k[1] = 1;
                 k
             },
-            // Track 8's drumpad wears the drum out of the box; everything
-            // else follows its kind.
+            // The drumpad on channel 1 wears the drum out of the box;
+            // everything else follows its kind.
             channel_icons: {
                 let mut c = [0u8; crate::recorder::CHANNELS];
-                c[7] = 1;
+                c[1] = 1;
                 c
             },
             reverb_mix: 0.0,
@@ -1258,8 +1267,8 @@ impl Default for Settings {
                             * crate::recorder::INSERTS
                     ];
                 v[0] = crate::dialogs::BUILTIN_PATH.to_owned();
-                // And track 8's bay 1 is the drumpad — see `channel_kinds`.
-                v[7 * crate::recorder::INSERTS] =
+                // And channel 1's bay 0 is the drumpad — see `channel_kinds`.
+                v[1 * crate::recorder::INSERTS] =
                     crate::dialogs::DRUMPAD_PATH.to_owned();
                 v
             },
@@ -1273,6 +1282,11 @@ impl Default for Settings {
             // 1/4 out of the box, both grids — the owner's default.
             arr_grid_exp: -2,
             arr_header_w: 0.0,
+            // Eight of each in view out of the box; Shift+wheel changes it.
+            mixer_visible: 8,
+            arr_visible: 8,
+            // Three octaves of keys, the editor's long-standing default.
+            midi_keys_visible: 36,
             tracks_added: 0,
             midi_editor_floating: false,
             midi_snap: true,
@@ -2065,6 +2079,16 @@ impl Settings {
         }
         if let Some(n) = map.shift_remove("arr_header_w").and_then(|v| v.as_f64()) {
             s.arr_header_w = n.clamp(0.0, 1000.0);
+        }
+        let chans = crate::recorder::CHANNELS as u64;
+        if let Some(n) = map.shift_remove("mixer_visible").and_then(|v| v.as_u64()) {
+            s.mixer_visible = n.clamp(1, chans) as u8;
+        }
+        if let Some(n) = map.shift_remove("arr_visible").and_then(|v| v.as_u64()) {
+            s.arr_visible = n.clamp(1, chans) as u8;
+        }
+        if let Some(n) = map.shift_remove("midi_keys_visible").and_then(|v| v.as_u64()) {
+            s.midi_keys_visible = n.clamp(12, 96) as u8;
         }
         if let Some(n) = map.shift_remove("tracks_added").and_then(|v| v.as_i64()) {
             s.tracks_added = n;
@@ -2860,6 +2884,9 @@ impl Settings {
         map.insert("arr_snap".into(), Value::Bool(self.arr_snap));
         map.insert("arr_grid_exp".into(), Value::from(self.arr_grid_exp));
         map.insert("arr_header_w".into(), Value::from(self.arr_header_w));
+        map.insert("mixer_visible".into(), Value::from(self.mixer_visible));
+        map.insert("arr_visible".into(), Value::from(self.arr_visible));
+        map.insert("midi_keys_visible".into(), Value::from(self.midi_keys_visible));
         map.insert("tracks_added".into(), Value::from(self.tracks_added));
         map.insert(
             "midi_editor_floating".into(),
@@ -3883,6 +3910,28 @@ mod tests {
     /// The three Setup keys, together, because they are read in the same breath
     /// by the host: a rate this build does not offer, a system that is not
     /// compiled in, or a channel toggle that failed to persist each produce the
+    /// **The Shift+wheel zoom counts survive a relaunch, and a hostile file
+    /// cannot put the desk into a shape it cannot draw.** Persisted like the
+    /// grid, clamped like every other count.
+    #[test]
+    fn the_visible_counts_round_trip_and_clamp() {
+        let mut s = Settings::default();
+        s.mixer_visible = 5;
+        s.arr_visible = 12;
+        s.midi_keys_visible = 24;
+        let back = Settings::from_json(&s.to_json());
+        assert_eq!(back.mixer_visible, 5);
+        assert_eq!(back.arr_visible, 12);
+        assert_eq!(back.midi_keys_visible, 24);
+        // Out-of-range values from a hand-edited file are clamped on load.
+        let wild = Settings::from_json(
+            r#"{"mixer_visible": 999, "arr_visible": 0, "midi_keys_visible": 3}"#,
+        );
+        assert_eq!(wild.mixer_visible as usize, crate::recorder::CHANNELS, "too many clamps down");
+        assert_eq!(wild.arr_visible, 1, "zero clamps up to one");
+        assert_eq!(wild.midi_keys_visible, 12, "too few keys clamps to the floor");
+    }
+
     /// same symptom — Setup opens showing something other than what is running.
     #[test]
     fn the_audio_path_settings_round_trip() {
@@ -4538,10 +4587,13 @@ mod tests {
         // 0..4. Unoccupied fill 4..8: slot1, slot3, slot4, input2; input3 is
         // the dropped ninth.
         assert_eq!(s.channel_kinds[..4], [1, 1, 2, 2], "the occupied four");
-        // The rest are unoccupied — however many channels this build has.
+        // The channels the split itself left empty stay empty. Channel 7 is
+        // the frozen v17 migration's business (it seats the drumpad there for
+        // a pre-v17 file), so this split-focused test does not speak for it.
         assert!(
-            s.channel_kinds[4..].iter().all(|k| *k == 0),
-            "the unoccupied rest: {:?}",
+            s.channel_kinds[4..7].iter().all(|k| *k == 0)
+                && s.channel_kinds[8..].iter().all(|k| *k == 0),
+            "the split occupied a channel it should not have: {:?}",
             &s.channel_kinds[4..]
         );
 

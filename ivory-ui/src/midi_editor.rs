@@ -52,6 +52,9 @@ pub struct MidiEditView<'a> {
     pub view_len_s: f64,
     /// The (fractional) key whose row TOP sits at the roll's top edge.
     pub top_key: f32,
+    /// How many keys (semitones) the roll shows top to bottom — Shift+wheel
+    /// zooms it. Defaults to [`KEYS_SHOWN`].
+    pub keys_shown: f32,
     pub snap_on: bool,
     pub grid_exp: i8,
     pub swing: bool,
@@ -201,19 +204,19 @@ pub fn x_of(l: &Layout, view: &MidiEditView<'_>, t: f64) -> f32 {
     l.roll.left() + l.roll.width() * f as f32
 }
 
-/// The key row height in points.
-pub fn key_h(l: &Layout) -> f32 {
-    l.roll.height().max(1.0) / KEYS_SHOWN
+/// The key row height in points, for a roll showing `keys_shown` keys.
+pub fn key_h(l: &Layout, keys_shown: f32) -> f32 {
+    l.roll.height().max(1.0) / keys_shown.max(1.0)
 }
 
 /// The (fractional) key under `y` — floor it for the row.
 pub fn key_at(l: &Layout, view: &MidiEditView<'_>, y: f32) -> f32 {
-    view.top_key - (y - l.roll.top()) / key_h(l)
+    view.top_key - (y - l.roll.top()) / key_h(l, view.keys_shown)
 }
 
 /// The TOP edge of `key`'s row.
 pub fn y_of(l: &Layout, view: &MidiEditView<'_>, key: f32) -> f32 {
-    l.roll.top() + (view.top_key - key) * key_h(l)
+    l.roll.top() + (view.top_key - key) * key_h(l, view.keys_shown)
 }
 
 // ── the grid ───────────────────────────────────────────────────────────────
@@ -479,11 +482,11 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
     if !l.roll.is_positive() || !l.keys.is_positive() {
         return;
     }
-    let kh = key_h(&l);
+    let kh = key_h(&l, view.keys_shown);
 
     // ── rows: the piano column and the roll's shading, one loop ──────────
     let top = view.top_key.ceil() as i32;
-    for k in (top - KEYS_SHOWN as i32 - 1)..=top {
+    for k in (top - view.keys_shown as i32 - 1)..=top {
         if !(0..=127).contains(&k) {
             continue;
         }
@@ -743,7 +746,7 @@ pub fn note_rect(l: &Layout, view: &MidiEditView<'_>, n: &ArrNote) -> Rect {
         Pos2::new(x0.max(l.roll.left()), y0.max(l.roll.top())),
         Pos2::new(
             x1.min(l.roll.right()).max(x0 + 2.0),
-            (y0 + key_h(l)).min(l.roll.bottom()),
+            (y0 + key_h(l, view.keys_shown)).min(l.roll.bottom()),
         ),
     );
     if r.is_positive() {
@@ -839,6 +842,7 @@ mod tests {
             view_start_s: 6.0,
             view_len_s: 20.0,
             top_key: 72.0,
+            keys_shown: KEYS_SHOWN,
             snap_on: true,
             grid_exp: -3,
             swing: false,
@@ -947,7 +951,7 @@ mod tests {
             hit_test(rect(), &v, Pos2::new(r.right() - 1.0, r.center().y)),
             Some(Hit::NoteRight(0))
         );
-        match hit_test(rect(), &v, Pos2::new(r.center().x, r.center().y - key_h(&l) * 2.0)) {
+        match hit_test(rect(), &v, Pos2::new(r.center().x, r.center().y - key_h(&l, v.keys_shown) * 2.0)) {
             Some(Hit::Cell(t, key)) => {
                 assert_eq!(key, 62, "two rows up from C4 is D4");
                 assert!((t - 10.5).abs() < 0.2, "the cell's second read as {t}");

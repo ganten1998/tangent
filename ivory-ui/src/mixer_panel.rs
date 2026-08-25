@@ -93,10 +93,12 @@ pub struct MixerView<'a> {
     /// that changes shape under your hands.
     pub strips: [StripView<'a>; COLUMNS],
     /// The first CHANNEL column shown in the scrolling region — the desk has
-    /// more channels than fit, so eight show at a time and this says which
-    /// eight. The click and the master are pinned at the right and never
-    /// scroll. Clamped by the app to `[0, CHANNELS - VISIBLE_CHANNELS]`.
+    /// more channels than fit, so a window of them shows and this says which.
+    /// The click and the master are pinned at the right and never scroll.
     pub scroll: usize,
+    /// How many channel columns show at once — Shift+wheel zooms it. The
+    /// click and the master are pinned beside them and not counted here.
+    pub visible: usize,
     /// True when anything at all is soloed, so the strips that are not can be
     /// drawn as what they are — silent, not merely unlit.
     pub any_solo: bool,
@@ -434,7 +436,7 @@ impl Layout {
         // Layout: [ 8 scrolling channels | GAP | click | GAP | master ].
         let click_col = CHANNELS; // column index of the click
         let master_col = COLUMNS - 1;
-        let visible = VISIBLE_CHANNELS.min(CHANNELS);
+        let visible = view.visible.clamp(1, CHANNELS);
         // Ten visible slots (eight channels + click + master), nine gaps.
         let slots = (visible + 2) as f32;
         let unit = ((inner.width() - GAP * (slots - 1.0)) / slots).max(1.0);
@@ -1778,6 +1780,7 @@ mod tests {
             }),
             any_solo: false,
             scroll: 0,
+            visible: VISIBLE_CHANNELS,
             selected: None,
             typing: None,
             naming: None,
@@ -1909,6 +1912,22 @@ mod tests {
             (l.strips[MASTER].panel.left() - master_x).abs() < 0.5,
             "the master moved when the channels scrolled"
         );
+    }
+
+    /// **The visible count is what the view says, not a constant.** Shift+
+    /// wheel changes it; the layout must honour whatever number arrives.
+    #[test]
+    fn the_mixer_shows_as_many_channels_as_asked() {
+        let r = rect();
+        for want in [4usize, 8, 12] {
+            let mut v = a_view();
+            v.visible = want;
+            v.scroll = 0;
+            let l = Layout::new(r, &v);
+            let shown = (0..CHANNELS).filter(|n| l.strips[*n].panel.is_positive()).count();
+            assert_eq!(shown, want.min(CHANNELS), "asked for {want}, showed {shown}");
+            assert!(l.strips[MASTER].panel.is_positive(), "the master must always show");
+        }
     }
 
     /// A strip with no send gives that room to its meter rather than leaving a

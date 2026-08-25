@@ -3030,10 +3030,10 @@ impl IvoryApp {
                 },
             }),
             any_solo: desk.any_solo(),
-            scroll: self.mixer_scroll.min(
-                crate::recorder::CHANNELS
-                    .saturating_sub(crate::mixer_panel::VISIBLE_CHANNELS),
-            ),
+            visible: self.mixer_visible(),
+            scroll: self
+                .mixer_scroll
+                .min(crate::recorder::CHANNELS.saturating_sub(self.mixer_visible())),
             selected: self.selected_channel,
             fx_menu: self.mixer_fx_menu,
             typing: self
@@ -7288,6 +7288,7 @@ impl IvoryApp {
             view_start_s: st.view_start_s,
             view_len_s: st.view_len_s,
             top_key: st.top_key,
+            keys_shown: self.midi_keys_visible(),
             snap_on: self.settings.midi_snap,
             grid_exp: self.settings.midi_grid_exp.clamp(-6, 3) as i8,
             swing: self.settings.midi_swing,
@@ -7330,8 +7331,8 @@ impl IvoryApp {
             id,
             view_start_s: (clip.start_s - pad).max(0.0),
             view_len_s: (clip.len_s + pad * 2.0).max(1.0),
-            top_key: (centre as f32 + crate::midi_editor::KEYS_SHOWN * 0.5)
-                .clamp(crate::midi_editor::KEYS_SHOWN, 128.0),
+            top_key: (centre as f32 + self.midi_keys_visible() * 0.5)
+                .clamp(self.midi_keys_visible(), 128.0),
             selected: Vec::new(),
             drag: None,
             dirty: false,
@@ -8897,16 +8898,27 @@ impl IvoryApp {
                     );
                     (a, s, over_grid)
                 };
+                let kv = self.midi_keys_visible();
+                // **Shift+wheel ZOOMS the visible note count** — the midi twin
+                // of the mixer's track-count zoom, anywhere in the editor. Two
+                // semitones a tick, a legible band.
+                if shift && scroll.y.abs() > 0.5 {
+                    let cur = self.settings.midi_keys_visible as i64;
+                    let next = (cur + if scroll.y > 0.0 { 2 } else { -2 }).clamp(12, 96);
+                    if next != cur {
+                        self.settings.midi_keys_visible = next as u8;
+                        self.save_settings();
+                    }
+                    return;
+                }
                 // **The wheel over the PIANO scrolls the note range** — the
                 // keyboard column is the pitch axis, so a plain wheel there
-                // walks `top_key` the way Cmd/Shift+wheel does anywhere else.
-                // No modifier, no scrollbar; the timeline keeps its zoom.
+                // walks `top_key`. No scrollbar; the timeline keeps its zoom.
                 let over_keys = crate::midi_editor::Layout::new(rect).keys.contains(p);
                 if over_keys && scroll.y.abs() > 0.5 {
                     if let Some(st) = self.midi_edit.as_mut() {
-                        let kh = rect.height().max(1.0) / crate::midi_editor::KEYS_SHOWN;
-                        st.top_key = (st.top_key + scroll.y / kh)
-                            .clamp(crate::midi_editor::KEYS_SHOWN, 128.0);
+                        let kh = rect.height().max(1.0) / kv;
+                        st.top_key = (st.top_key + scroll.y / kh).clamp(kv, 128.0);
                     }
                     return;
                 }
@@ -8928,11 +8940,11 @@ impl IvoryApp {
                     if let Some(st) = self.midi_edit.as_mut() {
                         st.view_start_s = (st.view_start_s - d).max(0.0);
                     }
-                } else if cmd || shift {
+                } else if cmd {
+                    // Cmd+wheel pans the note range (shift now zooms it).
                     if let Some(st) = self.midi_edit.as_mut() {
-                        let kh = rect.height().max(1.0) / crate::midi_editor::KEYS_SHOWN;
-                        st.top_key = (st.top_key + scroll.y / kh)
-                            .clamp(crate::midi_editor::KEYS_SHOWN, 128.0);
+                        let kh = rect.height().max(1.0) / kv;
+                        st.top_key = (st.top_key + scroll.y / kh).clamp(kv, 128.0);
                     }
                 } else {
                     // Zoom at the PLAYHEAD, as the arrangement does now —
@@ -9662,12 +9674,24 @@ impl IvoryApp {
                         .contains(p)
                 };
                 if over_headers {
-                    let max = crate::recorder::CHANNELS
-                        .saturating_sub(crate::arrangement_panel::VISIBLE_LANES);
-                    if scroll.y < -0.5 {
-                        self.arr_lane_scroll = (self.arr_lane_scroll + 1).min(max);
-                    } else if scroll.y > 0.5 {
-                        self.arr_lane_scroll = self.arr_lane_scroll.saturating_sub(1);
+                    if shift {
+                        // **Shift+wheel ZOOMS the lane count** — one lane per
+                        // tick, the mixer's own gesture on the vertical desk.
+                        let cur = self.settings.arr_visible as i64;
+                        let next = (cur + if scroll.y > 0.0 { 1 } else { -1 })
+                            .clamp(1, crate::recorder::CHANNELS as i64);
+                        if next != cur {
+                            self.settings.arr_visible = next as u8;
+                            self.save_settings();
+                        }
+                    } else {
+                        let max =
+                            crate::recorder::CHANNELS.saturating_sub(self.arr_visible());
+                        if scroll.y < -0.5 {
+                            self.arr_lane_scroll = (self.arr_lane_scroll + 1).min(max);
+                        } else if scroll.y > 0.5 {
+                            self.arr_lane_scroll = self.arr_lane_scroll.saturating_sub(1);
+                        }
                     }
                     return;
                 }
@@ -10579,10 +10603,10 @@ impl IvoryApp {
                     peak: peaks[n],
                 }
             }),
-            lane_scroll: self.arr_lane_scroll.min(
-                crate::recorder::CHANNELS
-                    .saturating_sub(crate::arrangement_panel::VISIBLE_LANES),
-            ),
+            lane_scroll: self
+                .arr_lane_scroll
+                .min(crate::recorder::CHANNELS.saturating_sub(self.arr_visible())),
+            visible_lanes: self.arr_visible(),
             clips,
             header_w: if self.settings.arr_header_w > 0.0 {
                 Some(self.settings.arr_header_w as f32)
@@ -11094,6 +11118,19 @@ impl IvoryApp {
     /// to the engine each frame; the same span the export reads.
     pub fn loop_region(&self) -> Option<(f64, f64)> {
         self.time_sel.filter(|(a, b)| b > a)
+    }
+
+    /// How many mixer channels / arrange lanes / MIDI keys show at once —
+    /// Shift+wheel zooms each, clamped to a legible band. Read from settings
+    /// so the choice survives a relaunch.
+    fn mixer_visible(&self) -> usize {
+        (self.settings.mixer_visible as usize).clamp(1, crate::recorder::CHANNELS)
+    }
+    fn arr_visible(&self) -> usize {
+        (self.settings.arr_visible as usize).clamp(1, crate::recorder::CHANNELS)
+    }
+    fn midi_keys_visible(&self) -> f32 {
+        (self.settings.midi_keys_visible as f32).clamp(12.0, 96.0)
     }
 
     /// The rate both streams should open at, or `None` for the device's own.
@@ -15182,15 +15219,28 @@ impl IvoryApp {
             // trackpad's horizontal swipe and a mouse wheel's vertical notch
             // both mean "the next channels".
             if ctx.pointer_interact_pos().is_some_and(|p| rect.contains(p)) {
-                let d = ctx.input(|i| i.raw_scroll_delta.x + i.raw_scroll_delta.y);
+                let (d, shift) =
+                    ctx.input(|i| (i.raw_scroll_delta.x + i.raw_scroll_delta.y, i.modifiers.shift));
                 if d.abs() > 0.5 {
-                    let max = crate::recorder::CHANNELS
-                        .saturating_sub(crate::mixer_panel::VISIBLE_CHANNELS);
-                    // Wheel up / swipe right reveals higher channels.
-                    if d < 0.0 {
-                        self.mixer_scroll = (self.mixer_scroll + 1).min(max);
+                    if shift {
+                        // **Shift+wheel ZOOMS the visible count** — one
+                        // channel per tick. Wheel up shows more (each
+                        // narrower); down shows fewer (each wider).
+                        let cur = self.settings.mixer_visible as i64;
+                        let next = (cur + if d > 0.0 { 1 } else { -1 })
+                            .clamp(1, crate::recorder::CHANNELS as i64);
+                        if next != cur {
+                            self.settings.mixer_visible = next as u8;
+                            self.save_settings();
+                        }
                     } else {
-                        self.mixer_scroll = self.mixer_scroll.saturating_sub(1);
+                        // Plain wheel SCROLLS — one channel per tick.
+                        let max = crate::recorder::CHANNELS.saturating_sub(self.mixer_visible());
+                        if d < 0.0 {
+                            self.mixer_scroll = (self.mixer_scroll + 1).min(max);
+                        } else {
+                            self.mixer_scroll = self.mixer_scroll.saturating_sub(1);
+                        }
                     }
                 }
             }
@@ -17511,14 +17561,20 @@ mod tests {
             Some(dialogs::BUILTIN_PATH),
             "the DX7 did not ride to row 4"
         );
-        assert_eq!(app.insert(0, 0), None, "row 1 still holds the old bay");
+        // Moving channel 0 to position 3 shifts channels 1..3 down one, so
+        // the drumpad (channel 1 by default now) lands on row 0.
+        assert_eq!(
+            app.insert(0, 0),
+            Some(dialogs::DRUMPAD_PATH),
+            "the drum on old row 1 did not shift into row 0"
+        );
         assert_eq!(
             app.arrangement().clips[0].lane,
             3,
             "the clip stayed behind"
         );
-        // The drumpad on 7 never moved; rows 1..3 stepped down one.
-        assert_eq!(app.insert(7, 0), Some(dialogs::DRUMPAD_PATH));
+        // Nothing rode onto row 7 — the drum lives near the top now.
+        assert_eq!(app.insert(7, 0), None);
         // And the host is told exactly what happened: order[new] = old. The
         // moved span is 0..3; every channel above it is carried unchanged,
         // however many the desk has.
@@ -20700,15 +20756,17 @@ mod tests {
     fn a_fresh_install_has_the_built_in_loaded() {
         let s = crate::settings::Settings::first_launch();
         assert_eq!(bay_of(&s, 0, 0), Some(dialogs::BUILTIN_PATH));
-        // Track 8 carries the drumpad — the other out-of-the-box instrument.
-        assert_eq!(bay_of(&s, 7, 0), Some(dialogs::DRUMPAD_PATH));
-        // And nothing else: two channels with instruments, not eight of
-        // something.
+        // Channel 1 carries the drumpad — the other out-of-the-box
+        // instrument, moved off the old track-8 seat now the desk is wide.
+        assert_eq!(bay_of(&s, 1, 0), Some(dialogs::DRUMPAD_PATH));
+        // And nothing else: two channels with instruments, not sixteen of
+        // something. Channels 0 (DX7) and 1 (drumpad) each hold one bay-0
+        // instrument; every other bay everywhere is empty.
         assert!(
-            (1..=crate::recorder::STRIPS)
-                .filter(|st| *st != 7)
+            (2..=crate::recorder::STRIPS)
                 .all(|st| (0..crate::recorder::INSERTS).all(|b| bay_of(&s, st, b).is_none()))
-                && (1..crate::recorder::INSERTS).all(|b| bay_of(&s, 7, b).is_none()),
+                && (1..crate::recorder::INSERTS).all(|b| bay_of(&s, 0, b).is_none())
+                && (1..crate::recorder::INSERTS).all(|b| bay_of(&s, 1, b).is_none()),
             "a fresh install loaded more than the two instruments"
         );
         // No cartridge chosen means the one that ships. See `dx7::factory`.
