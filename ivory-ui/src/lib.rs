@@ -32,6 +32,7 @@ pub mod settings;
 pub mod splash;
 pub mod staff;
 pub mod shell;
+pub mod theme;
 pub mod theory_panel;
 
 /// The version the About box reports.

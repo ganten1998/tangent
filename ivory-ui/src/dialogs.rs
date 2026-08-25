@@ -273,6 +273,13 @@ pub enum Dialog {
     Welcome {
         dont_show_again: bool,
     },
+    /// Name the colours the app is wearing and write them to the user themes
+    /// folder. Stays open on failure so the typed name is not lost.
+    SaveTheme {
+        name: String,
+        message: Option<String>,
+        focus: bool,
+    },
     /// Stream Tangent's master out over ReaStream to OBS/REAPER. Working copies
     /// of the settings, applied on the checkbox and on Done.
     ReaStream {
@@ -444,6 +451,8 @@ pub enum DialogAction {
     },
     /// Persist the welcome dialog's "don't show again" choice.
     SetShowWelcome(bool),
+    /// Write the current colours to the user themes folder under this name.
+    SaveThemeNamed(String),
     /// Open the ReaStream (stream-to-OBS) settings dialog.
     OpenReaStream,
     /// Persist the ReaStream send settings and reconcile the sender.
@@ -2242,6 +2251,12 @@ struct DialogTheme {
     button_bg: Color32,
     button_hover: Color32,
     button_border: Color32,
+    /// The ground under a TYPED value — text edits and `DragValue`s, which
+    /// egui paints on `extreme_bg_color` rather than on any widget fill. It
+    /// needs its own field because a field must contrast with the theme's
+    /// TEXT, and on the light theme the button fill is too close to the
+    /// ground to read as an input box. See `apply_theme`.
+    field_bg: Color32,
 }
 
 fn theme(dark: bool) -> DialogTheme {
@@ -2252,6 +2267,9 @@ fn theme(dark: bool) -> DialogTheme {
             button_bg: Color32::from_rgb(0x1a, 0x1a, 0x1a),
             button_hover: Color32::from_rgb(0x2a, 0x2a, 0x2a),
             button_border: Color32::from_rgb(0xE8, 0xDC, 0xC0),
+            // A shade above the black ground, so a field reads as a well
+            // rather than a hole, with the ivory text bright on top of it.
+            field_bg: Color32::from_rgb(0x14, 0x14, 0x14),
         }
     } else {
         DialogTheme {
@@ -2260,6 +2278,9 @@ fn theme(dark: bool) -> DialogTheme {
             button_bg: Color32::from_rgb(0xd4, 0xc8, 0xb0),
             button_hover: Color32::from_rgb(0xc0, 0xb4, 0x9c),
             button_border: Color32::from_rgb(0x00, 0x00, 0x00),
+            // Brighter than the ivory ground: on paper, an input is the
+            // lightest thing on the page, and the black text sits on it.
+            field_bg: Color32::from_rgb(0xF7, 0xF1, 0xE4),
         }
     }
 }
@@ -2285,6 +2306,15 @@ fn apply_theme(style: &mut egui::Style, t: &DialogTheme) {
     style.visuals.selection.bg_fill = t.button_hover;
     style.visuals.selection.stroke = Stroke::new(1.0_f32, t.text);
     style.visuals.hyperlink_color = t.text;
+    // **The field a value is TYPED into, which is not a button.** egui paints
+    // text edits and `DragValue`s on `extreme_bg_color`, and nothing here set
+    // it — so every themed field inherited egui's default near-black while the
+    // theme's text stayed black: the colour picker's R/G/B boxes were legible
+    // until you clicked into one, and then they were black on black. It is one
+    // field for every typed box in every themed dialog, so it belongs here
+    // rather than at each call site.
+    style.visuals.extreme_bg_color = t.field_bg;
+    style.visuals.widgets.noninteractive.bg_fill = t.bg;
 }
 
 /// Stock egui styling for the MIDI dialogs, which Qt showed with the platform
@@ -4820,6 +4850,81 @@ pub fn show(
             )
         }
 
+        Dialog::SaveTheme {
+            name,
+            message,
+            focus,
+        } => {
+            let t = theme(dark_mode);
+            let dim = t.text.gamma_multiply(0.62);
+            show_dialog_viewport(
+                ctx,
+                placement,
+                "Save Theme As",
+                Vec2::new(430.0, 210.0),
+                Vec2::new(380.0, 180.0),
+                |ui, result| {
+                    apply_theme(ui.style_mut(), &t);
+                    ui.visuals_mut().extreme_bg_color = t.field_bg;
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
+                    let bold = |size: f32| FontId::new(size, fonts::courier_bold());
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::same(12))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new("Save the colours you are wearing as:")
+                                    .font(bold(12.0))
+                                    .color(t.text),
+                            );
+                            ui.add_space(6.0);
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(name)
+                                    .font(bold(12.0))
+                                    .text_color(t.text)
+                                    .desired_width(f32::INFINITY),
+                            );
+                            if *focus {
+                                *focus = false;
+                                focus_and_select_all(ui, &resp, name);
+                            }
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new(
+                                    "Saved in the \"user themes\" folder beside your settings. \
+                                     Themes there survive Reset Settings to Default.",
+                                )
+                                .font(bold(9.5))
+                                .color(dim),
+                            );
+                            if let Some(msg) = message.as_deref() {
+                                ui.add_space(4.0);
+                                ui.label(RichText::new(msg).font(bold(10.5)).color(t.text));
+                            }
+                            ui.add_space((ui.available_height() - 30.0).max(0.0));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let ok = !name.trim().is_empty();
+                                if ui
+                                    .add_enabled(
+                                        ok,
+                                        Button::new(RichText::new("Save").color(t.text)),
+                                    )
+                                    .clicked()
+                                {
+                                    action = Some(DialogAction::SaveThemeNamed(name.clone()));
+                                    // NOT closed here: a failed write reports
+                                    // why and keeps the name.
+                                }
+                                if ui
+                                    .add(Button::new(RichText::new("Cancel").color(t.text)))
+                                    .clicked()
+                                {
+                                    result.close = true;
+                                }
+                            });
+                        });
+                },
+            )
+        }
         Dialog::ReaStream {
             enabled,
             identifier,

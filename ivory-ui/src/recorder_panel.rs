@@ -151,6 +151,13 @@ struct Palette {
     /// happening" signal.
     accent: Color32,
     rec: Color32,
+    /// The cluster's glass: the timecode digits and the scope trace, and the
+    /// face they sit on. Theme roles — see `crate::theme`.
+    lcd: Color32,
+    lcd_face: Color32,
+    /// The six effect dials, and the master, which is its own colour.
+    fx_knob: Color32,
+    master: Color32,
 }
 
 /// The two inks the band can wear.
@@ -233,6 +240,10 @@ fn palette(s: &Settings) -> Palette {
         },
         accent: s.white_key_active_color.to_color32(),
         rec: REC_RED,
+        lcd: s.scope_draw_color.to_color32(),
+        lcd_face: s.meter_bg_color.to_color32(),
+        fx_knob: s.fx_knob_color.to_color32(),
+        master: s.master_knob_color.to_color32(),
     }
 }
 
@@ -2492,7 +2503,7 @@ fn draw_timecode_cluster(painter: &Painter, r: Rect, view: &RecorderView<'_>, p:
     if !r.is_positive() {
         return;
     }
-    painter.rect_filled(r, 2.0, LCD_FACE);
+    painter.rect_filled(r, 2.0, p.lcd_face);
     painter.rect_stroke(r, 2.0, Stroke::new(1.0_f32, p.line), egui::StrokeKind::Inside);
     // The LEFT HALF carries the whole pre-scope cluster now, STACKED: the
     // big musical position with the clock beside it on top, the viewport's
@@ -2509,7 +2520,7 @@ fn draw_timecode_cluster(painter: &Painter, r: Rect, view: &RecorderView<'_>, p:
     let big_box = slice_h(main, 0.0, 0.66);
     let size = fit_text(big_box, &big, big_box.height() * 0.62);
     if size >= MIN_TEXT {
-        painter.text(big_box.center(), Align2::CENTER_CENTER, &big, font(size), LCD_GREEN);
+        painter.text(big_box.center(), Align2::CENTER_CENTER, &big, font(size), p.lcd);
         let small_box = slice_h(main, 0.66, 1.0);
         let clock = time_text(view.position_s);
         let ssize = fit_text(small_box, &clock, small_box.height() * 0.34);
@@ -2519,7 +2530,7 @@ fn draw_timecode_cluster(painter: &Painter, r: Rect, view: &RecorderView<'_>, p:
                 Align2::CENTER_CENTER,
                 &clock,
                 font(ssize),
-                LCD_GREEN.gamma_multiply(0.55),
+                p.lcd.gamma_multiply(0.55),
             );
         }
     }
@@ -2540,7 +2551,7 @@ fn draw_timecode_cluster(painter: &Painter, r: Rect, view: &RecorderView<'_>, p:
                 Align2::LEFT_CENTER,
                 *label,
                 font(lsize),
-                LCD_GREEN.gamma_multiply(0.45),
+                p.lcd.gamma_multiply(0.45),
             );
         }
         // Start and End are POSITIONS and count from one; Length is a
@@ -2559,7 +2570,7 @@ fn draw_timecode_cluster(painter: &Painter, r: Rect, view: &RecorderView<'_>, p:
                     Align2::RIGHT_CENTER,
                     &words[part],
                     font(csize),
-                    LCD_GREEN,
+                    p.lcd,
                 );
             }
             if part < 2 {
@@ -2568,7 +2579,7 @@ fn draw_timecode_cluster(painter: &Painter, r: Rect, view: &RecorderView<'_>, p:
                     Align2::LEFT_CENTER,
                     "|",
                     font(csize.max(8.0) * 0.9),
-                    LCD_GREEN.gamma_multiply(0.4),
+                    p.lcd.gamma_multiply(0.4),
                 );
             }
         }
@@ -2578,7 +2589,7 @@ fn draw_timecode_cluster(painter: &Painter, r: Rect, view: &RecorderView<'_>, p:
     // the same black glass the timecode is behind.
     let scope_side = slice_h(r, 0.50, 0.99);
     let scope_r = slice_v(scope_side, 0.07, 0.93).shrink2(egui::vec2(2.0, 0.0));
-    view.scope.draw(painter, scope_r, &crate::scope::ScopeStyle::lcd());
+    view.scope.draw(painter, scope_r, &crate::scope::ScopeStyle::themed(p.lcd, p.lcd_face));
 }
 
 /// Start, End, Length of the arrangement's viewport — each value in three

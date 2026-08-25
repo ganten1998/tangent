@@ -87,6 +87,14 @@ impl StripView<'_> {
 }
 
 /// Everything the mixer draws, pushed in.
+/// Scale a face's channels, keeping its hue — the same trick the band's
+/// `shade` uses, so a themed strip darkens into its own colour rather than
+/// into grey.
+fn shade_face(c: Color32, k: f32) -> Color32 {
+    let f = |v: u8| (f32::from(v) * k).clamp(0.0, 255.0) as u8;
+    Color32::from_rgb(f(c.r()), f(c.g()), f(c.b()))
+}
+
 pub struct MixerView<'a> {
     /// Every channel, then the master last. Fixed, because the desk is fixed:
     /// an app whose strips appear and disappear as things are loaded is a desk
@@ -103,6 +111,9 @@ pub struct MixerView<'a> {
     /// drawn as what they are — silent, not merely unlit.
     pub any_solo: bool,
     pub dark_mode: bool,
+    /// Theme roles the desk paints with.
+    pub fx_strip: Color32,
+    pub input_chip: Color32,
     /// The band's own wood, so the two surfaces are one instrument.
     pub wood: (u8, u8, u8),
     /// A decibel figure being typed, and into which strip.
@@ -780,6 +791,8 @@ pub fn drag_travel(hit: Hit) -> Option<f32> {
 struct Ink {
     wood: Color32,
     face: Color32,
+    /// The input chip, which is its own theme role — see where it is drawn.
+    chip: Color32,
     engrave: Color32,
     faint: Color32,
     track: Color32,
@@ -804,14 +817,21 @@ fn ink(view: &MixerView<'_>) -> Ink {
     let wood = Color32::from_rgb(r, g, b);
     // The strip faces are the band's own bone, lifted a little so a rack of
     // them does not read as one slab.
+    // The strip face is a THEME role now (`fx_strip`): the insert bays are
+    // the biggest painted area on the desk, and a theme that could not reach
+    // them changed the band and left the mixer behind. Dark mode still
+    // darkens whatever the theme chose, so the two controls compose instead
+    // of one cancelling the other.
+    let themed = view.fx_strip;
     let face = if view.dark_mode {
-        Color32::from_rgb(0xC9, 0xC0, 0xA6)
+        shade_face(themed, 0.88)
     } else {
-        Color32::from_rgb(0xE3, 0xD9, 0xBD)
+        themed
     };
     Ink {
         wood,
         face,
+        chip: view.input_chip,
         engrave: Color32::from_rgb(0x24, 0x20, 0x1A),
         faint: Color32::from_rgb(0x24, 0x20, 0x1A).gamma_multiply(0.55),
         // Dark enough to read as a well rather than as a lighter panel: at
@@ -1050,7 +1070,10 @@ fn strip(
     // looks pressable on any colour a channel is painted. A channel with
     // no input yet says so; the press is how one is chosen.
     if l.input_chip.is_positive() {
-        painter.rect_filled(l.input_chip, 2.0, p.face);
+        // Its own theme role: the chip says what is PLUGGED IN, which is a
+        // different question from what the strip is made of, and themes give
+        // it a signal colour (Studio's sage lamp, Hydra's phosphor).
+        painter.rect_filled(l.input_chip, 2.0, p.chip);
         painter.rect_stroke(
             l.input_chip,
             2.0,
@@ -1775,6 +1798,8 @@ mod tests {
     fn a_view() -> MixerView<'static> {
         let channels = Strip::shown();
         MixerView {
+            fx_strip: Color32::from_rgb(0xE3, 0xD9, 0xBD),
+            input_chip: Color32::from_rgb(0xE3, 0xD9, 0xBD),
             strips: std::array::from_fn(|i| {
                 a_strip(channels.get(i).copied(), false)
             }),

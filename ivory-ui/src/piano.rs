@@ -38,13 +38,38 @@ pub fn white_keys_before(note: u8) -> Option<usize> {
     Some(2 + 7 * (note as usize / 12 - 2) + offset)
 }
 
-/// Idle fill for a key. Dark mode is scoped to the theory window and the
-/// arrange view now, by the owner's word — the piano keeps its one look.
+/// Idle fill for a key.
+///
+/// **Dark mode moves the KEYBOARD as well as the theory content.** It was
+/// scoped to the theory window for a while, which left the first view half
+/// dark: black theory text over a bone-white keyboard, one toggle that
+/// visibly did half its job. The user's own chosen colours still win — a
+/// keyboard someone painted stays painted — so the swap applies only while
+/// the two idle colours are still the shipped defaults.
 fn idle_colors(s: &Settings) -> (Color32, Color32) {
-    (
-        s.white_key_idle_color.to_color32(),
-        s.black_key_idle_color.to_color32(),
-    )
+    let white = s.white_key_idle_color.to_color32();
+    let black = s.black_key_idle_color.to_color32();
+    let defaults = white == Color32::from_rgb(0xE8, 0xDC, 0xC0)
+        && black == Color32::from_rgb(0x1a, 0x1a, 0x1a);
+    if s.dark_mode && defaults {
+        // The same ivory/near-black pair the theory panel wears, inverted in
+        // ROLE rather than in hue: the white keys become the dark surface
+        // and the black keys the darker one, so the keyboard still reads as
+        // a keyboard and still belongs to the palette above it.
+        return (
+            Color32::from_rgb(0x2a, 0x28, 0x24),
+            Color32::from_rgb(0x0a, 0x0a, 0x0a),
+        );
+    }
+    (white, black)
+}
+
+/// Whether the keyboard is still wearing the colours it shipped with — the
+/// gate for every dark-mode swap in this module, so a hand-painted keyboard
+/// is never repainted behind the user's back.
+fn idle_is_default(s: &Settings) -> bool {
+    s.white_key_idle_color.to_color32() == Color32::from_rgb(0xE8, 0xDC, 0xC0)
+        && s.black_key_idle_color.to_color32() == Color32::from_rgb(0x1a, 0x1a, 0x1a)
 }
 
 pub fn bg_color(dark_mode: bool) -> Color32 {
@@ -71,7 +96,7 @@ pub fn draw(
     let top = rect.top();
 
     // 1. Background fill (visible only through truncation slivers).
-    painter.rect_filled(rect, 0.0, bg_color(false));
+    painter.rect_filled(rect, 0.0, bg_color(s.dark_mode));
 
     let white_key_w = w / WHITE_KEYS as f64;
     let black_key_w = white_key_w * 0.7;
@@ -82,8 +107,20 @@ pub fn draw(
     let white_active = s.white_key_active_color.to_color32();
     let black_active = s.black_key_active_color.to_color32();
 
-    let separator = Color32::from_rgb(92, 63, 31);
-    let outline = Color32::from_rgb(139, 115, 85);
+    // The walnut separator and outline are drawn FOR the bone keyboard; on
+    // the dark one they are the brightest thing on screen. Darkened together
+    // so the key edges stay visible without ruling the view.
+    let (separator, outline) = if s.dark_mode && idle_is_default(s) {
+        (
+            Color32::from_rgb(46, 32, 16),
+            Color32::from_rgb(70, 58, 43),
+        )
+    } else {
+        (
+            Color32::from_rgb(92, 63, 31),
+            Color32::from_rgb(139, 115, 85),
+        )
+    };
 
     // 2. White keys, left to right (int truncation per key, like Qt fillRect).
     // Fill every white key FIRST, then draw the separators on top — otherwise each

@@ -51,6 +51,11 @@ pub enum MenuAction {
     SelectMidiInput,
     PickColor(ColorTarget),
     ToggleDarkMode,
+    /// Wear a theme, by name. Factory names win over user ones — see
+    /// `crate::theme::by_name`.
+    ApplyTheme(String),
+    /// Write the colours the app is wearing into the user themes folder.
+    SaveThemeAs,
     ToggleKeytoggle,
     ToggleNotePreference,
     ToggleKeyNoteNames,
@@ -200,6 +205,14 @@ pub enum MenuAction {
 #[derive(Clone)]
 pub struct MenuView {
     pub dark_mode: bool,
+    /// The theme now worn, so its own row can be greyed: this app has no
+    /// checkmarks (Qt parity), and a row you cannot pick because you already
+    /// have it says the same thing with the idiom that is already here.
+    pub theme_name: String,
+    /// Factory theme names, in menu order, Default first.
+    pub factory_themes: Vec<String>,
+    /// Whatever is in the user themes folder, by file name.
+    pub user_themes: Vec<String>,
     pub borderless: bool,
     pub keytoggle: bool,
     pub prefer_flats: bool,
@@ -776,6 +789,50 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
     // Spelled the American way because every label inside it already is ("Set
     // White Key Color...") and a "Colours" hover full of "Color..." items reads
     // like a bug.
+    // ── Themes ─────────────────────────────────────────────────────────────
+    //
+    // **Two levels only, so the Factory/User split is drawn with greyed
+    // headers rather than nested hovers** (`Entry::Submenu` holds items, not
+    // submenus). A disabled row is already this menu's way of saying "not
+    // available", and it turns out to be exactly the way to say "heading" as
+    // well — it cannot be clicked and it cannot be mistaken for a theme.
+    //
+    // The theme now worn is greyed for the same reason: picking what you
+    // already have is a no-op, and this app has no checkmarks.
+    {
+        let mut themes: Vec<SubItem> = Vec::new();
+        let head = |label: &str| SubItem {
+            label: label.to_owned(),
+            action: MenuAction::SaveThemeAs, // never reached; the row is dead
+            enabled: false,
+        };
+        if !view.factory_themes.is_empty() {
+            themes.push(head("- Factory -"));
+            for name in &view.factory_themes {
+                themes.push(SubItem {
+                    label: name.clone(),
+                    action: MenuAction::ApplyTheme(name.clone()),
+                    enabled: *name != view.theme_name,
+                });
+            }
+        }
+        // The User heading appears only when there is something under it: an
+        // empty heading is a promise the folder has not kept yet.
+        if !view.user_themes.is_empty() {
+            themes.push(head("- User -"));
+            for name in &view.user_themes {
+                themes.push(SubItem {
+                    label: name.clone(),
+                    action: MenuAction::ApplyTheme(name.clone()),
+                    enabled: *name != view.theme_name,
+                });
+            }
+        }
+        themes.push(head(" "));
+        themes.push(row("Save Theme As...", MenuAction::SaveThemeAs));
+        push_category(&mut everywhere, "Themes", themes);
+    }
+
     push_category(
         &mut everywhere,
         "Colors",
@@ -1836,6 +1893,11 @@ mod tests {
     fn view() -> MenuView {
         MenuView {
             dark_mode: false,
+            theme_name: "Default".to_owned(),
+            factory_themes: crate::theme::factory().into_iter().map(|t| t.name).collect(),
+            // NOT read from disk in a test: a developer's own themes folder
+            // would change what the menu tests see.
+            user_themes: Vec::new(),
             borderless: false,
             keytoggle: false,
             prefer_flats: true,
@@ -2228,7 +2290,7 @@ mod tests {
         );
         assert_eq!(
             category_names(v.clone()),
-            vec!["Window", "Colors", "Chords", "Clef", "Key", "Stave"],
+            vec!["Window", "Themes", "Colors", "Chords", "Clef", "Key", "Stave"],
             "no fretboard hovers while the fretboard is off"
         );
 
@@ -2244,7 +2306,7 @@ mod tests {
         assert_eq!(
             category_names(v.clone()),
             vec![
-                "Window", "Colors", "Chords", "Clef", "Key", "Stave", "Fretboard", "Wood",
+                "Window", "Themes", "Colors", "Chords", "Clef", "Key", "Stave", "Fretboard", "Wood",
                 "Tuning", "Capo"
             ]
         );
@@ -2408,15 +2470,25 @@ mod tests {
         // retired as unused clutter — the rule that a feature whose key
         // leaves regains its row, written down in
         // `no_menu_row_does_what_a_key_already_does`.
+        //
+        // 21: THEMES, by the owner's word — a global menu option listing the
+        // factory and user sets. It earns a top-level row rather than hiding
+        // under Colors for the reason this budget exists at all: a theme is a
+        // SUBJECT (the whole app's appearance at once), where every row under
+        // Colors is one colour. It also cannot nest under Colors even if we
+        // wanted it to — a submenu holds items, never more submenus
+        // (`Entry::Submenu`), so folding it in would flatten eight themes and
+        // eight colour pickers into one seventeen-row hover.
         assert!(
-            count(fullest()) <= 20,
+            count(fullest()) <= 21,
             "the fullest menu is back to {} top-level rows",
             count(fullest())
         );
         // The everyday menu: a piano, the notation and no guitar — plus
-        // the recorder band's returned toggle (see above).
+        // the recorder band's returned toggle, and Themes (see above), which
+        // is present in every view because appearance is not about a surface.
         assert!(
-            count(view()) <= 13,
+            count(view()) <= 14,
             "the everyday menu is {} top-level rows",
             count(view())
         );
@@ -2651,7 +2723,7 @@ mod tests {
         assert_eq!(
             category_names(v.clone()),
             vec![
-                "Window", "Colors", "Chords", "Clef", "Key", "Stave", "Fretboard", "Wood",
+                "Window", "Themes", "Colors", "Chords", "Clef", "Key", "Stave", "Fretboard", "Wood",
                 "Tuning", "Capo"
             ]
         );
@@ -2819,7 +2891,7 @@ mod tests {
             "the global cut does not lead with the Project: {cats:?}"
         );
         assert_eq!(cats.get(1).map(String::as_str), Some("Plugin folders"));
-        for wanted in ["Window", "Colors"] {
+        for wanted in ["Window", "Themes", "Colors"] {
             assert!(cats.iter().any(|c| c == wanted), "{wanted} left the global cut");
         }
         for banned in ["Chords", "Theory", "Clef", "Tuning", "Capo", "Wood"] {

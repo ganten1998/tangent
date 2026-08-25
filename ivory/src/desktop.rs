@@ -1811,6 +1811,17 @@ impl DesktopApp {
                 }
             }
             let mut note = format!("scan: {} VST3 found", report.found.len());
+            if let Some(stale) = report.retired_seen.first() {
+                // The retired plugin is CLEANUP, not a plugin — say where it
+                // is and that the installers remove it now, so the user is
+                // never left wondering why another DAW still lists it.
+                note = format!(
+                    "{note}. A retired Tangent plugin is still at {} - Tangent \
+                     no longer ships or loads it; reinstalling Tangent (or \
+                     deleting the bundle) removes it.",
+                    stale.display()
+                );
+            }
             if report.found.is_empty() && report.vst2_seen > 0 {
                 // **No false trail to a VST3 that does not exist.** This used to
                 // send people to "ReaPlugs' VST3 build in Common Files\VST3" —

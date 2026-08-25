@@ -497,6 +497,15 @@ if [ "$WANT_APP" = "1" ]; then
         echo "no 'tangent' binary next to this script" >&2
         exit 1
     fi
+    # The retired plugin: a modern tarball carries no Tangent.vst3, so any
+    # copy in the install prefix is an old installer's leftover that other
+    # DAWs will keep listing forever. Cleaned up here, loudly. A tarball
+    # that DOES carry the bundle is an old one whose --vst3 path still
+    # works, so it is left alone in that case.
+    if [ ! -d "$SELF_DIR/$NAME.vst3" ] && [ -d "$VST3_DIR/$NAME.vst3" ]; then
+        echo "  removing retired plugin $VST3_DIR/$NAME.vst3"
+        run rm -rf "$VST3_DIR/$NAME.vst3"
+    fi
     echo "  application -> $BIN_DIR/tangent"
     run mkdir -p "$BIN_DIR"
     run cp "$SELF_DIR/tangent" "$BIN_DIR/tangent"

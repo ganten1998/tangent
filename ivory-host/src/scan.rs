@@ -224,6 +224,12 @@ pub struct ScanReport {
     /// can load — but the one honest explanation for a folder somebody
     /// SWEARS has plugins in it.
     pub vst2_seen: usize,
+    /// Copies of Tangent's own RETIRED VST3 plugin (retired 2026-08-24; the
+    /// installers stopped shipping it, but nothing ever cleaned up what the
+    /// old ones planted). Never listed as loadable — a DAW hosting its own
+    /// stale plugin build is a bug farm — but remembered here so the scan
+    /// note can tell the user the leftover exists and how it goes away.
+    pub retired_seen: Vec<PathBuf>,
 }
 
 pub fn discover_reported(extra: &[PathBuf]) -> ScanReport {
@@ -286,6 +292,15 @@ pub fn discover_reported(extra: &[PathBuf]) -> ScanReport {
                 // or saved.
                 let path = dir.join(entry.file_name());
                 if is_vst3(&path) {
+                    // Tangent's own retired plugin is cleanup, not a plugin:
+                    // see `ScanReport::retired_seen`.
+                    if path
+                        .file_name()
+                        .is_some_and(|n| n.eq_ignore_ascii_case("Tangent.vst3"))
+                    {
+                        report.retired_seen.push(path);
+                        continue;
+                    }
                     // A bundle is a directory and is NOT descended into.
                     out.push(path);
                     found_here += 1;
