@@ -743,7 +743,9 @@ enum ArrDrag {
     /// The GRIDBOX being dragged: up is finer, one step a notch.
     GridStep { from_y: f32, start: i64 },
     /// The seam between headers and lanes: the pointer's x IS the width.
-    HeaderGrip,
+    /// `from_x` remembers the press, so a motionless release reads as a
+    /// CLICK — which sends the playhead home.
+    HeaderGrip { from_x: f32 },
     /// The pointer's distance from the clip's start at the press, so the
     /// clip rides under the SAME point of the hand all the way.
     Move { id: u64, dt: f64 },
@@ -9097,7 +9099,7 @@ impl IvoryApp {
         // **The resize grip lights under the hand, and the cursor says
         // what it does** — every frame, hover or drag.
         {
-            let dragging = matches!(self.arr_drag, Some(ArrDrag::HeaderGrip));
+            let dragging = matches!(self.arr_drag, Some(ArrDrag::HeaderGrip { .. }));
             let hovering = !dragging
                 && self.arr_drag.is_none()
                 && ctx
@@ -9511,9 +9513,10 @@ impl IvoryApp {
                             self.arr_drag = Some(ArrDrag::ReorderLane { from: n });
                         }
                     }
-                    // The seam: drag to resize the header column.
+                    // The seam: drag to resize the header column; a plain
+                    // CLICK is the generous back-to-the-start target.
                     Some(A::HeaderGrip) => {
-                        self.arr_drag = Some(ArrDrag::HeaderGrip);
+                        self.arr_drag = Some(ArrDrag::HeaderGrip { from_x: p.x });
                     }
                     Some(A::Mute(n)) => self.apply_mixer_hit(M::Mute(Column(n)), 0.0),
                     Some(A::Solo(n)) => self.apply_mixer_hit(M::Solo(Column(n)), 0.0),
@@ -9733,7 +9736,7 @@ impl IvoryApp {
                         self.arr_band = Some((a, p));
                     }
                 }
-                ArrDrag::HeaderGrip => {
+                ArrDrag::HeaderGrip { .. } => {
                     // The pointer's x IS the width, clamped where the
                     // layout clamps. Persisted: a column somebody sized is
                     // a decision, not a session whim.
@@ -9956,6 +9959,14 @@ impl IvoryApp {
                         id: 0,
                     });
                     self.arr_save_edits();
+                }
+            }
+            // **A motionless click on the resize strip sends the playhead
+            // HOME** — the strip doubles as the back-to-bar-one target the
+            // retired dead gutter used to be.
+            if let Some(ArrDrag::HeaderGrip { from_x }) = self.arr_drag {
+                if pointer.is_some_and(|p| (p.x - from_x).abs() < 4.0) {
+                    self.request_recorder(recorder::RecorderRequest::Locate(0.0));
                 }
             }
             // A motionless click on the gridbox: one step FINER, the right

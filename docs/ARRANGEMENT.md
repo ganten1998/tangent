@@ -827,6 +827,17 @@ channels play back their clips and nothing else. "Ready to play" and
   build that still carries it; the plugin workspace stays in-tree
   for a possible visualizer-only return).
 
+- **4.78.0 — squares, shades, and the strip alone**: the bank band's
+  page cells are SQUARES now (the band's width follows from stacking
+  eight of them; the window's floor widened to fit), the drumpad and
+  explorer's near-black shades lifted so face, pads and rows read
+  apart, and a stale slot-based note caption that doubled the key
+  names left. The arrange divider: the extra dead gutter is GONE —
+  the resize STRIP alone stands between the tracks and the window,
+  a real 7-point wood-faced strip, hover-lit, its own cursor — and a
+  motionless CLICK on it sends the playhead home, keeping the
+  generous back-to-bar-one target.
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index
