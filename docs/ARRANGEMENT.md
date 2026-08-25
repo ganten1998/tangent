@@ -965,6 +965,21 @@ channels play back their clips and nothing else. "Ready to play" and
   embeds into the exe, so the setup, the app, and the Add/Remove
   entry are one mark instead of NSIS's placeholder.
 
+- **4.84.0 — zoom the desk, and the drum moves up**: Shift+wheel now
+  ZOOMS how many channels/lanes/keys show at once — one per tick, over
+  the mixer, the arrangement's track headers, and the MIDI editor's
+  roll (the note count in that case). Plain wheel still scrolls one at
+  a time; the two gestures share the same surfaces. The counts persist
+  like the grid, clamped to a legible band, and default to eight
+  channels / eight lanes / three octaves. The DRUM TRACK now ships on
+  channel 2 instead of channel 8 — with sixteen channels there was no
+  sense stranding the kit in the middle; a pre-v17 file still migrates
+  its kit to its historical seat. The arrange track header sheds
+  controls in the owner's order when a lane is short: the insert bays
+  go first, then the input selector, and never the name. (The default
+  grid was already 1/4 in both the arrangement and the editor — no
+  change needed there.)
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index
