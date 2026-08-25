@@ -1051,6 +1051,19 @@ pub struct VideoReport {
     /// was never surfaced. Zero here with a non-zero `frames_received` is the
     /// capture path keeping up.
     pub frames_dropped_late: u64,
+    /// Frames the ENCODER could not accept in time and dropped — the machine
+    /// could not composite and encode at the take's rate.
+    ///
+    /// **This is the number the band's live "N video frames lost" counter
+    /// shows**, and it belongs in the manifest for exactly that reason: a
+    /// tester who sees the band say five and the manifest say nothing has a
+    /// contradiction to report. It is a distinct fault from the camera-side
+    /// numbers above — those are frames that never reached the encoder; this
+    /// is frames that reached it and it could not keep up.
+    pub frames_encoder_dropped: u64,
+    /// Frames REPEATED to hold constant frame rate over a gap — a freeze, not
+    /// a hole. The band names these "repeated"; the file stays complete.
+    pub frames_padded: u64,
 }
 
 impl VideoReport {
@@ -1068,6 +1081,8 @@ impl VideoReport {
             ("frames_unreadable", Json::Int(self.frames_unreadable as i64)),
             ("frames_skipped", Json::Int(self.frames_skipped as i64)),
             ("frames_dropped_late", Json::Int(self.frames_dropped_late as i64)),
+            ("frames_encoder_dropped", Json::Int(self.frames_encoder_dropped as i64)),
+            ("frames_padded", Json::Int(self.frames_padded as i64)),
         ])
     }
 }

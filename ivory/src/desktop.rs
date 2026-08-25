@@ -5532,6 +5532,11 @@ impl DesktopApp {
                             .session
                             .camera_frames_dropped_late()
                             .saturating_sub(v.cam_dropped_late_at_start),
+                        // The band's live "N video frames lost" is exactly
+                        // this — record it so the manifest cannot contradict
+                        // the counter the tester watched.
+                        frames_encoder_dropped: dropped,
+                        frames_padded: v.padded,
                     },
                     &file_name,
                 );
