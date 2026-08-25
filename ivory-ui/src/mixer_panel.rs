@@ -10,7 +10,7 @@
 //! [`Layout::targets`] is the single source of truth both are derived from. No
 //! state, no `egui::Ui`, and nothing here can open a device or read a file.
 
-use crate::recorder::{gain_text, gain_to_fader, ChannelKind, Column, Strip, INSERTS};
+use crate::recorder::{gain_text, gain_to_fader, ChannelKind, Column, Strip, CHANNELS, INSERTS};
 use egui::{Color32, FontId, Painter, Pos2, Rect, Stroke, Vec2};
 
 /// One channel, as the painter sees it.
@@ -92,6 +92,11 @@ pub struct MixerView<'a> {
     /// an app whose strips appear and disappear as things are loaded is a desk
     /// that changes shape under your hands.
     pub strips: [StripView<'a>; COLUMNS],
+    /// The first CHANNEL column shown in the scrolling region — the desk has
+    /// more channels than fit, so eight show at a time and this says which
+    /// eight. The click and the master are pinned at the right and never
+    /// scroll. Clamped by the app to `[0, CHANNELS - VISIBLE_CHANNELS]`.
+    pub scroll: usize,
     /// True when anything at all is soloed, so the strips that are not can be
     /// drawn as what they are — silent, not merely unlit.
     pub any_solo: bool,
@@ -404,6 +409,10 @@ const GAP: f32 = 6.0;
 /// all eleven, which is what makes the ticks readable everywhere.
 const MASTER_EXTRA: f32 = 0.0;
 
+/// How many channel columns the mixer shows at once; the rest scroll. The
+/// click and the master are pinned beside them and are not counted here.
+pub const VISIBLE_CHANNELS: usize = 8;
+
 impl Layout {
     pub fn new(rect: Rect, view: &MixerView<'_>) -> Self {
         let inner = Rect::from_min_max(
@@ -415,29 +424,45 @@ impl Layout {
                 strips: [StripStrip::NONE; COLUMNS],
             };
         }
-        // **Every channel one unit wide, and the count never changes.** Five
-        // instrument slots, the interface's inputs, the backing track and the
-        // master — a fixed desk, drawn the same whether or not anything is in
-        // it. A rack that grows a column when something is plugged in is a
-        // rack whose controls move under a hand.
+        // **Eight channels show; the CLICK and the MASTER are pinned right.**
+        // The desk grew past what fits, so the channel columns scroll (see
+        // `MixerView::scroll`) while the two utility strips stay put at the
+        // edge — the master is the one you always want in reach, and the
+        // click beside it. Every column is one unit wide: a desk where one
+        // strip is a different size is a desk with two kinds of strip.
         //
-        // The master is a little wider, so it reads as the end of the row
-        // rather than as another channel.
-        let gaps = (COLUMNS - 1) as f32;
-        let units = gaps + 1.0 + MASTER_EXTRA;
-        let unit = (inner.width() - GAP * gaps) / units;
-        let mut x = inner.left();
+        // Layout: [ 8 scrolling channels | GAP | click | GAP | master ].
+        let click_col = CHANNELS; // column index of the click
+        let master_col = COLUMNS - 1;
+        let visible = VISIBLE_CHANNELS.min(CHANNELS);
+        // Ten visible slots (eight channels + click + master), nine gaps.
+        let slots = (visible + 2) as f32;
+        let unit = ((inner.width() - GAP * (slots - 1.0)) / slots).max(1.0);
+        let pitch = unit + GAP;
+        // The two pinned columns, from the right edge inward.
+        let master_x = inner.right() - unit;
+        let click_x = master_x - pitch;
+        // The scrolling region ends just left of the click.
+        let region_left = inner.left();
+        let first = view.scroll.min(CHANNELS.saturating_sub(visible));
         let strips = std::array::from_fn(|i| {
             let Some(v) = view.strips.get(i) else {
                 return StripStrip::NONE;
             };
-            let w = if i == COLUMNS - 1 {
-                unit * (1.0 + MASTER_EXTRA)
+            let x = if i == master_col {
+                master_x
+            } else if i == click_col {
+                click_x
             } else {
-                unit
+                // A channel column: only the `visible` window is drawn, laid
+                // out from the region's left. Everything else is off-desk.
+                if i < first || i >= first + visible {
+                    return StripStrip::NONE;
+                }
+                region_left + (i - first) as f32 * pitch
             };
-            let panel = Rect::from_min_size(Pos2::new(x, inner.top()), Vec2::new(w, inner.height()));
-            x += w + GAP;
+            let panel =
+                Rect::from_min_size(Pos2::new(x, inner.top()), Vec2::new(unit, inner.height()));
             Self::one(panel, Some(v))
         });
         Self { strips }
@@ -1752,6 +1777,7 @@ mod tests {
                 a_strip(channels.get(i).copied(), false)
             }),
             any_solo: false,
+            scroll: 0,
             selected: None,
             typing: None,
             naming: None,
@@ -1836,9 +1862,53 @@ mod tests {
         assert!(!click.send.is_positive(), "the click was given a send");
         assert!(click.mute.is_positive() && click.solo.is_positive());
         assert!(click.fader.is_positive(), "the click has no fader");
-        // And the backing track before it is an ordinary channel.
-        let track = &l.strips[CLICK - 1];
+        // And an ordinary channel has both a send and its switches. Channel
+        // 0, not the one just left of the click: only eight channels show at
+        // once now, and the click and master are pinned past them.
+        let track = &l.strips[0];
         assert!(track.send.is_positive() && track.mute.is_positive());
+    }
+
+    /// **Eight channels show, the rest scroll, and the master is pinned
+    /// right.** The desk has more channels than fit; only a window of them is
+    /// laid out, the click and master always are, and the master sits at the
+    /// far right whatever the scroll.
+    #[test]
+    fn the_mixer_scrolls_channels_and_pins_the_master() {
+        let r = rect();
+        // At rest: channels 0..VISIBLE show, the rest are off-desk.
+        let mut v = a_view();
+        v.scroll = 0;
+        let l = Layout::new(r, &v);
+        for n in 0..VISIBLE_CHANNELS {
+            assert!(l.strips[n].panel.is_positive(), "channel {n} should show");
+        }
+        for n in VISIBLE_CHANNELS..CHANNELS {
+            assert!(!l.strips[n].panel.is_positive(), "channel {n} should be scrolled off");
+        }
+        // The click and the master are always laid out...
+        assert!(l.strips[CLICK].panel.is_positive(), "the click vanished");
+        assert!(l.strips[MASTER].panel.is_positive(), "the master vanished");
+        // ...and the master is the rightmost thing on the desk.
+        let master_x = l.strips[MASTER].panel.left();
+        for s in &l.strips {
+            if s.panel.is_positive() {
+                assert!(
+                    s.panel.left() <= master_x + 0.5,
+                    "something sits right of the pinned master"
+                );
+            }
+        }
+        // Scrolled to the end: the last channels show, the master still pins.
+        let mut v = a_view();
+        v.scroll = CHANNELS - VISIBLE_CHANNELS;
+        let l = Layout::new(r, &v);
+        assert!(l.strips[CHANNELS - 1].panel.is_positive(), "the last channel never shows");
+        assert!(!l.strips[0].panel.is_positive(), "channel 0 should be scrolled off");
+        assert!(
+            (l.strips[MASTER].panel.left() - master_x).abs() < 0.5,
+            "the master moved when the channels scrolled"
+        );
     }
 
     /// A strip with no send gives that room to its meter rather than leaving a
@@ -2020,7 +2090,6 @@ mod tests {
     /// Every instrument slot is a channel, filled or not.
     #[test]
     fn the_desk_has_a_strip_for_every_slot() {
-        use crate::recorder::CHANNELS;
         let channels = Strip::shown();
         for n in 0..CHANNELS {
             assert_eq!(channels[n], Strip::Channel(n), "channel {n} has no column");
@@ -2265,10 +2334,13 @@ mod tests {
     /// they are drawn.
     #[test]
     fn the_switch_row_is_m_s_r_on_channels_and_m_s_on_the_click() {
-        let v = a_view();
         let r = rect();
-        let l = Layout::new(r, &v);
+        // Only VISIBLE_CHANNELS show at once, so scroll each channel into the
+        // window before checking it — the desk is wider than the desk shows.
         for n in 0..crate::recorder::CHANNELS {
+            let mut v = a_view();
+            v.scroll = n.min(CHANNELS - VISIBLE_CHANNELS);
+            let l = Layout::new(r, &v);
             let s = &l.strips[n];
             assert!(s.arm.is_positive(), "channel {n} has no R switch");
             assert_eq!(
@@ -2279,6 +2351,8 @@ mod tests {
             assert_eq!(hit_test(r, &v, s.mute.center()), Some(Hit::Mute(Column(n))));
             assert_eq!(hit_test(r, &v, s.solo.center()), Some(Hit::Solo(Column(n))));
         }
+        let v = a_view();
+        let l = Layout::new(r, &v);
         assert!(
             !l.strips[CLICK].arm.is_positive(),
             "the click grew an arm switch; a metronome cannot be recorded"

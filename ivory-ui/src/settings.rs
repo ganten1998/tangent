@@ -35,7 +35,7 @@ pub struct Rgb {
 /// the migration runs ONCE against a file written before the change, and after
 /// that the same value chosen deliberately is never touched again. A file with
 /// no stamp is version 0 — every file every previous build wrote.
-const SETTINGS_VERSION: u64 = 18;
+const SETTINGS_VERSION: u64 = 19;
 
 /// Where a desk channel written before the INPUT STRIPS ended up.
 ///
@@ -274,8 +274,16 @@ fn migrate_split_desk(s: &mut Settings, desk: &mut LegacyDesk) {
     desk.names = names;
     desk.sends = sends;
     desk.inserts = inserts;
-    s.channel_kinds = kinds;
-    s.channel_gains = gains;
+    // Copied, not assigned: `kinds`/`gains` are the FROZEN v12 width
+    // (`V12_CHANNELS`), and the live fields are today's `CHANNELS`, which is
+    // wider. The extra channels keep their defaults; a later migration
+    // (`migrate_grow_channels_v19`) is what fills the gap deliberately.
+    for (dst, src) in s.channel_kinds.iter_mut().zip(kinds) {
+        *dst = src;
+    }
+    for (dst, src) in s.channel_gains.iter_mut().zip(gains) {
+        *dst = src;
+    }
 }
 
 /// v13: **the BACKING strip retires.** The arrangement's lanes carry audio
@@ -1017,6 +1025,11 @@ pub struct Settings {
     /// v17 -> v18: the pad seats moved (+36); the host renames their
     /// insert-state sidecars once. Not serialized.
     pub pad_state_shift_v18: bool,
+    /// **The channel count grew 8 -> 16**, so every seat at or above the old
+    /// channel block — drums, click, fx, master, and all 128 pad seats —
+    /// stepped up 8. The host renames their insert-state sidecars once.
+    /// Set by `adopt_desk` on an eight-channel-era desk, never serialized.
+    pub desk_state_shift_v19: bool,
 }
 
 /// Where `Settings::path()` points during tests.
@@ -1076,6 +1089,7 @@ impl Default for Settings {
             desk_state_shift_v13: false,
             desk_state_shift_v14: false,
             pad_state_shift_v18: false,
+            desk_state_shift_v19: false,
             white_key_idle_color: Rgb::new(0xE8, 0xDC, 0xC0),
             black_key_idle_color: Rgb::new(0x1a, 0x1a, 0x1a),
             white_key_active_color: Rgb::new(0x6C, 0x9B, 0xD2),
@@ -2125,7 +2139,65 @@ impl Settings {
     /// chance to move anything worth keeping — which is the whole point of
     /// [`LegacyDesk`]. A row that reaches this function and does not fit is a
     /// row the migration decided not to carry.
-    fn adopt_desk(&mut self, desk: LegacyDesk) {
+    fn adopt_desk(&mut self, mut desk: LegacyDesk) {
+        // **The sixteen-pad era → 128 pads, base 12.** A desk from before the
+        // pad rescale carries `(V12_STRIPS+1+16)*V11_INSERTS` insert seats and
+        // its pads were keys 36..51. Done on the staging at the FROZEN v18
+        // base, and FIRST — before the channel widening below moves that base.
+        if desk.inserts.len() == (V12_STRIPS + 1 + 16) * V11_INSERTS {
+            desk.inserts
+                .resize((V12_STRIPS + 1 + 128) * V11_INSERTS, String::new());
+            for pad in (0..16usize).rev() {
+                for bay in 0..V11_INSERTS {
+                    let from = (V12_STRIPS + 1 + pad) * V11_INSERTS + bay;
+                    let to = (V12_STRIPS + 1 + 36 + pad) * V11_INSERTS + bay;
+                    desk.inserts[to] = std::mem::take(&mut desk.inserts[from]);
+                }
+            }
+        }
+        // **An eight-channel-era desk, grown to today's channel count.** Its
+        // drums/click/fx/master and every pad-insert seat sit `V12_CHANNELS`
+        // slots low; fold them up by inserting the new channels at index
+        // `V12_CHANNELS`. Keyed on the sends length — `V12_STRIPS` is the
+        // era's fingerprint — so a desk already at today's width is left
+        // alone, and so is a future width (its own step will detect its own
+        // length). This is `adopt_desk`, the fold-onto-today function, so
+        // reading today's `CHANNELS` here is right where the migration rule
+        // forbids it in the frozen `migrate_*` steps.
+        if desk.sends.len() == V12_STRIPS && crate::recorder::CHANNELS > V12_CHANNELS {
+            let grow = crate::recorder::CHANNELS - V12_CHANNELS;
+            let at = V12_CHANNELS;
+            for _ in 0..grow {
+                if at <= desk.colors.len() {
+                    desk.colors.insert(at, 0);
+                }
+                if at <= desk.names.len() {
+                    desk.names.insert(at, String::new());
+                }
+                if at <= desk.sends.len() {
+                    desk.sends.insert(at, 0.0);
+                }
+            }
+            let ins_at = at * V11_INSERTS;
+            for _ in 0..(grow * V11_INSERTS) {
+                if ins_at <= desk.inserts.len() {
+                    desk.inserts.insert(ins_at, String::new());
+                }
+            }
+            // The masks live on `self`; bits at or above the insert point
+            // step up by `grow`. Bits below (the kept channels) stay.
+            let move_mask = |mask: u32| -> u32 {
+                let keep = mask & ((1u32 << at) - 1);
+                let above = mask >> at;
+                keep | (above << (at + grow))
+            };
+            self.strip_muted = move_mask(self.strip_muted);
+            self.strip_soloed = move_mask(self.strip_soloed);
+            // The host renames the seat-numbered insert-state sidecars once:
+            // drums/click/fx/master and all 128 pad seats just moved up.
+            self.desk_state_shift_v19 = true;
+        }
+
         for (i, n) in desk.colors.iter().take(crate::recorder::STRIPS + 1).enumerate() {
             self.strip_colors[i] = *n;
         }
@@ -2134,27 +2206,10 @@ impl Settings {
         }
         if !desk.inserts.is_empty() {
             self.strip_inserts = desk.inserts;
-            // A PROJECT written in the sixteen-pad era carries exactly
-            // (12+16)*3 insert seats, and its pads were keys 36..51: the
-            // same relocation the v18 settings migration makes, decided by
-            // LENGTH because a document has no settings version.
-            if self.strip_inserts.len() == (12 + 16) * 3 {
-                self.strip_inserts
-                    .resize((12 + 128) * 3, String::new());
-                for pad in (0..16usize).rev() {
-                    for bay in 0..3 {
-                        let from = (12 + pad) * 3 + bay;
-                        let to = (12 + 36 + pad) * 3 + bay;
-                        let v = std::mem::take(&mut self.strip_inserts[from]);
-                        self.strip_inserts[to] = v;
-                    }
-                }
-            }
-            self.strip_inserts
-                .truncate(
-                    (crate::recorder::STRIPS + 1 + crate::recorder::DRUM_PADS)
-                        * crate::recorder::INSERTS,
-                );
+            self.strip_inserts.truncate(
+                (crate::recorder::STRIPS + 1 + crate::recorder::DRUM_PADS)
+                    * crate::recorder::INSERTS,
+            );
         }
         if !desk.names.is_empty() {
             self.strip_names = desk.names;
@@ -3487,6 +3542,76 @@ mod tests {
         assert!(!v13.desk_state_shift_v13);
     }
 
+    /// **An eight-channel v18 desk grows to sixteen with everything intact.**
+    ///
+    /// The widening inserts eight channels at index 8, so the drum bus, the
+    /// click, the fx return, the master and every pad-insert seat step up by
+    /// eight. A file the owner was using at eight channels a minute earlier
+    /// must come back with its master still the master, its click's FX still
+    /// on the click, and a pad's insert still on that pad — not scattered
+    /// onto the new empty channels.
+    #[test]
+    fn an_eight_channel_desk_grows_to_sixteen() {
+        use crate::recorder::{pad_insert_index, Strip, CHANNELS, INSERTS, STRIPS};
+        assert!(CHANNELS >= 16, "this test is about the 8 -> 16 widening");
+        // v18 8-channel shape: STRIPS = 11 (0..7 channels, 8 drums, 9 click,
+        // 10 fx), master at 11. Pad insert base 12.
+        let mut colors = vec![0i64; 12];
+        colors[2] = 14; // a painted channel, stays put
+        colors[8] = 9; // the drum bus
+        colors[9] = 8; // the click's amber
+        colors[10] = 3; // the fx return
+        colors[11] = 5; // the master's red
+        let mut sends = vec![0.0f64; 11];
+        sends[2] = 0.4;
+        sends[10] = 0.9; // the fx return's own send
+        let mut names = vec![String::new(); 12];
+        names[8] = "DRUMS".to_owned();
+        names[11] = "OUT".to_owned();
+        // 128-pad insert space at base 12; put an effect on pad 40's bay 0.
+        let old_pad_base = 12;
+        let mut inserts = vec![String::new(); (old_pad_base + 128) * 3];
+        inserts[0] = "@tangent-dx7".to_owned();
+        inserts[8 * 3] = "/x/Bus-Comp.vst3".to_owned(); // the drum bus's FX
+        inserts[11 * 3] = "/x/Pro-L 2.vst3".to_owned(); // the master's
+        inserts[(old_pad_base + 40) * 3] = "/x/Pad-Verb.vst3".to_owned(); // pad 40
+        let json = format!(
+            r#"{{"settings_version": 18, "strip_colors_v2": {colors:?},
+                 "strip_sends": {sends:?}, "strip_inserts": {inserts:?},
+                 "strip_names": {names:?},
+                 "strip_muted": {}, "strip_soloed": {}}}"#,
+            1u32 << 9, // the click muted
+            1u32 << 2  // channel 2 soloed
+        );
+        let s = Settings::from_json(&json);
+
+        // Channel 2 (below the insert point) is untouched.
+        assert_eq!(s.strip_colors[2], 14, "a kept channel's paint moved");
+        assert_eq!(s.strip_soloed, 1 << 2, "a solo below the widening moved");
+        // The specials rode up to the 16-channel positions.
+        assert_eq!(s.strip_colors[Strip::Drums.index()], 9, "the drum bus");
+        assert_eq!(s.strip_colors[Strip::Click.index()], 8, "the click");
+        assert_eq!(s.strip_colors[Strip::Fx.index()], 3, "the fx return");
+        assert_eq!(s.strip_colors[STRIPS], 5, "the master lost its red");
+        assert_eq!(s.strip_muted, 1 << Strip::Click.index(), "the muted click drifted");
+        assert!((s.strip_sends[Strip::Fx.index()] - 0.9).abs() < 1e-9, "the fx send");
+        assert_eq!(s.strip_names[Strip::Drums.index()], "DRUMS");
+        assert_eq!(s.strip_names[STRIPS], "OUT");
+        // The new channels 8..15 are empty ground.
+        for ch in 8..CHANNELS {
+            assert_eq!(s.strip_colors[ch], 0, "new channel {ch} came up painted");
+        }
+        // The bays followed their strips, pad 40 included.
+        let bay = |strip: usize| s.strip_inserts[strip * INSERTS].as_str();
+        assert_eq!(bay(Strip::Drums.index()), "/x/Bus-Comp.vst3");
+        assert_eq!(bay(STRIPS), "/x/Pro-L 2.vst3");
+        assert_eq!(bay(pad_insert_index(40)), "/x/Pad-Verb.vst3", "pad 40's FX moved");
+        // And the host is asked to shuffle the sidecars, once.
+        assert!(s.desk_state_shift_v19, "the host was not told to shuffle v19");
+        let v19 = Settings::from_json(r#"{"settings_version": 19}"#);
+        assert!(!v19.desk_state_shift_v19, "a v19 file must not re-trigger the shift");
+    }
+
     /// **A palette is a set of indices somebody has already saved.**
     ///
     /// Growing the table from eight colours to twenty-seven renumbered every
@@ -4413,7 +4538,12 @@ mod tests {
         // 0..4. Unoccupied fill 4..8: slot1, slot3, slot4, input2; input3 is
         // the dropped ninth.
         assert_eq!(s.channel_kinds[..4], [1, 1, 2, 2], "the occupied four");
-        assert_eq!(s.channel_kinds[4..], [0, 0, 0, 0], "the unoccupied rest");
+        // The rest are unoccupied — however many channels this build has.
+        assert!(
+            s.channel_kinds[4..].iter().all(|k| *k == 0),
+            "the unoccupied rest: {:?}",
+            &s.channel_kinds[4..]
+        );
 
         // Slot 0's instrument went to bay 1, its three effects kept two.
         let bays = |ch: usize| {

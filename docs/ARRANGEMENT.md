@@ -931,6 +931,25 @@ channels play back their clips and nothing else. "Ready to play" and
   STRIP lights each page's occupied 4×4 cells brighter, so the whole
   keyboard's loaded pads read at a glance.
 
+- **4.82.0 — sixteen channels, eight in view**: the desk grew from
+  eight channels to SIXTEEN. Eight show at a time in both the mixer
+  and the arrangement; the rest scroll — no scrollbar, the wheel
+  does it. In the mixer the wheel anywhere over the desk moves the
+  channels while the CLICK and the MASTER stay pinned at the right;
+  in the arrangement the wheel over the TRACK HEADERS moves the
+  lanes while the timeline keeps its zoom. The MIDI editor's piano
+  scrolls the note range under the wheel too, no modifier. Growing
+  the count renumbered the drum bus, the click, the fx return, the
+  master and all 128 pad-insert seats — every one steps up eight —
+  so a SETTINGS v19 migration and the project desk-snapshot path
+  both lift an eight-channel desk into the sixteen-channel shape
+  (drums/click/fx/master and each pad's FX land where they belong,
+  not scattered onto the new empty channels), and the host renames
+  the seat-numbered insert-state sidecars once. The bitmask masks
+  stay u32 — sixteen is well inside their room. Pinned by a v18→v19
+  grow test that carries a pad's FX across, and by mixer/arrange
+  layout tests for the window and the pinned master.
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index

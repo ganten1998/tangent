@@ -278,6 +278,13 @@ pub struct IvoryApp {
     /// rather than on the piano would be a surprise every launch, and the view
     /// costs one key to reach.
     mixer_open: bool,
+    /// The first channel column the mixer shows — the desk scrolls now that
+    /// it has more channels than fit. The click and the master are pinned;
+    /// only the channels move. Clamped where the view is built.
+    mixer_scroll: usize,
+    /// The first lane the arrangement shows — the vertical twin of
+    /// `mixer_scroll`, moved by the wheel over the track headers.
+    arr_lane_scroll: usize,
     /// The mixer control being dragged, and where the hand started.
     mixer_grab: Option<MixerGrab>,
     /// The strip whose colour palette is open, if any.
@@ -1348,6 +1355,8 @@ impl IvoryApp {
             dbg_fret_last: None,
             dismiss_message: false,
             mixer_open: false,
+            mixer_scroll: 0,
+            arr_lane_scroll: 0,
             mixer_grab: None,
             mixer_typing: None,
             mixer_naming: None,
@@ -3021,6 +3030,10 @@ impl IvoryApp {
                 },
             }),
             any_solo: desk.any_solo(),
+            scroll: self.mixer_scroll.min(
+                crate::recorder::CHANNELS
+                    .saturating_sub(crate::mixer_panel::VISIBLE_CHANNELS),
+            ),
             selected: self.selected_channel,
             fx_menu: self.mixer_fx_menu,
             typing: self
@@ -4501,6 +4514,10 @@ impl IvoryApp {
         std::mem::take(&mut self.settings.desk_state_shift_v14)
     }
 
+    pub fn take_desk_state_shift_v19(&mut self) -> bool {
+        std::mem::take(&mut self.settings.desk_state_shift_v19)
+    }
+
     /// Which channels are armed — record-ready and LIVE — for the host to
     /// push at the engine every frame.
     pub fn armed_mask(&self) -> u32 {
@@ -4986,6 +5003,59 @@ impl IvoryApp {
                 };
                 d.muted = move_mask(d.muted);
                 d.soloed = move_mask(d.soloed);
+            }
+            // **An eight-channel-era document, grown to today's count.** The
+            // settings path does this in `adopt_desk`; a project carries its
+            // own desk snapshot and needs the same lift, or opening a session
+            // saved at eight channels scatters its drums/click/fx/master and
+            // every pad's FX onto the new empty channels. Frozen eight-channel
+            // shape: STRIPS 11, master at 11, pad-insert base 12.
+            const OLD_CH: usize = 8;
+            const OLD_STRIPS: usize = 11;
+            let ins3 = crate::recorder::INSERTS;
+            // A sixteen-pad-era doc first grows its pads to 128 at base 12 —
+            // its pads were keys 36..51 — before the channels widen the base.
+            if d.inserts.len() == (OLD_STRIPS + 1 + 16) * ins3 {
+                d.inserts.resize((OLD_STRIPS + 1 + 128) * ins3, String::new());
+                for pad in (0..16usize).rev() {
+                    for bay in 0..ins3 {
+                        let from = (OLD_STRIPS + 1 + pad) * ins3 + bay;
+                        let to = (OLD_STRIPS + 1 + 36 + pad) * ins3 + bay;
+                        d.inserts[to] = std::mem::take(&mut d.inserts[from]);
+                    }
+                }
+            }
+            if d.sends.len() == OLD_STRIPS && crate::recorder::CHANNELS > OLD_CH {
+                let grow = crate::recorder::CHANNELS - OLD_CH;
+                for _ in 0..grow {
+                    if OLD_CH <= d.colors.len() {
+                        d.colors.insert(OLD_CH, 0);
+                    }
+                    if OLD_CH <= d.names.len() {
+                        d.names.insert(OLD_CH, String::new());
+                    }
+                    if OLD_CH <= d.sends.len() {
+                        d.sends.insert(OLD_CH, 0.0);
+                    }
+                }
+                let ins_at = OLD_CH * ins3;
+                for _ in 0..(grow * ins3) {
+                    if ins_at <= d.inserts.len() {
+                        d.inserts.insert(ins_at, String::new());
+                    }
+                }
+                let grow_mask = |mask: u32| -> u32 {
+                    let keep = mask & ((1u32 << OLD_CH) - 1);
+                    let above = mask >> OLD_CH;
+                    keep | (above << (OLD_CH + grow))
+                };
+                d.muted = grow_mask(d.muted);
+                d.soloed = grow_mask(d.soloed);
+                // Not the global `desk_state_shift_v19` flag: that renames the
+                // global state dir, and a project's insert states live in its
+                // own `state/`. The desk ARRAYS relocate here so plugins load
+                // at the right seats; a moved plugin's saved knobs fall back
+                // to defaults, the same graceful cost every shuffle accepts.
             }
             d
         };
@@ -5613,7 +5683,10 @@ impl IvoryApp {
         }
         if self.settings.auto_palette && i < crate::recorder::CHANNELS {
             let choice = self.settings.palette_choice.clamp(0, 4) as usize;
-            return crate::mixer_panel::PALETTES[choice].1[i] as usize;
+            // The palette holds eight hues; with more channels than that they
+            // cycle — channel 8 wears channel 0's colour, and so on.
+            let hues = &crate::mixer_panel::PALETTES[choice].1;
+            return hues[i % hues.len()] as usize;
         }
         0
     }
@@ -8824,6 +8897,19 @@ impl IvoryApp {
                     );
                     (a, s, over_grid)
                 };
+                // **The wheel over the PIANO scrolls the note range** — the
+                // keyboard column is the pitch axis, so a plain wheel there
+                // walks `top_key` the way Cmd/Shift+wheel does anywhere else.
+                // No modifier, no scrollbar; the timeline keeps its zoom.
+                let over_keys = crate::midi_editor::Layout::new(rect).keys.contains(p);
+                if over_keys && scroll.y.abs() > 0.5 {
+                    if let Some(st) = self.midi_edit.as_mut() {
+                        let kh = rect.height().max(1.0) / crate::midi_editor::KEYS_SHOWN;
+                        st.top_key = (st.top_key + scroll.y / kh)
+                            .clamp(crate::midi_editor::KEYS_SHOWN, 128.0);
+                    }
+                    return;
+                }
                 let step = if scroll.y > 0.5 {
                     1
                 } else if scroll.y < -0.5 {
@@ -9563,6 +9649,28 @@ impl IvoryApp {
         });
         if scroll != egui::Vec2::ZERO {
             if let Some(p) = pointer.filter(|p| rect.contains(*p)) {
+                // **The wheel over the TRACK HEADERS scrolls the lanes** —
+                // the desk has more lanes than the eight that show, and the
+                // header column (occupied rows, the plus rows, the wood
+                // behind them) is the channels' section. The timeline keeps
+                // the wheel's time-zoom, the owner's ruling. No scrollbar.
+                let over_headers = {
+                    let clips = self.arr_clip_views();
+                    let view = self.arrange_view(&clips);
+                    crate::arrangement_panel::Layout::new(rect, &view)
+                        .header
+                        .contains(p)
+                };
+                if over_headers {
+                    let max = crate::recorder::CHANNELS
+                        .saturating_sub(crate::arrangement_panel::VISIBLE_LANES);
+                    if scroll.y < -0.5 {
+                        self.arr_lane_scroll = (self.arr_lane_scroll + 1).min(max);
+                    } else if scroll.y > 0.5 {
+                        self.arr_lane_scroll = self.arr_lane_scroll.saturating_sub(1);
+                    }
+                    return;
+                }
                 let (anchor, s_per_px, start, len, over_grid) = {
                     let clips = self.arr_clip_views();
                     let view = self.arrange_view(&clips);
@@ -10471,6 +10579,10 @@ impl IvoryApp {
                     peak: peaks[n],
                 }
             }),
+            lane_scroll: self.arr_lane_scroll.min(
+                crate::recorder::CHANNELS
+                    .saturating_sub(crate::arrangement_panel::VISIBLE_LANES),
+            ),
             clips,
             header_w: if self.settings.arr_header_w > 0.0 {
                 Some(self.settings.arr_header_w as f32)
@@ -15064,6 +15176,24 @@ impl IvoryApp {
                         || self.mixer_reorder.is_some())
             })
         {
+            // **The wheel scrolls the channels** when the pointer is over the
+            // mixer — the desk has more channels than the eight that show, and
+            // the click and master stay pinned. Either axis moves it: a
+            // trackpad's horizontal swipe and a mouse wheel's vertical notch
+            // both mean "the next channels".
+            if ctx.pointer_interact_pos().is_some_and(|p| rect.contains(p)) {
+                let d = ctx.input(|i| i.raw_scroll_delta.x + i.raw_scroll_delta.y);
+                if d.abs() > 0.5 {
+                    let max = crate::recorder::CHANNELS
+                        .saturating_sub(crate::mixer_panel::VISIBLE_CHANNELS);
+                    // Wheel up / swipe right reveals higher channels.
+                    if d < 0.0 {
+                        self.mixer_scroll = (self.mixer_scroll + 1).min(max);
+                    } else {
+                        self.mixer_scroll = self.mixer_scroll.saturating_sub(1);
+                    }
+                }
+            }
             // **Ctrl/Cmd+T: a new track**, here as in the arrangement.
             if self.dialog.is_none()
                 && self.mixer_typing.is_none()
@@ -17389,9 +17519,13 @@ mod tests {
         );
         // The drumpad on 7 never moved; rows 1..3 stepped down one.
         assert_eq!(app.insert(7, 0), Some(dialogs::DRUMPAD_PATH));
-        // And the host is told exactly what happened: order[new] = old.
+        // And the host is told exactly what happened: order[new] = old. The
+        // moved span is 0..3; every channel above it is carried unchanged,
+        // however many the desk has.
         let perm = app.take_desk_state_perm().expect("no perm for the host");
-        assert_eq!(perm, vec![1, 2, 3, 0, 4, 5, 6, 7]);
+        let mut want: Vec<usize> = (0..crate::recorder::CHANNELS).collect();
+        want.splice(0..4, [1, 2, 3, 0]);
+        assert_eq!(perm, want);
         assert!(app.take_desk_state_perm().is_none(), "taken twice");
         let _ = std::fs::remove_dir_all(&root);
     }

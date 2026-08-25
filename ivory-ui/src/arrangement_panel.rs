@@ -92,6 +92,10 @@ pub struct ClipView<'a> {
 /// Everything the arrangement draws, pushed in.
 pub struct ArrangeView<'a> {
     pub lanes: [LaneView<'a>; CHANNELS],
+    /// The first lane shown — the arrangement has more lanes than fit, so
+    /// eight show at a time (see `VISIBLE_LANES`) and this says which eight.
+    /// Clamped by the app to `[0, CHANNELS - VISIBLE_LANES]`.
+    pub lane_scroll: usize,
     pub clips: &'a [ClipView<'a>],
     /// The toolbar's three facts: the click, the magnet, and the grid as a
     /// power of two in bars (3 = 8 bars … 0 = 1 bar … -5 = 1/32).
@@ -209,6 +213,8 @@ const RULER_H: (f32, f32, f32) = (0.06, 16.0, 24.0);
 
 /// How wide a clip's trim edge is, in points, and its fade corner square.
 const EDGE_W: f32 = 7.0;
+/// How many lanes the arrangement shows at once; the rest scroll vertically.
+pub const VISIBLE_LANES: usize = 8;
 const FADE_W: f32 = 11.0;
 
 /// Where everything is. Fractions of the rect, derived once, read by both
@@ -326,22 +332,27 @@ impl Layout {
             Pos2::new(field_x, rect.top() + ruler_h),
             rect.max,
         );
-        let lane_h = lanes_area.height() / CHANNELS as f32;
+        // **Eight lanes show; the rest scroll.** The desk grew past what
+        // fits at a legible height, so the height is fixed to `VISIBLE_LANES`
+        // and `view.lane_scroll` chooses which window shows. A lane outside
+        // the window is `NOTHING` — not drawn, not hit, and clips on it
+        // resolve to nothing through `clip_rect`'s `is_positive` filter.
+        let visible = VISIBLE_LANES.min(CHANNELS);
+        let lane_h = lanes_area.height() / visible as f32;
+        let first = view.lane_scroll.min(CHANNELS.saturating_sub(visible));
+        let row_at = |top: f32, left: f32, right: f32, i: usize| -> Rect {
+            if i < first || i >= first + visible {
+                return Rect::NOTHING;
+            }
+            let y = top + lane_h * (i - first) as f32;
+            Rect::from_min_max(Pos2::new(left, y), Pos2::new(right, y + lane_h))
+        };
         let lane_rows = std::array::from_fn(|i| {
-            Rect::from_min_max(
-                Pos2::new(lanes_area.left(), lanes_area.top() + lane_h * i as f32),
-                Pos2::new(
-                    lanes_area.right(),
-                    lanes_area.top() + lane_h * (i + 1) as f32,
-                ),
-            )
+            row_at(lanes_area.top(), lanes_area.left(), lanes_area.right(), i)
         });
         let header_rows = std::array::from_fn(|i| {
-            let row = Rect::from_min_max(
-                Pos2::new(header.left(), header.top() + lane_h * i as f32),
-                Pos2::new(header.right(), header.top() + lane_h * (i + 1) as f32),
-            );
-            let Some(lane) = view.lanes.get(i) else {
+            let row = row_at(header.top(), header.left(), header.right(), i);
+            let Some(lane) = view.lanes.get(i).filter(|_| row.is_positive()) else {
                 return HeaderRow::NONE;
             };
             Self::header_row(row, lane.used)
@@ -1766,6 +1777,7 @@ mod tests {
             time_sel: None,
             selected_channel: None,
             lanes: std::array::from_fn(|i| a_lane(i < 3)),
+            lane_scroll: 0,
             clips,
             metronome_on: true,
             snap_on: true,
@@ -1862,6 +1874,36 @@ mod tests {
             Some(Hit::Ruler(t)) => assert!((t - 60.0).abs() < 0.2, "ruler read {t}"),
             other => panic!("the ruler answered {other:?}"),
         }
+    }
+
+    /// **Eight lanes show; the rest scroll.** With more lanes than fit, only
+    /// a window is laid out — a lane outside it is `NOTHING`, so it neither
+    /// draws nor answers a hit — and the scroll chooses the window.
+    #[test]
+    fn the_arrangement_scrolls_its_lanes() {
+        let c = clips();
+        let r = rect();
+        // At rest: lanes 0..VISIBLE show, the rest are off-desk.
+        let mut v = a_view(&c);
+        v.lane_scroll = 0;
+        let l = Layout::new(r, &v);
+        for n in 0..VISIBLE_LANES {
+            assert!(l.lane_rows[n].is_positive(), "lane {n} should show");
+        }
+        for n in VISIBLE_LANES..CHANNELS {
+            assert!(!l.lane_rows[n].is_positive(), "lane {n} should be scrolled off");
+        }
+        // Scrolled down: the last lane shows, lane 0 does not.
+        let mut v = a_view(&c);
+        v.lane_scroll = CHANNELS - VISIBLE_LANES;
+        let l = Layout::new(r, &v);
+        assert!(l.lane_rows[CHANNELS - 1].is_positive(), "the last lane never shows");
+        assert!(!l.lane_rows[0].is_positive(), "lane 0 should be scrolled off");
+        // The first visible lane sits at the top of the lane area.
+        assert!(
+            (l.lane_rows[CHANNELS - VISIBLE_LANES].top() - l.lanes_area.top()).abs() < 0.5,
+            "the scrolled window does not start at the top"
+        );
     }
 
     /// **A used lane's header offers its controls; an unused lane offers
