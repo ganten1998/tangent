@@ -273,6 +273,15 @@ pub enum Dialog {
     Welcome {
         dont_show_again: bool,
     },
+    /// Stream Tangent's master out over ReaStream to OBS/REAPER. Working copies
+    /// of the settings, applied on the checkbox and on Done.
+    ReaStream {
+        enabled: bool,
+        identifier: String,
+        host: String,
+        /// Focus the identifier field on the first frame.
+        focus: bool,
+    },
     /// Paste a supporter key. Stays open on failure so the message can explain
     /// what went wrong without the user losing what they pasted.
     SupporterKey {
@@ -435,6 +444,14 @@ pub enum DialogAction {
     },
     /// Persist the welcome dialog's "don't show again" choice.
     SetShowWelcome(bool),
+    /// Open the ReaStream (stream-to-OBS) settings dialog.
+    OpenReaStream,
+    /// Persist the ReaStream send settings and reconcile the sender.
+    SetReaStream {
+        enabled: bool,
+        identifier: String,
+        host: String,
+    },
     /// Persist the take summary's "don't show again" choice.
     SetShowTakeSummary(bool),
     /// Frames per audio callback, or `None` for the device's own default.
@@ -1845,8 +1862,8 @@ fn vst3_locations() -> &'static str {
     } else if cfg!(target_os = "windows") {
         "No VST3 instruments found. Windows keeps them in %COMMONPROGRAMFILES%\\VST3 - usually \
          C:\\Program Files\\Common Files\\VST3. A folder of .dll plug-ins is VST2, which \
-         Tangent does not host - ReaPlugs and friends ship separate VST3 installers that put \
-         .vst3 files there. Rescan from the right-click menu after installing."
+         Tangent does not host (it loads VST3 only). Rescan from the right-click menu after \
+         installing a VST3 plug-in."
     } else {
         "No VST3 instruments found. Linux keeps them in ~/.vst3 for one user and /usr/lib/vst3 for \
          everybody."
@@ -4164,6 +4181,13 @@ pub fn show(
                             ) {
                                 action = Some(DialogAction::ProjectExportOpen);
                             }
+                            if row(
+                                ui,
+                                "Stream to OBS...",
+                                "send the master out over ReaStream to OBS or REAPER",
+                            ) {
+                                action = Some(DialogAction::OpenReaStream);
+                            }
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if ui
                                     .add(Button::new(RichText::new("Done").color(t.text)))
@@ -4768,6 +4792,100 @@ pub fn show(
             )
         }
 
+        Dialog::ReaStream {
+            enabled,
+            identifier,
+            host,
+            focus,
+        } => {
+            let t = theme(dark_mode);
+            let dim = t.text.gamma_multiply(0.62);
+            show_dialog_viewport(
+                ctx,
+                placement,
+                "Stream to OBS (ReaStream)",
+                Vec2::new(470.0, 310.0),
+                Vec2::new(410.0, 270.0),
+                |ui, result| {
+                    apply_theme(ui.style_mut(), &t);
+                    ui.visuals_mut().extreme_bg_color = t.bg;
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
+                    let bold = |size: f32| FontId::new(size, fonts::courier_bold());
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::same(12))
+                        .show(ui, |ui| {
+                            let mut on = *enabled;
+                            if ui
+                                .checkbox(
+                                    &mut on,
+                                    RichText::new("Send master out over ReaStream")
+                                        .font(bold(12.0))
+                                        .color(t.text),
+                                )
+                                .changed()
+                            {
+                                *enabled = on;
+                                action = Some(DialogAction::SetReaStream {
+                                    enabled: *enabled,
+                                    identifier: identifier.clone(),
+                                    host: host.clone(),
+                                });
+                            }
+                            ui.add_space(10.0);
+                            ui.label(
+                                RichText::new("Identifier (match OBS's ReaStream)")
+                                    .font(bold(11.0))
+                                    .color(t.text),
+                            );
+                            let id_resp = ui.add(
+                                egui::TextEdit::singleline(identifier)
+                                    .font(bold(11.0))
+                                    .text_color(t.text)
+                                    .desired_width(f32::INFINITY),
+                            );
+                            if *focus {
+                                *focus = false;
+                                focus_and_select_all(ui, &id_resp, identifier);
+                            }
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new("Receiver host (127.0.0.1 for OBS on this machine)")
+                                    .font(bold(11.0))
+                                    .color(t.text),
+                            );
+                            ui.add(
+                                egui::TextEdit::singleline(host)
+                                    .font(bold(11.0))
+                                    .text_color(t.text)
+                                    .desired_width(f32::INFINITY),
+                            );
+                            ui.add_space(10.0);
+                            ui.label(
+                                RichText::new(
+                                    "In OBS add the ReaStream filter, set it to Receive, and use \
+                                     the same identifier. UDP port 58710.",
+                                )
+                                .font(bold(9.5))
+                                .color(dim),
+                            );
+                            ui.add_space((ui.available_height() - 30.0).max(0.0));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui
+                                    .add(Button::new(RichText::new("Done").color(t.text)))
+                                    .clicked()
+                                {
+                                    action = Some(DialogAction::SetReaStream {
+                                        enabled: *enabled,
+                                        identifier: identifier.clone(),
+                                        host: host.clone(),
+                                    });
+                                    result.close = true;
+                                }
+                            });
+                        });
+                },
+            )
+        }
         Dialog::SupporterKey {
             input,
             message,

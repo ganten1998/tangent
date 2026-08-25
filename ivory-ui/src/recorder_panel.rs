@@ -1396,11 +1396,16 @@ impl Hit {
         let ships_at = |g: f32| gain_to_fader(g);
         let d = crate::recorder::Gains::default();
         Some(match self {
-            // **The limiter is the exception and it is not an inconsistency.**
-            // Its knob is a threshold, so "not applied" is fully clockwise —
-            // above everything, catching nothing — where every other knob's
-            // "not applied" is fully anticlockwise.
+            // **The limiter and the LPF reset fully clockwise, and that is
+            // not an inconsistency.** The limiter's knob is a threshold, so
+            // "not applied" is above everything, catching nothing. The LPF's
+            // knob is a cutoff, so "not applied" is fully OPEN — 20 kHz,
+            // letting everything through; resetting it to zero is a filter
+            // slammed shut, which is the opposite of a reset. Both match
+            // `Sends::default()`, the shipped state of a fresh desk. Every
+            // other knob's "not applied" is fully anticlockwise.
             Hit::SetFx(Fx::Limiter, _) => Hit::SetFx(Fx::Limiter, 1.0),
+            Hit::SetFx(Fx::Lpf, _) => Hit::SetFx(Fx::Lpf, 1.0),
             Hit::SetFx(fx, _) => Hit::SetFx(fx, 0.0),
             Hit::SetTempo(_) => Hit::SetTempo(DEFAULT_BPM),
             Hit::SetMaster(_) => Hit::SetMaster(ships_at(d.master)),
@@ -4785,9 +4790,13 @@ mod tests {
     fn a_double_click_puts_every_knob_back() {
         use crate::recorder::fader_to_gain;
         for fx in Fx::ALL {
-            // The limiter's dial is a threshold: not applied is fully
-            // clockwise, where it is above everything and catches nothing.
-            let rest = if fx == Fx::Limiter { 1.0 } else { 0.0 };
+            // The limiter's dial is a threshold and the LPF's is a cutoff:
+            // for both, "not applied" is fully clockwise — the limiter above
+            // everything, the filter wide open at 20 kHz. The owner met the
+            // old behavior as "double-click slams the LPF shut": a reset
+            // that filtered everything OUT of a knob whose shipped state
+            // filters nothing.
+            let rest = if fx == Fx::Limiter || fx == Fx::Lpf { 1.0 } else { 0.0 };
             assert_eq!(
                 Hit::SetFx(fx, 0.77).reset_to(),
                 Some(Hit::SetFx(fx, rest)),

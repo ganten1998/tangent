@@ -142,6 +142,13 @@ struct Recorder {
     engine: Option<crate::instrument::Engine>,
     /// Why the output device would not open, if it would not.
     engine_error: Option<String>,
+    /// Notices the output going quiet without an error — the ASIO
+    /// dead-driver case. Reset whenever the engine is (re)made.
+    engine_watch: crate::instrument::StallWatch,
+    /// The ReaStream sender, alive while the engine is and streaming while the
+    /// setting is on. Dropped when the engine restarts so the next one hands it
+    /// a fresh tap; see `reconcile_reastream`.
+    reastream: Option<ivory_record::reastream::ReaStreamSender>,
     /// What is loaded in each insert slot, flat like `Settings::strip_inserts`.
     /// Remembered whether or not the load worked, so a plugin that refuses is
     /// asked once — `load_insert` blocks for seconds on a sampler, and a
@@ -998,6 +1005,42 @@ impl DesktopApp {
         // The buffer size, on the edge. Reopening both streams is expensive —
         // the output takes every instrument with it — so it happens when the
         // choice CHANGES and not while a take is rolling.
+        // **A dead output announces itself and comes back.** Two ways an
+        // open stream dies without anybody asking: the backend admits it
+        // (`fault`, via the error callback), or it just stops serving
+        // callbacks while claiming to run — which is what an ASIO driver
+        // unloaded beneath a live stream looks like, and what the owner met
+        // as total silence with an empty console. Either way the engine is
+        // torn down LOUDLY (the band shows `engine_error`) and the standing
+        // retry path below rebuilds it through the same close-input-first
+        // door every other reopen uses.
+        if let Some(engine) = self.recorder.engine.as_ref() {
+            let fault = engine.fault();
+            let (running, callbacks) = engine.health();
+            let stalled =
+                self.recorder
+                    .engine_watch
+                    .note(running, callbacks, std::time::Instant::now());
+            if fault.is_some() || stalled {
+                let why = match fault {
+                    Some(f) => format!("audio output failed: {f} - reopening"),
+                    None => "the audio output went quiet (device stopped serving \
+                             audio) - reopening"
+                        .to_owned(),
+                };
+                log::warn!("{why}");
+                self.recorder.engine = None;
+                self.recorder.engine_error = Some(why);
+                self.recorder.inserts_loaded = vec![
+                    None;
+                    (ivory_ui::recorder::STRIPS + 1 + ivory_ui::recorder::DRUM_PADS)
+                        * ivory_ui::recorder::INSERTS
+                ];
+                self.recorder.engine_retry =
+                    Some((std::time::Instant::now(), ENGINE_TRIES.saturating_sub(1)));
+            }
+        }
+
         // A monitor that would not open a moment ago. See `engine_retry`.
         if self.recorder.engine.is_none() && self.app.recorder_band_open() {
             if let Some((at, _)) = self.recorder.engine_retry {
@@ -1617,6 +1660,8 @@ impl DesktopApp {
         #[cfg(feature = "recorder")]
         self.take_save_panel(ctx, frame);
         self.run_project_request();
+        #[cfg(feature = "recorder")]
+        self.reconcile_reastream();
         // Scanning reads directories, so it belongs out here with the other
         // things the UI is not allowed to do — and it runs AFTER the folder
         // picker above, so a folder added this frame is in the list this frame
@@ -1636,8 +1681,13 @@ impl DesktopApp {
             }
             let mut note = format!("scan: {} VST3 found", report.found.len());
             if report.found.is_empty() && report.vst2_seen > 0 {
+                // **No false trail to a VST3 that does not exist.** This used to
+                // send people to "ReaPlugs' VST3 build in Common Files\VST3" —
+                // there is no such build. ReaPlugs (ReaStream included) ships
+                // VST2 only, and Tangent hosts VST3. Say the true thing.
                 note = format!(
-                    "scan: 0 VST3 found — {} .dll files seen are VST2, which                      Tangent does not host; ReaPlugs' VST3 build installs to                      Common Files\\VST3",
+                    "scan: 0 VST3 found. {} .dll files seen are VST2, which \
+                     Tangent does not host (it loads VST3 only).",
                     report.vst2_seen
                 );
             }
@@ -4036,6 +4086,49 @@ const PAD_WAVE_BUCKETS: usize = 240;
         self.reconcile_audio(true);
     }
 
+    /// Bring the ReaStream sender in line with the engine and the setting.
+    ///
+    /// Called every frame; nearly always a no-op. The sender is created once
+    /// per engine — the moment there is one — taking the once-only send tap even
+    /// while streaming is off, so switching it on later is a config flip and
+    /// never a re-take. `None` config idles the thread; `Some` targets it.
+    #[cfg(feature = "recorder")]
+    fn reconcile_reastream(&mut self) {
+        use ivory_record::reastream::{ReaStreamConfig, ReaStreamSender};
+        if self.recorder.engine.is_none() {
+            // No engine, nothing to stream. A sender from a past engine (its
+            // producer already gone) is dropped here.
+            self.recorder.reastream = None;
+            return;
+        }
+        let enabled = self.app.reastream_enabled();
+        let (identifier, host, port) = self.app.reastream_target();
+        let target = enabled.then(|| ReaStreamConfig {
+            identifier,
+            host,
+            port,
+        });
+        if self.recorder.reastream.is_none() {
+            let started = self.recorder.engine.as_mut().and_then(|engine| {
+                engine.take_reastream_tap().map(|rx| {
+                    let rate = engine.output().sample_rate;
+                    engine.set_reastream_on(enabled);
+                    ReaStreamSender::start(rx, rate, target.clone())
+                })
+            });
+            if let Some(sender) = started {
+                self.recorder.reastream = Some(sender);
+            }
+        } else {
+            if let Some(sender) = self.recorder.reastream.as_ref() {
+                sender.set_config(target.clone());
+            }
+            if let Some(engine) = self.recorder.engine.as_ref() {
+                engine.set_reastream_on(enabled);
+            }
+        }
+    }
+
     fn start_engine(&mut self, ctx: &egui::Context) {
         if self.recorder.engine.is_some() {
             return;
@@ -4050,6 +4143,11 @@ const PAD_WAVE_BUCKETS: usize = 240;
                 self.recorder.engine = Some(e);
                 self.recorder.engine_error = None;
                 self.recorder.engine_retry = None;
+                self.recorder.engine_watch = crate::instrument::StallWatch::new();
+                // The old sender's tap came from the engine just replaced;
+                // drop it so `reconcile_reastream` takes a fresh one from this
+                // engine. Its thread stops when the socket and consumer drop.
+                self.recorder.reastream = None;
                 // A fresh engine has nothing loaded, whatever was loaded in
                 // the one it replaces — forgetting that here is what asks the
                 // reconcile below to fill the bays again.
@@ -4471,11 +4569,21 @@ const PAD_WAVE_BUCKETS: usize = 240;
         }
         match crate::devices::audio_selection(&self.recorder.audio) {
             Some(choice) => {
+                // The engine's own device object rides along for ASIO duplex:
+                // a single-client driver's input MUST join the output's
+                // stream set, not open a second one. Ignored on every other
+                // backend. See `ivory_record::audio::open_input`.
+                let duplex_with = self
+                    .recorder
+                    .engine
+                    .as_ref()
+                    .and_then(|e| e.output_device());
                 self.recorder.session.open_input(
                     &choice.selection,
                     choice.channels,
                     self.app.buffer_frames(),
                     self.app.sample_rate(),
+                    duplex_with,
                 );
                 // **The live tap, HELD until there is an engine to play it.**
                 //
@@ -4869,6 +4977,8 @@ impl DesktopApp {
                 camera_denied,
                 engine: None,
                 engine_error: None,
+                engine_watch: crate::instrument::StallWatch::new(),
+                reastream: None,
                 pads_retry: false,
                 inserts_loaded: vec![
                     None;

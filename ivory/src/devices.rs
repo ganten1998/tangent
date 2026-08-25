@@ -414,9 +414,9 @@ pub fn audio_selection(shared: &Shared) -> Option<AudioChoice> {
             }
             drop(sel);
             use cpal::traits::{DeviceTrait, HostTrait};
-            let out_name = ivory_record::audio::host()
-                .default_output_device()
-                .and_then(|d| d.name().ok())?;
+            let out_name = ivory_record::audio::with_host(|host| {
+                host.default_output_device().and_then(|d| d.name().ok())
+            })?;
             // **The HARDWARE inside the endpoint name.** CoreAudio names a
             // duplex interface identically on both sides; WASAPI wraps it —
             // "Speakers (Scarlett 2i2 USB)" vs "Microphone (Scarlett 2i2
@@ -1137,9 +1137,9 @@ mod tests {
         // — the bare system microphone above all — stays closed.
         let out_name = {
             use cpal::traits::{DeviceTrait, HostTrait};
-            ivory_record::audio::host()
-                .default_output_device()
-                .and_then(|d| d.name().ok())
+            ivory_record::audio::with_host(|host| {
+                host.default_output_device().and_then(|d| d.name().ok())
+            })
         };
         let allowed = |choice: &Option<AudioChoice>| match choice {
             None => true,

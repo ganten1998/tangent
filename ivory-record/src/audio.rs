@@ -573,18 +573,19 @@ pub fn system() -> Option<String> {
     }
 }
 
-/// The host every device lookup in this module goes through.
+/// Build the host for the wanted system name.
 ///
 /// Falls back to the default host when the saved name names a system this
 /// build does not have — which is what a settings file written on a machine
 /// with JACK, opened on one without it, looks like. Silently, because the
 /// alternative is refusing to open any audio at all over a preference.
-pub fn host() -> cpal::Host {
-    let want = system();
+fn build_host(want: &Option<String>) -> cpal::Host {
+    #[cfg(test)]
+    HOSTS_BUILT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let Some(want) = want {
         return cpal::available_hosts()
             .into_iter()
-            .find(|id| id.name() == want)
+            .find(|id| id.name() == *want)
             .and_then(|id| cpal::host_from_id(id).ok())
             .unwrap_or_else(cpal::default_host);
     }
@@ -601,6 +602,69 @@ pub fn host() -> cpal::Host {
     // ASIO is still fully offered — as an explicit CHOICE in settings,
     // where the person picking it knows they have an interface.
     cpal::default_host()
+}
+
+/// How many times a host was actually constructed, for the cache test.
+#[cfg(test)]
+static HOSTS_BUILT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+thread_local! {
+    /// The ONE host per thread, keyed by the system name it was built for.
+    ///
+    /// **This cache is the ASIO fix, not an optimisation.** cpal builds a
+    /// fresh backend context per `Host` (`asio::Host::new` makes a fresh
+    /// `sys::Asio`), and asio-sys's one-driver-at-a-time guard lives on that
+    /// instance — while the loader underneath (the ASIO SDK's `AsioDrivers`)
+    /// is PROCESS-GLOBAL and unloads the current driver to load the next.
+    /// So a second `Host`, with its empty guard, happily asks the SDK to load
+    /// a driver for enumeration and thereby TEARS DOWN the driver the first
+    /// host's stream is playing through. That is "switch to ASIO and the app
+    /// goes silent": the output opened on one fresh host, then the input
+    /// enumeration walked every registered driver through another.
+    ///
+    /// One instance per thread ends it, verified against asio-sys 0.2.6:
+    /// through a SHARED instance, `load_driver` returns the already-loaded
+    /// driver for the same name and `Err(DriverAlreadyExists)` for any other —
+    /// it never touches the SDK loader while a driver is live. Enumeration
+    /// while a stream runs then lists exactly the live driver, and the input
+    /// opens on the same duplex device the output owns, which is the only
+    /// correct answer a single-client ASIO driver has.
+    ///
+    /// Thread-local rather than global because `cpal::Host` is not guaranteed
+    /// `Send`/`Sync` across every backend — and every real open in this app
+    /// happens on the one UI thread anyway (`cpal::Stream` is `!Send`, so the
+    /// streams already live there).
+    static HOST_CACHE: std::cell::RefCell<Option<(Option<String>, cpal::Host)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` against THE host for the chosen system — cached, never rebuilt
+/// until the system choice changes.
+///
+/// Every device lookup and stream open in the process goes through here; a
+/// fresh `cpal::Host` outside this cache is how the ASIO teardown bug happened,
+/// so none are made (see [`HOST_CACHE`]). Not re-entrant: `f` must not call
+/// `with_host` again — internal helpers take `&cpal::Host` instead.
+pub fn with_host<T>(f: impl FnOnce(&cpal::Host) -> T) -> T {
+    let want = system();
+    HOST_CACHE.with(|cache| {
+        let mut slot = cache.borrow_mut();
+        let stale = match &*slot {
+            Some((key, _)) => *key != want,
+            None => true,
+        };
+        if stale {
+            // Build BEFORE dropping the old one so a panic in construction
+            // leaves the previous host usable. Dropping the old host is safe
+            // even mid-life: no cpal backend unloads anything on Host drop —
+            // devices and streams own their driver handles (ASIO's `Driver`
+            // Arc included), so a stream opened through the old host plays on.
+            let built = build_host(&want);
+            *slot = Some((want, built));
+        }
+        let (_, host) = slot.as_ref().expect("the cache was just filled");
+        f(host)
+    })
 }
 
 /// Which device to open.
@@ -1931,7 +1995,10 @@ impl LevelTracker {
 /// appear without a restart, and cpal has no change notification to hang a cache
 /// invalidation on.
 pub fn input_devices() -> Result<Vec<InputDeviceInfo>, AudioError> {
-    let host = host();
+    with_host(input_devices_on)
+}
+
+fn input_devices_on(host: &cpal::Host) -> Result<Vec<InputDeviceInfo>, AudioError> {
     let devices = host
         .input_devices()
         .map_err(|e| AudioError::Enumeration(e.to_string()))?;
@@ -1977,7 +2044,7 @@ pub fn input_devices() -> Result<Vec<InputDeviceInfo>, AudioError> {
 /// device's own default in that case and changes nothing.
 pub fn input_rates(selection: &InputSelection) -> Vec<u32> {
     const OFFERED: [u32; 6] = [44_100, 48_000, 88_200, 96_000, 176_400, 192_000];
-    let Ok(device) = resolve(selection) else {
+    let Ok(device) = with_host(|host| resolve(host, selection)) else {
         return Vec::new();
     };
     let Ok(ranges) = device.supported_input_configs() else {
@@ -1994,8 +2061,7 @@ pub fn input_rates(selection: &InputSelection) -> Vec<u32> {
         .collect()
 }
 
-fn resolve(selection: &InputSelection) -> Result<cpal::Device, AudioError> {
-    let host = host();
+fn resolve(host: &cpal::Host, selection: &InputSelection) -> Result<cpal::Device, AudioError> {
     match selection {
         InputSelection::Default => host.default_input_device().ok_or(AudioError::NoDefaultInput),
         // The caller has already set `PIPEWIRE_NODE`; this just finds the PCM
@@ -2094,7 +2160,19 @@ pub fn open_input(
     wish: &ConfigWish,
     ring_seconds: f32,
     timebase: Timebase,
+    duplex_with: Option<&cpal::Device>,
 ) -> Result<(InputStream, CaptureSink, Option<Consumer<f32>>), AudioError> {
+    // **Under ASIO the input opens on the OUTPUT's own device object.** An
+    // ASIO driver has one buffer set, and cpal keys stream state to the
+    // `Device` object: `ASIOCreateBuffers` from a second object on the same
+    // driver destroys the buffers the running output is playing through
+    // (asio-sys documents this on `prepare_output_stream`) — the exact
+    // "switched to ASIO, everything looks alive, total silence" the owner
+    // reported. Sharing the object takes cpal's real duplex path instead:
+    // the input is ADDED to the existing stream set. The stored selection is
+    // deliberately ignored here — a single-client driver has no other
+    // device to offer.
+    let duplex = duplex_with.filter(|_| system().as_deref() == Some("ASIO"));
     // **The binding covers the LOOKUP as well as the open.** cpal's ALSA host
     // opens each device's PCM handles while enumerating, and the stream reuses
     // the handle that is already open — so a variable set after `resolve` would
@@ -2104,15 +2182,21 @@ pub fn open_input(
         _ => String::new(),
     };
     let opened = with_pipewire_node(&node, || {
-        let device = resolve(selection)?;
+        let owned = match duplex {
+            Some(_) => None,
+            None => Some(with_host(|host| resolve(host, selection))?),
+        };
+        let device = duplex.unwrap_or_else(|| owned.as_ref().expect("one of the two is Some"));
         let default_config = device.default_input_config().ok();
         let ranges: Vec<_> = device
             .supported_input_configs()
             .map_err(|e| AudioError::Enumeration(e.to_string()))?
             .collect();
-        Ok::<_, AudioError>((device, default_config, ranges))
+        Ok::<_, AudioError>((owned, default_config, ranges))
     });
-    let (device, default_config, ranges) = opened?;
+    let (owned_device, default_config, ranges) = opened?;
+    let device: &cpal::Device =
+        duplex.unwrap_or_else(|| owned_device.as_ref().expect("resolved above"));
     let device_name = match selection {
         // The NODE's name, not the PCM's. Every PipeWire input opens through a
         // PCM called `pipewire`, so reporting that would put the same name on
@@ -2196,7 +2280,7 @@ pub fn open_input(
     let fault = Arc::new(Mutex::new(None));
 
     let stream = build_typed_stream(
-        &device,
+        device,
         &stream_config,
         chosen.sample_format(),
         source,
@@ -2313,6 +2397,46 @@ mod tests {
     use cpal::{StreamInstant, SupportedBufferSize};
 
     const RATE: f64 = 48_000.0;
+
+    /// **The host is built once per system choice, not once per call.**
+    ///
+    /// This is the ASIO teardown fix in miniature: every fresh `cpal::Host`
+    /// under ASIO is a fresh driver-guard, and a fresh guard is a license to
+    /// ask the SDK's process-global loader to unload the driver a running
+    /// stream is playing through. The cache is what makes that impossible, so
+    /// the cache is what this test pins. Thread-local state, and the whole
+    /// test on one thread, so parallel tests cannot race the counter.
+    #[test]
+    fn the_host_is_cached_until_the_system_choice_changes() {
+        // Serialize against any other test that touches SYSTEM.
+        let baseline_system = system();
+        with_host(|_| ()); // whatever key is current: cached from here on
+        let start = HOSTS_BUILT.load(std::sync::atomic::Ordering::Relaxed);
+        with_host(|_| ());
+        with_host(|_| ());
+        assert_eq!(
+            HOSTS_BUILT.load(std::sync::atomic::Ordering::Relaxed),
+            start,
+            "a second and third with_host on the same system rebuilt the host \
+             - under ASIO that rebuild is the driver-teardown bug"
+        );
+        // A DIFFERENT system name (even one this build does not have - it
+        // falls back to the default host) is a new key: built once, then
+        // cached again.
+        set_system(Some("not-a-real-system-name"));
+        with_host(|_| ());
+        let after_switch = HOSTS_BUILT.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(after_switch, start + 1, "the new key should build exactly once");
+        with_host(|_| ());
+        assert_eq!(
+            HOSTS_BUILT.load(std::sync::atomic::Ordering::Relaxed),
+            after_switch,
+            "the new key should then be cached"
+        );
+        // Put the process-global choice back for whoever runs next.
+        set_system(baseline_system.as_deref());
+        with_host(|_| ());
+    }
 
     fn stats() -> Arc<CaptureStats> {
         Arc::new(CaptureStats::new())
@@ -3320,6 +3444,7 @@ mod tests {
             &ConfigWish::default(),
             DEFAULT_RING_SECONDS,
             timebase,
+            None,
         )
         .expect("a default input");
         let mut tap = ClockTap::new(DEFAULT_SETTLE_NS);
@@ -3352,7 +3477,8 @@ mod tests {
         for info in input_devices().expect("enumeration") {
             let key = DeviceKey::from_setting(&info.key.to_setting());
             assert_eq!(key, info.key);
-            resolve(&InputSelection::Key(key)).expect("a key from enumeration must resolve");
+            with_host(|host| resolve(host, &InputSelection::Key(key)))
+                .expect("a key from enumeration must resolve");
         }
     }
 }

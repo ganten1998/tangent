@@ -25,6 +25,7 @@ pub mod encode;
 pub mod graph;
 /// Spawning a child without putting a console window on somebody's screen.
 pub mod proc;
+pub mod reastream;
 pub mod smf;
 pub mod take;
 pub mod wav;

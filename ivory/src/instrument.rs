@@ -1224,6 +1224,10 @@ struct Shared {
     /// of feedback the moment somebody turns their speakers on after a relaunch
     /// they had forgotten was monitoring.
     monitor_on: AtomicBool,
+    /// Whether the master out is being streamed over ReaStream. Off by default
+    /// and read once per block: when off, the callback neither packs nor pushes
+    /// the send ring, so a rig that never streams pays nothing for the feature.
+    reastream_on: AtomicBool,
     /// Where the track starts and stops, in frames. `out` of zero means "to
     /// the end", so a clip with no trim needs no knowledge of its own length
     /// down here.
@@ -1433,6 +1437,7 @@ impl Shared {
             loop_b: AtomicU64::new(0),
             track_loaded: AtomicBool::new(false),
             monitor_on: AtomicBool::new(false),
+            reastream_on: AtomicBool::new(false),
             pending_monitor: std::sync::Mutex::new(None),
             monitor_slip: AtomicU64::new(0),
             monitor_backlog: AtomicU32::new(0),
@@ -2146,6 +2151,11 @@ struct Renderer {
     /// drops the block, which is the policy: the scope is a picture.
     scope_tx: Producer<f32>,
     scope_scratch: Vec<f32>,
+    /// The master's stereo pair onto the ReaStream send ring — the same signal
+    /// the scope reads (what leaves), pushed only while streaming is on. Its own
+    /// stride-2 scratch so the block is contiguous L,R for the sender to plane.
+    reastream_tx: Producer<f32>,
+    reastream_scratch: Vec<f32>,
     /// One block of stems, accumulated by the three mixers and pushed once.
     stem_scratch: Vec<f32>,
     /// Each PAD's own block, interleaved stereo — rendered here first so a
@@ -2841,6 +2851,11 @@ impl Renderer {
                 let scope_at = (tap_frames - 1) * TAP_CHANNELS;
                 self.scope_scratch[scope_at] = src[0];
                 self.scope_scratch[scope_at + 1] = src.get(1).copied().unwrap_or(src[0]);
+                // ReaStream sends what leaves — the scope's pair, packed
+                // contiguously so the block is L,R,L,R for the sender to plane.
+                let ra_at = (tap_frames - 1) * 2;
+                self.reastream_scratch[ra_at] = src[0];
+                self.reastream_scratch[ra_at + 1] = src.get(1).copied().unwrap_or(src[0]);
                 let at = frame_index * dev_ch;
                 map_frame(src, &mut self.frame[..dev_ch]);
                 for c in 0..dev_ch {
@@ -2885,6 +2900,13 @@ impl Renderer {
         let _ = self
             .scope_tx
             .push_entire_slice(&self.scope_scratch[..tap_frames * TAP_CHANNELS]);
+        // Only while streaming, and a full ring drops the block like the scope's
+        // does — a stalled receiver must never back up into the audio thread.
+        if self.shared.reastream_on.load(Ordering::Relaxed) {
+            let _ = self
+                .reastream_tx
+                .push_entire_slice(&self.reastream_scratch[..tap_frames * 2]);
+        }
         self.publish_meters(frames, peak_l, peak_r, sumsq_l, sumsq_r, clipped);
     }
 
@@ -4293,6 +4315,17 @@ pub struct Engine {
     // whole value of this field is its `Drop`.
     #[allow(dead_code, reason = "held so the stream lives; dropping it stops audio")]
     stream: Option<cpal::Stream>,
+    /// The device the stream above plays through — kept for ASIO duplex.
+    ///
+    /// cpal keeps ASIO stream state per `Device` OBJECT, and the driver
+    /// underneath has exactly one buffer set: `ASIOCreateBuffers` from a
+    /// SECOND `Device` on the same driver destroys the first one's buffers
+    /// (asio-sys says so in `prepare_output_stream`'s own doc). So the input
+    /// must open through THIS object, not through a lookalike from a fresh
+    /// enumeration — that lookalike is how the output went silent the moment
+    /// the input opened, with no error anywhere. Dropped after `stream` by
+    /// declaration order.
+    out_device_obj: Option<cpal::Device>,
     /// **The OFFLINE renderer, when this engine has no device at all.** An
     /// export engine: the same rings, the same racks, the same push surface
     /// — `load_insert`, `set_clips`, everything — but the render is PULLED
@@ -4329,6 +4362,9 @@ pub struct Engine {
     cap_rx: Vec<Consumer<f32>>,
     stem_rx: Consumer<f32>,
     scope_rx: Consumer<f32>,
+    /// The ReaStream send ring's read end, handed to the sender thread once per
+    /// engine when streaming is switched on. `None` after it has been taken.
+    reastream_rx: Option<Consumer<f32>>,
     /// What is in each of them, for the desk to name.
     inserts_loaded: [[Option<Loaded>; INSERTS]; RACK_SEATS],
 
@@ -4428,18 +4464,23 @@ impl Engine {
             None
         } else {
             // The system the user chose, not whatever the platform hands
-            // out. One process, one driver stack: `ivory_record::audio`
-            // owns the choice because that is where the input opens, and
-            // the two sides opening through different hosts is a
-            // configuration nobody asked for and nothing would report.
-            let host = ivory_record::audio::host();
-            let device = resolve_output(&host, out_device)?;
-            let name = device
-                .name()
-                .unwrap_or_else(|_| "unnamed output device".to_string());
-            let supported = device
-                .default_output_config()
-                .map_err(|e| format!("{name}: no default output config ({e})"))?;
+            // out. One process, ONE HOST: `ivory_record::audio` owns the
+            // instance because that is where the input opens, and the two
+            // sides going through separate host instances is exactly the
+            // ASIO teardown bug — a second instance's empty driver-guard
+            // lets the SDK unload the driver the first one is playing
+            // through. `with_host` is the shared, cached instance.
+            let (device, name, supported) =
+                ivory_record::audio::with_host(|host| -> Result<_, String> {
+                    let device = resolve_output(host, out_device)?;
+                    let name = device
+                        .name()
+                        .unwrap_or_else(|_| "unnamed output device".to_string());
+                    let supported = device
+                        .default_output_config()
+                        .map_err(|e| format!("{name}: no default output config ({e})"))?;
+                    Ok((device, name, supported))
+                })?;
             Some((device, name, supported))
         };
         let channels = dev.as_ref().map_or(2, |(_, _, c)| c.channels());
@@ -4578,6 +4619,9 @@ impl Engine {
         let (stem_tx, stem_rx) = RingBuffer::<f32>::new(rate as usize * CHANNELS * 2 * 4);
         // The scope's third of a second of stereo.
         let (scope_tx, scope_rx) = RingBuffer::<f32>::new(1 << 15);
+        // The ReaStream send ring, the same generous third of a second so the
+        // sender thread's scheduling jitter never starves or overruns it.
+        let (reastream_tx, reastream_rx) = RingBuffer::<f32>::new(1 << 15);
         let renderer = Renderer {
             shared: Arc::clone(&shared),
             timebase,
@@ -4658,12 +4702,14 @@ impl Engine {
             stem_scratch: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
             scope_tx,
             scope_scratch: vec![0.0; MAX_CALLBACK_FRAMES * TAP_CHANNELS],
+            reastream_tx,
+            reastream_scratch: vec![0.0; MAX_CALLBACK_FRAMES * 2],
             pad_out: vec![0.0; MAX_BLOCK as usize * PADS * 2],
             pad_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             stems_live: false,
         };
 
-        let (stream, offline_renderer) = match dev {
+        let (stream, out_device_obj, offline_renderer) = match dev {
             Some((device, name, supported)) => {
                 let config = cpal::StreamConfig {
                     channels,
@@ -4681,15 +4727,18 @@ impl Engine {
                 stream
                     .play()
                     .map_err(|e| format!("{name}: could not start the output stream ({e})"))?;
-                (Some(stream), None)
+                // The device outlives the stream on purpose: ASIO's input
+                // must open through this same object. See `out_device_obj`.
+                (Some(stream), Some(device), None)
             }
             // Offline: the renderer stays HERE, pulled by hand.
-            None => (None, Some(Box::new(renderer))),
+            None => (None, None, Some(Box::new(renderer))),
         };
         shared.running.store(true, Ordering::Relaxed);
 
         Ok(Self {
             stream,
+            out_device_obj,
             offline: offline_renderer,
             output: OutputInfo {
                 device: name,
@@ -4713,6 +4762,7 @@ impl Engine {
             cap_rx,
             stem_rx,
             scope_rx,
+            reastream_rx: Some(reastream_rx),
             inserts_loaded: std::array::from_fn(|_| std::array::from_fn(|_| None)),
             tap: Some(RecorderTap {
                 rx: tap_rx,
@@ -5237,6 +5287,20 @@ impl Engine {
         self.tap.take()
     }
 
+    /// Take the ReaStream send ring's read end, once per engine, to hand to the
+    /// sender thread. `None` if it has already been taken. Taking it does NOT
+    /// start the flow — [`Engine::set_reastream_on`] gates the callback's push,
+    /// so a consumer that is dropped without the flag on simply drains nothing.
+    pub fn take_reastream_tap(&mut self) -> Option<Consumer<f32>> {
+        self.reastream_rx.take()
+    }
+
+    /// Switch the master-out ReaStream push on or off. Read once per block by
+    /// the callback; off means the send ring is neither packed nor pushed.
+    pub fn set_reastream_on(&self, on: bool) {
+        self.shared.reastream_on.store(on, Ordering::Relaxed);
+    }
+
     /// Take the hardware fast lane's write end, for `midi::MidiFastLane`.
     ///
     /// Once-only, like the recorder tap: the desktop seats it in the
@@ -5308,6 +5372,18 @@ impl Engine {
     /// is true is a device that has gone quiet without saying so.
     pub fn callbacks(&self) -> u64 {
         self.shared.callbacks.load(Ordering::Relaxed)
+    }
+
+    /// One health reading for [`StallWatch`], taken under one lock discipline.
+    pub fn health(&self) -> (bool, u64) {
+        (self.is_running(), self.callbacks())
+    }
+
+    /// The device the output stream is playing through, for ASIO duplex: the
+    /// input MUST open on this same object or the driver's single buffer set
+    /// is rebuilt out from under the running output. See `out_device_obj`.
+    pub fn output_device(&self) -> Option<&cpal::Device> {
+        self.out_device_obj.as_ref()
     }
 
     /// **Measured** output latency: how far ahead of its callback the backend
@@ -5850,32 +5926,87 @@ fn gain_coefficient(rate: f64) -> f32 {
     (1.0 - (-1.0 / (rate * GAIN_TAU_SECONDS)).exp()) as f32
 }
 
-/// Find an output device by name, exactly and then loosely.
+/// Does this device actually offer a working output?
 ///
-/// cpal has no stable device identifier on any backend — `name()` is the only
-/// identity method there is (`ivory-record`'s `audio.rs` documents the dig
-/// through the backends) — so a name is what a caller can pass and a substring
-/// is what a human will type.
-fn resolve_output(host: &cpal::Host, want: Option<&str>) -> Result<cpal::Device, String> {
-    let Some(want) = want else {
-        return host
-            .default_output_device()
-            .ok_or_else(|| "this machine reports no default audio output".to_string());
-    };
-    let devices: Vec<cpal::Device> = host
-        .output_devices()
-        .map_err(|e| format!("could not enumerate audio outputs ({e})"))?
-        .collect();
-    let names: Vec<String> = devices
-        .iter()
-        .map(|d| d.name().unwrap_or_else(|_| "unnamed".to_string()))
-        .collect();
+/// **A registered driver with no hardware behind it still enumerates.** Windows
+/// carries the ASIO driver list in the registry, so a Focusrite Thunderbolt
+/// ASIO stays listed — and can even be the host's *default* — on a machine that
+/// only has the USB box plugged in. It reports no config, or zero channels.
+/// Opening the engine on it is the silent-app-under-ASIO bug the owner hit: the
+/// default resolves to the driver that sorts first, the stream builds against
+/// nothing, and it plays silence with no error to show. A device that cannot
+/// name one working config is a device this codebase must skip, not seat.
+fn output_is_live(device: &cpal::Device) -> bool {
+    device
+        .default_output_config()
+        .map(|c| c.channels() > 0)
+        .unwrap_or(false)
+}
+
+/// The index of the output whose name a caller asked for: exact first, then the
+/// loose substring a human would type. Pure, so it can be tested without a sound
+/// card — cpal has no stable device identifier on any backend, `name()` is the
+/// only identity method there is (`ivory-record`'s `audio.rs` documents the dig
+/// through the backends), so a name and a substring are all a caller has.
+fn match_output_name(names: &[String], want: &str) -> Option<usize> {
     if let Some(i) = names.iter().position(|n| n == want) {
-        return Ok(devices.into_iter().nth(i).expect("index came from names"));
+        return Some(i);
     }
     let lower = want.to_lowercase();
-    if let Some(i) = names.iter().position(|n| n.to_lowercase().contains(&lower)) {
-        return Ok(devices.into_iter().nth(i).expect("index came from names"));
+    names.iter().position(|n| n.to_lowercase().contains(&lower))
+}
+
+/// Find the output device to open.
+///
+/// With a name: exactly, then loosely. Without one: the platform default when
+/// it can actually play, and otherwise the first output that can — because the
+/// default is not to be trusted under ASIO, where it may be a hardware-less
+/// driver that sorts ahead of the real one. See [`output_is_live`].
+fn resolve_output(host: &cpal::Host, want: Option<&str>) -> Result<cpal::Device, String> {
+    let Some(want) = want else {
+        // The happy path is one call and no probing: the default plays, seat
+        // it. Only when it does NOT do we pay to enumerate — so a normal
+        // machine loads exactly the driver it always did.
+        if let Some(device) = host.default_output_device() {
+            if output_is_live(&device) {
+                return Ok(device);
+            }
+            log::warn!(
+                "default audio output {:?} reports no working config; \
+                 looking for one that does (a registered driver with no \
+                 hardware attached, most often)",
+                device.name().ok()
+            );
+        }
+        // The default is missing or dead. Take the first output that is real.
+        return host
+            .output_devices()
+            .map_err(|e| format!("could not enumerate audio outputs ({e})"))?
+            .find(output_is_live)
+            .ok_or_else(|| {
+                "no audio output on this machine reports a working config".to_string()
+            });
+    };
+    // **Names first, devices dropped as we go — never all held at once.**
+    //
+    // Under ASIO a `Device` holds its driver loaded, and the shared host's
+    // guard refuses to load any OTHER driver while one is held — so a
+    // collected `Vec<Device>` would contain only the first loadable driver
+    // and every later row (the one the user asked for, say) would silently
+    // vanish from the list. Iterating lazily loads and releases one at a
+    // time, which is the only enumeration a single-client driver world
+    // permits. Two passes, but device lists are a handful of rows.
+    let names: Vec<String> = host
+        .output_devices()
+        .map_err(|e| format!("could not enumerate audio outputs ({e})"))?
+        .map(|d| d.name().unwrap_or_else(|_| "unnamed".to_string()))
+        .collect();
+    if let Some(i) = match_output_name(&names, want) {
+        return host
+            .output_devices()
+            .map_err(|e| format!("could not enumerate audio outputs ({e})"))?
+            .nth(i)
+            .ok_or_else(|| format!("audio output {want:?} disappeared between two listings"));
     }
     Err(format!(
         "no audio output matching {want:?}; this machine has {}",
@@ -6534,9 +6665,162 @@ pub fn plugin_test(filter: Option<String>) {
     }
 }
 
+/// Notices an output that has gone quiet without saying so.
+///
+/// The callback count is the only truth the engine has about its own stream:
+/// `is_running` stays true after a device dies silently (the error callback
+/// only fires when the backend ADMITS the death, and ASIO's does not when the
+/// SDK unloads a driver out from under it), so the watchdog is "the count
+/// stopped climbing while the stream claims to run". This was the invisible
+/// half of the ASIO silence: the owner's Focusrite opened, initialized, showed
+/// every sign of life, and played nothing — with `engine_error` empty and
+/// stderr blank, because nothing read these counters. Now something does.
+///
+/// Pure — fed readings, answers "stalled?" — so it is testable without a sound
+/// card. The caller decides what recovery looks like (drop + reopen).
+#[derive(Debug, Clone, Copy)]
+pub struct StallWatch {
+    /// The last callback count seen, and when it last MOVED.
+    seen: Option<(u64, std::time::Instant)>,
+}
+
+/// How long the callback count may sit still, while the stream claims to run,
+/// before the output is declared dead.
+///
+/// Two seconds is ~180 missed callbacks at typical sizes — far past jitter,
+/// system sleep excepted (and a rebuild on wake is the right call anyway) —
+/// while short enough that "I switched to ASIO and hear nothing" becomes a
+/// message and a recovery in the time it takes to reach for the fader.
+pub const STALL_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+
+impl StallWatch {
+    pub fn new() -> Self {
+        Self { seen: None }
+    }
+
+    /// Feed one reading; `true` means the output is stalled and should be
+    /// rebuilt. `now` is a parameter so tests need not sleep.
+    pub fn note(&mut self, running: bool, callbacks: u64, now: std::time::Instant) -> bool {
+        if !running {
+            // A stream that admits it stopped is the FAULT path's business,
+            // not the watchdog's; stop measuring so a later restart begins
+            // fresh.
+            self.seen = None;
+            return false;
+        }
+        match self.seen {
+            Some((count, _)) if count != callbacks => {
+                self.seen = Some((callbacks, now));
+                false
+            }
+            Some((_, since)) => now.duration_since(since) >= STALL_AFTER,
+            None => {
+                // First reading: start the clock here. A device that never
+                // serves ONE callback is exactly the dead-driver case, and
+                // this is what catches it — the count never moves off its
+                // initial value and the clock runs out.
+                self.seen = Some((callbacks, now));
+                false
+            }
+        }
+    }
+}
+
+impl Default for StallWatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── the output stall watchdog ──────────────────────────────────────────
+
+    #[test]
+    fn a_climbing_callback_count_is_never_a_stall() {
+        let mut w = StallWatch::new();
+        let t0 = std::time::Instant::now();
+        assert!(!w.note(true, 0, t0));
+        for i in 1..100u64 {
+            assert!(
+                !w.note(true, i, t0 + STALL_AFTER * 3 * i as u32),
+                "a count that moved since last look stalled at step {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_count_that_stops_climbing_while_running_is_a_stall_after_the_grace() {
+        let mut w = StallWatch::new();
+        let t0 = std::time::Instant::now();
+        w.note(true, 41, t0);
+        w.note(true, 42, t0 + std::time::Duration::from_millis(10));
+        // Still inside the grace: quiet, but not yet declared.
+        assert!(!w.note(true, 42, t0 + std::time::Duration::from_millis(500)));
+        // Past it: dead. This is the ASIO driver unloaded under a live stream.
+        assert!(w.note(true, 42, t0 + std::time::Duration::from_millis(10) + STALL_AFTER));
+    }
+
+    #[test]
+    fn a_device_that_never_serves_one_callback_is_caught_too() {
+        // The count never moves off zero; the first reading starts the clock.
+        let mut w = StallWatch::new();
+        let t0 = std::time::Instant::now();
+        assert!(!w.note(true, 0, t0));
+        assert!(w.note(true, 0, t0 + STALL_AFTER));
+    }
+
+    #[test]
+    fn a_stream_that_admits_stopping_is_not_the_watchdogs_business() {
+        let mut w = StallWatch::new();
+        let t0 = std::time::Instant::now();
+        w.note(true, 7, t0);
+        // The fault path owns this: running=false must not read as a stall,
+        // and must reset the clock so a restart starts fresh.
+        assert!(!w.note(false, 7, t0 + STALL_AFTER * 5));
+        assert!(!w.note(true, 7, t0 + STALL_AFTER * 5 + std::time::Duration::from_millis(1)));
+    }
+
+    // ── choosing the output device by name ─────────────────────────────────
+
+    #[test]
+    fn an_output_name_matches_exactly_before_it_matches_loosely() {
+        let names = vec![
+            "Focusrite USB ASIO".to_string(),
+            "Focusrite Thunderbolt ASIO".to_string(),
+        ];
+        // An exact name takes its own row even though "Focusrite" is a
+        // substring of both — otherwise the first loose hit would win and the
+        // choice would depend on registry order.
+        assert_eq!(
+            match_output_name(&names, "Focusrite Thunderbolt ASIO"),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn an_output_name_matches_a_human_typed_substring() {
+        let names = vec![
+            "Speakers (Realtek High Definition Audio)".to_string(),
+            "Focusrite USB ASIO".to_string(),
+        ];
+        assert_eq!(match_output_name(&names, "focusrite usb"), Some(1));
+    }
+
+    #[test]
+    fn an_unmatched_output_name_selects_nothing_rather_than_the_first_row() {
+        // The killer to avoid: a name that matches nothing must NOT silently
+        // fall through to device zero. resolve_output turns a None here into a
+        // loud error naming what the machine has, not a wrong device opened
+        // without a word — see the ASIO Thunderbolt-vs-USB silence.
+        let names = vec![
+            "Focusrite Thunderbolt ASIO".to_string(),
+            "Focusrite USB ASIO".to_string(),
+        ];
+        assert_eq!(match_output_name(&names, "MOTU"), None);
+    }
 
     // ── raw MIDI to a VST3 note ────────────────────────────────────────────
 
@@ -7070,6 +7354,8 @@ mod tests {
             stem_scratch: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
             scope_tx: RingBuffer::<f32>::new(1 << 15).0,
             scope_scratch: vec![0.0; MAX_CALLBACK_FRAMES * TAP_CHANNELS],
+            reastream_tx: RingBuffer::<f32>::new(1 << 15).0,
+            reastream_scratch: vec![0.0; MAX_CALLBACK_FRAMES * 2],
             pad_out: vec![0.0; MAX_BLOCK as usize * PADS * 2],
             pad_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             stems_live: false,
