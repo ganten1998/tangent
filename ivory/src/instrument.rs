@@ -4470,7 +4470,7 @@ impl Engine {
             // ASIO teardown bug — a second instance's empty driver-guard
             // lets the SDK unload the driver the first one is playing
             // through. `with_host` is the shared, cached instance.
-            let (device, name, supported) =
+            let (device, name, supported, host_is_asio) =
                 ivory_record::audio::with_host(|host| -> Result<_, String> {
                     let device = resolve_output(host, out_device)?;
                     let name = device
@@ -4479,11 +4479,15 @@ impl Engine {
                     let supported = device
                         .default_output_config()
                         .map_err(|e| format!("{name}: no default output config ({e})"))?;
-                    Ok((device, name, supported))
+                    // The backend actually in use, not the setting: the
+                    // setting can name a system this build lacks, and the
+                    // buffer arithmetic must follow the real driver stack.
+                    let asio = host.id().name() == "ASIO";
+                    Ok((device, name, supported, asio))
                 })?;
-            Some((device, name, supported))
+            Some((device, name, supported, host_is_asio))
         };
-        let channels = dev.as_ref().map_or(2, |(_, _, c)| c.channels());
+        let channels = dev.as_ref().map_or(2, |(_, _, c, _)| c.channels());
         // **The rate is asked for, not imposed.** Setup offers only what the
         // INPUT device supports, and this is the output — a different device
         // with its own ranges — so the request is honoured when this device can
@@ -4495,7 +4499,7 @@ impl Engine {
         // warning with no fix otherwise: the writer drains the instrument's
         // ring at the input's rate while the engine fills it at the output's,
         // and the take drifts.
-        let dev = dev.map(|(device, name, supported)| {
+        let dev = dev.map(|(device, name, supported, asio)| {
             let supported = match asked_rate {
                 // Narrowed through a RANGE rather than rebuilt:
                 // `with_sample_rate` belongs to the range, and taking it
@@ -4518,20 +4522,22 @@ impl Engine {
                     .unwrap_or(supported),
                 None => supported,
             };
-            (device, name, supported)
+            (device, name, supported, asio)
         });
         let rate = dev.as_ref().map_or_else(
             || asked_rate.unwrap_or(48_000),
-            |(_, _, s)| s.sample_rate().0,
+            |(_, _, s, _)| s.sample_rate().0,
         );
         let name = dev
             .as_ref()
-            .map_or_else(|| "offline".to_owned(), |(_, n, _)| n.clone());
+            .map_or_else(|| "offline".to_owned(), |(_, n, _, _)| n.clone());
         if channels == 0 || rate == 0 {
             return Err(format!("{name} reports {channels} channels at {rate} Hz"));
         }
         let (buffer_size, buffer_frames) = match dev.as_ref() {
-            Some((_, _, supported)) => pick_buffer(supported.buffer_size(), asked_buffer),
+            Some((_, _, supported, asio)) => {
+                pick_buffer(supported.buffer_size(), asked_buffer, *asio)
+            }
             // Offline renders in MAX_BLOCK bites; the "buffer" is a label.
             None => (cpal::BufferSize::Default, None),
         };
@@ -4710,7 +4716,7 @@ impl Engine {
         };
 
         let (stream, out_device_obj, offline_renderer) = match dev {
-            Some((device, name, supported)) => {
+            Some((device, name, supported, _)) => {
                 let config = cpal::StreamConfig {
                     channels,
                     sample_rate: supported.sample_rate(),
@@ -6054,21 +6060,49 @@ const BUFFER_PERIODS: u32 = if cfg!(target_os = "linux") {
 /// A `Fixed` size outside the supported range is a build error rather than a
 /// clamp, so the range is read first. `SupportedBufferSize::Unknown` means the
 /// backend will not say, and there the only safe answer is `Default`.
+///
+/// **`asio` changes the arithmetic, and getting this wrong CRASHED the app.**
+/// `BUFFER_PERIODS` exists because WASAPI and ALSA read `Fixed(v)` as a ring
+/// to be carved into periods — but ASIO's created size IS the callback
+/// period, so multiplying there asks the driver for a 2x buffer while the
+/// INPUT side of the same driver asks for the plain size. An ASIO driver has
+/// one buffer set: when the input joined, `ASIOCreateBuffers` re-granted the
+/// smaller size, and cpal's output callback — which derives its channel count
+/// by dividing its build-time buffer by the CURRENT size — suddenly computed
+/// four channels on a stereo interface and indexed off the end of a two-entry
+/// array (`asio/stream.rs:747`, "len is 2 but the index is 2", the canary's
+/// exact panic). Under ASIO the request is therefore the plain period — the
+/// same `Some -> Fixed / None -> Default` translation the input side uses on
+/// the same setting, so the two directions request identically, the re-grant
+/// equals the original grant, and the division stays at the channel count.
 fn pick_buffer(
     supported: &cpal::SupportedBufferSize,
     asked: Option<u32>,
+    asio: bool,
 ) -> (cpal::BufferSize, Option<u32>) {
     // The user's choice first, then the dev override, then the default. The
     // env var stays ahead of the built-in so a debugging session does not have
     // to go through the settings file, and behind the SETTING so that what the
     // Audio Status panel says is what the panel was told.
-    let want = asked
-        .or_else(|| {
-            std::env::var("IVORY_OUT_BUFFER")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-        })
-        .unwrap_or(WANT_BUFFER_FRAMES);
+    let choice = asked.or_else(|| {
+        std::env::var("IVORY_OUT_BUFFER")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+    });
+    if asio {
+        return match (choice, supported) {
+            (Some(v), cpal::SupportedBufferSize::Range { min, max }) if *min <= *max => {
+                let v = v.clamp(*min, *max);
+                (cpal::BufferSize::Fixed(v), Some(v))
+            }
+            // No stated choice: the driver's own preferred size — the value
+            // in its control panel, and the one thing every ASIO driver
+            // grants without argument. The input's `Default` lands on the
+            // same number, which is the equality that matters.
+            _ => (cpal::BufferSize::Default, None),
+        };
+    }
+    let want = choice.unwrap_or(WANT_BUFFER_FRAMES);
     match supported {
         cpal::SupportedBufferSize::Range { min, max } if *min <= *max => {
             // The PERIOD is what `want` means; the ring is however many
@@ -9634,10 +9668,41 @@ mod tests {
     }
 
     #[test]
+    fn asio_asks_for_the_plain_period_and_never_multiplies() {
+        let range = |min, max| cpal::SupportedBufferSize::Range { min, max };
+        // **The exact numbers from the canary's crash.** Windows multiplies
+        // by BUFFER_PERIODS=2 for WASAPI, so the output asked ASIO for
+        // Fixed(512) while the input side asked plain — the driver re-granted
+        // 256 when the input joined, and cpal's output callback divided its
+        // 512-frame buffer by the new 256 into FOUR channels on a stereo
+        // interface: "len is 2 but the index is 2", a startup crash. Under
+        // ASIO the request must be the plain period, identical to the input
+        // side's translation of the same setting.
+        let (size, frames) = pick_buffer(&range(16, 1024), Some(256), true);
+        assert!(
+            matches!(size, cpal::BufferSize::Fixed(256)),
+            "asio asked for {size:?}; multiplying is the crash"
+        );
+        assert_eq!(frames, Some(256));
+
+        // No stated choice: Default, the driver's own preferred size — the
+        // same place the input's `None` lands, which is the equality that
+        // keeps the two directions' grants identical.
+        let (size, frames) = pick_buffer(&range(16, 1024), None, true);
+        assert!(matches!(size, cpal::BufferSize::Default));
+        assert_eq!(frames, None);
+
+        // A choice outside the device's range is clamped, not a build error.
+        let (size, frames) = pick_buffer(&range(64, 128), Some(256), true);
+        assert!(matches!(size, cpal::BufferSize::Fixed(128)));
+        assert_eq!(frames, Some(128));
+    }
+
+    #[test]
     fn a_device_that_will_not_say_what_buffer_sizes_it_takes_gets_its_own_choice() {
         // `BufferSize::Fixed` outside the supported range is a build error, not
         // a clamp, so guessing is worse than deferring.
-        let (size, frames) = pick_buffer(&cpal::SupportedBufferSize::Unknown, None);
+        let (size, frames) = pick_buffer(&cpal::SupportedBufferSize::Unknown, None, false);
         assert!(matches!(size, cpal::BufferSize::Default));
         assert_eq!(frames, None);
         // **The RING is what is asked for and the PERIOD is what is
@@ -9652,23 +9717,23 @@ mod tests {
         };
 
         // Roomy device: the ring is the wanted period times the count.
-        let (size, frames) = pick_buffer(&range(16, 8192), Some(256));
+        let (size, frames) = pick_buffer(&range(16, 8192), Some(256), false);
         assert_eq!(ring_of(size), 256 * BUFFER_PERIODS);
         assert_eq!(frames, Some(256), "the period is not what was asked for");
 
         // Clamped up to the minimum, and the period follows the ring.
-        let (size, frames) = pick_buffer(&range(4096, 8192), Some(256));
+        let (size, frames) = pick_buffer(&range(4096, 8192), Some(256), false);
         assert_eq!(ring_of(size), 4096);
         assert_eq!(frames, Some(4096 / BUFFER_PERIODS));
 
         // And down to the maximum.
-        let (size, frames) = pick_buffer(&range(16, 64), Some(256));
+        let (size, frames) = pick_buffer(&range(16, 64), Some(256), false);
         assert_eq!(ring_of(size), 64);
         assert_eq!(frames, Some(64 / BUFFER_PERIODS));
 
         // A period is never reported as zero, whatever the device says: it is
         // divided into and displayed.
-        let (_, frames) = pick_buffer(&range(1, 2), Some(1));
+        let (_, frames) = pick_buffer(&range(1, 2), Some(1), false);
         assert!(frames.is_some_and(|f| f >= 1));
     }
 

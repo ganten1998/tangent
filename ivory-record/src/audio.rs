@@ -2245,7 +2245,25 @@ pub fn open_input(
     };
     #[cfg(not(target_os = "macos"))]
     let buffer_size = match wish.buffer_frames {
-        Some(frames) => BufferSize::Fixed(frames),
+        Some(frames) => {
+            // Under ASIO the request must land inside the driver's range —
+            // `Fixed` outside it is a build error, and a failed duplex open
+            // falls back in a way that re-grants the driver's ONE buffer set
+            // at a different size than the running output was built for,
+            // which is the "len is 2 but the index is 2" startup crash. The
+            // clamp mirrors `pick_buffer`'s ASIO arm exactly, so the two
+            // directions of the same setting always ask the same number.
+            let clamped = match (
+                system().as_deref() == Some("ASIO"),
+                chosen.buffer_size(),
+            ) {
+                (true, cpal::SupportedBufferSize::Range { min, max }) if *min <= *max => {
+                    frames.clamp(*min, *max)
+                }
+                _ => frames,
+            };
+            BufferSize::Fixed(clamped)
+        }
         None => BufferSize::Default,
     };
     let stream_config = StreamConfig {
