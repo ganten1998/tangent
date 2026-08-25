@@ -1,0 +1,16 @@
+# **Static CRT on Windows — the app carries its own runtime.**
+#
+# The x86_64-pc-windows-msvc target links the C runtime DYNAMICALLY by
+# default, so `tangent.exe` needs VCRUNTIME140.dll / msvcp140.dll from a
+# VC++ 2015-2022 redistributable that a clean Windows install does NOT have.
+# Most machines carry it via some other software, so testers with dev tools
+# or games never hit it — but a fresh Windows 11 box shows
+# "VCRUNTIME140.dll was not found" and the app never launches. Every
+# cross-built release to date had this latent dependency.
+#
+# `+crt-static` links the runtime INTO the exe: no redist, no app-local
+# DLLs, no installer step. cargo-xwin ships both the static and dynamic CRT
+# import libs, so the link finds `libcmt` without extra setup. Scoped to the
+# Windows target alone — macOS and Linux link as before.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
