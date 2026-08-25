@@ -31,3 +31,4 @@ build/*
 # under a directory ignored for a completely unrelated reason.
 !build/macos/
 /vendor/
+.claude/

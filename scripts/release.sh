@@ -177,6 +177,10 @@ for a in "${ARTIFACTS[@]}"; do
       ;;
     *linux*)
       printf '%s\n' "$list" | grep -Eq '/tangent$'             || note "$a: NO BINARY (the pre-2.1.0 empty-tarball bug)"
+      # The 4.92.0 tarball shipped without either of these while its own
+      # README told the user to run install.sh. Named parts, not vibes.
+      printf '%s\n' "$list" | grep -Eq '/install\.sh$'         || note "$a: no install.sh (README's first instruction)"
+      printf '%s\n' "$list" | grep -Eq '/tangent-ffmpeg$'      || note "$a: no bundled encoder (video takes break on clean machines)"
       ;;
   esac
 done

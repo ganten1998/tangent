@@ -1138,6 +1138,39 @@ channels play back their clips and nothing else. "Ready to play" and
   settings cog in audio section"): a STREAM row beside PROJECT and
   PLUGINS that reads out on/off and opens the dialog.
 
+- **4.93.0 — the ultra sweep, and the tarball keeps its promises**: the
+  owner ran the cloud multi-agent review over the 4.82-4.92 diff; 49
+  findings confirmed, verified, and fixed (3 candidates refuted and left
+  alone), ~30 new regression tests riding along. The ones a person would
+  have actually met: the FIRST EDIT of every session was un-undoable
+  (launch reopen never seeded the undo baseline — data loss, the
+  critical); arrow keys in the MIDI editor also TRANSPOSED THE
+  INSTRUMENT, persistently; double-click note delete could never fire
+  (checked at the press, delivered at the release); dismissing a popup
+  clicked THROUGH into the mixer or arrangement; Z (fit clip) also
+  toggled fullscreen; a camera stall over 2 s permanently desynced A/V
+  for the rest of the take; a clip at capacity dropped a note FOREVER
+  instead of parking it across the block; ordinal input picks could
+  record the WRONG INPUT against explicit bindings; the reprobe reopened
+  the microphone with the band closed; seven DX7 algorithms (10, 12, 18,
+  20, 21, 28, 30) had mistranscribed feedback routing and sounded wrong;
+  voice stealing judged loudness by OP1 alone and leaked sounding
+  voices; the reverb rebuilt heap buffers ON THE AUDIO THREAD; the v17
+  drumpad migration was clobbered on upgrade; partial WAV appends
+  desynced the write cursor; Bass (5)/(6)/(7) voicings got guitar
+  fingerings; and a supporter-key install() reported success when the
+  persist failed. Full sweep in the session log; suite 1,235+.
+  SECOND: the Linux tarball keeps its promises now. The native path — the
+  recommended one — shipped 4.92.0 without `install.sh` (its own
+  README's first instruction) and without the bundled encoder; a
+  tester's literal first step failed on a file that was not there.
+  build-linux-native.sh stages both (vendor cache, fetch fallback,
+  SKIP_FFMPEG escape for source builds), build-linux-remote.sh pushes
+  the checksum-pinned encoder cache to the build host and verifies the
+  result, release.sh refuses a linux artifact missing either piece, and
+  build-installer.sh's linux branch drops the retired-VST3 assertions
+  that made it exit 1 against correct artifacts forever.
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index
