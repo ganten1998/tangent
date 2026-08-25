@@ -621,6 +621,7 @@ impl Audio {
         tap_home: mpsc::Sender<Box<crate::instrument::RecorderTap>>,
         buffer_frames: Option<u32>,
         sample_rate: Option<u32>,
+        duplex_with: Option<&cpal::Device>,
     ) -> Result<Self, String> {
         // The user's buffer choice, or the device's own. Both streams get the
         // same one: they are two halves of one path, and a round-trip figure
@@ -640,8 +641,8 @@ impl Audio {
         // absurd headroom — and that is the point: the one thing that must
         // never happen is the ring filling because the machine hiccuped while
         // somebody was recording a take they cannot play again.
-        let (stream, sink, monitor) =
-            audio::open_input(selection, &wish, 3.0, timebase).map_err(|e| e.to_string())?;
+        let (stream, sink, monitor) = audio::open_input(selection, &wish, 3.0, timebase, duplex_with)
+            .map_err(|e| e.to_string())?;
         let config = stream.config().clone();
         let channels = config.channels as usize;
         // Read off the SINK, which knows what the device actually honoured —
@@ -1251,6 +1252,7 @@ impl Session {
         picks: audio::Picks,
         buffer_frames: Option<u32>,
         sample_rate: Option<u32>,
+        duplex_with: Option<&cpal::Device>,
     ) {
         if self.state.is_active() {
             return; // never swap the device out from under a running take
@@ -1279,6 +1281,7 @@ impl Session {
             self.tap_tx.clone(),
             buffer_frames,
             sample_rate,
+            duplex_with,
         )
         .or_else(|e| {
             if matches!(selection, InputSelection::Default) {
@@ -1291,6 +1294,7 @@ impl Session {
                 self.tap_tx.clone(),
                 buffer_frames,
                 sample_rate,
+                duplex_with,
             )
             .map(|a| {
                 fallback_note = Some(format!("{e} - using the default input instead"));
@@ -2319,7 +2323,13 @@ pub fn record_test(seconds: Option<String>) {
     let timebase = Timebase::new();
     let tap = Arc::new(RawMidiTap::new(60_000));
     let mut session = Session::new(Arc::clone(&tap), timebase);
-    session.open_input(&InputSelection::Default, audio::Picks::EVERYTHING, None, None);
+    session.open_input(
+        &InputSelection::Default,
+        audio::Picks::EVERYTHING,
+        None,
+        None,
+        None,
+    );
     match (session.audio_device_name(), session.audio_error()) {
         (Some(name), _) => println!("\nopen: {name}"),
         (None, Some(e)) => {

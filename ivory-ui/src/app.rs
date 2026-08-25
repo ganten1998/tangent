@@ -11149,6 +11149,22 @@ impl IvoryApp {
         self.settings.audio_system().map(str::to_owned)
     }
 
+    /// Whether the master out is being streamed over ReaStream.
+    pub fn reastream_enabled(&self) -> bool {
+        self.settings.reastream_enabled
+    }
+
+    /// The ReaStream identifier, host, and port, for the sender to target.
+    /// Kept as primitives so the desktop builds the record-crate config and no
+    /// new dependency crosses into the UI.
+    pub fn reastream_target(&self) -> (String, String, u16) {
+        (
+            self.settings.reastream_identifier.clone(),
+            self.settings.reastream_host.clone(),
+            self.settings.reastream_port.clamp(1, 65_535) as u16,
+        )
+    }
+
     /// Whether the live input is being monitored. Never persisted; see the
     /// field.
     pub fn input_monitor(&self) -> bool {
@@ -13335,6 +13351,30 @@ impl IvoryApp {
             }
             DialogAction::SetShowWelcome(show) => {
                 self.settings.show_welcome = show;
+                self.save_settings();
+            }
+            DialogAction::OpenReaStream => {
+                self.dialog = Some(dialogs::Dialog::ReaStream {
+                    enabled: self.settings.reastream_enabled,
+                    identifier: self.settings.reastream_identifier.clone(),
+                    host: self.settings.reastream_host.clone(),
+                    focus: true,
+                });
+            }
+            DialogAction::SetReaStream {
+                enabled,
+                identifier,
+                host,
+            } => {
+                // Blank fields fall back to the working defaults rather than
+                // stream to nowhere with an empty name or host.
+                self.settings.reastream_enabled = enabled;
+                let id = identifier.trim();
+                self.settings.reastream_identifier =
+                    if id.is_empty() { "default".to_owned() } else { id.to_owned() };
+                let host = host.trim();
+                self.settings.reastream_host =
+                    if host.is_empty() { "127.0.0.1".to_owned() } else { host.to_owned() };
                 self.save_settings();
             }
             DialogAction::LoadPlugin { path } => {

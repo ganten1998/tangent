@@ -1050,6 +1050,45 @@ channels play back their clips and nothing else. "Ready to play" and
   on macOS and Windows alike. The save panel now takes the same one
   extra frame the file pickers take (`arm_panel`) and lets the menu
   window go first. Both save panels, both platforms.
+- **4.90.0 — ReaStream to OBS, and ASIO stops dying silently**: two
+  things. FIRST: Project menu grew "Stream to OBS..." — a native
+  ReaStream SENDER (the wire protocol Cockos's plug-in speaks: UDP
+  58710, `MRSR` packets, float32 non-interleaved, 32-byte identifier),
+  so OBS running the genuine ReaStream VST2 in Receive picks up
+  Tangent's master out over localhost. Tangent hosts VST3 and
+  ReaStream ships VST2-only, so Tangent speaks the PROTOCOL instead of
+  loading the plug-in; the receiver stays the real thing. Byte layout
+  pinned against two reference implementations, plus a live UDP
+  loopback test through the real sender thread. The master pair is
+  tapped where the scope reads (what leaves), pushed to a lock-free
+  ring only while streaming — the audio thread never touches a socket.
+  SECOND, the ASIO silence, root-caused to two stacked teardowns and
+  both killed: (1) every device lookup built a FRESH `cpal::Host`, and
+  a fresh ASIO host's empty driver-guard lets the SDK's process-global
+  loader unload the driver a running stream is playing through — so
+  input enumeration tore down the live output. One cached host per
+  system now (`with_host`), verified against asio-sys 0.2.6: through a
+  shared instance the guard returns the live driver for its own name
+  and refuses all others, so enumeration while running lists exactly
+  the live driver and can tear down nothing. (2) an ASIO driver has
+  ONE buffer set and cpal keys stream state to the `Device` OBJECT:
+  opening the input through a second object destroys the running
+  output's buffers (`ASIOCreateBuffers`, per asio-sys's own doc) with
+  no error anywhere. The input now opens on the ENGINE'S OWN device
+  object under ASIO — cpal's real duplex path, input ADDED to the
+  output's stream set. And because silence must never be silent again:
+  a watchdog (`StallWatch`) declares an output whose callback count
+  stops climbing while it claims to run, surfaces it in the band, and
+  reopens through the standing retry path — the fault channel is read
+  now too. `resolve_output` also refuses a dead default device (a
+  registered driver with no hardware) and finds one that actually
+  plays. Windows ASIO validation on the canary box follows this ship.
+  Also: the plugin-scan and picker notes stop citing "ReaPlugs' VST3
+  build" — no such build exists; ReaPlugs is VST2-only, and the notes
+  now say the true thing. And double-clicking the band's LPF knob now
+  rests it fully OPEN (20 kHz), like the limiter and for the same
+  reason — its knob is a cutoff, so "not applied" is fully clockwise;
+  the old reset slammed the filter shut, the opposite of a reset.
 
 ## Order of work
 

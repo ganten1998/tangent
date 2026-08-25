@@ -493,6 +493,14 @@ pub struct Settings {
     pub recorder_bg_color: Rgb,
     /// Show the welcome/support note at startup. Cleared by its own checkbox.
     pub show_welcome: bool,
+    /// Stream the master out over ReaStream (to OBS/REAPER on the network).
+    pub reastream_enabled: bool,
+    /// The ReaStream identifier both ends match on. Default "default".
+    pub reastream_identifier: String,
+    /// The receiver's host. "127.0.0.1" for OBS on the same machine.
+    pub reastream_host: String,
+    /// The receiver's UDP port. 58710 is ReaStream's default.
+    pub reastream_port: i64,
     /// Supporter decoration: the pixel heart on the chord view.
     pub show_heart: bool,
     /// Index into chord_strip::HEART_COLORS. Wraps, so any stored value is safe.
@@ -1133,6 +1141,10 @@ impl Default for Settings {
                 b: 0xC0,
             },
             show_welcome: true,
+            reastream_enabled: false,
+            reastream_identifier: "default".to_owned(),
+            reastream_host: "127.0.0.1".to_owned(),
+            reastream_port: 58710,
             show_heart: true,
             heart_color: 0,
             detached_chord_width: None,
@@ -1610,6 +1622,26 @@ impl Settings {
         if let Some(v) = map.shift_remove("show_welcome") {
             if let Some(b) = v.as_bool() {
                 s.show_welcome = b;
+            }
+        }
+        if let Some(v) = map.shift_remove("reastream_enabled") {
+            if let Some(b) = v.as_bool() {
+                s.reastream_enabled = b;
+            }
+        }
+        if let Some(v) = map.shift_remove("reastream_identifier") {
+            if let Some(t) = v.as_str() {
+                s.reastream_identifier = t.to_owned();
+            }
+        }
+        if let Some(v) = map.shift_remove("reastream_host") {
+            if let Some(t) = v.as_str() {
+                s.reastream_host = t.to_owned();
+            }
+        }
+        if let Some(v) = map.shift_remove("reastream_port") {
+            if let Some(n) = v.as_i64() {
+                s.reastream_port = n;
             }
         }
         if let Some(v) = map.shift_remove("show_take_summary") {
@@ -2562,6 +2594,22 @@ impl Settings {
         );
         map.insert("show_welcome".into(), Value::Bool(self.show_welcome));
         map.insert(
+            "reastream_enabled".into(),
+            Value::Bool(self.reastream_enabled),
+        );
+        map.insert(
+            "reastream_identifier".into(),
+            Value::String(self.reastream_identifier.clone()),
+        );
+        map.insert(
+            "reastream_host".into(),
+            Value::String(self.reastream_host.clone()),
+        );
+        map.insert(
+            "reastream_port".into(),
+            Value::from(self.reastream_port),
+        );
+        map.insert(
             "show_take_summary".into(),
             Value::Bool(self.show_take_summary),
         );
@@ -3340,6 +3388,30 @@ mod tests {
     /// which the owner asked for four times and never once received. A file
     /// written before the stamp gets those defaults; a stamped file is left
     /// alone for ever after.
+    #[test]
+    fn the_reastream_send_settings_survive_a_save_and_load() {
+        let mut s = Settings::default();
+        // The defaults: off, the standard identifier, localhost, the ReaStream
+        // port. An OBS-on-this-machine setup needs no edit but the enable.
+        assert!(!s.reastream_enabled);
+        assert_eq!(s.reastream_identifier, "default");
+        assert_eq!(s.reastream_host, "127.0.0.1");
+        assert_eq!(s.reastream_port, 58710);
+
+        s.reastream_enabled = true;
+        s.reastream_identifier = "stage-left".to_owned();
+        s.reastream_host = "192.168.0.42".to_owned();
+        s.reastream_port = 60000;
+        let back = Settings::from_json(&s.to_json());
+        assert!(back.reastream_enabled);
+        assert_eq!(back.reastream_identifier, "stage-left");
+        assert_eq!(back.reastream_host, "192.168.0.42");
+        assert_eq!(back.reastream_port, 60000);
+
+        // A file that predates the feature comes up not streaming, not on.
+        assert!(!Settings::from_json("{}").reastream_enabled);
+    }
+
     #[test]
     fn an_unstamped_file_gets_the_defaults_it_never_had_a_chance_to_see() {
         let now = Settings::default();
