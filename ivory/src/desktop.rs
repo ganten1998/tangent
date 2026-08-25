@@ -3575,10 +3575,44 @@ impl DesktopApp {
                 // The scratch rule: an Untitled nobody SAVED is reclaimed,
                 // so New lands on "Untitled" instead of minting a pile.
                 let dir = ivory_ui::app::fresh_project_dir(&root);
+                // **Are we throwing away the session that is open right now?**
+                // `fresh_project_dir` reclaims the current unsaved Untitled,
+                // so New usually lands on the very folder on the desk.
+                let discarding_current = self
+                    .app
+                    .project_doc()
+                    .and_then(std::path::Path::parent)
+                    .map(|p| p == dir)
+                    .unwrap_or(false);
+                // **A clean slate.** Reclaiming a folder must not keep the
+                // last scratch's clips, drumpad, media or plugin state — the
+                // template only overwrites the files it HAS, so `drumpad.json`
+                // and `state/` survived a bare copy and New inherited them.
+                if dir.exists() {
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
                 if copy_dir_all(&template, &dir).is_err() {
                     return;
                 }
-                self.switch_project(&dir.join("project.tangent"));
+                let doc = dir.join("project.tangent");
+                if discarding_current {
+                    // **Do NOT save the session being discarded back over the
+                    // fresh template.** `switch_project` persists the current
+                    // doc first — into this same folder — which re-wrote the
+                    // very clips (and re-shelved the plugin states) New had
+                    // just cleared. Straight open, no save-back.
+                    self.app.open_project(&doc);
+                    if self.app.take_desk_reload() {
+                        self.copy_states_from_project();
+                        self.force_insert_reload();
+                    }
+                    self.track_cache.clear();
+                    self.pad_cache.clear();
+                    self.reload_clips();
+                    self.reload_pads();
+                } else {
+                    self.switch_project(&doc);
+                }
             }
         }
     }

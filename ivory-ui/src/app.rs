@@ -7332,6 +7332,16 @@ impl IvoryApp {
         (key < recorder::DRUM_PADS).then_some(key)
     }
 
+    /// The panel SLOT (0..16) the open pad menu sits on, or `None` when its
+    /// pad is on another page. `pad_menu` stores a KEY (0..128); the layout
+    /// speaks slots, and indexing a 16-slot array with a key up to 127 is
+    /// what crashed the right-click ("len is 16 but the index is 40").
+    fn pad_menu_slot(&self) -> Option<usize> {
+        let key = self.pad_menu?;
+        let base = crate::drumpad_panel::page_base(self.drumpad_page());
+        key.checked_sub(base).filter(|s| *s < recorder::DRUM_PAGE)
+    }
+
     fn drumpad_view(&self) -> crate::drumpad_panel::DrumpadView<'_> {
         let base = crate::drumpad_panel::page_base(self.drumpad_page());
         let pads = std::array::from_fn(|i| {
@@ -7378,6 +7388,16 @@ impl IvoryApp {
                 self.drumpad_peaks.get(base + i).copied().unwrap_or(0.0)
             }),
             page: self.drumpad_page(),
+            loaded_keys: {
+                // One bit per loaded key, for the bank strip's occupancy.
+                let mut bits = 0u128;
+                for (k, p) in self.drumpad.pads.iter().enumerate() {
+                    if k < 128 && !p.path.is_empty() {
+                        bits |= 1u128 << k;
+                    }
+                }
+                bits
+            },
             selected: self.drumpad_sel.saturating_sub(base).min(recorder::DRUM_PAGE - 1),
             down: self
                 .drumpad_down
@@ -7815,7 +7835,15 @@ impl IvoryApp {
 
         // ── the pad MENU, while it hangs: name, trimmer, obey ────────────
         if let Some(pad) = self.pad_menu {
-            let menu = crate::drumpad_panel::Layout::new(rect).pads[pad.min(recorder::DRUM_PADS - 1)];
+            // `pad` is a KEY (indexes `drumpad.pads`); the layout is
+            // slot-indexed. Off the current page the menu has no rect — close
+            // it rather than crash ("len is 16 but the index is 40").
+            let Some(slot) = self.pad_menu_slot() else {
+                self.pad_menu = None;
+                self.pad_name_typing = None;
+                return;
+            };
+            let menu = crate::drumpad_panel::Layout::new(rect).pads[slot];
             let menu = pad_menu_rect(menu, rect);
             let wave = pad_menu_wave(menu);
             // The NAME being typed owns the keys.
@@ -8426,9 +8454,14 @@ impl IvoryApp {
         let Some(pad) = self.pad_menu else {
             return;
         };
-        let pad = pad.min(recorder::DRUM_PADS - 1);
+        // `pad` is a KEY (indexes the status/params below); the anchor rect
+        // is slot-indexed, and off the current page there is none to draw.
         let l = crate::drumpad_panel::Layout::new(panel);
-        let Some(anchor) = l.pads.get(pad).copied().filter(|r| r.is_positive()) else {
+        let Some(anchor) = self
+            .pad_menu_slot()
+            .and_then(|slot| l.pads.get(slot).copied())
+            .filter(|r| r.is_positive())
+        else {
             return;
         };
         let menu = pad_menu_rect(anchor, panel);
