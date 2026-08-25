@@ -105,9 +105,14 @@ use linux as backend;
 #[cfg(target_os = "linux")]
 pub mod vaapi;
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(target_os = "windows")]
+mod windows;
+#[cfg(target_os = "windows")]
+use windows as backend;
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 mod stub;
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 use stub as backend;
 
 /// Bytes per pixel in both BGRA and RGBA. Named because a bare `4` in a stride

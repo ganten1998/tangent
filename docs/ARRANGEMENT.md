@@ -1013,6 +1013,22 @@ channels play back their clips and nothing else. "Ready to play" and
   ran out and stealing chopped ringing notes. A repeat reuses the
   held voice now, one per pitch, the way a real damper behaves.
 
+- **4.87.0 — the camera works on Windows**: Windows had only a
+  camera STUB; now it captures, through the bundled `tangent-ffmpeg`'s
+  DirectShow input. `camera/windows.rs` enumerates devices from
+  `ffmpeg -list_devices` (the stable `@device_pnp_…` alternative name
+  is the UID, the friendly name is display), reads each device's modes
+  from `-list_options`, and on open spawns one ffmpeg that decodes the
+  chosen mode to rgba on stdout while a reader thread stamps and
+  publishes each frame to the shared slot — the same delivery contract
+  the Linux and macOS backends use, with no new native COM code and
+  nothing extra to cross-compile. It honours the mjpeg/raw split a
+  webcam forces (720p is mjpeg-only; raw yuyv422 caps at 480p), so a
+  request for an mjpeg-only size passes `-vcodec mjpeg` rather than
+  letting dshow fall back to a lower raw mode. The picker's Windows
+  "no camera" text now points at the privacy setting instead of
+  saying the feature does not exist.
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index
