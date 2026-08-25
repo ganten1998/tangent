@@ -4901,6 +4901,9 @@ impl DesktopApp {
         if me.app.take_pad_state_shift_v18() {
             shift_insert_states_for_v18();
         }
+        if me.app.take_desk_state_shift_v19() {
+            shift_insert_states_for_v19();
+        }
         me
     }
 }
@@ -4938,6 +4941,24 @@ fn shift_insert_states_for_v18() {
             let from = insert_state_path(12 + pad, bay);
             if from.exists() {
                 let _ = std::fs::rename(&from, insert_state_path(12 + 36 + pad, bay));
+            }
+        }
+    }
+}
+
+/// v18 -> v19: the channel count grew 8 -> 16, so every seat at or above the
+/// old channel block stepped up by 8 — the drum bus 8 -> 16, the click 9 ->
+/// 17, the fx return 10 -> 18, the master 11 -> 19, and the 128 pad seats
+/// 12.. -> 20... Highest first, or the move eats itself; numbers frozen as
+/// literals per the historical-migration rule. The upper bound covers the
+/// old master (11) and all 128 pads (12..139).
+#[cfg(feature = "recorder")]
+fn shift_insert_states_for_v19() {
+    for bay in 0..3 {
+        for old in (8..(12 + 128)).rev() {
+            let from = insert_state_path(old, bay);
+            if from.exists() {
+                let _ = std::fs::rename(&from, insert_state_path(old + 8, bay));
             }
         }
     }

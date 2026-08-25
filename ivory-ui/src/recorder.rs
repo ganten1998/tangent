@@ -474,7 +474,7 @@ impl ChannelKind {
 /// shape: an app whose strips appear and disappear is a desk that changes
 /// shape under your hands, so an unused channel is drawn as a plus rather
 /// than not drawn.
-pub const CHANNELS: usize = 8;
+pub const CHANNELS: usize = 16;
 
 /// How many effect inserts a channel has room for.
 ///
