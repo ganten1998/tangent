@@ -34,6 +34,17 @@ const DEBOUNCE_100MS: Duration = Duration::from_millis(100);
 /// Long enough that a drag is one write, short enough that a kill -9 a second
 /// later still keeps the new position.
 const GEOMETRY_SAVE_DELAY: Duration = Duration::from_millis(700);
+/// How long a keytoggle SELECTION click is guaranteed to sound.
+///
+/// Selecting a note is a click, and a click is short — shorter than any
+/// note anybody meant to hear. On the DX7 that never showed, because its
+/// patches carry their own release tails; a sampled piano damps on the
+/// note-off, so the audition became a clipped tick the moment a real
+/// piano was loaded. The off is WITHHELD until this much time has passed
+/// since the press (a hold longer than this releases normally), and only
+/// the SOUND waits: the note leaves `sounding` with the gesture, so the
+/// display — and the neck's solver — never see a note the hand let go of.
+const SELECTION_RING: Duration = Duration::from_millis(1500);
 /// How much of a restored window must be on-screen before it counts as visible.
 /// A window peeking a few pixels onto the desktop is not reachable in practice.
 const OFFSCREEN_SLACK: f32 = 40.0;
@@ -642,6 +653,14 @@ pub struct IvoryApp {
     /// chord again, from the top, which on a decaying instrument is the whole
     /// point of pressing it twice.
     restrike: bool,
+    /// Notes whose note-off may not leave before the stored deadline — the
+    /// keytoggle selection clicks. Written at the press; consulted when
+    /// `reconcile_sound` is about to send the off. See [`SELECTION_RING`].
+    ring: std::collections::BTreeMap<u8, Instant>,
+    /// Withheld note-offs, waiting for their deadline. `ring_tick` fires
+    /// them. A note re-struck while in here is cancelled — its NEW gesture
+    /// owns the off now.
+    ringing: std::collections::BTreeMap<u8, Instant>,
     /// Whether the audition key was down last frame, so a hold is one note-on
     /// rather than one per frame. Key auto-repeat retriggered the chord dozens
     /// of times a second before this.
@@ -692,6 +711,14 @@ pub struct IvoryApp {
 
     last_sent_size: Option<Vec2>,
     decorations_sent: Option<bool>,
+    /// While set, the size triple re-sends every frame — the decoration
+    /// nudge. On X11 under a tiling WM (the owner's i3), toggling
+    /// decorations re-parents the window a beat later, and the surface
+    /// keeps painting at the old offset — a black strip on one edge and
+    /// content cut off at the other — until SOME configure arrives, which
+    /// used to be the next click. Re-pinning the same size is that
+    /// configure, sent for a few frames so it lands after the WM settles.
+    decor_nudge_until: Option<Instant>,
     main_inner_origin: Pos2,
     /// Whether `main_inner_origin` has ever been reported by the platform.
     /// Until it has, it is (0, 0) — which is a real position, not a missing
@@ -1417,6 +1444,8 @@ impl IvoryApp {
             clicked: std::collections::BTreeSet::new(),
             clicked_position: None,
             restrike: false,
+            ring: std::collections::BTreeMap::new(),
+            ringing: std::collections::BTreeMap::new(),
             audition_held: false,
             audio_status: recorder::AudioStatus::default(),
             fullscreen_sent: None,
@@ -1436,6 +1465,7 @@ impl IvoryApp {
             splash_up: false,
             last_sent_size: None,
             decorations_sent: None,
+            decor_nudge_until: None,
             main_inner_origin: Pos2::ZERO,
             main_origin_known: false,
             monitor_size: None,
@@ -1974,6 +2004,8 @@ impl IvoryApp {
         if !self.settings.keytoggle_enabled {
             return;
         }
+        // A selection click's sound is guaranteed its ring — the off waits.
+        self.ring.insert(note, Instant::now() + SELECTION_RING);
         if self.manual_notes.remove(&note) {
             self.manual_positions.remove(&note);
         } else {
@@ -3060,12 +3092,24 @@ impl IvoryApp {
         if want == self.settings.transpose {
             return;
         }
-        let mut held: HashSet<u8> = self.notes.held().iter().copied().collect();
-        if self.settings.keytoggle_enabled {
-            held.extend(self.manual_notes.iter().copied());
-        }
-        if transposed(&held, want).len() != held.len() {
+        // **Guarded in DISPLAY space, each kind by its own motion.** A
+        // hardware note is RAW and wears the whole offset at display time —
+        // see `lit_notes` — so the NEW offset applies whole; a placed note
+        // already lives in display space and moves only by the STEP. The old
+        // check applied the whole offset to both, which double-counted it on
+        // every placed note: the further a chord had been carried, the
+        // sooner it met a wall that was not MIDI's — the owner's "limited to
+        // 2 octaves".
+        let midi: HashSet<u8> = self.notes.held().iter().copied().collect();
+        if transposed(&midi, want).len() != midi.len() {
             return;
+        }
+        if self.settings.keytoggle_enabled {
+            let placed: HashSet<u8> = self.manual_notes.iter().copied().collect();
+            let by = want - self.settings.transpose;
+            if transposed(&placed, by).len() != placed.len() {
+                return;
+            }
         }
         let was = self.settings.transpose;
         self.settings.transpose = want;
@@ -3709,6 +3753,11 @@ impl IvoryApp {
                         // on. See `place_or_play`.
                         self.sound_while_held(theory_pitches(hit));
                         if self.settings.keytoggle_enabled {
+                            // Selection clicks ring — see `SELECTION_RING`.
+                            let deadline = Instant::now() + SELECTION_RING;
+                            for n in theory_pitches(hit) {
+                                self.ring.insert(n, deadline);
+                            }
                             self.toggle_theory_hit(hit);
                         }
                         return;
@@ -3770,8 +3819,11 @@ impl IvoryApp {
                     if let Some(note) = hit {
                         // **Sounded on the way past, in this mode too.** The
                         // toggle decides whether the note stays LIT, not
-                        // whether pressing a key makes a sound.
+                        // whether pressing a key makes a sound. And a
+                        // selection click's sound gets its ring — the off
+                        // waits for `SELECTION_RING`.
                         self.sound_while_held([note]);
+                        self.ring.insert(note, Instant::now() + SELECTION_RING);
                         if self.manual_notes.remove(&note) {
                             self.manual_positions.remove(&note);
                         } else {
@@ -3815,6 +3867,12 @@ impl IvoryApp {
                         self.sync_pins();
                         self.detection_tick(true); // immediate off-cadence update
                         self.voicing_tick(true);
+                        // A press that PLAYED must not also grab the window
+                        // — the keytoggle-off branch returns above, and this
+                        // one fell through: in borderless mode every note
+                        // click started a native window drag, whose grab is
+                        // what ends the press under egui's feet.
+                        return;
                     }
                 }
                 // Dragging moves OUR window. A plugin's window is the
@@ -4042,7 +4100,7 @@ impl IvoryApp {
             }
             std::mem::take(&mut self.sounding)
         };
-        let off: Vec<u8> = if held.is_empty() {
+        let mut off: Vec<u8> = if held.is_empty() {
             // Everything, because everything is about to be re-struck. Not
             // `held`, which is empty by construction on a strike.
             self.sounding.iter().copied().collect()
@@ -4050,6 +4108,33 @@ impl IvoryApp {
             held.difference(&want).copied().collect()
         };
         let on: Vec<u8> = want.difference(&held).copied().collect();
+        // **The ring: a selection click's off waits for its deadline.** Only
+        // the SOUND waits — the note leaves `sounding` with the gesture
+        // either way, so the display and the neck never draw a note the hand
+        // let go of, which is the delineation: no visual retrigger, and no
+        // clipped audition. A note about to be re-struck this same frame
+        // keeps its off (off-before-on is the restrike contract), and a
+        // re-struck note's PENDING off is cancelled — the new gesture owns
+        // the note now, and firing the old deadline would cut it short.
+        let now = Instant::now();
+        for n in &on {
+            self.ringing.remove(n);
+        }
+        off.retain(|n| {
+            if on.contains(n) {
+                return true;
+            }
+            match self.ring.get(n) {
+                Some(&t) if t > now => {
+                    self.ringing.insert(*n, t);
+                    false
+                }
+                _ => {
+                    self.ring.remove(n);
+                    true
+                }
+            }
+        });
         self.sounding = want;
         // **Off before on.** Releasing a pitch and re-taking it in the same
         // frame has to arrive in that order, or the instrument ends up holding
@@ -4064,6 +4149,33 @@ impl IvoryApp {
         }
         if !on.is_empty() {
             self.request_recorder(recorder::RecorderRequest::Audition { notes: on, on: true });
+        }
+    }
+
+    /// Fire the withheld note-offs whose deadline has passed, and keep the
+    /// frame loop alive until the last one has. Without the repaint request
+    /// an idle window would sit on a finished frame and the off would wait
+    /// for the next mouse twitch — a note that rings until you move.
+    fn ring_tick(&mut self, ctx: &egui::Context) {
+        if self.ringing.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let due: Vec<u8> = self
+            .ringing
+            .iter()
+            .filter(|(_, &t)| t <= now)
+            .map(|(&n, _)| n)
+            .collect();
+        if !due.is_empty() {
+            for n in &due {
+                self.ringing.remove(n);
+                self.ring.remove(n);
+            }
+            self.request_recorder(recorder::RecorderRequest::Audition { notes: due, on: false });
+        }
+        if let Some(&t) = self.ringing.values().min() {
+            ctx.request_repaint_after(t.saturating_duration_since(now));
         }
     }
 
@@ -14044,6 +14156,8 @@ impl IvoryApp {
         // path that can change that set has run by now, and this is the one
         // place that has to notice.
         self.reconcile_sound();
+        // And the offs the ring is holding back, on the same cadence.
+        self.ring_tick(&ctx);
 
         // Track our position on the monitor for global menu placement, child
         // window centring, and so the main window reopens where it was left.
@@ -14181,6 +14295,21 @@ impl IvoryApp {
             ctx.send_viewport_cmd(ViewportCommand::Decorations(decorations));
             ctx.send_viewport_cmd(ViewportCommand::Title("Tangent".to_owned()));
             self.decorations_sent = Some(decorations);
+            // Arm the nudge — see `decor_nudge_until`. Both directions of B
+            // left the picture shifted by a title bar under i3 until the
+            // next click; the re-pinned size is the configure that click
+            // was accidentally providing.
+            self.decor_nudge_until = Some(Instant::now() + Duration::from_millis(300));
+        }
+        if let Some(t) = self.decor_nudge_until {
+            if Instant::now() < t {
+                // Forget the pin so the triple above re-sends next frame,
+                // and make sure that frame comes without waiting for input.
+                self.last_sent_size = None;
+                ctx.request_repaint_after(Duration::from_millis(50));
+            } else {
+                self.decor_nudge_until = None;
+            }
         }
 
         // Paint, top to bottom: theory band, chord strip, piano, fretboard
@@ -18167,16 +18296,30 @@ mod tests {
                 }),
                 "keytoggle {keytoggle}: the click made no sound"
             );
-            // Letting go stops it, wherever the pointer ended up.
+            // Letting go: a PLAYED note stops with the button; a SELECTED
+            // one keeps ringing while its off waits out `SELECTION_RING` —
+            // see `a_keytoggle_selection_clicks_sound_outlives_the_click`.
             app.clicked.clear();
-            assert_eq!(
-                run_frame(&ctx, &mut app),
-                Some(recorder::RecorderRequest::Audition {
-                    notes: vec![67],
-                    on: false
-                }),
-                "keytoggle {keytoggle}: the note went on ringing"
-            );
+            if keytoggle {
+                assert_eq!(
+                    run_frame(&ctx, &mut app),
+                    None,
+                    "keytoggle: the selection click was clipped at release"
+                );
+                assert!(
+                    app.ringing.contains_key(&67),
+                    "the off is not waiting its ring out"
+                );
+            } else {
+                assert_eq!(
+                    run_frame(&ctx, &mut app),
+                    Some(recorder::RecorderRequest::Audition {
+                        notes: vec![67],
+                        on: false
+                    }),
+                    "keytoggle {keytoggle}: the note went on ringing"
+                );
+            }
             // And only with the toggle ON is it still lit afterwards.
             assert_eq!(
                 app.display_notes().contains(&67),
@@ -20455,19 +20598,133 @@ mod tests {
         );
     }
 
+    /// **A keytoggle selection click is never a clipped tick.** The click
+    /// that selects a note is short — shorter than any note anybody meant to
+    /// hear — and on an instrument that damps on note-off (a sampled piano;
+    /// the DX7's own tails hid this for months) the audition died with the
+    /// button. The off now waits out `SELECTION_RING`; only the SOUND waits,
+    /// the display follows the gesture. With keytoggle off the click IS the
+    /// gesture — playing, not selecting — and the off still rides the
+    /// release.
+    #[test]
+    fn a_keytoggle_selection_clicks_sound_outlives_the_click() {
+        for keytoggle in [true, false] {
+            let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+            app.settings.keytoggle_enabled = keytoggle;
+            pointer_frame(&ctx, &mut app, Vec::new());
+            let r = app.last_drawn;
+            assert!(r.is_positive(), "nothing was drawn");
+            let bands = app.layout_sizes();
+            let piano_top = r.min.y + bands.recorder_h + bands.theory_h + bands.chord_h;
+            assert!(bands.piano_h > 0.0, "no piano on screen");
+            let p = Pos2::new(r.min.x + r.width() * 0.5, piano_top + bands.piano_h * 0.85);
+            let local = p - Pos2::new(r.min.x, piano_top);
+            let note = piano::hit_test(local.x, local.y, r.width(), bands.piano_h)
+                .expect("the probe point missed every key");
+            // Press.
+            pointer_frame(
+                &ctx,
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(p),
+                    egui::Event::PointerButton {
+                        pos: p,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            let drain = |app: &mut IvoryApp| {
+                let mut ons = Vec::new();
+                let mut offs = Vec::new();
+                while let Some(rq) = app.take_recorder_request() {
+                    if let recorder::RecorderRequest::Audition { notes, on } = rq {
+                        if on { ons.extend(notes) } else { offs.extend(notes) }
+                    }
+                }
+                (ons, offs)
+            };
+            // The press sounds it, and holding never disturbs it.
+            let mut held_ons = drain(&mut app).0;
+            for _ in 0..20 {
+                pointer_frame(&ctx, &mut app, Vec::new());
+                let (ons, offs) = drain(&mut app);
+                held_ons.extend(ons);
+                assert!(offs.is_empty(), "keytoggle={keytoggle}: an off while held: {offs:?}");
+            }
+            assert_eq!(held_ons, vec![note], "keytoggle={keytoggle}: the press did not sound once");
+            // Release: a quick selection click keeps ringing; a played
+            // (keytoggle-off) click ends with the button.
+            pointer_frame(
+                &ctx,
+                &mut app,
+                vec![egui::Event::PointerButton {
+                    pos: p,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            // One settle frame: the panel's input runs after the frame's
+            // reconcile, so the release lands on the next diff — the same
+            // one-frame cadence the press's note-on rides.
+            pointer_frame(&ctx, &mut app, Vec::new());
+            let (_, offs) = drain(&mut app);
+            if keytoggle {
+                assert!(
+                    offs.is_empty(),
+                    "keytoggle: the selection click was clipped at release: {offs:?}"
+                );
+                assert_eq!(app.ringing.len(), 1, "the off is not waiting its ring out");
+                // And the deadline fires it — through `ring_tick`, off the
+                // real clock, so the test waits the ring out.
+                std::thread::sleep(SELECTION_RING + Duration::from_millis(50));
+                pointer_frame(&ctx, &mut app, Vec::new());
+                let (_, offs) = drain(&mut app);
+                assert_eq!(offs, vec![note], "the ring never ended the note");
+                assert!(app.ringing.is_empty() && app.ring.is_empty(), "ring state leaked");
+            } else {
+                assert_eq!(offs, vec![note], "release did not end the played note");
+            }
+        }
+    }
+
     /// The offset is bounded, or a held-down arrow key walks it somewhere a
     /// chord can never come back from.
     #[test]
     fn the_transpose_is_bounded_in_both_directions() {
         let (_ctx, mut app) = recorder_app();
-        for _ in 0..100 {
+        for _ in 0..200 {
             app.transpose_by(1);
         }
         assert_eq!(app.settings.transpose, crate::settings::TRANSPOSE_MAX);
-        for _ in 0..200 {
+        for _ in 0..400 {
             app.transpose_by(-1);
         }
         assert_eq!(app.settings.transpose, -crate::settings::TRANSPOSE_MAX);
+    }
+
+    /// **A keytoggle chord transposes across the whole keyboard.** The cap
+    /// used to be two octaves each way and the owner hit it moving a chord;
+    /// the real wall is MIDI's edges, enforced note-by-note by the
+    /// all-or-nothing guard — C-E-G-B from middle C has 56 semitones of
+    /// headroom before B leaves 127, and it gets every one of them.
+    #[test]
+    fn a_keytoggle_chord_transposes_to_midis_edge() {
+        let (_ctx, mut app) = recorder_app();
+        app.settings.keytoggle_enabled = true;
+        app.manual_notes = [60u8, 64, 67, 71].into_iter().collect();
+        for _ in 0..100 {
+            app.transpose_by(1);
+        }
+        assert_eq!(app.settings.transpose, 56, "up stops when B meets 127");
+        assert!(app.manual_notes.contains(&127), "the top note rode to the edge");
+        for _ in 0..300 {
+            app.transpose_by(-1);
+        }
+        assert_eq!(app.settings.transpose, -60, "down stops when C meets 0");
+        assert!(app.manual_notes.contains(&0), "the bottom note rode to the edge");
     }
 
     /// The arrows are drawn top-LEFT and the heart top-RIGHT, so one can never

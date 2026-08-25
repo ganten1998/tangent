@@ -1048,10 +1048,14 @@ fn test_path() -> PathBuf {
 
 /// How far the transpose control will go, in semitones.
 ///
-/// Two octaves each way. Further is arithmetically fine and musically pointless
-/// — and the limit is what stops a held-down arrow key from walking the offset
-/// somewhere a chord can never come back from.
-pub const TRANSPOSE_MAX: i64 = 24;
+/// The whole keyboard. This was two octaves each way for a while, and the
+/// owner hit the wall moving a keytoggle chord — the REAL limit is MIDI's
+/// edges, and `transpose_by`'s all-or-nothing guard already enforces exactly
+/// that: a chord steps until its top note would leave 127 or its bottom
+/// would leave 0, and not one semitone further. This constant is only the
+/// backstop for an EMPTY transpose — nothing held, nothing to guard — and
+/// for a hand-edited settings file.
+pub const TRANSPOSE_MAX: i64 = 127;
 
 /// The most a stored gain may be, as a linear multiplier.
 ///
