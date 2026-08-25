@@ -290,10 +290,19 @@ impl Dx7 {
         if pitch > 127 {
             return;
         }
+        // **A repeat of a pitch reuses that pitch's voice — sounding OR held
+        // by the damper.** With the pedal down, `note_off` leaves the voice
+        // ringing with `on = false` and the damper bit set. Matching only
+        // `on` here meant a re-struck key under the pedal allocated a FRESH
+        // voice every time, so rapid repeats stacked a dozen identical notes
+        // until the pool ran out and stealing chopped ringing voices — the
+        // owner's "many note glitches". Retriggering the held voice keeps one
+        // voice per pitch, which is what a real damper does.
+        let damper_held = |n: &Note| !n.on && n.age & (1 << 63) != 0;
         let slot = self
             .notes
             .iter()
-            .position(|n| n.on && n.pitch == pitch)
+            .position(|n| n.pitch == pitch && (n.on || damper_held(n)))
             .or_else(|| self.notes.iter().position(|n| n.eg[0].finished() && !n.on))
             .unwrap_or_else(|| {
                 let mut best = 0;
@@ -354,7 +363,11 @@ impl Dx7 {
         for n in &mut self.notes {
             if n.on && n.pitch == pitch {
                 if self.pedal {
-                    // Held by the damper. Still "on" so a repeat finds it.
+                    // Held by the damper: no longer keyed down, but still
+                    // ringing. The damper bit (1<<63) marks it so the pedal
+                    // lift releases it AND a repeat of this pitch reuses this
+                    // very voice rather than stacking a new one — see the
+                    // slot search in `note_on`.
                     n.on = false;
                     n.age |= 1 << 63;
                 } else {
@@ -878,6 +891,37 @@ mod tests {
         for r in 0..99 {
             let (a, b) = (r as f32, (r + 1) as f32);
             assert!(secs(a) > secs(b), "rate {a} is not slower than {b}");
+        }
+    }
+
+    /// **The pedal does not stack a repeated pitch into new voices.** With
+    /// the damper down, releasing and re-striking the same key many times
+    /// used to allocate a fresh voice each time, exhaust the sixteen-voice
+    /// pool, and then steal ringing voices — the owner's rapid-note glitches.
+    /// One pitch must occupy at most one voice, and distinct pitches struck
+    /// afterward must still find room.
+    #[test]
+    fn the_pedal_does_not_stack_repeated_pitches() {
+        const SR: f32 = 48_000.0;
+        let mut d = Dx7::new(SR);
+        d.set_pedal(true);
+        // Re-strike middle C forty times under the pedal, releasing between.
+        for _ in 0..40 {
+            d.note_on(60, 0.8);
+            d.note_off(60);
+        }
+        let c_voices = d.notes.iter().filter(|n| n.pitch == 60 && !n.eg[0].finished()).count();
+        assert!(
+            c_voices <= 1,
+            "one pitch took {c_voices} voices under the pedal — it should reuse one"
+        );
+        // Room remains for a chord: eight distinct pitches all get a voice.
+        for p in 61u8..69 {
+            d.note_on(p, 0.8);
+        }
+        for p in 61u8..69 {
+            let live = d.notes.iter().any(|n| n.pitch == p && n.on);
+            assert!(live, "pitch {p} found no voice — the pool was clogged by repeats");
         }
     }
 

@@ -999,6 +999,20 @@ channels play back their clips and nothing else. "Ready to play" and
   a permission-flavoured banner on Windows: `Unsupported` is a fact
   about the build, not an error, so the pane just shows "no camera".
 
+- **4.86.0 — the low-pass ships open, and the pedal stops glitching**:
+  the master LOW-PASS default read 200 Hz (the bottom of its sweep)
+  instead of the shipped-open 20 kHz — the six mix knobs never
+  advertised their own defaults in `effect_defaults`, so a reset or
+  the default marker fell to the fallback. They carry their real
+  defaults now (reverb/delay/chorus off, HPF open, LPF open at 20
+  kHz, limiter off). And the DX7 SUSTAIN PEDAL no longer glitches
+  under rapid notes: with the damper down, re-striking a key
+  allocated a fresh voice every time because `note_on` matched only
+  keys that were still `on`, not ones the damper was holding — so
+  rapid repeats stacked identical voices until the sixteen-voice pool
+  ran out and stealing chopped ringing notes. A repeat reuses the
+  held voice now, one per pitch, the way a real damper behaves.
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index
