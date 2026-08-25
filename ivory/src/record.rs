@@ -3045,6 +3045,11 @@ mod tests {
                 frames_unreadable: 0,
                 frames_skipped: 0,
                 frames_dropped_late: 0,
+                // The band showed "5 video frames lost"; the manifest must
+                // record the same 5, not a silent zero — the discrepancy a
+                // Windows camera take surfaced.
+                frames_encoder_dropped: 5,
+                frames_padded: 2,
             },
             "take.mp4",
         );
@@ -3055,6 +3060,11 @@ mod tests {
         assert_eq!(after["video"]["video_codec"], "h264", "{after:#}");
         assert_eq!(after["video"]["width"], 1920);
         assert_eq!(after["video"]["frames_received"], 297);
+        assert_eq!(
+            after["video"]["frames_encoder_dropped"], 5,
+            "the manifest did not record the frames the band reported lost: {after:#}"
+        );
+        assert_eq!(after["video"]["frames_padded"], 2);
         assert!(
             after["files"]
                 .as_array()
@@ -3091,6 +3101,8 @@ mod tests {
                 frames_unreadable: 0,
                 frames_skipped: 0,
                 frames_dropped_late: 0,
+                frames_encoder_dropped: 0,
+                frames_padded: 0,
             },
             "take.mp4",
         );

@@ -1029,6 +1029,18 @@ channels play back their clips and nothing else. "Ready to play" and
   "no camera" text now points at the privacy setting instead of
   saying the feature does not exist.
 
+- **4.88.0 — the take manifest tells the whole truth**: the band's
+  live "N video frames lost" counter reads the ENCODER's dropped
+  frames, but `take.json` only recorded the CAMERA-side numbers
+  (superseded, dropped-late) — so a take where the band said "5
+  dropped" wrote a manifest that said zero, a contradiction a tester
+  would rightly report. `VideoReport` carries `frames_encoder_dropped`
+  and `frames_padded` now, written from the same numbers the band
+  shows, so the counter and the manifest can never disagree. (Found
+  during the Windows camera validation — the camera itself passed end
+  to end on a clean box: live preview, correct colors, a video take
+  with the camera embedded.)
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index
