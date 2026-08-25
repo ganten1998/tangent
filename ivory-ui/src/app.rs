@@ -19670,7 +19670,15 @@ mod tests {
             app.apply_recorder_hit(reset);
         }
         for fx in recorder_panel::Fx::ALL {
-            let rest = if fx == recorder_panel::Fx::Limiter { 1.0 } else { 0.0 };
+            // The limiter and the LPF rest fully clockwise — threshold above
+            // everything, cutoff wide open at 20 kHz — matching
+            // `Sends::default()`. The owner met the old 0.0 LPF reset as
+            // "double-click slams the filter shut".
+            let rest = if matches!(fx, recorder_panel::Fx::Limiter | recorder_panel::Fx::Lpf) {
+                1.0
+            } else {
+                0.0
+            };
             assert_eq!(app.fx_value(fx), rest, "{} did not go back", fx.title());
         }
         assert!((app.settings.record_export.tempo_bpm - 120.0).abs() < 1.0e-9);

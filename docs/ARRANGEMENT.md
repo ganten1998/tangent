@@ -1089,6 +1089,27 @@ channels play back their clips and nothing else. "Ready to play" and
   rests it fully OPEN (20 kHz), like the limiter and for the same
   reason — its knob is a cutoff, so "not applied" is fully clockwise;
   the old reset slammed the filter shut, the opposite of a reset.
+- **4.91.0 — ASIO asks for the plain period**: 4.90.0's ASIO round on
+  the canary box crashed at startup — `index out of bounds: the len
+  is 2 but the index is 2` inside cpal's ASIO output callback — and
+  the arithmetic reconstructs exactly. `BUFFER_PERIODS` multiplies the
+  requested buffer for WASAPI (where `Fixed(n)` is a ring to be carved
+  into periods), so on Windows the OUTPUT asked ASIO for `Fixed(512)`
+  while the INPUT side of the same driver translated the same setting
+  plainly (`Default` → the panel's 256). An ASIO driver has one buffer
+  set: when the input joined, `ASIOCreateBuffers` re-granted 256, and
+  cpal's output callback — which derives channel count by dividing
+  its build-time buffer by the CURRENT size — computed (512×2)/256 =
+  4 channels on a stereo interface and indexed off the end of the
+  two-entry buffer array. Under ASIO the created size IS the callback
+  period, so `pick_buffer` now has an ASIO arm: plain `Fixed(asked)`
+  clamped to the device range, `Default` when nothing was asked — the
+  exact translation the input side uses on the same setting, so both
+  directions request identically and the re-grant equals the original
+  grant. The input side clamps identically under ASIO too (`Fixed`
+  outside the range is a build error). The wins the crash proved are
+  kept: the failure was LOUD (dialog + stderr, no silent silence) and
+  the cached host loaded the driver once, cleanly.
 
 ## Order of work
 
