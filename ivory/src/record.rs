@@ -1440,6 +1440,16 @@ impl Session {
         // for a preview whose job is framing.
         match camera::open_camera(uid, &camera::FormatWish::hd(), self.timebase) {
             Ok(stream) => self.camera = Some(stream),
+            // **A platform with no camera backend is not an ERROR to nag
+            // about.** On Windows the camera is unimplemented, and a settings
+            // file synced from a Mac (Dropbox) names a camera UID no Windows
+            // enumeration could produce — so every launch tried to open it,
+            // failed with `Unsupported`, and parked a banner that read like a
+            // permission problem. `Unsupported` is a fact about the build, not
+            // an actionable failure: swallow it, and the pane simply shows
+            // "no camera". Real errors (a denied permission, a disconnected
+            // device on a platform that HAS a camera) still surface.
+            Err(camera::CameraError::Unsupported) => {}
             Err(e) => self.camera_error = Some(e.to_string()),
         }
     }

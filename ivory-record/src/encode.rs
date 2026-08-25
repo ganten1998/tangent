@@ -211,6 +211,82 @@ impl AudioSpec {
     }
 }
 
+/// **MP3 through the bundled ffmpeg**, for the platforms that cannot link
+/// LAME in-process.
+///
+/// The Windows cross-build has no `mp3lame-encoder`: LAME's autotools build
+/// will not run under cargo-xwin, so the crate is left out and the in-process
+/// encoder does not exist there. ffmpeg is already bundled beside the binary
+/// for video, and its GPL build carries `libmp3lame`, so an MP3 export routes
+/// through it instead — a temporary WAV of the mix, then a transcode at the
+/// same 320 kbps the in-process encoder targets. Available off macOS, where
+/// the `ffmpeg` module lives; macOS always has the in-process encoder.
+#[cfg(not(target_os = "macos"))]
+pub fn encode_mp3_via_ffmpeg(
+    stereo: &[f32],
+    rate: u32,
+    mono: bool,
+    out: &std::path::Path,
+) -> Result<(), String> {
+    let frames = stereo.len() / 2;
+    let spec = crate::wav::WavSpec {
+        sample_rate: rate,
+        channels: if mono { 1 } else { 2 },
+        format: crate::wav::SampleFormat::Float32,
+    };
+    // A temp WAV beside the output — ffmpeg reads a FILE, so there is no
+    // stdin/stdout pipe to deadlock on, and it is swept whatever happens.
+    let tmp = out.with_extension("mp3.tmp.wav");
+    struct Sweep(std::path::PathBuf);
+    impl Drop for Sweep {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _sweep = Sweep(tmp.clone());
+    {
+        let bext = crate::wav::Bext::new(crate::wav::Wallclock::now_utc(), spec);
+        let mut w =
+            crate::wav::WavWriter::create(&tmp, spec, &bext).map_err(|e| format!("mp3: {e}"))?;
+        if mono {
+            let folded: Vec<f32> = (0..frames)
+                .map(|f| (stereo[f * 2] + stereo[f * 2 + 1]) * 0.5)
+                .collect();
+            w.write_interleaved(&folded).map_err(|e| format!("mp3: {e}"))?;
+        } else {
+            w.write_interleaved(stereo).map_err(|e| format!("mp3: {e}"))?;
+        }
+        w.finish().map_err(|e| format!("mp3: {e}"))?;
+    }
+    let program = ffmpeg::program();
+    let out_run = crate::proc::command(&program)
+        .args(["-nostdin", "-v", "error", "-y", "-i"])
+        .arg(&tmp)
+        // CBR 320: `-b:a` alone is constant bitrate on libmp3lame.
+        .args(["-c:a", "libmp3lame", "-b:a", "320k"])
+        .arg(out)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| {
+            format!(
+                "mp3: could not run ffmpeg ({e}). {}",
+                ffmpeg::how_to_install()
+            )
+        })?;
+    if !out_run.status.success() {
+        let why = String::from_utf8_lossy(&out_run.stderr);
+        let why = why.lines().last().unwrap_or("").trim().to_owned();
+        return Err(if why.is_empty() {
+            "mp3: ffmpeg could not encode it".to_owned()
+        } else {
+            format!("mp3: {why}")
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

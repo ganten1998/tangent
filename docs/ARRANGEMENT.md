@@ -980,6 +980,25 @@ channels play back their clips and nothing else. "Ready to play" and
   grid was already 1/4 in both the arrangement and the editor — no
   change needed there.)
 
+- **4.85.0 — the zoom unsticks, rename stops deleting tracks, and
+  Windows gets MP3**: the arrangement's Shift+wheel lane zoom only
+  zoomed IN both directions — holding Shift makes the OS turn the
+  wheel HORIZONTAL, so the notch arrived on X, and the lane-zoom read
+  Y alone (always the same branch). It reads the combined X+Y delta
+  now, exactly as the mixer's zoom (which worked) already did; the
+  MIDI editor's Shift+wheel key-zoom had the same flaw and the same
+  fix. RENAME FIELDS now swallow the frame's keys through one
+  `text_entry_active` gate every shortcut path consults: typing "DDD"
+  or Backspace into a track title, or H, no longer deletes the track
+  or slides the help card — only Enter, Escape and a mouse press act.
+  (The lane rename reuses the mixer's naming state, which the arrange
+  key gate did not know about.) WINDOWS MP3 EXPORT works now: the
+  cross-build cannot link LAME, so MP3 routes through the bundled
+  ffmpeg (its GPL build carries libmp3lame) — a temp WAV, then a 320
+  kbps transcode. And a camera UID synced from a Mac no longer parks
+  a permission-flavoured banner on Windows: `Unsupported` is a fact
+  about the build, not an error, so the pane just shows "no camera".
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index

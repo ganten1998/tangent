@@ -4660,15 +4660,18 @@ fn encode_mp3(
     Ok(())
 }
 
+/// No in-process LAME (the Windows cross-build) — encode through the bundled
+/// ffmpeg instead, so MP3 export works there too. See
+/// [`ivory_record::encode::encode_mp3_via_ffmpeg`].
 #[cfg(feature = "recorder")]
 #[cfg(not(feature = "mp3"))]
 fn encode_mp3(
-    _interleaved: &[f32],
-    _rate: u32,
-    _mono: bool,
-    _path: &std::path::Path,
+    interleaved: &[f32],
+    rate: u32,
+    mono: bool,
+    path: &std::path::Path,
 ) -> Result<(), String> {
-    Err("mp3 export is not in this build".to_owned())
+    ivory_record::encode::encode_mp3_via_ffmpeg(interleaved, rate, mono, path)
 }
 
 fn saved_insert_state(strip: usize, bay: usize, bundle: &str) -> Option<Vec<u8>> {
