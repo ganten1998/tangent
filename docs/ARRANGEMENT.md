@@ -838,6 +838,34 @@ channels play back their clips and nothing else. "Ready to play" and
   motionless CLICK on it sends the playhead home, keeping the
   generous back-to-bar-one target.
 
+- **4.79.0 — the ring, the whole keyboard, and i3 squared away**:
+  THE SELECTION RING — a keytoggle click's audition is never a
+  clipped tick again. The click that selects a note is shorter than
+  any note anybody meant to hear, and on an instrument that damps on
+  note-off (a sampled piano; the DX7's own tails hid it for months)
+  the sound died with the button. The off now waits out
+  `SELECTION_RING` (1.5s from the press; a longer hold releases
+  normally) while ONLY the sound waits: the note leaves `sounding`
+  with the gesture, so the display and the neck's solver never draw
+  a note the hand let go of — no visual retrigger, no shortened
+  audition. Piano, neck, staff and the theory band all ring; a
+  re-struck note cancels its pending off. TRANSPOSE ACROSS THE WHOLE
+  KEYBOARD: the range guard applied the whole offset to placed notes
+  that already live in display space, double-counting it — the
+  further a chord had been carried the sooner the wall, the owner's
+  "limited to 2 octaves". Each kind is guarded by its own motion now
+  (hardware notes wear the new offset whole; placed notes move by
+  the step), `TRANSPOSE_MAX` grew from 24 to 127 as a backstop, and
+  a chord steps until a note would leave MIDI — C-E-G-B gets all 56
+  up and 60 down. I3'S BORDERLESS OFFSET: toggling B re-parents the
+  window a beat later on X11 and the surface kept painting at the
+  old offset — black strip one edge, cutoff the other — until the
+  next click. The decoration toggle now arms a 300ms nudge that
+  re-pins the size triple each frame, which is the configure the
+  click was accidentally providing. And a keytoggle note click in a
+  borderless window no longer falls through to `StartDrag` — a press
+  that PLAYED must not also grab the window.
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index
