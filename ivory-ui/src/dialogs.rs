@@ -1488,10 +1488,13 @@ impl DeviceKind {
     fn nothing_found(self) -> &'static str {
         match self {
             DeviceKind::Camera => {
-                "Camera recording is not available on Windows yet - it is not                  a permission problem and there is nothing to grant. Takes                  still record the window, the audio and the MIDI."
+                "Camera recording is not available on Windows yet - it is not \
+                 a permission problem and there is nothing to grant. Takes \
+                 still record the window, the audio and the MIDI."
             }
             DeviceKind::AudioInput => {
-                "No audio inputs found. If an interface is connected, check                  that it appears under Settings > System > Sound > Input."
+                "No audio inputs found. If an interface is connected, check \
+                 that it appears under Settings > System > Sound > Input."
             }
             DeviceKind::ExtraInput(_) => {
                 "No other inputs on this interface. Tick the ones you want in \

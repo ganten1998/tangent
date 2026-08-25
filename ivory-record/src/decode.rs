@@ -93,28 +93,39 @@ const MAX_FRAMES: usize = 20 * 60 * 48_000;
 ///
 /// The error is a sentence for a person: this is reached by picking a file in
 /// a dialog, so "it did not work" has to say what to do instead.
+///
+/// **The decoder's word is verified, not trusted.** This used to read a bare
+/// `f32le` byte stream and stamp the asked-for rate on it — whatever the
+/// subprocess actually produced. The engine never resamples a clip, so any
+/// decoder that ignored `-ar` or `-ac` (a slimmed-down ffmpeg build, an odd
+/// codec path) came out as wrong-speed, wrong-channel garbage in every
+/// export and nothing anywhere could tell. The decode goes through a WAV
+/// container now, whose `fmt ` chunk states what was REALLY produced; a
+/// different rate is resampled here, a different layout is folded here, and
+/// a format this cannot read is a clear sentence instead of noise.
 pub fn decode(path: &Path, rate: u32) -> Result<Clip, String> {
     let rate = rate.clamp(8_000, 192_000);
-    let raw = read_raw(path, rate)?;
-    if raw.len() < 8 {
+    let wav = read_wav(path, rate)?;
+    let (samples, got) = wav_stereo_f32(&wav)?;
+    if samples.len() < 2 {
         return Err("that file has no audio in it".to_owned());
     }
-    let frames = raw.len() / 8;
-    if frames > MAX_FRAMES {
+    // The length check speaks in OUTPUT frames, and runs before the
+    // resample allocates them.
+    let frames_out = (samples.len() / 2) as u64 * u64::from(rate) / u64::from(got.max(1));
+    if frames_out as usize > MAX_FRAMES {
         return Err(format!(
             "that file is {:.0} minutes long. The backing track holds up to {} \
              minutes - trim it first, or pick a shorter one.",
-            frames as f64 / f64::from(rate) / 60.0,
+            frames_out as f64 / f64::from(rate) / 60.0,
             MAX_FRAMES / 60 / 48_000
         ));
     }
-    let mut samples = Vec::with_capacity(frames * 2);
-    for chunk in raw.chunks_exact(4) {
-        // A trailing partial sample is dropped rather than folded in: half a
-        // float is not a quiet sample, it is a loud wrong one.
-        samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-    }
-    samples.truncate(frames * 2);
+    let samples = if got == rate {
+        samples
+    } else {
+        resample_stereo(&samples, got, rate)
+    };
     Ok(Clip {
         samples,
         rate,
@@ -122,9 +133,124 @@ pub fn decode(path: &Path, rate: u32) -> Result<Clip, String> {
     })
 }
 
+/// Interleaved stereo f32 out of a RIFF/WAVE byte string, plus the rate its
+/// own `fmt ` chunk states.
+///
+/// **Walked rather than assumed at offset 44.** `afconvert` writes an `FLLR`
+/// padding chunk before `data` to page-align it, and ffmpeg piping to stdout
+/// writes `0xFFFFFFFF` for the sizes it could not seek back to fill in — the
+/// walk tolerates both. Mono is doubled into both ears; anything wider than
+/// stereo keeps its first pair (the decode asked for two, so this is a
+/// decoder that did not listen); int16/24/32 are converted, because a
+/// decoder that ignored the codec ask should still come out as music.
+fn wav_stereo_f32(bytes: &[u8]) -> Result<(Vec<f32>, u32), String> {
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Err("the decoder did not produce audio".to_owned());
+    }
+    let mut fmt: Option<(u16, u16, u32, u16)> = None; // tag, channels, rate, bits
+    let mut data: Option<&[u8]> = None;
+    let mut at = 12usize;
+    while at + 8 <= bytes.len() {
+        let id = &bytes[at..at + 4];
+        let size = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+        let from = at + 8;
+        // Clamped: a streamed WAV's size fields lie (see above), and a
+        // truncated file's run past the end — what there is is still music.
+        let to = from.saturating_add(size).min(bytes.len());
+        if id == b"fmt " && to - from >= 16 {
+            let c = &bytes[from..to];
+            let mut tag = u16::from_le_bytes([c[0], c[1]]);
+            let channels = u16::from_le_bytes([c[2], c[3]]);
+            let rate = u32::from_le_bytes([c[4], c[5], c[6], c[7]]);
+            let bits = u16::from_le_bytes([c[14], c[15]]);
+            // WAVE_FORMAT_EXTENSIBLE: the real tag leads the subformat GUID.
+            if tag == 0xFFFE && c.len() >= 26 {
+                tag = u16::from_le_bytes([c[24], c[25]]);
+            }
+            fmt = Some((tag, channels, rate, bits));
+        }
+        if id == b"data" {
+            data = Some(&bytes[from..to]);
+            // `data` is the last chunk either platform's decoder writes, and
+            // a lying streamed size would walk `at` past real bytes.
+            break;
+        }
+        // Chunks are word-aligned; an odd size carries a pad byte.
+        at = from.saturating_add(size + (size & 1));
+    }
+    let Some((tag, channels, rate, bits)) = fmt else {
+        return Err("the decoded audio does not say what format it is".to_owned());
+    };
+    let Some(data) = data else {
+        return Err("the decoded file has no audio in it".to_owned());
+    };
+    if channels == 0 || rate == 0 {
+        return Err("the decoded audio has an impossible format".to_owned());
+    }
+    let ch = channels as usize;
+    let read: fn(&[u8]) -> f32 = match (tag, bits) {
+        (3, 32) => |b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+        (1, 16) => |b| f32::from(i16::from_le_bytes([b[0], b[1]])) / 32768.0,
+        (1, 24) => |b| {
+            (i32::from_le_bytes([0, b[0], b[1], b[2]]) >> 8) as f32 / 8_388_608.0
+        },
+        (1, 32) => |b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32 / 2_147_483_648.0,
+        _ => {
+            return Err(format!(
+                "the decoded audio came out as format {tag} at {bits} bits, \
+                 which this cannot read"
+            ));
+        }
+    };
+    let step = (bits / 8) as usize;
+    let frame = step * ch;
+    let frames = data.len() / frame.max(1);
+    let mut samples = Vec::with_capacity(frames * 2);
+    for f in 0..frames {
+        let row = &data[f * frame..(f + 1) * frame];
+        let l = read(&row[0..step]);
+        let r = if ch >= 2 { read(&row[step..2 * step]) } else { l };
+        samples.push(l);
+        samples.push(r);
+    }
+    Ok((samples, rate))
+}
+
+/// Linear resample of interleaved stereo, `from` Hz to `to` Hz.
+///
+/// Linear is the honest budget here: this path only runs when the decoder
+/// DISOBEYED the rate it was asked for, which is a recovery, not the main
+/// road — and linear at these rates is transparent next to the wrong-speed
+/// playback it replaces.
+fn resample_stereo(input: &[f32], from: u32, to: u32) -> Vec<f32> {
+    let in_frames = input.len() / 2;
+    if in_frames == 0 || from == 0 || to == 0 || from == to {
+        return input.to_vec();
+    }
+    let out_frames = ((in_frames as u64 * u64::from(to)) / u64::from(from)) as usize;
+    let mut out = Vec::with_capacity(out_frames * 2);
+    let ratio = f64::from(from) / f64::from(to);
+    for i in 0..out_frames {
+        let pos = i as f64 * ratio;
+        let i0 = (pos as usize).min(in_frames - 1);
+        let i1 = (i0 + 1).min(in_frames - 1);
+        let t = (pos - i0 as f64) as f32;
+        for chan in 0..2 {
+            let a = input[i0 * 2 + chan];
+            let b = input[i1 * 2 + chan];
+            out.push(a + (b - a) * t);
+        }
+    }
+    out
+}
+
 /// Everywhere but macOS: the encoder the release already carries.
+///
+/// A WAV stream rather than bare `f32le`, so the container's `fmt ` chunk
+/// carries what the decoder REALLY produced — `wav_stereo_f32` is where the
+/// asked-for rate and layout stop being an assumption.
 #[cfg(not(target_os = "macos"))]
-fn read_raw(path: &Path, rate: u32) -> Result<Vec<u8>, String> {
+fn read_wav(path: &Path, rate: u32) -> Result<Vec<u8>, String> {
     use std::io::Read;
 
     let program = crate::encode::ffmpeg::program();
@@ -139,7 +265,7 @@ fn read_raw(path: &Path, rate: u32) -> Result<Vec<u8>, String> {
             "-map",
             "a:0",
             "-f",
-            "f32le",
+            "wav",
             "-acodec",
             "pcm_f32le",
             "-ac",
@@ -190,10 +316,11 @@ fn read_raw(path: &Path, rate: u32) -> Result<Vec<u8>, String> {
 ///
 /// It writes a file rather than a stream — there is no stdout mode that works
 /// across formats — so this goes via a temporary WAV and takes it away again.
-/// `LEF32@rate` is little-endian 32-bit float, which is the shape the caller
-/// wants; the RIFF wrapper is a header this walks past.
+/// `LEF32@rate` is little-endian 32-bit float; the whole WAV goes back to
+/// `wav_stereo_f32`, whose walk is what steps over `afconvert`'s `FLLR`
+/// padding chunk.
 #[cfg(target_os = "macos")]
-fn read_raw(path: &Path, rate: u32) -> Result<Vec<u8>, String> {
+fn read_wav(path: &Path, rate: u32) -> Result<Vec<u8>, String> {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -229,41 +356,83 @@ fn read_raw(path: &Path, rate: u32) -> Result<Vec<u8>, String> {
             format!("that file could not be read: {why}")
         });
     }
-    let bytes = std::fs::read(&tmp).map_err(|e| format!("the decoded file went missing ({e})"))?;
-    riff_data(&bytes).ok_or_else(|| "the decoded file has no audio in it".to_owned())
-}
-
-/// The `data` chunk of a RIFF/WAVE file.
-///
-/// **Walked rather than assumed at offset 44.** `afconvert` writes an `FLLR`
-/// padding chunk before `data` to page-align it, so the fixed offset every
-/// tutorial gives lands in the middle of the padding — which reads as a track
-/// that begins with a burst of noise.
-#[cfg(target_os = "macos")]
-fn riff_data(bytes: &[u8]) -> Option<Vec<u8>> {
-    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
-        return None;
-    }
-    let mut at = 12usize;
-    while at + 8 <= bytes.len() {
-        let id = &bytes[at..at + 4];
-        let size = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().ok()?) as usize;
-        let from = at + 8;
-        if id == b"data" {
-            // Clamped: a size field that runs past the end is a truncated
-            // file, and what there is of it is still music.
-            let to = from.saturating_add(size).min(bytes.len());
-            return Some(bytes[from..to].to_vec());
-        }
-        // Chunks are word-aligned; an odd size carries a pad byte.
-        at = from.saturating_add(size + (size & 1));
-    }
-    None
+    std::fs::read(&tmp).map_err(|e| format!("the decoded file went missing ({e})"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hand-rolled WAV: `fmt ` then `data`, sizes as given (a streamed
+    /// ffmpeg WAV writes `0xFFFFFFFF` where it could not seek back).
+    fn wav_bytes(tag: u16, channels: u16, rate: u32, bits: u16, data: &[u8], lie: bool) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"RIFF");
+        b.extend_from_slice(&if lie { u32::MAX } else { 36 + data.len() as u32 }.to_le_bytes());
+        b.extend_from_slice(b"WAVE");
+        b.extend_from_slice(b"fmt ");
+        b.extend_from_slice(&16u32.to_le_bytes());
+        b.extend_from_slice(&tag.to_le_bytes());
+        b.extend_from_slice(&channels.to_le_bytes());
+        b.extend_from_slice(&rate.to_le_bytes());
+        let step = u32::from(bits / 8);
+        b.extend_from_slice(&(rate * step * u32::from(channels)).to_le_bytes());
+        b.extend_from_slice(&(step as u16 * channels).to_le_bytes());
+        b.extend_from_slice(&bits.to_le_bytes());
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&if lie { u32::MAX } else { data.len() as u32 }.to_le_bytes());
+        b.extend_from_slice(data);
+        b
+    }
+
+    /// **The container is believed over the ask.** Float stereo comes
+    /// through untouched; a STREAMED wav whose size fields lie (ffmpeg to a
+    /// pipe) still parses; int16 MONO — a decoder that ignored both asks —
+    /// comes out converted and doubled into both ears rather than as noise.
+    #[test]
+    fn the_wav_parse_reads_what_was_really_produced() {
+        let f32s: Vec<u8> = [0.5f32, -0.5, 0.25, -0.25]
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
+        let (s, rate) = wav_stereo_f32(&wav_bytes(3, 2, 48_000, 32, &f32s, false)).expect("f32");
+        assert_eq!(rate, 48_000);
+        assert_eq!(s, vec![0.5, -0.5, 0.25, -0.25]);
+
+        let (s, _) = wav_stereo_f32(&wav_bytes(3, 2, 48_000, 32, &f32s, true)).expect("streamed");
+        assert_eq!(s.len(), 4, "the lying sizes truncated the data");
+
+        let i16s: Vec<u8> = [16384i16, -16384]
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
+        let (s, rate) = wav_stereo_f32(&wav_bytes(1, 1, 44_100, 16, &i16s, false)).expect("i16");
+        assert_eq!(rate, 44_100);
+        assert_eq!(s.len(), 4, "mono did not double into stereo");
+        assert!((s[0] - 0.5).abs() < 1e-3 && (s[1] - 0.5).abs() < 1e-3);
+        assert!((s[2] + 0.5).abs() < 1e-3);
+
+        assert!(
+            wav_stereo_f32(&wav_bytes(85, 2, 48_000, 32, &f32s, false))
+                .unwrap_err()
+                .contains("format 85"),
+            "an unknown format must name itself"
+        );
+    }
+
+    /// **A disobeyed rate is resampled, not stamped.** A one-second tone
+    /// declared at 24k and asked for at 48k comes out one second long at
+    /// 48k — the wrong-speed export this replaces played it at half speed.
+    #[test]
+    fn a_disobeyed_rate_is_resampled_to_the_ask() {
+        let n = 24_000usize;
+        let input: Vec<f32> = (0..n * 2).map(|i| (i / 2) as f32 / n as f32).collect();
+        let out = resample_stereo(&input, 24_000, 48_000);
+        assert_eq!(out.len(), n * 4, "one second at 48k is 48k frames");
+        // The ramp survives: halfway through is about half.
+        let mid = out[out.len() / 2];
+        assert!((mid - 0.5).abs() < 0.01, "halfway was {mid}");
+    }
 
     /// **A file goes in and stereo float comes out at the rate asked for.**
     ///

@@ -866,6 +866,47 @@ channels play back their clips and nothing else. "Ready to play" and
   borderless window no longer falls through to `StartDrag` — a press
   that PLAYED must not also grab the window.
 
+- **4.80.0 — the Windows tester's round**: eight the tester found,
+  most cross-platform. WINDOWS AUDIO no longer opens on ASIO by
+  default — an unset preference resolves to the platform default
+  (WASAPI), the door every Windows machine has; ASIO stays a
+  deliberate choice in settings. The output stream builder gained
+  I24 (a Realtek ASIO output's native depth — its absence was the
+  "output speaks i24, not supported" that left the app silent on
+  first launch), plus F64/I64. The banner's × now clears the INPUT
+  error too (it outranks the others, so the × looked dead exactly
+  when an input had failed), and a saved input that will not open
+  under the current host FALLS BACK to the default input instead of
+  a sticky "is not connected". COPY/PASTE across platforms: every
+  internal copy now stamps the SYSTEM clipboard, because winit
+  swallows Ctrl/Cmd+V whole when the OS clipboard holds no text —
+  paste was inert on any fresh machine and "worked" on the owner's
+  Mac only by luck. A cross-track GROUP copies whole (the clip menu
+  cleared the selection first — "pasting the first of the group")
+  and pastes keeping its lane spread (each lane was clamped
+  separately and piled on the last track). THE MARQUEE painted pure
+  white over the clips: `from_rgba_premultiplied` with RGB far above
+  the alpha is an out-of-range premultiplied color that composites
+  near-additively — unmultiplied cream now, arrangement and editor
+  both. DRUMPAD after the 128-key rescale: media drops and pad
+  REORDER hit-tested a panel SLOT (0..16) and passed it as a KEY
+  (0..128) — a drop landed on the wrong pad, a reorder swapped the
+  wrong seats; both map through `drumpad_key_of` now, and a
+  reordered pad's FX bays ride with it (seats swapped, host state
+  files permuted). A new session no longer inherits the last
+  scratch's pads — `new_project` reclaimed the Untitled dir but left
+  its `drumpad.json`; the sidecar is dropped now. EXPORT glitching:
+  the decoder's output is VERIFIED against the container it produced
+  rather than trusted — a Windows ffmpeg that ignored `-ar`/`-ac`
+  wrote wrong-speed, wrong-channel audio and nothing could tell,
+  because the engine never resamples a clip; decode reads a WAV now,
+  reads the real rate and layout from its `fmt ` chunk, and
+  resamples or folds to the ask. THE TIME SELECTION IS A LOOP ZONE:
+  the orange span loops playback (wrapped on the audio thread, so
+  the wrap lands on a block boundary), and Escape clears it. The
+  Windows camera picker's message lost its garbled runs of literal
+  spaces.
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index

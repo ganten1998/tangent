@@ -588,29 +588,19 @@ pub fn host() -> cpal::Host {
             .and_then(|id| cpal::host_from_id(id).ok())
             .unwrap_or_else(cpal::default_host);
     }
-    // **No stated preference: ASIO first where it exists.** It is the
-    // low-latency door on Windows and every tester with an interface has
-    // its driver. Decided ONCE — probing instantiates ASIO drivers, and a
-    // per-lookup probe would load them sixty times a second.
-    static PREFERRED: std::sync::OnceLock<Option<cpal::HostId>> =
-        std::sync::OnceLock::new();
-    let preferred = *PREFERRED.get_or_init(|| {
-        if !cfg!(target_os = "windows") {
-            return None;
-        }
-        let id = cpal::available_hosts()
-            .into_iter()
-            .find(|id| id.name() == "ASIO")?;
-        let h = cpal::host_from_id(id).ok()?;
-        let has = h
-            .output_devices()
-            .map(|mut d| d.next().is_some())
-            .unwrap_or(false);
-        has.then_some(id)
-    });
-    preferred
-        .and_then(|id| cpal::host_from_id(id).ok())
-        .unwrap_or_else(cpal::default_host)
+    // **No stated preference: the PLATFORM DEFAULT — WASAPI on Windows.**
+    //
+    // This used to be "ASIO first where it exists", on the theory that
+    // every tester with an interface has its driver. The first real
+    // Windows tester had no interface at all — and Realtek ships a
+    // generic ASIO wrapper, so the probe found "an ASIO device", seated
+    // the whole app on a driver stack this codebase has never run in
+    // anger, and the output opened i24 and failed: a silent app on first
+    // launch, on stock hardware, with a settings knob as the only way
+    // out. The safe door is the one every Windows machine actually has.
+    // ASIO is still fully offered — as an explicit CHOICE in settings,
+    // where the person picking it knows they have an interface.
+    cpal::default_host()
 }
 
 /// Which device to open.
