@@ -432,9 +432,24 @@ cp docs/ARTIFACT-README.md "$WINSTAGE/README.txt"
 # Archive whatever was staged above. A hand-maintained file list silently drops
 # anything newly added — that is how the readme went missing from the macOS
 # artifacts before 2.1.0.
+# **The zip is a TRANSIENT installer input, not a deliverable.** The owner
+# ships Windows as the NSIS setup.exe alone — a portable zip is a second
+# thing to explain to a tester and a second way for the install to go
+# wrong. It is still built here because `build-installer.sh` unzips exactly
+# it (so the installed files can never drift from a staging dir), then it is
+# removed the moment the installer exists.
 (cd "$WINSTAGE" && zip -qr "$ROOT/$WINZIP" . -x '.DS_Store' '._*')
 rm -rf "$WINSTAGE"
-echo "==> $WINZIP"
+if command -v makensis >/dev/null 2>&1; then
+  scripts/build-installer.sh windows
+  rm -f "$WINZIP"
+  echo "==> dist/Tangent-${VERSION}-windows-setup.exe  (portable zip removed)"
+else
+  # No installer toolchain: keep the zip rather than ship nothing, but say
+  # loudly that the deliverable the owner wants was NOT produced.
+  echo "WARNING: makensis not found — built NO installer and LEFT the portable zip." >&2
+  echo "         Install it with: brew install makensis, then rerun." >&2
+fi
 
-ls -lh dist/tangent-"${VERSION}"-* 2>/dev/null | sed 's/^/    /'
+ls -lh dist/tangent-"${VERSION}"-* dist/Tangent-"${VERSION}"-windows-setup.exe 2>/dev/null | sed 's/^/    /'
 [ "$LINUX_OK" = 1 ] || echo "NOTE: Linux artifacts were skipped (ALSA cross-build). Windows built OK."
