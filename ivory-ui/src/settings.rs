@@ -452,6 +452,35 @@ pub struct Settings {
     pub white_key_active_color: Rgb,
     pub black_key_active_color: Rgb,
     pub sustain_color: Rgb,
+    // ── theme roles ────────────────────────────────────────────────────────
+    // Ten colours that used to be literals in a painter somewhere. They live
+    // here because a THEME is a set of values for settings fields (see
+    // `crate::theme`), and a colour a theme cannot reach is a colour that
+    // makes a theme look half-applied. Defaults are exactly what those
+    // literals were, so a settings file written before themes existed looks
+    // identical after this change.
+    /// Every line the theory modules draw.
+    pub theory_line_color: Rgb,
+    /// Interval names on the fretboard.
+    pub interval_text_color: Rgb,
+    /// The six effect dials under the VU strip.
+    pub fx_knob_color: Rgb,
+    /// The master, which is its own colour on purpose.
+    pub master_knob_color: Rgb,
+    /// The well the timecode and oscilloscope sit in.
+    pub meter_bg_color: Rgb,
+    /// The oscilloscope trace.
+    pub scope_draw_color: Rgb,
+    /// Insert-bay strip faces, mixer and arrangement alike.
+    pub fx_strip_color: Rgb,
+    /// The input chip under a channel.
+    pub input_chip_color: Rgb,
+    pub fretboard_color: Rgb,
+    pub string_color: Rgb,
+    /// Which theme is applied. A NAME rather than a copy of its values: the
+    /// values are already in the fields above, and storing the name is what
+    /// lets the menu show a tick beside the right row.
+    pub theme_name: String,
     pub prefer_flats: bool,
     pub chord_detection_enabled: bool,
     /// Whether the chord strip band is drawn under the theory band.
@@ -1112,6 +1141,20 @@ impl Default for Settings {
             white_key_active_color: Rgb::new(0x6C, 0x9B, 0xD2),
             black_key_active_color: Rgb::new(0x6C, 0x9B, 0xD2),
             sustain_color: Rgb::new(0xD2, 0xA3, 0x6C),
+            // The literals these replaced, so nothing moves on upgrade:
+            // theory_panel's light `line`, the fretboard's on-board ink, the
+            // band accent, REC_RED, and the scope's own face and green.
+            theory_line_color: Rgb::new(0x9c, 0x8f, 0x74),
+            interval_text_color: Rgb::new(0xE8, 0xDC, 0xC0),
+            fx_knob_color: Rgb::new(0x6C, 0x9B, 0xD2),
+            master_knob_color: Rgb::new(0xE8, 0x3A, 0x4E),
+            meter_bg_color: Rgb::new(0x0B, 0x0E, 0x0A),
+            scope_draw_color: Rgb::new(0xA3, 0xE0, 0x48),
+            fx_strip_color: Rgb::new(0xE3, 0xD9, 0xBD),
+            input_chip_color: Rgb::new(0xE3, 0xD9, 0xBD),
+            fretboard_color: Rgb::new(0x4a, 0x2b, 0x22),
+            string_color: Rgb::new(0xC9, 0xC4, 0xBC),
+            theme_name: "Default".to_owned(),
             prefer_flats: true,
             chord_detection_enabled: true,
             show_chord_strip: false,
@@ -1587,6 +1630,21 @@ impl Settings {
             &mut s.black_key_active_color,
         );
         take_color(&mut map, "sustain_color", &mut s.sustain_color);
+        take_color(&mut map, "theory_line_color", &mut s.theory_line_color);
+        take_color(&mut map, "interval_text_color", &mut s.interval_text_color);
+        take_color(&mut map, "fx_knob_color", &mut s.fx_knob_color);
+        take_color(&mut map, "master_knob_color", &mut s.master_knob_color);
+        take_color(&mut map, "meter_bg_color", &mut s.meter_bg_color);
+        take_color(&mut map, "scope_draw_color", &mut s.scope_draw_color);
+        take_color(&mut map, "fx_strip_color", &mut s.fx_strip_color);
+        take_color(&mut map, "input_chip_color", &mut s.input_chip_color);
+        take_color(&mut map, "fretboard_color", &mut s.fretboard_color);
+        take_color(&mut map, "string_color", &mut s.string_color);
+        if let Some(v) = map.shift_remove("theme_name") {
+            if let Some(t) = v.as_str() {
+                s.theme_name = t.to_owned();
+            }
+        }
 
         if let Some(v) = map.shift_remove("window_size_percent") {
             if let Some(n) = v.as_i64() {
@@ -3013,6 +3071,21 @@ impl Settings {
             "settings_version".into(),
             Value::Number(SETTINGS_VERSION.into()),
         );
+        map.insert("theme_name".into(), Value::String(self.theme_name.clone()));
+        for (k, v) in [
+            ("theory_line_color", self.theory_line_color),
+            ("interval_text_color", self.interval_text_color),
+            ("fx_knob_color", self.fx_knob_color),
+            ("master_knob_color", self.master_knob_color),
+            ("meter_bg_color", self.meter_bg_color),
+            ("scope_draw_color", self.scope_draw_color),
+            ("fx_strip_color", self.fx_strip_color),
+            ("input_chip_color", self.input_chip_color),
+            ("fretboard_color", self.fretboard_color),
+            ("string_color", self.string_color),
+        ] {
+            map.insert(k.into(), Value::String(v.to_hex()));
+        }
         for (k, v) in &self.extra {
             map.insert(k.clone(), v.clone());
         }

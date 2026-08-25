@@ -96,6 +96,11 @@ Section "Tangent application" SEC_APP
   SetOutPath "$INSTDIR"
   File /r "${SRCDIR}/app/*.*"
 
+  ; The VST3 plugin was retired 2026-08-24; old installers planted it in the
+  ; system VST3 directory and nothing ever cleaned it up, so other DAWs (and
+  ; Tangent's own scanner) kept finding a stale build. Upgrades remove it.
+  RMDir /r "$COMMONFILES64\VST3\Tangent.vst3"
+
   CreateDirectory "$SMPROGRAMS\Tangent"
   CreateShortCut "$SMPROGRAMS\Tangent\Tangent.lnk" "$INSTDIR\tangent.exe"
   CreateShortCut "$SMPROGRAMS\Tangent\Uninstall Tangent.lnk" "$INSTDIR\Uninstall.exe"

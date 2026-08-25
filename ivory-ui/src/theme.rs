@@ -1,0 +1,719 @@
+//! Themes: a named set of colours that paints the whole app.
+//!
+//! **A theme is a set of values for the colour fields `Settings` already
+//! carries, not a parallel colour system.** Every panel in this app already
+//! builds its `Palette` from `Settings`, so applying a theme is one write into
+//! settings and every surface follows on the next frame. The alternative — a
+//! Theme object threaded through twelve panels — would have meant two places
+//! a colour could live and two places to forget.
+//!
+//! **Every role is optional.** `None` means "leave the shipped default", which
+//! is what makes a three-line user theme legal: set the two colours you care
+//! about, inherit the rest. It is also what `Default` is — a theme that sets
+//! nothing at all.
+//!
+//! **Factory themes are code; user themes are files.** The files live beside
+//! `settings.json` in a folder called `user themes`, so "Reset Settings to
+//! Default" — which rewrites settings.json — cannot delete somebody's work. A
+//! reset unsets the CHOICE and the colours go back to default; the theme file
+//! is still there to pick again.
+
+use crate::settings::{Rgb, Settings};
+use std::path::PathBuf;
+
+/// Where user themes live: beside the settings file, in a folder named for
+/// what a person would call it.
+pub fn user_dir() -> PathBuf {
+    Settings::path()
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("user themes")
+}
+
+/// One theme. Every field is a role a panel asks for by name.
+///
+/// The roles are the owner's list, in the order a person meets them: the
+/// keyboard, the words and lines over it, the recorder band, the desk, and
+/// the fretboard.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Theme {
+    pub name: String,
+
+    // ── the keyboard ───────────────────────────────────────────────────────
+    pub white_key: Option<Rgb>,
+    pub black_key: Option<Rgb>,
+    /// The colour a held key wears. One value drives both white and black
+    /// active keys — two was a distinction nobody ever set differently.
+    pub key_active: Option<Rgb>,
+    /// Held-by-the-pedal. Reaches EVERY theory module, not just the piano.
+    pub sustain: Option<Rgb>,
+
+    // ── words and lines ────────────────────────────────────────────────────
+    pub text: Option<Rgb>,
+    /// Every line the theory modules draw: staff rules, grid, outlines.
+    pub theory_line: Option<Rgb>,
+    pub interval_text: Option<Rgb>,
+
+    // ── the recorder band ──────────────────────────────────────────────────
+    pub recorder_bg: Option<Rgb>,
+    /// The six effect knobs under the VU strip.
+    pub fx_knob: Option<Rgb>,
+    /// The master, which is deliberately its own colour: it is the one
+    /// control that can undo every other one.
+    pub master_knob: Option<Rgb>,
+    /// The well the timecode and the oscilloscope sit in.
+    pub meter_bg: Option<Rgb>,
+    /// The oscilloscope's trace — the green, on a stock install.
+    pub scope_draw: Option<Rgb>,
+
+    // ── the desk ───────────────────────────────────────────────────────────
+    /// The insert-bay strips, in the mixer and the arrangement alike.
+    pub fx_strip: Option<Rgb>,
+    /// The input chip under a channel.
+    pub input_chip: Option<Rgb>,
+    /// Which auto-colour palette the channels wear: an index into
+    /// `settings::PALETTES`, cycled rather than clamped, so a theme written
+    /// against a build with more palettes still lands somewhere sensible.
+    pub channel_palette: Option<i64>,
+
+    // ── the fretboard ──────────────────────────────────────────────────────
+    pub fretboard: Option<Rgb>,
+    pub string: Option<Rgb>,
+}
+
+/// A `const`-friendly colour literal, because `Rgb::new` is not const and a
+/// factory table of ninety colours should not need ninety function calls.
+const fn c(r: u8, g: u8, b: u8) -> Option<Rgb> {
+    Some(Rgb { r, g, b })
+}
+
+impl Theme {
+    /// The theme a fresh install wears: every role unset, so every panel keeps
+    /// the colour it ships with. Naming it explicitly matters — "Default" has
+    /// to appear in the menu beside the others, and picking it has to be the
+    /// way BACK from a theme somebody tried.
+    pub fn factory_default() -> Self {
+        Self {
+            name: "Default".to_owned(),
+            ..Self::default()
+        }
+    }
+
+    /// Read a theme out of the settings it would produce. This is "Save Theme
+    /// As...": whatever the app is wearing right now becomes a file.
+    pub fn capture(name: &str, s: &Settings) -> Self {
+        Self {
+            name: name.to_owned(),
+            white_key: Some(s.white_key_idle_color),
+            black_key: Some(s.black_key_idle_color),
+            key_active: Some(s.white_key_active_color),
+            sustain: Some(s.sustain_color),
+            text: Some(s.chord_text_color),
+            theory_line: Some(s.theory_line_color),
+            interval_text: Some(s.interval_text_color),
+            recorder_bg: Some(s.recorder_bg_color),
+            fx_knob: Some(s.fx_knob_color),
+            master_knob: Some(s.master_knob_color),
+            meter_bg: Some(s.meter_bg_color),
+            scope_draw: Some(s.scope_draw_color),
+            fx_strip: Some(s.fx_strip_color),
+            input_chip: Some(s.input_chip_color),
+            channel_palette: Some(s.palette_choice),
+            fretboard: Some(s.fretboard_color),
+            string: Some(s.string_color),
+        }
+    }
+
+    /// Paint the settings with this theme. Unset roles are left exactly as
+    /// they are — which is what makes a partial user theme work, and what
+    /// makes `Default` a no-op over freshly-reset settings.
+    ///
+    /// Applying is deliberately NOT recorded per-role: the theme name is the
+    /// record. Someone who then hand-edits one colour has a modified theme,
+    /// and `capture` is how they keep it.
+    pub fn apply(&self, s: &mut Settings) {
+        if let Some(v) = self.white_key {
+            s.white_key_idle_color = v;
+        }
+        if let Some(v) = self.black_key {
+            s.black_key_idle_color = v;
+        }
+        if let Some(v) = self.key_active {
+            // Both, for the reason `key_active` gives.
+            s.white_key_active_color = v;
+            s.black_key_active_color = v;
+        }
+        if let Some(v) = self.sustain {
+            s.sustain_color = v;
+        }
+        if let Some(v) = self.text {
+            s.chord_text_color = v;
+        }
+        if let Some(v) = self.theory_line {
+            s.theory_line_color = v;
+        }
+        if let Some(v) = self.interval_text {
+            s.interval_text_color = v;
+        }
+        if let Some(v) = self.recorder_bg {
+            s.recorder_bg_color = v;
+        }
+        if let Some(v) = self.fx_knob {
+            s.fx_knob_color = v;
+        }
+        if let Some(v) = self.master_knob {
+            s.master_knob_color = v;
+        }
+        if let Some(v) = self.meter_bg {
+            s.meter_bg_color = v;
+        }
+        if let Some(v) = self.scope_draw {
+            s.scope_draw_color = v;
+        }
+        if let Some(v) = self.fx_strip {
+            s.fx_strip_color = v;
+        }
+        if let Some(v) = self.input_chip {
+            s.input_chip_color = v;
+        }
+        if let Some(v) = self.channel_palette {
+            s.palette_choice = v;
+        }
+        if let Some(v) = self.fretboard {
+            s.fretboard_color = v;
+        }
+        if let Some(v) = self.string {
+            s.string_color = v;
+        }
+        s.theme_name = self.name.clone();
+    }
+
+    /// Serialise to the JSON a user theme file holds. Unset roles are simply
+    /// absent, so a captured theme and a hand-written two-line one round-trip
+    /// through the same reader.
+    pub fn to_json(&self) -> String {
+        use serde_json::{Map, Value};
+        let mut m = Map::new();
+        m.insert("name".into(), Value::String(self.name.clone()));
+        let mut put = |k: &str, v: Option<Rgb>| {
+            if let Some(v) = v {
+                m.insert(k.to_owned(), Value::String(v.to_hex()));
+            }
+        };
+        put("white_key", self.white_key);
+        put("black_key", self.black_key);
+        put("key_active", self.key_active);
+        put("sustain", self.sustain);
+        put("text", self.text);
+        put("theory_line", self.theory_line);
+        put("interval_text", self.interval_text);
+        put("recorder_bg", self.recorder_bg);
+        put("fx_knob", self.fx_knob);
+        put("master_knob", self.master_knob);
+        put("meter_bg", self.meter_bg);
+        put("scope_draw", self.scope_draw);
+        put("fx_strip", self.fx_strip);
+        put("input_chip", self.input_chip);
+        put("fretboard", self.fretboard);
+        put("string", self.string);
+        if let Some(v) = self.channel_palette {
+            m.insert("channel_palette".into(), Value::from(v));
+        }
+        serde_json::to_string_pretty(&Value::Object(m)).unwrap_or_default()
+    }
+
+    /// Read a theme file. Unknown keys are ignored and unreadable colours are
+    /// simply unset, so a typo costs one role rather than the whole file —
+    /// the same forgiveness `Settings::from_map` gives.
+    pub fn from_json(text: &str, fallback_name: &str) -> Option<Self> {
+        let serde_json::Value::Object(map) = serde_json::from_str(text).ok()? else {
+            return None;
+        };
+        let get = |k: &str| -> Option<Rgb> {
+            map.get(k).and_then(serde_json::Value::as_str).and_then(Rgb::parse)
+        };
+        Some(Self {
+            name: map
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or(fallback_name)
+                .to_owned(),
+            white_key: get("white_key"),
+            black_key: get("black_key"),
+            key_active: get("key_active"),
+            sustain: get("sustain"),
+            text: get("text"),
+            theory_line: get("theory_line"),
+            interval_text: get("interval_text"),
+            recorder_bg: get("recorder_bg"),
+            fx_knob: get("fx_knob"),
+            master_knob: get("master_knob"),
+            meter_bg: get("meter_bg"),
+            scope_draw: get("scope_draw"),
+            fx_strip: get("fx_strip"),
+            input_chip: get("input_chip"),
+            channel_palette: map.get("channel_palette").and_then(serde_json::Value::as_i64),
+            fretboard: get("fretboard"),
+            string: get("string"),
+        })
+    }
+
+    /// Write this theme into the user folder. The file name is the theme's
+    /// name with anything path-shaped removed — a theme called `../../evil`
+    /// writes `evil.json` in the themes folder and nowhere else.
+    pub fn save(&self) -> std::io::Result<PathBuf> {
+        let dir = user_dir();
+        std::fs::create_dir_all(&dir)?;
+        let stem: String = self
+            .name
+            .chars()
+            .map(|ch| if ch.is_alphanumeric() || ch == ' ' || ch == '-' || ch == '_' { ch } else { '_' })
+            .collect();
+        let stem = stem.trim().to_owned();
+        let stem = if stem.is_empty() { "theme".to_owned() } else { stem };
+        let path = dir.join(format!("{stem}.json"));
+        std::fs::write(&path, self.to_json())?;
+        Ok(path)
+    }
+}
+
+/// Every theme that ships in the binary, Default first.
+///
+/// **Eight, and they are a spread rather than eight variations on one idea.**
+/// One light-ivory default, one warm-paper light theme, and six darks that do
+/// not repeat a hue: plum, teal, navy, grey, warm-console, indigo. Three of
+/// them are the owner's own applications' palettes, kept faithful to what
+/// those apps look like rather than approximated.
+pub fn factory() -> Vec<Theme> {
+    vec![
+        Theme::factory_default(),
+        // ── Valentine: the owner's Focusrite control panel. Dark plum with a
+        // rose highlight and one coral spark for anything engaged; meters ramp
+        // jade → amber → crimson, so the scope is jade and the master crimson.
+        Theme {
+            name: "Valentine".to_owned(),
+            white_key: c(0xf3, 0xdc, 0xe7),
+            black_key: c(0x25, 0x15, 0x24),
+            key_active: c(0xff, 0x5f, 0xa2),
+            // Amber, not the coral it started as: rose and coral differ in
+            // HUE but barely in brightness (1.22:1), so a held note and a
+            // struck one looked alike at a glance and identical to anyone
+            // who does not separate red from orange. Amber is 1.6:1 clear of
+            // the rose and is Valentine's own warning colour.
+            sustain: c(0xff, 0xb4, 0x54),
+            text: c(0xf3, 0xdc, 0xe7),
+            theory_line: c(0xa3, 0x76, 0x8f),
+            interval_text: c(0x4c, 0xc7, 0xa4),
+            recorder_bg: c(0x17, 0x0e, 0x15),
+            fx_knob: c(0xff, 0x8a, 0x5b),
+            master_knob: c(0xff, 0x3b, 0x5c),
+            meter_bg: c(0x25, 0x15, 0x24),
+            scope_draw: c(0x4c, 0xc7, 0xa4),
+            fx_strip: c(0x5e, 0x2c, 0x4e),
+            input_chip: c(0x4c, 0xc7, 0xa4),
+            fretboard: c(0x25, 0x15, 0x24),
+            string: c(0xa3, 0x76, 0x8f),
+            channel_palette: None,
+        },
+        // ── Hydra: the owner's audio-routing TUI. Near-black teal depths, a
+        // bioluminescent seafoam glow, and exactly one warm coral — which is
+        // the sustain, because sustain is the held/engaged state.
+        Theme {
+            name: "Hydra".to_owned(),
+            white_key: c(0xd6, 0xe8, 0xe4),
+            black_key: c(0x10, 0x24, 0x28),
+            key_active: c(0x3f, 0xd9, 0xb8),
+            sustain: c(0xe8, 0x84, 0x5c),
+            text: c(0xd6, 0xe8, 0xe4),
+            theory_line: c(0x6a, 0x8c, 0x88),
+            interval_text: c(0xe0, 0xb0, 0x50),
+            recorder_bg: c(0x07, 0x14, 0x16),
+            fx_knob: c(0x3f, 0xd9, 0xb8),
+            master_knob: c(0xf0, 0x5c, 0x78),
+            meter_bg: c(0x10, 0x24, 0x28),
+            scope_draw: c(0x4f, 0xd4, 0x9a),
+            fx_strip: c(0x1c, 0x38, 0x3c),
+            input_chip: c(0x4f, 0xd4, 0x9a),
+            fretboard: c(0x10, 0x24, 0x28),
+            string: c(0x6a, 0x8c, 0x88),
+            channel_palette: None,
+        },
+        // ── Navi: the owner's graph viewer. Layered night blues with
+        // periwinkle nodes rimmed in electric cyan, and exactly one warm
+        // colour — amber — which that app reserves for SELECTION, so it is
+        // the master here: the one control that is about intent.
+        Theme {
+            name: "Navi".to_owned(),
+            white_key: c(0xe0, 0xf0, 0xff),
+            black_key: c(0x0a, 0x1c, 0x34),
+            key_active: c(0x55, 0x78, 0xff),
+            sustain: c(0x40, 0xe8, 0xff),
+            text: c(0xe0, 0xf0, 0xff),
+            theory_line: c(0x26, 0x50, 0x80),
+            interval_text: c(0xa8, 0xc8, 0xd8),
+            recorder_bg: c(0x10, 0x1e, 0x2e),
+            fx_knob: c(0x00, 0xd8, 0xf8),
+            master_knob: c(0xf0, 0x90, 0x30),
+            meter_bg: c(0x0a, 0x1c, 0x34),
+            scope_draw: c(0x40, 0xe8, 0xff),
+            fx_strip: c(0x19, 0x2e, 0x48),
+            input_chip: c(0x55, 0x78, 0xff),
+            fretboard: c(0x0a, 0x1c, 0x34),
+            string: c(0x78, 0x98, 0xb8),
+            channel_palette: None,
+        },
+        // ── Mono: greys, and one red.
+        //
+        // Monochrome MOSTLY, by the owner's word, and the exception is the
+        // master: a fader that can silence everything has to be the one thing
+        // on screen that is not grey, or the discipline costs more than it
+        // buys. The scope draws white, like a scope.
+        Theme {
+            name: "Mono".to_owned(),
+            white_key: c(0xd8, 0xd8, 0xd8),
+            black_key: c(0x14, 0x14, 0x14),
+            key_active: c(0xf0, 0xf0, 0xf0),
+            sustain: c(0x90, 0x90, 0x90),
+            text: c(0xe0, 0xe0, 0xe0),
+            theory_line: c(0x5a, 0x5a, 0x5a),
+            interval_text: c(0xa8, 0xa8, 0xa8),
+            recorder_bg: c(0x0d, 0x0d, 0x0d),
+            fx_knob: c(0xc8, 0xc8, 0xc8),
+            master_knob: c(0xb0, 0x40, 0x38),
+            meter_bg: c(0x14, 0x14, 0x14),
+            scope_draw: c(0xd0, 0xd0, 0xd0),
+            fx_strip: c(0x26, 0x26, 0x26),
+            input_chip: c(0x8a, 0x8a, 0x8a),
+            fretboard: c(0x1a, 0x1a, 0x1a),
+            string: c(0x78, 0x78, 0x78),
+            channel_palette: None,
+        },
+        // ── Studio: the analogue console. Warm charcoal, cream legends, VU
+        // amber for anything that moves, an oxblood master, and the sage-green
+        // lamp old gear uses for "connected" on the input chip.
+        Theme {
+            name: "Studio".to_owned(),
+            white_key: c(0xe8, 0xe2, 0xd4),
+            black_key: c(0x19, 0x17, 0x14),
+            key_active: c(0xd8, 0xa0, 0x3c),
+            sustain: c(0x8f, 0x6b, 0x2f),
+            text: c(0xe8, 0xe2, 0xd4),
+            theory_line: c(0x6b, 0x63, 0x55),
+            interval_text: c(0xc0, 0x8f, 0x4a),
+            recorder_bg: c(0x1c, 0x1a, 0x17),
+            fx_knob: c(0xd8, 0xa0, 0x3c),
+            // Oxblood lifted until it is actually visible: at 0x8c2f28 the
+            // master was 2.1:1 against the band — the one control that can
+            // silence everything, and the hardest to find.
+            master_knob: c(0xb8, 0x45, 0x3a),
+            meter_bg: c(0x27, 0x24, 0x20),
+            scope_draw: c(0xd8, 0xa0, 0x3c),
+            fx_strip: c(0x3a, 0x35, 0x2e),
+            input_chip: c(0x7f, 0xa0, 0x5a),
+            fretboard: c(0x27, 0x24, 0x20),
+            string: c(0xa8, 0x98, 0x80),
+            channel_palette: None,
+        },
+        // ── Aurora: indigo night with a mint/violet complementary pair — mint
+        // for what is sounding, violet for what is HELD, so the two states of
+        // a note are opposite ends of the wheel and never confusable.
+        Theme {
+            name: "Aurora".to_owned(),
+            white_key: c(0xdf, 0xe4, 0xee),
+            black_key: c(0x12, 0x14, 0x1b),
+            key_active: c(0x5c, 0xe8, 0xb4),
+            sustain: c(0xa9, 0x7b, 0xf0),
+            text: c(0xdf, 0xe4, 0xee),
+            theory_line: c(0x4a, 0x50, 0x68),
+            interval_text: c(0x7f, 0xd4, 0xf0),
+            recorder_bg: c(0x14, 0x16, 0x1f),
+            fx_knob: c(0x5c, 0xe8, 0xb4),
+            master_knob: c(0xe0, 0x56, 0x7a),
+            meter_bg: c(0x1e, 0x21, 0x30),
+            scope_draw: c(0x5c, 0xe8, 0xb4),
+            fx_strip: c(0x2a, 0x2e, 0x40),
+            input_chip: c(0xa9, 0x7b, 0xf0),
+            fretboard: c(0x1e, 0x21, 0x30),
+            string: c(0x6b, 0x72, 0x90),
+            channel_palette: None,
+        },
+        // ── Sandstone: the LIGHT one, and the reason the set needs it — every
+        // other theme here is dark, and a person working in daylight has
+        // nowhere to go. Warm sand paper, umber ink, terracotta for what
+        // moves, sage for what is held. The scope draws DARK, because on a
+        // pale meter a bright trace is invisible: the one place a light theme
+        // cannot simply invert a dark one.
+        Theme {
+            name: "Sandstone".to_owned(),
+            white_key: c(0xfa, 0xf4, 0xe8),
+            black_key: c(0x4a, 0x3f, 0x34),
+            key_active: c(0xc8, 0x66, 0x3c),
+            // Deep sage rather than mid sage: on a light ground the sustain
+            // must be DARKER than the struck note, and the mid sage sat at
+            // the terracotta's own brightness (1.10:1) — two states, one
+            // apparent colour.
+            sustain: c(0x4f, 0x61, 0x36),
+            text: c(0x3a, 0x31, 0x28),
+            theory_line: c(0x9c, 0x8a, 0x70),
+            interval_text: c(0x8a, 0x5a, 0x2c),
+            recorder_bg: c(0xec, 0xe3, 0xd2),
+            fx_knob: c(0xc8, 0x66, 0x3c),
+            master_knob: c(0xa0, 0x38, 0x28),
+            meter_bg: c(0xde, 0xd2, 0xbc),
+            scope_draw: c(0x5a, 0x70, 0x40),
+            fx_strip: c(0xd5, 0xc8, 0xb0),
+            input_chip: c(0x7d, 0x8f, 0x5a),
+            fretboard: c(0xc9, 0xb5, 0x96),
+            string: c(0x6b, 0x5c, 0x48),
+            channel_palette: None,
+        },
+    ]
+}
+
+/// Every user theme on disk, by file name order. Unreadable files are skipped
+/// rather than reported: a themes folder is somewhere people put junk, and one
+/// bad file must not cost the menu.
+pub fn user_themes() -> Vec<Theme> {
+    let dir = user_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("json")))
+        .collect();
+    paths.sort();
+    paths
+        .iter()
+        .filter_map(|p| {
+            let text = std::fs::read_to_string(p).ok()?;
+            let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned())?;
+            Theme::from_json(&text, &stem)
+        })
+        .collect()
+}
+
+/// Find a theme by name: factory first, then the user folder. A user theme
+/// that shadows a factory name loses, so "Default" always means Default.
+pub fn by_name(name: &str) -> Option<Theme> {
+    factory()
+        .into_iter()
+        .find(|t| t.name == name)
+        .or_else(|| user_themes().into_iter().find(|t| t.name == name))
+}
+
+/// The example file, written into the user folder the first time the app
+/// looks, so somebody who opens that folder finds a template rather than
+/// nothing. Every role present and EMPTY, which is legal and does nothing —
+/// the point is that the key names are discoverable without documentation.
+pub const EXAMPLE: &str = r##"{
+  "name": "My Theme",
+
+  "_comment": "Every value below is optional. Delete a line to keep Tangent's",
+  "_comment2": "default for that role, or set it to a hex colour like \"#ff5fa2\".",
+  "_comment3": "Colours accept #rgb, #rrggbb, or rrggbb.",
+
+  "white_key": "",
+  "black_key": "",
+  "key_active": "",
+  "sustain": "",
+
+  "text": "",
+  "theory_line": "",
+  "interval_text": "",
+
+  "recorder_bg": "",
+  "fx_knob": "",
+  "master_knob": "",
+  "meter_bg": "",
+  "scope_draw": "",
+
+  "fx_strip": "",
+  "input_chip": "",
+
+  "fretboard": "",
+  "string": ""
+}
+"##;
+
+/// Put the example in the user folder if that folder has no example yet.
+/// Never overwrites: somebody may have edited it into a real theme.
+pub fn seed_example() {
+    let dir = user_dir();
+    let path = dir.join("example.json");
+    if path.exists() {
+        return;
+    }
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let _ = std::fs::write(&path, EXAMPLE);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_factory_set_is_eight_themes_with_default_first() {
+        let f = factory();
+        assert_eq!(f.len(), 8, "the owner asked for Default plus seven");
+        assert_eq!(f[0].name, "Default");
+        // Default sets nothing: picking it is the way back to the shipped look.
+        assert_eq!(f[0].white_key, None);
+        assert_eq!(f[0].recorder_bg, None);
+        // Names are unique, or the menu has two rows that do the same thing.
+        let mut names: Vec<&str> = f.iter().map(|t| t.name.as_str()).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(names.len(), before, "duplicate theme name");
+    }
+
+    #[test]
+    fn every_non_default_factory_theme_fills_every_role() {
+        // A half-filled factory theme reads as a bug on somebody's screen:
+        // half the app in the new colours, half in the old ones.
+        for t in factory().into_iter().skip(1) {
+            for (role, set) in [
+                ("white_key", t.white_key.is_some()),
+                ("black_key", t.black_key.is_some()),
+                ("key_active", t.key_active.is_some()),
+                ("sustain", t.sustain.is_some()),
+                ("text", t.text.is_some()),
+                ("theory_line", t.theory_line.is_some()),
+                ("interval_text", t.interval_text.is_some()),
+                ("recorder_bg", t.recorder_bg.is_some()),
+                ("fx_knob", t.fx_knob.is_some()),
+                ("master_knob", t.master_knob.is_some()),
+                ("meter_bg", t.meter_bg.is_some()),
+                ("scope_draw", t.scope_draw.is_some()),
+                ("fx_strip", t.fx_strip.is_some()),
+                ("input_chip", t.input_chip.is_some()),
+                ("fretboard", t.fretboard.is_some()),
+                ("string", t.string.is_some()),
+            ] {
+                assert!(set, "{} leaves {role} unset", t.name);
+            }
+        }
+    }
+
+    /// Relative luminance, the WCAG definition, for the contrast check below.
+    fn lum(c: Rgb) -> f64 {
+        let f = |v: u8| {
+            let s = f64::from(v) / 255.0;
+            if s <= 0.03928 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * f(c.r) + 0.7152 * f(c.g) + 0.0722 * f(c.b)
+    }
+
+    fn contrast(a: Rgb, b: Rgb) -> f64 {
+        let (x, y) = (lum(a), lum(b));
+        let (hi, lo) = if x > y { (x, y) } else { (y, x) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    #[test]
+    fn every_factory_theme_is_readable_on_its_own_background() {
+        // The whole point of shipping themes rather than leaving it to a
+        // config file is that the shipped ones are KNOWN to work. Text on the
+        // band, the scope trace in its own well, and the knobs against the
+        // band all have to clear a real threshold — a theme that looks
+        // striking in a table and is unreadable on screen is worse than no
+        // theme at all. 4.5:1 is WCAG AA for text; the marks are held to 3:1,
+        // the large-object threshold.
+        for t in factory().into_iter().skip(1) {
+            let bg = t.recorder_bg.expect("checked above");
+            let text = t.text.expect("checked above");
+            assert!(
+                contrast(text, bg) >= 4.5,
+                "{}: text on the band is {:.1}:1",
+                t.name,
+                contrast(text, bg)
+            );
+            let meter = t.meter_bg.expect("checked above");
+            let scope = t.scope_draw.expect("checked above");
+            assert!(
+                contrast(scope, meter) >= 3.0,
+                "{}: the scope trace is {:.1}:1 against its own well",
+                t.name,
+                contrast(scope, meter)
+            );
+            for (role, mark) in [
+                ("fx_knob", t.fx_knob.expect("checked")),
+                ("master_knob", t.master_knob.expect("checked")),
+                ("key_active", t.key_active.expect("checked")),
+            ] {
+                assert!(
+                    contrast(mark, bg) >= 3.0,
+                    "{}: {role} is {:.1}:1 against the band",
+                    t.name,
+                    contrast(mark, bg)
+                );
+            }
+            // A held note must not look like a sounding one.
+            let (a, s) = (t.key_active.expect("checked"), t.sustain.expect("checked"));
+            assert!(
+                contrast(a, s) >= 1.25,
+                "{}: sustain and active are {:.2}:1 apart - too close to tell",
+                t.name,
+                contrast(a, s)
+            );
+        }
+    }
+
+    #[test]
+    fn a_theme_round_trips_through_its_file_format() {
+        let t = &factory()[1];
+        let back = Theme::from_json(&t.to_json(), "ignored").expect("valid json");
+        assert_eq!(&back, t);
+    }
+
+    #[test]
+    fn a_partial_theme_leaves_every_other_role_alone() {
+        // The example file's whole premise: set one colour, inherit the rest.
+        let json = r##"{"name": "Two Lines", "sustain": "#123456"}"##;
+        let t = Theme::from_json(json, "file-name").expect("valid json");
+        assert_eq!(t.name, "Two Lines");
+        assert_eq!(t.sustain, Some(Rgb::new(0x12, 0x34, 0x56)));
+        assert_eq!(t.text, None);
+        assert_eq!(t.recorder_bg, None);
+    }
+
+    #[test]
+    fn empty_strings_in_the_example_are_unset_rather_than_black() {
+        // The shipped example has every key present and empty. If "" parsed
+        // as a colour, opening the app with it would paint everything black.
+        let t = Theme::from_json(EXAMPLE, "example").expect("the example is valid json");
+        assert_eq!(t.name, "My Theme");
+        assert_eq!(t.white_key, None, "an empty value must not become a colour");
+        assert_eq!(t.scope_draw, None);
+        assert_eq!(t.channel_palette, None);
+    }
+
+    #[test]
+    fn a_theme_name_can_never_write_outside_the_themes_folder() {
+        let evil = Theme {
+            name: "../../../etc/passwd".to_owned(),
+            ..Theme::default()
+        };
+        let stem: String = evil
+            .name
+            .chars()
+            .map(|ch| {
+                if ch.is_alphanumeric() || ch == ' ' || ch == '-' || ch == '_' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        assert!(!stem.contains('/'), "path separators survive: {stem}");
+        assert!(!stem.contains(".."), "traversal survives: {stem}");
+    }
+}

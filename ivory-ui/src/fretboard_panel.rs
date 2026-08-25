@@ -353,6 +353,25 @@ struct Palette {
     on_board: Color32,
 }
 
+/// A theme's board and strings, when a theme is worn.
+///
+/// **The wood is still the wood on Default.** A neck is made of what it is
+/// made of, and swapping maple for ebony because the lights went down would
+/// be a different instrument — that rule stands, and the Wood picker keeps
+/// working. But a THEME is the user saying "paint the whole app", and a
+/// fretboard that ignored it was the one panel left behind. So: Default wears
+/// its wood, every other theme paints the neck.
+fn themed_board(s: &Settings, wood_board: Color32, wood_string: Color32) -> (Color32, Color32) {
+    if s.theme_name == "Default" {
+        (wood_board, wood_string)
+    } else {
+        (
+            s.fretboard_color.to_color32(),
+            s.string_color.to_color32(),
+        )
+    }
+}
+
 fn palette(s: &Settings, wood: Wood) -> Palette {
     // The app is flat and high-contrast by design — cream keys, near-black
     // sharps, one accent colour for anything sounding — and the neck follows
@@ -388,6 +407,10 @@ fn palette(s: &Settings, wood: Wood) -> Palette {
             Color32::from_rgb(0xEC, 0xE6, 0xDA).gamma_multiply(0.82),
         ),
     };
+    // The theme paints the neck unless the theme is Default — see
+    // `themed_board`. Applied here, after the wood table, so the Wood picker
+    // still decides everything else about the neck (nut, wire, inlays).
+    let (board, string) = themed_board(s, board, string);
     Palette {
         bg: crate::piano::bg_color(dark),
         board,

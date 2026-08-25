@@ -428,6 +428,13 @@ pub fn band_bg(s: &Settings) -> Color32 {
     palette(s).bg
 }
 
+/// A themed line, darkened for dark mode, keeping its hue — dark mode and the
+/// theme are two controls and must compose rather than cancel.
+fn shade_line(c: Color32, k: f32) -> Color32 {
+    let f = |v: u8| (f32::from(v) * k).clamp(0.0, 255.0) as u8;
+    Color32::from_rgb(f(c.r()), f(c.g()), f(c.b()))
+}
+
 fn palette(s: &Settings) -> Palette {
     let lit = s.white_key_active_color.to_color32();
     // `faint` and `line` carry the outlines, the roman numerals and the key
@@ -442,7 +449,7 @@ fn palette(s: &Settings) -> Palette {
             bg: Color32::from_rgb(0x0a, 0x0a, 0x0a),
             ink: Color32::from_rgb(0xE8, 0xDC, 0xC0),
             faint: Color32::from_rgb(0x9a, 0x92, 0x80),
-            line: Color32::from_rgb(0x62, 0x5c, 0x50),
+            line: shade_line(s.theory_line_color.to_color32(), 0.66),
             lit,
             lit_text: Color32::BLACK,
             root: s.sustain_color.to_color32(),
@@ -452,7 +459,7 @@ fn palette(s: &Settings) -> Palette {
             bg: Color32::from_rgb(0xE8, 0xDC, 0xC0),
             ink: Color32::from_rgb(0x1a, 0x1a, 0x1a),
             faint: Color32::from_rgb(0x6b, 0x60, 0x4a),
-            line: Color32::from_rgb(0x9c, 0x8f, 0x74),
+            line: s.theory_line_color.to_color32(),
             lit,
             lit_text: Color32::WHITE,
             root: s.sustain_color.to_color32(),

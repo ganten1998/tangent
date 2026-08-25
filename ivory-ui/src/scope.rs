@@ -56,9 +56,19 @@ impl ScopeStyle {
     /// The cluster's own face: tape-green on black, both modes — the same
     /// glass the timecode is behind.
     pub fn lcd() -> Self {
-        let green = Color32::from_rgb(0xA3, 0xE0, 0x48);
+        Self::themed(
+            Color32::from_rgb(0xA3, 0xE0, 0x48),
+            Color32::from_rgb(0x0B, 0x0E, 0x0A),
+        )
+    }
+
+    /// The same glass in a theme's colours: one trace colour, one face, and
+    /// every derived shade (grid, glow, fill) taken from the trace so a theme
+    /// sets ONE value and the whole instrument follows.
+    pub fn themed(trace: Color32, face: Color32) -> Self {
+        let green = trace;
         Self {
-            face: Color32::from_rgb(0x0B, 0x0E, 0x0A),
+            face,
             bezel: None,
             grid: Color32::from_rgba_unmultiplied(green.r(), green.g(), green.b(), 26),
             trace: green,

@@ -109,6 +109,7 @@ build_macos() {
     --identifier com.ganten.tangent.app \
     --version "$VERSION" \
     --install-location /Applications \
+    --scripts installer/macos/scripts \
     "$WORK/macos/pkgs/Tangent-app.pkg" >/dev/null
 
   cp installer/macos/welcome.html installer/macos/conclusion.html "$WORK/macos/resources/"

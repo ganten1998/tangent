@@ -2989,6 +2989,8 @@ impl IvoryApp {
         };
         let channels = Strip::shown();
         crate::mixer_panel::MixerView {
+            fx_strip: self.settings.fx_strip_color.to_color32(),
+            input_chip: self.settings.input_chip_color.to_color32(),
             strips: std::array::from_fn(|i| match channels.get(i) {
                 Some(s) => strip(*s),
                 None => crate::mixer_panel::StripView {
@@ -3177,6 +3179,12 @@ impl IvoryApp {
         MenuView {
             // Scoped out of dark mode — see the mixer view.
             dark_mode: false,
+            theme_name: self.settings.theme_name.clone(),
+            factory_themes: crate::theme::factory().into_iter().map(|t| t.name).collect(),
+            // Read from disk every time the menu opens rather than cached: a
+            // person who drops a file in that folder expects to find it in
+            // the menu, and opening a context menu is not a hot path.
+            user_themes: crate::theme::user_themes().into_iter().map(|t| t.name).collect(),
             borderless: self.settings.borderless_mode,
             keytoggle: self.settings.keytoggle_enabled,
             prefer_flats: self.settings.prefer_flats,
@@ -12718,6 +12726,28 @@ impl IvoryApp {
                     color: seed.to_color32(),
                 });
             }
+            MenuAction::ApplyTheme(name) => {
+                if let Some(t) = crate::theme::by_name(&name) {
+                    t.apply(&mut self.settings);
+                } else {
+                    // A theme that vanished between opening the menu and
+                    // clicking it — deleted file, renamed folder. Falling
+                    // back to Default is the honest answer: it is the one
+                    // theme that always exists.
+                    crate::theme::Theme::factory_default().apply(&mut self.settings);
+                }
+                self.save_settings();
+            }
+            MenuAction::SaveThemeAs => {
+                // The colours the app is wearing, named by hand. Seeded with
+                // the current theme's name so "save a tweak to Mono" is a
+                // one-word edit rather than a fresh sentence.
+                self.dialog = Some(dialogs::Dialog::SaveTheme {
+                    name: self.settings.theme_name.clone(),
+                    message: None,
+                    focus: true,
+                });
+            }
             MenuAction::ToggleDarkMode => {
                 self.settings.dark_mode = !self.settings.dark_mode;
                 self.save_settings();
@@ -13465,6 +13495,30 @@ impl IvoryApp {
             DialogAction::SetShowWelcome(show) => {
                 self.settings.show_welcome = show;
                 self.save_settings();
+            }
+            DialogAction::SaveThemeNamed(name) => {
+                let name = name.trim().to_owned();
+                let theme = crate::theme::Theme::capture(&name, &self.settings);
+                match theme.save() {
+                    Ok(path) => {
+                        // The saved theme becomes the worn one, so the menu
+                        // greys the row the user just made — the app and the
+                        // folder agree from this moment on.
+                        self.settings.theme_name = name;
+                        self.save_settings();
+                        log::info!("theme saved to {}", path.display());
+                        self.dialog = None;
+                    }
+                    Err(e) => {
+                        // Stays open with the typed name intact: a read-only
+                        // folder or a full disk is worth saying out loud.
+                        if let Some(dialogs::Dialog::SaveTheme { message, .. }) =
+                            self.dialog.as_mut()
+                        {
+                            *message = Some(format!("Could not save: {e}"));
+                        }
+                    }
+                }
             }
             DialogAction::OpenReaStream => {
                 self.dialog = Some(dialogs::Dialog::ReaStream {
