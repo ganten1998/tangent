@@ -1481,6 +1481,22 @@ impl DesktopApp {
             );
             let engine = self.recorder.engine.as_ref();
             self.recorder.transport.push(engine, session_rolling);
+            // **The loop region, pushed every frame from the time
+            // selection.** Frames off the engine's own rate; cleared to
+            // (0,0) when there is no selection. Suppressed WHILE a take
+            // records — a loop that yanked the playhead back mid-take would
+            // overwrite what was just captured — the same guard the reorder
+            // and locate paths keep.
+            if let Some(e) = engine {
+                let rate = f64::from(e.output().sample_rate).max(1.0);
+                match self.app.loop_region().filter(|_| !session_rolling) {
+                    Some((a, b)) => e.set_loop(
+                        (a.max(0.0) * rate) as u64,
+                        (b.max(0.0) * rate) as u64,
+                    ),
+                    None => e.set_loop(0, 0),
+                }
+            }
         }
         // And a repaint while the audition rolls, or the playhead only moves
         // when the mouse does.
@@ -1797,6 +1813,10 @@ impl DesktopApp {
             // that dismisses one message and not the one under the cursor is
             // worse than no × at all.
             self.recorder.engine_error = None;
+            // And the INPUT error, which outranks both in the banner's
+            // priority order — with it uncleared the × was dead exactly
+            // when the message was the sticky "is not connected".
+            self.recorder.session.dismiss_audio_error();
         }
         while let Some(request) = self.app.take_recorder_request() {
             match request {

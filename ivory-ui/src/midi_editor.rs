@@ -713,7 +713,10 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
             Stroke::new(1.0, INK.gamma_multiply(0.8)),
             egui::StrokeKind::Inside,
         );
-        painter.rect_filled(r, 0.0, Color32::from_rgba_premultiplied(0xff, 0xf4, 0xe0, 10));
+        // UNmultiplied — the premultiplied form with RGB far above the
+        // alpha composited near-additively and painted the band white;
+        // same fix as the arrangement's ClipBand.
+        painter.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0xff, 0xf4, 0xe0, 28));
     }
 
     // ── the playhead ─────────────────────────────────────────────────────

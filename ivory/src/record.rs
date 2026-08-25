@@ -1262,20 +1262,49 @@ impl Session {
         // the channel rather than lost with the thread.
         self.plugin_audio = None;
         let tap = self.recover_tap();
-        match Audio::open(
+        // **A saved device that will not open falls back to the DEFAULT
+        // input rather than dead air.** A saved key lives in ONE host's
+        // namespace: switch WASAPI and ASIO, or unplug the interface, and
+        // the name resolves nowhere — the old behavior parked a sticky
+        // "is not connected" on the banner and captured nothing until the
+        // user re-picked a device by hand. The default is whatever the OS
+        // says the machine's microphone is, which is the right degraded
+        // answer; the banner still tells the truth about the device that
+        // was asked for.
+        let mut fallback_note = None;
+        let opened = Audio::open(
             selection,
             picks,
             self.timebase,
             self.tap_tx.clone(),
             buffer_frames,
             sample_rate,
-        ) {
+        )
+        .or_else(|e| {
+            if matches!(selection, InputSelection::Default) {
+                return Err(e);
+            }
+            Audio::open(
+                &InputSelection::Default,
+                picks,
+                self.timebase,
+                self.tap_tx.clone(),
+                buffer_frames,
+                sample_rate,
+            )
+            .map(|a| {
+                fallback_note = Some(format!("{e} - using the default input instead"));
+                a
+            })
+            .map_err(|_| e)
+        });
+        match opened {
             Ok(a) => {
                 if let Some(t) = tap {
                     let _ = a.cmds.send(Cmd::Plugin(Some(Box::new(t))));
                 }
                 self.audio = Some(a);
-                self.audio_error = None;
+                self.audio_error = fallback_note;
             }
             Err(e) => {
                 // The device would not open, so the instrument goes back to
@@ -1288,6 +1317,15 @@ impl Session {
                 self.audio_error = Some(e);
             }
         }
+    }
+
+    /// The × on the status row, reaching the INPUT error. The dismiss
+    /// handler cleared the take note and the engine's error and left this
+    /// one — the highest-priority message of the three — so the × looked
+    /// dead whenever an input had failed. Dismissal is acknowledgement,
+    /// not repair: the error returns if the next reopen fails again.
+    pub fn dismiss_audio_error(&mut self) {
+        self.audio_error = None;
     }
 
     /// Collect the instrument tap from whichever writer has just released it.

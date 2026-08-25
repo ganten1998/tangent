@@ -457,6 +457,18 @@ pub struct IvoryApp {
     note_clipboard: Vec<crate::arrangement::ArrNote>,
     /// The CLIP clipboard: starts relative to the earliest copied clip.
     clip_clipboard: Vec<crate::arrangement::ArrClip>,
+    /// Text to stamp onto the SYSTEM clipboard, flushed next frame.
+    ///
+    /// Not decoration. The winit layer answers Ctrl/Cmd+V by reading the
+    /// OS clipboard, and when that holds no text it swallows the chord
+    /// whole — no `Paste` event AND no `V` key reaches egui. This app
+    /// kept its clips in internal clipboards and never wrote the system
+    /// one, so on a machine where nobody had copied text yet (the
+    /// Windows tester's fresh box) paste was permanently inert; on the
+    /// owner's Mac it "worked" only because some text always happened to
+    /// be there. Every internal copy now stamps a marker so the chord
+    /// always comes back as an event.
+    clipboard_stamp: Option<String>,
     /// The gesture in flight on the arrangement, if any.
     arr_drag: Option<ArrDrag>,
     /// A clip edit happened during the current gesture: save on release.
@@ -1400,6 +1412,7 @@ impl IvoryApp {
             hist_at: 0,
             note_clipboard: Vec::new(),
             clip_clipboard: Vec::new(),
+            clipboard_stamp: None,
             arr_drag: None,
             arr_gesture_dirty: false,
             arr_pending: None,
@@ -4895,6 +4908,15 @@ impl IvoryApp {
         let root = self.record_root().join("Projects");
         let dir = fresh_project_dir(&root);
         let doc = dir.join("project.tangent");
+        // **A reclaimed scratch sheds its kit.** An unnamed Untitled gets
+        // reused, and only `project.tangent` was being rewritten — the old
+        // scratch's `drumpad.json` sat beside it, so `open_project`
+        // reloaded the previous session's pads into the "new" one, and
+        // they survived even a settings reset (the kit is project data,
+        // not settings). Only the SIDECAR goes: `media/` may hold takes
+        // recorded into the old scratch, and orphaned files are cheaper
+        // than deleted ones.
+        let _ = std::fs::remove_file(dir.join(crate::drumpad::FILE_NAME));
         let _ = std::fs::create_dir_all(dir.join("media"));
         let arr = crate::arrangement::Arrangement::default();
         arr.save_to(&doc);
@@ -6342,6 +6364,8 @@ impl IvoryApp {
         for c in &mut clips {
             c.start_s -= t0;
         }
+        // The stamp is what makes Ctrl/Cmd+V arrive at all — see the field.
+        self.clipboard_stamp = Some(format!("Tangent: {} clip(s)", clips.len()));
         self.clip_clipboard = clips;
     }
 
@@ -6364,6 +6388,19 @@ impl IvoryApp {
                 target.min(crate::recorder::CHANNELS - 1) as i64 - base as i64
             }
             None => 0,
+        };
+        // **The WHOLE group is shifted, or the shift is shortened** — the
+        // per-clip clamp below is a backstop, not the mechanism. Clamping
+        // each lane separately squashed a cross-track group onto the last
+        // lane when the target sat near the bottom: three stacked clips
+        // pasted as one visible clip.
+        let (lo, hi) = pasted.iter().fold((i64::MAX, i64::MIN), |(lo, hi), c| {
+            (lo.min(c.lane as i64), hi.max(c.lane as i64))
+        });
+        let lane_d = if lo <= hi {
+            lane_d.clamp(-lo, (crate::recorder::CHANNELS as i64 - 1 - hi).max(-lo))
+        } else {
+            lane_d
         };
         let mut fresh = Vec::new();
         for mut c in pasted {
@@ -6945,6 +6982,8 @@ impl IvoryApp {
             n.at_s -= t0;
         }
         notes.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
+        // The stamp is what makes Ctrl/Cmd+V arrive at all — see the field.
+        self.clipboard_stamp = Some(format!("Tangent: {} note(s)", notes.len()));
         self.note_clipboard = notes;
     }
 
@@ -7489,7 +7528,9 @@ impl IvoryApp {
             None => crate::drumpad::DrumpadDoc::default(),
         };
         self.drumpad_status = std::array::from_fn(|_| crate::ports::PadStatus::default());
-        self.drumpad_sel = 0;
+        // The classic kit's C1, not key 0 — no page even shows key 0 (the
+        // pages anchor at 4), so a selection there was invisible.
+        self.drumpad_sel = 36;
         self.drumpad_dirty = true;
     }
 
@@ -7672,13 +7713,23 @@ impl IvoryApp {
                 }
             }
         }
+        // **`pad_at` answers a panel SLOT (0..16); the kit speaks KEYS
+        // (0..128).** Both drop paths passed the slot straight to
+        // `drumpad_load` after the 128-key rescale, so a drop landed on
+        // key `slot` — a pad on another page, or one of the four keys
+        // before the page anchor that page 0 never shows. The hover
+        // highlight mapped through `drumpad_key_of` all along, which is
+        // why the drag LOOKED right while the drop went wrong.
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         if !dropped.is_empty() {
-            if let Some(pad) = hover_pos.and_then(|p| crate::drumpad_panel::pad_at(rect, p)) {
+            if let Some(key) = hover_pos
+                .and_then(|p| crate::drumpad_panel::pad_at(rect, p))
+                .and_then(|slot| self.drumpad_key_of(slot))
+            {
                 // N files land on N consecutive pads, the RS5k rack's rule.
                 for (n, file) in dropped.into_iter().enumerate() {
                     let Some(path) = file.path else { continue };
-                    let at = pad + n;
+                    let at = key + n;
                     if at >= recorder::DRUM_PADS {
                         break;
                     }
@@ -7689,11 +7740,14 @@ impl IvoryApp {
             }
         }
         if app_dragging && released {
-            if let Some(pad) = hover_pos.and_then(|p| crate::drumpad_panel::pad_at(rect, p)) {
+            if let Some(key) = hover_pos
+                .and_then(|p| crate::drumpad_panel::pad_at(rect, p))
+                .and_then(|slot| self.drumpad_key_of(slot))
+            {
                 if let Some(media) =
                     egui::DragAndDrop::take_payload::<crate::drumpad_panel::DraggedMedia>(ctx)
                 {
-                    if let Err(e) = self.drumpad_load(pad, &media.0) {
+                    if let Err(e) = self.drumpad_load(key, &media.0) {
                         self.track.error = e;
                     }
                 }
@@ -7938,8 +7992,13 @@ impl IvoryApp {
                 }
             } else {
                 if active {
+                    // `from` is a KEY (armed through `drumpad_key_of`);
+                    // `pad_at` answers a SLOT — map it before comparing or
+                    // swapping, or the drop trades key 4+s with key s: the
+                    // 128-key rescale's "nonsensical" reorder.
                     if let Some(to) = pointer
                         .and_then(|p| crate::drumpad_panel::pad_at(rect, p))
+                        .and_then(|slot| self.drumpad_key_of(slot))
                         .filter(|to| *to != from)
                     {
                         // The whole slot rides: path AND knobs, and the
@@ -7948,6 +8007,25 @@ impl IvoryApp {
                         self.drumpad_status.swap(from, to);
                         self.drumpad_peaks.swap(from, to);
                         self.drumpad_sel = to;
+                        // **And the pad's FX bays, which never rode
+                        // before.** The chips live in seat-indexed insert
+                        // space; the host follows with the saved states,
+                        // through the same door a channel reorder uses.
+                        use crate::recorder::{pad_insert_index, DRUM_PADS, INSERTS, STRIPS};
+                        let (a, b) = (pad_insert_index(from), pad_insert_index(to));
+                        let full = (STRIPS + 1 + DRUM_PADS) * INSERTS;
+                        while self.settings.strip_inserts.len() < full {
+                            self.settings.strip_inserts.push(String::new());
+                        }
+                        for bay in 0..INSERTS {
+                            self.settings
+                                .strip_inserts
+                                .swap(a * INSERTS + bay, b * INSERTS + bay);
+                        }
+                        let mut order: Vec<usize> = (0..=a.max(b)).collect();
+                        order.swap(a, b);
+                        self.desk_state_perm = Some(order);
+                        self.save_settings();
                         self.drumpad_save();
                         self.drumpad_dirty = true;
                     }
@@ -9267,14 +9345,23 @@ impl IvoryApp {
                 self.arr_clip_menu = None;
                 let rows = Self::clip_menu_rows(at);
                 match pointer {
+                    // **A menu on a member of the selected set acts on the
+                    // SET** — the same rule as grabbing a clip body. The
+                    // clear-first version threw away a marquee'd group and
+                    // copied or deleted one clip: the owner's "pasting the
+                    // first of the selected group".
                     Some(p) if pressed && rows[0].contains(p) => {
+                        if !self.arr_multi.contains(&id) {
+                            self.arr_multi.clear();
+                        }
                         self.arr_selected = Some(id);
-                        self.arr_multi.clear();
                         self.arr_delete_selected();
                     }
                     Some(p) if pressed && rows[1].contains(p) => {
+                        if !self.arr_multi.contains(&id) {
+                            self.arr_multi.clear();
+                        }
                         self.arr_selected = Some(id);
-                        self.arr_multi.clear();
                         self.arr_copy();
                     }
                     _ => {
@@ -10116,6 +10203,18 @@ impl IvoryApp {
             && !self.name_focused
             && self.num_edit.is_none()
             && self.drumpad_num.is_none();
+        // **Escape clears the time selection**, and with it the loop. The
+        // innermost claimant already had its turn — the editor and every
+        // menu run their own Escape before this and `return`, and the
+        // number-field ladder swallows it too — so a press that reaches
+        // here with a selection standing is one that means it.
+        if keys_ok
+            && self.midi_edit.is_none()
+            && self.time_sel.is_some()
+            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+        {
+            self.time_sel = None;
+        }
         // **The zoom keys: `-` out, `=` in, `W` fits the biggest clip** —
         // each increment around the playhead, the wheel's own anchor.
         if keys_ok && self.midi_edit.is_none() {
@@ -10843,6 +10942,13 @@ impl IvoryApp {
     /// device's own default. The host reopens its streams to match.
     pub fn buffer_frames(&self) -> Option<u32> {
         self.settings.buffer_frames()
+    }
+
+    /// The loop region in song seconds, or `None` when there is no time
+    /// selection to loop over. The host turns it into frames and pushes it
+    /// to the engine each frame; the same span the export reads.
+    pub fn loop_region(&self) -> Option<(f64, f64)> {
+        self.time_sel.filter(|(a, b)| b > a)
     }
 
     /// The rate both streams should open at, or `None` for the device's own.
@@ -14158,6 +14264,10 @@ impl IvoryApp {
         self.reconcile_sound();
         // And the offs the ring is holding back, on the same cadence.
         self.ring_tick(&ctx);
+        // The copy stamp reaches the OS clipboard here — see the field.
+        if let Some(text) = self.clipboard_stamp.take() {
+            ctx.copy_text(text);
+        }
 
         // Track our position on the monitor for global menu placement, child
         // window centring, and so the main window reopens where it was left.
@@ -14580,10 +14690,16 @@ impl IvoryApp {
                         ),
                         egui::StrokeKind::Inside,
                     );
+                    // UNmultiplied, and it matters: `from_rgba_premultiplied`
+                    // with RGB far above the alpha is an out-of-range
+                    // premultiplied color that composites almost additively —
+                    // the band painted PURE WHITE over the clips (the Windows
+                    // tester's report). Unmultiplied cream at this alpha is
+                    // the faint wash that was always intended.
                     ui.painter().rect_filled(
                         r,
                         0.0,
-                        egui::Color32::from_rgba_premultiplied(0xF2, 0xE9, 0xD2, 10),
+                        egui::Color32::from_rgba_unmultiplied(0xF2, 0xE9, 0xD2, 28),
                     );
                 }
             }
@@ -14732,9 +14848,15 @@ impl IvoryApp {
                 crate::drumpad_panel::draw(ui.painter(), r, &view);
                 self.draw_pad_menu(ui.painter(), r);
                 // A pad mid-carry: the target lights under the hand.
+                // `from` is a KEY; the layout's rects are SLOTS — map
+                // through the page base, and a source dragged from another
+                // page simply draws no outline here.
                 if let Some((from, _, true)) = self.pad_carry {
                     let l = crate::drumpad_panel::Layout::new(r);
-                    if let Some(src) = l.pads.get(from) {
+                    let base = crate::drumpad_panel::page_base(self.drumpad_page());
+                    if let Some(src) =
+                        from.checked_sub(base).and_then(|slot| l.pads.get(slot))
+                    {
                         ui.painter().rect_stroke(
                             *src,
                             3.0,
@@ -14745,7 +14867,7 @@ impl IvoryApp {
                     let at = ui.ctx().input(|i| i.pointer.interact_pos());
                     if let Some(to) = at
                         .and_then(|p| crate::drumpad_panel::pad_at(r, p))
-                        .filter(|t| *t != from)
+                        .filter(|slot| self.drumpad_key_of(*slot).is_some_and(|k| k != from))
                     {
                         if let Some(dst) = l.pads.get(to) {
                             ui.painter().rect_stroke(
@@ -17318,6 +17440,65 @@ mod tests {
             app.arrangement().clips.last().unwrap().lane,
             6,
             "the paste ignored the selected channel"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A cross-track group copies whole and pastes in shape.** Two walls
+    /// the Windows tester hit: copying a marquee'd group through the clip
+    /// menu threw the group away (the menu cleared `arr_multi` before
+    /// copying — "pasting the first of the selected group"), and pasting
+    /// near the last lane squashed the group's lanes together because each
+    /// clip was clamped separately. The menu keeps the set when the clicked
+    /// clip is a member, and the LANE SHIFT is clamped whole. And every
+    /// copy stamps the SYSTEM clipboard — winit swallows Ctrl+V outright
+    /// when the OS clipboard holds no text, so without the stamp paste was
+    /// inert on any machine where nobody had copied text yet.
+    #[test]
+    fn a_group_copies_whole_and_pastes_in_shape() {
+        let root = project_scratch("groupcopy");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        let file = root.join("a.wav");
+        std::fs::write(&file, b"pcm, allegedly").expect("write");
+        app.import_audio_at(&file, 2, 10.0).expect("import");
+        app.import_audio_at(&file, 3, 10.0).expect("import");
+        app.import_audio_at(&file, 4, 12.0).expect("import");
+        let ids: Vec<u64> = app.arrangement().clips.iter().map(|c| c.id).collect();
+        for &id in &ids {
+            app.set_clip_infos(vec![(id, vec![0.5; 10], 8.0)]);
+            app.arr_resolve_len(id);
+        }
+        // The whole group is selected; the copy carries all of it.
+        app.arr_multi = ids.clone();
+        app.arr_selected = None;
+        app.arr_copy();
+        assert_eq!(app.clip_clipboard.len(), 3, "the group did not copy whole");
+        assert!(
+            app.clipboard_stamp.as_deref().is_some_and(|s| s.contains('3')),
+            "the copy did not stamp the system clipboard"
+        );
+        // Pasting onto the LAST channel: the shift is shortened so the
+        // three lanes keep their spread instead of piling on the bottom.
+        app.recorder.position_s = 40.0;
+        app.selected_channel = Some(crate::recorder::CHANNELS - 1);
+        app.arr_paste();
+        let mut lanes: Vec<usize> = app
+            .arrangement()
+            .clips
+            .iter()
+            .filter(|c| c.start_s >= 39.0)
+            .map(|c| c.lane)
+            .collect();
+        lanes.sort_unstable();
+        assert_eq!(
+            lanes,
+            vec![
+                crate::recorder::CHANNELS - 3,
+                crate::recorder::CHANNELS - 2,
+                crate::recorder::CHANNELS - 1
+            ],
+            "the pasted group lost its lane spread"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

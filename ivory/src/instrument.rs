@@ -1202,6 +1202,14 @@ struct Shared {
     rolling: AtomicBool,
     /// The frame the callback reached at the end of the last chunk.
     transport_pos: AtomicU64,
+    /// **The loop region, in frames: `[loop_a, loop_b)`.** Active only when
+    /// `loop_b > loop_a`; zero-width means no loop. While rolling, the
+    /// callback wraps `pos` from `loop_b` back to `loop_a` — so the wrap
+    /// lands on a block boundary at worst one buffer late, which is a clock
+    /// job the UI frame loop could never do cleanly. Written host-side from
+    /// the time selection.
+    loop_a: AtomicU64,
+    loop_b: AtomicU64,
     /// A backing track has been handed over, playing or not.
     ///
     /// Read from the UI thread, which cannot see `Renderer::track` — that lives
@@ -1421,6 +1429,8 @@ impl Shared {
             transport_ack: AtomicU64::new(0),
             rolling: AtomicBool::new(false),
             transport_pos: AtomicU64::new(0),
+            loop_a: AtomicU64::new(0),
+            loop_b: AtomicU64::new(0),
             track_loaded: AtomicBool::new(false),
             monitor_on: AtomicBool::new(false),
             pending_monitor: std::sync::Mutex::new(None),
@@ -3212,6 +3222,17 @@ impl Renderer {
         let at = self.pos;
         if rolling {
             self.pos += frames as u64;
+            // **The loop wrap.** Active only when `b > a`; when `pos` has
+            // reached or passed `b`, fold the overshoot back from `a` so a
+            // block that straddles the boundary keeps its phase. Guarded so
+            // a playhead that STARTED past the loop (playing on ahead) is
+            // left alone rather than yanked backward — the loop catches the
+            // clock only when it runs INTO the end from inside or before.
+            let a = self.shared.loop_a.load(Ordering::Relaxed);
+            let b = self.shared.loop_b.load(Ordering::Relaxed);
+            if b > a && at < b && self.pos >= b {
+                self.pos = a + (self.pos - b) % (b - a);
+            }
         }
         self.shared.transport_pos.store(self.pos, Ordering::Relaxed);
         (at, rolling, jumped)
@@ -5495,6 +5516,14 @@ impl Engine {
         self.shared.rolling.store(rolling, Ordering::Relaxed);
     }
 
+    /// Set the loop region in frames, or clear it with `a >= b`. Re-asserted
+    /// every frame from the host; the callback reads it in `run_transport`.
+    pub fn set_loop(&self, a: u64, b: u64) {
+        let (a, b) = if b > a { (a, b) } else { (0, 0) };
+        self.shared.loop_a.store(a, Ordering::Relaxed);
+        self.shared.loop_b.store(b, Ordering::Relaxed);
+    }
+
     /// Where the callback's clock actually is, in frames. Monotone while
     /// rolling, constant while stopped, and exact for a given locate once
     /// [`Engine::transport_acked`] answers true for its generation.
@@ -5923,8 +5952,16 @@ fn build_stream(
     }
     match format {
         cpal::SampleFormat::F32 => open!(f32),
+        cpal::SampleFormat::F64 => open!(f64),
         cpal::SampleFormat::I32 => open!(i32),
+        // **24-bit is what a Realtek ASIO output actually offers**, and the
+        // first Windows tester's launch died on this arm's absence: "the
+        // output speaks i24, which is not supported" and a silent app.
+        // cpal carries the packed type; the conversion is FromSample like
+        // every other arm.
+        cpal::SampleFormat::I24 => open!(cpal::I24),
         cpal::SampleFormat::I16 => open!(i16),
+        cpal::SampleFormat::I64 => open!(i64),
         cpal::SampleFormat::U16 => open!(u16),
         cpal::SampleFormat::I8 => open!(i8),
         cpal::SampleFormat::U8 => open!(u8),
@@ -8213,6 +8250,52 @@ mod tests {
         assert!(
             lane2_peak > 0.1,
             "lane 2's stem is silent: {lane2_peak} over {frames} frames"
+        );
+    }
+
+    /// **The loop wraps the transport on the audio thread.** A region set
+    /// over [1000, 3000) frames; roll from 0 in 512-frame blocks and the
+    /// clock must never reach 3000 — it folds back near 1000. A playhead
+    /// that STARTS past the region (someone playing on ahead of the loop)
+    /// is left alone.
+    #[test]
+    fn the_loop_wraps_the_clock() {
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        e.set_loop(1000, 3000);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        let mut out = vec![0.0f32; 512 * 2];
+        let mut max_seen = 0u64;
+        for _ in 0..40 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            max_seen = max_seen.max(e.transport_position());
+        }
+        assert!(max_seen < 3000, "the clock ran past the loop end: {max_seen}");
+        assert!(max_seen >= 1000, "the clock never entered the loop: {max_seen}");
+
+        // A clear (a >= b) frees the clock to run straight past.
+        e.set_loop(0, 0);
+        e.set_transport(2, 0);
+        for _ in 0..40 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+        }
+        assert!(
+            e.transport_position() > 3000,
+            "the cleared loop still held the clock at {}",
+            e.transport_position()
+        );
+
+        // A playhead started PAST the region is not yanked back.
+        e.set_loop(1000, 3000);
+        e.set_transport(3, 5000);
+        out.fill(0.0);
+        e.render_offline(&mut out);
+        assert!(
+            e.transport_position() >= 5000,
+            "a playhead ahead of the loop was pulled back to {}",
+            e.transport_position()
         );
     }
 
