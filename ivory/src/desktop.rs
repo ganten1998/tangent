@@ -602,6 +602,21 @@ fn a_filter_knob_reads_out_where_its_filter_actually_is() {
             );
         }
     }
+    // **The LPF ships OPEN.** Its default must be advertised as 1.0 and read
+    // out as 20 kHz — the mix knobs' defaults were missing from `values`, so
+    // a reset or the default marker fell to the bottom of the sweep, 200 Hz.
+    let lpf_default = d
+        .values
+        .get("lpf_mix")
+        .and_then(serde_json::Value::as_f64)
+        .expect("lpf_mix has no advertised default");
+    assert!((lpf_default - 1.0).abs() < 1.0e-6, "the LPF default is {lpf_default}, not open");
+    let (_, lpf_unit) = d.units.iter().find(|(k, _)| k == "lpf_mix").expect("lpf unit");
+    assert_eq!(
+        ivory_ui::recorder_panel::knob_reading(*lpf_unit, lpf_default as f32),
+        "20 kHz",
+        "the LPF default does not read 20 kHz"
+    );
 }
 
 /// **A directory listing is a listing, sorted and filtered.**
@@ -661,10 +676,21 @@ pub fn effect_defaults_for_shot() -> ivory_ui::ports::EffectDefaults {
 /// and the audio cannot disagree about where a slider starts.
 #[cfg(feature = "recorder")]
 fn effect_defaults() -> ivory_ui::ports::EffectDefaults {
-    use crate::effects::{Division, Params};
+    use crate::effects::{Division, Params, Sends};
     let d = Params::default();
+    // **The six MIX knobs' own defaults live on `Sends`**, so a reset and the
+    // default marker land where the sound ships — not on a fallback. Their
+    // absence read the LPF's default as the bottom of its sweep, 200 Hz, when
+    // the shipped low-pass is fully OPEN at 20 kHz (`lpf = 1.0`).
+    let m = Sends::default();
     let mut values = serde_json::Map::new();
     for (key, v) in [
+        ("reverb_mix", m.reverb),
+        ("delay_mix", m.delay),
+        ("chorus_mix", m.chorus),
+        ("hpf_mix", m.hpf),
+        ("lpf_mix", m.lpf),
+        ("limiter_mix", m.limiter),
         ("reverb_size", d.reverb_size),
         ("reverb_damp", d.reverb_damp),
         ("reverb_width", d.reverb_width),
