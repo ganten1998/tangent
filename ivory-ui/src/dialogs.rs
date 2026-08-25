@@ -1773,10 +1773,12 @@ impl PluginChoice<'_> {
 ///
 /// Three rules, in this order:
 ///
-/// 1. The highlighted entry, **if the filter still shows it**. Select the modelled piano,
-///    then type "serum", and the modelled piano is not what the user is looking at any
-///    more; committing it would be the classic filtered-list bug wearing a
-///    different hat.
+/// 1. The highlighted entry, **if the filter still shows it** — and if its
+///    vendor folder is OPEN, the same rule in a second hat: select the modelled piano,
+///    collapse A VENDOR, and the highlight is gone from the screen; committing
+///    it would be the classic filtered-list bug wearing a different hat.
+///    Filtering forces every folder open (the draw does the same), and the
+///    built-ins stand above the folders.
 /// 2. Otherwise, the only entry the filter left — the reason typing four
 ///    letters and pressing Enter works, which with 112 plugins is how the
 ///    dialog is actually used. It needs a NON-EMPTY filter: on a machine with
@@ -1790,10 +1792,17 @@ fn plugin_choice<'a>(
     selected: Option<usize>,
     current: Option<&str>,
     filter: &str,
+    open_folders: &[String],
 ) -> Option<PluginChoice<'a>> {
     let visible = visible_plugins(plugins, filter);
     if let Some(i) = selected {
-        if visible.contains(&i) {
+        let in_open_folder = plugins.get(i).is_some_and(|p| {
+            p.path == BUILTIN_PATH
+                || p.path == DRUMPAD_PATH
+                || !filter.trim().is_empty()
+                || open_folders.iter().any(|f| f == plugin_folder(p))
+        });
+        if visible.contains(&i) && in_open_folder {
             // Resolved through `get` rather than indexed. The list is rebuilt
             // from disk every time the dialog opens, and a stale index must
             // select nothing rather than panic.
@@ -2569,14 +2578,20 @@ pub fn show(
                             ui.add_space(10.0);
                             // Not offered on a problem: see the type's doc.
                             if !problem {
-                                ui.checkbox(dont_show, "Don't show this again");
+                                // Committed on the TICK — the Welcome
+                                // dialog's own pattern. Committing only
+                                // under OK meant Esc and the title-bar X
+                                // threw the ticked state away: the summary
+                                // came back after the next take and the
+                                // checkbox read as broken.
+                                if ui.checkbox(dont_show, "Don't show this again").changed() {
+                                    action =
+                                        Some(DialogAction::SetShowTakeSummary(!*dont_show));
+                                }
                                 ui.add_space(6.0);
                             }
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if ui.button("OK").clicked() {
-                                    if !problem && *dont_show {
-                                        action = Some(DialogAction::SetShowTakeSummary(false));
-                                    }
                                     result.close = true;
                                 }
                             });
@@ -3294,11 +3309,25 @@ pub fn show(
                                 );
                                 ui.add_space(4.0);
                             } else {
+                                // The INSTALLED count, both sides of the
+                                // slash — `plugins` carries the two
+                                // built-in rows at the top, and counting
+                                // rows read "6 installed" to somebody
+                                // with four VST3s on disk.
                                 ui.label(
                                     RichText::new(if filter.trim().is_empty() {
-                                        format!("{} installed", plugins.len())
+                                        format!("{installed} installed")
                                     } else {
-                                        format!("{} of {}", visible.len(), plugins.len())
+                                        let found = visible
+                                            .iter()
+                                            .filter(|&&i| {
+                                                plugins.get(i).is_some_and(|p| {
+                                                    p.path != BUILTIN_PATH
+                                                        && p.path != DRUMPAD_PATH
+                                                })
+                                            })
+                                            .count();
+                                        format!("{found} of {installed}")
                                     })
                                     .font(bold(PLUGIN_NOTE_PT))
                                     .color(faint),
@@ -3442,7 +3471,13 @@ pub fn show(
                             // Computed AFTER the list, so it answers this
                             // frame's click rather than the one before it.
                             let choice =
-                                plugin_choice(plugins, *selected, current.as_deref(), filter);
+                                plugin_choice(
+                                    plugins,
+                                    *selected,
+                                    current.as_deref(),
+                                    filter,
+                                    open_folders,
+                                );
                             ui.add_space((ui.available_height() - 30.0).max(0.0));
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 let load = ui.add_enabled(
@@ -7220,7 +7255,7 @@ mod tests {
         let plugins = installed();
         // Vital is highlighted; "an" leaves Analog Lab V and the modelled piano, and
         // Vital is not among them.
-        let stale = plugin_choice(&plugins, Some(3), None, "an");
+        let stale = plugin_choice(&plugins, Some(3), None, "an", &[]);
         assert_eq!(
             stale, None,
             "Load stayed live over a selection the filter had hidden: {stale:?}"
@@ -7233,18 +7268,43 @@ mod tests {
         // is how a list of 112 is used, so the single match wins over a stale
         // highlight rather than greying the button out.
         assert_eq!(
-            plugin_choice(&plugins, Some(3), None, "piano"),
+            plugin_choice(&plugins, Some(3), None, "piano", &[]),
             Some(PluginChoice::Load(&plugins[1]))
         );
         // A selection the filter still SHOWS is untouched by any of this.
         assert_eq!(
-            plugin_choice(&plugins, Some(3), None, "ital"),
+            plugin_choice(&plugins, Some(3), None, "ital", &[]),
             Some(PluginChoice::Load(&plugins[3]))
         );
         // The list is rebuilt from disk on every open, so an index left over
         // from a bundle that has since been deleted selects nothing rather than
         // panicking.
-        assert_eq!(plugin_choice(&plugins, Some(99), None, ""), None);
+        assert_eq!(plugin_choice(&plugins, Some(99), None, "", &[]), None);
+    }
+
+    /// **A collapsed folder hides its rows from Load too.** Select a row,
+    /// click its vendor heading shut, and the highlight is gone from the
+    /// screen — rule 1's filtered-list bug in a second hat, which the gate
+    /// used to miss because only the FILTER was consulted.
+    #[test]
+    fn collapsing_a_folder_ungates_load_from_its_hidden_selection() {
+        let plugins = installed();
+        let folder = plugin_folder(&plugins[1]).to_owned();
+        assert_eq!(
+            plugin_choice(&plugins, Some(1), None, "", &[folder]),
+            Some(PluginChoice::Load(&plugins[1])),
+            "an open folder's row must stay loadable"
+        );
+        assert_eq!(
+            plugin_choice(&plugins, Some(1), None, "", &[]),
+            None,
+            "Load stayed live over a selection its collapsed folder hid"
+        );
+        // Filtering forces the folders open, so the filter path is untouched.
+        assert_eq!(
+            plugin_choice(&plugins, Some(1), None, "piano", &[]),
+            Some(PluginChoice::Load(&plugins[1]))
+        );
     }
 
     /// The None row is a real choice — it is how you get the sound back off a
@@ -7254,7 +7314,7 @@ mod tests {
     fn the_none_row_unloads_the_instrument_that_is_loaded() {
         let plugins = installed();
         let loaded = plugins[1].path.clone();
-        let choice = plugin_choice(&plugins, None, Some(&loaded), "")
+        let choice = plugin_choice(&plugins, None, Some(&loaded), "", &[])
             .expect("the None row is a choice, not an absence of one");
         assert_eq!(choice, PluginChoice::Unload);
         match choice.action() {
@@ -7265,13 +7325,13 @@ mod tests {
         }
         // Nothing loaded, nothing typed, nothing highlighted: Load is greyed,
         // because unloading nothing is not an action.
-        assert_eq!(plugin_choice(&plugins, None, None, ""), None);
+        assert_eq!(plugin_choice(&plugins, None, None, "", &[]), None);
         // One plugin installed and an empty filter also leaves "exactly one
         // match" — and if that rule fired here, the None row could never be
         // reached on a machine with a single instrument.
         let one = vec![plugins[1].clone()];
         assert_eq!(
-            plugin_choice(&one, None, Some(&loaded), ""),
+            plugin_choice(&one, None, Some(&loaded), "", &[]),
             Some(PluginChoice::Unload)
         );
     }
@@ -7480,7 +7540,7 @@ mod tests {
     fn confirming_commits_the_bundle_path_and_never_the_display_name() {
         let plugins = installed();
         let choice =
-            plugin_choice(&plugins, Some(1), None, "").expect("a highlighted row is a choice");
+            plugin_choice(&plugins, Some(1), None, "", &[plugin_folder(&plugins[1]).to_owned()]).expect("a highlighted row is a choice");
         assert_eq!(choice, PluginChoice::Load(&plugins[1]));
         match choice.action() {
             DialogAction::LoadPlugin { path } => {

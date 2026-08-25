@@ -1419,18 +1419,25 @@ impl CaptureSource {
                     }
                 }
             }
-            // Rule 1: round the room down to whole frames before asking.
             // The monitor gets the same samples, at the same point: after the
-            // channel pick, before the take's ring. A push that does not fit is
+            // channel pick, before the take's ring. What does not fit whole is
             // dropped and not counted — a listener missing a millisecond is not
             // a take losing a frame, and putting the two in one counter would
-            // make an idle monitor look like a failing recorder.
+            // make an idle monitor look like a failing recorder. Rule 1 binds
+            // this ring too, and it was missed here once: rtrb counts
+            // **samples**, so the moment the renderer's drain pops a partial
+            // frame — its scratch is a fixed sample count that need not divide
+            // by `ch` — the free space ends mid-frame, and `n.min(m.slots())`
+            // committed the split. From then on every monitor frame played the
+            // wrong lanes until the device was reopened, the exact silent swap
+            // the module doc promises cannot happen.
             if let Some(m) = self.monitor.as_mut() {
-                let _ = m.write_chunk_uninit(n.min(m.slots())).map(|c| {
-                    let filled = c.fill_from_iter(dst[..n].iter().copied());
-                    filled
-                });
+                let fit = m.slots() / ch * ch;
+                let _ = m
+                    .write_chunk_uninit(n.min(fit))
+                    .map(|c| c.fill_from_iter(dst[..n].iter().copied()));
             }
+            // Rule 1: round the room down to whole frames before asking.
             let room = self.samples.slots() / ch;
             let take = want.min(room);
             if take == 0 || self.samples.push_entire_slice(&dst[..take * ch]).is_err() {
@@ -2648,6 +2655,49 @@ mod tests {
         }
         assert_eq!(got, out.len() / 2);
         assert_eq!(got, 10, "the ring's whole depth, and not one sample more");
+    }
+
+    #[test]
+    fn a_full_monitor_ring_never_commits_half_a_frame() {
+        // The monitor-side twin of the test above, for the push that once
+        // truncated in SAMPLES. The monitor ring's capacity is a frame
+        // multiple, but its free space stops being one the moment the consumer
+        // pops a partial frame — which the renderer's fixed-size scratch can
+        // legitimately do. After that, a push clamped to `slots()` commits a
+        // split frame and every monitor frame that follows plays the wrong
+        // lanes until the device is reopened.
+        let ((mut src, _sink), monitor) =
+            capture_channel_monitored(2, Picks::EVERYTHING, 64, 64, stats(), 8);
+        let mut mon = monitor.expect("monitor_frames > 0 means a tap");
+
+        // Six of the tap's eight frames arrive...
+        src.accept(&frames(2, 6, 0), Some(0), 0);
+        // ...and the consumer missteps: three samples is a frame and a half,
+        // leaving seven free slots — not a whole number of stereo frames.
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            seen.push(mon.pop().unwrap());
+        }
+        // The next callback wants to push six frames into that room.
+        src.accept(&frames(2, 6, 6), Some(0), 0);
+
+        while let Ok(s) = mon.pop() {
+            seen.push(s);
+        }
+        assert_eq!(
+            seen.len() % 2,
+            0,
+            "the producer committed a split frame into the monitor ring"
+        );
+        // And the lanes must still be the lanes: everything the producer ever
+        // committed, in order, has to chunk back into (left, right) frames.
+        for (frame, pair) in seen.chunks_exact(2).enumerate() {
+            assert_eq!(
+                pair[1],
+                pair[0] + 0.1,
+                "monitor frame {frame} plays rotated lanes"
+            );
+        }
     }
 
     /// **One input of eight, and the right one.**

@@ -869,7 +869,11 @@ fn draw_circle(painter: &Painter, rect: Rect, input: Input, p: &Palette, s: &Set
 /// above, and kept next to it so the two cannot drift.
 fn circle_hit(rect: Rect, pos: Pos2) -> Option<u8> {
     let c = rect.center();
-    let r = rect.width().min(rect.height()) * 0.5 - 2.0;
+    // The SAME radius `draw_circle` shades — `DIAGRAM_FILL` included.
+    // Without it the accepted annulus sat ~9% outside the drawn ring:
+    // the ring's inner edge went click-dead, and the empty band just
+    // outside it — labels, not controls — sounded and placed notes.
+    let r = (rect.width().min(rect.height()) * 0.5 - 2.0) * DIAGRAM_FILL;
     if r < 20.0 {
         return None;
     }

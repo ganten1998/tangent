@@ -496,13 +496,28 @@ impl Layout {
                 Pos2::new(dial.right() + 1.0, dial.top() - 1.0),
             )
         };
+        // **What a NARROW header sheds: the three dials.** The vertical
+        // rule below drops rows; nothing dropped columns, and at the
+        // 150pt width floor the fixed cells flanking the column left it
+        // INVERTED — every used lane's name, input chip and bays simply
+        // vanished, rename and both menus dead with them. The mixer
+        // carries the same three dials, so they are the horizontal
+        // sacrifice — never the NAME.
+        const COL_MIN: f32 = 40.0;
+        let dials_fit = pan.left() - 6.0 - (arm.right() + 4.0) >= COL_MIN;
+        let col_right = if dials_fit { pan.left() } else { meter.left() };
+        let (send, knob, pan) = if dials_fit {
+            (send, knob, pan)
+        } else {
+            (Rect::NOTHING, Rect::NOTHING, Rect::NOTHING)
+        };
         // **Top-down: LABEL, then INPUT, then the THREE BAYS** — the
         // owner's order. Each row takes the column's whole width, so the
         // input strip and the slots are both WIDER; a short window trades
         // legibility for it, and that trade was accepted out loud.
         let col = Rect::from_min_max(
             Pos2::new(arm.right() + 4.0, r.top()),
-            Pos2::new(pan.left() - 6.0, r.bottom() - 1.0),
+            Pos2::new(col_right - 6.0, r.bottom() - 1.0),
         );
         let slice = |a: f32, b: f32| {
             Rect::from_min_max(
@@ -1034,40 +1049,6 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         );
     }
 
-    // ── the TIME SELECTION: a veil over the span, on ruler and lanes ──────
-    if let Some((t0, t1)) = view.time_sel.filter(|(a, b)| b > a) {
-        let x0 = x_of(rect, view, t0).max(l.lanes_area.left());
-        let x1 = x_of(rect, view, t1).min(l.lanes_area.right());
-        if x1 > x0 {
-            let sel = Color32::from_rgb(0xC9, 0x8B, 0x3D);
-            painter.rect_filled(
-                Rect::from_min_max(
-                    Pos2::new(x0, l.lanes_area.top()),
-                    Pos2::new(x1, l.lanes_area.bottom()),
-                ),
-                0.0,
-                Color32::from_rgba_unmultiplied(sel.r(), sel.g(), sel.b(), 26),
-            );
-            painter.rect_filled(
-                Rect::from_min_max(
-                    Pos2::new(x0, l.ruler.top()),
-                    Pos2::new(x1, l.ruler.bottom()),
-                ),
-                0.0,
-                Color32::from_rgba_unmultiplied(sel.r(), sel.g(), sel.b(), 84),
-            );
-            for x in [x0, x1] {
-                painter.line_segment(
-                    [
-                        Pos2::new(x, l.ruler.top()),
-                        Pos2::new(x, l.lanes_area.bottom()),
-                    ],
-                    Stroke::new(1.0, sel.gamma_multiply(0.8)),
-                );
-            }
-        }
-    }
-
     // ── the clips ─────────────────────────────────────────────────────────
     for clip in view.clips {
         let r = clip_rect(rect, view, clip);
@@ -1197,6 +1178,45 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             },
             egui::StrokeKind::Inside,
         );
+    }
+
+    // ── the TIME SELECTION: a veil over the span, on ruler and lanes ──────
+    // AFTER the clips, deliberately: the veil and its boundary lines are
+    // about the material inside the span, and painting them first let
+    // every opaque clip body hide exactly the part of the selection that
+    // mattered — visible only in the gaps, the standard DAW picture
+    // inverted. Under the playhead still, which always reads on top.
+    if let Some((t0, t1)) = view.time_sel.filter(|(a, b)| b > a) {
+        let x0 = x_of(rect, view, t0).max(l.lanes_area.left());
+        let x1 = x_of(rect, view, t1).min(l.lanes_area.right());
+        if x1 > x0 {
+            let sel = Color32::from_rgb(0xC9, 0x8B, 0x3D);
+            painter.rect_filled(
+                Rect::from_min_max(
+                    Pos2::new(x0, l.lanes_area.top()),
+                    Pos2::new(x1, l.lanes_area.bottom()),
+                ),
+                0.0,
+                Color32::from_rgba_unmultiplied(sel.r(), sel.g(), sel.b(), 26),
+            );
+            painter.rect_filled(
+                Rect::from_min_max(
+                    Pos2::new(x0, l.ruler.top()),
+                    Pos2::new(x1, l.ruler.bottom()),
+                ),
+                0.0,
+                Color32::from_rgba_unmultiplied(sel.r(), sel.g(), sel.b(), 84),
+            );
+            for x in [x0, x1] {
+                painter.line_segment(
+                    [
+                        Pos2::new(x, l.ruler.top()),
+                        Pos2::new(x, l.lanes_area.bottom()),
+                    ],
+                    Stroke::new(1.0, sel.gamma_multiply(0.8)),
+                );
+            }
+        }
     }
 
     // ── the playhead, through the lanes and the ruler ─────────────────────
@@ -1945,6 +1965,38 @@ mod tests {
         let row = l.header_rows[6];
         assert!(!row.arm.is_positive(), "an unused lane grew an arm");
         assert!(!row.knob.is_positive(), "an unused lane grew a knob");
+    }
+
+    /// **At the 150pt width floor the header sheds its DIALS, never the
+    /// name.** The fixed cells flanking the column used to leave it
+    /// inverted at the floor: every used lane's name, input chip and bays
+    /// vanished, and rename and both menus died with them.
+    #[test]
+    fn a_floor_width_header_keeps_name_input_and_bays() {
+        let c = clips();
+        let v = a_view(&c);
+        // Narrow enough that the automatic share (16%) hits the 150 floor.
+        let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 420.0));
+        let l = Layout::new(r, &v);
+        let row = l.header_rows[0];
+        assert!(row.name.is_positive(), "the name did not survive the floor");
+        assert!(row.input.is_positive(), "the input chip did not survive");
+        assert!(
+            row.bays.iter().all(|b| !b.is_positive()) || row.bays[0].is_positive(),
+            "bays must be all-or-nothing"
+        );
+        assert_eq!(
+            hit_test(r, &v, row.name.center()),
+            Some(Hit::HdrName(0)),
+            "rename is unreachable at the floor"
+        );
+        assert_eq!(
+            hit_test(r, &v, row.input.center()),
+            Some(Hit::HdrInput(0)),
+            "the input menu is unreachable at the floor"
+        );
+        // The dials are the horizontal sacrifice — the mixer still has them.
+        assert!(!row.pan.is_positive(), "the pan dial did not shed");
     }
 
     /// No header control collides with another, on any lane.

@@ -7433,8 +7433,12 @@ pub fn fraction_of(seconds: f64, position_s: f64) -> Option<f32> {
 }
 
 /// A time in seconds as `m:ss.t`, which is how somebody reads a position.
+/// Tenths TRUNCATED, then split — rounding the seconds while truncating
+/// the minutes printed the impossible "0:60.0" for the last 50 ms of
+/// every minute, a flash on the clock at each boundary the playhead
+/// crossed.
 pub fn time_text(seconds: f64) -> String {
-    let s = seconds.max(0.0);
-    format!("{}:{:04.1}", (s / 60.0) as u64, s % 60.0)
+    let tenths = (seconds.max(0.0) * 10.0).floor() as u64;
+    format!("{}:{:02}.{}", tenths / 600, (tenths / 10) % 60, tenths % 10)
 }
 

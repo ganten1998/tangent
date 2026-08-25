@@ -463,13 +463,20 @@ impl Weights {
         ..Weights::DEFAULT
     };
 
-    /// The ONLY place the "Bass (4) means a 34-inch neck" coupling lives.
+    /// The ONLY place the "a Bass preset means a 34-inch neck" coupling lives.
     /// `FretboardSpec` has no scale-length field to derive it from.
+    ///
+    /// EVERY bass preset in `fretboard::TUNINGS`, by name. This matched the
+    /// literal `"Bass (4)"` and nothing else, so for a while Bass (5)/(6)/(7)
+    /// — 34-35" instruments, all of them — were scored with the **25.5" guitar
+    /// hand**: on a 5-string, held B2+A3 drew a five-fret reach at the 9th
+    /// fret where the bass calibration draws the one-position shape. A bass
+    /// preset added to the table has to be added here too; the tests walk
+    /// `TUNINGS` so the next one cannot be forgotten quietly.
     pub fn for_tuning(t: &Tuning) -> Weights {
-        if t.name == "Bass (4)" {
-            Weights::BASS
-        } else {
-            Weights::DEFAULT
+        match t.name.as_ref() {
+            "Bass (4)" | "Bass (5)" | "Bass (6)" | "Bass (7)" => Weights::BASS,
+            _ => Weights::DEFAULT,
         }
     }
 
@@ -2324,6 +2331,27 @@ mod tests {
             v.notes.iter().find(|n| n.pitch == 67).unwrap().outcome,
             Outcome::Dropped { reason: DropReason::Doubled }
         );
+    }
+
+    #[test]
+    fn every_bass_preset_gets_the_bass_hand_not_the_guitar_hand() {
+        // `for_tuning` used to match the literal "Bass (4)" and nothing else,
+        // so the 5/6/7-string presets — the same 34" necks — were scored with
+        // the 25.5" guitar hand. Walk the whole table so the NEXT bass preset
+        // cannot ship half-coupled either.
+        for t in TUNINGS {
+            let want = if t.name.starts_with("Bass") { Weights::BASS } else { Weights::DEFAULT };
+            assert_eq!(Weights::for_tuning(t), want, "wrong hand model for {}", t.name);
+        }
+        // And the shape it decides: on a 5-string, held B2+A3 is one position
+        // at the 14th fret under the bass calibration. The guitar weights drew
+        // a five-fret reach at the 9th — a span no bass hand covers.
+        let spec = FretboardSpec {
+            tuning: Tuning::by_name("Bass (5)").unwrap().clone(),
+            ..Default::default()
+        };
+        let v = solve_cold(&spec, &[47, 57]);
+        assert_eq!(frets(&v), [None, None, Some(14), None, Some(14)]);
     }
 
     #[test]

@@ -3580,7 +3580,17 @@ impl IvoryApp {
                 let panel = recorder_panel::setup_popup_rect(ui.max_rect(), anchor);
                 match recorder_panel::setup_hit_test(ui.max_rect(), anchor, &view, pos) {
                     Some(hit) => self.apply_recorder_hit(hit),
-                    None if !panel.contains(pos) => self.setup_open = false,
+                    None if !panel.contains(pos) => {
+                        self.setup_open = false;
+                        // **The dismissing press is SPENT** — the same
+                        // latch every other overlay uses. The mixer and
+                        // arrangement passes run later this frame and
+                        // read `band_popup_owns` AFTER the flag cleared;
+                        // without the latch the click that closed the
+                        // cog also located the playhead or toggled a
+                        // mute underneath it.
+                        self.menu_ate_press = true;
+                    }
                     None => {}
                 }
             }
@@ -4049,9 +4059,12 @@ impl IvoryApp {
     /// was quit.
     fn audition_tick(&mut self, ctx: &egui::Context) {
         let focused = ctx.input(|i| i.focused);
+        // Every text field, not a hand-picked two: the drumpad's rename
+        // and knob-value fields count for the shortcut gate, and a space
+        // typed into "snare 2" was ALSO striking the lit chord for as
+        // long as the key was down.
         let down = focused
-            && !self.name_focused
-            && self.num_edit.is_none()
+            && !self.text_entry_active()
             && self.dialog.is_none()
             && !self.recorder.state.is_active()
             // On the desk's surfaces Space belongs to the TRANSPORT; an
@@ -4327,10 +4340,13 @@ impl IvoryApp {
             Some(recorder_panel::FxHit::Reset(fx)) => self.reset_effect(fx),
             Some(recorder_panel::FxHit::Close) => self.fx_open = None,
             // A press on the panel's own chrome is swallowed; one outside it
-            // closes the panel and does nothing else.
+            // closes the panel and does nothing else — SPENT, so the
+            // surfaces that read `band_popup_owns` later this frame do not
+            // catch the dismissal as a fresh press of their own.
             None => {
                 if !recorder_panel::fx_popup_rect(screen, anchor).contains(pos) {
                     self.fx_open = None;
+                    self.menu_ate_press = true;
                 }
             }
         }
@@ -4546,6 +4562,7 @@ impl IvoryApp {
             self.arrangement = crate::arrangement::Arrangement::load_from(&self.project_doc);
             self.clips_dirty = true;
             self.load_drumpad_doc();
+            self.undo_reset();
             return;
         }
         if !self.settings.project_path.is_empty() {
@@ -4555,6 +4572,14 @@ impl IvoryApp {
                 self.arrangement = crate::arrangement::Arrangement::load_from(&doc);
                 self.clips_dirty = true;
                 self.load_drumpad_doc();
+                // **Seed the undo baseline HERE too.** Every road into a
+                // document ends at `undo_reset` — open, save-as, fresh —
+                // and this one forgot, which left `history` empty until
+                // the FIRST edit committed its own post-state as moment
+                // zero: launch, delete a clip, Ctrl+Z, nothing. The desk
+                // needs no snapshot first — at launch the settings
+                // already ARE this project's live desk.
+                self.undo_reset();
                 return;
             }
             // A remembered project that is GONE falls through to a fresh
@@ -7722,7 +7747,11 @@ impl IvoryApp {
     /// editor's and the arrangement's frame of input, because the drumpad
     /// floats over both.
     fn drumpad_input(&mut self, ctx: &egui::Context) {
-        if self.menu_state.is_some() || self.menu_ate_press {
+        // A dialog too: in the PLUGIN build dialogs draw inline in this
+        // same context, and only `handle_main_interaction` checked — the
+        // pads under the dialog kept striking, and Esc meant for the
+        // dialog closed the panel.
+        if self.menu_state.is_some() || self.menu_ate_press || self.dialog.is_some() {
             return;
         }
         if !self.drumpad_open {
@@ -8423,8 +8452,12 @@ impl IvoryApp {
         };
         if !menu.rect.contains(p) {
             // A press outside commits nothing and closes — and is SWALLOWED,
-            // so closing the menu never also draws a note under it.
+            // so closing the menu never also draws a note under it. The
+            // latch makes the swallow true for the LANES as well: with the
+            // editor floating, the arrangement runs later this frame and
+            // would otherwise take the same press as a locate on the rim.
             self.swing_menu = None;
+            self.menu_ate_press = true;
             return;
         }
         if swing_menu_row(menu.rect, 0).contains(p) {
@@ -8723,9 +8756,11 @@ impl IvoryApp {
         if self.midi_edit.is_none() {
             return;
         }
-        if self.menu_state.is_some() || self.menu_ate_press {
+        if self.menu_state.is_some() || self.menu_ate_press || self.dialog.is_some() {
             // The menu owns the pointer — and the press that dismissed it
-            // is spent, exactly as on the arrangement.
+            // is spent, exactly as on the arrangement. A dialog owns it
+            // too: inline (plugin build) it draws in this same context,
+            // and its OK button must not double as a press on the roll.
             return;
         }
         // A drag that STARTED on the roll keeps its pointer across the
@@ -8745,9 +8780,13 @@ impl IvoryApp {
             self.close_midi_editor();
             return;
         }
-        let Some(rect) = self.midi_edit_rect else {
-            return;
-        };
+        // **The missing-clip close runs BEFORE the rect gate.** When the
+        // clip dies outside paint's window (recording over the very clip
+        // being edited), paint has already left `midi_edit_rect` at None —
+        // and the old order returned right there, leaving a GHOST editor:
+        // `midi_edit` stayed Some for ever, silently eating the
+        // arrangement's Delete, zoom, copy and paste, while K toggled an
+        // invisible roll's dark mode.
         if !self
             .arrangement
             .clips
@@ -8757,6 +8796,9 @@ impl IvoryApp {
             self.close_midi_editor();
             return;
         }
+        let Some(rect) = self.midi_edit_rect else {
+            return;
+        };
         let (pressed, secondary, pointer_down, released, pointer) = ctx.input(|i| {
             (
                 i.pointer.primary_pressed(),
@@ -8988,6 +9030,29 @@ impl IvoryApp {
             // The band's machinery takes it from here.
             return;
         }
+        // **Double-clicks first, on egui's own terms**: the flag fires on
+        // the second RELEASE, which the press branch below never sees —
+        // the arrangement's 4.54 landmine, and this roll had the same
+        // check sitting inside `if pressed`, unreachable. **A double-click
+        // REMOVES the note** — beside the right-click erase. The second
+        // press armed a Move; stand it down with the note.
+        if ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary)) {
+            if let Some(p) = pointer.filter(|p| rect.contains(*p)) {
+                let hit = {
+                    let st = self.midi_edit.as_ref().unwrap();
+                    let clip = self.arrangement.clips.iter().find(|c| c.id == id).unwrap();
+                    let view = self.midi_edit_view(st, clip);
+                    crate::midi_editor::hit_test(rect, &view, p)
+                };
+                if let Some(crate::midi_editor::Hit::NoteBody(i)) = hit {
+                    self.me_delete_note(i);
+                    if let Some(st) = self.midi_edit.as_mut() {
+                        st.drag = None;
+                    }
+                    return;
+                }
+            }
+        }
         if pressed || secondary {
             if let Some(p) = pointer.filter(|p| rect.contains(*p)) {
                 let hit = {
@@ -8997,20 +9062,6 @@ impl IvoryApp {
                     crate::midi_editor::hit_test(rect, &view, p)
                 };
                 use crate::midi_editor::Hit as H;
-                // **A double-click REMOVES the note** — beside the
-                // right-click erase. On the release edge, where egui
-                // raises the flag.
-                if ctx.input(|i| {
-                    i.pointer.button_double_clicked(egui::PointerButton::Primary)
-                }) {
-                    if let Some(H::NoteBody(i)) = hit {
-                        self.me_delete_note(i);
-                        if let Some(st) = self.midi_edit.as_mut() {
-                            st.drag = None;
-                        }
-                        return;
-                    }
-                }
                 match hit {
                     Some(H::Close) if pressed => self.close_midi_editor(),
                     Some(H::Detach) if pressed => {
@@ -9504,9 +9555,12 @@ impl IvoryApp {
             }
             return;
         }
-        if self.menu_state.is_some() || self.menu_ate_press {
+        if self.menu_state.is_some() || self.menu_ate_press || self.dialog.is_some() {
             // The menu owns the pointer; a press elsewhere dismisses it in
             // `menu::show` without also locating the playhead underneath.
+            // A dialog the same — inline in the plugin build it floats
+            // OVER the lanes, and its buttons must not locate the
+            // playhead or start a clip drag through it.
             return;
         }
         if self.drumpad_claims_pointer(ctx) && self.arr_drag.is_none() {
@@ -9520,6 +9574,16 @@ impl IvoryApp {
         // mixer closed nobody else runs it, so the arrangement does.
         if self.mixer_naming.is_some() && self.mixer_rect.is_none() {
             self.name_in_mixer(ctx);
+            // **And a press anywhere commits it** — the other half of the
+            // bargain, kept by the mixer's press block when the mixer is
+            // open. With it closed nobody kept it: the field stayed live
+            // through click-away, eating Space, Delete and undo until
+            // the user thought to press Enter.
+            if ctx.input(|i| i.pointer.primary_pressed()) {
+                if let Some((at, buf)) = std::mem::take(&mut self.mixer_naming) {
+                    self.commit_mixer_name(at, buf);
+                }
+            }
         }
         let (pressed, pointer_down, released, pointer) = ctx.input(|i| {
             (
@@ -9682,14 +9746,25 @@ impl IvoryApp {
                     // "can't unzoom". `x + y` picks up whichever axis carried
                     // it, exactly as the mixer's zoom already does.
                     let d = scroll.x + scroll.y;
-                    if shift {
+                    if shift && d.abs() > 0.5 {
                         // **Shift+wheel ZOOMS the lane count** — one lane per
                         // tick, the mixer's own gesture on the vertical desk.
+                        // Same 0.5 notch threshold as the mixer and the midi
+                        // editor: a trackpad's inertial tail, or a balanced
+                        // diagonal that sums to zero, must not tick a lane.
                         let cur = self.settings.arr_visible as i64;
                         let next = (cur + if d > 0.0 { 1 } else { -1 })
                             .clamp(1, crate::recorder::CHANNELS as i64);
                         if next != cur {
                             self.settings.arr_visible = next as u8;
+                            // Re-clamp the STORE too — the mixer's rule:
+                            // zooming in while scrolled deep left the
+                            // stale value above the new max, and wheel-up
+                            // went dead for that many notches.
+                            self.arr_lane_scroll = self.arr_lane_scroll.min(
+                                crate::recorder::CHANNELS
+                                    .saturating_sub(self.arr_visible()),
+                            );
                             self.save_settings();
                         }
                     } else {
@@ -11364,9 +11439,20 @@ impl IvoryApp {
                 self.name_focused = false;
             }
             Hit::SetTempo(bpm) => {
-                let old = self.settings.record_export.tempo_bpm;
+                // **The dial edits the tempo that PLAYS.** A session-only
+                // Export OK freezes the whole spec — tempo included — as
+                // `export_override`, and every reader (click, count-in,
+                // both grids) prefers it. So the edit's baseline is the
+                // EFFECTIVE tempo, and the override moves with the dial;
+                // leaving it stale meant the dial showed one number while
+                // the click kept another, and the clips were retimed for
+                // a grid nothing was playing.
+                let old = self.tempo_bpm();
                 let new = bpm.clamp(recorder::MIN_BPM, recorder::MAX_BPM);
                 self.settings.record_export.tempo_bpm = new;
+                if let Some(o) = self.export_override.as_mut() {
+                    o.tempo_bpm = new;
+                }
                 self.retime_arrangement(old, new);
                 self.save_settings_soon();
             }
@@ -11394,10 +11480,15 @@ impl IvoryApp {
                         .as_secs_f64()
                         .max(1.0e-3);
                     let beats = (self.tap_times.len() - 1) as f64;
-                    let old = self.settings.record_export.tempo_bpm;
+                    // Effective tempo, and the override follows — the
+                    // same rule as SetTempo above.
+                    let old = self.tempo_bpm();
                     let bpm =
                         (60.0 * beats / span).clamp(recorder::MIN_BPM, recorder::MAX_BPM);
                     self.settings.record_export.tempo_bpm = bpm;
+                    if let Some(o) = self.export_override.as_mut() {
+                        o.tempo_bpm = bpm;
+                    }
                     self.retime_arrangement(old, bpm);
                     self.save_settings_soon();
                 }
@@ -12949,6 +13040,18 @@ impl IvoryApp {
         self.manual_positions.clear();
         self.fret_window_visible = false;
         self.fret_shown_at = None;
+        // The theory and recorder popouts close too — the defaults just
+        // re-inlined both bands, and a window left standing drew the
+        // surface TWICE while its geometry debounce kept writing the
+        // stray window's frame into the freshly reset settings.
+        self.theory_window_visible = false;
+        self.theory_guard = None;
+        if self.recorder_window_visible {
+            self.recorder_window_visible = false;
+            self.recorder_guard = None;
+            // The band is inline again; the main window makes room.
+            self.request_natural_size();
+        }
         self.rebuild_voicing();
         if had_custom_font {
             // Settings were reset: back to the bundled default font too.
@@ -14483,6 +14586,21 @@ impl IvoryApp {
                     // S is the arrangement's SPLIT — cutting a clip you
                     // cannot see, under the editor, is a footgun; the key
                     // waits until the hand leaves the popup.
+                } else if editor_focus
+                    && matches!(
+                        action,
+                        keys::KeyAction::TransposeUp
+                            | keys::KeyAction::TransposeDown
+                            | keys::KeyAction::ToggleFullscreen
+                    )
+                {
+                    // The editor SPENDS these keys itself, over in
+                    // `midi_editor_input`: the arrows nudge the selected
+                    // notes and Z fits the clip. Nothing consumes an egui
+                    // key, so letting them reach the globals too meant
+                    // every nudge also TRANSPOSED the instrument (and
+                    // saved it), and every fit flipped the window
+                    // fullscreen.
                 } else if self.arrangement_open
                     && action == keys::KeyAction::ShowSupporterKey
                 {
@@ -15275,6 +15393,10 @@ impl IvoryApp {
                     // mixer honours it — and the press that dismissed it.
                     && self.menu_state.is_none()
                     && !self.menu_ate_press
+                    // And a dialog: inline (plugin build) it draws over
+                    // the desk in this same context, and a press on its
+                    // buttons was also toggling the mute underneath.
+                    && self.dialog.is_none()
                     && (!drumpad_owns
                         || self.mixer_grab.is_some()
                         || self.mixer_reorder.is_some())
@@ -15298,6 +15420,15 @@ impl IvoryApp {
                             .clamp(1, crate::recorder::CHANNELS as i64);
                         if next != cur {
                             self.settings.mixer_visible = next as u8;
+                            // Re-clamp the STORE, not just the view's
+                            // copy: zooming in while scrolled deep left
+                            // `mixer_scroll` above the new max, and the
+                            // next wheel-ups spent themselves walking the
+                            // stale value down — dead notches.
+                            self.mixer_scroll = self.mixer_scroll.min(
+                                crate::recorder::CHANNELS
+                                    .saturating_sub(self.mixer_visible()),
+                            );
                             self.save_settings();
                         }
                     } else {
@@ -17694,6 +17825,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// **The launch reopen seeds the undo baseline.** Reopening the
+    /// remembered project used to skip `undo_reset`, so the FIRST edit of
+    /// every session committed its own post-state as moment zero and
+    /// Ctrl+Z had nowhere to stand — the pre-edit document was already
+    /// overwritten on disk. The baseline must be the document as loaded.
+    #[test]
+    fn relaunch_reopen_keeps_the_first_edit_undoable() {
+        let root = project_scratch("relaunch-undo");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        let file = root.join("r.wav");
+        std::fs::write(&file, b"pcm, allegedly").expect("write");
+        app.import_audio_at(&file, 4, 10.0).expect("import");
+        assert_eq!(app.arrangement().clips.len(), 1);
+        // "Relaunch": a second app wakes with the remembered project path.
+        let mut remembered = Settings::default();
+        remembered.project_path = app.settings.project_path.clone();
+        let (_ctx2, mut app2) = headless_with(Caps::DESKTOP, remembered);
+        app2.bootstrap_project(&root.join("Projects"));
+        assert_eq!(app2.arrangement().clips.len(), 1, "the reopen lost the clip");
+        // The session's first edit walks back to the document as loaded.
+        app2.import_audio_at(&file, 5, 2.0).expect("import 2");
+        assert_eq!(app2.arrangement().clips.len(), 2);
+        app2.undo();
+        assert_eq!(
+            app2.arrangement().clips.len(),
+            1,
+            "the first edit after launch was un-undoable"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// **Copy lands where the playhead stands** — clips rebased to the
     /// earliest, fresh ids, the pasted set selected; and the note
     /// clipboard round-trips inside the editor's clip.
@@ -18640,7 +18803,10 @@ mod tests {
         // Aim at the HEADER column, on the left.
         let p = Pos2::new(rect.left() + 12.0, rect.top() + rect.height() * 0.5);
         // Shift held; the OS put the vertical notch on the X axis.
-        let shift_wheel_x = |ctx: &egui::Context, app: &mut IvoryApp, dx: f32| {
+        let shift_wheel = |ctx: &egui::Context,
+                           app: &mut IvoryApp,
+                           unit: egui::MouseWheelUnit,
+                           delta: Vec2| {
             let _ = ctx.run(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
@@ -18648,8 +18814,8 @@ mod tests {
                     events: vec![
                         egui::Event::PointerMoved(p),
                         egui::Event::MouseWheel {
-                            unit: egui::MouseWheelUnit::Line,
-                            delta: Vec2::new(dx, 0.0),
+                            unit,
+                            delta,
                             modifiers: egui::Modifiers { shift: true, ..Default::default() },
                         },
                     ],
@@ -18658,15 +18824,26 @@ mod tests {
                 |ctx| app.frame(ctx),
             );
         };
-        shift_wheel_x(&ctx, &mut app, 3.0);
+        use egui::MouseWheelUnit::{Line, Point};
+        shift_wheel(&ctx, &mut app, Line, Vec2::new(3.0, 0.0));
         let up = app.settings.arr_visible;
-        shift_wheel_x(&ctx, &mut app, -3.0);
+        shift_wheel(&ctx, &mut app, Line, Vec2::new(-3.0, 0.0));
         let down = app.settings.arr_visible;
-        shift_wheel_x(&ctx, &mut app, -3.0);
+        shift_wheel(&ctx, &mut app, Line, Vec2::new(-3.0, 0.0));
         let down2 = app.settings.arr_visible;
         assert!(up > 8, "shift+wheel one way did not add a lane: {up}");
         assert!(down < up, "shift+wheel the other way did not remove a lane: {up}->{down}");
         assert!(down2 < down, "a second tick did not keep unzooming: {down}->{down2}");
+        // Below the notch threshold nothing may tick. Trackpads speak in
+        // Points, not Lines: a fading inertial tail, and a balanced diagonal
+        // that passes the non-zero guard yet sums to 0.0 (which the strict
+        // `> 0.0` would read as "down").
+        shift_wheel(&ctx, &mut app, Point, Vec2::new(0.3, 0.0));
+        shift_wheel(&ctx, &mut app, Point, Vec2::new(1.0, -1.0));
+        assert_eq!(
+            app.settings.arr_visible, down2,
+            "a sub-threshold wheel ticked the lane count"
+        );
     }
 
     #[test]
@@ -19656,6 +19833,12 @@ mod tests {
                 .unwrap_or_else(|| panic!("{shown} is printed and not accepted"));
             assert!((back - t).abs() < 0.06, "{shown} came back as {back}");
         }
+        // And the minute boundary never prints the impossible "x:60.0" —
+        // rounded seconds under truncated minutes did, every minute, for
+        // the playhead's last 50 ms of the minute.
+        assert_eq!(recorder_panel::time_text(59.95), "0:59.9");
+        assert_eq!(recorder_panel::time_text(119.97), "1:59.9");
+        assert_eq!(recorder_panel::time_text(60.0), "1:00.0");
     }
 
     /// **The cog's STREAM door opens the ReaStream dialog, seeded from the

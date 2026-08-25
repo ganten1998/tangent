@@ -75,6 +75,15 @@
 //! 12. **A block whose length is not a whole number of frames** desynchronises
 //!     the channels for the rest of the file — left and right swap and never
 //!     swap back. It is refused.
+//! 13. **A failed append can be a *partial* append.** `write_all` loops over
+//!     `write(2)`, and a disk that fills mid-block keeps the bytes that fit —
+//!     advancing the cursor — before the next call errors. The byte count
+//!     never claims those bytes, the caller deliberately records on after a
+//!     write error, and once space frees up every block would land shifted by
+//!     the orphan amount: trap 12's channel rotation, inside a file whose
+//!     header calls it clean. So the append cursor is re-derived from the
+//!     writer's own byte count before every block, never trusted from the
+//!     last write.
 
 use std::fs::File;
 use std::io::{self, Seek, SeekFrom, Write};
@@ -571,6 +580,15 @@ impl WavWriter {
             }
         }
 
+        // Trap 13. The last `write_all` may have failed *partway*: ENOSPC
+        // mid-block leaves the cursor past bytes `data_bytes` never counted,
+        // and the caller keeps calling — a take outlives its first write
+        // error. Left alone, every block until the next periodic patch would
+        // land shifted by the orphan amount and decode as channel-rotated
+        // garbage once the disk frees up. The cursor comes from this writer's
+        // own byte count, exactly as `patch_sizes` restores it (trap 2), so a
+        // partial write costs the failed block and nothing after it.
+        self.file.seek(SeekFrom::Start(self.total_bytes()))?;
         self.file.write_all(&self.scratch)?;
         self.data_bytes += block;
         self.frames += frames;
@@ -711,6 +729,19 @@ impl WavWriter {
     #[cfg(test)]
     fn shrink_ceiling(&mut self, bytes: u64) {
         self.ceiling = bytes;
+    }
+
+    /// Kick the append cursor past where the byte count says the file ends.
+    ///
+    /// A test seam, like `shrink_ceiling`, and the only honest way to cover
+    /// trap 13: a genuine partial `write(2)` needs a disk that fills at
+    /// exactly the right byte, so the test reproduces its one observable
+    /// effect instead — a cursor sitting on bytes the ledger knows nothing
+    /// about.
+    #[cfg(test)]
+    fn derail_cursor(&mut self, off_by: u64) -> io::Result<()> {
+        self.file.seek(SeekFrom::Start(self.total_bytes() + off_by))?;
+        Ok(())
     }
 }
 
@@ -1100,6 +1131,45 @@ mod tests {
                 "frame {k} is not the frame that was written"
             );
         }
+    }
+
+    #[test]
+    fn a_partial_write_does_not_shift_the_blocks_that_follow() {
+        // Trap 13. ENOSPC mid-block: `write_all` pushed part of the scratch
+        // through `write(2)` before erroring, so the cursor sits past bytes
+        // `data_bytes` never counted. The session keeps the first error and
+        // keeps recording, so the next block must land where the byte count
+        // says the file ends — not where the failed write stopped. Five stray
+        // bytes is deliberately not a whole frame: an appender that trusts
+        // the cursor turns everything after them into channel-rotated
+        // garbage that the header claims as clean audio.
+        let p = scratch("partial");
+        let spec = WavSpec {
+            format: SampleFormat::Int16,
+            ..WavSpec::default()
+        };
+        let mut w = WavWriter::create(&p.0, spec, &Bext::new(wallclock(), spec)).unwrap();
+        w.write_interleaved(&[0.25, -0.25]).unwrap();
+        w.derail_cursor(5).unwrap(); // what the failed write left behind
+        w.write_interleaved(&[0.5, -0.5]).unwrap();
+        w.finish().unwrap();
+
+        let bytes = std::fs::read(&p.0).unwrap();
+        let cs = chunks(&bytes);
+        let (_, data, size) = *find(&cs, "data");
+        assert_eq!(size, 2 * 4, "two stereo 16-bit frames and nothing else");
+        assert_eq!(
+            data + size,
+            bytes.len(),
+            "orphan bytes past the accounted data survived the next append"
+        );
+        let l = i16::from_le_bytes(bytes[data + 4..data + 6].try_into().unwrap());
+        assert_eq!(
+            l,
+            (0.5f32 * 32_768.0).round() as i16,
+            "the second block landed where the derailed cursor pointed, not \
+             where the byte count says the file ends"
+        );
     }
 
     #[test]

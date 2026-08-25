@@ -1963,6 +1963,14 @@ struct Renderer {
     /// loop silent. Audio clips read straight off `at` and never needed this;
     /// the note scheduler is cursor-based and does.
     pending_flush: bool,
+    /// The LAST block's clip walk parked a note it could not deliver — the
+    /// lane's note list or the sounding ledger was full — and left the
+    /// cursor standing on it. `pending`'s idea for the clips: the next
+    /// block's walk must sound that note late rather than fast-forward over
+    /// it as "behind the playhead". Cleared by anything that rewinds the
+    /// cursors, because a rewind's behind-the-playhead notes really are
+    /// skipped, not owed.
+    clip_parked: bool,
     /// Every pitch currently sounding, from the note stream this renderer
     /// itself handed out. What a stop or a jump has to end.
     sounding: u128,
@@ -2434,7 +2442,11 @@ impl Renderer {
             f64::from_bits(self.shared.bpm.load(Ordering::Relaxed)),
             self.shared.beat_unit.load(Ordering::Relaxed),
         );
-        let req = self.shared.count_in_req.load(Ordering::Relaxed);
+        // Acquire pairs with `start_count_in`'s Release on the bump, so a new
+        // generation is seen with its OWN beat count — the beats are read
+        // once per generation and a stale zero here is a count-in that never
+        // clicks.
+        let req = self.shared.count_in_req.load(Ordering::Acquire);
         if req != self.beats.seen_req {
             self.beats.seen_req = req;
             let want = self.shared.count_in_beats.load(Ordering::Relaxed);
@@ -3025,7 +3037,17 @@ impl Renderer {
         let got = ring.slots().min(want);
         // Read into scratch first: the ring's chunk borrows it, and the mix
         // below needs `self.mix` mutably at the same time.
-        let take = got.min(self.monitor_scratch.len());
+        //
+        // WHOLE FRAMES here too, and this clamp was the one place the rule
+        // could break: `got` is frame-aligned (the producer pushes nothing
+        // else) but the scratch is `widest * 4096`, which an eighteen-input
+        // interface opened at its full width does not divide. Clamping to it
+        // committed a partial frame out of the ring, and every read after
+        // that mapped each interleaved column to the wrong input — sides
+        // swapped, microphones on the wrong strips, the capture tee taping
+        // the rotation — for the rest of the session, silently. Rounded
+        // DOWN, exactly as the stale-drop above rounds.
+        let take = (got.min(self.monitor_scratch.len()) / ch_in) * ch_in;
         let scratch = &mut self.monitor_scratch[..take];
         let got = match ring.read_chunk(scratch.len()) {
             Ok(chunk) => {
@@ -3734,6 +3756,9 @@ impl Renderer {
                 self.builtin.set_voice(v);
             }
         }
+        // The note the LAST block's walk parked, if any — taken so it lasts
+        // exactly one block unless the walk below parks again.
+        let mut parked = std::mem::take(&mut self.clip_parked);
         // A MIDI schedule arriving, by the racks' own swap protocol; its
         // cursors start over, and fast-forward past what is behind the
         // playhead without sounding it.
@@ -3743,6 +3768,9 @@ impl Renderer {
                 let _ = self.midi_retiring.push(old);
                 self.midi_cursor.clear();
                 self.midi_cursor.resize(self.midi_clips.len(), 0);
+                // Fresh cursors owe nothing: what stands behind the playhead
+                // now is the fast-forward's to skip, not a parked note's due.
+                parked = false;
             }
         }
         // A jump rewinds every cursor: each fast-forwards to the playhead on
@@ -3751,6 +3779,7 @@ impl Renderer {
             for c in &mut self.midi_cursor {
                 *c = 0;
             }
+            parked = false;
         }
         let wanted = self.shared.builtin_strip.load(Ordering::Relaxed);
         let builtin_at = (wanted >= 0).then_some(wanted as usize);
@@ -3856,23 +3885,40 @@ impl Renderer {
                         if on_f >= end {
                             break;
                         }
-                        cur += 1;
                         // Behind the playhead (a jump landed past it), past
                         // the clip's trimmed end — or inside the region a
                         // rolling record is REPLACING: skipped, not sounded.
-                        if on_f < at
+                        // The one exception is a note the LAST block parked:
+                        // it is behind by a block at most, and it sounds now,
+                        // at the top of this one, instead of being dropped.
+                        if (on_f < at && !parked)
                             || nt.at >= mc.len
                             || on_f >= self.shared.punch[ch].load(Ordering::Relaxed)
                         {
+                            cur += 1;
                             continue;
                         }
                         if lane_notes.len() >= lane_notes.capacity()
                             || self.active_clip.len() >= 256
                         {
+                            // **Withheld, not dropped.** `cur += 1` used to
+                            // run before this break, so the note it consumed
+                            // was never pushed anywhere and the stored cursor
+                            // stood past it: one clip note vanished from the
+                            // arrangement, for good, every time this fired —
+                            // where the live path parks its overflow in
+                            // `pending`. The cursor now stays ON the note and
+                            // `clip_parked` keeps the next block's walk from
+                            // fast-forwarding over it.
+                            self.clip_parked = true;
                             break;
                         }
+                        cur += 1;
                         lane_notes.push(Note {
-                            offset: (on_f - at) as i32,
+                            // `saturating_sub`, because a parked note's `on_f`
+                            // is behind `at` and it lands at offset 0 — late
+                            // by a block, which is the price of the park.
+                            offset: on_f.saturating_sub(at) as i32,
                             pitch: i16::from(nt.key),
                             velocity: f32::from(nt.vel) / 127.0,
                             on: true,
@@ -4651,6 +4697,7 @@ impl Engine {
             seen_req: 0,
             was_rolling: false,
             pending_flush: false,
+            clip_parked: false,
             sounding: 0,
             track_incoming,
             track_retiring,
@@ -4860,7 +4907,10 @@ impl Engine {
             {
                 *h = None;
             }
-            self.hand_off_insert(strip, slot, PluginBox(None));
+            // A refused UNLOAD changes nothing worth reporting: the box is
+            // empty, and the seat keeps its tenant until the callback drains
+            // the ring or the engine is torn down.
+            let _ = self.hand_off_insert(strip, slot, PluginBox(None));
             self.inserts_loaded[strip][slot] = None;
             if let Some(e) = self
                 .insert_state_errors
@@ -4966,7 +5016,7 @@ impl Engine {
         {
             *h = None;
         }
-        self.hand_off_insert(
+        if let Some(refused) = self.hand_off_insert(
             strip,
             slot,
             PluginBox(Some(Box::new(Hosted {
@@ -4976,7 +5026,23 @@ impl Engine {
                 channels,
                 voice,
             }))),
-        );
+        ) {
+            // **The seat never took it, so nothing here may say it did.**
+            // The refused box dies NOW, on this thread — references first,
+            // the lifetime rule from `editors`: the fresh handles point at
+            // its controller and must not outlive it. The ledger is left
+            // alone; the bay's previous tenant is still seated in the
+            // callback (its retire rides the same full ring), and naming it
+            // is more honest than naming the plugin that just died.
+            drop(editor_handle);
+            drop(state_handle);
+            drop(refused);
+            return Err(format!(
+                "the audio engine did not take {} — the seat's hand-off ring \
+                 is full, which means the callback has stalled",
+                class.name
+            ));
+        }
         if let Some(h) = self
             .insert_editor_handles
             .get_mut(strip)
@@ -5022,26 +5088,44 @@ impl Engine {
     }
 
     /// An insert's half of [`Engine::hand_off`], and the same wait.
-    fn hand_off_insert(&mut self, strip: usize, slot: usize, next: PluginBox) {
+    ///
+    /// Returns the box the seat did NOT take; `None` means the callback owns
+    /// it now. `rtrb` hands a refused value back inside the push error — the
+    /// exact trap `Rack::swap` documents — and this used to discard error and
+    /// instance both: a freshly created plugin died right here, silently, and
+    /// `load_insert` carried on installing its editor and state handles as if
+    /// it were seated. The desk then named a plugin that existed nowhere, and
+    /// the auto-open built a view on a terminated controller.
+    #[must_use]
+    fn hand_off_insert(
+        &mut self,
+        strip: usize,
+        slot: usize,
+        next: PluginBox,
+    ) -> Option<PluginBox> {
         let Some(pair) = self
             .insert_handoff
             .get_mut(strip)
             .and_then(|r| r.get_mut(slot))
         else {
-            return;
+            return Some(next);
         };
         while pair.from_audio.pop().is_ok() {}
-        if pair.to_audio.push(next).is_err() {
-            return;
+        if let Err(rtrb::PushError::Full(refused)) = pair.to_audio.push(next) {
+            // The seat's two-deep ring already holds two undelivered boxes,
+            // which means the callback has stalled. Handing the box back is
+            // what lets the caller refuse honestly.
+            return Some(refused);
         }
         let deadline = Instant::now() + RETIRE_TIMEOUT;
         while Instant::now() < deadline {
             if let Ok(old) = pair.from_audio.pop() {
                 drop(old);
-                return;
+                break;
             }
             std::thread::sleep(Duration::from_millis(1));
         }
+        None
     }
 
     // ── the plugins' own editors ────────────────────────────────────────────
@@ -5052,7 +5136,12 @@ impl Engine {
     /// in `load_plugin_with_state` for why a reference taken at load time is
     /// the only way to reach a plugin the audio thread owns.
     pub fn open_insert_editor(&mut self, strip: usize, slot: usize) -> Result<(), String> {
-        if strip > STRIPS || slot >= INSERTS {
+        // **The whole seat map, pads included** — the same stale bound
+        // `load_insert` had already been cured of. This still capped at
+        // `STRIPS`, so a pad's effect loaded, ran, and answered every click
+        // on its bay with a silent `Ok`: a plugin whose window could never
+        // open, and whose controls could therefore never be touched.
+        if strip >= RACK_SEATS || slot >= INSERTS {
             return Ok(());
         }
         self.poll_editor();
@@ -5812,9 +5901,14 @@ impl Engine {
         s.count_in_done.store(false, Ordering::Relaxed);
         s.beat_now.store(0, Ordering::Relaxed);
         s.downbeat_ns.store(i64::MIN, Ordering::Relaxed);
-        // Published last: the callback acts on the generation, so every other
-        // field is already in place when it does.
-        s.count_in_req.fetch_add(1, Ordering::Relaxed);
+        // Published last, **with Release** — the callback's Acquire on the
+        // generation pairs with it, so every store above is in place when it
+        // acts. This was Relaxed, which promises no such thing: on the
+        // owner's Apple-silicon Mac the bump could overtake the beats store,
+        // and the callback then latched the OLD beat count for the whole
+        // generation — a first count-in read as zero beats declares itself
+        // done before a single click. Same idiom as `set_transport`.
+        s.count_in_req.fetch_add(1, Ordering::Release);
     }
 
     /// Abandon a count-in. [`Engine::count_in_done`] stays false.
@@ -5823,7 +5917,10 @@ impl Engine {
         s.count_in_beats.store(0, Ordering::Relaxed);
         s.count_in_done.store(false, Ordering::Relaxed);
         s.beat_now.store(0, Ordering::Relaxed);
-        s.count_in_req.fetch_add(1, Ordering::Relaxed);
+        // Release, as in `start_count_in` and for the same reason: a cancel
+        // whose zeroed beat count arrives AFTER its generation is a count-in
+        // still clicking.
+        s.count_in_req.fetch_add(1, Ordering::Release);
     }
 
     /// The count-in beat sounding now, 1-based, for the big countdown. `None`
@@ -5885,9 +5982,20 @@ impl Drop for Engine {
         // window open. `load_insert(.., None)` is the whole teardown in the
         // right order: close the window, drop the controller reference, then
         // retire the instance and drop it HERE, on this thread.
-        for strip in 0..=STRIPS {
+        //
+        // **Every seat, the pad bays included.** This stopped at `STRIPS` —
+        // the stale bound `load_insert` was cured of — so a pad's effect was
+        // never retired at all and its terminate ran inside the stream
+        // teardown: the exact ordering this Drop exists to prevent, back for
+        // the hundred and twenty-eight seats it forgot. Only OCCUPIED seats
+        // are retired, because the hand-off's bounded wait is per seat: 444
+        // empty round trips is seconds of quit on a live callback and nearly
+        // two minutes on a stalled one.
+        for strip in 0..RACK_SEATS {
             for slot in 0..INSERTS {
-                let _ = self.load_insert(strip, slot, None, None);
+                if self.inserts_loaded[strip][slot].is_some() {
+                    let _ = self.load_insert(strip, slot, None, None);
+                }
             }
         }
     }
@@ -7417,6 +7525,7 @@ mod tests {
             seen_req: 0,
             was_rolling: false,
             pending_flush: false,
+            clip_parked: false,
             sounding: 0,
             // Abandoned peers, like the MIDI ring above: pop reports empty
             // and push fills to capacity, which is all a test needs.
@@ -8572,6 +8681,48 @@ mod tests {
         }
     }
 
+    /// **A pad seat reaches the editor door.** `open_insert_editor` kept the
+    /// pre-pads bound after `load_insert` was widened, so every pad seat was
+    /// refused with a silent `Ok(())`: the plugin loaded, ran, and its window
+    /// could never open. An EMPTY pad bay must answer "nothing is loaded" —
+    /// the honest error PAST the guard — and only a seat past the whole map
+    /// is the silent no-op.
+    #[test]
+    fn a_pad_seat_reaches_the_editor_door() {
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        assert!(
+            e.open_insert_editor(pad_rack_index(0), 0).is_err(),
+            "pad 0's empty bay answered Ok — the guard is refusing pad seats \
+             again, and a pad plugin's window can never open"
+        );
+        assert!(
+            e.open_insert_editor(pad_rack_index(PADS - 1), INSERTS - 1).is_err(),
+            "the last pad's last bay is inside the seat map too"
+        );
+        // Past the whole map is still a no-op, never a panic and never an
+        // error a menu would have to word.
+        assert!(e.open_insert_editor(RACK_SEATS, 0).is_ok());
+    }
+
+    /// **A refused hand-off comes back instead of dying silently.** The
+    /// seat's ring is two deep; with nothing pulling the render, the third
+    /// box must be handed BACK — it used to be dropped inside the discarded
+    /// push error, instance and all, while `load_insert` carried on
+    /// installing the dead instance's editor and state handles.
+    #[test]
+    fn a_full_insert_ring_hands_the_box_back() {
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        assert!(e.hand_off_insert(0, 0, PluginBox(None)).is_none());
+        assert!(e.hand_off_insert(0, 0, PluginBox(None)).is_none());
+        assert!(
+            e.hand_off_insert(0, 0, PluginBox(None)).is_some(),
+            "a push into a full ring reported delivery — the box it holds \
+             was dropped on the spot and the caller cannot know"
+        );
+        // A seat that does not exist cannot take anything either.
+        assert!(e.hand_off_insert(RACK_SEATS, 0, PluginBox(None)).is_some());
+    }
+
     /// **A looped MIDI clip keeps sounding past the first wrap.** The note
     /// scheduler is cursor-based and forward-only; a loop moves `pos`
     /// backward without a locate, so without the wrap's flush the cursor
@@ -8613,6 +8764,71 @@ mod tests {
             heard_late > 0.005,
             "the looped MIDI clip went silent after wrapping: {heard_late}"
         );
+    }
+
+    /// **A clip note the capacity break withholds is parked, not dropped.**
+    /// The walk consumed the note (`cur += 1`) BEFORE checking the block's
+    /// room, so when the note list or the sounding ledger was full the
+    /// stored cursor stood past a note nothing ever delivered — and the next
+    /// block's behind-the-playhead skip guaranteed it stayed lost. The live
+    /// path parks its overflow in `pending`; the clips park on the cursor:
+    /// it stays ON the note, and the note sounds — one block late — when
+    /// there is room again.
+    #[test]
+    fn a_clip_note_the_full_block_withholds_sounds_the_next_block() {
+        let shared = Arc::new(Shared::new());
+        let (tap_tx, _tap_rx) = RingBuffer::<f32>::new(1 << 16);
+        let mut r = test_renderer(Arc::clone(&shared), tap_tx, 2);
+        // 256 fillers on lane 0, all striking at frame 0: exactly enough to
+        // fill the sounding ledger before lane 1's walk runs. Their offs
+        // fall due in the SECOND block, which is what makes room.
+        let fillers: Vec<ClipNote> = (0..256)
+            .map(|_| ClipNote { at: 0, dur: 700, key: 60, vel: 100 })
+            .collect();
+        // And the victim on lane 1, due the same first block.
+        r.midi_clips = vec![
+            PlacedMidi {
+                strip: 0,
+                start: 0,
+                len: 48_000,
+                notes: Arc::new(fillers),
+            },
+            PlacedMidi {
+                strip: 1,
+                start: 0,
+                len: 48_000,
+                notes: Arc::new(vec![ClipNote {
+                    at: 0,
+                    dur: 40_000,
+                    key: 100,
+                    vel: 100,
+                }]),
+            },
+        ];
+        r.midi_cursor = vec![0, 0];
+        shared.rolling.store(true, Ordering::Relaxed);
+        let mut out = vec![0.0f32; 512 * 2];
+        // Block one: the ledger fills, the victim hits the break.
+        r.render(&mut out, 0, 0);
+        assert_eq!(
+            r.midi_cursor[1], 0,
+            "the cursor moved past the withheld note — consumed by the \
+             capacity break, delivered by nothing"
+        );
+        // Block two: the fillers' offs fall due, the ledger empties, and the
+        // parked note sounds.
+        out.fill(0.0);
+        r.render(&mut out, 0, 0);
+        assert!(
+            r.sounding & (1 << 100) != 0,
+            "the withheld clip note never sounded"
+        );
+        assert!(
+            r.active_clip.iter().any(|a| a.key == 100 && a.lane == 1),
+            "the parked note is missing from the sounding ledger, so its \
+             off will never be emitted"
+        );
+        assert_eq!(r.midi_cursor[1], 1);
     }
 
     #[test]
@@ -9455,6 +9671,47 @@ mod tests {
         );
     }
 
+    /// **The monitor drain takes WHOLE frames even when the scratch cuts it
+    /// short.** The clamp read `got.min(scratch.len())`, and the scratch is
+    /// `widest * 4096` — which the full width of an eighteen-input interface
+    /// does not divide. One clamped read committed a partial frame, and
+    /// every read after it mapped the interleaved columns one lane over:
+    /// sides swapped, microphones on the wrong strips, the capture tee
+    /// taping the rotation, for the rest of the session. A deliberately tiny
+    /// scratch stands in for the big one: 8 samples against a three-wide
+    /// input is the same misfit, provable in one block.
+    #[test]
+    fn a_scratch_clamped_monitor_read_keeps_whole_frames() {
+        let shared = Arc::new(Shared::new());
+        let (tap_tx, _tap_rx) = RingBuffer::<f32>::new(1 << 16);
+        let mut r = test_renderer(Arc::clone(&shared), tap_tx, 2);
+        let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 14);
+        // A hundred frames of a three-wide input: one mono pick and one
+        // stereo pair, laid end to end the way `Picks` lays them.
+        let pushed = 100 * 3;
+        for _ in 0..pushed {
+            let _ = in_tx.push(0.5);
+        }
+        r.monitor = Some(in_rx);
+        r.monitor_channels = 3;
+        r.monitor_widths = [1, 2, 0, 0];
+        r.monitor_block = 512;
+        // NOT a multiple of three, exactly as `widest * 4096` is not a
+        // multiple of eighteen.
+        r.monitor_scratch = vec![0.0; 8];
+        let mut out = vec![0.0f32; 512 * 2];
+        r.render(&mut out, 0, 0);
+        let left = r.monitor.as_ref().map_or(0, Consumer::slots);
+        let consumed = pushed - left;
+        assert!(consumed > 0, "nothing was drained at all");
+        assert_eq!(
+            consumed % 3,
+            0,
+            "the drain committed a partial frame ({consumed} samples of a \
+             3-wide input): every read from here on is rotated one lane"
+        );
+    }
+
     /// **The take is the desk. The room is the desk minus what nobody asked
     /// to hear.**
     ///
@@ -9972,23 +10229,27 @@ mod tests {
     fn a_bay_that_does_not_exist_is_a_no_op_and_never_a_panic() {
         // Every one of these is reachable from a menu, and a panic here goes
         // through the app's hook to a dialog and `exit(1)`.
+        //
+        // `RACK_SEATS`, not `STRIPS + 1`: that seat is pad 0's FX bay now,
+        // a bay that very much exists — the first seat that does not is the
+        // one past the whole map.
         let bundle = piano();
         let mut engine = Engine::start(None).expect("an audio output");
         assert!(matches!(
-            engine.load_insert(STRIPS + 1, 0, Some(&bundle), None),
+            engine.load_insert(RACK_SEATS, 0, Some(&bundle), None),
             Ok(None)
         ));
         assert!(matches!(
             engine.load_insert(0, INSERTS, Some(&bundle), None),
             Ok(None)
         ));
-        assert!(engine.open_insert_editor(STRIPS + 1, 0).is_ok());
-        let _ = engine.load_insert(STRIPS + 1, 0, None, None);
-        engine.close_insert_editor(STRIPS + 1, 0);
+        assert!(engine.open_insert_editor(RACK_SEATS, 0).is_ok());
+        let _ = engine.load_insert(RACK_SEATS, 0, None, None);
+        engine.close_insert_editor(RACK_SEATS, 0);
         engine.set_channel_gain(CHANNELS, 0.5);
-        assert!(!engine.insert_has_editor(STRIPS + 1, 0));
-        assert!(!engine.insert_editor_open(STRIPS + 1, 0));
-        assert!(engine.insert(STRIPS + 1, 0).is_none());
+        assert!(!engine.insert_has_editor(RACK_SEATS, 0));
+        assert!(!engine.insert_editor_open(RACK_SEATS, 0));
+        assert!(engine.insert(RACK_SEATS, 0).is_none());
         assert!(engine.is_running(), "a bad bay number stopped the stream");
     }
 

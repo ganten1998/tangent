@@ -745,8 +745,18 @@ impl FrameSlot {
     const NEVER: u64 = u64::MAX;
 
     /// Say who is looking. See [`FrameWant`].
+    ///
+    /// A CHANGE of policy restarts the delivery-rate window — the fps a
+    /// decimated preview produced says nothing about the take that follows,
+    /// and it is exactly what the take-end "needs more light" verdict used to
+    /// be computed from. Only a change: the host restates the current want on
+    /// every repaint, and a restart per repaint would leave the rate forever
+    /// too young to answer.
     pub fn want(&self, want: FrameWant) {
-        self.want.store(want as u8, Ordering::Relaxed);
+        let prev = self.want.swap(want as u8, Ordering::Relaxed);
+        if prev != want as u8 {
+            self.stats.restart_rate_window();
+        }
     }
 
     /// What one conversion just cost, for the budget to spend.
@@ -951,6 +961,22 @@ pub struct CameraStats {
     /// first frame would otherwise read as slow for the rest of the session.
     first_delivery_ns: AtomicU64,
     last_delivery_ns: AtomicU64,
+    /// Deliveries since the rate window last opened — the `n` behind
+    /// [`delivered_fps`](Self::delivered_fps), NOT the session total.
+    ///
+    /// **A separate count, because the session is not one measurement.** The
+    /// camera opens with the band and these stats live as long as it does,
+    /// but a preview deliberately converts fewer frames than arrive — that is
+    /// the whole point of [`FrameWant::Preview`] — and a hidden pane converts
+    /// none at all. An fps measured across all of it blamed the room's light
+    /// for the preview's own thrift: a minute of decimated Linux preview
+    /// followed by a perfectly healthy take averaged out to "17 fps", and the
+    /// take-end warning told the user to light a room for a camera that had
+    /// delivered every frame the take asked of it — while the same averaging
+    /// would let a long healthy preview bury a take that genuinely starved.
+    /// So the window restarts whenever [`FrameWant`] changes, and the rate is
+    /// a statement about the policy in force NOW.
+    window_frames: AtomicU64,
 }
 
 /// Monotonic nanoseconds from a process-wide origin.
@@ -1039,7 +1065,9 @@ impl CameraStats {
     }
 
     pub fn note_delivered(&self) {
-        let n = self.frames_delivered.fetch_add(1, Ordering::Relaxed);
+        self.frames_delivered.fetch_add(1, Ordering::Relaxed);
+        // The window's own count, not the session's: see `window_frames`.
+        let n = self.window_frames.fetch_add(1, Ordering::Relaxed);
         // Two relaxed stores on the capture thread, which is already doing
         // atomics here; the reader tolerates a torn pair by returning `None`.
         let now = monotonic_ns();
@@ -1054,12 +1082,15 @@ impl CameraStats {
     ///
     /// Measured between the first and most recent delivery, so it is the rate
     /// while running rather than an average that includes the time before the
-    /// stream produced anything.
+    /// stream produced anything — and only since [`FrameWant`] last changed,
+    /// so it is the rate under the policy in force now rather than an average
+    /// over a preview that was deliberately converting less. See
+    /// `window_frames` for the take this got wrong.
     pub fn delivered_fps(&self) -> Option<f64> {
         /// Enough arrivals that a slow start cannot masquerade as a slow
         /// camera. At 15 fps this is a couple of seconds.
         const ENOUGH: u64 = 30;
-        let n = self.frames_delivered();
+        let n = self.window_frames.load(Ordering::Relaxed);
         if n < ENOUGH {
             return None;
         }
@@ -1112,12 +1143,27 @@ impl CameraStats {
         self.buffers_allocated.load(Ordering::Relaxed)
     }
 
+    /// Forget the delivery rate: a new [`FrameWant`] policy is in force.
+    ///
+    /// Storing zero is the whole job — `note_delivered` restamps
+    /// `first_delivery_ns` when the count is zero, and `delivered_fps` will
+    /// not answer again until enough fresh frames have arrived under the new
+    /// policy. The session totals are untouched: `take.json`'s counters are
+    /// baselines subtracted from those, and a restart that clawed them back
+    /// would make a take report negative frames.
+    pub fn restart_rate_window(&self) {
+        self.window_frames.store(0, Ordering::Relaxed);
+    }
+
     /// Clear the counters for a new take. Never during one.
     pub fn reset(&self) {
         self.frames_delivered.store(0, Ordering::Relaxed);
         self.frames_superseded.store(0, Ordering::Relaxed);
         self.frames_dropped_late.store(0, Ordering::Relaxed);
         self.frames_unreadable.store(0, Ordering::Relaxed);
+        // The rate goes with them: a rate carried across a reset would be a
+        // measurement of frames the counters now deny ever arrived.
+        self.restart_rate_window();
     }
 }
 
@@ -1431,6 +1477,57 @@ mod tests {
         assert_eq!(stats.delivered_fps(), None, "answered on 29 frames");
         stats.note_delivered();
         assert!(stats.delivered_fps().is_some(), "still silent at 30 frames");
+    }
+
+    /// **The take's rate verdict is measured on the take, not on the whole
+    /// session.**
+    ///
+    /// The camera opens with the band and the stats live as long as it does,
+    /// but a preview deliberately converts fewer frames than arrive and a
+    /// hidden pane converts none, so an fps spanning all of it is an average
+    /// of policies, not a rate. A minute of decimated Linux preview plus a
+    /// healthy take read as "17 fps", and the take-end warning blamed the
+    /// room's light for a camera that had delivered every frame the take
+    /// asked of it. The window therefore restarts when the want CHANGES — and
+    /// only when it changes, because the host restates the current want on
+    /// every repaint.
+    #[test]
+    fn a_take_is_judged_on_its_own_frames_and_not_the_previews() {
+        let stats = Arc::new(CameraStats::new());
+        let slot = FrameSlot::new(Arc::clone(&stats));
+        slot.want(FrameWant::Preview);
+
+        // A preview period long enough to have an opinion of its own.
+        for _ in 0..60 {
+            stats.note_delivered();
+        }
+        assert!(stats.delivered_fps().is_some(), "sixty frames could not answer");
+        // Restating the same want is a repaint, not a policy change.
+        slot.want(FrameWant::Preview);
+        assert!(
+            stats.delivered_fps().is_some(),
+            "a restated want wiped the window"
+        );
+
+        // Record. The preview's history must not follow into the take…
+        slot.want(FrameWant::Every);
+        assert_eq!(
+            stats.delivered_fps(),
+            None,
+            "the take started with the preview's rate still on the books"
+        );
+        // …and the take earns its own answer from its own frames.
+        for _ in 0..30 {
+            stats.note_delivered();
+        }
+        assert!(
+            stats.delivered_fps().is_some(),
+            "thirty frames of the take itself could not answer"
+        );
+        // The session total survives every restart: `take.json`'s counters
+        // are baselines subtracted from this, and a restart that clawed it
+        // back would make a take report negative frames.
+        assert_eq!(stats.frames_delivered(), 90);
     }
 
     /// **The camera pays for a frame only when somebody is looking.**

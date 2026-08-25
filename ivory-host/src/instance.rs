@@ -182,8 +182,8 @@ use vst3::Steinberg::Vst::{
     ParamValue, ProcessData, ProcessModes_, ProcessSetup, SymbolicSampleSizes_, TChar, ViewType,
 };
 use vst3::Steinberg::{
-    int32, int64, kInvalidArgument, kResultFalse, kResultOk, tresult, uint32, FIDString,
-    IPluginBaseTrait, IPluginFactoryTrait, IPlugView, TUID,
+    int32, int64, kInvalidArgument, kNotImplemented, kResultFalse, kResultOk, tresult, uint32,
+    FIDString, IPluginBaseTrait, IPluginFactoryTrait, IPlugView, TUID,
 };
 use vst3::{Class, ComPtr, ComWrapper, Interface};
 
@@ -1088,10 +1088,16 @@ impl Instance {
         // SAFETY: active component.
         let r = unsafe { self.processor.setProcessing(u8::from(on)) };
         // Some plugins return kNotImplemented here and process perfectly well;
-        // the SDK treats the call as advisory. Only a hard failure is an error.
-        if r != kResultOk && r != kResultFalse {
-            self.processing = on;
-            return Ok(());
+        // the SDK treats the call as advisory, and kResultFalse gets the same
+        // pass. Only a hard failure is an error — and **this branch used to be
+        // a copy of the fall-through**: it latched `processing` and returned
+        // Ok, so a plugin that hard-refused its realtime section
+        // (kInternalError from a DSP whose buffers never allocated) was driven
+        // through `process` anyway, and the symptom was silence or a crash
+        // inside the plugin instead of the Err this signature promises. The
+        // plugin said no, so `processing` stays where it was.
+        if r != kResultOk && r != kResultFalse && r != kNotImplemented {
+            return Err(format!("setProcessing({on}) failed ({r})"));
         }
         self.processing = on;
         Ok(())
@@ -2595,6 +2601,21 @@ fn read_buses(component: &ComPtr<IComponent>, media: i32, dir: i32) -> Vec<Bus> 
         let mut info: BusInfo = unsafe { std::mem::zeroed() };
         // SAFETY: `i` is in range and `info` is a valid out-parameter.
         if unsafe { component.getBusInfo(media, dir, i, &mut info) } != kResultOk {
+            // A placeholder, NOT a skip. `Bus` stores no index, so **position
+            // is a bus's only identity**, and this used to `continue`: one
+            // failed query shifted every later bus down a slot, so
+            // `activate_all_buses` counted short and left the last real bus
+            // inactive, and the scratch under-sized `ProcessData::numOutputs`
+            // — the exact shape [`Scratch::new`]'s comment measured on
+            // the modelled piano, which "wrote nothing at all and still returned
+            // kResultOk". A zero-channel hole keeps the component's own
+            // numbering, so an unreadable bus costs itself, not every bus
+            // behind it.
+            out.push(Bus {
+                name: format!("(bus {i}: getBusInfo failed)"),
+                channels: 0,
+                aux: true,
+            });
             continue;
         }
         out.push(Bus {
@@ -3139,6 +3160,126 @@ mod tests {
             "a hundred blocks went to the allocator {touches} times; the whole \
              point of the scratch is that this is zero"
         );
+    }
+
+    /// A component with three output buses whose MIDDLE one refuses
+    /// `getBusInfo`. Out of spec — the index is in range — but this host loads
+    /// arbitrary third-party binaries and the question is what the failure
+    /// costs: one bus, or the numbering of every bus behind it.
+    struct HoleyComponent;
+
+    impl Class for HoleyComponent {
+        type Interfaces = (IComponent,);
+    }
+
+    impl IPluginBaseTrait for HoleyComponent {
+        unsafe fn initialize(&self, _context: *mut vst3::Steinberg::FUnknown) -> tresult {
+            kResultOk
+        }
+        unsafe fn terminate(&self) -> tresult {
+            kResultOk
+        }
+    }
+
+    impl IComponentTrait for HoleyComponent {
+        unsafe fn getControllerClassId(&self, _class_id: *mut TUID) -> tresult {
+            kResultFalse
+        }
+        unsafe fn setIoMode(&self, _mode: vst3::Steinberg::Vst::IoMode) -> tresult {
+            kResultOk
+        }
+        unsafe fn getBusCount(
+            &self,
+            _media: vst3::Steinberg::Vst::MediaType,
+            _dir: vst3::Steinberg::Vst::BusDirection,
+        ) -> int32 {
+            3
+        }
+        unsafe fn getBusInfo(
+            &self,
+            media: vst3::Steinberg::Vst::MediaType,
+            dir: vst3::Steinberg::Vst::BusDirection,
+            index: int32,
+            bus: *mut BusInfo,
+        ) -> tresult {
+            if index == 1 {
+                return vst3::Steinberg::kInternalError;
+            }
+            // SAFETY: the caller hands a valid out-parameter, as `read_buses`
+            // does.
+            let out = unsafe { &mut *bus };
+            out.mediaType = media;
+            out.direction = dir;
+            out.channelCount = 2;
+            out.name.fill(0);
+            let label = if index == 0 { "main" } else { "aux 2" };
+            for (i, unit) in label.encode_utf16().take(127).enumerate() {
+                out.name[i] = unit;
+            }
+            out.busType = i32::from(index != 0);
+            out.flags = 0;
+            kResultOk
+        }
+        unsafe fn getRoutingInfo(
+            &self,
+            _in_info: *mut vst3::Steinberg::Vst::RoutingInfo,
+            _out_info: *mut vst3::Steinberg::Vst::RoutingInfo,
+        ) -> tresult {
+            kResultFalse
+        }
+        unsafe fn activateBus(
+            &self,
+            _media: vst3::Steinberg::Vst::MediaType,
+            _dir: vst3::Steinberg::Vst::BusDirection,
+            _index: int32,
+            _state: vst3::Steinberg::TBool,
+        ) -> tresult {
+            kResultOk
+        }
+        unsafe fn setActive(&self, _state: vst3::Steinberg::TBool) -> tresult {
+            kResultOk
+        }
+        unsafe fn setState(&self, _state: *mut vst3::Steinberg::IBStream) -> tresult {
+            kResultOk
+        }
+        unsafe fn getState(&self, _state: *mut vst3::Steinberg::IBStream) -> tresult {
+            kResultOk
+        }
+    }
+
+    #[test]
+    fn a_bus_that_refuses_get_bus_info_keeps_its_slot_instead_of_shifting_the_rest() {
+        // `read_buses` used to `continue` past the failed index, and `Bus`
+        // stores no index, so position was the only identity — the third bus
+        // slid into the second's slot, `activate_all_buses` counted short, and
+        // the scratch under-sized `ProcessData::numOutputs`: the exact shape
+        // the modelled piano answers with silence. The failed bus must cost itself and
+        // nothing else.
+        let component = ComWrapper::new(HoleyComponent)
+            .to_com_ptr::<IComponent>()
+            .expect("the wrapper exposes IComponent");
+        let buses = read_buses(
+            &component,
+            MediaTypes_::kAudio as i32,
+            BusDirections_::kOutput as i32,
+        );
+
+        assert_eq!(buses.len(), 3, "one failed query must not shrink the layout");
+        assert_eq!((buses[0].name.as_str(), buses[0].channels), ("main", 2));
+        assert_eq!(buses[1].channels, 0, "the hole is a zero-channel placeholder");
+        assert_eq!(
+            (buses[2].name.as_str(), buses[2].channels, buses[2].aux),
+            ("aux 2", 2, true),
+            "the bus AFTER the hole keeps its own slot and its own shape"
+        );
+
+        // And the scratch built from that layout reports the component's true
+        // bus count, so a plugin walking `numOutputs` finds all of them.
+        let mut scratch = Scratch::new(64, &buses, &[]).expect("build the scratch");
+        let mut out: Vec<Vec<f32>> = vec![vec![0.0; 64]; 2];
+        let (ptr, count) = scratch.bind(2, 64, &mut out);
+        assert!(!ptr.is_null());
+        assert_eq!(count, 3, "numOutputs must match the component's numbering");
     }
 
     // ── the two that need a real instrument ─────────────────────────────────

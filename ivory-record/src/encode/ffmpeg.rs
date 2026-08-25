@@ -50,17 +50,28 @@ use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 /// How many composited frames may be waiting for the encoder.
 ///
 /// Small on purpose. A 1080p BGRA frame is 8 MB, so this is the difference
-/// between a bounded 33 MB of slack and an unbounded queue that ends a long
-/// take with the machine out of memory. Four is enough to ride out the
-/// ordinary hiccup and far too few to be a queue in disguise.
+/// between a bounded 80 MB of slack and an unbounded queue that ends a long
+/// take with the machine out of memory. Ten is enough to ride out the
+/// ordinary hiccup and far too few to be a queue in disguise. (It was four,
+/// and the prose here said four long after the constant stopped being it —
+/// anybody budgeting memory from the comment was 2.5x wrong.)
 const QUEUE: usize = 10;
 
-/// The longest gap one picture may be held across, in frames.
+/// The longest gap one picture may be FROZEN across, in frames.
 ///
 /// Two seconds at any rate this app offers. A compositor that stops for longer
 /// than that has not stalled, it has stopped — the camera was unplugged, the
 /// machine went to sleep — and painting the last picture over the whole of it
 /// would be inventing a recording of something that did not happen.
+///
+/// **Beyond the cap the fill goes BLACK, it does not stop.** The first version
+/// stopped: the slots past sixty were simply never written, which read as
+/// honest right up until `finish` muxed that shortened video against an audio
+/// track `push_audio` had padded to full length, from zero, with no offset.
+/// One long stall and everything after it played seconds EARLY against its own
+/// sound for the rest of the take. Every slot gets written now; black is how
+/// the file says "there was nothing to show" without stealing time from every
+/// frame that follows. See [`Frame::blank`].
 const MAX_PAD: u32 = 60;
 
 
@@ -158,8 +169,19 @@ struct Frame {
     /// The previous one, because that is what was on screen while the
     /// compositor was busy making this one. Padding with the new picture
     /// instead would pull every stall's worth of motion earlier — the same
-    /// error as sending no timestamps at all, just smaller.
+    /// error as sending no timestamps at all, just smaller. Capped at
+    /// [`MAX_PAD`]; whatever the gap still owes past that is `blank`.
     pad: u32,
+    /// Slots filled with BLACK, after the freeze and before this picture.
+    ///
+    /// **Every slot the ledger counts must go down the pipe.** `accept`
+    /// advances `slots` by the frame's whole gap, `push_audio` pads the same
+    /// gap with real silence, and `mux` joins the two from zero with no
+    /// offset — so a slot counted and not written is not a shorter video, it
+    /// is every later frame playing early against the sound. The freeze
+    /// covers the part of the gap the last picture was honestly on screen
+    /// for; black covers the stop [`MAX_PAD`] refuses to paint over.
+    blank: u64,
 }
 
 /// The samples, on their way to being a track.
@@ -189,9 +211,6 @@ pub struct Encoder {
     /// consulted on every frame.
     overflow_bytes: usize,
     last_pts: Option<Nanos>,
-    /// When the first frame of the take happened, which is where the video's
-    /// own timeline starts.
-    first_pts: Option<Nanos>,
     /// Frame slots already written, INCLUDING the ones written as padding.
     ///
     /// The video is constant-rate: slot `n` is `n / fps` seconds in, and this
@@ -250,20 +269,42 @@ impl Encoder {
                 // does not go through the channel, so a twenty-slot stall is
                 // twenty writes rather than twenty frames of backpressure.
                 let mut last: Option<Vec<u8>> = None;
+                // Black, made once at the size of the first frame that needs
+                // it and reused for every fill after. It stands in twice:
+                // for `blank` slots — the stop MAX_PAD refuses to freeze
+                // over — and for a gap AHEAD of the take's first picture,
+                // which has no previous frame to freeze and no business
+                // borrowing the one that comes after it.
+                let mut black: Vec<u8> = Vec::new();
                 for frame in rx {
-                    if let Some(prev) = last.as_ref() {
-                        for _ in 0..frame.pad {
-                            // A broken pipe means ffmpeg died. Keep DRAINING
-                            // rather than returning: the channel is bounded, so
-                            // a writer that stops receiving would block the
-                            // caller it exists to spare, and the take would
-                            // hang instead of reporting.
-                            if !alive {
-                                break;
-                            }
-                            if stdin.write_all(prev).is_err() {
-                                alive = false;
-                            }
+                    if (frame.blank > 0 || (frame.pad > 0 && last.is_none()))
+                        && black.len() != frame.bgra.len()
+                    {
+                        black = vec![0u8; frame.bgra.len()];
+                    }
+                    // The freeze first, then the black: the last picture was
+                    // still on screen when the stall began, and the void it
+                    // turned out to be comes after.
+                    let freeze = last.as_deref().unwrap_or(&black);
+                    for _ in 0..frame.pad {
+                        // A broken pipe means ffmpeg died. Keep DRAINING
+                        // rather than returning: the channel is bounded, so
+                        // a writer that stops receiving would block the
+                        // caller it exists to spare, and the take would
+                        // hang instead of reporting.
+                        if !alive {
+                            break;
+                        }
+                        if stdin.write_all(freeze).is_err() {
+                            alive = false;
+                        }
+                    }
+                    for _ in 0..frame.blank {
+                        if !alive {
+                            break;
+                        }
+                        if stdin.write_all(&black).is_err() {
+                            alive = false;
                         }
                     }
                     if alive && stdin.write_all(&frame.bgra).is_err() {
@@ -301,7 +342,6 @@ impl Encoder {
             overflow: VecDeque::new(),
             overflow_bytes: 0,
             last_pts: None,
-            first_pts: None,
             slots: 0,
             fps: f64::from(spec.fps.max(1)),
             repeated: 0,
@@ -359,8 +399,17 @@ impl Encoder {
         // speed, out of sync with its own audio. Measured on the owner's Linux
         // box across six takes: video length over audio length, 0.50 every
         // time.
-        let first = *self.first_pts.get_or_insert(pts_ns);
-        let slot = (((pts_ns - first) as f64 / 1.0e9) * self.fps).round().max(0.0) as u64;
+        //
+        // Anchored at ZERO, not at the first frame that got here. `pts_ns` is
+        // already take-relative — see `encode::Encoder::push` — and anchoring
+        // at the first survivor used to swallow any ticks lost AHEAD of it: a
+        // compositor that failed on the take's opening tick handed the next
+        // picture to slot 0, and the whole take's video played that much
+        // early against its own audio, with nothing in the manifest to say
+        // why. The macOS backend keeps the leading gap; now both do. A take
+        // whose picture starts late now starts with black, which is when the
+        // take started and what there was to see.
+        let slot = ((pts_ns.max(0) as f64 / 1.0e9) * self.fps).round() as u64;
         // Two pictures for one slot: the second is the one nobody would see,
         // so it is the one dropped. This is what a constant-rate resampler
         // does with frames that arrive faster than real time.
@@ -383,13 +432,20 @@ impl Encoder {
         // **The padding rides with the picture it precedes**, not with the one
         // it repeats. The writer holds no state, and a gap can therefore never
         // be written for a frame that was then dropped for want of room.
+        //
+        // The freeze is capped, because a stall of several seconds should not
+        // write several seconds of one picture into a file the user is going
+        // to watch. But the capped slots are NOT discarded — they go black.
+        // The first version discarded them and called the shortfall honest,
+        // and it was not: `accept` books the whole gap, `push_audio` pads the
+        // same gap with real silence, and `mux` joins the two from zero with
+        // no offset, so every slot dropped here played the rest of the take
+        // that much early against its own sound. See [`MAX_PAD`].
+        let pad = gap.min(u64::from(MAX_PAD)) as u32;
         let frame = Frame {
             bgra: bgra[..self.frame_bytes].to_vec(),
-            // Capped, because a stall of several seconds should not write
-            // several seconds of one picture into a file the user is going to
-            // watch. Beyond this the video runs short, which is at least
-            // honest about there having been nothing to show.
-            pad: gap.min(u64::from(MAX_PAD)) as u32,
+            pad,
+            blank: gap - u64::from(pad),
         };
         // Anything held from an earlier push goes first, or the video would be
         // out of order. Non-blocking: whatever does not fit stays held.
@@ -730,6 +786,134 @@ mod tests {
             n >= 18,
             "the file has {n} frames where the take was 19 slots long - the \
              video is short and fast, which is the bug"
+        );
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// **A gap longer than the freeze cap still fills every slot.**
+    ///
+    /// The bug this pins: `pad` was capped at [`MAX_PAD`] but `accept` booked
+    /// the UNCAPPED gap into the slot ledger, so the writer wrote fewer
+    /// frames than the ledger claimed and every later frame kept being
+    /// positioned by that ledger. The file came out short in the MIDDLE —
+    /// and because `finish` muxes it against audio padded to full length
+    /// with no offset, everything after the stall played early against its
+    /// own sound for the rest of the take. Ten seconds of gap at 10 fps must
+    /// come out as a hundred slots: sixty frozen, the rest black, none
+    /// missing.
+    #[test]
+    #[ignore = "needs ffmpeg"]
+    fn a_stall_past_the_freeze_cap_goes_black_rather_than_early() {
+        if !have_ffmpeg() {
+            eprintln!("no ffmpeg on PATH, the encoder was not exercised");
+            return;
+        }
+        const W: u32 = 64;
+        const H: u32 = 48;
+        let dir = std::env::temp_dir().join("ivory-ffmpeg-black");
+        let _ = std::fs::create_dir_all(&dir);
+        let out = dir.join("stall.mp4");
+        let _ = std::fs::remove_file(&out);
+        let mut enc = Encoder::create(
+            &out,
+            super::super::VideoSpec {
+                width: W,
+                height: H,
+                fps: 10,
+            },
+            None,
+        )
+        .expect("ffmpeg is on PATH");
+        let f = vec![0x40u8; (W * H * 4) as usize];
+        enc.push(&f, 0).expect("push");
+        // Ten seconds later: a stall far past MAX_PAD's two.
+        enc.push(&f, 10_000_000_000).expect("push after the stall");
+        assert_eq!(enc.frames_written(), 2);
+        assert_eq!(
+            enc.frames_repeated(),
+            99,
+            "the ledger must book the whole gap, because the writer now \
+             writes the whole gap"
+        );
+        enc.finish().expect("finish");
+
+        // The file is the authority: 101 slots at 10 fps, not the 62 the
+        // capped-and-discarded version wrote.
+        let probe = Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "v:0"])
+            .args(["-count_frames", "-show_entries", "stream=nb_read_frames"])
+            .args(["-of", "csv=p=0"])
+            .arg(&out)
+            .output()
+            .expect("ffprobe");
+        let text = String::from_utf8_lossy(&probe.stdout);
+        let n: u64 = text.trim().trim_end_matches(',').parse().unwrap_or(0);
+        assert!(
+            n >= 100,
+            "the file has {n} frames where the take was 101 slots long - the \
+             slots past the freeze cap were dropped, and everything after the \
+             stall plays early against the audio"
+        );
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// **Ticks lost ahead of the first picture must not shift the take.**
+    ///
+    /// The timeline used to be anchored at the first frame that survived the
+    /// compositor, so a take whose opening tick failed handed its second
+    /// picture to slot 0 and the WHOLE video played that much early against
+    /// the audio — which starts at take time zero, always. A first picture
+    /// at half a second belongs at slot five, behind five slots of black.
+    #[test]
+    #[ignore = "needs ffmpeg"]
+    fn a_lost_leading_tick_becomes_black_rather_than_a_shifted_take() {
+        if !have_ffmpeg() {
+            eprintln!("no ffmpeg on PATH, the encoder was not exercised");
+            return;
+        }
+        const W: u32 = 64;
+        const H: u32 = 48;
+        let dir = std::env::temp_dir().join("ivory-ffmpeg-anchor");
+        let _ = std::fs::create_dir_all(&dir);
+        let out = dir.join("late-start.mp4");
+        let _ = std::fs::remove_file(&out);
+        let mut enc = Encoder::create(
+            &out,
+            super::super::VideoSpec {
+                width: W,
+                height: H,
+                fps: 10,
+            },
+            None,
+        )
+        .expect("ffmpeg is on PATH");
+        let f = vec![0x40u8; (W * H * 4) as usize];
+        // The compositor missed the take's first five ticks.
+        enc.push(&f, 500_000_000).expect("push");
+        enc.push(&f, 600_000_000).expect("push");
+        assert_eq!(enc.frames_written(), 2);
+        assert_eq!(
+            enc.frames_repeated(),
+            5,
+            "the lost leading ticks were not booked as filled slots"
+        );
+        enc.finish().expect("finish");
+
+        // Seven slots — five black, two pictures — where the anchored-at-
+        // first-frame version wrote two and shifted the take half a second.
+        let probe = Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "v:0"])
+            .args(["-count_frames", "-show_entries", "stream=nb_read_frames"])
+            .args(["-of", "csv=p=0"])
+            .arg(&out)
+            .output()
+            .expect("ffprobe");
+        let text = String::from_utf8_lossy(&probe.stdout);
+        let n: u64 = text.trim().trim_end_matches(',').parse().unwrap_or(0);
+        assert!(
+            n >= 6,
+            "the file has {n} frames where the take was 7 slots long - the \
+             leading gap was swallowed and the video is shifted early"
         );
         let _ = std::fs::remove_file(&out);
     }

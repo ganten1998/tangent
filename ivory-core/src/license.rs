@@ -55,8 +55,11 @@ pub const PUBLIC_KEYS: &[[u8; 32]] = &[
     ],
 ];
 
-/// Why a license string was not accepted. Only ever used to phrase a message —
-/// every variant resolves to "run free".
+/// Why a license string was not accepted — or, for [`Unsaved`], accepted but
+/// not persisted. Only ever used to phrase a message; every refusal resolves
+/// to "run free".
+///
+/// [`Unsaved`]: LicenseError::Unsaved
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LicenseError {
     /// Nothing to check (empty or whitespace only).
@@ -72,6 +75,17 @@ pub enum LicenseError {
     FutureVersion(u8),
     /// Decoded and intact, but not signed by a key in the ring.
     BadSignature,
+    /// Genuine, but its `max_major` cap stops short of this build. Carries
+    /// the cap the same way `FutureVersion` carries the version: for the
+    /// `Debug` line, not the message.
+    VersionCapped(u8),
+    /// Verified fine, but writing `license.key` failed (read-only config dir,
+    /// full disk). The key IS honored for the running session — a disk
+    /// problem must never turn a supporter away — but the next launch starts
+    /// free, and the message has to say so. `install` used to answer plain
+    /// `Ok` here, so the app said "thank you" while nothing had reached disk
+    /// and the key silently evaporated on restart.
+    Unsaved,
 }
 
 impl LicenseError {
@@ -88,6 +102,13 @@ impl LicenseError {
                 "That key was made for a newer version of Ivory. Updating should accept it."
             }
             LicenseError::BadSignature => "That key could not be verified.",
+            LicenseError::VersionCapped(_) => {
+                "That key covers an earlier version of Ivory, and this build is past it."
+            }
+            LicenseError::Unsaved => {
+                "That key is genuine, but it could not be saved - it works for \
+                 now, and will need pasting again next launch."
+            }
         }
     }
 }
@@ -98,7 +119,10 @@ pub struct License {
     pub tier: u8,
     /// Days since 2020-01-01. Display only — nothing expires.
     pub issued_days: u16,
-    /// 0 = valid for every future version. Non-zero caps the major version.
+    /// 0 = valid for every future version. Non-zero caps the major version —
+    /// enforced by [`LicenseStore`] via [`License::covers_build_major`], NOT
+    /// by `verify_key`, so the mint tools can still verify and inspect a
+    /// capped key that this build would decline to honor.
     pub max_major: u8,
     /// Opaque 40-bit sale code. Meaningless without the owner's private ledger.
     pub order_id: [u8; 5],
@@ -111,6 +135,21 @@ const HEADER_LEN: usize = 11;
 const SIG_LEN: usize = 64;
 const CRC_LEN: usize = 4;
 const MAX_NAME: usize = 32;
+
+/// The major version `max_major` is compared against, parsed from this
+/// crate's own version at compile time. Sound because the workspace pins ONE
+/// version for every crate (`version.workspace = true`), so ivory-core's
+/// major and the app's major cannot disagree — no clock, no plumbing.
+const BUILD_MAJOR: u8 = {
+    let s = env!("CARGO_PKG_VERSION_MAJOR").as_bytes();
+    let mut n = 0u8;
+    let mut i = 0;
+    while i < s.len() {
+        n = n * 10 + (s[i] - b'0');
+        i += 1;
+    }
+    n
+};
 
 impl License {
     /// Canonical signed preimage. **Frozen**: change this and every issued key
@@ -156,6 +195,17 @@ impl License {
             order_id: [p[5], p[6], p[7], p[8], p[9]],
             name,
         })
+    }
+
+    /// Does the version cap admit this build? 0 is perpetual by definition.
+    ///
+    /// This is the only reader of `max_major` outside the mint tools. It has
+    /// to be, and for a while it did not exist at all: keygen signed the cap
+    /// into the payload, the doc above promised it meant something, and no
+    /// code anywhere compared it to a running version — a key capped at 4
+    /// would have kept unlocking 5.x, 6.x, forever.
+    pub fn covers_build_major(&self) -> bool {
+        self.max_major == 0 || self.max_major >= BUILD_MAJOR
     }
 }
 
@@ -337,7 +387,11 @@ impl LicenseStore {
         let Ok(raw) = std::fs::read_to_string(&path) else {
             return Self { path, raw: None, license: None };
         };
-        let license = verify_key(&raw).ok();
+        // A genuine key whose `max_major` stops short of this build is not
+        // installed — fails open to the free app like every other refusal,
+        // and `raw` still keeps the file verbatim (a cap is the ONE refusal a
+        // future build cannot cure, but the rule stays: never eat the file).
+        let license = verify_key(&raw).ok().filter(License::covers_build_major);
         Self { path, raw: Some(raw), license }
     }
 
@@ -362,26 +416,50 @@ impl LicenseStore {
         self.raw.as_deref()
     }
 
-    /// Validate and install a pasted key. On success the text is persisted
-    /// atomically; on failure NOTHING on disk changes and the previous license
-    /// (if any) is untouched.
+    /// Validate and install a pasted key. `Ok` means verified AND persisted
+    /// atomically; on a refused key NOTHING changes, on disk or in memory.
+    ///
+    /// The one in-between is [`LicenseError::Unsaved`]: a genuine key whose
+    /// write failed still installs for the running session — a read-only
+    /// config dir must never turn a supporter away — but the caller is told,
+    /// so the UI can warn that next launch starts free instead of saying
+    /// "thank you" over a key that never reached disk.
     pub fn install(&mut self, key_text: &str) -> Result<&License, LicenseError> {
         let license = verify_key(key_text)?;
+        // The cap is checked HERE, not in `verify_key`: to the wire format the
+        // key is genuine, this build just is not one it covers. Refused before
+        // anything is touched, same as any other bad paste.
+        if !license.covers_build_major() {
+            return Err(LicenseError::VersionCapped(license.max_major));
+        }
         if let Some(dir) = self.path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        // Write-then-rename, mirroring OverrideStore::save.
+        // Write-then-rename, mirroring OverrideStore::save — but the outcome
+        // is KEPT, not shrugged off. Both arms used to fall through to `Ok`,
+        // so a failed write was indistinguishable from a saved key until the
+        // next launch quietly came up free.
         let tmp = self.path.with_extension("key.tmp");
-        if std::fs::write(&tmp, key_text).is_ok() {
-            if std::fs::rename(&tmp, &self.path).is_err() {
-                let _ = std::fs::remove_file(&tmp);
+        let saved = match std::fs::write(&tmp, key_text) {
+            Ok(()) => {
+                let renamed = std::fs::rename(&tmp, &self.path).is_ok();
+                if !renamed {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+                renamed
             }
-        } else {
-            let _ = std::fs::remove_file(&tmp);
-        }
+            Err(_) => {
+                let _ = std::fs::remove_file(&tmp);
+                false
+            }
+        };
         self.raw = Some(key_text.to_owned());
         self.license = Some(license);
-        Ok(self.license.as_ref().expect("just assigned"))
+        if saved {
+            Ok(self.license.as_ref().expect("just assigned"))
+        } else {
+            Err(LicenseError::Unsaved)
+        }
     }
 
     /// Forget the installed license (removes the file). Used by a future
@@ -532,6 +610,29 @@ mod tests {
         assert_eq!(s.raw(), Some("not a key at all"));
         assert!(p.exists(), "a file we could not parse must never be deleted");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_version_cap_is_actually_consulted() {
+        // `max_major` was signed, documented, printed by keygen — and read by
+        // nothing. A key capped at 4 would have unlocked 5.x forever. The cap:
+        // 0 is perpetual, at-or-above this build passes, below it fails.
+        assert!(License { max_major: 0, ..sample() }.covers_build_major());
+        assert!(License { max_major: BUILD_MAJOR, ..sample() }.covers_build_major());
+        assert!(License { max_major: u8::MAX, ..sample() }.covers_build_major());
+        assert!(
+            !License { max_major: BUILD_MAJOR - 1, ..sample() }.covers_build_major(),
+            "a key capped below this build must not cover it"
+        );
+    }
+
+    #[test]
+    fn build_major_matches_the_workspace_version() {
+        // The whole enforcement rests on the const parse of this crate's own
+        // major, so pin it to the string it came from.
+        let major: u8 = env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap();
+        assert_eq!(BUILD_MAJOR, major);
+        assert!(BUILD_MAJOR > 0, "a 0 major would make every cap read as perpetual");
     }
 
     #[test]
