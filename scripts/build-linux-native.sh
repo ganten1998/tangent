@@ -49,6 +49,32 @@ cp assets/font-licenses/*.txt "$STAGE/font-licenses/"
 cp LICENSE THIRD-PARTY-LICENSES "$STAGE/"
 # The same user-facing readme the macOS and Windows artifacts carry.
 cp docs/ARTIFACT-README.md "$STAGE/README.txt"
+# **The installer the README tells them to run.** The 4.92.0 tarball shipped
+# WITHOUT install.sh while README.txt's first instruction was `./install.sh` —
+# a tester's very first step failed on a file that was not there. The cross
+# path (build-cross.sh package_linux) always staged it; this native path — the
+# "recommended Linux path" — never did.
+install -m 755 installer/linux/install.sh "$STAGE/install.sh"
+# **And the encoder the app expects beside itself.** Without the sidecar,
+# video takes silently fall back to whatever distro ffmpeg exists — on a clean
+# machine, none — which is the exact 4.11 regression the cross path was
+# hardened against. The checksum-pinned cache is authoritative; fetch fills it
+# when absent (needs network once); SKIP_FFMPEG=1 is the source-builder's
+# escape hatch, never the release path's.
+if [ ! -x "dist/vendor/linux/tangent-ffmpeg" ] && [ "${SKIP_FFMPEG:-0}" != "1" ]; then
+  scripts/fetch-ffmpeg.sh linux
+fi
+if [ -x "dist/vendor/linux/tangent-ffmpeg" ]; then
+  install -m 755 dist/vendor/linux/tangent-ffmpeg "$STAGE/tangent-ffmpeg"
+  mkdir -p "$STAGE/ffmpeg-licenses"
+  cp -R dist/vendor/linux/ffmpeg-licenses/. "$STAGE/ffmpeg-licenses/"
+elif [ "${SKIP_FFMPEG:-0}" = "1" ]; then
+  echo "==> SKIP_FFMPEG=1: tarball will have no bundled encoder (video takes"
+  echo "    need a system ffmpeg). Never ship this as a release artifact."
+else
+  echo "FAIL: no dist/vendor/linux/tangent-ffmpeg and fetch did not produce one" >&2
+  exit 1
+fi
 tar -C dist -czf "${STAGE}.tar.gz" "tangent-${VERSION}-linux-${ARCH}"
 rm -rf "$STAGE"
 echo "==> ${STAGE}.tar.gz"
@@ -71,5 +97,24 @@ ls -lh "${STAGE}.tar.gz" | sed 's/^/    /'
 if [ "$(tar -tzf "${STAGE}.tar.gz" | grep -c '/tangent$')" -eq 0 ]; then
   echo "FAIL: ${STAGE}.tar.gz contains no 'tangent' binary" >&2
   exit 1
+fi
+# **And the pieces the README sends people to.** The 4.92.0 tarball passed
+# the binary check while missing install.sh — the very first instruction in
+# its own README.txt — and the bundled encoder. An archive proves nothing
+# each part must be named. SKIP_FFMPEG builds are for source-builders and
+# exempt the encoder checks only.
+for want in '/install.sh$'; do
+  if [ "$(tar -tzf "${STAGE}.tar.gz" | grep -cE "$want")" -eq 0 ]; then
+    echo "FAIL: nothing matching $want in ${STAGE}.tar.gz" >&2
+    exit 1
+  fi
+done
+if [ "${SKIP_FFMPEG:-0}" != "1" ]; then
+  for want in '/tangent-ffmpeg$' 'ffmpeg-licenses/'; do
+    if [ "$(tar -tzf "${STAGE}.tar.gz" | grep -cE "$want")" -eq 0 ]; then
+      echo "FAIL: nothing matching $want in ${STAGE}.tar.gz" >&2
+      exit 1
+    fi
+  done
 fi
 echo "    contains: $(tar -tzf "${STAGE}.tar.gz" | wc -l | tr -d ' ') entries, binary present"

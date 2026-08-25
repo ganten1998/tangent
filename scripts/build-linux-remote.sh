@@ -122,6 +122,17 @@ rsync -az --delete ${SSH_OPTS:+-e "ssh $SSH_OPTS"} \
 # directory does not stay poisoned.
 ssh_ "$HOST" "[ -L $REMOTE_DIR/target ] && rm -f $REMOTE_DIR/target || true"
 
+# ── The encoder cache rides along ────────────────────────────────────────────
+# The rsync above excludes dist/ wholesale, so the checksum-pinned ffmpeg cache
+# never reached the build host — which is how the native path shipped tarballs
+# with no bundled encoder. Push just the vendor slice; the native script then
+# stages from cache instead of downloading on the build box.
+if [ -x dist/vendor/linux/tangent-ffmpeg ]; then
+  echo "==> Pushing the encoder cache"
+  ssh_ "$HOST" "mkdir -p $REMOTE_DIR/dist/vendor"
+  rsync -az ${SSH_OPTS:+-e "ssh $SSH_OPTS"} dist/vendor/linux "$HOST:$REMOTE_DIR/dist/vendor/"
+fi
+
 # ── Build ────────────────────────────────────────────────────────────────────
 echo "==> Building the standalone (first run compiles everything)"
 ssh_ "$HOST" "cd $REMOTE_DIR && chmod +x scripts/*.sh && scripts/build-linux-native.sh"
@@ -151,6 +162,15 @@ if [ "$(tar -tzf "$TARBALL" | grep -c '/tangent$')" -eq 0 ]; then
   tar -tzf "$TARBALL" | sed 's/^/    /' >&2
   exit 1
 fi
+
+# The pieces a buyer is told to use, not just the binary: the README's first
+# instruction is ./install.sh, and video takes need the bundled encoder.
+for want in '/install.sh$' '/tangent-ffmpeg$' 'ffmpeg-licenses/'; do
+  if [ "$(tar -tzf "$TARBALL" | grep -cE "$want")" -eq 0 ]; then
+    echo "FAIL: nothing matching $want in $TARBALL" >&2
+    exit 1
+  fi
+done
 
 echo "==> OK  $TARBALL"
 ls -lh "$TARBALL" | sed 's/^/    /'

@@ -304,21 +304,20 @@ build_linux() {
   tar -tzf "$out" | sed 's/^/      /'
   # Same lesson as everywhere else in this repo: an archive that exists proves
   # nothing. Both payloads and the installer must actually be in it.
+  # The VST3 is RETIRED (owner's ruling, 2026-08-24); requiring it here made
+  # this branch structurally un-runnable — every invocation exited 1 against
+  # an artifact that was correct.
   for want in '/tangent$' '/install.sh$' '/tangent-ffmpeg$' \
-              'ffmpeg-licenses/GPLv3.txt$' \
-              'Tangent.vst3/Contents/x86_64-linux/Tangent.so$'; do
+              'ffmpeg-licenses/GPLv3.txt$'; do
     if [ "$(tar -tzf "$out" | grep -cE "$want")" -eq 0 ]; then
       echo "FAIL: nothing matching $want in $out" >&2
       exit 1
     fi
   done
-  # Exactly one plugin bundle, and it is not inside itself.
-  if [ "$(tar -tzf "$out" | grep -c 'Tangent\.vst3/Tangent\.vst3')" -ne 0 ]; then
-    echo "FAIL: $out contains a nested Tangent.vst3 (the cp -R trap)" >&2
-    exit 1
-  fi
-  if [ "$(tar -tzf "$out" | grep -cE 'Tangent\.vst3/Contents/x86_64-linux/Tangent\.so$')" -ne 1 ]; then
-    echo "FAIL: $out does not contain exactly one plugin binary" >&2
+  # No plugin bundle may sneak back in: the VST3 is retired, and a tarball
+  # carrying one would resurrect copy the fulfil emails no longer promise.
+  if [ "$(tar -tzf "$out" | grep -c 'Tangent\.vst3')" -ne 0 ]; then
+    echo "FAIL: $out contains a Tangent.vst3 — the plugin is retired" >&2
     exit 1
   fi
   # **The installer itself has to RUN, not merely be present.** `sh -n` catches
