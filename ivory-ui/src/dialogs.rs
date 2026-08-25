@@ -4181,13 +4181,6 @@ pub fn show(
                             ) {
                                 action = Some(DialogAction::ProjectExportOpen);
                             }
-                            if row(
-                                ui,
-                                "Stream to OBS...",
-                                "send the master out over ReaStream to OBS or REAPER",
-                            ) {
-                                action = Some(DialogAction::OpenReaStream);
-                            }
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if ui
                                     .add(Button::new(RichText::new("Done").color(t.text)))
@@ -4798,7 +4791,10 @@ pub fn show(
             host,
             focus,
         } => {
-            let t = theme(dark_mode);
+            // ALWAYS the light theme — the owner's word ("keep the obs
+            // stream menu light"): ivory ground, black text, whatever the
+            // rest of the app is wearing.
+            let t = theme(false);
             let dim = t.text.gamma_multiply(0.62);
             show_dialog_viewport(
                 ctx,
