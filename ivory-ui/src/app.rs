@@ -8787,10 +8787,8 @@ impl IvoryApp {
         // ── the keys the editor owns while the hand is on it ─────────────
         let keys_ok = self.dialog.is_none()
             && self.menu_state.is_none()
-            && !self.name_focused
-            && self.num_edit.is_none()
             && self.swing_menu.is_none()
-            && self.drumpad_num.is_none();
+            && !self.text_entry_active();
         if keys_ok && over {
             if ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::O)) {
                 self.settings.midi_swing = !self.settings.midi_swing;
@@ -8901,10 +8899,12 @@ impl IvoryApp {
                 let kv = self.midi_keys_visible();
                 // **Shift+wheel ZOOMS the visible note count** — the midi twin
                 // of the mixer's track-count zoom, anywhere in the editor. Two
-                // semitones a tick, a legible band.
-                if shift && scroll.y.abs() > 0.5 {
+                // semitones a tick. Combined delta: Shift turns the wheel
+                // horizontal at the OS, so the notch lands on `x`, not `y`.
+                let shift_d = scroll.x + scroll.y;
+                if shift && shift_d.abs() > 0.5 {
                     let cur = self.settings.midi_keys_visible as i64;
-                    let next = (cur + if scroll.y > 0.0 { 2 } else { -2 }).clamp(12, 96);
+                    let next = (cur + if shift_d > 0.0 { 2 } else { -2 }).clamp(12, 96);
                     if next != cur {
                         self.settings.midi_keys_visible = next as u8;
                         self.save_settings();
@@ -9674,11 +9674,19 @@ impl IvoryApp {
                         .contains(p)
                 };
                 if over_headers {
+                    // **Combined delta, like the mixer.** Holding Shift makes
+                    // the OS turn a vertical wheel into HORIZONTAL scroll on
+                    // every platform, so the notch arrives on `x`, not `y`.
+                    // Reading `y` alone left the sign always negative under
+                    // Shift — both directions zoomed the same way, the owner's
+                    // "can't unzoom". `x + y` picks up whichever axis carried
+                    // it, exactly as the mixer's zoom already does.
+                    let d = scroll.x + scroll.y;
                     if shift {
                         // **Shift+wheel ZOOMS the lane count** — one lane per
                         // tick, the mixer's own gesture on the vertical desk.
                         let cur = self.settings.arr_visible as i64;
-                        let next = (cur + if scroll.y > 0.0 { 1 } else { -1 })
+                        let next = (cur + if d > 0.0 { 1 } else { -1 })
                             .clamp(1, crate::recorder::CHANNELS as i64);
                         if next != cur {
                             self.settings.arr_visible = next as u8;
@@ -9687,9 +9695,9 @@ impl IvoryApp {
                     } else {
                         let max =
                             crate::recorder::CHANNELS.saturating_sub(self.arr_visible());
-                        if scroll.y < -0.5 {
+                        if d < -0.5 {
                             self.arr_lane_scroll = (self.arr_lane_scroll + 1).min(max);
-                        } else if scroll.y > 0.5 {
+                        } else if d > 0.5 {
                             self.arr_lane_scroll = self.arr_lane_scroll.saturating_sub(1);
                         }
                     }
@@ -10365,9 +10373,7 @@ impl IvoryApp {
         // supporter card; Delete has no other meaning here.
         let keys_ok = self.dialog.is_none()
             && self.menu_state.is_none()
-            && !self.name_focused
-            && self.num_edit.is_none()
-            && self.drumpad_num.is_none();
+            && !self.text_entry_active();
         // **Escape clears the time selection**, and with it the loop. The
         // innermost claimant already had its turn — the editor and every
         // menu run their own Escape before this and `return`, and the
@@ -11171,6 +11177,22 @@ impl IvoryApp {
     /// knows a space bar is a space and not a Record press.
     pub fn recorder_name_focused(&self) -> bool {
         self.name_focused
+    }
+
+    /// **Is a text field taking the keystroke?** The one answer every key
+    /// gate consults, so a rename, a typed number or a pad name can never
+    /// leak a letter to a shortcut. Typing "DDD" into a track title must not
+    /// delete three tracks, backspace must not delete the track, and H must
+    /// not slide the help card down — the owner's report. A field swallows
+    /// the frame's keys; only Enter, Escape and a mouse press act, and each
+    /// of those is handled by the field itself.
+    fn text_entry_active(&self) -> bool {
+        self.name_focused
+            || self.num_edit.is_some()
+            || self.mixer_naming.is_some()
+            || self.mixer_typing.is_some()
+            || self.drumpad_num.is_some()
+            || self.pad_name_typing.is_some()
     }
 
     /// One click in the band.
@@ -14367,20 +14389,15 @@ impl IvoryApp {
         // A numeric field joins it for the same reason and one of its own: the
         // transpose arrows are bound to Up and Down, and typing a tempo with
         // those keys live would transpose the chord behind the field.
+        // **Every text field swallows the frame's keys** — the owner typed
+        // "tangent" into a track name and watched T open the about menu, G
+        // resize the window and E raise the chord corrector, one letter at a
+        // time. One `text_entry_active` answer gates every shortcut path.
         if self.dialog.is_none()
             && self.menu_state.is_none()
-            && !self.name_focused
-            && self.num_edit.is_none()
-            // **Every text field swallows the frame's keys** — the owner
-            // typed "tangent" into a track name and watched T open the
-            // about menu, G resize the window and E raise the chord
-            // corrector, one letter at a time.
-            && self.mixer_naming.is_none()
-            && self.mixer_typing.is_none()
             && self.input_menu.is_none()
             && self.swing_menu.is_none()
-            && self.drumpad_num.is_none()
-            && self.pad_name_typing.is_none()
+            && !self.text_entry_active()
         {
             if let Some(action) = keys::pressed(&ctx, self.key_gates()) {
                 // The GUITAR toggle answers nowhere but the piano view: on
@@ -15246,8 +15263,7 @@ impl IvoryApp {
             }
             // **Ctrl/Cmd+T: a new track**, here as in the arrangement.
             if self.dialog.is_none()
-                && self.mixer_typing.is_none()
-                && self.mixer_naming.is_none()
+                && !self.text_entry_active()
                 && ctx.input(|i| {
                     (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::T)
                 })
@@ -15258,10 +15274,7 @@ impl IvoryApp {
             // menu's Remove, on the key, as in the arrangement.
             if self.dialog.is_none()
                 && self.menu_state.is_none()
-                && self.mixer_typing.is_none()
-                && self.mixer_naming.is_none()
-                && self.num_edit.is_none()
-                && !self.name_focused
+                && !self.text_entry_active()
                 && ctx.input(|i| {
                     i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)
                 })
@@ -15535,12 +15548,7 @@ impl IvoryApp {
         // **The view keys: ctrl+A / ctrl+M / ctrl+V** — arrange, mixer,
         // visualizer, from anywhere a letter is not being typed. CTRL
         // proper, not command: the editor's own Cmd+A keeps select-all.
-        if self.dialog.is_none()
-            && !self.name_focused
-            && self.num_edit.is_none()
-            && self.mixer_typing.is_none()
-            && self.mixer_naming.is_none()
-        {
+        if self.dialog.is_none() && !self.text_entry_active() {
             // **Ctrl+Z / Ctrl+Shift+Z — one line of time**, whatever view
             // wrote the moment (Cmd works too, for the muscle that has it).
             let (undo_key, redo_key) = ctx.input(|i| {
@@ -15608,7 +15616,14 @@ impl IvoryApp {
         // Not while something modal is up. The key is read straight out of the
         // raw input, so without this an `h` typed into the supporter-key field
         // both entered the letter and slid the card down over the app.
-        let help = keys::help_progress(&ctx, self.dialog.is_none() && self.menu_state.is_none());
+        // Not while a text field is taking keys either: H is a letter in a
+        // track name before it is the help card. A dialog's own field is
+        // covered by `dialog.is_none()`; a lane or strip rename is not, so
+        // `text_entry_active` is what stops "HHH" from sliding the card.
+        let help = keys::help_progress(
+            &ctx,
+            self.dialog.is_none() && self.menu_state.is_none() && !self.text_entry_active(),
+        );
         if help > 0.0 {
             keys::draw_help(
                 ui.painter(),
@@ -18516,6 +18531,92 @@ mod tests {
             Some(0),
             "the chip did not open the input menu"
         );
+    }
+
+    #[test]
+    /// **A rename swallows the frame's keys — no track dies to a title.**
+    /// Typing "DDD" or hitting Backspace while renaming a lane used to reach
+    /// the Delete-track shortcut, because the arrange key gate did not know a
+    /// rename (which reuses `mixer_naming`) was live. Now every gate consults
+    /// `text_entry_active`. With a rename open, Delete leaves the desk alone.
+    #[test]
+    fn a_rename_swallows_the_delete_key() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.keytoggle_enabled = false;
+        let _ = run_frame(&ctx, &mut app);
+        app.arrangement_open = true;
+        app.set_channel_input_spec(2, "midi:all");
+        assert!(app.channel_used(2), "the fixture channel is not used");
+        app.selected_channel = Some(2);
+        // A lane rename is open — the same state the header's name field sets.
+        app.mixer_naming = Some((crate::recorder::Column(2), "DR".to_owned()));
+        assert!(app.text_entry_active(), "a rename must count as text entry");
+        let _ = run_frame(&ctx, &mut app);
+        // Backspace, then D, then D — the owner's "DDDD"/backspace title.
+        for key in [egui::Key::Backspace, egui::Key::D, egui::Key::D] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                    events: vec![egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |ctx| app.frame(ctx),
+            );
+        }
+        assert!(app.channel_used(2), "a keystroke during a rename deleted the track");
+    }
+
+    /// **Shift+wheel over the track headers zooms the lane count BOTH ways.**
+    /// The owner's "can't unzoom": holding Shift makes the OS deliver the
+    /// wheel as HORIZONTAL scroll, so the notch lands on `x`. The lane-zoom
+    /// read `y` alone, which stayed ~0 under Shift and always took the same
+    /// branch. Injected exactly as the platform sends it — shift held, delta
+    /// on x — and the count must move opposite ways for opposite signs.
+    #[test]
+    fn shift_wheel_over_headers_zooms_lanes_both_ways() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.keytoggle_enabled = false;
+        app.settings.arr_visible = 8;
+        let _ = run_frame(&ctx, &mut app);
+        app.arrangement_open = true;
+        let _ = run_frame(&ctx, &mut app);
+        let rect = app.arrangement_rect.expect("arrangement did not open");
+        // Aim at the HEADER column, on the left.
+        let p = Pos2::new(rect.left() + 12.0, rect.top() + rect.height() * 0.5);
+        // Shift held; the OS put the vertical notch on the X axis.
+        let shift_wheel_x = |ctx: &egui::Context, app: &mut IvoryApp, dx: f32| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                    modifiers: egui::Modifiers { shift: true, ..Default::default() },
+                    events: vec![
+                        egui::Event::PointerMoved(p),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Line,
+                            delta: Vec2::new(dx, 0.0),
+                            modifiers: egui::Modifiers { shift: true, ..Default::default() },
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| app.frame(ctx),
+            );
+        };
+        shift_wheel_x(&ctx, &mut app, 3.0);
+        let up = app.settings.arr_visible;
+        shift_wheel_x(&ctx, &mut app, -3.0);
+        let down = app.settings.arr_visible;
+        shift_wheel_x(&ctx, &mut app, -3.0);
+        let down2 = app.settings.arr_visible;
+        assert!(up > 8, "shift+wheel one way did not add a lane: {up}");
+        assert!(down < up, "shift+wheel the other way did not remove a lane: {up}->{down}");
+        assert!(down2 < down, "a second tick did not keep unzooming: {down}->{down2}");
     }
 
     #[test]
