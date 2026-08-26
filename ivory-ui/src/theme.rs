@@ -52,6 +52,16 @@ pub struct Theme {
     /// it would have quietly repainted the default keyboard.
     pub key_separator: Option<Rgb>,
 
+    // ── the ground everything else sits on ─────────────────────────────────
+    /// **The app's own background** — behind the keyboard, and the field every
+    /// theory module is drawn on.
+    ///
+    /// It was two fixed values, one per mode: near-black dark, ivory light,
+    /// the same on all sixteen themes. The owner's words were that no theme
+    /// changes the theory view's background, and they were right — it was the
+    /// one surface with no role at all.
+    pub background: Option<Rgb>,
+
     // ── words and lines ────────────────────────────────────────────────────
     pub text: Option<Rgb>,
     /// Every line the theory modules draw: staff rules, grid, outlines.
@@ -100,7 +110,8 @@ pub struct Theme {
 
 /// Every role a theme can name, in the spelling a theme FILE uses. One list,
 /// so the writer, the reader, the example and the dark map cannot drift.
-pub const ROLES: [&str; 17] = [
+pub const ROLES: [&str; 18] = [
+    "background",
     "white_key",
     "black_key",
     "key_active",
@@ -126,6 +137,22 @@ const fn c(r: u8, g: u8, b: u8) -> Option<Rgb> {
     Some(Rgb { r, g, b })
 }
 
+/// The dark-mode set for a factory theme, written as pairs.
+///
+/// A `BTreeMap` cannot be a const, and a factory theme should not need ten
+/// lines of insertion to name two colours.
+fn dark_of(pairs: &[(&str, (u8, u8, u8))]) -> std::collections::BTreeMap<String, Rgb> {
+    pairs
+        .iter()
+        .map(|(role, (r, g, b))| {
+            (
+                (*role).to_owned(),
+                Rgb { r: *r, g: *g, b: *b },
+            )
+        })
+        .collect()
+}
+
 impl Theme {
     /// The theme a fresh install wears — every role SET, to the exact value
     /// the app ships with.
@@ -141,6 +168,7 @@ impl Theme {
     pub fn factory_default() -> Self {
         Self {
             name: "Default".to_owned(),
+            background: c(0xeb, 0xc5, 0xc8),
             white_key: c(0xE8, 0xDC, 0xC0),
             black_key: c(0x1a, 0x1a, 0x1a),
             key_active: c(0x6C, 0x9B, 0xD2),
@@ -159,7 +187,7 @@ impl Theme {
             fretboard: c(0x4a, 0x2b, 0x22),
             string: c(0xC9, 0xC4, 0xBC),
             channel_palette: Some(0),
-            dark: Default::default(),
+            dark: dark_of(&[("background", (0x23, 0x1b, 0x1b))]),
         }
     }
 
@@ -168,6 +196,7 @@ impl Theme {
     pub fn capture(name: &str, s: &Settings) -> Self {
         Self {
             name: name.to_owned(),
+            background: Some(s.background_color),
             white_key: Some(s.white_key_idle_color),
             black_key: Some(s.black_key_idle_color),
             key_active: Some(s.white_key_active_color),
@@ -203,6 +232,9 @@ impl Theme {
         // under this one's light set is the "Default is not the default" bug
         // in a new costume.
         s.dark_roles = self.dark.clone();
+        if let Some(v) = self.background {
+            s.background_color = v;
+        }
         if let Some(v) = self.white_key {
             s.white_key_idle_color = v;
         }
@@ -288,6 +320,7 @@ impl Theme {
         put("meter_bg", self.meter_bg);
         put("scope_draw", self.scope_draw);
         put("fx_strip", self.fx_strip);
+        put("background", self.background);
         put("input_chip", self.input_chip);
         put("fretboard", self.fretboard);
         put("string", self.string);
@@ -335,6 +368,7 @@ impl Theme {
             fx_knob: get("fx_knob"),
             master_knob: get("master_knob"),
             meter_bg: get("meter_bg"),
+            background: get("background"),
             scope_draw: get("scope_draw"),
             fx_strip: get("fx_strip"),
             input_chip: get("input_chip"),
@@ -393,6 +427,7 @@ pub fn factory() -> Vec<Theme> {
         // jade → amber → crimson, so the scope is jade and the master crimson.
         Theme {
             name: "Valentine".to_owned(),
+            background: c(0xe9, 0xc3, 0xe0),
             white_key: c(0xf3, 0xdc, 0xe7),
             black_key: c(0x25, 0x15, 0x24),
             key_active: c(0xff, 0x5f, 0xa2),
@@ -416,13 +451,14 @@ pub fn factory() -> Vec<Theme> {
             fretboard: c(0x25, 0x15, 0x24),
             string: c(0xa3, 0x76, 0x8f),
             channel_palette: Some(6),
-            dark: Default::default(),
+            dark: dark_of(&[("background", (0x22, 0x1b, 0x20))]),
         },
         // ── Hydra: the owner's audio-routing TUI. Near-black teal depths, a
         // bioluminescent seafoam glow, and exactly one warm coral — which is
         // the sustain, because sustain is the held/engaged state.
         Theme {
             name: "Hydra".to_owned(),
+            background: c(0xb5, 0xd5, 0xd7),
             white_key: c(0xd6, 0xe8, 0xe4),
             black_key: c(0x10, 0x24, 0x28),
             key_active: c(0x3f, 0xd9, 0xb8),
@@ -441,7 +477,7 @@ pub fn factory() -> Vec<Theme> {
             fretboard: c(0x10, 0x24, 0x28),
             string: c(0x6a, 0x8c, 0x88),
             channel_palette: Some(2),
-            dark: Default::default(),
+            dark: dark_of(&[("background", (0x16, 0x1f, 0x1f))]),
         },
         // ── Navi: the owner's graph viewer. Layered night blues with
         // periwinkle nodes rimmed in electric cyan, and exactly one warm
@@ -449,6 +485,7 @@ pub fn factory() -> Vec<Theme> {
         // the master here: the one control that is about intent.
         Theme {
             name: "Navi".to_owned(),
+            background: c(0xc0, 0xd0, 0xe5),
             white_key: c(0xe0, 0xf0, 0xff),
             black_key: c(0x0a, 0x1c, 0x34),
             // Lifted from the app's own #5578ff: that periwinkle is drawn on
@@ -470,7 +507,7 @@ pub fn factory() -> Vec<Theme> {
             fretboard: c(0x0a, 0x1c, 0x34),
             string: c(0x78, 0x98, 0xb8),
             channel_palette: Some(2),
-            dark: Default::default(),
+            dark: dark_of(&[("background", (0x18, 0x1d, 0x23))]),
         },
         // ── Mono: greys, and one red.
         //
@@ -480,6 +517,7 @@ pub fn factory() -> Vec<Theme> {
         // buys. The scope draws white, like a scope.
         Theme {
             name: "Mono".to_owned(),
+            background: c(0xcf, 0xcf, 0xcf),
             white_key: c(0xd8, 0xd8, 0xd8),
             black_key: c(0x14, 0x14, 0x14),
             key_active: c(0xf0, 0xf0, 0xf0),
@@ -500,13 +538,14 @@ pub fn factory() -> Vec<Theme> {
             fretboard: c(0x1a, 0x1a, 0x1a),
             string: c(0x78, 0x78, 0x78),
             channel_palette: Some(5),
-            dark: Default::default(),
+            dark: dark_of(&[("background", (0x1d, 0x1d, 0x1d))]),
         },
         // ── Studio: the analogue console. Warm charcoal, cream legends, VU
         // amber for anything that moves, an oxblood master, and the sage-green
         // lamp old gear uses for "connected" on the input chip.
         Theme {
             name: "Studio".to_owned(),
+            background: c(0xd9, 0xcc, 0xc3),
             white_key: c(0xe8, 0xe2, 0xd4),
             black_key: c(0x19, 0x17, 0x14),
             key_active: c(0xd8, 0xa0, 0x3c),
@@ -528,13 +567,14 @@ pub fn factory() -> Vec<Theme> {
             fretboard: c(0x27, 0x24, 0x20),
             string: c(0xa8, 0x98, 0x80),
             channel_palette: Some(1),
-            dark: Default::default(),
+            dark: dark_of(&[("background", (0x1f, 0x1c, 0x1a))]),
         },
         // ── Aurora: indigo night with a mint/violet complementary pair — mint
         // for what is sounding, violet for what is HELD, so the two states of
         // a note are opposite ends of the wheel and never confusable.
         Theme {
             name: "Aurora".to_owned(),
+            background: c(0xc6, 0xce, 0xeb),
             white_key: c(0xdf, 0xe4, 0xee),
             black_key: c(0x12, 0x14, 0x1b),
             key_active: c(0x5c, 0xe8, 0xb4),
@@ -553,7 +593,7 @@ pub fn factory() -> Vec<Theme> {
             fretboard: c(0x1e, 0x21, 0x30),
             string: c(0x6b, 0x72, 0x90),
             channel_palette: Some(2),
-            dark: Default::default(),
+            dark: dark_of(&[("background", (0x1b, 0x1d, 0x22))]),
         },
         // ── Sandstone: the LIGHT one, and the reason the set needs it — every
         // other theme here is dark, and a person working in daylight has
@@ -563,6 +603,7 @@ pub fn factory() -> Vec<Theme> {
         // cannot simply invert a dark one.
         Theme {
             name: "Sandstone".to_owned(),
+            background: c(0xd4, 0xce, 0xc4),
             white_key: c(0xfa, 0xf4, 0xe8),
             black_key: c(0x4a, 0x3f, 0x34),
             // **A light theme is not a dark one inverted.** On paper the
@@ -586,7 +627,7 @@ pub fn factory() -> Vec<Theme> {
             fretboard: c(0xc9, 0xb5, 0x96),
             string: c(0x6b, 0x5c, 0x48),
             channel_palette: Some(1),
-            dark: Default::default(),
+            dark: dark_of(&[("background", (0x1d, 0x1d, 0x1b))]),
         },
         // ── Centennial: the DX7 II Centennial, 1987 — Yamaha's hundredth
         // birthday in brushed silver with gold legends and black cheeks. The
@@ -595,6 +636,7 @@ pub fn factory() -> Vec<Theme> {
         // is the one cool note, as it is on the instrument.
         Theme {
             name: "Centennial".to_owned(),
+            background: c(0xce, 0xce, 0xd1),
             white_key: c(0xf2, 0xf1, 0xee),
             black_key: c(0x26, 0x26, 0x2a),
             key_active: c(0x78, 0x5c, 0x17),
@@ -613,12 +655,13 @@ pub fn factory() -> Vec<Theme> {
             fretboard: c(0x3a, 0x3a, 0x40),
             string: c(0xc9, 0xc9, 0xcf),
             channel_palette: Some(5),
-            dark: Default::default(),
+            dark: dark_of(&[("background", (0x1c, 0x1c, 0x1d))]),
         },
         // ── Blueprint: a cyanotype. Prussian ground, chalk lines, and one
         // ochre for what is HELD — the pencil annotation on a blue print.
         Theme {
             name: "Blueprint".to_owned(),
+            background: c(0xbf, 0xd0, 0xe4),
             white_key: c(0xe6, 0xee, 0xf7),
             black_key: c(0x0d, 0x1c, 0x33),
             key_active: c(0x7f, 0xb2, 0xe8),
@@ -637,13 +680,14 @@ pub fn factory() -> Vec<Theme> {
             fretboard: c(0x13, 0x2b, 0x47),
             string: c(0x8f, 0xa8, 0xc0),
             channel_palette: Some(2),
-            dark: Default::default(),
+            dark: dark_of(&[("background", (0x18, 0x1d, 0x23))]),
         },
         // ── Porcelain: the other light theme, and cool where Sandstone is
         // warm. Delft cobalt on cool white, with a violet sustain so the two
         // note states are told apart by hue as well as by weight.
         Theme {
             name: "Porcelain".to_owned(),
+            background: c(0xcc, 0xce, 0xd1),
             white_key: c(0xfb, 0xfb, 0xfc),
             black_key: c(0x2a, 0x33, 0x40),
             key_active: c(0x2f, 0x5f, 0xa8),
@@ -662,13 +706,14 @@ pub fn factory() -> Vec<Theme> {
             fretboard: c(0x39, 0x42, 0x4e),
             string: c(0xc2, 0xc8, 0xd0),
             channel_palette: Some(2),
-            dark: Default::default(),
+            dark: dark_of(&[("background", (0x1c, 0x1c, 0x1d))]),
         },
         // ── Moss: deep forest, lichen text, and a low amber sustain. The
         // sustain is DARKER than the struck note here — on a green ground a
         // second bright mark competes with the first.
         Theme {
             name: "Moss".to_owned(),
+            background: c(0xbe, 0xd6, 0xb5),
             white_key: c(0xe4, 0xea, 0xd9),
             black_key: c(0x13, 0x1a, 0x12),
             key_active: c(0x8f, 0xc4, 0x6a),
@@ -687,13 +732,14 @@ pub fn factory() -> Vec<Theme> {
             fretboard: c(0x1d, 0x27, 0x18),
             string: c(0x9a, 0xa8, 0x8c),
             channel_palette: Some(3),
-            dark: Default::default(),
+            dark: dark_of(&[("background", (0x19, 0x1e, 0x18))]),
         },
         // ── Rhodes: black tolex, cream keys, and the nameplate's red on the
         // master. Warm where Studio is neutral: this is a wooden instrument
         // in a case, not a console in a rack.
         Theme {
             name: "Rhodes".to_owned(),
+            background: c(0xdb, 0xcc, 0xbf),
             white_key: c(0xef, 0xe6, 0xd2),
             black_key: c(0x16, 0x13, 0x11),
             key_active: c(0xd9, 0xa4, 0x41),
@@ -712,12 +758,13 @@ pub fn factory() -> Vec<Theme> {
             fretboard: c(0x24, 0x1d, 0x18),
             string: c(0xb8, 0xac, 0x98),
             channel_palette: Some(1),
-            dark: Default::default(),
+            dark: dark_of(&[("background", (0x1f, 0x1d, 0x1a))]),
         },
         // ── Copper: verdigris and rust, the two things copper becomes. The
         // patina is the ground and the oxide is what moves.
         Theme {
             name: "Copper".to_owned(),
+            background: c(0xb3, 0xd6, 0xcf),
             white_key: c(0xe8, 0xe2, 0xd4),
             black_key: c(0x14, 0x20, 0x1d),
             key_active: c(0xe0, 0x8a, 0x4a),
@@ -736,13 +783,14 @@ pub fn factory() -> Vec<Theme> {
             fretboard: c(0x1b, 0x2f, 0x2b),
             string: c(0xa8, 0xb8, 0xb2),
             channel_palette: Some(7),
-            dark: Default::default(),
+            dark: dark_of(&[("background", (0x17, 0x1e, 0x1d))]),
         },
         // ── Dusk: the sky twenty minutes after sunset — violet overhead,
         // warm at the horizon. The horizon colour is what sounds; the
         // overhead blue is what is held.
         Theme {
             name: "Dusk".to_owned(),
+            background: c(0xd4, 0xc8, 0xef),
             white_key: c(0xec, 0xe6, 0xf0),
             black_key: c(0x16, 0x12, 0x28),
             key_active: c(0xf0, 0x92, 0x5a),
@@ -761,13 +809,14 @@ pub fn factory() -> Vec<Theme> {
             fretboard: c(0x22, 0x1b, 0x3a),
             string: c(0x9a, 0x90, 0xb8),
             channel_palette: Some(6),
-            dark: Default::default(),
+            dark: dark_of(&[("background", (0x1e, 0x1b, 0x24))]),
         },
         // ── Iris: deep violet with its complement, chartreuse. The widest
         // hue gap in the set, so a sounding note cannot be mistaken for a
         // held one at any glance.
         Theme {
             name: "Iris".to_owned(),
+            background: c(0xd7, 0xc8, 0xef),
             white_key: c(0xee, 0xe8, 0xf4),
             black_key: c(0x19, 0x10, 0x26),
             key_active: c(0xc8, 0xe0, 0x5a),
@@ -786,7 +835,7 @@ pub fn factory() -> Vec<Theme> {
             fretboard: c(0x25, 0x18, 0x40),
             string: c(0xa8, 0x98, 0xc0),
             channel_palette: Some(6),
-            dark: Default::default(),
+            dark: dark_of(&[("background", (0x1e, 0x1b, 0x25))]),
         },
     ]
 }
@@ -835,6 +884,7 @@ pub const EXAMPLE: &str = r##"{
   "_comment2": "default for that role, or set it to a hex colour like \"#ff5fa2\".",
   "_comment3": "Colours accept #rgb, #rrggbb, or rrggbb.",
 
+  "background": "",
   "white_key": "",
   "black_key": "",
   "key_active": "",
@@ -862,6 +912,7 @@ pub const EXAMPLE: &str = r##"{
   "_comment_dark3": "way dark mode has always worked - the keyboard inverts, the",
   "_comment_dark4": "desk darkens. Leave the whole block out and nothing changes.",
   "dark": {
+    "background": "",
     "white_key": "",
     "black_key": "",
     "key_active": "",
