@@ -220,7 +220,9 @@
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1304,6 +1306,13 @@ struct Shared {
     /// is exactly the routing this app had when the effects were an insert on
     /// the instrument bus — so an upgrade sounds identical.
     send: [AtomicU32; STRIPS],
+    /// **Routing, packed for the audio thread.** A `Vec<Route>` cannot cross
+    /// into a callback that must not allocate, lock or drop, so the table is
+    /// a fixed array of packed words plus a count: the UI writes, the render
+    /// loop reads once per block into its own cache. See `pack_route`.
+    routes: [AtomicU32; MAX_ROUTES],
+    route_gain: [AtomicU32; MAX_ROUTES],
+    route_count: AtomicUsize,
     /// The effects bus's own fader, applied to what comes back from it.
     fx_return: AtomicU32,
     /// The loudest sample each strip produced since the UI last looked, as
@@ -1453,6 +1462,9 @@ impl Shared {
             // everything and nothing else sends anything, which is the same
             // sound the old five-slots-send-all default made. See the UI's
             // `Desk::default`, which this mirrors.
+            routes: std::array::from_fn(|_| AtomicU32::new(0)),
+            route_gain: std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
+            route_count: AtomicUsize::new(0),
             send: std::array::from_fn(|i| {
                 AtomicU32::new(if i == 0 { 1.0f32 } else { 0.0f32 }.to_bits())
             }),
@@ -2159,6 +2171,22 @@ struct Renderer {
     /// drops the block, which is the policy: the scope is a picture.
     scope_tx: Producer<f32>,
     scope_scratch: Vec<f32>,
+    /// The routing table, copied out of `Shared` once per block so the inner
+    /// loops read plain values rather than atomics: (from, target, hardware,
+    /// stereo, gain).
+    route_cache: [(usize, usize, bool, bool, f32); MAX_ROUTES],
+    route_n: usize,
+    /// Any HARDWARE route this block — the flag that decides whether
+    /// per-channel audio has to be kept at all. A desk that only uses sends
+    /// pays nothing for the jacks it never asked for.
+    routes_hw: bool,
+    /// Incoming sends, per destination channel, interleaved stereo. Filled by
+    /// the lane loop, processed through the destination's rack, then folded
+    /// into the master.
+    send_accum: Vec<f32>,
+    /// Planar scratch for running a destination's rack over its sends — the
+    /// same shape `pad_io` uses for the drum bus, and for the same reason.
+    send_io: Vec<Vec<f32>>,
     /// The master's stereo pair onto the ReaStream send ring — the same signal
     /// the scope reads (what leaves), pushed only while streaming is on. Its own
     /// stride-2 scratch so the block is contiguous L,R for the sender to plane.
@@ -2523,8 +2551,42 @@ impl Renderer {
             self.was_rolling = rolling;
             // The stem tap's block: the flag read once, the scratch
             // zeroed once, all three mixers write, one push at the end.
+            // **The routing table, read once and never again this block.**
+            // The count is acquired first so a table growing under us is seen
+            // whole or not at all (see `set_routes`).
+            self.route_n = self.shared.route_count.load(Ordering::Acquire).min(MAX_ROUTES);
+            self.routes_hw = false;
+            let mut kept = 0usize;
+            for i in 0..self.route_n {
+                let Some((from, target, hardware, stereo)) =
+                    unpack_route(self.shared.routes[i].load(Ordering::Relaxed))
+                else {
+                    continue;
+                };
+                // A route naming a channel this build does not have is
+                // dropped here rather than indexed with: the desk can shrink
+                // between the write and the read.
+                if from >= CHANNELS || (!hardware && target >= CHANNELS) {
+                    continue;
+                }
+                let gain = f32::from_bits(self.shared.route_gain[i].load(Ordering::Relaxed));
+                let gain = if gain.is_finite() { gain.clamp(0.0, 1.0) } else { 0.0 };
+                self.route_cache[kept] = (from, target, hardware, stereo, gain);
+                self.routes_hw |= hardware;
+                kept += 1;
+            }
+            self.route_n = kept;
+            // Sends are accumulated per destination and must start empty.
+            if self.route_n > 0 {
+                if let Some(sa) = self.send_accum.get_mut(..CHANNELS * n * TAP_CHANNELS) {
+                    sa.fill(0.0);
+                }
+            }
             self.stems_live = self.shared.stems_on.load(Ordering::Relaxed);
-            if self.stems_live {
+            // **Hardware routes need the same per-channel audio stems need.**
+            // One buffer, two customers: whichever asks, it is filled and
+            // zeroed exactly once.
+            if self.stems_live || self.route_n > 0 {
                 if let Some(st) = self.stem_scratch.get_mut(..n * CHANNELS * 2) {
                     st.fill(0.0);
                 }
@@ -2719,6 +2781,109 @@ impl Renderer {
             // The click is one voice on both sides.
             self.shared.note_strip_peak(Strip::Click, [click_peak; 2]);
 
+            // ── channel-to-channel sends ───────────────────────────────────
+            //
+            // **A destination's rack processes what is sent to it, exactly as
+            // the drum bus processes its summed kit.** `run_rack` with an
+            // EMPTY note list is an effects pass: a reverb on channel 9 wets
+            // what arrives, and a synth on channel 9 adds nothing, because a
+            // synth has no opinion about audio it is handed. That is what
+            // makes "put Pro-R on 9 and send 3 to 9" mean what it says.
+            //
+            // **One hop per block, and that is a safety rule.** The sends are
+            // taken from each lane's OWN audio (the stem buffer), never from
+            // what another send just added, so A to B to A cannot feed itself
+            // around the loop inside one callback. A chain still works; it
+            // simply carries a block of delay at each step, which is what
+            // every desk that allows the patch does.
+            if self.route_n > 0 {
+                // Gather: each routed lane's audio into its destination.
+                for i in 0..self.route_n {
+                    let (from, target, hardware, _, gain) = self.route_cache[i];
+                    if hardware || gain <= 0.0 {
+                        continue;
+                    }
+                    for f in 0..n {
+                        let (Some(l), Some(r)) = (
+                            self.stem_scratch.get(f * CHANNELS * 2 + from * 2).copied(),
+                            self.stem_scratch
+                                .get(f * CHANNELS * 2 + from * 2 + 1)
+                                .copied(),
+                        ) else {
+                            break;
+                        };
+                        let at = (target * n + f) * TAP_CHANNELS;
+                        if let Some(d) = self.send_accum.get_mut(at) {
+                            *d += l * gain;
+                        }
+                        if let Some(d) = self.send_accum.get_mut(at + 1) {
+                            *d += r * gain;
+                        }
+                    }
+                }
+                // Process: one destination at a time, through its own rack,
+                // then into the master at that channel's own fader — so the
+                // destination's fader rides the send, which is what a bus is.
+                for dest in 0..CHANNELS {
+                    let base = dest * n * TAP_CHANNELS;
+                    let live = self
+                        .send_accum
+                        .get(base..base + n * TAP_CHANNELS)
+                        .is_some_and(|b| b.iter().any(|v| *v != 0.0));
+                    if !live {
+                        continue;
+                    }
+                    for c in 0..TAP_CHANNELS {
+                        let Some(dst) = self.send_io.get_mut(c) else {
+                            break;
+                        };
+                        for f in 0..n {
+                            dst[f] = self
+                                .send_accum
+                                .get(base + f * TAP_CHANNELS + c)
+                                .copied()
+                                .unwrap_or(0.0);
+                        }
+                    }
+                    if !self.racks[dest].is_empty() {
+                        run_rack(
+                            &mut self.racks[dest],
+                            &mut self.send_io,
+                            n,
+                            &mut self.fx_out,
+                            &[],
+                            &[],
+                        );
+                    }
+                    let g = self.lane_gain[dest];
+                    let (pl, pr) = pan_gains(Shared::f32_of(&self.shared.channel_pans[dest]));
+                    for f in 0..n {
+                        let l = self.send_io[0][f] * g * pl;
+                        let r = self
+                            .send_io
+                            .get(1)
+                            .map_or(l, |ch| ch[f] * g * pr);
+                        if let Some(v) = self.mix.get_mut(f * TAP_CHANNELS) {
+                            *v += l;
+                        }
+                        if let Some(v) = self.mix.get_mut(f * TAP_CHANNELS + 1) {
+                            *v += r;
+                        }
+                        // The destination's METER shows what it is passing,
+                        // and its hardware route carries it too: both read
+                        // the stem, so both are told by writing it here.
+                        if let Some(v) = self.stem_scratch.get_mut(f * CHANNELS * 2 + dest * 2) {
+                            *v += l;
+                        }
+                        if let Some(v) =
+                            self.stem_scratch.get_mut(f * CHANNELS * 2 + dest * 2 + 1)
+                        {
+                            *v += r;
+                        }
+                    }
+                }
+            }
+
             // ── the bus, and then the master ───────────────────────────────
             let sends = crate::effects::Sends {
                 reverb: Shared::f32_of(&self.shared.reverb_mix),
@@ -2902,6 +3067,40 @@ impl Renderer {
                     } else if c == 1 {
                         peak_r = peak_r.max(mag);
                         sumsq_r += f64::from(mag) * f64::from(mag);
+                    }
+                }
+                // **Hardware routes: each routed channel onto its own jacks.**
+                //
+                // ADDED, never assigned: a jack can carry more than one
+                // routed channel (two players into one headphone amp), and
+                // the master pair is already written above — routing a
+                // channel to 1/2 puts it there TWICE on purpose, because a
+                // route does not take a channel off the master. Bounds are
+                // checked against the device rather than trusted: the table
+                // is written by the UI and the interface can change under it.
+                if self.routes_hw {
+                    for ri in 0..self.route_n {
+                        let (from, first, hardware, stereo, gain) = self.route_cache[ri];
+                        if !hardware || gain <= 0.0 {
+                            continue;
+                        }
+                        let lane_at = i * CHANNELS * 2 + from * 2;
+                        let (Some(l), Some(r)) = (
+                            self.stem_scratch.get(lane_at).copied(),
+                            self.stem_scratch.get(lane_at + 1).copied(),
+                        ) else {
+                            continue;
+                        };
+                        if stereo {
+                            if first + 1 < dev_ch {
+                                out[at + first] += l * gain;
+                                out[at + first + 1] += r * gain;
+                            }
+                        } else if first < dev_ch {
+                            // A mono jack SUMS the pair. Taking the left
+                            // alone would half-vanish anything panned right.
+                            out[at + first] += (l + r) * gain;
+                        }
                     }
                 }
             }
@@ -3218,7 +3417,7 @@ impl Renderer {
                     }
                     // The stem tap hears the lane's LIVE input too — a
                     // bounced stem is everything the lane put on the bus.
-                    if self.stems_live {
+                    if self.stems_live || self.route_n > 0 {
                         if let Some(sv) = self
                             .stem_scratch
                             .get_mut(i * CHANNELS * 2 + strip.index() * 2 + c.min(1))
@@ -3342,7 +3541,10 @@ impl Renderer {
             pan[lane] = pan_gains(Shared::f32_of(&self.shared.channel_pans[lane]));
             punch[lane] = self.shared.punch[lane].load(Ordering::Relaxed);
         }
-        let stems = self.stems_live;
+// Stems and ROUTING share this buffer: a send reads the
+        // lane's own audio out of it, so it is filled whenever either
+        // customer asks.
+        let stems = self.stems_live || self.route_n > 0;
         let (Some(mix), Some(aux), Some(stem)) = (
             self.mix.get_mut(..frames * TAP_CHANNELS),
             self.aux.get_mut(..frames * TAP_CHANNELS),
@@ -3702,7 +3904,10 @@ impl Renderer {
         // The fold: the DRUMS strip's fader, pan, send and peak, exactly as
         // every other strip does it.
         let want = frames * TAP_CHANNELS;
-        let stems = self.stems_live;
+// Stems and ROUTING share this buffer: a send reads the
+        // lane's own audio out of it, so it is filled whenever either
+        // customer asks.
+        let stems = self.stems_live || self.route_n > 0;
         let (Some(mix), Some(aux), Some(stem)) = (
             self.mix.get_mut(..want),
             self.aux.get_mut(..want),
@@ -4109,7 +4314,10 @@ impl Renderer {
             let (pan_l, pan_r) =
                 pan_gains(Shared::f32_of(&self.shared.channel_pans[ch]));
             let want = frames * TAP_CHANNELS;
-            let stems = self.stems_live;
+    // Stems and ROUTING share this buffer: a send reads the
+        // lane's own audio out of it, so it is filled whenever either
+        // customer asks.
+        let stems = self.stems_live || self.route_n > 0;
             let (Some(mix), Some(aux), Some(stem)) = (
                 self.mix.get_mut(..want),
                 self.aux.get_mut(..want),
@@ -4340,6 +4548,40 @@ impl RecorderTap {
 struct Handoff {
     to_audio: Producer<PluginBox>,
     from_audio: Consumer<PluginBox>,
+}
+
+/// How many routes the desk can carry at once.
+///
+/// A ceiling rather than a `Vec`, because this table is read on the audio
+/// thread: sixty-four is four routes per channel on a sixteen-channel desk,
+/// past anything a person builds by hand, and the whole array is 512 bytes.
+pub const MAX_ROUTES: usize = 64;
+
+/// Pack a route into one word the audio thread can read atomically.
+///
+/// `from` and `target` are channel indices (0..64 fits a byte with room),
+/// `hardware` says which kind of destination it is, and `stereo` only means
+/// anything for hardware. Bit 31 marks the word as occupied, so a zeroed
+/// slot can never read as "channel 0 to channel 0".
+fn pack_route(from: usize, target: usize, hardware: bool, stereo: bool) -> u32 {
+    (from as u32 & 0xff)
+        | ((target as u32 & 0xff) << 8)
+        | (u32::from(hardware) << 16)
+        | (u32::from(stereo) << 17)
+        | (1 << 31)
+}
+
+/// The inverse of [`pack_route`]. `None` for an empty slot.
+fn unpack_route(w: u32) -> Option<(usize, usize, bool, bool)> {
+    if w & (1 << 31) == 0 {
+        return None;
+    }
+    Some((
+        (w & 0xff) as usize,
+        ((w >> 8) & 0xff) as usize,
+        w & (1 << 16) != 0,
+        w & (1 << 17) != 0,
+    ))
 }
 
 /// The monitor engine: one output stream, [`SLOTS`] optional instruments layered
@@ -4757,6 +4999,11 @@ impl Engine {
             scope_scratch: vec![0.0; MAX_CALLBACK_FRAMES * TAP_CHANNELS],
             reastream_tx,
             reastream_scratch: vec![0.0; MAX_CALLBACK_FRAMES * 2],
+            route_cache: [(0, 0, false, false, 0.0); MAX_ROUTES],
+            route_n: 0,
+            routes_hw: false,
+            send_accum: vec![0.0; CHANNELS * MAX_BLOCK as usize * TAP_CHANNELS],
+            send_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             pad_out: vec![0.0; MAX_BLOCK as usize * PADS * 2],
             pad_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             stems_live: false,
@@ -5394,6 +5641,30 @@ impl Engine {
     /// the callback; off means the send ring is neither packed nor pushed.
     pub fn set_reastream_on(&self, on: bool) {
         self.shared.reastream_on.store(on, Ordering::Relaxed);
+    }
+
+    /// Publish the desk's routing table to the audio thread.
+    ///
+    /// **The count is stored LAST and cleared FIRST**, so the render loop can
+    /// never read a half-written table: growing, the new words land before
+    /// the count that admits them; shrinking, the count drops before the
+    /// words go. A torn read would route a channel to a jack nobody chose.
+    pub fn set_routes(&self, routes: &ivory_ui::routing::Routes) {
+        use ivory_ui::routing::Target;
+        let n = routes.0.len().min(MAX_ROUTES);
+        self.shared.route_count.store(0, Ordering::Release);
+        for (i, r) in routes.0.iter().take(n).enumerate() {
+            let (target, hardware, stereo) = match r.target {
+                Target::Hardware { first, stereo } => (first, true, stereo),
+                Target::Channel(c) => (c, false, false),
+            };
+            self.shared.routes[i].store(
+                pack_route(r.from, target, hardware, stereo),
+                Ordering::Relaxed,
+            );
+            self.shared.route_gain[i].store(r.gain.to_bits(), Ordering::Relaxed);
+        }
+        self.shared.route_count.store(n, Ordering::Release);
     }
 
     /// Take the hardware fast lane's write end, for `midi::MidiFastLane`.
@@ -7498,6 +7769,11 @@ mod tests {
             scope_scratch: vec![0.0; MAX_CALLBACK_FRAMES * TAP_CHANNELS],
             reastream_tx: RingBuffer::<f32>::new(1 << 15).0,
             reastream_scratch: vec![0.0; MAX_CALLBACK_FRAMES * 2],
+            route_cache: [(0, 0, false, false, 0.0); MAX_ROUTES],
+            route_n: 0,
+            routes_hw: false,
+            send_accum: vec![0.0; CHANNELS * MAX_BLOCK as usize * TAP_CHANNELS],
+            send_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             pad_out: vec![0.0; MAX_BLOCK as usize * PADS * 2],
             pad_io: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             stems_live: false,
@@ -8206,6 +8482,183 @@ mod tests {
         );
         let old = from.pop().expect("the displaced kit came back");
         assert!(old.pads[36].is_some(), "the wrong kit was returned");
+    }
+
+    /// **A hardware route puts a channel on its own jacks, and does not take
+    /// it off the master.**
+    ///
+    /// The owner's own example: a track sent to outs 3/4. The master pair
+    /// keeps the whole mix — a route is a send, not a move — and the routed
+    /// jacks carry that one channel at its route fader.
+    #[test]
+    fn a_hardware_route_reaches_its_jacks_without_leaving_the_master() {
+        use std::sync::Arc;
+        let clip = Arc::new(ivory_record::decode::Clip {
+            samples: vec![0.5; 4000],
+            rate: 48_000,
+            source: std::path::PathBuf::from("c.wav"),
+        });
+        // Four device outputs, so 3/4 exists to route to.
+        let (mut r, _tx, shared) = renderer_with_midi(4);
+        let (mut to_audio, _from) = r.hijack_track_rings();
+        to_audio
+            .push(vec![Placed {
+                clip,
+                strip: 1,
+                start: 0,
+                offset: 0,
+                len: 1000,
+                fade_in: 0,
+                fade_out: 0,
+            }])
+            .expect("room");
+        // Channel 1 -> outs 3/4 (zero-based first = 2), at half.
+        shared.routes[0].store(pack_route(1, 2, true, true), Ordering::Relaxed);
+        shared.route_gain[0].store(0.5f32.to_bits(), Ordering::Relaxed);
+        shared.route_count.store(1, Ordering::Release);
+        shared.transport_at.store(0, Ordering::Relaxed);
+        shared.transport_req.store(1, Ordering::Release);
+        shared.rolling.store(true, Ordering::Relaxed);
+
+        let frames = 256;
+        let mut out = vec![0.0f32; frames * 4];
+        r.render(&mut out, 0, 0);
+
+        let main = out[4 * 100];
+        let routed = out[4 * 100 + 2];
+        assert!(main.abs() > 1.0e-4, "the master pair went silent: {main}");
+        assert!(routed.abs() > 1.0e-4, "nothing reached outs 3/4: {routed}");
+        // The route carries the channel at its own fader, and the master is
+        // untouched by the routing — so the routed jack is half the main.
+        assert!(
+            (routed - main * 0.5).abs() < 1.0e-3,
+            "3/4 carried {routed} against a master of {main}"
+        );
+    }
+
+    /// **A mono jack SUMS the pair rather than taking the left.**
+    ///
+    /// A channel panned hard right would otherwise vanish into a mono
+    /// output, which is the kind of silence nobody can debug.
+    #[test]
+    fn a_mono_route_sums_rather_than_dropping_half_the_channel() {
+        use std::sync::Arc;
+        let clip = Arc::new(ivory_record::decode::Clip {
+            samples: vec![0.5; 4000],
+            rate: 48_000,
+            source: std::path::PathBuf::from("c.wav"),
+        });
+        let (mut r, _tx, shared) = renderer_with_midi(4);
+        let (mut to_audio, _from) = r.hijack_track_rings();
+        to_audio
+            .push(vec![Placed {
+                clip,
+                strip: 1,
+                start: 0,
+                offset: 0,
+                len: 1000,
+                fade_in: 0,
+                fade_out: 0,
+            }])
+            .expect("room");
+        // Hard right, and a MONO route to out 4 (index 3).
+        shared.channel_pans[1].store(1.0f32.to_bits(), Ordering::Relaxed);
+        shared.routes[0].store(pack_route(1, 3, true, false), Ordering::Relaxed);
+        shared.route_gain[0].store(1.0f32.to_bits(), Ordering::Relaxed);
+        shared.route_count.store(1, Ordering::Release);
+        shared.transport_at.store(0, Ordering::Relaxed);
+        shared.transport_req.store(1, Ordering::Release);
+        shared.rolling.store(true, Ordering::Relaxed);
+
+        let frames = 256;
+        let mut out = vec![0.0f32; frames * 4];
+        r.render(&mut out, 0, 0);
+        let mono = out[4 * 100 + 3];
+        assert!(
+            mono.abs() > 1.0e-4,
+            "a hard-panned channel vanished into its mono jack: {mono}"
+        );
+    }
+
+    /// **A send reaches the destination channel and rides its fader.**
+    ///
+    /// The bus behaviour: channel 1 sent to channel 5 is heard through
+    /// channel 5, so pulling channel 5 down pulls the send down with it. That
+    /// is what makes a channel usable AS a bus.
+    #[test]
+    fn a_send_arrives_at_the_destination_and_its_fader_rides_it() {
+        use std::sync::Arc;
+        let clip = Arc::new(ivory_record::decode::Clip {
+            samples: vec![0.5; 4000],
+            rate: 48_000,
+            source: std::path::PathBuf::from("c.wav"),
+        });
+        let render = |dest_gain: f32| {
+            let clip = Arc::clone(&clip);
+            let (mut r, _tx, shared) = renderer_with_midi(2);
+            let (mut to_audio, _from) = r.hijack_track_rings();
+            to_audio
+                .push(vec![Placed {
+                    clip,
+                    strip: 1,
+                    start: 0,
+                    offset: 0,
+                    len: 1000,
+                    fade_in: 0,
+                    fade_out: 0,
+                }])
+                .expect("room");
+            // Channel 1 -> channel 5, full.
+            shared.routes[0].store(pack_route(1, 5, false, false), Ordering::Relaxed);
+            shared.route_gain[0].store(1.0f32.to_bits(), Ordering::Relaxed);
+            shared.route_count.store(1, Ordering::Release);
+            shared.channel_gains[5].store(dest_gain.to_bits(), Ordering::Relaxed);
+            shared.transport_at.store(0, Ordering::Relaxed);
+            shared.transport_req.store(1, Ordering::Release);
+            shared.rolling.store(true, Ordering::Relaxed);
+            let mut out = vec![0.0f32; 256 * 2];
+            r.render(&mut out, 0, 0);
+            out[2 * 200]
+        };
+        let open = render(1.0);
+        let shut = render(0.0);
+        assert!(open.abs() > 1.0e-4, "the send never arrived: {open}");
+        assert!(
+            open.abs() > shut.abs() + 1.0e-4,
+            "the destination's fader did not ride the send ({open} vs {shut})"
+        );
+    }
+
+    /// **A route to a channel that does not exist is ignored, not indexed
+    /// with.** The table is written by the UI and the desk can shrink under
+    /// it; a bad word must cost the route and nothing else.
+    #[test]
+    fn a_route_naming_a_channel_off_the_desk_is_dropped() {
+        let (mut r, _tx, shared) = renderer_with_midi(2);
+        shared.routes[0].store(pack_route(200, 201, false, false), Ordering::Relaxed);
+        shared.route_gain[0].store(1.0f32.to_bits(), Ordering::Relaxed);
+        shared.route_count.store(1, Ordering::Release);
+        let mut out = vec![0.0f32; 128 * 2];
+        // The point is that this returns at all.
+        r.render(&mut out, 0, 0);
+        assert_eq!(r.route_n, 0, "a nonsense route survived the block's read");
+    }
+
+    /// **A packed route survives the round trip.** The table is the one place
+    /// the UI and the audio thread agree, and it is bit-packed.
+    #[test]
+    fn a_route_packs_and_unpacks_unchanged() {
+        for (from, target, hw, stereo) in [
+            (0usize, 0usize, false, false),
+            (15, 2, true, true),
+            (3, 9, false, false),
+            (7, 17, true, false),
+        ] {
+            let w = pack_route(from, target, hw, stereo);
+            assert_eq!(unpack_route(w), Some((from, target, hw, stereo)));
+        }
+        // A zeroed slot is EMPTY, not "channel 0 to channel 0".
+        assert_eq!(unpack_route(0), None);
     }
 
     /// **An arrangement of clips plays placed, trimmed, and faded.**

@@ -3468,6 +3468,17 @@ impl DesktopApp {
         e.set_armed(0);
         e.set_monitor_on(false);
         e.set_drums(self.app.drums_gain(), self.app.drums_pan());
+        // **The routing table, every frame, like every other desk value.**
+        // Pruned first against what the device actually has: an interface
+        // swapped for a smaller one leaves routes pointing at jacks that are
+        // gone, and a fader that moves and does nothing is worse than a
+        // route that admitted it went away. See `Routes::prune`.
+        //
+        // **In an EXPORT this drops the hardware routes and keeps the
+        // sends**, which is exactly right: a rendered file has no jacks, but
+        // a channel sent through another channel's reverb is part of the
+        // mix and has to be in the file.
+        self.publish_routes(&e);
         e.set_master_gain(gains.master);
         e.set_fx_return(gains.fx_return);
         let [reverb, delay, chorus, hpf, lpf, limiter] = self.app.effect_sends();
@@ -4420,6 +4431,20 @@ const PAD_WAVE_BUCKETS: usize = 240;
     /// a bool behind a smoothing ramp, so writing an unchanged value costs
     /// nothing — and a change-detection cache here would be a second copy of
     /// the settings to get out of step with the first.
+    /// Hand the desk's routes to the engine, dropping any that the current
+    /// device cannot honour.
+    ///
+    /// Pruning here rather than at the picker: the picker knows what the
+    /// device offered when it opened, and this runs every frame — so a route
+    /// survives an interface being unplugged and replugged, and is dropped
+    /// only against the device that is actually open.
+    fn publish_routes(&self, e: &crate::instrument::Engine) {
+        let outs = e.output().channels as usize;
+        let mut routes = self.app.routes().clone();
+        routes.prune(outs, ivory_ui::recorder::CHANNELS);
+        e.set_routes(&routes);
+    }
+
     fn push_monitor_settings(&mut self) {
         // **The live tap, if one has been waiting for an engine to appear.**
         //
@@ -4475,6 +4500,12 @@ const PAD_WAVE_BUCKETS: usize = 240;
         let gains = self.app.gains();
         e.set_metronome_gain(gains.metronome);
         e.set_drums(self.app.drums_gain(), self.app.drums_pan());
+        // **The routing table, every frame, like every other desk value.**
+        // Pruned first against what the device actually has: an interface
+        // swapped for a smaller one leaves routes pointing at jacks that are
+        // gone, and a fader that moves and does nothing is worse than a
+        // route that admitted it went away. See `Routes::prune`.
+        self.publish_routes(e);
         e.set_master_gain(gains.master);
         // **The channel that had no fader before there was a mixer**, and the
         // routing that decides what reaches the effects bus. Pushed whole
