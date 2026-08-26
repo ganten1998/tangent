@@ -1957,6 +1957,24 @@ mod tests {
         Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(1300.0, 420.0))
     }
 
+    /// **A channel that routes gets a button and a strip for each route.**
+    ///
+    /// The report was "the level strips are nowhere to be found", so this
+    /// asks the layout directly rather than by eye.
+    #[test]
+    fn a_channel_with_routes_gets_a_button_and_a_strip_for_each() {
+        let mut v = a_view();
+        v.strips[1].route_count = 2;
+        let l = Layout::new(rect(), &v);
+        let s = &l.strips[1];
+        assert!(s.routing.is_positive(), "no ROUTING button rect");
+        assert!(s.routes[0].is_positive(), "no rect for the first route");
+        assert!(s.routes[1].is_positive(), "no rect for the second route");
+        assert!(!s.routes[2].is_positive(), "a third rect for two routes");
+        assert!(!s.routes[0].intersects(s.routes[1]), "route strips overlap");
+        assert!(!s.routes[0].intersects(s.fader), "a route strip is on the fader");
+    }
+
     /// **Every control can be pressed, and presses where it is drawn.**
     ///
     /// `hit_test` is the painter's inverse and both read `targets`, so this is

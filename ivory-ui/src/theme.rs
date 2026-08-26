@@ -88,14 +88,37 @@ const fn c(r: u8, g: u8, b: u8) -> Option<Rgb> {
 }
 
 impl Theme {
-    /// The theme a fresh install wears: every role unset, so every panel keeps
-    /// the colour it ships with. Naming it explicitly matters — "Default" has
-    /// to appear in the menu beside the others, and picking it has to be the
-    /// way BACK from a theme somebody tried.
+    /// The theme a fresh install wears — every role SET, to the exact value
+    /// the app ships with.
+    ///
+    /// **Explicit, and that is the whole point.** It began as a theme that
+    /// set nothing, on the reasoning that unset means "keep the default".
+    /// That is true of a fresh install and false the moment somebody tries
+    /// another theme: applying one writes its colours into the settings, and
+    /// a Default that sets nothing then leaves them exactly where they are.
+    /// The owner met this as "resetting gives the real default, but picking
+    /// Default in the menu gives a different one" - and they were right.
+    /// Picking Default has to be the way BACK, so Default names every value.
     pub fn factory_default() -> Self {
         Self {
             name: "Default".to_owned(),
-            ..Self::default()
+            white_key: c(0xE8, 0xDC, 0xC0),
+            black_key: c(0x1a, 0x1a, 0x1a),
+            key_active: c(0x6C, 0x9B, 0xD2),
+            sustain: c(0xD2, 0xA3, 0x6C),
+            text: c(0xE8, 0xDC, 0xC0),
+            theory_line: c(0x9c, 0x8f, 0x74),
+            interval_text: c(0xE8, 0xDC, 0xC0),
+            recorder_bg: c(0x61, 0x37, 0x3a),
+            fx_knob: c(0x6C, 0x9B, 0xD2),
+            master_knob: c(0xE8, 0x3A, 0x4E),
+            meter_bg: c(0x0B, 0x0E, 0x0A),
+            scope_draw: c(0xA3, 0xE0, 0x48),
+            fx_strip: c(0xE3, 0xD9, 0xBD),
+            input_chip: c(0xE3, 0xD9, 0xBD),
+            fretboard: c(0x4a, 0x2b, 0x22),
+            string: c(0xC9, 0xC4, 0xBC),
+            channel_palette: Some(0),
         }
     }
 
@@ -305,7 +328,7 @@ pub fn factory() -> Vec<Theme> {
             text: c(0xf3, 0xdc, 0xe7),
             theory_line: c(0xa3, 0x76, 0x8f),
             interval_text: c(0x4c, 0xc7, 0xa4),
-            recorder_bg: c(0x17, 0x0e, 0x15),
+            recorder_bg: c(0x52, 0x30, 0x4a),
             fx_knob: c(0xff, 0x8a, 0x5b),
             master_knob: c(0xff, 0x3b, 0x5c),
             meter_bg: c(0x25, 0x15, 0x24),
@@ -328,7 +351,7 @@ pub fn factory() -> Vec<Theme> {
             text: c(0xd6, 0xe8, 0xe4),
             theory_line: c(0x6a, 0x8c, 0x88),
             interval_text: c(0xe0, 0xb0, 0x50),
-            recorder_bg: c(0x07, 0x14, 0x16),
+            recorder_bg: c(0x1d, 0x4a, 0x4e),
             fx_knob: c(0x3f, 0xd9, 0xb8),
             master_knob: c(0xf0, 0x5c, 0x78),
             meter_bg: c(0x10, 0x24, 0x28),
@@ -347,12 +370,15 @@ pub fn factory() -> Vec<Theme> {
             name: "Navi".to_owned(),
             white_key: c(0xe0, 0xf0, 0xff),
             black_key: c(0x0a, 0x1c, 0x34),
-            key_active: c(0x55, 0x78, 0xff),
+            // Lifted from the app's own #5578ff: that periwinkle is drawn on
+            // Navi's near-black canvas, and Tangent's band is a mid navy - the
+            // same colour that glows there is 2.7:1 here.
+            key_active: c(0x7f, 0x9b, 0xff),
             sustain: c(0x40, 0xe8, 0xff),
             text: c(0xe0, 0xf0, 0xff),
             theory_line: c(0x26, 0x50, 0x80),
             interval_text: c(0xa8, 0xc8, 0xd8),
-            recorder_bg: c(0x10, 0x1e, 0x2e),
+            recorder_bg: c(0x26, 0x42, 0x6a),
             fx_knob: c(0x00, 0xd8, 0xf8),
             master_knob: c(0xf0, 0x90, 0x30),
             meter_bg: c(0x0a, 0x1c, 0x34),
@@ -378,9 +404,11 @@ pub fn factory() -> Vec<Theme> {
             text: c(0xe0, 0xe0, 0xe0),
             theory_line: c(0x5a, 0x5a, 0x5a),
             interval_text: c(0xa8, 0xa8, 0xa8),
-            recorder_bg: c(0x0d, 0x0d, 0x0d),
+            recorder_bg: c(0x3c, 0x3c, 0x3c),
             fx_knob: c(0xc8, 0xc8, 0xc8),
-            master_knob: c(0xb0, 0x40, 0x38),
+            // Bright enough to read on the grey band — the ONE non-grey, and
+            // it has to be findable or the discipline costs more than it buys.
+            master_knob: c(0xe8, 0x69, 0x5a),
             meter_bg: c(0x14, 0x14, 0x14),
             scope_draw: c(0xd0, 0xd0, 0xd0),
             fx_strip: c(0x26, 0x26, 0x26),
@@ -401,12 +429,12 @@ pub fn factory() -> Vec<Theme> {
             text: c(0xe8, 0xe2, 0xd4),
             theory_line: c(0x6b, 0x63, 0x55),
             interval_text: c(0xc0, 0x8f, 0x4a),
-            recorder_bg: c(0x1c, 0x1a, 0x17),
+            recorder_bg: c(0x4a, 0x40, 0x38),
             fx_knob: c(0xd8, 0xa0, 0x3c),
-            // Oxblood lifted until it is actually visible: at 0x8c2f28 the
-            // master was 2.1:1 against the band — the one control that can
-            // silence everything, and the hardest to find.
-            master_knob: c(0xb8, 0x45, 0x3a),
+            // Oxblood lifted twice: once because it was 2.1:1 against the
+            // old band, again when the band itself came up out of near-black.
+            // The one control that can silence everything must be findable.
+            master_knob: c(0xe8, 0x72, 0x58),
             meter_bg: c(0x27, 0x24, 0x20),
             scope_draw: c(0xd8, 0xa0, 0x3c),
             fx_strip: c(0x3a, 0x35, 0x2e),
@@ -427,7 +455,7 @@ pub fn factory() -> Vec<Theme> {
             text: c(0xdf, 0xe4, 0xee),
             theory_line: c(0x4a, 0x50, 0x68),
             interval_text: c(0x7f, 0xd4, 0xf0),
-            recorder_bg: c(0x14, 0x16, 0x1f),
+            recorder_bg: c(0x33, 0x3a, 0x54),
             fx_knob: c(0x5c, 0xe8, 0xb4),
             master_knob: c(0xe0, 0x56, 0x7a),
             meter_bg: c(0x1e, 0x21, 0x30),
@@ -448,17 +476,18 @@ pub fn factory() -> Vec<Theme> {
             name: "Sandstone".to_owned(),
             white_key: c(0xfa, 0xf4, 0xe8),
             black_key: c(0x4a, 0x3f, 0x34),
-            key_active: c(0xc8, 0x66, 0x3c),
-            // Deep sage rather than mid sage: on a light ground the sustain
-            // must be DARKER than the struck note, and the mid sage sat at
-            // the terracotta's own brightness (1.10:1) — two states, one
-            // apparent colour.
-            sustain: c(0x4f, 0x61, 0x36),
+            // **A light theme is not a dark one inverted.** On paper the
+            // marks have to go DARKER to be seen, not brighter: the
+            // terracotta is deepened until it reads on sand, and the sustain
+            // is deepened further still, so a held note and a struck one are
+            // told apart by weight the way ink is.
+            key_active: c(0xa8, 0x4f, 0x28),
+            sustain: c(0x3a, 0x4a, 0x24),
             text: c(0x3a, 0x31, 0x28),
             theory_line: c(0x9c, 0x8a, 0x70),
             interval_text: c(0x8a, 0x5a, 0x2c),
-            recorder_bg: c(0xec, 0xe3, 0xd2),
-            fx_knob: c(0xc8, 0x66, 0x3c),
+            recorder_bg: c(0xe0, 0xd3, 0xba),
+            fx_knob: c(0xa8, 0x4f, 0x28),
             master_knob: c(0xa0, 0x38, 0x28),
             meter_bg: c(0xde, 0xd2, 0xbc),
             scope_draw: c(0x5a, 0x70, 0x40),
@@ -560,9 +589,23 @@ mod tests {
         let f = factory();
         assert_eq!(f.len(), 8, "the owner asked for Default plus seven");
         assert_eq!(f[0].name, "Default");
-        // Default sets nothing: picking it is the way back to the shipped look.
-        assert_eq!(f[0].white_key, None);
-        assert_eq!(f[0].recorder_bg, None);
+        // **Default RESTORES rather than declining to speak.** A theme that
+        // set nothing left whatever the last theme wrote, so picking Default
+        // after trying one gave neither. Every role is named.
+        let d = &f[0];
+        assert_eq!(d.recorder_bg, Some(Rgb::new(0x61, 0x37, 0x3a)));
+        assert_eq!(d.white_key, Some(Rgb::new(0xE8, 0xDC, 0xC0)));
+        // And applying it over a desk wearing another theme puts every value
+        // back to the one a fresh install has.
+        let mut s = Settings::default();
+        let shipped = Settings::default();
+        f[3].apply(&mut s);
+        assert_ne!(s.recorder_bg_color, shipped.recorder_bg_color);
+        d.apply(&mut s);
+        assert_eq!(s.recorder_bg_color, shipped.recorder_bg_color);
+        assert_eq!(s.white_key_idle_color, shipped.white_key_idle_color);
+        assert_eq!(s.scope_draw_color, shipped.scope_draw_color);
+        assert_eq!(s.fretboard_color, shipped.fretboard_color);
         // Names are unique, or the menu has two rows that do the same thing.
         let mut names: Vec<&str> = f.iter().map(|t| t.name.as_str()).collect();
         names.sort_unstable();
@@ -663,6 +706,46 @@ mod tests {
                 "{}: sustain and active are {:.2}:1 apart - too close to tell",
                 t.name,
                 contrast(a, s)
+            );
+        }
+    }
+
+    /// **A band has to have room UNDER and OVER it.**
+    ///
+    /// The recorder derives everything it paints from one colour: the well a
+    /// meter sits in is the band times 0.55, the face of a control is the
+    /// band times 1.35. Hand it a near-black and both land on black - every
+    /// recess, every control face and every fader track collapse into one
+    /// dark mush. That is exactly what the first pass of these themes did,
+    /// because they took each app's TERMINAL BACKGROUND, which is a colour
+    /// meant to sit behind text rather than to be a surface with parts.
+    ///
+    /// So: every band must separate its own derived parts about as well as
+    /// the shipped one does.
+    #[test]
+    fn every_band_leaves_room_for_the_parts_derived_from_it() {
+        let shade = |c: Rgb, k: f32| Rgb {
+            r: (f32::from(c.r) * k).min(255.0) as u8,
+            g: (f32::from(c.g) * k).min(255.0) as u8,
+            b: (f32::from(c.b) * k).min(255.0) as u8,
+        };
+        for t in factory() {
+            let bg = t.recorder_bg.expect("every factory theme names its band");
+            // Which way the band shades depends on which ink it takes, the
+            // same question `recorder_panel::wants_light_ink` asks.
+            let light_ink = contrast(bg, Rgb::new(0xE8, 0xDC, 0xC0))
+                > contrast(bg, Rgb::new(0x1a, 0x1a, 0x1a));
+            let (well, field) = if light_ink {
+                (shade(bg, 0.55), shade(bg, 1.35))
+            } else {
+                (shade(bg, 0.88), shade(bg, 0.94))
+            };
+            let sep = contrast(well, field);
+            assert!(
+                sep >= 1.12,
+                "{}: the band's well and control face are {sep:.2}:1 apart - \
+                 the whole strip reads as one flat colour",
+                t.name
             );
         }
     }

@@ -40,36 +40,32 @@ pub fn white_keys_before(note: u8) -> Option<usize> {
 
 /// Idle fill for a key.
 ///
-/// **Dark mode moves the KEYBOARD as well as the theory content.** It was
-/// scoped to the theory window for a while, which left the first view half
-/// dark: black theory text over a bone-white keyboard, one toggle that
-/// visibly did half its job. The user's own chosen colours still win — a
-/// keyboard someone painted stays painted — so the swap applies only while
-/// the two idle colours are still the shipped defaults.
+/// **Dark mode moves the KEYBOARD as well as the theory content, always.**
+/// It was scoped to the theory window for a while, which left the first view
+/// half dark. The first fix only swapped when the two colours were still the
+/// shipped defaults - which is false the moment somebody tries a theme or
+/// picks a colour, so the toggle went dead again for exactly the people most
+/// likely to press it.
+///
+/// So it SHADES rather than swaps: whatever colour the keys are wearing -
+/// shipped, themed, or hand-picked - is darkened toward the same near-black
+/// ground the theory panel uses. A custom keyboard stays recognisably itself
+/// and still answers the key.
 fn idle_colors(s: &Settings) -> (Color32, Color32) {
     let white = s.white_key_idle_color.to_color32();
     let black = s.black_key_idle_color.to_color32();
-    let defaults = white == Color32::from_rgb(0xE8, 0xDC, 0xC0)
-        && black == Color32::from_rgb(0x1a, 0x1a, 0x1a);
-    if s.dark_mode && defaults {
-        // The same ivory/near-black pair the theory panel wears, inverted in
-        // ROLE rather than in hue: the white keys become the dark surface
-        // and the black keys the darker one, so the keyboard still reads as
-        // a keyboard and still belongs to the palette above it.
-        return (
-            Color32::from_rgb(0x2a, 0x28, 0x24),
-            Color32::from_rgb(0x0a, 0x0a, 0x0a),
-        );
+    if !s.dark_mode {
+        return (white, black);
     }
-    (white, black)
+    (dim(white, 0.30), dim(black, 0.55))
 }
 
-/// Whether the keyboard is still wearing the colours it shipped with — the
-/// gate for every dark-mode swap in this module, so a hand-painted keyboard
-/// is never repainted behind the user's back.
-fn idle_is_default(s: &Settings) -> bool {
-    s.white_key_idle_color.to_color32() == Color32::from_rgb(0xE8, 0xDC, 0xC0)
-        && s.black_key_idle_color.to_color32() == Color32::from_rgb(0x1a, 0x1a, 0x1a)
+/// Scale a colour toward black, keeping its hue - the same trick the band's
+/// wells use, so a themed keyboard darkens into its own colour rather than
+/// into grey.
+fn dim(c: Color32, k: f32) -> Color32 {
+    let f = |v: u8| (f32::from(v) * k).clamp(0.0, 255.0) as u8;
+    Color32::from_rgb(f(c.r()), f(c.g()), f(c.b()))
 }
 
 pub fn bg_color(dark_mode: bool) -> Color32 {
@@ -110,7 +106,7 @@ pub fn draw(
     // The walnut separator and outline are drawn FOR the bone keyboard; on
     // the dark one they are the brightest thing on screen. Darkened together
     // so the key edges stay visible without ruling the view.
-    let (separator, outline) = if s.dark_mode && idle_is_default(s) {
+    let (separator, outline) = if s.dark_mode {
         (
             Color32::from_rgb(46, 32, 16),
             Color32::from_rgb(70, 58, 43),
