@@ -633,6 +633,9 @@ pub struct IvoryApp {
     /// labels are Strings, and a desk with a dozen routes would otherwise
     /// allocate a dozen of them sixty times a second.
     route_labels: Vec<(usize, String, f32)>,
+    /// A render in flight, for the window that floats over everything while
+    /// it runs. `None` when nothing is exporting.
+    export_progress: Option<crate::ports::ExportProgress>,
     /// How many outputs the open device has, pushed by the host. Only the
     /// host knows; the routing picker cannot offer jacks without it.
     device_outs: usize,
@@ -1471,6 +1474,7 @@ impl IvoryApp {
             fx_drag: None,
             fx_defaults: crate::ports::EffectDefaults::default(),
             device_outs: 2,
+            export_progress: None,
             route_labels: Vec::new(),
             sounding: std::collections::BTreeSet::new(),
             clicked: std::collections::BTreeSet::new(),
@@ -10863,6 +10867,11 @@ impl IvoryApp {
             .collect();
     }
 
+    /// Push (or clear) the export progress the floating window draws.
+    pub fn set_export_progress(&mut self, p: Option<crate::ports::ExportProgress>) {
+        self.export_progress = p;
+    }
+
     /// What the open output device offers, for the routing picker.
     pub fn set_device_outs(&mut self, n: usize) {
         self.device_outs = n;
@@ -16324,6 +16333,15 @@ impl IvoryApp {
             dialogs::show(&ctx, &mut self.dialog, false, placement)
         {
             self.apply_dialog_action(action);
+        }
+        // **The export window floats over everything, and is not a dialog.**
+        // A dialog is one at a time and answers a question; this answers
+        // nothing - it reports, while whatever the user had open stays open.
+        // It also has to keep painting, so it asks for the next frame itself
+        // rather than waiting for a pointer to move.
+        if let Some(p) = self.export_progress.clone() {
+            dialogs::show_export_progress(&ctx, &p, placement);
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
 
         // 50ms GUI cadence; MIDI events wake us sooner via request_repaint_of.

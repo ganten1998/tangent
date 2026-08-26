@@ -25,6 +25,25 @@ use std::sync::mpsc;
 /// the name would break for two identical webcams — which is not a hypothetical,
 /// it is what happens the moment somebody adds a second camera for a side angle
 /// — and again when the OS language changes and "Built-in Microphone" comes
+/// How far an export has got, and what it has heard so far.
+///
+/// **The waveform is the point.** A percentage says a render is moving; a
+/// waveform says what it is rendering, which is the difference between
+/// waiting and watching. Buckets are (min, max) pairs in -1..1, one per
+/// column of the drawn wave, filled left to right as the render walks the
+/// timeline - so the picture grows the way REAPER's does.
+#[derive(Debug, Clone, Default)]
+pub struct ExportProgress {
+    /// 0..=1.
+    pub fraction: f32,
+    /// What is happening, in words: rendering, encoding, writing.
+    pub label: String,
+    pub peaks: Vec<(f32, f32)>,
+}
+
+/// How many columns an export's waveform is drawn in.
+pub const EXPORT_PEAKS: usize = 480;
+
 /// What a project export writes, in which shape, and how fast.
 ///
 /// Assembled by the export dialog, carried whole to the host. FULL SPEED is
@@ -32,6 +51,7 @@ use std::sync::mpsc;
 /// fast as the machine goes; realtime is the option for the day a plugin
 /// misbehaves offline.
 #[derive(Debug, Clone, PartialEq)]
+
 pub struct ProjectExportSpec {
     /// The master mix lands in a file.
     pub master: bool,
