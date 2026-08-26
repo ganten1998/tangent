@@ -3398,6 +3398,11 @@ impl DesktopApp {
                 Ok(()) => {
                     self.recorder.take_note =
                         Some(format!("Exported  {}", out_dir.display()));
+                    // A long export is a thing people walk away from; the
+                    // first thing they want on returning is the file.
+                    if spec.open_when_done {
+                        reveal(&out_dir);
+                    }
                 }
                 Err(e) => {
                     self.recorder.take_note = Some(format!("export: {e}"));
@@ -3794,6 +3799,9 @@ impl DesktopApp {
             return;
         }
         self.recorder.take_note = Some(format!("Exported  {}", out_dir.display()));
+        if spec.open_when_done {
+            reveal(&out_dir);
+        }
     }
 
     /// The template shelf: `<record_root>/Projects/Templates`.

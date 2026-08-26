@@ -55,6 +55,10 @@ pub struct ProjectExportSpec {
     pub span: Option<(f64, f64)>,
     /// The WAV word size.
     pub depth: ExportDepth,
+    /// Show the folder when the render finishes. A long export is a thing
+    /// somebody walks away from, and the first thing they want on returning
+    /// is the file — not the app that made it.
+    pub open_when_done: bool,
 }
 
 impl Default for ProjectExportSpec {
@@ -68,6 +72,7 @@ impl Default for ProjectExportSpec {
             name: "mix".to_owned(),
             primary: ExportFormat::Wav,
             secondary: None,
+            open_when_done: true,
             realtime: false,
             span: None,
             depth: ExportDepth::Pcm24,

@@ -483,6 +483,10 @@ pub struct Settings {
     pub theme_name: String,
     /// Where each channel goes besides the master — see `crate::routing`.
     pub routes: crate::routing::Routes,
+    /// Wrap a saved project in its own folder. **On by default**, because a
+    /// project is a DIRECTORY (document plus `media/`) and saving one into a
+    /// folder that already has things in it scatters those parts among them.
+    pub project_subdir: bool,
     pub prefer_flats: bool,
     pub chord_detection_enabled: bool,
     /// Whether the chord strip band is drawn under the theory band.
@@ -1158,6 +1162,7 @@ impl Default for Settings {
             string_color: Rgb::new(0xC9, 0xC4, 0xBC),
             theme_name: "Default".to_owned(),
             routes: crate::routing::Routes::default(),
+            project_subdir: true,
             prefer_flats: true,
             chord_detection_enabled: true,
             show_chord_strip: false,
@@ -1643,6 +1648,11 @@ impl Settings {
         take_color(&mut map, "input_chip_color", &mut s.input_chip_color);
         take_color(&mut map, "fretboard_color", &mut s.fretboard_color);
         take_color(&mut map, "string_color", &mut s.string_color);
+        if let Some(v) = map.shift_remove("project_subdir") {
+            if let Some(b) = v.as_bool() {
+                s.project_subdir = b;
+            }
+        }
         if let Some(v) = map.shift_remove("routes") {
             s.routes = crate::routing::Routes::from_json(&v);
         }
@@ -3079,6 +3089,7 @@ impl Settings {
         );
         map.insert("theme_name".into(), Value::String(self.theme_name.clone()));
         map.insert("routes".into(), self.routes.to_json());
+        map.insert("project_subdir".into(), Value::Bool(self.project_subdir));
         for (k, v) in [
             ("theory_line_color", self.theory_line_color),
             ("interval_text_color", self.interval_text_color),

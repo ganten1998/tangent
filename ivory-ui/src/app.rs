@@ -5868,10 +5868,33 @@ impl IvoryApp {
     /// without the `.tangent` the panel's filter appended, it names the new
     /// project DIRECTORY.
     pub fn save_project_as(&mut self, target: &std::path::Path) {
-        let dir = if target.extension().is_some_and(|e| e == "tangent") {
+        let chosen = if target.extension().is_some_and(|e| e == "tangent") {
             target.with_extension("")
         } else {
             target.to_path_buf()
+        };
+        // **The wrap, and why it is on by default.** A project is a
+        // DIRECTORY - `project.tangent`, `media/`, the kit's sidecar - and a
+        // save panel pointed at a folder that already exists would otherwise
+        // scatter those parts among whatever is already in it. With the box
+        // ticked, an existing folder gets a folder of its own inside it,
+        // named for the project; a name that does not exist yet already IS
+        // its own folder, so nothing is nested twice.
+        let dir = if self.settings.project_subdir && chosen.is_dir() {
+            let name = {
+                let n = self.project_name();
+                let n = n.trim();
+                if n.is_empty() { "Untitled".to_owned() } else { n.to_owned() }
+            };
+            // Never a path: a project called `../..` must not climb out of
+            // the folder the user chose.
+            let safe: String = name
+                .chars()
+                .map(|c| if std::path::is_separator(c) || c == '.' { '_' } else { c })
+                .collect();
+            chosen.join(safe.trim())
+        } else {
+            chosen
         };
         let Some(src_dir) = self.project_doc().and_then(std::path::Path::parent) else {
             return;
@@ -11458,6 +11481,7 @@ impl IvoryApp {
             Hit::ProjectMenu => {
                 self.dialog = Some(dialogs::Dialog::Project {
                     name: self.project_name(),
+                    subdir: self.settings.project_subdir,
                 });
             }
             Hit::StreamToObs => {
@@ -13616,6 +13640,10 @@ impl IvoryApp {
             // two lists of the same hardware.
             DialogAction::ChooseAudioDevice => {
                 self.open_device_picker(dialogs::DeviceKind::AudioInput);
+            }
+            DialogAction::SetProjectSubdir(on) => {
+                self.settings.project_subdir = on;
+                self.save_settings();
             }
             DialogAction::SetShowWelcome(show) => {
                 self.settings.show_welcome = show;
