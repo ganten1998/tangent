@@ -806,14 +806,22 @@ impl Layout {
         // the unevenness the owner named. The cell is trimmed to the circle
         // (plus the room its ticks need), so every gap in the row is the gap
         // between two things a person can point at.
-        // **The circle, and nothing but the circle.** 2.4 radii still left a
-        // fifth of a diameter of air inside the knob's own slot, so the gap
-        // from the dial to the tap chip read wider than every gap after it —
-        // the row looked left-justified even though the arithmetic was even.
-        // The slot IS the circle now, so dial-to-tap is the same distance as
-        // tap-to-Record and every pair after it.
+        // **The slot is the knob's VISIBLE extent — ticks included.**
+        //
+        // Two mistakes to avoid here and both were made. Spacing by the CELL
+        // leaves a fifth of a diameter of dead air inside the knob's own
+        // slot, so the row reads left-justified however even the arithmetic
+        // is. Spacing by the bare circle (2 radii) is worse: `knob_face`
+        // budgets the radius from the SHORTER side of the cell, so narrowing
+        // the cell below the drawing's own width feeds back and the knob
+        // comes out smaller than the six it is supposed to match.
+        //
+        // The drawing runs to 1.26 radii — the skirt the ticks stand in — so
+        // its width is 2.52 radii, and a cell exactly that wide leaves the
+        // radius EXACTLY where it was: the shorter side is unchanged, so the
+        // budget is unchanged. Same knob as the others, no dead air.
         let knob_w = knob_face(head)
-            .map_or(head.width(), |f| (f.radius * 2.0).min(head.width()));
+            .map_or(head.width(), |f| (f.radius * 2.52).min(head.width()));
         widths.push(knob_w);
         widths.push(tap_w);
         for _ in 0..ICONS {
@@ -5015,6 +5023,30 @@ mod tests {
     /// They sit two inches apart and mean opposite things — one holds the
     /// output down, the other is the only control that can push it up past
     /// what the first one guaranteed.
+    /// **The tempo knob is the same size as the six it sits with.**
+    ///
+    /// It is sized from an effect cell on purpose — they are the same control
+    /// and the eye reads them as a set. Spacing the row by the knob's visible
+    /// extent nearly cost that: `knob_face` budgets the radius from the
+    /// SHORTER side of its cell, so a cell narrowed below the drawing's own
+    /// width feeds back and shrinks the knob. The owner caught it by eye.
+    #[test]
+    fn the_tempo_knob_is_exactly_the_size_of_an_effect_knob() {
+        for w in [900.0_f32, 1300.0, 1800.0] {
+            let v = idle();
+            let l = Layout::new(band(w), &v);
+            let (Some(tempo), Some(fx)) = (knob_face(l.tempo), knob_face(l.fx[0])) else {
+                continue;
+            };
+            assert!(
+                (tempo.radius - fx.radius).abs() < 0.01,
+                "at {w}pt the tempo knob is {:.2} where the effect knobs are {:.2}",
+                tempo.radius,
+                fx.radius
+            );
+        }
+    }
+
     #[test]
     fn the_limiter_and_the_master_are_told_apart_by_colour() {
         assert_ne!(Fx::Limiter.cap(), MASTER_CAP);
