@@ -83,7 +83,42 @@ pub struct Theme {
     // ── the fretboard ──────────────────────────────────────────────────────
     pub fretboard: Option<Rgb>,
     pub string: Option<Rgb>,
+
+    /// **The same roles again, for DARK mode — and anything else it wants.**
+    ///
+    /// Keyed by role name, so a theme file writes `"dark": {"fx_strip": ...}`
+    /// and every role above is available inside it. Unset roles are DERIVED,
+    /// which is what dark mode has always done: the piano swaps its keys, the
+    /// mixer darkens its face, the arrangement re-derives its field. A theme
+    /// that says nothing here behaves exactly as it did.
+    ///
+    /// Named, it wins. Somebody who cares enough to write a theme should be
+    /// able to say what every surface is in both modes rather than inherit a
+    /// transform designed for the colours this app happened to ship with.
+    pub dark: std::collections::BTreeMap<String, Rgb>,
 }
+
+/// Every role a theme can name, in the spelling a theme FILE uses. One list,
+/// so the writer, the reader, the example and the dark map cannot drift.
+pub const ROLES: [&str; 17] = [
+    "white_key",
+    "black_key",
+    "key_active",
+    "sustain",
+    "key_separator",
+    "text",
+    "theory_line",
+    "interval_text",
+    "recorder_bg",
+    "fx_knob",
+    "master_knob",
+    "meter_bg",
+    "scope_draw",
+    "fx_strip",
+    "input_chip",
+    "fretboard",
+    "string",
+];
 
 /// A `const`-friendly colour literal, because `Rgb::new` is not const and a
 /// factory table of ninety colours should not need ninety function calls.
@@ -124,6 +159,7 @@ impl Theme {
             fretboard: c(0x4a, 0x2b, 0x22),
             string: c(0xC9, 0xC4, 0xBC),
             channel_palette: Some(0),
+            dark: Default::default(),
         }
     }
 
@@ -150,6 +186,7 @@ impl Theme {
             channel_palette: Some(s.palette_choice),
             fretboard: Some(s.fretboard_color),
             string: Some(s.string_color),
+            dark: s.dark_roles.clone(),
         }
     }
 
@@ -161,6 +198,11 @@ impl Theme {
     /// record. Someone who then hand-edits one colour has a modified theme,
     /// and `capture` is how they keep it.
     pub fn apply(&self, s: &mut Settings) {
+        // The dark overrides replace whatever was there wholesale: a theme
+        // owns both modes, and half of the last theme's dark set surviving
+        // under this one's light set is the "Default is not the default" bug
+        // in a new costume.
+        s.dark_roles = self.dark.clone();
         if let Some(v) = self.white_key {
             s.white_key_idle_color = v;
         }
@@ -252,6 +294,15 @@ impl Theme {
         if let Some(v) = self.channel_palette {
             m.insert("channel_palette".into(), Value::from(v));
         }
+        // The dark set, only when there is one: a theme that leaves dark mode
+        // to the derivation should not grow an empty object in its file.
+        if !self.dark.is_empty() {
+            let mut d = Map::new();
+            for (role, c) in &self.dark {
+                d.insert(role.clone(), Value::String(c.to_hex()));
+            }
+            m.insert("dark".into(), Value::Object(d));
+        }
         serde_json::to_string_pretty(&Value::Object(m)).unwrap_or_default()
     }
 
@@ -288,6 +339,21 @@ impl Theme {
             fx_strip: get("fx_strip"),
             input_chip: get("input_chip"),
             channel_palette: map.get("channel_palette").and_then(serde_json::Value::as_i64),
+            // **Anything the file names for dark mode.** Unknown role names
+            // are kept rather than dropped: a theme written against a newer
+            // build should not lose a role by passing through an older one,
+            // and a role this build does not read costs nothing to carry.
+            dark: map
+                .get("dark")
+                .and_then(serde_json::Value::as_object)
+                .map(|d| {
+                    d.iter()
+                        .filter_map(|(k, v)| {
+                            v.as_str().and_then(Rgb::parse).map(|c| (k.clone(), c))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             fretboard: get("fretboard"),
             string: get("string"),
         })
@@ -350,6 +416,7 @@ pub fn factory() -> Vec<Theme> {
             fretboard: c(0x25, 0x15, 0x24),
             string: c(0xa3, 0x76, 0x8f),
             channel_palette: Some(6),
+            dark: Default::default(),
         },
         // ── Hydra: the owner's audio-routing TUI. Near-black teal depths, a
         // bioluminescent seafoam glow, and exactly one warm coral — which is
@@ -374,6 +441,7 @@ pub fn factory() -> Vec<Theme> {
             fretboard: c(0x10, 0x24, 0x28),
             string: c(0x6a, 0x8c, 0x88),
             channel_palette: Some(2),
+            dark: Default::default(),
         },
         // ── Navi: the owner's graph viewer. Layered night blues with
         // periwinkle nodes rimmed in electric cyan, and exactly one warm
@@ -402,6 +470,7 @@ pub fn factory() -> Vec<Theme> {
             fretboard: c(0x0a, 0x1c, 0x34),
             string: c(0x78, 0x98, 0xb8),
             channel_palette: Some(2),
+            dark: Default::default(),
         },
         // ── Mono: greys, and one red.
         //
@@ -431,6 +500,7 @@ pub fn factory() -> Vec<Theme> {
             fretboard: c(0x1a, 0x1a, 0x1a),
             string: c(0x78, 0x78, 0x78),
             channel_palette: Some(5),
+            dark: Default::default(),
         },
         // ── Studio: the analogue console. Warm charcoal, cream legends, VU
         // amber for anything that moves, an oxblood master, and the sage-green
@@ -458,6 +528,7 @@ pub fn factory() -> Vec<Theme> {
             fretboard: c(0x27, 0x24, 0x20),
             string: c(0xa8, 0x98, 0x80),
             channel_palette: Some(1),
+            dark: Default::default(),
         },
         // ── Aurora: indigo night with a mint/violet complementary pair — mint
         // for what is sounding, violet for what is HELD, so the two states of
@@ -482,6 +553,7 @@ pub fn factory() -> Vec<Theme> {
             fretboard: c(0x1e, 0x21, 0x30),
             string: c(0x6b, 0x72, 0x90),
             channel_palette: Some(2),
+            dark: Default::default(),
         },
         // ── Sandstone: the LIGHT one, and the reason the set needs it — every
         // other theme here is dark, and a person working in daylight has
@@ -514,6 +586,7 @@ pub fn factory() -> Vec<Theme> {
             fretboard: c(0xc9, 0xb5, 0x96),
             string: c(0x6b, 0x5c, 0x48),
             channel_palette: Some(1),
+            dark: Default::default(),
         },
         // ── Centennial: the DX7 II Centennial, 1987 — Yamaha's hundredth
         // birthday in brushed silver with gold legends and black cheeks. The
@@ -540,6 +613,7 @@ pub fn factory() -> Vec<Theme> {
             fretboard: c(0x3a, 0x3a, 0x40),
             string: c(0xc9, 0xc9, 0xcf),
             channel_palette: Some(5),
+            dark: Default::default(),
         },
         // ── Blueprint: a cyanotype. Prussian ground, chalk lines, and one
         // ochre for what is HELD — the pencil annotation on a blue print.
@@ -563,6 +637,7 @@ pub fn factory() -> Vec<Theme> {
             fretboard: c(0x13, 0x2b, 0x47),
             string: c(0x8f, 0xa8, 0xc0),
             channel_palette: Some(2),
+            dark: Default::default(),
         },
         // ── Porcelain: the other light theme, and cool where Sandstone is
         // warm. Delft cobalt on cool white, with a violet sustain so the two
@@ -587,6 +662,7 @@ pub fn factory() -> Vec<Theme> {
             fretboard: c(0x39, 0x42, 0x4e),
             string: c(0xc2, 0xc8, 0xd0),
             channel_palette: Some(2),
+            dark: Default::default(),
         },
         // ── Moss: deep forest, lichen text, and a low amber sustain. The
         // sustain is DARKER than the struck note here — on a green ground a
@@ -611,6 +687,7 @@ pub fn factory() -> Vec<Theme> {
             fretboard: c(0x1d, 0x27, 0x18),
             string: c(0x9a, 0xa8, 0x8c),
             channel_palette: Some(3),
+            dark: Default::default(),
         },
         // ── Rhodes: black tolex, cream keys, and the nameplate's red on the
         // master. Warm where Studio is neutral: this is a wooden instrument
@@ -635,6 +712,7 @@ pub fn factory() -> Vec<Theme> {
             fretboard: c(0x24, 0x1d, 0x18),
             string: c(0xb8, 0xac, 0x98),
             channel_palette: Some(1),
+            dark: Default::default(),
         },
         // ── Copper: verdigris and rust, the two things copper becomes. The
         // patina is the ground and the oxide is what moves.
@@ -658,6 +736,7 @@ pub fn factory() -> Vec<Theme> {
             fretboard: c(0x1b, 0x2f, 0x2b),
             string: c(0xa8, 0xb8, 0xb2),
             channel_palette: Some(7),
+            dark: Default::default(),
         },
         // ── Dusk: the sky twenty minutes after sunset — violet overhead,
         // warm at the horizon. The horizon colour is what sounds; the
@@ -682,6 +761,7 @@ pub fn factory() -> Vec<Theme> {
             fretboard: c(0x22, 0x1b, 0x3a),
             string: c(0x9a, 0x90, 0xb8),
             channel_palette: Some(6),
+            dark: Default::default(),
         },
         // ── Iris: deep violet with its complement, chartreuse. The widest
         // hue gap in the set, so a sounding note cannot be mistaken for a
@@ -706,6 +786,7 @@ pub fn factory() -> Vec<Theme> {
             fretboard: c(0x25, 0x18, 0x40),
             string: c(0xa8, 0x98, 0xc0),
             channel_palette: Some(6),
+            dark: Default::default(),
         },
     ]
 }
@@ -776,6 +857,30 @@ pub const EXAMPLE: &str = r##"{
   "fretboard": "",
   "string": "",
 
+  "_comment_dark": "DARK MODE. Any role above can be named again in here, and",
+  "_comment_dark2": "what you name WINS. Leave a role out and it is derived, the",
+  "_comment_dark3": "way dark mode has always worked - the keyboard inverts, the",
+  "_comment_dark4": "desk darkens. Leave the whole block out and nothing changes.",
+  "dark": {
+    "white_key": "",
+    "black_key": "",
+    "key_active": "",
+    "sustain": "",
+    "key_separator": "",
+    "text": "",
+    "theory_line": "",
+    "interval_text": "",
+    "recorder_bg": "",
+    "fx_knob": "",
+    "master_knob": "",
+    "meter_bg": "",
+    "scope_draw": "",
+    "fx_strip": "",
+    "input_chip": "",
+    "fretboard": "",
+    "string": ""
+  },
+
   "_comment4": "channel_palette picks what the SIXTEEN channels wear, plus the",
   "_comment5": "click and the master. A number, not a colour:",
   "_comment6": "0 IVORY (full spectrum)  1 EMBER (warm)   2 TIDE (cool)",
@@ -838,6 +943,65 @@ mod tests {
     /// in the middle of it — they kept whichever palette happened to be there,
     /// which is how the owner ended up looking at a purple theme wearing an
     /// orange click and a red master.
+
+    /// **A user theme can name ANY colour, for either mode.**
+    ///
+    /// The owner's word: somebody who cares enough to write a theme gets the
+    /// freedom to say what everything looks like. Dark mode used to be a
+    /// transform designed around the colours this app shipped with, and a
+    /// theme had no way to disagree with it.
+    #[test]
+    fn a_theme_can_name_every_role_for_dark_mode_too() {
+        let mut light = String::from("{\n  \"name\": \"Nightshift\"");
+        for role in ROLES {
+            light.push_str(&format!(",\n  \"{role}\": \"#123456\""));
+        }
+        light.push_str(",\n  \"dark\": {");
+        for (i, role) in ROLES.iter().enumerate() {
+            light.push_str(&format!(
+                "{}\n    \"{role}\": \"#abcdef\"",
+                if i == 0 { "" } else { "," }
+            ));
+        }
+        light.push_str("\n  }\n}");
+
+        let t = Theme::from_json(&light, "x").expect("the theme parses");
+        assert_eq!(t.dark.len(), ROLES.len(), "a role was dropped on the way in");
+        for role in ROLES {
+            assert_eq!(
+                t.dark.get(role).map(|c| c.to_hex()),
+                Some("#abcdef".to_owned()),
+                "{role} did not survive"
+            );
+        }
+
+        // It reaches the settings every panel reads...
+        let mut set = Settings::default();
+        t.apply(&mut set);
+        for role in ROLES {
+            assert!(set.dark_role(role).is_some(), "{role} never reached settings");
+        }
+        // ...and comes back out again, so Save Theme As keeps both modes.
+        let again = Theme::capture("Nightshift", &set);
+        assert_eq!(again.dark, t.dark, "capture lost the dark set");
+        let round = Theme::from_json(&again.to_json(), "x").expect("round trips");
+        assert_eq!(round.dark, t.dark, "the file lost the dark set");
+    }
+
+    /// A theme that says nothing about dark mode still behaves exactly as it
+    /// did — the derivation is the default, not a fallback nobody reaches.
+    #[test]
+    fn a_theme_with_no_dark_block_leaves_dark_mode_derived() {
+        let t = Theme::from_json(r##"{"name": "Quiet", "text": "#ffffff"}"##, "x")
+            .expect("parses");
+        assert!(t.dark.is_empty());
+        let mut set = Settings::default();
+        t.apply(&mut set);
+        for role in ROLES {
+            assert!(set.dark_role(role).is_none(), "{role} was invented");
+        }
+    }
+
     #[test]
     fn every_factory_theme_dresses_its_channels() {
         for t in factory() {

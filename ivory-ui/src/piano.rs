@@ -51,11 +51,19 @@ pub fn white_keys_before(note: u8) -> Option<usize> {
 fn idle_colors(s: &Settings) -> (Color32, Color32) {
     let white = s.white_key_idle_color.to_color32();
     let black = s.black_key_idle_color.to_color32();
-    if s.dark_mode {
-        (black, white)
-    } else {
-        (white, black)
+    if !s.dark_mode {
+        return (white, black);
     }
+    // **What the theme SAYS, before what dark mode would derive.**
+    //
+    // The swap below is the derivation, and it is a good one: the owner asked
+    // for a pure inversion to ivory on black and that is what it gives. But a
+    // theme that names its own dark keyboard means it, and a theme is allowed
+    // to disagree with the transform — that is what naming a colour is for.
+    (
+        s.dark_role("white_key").map_or(black, |c| c.to_color32()),
+        s.dark_role("black_key").map_or(white, |c| c.to_color32()),
+    )
 }
 
 /// Blend two colours, `t` of the way from `a` to `b`.

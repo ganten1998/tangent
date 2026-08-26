@@ -447,6 +447,19 @@ impl Rgb {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
     pub dark_mode: bool,
+    /// **What DARK MODE is painted with, when somebody has said.**
+    ///
+    /// Every role the app themes, again, and every one optional. Unset means
+    /// "derive it", which is what dark mode has always done — the piano swaps
+    /// its keys, the mixer darkens its face, the arrangement re-derives its
+    /// field. A theme that says nothing here behaves exactly as before.
+    ///
+    /// Set, it WINS. That is the point: somebody who cares enough to write a
+    /// theme should be able to say what every surface looks like in both
+    /// modes rather than accept a transform that was designed for the colours
+    /// this app shipped with. Keyed by the role name a theme file uses, so
+    /// the file format and this map are the same vocabulary.
+    pub dark_roles: std::collections::BTreeMap<String, Rgb>,
     pub white_key_idle_color: Rgb,
     pub black_key_idle_color: Rgb,
     pub white_key_active_color: Rgb,
@@ -1145,6 +1158,7 @@ impl Default for Settings {
             desk_state_shift_v14: false,
             pad_state_shift_v18: false,
             desk_state_shift_v19: false,
+            dark_roles: std::collections::BTreeMap::new(),
             white_key_idle_color: Rgb::new(0xE8, 0xDC, 0xC0),
             black_key_idle_color: Rgb::new(0x1a, 0x1a, 0x1a),
             white_key_active_color: Rgb::new(0x6C, 0x9B, 0xD2),
@@ -1379,6 +1393,21 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// The colour a theme named for `role` in DARK mode, if it named one.
+    ///
+    /// The one door every panel's dark-mode branch goes through: ask first,
+    /// derive only when the answer is `None`. Roles are spelled exactly as a
+    /// theme file spells them — see `theme::ROLES`.
+    pub fn dark_role(&self, role: &str) -> Option<Rgb> {
+        self.dark_roles.get(role).copied()
+    }
+
+    /// `dark_role`, but only when `dark` is set — for the panels that carry
+    /// their own dark flag rather than reading `dark_mode`.
+    pub fn dark_role_if(&self, dark: bool, role: &str) -> Option<Rgb> {
+        if dark { self.dark_role(role) } else { None }
+    }
+
 
     /// Which staves the sheet music band is showing.
     pub fn staff_set(&self) -> crate::staff::StaffSet {
@@ -1618,6 +1647,13 @@ impl Settings {
                 }
             }
         };
+        if let Some(Value::Object(d)) = map.shift_remove("dark_roles") {
+            for (role, v) in d {
+                if let Some(c) = v.as_str().and_then(Rgb::parse) {
+                    s.dark_roles.insert(role, c);
+                }
+            }
+        }
         take_color(
             &mut map,
             "white_key_idle_color",
@@ -2648,6 +2684,16 @@ impl Settings {
         // then the additive key, then any preserved unknown keys.
         let mut map = Map::new();
         map.insert("dark_mode".into(), Value::Bool(self.dark_mode));
+        // The dark overrides ride along as one object, so a settings file
+        // gains one key rather than seventeen, and an unknown role written by
+        // a newer build survives a round trip through an older one.
+        if !self.dark_roles.is_empty() {
+            let mut d = Map::new();
+            for (role, c) in &self.dark_roles {
+                d.insert(role.clone(), Value::String(c.to_hex()));
+            }
+            map.insert("dark_roles".into(), Value::Object(d));
+        }
         map.insert(
             "white_key_idle_color".into(),
             Value::String(self.white_key_idle_color.to_hex()),
@@ -4071,6 +4117,20 @@ mod tests {
         assert_eq!(json.matches("settings_version").count(), 1, "{json}");
     }
 
+    /// **`IVORY_SETTINGS_PATH` is process-global, and tests are not.**
+    ///
+    /// Two tests below point it at their own directory and take it away
+    /// again. Cargo runs them on parallel threads in ONE process, so without
+    /// this they interleave: one sets the path, the other removes it, and the
+    /// first then loads from the real settings file and preserves somebody
+    /// else's content. It failed exactly once in a full-workspace run and
+    /// passed every time it was run alone, which is the shape of a race and
+    /// the reason a suite stops being believed.
+    ///
+    /// The `SAFETY: single-threaded` notes on those `set_var` calls were
+    /// simply wrong. They are true now.
+    static SETTINGS_PATH_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// **A settings file that will not parse is preserved, not overwritten.**
     ///
     /// The failure this prevents: `load_from` answers an unreadable file with
@@ -4087,7 +4147,8 @@ mod tests {
 
         // Something a person would mind losing, in a file nothing can parse.
         std::fs::write(&path, b"{ \"dark_mode\": true, and then the disk died").unwrap();
-        // SAFETY: single-threaded test setup.
+        let _env = SETTINGS_PATH_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the lock above is what makes this single-threaded.
         unsafe { std::env::set_var("IVORY_SETTINGS_PATH", &path) };
         let s = Settings::load();
         unsafe { std::env::remove_var("IVORY_SETTINGS_PATH") };
@@ -4118,7 +4179,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("settings.json");
-        // SAFETY: single-threaded test setup.
+        let _env = SETTINGS_PATH_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the lock above is what makes this single-threaded.
         unsafe { std::env::set_var("IVORY_SETTINGS_PATH", &path) };
         let s = Settings::load();
         unsafe { std::env::remove_var("IVORY_SETTINGS_PATH") };

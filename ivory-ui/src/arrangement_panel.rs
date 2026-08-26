@@ -137,6 +137,14 @@ pub struct ArrangeView<'a> {
     pub selected_channel: Option<usize>,
     /// The band's own wood, so the two surfaces are one instrument.
     pub wood: (u8, u8, u8),
+    /// The strip face — the same theme role the mixer's bays wear, so a
+    /// header in one view and a strip in the other are one surface.
+    pub fx_strip: (u8, u8, u8),
+    /// The WELL: the theme's own dark canvas, which the lane field derives
+    /// from. The arrangement used to carry two hard-coded wardrobes (warm
+    /// browns dark, greys light) that no theme could reach, which is why it
+    /// was the one view that never changed with the rest of the app.
+    pub meter_bg: (u8, u8, u8),
 }
 
 /// What a press on the arrangement means.
@@ -829,60 +837,157 @@ struct Ink {
 }
 
 fn ink(view: &ArrangeView<'_>) -> Ink {
-    // **Two faces now, per the owner**: the greys are the LIGHT field, and
-    // dark wears the editor's warm browns — the same wardrobe the editor
-    // shares, toggled per view by D. The headers and toolbar keep the
-    // desk's fixed wood and bone beside either.
-    let (hr, hg, hb) = view.wood;
-    if view.dark_mode {
-        return Ink {
-            hdr_wood: Color32::from_rgb(hr, hg, hb),
-            hdr_face: Color32::from_rgb(0xE3, 0xD9, 0xBD),
-            hdr_lane: Color32::from_rgb(0x20, 0x1C, 0x16),
-            ruler: Color32::from_rgb(0x3A, 0x33, 0x2B),
-            wood: Color32::from_rgb(0x24, 0x1F, 0x1A),
-            face: Color32::from_rgb(0xE8, 0xDC, 0xC0),
-            engrave: Color32::from_rgb(0x18, 0x14, 0x10),
-            faint: Color32::from_rgb(0xE8, 0xDC, 0xC0).gamma_multiply(0.66),
-            lane: Color32::from_rgb(0x2A, 0x26, 0x21),
-            lane_alt: Color32::from_rgb(0x2F, 0x2A, 0x24),
-            grid: Color32::from_rgb(0x12, 0x0F, 0x0C),
-            empty_ground: Color32::from_rgb(0x22, 0x1E, 0x19),
-            seam: Color32::from_rgb(0x1B, 0x17, 0x13),
-            clip_ink: Color32::from_rgb(0xE8, 0xDC, 0xC0),
-            playhead: Color32::from_rgb(0xE8, 0x3A, 0x4E),
-            arm: Color32::from_rgb(0xE0, 0x22, 0x22),
-            mute: Color32::from_rgb(0xE0, 0xA8, 0x22),
-            solo: Color32::from_rgb(0xE8, 0x3A, 0x4E),
-            meter: Color32::from_rgb(0x3D, 0xC0, 0x5A),
-            select: Color32::from_rgb(0xF2, 0xE9, 0xD2),
-        };
-    }
+    // **DERIVED from the theme, in both modes.**
+    //
+    // This was two hard-coded wardrobes — warm browns for dark, greys for
+    // light — that no theme could reach, which is why the arrangement was the
+    // one view that never changed with the rest of the app. Every surface
+    // below now comes out of three theme roles: the band's WOOD, the strip
+    // FACE the mixer's bays already wear, and the WELL the timecode sits in.
+    //
+    // Dark mode is a different DERIVATION, not a different wardrobe: the same
+    // three roles, taken further down. That is what keeps a theme recognisable
+    // with D pressed instead of swapping it for somebody else's browns.
+    let wood = Color32::from_rgb(view.wood.0, view.wood.1, view.wood.2);
+    let strip = Color32::from_rgb(view.fx_strip.0, view.fx_strip.1, view.fx_strip.2);
+    let well = Color32::from_rgb(view.meter_bg.0, view.meter_bg.1, view.meter_bg.2);
+    let dark = view.dark_mode;
+
+    // The lane field. In light mode the well is lifted toward the strip so the
+    // lanes read as a SURFACE that clips sit on rather than a hole cut in the
+    // desk; in dark mode it stays near the well and is lifted only enough to
+    // separate from the seams.
+    // Through the dead-zone guard, for the reason `legible_surface` gives:
+    // the clips and the words that land on this field have to be readable
+    // whatever three roles it was derived from.
+    let lane = crate::recorder_panel::legible_surface(if dark {
+        shade(well, 1.55)
+    } else {
+        blend(well, strip, 0.46)
+    });
+    // **Structure separates from the field PERCEPTUALLY, not by a multiplier.**
+    //
+    // Scaling brightness is fine on a pale field and does almost nothing on a
+    // dark one: 0.78 of a near-black is still a near-black, and the grid, the
+    // seams and the alternating stripe all vanished together on every dark
+    // theme. So each moves AWAY from the field — toward white if the field is
+    // dark, toward black if it is light — by an amount that reads either way.
+    let lane_alt = separate(lane, 0.055);
+    let grid = separate(lane, 0.115);
+    let empty_ground = separate(lane, 0.16);
+    let seam = separate(lane, 0.24);
+    let ruler = blend(wood, lane, 0.55);
+
+    // Ink follows the surface it lands on — the rule this app has now had to
+    // learn six times. The headers wear the strip face; the lanes wear the
+    // field.
+    let on = |bg: Color32| {
+        if crate::recorder_panel::wants_light_ink(bg) {
+            crate::recorder_panel::INK_LIGHT
+        } else {
+            crate::recorder_panel::INK_DARK
+        }
+    };
+    let engrave = on(strip);
     Ink {
-        hdr_wood: Color32::from_rgb(hr, hg, hb),
-        hdr_face: Color32::from_rgb(0xE3, 0xD9, 0xBD),
-        hdr_lane: Color32::from_rgb(0x20, 0x1C, 0x16),
-        ruler: Color32::from_rgb(0x50, 0x50, 0x50),
-        wood: Color32::from_rgb(0x38, 0x38, 0x38),
-        face: Color32::from_rgb(0xC8, 0xC8, 0xC2),
-        engrave: Color32::from_rgb(0x24, 0x20, 0x1A),
-        faint: Color32::from_rgb(0xC8, 0xC8, 0xC2).gamma_multiply(0.72),
-        lane: Color32::from_rgb(0x41, 0x41, 0x41),
-        lane_alt: Color32::from_rgb(0x46, 0x46, 0x46),
-        // The GRID base: the draw derives the strong line by DARKENING it
-        // and the subdivisions stay at base — dark lines on a grey field,
-        // STARK enough to read against the raised lanes.
-        grid: Color32::from_rgb(0x1A, 0x1A, 0x1A),
-        empty_ground: Color32::from_rgb(0x36, 0x36, 0x36),
-        seam: Color32::from_rgb(0x2C, 0x2C, 0x2C),
-        clip_ink: Color32::from_rgb(0xE8, 0xDC, 0xC0),
-        playhead: Color32::from_rgb(0xE8, 0x3A, 0x4E),
+        hdr_wood: wood,
+        hdr_face: strip,
+        hdr_lane: shade(lane, 0.82),
+        ruler,
+        wood: shade(wood, if dark { 0.62 } else { 1.0 }),
+        face: strip,
+        engrave,
+        faint: blend(engrave, strip, 0.38),
+        lane,
+        lane_alt,
+        grid,
+        empty_ground,
+        seam,
+        // Clips wear PALETTE colours, and every one of those is generated
+        // dark enough to carry the ivory ink at 4.5:1 — that is the palette's
+        // own contract, held by `every_auto_palette_colour_can_carry_the_ink`.
+        // So the ink on a clip answers to the clip, not to the field behind it.
+        clip_ink: crate::recorder_panel::INK_LIGHT,
+        // The semantic lights are the desk's, everywhere, in every theme:
+        // a record light that changed colour with the wallpaper would be a
+        // record light you had to learn twice.
+        // **The playhead is a red that can be SEEN on this field.** It stays
+        // red in every theme — a transport light you had to learn twice would
+        // be a worse idea than a themed one — but a bright crimson on a bone
+        // field is a line nobody can follow, so the deep one answers there.
+        playhead: redder_of(lane),
         arm: Color32::from_rgb(0xE0, 0x22, 0x22),
         mute: Color32::from_rgb(0xE0, 0xA8, 0x22),
-        solo: Color32::from_rgb(0xE8, 0x3A, 0x4E),
+        solo: redder_of(lane),
         meter: Color32::from_rgb(0x3D, 0xC0, 0x5A),
-        select: Color32::from_rgb(0xF2, 0xE9, 0xD2),
+        select: on(lane),
     }
+}
+
+/// Move a colour AWAY from itself by `t`: toward white when it is dark,
+/// toward black when it is light. What "a shade darker" should have been on a
+/// surface that might be either.
+fn separate(c: Color32, t: f32) -> Color32 {
+    let toward = if crate::recorder_panel::wants_light_ink(c) {
+        Color32::WHITE
+    } else {
+        Color32::BLACK
+    };
+    blend(c, toward, t)
+}
+
+/// A transport red that can be SEEN on `bg`.
+///
+/// The two shipped reds first — a playhead should look like the playhead — and
+/// if the field sits between them, the winner is pushed away from the field
+/// until it clears. Pushed toward white it goes pink and toward black it goes
+/// maroon; both still read as the red line, which a line nobody can find does
+/// not.
+fn redder_of(bg: Color32) -> Color32 {
+    const FLOOR: f32 = 2.0;
+    let bright = Color32::from_rgb(0xE8, 0x3A, 0x4E);
+    let deep = Color32::from_rgb(0x8A, 0x10, 0x20);
+    let ratio = |c: Color32| crate::recorder_panel::contrast_ratio(c, bg);
+    let best = if ratio(bright) >= ratio(deep) { bright } else { deep };
+    if ratio(best) >= FLOOR {
+        return best;
+    }
+    let toward = if crate::recorder_panel::wants_light_ink(bg) {
+        Color32::WHITE
+    } else {
+        Color32::BLACK
+    };
+    let mut out = best;
+    for step in 1u8..=40 {
+        out = blend(best, toward, f32::from(step) * 0.025_f32);
+        if ratio(out) >= FLOOR {
+            break;
+        }
+    }
+    out
+}
+
+/// Scale a colour's brightness, keeping its hue. Above 1.0 lifts toward
+/// white rather than clipping, so a near-black well can still be lifted.
+fn shade(c: Color32, k: f32) -> Color32 {
+    if k <= 1.0 {
+        let f = |v: u8| (f32::from(v) * k).clamp(0.0, 255.0) as u8;
+        return Color32::from_rgb(f(c.r()), f(c.g()), f(c.b()));
+    }
+    // Lifting: add a fraction of the headroom, so hue survives and nothing
+    // saturates to grey.
+    let t = (k - 1.0).min(1.0);
+    let f = |v: u8| {
+        let v = f32::from(v);
+        (v + (255.0 - v) * t * 0.28).clamp(0.0, 255.0) as u8
+    };
+    Color32::from_rgb(f(c.r()), f(c.g()), f(c.b()))
+}
+
+/// `t` of the way from `a` to `b`.
+fn blend(a: Color32, b: Color32, t: f32) -> Color32 {
+    let f = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t) as u8;
+    Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
 }
 
 /// What the grid box SAYS: bars as a power of two — "8", "1", "1/16".
@@ -1884,6 +1989,8 @@ mod tests {
 
     fn a_view<'a>(clips: &'a [ClipView<'a>]) -> ArrangeView<'a> {
         ArrangeView {
+            fx_strip: (0xE3, 0xD9, 0xBD),
+            meter_bg: (0x0B, 0x0E, 0x0A),
             header_w: None,
             naming: None,
             time_sel: None,
@@ -1916,6 +2023,80 @@ mod tests {
 
     /// The time mapping round-trips, which is what keeps a clip drawn where
     /// it is grabbed.
+
+    /// **The arrangement wears the THEME, in both modes, legibly.**
+    ///
+    /// It used to carry two hard-coded wardrobes no theme could reach — warm
+    /// browns for dark, greys for light — so it was the one view that stayed
+    /// put while the rest of the app changed. Now every surface derives from
+    /// the band's wood, the strip face and the well, and this is what keeps
+    /// the derivation honest across all sixteen.
+    #[test]
+    fn every_theme_dresses_the_arrangement_legibly_in_both_modes() {
+        let mut bad: Vec<String> = Vec::new();
+        for theme in crate::theme::factory() {
+            for dark in [false, true] {
+                let mut set = crate::settings::Settings::default();
+                theme.apply(&mut set);
+                let clips: Vec<ClipView<'_>> = Vec::new();
+                let mut v = a_view(&clips);
+                v.dark_mode = dark;
+                v.wood = (
+                    set.recorder_bg_color.r,
+                    set.recorder_bg_color.g,
+                    set.recorder_bg_color.b,
+                );
+                v.fx_strip = (
+                    set.fx_strip_color.r,
+                    set.fx_strip_color.g,
+                    set.fx_strip_color.b,
+                );
+                v.meter_bg = (
+                    set.meter_bg_color.r,
+                    set.meter_bg_color.g,
+                    set.meter_bg_color.b,
+                );
+                let p = ink(&v);
+                let mode = if dark { "dark" } else { "light" };
+                let mut check = |what: &str, fg: Color32, bg: Color32, floor: f32| {
+                    let r = crate::recorder_panel::contrast_ratio(fg, bg);
+                    if r < floor {
+                        bad.push(format!("{} {mode}: {what} {r:.2}:1", theme.name));
+                    }
+                };
+                // Words have to be readable; structure only has to be seen.
+                check("header text", p.engrave, p.hdr_face, 4.5);
+                // **The clip ink is checked against the CLIP**, which is the
+                // only thing it is ever drawn on — the note miniatures and
+                // the fade lines both sit inside a clip's own rect. Measuring
+                // it against the lane behind was measuring a pairing that
+                // never happens, and Sandstone failed it for no reason.
+                let pal = &crate::mixer_panel::PALETTES
+                    [set.palette_choice.rem_euclid(
+                        crate::mixer_panel::PALETTES.len() as i64,
+                    ) as usize];
+                for ch in 0..crate::recorder::CHANNELS {
+                    let (r, g, b) =
+                        crate::mixer_panel::STRIP_COLORS[pal.slot(ch)];
+                    check(
+                        "clip ink on a clip",
+                        p.clip_ink,
+                        Color32::from_rgb(r, g, b),
+                        4.5,
+                    );
+                }
+                check("grid on lane", p.grid, p.lane, 1.12);
+                check("seam on lane", p.seam, p.lane, 1.25);
+                check("lane stripe", p.lane_alt, p.lane, 1.03);
+                check("playhead", p.playhead, p.lane, 1.6);
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "the arrangement does not hold up:\n  {}",
+            bad.join("\n  ")
+        );
+    }
     #[test]
     fn the_time_axis_round_trips() {
         let c = clips();
