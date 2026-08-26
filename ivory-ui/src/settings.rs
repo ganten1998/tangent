@@ -1301,16 +1301,13 @@ impl Default for Settings {
             metronome_gain: 0.5,
             master_gain: 1.0,
             track_gain: 1.0,
-            strip_colors: {
-                // **The one that is not an instrument comes coloured.** The
-                // click is neither a channel nor the master, and a colour
-                // says so before the label is read. (BACKING shipped violet
-                // here until its strip retired with the arrangement.)
-                let mut c = [0; crate::recorder::STRIPS + 1];
-                c[crate::recorder::Strip::Click.index()] = 8; // amber
-                c[crate::recorder::STRIPS] = crate::mixer_panel::MASTER_COLOR as i64;
-                c
-            },
+            // **Nothing is hand-painted on a fresh desk — not even the click
+            // and the master.** They used to ship holding a literal amber and
+            // a literal red, which `strip_color` cannot tell from a colour
+            // somebody chose, so they sat out every palette and every theme:
+            // sixteen channels would move and those two would not. They are
+            // ZERO now and the palette answers for them; see `Palette::click`.
+            strip_colors: [0; crate::recorder::STRIPS + 1],
             bus_effect: None,
             guitar_intervals: true,
             fx_return_gain: 1.0,
@@ -2071,7 +2068,8 @@ impl Settings {
         }
         take_bool(&mut map, "auto_palette", &mut s.auto_palette);
         if let Some(n) = map.shift_remove("palette_choice").and_then(|v| v.as_i64()) {
-            s.palette_choice = n.clamp(0, 4);
+            s.palette_choice =
+                n.rem_euclid(crate::mixer_panel::PALETTES.len() as i64);
         }
         if let Some(n) = map.shift_remove("drums_gain").and_then(|v| v.as_f64()) {
             if n.is_finite() && (0.0..=MAX_GAIN).contains(&n) {
@@ -2350,6 +2348,28 @@ impl Settings {
 
         for (i, n) in desk.colors.iter().take(crate::recorder::STRIPS + 1).enumerate() {
             self.strip_colors[i] = *n;
+        }
+        // **The click and the master rejoin the palette.** Both used to SHIP
+        // hand-painted — amber and red — so every desk ever saved carries a
+        // colour in those two slots that nobody picked, and `strip_color`
+        // reads any non-zero slot as a deliberate choice. Left alone they
+        // would be the only two strips a theme could never move, which is
+        // exactly what the owner saw. Recognised by their old default value
+        // and only there: a click somebody really did paint amber is a click
+        // that stays amber.
+        for (slot, legacy) in [
+            (
+                crate::recorder::Strip::Click.index(),
+                crate::mixer_panel::LEGACY_CLICK_COLOR,
+            ),
+            (
+                crate::recorder::STRIPS,
+                crate::mixer_panel::LEGACY_MASTER_COLOR,
+            ),
+        ] {
+            if self.strip_colors[slot] == legacy {
+                self.strip_colors[slot] = 0;
+            }
         }
         for (i, n) in desk.sends.iter().take(crate::recorder::STRIPS).enumerate() {
             self.strip_sends[i] = *n;
@@ -3659,10 +3679,13 @@ mod tests {
             2,
             "the input's channel does not know it is audio"
         );
+        // The master lands in the LAST slot — which is what this is really
+        // checking. Its colour comes back auto rather than the old red: it
+        // was holding that red because it SHIPPED holding it, never because
+        // anybody chose it, so it rejoins the palette on load.
         assert_eq!(
-            s.strip_colors[crate::recorder::STRIPS] as usize,
-            crate::mixer_panel::PALETTE_V1_TO_V2[1],
-            "the master is not last any more"
+            s.strip_colors[crate::recorder::STRIPS], 0,
+            "the master did not rejoin the palette"
         );
         assert!(
             (s.strip_sends[Strip::Fx.index()] - 0.5).abs() < 1.0e-9,
@@ -3725,15 +3748,18 @@ mod tests {
         );
         let s = Settings::from_json(&json);
         assert_eq!(s.strip_colors[3], 14, "a channel's paint moved");
+        // Both of these SHIPPED painted, so both rejoin the palette — see
+        // the click/master normalisation in `adopt_desk`. The channel check
+        // above is what holds the retirement shuffle honest.
         assert_eq!(
             s.strip_colors[Strip::Click.index()],
-            8,
-            "the click lost its amber"
+            0,
+            "the click did not rejoin the palette"
         );
         assert_eq!(
             s.strip_colors[crate::recorder::STRIPS],
-            5,
-            "the master lost its red"
+            0,
+            "the master did not rejoin the palette"
         );
         assert!(!s.strip_colors.contains(&23), "BACKING's violet leaked");
         assert!((s.strip_sends[0] - 1.0).abs() < 1e-9);
@@ -3812,9 +3838,12 @@ mod tests {
         assert_eq!(s.strip_soloed, 1 << 2, "a solo below the widening moved");
         // The specials rode up to the 16-channel positions.
         assert_eq!(s.strip_colors[Strip::Drums.index()], 9, "the drum bus");
-        assert_eq!(s.strip_colors[Strip::Click.index()], 8, "the click");
         assert_eq!(s.strip_colors[Strip::Fx.index()], 3, "the fx return");
-        assert_eq!(s.strip_colors[STRIPS], 5, "the master lost its red");
+        // The click and the master ride up to their new positions like every
+        // other strip, then rejoin the palette because the colours they were
+        // carrying were defaults rather than choices.
+        assert_eq!(s.strip_colors[Strip::Click.index()], 0, "the click");
+        assert_eq!(s.strip_colors[STRIPS], 0, "the master");
         assert_eq!(s.strip_muted, 1 << Strip::Click.index(), "the muted click drifted");
         assert!((s.strip_sends[Strip::Fx.index()] - 0.9).abs() < 1e-9, "the fx send");
         assert_eq!(s.strip_names[Strip::Drums.index()], "DRUMS");
@@ -3834,6 +3863,48 @@ mod tests {
         assert!(!v19.desk_state_shift_v19, "a v19 file must not re-trigger the shift");
     }
 
+    /// **A default is not a choice, but a choice is.**
+    ///
+    /// The click and the master shipped hand-painted — amber and red — and
+    /// `strip_color` cannot tell a shipped colour from a chosen one, so those
+    /// two strips sat out every palette and every theme while the sixteen
+    /// channels moved around them. They are released on load. What must NOT
+    /// happen is releasing a colour somebody really did pick, so the release
+    /// is keyed to the exact legacy value and nothing else.
+    #[test]
+    fn the_click_and_master_rejoin_the_palette_unless_they_were_really_painted() {
+        use crate::mixer_panel::{LEGACY_CLICK_COLOR, LEGACY_MASTER_COLOR};
+        use crate::recorder::{Strip, STRIPS};
+
+        let mut colors = vec![0i64; STRIPS + 1];
+        colors[Strip::Click.index()] = LEGACY_CLICK_COLOR;
+        colors[STRIPS] = LEGACY_MASTER_COLOR;
+        let shipped = Settings::from_json(&format!(
+            r#"{{"settings_version": 19, "strip_colors_v2": {colors:?}}}"#
+        ));
+        assert_eq!(shipped.strip_colors[Strip::Click.index()], 0, "the click held on");
+        assert_eq!(shipped.strip_colors[STRIPS], 0, "the master held on");
+
+        // A desk where somebody went and painted them something else keeps
+        // exactly what they painted.
+        let mut colors = vec![0i64; STRIPS + 1];
+        colors[Strip::Click.index()] = 17; // a teal click, chosen
+        colors[STRIPS] = 23; // a violet master, chosen
+        let painted = Settings::from_json(&format!(
+            r#"{{"settings_version": 19, "strip_colors_v2": {colors:?}}}"#
+        ));
+        assert_eq!(
+            painted.strip_colors[Strip::Click.index()],
+            17,
+            "a click somebody painted teal was taken away from them"
+        );
+        assert_eq!(
+            painted.strip_colors[STRIPS],
+            23,
+            "a master somebody painted violet was taken away from them"
+        );
+    }
+
     /// **A palette is a set of indices somebody has already saved.**
     ///
     /// Growing the table from eight colours to twenty-seven renumbered every
@@ -3848,16 +3919,23 @@ mod tests {
         // The old defaults: 4 was teal and 6 was violet.
         let old = Settings::from_json(r#"{"strip_colors": [0, 0, 0, 0, 0, 4, 6, 0, 0, 1]}"#);
         let teal = old.strip_colors[Strip::Channel(0).index()] as usize;
-        let red = old.strip_colors[crate::recorder::STRIPS] as usize;
         assert_eq!(teal, PALETTE_V1_TO_V2[4], "the microphone changed colour");
-        assert_eq!(red, PALETTE_V1_TO_V2[1], "the master changed colour");
-        // And they are still a teal and a red, not merely different numbers.
-        // (The violet at old index 6 was the BACKING track's, whose strip
-        // v13 retired — its colour goes with it.)
+        // And it is still a teal, not merely a different number. (The violet
+        // at old index 6 was the BACKING track's, whose strip v13 retired —
+        // its colour goes with it.)
         let (r, g, b) = STRIP_COLORS[teal];
         assert!(b > r && g > r, "index {teal} is not a teal: {r:02X}{g:02X}{b:02X}");
-        let (r, g, b) = STRIP_COLORS[red];
-        assert!(r > g && r > b, "index {red} is not a red: {r:02X}{g:02X}{b:02X}");
+        // The MASTER is the one exception to "a saved index keeps its
+        // colour", and deliberately: old index 1 was the master's own
+        // shipped default, so every desk ever saved carries it whether or not
+        // anybody chose it. It comes back auto and the palette dresses it —
+        // still a red, which is the part that actually mattered.
+        assert_eq!(
+            old.strip_colors[crate::recorder::STRIPS], 0,
+            "the master did not rejoin the palette"
+        );
+        let (r, g, b) = STRIP_COLORS[crate::mixer_panel::MASTER_COLOR];
+        assert!(r > g && r > b, "the master is not a red: {r:02X}{g:02X}{b:02X}");
 
         // A file already written by this build is taken at face value.
         let new = Settings::from_json(r#"{"strip_colors_v2": [0, 0, 0, 0, 0, 26, 0, 0, 0, 5]}"#);
@@ -4872,9 +4950,11 @@ mod tests {
             "something leaked into the master's second bay"
         );
 
-        // The click got its seeded amber, because a stored zero is not a
-        // choice for a column that never existed.
-        assert_eq!(s.strip_colors[Strip::Click.index()], 8);
+        // The click comes up AUTO. A stored zero is not a choice for a column
+        // that never existed — and it no longer has to be, because the click
+        // is dressed by whichever palette is in force rather than by a colour
+        // baked into the defaults.
+        assert_eq!(s.strip_colors[Strip::Click.index()], 0);
     }
 
     /// A v11 desk that never loaded a VST keeps making a sound: the DX7 is

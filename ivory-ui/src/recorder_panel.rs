@@ -161,8 +161,8 @@ struct Palette {
 }
 
 /// The two inks the band can wear.
-const INK_LIGHT: Color32 = Color32::from_rgb(0xE8, 0xDC, 0xC0);
-const INK_DARK: Color32 = Color32::from_rgb(0x1a, 0x1a, 0x1a);
+pub const INK_LIGHT: Color32 = Color32::from_rgb(0xE8, 0xDC, 0xC0);
+pub const INK_DARK: Color32 = Color32::from_rgb(0x1a, 0x1a, 0x1a);
 
 /// Relative luminance, sRGB, as WCAG defines it.
 fn luminance(c: Color32) -> f32 {
