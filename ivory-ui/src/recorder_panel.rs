@@ -205,6 +205,46 @@ pub fn contrast_ratio(a: Color32, b: Color32) -> f32 {
 /// **Shared with the mixer**, which faces the same question about its strip
 /// faces: what is printed on a surface has to answer to how light it is, and
 /// there must be one answer rather than two that can drift apart.
+/// The nearest shade of `c` that can actually CARRY its own ink at 4.5:1.
+///
+/// **There is a dead zone**, and a derived surface lands in it sooner or
+/// later. Between roughly 0.12 and 0.22 relative luminance neither the ivory
+/// nor the near-black clears 4.5:1 — a mid tone is equally far from both — so
+/// a panel derived from a pale theme's roles can come out a colour that
+/// nothing can be written on. Rather than let the ink lose, the SURFACE moves:
+/// away from whichever ink is already winning, by the least it takes.
+///
+/// Returns `c` untouched whenever `c` was fine, which is almost always.
+pub fn legible_surface(c: Color32) -> Color32 {
+    let light = contrast_ratio(c, INK_LIGHT);
+    let dark = contrast_ratio(c, INK_DARK);
+    if light.max(dark) >= 4.5 {
+        return c;
+    }
+    // Commit to the ink that is closer, and move the ground away from it.
+    let (ink, toward) = if light > dark {
+        (INK_LIGHT, Color32::BLACK)
+    } else {
+        (INK_DARK, Color32::WHITE)
+    };
+    let mut out = c;
+    for step in 1u8..=50 {
+        let t = f32::from(step) * 0.02_f32;
+        let f = |x: u8, y: u8| {
+            (f32::from(x) + (f32::from(y) - f32::from(x)) * t) as u8
+        };
+        out = Color32::from_rgb(
+            f(c.r(), toward.r()),
+            f(c.g(), toward.g()),
+            f(c.b(), toward.b()),
+        );
+        if contrast_ratio(out, ink) >= 4.6 {
+            break;
+        }
+    }
+    out
+}
+
 pub fn wants_light_ink(c: Color32) -> bool {
     contrast_ratio(c, INK_LIGHT) > contrast_ratio(c, INK_DARK)
 }

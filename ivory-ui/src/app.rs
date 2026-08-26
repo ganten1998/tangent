@@ -7448,6 +7448,14 @@ impl IvoryApp {
     ) -> crate::midi_editor::MidiEditView<'a> {
         let sig = self.time_signature();
         crate::midi_editor::MidiEditView {
+            fx_strip: {
+                let c = self.settings.fx_strip_color;
+                (c.r, c.g, c.b)
+            },
+            meter_bg: {
+                let c = self.settings.meter_bg_color;
+                (c.r, c.g, c.b)
+            },
             name: &clip.name,
             clip_start_s: clip.start_s,
             clip_len_s: clip.len_s,
@@ -10906,6 +10914,14 @@ impl IvoryApp {
             dark_mode: self.settings.arr_dark,
             wood: {
                 let c = self.settings.recorder_bg_color;
+                (c.r, c.g, c.b)
+            },
+            fx_strip: {
+                let c = self.settings.fx_strip_color;
+                (c.r, c.g, c.b)
+            },
+            meter_bg: {
+                let c = self.settings.meter_bg_color;
                 (c.r, c.g, c.b)
             },
         }
@@ -19914,8 +19930,13 @@ mod tests {
     fn the_empty_slot_borders_are_painted_over_nothing() {
         let (ctx, mut app) = headless(Caps::DESKTOP);
         let expected = {
-            // The dark wardrobe's face ink at the border's own fade.
-            egui::Color32::from_rgb(0xE8, 0xDC, 0xC0).gamma_multiply(0.35)
+            // The border is the arrangement's FACE at its own fade. That face
+            // is a theme role now (`fx_strip`) rather than a fixed wardrobe
+            // colour, so it is read from the settings the app is wearing —
+            // hard-coding it here made this test a second, silent opinion
+            // about what the arrangement is painted with.
+            let c = app.settings.fx_strip_color;
+            egui::Color32::from_rgb(c.r, c.g, c.b).gamma_multiply(0.35)
         };
         let raw = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1300.0, 800.0))),

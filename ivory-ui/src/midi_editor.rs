@@ -71,6 +71,11 @@ pub struct MidiEditView<'a> {
     pub color: usize,
     /// The editor's own DARK flag: warm browns on, the arrange greys off.
     pub dark: bool,
+    /// The strip face and the well, the same two roles the arrangement
+    /// derives from — so the editor that opens over the lanes is dressed by
+    /// the same theme rather than by its own private wardrobe.
+    pub fx_strip: (u8, u8, u8),
+    pub meter_bg: (u8, u8, u8),
     /// On the DRUM LANE: the sixteen pads' sample names, keyed 36..=51 —
     /// written on the keys, because a kit whose keys are anonymous is not
     /// an instrument. `None` everywhere else.
@@ -371,9 +376,22 @@ pub fn grid_word(view: &MidiEditView<'_>) -> String {
 
 // ── drawing ────────────────────────────────────────────────────────────────
 
-const FACE: Color32 = Color32::from_rgb(0x2A, 0x26, 0x21);
-const FACE_ROW_DARK: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 60);
-const INK: Color32 = Color32::from_rgb(0xFF, 0xF4, 0xE0);
+/// Lift a colour toward white by `t`, keeping its hue — how a near-black
+/// well becomes a panel you can see notes on.
+fn shade_up(c: Color32, t: f32) -> Color32 {
+    let f = |v: u8| {
+        let v = f32::from(v);
+        (v + (255.0 - v) * t).clamp(0.0, 255.0) as u8
+    };
+    Color32::from_rgb(f(c.r()), f(c.g()), f(c.b()))
+}
+
+/// `t` of the way from `a` to `b`.
+fn blend(a: Color32, b: Color32, t: f32) -> Color32 {
+    let f = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t) as u8;
+    Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
+}
+
 const OUTSIDE_VEIL: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 90);
 
 fn is_black(key: u8) -> bool {
@@ -394,13 +412,34 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
     if !l.panel.is_positive() {
         return;
     }
-    // **Two faces, the owner's pair**: dark keeps the editor's shipped
-    // warm browns; light borrows the arrangement's greys, so the two
-    // views share one wardrobe and D swaps it per view.
-    let face = if view.dark {
-        FACE
+    // **DERIVED from the theme, in both modes** — the same three-role rule
+    // the arrangement uses, because the editor opens over the arrangement and
+    // two surfaces that touch should not come from two different wardrobes.
+    // It used to be a fixed pair: warm browns for dark, one grey for light,
+    // neither of which any theme could reach.
+    let strip = Color32::from_rgb(view.fx_strip.0, view.fx_strip.1, view.fx_strip.2);
+    let well = Color32::from_rgb(view.meter_bg.0, view.meter_bg.1, view.meter_bg.2);
+    // Through the dead-zone guard: a pale theme's roles can average to a mid
+    // tone that neither ink can be written on, and the surface is the thing
+    // that should move.
+    let face = crate::recorder_panel::legible_surface(if view.dark {
+        shade_up(well, 0.22)
     } else {
-        Color32::from_rgb(0x46, 0x46, 0x46)
+        blend(well, strip, 0.34)
+    });
+    // The ink the panel can carry, measured — not the bone this was written
+    // with, which is invisible on a pale theme's editor.
+    let ink = if crate::recorder_panel::wants_light_ink(face) {
+        crate::recorder_panel::INK_LIGHT
+    } else {
+        crate::recorder_panel::INK_DARK
+    };
+    let face_row_dark = if crate::recorder_panel::wants_light_ink(face) {
+        Color32::from_rgba_premultiplied(0, 0, 0, 60)
+    } else {
+        // On a pale editor a black wash is a bruise; the darker rows go the
+        // other way and stay a shade of the face.
+        Color32::from_rgba_premultiplied(0, 0, 0, 26)
     };
     // A popup over the arrangement: its own face, a firm border, and a
     // clip so nothing leaks onto the lanes below.
@@ -409,7 +448,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
     painter.rect_stroke(
         l.panel,
         4.0,
-        Stroke::new(1.5, INK.gamma_multiply(0.5)),
+        Stroke::new(1.5, ink.gamma_multiply(0.5)),
         egui::StrokeKind::Inside,
     );
 
@@ -421,19 +460,19 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
         Align2::LEFT_CENTER,
         view.name,
         font(STRIP_H * 0.45),
-        INK,
+        ink,
     );
     let chip = |painter: &Painter, r: Rect, word: &str, lit: bool| {
         if !r.is_positive() {
             return;
         }
         if lit {
-            painter.rect_filled(r, 3.0, INK.gamma_multiply(0.85));
+            painter.rect_filled(r, 3.0, ink.gamma_multiply(0.85));
         }
         painter.rect_stroke(
             r,
             3.0,
-            Stroke::new(1.0, INK.gamma_multiply(if lit { 0.9 } else { 0.4 })),
+            Stroke::new(1.0, ink.gamma_multiply(if lit { 0.9 } else { 0.4 })),
             egui::StrokeKind::Inside,
         );
         painter.text(
@@ -441,7 +480,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
             Align2::CENTER_CENTER,
             word,
             font(r.height() * 0.55),
-            if lit { face } else { INK.gamma_multiply(0.7) },
+            if lit { face } else { ink.gamma_multiply(0.7) },
         );
     };
     chip(painter, l.tool_swing, "SWG", view.swing);
@@ -456,7 +495,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
         for s in [-1.0f32, 1.0] {
             painter.line_segment(
                 [Pos2::new(c.x - a, c.y - a * s), Pos2::new(c.x + a, c.y + a * s)],
-                Stroke::new(1.5, INK.gamma_multiply(0.7)),
+                Stroke::new(1.5, ink.gamma_multiply(0.7)),
             );
         }
     }
@@ -464,7 +503,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
     if l.detach.is_positive() {
         let a = l.detach.width() * 0.26;
         let c = l.detach.center();
-        let ink = INK.gamma_multiply(0.7);
+        let ink = ink.gamma_multiply(0.7);
         painter.rect_stroke(
             Rect::from_min_size(Pos2::new(c.x - a, c.y - a * 0.4), Vec2::splat(a * 1.3)),
             1.0,
@@ -507,7 +546,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
                 if is_black(key) {
                     Color32::from_rgb(0x1A, 0x16, 0x12)
                 } else {
-                    INK.gamma_multiply(0.85)
+                    ink.gamma_multiply(0.85)
                 },
             );
             if key % 12 == 0 && kh >= 7.0 {
@@ -516,7 +555,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
                     Align2::RIGHT_CENTER,
                     format!("C{}", i32::from(key / 12) - 1),
                     font((kh * 0.7).min(10.0)),
-                    if is_black(key) { INK } else { FACE },
+                    if is_black(key) { ink } else { face },
                 );
             }
             // **The kit's own names on its keys** — inverse ink, so a
@@ -531,7 +570,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
                             Align2::LEFT_CENTER,
                             name,
                             font((kh * 0.62).clamp(6.0, 9.5)),
-                            if is_black(key) { INK } else { FACE },
+                            if is_black(key) { ink } else { face },
                         );
                     }
                 }
@@ -539,7 +578,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
         }
         if row_roll.is_positive() {
             if is_black(key) {
-                painter.rect_filled(row_roll, 0.0, FACE_ROW_DARK);
+                painter.rect_filled(row_roll, 0.0, face_row_dark);
             }
             // Every C draws its line: the octave is the roll's ruler.
             if key % 12 == 0 {
@@ -548,14 +587,14 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
                         Pos2::new(row_roll.left(), row_roll.bottom()),
                         Pos2::new(row_roll.right(), row_roll.bottom()),
                     ],
-                    Stroke::new(1.0, INK.gamma_multiply(0.16)),
+                    Stroke::new(1.0, ink.gamma_multiply(0.16)),
                 );
             }
         }
     }
     painter.line_segment(
         [l.keys.right_top(), l.keys.right_bottom()],
-        Stroke::new(1.0, INK.gamma_multiply(0.4)),
+        Stroke::new(1.0, ink.gamma_multiply(0.4)),
     );
 
     // ── the grid ─────────────────────────────────────────────────────────
@@ -569,7 +608,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
             [Pos2::new(x, l.roll.top()), Pos2::new(x, l.roll.bottom())],
             Stroke::new(
                 1.0,
-                INK.gamma_multiply(if is_bar { 0.30 } else { 0.10 }),
+                ink.gamma_multiply(if is_bar { 0.30 } else { 0.10 }),
             ),
         );
     });
@@ -604,7 +643,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
             r,
             2.0,
             if view.selected.binary_search(&i).is_ok() {
-                Stroke::new(2.0, INK)
+                Stroke::new(2.0, ink)
             } else {
                 Stroke::new(1.0, Color32::from_black_alpha(140))
             },
@@ -636,14 +675,14 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
                 if x >= l.roll.left() - 0.5 && x <= l.roll.right() + 0.5 {
                     painter.line_segment(
                         [Pos2::new(x, l.ruler.bottom() - 4.0), Pos2::new(x, l.ruler.bottom())],
-                        Stroke::new(1.0, INK.gamma_multiply(0.6)),
+                        Stroke::new(1.0, ink.gamma_multiply(0.6)),
                     );
                     painter.text(
                         Pos2::new(x + 3.0, l.ruler.top() + 1.0),
                         Align2::LEFT_TOP,
                         format!("{}", n * step + 1),
                         font(9.0),
-                        INK.gamma_multiply(0.55),
+                        ink.gamma_multiply(0.55),
                     );
                 }
                 // **The beats between the numbers, as decimals** — 16, then
@@ -667,14 +706,14 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
                                     Pos2::new(xb, l.ruler.bottom() - 2.5),
                                     Pos2::new(xb, l.ruler.bottom()),
                                 ],
-                                Stroke::new(1.0, INK.gamma_multiply(0.35)),
+                                Stroke::new(1.0, ink.gamma_multiply(0.35)),
                             );
                             painter.text(
                                 Pos2::new(xb + 2.0, l.ruler.top() + 2.5),
                                 Align2::LEFT_TOP,
                                 format!("{}.{}", n + 1, b + 1),
                                 font(7.0),
-                                INK.gamma_multiply(0.38),
+                                ink.gamma_multiply(0.38),
                             );
                         }
                     }
@@ -702,7 +741,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
                     Pos2::new(x + 1.5, l.vel.bottom()),
                 ),
                 0.5,
-                if selected { INK } else { color },
+                if selected { ink } else { color },
             );
         }
     }
@@ -713,7 +752,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
         painter.rect_stroke(
             r,
             0.0,
-            Stroke::new(1.0, INK.gamma_multiply(0.8)),
+            Stroke::new(1.0, ink.gamma_multiply(0.8)),
             egui::StrokeKind::Inside,
         );
         // UNmultiplied — the premultiplied form with RGB far above the
@@ -832,6 +871,8 @@ mod tests {
 
     fn view<'a>(notes: &'a [ArrNote]) -> MidiEditView<'a> {
         MidiEditView {
+            fx_strip: (0xE3, 0xD9, 0xBD),
+            meter_bg: (0x0B, 0x0E, 0x0A),
             name: "MIDI",
             clip_start_s: 8.0,
             clip_len_s: 16.0,
@@ -863,6 +904,45 @@ mod tests {
     }
 
     /// The axes are inverses, and the vertical one puts higher pitch higher.
+
+    /// **The editor wears the theme, in both modes, legibly.**
+    ///
+    /// It carried a fixed pair — warm browns dark, one grey light — that no
+    /// theme could reach, so it was the second view that stayed put while the
+    /// rest of the app changed. The panel now derives from the same two roles
+    /// the arrangement does; this keeps that derivation honest.
+    #[test]
+    fn every_theme_dresses_the_editor_legibly_in_both_modes() {
+        let mut bad: Vec<String> = Vec::new();
+        for theme in crate::theme::factory() {
+            for dark in [false, true] {
+                let mut set = crate::settings::Settings::default();
+                theme.apply(&mut set);
+                let strip = set.fx_strip_color.to_color32();
+                let well = set.meter_bg_color.to_color32();
+                let face = crate::recorder_panel::legible_surface(if dark {
+                    shade_up(well, 0.22)
+                } else {
+                    blend(well, strip, 0.34)
+                });
+                let ink = if crate::recorder_panel::wants_light_ink(face) {
+                    crate::recorder_panel::INK_LIGHT
+                } else {
+                    crate::recorder_panel::INK_DARK
+                };
+                let r = crate::recorder_panel::contrast_ratio(ink, face);
+                if r < 4.5 {
+                    bad.push(format!(
+                        "{} {}: editor ink {r:.2}:1",
+                        theme.name,
+                        if dark { "dark" } else { "light" }
+                    ));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "the editor does not hold up:\n  {}", bad.join("\n  "));
+    }
+
     #[test]
     fn the_axes_round_trip_and_pitch_rises() {
         let n: [ArrNote; 0] = [];
