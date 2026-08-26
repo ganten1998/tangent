@@ -51,6 +51,8 @@ pub struct LaneView<'a> {
     pub stereo: bool,
     /// The three bays' short names — empty for an empty slot.
     pub inserts: [&'a str; crate::recorder::INSERTS],
+    /// How many routes leave this lane, for the ROUTING chip.
+    pub route_count: usize,
     pub muted: bool,
     pub soloed: bool,
     /// Linear, as the mixer fader sits. The header knob is the same value.
@@ -141,6 +143,8 @@ pub enum Hit {
     HdrNumber(usize),
     /// One of a track's three insert BAYS — the mixer's own door, here.
     HdrBay(usize, usize),
+    /// The Routing button under a lane's dials: open the routing window.
+    HdrRouting(usize),
     /// The R dot on a lane's header.
     Arm(usize),
     Mute(usize),
@@ -260,6 +264,8 @@ pub struct HeaderRow {
     pub input: Rect,
     /// The three insert BAYS — the mixer's slots, reachable from here.
     pub bays: [Rect; crate::recorder::INSERTS],
+    /// The Routing button, under the dials. `NOTHING` where they are.
+    pub routing: Rect,
     /// The circled plus, on empty lanes alone.
     pub add: Rect,
 }
@@ -273,6 +279,7 @@ impl HeaderRow {
         knob: Rect::NOTHING,
         send: Rect::NOTHING,
         knob_readout: Rect::NOTHING,
+        routing: Rect::NOTHING,
         send_readout: Rect::NOTHING,
         pan: Rect::NOTHING,
         pan_readout: Rect::NOTHING,
@@ -511,6 +518,20 @@ impl Layout {
         } else {
             (Rect::NOTHING, Rect::NOTHING, Rect::NOTHING)
         };
+        // **ROUTING sits under the dials** — the owner's placement. It goes
+        // with the dials rather than with the name column because it is the
+        // same kind of thing they are: what this lane DOES with its signal,
+        // not what it is called. So it shares their fate on a narrow header
+        // and their room on a short one: no dials, no button, and no button
+        // when the space under them would make it a sliver to aim at.
+        let routing = if dials_fit && r.bottom() - (dial_top + kd) >= 11.0 {
+            Rect::from_min_max(
+                Pos2::new(pan.left(), dial_top + kd + 2.0),
+                Pos2::new(send.right(), (dial_top + kd + 13.0).min(r.bottom() - 1.0)),
+            )
+        } else {
+            Rect::NOTHING
+        };
         // **Top-down: LABEL, then INPUT, then the THREE BAYS** — the
         // owner's order. Each row takes the column's whole width, so the
         // input strip and the slots are both WIDER; a short window trades
@@ -570,6 +591,7 @@ impl Layout {
             solo,
             input,
             bays,
+            routing,
             add: Rect::NOTHING,
         }
     }
@@ -718,6 +740,9 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
             if r.is_positive() && r.contains(pos) {
                 return Some(Hit::HdrBay(i, b));
             }
+        }
+        if row.routing.is_positive() && row.routing.contains(pos) {
+            return Some(Hit::HdrRouting(i));
         }
     }
     if l.ruler.is_positive() && l.ruler.contains(pos) {
@@ -1417,6 +1442,18 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 !bay_word.is_empty(),
             );
         }
+        // ROUTING, under the dials: the same door the mixer's button opens,
+        // wearing the same chip the bays do so the header reads as one row
+        // of pressable things rather than two idioms.
+        if row.routing.is_positive() {
+            let n = lane.route_count;
+            let word = if n > 0 {
+                format!("ROUTING {n}")
+            } else {
+                "ROUTING".to_owned()
+            };
+            chip(painter, row.routing, &word, n > 0);
+        }
         // The two dials: VOLUME (the mixer fader as a dial) and SEND, each
         // with its number under it — a dial this small needs the readout to
         // be a control you can trust.
@@ -1751,6 +1788,7 @@ mod tests {
 
     fn a_lane(used: bool) -> LaneView<'static> {
         LaneView {
+            route_count: 0,
             stereo: true,
             inserts: [""; crate::recorder::INSERTS],
             name: "KEYS",
