@@ -3462,6 +3462,18 @@ impl Renderer {
                 );
             }
             let mut room = room_from;
+            // **A LIVE INPUT is on the lane too, and it routes with it.**
+            // The routed-away gate was put on the clip, pad and instrument
+            // folds and missed this one, so a channel with an input open went
+            // straight to the master here AND was gathered out of the stem
+            // below and folded in again through its destination: the owner's
+            // "100 percent a volume jump on a send added". Every path a lane
+            // reaches the master by has to answer to the same switch.
+            let direct = self
+                .route_direct
+                .get(strip.index())
+                .copied()
+                .unwrap_or(1.0);
             for i in 0..n {
                 // The room's own slew, advanced here rather than above: it
                 // moves once per frame however many inputs are open, and
@@ -3477,7 +3489,7 @@ impl Renderer {
                         * if c == 0 { pan_l } else { pan_r };
                     peak[c.min(1)] = peak[c.min(1)].max(src.abs());
                     if let Some(v) = self.mix.get_mut(at + c) {
-                        *v += src;
+                        *v += src * direct;
                     }
                     // The stem tap hears the lane's LIVE input too — a
                     // bounced stem is everything the lane put on the bus.
@@ -8781,6 +8793,63 @@ mod tests {
         assert!(
             routed.abs() < plain.abs() * 1.5,
             "the channel is still being heard twice: {routed} against {plain}"
+        );
+    }
+
+    /// **A LIVE INPUT routes with its lane, like everything else on it.**
+    ///
+    /// The routed-away gate went on the clip, pad and instrument folds and
+    /// missed the monitor, so a channel with an input open reached the master
+    /// twice: once straight out of `mix_monitor`, and once more gathered out
+    /// of the stem and folded in through its destination. The owner heard it
+    /// immediately — "100 percent a volume jump on a send added" — because a
+    /// live input is exactly what somebody testing a send has open.
+    #[test]
+    fn a_live_input_does_not_double_when_its_lane_is_routed() {
+        const BLOCK: usize = 128;
+        let feed = |route: bool| {
+            let shared = Arc::new(Shared::new());
+            let (tap_tx, _tap_rx) = RingBuffer::<f32>::new(1 << 16);
+            let mut r = test_renderer(Arc::clone(&shared), tap_tx, 2);
+            let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 15);
+            r.monitor = Some(in_rx);
+            r.monitor_channels = 1;
+            r.monitor_widths = [1, 0, 0, 0];
+            r.monitor_block = BLOCK;
+            r.monitor_scratch = vec![0.0; 8192];
+            shared.pick_strip[0].store(1, Ordering::Relaxed);
+            shared.midi_off.store(1 << 1, Ordering::Relaxed);
+            shared.channel_gains[1].store(1.0f32.to_bits(), Ordering::Relaxed);
+            r.channel_gain[1] = 1.0;
+            shared.monitor_on.store(true, Ordering::Relaxed);
+            r.room_gain = 1.0;
+            if route {
+                // Channel 1 -> channel 5, at unity, through an empty rack.
+                shared.routes[0].store(pack_route(1, 5, false, false), Ordering::Relaxed);
+                shared.route_gain[0].store(1.0f32.to_bits(), Ordering::Relaxed);
+                shared.route_count.store(1, Ordering::Release);
+                shared.channel_gains[5].store(1.0f32.to_bits(), Ordering::Relaxed);
+                r.lane_gain[5] = 1.0;
+            }
+            let mut out = vec![0.0f32; BLOCK * 2];
+            let mut heard = 0.0f32;
+            for _ in 0..4 {
+                for _ in 0..BLOCK {
+                    let _ = in_tx.push(0.5);
+                }
+                out.fill(0.0);
+                r.render(&mut out, 0, 0);
+                heard = out.iter().fold(0.0f32, |a, s| a.max(s.abs()));
+            }
+            heard
+        };
+        let plain = feed(false);
+        let routed = feed(true);
+        assert!(plain > 1.0e-4, "the input was never heard unrouted: {plain}");
+        assert!(routed > 1.0e-4, "the route swallowed the input: {routed}");
+        assert!(
+            routed < plain * 1.5,
+            "the live input is being heard twice: {routed} routed against {plain}"
         );
     }
 

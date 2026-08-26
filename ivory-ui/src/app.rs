@@ -478,6 +478,18 @@ pub struct IvoryApp {
     clipboard_stamp: Option<String>,
     /// The gesture in flight on the arrangement, if any.
     arr_drag: Option<ArrDrag>,
+    /// Where a dropped file would land — lane and seconds — tracked WHILE it
+    /// hovers rather than read on the frame it lands.
+    ///
+    /// **An OS drag produces no ordinary pointer events**, so `hover_pos` is
+    /// routinely None on exactly the frame `dropped_files` arrives, and the
+    /// fallback was lane ZERO. Lane zero is the DX7, a MIDI lane: a `.mid`
+    /// landed there and appeared to work (on the wrong lane), and an audio
+    /// file landed there and was REFUSED, because a MIDI lane cannot take
+    /// audio. That is the whole of "drag import only works for MIDI".
+    arr_drop: Option<(usize, f64)>,
+    /// Files are over the window right now: the lane under them lights.
+    arr_drop_hover: bool,
     /// A clip edit happened during the current gesture: save on release.
     arr_gesture_dirty: bool,
     /// The MIDI item being drawn by shift-drag: lane, from, to (ordered).
@@ -1439,6 +1451,8 @@ impl IvoryApp {
             clip_clipboard: Vec::new(),
             clipboard_stamp: None,
             arr_drag: None,
+            arr_drop: None,
+            arr_drop_hover: false,
             arr_gesture_dirty: false,
             arr_pending: None,
             arrangement_rect: None,
@@ -10670,6 +10684,34 @@ impl IvoryApp {
         }
 
         // ── files dropped from the outside world ──────────────────────────
+        //
+        // **Where it would land is worked out WHILE it hovers.** See
+        // `arr_drop`: the pointer is not there to ask on the frame the drop
+        // arrives, and guessing lane zero is what made audio import look
+        // broken while MIDI looked merely wrong.
+        let landing_now = |me: &Self, p: Pos2| -> (usize, f64) {
+            let clips = me.arr_clip_views();
+            let view = me.arrange_view(&clips);
+            let l = crate::arrangement_panel::Layout::new(rect, &view);
+            let lane = l
+                .lane_rows
+                .iter()
+                .position(|r| r.is_positive() && r.contains(p))
+                .unwrap_or_else(|| me.selected_channel.unwrap_or(0));
+            (lane, crate::arrangement_panel::time_at(rect, &view, p.x).max(0.0))
+        };
+        self.arr_drop_hover = ctx.input(|i| !i.raw.hovered_files.is_empty());
+        if self.arr_drop_hover {
+            // `latest_pos` as well as `hover_pos`: the cursor can be counted
+            // as having left the window during an OS drag, and the last place
+            // it was seen is still the right answer.
+            let at = ctx
+                .input(|i| i.pointer.hover_pos().or_else(|| i.pointer.latest_pos()))
+                .filter(|p| rect.contains(*p));
+            if let Some(p) = at {
+                self.arr_drop = Some(landing_now(self, p));
+            }
+        }
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         // A drop inside the floating drumpad is the drumpad's own — its
         // input took it this frame — and must not ALSO land on a lane. Its
@@ -10681,39 +10723,28 @@ impl IvoryApp {
                 .zip(self.drumpad_rect)
                 .is_some_and(|(p, r)| r.contains(p));
         if !dropped.is_empty() && !pad_claims {
-            let at = drop_pos.filter(|p| rect.contains(*p));
-            let (lane, t) = match at {
-                Some(p) => {
-                    let clips = self.arr_clip_views();
-                    let view = self.arrange_view(&clips);
-                    let l = crate::arrangement_panel::Layout::new(rect, &view);
-                    let lane = l
-                        .lane_rows
-                        .iter()
-                        .position(|r| r.is_positive() && r.contains(p))
-                        .unwrap_or(0);
-                    (lane, crate::arrangement_panel::time_at(rect, &view, p.x).max(0.0))
-                }
-                None => (0, 0.0),
-            };
-            for file in dropped {
-                let Some(path) = file.path else { continue };
-                let is_midi = path
-                    .extension()
-                    .is_some_and(|e| {
-                        let e = e.to_ascii_lowercase();
-                        e == "mid" || e == "midi" || e == "smf"
-                    });
-                // The refusal is the import's own; one sentence into the
-                // status line, cleared by the next successful reload.
-                let landed = if is_midi {
-                    self.import_midi_at(&path, lane, t)
-                } else {
-                    self.import_audio_at(&path, lane, t)
-                };
-                if let Err(e) = landed {
-                    self.track.error = e;
-                }
+            // The pointer if it is there, and what the hover worked out if it
+            // is not. Only if BOTH are missing does anything get guessed.
+            let (lane, t) = drop_pos
+                .filter(|p| rect.contains(*p))
+                .map(|p| landing_now(self, p))
+                .or(self.arr_drop)
+                .unwrap_or_else(|| (self.selected_channel.unwrap_or(0), 0.0));
+            self.arr_drop = None;
+            // **The lane under the pointer is now the SELECTED one.** The
+            // owner asked for the track being dropped onto to select, and it
+            // is also what makes the next gesture land where the eye is.
+            self.selected_channel = Some(lane);
+            // **Through the same fan-out the menu uses.** Dropping four
+            // stems at once used to stack all four on the lane under the
+            // pointer, at the same instant, which is not a thing anybody
+            // wants and is invisible until you move the top one.
+            let paths: Vec<std::path::PathBuf> =
+                dropped.into_iter().filter_map(|f| f.path).collect();
+            // The refusal is the import's own; one sentence into the status
+            // line, cleared by the next successful reload.
+            if let Some(e) = self.insert_media_files(lane, &paths, t).into_iter().next() {
+                self.track.error = e;
             }
         }
     }
@@ -10849,6 +10880,7 @@ impl IvoryApp {
             metronome_on: self.settings.metronome_on,
             snap_on: self.settings.arr_snap,
             grip_lit: self.arr_grip_lit,
+            drop_lane: self.arr_drop_hover.then(|| self.arr_drop.map(|(l, _)| l)).flatten(),
             grid_exp: self.settings.arr_grid_exp as i8,
             pending: self.arr_pending,
             view_start_s,
@@ -10969,7 +11001,7 @@ impl IvoryApp {
             .routes
             .from(channel)
             .into_iter()
-            .map(|(at, r)| (at, r.target.label()))
+            .map(|(at, r)| (at, r.target.label(), r.gain))
             .collect();
         dialogs::Dialog::Routing {
             channel,
@@ -11167,6 +11199,68 @@ impl IvoryApp {
         // The patch index belonged to the cartridge that was there before.
         self.settings.dx7_patch = 0;
         self.save_settings();
+    }
+
+
+    /// Whether a path names a MIDI file rather than audio. One spelling, so
+    /// the drop and the menu can never disagree about what a `.mid` is.
+    pub fn is_midi_path(path: &std::path::Path) -> bool {
+        path.extension().is_some_and(|e| {
+            let e = e.to_ascii_lowercase();
+            e == "mid" || e == "midi" || e == "smf"
+        })
+    }
+
+    /// Stand one or more files on the timeline at `at`, the first on `lane`.
+    ///
+    /// **Everything past the first gets a lane of its own**, created if it has
+    /// to be — the owner's rule, and the only one that makes picking four
+    /// stems in one gesture mean anything. The next FREE lane rather than the
+    /// next lane along: dropping a second file onto somebody's existing vocal
+    /// track because it happened to be underneath is not "auto create".
+    ///
+    /// Returns what refused, one sentence each, so the caller can put it in
+    /// the status line. A file that will not import does not stop the rest.
+    pub fn insert_media_files(
+        &mut self,
+        lane: usize,
+        files: &[std::path::PathBuf],
+        at: f64,
+    ) -> Vec<String> {
+        let mut errors = Vec::new();
+        let mut lane = lane.min(crate::recorder::CHANNELS - 1);
+        for (i, path) in files.iter().enumerate() {
+            if i > 0 {
+                let Some(free) = (0..crate::recorder::CHANNELS).find(|n| !self.channel_used(*n))
+                else {
+                    errors.push(format!(
+                        "no empty track left for {}",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    ));
+                    break;
+                };
+                lane = free;
+            }
+            // A bare lane becomes a track: the media has to land on something
+            // that draws, arms and can be turned down.
+            if !self.channel_used(lane) {
+                self.add_bare_track(lane);
+            }
+            let landed = if Self::is_midi_path(path) {
+                self.import_midi_at(path, lane, at)
+            } else {
+                self.import_audio_at(path, lane, at)
+            };
+            if let Err(e) = landed {
+                errors.push(e);
+            }
+        }
+        errors
+    }
+
+    /// The playhead, where an insert lands.
+    pub fn playhead_s(&self) -> f64 {
+        self.recorder.position_s.max(0.0)
     }
 
     /// Take a pending "choose a file" request. Same contract again.
@@ -12863,6 +12957,20 @@ impl IvoryApp {
     fn apply_menu_action(&mut self, ctx: &egui::Context, action: MenuAction) {
         match action {
             // ── the project ────────────────────────────────────────────────
+            // **The SELECTED track**, which is what the highlight is for.
+            // With nothing selected it is the first track on the desk rather
+            // than a refusal: somebody who has just opened a fresh song and
+            // wants a file on it has selected nothing and means lane zero.
+            MenuAction::InsertMedia => {
+                let lane = self
+                    .selected_channel
+                    .unwrap_or_else(|| {
+                        (0..crate::recorder::CHANNELS)
+                            .find(|n| self.channel_used(*n))
+                            .unwrap_or(0)
+                    });
+                self.apply_dialog_action(dialogs::DialogAction::InsertMedia(lane));
+            }
             MenuAction::NewProject => {
                 self.project_request = Some(crate::ports::ProjectRequest::New);
             }
@@ -12878,6 +12986,7 @@ impl IvoryApp {
                     extensions: vec!["tangent".to_owned()],
                     extension_label: "Tangent project".to_owned(),
                     purpose: crate::ports::FilePurpose::Project,
+                    multi: false,
                 });
             }
             MenuAction::DuplicateProject => {
@@ -13564,6 +13673,7 @@ impl IvoryApp {
                     extensions: vec!["tangent".to_owned()],
                     extension_label: "Tangent project".to_owned(),
                     purpose: crate::ports::FilePurpose::Project,
+                    multi: false,
                 });
             }
             DialogAction::ProjectSave { name } => {
@@ -13731,6 +13841,37 @@ impl IvoryApp {
                 // one window rather than one window per route.
                 self.dialog = Some(self.routing_dialog(from, None));
             }
+            DialogAction::InsertMedia(lane) => {
+                // The dialog stands down so the OS panel is not raised behind
+                // it — the same one-frame handshake every other picker uses.
+                self.dialog = None;
+                self.native_panel_up = true;
+                self.file_request = Some(crate::ports::FileRequest {
+                    start_at: self.project_doc().and_then(|d| d.parent().map(|p| p.join("media"))),
+                    title: "Insert Media".to_owned(),
+                    extensions: vec![
+                        "wav".into(), "aif".into(), "aiff".into(), "flac".into(),
+                        "mp3".into(), "m4a".into(), "ogg".into(), "opus".into(),
+                        "mid".into(), "midi".into(), "smf".into(),
+                    ],
+                    extension_label: "Audio and MIDI".to_owned(),
+                    purpose: crate::ports::FilePurpose::InsertMedia(lane),
+                    multi: true,
+                });
+            }
+            DialogAction::SetRouteGain(index, gain) => {
+                // The window is NOT rebuilt: it is rebuilt on add and remove
+                // because those renumber the table, and a drag that rebuilt
+                // the dialog under the hand would drop the grab every frame.
+                self.settings.routes.set_gain(index, gain);
+                self.refresh_route_labels();
+                self.save_settings();
+                if let Some(dialogs::Dialog::Routing { existing, .. }) = self.dialog.as_mut() {
+                    if let Some(row) = existing.iter_mut().find(|(at, _, _)| *at == index) {
+                        row.2 = gain.clamp(0.0, 1.0);
+                    }
+                }
+            }
             DialogAction::RemoveRoute(index) => {
                 // The channel is read BEFORE the removal: after it, the index
                 // names a different route or nothing at all.
@@ -13893,6 +14034,7 @@ impl IvoryApp {
                     extensions: vec!["syx".to_owned(), "SYX".to_owned()],
                     extension_label: "DX7 cartridge".to_owned(),
                     purpose: crate::ports::FilePurpose::Cartridge,
+                    multi: false,
                 });
             }
             DialogAction::ChooseDevice { kind, uid } => {
@@ -18032,6 +18174,133 @@ mod tests {
             "a MIDI clip was refused an audio channel"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+
+    /// **Several files picked at once get a track each.**
+    ///
+    /// The owner's rule for Insert Media, and the same fan-out a multi-file
+    /// DROP goes through — dropping four stems used to stack all four on one
+    /// lane at the same instant, where three of them are invisible until you
+    /// move the top one.
+    #[test]
+    fn inserting_several_files_gives_each_one_its_own_track() {
+        let root = project_scratch("insertmedia");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        let mut files = Vec::new();
+        for n in 0..3 {
+            let f = root.join(format!("stem{n}.wav"));
+            std::fs::write(&f, b"pcm, allegedly").expect("write");
+            files.push(f);
+        }
+        // Lane 4 is the one the menu was opened on.
+        let errors = app.insert_media_files(4, &files, 2.5);
+        assert!(errors.is_empty(), "imports refused: {errors:?}");
+
+        let lanes: Vec<usize> = app.arrangement.clips.iter().map(|c| c.lane).collect();
+        assert!(lanes.contains(&4), "the first file did not land on the chosen lane");
+        assert_eq!(lanes.len(), 3, "not every file landed: {lanes:?}");
+        let mut unique = lanes.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), 3, "files shared a lane: {lanes:?}");
+        for c in &app.arrangement.clips {
+            assert!(
+                (c.start_s - 2.5).abs() < 1.0e-9,
+                "a clip did not land at the playhead: {}",
+                c.start_s
+            );
+        }
+        // And every lane they landed on is a real track now, not bare ground.
+        for l in unique {
+            assert!(app.channel_used(l), "lane {l} was never made a track");
+        }
+    }
+
+    /// A single file goes exactly where it was asked for and makes no
+    /// second track.
+    #[test]
+    fn inserting_one_file_touches_one_lane() {
+        let root = project_scratch("insertone");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        let f = root.join("one.wav");
+        std::fs::write(&f, b"pcm, allegedly").expect("write");
+        let before = app.arrangement.clips.len();
+        assert!(app.insert_media_files(6, std::slice::from_ref(&f), 0.0).is_empty());
+        assert_eq!(app.arrangement.clips.len(), before + 1);
+        assert_eq!(
+            app.arrangement.clips.last().map(|c| c.lane),
+            Some(6),
+            "the file did not land on the lane it was given"
+        );
+    }
+
+
+    /// **A dropped file lands on the lane it was dropped ON.**
+    ///
+    /// It used to land on lane ZERO whenever the pointer was not readable on
+    /// the frame the drop arrived — which is most of the time, because an OS
+    /// drag produces no ordinary pointer events. Lane zero is the DX7, a MIDI
+    /// lane, so a `.mid` appeared to work while landing in the wrong place and
+    /// an audio file was refused outright: the owner's "drag ONLY works for
+    /// MIDI". The landing is worked out while the file HOVERS instead.
+    #[test]
+    fn a_dropped_file_lands_on_the_lane_it_was_dragged_over() {
+        let root = project_scratch("droplane");
+        let (ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.settings.keytoggle_enabled = false;
+        app.arrangement_open = true;
+        let _ = run_frame(&ctx, &mut app);
+        let _ = run_frame(&ctx, &mut app);
+
+        // Whatever the launch put up owns the pointer while it stands, and
+        // `arrangement_input` rightly stands down for it.
+        app.dialog = None;
+        let rect = app.arrangement_rect.expect("the arrangement did not open");
+        // The middle of lane 3's row — a lane that is NOT the fallback and
+        // not the DX7.
+        let target = {
+            let clips = app.arr_clip_views();
+            let view = app.arrange_view(&clips);
+            let l = crate::arrangement_panel::Layout::new(rect, &view);
+            l.lane_rows[3].center()
+        };
+        let file = root.join("drop.wav");
+        std::fs::write(&file, b"pcm, allegedly").expect("write");
+
+        // Frame one: the file HOVERS over lane 3, pointer readable.
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                events: vec![egui::Event::PointerMoved(target)],
+                hovered_files: vec![egui::HoveredFile::default()],
+                ..Default::default()
+            },
+            |ctx| app.frame(ctx),
+        );
+        // Frame two: it LANDS, and the pointer is no longer anywhere useful —
+        // which is the real case. An OS drag does not move egui's pointer, so
+        // on the drop frame it is stale, gone, or (as here) somewhere else
+        // entirely; the landing must come from the hover, not from it.
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                events: vec![egui::Event::PointerMoved(Pos2::new(8.0, 8.0))],
+                dropped_files: vec![egui::DroppedFile {
+                    path: Some(file.clone()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            |ctx| app.frame(ctx),
+        );
+
+        let lanes: Vec<usize> = app.arrangement.clips.iter().map(|c| c.lane).collect();
+        assert_eq!(lanes, vec![3], "the drop did not land on the lane under it");
+        assert_eq!(app.selected_channel, Some(3), "the dropped-on lane did not select");
     }
 
     /// **A track carries its whole identity to a new row** — kind, input,

@@ -2558,15 +2558,28 @@ impl DesktopApp {
             // is a dialog somebody closes again, and they are right to.
             dialog = dialog.add_filter("All files", &["*"]);
         }
-        let file = dialog.pick_file();
+        // **One panel or many, decided by the request.** Insert Media is the
+        // one gesture where picking four stems at once is the point; every
+        // other picker wants exactly one answer.
+        let files: Vec<std::path::PathBuf> = if request.multi {
+            dialog.pick_files().unwrap_or_default()
+        } else {
+            dialog.pick_file().into_iter().collect()
+        };
         // **Whether or not anything was chosen**, on both counts: back to
         // fullscreen, because a cancel must not leave the window in a shape
         // the user did not ask for, and dialogs may float again, because a
         // cancelled panel is a panel that has gone.
         self.app.native_panel_closed();
         self.restore_fullscreen(ctx);
-        let Some(file) = file else { return };
-        self.finish_file_choice(purpose, &file);
+        if files.is_empty() {
+            return;
+        }
+        if let ivory_ui::ports::FilePurpose::InsertMedia(lane) = purpose {
+            self.insert_media(lane, &files);
+            return;
+        }
+        self.finish_file_choice(purpose, &files[0]);
     }
 
     /// Raise the SAVE panel the app asked for, and answer it.
@@ -2658,6 +2671,23 @@ impl DesktopApp {
             ivory_ui::ports::DirPurpose::RecordRoot => self.app.set_record_dir(dir),
             ivory_ui::ports::DirPurpose::ExportDir => self.app.set_export_dir(dir),
             ivory_ui::ports::DirPurpose::PluginFolder => self.app.add_plugin_folder(dir),
+        }
+    }
+
+    /// Stand the chosen media on the timeline, the first on `lane`.
+    ///
+    /// The app owns the fan-out and the refusals; this is here only because
+    /// the reload afterwards is the host's — a clip the document gained has
+    /// to be decoded and pushed at the engine before it can be heard.
+    #[cfg(feature = "recorder")]
+    fn insert_media(&mut self, lane: usize, files: &[std::path::PathBuf]) {
+        let at = self.app.playhead_s();
+        let errors = self.app.insert_media_files(lane, files, at);
+        if let Some(first) = errors.first() {
+            self.app.set_track_info(ivory_ui::ports::TrackInfo {
+                error: first.clone(),
+                ..Default::default()
+            });
         }
     }
 

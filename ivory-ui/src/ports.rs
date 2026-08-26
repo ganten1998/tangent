@@ -252,6 +252,8 @@ pub struct FileRequest {
     pub extensions: Vec<String>,
     pub extension_label: String,
     pub purpose: FilePurpose,
+    /// Whether the panel may return MORE THAN ONE file.
+    pub multi: bool,
 }
 
 /// The backing track, as the band needs to draw it.
@@ -441,6 +443,10 @@ pub enum FilePurpose {
     BackingTrack,
     /// A project document (`project.tangent`) to open.
     Project,
+    /// Media to stand on the timeline at the playhead. The lane is the one
+    /// the menu was opened on; anything picked past the first goes to a
+    /// lane of its own.
+    InsertMedia(usize),
 }
 
 /// A place the app has asked the host to raise a SAVE panel for.

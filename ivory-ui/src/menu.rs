@@ -49,6 +49,8 @@ pub enum MenuAction {
     SetSizePercent(i64),
     ToggleBorderless,
     SelectMidiInput,
+    /// Stand media on the timeline at the playhead, on the selected track.
+    InsertMedia,
     PickColor(ColorTarget),
     ToggleDarkMode,
     /// Wear a theme, by name. Factory names win over user ones — see
@@ -1166,6 +1168,13 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
                 row("New Project", MenuAction::NewProject),
                 row("Open Project...", MenuAction::OpenProject),
                 row("Duplicate Project As...", MenuAction::DuplicateProject),
+                // **Media IN, beside the exports that take it out.** It wants
+                // to be reachable from a right-click on the arrangement,
+                // where the lane bodies are spoken for by the selection box
+                // and only a track's own header opens a menu — so an empty
+                // desk had nowhere to ask from. No new top-level row: this is
+                // the import that belongs next to the exports.
+                row("Insert Media...", MenuAction::InsertMedia),
             ],
         );
     }

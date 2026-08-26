@@ -108,6 +108,9 @@ pub struct ArrangeView<'a> {
     /// The header resize strip is under the pointer (or being dragged):
     /// it lights, and the app swaps the cursor to the resize arrows.
     pub grip_lit: bool,
+    /// A file is being dragged over this lane right now: it lights, so the
+    /// drop lands somewhere the eye already picked.
+    pub drop_lane: Option<usize>,
     /// A MIDI item being drawn by shift-drag right now: lane, from, to —
     /// ghosted until the button comes up and the document takes it.
     pub pending: Option<(usize, f64, f64)>,
@@ -1081,6 +1084,26 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         );
     }
 
+    // ── the lane a hovering file would land on ────────────────────────────
+    //
+    // Drawn UNDER the clips and over the field, so it reads as the lane
+    // lighting up rather than as something laid on top of the music.
+    if let Some(target) = view.drop_lane {
+        if let Some(row) = target
+            .checked_sub(view.lane_scroll)
+            .and_then(|i| l.lane_rows.get(i))
+            .filter(|r| r.is_positive())
+        {
+            painter.rect_filled(*row, 0.0, p.select.gamma_multiply(0.16));
+            painter.rect_stroke(
+                *row,
+                0.0,
+                Stroke::new(1.5, p.select.gamma_multiply(0.85)),
+                egui::StrokeKind::Inside,
+            );
+        }
+    }
+
     // ── the clips ─────────────────────────────────────────────────────────
     for clip in view.clips {
         let r = clip_rect(rect, view, clip);
@@ -1872,6 +1895,7 @@ mod tests {
             metronome_on: true,
             snap_on: true,
             grip_lit: false,
+            drop_lane: None,
             grid_exp: 0,
             pending: None,
             view_start_s: 0.0,
