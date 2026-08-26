@@ -524,6 +524,19 @@ pub trait MidiPorts: Send {
 
     /// The port currently open, if any.
     fn current(&self) -> Option<String>;
+
+    /// Open whatever the startup priority chain picks — **deferred, and that
+    /// is the point.**
+    ///
+    /// Doing this while the window is being built cost 695 ms of the 790 ms
+    /// before the first frame: opening a MIDI client is the first CoreMIDI
+    /// call in the process and it pays for the whole subsystem coming up.
+    /// The app looked like it hung, and the splash — which is painted by the
+    /// app — could not appear until it was over, so the splash was proof the
+    /// load had FINISHED rather than cover for it happening.
+    ///
+    /// Default is a no-op, so the plugin and the test fake say nothing.
+    fn auto_connect(&mut self, _tx: mpsc::Sender<MidiEvent>) {}
 }
 
 #[cfg(test)]
@@ -537,6 +550,8 @@ mod tests {
     struct Fake {
         available: Vec<String>,
         open: Option<String>,
+        /// Whether the priority chain was asked to run, and when.
+        auto_calls: usize,
     }
 
     impl MidiPorts for Fake {
@@ -554,6 +569,60 @@ mod tests {
         fn current(&self) -> Option<String> {
             self.open.clone()
         }
+        fn auto_connect(&mut self, _tx: mpsc::Sender<MidiEvent>) {
+            self.auto_calls += 1;
+            self.open = self.available.first().cloned();
+        }
+    }
+
+    /// **The priority chain is a call somebody makes, not something a
+    /// constructor does.**
+    ///
+    /// Opening a MIDI client is the first CoreMIDI call the process makes and
+    /// it pays for the whole subsystem coming up — measured at 695 ms of the
+    /// 790 ms before Tangent's first frame, on a machine where the window and
+    /// the GPU together took 100. Because the splash is painted BY the app,
+    /// nothing could be on screen until it was over: the window sat unpainted
+    /// and the splash appeared only once the load had already finished.
+    ///
+    /// It runs on the frame after the splash is up now. This is the seam that
+    /// makes that possible, and the default being a no-op is what lets the
+    /// plugin and the fakes ignore it.
+    #[test]
+    fn the_priority_chain_is_a_separate_call_from_construction() {
+        let (tx, _rx) = mpsc::channel();
+        let mut p = Fake {
+            available: vec!["USB-MIDI 1".into()],
+            ..Default::default()
+        };
+        // Built, and nothing is open: construction opens no device.
+        assert_eq!(p.current(), None);
+        assert_eq!(p.auto_calls, 0);
+        p.auto_connect(tx);
+        assert_eq!(p.auto_calls, 1, "the chain was never asked to run");
+        assert_eq!(p.current().as_deref(), Some("USB-MIDI 1"));
+    }
+
+    /// A source that has no chain says nothing rather than erroring — the
+    /// plugin has no ports of its own to pick from.
+    #[test]
+    fn a_source_with_no_chain_ignores_the_request() {
+        struct Bare;
+        impl MidiPorts for Bare {
+            fn list(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn connect(&mut self, _n: &str, _tx: mpsc::Sender<MidiEvent>) -> Result<(), String> {
+                Ok(())
+            }
+            fn current(&self) -> Option<String> {
+                None
+            }
+        }
+        let (tx, _rx) = mpsc::channel();
+        let mut b = Bare;
+        b.auto_connect(tx);
+        assert_eq!(b.current(), None);
     }
 
     #[test]
@@ -561,7 +630,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let mut p = Fake {
             available: vec!["Scarlett 2i2".into(), "USB-MIDI 1".into()],
-            open: None,
+            ..Default::default()
         };
         assert_eq!(p.current(), None);
         assert!(p.connect("USB-MIDI 1", tx.clone()).is_ok());
