@@ -476,6 +476,9 @@ pub struct IvoryApp {
     /// be there. Every internal copy now stamps a marker so the chord
     /// always comes back as an event.
     clipboard_stamp: Option<String>,
+    /// Counts dialog openings, so a window that remembers per-id state (an
+    /// egui scroll offset) gets a fresh one each time it is opened.
+    dialog_serial: u64,
     /// The gesture in flight on the arrangement, if any.
     arr_drag: Option<ArrDrag>,
     /// Where a dropped file would land — lane and seconds — tracked WHILE it
@@ -1454,6 +1457,7 @@ impl IvoryApp {
             note_clipboard: Vec::new(),
             clip_clipboard: Vec::new(),
             clipboard_stamp: None,
+            dialog_serial: 0,
             arr_drag: None,
             arr_drop: None,
             arr_drop_hover: false,
@@ -9841,6 +9845,12 @@ impl IvoryApp {
                     // press falls through to the app menu instead.
                     if self.channel_used(lane) {
                         self.dialog = Some(dialogs::Dialog::Track {
+                            palette: self.settings.palette_choice,
+                            palette_auto: self.settings.palette_auto,
+                            serial: {
+                                self.dialog_serial = self.dialog_serial.wrapping_add(1);
+                                self.dialog_serial
+                            },
                             lane,
                             removable: true,
                             icon: self
@@ -13816,8 +13826,31 @@ impl IvoryApp {
             }
             DialogAction::TrackPalette(i) => {
                 self.settings.auto_palette = true;
-                self.settings.palette_choice =
-                    i.rem_euclid(crate::mixer_panel::PALETTES.len() as i64);
+                if i == dialogs::PALETTE_AUTO {
+                    // **Back to following the theme**, and the theme's own
+                    // palette lands at once rather than on the next switch —
+                    // a row that says "auto" and changes nothing until you
+                    // pick a theme is a row that looks broken.
+                    self.settings.palette_auto = true;
+                    if let Some(t) = crate::theme::by_name(&self.settings.theme_name) {
+                        if let Some(v) = t.channel_palette {
+                            self.settings.palette_choice = v;
+                        }
+                    }
+                } else {
+                    // A hand-picked palette STOPS following the theme, or the
+                    // next theme would silently take it back.
+                    self.settings.palette_auto = false;
+                    self.settings.palette_choice =
+                        i.rem_euclid(crate::mixer_panel::PALETTES.len() as i64);
+                }
+                // The open window shows what just happened.
+                if let Some(dialogs::Dialog::Track { palette, palette_auto, .. }) =
+                    self.dialog.as_mut()
+                {
+                    *palette = self.settings.palette_choice;
+                    *palette_auto = self.settings.palette_auto;
+                }
                 self.save_settings();
             }
             DialogAction::ProjectExportOpen => {
@@ -16047,6 +16080,12 @@ impl IvoryApp {
                                 self.open_global_menu_at(&ctx, pos);
                             } else if let Some(strip) = i.strip() {
                                 self.dialog = Some(dialogs::Dialog::Track {
+                            palette: self.settings.palette_choice,
+                            palette_auto: self.settings.palette_auto,
+                            serial: {
+                                self.dialog_serial = self.dialog_serial.wrapping_add(1);
+                                self.dialog_serial
+                            },
                                     lane: strip.index(),
                                     removable: matches!(
                                         strip,
@@ -16080,6 +16119,12 @@ impl IvoryApp {
                                 self.open_global_menu_at(&ctx, pos);
                             } else if let Some(strip) = at {
                                 self.dialog = Some(dialogs::Dialog::Track {
+                            palette: self.settings.palette_choice,
+                            palette_auto: self.settings.palette_auto,
+                            serial: {
+                                self.dialog_serial = self.dialog_serial.wrapping_add(1);
+                                self.dialog_serial
+                            },
                                     lane: strip.index(),
                                     removable: matches!(
                                         strip,

@@ -880,6 +880,14 @@ pub struct Settings {
     /// set — hand-painted channels keep their own.
     pub auto_palette: bool,
     pub palette_choice: i64,
+    /// **Whether the palette FOLLOWS the theme.**
+    ///
+    /// On by default, which is what "auto" means in the track menu: every
+    /// theme names a palette that suits it and picking a theme brings its
+    /// palette along. Turned off the moment somebody chooses one by hand, so
+    /// a deliberate pick is not quietly overwritten by the next theme —
+    /// mixing and matching is the point of offering all of them.
+    pub palette_auto: bool,
     /// The DRUM BUS: its fader and its pan. The pads sum through this
     /// strip — see `Strip::Drums`.
     pub drums_gain: f64,
@@ -1288,6 +1296,7 @@ impl Default for Settings {
             drums_pan: 0.0,
             auto_palette: true,
             palette_choice: 0,
+            palette_auto: true,
             // **Channel 0 ships as the DX7, channel 1 as the DRUMPAD.** The
             // two built-in instruments sit side by side in the first two
             // slots — so a fresh install makes a sound, has a kit the editor
@@ -2109,6 +2118,7 @@ impl Settings {
             }
         }
         take_bool(&mut map, "auto_palette", &mut s.auto_palette);
+        take_bool(&mut map, "palette_auto", &mut s.palette_auto);
         if let Some(n) = map.shift_remove("palette_choice").and_then(|v| v.as_i64()) {
             s.palette_choice =
                 n.rem_euclid(crate::mixer_panel::PALETTES.len() as i64);
@@ -3184,6 +3194,7 @@ impl Settings {
             "background_color".into(),
             Value::String(self.background_color.to_hex()),
         );
+        map.insert("palette_auto".into(), Value::Bool(self.palette_auto));
         // One object rather than seventeen keys, and only when there is
         // something to say.
         if !self.dark_roles.is_empty() {

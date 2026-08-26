@@ -1546,6 +1546,26 @@ impl DesktopApp {
     /// Everything that must happen OUTSIDE a frame: opening devices, raising
     /// native panels, creating directories.
     fn after_frame(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        // **Nothing heavy until a frame has actually REACHED THE SCREEN.**
+        //
+        // eframe presents a frame when `update` RETURNS, and this runs inside
+        // it — so every blocking thing here happens before the window has ever
+        // been drawn. Loading one insert is enough: a the modelled piano takes seconds
+        // to construct, and the first window draw waited on it, every launch.
+        // The owner called it exactly — "it still waits for the vsts to load
+        // before a single window draw every single time".
+        //
+        // The earlier "first frame at 140 ms" was measured at the TOP of
+        // `update`, which is when the work STARTS, not when pixels appear.
+        // It was the wrong number for the question.
+        //
+        // `painted_once` is set at the bottom of `update`, so the first pass
+        // does nothing but paint: window and splash at once, and the desk
+        // comes up behind it from the second pass on.
+        if !self.painted_once {
+            ctx.request_repaint();
+            return;
+        }
         use ivory_ui::recorder::RecorderRequest as R;
 
         // Dev hook, alongside IVORY_INLINE and IVORY_DEMO_NOTES: open slot 0's
@@ -5659,7 +5679,16 @@ impl eframe::App for DesktopApp {
         // **Where the cursor is during a FILE DRAG.** Asked of the OS,
         // because the window toolkit will not say — see `drag_pointer`.
         self.app.set_drag_pointer(Self::drag_pointer(ctx));
-        self.app.frame(ctx);
+        // **The first frame is the SPLASH and nothing else.**
+        //
+        // The app's first `frame` costs about a second — the font atlas is
+        // built and uploaded the first time anything is laid out — and it
+        // runs inside `update`, so the window cannot appear until it is done.
+        // Skipping it once puts the splash on screen roughly half a second
+        // sooner; the app draws from the next pass, behind it.
+        if self.painted_once {
+            self.app.frame(ctx);
+        }
         #[cfg(feature = "recorder")]
         self.after_frame(ctx, frame);
         self.paint_splash(ctx);
@@ -6227,6 +6256,26 @@ struct Splash {
 }
 
 impl DesktopApp {
+
+    /// Whether any insert bay still has a plugin to load.
+    ///
+    /// The same comparison `reconcile_inserts` makes to pick the next one, so
+    /// the splash and the loader cannot disagree about whether the desk is
+    /// finished.
+    #[cfg(feature = "recorder")]
+    fn inserts_pending(&self) -> bool {
+        // Nothing can load without an engine; a desk waiting for one is not
+        // waiting for plugins, and the splash must not hang on that.
+        if self.recorder.engine.is_none() {
+            return false;
+        }
+        let inserts = ivory_ui::recorder::INSERTS;
+        (0..self.recorder.inserts_loaded.len()).any(|i| {
+            self.app.insert(i / inserts, i % inserts).map(str::to_owned)
+                != self.recorder.inserts_loaded[i]
+        })
+    }
+
     /// Paint the splash, and decide when it goes.
     ///
     /// Drawn on the FOREGROUND layer after the app's own frame, so it covers
@@ -6234,6 +6283,18 @@ impl DesktopApp {
     /// card half-visible through a loading screen is the sort of detail that
     /// makes an app feel unfinished.
     fn paint_splash(&mut self, ctx: &egui::Context) {
+        if self.splash.is_none() {
+            return;
+        }
+        // Read BEFORE the splash is borrowed mutably — both look at `self`.
+        #[cfg(feature = "recorder")]
+        let inserts = self.inserts_pending();
+        #[cfg(not(feature = "recorder"))]
+        let inserts = false;
+        #[cfg(feature = "recorder")]
+        let camera = self.recorder.camera_opening;
+        #[cfg(not(feature = "recorder"))]
+        let camera = false;
         let Some(splash) = self.splash.as_mut() else {
             return;
         };
@@ -6242,12 +6303,21 @@ impl DesktopApp {
 
         // What is still being waited on. The splash no longer SAYS it — the
         // lattice is the whole picture — but readiness still depends on it.
-        #[cfg(feature = "recorder")]
-        let camera = self.recorder.camera_opening;
-        #[cfg(not(feature = "recorder"))]
-        let camera = false;
-
-        let busy = camera;
+        // **The PLUGINS, which are the whole of a slow launch.**
+        //
+        // Inserts load one per frame, deliberately — but a JUCE plugin takes
+        // the better part of a second to come up, so a desk with several of
+        // them spends seconds with the main thread inside somebody else's
+        // constructor. The splash used to lift on elapsed time alone, and
+        // since frames are a second apart while this is happening it was gone
+        // by the second one: the owner watched a half-drawn window for seven
+        // seconds and reported, exactly right, "insanely long and zero
+        // splash".
+        //
+        // So it waits for them. That is what makes the splash cover the load
+        // rather than announce the end of it — and `SPLASH_MAX` is still the
+        // backstop for a plugin that never answers.
+        let busy = camera || inserts;
         // "Ready" is a minimum time AND nothing outstanding — or the cap.
         if !busy && elapsed >= SPLASH_MIN && splash.done_at.is_none() {
             splash.done_at = Some(now);

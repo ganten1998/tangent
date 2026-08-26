@@ -43,6 +43,16 @@ pub enum Dialog {
         removable: bool,
         /// The lane's current badge, 0..=3 — the picker's lit slot.
         icon: u8,
+        /// Which auto-palette is in force, and whether it is following the
+        /// theme — the palette list marks the live one either way.
+        palette: i64,
+        palette_auto: bool,
+        /// Bumped every time this window is opened, so the palette list's
+        /// scroll state cannot be carried over from the last time. egui keys
+        /// scroll offsets by id and remembers them for the life of the
+        /// process; the old whole-dialog scroll came up halfway down a strip
+        /// somebody had never scrolled.
+        serial: u64,
     },
     /// The project export: sources, rate, shape, formats, speed — and the
     /// arrange view's time selection, if one stands.
@@ -433,6 +443,9 @@ pub struct LearningStatus {
     /// One row per perceptron feature: (label, weight).
     pub weights: Vec<(&'static str, f64)>,
 }
+
+/// `TrackPalette` with this means "follow the theme" rather than naming one.
+pub const PALETTE_AUTO: i64 = -1;
 
 pub enum DialogAction {
     /// New session from the `default` template.
@@ -4651,11 +4664,14 @@ pub fn show(
                 },
             )
         }
-        Dialog::Track { lane, removable, icon } => {
+        Dialog::Track { lane, removable, icon, palette, palette_auto, serial } => {
             let t = theme(face);
             let lane = *lane;
             let removable = *removable;
             let current_icon = *icon;
+            let palette_now = *palette;
+            let palette_auto = *palette_auto;
+            let serial = *serial;
             show_dialog_viewport(
                 ctx,
                 placement,
@@ -4664,8 +4680,13 @@ pub fn show(
                 // the stack — and the Done row pins to the BOTTOM via a
                 // height stretch, so a resize can never push it past the
                 // frame again.
-                Vec2::new(300.0, 434.0),
-                Vec2::new(300.0, 434.0),
+                // **Big enough that nothing scrolls.** It held a scroll area
+                // whose offset egui remembers by id, so opening the menu,
+                // scrolling, closing it and opening it on ANOTHER track came
+                // up halfway down somebody else's strip. The content is a
+                // handful of rows; the honest fix is a window that fits it.
+                Vec2::new(360.0, 616.0),
+                Vec2::new(360.0, 616.0),
                 |ui, result| {
                     apply_theme(ui.style_mut(), &t);
                     ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
@@ -4690,14 +4711,26 @@ pub fn show(
                                     Vec2::new(56.0, 22.0),
                                 )
                             };
-                            egui::ScrollArea::vertical()
-                                .max_height((ui.available_height() - 32.0).max(60.0))
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                            // **INSERT MEDIA first, and taller than the rest.**
-                            // It is the row somebody opens this window for
-                            // while they are building an arrangement; Remove
-                            // Track is the one they open it for once.
+                            {
+                            // **REMOVE TRACK on top, the owner's order**: it
+                            // is the destructive one and the one this menu was
+                            // built around; Insert Media sits under it.
+                            if removable {
+                                if ui
+                                    .add_sized(
+                                        Vec2::new(ui.available_width(), 22.0),
+                                        Button::new(
+                                            RichText::new("Remove Track")
+                                                .font(plain(11.0))
+                                                .color(t.text),
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    action = Some(DialogAction::TrackRemove(lane));
+                                }
+                                ui.add_space(6.0);
+                            }
                             if lane < crate::recorder::CHANNELS {
                                 if ui
                                     .add_sized(
@@ -4721,22 +4754,6 @@ pub fn show(
                                     .color(dim),
                                 );
                                 ui.add_space(8.0);
-                            }
-                            if removable {
-                                if ui
-                                    .add_sized(
-                                        Vec2::new(ui.available_width(), 22.0),
-                                        Button::new(
-                                            RichText::new("Remove Track")
-                                                .font(plain(11.0))
-                                                .color(t.text),
-                                        ),
-                                    )
-                                    .clicked()
-                                {
-                                    action = Some(DialogAction::TrackRemove(lane));
-                                }
-                                ui.add_space(6.0);
                             }
                             if lane < crate::recorder::CHANNELS {
                                 ui.label(
@@ -4853,6 +4870,65 @@ pub fn show(
                                     .font(bold(10.0))
                                     .color(dim),
                             );
+                            // **A scroll for the LIST alone, and it starts at
+                            // the top every time.** Sixteen palettes plus AUTO
+                            // will not fit any sane window, so this one does
+                            // scroll — but egui remembers an offset by id
+                            // forever, which is how the old whole-dialog
+                            // scroll came up halfway down somebody else's
+                            // strip. The id carries the lane, and the offset
+                            // is reset when the window opens.
+                            // **A framed WELL, filling the room that is
+                            // left.** A bare scroll area with a fixed height
+                            // read as "eight palettes, the last one cut off",
+                            // with a huge blank slab under it that looked
+                            // like the Done button's own territory. Nothing
+                            // said the list moved. So it is a sunken panel
+                            // with a border: an edge is what makes a region
+                            // read as a region, and it now takes all the
+                            // height between the heading and Done.
+                            let room = (done_rect.top() - ui.min_rect().bottom() - 14.0)
+                                .clamp(120.0, 460.0);
+                            egui::Frame::NONE
+                                .fill(t.field_bg)
+                                .stroke(Stroke::new(1.0, t.text.gamma_multiply(0.45)))
+                                .inner_margin(egui::Margin::same(4))
+                                .corner_radius(3)
+                                .show(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .id_salt(("track-palettes", lane, serial))
+                                .max_height(room)
+                                .min_scrolled_height(room)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                            // **AUTO first, and it is the default.** Every
+                            // theme names a palette that suits it, so the
+                            // ordinary answer is "whichever this theme says".
+                            // The eight are all offered under it because
+                            // mixing and matching is somebody's business but
+                            // theirs — a hand-picked one then stops following
+                            // the theme, which is what makes the pick stick.
+                            ui.horizontal(|ui| {
+                                let lit = palette_auto;
+                                if ui
+                                    .add_sized(
+                                        Vec2::new(64.0, 18.0),
+                                        Button::new(
+                                            RichText::new(if lit { "> AUTO" } else { "AUTO" })
+                                                .font(plain(10.0))
+                                                .color(t.text),
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    action = Some(DialogAction::TrackPalette(PALETTE_AUTO));
+                                }
+                                ui.label(
+                                    RichText::new("follows the theme")
+                                        .font(plain(9.0))
+                                        .color(dim),
+                                );
+                            });
                             for (i, pal) in
                                 crate::mixer_panel::PALETTES.iter().enumerate()
                             {
@@ -4861,9 +4937,15 @@ pub fn show(
                                         .add_sized(
                                             Vec2::new(64.0, 18.0),
                                             Button::new(
-                                                RichText::new(pal.name)
-                                                    .font(plain(10.0))
-                                                    .color(t.text),
+                                                RichText::new(
+                                                    if !palette_auto && palette_now == i as i64 {
+                                                        format!("> {}", pal.name)
+                                                    } else {
+                                                        pal.name.to_owned()
+                                                    },
+                                                )
+                                                .font(plain(10.0))
+                                                .color(t.text),
                                             ),
                                         )
                                         .clicked()
@@ -4900,6 +4982,8 @@ pub fn show(
                                 });
                             }
                             });
+                            });
+                            }
                             if ui
                                 .put(
                                     done_rect,
