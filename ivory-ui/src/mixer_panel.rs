@@ -100,7 +100,7 @@ fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
 }
 
-fn shade_face(c: Color32, k: f32) -> Color32 {
+pub fn shade_face(c: Color32, k: f32) -> Color32 {
     let f = |v: u8| (f32::from(v) * k).clamp(0.0, 255.0) as u8;
     Color32::from_rgb(f(c.r()), f(c.g()), f(c.b()))
 }

@@ -650,7 +650,15 @@ fn layout(rect: Rect, rows: usize, widest: usize, widest_key: usize) -> (Rect, f
 /// `gates` reaches the card for one reason only: a shortcut the app would
 /// ignore must not be advertised. It goes through the same `available` the
 /// keyboard does, so the card and the binding cannot disagree about Space.
-pub fn draw_help(painter: &Painter, rect: Rect, dark: bool, t: f32, gates: Gates, view: HelpView) {
+pub fn draw_help(
+    painter: &Painter,
+    rect: Rect,
+    dark: bool,
+    face: Color32,
+    t: f32,
+    gates: Gates,
+    view: HelpView,
+) {
     let rows = card_rows(gates, view);
     let widest = rows.iter().map(|(_, d)| d.len()).max().unwrap_or(20);
     // Counted in `chars`, not bytes: the labels are ASCII today and a "⌫" one
@@ -677,21 +685,11 @@ pub fn draw_help(painter: &Painter, rect: Rect, dark: bool, t: f32, gates: Gates
     // card had arrived to explain why.
     painter.rect_filled(rect, 0.0, Color32::from_black_alpha((150.0 * t) as u8));
 
-    let (bg, fg, dim, edge) = if dark {
-        (
-            Color32::from_rgb(0x1a, 0x1a, 0x1a),
-            Color32::from_rgb(0xE8, 0xDC, 0xC0),
-            Color32::from_rgb(0x99, 0x99, 0x99),
-            Color32::from_rgb(0x5A, 0x5A, 0x5A),
-        )
-    } else {
-        (
-            Color32::from_rgb(0xE8, 0xDC, 0xC0),
-            Color32::from_rgb(0x2a, 0x1e, 0x14),
-            Color32::from_rgb(0x6d, 0x5a, 0x46),
-            Color32::from_rgb(0x8B, 0x73, 0x55),
-        )
-    };
+    // The desk's own face, through the one derivation every floating panel
+    // shares — it was the frozen pair, reachable by no theme.
+    let _ = dark;
+    let p = crate::recorder_panel::surface_of(face);
+    let (bg, fg, dim, edge) = (p.bg, p.ink, p.faint, p.edge);
     painter.rect_filled(card_rect, 4.0, bg);
     painter.rect_stroke(
         card_rect,
@@ -1163,13 +1161,13 @@ mod tests {
                     for gates in [Gates::default(), Gates { recorder_shown: true, recorder_available: true, window_sizing: true }] {
                         for view in [HelpView::Piano, HelpView::Mixer, HelpView::Arrange] {
                             for t in [0.0, 0.01, 0.5, 0.999, 1.0] {
-                                draw_help(ui.painter(), rect, false, t, gates, view);
-                                draw_help(ui.painter(), rect, true, t, gates, view);
+                                draw_help(ui.painter(), rect, false, Color32::from_rgb(0xE3, 0xD9, 0xBD), t, gates, view);
+                                draw_help(ui.painter(), rect, true, Color32::from_rgb(0xE3, 0xD9, 0xBD), t, gates, view);
                             }
                         }
                         // Out of range must not escape the window either.
-                        draw_help(ui.painter(), rect, false, -1.0, gates, HelpView::Piano);
-                        draw_help(ui.painter(), rect, true, 2.0, gates, HelpView::Piano);
+                        draw_help(ui.painter(), rect, false, Color32::from_rgb(0xE3, 0xD9, 0xBD), -1.0, gates, HelpView::Piano);
+                        draw_help(ui.painter(), rect, true, Color32::from_rgb(0xE3, 0xD9, 0xBD), 2.0, gates, HelpView::Piano);
                     }
                 });
             });

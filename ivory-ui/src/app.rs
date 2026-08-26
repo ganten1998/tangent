@@ -3259,6 +3259,25 @@ impl IvoryApp {
 
     fn menu_view(&self) -> MenuView {
         MenuView {
+            // The desk's own face, in the mode the app is in — the menu is
+            // made of the same material as the surfaces it opens over.
+            face: {
+                let c = self
+                    .settings
+                    .dark_role("fx_strip")
+                    .filter(|_| self.settings.dark_mode)
+                    .unwrap_or(self.settings.fx_strip_color);
+                let c = c.to_color32();
+                let c = if self.settings.dark_mode
+                    && self.settings.dark_role("fx_strip").is_none()
+                {
+                    // The derivation dark mode has always used for the desk.
+                    crate::mixer_panel::shade_face(c, 0.88)
+                } else {
+                    c
+                };
+                (c.r(), c.g(), c.b())
+            },
             // Scoped out of dark mode — see the mixer view.
             dark_mode: false,
             theme_name: self.settings.theme_name.clone(),
@@ -11292,6 +11311,20 @@ impl IvoryApp {
         self.recorder.position_s.max(0.0)
     }
 
+
+    /// The desk's own face for the mode the app is in — what every floating
+    /// panel is made of: the menus, the dialogs, the help card, the hover
+    /// card. One resolution, so they cannot drift apart again.
+    pub fn panel_face(&self) -> egui::Color32 {
+        if !self.settings.dark_mode {
+            return self.settings.fx_strip_color.to_color32();
+        }
+        self.settings.dark_role("fx_strip").map_or_else(
+            || crate::mixer_panel::shade_face(self.settings.fx_strip_color.to_color32(), 0.88),
+            |c| c.to_color32(),
+        )
+    }
+
     /// Where the pointer is during a file drag, pushed in by the host.
     ///
     /// **The UI cannot ask.** An OS drag produces no pointer events, so for
@@ -15742,7 +15775,8 @@ impl IvoryApp {
         }
         if let Some(hr) = heart_rect_for_card {
             if ctx.pointer_latest_pos().is_some_and(|p| hr.contains(p)) {
-                chord_strip::draw_thanks(ui.painter(), hr, ui.max_rect(), false);
+                let face = self.panel_face();
+                chord_strip::draw_thanks(ui.painter(), hr, ui.max_rect(), false, face);
             }
         }
 
@@ -16299,10 +16333,12 @@ impl IvoryApp {
             self.dialog.is_none() && self.menu_state.is_none() && !self.text_entry_active(),
         );
         if help > 0.0 {
+            let face = self.panel_face();
             keys::draw_help(
                 ui.painter(),
                 ui.max_rect(),
                 false,
+                face,
                 help,
                 self.key_gates(),
                 // **The card describes the surface you are on.** The keys a
@@ -16580,7 +16616,11 @@ impl IvoryApp {
             monitor: self.monitor_size,
         };
         if let Some(action) =
-            dialogs::show(&ctx, &mut self.dialog, false, placement)
+            {
+                // Read BEFORE the dialog is borrowed mutably.
+                let face = self.panel_face();
+                dialogs::show(&ctx, &mut self.dialog, face, placement)
+            }
         {
             self.apply_dialog_action(action);
         }

@@ -161,7 +161,13 @@ pub const THANKS: &[&str] = &[
 /// Drawn here rather than as an egui tooltip because this band is a pure
 /// painter with no `Ui` anywhere near it, and because the compositor draws the
 /// same band into a video where a tooltip would not exist at all.
-pub fn draw_thanks(painter: &Painter, heart: Rect, screen: Rect, dark: bool) {
+pub fn draw_thanks(
+    painter: &Painter,
+    heart: Rect,
+    screen: Rect,
+    dark: bool,
+    face: Color32,
+) {
     // **The card's own colours, and its own size.**
     //
     // It used to take the chord label's colour and paint itself on a fixed
@@ -169,17 +175,12 @@ pub fn draw_thanks(painter: &Painter, heart: Rect, screen: Rect, dark: bool) {
     // in the app that ignored the theme. And it took its type size from the
     // HEART, which is a sprite in a corner: a small heart made an unreadable
     // card, and the two have nothing to do with each other.
-    let (card_bg, ink) = if dark {
-        (
-            Color32::from_rgb(0x0a, 0x0a, 0x0a),
-            Color32::from_rgb(0xE8, 0xDC, 0xC0),
-        )
-    } else {
-        (
-            Color32::from_rgb(0xE8, 0xDC, 0xC0),
-            Color32::from_rgb(0x1a, 0x1a, 0x1a),
-        )
-    };
+    // The comment above was right that this card must not ignore the theme,
+    // and it still did: the frozen pair, one more time. It is the desk's face
+    // now, through the derivation every floating panel shares.
+    let _ = dark;
+    let p = crate::recorder_panel::surface_of(face);
+    let (card_bg, ink) = (p.bg, p.ink);
     // Sized off the WINDOW, which is what anybody reading it is looking at —
     // but a hover card is a footnote, not a headline. The first cut at this
     // was half again bigger and read as a dialog that had opened by itself.
@@ -254,7 +255,7 @@ mod thanks_tests {
                 for dark in [false, true] {
                     let _ = ctx.run(Default::default(), |ctx| {
                         let p = ctx.layer_painter(egui::LayerId::background());
-                        draw_thanks(&p, heart_rect(strip), screen, dark);
+                        draw_thanks(&p, heart_rect(strip), screen, dark, Color32::from_rgb(0xE3, 0xD9, 0xBD));
                     });
                 }
             }
