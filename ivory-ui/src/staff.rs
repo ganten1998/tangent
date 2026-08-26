@@ -724,26 +724,41 @@ struct Palette {
     lit_text: Color32,
 }
 
-/// Black on ivory, and its inverse in dark mode — the same two colours the
-/// theory band and the chord strip use, because a page of music that did not
-/// match the app it is in would read as a screenshot of something else.
+/// The page the music is printed on — **the THEME's ground**, and ink
+/// measured against it.
+///
+/// It was black on ivory and its inverse, frozen, exactly as the theory band
+/// was: a cream card that stayed cream on all sixteen themes while the
+/// background behind it moved, which is the owner's screenshot. A page of
+/// music that does not match the app it is in reads as a screenshot of
+/// something else — which is the right instinct, and the reason it has to
+/// follow the theme rather than a fixed pair.
 fn palette(s: &Settings) -> Palette {
-    if s.dark_mode {
-        Palette {
-            bg: Color32::from_rgb(0x0a, 0x0a, 0x0a),
-            ink: Color32::from_rgb(0xE8, 0xDC, 0xC0),
-            faint: Color32::from_rgb(0x9a, 0x92, 0x80),
-            lit: s.white_key_active_color.to_color32(),
-            lit_text: Color32::BLACK,
-        }
+    let bg = crate::piano::themed_bg(s);
+    let ink = if crate::recorder_panel::wants_light_ink(bg) {
+        crate::recorder_panel::INK_LIGHT
     } else {
-        Palette {
-            bg: Color32::from_rgb(0xE8, 0xDC, 0xC0),
-            ink: Color32::from_rgb(0x1a, 0x1a, 0x1a),
-            faint: Color32::from_rgb(0x6b, 0x60, 0x4a),
-            lit: s.white_key_active_color.to_color32(),
-            lit_text: Color32::BLACK,
-        }
+        crate::recorder_panel::INK_DARK
+    };
+    let lit = s.white_key_active_color.to_color32();
+    Palette {
+        bg,
+        ink,
+        // Ledger lines and the quieter marks: a ratio of the two, so it holds
+        // on any ground instead of being a grey that suits one.
+        faint: {
+            let f = |x: u8, y: u8| {
+                (f32::from(x) + (f32::from(y) - f32::from(x)) * 0.32) as u8
+            };
+            Color32::from_rgb(f(ink.r(), bg.r()), f(ink.g(), bg.g()), f(ink.b(), bg.b()))
+        },
+        lit,
+        // A lit note head is the user's own colour and can be anything.
+        lit_text: if crate::recorder_panel::wants_light_ink(lit) {
+            crate::recorder_panel::INK_LIGHT
+        } else {
+            crate::recorder_panel::INK_DARK
+        },
     }
 }
 
@@ -1714,6 +1729,46 @@ mod tests {
     /// same note back. This is the assertion that the extracted `Frame` exists
     /// for — two copies of the geometry would pass every other test and fail
     /// this one.
+
+    /// **The page the music is printed on follows the theme.**
+    ///
+    /// The owner's screenshot: a cream staff card sitting on a lavender
+    /// ground, because the staff kept the frozen pair the theory band had
+    /// just been freed from. Same audit as the theory view.
+    #[test]
+    fn every_theme_prints_the_staff_on_its_own_page() {
+        let mut grounds = std::collections::HashSet::new();
+        let mut bad: Vec<String> = Vec::new();
+        for theme in crate::theme::factory() {
+            for dark in [false, true] {
+                let mut s = Settings::default();
+                theme.apply(&mut s);
+                s.dark_mode = dark;
+                let p = palette(&s);
+                grounds.insert((p.bg.r(), p.bg.g(), p.bg.b(), dark));
+                let mode = if dark { "dark" } else { "light" };
+                for (what, fg, floor) in [
+                    ("staff ink", p.ink, 4.5),
+                    ("ledger", p.faint, 3.0),
+                ] {
+                    let r = crate::recorder_panel::contrast_ratio(fg, p.bg);
+                    if r < floor {
+                        bad.push(format!("{} {mode}: {what} {r:.2}:1", theme.name));
+                    }
+                }
+                let lit = crate::recorder_panel::contrast_ratio(p.lit_text, p.lit);
+                if lit < 4.5 {
+                    bad.push(format!("{} {mode}: lit note {lit:.2}:1", theme.name));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "the staff does not hold up:\n  {}", bad.join("\n  "));
+        assert!(
+            grounds.len() > 16,
+            "only {} distinct staff pages across sixteen themes and two modes",
+            grounds.len()
+        );
+    }
     #[test]
     fn clicking_a_staff_position_gives_back_the_note_drawn_there() {
         let mut s = Settings::default();

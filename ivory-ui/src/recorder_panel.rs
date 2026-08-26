@@ -205,6 +205,77 @@ pub fn contrast_ratio(a: Color32, b: Color32) -> f32 {
 /// **Shared with the mixer**, which faces the same question about its strip
 /// faces: what is printed on a surface has to answer to how light it is, and
 /// there must be one answer rather than two that can drift apart.
+/// Everything a floating PANEL is made of, derived from one colour.
+///
+/// **The same frozen pair kept turning up**: black-on-ivory in light mode and
+/// its inverse in dark, hard-coded separately in the right-click menus, the
+/// help card, the chord hover card, the dialogs, the theory band, the staff
+/// and the arrangement's chips. Seven copies of one decision, none of which
+/// any theme could reach, each found by a screenshot.
+///
+/// So it is one decision now. Hand it the desk's face and it answers with a
+/// panel made of that face: a ground that can carry its own ink, the ink, a
+/// quieter ink for secondary rows, a raised shade for buttons and the
+/// highlighted row, a hover a step beyond that, and a well for typed fields.
+pub struct Surface {
+    pub bg: Color32,
+    pub ink: Color32,
+    /// Secondary text — a ratio of ink to ground, so it holds on either.
+    pub faint: Color32,
+    /// Buttons, and the row under the pointer.
+    pub raised: Color32,
+    pub hover: Color32,
+    /// The ground under a typed value: away from the panel in the direction
+    /// that reads as recessed on this ground.
+    pub well: Color32,
+    pub edge: Color32,
+}
+
+/// Build a [`Surface`] from a face colour.
+pub fn surface_of(face: Color32) -> Surface {
+    let bg = legible_surface(face);
+    let light_ink = wants_light_ink(bg);
+    let ink = if light_ink { INK_LIGHT } else { INK_DARK };
+    // The direction a RAISED thing goes: lighter on a dark panel, darker on a
+    // pale one. That is also the direction the ink came from, so every step
+    // this way costs contrast — which is why each one is pulled back below.
+    let up = if light_ink { Color32::WHITE } else { Color32::BLACK };
+    // And the direction a RECESSED thing goes, away from the ink. Contrast
+    // only improves here, so it is free.
+    let down = if light_ink { Color32::BLACK } else { Color32::WHITE };
+    let step = |from: Color32, to: Color32, t: f32| {
+        let f = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t) as u8;
+        Color32::from_rgb(f(from.r(), to.r()), f(from.g(), to.g()), f(from.b(), to.b()))
+    };
+    // **As far as it can go and still be written on.** A button that reads as
+    // raised is worth nothing if the word on it stops being readable, and the
+    // panel ground is guaranteed legible, so walking back toward it always
+    // converges.
+    let hold = |target: Color32| {
+        if contrast_ratio(ink, target) >= 4.6 {
+            return target;
+        }
+        let mut out = target;
+        for k in 1u8..=20 {
+            out = step(target, bg, f32::from(k) * 0.05_f32);
+            if contrast_ratio(ink, out) >= 4.6 {
+                break;
+            }
+        }
+        out
+    };
+    Surface {
+        bg,
+        ink,
+        faint: step(ink, bg, 0.34),
+        raised: hold(step(bg, up, 0.14)),
+        hover: hold(step(bg, up, 0.26)),
+        well: step(bg, down, 0.30),
+        edge: step(ink, bg, 0.45),
+    }
+}
+
+
 /// The nearest shade of `c` that can actually CARRY its own ink at 4.5:1.
 ///
 /// **There is a dead zone**, and a derived surface lands in it sooner or
@@ -4638,6 +4709,58 @@ mod tests {
     /// A rect-by-rect walk rather than a list of Hits, so this cannot be
     /// satisfied by a target that exists in `targets()` and is covered by
     /// something drawn over it.
+
+    /// **One derivation for every floating panel, checked on every theme.**
+    ///
+    /// The frozen pair — black-on-ivory light, its inverse dark — was
+    /// hard-coded SEVEN times: the right-click menus, the help card, the
+    /// chord hover card, the dialogs, the theory band, the staff and the
+    /// arrangement's chips. Each was found by a screenshot rather than a
+    /// test, one at a time, over three rounds of the same report. This is the
+    /// test that stops an eighth.
+    #[test]
+    fn every_theme_makes_a_readable_panel_out_of_its_own_face() {
+        let mut bad: Vec<String> = Vec::new();
+        let mut grounds = std::collections::HashSet::new();
+        for theme in crate::theme::factory() {
+            for dark in [false, true] {
+                let mut set = Settings::default();
+                theme.apply(&mut set);
+                let face = set.dark_role("fx_strip").filter(|_| dark).map_or_else(
+                    || {
+                        let c = set.fx_strip_color.to_color32();
+                        if dark { crate::mixer_panel::shade_face(c, 0.88) } else { c }
+                    },
+                    |c| c.to_color32(),
+                );
+                let p = surface_of(face);
+                grounds.insert((p.bg.r(), p.bg.g(), p.bg.b(), dark));
+                let mode = if dark { "dark" } else { "light" };
+                let mut check = |what: &str, fg: Color32, bg: Color32, floor: f32| {
+                    let r = contrast_ratio(fg, bg);
+                    if r < floor {
+                        bad.push(format!("{} {mode}: {what} {r:.2}:1", theme.name));
+                    }
+                };
+                // Words, wherever they land: the panel, a button, a field.
+                check("ink on panel", p.ink, p.bg, 4.5);
+                check("ink on a button", p.ink, p.raised, 4.5);
+                check("ink on hover", p.ink, p.hover, 4.5);
+                check("ink in a field", p.ink, p.well, 4.5);
+                // And the parts have to be tellable from the panel.
+                check("button edge", p.edge, p.bg, 1.6);
+                check("button", p.raised, p.bg, 1.05);
+                check("field", p.well, p.bg, 1.05);
+                check("faint", p.faint, p.bg, 3.0);
+            }
+        }
+        assert!(bad.is_empty(), "panels do not hold up:\n  {}", bad.join("\n  "));
+        assert!(
+            grounds.len() > 16,
+            "only {} distinct panel grounds across sixteen themes and two modes",
+            grounds.len()
+        );
+    }
     #[test]
     fn every_take_settings_control_can_actually_be_clicked() {
         let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));

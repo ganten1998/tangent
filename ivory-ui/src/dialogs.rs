@@ -2305,29 +2305,21 @@ struct DialogTheme {
     field_bg: Color32,
 }
 
-fn theme(dark: bool) -> DialogTheme {
-    if dark {
-        DialogTheme {
-            bg: Color32::from_rgb(0x00, 0x00, 0x00),
-            text: Color32::from_rgb(0xE8, 0xDC, 0xC0),
-            button_bg: Color32::from_rgb(0x1a, 0x1a, 0x1a),
-            button_hover: Color32::from_rgb(0x2a, 0x2a, 0x2a),
-            button_border: Color32::from_rgb(0xE8, 0xDC, 0xC0),
-            // A shade above the black ground, so a field reads as a well
-            // rather than a hole, with the ivory text bright on top of it.
-            field_bg: Color32::from_rgb(0x14, 0x14, 0x14),
-        }
-    } else {
-        DialogTheme {
-            bg: Color32::from_rgb(0xE8, 0xDC, 0xC0),
-            text: Color32::from_rgb(0x00, 0x00, 0x00),
-            button_bg: Color32::from_rgb(0xd4, 0xc8, 0xb0),
-            button_hover: Color32::from_rgb(0xc0, 0xb4, 0x9c),
-            button_border: Color32::from_rgb(0x00, 0x00, 0x00),
-            // Brighter than the ivory ground: on paper, an input is the
-            // lightest thing on the page, and the black text sits on it.
-            field_bg: Color32::from_rgb(0xF7, 0xF1, 0xE4),
-        }
+/// A dialog is a floating panel like any other — **made of the desk's own
+/// face**, through the one derivation every panel now shares.
+///
+/// It was the frozen pair: black-on-ivory and its inverse, reachable by no
+/// theme. Worse, the only caller passed `false` forever, so a dialog never
+/// went dark either — it was a light card over a dark app.
+fn theme(face: Color32) -> DialogTheme {
+    let p = crate::recorder_panel::surface_of(face);
+    DialogTheme {
+        bg: p.bg,
+        text: p.ink,
+        button_bg: p.raised,
+        button_hover: p.hover,
+        button_border: p.edge,
+        field_bg: p.well,
     }
 }
 
@@ -2540,7 +2532,7 @@ pub fn show_export_progress(
     p: &crate::ports::ExportProgress,
     placement: Placement,
 ) {
-    let t = theme(false);
+    let t = theme(Color32::from_rgb(0xE3, 0xD9, 0xBD));
     let bold = |size: f32| FontId::new(size, fonts::courier_bold());
     show_dialog_viewport(
         ctx,
@@ -2624,7 +2616,8 @@ pub fn show_export_progress(
 pub fn show(
     ctx: &egui::Context,
     dialog_opt: &mut Option<Dialog>,
-    dark_mode: bool,
+    // The desk's face, resolved for the mode the app is in.
+    face: Color32,
     placement: Placement,
 ) -> Option<DialogAction> {
     let dialog = dialog_opt.as_mut()?;
@@ -2891,7 +2884,7 @@ pub fn show(
             name,
             note,
         } => {
-            let t = theme(dark_mode);
+            let t = theme(face);
             let slot = *slot;
             show_dialog_viewport(
                 ctx,
@@ -3138,7 +3131,7 @@ pub fn show(
             focus,
             error,
         } => {
-            let t = theme(dark_mode);
+            let t = theme(face);
             let slot = *slot;
             show_dialog_viewport(
                 ctx,
@@ -3403,7 +3396,7 @@ pub fn show(
             // device picker is their twin; this one has a live text field and
             // two paragraphs of the app's own voice in it, and reads as part of
             // Tangent rather than as a system sheet.
-            let t = theme(dark_mode);
+            let t = theme(face);
             show_dialog_viewport(
                 ctx,
                 placement,
@@ -3806,7 +3799,7 @@ pub fn show(
             exposed,
             alias,
         } => {
-            let t = theme(dark_mode);
+            let t = theme(face);
             show_dialog_viewport(
                 ctx,
                 placement,
@@ -4157,7 +4150,7 @@ pub fn show(
             channels,
             exposed,
         } => {
-            let t = theme(dark_mode);
+            let t = theme(face);
             let n = *channels;
             // Two columns, one row per input. Tall enough for the longer of
             // them — mono has `n` boxes, stereo `n - 1` — and no taller,
@@ -4302,7 +4295,7 @@ pub fn show(
         }
 
         Dialog::Project { name, subdir } => {
-            let t = theme(dark_mode);
+            let t = theme(face);
             show_dialog_viewport(
                 ctx,
                 placement,
@@ -4431,7 +4424,7 @@ pub fn show(
         }
         Dialog::ExportProject { spec, sel } => {
             let sel = *sel;
-            let t = theme(dark_mode);
+            let t = theme(face);
             show_dialog_viewport(
                 ctx,
                 placement,
@@ -4659,7 +4652,7 @@ pub fn show(
             )
         }
         Dialog::Track { lane, removable, icon } => {
-            let t = theme(dark_mode);
+            let t = theme(face);
             let lane = *lane;
             let removable = *removable;
             let current_icon = *icon;
@@ -4921,7 +4914,7 @@ pub fn show(
             )
         }
         Dialog::About => {
-            let t = theme(dark_mode);
+            let t = theme(face);
             show_dialog_viewport(
                 ctx,
                 placement,
@@ -4988,7 +4981,7 @@ pub fn show(
         }
 
         Dialog::ColorPick { target, color } => {
-            let t = theme(dark_mode);
+            let t = theme(face);
             let target = *target;
             show_dialog_viewport(
                 ctx,
@@ -5030,7 +5023,7 @@ pub fn show(
         }
 
         Dialog::Welcome { dont_show_again } => {
-            let t = theme(dark_mode);
+            let t = theme(face);
             show_dialog_viewport(
                 ctx,
                 placement,
@@ -5083,7 +5076,7 @@ pub fn show(
             channels,
             existing,
         } => {
-            let t = theme(dark_mode);
+            let t = theme(face);
             let dim = t.text.gamma_multiply(0.62);
             let ch = *channel;
             let step = *picking;
@@ -5333,7 +5326,7 @@ pub fn show(
             message,
             focus,
         } => {
-            let t = theme(dark_mode);
+            let t = theme(face);
             let dim = t.text.gamma_multiply(0.62);
             show_dialog_viewport(
                 ctx,
@@ -5412,7 +5405,7 @@ pub fn show(
             // ALWAYS the light theme — the owner's word ("keep the obs
             // stream menu light"): ivory ground, black text, whatever the
             // rest of the app is wearing.
-            let t = theme(false);
+            let t = theme(Color32::from_rgb(0xE3, 0xD9, 0xBD));
             let dim = t.text.gamma_multiply(0.62);
             show_dialog_viewport(
                 ctx,
@@ -5506,7 +5499,7 @@ pub fn show(
             installed_as,
             focus,
         } => {
-            let t = theme(dark_mode);
+            let t = theme(face);
             show_dialog_viewport(
                 ctx,
                 placement,
@@ -5594,7 +5587,7 @@ pub fn show(
             apply_all_keys,
             focus,
         } => {
-            let t = theme(dark_mode);
+            let t = theme(face);
             let notes = notes.clone();
             show_dialog_viewport(
                 ctx,
@@ -5680,7 +5673,7 @@ pub fn show(
             candidates,
             selected,
         } => {
-            let t = theme(dark_mode);
+            let t = theme(face);
             let notes = notes.clone();
             show_dialog_viewport(
                 ctx,
@@ -5800,7 +5793,7 @@ pub fn show(
         }
 
         Dialog::LearnResult { title, message } => {
-            let t = theme(dark_mode);
+            let t = theme(face);
             let title = *title;
             let message = message.clone();
             // Size from the content. These messages range from one line to ten,
@@ -5843,7 +5836,7 @@ pub fn show(
         }
 
         Dialog::ManageTaught { rows, learning } => {
-            let t = theme(dark_mode);
+            let t = theme(face);
             let mut to_delete: Option<Vec<u8>> = None;
             let mut forget = false;
             // Snapshot for the closure; the live binding is updated afterwards.
@@ -6009,7 +6002,7 @@ pub fn show(
             prefer_flats,
             focus,
         } => {
-            let t = theme(dark_mode);
+            let t = theme(face);
             let flats = *prefer_flats;
             // Asked once, outside the loop: see `highest_open_pitch`. The
             // spinner is clamped to it, so the one refusal a user could hit by
@@ -6287,7 +6280,7 @@ pub fn show(
             post_take,
             had_camera,
         } => {
-            let t = theme(dark_mode);
+            let t = theme(face);
             let post_take = *post_take;
             // Asked once, outside the drawing, because every greyed control in
             // the dialog is greyed by this one value. See `Rederivable`.
@@ -7122,7 +7115,7 @@ mod tests {
                 ..Default::default()
             },
             |ctx| {
-                action = show(ctx, &mut dialog, true, placement);
+                action = show(ctx, &mut dialog, Color32::from_rgb(0xE3, 0xD9, 0xBD), placement);
             },
         );
         assert!(action.is_none(), "the editor acted without being asked to");
@@ -7686,7 +7679,7 @@ mod tests {
                 ..Default::default()
             },
             |ctx| {
-                action = show(ctx, &mut dialog, true, placement);
+                action = show(ctx, &mut dialog, Color32::from_rgb(0xE3, 0xD9, 0xBD), placement);
             },
         );
         assert!(action.is_none(), "the dialog exported without being asked");
@@ -7791,7 +7784,7 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    if let Some(a) = show(ctx, dialog, true, placement) {
+                    if let Some(a) = show(ctx, dialog, Color32::from_rgb(0xE3, 0xD9, 0xBD), placement) {
                         action = Some(a);
                     }
                 },
@@ -8097,7 +8090,7 @@ mod tests {
 
         let mut action = None;
         let _ = ctx.run(held_enter(), |ctx| {
-            action = show(ctx, &mut dialog, true, placement);
+            action = show(ctx, &mut dialog, Color32::from_rgb(0xE3, 0xD9, 0xBD), placement);
         });
         assert!(
             action.is_none() && dialog.is_some(),
@@ -8105,7 +8098,7 @@ mod tests {
         );
 
         let _ = ctx.run(held_enter(), |ctx| {
-            action = show(ctx, &mut dialog, true, placement);
+            action = show(ctx, &mut dialog, Color32::from_rgb(0xE3, 0xD9, 0xBD), placement);
         });
         match action {
             Some(DialogAction::LoadPlugin { path }) => {

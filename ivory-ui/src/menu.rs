@@ -206,6 +206,9 @@ pub enum MenuAction {
 #[derive(Clone)]
 pub struct MenuView {
     pub dark_mode: bool,
+    /// The theme's strip face, already resolved for the mode the app is in.
+    /// The menu is made of the same material as the desk under it.
+    pub face: (u8, u8, u8),
     /// The theme now worn, so its own row can be greyed: this app has no
     /// checkmarks (Qt parity), and a row you cannot pick because you already
     /// have it says the same thing with the idiom that is already here.
@@ -343,22 +346,21 @@ pub struct MenuColors {
     pub sep: Color32,
 }
 
-pub fn colors(dark_mode: bool) -> MenuColors {
-    if dark_mode {
-        MenuColors {
-            bg: Color32::from_rgb(0x00, 0x00, 0x00),
-            text: Color32::from_rgb(0xE8, 0xDC, 0xC0),
-            sel: Color32::from_rgb(0x1a, 0x1a, 0x1a),
-            sep: Color32::from_rgb(0xE8, 0xDC, 0xC0),
-        }
-    } else {
-        MenuColors {
-            bg: Color32::from_rgb(0xE8, 0xDC, 0xC0),
-            text: Color32::from_rgb(0x00, 0x00, 0x00),
-            sel: Color32::from_rgb(0xd4, 0xc8, 0xb0),
-            sep: Color32::from_rgb(0x00, 0x00, 0x00),
-        }
-    }
+/// The right-click menu's colours, **derived from the desk it belongs to**.
+///
+/// `face` is the theme's strip face — the same role the mixer's bays and the
+/// arrangement's chips wear — so a menu opened over any surface in the app is
+/// made of the same material as that surface. On the DEFAULT theme that face
+/// is the shipped bone, so the menu keeps the ivory-and-black signature it
+/// has always had; every other theme gets its own, and the text is measured
+/// rather than assumed.
+///
+/// It was a frozen pair before: black-on-ivory light, ivory-on-black dark, on
+/// all sixteen themes.
+pub fn colors(dark_mode: bool, face: Color32) -> MenuColors {
+    let _ = dark_mode;
+    let p = crate::recorder_panel::surface_of(face);
+    MenuColors { bg: p.bg, text: p.ink, sel: p.raised, sep: p.ink }
 }
 
 const MENU_FONT_SIZE: f32 = 13.0;
@@ -528,6 +530,7 @@ pub struct MenuState {
     /// clicked. Size never hit this: it is the first row and seven rows tall.
     monitor: Option<Vec2>,
     dark_mode: bool,
+    face: (u8, u8, u8),
     opened_at: Instant,
     saw_focus: bool,
     /// Text size multiplier, below 1.0 only when the menu had to be squeezed
@@ -1471,6 +1474,7 @@ impl MenuState {
             armed: false,
             monitor: monitor_size,
             dark_mode: view.dark_mode,
+            face: view.face,
             opened_at: Instant::now(),
             saw_focus: false,
             caps: view.caps,
@@ -1636,7 +1640,10 @@ fn menu_button(ui: &mut egui::Ui, label: &str, enabled: bool, row_h: f32) -> egu
 /// `state_opt` is set to None when the menu closes for any reason.
 pub fn show(ctx: &egui::Context, state_opt: &mut Option<MenuState>) -> Option<MenuAction> {
     let state = state_opt.as_mut()?;
-    let c = colors(state.dark_mode);
+    let c = colors(
+        state.dark_mode,
+        Color32::from_rgb(state.face.0, state.face.1, state.face.2),
+    );
     let caps = state.caps;
     let row_h = state.row_h;
     let submenu_open = state.submenu_open;
@@ -1901,6 +1908,7 @@ mod tests {
     fn view() -> MenuView {
         MenuView {
             dark_mode: false,
+            face: (0xE3, 0xD9, 0xBD),
             theme_name: "Default".to_owned(),
             factory_themes: crate::theme::factory().into_iter().map(|t| t.name).collect(),
             // NOT read from disk in a test: a developer's own themes folder
@@ -1971,6 +1979,72 @@ mod tests {
         }
     }
 
+
+    /// **Every right-click menu is readable, on every theme, in both modes —
+    /// and the DEFAULT theme keeps its ivory-and-black signature.**
+    ///
+    /// The owner's ruling: the shipped look stays the shipped look, and the
+    /// rest are themed and checked. It was a frozen pair before, black on
+    /// ivory and its inverse, on all sixteen.
+    #[test]
+    fn every_theme_dresses_the_menus_readably() {
+        let mut bad: Vec<String> = Vec::new();
+        let mut grounds = std::collections::HashSet::new();
+        for theme in crate::theme::factory() {
+            for dark in [false, true] {
+                let mut set = crate::settings::Settings::default();
+                theme.apply(&mut set);
+                set.dark_mode = dark;
+                let face = set
+                    .dark_role("fx_strip")
+                    .filter(|_| dark)
+                    .map_or_else(
+                        || {
+                            let c = set.fx_strip_color.to_color32();
+                            if dark { crate::mixer_panel::shade_face(c, 0.88) } else { c }
+                        },
+                        |c| c.to_color32(),
+                    );
+                let c = colors(dark, face);
+                grounds.insert((c.bg.r(), c.bg.g(), c.bg.b()));
+                let mode = if dark { "dark" } else { "light" };
+                let words = crate::recorder_panel::contrast_ratio(c.text, c.bg);
+                if words < 4.5 {
+                    bad.push(format!("{} {mode}: menu text {words:.2}:1", theme.name));
+                }
+                // The row under the pointer has to be findable, and its text
+                // still readable on it.
+                let hl = crate::recorder_panel::contrast_ratio(c.sel, c.bg);
+                if hl < 1.06 {
+                    bad.push(format!("{} {mode}: highlight {hl:.2}:1", theme.name));
+                }
+                let on_sel = crate::recorder_panel::contrast_ratio(c.text, c.sel);
+                if on_sel < 4.0 {
+                    bad.push(format!("{} {mode}: text on highlight {on_sel:.2}:1", theme.name));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "menus do not hold up:\n  {}", bad.join("\n  "));
+        assert!(
+            grounds.len() > 8,
+            "only {} distinct menu grounds across sixteen themes",
+            grounds.len()
+        );
+
+        // **Default is the signature**: the shipped bone, with black on it.
+        let mut set = crate::settings::Settings::default();
+        crate::theme::Theme::factory_default().apply(&mut set);
+        let c = colors(false, set.fx_strip_color.to_color32());
+        assert_eq!(
+            (c.bg.r(), c.bg.g(), c.bg.b()),
+            (0xE3, 0xD9, 0xBD),
+            "the default menu stopped being the desk's own bone"
+        );
+        assert!(
+            !crate::recorder_panel::wants_light_ink(c.bg),
+            "the default menu stopped taking black text"
+        );
+    }
     #[test]
     #[ignore = "structure dump, not an assertion"]
     fn dump_menu_structure() {
