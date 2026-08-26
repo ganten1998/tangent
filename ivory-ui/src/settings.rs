@@ -460,6 +460,10 @@ pub struct Settings {
     /// this app shipped with. Keyed by the role name a theme file uses, so
     /// the file format and this map are the same vocabulary.
     pub dark_roles: std::collections::BTreeMap<String, Rgb>,
+    /// The app's own background: behind the keyboard, and the ground every
+    /// theory module draws on. A theme role since it was the one surface that
+    /// had none — two fixed values, one per mode, on all sixteen themes.
+    pub background_color: Rgb,
     pub white_key_idle_color: Rgb,
     pub black_key_idle_color: Rgb,
     pub white_key_active_color: Rgb,
@@ -1159,6 +1163,7 @@ impl Default for Settings {
             pad_state_shift_v18: false,
             desk_state_shift_v19: false,
             dark_roles: std::collections::BTreeMap::new(),
+            background_color: Rgb::new(0xE8, 0xE8, 0xE8),
             white_key_idle_color: Rgb::new(0xE8, 0xDC, 0xC0),
             black_key_idle_color: Rgb::new(0x1a, 0x1a, 0x1a),
             white_key_active_color: Rgb::new(0x6C, 0x9B, 0xD2),
@@ -1654,6 +1659,7 @@ impl Settings {
                 }
             }
         }
+        take_color(&mut map, "background_color", &mut s.background_color);
         take_color(
             &mut map,
             "white_key_idle_color",
@@ -2687,13 +2693,6 @@ impl Settings {
         // The dark overrides ride along as one object, so a settings file
         // gains one key rather than seventeen, and an unknown role written by
         // a newer build survives a round trip through an older one.
-        if !self.dark_roles.is_empty() {
-            let mut d = Map::new();
-            for (role, c) in &self.dark_roles {
-                d.insert(role.clone(), Value::String(c.to_hex()));
-            }
-            map.insert("dark_roles".into(), Value::Object(d));
-        }
         map.insert(
             "white_key_idle_color".into(),
             Value::String(self.white_key_idle_color.to_hex()),
@@ -3175,6 +3174,24 @@ impl Settings {
             ("string_color", self.string_color),
         ] {
             map.insert(k.into(), Value::String(v.to_hex()));
+        }
+        // **Additive keys go at the END**, ahead only of the preserved
+        // unknown ones. Inserting mid-map shifts every key after it, which is
+        // what `unknown_keys_preserved_and_key_order_stable` is for: the
+        // point is that a saved file does not churn its key order, not that
+        // any one index is sacred.
+        map.insert(
+            "background_color".into(),
+            Value::String(self.background_color.to_hex()),
+        );
+        // One object rather than seventeen keys, and only when there is
+        // something to say.
+        if !self.dark_roles.is_empty() {
+            let mut d = Map::new();
+            for (role, c) in &self.dark_roles {
+                d.insert(role.clone(), Value::String(c.to_hex()));
+            }
+            map.insert("dark_roles".into(), Value::Object(d));
         }
         for (k, v) in &self.extra {
             map.insert(k.clone(), v.clone());

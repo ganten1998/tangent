@@ -1492,8 +1492,14 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             if !r.is_positive() {
                 return;
             }
-            let bone = Color32::from_rgb(0xE3, 0xD9, 0xBD);
-            let ink = Color32::from_rgb(0x24, 0x20, 0x1A);
+            // **The same surface the mixer's bays are**, and the same ink.
+            // These were a hard-coded bone panel with hard-coded near-black
+            // on it — the shipped desk's colours, frozen — so on every theme
+            // but the default the input, FX and routing chips stayed white
+            // modules on a desk that had moved. `hdr_face` IS the mixer's
+            // strip face, and `engrave` is what that face can carry.
+            let bone = p.hdr_face;
+            let ink = p.engrave;
             painter.rect_filled(r, 2.0, bone);
             painter.rect_stroke(
                 r,
@@ -2066,6 +2072,23 @@ mod tests {
                 };
                 // Words have to be readable; structure only has to be seen.
                 check("header text", p.engrave, p.hdr_face, 4.5);
+                // **The chips are the mixer's bays.** Input, FX and routing
+                // were a hard-coded bone panel with hard-coded near-black on
+                // it, so on every theme but the default they stayed white
+                // modules on a desk that had moved. Same surface, same ink —
+                // and the faded state has to read too, which is the one the
+                // 0.55 alpha used to make invisible.
+                check("chip text", p.engrave, p.hdr_face, 4.5);
+                assert_eq!(
+                    p.hdr_face,
+                    Color32::from_rgb(
+                        set.fx_strip_color.r,
+                        set.fx_strip_color.g,
+                        set.fx_strip_color.b,
+                    ),
+                    "{} {mode}: the chips left the mixer's strip face",
+                    theme.name,
+                );
                 // **The clip ink is checked against the CLIP**, which is the
                 // only thing it is ever drawn on — the note miniatures and
                 // the fade lines both sit inside a clip's own rect. Measuring

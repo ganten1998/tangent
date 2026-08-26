@@ -72,12 +72,34 @@ fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
 }
 
+/// The ground behind the keyboard — a THEME ROLE now.
+///
+/// It was two fixed values, one per mode, identical on all sixteen themes.
 pub fn bg_color(dark_mode: bool) -> Color32 {
     if dark_mode {
         Color32::from_rgb(0x1a, 0x1a, 0x1a)
     } else {
         Color32::from_rgb(0xE8, 0xE8, 0xE8)
     }
+}
+
+/// The background this theme asks for, in the mode it is in.
+///
+/// Dark mode takes the theme's own dark ground when it named one and darkens
+/// the light one when it did not, which is the derivation every other role
+/// gets.
+pub fn themed_bg(s: &Settings) -> Color32 {
+    if !s.dark_mode {
+        return s.background_color.to_color32();
+    }
+    s.dark_role("background").map_or_else(
+        || {
+            let c = s.background_color.to_color32();
+            let f = |v: u8| (f32::from(v) * 0.12) as u8;
+            Color32::from_rgb(f(c.r()), f(c.g()), f(c.b()))
+        },
+        |c| c.to_color32(),
+    )
 }
 
 /// Draw the piano into `rect`. `display_notes` must already include manual
@@ -96,7 +118,7 @@ pub fn draw(
     let top = rect.top();
 
     // 1. Background fill (visible only through truncation slivers).
-    painter.rect_filled(rect, 0.0, bg_color(s.dark_mode));
+    painter.rect_filled(rect, 0.0, themed_bg(s));
 
     let white_key_w = w / WHITE_KEYS as f64;
     let black_key_w = white_key_w * 0.7;

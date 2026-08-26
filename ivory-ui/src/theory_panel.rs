@@ -444,27 +444,85 @@ fn palette(s: &Settings) -> Palette {
     // against their background where text wants 4.5:1. Darkened on light and
     // lightened on dark until the numerals read at a glance, while staying
     // clearly below the note names in weight.
-    if s.dark_mode {
-        Palette {
-            bg: Color32::from_rgb(0x0a, 0x0a, 0x0a),
-            ink: Color32::from_rgb(0xE8, 0xDC, 0xC0),
-            faint: Color32::from_rgb(0x9a, 0x92, 0x80),
-            line: shade_line(s.theory_line_color.to_color32(), 0.66),
-            lit,
-            lit_text: Color32::BLACK,
-            root: s.sustain_color.to_color32(),
-        }
+    // **The ground is the THEME's, and everything on it is measured against
+    // it.** These were two frozen pairs — near-black and cream — so every one
+    // of the sixteen themes drew its theory modules on the same two
+    // backgrounds, which is what the owner saw: "ivory on every light mode,
+    // black on every dark mode".
+    let bg = crate::piano::themed_bg(s);
+    let ink = if crate::recorder_panel::wants_light_ink(bg) {
+        crate::recorder_panel::INK_LIGHT
     } else {
-        Palette {
-            bg: Color32::from_rgb(0xE8, 0xDC, 0xC0),
-            ink: Color32::from_rgb(0x1a, 0x1a, 0x1a),
-            faint: Color32::from_rgb(0x6b, 0x60, 0x4a),
-            line: s.theory_line_color.to_color32(),
-            lit,
-            lit_text: Color32::WHITE,
-            root: s.sustain_color.to_color32(),
+        crate::recorder_panel::INK_DARK
+    };
+    Palette {
+        bg,
+        ink,
+        // The numerals and the key signatures: below the note names in weight
+        // and still readable, which is what pulling the ink 30% toward the
+        // ground buys — and it is a RATIO of the two, so it holds on any
+        // ground rather than being a grey that suits one.
+        faint: {
+            let f = |x: u8, y: u8| {
+                (f32::from(x) + (f32::from(y) - f32::from(x)) * 0.30) as u8
+            };
+            Color32::from_rgb(
+                f(ink.r(), bg.r()),
+                f(ink.g(), bg.g()),
+                f(ink.b(), bg.b()),
+            )
+        },
+        // **The theme's line, pushed off the ground if it lands on it.**
+        //
+        // Dark mode used to darken this by a fixed 0.66, which was tuned for
+        // the one near-black background this view used to have. Against a
+        // ground that now moves with the theme, a fixed nudge is a line that
+        // disappears on seven of the sixteen — so it is measured instead, and
+        // moved only as far as it has to be.
+        line: visible_on(s.theory_line_color.to_color32(), bg, 1.9),
+        lit,
+        // What a lit cell can carry, for the same reason as everything else:
+        // the lit colour is the user's and can be anything.
+        lit_text: if crate::recorder_panel::wants_light_ink(lit) {
+            crate::recorder_panel::INK_LIGHT
+        } else {
+            crate::recorder_panel::INK_DARK
+        },
+        root: s.sustain_color.to_color32(),
+    }
+}
+
+/// Move `c` away from `bg` until it can be SEEN on it — the least distance
+/// that clears `floor`, so a theme's own colour survives wherever it already
+/// worked.
+///
+/// Lines are structure rather than words, so the bar is well under the 4.5:1
+/// that text answers to; what it prevents is a grid that is not there.
+fn visible_on(c: Color32, bg: Color32, floor: f32) -> Color32 {
+    if crate::recorder_panel::contrast_ratio(c, bg) >= floor {
+        return c;
+    }
+    let toward = if crate::recorder_panel::wants_light_ink(bg) {
+        Color32::WHITE
+    } else {
+        Color32::BLACK
+    };
+    let mut out = c;
+    for step in 1u8..=40 {
+        let t = f32::from(step) * 0.025_f32;
+        let f = |x: u8, y: u8| {
+            (f32::from(x) + (f32::from(y) - f32::from(x)) * t) as u8
+        };
+        out = Color32::from_rgb(
+            f(c.r(), toward.r()),
+            f(c.g(), toward.g()),
+            f(c.b(), toward.b()),
+        );
+        if crate::recorder_panel::contrast_ratio(out, bg) >= floor {
+            break;
         }
     }
+    out
 }
 
 fn font(size: f32) -> FontId {
@@ -1781,6 +1839,56 @@ mod tests {
 
     /// The circle really is fifths, all the way round and back to the start.
     /// A typo in that table would still look like a circle of fifths.
+
+    /// **Every theme brings its own theory ground, in both modes.**
+    ///
+    /// The owner: "ivory on every light mode, black on every dark mode when
+    /// they should be per theme". Two frozen pairs meant sixteen themes drew
+    /// their modules on the same two backgrounds. This checks that the ground
+    /// MOVES with the theme, and that everything printed on it still reads.
+    #[test]
+    fn every_theme_grounds_the_theory_view_in_its_own_colour() {
+        let mut seen_light = std::collections::HashSet::new();
+        let mut seen_dark = std::collections::HashSet::new();
+        let mut bad: Vec<String> = Vec::new();
+        for theme in crate::theme::factory() {
+            for dark in [false, true] {
+                let mut s = Settings::default();
+                theme.apply(&mut s);
+                s.dark_mode = dark;
+                let p = palette(&s);
+                let mode = if dark { "dark" } else { "light" };
+                let key = (p.bg.r(), p.bg.g(), p.bg.b());
+                if dark { seen_dark.insert(key) } else { seen_light.insert(key) };
+                for (what, fg, floor) in [
+                    ("ink", p.ink, 4.5),
+                    ("faint", p.faint, 3.0),
+                    ("line", p.line, 1.7),
+                ] {
+                    let r = crate::recorder_panel::contrast_ratio(fg, p.bg);
+                    if r < floor {
+                        bad.push(format!("{} {mode}: {what} {r:.2}:1", theme.name));
+                    }
+                }
+                let lit = crate::recorder_panel::contrast_ratio(p.lit_text, p.lit);
+                if lit < 4.5 {
+                    bad.push(format!("{} {mode}: lit text {lit:.2}:1", theme.name));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "the theory view does not hold up:\n  {}", bad.join("\n  "));
+        // And they are not all the same ground, which was the whole report.
+        assert!(
+            seen_light.len() > 8,
+            "only {} distinct light grounds across sixteen themes",
+            seen_light.len()
+        );
+        assert!(
+            seen_dark.len() > 8,
+            "only {} distinct dark grounds across sixteen themes",
+            seen_dark.len()
+        );
+    }
     #[test]
     fn the_circle_ascends_by_fifths_and_closes() {
         for i in 0..12 {

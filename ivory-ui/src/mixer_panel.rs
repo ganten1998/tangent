@@ -1905,21 +1905,41 @@ fn switch(painter: &Painter, r: Rect, label: &str, on: bool, lit: Color32, p: &I
     if !r.is_positive() {
         return;
     }
-    painter.rect_filled(r, 2.0, if on { lit } else { p.track });
+    // **A lit switch is deepened until its letter fits on it.**
+    //
+    // The solo crimson and the record red both land in the dead zone where
+    // neither ink clears 4.5:1 — 4.27 and 3.66 — so S and R were the two
+    // least readable things on the desk, on every theme, and had been since
+    // they were drawn. They stay recognisably the same lights; they are just
+    // taken far enough down to carry a letter. The meters and the playhead
+    // keep the undimmed reds, because nothing is printed on those.
+    let ground = if on {
+        crate::recorder_panel::legible_surface(lit)
+    } else {
+        p.track
+    };
+    painter.rect_filled(r, 2.0, ground);
     let size = (r.height() * 0.62).clamp(8.0, 13.0);
     centred(
         painter,
         r,
         label,
         FontId::new(size, crate::fonts::courier_bold()),
-        // **Light either way.** The well behind an unlit switch is nearly
-        // black, so the dark ink the rest of the strip uses vanished into it —
-        // two unlabelled rectangles under every channel, which is what the
-        // first version of this drew.
-        if on {
-            p.engrave
+        // **Measured against the SWITCH, not against the strip.**
+        //
+        // Both branches were wrong. Lit, it took `engrave` — which is the ink
+        // for the strip FACE, not for the mute's amber or the arm's red, and
+        // an ivory M on amber is not a letter anybody reads. Unlit, it took
+        // `p.face`: the themed strip colour used AS INK, which is the same
+        // mistake `print_on` was carrying, and it goes dark-on-near-black the
+        // moment a theme picks a dark face.
+        //
+        // A switch is a surface like any other. What can be printed on it is
+        // a property of the colour it was just filled with.
+        if crate::recorder_panel::wants_light_ink(ground) {
+            crate::recorder_panel::INK_LIGHT
         } else {
-            p.face.gamma_multiply(0.78)
+            crate::recorder_panel::INK_DARK
         },
     );
 }
@@ -2654,6 +2674,50 @@ mod tests {
             0,
             "the neutrals and the hues do not line up into rows"
         );
+    }
+
+
+    /// **M, S and R are readable lit and unlit, on every theme.**
+    ///
+    /// Both branches used to be wrong at once. Lit, the letter took the ink
+    /// for the strip FACE and printed it on the mute's amber or the arm's
+    /// red. Unlit, it took the themed face colour AS INK and went
+    /// dark-on-near-black the moment a theme picked a dark face.
+    #[test]
+    fn the_switch_letters_read_lit_and_unlit_on_every_theme() {
+        let mut bad: Vec<String> = Vec::new();
+        for theme in crate::theme::factory() {
+            for dark in [false, true] {
+                let mut set = crate::settings::Settings::default();
+                theme.apply(&mut set);
+                let mut v = a_view();
+                v.dark_mode = dark;
+                v.fx_strip = set.fx_strip_color.to_color32();
+                let p = ink(&v);
+                let grounds = [
+                    ("unlit", p.track),
+                    ("mute", crate::recorder_panel::legible_surface(p.mute)),
+                    ("solo", crate::recorder_panel::legible_surface(p.solo)),
+                    ("arm", crate::recorder_panel::legible_surface(p.arm)),
+                ];
+                for (what, ground) in grounds {
+                    let letter = if crate::recorder_panel::wants_light_ink(ground) {
+                        crate::recorder_panel::INK_LIGHT
+                    } else {
+                        crate::recorder_panel::INK_DARK
+                    };
+                    let r = crate::recorder_panel::contrast_ratio(letter, ground);
+                    if r < 4.5 {
+                        bad.push(format!(
+                            "{} {}: {what} switch {r:.2}:1",
+                            theme.name,
+                            if dark { "dark" } else { "light" }
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(bad.is_empty(), "switch letters unreadable:\n  {}", bad.join("\n  "));
     }
 
     fn rgb(i: usize) -> Color32 {
