@@ -4773,7 +4773,11 @@ pub fn show(
                             ui.label(RichText::new("COLOUR").font(bold(10.0)).color(dim));
                             // The swatch grid: hues down, tones across —
                             // the palette overlay's own table.
-                            let cols = 9usize;
+                            // Only the HAND-PICKABLE part of the table: the
+                            // auto-palettes' own colours live past it and are
+                            // reached by choosing a palette, never a swatch.
+                            let cols = crate::mixer_panel::MANUAL_COLORS
+                                / crate::mixer_panel::PALETTE_COLUMNS;
                             let sw = (ui.available_width() - (cols as f32 - 1.0) * 3.0)
                                 / cols as f32;
                             for row in 0..3 {
@@ -4787,8 +4791,8 @@ pub fn show(
                                             _ => 0,
                                         };
                                         let (cr, cg, cb) =
-                                            crate::mixer_panel::STRIP_COLORS
-                                                [idx.min(26)];
+                                            crate::mixer_panel::STRIP_COLORS[idx
+                                                .min(crate::mixer_panel::MANUAL_COLORS - 1)];
                                         let color = if idx == 0 {
                                             egui::Color32::from_rgb(0x6B, 0x4A, 0x3A)
                                         } else {
@@ -4822,7 +4826,7 @@ pub fn show(
                                     .font(bold(10.0))
                                     .color(dim),
                             );
-                            for (i, (name, set)) in
+                            for (i, pal) in
                                 crate::mixer_panel::PALETTES.iter().enumerate()
                             {
                                 ui.horizontal(|ui| {
@@ -4830,7 +4834,7 @@ pub fn show(
                                         .add_sized(
                                             Vec2::new(64.0, 18.0),
                                             Button::new(
-                                                RichText::new(*name)
+                                                RichText::new(pal.name)
                                                     .font(plain(10.0))
                                                     .color(t.text),
                                             ),
@@ -4840,11 +4844,18 @@ pub fn show(
                                         action =
                                             Some(DialogAction::TrackPalette(i as i64));
                                     }
-                                    for idx in set {
+                                    // Sixteen channels, then the click and the
+                                    // master set a little apart — the row is
+                                    // the whole desk in miniature, and the two
+                                    // that are not channels should not read as
+                                    // the seventeenth and eighteenth.
+                                    let sw = ((ui.available_width() - 8.0) / 18.0)
+                                        .clamp(5.0, 12.0);
+                                    let mut swatch = |ui: &mut egui::Ui, c: usize| {
                                         let (cr, cg, cb) = crate::mixer_panel::STRIP_COLORS
-                                            [(*idx as usize).min(26)];
+                                            [c.min(crate::mixer_panel::STRIP_COLORS.len() - 1)];
                                         let (rect, _) = ui.allocate_exact_size(
-                                            Vec2::new(14.0, 14.0),
+                                            Vec2::new(sw, 14.0),
                                             egui::Sense::hover(),
                                         );
                                         ui.painter().rect_filled(
@@ -4852,7 +4863,13 @@ pub fn show(
                                             2.0,
                                             egui::Color32::from_rgb(cr, cg, cb),
                                         );
+                                    };
+                                    for c in 0..crate::recorder::CHANNELS {
+                                        swatch(ui, pal.slot(c));
                                     }
+                                    ui.add_space(6.0);
+                                    swatch(ui, pal.click());
+                                    swatch(ui, pal.master());
                                 });
                             }
                             });

@@ -295,7 +295,7 @@ impl Hit {
 /// [`PALETTE_COLUMNS`] is what makes the grid read as hues rather than as
 /// twenty-seven swatches: reading down a column is one tone, across a row is
 /// one colour.
-pub const STRIP_COLORS: [(u8, u8, u8); 27] = [
+pub const STRIP_COLORS: [(u8, u8, u8); 164] = [
     (0x00, 0x00, 0x00), // the desk's own wood — replaced at draw time
     (0x36, 0x33, 0x30), // slate
     (0x56, 0x51, 0x4D), // stone
@@ -307,30 +307,147 @@ pub const STRIP_COLORS: [(u8, u8, u8); 27] = [
     (0x12, 0x24, 0x3F), (0x17, 0x36, 0x63), (0x27, 0x4D, 0x86), // blue
     (0x29, 0x12, 0x3F), (0x3D, 0x17, 0x63), (0x57, 0x27, 0x86), // violet
     (0x3F, 0x12, 0x33), (0x63, 0x17, 0x4E), (0x86, 0x27, 0x6C), // magenta
+    // ── the auto-palette colours, past the hand-picking grid ──────────────
+    //
+    // **Generated, not eyeballed** — `scripts/palgen.py` solves each one for
+    // a target luminance under a chroma ceiling, because the two things that
+    // went wrong when these were picked by hand are exactly the two things a
+    // person cannot do by eye. Every colour here is dark enough that the
+    // ivory ink wins on it at 4.5:1 or better, and no more colourful than its
+    // neighbours — equal luminance is NOT equal vividness, and a violet
+    // forced onto an ochre's luminance climbs to a neon #7736c1 to get there.
+    //
+    // They are APPENDED, and appending is the whole trick: every index
+    // already written into somebody's saved desk still means the colour it
+    // meant. See `PALETTE_V1_TO_V2` for what renumbering this table costs.
+    (0xb0, 0x20, 0x33), // 27  the master, shared by every palette
+    // IVORY: channels 28..43, click 44
+    (0x76, 0x38, 0x21), (0x2b, 0x21, 0x0c), (0x43, 0x4e, 0x16), (0x0f, 0x27, 0x0b),
+    (0x17, 0x52, 0x47), (0x10, 0x23, 0x38), (0x59, 0x3d, 0x79), (0x3d, 0x11, 0x2f),
+    (0x8e, 0x47, 0x2d), (0x45, 0x34, 0x13), (0x53, 0x60, 0x1b), (0x18, 0x3f, 0x12),
+    (0x1c, 0x65, 0x57), (0x19, 0x38, 0x5b), (0x6b, 0x4d, 0x8e), (0x60, 0x1b, 0x49),
+    (0x3a, 0x37, 0x29),
+    // EMBER: channels 45..60, click 61
+    (0x36, 0x1b, 0x0e), (0x4a, 0x32, 0x13), (0x54, 0x49, 0x16), (0x51, 0x61, 0x19),
+    (0x56, 0x2c, 0x16), (0x63, 0x44, 0x1a), (0x67, 0x5a, 0x1b), (0x1e, 0x24, 0x09),
+    (0x73, 0x3a, 0x1e), (0x79, 0x53, 0x20), (0x27, 0x23, 0x0a), (0x31, 0x3b, 0x0f),
+    (0x8b, 0x49, 0x27), (0x2e, 0x20, 0x0c), (0x3e, 0x37, 0x10), (0x42, 0x4f, 0x15),
+    (0x3a, 0x37, 0x2c),
+    // TIDE: channels 62..77, click 78
+    (0x0a, 0x26, 0x21), (0x13, 0x3b, 0x4a), (0x28, 0x47, 0x86), (0x63, 0x50, 0x90),
+    (0x10, 0x3d, 0x34), (0x1a, 0x50, 0x63), (0x38, 0x59, 0x9c), (0x27, 0x16, 0x50),
+    (0x16, 0x53, 0x47), (0x20, 0x62, 0x79), (0x11, 0x21, 0x41), (0x3e, 0x2c, 0x68),
+    (0x1a, 0x66, 0x56), (0x0c, 0x25, 0x2e), (0x1b, 0x35, 0x69), (0x52, 0x3f, 0x7d),
+    (0x2f, 0x38, 0x3c),
+    // MOSS: channels 79..94, click 95
+    (0x1d, 0x25, 0x0a), (0x1d, 0x3e, 0x10), (0x16, 0x54, 0x27), (0x1b, 0x66, 0x55),
+    (0x2e, 0x3b, 0x0f), (0x26, 0x53, 0x16), (0x1f, 0x67, 0x32), (0x0a, 0x26, 0x20),
+    (0x3e, 0x4f, 0x15), (0x37, 0x65, 0x27), (0x0a, 0x27, 0x12), (0x10, 0x3e, 0x33),
+    (0x4d, 0x62, 0x1a), (0x12, 0x26, 0x0a), (0x11, 0x3f, 0x1d), (0x16, 0x53, 0x45),
+    (0x33, 0x38, 0x2b),
+    // NEON: channels 96..111, click 112
+    (0x88, 0x29, 0x07), (0x2e, 0x20, 0x02), (0x40, 0x4f, 0x04), (0x07, 0x28, 0x02),
+    (0x04, 0x54, 0x44), (0x03, 0x22, 0x45), (0x5e, 0x34, 0x8e), (0x46, 0x04, 0x30),
+    (0x9e, 0x3b, 0x18), (0x4a, 0x33, 0x04), (0x4f, 0x61, 0x05), (0x0b, 0x40, 0x03),
+    (0x05, 0x67, 0x54), (0x06, 0x36, 0x6e), (0x70, 0x45, 0xa2), (0x6c, 0x05, 0x4a),
+    (0x48, 0x2e, 0x48),
+    // ASH: channels 113..128, click 129
+    (0x14, 0x11, 0x0f), (0x1a, 0x1f, 0x24), (0x2a, 0x26, 0x20), (0x27, 0x2d, 0x36),
+    (0x38, 0x32, 0x2b), (0x31, 0x3a, 0x44), (0x43, 0x3c, 0x33), (0x39, 0x43, 0x4f),
+    (0x4d, 0x45, 0x3b), (0x40, 0x4b, 0x59), (0x55, 0x4c, 0x41), (0x46, 0x51, 0x61),
+    (0x5c, 0x52, 0x46), (0x4b, 0x58, 0x68), (0x63, 0x58, 0x4b), (0x50, 0x5d, 0x6f),
+    (0x42, 0x35, 0x1e),
+    // BLOOM: channels 130..145, click 146
+    (0x2e, 0x14, 0x4b), (0x57, 0x1f, 0x57), (0x7d, 0x2b, 0x59), (0x50, 0x55, 0x95),
+    (0x45, 0x29, 0x65), (0x6e, 0x33, 0x6e), (0x8f, 0x3f, 0x6c), (0x16, 0x1b, 0x56),
+    (0x59, 0x3d, 0x79), (0x7f, 0x45, 0x7f), (0x3f, 0x10, 0x2b), (0x2c, 0x30, 0x6e),
+    (0x6b, 0x4d, 0x8e), (0x3b, 0x0f, 0x3b), (0x63, 0x1a, 0x44), (0x3f, 0x43, 0x83),
+    (0x41, 0x32, 0x41),
+    // PATINA: channels 147..162, click 163
+    (0x0a, 0x26, 0x22), (0x50, 0x2f, 0x15), (0x18, 0x50, 0x5c), (0x6e, 0x58, 0x1d),
+    (0x10, 0x3d, 0x36), (0x6c, 0x3e, 0x1c), (0x1e, 0x63, 0x71), (0x29, 0x21, 0x0b),
+    (0x15, 0x52, 0x48), (0x85, 0x4d, 0x22), (0x0b, 0x25, 0x2b), (0x43, 0x36, 0x11),
+    (0x1a, 0x65, 0x59), (0x32, 0x1d, 0x0d), (0x12, 0x3d, 0x45), (0x59, 0x48, 0x17),
+    (0x2c, 0x39, 0x37),
 ];
 
-/// Three, because the table is hues down and tones across.
+/// How much of [`STRIP_COLORS`] a person can point at.
+///
+/// The rest is the auto-palettes' own, reachable by choosing a palette and
+/// never by choosing a swatch: a hundred and thirty-odd swatches is not a
+/// picker, it is a wall.
+pub const MANUAL_COLORS: usize = 27;
+
+/// Three, because the hand-picking grid is hues down and tones across.
 pub const PALETTE_COLUMNS: usize = 3;
 
-/// The AUTO-PALETTES: a colour per SLOT, worn by every channel nobody has
-/// painted by hand. Five staged sets — the default complements the wood
-/// and the dark lane field — and no custom ones yet, by the owner's word.
-pub const PALETTES: [(&str, [i64; 8]); 5] = [
-    ("IVORY", [4, 7, 10, 13, 16, 19, 22, 25]),
-    ("EMBER", [5, 8, 4, 7, 26, 25, 11, 3]),
-    ("TIDE", [17, 20, 14, 16, 19, 13, 23, 15]),
-    ("MOSS", [10, 13, 7, 12, 9, 6, 16, 11]),
-    ("NEON", [5, 8, 11, 14, 17, 20, 23, 26]),
+/// One auto-palette: what every channel nobody has painted by hand wears.
+///
+/// **Sixteen slots, because the desk has sixteen channels.** They used to be
+/// eight and cycle, so channel 8 wore channel 0's colour and two tracks that
+/// had nothing to do with each other matched.
+pub struct Palette {
+    pub name: &'static str,
+    /// Where this palette's run starts in [`STRIP_COLORS`]: sixteen channel
+    /// colours, then its click.
+    pub base: usize,
+}
+
+impl Palette {
+    /// The colour for channel `i`.
+    pub fn slot(&self, i: usize) -> usize {
+        self.base + i % crate::recorder::CHANNELS
+    }
+
+    /// The click's colour in this palette.
+    ///
+    /// The click is not a channel and should not dress like one — but it is
+    /// not the master either, so it gets the palette's own quiet neutral
+    /// rather than a hue out of the set.
+    pub fn click(&self) -> usize {
+        self.base + crate::recorder::CHANNELS
+    }
+
+    /// The master's colour — the SAME crimson in every palette.
+    ///
+    /// It is the one strip you go looking for, and a master that changed
+    /// colour with the theme would be a master you had to find twice.
+    pub fn master(&self) -> usize {
+        MASTER_COLOR
+    }
+}
+
+/// The AUTO-PALETTES. The first five keep the names and the order they
+/// shipped with, because `palette_choice` is an INDEX somebody has saved.
+pub const PALETTES: [Palette; 8] = [
+    Palette { name: "IVORY", base: 28 },
+    Palette { name: "EMBER", base: 45 },
+    Palette { name: "TIDE", base: 62 },
+    Palette { name: "MOSS", base: 79 },
+    Palette { name: "NEON", base: 96 },
+    Palette { name: "ASH", base: 113 },
+    Palette { name: "BLOOM", base: 130 },
+    Palette { name: "PATINA", base: 147 },
 ];
 
 /// The drum bus's colour everywhere: dark violet, no palette uses it, so
 /// the bus can never dress like one of the eight.
 pub const DRUMS_COLOR: usize = 22;
 
-/// The master's colour on a fresh install. Red, because it is the one channel
-/// you look for — the top tone of it, which is the one that reads as RED
-/// rather than as maroon.
-pub const MASTER_COLOR: usize = 5;
+/// The master's colour. Crimson, because it is the one channel you look for.
+///
+/// It sits ABOVE the chroma ceiling the channel colours obey — deliberately.
+/// Pulled down to their vividness it stops being crimson and becomes another
+/// dark rose in a rack of them, which is the opposite of the job.
+pub const MASTER_COLOR: usize = 27;
+
+/// What the master used to be: the old table's top red. Recognised on load so
+/// a desk that never had its master repainted joins the palette instead of
+/// keeping a colour the owner never actually chose.
+pub const LEGACY_MASTER_COLOR: i64 = 5;
+
+/// What the click used to be, for the same reason.
+pub const LEGACY_CLICK_COLOR: i64 = 8;
 
 /// Where the eight-colour table's indices moved to when it became this one.
 ///
@@ -1888,7 +2005,23 @@ fn luma(c: Color32) -> f32 {
 ///
 /// `bg` must be a colour that is really on screen — see [`flatten`].
 fn print_on(bg: Color32, p: &Ink) -> Color32 {
-    if luma(bg) > 140.0 { p.engrave } else { p.face }
+    // **Never the FACE.** This used to answer `p.face` on a dark channel,
+    // which was right for exactly as long as the face was the desk's bone:
+    // light, neutral, and legible on anything dark. Once `fx_strip` became a
+    // theme role the face became whatever colour the theme wanted, and the
+    // rule started printing the Iris theme's purple onto an olive track —
+    // the owner's screenshot, and every reading of "a text colour that
+    // doesn't contrast or fit".
+    //
+    // The ink a surface can carry is a property OF THAT SURFACE. So it is
+    // measured, out of the same pair and by the same authority the band and
+    // the strip faces already use.
+    let _ = p;
+    if crate::recorder_panel::wants_light_ink(bg) {
+        crate::recorder_panel::INK_LIGHT
+    } else {
+        crate::recorder_panel::INK_DARK
+    }
 }
 
 fn cut_to_fit(painter: &Painter, width: f32, text: &str, font: &FontId) -> String {
@@ -2517,9 +2650,136 @@ mod tests {
         // still has to BE in the table it indexes.
         assert!(MASTER_COLOR < STRIP_COLORS.len());
         assert_eq!(
-            (STRIP_COLORS.len() - PALETTE_COLUMNS) % PALETTE_COLUMNS,
+            (MANUAL_COLORS - PALETTE_COLUMNS) % PALETTE_COLUMNS,
             0,
             "the neutrals and the hues do not line up into rows"
+        );
+    }
+
+    fn rgb(i: usize) -> Color32 {
+        let (r, g, b) = STRIP_COLORS[i];
+        Color32::from_rgb(r, g, b)
+    }
+
+    /// CIE76 over D65 — enough to answer "can these two be told apart",
+    /// which is the only question asked of it.
+    fn delta_e(a: Color32, b: Color32) -> f32 {
+        fn lab(c: Color32) -> (f32, f32, f32) {
+            let ch = |v: u8| {
+                let v = f32::from(v) / 255.0;
+                if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+            };
+            let (r, g, b) = (ch(c.r()), ch(c.g()), ch(c.b()));
+            let f = |t: f32| if t > 0.008856 { t.cbrt() } else { 7.787 * t + 16.0 / 116.0 };
+            let x = f((r * 0.4124 + g * 0.3576 + b * 0.1805) / 0.95047);
+            let y = f(r * 0.2126 + g * 0.7152 + b * 0.0722);
+            let z = f((r * 0.0193 + g * 0.1192 + b * 0.9505) / 1.08883);
+            (116.0 * y - 16.0, 500.0 * (x - y), 200.0 * (y - z))
+        }
+        let (a, b) = (lab(a), lab(b));
+        ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2) + (a.2 - b.2).powi(2)).sqrt()
+    }
+
+    /// **A palette colour is a whole painted surface with small text on it.**
+    ///
+    /// Not a dot beside a name — the icon, the second line, the dial ticks and
+    /// the decibel readout are all printed straight onto the channel. So every
+    /// colour a palette can hand out has to carry that ink at full strength,
+    /// and the ONLY thing standing between a palette and an unreadable rack is
+    /// this test. It is the rule `scripts/palgen.py` solves for.
+    #[test]
+    fn every_auto_palette_colour_can_carry_the_ink_printed_on_it() {
+        for pal in &PALETTES {
+            for slot in (0..CHANNELS).map(|c| pal.slot(c)).chain([pal.click(), pal.master()]) {
+                let face = rgb(slot);
+                let ink = print_on(face, &ink(&a_view()));
+                let ratio = crate::recorder_panel::contrast_ratio(face, ink);
+                assert!(
+                    ratio >= 4.5,
+                    "{} slot {slot} {face:?} carries its ink at only {ratio:.2}:1",
+                    pal.name
+                );
+            }
+        }
+    }
+
+    /// Sixteen channels, sixteen colours, none of them repeated: the eight
+    /// that cycled meant channel 8 wore channel 0's colour, so two tracks
+    /// with nothing to do with each other matched.
+    #[test]
+    fn every_auto_palette_dresses_all_sixteen_channels_differently() {
+        for pal in &PALETTES {
+            let mut seen = std::collections::HashSet::new();
+            for c in 0..CHANNELS {
+                assert!(
+                    seen.insert(pal.slot(c)),
+                    "{} repeats a colour by channel {c}",
+                    pal.name
+                );
+            }
+            assert_eq!(seen.len(), CHANNELS, "{} is not sixteen wide", pal.name);
+        }
+    }
+
+    /// **Neighbours have to be TELLABLE APART**, which is the entire job of
+    /// colouring a channel. ASH is the exception it is allowed to be: sixteen
+    /// steps inside one ink-safe luminance range cannot be more than a few
+    /// dE apart, and being nearly uniform is what a monochrome theme is for.
+    #[test]
+    fn adjacent_channels_never_wear_the_same_colour_twice_over() {
+        for pal in &PALETTES {
+            let floor = if pal.name == "ASH" { 3.0 } else { 10.0 };
+            for c in 1..CHANNELS {
+                let d = delta_e(rgb(pal.slot(c - 1)), rgb(pal.slot(c)));
+                assert!(
+                    d >= floor,
+                    "{}: channels {} and {c} are {d:.1} apart, under {floor}",
+                    pal.name,
+                    c - 1
+                );
+            }
+        }
+    }
+
+    /// The click and the master are not channels and must not read as one —
+    /// the owner's rack had a fixed amber click and a fixed red master sitting
+    /// beside sixteen channels that had all moved with the theme.
+    #[test]
+    fn the_click_and_the_master_stand_apart_from_every_channel() {
+        for pal in &PALETTES {
+            for (what, slot) in [("click", pal.click()), ("master", pal.master())] {
+                let nearest = (0..CHANNELS)
+                    .map(|c| delta_e(rgb(pal.slot(c)), rgb(slot)))
+                    .fold(f32::MAX, f32::min);
+                assert!(
+                    nearest >= 8.0,
+                    "{}'s {what} is only {nearest:.1} from a channel",
+                    pal.name
+                );
+            }
+            let split = delta_e(rgb(pal.click()), rgb(pal.master()));
+            assert!(split >= 20.0, "{}: click and master are {split:.1} apart", pal.name);
+        }
+    }
+
+    /// **Appending is the contract.** The hand-pickable swatches are the first
+    /// twenty-seven and the palettes' own colours come after, so every index
+    /// already written into somebody's saved desk still means what it meant.
+    #[test]
+    fn the_palettes_live_past_the_swatches_a_person_can_point_at() {
+        assert_eq!(MANUAL_COLORS, 27, "the hand-picking grid changed size");
+        for pal in &PALETTES {
+            assert!(
+                pal.base >= MANUAL_COLORS,
+                "{} starts inside the hand-picked swatches",
+                pal.name
+            );
+            assert!(pal.click() < STRIP_COLORS.len(), "{} runs off the table", pal.name);
+        }
+        assert_eq!(
+            STRIP_COLORS[MANUAL_COLORS - 1],
+            (0x86, 0x27, 0x6C),
+            "the last hand-pickable swatch moved — saved desks just changed colour"
         );
     }
 

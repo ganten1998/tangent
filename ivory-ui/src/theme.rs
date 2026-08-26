@@ -349,7 +349,7 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x4c, 0xc7, 0xa4),
             fretboard: c(0x25, 0x15, 0x24),
             string: c(0xa3, 0x76, 0x8f),
-            channel_palette: None,
+            channel_palette: Some(6),
         },
         // ── Hydra: the owner's audio-routing TUI. Near-black teal depths, a
         // bioluminescent seafoam glow, and exactly one warm coral — which is
@@ -373,7 +373,7 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x4f, 0xd4, 0x9a),
             fretboard: c(0x10, 0x24, 0x28),
             string: c(0x6a, 0x8c, 0x88),
-            channel_palette: None,
+            channel_palette: Some(2),
         },
         // ── Navi: the owner's graph viewer. Layered night blues with
         // periwinkle nodes rimmed in electric cyan, and exactly one warm
@@ -401,7 +401,7 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x55, 0x78, 0xff),
             fretboard: c(0x0a, 0x1c, 0x34),
             string: c(0x78, 0x98, 0xb8),
-            channel_palette: None,
+            channel_palette: Some(2),
         },
         // ── Mono: greys, and one red.
         //
@@ -430,7 +430,7 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x8a, 0x8a, 0x8a),
             fretboard: c(0x1a, 0x1a, 0x1a),
             string: c(0x78, 0x78, 0x78),
-            channel_palette: None,
+            channel_palette: Some(5),
         },
         // ── Studio: the analogue console. Warm charcoal, cream legends, VU
         // amber for anything that moves, an oxblood master, and the sage-green
@@ -457,7 +457,7 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x7f, 0xa0, 0x5a),
             fretboard: c(0x27, 0x24, 0x20),
             string: c(0xa8, 0x98, 0x80),
-            channel_palette: None,
+            channel_palette: Some(1),
         },
         // ── Aurora: indigo night with a mint/violet complementary pair — mint
         // for what is sounding, violet for what is HELD, so the two states of
@@ -481,7 +481,7 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0xa9, 0x7b, 0xf0),
             fretboard: c(0x1e, 0x21, 0x30),
             string: c(0x6b, 0x72, 0x90),
-            channel_palette: None,
+            channel_palette: Some(2),
         },
         // ── Sandstone: the LIGHT one, and the reason the set needs it — every
         // other theme here is dark, and a person working in daylight has
@@ -513,7 +513,7 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x7d, 0x8f, 0x5a),
             fretboard: c(0xc9, 0xb5, 0x96),
             string: c(0x6b, 0x5c, 0x48),
-            channel_palette: None,
+            channel_palette: Some(1),
         },
         // ── Centennial: the DX7 II Centennial, 1987 — Yamaha's hundredth
         // birthday in brushed silver with gold legends and black cheeks. The
@@ -539,7 +539,7 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x5d, 0x6b, 0x78),
             fretboard: c(0x3a, 0x3a, 0x40),
             string: c(0xc9, 0xc9, 0xcf),
-            channel_palette: None,
+            channel_palette: Some(5),
         },
         // ── Blueprint: a cyanotype. Prussian ground, chalk lines, and one
         // ochre for what is HELD — the pencil annotation on a blue print.
@@ -562,7 +562,7 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x6f, 0xc3, 0xb8),
             fretboard: c(0x13, 0x2b, 0x47),
             string: c(0x8f, 0xa8, 0xc0),
-            channel_palette: None,
+            channel_palette: Some(2),
         },
         // ── Porcelain: the other light theme, and cool where Sandstone is
         // warm. Delft cobalt on cool white, with a violet sustain so the two
@@ -586,7 +586,7 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x5a, 0x8a, 0x7a),
             fretboard: c(0x39, 0x42, 0x4e),
             string: c(0xc2, 0xc8, 0xd0),
-            channel_palette: None,
+            channel_palette: Some(2),
         },
         // ── Moss: deep forest, lichen text, and a low amber sustain. The
         // sustain is DARKER than the struck note here — on a green ground a
@@ -610,7 +610,7 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x7f, 0xae, 0x94),
             fretboard: c(0x1d, 0x27, 0x18),
             string: c(0x9a, 0xa8, 0x8c),
-            channel_palette: None,
+            channel_palette: Some(3),
         },
         // ── Rhodes: black tolex, cream keys, and the nameplate's red on the
         // master. Warm where Studio is neutral: this is a wooden instrument
@@ -634,7 +634,7 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x8f, 0xa0, 0x6a),
             fretboard: c(0x24, 0x1d, 0x18),
             string: c(0xb8, 0xac, 0x98),
-            channel_palette: None,
+            channel_palette: Some(1),
         },
         // ── Copper: verdigris and rust, the two things copper becomes. The
         // patina is the ground and the oxide is what moves.
@@ -657,7 +657,7 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0xc0, 0x8a, 0x5a),
             fretboard: c(0x1b, 0x2f, 0x2b),
             string: c(0xa8, 0xb8, 0xb2),
-            channel_palette: None,
+            channel_palette: Some(7),
         },
         // ── Dusk: the sky twenty minutes after sunset — violet overhead,
         // warm at the horizon. The horizon colour is what sounds; the
@@ -681,7 +681,7 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x8f, 0x7f, 0xd0),
             fretboard: c(0x22, 0x1b, 0x3a),
             string: c(0x9a, 0x90, 0xb8),
-            channel_palette: None,
+            channel_palette: Some(6),
         },
         // ── Iris: deep violet with its complement, chartreuse. The widest
         // hue gap in the set, so a sounding note cannot be mistaken for a
@@ -705,7 +705,7 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x9f, 0x7f, 0xd8),
             fretboard: c(0x25, 0x18, 0x40),
             string: c(0xa8, 0x98, 0xc0),
-            channel_palette: None,
+            channel_palette: Some(6),
         },
     ]
 }
@@ -823,6 +823,26 @@ mod tests {
         let before = names.len();
         names.dedup();
         assert_eq!(names.len(), before, "duplicate theme name");
+    }
+
+    /// **A theme that does not name a palette is a theme the channels
+    /// ignore.** Every factory theme used to leave `channel_palette` unset,
+    /// so switching theme repainted the whole desk EXCEPT the sixteen strips
+    /// in the middle of it — they kept whichever palette happened to be there,
+    /// which is how the owner ended up looking at a purple theme wearing an
+    /// orange click and a red master.
+    #[test]
+    fn every_factory_theme_dresses_its_channels() {
+        for t in factory() {
+            let choice = t
+                .channel_palette
+                .unwrap_or_else(|| panic!("{} names no palette", t.name));
+            assert!(
+                (choice as usize) < crate::mixer_panel::PALETTES.len(),
+                "{} names palette {choice}, which does not exist",
+                t.name
+            );
+        }
     }
 
     #[test]

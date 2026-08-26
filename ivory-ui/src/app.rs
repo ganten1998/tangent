@@ -5792,14 +5792,31 @@ impl IvoryApp {
         if i == crate::recorder::Strip::Drums.index() {
             return crate::mixer_panel::DRUMS_COLOR;
         }
-        if self.settings.auto_palette && i < crate::recorder::CHANNELS {
-            let choice = self.settings.palette_choice.clamp(0, 4) as usize;
-            // The palette holds eight hues; with more channels than that they
-            // cycle — channel 8 wears channel 0's colour, and so on.
-            let hues = &crate::mixer_panel::PALETTES[choice].1;
-            return hues[i % hues.len()] as usize;
+        if self.settings.auto_palette {
+            let pal = self.palette();
+            // **The click and the master belong to the palette too.** They
+            // used to hold fixed amber and fixed red whatever the theme was,
+            // which is how a purple theme ended up with an orange click and a
+            // red master sitting next to sixteen channels that had all moved.
+            if i == crate::recorder::Strip::Click.index() {
+                return pal.click();
+            }
+            if i == crate::recorder::STRIPS {
+                return pal.master();
+            }
+            if i < crate::recorder::CHANNELS {
+                return pal.slot(i);
+            }
         }
         0
+    }
+
+    /// The auto-palette in force. Cycled rather than clamped, so a theme
+    /// written against a build with more palettes still lands on one.
+    pub fn palette(&self) -> &'static crate::mixer_panel::Palette {
+        let n = crate::mixer_panel::PALETTES.len() as i64;
+        let choice = self.settings.palette_choice.rem_euclid(n) as usize;
+        &crate::mixer_panel::PALETTES[choice]
     }
 
     /// The drum bus's fader and pan, for the host.
@@ -13599,7 +13616,8 @@ impl IvoryApp {
             }
             DialogAction::TrackPalette(i) => {
                 self.settings.auto_palette = true;
-                self.settings.palette_choice = i.clamp(0, 4);
+                self.settings.palette_choice =
+                    i.rem_euclid(crate::mixer_panel::PALETTES.len() as i64);
                 self.save_settings();
             }
             DialogAction::ProjectExportOpen => {
