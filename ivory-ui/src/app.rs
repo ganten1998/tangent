@@ -10005,6 +10005,12 @@ impl IvoryApp {
                     // The rename is the double-click, handled above on the
                     // release edge; a single press does nothing.
                     Some(A::HdrName(_)) => {}
+                    // The same window the mixer's button opens: routing is
+                    // one subject, reachable from either view.
+                    Some(A::HdrRouting(n)) => {
+                        self.selected_channel = Some(n);
+                        self.dialog = Some(self.routing_dialog(n, None));
+                    }
                     Some(A::HdrBay(n, bay)) => {
                         // The mixer's own door, from here: picker when
                         // empty, the plugin's face when loaded, the patch
@@ -10721,6 +10727,7 @@ impl IvoryApp {
             lanes: std::array::from_fn(|n| {
                 let kind = self.channel_kind(n);
                 crate::arrangement_panel::LaneView {
+                    route_count: self.settings.routes.from(n).len(),
                     name: self.channel_display_name(n),
                     input: self.input_chip_text(n),
                     stereo: match kind {
