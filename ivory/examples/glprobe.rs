@@ -14,7 +14,9 @@
 
 #[cfg(not(all(unix, not(target_os = "macos"))))]
 pub fn main() {
-    eprintln!("glprobe asks why wgpu sees no hardware adapter on Linux; there is nothing to ask here.");
+    eprintln!(
+        "glprobe asks why wgpu sees no hardware adapter on Linux; there is nothing to ask here."
+    );
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]

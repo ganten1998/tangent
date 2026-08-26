@@ -127,7 +127,12 @@ mod tests {
             assert!(carriers >= 1, "algorithm {} has no carrier", a + 1);
             assert!(carriers <= 6, "algorithm {} has {carriers} carriers", a + 1);
             for (i, d) in dest.iter().enumerate() {
-                assert!(*d <= 6, "algorithm {} operator {} targets {d}", a + 1, i + 1);
+                assert!(
+                    *d <= 6,
+                    "algorithm {} operator {} targets {d}",
+                    a + 1,
+                    i + 1
+                );
                 assert_ne!(
                     *d as usize,
                     i + 1,
@@ -211,7 +216,15 @@ mod tests {
     /// cannot come back.
     #[test]
     fn the_entries_that_were_once_mistranscribed_match_the_chart() {
-        for (alg, op) in [(10, 3u8), (12, 2), (18, 3), (20, 3), (21, 3), (28, 5), (30, 5)] {
+        for (alg, op) in [
+            (10, 3u8),
+            (12, 2),
+            (18, 3),
+            (20, 3),
+            (21, 3),
+            (28, 5),
+            (30, 5),
+        ] {
             assert_eq!(
                 FEEDBACK_OP[alg - 1],
                 op,

@@ -490,6 +490,10 @@ pub struct IvoryApp {
     arr_drop: Option<(usize, f64)>,
     /// Files are over the window right now: the lane under them lights.
     arr_drop_hover: bool,
+    /// The pointer during a file drag, in window-local points, as the HOST
+    /// asked the platform for it. `None` when nothing is being dragged, or on
+    /// a platform with no query written. See `DesktopApp::drag_pointer`.
+    drag_pointer: Option<Pos2>,
     /// A clip edit happened during the current gesture: save on release.
     arr_gesture_dirty: bool,
     /// The MIDI item being drawn by shift-drag: lane, from, to (ordered).
@@ -1453,6 +1457,7 @@ impl IvoryApp {
             arr_drag: None,
             arr_drop: None,
             arr_drop_hover: false,
+            drag_pointer: None,
             arr_gesture_dirty: false,
             arr_pending: None,
             arrangement_rect: None,
@@ -10705,8 +10710,14 @@ impl IvoryApp {
             // `latest_pos` as well as `hover_pos`: the cursor can be counted
             // as having left the window during an OS drag, and the last place
             // it was seen is still the right answer.
-            let at = ctx
-                .input(|i| i.pointer.hover_pos().or_else(|| i.pointer.latest_pos()))
+            // The HOST's answer first: during a drag it is the only real
+            // one. egui's pointer is the fallback for platforms with no
+            // query written, where it is at least sometimes right.
+            let at = self
+                .drag_pointer
+                .or_else(|| {
+                    ctx.input(|i| i.pointer.hover_pos().or_else(|| i.pointer.latest_pos()))
+                })
                 .filter(|p| rect.contains(*p));
             if let Some(p) = at {
                 self.arr_drop = Some(landing_now(self, p));
@@ -10725,7 +10736,9 @@ impl IvoryApp {
         if !dropped.is_empty() && !pad_claims {
             // The pointer if it is there, and what the hover worked out if it
             // is not. Only if BOTH are missing does anything get guessed.
-            let (lane, t) = drop_pos
+            let (lane, t) = self
+                .drag_pointer
+                .or(drop_pos)
                 .filter(|p| rect.contains(*p))
                 .map(|p| landing_now(self, p))
                 .or(self.arr_drop)
@@ -11261,6 +11274,16 @@ impl IvoryApp {
     /// The playhead, where an insert lands.
     pub fn playhead_s(&self) -> f64 {
         self.recorder.position_s.max(0.0)
+    }
+
+    /// Where the pointer is during a file drag, pushed in by the host.
+    ///
+    /// **The UI cannot ask.** An OS drag produces no pointer events, so for
+    /// the whole of a drag egui's pointer is stale or absent — which is why
+    /// the first attempt at "land it on the lane it is over" tracked a
+    /// position that was never there. The host asks the platform instead.
+    pub fn set_drag_pointer(&mut self, at: Option<Pos2>) {
+        self.drag_pointer = at;
     }
 
     /// Take a pending "choose a file" request. Same contract again.

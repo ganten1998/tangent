@@ -92,11 +92,7 @@ fn op_rows(op: &Op) -> Vec<PatchParam> {
     v.push(num("Output level", op.output_level, 99));
     v.push(num("Velocity sens", op.vel_sens, 7));
     // Frequency: a ratio of the note, or a fixed pitch.
-    v.push(choice(
-        "Mode",
-        u8::from(op.fixed),
-        &["ratio", "fixed Hz"],
-    ));
+    v.push(choice("Mode", u8::from(op.fixed), &["ratio", "fixed Hz"]));
     v.push(num("Coarse", op.coarse, 31));
     v.push(num("Fine", op.fine, 99));
     // 7 is no detune at all, which is why this is not simply 0..=14.

@@ -577,7 +577,9 @@ impl Writer {
                 + self.short_frames
                 + {
                     let armed = self.plugin_dropped_at_arm;
-                    self.plugin.as_ref().map_or(0, |t| t.dropped().saturating_sub(armed))
+                    self.plugin
+                        .as_ref()
+                        .map_or(0, |t| t.dropped().saturating_sub(armed))
                 },
             // Taken, not copied. It is reset on `Cmd::Start`, and a take that
             // writes no `.wav` at all never sends one — so without this the
@@ -656,8 +658,9 @@ impl Audio {
         // absurd headroom — and that is the point: the one thing that must
         // never happen is the ring filling because the machine hiccuped while
         // somebody was recording a take they cannot play again.
-        let (stream, sink, monitor) = audio::open_input(selection, &wish, 3.0, timebase, duplex_with)
-            .map_err(|e| e.to_string())?;
+        let (stream, sink, monitor) =
+            audio::open_input(selection, &wish, 3.0, timebase, duplex_with)
+                .map_err(|e| e.to_string())?;
         let config = stream.config().clone();
         let channels = config.channels as usize;
         // Read off the SINK, which knows what the device actually honoured —
@@ -858,15 +861,8 @@ impl Audio {
             // picks travel alongside so the renderer can find each strip's
             // columns in them.
             dev_channels,
-            monitor: monitor.map(|m| {
-                (
-                    m,
-                    dev_channels as u16,
-                    sink_widths,
-                    in_block,
-                    monitor_picks,
-                )
-            }),
+            monitor: monitor
+                .map(|m| (m, dev_channels as u16, sink_widths, in_block, monitor_picks)),
         })
     }
 
@@ -1345,10 +1341,10 @@ impl Session {
             return; // never swap the device out from under a running take
         }
         self.audio = None; // close the old one FIRST; some drivers refuse two
-        // And stop the instrument's own writer, which was only running because
-        // there was no input. Both drops join their threads, and each hands the
-        // instrument tap back on the way out — so after this line the tap is in
-        // the channel rather than lost with the thread.
+                           // And stop the instrument's own writer, which was only running because
+                           // there was no input. Both drops join their threads, and each hands the
+                           // instrument tap back on the way out — so after this line the tap is in
+                           // the channel rather than lost with the thread.
         self.plugin_audio = None;
         let tap = self.recover_tap();
         // **A saved device that will not open falls back to the DEFAULT
@@ -1500,8 +1496,7 @@ impl Session {
             // loaded instrument recordable rather than mute — which is the
             // whole point of the None row saying what it now says.
             if let Some(t) = self.recover_tap() {
-                self.plugin_audio =
-                    Some(PluginAudio::start(t, self.timebase, self.tap_tx.clone()));
+                self.plugin_audio = Some(PluginAudio::start(t, self.timebase, self.tap_tx.clone()));
             }
         }
     }
@@ -1599,9 +1594,7 @@ impl Session {
     /// device that has been unplugged — the format is cached at open. Anything
     /// deciding whether to keep showing a picture has to ask this one.
     pub fn camera_running(&self) -> bool {
-        self.camera
-            .as_ref()
-            .is_some_and(|c| c.state().is_running())
+        self.camera.as_ref().is_some_and(|c| c.state().is_running())
     }
 
     /// Whether the camera is delivering materially less than it agreed to.
@@ -1724,8 +1717,7 @@ impl Session {
             // callback, not with `now`: this loop runs at frame rate, and a
             // uniformly late reading is exactly what a running-minimum anchor
             // cannot see through.
-            self.midi_clock
-                .observe(stamp, self.timebase.at(arrived));
+            self.midi_clock.observe(stamp, self.timebase.at(arrived));
             let t = self
                 .midi_clock
                 .to_timebase(stamp)
@@ -1909,7 +1901,10 @@ impl Session {
         // T0 is read AFTER the directory exists. Creating a folder can block on
         // a slow or networked volume, and a T0 taken before it would put that
         // delay at the head of the file as silence the MIDI does not know about.
-        self.t0 = self.arm_override.take().unwrap_or_else(|| self.timebase.now());
+        self.t0 = self
+            .arm_override
+            .take()
+            .unwrap_or_else(|| self.timebase.now());
         self.started_at = at;
         self.manifest_facts = (timeline_start, head, muted, soloed);
         self.started_instant = Some(Instant::now());
@@ -2230,9 +2225,10 @@ impl Session {
         }
         // Which sources this take was made of, so a file that sounds like a
         // piano and a file that sounds like a room can be told apart later.
-        manifest
-            .sources
-            .push(take::SourceReport::from_clock("take_source", &self.midi_clock));
+        manifest.sources.push(take::SourceReport::from_clock(
+            "take_source",
+            &self.midi_clock,
+        ));
         if let Some(last) = manifest.sources.last_mut() {
             last.name = "sources: the desk".to_owned();
         }
@@ -2287,7 +2283,6 @@ impl Session {
         self.forget_arm();
         self.state = RecordState::Idle;
     }
-
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -2441,11 +2436,7 @@ pub fn record_test(seconds: Option<String>) {
         std::thread::sleep(Duration::from_millis(100));
         let m = session.meters();
         let bar = |v: f32| "#".repeat((v.clamp(0.0, 1.0) * 40.0) as usize);
-        println!(
-            "  L {:<40} R {:<40}",
-            bar(m.left.peak),
-            bar(m.right.peak)
-        );
+        println!("  L {:<40} R {:<40}", bar(m.left.peak), bar(m.right.peak));
     }
 
     let root = std::env::temp_dir().join("Tangent");
@@ -2534,7 +2525,10 @@ mod tests {
     /// exactly the frames the device produced?" — is invisible until you count
     /// them.
     /// A `PluginWriter` over a ring the test owns the other end of.
-    fn plugin_writer(channels: usize, slots: usize) -> (PluginWriter, rtrb::Producer<f32>, impl Fn(u64)) {
+    fn plugin_writer(
+        channels: usize,
+        slots: usize,
+    ) -> (PluginWriter, rtrb::Producer<f32>, impl Fn(u64)) {
         let (tap, tx, note) = crate::instrument::RecorderTap::for_test(slots, channels);
         let w = PluginWriter {
             tap: Some(tap),
@@ -2829,7 +2823,8 @@ mod tests {
         // count: a writer that miscounted in the same direction as it wrote
         // would agree with itself.
         let size = std::fs::metadata(&path).expect("stat").len();
-        let audio_bytes = u64::from(TAKE_FORMAT.bytes_per_sample()) * CH as u64 * (BLOCK * BLOCKS) as u64;
+        let audio_bytes =
+            u64::from(TAKE_FORMAT.bytes_per_sample()) * CH as u64 * (BLOCK * BLOCKS) as u64;
         assert!(
             size > audio_bytes && size < audio_bytes + 4096,
             "file is {size} bytes; expected {audio_bytes} of audio plus a header"
@@ -2870,7 +2865,11 @@ mod tests {
         }
         // The idle path fills `buf` with the desk, so the two sides are still
         // two sides by the time anything downstream sees them.
-        let left = writer.buf.iter().step_by(2).fold(0.0f32, |a, s| a.max(s.abs()));
+        let left = writer
+            .buf
+            .iter()
+            .step_by(2)
+            .fold(0.0f32, |a, s| a.max(s.abs()));
         let right = writer
             .buf
             .iter()
@@ -3181,14 +3180,21 @@ mod tests {
         let mut s = session();
         s.toggle(&dir, Some("filmed"), 0, ExportSpec::default());
         s.stop();
-        let folder = s.last_summary().expect("a take produces a summary").folder.clone();
+        let folder = s
+            .last_summary()
+            .expect("a take produces a summary")
+            .folder
+            .clone();
         let manifest = dir.join(&folder).join("take.json");
 
         // At Stop the encoder is still writing, so there is no video yet.
         let before: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&manifest).expect("take.json"))
                 .expect("valid json");
-        assert!(before["video"].is_null(), "a video before the encoder finished");
+        assert!(
+            before["video"].is_null(),
+            "a video before the encoder finished"
+        );
 
         s.record_video(
             ivory_record::take::VideoReport {
@@ -3436,10 +3442,7 @@ mod tests {
         assert_eq!(s.state(), RecordState::Rolling);
 
         s.set_meter(six);
-        assert_eq!(
-            s.meter, four,
-            "the signature moved under a rolling take"
-        );
+        assert_eq!(s.meter, four, "the signature moved under a rolling take");
         // The beat length the countdown and the file use is the OLD one too.
         assert!((s.beat().as_secs_f64() - four.beat_seconds(120.0)).abs() < 1e-9);
 
@@ -3621,7 +3624,10 @@ mod tests {
     fn free_space_is_reported_for_a_folder_that_does_not_exist_yet() {
         let root = std::env::temp_dir().join("tangent-not-created/deeper/still");
         let bytes = available_bytes(&root).expect("the temp volume has a size");
-        assert!(bytes > 0, "a writable volume with zero bytes free is not one");
+        assert!(
+            bytes > 0,
+            "a writable volume with zero bytes free is not one"
+        );
         assert!(
             available_bytes(&std::env::temp_dir()).is_some(),
             "and an existing folder answers too"
@@ -3675,8 +3681,6 @@ mod tests {
         );
     }
 }
-
-
 
 // ───────────────────────────────────────────────────────────────────────────
 // A take with no input device
@@ -3971,5 +3975,4 @@ impl PluginWriter {
             error: self.error.take(),
         }
     }
-
 }

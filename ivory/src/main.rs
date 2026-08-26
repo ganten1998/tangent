@@ -10,6 +10,9 @@
 /// not, so it does not care which renderer the app is drawing with.
 #[cfg(feature = "recorder")]
 mod composite;
+mod desktop;
+#[cfg(feature = "recorder")]
+mod devices;
 /// Six-operator FM, and real DX7 cartridges to feed it. The instrument the app
 /// has when it has no instrument, so a fresh install makes a sound. The default
 /// patch is written in the source: no samples, no data, no licence questions.
@@ -18,9 +21,6 @@ mod dx7;
 /// Reverb and delay, on everything the app plays.
 #[cfg(feature = "recorder")]
 mod effects;
-mod desktop;
-#[cfg(feature = "recorder")]
-mod devices;
 /// The monitor engine: the audio OUTPUT stream that plays a hosted VST3
 /// instrument and the metronome. Absent from a Minimal build for the same
 /// reason `record` is (docs/RECORDER-PLAN.md §12a).

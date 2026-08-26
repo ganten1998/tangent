@@ -1250,10 +1250,17 @@ struct Shared {
     /// same place `pending_monitor` is, and for the same reason: the audio
     /// thread must never block on the UI's lock.
     pending_monitor_layout: std::sync::Mutex<Option<([u8; INPUTS], ivory_record::audio::Picks)>>,
-    pending_monitor:
-        std::sync::Mutex<
-            Option<Option<(rtrb::Consumer<f32>, u16, [u8; INPUTS], u32, ivory_record::audio::Picks)>>,
+    pending_monitor: std::sync::Mutex<
+        Option<
+            Option<(
+                rtrb::Consumer<f32>,
+                u16,
+                [u8; INPUTS],
+                u32,
+                ivory_record::audio::Picks,
+            )>,
         >,
+    >,
     /// Frames of the monitor ring that were STALE and thrown away, so that what
     /// is heard is what is happening.
     ///
@@ -1551,7 +1558,11 @@ impl Shared {
 
     fn set_channel_pan(&self, ch: usize, pan: f32) {
         if let Some(cell) = self.channel_pans.get(ch) {
-            let p = if pan.is_finite() { pan.clamp(-1.0, 1.0) } else { 0.0 };
+            let p = if pan.is_finite() {
+                pan.clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
             cell.store(p.to_bits(), Ordering::Relaxed);
         }
     }
@@ -1561,7 +1572,13 @@ impl Shared {
     /// Sanitised here rather than at the point of use, for the same reason the
     /// gains are: a NaN reaching a feedback loop does not stay in one sample.
     fn set_effects(&self, sends: crate::effects::Sends) {
-        let sane = |v: f32| if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 };
+        let sane = |v: f32| {
+            if v.is_finite() {
+                v.clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        };
         self.reverb_mix
             .store(sane(sends.reverb).to_bits(), Ordering::Relaxed);
         self.delay_mix
@@ -1582,13 +1599,14 @@ impl Shared {
     /// taking a lock sixty times a second to write the same eleven numbers is a
     /// lock the audio thread can contend with for nothing.
     fn set_effect_params(&self, p: crate::effects::Params) {
-        let Ok(mut g) = self.params.lock() else { return };
+        let Ok(mut g) = self.params.lock() else {
+            return;
+        };
         if *g != p {
             *g = p;
             self.params_dirty.store(true, Ordering::Release);
         }
     }
-
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -1881,7 +1899,10 @@ fn run_rack(
             // Replaces rather than mixes: a MIDI channel's signal IS its
             // instrument, and whatever was in `planar` before bay 1 ran is
             // silence or an upstream voice being superseded.
-            if p.inst.process_with_controls(notes, controls, frames, &mut p.bufs).is_err() {
+            if p.inst
+                .process_with_controls(notes, controls, frames, &mut p.bufs)
+                .is_err()
+            {
                 continue;
             }
         } else if p.inst.process_effect(planar, frames, out).is_err() {
@@ -2273,7 +2294,14 @@ impl Renderer {
         let Some(rack) = self.racks.get_mut(at) else {
             return;
         };
-        run_rack(rack, &mut self.fx_in, frames, &mut self.fx_out, notes, controls);
+        run_rack(
+            rack,
+            &mut self.fx_in,
+            frames,
+            &mut self.fx_out,
+            notes,
+            controls,
+        );
         let dst = if buf_is_aux {
             self.aux.get_mut(..n)
         } else {
@@ -2303,7 +2331,9 @@ impl Renderer {
             swapped += rack.swap();
         }
         if swapped > 0 {
-            self.shared.swaps.fetch_add(swapped as u64, Ordering::Relaxed);
+            self.shared
+                .swaps
+                .fetch_add(swapped as u64, Ordering::Relaxed);
         }
         swapped
     }
@@ -2365,7 +2395,11 @@ impl Renderer {
                             != 0
                         && self.pad_offs.len() < self.pad_offs.capacity()
                     {
-                        self.pad_offs.push(PadHit { offset, pad, velocity: 0.0 });
+                        self.pad_offs.push(PadHit {
+                            offset,
+                            pad,
+                            velocity: 0.0,
+                        });
                     }
                 } else if event.status & 0xF0 == 0x90 && velocity != 0 {
                     if self.pad_hits.len() == self.pad_hits.capacity() {
@@ -2505,7 +2539,9 @@ impl Renderer {
             self.beats.seen_req = req;
             let want = self.shared.count_in_beats.load(Ordering::Relaxed);
             self.beats.restart(want);
-            self.shared.count_in_done.store(want == 0, Ordering::Relaxed);
+            self.shared
+                .count_in_done
+                .store(want == 0, Ordering::Relaxed);
             self.shared.beat_now.store(0, Ordering::Relaxed);
             self.shared.downbeat_ns.store(i64::MIN, Ordering::Relaxed);
             self.voice.playing = false;
@@ -2561,8 +2597,7 @@ impl Renderer {
             if flush && self.sounding != 0 {
                 self.builtin.all_notes_off();
                 for pitch in 0..128u8 {
-                    if self.sounding & (1 << pitch) != 0
-                        && self.notes.len() < MAX_EVENTS_PER_BLOCK
+                    if self.sounding & (1 << pitch) != 0 && self.notes.len() < MAX_EVENTS_PER_BLOCK
                     {
                         self.notes.push(ivory_host::Note {
                             offset: 0,
@@ -2580,7 +2615,11 @@ impl Renderer {
             // **The routing table, read once and never again this block.**
             // The count is acquired first so a table growing under us is seen
             // whole or not at all (see `set_routes`).
-            self.route_n = self.shared.route_count.load(Ordering::Acquire).min(MAX_ROUTES);
+            self.route_n = self
+                .shared
+                .route_count
+                .load(Ordering::Acquire)
+                .min(MAX_ROUTES);
             self.routes_hw = false;
             let mut kept = 0usize;
             for i in 0..self.route_n {
@@ -2596,7 +2635,11 @@ impl Renderer {
                     continue;
                 }
                 let gain = f32::from_bits(self.shared.route_gain[i].load(Ordering::Relaxed));
-                let gain = if gain.is_finite() { gain.clamp(0.0, 1.0) } else { 0.0 };
+                let gain = if gain.is_finite() {
+                    gain.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
                 self.route_cache[kept] = (from, target, hardware, stereo, gain);
                 self.routes_hw |= hardware;
                 kept += 1;
@@ -2674,9 +2717,8 @@ impl Renderer {
             // Read here rather than through a closure: a closure over
             // `self.shared` borrows the whole of `self`, and the mixing below
             // needs `self` mutably.
-            let send_of = |sh: &Shared, strip: Strip| {
-                Shared::f32_of(&sh.send[strip.index()]).clamp(0.0, 1.0)
-            };
+            let send_of =
+                |sh: &Shared, strip: Strip| Shared::f32_of(&sh.send[strip.index()]).clamp(0.0, 1.0);
 
             // **The slots did their own folding.** Each instrument is a channel
             // with its own fader, its own send and its own mute — see
@@ -2738,9 +2780,7 @@ impl Renderer {
                         // for.
                         self.count_in_tail = self.beats.period.max(1.0) as u64;
                     }
-                    self.shared
-                        .beat_now
-                        .store(beat.count_in, Ordering::Relaxed);
+                    self.shared.beat_now.store(beat.count_in, Ordering::Relaxed);
                     if beat.downbeat {
                         let at = heard + (frame_index as f64 / self.rate * 1e9) as Nanos;
                         self.shared.downbeat_ns.store(at, Ordering::Relaxed);
@@ -2795,8 +2835,7 @@ impl Renderer {
                         & (1 << Strip::Click.index().min(31))
                         == 0;
                     let notes: &[ivory_host::Note] = if armed { &self.notes } else { &[] };
-                    let controls: &[ivory_host::Control] =
-                        if armed { &self.controls } else { &[] };
+                    let controls: &[ivory_host::Control] = if armed { &self.controls } else { &[] };
                     run_rack(
                         &mut self.racks[Strip::Click.index()],
                         &mut self.fx_in,
@@ -2830,42 +2869,115 @@ impl Renderer {
             // synth has no opinion about audio it is handed. That is what
             // makes "put Pro-R on 9 and send 3 to 9" mean what it says.
             //
-            // **One hop per block, and that is a safety rule.** The sends are
-            // taken from each lane's OWN audio (the stem buffer), never from
-            // what another send just added, so A to B to A cannot feed itself
-            // around the loop inside one callback. A chain still works; it
-            // simply carries a block of delay at each step, which is what
-            // every desk that allows the patch does.
+            // **A CHAIN WORKS, in one block, because the destinations are
+            // processed in dependency order.**
+            //
+            // They used to run in index order with every gather done up
+            // front, which meant the second hop of A->B->C read a stem B had
+            // not written yet: the chain silently did nothing, C's rack and
+            // fader never touched the audio, and A arrived at the master
+            // through B regardless. Every desk worth comparing to — REAPER,
+            // Ardour, Live, Pro Tools — treats a multi-hop chain as ordinary.
+            //
+            // So each destination is finished BEFORE anything it feeds
+            // gathers, and each one gathers at the moment it runs rather than
+            // in a pass beforehand.
+            //
+            // **A CYCLE keeps the old one-hop behaviour, and that is the
+            // safety rule.** Anything left unordered gathers whatever the
+            // stem holds at that moment, so A->B->A carries a block of delay
+            // instead of feeding itself inside one callback. That is a better
+            // answer than the two competitors that allow cycles at all:
+            // REAPER gives up delay compensation across the whole project for
+            // it, and Live cannot latency-compensate the path either.
             if self.route_n > 0 {
-                // Gather: each routed lane's audio into its destination.
+                // **Who feeds whom.** `receives` is every channel a send
+                // lands on; `deps` is, per destination, the sources feeding
+                // it that are themselves destinations — the only ones worth
+                // waiting for, because everything else is already in the stem.
+                let mut receives: u32 = 0;
                 for i in 0..self.route_n {
-                    let (from, target, hardware, _, gain) = self.route_cache[i];
-                    if hardware || gain <= 0.0 {
-                        continue;
-                    }
-                    for f in 0..n {
-                        let (Some(l), Some(r)) = (
-                            self.stem_scratch.get(f * CHANNELS * 2 + from * 2).copied(),
-                            self.stem_scratch
-                                .get(f * CHANNELS * 2 + from * 2 + 1)
-                                .copied(),
-                        ) else {
-                            break;
-                        };
-                        let at = (target * n + f) * TAP_CHANNELS;
-                        if let Some(d) = self.send_accum.get_mut(at) {
-                            *d += l * gain;
-                        }
-                        if let Some(d) = self.send_accum.get_mut(at + 1) {
-                            *d += r * gain;
-                        }
+                    let (_, target, hardware, _, gain) = self.route_cache[i];
+                    if !hardware && gain > 0.0 && target < CHANNELS {
+                        receives |= 1 << target;
                     }
                 }
-                // Process: one destination at a time, through its own rack,
-                // then into the master at that channel's own fader — so the
-                // destination's fader rides the send, which is what a bus is.
+                let mut deps = [0u32; CHANNELS];
+                for i in 0..self.route_n {
+                    let (from, target, hardware, _, gain) = self.route_cache[i];
+                    if hardware || gain <= 0.0 || target >= CHANNELS || from >= CHANNELS {
+                        continue;
+                    }
+                    if receives & (1 << from) != 0 {
+                        deps[target] |= 1 << from;
+                    }
+                }
+                // Kahn's, over bitmasks: at most CHANNELS passes, each a
+                // handful of bit tests. No allocation, and nothing runs at
+                // all on a desk with no routes.
+                let mut order = [0usize; CHANNELS];
+                let mut n_order = 0usize;
+                let mut placed: u32 = 0;
+                for _ in 0..CHANNELS {
+                    let mut moved = false;
+                    for dest in 0..CHANNELS {
+                        let bit = 1u32 << dest;
+                        if receives & bit == 0 || placed & bit != 0 {
+                            continue;
+                        }
+                        if deps[dest] & !placed == 0 {
+                            order[n_order] = dest;
+                            n_order += 1;
+                            placed |= bit;
+                            moved = true;
+                        }
+                    }
+                    if !moved {
+                        break;
+                    }
+                }
+                // Whatever is left is in a cycle (a self-route counts): it
+                // runs last, one hop, exactly as before.
                 for dest in 0..CHANNELS {
+                    let bit = 1u32 << dest;
+                    if receives & bit != 0 && placed & bit == 0 {
+                        order[n_order] = dest;
+                        n_order += 1;
+                    }
+                }
+
+                for oi in 0..n_order {
+                    let dest = order[oi];
                     let base = dest * n * TAP_CHANNELS;
+                    // Gather THIS destination's inputs now — so a bus that
+                    // has already run is picked up whole, its rack and fader
+                    // included, out of the stem it just wrote.
+                    for i in 0..self.route_n {
+                        let (from, target, hardware, _, gain) = self.route_cache[i];
+                        if hardware || gain <= 0.0 || target != dest {
+                            continue;
+                        }
+                        for f in 0..n {
+                            let (Some(l), Some(r)) = (
+                                self.stem_scratch.get(f * CHANNELS * 2 + from * 2).copied(),
+                                self.stem_scratch
+                                    .get(f * CHANNELS * 2 + from * 2 + 1)
+                                    .copied(),
+                            ) else {
+                                break;
+                            };
+                            let at = base + f * TAP_CHANNELS;
+                            if let Some(d) = self.send_accum.get_mut(at) {
+                                *d += l * gain;
+                            }
+                            if let Some(d) = self.send_accum.get_mut(at + 1) {
+                                *d += r * gain;
+                            }
+                        }
+                    }
+                    // Then through its own rack and into the master at that
+                    // channel's own fader — the destination's fader rides the
+                    // send, which is what a bus is.
                     let live = self
                         .send_accum
                         .get(base..base + n * TAP_CHANNELS)
@@ -2897,17 +3009,21 @@ impl Renderer {
                     }
                     let g = self.lane_gain[dest];
                     let (pl, pr) = pan_gains(Shared::f32_of(&self.shared.channel_pans[dest]));
+                    // **A bus that is itself routed onward does not ALSO go
+                    // to the master.** What it passes goes into its stem
+                    // below, which is where the destination downstream of it
+                    // gathers from. Without this the middle of a chain was
+                    // heard twice over: once bypassing everything after it,
+                    // and once properly through the end of the chain.
+                    let direct = self.route_direct[dest];
                     for f in 0..n {
                         let l = self.send_io[0][f] * g * pl;
-                        let r = self
-                            .send_io
-                            .get(1)
-                            .map_or(l, |ch| ch[f] * g * pr);
+                        let r = self.send_io.get(1).map_or(l, |ch| ch[f] * g * pr);
                         if let Some(v) = self.mix.get_mut(f * TAP_CHANNELS) {
-                            *v += l;
+                            *v += l * direct;
                         }
                         if let Some(v) = self.mix.get_mut(f * TAP_CHANNELS + 1) {
-                            *v += r;
+                            *v += r * direct;
                         }
                         // The destination's METER shows what it is passing,
                         // and its hardware route carries it too: both read
@@ -2915,8 +3031,7 @@ impl Renderer {
                         if let Some(v) = self.stem_scratch.get_mut(f * CHANNELS * 2 + dest * 2) {
                             *v += l;
                         }
-                        if let Some(v) =
-                            self.stem_scratch.get_mut(f * CHANNELS * 2 + dest * 2 + 1)
+                        if let Some(v) = self.stem_scratch.get_mut(f * CHANNELS * 2 + dest * 2 + 1)
                         {
                             *v += r;
                         }
@@ -3396,7 +3511,11 @@ impl Renderer {
             // AUDIO channel takes pick k. An unbound pick still drains — the
             // ring has to keep moving — but is nobody's audio.
             let bound = self.shared.pick_strip[input].load(Ordering::Relaxed);
-            let Some(strip) = usize::try_from(bound).ok().filter(|b| *b < CHANNELS).map(Strip::Channel) else {
+            let Some(strip) = usize::try_from(bound)
+                .ok()
+                .filter(|b| *b < CHANNELS)
+                .map(Strip::Channel)
+            else {
                 self.monitor_gain[input] = 0.0;
                 continue;
             };
@@ -3404,9 +3523,8 @@ impl Renderer {
             // still drains (the ring must keep moving) and still reaches a
             // take — mute decides the take, and arm is not mute — but the
             // ROOM gets none of it: a project must open without headphones.
-            let live = self.shared.armed.load(Ordering::Relaxed)
-                & (1 << strip.index().min(31))
-                != 0;
+            let live =
+                self.shared.armed.load(Ordering::Relaxed) & (1 << strip.index().min(31)) != 0;
             let heard = live && strip_is_heard(strip, muted, soloed);
             let target = if heard {
                 Shared::f32_of(&self.shared.channel_gains[strip.index()]).clamp(0.0, 8.0)
@@ -3420,8 +3538,9 @@ impl Renderer {
                 continue;
             }
             let send = Shared::f32_of(&self.shared.send[strip.index()]).clamp(0.0, 1.0);
-            let (pan_l, pan_r) =
-                pan_gains(Shared::f32_of(&self.shared.channel_pans[strip.index().min(CHANNELS - 1)]));
+            let (pan_l, pan_r) = pan_gains(Shared::f32_of(
+                &self.shared.channel_pans[strip.index().min(CHANNELS - 1)],
+            ));
             let mut peak = [0.0f32; 2];
             // **This strip's own audio first, then its rack, then the fold.**
             //
@@ -3448,8 +3567,9 @@ impl Renderer {
             {
                 // An input channel's rack can hold a voice too — the desk is
                 // about to stop distinguishing — and the gate is the same one.
-                let armed =
-                    self.shared.midi_off.load(Ordering::Relaxed) & (1 << strip.index().min(31)) == 0;
+                let armed = self.shared.midi_off.load(Ordering::Relaxed)
+                    & (1 << strip.index().min(31))
+                    == 0;
                 let notes: &[ivory_host::Note] = if armed { &self.notes } else { &[] };
                 let controls: &[ivory_host::Control] = if armed { &self.controls } else { &[] };
                 run_rack(
@@ -3469,11 +3589,7 @@ impl Renderer {
             // below and folded in again through its destination: the owner's
             // "100 percent a volume jump on a send added". Every path a lane
             // reaches the master by has to answer to the same switch.
-            let direct = self
-                .route_direct
-                .get(strip.index())
-                .copied()
-                .unwrap_or(1.0);
+            let direct = self.route_direct.get(strip.index()).copied().unwrap_or(1.0);
             for i in 0..n {
                 // The room's own slew, advanced here rather than above: it
                 // moves once per frame however many inputs are open, and
@@ -3617,7 +3733,7 @@ impl Renderer {
             pan[lane] = pan_gains(Shared::f32_of(&self.shared.channel_pans[lane]));
             punch[lane] = self.shared.punch[lane].load(Ordering::Relaxed);
         }
-// Stems and ROUTING share this buffer: a send reads the
+        // Stems and ROUTING share this buffer: a send reads the
         // lane's own audio out of it, so it is filled whenever either
         // customer asks.
         let stems = self.stems_live || self.route_n > 0;
@@ -3660,8 +3776,7 @@ impl Renderer {
                 // Bounds-checked rather than trusted: `k < len` is the
                 // clamp, and this is the line that would panic on the audio
                 // thread if the host ever pushed a len past the file.
-                let (cl, cr) = match (placed.clip.samples.get(i), placed.clip.samples.get(i + 1))
-                {
+                let (cl, cr) = match (placed.clip.samples.get(i), placed.clip.samples.get(i + 1)) {
                     (Some(a), Some(b)) => (*a, *b),
                     _ => continue,
                 };
@@ -3808,9 +3923,7 @@ impl Renderer {
         let bus_strip = drum_lane.map_or(Strip::Drums, Strip::Channel);
         let master = if strip_is_heard(bus_strip, muted, soloed) {
             match drum_lane {
-                Some(ch) => {
-                    Shared::f32_of(&self.shared.channel_gains[ch]).clamp(0.0, 8.0)
-                }
+                Some(ch) => Shared::f32_of(&self.shared.channel_gains[ch]).clamp(0.0, 8.0),
                 None => Shared::f32_of(&self.shared.drums_gain).clamp(0.0, 8.0),
             }
         } else {
@@ -3820,8 +3933,7 @@ impl Renderer {
             Some(ch) => Shared::f32_of(&self.shared.channel_pans[ch]),
             None => Shared::f32_of(&self.shared.drums_pan),
         });
-        let bus_send =
-            Shared::f32_of(&self.shared.send[bus_strip.index()]).clamp(0.0, 1.0);
+        let bus_send = Shared::f32_of(&self.shared.send[bus_strip.index()]).clamp(0.0, 1.0);
         // The knobs, read once per chunk like the channel gains: they are
         // published at human speed. The clamps are the audio thread refusing
         // to trust numbers it did not make; the setter sanitised them too.
@@ -3985,7 +4097,7 @@ impl Renderer {
         // The fold: the DRUMS strip's fader, pan, send and peak, exactly as
         // every other strip does it.
         let want = frames * TAP_CHANNELS;
-// Stems and ROUTING share this buffer: a send reads the
+        // Stems and ROUTING share this buffer: a send reads the
         // lane's own audio out of it, so it is filled whenever either
         // customer asks.
         let stems = self.stems_live || self.route_n > 0;
@@ -4075,8 +4187,7 @@ impl Renderer {
         let drum_wanted = self.shared.drum_strip.load(Ordering::Relaxed);
         let drum_at = (drum_wanted >= 0).then_some(drum_wanted as usize);
         let midi_off = self.shared.midi_off.load(Ordering::Relaxed);
-        let builtin_armed =
-            builtin_at.is_some_and(|ch| midi_off & (1 << ch.min(31)) == 0);
+        let builtin_armed = builtin_at.is_some_and(|ch| midi_off & (1 << ch.min(31)) == 0);
         // CC 64 is the damper, live input only. Half scale is the switch
         // point every synth uses.
         if builtin_armed {
@@ -4355,7 +4466,9 @@ impl Renderer {
                 scratch.fill(0.0);
                 self.builtin.render(scratch, frames, TAP_CHANNELS);
                 for c in 0..TAP_CHANNELS {
-                    let Some(dst) = self.fx_in.get_mut(c) else { continue };
+                    let Some(dst) = self.fx_in.get_mut(c) else {
+                        continue;
+                    };
                     for f in 0..frames {
                         dst[f] = scratch[f * TAP_CHANNELS + c];
                     }
@@ -4373,8 +4486,7 @@ impl Renderer {
                 }
             }
             if rack_live {
-                let controls: &[ivory_host::Control] =
-                    if armed { &self.controls } else { &[] };
+                let controls: &[ivory_host::Control] = if armed { &self.controls } else { &[] };
                 run_rack(
                     &mut self.racks[ch],
                     &mut self.fx_in,
@@ -4395,13 +4507,12 @@ impl Renderer {
                 self.shared.send[Strip::Channel(ch).index()].load(Ordering::Relaxed),
             )
             .clamp(0.0, 1.0);
-            let (pan_l, pan_r) =
-                pan_gains(Shared::f32_of(&self.shared.channel_pans[ch]));
+            let (pan_l, pan_r) = pan_gains(Shared::f32_of(&self.shared.channel_pans[ch]));
             let want = frames * TAP_CHANNELS;
-    // Stems and ROUTING share this buffer: a send reads the
-        // lane's own audio out of it, so it is filled whenever either
-        // customer asks.
-        let stems = self.stems_live || self.route_n > 0;
+            // Stems and ROUTING share this buffer: a send reads the
+            // lane's own audio out of it, so it is filled whenever either
+            // customer asks.
+            let stems = self.stems_live || self.route_n > 0;
             let direct = self.route_direct[ch];
             let (Some(mix), Some(aux), Some(stem)) = (
                 self.mix.get_mut(..want),
@@ -4618,7 +4729,6 @@ impl RecorderTap {
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
-
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -4686,7 +4796,10 @@ pub struct Engine {
     // Declared first so it is dropped first: stopping the device before
     // anything it might still be reading goes away. Held, never read — the
     // whole value of this field is its `Drop`.
-    #[allow(dead_code, reason = "held so the stream lives; dropping it stops audio")]
+    #[allow(
+        dead_code,
+        reason = "held so the stream lives; dropping it stops audio"
+    )]
     stream: Option<cpal::Stream>,
     /// The device the stream above plays through — kept for ASIO duplex.
     ///
@@ -5167,7 +5280,6 @@ impl Engine {
         })
     }
 
-
     // ── the instruments ─────────────────────────────────────────────────────
 
     /// As [`Engine::load_plugin`], and restore `state` into the instrument
@@ -5410,10 +5522,7 @@ impl Engine {
     /// preset did not survive — worth saying out loud, because the symptom is
     /// "it keeps forgetting my piano" and nothing else in the app would know.
     pub fn insert_state_error(&self, strip: usize, slot: usize) -> Option<&str> {
-        self.insert_state_errors
-            .get(strip)?
-            .get(slot)?
-            .as_deref()
+        self.insert_state_errors.get(strip)?.get(slot)?.as_deref()
     }
 
     /// What is in one insert, if anything.
@@ -5431,12 +5540,7 @@ impl Engine {
     /// it were seated. The desk then named a plugin that existed nowhere, and
     /// the auto-open built a view on a terminated controller.
     #[must_use]
-    fn hand_off_insert(
-        &mut self,
-        strip: usize,
-        slot: usize,
-        next: PluginBox,
-    ) -> Option<PluginBox> {
+    fn hand_off_insert(&mut self, strip: usize, slot: usize, next: PluginBox) -> Option<PluginBox> {
         let Some(pair) = self
             .insert_handoff
             .get_mut(strip)
@@ -5502,8 +5606,7 @@ impl Engine {
             Some(l) => format!("{} - Tangent, insert {}", l.class, slot + 1),
             None => format!("Insert {} - Tangent", slot + 1),
         };
-        let editor =
-            ivory_host::Editor::open_handle(handle, &title).map_err(|e| e.to_string())?;
+        let editor = ivory_host::Editor::open_handle(handle, &title).map_err(|e| e.to_string())?;
         if let Some(e) = self
             .insert_editors
             .get_mut(strip)
@@ -5979,10 +6082,11 @@ impl Engine {
             if p.obey {
                 obey[i >> 6] |= 1u64 << (i & 63);
             }
-            sh.pad_trim_start[i]
-                .store(sane(p.trim_start, 0.0, 1.0, 0.0).to_bits(), Ordering::Relaxed);
-            sh.pad_trim_end[i]
-                .store(sane(p.trim_end, 0.0, 1.0, 1.0).to_bits(), Ordering::Relaxed);
+            sh.pad_trim_start[i].store(
+                sane(p.trim_start, 0.0, 1.0, 0.0).to_bits(),
+                Ordering::Relaxed,
+            );
+            sh.pad_trim_end[i].store(sane(p.trim_end, 0.0, 1.0, 1.0).to_bits(), Ordering::Relaxed);
         }
         sh.pad_obey[0].store(obey[0], Ordering::Relaxed);
         sh.pad_obey[1].store(obey[1], Ordering::Relaxed);
@@ -6024,7 +6128,11 @@ impl Engine {
         self.shared
             .drums_gain
             .store(sane_gain(gain).to_bits(), Ordering::Relaxed);
-        let p = if pan.is_finite() { pan.clamp(-1.0, 1.0) } else { 0.0 };
+        let p = if pan.is_finite() {
+            pan.clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
         self.shared.drums_pan.store(p.to_bits(), Ordering::Relaxed);
     }
 
@@ -6059,7 +6167,9 @@ impl Engine {
     /// first pushed frame.
     pub fn set_transport(&self, generation: u64, frames: u64) {
         self.shared.transport_at.store(frames, Ordering::Relaxed);
-        self.shared.transport_req.store(generation, Ordering::Release);
+        self.shared
+            .transport_req
+            .store(generation, Ordering::Release);
     }
 
     /// The transport level: rolling or stopped. Safe to re-assert every frame;
@@ -6130,7 +6240,13 @@ impl Engine {
     /// Hand the renderer the live input's ring. `None` takes it away.
     pub fn set_monitor(
         &mut self,
-        tap: Option<(rtrb::Consumer<f32>, u16, [u8; INPUTS], u32, ivory_record::audio::Picks)>,
+        tap: Option<(
+            rtrb::Consumer<f32>,
+            u16,
+            [u8; INPUTS],
+            u32,
+            ivory_record::audio::Picks,
+        )>,
     ) {
         if let Ok(mut g) = self.shared.pending_monitor.lock() {
             *g = Some(tap);
@@ -6204,8 +6320,6 @@ impl Engine {
             .store(sane_gain(linear).to_bits(), Ordering::Relaxed);
     }
 
-
-
     // ── the metronome ───────────────────────────────────────────────────────
 
     /// Turn the free-running click on or off. Switching it on restarts the
@@ -6213,7 +6327,6 @@ impl Engine {
     pub fn set_metronome_enabled(&self, on: bool) {
         self.shared.metro_on.store(on, Ordering::Relaxed);
     }
-
 
     /// Whether the click is mixed into what the recorder captures.
     ///
@@ -6229,11 +6342,9 @@ impl Engine {
         self.shared.count_in_in_take.store(on, Ordering::Relaxed);
     }
 
-
     pub fn set_tempo(&self, bpm: f64) {
         self.shared.bpm.store(bpm.to_bits(), Ordering::Relaxed);
     }
-
 
     /// Beats per bar, which decides which beat is accented.
     pub fn set_beats_per_bar(&self, beats: u32) {
@@ -6472,9 +6583,7 @@ fn resolve_output(host: &cpal::Host, want: Option<&str>) -> Result<cpal::Device,
             .output_devices()
             .map_err(|e| format!("could not enumerate audio outputs ({e})"))?
             .find(output_is_live)
-            .ok_or_else(|| {
-                "no audio output on this machine reports a working config".to_string()
-            });
+            .ok_or_else(|| "no audio output on this machine reports a working config".to_string());
     };
     // **Names first, devices dropped as we go — never all held at once.**
     //
@@ -6636,7 +6745,9 @@ fn build_stream(
         cpal::SampleFormat::U16 => open!(u16),
         cpal::SampleFormat::I8 => open!(i8),
         cpal::SampleFormat::U8 => open!(u8),
-        other => Err(format!("the output device speaks {other}, which is not supported")),
+        other => Err(format!(
+            "the output device speaks {other}, which is not supported"
+        )),
     }
 }
 
@@ -6685,7 +6796,10 @@ where
                     let samples = frames * dev_ch;
                     let ahead = ((done / dev_ch) as f64 / rate * 1e9) as Nanos;
                     renderer.render(&mut scratch[..samples], now + ahead, heard + ahead);
-                    for (d, s) in data[done..done + samples].iter_mut().zip(&scratch[..samples]) {
+                    for (d, s) in data[done..done + samples]
+                        .iter_mut()
+                        .zip(&scratch[..samples])
+                    {
                         *d = T::from_sample(*s);
                     }
                     done += samples;
@@ -6808,7 +6922,11 @@ pub fn plugin_test(filter: Option<String>) {
     let filter = filter.unwrap_or_else(|| "Pianoteq".to_string());
     let Some(bundle) = ivory_host::discover().into_iter().find(|p| {
         p.file_name()
-            .map(|n| n.to_string_lossy().to_lowercase().contains(&filter.to_lowercase()))
+            .map(|n| {
+                n.to_string_lossy()
+                    .to_lowercase()
+                    .contains(&filter.to_lowercase())
+            })
             .unwrap_or(false)
     }) else {
         eprintln!("no VST3 matching {filter:?}");
@@ -6822,7 +6940,11 @@ pub fn plugin_test(filter: Option<String>) {
             std::process::exit(1);
         }
     };
-    println!("output:   {} ({})", engine.output().device, engine.output().latency_line());
+    println!(
+        "output:   {} ({})",
+        engine.output().device,
+        engine.output().latency_line()
+    );
 
     println!(
         "loading:  {} into channel 1's first bay (this blocks for the warm-up)",
@@ -6988,9 +7110,7 @@ pub fn plugin_test(filter: Option<String>) {
     for slot in 0..LAYERS {
         if slot > 0 {
             println!("  loading channel {} with the same instrument...", slot + 1);
-            if let Err(why) =
-                engine.load_insert(slot, 0, Some(&bundle), preset.as_deref())
-            {
+            if let Err(why) = engine.load_insert(slot, 0, Some(&bundle), preset.as_deref()) {
                 println!("  channel {} would not load: {why}", slot + 1);
                 break;
             }
@@ -7277,7 +7397,11 @@ mod tests {
         // Still inside the grace: quiet, but not yet declared.
         assert!(!w.note(true, 42, t0 + std::time::Duration::from_millis(500)));
         // Past it: dead. This is the ASIO driver unloaded under a live stream.
-        assert!(w.note(true, 42, t0 + std::time::Duration::from_millis(10) + STALL_AFTER));
+        assert!(w.note(
+            true,
+            42,
+            t0 + std::time::Duration::from_millis(10) + STALL_AFTER
+        ));
     }
 
     #[test]
@@ -7297,7 +7421,11 @@ mod tests {
         // The fault path owns this: running=false must not read as a stall,
         // and must reset the clock so a restart starts fresh.
         assert!(!w.note(false, 7, t0 + STALL_AFTER * 5));
-        assert!(!w.note(true, 7, t0 + STALL_AFTER * 5 + std::time::Duration::from_millis(1)));
+        assert!(!w.note(
+            true,
+            7,
+            t0 + STALL_AFTER * 5 + std::time::Duration::from_millis(1)
+        ));
     }
 
     // ── choosing the output device by name ─────────────────────────────────
@@ -7460,7 +7588,10 @@ mod tests {
         // The last frame of the block is inside it; one sample later is not.
         assert_eq!(place(10_666_000, 0, RATE, 512), Placement::At(511));
         // And an offset is measured from the block's own start, not from zero.
-        assert_eq!(place(101_000_000, 100_000_000, RATE, 512), Placement::At(48));
+        assert_eq!(
+            place(101_000_000, 100_000_000, RATE, 512),
+            Placement::At(48)
+        );
     }
 
     #[test]
@@ -7475,7 +7606,11 @@ mod tests {
     fn a_mono_instrument_is_heard_from_both_speakers() {
         let mut dst = [0.0; 2];
         map_frame(&[0.5], &mut dst);
-        assert_eq!(dst, [0.5, 0.5], "a mono plugin in one speaker reads as broken");
+        assert_eq!(
+            dst,
+            [0.5, 0.5],
+            "a mono plugin in one speaker reads as broken"
+        );
     }
 
     #[test]
@@ -7499,7 +7634,11 @@ mod tests {
     fn a_mono_device_gets_the_average_and_not_the_sum() {
         let mut dst = [9.0; 1];
         map_frame(&[0.5, 0.5], &mut dst);
-        assert_eq!(dst, [0.5], "summing to mono is +6 dB and clips a correct mix");
+        assert_eq!(
+            dst,
+            [0.5],
+            "summing to mono is +6 dB and clips a correct mix"
+        );
         map_frame(&[0.5], &mut dst);
         assert_eq!(dst, [0.5]);
     }
@@ -7554,7 +7693,10 @@ mod tests {
         );
         let down: Vec<_> = fired.iter().filter(|(_, x)| x.downbeat).collect();
         assert_eq!(down.len(), 1);
-        assert_eq!(down[0].0, 96_000, "recording starts a whole beat after beat 4");
+        assert_eq!(
+            down[0].0, 96_000,
+            "recording starts a whole beat after beat 4"
+        );
     }
 
     #[test]
@@ -7723,7 +7865,8 @@ mod tests {
     #[test]
     fn the_tap_moves_whole_frames_and_reports_how_many() {
         let (mut tx, mut tap, _) = tap_pair(64);
-        tx.push_entire_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        tx.push_entire_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+            .unwrap();
         let mut out = Vec::new();
         assert_eq!(tap.drain(&mut out), 3);
         assert_eq!(out, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
@@ -7764,7 +7907,11 @@ mod tests {
         };
 
         tap.arm();
-        assert_eq!(tap.dropped(), 0, "a take must not inherit the monitor's losses");
+        assert_eq!(
+            tap.dropped(),
+            0,
+            "a take must not inherit the monitor's losses"
+        );
         let mut out = Vec::new();
         assert_eq!(tap.drain(&mut out), 0, "stale audio was left in the ring");
 
@@ -7813,9 +7960,7 @@ mod tests {
         /// Replace the track rings with fresh ones and hand back the far
         /// ends, so a test can send clips and collect what comes back —
         /// the same two-way trip the engine makes.
-        fn hijack_track_rings(
-            &mut self,
-        ) -> (Producer<Vec<Placed>>, Consumer<Vec<Placed>>) {
+        fn hijack_track_rings(&mut self) -> (Producer<Vec<Placed>>, Consumer<Vec<Placed>>) {
             let (to, incoming) = RingBuffer::<Vec<Placed>>::new(2);
             let (retiring, from) = RingBuffer::<Vec<Placed>>::new(2);
             self.track_incoming = incoming;
@@ -7823,9 +7968,7 @@ mod tests {
             (to, from)
         }
 
-        fn hijack_midi_rings(
-            &mut self,
-        ) -> (Producer<Vec<PlacedMidi>>, Consumer<Vec<PlacedMidi>>) {
+        fn hijack_midi_rings(&mut self) -> (Producer<Vec<PlacedMidi>>, Consumer<Vec<PlacedMidi>>) {
             let (to, incoming) = RingBuffer::<Vec<PlacedMidi>>::new(2);
             let (retiring, from) = RingBuffer::<Vec<PlacedMidi>>::new(2);
             self.midi_incoming = incoming;
@@ -7918,10 +8061,8 @@ mod tests {
             pad_kit: PadKit::default(),
             pad_incoming: RingBuffer::<PadKit>::new(2).1,
             pad_retiring: RingBuffer::<PadKit>::new(2).0,
-            preview_incoming:
-                RingBuffer::<Option<Arc<ivory_record::decode::Clip>>>::new(2).1,
-            preview_retiring:
-                RingBuffer::<Option<Arc<ivory_record::decode::Clip>>>::new(2).0,
+            preview_incoming: RingBuffer::<Option<Arc<ivory_record::decode::Clip>>>::new(2).1,
+            preview_retiring: RingBuffer::<Option<Arc<ivory_record::decode::Clip>>>::new(2).0,
             preview: None,
             preview_pos: 0,
             pad_voices: [PadVoice::default(); PADS],
@@ -8145,7 +8286,10 @@ mod tests {
             .load_insert(at, 0, None, None)
             .expect("unloading an insert must not fail");
         assert!(engine.insert(at, 0).is_none(), "the bay kept its effect");
-        assert!(!engine.insert_editor_open(at, 0), "a window survived the unload");
+        assert!(
+            !engine.insert_editor_open(at, 0),
+            "a window survived the unload"
+        );
 
         // And dropping a live engine with a loaded insert completes.
         engine
@@ -8196,10 +8340,16 @@ mod tests {
 
         // Bay 0's retiring ring is full — the UI thread timed out and never
         // collected what it was given.
-        rack.retiring[0].push(PluginBox(None)).expect("room for one");
+        rack.retiring[0]
+            .push(PluginBox(None))
+            .expect("room for one");
         // And a fresh plugin has been sent to that bay.
         to_audio[0].push(PluginBox(None)).expect("room for one");
-        assert_eq!(rack.incoming[0].slots(), 1, "the arrival never reached the ring");
+        assert_eq!(
+            rack.incoming[0].slots(),
+            1,
+            "the arrival never reached the ring"
+        );
 
         rack.swap();
 
@@ -8211,10 +8361,20 @@ mod tests {
         );
 
         // And once the UI thread collects, the very next swap goes through.
-        from_audio[0].pop().expect("the retired one was there to collect");
+        from_audio[0]
+            .pop()
+            .expect("the retired one was there to collect");
         rack.swap();
-        assert_eq!(rack.incoming[0].slots(), 0, "the rack never took the arrival");
-        assert_eq!(from_audio[0].slots(), 1, "the displaced one was not handed back");
+        assert_eq!(
+            rack.incoming[0].slots(),
+            0,
+            "the rack never took the arrival"
+        );
+        assert_eq!(
+            from_audio[0].slots(),
+            1,
+            "the displaced one was not handed back"
+        );
     }
 
     /// The other bays are untouched by a bay that is waiting.
@@ -8239,7 +8399,9 @@ mod tests {
             incoming: std::array::from_fn(|_| inc.next().expect("one per insert")),
             retiring: std::array::from_fn(|_| ret.next().expect("one per insert")),
         };
-        rack.retiring[0].push(PluginBox(None)).expect("room for one");
+        rack.retiring[0]
+            .push(PluginBox(None))
+            .expect("room for one");
         for t in &mut to_audio {
             t.push(PluginBox(None)).expect("room for one");
         }
@@ -8271,7 +8433,10 @@ mod tests {
         let none = 0;
         // Nothing muted, nothing soloed: everybody is heard.
         for s in &all {
-            assert!(strip_is_heard(*s, none, none), "{s:?} was silent for no reason");
+            assert!(
+                strip_is_heard(*s, none, none),
+                "{s:?} was silent for no reason"
+            );
         }
         // One muted: it alone is silent.
         let m = Channel(0).bit();
@@ -8296,7 +8461,10 @@ mod tests {
         // strip had to go.
         let one = Channel(2).bit();
         assert!(!strip_is_heard(Channel(2), one, none));
-        assert!(strip_is_heard(Channel(3), one, none), "muting one channel muted another");
+        assert!(
+            strip_is_heard(Channel(3), one, none),
+            "muting one channel muted another"
+        );
         // Every strip owns a bit of its own, or two of them would mute together.
         let mut bits: Vec<u32> = all.iter().map(|s| s.bit()).collect();
         let n = bits.len();
@@ -8456,7 +8624,12 @@ mod tests {
         assert!(out.iter().all(|s| *s == 0.0), "not silent before the note");
 
         hw_tx
-            .push(MidiEvent { stamp: 0, status: 0x90, data1: 60, data2: 100 })
+            .push(MidiEvent {
+                stamp: 0,
+                status: 0x90,
+                data1: 60,
+                data2: 100,
+            })
             .expect("the test ring holds one note");
         let mut heard = vec![0.0_f32; 2 * 2048];
         r.render(&mut heard, 0, 0);
@@ -8578,7 +8751,8 @@ mod tests {
         let (retiring, mut from) = RingBuffer::<PadKit>::new(2);
         r.pad_incoming = incoming;
         r.pad_retiring = retiring;
-        to.push(test_kit(&[1], 4800, 0.25)).expect("room for the kit");
+        to.push(test_kit(&[1], 4800, 0.25))
+            .expect("room for the kit");
 
         r.render(&mut out, 0, 0);
         let peak = out.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
@@ -8783,7 +8957,10 @@ mod tests {
         let plain = render(false);
         let routed = render(true);
         assert!(plain.abs() > 1.0e-4, "nothing played unrouted: {plain}");
-        assert!(routed.abs() > 1.0e-4, "the route swallowed the channel: {routed}");
+        assert!(
+            routed.abs() > 1.0e-4,
+            "the route swallowed the channel: {routed}"
+        );
         // The destination is empty and at unity, so arriving through it must
         // sound like arriving directly — not like arriving twice.
         assert!(
@@ -8845,12 +9022,140 @@ mod tests {
         };
         let plain = feed(false);
         let routed = feed(true);
-        assert!(plain > 1.0e-4, "the input was never heard unrouted: {plain}");
+        assert!(
+            plain > 1.0e-4,
+            "the input was never heard unrouted: {plain}"
+        );
         assert!(routed > 1.0e-4, "the route swallowed the input: {routed}");
         assert!(
             routed < plain * 1.5,
             "the live input is being heard twice: {routed} routed against {plain}"
         );
+    }
+
+
+    /// **A CHAIN carries through in one block: A to B to C.**
+    ///
+    /// It used to do nothing at all. Destinations ran in index order with
+    /// every gather done up front, so the second hop read a stem the first
+    /// had not written yet — the level was identical with and without the C
+    /// hop, and C's fader and rack never touched the audio. Every desk worth
+    /// comparing to treats a multi-hop chain as ordinary; this is the test
+    /// that says Tangent does.
+    #[test]
+    fn a_chain_of_routes_carries_through_to_the_end_of_it() {
+        use std::sync::Arc;
+        let clip = Arc::new(ivory_record::decode::Clip {
+            samples: vec![0.5; 4000],
+            rate: 48_000,
+            source: std::path::PathBuf::from("c.wav"),
+        });
+        // **Channel 1 -> 7 -> 5: the chain runs DOWN the desk.**
+        //
+        // Deliberately descending. An ascending chain is carried by plain
+        // index order whether anything was sorted or not, so a 1 -> 5 -> 7
+        // test passes against the broken build and proves nothing — which is
+        // exactly what the first version of this test did.
+        let render = |chain: bool, end_gain: f32| {
+            let clip = Arc::clone(&clip);
+            let (mut r, _tx, shared) = renderer_with_midi(2);
+            let (mut to_audio, _from) = r.hijack_track_rings();
+            to_audio
+                .push(vec![Placed {
+                    clip,
+                    strip: 1,
+                    start: 0,
+                    offset: 0,
+                    len: 1000,
+                    fade_in: 0,
+                    fade_out: 0,
+                }])
+                .expect("room");
+            let first = if chain { 7 } else { 5 };
+            shared.routes[0].store(pack_route(1, first, false, false), Ordering::Relaxed);
+            shared.route_gain[0].store(1.0f32.to_bits(), Ordering::Relaxed);
+            let n = if chain {
+                shared.routes[1].store(pack_route(7, 5, false, false), Ordering::Relaxed);
+                shared.route_gain[1].store(1.0f32.to_bits(), Ordering::Relaxed);
+                2
+            } else {
+                1
+            };
+            shared.route_count.store(n, Ordering::Release);
+            // 7 is the middle of the chain and stays open; 5 is the END, and
+            // its fader is what the last assertion closes.
+            shared.channel_gains[7].store(1.0f32.to_bits(), Ordering::Relaxed);
+            shared.channel_gains[5].store(end_gain.to_bits(), Ordering::Relaxed);
+            r.lane_gain[7] = 1.0;
+            r.lane_gain[5] = end_gain;
+            shared.transport_at.store(0, Ordering::Relaxed);
+            shared.transport_req.store(1, Ordering::Release);
+            shared.rolling.store(true, Ordering::Relaxed);
+            let mut out = vec![0.0f32; 256 * 2];
+            r.render(&mut out, 0, 0);
+            out[2 * 200]
+        };
+        let one_hop = render(false, 1.0);
+        let chained = render(true, 1.0);
+        let shut = render(true, 0.0);
+        assert!(one_hop.abs() > 1.0e-4, "nothing played at all: {one_hop}");
+        // Through two unity buses it still arrives once, at the same level.
+        assert!(
+            (chained.abs() - one_hop.abs()).abs() < 1.0e-3,
+            "the chain changed the level: {one_hop} one hop vs {chained} chained"
+        );
+        // **The END of the chain is what governs it.** This is the assertion
+        // the old code could not pass: closing C silenced nothing, because
+        // the audio was reaching the master through B and bypassing C.
+        assert!(
+            shut.abs() < 1.0e-4,
+            "closing the last link did not silence the chain: {shut}"
+        );
+    }
+
+    /// **A CYCLE does not feed itself inside one callback.** Left unordered
+    /// on purpose: it gathers whatever the stem holds at that moment, so
+    /// A->B->A carries a block of delay rather than running away. The test
+    /// is that a block renders, finitely, at a sane level.
+    #[test]
+    fn a_routing_cycle_stays_finite() {
+        use std::sync::Arc;
+        let clip = Arc::new(ivory_record::decode::Clip {
+            samples: vec![0.5; 4000],
+            rate: 48_000,
+            source: std::path::PathBuf::from("c.wav"),
+        });
+        let (mut r, _tx, shared) = renderer_with_midi(2);
+        let (mut to_audio, _from) = r.hijack_track_rings();
+        to_audio
+            .push(vec![Placed {
+                clip,
+                strip: 1,
+                start: 0,
+                offset: 0,
+                len: 4000,
+                fade_in: 0,
+                fade_out: 0,
+            }])
+            .expect("room");
+        // 1 -> 5, 5 -> 6, 6 -> 5: a loop with a tail feeding it.
+        for (i, (a, b)) in [(1usize, 5usize), (5, 6), (6, 5)].iter().enumerate() {
+            shared.routes[i].store(pack_route(*a, *b, false, false), Ordering::Relaxed);
+            shared.route_gain[i].store(1.0f32.to_bits(), Ordering::Relaxed);
+        }
+        shared.route_count.store(3, Ordering::Release);
+        shared.transport_at.store(0, Ordering::Relaxed);
+        shared.transport_req.store(1, Ordering::Release);
+        shared.rolling.store(true, Ordering::Relaxed);
+        let mut out = vec![0.0f32; 256 * 2];
+        for _ in 0..8 {
+            out.fill(0.0);
+            r.render(&mut out, 0, 0);
+            for v in &out {
+                assert!(v.is_finite(), "a cycle produced {v}");
+                assert!(v.abs() < 8.0, "a cycle ran away to {v}");
+            }
+        }
     }
 
     /// **A route to a channel that does not exist is ignored, not indexed
@@ -8991,10 +9296,16 @@ mod tests {
             (out[2 * 512], out[2 * 512 + 1])
         };
         let (l, r) = run(0.0);
-        assert!((l - 0.5).abs() < 0.01 && (r - 0.5).abs() < 0.01, "centre is not unity: {l} {r}");
+        assert!(
+            (l - 0.5).abs() < 0.01 && (r - 0.5).abs() < 0.01,
+            "centre is not unity: {l} {r}"
+        );
         let (l, r) = run(-1.0);
         assert!(r.abs() < 1.0e-3, "hard left leaks right: {r}");
-        assert!((l - 0.5 * std::f32::consts::SQRT_2).abs() < 0.01, "hard left is not +3dB: {l}");
+        assert!(
+            (l - 0.5 * std::f32::consts::SQRT_2).abs() < 0.01,
+            "hard left is not +3dB: {l}"
+        );
         let (l, r) = run(1.0);
         assert!(l.abs() < 1.0e-3, "hard right leaks left: {l}");
         assert!((r - 0.5 * std::f32::consts::SQRT_2).abs() < 0.01);
@@ -9257,7 +9568,10 @@ mod tests {
             late
         };
         let ringing = render(false, 1.0);
-        assert!(ringing > 0.05, "a one-shot went quiet on its own: {ringing}");
+        assert!(
+            ringing > 0.05,
+            "a one-shot went quiet on its own: {ringing}"
+        );
         let obeyed = render(true, 1.0);
         assert!(
             obeyed < ringing * 0.05,
@@ -9313,8 +9627,18 @@ mod tests {
             start: 0,
             len: 96_000,
             notes: Arc::new(vec![
-                ClipNote { at: 0, dur: 4_800, key: 60, vel: 100 },
-                ClipNote { at: 4_800, dur: 4_800, key: 60, vel: 100 },
+                ClipNote {
+                    at: 0,
+                    dur: 4_800,
+                    key: 60,
+                    vel: 100,
+                },
+                ClipNote {
+                    at: 4_800,
+                    dur: 4_800,
+                    key: 60,
+                    vel: 100,
+                },
             ]),
         }]);
         e.set_builtin_strip(Some(0));
@@ -9329,15 +9653,17 @@ mod tests {
             e.render_offline(&mut out);
             // Blocks 6..9 sit inside the SECOND note (4800+ frames in).
             if (1..4).contains(&block) {
-                heard_first =
-                    heard_first.max(out.iter().fold(0.0f32, |a, b| a.max(b.abs())));
+                heard_first = heard_first.max(out.iter().fold(0.0f32, |a, b| a.max(b.abs())));
             }
             if (6..9).contains(&block) {
-                heard_after_tie = heard_after_tie
-                    .max(out.iter().fold(0.0f32, |a, b| a.max(b.abs())));
+                heard_after_tie =
+                    heard_after_tie.max(out.iter().fold(0.0f32, |a, b| a.max(b.abs())));
             }
         }
-        assert!(heard_first > 0.01, "the FIRST note never sounded: {heard_first}");
+        assert!(
+            heard_first > 0.01,
+            "the FIRST note never sounded: {heard_first}"
+        );
         assert!(
             heard_after_tie > 0.005,
             "the second note of the tie never sounded: {heard_after_tie}"
@@ -9373,7 +9699,8 @@ mod tests {
              again, and a pad plugin's window can never open"
         );
         assert!(
-            e.open_insert_editor(pad_rack_index(PADS - 1), INSERTS - 1).is_err(),
+            e.open_insert_editor(pad_rack_index(PADS - 1), INSERTS - 1)
+                .is_err(),
             "the last pad's last bay is inside the seat map too"
         );
         // Past the whole map is still a no-op, never a panic and never an
@@ -9413,7 +9740,12 @@ mod tests {
         let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
         // A note every 2400 frames across a 24000-frame clip.
         let notes: Vec<ClipNote> = (0..10)
-            .map(|i| ClipNote { at: i * 2_400, dur: 1_200, key: 60, vel: 100 })
+            .map(|i| ClipNote {
+                at: i * 2_400,
+                dur: 1_200,
+                key: 60,
+                vel: 100,
+            })
             .collect();
         e.set_midi_clips(vec![PlacedMidi {
             strip: 0,
@@ -9460,7 +9792,12 @@ mod tests {
         // fill the sounding ledger before lane 1's walk runs. Their offs
         // fall due in the SECOND block, which is what makes room.
         let fillers: Vec<ClipNote> = (0..256)
-            .map(|_| ClipNote { at: 0, dur: 700, key: 60, vel: 100 })
+            .map(|_| ClipNote {
+                at: 0,
+                dur: 700,
+                key: 60,
+                vel: 100,
+            })
             .collect();
         // And the victim on lane 1, due the same first block.
         r.midi_clips = vec![
@@ -9565,8 +9902,14 @@ mod tests {
             e.render_offline(&mut out);
             max_seen = max_seen.max(e.transport_position());
         }
-        assert!(max_seen < 3000, "the clock ran past the loop end: {max_seen}");
-        assert!(max_seen >= 1000, "the clock never entered the loop: {max_seen}");
+        assert!(
+            max_seen < 3000,
+            "the clock ran past the loop end: {max_seen}"
+        );
+        assert!(
+            max_seen >= 1000,
+            "the clock never entered the loop: {max_seen}"
+        );
 
         // A clear (a >= b) frees the clock to run straight past.
         e.set_loop(0, 0);
@@ -9856,7 +10199,10 @@ mod tests {
         // what returns.
         let mut came_back = false;
         while let Ok(returned) = from_audio.pop() {
-            if returned.first().is_some_and(|p| Arc::ptr_eq(&p.clip, &clip)) {
+            if returned
+                .first()
+                .is_some_and(|p| Arc::ptr_eq(&p.clip, &clip))
+            {
                 came_back = true;
             }
         }
@@ -9912,7 +10258,10 @@ mod tests {
             half / unity
         );
         let off = level(0.0);
-        assert!(off < unity * 0.02, "the fader at zero still let {off} through");
+        assert!(
+            off < unity * 0.02,
+            "the fader at zero still let {off} through"
+        );
     }
 
     #[test]
@@ -9952,7 +10301,10 @@ mod tests {
         let after = sound(&mut r, &mut tx);
 
         let peak = |v: &[f32]| v.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
-        assert!(peak(&piano) > 0.01 && peak(&after) > 0.01, "one of them was silent");
+        assert!(
+            peak(&piano) > 0.01 && peak(&after) > 0.01,
+            "one of them was silent"
+        );
         // Not "the buffers differ" — two renders of the SAME patch differ, on
         // free-running phase alone. The organ sustains and the piano does not,
         // so the end of the block is where they cannot be confused.
@@ -10029,12 +10381,22 @@ mod tests {
         let now = 1_000_000_000;
         // One note in each of the eight blocks: 512 frames is 10.667 ms.
         for k in 0..8i64 {
-            queue(&mut tx, now + k * 10_666_667 + 1_000_000, [0x90, 60 + k as u8, 100]);
+            queue(
+                &mut tx,
+                now + k * 10_666_667 + 1_000_000,
+                [0x90, 60 + k as u8, 100],
+            );
         }
         let mut out = vec![0.0f32; 4096 * 2];
         r.render(&mut out, now, now);
-        assert_eq!(r.chunks, 8, "4096 frames must become eight 512-frame blocks");
-        assert!(r.pending.is_none(), "an event was left over after 4096 frames");
+        assert_eq!(
+            r.chunks, 8,
+            "4096 frames must become eight 512-frame blocks"
+        );
+        assert!(
+            r.pending.is_none(),
+            "an event was left over after 4096 frames"
+        );
         assert_eq!(
             r.midi.slots(),
             0,
@@ -10060,7 +10422,10 @@ mod tests {
         r.collect_notes(block1_start, 512);
         assert_eq!(r.notes.len(), 1);
         assert_eq!(r.notes[0].offset, 208);
-        assert!(r.notes[0].offset < 512, "an offset past the block is refused by process");
+        assert!(
+            r.notes[0].offset < 512,
+            "an offset past the block is refused by process"
+        );
         let _ = &mut out;
     }
 
@@ -10082,7 +10447,10 @@ mod tests {
         queue(&mut tx, 5_000_000, [0x90, 60, 100]);
         let mut out = vec![0.0f32; 64 * 2];
         r.render(&mut out, now, now);
-        assert!(r.pending.is_some(), "a future event must be held, not dropped");
+        assert!(
+            r.pending.is_some(),
+            "a future event must be held, not dropped"
+        );
         // And it comes back out on a later callback that covers it.
         r.render(&mut out, 5_000_000, 5_000_000);
         assert!(r.pending.is_none());
@@ -10100,7 +10468,10 @@ mod tests {
         let capacity = r.notes.capacity();
         r.render(&mut out, 0, 0);
         assert_eq!(r.notes.capacity(), capacity, "the note buffer reallocated");
-        assert!(r.pending.is_some() || r.midi.slots() > 0, "the rest must be held");
+        assert!(
+            r.pending.is_some() || r.midi.slots() > 0,
+            "the rest must be held"
+        );
         for _ in 0..8 {
             r.render(&mut out, 0, 0);
         }
@@ -10151,11 +10522,7 @@ mod tests {
         let sent: Vec<i16> = r.controls.iter().map(|c| c.controller).collect();
         assert_eq!(
             sent,
-            vec![
-                Control::SUSTAIN,
-                Control::SOSTENUTO,
-                Control::SOFT
-            ]
+            vec![Control::SUSTAIN, Control::SOSTENUTO, Control::SOFT]
         );
     }
 
@@ -10238,7 +10605,10 @@ mod tests {
         r.render(&mut out, 0, 0);
 
         let heard = out.iter().fold(0.0f32, |a, s| a.max(s.abs()));
-        assert!(heard > 0.5, "the click never reached the output (peak {heard})");
+        assert!(
+            heard > 0.5,
+            "the click never reached the output (peak {heard})"
+        );
 
         let mut tap = RecorderTap {
             rx: tap_rx,
@@ -10487,7 +10857,10 @@ mod tests {
         let mut captured = Vec::new();
         tap.drain(&mut captured);
         let bled = captured.iter().fold(0.0f32, |a, s| a.max(s.abs()));
-        assert!(bled > 0.5, "asked for a guide click and got none (peak {bled})");
+        assert!(
+            bled > 0.5,
+            "asked for a guide click and got none (peak {bled})"
+        );
     }
 
     #[test]
@@ -10536,7 +10909,11 @@ mod tests {
         shared.set_channel_gain(CHANNELS, 0.25);
         shared.set_channel_gain(usize::MAX, 0.25);
         for cell in &shared.channel_gains {
-            assert_eq!(Shared::f32_of(cell), 1.0, "a real channel was written instead");
+            assert_eq!(
+                Shared::f32_of(cell),
+                1.0,
+                "a real channel was written instead"
+            );
         }
         shared.set_channel_gain(CHANNELS - 1, 0.25);
         assert_eq!(Shared::f32_of(&shared.channel_gains[CHANNELS - 1]), 0.25);
@@ -10551,7 +10928,10 @@ mod tests {
         shared.peak_l.fetch_max(0.1f32.to_bits(), Ordering::Relaxed);
         assert_eq!(f32::from_bits(shared.peak_l.load(Ordering::Relaxed)), 0.9);
         // And reading clears it, so the next window starts empty.
-        assert_eq!(f32::from_bits(shared.peak_l.swap(0, Ordering::Relaxed)), 0.9);
+        assert_eq!(
+            f32::from_bits(shared.peak_l.swap(0, Ordering::Relaxed)),
+            0.9
+        );
         assert_eq!(f32::from_bits(shared.peak_l.load(Ordering::Relaxed)), 0.0);
     }
 
@@ -10694,7 +11074,10 @@ mod tests {
             "the metronome made no sound without a plugin"
         );
         assert!(engine.take_recorder_tap().is_some());
-        assert!(engine.take_recorder_tap().is_none(), "the tap is taken once");
+        assert!(
+            engine.take_recorder_tap().is_none(),
+            "the tap is taken once"
+        );
     }
 
     #[test]
@@ -10821,7 +11204,10 @@ mod tests {
         engine.send_midi(now, &[0x90, 64, 100]);
         engine.send_midi(now, &[0x90, 67, 100]);
         std::thread::sleep(Duration::from_millis(500));
-        assert!(engine.meters().peak() > 0.001, "the instrument was not heard");
+        assert!(
+            engine.meters().peak() > 0.001,
+            "the instrument was not heard"
+        );
         engine.send_midi(engine.timebase().now(), &[0x80, 60, 64]);
         engine.send_midi(engine.timebase().now(), &[0x80, 64, 64]);
         engine.send_midi(engine.timebase().now(), &[0x80, 67, 64]);
@@ -10831,8 +11217,14 @@ mod tests {
         assert_eq!(tap.channels(), TAP_CHANNELS);
         let _ = engine.load_insert(0, 0, None, None);
         assert!(engine.insert(0, 0).is_none());
-        engine.load_insert(0, 0, Some(&bundle), None).expect("reload");
-        assert_eq!(tap.channels(), TAP_CHANNELS, "the tap changed width mid-take");
+        engine
+            .load_insert(0, 0, Some(&bundle), None)
+            .expect("reload");
+        assert_eq!(
+            tap.channels(),
+            TAP_CHANNELS,
+            "the tap changed width mid-take"
+        );
         assert!(engine.is_running());
         let mut out = Vec::new();
         tap.drain(&mut out);
@@ -10850,14 +11242,21 @@ mod tests {
         // structural test in this file would happily pass.
         let bundle = pianoteq();
         let mut engine = Engine::start(None).expect("an audio output");
-        engine.load_insert(0, 0, Some(&bundle), None).expect("channel 1");
+        engine
+            .load_insert(0, 0, Some(&bundle), None)
+            .expect("channel 1");
         for ch in 0..CHANNELS {
             engine.set_channel_gain(ch, 0.4);
         }
         let one = chord_peak(&engine);
-        engine.load_insert(1, 0, Some(&bundle), None).expect("channel 2");
+        engine
+            .load_insert(1, 0, Some(&bundle), None)
+            .expect("channel 2");
         let two = chord_peak(&engine);
-        println!("one channel {one:.4}, two {two:.4}, ratio {:.2}x", two / one);
+        println!(
+            "one channel {one:.4}, two {two:.4}, ratio {:.2}x",
+            two / one
+        );
         assert!(one > 0.001, "the first instrument was never heard ({one})");
         // Wide bounds on purpose: a real piano's peak is a transient and the
         // two instances are separately seeded. 1.5x rules out "the second
@@ -10881,8 +11280,12 @@ mod tests {
         // take the other with it.
         let bundle = pianoteq();
         let mut engine = Engine::start(None).expect("an audio output");
-        engine.load_insert(0, 0, Some(&bundle), None).expect("channel 1");
-        engine.load_insert(1, 0, Some(&bundle), None).expect("channel 2");
+        engine
+            .load_insert(0, 0, Some(&bundle), None)
+            .expect("channel 1");
+        engine
+            .load_insert(1, 0, Some(&bundle), None)
+            .expect("channel 2");
         for ch in 0..CHANNELS {
             engine.set_channel_gain(ch, 0.4);
         }

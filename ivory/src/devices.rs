@@ -183,7 +183,11 @@ fn channel_uid(key: &str, pick: ChannelPick) -> String {
 /// "Scarlett  -  inputs 1/2" in the picker and reading something else in the
 /// band is how somebody ends up unsure which input a take actually holds.
 fn with_channel(name: &str, pick: ChannelPick) -> String {
-    let word = if pick.channels() == 2 { "inputs" } else { "input" };
+    let word = if pick.channels() == 2 {
+        "inputs"
+    } else {
+        "input"
+    };
     format!("{name}  -  {word} {}", channel_label(pick))
 }
 
@@ -224,7 +228,10 @@ fn with_exposed(found: Vec<DeviceInfo>, exposed: &[String]) -> Vec<DeviceInfo> {
             .iter()
             .filter_map(|uid| {
                 let (key, pick) = split_channel(uid);
-                (key == d.uid).then_some(()).and(pick).map(|p| (p, uid.clone()))
+                (key == d.uid)
+                    .then_some(())
+                    .and(pick)
+                    .map(|p| (p, uid.clone()))
             })
             .collect();
         extras.sort_by_key(|(p, _)| pick_order(*p));
@@ -384,7 +391,10 @@ pub fn audio_selection(shared: &Shared) -> Option<AudioChoice> {
                 }
             }
             let channels = ivory_record::audio::Picks::from_slice(&picks);
-            Some(AudioChoice { selection, channels })
+            Some(AudioChoice {
+                selection,
+                channels,
+            })
         }
         // **Nothing chosen means nothing opened.** There used to be a fallback
         // to `InputSelection::Default` here, for the case where the user had
@@ -432,10 +442,7 @@ pub fn audio_selection(shared: &Shared) -> Option<AudioChoice> {
             let matched = ivory_record::audio::input_devices()
                 .ok()?
                 .into_iter()
-                .find(|d| {
-                    d.key.name == out_name
-                        || core(&d.key.name) == core(&out_name)
-                })?;
+                .find(|d| d.key.name == out_name || core(&d.key.name) == core(&out_name))?;
             // **The match BECOMES the wanted device.** Leaving `wanted` at
             // None while the session opens the match kept the selection
             // stale for ever — `wanted != open` — so every frame paid a
@@ -458,7 +465,12 @@ pub fn audio_selection(shared: &Shared) -> Option<AudioChoice> {
 ///
 /// Always called after an attempt, success or failure. A failed open that left
 /// `open != wanted` would be retried every frame forever.
-pub fn settle(shared: &Shared, opened: Option<String>, name: Option<String>, error: Option<String>) {
+pub fn settle(
+    shared: &Shared,
+    opened: Option<String>,
+    name: Option<String>,
+    error: Option<String>,
+) {
     let mut sel = lock(shared);
     sel.open = opened;
     sel.settled = true;
@@ -598,9 +610,7 @@ impl ivory_ui::ports::AudioSetup for Setup {
         // that offered a different list for input 3 would be inventing one.
         match audio_selection(&self.0) {
             Some(choice) => ivory_record::audio::input_rates(&choice.selection),
-            None => ivory_record::audio::input_rates(
-                &ivory_record::audio::InputSelection::Default,
-            ),
+            None => ivory_record::audio::input_rates(&ivory_record::audio::InputSelection::Default),
         }
     }
 }
@@ -799,7 +809,6 @@ pub fn restore(
     sel.extra = extra.to_vec();
 }
 
-
 /// The rows a fresh multichannel interface should arrive wearing: every
 /// mono input, and the natural stereo pairs — 1/2, 3/4, onward. The
 /// overlapping pairs (2/3 and friends) stay a chooser affair: they are
@@ -991,10 +1000,17 @@ mod tests {
     fn an_absent_interface_contributes_no_rows_and_loses_nothing() {
         let gone = channel_uid("Scarlett 18i20#0", ChannelPick::Stereo(0, 1));
         let rows = with_exposed(
-            vec![a_device("MacBook Pro Microphone#0", "MacBook Pro Microphone")],
+            vec![a_device(
+                "MacBook Pro Microphone#0",
+                "MacBook Pro Microphone",
+            )],
             std::slice::from_ref(&gone),
         );
-        assert_eq!(rows.len(), 1, "a row appeared for hardware that is not here");
+        assert_eq!(
+            rows.len(),
+            1,
+            "a row appeared for hardware that is not here"
+        );
 
         let (_a, shared) = AudioInputs::new();
         restore(&shared, None, false, std::slice::from_ref(&gone), &[]);
@@ -1039,7 +1055,13 @@ mod tests {
         use ivory_ui::ports::AudioSetup as _;
         let other = channel_uid("Behringer UMC1820#0", ChannelPick::Mono(7));
         let (_a, shared) = AudioInputs::new();
-        restore(&shared, Some("Scarlett 18i20#0"), false, &[other.clone()], &[]);
+        restore(
+            &shared,
+            Some("Scarlett 18i20#0"),
+            false,
+            &[other.clone()],
+            &[],
+        );
 
         let mut setup = Setup::new(&shared);
         assert!(
@@ -1056,7 +1078,8 @@ mod tests {
     #[test]
     fn choosing_a_device_does_not_open_it() {
         let (mut a, shared) = AudioInputs::new();
-        a.open("Scarlett 2i2#0").expect("recording intent cannot fail");
+        a.open("Scarlett 2i2#0")
+            .expect("recording intent cannot fail");
         assert_eq!(a.current().as_deref(), Some("Scarlett 2i2#0"));
         assert!(
             selection(&shared).is_stale(),
@@ -1231,7 +1254,13 @@ mod tests {
         use ivory_record::audio::InputSelection;
         let node = "alsa_input.usb-Focusrite_Scarlett_Solo_USB_Y771VU50AAEF28-00.pro-input-0";
         let (_a, shared) = AudioInputs::new();
-        restore(&shared, Some(&format!("{PIPEWIRE_UID}{node}")), false, &[], &[]);
+        restore(
+            &shared,
+            Some(&format!("{PIPEWIRE_UID}{node}")),
+            false,
+            &[],
+            &[],
+        );
         let choice = audio_selection(&shared).expect("a device was chosen");
         assert_eq!(
             choice.selection,
@@ -1244,7 +1273,10 @@ mod tests {
         let (_b, with_ch) = AudioInputs::new();
         restore(
             &with_ch,
-            Some(&channel_uid(&format!("{PIPEWIRE_UID}{node}"), ChannelPick::Stereo(1, 2))),
+            Some(&channel_uid(
+                &format!("{PIPEWIRE_UID}{node}"),
+                ChannelPick::Stereo(1, 2),
+            )),
             false,
             &[],
             &[],
@@ -1275,7 +1307,13 @@ mod tests {
         let mono6 = channel_uid(key, ChannelPick::Mono(5));
         let pair45 = channel_uid(key, ChannelPick::Stereo(3, 4));
         let (_b, shared) = AudioInputs::new();
-        restore(&shared, Some(&mono6), false, &[], std::slice::from_ref(&pair45));
+        restore(
+            &shared,
+            Some(&mono6),
+            false,
+            &[],
+            std::slice::from_ref(&pair45),
+        );
         let choice = audio_selection(&shared).expect("a device was chosen");
         assert_eq!(
             choice.channels.iter().collect::<Vec<_>>(),
@@ -1326,7 +1364,13 @@ mod tests {
         let key = "Scarlett 18i20#0";
         let mono6 = channel_uid(key, ChannelPick::Mono(5));
         let (_b, shared) = AudioInputs::new();
-        restore(&shared, Some(&mono6), false, &[], std::slice::from_ref(&mono6));
+        restore(
+            &shared,
+            Some(&mono6),
+            false,
+            &[],
+            std::slice::from_ref(&mono6),
+        );
         let choice = audio_selection(&shared).expect("a device was chosen");
         assert_eq!(choice.channels.len(), 1, "the same input opened twice");
     }
@@ -1359,7 +1403,13 @@ mod tests {
     fn a_malformed_channel_still_opens_the_device() {
         use ivory_record::audio::{DeviceKey, InputSelection};
         let (_a, shared) = AudioInputs::new();
-        restore(&shared, Some(&format!("Scarlett{CHANNEL_SEP}left")), false, &[], &[]);
+        restore(
+            &shared,
+            Some(&format!("Scarlett{CHANNEL_SEP}left")),
+            false,
+            &[],
+            &[],
+        );
         let choice = audio_selection(&shared).expect("the device still opens");
         assert_eq!(
             choice.selection,

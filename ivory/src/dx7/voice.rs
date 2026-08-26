@@ -324,7 +324,11 @@ impl Voice {
         let mut out = [b' '; 10];
         for (dst, c) in out.iter_mut().zip(text.chars()) {
             let b = c as u32;
-            *dst = if (0x20..0x7f).contains(&b) { b as u8 } else { b' ' };
+            *dst = if (0x20..0x7f).contains(&b) {
+                b as u8
+            } else {
+                b' '
+            };
         }
         self.name = out;
     }
