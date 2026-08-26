@@ -178,7 +178,7 @@ fn luminance(c: Color32) -> f32 {
 }
 
 /// Contrast ratio between two colours, 1.0 (identical) to 21.0 (black/white).
-fn contrast_ratio(a: Color32, b: Color32) -> f32 {
+pub fn contrast_ratio(a: Color32, b: Color32) -> f32 {
     let (x, y) = (luminance(a), luminance(b));
     let (hi, lo) = if x > y { (x, y) } else { (y, x) };
     (hi + 0.05) / (lo + 0.05)
@@ -202,7 +202,10 @@ fn contrast_ratio(a: Color32, b: Color32) -> f32 {
 /// WCAG's 3.0 for large text and below its 4.5 for body text, which is honest:
 /// somebody who picks that exact colour gets a legible band and not a
 /// comfortable one.
-fn wants_light_ink(c: Color32) -> bool {
+/// **Shared with the mixer**, which faces the same question about its strip
+/// faces: what is printed on a surface has to answer to how light it is, and
+/// there must be one answer rather than two that can drift apart.
+pub fn wants_light_ink(c: Color32) -> bool {
     contrast_ratio(c, INK_LIGHT) > contrast_ratio(c, INK_DARK)
 }
 
@@ -803,8 +806,14 @@ impl Layout {
         // the unevenness the owner named. The cell is trimmed to the circle
         // (plus the room its ticks need), so every gap in the row is the gap
         // between two things a person can point at.
+        // **The circle, and nothing but the circle.** 2.4 radii still left a
+        // fifth of a diameter of air inside the knob's own slot, so the gap
+        // from the dial to the tap chip read wider than every gap after it —
+        // the row looked left-justified even though the arithmetic was even.
+        // The slot IS the circle now, so dial-to-tap is the same distance as
+        // tap-to-Record and every pair after it.
         let knob_w = knob_face(head)
-            .map_or(head.width(), |f| (f.radius * 2.4).min(head.width()));
+            .map_or(head.width(), |f| (f.radius * 2.0).min(head.width()));
         widths.push(knob_w);
         widths.push(tap_w);
         for _ in 0..ICONS {

@@ -40,32 +40,22 @@ pub fn white_keys_before(note: u8) -> Option<usize> {
 
 /// Idle fill for a key.
 ///
-/// **Dark mode moves the KEYBOARD as well as the theory content, always.**
-/// It was scoped to the theory window for a while, which left the first view
-/// half dark. The first fix only swapped when the two colours were still the
-/// shipped defaults - which is false the moment somebody tries a theme or
-/// picks a colour, so the toggle went dead again for exactly the people most
-/// likely to press it.
-///
-/// So it SHADES rather than swaps: whatever colour the keys are wearing -
-/// shipped, themed, or hand-picked - is darkened toward the same near-black
-/// ground the theory panel uses. A custom keyboard stays recognisably itself
-/// and still answers the key.
+/// **Dark mode INVERTS the keyboard rather than dimming it.** Shading each
+/// colour down was an improvement on not responding at all, but it is not
+/// what this toggle used to do and not what it should do: the naturals go to
+/// the sharps' colour and the sharps to the naturals', so a stock keyboard
+/// reads as ivory sharps on black naturals - the same ivory-on-black the
+/// theory panel above it wears, out of the same two colours the user already
+/// chose. A themed or hand-painted keyboard inverts with its own pair, so it
+/// stays recognisably itself.
 fn idle_colors(s: &Settings) -> (Color32, Color32) {
     let white = s.white_key_idle_color.to_color32();
     let black = s.black_key_idle_color.to_color32();
-    if !s.dark_mode {
-        return (white, black);
+    if s.dark_mode {
+        (black, white)
+    } else {
+        (white, black)
     }
-    (dim(white, 0.30), dim(black, 0.55))
-}
-
-/// Scale a colour toward black, keeping its hue - the same trick the band's
-/// wells use, so a themed keyboard darkens into its own colour rather than
-/// into grey.
-fn dim(c: Color32, k: f32) -> Color32 {
-    let f = |v: u8| (f32::from(v) * k).clamp(0.0, 255.0) as u8;
-    Color32::from_rgb(f(c.r()), f(c.g()), f(c.b()))
 }
 
 pub fn bg_color(dark_mode: bool) -> Color32 {

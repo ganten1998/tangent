@@ -521,6 +521,11 @@ pub struct IvoryApp {
     menu_cache_at: Option<std::time::Instant>,
     /// The submenu row under the pointer, for the hover light.
     menu_hover_row: Option<usize>,
+    /// The TOP row under the pointer, for lighting it. Separate from
+    /// `InputMenu::hover`, which means "whose submenu is open" and is only
+    /// ever one of the first three — so the None row, which has no submenu,
+    /// never lit and read as the one row you could not choose.
+    menu_hover_top: Option<usize>,
     /// The SELECTED channel — a left-click on a strip or header lights it
     /// slightly. Groundwork the owner asked for; nothing routes off it yet.
     selected_channel: Option<usize>,
@@ -1453,6 +1458,7 @@ impl IvoryApp {
             menu_cache_key: (String::new(), 0),
             menu_cache_at: None,
             menu_hover_row: None,
+            menu_hover_top: None,
             selected_channel: None,
             lcd_drag: None,
             input_width: 0,
@@ -5244,6 +5250,7 @@ impl IvoryApp {
         let rows = self.menu_rows_cache.clone().unwrap_or_default();
         let width = self.menu_cache_key.1;
         self.menu_hover_row = None;
+        self.menu_hover_top = None;
         self.input_menu = Some(InputMenu {
             ch,
             at: self.menu_anchor,
@@ -5401,8 +5408,11 @@ impl IvoryApp {
         let (tops, subs) = self.input_menu_rects(&m);
         let pointer = ctx.pointer_latest_pos().or(ctx.pointer_interact_pos());
         self.menu_hover_row = None;
+        self.menu_hover_top = None;
         if let Some(pos) = pointer {
             if let Some(i) = tops.iter().position(|r| r.contains(pos)) {
+                // Lit for EVERY top row, including None.
+                self.menu_hover_top = Some(i);
                 if i < 3 {
                     m.hover = Some(i);
                 }
@@ -5470,7 +5480,7 @@ impl IvoryApp {
         };
         column(painter, &tops);
         for (i, r) in tops.iter().enumerate() {
-            if m.hover == Some(i) && i < 3 {
+            if self.menu_hover_top == Some(i) || (m.hover == Some(i) && i < 3) {
                 painter.rect_filled(r.shrink(1.0), 2.0, lit);
             }
             painter.text(
