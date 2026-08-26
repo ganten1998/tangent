@@ -28,7 +28,8 @@ pub enum KeyAction {
     ToggleNoteNames,
     /// One of the theory band's elements, by its number key.
     ToggleTheoryElement(usize),
-    CycleTheory,
+    /// Wear the next theme. See `theme::factory` and the user folder.
+    CycleTheme,
     ToggleDarkMode,
     ToggleDetection,
     ToggleBorderless,
@@ -168,7 +169,12 @@ const BINDINGS: &[(Key, &str, KeyAction, bool)] = &[
     (Key::Num2, "2", KeyAction::ToggleTheoryElement(2), false),
     (Key::Num3, "3", KeyAction::ToggleTheoryElement(3), false),
     (Key::Num4, "4", KeyAction::ToggleTheoryElement(4), false),
-    (Key::T, "T", KeyAction::CycleTheory, true),
+    // **T is THEMES.** It used to turn every theory diagram on at once,
+    // which is not a cycle: the second press did nothing, and the owner said
+    // so. The 1-4 keys already toggle the diagrams one at a time, so the
+    // letter went to the thing people actually flick through - sixteen
+    // themes plus whatever is in the user folder.
+    (Key::T, "T", KeyAction::CycleTheme, true),
     (Key::C, "C", KeyAction::ToggleDetection, true),
     (Key::D, "D", KeyAction::ToggleDarkMode, true),
     (Key::B, "B", KeyAction::ToggleBorderless, true),
@@ -252,7 +258,7 @@ fn describe(a: KeyAction) -> &'static str {
         KeyAction::ToggleNoteNames => "note names",
         // The row reads `1-4`, not `1`, because the four keys are one control.
         KeyAction::ToggleTheoryElement(_) => "theory panel on/off (1-4)",
-        KeyAction::CycleTheory => "cycle the theory band",
+        KeyAction::CycleTheme => "cycle themes",
         KeyAction::ToggleDarkMode => "dark mode",
         KeyAction::ToggleDetection => "chord detection",
         KeyAction::ToggleBorderless => "window border",

@@ -10876,6 +10876,28 @@ impl IvoryApp {
     /// What the effects ship as. Told by the host; see [`EffectDefaults`].
     ///
     /// [`EffectDefaults`]: crate::ports::EffectDefaults
+    /// Wear the next theme, factory then user, wrapping at the end.
+    ///
+    /// **By NAME, not by index.** The user folder can gain or lose a file
+    /// between two presses, and an index into a list that changed underneath
+    /// would jump somewhere arbitrary. A name that has gone starts the cycle
+    /// again at Default, which is the one theme that always exists.
+    fn cycle_theme(&mut self) {
+        let mut all = crate::theme::factory();
+        all.extend(crate::theme::user_themes());
+        if all.is_empty() {
+            return;
+        }
+        let at = all
+            .iter()
+            .position(|t| t.name == self.settings.theme_name)
+            .map_or(0, |i| (i + 1) % all.len());
+        if let Some(t) = all.get(at) {
+            t.apply(&mut self.settings);
+            self.save_settings();
+        }
+    }
+
     /// Re-render the route labels the panels draw. Called wherever the table
     /// changes — adding, removing, loading — and nowhere else.
     fn refresh_route_labels(&mut self) {
@@ -12696,7 +12718,7 @@ impl IvoryApp {
             // it better — so this key is the way OUT of any arrangement,
             // including the empty one you cannot press a number to escape from
             // without knowing which number.
-            K::CycleTheory => self.apply_menu_action(ctx, MenuAction::ShowAllTheory),
+            K::CycleTheme => self.cycle_theme(),
             K::ToggleTheoryElement(n) => {
                 if let Some(v) = theory_panel::View::from_number(n) {
                     self.apply_menu_action(ctx, MenuAction::ToggleTheoryView(v));
@@ -12987,12 +13009,6 @@ impl IvoryApp {
                 // divide its width — but it goes to zero when the last element
                 // leaves and comes back when the first one returns, so the
                 // window still has to be re-measured.
-                self.request_natural_size();
-            }
-            MenuAction::ShowAllTheory => {
-                self.settings
-                    .set_theory_views(&theory_panel::Views::all());
-                self.save_settings();
                 self.request_natural_size();
             }
             MenuAction::ToggleFretboard => {
