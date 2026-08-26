@@ -2519,6 +2519,100 @@ fn shorten_middle(s: &str, max: usize) -> String {
     format!("{head}\u{2026}{tail}")
 }
 
+/// The export window: a wave that draws itself while the render walks the
+/// timeline, and a bar under it.
+///
+/// **Not a dialog.** It answers no question, it does not take the one dialog
+/// slot, and it cannot be dismissed - it goes when the export goes. It floats
+/// over the main window because that is where an eye already is, and because
+/// an export is the one thing in this app that can run long enough for a
+/// person to wonder whether it is running at all.
+pub fn show_export_progress(
+    ctx: &egui::Context,
+    p: &crate::ports::ExportProgress,
+    placement: Placement,
+) {
+    let t = theme(false);
+    let bold = |size: f32| FontId::new(size, fonts::courier_bold());
+    show_dialog_viewport(
+        ctx,
+        placement,
+        "Exporting",
+        Vec2::new(520.0, 210.0),
+        Vec2::new(420.0, 180.0),
+        |ui, _result| {
+            apply_theme(ui.style_mut(), &t);
+            ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
+            egui::Frame::NONE
+                .inner_margin(egui::Margin::same(12))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!("{}  {:.0}%", p.label, p.fraction * 100.0))
+                            .font(bold(12.0))
+                            .color(t.text),
+                    );
+                    ui.add_space(8.0);
+                    // ── the wave ──────────────────────────────────────────
+                    let w = ui.available_width();
+                    let (rect, _) = ui.allocate_exact_size(
+                        Vec2::new(w, 96.0),
+                        egui::Sense::hover(),
+                    );
+                    let painter = ui.painter_at(rect);
+                    painter.rect_filled(rect, 2.0, t.field_bg);
+                    let mid = rect.center().y;
+                    // The zero line, so a silent passage still reads as
+                    // rendered rather than as nothing drawn yet.
+                    painter.line_segment(
+                        [
+                            Pos2::new(rect.left(), mid),
+                            Pos2::new(rect.right(), mid),
+                        ],
+                        Stroke::new(1.0_f32, t.text.gamma_multiply(0.25)),
+                    );
+                    let cols = p.peaks.len().max(1);
+                    let half = rect.height() * 0.5 - 2.0;
+                    for (i, (lo, hi)) in p.peaks.iter().enumerate() {
+                        if *lo == 0.0 && *hi == 0.0 {
+                            continue;
+                        }
+                        let x = rect.left() + rect.width() * (i as f32 + 0.5) / cols as f32;
+                        let top = mid - hi.clamp(-1.0, 1.0) * half;
+                        let bot = mid - lo.clamp(-1.0, 1.0) * half;
+                        painter.line_segment(
+                            [Pos2::new(x, top), Pos2::new(x, bot.max(top + 1.0))],
+                            Stroke::new(1.0_f32, t.text),
+                        );
+                    }
+                    // The playhead: where the render has got to.
+                    let x = rect.left() + rect.width() * p.fraction.clamp(0.0, 1.0);
+                    painter.line_segment(
+                        [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+                        Stroke::new(1.0_f32, Color32::from_rgb(0xE8, 0x3A, 0x4E)),
+                    );
+                    ui.add_space(8.0);
+                    // ── the bar ───────────────────────────────────────────
+                    let (bar, _) = ui.allocate_exact_size(
+                        Vec2::new(w, 10.0),
+                        egui::Sense::hover(),
+                    );
+                    let painter = ui.painter_at(bar);
+                    painter.rect_filled(bar, 1.0, t.field_bg);
+                    let filled = Rect::from_min_max(
+                        bar.min,
+                        Pos2::new(
+                            bar.left() + bar.width() * p.fraction.clamp(0.0, 1.0),
+                            bar.bottom(),
+                        ),
+                    );
+                    if filled.width() > 0.5 {
+                        painter.rect_filled(filled, 1.0, t.text);
+                    }
+                });
+        },
+    );
+}
+
 pub fn show(
     ctx: &egui::Context,
     dialog_opt: &mut Option<Dialog>,

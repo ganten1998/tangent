@@ -311,6 +311,10 @@ struct OfflineBounce {
     stems: Vec<(usize, std::path::PathBuf, ivory_record::wav::WavWriter)>,
     stem_scratch: Vec<f32>,
     out_dir: std::path::PathBuf,
+    /// The wave as it is heard, one (min, max) per drawn column. Written by
+    /// position rather than appended, so a block that spans two columns fills
+    /// both and a render that stalls leaves no gap.
+    peaks: Vec<(f32, f32)>,
 }
 
 struct Bounce {
@@ -3394,6 +3398,7 @@ impl DesktopApp {
                     }
                 }
             }
+            self.app.set_export_progress(None);
             match deliver_formats_inner(&paths, &spec, true) {
                 Ok(()) => {
                     self.recorder.take_note =
@@ -3705,6 +3710,7 @@ impl DesktopApp {
             stems,
             stem_scratch: Vec::new(),
             out_dir,
+            peaks: vec![(0.0, 0.0); ivory_ui::ports::EXPORT_PEAKS],
         });
     }
 
@@ -3752,17 +3758,47 @@ impl DesktopApp {
                     let _ = w.write_interleaved(&fold);
                 }
             }
+            // The wave, bucketed by where this block sits in the whole
+            // render. Min and max rather than a mean: a peak that only
+            // exists for two samples is exactly what somebody watching an
+            // export is looking for.
+            if b.until > 0 {
+                let cols = ivory_ui::ports::EXPORT_PEAKS as u64;
+                for f in 0..n {
+                    let at = ((b.done + f as u64) * cols / b.until) as usize;
+                    let Some(cell) = b.peaks.get_mut(at.min(ivory_ui::ports::EXPORT_PEAKS - 1))
+                    else {
+                        break;
+                    };
+                    let l = out[f * 2];
+                    let r = out[f * 2 + 1];
+                    cell.0 = cell.0.min(l).min(r);
+                    cell.1 = cell.1.max(l).max(r);
+                }
+            }
             b.done += n as u64;
             if budget.elapsed() > std::time::Duration::from_millis(80) {
                 break;
             }
         }
         if b.done < b.until {
-            let pct = (b.done as f64 / b.until as f64 * 100.0) as u32;
-            self.recorder.take_note = Some(format!("Rendering at full speed… {pct}%"));
+            let fraction = (b.done as f64 / b.until as f64) as f32;
+            self.app.set_export_progress(Some(ivory_ui::ports::ExportProgress {
+                fraction,
+                label: "Rendering".to_owned(),
+                peaks: b.peaks.clone(),
+            }));
             self.recorder.offline_bounce = Some(b);
             return;
         }
+        // Rendering is done; the format pass still has to run, and on a long
+        // mp3 that is the part that used to look like a hang. Say so, and let
+        // the window paint this frame before it starts.
+        self.app.set_export_progress(Some(ivory_ui::ports::ExportProgress {
+            fraction: 1.0,
+            label: "Writing files".to_owned(),
+            peaks: b.peaks.clone(),
+        }));
         // ── done: close the files, then the format pass ──
         let OfflineBounce {
             spec,
@@ -3788,6 +3824,7 @@ impl DesktopApp {
         }
         if let Some(p) = problem {
             self.recorder.take_note = Some(format!("export failed: {p}"));
+            self.app.set_export_progress(None);
             return;
         }
         let mut paths = stem_paths;
@@ -3796,9 +3833,11 @@ impl DesktopApp {
         }
         if let Err(e) = deliver_formats(&paths, &spec) {
             self.recorder.take_note = Some(format!("export: {e}"));
+            self.app.set_export_progress(None);
             return;
         }
         self.recorder.take_note = Some(format!("Exported  {}", out_dir.display()));
+        self.app.set_export_progress(None);
         if spec.open_when_done {
             reveal(&out_dir);
         }
