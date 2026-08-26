@@ -60,6 +60,13 @@ pub struct Theme {
     /// the same on all sixteen themes. The owner's words were that no theme
     /// changes the theory view's background, and they were right — it was the
     /// one surface with no role at all.
+    ///
+    /// **It is the KEYBOARD's colour, not the band's.** The first pass took it
+    /// from `recorder_bg`, which on the default theme is the band's wine — so
+    /// the theory modules came up on pink. A page of music belongs on the same
+    /// bone the naturals are, with the same black on it, and in dark mode on
+    /// the same near-black the sharps are. Default is `#e8dcc0` over
+    /// `#1a1a1a`, which is exactly what this view always looked like.
     pub background: Option<Rgb>,
 
     // ── words and lines ────────────────────────────────────────────────────
@@ -168,7 +175,7 @@ impl Theme {
     pub fn factory_default() -> Self {
         Self {
             name: "Default".to_owned(),
-            background: c(0xeb, 0xc5, 0xc8),
+            background: c(0xe8, 0xdc, 0xc0),
             white_key: c(0xE8, 0xDC, 0xC0),
             black_key: c(0x1a, 0x1a, 0x1a),
             key_active: c(0x6C, 0x9B, 0xD2),
@@ -187,7 +194,7 @@ impl Theme {
             fretboard: c(0x4a, 0x2b, 0x22),
             string: c(0xC9, 0xC4, 0xBC),
             channel_palette: Some(0),
-            dark: dark_of(&[("background", (0x23, 0x1b, 0x1b))]),
+            dark: dark_of(&[("background", (0x1a, 0x1a, 0x1a))]),
         }
     }
 
@@ -282,8 +289,13 @@ impl Theme {
         if let Some(v) = self.input_chip {
             s.input_chip_color = v;
         }
+        // **Only when the palette is following the theme.** Somebody who has
+        // picked one by hand in the track menu has said what they want, and
+        // the next theme must not take it back.
         if let Some(v) = self.channel_palette {
-            s.palette_choice = v;
+            if s.palette_auto {
+                s.palette_choice = v;
+            }
         }
         if let Some(v) = self.fretboard {
             s.fretboard_color = v;
@@ -427,7 +439,7 @@ pub fn factory() -> Vec<Theme> {
         // jade → amber → crimson, so the scope is jade and the master crimson.
         Theme {
             name: "Valentine".to_owned(),
-            background: c(0xe9, 0xc3, 0xe0),
+            background: c(0xf3, 0xdc, 0xe7),
             white_key: c(0xf3, 0xdc, 0xe7),
             black_key: c(0x25, 0x15, 0x24),
             key_active: c(0xff, 0x5f, 0xa2),
@@ -450,15 +462,15 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x4c, 0xc7, 0xa4),
             fretboard: c(0x25, 0x15, 0x24),
             string: c(0xa3, 0x76, 0x8f),
-            channel_palette: Some(6),
-            dark: dark_of(&[("background", (0x22, 0x1b, 0x20))]),
+            channel_palette: Some(1),
+            dark: dark_of(&[("background", (0x25, 0x15, 0x24))]),
         },
         // ── Hydra: the owner's audio-routing TUI. Near-black teal depths, a
         // bioluminescent seafoam glow, and exactly one warm coral — which is
         // the sustain, because sustain is the held/engaged state.
         Theme {
             name: "Hydra".to_owned(),
-            background: c(0xb5, 0xd5, 0xd7),
+            background: c(0xd6, 0xe8, 0xe4),
             white_key: c(0xd6, 0xe8, 0xe4),
             black_key: c(0x10, 0x24, 0x28),
             key_active: c(0x3f, 0xd9, 0xb8),
@@ -477,7 +489,7 @@ pub fn factory() -> Vec<Theme> {
             fretboard: c(0x10, 0x24, 0x28),
             string: c(0x6a, 0x8c, 0x88),
             channel_palette: Some(2),
-            dark: dark_of(&[("background", (0x16, 0x1f, 0x1f))]),
+            dark: dark_of(&[("background", (0x10, 0x24, 0x28))]),
         },
         // ── Navi: the owner's graph viewer. Layered night blues with
         // periwinkle nodes rimmed in electric cyan, and exactly one warm
@@ -485,7 +497,7 @@ pub fn factory() -> Vec<Theme> {
         // the master here: the one control that is about intent.
         Theme {
             name: "Navi".to_owned(),
-            background: c(0xc0, 0xd0, 0xe5),
+            background: c(0xe0, 0xf0, 0xff),
             white_key: c(0xe0, 0xf0, 0xff),
             black_key: c(0x0a, 0x1c, 0x34),
             // Lifted from the app's own #5578ff: that periwinkle is drawn on
@@ -506,8 +518,8 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x55, 0x78, 0xff),
             fretboard: c(0x0a, 0x1c, 0x34),
             string: c(0x78, 0x98, 0xb8),
-            channel_palette: Some(2),
-            dark: dark_of(&[("background", (0x18, 0x1d, 0x23))]),
+            channel_palette: Some(3),
+            dark: dark_of(&[("background", (0x0a, 0x1c, 0x34))]),
         },
         // ── Mono: greys, and one red.
         //
@@ -517,7 +529,7 @@ pub fn factory() -> Vec<Theme> {
         // buys. The scope draws white, like a scope.
         Theme {
             name: "Mono".to_owned(),
-            background: c(0xcf, 0xcf, 0xcf),
+            background: c(0xd8, 0xd8, 0xd8),
             white_key: c(0xd8, 0xd8, 0xd8),
             black_key: c(0x14, 0x14, 0x14),
             key_active: c(0xf0, 0xf0, 0xf0),
@@ -537,15 +549,15 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x8a, 0x8a, 0x8a),
             fretboard: c(0x1a, 0x1a, 0x1a),
             string: c(0x78, 0x78, 0x78),
-            channel_palette: Some(5),
-            dark: dark_of(&[("background", (0x1d, 0x1d, 0x1d))]),
+            channel_palette: Some(4),
+            dark: dark_of(&[("background", (0x14, 0x14, 0x14))]),
         },
         // ── Studio: the analogue console. Warm charcoal, cream legends, VU
         // amber for anything that moves, an oxblood master, and the sage-green
         // lamp old gear uses for "connected" on the input chip.
         Theme {
             name: "Studio".to_owned(),
-            background: c(0xd9, 0xcc, 0xc3),
+            background: c(0xe8, 0xe2, 0xd4),
             white_key: c(0xe8, 0xe2, 0xd4),
             black_key: c(0x19, 0x17, 0x14),
             key_active: c(0xd8, 0xa0, 0x3c),
@@ -566,15 +578,15 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x7f, 0xa0, 0x5a),
             fretboard: c(0x27, 0x24, 0x20),
             string: c(0xa8, 0x98, 0x80),
-            channel_palette: Some(1),
-            dark: dark_of(&[("background", (0x1f, 0x1c, 0x1a))]),
+            channel_palette: Some(5),
+            dark: dark_of(&[("background", (0x19, 0x17, 0x14))]),
         },
         // ── Aurora: indigo night with a mint/violet complementary pair — mint
         // for what is sounding, violet for what is HELD, so the two states of
         // a note are opposite ends of the wheel and never confusable.
         Theme {
             name: "Aurora".to_owned(),
-            background: c(0xc6, 0xce, 0xeb),
+            background: c(0xdf, 0xe4, 0xee),
             white_key: c(0xdf, 0xe4, 0xee),
             black_key: c(0x12, 0x14, 0x1b),
             key_active: c(0x5c, 0xe8, 0xb4),
@@ -592,8 +604,8 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0xa9, 0x7b, 0xf0),
             fretboard: c(0x1e, 0x21, 0x30),
             string: c(0x6b, 0x72, 0x90),
-            channel_palette: Some(2),
-            dark: dark_of(&[("background", (0x1b, 0x1d, 0x22))]),
+            channel_palette: Some(6),
+            dark: dark_of(&[("background", (0x12, 0x14, 0x1b))]),
         },
         // ── Sandstone: the LIGHT one, and the reason the set needs it — every
         // other theme here is dark, and a person working in daylight has
@@ -603,7 +615,7 @@ pub fn factory() -> Vec<Theme> {
         // cannot simply invert a dark one.
         Theme {
             name: "Sandstone".to_owned(),
-            background: c(0xd4, 0xce, 0xc4),
+            background: c(0xfa, 0xf4, 0xe8),
             white_key: c(0xfa, 0xf4, 0xe8),
             black_key: c(0x4a, 0x3f, 0x34),
             // **A light theme is not a dark one inverted.** On paper the
@@ -626,8 +638,8 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x7d, 0x8f, 0x5a),
             fretboard: c(0xc9, 0xb5, 0x96),
             string: c(0x6b, 0x5c, 0x48),
-            channel_palette: Some(1),
-            dark: dark_of(&[("background", (0x1d, 0x1d, 0x1b))]),
+            channel_palette: Some(7),
+            dark: dark_of(&[("background", (0x4a, 0x3f, 0x34))]),
         },
         // ── Centennial: the DX7 II Centennial, 1987 — Yamaha's hundredth
         // birthday in brushed silver with gold legends and black cheeks. The
@@ -636,7 +648,7 @@ pub fn factory() -> Vec<Theme> {
         // is the one cool note, as it is on the instrument.
         Theme {
             name: "Centennial".to_owned(),
-            background: c(0xce, 0xce, 0xd1),
+            background: c(0xf2, 0xf1, 0xee),
             white_key: c(0xf2, 0xf1, 0xee),
             black_key: c(0x26, 0x26, 0x2a),
             key_active: c(0x78, 0x5c, 0x17),
@@ -654,14 +666,14 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x5d, 0x6b, 0x78),
             fretboard: c(0x3a, 0x3a, 0x40),
             string: c(0xc9, 0xc9, 0xcf),
-            channel_palette: Some(5),
-            dark: dark_of(&[("background", (0x1c, 0x1c, 0x1d))]),
+            channel_palette: Some(8),
+            dark: dark_of(&[("background", (0x26, 0x26, 0x2a))]),
         },
         // ── Blueprint: a cyanotype. Prussian ground, chalk lines, and one
         // ochre for what is HELD — the pencil annotation on a blue print.
         Theme {
             name: "Blueprint".to_owned(),
-            background: c(0xbf, 0xd0, 0xe4),
+            background: c(0xe6, 0xee, 0xf7),
             white_key: c(0xe6, 0xee, 0xf7),
             black_key: c(0x0d, 0x1c, 0x33),
             key_active: c(0x7f, 0xb2, 0xe8),
@@ -679,15 +691,15 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x6f, 0xc3, 0xb8),
             fretboard: c(0x13, 0x2b, 0x47),
             string: c(0x8f, 0xa8, 0xc0),
-            channel_palette: Some(2),
-            dark: dark_of(&[("background", (0x18, 0x1d, 0x23))]),
+            channel_palette: Some(9),
+            dark: dark_of(&[("background", (0x0d, 0x1c, 0x33))]),
         },
         // ── Porcelain: the other light theme, and cool where Sandstone is
         // warm. Delft cobalt on cool white, with a violet sustain so the two
         // note states are told apart by hue as well as by weight.
         Theme {
             name: "Porcelain".to_owned(),
-            background: c(0xcc, 0xce, 0xd1),
+            background: c(0xfb, 0xfb, 0xfc),
             white_key: c(0xfb, 0xfb, 0xfc),
             black_key: c(0x2a, 0x33, 0x40),
             key_active: c(0x2f, 0x5f, 0xa8),
@@ -705,15 +717,15 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x5a, 0x8a, 0x7a),
             fretboard: c(0x39, 0x42, 0x4e),
             string: c(0xc2, 0xc8, 0xd0),
-            channel_palette: Some(2),
-            dark: dark_of(&[("background", (0x1c, 0x1c, 0x1d))]),
+            channel_palette: Some(10),
+            dark: dark_of(&[("background", (0x2a, 0x33, 0x40))]),
         },
         // ── Moss: deep forest, lichen text, and a low amber sustain. The
         // sustain is DARKER than the struck note here — on a green ground a
         // second bright mark competes with the first.
         Theme {
             name: "Moss".to_owned(),
-            background: c(0xbe, 0xd6, 0xb5),
+            background: c(0xe4, 0xea, 0xd9),
             white_key: c(0xe4, 0xea, 0xd9),
             black_key: c(0x13, 0x1a, 0x12),
             key_active: c(0x8f, 0xc4, 0x6a),
@@ -731,15 +743,15 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x7f, 0xae, 0x94),
             fretboard: c(0x1d, 0x27, 0x18),
             string: c(0x9a, 0xa8, 0x8c),
-            channel_palette: Some(3),
-            dark: dark_of(&[("background", (0x19, 0x1e, 0x18))]),
+            channel_palette: Some(11),
+            dark: dark_of(&[("background", (0x13, 0x1a, 0x12))]),
         },
         // ── Rhodes: black tolex, cream keys, and the nameplate's red on the
         // master. Warm where Studio is neutral: this is a wooden instrument
         // in a case, not a console in a rack.
         Theme {
             name: "Rhodes".to_owned(),
-            background: c(0xdb, 0xcc, 0xbf),
+            background: c(0xef, 0xe6, 0xd2),
             white_key: c(0xef, 0xe6, 0xd2),
             black_key: c(0x16, 0x13, 0x11),
             key_active: c(0xd9, 0xa4, 0x41),
@@ -757,14 +769,14 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x8f, 0xa0, 0x6a),
             fretboard: c(0x24, 0x1d, 0x18),
             string: c(0xb8, 0xac, 0x98),
-            channel_palette: Some(1),
-            dark: dark_of(&[("background", (0x1f, 0x1d, 0x1a))]),
+            channel_palette: Some(12),
+            dark: dark_of(&[("background", (0x16, 0x13, 0x11))]),
         },
         // ── Copper: verdigris and rust, the two things copper becomes. The
         // patina is the ground and the oxide is what moves.
         Theme {
             name: "Copper".to_owned(),
-            background: c(0xb3, 0xd6, 0xcf),
+            background: c(0xe8, 0xe2, 0xd4),
             white_key: c(0xe8, 0xe2, 0xd4),
             black_key: c(0x14, 0x20, 0x1d),
             key_active: c(0xe0, 0x8a, 0x4a),
@@ -782,15 +794,15 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0xc0, 0x8a, 0x5a),
             fretboard: c(0x1b, 0x2f, 0x2b),
             string: c(0xa8, 0xb8, 0xb2),
-            channel_palette: Some(7),
-            dark: dark_of(&[("background", (0x17, 0x1e, 0x1d))]),
+            channel_palette: Some(13),
+            dark: dark_of(&[("background", (0x14, 0x20, 0x1d))]),
         },
         // ── Dusk: the sky twenty minutes after sunset — violet overhead,
         // warm at the horizon. The horizon colour is what sounds; the
         // overhead blue is what is held.
         Theme {
             name: "Dusk".to_owned(),
-            background: c(0xd4, 0xc8, 0xef),
+            background: c(0xec, 0xe6, 0xf0),
             white_key: c(0xec, 0xe6, 0xf0),
             black_key: c(0x16, 0x12, 0x28),
             key_active: c(0xf0, 0x92, 0x5a),
@@ -808,15 +820,15 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x8f, 0x7f, 0xd0),
             fretboard: c(0x22, 0x1b, 0x3a),
             string: c(0x9a, 0x90, 0xb8),
-            channel_palette: Some(6),
-            dark: dark_of(&[("background", (0x1e, 0x1b, 0x24))]),
+            channel_palette: Some(14),
+            dark: dark_of(&[("background", (0x16, 0x12, 0x28))]),
         },
         // ── Iris: deep violet with its complement, chartreuse. The widest
         // hue gap in the set, so a sounding note cannot be mistaken for a
         // held one at any glance.
         Theme {
             name: "Iris".to_owned(),
-            background: c(0xd7, 0xc8, 0xef),
+            background: c(0xee, 0xe8, 0xf4),
             white_key: c(0xee, 0xe8, 0xf4),
             black_key: c(0x19, 0x10, 0x26),
             key_active: c(0xc8, 0xe0, 0x5a),
@@ -834,8 +846,8 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x9f, 0x7f, 0xd8),
             fretboard: c(0x25, 0x18, 0x40),
             string: c(0xa8, 0x98, 0xc0),
-            channel_palette: Some(6),
-            dark: dark_of(&[("background", (0x1e, 0x1b, 0x25))]),
+            channel_palette: Some(15),
+            dark: dark_of(&[("background", (0x19, 0x10, 0x26))]),
         },
     ]
 }
@@ -1050,6 +1062,120 @@ mod tests {
         t.apply(&mut set);
         for role in ROLES {
             assert!(set.dark_role(role).is_none(), "{role} was invented");
+        }
+    }
+
+
+    /// **The theory ground is the KEYBOARD's, not the band's.**
+    ///
+    /// The first pass derived it from `recorder_bg`, which on the default
+    /// theme is the band's wine — so the theory modules came up on PINK. The
+    /// owner's rule: a page of music sits on the same bone the naturals are,
+    /// with the same black on it, and in dark mode on the same near-black the
+    /// sharps are.
+    #[test]
+    fn the_theory_ground_is_the_keyboard_not_the_band() {
+        for t in factory() {
+            let bg = t.background.expect("every theme names a ground");
+            assert_eq!(
+                Some(bg),
+                t.white_key,
+                "{}: the light ground is not the naturals' colour",
+                t.name
+            );
+            let dark = t.dark.get("background").copied();
+            assert_eq!(
+                dark, t.black_key,
+                "{}: the dark ground is not the sharps' colour",
+                t.name
+            );
+            // And specifically NOT the band, which is what produced the pink.
+            if t.recorder_bg != t.white_key {
+                assert_ne!(
+                    Some(bg),
+                    t.recorder_bg,
+                    "{}: the theory ground came from the band again",
+                    t.name
+                );
+            }
+        }
+        // The default, named outright: black on bone, the way this view has
+        // always looked.
+        let d = Theme::factory_default();
+        assert_eq!(d.background, Some(Rgb { r: 0xE8, g: 0xDC, b: 0xC0 }));
+        assert_eq!(
+            d.dark.get("background").copied(),
+            Some(Rgb { r: 0x1a, g: 0x1a, b: 0x1a })
+        );
+    }
+
+
+    /// **A hand-picked palette outlives the next theme; AUTO does not.**
+    ///
+    /// The track menu offers all eight and an AUTO row. Auto is the default
+    /// and means "whatever this theme names" — which is what makes sixteen
+    /// themes each arrive dressed. Choosing one by hand is a decision, and a
+    /// decision that the next theme quietly undid would be worse than not
+    /// offering the choice.
+    #[test]
+    fn a_hand_picked_palette_survives_a_theme_change() {
+        let themed: Vec<Theme> = factory()
+            .into_iter()
+            .filter(|t| t.channel_palette.is_some())
+            .collect();
+        assert!(themed.len() > 8, "too few themes name a palette to test with");
+
+        // AUTO: every theme brings its own along.
+        let mut s = Settings::default();
+        assert!(s.palette_auto, "auto is not the default");
+        let mut seen = std::collections::HashSet::new();
+        for t in &themed {
+            t.apply(&mut s);
+            assert_eq!(
+                Some(s.palette_choice),
+                t.channel_palette,
+                "{} did not bring its palette",
+                t.name
+            );
+            seen.insert(s.palette_choice);
+        }
+        assert!(seen.len() > 1, "every theme landed on the same palette");
+
+        // HAND-PICKED: nothing takes it back.
+        let mut s = Settings::default();
+        s.palette_auto = false;
+        s.palette_choice = 6;
+        for t in &themed {
+            t.apply(&mut s);
+            assert_eq!(s.palette_choice, 6, "{} overrode a chosen palette", t.name);
+        }
+    }
+
+
+    /// **A palette per theme, named for it, and each theme points at its own.**
+    ///
+    /// They used to be eight abstract sets that sixteen themes shared. The
+    /// owner's word was "pick and choose": you can put Rhodes' colours on the
+    /// Iris desk, and to do that they have to be NAMED, which means one each.
+    #[test]
+    fn every_theme_has_a_palette_of_its_own_name() {
+        let themes = factory();
+        assert_eq!(
+            themes.len(),
+            crate::mixer_panel::PALETTES.len(),
+            "there is no longer one palette per theme"
+        );
+        for (i, t) in themes.iter().enumerate() {
+            assert_eq!(
+                t.channel_palette,
+                Some(i as i64),
+                "{} does not point at its own palette",
+                t.name
+            );
+            assert_eq!(
+                crate::mixer_panel::PALETTES[i].name, t.name,
+                "palette {i} is not named for the theme that uses it"
+            );
         }
     }
 

@@ -892,7 +892,10 @@ fn ink(view: &ArrangeView<'_>) -> Ink {
     Ink {
         hdr_wood: wood,
         hdr_face: strip,
-        hdr_lane: shade(lane, 0.82),
+        // Through the guard as well: it carries the M/S/R letters, and
+        // shading the field 18% darker is exactly the kind of nudge that
+        // lands a pale theme in the dead zone where neither ink clears.
+        hdr_lane: crate::recorder_panel::legible_surface(shade(lane, 0.82)),
         ruler,
         wood: shade(wood, if dark { 0.62 } else { 1.0 }),
         face: strip,
@@ -922,6 +925,47 @@ fn ink(view: &ArrangeView<'_>) -> Ink {
         meter: Color32::from_rgb(0x3D, 0xC0, 0x5A),
         select: on(lane),
     }
+}
+
+/// A quieter ink: pulled toward the ground it sits on, never made
+/// transparent.
+///
+/// **`gamma_multiply` on text is the bug this replaces.** It lowers the
+/// ALPHA, so the letters composite into whatever is behind them — which on a
+/// bone strip reads as grey and on a dark themed one reads as nothing at all.
+/// The mixer learned this once already ("pulled toward the face rather than
+/// made transparent"); the arrangement was still doing it in six places, and
+/// the owner photographed the result.
+fn on_ink(bg: Color32) -> Color32 {
+    if crate::recorder_panel::wants_light_ink(bg) {
+        crate::recorder_panel::INK_LIGHT
+    } else {
+        crate::recorder_panel::INK_DARK
+    }
+}
+
+fn quiet(ink: Color32, bg: Color32, t: f32) -> Color32 {
+    // **Quieter, but never quiet enough to stop being words.** How far `t`
+    // can go depends on the ground: on the pale themes a third of the way
+    // toward a near-white panel is already a grey nobody reads, which is what
+    // the audit caught on Centennial and Porcelain. So it is blended as asked
+    // and then walked back until it clears — secondary text is still text.
+    // 4.5, the same bar every other word in the app answers to. Quieter is a
+    // matter of WEIGHT, not of being harder to read.
+    const FLOOR: f32 = 4.5;
+    let out = blend(ink, bg, t);
+    if crate::recorder_panel::contrast_ratio(out, bg) >= FLOOR {
+        return out;
+    }
+    let mut back = t;
+    for _ in 0..12 {
+        back *= 0.7;
+        let c = blend(ink, bg, back);
+        if crate::recorder_panel::contrast_ratio(c, bg) >= FLOOR {
+            return c;
+        }
+    }
+    ink
 }
 
 /// Move a colour AWAY from itself by `t`: toward white when it is dark,
@@ -1087,7 +1131,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     Align2::LEFT_BOTTOM,
                     word,
                     font.clone(),
-                    p.face.gamma_multiply(0.8),
+                    quiet(on_ink(p.ruler), p.ruler, 0.18),
                 );
             }
             n += 1.0;
@@ -1463,23 +1507,24 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             // "my bad" screenshot.
             painter.rect_filled(row.panel, 0.0, p.empty_ground);
         }
-        // MEASURED, not thresholded — the header plate wears the lane's own
-        // colour, and the palettes now hand out sixteen of them per set. A
-        // brightness threshold is the mechanism `wants_light_ink` exists to
-        // replace: a mid tone sits under any sensible cutoff and still takes
-        // dark ink far better than light.
-        let ink_on = if crate::recorder_panel::wants_light_ink(face) {
-            p.hdr_face
-        } else {
-            p.engrave
-        };
+        // **The ink is one of the two INKS, not one of the theme's colours.**
+        //
+        // This measured the right thing and then answered with the wrong
+        // values: on a dark plate it returned `p.hdr_face` — the themed strip
+        // colour — so on every theme whose strip is dark, the lane title, the
+        // dial readouts and the switch letters were drawn in a dark navy or
+        // teal ON a dark navy or teal plate. Fixing the threshold and leaving
+        // the branches was half a fix, and the audit did not catch it because
+        // the audit computed its own ink instead of calling this. It calls
+        // `on_ink` now, and so does the audit.
+        let ink_on = on_ink(face);
         painter.text(
             Pos2::new(plate.left() + 4.0, plate.center().y),
             Align2::LEFT_CENTER,
             format!("{}", i + 1),
             num_font.clone(),
             if lane.used {
-                ink_on.gamma_multiply(0.7)
+                quiet(ink_on, face, 0.30)
             } else {
                 // Tucked faint on the dark ground, clear of the + circle.
                 p.hdr_face.gamma_multiply(0.30)
@@ -1513,13 +1558,17 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 Align2::CENTER_CENTER,
                 cut_to(painter, r.width() - 4.0, word, &font),
                 font,
-                ink.gamma_multiply(if has { 0.85 } else { 0.55 }),
+                quiet(ink, bone, if has { 0.08 } else { 0.34 }),
             );
         };
         if !lane.used {
             if row.add.is_positive() {
                 let c = row.add.center();
-                let ink = p.hdr_face.gamma_multiply(0.55);
+                // The + on an empty slot: measured against the ground it is
+                // actually drawn on, and blended rather than made
+                // transparent. It was the themed face at 55% alpha, which on
+                // a dark theme is a circle nobody can see.
+                let ink = quiet(on_ink(p.empty_ground), p.empty_ground, 0.22);
                 let radius = row.add.width().min(row.add.height()) * 0.5 - 1.0;
                 let w = (radius * 0.12).clamp(1.2, 2.2);
                 painter.circle_stroke(c, radius, Stroke::new(w, ink));
@@ -1638,7 +1687,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     cell.height().clamp(7.0, 9.0).min(fit).max(5.5),
                     crate::fonts::courier(),
                 ),
-                ink_on.gamma_multiply(0.8),
+                ink_on,
             );
         };
         dial(
@@ -1698,7 +1747,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     Align2::CENTER_TOP,
                     word,
                     FontId::new(band.height().clamp(6.0, 8.0), crate::fonts::courier()),
-                    ink_on.gamma_multiply(0.5),
+                    quiet(ink_on, face, 0.34),
                 );
             }
         }
@@ -1751,7 +1800,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 Align2::CENTER_CENTER,
                 label,
                 FontId::new((r.height() * 0.6).clamp(8.0, 12.0), crate::fonts::courier_bold()),
-                if on { p.engrave } else { p.hdr_face.gamma_multiply(0.75) },
+                if on { on_ink(lit) } else { quiet(on_ink(p.hdr_lane), p.hdr_lane, 0.18) },
             );
         }
     }
@@ -2064,6 +2113,31 @@ mod tests {
                 );
                 let p = ink(&v);
                 let mode = if dark { "dark" } else { "light" };
+                // **The lane's OWN colour is the ground the header text lands
+                // on**, not the strip face — every used lane wears a palette
+                // colour. The first version of this audit left the lanes
+                // uncoloured, so it measured a pairing the app never draws
+                // and passed while the owner was looking at unreadable
+                // titles.
+                let pal = &crate::mixer_panel::PALETTES[set
+                    .palette_choice
+                    .rem_euclid(crate::mixer_panel::PALETTES.len() as i64)
+                    as usize];
+                for ch in 0..crate::recorder::CHANNELS {
+                    let (r, g, b) = crate::mixer_panel::STRIP_COLORS[pal.slot(ch)];
+                    let plate = Color32::from_rgb(r, g, b);
+                    let ink_on = on_ink(plate);
+                    let mut c2 = |what: &str, fg: Color32, floor: f32| {
+                        let r = crate::recorder_panel::contrast_ratio(fg, plate);
+                        if r < floor {
+                            bad.push(format!("{} {mode} ch{ch}: {what} {r:.2}:1", theme.name));
+                        }
+                    };
+                    c2("lane title", ink_on, 4.5);
+                    c2("second line", quiet(ink_on, plate, 0.30), 4.0);
+                    c2("dial readout", ink_on, 4.5);
+                    c2("lane number", quiet(ink_on, plate, 0.34), 4.0);
+                }
                 let mut check = |what: &str, fg: Color32, bg: Color32, floor: f32| {
                     let r = crate::recorder_panel::contrast_ratio(fg, bg);
                     if r < floor {
@@ -2079,6 +2153,30 @@ mod tests {
                 // and the faded state has to read too, which is the one the
                 // 0.55 alpha used to make invisible.
                 check("chip text", p.engrave, p.hdr_face, 4.5);
+                // **And the QUIETED versions**, which is what the last audit
+                // missed. Six places drew text with `gamma_multiply`, which
+                // lowers alpha and composites the letters into the ground —
+                // full-strength ink passing says nothing about what was
+                // actually on screen. These are the blends that replaced it.
+                check(
+                    "empty bay chip",
+                    quiet(p.engrave, p.hdr_face, 0.34),
+                    p.hdr_face,
+                    3.0,
+                );
+                check(
+                    "filled bay chip",
+                    quiet(p.engrave, p.hdr_face, 0.08),
+                    p.hdr_face,
+                    4.5,
+                );
+                check("ruler seconds", quiet(on_ink(p.ruler), p.ruler, 0.18), p.ruler, 4.0);
+                check(
+                    "unlit switch letter",
+                    quiet(on_ink(p.hdr_lane), p.hdr_lane, 0.18),
+                    p.hdr_lane,
+                    4.0,
+                );
                 assert_eq!(
                     p.hdr_face,
                     Color32::from_rgb(
