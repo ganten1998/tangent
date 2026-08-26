@@ -96,9 +96,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 dirs = "6"
 fd-lock = "4"
-# Optional: the LAME C build cannot cross-compile to Windows under xwin
-# (autotools), so the Windows leg builds without `mp3` and the delivery
-# falls back to WAV with an honest note.
+# Optional: the LAME C build cannot be CROSS-compiled at all — autoconf tests
+# its toolchain by compiling and RUNNING programs, which a macOS host cannot do
+# for a Windows or Linux target. Both cross legs therefore build without `mp3`;
+# both ship `tangent-ffmpeg`, so MP3 delivery goes through the sidecar and only
+# a build with no sidecar at all falls back to WAV with an honest note.
 mp3lame-encoder = { version = "0.2.5", optional = true }
 
 [dev-dependencies]

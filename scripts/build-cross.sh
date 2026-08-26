@@ -261,13 +261,18 @@ package_linux() { # $1 = rust target, $2 = artifact arch name
   # checked by hand — otherwise a failed cargo build sails on and tar cheerfully
   # ships an archive containing licences and fonts but no program. That is
   # exactly what happened before 2.1.0.
-  # Clear the STAGE, never the tarball. On a macOS host the Linux build is
-  # EXPECTED to fail (alsa-sys has no sysroot), so removing the artifact up
-  # front meant every single `build-cross.sh` run on this machine destroyed a
-  # perfectly good Linux release that had been built on the Linux box and
-  # rsynced back — silently, and before the failure that made it look like the
-  # run had simply not produced one. The replacement happens at the end, and
-  # only on success.
+  # **NO `mp3`, for the same reason Windows has none.** `mp3lame-sys` builds
+  # LAME from C through autotools, and autoconf cross-compiles by COMPILING
+  # AND RUNNING test programs — which a macOS host cannot do for a Linux
+  # target. Every `build-cross.sh` run attempted it, failed, and blamed the
+  # ALSA sysroot; the tarball ships `tangent-ffmpeg`, so MP3 delivery goes
+  # through the sidecar exactly as it does on Windows and nothing is lost.
+  #
+  # Clear the STAGE, never the tarball. Removing the artifact up front meant a
+  # failed run destroyed a perfectly good Linux release that had been built on
+  # the Linux box and rsynced back — silently, and before the failure that made
+  # it look like the run had simply not produced one. The replacement happens
+  # at the end, and only on success.
   rm -rf "$stage"
   # The sysroot, and the multiarch directory name inside it — which is the
   # Debian spelling of the target, not the Rust one.
@@ -284,7 +289,8 @@ package_linux() { # $1 = rust target, $2 = artifact arch name
   PKG_CONFIG_SYSROOT_DIR="$sysroot" \
   PKG_CONFIG_PATH="$sysroot/usr/lib/$multiarch/pkgconfig" \
   RUSTFLAGS="-L $sysroot/usr/lib/$multiarch" \
-    cargo zigbuild --release --target "${target}.${GLIBC}" -p ivory || return 1
+    cargo zigbuild --release --target "${target}.${GLIBC}" -p ivory \
+      --no-default-features --features recorder || return 1
   if [ ! -f "target/${target}/release/tangent" ]; then
     echo "!! no binary at target/${target}/release/tangent"
     return 1
@@ -374,10 +380,10 @@ package_linux() { # $1 = rust target, $2 = artifact arch name
 # (no ALSA) still builds below regardless.
 LINUX_OK=1
 echo "==> Tangent $VERSION — Linux x86_64"
-package_linux x86_64-unknown-linux-gnu x86_64 || { LINUX_OK=0; echo "!! Linux x86_64 build failed (ALSA sysroot? see docs/RELEASE.md)"; }
+package_linux x86_64-unknown-linux-gnu x86_64 || { LINUX_OK=0; echo "!! Linux x86_64 build failed — see the log above, not docs/RELEASE.md's sysroot note"; }
 
 echo "==> Tangent $VERSION — Linux aarch64"
-package_linux aarch64-unknown-linux-gnu aarch64 || { LINUX_OK=0; echo "!! Linux aarch64 build failed (ALSA sysroot? see docs/RELEASE.md)"; }
+package_linux aarch64-unknown-linux-gnu aarch64 || { LINUX_OK=0; echo "!! Linux aarch64 build failed — see the log above, not docs/RELEASE.md's sysroot note"; }
 
 echo "==> Tangent $VERSION — Windows x86_64"
 # No mp3 on the Windows leg: LAME's autotools build cannot run under
