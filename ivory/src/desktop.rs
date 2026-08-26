@@ -1793,6 +1793,8 @@ impl DesktopApp {
         self.run_project_request();
         #[cfg(feature = "recorder")]
         self.reconcile_reastream();
+        #[cfg(feature = "recorder")]
+        self.publish_device_outs();
         // Scanning reads directories, so it belongs out here with the other
         // things the UI is not allowed to do — and it runs AFTER the folder
         // picker above, so a folder added this frame is in the list this frame
@@ -4438,6 +4440,17 @@ const PAD_WAVE_BUCKETS: usize = 240;
     /// device offered when it opened, and this runs every frame — so a route
     /// survives an interface being unplugged and replugged, and is dropped
     /// only against the device that is actually open.
+    /// Tell the app how many outputs the open device has, so the routing
+    /// picker offers the jacks that exist rather than a guess.
+    fn publish_device_outs(&mut self) {
+        let outs = self
+            .recorder
+            .engine
+            .as_ref()
+            .map_or(2, |e| e.output().channels as usize);
+        self.app.set_device_outs(outs);
+    }
+
     fn publish_routes(&self, e: &crate::instrument::Engine) {
         let outs = e.output().channels as usize;
         let mut routes = self.app.routes().clone();

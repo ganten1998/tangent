@@ -273,6 +273,26 @@ pub enum Dialog {
     Welcome {
         dont_show_again: bool,
     },
+    /// Where a channel goes besides the master. Two steps in one window: the
+    /// kind first (a send or a pair of jacks), then the destination.
+    Routing {
+        /// The channel this is about.
+        channel: usize,
+        /// `None` while the two kinds are showing; `Some(true)` listing
+        /// hardware outputs, `Some(false)` listing channels to send to.
+        picking: Option<bool>,
+        /// Hardware destinations the OPEN DEVICE offers: label, first
+        /// channel, stereo. Built by the app, because only the host knows
+        /// what the interface has.
+        hardware: Vec<(String, usize, bool)>,
+        /// Channels worth sending to: index and name. Empty slots are left
+        /// out — sending into a channel with nothing on it is a route to
+        /// silence, and the owner asked for used channels only.
+        channels: Vec<(usize, String)>,
+        /// Destination labels already routed from this channel, so a
+        /// duplicate is greyed rather than refused after the click.
+        taken: Vec<String>,
+    },
     /// Name the colours the app is wearing and write them to the user themes
     /// folder. Stays open on failure so the typed name is not lost.
     SaveTheme {
@@ -451,6 +471,17 @@ pub enum DialogAction {
     },
     /// Persist the welcome dialog's "don't show again" choice.
     SetShowWelcome(bool),
+    /// Open the routing window for a channel.
+    OpenRouting(usize),
+    /// Step into one of the two lists: `true` for hardware outputs.
+    RoutingPick { channel: usize, hardware: bool },
+    /// Make the route. The app owns the no-duplicates rule.
+    AddRoute {
+        from: usize,
+        target: crate::routing::Target,
+    },
+    /// Take a route off, by its index in the desk's table.
+    RemoveRoute(usize),
     /// Write the current colours to the user themes folder under this name.
     SaveThemeNamed(String),
     /// Open the ReaStream (stream-to-OBS) settings dialog.
@@ -4850,6 +4881,183 @@ pub fn show(
             )
         }
 
+        Dialog::Routing {
+            channel,
+            picking,
+            hardware,
+            channels,
+            taken,
+        } => {
+            let t = theme(dark_mode);
+            let dim = t.text.gamma_multiply(0.62);
+            let ch = *channel;
+            let step = *picking;
+            show_dialog_viewport(
+                ctx,
+                placement,
+                &format!("Routing - Channel {}", ch + 1),
+                Vec2::new(420.0, 420.0),
+                Vec2::new(360.0, 300.0),
+                |ui, result| {
+                    apply_theme(ui.style_mut(), &t);
+                    ui.visuals_mut().extreme_bg_color = t.field_bg;
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
+                    let bold = |size: f32| FontId::new(size, fonts::courier_bold());
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::same(12))
+                        .show(ui, |ui| {
+                            let row = |ui: &mut egui::Ui, label: &str, hint: &str, on: bool| -> bool {
+                                let clicked = ui
+                                    .add_enabled(
+                                        on,
+                                        Button::new(
+                                            RichText::new(label).font(bold(12.0)).color(t.text),
+                                        )
+                                        .min_size(Vec2::new(ui.available_width(), 24.0)),
+                                    )
+                                    .clicked();
+                                if !hint.is_empty() {
+                                    ui.label(RichText::new(hint).font(bold(9.0)).color(dim));
+                                }
+                                ui.add_space(4.0);
+                                clicked
+                            };
+                            match step {
+                                // ── which kind ────────────────────────────
+                                None => {
+                                    ui.label(
+                                        RichText::new("Send this channel somewhere else.")
+                                            .font(bold(11.0))
+                                            .color(t.text),
+                                    );
+                                    ui.label(
+                                        RichText::new(
+                                            "It keeps going to the master either way - a route \
+                                             is a send, not a move.",
+                                        )
+                                        .font(bold(9.0))
+                                        .color(dim),
+                                    );
+                                    ui.add_space(10.0);
+                                    if row(
+                                        ui,
+                                        "Sends",
+                                        "into another channel, through whatever is loaded on it",
+                                        !channels.is_empty(),
+                                    ) {
+                                        action = Some(DialogAction::RoutingPick {
+                                            channel: ch,
+                                            hardware: false,
+                                        });
+                                    }
+                                    if channels.is_empty() {
+                                        ui.label(
+                                            RichText::new("(no other channel is in use yet)")
+                                                .font(bold(9.0))
+                                                .color(dim),
+                                        );
+                                        ui.add_space(4.0);
+                                    }
+                                    if row(
+                                        ui,
+                                        "Hardware Outputs",
+                                        "out of the interface on its own jacks",
+                                        !hardware.is_empty(),
+                                    ) {
+                                        action = Some(DialogAction::RoutingPick {
+                                            channel: ch,
+                                            hardware: true,
+                                        });
+                                    }
+                                    if hardware.is_empty() {
+                                        ui.label(
+                                            RichText::new(
+                                                "(this device has no outputs to offer)",
+                                            )
+                                            .font(bold(9.0))
+                                            .color(dim),
+                                        );
+                                    }
+                                }
+                                // ── which destination ─────────────────────
+                                Some(is_hw) => {
+                                    ui.label(
+                                        RichText::new(if is_hw {
+                                            "Pick an output:"
+                                        } else {
+                                            "Pick a channel to send to:"
+                                        })
+                                        .font(bold(11.0))
+                                        .color(t.text),
+                                    );
+                                    ui.add_space(6.0);
+                                    egui::ScrollArea::vertical()
+                                        .max_height(ui.available_height() - 40.0)
+                                        .show(ui, |ui| {
+                                            if is_hw {
+                                                for (label, first, stereo) in hardware.iter() {
+                                                    // A destination already
+                                                    // routed from here is
+                                                    // greyed: the rule is no
+                                                    // duplicates, and saying
+                                                    // so before the click
+                                                    // beats refusing after.
+                                                    let free = !taken.contains(label);
+                                                    if row(ui, label, "", free) {
+                                                        action = Some(DialogAction::AddRoute {
+                                                            from: ch,
+                                                            target: crate::routing::Target::Hardware {
+                                                                first: *first,
+                                                                stereo: *stereo,
+                                                            },
+                                                        });
+                                                    }
+                                                }
+                                            } else {
+                                                for (idx, name) in channels.iter() {
+                                                    let label =
+                                                        crate::routing::Target::Channel(*idx)
+                                                            .label();
+                                                    let shown = if name.is_empty() {
+                                                        label.clone()
+                                                    } else {
+                                                        format!("{label} - {name}")
+                                                    };
+                                                    let free = !taken.contains(&label);
+                                                    if row(ui, &shown, "", free) {
+                                                        action = Some(DialogAction::AddRoute {
+                                                            from: ch,
+                                                            target:
+                                                                crate::routing::Target::Channel(
+                                                                    *idx,
+                                                                ),
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                        });
+                                }
+                            }
+                            ui.add_space((ui.available_height() - 30.0).max(0.0));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui
+                                    .add(Button::new(RichText::new("Close").color(t.text)))
+                                    .clicked()
+                                {
+                                    result.close = true;
+                                }
+                                if step.is_some()
+                                    && ui
+                                        .add(Button::new(RichText::new("Back").color(t.text)))
+                                        .clicked()
+                                {
+                                    action = Some(DialogAction::OpenRouting(ch));
+                                }
+                            });
+                        });
+                },
+            )
+        }
         Dialog::SaveTheme {
             name,
             message,

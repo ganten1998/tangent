@@ -628,6 +628,14 @@ pub struct IvoryApp {
     fx_drag: Option<&'static str>,
     /// What the effects ship as. Empty until the host says; see the type.
     fx_defaults: crate::ports::EffectDefaults,
+    /// The desk's routes, pre-rendered as (source, label, fader) for the
+    /// panels. Rebuilt when the routes change rather than every frame: the
+    /// labels are Strings, and a desk with a dozen routes would otherwise
+    /// allocate a dozen of them sixty times a second.
+    route_labels: Vec<(usize, String, f32)>,
+    /// How many outputs the open device has, pushed by the host. Only the
+    /// host knows; the routing picker cannot offer jacks without it.
+    device_outs: usize,
     /// Notes sounding because a gesture is holding them: the audition key, or
     /// a mouse button on a key or a fret.
     ///
@@ -1300,7 +1308,7 @@ impl IvoryApp {
 
         // Computed BEFORE the literal takes `settings`. See `default_armed`.
         let armed = default_armed(&settings);
-        Self {
+        let mut me = Self {
             settings,
             detector,
             license,
@@ -1462,6 +1470,8 @@ impl IvoryApp {
 
             fx_drag: None,
             fx_defaults: crate::ports::EffectDefaults::default(),
+            device_outs: 2,
+            route_labels: Vec::new(),
             sounding: std::collections::BTreeSet::new(),
             clicked: std::collections::BTreeSet::new(),
             clicked_position: None,
@@ -1496,7 +1506,12 @@ impl IvoryApp {
             main_live_size: None,
             detached_shown_at: None,
             detached_wm_managed: false,
-        }
+        };
+        // The panels draw from the rendered labels, so a session that loads
+        // with routes has to arrive with them already rendered — otherwise
+        // the strips are invisible until the first edit.
+        me.refresh_route_labels();
+        me
     }
 
     // ── Geometry (spec §3.2, integer truncation like Python) ───────────────
@@ -2308,6 +2323,17 @@ impl IvoryApp {
                 .get(i.0)
                 .map_or(0.0, |s| recorder::gain_to_fader(s.gain)),
             H::Send(i) => view.strips.get(i.0).map_or(0.0, |s| s.send),
+            // A route's own level, by its place in THIS channel's list.
+            H::RouteGain(i, k) => match i.strip() {
+                Some(crate::recorder::Strip::Channel(n)) => self
+                    .settings
+                    .routes
+                    .from(n)
+                    .get(k)
+                    .map_or(0.0, |(_, r)| r.gain),
+                _ => 0.0,
+            },
+            H::Routing(_) => 0.0,
             H::Pan(i) => view.strips.get(i.0).map_or(0.5, |s| (s.pan + 1.0) * 0.5),
             H::Mute(_) | H::Solo(_) | H::Add(_) | H::Insert(..)
             | H::Db(_) | H::Name(_) | H::Remove(_) | H::Arm(_)
@@ -2376,6 +2402,27 @@ impl IvoryApp {
         let v = value.clamp(0.0, 1.0);
         let gain = f64::from(recorder::fader_to_gain(v));
         match hit {
+            // The button is a door, not a value: it opens the window and the
+            // `value` this call carries means nothing to it.
+            H::Routing(i) => {
+                if let Some(crate::recorder::Strip::Channel(n)) = i.strip() {
+                    self.dialog = Some(self.routing_dialog(n, None));
+                }
+                return;
+            }
+            H::RouteGain(i, k) => {
+                if let Some(crate::recorder::Strip::Channel(n)) = i.strip() {
+                    // By POSITION in this channel's list, translated to the
+                    // desk table's index here — the panel never sees the
+                    // table, so a reorder cannot desync the two.
+                    if let Some((at, _)) = self.settings.routes.from(n).get(k).copied() {
+                        self.settings.routes.set_gain(at, value);
+                        self.refresh_route_labels();
+                        self.save_settings();
+                    }
+                }
+                return;
+            }
             // **By COLUMN, not by `Strip::all()`.** See `Strip::column`: the
             // two lists differ by the click and the bus, so the master column
             // used to land on the metronome — a fader that did not move and
@@ -2928,6 +2975,10 @@ impl IvoryApp {
             };
             crate::mixer_panel::StripView {
                 strip: Some(s),
+                route_count: match s {
+                    crate::recorder::Strip::Channel(n) => self.settings.routes.from(n).len(),
+                    _ => 0,
+                },
                 // **What the user called it wins.** A desk is a set of names
                 // before it is a set of faders: "BELL KEYS" is what the app
                 // knows and "Rhodes" is what the person at the desk knows.
@@ -2989,11 +3040,13 @@ impl IvoryApp {
         };
         let channels = Strip::shown();
         crate::mixer_panel::MixerView {
+            routes: &self.route_labels,
             fx_strip: self.settings.fx_strip_color.to_color32(),
             input_chip: self.settings.input_chip_color.to_color32(),
             strips: std::array::from_fn(|i| match channels.get(i) {
                 Some(s) => strip(*s),
                 None => crate::mixer_panel::StripView {
+                    route_count: 0,
                     strip: None,
                     icon: 0,
                     name: self
@@ -10768,6 +10821,66 @@ impl IvoryApp {
     /// What the effects ship as. Told by the host; see [`EffectDefaults`].
     ///
     /// [`EffectDefaults`]: crate::ports::EffectDefaults
+    /// Re-render the route labels the panels draw. Called wherever the table
+    /// changes — adding, removing, loading — and nowhere else.
+    fn refresh_route_labels(&mut self) {
+        self.route_labels = self
+            .settings
+            .routes
+            .0
+            .iter()
+            .map(|r| (r.from, r.target.label(), r.gain))
+            .collect();
+    }
+
+    /// What the open output device offers, for the routing picker.
+    pub fn set_device_outs(&mut self, n: usize) {
+        self.device_outs = n;
+    }
+
+    /// Build the routing window for a channel, with the lists only the app
+    /// can assemble: the device's jacks, the channels worth sending to, and
+    /// what this channel already routes to.
+    fn routing_dialog(&self, channel: usize, picking: Option<bool>) -> dialogs::Dialog {
+        let hardware = crate::routing::hardware_targets(self.device_outs)
+            .into_iter()
+            .filter_map(|t| match t {
+                crate::routing::Target::Hardware { first, stereo } => {
+                    Some((t.label(), first, stereo))
+                }
+                crate::routing::Target::Channel(_) => None,
+            })
+            .collect();
+        // Used channels only, and never this one: a channel cannot send to
+        // itself, and an empty slot is a route to silence.
+        let channels = (0..crate::recorder::CHANNELS)
+            .filter(|n| *n != channel && self.channel_used(*n))
+            .map(|n| {
+                let name = self
+                    .settings
+                    .strip_names
+                    .get(n)
+                    .cloned()
+                    .unwrap_or_default();
+                (n, name)
+            })
+            .collect();
+        let taken = self
+            .settings
+            .routes
+            .from(channel)
+            .into_iter()
+            .map(|(_, r)| r.target.label())
+            .collect();
+        dialogs::Dialog::Routing {
+            channel,
+            picking,
+            hardware,
+            channels,
+            taken,
+        }
+    }
+
     pub fn set_effect_defaults(&mut self, defaults: crate::ports::EffectDefaults) {
         self.fx_defaults = defaults;
     }
@@ -13501,6 +13614,29 @@ impl IvoryApp {
                 self.settings.show_welcome = show;
                 self.save_settings();
             }
+            DialogAction::OpenRouting(channel) => {
+                self.dialog = Some(self.routing_dialog(channel, None));
+            }
+            DialogAction::RoutingPick { channel, hardware } => {
+                self.dialog = Some(self.routing_dialog(channel, Some(hardware)));
+            }
+            DialogAction::AddRoute { from, target } => {
+                // `add` owns the no-duplicates rule; the picker greys what is
+                // taken, so a refusal here means the desk changed under the
+                // open window rather than that the user did something wrong.
+                if self.settings.routes.add(crate::routing::Route::new(from, target)) {
+                    self.refresh_route_labels();
+                    self.save_settings();
+                }
+                // Back to the two kinds, so adding several routes in a row is
+                // one window rather than one window per route.
+                self.dialog = Some(self.routing_dialog(from, None));
+            }
+            DialogAction::RemoveRoute(index) => {
+                self.settings.routes.remove(index);
+                self.refresh_route_labels();
+                self.save_settings();
+            }
             DialogAction::SaveThemeNamed(name) => {
                 let name = name.trim().to_owned();
                 let theme = crate::theme::Theme::capture(&name, &self.settings);
@@ -15760,9 +15896,13 @@ impl IvoryApp {
                     }
                 }
                 if self.mixer_grab.is_some_and(|g| g.moved) {
-                    if let (Some(_), Some(travel)) = (grab.hit.axis(), grab.hit.travel()) {
-                        // Up is louder, so the distance is measured upward.
-                        let moved = grab.from.y - pos.y;
+                    if let (Some(axis), Some(travel)) = (grab.hit.axis(), grab.hit.travel()) {
+                        // Up is louder on a standing control; RIGHT is louder
+                        // on one that lies down (the route strips).
+                        let moved = match axis {
+                            crate::mixer_panel::DragAxis::Vertical => grab.from.y - pos.y,
+                            crate::mixer_panel::DragAxis::Horizontal => pos.x - grab.from.x,
+                        };
                         let fine = if ctx.input(|i| i.modifiers.shift) {
                             recorder_panel::FINE_DRAG
                         } else {
