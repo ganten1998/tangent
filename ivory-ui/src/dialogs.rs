@@ -29,7 +29,12 @@ use ivory_core::OverrideInfo;
 pub enum Dialog {
     /// The project menu behind the band's folder button: the session's
     /// name, and the five things you do with sessions.
-    Project { name: String },
+    Project {
+        name: String,
+        /// The "Create Project Subdirectory" tick, mirrored from settings so
+        /// the box moves under the pointer before the app answers.
+        subdir: bool,
+    },
     /// The TRACK menu behind a right-click on a strip or a lane header:
     /// remove it, paint it, or choose the auto-palette everybody unpainted
     /// wears.
@@ -469,6 +474,8 @@ pub enum DialogAction {
         what: BrowseFor,
         path: Option<std::path::PathBuf>,
     },
+    /// Persist the "Create Project Subdirectory" tick.
+    SetProjectSubdir(bool),
     /// Persist the welcome dialog's "don't show again" choice.
     SetShowWelcome(bool),
     /// Open the routing window for a channel.
@@ -4192,7 +4199,7 @@ pub fn show(
             )
         }
 
-        Dialog::Project { name } => {
+        Dialog::Project { name, subdir } => {
             let t = theme(dark_mode);
             show_dialog_viewport(
                 ctx,
@@ -4261,6 +4268,34 @@ pub fn show(
                             }
                             if row(ui, "Save As...", "copy the whole session and open the copy") {
                                 action = Some(DialogAction::ProjectSaveAs);
+                            }
+                            // **A checkbox rather than a row**, because it
+                            // does not DO anything on click - it changes what
+                            // the next Save As does, which is what a tick is
+                            // for. Sits under Save As, the thing it changes.
+                            {
+                                let mut on = *subdir;
+                                if ui
+                                    .checkbox(
+                                        &mut on,
+                                        RichText::new("Create Project Subdirectory")
+                                            .font(plain(10.0))
+                                            .color(t.text),
+                                    )
+                                    .changed()
+                                {
+                                    *subdir = on;
+                                    action = Some(DialogAction::SetProjectSubdir(on));
+                                }
+                                ui.label(
+                                    RichText::new(
+                                        "wrap the project in its own folder - media always \
+                                         travels inside it",
+                                    )
+                                    .font(plain(8.5))
+                                    .color(dim),
+                                );
+                                ui.add_space(4.0);
                             }
                             if row(
                                 ui,
@@ -4417,6 +4452,14 @@ pub fn show(
                                 usize::from(spec.realtime),
                             ) {
                                 spec.realtime = i == 1;
+                            }
+                            if let Some(i) = choice(
+                                ui,
+                                "WHEN DONE",
+                                &["Stay here", "Open folder"],
+                                usize::from(spec.open_when_done),
+                            ) {
+                                spec.open_when_done = i == 1;
                             }
                             let prim = matches!(spec.primary, crate::ports::ExportFormat::Mp3);
                             if let Some(i) =
