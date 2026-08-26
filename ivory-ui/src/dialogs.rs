@@ -294,11 +294,13 @@ pub enum Dialog {
         /// out — sending into a channel with nothing on it is a route to
         /// silence, and the owner asked for used channels only.
         channels: Vec<(usize, String)>,
-        /// What this channel already routes to: the desk-table index and the
-        /// destination's label. Greys the duplicates in the picker AND gives
-        /// every existing route a row with a way OFF - which the first pass
-        /// forgot, leaving a send that could be made and never unmade.
-        existing: Vec<(usize, String)>,
+        /// What this channel already routes to: the desk-table index, the
+        /// destination's label, and the route's LEVEL. Greys the duplicates
+        /// in the picker AND gives every existing route a row with a level
+        /// and a way OFF - the first pass forgot the way off, and the second
+        /// forgot the level, which left a route that could only ever be made
+        /// at full and never turned down from the view the owner was in.
+        existing: Vec<(usize, String, f32)>,
     },
     /// Name the colours the app is wearing and write them to the user themes
     /// folder. Stays open on failure so the typed name is not lost.
@@ -491,6 +493,10 @@ pub enum DialogAction {
     },
     /// Take a route off, by its index in the desk's table.
     RemoveRoute(usize),
+    /// Put media on this lane at the playhead, through the OS's own panel.
+    InsertMedia(usize),
+    /// Set one route's level, by its index in the desk's table.
+    SetRouteGain(usize, f32),
     /// Write the current colours to the user themes folder under this name.
     SaveThemeNamed(String),
     /// Open the ReaStream (stream-to-OBS) settings dialog.
@@ -4695,6 +4701,34 @@ pub fn show(
                                 .max_height((ui.available_height() - 32.0).max(60.0))
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
+                            // **INSERT MEDIA first, and taller than the rest.**
+                            // It is the row somebody opens this window for
+                            // while they are building an arrangement; Remove
+                            // Track is the one they open it for once.
+                            if lane < crate::recorder::CHANNELS {
+                                if ui
+                                    .add_sized(
+                                        Vec2::new(ui.available_width(), 26.0),
+                                        Button::new(
+                                            RichText::new("Insert Media...")
+                                                .font(bold(12.0))
+                                                .color(t.text),
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    action = Some(DialogAction::InsertMedia(lane));
+                                }
+                                ui.label(
+                                    RichText::new(
+                                        "At the playhead. Pick several and each one \
+                                         gets its own track.",
+                                    )
+                                    .font(plain(9.0))
+                                    .color(dim),
+                                );
+                                ui.add_space(8.0);
+                            }
                             if removable {
                                 if ui
                                     .add_sized(
@@ -5093,8 +5127,9 @@ pub fn show(
                                     );
                                     ui.label(
                                         RichText::new(
-                                            "It keeps going to the master either way - a route \
-                                             is a send, not a move.",
+                                            "Routing to a channel MOVES it there, through \
+                                             whatever is loaded on it. For a copy - a reverb \
+                                             feed - use the SEND knob instead.",
                                         )
                                         .font(bold(9.0))
                                         .color(dim),
@@ -5111,12 +5146,39 @@ pub fn show(
                                                 .font(bold(10.0))
                                                 .color(dim),
                                         );
-                                        for (at, label) in existing.iter() {
+                                        for (at, label, gain) in existing.iter() {
                                             ui.horizontal(|ui| {
                                                 ui.label(
                                                     RichText::new(label)
                                                         .font(bold(11.0))
                                                         .color(t.text),
+                                                );
+                                                // The LEVEL, here rather than
+                                                // only on the mixer strip:
+                                                // the arrangement header has
+                                                // room for the door and not
+                                                // for the fader, so a person
+                                                // working in that view had no
+                                                // way to turn a route down.
+                                                let mut g = *gain;
+                                                if ui
+                                                    .add(
+                                                        egui::Slider::new(&mut g, 0.0..=1.0)
+                                                            .show_value(false),
+                                                    )
+                                                    .changed()
+                                                {
+                                                    action = Some(
+                                                        DialogAction::SetRouteGain(*at, g),
+                                                    );
+                                                }
+                                                ui.label(
+                                                    RichText::new(format!(
+                                                        "{:>3.0}%",
+                                                        g.clamp(0.0, 1.0) * 100.0
+                                                    ))
+                                                    .font(bold(10.0))
+                                                    .color(dim),
                                                 );
                                                 ui.with_layout(
                                                     Layout::right_to_left(Align::Center),
@@ -5209,7 +5271,7 @@ pub fn show(
                                                     // so before the click
                                                     // beats refusing after.
                                                     let free =
-                                                        !existing.iter().any(|(_, l)| l == label);
+                                                        !existing.iter().any(|(_, l, _)| l == label);
                                                     if row(ui, label, "", free) {
                                                         action = Some(DialogAction::AddRoute {
                                                             from: ch,
@@ -5231,7 +5293,7 @@ pub fn show(
                                                         format!("{label} - {name}")
                                                     };
                                                     let free =
-                                                        !existing.iter().any(|(_, l)| *l == label);
+                                                        !existing.iter().any(|(_, l, _)| *l == label);
                                                     if row(ui, &shown, "", free) {
                                                         action = Some(DialogAction::AddRoute {
                                                             from: ch,
