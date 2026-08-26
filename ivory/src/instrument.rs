@@ -2192,6 +2192,20 @@ struct Renderer {
     /// per-channel audio has to be kept at all. A desk that only uses sends
     /// pays nothing for the jacks it never asked for.
     routes_hw: bool,
+    /// Whether each channel still reaches the master DIRECTLY: 1.0 normally,
+    /// 0.0 once it feeds another channel.
+    ///
+    /// **Routing a channel to a channel MOVES it, it does not copy it.** It
+    /// copied, once — so making a send put the same audio into the master
+    /// twice, at the same level, and the owner heard every routed track play
+    /// twice. A copy is what the SND knob already does, into the effects
+    /// bus, which is why it is the knob you reach for to feed a reverb; this
+    /// is the other thing, the one that bus-routing means: the channel now
+    /// arrives through its destination, at that destination's fader, pan and
+    /// rack. Hardware routes are NOT affected — a jack feed is a tap, and
+    /// muting the master because somebody wanted a headphone mix would be
+    /// its own bug.
+    route_direct: [f32; CHANNELS],
     /// Incoming sends, per destination channel, interleaved stereo. Filled by
     /// the lane loop, processed through the destination's rack, then folded
     /// into the master.
@@ -2588,6 +2602,20 @@ impl Renderer {
                 kept += 1;
             }
             self.route_n = kept;
+            // **Which channels have stopped going straight to the master.**
+            // Read off the table that was just latched, so it answers for
+            // exactly the routes this block will run — and recomputed every
+            // block, so pulling the last route off a channel puts it back
+            // rather than leaving it silent until the next restart.
+            self.route_direct = [1.0; CHANNELS];
+            for i in 0..self.route_n {
+                let (from, _, hardware, _, _) = self.route_cache[i];
+                if !hardware {
+                    if let Some(d) = self.route_direct.get_mut(from) {
+                        *d = 0.0;
+                    }
+                }
+            }
             // Sends are accumulated per destination and must start empty.
             if self.route_n > 0 {
                 if let Some(sa) = self.send_accum.get_mut(..CHANNELS * n * TAP_CHANNELS) {
@@ -3581,6 +3609,9 @@ impl Renderer {
         // lane's own audio out of it, so it is filled whenever either
         // customer asks.
         let stems = self.stems_live || self.route_n > 0;
+        // Copied out before the buffers are borrowed: the fold below holds
+        // `mix`/`aux`/`stem` mutably, and this has to be readable inside it.
+        let direct = self.route_direct;
         let (Some(mix), Some(aux), Some(stem)) = (
             self.mix.get_mut(..frames * TAP_CHANNELS),
             self.aux.get_mut(..frames * TAP_CHANNELS),
@@ -3640,8 +3671,10 @@ impl Renderer {
                 let (l, r) = (cl * env * g * pan[lane].0, cr * env * g * pan[lane].1);
                 peak[lane][0] = peak[lane][0].max(l.abs());
                 peak[lane][1] = peak[lane][1].max(r.abs());
-                mix[f * TAP_CHANNELS] += l;
-                mix[f * TAP_CHANNELS + 1] += r;
+                // The METER and the STEM still see the whole lane; only the
+                // path to the master closes when the lane feeds a bus.
+                mix[f * TAP_CHANNELS] += l * direct[lane];
+                mix[f * TAP_CHANNELS + 1] += r * direct[lane];
                 aux[f * TAP_CHANNELS] += l * send[lane];
                 aux[f * TAP_CHANNELS + 1] += r * send[lane];
                 if stems {
@@ -3952,6 +3985,9 @@ impl Renderer {
             return;
         };
         let mut bus_peak = [0.0f32; 2];
+        // The kit rides its lane's routing like anything else on that lane:
+        // route the drum lane to a bus and the kit goes with it.
+        let direct = drum_lane.map_or(1.0, |ch| self.route_direct[ch]);
         for f in 0..frames {
             self.pad_gain += (master - self.pad_gain) * coeff;
             let g = self.pad_gain;
@@ -3959,8 +3995,8 @@ impl Renderer {
             let r = self.fx_in.get(1).map_or(0.0, |b| b[f]) * g * bus_r;
             bus_peak[0] = bus_peak[0].max(l.abs());
             bus_peak[1] = bus_peak[1].max(r.abs());
-            mix[f * TAP_CHANNELS] += l;
-            mix[f * TAP_CHANNELS + 1] += r;
+            mix[f * TAP_CHANNELS] += l * direct;
+            mix[f * TAP_CHANNELS + 1] += r * direct;
             aux[f * TAP_CHANNELS] += l * bus_send;
             aux[f * TAP_CHANNELS + 1] += r * bus_send;
             // The kit lands in ITS LANE's stem — the gap the owner's
@@ -4354,6 +4390,7 @@ impl Renderer {
         // lane's own audio out of it, so it is filled whenever either
         // customer asks.
         let stems = self.stems_live || self.route_n > 0;
+            let direct = self.route_direct[ch];
             let (Some(mix), Some(aux), Some(stem)) = (
                 self.mix.get_mut(..want),
                 self.aux.get_mut(..want),
@@ -4369,8 +4406,8 @@ impl Renderer {
                 let r = self.fx_in.get(1).map_or(0.0, |b| b[f]) * g * pan_r;
                 peak[0] = peak[0].max(l.abs());
                 peak[1] = peak[1].max(r.abs());
-                mix[f * TAP_CHANNELS] += l;
-                mix[f * TAP_CHANNELS + 1] += r;
+                mix[f * TAP_CHANNELS] += l * direct;
+                mix[f * TAP_CHANNELS + 1] += r * direct;
                 aux[f * TAP_CHANNELS] += l * send;
                 aux[f * TAP_CHANNELS + 1] += r * send;
                 if stems {
@@ -5037,6 +5074,7 @@ impl Engine {
             reastream_tx,
             reastream_scratch: vec![0.0; MAX_CALLBACK_FRAMES * 2],
             route_cache: [(0, 0, false, false, 0.0); MAX_ROUTES],
+            route_direct: [1.0; CHANNELS],
             route_n: 0,
             routes_hw: false,
             send_accum: vec![0.0; CHANNELS * MAX_BLOCK as usize * TAP_CHANNELS],
@@ -7825,6 +7863,7 @@ mod tests {
             reastream_tx: RingBuffer::<f32>::new(1 << 15).0,
             reastream_scratch: vec![0.0; MAX_CALLBACK_FRAMES * 2],
             route_cache: [(0, 0, false, false, 0.0); MAX_ROUTES],
+            route_direct: [1.0; CHANNELS],
             route_n: 0,
             routes_hw: false,
             send_accum: vec![0.0; CHANNELS * MAX_BLOCK as usize * TAP_CHANNELS],
@@ -8681,6 +8720,67 @@ mod tests {
         assert!(
             open.abs() > shut.abs() + 1.0e-4,
             "the destination's fader did not ride the send ({open} vs {shut})"
+        );
+    }
+
+    /// **A routed channel is HEARD ONCE.**
+    ///
+    /// It used to be heard twice: the lane went straight to the master the
+    /// way it always had, and the send put the very same audio in again
+    /// through the destination, at the same level. The owner's words were
+    /// "every send created is a duplicate of that channel heard — 2 instances
+    /// of same channel", and they were describing a doubling of exactly 6 dB.
+    ///
+    /// Routing a channel to a channel MOVES it. A copy is what the SND knob
+    /// does into the effects bus, and that is still there for reverb.
+    #[test]
+    fn routing_a_channel_moves_it_rather_than_playing_it_twice() {
+        use std::sync::Arc;
+        let clip = Arc::new(ivory_record::decode::Clip {
+            samples: vec![0.5; 4000],
+            rate: 48_000,
+            source: std::path::PathBuf::from("c.wav"),
+        });
+        let render = |route: bool| {
+            let clip = Arc::clone(&clip);
+            let (mut r, _tx, shared) = renderer_with_midi(2);
+            let (mut to_audio, _from) = r.hijack_track_rings();
+            to_audio
+                .push(vec![Placed {
+                    clip,
+                    strip: 1,
+                    start: 0,
+                    offset: 0,
+                    len: 1000,
+                    fade_in: 0,
+                    fade_out: 0,
+                }])
+                .expect("room");
+            if route {
+                shared.routes[0].store(pack_route(1, 5, false, false), Ordering::Relaxed);
+                shared.route_gain[0].store(1.0f32.to_bits(), Ordering::Relaxed);
+                shared.route_count.store(1, Ordering::Release);
+            }
+            shared.transport_at.store(0, Ordering::Relaxed);
+            shared.transport_req.store(1, Ordering::Release);
+            shared.rolling.store(true, Ordering::Relaxed);
+            let mut out = vec![0.0f32; 256 * 2];
+            r.render(&mut out, 0, 0);
+            out[2 * 200]
+        };
+        let plain = render(false);
+        let routed = render(true);
+        assert!(plain.abs() > 1.0e-4, "nothing played unrouted: {plain}");
+        assert!(routed.abs() > 1.0e-4, "the route swallowed the channel: {routed}");
+        // The destination is empty and at unity, so arriving through it must
+        // sound like arriving directly — not like arriving twice.
+        assert!(
+            (routed.abs() - plain.abs()).abs() < 1.0e-3,
+            "routing changed the level: {plain} unrouted vs {routed} routed"
+        );
+        assert!(
+            routed.abs() < plain.abs() * 1.5,
+            "the channel is still being heard twice: {routed} against {plain}"
         );
     }
 

@@ -5141,8 +5141,14 @@ pub fn show(
                                     }
                                     if row(
                                         ui,
-                                        "Sends",
-                                        "into another channel, through whatever is loaded on it",
+                                        // Not "Sends" — a send is a COPY, and
+                                        // this moves the channel. The SND
+                                        // knob is the copy, into the effects
+                                        // bus, and calling both the same
+                                        // thing is how you end up expecting
+                                        // to hear the track twice.
+                                        "Another Channel",
+                                        "moves it there, through whatever is loaded on it",
                                         !channels.is_empty(),
                                     ) {
                                         action = Some(DialogAction::RoutingPick {
