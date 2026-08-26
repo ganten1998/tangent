@@ -1246,8 +1246,14 @@ struct Shared {
     /// chosen inputs end to end in one stream — a mono input then a stereo
     /// pair is one channel then two — and without the widths this side would
     /// have a block of three channels and no idea which strip owns which.
+    /// A layout change for the monitor ring already handed over. Read in the
+    /// same place `pending_monitor` is, and for the same reason: the audio
+    /// thread must never block on the UI's lock.
+    pending_monitor_layout: std::sync::Mutex<Option<([u8; INPUTS], ivory_record::audio::Picks)>>,
     pending_monitor:
-        std::sync::Mutex<Option<Option<(rtrb::Consumer<f32>, u16, [u8; INPUTS], u32)>>>,
+        std::sync::Mutex<
+            Option<Option<(rtrb::Consumer<f32>, u16, [u8; INPUTS], u32, ivory_record::audio::Picks)>>,
+        >,
     /// Frames of the monitor ring that were STALE and thrown away, so that what
     /// is heard is what is happening.
     ///
@@ -1448,6 +1454,7 @@ impl Shared {
             monitor_on: AtomicBool::new(false),
             reastream_on: AtomicBool::new(false),
             pending_monitor: std::sync::Mutex::new(None),
+            pending_monitor_layout: std::sync::Mutex::new(None),
             monitor_slip: AtomicU64::new(0),
             monitor_backlog: AtomicU32::new(0),
             midi_off: AtomicU32::new(0),
@@ -2154,6 +2161,11 @@ struct Renderer {
     monitor_gain: [f32; INPUTS],
     /// Channels per input strip, in stream order. Zero for one not open.
     monitor_widths: [usize; INPUTS],
+    /// **Which DEVICE column each strip's channels live in.** The capture
+    /// rings carry whole device frames now, so the picks that used to decide
+    /// the ring's shape decide the READING of it instead — and a stereo pick
+    /// need not be two adjacent inputs, so this cannot be an offset.
+    monitor_picks: ivory_record::audio::Picks,
     /// The INPUT device's own block, in frames. What the monitor ring is
     /// allowed to hold before the surplus is stale rather than in flight.
     monitor_block: usize,
@@ -3166,19 +3178,32 @@ impl Renderer {
         // mix also leaves the room equal to the take.
         self.room_live = false;
         // A ring arriving, or being taken away. `try_lock`, never `lock`.
+        // **A layout change for the ring already held.** Read before the
+        // ring handoff so a frame where both arrive takes the new ring's own
+        // layout rather than being overwritten by an older one.
+        if let Ok(mut layout) = self.shared.pending_monitor_layout.try_lock() {
+            if let Some((widths, picks)) = layout.take() {
+                if self.monitor.is_some() {
+                    self.monitor_widths = widths.map(usize::from);
+                    self.monitor_picks = picks;
+                }
+            }
+        }
         if let Ok(mut pending) = self.shared.pending_monitor.try_lock() {
             if let Some(next) = pending.take() {
                 match next {
-                    Some((ring, channels, widths, block)) => {
+                    Some((ring, channels, widths, block, picks)) => {
                         self.monitor = Some(ring);
                         self.monitor_channels = usize::from(channels).max(1);
                         self.monitor_widths = widths.map(usize::from);
+                        self.monitor_picks = picks;
                         self.monitor_block = block.max(1) as usize;
                     }
                     None => {
                         self.monitor = None;
                         self.monitor_channels = 0;
                         self.monitor_widths = [0; INPUTS];
+                        self.monitor_picks = ivory_record::audio::Picks::EVERYTHING;
                         self.monitor_block = 0;
                     }
                 }
@@ -3308,6 +3333,17 @@ impl Renderer {
             }
             let at_ch = offset;
             offset += width;
+            // **The device column this strip's k-th channel lives in.** The
+            // ring is device-wide, so a strip's columns are wherever its pick
+            // put them — not `at_ch + k`, which was the old ring's own
+            // packing. `EVERYTHING` has no picks and maps straight through,
+            // which is exactly right for "the whole device in its own order".
+            let dev_col = |k: usize| {
+                self.monitor_picks
+                    .source(at_ch + k, ch_in)
+                    .unwrap_or(at_ch + k)
+                    .min(ch_in.saturating_sub(1))
+            };
             // ── the arrangement's tee: RAW frames, folded to stereo exactly
             // as the monitor folds (a mono input to both sides) — pre-fader,
             // pre-rack, pre-arm. The take is the signal at the jack, not the
@@ -3317,7 +3353,7 @@ impl Renderer {
                     if tx.slots() >= n * 2 {
                         for i in 0..n {
                             for c in 0..2 {
-                                let col = at_ch + c.min(width - 1);
+                                let col = dev_col(c.min(width - 1));
                                 let _ = tx.push(scratch[i * ch_in + col]);
                             }
                         }
@@ -3374,7 +3410,7 @@ impl Renderer {
             for i in 0..n {
                 self.monitor_gain[input] += (target - self.monitor_gain[input]) * self.gain_coeff;
                 for c in 0..TAP_CHANNELS {
-                    let lane = at_ch + c.min(width - 1);
+                    let lane = dev_col(c.min(width - 1));
                     let src = scratch[i * ch_in + lane] * self.monitor_gain[input];
                     if let Some(dst) = self.fx_in.get_mut(c) {
                         dst[i] = src;
@@ -4990,6 +5026,7 @@ impl Engine {
             monitor_channels: 0,
             monitor_gain: [0.0; INPUTS],
             monitor_widths: [0; INPUTS],
+            monitor_picks: ivory_record::audio::Picks::EVERYTHING,
             monitor_block: 0,
             monitor_scratch: vec![0.0; widest * 4096],
             cap_tx,
@@ -6026,8 +6063,25 @@ impl Engine {
         f64::from(self.shared.monitor_backlog.load(Ordering::Relaxed)) * 1000.0 / rate
     }
 
+    /// Tell the renderer which columns of the monitor ring belong to which
+    /// strip, without handing it a new ring.
+    ///
+    /// **This is the monitor's half of a live pick change.** The ring carries
+    /// whole device frames for the life of the stream, so choosing different
+    /// inputs does not change what is IN it — only which columns each strip
+    /// reads. Nothing has to be flushed and nothing can be misread: every
+    /// frame in the ring means the same thing before and after.
+    pub fn set_monitor_layout(&self, widths: [u8; INPUTS], picks: ivory_record::audio::Picks) {
+        if let Ok(mut g) = self.shared.pending_monitor_layout.lock() {
+            *g = Some((widths, picks));
+        }
+    }
+
     /// Hand the renderer the live input's ring. `None` takes it away.
-    pub fn set_monitor(&mut self, tap: Option<(rtrb::Consumer<f32>, u16, [u8; INPUTS], u32)>) {
+    pub fn set_monitor(
+        &mut self,
+        tap: Option<(rtrb::Consumer<f32>, u16, [u8; INPUTS], u32, ivory_record::audio::Picks)>,
+    ) {
         if let Ok(mut g) = self.shared.pending_monitor.lock() {
             *g = Some(tap);
         }
@@ -7760,6 +7814,7 @@ mod tests {
             monitor_channels: 0,
             monitor_gain: [0.0; INPUTS],
             monitor_widths: [0; INPUTS],
+            monitor_picks: ivory_record::audio::Picks::EVERYTHING,
             monitor_block: 0,
             monitor_scratch: Vec::new(),
             cap_tx: Vec::new(),
