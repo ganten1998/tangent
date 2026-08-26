@@ -1171,6 +1171,37 @@ channels play back their clips and nothing else. "Ready to play" and
   build-installer.sh's linux branch drops the retired-VST3 assertions
   that made it exit 1 against correct artifacts forever.
 
+- **5.0.0-beta.1 — themes, routing, and an export you can watch**:
+  the first beta of 5.0, and the version number moves once for the
+  whole set rather than once per feature — the owner's pacing call.
+  THEMES: eight factory sets (Default, Valentine, Hydra, Navi, Mono,
+  Studio, Aurora, Sandstone), three of them faithful to the owner's
+  own applications' palettes, all eight gated by a contrast test that
+  caught three real defects in them. User themes are FILES in a
+  `user themes` folder beside settings.json, so Reset Settings to
+  Default cannot delete somebody's work; partial themes are legal and
+  an example ships. Seventeen roles, ten of which were literals in a
+  painter before this. ROUTING: a channel can go somewhere besides the
+  master — out of the interface on its own jacks, or into another
+  CHANNEL through whatever is loaded on it. The second one is real:
+  put Pro-R on channel 9, send 3 to 9, and 3 comes back wet, because
+  a rack turned out to be a general audio processor that happens to
+  be fed notes. Sends ride the destination's fader; hardware routes
+  never take a channel off the master; a mono jack sums; one hop per
+  block so a loop cannot feed itself. EXPORT: a window that floats
+  over the app and draws the waveform as it renders, because a
+  percentage says a render is moving and a waveform says what it is
+  rendering. The render was never the freeze — the format pass was,
+  and it announces itself now. Plus: dark mode moves the KEYBOARD as
+  well as the theory content; every typed field in every themed
+  dialog is legible again (the colour picker was black on black);
+  the retired VST3 plugin cleans itself up on upgrade from all four
+  install paths; Create Project Subdirectory (ticked by default, and
+  media has always travelled inside the project); Open Folder When
+  Done on both export paths; and the transport strip is one evenly
+  gapped row spanning the LCD above it, with Stop standing exactly
+  where it stood when a take starts.
+
 ## Order of work
 
 1. **Desk change**: retire `Strip::Track`, settings v13 (+ index
