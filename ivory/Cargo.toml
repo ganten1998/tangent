@@ -152,6 +152,14 @@ wgpu = { version = "27", default-features = false, features = ["vulkan", "gles"]
 egui-wgpu = { version = "0.33", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# **Where the cursor is during a FILE DRAG**, which is the one time the
+# window toolkit will not say. winit reports `HoveredFile` and no
+# `CursorMoved`, so egui has no pointer to offer for the whole drag, and a
+# drop had to guess which lane it landed on. Core Graphics answers in global
+# display points, which is the same unit egui reports the window's inner rect
+# in, so the two subtract cleanly. Already in the tree via wgpu.
+core-graphics = "0.23"
+
 # THE macOS RENDERER, and a bug fix rather than a preference.
 #
 # With a VST3 editor open the main window flickered rapidly, recovering the

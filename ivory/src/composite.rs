@@ -404,7 +404,6 @@ impl Compositor {
     /// Build the compositor on one specific context we have already created.
     #[cfg(target_os = "linux")]
     fn on_this_gl(gl: glctx::Gl, width: u32, height: u32) -> Result<Self, String> {
-
         // Everything from here to the end of this scope touches GL, including
         // the resources `Self::on` allocates, so the context stays current for
         // all of it.
@@ -474,11 +473,8 @@ impl Compositor {
         // not a conversion. Every channel swizzle avoided here is 8 MB a frame
         // of CPU work at 1080p that nobody has to do.
         let format = wgpu::TextureFormat::Bgra8Unorm;
-        let renderer = egui_wgpu::Renderer::new(
-            &device,
-            format,
-            egui_wgpu::RendererOptions::default(),
-        );
+        let renderer =
+            egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
         let target = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("tangent composite"),
             size: wgpu::Extent3d {
@@ -571,7 +567,16 @@ impl Compositor {
         camera: Option<(&[u8], u32, u32)>,
         pts_ns: i64,
     ) -> Result<Option<i64>, String> {
-        self.frame_painting(app, layout, shows, want_camera, want_display, camera, pts_ns, None)
+        self.frame_painting(
+            app,
+            layout,
+            shows,
+            want_camera,
+            want_display,
+            camera,
+            pts_ns,
+            None,
+        )
     }
 
     /// [`Compositor::frame`], with the option of painting something else.
@@ -886,12 +891,7 @@ impl Compositor {
 /// pane that is itself inside a frame, which is two nested borders and reads as
 /// a mistake. Cropping loses the edges of the picture, and the edges of a
 /// webcam pointed at a piano are the wall.
-fn paint_camera(
-    painter: &egui::Painter,
-    pane: egui::Rect,
-    id: egui::TextureId,
-    size: (u32, u32),
-) {
+fn paint_camera(painter: &egui::Painter, pane: egui::Rect, id: egui::TextureId, size: (u32, u32)) {
     if !pane.is_positive() || size.0 == 0 || size.1 == 0 {
         return;
     }
@@ -956,7 +956,10 @@ mod tests {
             let p = padded_bytes_per_row(w);
             assert_eq!(p % 256, 0, "{w} gave an unaligned stride {p}");
             assert!(p >= w * 4, "{w} gave a stride {p} too small for its row");
-            assert!(p < w * 4 + 256, "{w} gave a stride {p} padded more than once");
+            assert!(
+                p < w * 4 + 256,
+                "{w} gave a stride {p} padded more than once"
+            );
         }
     }
 
@@ -966,7 +969,11 @@ mod tests {
     fn the_common_widths_are_already_aligned_and_the_awkward_ones_are_not() {
         assert_eq!(padded_bytes_per_row(1920), 7680);
         assert_eq!(padded_bytes_per_row(1280), 5120);
-        assert_eq!(padded_bytes_per_row(1080), 4352, "1080*4 = 4320, padded to 4352");
+        assert_eq!(
+            padded_bytes_per_row(1080),
+            4352,
+            "1080*4 = 4320, padded to 4352"
+        );
     }
 
     /// A headless device, so the GPU path can be tested without a window.
@@ -1152,7 +1159,11 @@ mod tests {
             ivory_ui::host::Caps::DESKTOP,
         );
         let out = compose_one(&mut c, &app, Some((&cam, W, H))).expect("composite");
-        assert_eq!(out.len(), (W * H * 4) as usize, "the frame is the wrong size");
+        assert_eq!(
+            out.len(),
+            (W * H * 4) as usize,
+            "the frame is the wrong size"
+        );
         // **Searched for, not sampled at a known point.** The camera has no
         // pane of its own any more — it is drawn inside the recorder band's
         // preview, wherever the band puts it — so the thing to assert is that
@@ -1267,7 +1278,10 @@ mod tests {
         enc.finish().expect("finish");
         eprintln!("wrote {}", path.display());
 
-        assert!(written >= N - 2, "only {written} of {N} frames were encoded");
+        assert!(
+            written >= N - 2,
+            "only {written} of {N} frames were encoded"
+        );
         let Ok(out) = std::process::Command::new("ffprobe")
             .args([
                 "-v",
@@ -1387,8 +1401,7 @@ mod tests {
         );
         // And it is DETERMINISTIC. Garbage is what differs between two frames
         // of the same unchanged app.
-        let twice = compose_one(&mut c, &app, None)
-            .expect("composite");
+        let twice = compose_one(&mut c, &app, None).expect("composite");
         assert_eq!(once, twice, "two frames of an unchanged app differ");
     }
 }
@@ -1474,7 +1487,11 @@ mod cost {
             };
             println!(
                 "path    : {}",
-                if c.is_owned_gl() { "** OWNED HARDWARE GL **" } else { "wgpu's own adapter" }
+                if c.is_owned_gl() {
+                    "** OWNED HARDWARE GL **"
+                } else {
+                    "wgpu's own adapter"
+                }
             );
             let mut settings = ivory_ui::settings::Settings::default();
             settings.show_recorder = true;
@@ -1510,7 +1527,11 @@ mod cost {
             let cpu = cpu_seconds() - c0;
             assert!(c.last_frame().is_some(), "no frame ever came back");
             println!("frames  : {frames} at {w}x{h}");
-            println!("CPU     : {:.3} s  ->  {:.2} ms/frame", cpu, cpu * 1000.0 / frames as f64);
+            println!(
+                "CPU     : {:.3} s  ->  {:.2} ms/frame",
+                cpu,
+                cpu * 1000.0 / frames as f64
+            );
             println!(
                 "wall    : {:.3} s  ->  {:.2} ms/frame  ({:.1} composites/sec)",
                 wall,
@@ -1541,32 +1562,34 @@ mod cost {
             return;
         };
         let info = adapter.get_info();
-        println!("adapter : {} ({:?}/{:?})", info.name, info.backend, info.device_type);
-        let (device, queue) = match block_on(
-            adapter.request_device(&wgpu::DeviceDescriptor::default()),
-        ) {
-            Ok(dq) => dq,
-            Err(e) => {
-                println!("   default limits refused: {e}");
-                // GLES 3.0 cannot meet wgpu's default limits; downlevel is the
-                // set wgpu itself defines for exactly this case.
-                let desc = wgpu::DeviceDescriptor {
-                    required_limits: wgpu::Limits::downlevel_webgl2_defaults()
-                        .using_resolution(adapter.limits()),
-                    ..Default::default()
-                };
-                match block_on(adapter.request_device(&desc)) {
-                    Ok(dq) => {
-                        println!("   downlevel_webgl2 limits: accepted");
-                        dq
-                    }
-                    Err(e2) => {
-                        println!("   downlevel limits refused too: {e2}");
-                        return;
+        println!(
+            "adapter : {} ({:?}/{:?})",
+            info.name, info.backend, info.device_type
+        );
+        let (device, queue) =
+            match block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())) {
+                Ok(dq) => dq,
+                Err(e) => {
+                    println!("   default limits refused: {e}");
+                    // GLES 3.0 cannot meet wgpu's default limits; downlevel is the
+                    // set wgpu itself defines for exactly this case.
+                    let desc = wgpu::DeviceDescriptor {
+                        required_limits: wgpu::Limits::downlevel_webgl2_defaults()
+                            .using_resolution(adapter.limits()),
+                        ..Default::default()
+                    };
+                    match block_on(adapter.request_device(&desc)) {
+                        Ok(dq) => {
+                            println!("   downlevel_webgl2 limits: accepted");
+                            dq
+                        }
+                        Err(e2) => {
+                            println!("   downlevel limits refused too: {e2}");
+                            return;
+                        }
                     }
                 }
-            }
-        };
+            };
 
         // 720p15 is where the app pins itself on the machine this is about.
         let (w, h) = (1280u32, 720u32);
@@ -1620,9 +1643,20 @@ mod cost {
 
         let soft = info.device_type == wgpu::DeviceType::Cpu;
         println!();
-        println!("          {}", if soft { "SOFTWARE RASTERIZER" } else { "** HARDWARE **" });
+        println!(
+            "          {}",
+            if soft {
+                "SOFTWARE RASTERIZER"
+            } else {
+                "** HARDWARE **"
+            }
+        );
         println!("frames  : {frames} at {w}x{h}");
-        println!("CPU     : {:.3} s  ->  {:.2} ms/frame", cpu, cpu * 1000.0 / frames as f64);
+        println!(
+            "CPU     : {:.3} s  ->  {:.2} ms/frame",
+            cpu,
+            cpu * 1000.0 / frames as f64
+        );
         println!(
             "wall    : {:.3} s  ->  {:.2} ms/frame  ({:.1} composites/sec)",
             wall,
@@ -1717,7 +1751,11 @@ mod shot {
                 .map(|i| {
                     let t = i as f32 / 1000.0;
                     let body = ((t - 0.5) * 6.0).cos().abs();
-                    let env = if (0.06..=0.93).contains(&t) { 1.0 } else { 0.05 };
+                    let env = if (0.06..=0.93).contains(&t) {
+                        1.0
+                    } else {
+                        0.05
+                    };
                     (0.35 + 0.6 * ((i as f32 * 0.7).sin().abs())) * body * env
                 })
                 .collect();
@@ -1754,10 +1792,18 @@ mod shot {
             app.open_arrangement_for_shot();
         }
         let mut shoot = |app: &IvoryApp| {
-            c.frame(app, Layout::default(), DisplayShows::default(), false, true, None, 0)
-                .and_then(|_| c.flush())
-                .map(|_| ())
-                .map(|_| ())
+            c.frame(
+                app,
+                Layout::default(),
+                DisplayShows::default(),
+                false,
+                true,
+                None,
+                0,
+            )
+            .and_then(|_| c.flush())
+            .map(|_| ())
+            .map(|_| ())
         };
         // The first frame lays out and the second draws what it decided.
         for _ in 0..2 {
@@ -1885,7 +1931,12 @@ mod shot {
             eprintln!("nothing came back");
             return;
         };
-        write_png(std::path::Path::new(&out), &px[..(h * w * 4) as usize], w, h);
+        write_png(
+            std::path::Path::new(&out),
+            &px[..(h * w * 4) as usize],
+            w,
+            h,
+        );
         println!("wrote {out}");
     }
 
@@ -1949,7 +2000,12 @@ mod shot {
             eprintln!("nothing came back");
             return;
         };
-        write_png(std::path::Path::new(&out), &px[..(h * w * 4) as usize], w, h);
+        write_png(
+            std::path::Path::new(&out),
+            &px[..(h * w * 4) as usize],
+            w,
+            h,
+        );
         println!("wrote {out}");
     }
 
@@ -2014,7 +2070,12 @@ mod shot {
             eprintln!("nothing came back");
             return;
         };
-        write_png(std::path::Path::new(&out), &px[..(h * w * 4) as usize], w, h);
+        write_png(
+            std::path::Path::new(&out),
+            &px[..(h * w * 4) as usize],
+            w,
+            h,
+        );
         println!("wrote {out}");
     }
 
@@ -2073,7 +2134,12 @@ mod shot {
             eprintln!("nothing came back");
             return;
         };
-        write_png(std::path::Path::new(&out), &px[..(h * w * 4) as usize], w, h);
+        write_png(
+            std::path::Path::new(&out),
+            &px[..(h * w * 4) as usize],
+            w,
+            h,
+        );
         println!("wrote {out}");
     }
 
@@ -2084,7 +2150,11 @@ mod shot {
             for b in bytes {
                 c ^= u32::from(*b);
                 for _ in 0..8 {
-                    c = if c & 1 != 0 { 0xedb8_8320 ^ (c >> 1) } else { c >> 1 };
+                    c = if c & 1 != 0 {
+                        0xedb8_8320 ^ (c >> 1)
+                    } else {
+                        c >> 1
+                    };
                 }
             }
             !c

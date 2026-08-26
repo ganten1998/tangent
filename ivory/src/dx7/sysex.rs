@@ -51,9 +51,8 @@ const FACTORY_BYTES: &[u8] = include_bytes!("../../assets/Tangent-01-Tines-and-B
 /// A parse error here would mean a corrupted executable, and the honest answer
 /// to that is the patch that is written in the source.
 pub fn factory() -> Cartridge {
-    Cartridge::parse(FACTORY_BYTES, FACTORY_NAME).unwrap_or_else(|_| {
-        Cartridge::of(FACTORY_NAME, vec![Voice::default()])
-    })
+    Cartridge::parse(FACTORY_BYTES, FACTORY_NAME)
+        .unwrap_or_else(|_| Cartridge::of(FACTORY_NAME, vec![Voice::default()]))
 }
 
 /// What the picker calls the bank that is compiled in.
@@ -129,9 +128,10 @@ impl Cartridge {
     /// Read one from disk.
     pub fn load(path: &std::path::Path) -> Result<Self, String> {
         let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let name = path
-            .file_stem()
-            .map_or_else(|| "cartridge".to_owned(), |s| s.to_string_lossy().into_owned());
+        let name = path.file_stem().map_or_else(
+            || "cartridge".to_owned(),
+            |s| s.to_string_lossy().into_owned(),
+        );
         Self::parse(&bytes, &name)
     }
 
@@ -208,7 +208,10 @@ mod tests {
             d[at + 118..at + 128].copy_from_slice(&name.as_bytes()[..10]);
             d[at + 110] = (i % 32) as u8; // algorithm
         }
-        let sum: u32 = d[6..6 + VOICES * PACKED].iter().map(|b| u32::from(*b)).sum();
+        let sum: u32 = d[6..6 + VOICES * PACKED]
+            .iter()
+            .map(|b| u32::from(*b))
+            .sum();
         d[BULK_LEN - 2] = if good_checksum {
             ((sum.wrapping_neg()) & 0x7f) as u8
         } else {
@@ -343,7 +346,10 @@ mod tests {
     #[test]
     fn a_bank_is_always_thirty_two_voices() {
         assert_eq!(Cartridge::of("x", Vec::new()).voices.len(), 32);
-        assert_eq!(Cartridge::of("x", vec![Voice::default(); 40]).voices.len(), 32);
+        assert_eq!(
+            Cartridge::of("x", vec![Voice::default(); 40]).voices.len(),
+            32
+        );
     }
 
     /// **The bank that ships is a bank.** It is compiled into the binary, so
@@ -411,10 +417,7 @@ mod tests {
                     stack.push(p);
                     continue;
                 }
-                if !p
-                    .extension()
-                    .is_some_and(|x| x.eq_ignore_ascii_case("syx"))
-                {
+                if !p.extension().is_some_and(|x| x.eq_ignore_ascii_case("syx")) {
                     continue;
                 }
                 walked += 1;

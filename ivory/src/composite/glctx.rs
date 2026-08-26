@@ -238,8 +238,7 @@ struct Egl {
     CreateContext:
         unsafe extern "C" fn(EGLDisplay, EGLConfig, EGLContext, *const EGLint) -> EGLContext,
     DestroyContext: unsafe extern "C" fn(EGLDisplay, EGLContext) -> EGLBoolean,
-    CreatePbufferSurface:
-        unsafe extern "C" fn(EGLDisplay, EGLConfig, *const EGLint) -> EGLSurface,
+    CreatePbufferSurface: unsafe extern "C" fn(EGLDisplay, EGLConfig, *const EGLint) -> EGLSurface,
     DestroySurface: unsafe extern "C" fn(EGLDisplay, EGLSurface) -> EGLBoolean,
     MakeCurrent: MakeCurrentFn,
     GetCurrentContext: unsafe extern "C" fn() -> EGLContext,
@@ -337,61 +336,61 @@ impl Gl {
     /// The same, skipping the first `skip` candidates, and reporting which one
     /// it used.
     ///
-/// The EGL display for a context that renders offscreen and owns itself.
-///
-/// **`eglGetDisplay(EGL_DEFAULT_DISPLAY)` asks mesa to GUESS**, from the
-/// environment, which window system to attach to. Under X11 it sees `DISPLAY`
-/// and guesses right. Under Wayland, with no `DISPLAY` set, it guesses wrong
-/// and hands back nothing — and the compositor then falls all the way back to
-/// wgpu's own adapter, which on this hardware is llvmpipe.
-///
-/// Measured on the 2013 Air, 60 frames at 1280x720, same binary minutes apart:
-///
-/// | session | platform          | path              | CPU/frame | at 15 fps |
-/// |---------|-------------------|-------------------|-----------|-----------|
-/// | X11     | guessed           | owned hardware GL |   8.17 ms |       12% |
-/// | Wayland | guessed           | llvmpipe          | 205-337ms |  308-506% |
-/// | Wayland | surfaceless       | owned hardware GL |   9.17 ms |       14% |
-/// | X11     | surfaceless       | owned hardware GL |   6.33 ms |       10% |
-///
-/// So this was never a Wayland limitation: hardware GL is available there and
-/// is if anything cheaper. It was one guess, made silently, costing every
-/// Wayland user a factor of twenty-five.
-///
-/// **Surfaceless is what this context actually wants.** It renders to a texture
-/// and has no business connecting to a compositor at all, so asking for a
-/// platform with no window system is not a workaround — it is the honest
-/// request, and it happens to be the fastest on both. The guess is kept as the
-/// last resort, for a libEGL too old to offer the platform extension.
-fn open_display(egl: &Egl) -> EGLDisplay {
-    // EGL_MESA_platform_surfaceless. Also accepted by the EGL 1.5 core entry
-    // point, which is why the EXT one is enough to ask for.
-    const EGL_PLATFORM_SURFACELESS_MESA: EGLenum = 0x31DD;
-    type GetPlatformDisplayExt =
-        unsafe extern "C" fn(EGLenum, *mut c_void, *const EGLint) -> EGLDisplay;
+    /// The EGL display for a context that renders offscreen and owns itself.
+    ///
+    /// **`eglGetDisplay(EGL_DEFAULT_DISPLAY)` asks mesa to GUESS**, from the
+    /// environment, which window system to attach to. Under X11 it sees `DISPLAY`
+    /// and guesses right. Under Wayland, with no `DISPLAY` set, it guesses wrong
+    /// and hands back nothing — and the compositor then falls all the way back to
+    /// wgpu's own adapter, which on this hardware is llvmpipe.
+    ///
+    /// Measured on the 2013 Air, 60 frames at 1280x720, same binary minutes apart:
+    ///
+    /// | session | platform          | path              | CPU/frame | at 15 fps |
+    /// |---------|-------------------|-------------------|-----------|-----------|
+    /// | X11     | guessed           | owned hardware GL |   8.17 ms |       12% |
+    /// | Wayland | guessed           | llvmpipe          | 205-337ms |  308-506% |
+    /// | Wayland | surfaceless       | owned hardware GL |   9.17 ms |       14% |
+    /// | X11     | surfaceless       | owned hardware GL |   6.33 ms |       10% |
+    ///
+    /// So this was never a Wayland limitation: hardware GL is available there and
+    /// is if anything cheaper. It was one guess, made silently, costing every
+    /// Wayland user a factor of twenty-five.
+    ///
+    /// **Surfaceless is what this context actually wants.** It renders to a texture
+    /// and has no business connecting to a compositor at all, so asking for a
+    /// platform with no window system is not a workaround — it is the honest
+    /// request, and it happens to be the fastest on both. The guess is kept as the
+    /// last resort, for a libEGL too old to offer the platform extension.
+    fn open_display(egl: &Egl) -> EGLDisplay {
+        // EGL_MESA_platform_surfaceless. Also accepted by the EGL 1.5 core entry
+        // point, which is why the EXT one is enough to ask for.
+        const EGL_PLATFORM_SURFACELESS_MESA: EGLenum = 0x31DD;
+        type GetPlatformDisplayExt =
+            unsafe extern "C" fn(EGLenum, *mut c_void, *const EGLint) -> EGLDisplay;
 
-    // A CLIENT extension: queried with no display, which is the one thing
-    // `eglGetProcAddress` is allowed to do before `eglInitialize`.
-    let p = unsafe { (egl.GetProcAddress)(c"eglGetPlatformDisplayEXT".as_ptr()) };
-    if !p.is_null() {
-        // SAFETY: the EGL spec fixes this signature for this name, and the
-        // pointer came from `eglGetProcAddress` asked for exactly that name.
-        let f: GetPlatformDisplayExt = unsafe { std::mem::transmute(p) };
-        let d = unsafe {
-            f(
-                EGL_PLATFORM_SURFACELESS_MESA,
-                std::ptr::null_mut(),
-                std::ptr::null(),
-            )
-        };
-        if d != EGL_NO_DISPLAY {
-            log::debug!("compositor GL: surfaceless EGL display");
-            return d;
+        // A CLIENT extension: queried with no display, which is the one thing
+        // `eglGetProcAddress` is allowed to do before `eglInitialize`.
+        let p = unsafe { (egl.GetProcAddress)(c"eglGetPlatformDisplayEXT".as_ptr()) };
+        if !p.is_null() {
+            // SAFETY: the EGL spec fixes this signature for this name, and the
+            // pointer came from `eglGetProcAddress` asked for exactly that name.
+            let f: GetPlatformDisplayExt = unsafe { std::mem::transmute(p) };
+            let d = unsafe {
+                f(
+                    EGL_PLATFORM_SURFACELESS_MESA,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                )
+            };
+            if d != EGL_NO_DISPLAY {
+                log::debug!("compositor GL: surfaceless EGL display");
+                return d;
+            }
+            log::debug!("compositor GL: no surfaceless platform, falling back to the default");
         }
-        log::debug!("compositor GL: no surfaceless platform, falling back to the default");
+        unsafe { (egl.GetDisplay)(EGL_DEFAULT_DISPLAY) }
     }
-    unsafe { (egl.GetDisplay)(EGL_DEFAULT_DISPLAY) }
-}
 
     /// **Creating a context is not the last thing that can fail.** wgpu opens a
     /// device on it afterwards, and that can be refused for reasons only
@@ -427,8 +426,7 @@ fn open_display(egl: &Egl) -> EGLDisplay {
         };
         // A context with no surface needs either EGL 1.5 or the KHR extension;
         // otherwise a 1x1 pbuffer stands in, which is what wgpu does too.
-        let surfaceless =
-            (major, minor) >= (1, 5) || exts.contains("EGL_KHR_surfaceless_context");
+        let surfaceless = (major, minor) >= (1, 5) || exts.contains("EGL_KHR_surfaceless_context");
 
         // **GLES before desktop GL, and that ordering is load-bearing.**
         //
@@ -460,9 +458,7 @@ fn open_display(egl: &Egl) -> EGLDisplay {
             (Api::Gles, EGL_OPENGL_ES_API, EGL_OPENGL_ES2_BIT, 2, 0),
         ];
 
-        for (idx, &(api, egl_api, renderable, maj, min)) in
-            attempts.iter().enumerate().skip(skip)
-        {
+        for (idx, &(api, egl_api, renderable, maj, min)) in attempts.iter().enumerate().skip(skip) {
             let cfg_attrs = [
                 EGL_SURFACE_TYPE,
                 EGL_PBUFFER_BIT,
@@ -480,9 +476,8 @@ fn open_display(egl: &Egl) -> EGLDisplay {
             ];
             let mut config: EGLConfig = std::ptr::null_mut();
             let mut n: EGLint = 0;
-            let ok = unsafe {
-                (egl.ChooseConfig)(display, cfg_attrs.as_ptr(), &mut config, 1, &mut n)
-            };
+            let ok =
+                unsafe { (egl.ChooseConfig)(display, cfg_attrs.as_ptr(), &mut config, 1, &mut n) };
             if ok == EGL_FALSE || n < 1 {
                 continue;
             }
@@ -569,13 +564,16 @@ fn open_display(egl: &Egl) -> EGLDisplay {
         }
         // SAFETY: `glGetString` has this signature, and the caller holds the
         // context current through a `Guard`.
-        let f: unsafe extern "C" fn(c_uint) -> *const c_char =
-            unsafe { std::mem::transmute(p) };
+        let f: unsafe extern "C" fn(c_uint) -> *const c_char = unsafe { std::mem::transmute(p) };
         let s = unsafe { f(GL_RENDERER) };
         if s.is_null() {
             return None;
         }
-        Some(unsafe { std::ffi::CStr::from_ptr(s) }.to_string_lossy().into_owned())
+        Some(
+            unsafe { std::ffi::CStr::from_ptr(s) }
+                .to_string_lossy()
+                .into_owned(),
+        )
     }
 
     /// The address of a GL entry point, for glow's loader.
@@ -613,9 +611,7 @@ fn open_display(egl: &Egl) -> EGLDisplay {
                 prev.glx = Some((glx, g));
             }
         }
-        let ok = unsafe {
-            (e.MakeCurrent)(self.display, self.pbuffer, self.pbuffer, self.context)
-        };
+        let ok = unsafe { (e.MakeCurrent)(self.display, self.pbuffer, self.pbuffer, self.context) };
         if ok == EGL_FALSE {
             log::debug!("compositor GL: eglMakeCurrent failed (0x{:X})", unsafe {
                 (e.GetError)()
@@ -887,7 +883,13 @@ mod tests {
                 if make_current(display, drawable, drawable, context) == 0 {
                     return None;
                 }
-                Some(GlxCtx { display, context, drawable, make_current, get_current })
+                Some(GlxCtx {
+                    display,
+                    context,
+                    drawable,
+                    make_current,
+                    get_current,
+                })
             }
         }
 
@@ -916,7 +918,10 @@ mod tests {
             eprintln!("no GLX here; nothing to step around");
             return;
         };
-        assert!(glx.is_current(), "the stand-in GLX context did not become current");
+        assert!(
+            glx.is_current(),
+            "the stand-in GLX context did not become current"
+        );
 
         let Some(gl) = Gl::create() else {
             eprintln!("no EGL here");

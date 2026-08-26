@@ -400,7 +400,13 @@ pub fn dump_raw(port: Option<String>) {
     let tap = Arc::new(RawMidiTap::new(100_000));
     let (tx, _rx) = mpsc::channel();
     let lane = Arc::new(MidiFastLane::new());
-    let conn = match connect_by_name(&chosen, tx, egui::Context::default(), Arc::clone(&tap), lane) {
+    let conn = match connect_by_name(
+        &chosen,
+        tx,
+        egui::Context::default(),
+        Arc::clone(&tap),
+        lane,
+    ) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("could not open {chosen:?}: {e}");
@@ -408,14 +414,18 @@ pub fn dump_raw(port: Option<String>) {
         }
     };
 
-    println!("listening on {:?} - play something; Ctrl-C to stop", conn.port_name);
-    println!("{:>12}  {:>10}  {:>9}  bytes", "t (ms)", "delta (ms)", "stamp");
+    println!(
+        "listening on {:?} - play something; Ctrl-C to stop",
+        conn.port_name
+    );
+    println!(
+        "{:>12}  {:>10}  {:>9}  bytes",
+        "t (ms)", "delta (ms)", "stamp"
+    );
 
     let epoch = Instant::now();
-    let mut clock = ivory_record::clock::SourceClock::new(
-        ivory_record::clock::MIDIR_SCALE_NS,
-        2_000_000_000,
-    );
+    let mut clock =
+        ivory_record::clock::SourceClock::new(ivory_record::clock::MIDIR_SCALE_NS, 2_000_000_000);
     let mut first: Option<i64> = None;
     let mut prev_stamp: Option<u64> = None;
 
@@ -582,7 +592,10 @@ mod tests {
         // Already channel 10: no double.
         lane.play(&[0x99, 40, 90]);
         assert!(rx.pop().is_ok());
-        assert!(rx.pop().is_err(), "a channel-10 note was mirrored onto itself");
+        assert!(
+            rx.pop().is_err(),
+            "a channel-10 note was mirrored onto itself"
+        );
 
         // EVERY key is a pad now: high notes mirror too.
         lane.play(&[0x90, 72, 90]);

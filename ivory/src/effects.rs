@@ -264,7 +264,11 @@ impl Params {
             &mut self.limiter_release,
             &mut self.limiter_knee,
         ] {
-            *v = if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.5 };
+            *v = if v.is_finite() {
+                v.clamp(0.0, 1.0)
+            } else {
+                0.5
+            };
         }
         self
     }
@@ -899,8 +903,12 @@ impl Filter {
         match slope {
             Slope::Six => self.one.set(sample_rate, hz),
             Slope::Twelve => {
-                self.a
-                    .set(sample_rate, hz, std::f32::consts::FRAC_1_SQRT_2 * lift, high);
+                self.a.set(
+                    sample_rate,
+                    hz,
+                    std::f32::consts::FRAC_1_SQRT_2 * lift,
+                    high,
+                );
             }
             Slope::TwentyFour => {
                 self.a.set(sample_rate, hz, BUTTER_Q4.0, high);
@@ -1324,7 +1332,9 @@ impl Effects {
             // copy of signal that is already reaching the master; handing it
             // back untouched because nothing is switched on would double it.
             if self.wet_only {
-                buf.iter_mut().take(frames * channels).for_each(|v| *v = 0.0);
+                buf.iter_mut()
+                    .take(frames * channels)
+                    .for_each(|v| *v = 0.0);
             }
             if !self.idle {
                 // Once, on the way down: whatever was still ringing when the
@@ -1338,7 +1348,9 @@ impl Effects {
         self.idle = false;
         if channels < 2 {
             if self.wet_only {
-                buf.iter_mut().take(frames * channels).for_each(|v| *v = 0.0);
+                buf.iter_mut()
+                    .take(frames * channels)
+                    .for_each(|v| *v = 0.0);
             }
             return;
         }
@@ -1419,7 +1431,13 @@ impl Effects {
                 self.hpf[ch].clear();
             }
             if lpf_on {
-                self.lpf[ch].set(self.sample_rate, lpf_hz, p.lpf_slope, p.lpf_resonance, false);
+                self.lpf[ch].set(
+                    self.sample_rate,
+                    lpf_hz,
+                    p.lpf_slope,
+                    p.lpf_resonance,
+                    false,
+                );
             } else {
                 self.lpf[ch].clear();
             }
@@ -1655,7 +1673,6 @@ mod tests {
         }
     }
 
-
     const SR: f32 = 48_000.0;
 
     /// Reconstruct the analogue peak of a buffer, INDEPENDENTLY of the
@@ -1691,8 +1708,7 @@ mod tests {
                     };
                     let w = 0.42
                         - 0.5 * (std::f32::consts::TAU * k as f32 / (TAPS - 1) as f32).cos()
-                        + 0.08
-                            * (2.0 * std::f32::consts::TAU * k as f32 / (TAPS - 1) as f32).cos();
+                        + 0.08 * (2.0 * std::f32::consts::TAU * k as f32 / (TAPS - 1) as f32).cos();
                     let i = n as isize + k as isize - CENTRE;
                     if i >= 0 && (i as usize) < x.len() {
                         acc += sinc * w * x[i as usize];
@@ -1827,7 +1843,11 @@ mod tests {
     #[test]
     fn the_limiter_dial_runs_from_off_at_the_top() {
         assert_eq!(Sends::threshold_db(1.0), 0.0, "fully right is not 0 dB");
-        assert_eq!(Sends::threshold_db(0.5), -24.0, "twelve o'clock is not -24 dB");
+        assert_eq!(
+            Sends::threshold_db(0.5),
+            -24.0,
+            "twelve o'clock is not -24 dB"
+        );
         assert_eq!(Sends::threshold_db(0.0), -48.0, "fully left is not -48 dB");
 
         // And at rest it does nothing at all, bit for bit.
@@ -1907,7 +1927,11 @@ mod tests {
     /// near the corner, which is the part anybody hears.
     #[test]
     fn the_filter_slopes_are_what_they_say() {
-        for (slope, order) in [(Slope::Six, 1_i32), (Slope::Twelve, 2), (Slope::TwentyFour, 4)] {
+        for (slope, order) in [
+            (Slope::Six, 1_i32),
+            (Slope::Twelve, 2),
+            (Slope::TwentyFour, 4),
+        ] {
             for high in [true, false] {
                 // Both measurement points stay under an eighth of the sample
                 // rate: a digital filter's response bends towards Nyquist, and
@@ -1986,11 +2010,7 @@ mod tests {
             fx.process(&mut buf, 2_048, 2, sends, &p, 120.0);
             // Once the knob has slewed all the way up.
             if block >= 50 {
-                worst = worst.max(
-                    buf.iter()
-                        .skip(64)
-                        .fold(0.0f32, |a, b| a.max(b.abs())),
-                );
+                worst = worst.max(buf.iter().skip(64).fold(0.0f32, |a, b| a.max(b.abs())));
             }
         }
         let db = 20.0 * worst.max(1.0e-9).log10();
@@ -2043,13 +2063,7 @@ mod tests {
     /// As [`strike`], at a stated tempo and settings. **The tempo has to be the
     /// same one the warm-up used**: the delay time slews, so a different bpm
     /// here starts it moving back and the repeat arrives somewhere between.
-    fn strike_with(
-        fx: &mut Effects,
-        frames: usize,
-        s: Sends,
-        p: &Params,
-        bpm: f64,
-    ) -> Vec<f32> {
+    fn strike_with(fx: &mut Effects, frames: usize, s: Sends, p: &Params, bpm: f64) -> Vec<f32> {
         let mut out = vec![0.0_f32; frames * 2];
         out[0] = 1.0;
         out[1] = 1.0;
@@ -2069,7 +2083,14 @@ mod tests {
         let mut fx = Effects::new(SR);
         let mut buf: Vec<f32> = (0..512).map(|i| (i as f32 * 0.01).sin()).collect();
         let before = buf.clone();
-        fx.process(&mut buf, 256, 2, Sends::default(), &Params::default(), 120.0);
+        fx.process(
+            &mut buf,
+            256,
+            2,
+            Sends::default(),
+            &Params::default(),
+            120.0,
+        );
         assert_eq!(buf, before, "an effect at zero changed the signal");
     }
 
@@ -2095,7 +2116,10 @@ mod tests {
             .iter()
             .zip(&r)
             .fold(0.0_f32, |m, (a, b)| m.max((a - b).abs()));
-        assert!(diff > 1.0e-5, "both channels are identical: the reverb is mono");
+        assert!(
+            diff > 1.0e-5,
+            "both channels are identical: the reverb is mono"
+        );
     }
 
     /// **Size is a real control.** A bigger room rings longer, or the menu is
@@ -2135,7 +2159,10 @@ mod tests {
                 ..Params::default()
             };
             let out = strike_with(&mut fx, 96_000, sends(1.0, 0.0, 0.0), &p, 120.0);
-            (out.iter().map(|s| f64::from(*s) * f64::from(*s)).sum::<f64>()).sqrt()
+            (out.iter()
+                .map(|s| f64::from(*s) * f64::from(*s))
+                .sum::<f64>())
+            .sqrt()
         };
         let (small, large) = (energy(0.0), energy(1.0));
         assert!(
@@ -2172,17 +2199,20 @@ mod tests {
             let out = strike_with(&mut fx, 48_000, sends(0.0, 1.0, 0.0), &p, bpm);
             // The loudest thing after the impulse itself is the first repeat.
             let left: Vec<f32> = out.chunks_exact(2).map(|f| f[0].abs()).collect();
-            let (at, _) = left
-                .iter()
-                .enumerate()
-                .skip(64)
-                .fold((0usize, 0.0_f32), |(bi, bv), (i, v)| {
-                    if *v > bv {
-                        (i, *v)
-                    } else {
-                        (bi, bv)
-                    }
-                });
+            let (at, _) =
+                left.iter()
+                    .enumerate()
+                    .skip(64)
+                    .fold(
+                        (0usize, 0.0_f32),
+                        |(bi, bv), (i, v)| {
+                            if *v > bv {
+                                (i, *v)
+                            } else {
+                                (bi, bv)
+                            }
+                        },
+                    );
             let got = at as f32 / SR;
             assert!(
                 (got - want).abs() < 0.02,

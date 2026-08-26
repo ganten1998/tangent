@@ -597,8 +597,14 @@ fn a_filter_knob_reads_out_where_its_filter_actually_is() {
         "0.0 dB",
         "the limiter's resting position is not 0 dB"
     );
-    assert_eq!(ivory_ui::recorder_panel::knob_reading(*limiter, 0.5), "-24.0 dB");
-    assert_eq!(ivory_ui::recorder_panel::knob_reading(*limiter, 0.0), "-48.0 dB");
+    assert_eq!(
+        ivory_ui::recorder_panel::knob_reading(*limiter, 0.5),
+        "-24.0 dB"
+    );
+    assert_eq!(
+        ivory_ui::recorder_panel::knob_reading(*limiter, 0.0),
+        "-48.0 dB"
+    );
 
     for (key, range) in [
         ("hpf_mix", crate::effects::HPF_HZ),
@@ -623,7 +629,11 @@ fn a_filter_knob_reads_out_where_its_filter_actually_is() {
             let said = ivory_ui::recorder_panel::knob_reading(*unit, t);
             let actual = range.0 * (range.1 / range.0).powf(t);
             let shown: f32 = said.split_whitespace().next().unwrap().parse().unwrap();
-            let shown = if said.contains('k') { shown * 1_000.0 } else { shown };
+            let shown = if said.contains('k') {
+                shown * 1_000.0
+            } else {
+                shown
+            };
             assert!(
                 (shown - actual).abs() / actual < 0.02,
                 "{key} at {t} reads {said} and the filter is at {actual:.0} Hz"
@@ -638,8 +648,15 @@ fn a_filter_knob_reads_out_where_its_filter_actually_is() {
         .get("lpf_mix")
         .and_then(serde_json::Value::as_f64)
         .expect("lpf_mix has no advertised default");
-    assert!((lpf_default - 1.0).abs() < 1.0e-6, "the LPF default is {lpf_default}, not open");
-    let (_, lpf_unit) = d.units.iter().find(|(k, _)| k == "lpf_mix").expect("lpf unit");
+    assert!(
+        (lpf_default - 1.0).abs() < 1.0e-6,
+        "the LPF default is {lpf_default}, not open"
+    );
+    let (_, lpf_unit) = d
+        .units
+        .iter()
+        .find(|(k, _)| k == "lpf_mix")
+        .expect("lpf unit");
     assert_eq!(
         ivory_ui::recorder_panel::knob_reading(*lpf_unit, lpf_default as f32),
         "20 kHz",
@@ -670,18 +687,27 @@ fn the_browser_lists_folders_first_and_filters_what_it_offers() {
 
     // The way up, then folders, then files - each sorted without regard to
     // case, which is the order every file manager uses.
-    assert_eq!(names, ["..", "apple", "Zebra", "A.MP3", "b.wav"], "{names:?}");
+    assert_eq!(
+        names,
+        ["..", "apple", "Zebra", "A.MP3", "b.wav"],
+        "{names:?}"
+    );
     assert!(rows[0].is_dir && rows[1].is_dir && rows[2].is_dir);
     assert!(!rows[3].is_dir);
     // **Case-insensitively filtered**: a file named `.MP3` is an mp3, and a
     // browser that only matched lowercase would hide half of anybody's music.
-    assert!(!names.contains(&"notes.txt"), "an unmatched file was offered");
+    assert!(
+        !names.contains(&"notes.txt"),
+        "an unmatched file was offered"
+    );
     assert!(!names.contains(&".hidden.wav"), "a dotfile was offered");
 
     // No filter at all offers everything but the dotfiles.
     let (all, _) = DesktopApp::list_dir(&root, &[]);
     assert!(all.iter().any(|e| e.name == "notes.txt"));
-    assert!(!all.iter().any(|e| e.name.starts_with('.') && e.name != ".."));
+    assert!(!all
+        .iter()
+        .any(|e| e.name.starts_with('.') && e.name != ".."));
 
     // A folder that is not there is a sentence, not a panic or an empty list
     // that looks like an empty folder.
@@ -805,7 +831,11 @@ fn slope_choice(key: &str, default: crate::effects::Slope) -> ivory_ui::ports::C
 fn effect_params_from(map: &serde_json::Map<String, serde_json::Value>) -> crate::effects::Params {
     use crate::effects::{Division, Params};
     let mut p = Params::default();
-    let num = |key: &str| map.get(key).and_then(serde_json::Value::as_f64).map(|v| v as f32);
+    let num = |key: &str| {
+        map.get(key)
+            .and_then(serde_json::Value::as_f64)
+            .map(|v| v as f32)
+    };
     for (key, dst) in [
         ("reverb_size", &mut p.reverb_size),
         ("reverb_damp", &mut p.reverb_damp),
@@ -1025,10 +1055,10 @@ impl DesktopApp {
             // were about to be dropped anyway. And the buffer it displaces
             // goes BACK to the capture thread, which is what makes the
             // steady state allocation-free — see `FrameSlot::recycle`.
-            let spent = self
-                .recorder
-                .camera_rgba
-                .replace((frame.pixels, frame.width, frame.height));
+            let spent =
+                self.recorder
+                    .camera_rgba
+                    .replace((frame.pixels, frame.width, frame.height));
             if let Some((pixels, ..)) = spent {
                 self.recorder.session.recycle_frame(pixels);
             }
@@ -1114,7 +1144,9 @@ impl DesktopApp {
                     .note(running, callbacks, std::time::Instant::now());
             if fault.is_some() || stalled {
                 let why = match fault {
-                    Some(f) => format!("audio output failed: {f} - will reopen when the device is back"),
+                    Some(f) => {
+                        format!("audio output failed: {f} - will reopen when the device is back")
+                    }
                     None => "the audio output went quiet (device stopped serving \
                              audio) - will reopen when the device is back"
                         .to_owned(),
@@ -1122,11 +1154,12 @@ impl DesktopApp {
                 log::warn!("{why}");
                 self.recorder.engine = None;
                 self.recorder.engine_error = Some(why);
-                self.recorder.inserts_loaded = vec![
-                    None;
-                    (ivory_ui::recorder::STRIPS + 1 + ivory_ui::recorder::DRUM_PADS)
-                        * ivory_ui::recorder::INSERTS
-                ];
+                self.recorder.inserts_loaded =
+                    vec![
+                        None;
+                        (ivory_ui::recorder::STRIPS + 1 + ivory_ui::recorder::DRUM_PADS)
+                            * ivory_ui::recorder::INSERTS
+                    ];
                 // **No timed retries here — the reprobe thread owns recovery.**
                 // The yank test proved why: a watchdog-declared death is
                 // usually GONE HARDWARE, and `Engine::start` against a dead
@@ -1157,7 +1190,12 @@ impl DesktopApp {
         // than trusting the next paint to somebody moving the mouse.
         if self.recorder.engine.is_some() {
             self.recorder.reprobe = None;
-        } else if self.recorder.reprobe.as_ref().is_some_and(Reprobe::device_back) {
+        } else if self
+            .recorder
+            .reprobe
+            .as_ref()
+            .is_some_and(Reprobe::device_back)
+        {
             // **Only while the band is open.** Without this gate the replug
             // fired `open_audio_path` regardless: device dies with the band
             // open, the user closes the band, plugs the device back in — and
@@ -1212,7 +1250,11 @@ impl DesktopApp {
             // frames, announced as usual.
             self.recorder.engine = None;
             self.recorder.inserts_loaded =
-                vec![None; (ivory_ui::recorder::STRIPS + 1 + ivory_ui::recorder::DRUM_PADS) * ivory_ui::recorder::INSERTS];
+                vec![
+                    None;
+                    (ivory_ui::recorder::STRIPS + 1 + ivory_ui::recorder::DRUM_PADS)
+                        * ivory_ui::recorder::INSERTS
+                ];
             self.open_audio_path(ctx);
         }
 
@@ -1295,10 +1337,14 @@ impl DesktopApp {
             // problems, which belong in the band because they are true NOW.
             ;
 
-        let preview = self.recorder.preview.as_ref().map(|h| ivory_ui::recorder::Preview {
-            texture: h.id(),
-            size: self.recorder.preview_px,
-        });
+        let preview = self
+            .recorder
+            .preview
+            .as_ref()
+            .map(|h| ivory_ui::recorder::Preview {
+                texture: h.id(),
+                size: self.recorder.preview_px,
+            });
 
         // **Once per take, on the edge.** `last_summary` keeps answering with
         // the same take until the next one, so the message it carries is the
@@ -1407,8 +1453,16 @@ impl DesktopApp {
             }
             state.gr_db = 7.5;
             state.master = ivory_ui::recorder::Meters {
-                left: ivory_ui::recorder::Level { peak: 0.79, rms: 0.5, hold: 0.9 },
-                right: ivory_ui::recorder::Level { peak: 0.44, rms: 0.3, hold: 0.55 },
+                left: ivory_ui::recorder::Level {
+                    peak: 0.79,
+                    rms: 0.5,
+                    hold: 0.9,
+                },
+                right: ivory_ui::recorder::Level {
+                    peak: 0.44,
+                    rms: 0.3,
+                    hold: 0.55,
+                },
                 mono: false,
                 clipped: false,
             };
@@ -1445,7 +1499,11 @@ impl DesktopApp {
             let label = if device.is_empty() {
                 String::new()
             } else {
-                let head = if alias.is_empty() { device.as_str() } else { alias.as_str() };
+                let head = if alias.is_empty() {
+                    device.as_str()
+                } else {
+                    alias.as_str()
+                };
                 if channel.is_empty() {
                     head.to_owned()
                 } else {
@@ -1505,9 +1563,10 @@ impl DesktopApp {
                 // `=patch` goes one further, to the patch EDITOR, which is
                 // otherwise two clicks in and cannot be reached from a script.
                 if std::env::var("IVORY_OPEN_EDITOR").as_deref() == Ok("patch") {
-                    self.app.apply_dialog_action(ivory_ui::dialogs::DialogAction::EditPatch {
-                        slot: 0,
-                    });
+                    self.app
+                        .apply_dialog_action(ivory_ui::dialogs::DialogAction::EditPatch {
+                            slot: 0,
+                        });
                 }
                 eprintln!("IVORY_OPEN_EDITOR: opened slot 1");
             }
@@ -1521,8 +1580,10 @@ impl DesktopApp {
             let bays: Vec<(usize, usize)> = (0..=ivory_ui::recorder::STRIPS)
                 .flat_map(|s| (0..ivory_ui::recorder::INSERTS).map(move |b| (s, b)))
                 .collect();
-            let was: Vec<bool> =
-                bays.iter().map(|&(st, b)| e.insert_editor_open(st, b)).collect();
+            let was: Vec<bool> = bays
+                .iter()
+                .map(|&(st, b)| e.insert_editor_open(st, b))
+                .collect();
             e.poll_editor();
             // An editor that has just closed is a preset that has just been
             // chosen. Save then, rather than only at quit, because the gap
@@ -1644,7 +1705,11 @@ impl DesktopApp {
                 // Recovery restarts from the open edge like everything else.
                 self.recorder.reprobe = None;
                 self.recorder.inserts_loaded =
-                    vec![None; (ivory_ui::recorder::STRIPS + 1 + ivory_ui::recorder::DRUM_PADS) * ivory_ui::recorder::INSERTS];
+                    vec![
+                        None;
+                        (ivory_ui::recorder::STRIPS + 1 + ivory_ui::recorder::DRUM_PADS)
+                            * ivory_ui::recorder::INSERTS
+                    ];
             }
         } else if open {
             self.reconcile_audio(false);
@@ -1708,10 +1773,9 @@ impl DesktopApp {
             if let Some(e) = engine {
                 let rate = f64::from(e.output().sample_rate).max(1.0);
                 match self.app.loop_region().filter(|_| !session_rolling) {
-                    Some((a, b)) => e.set_loop(
-                        (a.max(0.0) * rate) as u64,
-                        (b.max(0.0) * rate) as u64,
-                    ),
+                    Some((a, b)) => {
+                        e.set_loop((a.max(0.0) * rate) as u64, (b.max(0.0) * rate) as u64)
+                    }
                     None => e.set_loop(0, 0),
                 }
             }
@@ -1877,18 +1941,16 @@ impl DesktopApp {
         if let Some(order) = self.app.take_desk_state_perm() {
             self.save_plugin_states_as_loaded();
             permute_insert_states_in(
-                insert_state_path(0, 0).parent().map(std::path::Path::to_path_buf),
+                insert_state_path(0, 0)
+                    .parent()
+                    .map(std::path::Path::to_path_buf),
                 &order,
             );
             permute_insert_states_in(self.project_state_dir(), &order);
             self.force_insert_reload();
         }
         let inserts = ivory_ui::recorder::INSERTS;
-        let want_at = |i: usize| {
-            self.app
-                .insert(i / inserts, i % inserts)
-                .map(str::to_owned)
-        };
+        let want_at = |i: usize| self.app.insert(i / inserts, i % inserts).map(str::to_owned);
         if let Some(i) = (0..self.recorder.inserts_loaded.len())
             .find(|i| want_at(*i) != self.recorder.inserts_loaded[*i])
         {
@@ -1900,12 +1962,9 @@ impl DesktopApp {
                 // saved and named by the same code — but the ENGINE renders it
                 // in `mix_channels`, not in the rack, so the bay itself is
                 // handed nothing. See `set_builtin_strip`, pushed each frame.
-                let engine_want = want
-                    .as_deref()
-                    .filter(|p| {
-                        *p != ivory_ui::dialogs::BUILTIN_PATH
-                            && *p != ivory_ui::dialogs::DRUMPAD_PATH
-                    });
+                let engine_want = want.as_deref().filter(|p| {
+                    *p != ivory_ui::dialogs::BUILTIN_PATH && *p != ivory_ui::dialogs::DRUMPAD_PATH
+                });
                 let path = engine_want.map(std::path::Path::new);
                 // **With the bay's saved preset, when one belongs to this
                 // plugin.** The same bargain the instrument slots have had for
@@ -1926,9 +1985,8 @@ impl DesktopApp {
                             && self.app.take_open_insert_on_load(i / inserts, i % inserts)
                         {
                             if let Err(err) = e.open_insert_editor(i / inserts, i % inserts) {
-                                self.recorder.engine_error = Some(format!(
-                                    "could not open the plugin's window: {err}"
-                                ));
+                                self.recorder.engine_error =
+                                    Some(format!("could not open the plugin's window: {err}"));
                             }
                         }
                     }
@@ -2151,7 +2209,9 @@ impl DesktopApp {
                     // export" — the count is at the head of the file to trim to
                     // or to keep.
                     let wait = if in_take { 0 } else { beats };
-                    self.recorder.session.toggle(&root, name.as_deref(), wait, spec);
+                    self.recorder
+                        .session
+                        .toggle(&root, name.as_deref(), wait, spec);
                 }
                 // **One stop for both machines.** The square ends whichever
                 // is running — the take by the session's own stop, the
@@ -2427,9 +2487,10 @@ impl DesktopApp {
         let cart = crate::dx7::Cartridge::of("my-patches", voices);
         match cart.save(&path) {
             Ok(()) => {
-                let where_to = path
-                    .file_name()
-                    .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+                let where_to = path.file_name().map_or_else(
+                    || path.display().to_string(),
+                    |n| n.to_string_lossy().into_owned(),
+                );
                 if full {
                     format!("Saved to {where_to}. The bank was full, so the oldest went.")
                 } else {
@@ -2468,7 +2529,8 @@ impl DesktopApp {
                 crate::dx7::factory()
             })
         };
-        self.app.set_cartridge(cartridge_info(&cart, "", is_factory));
+        self.app
+            .set_cartridge(cartridge_info(&cart, "", is_factory));
         if let Some(v) = cart.voices.get(patch).copied() {
             if let Some(e) = self.recorder.engine.as_mut() {
                 e.set_builtin_voice(v);
@@ -2661,7 +2723,8 @@ impl DesktopApp {
         self.app.bootstrap_project(&root);
         // The default template exists from the start — the folder New
         // clones, and the one "Save As Template" named `default` replaces.
-        self.app.seed_template(&self.templates_dir().join("default"));
+        self.app
+            .seed_template(&self.templates_dir().join("default"));
     }
 
     /// What to do with a chosen folder, whichever picker chose it.
@@ -2724,13 +2787,69 @@ impl DesktopApp {
             // Reported INTO the dialog rather than as a message box, because
             // the dialog is still open and the next thing the user will do is
             // pick a different file from the same folder.
-            Err(e) => self
-                .app
-                .set_cartridge(ivory_ui::ports::CartridgeInfo {
-                    error: e,
-                    ..Default::default()
-                }),
+            Err(e) => self.app.set_cartridge(ivory_ui::ports::CartridgeInfo {
+                error: e,
+                ..Default::default()
+            }),
         }
+    }
+
+
+    /// The pointer during a FILE DRAG, in window-local points — or `None`
+    /// when nothing is being dragged and on platforms that are not asked.
+    ///
+    /// **An OS drag produces no pointer events.** winit reports `HoveredFile`
+    /// when files enter the window and never a `CursorMoved` for the whole
+    /// drag, so `egui`'s pointer is stale or absent for exactly as long as
+    /// somebody is holding a file over the app. The first fix tracked the
+    /// pointer while the file hovered, which tracked nothing at all: there
+    /// was no position to read. So the cursor is asked of the platform.
+    ///
+    /// Only while files hover. Polling the OS for the mouse every frame of
+    /// every session to answer a question nobody asked is not a thing to do
+    /// in a paint loop.
+    fn drag_pointer(ctx: &egui::Context) -> Option<egui::Pos2> {
+        if ctx.input(|i| i.raw.hovered_files.is_empty()) {
+            return None;
+        }
+        let inner = ctx.input(|i| i.viewport().inner_rect)?;
+        let (sx, sy) = Self::os_cursor_points(ctx)?;
+        Some(egui::Pos2::new(sx - inner.min.x, sy - inner.min.y))
+    }
+
+    /// The cursor in SCREEN points, the same unit egui reports the window's
+    /// inner rect in.
+    #[cfg(target_os = "macos")]
+    fn os_cursor_points(_ctx: &egui::Context) -> Option<(f32, f32)> {
+        use core_graphics::event::CGEvent;
+        use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+        // Core Graphics answers in global display points already — the same
+        // logical unit, Retina or not — so there is no scale to apply.
+        let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState).ok()?;
+        let event = CGEvent::new(source).ok()?;
+        let p = event.location();
+        Some((p.x as f32, p.y as f32))
+    }
+
+    /// Windows answers in physical pixels, so it is divided down.
+    #[cfg(target_os = "windows")]
+    fn os_cursor_points(ctx: &egui::Context) -> Option<(f32, f32)> {
+        use windows_sys::Win32::Foundation::POINT;
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+        let mut p = POINT { x: 0, y: 0 };
+        // SAFETY: `p` is a valid, owned POINT for the duration of the call.
+        if unsafe { GetCursorPos(&mut p) } == 0 {
+            return None;
+        }
+        let ppp = ctx.pixels_per_point().max(0.1);
+        Some((p.x as f32 / ppp, p.y as f32 / ppp))
+    }
+
+    /// Left alone elsewhere: X11 and Wayland want their own query, and the
+    /// existing pointer path is what those builds keep until one is written.
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    fn os_cursor_points(_ctx: &egui::Context) -> Option<(f32, f32)> {
+        None
     }
 
     /// Whether a picker has to wait for the window to leave fullscreen first.
@@ -2836,9 +2955,8 @@ impl DesktopApp {
     #[cfg(target_os = "linux")]
     fn native_dialogs_work() -> bool {
         fn which_on_path(exe: &str) -> bool {
-            std::env::var_os("PATH").is_some_and(|p| {
-                std::env::split_paths(&p).any(|d| d.join(exe).is_file())
-            })
+            std::env::var_os("PATH")
+                .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(exe).is_file()))
         }
 
         // A session bus at all. Without one there is no portal by definition.
@@ -3028,8 +3146,7 @@ impl DesktopApp {
                 }
                 Some(ivory_ui::recorder::ChannelKind::Audio) => {
                     if any_explicit
-                        && IvoryApp::parse_input_spec(self.app.channel_input_spec(ch))
-                            .is_none()
+                        && IvoryApp::parse_input_spec(self.app.channel_input_spec(ch)).is_none()
                     {
                         // NO INPUT on an explicit desk: the engine opened no
                         // ring for this lane, so there is nothing to tee.
@@ -3195,8 +3312,7 @@ impl DesktopApp {
             _ => (0.0, self.app.arr_span_s() + 2.0),
         };
         if until_s <= from_s + 2.0 && self.app.arr_span_s() <= 0.0 {
-            self.recorder.take_note =
-                Some("Nothing to export — the timeline is empty.".to_owned());
+            self.recorder.take_note = Some("Nothing to export — the timeline is empty.".to_owned());
             return;
         }
         let root = self.app.record_root();
@@ -3248,10 +3364,8 @@ impl DesktopApp {
                         .collect();
                     let path = dir.join(format!("{:02}-{}.wav", lane + 1, name.trim()));
                     let _ = std::fs::remove_file(&path);
-                    let bext = ivory_record::wav::Bext::new(
-                        ivory_record::wav::Wallclock::now_utc(),
-                        spec,
-                    );
+                    let bext =
+                        ivory_record::wav::Bext::new(ivory_record::wav::Wallclock::now_utc(), spec);
                     if let Ok(w) = ivory_record::wav::WavWriter::create(&path, spec, &bext) {
                         stem_writers.push((lane, w));
                     }
@@ -3376,8 +3490,7 @@ impl DesktopApp {
                 .find(|p| p.extension().is_some_and(|e| e == "wav"))
         });
         let Some(wav) = wav else {
-            self.recorder.take_note =
-                Some("export: the take produced no audio file".to_owned());
+            self.recorder.take_note = Some("export: the take produced no audio file".to_owned());
             return;
         };
         let mut n = 1usize;
@@ -3437,8 +3550,7 @@ impl DesktopApp {
             self.app.set_export_progress(None);
             match deliver_formats_inner(&paths, &spec, true) {
                 Ok(()) => {
-                    self.recorder.take_note =
-                        Some(format!("Exported  {}", out_dir.display()));
+                    self.recorder.take_note = Some(format!("Exported  {}", out_dir.display()));
                     // A long export is a thing people walk away from; the
                     // first thing they want on returning is the file.
                     if spec.open_when_done {
@@ -3456,7 +3568,10 @@ impl DesktopApp {
 
     /// Where an export lands: the spec's directory, or the project's own
     /// `export/` folder.
-    fn export_out_dir(&self, spec: &ivory_ui::ports::ProjectExportSpec) -> Option<std::path::PathBuf> {
+    fn export_out_dir(
+        &self,
+        spec: &ivory_ui::ports::ProjectExportSpec,
+    ) -> Option<std::path::PathBuf> {
         if !spec.dir.trim().is_empty() {
             return Some(std::path::PathBuf::from(spec.dir.trim()));
         }
@@ -3484,8 +3599,7 @@ impl DesktopApp {
             _ => (0.0, self.app.arr_span_s()),
         };
         if span <= 0.0 {
-            self.recorder.take_note =
-                Some("Nothing to export — the timeline is empty.".to_owned());
+            self.recorder.take_note = Some("Nothing to export — the timeline is empty.".to_owned());
             return;
         }
         let Some(out_dir) = self.export_out_dir(&spec) else {
@@ -3497,13 +3611,14 @@ impl DesktopApp {
             return;
         }
         let rate = spec.rate.clamp(8_000, 192_000);
-        let mut e = match crate::instrument::Engine::offline(rate, ivory_record::audio::Timebase::new()) {
-            Ok(e) => e,
-            Err(err) => {
-                self.recorder.take_note = Some(format!("export: {err}"));
-                return;
-            }
-        };
+        let mut e =
+            match crate::instrument::Engine::offline(rate, ivory_record::audio::Timebase::new()) {
+                Ok(e) => e,
+                Err(err) => {
+                    self.recorder.take_note = Some(format!("export: {err}"));
+                    return;
+                }
+            };
         // ── the desk, exactly as the live walk pushes it ──
         e.set_desk(&self.app.desk());
         let gains = self.app.gains();
@@ -3548,13 +3663,13 @@ impl DesktopApp {
         }
         // The built-in: rendered by the engine itself when a channel's
         // first bay names it — the live walk's own rule.
-        let builtin = (0..ivory_ui::recorder::CHANNELS).find(|ch| {
-            self.app.insert(*ch, 0) == Some(ivory_ui::dialogs::BUILTIN_PATH)
-        });
+        let builtin = (0..ivory_ui::recorder::CHANNELS)
+            .find(|ch| self.app.insert(*ch, 0) == Some(ivory_ui::dialogs::BUILTIN_PATH));
         e.set_builtin_strip(builtin);
-        e.set_drum_strip((0..ivory_ui::recorder::CHANNELS).find(|ch| {
-            self.app.insert(*ch, 0) == Some(ivory_ui::dialogs::DRUMPAD_PATH)
-        }));
+        e.set_drum_strip(
+            (0..ivory_ui::recorder::CHANNELS)
+                .find(|ch| self.app.insert(*ch, 0) == Some(ivory_ui::dialogs::DRUMPAD_PATH)),
+        );
         // The DX7's sound is the SESSION's cartridge — the live engine
         // already carries it, so the export borrows the loaded copy.
         if builtin.is_some() {
@@ -3574,19 +3689,18 @@ impl DesktopApp {
             let seat = i / inserts;
             let bay = i % inserts;
             let want = self.app.insert(seat, bay).map(str::to_owned);
-            let engine_want = want
-                .as_deref()
-                .filter(|p| {
-                        *p != ivory_ui::dialogs::BUILTIN_PATH
-                            && *p != ivory_ui::dialogs::DRUMPAD_PATH
-                    });
+            let engine_want = want.as_deref().filter(|p| {
+                *p != ivory_ui::dialogs::BUILTIN_PATH && *p != ivory_ui::dialogs::DRUMPAD_PATH
+            });
             let Some(path) = engine_want else { continue };
             let state = saved_insert_state(seat, bay, path);
-            if let Err(err) =
-                e.load_insert(seat, bay, Some(std::path::Path::new(path)), state.as_deref())
-            {
-                self.recorder.take_note =
-                    Some(format!("export: a rack refused to load: {err}"));
+            if let Err(err) = e.load_insert(
+                seat,
+                bay,
+                Some(std::path::Path::new(path)),
+                state.as_deref(),
+            ) {
+                self.recorder.take_note = Some(format!("export: a rack refused to load: {err}"));
             }
         }
         // ── the clips, decoded at the EXPORT rate with a cache of their
@@ -3660,9 +3774,10 @@ impl DesktopApp {
             let mut kit = crate::instrument::PadKit::default();
             for (i, path) in self.app.drumpad_paths().iter().enumerate() {
                 let Some(path) = path else { continue };
-                if let (Ok(c), Some(slot)) =
-                    (ivory_record::decode::decode(path, rate), kit.pads.get_mut(i))
-                {
+                if let (Ok(c), Some(slot)) = (
+                    ivory_record::decode::decode(path, rate),
+                    kit.pads.get_mut(i),
+                ) {
                     *slot = Some(Arc::new(c));
                 }
             }
@@ -3679,9 +3794,7 @@ impl DesktopApp {
             format: match spec.depth {
                 ivory_ui::ports::ExportDepth::Pcm16 => ivory_record::wav::SampleFormat::Int16,
                 ivory_ui::ports::ExportDepth::Pcm24 => ivory_record::wav::SampleFormat::Int24,
-                ivory_ui::ports::ExportDepth::Float32 => {
-                    ivory_record::wav::SampleFormat::Float32
-                }
+                ivory_ui::ports::ExportDepth::Float32 => ivory_record::wav::SampleFormat::Float32,
             },
         };
         let bext = ivory_record::wav::Bext::new(ivory_record::wav::Wallclock::now_utc(), wav_spec);
@@ -3713,8 +3826,7 @@ impl DesktopApp {
                 // input that renders silence offline, and a folder of
                 // silent WAVs reads as a bug.
                 let sounds = doc.clips.iter().any(|c| c.lane == lane)
-                    || (0..ivory_ui::recorder::INSERTS)
-                        .any(|b| self.app.insert(lane, b).is_some());
+                    || (0..ivory_ui::recorder::INSERTS).any(|b| self.app.insert(lane, b).is_some());
                 if !sounds {
                     continue;
                 }
@@ -3819,22 +3931,24 @@ impl DesktopApp {
         }
         if b.done < b.until {
             let fraction = (b.done as f64 / b.until as f64) as f32;
-            self.app.set_export_progress(Some(ivory_ui::ports::ExportProgress {
-                fraction,
-                label: "Rendering".to_owned(),
-                peaks: b.peaks.clone(),
-            }));
+            self.app
+                .set_export_progress(Some(ivory_ui::ports::ExportProgress {
+                    fraction,
+                    label: "Rendering".to_owned(),
+                    peaks: b.peaks.clone(),
+                }));
             self.recorder.offline_bounce = Some(b);
             return;
         }
         // Rendering is done; the format pass still has to run, and on a long
         // mp3 that is the part that used to look like a hang. Say so, and let
         // the window paint this frame before it starts.
-        self.app.set_export_progress(Some(ivory_ui::ports::ExportProgress {
-            fraction: 1.0,
-            label: "Writing files".to_owned(),
-            peaks: b.peaks.clone(),
-        }));
+        self.app
+            .set_export_progress(Some(ivory_ui::ports::ExportProgress {
+                fraction: 1.0,
+                label: "Writing files".to_owned(),
+                peaks: b.peaks.clone(),
+            }));
         // ── done: close the files, then the format pass ──
         let OfflineBounce {
             spec,
@@ -3925,13 +4039,21 @@ impl DesktopApp {
             ivory_ui::ports::ProjectRequest::Export(spec) => {
                 self.recorder.take_note = Some(format!(
                     "export: {} {} → {}…",
-                    if spec.realtime { "realtime" } else { "full-speed" },
+                    if spec.realtime {
+                        "realtime"
+                    } else {
+                        "full-speed"
+                    },
                     match (spec.master, spec.stems) {
                         (true, false) => "master",
                         (false, true) => "stems",
                         _ => "master+stems",
                     },
-                    if spec.dir.trim().is_empty() { "project/export" } else { spec.dir.trim() },
+                    if spec.dir.trim().is_empty() {
+                        "project/export"
+                    } else {
+                        spec.dir.trim()
+                    },
                 ));
                 if spec.realtime {
                     // The realtime pass: the live engine, the live rate. The
@@ -4181,9 +4303,9 @@ impl DesktopApp {
         }
         // Files no clip references any more leave the cache with the edit.
         self.track_cache.retain(|path, _| {
-            doc.clips.iter().any(|c| {
-                ivory_ui::arrangement::Arrangement::resolve(&doc_path, &c.path) == *path
-            })
+            doc.clips
+                .iter()
+                .any(|c| ivory_ui::arrangement::Arrangement::resolve(&doc_path, &c.path) == *path)
         });
         if let Some(e) = self.recorder.engine.as_mut() {
             e.set_clips(placed);
@@ -4202,8 +4324,8 @@ impl DesktopApp {
         /// Columns in a pad's waveform ghost. A pad is fifty-odd points
         /// wide at most; forty-eight columns is under a point each.
         // 240 buckets: the trimmer draws the sample's real shape now, and the
-// pad ghost decimates for free.
-const PAD_WAVE_BUCKETS: usize = 240;
+        // pad ghost decimates for free.
+        const PAD_WAVE_BUCKETS: usize = 240;
         let rate = self
             .recorder
             .engine
@@ -4428,7 +4550,11 @@ const PAD_WAVE_BUCKETS: usize = 240;
                 // the one it replaces — forgetting that here is what asks the
                 // reconcile below to fill the bays again.
                 self.recorder.inserts_loaded =
-                    vec![None; (ivory_ui::recorder::STRIPS + 1 + ivory_ui::recorder::DRUM_PADS) * ivory_ui::recorder::INSERTS];
+                    vec![
+                        None;
+                        (ivory_ui::recorder::STRIPS + 1 + ivory_ui::recorder::DRUM_PADS)
+                            * ivory_ui::recorder::INSERTS
+                    ];
                 // **The tap belongs to the ENGINE, so it is taken when the
                 // engine starts.**
                 //
@@ -4447,8 +4573,11 @@ const PAD_WAVE_BUCKETS: usize = 240;
                 // VST3 branch's own call is now a no-op that costs nothing and
                 // is left where it is: it is the line that says the take has to
                 // be able to record what it can hear.
-                if let Some(tap) =
-                    self.recorder.engine.as_mut().and_then(|e| e.take_recorder_tap())
+                if let Some(tap) = self
+                    .recorder
+                    .engine
+                    .as_mut()
+                    .and_then(|e| e.take_recorder_tap())
                 {
                     self.recorder.session.set_plugin_tap(Some(tap));
                 }
@@ -4456,9 +4585,7 @@ const PAD_WAVE_BUCKETS: usize = 240;
                 // midir callback feeds the audio callback directly; the old
                 // producer (a dead engine's) is dropped inside, on this
                 // thread. See `midi::MidiFastLane`.
-                if let Some(tx) =
-                    self.recorder.engine.as_mut().and_then(|e| e.take_hw_midi())
-                {
+                if let Some(tx) = self.recorder.engine.as_mut().and_then(|e| e.take_hw_midi()) {
                     self.midi_lane.install(tx);
                 }
                 self.push_monitor_settings();
@@ -4468,12 +4595,9 @@ const PAD_WAVE_BUCKETS: usize = 240;
                 // enumerates drivers, and a launch that never opens the band
                 // never films anything. Once ever, and only from the shipped
                 // defaults — see `lower_video_defaults_for_cpu`.
-                if crate::composite::renders_on_the_cpu()
-                    && self.app.lower_video_defaults_for_cpu()
+                if crate::composite::renders_on_the_cpu() && self.app.lower_video_defaults_for_cpu()
                 {
-                    log::info!(
-                        "no GPU driver for video: composite defaults lowered to 720p/15"
-                    );
+                    log::info!("no GPU driver for video: composite defaults lowered to 720p/15");
                 }
                 // **The chosen patch, now that there is something to play it.**
                 // The cartridge is read at construction, long before the band
@@ -4635,8 +4759,7 @@ const PAD_WAVE_BUCKETS: usize = 240;
         // set up before the menu existed changes under them.
         let any_explicit = (0..ivory_ui::recorder::CHANNELS).any(|ch| {
             self.app.channel_kind(ch) == Some(ivory_ui::recorder::ChannelKind::Audio)
-                && IvoryApp::parse_input_spec(self.app.channel_input_spec(ch))
-                    .is_some()
+                && IvoryApp::parse_input_spec(self.app.channel_input_spec(ch)).is_some()
         });
         let mut explicit: Vec<ivory_record::audio::ChannelPick> = Vec::new();
         for ch in 0..ivory_ui::recorder::CHANNELS {
@@ -4652,8 +4775,7 @@ const PAD_WAVE_BUCKETS: usize = 240;
                         midi_off |= 1 << ch;
                     }
                     if builtin.is_none()
-                        && self.app.insert(ch, 0)
-                            == Some(ivory_ui::dialogs::BUILTIN_PATH)
+                        && self.app.insert(ch, 0) == Some(ivory_ui::dialogs::BUILTIN_PATH)
                     {
                         builtin = Some(ch);
                     }
@@ -4661,9 +4783,9 @@ const PAD_WAVE_BUCKETS: usize = 240;
                 Some(ivory_ui::recorder::ChannelKind::Audio) => {
                     midi_off |= 1 << ch;
                     if any_explicit {
-                        if let Some((a, b)) = IvoryApp::parse_input_spec(
-                            self.app.channel_input_spec(ch),
-                        ) {
+                        if let Some((a, b)) =
+                            IvoryApp::parse_input_spec(self.app.channel_input_spec(ch))
+                        {
                             if next_pick < picks.len() {
                                 picks[next_pick] = Some(ch);
                                 explicit.push(match b {
@@ -4711,9 +4833,10 @@ const PAD_WAVE_BUCKETS: usize = 240;
         e.set_builtin_strip(builtin);
         // The drumpad's lane, by the same bay-1 sentinel rule — any kind of
         // channel counts, because playback does not ask the arm.
-        e.set_drum_strip((0..ivory_ui::recorder::CHANNELS).find(|ch| {
-            self.app.insert(*ch, 0) == Some(ivory_ui::dialogs::DRUMPAD_PATH)
-        }));
+        e.set_drum_strip(
+            (0..ivory_ui::recorder::CHANNELS)
+                .find(|ch| self.app.insert(*ch, 0) == Some(ivory_ui::dialogs::DRUMPAD_PATH)),
+        );
         // Never read from a settings file — see `IvoryApp::input_monitor`. It
         // is pushed every frame like every other monitor setting, and its value
         // at launch is false because the field it comes from starts false.
@@ -4868,7 +4991,10 @@ const PAD_WAVE_BUCKETS: usize = 240;
         crate::devices::set_extra_inputs(&self.recorder.audio, self.app.extra_inputs().to_vec());
         let (stale, same_device) = {
             let sel = crate::devices::selection(&self.recorder.audio);
-            (sel.is_stale(), sel.wanted.is_some() && sel.wanted == sel.open)
+            (
+                sel.is_stale(),
+                sel.wanted.is_some() && sel.wanted == sel.open,
+            )
         };
         if !stale && !force {
             return;
@@ -5042,10 +5168,20 @@ fn insert_state_path(strip: usize, bay: usize) -> std::path::PathBuf {
 fn sanitize_file_stem(name: &str) -> String {
     let s: String = name
         .chars()
-        .map(|c| if std::path::is_separator(c) || c == ':' { '-' } else { c })
+        .map(|c| {
+            if std::path::is_separator(c) || c == ':' {
+                '-'
+            } else {
+                c
+            }
+        })
         .collect();
     let s = s.trim();
-    if s.is_empty() { "mix".to_owned() } else { s.to_owned() }
+    if s.is_empty() {
+        "mix".to_owned()
+    } else {
+        s.to_owned()
+    }
 }
 
 /// The format pass over freshly written WAVs: encode an MP3 beside each
@@ -5067,24 +5203,17 @@ fn deliver_formats_inner(
     rewrite_depth: bool,
 ) -> Result<(), String> {
     use ivory_ui::ports::ExportFormat;
-    let want_wav = spec.primary == ExportFormat::Wav
-        || spec.secondary == Some(ExportFormat::Wav);
-    let want_mp3 = spec.primary == ExportFormat::Mp3
-        || spec.secondary == Some(ExportFormat::Mp3);
+    let want_wav = spec.primary == ExportFormat::Wav || spec.secondary == Some(ExportFormat::Wav);
+    let want_mp3 = spec.primary == ExportFormat::Mp3 || spec.secondary == Some(ExportFormat::Mp3);
     for path in paths {
-        if rewrite_depth
-            && want_wav
-            && spec.depth != ivory_ui::ports::ExportDepth::Float32
-        {
+        if rewrite_depth && want_wav && spec.depth != ivory_ui::ports::ExportDepth::Float32 {
             let decoded = ivory_record::decode::decode(path, spec.rate)
                 .map_err(|e| format!("{}: {e}", path.display()))?;
             let wav_spec = ivory_record::wav::WavSpec {
                 sample_rate: spec.rate,
                 channels: 2,
                 format: match spec.depth {
-                    ivory_ui::ports::ExportDepth::Pcm16 => {
-                        ivory_record::wav::SampleFormat::Int16
-                    }
+                    ivory_ui::ports::ExportDepth::Pcm16 => ivory_record::wav::SampleFormat::Int16,
                     _ => ivory_record::wav::SampleFormat::Int24,
                 },
             };
@@ -5118,23 +5247,19 @@ fn deliver_formats_inner(
 /// quality — an export is the one place nobody wants a knob for this.
 #[cfg(feature = "recorder")]
 #[cfg(feature = "mp3")]
-fn encode_mp3(
-    stereo: &[f32],
-    rate: u32,
-    mono: bool,
-    path: &std::path::Path,
-) -> Result<(), String> {
+fn encode_mp3(stereo: &[f32], rate: u32, mono: bool, path: &std::path::Path) -> Result<(), String> {
     use mp3lame_encoder::{Bitrate, Builder, DualPcm, FlushNoGap, MonoPcm, Quality};
     let mut b = Builder::new().ok_or("mp3: the encoder would not initialise")?;
     b.set_num_channels(if mono { 1 } else { 2 })
         .map_err(|e| format!("mp3: {e}"))?;
     b.set_sample_rate(rate).map_err(|e| format!("mp3: {e}"))?;
-    b.set_brate(Bitrate::Kbps320).map_err(|e| format!("mp3: {e}"))?;
-    b.set_quality(Quality::Best).map_err(|e| format!("mp3: {e}"))?;
+    b.set_brate(Bitrate::Kbps320)
+        .map_err(|e| format!("mp3: {e}"))?;
+    b.set_quality(Quality::Best)
+        .map_err(|e| format!("mp3: {e}"))?;
     let mut enc = b.build().map_err(|e| format!("mp3: {e}"))?;
     let frames = stereo.len() / 2;
-    let mut out: Vec<u8> =
-        Vec::with_capacity(mp3lame_encoder::max_required_buffer_size(frames));
+    let mut out: Vec<u8> = Vec::with_capacity(mp3lame_encoder::max_required_buffer_size(frames));
     if mono {
         let folded: Vec<f32> = (0..frames)
             .map(|f| (stereo[f * 2] + stereo[f * 2 + 1]) * 0.5)
@@ -5321,7 +5446,10 @@ impl DesktopApp {
                 pads_retry: false,
                 inserts_loaded: vec![
                     None;
-                    (ivory_ui::recorder::STRIPS + 1 + ivory_ui::recorder::DRUM_PADS) * ivory_ui::recorder::INSERTS
+                    (ivory_ui::recorder::STRIPS
+                        + 1
+                        + ivory_ui::recorder::DRUM_PADS)
+                        * ivory_ui::recorder::INSERTS
                 ],
                 camera_opening: false,
                 camera_silent_since: None,
@@ -5498,6 +5626,9 @@ impl eframe::App for DesktopApp {
         // Welcome card while it paints, and a flag set afterwards would be one
         // frame stale — which is exactly one frame of card over wordmark.
         self.app.set_splash_up(self.splash.is_some());
+        // **Where the cursor is during a FILE DRAG.** Asked of the OS,
+        // because the window toolkit will not say — see `drag_pointer`.
+        self.app.set_drag_pointer(Self::drag_pointer(ctx));
         self.app.frame(ctx);
         #[cfg(feature = "recorder")]
         self.after_frame(ctx, frame);
@@ -5692,14 +5823,17 @@ impl DesktopApp {
                 sample_rate: rate,
                 channels,
             });
-        let compositor =
-            match crate::composite::Compositor::new(window_device(frame), video.width, video.height) {
-                Ok(c) => c,
-                Err(e) => {
-                    self.recorder.engine_error = Some(format!("no video this take: {e}"));
-                    return;
-                }
-            };
+        let compositor = match crate::composite::Compositor::new(
+            window_device(frame),
+            video.width,
+            video.height,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                self.recorder.engine_error = Some(format!("no video this take: {e}"));
+                return;
+            }
+        };
         // The offscreen context needs the app's fonts or every chord name in
         // the video renders in egui's default face.
         self.app.install_fonts(compositor.context());
@@ -5809,11 +5943,14 @@ impl DesktopApp {
                 continue;
             }
             let pts = (v.next as i64 * 1_000_000_000) / i64::from(v.fps);
-            let frame = self.recorder.camera_rgba.as_ref().map(|(px, w, h)| (px.as_slice(), *w, *h));
-            match v
-                .compositor
-                .frame(&self.app, v.layout, v.shows, v.camera, v.display, frame, pts)
-            {
+            let frame = self
+                .recorder
+                .camera_rgba
+                .as_ref()
+                .map(|(px, w, h)| (px.as_slice(), *w, *h));
+            match v.compositor.frame(
+                &self.app, v.layout, v.shows, v.camera, v.display, frame, pts,
+            ) {
                 // A frame from one tick ago is now readable, carrying its own
                 // pts. The readback is pipelined so the UI thread never waits
                 // on the rasteriser — see `composite`'s module docs.

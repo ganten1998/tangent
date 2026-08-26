@@ -345,19 +345,15 @@ impl Dx7 {
         for i in 0..6 {
             let op = v.ops[i];
             // How fast this operator's envelope runs at this pitch.
-            let rs = f32::from(op.rate_scaling) / 7.0
-                * ((sounding_pitch - 21.0) / 87.0).clamp(0.0, 1.0);
+            let rs =
+                f32::from(op.rate_scaling) / 7.0 * ((sounding_pitch - 21.0) / 87.0).clamp(0.0, 1.0);
             n.eg[i] = Eg::new(op.rate, op.level, sr, rs);
             n.step[i] = std::f32::consts::TAU * op_hz(&op, hz) / sr;
             // A patch with oscillator sync starts every operator at zero, which
             // is what makes a percussive attack repeatable. Without it they run
             // free and each note is slightly different, which is what makes a
             // pad breathe.
-            n.phase[i] = if v.osc_sync {
-                0.0
-            } else {
-                self.next_random()
-            } * std::f32::consts::TAU;
+            n.phase[i] = if v.osc_sync { 0.0 } else { self.next_random() } * std::f32::consts::TAU;
 
             let db = f32::from(op.output_level).min(99.0);
             let scaled = db + keyboard_scaling(&op, sounding_pitch) + velocity_offset(&op, vel);
@@ -523,9 +519,9 @@ impl Dx7 {
         }
         let p = self.lfo_phase;
         self.lfo_value = match self.voice.lfo_wave {
-            0 => 1.0 - 4.0 * (p - 0.5).abs(),      // triangle
-            1 => 1.0 - 2.0 * p,                    // saw down
-            2 => 2.0 * p - 1.0,                    // saw up
+            0 => 1.0 - 4.0 * (p - 0.5).abs(), // triangle
+            1 => 1.0 - 2.0 * p,               // saw down
+            2 => 2.0 * p - 1.0,               // saw up
             3 => {
                 if p < 0.5 {
                     1.0
@@ -615,12 +611,7 @@ fn level_to_db(level: u8) -> f32 {
     // Roughly three quarters of a dB per step at the top, steepening below,
     // which is where the DX7's own table bends.
     let db = (99.0 - l) * 0.75;
-    if l >= 20.0 {
-        db
-    } else {
-        db + (20.0 - l) * 1.6
-    }
-    .min(RANGE_DB)
+    if l >= 20.0 { db } else { db + (20.0 - l) * 1.6 }.min(RANGE_DB)
 }
 
 /// An operator level in the 0..=99 domain, as a linear amplitude.
@@ -739,7 +730,11 @@ mod tests {
         assert!(d.active());
         let mut out = vec![0.0_f32; 2 * 2048];
         d.render(&mut out, 2048, 2);
-        assert!(rms(&out) > 0.01, "an organ patch was inaudible: {}", rms(&out));
+        assert!(
+            rms(&out) > 0.01,
+            "an organ patch was inaudible: {}",
+            rms(&out)
+        );
 
         d.note_off(60);
         for _ in 0..400 {
@@ -789,10 +784,7 @@ mod tests {
             .filter(|w| w[0] <= 0.0 && w[1] > 0.0)
             .count();
         let hz = crossings as f32 / (tail.len() as f32 / sr);
-        assert!(
-            (hz - 440.0).abs() < 12.0,
-            "A440 came out at {hz} Hz"
-        );
+        assert!((hz - 440.0).abs() < 12.0, "A440 came out at {hz} Hz");
     }
 
     /// Every algorithm has to render without panicking and without silence,
@@ -835,7 +827,11 @@ mod tests {
         if let Ok(path) = std::env::var("IVORY_SYX_DEMO") {
             match super::super::Cartridge::load(std::path::Path::new(&path)) {
                 Ok(c) => {
-                    println!("bank {} ({} checksum)", c.name, if c.checksum_ok { "good" } else { "bad" });
+                    println!(
+                        "bank {} ({} checksum)",
+                        c.name,
+                        if c.checksum_ok { "good" } else { "bad" }
+                    );
                     for (i, v) in c.voices.iter().enumerate().take(4) {
                         banks.push((format!("{i}: {}", v.display_name()), *v));
                     }
@@ -888,7 +884,11 @@ mod tests {
             wav.extend_from_slice(&((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes());
         }
         std::fs::write(&path, wav).expect("write the demo");
-        println!("wrote {} ({:.1}s)", path.display(), left.len() as f32 / SR as f32);
+        println!(
+            "wrote {} ({:.1}s)",
+            path.display(),
+            left.len() as f32 / SR as f32
+        );
     }
 
     /// **The rate curve, against the hardware.** Three points off a real DX7,
@@ -928,7 +928,11 @@ mod tests {
             d.note_on(60, 0.8);
             d.note_off(60);
         }
-        let c_voices = d.notes.iter().filter(|n| n.pitch == 60 && !n.eg[0].finished()).count();
+        let c_voices = d
+            .notes
+            .iter()
+            .filter(|n| n.pitch == 60 && !n.eg[0].finished())
+            .count();
         assert!(
             c_voices <= 1,
             "one pitch took {c_voices} voices under the pedal — it should reuse one"
@@ -939,7 +943,10 @@ mod tests {
         }
         for p in 61u8..69 {
             let live = d.notes.iter().any(|n| n.pitch == p && n.on);
-            assert!(live, "pitch {p} found no voice — the pool was clogged by repeats");
+            assert!(
+                live,
+                "pitch {p} found no voice — the pool was clogged by repeats"
+            );
         }
     }
 
@@ -969,9 +976,15 @@ mod tests {
         // Long enough for OP1's release to finish; OP3 is still ringing.
         let mut b = vec![0.0_f32; 2 * 2048];
         d.render(&mut b, 2048, 2);
-        let ringing =
-            |d: &Dx7| d.notes.iter().any(|n| n.pitch == 60 && !n.eg.iter().all(Eg::finished));
-        assert!(ringing(&d), "the tail died before the test could threaten it");
+        let ringing = |d: &Dx7| {
+            d.notes
+                .iter()
+                .any(|n| n.pitch == 60 && !n.eg.iter().all(Eg::finished))
+        };
+        assert!(
+            ringing(&d),
+            "the tail died before the test could threaten it"
+        );
 
         // A new note must take one of the fifteen silent slots, not the tail.
         d.note_on(62, 0.9);
@@ -986,7 +999,10 @@ mod tests {
             let mut b = vec![0.0_f32; 2 * 2048];
             d.render(&mut b, 2048, 2);
         }
-        assert!(!d.active(), "`sounding` leaked: active() with nothing ringing");
+        assert!(
+            !d.active(),
+            "`sounding` leaked: active() with nothing ringing"
+        );
     }
 
     /// **The default patch has to still be sounding when the note is.** A patch
@@ -1047,6 +1063,9 @@ mod tests {
             d.render(&mut o, 2048, 2);
             rms(&o)
         };
-        assert!(soft < loud * 0.6, "soft {soft} was not quieter than loud {loud}");
+        assert!(
+            soft < loud * 0.6,
+            "soft {soft} was not quieter than loud {loud}"
+        );
     }
 }

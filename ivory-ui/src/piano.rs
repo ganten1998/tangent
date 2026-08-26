@@ -208,7 +208,7 @@ pub fn draw(
     }
 
     if s.show_piano_note_names {
-        draw_names(painter, rect, display_notes, s);
+        draw_names(painter, rect, display_notes, sustain_down, s);
     }
 }
 
@@ -221,7 +221,13 @@ pub fn draw(
 ///
 /// Near the bottom of each key, because that is where a sticker goes and
 /// because it keeps the letters clear of the black keys entirely.
-fn draw_names(painter: &Painter, rect: Rect, display_notes: &HashSet<u8>, s: &Settings) {
+fn draw_names(
+    painter: &Painter,
+    rect: Rect,
+    display_notes: &HashSet<u8>,
+    sustain_down: bool,
+    s: &Settings,
+) {
     let w = rect.width() as f64;
     let h = rect.height() as f64;
     let white_key_w = w / WHITE_KEYS as f64;
@@ -236,21 +242,43 @@ fn draw_names(painter: &Painter, rect: Rect, display_notes: &HashSet<u8>, s: &Se
         return;
     }
     let font = FontId::new(size, fonts::courier_bold());
-    let lit_ink = |lit: bool, on_black: bool| {
-        if lit {
-            // A lit key is the user's own colour, which can be anything, so the
-            // label goes to whichever end of the scale it is furthest from.
-            let c = if on_black {
+    // The SAME pair the keys were filled from — dark mode swaps them, and the
+    // ink has to follow the swap.
+    let (white_idle, black_idle) = idle_colors(s);
+
+    // **MEASURED against the key it lands on, every time.**
+    //
+    // The four idle/lit cases used to be two fixed greys — 0x30 on a natural
+    // and 0xD0 on a sharp — which is right on exactly one keyboard: the bone
+    // one this app shipped with. A theme that picks its own key colours
+    // breaks it, and DARK MODE breaks it twice over, because the naturals and
+    // the sharps SWAP (`idle_colors`): the dark grey meant for ivory lands on
+    // a near-black natural and the light grey meant for a black key lands on
+    // an ivory one. Both illegible at once, which is what the owner
+    // photographed.
+    //
+    // A lit key was already measured, by a brightness sum. That is the rule
+    // `wants_light_ink` exists to replace — it MEASURES both candidates
+    // instead of testing a threshold — so all four cases go through it now,
+    // against the colour actually painted.
+    let ink_on = |lit: bool, on_black: bool| {
+        let bg = if lit {
+            if sustain_down {
+                s.sustain_color.to_color32()
+            } else if on_black {
                 s.black_key_active_color.to_color32()
             } else {
                 s.white_key_active_color.to_color32()
-            };
-            let bright = u32::from(c.r()) + u32::from(c.g()) + u32::from(c.b()) > 3 * 140;
-            if bright { Color32::from_gray(0x18) } else { Color32::from_gray(0xF0) }
+            }
         } else if on_black {
-            Color32::from_gray(0xD0)
+            black_idle
         } else {
-            Color32::from_gray(0x30)
+            white_idle
+        };
+        if crate::recorder_panel::wants_light_ink(bg) {
+            crate::recorder_panel::INK_LIGHT
+        } else {
+            crate::recorder_panel::INK_DARK
         }
     };
 
@@ -268,7 +296,7 @@ fn draw_names(painter: &Painter, rect: Rect, display_notes: &HashSet<u8>, s: &Se
             Align2::CENTER_CENTER,
             pc_name(note % 12, s.prefer_flats),
             font.clone(),
-            lit_ink(display_notes.contains(&note), false),
+            ink_on(display_notes.contains(&note), false),
         );
     }
 
@@ -290,7 +318,7 @@ fn draw_names(painter: &Painter, rect: Rect, display_notes: &HashSet<u8>, s: &Se
                 Align2::CENTER_CENTER,
                 pc_name(note % 12, s.prefer_flats),
                 font.clone(),
-                lit_ink(display_notes.contains(&note), true),
+                ink_on(display_notes.contains(&note), true),
             );
         }
     }
@@ -357,6 +385,54 @@ pub fn hit_test(x: f32, y: f32, w: f32, h: f32) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    /// **Every note name is legible, on every theme, in BOTH modes.**
+    ///
+    /// The owner's screenshot: names printed in two fixed greys chosen for
+    /// the bone keyboard this app shipped with. A theme picking its own key
+    /// colours breaks that, and dark mode breaks it twice over, because the
+    /// naturals and the sharps swap — so the grey meant for ivory lands on a
+    /// near-black key and vice versa.
+    ///
+    /// Four fills per keyboard (natural and sharp, idle and lit) times two
+    /// modes times every factory theme. 4.5:1 throughout, the same bar the
+    /// strip faces answer to.
+    #[test]
+    fn every_theme_prints_readable_note_names_in_both_modes() {
+        let mut bad: Vec<String> = Vec::new();
+        for theme in crate::theme::factory() {
+            for dark in [false, true] {
+                let mut s = Settings::default();
+                theme.apply(&mut s);
+                s.dark_mode = dark;
+                let (white_idle, black_idle) = idle_colors(&s);
+                let cases = [
+                    ("natural idle", white_idle),
+                    ("sharp idle", black_idle),
+                    ("natural lit", s.white_key_active_color.to_color32()),
+                    ("sharp lit", s.black_key_active_color.to_color32()),
+                    ("sustain", s.sustain_color.to_color32()),
+                ];
+                for (what, bg) in cases {
+                    let ink = if crate::recorder_panel::wants_light_ink(bg) {
+                        crate::recorder_panel::INK_LIGHT
+                    } else {
+                        crate::recorder_panel::INK_DARK
+                    };
+                    let ratio = crate::recorder_panel::contrast_ratio(bg, ink);
+                    if ratio < 4.5 {
+                        bad.push(format!(
+                            "{} {}: {what} {ratio:.2}:1",
+                            theme.name,
+                            if dark { "dark" } else { "light" },
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(bad.is_empty(), "note names unreadable:\n  {}", bad.join("\n  "));
+    }
 
     #[test]
     fn there_are_52_white_and_36_black_keys() {
