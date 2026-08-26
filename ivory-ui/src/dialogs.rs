@@ -6634,6 +6634,60 @@ mod tests {
     /// frame, before the platform has reported the main window's rect; handing
     /// it a rect at (0, 0) made it centre on the corner of the screen, which
     /// looks like a placement bug and is really a "we did not know" bug.
+
+    /// **The Welcome card is the receipt for your settings.**
+    ///
+    /// The owner's rule, and it needs no special case to hold. A FIRST
+    /// install has no settings file, so it comes up on the Default theme,
+    /// whose strip face IS the shipped bone — the card is black on ivory and
+    /// matches the default right-click menus exactly, which is what a first
+    /// launch should look like.
+    ///
+    /// An update or a reinstall keeps `settings.json` — it lives beside the
+    /// config, not inside the bundle — so the theme survives, and the card
+    /// comes up wearing it. Somebody who has themed their desk can SEE their
+    /// settings were kept before they have clicked anything.
+    #[test]
+    fn the_welcome_card_wears_the_theme_and_a_fresh_install_is_the_default() {
+        // First install: nothing carried over.
+        let fresh = crate::settings::Settings::default();
+        assert!(fresh.show_welcome, "a first launch does not greet anybody");
+        let face = fresh.fx_strip_color.to_color32();
+        let card = theme(face);
+        assert_eq!(
+            (card.bg.r(), card.bg.g(), card.bg.b()),
+            (0xE3, 0xD9, 0xBD),
+            "a first-install Welcome card is not the shipped bone"
+        );
+        assert!(
+            !crate::recorder_panel::wants_light_ink(card.bg),
+            "a first-install Welcome card is not black on ivory"
+        );
+        // And it is the SAME surface the default right-click menu is, which
+        // is the whole of "matches the default theme's context menus".
+        let menu = crate::menu::colors(false, face);
+        assert_eq!(card.bg, menu.bg, "the card and the menu disagree on the default");
+        assert_eq!(card.text, menu.text, "the card and the menu disagree on the ink");
+
+        // An update: the settings file survived, so the theme did.
+        let mut kept = crate::settings::Settings::default();
+        let mut themed = 0;
+        for t in crate::theme::factory().into_iter().skip(1) {
+            t.apply(&mut kept);
+            let card = theme(kept.fx_strip_color.to_color32());
+            if card.bg != Color32::from_rgb(0xE3, 0xD9, 0xBD) {
+                themed += 1;
+            }
+            // Whatever it wears, it has to be readable — the card is a
+            // paragraph of text and nothing else.
+            let r = crate::recorder_panel::contrast_ratio(card.text, card.bg);
+            assert!(r >= 4.5, "{}: the Welcome card reads at {r:.2}:1", t.name);
+        }
+        assert!(
+            themed > 8,
+            "only {themed} of the themes changed the Welcome card at all"
+        );
+    }
     #[test]
     fn a_dialog_centres_on_the_window_or_declines_to_place_itself() {
         let size = Vec2::new(400.0, 300.0);
