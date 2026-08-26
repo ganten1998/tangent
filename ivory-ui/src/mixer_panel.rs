@@ -94,6 +94,12 @@ impl StripView<'_> {
 /// Scale a face's channels, keeping its hue — the same trick the band's
 /// `shade` uses, so a themed strip darkens into its own colour rather than
 /// into grey.
+/// Blend two colours, `t` of the way from `a` to `b`.
+fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+    let f = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t) as u8;
+    Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
+}
+
 fn shade_face(c: Color32, k: f32) -> Color32 {
     let f = |v: u8| (f32::from(v) * k).clamp(0.0, 255.0) as u8;
     Color32::from_rgb(f(c.r()), f(c.g()), f(c.b()))
@@ -895,12 +901,29 @@ fn ink(view: &MixerView<'_>) -> Ink {
     } else {
         themed
     };
+    // **The ink follows the FACE, exactly as the band's ink follows the
+    // band.** Every word on a strip - the name, the input chip, the bay
+    // labels, the dial ticks and their readouts, the dB line, M/S/R and the
+    // plus on an empty slot - was one fixed near-black, which is right on the
+    // bone face this desk ships with and unreadable on any dark one. The
+    // owner's screenshot showed a whole rack of dark-on-dark. The strip is a
+    // surface like any other: what is printed on it has to answer to how
+    // light it is.
+    let dark_face = crate::recorder_panel::wants_light_ink(face);
+    let engrave = if dark_face {
+        Color32::from_rgb(0xE8, 0xDC, 0xC0)
+    } else {
+        Color32::from_rgb(0x24, 0x20, 0x1A)
+    };
     Ink {
         wood,
         face,
         chip: view.input_chip,
-        engrave: Color32::from_rgb(0x24, 0x20, 0x1A),
-        faint: Color32::from_rgb(0x24, 0x20, 0x1A).gamma_multiply(0.55),
+        engrave,
+        // Secondary text: pulled toward the face rather than made
+        // transparent, so it reads as quieter ink on either ground instead of
+        // fading into the panel.
+        faint: mix(engrave, face, 0.42),
         // Dark enough to read as a well rather than as a lighter panel: at
         // rest a meter should look like somewhere a level would go.
         track: Color32::from_rgb(0x1A, 0x17, 0x12),
@@ -1955,6 +1978,43 @@ mod tests {
 
     fn rect() -> Rect {
         Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(1300.0, 420.0))
+    }
+
+    /// **What is printed on a strip is legible on the strip.**
+    ///
+    /// The owner sent a screenshot of a themed rack where the track titles,
+    /// the icons, the bay labels, the dial ticks and readouts, the dB line,
+    /// M/S/R and the plus on an empty slot were all dark ink on a dark face.
+    /// The ink was one fixed near-black — right on the bone face this desk
+    /// ships with, unreadable on any dark one a theme sets. This holds the
+    /// rule for every theme the app can wear.
+    #[test]
+    fn every_theme_prints_legibly_on_its_own_strip_face() {
+        for t in crate::theme::factory() {
+            let Some(strip) = t.fx_strip else { continue };
+            let mut v = a_view();
+            v.fx_strip = strip.to_color32();
+            for dark in [false, true] {
+                v.dark_mode = dark;
+                let p = ink(&v);
+                let c = crate::recorder_panel::contrast_ratio(p.engrave, p.face);
+                assert!(
+                    c >= 4.5,
+                    "{}{}: the ink is {c:.1}:1 on the strip face",
+                    t.name,
+                    if dark { " (dark mode)" } else { "" }
+                );
+                // And the quieter ink still has to be readable, not merely
+                // present: it carries the input chip and the bay labels.
+                let f = crate::recorder_panel::contrast_ratio(p.faint, p.face);
+                assert!(
+                    f >= 2.2,
+                    "{}{}: the secondary ink is {f:.1}:1 on the strip face",
+                    t.name,
+                    if dark { " (dark mode)" } else { "" }
+                );
+            }
+        }
     }
 
     /// **A channel that routes gets a button and a strip for each route.**
