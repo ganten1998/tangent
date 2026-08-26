@@ -1335,7 +1335,16 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             // "my bad" screenshot.
             painter.rect_filled(row.panel, 0.0, p.empty_ground);
         }
-        let ink_on = if luma(face) > 140.0 { p.engrave } else { p.hdr_face };
+        // MEASURED, not thresholded — the header plate wears the lane's own
+        // colour, and the palettes now hand out sixteen of them per set. A
+        // brightness threshold is the mechanism `wants_light_ink` exists to
+        // replace: a mid tone sits under any sensible cutoff and still takes
+        // dark ink far better than light.
+        let ink_on = if crate::recorder_panel::wants_light_ink(face) {
+            p.hdr_face
+        } else {
+            p.engrave
+        };
         painter.text(
             Pos2::new(plate.left() + 4.0, plate.center().y),
             Align2::LEFT_CENTER,
