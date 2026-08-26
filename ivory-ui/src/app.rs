@@ -1564,6 +1564,24 @@ impl IvoryApp {
     /// is made here. A host that is given its notes never calls this, which is
     /// also what makes the MIDI menu row and the picker dialog inert rather
     /// than merely hidden.
+    /// Run the MIDI priority chain now. Called once, after the first frame is
+    /// on screen — see `MidiPorts::auto_connect`.
+    /// Open a named MIDI port — the `-p NAME` path, deferred with the rest.
+    pub fn connect_midi_named(&mut self, name: &str) -> Result<(), String> {
+        let tx = self.midi_sender();
+        match self.ports.as_mut() {
+            Some(p) => p.connect(name, tx),
+            None => Err("no MIDI ports".to_owned()),
+        }
+    }
+
+    pub fn midi_auto_connect(&mut self) {
+        let tx = self.midi_sender();
+        if let Some(p) = self.ports.as_mut() {
+            p.auto_connect(tx);
+        }
+    }
+
     pub fn set_ports(&mut self, ports: Option<Box<dyn MidiPorts>>) {
         self.ports = ports;
     }

@@ -100,6 +100,10 @@ impl MidiPorts for DeviceMidi {
         midi::list_port_names()
     }
 
+    fn auto_connect(&mut self, tx: mpsc::Sender<MidiEvent>) {
+        DeviceMidi::auto_connect(self, tx);
+    }
+
     fn connect(&mut self, name: &str, tx: mpsc::Sender<MidiEvent>) -> Result<(), String> {
         // Close the old port FIRST (parity): some drivers refuse a second open
         // of the same device, so holding both across the switch fails on the
@@ -404,6 +408,12 @@ pub struct DesktopApp {
     recorder: Recorder,
     /// The launch splash, until it has been earned and faded. `None` after.
     splash: Option<Splash>,
+    /// The MIDI port to open once the window is up: `Some(Some(name))` from
+    /// `-p`, `Some(None)` for the priority chain, `None` once it has run.
+    /// See where it is taken for why it is not done in the constructor.
+    pending_midi: Option<Option<String>>,
+    /// A frame has reached the screen. Deferred startup work waits for it.
+    painted_once: bool,
     /// The DX7 cartridge the built-in is playing out of, if one is loaded.
     ///
     /// **The host holds the voices; the UI holds the names.** Kept here rather
@@ -5369,14 +5379,16 @@ impl DesktopApp {
         let (tap, timebase) = (device.tap(), device.timebase());
         // `-p NAME` beats the priority chain, and a bad name is not fatal: the
         // app opens with no MIDI, which is the same outcome as no device.
-        match cli_port {
-            Some(name) => {
-                if let Err(e) = device.connect(&name, app.midi_sender()) {
-                    eprintln!("could not open MIDI port {name:?}: {e}");
-                }
-            }
-            None => device.auto_connect(app.midi_sender()),
-        }
+        // **NOT opened here.** Opening a MIDI client is the first CoreMIDI
+        // call the process makes and it pays for the whole subsystem coming
+        // up — measured at 695 ms of the 790 ms before the first frame, on a
+        // machine where the window and the GPU together took 100. The app
+        // looked like it hung, and the splash could not appear until it was
+        // over, because the splash is painted BY the app: it was proof the
+        // load had finished rather than cover for it happening.
+        //
+        // It is remembered and run on the frame after the splash is up.
+        let pending_midi = cli_port;
         let midi_lane = device.lane();
         app.set_ports(Some(Box::new(device)));
 
@@ -5477,6 +5489,8 @@ impl DesktopApp {
         };
 
         let mut me = Self {
+            pending_midi: Some(pending_midi),
+            painted_once: false,
             midi_lane,
             app,
             #[cfg(feature = "recorder")]
@@ -5625,6 +5639,22 @@ impl eframe::App for DesktopApp {
         // Before the frame, not after: the app decides whether to raise the
         // Welcome card while it paints, and a flag set afterwards would be one
         // frame stale — which is exactly one frame of card over wordmark.
+        // **After the first frame, never during it.** The splash is already
+        // on screen by the time this runs, so the ~700 ms the MIDI subsystem
+        // takes to come up is spent behind it rather than in front of a blank
+        // window. `painted_once` is set at the bottom of this function.
+        if self.painted_once {
+            if let Some(port) = self.pending_midi.take() {
+                match port {
+                    Some(name) => {
+                        if let Err(e) = self.app.connect_midi_named(&name) {
+                            eprintln!("could not open MIDI port {name:?}: {e}");
+                        }
+                    }
+                    None => self.app.midi_auto_connect(),
+                }
+            }
+        }
         self.app.set_splash_up(self.splash.is_some());
         // **Where the cursor is during a FILE DRAG.** Asked of the OS,
         // because the window toolkit will not say — see `drag_pointer`.
@@ -5633,6 +5663,7 @@ impl eframe::App for DesktopApp {
         #[cfg(feature = "recorder")]
         self.after_frame(ctx, frame);
         self.paint_splash(ctx);
+        self.painted_once = true;
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
