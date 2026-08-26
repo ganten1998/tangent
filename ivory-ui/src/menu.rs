@@ -135,7 +135,6 @@ pub enum MenuAction {
     ToggleTheoryView(crate::theory_panel::View),
     /// Put every theory element back, in the numbered order. The way out of a
     /// collapsed band without having to remember which number is which.
-    ShowAllTheory,
     /// D-UI-17: whether the theory band follows live playing or stays put.
     ToggleTheoryFollowsMidi,
     /// D-UI-16: pop the guitar view into its own window, and put it back.
@@ -2197,7 +2196,6 @@ mod tests {
             (MenuAction::ToggleKeytoggle, KeyAction::ToggleKeytoggle),
             (MenuAction::ToggleNotePreference, KeyAction::ToggleNotePreference),
             (MenuAction::ToggleNoteNames, KeyAction::ToggleNoteNames),
-            (MenuAction::ShowAllTheory, KeyAction::CycleTheory),
             (
                 MenuAction::ToggleTheoryView(crate::theory_panel::View::Circle),
                 KeyAction::ToggleTheoryElement(1),
