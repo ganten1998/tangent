@@ -115,6 +115,13 @@ enum Cmd {
     /// the tracker lives on THIS thread, not in the audio callback — there is
     /// nothing to make lock-free.
     ClearClip,
+    /// Choose different inputs on the OPEN stream.
+    ///
+    /// **A command rather than a reopen.** The rings carry whole device
+    /// frames, so which inputs a take contains is decided where the ring is
+    /// read — here, on the writer's own thread — and choosing one no longer
+    /// costs a device cycle. See `CaptureSink::set_picks`.
+    Picks(audio::Picks),
     Quit,
 }
 
@@ -610,7 +617,15 @@ struct Audio {
     running: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     /// The live tap, until the engine takes it. See `Session::take_monitor`.
-    monitor: Option<(rtrb::Consumer<f32>, u16, [u8; crate::instrument::INPUTS], u32)>,
+    /// The device's channel count — what the rings carry.
+    dev_channels: usize,
+    monitor: Option<(
+        rtrb::Consumer<f32>,
+        u16,
+        [u8; crate::instrument::INPUTS],
+        u32,
+        audio::Picks,
+    )>,
 }
 
 impl Audio {
@@ -650,6 +665,8 @@ impl Audio {
         // from what was asked for would then point every strip at the wrong
         // column of the block.
         let sink_widths = sink.widths::<{ crate::instrument::INPUTS }>();
+        let dev_channels = sink.device_channels();
+        let monitor_picks = sink.picks();
         // **The device's own block, for the monitor's backlog ceiling.**
         // `Default` means cpal did not say, so this takes the largest buffer
         // the app offers rather than guessing small — a ceiling that is too
@@ -785,6 +802,17 @@ impl Audio {
                         // history. Acknowledging a red light must not erase the
                         // evidence that the take was silent.
                         Ok(Cmd::ClearClip) => writer.tracker.clear_clip(),
+                        // **Refused while a file is open**, and the guard is
+                        // here as well as at the caller: the WAV header names
+                        // a channel count, and a layout that changed halfway
+                        // would leave the second half of the file interleaved
+                        // differently from the first, with nothing downstream
+                        // able to notice.
+                        Ok(Cmd::Picks(p)) => {
+                            if writer.wav.is_none() {
+                                writer.sink.set_picks(p);
+                            }
+                        }
                         Ok(Cmd::Quit) | Err(mpsc::TryRecvError::Disconnected) => break,
                         Err(mpsc::TryRecvError::Empty) => {}
                     }
@@ -824,7 +852,21 @@ impl Audio {
             // how much of the ring is legitimately in flight and how much is
             // history to be thrown away. NOT the take's width: those parted
             // company when the take became the desk.
-            monitor: monitor.map(|m| (m, config.channels, sink_widths, in_block)),
+            // **The monitor ring's width is the DEVICE's, not the take's.**
+            // The rings carry whole device frames now so that choosing an
+            // input costs nothing (see `capture_channel_monitored`); the
+            // picks travel alongside so the renderer can find each strip's
+            // columns in them.
+            dev_channels,
+            monitor: monitor.map(|m| {
+                (
+                    m,
+                    dev_channels as u16,
+                    sink_widths,
+                    in_block,
+                    monitor_picks,
+                )
+            }),
         })
     }
 
@@ -965,6 +1007,9 @@ impl Summary {
 /// The recorder, as the app holds it.
 pub struct Session {
     timebase: Timebase,
+    /// The inputs the open stream is honouring. Kept here because it survives
+    /// the writer thread and is what the monitor's layout is derived from.
+    picks: audio::Picks,
     tap: Arc<RawMidiTap>,
     /// **The microphone fader.** `f32` bits, shared with whatever writer thread
     /// is currently draining the input.
@@ -1065,6 +1110,7 @@ impl Session {
         let (tap_tx, tap_rx) = mpsc::channel();
         Self {
             timebase,
+            picks: audio::Picks::EVERYTHING,
             tap,
             audio: None,
             audio_error: None,
@@ -1143,9 +1189,50 @@ impl Session {
     ///
     /// Taken rather than borrowed: the ring's read end belongs to exactly one
     /// consumer, and that is the engine's render thread.
+    /// Choose different inputs on the OPEN device.
+    ///
+    /// **The whole point of the device-wide rings**: this used to be a close
+    /// and a reopen, which is tens of milliseconds of silence in the middle
+    /// of a session on the gesture people make most while building a desk.
+    /// Now it is a message to the writer thread.
+    ///
+    /// Returns whether it was taken. `false` means the caller must fall back
+    /// to reopening — there is no device, or a take is running and the file's
+    /// channel count is already written down.
+    pub fn set_picks(&mut self, picks: audio::Picks) -> bool {
+        if self.state.is_active() {
+            return false;
+        }
+        let Some(a) = self.audio.as_ref() else {
+            return false;
+        };
+        if a.cmds.send(Cmd::Picks(picks)).is_err() {
+            return false;
+        }
+        self.picks = picks;
+        true
+    }
+
+    /// The open device's own channel count — the width the capture rings
+    /// carry. `None` when nothing is open.
+    pub fn device_channels(&self) -> Option<usize> {
+        self.audio.as_ref().map(|a| a.dev_channels)
+    }
+
+    /// The picks the open stream is honouring, for the monitor's layout.
+    pub fn picks(&self) -> audio::Picks {
+        self.picks
+    }
+
     pub fn take_monitor(
         &mut self,
-    ) -> Option<(rtrb::Consumer<f32>, u16, [u8; crate::instrument::INPUTS], u32)> {
+    ) -> Option<(
+        rtrb::Consumer<f32>,
+        u16,
+        [u8; crate::instrument::INPUTS],
+        u32,
+        audio::Picks,
+    )> {
         self.audio.as_mut().and_then(|a| a.monitor.take())
     }
 
@@ -1304,6 +1391,7 @@ impl Session {
         });
         match opened {
             Ok(a) => {
+                self.picks = picks;
                 if let Some(t) = tap {
                     let _ = a.cmds.send(Cmd::Plugin(Some(Box::new(t))));
                 }
@@ -3678,6 +3766,9 @@ impl PluginAudio {
                         // republishes its own latch every cycle, so clearing
                         // the shared meters alone would be undone in 4 ms.
                         Ok(Cmd::ClearClip) => w.tracker.clear_clip(),
+                        // The instrument-only writer has no input to choose:
+                        // it exists precisely because there is no device.
+                        Ok(Cmd::Picks(_)) => {}
                         Ok(Cmd::Quit) | Err(mpsc::TryRecvError::Disconnected) => break,
                         Err(mpsc::TryRecvError::Empty) => {}
                     }

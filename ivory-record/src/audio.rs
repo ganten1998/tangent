@@ -883,6 +883,24 @@ impl Picks {
         None
     }
 
+    /// How many channels each pick contributes, in order — the layout the
+    /// monitor's other end shares out between input strips.
+    ///
+    /// On `Picks` rather than only on the sink, because the UI thread has to
+    /// compute it when picks change LIVE, without the sink (which lives on
+    /// the writer's thread).
+    pub fn widths<const N: usize>(&self, device_channels: usize) -> [u8; N] {
+        if self.is_empty() {
+            let mut out = [0u8; N];
+            if let Some(first) = out.first_mut() {
+                *first = device_channels.min(u8::MAX as usize) as u8;
+            }
+            return out;
+        }
+        let mut it = self.iter();
+        std::array::from_fn(|_| it.next().map_or(0, |p| p.channels() as u8))
+    }
+
     /// Drop the picks this device cannot honour, keeping the rest.
     ///
     /// **Per pick, not all-or-nothing.** An interface that came back from a hub
@@ -1267,18 +1285,39 @@ pub fn capture_channel_monitored(
     } else {
         picks.channels()
     };
-    let (sample_tx, sample_rx) = RingBuffer::<f32>::new(ring_frames.max(1) * channels);
+    // **The rings carry WHOLE DEVICE FRAMES, whatever is picked.**
+    //
+    // The picks used to decide the ring's width, which is why choosing an
+    // input had to close the device and open it again: the layout was baked
+    // into the buffers. That reopen is tens of milliseconds of silence in the
+    // middle of a session, on the one gesture people make most while
+    // building a desk.
+    //
+    // Fixing the width at the device's own channel count makes a pick change
+    // free. It also makes it SAFE, which matters more here than the
+    // milliseconds: a frame in this ring means exactly one thing for the life
+    // of the stream, so a pick that changes while the callback is mid-block
+    // cannot leave a half-old frame for the writer to interleave wrongly -
+    // the failure this module's rule 1 exists to prevent. The picks move to
+    // the two places that READ the ring, both of which can change their mind
+    // between blocks without telling the audio thread anything.
+    //
+    // The cost is honest: the ring is as wide as the interface rather than as
+    // wide as what is used, and the callback copies every channel. Three
+    // seconds of an eighteen-in interface is about ten megabytes, and the
+    // copy is a straight run rather than the strided per-sample lookup it
+    // replaces - the callback does LESS work than it did.
+    let (sample_tx, sample_rx) = RingBuffer::<f32>::new(ring_frames.max(1) * device_channels);
     let (mark_tx, mark_rx) = RingBuffer::<TimingMark>::new(mark_slots.max(1));
     let mut source = CaptureSource {
         samples: sample_tx,
         marks: mark_tx,
         stats: Arc::clone(&stats),
-        channels,
+        channels: device_channels,
         device_channels,
-        picks,
         frames: 0,
         stamp_epoch: None,
-        scratch: vec![0.0; CHUNK_FRAMES * channels],
+        scratch: vec![0.0; CHUNK_FRAMES * device_channels],
         monitor: None,
     };
     let sink = CaptureSink {
@@ -1286,10 +1325,12 @@ pub fn capture_channel_monitored(
         marks: mark_rx,
         stats,
         channels,
+        device_channels,
         picks,
+        lift: Vec::new(),
     };
     let monitor = (monitor_frames > 0).then(|| {
-        let (tx, rx) = RingBuffer::<f32>::new(monitor_frames * channels);
+        let (tx, rx) = RingBuffer::<f32>::new(monitor_frames * device_channels);
         source.monitor = Some(tx);
         rx
     });
@@ -1313,9 +1354,6 @@ pub struct CaptureSource {
     /// channel is picked, and confusing them swaps the interleaving for the
     /// rest of the take — which is rule 1 of `accept`, one level down.
     device_channels: usize,
-    /// Which inputs to keep, already range-checked against `device_channels`.
-    /// Empty means the whole device, in its own order.
-    picks: Picks,
     frames: u64,
     stamp_epoch: Option<Nanos>,
     scratch: Vec<f32>,
@@ -1390,37 +1428,16 @@ impl CaptureSource {
             let want = chunk_frames.min(frames_in - pushed);
             let n = want * ch;
             let dst = &mut self.scratch[..n];
-            if self.picks.is_empty() {
-                // Everything, in order: the straight-through case, and the only
-                // one where `ch_in == ch` so a flat zip over the slice is right.
-                let src = &data[pushed * ch_in..pushed * ch_in + want * ch_in];
-                for (d, s) in dst.iter_mut().zip(src) {
-                    *d = f32::from_sample(*s);
-                }
-            } else {
-                // One input of many, strided. `dst` is one sample per frame
-                // here, so the index into `data` is a frame number times the
-                // DEVICE's channel count — the one place where using `ch` would
-                // compile, run, and quietly read the wrong input.
-                // Some inputs of many, strided. `dst` holds `ch` samples per
-                // frame here — the picks' channels laid end to end — so the
-                // index into `data` is a frame number times the DEVICE's
-                // channel count plus that output channel's own source, which is
-                // the one place where using `ch` would compile, run, and
-                // quietly read the wrong input.
-                for (i, frame) in dst.chunks_exact_mut(ch).enumerate() {
-                    let at = (pushed + i) * ch_in;
-                    for (c, d) in frame.iter_mut().enumerate() {
-                        // Checked at construction; `unwrap_or(0)` rather than an
-                        // index so a pick that slipped through cannot panic in
-                        // the audio callback.
-                        let src = self.picks.source(c, ch_in).unwrap_or(0);
-                        *d = f32::from_sample(data[at + src]);
-                    }
-                }
+            // **Everything, in order.** `ch == ch_in` for the life of the
+            // stream now (see `capture_channel_monitored`), so this is a flat
+            // run over the buffer and the only case there is. Choosing inputs
+            // happens where the ring is READ.
+            let src = &data[pushed * ch_in..pushed * ch_in + want * ch_in];
+            for (d, s) in dst.iter_mut().zip(src) {
+                *d = f32::from_sample(*s);
             }
-            // The monitor gets the same samples, at the same point: after the
-            // channel pick, before the take's ring. What does not fit whole is
+            // The monitor gets the same samples, at the same point: whole
+            // device frames, before the take's ring. What does not fit whole is
             // dropped and not counted — a listener missing a millisecond is not
             // a take losing a frame, and putting the two in one counter would
             // make an idle monitor look like a failing recorder. Rule 1 binds
@@ -1508,9 +1525,48 @@ pub struct CaptureSink {
     /// downstream that shares the block out between input strips would then be
     /// reading the wrong columns — silently, and with plausible audio in them.
     picks: Picks,
+    /// The device's own width, which is what the ring carries.
+    device_channels: usize,
+    /// Scratch for lifting device frames out of the ring before the picked
+    /// channels are copied out of them. Owned so the writer thread's drain
+    /// allocates once rather than once a block.
+    lift: Vec<f32>,
 }
 
 impl CaptureSink {
+    /// The width the RINGS carry — the device's own channel count, fixed for
+    /// the life of the stream. Different from [`channels`](Self::channels),
+    /// which is what the TAKE contains after the picks are applied.
+    pub fn device_channels(&self) -> usize {
+        self.device_channels
+    }
+
+    /// The picks in force, for the monitor's other end to map with.
+    pub fn picks(&self) -> Picks {
+        self.picks
+    }
+
+    /// Choose different inputs, without touching the device.
+    ///
+    /// **This is what a pick change costs now: a field write.** The ring
+    /// carries whole device frames whatever is picked, so nothing about the
+    /// stream, the buffers or the callback has to change — only which columns
+    /// are copied out of it, which is decided here on the writer's own
+    /// thread.
+    ///
+    /// The caller must not do this during a take: the WAV header is written
+    /// with a channel count, and changing the layout mid-file would leave the
+    /// second half interleaved differently from the first. `Session` holds
+    /// that rule.
+    pub fn set_picks(&mut self, picks: Picks) {
+        let picks = picks.fitted(self.device_channels);
+        self.channels = if picks.is_empty() {
+            self.device_channels
+        } else {
+            picks.channels()
+        };
+        self.picks = picks;
+    }
     pub fn channels(&self) -> usize {
         self.channels
     }
@@ -1535,7 +1591,7 @@ impl CaptureSink {
 
     /// Frames sitting in the ring right now.
     pub fn frames_available(&self) -> usize {
-        self.samples.slots() / self.channels
+        self.samples.slots() / self.device_channels
     }
 
     /// Take the next timing mark, if the callback has produced one.
@@ -1545,22 +1601,43 @@ impl CaptureSink {
 
     /// Move up to `frames` whole frames into `out`, appending. Returns frames moved.
     pub fn pop_frames(&mut self, frames: usize, out: &mut Vec<f32>) -> usize {
+        let dev = self.device_channels;
         let ch = self.channels;
-        let available = self.samples.slots() / ch;
+        let available = self.samples.slots() / dev;
         let take = frames.min(available);
         if take == 0 {
             return 0;
         }
-        let start = out.len();
-        out.resize(start + take * ch, 0.0);
-        let (popped, _) = self.samples.pop_partial_slice(&mut out[start..]);
-        // Round down on the way out as well. Belt and braces: the push side
+        // Lifted whole-device-frame first, then the picked columns copied out
+        // of it. Two steps rather than one because the ring's width and the
+        // file's width are different questions now — see `set_picks`.
+        self.lift.clear();
+        self.lift.resize(take * dev, 0.0);
+        let (popped, _) = self.samples.pop_partial_slice(&mut self.lift);
+        // Round down to whole DEVICE frames. Belt and braces: the push side
         // already guarantees whole frames, but a half frame reaching the WAV
         // writer swaps the channels for the rest of the file and there is no
         // downstream check that would notice.
-        let whole = popped.len() / ch * ch;
-        out.truncate(start + whole);
-        whole / ch
+        let got = popped.len() / dev;
+        if got == 0 {
+            return 0;
+        }
+        let start = out.len();
+        out.resize(start + got * ch, 0.0);
+        if self.picks.is_empty() {
+            // The whole device, in its own order: one flat run.
+            out[start..start + got * ch].copy_from_slice(&self.lift[..got * dev]);
+        } else {
+            for f in 0..got {
+                for c in 0..ch {
+                    // `unwrap_or(0)` rather than an index: a pick that
+                    // slipped through must not panic the writer thread.
+                    let src = self.picks.source(c, dev).unwrap_or(0);
+                    out[start + f * ch + c] = self.lift[f * dev + src];
+                }
+            }
+        }
+        got
     }
 
     /// Move every whole frame currently in the ring into `out`.
@@ -2769,6 +2846,63 @@ mod tests {
             assert_eq!(out[at + 1], want(3), "frame {frame}: the pair's left moved");
             assert_eq!(out[at + 2], want(4), "frame {frame}: the pair's right moved");
         }
+    }
+
+    /// **Choosing a different input on an OPEN stream changes what the take
+    /// keeps, and changes nothing else.**
+    ///
+    /// This is the whole point of the device-wide rings. Picking an input used
+    /// to close the device and open it again — tens of milliseconds of
+    /// silence, on the gesture people make most while building a desk. Now the
+    /// stream, the buffers and the callback are untouched and only the reading
+    /// of the ring moves.
+    ///
+    /// The strong claim here is the second half: frames the callback pushed
+    /// BEFORE the change are still whole device frames, so they are read
+    /// correctly under the new picks. There is no window in which a frame
+    /// means two things.
+    #[test]
+    fn picking_a_different_input_on_an_open_stream_needs_no_reopen() {
+        use ChannelPick::Mono;
+        let (mut src, mut sink) = capture_channel_from(4, Picks::one(Mono(0)), 64, 64, stats());
+        assert_eq!(sink.channels(), 1);
+
+        // Two frames arrive under the FIRST pick and are left in the ring.
+        src.accept(&frames(4, 2, 0), Some(0), 0);
+        // The choice changes with the stream still open and running.
+        sink.set_picks(Picks::one(Mono(2)));
+        assert_eq!(sink.channels(), 1, "still one channel wide");
+        // Two more arrive after it.
+        src.accept(&frames(4, 2, 2), Some(0), 0);
+
+        let mut out = Vec::new();
+        let got = sink.drain_samples(&mut out);
+        assert_eq!(got, 4, "every frame survived the change");
+        // EVERY frame reads as channel 2 — including the two that were
+        // already sitting in the ring when the pick changed. They were stored
+        // whole, so the new choice applies to them as cleanly as to the rest.
+        for (f, v) in out.iter().enumerate() {
+            let want = f as f32 + 2.0 / 10.0;
+            assert_eq!(*v, want, "frame {f} did not come from channel 2");
+        }
+    }
+
+    /// **A pick change is refused where it would corrupt a file.**
+    ///
+    /// Widths are the WAV header. This is the sink half of the rule; the
+    /// writer thread and `Session` hold the other two.
+    #[test]
+    fn a_pick_change_moves_the_width_the_take_would_be_written_at() {
+        use ChannelPick::{Mono, Stereo};
+        let (_src, mut sink) = capture_channel_from(8, Picks::one(Mono(0)), 64, 64, stats());
+        assert_eq!(sink.channels(), 1);
+        assert_eq!(sink.widths::<4>(), [1, 0, 0, 0]);
+        sink.set_picks(Picks::from_slice(&[Mono(5), Stereo(3, 4)]));
+        assert_eq!(sink.channels(), 3, "one plus two");
+        assert_eq!(sink.widths::<4>(), [1, 2, 0, 0], "the strips' shares moved");
+        // A pick the device cannot honour is still dropped whole.
+        sink.set_picks(Picks::one(Stereo(6, 99)));
+        assert_eq!(sink.channels(), 8, "no picks left means the whole device");
     }
 
     /// **One input going missing costs that input and not the others.**

@@ -208,7 +208,13 @@ struct Recorder {
     /// ENGINE, and the two are opened by different edges — so it is held here
     /// rather than dropped when the second one is not there yet. See
     /// `push_monitor_settings`, which is where it gets handed over.
-    pending_monitor: Option<(rtrb::Consumer<f32>, u16, [u8; crate::instrument::INPUTS], u32)>,
+    pending_monitor: Option<(
+        rtrb::Consumer<f32>,
+        u16,
+        [u8; crate::instrument::INPUTS],
+        u32,
+        ivory_record::audio::Picks,
+    )>,
     /// What each input strip is called, as the picker names it. Empty for one
     /// nobody has filled.
     ///
@@ -4827,16 +4833,47 @@ const PAD_WAVE_BUCKETS: usize = 240;
             }
         }
         // **The extras, pushed before the staleness check reads it.** Choosing
-        // a second input changes how many channels the stream carries and
-        // which ones, so it is a reopen — `set_extra_inputs` marks the
-        // selection unsettled and this call is what notices.
+        // a second input changes which channels the take keeps — and used to
+        // change how many the STREAM carried, which is why it was a reopen.
         crate::devices::set_extra_inputs(&self.recorder.audio, self.app.extra_inputs().to_vec());
-        let stale = {
+        let (stale, same_device) = {
             let sel = crate::devices::selection(&self.recorder.audio);
-            sel.is_stale()
+            (sel.is_stale(), sel.wanted.is_some() && sel.wanted == sel.open)
         };
         if !stale && !force {
             return;
+        }
+        // **The live path: the device stays open and the picks change under
+        // it.** The rings carry whole device frames now, so choosing an input
+        // is a message to the writer and a layout note to the renderer -
+        // nothing is closed, nothing is allocated, and nothing goes quiet.
+        // Only when the DEVICE itself is unchanged: a different interface is
+        // a different stream and has to be opened.
+        if stale && !force && same_device {
+            if let Some(choice) = crate::devices::audio_selection(&self.recorder.audio) {
+                if self.recorder.session.set_picks(choice.channels) {
+                    // The monitor keeps its ring — the frames in it mean the
+                    // same thing before and after — and is told which columns
+                    // each strip owns now.
+                    if let Some(e) = self.recorder.engine.as_ref() {
+                        let dev = self.recorder.session.device_channels().unwrap_or(2);
+                        e.set_monitor_layout(
+                            choice
+                                .channels
+                                .widths::<{ ivory_ui::recorder::INPUTS }>(dev),
+                            choice.channels,
+                        );
+                    }
+                    let opened = crate::devices::selection(&self.recorder.audio).wanted;
+                    crate::devices::settle(
+                        &self.recorder.audio,
+                        opened,
+                        self.recorder.session.audio_device_name().map(str::to_owned),
+                        self.recorder.session.audio_error().map(str::to_owned),
+                    );
+                    return;
+                }
+            }
         }
         match crate::devices::audio_selection(&self.recorder.audio) {
             Some(choice) => {
