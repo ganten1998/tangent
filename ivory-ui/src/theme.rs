@@ -774,7 +774,14 @@ pub const EXAMPLE: &str = r##"{
   "input_chip": "",
 
   "fretboard": "",
-  "string": ""
+  "string": "",
+
+  "_comment4": "channel_palette picks what the SIXTEEN channels wear, plus the",
+  "_comment5": "click and the master. A number, not a colour:",
+  "_comment6": "0 IVORY (full spectrum)  1 EMBER (warm)   2 TIDE (cool)",
+  "_comment7": "3 MOSS (greens)          4 NEON (vivid)   5 ASH (near-monochrome)",
+  "_comment8": "6 BLOOM (violet)         7 PATINA (teal and copper)",
+  "channel_palette": ""
 }
 "##;
 
