@@ -31,6 +31,10 @@ pub struct StripView<'a> {
     /// What is in each of this channel's three insert slots, by short name.
     /// Empty for an empty slot, which is drawn as somewhere to put one.
     pub inserts: [&'a str; INSERTS],
+    /// How many routes leave this channel, for the strips under the button.
+    /// The routes THEMSELVES live on the view, not the strip: one borrow for
+    /// the whole desk beats a list per column rebuilt every frame.
+    pub route_count: usize,
     /// What feeds a general channel, for its icon. `None` on everything else
     /// and on an unused channel.
     pub kind: Option<crate::recorder::ChannelKind>,
@@ -111,6 +115,9 @@ pub struct MixerView<'a> {
     /// drawn as what they are — silent, not merely unlit.
     pub any_solo: bool,
     pub dark_mode: bool,
+    /// Every route on the desk: source channel, label, fader. Each strip
+    /// draws the ones that leave it, in order.
+    pub routes: &'a [(usize, String, f32)],
     /// Theme roles the desk paints with.
     pub fx_strip: Color32,
     pub input_chip: Color32,
@@ -173,6 +180,12 @@ pub enum Hit {
     /// One of the three insert chips: put an effect in it, or take one out.
     /// The second field is the BAY, which is not a channel of anything.
     Insert(Column, usize),
+    /// The Routing button under the insert bays: open the routing window.
+    Routing(Column),
+    /// One route strip's fader. The second field is which route, counting
+    /// from the top of THIS channel's list — not an index into the desk's
+    /// table, which the panel has no business knowing.
+    RouteGain(Column, usize),
     /// The decibel readout: type a number into it.
     Db(Column),
     /// The channel's name: type a new one.
@@ -221,7 +234,8 @@ impl Hit {
             | Hit::Arm(i)
             | Hit::FxMenu(i, ..)
             | Hit::InputChip(i)
-            | Hit::InputChip(i) => i,
+            | Hit::Routing(i)
+            | Hit::RouteGain(i, _) => i,
         }
     }
 
@@ -235,9 +249,13 @@ impl Hit {
             Hit::Fader(_) => Some(DragAxis::Vertical),
             Hit::Send(_) => Some(DragAxis::Vertical),
             Hit::Pan(_) => Some(DragAxis::Vertical),
+            // **A route strip drags SIDEWAYS.** It is drawn as a level lying
+            // down, and a control that fills to the right has to be swept to
+            // the right or the picture and the hand disagree.
+            Hit::RouteGain(..) => Some(DragAxis::Horizontal),
             Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(..)
             | Hit::Db(_) | Hit::Name(_) | Hit::Remove(_) | Hit::Arm(_)
-            | Hit::FxMenu(..) | Hit::InputChip(_) => None,
+            | Hit::FxMenu(..) | Hit::InputChip(_) | Hit::Routing(_) => None,
         }
     }
 
@@ -247,9 +265,10 @@ impl Hit {
             Hit::Fader(_) => Some(FADER_TRAVEL),
             Hit::Send(_) => Some(SEND_TRAVEL),
             Hit::Pan(_) => Some(SEND_TRAVEL),
+            Hit::RouteGain(..) => Some(SEND_TRAVEL),
             Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(..)
             | Hit::Db(_) | Hit::Name(_) | Hit::Remove(_) | Hit::Arm(_)
-            | Hit::FxMenu(..) | Hit::InputChip(_) => None,
+            | Hit::FxMenu(..) | Hit::InputChip(_) | Hit::Routing(_) => None,
         }
     }
 }
@@ -324,6 +343,9 @@ pub const PALETTE_V1_TO_V2: [usize; 8] = [0, 5, 8, 14, 16, 20, 23, 2];
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DragAxis {
     Vertical,
+    /// Swept sideways: a control drawn as a level lying down has to fill in
+    /// the direction the hand moves, or the picture and the gesture disagree.
+    Horizontal,
 }
 
 /// How far the hand moves to sweep a fader end to end, in points.
@@ -354,6 +376,16 @@ const SEND_TRAVEL: f32 = 420.0;
 // here and is retired: the arrangement's lanes carry audio now.
 pub const COLUMNS: usize = crate::recorder::CHANNELS + 2;
 
+/// How many route strips a mixer channel shows before it stops growing.
+///
+/// **Three, because they come out of the fader's travel.** Every strip is
+/// vertical space the fader used to have; three is enough for the patches
+/// people actually build (a headphone feed, a reverb send, a stage monitor)
+/// and leaves the fader long enough to ride. Past three, the routes are all
+/// still THERE and all still audible - the strip simply stops drawing them,
+/// and the routing window remains where they are managed.
+pub const STRIP_ROUTES: usize = 3;
+
 pub struct Layout {
     pub strips: [StripStrip; COLUMNS],
 }
@@ -379,6 +411,11 @@ pub struct StripStrip {
     pub arm: Rect,
     /// A user effect plugin across this strip. Only the bus has one today.
     pub inserts: [Rect; INSERTS],
+    /// The Routing button, under the insert bays — the owner's placement.
+    pub routing: Rect,
+    /// One small strip per route: a label and its own fader. `NOTHING` past
+    /// what this channel actually routes. See [`STRIP_ROUTES`].
+    pub routes: [Rect; STRIP_ROUTES],
     /// The plus on an empty slot.
     pub add: Rect,
     /// The × at the top right of a removable channel. `NOTHING` on the rest.
@@ -405,6 +442,8 @@ impl StripStrip {
         solo: Rect::NOTHING,
         arm: Rect::NOTHING,
         inserts: [Rect::NOTHING; INSERTS],
+        routing: Rect::NOTHING,
+        routes: [Rect::NOTHING; STRIP_ROUTES],
         add: Rect::NOTHING,
         close: Rect::NOTHING,
     };
@@ -571,7 +610,10 @@ impl Layout {
         // as wide as the channel, which is where the reading room comes from;
         // the height it costs comes out of the fader's travel, which had the
         // most of anything on the strip.
-        let rack = cut(0.195, 0.395);
+        // **Shorter than it was, to make room for the Routing button under
+        // it** - the owner's call about what gives when something new needs
+        // a place: the bays first.
+        let rack = cut(0.195, 0.345);
         let inserts: [Rect; INSERTS] = std::array::from_fn(|i| {
             let h = rack.height() / INSERTS as f32;
             let y = rack.top() + h * i as f32;
@@ -616,7 +658,26 @@ impl Layout {
         // press one and get the other.
         // Every channel has an insert row now, so every channel's travel
         // starts below it — a send is what still moves the line.
-        let travel = cut(if sends { 0.55 } else { 0.42 }, 0.82);
+        // **The routing band, and it comes out of the fader.** Routes are
+        // drawn only where they exist, so a channel that routes nowhere is
+        // exactly the strip it always was; each one that does costs the
+        // fader a slice, which is the honest price of putting them here.
+        let route_n = view.route_count.min(STRIP_ROUTES);
+        let routing = if matches!(view.strip, Some(Strip::Channel(_))) && !view.empty {
+            cut(0.352, 0.398)
+        } else {
+            Rect::NOTHING
+        };
+        const ROUTE_H: f32 = 0.043;
+        let route_top = if sends { 0.55 } else { 0.42 };
+        let routes: [Rect; STRIP_ROUTES] = std::array::from_fn(|i| {
+            if i >= route_n {
+                return Rect::NOTHING;
+            }
+            let y = route_top + ROUTE_H * i as f32;
+            cut(y + 0.004, y + ROUTE_H - 0.004)
+        });
+        let travel = cut(route_top + ROUTE_H * route_n as f32, 0.82);
         // The meter takes the left third and the fader the rest, so the fader
         // still sits near the middle of the strip where a hand expects it.
         let split = travel.left() + travel.width() * 0.42;
@@ -667,6 +728,8 @@ impl Layout {
         };
         StripStrip {
             panel,
+            routing,
+            routes,
             icon,
             // **Loosely fitting the text, not a band of face.** These were a
             // fifteenth of the strip each, which at any usable window size is
@@ -732,6 +795,10 @@ impl Layout {
                 (s.inserts[0], Hit::Insert(i, 0)),
                 (s.inserts[1], Hit::Insert(i, 1)),
                 (s.inserts[2], Hit::Insert(i, 2)),
+                (s.routing, Hit::Routing(i)),
+                (s.routes[0], Hit::RouteGain(i, 0)),
+                (s.routes[1], Hit::RouteGain(i, 1)),
+                (s.routes[2], Hit::RouteGain(i, 2)),
                 (s.db, Hit::Db(i)),
                 (s.name, Hit::Name(i)),
                 (s.close, Hit::Remove(i)),
@@ -868,7 +935,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MixerView<'_>) {
         let heard = view.heard(i);
         let typed = view.typing.filter(|(at, _)| at.0 == i).map(|(_, b)| b);
         let naming = view.naming.filter(|(at, _)| at.0 == i).map(|(_, b)| b);
-        strip(painter, s, v, &p, heard, typed, naming);
+        strip(painter, s, v, &p, view.routes, heard, typed, naming);
         // The selected channel's faint rim — the owner's slight light.
         if view
             .selected
@@ -922,6 +989,7 @@ fn strip(
     l: &StripStrip,
     v: &StripView<'_>,
     p: &Ink,
+    routes: &[(usize, String, f32)],
     heard: bool,
     typed: Option<&str>,
     naming: Option<&str>,
@@ -1097,6 +1165,68 @@ fn strip(
             ink.gamma_multiply(0.72),
         );
     }
+
+    // ── Routing: the button, and a strip per route ─────────────────────────
+    //
+    // The button says what it opens and nothing else; the strips under it are
+    // the routes themselves, each one a label and its own fader. A route is a
+    // send, so the strip is deliberately SMALL - it is not a second channel,
+    // it is a tap off this one.
+    if l.routing.is_positive() {
+        let lit = v.route_count > 0;
+        painter.rect_filled(l.routing, 2.0, if lit { p.face } else { shade_face(p.face, 0.94) });
+        painter.rect_stroke(
+            l.routing,
+            2.0,
+            Stroke::new(1.0_f32, p.engrave),
+            egui::StrokeKind::Inside,
+        );
+        let label = if lit {
+            format!("ROUTING  {}", v.route_count)
+        } else {
+            "ROUTING".to_owned()
+        };
+        let size = (l.routing.height() * 0.52).clamp(6.0, 10.0);
+        painter.text(
+            l.routing.center(),
+            egui::Align2::CENTER_CENTER,
+            &label,
+            FontId::new(size, crate::fonts::courier_bold()),
+            p.engrave,
+        );
+    }
+    if let Some(Strip::Channel(n)) = v.strip {
+        let mine: Vec<&(usize, String, f32)> =
+            routes.iter().filter(|(from, _, _)| *from == n).collect();
+        for (i, r) in l.routes.iter().enumerate() {
+            let Some((_, label, gain)) = mine.get(i) else {
+                break;
+            };
+            if !r.is_positive() {
+                continue;
+            }
+            // The well, then the fill to the route's own level, then the
+            // name over it: the same picture as a fader lying down, so it
+            // reads as a level without needing a second idiom.
+            painter.rect_filled(*r, 1.0, p.slot);
+            let filled = Rect::from_min_max(
+                r.min,
+                Pos2::new(r.left() + r.width() * gain.clamp(0.0, 1.0), r.bottom()),
+            );
+            if filled.width() > 0.5 {
+                painter.rect_filled(filled, 1.0, p.lit.gamma_multiply(0.55));
+            }
+            let size = (r.height() * 0.62).clamp(5.0, 9.0);
+            painter.text(
+                Pos2::new(r.left() + 3.0, r.center().y),
+                egui::Align2::LEFT_CENTER,
+                label,
+                FontId::new(size, crate::fonts::courier_bold()),
+                p.face,
+            );
+        }
+    }
+
     // A dimmed channel is dimmed by a veil rather than by a paler face, so
     // painting one does not cost it its "not heard" state.
     if !heard {
@@ -1769,6 +1899,7 @@ mod tests {
 
     fn a_strip(strip: Option<Strip>, empty: bool) -> StripView<'static> {
         StripView {
+            route_count: 0,
             icon: 0,
             strip,
             name: "CHANNEL",
@@ -1798,6 +1929,7 @@ mod tests {
     fn a_view() -> MixerView<'static> {
         let channels = Strip::shown();
         MixerView {
+            routes: &[],
             fx_strip: Color32::from_rgb(0xE3, 0xD9, 0xBD),
             input_chip: Color32::from_rgb(0xE3, 0xD9, 0xBD),
             strips: std::array::from_fn(|i| {
@@ -2416,7 +2548,13 @@ mod tests {
     #[test]
     fn every_travelling_control_has_an_axis_and_a_distance() {
         for hit in [Hit::Fader(Column(0)), Hit::Send(Column(1))] {
-            assert_eq!(hit.axis(), Some(DragAxis::Vertical), "{hit:?}");
+            // Faders, sends and pans stand up; a route strip lies down.
+            let want = if matches!(hit, Hit::RouteGain(..)) {
+                DragAxis::Horizontal
+            } else {
+                DragAxis::Vertical
+            };
+            assert_eq!(hit.axis(), Some(want), "{hit:?}");
             assert!(hit.travel().is_some_and(|t| t > 0.0), "{hit:?}");
         }
         for hit in [Hit::Mute(Column(0)), Hit::Solo(Column(0))] {
