@@ -524,10 +524,17 @@ impl Layout {
         // not what it is called. So it shares their fate on a narrow header
         // and their room on a short one: no dials, no button, and no button
         // when the space under them would make it a sliver to aim at.
-        let routing = if dials_fit && r.bottom() - (dial_top + kd) >= 11.0 {
+        // **Under the LABELS, not on them.** The dials print VOL / SND / PAN
+        // in the band between their own bottom and the row's, so a button
+        // pinned straight under the dial covered the words that say which
+        // dial is which. It goes below that band, and only when the row is
+        // tall enough to hold the labels AND a button worth aiming at.
+        const DIAL_LABEL_H: f32 = 9.0;
+        let routing_top = dial_top + kd + DIAL_LABEL_H;
+        let routing = if dials_fit && r.bottom() - 1.0 - routing_top >= 11.0 {
             Rect::from_min_max(
-                Pos2::new(pan.left(), dial_top + kd + 2.0),
-                Pos2::new(send.right(), (dial_top + kd + 13.0).min(r.bottom() - 1.0)),
+                Pos2::new(pan.left(), routing_top),
+                Pos2::new(send.right(), r.bottom() - 1.0),
             )
         } else {
             Rect::NOTHING

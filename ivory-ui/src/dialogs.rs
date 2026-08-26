@@ -294,9 +294,11 @@ pub enum Dialog {
         /// out — sending into a channel with nothing on it is a route to
         /// silence, and the owner asked for used channels only.
         channels: Vec<(usize, String)>,
-        /// Destination labels already routed from this channel, so a
-        /// duplicate is greyed rather than refused after the click.
-        taken: Vec<String>,
+        /// What this channel already routes to: the desk-table index and the
+        /// destination's label. Greys the duplicates in the picker AND gives
+        /// every existing route a row with a way OFF - which the first pass
+        /// forgot, leaving a send that could be made and never unmade.
+        existing: Vec<(usize, String)>,
     },
     /// Name the colours the app is wearing and write them to the user themes
     /// folder. Stays open on failure so the typed name is not lost.
@@ -4299,8 +4301,11 @@ pub fn show(
                 ctx,
                 placement,
                 "Project",
-                Vec2::new(340.0, 356.0),
-                Vec2::new(340.0, 316.0),
+                // Taller for the subdirectory tick and its line of fine
+                // print: the row went in without the window growing, and the
+                // Done button fell off the bottom until somebody resized.
+                Vec2::new(340.0, 410.0),
+                Vec2::new(340.0, 370.0),
                 |ui, result| {
                     apply_theme(ui.style_mut(), &t);
                     ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
@@ -4425,8 +4430,10 @@ pub fn show(
                 ctx,
                 placement,
                 "Export",
+                // Taller for the WHEN DONE row, which was added below the
+                // window's floor and could not be reached at all.
+                Vec2::new(380.0, 446.0),
                 Vec2::new(380.0, 396.0),
-                Vec2::new(380.0, 376.0),
                 |ui, result| {
                     apply_theme(ui.style_mut(), &t);
                     ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
@@ -5023,7 +5030,7 @@ pub fn show(
             picking,
             hardware,
             channels,
-            taken,
+            existing,
         } => {
             let t = theme(dark_mode);
             let dim = t.text.gamma_multiply(0.62);
@@ -5075,7 +5082,46 @@ pub fn show(
                                         .font(bold(9.0))
                                         .color(dim),
                                     );
-                                    ui.add_space(10.0);
+                                    ui.add_space(8.0);
+                                    // ── what is already routed, each with a
+                                    // way off. Shown FIRST: somebody opening
+                                    // this window on a channel that already
+                                    // routes is more often here to change
+                                    // that than to add another.
+                                    if !existing.is_empty() {
+                                        ui.label(
+                                            RichText::new("Now routing to:")
+                                                .font(bold(10.0))
+                                                .color(dim),
+                                        );
+                                        for (at, label) in existing.iter() {
+                                            ui.horizontal(|ui| {
+                                                ui.label(
+                                                    RichText::new(label)
+                                                        .font(bold(11.0))
+                                                        .color(t.text),
+                                                );
+                                                ui.with_layout(
+                                                    Layout::right_to_left(Align::Center),
+                                                    |ui| {
+                                                        if ui
+                                                            .add(Button::new(
+                                                                RichText::new("Remove")
+                                                                    .font(bold(10.0))
+                                                                    .color(t.text),
+                                                            ))
+                                                            .clicked()
+                                                        {
+                                                            action = Some(
+                                                                DialogAction::RemoveRoute(*at),
+                                                            );
+                                                        }
+                                                    },
+                                                );
+                                            });
+                                        }
+                                        ui.add_space(8.0);
+                                    }
                                     if row(
                                         ui,
                                         "Sends",
@@ -5139,7 +5185,8 @@ pub fn show(
                                                     // duplicates, and saying
                                                     // so before the click
                                                     // beats refusing after.
-                                                    let free = !taken.contains(label);
+                                                    let free =
+                                                        !existing.iter().any(|(_, l)| l == label);
                                                     if row(ui, label, "", free) {
                                                         action = Some(DialogAction::AddRoute {
                                                             from: ch,
@@ -5160,7 +5207,8 @@ pub fn show(
                                                     } else {
                                                         format!("{label} - {name}")
                                                     };
-                                                    let free = !taken.contains(&label);
+                                                    let free =
+                                                        !existing.iter().any(|(_, l)| *l == label);
                                                     if row(ui, &shown, "", free) {
                                                         action = Some(DialogAction::AddRoute {
                                                             from: ch,

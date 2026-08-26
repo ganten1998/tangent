@@ -5553,6 +5553,17 @@ impl IvoryApp {
             Some(recorder::ChannelKind::Audio)
         };
         let was = self.channel_kind(ch);
+        // **A track that loses its input KEEPS EXISTING.** The input is the
+        // kind, so clearing it clears the kind - and a channel whose only
+        // claim to being on the desk WAS that kind then vanished the moment
+        // somebody chose None. That is the shape of a send-only track (no
+        // input, fed entirely by other channels), so choosing None has to
+        // leave a track behind rather than take one away: the desk's
+        // added-track bit is what says "this exists because somebody said
+        // so", and it is set here.
+        if kind.is_none() && was.is_some() && ch < 32 {
+            self.settings.tracks_added |= 1 << ch;
+        }
         if let Some(slot) = self.settings.channel_kinds.get_mut(ch) {
             *slot = recorder::ChannelKind::as_u8(kind);
         }
@@ -10904,19 +10915,19 @@ impl IvoryApp {
                 (n, name)
             })
             .collect();
-        let taken = self
+        let existing = self
             .settings
             .routes
             .from(channel)
             .into_iter()
-            .map(|(_, r)| r.target.label())
+            .map(|(at, r)| (at, r.target.label()))
             .collect();
         dialogs::Dialog::Routing {
             channel,
             picking,
             hardware,
             channels,
-            taken,
+            existing,
         }
     }
 
@@ -13677,9 +13688,20 @@ impl IvoryApp {
                 self.dialog = Some(self.routing_dialog(from, None));
             }
             DialogAction::RemoveRoute(index) => {
+                // The channel is read BEFORE the removal: after it, the index
+                // names a different route or nothing at all.
+                let channel = self.settings.routes.0.get(index).map(|r| r.from);
                 self.settings.routes.remove(index);
                 self.refresh_route_labels();
                 self.save_settings();
+                // Rebuilt rather than left standing: every row below the one
+                // that went now has a different index, and a stale window
+                // would remove the wrong route on the next click.
+                if let Some(ch) = channel {
+                    if matches!(self.dialog, Some(dialogs::Dialog::Routing { .. })) {
+                        self.dialog = Some(self.routing_dialog(ch, None));
+                    }
+                }
             }
             DialogAction::SaveThemeNamed(name) => {
                 let name = name.trim().to_owned();
@@ -15864,6 +15886,9 @@ impl IvoryApp {
                         | crate::mixer_panel::Hit::Arm(_)
                         | crate::mixer_panel::Hit::FxMenu(..)
                         | crate::mixer_panel::Hit::InputChip(_)
+                        // A door, not a fader: without this it fell through
+                        // to the drag branch and a click did nothing at all.
+                        | crate::mixer_panel::Hit::Routing(_)
                         | crate::mixer_panel::Hit::Db(_))) => {
                             self.apply_mixer_hit(hit, 0.0);
                         }

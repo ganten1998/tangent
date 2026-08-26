@@ -796,7 +796,16 @@ impl Layout {
         let tap_w = (side * 1.9).clamp(24.0, 38.0);
         const ICONS: usize = 7;
         let mut widths: Vec<f32> = Vec::with_capacity(ICONS + 2);
-        widths.push(head.width());
+        // **The knob is spaced by what you SEE, not by the cell it lives in.**
+        // It is sized from an effect cell, which is wider than the circle
+        // inside it; spacing by the cell put a visibly bigger gap between the
+        // knob and the tap chip than between any other pair, which is exactly
+        // the unevenness the owner named. The cell is trimmed to the circle
+        // (plus the room its ticks need), so every gap in the row is the gap
+        // between two things a person can point at.
+        let knob_w = knob_face(head)
+            .map_or(head.width(), |f| (f.radius * 2.4).min(head.width()));
+        widths.push(knob_w);
         widths.push(tap_w);
         for _ in 0..ICONS {
             widths.push(side);
@@ -839,9 +848,13 @@ impl Layout {
             x += w + gap;
         }
         let centre = |i: usize| spans.get(i).map(|(a, b)| (a + b) * 0.5);
-        // The knob keeps the cell it was sized into, moved to its new place.
+        // The knob keeps its HEIGHT (the circle is budgeted from the shorter
+        // side, so the drawn size does not move) and takes the trimmed width.
         let head = centre(0).map_or(head, |cx| {
-            Rect::from_center_size(Pos2::new(cx, head.center().y), head.size())
+            Rect::from_center_size(
+                Pos2::new(cx, head.center().y),
+                Vec2::new(knob_w, head.height()),
+            )
         });
         if rolling {
             self.timecode = head;
