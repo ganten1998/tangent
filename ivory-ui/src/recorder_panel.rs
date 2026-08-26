@@ -2184,7 +2184,7 @@ fn draw_monitor(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Pale
                 typing: typing_for(view, field),
                 turning: view.turning == Some(field),
                 reading: gain_text(g),
-                cap: MASTER_CAP,
+                cap: p.master,
             },
             p,
         );
@@ -2203,7 +2203,7 @@ fn draw_monitor(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Pale
                 typing: typing_for(view, field),
                 turning: view.turning == Some(field),
                 reading: knob_reading(view.fx_units[fx.index()], v),
-                cap: fx.cap(),
+                cap: fx.cap_themed(p),
             },
             p,
         );
@@ -4952,6 +4952,26 @@ mod tests {
         for fx in Fx::ALL {
             assert_ne!(fx.cap(), MASTER_CAP, "{} wears the master's red", fx.title());
         }
+        // **And under every theme, not just the stock colours.** Themes paint
+        // the master; if one of them lands on the limiter's red, the two
+        // controls that mean opposite things become the same colour on
+        // somebody's screen. Held to a real distance, not mere inequality.
+        for t in crate::theme::factory() {
+            let Some(master) = t.master_knob else { continue };
+            let master = master.to_color32();
+            let d = |a: Color32, b: Color32| {
+                (f32::from(a.r()) - f32::from(b.r())).abs()
+                    + (f32::from(a.g()) - f32::from(b.g())).abs()
+                    + (f32::from(a.b()) - f32::from(b.b())).abs()
+            };
+            assert!(
+                d(master, LIMITER_CAP) > 60.0,
+                "{}: the master ({:?}) and the limiter ({:?}) are the same red",
+                t.name,
+                master,
+                LIMITER_CAP
+            );
+        }
     }
 
     #[test]
@@ -6746,6 +6766,24 @@ impl Fx {
         match self {
             Fx::Reverb | Fx::Delay | Fx::Chorus => KNOB_CAP,
             Fx::Hpf | Fx::Lpf => FILTER_CAP,
+            Fx::Limiter => LIMITER_CAP,
+        }
+    }
+
+    /// The same cap in the theme's colours, keeping the meaning the three
+    /// stock colours carry.
+    ///
+    /// **The limiter stays out of it, and that is a rule rather than an
+    /// oversight** — see `the_limiter_and_the_master_are_told_apart_by_colour`.
+    /// A theme drives the sends and the filters; the one control that will
+    /// alter a take whether or not anybody is listening keeps its own red, so
+    /// no theme can ever paint it into the master's colour by accident.
+    pub fn cap_themed(self, p: &Palette) -> Color32 {
+        match self {
+            Fx::Reverb | Fx::Delay | Fx::Chorus => p.fx_knob,
+            // The filters are the same family a step down, so the two rows
+            // still read as two rows under any theme.
+            Fx::Hpf | Fx::Lpf => shade(p.fx_knob, 0.72),
             Fx::Limiter => LIMITER_CAP,
         }
     }

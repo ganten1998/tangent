@@ -32,6 +32,7 @@ pub mod settings;
 pub mod splash;
 pub mod staff;
 pub mod shell;
+pub mod routing;
 pub mod theme;
 pub mod theory_panel;
 

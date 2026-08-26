@@ -351,6 +351,9 @@ struct Palette {
     /// Marks ON the board, which is now everything: the board runs the full
     /// width of the band, so there is no background strip left to draw on.
     on_board: Color32,
+    /// The interval names beside the neck — a theme role of their own, since
+    /// they answer a different question from anything printed on the board.
+    interval: Color32,
 }
 
 /// A theme's board and strings, when a theme is worn.
@@ -412,6 +415,7 @@ fn palette(s: &Settings, wood: Wood) -> Palette {
     // still decides everything else about the neck (nut, wire, inlays).
     let (board, string) = themed_board(s, board, string);
     Palette {
+        interval: s.interval_text_color.to_color32(),
         bg: crate::piano::bg_color(dark),
         board,
         // A real nut is bone. On maple that would disappear, so there it is the
@@ -1065,7 +1069,7 @@ fn draw_intervals(
             if name == "R" {
                 s.chord_text_color.to_color32()
             } else {
-                p.on_board
+                p.interval
             },
         );
     }
