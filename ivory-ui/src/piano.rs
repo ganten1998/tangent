@@ -58,6 +58,12 @@ fn idle_colors(s: &Settings) -> (Color32, Color32) {
     }
 }
 
+/// Blend two colours, `t` of the way from `a` to `b`.
+fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+    let f = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t) as u8;
+    Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
+}
+
 pub fn bg_color(dark_mode: bool) -> Color32 {
     if dark_mode {
         Color32::from_rgb(0x1a, 0x1a, 0x1a)
@@ -96,16 +102,26 @@ pub fn draw(
     // The walnut separator and outline are drawn FOR the bone keyboard; on
     // the dark one they are the brightest thing on screen. Darkened together
     // so the key edges stay visible without ruling the view.
-    let (separator, outline) = if s.dark_mode {
-        (
-            Color32::from_rgb(46, 32, 16),
-            Color32::from_rgb(70, 58, 43),
-        )
-    } else {
-        (
-            Color32::from_rgb(92, 63, 31),
-            Color32::from_rgb(139, 115, 85),
-        )
+    // **The separators are a theme role, drawn for the keyboard they are
+    // on.** The shipped walnut is right on a bone keyboard: dark cuts between
+    // light keys. Inverted, the naturals ARE dark — a dark separator is a
+    // line nobody can see, and a brown one reads as the recorder band's
+    // colour leaking into the instrument, which is what the owner saw.
+    //
+    // So the theme names the colour, and it is flipped toward the SHARP key's
+    // colour when it would otherwise disappear into the natural it is cut
+    // into. One rule, and it holds for a themed keyboard as well as a stock
+    // one: the cut always contrasts with the key it divides.
+    let (separator, outline) = {
+        let base = s.key_separator_color.to_color32();
+        let natural = white_idle;
+        let cut = if crate::recorder_panel::wants_light_ink(natural) {
+            // Dark keys: lift the separator toward the sharps' light colour.
+            mix(base, black_idle, 0.72)
+        } else {
+            base
+        };
+        (cut, mix(cut, natural, 0.42))
     };
 
     // 2. White keys, left to right (int truncation per key, like Qt fillRect).

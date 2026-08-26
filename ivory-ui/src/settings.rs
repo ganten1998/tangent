@@ -452,6 +452,9 @@ pub struct Settings {
     pub white_key_active_color: Rgb,
     pub black_key_active_color: Rgb,
     pub sustain_color: Rgb,
+    /// The cuts between piano keys — a theme role, so a themed keyboard does
+    /// not keep the walnut of a desk it no longer matches.
+    pub key_separator_color: Rgb,
     // ── theme roles ────────────────────────────────────────────────────────
     // Ten colours that used to be literals in a painter somewhere. They live
     // here because a THEME is a set of values for settings fields (see
@@ -1147,6 +1150,7 @@ impl Default for Settings {
             white_key_active_color: Rgb::new(0x6C, 0x9B, 0xD2),
             black_key_active_color: Rgb::new(0x6C, 0x9B, 0xD2),
             sustain_color: Rgb::new(0xD2, 0xA3, 0x6C),
+            key_separator_color: Rgb::new(0x5c, 0x3f, 0x1f),
             // The literals these replaced, so nothing moves on upgrade:
             // theory_panel's light `line`, the fretboard's on-board ink, the
             // band accent, REC_RED, and the scope's own face and green.
@@ -1638,6 +1642,7 @@ impl Settings {
             &mut s.black_key_active_color,
         );
         take_color(&mut map, "sustain_color", &mut s.sustain_color);
+        take_color(&mut map, "key_separator_color", &mut s.key_separator_color);
         take_color(&mut map, "theory_line_color", &mut s.theory_line_color);
         take_color(&mut map, "interval_text_color", &mut s.interval_text_color);
         take_color(&mut map, "fx_knob_color", &mut s.fx_knob_color);
@@ -3091,6 +3096,7 @@ impl Settings {
         map.insert("routes".into(), self.routes.to_json());
         map.insert("project_subdir".into(), Value::Bool(self.project_subdir));
         for (k, v) in [
+            ("key_separator_color", self.key_separator_color),
             ("theory_line_color", self.theory_line_color),
             ("interval_text_color", self.interval_text_color),
             ("fx_knob_color", self.fx_knob_color),

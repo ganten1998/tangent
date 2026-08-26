@@ -47,6 +47,10 @@ pub struct Theme {
     pub key_active: Option<Rgb>,
     /// Held-by-the-pedal. Reaches EVERY theory module, not just the piano.
     pub sustain: Option<Rgb>,
+    /// The cuts between keys. Its own role rather than a shade of the keys:
+    /// the shipped walnut is a hue neither key colour contains, and deriving
+    /// it would have quietly repainted the default keyboard.
+    pub key_separator: Option<Rgb>,
 
     // ── words and lines ────────────────────────────────────────────────────
     pub text: Option<Rgb>,
@@ -106,6 +110,7 @@ impl Theme {
             black_key: c(0x1a, 0x1a, 0x1a),
             key_active: c(0x6C, 0x9B, 0xD2),
             sustain: c(0xD2, 0xA3, 0x6C),
+            key_separator: c(0x5c, 0x3f, 0x1f),
             text: c(0xE8, 0xDC, 0xC0),
             theory_line: c(0x9c, 0x8f, 0x74),
             interval_text: c(0xE8, 0xDC, 0xC0),
@@ -131,6 +136,7 @@ impl Theme {
             black_key: Some(s.black_key_idle_color),
             key_active: Some(s.white_key_active_color),
             sustain: Some(s.sustain_color),
+            key_separator: Some(s.key_separator_color),
             text: Some(s.chord_text_color),
             theory_line: Some(s.theory_line_color),
             interval_text: Some(s.interval_text_color),
@@ -168,6 +174,9 @@ impl Theme {
         }
         if let Some(v) = self.sustain {
             s.sustain_color = v;
+        }
+        if let Some(v) = self.key_separator {
+            s.key_separator_color = v;
         }
         if let Some(v) = self.text {
             s.chord_text_color = v;
@@ -227,6 +236,7 @@ impl Theme {
         put("black_key", self.black_key);
         put("key_active", self.key_active);
         put("sustain", self.sustain);
+        put("key_separator", self.key_separator);
         put("text", self.text);
         put("theory_line", self.theory_line);
         put("interval_text", self.interval_text);
@@ -266,6 +276,7 @@ impl Theme {
             black_key: get("black_key"),
             key_active: get("key_active"),
             sustain: get("sustain"),
+            key_separator: get("key_separator"),
             text: get("text"),
             theory_line: get("theory_line"),
             interval_text: get("interval_text"),
@@ -303,7 +314,7 @@ impl Theme {
 
 /// Every theme that ships in the binary, Default first.
 ///
-/// **Eight, and they are a spread rather than eight variations on one idea.**
+/// **Sixteen, and they are a spread rather than variations on one idea.**
 /// One light-ivory default, one warm-paper light theme, and six darks that do
 /// not repeat a hue: plum, teal, navy, grey, warm-console, indigo. Three of
 /// them are the owner's own applications' palettes, kept faithful to what
@@ -325,6 +336,7 @@ pub fn factory() -> Vec<Theme> {
             // who does not separate red from orange. Amber is 1.6:1 clear of
             // the rose and is Valentine's own warning colour.
             sustain: c(0xff, 0xb4, 0x54),
+            key_separator: c(0x5e, 0x2c, 0x4e),
             text: c(0xf3, 0xdc, 0xe7),
             theory_line: c(0xa3, 0x76, 0x8f),
             interval_text: c(0x4c, 0xc7, 0xa4),
@@ -348,6 +360,7 @@ pub fn factory() -> Vec<Theme> {
             black_key: c(0x10, 0x24, 0x28),
             key_active: c(0x3f, 0xd9, 0xb8),
             sustain: c(0xe8, 0x84, 0x5c),
+            key_separator: c(0x1c, 0x38, 0x3c),
             text: c(0xd6, 0xe8, 0xe4),
             theory_line: c(0x6a, 0x8c, 0x88),
             interval_text: c(0xe0, 0xb0, 0x50),
@@ -375,6 +388,7 @@ pub fn factory() -> Vec<Theme> {
             // same colour that glows there is 2.7:1 here.
             key_active: c(0x7f, 0x9b, 0xff),
             sustain: c(0x40, 0xe8, 0xff),
+            key_separator: c(0x26, 0x50, 0x80),
             text: c(0xe0, 0xf0, 0xff),
             theory_line: c(0x26, 0x50, 0x80),
             interval_text: c(0xa8, 0xc8, 0xd8),
@@ -401,6 +415,7 @@ pub fn factory() -> Vec<Theme> {
             black_key: c(0x14, 0x14, 0x14),
             key_active: c(0xf0, 0xf0, 0xf0),
             sustain: c(0x90, 0x90, 0x90),
+            key_separator: c(0x3a, 0x3a, 0x3a),
             text: c(0xe0, 0xe0, 0xe0),
             theory_line: c(0x5a, 0x5a, 0x5a),
             interval_text: c(0xa8, 0xa8, 0xa8),
@@ -426,6 +441,7 @@ pub fn factory() -> Vec<Theme> {
             black_key: c(0x19, 0x17, 0x14),
             key_active: c(0xd8, 0xa0, 0x3c),
             sustain: c(0x8f, 0x6b, 0x2f),
+            key_separator: c(0x3a, 0x35, 0x2e),
             text: c(0xe8, 0xe2, 0xd4),
             theory_line: c(0x6b, 0x63, 0x55),
             interval_text: c(0xc0, 0x8f, 0x4a),
@@ -452,6 +468,7 @@ pub fn factory() -> Vec<Theme> {
             black_key: c(0x12, 0x14, 0x1b),
             key_active: c(0x5c, 0xe8, 0xb4),
             sustain: c(0xa9, 0x7b, 0xf0),
+            key_separator: c(0x2a, 0x2e, 0x40),
             text: c(0xdf, 0xe4, 0xee),
             theory_line: c(0x4a, 0x50, 0x68),
             interval_text: c(0x7f, 0xd4, 0xf0),
@@ -483,6 +500,7 @@ pub fn factory() -> Vec<Theme> {
             // told apart by weight the way ink is.
             key_active: c(0xa8, 0x4f, 0x28),
             sustain: c(0x3a, 0x4a, 0x24),
+            key_separator: c(0x9c, 0x8a, 0x70),
             text: c(0x3a, 0x31, 0x28),
             theory_line: c(0x9c, 0x8a, 0x70),
             interval_text: c(0x8a, 0x5a, 0x2c),
@@ -495,6 +513,198 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x7d, 0x8f, 0x5a),
             fretboard: c(0xc9, 0xb5, 0x96),
             string: c(0x6b, 0x5c, 0x48),
+            channel_palette: None,
+        },
+        // ── Centennial: the DX7 II Centennial, 1987 — Yamaha's hundredth
+        // birthday in brushed silver with gold legends and black cheeks. The
+        // gold is an ACCENT and never the text: it is beautiful at 3:1 on
+        // silver and unreadable as a paragraph. Slate blue on the input chip
+        // is the one cool note, as it is on the instrument.
+        Theme {
+            name: "Centennial".to_owned(),
+            white_key: c(0xf2, 0xf1, 0xee),
+            black_key: c(0x26, 0x26, 0x2a),
+            key_active: c(0x7d, 0x5f, 0x18),
+            sustain: c(0x3f, 0x4a, 0x55),
+            key_separator: c(0x9a, 0x9a, 0xa0),
+            text: c(0x1f, 0x1f, 0x23),
+            theory_line: c(0x8e, 0x8e, 0x96),
+            interval_text: c(0x6f, 0x57, 0x14),
+            recorder_bg: c(0xc2, 0xc2, 0xc8),
+            fx_knob: c(0x7d, 0x5f, 0x18),
+            master_knob: c(0x9c, 0x32, 0x26),
+            meter_bg: c(0x2a, 0x2a, 0x2e),
+            scope_draw: c(0xd8, 0xb4, 0x5a),
+            fx_strip: c(0xd5, 0xd5, 0xda),
+            input_chip: c(0x5d, 0x6b, 0x78),
+            fretboard: c(0x3a, 0x3a, 0x40),
+            string: c(0xc9, 0xc9, 0xcf),
+            channel_palette: None,
+        },
+        // ── Blueprint: a cyanotype. Prussian ground, chalk lines, and one
+        // ochre for what is HELD — the pencil annotation on a blue print.
+        Theme {
+            name: "Blueprint".to_owned(),
+            white_key: c(0xe6, 0xee, 0xf7),
+            black_key: c(0x0d, 0x1c, 0x33),
+            key_active: c(0x7f, 0xb2, 0xe8),
+            sustain: c(0xf7, 0xd9, 0x8a),
+            key_separator: c(0x2b, 0x4a, 0x70),
+            text: c(0xe6, 0xee, 0xf7),
+            theory_line: c(0x5b, 0x7f, 0xa8),
+            interval_text: c(0xa8, 0xc4, 0xe0),
+            recorder_bg: c(0x20, 0x45, 0x6e),
+            fx_knob: c(0x7f, 0xb2, 0xe8),
+            master_knob: c(0xf0, 0x70, 0x5f),
+            meter_bg: c(0x0f, 0x24, 0x40),
+            scope_draw: c(0x9f, 0xd0, 0xf5),
+            fx_strip: c(0x1a, 0x3a, 0x5e),
+            input_chip: c(0x6f, 0xc3, 0xb8),
+            fretboard: c(0x13, 0x2b, 0x47),
+            string: c(0x8f, 0xa8, 0xc0),
+            channel_palette: None,
+        },
+        // ── Porcelain: the other light theme, and cool where Sandstone is
+        // warm. Delft cobalt on cool white, with a violet sustain so the two
+        // note states are told apart by hue as well as by weight.
+        Theme {
+            name: "Porcelain".to_owned(),
+            white_key: c(0xfb, 0xfb, 0xfc),
+            black_key: c(0x2a, 0x33, 0x40),
+            key_active: c(0x2f, 0x5f, 0xa8),
+            sustain: c(0x8f, 0x66, 0xc0),
+            key_separator: c(0xb6, 0xbc, 0xc4),
+            text: c(0x23, 0x2a, 0x33),
+            theory_line: c(0x9a, 0xa4, 0xb0),
+            interval_text: c(0x3a, 0x6e, 0xa8),
+            recorder_bg: c(0xcc, 0xd2, 0xd9),
+            fx_knob: c(0x2f, 0x5f, 0xa8),
+            master_knob: c(0xa8, 0x3a, 0x30),
+            meter_bg: c(0x28, 0x31, 0x3c),
+            scope_draw: c(0x4a, 0x90, 0xd0),
+            fx_strip: c(0xdd, 0xe2, 0xe8),
+            input_chip: c(0x5a, 0x8a, 0x7a),
+            fretboard: c(0x39, 0x42, 0x4e),
+            string: c(0xc2, 0xc8, 0xd0),
+            channel_palette: None,
+        },
+        // ── Moss: deep forest, lichen text, and a low amber sustain. The
+        // sustain is DARKER than the struck note here — on a green ground a
+        // second bright mark competes with the first.
+        Theme {
+            name: "Moss".to_owned(),
+            white_key: c(0xe4, 0xea, 0xd9),
+            black_key: c(0x13, 0x1a, 0x12),
+            key_active: c(0x8f, 0xc4, 0x6a),
+            sustain: c(0xb0, 0x7f, 0x28),
+            key_separator: c(0x2c, 0x3a, 0x26),
+            text: c(0xe4, 0xea, 0xd9),
+            theory_line: c(0x6b, 0x7d, 0x5e),
+            interval_text: c(0xb9, 0xcf, 0x9a),
+            recorder_bg: c(0x2f, 0x40, 0x29),
+            fx_knob: c(0x8f, 0xc4, 0x6a),
+            master_knob: c(0xe8, 0x6a, 0x4a),
+            meter_bg: c(0x16, 0x1f, 0x13),
+            scope_draw: c(0xa8, 0xd8, 0x78),
+            fx_strip: c(0x26, 0x33, 0x1f),
+            input_chip: c(0x7f, 0xae, 0x94),
+            fretboard: c(0x1d, 0x27, 0x18),
+            string: c(0x9a, 0xa8, 0x8c),
+            channel_palette: None,
+        },
+        // ── Rhodes: black tolex, cream keys, and the nameplate's red on the
+        // master. Warm where Studio is neutral: this is a wooden instrument
+        // in a case, not a console in a rack.
+        Theme {
+            name: "Rhodes".to_owned(),
+            white_key: c(0xef, 0xe6, 0xd2),
+            black_key: c(0x16, 0x13, 0x11),
+            key_active: c(0xd9, 0xa4, 0x41),
+            sustain: c(0x8a, 0x6a, 0xb0),
+            key_separator: c(0x3a, 0x30, 0x2a),
+            text: c(0xef, 0xe6, 0xd2),
+            theory_line: c(0x7a, 0x6a, 0x58),
+            interval_text: c(0xc9, 0xa0, 0x6a),
+            recorder_bg: c(0x3c, 0x32, 0x2a),
+            fx_knob: c(0xd9, 0xa4, 0x41),
+            master_knob: c(0xe0, 0x58, 0x4a),
+            meter_bg: c(0x1a, 0x15, 0x12),
+            scope_draw: c(0xe8, 0xc4, 0x6a),
+            fx_strip: c(0x2e, 0x26, 0x20),
+            input_chip: c(0x8f, 0xa0, 0x6a),
+            fretboard: c(0x24, 0x1d, 0x18),
+            string: c(0xb8, 0xac, 0x98),
+            channel_palette: None,
+        },
+        // ── Copper: verdigris and rust, the two things copper becomes. The
+        // patina is the ground and the oxide is what moves.
+        Theme {
+            name: "Copper".to_owned(),
+            white_key: c(0xe8, 0xe2, 0xd4),
+            black_key: c(0x14, 0x20, 0x1d),
+            key_active: c(0xe0, 0x8a, 0x4a),
+            sustain: c(0x6f, 0xd8, 0xc0),
+            key_separator: c(0x2f, 0x4a, 0x44),
+            text: c(0xe8, 0xe2, 0xd4),
+            theory_line: c(0x6a, 0x8a, 0x82),
+            interval_text: c(0x8f, 0xd8, 0xc8),
+            recorder_bg: c(0x2c, 0x4a, 0x44),
+            fx_knob: c(0xe0, 0x8a, 0x4a),
+            master_knob: c(0xf0, 0x70, 0x58),
+            meter_bg: c(0x16, 0x24, 0x23),
+            scope_draw: c(0x6f, 0xd8, 0xc0),
+            fx_strip: c(0x23, 0x3a, 0x36),
+            input_chip: c(0xc0, 0x8a, 0x5a),
+            fretboard: c(0x1b, 0x2f, 0x2b),
+            string: c(0xa8, 0xb8, 0xb2),
+            channel_palette: None,
+        },
+        // ── Dusk: the sky twenty minutes after sunset — violet overhead,
+        // warm at the horizon. The horizon colour is what sounds; the
+        // overhead blue is what is held.
+        Theme {
+            name: "Dusk".to_owned(),
+            white_key: c(0xec, 0xe6, 0xf0),
+            black_key: c(0x16, 0x12, 0x28),
+            key_active: c(0xf0, 0x92, 0x5a),
+            sustain: c(0x7f, 0x8c, 0xe0),
+            key_separator: c(0x33, 0x2a, 0x4a),
+            text: c(0xec, 0xe6, 0xf0),
+            theory_line: c(0x6a, 0x5f, 0x8a),
+            interval_text: c(0xc0, 0xa8, 0xe8),
+            recorder_bg: c(0x3a, 0x2f, 0x55),
+            fx_knob: c(0xf0, 0x92, 0x5a),
+            master_knob: c(0xe0, 0x4a, 0x6a),
+            meter_bg: c(0x1b, 0x16, 0x30),
+            scope_draw: c(0xf0, 0xb0, 0x70),
+            fx_strip: c(0x2c, 0x24, 0x44),
+            input_chip: c(0x8f, 0x7f, 0xd0),
+            fretboard: c(0x22, 0x1b, 0x3a),
+            string: c(0x9a, 0x90, 0xb8),
+            channel_palette: None,
+        },
+        // ── Iris: deep violet with its complement, chartreuse. The widest
+        // hue gap in the set, so a sounding note cannot be mistaken for a
+        // held one at any glance.
+        Theme {
+            name: "Iris".to_owned(),
+            white_key: c(0xee, 0xe8, 0xf4),
+            black_key: c(0x19, 0x10, 0x26),
+            key_active: c(0xc8, 0xe0, 0x5a),
+            sustain: c(0xb0, 0x7f, 0xe8),
+            key_separator: c(0x3a, 0x2a, 0x52),
+            text: c(0xee, 0xe8, 0xf4),
+            theory_line: c(0x6f, 0x5a, 0x8c),
+            interval_text: c(0xd8, 0xe8, 0x8a),
+            recorder_bg: c(0x3f, 0x2d, 0x5c),
+            fx_knob: c(0xc8, 0xe0, 0x5a),
+            master_knob: c(0xe0, 0x50, 0x7a),
+            meter_bg: c(0x1e, 0x13, 0x30),
+            scope_draw: c(0xd8, 0xf0, 0x70),
+            fx_strip: c(0x31, 0x22, 0x43),
+            input_chip: c(0x9f, 0x7f, 0xd8),
+            fretboard: c(0x25, 0x18, 0x40),
+            string: c(0xa8, 0x98, 0xc0),
             channel_palette: None,
         },
     ]
@@ -548,6 +758,7 @@ pub const EXAMPLE: &str = r##"{
   "black_key": "",
   "key_active": "",
   "sustain": "",
+  "key_separator": "",
 
   "text": "",
   "theory_line": "",
@@ -585,9 +796,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_factory_set_is_eight_themes_with_default_first() {
+    fn the_factory_set_is_sixteen_themes_with_default_first() {
         let f = factory();
-        assert_eq!(f.len(), 8, "the owner asked for Default plus seven");
+        assert_eq!(f.len(), 16, "Default, seven, and eight more");
         assert_eq!(f[0].name, "Default");
         // **Default RESTORES rather than declining to speak.** A theme that
         // set nothing left whatever the last theme wrote, so picking Default
@@ -624,6 +835,7 @@ mod tests {
                 ("black_key", t.black_key.is_some()),
                 ("key_active", t.key_active.is_some()),
                 ("sustain", t.sustain.is_some()),
+                ("key_separator", t.key_separator.is_some()),
                 ("text", t.text.is_some()),
                 ("theory_line", t.theory_line.is_some()),
                 ("interval_text", t.interval_text.is_some()),
