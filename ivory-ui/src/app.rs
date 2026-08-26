@@ -11232,6 +11232,11 @@ impl IvoryApp {
         self.settings.audio_system().map(str::to_owned)
     }
 
+    /// The desk's routing table, for the host to hand to the engine.
+    pub fn routes(&self) -> &crate::routing::Routes {
+        &self.settings.routes
+    }
+
     /// Whether the master out is being streamed over ReaStream.
     pub fn reastream_enabled(&self) -> bool {
         self.settings.reastream_enabled
