@@ -765,61 +765,108 @@ impl Layout {
         } else {
             slice_h(bar, 0.00, 0.28)
         };
+        // **One row, evenly spaced, spanning exactly the LCD above it.**
+        //
+        // The owner's rule: the tempo is as far from the tap chip as the tap
+        // chip is from Record, and so on down the row. That is EDGE gaps, not
+        // centre pitch — the knob cell is wider than a transport button, so
+        // equal pitch would put visibly different air between different pairs
+        // and read as an accident.
+        //
+        // And the row fills the bar end to end, which is the same width as
+        // the timecode cluster above (both are vertical slices of `col`), so
+        // the two read as one instrument rather than a wide readout with a
+        // short strip under it.
+        let (line, from_knob) = knob_centre(head).map_or((bar.center().y, None), |c| {
+            (c.y, knob_face(head).map(|k| k.radius * 2.0))
+        });
+        let side = from_knob
+            .map_or(bar.height() * TRANSPORT_SIDE, |d| d * TRANSPORT_SIDE)
+            .min(bar.width() * 0.125);
+        // What stands in the row, left to right, by WIDTH. The knob keeps its
+        // own cell width; the tap chip is a peer now rather than a passenger
+        // in the knob's slack; every transport icon is one square.
+        // **The same nine slots in BOTH layouts**, occupied or not. The row
+        // has always kept one rule above the others: Stop stands exactly
+        // where it stood when the take started. A rolling row that dropped
+        // the tap chip and the three buttons it does not use would slide
+        // everything left and break that on the one press that matters most.
+        // So the grid is fixed and the rolling state simply leaves slots
+        // empty.
+        let tap_w = (side * 1.9).clamp(24.0, 38.0);
+        const ICONS: usize = 7;
+        let mut widths: Vec<f32> = Vec::with_capacity(ICONS + 2);
+        widths.push(head.width());
+        widths.push(tap_w);
+        for _ in 0..ICONS {
+            widths.push(side);
+        }
+        let total: f32 = widths.iter().sum();
+        // The gap that makes the row span the bar exactly. Never negative:
+        // at the narrowest band the items simply sit shoulder to shoulder
+        // rather than overlapping.
+        // **A floor under the gap, because touching is overlapping.** Two
+        // hit regions that share an edge are two controls a press between
+        // them can land on either of — the overlap guard says so, and it is
+        // right. Where the row cannot afford the floor, every item shrinks
+        // to pay for it rather than the row spilling past the bar.
+        const MIN_GAP: f32 = 3.0;
+        let slots = widths.len().saturating_sub(1) as f32;
+        let mut gap = if slots > 0.0 {
+            (bar.width() - total) / slots
+        } else {
+            0.0
+        };
+        if gap < MIN_GAP {
+            gap = MIN_GAP;
+            let room = (bar.width() - gap * slots).max(1.0);
+            let scale = (room / total).min(1.0);
+            for w in &mut widths {
+                *w *= scale;
+            }
+        }
+        let total: f32 = widths.iter().sum();
+        let _ = total;
+        // **The even spacing is HORIZONTAL only.** Each item keeps the
+        // vertical placement it already had — the knob sits on the foot of
+        // the row, the buttons ride the knob's centre line — because a cell
+        // that inherited the bar's own height collapsed to nothing on a short
+        // band and took every control in the row with it.
+        let mut x = bar.left();
+        let mut spans: Vec<(f32, f32)> = Vec::with_capacity(widths.len());
+        for w in &widths {
+            spans.push((x, x + w));
+            x += w + gap;
+        }
+        let centre = |i: usize| spans.get(i).map(|(a, b)| (a + b) * 0.5);
+        // The knob keeps the cell it was sized into, moved to its new place.
+        let head = centre(0).map_or(head, |cx| {
+            Rect::from_center_size(Pos2::new(cx, head.center().y), head.size())
+        });
         if rolling {
             self.timecode = head;
             self.tempo_tap = Rect::NOTHING;
         } else {
             self.tempo = head;
-            // **The TAP chip lives in the knob cell's slack.** The circle is
-            // budgeted from the face's SHORTER side, so a wide cell leaves
-            // room beside the skirt; the chip takes the right-hand slack
-            // when there is enough of it and stands down when there is not
-            // — a control that would overlap the ticks is worse than none.
-            self.tempo_tap = knob_face(head).map_or(Rect::NOTHING, |f| {
-                let slack = f.face.width() * 0.5 - f.radius * 1.26;
-                if slack < 26.0 {
-                    return Rect::NOTHING;
-                }
-                let w = (slack - 6.0).min(34.0);
-                let h = (f.radius * 0.9).clamp(11.0, 16.0);
+            self.tempo_tap = centre(1).map_or(Rect::NOTHING, |cx| {
                 Rect::from_center_size(
-                    Pos2::new(f.face.right() - w * 0.5 - 2.0, f.face.center().y),
-                    Vec2::new(w, h),
+                    Pos2::new(cx, line),
+                    Vec2::new(tap_w.min(widths[1]), (side * 0.9).clamp(11.0, 16.0)),
                 )
             });
         }
-        // **The buttons start where the knob's CELL ends**, not at a fraction
-        // of the row. The knob's ticks stand outside its body but inside its
-        // cell, so a gap measured from the row left a hole that looked like
-        // something was missing from it.
-        let buttons = Rect::from_min_max(
-            Pos2::new(head.right() + bar.width() * 0.02, bar.top()),
-            bar.max,
-        );
-        // **Sized and lined up against the KNOB, not against the row.** They
-        // are one group with it, and a group whose parts are measured from
-        // different things is a group that only looks like one by accident:
-        // the knob's circle hangs in its own face, under a label the buttons
-        // do not have, so a row-centred button sat visibly below it.
-        //
-        // Their side comes off the knob's body diameter — the thing you see —
-        // and smaller than it, because the transport's job is Record and the
-        // tempo is what you set once.
-        let (line, from_knob) = knob_centre(head).map_or((buttons.center().y, None), |c| {
-            (c.y, knob_face(head).map(|k| k.radius * 2.0))
-        });
-        let side = from_knob
-            .map_or(buttons.height() * TRANSPORT_SIDE, |d| d * TRANSPORT_SIDE)
-            // Seven slots at a pitch of a seventh of the row: the cap
-            // keeps a gap between neighbours at the narrowest band.
-            .min(buttons.width() * 0.125);
-        // Seven slots: the owner's order — Rec, Play, Stop, Pause — then
-        // the cog, the cassette and the folder. Fourteenths, and BOTH
-        // layouts use them, so stop stands exactly where it stood when the
-        // take starts — the rule this row has always kept.
+        // Slot 0 is the knob (or the clock), slot 1 the tap chip, and the
+        // seven transport slots follow — in both layouts.
+        let first_icon = 2;
         let icon = |i: usize| {
-            let cx = buttons.left() + buttons.width() * (i as f32 * 2.0 + 1.0) / 14.0;
-            Rect::from_center_size(Pos2::new(cx, line), Vec2::splat(side))
+            let at = first_icon + i;
+            centre(at).map_or(Rect::NOTHING, |cx| {
+                // Never wider than the span it was given: the spans are what
+                // the even spacing guarantees, and a square that overhung one
+                // would reach into its neighbour's gap.
+                let d = side.min(widths.get(at).copied().unwrap_or(side));
+                Rect::from_center_size(Pos2::new(cx, line), Vec2::splat(d))
+            })
         };
         // The typing box, under the knob and only ever drawn while somebody is
         // typing into it. Allowed to hang below the column: it is an overlay
