@@ -167,7 +167,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use vst3::Steinberg::Vst::IAttributeList_::AttrID;
 use vst3::Steinberg::Vst::{
@@ -679,6 +679,14 @@ struct ComponentHandler {
     used: AtomicUsize,
     edits: AtomicU64,
     restarts: AtomicU64,
+    /// The plugin has said its LATENCY changed and the host must ask again.
+    ///
+    /// **Set from `restartComponent`, which used to throw its flags away.**
+    /// Several samplers and every lookahead limiter worth having change
+    /// latency on a preset change — a host that read the figure once at load
+    /// would compensate for a delay the plugin no longer has, which is worse
+    /// than not compensating at all: the error is silent and it moves.
+    latency_dirty: AtomicBool,
     /// Edits that arrived after every slot was claimed by a different
     /// parameter. Counted rather than dropped silently, because the symptom is
     /// "one control in this plugin does nothing".
@@ -698,6 +706,7 @@ impl ComponentHandler {
             used: AtomicUsize::new(0),
             edits: AtomicU64::new(0),
             restarts: AtomicU64::new(0),
+            latency_dirty: AtomicBool::new(false),
             overflow: AtomicU64::new(0),
         }
     }
@@ -753,7 +762,7 @@ impl IComponentHandlerTrait for ComponentHandler {
         kResultOk
     }
 
-    unsafe fn restartComponent(&self, _flags: int32) -> tresult {
+    unsafe fn restartComponent(&self, flags: int32) -> tresult {
         // `kResultOk` and not `kNotImplemented`: a plugin that is told its
         // restart request failed can and does take that as a fatal condition,
         // and every flag it could ask for here (parameter values changed,
@@ -764,6 +773,14 @@ impl IComponentHandlerTrait for ComponentHandler {
         // the host, which is precisely how a host with no `performEdit`
         // forwarding can look like it works.
         self.restarts.fetch_add(1, Ordering::Relaxed);
+        // **Except the latency, which is not a value this host re-reads by
+        // accident.** Everything else in that comment above is refreshed by
+        // reading fresh values on the next block; a latency figure is asked
+        // for once and then acted on for as long as the plugin is loaded, so
+        // it is the one flag that has to be remembered.
+        if flags & vst3::Steinberg::Vst::RestartFlags_::kLatencyChanged as i32 != 0 {
+            self.latency_dirty.store(true, Ordering::Relaxed);
+        }
         kResultOk
     }
 }
@@ -1304,6 +1321,31 @@ impl Instance {
     /// Diagnostic. A rising first number with an unchanging sound is the exact
     /// symptom [`Instance::drain_editor_edits`] exists to cure, so it is worth
     /// being able to see.
+    /// How many frames this plugin delays its output by.
+    ///
+    /// Asked of the plugin rather than guessed, and asked AFTER activation:
+    /// VST3 says the figure is only meaningful once the processor is set up
+    /// and active, and a lookahead limiter that has not been told its block
+    /// size has nothing to report yet.
+    pub fn latency_samples(&self) -> u32 {
+        // SAFETY: the same contract every other `processor` call here keeps —
+        // main thread, instance alive, no reentrancy. `getLatencySamples`
+        // takes nothing and returns a plain `uint32`: no tresult, no
+        // out-parameter, nothing to leak on failure.
+        unsafe { self.processor.getLatencySamples() }
+    }
+
+    /// Whether the plugin has asked the host to read its latency again since
+    /// this was last called. Clears on read.
+    ///
+    /// A flag rather than a number because the READ has to happen on the
+    /// main thread — `getLatencySamples` is not a `process`-safe call — so
+    /// the audio thread can only be told that an answer is stale, never
+    /// fetch a new one itself.
+    pub fn take_latency_dirty(&self) -> bool {
+        self.handler.latency_dirty.swap(false, Ordering::Relaxed)
+    }
+
     pub fn editor_edits(&self) -> (u64, u64) {
         (
             self.handler.edits.load(Ordering::Relaxed),

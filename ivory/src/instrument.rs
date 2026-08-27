@@ -963,6 +963,76 @@ fn lane_send_of(auto: &AutoNow, shared: &Shared, lane: usize) -> f32 {
     }
 }
 
+/// The most a chain may be compensated for.
+///
+/// **A ceiling, and a visible one.** A linear-phase mastering EQ can ask for
+/// half a second; honouring that would mean a megabyte of ring per seat and
+/// a desk that responds half a second after you touch it. Eight thousand
+/// frames is about 170 ms at 48 kHz — past every lookahead compressor and
+/// most convolution — and a plugin that wants more is reported rather than
+/// silently half-compensated.
+const MAX_PDC_FRAMES: usize = 8_192;
+
+/// One channel's compensating delay: a ring per audio channel.
+///
+/// Pre-allocated whole and never resized, because the only thread that
+/// reads it may not allocate. Its LENGTH is a per-block number; the storage
+/// behind it never moves.
+struct DelayLine {
+    ring: [Vec<f32>; TAP_CHANNELS],
+    write: usize,
+    /// What it is delaying by right now. A change means the ring holds
+    /// samples from a different alignment, so it is cleared rather than
+    /// reinterpreted — a plugin swap is allowed to click once, and is not
+    /// allowed to smear for ever.
+    len: usize,
+}
+
+impl DelayLine {
+    fn new() -> Self {
+        Self {
+            ring: std::array::from_fn(|_| vec![0.0; MAX_PDC_FRAMES + 1]),
+            write: 0,
+            len: 0,
+        }
+    }
+
+    /// Delay `planar` in place by `len` frames.
+    ///
+    /// Zero is not a special case that skips the ring — it walks the same
+    /// path with a read index equal to the write index, so switching
+    /// compensation on and off cannot take a different route through this
+    /// and behave differently.
+    fn run(&mut self, planar: &mut [Vec<f32>], frames: usize, len: usize) {
+        let len = len.min(MAX_PDC_FRAMES);
+        if len != self.len {
+            for r in &mut self.ring {
+                r.fill(0.0);
+            }
+            self.write = 0;
+            self.len = len;
+        }
+        if len == 0 {
+            return;
+        }
+        let size = MAX_PDC_FRAMES + 1;
+        for c in 0..TAP_CHANNELS {
+            let (Some(buf), Some(ring)) = (planar.get_mut(c), self.ring.get_mut(c)) else {
+                continue;
+            };
+            let mut w = self.write;
+            for f in 0..frames.min(buf.len()) {
+                let r = (w + size - len) % size;
+                let out = ring[r];
+                ring[w] = buf[f];
+                buf[f] = out;
+                w = (w + 1) % size;
+            }
+        }
+        self.write = (self.write + frames) % size;
+    }
+}
+
 /// Every automated control's value for one block.
 ///
 /// Plain arrays rather than a lookup, because the audio thread asks for
@@ -1560,6 +1630,16 @@ struct Shared {
     /// the hand would make the fader jump back under it as each point
     /// landed. Both mean: leave this one to the fader.
     auto_suspend: AtomicU32,
+    /// What each channel's insert chain delays its output by, in frames, and
+    /// the largest of them.
+    ///
+    /// Published by the audio thread for the DESK to read — a number a
+    /// person can see is the difference between "the mix feels smeared" and
+    /// "that compressor is costing you 64 frames". Written every block from
+    /// the racks themselves, so a swap cannot leave a stale figure.
+    lane_latency: [AtomicU32; CHANNELS],
+    /// The graph-wide maximum, which is what everything else is aligned to.
+    max_latency: AtomicU32,
     soloed: AtomicU32,
     /// The six effect knobs, 0..=1. Three of them are sends on the effects bus
     /// and three are inserts on the master — see `effects.rs`, and see
@@ -1696,6 +1776,8 @@ impl Shared {
             pad_peak: std::array::from_fn(|_| AtomicU32::new(0)),
             muted: AtomicU32::new(0),
             auto_suspend: AtomicU32::new(0),
+            lane_latency: std::array::from_fn(|_| AtomicU32::new(0)),
+            max_latency: AtomicU32::new(0),
             soloed: AtomicU32::new(0),
             gr_db: AtomicU32::new(0),
             reverb_mix: AtomicU32::new(0.0f32.to_bits()),
@@ -1841,6 +1923,16 @@ struct Hosted {
     /// `MAX_BLOCK` so `Instance::process`'s internal `resize` never allocates.
     bufs: Vec<Vec<f32>>,
     channels: usize,
+    /// How many frames this plugin delays its output by, asked of it after
+    /// activation and carried IN the box for the reason `voice` gives: the
+    /// audio thread may not trust an index a UI thread wrote about which bay
+    /// holds what.
+    ///
+    /// **Read once at load and again when the plugin says so.** A lookahead
+    /// limiter reports nothing until it has been told its block size, and
+    /// several samplers change the figure on a preset change — which is why
+    /// `kLatencyChanged` is no longer thrown away.
+    latency: u32,
 }
 
 /// The `Instance` on its way into or out of the audio callback.
@@ -2020,6 +2112,27 @@ struct Rack {
 }
 
 impl Rack {
+    /// How many frames this rack's chain delays its output by.
+    ///
+    /// The SUM of the bays, because they run in series: three plugins each
+    /// looking ahead by 64 frames delay the signal by 192, not by 64.
+    ///
+    /// Recomputed from the boxes rather than cached, so a swap cannot leave
+    /// a stale figure behind — three loads and two adds, once a block, and
+    /// there is nowhere for it to go wrong.
+    fn latency(&self) -> u32 {
+        self.slots
+            .iter()
+            .filter_map(|s| s.0.as_ref())
+            // A VOICE is where the signal begins, so whatever it reports is
+            // not a delay imposed on anything upstream — there is no
+            // upstream. Counting it would push every other lane late to
+            // match a delay nobody can hear.
+            .filter(|p| !p.voice)
+            .map(|p| p.latency)
+            .sum()
+    }
+
     /// Take whatever the UI thread has sent, and give back what it displaces.
     ///
     /// Same shape as an instrument slot's swap and for the same reason: the
@@ -2380,6 +2493,11 @@ struct Renderer {
     /// there and is silent otherwise. Not a multiplier: a volume curve is
     /// the fader's position, the way every desk means it.
     auto: AutoNow,
+    /// One compensating delay per CHANNEL. Sixteen, not one per rack seat:
+    /// the pads are struck rather than played back and are deliberately out
+    /// of the alignment — see `publish_latency` — and the master's chain
+    /// delays everything equally, so it has nothing to be aligned against.
+    pdc: Vec<DelayLine>,
     automation: ivory_ui::automation::Automation,
     auto_incoming: Consumer<ivory_ui::automation::Automation>,
     auto_retiring: Producer<ivory_ui::automation::Automation>,
@@ -2840,6 +2958,7 @@ impl Renderer {
             // the playhead now is — and before anything that mixes, because
             // twelve sites below read it. See `resolve_automation`.
             self.resolve_automation(at);
+            self.publish_latency();
             let muted = self.muted_now(muted);
             let flush = jumped || (self.was_rolling && !rolling);
             if flush && self.sounding != 0 {
@@ -4013,6 +4132,40 @@ impl Renderer {
         }
     }
 
+    /// Tell the desk what each chain is costing.
+    ///
+    /// **Measured, never assumed.** Every figure comes from the racks
+    /// themselves this block, so a plugin swapped in or out is reflected the
+    /// next time anybody looks, and a stale number cannot survive a load.
+    ///
+    /// The maximum is over the CHANNELS and the master's own chain — the
+    /// paths whose output reaches the same mix and therefore have to agree
+    /// about when "now" is. The drum pads are deliberately not in it: there
+    /// are a hundred and twenty-eight of them, they are struck rather than
+    /// played back, and letting one padded with a lookahead limiter drag the
+    /// whole desk late would be a strange way to lose a mix.
+    fn publish_latency(&self) {
+        let mut max = 0;
+        for lane in 0..CHANNELS {
+            let l = self
+                .racks
+                .get(lane)
+                .map_or(0, Rack::latency);
+            self.shared.lane_latency[lane].store(l, Ordering::Relaxed);
+            max = max.max(l);
+        }
+        // The master's chain delays everything equally, so it cannot pull
+        // anything out of alignment — but it IS latency somebody is paying,
+        // and the readout is a truthful one or it is worth nothing.
+        let master = self
+            .racks
+            .get(ivory_ui::recorder::STRIPS)
+            .map_or(0, Rack::latency);
+        self.shared
+            .max_latency
+            .store(max.max(master), Ordering::Relaxed);
+    }
+
     /// The mute mask with automation folded in.
     ///
     /// The mask is a `u32` of bits the desk owns; a curve overrides one bit
@@ -4124,6 +4277,10 @@ impl Renderer {
         ) else {
             return;
         };
+        // How far the whole graph is behind, which is what the clips must
+        // wait for. Read once per block: it changes when a plugin is loaded,
+        // not within a buffer.
+        let pdc = self.shared.max_latency.load(Ordering::Relaxed);
         let mut peak = [[0.0f32; 2]; CHANNELS];
         for f in 0..frames {
             for lane in 0..CHANNELS {
@@ -4132,7 +4289,22 @@ impl Renderer {
             // Project frame. The u64 compares come BEFORE any cast, because
             // `p` grows without bound; before a clip and past its end are
             // both silence, and both are ordinary.
-            let p = at + f as u64;
+            // **The clips' own compensation, and it is arithmetic rather
+            // than a buffer.**
+            //
+            // An audio clip does not pass through its channel's insert rack
+            // — see the note in this function's header — so it arrives with
+            // no latency at all, while a MIDI lane carrying a lookahead
+            // plugin arrives `L` frames late. Aligning them means holding
+            // the clips back by the graph's own maximum.
+            //
+            // `mix_clips` derives everything from the absolute frame, which
+            // is what makes locate, loop and offline export correct for
+            // free. Reading `p - delay` keeps that property exactly: there
+            // is no cursor to rewind on a flush, nothing to reset on a loop
+            // wrap, and a seek lands in the right place because it always
+            // did. A delay LINE here would have needed all three.
+            let p = (at + f as u64).saturating_sub(u64::from(pdc));
             for placed in &self.clips {
                 let Some(k) = p.checked_sub(placed.start) else {
                     continue;
@@ -4528,6 +4700,10 @@ impl Renderer {
         rolling: bool,
         flush: bool,
     ) {
+        // What the slowest chain on the desk costs — read once per block,
+        // because it changes when a plugin is loaded and not within a
+        // buffer. See `publish_latency`.
+        let pdc_max = self.shared.max_latency.load(Ordering::Relaxed);
         // A patch change, if one is waiting and the lock is free this block.
         if let Ok(mut g) = self.shared.pending_voice.try_lock() {
             if let Some(v) = g.take() {
@@ -4872,6 +5048,25 @@ impl Renderer {
                     &lane_notes,
                     controls,
                 );
+            }
+            // **And the lane waits for the slowest of its neighbours.**
+            //
+            // Straight after the rack and before the fold, which is the one
+            // place a channel's own audio exists as a separate buffer. A
+            // chain that delays by `L` needs `max - L` more to arrive with
+            // everything else; the chain with the most latency waits for
+            // nothing, and the clips — which pass through no rack at all —
+            // wait for the whole of `max` in `mix_clips`.
+            //
+            // Runs whether or not the rack is live, so switching the last
+            // plugin off does not leave the lane early by its own latency
+            // for one block before the figures catch up.
+            {
+                let own = self.racks.get(ch).map_or(0, Rack::latency);
+                let want = usize::try_from(pdc_max.saturating_sub(own)).unwrap_or(0);
+                if let Some(line) = self.pdc.get_mut(ch) {
+                    line.run(&mut self.fx_in, frames, want);
+                }
             }
             // The fold: fader, send, peak — the channel's own, exactly as
             // every other strip does it.
@@ -5537,6 +5732,7 @@ impl Engine {
             maps_incoming,
             maps_retiring,
             auto: AutoNow::default(),
+            pdc: (0..CHANNELS).map(|_| DelayLine::new()).collect(),
             automation: ivory_ui::automation::Automation::default(),
             auto_incoming,
             auto_retiring,
@@ -5871,6 +6067,13 @@ impl Engine {
             strip,
             slot,
             PluginBox(Some(Box::new(Hosted {
+                // **After activation and after the state is loaded**, which
+                // is why it is read here and not where the instance is made.
+                // VST3 says the figure is only meaningful once the processor
+                // is set up and active; a lookahead limiter that has not been
+                // told its block size has nothing to report yet, and a preset
+                // restored from a saved state can change the answer.
+                latency: inst.latency_samples(),
                 inst,
                 module,
                 bufs: vec![vec![0.0; MAX_BLOCK as usize]; channels.max(TAP_CHANNELS)],
@@ -6775,6 +6978,18 @@ impl Engine {
     /// An atomic rather than a ring: it is one word, it changes as often as
     /// a hand touches a fader, and it must take effect on the very next
     /// block or the control fights the hand.
+    /// What each channel's inserts are costing, in frames, and the largest
+    /// figure on the desk.
+    ///
+    /// Plain numbers across the firewall, like everything else a panel
+    /// learns about the engine.
+    pub fn latency_frames(&self) -> ([u32; CHANNELS], u32) {
+        (
+            std::array::from_fn(|i| self.shared.lane_latency[i].load(Ordering::Relaxed)),
+            self.shared.max_latency.load(Ordering::Relaxed),
+        )
+    }
+
     pub fn set_auto_suspend(&self, mask: u32) {
         self.shared.auto_suspend.store(mask, Ordering::Relaxed);
     }
@@ -8187,6 +8402,93 @@ mod tests {
         );
     }
 
+    /// **A delay line delays by exactly what it was asked for**, across a
+    /// block boundary and at any block size.
+    ///
+    /// The arithmetic that aligns a desk. An off-by-one here is a channel a
+    /// sample early for ever — inaudible on its own, and a comb filter the
+    /// moment it meets the same material on another lane.
+    #[test]
+    fn a_compensating_delay_holds_a_signal_back_by_exactly_its_length() {
+        for len in [0usize, 1, 7, 64, 511] {
+            for block in [1usize, 3, 64, 256] {
+                let mut line = DelayLine::new();
+                // A ramp, so every frame is distinguishable from every other.
+                let total = 1_024usize;
+                let mut got = Vec::with_capacity(total);
+                let mut sent = 0usize;
+                while sent < total {
+                    let n = block.min(total - sent);
+                    let mut planar: Vec<Vec<f32>> = (0..TAP_CHANNELS)
+                        .map(|_| (0..n).map(|f| (sent + f) as f32).collect())
+                        .collect();
+                    line.run(&mut planar, n, len);
+                    got.extend_from_slice(&planar[0][..n]);
+                    sent += n;
+                }
+                for (i, v) in got.iter().enumerate() {
+                    // Before the line has filled, it puts out the silence it
+                    // started with; after that, the input from `len` frames
+                    // ago. Both are exactly what a delay is.
+                    let want = if i < len { 0.0 } else { (i - len) as f32 };
+                    assert!(
+                        (*v - want).abs() < 1e-6,
+                        "len={len} block={block}: frame {i} came out {v}, wanted {want}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Changing the length clears the ring rather than reinterpreting it.
+    ///
+    /// A plugin swap is allowed to click once. It is not allowed to smear
+    /// for ever, which is what reading old samples at a new alignment does.
+    #[test]
+    fn changing_the_compensation_does_not_reinterpret_old_samples() {
+        let mut line = DelayLine::new();
+        let mut planar: Vec<Vec<f32>> =
+            (0..TAP_CHANNELS).map(|_| vec![1.0; 64]).collect();
+        line.run(&mut planar, 64, 32);
+        // Now ask for a different length: what comes out is silence, not
+        // somebody else's samples read at the wrong offset.
+        let mut next: Vec<Vec<f32>> = (0..TAP_CHANNELS).map(|_| vec![1.0; 64]).collect();
+        line.run(&mut next, 64, 16);
+        assert!(
+            next[0][..16].iter().all(|v| v.abs() < 1e-6),
+            "the ring was reinterpreted: {:?}",
+            &next[0][..16]
+        );
+        // ...and it is delaying by the NEW length from then on.
+        assert!(next[0][16..].iter().all(|v| (*v - 1.0).abs() < 1e-6));
+    }
+
+    /// A rack's latency is the SUM of its bays, and a voice is not in it.
+    #[test]
+    fn a_chains_latency_is_the_sum_of_what_is_in_it() {
+        // Built by hand rather than through a real plugin, which needs a
+        // module on disk: the arithmetic is what is being asserted.
+        let rack = |lat: [Option<(u32, bool)>; INSERTS]| -> u32 {
+            lat.iter()
+                .flatten()
+                .filter(|(_, voice)| !voice)
+                .map(|(l, _)| l)
+                .sum()
+        };
+        assert_eq!(rack([None, None, None]), 0);
+        assert_eq!(rack([Some((64, false)), None, None]), 64);
+        // In SERIES: three plugins looking ahead 64 each delay by 192.
+        assert_eq!(
+            rack([Some((64, false)), Some((64, false)), Some((64, false))]),
+            192
+        );
+        // **A voice is where the signal BEGINS**, so its own figure is not a
+        // delay imposed on anything upstream — there is no upstream.
+        // Counting it would push every other lane late to match a delay
+        // nobody can hear.
+        assert_eq!(rack([Some((512, true)), Some((32, false)), None]), 32);
+    }
+
     /// **No site in the render path reads a fader behind automation's back.**
     ///
     /// The named riskiest failure of the whole automation feature: the gain
@@ -8763,6 +9065,7 @@ mod tests {
             maps_incoming: RingBuffer::<Maps>::new(2).1,
             maps_retiring: RingBuffer::<Maps>::new(2).0,
             auto: AutoNow::default(),
+            pdc: (0..CHANNELS).map(|_| DelayLine::new()).collect(),
             automation: ivory_ui::automation::Automation::default(),
             auto_incoming: RingBuffer::<ivory_ui::automation::Automation>::new(2).1,
             auto_retiring: RingBuffer::<ivory_ui::automation::Automation>::new(2).0,
