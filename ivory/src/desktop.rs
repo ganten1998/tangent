@@ -495,6 +495,25 @@ const CLIP_WAVE_BUCKETS: usize = 600;
 /// interleaved stereo folded to one magnitude per bucket — the played
 /// span's picture, where `Clip::envelope` is the whole file's.
 #[cfg(feature = "recorder")]
+/// Seconds on the timeline to frames at `rate` — the ONE conversion.
+///
+/// **It was four hand-written copies of the same closure**, in the live clip
+/// builder (twice, once for MIDI and once for audio), in the offline bounce's
+/// mirror of it, and in the arrangement recorder. They agreed, which is the
+/// only reason nothing was wrong: `reload_clips` and `start_offline_bounce`
+/// have no shared helper at all, so what you hear and what you export are two
+/// separately-maintained readings of the same document.
+///
+/// One function so a tempo map — which turns this from a multiply into a walk
+/// along a piecewise curve — cannot be taught to three of the four.
+///
+/// `max(0.0)` because a negative position is a document that has been edited
+/// by hand, and `as u64` on a negative float saturates to zero anyway; saying
+/// so is better than relying on it.
+fn frames_at(rate: f64, seconds: f64) -> u64 {
+    (seconds.max(0.0) * rate).round() as u64
+}
+
 fn span_envelope(
     clip: &ivory_record::decode::Clip,
     offset: usize,
@@ -3743,7 +3762,7 @@ impl DesktopApp {
                 std::path::PathBuf,
                 Arc<ivory_record::decode::Clip>,
             > = std::collections::HashMap::new();
-            let frames = |sec: f64| (sec.max(0.0) * f64::from(rate)).round() as u64;
+            let frames = |s: f64| frames_at(f64::from(rate), s);
             for clip in &doc.clips {
                 if clip.kind == ivory_ui::arrangement::ClipKind::Midi {
                     let mut notes: Vec<crate::instrument::ClipNote> = clip
@@ -4242,7 +4261,7 @@ impl DesktopApp {
             // re-attacked, and the walk in `mix_channels` needs them sorted.
             if clip.kind == ivory_ui::arrangement::ClipKind::Midi {
                 span = span.max(clip.start_s + clip.len_s);
-                let frames = |s: f64| (s.max(0.0) * f64::from(rate)).round() as u64;
+                let frames = |s: f64| frames_at(f64::from(rate), s);
                 let mut notes: Vec<crate::instrument::ClipNote> = clip
                     .notes
                     .iter()
@@ -4294,7 +4313,7 @@ impl DesktopApp {
             }
             let len_s = clip.play_len_s(file_s);
             span = span.max(clip.start_s + len_s);
-            let frames = |s: f64| (s.max(0.0) * f64::from(rate)).round() as u64;
+            let frames = |s: f64| frames_at(f64::from(rate), s);
             placed.push(crate::instrument::Placed {
                 clip: Arc::clone(&decoded),
                 strip: clip.lane.min(ivory_ui::recorder::CHANNELS - 1),
@@ -4846,7 +4865,7 @@ impl DesktopApp {
                 [None; ivory_ui::recorder::CHANNELS];
             if let Some(rec) = self.recorder.arr_rec.as_ref() {
                 let rate = f64::from(e.output().sample_rate).max(1.0);
-                let at = (rec.start_s.max(0.0) * rate).round() as u64;
+                let at = frames_at(rate, rec.start_s);
                 for l in &rec.midi_lanes {
                     if *l < punches.len() {
                         punches[*l] = Some(at);
