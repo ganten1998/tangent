@@ -1678,6 +1678,19 @@ mod shot {
     ///
     ///   IVORY_SHOT=/tmp/x.png cargo test -p ivory --bins shot::window \
     ///     -- --ignored --nocapture
+    ///
+    /// **It photographs the COMPOSITE, not the app's own frame**, and the
+    /// distinction costs an hour if you meet it by surprise. `Compositor::frame`
+    /// paints what the video records — the bands and the keyboard — from a
+    /// `&IvoryApp`; it never calls `app.frame(ctx)`. So nothing that lives in
+    /// an egui pass can appear here: no menu, no dialog, no mixer. Dialogs are
+    /// child viewports on the desktop besides, which an offscreen compositor
+    /// does not run at all.
+    ///
+    /// To look at a DIALOG, run the real binary with the inline caps, where
+    /// they are drawn as a layer over the canvas:
+    ///
+    ///   IVORY_INLINE=menu ./target/debug/tangent
     #[test]
     #[ignore = "writes a picture for a person to look at"]
     fn window() {

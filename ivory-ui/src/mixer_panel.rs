@@ -2789,24 +2789,9 @@ mod tests {
         Color32::from_rgb(r, g, b)
     }
 
-    /// CIE76 over D65 — enough to answer "can these two be told apart",
-    /// which is the only question asked of it.
-    fn delta_e(a: Color32, b: Color32) -> f32 {
-        fn lab(c: Color32) -> (f32, f32, f32) {
-            let ch = |v: u8| {
-                let v = f32::from(v) / 255.0;
-                if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
-            };
-            let (r, g, b) = (ch(c.r()), ch(c.g()), ch(c.b()));
-            let f = |t: f32| if t > 0.008856 { t.cbrt() } else { 7.787 * t + 16.0 / 116.0 };
-            let x = f((r * 0.4124 + g * 0.3576 + b * 0.1805) / 0.95047);
-            let y = f(r * 0.2126 + g * 0.7152 + b * 0.0722);
-            let z = f((r * 0.0193 + g * 0.1192 + b * 0.9505) / 1.08883);
-            (116.0 * y - 16.0, 500.0 * (x - y), 200.0 * (y - z))
-        }
-        let (a, b) = (lab(a), lab(b));
-        ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2) + (a.2 - b.2).powi(2)).sqrt()
-    }
+    /// Moved to `recorder_panel`, beside `contrast_ratio` and the two inks,
+    /// once a second surface needed the same question answered.
+    use crate::recorder_panel::delta_e;
 
     /// **A palette colour is a whole painted surface with small text on it.**
     ///

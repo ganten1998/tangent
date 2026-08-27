@@ -4116,7 +4116,15 @@ impl DesktopApp {
             }
             ivory_ui::ports::ProjectRequest::ExportTrack => self.start_bounce(false, None),
             ivory_ui::ports::ProjectRequest::ExportStems => self.start_bounce(true, None),
-            ivory_ui::ports::ProjectRequest::New => {
+            ivory_ui::ports::ProjectRequest::New
+            | ivory_ui::ports::ProjectRequest::NewKeeping
+            | ivory_ui::ports::ProjectRequest::NewDiscarding => {
+                // **Which of the three this is.** `New` is the menu row and
+                // is allowed to stop and ask; the other two are the answers
+                // to that question and never ask again.
+                let asked = !matches!(req, ivory_ui::ports::ProjectRequest::New);
+                let keeping =
+                    matches!(req, ivory_ui::ports::ProjectRequest::NewKeeping);
                 // The default template exists from the start: seeded here if
                 // nothing ever saved over it.
                 let template = self.templates_dir().join("default");
@@ -4125,6 +4133,35 @@ impl DesktopApp {
                 // The scratch rule: an Untitled nobody SAVED is reclaimed,
                 // so New lands on "Untitled" instead of minting a pile.
                 let dir = ivory_ui::app::fresh_project_dir(&root);
+                // **What is in the folder the reclaim would take?**
+                //
+                // The reclaim rule is right — an Untitled nobody saved should
+                // not mint a pile of them — but it ran `remove_dir_all` over
+                // that folder with `media/` inside it and no warning. A take
+                // somebody recorded and never named is still a take they
+                // played, and it is the only thing in this app that cannot be
+                // made a second time. Everything else in there (the document,
+                // the drumpad, the plugin state) genuinely is scratch.
+                let takes = count_media(&dir);
+                if takes > 0 && !asked {
+                    // Ask, and do nothing else this frame. The answer comes
+                    // back as `NewKeeping` or `NewDiscarding`.
+                    self.app.warn_about_scratch(ivory_ui::ports::ScratchWarning {
+                        name: dir
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "Untitled".to_owned()),
+                        takes,
+                    });
+                    return;
+                }
+                // Keeping it means not reclaiming it at all: mint the next
+                // free name and leave the recordings where they are.
+                let dir = if keeping && takes > 0 {
+                    next_untitled(&root, &dir)
+                } else {
+                    dir
+                };
                 // **Are we throwing away the session that is open right now?**
                 // `fresh_project_dir` reclaims the current unsaved Untitled,
                 // so New usually lands on the very folder on the desk.
@@ -5149,6 +5186,42 @@ impl DesktopApp {
 /// bytes to a `setState` that will believe them.
 #[cfg(feature = "recorder")]
 /// Copy a directory tree, best effort — the project system's clone.
+/// How many files are sitting in a project's `media/`.
+///
+/// **The one folder in a scratch project that holds work.** The document,
+/// the drumpad sidecar and the plugin-state shelf are all re-creatable; a
+/// recording is not. Files only, and one level deep, which is exactly how
+/// `copy_into_media` writes them.
+///
+/// An unreadable directory counts as ZERO and the reclaim proceeds — the same
+/// way a missing one does. Refusing to start a new project because a folder
+/// could not be listed would turn a permissions problem into a stuck app.
+fn count_media(project_dir: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(project_dir.join("media")) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .count()
+}
+
+/// The next free `Untitled n` at or after `taken`, for a New that must not
+/// reclaim the scratch it landed on.
+///
+/// Deliberately not `fresh_project_dir` again: that function's whole job is
+/// to RECLAIM an unsaved Untitled, so asking it a second time hands back the
+/// same folder. This one skips every directory that exists, saved or not.
+fn next_untitled(root: &std::path::Path, taken: &std::path::Path) -> std::path::PathBuf {
+    for n in 2..10_000 {
+        let candidate = root.join(format!("Untitled {n}"));
+        if candidate != taken && !candidate.exists() {
+            return candidate;
+        }
+    }
+    taken.to_path_buf()
+}
+
 fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
