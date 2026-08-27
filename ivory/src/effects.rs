@@ -237,6 +237,17 @@ pub struct Params {
     pub reverb_damp: f32,
     /// How far apart the two channels' rooms are. 0 is mono.
     pub reverb_width: f32,
+    /// How much of the plate's dispersion is in circuit.
+    ///
+    /// **The chirp, as a control.** 1.0 is the sheet of steel; 0 is a tank
+    /// with no plate physics in it at all, which is a perfectly good small
+    /// reverb and is not what this is called. See [`Dispersion`].
+    pub plate_dispersion: f32,
+    /// Silence in front of the plate, across [`PLATE_PREDELAY_MS`].
+    ///
+    /// The plate itself has none — see the constant. This is the tape machine
+    /// every studio patched in front of theirs.
+    pub plate_predelay: f32,
 
     pub delay_division: Division,
     /// How much of each repeat comes back for the next.
@@ -296,9 +307,15 @@ impl Default for Params {
     /// against before there was a menu to change them. A reset goes here.
     fn default() -> Self {
         Self {
-            reverb_size: 0.62,
-            reverb_damp: 0.35,
-            reverb_width: 0.70,
+            // **2.2 seconds, bright, wide, and 18 ms in front of it.** A
+            // plate voiced where a plate is used: long enough to be a room,
+            // short enough to sit under a piano, and with the predelay every
+            // engineer patched in already patched in.
+            reverb_size: 0.34,
+            reverb_damp: 0.55,
+            reverb_width: 0.80,
+            plate_dispersion: 0.75,
+            plate_predelay: 0.12,
             delay_division: Division::DottedEighth,
             delay_feedback: 0.42,
             delay_tone: 0.55,
@@ -338,6 +355,8 @@ impl Params {
             &mut self.reverb_size,
             &mut self.reverb_damp,
             &mut self.reverb_width,
+            &mut self.plate_dispersion,
+            &mut self.plate_predelay,
             &mut self.delay_feedback,
             &mut self.delay_tone,
             &mut self.delay_width,
@@ -378,123 +397,186 @@ fn flush(x: f32) -> f32 {
     }
 }
 
-// ── reverb ──────────────────────────────────────────────────────────────────
+// ── the plate ───────────────────────────────────────────────────────────────
+//
+// A steel plate, after the EMT 140: a 2 m x 1 m sheet, half a millimetre
+// thick, hung under tension and driven by a coil at one point while an
+// accelerometer listens at another.
+//
+// # What makes a plate a plate
+//
+// Not its size. Three consequences of one fact — that bending waves in a thin
+// plate are DISPERSIVE, so high frequencies travel faster than low ones:
+//
+// 1. **The chirp.** Group velocity on the real plate runs from about 20 m/s at
+//    20 Hz to 628 m/s at 20 kHz. Measured at one pickup the top of the band
+//    arrives after a millisecond and the bottom after thirty. That smear,
+//    treble first, is the bright "pew" on the front of every hit, and it is
+//    the one thing a room cannot do — air is not dispersive, so a room's early
+//    reflections arrive with the waveform intact. An emulation without it is a
+//    small bright room, not a plate. See [`Dispersion`].
+//
+// 2. **Instant density, and no early reflections at all.** Because the top of
+//    the band crosses the plate in a millisecond, the echoes are already too
+//    dense to count by the time anybody hears them. There is no build-up and
+//    no reflection pattern to place a listener in a space. What predelay a
+//    record has, an engineer patched in front.
+//
+// 3. **Flat modal density.** A room's modes crowd together as f^2; a plate's
+//    are spread evenly — about 1.3 per hertz for this one, right across the
+//    band. So there is no low-frequency modal signature to give away a room,
+//    and no thinning at the top.
+//
+// # Why this shape and not the physics
+//
+// The plate equation can be integrated directly, and the published work that
+// does it for exactly this plate needed aggressive mode-rejection to reach
+// real time for ONE instance on a desktop. Three `Effects` run here at once
+// and this file counts multiply-adds. So: an allpass tank for density, with
+// the dispersion the tank cannot produce added explicitly on top, and a decay
+// that is banded because the real plate's is.
+//
+// The tank is the figure-of-eight arrangement — a cascade of input diffusers
+// into two branches that feed each other — which is thirty years old and
+// published. The delay lengths here are NOT the published ones: they are
+// mutually prime values chosen for a loop of about 75 ms, because a plate is
+// small and the classic numbers describe a much larger tank.
 
-/// Comb delay lengths in samples at 44.1 kHz, from the original.
+/// Where the decay control sweeps, in seconds.
 ///
-/// Mutually prime on purpose: shared factors make the combs agree about which
-/// frequencies to reinforce, and a reverb that agrees with itself is a ringing
-/// metal box.
-const COMB_LEN: [usize; 8] = [1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617];
+/// **The EMT's own read-out.** The damper is a fibreglass panel that winds
+/// between 11 mm and 66 mm from the plate, and the remote head that drove it
+/// was marked in seconds: 0.5 to 5.5, in tenths. Anything else here would be a
+/// number about the knob rather than about the plate.
+pub const PLATE_DECAY_S: (f32, f32) = (0.5, 5.5);
 
-/// Allpass lengths, same source and the same reasoning.
-const ALLPASS_LEN: [usize; 4] = [556, 441, 341, 225];
-
-/// Samples the right channel's delays are lengthened by, at full width.
+/// How far the predelay reaches, in milliseconds.
 ///
-/// What makes the output stereo at all: the same input through two slightly
-/// different rooms. Too small and it is mono; too large and it is an echo.
-///
-/// Fixed at construction rather than swept, because changing a delay LENGTH
-/// resizes a buffer and cannot be done per sample. The width control scales
-/// this when the reverb is built, and a change to it rebuilds the pair — which
-/// happens when somebody moves a menu slider, not in the audio callback.
-const STEREO_SPREAD: usize = 23;
+/// **The plate has none**, which is why this is here. The tail starts the
+/// instant the coil moves, so every record with air in front of its plate got
+/// it from a tape machine patched in front. 150 ms is longer than anybody
+/// patched and short enough to stay a predelay rather than a slap.
+pub const PLATE_PREDELAY_MS: (f32, f32) = (0.0, 150.0);
 
-/// The rate the lengths above were chosen at.
+/// The corner the tone control sweeps, in hertz.
+///
+/// The damper absorbs treble harder than bass, so bringing it in tilts the
+/// decay as well as shortening it. This is the corner above which the tail is
+/// pulled down towards [`PLATE_TONE_RATIO`] of its mid-band length.
+const PLATE_TONE_HZ: (f32, f32) = (1_400.0, 9_000.0);
+
+/// How much shorter the top of the band decays than the middle, at each end of
+/// the tone control.
+///
+/// **Measured, not chosen.** With the damper out the real plate rings about
+/// five seconds at 500 Hz and about one and a half at 10 kHz — a ratio near
+/// 0.3 — and bringing the damper in shortens the top faster than the bottom.
+/// A plate whose highs last as long as its mids is a spring.
+const PLATE_TONE_RATIO: (f32, f32) = (0.22, 0.85);
+
+/// Sample rate the lengths below are written at.
 const DESIGN_RATE: f32 = 44_100.0;
 
-/// How much of each comb's output returns to its input, at each end of the
-/// size control.
+/// The four input diffusers, in samples at [`DESIGN_RATE`].
 ///
-/// The top is deliberately short of 1.0: a comb at unity never decays, and a
-/// control that can be turned to "for ever" is a control somebody turns to for
-/// ever by accident.
-const COMB_FEEDBACK: (f32, f32) = (0.68, 0.92);
+/// **Short, and that is the point.** These are 1.8 to 5.7 ms: by the time the
+/// tank sees the signal it has already been smeared past the point where any
+/// single reflection can be picked out, which is what "no early reflections"
+/// has to mean in a delay network. Mutually prime, so they cannot agree with
+/// each other about which frequencies to reinforce.
+const PLATE_IN_AP: [usize; 4] = [79, 113, 191, 251];
 
-/// The lowpass inside each comb, at each end of the damping control. Air and
-/// soft furnishings absorb treble, so a reverb whose highs last as long as its
-/// lows sounds like a swimming pool.
-const COMB_DAMP: (f32, f32) = (0.06, 0.55);
+/// Their coefficients. Away from zero, which does nothing, and away from one,
+/// which buzzes.
+const PLATE_IN_G: [f32; 4] = [0.750, 0.750, 0.625, 0.625];
 
-/// The fixed allpass coefficient from the original. Diffusion, not colour.
-const ALLPASS_FEEDBACK: f32 = 0.5;
-
-/// Scales the whole wet path, at [`REVERB_TRIM_AT`]. Eight combs in parallel is
-/// eight times the input before anything else happens.
-const REVERB_TRIM: f32 = 0.055;
-
-/// The size this trim was voiced at.
+/// The tank: two branches, each an allpass, a delay, the damper, a second
+/// allpass and a second delay. All at [`DESIGN_RATE`], all mutually prime.
 ///
-/// **Size must not be a volume control.** A comb's steady-state gain is
-/// `1/(1 - feedback)`, so turning the room up from small to large multiplies
-/// the wet by more than two on its own — somebody reaching for a longer tail
-/// gets a louder one and turns the send back down to compensate, and now they
-/// have two controls fighting. The trim is scaled by `1 - feedback` against
-/// this point, which holds the wet level steady across the whole sweep and
-/// leaves the DEFAULT sounding exactly as it did before there was a control.
-const REVERB_TRIM_AT: f32 = 0.62;
+/// The eight together are a loop of 3300 samples — **about 75 ms** — which is
+/// the number that matters: it is how often the tail passes the damper, and it
+/// is what [`Plate::feedback`] solves against to turn a decay in seconds into
+/// a coefficient.
+const PLATE_AP1: [usize; 2] = [131, 173];
+const PLATE_D1: [usize; 2] = [661, 617];
+const PLATE_AP2: [usize; 2] = [293, 359];
+const PLATE_D2: [usize; 2] = [557, 509];
 
-/// A comb filter with a one-pole lowpass in its feedback path.
-struct Comb {
+/// One trip round the tank, in samples at [`DESIGN_RATE`]. Kept as a constant
+/// rather than summed at runtime so [`Plate::feedback`] is a closed form.
+const PLATE_LOOP: f32 = 3_300.0;
+
+/// The tank diffusers' coefficients.
+const PLATE_TANK_G1: f32 = 0.70;
+const PLATE_TANK_G2: f32 = 0.50;
+
+/// How far the first tank allpass in each branch is swept, in samples, and how
+/// fast.
+///
+/// **Small, slow, and not optional.** An allpass loop with fixed lengths
+/// settles into standing tones — the network agrees with itself about a
+/// handful of frequencies and rings on them after the plate would have stopped.
+/// A few samples of movement at a rate nobody can hear breaks the agreement.
+/// The real plate does this for free: it is a sheet of metal under tension in
+/// a room, and it is never quite the same length twice.
+const PLATE_MOD_SAMPLES: f32 = 6.0;
+const PLATE_MOD_HZ: f32 = 0.9;
+
+/// Scales the whole wet path.
+///
+/// Voiced against [`PLATE_TRIM_AT`], and scaled by the tank's energy so the
+/// decay control changes how LONG and not how loud. See the comment on
+/// [`Plate::process`] for the arithmetic and for why it is a square root.
+const PLATE_TRIM: f32 = 0.34;
+
+/// The decay position the trim above was voiced at, as a fraction of
+/// [`PLATE_DECAY_S`]. 0.4 of 0.5..5.5 is 2.5 seconds — a plate.
+const PLATE_TRIM_AT: f32 = 0.4;
+
+/// A plain delay line with a fixed length, read at the write point.
+struct Line {
     buf: Vec<f32>,
     at: usize,
-    /// The delay actually in use, in samples: the width control moves THIS,
-    /// inside a buffer allocated once for the widest it can ask. See
-    /// [`ReverbChannel::set_offset`] for why the allocation never moves.
-    len: usize,
-    /// The lowpass's state: the running average that damps the loop.
-    store: f32,
 }
 
-impl Comb {
-    fn new(cap: usize) -> Self {
+impl Line {
+    fn new(len: usize) -> Self {
         Self {
-            buf: vec![0.0; cap.max(1)],
+            buf: vec![0.0; len.max(1)],
             at: 0,
-            len: cap.max(1),
-            store: 0.0,
-        }
-    }
-
-    /// Change the delay without touching the allocation. A line whose length
-    /// moves is cleared: a delay that shrinks and grows back would otherwise
-    /// replay whatever it was holding beyond the old wrap point.
-    fn set_len(&mut self, len: usize) {
-        let len = len.clamp(1, self.buf.len());
-        if len != self.len {
-            self.len = len;
-            self.at = 0;
-            self.clear();
         }
     }
 
     #[inline]
-    fn process(&mut self, input: f32, feedback: f32, damp: f32) -> f32 {
+    fn push(&mut self, x: f32) -> f32 {
         let out = self.buf[self.at];
-        self.store = flush(out * (1.0 - damp) + self.store * damp);
-        self.buf[self.at] = flush(input + self.store * feedback);
-        self.at = (self.at + 1) % self.len;
+        self.buf[self.at] = flush(x);
+        self.at += 1;
+        if self.at >= self.buf.len() {
+            self.at = 0;
+        }
         out
     }
 
     fn clear(&mut self) {
         self.buf.fill(0.0);
-        self.store = 0.0;
+        self.at = 0;
     }
 }
 
-/// An allpass: passes every frequency at the same level and scrambles phase.
-///
-/// What turns eight discrete echoes into something that sounds continuous.
-struct Allpass {
+/// A Schroeder allpass: unity magnitude, scrambled phase. What turns a handful
+/// of discrete echoes into something that sounds continuous.
+struct Diffuser {
     buf: Vec<f32>,
     at: usize,
-    /// As in [`Comb`]: the delay in use, inside a fixed allocation.
+    /// The length actually in use. Only the tank's first pair move theirs, and
+    /// they move it inside a buffer allocated for the widest sweep — see
+    /// [`PLATE_MOD_SAMPLES`], and see `ReverbChannel::set_offset` in the file
+    /// this replaced for why an audio-thread reallocation is not an option.
     len: usize,
 }
 
-impl Allpass {
+impl Diffuser {
     fn new(cap: usize) -> Self {
         Self {
             buf: vec![0.0; cap.max(1)],
@@ -503,100 +585,314 @@ impl Allpass {
         }
     }
 
-    /// See [`Comb::set_len`].
     fn set_len(&mut self, len: usize) {
-        let len = len.clamp(1, self.buf.len());
-        if len != self.len {
-            self.len = len;
-            self.at = 0;
-            self.clear();
-        }
+        self.len = len.clamp(1, self.buf.len());
     }
 
     #[inline]
-    fn process(&mut self, input: f32) -> f32 {
-        let buffered = self.buf[self.at];
-        self.buf[self.at] = flush(input + buffered * ALLPASS_FEEDBACK);
-        self.at = (self.at + 1) % self.len;
-        buffered - input
+    fn process(&mut self, x: f32, g: f32) -> f32 {
+        // Read `len` back from the write point, which for a line this short is
+        // cheaper than an interpolated tap and inaudible against it: the
+        // modulation below moves whole samples slowly enough that the step is
+        // far under the diffusion it is already applying.
+        let read = (self.at + self.buf.len() - self.len) % self.buf.len();
+        let buffered = self.buf[read];
+        let v = x + buffered * g;
+        self.buf[self.at] = flush(v);
+        self.at += 1;
+        if self.at >= self.buf.len() {
+            self.at = 0;
+        }
+        buffered - v * g
     }
 
     fn clear(&mut self) {
         self.buf.fill(0.0);
+        self.at = 0;
     }
 }
 
-/// One channel of reverb: eight combs into four allpasses.
-struct ReverbChannel {
-    combs: [Comb; 8],
-    allpasses: [Allpass; 4],
+/// How many first-order sections the dispersion chain runs.
+///
+/// Twelve is where the differential group delay stops buying much and the
+/// multiply count starts mattering: three multiply-adds each, twice over for
+/// stereo, on every sample the plate is up.
+const DISPERSION_STAGES: usize = 12;
+
+/// The coefficients, lowest first.
+///
+/// **Staggered rather than identical, and that is the whole design.** One
+/// first-order allpass with a NEGATIVE coefficient has its group delay maximum
+/// at DC and its minimum at Nyquist — the right shape, the lows held back —
+/// but a single corner. The real plate's delay goes as the inverse root of
+/// frequency, a smooth slide across the whole band, so the chain spreads its
+/// coefficients geometrically: the high ones hold the bottom octave back hard,
+/// the low ones keep the slide going up through the mids.
+///
+/// Written out rather than computed so the voicing is a thing somebody can
+/// read, argue with, and change one number of.
+const DISPERSION_G: [f32; DISPERSION_STAGES] = [
+    -0.94, -0.92, -0.90, -0.87, -0.84, -0.80, -0.75, -0.70, -0.63, -0.55, -0.46, -0.36,
+];
+
+/// A cascade of first-order allpasses that delays low frequencies more than
+/// high ones.
+///
+/// # Why this and not a filter bank
+///
+/// It costs three multiply-adds a stage and it is exactly unity magnitude at
+/// every frequency, which is what dispersion IS — the plate does not change
+/// how loud anything is on its way across, only when it arrives. A crossover
+/// into delayed bands would colour the tail and leave seams at the corners.
+#[derive(Clone)]
+struct Dispersion {
+    x1: [f32; DISPERSION_STAGES],
+    y1: [f32; DISPERSION_STAGES],
 }
 
-impl ReverbChannel {
-    /// `offset` is the stereo spread this channel starts at: 0 for the left,
-    /// up to [`STEREO_SPREAD`] for the right, wherever the width knob sits.
-    ///
-    /// The buffers are allocated once, sized for the FULL spread; the offset
-    /// only decides how much of each is in use. See [`set_offset`].
-    ///
-    /// [`set_offset`]: ReverbChannel::set_offset
-    fn new(sample_rate: f32, offset: usize) -> Self {
-        // The lengths are in samples at 44.1k, so at 96k the same room needs
-        // twice as many. A reverb that ignored this would be half as long and
-        // an octave brighter on half the interfaces people own.
-        let cap = |len: usize| ((len + STEREO_SPREAD) as f32 * sample_rate / DESIGN_RATE) as usize;
-        let mut ch = Self {
-            combs: std::array::from_fn(|i| Comb::new(cap(COMB_LEN[i]))),
-            allpasses: std::array::from_fn(|i| Allpass::new(cap(ALLPASS_LEN[i]))),
-        };
-        ch.set_offset(sample_rate, offset);
-        ch
-    }
-
-    /// Move every delay length to a new spread, WITHOUT allocating.
-    ///
-    /// **This runs on the audio thread.** The width knob is the one reverb
-    /// parameter that is a buffer length rather than a coefficient, and the
-    /// first version rebuilt both channels from fresh `Vec`s whenever it
-    /// moved — on the theory that "a person moves it, which is never in
-    /// audio terms". A person DRAGS it, the UI reposts it every frame of the
-    /// drag, and that theory became malloc and free on the callback, block
-    /// after block, in up to three `Effects` at once. Now the buffers stand
-    /// at full size from construction and the knob only moves the wrap
-    /// points: the lines whose length changed are cleared — a memset, not an
-    /// allocator — so the tail restarts there exactly as it did when they
-    /// were rebuilt, and the lines that did not move keep ringing.
-    fn set_offset(&mut self, sample_rate: f32, offset: usize) {
-        let scale = |len: usize| ((len + offset) as f32 * sample_rate / DESIGN_RATE) as usize;
-        for (c, len) in self.combs.iter_mut().zip(COMB_LEN) {
-            c.set_len(scale(len));
-        }
-        for (a, len) in self.allpasses.iter_mut().zip(ALLPASS_LEN) {
-            a.set_len(scale(len));
+impl Dispersion {
+    fn new() -> Self {
+        Self {
+            x1: [0.0; DISPERSION_STAGES],
+            y1: [0.0; DISPERSION_STAGES],
         }
     }
 
+    /// `amount` scales how many stages are in circuit, 0..=1. At 0 the chain
+    /// is a wire; at 1 every stage is working.
     #[inline]
-    fn process(&mut self, input: f32, feedback: f32, damp: f32) -> f32 {
-        // Parallel: every comb sees the same input and their outputs sum.
-        let mut out = 0.0;
-        for c in &mut self.combs {
-            out += c.process(input, feedback, damp);
+    fn process(&mut self, x: f32, amount: f32) -> f32 {
+        let mut v = x;
+        for i in 0..DISPERSION_STAGES {
+            // Coefficient scaled towards zero rather than stages switched out,
+            // so the control is continuous. An allpass at g = 0 is a one-sample
+            // delay and nothing else, which is the right thing to fade to.
+            let g = DISPERSION_G[i] * amount;
+            let y = g * v + self.x1[i] - g * self.y1[i];
+            self.x1[i] = v;
+            self.y1[i] = flush(y);
+            v = y;
         }
-        // Series: each allpass sees what the one before it made.
-        for a in &mut self.allpasses {
-            out = a.process(out);
-        }
-        out
+        v
     }
 
     fn clear(&mut self) {
-        for c in &mut self.combs {
-            c.clear();
+        self.x1 = [0.0; DISPERSION_STAGES];
+        self.y1 = [0.0; DISPERSION_STAGES];
+    }
+}
+
+/// A one-pole low-pass, used as the tank's damper and as the input bandwidth.
+#[derive(Clone, Copy, Default)]
+struct Pole {
+    z: f32,
+}
+
+impl Pole {
+    /// `a` is the pole: 0 passes everything, near 1 passes almost nothing.
+    #[inline]
+    fn lp(&mut self, x: f32, a: f32) -> f32 {
+        self.z = flush(x * (1.0 - a) + self.z * a);
+        self.z
+    }
+
+    fn clear(&mut self) {
+        self.z = 0.0;
+    }
+}
+
+/// The plate.
+struct Plate {
+    /// Predelay, allocated for the longest [`PLATE_PREDELAY_MS`] can ask.
+    pre: [Vec<f32>; 2],
+    pre_at: usize,
+    /// The coil is not a tweeter. Rolls the very top off what goes in, so the
+    /// tank is not asked to diffuse something the plate could never carry.
+    bandwidth: [Pole; 2],
+    in_ap: [[Diffuser; 4]; 2],
+    dispersion: [Dispersion; 2],
+    ap1: [Diffuser; 2],
+    d1: [Line; 2],
+    damp: [Pole; 2],
+    ap2: [Diffuser; 2],
+    d2: [Line; 2],
+    /// What each branch hands the other. The figure of eight.
+    cross: [f32; 2],
+    /// The modulation phase for [`PLATE_MOD_SAMPLES`], in turns.
+    lfo: f32,
+    /// Base lengths of the swept pair, in samples at this rate.
+    ap1_base: [f32; 2],
+    sample_rate: f32,
+}
+
+impl Plate {
+    fn new(sample_rate: f32) -> Self {
+        let sr = sample_rate.max(8_000.0);
+        let scale = |n: usize| ((n as f32) * sr / DESIGN_RATE).max(1.0);
+        let pre_cap = (sr * PLATE_PREDELAY_MS.1 / 1_000.0) as usize + 2;
+        Self {
+            pre: [vec![0.0; pre_cap], vec![0.0; pre_cap]],
+            pre_at: 0,
+            bandwidth: [Pole::default(); 2],
+            in_ap: std::array::from_fn(|_| {
+                std::array::from_fn(|i| Diffuser::new(scale(PLATE_IN_AP[i]) as usize))
+            }),
+            dispersion: [Dispersion::new(), Dispersion::new()],
+            // The swept pair are allocated for their base length plus the
+            // full sweep; the sweep only decides how much is in use.
+            ap1: std::array::from_fn(|i| {
+                Diffuser::new((scale(PLATE_AP1[i]) + PLATE_MOD_SAMPLES + 2.0) as usize)
+            }),
+            d1: std::array::from_fn(|i| Line::new(scale(PLATE_D1[i]) as usize)),
+            damp: [Pole::default(); 2],
+            ap2: std::array::from_fn(|i| Diffuser::new(scale(PLATE_AP2[i]) as usize)),
+            d2: std::array::from_fn(|i| Line::new(scale(PLATE_D2[i]) as usize)),
+            cross: [0.0; 2],
+            lfo: 0.0,
+            ap1_base: std::array::from_fn(|i| scale(PLATE_AP1[i])),
+            sample_rate: sr,
         }
-        for a in &mut self.allpasses {
-            a.clear();
+    }
+
+    /// This decay's tank coefficient.
+    ///
+    /// **A time in seconds is the control; a coefficient is what the loop
+    /// wants**, and solving for it here rather than mapping a knob onto one by
+    /// ear is what lets the decay dial read in seconds and be telling the
+    /// truth. See `the_decay_dial_is_a_time_in_seconds`, which is the test
+    /// that holds this honest.
+    ///
+    /// **`g` is applied per BRANCH, not per loop, and the factor of two is the
+    /// whole difference between a plate that rings for the time on the dial
+    /// and one that rings for half of it.** Each branch multiplies its output
+    /// by `g` on the way to the other, so a full trip round the figure of
+    /// eight — [`PLATE_LOOP`] samples, both branches — costs `g²`. Falling
+    /// 60 dB in `t60` seconds therefore wants `g² ^ (t60 / loop_secs) = 10^-3`,
+    /// which is the 1.5 below rather than the 3 that a single-loop reading
+    /// gives. The first version had the 3; the test measured 1.09 seconds
+    /// against a dial asking for 2.20 and said so.
+    ///
+    /// The damper is a real loss on top of this and pulls the measured time a
+    /// little under the requested one, more so as the tone control comes down.
+    /// That is the plate behaving like a plate — the panel absorbs — and not
+    /// an error in the solution.
+    fn feedback(&self, t60: f32) -> f32 {
+        let loop_secs = PLATE_LOOP / DESIGN_RATE;
+        let t = t60.max(0.05);
+        10f32.powf(-1.5 * loop_secs / t)
+    }
+
+    /// Seconds of decay at this position of the control.
+    fn decay_secs(size: f32) -> f32 {
+        PLATE_DECAY_S.0 + (PLATE_DECAY_S.1 - PLATE_DECAY_S.0) * size.clamp(0.0, 1.0)
+    }
+
+    /// One stereo frame in, the plate's output out. Wet only; the caller mixes.
+    #[inline]
+    fn process(&mut self, input: [f32; 2], p: &Params, predelay: f32) -> [f32; 2] {
+        // ── the input path ──────────────────────────────────────────────
+        //
+        // Predelay first, because it is meant to be silence in front of the
+        // plate and not silence in front of the diffusers.
+        let pre_len = ((predelay.clamp(0.0, 1.0) * PLATE_PREDELAY_MS.1 / 1_000.0)
+            * self.sample_rate) as usize;
+        let cap = self.pre[0].len();
+        let pre_len = pre_len.min(cap - 1);
+        let read = (self.pre_at + cap - pre_len) % cap;
+        let mut v = [self.pre[0][read], self.pre[1][read]];
+        self.pre[0][self.pre_at] = flush(input[0]);
+        self.pre[1][self.pre_at] = flush(input[1]);
+        self.pre_at += 1;
+        if self.pre_at >= cap {
+            self.pre_at = 0;
         }
+
+        for ch in 0..2 {
+            v[ch] = self.bandwidth[ch].lp(v[ch], 0.18);
+            for (ap, g) in self.in_ap[ch].iter_mut().zip(PLATE_IN_G) {
+                v[ch] = ap.process(v[ch], g);
+            }
+            // **The chirp, applied where it is heard.** In the input path the
+            // very first arrival already carries it, which is the attack;
+            // inside the tank it would only accumulate, and the plate's
+            // signature is on the front of the note.
+            v[ch] = self.dispersion[ch].process(v[ch], p.plate_dispersion.clamp(0.0, 1.0));
+        }
+
+        // ── the tank ────────────────────────────────────────────────────
+        let t60 = Self::decay_secs(p.reverb_size);
+        let g = self.feedback(t60);
+        // The damper. `tone` moves both where the top starts coming off and
+        // how much shorter the top is than the middle; one control, because on
+        // the real plate one panel does both.
+        let tone = p.reverb_damp.clamp(0.0, 1.0);
+        // Inverted against the control: turning tone UP is a brighter tail,
+        // which means a HIGHER corner and a ratio nearer one.
+        let corner = PLATE_TONE_HZ.0 + (PLATE_TONE_HZ.1 - PLATE_TONE_HZ.0) * tone;
+        let ratio = PLATE_TONE_RATIO.0 + (PLATE_TONE_RATIO.1 - PLATE_TONE_RATIO.0) * tone;
+        // A one-pole whose corner is `corner`, expressed as its pole.
+        let damp_a = (-std::f32::consts::TAU * corner / self.sample_rate).exp();
+        // How much of the damped signal is mixed back in. At ratio 1 the
+        // damper is out of circuit and the tail is flat; at ratio 0.22 the top
+        // decays to a fifth of the mid-band length.
+        let damp_mix = 1.0 - ratio;
+
+        self.lfo += PLATE_MOD_HZ / self.sample_rate;
+        if self.lfo >= 1.0 {
+            self.lfo -= 1.0;
+        }
+        let sweep = (std::f32::consts::TAU * self.lfo).sin() * PLATE_MOD_SAMPLES * 0.5;
+
+        let mut out = [0.0_f32; 2];
+        for ch in 0..2 {
+            // The other branch's return, plus this channel's fresh input.
+            let mut x = v[ch] + self.cross[ch ^ 1];
+            self.ap1[ch].set_len((self.ap1_base[ch] + sweep) as usize);
+            x = self.ap1[ch].process(x, PLATE_TANK_G1);
+            x = self.d1[ch].push(x);
+            // Damp: the mid band passes, the top is pulled towards `ratio`.
+            let low = self.damp[ch].lp(x, damp_a);
+            x = x - (x - low) * damp_mix;
+            x = self.ap2[ch].process(x, PLATE_TANK_G2);
+            // The tap. Taken BEFORE the second delay so the two channels are
+            // hearing different points on the loop rather than the same point
+            // one delay apart, which is what makes them decorrelate.
+            out[ch] = x;
+            x = self.d2[ch].push(x);
+            self.cross[ch] = flush(x * g);
+        }
+        // **Width is a fold, not a delay length.** The two branches already
+        // run different lengths, so the pair decorrelates on its own; this
+        // control only decides how much of that difference survives. At 0 it
+        // is the 1957 plate with its single pickup, at 1 it is the 140ST's
+        // two. Done arithmetically rather than by moving a buffer, because a
+        // length that moves under a drag is the war story on the reverb this
+        // replaced — a knob drag is a few hundred block boundaries and every
+        // one of them was a `malloc` on the audio thread.
+        let w = p.reverb_width.clamp(0.0, 1.0);
+        let mid = (out[0] + out[1]) * 0.5;
+        [mid + (out[0] - mid) * w, mid + (out[1] - mid) * w]
+    }
+
+    fn clear(&mut self) {
+        for b in &mut self.pre {
+            b.fill(0.0);
+        }
+        self.pre_at = 0;
+        for ch in 0..2 {
+            self.bandwidth[ch].clear();
+            for ap in &mut self.in_ap[ch] {
+                ap.clear();
+            }
+            self.dispersion[ch].clear();
+            self.ap1[ch].clear();
+            self.d1[ch].clear();
+            self.damp[ch].clear();
+            self.ap2[ch].clear();
+            self.d2[ch].clear();
+        }
+        self.cross = [0.0; 2];
+        self.lfo = 0.0;
     }
 }
 
@@ -1451,7 +1747,7 @@ impl Sends {
 
 /// The three effects on the instrument bus.
 pub struct Effects {
-    reverb: [ReverbChannel; 2],
+    plate: Plate,
     delay: Delay,
     chorus: Chorus,
     phaser: Phaser,
@@ -1460,14 +1756,6 @@ pub struct Effects {
     limiter: Limiter,
     /// Where the wet mixes actually are, chasing where the knobs say.
     mix: Sends,
-    /// The width the reverb's delay lengths were last set from.
-    ///
-    /// The one parameter that is a delay LENGTH rather than a coefficient.
-    /// Compared each block so a change takes effect — and applied by moving
-    /// wrap points inside preallocated buffers, never by rebuilding them,
-    /// because a knob drag lands here every block and this is the audio
-    /// thread. See [`ReverbChannel::set_offset`].
-    built_width: f32,
     sample_rate: f32,
     /// Everything was off last block, so the tails are already flushed and do
     /// not need flushing again.
@@ -1515,10 +1803,9 @@ impl Effects {
 
     fn build(sample_rate: f32, wet_only: bool) -> Self {
         let sr = sample_rate.max(8_000.0);
-        let p = Params::default();
         Self {
             wet_only,
-            reverb: Self::build_reverb(sr, p.reverb_width),
+            plate: Plate::new(sr),
             delay: Delay::new(sr),
             chorus: Chorus::new(sr),
             phaser: Phaser::new(sr),
@@ -1526,20 +1813,10 @@ impl Effects {
             lpf: [Filter::default(); 2],
             limiter: Limiter::new(sr),
             mix: Sends::default(),
-            built_width: p.reverb_width,
             sample_rate: sr,
             idle: true,
             gr: 1.0,
         }
-    }
-
-    /// The two reverb channels, the right one offset by `width`.
-    fn build_reverb(sample_rate: f32, width: f32) -> [ReverbChannel; 2] {
-        let spread = (STEREO_SPREAD as f32 * width.clamp(0.0, 1.0)) as usize;
-        [
-            ReverbChannel::new(sample_rate, 0),
-            ReverbChannel::new(sample_rate, spread),
-        ]
     }
 
     /// Apply both, in place, to an interleaved buffer.
@@ -1612,30 +1889,25 @@ impl Effects {
             }
             return;
         }
-        // The one parameter that is a buffer length rather than a coefficient.
-        // Only the RIGHT channel carries the spread, and moving it is a
-        // memset inside buffers that were allocated at construction — never
-        // an allocation, because a drag of the width knob lands here every
-        // block. See `ReverbChannel::set_offset` for the war story.
-        if (p.reverb_width - self.built_width).abs() > 1.0e-4 {
-            let spread = (STEREO_SPREAD as f32 * p.reverb_width.clamp(0.0, 1.0)) as usize;
-            self.reverb[1].set_offset(self.sample_rate, spread);
-            self.built_width = p.reverb_width;
-        }
         let target = self.delay.target(bpm, p);
-        let comb_fb = COMB_FEEDBACK.0 + (COMB_FEEDBACK.1 - COMB_FEEDBACK.0) * p.reverb_size;
-        let comb_damp = COMB_DAMP.0 + (COMB_DAMP.1 - COMB_DAMP.0) * p.reverb_damp;
-        // See `REVERB_TRIM_AT`: size changes how long, not how loud.
+        // **Decay changes how long, not how loud**, and the arithmetic is the
+        // same one the Freeverb here used to need — only the loop it is
+        // solved against has changed.
         //
-        // **The square root, and it matters which.** A comb's impulse response
-        // is `fb^n`, so its ENERGY is `1/(1 - fb²)` and its amplitude goes as
-        // the root of that. Normalising by `1 - fb` instead — the steady-state
-        // gain — overshoots badly: it made the smallest room four times louder
-        // than the largest, because a small room's level is its early
-        // reflections and those barely depend on the feedback at all.
-        let voiced_fb = COMB_FEEDBACK.0 + (COMB_FEEDBACK.1 - COMB_FEEDBACK.0) * REVERB_TRIM_AT;
-        let energy = |fb: f32| (1.0 - fb * fb).max(1.0e-6).sqrt();
-        let trim = REVERB_TRIM * energy(comb_fb) / energy(voiced_fb);
+        // The tank's impulse response is `g^n`, so its ENERGY is `1/(1 - g²)`
+        // and its amplitude goes as the root of that. Normalising by `1 - g`
+        // instead — the steady-state gain — overshoots badly: it made the
+        // shortest decay several times louder than the longest, because a
+        // short tail's level is its early diffusion and that barely depends on
+        // the feedback at all.
+        //
+        // Without this, somebody reaching for a longer plate gets a louder one
+        // and turns the send back down to compensate, and now two controls are
+        // fighting over one thing.
+        let plate_g = self.plate.feedback(Plate::decay_secs(p.reverb_size));
+        let voiced_g = self.plate.feedback(Plate::decay_secs(PLATE_TRIM_AT));
+        let energy = |g: f32| (1.0 - g * g).max(1.0e-6).sqrt();
+        let trim = PLATE_TRIM * energy(plate_g) / energy(voiced_g);
 
         // The filters' corners, set once a block. A biquad's coefficients are
         // six transcendental functions; per-sample they would cost more than
@@ -1787,10 +2059,8 @@ impl Effects {
                 phased[0] + wet_d[0] * self.mix.delay,
                 phased[1] + wet_d[1] * self.mix.delay,
             ];
-            let wet_r = [
-                self.reverb[0].process(into_verb[0], comb_fb, comb_damp) * trim,
-                self.reverb[1].process(into_verb[1], comb_fb, comb_damp) * trim,
-            ];
+            let plate = self.plate.process(into_verb, p, p.plate_predelay);
+            let wet_r = [plate[0] * trim, plate[1] * trim];
             let mut out = [0.0f32; 2];
             for ch in 0..2 {
                 out[ch] = phased[ch] + wet_d[ch] * self.mix.delay + wet_r[ch] * self.mix.reverb;
@@ -1847,6 +2117,25 @@ impl Effects {
             buf[at] = out[0];
             buf[at + 1] = out[1];
         }
+
+        // **The flush, for a fade that finished inside this block.**
+        //
+        // The check at the top of this function catches a call that BEGINS
+        // with everything at rest. A single long call that spans the whole
+        // fade-out reaches zero down here instead, and used to leave the tail
+        // standing in the buffers until some later call happened to start
+        // quiet — so the promise made up there, that nothing rings on from an
+        // hour ago, was only kept when the knob reached zero between calls.
+        //
+        // With the room this file used to have, an unflushed tail was already
+        // below anything audible by the time the mix arrived at zero. A plate
+        // rings for seconds, and the leftover comes back under the next note
+        // as the mix slews up again. `turning_everything_off_flushes_what_was_
+        // ringing` measured 7.9e-6 where it wanted nothing.
+        if quiet(&want) && quiet(&self.mix) {
+            self.clear();
+            self.idle = true;
+        }
     }
 
     /// How hard the limiter has been working since this was last called, in
@@ -1864,9 +2153,7 @@ impl Effects {
 
     /// Drop every tail. Called when every knob reaches zero, and on a stop.
     pub fn clear(&mut self) {
-        for r in &mut self.reverb {
-            r.clear();
-        }
+        self.plate.clear();
         self.delay.clear();
         self.chorus.clear();
         for f in self.hpf.iter_mut().chain(self.lpf.iter_mut()) {
@@ -2749,6 +3036,165 @@ mod tests {
         );
     }
 
+    /// **The plate's own signature: the bottom of the band arrives last.**
+    ///
+    /// Bending waves in a thin plate are dispersive — group velocity on the
+    /// real EMT 140 runs from about 20 m/s at 20 Hz to 628 m/s at 20 kHz, so
+    /// measured at one pickup the top of the band lands after a millisecond
+    /// and the bottom after thirty. That is the bright "pew" on the front of
+    /// every hit and it is the one thing a room cannot do.
+    ///
+    /// Tested on [`Dispersion`] alone rather than through the whole plate: the
+    /// tank's diffusion smears arrival times on purpose, so measuring the
+    /// chirp downstream of it would be measuring the diffuser. The centre of
+    /// mass of the impulse response is the honest measure of "when did this
+    /// band arrive" for a filter that changes no level anywhere.
+    #[test]
+    fn the_plate_holds_the_bottom_of_the_band_back() {
+        const N: usize = 4096;
+        let mut d = Dispersion::new();
+        let mut h = vec![0.0_f32; N];
+        h[0] = 1.0;
+        for v in &mut h {
+            *v = d.process(*v, 1.0);
+        }
+
+        // Where the energy of one band sits in time, in samples. A one-pole
+        // each way is enough: this is asking which of two broad regions of the
+        // spectrum arrives first, not drawing a group-delay curve.
+        let centroid = |cut: f32, high: bool| {
+            let a = (-std::f32::consts::TAU * cut / SR).exp();
+            let (mut z, mut num, mut den) = (0.0_f32, 0.0_f64, 0.0_f64);
+            for (n, x) in h.iter().enumerate() {
+                z = x * (1.0 - a) + z * a;
+                let y = if high { x - z } else { z };
+                let e = f64::from(y) * f64::from(y);
+                num += e * n as f64;
+                den += e;
+            }
+            num / den.max(1.0e-30)
+        };
+        let low = centroid(200.0, false);
+        let high = centroid(4_000.0, true);
+
+        assert!(
+            low > high * 3.0,
+            "the low band's energy sits at {low:.0} samples and the high at \
+             {high:.0}: there is no chirp, which means there is no plate"
+        );
+        // And it is a real amount of time, not a rounding error. The real
+        // plate spreads about 29 ms across the band; one pass of this chain
+        // carries a fraction of that and the tank's recirculation does the
+        // rest, so the floor here is deliberately modest.
+        let spread_ms = (low - high) * 1_000.0 / f64::from(SR);
+        assert!(
+            spread_ms > 1.0,
+            "only {spread_ms:.2} ms between the bottom of the band and the top"
+        );
+    }
+
+    /// **An all-pass changes when, never how loud.** Dispersion that also
+    /// filtered would be a tone control wearing a physics hat — and the plate
+    /// does not lose level on its way across, it only rearranges arrival.
+    #[test]
+    fn the_dispersion_is_flat() {
+        for hz in [110.0_f32, 440.0, 1_760.0, 7_040.0] {
+            let mut d = Dispersion::new();
+            let frames = 24_000;
+            // Well past the chain's own delay, so this is the steady state and
+            // not the onset.
+            let mut peak = 0.0_f32;
+            for n in 0..frames {
+                let x = (std::f32::consts::TAU * hz * n as f32 / SR).sin();
+                let y = d.process(x, 1.0);
+                if n > frames / 2 {
+                    peak = peak.max(y.abs());
+                }
+            }
+            assert!(
+                (peak - 1.0).abs() < 0.02,
+                "a {hz} Hz tone came out at {peak:.3} instead of unity: the \
+                 dispersion chain is filtering"
+            );
+        }
+    }
+
+    /// **The decay dial reads in seconds, and it is telling the truth.**
+    ///
+    /// The EMT's remote was marked 0.5 to 5.5 seconds because the damper
+    /// position really did set a reverberation time, and a dial that says
+    /// seconds while meaning "some coefficient" is a dial that lies every time
+    /// somebody matches a plate to a tempo. [`Plate::feedback`] solves for the
+    /// coefficient rather than mapping a knob onto one by ear; this is what
+    /// checks that the solution is right in the tank it was solved for.
+    #[test]
+    fn the_decay_dial_is_a_time_in_seconds() {
+        // **Measured as a slope, not as a threshold crossing.** A tail is
+        // noisy sample to sample; the fall between two windows a known
+        // distance apart averages that away and extrapolates to sixty decibels
+        // without needing the tail to actually get there.
+        let measured = |size: f32| {
+            let mut fx = Effects::new_send(SR);
+            let p = Params {
+                reverb_size: size,
+                ..Params::default()
+            };
+            let out = strike_with(&mut fx, 192_000, sends(1.0, 0.0, 0.0), &p, 120.0);
+            let rms = |from: usize, to: usize| {
+                let s: f64 = out[from * 2..to * 2]
+                    .iter()
+                    .map(|v| f64::from(*v) * f64::from(*v))
+                    .sum();
+                (s / ((to - from) * 2) as f64).sqrt()
+            };
+            // Both windows well after the build-up and well before the buffer
+            // runs out, half a second apart.
+            let a = rms(9_600, 19_200);
+            let b = rms(33_600, 43_200);
+            let db = 20.0 * (a / b.max(1.0e-30)).log10();
+            // Sixty decibels at this rate of fall.
+            60.0 * 0.5 / db
+        };
+
+        for size in [0.0_f32, 0.34, 1.0] {
+            let want = f64::from(Plate::decay_secs(size));
+            let got = measured(size);
+            assert!(
+                got > want * 0.6 && got < want * 1.7,
+                "the dial asked for {want:.2} s of decay and the plate rang \
+                 for {got:.2} s"
+            );
+        }
+    }
+
+    /// **The plate has no predelay, so the control has to supply it.**
+    ///
+    /// A real plate starts the instant the coil moves — there is no distance
+    /// for sound to cross and no early reflection pattern — which is why every
+    /// studio that wanted air in front of theirs patched a tape machine in.
+    /// This checks that turning it up really is silence and not a fade.
+    #[test]
+    fn the_predelay_is_silence_in_front_of_the_plate() {
+        let p = Params {
+            plate_predelay: 1.0,
+            ..Params::default()
+        };
+        let mut fx = Effects::new_send(SR);
+        let out = strike_with(&mut fx, 48_000, sends(1.0, 0.0, 0.0), &p, 120.0);
+
+        // 150 ms at the top of the sweep; measure comfortably inside it.
+        let quiet = peak(&out[..(SR as usize / 10) * 2]);
+        let ringing = peak(&out[(SR as usize / 5) * 2..]);
+        assert!(
+            quiet < 1.0e-6,
+            "something arrived {quiet:e} inside the predelay window"
+        );
+        assert!(
+            ringing > 1.0e-4,
+            "nothing arrived after the predelay either: {ringing:e}"
+        );
+    }
+
     /// **The delay lands on the beat**, and the division says where. The whole
     /// reason the time is not a knob: at 120 bpm a dotted eighth is 375 ms, and
     /// a repeat anywhere else is a mistake somebody has to hear to find.
@@ -2982,6 +3428,8 @@ mod tests {
                         reverb_size: a,
                         reverb_damp: b,
                         reverb_width: a,
+                        plate_dispersion: b,
+                        plate_predelay: a,
                         delay_division: division,
                         delay_feedback: a,
                         delay_tone: b,
