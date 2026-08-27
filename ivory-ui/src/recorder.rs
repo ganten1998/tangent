@@ -239,11 +239,17 @@ pub struct RecorderView<'a> {
     /// The four faders, as LINEAR gains (not fader positions). See
     /// [`gain_to_fader`] for turning one into a knob angle.
     pub gains: Gains,
-    /// The six effect knobs, 0..=1, as they are drawn.
+    /// The eight effect knobs, 0..=1, as they are drawn.
     pub fx: FxSends,
+    /// The varispeed dial. Its own type rather than a bare `f32`, because the
+    /// number the dial DRAWS at and the number it MEANS are related by the
+    /// range, and only one place should know how.
+    pub varispeed: crate::varispeed::Varispeed,
+    /// The loudness column: three readings and which of them is showing.
+    pub loudness: Loudness,
     /// What each of those numbers MEANS, in [`crate::recorder_panel::Fx::ALL`]
     /// order. Told by the host; see [`crate::ports::KnobUnit`].
-    pub fx_units: [crate::ports::KnobUnit; 6],
+    pub fx_units: [crate::ports::KnobUnit; crate::recorder_panel::Fx::ALL.len()],
     /// The backing track: its name, its length and its outline. Borrowed, not
     /// owned — the outline is a thousand floats and the view is built every
     /// frame.
@@ -348,8 +354,19 @@ impl RecorderView<'_> {
             editing: None,
             folder_preview: "",
             gains: Gains::default(),
-            fx: FxSends { reverb: 0.0, delay: 0.0, chorus: 0.0, hpf: 0.0, lpf: 1.0, limiter: 0.0 },
-            fx_units: [crate::ports::KnobUnit::Percent; 6],
+            fx: FxSends {
+                reverb: 0.0,
+                delay: 0.0,
+                chorus: 0.0,
+                phaser: 0.0,
+                hpf: 0.0,
+                lpf: 1.0,
+                gain: 0.0,
+                limiter: 0.0,
+            },
+            fx_units: [crate::ports::KnobUnit::Percent; crate::recorder_panel::Fx::ALL.len()],
+            varispeed: crate::varispeed::Varispeed::default(),
+            loudness: Loudness::default(),
             track: crate::ports::TrackInfo::NONE,
             scrub: ScrubView::default(),
             turning: None,
@@ -897,6 +914,10 @@ pub struct RecorderState {
     /// fields on [`RecorderView`].
     pub master: Meters,
     pub gr_db: f32,
+    /// The loudness column's three readings, published by the engine ten
+    /// times a second. The WINDOW is a setting and is not stored here — see
+    /// `IvoryApp::recorder_layout_view`, which puts the two together.
+    pub loudness: Loudness,
     /// The output directory, shortened for display.
     pub dest: String,
     /// What the next take's folder will be called, from `ivory_record::take`.
@@ -984,7 +1005,9 @@ impl RecorderState {
             // Percent until the caller says otherwise: what each knob's number
             // MEANS is the host describing its own sweeps, not a preference,
             // so it is set over the top rather than threaded through here.
-            fx_units: [crate::ports::KnobUnit::Percent; 6],
+            fx_units: [crate::ports::KnobUnit::Percent; crate::recorder_panel::Fx::ALL.len()],
+            varispeed: crate::varispeed::Varispeed::default(),
+            loudness: Loudness::default(),
             turning,
             camera: label(&self.camera_name, self.camera_missing),
             audio: label(&self.audio_name, self.audio_missing),
@@ -1010,27 +1033,204 @@ pub struct FxSends {
     pub reverb: f32,
     pub delay: f32,
     pub chorus: f32,
+    /// The phaser's wet mix. 0 is off.
+    pub phaser: f32,
     /// The high-pass corner. 0 is out of the way.
     pub hpf: f32,
     /// The low-pass corner. **1.0 is out of the way** — see the binary's
     /// `Sends::lpf`.
     pub lpf: f32,
-    /// How hard the limiter is driven. 0 is bypass.
+    /// Output gain into the limiter, 0..=1 across [`GAIN_DB`]. **0 is unity**
+    /// — this one adds decibels rather than taking them away, which is why
+    /// its resting place is the bottom of its travel and not the middle.
+    pub gain: f32,
+    /// The limiter's THRESHOLD. 1.0 is bypass.
     pub limiter: f32,
 }
 
 impl FxSends {
     /// In the order they are drawn: the row of sends, then the row of
-    /// dynamics. Used by anything that walks all six.
+    /// dynamics. Used by anything that walks all eight.
     pub fn get(&self, fx: crate::recorder_panel::Fx) -> f32 {
         use crate::recorder_panel::Fx;
         match fx {
             Fx::Reverb => self.reverb,
             Fx::Delay => self.delay,
             Fx::Chorus => self.chorus,
+            Fx::Phaser => self.phaser,
             Fx::Hpf => self.hpf,
             Fx::Lpf => self.lpf,
+            Fx::Gain => self.gain,
             Fx::Limiter => self.limiter,
+        }
+    }
+}
+
+/// Which loudness window the ladder is showing.
+///
+/// **Three, in this order, and the order is the point**: they are the same
+/// measurement over three lengths of time, from the one that moves with the
+/// music to the one that describes the whole record. Cycling walks along that,
+/// which is why it is a click rather than a menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LoudnessWindow {
+    /// 400 ms, ungated. What is happening now — the reading that moves.
+    #[default]
+    Momentary,
+    /// 3 s, ungated. What the last phrase came to, which is what a mix
+    /// engineer actually rides.
+    ShortTerm,
+    /// The gated mean over everything since it was last reset. **This is the
+    /// number a streaming service reads**, and the only one worth comparing
+    /// against a target.
+    Integrated,
+}
+
+impl LoudnessWindow {
+    pub const ALL: [LoudnessWindow; 3] = [
+        LoudnessWindow::Momentary,
+        LoudnessWindow::ShortTerm,
+        LoudnessWindow::Integrated,
+    ];
+
+    /// The next one along, wrapping. See the type's own note on the order.
+    #[must_use]
+    pub fn next(self) -> Self {
+        match self {
+            LoudnessWindow::Momentary => LoudnessWindow::ShortTerm,
+            LoudnessWindow::ShortTerm => LoudnessWindow::Integrated,
+            LoudnessWindow::Integrated => LoudnessWindow::Momentary,
+        }
+    }
+
+    /// The word under the ladder. Short, because the column is narrow: the
+    /// standard's own abbreviations, which anybody who has read a loudness
+    /// spec already knows and anybody who has not can learn from three
+    /// letters as easily as from eleven.
+    pub fn label(self) -> &'static str {
+        match self {
+            LoudnessWindow::Momentary => "M",
+            LoudnessWindow::ShortTerm => "S",
+            LoudnessWindow::Integrated => "I",
+        }
+    }
+
+    /// The whole word, for the status line and the screen reader.
+    pub fn title(self) -> &'static str {
+        match self {
+            LoudnessWindow::Momentary => "Momentary",
+            LoudnessWindow::ShortTerm => "Short-term",
+            LoudnessWindow::Integrated => "Integrated",
+        }
+    }
+
+    /// Its index, for a persisted setting. **Append-only**, like every other
+    /// index table in this app: a saved 2 has to keep meaning Integrated.
+    pub fn index(self) -> usize {
+        match self {
+            LoudnessWindow::Momentary => 0,
+            LoudnessWindow::ShortTerm => 1,
+            LoudnessWindow::Integrated => 2,
+        }
+    }
+
+    pub fn from_index(i: usize) -> Self {
+        Self::ALL.get(i).copied().unwrap_or_default()
+    }
+}
+
+/// **Where the ladder ends, in LUFS.**
+///
+/// The bottom is quieter than any mix anybody would keep and the top is above
+/// full scale — a loudness meter that stops at 0 hides exactly the case it is
+/// there to warn about, because loudness is a MEAN and a mean can pass 0 LUFS
+/// on material that has been squashed hard enough.
+pub const LUFS_RANGE: (f32, f32) = (-40.0, 3.0);
+
+/// Silence, and anything close enough to it. Below the standard's own
+/// absolute gate there is no useful reading, only a number falling towards
+/// negative infinity, so the ladder shows nothing rather than a number.
+pub const LUFS_SILENCE: f32 = -70.0;
+
+/// The marks printed down the loudness ladder, and who asks for each.
+///
+/// **Not decoration.** The whole reason to put a loudness meter on a desk is
+/// to hit a number somebody else chose, and the numbers are public: a
+/// meter that made you look them up would be a meter you look up once and
+/// then guess at for ever.
+pub const LUFS_MARKS: [(f32, &str); 5] = [
+    // The club/CD-loud end. Not a target anybody publishes — it is where
+    // masters that fight the loudness war land, and it is on the ladder so
+    // you can see when you are there.
+    (-9.0, "-9"),
+    // Spotify, YouTube, Amazon, Tidal: the streaming consensus.
+    (-14.0, "-14"),
+    // Apple Music, and the podcast norm.
+    (-16.0, "-16"),
+    // The broadcast mixes that sit between the two.
+    (-18.0, "-18"),
+    // EBU R128 / ATSC A/85: European and American broadcast.
+    (-23.0, "-23"),
+];
+
+/// The three readings, as the ladder shows them.
+///
+/// All three are carried even though only one is drawn, because the window is
+/// cycled by a click and a view that carried only the current one would go
+/// blank for a whole second every time somebody pressed it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Loudness {
+    /// 400 ms.
+    pub momentary: f32,
+    /// 3 s.
+    pub short: f32,
+    /// Gated, since the last reset.
+    pub integrated: f32,
+    /// Which one the ladder is showing.
+    pub window: LoudnessWindow,
+}
+
+impl Default for Loudness {
+    /// Silence, which is what a desk with nothing playing is measuring.
+    fn default() -> Self {
+        Self {
+            momentary: LUFS_SILENCE,
+            short: LUFS_SILENCE,
+            integrated: LUFS_SILENCE,
+            window: LoudnessWindow::default(),
+        }
+    }
+}
+
+impl Loudness {
+    /// The reading on show.
+    pub fn now(self) -> f32 {
+        match self.window {
+            LoudnessWindow::Momentary => self.momentary,
+            LoudnessWindow::ShortTerm => self.short,
+            LoudnessWindow::Integrated => self.integrated,
+        }
+    }
+
+    /// The reading as a fraction of the ladder, 0 at the bottom.
+    ///
+    /// `None` for silence — see [`LUFS_SILENCE`]. A ladder drawn at zero
+    /// height and a ladder drawn for a signal 70 dB down look the same and
+    /// mean different things, so the caller is made to say which.
+    pub fn fraction(self) -> Option<f32> {
+        let v = self.now();
+        if !v.is_finite() || v <= LUFS_SILENCE {
+            return None;
+        }
+        let (lo, hi) = LUFS_RANGE;
+        Some(((v - lo) / (hi - lo)).clamp(0.0, 1.0))
+    }
+
+    /// What the number under the ladder says.
+    pub fn text(self) -> String {
+        match self.fraction() {
+            Some(_) => format!("{:.1}", self.now()),
+            None => "--".to_owned(),
         }
     }
 }
@@ -1102,6 +1302,12 @@ pub enum RecorderRequest {
     Pause,
     /// Put out every clip latch: the user has seen it.
     DismissClip,
+    /// Start the INTEGRATED loudness reading again from nothing.
+    ///
+    /// A request rather than a setting, because the number does not live
+    /// here: it is a gated mean the audio thread is accumulating, and the
+    /// only thing the UI can do about it is ask for it to be dropped.
+    ResetLoudness,
     /// Open one insert's OWN editor — the plugin's window, with its presets
     /// and its knobs: `(desk index, bay)`.
     ///
@@ -2050,6 +2256,16 @@ pub enum NumField {
     /// The time signature. Typed rather than dragged — "6/8" is two numbers and
     /// a slash, and there is no continuum between 4/4 and 7/8 to drag along.
     Meter,
+    /// The varispeed range's two fields, typed as plain percentages of
+    /// normal speed — 85 and 115, the numbers printed beside them. **Not
+    /// signed trims like the dial above:** a range is two absolute ends, and
+    /// `Min: -15` would be a field disagreeing with the label next to it.
+    VariMin,
+    VariMax,
+    /// The varispeed dial, typed as a SIGNED PERCENTAGE — the number it
+    /// reads. `+15`, `-7.5`, `0`. Typing 115 for fifteen percent up would be
+    /// the field disagreeing with the readout directly above it.
+    Varispeed,
 }
 
 /// A time typed into a trim field, in seconds.
@@ -2072,6 +2288,19 @@ pub fn parse_time(text: &str) -> Option<f64> {
         return None;
     }
     Some(mins * 60.0 + secs)
+}
+
+/// A signed percentage typed into the varispeed dial, as the trim itself.
+///
+/// **Lenient about the things somebody actually types**: a leading `+`, a
+/// trailing `%`, and either. What it refuses is anything that is not a
+/// number — a field that read `abc` as zero would silently disengage a dial
+/// somebody meant to nudge.
+pub fn parse_trim_percent(text: &str) -> Option<f32> {
+    let t = text.trim().trim_end_matches('%').trim();
+    let t = t.strip_prefix('+').unwrap_or(t);
+    let v: f32 = t.parse().ok()?;
+    v.is_finite().then_some(v)
 }
 
 /// A percent typed into an effect send, as 0..=1.

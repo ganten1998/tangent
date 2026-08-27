@@ -82,6 +82,10 @@ pub struct Theme {
     /// The master, which is deliberately its own colour: it is the one
     /// control that can undo every other one.
     pub master_knob: Option<Rgb>,
+    /// The varispeed dial's face. Its own role and not a shade of `fx_knob`,
+    /// because it is not one of the effects: it is the one control that
+    /// changes the PITCH of everything, and a theme should be able to say so.
+    pub varispeed: Option<Rgb>,
     /// The well the timecode and the oscilloscope sit in.
     pub meter_bg: Option<Rgb>,
     /// The oscilloscope's trace — the green, on a stock install.
@@ -117,7 +121,7 @@ pub struct Theme {
 
 /// Every role a theme can name, in the spelling a theme FILE uses. One list,
 /// so the writer, the reader, the example and the dark map cannot drift.
-pub const ROLES: [&str; 18] = [
+pub const ROLES: [&str; 19] = [
     "background",
     "white_key",
     "black_key",
@@ -130,6 +134,7 @@ pub const ROLES: [&str; 18] = [
     "recorder_bg",
     "fx_knob",
     "master_knob",
+    "varispeed",
     "meter_bg",
     "scope_draw",
     "fx_strip",
@@ -187,6 +192,7 @@ impl Theme {
             recorder_bg: c(0x61, 0x37, 0x3a),
             fx_knob: c(0x6C, 0x9B, 0xD2),
             master_knob: c(0xE8, 0x3A, 0x4E),
+            varispeed: c(0xE8, 0xDC, 0xC0),
             meter_bg: c(0x0B, 0x0E, 0x0A),
             scope_draw: c(0xA3, 0xE0, 0x48),
             fx_strip: c(0xE3, 0xD9, 0xBD),
@@ -215,6 +221,7 @@ impl Theme {
             recorder_bg: Some(s.recorder_bg_color),
             fx_knob: Some(s.fx_knob_color),
             master_knob: Some(s.master_knob_color),
+            varispeed: Some(s.varispeed_color),
             meter_bg: Some(s.meter_bg_color),
             scope_draw: Some(s.scope_draw_color),
             fx_strip: Some(s.fx_strip_color),
@@ -277,6 +284,9 @@ impl Theme {
         if let Some(v) = self.master_knob {
             s.master_knob_color = v;
         }
+        if let Some(v) = self.varispeed {
+            s.varispeed_color = v;
+        }
         if let Some(v) = self.meter_bg {
             s.meter_bg_color = v;
         }
@@ -329,6 +339,7 @@ impl Theme {
         put("recorder_bg", self.recorder_bg);
         put("fx_knob", self.fx_knob);
         put("master_knob", self.master_knob);
+        put("varispeed", self.varispeed);
         put("meter_bg", self.meter_bg);
         put("scope_draw", self.scope_draw);
         put("fx_strip", self.fx_strip);
@@ -379,6 +390,7 @@ impl Theme {
             recorder_bg: get("recorder_bg"),
             fx_knob: get("fx_knob"),
             master_knob: get("master_knob"),
+            varispeed: get("varispeed"),
             meter_bg: get("meter_bg"),
             background: get("background"),
             scope_draw: get("scope_draw"),
@@ -456,6 +468,7 @@ pub fn factory() -> Vec<Theme> {
             recorder_bg: c(0x52, 0x30, 0x4a),
             fx_knob: c(0xff, 0x8a, 0x5b),
             master_knob: c(0xff, 0x3b, 0x5c),
+            varispeed: c(0xF3, 0xDC, 0xE7),
             meter_bg: c(0x25, 0x15, 0x24),
             scope_draw: c(0x4c, 0xc7, 0xa4),
             fx_strip: c(0x5e, 0x2c, 0x4e),
@@ -482,6 +495,7 @@ pub fn factory() -> Vec<Theme> {
             recorder_bg: c(0x1d, 0x4a, 0x4e),
             fx_knob: c(0x3f, 0xd9, 0xb8),
             master_knob: c(0xf0, 0x5c, 0x78),
+            varispeed: c(0xD6, 0xE8, 0xE4),
             meter_bg: c(0x10, 0x24, 0x28),
             scope_draw: c(0x4f, 0xd4, 0x9a),
             fx_strip: c(0x1c, 0x38, 0x3c),
@@ -512,6 +526,7 @@ pub fn factory() -> Vec<Theme> {
             recorder_bg: c(0x26, 0x42, 0x6a),
             fx_knob: c(0x00, 0xd8, 0xf8),
             master_knob: c(0xf0, 0x90, 0x30),
+            varispeed: c(0xC9, 0xD8, 0xE8),
             meter_bg: c(0x0a, 0x1c, 0x34),
             scope_draw: c(0x40, 0xe8, 0xff),
             fx_strip: c(0x19, 0x2e, 0x48),
@@ -543,6 +558,7 @@ pub fn factory() -> Vec<Theme> {
             // Bright enough to read on the grey band — the ONE non-grey, and
             // it has to be findable or the discipline costs more than it buys.
             master_knob: c(0xe8, 0x69, 0x5a),
+            varispeed: c(0xEF, 0xEF, 0xEF),
             meter_bg: c(0x14, 0x14, 0x14),
             scope_draw: c(0xd0, 0xd0, 0xd0),
             fx_strip: c(0x26, 0x26, 0x26),
@@ -572,6 +588,7 @@ pub fn factory() -> Vec<Theme> {
             // old band, again when the band itself came up out of near-black.
             // The one control that can silence everything must be findable.
             master_knob: c(0xe8, 0x72, 0x58),
+            varispeed: c(0xDC, 0xD3, 0xBE),
             meter_bg: c(0x27, 0x24, 0x20),
             scope_draw: c(0xd8, 0xa0, 0x3c),
             fx_strip: c(0x3a, 0x35, 0x2e),
@@ -598,6 +615,7 @@ pub fn factory() -> Vec<Theme> {
             recorder_bg: c(0x33, 0x3a, 0x54),
             fx_knob: c(0x5c, 0xe8, 0xb4),
             master_knob: c(0xe0, 0x56, 0x7a),
+            varispeed: c(0x8F, 0xD8, 0xF5),
             meter_bg: c(0x1e, 0x21, 0x30),
             scope_draw: c(0x5c, 0xe8, 0xb4),
             fx_strip: c(0x2a, 0x2e, 0x40),
@@ -632,6 +650,7 @@ pub fn factory() -> Vec<Theme> {
             recorder_bg: c(0xe0, 0xd3, 0xba),
             fx_knob: c(0xa8, 0x4f, 0x28),
             master_knob: c(0xa0, 0x38, 0x28),
+            varispeed: c(0x40, 0x60, 0x6E),
             meter_bg: c(0xde, 0xd2, 0xbc),
             scope_draw: c(0x5a, 0x70, 0x40),
             fx_strip: c(0xd5, 0xc8, 0xb0),
@@ -660,6 +679,7 @@ pub fn factory() -> Vec<Theme> {
             recorder_bg: c(0xc2, 0xc2, 0xc8),
             fx_knob: c(0x7d, 0x5f, 0x18),
             master_knob: c(0x9c, 0x32, 0x26),
+            varispeed: c(0x35, 0x50, 0x6E),
             meter_bg: c(0x2a, 0x2a, 0x2e),
             scope_draw: c(0xd8, 0xb4, 0x5a),
             fx_strip: c(0xd5, 0xd5, 0xda),
@@ -685,6 +705,7 @@ pub fn factory() -> Vec<Theme> {
             recorder_bg: c(0x20, 0x45, 0x6e),
             fx_knob: c(0x7f, 0xb2, 0xe8),
             master_knob: c(0xf0, 0x70, 0x5f),
+            varispeed: c(0xE8, 0xE4, 0xD8),
             meter_bg: c(0x0f, 0x24, 0x40),
             scope_draw: c(0x9f, 0xd0, 0xf5),
             fx_strip: c(0x1a, 0x3a, 0x5e),
@@ -711,6 +732,7 @@ pub fn factory() -> Vec<Theme> {
             recorder_bg: c(0xcc, 0xd2, 0xd9),
             fx_knob: c(0x2f, 0x5f, 0xa8),
             master_knob: c(0xa8, 0x3a, 0x30),
+            varispeed: c(0x24, 0x54, 0x4A),
             meter_bg: c(0x28, 0x31, 0x3c),
             scope_draw: c(0x4a, 0x90, 0xd0),
             fx_strip: c(0xdd, 0xe2, 0xe8),
@@ -737,6 +759,7 @@ pub fn factory() -> Vec<Theme> {
             recorder_bg: c(0x2f, 0x40, 0x29),
             fx_knob: c(0x8f, 0xc4, 0x6a),
             master_knob: c(0xe8, 0x6a, 0x4a),
+            varispeed: c(0xD8, 0xCF, 0xA8),
             meter_bg: c(0x16, 0x1f, 0x13),
             scope_draw: c(0xa8, 0xd8, 0x78),
             fx_strip: c(0x26, 0x33, 0x1f),
@@ -763,6 +786,7 @@ pub fn factory() -> Vec<Theme> {
             recorder_bg: c(0x3c, 0x32, 0x2a),
             fx_knob: c(0xd9, 0xa4, 0x41),
             master_knob: c(0xe0, 0x58, 0x4a),
+            varispeed: c(0x7F, 0xB6, 0xA8),
             meter_bg: c(0x1a, 0x15, 0x12),
             scope_draw: c(0xe8, 0xc4, 0x6a),
             fx_strip: c(0x2e, 0x26, 0x20),
@@ -788,6 +812,7 @@ pub fn factory() -> Vec<Theme> {
             recorder_bg: c(0x2c, 0x4a, 0x44),
             fx_knob: c(0xe0, 0x8a, 0x4a),
             master_knob: c(0xf0, 0x70, 0x58),
+            varispeed: c(0xE6, 0xDA, 0xC2),
             meter_bg: c(0x16, 0x24, 0x23),
             scope_draw: c(0x6f, 0xd8, 0xc0),
             fx_strip: c(0x23, 0x3a, 0x36),
@@ -814,6 +839,7 @@ pub fn factory() -> Vec<Theme> {
             recorder_bg: c(0x3a, 0x2f, 0x55),
             fx_knob: c(0xf0, 0x92, 0x5a),
             master_knob: c(0xe0, 0x4a, 0x6a),
+            varispeed: c(0xC0, 0xA8, 0xE8),
             meter_bg: c(0x1b, 0x16, 0x30),
             scope_draw: c(0xf0, 0xb0, 0x70),
             fx_strip: c(0x2c, 0x24, 0x44),
@@ -840,6 +866,7 @@ pub fn factory() -> Vec<Theme> {
             recorder_bg: c(0x3f, 0x2d, 0x5c),
             fx_knob: c(0xc8, 0xe0, 0x5a),
             master_knob: c(0xe0, 0x50, 0x7a),
+            varispeed: c(0x9A, 0xB4, 0xF0),
             meter_bg: c(0x1e, 0x13, 0x30),
             scope_draw: c(0xd8, 0xf0, 0x70),
             fx_strip: c(0x31, 0x22, 0x43),
@@ -910,6 +937,7 @@ pub const EXAMPLE: &str = r##"{
   "recorder_bg": "",
   "fx_knob": "",
   "master_knob": "",
+  "varispeed": "",
   "meter_bg": "",
   "scope_draw": "",
 
@@ -936,6 +964,8 @@ pub const EXAMPLE: &str = r##"{
     "recorder_bg": "",
     "fx_knob": "",
     "master_knob": "",
+    "varispeed": "",
+  "varispeed": "",
     "meter_bg": "",
     "scope_draw": "",
     "fx_strip": "",

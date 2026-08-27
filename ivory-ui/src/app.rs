@@ -738,6 +738,9 @@ pub struct IvoryApp {
     /// One at a time, like `dialog`: three panels at once over a band this
     /// small is three panels covering each other.
     fx_open: Option<recorder_panel::Fx>,
+    /// The varispeed range panel is open. Mutually exclusive with `fx_open`
+    /// for the reason above it: one panel at a time over a band this small.
+    vari_open: bool,
     /// The backing track's waveform panel, and which handle a hand is on.
 
     /// The row of that panel a drag is on, once one has started. `&'static
@@ -1642,6 +1645,7 @@ impl IvoryApp {
             setup_open: false,
             input_monitor: true,
             fx_open: None,
+            vari_open: false,
 
             fx_drag: None,
             fx_defaults: crate::ports::EffectDefaults::default(),
@@ -3344,6 +3348,14 @@ impl IvoryApp {
             scrub: self.scrub_view(),
             input_monitor: self.input_monitor,
             scope: &self.scope,
+            // **From the settings, not from a copy on `recorder`.** The dial
+            // is a persisted preference like the eight beside it; a second
+            // copy is a second thing to keep in step.
+            varispeed: self.settings.varispeed,
+            loudness: crate::recorder::Loudness {
+                window: self.settings.lufs_window,
+                ..self.recorder.loudness
+            },
             ..self.recorder.view(
             self.settings.record_take_name.as_deref().unwrap_or_default(),
             self.name_focused,
@@ -3725,12 +3737,37 @@ impl IvoryApp {
                 // a text box instead — and a text box is what the word above
                 // the dial is for. A knob with no parameters swallows the
                 // press rather than opening the band's menu under a control.
-                if self.knob_under(recorder_rect, pos).is_some() {
-                    if let Some(fx) = self.fx_under(recorder_rect, pos) {
+                if let Some(hit) = self.knob_under(recorder_rect, pos) {
+                    // **The varispeed dial opens its RANGE**, which is what
+                    // it has instead of parameters — the owner's words were
+                    // "right click while like with the fx dials, and input a
+                    // custom range". Same gesture, same place, different
+                    // thing behind it because there is no effect here.
+                    if matches!(hit, recorder_panel::Hit::SetVarispeed(_)) {
+                        self.vari_open = true;
+                        self.fx_open = None;
+                        self.fx_drag = None;
+                    } else if let Some(fx) = self.fx_under(recorder_rect, pos) {
                         self.fx_open = Some(fx);
+                        self.vari_open = false;
                         self.fx_drag = None;
                     }
                     return;
+                }
+                // **The loudness ladder: right-click starts the integrated
+                // reading again.** Left-click cycles the window, which is the
+                // gesture somebody uses constantly; the reset is the one they
+                // want once a take, and it is behind the button that means
+                // "the other thing" everywhere else in this band.
+                if let Some(band) = recorder_rect.filter(|r| r.contains(pos)) {
+                    let view = self.recorder_layout_view();
+                    if matches!(
+                        recorder_panel::hit_test(band, &view, pos),
+                        Some(recorder_panel::Hit::CycleLufs)
+                    ) {
+                        self.apply_recorder_hit(recorder_panel::Hit::ResetLufs);
+                        return;
+                    }
                 }
                 // **And a right-click on a fader means nothing at all.** It
                 // has one number and one gesture set; opening a menu over it
@@ -3862,6 +3899,17 @@ impl IvoryApp {
             }
         }
 
+        // The varispeed range panel, on the same terms as the effect panel
+        // below it — and BEFORE it, because the two are mutually exclusive
+        // and this one is the newer of the pair.
+        if self.vari_open {
+            if primary_pressed {
+                if let Some(pos) = pointer {
+                    self.press_in_vari_panel(ui.max_rect(), pos);
+                }
+                return;
+            }
+        }
         // The effect panel, on the same terms as the take settings below it.
         if let Some(fx) = self.fx_open {
             if primary_pressed || (pointer_down && self.fx_drag.is_some()) {
@@ -4622,6 +4670,49 @@ impl IvoryApp {
     /// every later position sets THAT key, wherever the pointer has slid to —
     /// the same rule the band's own faders follow, and for the same reason: a
     /// hand that drifts up a row must not start setting the row above.
+    /// The anchor the range panel hangs off: the dial that opened it.
+    fn vari_anchor(&self) -> Rect {
+        let view = self.recorder_layout_view();
+        recorder_panel::knob_rect(
+            self.last_band,
+            &view,
+            recorder_panel::Hit::SetVarispeed(0.5),
+        )
+        .unwrap_or(Rect::NOTHING)
+    }
+
+    /// A press inside the open varispeed range panel.
+    fn press_in_vari_panel(&mut self, screen: Rect, pos: Pos2) {
+        let anchor = self.vari_anchor();
+        match recorder_panel::vari_hit_test(screen, anchor, pos) {
+            Some(recorder_panel::VariHit::Type(field)) => {
+                self.apply_recorder_hit(recorder_panel::Hit::Type(field));
+            }
+            Some(recorder_panel::VariHit::Reset) => {
+                // **The RANGE, and not the dial.** Somebody who has widened
+                // the reach and wants it back has not asked for the speed to
+                // change, and `set_min`/`set_max` keep it — see their notes.
+                self.settings.varispeed.set_min(crate::varispeed::DEFAULT_MIN);
+                self.settings.varispeed.set_max(crate::varispeed::DEFAULT_MAX);
+                self.num_edit = None;
+                self.save_settings();
+            }
+            Some(recorder_panel::VariHit::Close) => {
+                self.vari_open = false;
+                self.num_edit = None;
+            }
+            // Panel chrome swallows the press; outside it, the press closes
+            // the panel and is SPENT — the rule `press_in_fx_panel` gives.
+            None => {
+                if !recorder_panel::vari_popup_rect(screen, anchor).contains(pos) {
+                    self.vari_open = false;
+                    self.num_edit = None;
+                    self.menu_ate_press = true;
+                }
+            }
+        }
+    }
+
     fn press_in_fx_panel(
         &mut self,
         screen: Rect,
@@ -11733,8 +11824,8 @@ impl IvoryApp {
     /// Percent unless the host said otherwise, which is the right answer for
     /// a build talking to an older host and for the four that really are
     /// percentages.
-    fn fx_units(&self) -> [crate::ports::KnobUnit; 6] {
-        let mut out = [crate::ports::KnobUnit::Percent; 6];
+    fn fx_units(&self) -> [crate::ports::KnobUnit; recorder_panel::Fx::ALL.len()] {
+        let mut out = [crate::ports::KnobUnit::Percent; recorder_panel::Fx::ALL.len()];
         for (fx, slot) in recorder_panel::Fx::ALL.into_iter().zip(&mut out) {
             if let Some((_, u)) = self
                 .fx_defaults
@@ -11750,8 +11841,8 @@ impl IvoryApp {
 
     /// Where one effect knob's value lives in the settings.
     ///
-    /// **One place, reached by both the reader and the writer.** Six knobs
-    /// times two directions is twelve chances to wire a knob to the wrong
+    /// **One place, reached by both the reader and the writer.** Eight knobs
+    /// times two directions is sixteen chances to wire a knob to the wrong
     /// field, and a knob reading one number while writing another looks
     /// exactly like a knob that does not work.
     fn fx_mix(&mut self, fx: recorder_panel::Fx) -> &mut f64 {
@@ -11760,8 +11851,10 @@ impl IvoryApp {
             Fx::Reverb => &mut self.settings.reverb_mix,
             Fx::Delay => &mut self.settings.delay_mix,
             Fx::Chorus => &mut self.settings.chorus_mix,
+            Fx::Phaser => &mut self.settings.phaser_mix,
             Fx::Hpf => &mut self.settings.hpf_mix,
             Fx::Lpf => &mut self.settings.lpf_mix,
+            Fx::Gain => &mut self.settings.gain_mix,
             Fx::Limiter => &mut self.settings.limiter_mix,
         }
     }
@@ -11776,8 +11869,10 @@ impl IvoryApp {
             Fx::Reverb => self.settings.reverb_mix,
             Fx::Delay => self.settings.delay_mix,
             Fx::Chorus => self.settings.chorus_mix,
+            Fx::Phaser => self.settings.phaser_mix,
             Fx::Hpf => self.settings.hpf_mix,
             Fx::Lpf => self.settings.lpf_mix,
+            Fx::Gain => self.settings.gain_mix,
             Fx::Limiter => self.settings.limiter_mix,
         }) as f32
     }
@@ -11835,13 +11930,19 @@ impl IvoryApp {
     }
 
     /// The three effect sends, 0..=1, for the host to hand the audio thread.
-    pub fn effect_sends(&self) -> [f32; 6] {
+    pub fn effect_sends(&self) -> [f32; recorder_panel::Fx::ALL.len()] {
+        // **In `Fx::ALL` order**, which is the order they are drawn and the
+        // order the host destructures them in. The array is sized from the
+        // table rather than written as 8, so adding a ninth knob is a compile
+        // error at every call site instead of a silent reordering.
         [
             self.settings.reverb_mix as f32,
             self.settings.delay_mix as f32,
             self.settings.chorus_mix as f32,
+            self.settings.phaser_mix as f32,
             self.settings.hpf_mix as f32,
             self.settings.lpf_mix as f32,
+            self.settings.gain_mix as f32,
             self.settings.limiter_mix as f32,
         ]
     }
@@ -12641,6 +12742,18 @@ impl IvoryApp {
                 *self.fx_mix(fx) = f64::from(v.clamp(0.0, 1.0));
                 self.save_settings_soon();
             }
+            // **Through the model, never straight into the field.** The
+            // detent lives in `set_pos`, and a drag that wrote the position
+            // raw would be a dial that can never be switched off again.
+            Hit::SetVarispeed(v) => {
+                self.settings.varispeed.set_pos(v);
+                self.save_settings_soon();
+            }
+            Hit::CycleLufs => {
+                self.settings.lufs_window = self.settings.lufs_window.next();
+                self.save_settings();
+            }
+            Hit::ResetLufs => self.request_recorder(R::ResetLoudness),
             Hit::ToggleMetronomeInTake => {
                 self.settings.metronome_in_take = !self.settings.metronome_in_take;
                 self.save_settings();
@@ -13401,6 +13514,32 @@ impl IvoryApp {
             // In the knob's OWN unit: a filter is typed in hertz.
             F::Fx(fx) => recorder_panel::knob_typed(self.fx_units()[fx.index()], &edit.text)
                 .map(|v| Hit::SetFx(fx, v)),
+            // **A signed trim, and the position is worked out by the model**
+            // — the mapping from a percentage to a dial angle depends on the
+            // range and there must be one place that knows it. See
+            // `Varispeed::set_percent`, which also clamps a number the
+            // current range cannot reach rather than refusing it.
+            // **The two range ends commit HERE and return no hit**, like the
+            // time signature above: they are not a control on the band, they
+            // are the reach of one, and there is no `Hit` that carries a
+            // range.
+            F::VariMin | F::VariMax => {
+                if let Some(v) = recorder::parse_trim_percent(&edit.text) {
+                    let n = v.round().clamp(0.0, f32::from(u16::MAX)) as u16;
+                    if edit.field == F::VariMin {
+                        self.settings.varispeed.set_min(n);
+                    } else {
+                        self.settings.varispeed.set_max(n);
+                    }
+                    self.save_settings();
+                }
+                None
+            }
+            F::Varispeed => recorder::parse_trim_percent(&edit.text).map(|d| {
+                let mut v = self.settings.varispeed;
+                v.set_percent(crate::varispeed::OFF + d);
+                Hit::SetVarispeed(v.pos())
+            }),
         };
         if let Some(hit) = hit {
             self.apply_recorder_hit(hit);
@@ -13428,6 +13567,13 @@ impl IvoryApp {
                 } else {
                     format!("{:.1}", 20.0 * g.log10())
                 }
+            }
+            F::VariMin => format!("{}", self.settings.varispeed.min()),
+            F::VariMax => format!("{}", self.settings.varispeed.max()),
+            F::Varispeed => {
+                // The readout carries the sign and the field opens on what
+                // the readout says; `parse_trim_percent` takes it back.
+                format!("{:+.1}", self.settings.varispeed.percent() - crate::varispeed::OFF)
             }
             F::Fx(fx) => {
                 let v = self.fx_value(fx);
@@ -16866,6 +17012,23 @@ impl IvoryApp {
                 // draw knobs in, and a panel left latched over nothing is a
                 // panel with no way back to the control it belongs to.
                 self.fx_open = None;
+            }
+        }
+        // The varispeed range, on the same terms as the effect panels above.
+        if self.vari_open {
+            let anchor = self.vari_anchor();
+            if anchor.is_positive() {
+                recorder_panel::draw_vari_range(
+                    ui.painter(),
+                    ui.max_rect(),
+                    anchor,
+                    self.settings.varispeed,
+                    self.num_edit.as_ref(),
+                    &self.settings,
+                );
+            } else {
+                // No dial, no panel — the rule the effect panels follow.
+                self.vari_open = false;
             }
         }
         self.draw_input_menu(ui.painter());
@@ -22283,6 +22446,9 @@ mod tests {
                 ("chorus_depth", 0.55),
                 ("chorus_width", 0.85),
                 ("chorus_tone", 0.45),
+                ("phaser_rate", 0.22),
+                ("phaser_feedback", 0.55),
+                ("phaser_range", 0.35),
             ]
             .into_iter()
             .map(|(k, v)| (k.to_owned(), serde_json::Value::from(v)))
@@ -22302,6 +22468,14 @@ mod tests {
                 },
                 slope_choice("hpf_slope"),
                 slope_choice("lpf_slope"),
+                crate::ports::ChoiceParam {
+                    key: "phaser_stages".to_owned(),
+                    options: [("2", "2 - Phase 45"), ("4", "4 - Phase 90"), ("6", "6")]
+                        .into_iter()
+                        .map(|(k, l)| (k.to_owned(), l.to_owned()))
+                        .collect(),
+                    default: "4".to_owned(),
+                },
             ],
         });
         (ctx, app)

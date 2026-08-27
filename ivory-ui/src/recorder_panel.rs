@@ -155,9 +155,11 @@ struct Palette {
     /// face they sit on. Theme roles — see `crate::theme`.
     lcd: Color32,
     lcd_face: Color32,
-    /// The six effect dials, and the master, which is its own colour.
+    /// The eight effect dials, and the master, which is its own colour.
     fx_knob: Color32,
     master: Color32,
+    /// The varispeed dial's face. Its own role — see `Settings`.
+    varispeed: Color32,
 }
 
 /// The two inks the band can wear.
@@ -423,6 +425,7 @@ fn palette(s: &Settings) -> Palette {
         lcd_face: s.meter_bg_color.to_color32(),
         fx_knob: s.fx_knob_color.to_color32(),
         master: s.master_knob_color.to_color32(),
+        varispeed: s.varispeed_color.to_color32(),
     }
 }
 
@@ -532,6 +535,24 @@ struct Layout {
     master_scale: [Rect; 2],
     master_bars: Rect,
     master_knob: Rect,
+
+    /// The loudness ladder, left of the master. Its scale runs down one side
+    /// only: the numbers on a LUFS ladder are three characters wide and the
+    /// column is half the master's, so a scale at each side would leave no
+    /// ladder between them.
+    lufs_scale: Rect,
+    lufs_bar: Rect,
+    /// The number under the ladder, and the target that cycles the window —
+    /// momentary, short-term, integrated. See [`LoudnessWindow`].
+    lufs_readout: Rect,
+    /// The varispeed dial, at the foot of the loudness column.
+    ///
+    /// **The same seat the master knob has under its own ladder**, which is
+    /// what puts it in the gap between the LIMITER and the MASTER that the
+    /// owner asked for and what makes the two feet line up. It is not one of
+    /// the eight — it is not an effect, it changes the SPEED — so it is not
+    /// in `fx` and it is not drawn like them.
+    vari: Rect,
 
     /// The six effect knobs, in [`Fx::ALL`] order, under the meters.
     ///
@@ -660,6 +681,10 @@ impl Layout {
             master_scale: [Rect::NOTHING; 2],
             master_bars: Rect::NOTHING,
             master_knob: Rect::NOTHING,
+            lufs_scale: Rect::NOTHING,
+            lufs_bar: Rect::NOTHING,
+            lufs_readout: Rect::NOTHING,
+            vari: Rect::NOTHING,
             fx: [Rect::NOTHING; Fx::ALL.len()],
             tempo_entry: Rect::NOTHING,
             tempo_tap: Rect::NOTHING,
@@ -1153,6 +1178,64 @@ impl Layout {
         self.master_bars = slice_h(meter, MASTER_SCALE_W + 0.03, 1.0 - MASTER_SCALE_W - 0.03);
     }
 
+    /// The loudness column: the ladder, its scale, the reading under it, and
+    /// the varispeed dial at its foot.
+    ///
+    /// `foot` is the master knob — not a size but the rectangle itself,
+    /// because the varispeed dial has to line up with it exactly. Two knobs
+    /// at the same size but a few points apart vertically read as a mistake,
+    /// and this is the one place in the band where two knobs of different
+    /// kinds stand side by side.
+    fn fill_lufs(&mut self, c: Rect, foot: Rect) {
+        if !c.is_positive() {
+            return;
+        }
+        // **No foot, no dial** — and no ladder either. The master knob is
+        // refused when the band is too short for it (`knob_fits`), and a
+        // loudness column that kept its ladder while the row of knobs beside
+        // it vanished would be the only thing left standing in an empty
+        // corner.
+        if !foot.is_positive() {
+            return;
+        }
+        let vari = Rect::from_min_max(
+            Pos2::new(c.left(), foot.top()),
+            Pos2::new(c.right(), foot.bottom()),
+        );
+        if !knob_fits(vari) {
+            return;
+        }
+        self.vari = vari;
+        // The reading sits between the ladder and the dial, in the gap the
+        // master column spends on nothing.
+        let above = Rect::from_min_max(c.min, Pos2::new(c.right(), vari.top() - 4.0));
+        if !above.is_positive() {
+            return;
+        }
+        // A line of text is worth about a fifth of what is left, floored so
+        // it does not vanish on a tall band and capped so it does not eat the
+        // ladder on a short one.
+        let read_h = (above.height() * 0.18).clamp(9.0, 16.0);
+        let ladder = Rect::from_min_max(
+            above.min,
+            Pos2::new(above.right(), above.bottom() - read_h),
+        );
+        if !ladder.is_positive() {
+            return;
+        }
+        self.lufs_readout = Rect::from_min_max(
+            Pos2::new(above.left(), above.bottom() - read_h),
+            above.max,
+        );
+        // Scale on the LEFT, ladder to its right: the numbers are read
+        // against the bar beside them, and the master's own scale is
+        // immediately to the right of this column — putting one here too
+        // would set two columns of numbers back to back with nothing but
+        // numbers between the two ladders.
+        self.lufs_scale = slice_h(ladder, 0.0, LUFS_SCALE_W);
+        self.lufs_bar = slice_h(ladder, LUFS_SCALE_W + 0.06, 1.0);
+    }
+
     fn fill_transport(&mut self, t: Rect) {
         if !t.is_positive() {
             return;
@@ -1173,21 +1256,31 @@ impl Layout {
         // 0.02 off the timeline's rule rather than 0.04: the VU faces are
         // sized by this column's width, and the margin was twice what the
         // rule between them needs.
-        let right = slice_h(t, FADER_COL + 0.02, MASTER_COL);
+        let right = slice_h(t, FADER_COL + 0.02, LUFS_COL);
+        // The loudness column, between the knobs and the master.
+        let lufs_col = slice_h(t, LUFS_COL + 0.005, MASTER_COL);
         // A touch LEFT of where it was, and no longer stopped under the
         // heart: the ladder runs to the VU faces' own top line, and the
         // heart keeps the corner with room to breathe beside the ladder.
         let master_col = slice_h(t, MASTER_COL + 0.005, 0.985);
         self.meter = slice_v(right, 0.0, METER_SHARE);
         let knobs = slice_v(right, METER_SHARE + 0.03, 1.0);
-        // Side by side, one third each, with the gap inside the cell: the
+        // Side by side, a quarter each, with the gap inside the cell: the
         // label is centred over the dial and `draw_knob` centres the pair in
         // whatever it is handed.
-        // **Two rows of three.** Three sends on top, then the three that
-        // shape the whole output: a high-pass, a low-pass and the limiter that
-        // is always the last thing in the chain. Six across one row would put
-        // every knob below the size `knob_fits` will accept at any window this
-        // app opens at.
+        // **Two rows of FOUR.** Four sends on top — the three that add a room
+        // and the phaser — then the four that shape what leaves: a high-pass,
+        // a low-pass, the gain and the limiter that is always the last thing
+        // in the chain. Eight across one row would put every knob below the
+        // size `knob_fits` will accept at any window this app opens at.
+        //
+        // **Going from three to four costs the knobs nothing.** A knob's
+        // diameter is set by the shorter side of its cell and these cells are
+        // twice as wide as they are tall, so a quarter of the row is still
+        // three times the width the circle needs — what shrinks is the margin
+        // beside it. The words shrink to fit and LIMITER, the longest of the
+        // eight, still lands well inside a quarter cell. See `knob_face` and
+        // `fit_text`.
         // **The gap between the rows is bigger than it looks like it needs to
         // be**, because a knob is bigger than its cell: the tick marks stand
         // out to 1.26 of the face radius and are drawn OUTSIDE the rectangle
@@ -1199,21 +1292,34 @@ impl Layout {
         // word and the reverb knob's skirt, which is twice the gap that
         // collision happened at.
         let (top, bottom) = (row(0.00, 0.46), row(0.54, 1.00));
+        // A quarter each with a fiftieth of the row between them, which is
+        // the same proportional gutter the thirds had.
+        let col = |i: f32| (i * 0.25 + 0.01 * i.min(1.0).ceil(), (i + 1.0) * 0.25);
+        let cell = |r: Rect, i: usize| {
+            let i = i as f32;
+            let (a, b) = (i * 0.25, (i + 1.0) * 0.25);
+            let pad = 0.012;
+            slice_h(r, a + if i > 0.0 { pad } else { 0.0 }, b - if i < 3.0 { pad } else { 0.0 })
+        };
+        let _ = col;
         let cells = [
-            slice_h(top, 0.00, 0.32),
-            slice_h(top, 0.34, 0.66),
-            slice_h(top, 0.68, 1.00),
-            slice_h(bottom, 0.00, 0.32),
-            slice_h(bottom, 0.34, 0.66),
-            slice_h(bottom, 0.68, 1.00),
+            cell(top, 0),
+            cell(top, 1),
+            cell(top, 2),
+            cell(top, 3),
+            cell(bottom, 0),
+            cell(bottom, 1),
+            cell(bottom, 2),
+            cell(bottom, 3),
         ];
         // **A control nobody can see is not a control.** `draw_knob` refuses a
         // cell too small to be a knob rather than drawing a smudge, so the
         // layout has to refuse it too — otherwise the band keeps a live drag
         // target over blank panel. One predicate, asked by both.
         //
-        // All six or none: five knobs where there should be six is worse than
-        // none, because the missing one is the one somebody goes looking for.
+        // All eight or none: seven knobs where there should be eight is worse
+        // than none, because the missing one is the one somebody goes looking
+        // for.
         if cells.iter().copied().all(knob_fits) {
             self.fx = cells;
         }
@@ -1222,6 +1328,11 @@ impl Layout {
         // same size; taking a share of its own column instead would make it
         // half again as big, which reads as a different kind of thing.
         self.fill_master(master_col, self.fx[0].size());
+        // **After the master, because it borrows its FOOT.** The varispeed
+        // dial has to sit at the same height as the master knob or the two
+        // read as two different rows of controls; the master's is placed
+        // above, so this asks for it rather than working it out again.
+        self.fill_lufs(lufs_col, self.master_knob);
     }
 
     /// Rolling: readable from the bench. The preview collapses to a strip that
@@ -1270,12 +1381,21 @@ impl Layout {
         }
     }
 
+    /// Where one effect knob's cell is.
+    ///
+    /// A method rather than `self.fx[n]` at each call site — see the note in
+    /// `targets`, where eight literal indices went stale the moment the row
+    /// gained a knob.
+    fn cell(&self, fx: Fx) -> Rect {
+        self.fx.get(fx.index()).copied().unwrap_or(Rect::NOTHING)
+    }
+
     /// Every clickable region and what it means, in one place.
     ///
     /// [`hit_test`] reads this and so does the test that proves no two of them
     /// overlap, so a control that moves onto another one fails a test rather
     /// than quietly swallowing its clicks.
-    fn targets(&self) -> [(Rect, Produces); 33] {
+    fn targets(&self) -> [(Rect, Produces); 40] {
         use Produces::{Along, AlongV, Fixed};
         // The word over a knob, which is the same thing for a dial.
         // **Nothing when there is no word.** Below a certain height the label
@@ -1311,12 +1431,23 @@ impl Layout {
             (cap(self.tempo), Fixed(Hit::Type(NumField::Tempo))),
             (self.tempo_tap, Fixed(Hit::TapTempo)),
             (cap(self.master_knob), Fixed(Hit::Type(NumField::Master))),
-            (cap(self.fx[0]), Fixed(Hit::Type(NumField::Fx(Fx::Reverb)))),
-            (cap(self.fx[1]), Fixed(Hit::Type(NumField::Fx(Fx::Delay)))),
-            (cap(self.fx[2]), Fixed(Hit::Type(NumField::Fx(Fx::Chorus)))),
-            (cap(self.fx[3]), Fixed(Hit::Type(NumField::Fx(Fx::Hpf)))),
-            (cap(self.fx[4]), Fixed(Hit::Type(NumField::Fx(Fx::Lpf)))),
-            (cap(self.fx[5]), Fixed(Hit::Type(NumField::Fx(Fx::Limiter)))),
+            (cap(self.vari), Fixed(Hit::Type(NumField::Varispeed))),
+            // **Indexed through `Fx::index()`, never by a literal.** These
+            // were written as `self.fx[0]` … `self.fx[5]` against the order
+            // the six knobs happened to be in; adding the phaser at position
+            // three silently handed the PHASER's rectangle to the HPF and
+            // every knob after it shifted by one. Nothing overlapped and
+            // nothing was unreachable, so only a test that pressed each
+            // knob's own cell could see it. Asking the enum where it sits
+            // makes the pairing structural.
+            (cap(self.cell(Fx::Reverb)), Fixed(Hit::Type(NumField::Fx(Fx::Reverb)))),
+            (cap(self.cell(Fx::Delay)), Fixed(Hit::Type(NumField::Fx(Fx::Delay)))),
+            (cap(self.cell(Fx::Chorus)), Fixed(Hit::Type(NumField::Fx(Fx::Chorus)))),
+            (cap(self.cell(Fx::Phaser)), Fixed(Hit::Type(NumField::Fx(Fx::Phaser)))),
+            (cap(self.cell(Fx::Hpf)), Fixed(Hit::Type(NumField::Fx(Fx::Hpf)))),
+            (cap(self.cell(Fx::Lpf)), Fixed(Hit::Type(NumField::Fx(Fx::Lpf)))),
+            (cap(self.cell(Fx::Gain)), Fixed(Hit::Type(NumField::Fx(Fx::Gain)))),
+            (cap(self.cell(Fx::Limiter)), Fixed(Hit::Type(NumField::Fx(Fx::Limiter)))),
             // **The picture is the picker.** Not while a take is rolling: the
             // camera cannot be changed mid-take, and the dialog it opens is
             // modal over the one gesture that matters then, which is Stop.
@@ -1341,12 +1472,24 @@ impl Layout {
             // Up the cell for more, which is the direction every knob in every
             // studio turns and the direction the two faders beside them move.
             (dial(self.master_knob), AlongV(Hit::SetMaster)),
-            (dial(self.fx[0]), AlongV(|v| Hit::SetFx(Fx::Reverb, v))),
-            (dial(self.fx[1]), AlongV(|v| Hit::SetFx(Fx::Delay, v))),
-            (dial(self.fx[2]), AlongV(|v| Hit::SetFx(Fx::Chorus, v))),
-            (dial(self.fx[3]), AlongV(|v| Hit::SetFx(Fx::Hpf, v))),
-            (dial(self.fx[4]), AlongV(|v| Hit::SetFx(Fx::Lpf, v))),
-            (dial(self.fx[5]), AlongV(|v| Hit::SetFx(Fx::Limiter, v))),
+            // Up for faster, which is the direction every dial on this panel
+            // turns for more — and, on a tape machine, the direction the
+            // pitch goes.
+            (dial(self.vari), AlongV(Hit::SetVarispeed)),
+            // **The whole ladder, and the number under it.** A loudness
+            // reading is read, not aimed at: the target that cycles the
+            // window has to be the thing somebody is already looking at, and
+            // a thirty-point-wide bar is not something to ask a hand to hit
+            // twice.
+            (self.lufs_bar.union(self.lufs_readout), Fixed(Hit::CycleLufs)),
+            (dial(self.cell(Fx::Reverb)), AlongV(|v| Hit::SetFx(Fx::Reverb, v))),
+            (dial(self.cell(Fx::Delay)), AlongV(|v| Hit::SetFx(Fx::Delay, v))),
+            (dial(self.cell(Fx::Chorus)), AlongV(|v| Hit::SetFx(Fx::Chorus, v))),
+            (dial(self.cell(Fx::Phaser)), AlongV(|v| Hit::SetFx(Fx::Phaser, v))),
+            (dial(self.cell(Fx::Hpf)), AlongV(|v| Hit::SetFx(Fx::Hpf, v))),
+            (dial(self.cell(Fx::Lpf)), AlongV(|v| Hit::SetFx(Fx::Lpf, v))),
+            (dial(self.cell(Fx::Gain)), AlongV(|v| Hit::SetFx(Fx::Gain, v))),
+            (dial(self.cell(Fx::Limiter)), AlongV(|v| Hit::SetFx(Fx::Limiter, v))),
             (self.dest, Fixed(Hit::ChooseFolder)),
             (self.reveal, Fixed(Hit::RevealFolder)),
             (self.open_when_done, Fixed(Hit::ToggleOpenWhenDone)),
@@ -1521,6 +1664,27 @@ pub enum Hit {
     /// every other numeric cell there is nothing to drag: "6/8" is two numbers
     /// and a slash, not a point on a continuum.
     EditTimeSignature,
+    /// The varispeed dial, as a POSITION 0..=1 with 0.5 at twelve o'clock.
+    ///
+    /// Its own variant rather than a ninth `SetFx`, because it is not an
+    /// effect: nothing about it goes through the effects chain, its resting
+    /// place is the middle of its travel rather than an end, and it is the
+    /// only control in the band that changes what the master's SAMPLE RATE
+    /// means. See `crate::varispeed`.
+    SetVarispeed(f32),
+    /// The loudness ladder: step to the next window — momentary, short-term,
+    /// integrated. A click rather than a menu, because there are three of
+    /// them and they have an order.
+    CycleLufs,
+    /// Put the integrated reading back to nothing and start measuring again.
+    ///
+    /// **Only the integrated one has this and only the integrated one needs
+    /// it**: momentary and short-term are windows that forget by themselves,
+    /// and an integrated reading is a gated mean over everything since it was
+    /// last cleared — which, without this, is everything since the app
+    /// opened, including the twenty minutes of silence before you pressed
+    /// play.
+    ResetLufs,
 }
 
 impl Hit {
@@ -1543,6 +1707,7 @@ impl Hit {
         match self {
             Hit::SetFx(fx, _) => Hit::SetFx(fx, v),
             Hit::SetMaster(_) => Hit::SetMaster(v),
+            Hit::SetVarispeed(_) => Hit::SetVarispeed(v),
             // **The tempo, which was missing.** Every other knob's drag goes
             // through here to turn "how far the hand has moved" into a value;
             // without an arm the tempo fell to `other => other` and every
@@ -1561,7 +1726,7 @@ impl Hit {
     ///
     /// The four per-slot controls appear once per slot, because "reachable" is
     /// a question about slot 2 that slot 0 cannot answer for it.
-    pub const ALL: [Hit; 28] = [
+    pub const ALL: [Hit; 33] = [
         Hit::Play,
         Hit::Record,
         Hit::Stop,
@@ -1585,11 +1750,16 @@ impl Hit {
         Hit::SetFx(Fx::Reverb, Hit::MIDWAY),
         Hit::SetFx(Fx::Delay, Hit::MIDWAY),
         Hit::SetFx(Fx::Chorus, Hit::MIDWAY),
+        Hit::SetFx(Fx::Phaser, Hit::MIDWAY),
         Hit::SetFx(Fx::Hpf, Hit::MIDWAY),
         Hit::SetFx(Fx::Lpf, Hit::MIDWAY),
+        Hit::SetFx(Fx::Gain, Hit::MIDWAY),
         Hit::SetFx(Fx::Limiter, Hit::MIDWAY),
         Hit::SetTempo((MIN_BPM + MAX_BPM) * 0.5),
         Hit::EditTimeSignature,
+        Hit::SetVarispeed(Hit::MIDWAY),
+        Hit::CycleLufs,
+        Hit::ResetLufs,
     ];
 
     pub fn label(self) -> &'static str {
@@ -1627,6 +1797,11 @@ impl Hit {
             Hit::SetTempo(_) => "Tempo",
             Hit::TapTempo => "Tap the tempo - each press is one beat",
             Hit::EditTimeSignature => "Time signature",
+            Hit::SetVarispeed(_) => {
+                "Varispeed  -  pitch follows speed; centre is off, right-click for the range"
+            }
+            Hit::CycleLufs => "Loudness  -  click for momentary, short-term, integrated",
+            Hit::ResetLufs => "Loudness  -  right-click to start the integrated reading again",
         }
     }
 
@@ -1636,7 +1811,10 @@ impl Hit {
     /// function of where the pointer is, so they are the ones the app has to
     /// keep following while the button is held. A button has nothing to follow.
     pub fn is_draggable(&self) -> bool {
-        matches!(self, Hit::SetFx(..) | Hit::SetMaster(_) | Hit::SetTempo(_))
+        matches!(
+            self,
+            Hit::SetFx(..) | Hit::SetMaster(_) | Hit::SetTempo(_) | Hit::SetVarispeed(_)
+        )
     }
 
     /// Whether this is one of the eight knobs.
@@ -1647,7 +1825,10 @@ impl Hit {
     /// tap, and a control that opened a text box under every double-click
     /// could never be reset by one.
     pub fn is_knob(self) -> bool {
-        matches!(self, Hit::SetFx(..) | Hit::SetTempo(_) | Hit::SetMaster(_))
+        matches!(
+            self,
+            Hit::SetFx(..) | Hit::SetTempo(_) | Hit::SetMaster(_) | Hit::SetVarispeed(_)
+        )
     }
 
     /// What a double-click puts this control back to.
@@ -1678,6 +1859,10 @@ impl Hit {
             Hit::SetFx(fx, _) => Hit::SetFx(fx, 0.0),
             Hit::SetTempo(_) => Hit::SetTempo(DEFAULT_BPM),
             Hit::SetMaster(_) => Hit::SetMaster(ships_at(d.master)),
+            // Dead centre, which is the one place this dial is OFF. It is
+            // also the only knob here whose "not applied" is the MIDDLE of
+            // its travel rather than an end — see `crate::varispeed`.
+            Hit::SetVarispeed(_) => Hit::SetVarispeed(crate::varispeed::Varispeed::CENTRE),
             _ => return None,
         })
     }
@@ -1725,6 +1910,9 @@ fn num_field_key(f: NumField) -> usize {
         NumField::Master => 102,
         NumField::Tempo => 104,
         NumField::Meter => 105,
+        NumField::Varispeed => 106,
+        NumField::VariMin => 107,
+        NumField::VariMax => 108,
         NumField::Fx(fx) => 200 + fx.index(),
     }
 }
@@ -1742,6 +1930,7 @@ pub fn num_field(hit: Hit) -> Option<NumField> {
         Hit::SetTempo(_) => Some(NumField::Tempo),
         Hit::SetFx(fx, _) => Some(NumField::Fx(fx)),
         Hit::SetMaster(_) => Some(NumField::Master),
+        Hit::SetVarispeed(_) => Some(NumField::Varispeed),
         // **The one that opens a field IS a field.** Everything else here
         // reports which field it would be typed into if somebody asked; this
         // one is the asking.
@@ -1960,6 +2149,7 @@ pub fn knob_rect(rect: Rect, view: &RecorderView<'_>, hit: Hit) -> Option<Rect> 
         Hit::SetFx(fx, _) => l.fx[fx.index()],
         Hit::SetMaster(_) => l.master_knob,
         Hit::SetTempo(_) => l.tempo,
+        Hit::SetVarispeed(_) => l.vari,
         _ => return None,
     };
     r.is_positive().then_some(r)
@@ -2105,6 +2295,27 @@ fn name_for(
             Hit::PluginFolders => Node::button(id("pluginfolders"), r, "Add a plugin folder"),
             Hit::StreamToObs => Node::button(id("obs"), r, "Stream to OBS"),
             Hit::ShowAudioStatus => Node::button(id("audiostatus"), r, "Audio status"),
+            // **The one control on the band a screen reader most needs to be
+            // told about**, because it is the one whose engaged state is
+            // otherwise invisible: a varispeed left on makes every export
+            // come out at the wrong pitch, and its readout is a number in a
+            // corner. So the value is the whole sentence, not just the
+            // percentage.
+            Hit::CycleLufs => Node::readout(
+                id("lufs"),
+                r,
+                "Loudness",
+                if view.loudness.fraction().is_some() {
+                    format!(
+                        "{} {} LUFS",
+                        view.loudness.window.title(),
+                        view.loudness.text()
+                    )
+                } else {
+                    format!("{}, nothing measured yet", view.loudness.window.title())
+                },
+            ),
+            Hit::ResetLufs => return None,
             // The typed twins of the dials below. A screen reader hearing
             // both would hear every knob twice, and the dial is the one that
             // can be nudged with an arrow.
@@ -2150,6 +2361,27 @@ fn name_for(
                     // Raw, unlike the master: `Hit::SetFx` carries the mix
                     // itself, which `apply_recorder_hit` stores as-is.
                     up(view.fx.get(fx)),
+                ),
+                Hit::SetVarispeed(_) => Node::slider(
+                    id("varispeed"),
+                    r,
+                    "Varispeed",
+                    f64::from(view.varispeed.pos()),
+                    0.0,
+                    1.0,
+                    if view.varispeed.engaged() {
+                        format!(
+                            "{}, {:+.1} semitones",
+                            view.varispeed.reading(),
+                            view.varispeed.semitones()
+                        )
+                    } else {
+                        "off".to_owned()
+                    },
+                    // The POSITION, like the master's: the percentage it
+                    // reads depends on the range, and an arrow key moves the
+                    // dial and not the number.
+                    up(view.varispeed.pos()),
                 ),
                 Hit::SetTempo(_) => Node::slider(
                     id("tempo"),
@@ -2614,6 +2846,19 @@ fn draw_monitor(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Pale
             Stroke::new(w, ink),
         );
     }
+    // The loudness column, left of the master: the ladder, its targets, and
+    // the varispeed dial at its foot.
+    draw_lufs(painter, l, view, p);
+    if l.vari.is_positive() {
+        draw_varispeed(
+            painter,
+            l.vari,
+            view.varispeed,
+            typing_for(view, NumField::Varispeed),
+            view.turning == Some(NumField::Varispeed),
+            p,
+        );
+    }
     // The master: what leaves, what the limiter is taking off, and the one
     // control that changes it.
     draw_master(painter, l, view, p);
@@ -2634,7 +2879,7 @@ fn draw_monitor(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Pale
             p,
         );
     }
-    // The six effect knobs, under the meters: three sends, then the three
+    // The eight effect knobs, under the meters: four sends, then the four
     // that shape what leaves.
     for fx in Fx::ALL {
         let field = NumField::Fx(fx);
@@ -4120,6 +4365,234 @@ fn draw_ladder(painter: &Painter, r: Rect, filled: f32, hold: Option<f32>) {
 
 /// The master column: what leaves, how hard the limiter is working, and the
 /// one control that changes it.
+/// The varispeed dial: a line, a recessed well, and the dial in it.
+///
+/// **Not drawn like the eight beside it, on purpose.** Those are moulded
+/// knobs on a panel; this one sits in a machined recess with a line above it,
+/// which is how the tape machines that had a pitch control drew theirs — and
+/// it is the reading somebody has to be able to take in at a glance from
+/// across a room, because a varispeed left engaged ruins a take silently.
+///
+/// The face is the theme's `varispeed` role, which ships as the app's own
+/// ivory. The WELL is derived from the band's own ground so the recess reads
+/// as a recess whatever the band is coloured, exactly as `Palette::well` is;
+/// and the ink on the face is measured against the face, never inherited —
+/// see `surface_of`.
+fn draw_varispeed(
+    painter: &Painter,
+    cell: Rect,
+    v: crate::varispeed::Varispeed,
+    typing: Option<String>,
+    turning: bool,
+    p: &Palette,
+) {
+    let Some(KnobFace { face, radius: rad, label_h }) = knob_face(cell) else {
+        return;
+    };
+    let engaged = v.engaged();
+    // **The subtle line, above everything.** It is what separates this bay
+    // from the row of knobs to its left without a border around it.
+    let line_y = cell.top() + label_h * 0.5;
+    if cell.width() > 6.0 {
+        painter.line_segment(
+            [
+                Pos2::new(cell.left() + 2.0, line_y),
+                Pos2::new(cell.right() - 2.0, line_y),
+            ],
+            Stroke::new(1.0_f32, p.line),
+        );
+    }
+    // The reading, above the dial, where every other dial in the band keeps
+    // its number. **Lit when engaged**: this is the one control whose resting
+    // state has to be unmistakable from a distance.
+    let strip = label_h.max(KNOB_LABEL.1);
+    let top_band = Rect::from_min_max(
+        Pos2::new(cell.left(), line_y + 1.0),
+        Pos2::new(cell.right(), line_y + 1.0 + strip),
+    );
+    let text = typing.clone().unwrap_or_else(|| v.reading());
+    let size = fit_text(top_band, &text, strip * 0.96);
+    if size >= MIN_TEXT {
+        let ink = if typing.is_some() || turning || engaged {
+            p.ink
+        } else {
+            p.ink.gamma_multiply(0.7)
+        };
+        painter.text(
+            Pos2::new(cell.center().x, top_band.top()),
+            Align2::CENTER_TOP,
+            &text,
+            font(size),
+            ink,
+        );
+    }
+    let c = face.center();
+    // **The recess**: a darker version of the band's own shade, which is what
+    // `well` already is, taken one step further so the dial reads as sunk
+    // into the panel rather than sitting on it.
+    let well = shade(p.well, if wants_light_ink(p.bg) { 0.82 } else { 0.94 });
+    painter.circle_filled(c, rad * 1.24, well);
+    painter.circle_stroke(c, rad * 1.24, Stroke::new(1.0_f32, p.line));
+    // The dial face, in the theme's own colour for it.
+    let dial = surface_of(p.varispeed);
+    painter.circle_filled(c, rad, dial.bg);
+    // **The centre detent, marked on the recess and not on the dial.** It is
+    // a property of the panel — where the control is OFF — and a mark that
+    // turned with the dial would say nothing.
+    let up = Vec2::new(0.0, -1.0);
+    painter.line_segment(
+        [c + up * (rad * 1.06), c + up * (rad * 1.24)],
+        Stroke::new(1.4_f32, if engaged { p.line } else { p.accent }),
+    );
+    // The slot, which IS the pointer: across the whole face and through the
+    // centre, the same grammar as the moulded knobs beside it.
+    let t = v.pos().clamp(0.0, 1.0);
+    let angle = std::f32::consts::PI + (t - 0.5) * KNOB_SWEEP;
+    let dir = Vec2::new(angle.sin(), -angle.cos());
+    painter.line_segment(
+        [c - dir * rad * 0.82, c + dir * rad * 0.82],
+        Stroke::new((rad * 0.19).max(1.2), dial.ink),
+    );
+    // The two ends, marked the way a pitch control marks them.
+    if rad >= 9.0 {
+        let mark = |s: &str, side: f32| {
+            let size = (rad * 0.44).min(9.0);
+            if size >= MIN_TEXT {
+                painter.text(
+                    Pos2::new(c.x + side * rad * 1.34, c.y + rad * 1.16),
+                    Align2::CENTER_CENTER,
+                    s,
+                    font(size),
+                    p.faint,
+                );
+            }
+        };
+        mark("-", -1.0);
+        mark("+", 1.0);
+    }
+    // The word, below, like every other dial's.
+    if label_h > 0.0 {
+        let bottom = Rect::from_min_max(
+            Pos2::new(cell.left(), cell.bottom() - label_h),
+            cell.max,
+        );
+        let size = fit_text(bottom, VARISPEED_LABEL, label_h * 0.9);
+        if size >= MIN_TEXT {
+            painter.text(
+                Pos2::new(cell.center().x, cell.bottom()),
+                Align2::CENTER_BOTTOM,
+                VARISPEED_LABEL,
+                font(size),
+                // **Lit when engaged, faint at rest** — and `faint` has a
+                // measured contrast floor against the band, so the word is
+                // legible on every theme in both modes rather than on the
+                // ones that happen to be dark. See `Palette::faint` and the
+                // test that walks all sixteen.
+                if engaged { p.ink } else { p.faint },
+            );
+        }
+    }
+}
+
+/// The word under the varispeed dial.
+///
+/// **Not "VARISPEED".** The bay is a fraction of the band wide and
+/// `fit_text` shrinks a word to fit rather than clipping it, so nine
+/// characters come out two thirds the size of LIMITER next door — legible on
+/// a big window and a smudge on a small one. VARI is what the tape machines
+/// wrote and it holds its size at every width this app opens at.
+const VARISPEED_LABEL: &str = "VARI";
+
+/// The loudness column: a continuous bar, the industry marks beside it, the
+/// reading under it.
+///
+/// **A bar, not a ladder of LEDs.** The master's segments are right for a
+/// peak meter, where what matters is how close the top is; loudness is a mean
+/// that moves slowly and is READ AGAINST A NUMBER, so what it needs is a
+/// scale you can line an edge up with.
+fn draw_lufs(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Palette) {
+    use crate::recorder::{LUFS_MARKS, LUFS_RANGE};
+    if !l.lufs_bar.is_positive() {
+        return;
+    }
+    let bar = l.lufs_bar;
+    // The well it stands in, and its ink measured against that well rather
+    // than assumed from the theme. See `surface_of`.
+    let face = surface_of(p.lcd_face);
+    painter.rect_filled(bar, 1.0, face.bg);
+    let inner = bar.shrink(1.0);
+    let at = |lufs: f32| {
+        let (lo, hi) = LUFS_RANGE;
+        inner.bottom() - ((lufs - lo) / (hi - lo)).clamp(0.0, 1.0) * inner.height()
+    };
+    // **The marks first, so the fill covers them where it reaches.** A target
+    // line you can still see through the bar is a target line you cannot tell
+    // you have passed.
+    let scale = surface_of(p.bg);
+    // **Every mark gets its LINE; only some get their number.**
+    //
+    // −14, −16 and −18 are two LU apart, which on a short band is a few
+    // pixels: printed unconditionally they overlap into an unreadable smear
+    // exactly when the column is smallest. The lines still all draw — a
+    // target you can line the bar up against is useful without its label,
+    // and the numbers are in the order the standards matter, so what
+    // survives on a short band is the loudest and the streaming one.
+    let mut last_label = f32::NEG_INFINITY;
+    let size = (l.lufs_scale.width() * 0.30).clamp(0.0, 10.0);
+    let room = size * 1.35;
+    for (lufs, text) in LUFS_MARKS {
+        let y = at(lufs);
+        if y < inner.top() || y > inner.bottom() {
+            continue;
+        }
+        painter.line_segment(
+            [Pos2::new(inner.left(), y), Pos2::new(inner.right(), y)],
+            Stroke::new(1.0_f32, face.faint),
+        );
+        if l.lufs_scale.is_positive() && size >= MIN_TEXT && (y - last_label).abs() >= room {
+            last_label = y;
+            painter.text(
+                Pos2::new(l.lufs_scale.right() - 2.0, y),
+                Align2::RIGHT_CENTER,
+                text,
+                font_light(size),
+                scale.faint,
+            );
+        }
+    }
+    if let Some(f) = view.loudness.fraction() {
+        let top = inner.bottom() - f * inner.height();
+        let fill = Rect::from_min_max(
+            Pos2::new(inner.left(), top),
+            Pos2::new(inner.right(), inner.bottom()),
+        );
+        if fill.is_positive() {
+            // **The bar goes red past the loudest target on the ladder**, and
+            // not past 0: a loudness meter's whole job is the comparison
+            // against a number somebody else chose, and by the time a MEAN
+            // reaches full scale the argument was lost a long way back.
+            let hot = view.loudness.now() > LUFS_MARKS[0].0;
+            painter.rect_filled(fill, 0.0, if hot { p.rec } else { p.accent });
+        }
+    }
+    painter.rect_stroke(bar, 1.0, Stroke::new(1.0_f32, p.line), StrokeKind::Inside);
+    // The reading, and the letter that says which window it is.
+    if l.lufs_readout.is_positive() {
+        let r = l.lufs_readout;
+        let text = format!("{} {}", view.loudness.window.label(), view.loudness.text());
+        let size = fit_text(r, &text, r.height() * 0.9);
+        if size >= MIN_TEXT {
+            painter.text(
+                r.center(),
+                Align2::CENTER_CENTER,
+                &text,
+                font(size),
+                surface_of(p.bg).ink,
+            );
+        }
+    }
+}
+
 fn draw_master(painter: &Painter, l: &Layout, view: &RecorderView<'_>, p: &Palette) {
     if !l.master_bars.is_positive() {
         return;
@@ -4260,6 +4733,10 @@ const FILTER_CAP: Color32 = Color32::from_rgb(0x7b, 0x5c, 0xc9);
 /// which nothing else here is.
 const LIMITER_CAP: Color32 = Color32::from_rgb(0x2f, 0x8f, 0x5c);
 
+/// The gain's cap. Amber, because it is the one knob on the panel that can
+/// make a take clip — and it sits beside the one that stops it.
+const GAIN_CAP: Color32 = Color32::from_rgb(0xd8, 0x93, 0x2c);
+
 /// The master's cap.
 ///
 /// Red, alone. It is the last thing in the chain and the only control here
@@ -4314,6 +4791,24 @@ const METER_SHARE: f32 = 0.36;
 /// legible at the width that remains; the VU faces are width-bound and grow
 /// by exactly what anything to their left or right gives up.
 const MASTER_COL: f32 = 0.80;
+
+/// Where the VU-and-knobs column stops and the LOUDNESS column starts.
+///
+/// **The eleven-hundredths between here and `MASTER_COL` is what the
+/// loudness ladder and the varispeed dial cost**, and it comes out of the
+/// meters' column rather than the master's: the master ladder is read against
+/// numbers on both sides and has none to give, while the VU faces are
+/// *height*-bound at every width this app opens at — a face is sized by
+/// whichever of its height and width runs out first (see `draw_meters`), and
+/// the pair does not become width-bound until this column falls under about
+/// two hundred and sixty points. Taking eighty from it costs the faces
+/// nothing and the eight knobs nothing; what shrinks is the margin either
+/// side of each circle.
+const LUFS_COL: f32 = 0.735;
+
+/// The loudness scale's share of its column's width. Wider than the master's
+/// because the numbers are wider: `-23` against `-6`.
+const LUFS_SCALE_W: f32 = 0.42;
 
 
 /// The dB scale's share of the master column's width, **at each side**. What
@@ -5453,7 +5948,9 @@ mod tests {
     #[test]
     fn the_knobs_are_the_ones_that_look_like_knobs() {
         let knobs: Vec<Hit> = Hit::ALL.into_iter().filter(|h| h.is_knob()).collect();
-        assert_eq!(knobs.len(), Fx::ALL.len() + 2, "{knobs:?}");
+        // The eight effects, the master, the tempo and the varispeed.
+        assert_eq!(knobs.len(), Fx::ALL.len() + 3, "{knobs:?}");
+        assert!(knobs.iter().any(|h| h.is_same_control(Hit::SetVarispeed(0.0))));
         for fx in Fx::ALL {
             assert!(knobs.iter().any(|h| h.is_same_control(Hit::SetFx(fx, 0.0))));
         }
@@ -5808,7 +6305,7 @@ mod tests {
     /// putting an indicator away. The pickers and the import do not, because
     /// each one opens a dialog over the one gesture that matters mid-take,
     /// which is Stop.
-    const SURVIVORS: [Hit; 18] = [
+    const SURVIVORS: [Hit; 25] = [
         Hit::Stop,
         // The cassette started this take, and pressing it again is how a
         // count-in is cancelled — the one control whose whole job is
@@ -5832,18 +6329,31 @@ mod tests {
         Hit::Type(NumField::Fx(Fx::Reverb)),
         Hit::Type(NumField::Fx(Fx::Delay)),
         Hit::Type(NumField::Fx(Fx::Chorus)),
+        Hit::Type(NumField::Fx(Fx::Phaser)),
         Hit::Type(NumField::Fx(Fx::Hpf)),
         Hit::Type(NumField::Fx(Fx::Lpf)),
+        Hit::Type(NumField::Fx(Fx::Gain)),
         Hit::Type(NumField::Fx(Fx::Limiter)),
+        Hit::Type(NumField::Varispeed),
         Hit::SetFx(Fx::Reverb, 0.0),
         Hit::SetFx(Fx::Delay, 0.0),
         Hit::SetFx(Fx::Chorus, 0.0),
+        Hit::SetFx(Fx::Phaser, 0.0),
         // The filters and the limiter survive a take for the same reason the
         // sends do: they are the sound, and a take is when somebody wants to
         // change it.
         Hit::SetFx(Fx::Hpf, 0.0),
         Hit::SetFx(Fx::Lpf, 0.0),
+        Hit::SetFx(Fx::Gain, 0.0),
         Hit::SetFx(Fx::Limiter, 0.0),
+        // **The varispeed rides**, which is what a tape operator does with
+        // one: it cannot change a frame that is already written, and pulling
+        // the speed during a pass is the oldest use the control has.
+        Hit::SetVarispeed(0.5),
+        // And the loudness ladder, which is a METER. Cycling its window is
+        // reading, not changing — and a take is exactly when somebody wants
+        // to know whether the programme is landing on target.
+        Hit::CycleLufs,
     ];
 
     /// The whole reason `band_height` takes one argument. A camera that could
@@ -6253,6 +6763,24 @@ mod tests {
                         hit_test(r, &v, l.timeline_close.center()),
                         Some(Hit::ClearTrack),
                         "the timeline's × is not clickable at its own centre"
+                    );
+                    continue;
+                }
+                // **The loudness reset is a SECONDARY click** on a target
+                // that already exists, exactly as the timeline's × is a
+                // primary one that `hit_test` pre-empts. It has no rectangle
+                // of its own by design; what it has is the ladder's, and the
+                // app routes the right button. Proved directly rather than
+                // through `targets`.
+                if want.is_same_control(Hit::ResetLufs) {
+                    assert!(
+                        l.lufs_bar.is_positive(),
+                        "the loudness ladder has nothing to right-click"
+                    );
+                    assert_eq!(
+                        hit_test(r, &v, l.lufs_bar.center()),
+                        Some(Hit::CycleLufs),
+                        "the ladder is not clickable at its own centre"
                     );
                     continue;
                 }
@@ -6929,8 +7457,10 @@ mod tests {
                                     reverb: 0.0,
                                     delay: 1.0,
                                     chorus: 0.5,
+                                    phaser: 0.4,
                                     hpf: 0.35,
                                     lpf: 1.0,
+                                    gain: 0.5,
                                     limiter: 0.7,
                                 },
                                 // The filters read in hertz, so the sweep
@@ -6959,13 +7489,17 @@ mod tests {
                                 // other, so the sweep covers both the row that
                                 // is an offer and the row that is a control.
                                 track: if dark { a_track() } else { crate::ports::TrackInfo::NONE },
+                                varispeed: crate::varispeed::Varispeed::default(),
+                                loudness: crate::recorder::Loudness::default(),
                                 fx_units: [
+                                    KnobUnit::Percent,
                                     KnobUnit::Percent,
                                     KnobUnit::Percent,
                                     KnobUnit::Percent,
                                     KnobUnit::Hertz { low: 20.0, high: 1_200.0 },
                                     KnobUnit::Hertz { low: 200.0, high: 20_000.0 },
-                                    KnobUnit::Decibels { low: 0.0, high: -30.0 },
+                                    KnobUnit::Decibels { low: 0.0, high: 24.0 },
+                                    KnobUnit::Decibels { low: -48.0, high: 0.0 },
                                 ],
                                 // A knob mid-turn, so the sweep also covers a
                                 // knob showing a number instead of its name.
@@ -7309,8 +7843,10 @@ pub enum Fx {
     Reverb,
     Delay,
     Chorus,
+    Phaser,
     Hpf,
     Lpf,
+    Gain,
     Limiter,
 }
 
@@ -7318,12 +7854,14 @@ impl Fx {
     /// **In drawn order: the top row, then the bottom row.** Three sends over
     /// three things that shape the whole output. Anything walking all six
     /// walks them in the order a hand finds them.
-    pub const ALL: [Fx; 6] = [
+    pub const ALL: [Fx; 8] = [
         Fx::Reverb,
         Fx::Delay,
         Fx::Chorus,
+        Fx::Phaser,
         Fx::Hpf,
         Fx::Lpf,
+        Fx::Gain,
         Fx::Limiter,
     ];
 
@@ -7332,8 +7870,10 @@ impl Fx {
             Fx::Reverb => "REVERB",
             Fx::Delay => "DELAY",
             Fx::Chorus => "CHORUS",
+            Fx::Phaser => "PHASER",
             Fx::Hpf => "HPF",
             Fx::Lpf => "LPF",
+            Fx::Gain => "GAIN",
             Fx::Limiter => "LIMITER",
         }
     }
@@ -7346,9 +7886,11 @@ impl Fx {
             Fx::Reverb => "eight combs into four allpasses",
             Fx::Delay => "in time with the tempo",
             Fx::Chorus => "true stereo, after the Boss CE-1",
+            Fx::Phaser => "four stages, after the MXR Phase 90",
             Fx::Hpf => "takes the bottom off, after everything",
             Fx::Lpf => "takes the top off - up is darker",
-            Fx::Limiter => "true peak, held under the threshold",
+            Fx::Gain => "drive into the limiter - it CAN clip",
+            Fx::Limiter => "true peak ceiling - no makeup",
         }
     }
 
@@ -7367,8 +7909,10 @@ impl Fx {
             Fx::Reverb => "reverb_mix",
             Fx::Delay => "delay_mix",
             Fx::Chorus => "chorus_mix",
+            Fx::Phaser => "phaser_mix",
             Fx::Hpf => "hpf_mix",
             Fx::Lpf => "lpf_mix",
+            Fx::Gain => "gain_mix",
             Fx::Limiter => "limiter_mix",
         }
     }
@@ -7384,8 +7928,10 @@ impl Fx {
             Fx::Reverb => "Reverb  -  shift right-click for its parameters",
             Fx::Delay => "Delay  -  shift right-click for its parameters",
             Fx::Chorus => "Chorus  -  shift right-click for its parameters",
+            Fx::Phaser => "Phaser  -  shift right-click for its parameters",
             Fx::Hpf => "High-pass  -  shift right-click for its parameters",
             Fx::Lpf => "Low-pass  -  shift right-click for its parameters",
+            Fx::Gain => "Output gain, into the limiter  -  it can clip",
             Fx::Limiter => "Limiter threshold  -  shift right-click for more",
         }
     }
@@ -7398,8 +7944,9 @@ impl Fx {
     /// or not anybody is listening for it, so it is the one that is red.
     pub fn cap(self) -> Color32 {
         match self {
-            Fx::Reverb | Fx::Delay | Fx::Chorus => KNOB_CAP,
+            Fx::Reverb | Fx::Delay | Fx::Chorus | Fx::Phaser => KNOB_CAP,
             Fx::Hpf | Fx::Lpf => FILTER_CAP,
+            Fx::Gain => GAIN_CAP,
             Fx::Limiter => LIMITER_CAP,
         }
     }
@@ -7414,10 +7961,16 @@ impl Fx {
     /// no theme can ever paint it into the master's colour by accident.
     pub fn cap_themed(self, p: &Palette) -> Color32 {
         match self {
-            Fx::Reverb | Fx::Delay | Fx::Chorus => p.fx_knob,
+            Fx::Reverb | Fx::Delay | Fx::Chorus | Fx::Phaser => p.fx_knob,
             // The filters are the same family a step down, so the two rows
             // still read as two rows under any theme.
             Fx::Hpf | Fx::Lpf => shade(p.fx_knob, 0.72),
+            // **The gain keeps its own amber for the same reason the limiter
+            // keeps its red.** They are the pair that decides whether a take
+            // clips, they sit next to each other, and a theme that painted
+            // them alike would put the control that CAUSES clipping and the
+            // control that PREVENTS it in one colour.
+            Fx::Gain => GAIN_CAP,
             Fx::Limiter => LIMITER_CAP,
         }
     }
@@ -7453,6 +8006,18 @@ impl Fx {
                 slide("chorus_width", "Width"),
                 slide("chorus_tone", "Tone"),
             ],
+            // **The Phase 90 has ONE knob and it is Speed.** The other three
+            // are the differences between the pedals in that family rather
+            // than controls the original had: the number of stages is a
+            // Phase 90 against a Phase 100, the feedback is the script logo
+            // against the block, and the range is where in the spectrum the
+            // notches sweep. Shipping defaults are the block-logo 90.
+            Fx::Phaser => [
+                slide("phaser_rate", "Speed"),
+                slide("phaser_feedback", "Feedback"),
+                step("phaser_stages", "Stages"),
+                slide("phaser_range", "Range"),
+            ],
             Fx::Hpf => [
                 step("hpf_slope", "Slope"),
                 slide("hpf_resonance", "Resonance"),
@@ -7465,6 +8030,11 @@ impl Fx {
                 FxRow::NONE,
                 FxRow::NONE,
             ],
+            // **Nothing under the gain.** It is a number of decibels and
+            // there is no parameter that changes what that means. A panel
+            // with a title and a Reset in it would be a panel that punishes
+            // the right-click somebody used on the seven knobs beside it.
+            Fx::Gain => [FxRow::NONE; 4],
             Fx::Limiter => [
                 slide("limiter_release", "Release"),
                 slide("limiter_knee", "Knee"),
@@ -7609,6 +8179,204 @@ impl FxLayout {
 /// fader row does — so the two kinds of control in this app look like each
 /// other rather than like two people's work.
 const FX_TRACK: (f32, f32) = (0.40, 0.86);
+
+// ── the varispeed range ─────────────────────────────────────────────────────
+//
+// A small panel, the same chrome as an effect's, with two typed fields in it
+// instead of four tracks. **Typed and not dragged**: the ends of a range are
+// numbers somebody has in mind — 85 and 115, or 50 and 200 — and there is
+// nothing to sweep along between them worth the pixels a track would take.
+
+/// Where everything in the range panel goes.
+struct VariLayout {
+    panel: Rect,
+    title: Rect,
+    close: Rect,
+    /// Min, then Max.
+    rows: [Rect; 2],
+    reset: Rect,
+}
+
+impl VariLayout {
+    const NONE: Self = Self {
+        panel: Rect::NOTHING,
+        title: Rect::NOTHING,
+        close: Rect::NOTHING,
+        rows: [Rect::NOTHING; 2],
+        reset: Rect::NOTHING,
+    };
+
+    fn new(screen: Rect, anchor: Rect) -> Self {
+        if !screen.is_positive() || !anchor.is_positive() {
+            return Self::NONE;
+        }
+        // Narrower and shorter than an effect's: two rows, not four, and
+        // nothing in them but a word and a number.
+        let w = (screen.width() * 0.16).clamp(200.0, 300.0_f32.min(screen.width()));
+        let h = (w * 0.62).min(screen.height() * 0.80);
+        let mut panel = Rect::from_min_size(
+            Pos2::new(anchor.center().x - w * 0.5, anchor.bottom() + h * 0.05),
+            Vec2::new(w, h),
+        );
+        let dx = (screen.left() - panel.left()).max(0.0) - (panel.right() - screen.right()).max(0.0);
+        let dy = (screen.top() - panel.top()).max(0.0) - (panel.bottom() - screen.bottom()).max(0.0);
+        panel = panel.translate(Vec2::new(dx, dy));
+        let pad = (h * 0.08).clamp(4.0, 14.0);
+        let body = panel.shrink(pad);
+        if !body.is_positive() {
+            return Self { panel, ..Self::NONE };
+        }
+        let title_h = body.height() * 0.30;
+        let title = Rect::from_min_max(body.min, Pos2::new(body.right(), body.top() + title_h));
+        let close_w = (title.height() * 0.42).min(body.width() * 0.16);
+        let close = Rect::from_min_size(
+            Pos2::new(title.right() - close_w, title.top()),
+            Vec2::splat(close_w),
+        );
+        let rest = Rect::from_min_max(Pos2::new(body.left(), title.bottom()), body.max);
+        let pitch = rest.height() / 3.0;
+        let row = |i: usize| {
+            Rect::from_min_size(
+                Pos2::new(rest.left(), rest.top() + pitch * i as f32),
+                Vec2::new(rest.width(), pitch * 0.86),
+            )
+        };
+        Self {
+            panel,
+            title,
+            close,
+            rows: [row(0), row(1)],
+            reset: {
+                let r = row(2);
+                Rect::from_min_max(Pos2::new(r.right() - r.width() * 0.40, r.top()), r.max)
+            },
+        }
+    }
+
+    /// Where a row's number sits — the part a press opens for typing.
+    fn field(row: Rect) -> Rect {
+        slice_h(row, 0.52, 1.0)
+    }
+}
+
+/// What a press inside the varispeed range panel means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VariHit {
+    /// Open one end for typing.
+    Type(NumField),
+    /// Back to 85 and 115.
+    Reset,
+    Close,
+}
+
+/// Where the range panel goes, for a caller that has to swallow presses.
+pub fn vari_popup_rect(screen: Rect, anchor: Rect) -> Rect {
+    VariLayout::new(screen, anchor).panel
+}
+
+/// What is under `pos` in the range panel. `None` is its own chrome, which
+/// the caller still swallows.
+pub fn vari_hit_test(screen: Rect, anchor: Rect, pos: Pos2) -> Option<VariHit> {
+    let l = VariLayout::new(screen, anchor);
+    if !l.panel.contains(pos) {
+        return None;
+    }
+    if l.close.contains(pos) {
+        return Some(VariHit::Close);
+    }
+    if l.reset.contains(pos) {
+        return Some(VariHit::Reset);
+    }
+    for (row, field) in l.rows.into_iter().zip([NumField::VariMin, NumField::VariMax]) {
+        if row.contains(pos) {
+            return Some(VariHit::Type(field));
+        }
+    }
+    None
+}
+
+/// The range panel.
+pub fn draw_vari_range(
+    painter: &Painter,
+    screen: Rect,
+    anchor: Rect,
+    v: crate::varispeed::Varispeed,
+    typing: Option<&crate::recorder::NumEdit>,
+    s: &Settings,
+) {
+    use crate::varispeed::{HARD_MAX, HARD_MIN};
+    let l = VariLayout::new(screen, anchor);
+    if !l.panel.is_positive() {
+        return;
+    }
+    let p = palette(s);
+    painter.rect_filled(screen, 0.0, Color32::from_black_alpha(96));
+    painter.rect_filled(l.panel, 4.0, p.bg);
+    painter.rect_stroke(l.panel, 4.0, Stroke::new(1.0_f32, p.ink), StrokeKind::Inside);
+    if l.title.is_positive() {
+        let size = fit_text(l.title, "VARISPEED RANGE", l.title.height() * 0.34);
+        if size >= MIN_TEXT {
+            painter.text(
+                Pos2::new(l.title.left(), l.title.top() + l.title.height() * 0.30),
+                Align2::LEFT_CENTER,
+                "VARISPEED RANGE",
+                font(size),
+                p.ink,
+            );
+        }
+        // The hard limits, said out loud rather than discovered by typing a
+        // number and watching it change to something else.
+        let sub = format!("percent of normal speed, {HARD_MIN} to {HARD_MAX}");
+        let size = fit_text(l.title, &sub, l.title.height() * 0.22);
+        if size >= MIN_TEXT {
+            painter.text(
+                Pos2::new(l.title.left(), l.title.top() + l.title.height() * 0.74),
+                Align2::LEFT_CENTER,
+                &sub,
+                font(size),
+                p.faint,
+            );
+        }
+        draw_word_button_sized(painter, l.close, &["X"], 0.34, &p);
+    }
+    for (row, (field, label, value)) in l.rows.into_iter().zip([
+        (NumField::VariMin, "Min", v.min()),
+        (NumField::VariMax, "Max", v.max()),
+    ]) {
+        if !row.is_positive() {
+            continue;
+        }
+        let size = fit_text(slice_h(row, 0.0, 0.5), label, row.height() * 0.52);
+        if size >= MIN_TEXT {
+            painter.text(
+                Pos2::new(row.left(), row.center().y),
+                Align2::LEFT_CENTER,
+                label,
+                font(size),
+                p.ink,
+            );
+        }
+        let field_r = VariLayout::field(row);
+        let well = surface_of(p.field);
+        painter.rect_filled(field_r, 2.0, well.bg);
+        let editing = typing.filter(|e| e.field == field);
+        let text = match editing {
+            Some(e) => format!("{}|", e.text),
+            None => format!("{value}"),
+        };
+        let size = fit_text(field_r.shrink(4.0), &text, row.height() * 0.56);
+        if size >= MIN_TEXT {
+            painter.text(
+                Pos2::new(field_r.right() - 4.0, field_r.center().y),
+                Align2::RIGHT_CENTER,
+                &text,
+                font(size),
+                well.ink,
+            );
+        }
+    }
+    draw_word_button_sized(painter, l.reset, &["RESET"], 0.34, &p);
+}
 
 /// Where an effect panel goes, for a caller that has to swallow presses.
 pub fn fx_popup_rect(screen: Rect, anchor: Rect) -> Rect {
