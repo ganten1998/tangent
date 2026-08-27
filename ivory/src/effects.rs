@@ -1412,17 +1412,62 @@ impl TapeEcho {
 
 /// The sweep's slowest and fastest, in Hz.
 ///
-/// The CE-1's rate control covers roughly this. The bottom is a swell you feel
+/// The CE-1's rate control covers roughly this. Measurements on a real one put
+/// its chorus mode near 1.2 Hz at moderate settings and about 2.1 Hz at the
+/// top, which is comfortably inside this. The bottom is a swell you feel
 /// rather than hear; the top is where chorus becomes vibrato and then becomes
 /// seasick.
 const CHORUS_RATE_HZ: (f32, f32) = (0.12, 3.2);
 
-/// The delay the sweep moves through, in milliseconds.
+/// The shortest the bucket brigade ever gets, in milliseconds.
 ///
-/// A bucket brigade at these clock rates is a few milliseconds long. Under
-/// about 4ms it is a flanger; over about 12ms the pitch wobble becomes an
-/// audible detune rather than a shimmer.
-const CHORUS_MS: (f32, f32) = (4.5, 11.5);
+/// **The floor does not move, and that is the correction.** This used to be a
+/// sweep CENTRED at 8 ms opening symmetrically to 4.5–11.5. Measurements on a
+/// real CE-1 put the delay at 3–5 ms at the bottom of Intensity and 3–7 ms at
+/// the top: both share a floor, and the knob stretches the long end while the
+/// short end stays put.
+///
+/// The difference is audible and it is not subtle. A symmetric swing sits the
+/// average delay somewhere the pedal never sits, and detunes sharp and flat
+/// equally where the pedal spends most of its time near the short end and
+/// excursions long.
+const CHORUS_FLOOR_MS: f32 = 3.0;
+
+/// How far above the floor the sweep reaches, at each end of the depth
+/// control. See [`CHORUS_FLOOR_MS`] for where these two numbers come from.
+const CHORUS_SPAN_MS: (f32, f32) = (2.0, 4.0);
+
+/// How loud the bucket brigade's own noise is, relative to full scale.
+///
+/// **Roland skipped the compander.** Every other BBD chorus of the era wrapped
+/// its delay line in one to bury the clock noise; the CE-1 got a noise GATE
+/// instead, which mutes the delay path when nothing is playing. So the hiss
+/// vanishes between phrases and comes back with the note, and a clean model
+/// has neither the noise nor the arrival.
+const CHORUS_HISS: f32 = 1.6e-5;
+
+/// Where the gate opens and how fast it lets go.
+///
+/// A gate on the WET path only — the dry never passes through the delay line
+/// and has nothing to be gated. Fast to open, because a chorus that arrives
+/// late on a note is a chorus somebody notices; slow to close, because the
+/// alternative is chattering on a decay.
+const CHORUS_GATE_OPEN_MS: f32 = 8.0;
+const CHORUS_GATE_CLOSE_MS: f32 = 260.0;
+
+/// How fast the envelope watching the input falls.
+///
+/// **Separate from the gate's own slew above, and it has to be.** One constant
+/// doing both jobs means the envelope has to fall from a loud note all the way
+/// past the threshold before the gate even begins to move, which from 0 dBFS
+/// to −60 is seven time constants — nearly two seconds of hiss after the last
+/// note. Two constants: the envelope tracks the playing, the gate smooths the
+/// decision.
+const CHORUS_ENV_MS: f32 = 120.0;
+
+/// Below this input envelope the gate is shut. −62 dBFS, which is comfortably
+/// under anything anybody is playing and comfortably over [`CHORUS_HISS`].
+const CHORUS_GATE_FLOOR: f32 = 8.0e-4;
 
 /// The bucket brigade's own bandwidth, in Hz, at each end of the tone control.
 ///
@@ -1458,31 +1503,52 @@ struct Chorus {
     phase: f32,
     /// One-pole lowpass state for the BBD bandwidth, per channel.
     lp: [f32; 2],
+    /// The gate's envelope follower, and the gate itself. See
+    /// [`CHORUS_GATE_FLOOR`].
+    env: f32,
+    gate: f32,
+    /// Hiss generator, as on the tape: an xorshift, because this runs on the
+    /// audio thread and must not allocate, lock or reach for a global.
+    noise: u32,
     sample_rate: f32,
 }
 
 impl Chorus {
     fn new(sample_rate: f32) -> Self {
         // Room for the longest delay the depth can reach, and a little over.
-        let cap = (sample_rate * CHORUS_MS.1 * 2.0 / 1000.0) as usize + 4;
+        let longest = CHORUS_FLOOR_MS + CHORUS_SPAN_MS.1;
+        let cap = (sample_rate * longest * 2.0 / 1000.0) as usize + 4;
         Self {
             buf: [vec![0.0; cap], vec![0.0; cap]],
             at: 0,
             phase: 0.0,
             lp: [0.0; 2],
+            env: 0.0,
+            gate: 0.0,
+            noise: 0x9E37_79B9,
             sample_rate,
         }
     }
 
-    /// The triangle, as -1..=1.
+    /// The sweep, as 0..=1 — **unipolar**, because the delay opens upward from
+    /// a fixed floor rather than swinging either side of a centre.
+    ///
+    /// A triangle, which is what the CE-1's chorus mode uses, and one with its
+    /// peaks FLATTENED: measurements on a real one describe a wave that is not
+    /// quite triangular, spending slightly longer at each extreme than a
+    /// straight ramp would. That is a capacitor charging into the ends of its
+    /// range, and it is why the pedal's detune reads as two pitches with a
+    /// slide between them rather than as one continuous glide.
     #[inline]
-    fn triangle(phase: f32) -> f32 {
-        // Up for the first half, down for the second.
-        if phase < 0.5 {
-            phase * 4.0 - 1.0
+    fn sweep(phase: f32) -> f32 {
+        let tri = if phase < 0.5 {
+            phase * 2.0
         } else {
-            3.0 - phase * 4.0
-        }
+            2.0 - phase * 2.0
+        };
+        // Flatten: push the middle of the ramp out towards the ends. A
+        // smootherstep does it with three multiplies and no transcendental.
+        tri * tri * (3.0 - 2.0 * tri)
     }
 
     #[inline]
@@ -1490,26 +1556,47 @@ impl Chorus {
         let rate = CHORUS_RATE_HZ.0 + (CHORUS_RATE_HZ.1 - CHORUS_RATE_HZ.0) * p.chorus_rate;
         self.phase = (self.phase + rate / self.sample_rate).fract();
 
-        // The sweep, in samples. Centred in the range so depth opens outward
-        // from the middle rather than from the short end — a depth of zero is
-        // then a fixed short delay, which is a comb filter and not a wobble.
-        let (lo, hi) = (
-            CHORUS_MS.0 * self.sample_rate / 1000.0,
-            CHORUS_MS.1 * self.sample_rate / 1000.0,
-        );
-        let centre = (lo + hi) * 0.5;
-        let swing = (hi - lo) * 0.5 * p.chorus_depth;
-        let len = centre + Self::triangle(self.phase) * swing;
+        // **The sweep, anchored at the floor and opening upward.** See
+        // `CHORUS_FLOOR_MS`: the short end of a real CE-1's delay does not
+        // move, and the Intensity knob stretches the long end away from it.
+        let floor = CHORUS_FLOOR_MS * self.sample_rate / 1000.0;
+        let span = (CHORUS_SPAN_MS.0
+            + (CHORUS_SPAN_MS.1 - CHORUS_SPAN_MS.0) * p.chorus_depth.clamp(0.0, 1.0))
+            * self.sample_rate
+            / 1000.0;
+        let len = floor + Self::sweep(self.phase) * span;
 
         // The BBD's bandwidth, as a one-pole coefficient.
         let cutoff = CHORUS_LP_HZ.0 + (CHORUS_LP_HZ.1 - CHORUS_LP_HZ.0) * p.chorus_tone;
         let a = (-std::f32::consts::TAU * cutoff / self.sample_rate).exp();
 
+        // **The gate, which is the CE-1's answer to a compander.** Every other
+        // bucket-brigade chorus of the era wrapped its delay line in one to
+        // bury the clock noise; Roland fitted a gate and let the hiss ride
+        // with the signal. So the noise floor arrives under the note and
+        // leaves after it, which is a sound rather than a defect — and a model
+        // with neither is missing the thing people mean by "that chorus".
+        let peak = input[0].abs().max(input[1].abs());
+        let coeff = |ms: f32| (-1.0 / (ms * 0.001 * self.sample_rate)).exp();
+        self.env = flush(peak.max(self.env * coeff(CHORUS_ENV_MS)));
+        let want = if self.env > CHORUS_GATE_FLOOR { 1.0 } else { 0.0 };
+        let slew = if want > self.gate {
+            coeff(CHORUS_GATE_OPEN_MS)
+        } else {
+            coeff(CHORUS_GATE_CLOSE_MS)
+        };
+        self.gate = flush(want + (self.gate - want) * slew);
+
+        self.noise ^= self.noise << 13;
+        self.noise ^= self.noise >> 17;
+        self.noise ^= self.noise << 5;
+        let hiss = (self.noise as f32 / u32::MAX as f32 - 0.5) * CHORUS_HISS;
+
         let mut wet = [0.0_f32; 2];
         for ch in 0..2 {
             let tapped = tap(&self.buf[ch], self.at, len);
             self.lp[ch] = flush(tapped * (1.0 - a) + self.lp[ch] * a);
-            wet[ch] = self.lp[ch];
+            wet[ch] = (self.lp[ch] + hiss) * self.gate;
             self.buf[ch][self.at] = flush(input[ch]);
         }
         self.at = (self.at + 1) % self.buf[0].len();
@@ -1526,6 +1613,8 @@ impl Chorus {
             b.fill(0.0);
         }
         self.lp = [0.0; 2];
+        self.env = 0.0;
+        self.gate = 0.0;
     }
 }
 
@@ -1566,10 +1655,62 @@ const BUTTER_Q4: (f32, f32) = (0.541_196_1, 1.306_563);
 /// control covers roughly a third of a hertz to eight; below that it stops
 /// reading as movement and above it stops reading as a phaser.
 pub const PHASER_RATE_HZ: (f32, f32) = (0.05, 8.0);
-/// The bottom and top of where the notches travel, in hertz, at the widest
-/// setting of the Range control. The narrow end of Range is a band centred in
-/// the middle of this.
-pub const PHASER_SWEEP_HZ: (f32, f32) = (120.0, 3_600.0);
+/// The all-pass corner's floor, in hertz, and it is a component value.
+///
+/// **The sweep has a bottom and the bottom is a resistor.** Each stage's RC is
+/// a 47 nF capacitor against a 2N5952 JFET **in parallel with 22 kΩ** (24 kΩ
+/// in some units). Take the JFET towards cutoff and its channel runs to
+/// megohms, so the fixed resistor takes over and the corner cannot fall below
+///
+/// ```text
+/// 1 / (2π · 22 kΩ · 47 nF)  =  154 Hz
+/// ```
+///
+/// This file used to sweep from 120 Hz, which is under anything the pedal can
+/// reach. The floor is not a voicing choice; it is what is soldered in.
+pub const PHASER_FLOOR_HZ: f32 = 154.0;
+
+/// The top of the corner's travel at the widest Range, in hertz.
+///
+/// Where the LFO's gate swing actually takes the JFET, which on the real pedal
+/// is set by ear on an internal trimmer — so this is a voicing, unlike the
+/// floor above. At 2 kHz the upper notch reaches 4.8 kHz, which is as bright
+/// as a Phase 90 gets before it stops sounding like one.
+pub const PHASER_TOP_HZ: f32 = 2_000.0;
+
+/// Where the corner travels, floor first. Kept under the old name because it
+/// is public and it still answers the same question.
+pub const PHASER_SWEEP_HZ: (f32, f32) = (PHASER_FLOOR_HZ, PHASER_TOP_HZ);
+
+/// Where the two notches sit relative to the all-pass corner.
+///
+/// **Four identical first-order all-passes give exactly two notches, and their
+/// spacing never changes.** Total phase is −8·arctan(f/f0); the 180° and 540°
+/// crossings — the nulls, once the chain is summed with the dry — are at
+/// `f0·tan(22.5°)` and `f0·tan(67.5°)`. The sweep moves the pair; it cannot
+/// stretch it.
+///
+/// Recorded here because it says where the effect actually IS. At the bottom
+/// of the travel the pair sits at 64 Hz and 372 Hz, a long way under where
+/// anybody pictures a phaser. Published analysis of the circuit quotes 58.5
+/// and 340.8 Hz for a 141 Hz corner, which is 0.415 and 2.417 of it — the
+/// derivation and the measurement agree.
+const PHASER_NOTCH: (f32, f32) = (0.414_213_56, 2.414_213_6);
+
+/// How far the four stages are detuned from each other.
+///
+/// **The JFETs in a real pedal are not matched, and matching them perfectly
+/// makes it sound wrong.** A block-logo unit measured V_GS(10k) of −1.78,
+/// −1.71, −1.72 and −1.80 volts across its four devices — a 0.09 V spread on
+/// about 1.75 V, near enough five percent — and the DIY guidance is that
+/// anything inside 0.1 V phases properly. Four identical coefficients give a
+/// deeper, narrower notch than four slightly staggered ones.
+///
+/// Fixed rather than random: a phaser that sounds different every launch is a
+/// bug, and these are one unit's actual devices rather than a distribution.
+const PHASER_STAGE_TRIM: [f32; Stages::MAX] = [
+    1.000, 0.972, 0.981, 1.024, 0.994, 1.013, 0.978, 1.006,
+];
 
 /// One first-order all-pass: unity magnitude, and the phase turns.
 ///
@@ -1633,17 +1774,46 @@ impl Phaser {
         if self.phase >= 1.0 {
             self.phase -= self.phase.floor();
         }
-        // A sine, which is what the pedal's op-amp oscillator makes and what
-        // keeps the sweep from having a corner at each end.
-        let lfo = 0.5 - 0.5 * (std::f32::consts::TAU * self.phase as f32).cos();
-        // **The sweep is EXPONENTIAL in frequency**, because pitch is. A
-        // linear sweep between 120 Hz and 3.6 kHz spends nine tenths of its
-        // travel above a kilohertz and lurches through the bottom octave.
-        let (lo, hi) = PHASER_SWEEP_HZ;
-        let centre = (lo * hi).sqrt();
-        let span = (hi / lo).sqrt().powf(p.phaser_range.clamp(0.0, 1.0).max(0.05));
-        let (lo, hi) = (centre / span, centre * span);
-        let f = lo * (hi / lo).powf(lfo);
+        // **A triangle, because the LFO is a Schmitt trigger and an
+        // integrator**, and that pair makes exactly one wave. This was a sine,
+        // with a comment saying a sine is what the pedal's oscillator makes.
+        // It is not; the circuit is a comparator charging a capacitor at a
+        // constant current, which is a triangle by construction.
+        //
+        // Rounded slightly rather than served raw. The triangle is a voltage
+        // on a JFET gate, and the device's transfer curve is not perfectly
+        // straight, so the turning points arrive softened. A little sine mixed
+        // in is a cheap stand-in for that curve and stops the corners reading
+        // as a tick at slow speeds.
+        let t = self.phase as f32;
+        let tri = if t < 0.5 { t * 2.0 } else { 2.0 - t * 2.0 };
+        let sine = 0.5 - 0.5 * (std::f32::consts::TAU * t).cos();
+        let lfo = tri * 0.85 + sine * 0.15;
+
+        // **The sweep is linear in CONDUCTANCE, which is what the circuit
+        // sweeps, and that is not the same as linear or exponential in
+        // frequency.**
+        //
+        // The JFET's channel conductance is very nearly proportional to gate
+        // voltage over the working range, and it sits in PARALLEL with a fixed
+        // 22 kΩ. Conductances in parallel add, so
+        //
+        // ```text
+        // 1/R_total = 1/R_jfet(Vgs) + 1/22kΩ     and     f0 ∝ 1/R_total
+        // ```
+        //
+        // — the corner is an offset linear function of the LFO, with the
+        // offset being [`PHASER_FLOOR_HZ`]. Both facts fall out together:
+        // where the bottom of the sweep is, and the shape of the travel.
+        //
+        // This file used to sweep exponentially and its comment explained why:
+        // a linear sweep "spends nine tenths of its travel above a kilohertz
+        // and lurches through the bottom octave". It does. That lurch is the
+        // Phase 90 — it is what the pedal sounds like — and the exponential
+        // was a smoother sweep than the hardware has ever made.
+        let range = p.phaser_range.clamp(0.0, 1.0).max(0.05);
+        let top = PHASER_FLOOR_HZ + (PHASER_TOP_HZ - PHASER_FLOOR_HZ) * range;
+        let f = PHASER_FLOOR_HZ + (top - PHASER_FLOOR_HZ) * lfo;
         // **The first-order all-pass whose −90° point is `f`, and the sign
         // is the whole filter.**
         //
@@ -1655,14 +1825,32 @@ impl Phaser {
         // test passes on it, because an identity filter is perfectly
         // transparent. What caught it was asking whether a tone in the
         // sweep's path ever gets quieter.
-        let d = (std::f32::consts::PI * f / self.sample_rate).tan();
-        (d - 1.0) / (d + 1.0)
+        //
+        // **Returns `d` rather than the coefficient**, because the four stages
+        // no longer share one — see [`PHASER_STAGE_TRIM`]. One `tan` a sample
+        // and eight cheap perturbations of it, rather than eight `tan`s: over
+        // this range `tan θ` is close enough to `θ` that scaling `d` by a few
+        // percent and scaling the frequency by a few percent are the same
+        // thing to well under a percent.
+        (std::f32::consts::PI * f / self.sample_rate).tan()
     }
 
     /// One stereo frame in, the WET signal out. The caller does the blend.
     #[inline]
-    fn run(&mut self, x: [f32; 2], a: f32, p: &Params) -> [f32; 2] {
+    fn run(&mut self, x: [f32; 2], d: f32, p: &Params) -> [f32; 2] {
         let n = p.phaser_stages.count();
+        // **The feedback goes into the SECOND stage, not the first.** The
+        // block-logo redesign added a 22 kΩ resistor from the output of the
+        // fourth phase stage to the input of the second, so the loop wraps
+        // three stages and not four. A four-stage loop resonates at different
+        // frequencies from a three-stage one, and where that resonant hump
+        // sits is the whole audible difference between the block and the
+        // script. This used to wrap all of them.
+        //
+        // On a two-stage Phase 45 there is no second stage to feed into that
+        // is not also the last, so it wraps one — which is what a two-stage
+        // version of the same wiring does.
+        let inject = 1.min(n.saturating_sub(1));
         // **Kept well under one.** The feedback path runs through four
         // all-passes whose magnitude is exactly unity, so a coefficient of
         // 1.0 is a loop with no loss in it at all — an oscillator, at
@@ -1678,9 +1866,17 @@ impl Phaser {
         let fb = p.phaser_feedback.clamp(0.0, 1.0) * 0.80;
         let mut out = [0.0f32; 2];
         for ch in 0..2 {
-            let mut v = x[ch] + self.fb[ch] * fb;
-            for stage in self.stages[ch].iter_mut().take(n) {
-                v = stage.process(v, a);
+            let mut v = x[ch];
+            for (i, stage) in self.stages[ch].iter_mut().take(n).enumerate() {
+                if i == inject {
+                    v += self.fb[ch] * fb;
+                }
+                // Each stage on its own slightly different corner. See
+                // `PHASER_STAGE_TRIM`: the devices in a real pedal are matched
+                // to about five percent, and four identical stages cut a
+                // deeper, narrower notch than the pedal does.
+                let di = d * PHASER_STAGE_TRIM[i];
+                v = stage.process(v, (di - 1.0) / (di + 1.0));
             }
             // Nothing infinite is allowed back into the loop. A denormal or
             // a NaN from a stalled buffer would otherwise live in `fb` for
@@ -4033,6 +4229,185 @@ mod tests {
             hi > lo * 1.4,
             "the sweep is not moving: the envelope sat between {lo:e} and {hi:e}"
         );
+    }
+
+    /// **The bucket brigade has a shortest length and it does not move.**
+    ///
+    /// A real CE-1 runs 3–5 ms at the bottom of Intensity and 3–7 ms at the
+    /// top: the floor is shared and the knob stretches only the long end. This
+    /// file used to centre the sweep at 8 ms and open it symmetrically, which
+    /// put the average delay somewhere the pedal never sits.
+    ///
+    /// Measured by where an impulse comes back out, sampled right across an
+    /// LFO cycle so both ends of the travel are seen.
+    #[test]
+    fn the_chorus_delay_opens_upward_from_a_fixed_floor() {
+        let travel = |depth: f32| {
+            let p = Params {
+                chorus_depth: depth,
+                // Fast, so a whole cycle fits in a reasonable number of
+                // probes; the floor and the span do not depend on rate.
+                chorus_rate: 1.0,
+                chorus_width: 0.0,
+                // Flat, or the one-pole smears the arrival being timed.
+                chorus_tone: 1.0,
+                ..Params::default()
+            };
+            let (mut lo, mut hi) = (f32::MAX, 0.0_f32);
+            // Twenty probes across one sweep at the top rate.
+            for probe in 0..20 {
+                let mut fx = Effects::new_send(SR);
+                // Advance the LFO by a different amount before each probe.
+                let skip = probe * (SR as usize / 64);
+                if skip > 0 {
+                    let mut warm = vec![0.0_f32; skip * 2];
+                    fx.process(&mut warm, skip, 2, sends(0.0, 0.0, 1.0), &p, 120.0);
+                }
+                let out = strike_with(&mut fx, 2_048, sends(0.0, 0.0, 1.0), &p, 120.0);
+                let mag: Vec<f32> = out.chunks_exact(2).map(|f| f[0].abs()).collect();
+                let (at, v) = mag.iter().enumerate().fold((0usize, 0.0_f32), |b, (i, x)| {
+                    if *x > b.1 {
+                        (i, *x)
+                    } else {
+                        b
+                    }
+                });
+                if v > 1.0e-5 {
+                    let ms = at as f32 * 1_000.0 / SR;
+                    lo = lo.min(ms);
+                    hi = hi.max(ms);
+                }
+            }
+            (lo, hi)
+        };
+
+        let (lo_min, hi_min) = travel(0.0);
+        let (lo_max, hi_max) = travel(1.0);
+
+        // The floor is the floor at both settings.
+        for (name, lo) in [("least", lo_min), ("most", lo_max)] {
+            assert!(
+                (lo - CHORUS_FLOOR_MS).abs() < 0.6,
+                "at {name} depth the shortest delay was {lo:.2} ms, wanted \
+                 {CHORUS_FLOOR_MS:.1}"
+            );
+        }
+        // And the long end moves out with depth, roughly 5 ms to 7 ms.
+        assert!(
+            hi_max > hi_min + 1.0,
+            "depth stretched the long end from {hi_min:.2} ms only as far as \
+             {hi_max:.2} ms"
+        );
+        assert!(
+            hi_min < 6.0 && hi_max < 8.5,
+            "the sweep reached {hi_min:.2} / {hi_max:.2} ms, well past what a \
+             CE-1 does"
+        );
+    }
+
+    /// **The gate is what a CE-1 has instead of a compander**, so the wet path
+    /// is silent when nothing is playing and the hiss arrives with the note.
+    #[test]
+    fn the_chorus_gate_shuts_when_nothing_is_playing() {
+        let p = Params::default();
+        let mut fx = Effects::new_send(SR);
+        let s = sends(0.0, 0.0, 1.0);
+
+        // Play something, so the gate is open and the line is full.
+        let mut buf = vec![0.0_f32; 24_000 * 2];
+        for (i, f) in buf.chunks_exact_mut(2).enumerate() {
+            let v = (i as f32 * 330.0 * std::f32::consts::TAU / SR).sin() * 0.4;
+            f[0] = v;
+            f[1] = v;
+        }
+        fx.process(&mut buf, 24_000, 2, s, &p, 120.0);
+        assert!(peak(&buf) > 1.0e-3, "the chorus made nothing while playing");
+
+        // Then stop. **Two seconds, and the window is not generosity** — a
+        // gate that slams shut on the end of a phrase is a worse artefact than
+        // the hiss it is removing, so the envelope has to fall past the
+        // threshold and the gate has to slew after it. Measured over the last
+        // half second, by which point both have finished.
+        let mut quiet = vec![0.0_f32; 96_000 * 2];
+        fx.process(&mut quiet, 96_000, 2, s, &p, 120.0);
+        let tail = peak(&quiet[72_000 * 2..]);
+        assert!(
+            tail < 1.0e-6,
+            "the wet path was still making {tail:e} into silence: the gate is \
+             not shutting, and on a CE-1 that is the hiss"
+        );
+    }
+
+    /// **The phaser's sweep has a bottom, and the bottom is a resistor.**
+    ///
+    /// Each all-pass stage is 47 nF against a JFET in parallel with 22 kΩ.
+    /// Take the JFET to cutoff and the fixed resistor sets the corner at
+    /// 1/(2π·22k·47n) = 154 Hz, and nothing can push it lower. This file used
+    /// to sweep from 120 Hz, under anything the pedal can reach.
+    ///
+    /// Read straight off [`Phaser::step`], which returns `tan(π f / fs)`, so
+    /// the corner it is asking for comes back out with an `atan`.
+    #[test]
+    fn the_phaser_corner_never_falls_below_its_resistor() {
+        for range in [0.0_f32, 0.35, 1.0] {
+            let p = Params {
+                phaser_range: range,
+                phaser_rate: 1.0,
+                ..Params::default()
+            };
+            let mut ph = Phaser::new(SR);
+            let (mut lo, mut hi) = (f32::MAX, 0.0_f32);
+            // Several full LFO cycles at the top rate.
+            for _ in 0..(SR as usize) {
+                let d = ph.step(&p);
+                let f = d.atan() * SR / std::f32::consts::PI;
+                lo = lo.min(f);
+                hi = hi.max(f);
+            }
+            assert!(
+                lo > PHASER_FLOOR_HZ - 1.0,
+                "at range {range} the corner reached {lo:.1} Hz, under the \
+                 {PHASER_FLOOR_HZ:.0} Hz the 22k sets"
+            );
+            assert!(
+                lo < PHASER_FLOOR_HZ + 4.0,
+                "at range {range} the corner bottomed out at {lo:.1} Hz and \
+                 never reached its floor"
+            );
+            assert!(
+                hi <= PHASER_TOP_HZ + 1.0,
+                "at range {range} the corner reached {hi:.1} Hz, past the top \
+                 of the travel"
+            );
+        }
+    }
+
+    /// **The two notches keep a fixed ratio, and it is 5.83.**
+    ///
+    /// Four identical first-order all-passes give a total phase of
+    /// −8·arctan(f/f0), so the nulls sit where that reaches 180° and 540°:
+    /// `tan(22.5°)` and `tan(67.5°)` times the corner. The sweep moves the
+    /// pair and cannot stretch it, which is worth a test because it is the
+    /// fact that says where a Phase 90 actually operates — at the bottom of
+    /// the travel the pair is at 64 Hz and 372 Hz.
+    #[test]
+    fn the_notch_pair_is_where_the_arithmetic_says() {
+        let ratio = PHASER_NOTCH.1 / PHASER_NOTCH.0;
+        assert!(
+            (ratio - 5.828).abs() < 0.01,
+            "the notches are {ratio:.3} apart, not 5.83"
+        );
+        // Against the published analysis of the circuit: 58.5 Hz and 340.8 Hz
+        // for a 141 Hz corner.
+        for (corner, want) in [(141.0_f32, 58.5_f32), (141.0, 340.8)] {
+            let low = corner * PHASER_NOTCH.0;
+            let high = corner * PHASER_NOTCH.1;
+            assert!(
+                (low - want).abs() < 1.0 || (high - want).abs() < 1.0,
+                "a {corner} Hz corner puts the pair at {low:.1} and {high:.1}, \
+                 and the measurement says {want}"
+            );
+        }
     }
 
     /// **Nothing rings on from an hour ago.** Turning the knobs down flushes
