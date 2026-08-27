@@ -1,4 +1,4 @@
-//! Reverb and delay, on everything the app plays.
+//! A plate, a tape echo and the pedals, on everything the app plays.
 //!
 //! Two knobs on the recorder, modelled on the Tascam 388's effect returns, and
 //! one number each: how much. Everything else is chosen here, because the
@@ -16,19 +16,48 @@
 //!
 //! # Why these algorithms
 //!
-//! The reverb is Schroeder-Moorer (the "Freeverb" arrangement): eight comb
-//! filters in parallel into four allpasses in series, per channel, with the
-//! right channel's delays offset so the two decorrelate into something wide.
-//! It is thirty years old, it is public domain, it is about a hundred lines,
-//! and it costs a few hundred multiply-adds a sample. A convolution reverb
-//! would sound better and would mean shipping impulse responses, a partitioned
-//! FFT, and a latency budget, for a control that is off by default.
+//! Four of them name real hardware, and the naming is not decoration: it is
+//! the fastest way to say what a sound is to somebody who has heard one, and
+//! it is what decided every constant below. Where a number came off a service
+//! manual, a measurement or a component value rather than out of somebody's
+//! ear, the comment beside it says so.
 //!
-//! The delay is a delay line with feedback and a lowpass in the loop, and its
-//! **time comes from the session tempo**. That is the one real opinion in this
-//! file: a musician with one knob wants repeats that land on the beat, and
-//! Tangent is the rare effect that already knows the tempo because there is a
-//! metronome next to it.
+//! **The reverb is a steel plate**, after the EMT 140 — two metres by one,
+//! half a millimetre thick. Bending waves in a thin plate are dispersive, so
+//! the top of the band crosses it in a millisecond and the bottom takes
+//! thirty, and that chirp is the whole difference between a plate and a small
+//! bright room. An allpass tank supplies the density; [`Dispersion`] supplies
+//! the physics the tank cannot. It replaced a Schroeder-Moorer arrangement
+//! that was cheaper, older, and a room.
+//!
+//! A convolution reverb would be more faithful still and would mean shipping
+//! impulse responses, a partitioned FFT and a latency budget — and an impulse
+//! response of a real machine is a recording somebody owns. An algorithm is
+//! nobody's. See LICENSING.md.
+//!
+//! **The delay is a tape echo**, after the RE-201: one mono loop, three
+//! playback heads at 1 : 1.94 : 2.85, and Roland's twelve-position Mode
+//! Selector deciding which of them are listening. Its **time still comes from
+//! the session tempo**, which is the one real opinion in this file and has
+//! survived the rewrite: a musician with one knob wants repeats that land on
+//! the beat, and Tangent is the rare effect that already knows the tempo
+//! because there is a metronome next to it. The division sets head one; the
+//! other two follow by the ratios.
+//!
+//! **The chorus is a bucket brigade**, after the Boss CE-1, and **the phaser
+//! is four JFETs**, after the MXR Phase 90. Both are bounded by a component
+//! value rather than by taste — the chorus by the shortest delay its BBD ever
+//! reaches, the phaser by the 22 kΩ that sits across each JFET and stops the
+//! sweep at 154 Hz.
+//!
+//! # What the marks are doing here
+//!
+//! Naming somebody else's machine to say what a sound is, and nothing more.
+//! Every effect's own NAME is Tangent's; the hardware appears in the line
+//! underneath, which is a reference rather than a claim. `dialogs::FX_UNITS`
+//! keeps that split and `no_effect_is_named_after_hardware_it_only_refers_to`
+//! enforces it. Nothing here is sampled from, recorded off, or derived from
+//! anybody's code.
 //!
 //! # Denormals
 //!
@@ -957,6 +986,14 @@ const HEAD_RATIO: [f32; 3] = [1.0, 1.94, 2.85];
 /// three — exactly the modes whose LOWEST active head is one, two and three.
 /// Two independent tables agreeing is the only reason to trust a twelve-way
 /// switch nobody here has in front of them.
+/// **`dead_code` until the host wires the choice, and no longer.** Eleven of
+/// the twelve variants and the whole `ALL`/`label`/`key`/`from_key` group are
+/// the interface `desktop.rs` reaches for — exactly the shape [`Division`] and
+/// [`Slope`] already have, and those do not warn because two functions there
+/// use them. Adding `echo_mode` to `effect_defaults()` and
+/// `effect_params_from()` is what makes this attribute removable, and it is
+/// the first item in the handoff spec.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EchoMode {
     /// Head 1. The short slap, and the default: it is the one position where
@@ -988,6 +1025,9 @@ pub enum EchoMode {
     ReverbOnly,
 }
 
+// See the note on the enum: this whole group is the host's interface and is
+// unused until `desktop.rs` reads it.
+#[allow(dead_code)]
 impl EchoMode {
     /// Every position, in the order the switch turns.
     pub const ALL: [EchoMode; 12] = [
@@ -1678,10 +1718,6 @@ pub const PHASER_FLOOR_HZ: f32 = 154.0;
 /// as a Phase 90 gets before it stops sounding like one.
 pub const PHASER_TOP_HZ: f32 = 2_000.0;
 
-/// Where the corner travels, floor first. Kept under the old name because it
-/// is public and it still answers the same question.
-pub const PHASER_SWEEP_HZ: (f32, f32) = (PHASER_FLOOR_HZ, PHASER_TOP_HZ);
-
 /// Where the two notches sit relative to the all-pass corner.
 ///
 /// **Four identical first-order all-passes give exactly two notches, and their
@@ -1695,6 +1731,12 @@ pub const PHASER_SWEEP_HZ: (f32, f32) = (PHASER_FLOOR_HZ, PHASER_TOP_HZ);
 /// anybody pictures a phaser. Published analysis of the circuit quotes 58.5
 /// and 340.8 Hz for a 141 Hz corner, which is 0.415 and 2.417 of it — the
 /// derivation and the measurement agree.
+///
+/// Test-only because nothing in the signal path needs it: the all-passes make
+/// the notches without being told where they are. It is here so that
+/// `the_notch_pair_is_where_the_arithmetic_says` can pin the fact against the
+/// published measurement, and so the fact is written down somewhere.
+#[cfg(test)]
 const PHASER_NOTCH: (f32, f32) = (0.414_213_56, 2.414_213_6);
 
 /// How far the four stages are detuned from each other.
