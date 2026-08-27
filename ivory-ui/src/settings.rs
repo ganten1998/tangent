@@ -3612,6 +3612,14 @@ impl Settings {
         self.borderless_mode = fresh.borderless_mode;
         self.window_x = fresh.window_x;
         self.window_y = fresh.window_y;
+        // The SIZE as well as the position, or "puts the window back to its
+        // opening size and position" is a sentence the dialog says and the
+        // reset does not keep. Missed when the pair was added because the
+        // partition test could only see fields the WRITER emits, and an
+        // optional one that is `None` at first launch is never written — it
+        // compares the structs as well now, which is what catches this.
+        self.window_w = fresh.window_w;
+        self.window_h = fresh.window_h;
         self.chord_window_detached = fresh.chord_window_detached;
         self.detached_chord_height = fresh.detached_chord_height;
         self.detached_chord_width = fresh.detached_chord_width;
@@ -4727,6 +4735,14 @@ mod tests {
     /// the struct: a field added tomorrow is perturbed tomorrow, with no edit
     /// here. Numbers move, bools flip, strings gain a suffix, arrays perturb
     /// element-wise, objects recurse.
+    /// Settings with every persisted value moved off its default.
+    ///
+    /// **Optional fields need a hand.** The perturbation walks the emitted
+    /// JSON, and `to_map` writes an `Option` only when it is `Some` — so a
+    /// pair that is `None` at first launch is invisible to it. They are set
+    /// here explicitly, and the struct comparison in
+    /// `the_scopes_together_are_everything` is the backstop for the next one
+    /// somebody adds without reading this.
     fn every_value_moved() -> Settings {
         fn bump(v: &Value) -> Value {
             match v {
@@ -4750,7 +4766,10 @@ mod tests {
             }
             *v = bump(v);
         }
-        Settings::from_map(map)
+        let mut out = Settings::from_map(map);
+        out.window_w = Some(1234);
+        out.window_h = Some(567);
+        out
     }
 
     /// The keys that are NOT settings: the version stamp and the flags
@@ -4805,6 +4824,39 @@ mod tests {
         assert!(
             stragglers.is_empty(),
             "these keys survived every scope, so no reset can put them back: {stragglers:?}"
+        );
+
+        // **And the STRUCT, which is what actually has to be reset.**
+        //
+        // The key walk above names the offender, which is why it comes first,
+        // but it can only see fields the writer EMITS — and an optional field
+        // is written only when it is `Some`, so a pair that is `None` at
+        // first launch never appears in either map and the comparison passes
+        // straight over it. `window_w`/`window_h` were added that way and no
+        // scope reset them: the reset promised to put the window back to its
+        // opening size and left the dragged one on disk.
+        //
+        // Comparing the structs closes the class rather than the instance.
+        // The bookkeeping is levelled first, for the reason `BOOKKEEPING`
+        // gives — a reset is deliberately not a first launch.
+        let mut levelled = s.clone();
+        let mut baseline = fresh.clone();
+        for side in [&mut levelled, &mut baseline] {
+            side.video_default_applied = true;
+            side.shows_default_applied = true;
+            side.video_defaults_lowered = false;
+            side.auto_exposed = Vec::new();
+            side.tracks_added = 0;
+            side.desk_state_shift_v13 = false;
+            side.desk_state_shift_v14 = false;
+            side.desk_state_shift_v19 = false;
+            side.pad_state_shift_v18 = false;
+            side.extra = Map::new();
+        }
+        assert!(
+            levelled == baseline,
+            "a field survived every scope that `to_map` does not emit, so the \
+             key walk above could not name it; compare the two Settings by hand"
         );
     }
 
