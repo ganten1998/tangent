@@ -111,7 +111,19 @@ impl TempoMap {
             p.bpm = clamp_bpm(p.bpm);
         }
         points.sort_by(|a, b| a.at_beat.partial_cmp(&b.at_beat).unwrap_or(std::cmp::Ordering::Equal));
-        points.dedup_by(|a, b| (a.at_beat - b.at_beat).abs() < 1e-9);
+        // **The LAST of two points on one beat wins**, which is what the doc
+        // above says and what `dedup_by` does NOT do — it keeps the first of
+        // each run. Caught by the automation curves' own sanitiser test
+        // asserting which value survived, where this one had only asserted
+        // how many did.
+        let mut kept: Vec<TempoPoint> = Vec::with_capacity(points.len());
+        for p in points {
+            if kept.last().is_some_and(|q| (q.at_beat - p.at_beat).abs() < 1e-9) {
+                kept.pop();
+            }
+            kept.push(p);
+        }
+        let mut points = kept;
         match points.first() {
             // A map that starts late leaves the opening bars with no tempo at
             // all. The first point's own tempo is the only honest thing to
@@ -518,6 +530,14 @@ mod tests {
             TempoPoint { at_beat: 4.0, bpm: 140.0, ramp: false },
         ]);
         assert_eq!(dup.points().len(), 2, "{:?}", dup.points());
+        // **WHICH one survived**, not merely how many. This assertion was
+        // missing, and without it the code kept the first while the comment
+        // promised the last — for as long as nobody looked.
+        assert!(
+            (dup.bpm_at_beat(4.0) - 140.0).abs() < 1e-9,
+            "the earlier of two points on one beat won: {:?}",
+            dup.points()
+        );
     }
 
     /// Bars and beats, through a signature change.

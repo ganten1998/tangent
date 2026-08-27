@@ -8,6 +8,8 @@
 /// `Painter`. See the module for why every panel needed a second enumerator.
 pub mod a11y;
 pub mod app;
+/// Automation curves: a control's value written down as a shape over time.
+pub mod automation;
 pub mod chord_strip;
 pub mod dialogs;
 /// The drumpad's document: the kit, saved beside the arrangement.
