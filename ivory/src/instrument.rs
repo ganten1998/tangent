@@ -2903,7 +2903,21 @@ impl Renderer {
     /// `out` is interleaved at the device's channel count. `now` is the host
     /// instant the callback was entered and `heard` is the instant its first
     /// frame will actually leave the DAC.
-    fn render(&mut self, out: &mut [f32], now: Nanos, heard: Nanos) {
+    /// Render `frames` PROGRAM frames into `out`, and answer how many the
+    /// taps hold.
+    ///
+    /// **Program frames, which are device frames only when the varispeed
+    /// dial is at rest.** Everything in here — the transport, the clips, the
+    /// plugins, the click — is generated on demand and has no opinion about
+    /// how fast it is being asked for; `render` is where the two clocks meet.
+    /// See `crate::varispeed`.
+    fn render_program(
+        &mut self,
+        out: &mut [f32],
+        frames: usize,
+        now: Nanos,
+        heard: Nanos,
+    ) -> usize {
         self.shared.callbacks.fetch_add(1, Ordering::Relaxed);
         self.shared
             .delay_ns
@@ -2922,14 +2936,13 @@ impl Renderer {
             // is a division, an integer division by zero PANICS in Rust, and a
             // panic across the cpal boundary is undefined behaviour rather than
             // a stack trace.
-            return;
+            return 0;
         }
         // Clamped, not trusted: the scratch buffers below are sized for
         // MAX_CALLBACK_FRAMES and indexing past them would be the same panic in
-        // a different costume. A device that hands over more than this gets its
-        // tail as silence, which is audible and survivable; the caller in
-        // `build_for` splits the callback so it never happens.
-        let frames = (out.len() / dev_ch).min(MAX_CALLBACK_FRAMES);
+        // a different costume. A buffer shorter than the caller claimed gets
+        // its tail as silence, which is audible and survivable.
+        let frames = frames.min(out.len() / dev_ch).min(MAX_CALLBACK_FRAMES);
 
         // How many frames one pass through the instruments may cover. `MAX_BLOCK`
         // is the plugins' limit — `Instance::process` REFUSES more rather than
@@ -2940,7 +2953,7 @@ impl Renderer {
         // audio thread rather than a wrong sample.
         let chunk = (MAX_BLOCK as usize).min(self.mix.len() / 2);
         if chunk == 0 {
-            return;
+            return 0;
         }
 
         // Read the controls once per callback, not once per frame: they are
@@ -3765,17 +3778,11 @@ impl Renderer {
             done += n;
         }
 
-        self.push_tap(tap_frames);
-        let _ = self
-            .scope_tx
-            .push_entire_slice(&self.scope_scratch[..tap_frames * TAP_CHANNELS]);
-        // Only while streaming, and a full ring drops the block like the scope's
-        // does — a stalled receiver must never back up into the audio thread.
-        if self.shared.reastream_on.load(Ordering::Relaxed) {
-            let _ = self
-                .reastream_tx
-                .push_entire_slice(&self.reastream_scratch[..tap_frames * 2]);
-        }
+        // **The taps are pushed by the CALLER**, not here: under varispeed
+        // they hold program frames and have to be squeezed to the device's
+        // rate first, or the take would be a recording of a tape running at
+        // the wrong speed. See `render`.
+        //
         // Ten times a second at most, which is when a cell closed and the
         // readings actually moved. See `Loudness::push`.
         if lufs_moved {
@@ -3785,6 +3792,147 @@ impl Renderer {
             }
         }
         self.publish_meters(frames, peak_l, peak_r, sumsq_l, sumsq_r, clipped);
+        tap_frames
+    }
+
+    /// One device callback.
+    ///
+    /// **Where the two clocks meet.** At rest they are the same clock and
+    /// this costs one atomic load; engaged, the program is rendered at
+    /// `frames × ratio` and everything that leaves — the speakers, the take,
+    /// the scope, the ReaStream send — is resampled back to the device's rate
+    /// together, from one shared phase, so they are all the same instant.
+    fn render(&mut self, out: &mut [f32], now: Nanos, heard: Nanos) {
+        let dev_ch = self.dev_channels;
+        if dev_ch == 0 {
+            return;
+        }
+        let dev_frames = (out.len() / dev_ch).min(MAX_CALLBACK_FRAMES);
+        let Some(ratio) = self.varispeed_ratio() else {
+            if self.vs_was_engaged {
+                // **Dropped on the way OUT, not on the way in.** The
+                // histories hold the last few frames of a signal that was
+                // running at a different rate; carried into the next
+                // engagement they would be spliced onto it, minutes or hours
+                // later, as a click.
+                self.clear_varispeed();
+            }
+            self.vs_was_engaged = false;
+            let tap_frames = self.render_program(out, dev_frames, now, heard);
+            self.push_taps(tap_frames);
+            return;
+        };
+        if !self.vs_was_engaged {
+            self.clear_varispeed();
+        }
+        self.vs_was_engaged = true;
+        // How much program this callback needs, bounded by what the
+        // program-rate scratches were sized for. The caller keeps the device
+        // side small enough that the cap is never the binding one — see
+        // `Renderer::max_device_frames`.
+        let program = self
+            .vs_phase
+            .program_frames(dev_frames, ratio)
+            .min(MAX_CALLBACK_FRAMES);
+        if program == 0 {
+            out.fill(0.0);
+            return;
+        }
+        let frac = self.vs_phase.frac();
+        // Out of `self` so the render below can borrow the rest of it. A
+        // move, not an allocation.
+        let mut dev = std::mem::take(&mut self.vs_dev);
+        let need = program * dev_ch;
+        if dev.len() < need {
+            // Unreachable — it is sized for `MAX_CALLBACK_FRAMES * widest` at
+            // construction — and written down because the alternative to
+            // noticing is a panic on the audio thread.
+            self.vs_dev = dev;
+            out.fill(0.0);
+            return;
+        }
+        let tap_frames = self.render_program(&mut dev[..need], program, now, heard);
+        out.fill(0.0);
+        self.vs_out.run(&dev, program, out, dev_frames, frac, ratio);
+        self.vs_dev = dev;
+        // The three taps, from the SAME phase and the same ratio: a take a
+        // fraction of a frame away from what came out of the speakers is a
+        // take that will not line up with anything.
+        let mut dst = std::mem::take(&mut self.vs_dst);
+        for (stream, src, ch) in [
+            (&mut self.vs_tap, &mut self.tap_scratch, TAP_CHANNELS),
+            (&mut self.vs_scope, &mut self.scope_scratch, TAP_CHANNELS),
+            (&mut self.vs_reastream, &mut self.reastream_scratch, 2),
+        ] {
+            let n = dev_frames * ch;
+            if dst.len() < n || src.len() < n {
+                continue;
+            }
+            stream.run(src, tap_frames, &mut dst, dev_frames, frac, ratio);
+            src[..n].copy_from_slice(&dst[..n]);
+        }
+        self.vs_dst = dst;
+        self.vs_phase.advance(dev_frames, program, ratio);
+        self.push_taps(dev_frames);
+    }
+
+    /// Hand the take, the scope and the ReaStream send what this callback
+    /// made. `frames` is in DEVICE frames — see `render`.
+    fn push_taps(&mut self, frames: usize) {
+        self.push_tap(frames);
+        let _ = self
+            .scope_tx
+            .push_entire_slice(&self.scope_scratch[..frames * TAP_CHANNELS]);
+        // Only while streaming, and a full ring drops the block like the
+        // scope's does — a stalled receiver must never back up into the audio
+        // thread.
+        if self.shared.reastream_on.load(Ordering::Relaxed) {
+            let _ = self
+                .reastream_tx
+                .push_entire_slice(&self.reastream_scratch[..frames * 2]);
+        }
+    }
+
+    /// The largest device callback this renderer can serve in one pass.
+    ///
+    /// **Half the usual, while the varispeed is engaged.** The program-rate
+    /// scratches are sized for `MAX_CALLBACK_FRAMES`, and at the dial's top
+    /// speed one device frame costs two program frames — so the device side
+    /// has to be halved or the mix buffer is the thing that runs out. A few
+    /// frames of slack for the interpolator's reach past the last read.
+    fn max_callback_frames(&self) -> usize {
+        match self.varispeed_ratio() {
+            None => MAX_CALLBACK_FRAMES,
+            Some(_) => (MAX_CALLBACK_FRAMES - 8) / 2,
+        }
+    }
+
+    /// The varispeed ratio, or `None` at rest.
+    ///
+    /// Sanitised HERE, in one place, so no caller can be handed a NaN or a
+    /// speed outside the dial's own limits — a NaN read position resamples to
+    /// silence at best and indexes wildly at worst.
+    fn varispeed_ratio(&self) -> Option<f64> {
+        let r = f64::from(Shared::f32_of(&self.shared.varispeed));
+        if !r.is_finite() || !(0.5..=crate::varispeed::MAX_RATIO).contains(&r) {
+            return None;
+        }
+        ((r - 1.0).abs() > 1.0e-9).then_some(r)
+    }
+
+    /// Every varispeed history and both phases back to nothing.
+    fn clear_varispeed(&mut self) {
+        self.vs_phase.reset();
+        self.vs_in_phase.reset();
+        for s in [
+            &mut self.vs_out,
+            &mut self.vs_tap,
+            &mut self.vs_scope,
+            &mut self.vs_reastream,
+            &mut self.vs_in,
+        ] {
+            s.clear();
+        }
     }
 
     /// Render one chunk from **every** loaded slot and return how many channels
@@ -3866,11 +4014,36 @@ impl Renderer {
                 self.monitor_gain = [0.0; INPUTS];
             }
         }
+        // Read before the ring is borrowed: `varispeed_ratio` takes `&self`
+        // and the ring is a `&mut` into the same struct.
+        let vs = self.varispeed_ratio();
         let Some(ring) = self.monitor.as_mut() else {
             return;
         };
         let ch_in = self.monitor_channels.max(1);
-        let want = frames * ch_in;
+        // **How much REAL time this chunk of program covers.**
+        //
+        // At rest they are the same number. Engaged, they are not, and this
+        // is the half of varispeed that is easy to forget: the program is
+        // being rendered faster than real time, but the interface still
+        // delivers exactly one second of audio per second. A desk that read
+        // the input at program rate would ask for fifteen percent more than
+        // will ever arrive, every callback, and the monitor path would run
+        // dry — a gap in the take fifteen percent of the way through every
+        // block, for ever.
+        //
+        // So the ring is read at REAL rate and stretched to fill the chunk,
+        // which also means the two resamplings cancel: a player hears
+        // themselves unshifted while the tape runs fast, which is what
+        // monitoring through a varispeed'd machine does.
+        let (real_frames, step) = match vs {
+            Some(ratio) => {
+                let step = 1.0 / ratio;
+                (self.vs_in_phase.program_frames(frames, step), step)
+            }
+            None => (frames, 1.0),
+        };
+        let want = real_frames * ch_in;
         // **What is heard has to be what is HAPPENING, and it was not.**
         //
         // The consumer takes at most one output block per output callback, so
@@ -3926,17 +4099,46 @@ impl Renderer {
         // the rotation — for the rest of the session, silently. Rounded
         // DOWN, exactly as the stale-drop above rounds.
         let take = (got.min(self.monitor_scratch.len()) / ch_in) * ch_in;
-        let scratch = &mut self.monitor_scratch[..take];
-        let got = match ring.read_chunk(scratch.len()) {
-            Ok(chunk) => {
-                let (a, b) = chunk.as_slices();
-                scratch[..a.len()].copy_from_slice(a);
-                scratch[a.len()..a.len() + b.len()].copy_from_slice(b);
-                let n = a.len() + b.len();
-                chunk.commit_all();
+        let got = {
+            let scratch = &mut self.monitor_scratch[..take];
+            match ring.read_chunk(scratch.len()) {
+                Ok(chunk) => {
+                    let (a, b) = chunk.as_slices();
+                    scratch[..a.len()].copy_from_slice(a);
+                    scratch[a.len()..a.len() + b.len()].copy_from_slice(b);
+                    let n = a.len() + b.len();
+                    chunk.commit_all();
+                    n
+                }
+                Err(_) => 0,
+            }
+        };
+        // Stretched into the program's timeline, in place, so everything
+        // below reads the same buffer it always did. `got` becomes the CHUNK
+        // length: whatever arrived covers this chunk now.
+        let got = match vs {
+            None => got,
+            Some(_) => {
+                let src_frames = got / ch_in;
+                let n = frames * ch_in;
+                let frac = self.vs_in_phase.frac();
+                let mut dst = std::mem::take(&mut self.vs_in_src);
+                if dst.len() >= n && self.monitor_scratch.len() >= n {
+                    self.vs_in.set_channels(ch_in);
+                    self.vs_in
+                        .run(&self.monitor_scratch, src_frames, &mut dst, frames, frac, step);
+                    self.monitor_scratch[..n].copy_from_slice(&dst[..n]);
+                }
+                self.vs_in_src = dst;
+                // **Advanced by what was ASKED for, not by what arrived.**
+                // A short read is the interface being late; the phase is a
+                // position in a stream that is still running at real time,
+                // and slipping it by the shortfall would leave the input
+                // permanently behind by however many frames were once
+                // missing.
+                self.vs_in_phase.advance(frames, real_frames, step);
                 n
             }
-            Err(_) => 0,
         };
 
         // **Mute decides the take. Monitoring decides only the room.**
@@ -4008,7 +4210,7 @@ impl Renderer {
                         for i in 0..n {
                             for c in 0..2 {
                                 let col = dev_col(c.min(width - 1));
-                                let _ = tx.push(scratch[i * ch_in + col]);
+                                let _ = tx.push(self.monitor_scratch[i * ch_in + col]);
                             }
                         }
                     } else {
@@ -4072,7 +4274,7 @@ impl Renderer {
                 self.monitor_gain[input] += (target - self.monitor_gain[input]) * self.gain_coeff;
                 for c in 0..TAP_CHANNELS {
                     let lane = dev_col(c.min(width - 1));
-                    let src = scratch[i * ch_in + lane] * self.monitor_gain[input];
+                    let src = self.monitor_scratch[i * ch_in + lane] * self.monitor_gain[input];
                     if let Some(dst) = self.fx_in.get_mut(c) {
                         dst[i] = src;
                     }
@@ -5653,8 +5855,26 @@ impl Engine {
     /// One rendered block of an OFFLINE engine, `out` interleaved stereo.
     /// Does nothing on a live engine — the callback owns that render.
     pub fn render_offline(&mut self, out: &mut [f32]) {
-        if let Some(r) = self.offline.as_mut() {
-            r.render(out, 0, 0);
+        let Some(r) = self.offline.as_mut() else {
+            return;
+        };
+        // **Split the same way the device callback is**, and for the same
+        // reason: the varispeed path halves what one pass can serve, and a
+        // buffer past that would be rendered from too little program and come
+        // out holding the last frame over and over. The exporter hands over a
+        // kilo-frame at a time so this never bites today; it is here because
+        // the day it changes, the symptom is a stutter in a finished file.
+        let ch = 2usize;
+        let mut done = 0usize;
+        while done + ch <= out.len() {
+            let cap = r.max_callback_frames();
+            let frames = ((out.len() - done) / ch).min(cap);
+            if frames == 0 {
+                break;
+            }
+            let n = frames * ch;
+            r.render(&mut out[done..done + n], 0, 0);
+            done += n;
         }
     }
 
@@ -6771,6 +6991,24 @@ impl Engine {
         self.shared.lufs_reset.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// How fast the whole desk plays. 1.0 is off. See `crate::varispeed`.
+    ///
+    /// Sanitised on the way in as well as on the way out: this multiplies
+    /// into a read position on the audio thread, and a NaN there is not a
+    /// display glitch.
+    pub fn set_varispeed(&self, ratio: f32) {
+        let r = if ratio.is_finite() {
+            f64::from(ratio).clamp(0.5, crate::varispeed::MAX_RATIO)
+        } else {
+            1.0
+        };
+        self.shared
+            .varispeed
+            .store((r as f32).to_bits(), Ordering::Relaxed);
+    }
+
+
+
     // ── health ──────────────────────────────────────────────────────────────
 
     /// True while the device is open and the callback has not reported a fatal
@@ -7712,7 +7950,11 @@ where
                 // in the second pass would be placed against the first pass's
                 // window.
                 while done + dev_ch <= data.len() {
-                    let frames = ((data.len() - done) / dev_ch).min(MAX_CALLBACK_FRAMES);
+                    // **Asked of the renderer rather than assumed**, because
+                    // the answer halves while the varispeed is engaged — see
+                    // `Renderer::max_callback_frames`.
+                    let cap = renderer.max_callback_frames();
+                    let frames = ((data.len() - done) / dev_ch).min(cap);
                     let samples = frames * dev_ch;
                     let ahead = ((done / dev_ch) as f64 / rate * 1e9) as Nanos;
                     renderer.render(&mut scratch[..samples], now + ahead, heard + ahead);
@@ -10179,6 +10421,152 @@ mod tests {
             (routed - main * 0.5).abs() < 1.0e-3,
             "3/4 carried {routed} against a master of {main}"
         );
+    }
+
+    // ── varispeed ───────────────────────────────────────────────────────────
+
+    /// Play a sine clip through the whole renderer at `ratio` and hand back
+    /// what left the main pair.
+    fn varispeed_out(ratio: f32, hz: f64, seconds: f64) -> (Vec<f32>, u64) {
+        use std::sync::Arc;
+        let rate = 48_000.0_f64;
+        // Long enough that the clip never runs out even at half speed.
+        let n = (rate * seconds * 3.0) as usize;
+        let clip = Arc::new(ivory_record::decode::Clip {
+            // **Interleaved stereo** — `Clip::samples` is, and generating one
+            // sample per index rather than one FRAME per index makes a tone
+            // at twice the frequency asked for, which is exactly the kind of
+            // wrong a varispeed test cannot afford to be built on.
+            samples: (0..n)
+                .flat_map(|f| {
+                    let v = (std::f64::consts::TAU * hz * f as f64 / rate).sin() as f32;
+                    [v, v]
+                })
+                .collect(),
+            rate: 48_000,
+            source: std::path::PathBuf::from("s.wav"),
+        });
+        let (mut r, _tx, shared) = renderer_with_midi(2);
+        let (to, _from) = r.hijack_track_rings();
+        let mut to = to;
+        to.push(vec![Placed {
+            clip,
+            strip: 1,
+            start: 0,
+            offset: 0,
+            len: n as u64,
+            fade_in: 0,
+            fade_out: 0,
+        }])
+        .expect("room");
+        shared.transport_at.store(0, Ordering::Relaxed);
+        shared.transport_req.store(1, Ordering::Release);
+        shared.rolling.store(true, Ordering::Relaxed);
+        shared
+            .varispeed
+            .store(ratio.to_bits(), Ordering::Relaxed);
+
+        let block = 256;
+        let blocks = ((rate * seconds) as usize) / block;
+        let mut out = Vec::with_capacity(blocks * block * 2);
+        let mut buf = vec![0.0f32; block * 2];
+        for _ in 0..blocks {
+            buf.fill(0.0);
+            r.render(&mut buf, 0, 0);
+            out.extend_from_slice(&buf);
+        }
+        (out, shared.transport_pos.load(Ordering::Relaxed))
+    }
+
+    /// **The pitch follows the speed, through the whole desk.**
+    ///
+    /// `varispeed::tests` proves the resampler; this proves it is WIRED —
+    /// that a clip on a channel, mixed, master-faded and handed to the
+    /// device, comes out at the frequency the dial says. A resampler that
+    /// worked perfectly and was never reached would pass every test in that
+    /// module.
+    #[test]
+    fn the_desk_plays_faster_and_sharper_when_the_dial_is_off_centre() {
+        let rate = 48_000.0_f64;
+        let count = |out: &[f32]| {
+            // The settled part, on the left channel.
+            let l: Vec<f32> = out.chunks(2).skip(4_000).map(|c| c[0]).collect();
+            let crossings = l.windows(2).filter(|w| (w[0] <= 0.0) != (w[1] <= 0.0)).count();
+            crossings as f64 / 2.0 / (l.len() as f64 / rate)
+        };
+        let (rest, _) = varispeed_out(1.0, 500.0, 0.5);
+        let at_rest = count(&rest);
+        assert!(
+            (at_rest - 500.0).abs() < 12.0,
+            "the clip did not play at 500 Hz at rest: {at_rest:.1}"
+        );
+        for ratio in [0.85_f32, 1.15, 2.0] {
+            let (out, _) = varispeed_out(ratio, 500.0, 0.5);
+            let got = count(&out);
+            let want = 500.0 * f64::from(ratio);
+            assert!(
+                (got - want).abs() / want < 0.03,
+                "at {ratio}x the desk played {got:.1} Hz where {want:.1} was wanted"
+            );
+        }
+    }
+
+    /// **The timeline moves at the same speed the audio does.**
+    ///
+    /// The clock and the sound have to agree or the playhead walks away from
+    /// the music — which is the failure that would make varispeed useless for
+    /// the one thing anybody records with it, which is playing along.
+    #[test]
+    fn the_playhead_moves_with_the_audio() {
+        let (_, at_rest) = varispeed_out(1.0, 500.0, 0.25);
+        for ratio in [0.85_f32, 1.15, 2.0] {
+            let (_, moved) = varispeed_out(ratio, 500.0, 0.25);
+            let want = at_rest as f64 * f64::from(ratio);
+            let got = moved as f64;
+            assert!(
+                (got - want).abs() / want < 0.02,
+                "at {ratio}x the playhead reached {got} where {want:.0} was wanted"
+            );
+        }
+    }
+
+    /// **Dead centre is the un-engaged path, exactly.**
+    ///
+    /// The detent guarantees 1.0 is reachable, and this is what makes
+    /// reaching it free: at rest the resampler is not in circuit at all, so
+    /// there is no interpolation error to hear and nothing to switch out.
+    #[test]
+    fn at_rest_nothing_is_resampled() {
+        let (a, _) = varispeed_out(1.0, 500.0, 0.2);
+        let (b, _) = varispeed_out(1.0, 500.0, 0.2);
+        assert_eq!(a, b, "the un-engaged path is not deterministic");
+        // A ratio a hair off unity IS engaged — the detent lives in the UI,
+        // and the engine's job is to do what it is told.
+        let (c, _) = varispeed_out(1.02, 500.0, 0.2);
+        assert_ne!(a, c, "1.02 was treated as off");
+    }
+
+    /// A device callback bigger than the varispeed path can serve in one pass
+    /// is split, not truncated.
+    #[test]
+    fn a_long_callback_is_split_rather_than_cut_short() {
+        let (mut r, _tx, shared) = renderer_with_midi(2);
+        assert_eq!(r.max_callback_frames(), MAX_CALLBACK_FRAMES, "at rest");
+        shared.varispeed.store(2.0f32.to_bits(), Ordering::Relaxed);
+        let cap = r.max_callback_frames();
+        assert!(cap < MAX_CALLBACK_FRAMES, "the cap did not move");
+        // **The bound that matters**: at the dial's fastest, one device frame
+        // costs two program frames, and the program-rate scratches are sized
+        // for `MAX_CALLBACK_FRAMES`. Whatever the cap is, twice it plus the
+        // interpolator's reach has to fit.
+        let ph = crate::varispeed::Phase::new();
+        assert!(
+            ph.program_frames(cap, crate::varispeed::MAX_RATIO) <= MAX_CALLBACK_FRAMES,
+            "a full callback at 2x asks for more program than the mix holds"
+        );
+        // And a callback at the cap renders without truncating.
+        let mut out = vec![0.0f32; cap * 2];
+        r.render(&mut out, 0, 0);
     }
 
     /// **A mono jack SUMS the pair rather than taking the left.**

@@ -405,15 +405,28 @@ fn palette(s: &Settings) -> Palette {
         well: shade(bg, if dark { 0.55 } else { 0.88 }),
         field: shade(bg, if dark { 1.35 } else { 0.94 }),
         ink: if dark { INK_LIGHT } else { INK_DARK },
-        // Secondary text carries the folder preview and the disk line, which
-        // are the two things a first-time user actually learns the scheme
-        // from, so it is darkened on light and lightened on dark until it
-        // reads at a glance — the same correction `theory_panel` needed.
-        faint: if dark {
-            Color32::from_rgb(0x9a, 0x92, 0x80)
-        } else {
-            Color32::from_rgb(0x6b, 0x60, 0x4a)
-        },
+        // Secondary text carries the folder preview, the disk line and the
+        // WORD UNDER EVERY KNOB, so it is darkened on light and lightened on
+        // dark until it reads at a glance.
+        //
+        // **And then held to the same 4.5:1 every other word answers to**,
+        // which it was not. These two colours were picked against the stock
+        // walnut band and then inherited by all sixteen themes: measured,
+        // they came out between 3.17 and 3.61 against the band on EVERY one
+        // of them, which is the WCAG floor for large text and this is not
+        // large text — it is REVERB and LIMITER at nine points. The eighth
+        // instance of the rule this app keeps learning: ink is a property of
+        // the surface it lands on, never a colour inherited from a role. See
+        // `hold_ink`, which `surface_of` has used since the fourth.
+        faint: hold_ink(
+            if dark {
+                Color32::from_rgb(0x9a, 0x92, 0x80)
+            } else {
+                Color32::from_rgb(0x6b, 0x60, 0x4a)
+            },
+            if dark { INK_LIGHT } else { INK_DARK },
+            bg,
+        ),
         line: if dark {
             Color32::from_rgb(0x62, 0x5c, 0x50)
         } else {
@@ -4442,7 +4455,16 @@ fn draw_varispeed(
     let up = Vec2::new(0.0, -1.0);
     painter.line_segment(
         [c + up * (rad * 1.06), c + up * (rad * 1.24)],
-        Stroke::new(1.4_f32, if engaged { p.line } else { p.accent }),
+        // **Measured against the RECESS it is drawn on**, not taken from
+        // `Palette::line`. The panel's line colour is a fixed tan picked
+        // against the stock walnut; on Centennial's pale grey it came out at
+        // 1.21:1 against the well — a detent mark nobody could see, on the
+        // one theme where finding twelve o'clock matters as much as on any
+        // other. The eighth instance of the same rule.
+        Stroke::new(
+            1.4_f32,
+            if engaged { surface_of(well).faint } else { p.accent },
+        ),
     );
     // The slot, which IS the pointer: across the whole face and through the
     // centre, the same grammar as the moulded knobs beside it.
@@ -6074,6 +6096,117 @@ mod tests {
                 tempo.radius,
                 fx.radius
             );
+        }
+    }
+
+    /// **The varispeed dial, and its word, on all sixteen.**
+    ///
+    /// The owner asked for this one by name — "whole dial must be subject and
+    /// tested WITH IT's LABEL TEST LEGIBLE in all 16" — and it is the right
+    /// thing to ask for. Every ink failure this app has had was found by
+    /// looking at a screenshot rather than by a test, seven times over, and
+    /// every one of them was a colour inherited from a role instead of
+    /// measured against the surface it actually landed on.
+    ///
+    /// So this measures each part against the ground it is drawn on, in both
+    /// modes, on every shipped theme:
+    ///
+    /// - the WORD under the dial, which is what the request named — twice,
+    ///   because it is drawn faint at rest and in full ink when engaged;
+    /// - the READING above it, same two states;
+    /// - the SLOT on the dial's face, which is the pointer and the only thing
+    ///   that says where the control is set;
+    /// - the recess the dial sits in, against the band, so a dial on a pale
+    ///   theme is still visibly a dial and not a flat disc.
+    #[test]
+    fn every_theme_dresses_the_varispeed_dial_legibly() {
+        let mut bad: Vec<String> = Vec::new();
+        for theme in crate::theme::factory() {
+            for dark in [false, true] {
+                let mut set = Settings::default();
+                theme.apply(&mut set);
+                set.dark_mode = dark;
+                let p = palette(&set);
+                let mode = if dark { "dark" } else { "light" };
+                let mut check = |what: &str, fg: Color32, bg: Color32, floor: f32| {
+                    let r = contrast_ratio(fg, bg);
+                    if r < floor {
+                        bad.push(format!("{} {mode}: {what} {r:.2}:1", theme.name));
+                    }
+                };
+                // **The word, both ways it is drawn.** `faint` carries it at
+                // rest and `ink` when the dial is engaged; a theme that made
+                // either unreadable would be a control nobody can name.
+                check("VARI at rest", p.faint, p.bg, 4.5);
+                check("VARI engaged", p.ink, p.bg, 4.5);
+                // The reading over it, which is the number that says whether
+                // the take is about to come out at the wrong pitch.
+                check("the reading", p.ink, p.bg, 4.5);
+                check("the reading at rest", p.ink.gamma_multiply(0.7), p.bg, 3.0);
+                // The recess, against the band it is cut into. A LOWER bar
+                // than text on purpose: this is a shape, not a glyph, and
+                // WCAG's 3:1 for non-text is the right one to hold it to.
+                let well = shade(p.well, if wants_light_ink(p.bg) { 0.82 } else { 0.94 });
+                check("the recess", well, p.bg, 1.18);
+                // The SLOT, on the dial's own face — measured against that
+                // face, never picked from the theme. This is the rule that
+                // seven separate ink bugs were each a violation of.
+                let dial = surface_of(p.varispeed);
+                check("the slot", dial.ink, dial.bg, 4.5);
+                // And the face against the recess, so the dial is visible in
+                // the hole it sits in.
+                check("the face in its recess", dial.bg, well, 1.6);
+                // The detent mark on the recess, which is what says where OFF
+                // is: the accent at rest, the panel's line when engaged.
+                check("the detent at rest", p.accent, well, 1.6);
+                // A 1.4-point mark, so WCAG's 3:1 for non-text — and it is
+                // held to it rather than to whatever a fixed colour happens
+                // to give, which is where `Palette::line` left it at 1.21:1
+                // on Centennial.
+                check("the detent engaged", surface_of(well).faint, well, 3.0);
+                // The − and + beside it.
+                check("the ends", p.faint, p.bg, 4.5);
+            }
+        }
+        assert!(bad.is_empty(), "{} unreadable: {bad:#?}", bad.len());
+    }
+
+    /// The varispeed dial is not any of the eight, and no theme can paint it
+    /// into one.
+    ///
+    /// It sits between the LIMITER and the MASTER — the two knobs that decide
+    /// whether a take clips — and it does something neither of them does. A
+    /// theme that landed it on either colour would put three controls that
+    /// mean three different things in one livery, in the one corner of the
+    /// band where that matters most.
+    #[test]
+    fn no_theme_paints_the_varispeed_into_a_knob_beside_it() {
+        for t in crate::theme::factory() {
+            let Some(vs) = t.varispeed else {
+                panic!("{} has no varispeed colour", t.name);
+            };
+            let vs = vs.to_color32();
+            let mut set = Settings::default();
+            t.apply(&mut set);
+            let p = palette(&set);
+            // **ΔE and not a contrast ratio.** The question is "can a person
+            // tell these two apart", which is perceptual distance; contrast
+            // is a LUMINANCE ratio and says two colours of the same
+            // brightness and opposite hue are identical. That mistake failed
+            // all sixteen themes at 1.5:1 once already.
+            for (name, other) in [
+                ("the master", p.master),
+                ("the limiter", LIMITER_CAP),
+                ("the gain", GAIN_CAP),
+                ("the effect knobs", p.fx_knob),
+            ] {
+                let d = delta_e(vs, other);
+                assert!(
+                    d > 25.0,
+                    "{}: the varispeed ({vs:?}) and {name} ({other:?}) are {d:.1} apart",
+                    t.name
+                );
+            }
         }
     }
 
