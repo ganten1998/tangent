@@ -83,7 +83,69 @@ const V5_MUSICAL_TIME: u64 = 5;
 /// the keys that belong to a newer build, and
 /// `a_clip_knows_which_of_its_keys_are_its_own` walks a fully-populated clip
 /// through a round trip to prove nothing was left off it.
-const CLIP_KEYS: [&str; 13] = [
+/// Whether a clip key's value is the SHAPE this build reads.
+///
+/// Absent is readable — there is nothing to lose. Present and of another
+/// type is not: see the call site.
+fn clip_key_is_readable(key: &str, value: Option<&Value>) -> bool {
+    let Some(v) = value else {
+        return true;
+    };
+    match key {
+        "kind" | "path" | "name" | "anchor" | "stretch_mode" => v.is_string(),
+        "lane" | "id" => v.is_number(),
+        "start_s" | "offset_s" | "len_s" | "fade_in_s" | "fade_out_s" | "stretch" => {
+            v.is_number()
+        }
+        "follow_tempo" => v.is_boolean(),
+        "notes" => v.is_array(),
+        // A name not in the list is not a key this build claims, so nothing
+        // is about to consume it either way.
+        _ => true,
+    }
+}
+
+/// The stretch algorithms a clip can name, and what a menu calls them.
+///
+/// **Keys and labels only.** The algorithms live in the binary with the DSP;
+/// this crate holds what somebody chose, exactly as it holds the effect
+/// parameters. `stretch::MODE_KEYS` asserts the two lists agree, so a mode
+/// added on one side is a compile error on the other rather than a menu row
+/// that does nothing.
+///
+/// The empty string means the same as `"auto"` — a clip that has never been
+/// told which algorithm to use.
+pub const STRETCH_MODES: [(&str, &str); 4] = [
+    ("auto", "Stretch: Auto"),
+    ("tape", "Stretch: Tape"),
+    ("rhythmic", "Stretch: Rhythmic"),
+    ("tonal", "Stretch: Tonal"),
+];
+
+/// The mode after `key`, wrapping. An unknown key steps to the first.
+pub fn next_stretch_mode(key: &str) -> &'static str {
+    let at = STRETCH_MODES
+        .iter()
+        .position(|(k, _)| *k == key)
+        .unwrap_or(0);
+    STRETCH_MODES[(at + 1) % STRETCH_MODES.len()].0
+}
+
+/// What a menu calls `key`. An unknown one reads as auto, which is what the
+/// binary does with it.
+pub fn stretch_mode_label(key: &str) -> &'static str {
+    STRETCH_MODES
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map_or(STRETCH_MODES[0].1, |(_, l)| *l)
+}
+
+/// How far a clip may be time-stretched. Mirrors the binary's own
+/// `stretch::RATIO`; it is written down here because the document clamps on
+/// read and `ivory-ui` cannot name a constant that lives with the DSP.
+pub const STRETCH_RATIO: (f64, f64) = (0.25, 4.0);
+
+const CLIP_KEYS: [&str; 15] = [
     "kind",
     "lane",
     "path",
@@ -97,6 +159,8 @@ const CLIP_KEYS: [&str; 13] = [
     "fade_out_s",
     "anchor",
     "follow_tempo",
+    "stretch",
+    "stretch_mode",
 ];
 
 /// What a clip is made of.
@@ -217,6 +281,23 @@ pub struct ArrClip {
     /// is opt-in per clip rather than a property of the anchor — moving a
     /// take to keep its bar is cheap and lossless, stretching it is neither.
     pub follow_tempo: bool,
+    /// How much longer this clip plays than the file it came from, with the
+    /// PITCH KEPT. 1.0 is untouched, and untouched is the fast path all the
+    /// way down: the host hands the engine the decoded file itself.
+    ///
+    /// **The opposite of the varispeed dial**, which moves the speed and
+    /// lets the pitch follow. See the binary's `stretch` module for the
+    /// three algorithms and for why the stretched audio is rendered once
+    /// rather than streamed.
+    pub stretch: f64,
+    /// Which algorithm, by its key — `"auto"`, `"tape"`, `"rhythmic"`,
+    /// `"tonal"`. Empty means auto.
+    ///
+    /// **A string and not an enum**, because `ivory-ui` cannot name a type
+    /// that lives in the binary with the DSP. The same bargain the effect
+    /// parameters make: this crate holds what somebody chose and the binary
+    /// knows what it means.
+    pub stretch_mode: String,
     /// Keys THIS build does not know, kept so a newer build's clip survives
     /// being opened here.
     ///
@@ -663,6 +744,26 @@ impl Arrangement {
                         .get("follow_tempo")
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
+                    // **Clamped on read**, like every gain: this multiplies
+                    // into a buffer length, and a NaN or a zero there is an
+                    // allocation of nothing or of everything.
+                    stretch: c
+                        .get("stretch")
+                        .and_then(Value::as_f64)
+                        .filter(|v| {
+                            v.is_finite()
+                                && (STRETCH_RATIO.0..=STRETCH_RATIO.1).contains(v)
+                        })
+                        .unwrap_or(1.0),
+                    // Kept as whatever string is there. An algorithm this
+                    // build does not know reads as auto — see the binary's
+                    // `Mode::from_key` — which is the right answer and not
+                    // an error.
+                    stretch_mode: c
+                        .get("stretch_mode")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
                     // **Whatever is left is somebody else's.** Take the keys
                     // this build understands out of the object and keep the
                     // remainder verbatim; `shift_remove` and not `remove`,
@@ -679,6 +780,26 @@ impl Arrangement {
                     // is what catches that.
                     extra: {
                         for known in CLIP_KEYS {
+                            // **A key we own but cannot READ stays where it
+                            // is.**
+                            //
+                            // Owning a name should not mean eating a value.
+                            // A newer build that writes `stretch` as an
+                            // object rather than a number is exactly the
+                            // case `a_newer_builds_clip_keys_survive`
+                            // describes, and consuming it into a field that
+                            // then falls back to its default is the silent
+                            // data loss `extra` exists to stop — the version
+                            // of it that is hardest to see, because the name
+                            // is one this build recognises.
+                            //
+                            // "Readable" is the type the reader above asked
+                            // for. A number that is out of range IS readable
+                            // and is clamped; that is a value we understood
+                            // and disagreed with, which is ours to own.
+                            if !clip_key_is_readable(known, c.get(known)) {
+                                continue;
+                            }
                             c.shift_remove(known);
                         }
                         c
@@ -909,6 +1030,20 @@ impl Arrangement {
                         if c.follow_tempo {
                             m.insert("follow_tempo".into(), Value::Bool(true));
                         }
+                        // Written only when there is something to say, so a
+                        // clip nobody has stretched keeps its byte-for-byte
+                        // shape — the settings file's own rule.
+                        if (c.stretch - 1.0).abs() > 1.0e-9 {
+                            if let Some(n) = serde_json::Number::from_f64(c.stretch) {
+                                m.insert("stretch".into(), Value::Number(n));
+                            }
+                        }
+                        if !c.stretch_mode.is_empty() && c.stretch_mode != "auto" {
+                            m.insert(
+                                "stretch_mode".into(),
+                                Value::String(c.stretch_mode.clone()),
+                            );
+                        }
                         for (key, v) in [
                             ("start_s", c.start_s),
                             ("offset_s", c.offset_s),
@@ -1070,6 +1205,8 @@ mod tests {
             id: 0,
             anchor: Anchor::Time,
             follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
             extra: Map::new(),
         }
     }
@@ -1178,6 +1315,45 @@ mod tests {
             out.contains("groove_map") && out.contains("121"),
             "a newer build's key was stripped: {out}"
         );
+    }
+
+    /// A clip's stretch survives the trip, and nonsense in the file does
+    /// not reach the DSP.
+    #[test]
+    fn a_stretched_clip_round_trips_and_a_bad_ratio_does_not() {
+        let doc = |body: &str| {
+            Arrangement::from_json(&format!(
+                r#"{{"arrangement_version": 9, "clips": [
+                    {{"lane": 1, "path": "s.wav", "start_s": 0.0 {body}}}]}}"#
+            ))
+        };
+        let a = doc(r#", "stretch": 1.5, "stretch_mode": "rhythmic""#);
+        assert!((a.clips[0].stretch - 1.5).abs() < 1e-9);
+        assert_eq!(a.clips[0].stretch_mode, "rhythmic");
+        let back = Arrangement::from_json(&a.to_json());
+        assert!((back.clips[0].stretch - 1.5).abs() < 1e-9);
+        assert_eq!(back.clips[0].stretch_mode, "rhythmic");
+
+        // **Clamped, and the clamp is a real one**: this number multiplies
+        // into a buffer length, so a zero is an allocation of nothing and a
+        // million is an allocation of everything.
+        for bad in ["0", "-4", "1e9"] {
+            let c = doc(&format!(r#", "stretch": {bad}"#));
+            assert!(
+                (c.clips[0].stretch - 1.0).abs() < 1e-9,
+                "{bad} came through as {}",
+                c.clips[0].stretch
+            );
+        }
+        // A mode this build has never heard of is kept and reads as auto
+        // downstream — not an error, and not a reason to lose the string.
+        let odd = doc(r#", "stretch_mode": "spectral-9""#);
+        assert_eq!(odd.clips[0].stretch_mode, "spectral-9");
+        assert!(odd.to_json().contains("spectral-9"));
+        // A clip nobody stretched writes neither key, so an untouched song
+        // keeps its byte-for-byte shape.
+        let plain = doc("");
+        assert!(!plain.to_json().contains("stretch"), "{}", plain.to_json());
     }
 
     /// A newer build's keys ON A CLIP survive too — the half of the bargain
@@ -1342,6 +1518,8 @@ mod tests {
             kind: ClipKind::Midi,
             anchor: Anchor::Beat,
             follow_tempo: true,
+            stretch: 1.0,
+            stretch_mode: String::new(),
             ..a_clip(1, "", 4.0)
         });
         a.add_clip(a_clip(2, "/x/take.wav", 8.0));
@@ -1409,6 +1587,8 @@ mod tests {
             id: 0,
             anchor: Anchor::Beat,
             follow_tempo: true,
+            stretch: 0.75,
+            stretch_mode: "tonal".into(),
             extra: Map::new(),
         });
         let Ok(Value::Object(doc)) = serde_json::from_str::<Value>(&a.to_json()) else {

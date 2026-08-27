@@ -23,6 +23,7 @@ mod dx7;
 mod effects;
 mod loudness;
 mod varispeed;
+mod stretch;
 /// The monitor engine: the audio OUTPUT stream that plays a hosted VST3
 /// instrument and the metronome. Absent from a Minimal build for the same
 /// reason `record` is (docs/RECORDER-PLAN.md §12a).

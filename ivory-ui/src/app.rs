@@ -1186,6 +1186,8 @@ fn clip_at(rel_path: &str, lane: usize, start_s: f64) -> crate::arrangement::Arr
         extra: Default::default(),
         anchor: Default::default(),
         follow_tempo: false,
+        stretch: 1.0,
+        stretch_mode: String::new(),
     }
 }
 
@@ -2952,6 +2954,8 @@ impl IvoryApp {
             extra: Default::default(),
             anchor: Default::default(),
             follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
         });
         let take = arr.add_clip(crate::arrangement::ArrClip {
             kind: crate::arrangement::ClipKind::Audio,
@@ -2968,6 +2972,8 @@ impl IvoryApp {
             extra: Default::default(),
             anchor: Default::default(),
             follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
         });
         let solo = arr.add_clip(crate::arrangement::ArrClip {
             kind: crate::arrangement::ClipKind::Audio,
@@ -2984,6 +2990,8 @@ impl IvoryApp {
             extra: Default::default(),
             anchor: Default::default(),
             follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
         });
         // And a MIDI item with a phrase in it, so the note miniature is in
         // the picture.
@@ -3016,6 +3024,8 @@ impl IvoryApp {
             extra: Default::default(),
             anchor: Default::default(),
             follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
         });
         self.arrangement = arr;
         // **A tempo map and a signature change, for the row to have
@@ -5168,6 +5178,8 @@ impl IvoryApp {
             extra: Default::default(),
             anchor: Default::default(),
             follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
         });
         let _ = doc;
         self.arr_save_edits();
@@ -5306,6 +5318,8 @@ impl IvoryApp {
                 extra: Default::default(),
                 anchor: Default::default(),
                 follow_tempo: false,
+                stretch: 1.0,
+                stretch_mode: String::new(),
             });
             added = Some(id);
         }
@@ -7439,28 +7453,118 @@ impl IvoryApp {
     /// both — starts rebased to the earliest, notes and paths intact.
     /// The clip menu's two row rects, from where it hangs. Fixed geometry:
     /// the same math draws it and hit-tests it, so they cannot disagree.
-    fn clip_menu_rows(at: Pos2) -> [Rect; 2] {
-        const W: f32 = 118.0;
+    fn clip_menu_rows(at: Pos2, n: usize) -> Vec<Rect> {
+        // Wider than it was: the stretch rows carry a word and a value.
+        const W: f32 = 168.0;
         const ROW: f32 = 24.0;
-        [0, 1].map(|i| {
-            Rect::from_min_size(
-                Pos2::new(at.x, at.y + ROW * i as f32),
-                egui::vec2(W, ROW),
-            )
-        })
+        (0..n)
+            .map(|i| {
+                Rect::from_min_size(
+                    Pos2::new(at.x, at.y + ROW * i as f32),
+                    egui::vec2(W, ROW),
+                )
+            })
+            .collect()
+    }
+
+    /// Step this clip's stretch algorithm to the next one.
+    ///
+    /// **The whole SET when the clip is in one**, the rule every other clip
+    /// action here follows: a marquee over eight takes and a menu on one of
+    /// them means all eight.
+    fn arr_cycle_stretch_mode(&mut self, id: u64) {
+        let now = self
+            .arrangement
+            .clips
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| c.stretch_mode.clone())
+            .unwrap_or_default();
+        let next = crate::arrangement::next_stretch_mode(&now);
+        let touched = self.arr_acting_on(id);
+        for c in &mut self.arrangement.clips {
+            if touched.contains(&c.id) && c.kind == crate::arrangement::ClipKind::Audio {
+                c.stretch_mode = next.to_owned();
+            }
+        }
+        self.clips_dirty = true;
+        self.arr_save_edits();
+    }
+
+    /// Put a clip back to its own speed.
+    fn arr_reset_stretch(&mut self, id: u64) {
+        let touched = self.arr_acting_on(id);
+        for c in &mut self.arrangement.clips {
+            if !touched.contains(&c.id) || c.kind != crate::arrangement::ClipKind::Audio {
+                continue;
+            }
+            // **The length goes back with the ratio.** The clip is playing a
+            // file `stretch` times longer than the one on disk; putting the
+            // ratio back without the length would leave it playing that many
+            // seconds of a file that is no longer that long.
+            let k = c.stretch;
+            if k > 0.0 {
+                c.len_s /= k;
+                c.offset_s /= k;
+                c.fade_in_s /= k;
+                c.fade_out_s /= k;
+            }
+            c.stretch = 1.0;
+        }
+        self.clips_dirty = true;
+        self.arr_save_edits();
+    }
+
+    /// Which clips a menu on `id` acts on: the selected set if it is in one,
+    /// and otherwise just it.
+    fn arr_acting_on(&self, id: u64) -> Vec<u64> {
+        if self.arr_multi.contains(&id) {
+            self.arr_multi.iter().copied().collect()
+        } else {
+            vec![id]
+        }
+    }
+
+    /// What the clip menu offers for `id`.
+    ///
+    /// **Two rows for anything, four for a stretched audio clip.** The two
+    /// stretch rows are not offered on a clip nobody has stretched: a menu
+    /// that lists an algorithm for a clip playing at its own speed is a menu
+    /// asking a question that has no answer.
+    fn clip_menu_labels(&self, id: u64) -> Vec<String> {
+        let mut out = vec!["Delete take".to_owned(), "Copy take".to_owned()];
+        let stretched = self.arrangement.clips.iter().find(|c| {
+            c.id == id
+                && c.kind == crate::arrangement::ClipKind::Audio
+                && (c.stretch - 1.0).abs() > 1.0e-9
+        });
+        if let Some(c) = stretched {
+            out.push(
+                crate::arrangement::stretch_mode_label(&c.stretch_mode).to_owned(),
+            );
+            out.push(format!("Reset stretch ({:.0}%)", c.stretch * 100.0));
+        }
+        out
     }
 
     /// Draw the clip menu — or the bay's FX menu — over the arrangement.
     fn draw_clip_menu(&self, painter: &egui::Painter) {
-        let (at, labels) = if let Some((_, at)) = self.arr_clip_menu {
-            (at, ["Delete take", "Copy take"])
+        let (at, labels) = if let Some((id, at)) = self.arr_clip_menu {
+            (at, self.clip_menu_labels(id))
         } else if let Some((.., at)) = self.arr_fx_menu {
-            (at, ["Delete FX", "Replace FX"])
+            (at, vec!["Delete FX".to_owned(), "Replace FX".to_owned()])
         } else {
             return;
         };
-        let rows = Self::clip_menu_rows(at);
-        let frame = rows[0].union(rows[1]).expand(1.0);
+        let rows = Self::clip_menu_rows(at, labels.len());
+        let Some(frame) = rows
+            .iter()
+            .copied()
+            .reduce(|a, b| a.union(b))
+            .map(|r| r.expand(1.0))
+        else {
+            return;
+        };
         painter.rect_filled(frame, 3.0, egui::Color32::from_rgb(0xEE, 0xE6, 0xCE));
         painter.rect_stroke(
             frame,
@@ -7468,7 +7572,7 @@ impl IvoryApp {
             egui::Stroke::new(1.0, egui::Color32::from_rgb(0x24, 0x20, 0x1A)),
             egui::StrokeKind::Inside,
         );
-        for (r, label) in rows.iter().zip(labels) {
+        for (r, label) in rows.iter().zip(&labels) {
             painter.text(
                 Pos2::new(r.left() + 8.0, r.center().y),
                 egui::Align2::LEFT_CENTER,
@@ -7642,6 +7746,8 @@ impl IvoryApp {
                 extra: Default::default(),
                 anchor: Default::default(),
                 follow_tempo: false,
+                stretch: 1.0,
+                stretch_mode: String::new(),
             });
         }
         if tails.is_empty() {
@@ -10555,7 +10661,7 @@ impl IvoryApp {
             });
             if pressed || sec {
                 self.arr_fx_menu = None;
-                let rows = Self::clip_menu_rows(at);
+                let rows = Self::clip_menu_rows(at, 2);
                 match pointer {
                     Some(p) if pressed && rows[0].contains(p) => {
                         self.set_insert(lane, bay, None);
@@ -10581,7 +10687,7 @@ impl IvoryApp {
             });
             if pressed || sec {
                 self.arr_clip_menu = None;
-                let rows = Self::clip_menu_rows(at);
+                let rows = Self::clip_menu_rows(at, self.clip_menu_labels(id).len());
                 match pointer {
                     // **A menu on a member of the selected set acts on the
                     // SET** — the same rule as grabbing a clip body. The
@@ -10601,6 +10707,18 @@ impl IvoryApp {
                         }
                         self.arr_selected = Some(id);
                         self.arr_copy();
+                    }
+                    // **The algorithm, cycled.** One press, one step — the
+                    // gridbox's and the clef's gesture, and there is no room
+                    // in a menu row for four of them.
+                    Some(p) if pressed && rows.get(2).is_some_and(|r| r.contains(p)) => {
+                        self.arr_cycle_stretch_mode(id);
+                    }
+                    // ...and the way back to unstretched, which is the one
+                    // thing a dragged edge cannot reach: the ratio compounds,
+                    // so dragging back is a second stretch and not an undo.
+                    Some(p) if pressed && rows.get(3).is_some_and(|r| r.contains(p)) => {
+                        self.arr_reset_stretch(id);
                     }
                     _ => {
                         // Dismissed: the press is SPENT, the same rule as
@@ -11221,23 +11339,27 @@ impl IvoryApp {
                         let edge_left = matches!(hit, Some(A::ClipLeft(_)));
                         let on_edge =
                             matches!(hit, Some(A::ClipLeft(_)) | Some(A::ClipRight(_)));
-                        let grabbed_midi = self.arrangement.clips.iter().any(|c| {
-                            c.id == id && c.kind == crate::arrangement::ClipKind::Midi
-                        });
-                        if shift && on_edge && grabbed_midi {
-                            // **Shift from a MIDI clip's edge STRETCHES.**
-                            // The set is the multi-selection's MIDI clips
-                            // (the grabbed one included); audio cannot
-                            // stretch and stays out. Snapshot at the press
-                            // — every tick scales from these originals.
+                        if shift && on_edge {
+                            // **Shift from a clip's edge STRETCHES**, MIDI
+                            // and audio alike.
+                            //
+                            // Audio used to be excluded — "audio cannot
+                            // stretch", which was true of this app and of no
+                            // other. It can now: `crate::stretch` renders a
+                            // stretched copy and the clip carries the ratio.
+                            // The arithmetic below is identical for both,
+                            // which is what `arr_stretch` relies on; what
+                            // differs is that a MIDI clip re-times its notes
+                            // exactly and an audio clip goes through an
+                            // algorithm.
+                            //
+                            // Snapshot at the press — every tick scales from
+                            // these originals.
                             let orig: Vec<crate::arrangement::ArrClip> = self
                                 .arrangement
                                 .clips
                                 .iter()
-                                .filter(|c| {
-                                    (c.id == id || self.arr_multi.contains(&c.id))
-                                        && c.kind == crate::arrangement::ClipKind::Midi
-                                })
+                                .filter(|c| c.id == id || self.arr_multi.contains(&c.id))
                                 .cloned()
                                 .collect();
                             let anchor = if edge_left {
@@ -11617,6 +11739,8 @@ impl IvoryApp {
                         extra: Default::default(),
                         anchor: Default::default(),
                         follow_tempo: false,
+                        stretch: 1.0,
+                        stretch_mode: String::new(),
                     });
                     self.arr_save_edits();
                 }
@@ -13311,6 +13435,23 @@ impl IvoryApp {
             for (n, n0) in c.notes.iter_mut().zip(o.notes.iter()) {
                 n.at_s = n0.at_s * k;
                 n.dur_s = (n0.dur_s * k).max(0.01);
+            }
+            // **Audio carries the ratio; MIDI does not need to.**
+            //
+            // A MIDI clip's notes have just been re-timed exactly, and
+            // that IS the stretch. Audio has no notes to move: the file is
+            // the length it is, so the clip records how much longer it
+            // should PLAY and the host renders a copy — see
+            // `crate::stretch`. Multiplied rather than assigned, so
+            // stretching an already-stretched clip composes instead of
+            // throwing the first stretch away.
+            if c.kind == crate::arrangement::ClipKind::Audio {
+                c.stretch = (o.stretch * k)
+                    .clamp(crate::arrangement::STRETCH_RATIO.0, crate::arrangement::STRETCH_RATIO.1);
+                // **The offset and the fades are in the STRETCHED file's
+                // seconds**, which the loop above has already scaled them
+                // into: the host hands the engine a file `k` times longer,
+                // so a trim `k` times further in lands on the same audio.
             }
         }
         self.clips_dirty = true;
@@ -19083,6 +19224,8 @@ mod tests {
             extra: Default::default(),
             anchor: Default::default(),
             follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
         });
         app.open_midi_editor(id);
         app.me_select_all();
@@ -19205,6 +19348,8 @@ mod tests {
             extra: Default::default(),
             anchor: Default::default(),
             follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
         });
         app.add_recorded_clips(vec![crate::arrangement::RecordedClip {
             lane: 0,
@@ -19261,6 +19406,8 @@ mod tests {
             extra: Default::default(),
             anchor: Default::default(),
             follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
         });
         app.add_recorded_clips(vec![crate::arrangement::RecordedClip {
             lane: 0,
@@ -19304,6 +19451,8 @@ mod tests {
             extra: Default::default(),
             anchor: Default::default(),
             follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
         };
         // One spanning clip 0..20, one swallowed 22..24, one tail-side 25..35.
         app.arrangement.add_clip(clip(1, 0.0, 20.0));
@@ -19486,6 +19635,8 @@ mod tests {
             extra: Default::default(),
             anchor: Default::default(),
             follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
         });
         app.open_midi_editor(id);
         assert!(app.midi_edit.is_some(), "the editor did not open");
@@ -21412,6 +21563,8 @@ mod tests {
             extra: Default::default(),
             anchor: Default::default(),
             follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
         });
         let id = app.arrangement.clips[0].id;
         let _ = run_frame(&ctx, &mut app);
@@ -22808,6 +22961,8 @@ mod tests {
             extra: Default::default(),
             anchor: Default::default(),
             follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
         });
         app.arrangement.add_clip(ArrClip {
             kind: ClipKind::Audio,
@@ -22824,6 +22979,8 @@ mod tests {
             extra: Default::default(),
             anchor: Default::default(),
             follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
         });
         app.apply_recorder_hit(recorder_panel::Hit::SetTempo(180.0));
         let r = 120.0 / 180.0;
@@ -22874,6 +23031,8 @@ mod tests {
             extra: Default::default(),
             anchor: Default::default(),
             follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
         });
         let id = app.arrangement.clips[0].id;
         app.open_midi_editor(id);
