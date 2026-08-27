@@ -226,6 +226,33 @@ pub struct IvoryApp {
     /// A size the user asked for that the host has not been told about yet.
     /// Only ever set when the host owns the window.
     pending_resize: Option<Vec2>,
+    /// Which lanes have their automation row open, and which parameter each
+    /// is showing.
+    ///
+    /// **Session state and not settings**, deliberately: which curve you are
+    /// looking at is where you are in a job, not a preference, and a project
+    /// that reopened with four rows unfolded because of what somebody did
+    /// last Tuesday would be the same species of surprise as a window that
+    /// remembers a tiling manager's geometry.
+    arr_auto_open: std::collections::HashSet<usize>,
+    arr_auto_params: std::collections::HashMap<usize, crate::automation::AutoParam>,
+    /// The point under the pointer or being dragged: `(lane, index)`.
+    arr_auto_hot: Option<(usize, usize)>,
+    /// Each lane's automation mode. Absent is [`crate::automation::AutoMode`]'s
+    /// default, Read. Session-only — see the type, where the reason is a
+    /// safety one.
+    arr_auto_modes: std::collections::HashMap<usize, crate::automation::AutoMode>,
+    /// Lanes a Latch has armed. Cleared when the transport stops, which is
+    /// what makes Latch different from Write.
+    arr_auto_latched: std::collections::HashSet<usize>,
+    /// The last point WRITTEN per `(lane, param)`, so a move at sixty frames
+    /// a second does not lay down sixty points a second. See
+    /// `arr_write_automation`.
+    arr_auto_last: std::collections::HashMap<(usize, crate::automation::AutoParam), (f64, f64)>,
+    /// Whether the transport was rolling last frame, so the app can notice
+    /// it STOP. The host writes the recorder's state straight into the app,
+    /// so there is no call to hang this on — the edge is looked for instead.
+    arr_was_rolling: bool,
     /// A reset the confirmation said yes to, waiting for the frame loop.
     ///
     /// Deferred rather than done on the spot because
@@ -914,6 +941,11 @@ struct Grab {
 /// never makes the thing jump to the pointer.
 #[derive(Debug, Clone, Copy)]
 enum ArrDrag {
+    /// An automation point being carried. `(lane, index)` — the index is
+    /// re-derived after every move, because moving a point past its
+    /// neighbour re-sorts the curve and the old index would then name
+    /// somebody else's point.
+    AutoPoint(usize, usize),
     /// The right button's selection band over the lanes.
     ClipBand,
     /// A track being carried to another row, by its number.
@@ -1642,6 +1674,13 @@ impl IvoryApp {
             last_sent_size: None,
             min_sent: None,
             a11y_on: None,
+            arr_auto_open: std::collections::HashSet::new(),
+            arr_auto_params: std::collections::HashMap::new(),
+            arr_auto_hot: None,
+            arr_auto_modes: std::collections::HashMap::new(),
+            arr_auto_latched: std::collections::HashSet::new(),
+            arr_auto_last: std::collections::HashMap::new(),
+            arr_was_rolling: false,
             // The window opens at a size this app chose — see `main.rs` —
             // so the grace runs from launch.
             size_asked_at: Some(Instant::now()),
@@ -2568,6 +2607,12 @@ impl IvoryApp {
         use crate::mixer_panel::Hit as H;
         use crate::recorder::Strip;
         let v = value.clamp(0.0, 1.0);
+        // **The one place a control's value arrives, so the one place a
+        // write can be caught.** Every road to a fader, a pan or a send —
+        // mouse, keyboard, the arrangement's own header — comes through
+        // here, which is what makes recording a pass a hook rather than a
+        // gesture reimplemented three times.
+        self.record_automation_move(hit, v);
         let gain = f64::from(recorder::fader_to_gain(v));
         match hit {
             // The button is a door, not a value: it opens the window and the
@@ -6616,6 +6661,283 @@ impl IvoryApp {
         }
     }
 
+    // ── automation lanes ───────────────────────────────────────────────────
+
+    /// Which parameter a lane's automation row is showing.
+    fn arr_auto_param(&self, lane: usize) -> crate::automation::AutoParam {
+        self.arr_auto_params
+            .get(&lane)
+            .copied()
+            .unwrap_or(crate::automation::AutoParam::Gain)
+    }
+
+    /// Show or hide a lane's automation row.
+    fn arr_toggle_automation(&mut self, lane: usize) {
+        if !self.arr_auto_open.remove(&lane) {
+            self.arr_auto_open.insert(lane);
+        }
+        self.arr_auto_hot = None;
+    }
+
+    /// Step to the next parameter on this lane's row.
+    ///
+    /// A cycle rather than a menu, matching the gridbox and the clef: one
+    /// press, one step, and nothing to aim at in a row this short.
+    fn arr_cycle_auto_param(&mut self, lane: usize) {
+        use crate::automation::AutoParam;
+        let now = self.arr_auto_param(lane);
+        let i = AutoParam::ALL.iter().position(|p| *p == now).unwrap_or(0);
+        let next = AutoParam::ALL[(i + 1) % AutoParam::ALL.len()];
+        self.arr_auto_params.insert(lane, next);
+        self.arr_auto_hot = None;
+    }
+
+    /// Put a point on a lane's curve, answering where it landed.
+    ///
+    /// **Snapped in time, free in value.** The horizontal axis is the song's
+    /// grid and the same magnet everything else on this surface obeys; the
+    /// vertical one is a level, and a level that could only take sixteen
+    /// values would be a worse control than the fader it automates.
+    fn arr_put_auto_point(&mut self, lane: usize, t: f64, v: f64) -> Option<usize> {
+        use crate::automation::{Point, Shape};
+        let param = self.arr_auto_param(lane);
+        let at_s = self.arr_snap_t(t);
+        // A switch steps; a level ramps. Choosing the shape from the
+        // parameter rather than asking is what makes a mute curve behave
+        // like a mute the first time somebody draws one.
+        let shape = if param == crate::automation::AutoParam::Mute {
+            Shape::Hold
+        } else {
+            Shape::Linear
+        };
+        self.arrangement
+            .automation
+            .entry(lane, param)
+            .put(Point { at_s, value: v.clamp(0.0, 1.0), shape });
+        self.arr_save_edits();
+        self.arr_auto_index(lane, at_s)
+    }
+
+    /// Where a point at `at_s` sits in its curve now.
+    ///
+    /// Re-derived rather than remembered, because `put` keeps the curve
+    /// sorted: dragging a point past its neighbour changes its index, and a
+    /// carried index would then be moving somebody else's point.
+    fn arr_auto_index(&self, lane: usize, at_s: f64) -> Option<usize> {
+        let param = self.arr_auto_param(lane);
+        self.arrangement
+            .automation
+            .get(lane, param)?
+            .points()
+            .iter()
+            .position(|p| (p.at_s - at_s).abs() < 1e-9)
+    }
+
+    /// Move the point being dragged to where the pointer is.
+    fn arr_drag_auto_point(&mut self, lane: usize, index: usize, t: f64, v: f64) {
+        use crate::automation::Point;
+        let param = self.arr_auto_param(lane);
+        let Some(old) = self
+            .arrangement
+            .automation
+            .get(lane, param)
+            .and_then(|c| c.points().get(index).copied())
+        else {
+            return;
+        };
+        let at_s = self.arr_snap_t(t);
+        let curve = self.arrangement.automation.entry(lane, param);
+        // Take the old one out before putting the new one in, or a move
+        // along the curve leaves a trail of points behind it.
+        curve.remove_near(old.at_s, 1e-9);
+        curve.put(Point { at_s, value: v.clamp(0.0, 1.0), shape: old.shape });
+        self.arr_auto_hot = self.arr_auto_index(lane, at_s).map(|i| (lane, i));
+        if let Some((_, i)) = self.arr_auto_hot {
+            self.arr_drag = Some(ArrDrag::AutoPoint(lane, i));
+        }
+    }
+
+    /// Take the point nearest `t` off a lane's curve.
+    fn arr_remove_auto_point(&mut self, lane: usize, t: f64) {
+        let param = self.arr_auto_param(lane);
+        let reach = (self.arr_window_now().1 * 0.01).max(0.01);
+        if self
+            .arrangement
+            .automation
+            .entry(lane, param)
+            .remove_near(t, reach)
+        {
+            // An emptied curve is dropped rather than kept empty — see
+            // `Automation::set`, which is what `entry` leaves behind.
+            let curve = self.arrangement.automation.entry(lane, param).clone();
+            self.arrangement.automation.set(curve);
+            self.arr_auto_hot = None;
+            self.arr_save_edits();
+        }
+    }
+
+    /// Catch a control's move and write it down, if this lane is recording.
+    ///
+    /// **Only while the transport ROLLS.** Automation is a record of a
+    /// performance against the song, so a fader moved with the transport
+    /// parked is somebody setting a level, not writing a move — and a mode
+    /// left in Write would otherwise flatten a curve to one value the moment
+    /// anybody touched the desk.
+    fn record_automation_move(&mut self, hit: crate::mixer_panel::Hit, v: f32) {
+        use crate::automation::AutoParam;
+        use crate::mixer_panel::Hit as H;
+        use crate::recorder::Strip;
+        if !(self.recorder.playing || self.recorder.arr_recording) {
+            return;
+        }
+        let (lane, param, value) = match hit {
+            H::Fader(i) => match i.strip() {
+                Some(Strip::Channel(n)) => (n, AutoParam::Gain, f64::from(v)),
+                _ => return,
+            },
+            H::Pan(i) => match i.strip() {
+                Some(Strip::Channel(n)) => (n, AutoParam::Pan, f64::from(v)),
+                _ => return,
+            },
+            H::Send(i) => match i.strip() {
+                Some(Strip::Channel(n)) => (n, AutoParam::Send, f64::from(v)),
+                _ => return,
+            },
+            // A mute is a press rather than a value, so it writes the state
+            // it is about to BE — which is the opposite of what it reads.
+            H::Mute(i) => match i.strip() {
+                Some(Strip::Channel(n)) => {
+                    let now = self.settings.strip_muted & (1 << n) != 0;
+                    (n, AutoParam::Mute, if now { 0.0 } else { 1.0 })
+                }
+                _ => return,
+            },
+            _ => return,
+        };
+        // A control being moved by hand is being TOUCHED, which is the whole
+        // of what Touch and Latch key off.
+        if !self.arr_auto_writing(lane, true) {
+            return;
+        }
+        self.arr_write_automation(lane, param, value);
+    }
+
+    /// Which lanes' curves must not drive their controls, one bit each.
+    ///
+    /// Crosses to the engine as a plain word — see `Engine::set_auto_suspend`.
+    /// A lane is suspended when it is switched Off, and while it is being
+    /// WRITTEN: a curve that fought the hand would make the fader jump back
+    /// under it as each point landed.
+    pub fn auto_suspend_mask(&self) -> u32 {
+        let mut mask = 0u32;
+        for lane in 0..crate::recorder::CHANNELS.min(32) {
+            let mode = self.arr_auto_mode(lane);
+            // `true` for touching: a lane whose mode writes on touch is
+            // suspended while a hand is on it, and asking the question with
+            // the hand assumed present is what makes the fader lead rather
+            // than fight. A Read lane answers false either way.
+            if !mode.reads() || self.arr_auto_writing(lane, true) {
+                mask |= 1 << lane;
+            }
+        }
+        mask
+    }
+
+    /// A lane's automation mode.
+    pub fn arr_auto_mode(&self, lane: usize) -> crate::automation::AutoMode {
+        self.arr_auto_modes.get(&lane).copied().unwrap_or_default()
+    }
+
+    /// Step a lane to the next mode.
+    fn arr_cycle_auto_mode(&mut self, lane: usize) {
+        use crate::automation::AutoMode;
+        let now = self.arr_auto_mode(lane);
+        let i = AutoMode::ALL.iter().position(|m| *m == now).unwrap_or(0);
+        let next = AutoMode::ALL[(i + 1) % AutoMode::ALL.len()];
+        self.arr_auto_modes.insert(lane, next);
+        // Leaving a writing mode disarms whatever it armed, or a lane could
+        // sit latched in a mode that has no latch.
+        self.arr_auto_latched.remove(&lane);
+        self.arr_auto_last.retain(|(l, _), _| *l != lane);
+    }
+
+    /// The transport stopped: every latch lets go.
+    ///
+    /// **This is the whole of the difference between Latch and Write.** A
+    /// latch that survived the stop would be a Write nobody asked for, and
+    /// it would show up as a curve quietly flattened on the next pass.
+    fn arr_release_latches(&mut self) {
+        self.arr_auto_latched.clear();
+        self.arr_auto_last.clear();
+    }
+
+    /// Whether a lane is writing right now, which is also whether its curve
+    /// should stop driving the control.
+    fn arr_auto_writing(&self, lane: usize, touching: bool) -> bool {
+        self.arr_auto_mode(lane)
+            .writes(touching, self.arr_auto_latched.contains(&lane))
+    }
+
+    /// A control was MOVED while the transport rolled: write it down.
+    ///
+    /// **Thinned, and it has to be.** A hand on a fader produces a value
+    /// every frame, so an unthinned write lays down sixty points a second —
+    /// eighteen hundred across a thirty-second pass, on one lane. A curve
+    /// like that is slower to draw than the song is to play and impossible
+    /// to edit afterwards. A point is written when the value has moved
+    /// enough to hear or enough time has passed to matter, and the last
+    /// value is always written on release so the curve ends where the hand
+    /// did.
+    fn arr_write_automation(
+        &mut self,
+        lane: usize,
+        param: crate::automation::AutoParam,
+        value: f64,
+    ) {
+        use crate::automation::{Point, Shape};
+        if lane >= crate::recorder::CHANNELS {
+            return;
+        }
+        let at_s = self.recorder.position_s.max(0.0);
+        let key = (lane, param);
+        // How far apart two written points have to be. A twentieth of a
+        // second is finer than any fader move anybody makes and coarse
+        // enough that a pass leaves a curve somebody can pick up and edit.
+        const MIN_GAP_S: f64 = 0.05;
+        const MIN_STEP: f64 = 0.002;
+        if let Some((last_t, last_v)) = self.arr_auto_last.get(&key).copied() {
+            // **OR, not AND**, and the difference is the whole feature. Too
+            // soon is a reason to wait; not having moved is a reason to say
+            // nothing at all. Written as AND, a fader held perfectly still
+            // for a minute wrote a point every frame the clock advanced past
+            // the gap — six hundred points describing one value.
+            //
+            // Nothing is lost by staying silent while a control does not
+            // move: a curve is flat between its points, so "it stayed there"
+            // is exactly what two points already say.
+            let too_soon = (at_s - last_t).abs() < MIN_GAP_S;
+            let unmoved = (value - last_v).abs() < MIN_STEP;
+            if too_soon || unmoved {
+                return;
+            }
+        }
+        let shape = if param == crate::automation::AutoParam::Mute {
+            Shape::Hold
+        } else {
+            Shape::Linear
+        };
+        self.arrangement
+            .automation
+            .entry(lane, param)
+            .put(Point { at_s, value: value.clamp(0.0, 1.0), shape });
+        self.arr_auto_last.insert(key, (at_s, value));
+        // A Latch arms the moment it first writes, so the hand can come off.
+        if self.arr_auto_mode(lane) == crate::automation::AutoMode::Latch {
+            self.arr_auto_latched.insert(lane);
+        }
+        self.clips_dirty = true;
+    }
+
     /// A gesture's edits, written down: the document saved atomically, the
     /// host told to rebuild the schedule.
     fn arr_save_edits(&mut self) {
@@ -10290,6 +10612,26 @@ impl IvoryApp {
                     self.selected_channel = Some(n);
                 }
                 match hit {
+                    // ── automation ────────────────────────────────────────
+                    //
+                    // The fold arrow and the parameter picker are the row's
+                    // own chrome; the lane itself makes and moves points.
+                    Some(A::AutoFold(n)) => self.arr_toggle_automation(n),
+                    Some(A::AutoParamPick(n)) => self.arr_cycle_auto_param(n),
+                    Some(A::AutoPoint(n, i)) => {
+                        self.arr_auto_hot = Some((n, i));
+                        self.arr_drag = Some(ArrDrag::AutoPoint(n, i));
+                    }
+                    // **A press on empty room MAKES a point**, which is what
+                    // every desk does and what makes a curve drawable rather
+                    // than assembled. It is then dragged, so one gesture
+                    // places it and puts it where you meant.
+                    Some(A::AutoLane(n, t, v)) => {
+                        if let Some(i) = self.arr_put_auto_point(n, t, v) {
+                            self.arr_auto_hot = Some((n, i));
+                            self.arr_drag = Some(ArrDrag::AutoPoint(n, i));
+                        }
+                    }
                     // The header's switches are the mixer strip's own, by
                     // the same hits, so the two surfaces cannot drift.
                     Some(A::Arm(n)) => self.apply_mixer_hit(M::Arm(Column(n)), 0.0),
@@ -10538,6 +10880,33 @@ impl IvoryApp {
                 crate::arrangement_panel::time_at(rect, &view, p.x)
             };
             match drag {
+                // **The row is asked where the pointer is, through the same
+                // two functions the drawing uses.** A drag that computed the
+                // value itself would be a third mapping, and the one that
+                // drifts — see `auto_y_of`.
+                ArrDrag::AutoPoint(lane, index) => {
+                    let rect = self.arrangement_rect.unwrap_or(Rect::NOTHING);
+                    let row = {
+                        let clips = self.arr_clip_views();
+                        let view = self.arrange_view(&clips);
+                        crate::arrangement_panel::Layout::new(rect, &view)
+                            .rows
+                            .iter()
+                            .find(|r| {
+                                r.kind == crate::arrangement_panel::RowKind::Automation(lane)
+                            })
+                            .map(|r| r.lane)
+                    };
+                    if let Some(row) = row.filter(egui::Rect::is_positive) {
+                        let t = {
+                            let clips = self.arr_clip_views();
+                            let view = self.arrange_view(&clips);
+                            crate::arrangement_panel::time_at(rect, &view, p.x)
+                        };
+                        let v = crate::arrangement_panel::auto_value_at(row, p.y);
+                        self.arr_drag_auto_point(lane, index, t, v);
+                    }
+                }
                 ArrDrag::GridStep { from_y, start } => {
                     let steps = f64::from((from_y - p.y) / 14.0).round() as i64;
                     let to = (start - steps).clamp(-5, 3);
@@ -11054,13 +11423,26 @@ impl IvoryApp {
         let peaks = self.meter_hold;
         let (view_start_s, view_len_s) = self.arr_window_now();
         crate::arrangement_panel::ArrangeView {
-            // No UI to open it yet — the row exists so the tempo work and
-            // the automation lanes have somewhere to land.
+            // No UI to open it yet — the row exists so the tempo work has
+            // somewhere to land.
             show_tempo_lane: false,
             lanes: std::array::from_fn(|n| {
                 let kind = self.channel_kind(n);
+                let open = self.arr_auto_open.contains(&n);
                 crate::arrangement_panel::LaneView {
-                    automation_open: false,
+                    automation_open: open,
+                    automation: open.then(|| {
+                        let param = self.arr_auto_param(n);
+                        crate::arrangement_panel::AutoView {
+                            param,
+                            points: self
+                                .arrangement
+                                .automation
+                                .get(n, param)
+                                .map_or(&[][..], crate::automation::Curve::points),
+                            hot: self.arr_auto_hot.filter(|(l, _)| *l == n).map(|(_, i)| i),
+                        }
+                    }),
                     route_count: self.settings.routes.from(n).len(),
                     name: self.channel_display_name(n),
                     input: self.input_chip_text(n),
@@ -12496,6 +12878,11 @@ impl IvoryApp {
     /// count-in is.
     pub fn time_signature(&self) -> recorder::TimeSignature {
         self.settings.time_signature()
+    }
+
+    /// Every automation curve in the open song.
+    pub fn automation(&self) -> &crate::automation::Automation {
+        &self.arrangement.automation
     }
 
     /// The tempo map the ENGINE should play against.
@@ -15289,6 +15676,27 @@ impl IvoryApp {
         // stale, which is what stops an arrow key moving a fader that is no
         // longer on screen.
         self.a11y_on = None;
+        // **The transport stopping is what lets a Latch go.** Watched for
+        // rather than told, because the host writes the recorder's state
+        // straight into this app and there is no call to hang it on.
+        // **Level-triggered, not edge-triggered.** An edge is missed when the
+        // transport starts and stops between two frames, and a latch that
+        // outlived its transport would be a Write nobody asked for. "Not
+        // rolling implies nothing is latched" is a state that cannot be
+        // missed, only observed late.
+        let rolling = self.recorder.playing || self.recorder.arr_recording;
+        if !rolling && !self.arr_auto_latched.is_empty() {
+            self.arr_release_latches();
+        }
+        if self.arr_was_rolling && !rolling {
+            // A pass just ended, so what it wrote is worth writing DOWN —
+            // and worth being one undo step rather than the eighty points it
+            // laid down.
+            if !self.arrangement.automation.is_empty() {
+                self.arr_save_edits();
+            }
+        }
+        self.arr_was_rolling = rolling;
         crate::shell::viewport_ui(ctx, |ui| self.paint(ui));
         // ...and acted on after it, once every panel has had its turn.
         self.nudge_focused(ctx);
@@ -20765,6 +21173,259 @@ mod tests {
                 "{t} snapped to {at}, which is quarter {q} — not a bar line"
             );
         }
+    }
+
+    /// **A curve is drawn, moved and undrawn through the app's own hits.**
+    ///
+    /// The pieces each have their own test; this is the chain. Making a
+    /// point has to save the document (so undo has it), moving one must not
+    /// leave the old one behind, and emptying a curve must take it out of
+    /// the document rather than leave a curve with nothing in it.
+    #[test]
+    fn drawing_a_curve_edits_the_document_and_undrawing_it_removes_the_curve() {
+        use crate::automation::AutoParam;
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.arr_snap = false; // the magnet is its own test
+
+        // A point where there was none.
+        let i = app.arr_put_auto_point(0, 4.0, 0.75).expect("no point landed");
+        let c = app
+            .arrangement
+            .automation
+            .get(0, AutoParam::Gain)
+            .expect("no curve");
+        assert_eq!(c.points().len(), 1);
+        assert!((c.points()[i].at_s - 4.0).abs() < 1e-9);
+        assert!((c.points()[i].value - 0.75).abs() < 1e-9);
+
+        // Moving it leaves ONE point, not a trail.
+        app.arr_drag_auto_point(0, i, 9.0, 0.25);
+        let c = app.arrangement.automation.get(0, AutoParam::Gain).expect("no curve");
+        assert_eq!(c.points().len(), 1, "the drag left a trail: {:?}", c.points());
+        assert!((c.points()[0].at_s - 9.0).abs() < 1e-9);
+        assert!((c.points()[0].value - 0.25).abs() < 1e-9);
+
+        // A second point, and moving the first PAST it keeps both and
+        // re-sorts — the case a carried index would get wrong.
+        app.arr_put_auto_point(0, 12.0, 0.5);
+        app.arr_drag_auto_point(0, 0, 20.0, 0.1);
+        let c = app.arrangement.automation.get(0, AutoParam::Gain).expect("no curve");
+        assert_eq!(c.points().len(), 2, "{:?}", c.points());
+        assert!(
+            c.points().windows(2).all(|w| w[0].at_s < w[1].at_s),
+            "the curve is out of order: {:?}",
+            c.points()
+        );
+
+        // Undrawing both takes the curve out of the document entirely.
+        app.arr_remove_auto_point(0, 20.0);
+        app.arr_remove_auto_point(0, 12.0);
+        assert!(
+            app.arrangement.automation.is_empty(),
+            "an emptied curve was kept: {:?}",
+            app.arrangement.automation.curves()
+        );
+    }
+
+    /// **Moving a fader while rolling writes the curve — in the right modes
+    /// and no others.**
+    ///
+    /// The whole point of Touch/Latch/Write, and four ways to get it wrong:
+    /// writing when parked, writing in Read, a Touch that keeps writing
+    /// after the hand comes off, and a Latch that does not.
+    #[test]
+    fn a_fader_move_writes_a_curve_only_when_the_mode_says_so() {
+        use crate::automation::{AutoMode, AutoParam};
+        use crate::mixer_panel::Hit as M;
+        use crate::recorder::Column;
+
+        let armed = |mode: AutoMode, rolling: bool| {
+            let (_ctx, mut app) = headless(Caps::DESKTOP);
+            app.arr_auto_modes.insert(0, mode);
+            app.recorder.playing = rolling;
+            app.recorder.position_s = 4.0;
+            app.apply_mixer_hit(M::Fader(Column(0)), 0.6);
+            app.arrangement.automation.get(0, AutoParam::Gain).is_some()
+        };
+
+        // **Parked writes nothing, in every mode.** A fader moved with the
+        // transport stopped is somebody setting a level, and a lane left in
+        // Write would otherwise flatten its curve the moment anybody touched
+        // the desk.
+        for mode in AutoMode::ALL {
+            assert!(!armed(mode, false), "{mode:?} wrote while parked");
+        }
+        // Rolling: only the writing modes.
+        assert!(!armed(AutoMode::Off, true), "Off wrote");
+        assert!(!armed(AutoMode::Read, true), "Read wrote");
+        assert!(armed(AutoMode::Touch, true), "Touch did not write");
+        assert!(armed(AutoMode::Latch, true), "Latch did not write");
+        assert!(armed(AutoMode::Write, true), "Write did not write");
+    }
+
+    /// A Latch keeps writing after the hand comes off; the transport
+    /// stopping is what lets it go.
+    #[test]
+    fn a_latch_outlives_the_hand_and_not_the_transport() {
+        use crate::automation::AutoMode;
+        let (ctx, mut app) = headless(Caps::DESKTOP);
+        app.arr_auto_modes.insert(0, AutoMode::Latch);
+        app.recorder.playing = true;
+        app.recorder.position_s = 1.0;
+
+        // Nothing is armed until something is actually touched.
+        assert!(!app.arr_auto_writing(0, false), "a latch armed itself");
+        app.apply_mixer_hit(crate::mixer_panel::Hit::Fader(crate::recorder::Column(0)), 0.6);
+        // ...and now it stays armed with the hand off.
+        assert!(app.arr_auto_writing(0, false), "the latch did not hold");
+
+        // The transport stopping releases it. Driven through a real frame,
+        // because that is where the edge is looked for.
+        app.recorder.playing = false;
+        run_frame(&ctx, &mut app);
+        assert!(!app.arr_auto_writing(0, false), "the latch survived the stop");
+
+        // A Touch, by contrast, lets go the moment the hand does.
+        app.arr_auto_modes.insert(1, AutoMode::Touch);
+        app.recorder.playing = true;
+        app.apply_mixer_hit(crate::mixer_panel::Hit::Fader(crate::recorder::Column(1)), 0.6);
+        assert!(!app.arr_auto_writing(1, false), "a Touch latched");
+    }
+
+    /// **A pass does not lay down sixty points a second.**
+    ///
+    /// A hand on a fader produces a value every frame. Unthinned, thirty
+    /// seconds of writing is eighteen hundred points on one lane — slower to
+    /// draw than the song is to play, and impossible to edit afterwards.
+    #[test]
+    fn writing_a_pass_thins_the_points_it_lays_down() {
+        use crate::automation::{AutoMode, AutoParam};
+        use crate::mixer_panel::Hit as M;
+        use crate::recorder::Column;
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.arr_auto_modes.insert(0, AutoMode::Write);
+        app.recorder.playing = true;
+
+        // Sixty frames a second for ten seconds, the fader creeping.
+        for i in 0..600 {
+            app.recorder.position_s = f64::from(i) / 60.0;
+            let v = 0.5 + f64::from(i) / 6_000.0;
+            app.apply_mixer_hit(M::Fader(Column(0)), v as f32);
+        }
+        let n = app
+            .arrangement
+            .automation
+            .get(0, AutoParam::Gain)
+            .expect("nothing was written")
+            .points()
+            .len();
+        // Ten seconds at a 0.05s floor is at most about two hundred, and a
+        // move this gentle is bounded by the value step instead. Both ends
+        // asserted: too many is a curve nobody can edit, too few is a pass
+        // that did not record what was played.
+        assert!(n <= 200, "the pass was not thinned enough: {n} points in 10s");
+        assert!(n >= 20, "the pass was thinned past usefulness: {n} points in 10s");
+        // And it really does describe the move: the curve ends where the
+        // fader did, not where the thinning last happened to look.
+        let c = app.arrangement.automation.get(0, AutoParam::Gain).expect("curve");
+        let last = c.points().last().expect("a point").value;
+        assert!(
+            (last - 0.5).abs() > 0.05,
+            "the curve ends at {last}, so the ten seconds of movement were lost"
+        );
+
+        // **And a control that does not move writes almost nothing.** Sixty
+        // seconds of holding a fader still is one value, however long you
+        // hold it.
+        let (_ctx, mut still) = headless(Caps::DESKTOP);
+        still.arr_auto_modes.insert(0, AutoMode::Write);
+        still.recorder.playing = true;
+        for i in 0..600 {
+            still.recorder.position_s = f64::from(i) / 10.0;
+            still.apply_mixer_hit(M::Fader(Column(0)), 0.5);
+        }
+        let held = still
+            .arrangement
+            .automation
+            .get(0, AutoParam::Gain)
+            .expect("nothing was written")
+            .points()
+            .len();
+        assert!(
+            held <= 2,
+            "a fader nobody moved wrote {held} points; a curve is flat \
+             between its points, so staying put needs no describing"
+        );
+    }
+
+    /// A written or switched-off lane tells the engine to leave it alone.
+    #[test]
+    fn the_engine_is_told_which_lanes_the_curves_must_not_drive() {
+        use crate::automation::AutoMode;
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        assert_eq!(app.auto_suspend_mask(), 0, "a fresh song suspends something");
+
+        // Off keeps the curve and stops obeying it.
+        app.arr_auto_modes.insert(2, AutoMode::Off);
+        assert_eq!(app.auto_suspend_mask() & (1 << 2), 1 << 2, "Off is not suspended");
+        // Read obeys it.
+        app.arr_auto_modes.insert(2, AutoMode::Read);
+        assert_eq!(app.auto_suspend_mask() & (1 << 2), 0, "Read is suspended");
+        // A writing mode suspends, so the curve does not fight the hand.
+        app.arr_auto_modes.insert(2, AutoMode::Write);
+        assert_eq!(app.auto_suspend_mask() & (1 << 2), 1 << 2, "Write is not suspended");
+        // ...and nothing else is caught up in it.
+        assert_eq!(app.auto_suspend_mask() & !(1 << 2), 0, "a neighbour was suspended");
+    }
+
+    /// A mute curve steps; a level curve ramps.
+    ///
+    /// Chosen from the parameter rather than asked, so a mute behaves like a
+    /// mute the first time somebody draws one — a mute that faded in over
+    /// four bars would be nobody's idea of a mute.
+    #[test]
+    fn a_mute_curve_is_drawn_as_a_switch_and_a_level_as_a_ramp() {
+        use crate::automation::{AutoParam, Shape};
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.arr_snap = false;
+        app.arr_auto_params.insert(0, AutoParam::Mute);
+        app.arr_put_auto_point(0, 1.0, 1.0);
+        assert_eq!(
+            app.arrangement.automation.get(0, AutoParam::Mute).expect("curve").points()[0].shape,
+            Shape::Hold,
+            "a mute point ramps"
+        );
+        app.arr_auto_params.insert(1, AutoParam::Gain);
+        app.arr_put_auto_point(1, 1.0, 1.0);
+        assert_eq!(
+            app.arrangement.automation.get(1, AutoParam::Gain).expect("curve").points()[0].shape,
+            Shape::Linear,
+            "a level steps"
+        );
+    }
+
+    /// The row opens, cycles its parameter, and closes.
+    #[test]
+    fn a_lanes_automation_row_folds_and_cycles() {
+        use crate::automation::AutoParam;
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        assert!(!app.arr_auto_open.contains(&2));
+        app.arr_toggle_automation(2);
+        assert!(app.arr_auto_open.contains(&2), "the row did not open");
+        assert_eq!(app.arr_auto_param(2), AutoParam::Gain, "it did not open on volume");
+        // Every parameter is reachable, and the cycle comes home.
+        for want in [AutoParam::Pan, AutoParam::Send, AutoParam::Mute, AutoParam::Gain] {
+            app.arr_cycle_auto_param(2);
+            assert_eq!(app.arr_auto_param(2), want);
+        }
+        app.arr_toggle_automation(2);
+        assert!(!app.arr_auto_open.contains(&2), "the row did not close");
+        // Folding a row away does NOT throw its curve out — it is a view,
+        // not the document.
+        app.arr_put_auto_point(2, 1.0, 0.5);
+        app.arr_toggle_automation(2);
+        app.arr_toggle_automation(2);
+        assert!(app.arrangement.automation.get(2, AutoParam::Gain).is_some());
     }
 
     /// **A note is spelled so a screen reader can pronounce it.**

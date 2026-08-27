@@ -78,6 +78,76 @@ impl AutoParam {
     }
 }
 
+/// What a lane's automation does while the transport rolls.
+///
+/// **Session state, never persisted, and that is a safety decision rather
+/// than an oversight.** A lane left in `Write` and saved would overwrite its
+/// own curve the next time anybody pressed play — the work destroyed by an
+/// action nobody would think of as destructive, in a file they opened to
+/// listen to. Every mode returns to [`AutoMode::Read`] when the song does.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AutoMode {
+    /// The curve is kept but not obeyed: the fader is the fader again.
+    ///
+    /// What somebody wants while they work out what the part should be,
+    /// without throwing away what they drew.
+    Off,
+    /// The curve plays the control. The ordinary state, and the default.
+    #[default]
+    Read,
+    /// Reading, until a control is TOUCHED — then writing, until it is let
+    /// go, and reading again after.
+    Touch,
+    /// Reading, until a control is touched — then writing until the
+    /// transport stops. What you want for a move you make once and mean.
+    Latch,
+    /// Writing from the moment the transport rolls, touched or not.
+    ///
+    /// The dangerous one, and the reason none of these is saved.
+    Write,
+}
+
+impl AutoMode {
+    /// In the order the row cycles them.
+    pub const ALL: [AutoMode; 5] = [
+        AutoMode::Read,
+        AutoMode::Touch,
+        AutoMode::Latch,
+        AutoMode::Write,
+        AutoMode::Off,
+    ];
+
+    /// The word on the row.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Read => "Read",
+            Self::Touch => "Touch",
+            Self::Latch => "Latch",
+            Self::Write => "Write",
+        }
+    }
+
+    /// Whether the curve should drive the control at all.
+    pub fn reads(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// Whether MOVING a control writes it down, given whether the control is
+    /// being held right now and whether a latch is already armed.
+    ///
+    /// The whole of the mode's behaviour in one place, so the audio side and
+    /// the UI side cannot come to different conclusions about it.
+    pub fn writes(self, touching: bool, latched: bool) -> bool {
+        match self {
+            Self::Off | Self::Read => false,
+            Self::Touch => touching,
+            Self::Latch => touching || latched,
+            Self::Write => true,
+        }
+    }
+}
+
 /// How a curve gets from this point to the next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Shape {
@@ -403,6 +473,45 @@ mod tests {
         // Emptying it takes it out of the document.
         a.set(Curve::sanitised(0, AutoParam::Gain, Vec::new()));
         assert!(a.is_empty(), "an emptied curve was kept: {:?}", a.curves());
+    }
+
+    /// Each mode writes exactly when it should.
+    ///
+    /// The table in one test, because the four modes differ only in when
+    /// they write and getting one wrong is a curve that either will not
+    /// record or will not stop.
+    #[test]
+    fn the_modes_differ_only_in_when_they_write() {
+        use AutoMode::{Latch, Off, Read, Touch, Write};
+        // (mode, touching, latched) -> writes
+        let table = [
+            ((Off, false, false), false),
+            ((Off, true, true), false),
+            ((Read, true, true), false),
+            // Touch writes only while the control is held.
+            ((Touch, false, false), false),
+            ((Touch, true, false), true),
+            ((Touch, false, true), false),
+            // Latch keeps writing after the hand comes off.
+            ((Latch, false, false), false),
+            ((Latch, true, false), true),
+            ((Latch, false, true), true),
+            // Write writes regardless — the dangerous one.
+            ((Write, false, false), true),
+        ];
+        for ((mode, touching, latched), want) in table {
+            assert_eq!(
+                mode.writes(touching, latched),
+                want,
+                "{mode:?} touching={touching} latched={latched}"
+            );
+        }
+        // Only Off stops the curve being obeyed.
+        for m in AutoMode::ALL {
+            assert_eq!(m.reads(), m != Off, "{m:?}");
+        }
+        // The default is the safe one.
+        assert_eq!(AutoMode::default(), Read);
     }
 
     /// The persisted spellings do not move.

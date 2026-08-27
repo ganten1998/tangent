@@ -56,6 +56,8 @@ pub struct LaneView<'a> {
     pub muted: bool,
     /// This lane's automation curve is showing, in a row of its own under it.
     pub automation_open: bool,
+    /// What that row holds. `None` while the row is closed.
+    pub automation: Option<AutoView<'a>>,
     pub soloed: bool,
     /// Linear, as the mixer fader sits. The header knob is the same value.
     pub gain: f32,
@@ -91,6 +93,19 @@ pub struct ClipView<'a> {
     pub midi: bool,
     /// Being RECORDED right now: drawn hot, and no gesture lands on it.
     pub recording: bool,
+}
+
+/// One automation lane's contents, pushed in.
+///
+/// **Points in SCREEN-independent terms** — seconds and a normalised value —
+/// exactly as the document holds them. The panel turns them into pixels; it
+/// is handed nothing that has already been through a rect, so a resize
+/// cannot leave a stale coordinate behind.
+pub struct AutoView<'a> {
+    pub param: crate::automation::AutoParam,
+    pub points: &'a [crate::automation::Point],
+    /// The point under the pointer or being dragged, so it can be drawn lit.
+    pub hot: Option<usize>,
 }
 
 /// Everything the arrangement draws, pushed in.
@@ -188,6 +203,16 @@ pub enum Hit {
     /// The header's pan dial — third of the set, every channel carries one.
     Pan(usize),
     /// The toolbar: the click on and off.
+    /// A point on an automation curve, by lane and by index into that
+    /// curve's points. Grabbed to drag, or pressed to select.
+    AutoPoint(usize, usize),
+    /// Empty room on an automation lane: `(lane, seconds, value)`. A press
+    /// here MAKES a point, which is how every DAW draws one.
+    AutoLane(usize, f64, f64),
+    /// The sub-lane's own header: which parameter it shows.
+    AutoParamPick(usize),
+    /// The header's fold arrow: show or hide this lane's automation.
+    AutoFold(usize),
     ToolMetronome,
     /// The toolbar: the magnet.
     ToolSnap,
@@ -739,6 +764,62 @@ pub fn time_at(rect: Rect, view: &ArrangeView<'_>, x: f32) -> f64 {
     (view.view_start_s + t * view.view_len_s).max(0.0)
 }
 
+/// **Where a point sits inside an automation row, and its inverse.**
+///
+/// Two functions, one truth. The drawing and the hit test are the classic
+/// pair that drift: one gains an inset and the other does not, and the
+/// result is a curve you can see but cannot grab — worse near the top and
+/// bottom, which is exactly where the interesting values are. So the pixels
+/// come from here in both directions and nowhere else.
+///
+/// The inset is why it matters at all: a value of 1.0 drawn ON the row's top
+/// edge is half a point tall and clipped by the row above, so the usable
+/// band is inset by the radius a handle is drawn at.
+pub fn auto_y_of(row: Rect, value: f64) -> f32 {
+    let Some((top, bottom)) = auto_band(row) else {
+        return 0.0;
+    };
+    let v = if value.is_finite() { value.clamp(0.0, 1.0) as f32 } else { 0.0 };
+    bottom - (bottom - top) * v
+}
+
+/// The value a `y` inside an automation row means. [`auto_y_of`]'s inverse.
+pub fn auto_value_at(row: Rect, y: f32) -> f64 {
+    let Some((top, bottom)) = auto_band(row) else {
+        return 0.0;
+    };
+    if !y.is_finite() || bottom <= top {
+        return 0.0;
+    }
+    f64::from(((bottom - y) / (bottom - top)).clamp(0.0, 1.0))
+}
+
+/// The band a curve may actually occupy — the row, inset so a handle drawn
+/// at either end is whole.
+///
+/// **`None` for a row that is not a rectangle**, and that guard is not
+/// theoretical: `Rect::NOTHING` in egui is `[+inf, +inf]..[-inf, -inf]`, so
+/// its height is `-inf`, the inset is `-inf`, and `inf + -inf` is NaN. A NaN
+/// reaching the painter is a shape that silently does not draw and a hit
+/// test where every comparison is false — the kind of wrong that looks like
+/// nothing happening.
+///
+/// Callers already skip non-positive rows, but these two are `pub` and the
+/// drag path reaches them from `app.rs`, so the guard lives where the
+/// arithmetic is rather than at each place somebody remembers.
+fn auto_band(row: Rect) -> Option<(f32, f32)> {
+    if !row.is_positive() || !row.height().is_finite() || !row.top().is_finite() {
+        return None;
+    }
+    // Half the row at most: a row too short for two insets would otherwise
+    // invert its own band, and every value would read as the same one.
+    let inset = AUTO_POINT_R.min(row.height() * 0.25).max(0.0);
+    Some((row.top() + inset, row.bottom() - inset))
+}
+
+/// How big a point's handle is drawn, and the reach of a press for one.
+pub const AUTO_POINT_R: f32 = 4.0;
+
 /// The x a song second draws at. `time_at`'s inverse.
 pub fn x_of(rect: Rect, view: &ArrangeView<'_>, t: f64) -> f32 {
     let l = Layout::new(rect, view);
@@ -876,6 +957,73 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
         if row.routing.is_positive() && row.routing.contains(pos) {
             return Some(Hit::HdrRouting(i));
         }
+    }
+    // **The automation rows, before the clips.** They are their own rows, so
+    // there is no overlap to resolve — but they are checked here because a
+    // point's handle sticks out past the row's own edges by its radius, and
+    // a press on the top of a handle belongs to the point rather than to
+    // whatever row that pixel is technically in.
+    for row in &l.rows {
+        let RowKind::Automation(lane) = row.kind else {
+            continue;
+        };
+        if row.header.is_positive() && row.header.contains(pos) {
+            return Some(Hit::AutoParamPick(lane));
+        }
+        if !row.lane.is_positive() {
+            continue;
+        }
+        let Some(auto) = view.lanes.get(lane).and_then(|l| l.automation.as_ref()) else {
+            continue;
+        };
+        // The row plus a handle's radius: a press on the top of a point
+        // whose handle overhangs the row's edge belongs to that point.
+        // Guarded, because expanding a degenerate rect gives one that
+        // contains everything or nothing.
+        if !pos.x.is_finite() || !pos.y.is_finite() {
+            continue;
+        }
+        let grab = row.lane.expand(AUTO_POINT_R);
+        if !grab.is_positive() || !grab.contains(pos) {
+            continue;
+        }
+        // The nearest point within reach wins, measured in PIXELS in both
+        // axes: a curve is looked at, so "near" means near on screen and not
+        // near in seconds — at a wide zoom a second is a hair's breadth and
+        // at a tight one it is half the window.
+        //
+        // Only the points that can be SEEN are candidates, by the same
+        // binary search the drawing uses: a point scrolled off the left edge
+        // is drawn nowhere, so grabbing one would be grabbing something
+        // invisible. It also keeps the cost of a press independent of how
+        // long the song is.
+        let from_s = view.view_start_s;
+        let to_s = view.view_start_s + view.view_len_s;
+        let lo = auto.points.partition_point(|q| q.at_s < from_s).saturating_sub(1);
+        let hi = (auto.points.partition_point(|q| q.at_s <= to_s) + 1)
+            .min(auto.points.len());
+        let near = auto.points[lo.min(hi)..hi]
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let at = Pos2::new(x_of(rect, view, p.at_s), auto_y_of(row.lane, p.value));
+                (lo + i, at.distance(pos))
+            })
+            // **Finite first.** A non-finite distance compares false against
+            // everything, so it would neither be filtered out by the reach
+            // nor lose the `min_by` — it would simply be whichever the
+            // iterator happened to reach first.
+            .filter(|(_, d)| d.is_finite() && *d <= AUTO_POINT_R * 2.0)
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        if let Some((i, _)) = near {
+            return Some(Hit::AutoPoint(lane, i));
+        }
+        // Empty room: where a new point would go.
+        return Some(Hit::AutoLane(
+            lane,
+            time_at(rect, view, pos.x),
+            auto_value_at(row.lane, pos.y),
+        ));
     }
     if l.ruler.is_positive() && l.ruler.contains(pos) {
         return Some(Hit::Ruler(time_at(rect, view, pos.x)));
@@ -1178,6 +1326,20 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     for (i, row) in l.lane_rows.iter().enumerate() {
         painter.rect_filled(*row, 0.0, if i % 2 == 0 { p.lane } else { p.lane_alt });
     }
+    // **An automation row takes the ground of the track it belongs to**, a
+    // shade recessed. Its own stripe colour would read as a ninth track;
+    // being a darker version of its parent's is what says "part of that
+    // one" without a line or a label doing the work.
+    for row in &l.rows {
+        let RowKind::Automation(lane) = row.kind else {
+            continue;
+        };
+        if !row.lane.is_positive() {
+            continue;
+        }
+        let base = if lane % 2 == 0 { p.lane } else { p.lane_alt };
+        painter.rect_filled(row.lane, 0.0, shade(base, 0.88));
+    }
 
     // ── the grid: bar lines through the lanes, numbers on the ruler ───────
     let bar = bar_s(view);
@@ -1364,6 +1526,115 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 Stroke::new(1.5, p.select.gamma_multiply(0.85)),
                 egui::StrokeKind::Inside,
             );
+        }
+    }
+
+    // ── the automation curves ─────────────────────────────────────────────
+    //
+    // **In the CHANNEL's own colour**, which is the same decision the MIDI
+    // editor's velocity lane already made (`lane_color`). It costs no new
+    // theme role, those colours are already chroma- and luminance-capped per
+    // palette, and it means a volume curve under the guitar track is the
+    // guitar's green — identifiable at a glance in a stack of them.
+    for row in &l.rows {
+        let RowKind::Automation(lane) = row.kind else {
+            continue;
+        };
+        if !row.lane.is_positive() {
+            continue;
+        }
+        let Some(auto) = view.lanes.get(lane).and_then(|v| v.automation.as_ref()) else {
+            continue;
+        };
+        let (cr, cg, cb) = STRIP_COLORS[view
+            .lanes
+            .get(lane)
+            .map_or(0, |v| v.color)
+            .min(STRIP_COLORS.len() - 1)];
+        let ground = shade(if lane % 2 == 0 { p.lane } else { p.lane_alt }, 0.88);
+        // The curve has to be legible on the ground it is drawn on, and a
+        // channel colour is chosen to CARRY ink rather than to be ink. Lift
+        // it away from the ground until it reads — the same walk `quiet`
+        // does for text, in the other direction.
+        let mut curve = Color32::from_rgb(cr, cg, cb);
+        for _ in 0..8 {
+            if crate::recorder_panel::contrast_ratio(curve, ground) >= 2.2 {
+                break;
+            }
+            curve = shade(curve, 1.25);
+        }
+        // **Only the points that can be seen**, found by binary search
+        // rather than by walking. A curve is sorted, and a song with a
+        // thousand points on a lane would otherwise cost a thousand
+        // segments a frame at every zoom — most of them off-screen, and all
+        // of them recomputed sixty times a second.
+        //
+        // One point either side of the window, because the segment that
+        // ENTERS the view starts outside it: culling to exactly the visible
+        // points would leave the curve beginning at the left edge of the
+        // screen instead of arriving there.
+        let from_s = view.view_start_s;
+        let to_s = view.view_start_s + view.view_len_s;
+        let lo = auto
+            .points
+            .partition_point(|q| q.at_s < from_s)
+            .saturating_sub(1);
+        let hi = auto.points.partition_point(|q| q.at_s <= to_s);
+        let hi = (hi + 1).min(auto.points.len());
+        let shown = &auto.points[lo.min(hi)..hi];
+
+        // The polyline, built in ONE pass. A hold contributes the step
+        // across before the next point's own vertex, which is the whole
+        // difference between a switch and a ramp.
+        let mut line: Vec<Pos2> = Vec::with_capacity(shown.len() * 2 + 2);
+        // **Flat back to the left edge**, because that is what the curve
+        // MEANS before its first point — see `Curve::value_at`. A line that
+        // began at the first handle would draw a level the song never plays.
+        if let Some(first) = auto.points.first() {
+            let y = auto_y_of(row.lane, first.value);
+            line.push(Pos2::new(row.lane.left(), y));
+        }
+        for (i, q) in shown.iter().enumerate() {
+            let at = Pos2::new(x_of(rect, view, q.at_s), auto_y_of(row.lane, q.value));
+            line.push(at);
+            if q.shape == crate::automation::Shape::Hold {
+                if let Some(next) = shown.get(i + 1) {
+                    line.push(Pos2::new(x_of(rect, view, next.at_s), at.y));
+                }
+            }
+        }
+        // ...and flat on to the right edge, for the same reason.
+        if let Some(last) = auto.points.last() {
+            let y = auto_y_of(row.lane, last.value);
+            line.push(Pos2::new(row.lane.right(), y));
+        }
+        for pair in line.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            // A segment wholly outside the row's own x-range draws nothing
+            // anybody can see, and a non-finite one draws nothing at all
+            // while quietly poisoning the shape it is in.
+            if !a.x.is_finite() || !b.x.is_finite() || !a.y.is_finite() || !b.y.is_finite() {
+                continue;
+            }
+            if a.x.max(b.x) < row.lane.left() || a.x.min(b.x) > row.lane.right() {
+                continue;
+            }
+            painter.line_segment([a, b], Stroke::new(1.5, curve));
+        }
+        // The handles, over the line, and only where one can be seen.
+        for (i, q) in shown.iter().enumerate() {
+            let at = Pos2::new(x_of(rect, view, q.at_s), auto_y_of(row.lane, q.value));
+            if !at.x.is_finite() || !at.y.is_finite() {
+                continue;
+            }
+            if at.x < row.lane.left() - AUTO_POINT_R || at.x > row.lane.right() + AUTO_POINT_R {
+                continue;
+            }
+            let hot = auto.hot == Some(lo + i);
+            painter.circle_filled(at, if hot { AUTO_POINT_R + 1.0 } else { AUTO_POINT_R }, curve);
+            // A ring in the ground's own colour, so two points close
+            // together read as two rather than as a blob.
+            painter.circle_stroke(at, AUTO_POINT_R, Stroke::new(1.0, ground));
         }
     }
 
@@ -2102,6 +2373,7 @@ mod tests {
     fn a_lane(used: bool) -> LaneView<'static> {
 LaneView {
             automation_open: false,
+            automation: None,
             route_count: 0,
             stereo: true,
             inserts: [""; crate::recorder::INSERTS],
@@ -2406,6 +2678,240 @@ ArrangeView {
             Some(Hit::Ruler(t)) => assert!((t - 60.0).abs() < 0.2, "ruler read {t}"),
             other => panic!("the ruler answered {other:?}"),
         }
+    }
+
+    /// **The drawing and the hit test agree about where a point is.**
+    ///
+    /// The classic pair that drifts: one gains an inset and the other does
+    /// not, and you get a curve you can see and cannot grab — worse at the
+    /// top and bottom, which is exactly where the interesting values are. So
+    /// both go through `auto_y_of` / `auto_value_at`, and this walks the
+    /// whole band demanding they invert.
+    #[test]
+    fn a_point_is_grabbed_where_it_is_drawn() {
+        let row = Rect::from_min_max(Pos2::new(0.0, 100.0), Pos2::new(400.0, 160.0));
+        for n in 0..=20 {
+            let v = f64::from(n) / 20.0;
+            let y = auto_y_of(row, v);
+            let back = auto_value_at(row, y);
+            assert!(
+                (back - v).abs() < 1e-3,
+                "{v} drew at {y} and read back as {back}"
+            );
+            // ...and inside the row, so the handle is whole.
+            assert!(
+                y >= row.top() && y <= row.bottom(),
+                "{v} drew at {y}, outside {row:?}"
+            );
+        }
+        // Up is MORE. A lane that ran the other way would be the one control
+        // in the app that did.
+        assert!(auto_y_of(row, 1.0) < auto_y_of(row, 0.0), "the lane is upside down");
+        // Out-of-range values are clamped rather than drawn off the row.
+        assert!((auto_y_of(row, 9.0) - auto_y_of(row, 1.0)).abs() < 1e-6);
+        assert!((auto_value_at(row, row.top() - 50.0) - 1.0).abs() < 1e-6);
+    }
+
+    /// **A row that is not a rectangle answers finitely.**
+    ///
+    /// `Rect::NOTHING` in egui is `[+inf, +inf]..[-inf, -inf]`, so its height
+    /// is `-inf`, the inset computed from it is `-inf`, and `inf + -inf` is
+    /// NaN. A NaN reaching the painter is a shape that silently does not
+    /// draw; a NaN in a hit test is a comparison that is false against
+    /// everything. Both look exactly like nothing happening.
+    #[test]
+    fn a_degenerate_row_never_produces_a_nan() {
+        let bad = [
+            Rect::NOTHING,
+            Rect::ZERO,
+            Rect::from_min_max(Pos2::new(10.0, 10.0), Pos2::new(10.0, 10.0)),
+            // Inverted, which is what a layout produces when it runs out of
+            // room and something subtracts past zero.
+            Rect::from_min_max(Pos2::new(10.0, 60.0), Pos2::new(200.0, 10.0)),
+            Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(f32::NAN, 40.0)),
+        ];
+        for r in bad {
+            for v in [0.0_f64, 0.5, 1.0, f64::NAN, f64::INFINITY, -3.0] {
+                let y = auto_y_of(r, v);
+                assert!(y.is_finite(), "{r:?} at {v} drew at {y}");
+            }
+            for y in [0.0_f32, 42.0, f32::NAN, f32::INFINITY, -1e30] {
+                let got = auto_value_at(r, y);
+                assert!(got.is_finite(), "{r:?} at y={y} read {got}");
+                assert!((0.0..=1.0).contains(&got), "{r:?} at y={y} read {got}");
+            }
+        }
+        // A row TOO SHORT for two insets does not invert its own band — every
+        // value would otherwise read as the same one.
+        let thin = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(100.0, 3.0));
+        assert!(
+            auto_y_of(thin, 1.0) <= auto_y_of(thin, 0.0),
+            "a thin row runs backwards"
+        );
+    }
+
+    /// The curve draws at every zoom and every size, without panicking and
+    /// without asking the painter for a coordinate it cannot use.
+    #[test]
+    fn the_automation_lane_paints_at_every_size_and_zoom() {
+        use crate::automation::{AutoParam, Point, Shape};
+        let ctx = egui::Context::default();
+        // The panel writes bar numbers on the ruler, and a bare context has
+        // no font bound to the family they ask for.
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        let pts: Vec<Point> = (0..64)
+            .map(|i| Point {
+                at_s: f64::from(i) * 1.7,
+                value: f64::from(i % 7) / 6.0,
+                shape: if i % 3 == 0 { Shape::Hold } else { Shape::Linear },
+            })
+            .collect();
+        for size in [
+            Vec2::new(1300.0, 420.0),
+            Vec2::new(320.0, 120.0),
+            Vec2::new(60.0, 40.0),
+            Vec2::new(4000.0, 1400.0),
+        ] {
+            for (start, len) in [
+                (0.0_f64, 30.0_f64),
+                (0.0, 1e-4),      // absurdly deep zoom
+                (0.0, 1e7),       // the whole imaginable song
+                (5_000.0, 10.0),  // long past the last point
+            ] {
+                let mut v = a_view(&[]);
+                v.visible_lanes = 8;
+                v.view_start_s = start;
+                v.view_len_s = len;
+                v.lanes[0].automation_open = true;
+                v.lanes[0].automation = Some(AutoView {
+                    param: AutoParam::Gain,
+                    points: &pts,
+                    hot: Some(3),
+                });
+                let r = Rect::from_min_size(Pos2::ZERO, size);
+                // Painting is the assertion: a NaN or an inverted rect
+                // panics in egui's tessellator rather than drawing wrong.
+                ctx.run(Default::default(), |ctx| {
+                    egui::Area::new("auto-probe".into()).show(ctx, |ui| {
+                        draw(ui.painter(), r, &v);
+                    });
+                });
+                // ...and a press anywhere in it answers something sane.
+                for at in [r.center(), r.min, r.max, Pos2::new(r.right(), r.top())] {
+                    let _ = hit_test(r, &v, at);
+                }
+            }
+        }
+    }
+
+    /// **A long curve costs what is on screen, not what is in the song.**
+    ///
+    /// A thousand points on a lane would otherwise be a thousand segments a
+    /// frame at every zoom, nearly all of them off-screen and every one of
+    /// them recomputed sixty times a second.
+    #[test]
+    fn only_the_visible_part_of_a_curve_is_considered() {
+        use crate::automation::{AutoParam, Point, Shape};
+        let pts: Vec<Point> = (0..4_000)
+            .map(|i| Point {
+                at_s: f64::from(i),
+                value: f64::from(i % 2),
+                shape: Shape::Linear,
+            })
+            .collect();
+        let mut v = a_view(&[]);
+        v.visible_lanes = 8;
+        v.view_start_s = 2_000.0;
+        v.view_len_s = 4.0;
+        v.lanes[0].automation_open = true;
+        v.lanes[0].automation = Some(AutoView {
+            param: AutoParam::Gain,
+            points: &pts,
+            hot: None,
+        });
+        let l = Layout::new(rect(), &v);
+        let row = l
+            .rows
+            .iter()
+            .find(|r| r.kind == RowKind::Automation(0))
+            .expect("no automation row")
+            .lane;
+        // **The point under the pointer is the RIGHT one**, four thousand
+        // points in — which is what would break if the culling and the
+        // indexing disagreed by the offset the search skipped.
+        let want = 2_001usize;
+        let at = Pos2::new(
+            x_of(rect(), &v, pts[want].at_s),
+            auto_y_of(row, pts[want].value),
+        );
+        assert_eq!(
+            hit_test(rect(), &v, at),
+            Some(Hit::AutoPoint(0, want)),
+            "the index came back offset by the cull"
+        );
+    }
+
+    /// A press on a point grabs it; a press on empty room makes one.
+    #[test]
+    fn the_automation_row_answers_points_and_empty_room_differently() {
+        use crate::automation::{AutoParam, Point, Shape};
+        let pts = [
+            Point { at_s: 2.0, value: 0.75, shape: Shape::Linear },
+            Point { at_s: 6.0, value: 0.25, shape: Shape::Linear },
+        ];
+        let mut v = a_view(&[]);
+        v.visible_lanes = 8;
+        v.lanes[0].automation_open = true;
+        v.lanes[0].automation = Some(AutoView {
+            param: AutoParam::Gain,
+            points: &pts,
+            hot: None,
+        });
+        let l = Layout::new(rect(), &v);
+        let row = l
+            .rows
+            .iter()
+            .find(|r| r.kind == RowKind::Automation(0))
+            .expect("no automation row")
+            .lane;
+        assert!(row.is_positive());
+
+        // Straight at the first point.
+        let at = Pos2::new(x_of(rect(), &v, 2.0), auto_y_of(row, 0.75));
+        assert_eq!(hit_test(rect(), &v, at), Some(Hit::AutoPoint(0, 0)));
+        // A little off it, still within the handle's reach.
+        let near = Pos2::new(at.x + 2.0, at.y - 2.0);
+        assert_eq!(hit_test(rect(), &v, near), Some(Hit::AutoPoint(0, 0)));
+        // Well away from both: empty room, and it says WHERE.
+        let empty = Pos2::new(x_of(rect(), &v, 4.0), row.center().y);
+        match hit_test(rect(), &v, empty) {
+            Some(Hit::AutoLane(0, t, val)) => {
+                assert!((t - 4.0).abs() < 0.2, "the press landed at {t}s");
+                assert!((val - 0.5).abs() < 0.1, "the middle of the row read as {val}");
+            }
+            other => panic!("empty room answered {other:?}"),
+        }
+        // The nearer of two points wins, not the first.
+        let second = Pos2::new(x_of(rect(), &v, 6.0), auto_y_of(row, 0.25));
+        assert_eq!(hit_test(rect(), &v, second), Some(Hit::AutoPoint(0, 1)));
+    }
+
+    /// A closed row is not hit at all, and its clips still are.
+    #[test]
+    fn a_closed_automation_row_gets_in_nobodys_way() {
+        let mut v = a_view(&[]);
+        v.visible_lanes = 8;
+        let l = Layout::new(rect(), &v);
+        assert!(
+            !l.rows.iter().any(|r| matches!(r.kind, RowKind::Automation(_))),
+            "a closed lane laid out an automation row"
+        );
+        // The lane under the pointer is still the track's own.
+        let p = l.lane_rows[0].center();
+        assert!(
+            matches!(hit_test(rect(), &v, p), Some(Hit::Lane(0, _))),
+            "the track lane stopped answering"
+        );
     }
 
     /// **The rewrite is a no-op until something is expanded.**

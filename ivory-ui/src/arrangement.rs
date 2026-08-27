@@ -412,6 +412,14 @@ pub struct Arrangement {
     /// Keys this build does not know, kept so a newer build's document
     /// survives being opened here — the settings file's own bargain.
     pub extra: Map<String, Value>,
+    /// Every automated control's curve. See [`crate::automation`].
+    ///
+    /// In the document beside the tempo map, and for the same two reasons: a
+    /// curve is a fact about a SONG rather than a preference, and putting it
+    /// here puts it inside the undo funnel for nothing — `undo_state` is the
+    /// whole `Arrangement` serialised, so drawing a point becomes undoable
+    /// without a line of new code.
+    pub automation: crate::automation::Automation,
     /// Tempo over the whole song, in quarter notes. See
     /// [`crate::tempo::TempoMap`].
     ///
@@ -466,6 +474,7 @@ impl Default for Arrangement {
             version: ARRANGEMENT_VERSION,
             tempo: crate::tempo::TempoMap::default(),
             meter: crate::tempo::MeterMap::default(),
+            automation: crate::automation::Automation::default(),
         }
     }
 }
@@ -578,6 +587,7 @@ impl Arrangement {
         // the sort of thing somebody notices as "it sounds wrong" and never
         // reports as a bug.
         let (tempo, meter) = Self::read_maps(&mut map, version, desk.as_ref());
+        let automation = Self::read_automation(&mut map);
         let mut clips = Vec::new();
         if let Some(Value::Array(list)) = map.shift_remove("clips") {
             for item in list {
@@ -710,6 +720,7 @@ impl Arrangement {
             version: version.max(ARRANGEMENT_VERSION),
             tempo,
             meter,
+            automation,
         }
     }
 
@@ -768,6 +779,52 @@ impl Arrangement {
             )),
         };
         (tempo, meter)
+    }
+
+    /// The automation curves, or none at all.
+    ///
+    /// **No version gate**, unlike the tempo maps: there is nothing in a v4
+    /// document to migrate FROM, so an absent key simply means a song nobody
+    /// has automated. Every value is put through `Curve::sanitised` rather
+    /// than believed, for the reason that function gives.
+    fn read_automation(map: &mut Map<String, Value>) -> crate::automation::Automation {
+        use crate::automation::{AutoParam, Automation, Curve, Point, Shape};
+        let Some(Value::Array(list)) = map.shift_remove("automation") else {
+            return Automation::default();
+        };
+        let curves = list
+            .iter()
+            .filter_map(|v| {
+                let o = v.as_object()?;
+                let lane = usize::try_from(o.get("lane")?.as_u64()?).ok()?;
+                // A curve naming a channel this desk does not have is
+                // DROPPED rather than clamped onto channel 15: a level
+                // landing on the wrong instrument is worse than one that
+                // does not land at all, and it would be silent.
+                if lane >= crate::recorder::CHANNELS {
+                    return None;
+                }
+                let param = AutoParam::from_key(o.get("param")?.as_str()?)?;
+                let points = o
+                    .get("points")?
+                    .as_array()?
+                    .iter()
+                    .filter_map(|p| {
+                        let p = p.as_object()?;
+                        Some(Point {
+                            at_s: p.get("at")?.as_f64()?,
+                            value: p.get("v")?.as_f64()?,
+                            shape: p
+                                .get("shape")
+                                .and_then(Value::as_str)
+                                .map_or(Shape::Linear, Shape::from_key),
+                        })
+                    })
+                    .collect();
+                Some(Curve::sanitised(lane, param, points))
+            })
+            .collect();
+        Automation::from_curves(curves)
     }
 
     pub fn to_json(&self) -> String {
@@ -902,6 +959,53 @@ impl Arrangement {
                             if p.ramp {
                                 o.insert("ramp".into(), Value::Bool(true));
                             }
+                            Value::Object(o)
+                        })
+                        .collect(),
+                ),
+            );
+        }
+        // Written only when there is automation, so a song without any keeps
+        // the shape it had — the same bargain the maps make.
+        if !self.automation.is_empty() {
+            map.insert(
+                "automation".into(),
+                Value::Array(
+                    self.automation
+                        .curves()
+                        .iter()
+                        .map(|c| {
+                            let mut o = Map::new();
+                            o.insert("lane".into(), Value::Number((c.lane as u64).into()));
+                            o.insert("param".into(), Value::String(c.param.key().to_owned()));
+                            o.insert(
+                                "points".into(),
+                                Value::Array(
+                                    c.points()
+                                        .iter()
+                                        .map(|p| {
+                                            let mut q = Map::new();
+                                            for (k, v) in [("at", p.at_s), ("v", p.value)] {
+                                                if let Some(n) =
+                                                    serde_json::Number::from_f64(v)
+                                                {
+                                                    q.insert(k.into(), Value::Number(n));
+                                                }
+                                            }
+                                            // The ordinary shape is not
+                                            // written; a file of linear
+                                            // points stays small.
+                                            if p.shape != crate::automation::Shape::Linear {
+                                                q.insert(
+                                                    "shape".into(),
+                                                    Value::String(p.shape.key().to_owned()),
+                                                );
+                                            }
+                                            Value::Object(q)
+                                        })
+                                        .collect(),
+                                ),
+                            );
                             Value::Object(o)
                         })
                         .collect(),
@@ -1168,6 +1272,66 @@ mod tests {
         // The ritardando's flag is part of it — a ramp read back as a step
         // is a different piece of music.
         assert!(back.tempo.points()[0].ramp, "the ramp was flattened");
+    }
+
+    /// Automation survives a round trip, and costs nothing without any.
+    #[test]
+    fn automation_round_trips_and_an_unautomated_song_writes_none() {
+        use crate::automation::{AutoParam, Curve, Point, Shape};
+        let plain = Arrangement::default();
+        assert!(
+            !plain.to_json().contains("automation"),
+            "a song nobody automated wrote a curve"
+        );
+
+        let mut a = Arrangement::default();
+        // A clip, so `next_id` has been handed out — an empty document keeps
+        // 0 while a read one starts at 1, which is older behaviour and not
+        // what this test is about.
+        a.add_clip(a_clip(2, "/x/take.wav", 0.0));
+        a.automation.set(Curve::sanitised(
+            2,
+            AutoParam::Gain,
+            vec![
+                Point { at_s: 0.0, value: 1.0, shape: Shape::Linear },
+                Point { at_s: 8.0, value: 0.25, shape: Shape::Hold },
+            ],
+        ));
+        a.automation.set(Curve::sanitised(
+            2,
+            AutoParam::Pan,
+            vec![Point { at_s: 4.0, value: 0.0, shape: Shape::Linear }],
+        ));
+        let back = Arrangement::from_json(&a.to_json());
+        assert_eq!(back.automation, a.automation, "the curves did not survive");
+        // The shape is part of the music: a hold read back as a ramp is a
+        // level that slides where it was meant to step.
+        assert_eq!(
+            back.automation.get(2, AutoParam::Gain).expect("a curve").points()[1].shape,
+            Shape::Hold,
+            "the hold was flattened"
+        );
+        assert_eq!(back, a, "the document did not survive its own round trip");
+    }
+
+    /// A curve naming a channel this desk has not got is dropped.
+    ///
+    /// Clamping it onto the last channel would put somebody's fade on the
+    /// wrong instrument, silently. Dropping it loses the curve and nothing
+    /// else.
+    #[test]
+    fn a_curve_for_a_channel_that_does_not_exist_is_not_moved_onto_one_that_does() {
+        let a = Arrangement::from_json(
+            r#"{"arrangement_version": 5, "clips": [], "automation": [
+                {"lane": 99, "param": "gain", "points": [{"at": 0, "v": 0.5}]},
+                {"lane": 1, "param": "gain", "points": [{"at": 0, "v": 0.5}]},
+                {"lane": 2, "param": "nonesuch", "points": [{"at": 0, "v": 0.5}]}]}"#,
+        );
+        assert_eq!(a.automation.curves().len(), 1, "{:?}", a.automation.curves());
+        assert_eq!(a.automation.curves()[0].lane, 1);
+        // A parameter from a newer build is dropped for the same reason: it
+        // is better to lose one curve than to apply it to the wrong control.
+        assert!(a.automation.get(2, crate::automation::AutoParam::Gain).is_none());
     }
 
     /// An anchor survives, and is only written when it says something.
