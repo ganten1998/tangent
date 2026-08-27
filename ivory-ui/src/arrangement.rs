@@ -50,7 +50,34 @@ use std::path::PathBuf;
 
 /// The document's schema version. Bump WITH a migration arm in
 /// [`Arrangement::from_map`], never without one.
+///
+/// **A document that already claims a HIGHER number keeps it.** See
+/// [`Arrangement::version`]: writing this constant unconditionally would
+/// stamp "version 4" on a file still full of version 9's keys, and the build
+/// that wrote them would then run its 4→9 migrations over data that had
+/// already been through them.
 pub const ARRANGEMENT_VERSION: u64 = 4;
+
+/// Every key a clip object holds that THIS build understands.
+///
+/// One list, because it is read in two directions and the two must not
+/// drift: [`Arrangement::from_map`] subtracts it from a clip object to find
+/// the keys that belong to a newer build, and
+/// `a_clip_knows_which_of_its_keys_are_its_own` walks a fully-populated clip
+/// through a round trip to prove nothing was left off it.
+const CLIP_KEYS: [&str; 11] = [
+    "kind",
+    "lane",
+    "path",
+    "name",
+    "notes",
+    "id",
+    "start_s",
+    "offset_s",
+    "len_s",
+    "fade_in_s",
+    "fade_out_s",
+];
 
 /// What a clip is made of.
 ///
@@ -91,7 +118,7 @@ pub struct RecordedClip {
 }
 
 /// One piece of audio or MIDI standing on the timeline.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ArrClip {
     pub kind: ClipKind,
     /// A MIDI clip's notes. Empty on audio clips, and on a MIDI item that
@@ -119,6 +146,23 @@ pub struct ArrClip {
     /// Stable identity for edits — selection, undo one day. Assigned from
     /// [`Arrangement::next_id`], never reused within a document.
     pub id: u64,
+    /// Keys THIS build does not know, kept so a newer build's clip survives
+    /// being opened here.
+    ///
+    /// **The document already made this bargain and the clips were left out
+    /// of it.** [`Arrangement::extra`] has always carried the top-level keys
+    /// a newer build wrote — that is what `a_newer_builds_keys_survive`
+    /// proves — but the clip loop destructured each clip object, read the
+    /// eleven fields it knew, and dropped the rest on the floor. So a
+    /// document whose clips carry a stretch ratio, an automation curve or a
+    /// beat anchor came back from an older build with the timeline intact
+    /// and every clip silently reverted.
+    ///
+    /// It has never mattered, because no build has ever written a per-clip
+    /// key this one does not know. It is about to matter three times over,
+    /// which is why the bag arrives BEFORE any of them rather than after the
+    /// first one loses somebody's work.
+    pub extra: Map<String, Value>,
 }
 
 impl ArrClip {
@@ -281,7 +325,7 @@ impl DeskSnap {
 }
 
 /// The whole document.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Arrangement {
     pub clips: Vec<ArrClip>,
     /// The desk this session was saved with. `None` in documents older
@@ -297,6 +341,47 @@ pub struct Arrangement {
     /// Keys this build does not know, kept so a newer build's document
     /// survives being opened here — the settings file's own bargain.
     pub extra: Map<String, Value>,
+    /// The schema version this document is IN, which is never lower than
+    /// [`ARRANGEMENT_VERSION`].
+    ///
+    /// Normalised on the way in, because reading a v1 document with this
+    /// build's reader **is** the v1→v4 migration — "the migration is the
+    /// defaults", as the header says. So the value here is what the document
+    /// became, not what the file happened to claim, and a load followed by a
+    /// save is idempotent.
+    ///
+    /// **Read and then thrown away, until now.** `from_map` bound it into
+    /// `let _version` and `to_json` wrote the constant back, which meant
+    /// opening a version-9 song in this build and touching anything wrote
+    /// out a file that claimed to be version 4 while still carrying every
+    /// version-9 key — because `extra` faithfully preserved them. The build
+    /// that made that song would open it next, believe the stamp, and run
+    /// its 4→9 migrations a second time over data that had already been
+    /// migrated.
+    ///
+    /// The extras bargain is "we do not understand your keys, so we will not
+    /// touch them". Rewriting the version stamp is touching them, in the one
+    /// way guaranteed to be misread. So a higher number RIDES ALONG, and the
+    /// only direction this value ever moves is up.
+    pub version: u64,
+}
+
+impl Default for Arrangement {
+    /// A document this build invented is a document at this build's version.
+    ///
+    /// Hand-written rather than derived for that one field: a derived
+    /// `Default` gives `version: 0`, and the empty document that a corrupt
+    /// file falls back to would then be saved claiming to predate the stamp.
+    fn default() -> Self {
+        Self {
+            clips: Vec::new(),
+            desk: None,
+            next_id: 0,
+            named: false,
+            extra: Map::new(),
+            version: ARRANGEMENT_VERSION,
+        }
+    }
 }
 
 impl Arrangement {
@@ -388,7 +473,7 @@ impl Arrangement {
         // Version 1 documents simply lack the v2 fields, and every one of
         // them has an honest default — no trim, no fade, name from the file,
         // ids assigned below — so the "migration" is the defaults.
-        let _version = map
+        let version = map
             .shift_remove("arrangement_version")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
@@ -402,7 +487,7 @@ impl Arrangement {
         let mut clips = Vec::new();
         if let Some(Value::Array(list)) = map.shift_remove("clips") {
             for item in list {
-                let Value::Object(c) = item else { continue };
+                let Value::Object(mut c) = item else { continue };
                 let lane = c.get("lane").and_then(Value::as_u64).unwrap_or(0) as usize;
                 let kind = match c.get("kind").and_then(Value::as_str) {
                     Some("midi") => ClipKind::Midi,
@@ -445,7 +530,7 @@ impl Arrangement {
                         });
                     }
                 }
-                clips.push(ArrClip {
+                let clip = ArrClip {
                     kind,
                     notes,
                     lane,
@@ -457,7 +542,28 @@ impl Arrangement {
                     fade_out_s: secs(&c, "fade_out_s"),
                     name,
                     id: c.get("id").and_then(Value::as_u64).unwrap_or(0),
-                });
+                    // **Whatever is left is somebody else's.** Take the keys
+                    // this build understands out of the object and keep the
+                    // remainder verbatim; `shift_remove` and not `remove`,
+                    // for the settings file's reason — under `preserve_order`
+                    // the plain one is a swap and would rotate a preserved
+                    // key into the hole it just made.
+                    //
+                    // The list below is the eleven names read above and must
+                    // stay in step with them. A field added to `ArrClip`
+                    // without a name added here comes back DUPLICATED: once
+                    // as itself and once inside `extra`, and the extras merge
+                    // in `to_json` would then be writing a stale copy of a
+                    // live field. `a_clip_knows_which_of_its_keys_are_its_own`
+                    // is what catches that.
+                    extra: {
+                        for known in CLIP_KEYS {
+                            c.shift_remove(known);
+                        }
+                        c
+                    },
+                };
+                clips.push(clip);
             }
         }
         // Ids: keep what the file says where it is usable, hand out fresh
@@ -488,14 +594,21 @@ impl Arrangement {
             next_id,
             named,
             extra: map,
+            // Up, never down. A v1 document has just been migrated by being
+            // read; a v9 one keeps the number its own build will look for.
+            version: version.max(ARRANGEMENT_VERSION),
         }
     }
 
     pub fn to_json(&self) -> String {
         let mut map = Map::new();
+        // The document's OWN version, not this build's constant. See
+        // [`Arrangement::version`]: stamping 4 onto a file still carrying a
+        // version-9 build's keys — which `extra` faithfully preserves —
+        // would tell that build its own migrations had not run yet.
         map.insert(
             "arrangement_version".into(),
-            Value::Number(ARRANGEMENT_VERSION.into()),
+            Value::Number(self.version.into()),
         );
         map.insert(
             "next_clip_id".into(),
@@ -571,6 +684,17 @@ impl Arrangement {
                                 m.insert(key.into(), Value::Number(n));
                             }
                         }
+                        // The clip's unknown keys LAST, and a KNOWN key wins
+                        // — the document-level rule at the tail of this
+                        // function, applied one level down. (The settings
+                        // file resolves the same collision the other way, and
+                        // deliberately: there a preserved extra is the newer
+                        // build's opinion about a key this one has since
+                        // learned. Here the field was just written from live
+                        // state and the extra is a stale copy of it.)
+                        for (k, v) in &c.extra {
+                            m.entry(k.clone()).or_insert_with(|| v.clone());
+                        }
                         Value::Object(m)
                     })
                     .collect(),
@@ -614,6 +738,7 @@ mod tests {
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default(),
             id: 0,
+            extra: Map::new(),
         }
     }
 
@@ -714,6 +839,115 @@ mod tests {
         assert!(
             out.contains("tempo_map") && out.contains("121"),
             "a newer build's tempo map was stripped: {out}"
+        );
+    }
+
+    /// A newer build's keys ON A CLIP survive too — the half of the bargain
+    /// the clips were left out of.
+    ///
+    /// This is the whole reason [`ArrClip::extra`] exists. Before it, a
+    /// document whose clips carried a stretch ratio or a beat anchor opened
+    /// here with the timeline perfectly intact and every clip quietly
+    /// reverted, which is the worst shape a data-loss bug can take: nothing
+    /// looks wrong until you go back to the build that wrote it.
+    #[test]
+    fn a_newer_builds_clip_keys_survive() {
+        let a = Arrangement::from_json(
+            r#"{"arrangement_version": 9, "clips": [
+                {"lane": 1, "path": "media/solo.wav", "start_s": 4.0,
+                 "stretch": {"ratio": 0.847, "mode": "wsola"},
+                 "anchor": "beat"}]}"#,
+        );
+        assert_eq!(a.clips.len(), 1);
+        let out = a.to_json();
+        assert!(out.contains("0.847"), "the clip's stretch ratio was stripped: {out}");
+        assert!(out.contains("wsola"), "the clip's stretch mode was stripped: {out}");
+        assert!(out.contains(r#""anchor""#), "the clip's anchor was stripped: {out}");
+        // And the whole document is still equal to itself across the trip,
+        // which is what makes an older build safe to open a song in.
+        assert_eq!(Arrangement::from_json(&out), a);
+    }
+
+    /// The version stamp only ever moves UP.
+    ///
+    /// A v9 document opened here and re-saved must still say 9. It says so
+    /// while carrying v9's keys — see the test above — and a build that
+    /// found "4" on that file would run its 4→9 migrations over data that
+    /// had already been through them.
+    #[test]
+    fn the_version_stamp_never_goes_backwards() {
+        let newer = Arrangement::from_json(r#"{"arrangement_version": 9, "clips": []}"#);
+        assert_eq!(newer.version, 9);
+        assert!(
+            newer.to_json().contains(r#""arrangement_version": 9"#),
+            "a newer build's document was downgraded: {}",
+            newer.to_json()
+        );
+        // An OLDER document is upgraded, because reading it here is the
+        // migration — that is the direction this is allowed to move.
+        let older = Arrangement::from_json(r#"{"arrangement_version": 1, "clips": []}"#);
+        assert_eq!(older.version, ARRANGEMENT_VERSION);
+        // And a document with no stamp at all, which is what v0 files are.
+        assert_eq!(Arrangement::from_json("{}").version, ARRANGEMENT_VERSION);
+        // A document this build invented is at this build's version, never
+        // zero — the reason `Default` is hand-written.
+        assert_eq!(Arrangement::default().version, ARRANGEMENT_VERSION);
+    }
+
+    /// [`CLIP_KEYS`] names every key a clip writes, and nothing it does not.
+    ///
+    /// **The drift this catches is silent and self-inflicted.** A field
+    /// added to `ArrClip` and to `to_json` but forgotten in `CLIP_KEYS` is
+    /// not dropped — it comes back DOUBLED, once as the live field and once
+    /// inside `extra`, and the extras merge then keeps writing a copy that
+    /// stopped tracking the field the first time somebody edited it. Nothing
+    /// fails, the file just grows a stale twin of a real value.
+    #[test]
+    fn a_clip_knows_which_of_its_keys_are_its_own() {
+        let mut a = Arrangement::default();
+        a.add_clip(ArrClip {
+            kind: ClipKind::Midi,
+            notes: vec![ArrNote { at_s: 0.5, dur_s: 1.0, key: 64, vel: 99 }],
+            lane: 2,
+            path: String::new(),
+            start_s: 3.0,
+            offset_s: 0.25,
+            len_s: 9.0,
+            fade_in_s: 0.1,
+            fade_out_s: 0.2,
+            name: "everything set".into(),
+            id: 0,
+            extra: Map::new(),
+        });
+        let Ok(Value::Object(doc)) = serde_json::from_str::<Value>(&a.to_json()) else {
+            panic!("the document did not parse as an object");
+        };
+        let Some(Value::Array(clips)) = doc.get("clips") else {
+            panic!("no clips array");
+        };
+        let Some(Value::Object(c)) = clips.first() else {
+            panic!("no clip");
+        };
+        for key in c.keys() {
+            assert!(
+                CLIP_KEYS.contains(&key.as_str()),
+                "`{key}` is written by `to_json` and missing from CLIP_KEYS, so it \
+                 will come back duplicated inside `extra`"
+            );
+        }
+        // And nothing in the list is a name the writer never emits, which
+        // would quietly make a real newer-build key look known and drop it.
+        for known in CLIP_KEYS {
+            assert!(
+                c.contains_key(known),
+                "CLIP_KEYS names `{known}`, which a fully-populated clip does not \
+                 write — a newer build's `{known}` would be silently discarded"
+            );
+        }
+        // The round trip leaves the bag empty, because every key was ours.
+        assert!(
+            Arrangement::from_json(&a.to_json()).clips[0].extra.is_empty(),
+            "a clip claimed one of its own keys as a stranger's"
         );
     }
 

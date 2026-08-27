@@ -1043,6 +1043,7 @@ fn clip_at(rel_path: &str, lane: usize, start_s: f64) -> crate::arrangement::Arr
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default(),
         id: 0,
+        extra: Default::default(),
     }
 }
 
@@ -2773,6 +2774,7 @@ impl IvoryApp {
             fade_out_s: 6.0,
             name: "Blue Bossa - backing".to_owned(),
             id: 0,
+            extra: Default::default(),
         });
         let take = arr.add_clip(crate::arrangement::ArrClip {
             kind: crate::arrangement::ClipKind::Audio,
@@ -2786,6 +2788,7 @@ impl IvoryApp {
             fade_out_s: 0.4,
             name: "take 3".to_owned(),
             id: 0,
+            extra: Default::default(),
         });
         let solo = arr.add_clip(crate::arrangement::ArrClip {
             kind: crate::arrangement::ClipKind::Audio,
@@ -2799,6 +2802,7 @@ impl IvoryApp {
             fade_out_s: 2.5,
             name: "solo".to_owned(),
             id: 0,
+            extra: Default::default(),
         });
         // And a MIDI item with a phrase in it, so the note miniature is in
         // the picture.
@@ -2828,6 +2832,7 @@ impl IvoryApp {
             fade_out_s: 0.0,
             name: "MIDI".to_owned(),
             id: 0,
+            extra: Default::default(),
         });
         self.arrangement = arr;
         let wave = |n: usize, seed: f32| -> Vec<f32> {
@@ -2924,6 +2929,7 @@ impl IvoryApp {
                     tune,
                     choke,
                 },
+                extra: Default::default(),
             };
             let wave: Vec<f32> = (0..48)
                 .map(|b| {
@@ -2945,6 +2951,7 @@ impl IvoryApp {
             path: "media/Cowbell.wav".to_owned(),
             name: String::new(),
             params: recorder::DrumPadParams::default(),
+            extra: Default::default(),
         };
         self.drumpad_status[11] = crate::ports::PadStatus {
             loaded: false,
@@ -4865,6 +4872,7 @@ impl IvoryApp {
             fade_out_s: 0.0,
             name,
             id: 0,
+            extra: Default::default(),
         });
         let _ = doc;
         self.arr_save_edits();
@@ -5000,6 +5008,7 @@ impl IvoryApp {
                 fade_out_s: 0.0,
                 name,
                 id: 0,
+                extra: Default::default(),
             });
             added = Some(id);
         }
@@ -6780,6 +6789,7 @@ impl IvoryApp {
                 fade_out_s: tail_fade,
                 name: c.name.clone(),
                 id: 0,
+                extra: Default::default(),
             });
         }
         if tails.is_empty() {
@@ -10610,6 +10620,7 @@ impl IvoryApp {
                         fade_out_s: 0.0,
                         name: "MIDI".to_owned(),
                         id: 0,
+                        extra: Default::default(),
                     });
                     self.arr_save_edits();
                 }
@@ -17286,6 +17297,7 @@ mod tests {
             fade_out_s: 0.0,
             name: "MIDI".to_owned(),
             id: 0,
+            extra: Default::default(),
         });
         app.open_midi_editor(id);
         app.me_select_all();
@@ -17405,6 +17417,7 @@ mod tests {
             fade_out_s: 0.0,
             name: "old".to_owned(),
             id: 0,
+            extra: Default::default(),
         });
         app.add_recorded_clips(vec![crate::arrangement::RecordedClip {
             lane: 0,
@@ -17458,6 +17471,7 @@ mod tests {
             fade_out_s: 0.0,
             name: "old".to_owned(),
             id: 0,
+            extra: Default::default(),
         });
         app.add_recorded_clips(vec![crate::arrangement::RecordedClip {
             lane: 0,
@@ -17498,6 +17512,7 @@ mod tests {
             fade_out_s: 0.0,
             name: "x".to_owned(),
             id: 0,
+            extra: Default::default(),
         };
         // One spanning clip 0..20, one swallowed 22..24, one tail-side 25..35.
         app.arrangement.add_clip(clip(1, 0.0, 20.0));
@@ -17677,6 +17692,7 @@ mod tests {
             fade_out_s: 0.0,
             name: "MIDI".to_owned(),
             id: 0,
+            extra: Default::default(),
         });
         app.open_midi_editor(id);
         assert!(app.midi_edit.is_some(), "the editor did not open");
@@ -19600,6 +19616,7 @@ mod tests {
             fade_out_s: 0.0,
             name: "MIDI".to_owned(),
             id: 0,
+            extra: Default::default(),
         });
         let id = app.arrangement.clips[0].id;
         let _ = run_frame(&ctx, &mut app);
@@ -20136,6 +20153,7 @@ mod tests {
             fade_out_s: 0.0,
             name: "m".into(),
             id: 0,
+            extra: Default::default(),
         });
         app.arrangement.add_clip(ArrClip {
             kind: ClipKind::Audio,
@@ -20149,6 +20167,7 @@ mod tests {
             fade_out_s: 0.1,
             name: "a".into(),
             id: 0,
+            extra: Default::default(),
         });
         app.apply_recorder_hit(recorder_panel::Hit::SetTempo(180.0));
         let r = 120.0 / 180.0;
@@ -20196,6 +20215,7 @@ mod tests {
             fade_out_s: 0.0,
             name: "m".into(),
             id: 0,
+            extra: Default::default(),
         });
         let id = app.arrangement.clips[0].id;
         app.open_midi_editor(id);

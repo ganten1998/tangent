@@ -1406,6 +1406,155 @@ impl Default for Settings {
     }
 }
 
+/// How much of the settings a reset puts back.
+///
+/// **One row became six, because "Reset Settings to Default" was answering a
+/// question nobody asks.** It destroyed all one hundred and sixty-four fields
+/// — the desk, every colour, the chosen audio interface and camera, the
+/// record folder, and `project_path`, which defaults to empty and so silently
+/// orphaned the open session at the next launch — from a row sitting directly
+/// under About in every context menu the app opens, with no confirmation.
+///
+/// The overwhelmingly common real intent is "undo what I did to the colours".
+/// A confirmation in front of the old behaviour would have made that intent
+/// cost the user their audio setup slightly less often. Naming the scopes
+/// makes it cost them nothing.
+///
+/// The five parts partition the struct: every field belongs to exactly one,
+/// except `strip_colors` which belongs to two, and the ten bookkeeping fields
+/// that belong to none and must never be reset (`extra`, the migration
+/// flags). `the_scopes_together_are_everything` is what keeps that true — a
+/// field added to `Settings` and to no scope fails it by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetScope {
+    Colours,
+    Layout,
+    Playing,
+    Desk,
+    Devices,
+    Everything,
+}
+
+impl ResetScope {
+    /// Every scope, in the order the menu offers them: the four narrow ones
+    /// a person actually wants, then the one that used to be the only one.
+    pub const ALL: [ResetScope; 6] = [
+        ResetScope::Colours,
+        ResetScope::Layout,
+        ResetScope::Playing,
+        ResetScope::Desk,
+        ResetScope::Devices,
+        ResetScope::Everything,
+    ];
+
+    /// The five parts, without `Everything` — what the exhaustiveness test
+    /// walks, and what `Everything` is defined as applying all of.
+    pub const PARTS: [ResetScope; 5] = [
+        ResetScope::Colours,
+        ResetScope::Layout,
+        ResetScope::Playing,
+        ResetScope::Desk,
+        ResetScope::Devices,
+    ];
+
+    /// The menu row. Ends in an ellipsis because every one of them opens a
+    /// confirmation — the app's own convention for a row that asks before it
+    /// acts.
+    pub fn row(self) -> &'static str {
+        match self {
+            ResetScope::Colours => "Colours and Theme...",
+            ResetScope::Layout => "Layout and Windows...",
+            ResetScope::Playing => "Playing and Theory...",
+            ResetScope::Desk => "The Desk...",
+            ResetScope::Devices => "Devices and Folders...",
+            ResetScope::Everything => "Everything...",
+        }
+    }
+
+    /// The confirmation's title.
+    pub fn title(self) -> &'static str {
+        match self {
+            ResetScope::Colours => "Reset Colours and Theme",
+            ResetScope::Layout => "Reset Layout and Windows",
+            ResetScope::Playing => "Reset Playing and Theory",
+            ResetScope::Desk => "Reset the Desk",
+            ResetScope::Devices => "Reset Devices and Folders",
+            ResetScope::Everything => "Reset Everything",
+        }
+    }
+
+    /// What it will do, in the words somebody would use for it.
+    pub fn body(self) -> &'static str {
+        match self {
+            ResetScope::Colours => {
+                "This puts every colour, the theme and the font back to how \
+                 Tangent came, and lets the channels take their colours from \
+                 the theme again."
+            }
+            ResetScope::Layout => {
+                "This puts the window back to its opening size and position, \
+                 shows the bands a fresh install shows, and re-attaches \
+                 anything you have detached."
+            }
+            ResetScope::Playing => {
+                "This puts the tuning, capo, key, note names, grids, snap, \
+                 swing and transpose back to how Tangent came."
+            }
+            ResetScope::Desk => {
+                "This empties every channel: names, colours, inputs, inserts, \
+                 sends, faders, pans, mutes, solos, the routes, the buses, \
+                 the effects, and the built-in instrument's patch."
+            }
+            ResetScope::Devices => {
+                "This forgets your audio interface, camera and inputs, and \
+                 puts the record folder and the open project back to their \
+                 defaults."
+            }
+            ResetScope::Everything => {
+                "This puts all five of the above back at once: colours, \
+                 layout, playing, the desk, and your devices and folders."
+            }
+        }
+    }
+
+    /// What survives. Its own line, because the reason this row was
+    /// frightening is that it never said.
+    pub fn kept(self) -> &'static str {
+        // The three that survive ANY reset are named every time: taught
+        // chords live in `overrides.json`, saved themes in the `user themes`
+        // folder, and neither is written by a reset. Projects on disk are
+        // never touched by any of this.
+        match self {
+            ResetScope::Colours => {
+                "Kept: the desk, your devices, the record folder, the open \
+                 project, your taught chords, and your saved theme files."
+            }
+            ResetScope::Layout => {
+                "Kept: every colour, the desk, your devices, the record \
+                 folder, the open project, and your taught chords."
+            }
+            ResetScope::Playing => {
+                "Kept: every colour, the desk, your devices, the open \
+                 project, and your taught chords."
+            }
+            ResetScope::Desk => {
+                "Kept: your devices, the record folder, the open project, \
+                 every recording you have made, your taught chords, and your \
+                 saved theme files."
+            }
+            ResetScope::Devices => {
+                "Kept: every colour, the desk, your projects and recordings \
+                 on disk, and your taught chords."
+            }
+            ResetScope::Everything => {
+                "Kept: your projects and recordings on disk, your taught \
+                 chords, and your saved theme files. Nothing you have \
+                 recorded is deleted."
+            }
+        }
+    }
+}
+
 impl Settings {
     /// The colour a theme named for `role` in DARK mode, if it named one.
     ///
@@ -3247,6 +3396,300 @@ impl Settings {
         }
     }
 
+    /// Where the copy taken before a destructive action lives.
+    ///
+    /// Beside `settings.json`, and named so a person poking at the folder can
+    /// tell what it is without being told.
+    pub fn backup_path() -> std::path::PathBuf {
+        Self::path().with_file_name("settings.backup.json")
+    }
+
+    /// Put the CURRENT settings aside, so the next thing has a way back.
+    ///
+    /// **Deliberately not a `.bak` written on every save.** This app saves on
+    /// every change — a fader, a colour, a window drag — so a backup that
+    /// tracked every write would be a copy of the state you are trying to
+    /// escape by the time you wanted it. It is taken at the one moment a
+    /// backup means something: immediately before something irreversible.
+    ///
+    /// Written from memory rather than copied from disk, because memory is
+    /// the truth: a setting changed this frame may not have reached the file
+    /// yet, and a file copy would quietly restore a slightly older desk.
+    pub fn write_backup(&self) -> bool {
+        self.write_backup_to(&Self::backup_path())
+    }
+
+    /// The same, to a named path — the half a test can drive.
+    ///
+    /// `Settings::path` reads a process-global environment variable, so a
+    /// test that pointed it somewhere safe would be changing it for every
+    /// other test running beside it. `save_to`/`load_from` already split this
+    /// way for the same reason.
+    pub fn write_backup_to(&self, path: &std::path::Path) -> bool {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let Ok(text) = serde_json::to_string_pretty(&Value::Object(self.to_map())) else {
+            return false;
+        };
+        // Write-then-rename, like every other file this app owns: a torn
+        // backup is worse than none, because it looks like a way back.
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, text).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return false;
+        }
+        if std::fs::rename(&tmp, &path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return false;
+        }
+        true
+    }
+
+    /// The copy, if there is a readable one. `None` covers both "never taken"
+    /// and "will not parse", which are the same thing to a caller offering an
+    /// Undo: there is nothing to go back to.
+    pub fn load_backup() -> Option<Self> {
+        Self::try_load_from(&Self::backup_path())
+    }
+
+    /// The same, from a named path.
+    pub fn load_backup_from(path: &std::path::Path) -> Option<Self> {
+        Self::try_load_from(path)
+    }
+
+    /// Whether an Undo has anything to offer.
+    pub fn has_backup() -> bool {
+        Self::backup_path().exists()
+    }
+
+    /// Put one part of the settings back to what a fresh install has.
+    ///
+    /// See [`ResetScope`] for why this is five narrow answers and one wide
+    /// one rather than the single wide one it used to be.
+    pub fn reset(&mut self, scope: ResetScope) {
+        let fresh = Self::first_launch();
+        let all = scope == ResetScope::Everything;
+        if all || scope == ResetScope::Colours {
+            self.take_colours(&fresh);
+        }
+        if all || scope == ResetScope::Layout {
+            self.take_layout(&fresh);
+        }
+        if all || scope == ResetScope::Playing {
+            self.take_playing(&fresh);
+        }
+        if all || scope == ResetScope::Desk {
+            self.take_desk(&fresh);
+        }
+        if all || scope == ResetScope::Devices {
+            self.take_devices(&fresh);
+        }
+        // A reset is not a first launch: the migrations have already run, and
+        // re-running them would put video back on for somebody who has just
+        // asked for something to go back to how it was. The same two lines
+        // `reset_to_defaults` has always carried, and for its reason.
+        self.video_default_applied = true;
+        self.shows_default_applied = true;
+    }
+
+    /// Every colour role, the theme that names them, the font, and the
+    /// auto-palette the desk follows.
+    ///
+    /// `strip_colors` is here AND in [`Settings::take_desk`] — the one field two
+    /// scopes own. It is a colour and it is a property of the desk, and somebody
+    /// asking for either of those back means it either way.
+    fn take_colours(&mut self, fresh: &Self) {
+        self.dark_mode = fresh.dark_mode;
+        self.dark_roles = fresh.dark_roles.clone();
+        self.background_color = fresh.background_color;
+        self.white_key_idle_color = fresh.white_key_idle_color;
+        self.black_key_idle_color = fresh.black_key_idle_color;
+        self.white_key_active_color = fresh.white_key_active_color;
+        self.black_key_active_color = fresh.black_key_active_color;
+        self.sustain_color = fresh.sustain_color;
+        self.key_separator_color = fresh.key_separator_color;
+        self.theory_line_color = fresh.theory_line_color;
+        self.interval_text_color = fresh.interval_text_color;
+        self.fx_knob_color = fresh.fx_knob_color;
+        self.master_knob_color = fresh.master_knob_color;
+        self.meter_bg_color = fresh.meter_bg_color;
+        self.scope_draw_color = fresh.scope_draw_color;
+        self.fx_strip_color = fresh.fx_strip_color;
+        self.input_chip_color = fresh.input_chip_color;
+        self.fretboard_color = fresh.fretboard_color;
+        self.string_color = fresh.string_color;
+        self.theme_name = fresh.theme_name.clone();
+        self.chord_text_color = fresh.chord_text_color;
+        self.recorder_bg_color = fresh.recorder_bg_color;
+        self.heart_color = fresh.heart_color;
+        self.show_heart = fresh.show_heart;
+        self.auto_palette = fresh.auto_palette;
+        self.palette_choice = fresh.palette_choice;
+        self.palette_auto = fresh.palette_auto;
+        self.arr_dark = fresh.arr_dark;
+        self.me_dark = fresh.me_dark;
+        self.fretboard_wood = fresh.fretboard_wood.clone();
+        self.strip_colors = fresh.strip_colors;
+        self.custom_font_path = fresh.custom_font_path.clone();
+        self.font_choice = fresh.font_choice.clone();
+    }
+
+    /// Which bands are showing, where the windows are, how big they are, and
+    /// which of the detachable surfaces are out on their own.
+    fn take_layout(&mut self, fresh: &Self) {
+        self.window_size_percent = fresh.window_size_percent;
+        self.borderless_mode = fresh.borderless_mode;
+        self.window_x = fresh.window_x;
+        self.window_y = fresh.window_y;
+        self.chord_window_detached = fresh.chord_window_detached;
+        self.detached_chord_height = fresh.detached_chord_height;
+        self.detached_chord_width = fresh.detached_chord_width;
+        self.detached_chord_x = fresh.detached_chord_x;
+        self.detached_chord_y = fresh.detached_chord_y;
+        self.show_chord_strip = fresh.show_chord_strip;
+        self.show_piano = fresh.show_piano;
+        self.show_fretboard = fresh.show_fretboard;
+        self.show_recorder = fresh.show_recorder;
+        self.fretboard_detached = fresh.fretboard_detached;
+        self.theory_detached = fresh.theory_detached;
+        self.recorder_detached = fresh.recorder_detached;
+        self.fretboard_win_w = fresh.fretboard_win_w;
+        self.fretboard_win_h = fresh.fretboard_win_h;
+        self.fretboard_win_x = fresh.fretboard_win_x;
+        self.fretboard_win_y = fresh.fretboard_win_y;
+        self.theory_win_w = fresh.theory_win_w;
+        self.theory_win_h = fresh.theory_win_h;
+        self.theory_win_x = fresh.theory_win_x;
+        self.theory_win_y = fresh.theory_win_y;
+        self.recorder_win_w = fresh.recorder_win_w;
+        self.recorder_win_h = fresh.recorder_win_h;
+        self.recorder_win_x = fresh.recorder_win_x;
+        self.recorder_win_y = fresh.recorder_win_y;
+        self.theory_order = fresh.theory_order.clone();
+        self.show_camera_pane = fresh.show_camera_pane;
+        self.camera_pane_left = fresh.camera_pane_left;
+        self.mixer_visible = fresh.mixer_visible;
+        self.arr_visible = fresh.arr_visible;
+        self.midi_keys_visible = fresh.midi_keys_visible;
+        self.midi_editor_floating = fresh.midi_editor_floating;
+        self.arr_header_w = fresh.arr_header_w;
+        self.show_welcome = fresh.show_welcome;
+        self.show_take_summary = fresh.show_take_summary;
+        self.drumpad_page = fresh.drumpad_page;
+    }
+
+    /// How the teaching surfaces and the editors are SET UP — the tuning, the
+    /// capo, the key, the note names, the grids and the swing.
+    ///
+    /// Its own scope because none of the other four is where anybody would go
+    /// looking for it: a capo is not a colour, not a window, not a channel and
+    /// not a device, and folding it into one of them would make that scope's
+    /// own sentence a lie.
+    fn take_playing(&mut self, fresh: &Self) {
+        self.prefer_flats = fresh.prefer_flats;
+        self.chord_detection_enabled = fresh.chord_detection_enabled;
+        self.show_piano_note_names = fresh.show_piano_note_names;
+        self.show_fret_note_names = fresh.show_fret_note_names;
+        self.keytoggle_enabled = fresh.keytoggle_enabled;
+        self.teach_apply_all_keys = fresh.teach_apply_all_keys;
+        self.fretboard_tuning = fresh.fretboard_tuning.clone();
+        self.fretboard_custom_name = fresh.fretboard_custom_name.clone();
+        self.fretboard_custom_open = fresh.fretboard_custom_open.clone();
+        self.fretboard_capo = fresh.fretboard_capo;
+        self.capo_style = fresh.capo_style.clone();
+        self.theory_follow_midi = fresh.theory_follow_midi;
+        self.staff_set = fresh.staff_set.clone();
+        self.staff_note_names = fresh.staff_note_names;
+        self.staff_key = fresh.staff_key;
+        self.custom_staff_set = fresh.custom_staff_set.clone();
+        self.guitar_intervals = fresh.guitar_intervals;
+        self.arr_snap = fresh.arr_snap;
+        self.arr_grid_exp = fresh.arr_grid_exp;
+        self.midi_snap = fresh.midi_snap;
+        self.midi_grid_exp = fresh.midi_grid_exp;
+        self.midi_swing = fresh.midi_swing;
+        self.midi_swing_pct = fresh.midi_swing_pct;
+        self.midi_triplet = fresh.midi_triplet;
+        self.transpose = fresh.transpose;
+        self.show_transpose = fresh.show_transpose;
+    }
+
+    /// The sixteen channels and everything standing on them: gains, pans,
+    /// names, colours, inputs, inserts, sends, mutes, solos, the routes, the
+    /// buses, the effects, and the built-in instrument's patch.
+    fn take_desk(&mut self, fresh: &Self) {
+        self.channel_gains = fresh.channel_gains;
+        self.channel_pans = fresh.channel_pans;
+        self.channel_inputs = fresh.channel_inputs.clone();
+        self.channel_kinds = fresh.channel_kinds;
+        self.channel_icons = fresh.channel_icons;
+        self.strip_names = fresh.strip_names.clone();
+        self.strip_colors = fresh.strip_colors;
+        self.strip_inserts = fresh.strip_inserts.clone();
+        self.strip_sends = fresh.strip_sends;
+        self.strip_muted = fresh.strip_muted;
+        self.strip_soloed = fresh.strip_soloed;
+        self.input_alias = fresh.input_alias.clone();
+        self.routes = fresh.routes.clone();
+        self.master_gain = fresh.master_gain;
+        self.track_gain = fresh.track_gain;
+        self.drums_gain = fresh.drums_gain;
+        self.drums_pan = fresh.drums_pan;
+        self.metronome_gain = fresh.metronome_gain;
+        self.fx_return_gain = fresh.fx_return_gain;
+        self.reverb_mix = fresh.reverb_mix;
+        self.delay_mix = fresh.delay_mix;
+        self.chorus_mix = fresh.chorus_mix;
+        self.hpf_mix = fresh.hpf_mix;
+        self.lpf_mix = fresh.lpf_mix;
+        self.limiter_mix = fresh.limiter_mix;
+        self.effect_params = fresh.effect_params.clone();
+        self.bus_effect = fresh.bus_effect.clone();
+        self.dx7_cartridge = fresh.dx7_cartridge.clone();
+        self.dx7_patch = fresh.dx7_patch;
+        self.metronome_on = fresh.metronome_on;
+        self.metronome_in_take = fresh.metronome_in_take;
+        self.plugin_paths = fresh.plugin_paths.clone();
+    }
+
+    /// The hardware and the folders — the interface, the camera, the inputs,
+    /// the buffer and the rate, where takes are written, and which project is
+    /// open.
+    ///
+    /// **Deliberately its own scope, and deliberately part of no other.** Nobody
+    /// presses “put the colours back” meaning “forget my audio interface”, and
+    /// re-picking a device is the most tedious part of any recovery.
+    /// `project_path` is here too: it defaults to empty, so a reset that took it
+    /// silently orphaned the open session at the next launch.
+    fn take_devices(&mut self, fresh: &Self) {
+        self.record_dir = fresh.record_dir.clone();
+        self.record_camera_uid = fresh.record_camera_uid.clone();
+        self.record_audio_device = fresh.record_audio_device.clone();
+        self.record_input_channels = fresh.record_input_channels.clone();
+        self.record_extra_inputs = fresh.record_extra_inputs.clone();
+        self.record_input_off = fresh.record_input_off;
+        self.record_buffer_frames = fresh.record_buffer_frames;
+        self.record_sample_rate = fresh.record_sample_rate;
+        self.audio_system = fresh.audio_system.clone();
+        self.media_default_dir = fresh.media_default_dir.clone();
+        self.track_path = fresh.track_path.clone();
+        self.project_path = fresh.project_path.clone();
+        self.project_subdir = fresh.project_subdir;
+        self.record_take_name = fresh.record_take_name.clone();
+        self.record_open_when_done = fresh.record_open_when_done;
+        self.record_hide_elapsed = fresh.record_hide_elapsed;
+        self.record_export = fresh.record_export;
+        self.record_count_in_beats = fresh.record_count_in_beats;
+        self.record_count_in_bars = fresh.record_count_in_bars;
+        self.record_time_signature = fresh.record_time_signature.clone();
+        self.record_count_in_in_take = fresh.record_count_in_in_take;
+        self.reastream_enabled = fresh.reastream_enabled;
+        self.reastream_identifier = fresh.reastream_identifier.clone();
+        self.reastream_host = fresh.reastream_host.clone();
+        self.reastream_port = fresh.reastream_port;
+    }
+
     /// "Reset Settings to Default" (D-UI-8): resets the 13 parity keys and
     /// `custom_font_path`, keeps unknown keys.
     /// **Resets to what a FRESH INSTALL gets, not to `Settings::default()`.**
@@ -4197,6 +4640,216 @@ mod tests {
         // And what came up is usable rather than a half-empty window.
         assert!(s.show_recorder && s.show_fretboard);
         assert_eq!(s.strip_inserts.first().map(String::as_str), Some(crate::dialogs::BUILTIN_PATH));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Settings with EVERY persisted value moved off its default.
+    ///
+    /// Built through the JSON rather than by hand, so it cannot fall behind
+    /// the struct: a field added tomorrow is perturbed tomorrow, with no edit
+    /// here. Numbers move, bools flip, strings gain a suffix, arrays perturb
+    /// element-wise, objects recurse.
+    fn every_value_moved() -> Settings {
+        fn bump(v: &Value) -> Value {
+            match v {
+                Value::Bool(b) => Value::Bool(!b),
+                Value::Number(n) => n
+                    .as_f64()
+                    .and_then(|f| serde_json::Number::from_f64(f + 1.0))
+                    .map_or_else(|| v.clone(), Value::Number),
+                Value::String(t) => Value::String(format!("{t}-moved")),
+                Value::Array(a) => Value::Array(a.iter().map(bump).collect()),
+                Value::Object(o) => {
+                    Value::Object(o.iter().map(|(k, x)| (k.clone(), bump(x))).collect())
+                }
+                Value::Null => Value::Null,
+            }
+        }
+        let mut map = Settings::first_launch().to_map();
+        for (k, v) in &mut map {
+            if BOOKKEEPING.contains(&k.as_str()) {
+                continue;
+            }
+            *v = bump(v);
+        }
+        Settings::from_map(map)
+    }
+
+    /// The keys that are NOT settings: the version stamp and the flags
+    /// recording which migrations have run.
+    ///
+    /// Excluded from the perturbation because moving them sends the loader
+    /// down a migration ladder instead of loading, and excluded from the
+    /// comparison in `the_scopes_together_are_everything` because a reset is
+    /// deliberately NOT a first launch — `video_default_applied` and
+    /// `shows_default_applied` come out TRUE where a fresh install has them
+    /// false, so that a reset does not put video back on for somebody who
+    /// just asked for things to go back to how they were.
+    ///
+    /// `a_reset_does_not_touch_the_bookkeeping` is where these are checked
+    /// instead, one at a time and against what they are each supposed to be.
+    const BOOKKEEPING: [&str; 10] = [
+        "settings_version",
+        "video_default_applied",
+        "shows_default_applied",
+        "video_defaults_lowered",
+        "auto_exposed",
+        "tracks_added",
+        "desk_state_shift_v13",
+        "desk_state_shift_v14",
+        "desk_state_shift_v19",
+        "pad_state_shift_v18",
+    ];
+
+    /// **The five scopes partition the settings.** Apply all of them and you
+    /// are where a fresh install is.
+    ///
+    /// This is the test that makes scoped resets safe to keep adding fields
+    /// to. A field added to `Settings` and to none of the five `take_*`
+    /// methods survives every reset the app offers, including "Everything" —
+    /// which is a reset that does not reset, and the kind of thing nobody
+    /// notices until somebody cannot get rid of a value. It fails here, by
+    /// name, the moment the field exists.
+    #[test]
+    fn the_scopes_together_are_everything() {
+        let mut s = every_value_moved();
+        let fresh = Settings::first_launch();
+        assert_ne!(s.to_map(), fresh.to_map(), "nothing was actually moved");
+        for scope in ResetScope::PARTS {
+            s.reset(scope);
+        }
+        let (got, want) = (s.to_map(), fresh.to_map());
+        let stragglers: Vec<&String> = want
+            .keys()
+            .filter(|k| !BOOKKEEPING.contains(&k.as_str()))
+            .filter(|k| got.get(*k) != want.get(*k))
+            .collect();
+        assert!(
+            stragglers.is_empty(),
+            "these keys survived every scope, so no reset can put them back: {stragglers:?}"
+        );
+    }
+
+    /// "Everything" is exactly the five parts, and lands where a fresh
+    /// install lands.
+    ///
+    /// The old `reset_to_defaults` promise, kept — see
+    /// `resetting_lands_where_a_fresh_install_lands` in `app.rs`, which pins
+    /// the same thing from the outside.
+    #[test]
+    fn everything_is_the_five_parts_at_once() {
+        let mut wide = every_value_moved();
+        wide.reset(ResetScope::Everything);
+        let mut narrow = every_value_moved();
+        for scope in ResetScope::PARTS {
+            narrow.reset(scope);
+        }
+        assert_eq!(wide.to_map(), narrow.to_map(), "Everything is not the parts");
+        let (got, want) = (wide.to_map(), Settings::first_launch().to_map());
+        for (k, v) in &want {
+            if BOOKKEEPING.contains(&k.as_str()) {
+                continue;
+            }
+            assert_eq!(
+                got.get(k),
+                Some(v),
+                "`{k}` did not land where a fresh install has it"
+            );
+        }
+    }
+
+    /// A NARROW scope leaves the other four alone.
+    ///
+    /// The whole point of the split. Resetting the colours must not cost
+    /// somebody their audio interface, which is what the single wide row did
+    /// every time anybody used it for what they actually wanted.
+    #[test]
+    fn a_narrow_reset_keeps_its_hands_off_everything_else() {
+        // The device cluster and the open project: the fields whose loss was
+        // the most expensive part of the old reset.
+        for scope in [ResetScope::Colours, ResetScope::Layout, ResetScope::Playing] {
+            let mut s = every_value_moved();
+            let before = s.clone();
+            s.reset(scope);
+            assert_eq!(s.record_audio_device, before.record_audio_device, "{scope:?}");
+            assert_eq!(s.record_camera_uid, before.record_camera_uid, "{scope:?}");
+            assert_eq!(s.record_dir, before.record_dir, "{scope:?}");
+            assert_eq!(s.project_path, before.project_path, "{scope:?}");
+            assert_eq!(s.audio_system, before.audio_system, "{scope:?}");
+            assert_eq!(s.channel_gains, before.channel_gains, "{scope:?}");
+            assert_eq!(s.strip_inserts, before.strip_inserts, "{scope:?}");
+        }
+        // And the colours scope really does move the colours.
+        let mut s = every_value_moved();
+        s.reset(ResetScope::Colours);
+        assert_eq!(s.theme_name, Settings::first_launch().theme_name);
+        assert_eq!(s.background_color, Settings::first_launch().background_color);
+        // ...while the desk's faders are untouched by it.
+        assert_ne!(s.channel_gains, Settings::first_launch().channel_gains);
+    }
+
+    /// Bookkeeping is not a setting, and no scope may reset it.
+    ///
+    /// `extra` carries a newer build's keys and the migration flags say which
+    /// ladders have run. A reset that cleared either would re-run migrations
+    /// over already-migrated settings, or drop somebody else's keys.
+    #[test]
+    fn a_reset_does_not_touch_the_bookkeeping() {
+        let mut s = Settings::first_launch();
+        s.extra.insert("from_a_newer_build".into(), Value::from(7));
+        s.desk_state_shift_v19 = true;
+        s.pad_state_shift_v18 = true;
+        s.reset(ResetScope::Everything);
+        assert_eq!(
+            s.extra.get("from_a_newer_build"),
+            Some(&Value::from(7)),
+            "a reset dropped a newer build's key"
+        );
+        assert!(s.desk_state_shift_v19, "a reset un-ran a migration");
+        assert!(s.pad_state_shift_v18, "a reset un-ran a migration");
+        assert!(s.video_default_applied, "a reset re-armed the video migration");
+        assert!(s.shows_default_applied, "a reset re-armed the shows migration");
+    }
+
+    /// The pre-reset copy is taken from MEMORY and reads back whole.
+    ///
+    /// From memory and not by copying the file, because a setting changed
+    /// this frame may not have reached disk yet — a file copy would offer a
+    /// way back to a desk one edit older than the one being destroyed.
+    #[test]
+    fn a_backup_is_a_way_back_to_the_live_desk() {
+        let dir = std::env::temp_dir()
+            .join(format!("ivory-backup-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("settings.backup.json");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            Settings::load_backup_from(&path).is_none(),
+            "an absent backup read as Some"
+        );
+
+        let mut live = Settings::first_launch();
+        live.window_size_percent = 175;
+        live.theme_name = "Iris".into();
+        // NOT saved to a settings file first: this is the case the doc
+        // comment names — the live desk is ahead of the file on disk, and a
+        // backup taken by copying that file would be one edit stale.
+        assert!(live.write_backup_to(&path), "the backup could not be written");
+
+        let back = Settings::load_backup_from(&path).expect("the backup did not read back");
+        assert_eq!(back.window_size_percent, 175);
+        assert_eq!(back.theme_name, "Iris");
+
+        // A torn or absent backup is `None`, never half a desk: a way back
+        // that restores nine tenths of your settings is worse than none,
+        // because you cannot tell which tenth went.
+        let _ = std::fs::write(&path, "{ not json");
+        assert!(
+            Settings::load_backup_from(&path).is_none(),
+            "an unreadable backup was offered as a way back"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
