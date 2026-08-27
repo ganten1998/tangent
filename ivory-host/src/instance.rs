@@ -686,7 +686,11 @@ struct ComponentHandler {
     /// latency on a preset change — a host that read the figure once at load
     /// would compensate for a delay the plugin no longer has, which is worse
     /// than not compensating at all: the error is silent and it moves.
-    latency_dirty: AtomicBool,
+    ///
+    /// Behind an `Arc` so a [`LatencyHandle`] can outlive this handler: the
+    /// instance goes to the audio thread and the main thread still has to be
+    /// able to hear that the figure has gone stale.
+    shared: std::sync::Arc<HandlerShared>,
     /// Edits that arrived after every slot was claimed by a different
     /// parameter. Counted rather than dropped silently, because the symptom is
     /// "one control in this plugin does nothing".
@@ -706,7 +710,9 @@ impl ComponentHandler {
             used: AtomicUsize::new(0),
             edits: AtomicU64::new(0),
             restarts: AtomicU64::new(0),
-            latency_dirty: AtomicBool::new(false),
+            shared: std::sync::Arc::new(HandlerShared {
+                latency_dirty: AtomicBool::new(false),
+            }),
             overflow: AtomicU64::new(0),
         }
     }
@@ -779,10 +785,53 @@ impl IComponentHandlerTrait for ComponentHandler {
         // for once and then acted on for as long as the plugin is loaded, so
         // it is the one flag that has to be remembered.
         if flags & vst3::Steinberg::Vst::RestartFlags_::kLatencyChanged as i32 != 0 {
-            self.latency_dirty.store(true, Ordering::Relaxed);
+            self.shared.latency_dirty.store(true, Ordering::Relaxed);
         }
         kResultOk
     }
+}
+
+/// Asks a plugin its latency, from the main thread, after the instance has
+/// gone.
+///
+/// **Two halves, and they live on different threads.** The FLAG is an atomic
+/// the plugin sets from `restartComponent`, which can arrive on any thread;
+/// the ANSWER comes from `getLatencySamples`, which is a main-thread VST3
+/// call and must never be made from the callback. So the audio thread can
+/// only ever learn that its figure is stale — never fetch a fresh one — and
+/// this is how the main thread does the fetching.
+pub struct LatencyHandle {
+    processor: ComPtr<IAudioProcessor>,
+    handler: std::sync::Arc<HandlerShared>,
+    /// `!Send` on purpose, exactly as `StateHandle` is: the bindings put an
+    /// unconditional `unsafe impl Send` on every interface type, so this
+    /// marker is the only thing keeping the call on the thread that may make
+    /// it.
+    not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl LatencyHandle {
+    /// Whether the plugin has asked for its latency to be read again since
+    /// this was last called. Clears on read.
+    pub fn take_dirty(&self) -> bool {
+        self.handler.latency_dirty.swap(false, Ordering::Relaxed)
+    }
+
+    /// The plugin's current latency in frames. Main thread only.
+    pub fn latency_samples(&self) -> u32 {
+        // SAFETY: main thread, instance alive for as long as this handle's
+        // `ComPtr` is, no reentrancy. `getLatencySamples` takes nothing and
+        // returns a plain `uint32`.
+        unsafe { self.processor.getLatencySamples() }
+    }
+}
+
+/// The part of the component handler both threads share.
+///
+/// Split out of `ComponentHandler` so a handle can hold it: the handler
+/// itself is owned by the instance and goes with it.
+pub struct HandlerShared {
+    latency_dirty: AtomicBool,
 }
 
 /// A live plugin instance.
@@ -1298,6 +1347,23 @@ impl Instance {
     /// which also argues why `getState` is safe while `process` is running.
     ///
     /// The handle must be dropped before the `Instance` is.
+    /// A way to ask this plugin its latency again, from the MAIN thread,
+    /// after the instance itself has moved to the audio thread.
+    ///
+    /// The same shape as [`Instance::state_handle`] and
+    /// [`Instance::editor_handle`], and for the same reason: once a plugin is
+    /// handed off there is never a `&Instance` here again, and these three
+    /// cloned pointers are the whole of what the host keeps.
+    ///
+    /// Taken in the last moment before the box moves.
+    pub fn latency_handle(&self) -> LatencyHandle {
+        LatencyHandle {
+            processor: self.processor.clone(),
+            handler: std::sync::Arc::clone(&self.handler.shared),
+            not_send: std::marker::PhantomData,
+        }
+    }
+
     pub fn state_handle(&self) -> crate::state::StateHandle {
         crate::state::StateHandle::new(
             self.component.clone(),
@@ -1333,17 +1399,6 @@ impl Instance {
         // takes nothing and returns a plain `uint32`: no tresult, no
         // out-parameter, nothing to leak on failure.
         unsafe { self.processor.getLatencySamples() }
-    }
-
-    /// Whether the plugin has asked the host to read its latency again since
-    /// this was last called. Clears on read.
-    ///
-    /// A flag rather than a number because the READ has to happen on the
-    /// main thread — `getLatencySamples` is not a `process`-safe call — so
-    /// the audio thread can only be told that an answer is stale, never
-    /// fetch a new one itself.
-    pub fn take_latency_dirty(&self) -> bool {
-        self.handler.latency_dirty.swap(false, Ordering::Relaxed)
     }
 
     pub fn editor_edits(&self) -> (u64, u64) {
