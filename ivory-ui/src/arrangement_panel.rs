@@ -1018,12 +1018,27 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
         if let Some((i, _)) = near {
             return Some(Hit::AutoPoint(lane, i));
         }
-        // Empty room: where a new point would go.
-        return Some(Hit::AutoLane(
-            lane,
-            time_at(rect, view, pos.x),
-            auto_value_at(row.lane, pos.y),
-        ));
+        // **Empty room, but only room that is really in this row.**
+        //
+        // The grab area above is the row EXPANDED by a handle's radius, which
+        // is right for catching a point whose handle overhangs the edge and
+        // wrong for placing a new one. Rows stack against each other, so a
+        // press a few pixels above an open automation row is visually in the
+        // clip strip of the track ABOVE — and this made a point out of it, at
+        // full value, because `auto_value_at` clamps and the caller never
+        // learned the press was out of band. `arr_put_auto_point` then wrote
+        // it to disk immediately.
+        //
+        // Falling through rather than returning, so the press goes on to the
+        // row it actually landed in.
+        if row.lane.contains(pos) {
+            return Some(Hit::AutoLane(
+                lane,
+                time_at(rect, view, pos.x),
+                auto_value_at(row.lane, pos.y),
+            ));
+        }
+        continue;
     }
     if l.ruler.is_positive() && l.ruler.contains(pos) {
         return Some(Hit::Ruler(time_at(rect, view, pos.x)));
@@ -2894,6 +2909,57 @@ ArrangeView {
         // The nearer of two points wins, not the first.
         let second = Pos2::new(x_of(rect(), &v, 6.0), auto_y_of(row, 0.25));
         assert_eq!(hit_test(rect(), &v, second), Some(Hit::AutoPoint(0, 1)));
+    }
+
+    /// **A press just above an automation row does not make a point in it.**
+    ///
+    /// The grab area is the row expanded by a handle's radius, so an
+    /// overhanging handle can be caught. That is right for GRABBING and
+    /// wrong for PLACING: rows stack against each other, so those few pixels
+    /// are visually the clip strip of the track above — and a press there
+    /// made a point at full value and wrote it to disk at once, because
+    /// `auto_value_at` clamps and the caller never learned it was out of
+    /// band.
+    #[test]
+    fn a_press_above_an_automation_row_belongs_to_the_track_above() {
+        use crate::automation::{AutoParam, Point, Shape};
+        let pts = [Point { at_s: 2.0, value: 0.5, shape: Shape::Linear }];
+        let mut v = a_view(&[]);
+        v.visible_lanes = 8;
+        v.lanes[0].automation_open = true;
+        v.lanes[0].automation = Some(AutoView {
+            param: AutoParam::Gain,
+            points: &pts,
+            hot: None,
+        });
+        let l = Layout::new(rect(), &v);
+        let row = l
+            .rows
+            .iter()
+            .find(|r| r.kind == RowKind::Automation(0))
+            .expect("no automation row")
+            .lane;
+
+        // Just above the row, and far from the one point so the handle
+        // search cannot claim it.
+        let above = Pos2::new(x_of(rect(), &v, 20.0), row.top() - 2.0);
+        assert!(!row.contains(above), "the probe is inside the row after all");
+        assert!(
+            !matches!(hit_test(rect(), &v, above), Some(Hit::AutoLane(..))),
+            "a press above the row made a point in it"
+        );
+
+        // ...and a press really INSIDE the row still works, or the fix has
+        // made the lane unusable instead of safe.
+        let inside = Pos2::new(x_of(rect(), &v, 20.0), row.center().y);
+        assert!(
+            matches!(hit_test(rect(), &v, inside), Some(Hit::AutoLane(0, ..))),
+            "the row stopped accepting presses"
+        );
+        // A handle overhanging the edge is still grabbable, which is the
+        // whole reason the grab area is expanded.
+        let handle = Pos2::new(x_of(rect(), &v, 2.0), auto_y_of(row, 0.5));
+        assert_eq!(hit_test(rect(), &v, handle), Some(Hit::AutoPoint(0, 0)));
     }
 
     /// A closed row is not hit at all, and its clips still are.

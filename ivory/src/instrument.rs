@@ -4259,7 +4259,7 @@ impl Renderer {
             } else {
                 0.0
             };
-            send[lane] = Shared::f32_of(&self.shared.send[strip.index()]).clamp(0.0, 1.0);
+            send[lane] = self.lane_send(strip.index());
             pan[lane] = pan_gains(self.lane_pan(lane));
             punch[lane] = self.shared.punch[lane].load(Ordering::Relaxed);
         }
@@ -4304,7 +4304,23 @@ impl Renderer {
             // is no cursor to rewind on a flush, nothing to reset on a loop
             // wrap, and a seek lands in the right place because it always
             // did. A delay LINE here would have needed all three.
-            let p = (at + f as u64).saturating_sub(u64::from(pdc));
+            //
+            // **`checked_sub`, not `saturating_sub`.** Saturating pins `p` at
+            // zero for the first `pdc` frames — which is precisely the window
+            // compensation exists for — so a clip starting at 0:00 emitted
+            // its first sample over and over while the plugin lane's own
+            // delay line was correctly putting out silence. A DC step
+            // followed by a discontinuity, on every play-from-zero with a
+            // lookahead plugin loaded.
+            //
+            // Before the compensated zero there is no project frame, and the
+            // honest answer is the same one the clip loop gives for any
+            // other position a clip does not cover: nothing. The per-lane
+            // gain smoothing above has already run, so the fader still
+            // settles across these frames.
+            let Some(p) = (at + f as u64).checked_sub(u64::from(pdc)) else {
+                continue;
+            };
             for placed in &self.clips {
                 let Some(k) = p.checked_sub(placed.start) else {
                     continue;
@@ -4482,7 +4498,11 @@ impl Renderer {
             Some(ch) => self.lane_pan(ch),
             None => Shared::f32_of(&self.shared.drums_pan),
         });
-        let bus_send = Shared::f32_of(&self.shared.send[bus_strip.index()]).clamp(0.0, 1.0);
+        // Through the accessor like every other control, even though the
+        // drum BUS sits past the sixteen channels a curve can name: it falls
+        // through to the atomic, and going round it is how the other three
+        // sites came to be missed.
+        let bus_send = self.lane_send(bus_strip.index());
         // The knobs, read once per chunk like the channel gains: they are
         // published at human speed. The clamps are the audio thread refusing
         // to trust numbers it did not make; the setter sanitised them too.
@@ -5075,10 +5095,7 @@ impl Renderer {
             } else {
                 0.0
             };
-            let send = f32::from_bits(
-                self.shared.send[Strip::Channel(ch).index()].load(Ordering::Relaxed),
-            )
-            .clamp(0.0, 1.0);
+            let send = self.lane_send(Strip::Channel(ch).index());
             let (pan_l, pan_r) = pan_gains(self.lane_pan(ch));
             let want = frames * TAP_CHANNELS;
             // Stems and ROUTING share this buffer: a send reads the
@@ -8463,6 +8480,47 @@ mod tests {
         assert!(next[0][16..].iter().all(|v| (*v - 1.0).abs() < 1e-6));
     }
 
+    /// **Before the compensated zero there is silence, not a held sample.**
+    ///
+    /// The clips wait for the graph's latency by reading `p - pdc`. Written
+    /// with `saturating_sub` that pins `p` at zero for the first `pdc`
+    /// frames — exactly the window compensation exists for — so a clip
+    /// starting at 0:00 emitted its first sample over and over while the
+    /// plugin lane's own delay line correctly put out silence. A DC step,
+    /// then a discontinuity, on every play-from-zero with a lookahead plugin
+    /// loaded.
+    ///
+    /// This asserts the arithmetic rather than the mixer, because the bug
+    /// was the arithmetic: an unrepresentable project frame has to be
+    /// ABSENT, not clamped.
+    #[test]
+    fn a_clip_reads_nothing_before_the_compensated_zero() {
+        let pdc = 128u32;
+        // Inside the compensation window there is no project frame at all.
+        for f in 0..pdc as u64 {
+            assert!(
+                f.checked_sub(u64::from(pdc)).is_none(),
+                "frame {f} produced a project frame inside the window"
+            );
+            // ...and the old arithmetic pinned every one of them to zero,
+            // which is what made a clip repeat its first sample.
+            assert_eq!(f.saturating_sub(u64::from(pdc)), 0);
+        }
+        // At the boundary and after it, the frame is the real one, offset.
+        for f in [pdc as u64, pdc as u64 + 1, 48_000] {
+            assert_eq!(
+                f.checked_sub(u64::from(pdc)),
+                Some(f - u64::from(pdc)),
+                "frame {f} did not compensate cleanly"
+            );
+        }
+        // With no compensation the two agree, which is why nothing showed up
+        // until a plugin with lookahead was loaded.
+        for f in [0u64, 1, 999] {
+            assert_eq!(f.checked_sub(0), Some(f.saturating_sub(0)));
+        }
+    }
+
     /// A rack's latency is the SUM of its bays, and a voice is not in it.
     #[test]
     fn a_chains_latency_is_the_sum_of_what_is_in_it() {
@@ -8518,6 +8576,13 @@ mod tests {
         for (field, accessor) in [
             ("channel_gains[", "lane_gain"),
             ("channel_pans[", "lane_pan"),
+            // **Added after `send[` was missed on three of four paths.** The
+            // accessor was written and only one site ever called it, so Send
+            // automation moved the live monitor and nothing else — and this
+            // scan, which exists precisely to catch that, was not looking
+            // for it. A guard that covers two of the three controls it is
+            // guarding is a guard somebody trusts by mistake.
+            ("shared.send[", "lane_send"),
         ] {
             // The accessors themselves are the exception, and they are free
             // functions ABOVE the impl — so anything left in here is a site
