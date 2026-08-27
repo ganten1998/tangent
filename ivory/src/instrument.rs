@@ -928,6 +928,138 @@ impl Beats {
     }
 }
 
+/// The two maps the engine reads, swapped in together.
+///
+/// One struct because they are one fact: a bar line is where it is because of
+/// the METER, and it happens when it does because of the TEMPO. A block that
+/// caught a new tempo map against the old meter would put its bar lines in
+/// places neither map describes.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Maps {
+    pub tempo: ivory_ui::tempo::TempoMap,
+    pub meter: ivory_ui::tempo::MeterMap,
+}
+
+/// **The click, locked to the song's bar lines.**
+///
+/// [`Beats`] is a free-running phase accumulator: it counts from wherever the
+/// phase last restarted, which is the moment play was pressed. That is right
+/// for a count-in — which is a countdown and belongs to the keypress, not to
+/// the song — and wrong for everything else. Pressing play at bar 9 put the
+/// downbeat at start-of-playback rather than on bar 9's line, and with a
+/// tempo MAP it is not merely wrong but meaningless: there is no single
+/// period to accumulate.
+///
+/// So this one does not accumulate at all. It holds the next beat as a
+/// `(bar, beat)` PAIR and asks the maps where that lands. Being a pure
+/// function of the transport's position, it cannot drift, it survives a
+/// locate and a loop wrap by being re-derived, and it puts a beat exactly
+/// where the ruler draws one — because the ruler asks the same maps.
+///
+/// Integers and not a quarter count, deliberately: a signature change moves
+/// how many beats a bar holds and how long each is, and `(bar, beat)` walks
+/// that correctly by construction while an accumulated quarter would need the
+/// change handled at every place it was read.
+#[derive(Debug, Default)]
+struct BarClock {
+    bar: u32,
+    beat: u32,
+    /// The frame the next beat lands on, so the per-frame test is one
+    /// comparison rather than two map walks.
+    at_frame: f64,
+    /// Where the transport was expected to be. A position that is not this is
+    /// a locate, a loop wrap, or the first block after a count-in, and the
+    /// answer to all three is the same: work out where we are from scratch.
+    expect: u64,
+    armed: bool,
+}
+
+impl BarClock {
+    /// Re-derive from the transport's actual position.
+    fn resync(&mut self, pos: u64, maps: &Maps, rate: f64) {
+        let secs = pos as f64 / rate.max(1.0);
+        let quarter = maps.tempo.beat_at_seconds(secs);
+        let (bar, beat) = maps.meter.bar_beat_at_quarter(quarter);
+        self.bar = bar;
+        // **This beat if we are exactly ON it, otherwise the next.**
+        //
+        // Both halves matter and the first draft had only the second. Play
+        // from 0:00 is exactly on beat one, and it has to click there — that
+        // is what pressing play sounds like. A locate that lands on a beat
+        // line should click too, for the same reason.
+        //
+        // But a resync a frame or two INTO a beat must not fire it: that beat
+        // has already been and gone. The case that makes this load-bearing is
+        // the count-in, where `Beats` sounds the downbeat and the transport
+        // starts rolling — the next frame resyncs this clock a frame or two
+        // past beat one, and firing there would be a second click on the "go".
+        self.beat = beat.floor() as u32;
+        self.normalise(maps);
+        self.at_frame = self.frame_of(maps, rate);
+        if self.at_frame < pos as f64 {
+            self.beat += 1;
+            self.normalise(maps);
+            self.at_frame = self.frame_of(maps, rate);
+        }
+        self.armed = true;
+    }
+
+    /// Carry a beat index past the end of its bar, through however many
+    /// signature changes that crosses.
+    fn normalise(&mut self, maps: &Maps) {
+        for _ in 0..64 {
+            let sig = maps.meter.sig_at_bar(self.bar);
+            let per_bar = u32::from(sig.beats.max(1));
+            if self.beat < per_bar {
+                return;
+            }
+            self.beat -= per_bar;
+            self.bar = self.bar.saturating_add(1);
+        }
+    }
+
+    /// The absolute frame the pending beat falls on.
+    fn frame_of(&self, maps: &Maps, rate: f64) -> f64 {
+        let sig = maps.meter.sig_at_bar(self.bar);
+        // Beats of the SIGNATURE into quarters — the one exchange rate, and
+        // the same one `MeterMap::quarters_in_bar` uses.
+        let quarter = maps.meter.quarter_at_bar(self.bar)
+            + f64::from(self.beat) * (4.0 / f64::from(sig.unit.max(1)));
+        maps.tempo.seconds_at_beat(quarter) * rate
+    }
+
+    /// Advance one frame. `Some` on the frame a beat lands.
+    ///
+    /// `pos` is the transport's ABSOLUTE frame for this sample, which is what
+    /// makes the whole thing derived rather than counted.
+    fn tick(&mut self, pos: u64, maps: &Maps, rate: f64) -> Option<Beat> {
+        if !self.armed || pos != self.expect {
+            self.resync(pos, maps, rate);
+        }
+        self.expect = pos + 1;
+        if (pos as f64) < self.at_frame {
+            return None;
+        }
+        let accent = self.beat == 0;
+        self.beat += 1;
+        self.normalise(maps);
+        self.at_frame = self.frame_of(maps, rate);
+        // **A guard against a map that goes nowhere.** A tempo of zero is
+        // impossible — `TempoMap` clamps to `MIN_BPM` — but a meter of one
+        // beat per bar at a very high tempo can put two beats inside one
+        // frame, and a `while` here would spin the audio thread. One beat per
+        // frame is the honest ceiling: nothing can be heard faster.
+        if self.at_frame <= pos as f64 {
+            self.at_frame = pos as f64 + 1.0;
+        }
+        Some(Beat {
+            accent,
+            count_in: 0,
+            downbeat: false,
+        })
+    }
+}
+
 /// Frames per beat, with the tempo clamped to something the frame counter can
 /// represent.
 ///
@@ -2156,6 +2288,14 @@ struct Renderer {
     click: Click,
     voice: Voice,
     beats: Beats,
+    /// The click while the transport ROLLS. See [`BarClock`]: derived from
+    /// the position rather than accumulated, so it lands on the song's own
+    /// bar lines and follows a tempo map that has no single period.
+    bar_clock: BarClock,
+    /// The tempo and meter maps the click and the ruler share.
+    maps: Maps,
+    maps_incoming: Consumer<Maps>,
+    maps_retiring: Producer<Maps>,
     /// Frames left during which a count-in click is still SOUNDING.
     ///
     /// `Beats::counting_in` goes false the moment the last count-in beat is
@@ -2525,6 +2665,19 @@ impl Renderer {
         let in_take = self.shared.metro_in_take.load(Ordering::Relaxed);
         let count_in_recorded = self.shared.count_in_in_take.load(Ordering::Relaxed);
         let bpb = self.shared.beats_per_bar.load(Ordering::Relaxed);
+        // **The maps arriving, and the displaced pair going back.** The
+        // clip list's own protocol: no room to return the old one, no swap
+        // this block, because dropping a `Vec` here is an allocator call on
+        // the audio thread.
+        if !self.maps_retiring.is_full() {
+            if let Ok(next) = self.maps_incoming.pop() {
+                let old = std::mem::replace(&mut self.maps, next);
+                let _ = self.maps_retiring.push(old);
+                // The bar lines just moved. Whatever the clock was counting
+                // towards is a beat in a song that no longer exists.
+                self.bar_clock.armed = false;
+            }
+        }
         self.beats.period = period_frames(
             self.rate,
             f64::from_bits(self.shared.bpm.load(Ordering::Relaxed)),
@@ -2771,7 +2924,33 @@ impl Renderer {
                 // by M, HEARD under play or record (the count-in rides its
                 // own gate inside `tick`). A practice click that started at
                 // the keypress was the owner's complaint.
-                if let Some(beat) = self.beats.tick(metro_on && rolling, bpb) {
+                // **Two clocks, and which one speaks is the whole point.**
+                //
+                // A count-in belongs to the KEYPRESS: it is a countdown, it
+                // starts when you press record, and `Beats` counts it out
+                // from there — which is also what makes the countdown on
+                // screen and the click in the room the same event, the
+                // property `Beats`'s own header explains at length.
+                //
+                // Everything else belongs to the SONG. `BarClock` derives
+                // the beat from where the transport actually is, so pressing
+                // play at bar 9 puts the accent on bar 9's line instead of
+                // wherever playback happened to begin, and a tempo map —
+                // which has no single period to accumulate — works at all.
+                let heard_beat = if self.beats.counting_in() || !rolling {
+                    self.beats.tick(metro_on && rolling, bpb)
+                } else if metro_on {
+                    self.bar_clock.tick(at + frame_index as u64, &self.maps, self.rate)
+                } else {
+                    // Not heard, but still followed: leaving the clock
+                    // un-ticked would make the next frame look like a locate
+                    // and re-derive, which is work in the callback for
+                    // nothing. Ticking it and dropping the beat keeps it in
+                    // step for the moment the click comes back on.
+                    self.bar_clock.tick(at + frame_index as u64, &self.maps, self.rate);
+                    None
+                };
+                if let Some(beat) = heard_beat {
                     self.voice.trigger(beat.accent);
                     if beat.count_in > 0 || beat.downbeat {
                         // A whole beat, so the sample has room to decay, and
@@ -4837,6 +5016,8 @@ pub struct Engine {
     /// exact reason: the audio thread must never free a hundred megabytes of
     /// samples, so the displaced clip comes BACK here and is dropped by the
     /// thread that sent its replacement.
+    maps_to_audio: Producer<Maps>,
+    maps_from_audio: Consumer<Maps>,
     track_to_audio: Producer<Vec<Placed>>,
     track_from_audio: Consumer<Vec<Placed>>,
     midi_to_audio: Producer<Vec<PlacedMidi>>,
@@ -5089,6 +5270,12 @@ impl Engine {
         let (track_retiring, track_from_audio) = RingBuffer::<Vec<Placed>>::new(2);
         let (midi_to_audio, midi_incoming) = RingBuffer::<Vec<PlacedMidi>>::new(2);
         let (midi_retiring, midi_from_audio) = RingBuffer::<Vec<PlacedMidi>>::new(2);
+        // The maps' pair. A map is a growable `Vec` and the callback may not
+        // free one, so it travels the same road the clip list does: in on one
+        // ring, the displaced one back out on the other, dropped on the UI
+        // thread.
+        let (maps_to_audio, maps_incoming) = RingBuffer::<Maps>::new(2);
+        let (maps_retiring, maps_from_audio) = RingBuffer::<Maps>::new(2);
         // The drumpad kit's pair, same capacity, same reason.
         let (pad_to_audio, pad_incoming) = RingBuffer::<PadKit>::new(2);
         let (pad_retiring, pad_from_audio) = RingBuffer::<PadKit>::new(2);
@@ -5139,6 +5326,10 @@ impl Engine {
             pending_flush: false,
             clip_parked: false,
             sounding: 0,
+            bar_clock: BarClock::default(),
+            maps: Maps::default(),
+            maps_incoming,
+            maps_retiring,
             track_incoming,
             track_retiring,
             midi_incoming,
@@ -5251,6 +5442,8 @@ impl Engine {
             midi: RefCell::new(midi_tx),
             hw_midi_tx: Some(hw_midi_tx),
             insert_handoff,
+            maps_to_audio,
+            maps_from_audio,
             track_to_audio,
             track_from_audio,
             midi_to_audio,
@@ -6340,6 +6533,26 @@ impl Engine {
     /// [`Shared::count_in_in_take`] for why this is not the same switch.
     pub fn set_count_in_in_take(&self, on: bool) {
         self.shared.count_in_in_take.store(on, Ordering::Relaxed);
+    }
+
+    /// Hand the audio thread the tempo and meter maps, whole.
+    ///
+    /// The same swap protocol as [`Engine::set_clips`], and for the same
+    /// reason: a map is a growable `Vec` and the callback may neither read a
+    /// growing one nor free the old one.
+    pub fn set_maps(&mut self, maps: Maps) {
+        while self.maps_from_audio.pop().is_ok() {}
+        if self.maps_to_audio.push(maps).is_err() {
+            return;
+        }
+        let deadline = Instant::now() + RETIRE_TIMEOUT;
+        while Instant::now() < deadline {
+            if let Ok(old) = self.maps_from_audio.pop() {
+                drop(old);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     pub fn set_tempo(&self, bpm: f64) {
@@ -7735,6 +7948,129 @@ mod tests {
         );
     }
 
+    /// Walk a `BarClock` over a span of frames and answer where it fired.
+    fn locked_beats(maps: &Maps, rate: f64, from: u64, frames: u64) -> Vec<(u64, bool)> {
+        let mut c = BarClock::default();
+        let mut out = Vec::new();
+        for i in 0..frames {
+            let pos = from + i;
+            if let Some(b) = c.tick(pos, maps, rate) {
+                out.push((pos, b.accent));
+            }
+        }
+        out
+    }
+
+    fn maps_at(bpm: f64) -> Maps {
+        Maps {
+            tempo: ivory_ui::tempo::TempoMap::constant(bpm),
+            meter: ivory_ui::tempo::MeterMap::default(),
+        }
+    }
+
+    /// **The click lands on the SONG's bar lines, not on the keypress.**
+    ///
+    /// `Beats` counts from wherever the phase last restarted, so pressing
+    /// play at bar 9 put the downbeat at start-of-playback. `BarClock` is
+    /// derived from the transport's position, so starting anywhere lands the
+    /// accents where the ruler draws them.
+    #[test]
+    fn the_locked_click_accents_the_songs_own_bars_wherever_play_began() {
+        let rate = 48_000.0;
+        let maps = maps_at(120.0);
+        // 120 bpm, 4/4: a beat every 24000 frames, a bar every 96000.
+        // Start midway through bar 2, a third of a beat in.
+        let from = 96_000 * 2 + 24_000 + 8_000;
+        let fired = locked_beats(&maps, rate, from, 96_000 * 2);
+        assert!(!fired.is_empty(), "the locked click never fired");
+        for (at, accent) in &fired {
+            // Every beat is on a beat line of the song, wherever we began.
+            let off = *at % 24_000;
+            assert!(off == 0, "a beat landed {off} frames off the grid at {at}");
+            // ...and the accents are the bar lines, again the song's.
+            assert_eq!(
+                *accent,
+                at % 96_000 == 0,
+                "the accent at {at} disagrees with the bar line"
+            );
+        }
+    }
+
+    /// A locate does not shift the grid; it is re-derived.
+    #[test]
+    fn the_locked_click_survives_a_locate_and_a_loop_wrap() {
+        let rate = 48_000.0;
+        let maps = maps_at(120.0);
+        let mut c = BarClock::default();
+        // Play a little from zero...
+        for i in 0..30_000u64 {
+            c.tick(i, &maps, rate);
+        }
+        // ...then jump somewhere unrelated, mid-beat, exactly as a loop wrap
+        // or a click on the ruler does.
+        let mut fired = Vec::new();
+        for i in 0..96_000u64 {
+            let pos = 480_000 + 5_000 + i;
+            if let Some(b) = c.tick(pos, &maps, rate) {
+                fired.push((pos, b.accent));
+            }
+        }
+        assert!(!fired.is_empty(), "nothing fired after the jump");
+        for (at, _) in &fired {
+            assert_eq!(at % 24_000, 0, "the grid shifted after a locate: {at}");
+        }
+    }
+
+    /// **The click follows a tempo map**, which a phase accumulator cannot.
+    #[test]
+    fn the_locked_click_follows_a_tempo_change() {
+        let rate = 48_000.0;
+        let maps = Maps {
+            // 120 for the first two bars (8 quarters), then 60.
+            tempo: ivory_ui::tempo::TempoMap::sanitised(vec![
+                ivory_ui::tempo::TempoPoint { at_beat: 0.0, bpm: 120.0, ramp: false },
+                ivory_ui::tempo::TempoPoint { at_beat: 8.0, bpm: 60.0, ramp: false },
+            ]),
+            meter: ivory_ui::tempo::MeterMap::default(),
+        };
+        let fired = locked_beats(&maps, rate, 0, 48_000 * 12);
+        // Before the change: 0.5s apart. After: 1.0s apart.
+        let gaps: Vec<u64> = fired.windows(2).map(|w| w[1].0 - w[0].0).collect();
+        assert!(gaps.len() > 8, "too few beats to judge: {gaps:?}");
+        for g in &gaps[..7] {
+            assert!(g.abs_diff(24_000) <= 1, "before the change a gap was {g}");
+        }
+        for g in &gaps[8..] {
+            assert!(g.abs_diff(48_000) <= 1, "after the change a gap was {g}");
+        }
+    }
+
+    /// A signature change moves how many beats a bar holds.
+    #[test]
+    fn the_locked_click_follows_a_signature_change() {
+        let rate = 48_000.0;
+        let maps = Maps {
+            tempo: ivory_ui::tempo::TempoMap::constant(120.0),
+            meter: ivory_ui::tempo::MeterMap::sanitised(vec![
+                ivory_ui::tempo::MeterPoint {
+                    at_bar: 0,
+                    sig: ivory_ui::recorder::TimeSignature { beats: 4, unit: 4 },
+                },
+                ivory_ui::tempo::MeterPoint {
+                    at_bar: 2,
+                    sig: ivory_ui::recorder::TimeSignature { beats: 3, unit: 4 },
+                },
+            ]),
+        };
+        let fired = locked_beats(&maps, rate, 0, 48_000 * 12);
+        let accents: Vec<u64> = fired.iter().filter(|(_, a)| *a).map(|(at, _)| *at).collect();
+        // Two bars of four (96000 frames each), then bars of three (72000).
+        assert_eq!(accents[0], 0);
+        assert_eq!(accents[1], 96_000);
+        assert_eq!(accents[2], 192_000, "the third bar line");
+        assert_eq!(accents[3], 192_000 + 72_000, "a bar of three is shorter");
+    }
+
     #[test]
     fn the_metronome_accents_the_first_beat_of_every_bar() {
         let mut b = Beats::new(48_000.0, 120.0);
@@ -8093,6 +8429,10 @@ mod tests {
             },
             voice: Voice::default(),
             beats: Beats::new(RATE, 120.0),
+            bar_clock: BarClock::default(),
+            maps: Maps::default(),
+            maps_incoming: RingBuffer::<Maps>::new(2).1,
+            maps_retiring: RingBuffer::<Maps>::new(2).0,
             count_in_tail: 0,
             chunks: 0,
             metro_gain: 1.0,
