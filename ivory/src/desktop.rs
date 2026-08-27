@@ -243,7 +243,20 @@ struct Recorder {
     /// not the window's, so the pixels have to still be here when it does.
     /// Without this the video would only ever contain frames that happened to
     /// land on the same window frame as a tick.
-    camera_rgba: Option<(Vec<u8>, u32, u32)>,
+    /// **And WHEN it arrived**, which is the part that was missing.
+    ///
+    /// This is the picture that goes into the recorded video, and it had no
+    /// staleness guard of any kind: the on-screen preview is dropped the
+    /// moment `camera_running` goes false, and this was kept for ever. A
+    /// camera that opens, hands over one frame from its own stale buffer and
+    /// then delivers nothing composited that one frame into every tick of
+    /// every take — a picture six hours old, over a performance that
+    /// happened tonight, and nothing on screen to say so.
+    ///
+    /// `camera_silent` cannot catch that: it asks whether the device has
+    /// EVER delivered a frame, and this one delivered exactly one. Only the
+    /// age of the picture in hand answers the question.
+    camera_rgba: Option<(Vec<u8>, u32, u32, std::time::Instant)>,
     /// When to try starting the monitor output again, and how many tries are
     /// left.
     ///
@@ -509,6 +522,16 @@ pub struct DesktopApp {
 #[cfg(feature = "recorder")]
 const TRACK_WAVE_BUCKETS: usize = 1000;
 
+/// How old the camera's last frame may be and still be composited.
+///
+/// **One second.** The slowest format this app will open is fifteen frames a
+/// second, so a camera that is working delivers one every sixty-seven
+/// milliseconds; a whole second of nothing is a device that has stopped.
+/// Generous enough that a stall on a busy machine does not blank the pane,
+/// short enough that nothing six hours old ever reaches a file.
+#[cfg(feature = "recorder")]
+const CAMERA_FRAME_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Buckets per CLIP picture in the arrangement. Smaller than the band's:
 /// a clip is one of many and redrawn on every trim.
 const CLIP_WAVE_BUCKETS: usize = 600;
@@ -549,19 +572,82 @@ fn span_envelope(
     if frames == 0 || buckets == 0 {
         return Vec::new();
     }
-    let mut out = vec![0.0f32; buckets];
-    for (i, slot) in out.iter_mut().enumerate() {
+    // **MIN and MAX, not a peak.** A column drawn from one number is a bar
+    // chart of loudness; the shape anybody reads off a waveform is the
+    // outline of both sides, and audio is not symmetric about zero. See
+    // `ivory_ui::ports::ClipInfo`.
+    let mut out = vec![0.0f32; buckets * 2];
+    for i in 0..buckets {
         let a = start + i * frames / buckets;
         let b = (start + (i + 1) * frames / buckets).max(a + 1).min(end);
-        let mut peak = 0.0f32;
+        // **Seeded at the infinities, not at zero.**
+        //
+        // Starting both at 0.0 forces every bucket to straddle it: a passage
+        // that is entirely above the line — a bass note's positive half, or
+        // anything with a DC offset on it — reports a minimum of zero and is
+        // drawn as though it swung down to silence. Audio crosses zero often
+        // enough that it mostly looked right, which is why it would have
+        // survived a glance.
+        let mut lo = f32::INFINITY;
+        let mut hi = f32::NEG_INFINITY;
         for f in a..b {
-            let l = clip.samples.get(f * 2).copied().unwrap_or(0.0).abs();
-            let r = clip.samples.get(f * 2 + 1).copied().unwrap_or(0.0).abs();
-            peak = peak.max(l).max(r);
+            for ch in 0..2 {
+                let v = clip.samples.get(f * 2 + ch).copied().unwrap_or(0.0);
+                if v.is_finite() {
+                    lo = lo.min(v);
+                    hi = hi.max(v);
+                }
+            }
         }
-        *slot = peak.min(1.0);
+        // An empty or wholly non-finite bucket is a flat line, which is the
+        // only honest thing to draw for "nothing here".
+        let (lo, hi) = if lo <= hi { (lo, hi) } else { (0.0, 0.0) };
+        out[i * 2] = lo.max(-1.0);
+        out[i * 2 + 1] = hi.min(1.0);
     }
     out
+}
+
+/// How many buckets a clip's picture wants, and which of its seconds.
+///
+/// **Only what is on screen, at the pixels it occupies.**
+///
+/// A picture computed once at import is sharp at one zoom and blocky at
+/// every other, and a fixed budget cannot win: raise it enough for a
+/// close-up of a five-minute file and every clip carries a megabyte for a
+/// view nobody is looking at. Bounding the work by the WINDOW instead means
+/// the cost of a redraw is the seconds on screen, whatever the clip's
+/// length.
+///
+/// `None` when the clip is not in view at all, which is most of them on a
+/// long song.
+#[cfg(feature = "recorder")]
+fn wave_span(
+    clip_start_s: f64,
+    clip_len_s: f64,
+    view_start_s: f64,
+    view_len_s: f64,
+    lane_px: f32,
+) -> Option<(f64, f64, usize)> {
+    if clip_len_s <= 0.0 || view_len_s <= 0.0 || lane_px < 1.0 {
+        return None;
+    }
+    // **A margin either side**, so a small pan does not have to redraw: the
+    // staleness threshold in `arr_waves_stale` lets the view move by a
+    // twentieth before it asks again, and a picture that covered exactly the
+    // window would be short by that much for the whole of that movement.
+    let margin = view_len_s * 0.10;
+    let from = (view_start_s - margin).max(clip_start_s);
+    let to = (view_start_s + view_len_s + margin).min(clip_start_s + clip_len_s);
+    let span = to - from;
+    if span <= 0.0 {
+        return None;
+    }
+    let px_per_s = f64::from(lane_px) / view_len_s;
+    // One bucket per pixel, and never more than a screenful of them: past
+    // that they are drawn on top of each other.
+    let buckets = ((span * px_per_s).ceil() as usize).clamp(1, 8_192);
+    Some((from, span, buckets))
 }
 
 /// **Every stepped row has a list to step through.**
@@ -1139,10 +1225,12 @@ impl DesktopApp {
             // were about to be dropped anyway. And the buffer it displaces
             // goes BACK to the capture thread, which is what makes the
             // steady state allocation-free — see `FrameSlot::recycle`.
-            let spent =
-                self.recorder
-                    .camera_rgba
-                    .replace((frame.pixels, frame.width, frame.height));
+            let spent = self.recorder.camera_rgba.replace((
+                frame.pixels,
+                frame.width,
+                frame.height,
+                std::time::Instant::now(),
+            ));
             if let Some((pixels, ..)) = spent {
                 self.recorder.session.recycle_frame(pixels);
             }
@@ -1168,7 +1256,27 @@ impl DesktopApp {
         // detect the case this exists for — a webcam unplugged mid-session left
         // its last frame on screen looking live, indefinitely.
         let camera_open = self.recorder.session.camera_running();
-        if self.recorder.session.camera_silent() {
+        // **Silent means "not sending a picture NOW", not "has never sent
+        // one".**
+        //
+        // `Session::camera_silent` asks whether the device has EVER delivered
+        // a frame, which cannot see the failure this was reported for: a
+        // camera that opens, hands over one frame from its own stale buffer
+        // and then stops. It had delivered one, so nothing here fired, and
+        // the stale picture sat in the band and in every take's video looking
+        // live.
+        //
+        // Asked of the picture in hand instead. `camera_silent` is kept in
+        // the OR because it is true before the first frame arrives — when
+        // there is no picture to have an age — and the three-second grace on
+        // the message below is what covers an ordinary open.
+        let no_fresh_frame = camera_open
+            && !self
+                .recorder
+                .camera_rgba
+                .as_ref()
+                .is_some_and(|(.., at)| at.elapsed() <= CAMERA_FRAME_STALE_AFTER);
+        if self.recorder.session.camera_silent() || no_fresh_frame {
             self.recorder
                 .camera_silent_since
                 .get_or_insert_with(std::time::Instant::now);
@@ -1179,6 +1287,29 @@ impl DesktopApp {
             // Drop the stale picture when there is no camera behind it, or the
             // last frame of an unplugged webcam stays on screen looking live.
             self.recorder.preview = None;
+            // **And the one the VIDEO uses**, which is the same rule and was
+            // not applied to it. The preview has been protected since a
+            // webcam was unplugged mid-session; the recording, which is the
+            // copy that outlives the session, was not.
+            if let Some((pixels, ..)) = self.recorder.camera_rgba.take() {
+                self.recorder.session.recycle_frame(pixels);
+            }
+        }
+        // A picture too old to be true goes as well, camera open or not.
+        //
+        // **A missing picture is diagnosable and a stale one is not.** A
+        // black camera pane in a take is somebody asking why; a six-hour-old
+        // frame of the same room is a take that looks fine until it does
+        // not, and by then it has been sent somewhere.
+        if self
+            .recorder
+            .camera_rgba
+            .as_ref()
+            .is_some_and(|(.., at)| at.elapsed() > CAMERA_FRAME_STALE_AFTER)
+        {
+            if let Some((pixels, ..)) = self.recorder.camera_rgba.take() {
+                self.recorder.session.recycle_frame(pixels);
+            }
         }
 
         // What both sides are doing, for the Audio Status panel. Pushed every
@@ -1379,7 +1510,8 @@ impl DesktopApp {
                     // naming none.
                     if cfg!(target_os = "macos") {
                         "the camera is open but sending no picture - check \
-                         Camera access in System Settings > Privacy & Security"
+                         Camera access in System Settings > Privacy & Security, \
+                         and whether another app is holding it"
                     } else if cfg!(target_os = "linux") {
                         "the camera is open but sending no picture - another \
                          program may be holding it, or the format may not be \
@@ -1503,6 +1635,9 @@ impl DesktopApp {
             state.loudness.momentary = m;
             state.loudness.short = st;
             state.loudness.integrated = i;
+            // What the timeline is playing, lane by lane — the half the
+            // theory view could never see. See `Engine::lane_sounding`.
+            state.lane_sounding = e.lane_sounding();
             // The desk's own meters. Read-and-reset on the engine's side, so
             // this has to happen exactly once a frame and here is that once.
             state.strip_peaks = e.strip_peaks();
@@ -1528,6 +1663,7 @@ impl DesktopApp {
             state.master = ivory_ui::recorder::Meters::SILENT;
             state.gr_db = 0.0;
             state.loudness = ivory_ui::recorder::Loudness::default();
+            state.lane_sounding = [0; ivory_ui::recorder::CHANNELS];
         }
         // **Levels with nothing plugged in, for looking at the desk.**
         //
@@ -2150,7 +2286,13 @@ impl DesktopApp {
         // **The document's clips, whenever an edit touched them.** The app
         // marks; this decodes, pushes the engine's schedule, and rebuilds
         // the band's picture — after the frame, like every other slow thing.
-        if self.app.take_clips_dirty() {
+        // **...and whenever the ZOOM has moved far enough to matter.** A
+        // waveform is drawn at a zoom: the pictures are made at the pixels
+        // the clips occupy, so a view that has travelled needs new ones or
+        // the audio is smeared across columns it does not belong in. See
+        // `IvoryApp::arr_waves_stale`, which is the threshold that keeps
+        // this off the frame path during a drag.
+        if self.app.take_clips_dirty() || self.app.arr_waves_stale() {
             self.reload_clips();
         }
 
@@ -2382,6 +2524,10 @@ impl DesktopApp {
                     if let Some(e) = self.recorder.engine.as_ref() {
                         e.clear_clip();
                     }
+                }
+                R::NormalizeClips(ids) => self.normalize_clips(&ids),
+                R::CopyInsert { from_strip, from_bay, to_strip } => {
+                    self.copy_insert(from_strip, from_bay, to_strip);
                 }
                 R::ResetLoudness => {
                     if let Some(e) = self.recorder.engine.as_ref() {
@@ -3931,6 +4077,7 @@ impl DesktopApp {
                     len: frames(len_s),
                     fade_in: frames(clip.fade_in_s),
                     fade_out: frames(clip.fade_out_s),
+                    gain: 1.0,
                 });
             }
             e.set_clips(placed);
@@ -4421,7 +4568,9 @@ impl DesktopApp {
         let mut span = 0.0f64;
         let mut error = String::new();
         let mut fill_len: Vec<(u64, f64)> = Vec::new();
-        let mut clip_infos: Vec<(u64, Vec<f32>, f64)> = Vec::new();
+        let mut clip_infos: Vec<ivory_ui::ports::ClipInfo> = Vec::new();
+        // The window the pictures are being made FOR. See `wave_span`.
+        let wave_view = self.app.arr_wave_view();
         for clip in &doc.clips {
             // A MIDI item is a schedule of its own: notes in frames from
             // the clip's drawn left edge — the trim (`offset_s`) already
@@ -4518,6 +4667,7 @@ impl DesktopApp {
                 len: frames(len_s),
                 fade_in: frames(clip.fade_in_s),
                 fade_out: frames(clip.fade_out_s),
+                gain: clip.gain as f32,
             });
             if info.is_none() {
                 info = Some(ivory_ui::ports::TrackInfo {
@@ -4527,20 +4677,55 @@ impl DesktopApp {
                     error: String::new(),
                 });
             }
-            // The clip's own picture: the PLAYED span's envelope, so a
-            // trimmed clip shows the audio it will actually make.
-            clip_infos.push((
-                clip.id,
-                span_envelope(
-                    &decoded,
-                    frames(clip.offset_s) as usize,
-                    frames(len_s) as usize,
-                    CLIP_WAVE_BUCKETS,
+            // **The clip's own picture, at the resolution it is being drawn
+            // at.** Only the visible slice, and only when the arrangement is
+            // showing — see `wave_span`, which says why a fixed budget
+            // cannot be right at every zoom.
+            let (wave, wave_from_s, wave_span_s) = match wave_view.and_then(|(vs, vl, px)| {
+                wave_span(clip.start_s, len_s, vs, vl, px)
+            }) {
+                Some((from, span, buckets)) => {
+                    // In the clip's own file, which is where the samples
+                    // are: the drawn second `from` is `from - start_s` into
+                    // the played span, past the left trim.
+                    let into = (from - clip.start_s).max(0.0);
+                    (
+                        span_envelope(
+                            &decoded,
+                            frames(clip.offset_s + into) as usize,
+                            frames(span) as usize,
+                            buckets,
+                        ),
+                        from,
+                        span,
+                    )
+                }
+                // Nothing on screen, or no panel: a coarse whole-clip
+                // picture, which is what the band's own scrubber uses and
+                // what a clip needs before anybody has looked at it.
+                None => (
+                    span_envelope(
+                        &decoded,
+                        frames(clip.offset_s) as usize,
+                        frames(len_s) as usize,
+                        CLIP_WAVE_BUCKETS,
+                    ),
+                    clip.start_s,
+                    len_s,
                 ),
+            };
+            clip_infos.push(ivory_ui::ports::ClipInfo {
+                id: clip.id,
+                wave,
                 file_s,
-            ));
+                wave_from_s,
+                wave_span_s,
+            });
         }
         self.app.set_clip_infos(clip_infos);
+        if let Some(at) = wave_view {
+            self.app.note_waves_drawn(at);
+        }
         // Lengths the decode just established, written down so the scrubber
         // can draw next launch without one. Never marks the clips dirty.
         for (id, len_s) in fill_len {
@@ -4646,6 +4831,117 @@ impl DesktopApp {
     /// than the first, because closing the editor is the moment right after
     /// somebody chose a preset, and it is also the moment they are most likely
     /// to then force-quit or unplug something.
+    /// Bring each clip up so its loudest point sits just under full scale.
+    ///
+    /// **The PLAYED span, not the file.** A clip trimmed to its quiet half
+    /// should come up by what that half needs; measuring the whole file
+    /// would normalise to a peak the clip does not play, which is the
+    /// difference between "this take is level with the others" and "nothing
+    /// happened".
+    ///
+    /// **And nothing is written to disk.** The gain is a number on the clip:
+    /// undoable, reversible, and the same file still under it.
+    #[cfg(feature = "recorder")]
+    fn normalize_clips(&mut self, ids: &[u64]) {
+        let Some(doc_path) = self.app.project_doc().map(std::path::Path::to_path_buf) else {
+            return;
+        };
+        let rate = self
+            .recorder
+            .engine
+            .as_ref()
+            .map_or(48_000, |e| e.output().sample_rate);
+        let doc = self.app.arrangement().clone();
+        let mut done = 0usize;
+        let mut silent = 0usize;
+        for clip in doc.clips.iter().filter(|c| ids.contains(&c.id)) {
+            if clip.kind != ivory_ui::arrangement::ClipKind::Audio {
+                continue;
+            }
+            let path = ivory_ui::arrangement::Arrangement::resolve(&doc_path, &clip.path);
+            let Some(decoded) = self.track_cache.get(&path).map(Arc::clone) else {
+                continue;
+            };
+            let frames = |s: f64| frames_at(f64::from(rate), s) as usize;
+            let from = frames(clip.offset_s);
+            let len = frames(clip.play_len_s(decoded.seconds()));
+            let end = (from + len).min(decoded.frames());
+            let mut peak = 0.0f32;
+            for f in from.min(end)..end {
+                for ch in 0..2 {
+                    let v = decoded.samples.get(f * 2 + ch).copied().unwrap_or(0.0);
+                    if v.is_finite() {
+                        peak = peak.max(v.abs());
+                    }
+                }
+            }
+            // **Silence has no peak to normalise to.** Dividing by it is an
+            // infinite gain on a clip that would still be silent, and the
+            // honest answer is to say so rather than to multiply nothing by
+            // a very large number.
+            if peak <= 1.0e-5 {
+                silent += 1;
+                continue;
+            }
+            // A hair under full scale: normalising exactly TO it leaves a
+            // clip that clips the moment anything is added to it, and the
+            // master's own limiter is not what this should be leaning on.
+            const CEILING: f32 = 0.891; // −1 dBFS
+            self.app
+                .set_clip_gain(clip.id, f64::from(CEILING / peak));
+            done += 1;
+        }
+        self.recorder.take_note = Some(match (done, silent) {
+            (0, 0) => "Nothing to normalise.".to_owned(),
+            (0, n) => format!("{n} clip(s) are silent - nothing to bring up."),
+            (d, 0) => format!("Normalised {d} clip(s) to -1 dBFS."),
+            (d, n) => format!("Normalised {d} clip(s); {n} were silent."),
+        });
+    }
+
+    /// Copy one bay's effect to another channel's next free bay, with the
+    /// settings it is playing at right now.
+    ///
+    /// **The state is written BEFORE the settings**, and that order is the
+    /// whole function: the reconcile that loads the target's plugin reads
+    /// the sidecar as it constructs the instance, so a sidecar written
+    /// afterwards is a sidecar the plugin has already come up without. The
+    /// symptom would be a copy that works on the second reload and not on
+    /// the first, which is the kind of thing that gets reported as "it
+    /// sometimes forgets".
+    #[cfg(feature = "recorder")]
+    fn copy_insert(&mut self, from_strip: usize, from_bay: usize, to_strip: usize) {
+        let Some(bundle) = self.app.insert(from_strip, from_bay).map(str::to_owned) else {
+            return;
+        };
+        if from_strip == to_strip {
+            return;
+        }
+        let bays = ivory_ui::recorder::INSERTS;
+        let Some(to_bay) = (0..bays).find(|b| self.app.insert(to_strip, *b).is_none()) else {
+            // **Every bay full is a refusal with a reason.** Silently
+            // replacing one would be throwing away an effect somebody dialled
+            // in, from a gesture that says "copy".
+            self.recorder.take_note = Some(format!(
+                "{} has no free insert bay",
+                self.app.channel_display_name(to_strip)
+            ));
+            return;
+        };
+        // The state it is playing at, not the one on disk: a plugin somebody
+        // has been turning knobs on has not written a sidecar since it
+        // loaded.
+        if let Some(state) = self
+            .recorder
+            .engine
+            .as_ref()
+            .and_then(|e| e.save_insert_state(from_strip, from_bay))
+        {
+            write_insert_state(to_strip, to_bay, &bundle, &state);
+        }
+        self.app.set_insert(to_strip, to_bay, Some(&bundle));
+    }
+
     fn save_plugin_states(&mut self) {
         for strip in 0..ivory_ui::recorder::STRIPS + 1 + ivory_ui::recorder::DRUM_PADS {
             for bay in 0..ivory_ui::recorder::INSERTS {
@@ -6382,11 +6678,15 @@ impl DesktopApp {
                 continue;
             }
             let pts = (v.next as i64 * 1_000_000_000) / i64::from(v.fps);
+            // Only a picture that is still true — see `camera_rgba`. The
+            // sweep above drops a stale one, and this is the second half of
+            // the same rule for the window frames in between.
             let frame = self
                 .recorder
                 .camera_rgba
                 .as_ref()
-                .map(|(px, w, h)| (px.as_slice(), *w, *h));
+                .filter(|(.., at)| at.elapsed() <= CAMERA_FRAME_STALE_AFTER)
+                .map(|(px, w, h, _)| (px.as_slice(), *w, *h));
             match v.compositor.frame(
                 &self.app, v.layout, v.shows, v.camera, v.display, frame, pts,
             ) {
@@ -6732,6 +7032,96 @@ impl DesktopApp {
 #[cfg(all(test, feature = "recorder"))]
 mod tests {
     use super::*;
+
+    /// **A clip's picture covers what is on screen, at the pixels it
+    /// occupies.**
+    ///
+    /// A fixed bucket count cannot be right at every zoom, and computing the
+    /// whole of a long clip at screen resolution every time the view moves is
+    /// a pass over the part of it nobody can see. The span is bounded by the
+    /// WINDOW, which is what makes the cost independent of how long the clip
+    /// is.
+    #[test]
+    fn a_clips_picture_follows_the_window_and_not_its_length() {
+        // A five-minute clip, ten seconds of it on screen across 1000 points.
+        let got = wave_span(0.0, 300.0, 100.0, 10.0, 1000.0);
+        let (from, span, buckets) = got.expect("a clip under the window has a picture");
+        // A margin either side, so a small pan does not have to redraw.
+        assert!(from < 100.0 && from >= 88.0, "from {from}");
+        assert!(span >= 10.0 && span <= 13.0, "span {span}");
+        // About one bucket per pixel of the span, and never a screenful more.
+        let px = span * 100.0;
+        assert!(
+            (buckets as f64 - px).abs() <= 2.0,
+            "{buckets} buckets for {px:.0} pixels"
+        );
+        assert!(buckets <= 8_192);
+
+        // **The same window over a clip a thousand times longer is the same
+        // work.** This is the whole point.
+        let long = wave_span(0.0, 300_000.0, 100.0, 10.0, 1000.0).unwrap();
+        assert_eq!(long.2, buckets, "a longer clip cost more buckets");
+
+        // Zoomed right in: more buckets for fewer seconds, which is the
+        // resolution that was missing.
+        let close = wave_span(0.0, 300.0, 100.0, 0.5, 1000.0).unwrap();
+        assert!(close.1 < 1.0, "span {}", close.1);
+        assert!(close.2 >= 500, "{} buckets at a half-second zoom", close.2);
+
+        // A clip nowhere near the window has no picture to make.
+        assert!(wave_span(0.0, 5.0, 100.0, 10.0, 1000.0).is_none());
+        assert!(wave_span(400.0, 5.0, 100.0, 10.0, 1000.0).is_none());
+        // ...and neither does a degenerate ask.
+        assert!(wave_span(0.0, 0.0, 0.0, 10.0, 1000.0).is_none());
+        assert!(wave_span(0.0, 10.0, 0.0, 0.0, 1000.0).is_none());
+        assert!(wave_span(0.0, 10.0, 0.0, 10.0, 0.0).is_none());
+        // A clip that only PARTLY overlaps is clipped to itself, never past
+        // its own ends — a picture that claimed seconds the clip does not
+        // have would draw somebody else's audio at its edge.
+        let (from, span, _) = wave_span(105.0, 2.0, 100.0, 10.0, 1000.0).unwrap();
+        assert!(from >= 105.0 - 1e-9, "from {from} is before the clip");
+        assert!(from + span <= 107.0 + 1e-9, "it ran past the clip's end");
+    }
+
+    /// The envelope is MIN and MAX, and a silent clip is a flat line rather
+    /// than a NaN.
+    #[test]
+    fn the_envelope_carries_both_sides() {
+        let clip = ivory_record::decode::Clip {
+            // A sawtooth from −1 to +1: the two sides are different, which is
+            // what a peak-only envelope cannot show.
+            samples: (0..1000)
+                .flat_map(|i| {
+                    let v = (i as f32 / 500.0) - 1.0;
+                    [v, v]
+                })
+                .collect(),
+            rate: 48_000,
+            source: std::path::PathBuf::from("t.wav"),
+        };
+        let env = span_envelope(&clip, 0, 1000, 4);
+        assert_eq!(env.len(), 8, "four buckets is four pairs");
+        for k in 0..4 {
+            let (lo, hi) = (env[k * 2], env[k * 2 + 1]);
+            assert!(lo <= hi, "bucket {k} runs backwards: {lo}..{hi}");
+            assert!(lo >= -1.0 && hi <= 1.0, "bucket {k} left the range");
+        }
+        // The first bucket is the negative quarter and the last the positive
+        // one, which a mirrored peak envelope would have drawn identically.
+        assert!(env[0] < -0.4 && env[1] < 0.0, "{:?}", &env[..2]);
+        assert!(env[6] > 0.0 && env[7] > 0.4, "{:?}", &env[6..]);
+
+        let quiet = ivory_record::decode::Clip {
+            samples: vec![0.0; 200],
+            rate: 48_000,
+            source: std::path::PathBuf::from("q.wav"),
+        };
+        assert!(span_envelope(&quiet, 0, 100, 4).iter().all(|v| *v == 0.0));
+        // Nothing to draw is nothing, not a panic.
+        assert!(span_envelope(&quiet, 0, 0, 4).is_empty());
+        assert!(span_envelope(&quiet, 0, 100, 0).is_empty());
+        assert!(span_envelope(&quiet, 9_999, 100, 4).is_empty());
+    }
 
     /// **A fresh engine is told the song's musical time.**
     ///

@@ -477,6 +477,31 @@ pub struct LearningStatus {
 /// `TrackPalette` with this means "follow the theme" rather than naming one.
 pub const PALETTE_AUTO: i64 = -1;
 
+/// How wide each of `count` cells may be to fit `available` with `gap`
+/// between them.
+///
+/// **The gap is the part that gets forgotten.** `ui.horizontal` inserts
+/// `item_spacing.x` between every pair, so a row of nine cells has eight
+/// gaps and a row of eighteen has seventeen — and a width computed by
+/// dividing the available space by the count alone overflows by exactly that
+/// much. egui then CLIPS it, so there is no overdraw and no panic: the last
+/// cells simply are not there, which is the shape this bug arrived in.
+///
+/// Both swatch rows in the track dialog got it wrong in different ways: one
+/// assumed a three-point gap where there were eight, and the other budgeted
+/// eight points in total for seventeen of them.
+///
+/// **Zero when the gaps alone do not fit.** Eighteen eight-point gaps do not
+/// go into a hundred and twenty points however narrow the cells are, and no
+/// width this could return would make them; the caller needs a smaller gap.
+pub fn cells_across(available: f32, count: usize, gap: f32) -> f32 {
+    if count == 0 || !available.is_finite() {
+        return 0.0;
+    }
+    let gaps = (count.saturating_sub(1)) as f32 * gap.max(0.0);
+    ((available - gaps) / count as f32).max(0.0)
+}
+
 /// One button on a [`Dialog::Confirm`].
 pub struct ConfirmChoice {
     pub label: String,
@@ -4898,8 +4923,22 @@ pub fn show(
                             // reached by choosing a palette, never a swatch.
                             let cols = crate::mixer_panel::MANUAL_COLORS
                                 / crate::mixer_panel::PALETTE_COLUMNS;
-                            let sw = (ui.available_width() - (cols as f32 - 1.0) * 3.0)
-                                / cols as f32;
+                            // **The gap egui will REALLY put between them.**
+                            //
+                            // This divided the width by nine assuming a
+                            // three-point gap, and `ui.horizontal` inserts
+                            // `item_spacing.x` — eight by default, which
+                            // nothing here changes. Eight columns of gap at
+                            // five points too many is forty points of
+                            // overflow on a three-hundred-point row: the last
+                            // swatch and a good part of the one before it ran
+                            // off the right-hand edge of the dialog, on every
+                            // theme, since the grid was written.
+                            //
+                            // Asked of the ui rather than assumed, so it
+                            // stays right if the dialog's spacing ever moves.
+                            let gap = ui.spacing().item_spacing.x;
+                            let sw = cells_across(ui.available_width(), cols, gap);
                             for row in 0..3 {
                                 ui.horizontal(|ui| {
                                     for col in 0..cols {
@@ -5034,8 +5073,26 @@ pub fn show(
                                     // the whole desk in miniature, and the two
                                     // that are not channels should not read as
                                     // the seventeenth and eighteenth.
-                                    let sw = ((ui.available_width() - 8.0) / 18.0)
-                                        .clamp(5.0, 12.0);
+                                    //
+                                    // **The gap between them is set to ONE
+                                    // and then paid for.** Eighteen swatches
+                                    // in a `horizontal` take seventeen gaps
+                                    // of whatever `item_spacing.x` is — eight
+                                    // by default — which is a hundred and
+                                    // thirty-six points nobody budgeted for,
+                                    // on a row of about two hundred. The
+                                    // miniature desk ran off the right of the
+                                    // dialog and took its last few channels
+                                    // with it.
+                                    ui.spacing_mut().item_spacing.x = 1.0;
+                                    // The extra six is `add_space` between the
+                                    // channels and the two that are not.
+                                    let sw = cells_across(
+                                        ui.available_width() - 6.0,
+                                        crate::recorder::CHANNELS + 2,
+                                        1.0,
+                                    )
+                                    .clamp(3.0, 12.0);
                                     let mut swatch = |ui: &mut egui::Ui, c: usize| {
                                         let (cr, cg, cb) = crate::mixer_panel::STRIP_COLORS
                                             [c.min(crate::mixer_panel::STRIP_COLORS.len() - 1)];
@@ -6865,6 +6922,54 @@ pub fn show(
 
 #[cfg(test)]
 mod tests {
+
+    /// **A row of cells and its gaps fit the space it was given.**
+    ///
+    /// The track dialog's colour grid ran off the right-hand edge of the
+    /// dialog for as long as it existed, and nothing said so: `ui.horizontal`
+    /// inserts `item_spacing.x` between every pair of cells, egui clips what
+    /// does not fit, and a clipped swatch looks exactly like a swatch that
+    /// was never drawn. One row assumed a three-point gap where there were
+    /// eight; the other budgeted eight points for seventeen of them.
+    #[test]
+    fn a_row_of_swatches_fits_the_space_it_was_given() {
+        for available in [120.0_f32, 200.0, 336.0, 900.0] {
+            for count in [1_usize, 2, 9, 18, 27] {
+                for gap in [0.0_f32, 1.0, 3.0, 8.0] {
+                    let w = cells_across(available, count, gap);
+                    assert!(w.is_finite() && w >= 0.0, "{w} is not a width");
+                    let gaps = (count - 1) as f32 * gap;
+                    // **Only when the gaps themselves fit.** Eighteen
+                    // eight-point gaps do not go into a hundred and twenty
+                    // points however narrow the cells are, and no width this
+                    // function could return would make them: that row needs a
+                    // smaller GAP, which is what the palette row does. Zero
+                    // is the honest answer and the caller's cue.
+                    if gaps > available {
+                        assert_eq!(w, 0.0, "{count} cells claimed room that is not there");
+                        continue;
+                    }
+                    let used = w * count as f32 + gaps;
+                    assert!(
+                        used <= available + 0.01,
+                        "{count} cells at {w} with a {gap} gap take {used} of {available}"
+                    );
+                    // ...and it does not waste the space either: a row that
+                    // fits in half the width is a grid with a hole in it.
+                    assert!(
+                        used >= available - 0.01,
+                        "{count} cells left {} unused of {available}",
+                        available - used
+                    );
+                }
+            }
+        }
+        // Degenerate asks answer a number rather than a NaN or a negative
+        // width, either of which is an inverted rect in the painter.
+        assert_eq!(cells_across(100.0, 0, 4.0), 0.0);
+        assert_eq!(cells_across(4.0, 27, 8.0), 0.0);
+        assert!(cells_across(100.0, 4, -8.0) > 0.0);
+    }
     use super::*;
 
     /// **Every theme dresses the confirmation legibly, warning and all.**

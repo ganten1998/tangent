@@ -75,6 +75,8 @@ pub struct StripView<'a> {
     /// monitors its input. Session state, never saved: a project must be
     /// openable without headphones. See docs/ARRANGEMENT.md.
     pub armed: bool,
+    /// This channel's MIDI goes to the theory view — the **T** switch.
+    pub to_theory: bool,
 }
 
 impl StripView<'_> {
@@ -183,6 +185,8 @@ pub enum Hit {
     /// interface for an input, the instrument for a slot, the file for the
     /// backing track — because both ask the same question.
     Add(Column),
+    /// **T** — send this channel's MIDI to the theory view, or stop.
+    ToTheory(Column),
     /// One of the three insert chips: put an effect in it, or take one out.
     /// The second field is the BAY, which is not a channel of anything.
     Insert(Column, usize),
@@ -238,6 +242,7 @@ impl Hit {
             | Hit::Name(i)
             | Hit::Remove(i)
             | Hit::Arm(i)
+            | Hit::ToTheory(i)
             | Hit::FxMenu(i, ..)
             | Hit::InputChip(i)
             | Hit::Routing(i)
@@ -260,7 +265,7 @@ impl Hit {
             // the right or the picture and the hand disagree.
             Hit::RouteGain(..) => Some(DragAxis::Horizontal),
             Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(..)
-            | Hit::Db(_) | Hit::Name(_) | Hit::Remove(_) | Hit::Arm(_)
+            | Hit::Db(_) | Hit::Name(_) | Hit::Remove(_) | Hit::Arm(_) | Hit::ToTheory(_)
             | Hit::FxMenu(..) | Hit::InputChip(_) | Hit::Routing(_) => None,
         }
     }
@@ -273,7 +278,7 @@ impl Hit {
             Hit::Pan(_) => Some(SEND_TRAVEL),
             Hit::RouteGain(..) => Some(SEND_TRAVEL),
             Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(..)
-            | Hit::Db(_) | Hit::Name(_) | Hit::Remove(_) | Hit::Arm(_)
+            | Hit::Db(_) | Hit::Name(_) | Hit::Remove(_) | Hit::Arm(_) | Hit::ToTheory(_)
             | Hit::FxMenu(..) | Hit::InputChip(_) | Hit::Routing(_) => None,
         }
     }
@@ -596,6 +601,9 @@ pub struct StripStrip {
     pub solo: Rect,
     /// The R switch. `NOTHING` on everything but a general channel.
     pub arm: Rect,
+    /// The T switch: send this track's MIDI to the theory view. `NOTHING`
+    /// on everything but a general channel, for the same reason.
+    pub theory: Rect,
     /// A user effect plugin across this strip. Only the bus has one today.
     pub inserts: [Rect; INSERTS],
     /// The Routing button, under the insert bays — the owner's placement.
@@ -615,6 +623,7 @@ impl StripStrip {
     /// `Rect` has no `Default` and a zero-sized rect at the origin would be
     /// INSIDE small windows — a target you can press by accident.
     const NONE: Self = Self {
+        theory: Rect::NOTHING,
         panel: Rect::NOTHING,
         icon: Rect::NOTHING,
         name: Rect::NOTHING,
@@ -815,25 +824,31 @@ impl Layout {
         // switches share the row the pair had; the letters carry them at the
         // width that leaves.
         let has_arm = matches!(view.strip, Some(Strip::Channel(_)));
-        let (mute, solo, arm) = if switchable && has_arm {
-            let w = ((switches.width() - 8.0) / 3.0).max(1.0);
+        // **FOUR switches on a general channel now** — M, S, R and T, the
+        // last being "send this track's MIDI to the theory view". A channel
+        // is the only thing that can be any of them, so the strips that are
+        // not one keep the pair they had.
+        let (mute, solo, arm, theory) = if switchable && has_arm {
+            let gap = 3.0;
+            let w = ((switches.width() - gap * 3.0) / 4.0).max(1.0);
             let cell = |k: f32| {
-                let left = switches.left() + k * (w + 4.0);
+                let left = switches.left() + k * (w + gap);
                 Rect::from_min_max(
                     Pos2::new(left, switches.top()),
                     Pos2::new(left + w, switches.bottom()),
                 )
             };
-            (cell(0.0), cell(1.0), cell(2.0))
+            (cell(0.0), cell(1.0), cell(2.0), cell(3.0))
         } else if switchable {
             let mid = switches.center().x;
             (
                 Rect::from_min_max(switches.min, Pos2::new(mid - 3.0, switches.max.y)),
                 Rect::from_min_max(Pos2::new(mid + 3.0, switches.min.y), switches.max),
                 Rect::NOTHING,
+                Rect::NOTHING,
             )
         } else {
-            (Rect::NOTHING, Rect::NOTHING, Rect::NOTHING)
+            (Rect::NOTHING, Rect::NOTHING, Rect::NOTHING, Rect::NOTHING)
         };
         // A strip with no send starts its fader where the send would have been,
         // rather than leaving a hole: a hole reads as a control that failed to
@@ -951,6 +966,7 @@ impl Layout {
             mute,
             solo,
             arm,
+            theory,
             inserts,
             // **The same target as the plus on an empty one**, because it is
             // the same question: what is on this channel. An empty slot draws
@@ -978,6 +994,7 @@ impl Layout {
                 (s.mute, Hit::Mute(i)),
                 (s.solo, Hit::Solo(i)),
                 (s.arm, Hit::Arm(i)),
+                (s.theory, Hit::ToTheory(i)),
                 (s.add, Hit::Add(i)),
                 (s.inserts[0], Hit::Insert(i, 0)),
                 (s.inserts[1], Hit::Insert(i, 1)),
@@ -1071,6 +1088,12 @@ pub fn a11y_nodes(rect: Rect, view: &MixerView<'_>) -> Vec<crate::a11y::Node> {
             Hit::Mute(_) => Node::toggle(id, r, format!("{who} mute"), s.muted),
             Hit::Solo(_) => Node::toggle(id, r, format!("{who} solo"), s.soloed),
             Hit::Arm(_) => Node::toggle(id, r, format!("{who} record arm"), s.armed),
+            Hit::ToTheory(_) => Node::toggle(
+                id,
+                r,
+                format!("{who} sends its MIDI to the theory view"),
+                s.to_theory,
+            ),
             Hit::Add(_) => Node::button(id, r, format!("Add a channel at slot {}", col.0 + 1)),
             Hit::Remove(_) => Node::button(id, r, format!("Remove {who}")),
             Hit::Name(_) => Node::readout(id, r, format!("{who} name"), who.clone()),
@@ -1128,6 +1151,7 @@ fn hit_column(hit: Hit) -> Option<Column> {
         | Hit::Mute(i)
         | Hit::Solo(i)
         | Hit::Arm(i)
+        | Hit::ToTheory(i)
         | Hit::Add(i)
         | Hit::Routing(i)
         | Hit::Db(i)
@@ -2287,6 +2311,7 @@ mod tests {
 
     fn a_strip(strip: Option<Strip>, empty: bool) -> StripView<'static> {
         StripView {
+            to_theory: false,
             route_count: 0,
             icon: 0,
             strip,

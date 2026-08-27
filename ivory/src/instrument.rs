@@ -1668,6 +1668,19 @@ struct Shared {
     /// The varispeed ratio, as `f32` bits. **1.0 is off**, and the whole
     /// resampling path is skipped there — see `crate::varispeed`.
     varispeed: AtomicU32,
+    /// Which pitches each lane's CLIPS are sounding, two `u64` per lane.
+    ///
+    /// **Playback, and only playback.** The live notes are already in the
+    /// app's own hands — it is the thing that received them — so what it
+    /// cannot know is which lanes the TIMELINE is currently playing. That is
+    /// the half the theory view needs to light a clip, and the half a
+    /// per-track "send this to the theory view" switch has nothing to switch
+    /// without.
+    ///
+    /// Two atomics rather than one `u128`: the wide one is not lock-free on
+    /// every target this ships to, and a lock on the audio thread is not a
+    /// thing to introduce for a picture.
+    lane_sounding: Vec<AtomicU64>,
     max_latency: AtomicU32,
     /// **What is SHOWN** — the whole delay somebody is actually paying,
     /// master included.
@@ -1822,6 +1835,7 @@ impl Shared {
             }),
             lufs_reset: AtomicU32::new(0),
             varispeed: AtomicU32::new(1.0f32.to_bits()),
+            lane_sounding: (0..CHANNELS * 2).map(|_| AtomicU64::new(0)).collect(),
             max_latency: AtomicU32::new(0),
             total_latency: AtomicU32::new(0),
             soloed: AtomicU32::new(0),
@@ -2085,6 +2099,12 @@ pub struct Placed {
     pub fade_in: u64,
     /// Frames of ramp down to silence at the tail. Zero for none.
     pub fade_out: u64,
+    /// The clip's own level, linear. 1.0 is untouched.
+    ///
+    /// **Where NORMALISE lives.** Rewriting the file would be destructive
+    /// and un-undoable; a number on the clip is neither, and it costs one
+    /// multiply in a loop that is already doing three.
+    pub gain: f32,
 }
 
 impl Placed {
@@ -2100,6 +2120,7 @@ impl Placed {
             len,
             fade_in: 0,
             fade_out: 0,
+            gain: 1.0,
         }
     }
 }
@@ -3791,6 +3812,24 @@ impl Renderer {
                 cell.store(v.to_bits(), Ordering::Relaxed);
             }
         }
+        // **What the timeline is playing, lane by lane.** Rebuilt from
+        // `active_clip`, which is the authority on what is sounding from a
+        // clip and already carries the lane; deriving it here costs one pass
+        // over a list that is at most a few dozen long and saves keeping a
+        // second copy in step.
+        {
+            let mut mask = [0u64; CHANNELS * 2];
+            for a in &self.active_clip {
+                let lane = usize::from(a.lane);
+                if lane >= CHANNELS || a.key >= 128 {
+                    continue;
+                }
+                mask[lane * 2 + usize::from(a.key >= 64)] |= 1u64 << (a.key % 64);
+            }
+            for (cell, v) in self.shared.lane_sounding.iter().zip(mask) {
+                cell.store(v, Ordering::Relaxed);
+            }
+        }
         self.publish_meters(frames, peak_l, peak_r, sumsq_l, sumsq_r, clipped);
         tap_frames
     }
@@ -4684,7 +4723,15 @@ impl Renderer {
                     env *= (left - 1) as f32 / placed.fade_out as f32;
                 }
                 let lane = placed.strip.min(CHANNELS - 1);
-                let g = self.lane_gain[lane];
+                // **The clip's own level, before the lane's.** Sanitised
+                // here rather than trusted: this multiplies into somebody's
+                // monitors, and the rule the gains follow everywhere else.
+                let clip_g = if placed.gain.is_finite() {
+                    placed.gain.clamp(0.0, 64.0)
+                } else {
+                    1.0
+                };
+                let g = self.lane_gain[lane] * clip_g;
                 let (l, r) = (cl * env * g * pan[lane].0, cr * env * g * pan[lane].1);
                 peak[lane][0] = peak[lane][0].max(l.abs());
                 peak[lane][1] = peak[lane][1].max(r.abs());
@@ -6977,6 +7024,25 @@ impl Engine {
     /// their hands when it happened.
     pub fn clear_clip(&self) {
         self.shared.clipped.store(false, Ordering::Relaxed);
+    }
+
+    /// Which pitches each lane's CLIPS are sounding right now.
+    ///
+    /// Playback only — see `Shared::lane_sounding`.
+    pub fn lane_sounding(&self) -> [u128; CHANNELS] {
+        std::array::from_fn(|lane| {
+            let lo = self
+                .shared
+                .lane_sounding
+                .get(lane * 2)
+                .map_or(0, |c| c.load(Ordering::Relaxed));
+            let hi = self
+                .shared
+                .lane_sounding
+                .get(lane * 2 + 1)
+                .map_or(0, |c| c.load(Ordering::Relaxed));
+            u128::from(lo) | (u128::from(hi) << 64)
+        })
     }
 
     /// The loudness ladder's three readings, in LUFS.
@@ -10397,6 +10463,7 @@ mod tests {
                 len: 1000,
                 fade_in: 0,
                 fade_out: 0,
+                gain: 1.0,
             }])
             .expect("room");
         // Channel 1 -> outs 3/4 (zero-based first = 2), at half.
@@ -10457,6 +10524,7 @@ mod tests {
             len: n as u64,
             fade_in: 0,
             fade_out: 0,
+            gain: 1.0,
         }])
         .expect("room");
         shared.transport_at.store(0, Ordering::Relaxed);
@@ -10592,6 +10660,7 @@ mod tests {
                 len: 1000,
                 fade_in: 0,
                 fade_out: 0,
+                gain: 1.0,
             }])
             .expect("room");
         // Hard right, and a MONO route to out 4 (index 3).
@@ -10639,6 +10708,7 @@ mod tests {
                     len: 1000,
                     fade_in: 0,
                     fade_out: 0,
+                    gain: 1.0,
                 }])
                 .expect("room");
             // Channel 1 -> channel 5, full.
@@ -10693,6 +10763,7 @@ mod tests {
                     len: 1000,
                     fade_in: 0,
                     fade_out: 0,
+                    gain: 1.0,
                 }])
                 .expect("room");
             if route {
@@ -10822,6 +10893,7 @@ mod tests {
                     len: 1000,
                     fade_in: 0,
                     fade_out: 0,
+                    gain: 1.0,
                 }])
                 .expect("room");
             let first = if chain { 7 } else { 5 };
@@ -10889,6 +10961,7 @@ mod tests {
                 len: 4000,
                 fade_in: 0,
                 fade_out: 0,
+                gain: 1.0,
             }])
             .expect("room");
         // 1 -> 5, 5 -> 6, 6 -> 5: a loop with a tail feeding it.
@@ -10976,6 +11049,7 @@ mod tests {
                     len: 500,
                     fade_in: 0,
                     fade_out: 0,
+                    gain: 1.0,
                 },
                 // B: trimmed 100 frames into its file, 300 long, standing at
                 // 400 — so 400..500 overlaps A — with 100-frame ramps.
@@ -10987,6 +11061,7 @@ mod tests {
                     len: 300,
                     fade_in: 100,
                     fade_out: 100,
+                    gain: 1.0,
                 },
             ])
             .expect("room");
@@ -11037,6 +11112,7 @@ mod tests {
                     len: 2000,
                     fade_in: 0,
                     fade_out: 0,
+                    gain: 1.0,
                 }])
                 .expect("room");
             shared.set_channel_pan(0, pan);
@@ -11614,6 +11690,7 @@ mod tests {
             len: 48_000,
             fade_in: 0,
             fade_out: 0,
+            gain: 1.0,
         }]);
         e.set_stems(true);
         e.set_transport(1, 0);
@@ -11709,6 +11786,7 @@ mod tests {
             len: 48_000,
             fade_in: 0,
             fade_out: 0,
+            gain: 1.0,
         }]);
         e.set_transport(1, 0);
         e.set_rolling(true);
@@ -11745,6 +11823,7 @@ mod tests {
             len: 4000,
             fade_in: 0,
             fade_out: 0,
+            gain: 1.0,
         };
         let (mut r, _tx, shared) = renderer_with_midi(2);
         let (mut to_audio, _from) = r.hijack_track_rings();
@@ -11798,6 +11877,7 @@ mod tests {
             len: 2000,
             fade_in: 0,
             fade_out: 0,
+            gain: 1.0,
         };
         let run = |muted: u32, soloed: u32| -> f32 {
             let (mut r, _tx, shared) = renderer_with_midi(2);

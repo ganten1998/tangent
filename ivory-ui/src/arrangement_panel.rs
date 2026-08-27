@@ -59,6 +59,8 @@ pub struct LaneView<'a> {
     /// What that row holds. `None` while the row is closed.
     pub automation: Option<AutoView<'a>>,
     pub soloed: bool,
+    /// This lane's MIDI is sent to the theory view — the **T** switch.
+    pub to_theory: bool,
     /// Linear, as the mixer fader sits. The header knob is the same value.
     pub gain: f32,
     /// 0..=1, the strip's send — the second dial.
@@ -81,8 +83,14 @@ pub struct ClipView<'a> {
     pub fade_in_s: f64,
     pub fade_out_s: f64,
     pub name: &'a str,
-    /// A peak envelope of the PLAYED span, 0..=1. May be empty.
+    /// The clip's picture: `[min, max, min, max, …]`, each in −1..=1, over
+    /// the seconds `wave_from_s`..`wave_from_s + wave_span_s`. May be empty.
+    ///
+    /// **Pairs, and a span** — see `crate::ports::ClipInfo`, which says why
+    /// both.
     pub wave: &'a [f32],
+    pub wave_from_s: f64,
+    pub wave_span_s: f64,
     /// The clip's notes, source-relative like the document's. Drawn as a
     /// miniature where audio draws its wave; empty draws the dashed staff.
     pub notes: &'a [crate::arrangement::ArrNote],
@@ -230,6 +238,8 @@ pub enum Hit {
     AutoParamPick(usize),
     /// The header's fold arrow: show or hide this lane's automation.
     AutoFold(usize),
+    /// **T** — send this track's MIDI to the theory view, or stop.
+    ToTheory(usize),
     /// A point on the tempo curve, by index. Grabbed to drag.
     TempoPoint(usize),
     /// Empty room on the tempo lane: `(seconds, bpm)`. A press MAKES a
@@ -399,6 +409,12 @@ pub struct HeaderRow {
     pub meter: Rect,
     pub mute: Rect,
     pub solo: Rect,
+    /// **T** — send this track's MIDI to the theory view.
+    ///
+    /// Beside the mute and the solo because it is the same kind of thing: a
+    /// per-track switch about where the track goes. Same size, so a hand
+    /// that has learned M and S finds it without looking.
+    pub theory: Rect,
     /// The input chip, under the name — every lane wears one now: binding
     /// an input is how a bare lane BECOMES a track.
     pub input: Rect,
@@ -415,6 +431,7 @@ impl HeaderRow {
         panel: Rect::NOTHING,
         number: Rect::NOTHING,
         arm: Rect::NOTHING,
+        theory: Rect::NOTHING,
         name: Rect::NOTHING,
         knob: Rect::NOTHING,
         send: Rect::NOTHING,
@@ -682,6 +699,25 @@ impl Layout {
             Pos2::new(mute.left() - 8.0, r.top() + h * 0.15),
             Pos2::new(mute.left() - 3.0, r.bottom() - h * 0.15),
         );
+        // **T sits beside the ARM, not beside the mute.**
+        //
+        // Its first home was left of the M/S pair, which took its width out
+        // of the meter and the dials — and at the header widths this app
+        // opens at, the volume knob simply stopped fitting. The left end has
+        // the room: the arm dot and the number keep fixed seats there and
+        // everything to their right is proportional, so a switch after the
+        // dot costs the NAME a character and costs no control anything.
+        //
+        // It also reads better there. The arm decides whether this track
+        // records what you play; this decides whether what you play reaches
+        // the chord readout. They are two questions about the same signal.
+        let theory = {
+            let d = (h * 0.42).clamp(9.0, 15.0);
+            Rect::from_center_size(
+                Pos2::new(arm.right() + 3.0 + d * 0.5, r.center().y),
+                Vec2::splat(d),
+            )
+        };
         // **Two dials now — volume, then send — a shade smaller than the
         // one was**, each with a readout under it: the number is the other
         // half of a dial this size.
@@ -750,7 +786,8 @@ impl Layout {
         // input strip and the slots are both WIDER; a short window trades
         // legibility for it, and that trade was accepted out loud.
         let col = Rect::from_min_max(
-            Pos2::new(arm.right() + 4.0, r.top()),
+            // After the T switch, which sits between the arm and the name.
+            Pos2::new(theory.right() + 4.0, r.top()),
             Pos2::new(col_right - 6.0, r.bottom() - 1.0),
         );
         let slice = |a: f32, b: f32| {
@@ -789,6 +826,7 @@ impl Layout {
             )
         });
         HeaderRow {
+            theory,
             panel: row,
             number,
             arm,
@@ -1035,6 +1073,7 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
             (row.arm, Hit::Arm(i)),
             (row.mute, Hit::Mute(i)),
             (row.solo, Hit::Solo(i)),
+            (row.theory, Hit::ToTheory(i)),
             (row.knob, Hit::Gain(i)),
             (row.send, Hit::Send(i)),
             (row.pan, Hit::Pan(i)),
@@ -1885,8 +1924,16 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     // between "and now it is slower" and a ritardando.
     if let Some(row) = l.rows.iter().find(|r| r.kind == RowKind::Tempo) {
         if row.lane.is_positive() {
-            let ground = p.lane;
-            painter.rect_filled(row.lane, 0.0, shade(ground, 0.94));
+            // **Its own ground, and visibly so.** At a shade off the lane
+            // stripes the row read as a ninth track with a red line through
+            // it; the tempo is a property of the SONG and the row has to say
+            // that before anything in it is read.
+            let ground = shade(p.lane, 0.82);
+            painter.rect_filled(row.lane, 0.0, ground);
+            painter.line_segment(
+                [row.lane.left_bottom(), row.lane.right_bottom()],
+                Stroke::new(1.0, p.seam),
+            );
             let mut curve = p.playhead;
             for _ in 0..8 {
                 if crate::recorder_panel::contrast_ratio(curve, ground) >= 2.2 {
@@ -1962,6 +2009,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         }
         // The header: the word, and what the map is doing.
         if row.header.is_positive() {
+            painter.rect_filled(row.header, 0.0, p.hdr_lane);
             let font = FontId::new(
                 (row.header.height() * 0.42).clamp(7.0, 11.0),
                 crate::fonts::courier(),
@@ -2076,25 +2124,61 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 draw_note_miniature(painter, r, full_x, clip, &p);
             }
         }
-        // The wave, drawn inside at the clip's own resolution — sampled
-        // through the clip's FULL pixel span, so a clip cut by the
-        // viewport shows the right piece of itself rather than the whole
-        // wave squeezed into what is visible.
-        if !clip.wave.is_empty() && r.width() >= 8.0 {
+        // ── the wave ──────────────────────────────────────────────────────
+        //
+        // **Mapped through the seconds the picture actually covers**, not
+        // through the clip. The host draws only what is on screen, at the
+        // pixels it occupies — so the picture's span moves and narrows as
+        // the view does, and a mapping that assumed the whole clip would
+        // stretch a close-up of four seconds across four minutes.
+        //
+        // **And drawn as MIN to MAX**, not as a peak mirrored about the
+        // middle. Audio is not symmetric; the outline of both sides is the
+        // shape people read, and one number per column is a bar chart of
+        // loudness wearing a waveform's clothes.
+        let pairs = clip.wave.len() / 2;
+        if pairs > 0 && clip.wave_span_s > 0.0 && r.width() >= 4.0 {
             let mid = r.center().y;
-            let half = r.height() * 0.38;
-            let cols = r.width() as usize;
-            let fx0 = x_of(rect, view, clip.start_s);
-            let fw = (x_of(rect, view, clip.start_s + clip.len_s) - fx0).max(1.0);
+            let half = r.height() * 0.40;
+            let cols = r.width().ceil() as usize;
+            // Seconds per pixel, from the panel's own mapping so this cannot
+            // drift from the grid.
+            let t0 = time_at(rect, view, r.left());
+            let t1 = time_at(rect, view, r.left() + 1.0);
+            let dt = (t1 - t0).abs().max(1.0e-9);
+            let ink = p.clip_ink.gamma_multiply(0.62);
             for i in 0..cols {
-                let x_at = r.left() + i as f32;
-                let f = ((x_at - fx0) / fw).clamp(0.0, 1.0);
-                let v = clip.wave[(f * clip.wave.len() as f32) as usize % clip.wave.len()];
                 let x = r.left() + i as f32;
-                let h = (v * half).max(0.5);
+                if x > r.right() {
+                    break;
+                }
+                let t = t0 + f64::from(i as f32) * dt;
+                let f = (t - clip.wave_from_s) / clip.wave_span_s;
+                if !(0.0..1.0).contains(&f) {
+                    continue;
+                }
+                // **The whole bucket range this column covers**, so zooming
+                // OUT is a filled band rather than a comb of samples: one
+                // pixel can hold many buckets, and taking only the first is
+                // how a waveform turns into aliasing hash.
+                let a = (f * pairs as f64) as usize;
+                let b = (((t + dt - clip.wave_from_s) / clip.wave_span_s) * pairs as f64)
+                    .ceil() as usize;
+                let (a, b) = (a.min(pairs - 1), b.clamp(a + 1, pairs));
+                let mut lo = f32::INFINITY;
+                let mut hi = f32::NEG_INFINITY;
+                for k in a..b {
+                    lo = lo.min(clip.wave[k * 2]);
+                    hi = hi.max(clip.wave[k * 2 + 1]);
+                }
+                if !lo.is_finite() || !hi.is_finite() {
+                    continue;
+                }
+                let y0 = mid - hi.clamp(-1.0, 1.0) * half;
+                let y1 = mid - lo.clamp(-1.0, 1.0) * half;
                 painter.line_segment(
-                    [Pos2::new(x, mid - h), Pos2::new(x, mid + h)],
-                    Stroke::new(1.0, p.clip_ink.gamma_multiply(0.55)),
+                    [Pos2::new(x, y0.min(y1)), Pos2::new(x, y1.max(y0) + 0.5)],
+                    Stroke::new(1.0, ink),
                 );
             }
         }
@@ -2568,7 +2652,14 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 }
             }
         }
+        // **T**, beside the arm: this track's MIDI reaches the theory view.
+        //
+        // Drawn with the M and the S rather than on its own, so a hand that
+        // has learned those two recognises it — in the theme's own selection
+        // colour, because it is neither a mute nor a solo and three switches
+        // wearing two colours is one of them being mistaken for another.
         for (r, label, on, lit) in [
+            (row.theory, "T", lane.to_theory, p.select),
             (row.mute, "M", lane.muted, p.mute),
             (row.solo, "S", lane.soloed, p.solo),
         ] {
@@ -2789,6 +2880,7 @@ mod tests {
 
     fn a_lane(used: bool) -> LaneView<'static> {
 LaneView {
+    to_theory: false,
             automation_open: false,
             automation: None,
             route_count: 0,
@@ -2821,6 +2913,8 @@ LaneView {
                 fade_out_s: 3.0,
                 name: "backing",
                 wave: &[],
+                wave_from_s: 0.0,
+                wave_span_s: 0.0,
                 selected: false,
                 midi: false,
                 notes: &[],
@@ -2837,6 +2931,8 @@ LaneView {
                 fade_out_s: 0.0,
                 name: "solo",
                 wave: &[],
+                wave_from_s: 0.0,
+                wave_span_s: 0.0,
                 selected: true,
                 midi: false,
                 notes: &[],
@@ -3169,6 +3265,70 @@ ArrangeView {
             auto_y_of(thin, 1.0) <= auto_y_of(thin, 0.0),
             "a thin row runs backwards"
         );
+    }
+
+    /// **The T switch reads on every theme, lit and unlit.**
+    ///
+    /// The owner asked for this one by name. It is a two-state control the
+    /// size of a fingernail carrying a single letter, which is the shape
+    /// every ink failure this app has had took — and it wears the theme's
+    /// own selection colour rather than a fixed one, so there are sixteen
+    /// grounds to be legible on and not one.
+    #[test]
+    fn every_theme_dresses_the_theory_switch_legibly() {
+        let mut bad: Vec<String> = Vec::new();
+        for theme in crate::theme::factory() {
+            for dark in [false, true] {
+                let mut set = crate::settings::Settings::default();
+                theme.apply(&mut set);
+                set.arr_dark = dark;
+                let mut v = a_view(&[]);
+                v.dark_mode = dark;
+                v.wood = {
+                    let c = set.recorder_bg_color;
+                    (c.r, c.g, c.b)
+                };
+                v.fx_strip = {
+                    let c = set.fx_strip_color;
+                    (c.r, c.g, c.b)
+                };
+                v.meter_bg = {
+                    let c = set.meter_bg_color;
+                    (c.r, c.g, c.b)
+                };
+                let p = ink(&v);
+                let mode = if dark { "dark" } else { "light" };
+                let mut check = |what: &str, fg: Color32, bg: Color32| {
+                    let r = crate::recorder_panel::contrast_ratio(fg, bg);
+                    if r < 4.5 {
+                        bad.push(format!("{} {mode}: {what} {r:.2}:1", theme.name));
+                    }
+                };
+                // Lit and unlit both, which is the whole of what the switch
+                // can look like. `on_ink` measures the letter against the
+                // ground it lands on rather than inheriting it, which is the
+                // rule this app has learned eight times.
+                check("T lit", on_ink(p.select), p.select);
+                check(
+                    "T at rest",
+                    quiet(on_ink(p.hdr_lane), p.hdr_lane, 0.18),
+                    p.hdr_lane,
+                );
+                // And the lit switch has to be tellable from the two beside
+                // it — a T that looks like an M is a track somebody thinks
+                // they muted.
+                for (name, other) in [("the mute", p.mute), ("the solo", p.solo)] {
+                    let d = crate::recorder_panel::delta_e(p.select, other);
+                    if d < 25.0 {
+                        bad.push(format!(
+                            "{} {mode}: the T and {name} are {d:.1} apart",
+                            theme.name
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(bad.is_empty(), "{} unreadable: {bad:#?}", bad.len());
     }
 
     /// The tempo lane's scale is monotonic, logarithmic, and reversible.

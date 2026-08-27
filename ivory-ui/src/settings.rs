@@ -1062,6 +1062,20 @@ pub struct Settings {
     pub arr_snap: bool,
     /// The grid, in bars as a power of two: 3 = 8 bars … 0 = 1 … -5 = 1/32.
     pub arr_grid_exp: i64,
+    /// Which channels send their MIDI to the THEORY view — the chord
+    /// readout, the staff, the neck and the piano.
+    ///
+    /// **On for channel one and nothing else, out of the box.** That is the
+    /// DX7 on a fresh install, which is the instrument somebody plays while
+    /// they are learning what they just played — and it is the only track
+    /// where the theory readout is about them rather than about the record.
+    /// Sixteen tracks all feeding one chord detector is a chord nobody
+    /// played.
+    ///
+    /// A `Vec` rather than a bitmask because that is what every other
+    /// per-channel setting here is, and a saved file that gains a channel
+    /// should not have to be re-encoded.
+    pub strip_to_theory: Vec<bool>,
     /// The tempo lane is showing above the tracks. OFF out of the box: a
     /// song at one tempo has nothing to put in it, and the row would cost a
     /// track's worth of height to say so.
@@ -1455,6 +1469,11 @@ impl Default for Settings {
             project_path: String::new(),
             arr_snap: true,
             arr_tempo_lane: false,
+            strip_to_theory: {
+                let mut v = vec![false; crate::recorder::CHANNELS];
+                v[0] = true;
+                v
+            },
             // 1/4 out of the box, both grids — the owner's default.
             arr_grid_exp: -2,
             arr_header_w: 0.0,
@@ -2507,6 +2526,13 @@ impl Settings {
         }
         take_bool(&mut map, "arr_snap", &mut s.arr_snap);
         take_bool(&mut map, "arr_tempo_lane", &mut s.arr_tempo_lane);
+        if let Some(Value::Array(v)) = map.shift_remove("strip_to_theory") {
+            let mut out = vec![false; crate::recorder::CHANNELS];
+            for (slot, val) in out.iter_mut().zip(v.iter()) {
+                *slot = val.as_bool().unwrap_or(false);
+            }
+            s.strip_to_theory = out;
+        }
         if let Some(n) = map.shift_remove("arr_grid_exp").and_then(|v| v.as_i64()) {
             s.arr_grid_exp = n.clamp(-5, 3);
         }
@@ -3501,6 +3527,23 @@ impl Settings {
         if self.arr_tempo_lane {
             map.insert("arr_tempo_lane".into(), Value::Bool(true));
         }
+        // Written only when it differs from the shipped set, so an untouched
+        // file keeps its shape.
+        {
+            let fresh = {
+                let mut v = vec![false; crate::recorder::CHANNELS];
+                v[0] = true;
+                v
+            };
+            if self.strip_to_theory != fresh {
+                map.insert(
+                    "strip_to_theory".into(),
+                    Value::Array(
+                        self.strip_to_theory.iter().map(|b| Value::Bool(*b)).collect(),
+                    ),
+                );
+            }
+        }
         if self.lufs_window != crate::recorder::LoudnessWindow::default() {
             map.insert(
                 "lufs_window".into(),
@@ -3799,6 +3842,7 @@ impl Settings {
         self.guitar_intervals = fresh.guitar_intervals;
         self.arr_snap = fresh.arr_snap;
         self.arr_tempo_lane = fresh.arr_tempo_lane;
+        self.strip_to_theory = fresh.strip_to_theory.clone();
         self.arr_grid_exp = fresh.arr_grid_exp;
         self.midi_snap = fresh.midi_snap;
         self.midi_grid_exp = fresh.midi_grid_exp;
