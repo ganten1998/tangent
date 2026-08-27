@@ -386,6 +386,18 @@ pub struct IvoryApp {
     arr_lane_scroll: usize,
     /// The mixer control being dragged, and where the hand started.
     mixer_grab: Option<MixerGrab>,
+    /// An insert bay being carried to another channel: `(strip, bay, where
+    /// the press landed, has it really moved)`.
+    ///
+    /// **One field for both surfaces.** The mixer's rack and the
+    /// arrangement's header bays are the same three chips twice over, and a
+    /// gesture that worked in one place and not the other is the kind of
+    /// inconsistency somebody learns as "it does not work".
+    ///
+    /// The bool is the same arming the strip carry uses: a press that never
+    /// travels is a CLICK and still opens the plugin's window, so the new
+    /// gesture costs the old one nothing.
+    bay_carry: Option<(usize, usize, Pos2, bool)>,
     /// The strip whose colour palette is open, if any.
     /// A decibel figure being typed into a strip, and which.
     mixer_typing: Option<(crate::recorder::Column, String)>,
@@ -604,7 +616,14 @@ pub struct IvoryApp {
     arrangement_rect: Option<Rect>,
     /// Per-clip pictures the host pushed after decoding: the PLAYED span's
     /// wave and the file's length in seconds, by clip id.
-    clip_infos: std::collections::HashMap<u64, (Vec<f32>, f64)>,
+    clip_infos: std::collections::HashMap<u64, crate::ports::ClipInfo>,
+    /// The window the clip pictures were last drawn FOR.
+    ///
+    /// **A waveform is drawn at a zoom**, and a picture computed once at
+    /// import is a picture that is right at one zoom and blocky at every
+    /// other. The host recomputes when this has moved far enough to matter;
+    /// see `IvoryApp::arr_wave_view`.
+    arr_wave_at: Option<(f64, f64, f32)>,
     /// Where the mixer was last drawn, so a press can be tested against it.
     mixer_rect: Option<Rect>,
     /// The OS's own file panel is on screen right now.
@@ -1188,6 +1207,7 @@ fn clip_at(rel_path: &str, lane: usize, start_s: f64) -> crate::arrangement::Arr
         follow_tempo: false,
         stretch: 1.0,
         stretch_mode: String::new(),
+        gain: 1.0,
     }
 }
 
@@ -1549,6 +1569,7 @@ impl IvoryApp {
             mixer_scroll: 0,
             arr_lane_scroll: 0,
             mixer_grab: None,
+            bay_carry: None,
             mixer_typing: None,
             mixer_naming: None,
             swing_menu: None,
@@ -1622,6 +1643,7 @@ impl IvoryApp {
             arr_pending: None,
             arrangement_rect: None,
             clip_infos: std::collections::HashMap::new(),
+            arr_wave_at: None,
             open_insert_on_load: None,
             mixer_rect: None,
             native_panel_up: false,
@@ -2120,9 +2142,55 @@ impl IvoryApp {
         }
     }
 
+    /// Whether a channel's MIDI reaches the theory view.
+    pub fn to_theory(&self, ch: usize) -> bool {
+        self.settings.strip_to_theory.get(ch).copied().unwrap_or(false)
+    }
+
+    /// Turn one channel's theory send on or off.
+    pub fn set_to_theory(&mut self, ch: usize, on: bool) {
+        while self.settings.strip_to_theory.len() < crate::recorder::CHANNELS {
+            self.settings.strip_to_theory.push(false);
+        }
+        if let Some(slot) = self.settings.strip_to_theory.get_mut(ch) {
+            *slot = on;
+        }
+        self.save_settings();
+    }
+
+    /// Whether ANY channel that could take a live note sends it on.
+    ///
+    /// **Live MIDI has no lane by the time it reaches this crate**: the host
+    /// hands over events, and which channels take them is the desk's arm and
+    /// input rules. So the question the theory view can actually answer is
+    /// whether any MIDI channel with the switch on is listening — which, on
+    /// the shipped desk, is exactly "is track one's switch on".
+    fn live_reaches_theory(&self) -> bool {
+        (0..crate::recorder::CHANNELS).any(|n| {
+            self.to_theory(n)
+                && self.channel_kind(n) == Some(recorder::ChannelKind::Midi)
+        })
+    }
+
     /// Everything drawn as active: what is lit, plus whatever is sounding.
     fn display_notes(&self) -> HashSet<u8> {
         let mut set = self.lit_notes();
+        // **What the TIMELINE is playing, on the tracks that ask for it.**
+        //
+        // Playback never reached the theory view at all: a MIDI clip played
+        // and the chord readout said nothing, because everything here came
+        // from the keyboard. The engine reports what each lane's clips are
+        // sounding and the per-track switch chooses whose.
+        for (lane, mask) in self.recorder.lane_sounding.iter().enumerate() {
+            if *mask == 0 || !self.to_theory(lane) {
+                continue;
+            }
+            for key in 0..128u8 {
+                if mask & (1u128 << key) != 0 {
+                    set.insert(key);
+                }
+            }
+        }
         // A note being sounded is a note being played, so it lights up like
         // one. Added AFTER the transpose rather than before: `sounding` is
         // already in display pitches, and transposing it a second time lit
@@ -2174,7 +2242,20 @@ impl IvoryApp {
         // transpose of -11, clicking middle C lit C sharp a major seventh
         // below it. The same double application had `sounding` lighting
         // phantom keys until it was moved after this line.
-        let held: HashSet<u8> = self.notes.held().iter().copied().collect();
+        // **And the per-track switch decides whether the LIVE keyboard is in
+        // the picture at all.**
+        //
+        // Gated here rather than at the receive: `self.notes` is the true
+        // state of the keyboard and everything else in the app depends on it
+        // being true. What a switch turns off is what the theory view SHOWS,
+        // and a note held across the moment somebody flips it is then simply
+        // not drawn rather than becoming a note the tracker thinks is still
+        // down.
+        let held: HashSet<u8> = if self.live_reaches_theory() {
+            self.notes.held().iter().copied().collect()
+        } else {
+            HashSet::new()
+        };
         let mut set = transposed(&held, self.settings.transpose);
         if self.settings.keytoggle_enabled {
             set.extend(self.manual_notes.iter().copied());
@@ -2558,7 +2639,7 @@ impl IvoryApp {
             },
             H::Routing(_) => 0.0,
             H::Pan(i) => view.strips.get(i.0).map_or(0.5, |s| (s.pan + 1.0) * 0.5),
-            H::Mute(_) | H::Solo(_) | H::Add(_) | H::Insert(..)
+            H::Mute(_) | H::Solo(_) | H::Add(_) | H::Insert(..) | H::ToTheory(_)
             | H::Db(_) | H::Name(_) | H::Remove(_) | H::Arm(_)
             | H::FxMenu(..) | H::InputChip(_) => 0.0,
         }
@@ -2798,6 +2879,18 @@ impl IvoryApp {
             }
             // The R switch: arm is record-ready AND live, and it is session
             // state — deliberately unsaved, so no project can open loud.
+            // **T** — this channel's MIDI goes to the theory view, or does
+            // not. A saved preference, unlike the arm beside it: where the
+            // chord readout looks is a decision about how somebody works,
+            // and one that reset every launch would be one nobody bothered
+            // to make.
+            H::ToTheory(i) => {
+                if let Some(Strip::Channel(n)) = i.strip() {
+                    let on = self.to_theory(n);
+                    self.set_to_theory(n, !on);
+                }
+                return;
+            }
             H::Arm(i) => {
                 if let Some(Strip::Channel(n)) = i.strip() {
                     // **A plain press TOGGLES, the way it always did** — the
@@ -2956,6 +3049,7 @@ impl IvoryApp {
             follow_tempo: false,
             stretch: 1.0,
             stretch_mode: String::new(),
+            gain: 1.0,
         });
         let take = arr.add_clip(crate::arrangement::ArrClip {
             kind: crate::arrangement::ClipKind::Audio,
@@ -2974,6 +3068,7 @@ impl IvoryApp {
             follow_tempo: false,
             stretch: 1.0,
             stretch_mode: String::new(),
+            gain: 1.0,
         });
         let solo = arr.add_clip(crate::arrangement::ArrClip {
             kind: crate::arrangement::ClipKind::Audio,
@@ -2992,6 +3087,7 @@ impl IvoryApp {
             follow_tempo: false,
             stretch: 1.0,
             stretch_mode: String::new(),
+            gain: 1.0,
         });
         // And a MIDI item with a phrase in it, so the note miniature is in
         // the picture.
@@ -3026,6 +3122,7 @@ impl IvoryApp {
             follow_tempo: false,
             stretch: 1.0,
             stretch_mode: String::new(),
+            gain: 1.0,
         });
         self.arrangement = arr;
         // **A tempo map and a signature change, for the row to have
@@ -3059,10 +3156,23 @@ impl IvoryApp {
                 })
                 .collect()
         };
+        let shot = |id: u64, w: Vec<f32>, file_s: f64, span_s: f64| {
+            // The shot's fake wave is one number per column; the real one is
+            // min/max pairs, so it is mirrored here rather than the drawing
+            // learning a second shape.
+            let pairs = w.into_iter().flat_map(|v| [-v, v]).collect();
+            crate::ports::ClipInfo {
+                id,
+                wave: pairs,
+                file_s,
+                wave_from_s: 0.0,
+                wave_span_s: span_s,
+            }
+        };
         self.set_clip_infos(vec![
-            (backing, wave(600, 0.7), 95.0),
-            (take, wave(300, 1.3), 23.0),
-            (solo, wave(300, 2.1), 30.0),
+            shot(backing, wave(600, 0.7), 95.0, 95.0),
+            shot(take, wave(300, 1.3), 23.0, 21.0),
+            shot(solo, wave(300, 2.1), 30.0, 30.0),
         ]);
         self.arr_selected = Some(take);
         self.recorder.position_s = 22.0;
@@ -3247,6 +3357,10 @@ impl IvoryApp {
                 Strip::Fx => ("FX BUS", "reverb · delay · chorus", g.fx_return, false),
             };
             crate::mixer_panel::StripView {
+                to_theory: match s {
+                    Strip::Channel(n) => self.to_theory(n),
+                    _ => false,
+                },
                 strip: Some(s),
                 route_count: match s {
                     crate::recorder::Strip::Channel(n) => self.settings.routes.from(n).len(),
@@ -3319,6 +3433,8 @@ impl IvoryApp {
             strips: std::array::from_fn(|i| match channels.get(i) {
                 Some(s) => strip(*s),
                 None => crate::mixer_panel::StripView {
+                    // The master is not a channel and has no MIDI to send.
+                    to_theory: false,
                     route_count: 0,
                     strip: None,
                     icon: 0,
@@ -3328,12 +3444,17 @@ impl IvoryApp {
                         .get(crate::recorder::STRIPS)
                         .map_or("MASTER", |n| if n.is_empty() { "MASTER" } else { n.as_str() }),
                     detail: "",
-                    color: self
-                        .settings
-                        .strip_colors
-                        .last()
-                        .copied()
-                        .unwrap_or(0) as usize,
+                    // **Through `strip_color`, like every other strip.**
+                    //
+                    // This read `strip_colors.last()` raw, so the master
+                    // never saw the palette at all: `strip_color(STRIPS)`
+                    // answers `Palette::master()` — the same crimson in
+                    // every palette, because the master is the one strip you
+                    // go looking for — and nothing called it. A desk nobody
+                    // had painted by hand got a zero, which is the wood, so
+                    // the master came out the same bone as the empty slots
+                    // beside it on every theme including the default.
+                    color: self.strip_color(crate::recorder::STRIPS),
                     inserts: std::array::from_fn(|n| {
                         self.insert(crate::recorder::STRIPS, n)
                             .map_or("", plugin_display_name)
@@ -5180,6 +5301,7 @@ impl IvoryApp {
             follow_tempo: false,
             stretch: 1.0,
             stretch_mode: String::new(),
+            gain: 1.0,
         });
         let _ = doc;
         self.arr_save_edits();
@@ -5320,6 +5442,7 @@ impl IvoryApp {
                 follow_tempo: false,
                 stretch: 1.0,
                 stretch_mode: String::new(),
+                gain: 1.0,
             });
             added = Some(id);
         }
@@ -6370,8 +6493,8 @@ impl IvoryApp {
 
     /// The pictures the host made of each clip after decoding: the played
     /// span's wave, and the file's length in seconds.
-    pub fn set_clip_infos(&mut self, infos: Vec<(u64, Vec<f32>, f64)>) {
-        self.clip_infos = infos.into_iter().map(|(id, w, s)| (id, (w, s))).collect();
+    pub fn set_clip_infos(&mut self, infos: Vec<crate::ports::ClipInfo>) {
+        self.clip_infos = infos.into_iter().map(|i| (i.id, i)).collect();
     }
 
     /// A channel's display name: the typed one wins, then the default its
@@ -6417,7 +6540,7 @@ impl IvoryApp {
             return c.len_s;
         }
         match self.clip_infos.get(&c.id) {
-            Some((_, file_s)) if *file_s > 0.0 => (file_s - c.offset_s).max(0.05),
+            Some(i) if i.file_s > 0.0 => (i.file_s - c.offset_s).max(0.05),
             _ => 0.5,
         }
     }
@@ -6429,6 +6552,51 @@ impl IvoryApp {
             .iter()
             .map(|c| c.start_s + self.clip_len_resolved(c))
             .fold(0.0, f64::max)
+    }
+
+    /// What the clip pictures should be drawn FOR: the window on screen and
+    /// how many points wide the lanes are.
+    ///
+    /// `None` when the arrangement is not showing, which is the host's cue
+    /// to leave the pictures alone — a panel nobody is looking at is not
+    /// worth a pass over every clip's samples.
+    pub fn arr_wave_view(&self) -> Option<(f64, f64, f32)> {
+        let rect = self.arrangement_rect.filter(|r| r.is_positive())?;
+        if !self.arrangement_open {
+            return None;
+        }
+        let clips = self.arr_clip_views();
+        let view = self.arrange_view(&clips);
+        let l = crate::arrangement_panel::Layout::new(rect, &view);
+        let w = l.lanes_area.width();
+        (w >= 1.0).then_some((view.view_start_s, view.view_len_s, w))
+    }
+
+    /// Whether the pictures are stale enough to be worth redrawing.
+    ///
+    /// **A threshold and not equality.** The window moves by a fraction of a
+    /// pixel on any drag, and recomputing a screenful of waveforms sixty
+    /// times a second is a pass over several million samples per frame for a
+    /// picture nobody could tell apart from the last one.
+    pub fn arr_waves_stale(&self) -> bool {
+        let Some((start, len, w)) = self.arr_wave_view() else {
+            return false;
+        };
+        match self.arr_wave_at {
+            None => true,
+            Some((s0, l0, w0)) => {
+                // A twentieth of the window is about fifty points at any
+                // useful width: past that the smearing is visible.
+                (start - s0).abs() > len * 0.05
+                    || (len / l0.max(1e-9) - 1.0).abs() > 0.05
+                    || (w - w0).abs() > 24.0
+            }
+        }
+    }
+
+    /// The host says it has just drawn the pictures for this window.
+    pub fn note_waves_drawn(&mut self, at: (f64, f64, f32)) {
+        self.arr_wave_at = Some(at);
     }
 
     /// The zoom window: steered, or fitted to the whole song.
@@ -6593,12 +6761,14 @@ impl IvoryApp {
             .clips
             .iter()
             .map(|c| {
-                let (wave, file_s) = self
-                    .clip_infos
-                    .get(&c.id)
-                    .map(|(w, s)| (w.as_slice(), *s))
-                    .unwrap_or((&[][..], 0.0));
+                let info = self.clip_infos.get(&c.id);
+                let wave = info.map_or(&[][..], |i| i.wave.as_slice());
+                let file_s = info.map_or(0.0, |i| i.file_s);
+                let (wave_from_s, wave_span_s) =
+                    info.map_or((0.0, 0.0), |i| (i.wave_from_s, i.wave_span_s));
                 crate::arrangement_panel::ClipView {
+                    wave_from_s,
+                    wave_span_s,
                     id: c.id,
                     notes: &c.notes,
                     offset_s: c.offset_s,
@@ -6640,6 +6810,8 @@ impl IvoryApp {
                         fade_out_s: 0.0,
                         name: "",
                         wave: &[],
+                        wave_from_s: 0.0,
+                        wave_span_s: 0.0,
                         notes: if *is_midi { &rec.notes } else { &[] },
                         selected: false,
                         midi: *is_midi,
@@ -6798,7 +6970,7 @@ impl IvoryApp {
             .and_then(|c| {
                 self.clip_infos
                     .get(&c.id)
-                    .map(|(_, file_s)| (file_s - c.offset_s).max(MIN))
+                    .map(|i| (i.file_s - c.offset_s).max(MIN))
             })
             .unwrap_or(f64::INFINITY);
         if let Some(c) = self.arr_clip_mut(id) {
@@ -7515,6 +7687,50 @@ impl IvoryApp {
         self.arr_save_edits();
     }
 
+    /// Ask the host to normalise whatever audio is selected.
+    ///
+    /// **The set, or the one.** The same rule every clip action here follows:
+    /// a marquee over eight takes means all eight.
+    fn arr_normalize_selection(&mut self) {
+        let mut ids: Vec<u64> = self.arr_multi.iter().copied().collect();
+        if let Some(one) = self.arr_selected {
+            if !ids.contains(&one) {
+                ids.push(one);
+            }
+        }
+        // Audio only — a note's velocity is a performance, not a level.
+        ids.retain(|id| {
+            self.arrangement
+                .clips
+                .iter()
+                .any(|c| c.id == *id && c.kind == crate::arrangement::ClipKind::Audio)
+        });
+        if ids.is_empty() {
+            self.report_take(
+                "Nothing to normalise - select an audio clip first.".to_owned(),
+                false,
+            );
+            return;
+        }
+        self.request_recorder(recorder::RecorderRequest::NormalizeClips(ids));
+    }
+
+    /// The host's answer: this clip's level, measured.
+    pub fn set_clip_gain(&mut self, id: u64, gain: f64) {
+        let g = if gain.is_finite() { gain.clamp(0.0, 64.0) } else { 1.0 };
+        if let Some(c) = self.arrangement.clips.iter_mut().find(|c| c.id == id) {
+            if (c.gain - g).abs() > 1.0e-9 {
+                c.gain = g;
+                self.clips_dirty = true;
+            }
+        }
+    }
+
+    /// Put a clip's level back to unity.
+    pub fn reset_clip_gain(&mut self, id: u64) {
+        self.set_clip_gain(id, 1.0);
+    }
+
     /// Which clips a menu on `id` acts on: the selected set if it is in one,
     /// and otherwise just it.
     fn arr_acting_on(&self, id: u64) -> Vec<u64> {
@@ -7545,6 +7761,81 @@ impl IvoryApp {
             out.push(format!("Reset stretch ({:.0}%)", c.stretch * 100.0));
         }
         out
+    }
+
+    /// Let go of a carried insert bay over `to`, if anything.
+    ///
+    /// **One function for both surfaces**, so the mixer's rack and the
+    /// arrangement's header cannot disagree about what a drop means. The
+    /// caller answers only "which channel is under the hand", which is the
+    /// one thing that differs between them.
+    ///
+    /// A carry that never travelled is a CLICK and opens the plugin, which
+    /// is what a press on a bay has always done — see `bay_carry`.
+    fn land_bay_carry(&mut self, to: Option<usize>) {
+        let Some((strip, bay, _, active)) = self.bay_carry.take() else {
+            return;
+        };
+        if !active {
+            self.open_insert_face(strip, bay);
+            return;
+        }
+        // **Nothing is written here.** The target BAY is the host's to
+        // choose — the next free one — and the copy is only worth having
+        // with the plugin's live settings beside it, which is host-side
+        // too. See `RecorderRequest::CopyInsert`.
+        if let Some(to) = to.filter(|t| *t != strip) {
+            self.request_recorder(recorder::RecorderRequest::CopyInsert {
+                from_strip: strip,
+                from_bay: bay,
+                to_strip: to,
+            });
+        }
+    }
+
+    /// The chip that follows the hand while an insert is being carried.
+    ///
+    /// **A gesture with no picture is a gesture nobody finds.** The carry is
+    /// armed on a press and lands on a release; between those two there is
+    /// nothing on screen to say it is happening, and a hand that lets go
+    /// unsure of what it did will not try again. Drawn in the same colours
+    /// the clip menu uses, so the two overlays read as the same app.
+    fn draw_bay_carry(&self, painter: &egui::Painter, at: Option<Pos2>) {
+        let (Some((strip, bay, _, true)), Some(p)) = (self.bay_carry, at) else {
+            return;
+        };
+        let Some(name) = self.insert(strip, bay) else {
+            return;
+        };
+        // The file's stem, which is what every other row in this app calls a
+        // plugin: a bundle path is sixty characters of somebody's home
+        // directory and four of the name.
+        let name: String = std::path::Path::new(name)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| name.to_owned());
+        let font = egui::FontId::new(11.0, crate::fonts::courier_bold());
+        let w = 8.0 + name.chars().count() as f32 * 11.0 * 0.62 + 8.0;
+        // Offset from the pointer, not under it: a chip drawn on the hot spot
+        // covers the row you are aiming at.
+        let r = Rect::from_min_size(
+            Pos2::new(p.x + 12.0, p.y - 10.0),
+            egui::vec2(w.min(220.0), 20.0),
+        );
+        painter.rect_filled(r, 3.0, egui::Color32::from_rgb(0xEE, 0xE6, 0xCE));
+        painter.rect_stroke(
+            r,
+            3.0,
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(0x24, 0x20, 0x1A)),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            Pos2::new(r.left() + 8.0, r.center().y),
+            egui::Align2::LEFT_CENTER,
+            &name,
+            font,
+            egui::Color32::from_rgb(0x24, 0x20, 0x1A),
+        );
     }
 
     /// Draw the clip menu — or the bay's FX menu — over the arrangement.
@@ -7748,6 +8039,7 @@ impl IvoryApp {
                 follow_tempo: false,
                 stretch: 1.0,
                 stretch_mode: String::new(),
+                gain: 1.0,
             });
         }
         if tails.is_empty() {
@@ -11224,12 +11516,29 @@ impl IvoryApp {
                         // empty, the plugin's face when loaded, the patch
                         // picker for the DX7, the drumpad for the kit.
                         self.selected_channel = Some(n);
-                        self.open_insert_face(n, bay);
+                        // **And the mixer's own CARRY**, on the same terms —
+                        // see `bay_carry`. A loaded bay arms; the window
+                        // still opens on a press that does not travel.
+                        if self.insert(n, bay).is_some() {
+                            self.bay_carry = Some((n, bay, p, false));
+                        } else {
+                            self.open_insert_face(n, bay);
+                        }
                     }
                     // **The NUMBER is the handle**: press and carry the
                     // track to another row. Empty rows have nothing to
                     // carry, but any row can be carried TO.
-                    Some(A::HdrNumber(n)) => {
+                    // **The NUMBER and the NAME are both handles.**
+                    //
+                    // The number alone was twelve points of target on a
+                    // header full of controls, and the name plate beside it
+                    // is the thing a hand reaches for — the mixer has worked
+                    // this way since its own carry landed. A press that
+                    // never travels is still a press: the drop refuses a row
+                    // that is the row it started on, so a click on a name
+                    // does nothing and the double-click that renames is
+                    // untouched (it clears the drag before this ever runs).
+                    Some(A::HdrNumber(n)) | Some(A::HdrName(n)) => {
                         if self.channel_used(n) {
                             self.selected_channel = Some(n);
                             self.arr_drag = Some(ArrDrag::ReorderLane { from: n });
@@ -11239,6 +11548,10 @@ impl IvoryApp {
                     // CLICK is the generous back-to-the-start target.
                     Some(A::HeaderGrip) => {
                         self.arr_drag = Some(ArrDrag::HeaderGrip { from_x: p.x });
+                    }
+                    Some(A::ToTheory(n)) => {
+                        let on = self.to_theory(n);
+                        self.set_to_theory(n, !on);
                     }
                     Some(A::Mute(n)) => self.apply_mixer_hit(M::Mute(Column(n)), 0.0),
                     Some(A::Solo(n)) => self.apply_mixer_hit(M::Solo(Column(n)), 0.0),
@@ -11647,6 +11960,27 @@ impl IvoryApp {
                 }
             }
         }
+        // The carried BAY, in the arrangement's header — the mixer's own
+        // gesture, on the same three chips. See `bay_carry`.
+        if let (Some((strip, bay, origin, active)), Some(p)) = (self.bay_carry, pointer) {
+            if !released {
+                if !active && (p - origin).length() > 8.0 {
+                    self.bay_carry = Some((strip, bay, origin, true));
+                }
+            } else {
+                let target = {
+                    let clips = self.arr_clip_views();
+                    let view = self.arrange_view(&clips);
+                    let l = crate::arrangement_panel::Layout::new(rect, &view);
+                    l.header_rows.iter().position(|row| {
+                        row.panel.is_positive()
+                            && (row.panel.top()..=row.panel.bottom()).contains(&p.y)
+                    })
+                };
+                let _ = (strip, bay, active);
+                self.land_bay_carry(target);
+            }
+        }
         if released {
             // **The carried track lands** on the row under the hand.
             if let Some(ArrDrag::ReorderLane { from }) = self.arr_drag {
@@ -11741,6 +12075,7 @@ impl IvoryApp {
                         follow_tempo: false,
                         stretch: 1.0,
                         stretch_mode: String::new(),
+                        gain: 1.0,
                     });
                     self.arr_save_edits();
                 }
@@ -11863,6 +12198,26 @@ impl IvoryApp {
             if paste_ev {
                 self.arr_paste();
             }
+        }
+        // **Ctrl/Cmd+Shift+N: normalise.**
+        //
+        // The selected AUDIO clips come up so their loudest point sits just
+        // under full scale. MIDI is left alone: a note's velocity is a
+        // performance and not a level, and "normalising" one would be the
+        // app rewriting how hard somebody played.
+        //
+        // Checked BEFORE the plain Cmd+N below it would be — shift is not a
+        // modifier that arm ignores — and it never touches the file: the
+        // level is a number on the clip, so it is undoable and reversible.
+        if keys_ok
+            && self.midi_edit.is_none()
+            && ctx.input(|i| {
+                (i.modifiers.command || i.modifiers.ctrl)
+                    && i.modifiers.shift
+                    && i.key_pressed(egui::Key::N)
+            })
+        {
+            self.arr_normalize_selection();
         }
         // **Ctrl/Cmd+T: a new track**, bare, on the first free slot — the
         // owner's keyboard twin of the + circle.
@@ -12064,6 +12419,7 @@ impl IvoryApp {
                     armed: self.armed & (1 << n) != 0,
                     muted: desk.muted[n],
                     soloed: desk.soloed[n],
+                    to_theory: self.to_theory(n),
                     gain: g.channels.get(n).copied().unwrap_or(1.0),
                     send: desk.send[n],
                     pan: self.channel_pan(n),
@@ -16541,6 +16897,18 @@ impl IvoryApp {
             |top: f32, h: f32| Rect::from_min_size(Pos2::new(origin.x, origin.y + top), Vec2::new(w, h));
 
         let display = self.display_notes();
+        // **Whether a VIEW has taken the room under the band.**
+        //
+        // The mixer and the arrangement replace everything below the recorder
+        // band when they are open — that is what the Tab cycle does — and the
+        // composite knew nothing about either. So somebody working in the
+        // arrangement pressed record and got a video of a piano they were not
+        // looking at: the take was the window minus the thing they were
+        // doing, which is the opposite of what "a take is the window" means.
+        //
+        // Decided HERE, before the bands it displaces, so the theory and the
+        // chord strip are not drawn and then covered.
+        let took_the_room = self.mixer_open || self.arrangement_open;
         // **The recorder band, first, exactly as the window stacks it.** It
         // was never painted here at all: `composite_settings` forced it off
         // and every offset below counted from the theory band. So a take was
@@ -16600,7 +16968,7 @@ impl IvoryApp {
                 &s,
             );
         }
-        if bands.theory_h > 0.0 {
+        if bands.theory_h > 0.0 && !took_the_room {
             // The same cut as the live window, from the same function — this
             // is the point of the whole change. What the video shows is what
             // the window shows, camera included, because there is only one
@@ -16633,7 +17001,7 @@ impl IvoryApp {
                 );
             }
         }
-        if bands.chord_h > 0.0 && shows.chord {
+        if bands.chord_h > 0.0 && shows.chord && !took_the_room {
             chord_strip::draw(
                 painter,
                 band_at(bands.recorder_h + bands.theory_h, bands.chord_h),
@@ -16648,7 +17016,36 @@ impl IvoryApp {
                 None,
             );
         }
-        if shows.piano {
+        // **The view that is OPEN takes the space below the band**, exactly
+        // as it does in the window.
+        //
+        // This is what "the take is the window" was missing. The mixer and
+        // the arrangement REPLACE everything under the recorder band when
+        // they are open — that is what the Tab cycle does — and the composite
+        // knew nothing about either. So somebody working in the arrangement
+        // pressed record and got a video of a piano they were not looking at:
+        // the take was the window minus the thing they were doing.
+        //
+        // Drawn from the same rect the live paint computes (`recorder_h` to
+        // the foot) and through the same `draw`, so what the video shows is
+        // what the window shows for the same reason the band already does.
+        let under_band = band_at(
+            bands.recorder_h,
+            (total.y - bands.recorder_h).max(0.0),
+        );
+        if took_the_room && under_band.is_positive() {
+            // The mixer wins the tie, exactly as it does in the live paint:
+            // both flags can be set and only one surface is drawn.
+            if self.mixer_open {
+                let view = self.mixer_view();
+                crate::mixer_panel::draw(painter, under_band, &view);
+            } else {
+                let clips = self.arr_clip_views();
+                let view = self.arrange_view(&clips);
+                crate::arrangement_panel::draw(painter, under_band, &view);
+            }
+        }
+        if shows.piano && !took_the_room {
             piano::draw(
                 painter,
                 band_at(bands.recorder_h + bands.theory_h + bands.chord_h, bands.piano_h),
@@ -16657,7 +17054,7 @@ impl IvoryApp {
                 &s,
             );
         }
-        if bands.fret_h > 0.0 {
+        if bands.fret_h > 0.0 && !took_the_room {
             let spec = s.fretboard_spec();
             let r = band_at(
                 bands.recorder_h + bands.theory_h + bands.chord_h + bands.piano_h,
@@ -16714,6 +17111,22 @@ impl IvoryApp {
         if !self.demo_menu_done && std::env::var("IVORY_INLINE").as_deref() == Ok("setup") {
             self.demo_menu_done = true;
             self.setup_open = true;
+        }
+        // The TRACK dialog — the colour grid and the palette list — which is
+        // the one surface whose faults are all proportional and which cannot
+        // be photographed any other way: it is a child viewport on the
+        // desktop, so the compositor's shot never sees it.
+        //   IVORY_INLINE=track /Applications/Tangent.app/Contents/MacOS/tangent
+        if !self.demo_menu_done && std::env::var("IVORY_INLINE").as_deref() == Ok("track") {
+            self.demo_menu_done = true;
+            self.dialog = Some(dialogs::Dialog::Track {
+                lane: 0,
+                removable: true,
+                icon: self.settings.channel_icons.first().copied().unwrap_or(0),
+                palette: self.settings.palette_choice,
+                palette_auto: self.settings.palette_auto,
+                serial: 1,
+            });
         }
         // **Audio Setup**, which is now where the interface's short name is
         // typed as well as where the path is chosen. Held until the host has
@@ -17355,6 +17768,7 @@ impl IvoryApp {
         if let Some(rect) = mixer_rect {
             let view = self.mixer_view();
             crate::mixer_panel::draw(ui.painter(), rect, &view);
+            self.draw_bay_carry(ui.painter(), ui.ctx().pointer_interact_pos());
             // Sixteen strips' worth of tab stops. See `ivory_ui::a11y`.
             //
             // Both lists built before the call, so the view's borrow of
@@ -17423,6 +17837,7 @@ impl IvoryApp {
             let view = self.arrange_view(&clips);
             crate::arrangement_panel::draw(ui.painter(), rect, &view);
             self.draw_clip_menu(ui.painter());
+            self.draw_bay_carry(ui.painter(), ui.ctx().pointer_interact_pos());
             // A track mid-carry: the target row lights under the hand.
             if let Some(ArrDrag::ReorderLane { from }) = self.arr_drag {
                 let l = crate::arrangement_panel::Layout::new(rect, &view);
@@ -18076,6 +18491,17 @@ impl IvoryApp {
                     }
                     let view = self.mixer_view();
                     match crate::mixer_panel::hit_test(rect, &view, pos) {
+                        // **A LOADED bay arms the carry** rather than
+                        // opening at once: the window still opens on a press
+                        // that does not travel (see the release below), and a
+                        // press that does travel copies the effect to another
+                        // channel. An empty bay has nothing to carry and
+                        // keeps the immediate picker.
+                        Some(crate::mixer_panel::Hit::Insert(i, n))
+                            if self.insert(i.desk_index(), n).is_some() =>
+                        {
+                            self.bay_carry = Some((i.desk_index(), n, pos, false));
+                        }
                         Some(hit @ (crate::mixer_panel::Hit::Mute(_)
                         | crate::mixer_panel::Hit::Solo(_)
                         | crate::mixer_panel::Hit::Add(_)
@@ -18122,6 +18548,22 @@ impl IvoryApp {
                             }
                         }
                     }
+                }
+            }
+            // The carried bay: armed on the press above, landed here.
+            if let (Some((strip, bay, origin, active)), Some(p)) = (self.bay_carry, pos) {
+                if pointer_down {
+                    if !active && (p - origin).length() > 8.0 {
+                        self.bay_carry = Some((strip, bay, origin, true));
+                    }
+                } else {
+                    let target = {
+                        let view = self.mixer_view();
+                        crate::mixer_panel::strip_at(rect, &view, p)
+                            .map(crate::recorder::Column::desk_index)
+                    };
+                    let _ = active;
+                    self.land_bay_carry(target);
                 }
             }
             if let (Some((from, origin, active)), Some(p)) =
@@ -19226,6 +19668,7 @@ mod tests {
             follow_tempo: false,
             stretch: 1.0,
             stretch_mode: String::new(),
+            gain: 1.0,
         });
         app.open_midi_editor(id);
         app.me_select_all();
@@ -19350,6 +19793,7 @@ mod tests {
             follow_tempo: false,
             stretch: 1.0,
             stretch_mode: String::new(),
+            gain: 1.0,
         });
         app.add_recorded_clips(vec![crate::arrangement::RecordedClip {
             lane: 0,
@@ -19408,6 +19852,7 @@ mod tests {
             follow_tempo: false,
             stretch: 1.0,
             stretch_mode: String::new(),
+            gain: 1.0,
         });
         app.add_recorded_clips(vec![crate::arrangement::RecordedClip {
             lane: 0,
@@ -19453,6 +19898,7 @@ mod tests {
             follow_tempo: false,
             stretch: 1.0,
             stretch_mode: String::new(),
+            gain: 1.0,
         };
         // One spanning clip 0..20, one swallowed 22..24, one tail-side 25..35.
         app.arrangement.add_clip(clip(1, 0.0, 20.0));
@@ -19637,6 +20083,7 @@ mod tests {
             follow_tempo: false,
             stretch: 1.0,
             stretch_mode: String::new(),
+            gain: 1.0,
         });
         app.open_midi_editor(id);
         assert!(app.midi_edit.is_some(), "the editor did not open");
@@ -20561,7 +21008,7 @@ mod tests {
         std::fs::write(&file, b"pcm, allegedly").expect("write");
         app.import_audio_at(&file, 4, 10.0).expect("import");
         let id = app.arrangement().clips[0].id;
-        app.set_clip_infos(vec![(id, vec![0.5; 10], 8.0)]);
+        app.set_clip_infos(vec![crate::ports::ClipInfo { id: id, wave: vec![0.5; 10], file_s: 8.0, wave_from_s: 0.0, wave_span_s: 8.0 }]);
         app.arr_resolve_len(id);
 
         app.arr_selected = Some(id);
@@ -20609,7 +21056,7 @@ mod tests {
         app.import_audio_at(&file, 4, 12.0).expect("import");
         let ids: Vec<u64> = app.arrangement().clips.iter().map(|c| c.id).collect();
         for &id in &ids {
-            app.set_clip_infos(vec![(id, vec![0.5; 10], 8.0)]);
+            app.set_clip_infos(vec![crate::ports::ClipInfo { id: id, wave: vec![0.5; 10], file_s: 8.0, wave_from_s: 0.0, wave_span_s: 8.0 }]);
             app.arr_resolve_len(id);
         }
         // The whole group is selected; the copy carries all of it.
@@ -20662,7 +21109,7 @@ mod tests {
         app.import_audio_at(&file, 4, 10.0).expect("import");
         let id = app.arrangement().clips[0].id;
         // The host met the file: 60 seconds long.
-        app.set_clip_infos(vec![(id, vec![0.5; 10], 60.0)]);
+        app.set_clip_infos(vec![crate::ports::ClipInfo { id: id, wave: vec![0.5; 10], file_s: 60.0, wave_from_s: 0.0, wave_span_s: 60.0 }]);
         app.arr_resolve_len(id);
         assert!((app.arrangement().clips[0].len_s - 60.0).abs() < 1e-9);
 
@@ -21565,6 +22012,7 @@ mod tests {
             follow_tempo: false,
             stretch: 1.0,
             stretch_mode: String::new(),
+            gain: 1.0,
         });
         let id = app.arrangement.clips[0].id;
         let _ = run_frame(&ctx, &mut app);
@@ -22963,6 +23411,7 @@ mod tests {
             follow_tempo: false,
             stretch: 1.0,
             stretch_mode: String::new(),
+            gain: 1.0,
         });
         app.arrangement.add_clip(ArrClip {
             kind: ClipKind::Audio,
@@ -22981,6 +23430,7 @@ mod tests {
             follow_tempo: false,
             stretch: 1.0,
             stretch_mode: String::new(),
+            gain: 1.0,
         });
         app.apply_recorder_hit(recorder_panel::Hit::SetTempo(180.0));
         let r = 120.0 / 180.0;
@@ -23033,6 +23483,7 @@ mod tests {
             follow_tempo: false,
             stretch: 1.0,
             stretch_mode: String::new(),
+            gain: 1.0,
         });
         let id = app.arrangement.clips[0].id;
         app.open_midi_editor(id);
@@ -23493,6 +23944,229 @@ mod tests {
             "the master came back at {}",
             app.settings.master_gain
         );
+    }
+
+    /// **A fresh install sends track ONE to the theory view and nothing
+    /// else** — the DX7, which is the instrument somebody plays while they
+    /// are learning what they just played.
+    ///
+    /// Sixteen tracks all feeding one chord detector is a chord nobody
+    /// played, which is what "all on" would mean.
+    #[test]
+    fn the_theory_send_ships_on_for_track_one_alone() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        assert!(app.to_theory(0), "track one does not reach the theory view");
+        for n in 1..crate::recorder::CHANNELS {
+            assert!(!app.to_theory(n), "track {} ships switched on", n + 1);
+        }
+        // The switch is a saved preference, unlike the arm beside it.
+        app.set_to_theory(3, true);
+        assert!(app.to_theory(3));
+        let json = app.settings.to_json();
+        let back = crate::settings::Settings::from_json(&json);
+        assert!(back.strip_to_theory[3], "the switch did not survive a save");
+        assert!(back.strip_to_theory[0], "track one's switch was lost");
+        // And an untouched desk writes nothing, so a fresh file keeps its
+        // shape — the rule every additive key here follows.
+        let plain = crate::settings::Settings::default();
+        assert!(
+            !plain.to_json().contains("strip_to_theory"),
+            "an untouched desk wrote the key"
+        );
+        // Out of range is a question with no answer, not a panic.
+        assert!(!app.to_theory(9_999));
+        app.set_to_theory(9_999, true);
+    }
+
+    /// **Playback lights the theory view for the tracks that ask, and only
+    /// those.**
+    ///
+    /// The other half of the switch, and the half that did not exist: a MIDI
+    /// clip played and the chord readout said nothing at all, because
+    /// everything the theory view knew came from the keyboard.
+    #[test]
+    fn playback_reaches_the_theory_view_only_where_the_switch_is_on() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        // Track 1 is on out of the box; track 3 is not.
+        app.recorder.lane_sounding[0] = 1u128 << 60;
+        app.recorder.lane_sounding[2] = 1u128 << 72;
+        let lit = app.display_notes();
+        assert!(lit.contains(&60), "track one's clip did not light the view");
+        assert!(!lit.contains(&72), "track three's clip lit it uninvited");
+        // Turn three on and it joins.
+        app.set_to_theory(2, true);
+        let lit = app.display_notes();
+        assert!(lit.contains(&72), "the switch did not let track three in");
+        // Turn one off and it leaves.
+        app.set_to_theory(0, false);
+        let lit = app.display_notes();
+        assert!(!lit.contains(&60), "track one stayed after being switched off");
+    }
+
+    /// **Normalise acts on the selected AUDIO and asks the host to measure.**
+    ///
+    /// The peak lives behind the firewall with the decoder, so this crate's
+    /// half is the selection and the refusal: MIDI is left alone, because a
+    /// note's velocity is a performance and not a level.
+    #[test]
+    fn normalise_takes_the_audio_selection_and_leaves_midi_alone() {
+        use crate::arrangement::{ArrClip, ClipKind};
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        let mut add = |kind: ClipKind| {
+            app.arrangement.add_clip(ArrClip {
+                kind,
+                notes: Vec::new(),
+                lane: 0,
+                path: "a.wav".into(),
+                start_s: 0.0,
+                offset_s: 0.0,
+                len_s: 4.0,
+                fade_in_s: 0.0,
+                fade_out_s: 0.0,
+                name: String::new(),
+                id: 0,
+                extra: Default::default(),
+                anchor: Default::default(),
+                follow_tempo: false,
+                stretch: 1.0,
+                stretch_mode: String::new(),
+                gain: 1.0,
+            })
+        };
+        let audio = add(ClipKind::Audio);
+        let midi = add(ClipKind::Midi);
+
+        // The whole selected SET, audio only.
+        app.arr_multi.push(audio);
+        app.arr_multi.push(midi);
+        app.arr_normalize_selection();
+        let req = app.take_recorder_request();
+        match req {
+            Some(recorder::RecorderRequest::NormalizeClips(ids)) => {
+                assert_eq!(ids, vec![audio], "{ids:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // Nothing but MIDI selected: it says so rather than asking for
+        // nothing, because a shortcut that silently does nothing is one
+        // people press twice and then give up on.
+        app.arr_multi.clear();
+        app.arr_selected = Some(midi);
+        app.dialog = None;
+        app.arr_normalize_selection();
+        assert!(app.take_recorder_request().is_none());
+        assert!(app.dialog.is_some(), "it went quiet on an empty selection");
+
+        // The host's answer lands on the clip and marks it for the engine.
+        app.set_clip_gain(audio, 2.5);
+        assert!((app.arrangement.clips[0].gain - 2.5).abs() < 1e-9);
+        // Nonsense is clamped rather than multiplied into somebody's
+        // monitors — the rule every gain in this app follows.
+        app.set_clip_gain(audio, f64::NAN);
+        assert_eq!(app.arrangement.clips[0].gain, 1.0);
+        app.set_clip_gain(audio, 1.0e9);
+        assert_eq!(app.arrangement.clips[0].gain, 64.0);
+        app.reset_clip_gain(audio);
+        assert_eq!(app.arrangement.clips[0].gain, 1.0);
+    }
+
+    /// **A track is carried by its NAME as well as by its number.**
+    ///
+    /// The number is twelve points wide on a header full of controls; the
+    /// name plate beside it is what a hand actually goes for, and the mixer
+    /// has worked that way since its own carry landed.
+    #[test]
+    fn a_track_is_carried_by_its_name_and_by_its_number() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.arrangement_open = true;
+        app.settings.strip_names = vec!["Rhodes".into()];
+        let _ = &ctx;
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 500.0));
+        app.arrangement_rect = Some(rect);
+        let clips = app.arr_clip_views();
+        let view = app.arrange_view(&clips);
+        let l = crate::arrangement_panel::Layout::new(rect, &view);
+        let row = l.header_rows[0];
+        assert!(row.number.is_positive() && row.name.is_positive());
+        // Both cells answer with a hit that carries the same lane, which is
+        // the property the press arm relies on.
+        use crate::arrangement_panel::Hit as A;
+        assert_eq!(
+            crate::arrangement_panel::hit_test(rect, &view, row.number.center()),
+            Some(A::HdrNumber(0))
+        );
+        assert_eq!(
+            crate::arrangement_panel::hit_test(rect, &view, row.name.center()),
+            Some(A::HdrName(0))
+        );
+        // And the two cells do not overlap, so a press on one is never the
+        // other — the panel's own no-overlap rule, asserted here because
+        // these two now share a gesture.
+        assert!(
+            !row.number.intersects(row.name)
+                || row.number.intersect(row.name).area() < 0.01,
+            "the number and the name overlap"
+        );
+    }
+
+    /// **Carrying an insert to another channel asks for a COPY, and a press
+    /// that never travels still opens the plugin.**
+    ///
+    /// The second half is what makes the gesture free: the bay's press used
+    /// to act at once, and arming a carry on it would have cost the click if
+    /// the release did not put it back.
+    #[test]
+    fn an_insert_bay_carries_to_another_channel_and_still_opens_on_a_click() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.set_insert(0, 1, Some("/x/Comp.vst3"));
+        assert_eq!(app.insert(0, 1), Some("/x/Comp.vst3"));
+
+        // A carry that travelled: the request goes, and NOTHING is written
+        // here — the target bay is the host's to choose, because only the
+        // host can lay the plugin's state beside it.
+        app.bay_carry = Some((0, 1, Pos2::new(10.0, 10.0), true));
+        app.land_bay_carry(Some(4));
+        let req = app.take_recorder_request();
+        assert!(
+            matches!(
+                req,
+                Some(recorder::RecorderRequest::CopyInsert {
+                    from_strip: 0,
+                    from_bay: 1,
+                    to_strip: 4
+                })
+            ),
+            "{req:?}"
+        );
+        assert_eq!(app.bay_carry, None, "the carry did not let go");
+        assert!(app.insert(4, 0).is_none(), "the app wrote the target itself");
+
+        // A press that never travelled is a click, and a click opens what is
+        // in the bay rather than copying it anywhere. It asks for the
+        // EDITOR, which is a request of its own — the assertion is about
+        // which one, not about whether anything was asked.
+        app.bay_carry = Some((0, 1, Pos2::new(10.0, 10.0), false));
+        app.land_bay_carry(Some(4));
+        let req = app.take_recorder_request();
+        assert!(
+            matches!(req, Some(recorder::RecorderRequest::OpenInsertEditor(0, 1))),
+            "a click on a loaded bay asked for {req:?}"
+        );
+        assert_eq!(app.bay_carry, None);
+
+        // Dropped on nothing: nothing asked, and the carry still lets go.
+        app.bay_carry = Some((0, 1, Pos2::new(10.0, 10.0), true));
+        app.land_bay_carry(None);
+        assert!(app.take_recorder_request().is_none());
+        assert_eq!(app.bay_carry, None);
+
+        // **And dropped on its OWN channel, nothing happens.** Copying a
+        // compressor to the channel it is already on is a second instance of
+        // it in the next bay, which is never what the gesture meant.
+        app.bay_carry = Some((0, 1, Pos2::new(10.0, 10.0), true));
+        app.land_bay_carry(Some(0));
+        assert!(app.take_recorder_request().is_none(), "it copied onto itself");
     }
 
     /// **A right-click on a knob opens it for typing** — all eight — and

@@ -93,6 +93,7 @@ fn clip_key_is_readable(key: &str, value: Option<&Value>) -> bool {
     };
     match key {
         "kind" | "path" | "name" | "anchor" | "stretch_mode" => v.is_string(),
+        "gain" => v.is_number(),
         "lane" | "id" => v.is_number(),
         "start_s" | "offset_s" | "len_s" | "fade_in_s" | "fade_out_s" | "stretch" => {
             v.is_number()
@@ -145,7 +146,7 @@ pub fn stretch_mode_label(key: &str) -> &'static str {
 /// read and `ivory-ui` cannot name a constant that lives with the DSP.
 pub const STRETCH_RATIO: (f64, f64) = (0.25, 4.0);
 
-const CLIP_KEYS: [&str; 15] = [
+const CLIP_KEYS: [&str; 16] = [
     "kind",
     "lane",
     "path",
@@ -161,6 +162,7 @@ const CLIP_KEYS: [&str; 15] = [
     "follow_tempo",
     "stretch",
     "stretch_mode",
+    "gain",
 ];
 
 /// What a clip is made of.
@@ -298,6 +300,12 @@ pub struct ArrClip {
     /// parameters make: this crate holds what somebody chose and the binary
     /// knows what it means.
     pub stretch_mode: String,
+    /// The clip's own level, linear. 1.0 is untouched.
+    ///
+    /// **Where NORMALISE lives**, and why it is undoable: rewriting the file
+    /// would be destructive and irreversible; a number on the clip is
+    /// neither. It rides through to the engine on `Placed::gain`.
+    pub gain: f64,
     /// Keys THIS build does not know, kept so a newer build's clip survives
     /// being opened here.
     ///
@@ -764,6 +772,13 @@ impl Arrangement {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_owned(),
+                    // Clamped on read, like every gain: this multiplies into
+                    // somebody's monitors.
+                    gain: c
+                        .get("gain")
+                        .and_then(Value::as_f64)
+                        .filter(|v| v.is_finite() && (0.0..=64.0).contains(v))
+                        .unwrap_or(1.0),
                     // **Whatever is left is somebody else's.** Take the keys
                     // this build understands out of the object and keep the
                     // remainder verbatim; `shift_remove` and not `remove`,
@@ -1038,6 +1053,11 @@ impl Arrangement {
                                 m.insert("stretch".into(), Value::Number(n));
                             }
                         }
+                        if (c.gain - 1.0).abs() > 1.0e-9 {
+                            if let Some(n) = serde_json::Number::from_f64(c.gain) {
+                                m.insert("gain".into(), Value::Number(n));
+                            }
+                        }
                         if !c.stretch_mode.is_empty() && c.stretch_mode != "auto" {
                             m.insert(
                                 "stretch_mode".into(),
@@ -1207,6 +1227,7 @@ mod tests {
             follow_tempo: false,
             stretch: 1.0,
             stretch_mode: String::new(),
+            gain: 1.0,
             extra: Map::new(),
         }
     }
@@ -1520,6 +1541,7 @@ mod tests {
             follow_tempo: true,
             stretch: 1.0,
             stretch_mode: String::new(),
+            gain: 1.0,
             ..a_clip(1, "", 4.0)
         });
         a.add_clip(a_clip(2, "/x/take.wav", 8.0));
@@ -1589,6 +1611,7 @@ mod tests {
             follow_tempo: true,
             stretch: 0.75,
             stretch_mode: "tonal".into(),
+            gain: 0.5,
             extra: Map::new(),
         });
         let Ok(Value::Object(doc)) = serde_json::from_str::<Value>(&a.to_json()) else {

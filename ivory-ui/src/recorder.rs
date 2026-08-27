@@ -918,6 +918,10 @@ pub struct RecorderState {
     /// times a second. The WINDOW is a setting and is not stored here — see
     /// `IvoryApp::recorder_layout_view`, which puts the two together.
     pub loudness: Loudness,
+    /// What each lane's CLIPS are sounding, as a pitch mask. Playback only —
+    /// the live notes are already in the app's own hands, because it is the
+    /// thing that received them.
+    pub lane_sounding: [u128; CHANNELS],
     /// The output directory, shortened for display.
     pub dest: String,
     /// What the next take's folder will be called, from `ivory_record::take`.
@@ -1302,6 +1306,32 @@ pub enum RecorderRequest {
     Pause,
     /// Put out every clip latch: the user has seen it.
     DismissClip,
+    /// Copy the effect in one bay to another channel's next free bay,
+    /// **with the settings it is playing at**.
+    ///
+    /// A request rather than a settings write, because the useful half of it
+    /// is host-side: an effect copied as a bare path is a fresh instance
+    /// with factory defaults, which is not what anybody means by "copy this
+    /// compressor to the other guitar". The host asks the live plugin for
+    /// its state and lays it beside the target bay so the new instance comes
+    /// up already dialled in.
+    ///
+    /// The target BAY is the host's to choose — the next free one — for the
+    /// reason the owner gave: a drop that landed on an occupied insert
+    /// should still work rather than refusing or overwriting.
+    CopyInsert {
+        from_strip: usize,
+        from_bay: usize,
+        to_strip: usize,
+    },
+    /// Bring these clips up so their loudest point sits just under full
+    /// scale.
+    ///
+    /// A request because the PEAK is host-side: `ivory-ui` holds a path and
+    /// a length, and the samples live behind the firewall with the decoder.
+    /// The host measures and writes the gain back through
+    /// `IvoryApp::set_clip_gain`.
+    NormalizeClips(Vec<u64>),
     /// Start the INTEGRATED loudness reading again from nothing.
     ///
     /// A request rather than a setting, because the number does not live

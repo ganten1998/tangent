@@ -15,6 +15,34 @@
 //! `process()` sends into it from the audio thread and the editor drains it on
 //! the next frame, which is the same shape as `midir`'s callback thread.
 
+/// One clip's picture, made by the host after decoding.
+///
+/// **The wave is MIN/MAX pairs, and it covers a SPAN rather than the whole
+/// clip.**
+///
+/// Pairs because a waveform drawn as one number per column is a bar chart:
+/// audio is not symmetric about zero and the shape people read is the
+/// outline of both sides. A span because the resolution has to follow the
+/// zoom — a picture computed once at import is sharp at one zoom and blocky
+/// at every other, and computing the whole of a five-minute clip at
+/// screen resolution every time the view moves is a pass over fourteen
+/// million frames for the part of it nobody can see.
+///
+/// So the host draws only what is on screen, at the pixels it occupies, and
+/// says which seconds it drew.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ClipInfo {
+    pub id: u64,
+    /// `[min, max, min, max, …]`, each in −1..=1. May be empty.
+    pub wave: Vec<f32>,
+    /// The whole FILE's length, which is what a trim is measured against.
+    pub file_s: f64,
+    /// The first second `wave` covers, in the clip's own drawn timeline.
+    pub wave_from_s: f64,
+    /// How many seconds it covers. Zero means there is no picture.
+    pub wave_span_s: f64,
+}
+
 use crate::midi_event::MidiEvent;
 use std::sync::mpsc;
 
