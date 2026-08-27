@@ -195,6 +195,9 @@ pub enum MenuAction {
     /// After a blinking light, a running timer is the most-cited performance
     /// distraction in the piano forums, and no competitor offers the switch.
     ToggleHideElapsed,
+    /// Draw the menu and the dialogs in the canvas, so a screen reader can
+    /// reach them. See `Settings::screen_reader_mode`.
+    ToggleScreenReaderMode,
     ShowAbout,
     /// Put one part of the settings back. Every one of these opens a
     /// confirmation — see [`crate::settings::ResetScope`], which is also
@@ -208,6 +211,9 @@ pub enum MenuAction {
 /// explicit `.clone()` where a view is reused.
 #[derive(Clone)]
 pub struct MenuView {
+    /// The dialogs are drawn in the canvas for a screen reader, so the row
+    /// offers the way back rather than the way in.
+    pub screen_reader: bool,
     pub dark_mode: bool,
     /// The theme's strip face, already resolved for the mode the app is in.
     /// The menu is made of the same material as the desk under it.
@@ -789,6 +795,20 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
                 "Borderless"
             },
             MenuAction::ToggleBorderless,
+        ));
+    }
+    // **Where a person goes looking for it**, which is the same category as
+    // every other question about how the window behaves. Only where there
+    // ARE child windows to give up: in a plugin the dialogs are already
+    // inline and the row would be a switch with nothing on either side of it.
+    if view.caps.window_sizing {
+        window.push(row(
+            if view.screen_reader {
+                "Menus in Their Own Windows"
+            } else {
+                "Menus Inside the Window (Screen Reader)"
+            },
+            MenuAction::ToggleScreenReaderMode,
         ));
     }
     push_category(&mut everywhere, "Window", window);
@@ -1928,6 +1948,7 @@ mod tests {
 
     fn view() -> MenuView {
         MenuView {
+            screen_reader: false,
             dark_mode: false,
             face: (0xE3, 0xD9, 0xBD),
             theme_name: "Default".to_owned(),

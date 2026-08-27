@@ -52,6 +52,62 @@ const OFFSCREEN_SLACK: f32 = 40.0;
 /// asked for. Rounding and DPI scaling move things by a pixel or two.
 const WM_SIZE_TOLERANCE: f32 = 8.0;
 
+/// Where the keyboard is standing, and how that panel is told about it.
+///
+/// **One variant per panel, because a keyboard press should take whatever
+/// road a CLICK on that panel already takes.** They are not the same road:
+/// the band's hits carry their own values, so a nudge synthesises the point
+/// a pointer would be at and asks `hit_test`; the desk's hits carry only
+/// which control, with the value passed beside them, so a nudge passes the
+/// value. Forcing both through one shape would have meant inventing a third
+/// road for at least one of them, and a third road is the one that drifts.
+#[derive(Debug, Clone, Copy)]
+enum Focused {
+    Band {
+        /// The whole panel, which is what `hit_test` wants.
+        panel: Rect,
+        /// The control inside it.
+        rect: Rect,
+        travel: Option<crate::a11y::Travel>,
+    },
+    Desk {
+        hit: crate::mixer_panel::Hit,
+        travel: Option<crate::a11y::Travel>,
+    },
+}
+
+/// Lay the nodes over a painted panel and answer whichever one has focus.
+///
+/// A free function and not a method, because every caller is inside a
+/// borrow of the view it just drew from and `&mut self` here would fight it.
+/// What it needs from the app is one colour.
+fn offer_nodes<'n>(
+    ui: &egui::Ui,
+    nodes: &'n [crate::a11y::Node],
+    accent: egui::Color32,
+) -> Option<&'n crate::a11y::Node> {
+    let mut out = None;
+    for (node, response) in nodes.iter().zip(crate::a11y::install(ui, nodes)) {
+        if !response.has_focus() {
+            continue;
+        }
+        // Drawn on the SAME painter the panel used, so the ring lands over
+        // the control rather than under it — a ring behind a fader is a ring
+        // nobody sees.
+        crate::a11y::draw_focus_ring(ui.painter(), node.rect, accent);
+        out = Some(node);
+    }
+    out
+}
+
+impl Focused {
+    fn travel(self) -> Option<crate::a11y::Travel> {
+        match self {
+            Self::Band { travel, .. } | Self::Desk { travel, .. } => travel,
+        }
+    }
+}
+
 /// Whether something other than us is sizing our windows.
 ///
 /// Under a tiling window manager (AeroSpace, yabai, i3) the size we ask for is
@@ -779,6 +835,13 @@ pub struct IvoryApp {
     /// The minimum has been handed to the window manager. Once, not per
     /// frame — see the send site.
     min_sent: Option<bool>,
+    /// Which painted surface the keyboard is standing on, and which control.
+    ///
+    /// Set while a node laid over a panel holds egui's focus, and cleared the
+    /// frame nothing does. It is a RECT and a surface rather than a hit,
+    /// because turning it into a hit is `hit_test`'s job — see
+    /// `nudge_focused`.
+    a11y_on: Option<Focused>,
     /// When the app last asked the window manager for a size — including at
     /// startup, where the size is baked into the `ViewportBuilder`.
     ///
@@ -1266,6 +1329,14 @@ impl IvoryApp {
     /// MIDI source at all; a host that picks its own attaches one with
     /// `set_ports`, and one that is handed its notes never does.
     pub fn new(ctx: &egui::Context, mut settings: Settings, caps: Caps) -> Self {
+        // **A screen reader takes the dialogs into the canvas.** eframe 0.33
+        // adapts the ROOT viewport only, so a dialog in a child window is a
+        // dialog a reader cannot see; drawing it inline is the road the
+        // plugin build already takes. See `Settings::screen_reader_mode`.
+        let mut caps = caps;
+        if settings.screen_reader_mode {
+            caps.child_windows = false;
+        }
         // **Nothing is detached, ever, on any host.**
         //
         // Four surfaces — the chord readout, the neck, the theory band and the
@@ -1568,6 +1639,7 @@ impl IvoryApp {
             splash_up: false,
             last_sent_size: None,
             min_sent: None,
+            a11y_on: None,
             // The window opens at a size this app chose — see `main.rs` —
             // so the grace runs from launch.
             size_asked_at: Some(Instant::now()),
@@ -3330,6 +3402,7 @@ impl IvoryApp {
 
     fn menu_view(&self) -> MenuView {
         MenuView {
+            screen_reader: self.settings.screen_reader_mode,
             // The desk's own face, in the mode the app is in — the menu is
             // made of the same material as the surfaces it opens over.
             face: {
@@ -11290,6 +11363,31 @@ impl IvoryApp {
 
     /// The dialog on screen, if any. The host reads it to keep a slot row in
     /// step with the picker that belongs to it.
+    /// A screen reader attached, or went away.
+    ///
+    /// Pushed from the binary crate, because whether AccessKit is live is a
+    /// question only `egui/accesskit` can answer and `ivory-ui` may not name
+    /// a feature — see the firewall. Plain data across it, like everything
+    /// else a panel learns about the world.
+    ///
+    /// Sticky by design: once the dialogs are inline, a reader being detached
+    /// mid-session does NOT move them back. Windows appearing and vanishing
+    /// under somebody who has just started using a reader is worse than a
+    /// setting that stays where it was put, and the row in the menu is how it
+    /// goes back.
+    pub fn set_screen_reader(&mut self, attached: bool) {
+        if !attached || self.settings.screen_reader_mode {
+            return;
+        }
+        self.settings.screen_reader_mode = true;
+        self.caps.child_windows = false;
+        // Anything already out in a window comes home, or it is a surface a
+        // reader cannot reach and the app cannot close.
+        self.dialog = None;
+        self.menu_state = None;
+        self.save_settings();
+    }
+
     /// The host declined to reclaim a scratch project because it holds
     /// recordings. The app turns this into the question.
     pub fn warn_about_scratch(&mut self, warn: crate::ports::ScratchWarning) {
@@ -11770,6 +11868,207 @@ impl IvoryApp {
     /// touches a device or the filesystem becomes a request for the host. That
     /// split is the same one `Caps` draws, and it is why a plugin could paint
     /// this band harmlessly if it ever had reason to.
+    // ── Keyboard reach (a11y) ──────────────────────────────────────────────
+
+    /// A note, spelled so a screen reader can pronounce it.
+    ///
+    /// **"C sharp 4" and not "C#4".** Readers say the glyph — "C number
+    /// sign four", "C pound four", or nothing at all — and a flat is worse:
+    /// `Eb` comes out as a word. This is the difference between a theory app
+    /// a blind student can follow and one that reads them punctuation.
+    ///
+    /// The letter itself comes from the detector, so the spelling follows the
+    /// same sharps-or-flats preference the screen shows. A readout that said
+    /// A-sharp while the staff drew B-flat would be its own kind of useless.
+    fn spoken_note(&self, note: u8) -> String {
+        let pc = self.detector.get_note_name(note % 12);
+        let octave = i32::from(note / 12) - 1;
+        let said = pc.replace('#', " sharp").replace('b', " flat");
+        // A space only where an accidental was spelled out, so "C4" stays the
+        // scientific spelling everyone reads and "C sharp 4" does not run its
+        // last word into the number.
+        if said.len() > 1 {
+            format!("{said} {octave}")
+        } else {
+            format!("{said}{octave}")
+        }
+    }
+
+    /// The held notes, in pitch order, as words.
+    fn spoken_notes(&self, notes: &std::collections::HashSet<u8>) -> String {
+        if notes.is_empty() {
+            return "nothing held".to_owned();
+        }
+        let mut list: Vec<u8> = notes.iter().copied().collect();
+        list.sort_unstable();
+        list.iter()
+            .map(|n| self.spoken_note(*n))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// What the theory surfaces say, for a reader.
+    ///
+    /// **The half of accessibility that is not about controls.** An app whose
+    /// buttons are all reachable and whose staff is silent has been made
+    /// operable and not useful — and a music-theory app that a blind student
+    /// cannot read the notes out of has missed its own point. Nothing in the
+    /// competitor set does this.
+    fn musical_nodes(
+        &self,
+        display: &std::collections::HashSet<u8>,
+        piano_rect: Rect,
+        chord_rect: Option<Rect>,
+        fret_rect: Option<Rect>,
+    ) -> Vec<crate::a11y::Node> {
+        use crate::a11y::Node;
+        let mut out = Vec::new();
+        if let Some(r) = chord_rect.filter(|r| r.is_positive()) {
+            out.push(Node::readout(
+                egui::Id::new("read-chord"),
+                r,
+                "Chord",
+                self.current_chord
+                    .clone()
+                    .unwrap_or_else(|| "no chord".to_owned()),
+            ));
+        }
+        if piano_rect.is_positive() {
+            let held = self.spoken_notes(display);
+            // The pedal changes what the keyboard MEANS, so it is part of
+            // what the keyboard says rather than a separate node nobody
+            // would think to go and read.
+            let pedal = if self.notes.sustain_down() { ", sustain pedal down" } else { "" };
+            out.push(Node::readout(
+                egui::Id::new("read-piano"),
+                piano_rect,
+                "Piano keyboard",
+                format!("{held}{pedal}"),
+            ));
+        }
+        if let Some(r) = fret_rect.filter(|r| r.is_positive()) {
+            out.push(Node::readout(
+                egui::Id::new("read-fretboard"),
+                r,
+                "Guitar neck",
+                self.spoken_shape(),
+            ));
+        }
+        out
+    }
+
+    /// The guitar shape in words: which string, which fret.
+    ///
+    /// Read off the solved voicing rather than off the notes, because the
+    /// whole point of the neck is WHERE to put your fingers — two shapes of
+    /// the same chord are different answers and a readout that gave the
+    /// pitches would have given neither.
+    fn spoken_shape(&self) -> String {
+        use ivory_core::voicing::StringState;
+        let v = self.voicing.current();
+        let mut said: Vec<String> = Vec::new();
+        for (i, state) in v.strings.iter().enumerate() {
+            // **String 1 is the LOW one here**, matching how this app numbers
+            // them everywhere else. A readout that counted the other way
+            // would be telling a guitarist to play the shape upside down.
+            match state {
+                StringState::Sounding { fret: 0, .. } => {
+                    said.push(format!("string {} open", i + 1));
+                }
+                StringState::Sounding { fret, .. } => {
+                    said.push(format!("string {} fret {fret}", i + 1));
+                }
+                // A string the player must DAMP is part of the shape and is
+                // said so; one outside the chord's span is simply not in it.
+                StringState::Skipped => said.push(format!("string {} muted", i + 1)),
+                StringState::Unused => {}
+            }
+        }
+        if said.is_empty() {
+            "nothing held".to_owned()
+        } else {
+            said.join(", ")
+        }
+    }
+
+    /// Lay this frame's nodes over a panel, and notice if one has focus.
+    ///
+    /// Called right after the panel paints, so the rects are the ones just
+    /// drawn. Returns nothing: what it produces is `self.a11y_on`, read later
+    /// by [`Self::nudge_focused`] once every panel has had its turn.
+    fn offer_to_keyboard(
+        &mut self,
+        ui: &egui::Ui,
+        nodes: &[crate::a11y::Node],
+        mut focused: impl FnMut(&crate::a11y::Node) -> Option<Focused>,
+    ) {
+        if let Some(node) = offer_nodes(
+            ui,
+            nodes,
+            // The colour a held key wears — the app's own "this one is live"
+            // accent, already a theme role in every palette. It is decoration
+            // here and never the thing that has to be seen; see
+            // `draw_focus_ring`.
+            self.settings.white_key_active_color.to_color32(),
+        ) {
+            self.a11y_on = focused(node);
+        }
+    }
+
+    /// Act on the arrow keys and Space, for whichever control has focus.
+    ///
+    /// **Through the panel's own `hit_test`, never around it.** A nudge works
+    /// out where a pointer WOULD be for the new value and asks the panel what
+    /// a press there means; an activation asks about the control's centre.
+    /// So the keyboard and the mouse produce the same hits by construction,
+    /// and a panel that changes what a control does changes it for both.
+    fn nudge_focused(&mut self, ctx: &egui::Context) {
+        let Some(on) = self.a11y_on else {
+            return;
+        };
+        // A field being typed into owns every key; so does an open dialog.
+        if self.text_entry_active() || self.dialog.is_some() {
+            return;
+        }
+        let Some(gesture) = ctx.input(crate::a11y::Gesture::read) else {
+            return;
+        };
+        let travel = on.travel();
+        // What the control reads AFTER the press. `Activate` leaves it alone —
+        // pressing a fader is not moving it.
+        let want = travel.map(|t| {
+            if matches!(gesture, crate::a11y::Gesture::Activate) {
+                t.norm
+            } else {
+                gesture.nudged(t.norm)
+            }
+        });
+        match on {
+            Focused::Band { panel, rect, .. } => {
+                // The band's road: a point, then the panel's own `hit_test`,
+                // then the same `apply_recorder_hit` a click reaches.
+                let point = match (travel, want) {
+                    (Some(t), Some(v)) => t.point(rect, v),
+                    _ => rect.center(),
+                };
+                let view = self.recorder_layout_view();
+                if let Some(hit) = recorder_panel::hit_test(panel, &view, point) {
+                    self.apply_recorder_hit(hit);
+                }
+            }
+            Focused::Desk { hit, .. } => {
+                // The desk's road: the hit and the value together, which is
+                // exactly what its pointer path passes.
+                self.apply_mixer_hit(hit, want.unwrap_or(0.0));
+            }
+        }
+        // The key was ours; nobody else gets it. Without this an arrow over a
+        // focused fader also scrolls whatever is behind it.
+        ctx.input_mut(|i| {
+            i.events.retain(|e| !matches!(e, egui::Event::Key { pressed: true, .. }));
+        });
+    }
+
     fn apply_recorder_hit(&mut self, hit: recorder_panel::Hit) {
         use recorder_panel::Hit;
         use recorder::RecorderRequest as R;
@@ -13538,6 +13837,19 @@ impl IvoryApp {
                     focus: true,
                 })
             }
+            // **Both ways, by hand.** The host turns this on when it sees a
+            // reader attach and never turns it off — see
+            // `set_screen_reader` — so this row is how somebody says
+            // otherwise in either direction.
+            MenuAction::ToggleScreenReaderMode => {
+                let on = !self.settings.screen_reader_mode;
+                self.settings.screen_reader_mode = on;
+                self.caps.child_windows = !on;
+                // Whatever is open is open in the WRONG kind of surface now.
+                self.dialog = None;
+                self.menu_state = None;
+                self.save_settings();
+            }
             MenuAction::ShowAbout => self.dialog = Some(Dialog::About),
             MenuAction::Reset(scope) => self.ask_before_resetting(scope),
         }
@@ -14865,7 +15177,15 @@ impl IvoryApp {
         // The input menu's rows, kept warm: rebuilt the frame the device
         // arrives or changes, so the menu never opens against a cold cache.
         self.tend_menu_cache();
+        // **Cleared before the paint, set during it.** The nodes are laid
+        // over the panels as they draw, so whichever one holds focus writes
+        // itself here; a frame where nothing does leaves it empty rather than
+        // stale, which is what stops an arrow key moving a fader that is no
+        // longer on screen.
+        self.a11y_on = None;
         crate::shell::viewport_ui(ctx, |ui| self.paint(ui));
+        // ...and acted on after it, once every panel has had its turn.
+        self.nudge_focused(ctx);
     }
 
     /// One frame into a `Ui` that somebody else made.
@@ -15712,6 +16032,14 @@ impl IvoryApp {
                 &self.recorder_layout_view(),
                 &self.settings,
             );
+            // **After the paint, so the rects are the ones just drawn.**
+            // Invisible, focusable widgets over every control the band has:
+            // a tab stop, and a node a screen reader can say. See
+            // `ivory_ui::a11y`.
+            let nodes = recorder_panel::a11y_nodes(rect, &self.recorder_layout_view());
+            self.offer_to_keyboard(ui, &nodes, |node| {
+                Some(Focused::Band { panel: rect, rect: node.rect, travel: node.travel })
+            });
             // **The heart.** It moved here from the chord strip, which is off
             // by default in 5.0 — a heart that hides itself thanks nobody.
             // Drawn by the app rather than by the band because the colour is
@@ -15787,6 +16115,31 @@ impl IvoryApp {
         if let Some(rect) = mixer_rect {
             let view = self.mixer_view();
             crate::mixer_panel::draw(ui.painter(), rect, &view);
+            // Sixteen strips' worth of tab stops. See `ivory_ui::a11y`.
+            //
+            // Both lists built before the call, so the view's borrow of
+            // `self` is done with by the time `offer_to_keyboard` wants it
+            // mutably. They are pure functions of the rect and the view;
+            // hoisting them changes nothing but the borrow.
+            let (nodes, hits) = {
+                let nodes = crate::mixer_panel::a11y_nodes(rect, &view);
+                let hits = crate::mixer_panel::Layout::new(rect, &view).targets();
+                (nodes, hits)
+            };
+            let on_desk = offer_nodes(
+                ui,
+                &nodes,
+                self.settings.white_key_active_color.to_color32(),
+            )
+            .and_then(|node| {
+                // Back to the hit by RECT, which is what both lists are keyed
+                // on — `a11y_nodes` walks `targets` and keeps its rects, so
+                // this cannot mismatch without the two having disagreed about
+                // the layout, which they cannot: they build the same one.
+                hits.iter()
+                    .find(|(r, _)| *r == node.rect)
+                    .map(|(_, hit)| Focused::Desk { hit: *hit, travel: node.travel })
+            });
             // A strip mid-carry: the source dims, the target column lights.
             if let Some((from, _, true)) = self.mixer_reorder {
                 let l = crate::mixer_panel::Layout::new(rect, &view);
@@ -15817,6 +16170,13 @@ impl IvoryApp {
                         }
                     }
                 }
+            }
+            // **After the view's borrow is done with**, which is the only
+            // reason this is not written where the nodes are laid out: the
+            // reorder overlay above still needs `view`, and assigning into
+            // `self` mid-borrow is what the compiler objects to.
+            if on_desk.is_some() {
+                self.a11y_on = on_desk;
             }
         } else if let Some(rect) = arrangement_rect {
             let clips = self.arr_clip_views();
@@ -15931,6 +16291,23 @@ impl IvoryApp {
                 self.guitar_intervals(&display),
             );
             fretboard_panel::draw_top_edge(ui.painter(), fret_rect, &self.settings);
+        }
+
+        // **The theory surfaces, said out loud.** One node each rather than
+        // one per key or per fret: eighty-eight tab stops across a keyboard
+        // is a tab order nobody can get out of, and what a person wants from
+        // a piano they cannot see is what is being HELD, not the ability to
+        // walk it. See `musical_nodes`.
+        let musical = self.musical_nodes(&display, piano_rect, chord_rect_for_hit, fret_rect_for_hit);
+        if let Some(node) = offer_nodes(
+            ui,
+            &musical,
+            self.settings.white_key_active_color.to_color32(),
+        ) {
+            // Readouts, so there is nothing to nudge and nothing to press —
+            // recorded only so the ring is drawn and focus is not lost the
+            // next frame.
+            let _ = node;
         }
 
         // **The thanks card, last of everything.** It hangs out of the recorder
@@ -20223,6 +20600,192 @@ mod tests {
             lit,
             [60].into_iter().collect::<HashSet<u8>>(),
             "a phantom key lit an interval away from the one playing"
+        );
+    }
+
+    /// **A note is spelled so a screen reader can pronounce it.**
+    ///
+    /// "C sharp 4", never "C#4". Readers say the glyph — "C number sign
+    /// four" — and a flat is worse, because `Eb` is a word. This is the
+    /// difference between a theory app a blind student can follow and one
+    /// that reads them punctuation.
+    #[test]
+    fn a_note_is_spelled_for_the_ear_and_not_for_the_eye() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.detector.set_note_preference(false); // sharps
+        assert_eq!(app.spoken_note(60), "C4");
+        assert_eq!(app.spoken_note(61), "C sharp 4");
+        assert_eq!(app.spoken_note(69), "A4");
+        // No punctuation survives into anything spoken.
+        for n in 0..=127u8 {
+            let said = app.spoken_note(n);
+            assert!(
+                !said.contains('#'),
+                "{n} is spelled {said:?}, which a reader says as punctuation"
+            );
+        }
+        // **And the spelling follows the screen.** A readout saying A-sharp
+        // over a staff drawing B-flat is its own kind of useless.
+        app.detector.set_note_preference(true); // flats
+        let flat = app.spoken_note(70);
+        assert!(
+            flat.contains("flat") || flat.starts_with('A'),
+            "with flats preferred, 70 is spelled {flat:?}"
+        );
+        for n in 0..=127u8 {
+            let said = app.spoken_note(n);
+            assert!(!said.contains('#'), "{n} kept a sharp sign under flats: {said:?}");
+        }
+    }
+
+    /// The theory surfaces say what is on them.
+    #[test]
+    fn the_theory_surfaces_read_out_what_they_are_showing() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.detector.set_note_preference(false);
+        let piano = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 150.0));
+        let chord = Rect::from_min_size(Pos2::new(0.0, 160.0), Vec2::new(1300.0, 50.0));
+
+        // Nothing held: it says so, rather than saying nothing.
+        let quiet = app.musical_nodes(&HashSet::new(), piano, Some(chord), None);
+        let keys = quiet
+            .iter()
+            .find(|n| n.label == "Piano keyboard")
+            .expect("the keyboard has no readout");
+        assert!(keys.spoken().contains("nothing held"), "{:?}", keys.spoken());
+
+        // A C minor triad, in pitch order and by name.
+        let held: HashSet<u8> = [60, 63, 67].into_iter().collect();
+        app.current_chord = Some("Cm".to_owned());
+        let nodes = app.musical_nodes(&held, piano, Some(chord), None);
+        let said = |label: &str| {
+            nodes
+                .iter()
+                .find(|n| n.label == label)
+                .map(crate::a11y::Node::spoken)
+                .unwrap_or_default()
+        };
+        let keys = said("Piano keyboard");
+        assert!(keys.contains("C4"), "the keyboard reads {keys:?}");
+        assert!(keys.contains("G4"), "the keyboard reads {keys:?}");
+        // Ascending, which is the order somebody would say them in.
+        let c = keys.find("C4").unwrap();
+        let g = keys.find("G4").unwrap();
+        assert!(c < g, "the notes are not in pitch order: {keys:?}");
+        assert!(said("Chord").contains("Cm"), "the chord reads {:?}", said("Chord"));
+
+        // The pedal is part of what the keyboard MEANS, so it is said there
+        // rather than parked in a node nobody would think to visit.
+        assert!(
+            !keys.contains("sustain"),
+            "the pedal is up but the keyboard says {keys:?}"
+        );
+    }
+
+    /// **A focused knob answers the arrow keys, through the mouse's road.**
+    ///
+    /// The end of the chain the `a11y` module exists for: an invisible
+    /// focusable widget over a painted knob, egui's focus on it, an arrow
+    /// key, a synthesised point, the panel's own `hit_test`, and the same
+    /// `apply_recorder_hit` a click would have reached. Every one of those
+    /// links is testable alone and none of them proves the chain.
+    ///
+    /// Faders and knobs were mouse-drag only — the audit's words — and there
+    /// was no keyboard nudge anywhere in the app.
+    #[test]
+    fn a_focused_knob_answers_the_arrow_keys() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.master_gain = 0.5;
+        // One frame so the nodes exist and egui has heard of their ids.
+        pointer_frame(&ctx, &mut app, Vec::new());
+
+        let master = egui::Id::new(("band", "master"));
+        ctx.memory_mut(|m| m.request_focus(master));
+        let before = app.settings.master_gain;
+
+        pointer_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::ArrowUp,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(
+            app.settings.master_gain > before,
+            "an arrow key on a focused master did nothing: {before} -> {}",
+            app.settings.master_gain
+        );
+
+        // ...and the other way, by the same amount.
+        let up_to = app.settings.master_gain;
+        ctx.memory_mut(|m| m.request_focus(master));
+        pointer_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::ArrowDown,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(
+            app.settings.master_gain < up_to,
+            "the down arrow did not come back: {up_to} -> {}",
+            app.settings.master_gain
+        );
+
+        // **And it comes back to where it started**, which is the assertion
+        // that catches a wrong CURVE rather than a wrong direction. The first
+        // version of this handed the knob the master's amplitude where its
+        // FADER position belongs; one press then moved -6 dB to -20.4, and an
+        // "it changed" assertion would have called that a pass.
+        assert!(
+            (app.settings.master_gain - before).abs() < 1e-6,
+            "up then down did not return: {before} -> {}",
+            app.settings.master_gain
+        );
+        // One press is one STEP of the fader's travel, not of its gain.
+        let moved = crate::recorder::gain_to_fader(up_to as f32)
+            - crate::recorder::gain_to_fader(before as f32);
+        assert!(
+            (moved - crate::a11y::STEP).abs() < 1e-3,
+            "one press moved the fader {moved} rather than {}",
+            crate::a11y::STEP
+        );
+    }
+
+    /// Nothing focused, nothing nudged.
+    ///
+    /// An arrow key belongs to whatever else wants it when the keyboard is
+    /// not standing on a control — and `a11y_on` is cleared every frame
+    /// rather than left stale, so a fader scrolled off screen cannot still
+    /// be moved.
+    #[test]
+    fn an_arrow_key_with_nothing_focused_moves_nothing() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.master_gain = 0.5;
+        pointer_frame(&ctx, &mut app, Vec::new());
+        ctx.memory_mut(|m| m.surrender_focus(egui::Id::new(("band", "master"))));
+        pointer_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::ArrowUp,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(
+            (app.settings.master_gain - 0.5).abs() < 1e-9,
+            "an arrow moved the master with nothing focused"
         );
     }
 

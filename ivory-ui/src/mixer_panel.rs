@@ -999,6 +999,154 @@ impl Layout {
     }
 }
 
+/// Everything on the desk a keyboard can reach and a screen reader can say.
+///
+/// Built from [`Layout::targets`], which the panel already had, so this
+/// cannot disagree with `hit_test` about where a control is. `Hit::axis`
+/// does the rest of the work: a hit that drags is a slider and knows which
+/// way it travels, and one that does not is a button.
+///
+/// **Named by their STRIP, always.** "Volume" on its own is useless on a desk
+/// with sixteen of them, and a screen reader announcing sixteen identical
+/// labels is a desk nobody can navigate. Every node here leads with the
+/// channel's own name.
+pub fn a11y_nodes(rect: Rect, view: &MixerView<'_>) -> Vec<crate::a11y::Node> {
+    use crate::a11y::{Node, Travel};
+    let l = Layout::new(rect, view);
+    let mut out = Vec::new();
+    for (r, hit) in l.targets() {
+        let Some(col) = hit_column(hit) else { continue };
+        let Some(s) = view.strips.get(col.0) else { continue };
+        // An empty slot is a plus sign and nothing else; the eight controls
+        // that would be on a channel are not there to be reached.
+        if s.empty && !matches!(hit, Hit::Add(_)) {
+            continue;
+        }
+        let who = if s.name.is_empty() {
+            format!("Channel {}", col.0 + 1)
+        } else {
+            s.name.to_owned()
+        };
+        let id = egui::Id::new(("desk", col.0, format!("{hit:?}")));
+        let travel = |norm: f32, axis: DragAxis| Travel {
+            norm: norm.clamp(0.0, 1.0),
+            up: matches!(axis, DragAxis::Vertical),
+        };
+        let node = match hit {
+            Hit::Fader(_) => Node::slider(
+                id,
+                r,
+                format!("{who} volume"),
+                f64::from(s.gain),
+                0.0,
+                1.0,
+                crate::recorder::gain_text(s.gain),
+                // The fader's POSITION, not its amplitude — they are equal
+                // only at the ends. See the master knob in `recorder_panel`,
+                // where getting this wrong sent one arrow press from -6 dB
+                // to -20.4.
+                travel(crate::recorder::gain_to_fader(s.gain), DragAxis::Vertical),
+            ),
+            Hit::Send(_) => Node::slider(
+                id,
+                r,
+                format!("{who} send"),
+                f64::from(s.send),
+                0.0,
+                1.0,
+                format!("{:.0}%", s.send * 100.0),
+                travel(s.send, DragAxis::Vertical),
+            ),
+            Hit::Pan(_) => Node::slider(
+                id,
+                r,
+                format!("{who} pan"),
+                f64::from(s.pan),
+                -1.0,
+                1.0,
+                pan_text(s.pan),
+                // -1..1 laid onto the 0..1 the keyboard moves.
+                travel((s.pan + 1.0) * 0.5, DragAxis::Vertical),
+            ),
+            Hit::Mute(_) => Node::toggle(id, r, format!("{who} mute"), s.muted),
+            Hit::Solo(_) => Node::toggle(id, r, format!("{who} solo"), s.soloed),
+            Hit::Arm(_) => Node::toggle(id, r, format!("{who} record arm"), s.armed),
+            Hit::Add(_) => Node::button(id, r, format!("Add a channel at slot {}", col.0 + 1)),
+            Hit::Remove(_) => Node::button(id, r, format!("Remove {who}")),
+            Hit::Name(_) => Node::readout(id, r, format!("{who} name"), who.clone()),
+            Hit::InputChip(_) => Node::readout(
+                id,
+                r,
+                format!("{who} input"),
+                if s.detail.is_empty() { "none".to_owned() } else { s.detail.to_owned() },
+            ),
+            Hit::Db(_) => Node::readout(
+                id,
+                r,
+                format!("{who} level"),
+                crate::recorder::gain_text(s.gain),
+            ),
+            Hit::Routing(_) => Node::button(id, r, format!("{who} routing")),
+            Hit::Insert(_, bay) => {
+                let what = s.inserts.get(bay).copied().unwrap_or("");
+                Node::readout(
+                    id,
+                    r,
+                    format!("{who} insert {}", bay + 1),
+                    if what.is_empty() { "empty".to_owned() } else { what.to_owned() },
+                )
+            }
+            Hit::RouteGain(_, k) => {
+                let level = view.routes.get(k).map_or(0.0, |(_, _, g)| *g);
+                Node::slider(
+                    id,
+                    r,
+                    format!("{who} route {} level", k + 1),
+                    f64::from(level),
+                    0.0,
+                    1.0,
+                    format!("{:.0}%", level * 100.0),
+                    travel(level, DragAxis::Horizontal),
+                )
+            }
+            // The insert menu is modal over the whole desk while it is up;
+            // its two rows are not part of the desk's tab order.
+            Hit::FxMenu(..) => continue,
+        };
+        out.push(node);
+    }
+    out
+}
+
+/// Which column a hit belongs to. Every variant carries one.
+fn hit_column(hit: Hit) -> Option<Column> {
+    Some(match hit {
+        Hit::Fader(i)
+        | Hit::Send(i)
+        | Hit::Pan(i)
+        | Hit::InputChip(i)
+        | Hit::Mute(i)
+        | Hit::Solo(i)
+        | Hit::Arm(i)
+        | Hit::Add(i)
+        | Hit::Routing(i)
+        | Hit::Db(i)
+        | Hit::Name(i)
+        | Hit::Remove(i) => i,
+        Hit::Insert(i, _) | Hit::RouteGain(i, _) | Hit::FxMenu(i, _, _) => i,
+    })
+}
+
+/// "L64", "C", "R20" — where a pan sits, in the words the desk uses.
+fn pan_text(pan: f32) -> String {
+    let p = (pan.clamp(-1.0, 1.0) * 100.0).round() as i32;
+    match p {
+        0 => "centre".to_owned(),
+        n if n < 0 => format!("left {}", -n),
+        n => format!("right {n}"),
+    }
+}
+
 /// What a press at `pos` means, or nothing.
 pub fn hit_test(rect: Rect, view: &MixerView<'_>, pos: Pos2) -> Option<Hit> {
     let l = Layout::new(rect, view);
@@ -2195,6 +2343,110 @@ mod tests {
 
     fn rect() -> Rect {
         Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(1300.0, 420.0))
+    }
+
+    /// **Every control on the desk has words, and they name their strip.**
+    ///
+    /// Sixteen channels of identical controls is the case where a screen
+    /// reader label like "volume" is worse than none — a person hears the
+    /// same word sixteen times and cannot tell which fader they are on. Every
+    /// node here leads with the channel.
+    #[test]
+    fn every_control_on_the_desk_says_which_strip_it_belongs_to() {
+        let view = a_view();
+        let r = rect();
+        let nodes = a11y_nodes(r, &view);
+        assert!(nodes.len() > 40, "only {} controls have names", nodes.len());
+
+        // Coverage against the panel's own enumeration, minus the modal
+        // insert menu, which is not part of the desk's tab order.
+        let l = Layout::new(r, &view);
+        let mut unnamed = Vec::new();
+        for (rr, hit) in l.targets() {
+            if matches!(hit, Hit::FxMenu(..)) {
+                continue;
+            }
+            if !nodes.iter().any(|n| n.rect == rr) {
+                unnamed.push(format!("{hit:?}"));
+            }
+        }
+        assert!(unnamed.is_empty(), "unnamed desk controls: {unnamed:#?}");
+
+        for n in &nodes {
+            assert!(!n.label.is_empty(), "a desk node has no label");
+            assert!(
+                r.contains_rect(n.rect),
+                "{:?} is outside the desk it belongs to",
+                n.label
+            );
+        }
+        // Distinct ids, or Tab lands on the wrong fader.
+        let mut ids: Vec<String> = nodes.iter().map(|n| format!("{:?}", n.id)).collect();
+        ids.sort();
+        let before = ids.len();
+        ids.dedup();
+        assert_eq!(before, ids.len(), "two desk controls share an id");
+    }
+
+    /// A fader reads in decibels and a pan in sides, never in 0..1.
+    #[test]
+    fn the_desk_speaks_in_the_numbers_printed_on_it() {
+        let mut view = a_view();
+        view.strips[0].gain = 0.5;
+        view.strips[0].pan = -0.64;
+        let nodes = a11y_nodes(rect(), &view);
+        let said = |needle: &str| {
+            nodes
+                .iter()
+                .find(|n| n.label.contains(needle))
+                .map(crate::a11y::Node::spoken)
+                .unwrap_or_default()
+        };
+        assert!(said("volume").contains("dB"), "the fader reads {:?}", said("volume"));
+        assert!(
+            said("pan").contains("left"),
+            "a pan of -0.64 reads {:?} rather than a side",
+            said("pan")
+        );
+        assert_eq!(pan_text(0.0), "centre");
+        assert_eq!(pan_text(-0.5), "left 50");
+        assert_eq!(pan_text(0.25), "right 25");
+
+        // Mute and solo say which they are AND whether they are on, because
+        // a toggle that only says its name is one nobody can read the state
+        // of without pressing it.
+        let mut on = a_view();
+        on.strips[0].muted = true;
+        let muted = a11y_nodes(rect(), &on);
+        let m = muted
+            .iter()
+            .find(|n| n.label.contains("mute"))
+            .expect("no mute node");
+        assert!(m.spoken().ends_with(", on"), "a lit mute reads {:?}", m.spoken());
+    }
+
+    /// An empty slot offers a plus and nothing else.
+    ///
+    /// Eight controls belonging to a channel that is not there would be eight
+    /// tab stops onto nothing.
+    #[test]
+    fn an_empty_slot_is_one_tab_stop_and_not_nine() {
+        let channels = Strip::shown();
+        let view = MixerView {
+            strips: std::array::from_fn(|i| a_strip(channels.get(i).copied(), i == 2)),
+            ..a_view()
+        };
+        let nodes = a11y_nodes(rect(), &view);
+        let on_two: Vec<_> = nodes
+            .iter()
+            .filter(|n| n.label.contains("slot 3") || n.label.contains("Channel 3"))
+            .collect();
+        assert!(
+            on_two.len() <= 1,
+            "an empty slot offers {} tab stops: {:?}",
+            on_two.len(),
+            on_two.iter().map(|n| &n.label).collect::<Vec<_>>()
+        );
     }
 
     /// **What is printed on a strip is legible on the strip.**

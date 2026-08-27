@@ -2039,6 +2039,7 @@ fn name_for(
     let fx_value = |fx: Fx| {
         crate::recorder_panel::knob_reading(view.fx_units[fx.index()], view.fx.get(fx))
     };
+    let up = |norm: f32| crate::a11y::Travel { norm: norm.clamp(0.0, 1.0), up: true };
     Some(match produces {
         Produces::Fixed(hit) => match hit {
             Hit::Play => Node::button(id("play"), r, "Play"),
@@ -2117,6 +2118,10 @@ fn name_for(
             // tracked in a parallel list: `Produces` carries a fn pointer, and
             // the cheapest honest way to identify it is to see what it makes.
             match f(0.5) {
+                // `up: true` on every one of them, because they all arrive
+                // through `AlongV` — this band's dials are round, and a round
+                // knob read left-to-right goes the wrong way from whichever
+                // side of it you did not grab.
                 Hit::SetMaster(_) => Node::slider(
                     id("master"),
                     r,
@@ -2125,6 +2130,14 @@ fn name_for(
                     0.0,
                     1.0,
                     crate::recorder::gain_text(view.gains.master),
+                    // **The FADER's position, not the gain.** `Hit::SetMaster`
+                    // carries where the knob stands and `fader_to_gain` turns
+                    // it into amplitude over a decibel curve, so the two are
+                    // only equal at the ends. Handing the gain over as the
+                    // knob's position sent one press of the up arrow from
+                    // -6 dB to -20.4 — it moved, which is exactly why a test
+                    // that only asked "did anything change" would have passed.
+                    up(crate::recorder::gain_to_fader(view.gains.master)),
                 ),
                 Hit::SetFx(fx, _) => Node::slider(
                     id(fx.title()),
@@ -2134,6 +2147,9 @@ fn name_for(
                     0.0,
                     1.0,
                     fx_value(fx),
+                    // Raw, unlike the master: `Hit::SetFx` carries the mix
+                    // itself, which `apply_recorder_hit` stores as-is.
+                    up(view.fx.get(fx)),
                 ),
                 Hit::SetTempo(_) => Node::slider(
                     id("tempo"),
@@ -2143,6 +2159,10 @@ fn name_for(
                     f64::from(MIN_BPM),
                     f64::from(MAX_BPM),
                     format!("{:.0} BPM", view.tempo_bpm),
+                    // NOT the tempo over its range: the knob's sweep is
+                    // mapped through `knob_to_tempo`, so the fraction the
+                    // pointer means is `tempo_to_knob` and nothing simpler.
+                    up(tempo_to_knob(view.tempo_bpm)),
                 ),
                 _ => return None,
             }
