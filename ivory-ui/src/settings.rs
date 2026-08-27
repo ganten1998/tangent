@@ -1062,6 +1062,10 @@ pub struct Settings {
     pub arr_snap: bool,
     /// The grid, in bars as a power of two: 3 = 8 bars … 0 = 1 … -5 = 1/32.
     pub arr_grid_exp: i64,
+    /// The tempo lane is showing above the tracks. OFF out of the box: a
+    /// song at one tempo has nothing to put in it, and the row would cost a
+    /// track's worth of height to say so.
+    pub arr_tempo_lane: bool,
     /// The arrangement header column's width in points; 0 = automatic.
     pub arr_header_w: f64,
     /// How many channels the MIXER shows at once, and how many LANES the
@@ -1450,6 +1454,7 @@ impl Default for Settings {
             track_path: String::new(),
             project_path: String::new(),
             arr_snap: true,
+            arr_tempo_lane: false,
             // 1/4 out of the box, both grids — the owner's default.
             arr_grid_exp: -2,
             arr_header_w: 0.0,
@@ -2501,6 +2506,7 @@ impl Settings {
             s.project_path = path;
         }
         take_bool(&mut map, "arr_snap", &mut s.arr_snap);
+        take_bool(&mut map, "arr_tempo_lane", &mut s.arr_tempo_lane);
         if let Some(n) = map.shift_remove("arr_grid_exp").and_then(|v| v.as_i64()) {
             s.arr_grid_exp = n.clamp(-5, 3);
         }
@@ -3492,6 +3498,9 @@ impl Settings {
                 }
             }
         }
+        if self.arr_tempo_lane {
+            map.insert("arr_tempo_lane".into(), Value::Bool(true));
+        }
         if self.lufs_window != crate::recorder::LoudnessWindow::default() {
             map.insert(
                 "lufs_window".into(),
@@ -3789,6 +3798,7 @@ impl Settings {
         self.custom_staff_set = fresh.custom_staff_set.clone();
         self.guitar_intervals = fresh.guitar_intervals;
         self.arr_snap = fresh.arr_snap;
+        self.arr_tempo_lane = fresh.arr_tempo_lane;
         self.arr_grid_exp = fresh.arr_grid_exp;
         self.midi_snap = fresh.midi_snap;
         self.midi_grid_exp = fresh.midi_grid_exp;

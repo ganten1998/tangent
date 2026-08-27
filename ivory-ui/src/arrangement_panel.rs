@@ -133,6 +133,11 @@ pub struct ArrangeView<'a> {
     pub pending: Option<(usize, f64, f64)>,
     /// The tempo and meter map get a lane of their own, above the tracks.
     pub show_tempo_lane: bool,
+    /// Which tempo point a hand is on, if any. Drawn a size larger, exactly
+    /// as an automation point under the pointer is.
+    pub tempo_hot: Option<usize>,
+    /// A signature chip being typed into, and what is in the field so far.
+    pub meter_edit: Option<(u32, &'a str)>,
     /// The zoom window, in seconds of song.
     pub view_start_s: f64,
     pub view_len_s: f64,
@@ -140,10 +145,22 @@ pub struct ArrangeView<'a> {
     /// box's outer rectangle, and never shorter than the window.
     pub song_s: f64,
     pub playhead_s: f64,
-    /// The ruler's grid: bars from the band's own tempo and signature.
-    pub bpm: f64,
-    pub sig_top: u32,
-    pub sig_bottom: u32,
+    /// The ruler's grid, and everything else that has to know where a bar
+    /// is: the song's tempo and its meter, as MAPS.
+    ///
+    /// **Not a bpm and a signature.** They were, and the grid drawn from
+    /// them was a ruler of evenly spaced bars laid over a song whose bars
+    /// are not evenly spaced the moment anybody puts a tempo change in
+    /// it — every line in the wrong place, every clip apparently off the
+    /// grid, and snapping (which already went through the maps) landing
+    /// somewhere the grid did not draw.
+    ///
+    /// Owned rather than borrowed because the app builds them per frame out
+    /// of the document and the export override; a handful of points cloned
+    /// sixty times a second is nothing, and a borrow would mean the caller
+    /// keeping a temporary alive across the whole draw.
+    pub tempo: crate::tempo::TempoMap,
+    pub meter: crate::tempo::MeterMap,
     pub dark_mode: bool,
     /// The header column's width in points, when somebody has dragged the
     /// grip. `None` is the automatic share.
@@ -213,9 +230,25 @@ pub enum Hit {
     AutoParamPick(usize),
     /// The header's fold arrow: show or hide this lane's automation.
     AutoFold(usize),
+    /// A point on the tempo curve, by index. Grabbed to drag.
+    TempoPoint(usize),
+    /// Empty room on the tempo lane: `(seconds, bpm)`. A press MAKES a
+    /// point, the same gesture an automation lane has.
+    TempoLane(f64, f64),
+    /// The tempo lane's own header: show the song's tempo map, or a button
+    /// to put the whole thing back to one tempo.
+    TempoHeader,
+    /// A time-signature chip on the ruler, by the bar it starts at. A press
+    /// opens it for editing.
+    MeterChip(u32),
+    /// The ruler's chip strip, where there is no chip: `bar`. A press adds a
+    /// signature change at that bar.
+    MeterStrip(u32),
     ToolMetronome,
     /// The toolbar: the magnet.
     ToolSnap,
+    /// The toolbar: show or hide the tempo lane.
+    ToolTempoLane,
     /// The toolbar's grid box. A press steps FINER; the wheel over it is
     /// the real control, handled by the app from this same rectangle.
     ToolGrid,
@@ -307,10 +340,19 @@ pub struct Row {
 pub struct Layout {
     pub header: Rect,
     pub ruler: Rect,
+    /// The top sliver of the ruler, where the time-signature chips sit.
+    ///
+    /// Carved OUT of the ruler rather than added above it: the ruler already
+    /// has a bar-number row and a clock row, and a third band would push the
+    /// lanes down to say something that belongs beside the bar numbers. The
+    /// chips take the top third, where nothing was drawn.
+    pub meter_strip: Rect,
     /// The corner cell's toolbar: metronome, magnet, grid box.
     pub tool_met: Rect,
     pub tool_snap: Rect,
     pub tool_grid: Rect,
+    /// The tempo lane's switch: the row above the tracks, on and off.
+    pub tool_tempo: Rect,
     /// The little navigator: outer = the whole song, inner = the window.
     /// Drag it to scroll; drag UP to zoom in at the same time.
     pub tool_nav: Rect,
@@ -396,9 +438,11 @@ impl Layout {
             return Self {
                 header: Rect::NOTHING,
                 ruler: Rect::NOTHING,
+                meter_strip: Rect::NOTHING,
                 tool_met: Rect::NOTHING,
                 tool_snap: Rect::NOTHING,
                 tool_grid: Rect::NOTHING,
+                tool_tempo: Rect::NOTHING,
                 tool_nav: Rect::NOTHING,
                 lanes_area: Rect::NOTHING,
                 grip: Rect::NOTHING,
@@ -435,6 +479,15 @@ impl Layout {
             Pos2::new(field_x, rect.top()),
             Pos2::new(rect.right(), rect.top() + ruler_h),
         );
+        // Only when there is a change to show: on a song in one signature —
+        // which is nearly all of them — the strip is nothing and the bar
+        // numbers keep the whole ruler.
+        let meter_strip = if view.meter.is_constant() {
+            Rect::NOTHING
+        } else {
+            let h = (ruler_h * 0.34).clamp(8.0, 13.0).min(ruler_h * 0.5);
+            Rect::from_min_max(ruler.min, Pos2::new(ruler.right(), ruler.top() + h))
+        };
         let lanes_area = Rect::from_min_max(
             Pos2::new(field_x, rect.top() + ruler_h),
             rect.max,
@@ -515,8 +568,9 @@ impl Layout {
             Self::header_row(row, lane.used)
         });
         // **The toolbar, in the corner cell** — the room above the track
-        // list, before the ruler's first tick. Three small controls: the
-        // click, the magnet, and the grid box the wheel turns.
+        // list, before the ruler's first tick. Four small controls: the
+        // click, the magnet, the tempo lane's switch, and the grid box the
+        // wheel turns.
         let corner = Rect::from_min_max(
             rect.min,
             Pos2::new(rect.left() + header_w, rect.top() + ruler_h),
@@ -529,11 +583,11 @@ impl Layout {
                 Vec2::splat(side),
             )
         };
-        let (tool_met, tool_snap) = (cell(0.0), cell(1.0));
+        let (tool_met, tool_snap, tool_tempo) = (cell(0.0), cell(1.0), cell(2.0));
         let tool_grid = Rect::from_min_max(
-            Pos2::new(tool_snap.right() + 3.0, corner.top()),
+            Pos2::new(tool_tempo.right() + 3.0, corner.top()),
             Pos2::new(
-                (tool_snap.right() + 3.0 + side * 2.4).min(corner.right()),
+                (tool_tempo.right() + 3.0 + side * 2.4).min(corner.right()),
                 corner.bottom(),
             ),
         );
@@ -551,11 +605,13 @@ impl Layout {
             Rect::NOTHING
         };
         Self {
+            meter_strip,
             header,
             ruler,
             tool_met,
             tool_snap,
             tool_grid,
+            tool_tempo,
             tool_nav,
             lanes_area,
             grip: Rect::from_min_max(
@@ -820,6 +876,47 @@ fn auto_band(row: Rect) -> Option<(f32, f32)> {
 /// How big a point's handle is drawn, and the reach of a press for one.
 pub const AUTO_POINT_R: f32 = 4.0;
 
+// ── the tempo lane ──────────────────────────────────────────────────────────
+
+/// The BPM range the tempo lane draws across.
+///
+/// **Fixed rather than fitted to the song.** A lane whose scale moved with
+/// its contents would redraw every point every time one of them changed, and
+/// a 4 bpm nudge would look like a cliff. These are the ends of the band's
+/// own tempo dial, so a point at the top of the lane is a tempo the rest of
+/// the app agrees exists.
+pub const TEMPO_LANE_BPM: (f64, f64) = (20.0, 300.0);
+
+/// Where a bpm sits in the tempo row. The lane's `auto_y_of`.
+pub fn tempo_y_of(row: Rect, bpm: f64) -> f32 {
+    let Some((top, bottom)) = auto_band(row) else {
+        return 0.0;
+    };
+    let (lo, hi) = TEMPO_LANE_BPM;
+    // **Logarithmic**, because tempo is: the step from 60 to 70 is the same
+    // musical distance as 120 to 140, and a linear lane gives the top half
+    // of the travel to tempos nobody writes.
+    let t = if bpm.is_finite() && bpm > 0.0 {
+        ((bpm.clamp(lo, hi) / lo).ln() / (hi / lo).ln()) as f32
+    } else {
+        0.0
+    };
+    bottom - (bottom - top) * t.clamp(0.0, 1.0)
+}
+
+/// The bpm a `y` in the tempo row means. [`tempo_y_of`]'s inverse.
+pub fn tempo_bpm_at(row: Rect, y: f32) -> f64 {
+    let Some((top, bottom)) = auto_band(row) else {
+        return TEMPO_LANE_BPM.0;
+    };
+    if !y.is_finite() || bottom <= top {
+        return TEMPO_LANE_BPM.0;
+    }
+    let (lo, hi) = TEMPO_LANE_BPM;
+    let t = f64::from(((bottom - y) / (bottom - top)).clamp(0.0, 1.0));
+    lo * (hi / lo).powf(t)
+}
+
 /// The x a song second draws at. `time_at`'s inverse.
 pub fn x_of(rect: Rect, view: &ArrangeView<'_>, t: f64) -> f32 {
     let l = Layout::new(rect, view);
@@ -923,6 +1020,7 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
         (l.tool_met, Hit::ToolMetronome),
         (l.tool_snap, Hit::ToolSnap),
         (l.tool_grid, Hit::ToolGrid),
+        (l.tool_tempo, Hit::ToolTempoLane),
         (l.tool_nav, Hit::ToolNav),
     ] {
         if r.is_positive() && r.contains(pos) {
@@ -956,6 +1054,70 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
         }
         if row.routing.is_positive() && row.routing.contains(pos) {
             return Some(Hit::HdrRouting(i));
+        }
+    }
+    // **The signature chips, before the ruler itself.** They sit ON the
+    // ruler and a press on one must not also locate — the same pre-pass rule
+    // the band's timeline × follows.
+    if l.meter_strip.is_positive() && l.meter_strip.contains(pos) {
+        let font_h = (l.meter_strip.height() * 0.78).clamp(6.0, 10.0);
+        for pt in view.meter.points() {
+            if pt.at_bar == 0 && view.meter.points().len() == 1 {
+                continue;
+            }
+            let x = x_of(rect, view, bar_at(view, pt.at_bar));
+            // The same width the chip is DRAWN at, including the field's
+            // caret: a target that disagreed with the paint by a character
+            // would be a chip you cannot press once you have opened it.
+            let text = match view.meter_edit.filter(|(b, _)| *b == pt.at_bar) {
+                Some((_, t)) => format!("{t}|"),
+                None => format!("{}/{}", pt.sig.beats, pt.sig.unit),
+            };
+            let w = (font_h * 0.62 * text.chars().count() as f32 + 6.0).max(font_h * 2.2);
+            if pos.x >= x && pos.x <= x + w {
+                return Some(Hit::MeterChip(pt.at_bar));
+            }
+        }
+        // Empty strip: the bar under the pointer, which is where a new
+        // signature would start. Snapped to a BAR by construction — a
+        // signature change part-way through a bar is not a thing.
+        return Some(Hit::MeterStrip(bar_of(view, time_at(rect, view, pos.x))));
+    }
+    // **The tempo lane**, on the same terms as an automation row: the
+    // handles overhang, so it is checked before the rows below it.
+    if let Some(row) = l.rows.iter().find(|r| r.kind == RowKind::Tempo) {
+        if row.header.is_positive() && row.header.contains(pos) {
+            return Some(Hit::TempoHeader);
+        }
+        if row.lane.is_positive() && pos.x.is_finite() && pos.y.is_finite() {
+            let grab = row.lane.expand(AUTO_POINT_R);
+            if grab.is_positive() && grab.contains(pos) {
+                let pts = view.tempo.points();
+                let near = pts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, q)| {
+                        let at = Pos2::new(
+                            x_of(rect, view, view.tempo.seconds_at_beat(q.at_beat)),
+                            tempo_y_of(row.lane, q.bpm),
+                        );
+                        (i, at.distance(pos))
+                    })
+                    .filter(|(_, d)| d.is_finite() && *d <= AUTO_POINT_R * 2.0)
+                    .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                if let Some((i, _)) = near {
+                    return Some(Hit::TempoPoint(i));
+                }
+                // Empty room that is really in the row — the automation
+                // lane's own rule, and for the same reason: a press a few
+                // pixels above lands visually in the ruler.
+                if row.lane.contains(pos) {
+                    return Some(Hit::TempoLane(
+                        time_at(rect, view, pos.x),
+                        tempo_bpm_at(row.lane, pos.y),
+                    ));
+                }
+            }
         }
     }
     // **The automation rows, before the clips.** They are their own rows, so
@@ -1320,12 +1482,39 @@ pub fn grid_label(exp: i8) -> String {
     }
 }
 
-/// Seconds per bar, from the band's own tempo and signature.
-fn bar_s(view: &ArrangeView<'_>) -> f64 {
-    let bpm = view.bpm.clamp(20.0, 400.0);
-    let top = view.sig_top.clamp(1, 32) as f64;
-    let bottom = view.sig_bottom.clamp(1, 32) as f64;
-    top * (60.0 / bpm) * (4.0 / bottom)
+/// Where a bar LINE falls, in seconds. Bars count from zero here and from
+/// one on the ruler, the way musicians write them.
+fn bar_at(view: &ArrangeView<'_>, bar: u32) -> f64 {
+    view.tempo.seconds_at_beat(view.meter.quarter_at_bar(bar))
+}
+
+/// Which bar a moment falls in.
+fn bar_of(view: &ArrangeView<'_>, seconds: f64) -> u32 {
+    view.meter
+        .bar_beat_at_quarter(view.tempo.beat_at_seconds(seconds.max(0.0)))
+        .0
+}
+
+/// How many bars to skip between drawn lines, so the numbers stay a hand
+/// apart.
+///
+/// **Measured over the whole window rather than off one bar**, because with
+/// a tempo change in view the bars are not the same width: a step chosen
+/// from the first bar of a ritardando would put four lines in the last inch
+/// and none in the first foot. The count of bars actually in the window is
+/// the honest average, and the labels that would still collide are dropped
+/// individually where they are drawn.
+fn bar_step(view: &ArrangeView<'_>, width: f32) -> u32 {
+    let first = bar_of(view, view.view_start_s);
+    let last = bar_of(view, view.view_start_s + view.view_len_s);
+    let bars = last.saturating_sub(first).max(1);
+    let px = f64::from(width) / f64::from(bars);
+    let mut step = 1u32;
+    // 1 << 20 bars is an hour of 4/4 at 120: past that the ruler is a line.
+    while px * f64::from(step) < 64.0 && step < (1 << 20) {
+        step *= 2;
+    }
+    step
 }
 
 /// Paint the whole view into `rect`.
@@ -1357,23 +1546,39 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     }
 
     // ── the grid: bar lines through the lanes, numbers on the ruler ───────
-    let bar = bar_s(view);
-    let px_per_s = f64::from(l.lanes_area.width()) / view.view_len_s.max(1e-9);
-    // The step that keeps labels a hand apart: 1, 2, 4, 8... bars.
-    let mut step = 1u64;
-    while (bar * step as f64) * px_per_s < 64.0 && step < 1 << 20 {
-        step *= 2;
-    }
+    //
+    // **Walked in BARS, not stepped in seconds.** A bar is a fixed number of
+    // seconds only while the tempo is; the moment a song has a change in it,
+    // a ruler laid out by multiplying one bar's length puts every line after
+    // the change in the wrong place — and the SNAP, which has gone through
+    // the maps all along, then lands where the grid is not drawn. See
+    // `bar_at`.
     painter.rect_filled(l.ruler, 0.0, p.ruler);
-    let first = (view.view_start_s / (bar * step as f64)).floor().max(0.0) as u64;
-    let last = ((view.view_start_s + view.view_len_s) / (bar * step as f64)).ceil() as u64;
+    let step = bar_step(view, l.lanes_area.width());
+    let first = (bar_of(view, view.view_start_s) / step) * step;
+    let last = bar_of(view, view.view_start_s + view.view_len_s).saturating_add(step);
     let font = FontId::new((l.ruler.height() * 0.55).clamp(8.0, 12.0), crate::fonts::courier());
-    for n in first..=last {
-        let t = n as f64 * bar * step as f64;
-        let x = x_of(rect, view, t);
-        if x < l.lanes_area.left() - 0.5 || x > l.lanes_area.right() + 0.5 {
-            continue;
+    // **Bounded.** The step is chosen so this is a few dozen iterations, and
+    // the bound is here because a hand-edited map with a one-beat bar in it
+    // could otherwise ask the UI thread for millions.
+    let mut bars: Vec<(u32, f32)> = Vec::new();
+    let mut n = first;
+    while n <= last && bars.len() < 512 {
+        let x = x_of(rect, view, bar_at(view, n));
+        if x >= l.lanes_area.left() - 0.5 && x <= l.lanes_area.right() + 0.5 {
+            bars.push((n, x));
         }
+        n = n.saturating_add(step);
+        if n == u32::MAX {
+            break;
+        }
+    }
+    // The numbers, with any that would land on top of the last one dropped —
+    // which a ritardando makes routine, because its bars get wider as they go
+    // and its step was chosen from the average.
+    let mut last_label = f32::NEG_INFINITY;
+    let room = font.size * 2.4;
+    for &(n, x) in &bars {
         painter.line_segment(
             [
                 Pos2::new(x, l.ruler.bottom() - 4.0),
@@ -1381,11 +1586,21 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             ],
             Stroke::new(1.0, p.faint),
         );
+        if x - last_label < room {
+            continue;
+        }
+        last_label = x;
         // Bars count from ONE, the way musicians do.
+        //
+        // **Under the chip strip when there is one.** The strip is carved
+        // out of the ruler's top, so a number drawn at the ruler's top edge
+        // would be printed behind the signature chips — which is a bar
+        // number you cannot read on exactly the songs that have the most to
+        // say about their bars.
         painter.text(
-            Pos2::new(x + 3.0, l.ruler.top() + 1.0),
+            Pos2::new(x + 3.0, l.ruler.top() + 1.0 + l.meter_strip.height().max(0.0)),
             Align2::LEFT_TOP,
-            format!("{}", n * step + 1),
+            format!("{}", n.saturating_add(1)),
             font.clone(),
             p.faint,
         );
@@ -1404,7 +1619,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         let want = steps
             .iter()
             .copied()
-            .find(|st| st * px_per_s >= 70.0)
+            .find(|st| st * (f64::from(l.lanes_area.width()) / view.view_len_s.max(1e-9)) >= 70.0)
             .unwrap_or(3600.0);
         let mut n = (view.view_start_s / want).floor().max(0.0);
         while n * want <= view.view_start_s + view.view_len_s {
@@ -1435,14 +1650,9 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     // line while bars are wide enough to tell apart, and the gridbox's own
     // subdivision draws between them, fainter but VISIBLE.
     {
-        let g = bar * 2.0f64.powi(i32::from(view.grid_exp.clamp(-6, 6)));
-        let bar_px = bar * px_per_s;
-        let grid_px = g * px_per_s;
-        let t1 = view.view_start_s + view.view_len_s;
         // `w` < 1 DARKENS: the strong line (the snap grid) is the darker
         // one on this grey field, the reference shot's own look.
-        let line = |t: f64, w: f32| {
-            let x = x_of(rect, view, t);
+        let line = |x: f32, w: f32| {
             if x >= l.lanes_area.left() - 0.5 && x <= l.lanes_area.right() + 0.5 {
                 painter.line_segment(
                     [
@@ -1459,50 +1669,63 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 );
             }
         };
-        if g >= bar - 1.0e-9 {
-            // **A multi-bar grid draws COARSER, visibly** — the owner
-            // turned the box to "4" and saw no change, because every bar
-            // drew at full weight whatever the grid said. The grid step
-            // gets the strong line; the bars inside it drop to the faint
-            // weight the subdivisions use.
-            if grid_px >= 5.0 {
-                let mut n = (view.view_start_s / g).floor().max(0.0);
-                while n * g <= t1 {
-                    line(n * g, 1.0);
-                    n += 1.0;
-                }
+        // **Walked bar by bar, and the subdivisions live INSIDE their own
+        // bar.** The grid used to be a fixed number of seconds stepped from
+        // zero, which is two separate wrongs the moment a song has changes
+        // in it: after a tempo change every line is in the wrong place, and
+        // in a 3/4 bar a quarter-note grid drew four lines where there are
+        // three beats. A bar's subdivisions are that bar's own length
+        // divided, so 6/8 gets six and 4/4 gets four.
+        let exp = i32::from(view.grid_exp.clamp(-6, 6));
+        let t1 = view.view_start_s + view.view_len_s;
+        let first = bar_of(view, view.view_start_s);
+        let mut n = first;
+        // Bounded for the reason the ruler's walk is: a hand-edited meter
+        // with a one-beat bar in it must not ask the UI thread for millions.
+        let mut drawn = 0usize;
+        while drawn < 4_096 {
+            let q0 = view.meter.quarter_at_bar(n);
+            let qn = view.meter.quarters_in_bar(n).max(1.0e-6);
+            let t0 = view.tempo.seconds_at_beat(q0);
+            if t0 > t1 {
+                break;
             }
-            if g > bar + 1.0e-9 && bar_px >= 5.0 {
-                let mut n = (view.view_start_s / bar).floor().max(0.0);
-                while n * bar <= t1 {
-                    let t = n * bar;
-                    let on_grid = (t / g - (t / g).round()).abs() < 1.0e-6;
-                    if !on_grid {
-                        line(t, 0.55);
+            let x0 = x_of(rect, view, t0);
+            let x1 = x_of(rect, view, view.tempo.seconds_at_beat(q0 + qn));
+            let bar_px = f64::from(x1 - x0);
+            if exp >= 0 {
+                // **A multi-bar grid draws COARSER, visibly** — the owner
+                // turned the box to "4" and saw no change, because every bar
+                // drew at full weight whatever the grid said. The grid step
+                // gets the strong line; the bars inside it drop to the faint
+                // weight the subdivisions use.
+                let every = 1u32 << exp.min(20);
+                let strong = n % every == 0;
+                if strong || bar_px >= 5.0 {
+                    line(x0, if strong { 1.0 } else { 0.55 });
+                    drawn += 1;
+                }
+            } else {
+                if bar_px >= 5.0 {
+                    line(x0, 1.0);
+                    drawn += 1;
+                }
+                let div = 1u32 << (-exp).min(20);
+                if bar_px / f64::from(div) >= 5.0 {
+                    let step_q = qn / f64::from(div);
+                    for k in 1..div {
+                        let t = view.tempo.seconds_at_beat(q0 + f64::from(k) * step_q);
+                        line(x_of(rect, view, t), 0.55);
+                        drawn += 1;
                     }
-                    n += 1.0;
                 }
             }
-        } else {
-            // A sub-bar grid: bars strong, subdivisions between them
-            // fainter but visible — the rule since the owner asked for it.
-            if bar_px >= 5.0 {
-                let mut n = (view.view_start_s / bar).floor().max(0.0);
-                while n * bar <= t1 {
-                    line(n * bar, 1.0);
-                    n += 1.0;
-                }
-            }
-            if grid_px >= 5.0 {
-                let mut n = (view.view_start_s / g).floor().max(0.0);
-                while n * g <= t1 {
-                    let t = n * g;
-                    let on_bar = (t / bar - (t / bar).round()).abs() < 1.0e-6;
-                    if !on_bar {
-                        line(t, 0.55);
-                    }
-                    n += 1.0;
-                }
+            // A bar too narrow to draw is a view too wide to walk one bar at
+            // a time: skip ahead by whatever the ruler settled on rather
+            // than stepping through ten thousand of them.
+            n = n.saturating_add(if bar_px >= 5.0 { 1 } else { step.max(1) });
+            if n == u32::MAX {
+                break;
             }
         }
     }
@@ -1650,6 +1873,164 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             // A ring in the ground's own colour, so two points close
             // together read as two rather than as a blob.
             painter.circle_stroke(at, AUTO_POINT_R, Stroke::new(1.0, ground));
+        }
+    }
+
+    // ── the tempo lane ────────────────────────────────────────────────────
+    //
+    // The song's own speed, drawn where a curve belongs: a line across a
+    // row, with a handle at every point. Two things make it not an
+    // automation lane — the scale is LOGARITHMIC in bpm (see `tempo_y_of`),
+    // and a segment is either a step or a RAMP, which is the difference
+    // between "and now it is slower" and a ritardando.
+    if let Some(row) = l.rows.iter().find(|r| r.kind == RowKind::Tempo) {
+        if row.lane.is_positive() {
+            let ground = p.lane;
+            painter.rect_filled(row.lane, 0.0, shade(ground, 0.94));
+            let mut curve = p.playhead;
+            for _ in 0..8 {
+                if crate::recorder_panel::contrast_ratio(curve, ground) >= 2.2 {
+                    break;
+                }
+                curve = shade(curve, 1.25);
+            }
+            let pts = view.tempo.points();
+            // The polyline, in seconds. A HOLD steps across to the next
+            // point's x at the old height; a RAMP goes straight there.
+            let mut line: Vec<Pos2> = Vec::with_capacity(pts.len() * 2 + 2);
+            if let Some(first) = pts.first() {
+                line.push(Pos2::new(row.lane.left(), tempo_y_of(row.lane, first.bpm)));
+            }
+            for (i, q) in pts.iter().enumerate() {
+                let x = x_of(rect, view, view.tempo.seconds_at_beat(q.at_beat));
+                let at = Pos2::new(x, tempo_y_of(row.lane, q.bpm));
+                line.push(at);
+                if let Some(next) = pts.get(i + 1) {
+                    let nx = x_of(rect, view, view.tempo.seconds_at_beat(next.at_beat));
+                    // **The RAMP belongs to the point it slides FROM**, which
+                    // is `TempoPoint::ramp`'s own words and what
+                    // `bpm_at_beat` reads: a ramp on point *i* interpolates
+                    // across the span to *i+1*. So the segment leaving this
+                    // point is a slope when THIS point says so, and a step
+                    // held at this point's height when it does not.
+                    if !q.ramp {
+                        line.push(Pos2::new(nx, at.y));
+                    }
+                }
+            }
+            if let Some(last) = pts.last() {
+                line.push(Pos2::new(row.lane.right(), tempo_y_of(row.lane, last.bpm)));
+            }
+            for pair in line.windows(2) {
+                let (a, b) = (pair[0], pair[1]);
+                if !a.x.is_finite() || !b.x.is_finite() || !a.y.is_finite() || !b.y.is_finite() {
+                    continue;
+                }
+                if a.x.max(b.x) < row.lane.left() || a.x.min(b.x) > row.lane.right() {
+                    continue;
+                }
+                painter.line_segment([a, b], Stroke::new(1.5, curve));
+            }
+            let font = FontId::new(
+                (row.lane.height() * 0.34).clamp(7.0, 11.0),
+                crate::fonts::courier(),
+            );
+            for (i, q) in pts.iter().enumerate() {
+                let x = x_of(rect, view, view.tempo.seconds_at_beat(q.at_beat));
+                let at = Pos2::new(x, tempo_y_of(row.lane, q.bpm));
+                if !at.x.is_finite() || !at.y.is_finite() {
+                    continue;
+                }
+                if at.x < row.lane.left() - AUTO_POINT_R || at.x > row.lane.right() + AUTO_POINT_R {
+                    continue;
+                }
+                let hot = view.tempo_hot == Some(i);
+                painter.circle_filled(at, if hot { AUTO_POINT_R + 1.0 } else { AUTO_POINT_R }, curve);
+                painter.circle_stroke(at, AUTO_POINT_R, Stroke::new(1.0, ground));
+                // The number beside the handle, so a lane read at a glance
+                // says what it is and not merely that something happens.
+                if font.size >= 7.0 && (hot || pts.len() <= 24) {
+                    painter.text(
+                        Pos2::new(at.x + AUTO_POINT_R + 2.0, at.y),
+                        Align2::LEFT_CENTER,
+                        format!("{:.0}", q.bpm),
+                        font.clone(),
+                        p.faint,
+                    );
+                }
+            }
+        }
+        // The header: the word, and what the map is doing.
+        if row.header.is_positive() {
+            let font = FontId::new(
+                (row.header.height() * 0.42).clamp(7.0, 11.0),
+                crate::fonts::courier(),
+            );
+            painter.text(
+                Pos2::new(row.header.left() + 6.0, row.header.center().y),
+                Align2::LEFT_CENTER,
+                "TEMPO",
+                font.clone(),
+                p.engrave,
+            );
+            let says = if view.tempo.is_constant() {
+                format!("{:.0}", view.tempo.bpm_at_beat(0.0))
+            } else {
+                format!("{} pts", view.tempo.points().len())
+            };
+            painter.text(
+                Pos2::new(row.header.right() - 6.0, row.header.center().y),
+                Align2::RIGHT_CENTER,
+                says,
+                font,
+                p.faint,
+            );
+        }
+    }
+
+    // ── the time signatures, as chips along the ruler's own top ───────────
+    //
+    // On the ruler and not in a lane of their own: a signature change is a
+    // property of a BAR, the ruler is what counts bars, and a second row of
+    // song-wide markers would take height from the tracks to say something
+    // the bar numbers are already sitting next to.
+    if l.meter_strip.is_positive() {
+        let font = FontId::new(
+            (l.meter_strip.height() * 0.78).clamp(6.0, 10.0),
+            crate::fonts::courier(),
+        );
+        for pt in view.meter.points() {
+            // Bar 0's signature is the song's, not a CHANGE — there is
+            // nothing before it for it to be different from, and a chip on
+            // the first bar of every song would be noise on the overwhelming
+            // majority that never change.
+            if pt.at_bar == 0 && view.meter.points().len() == 1 {
+                continue;
+            }
+            let x = x_of(rect, view, bar_at(view, pt.at_bar));
+            if x < l.meter_strip.left() - 2.0 || x > l.meter_strip.right() + 2.0 {
+                continue;
+            }
+            let typing = view.meter_edit.filter(|(b, _)| *b == pt.at_bar);
+            let text = match typing {
+                Some((_, t)) => format!("{t}|"),
+                None => format!("{}/{}", pt.sig.beats, pt.sig.unit),
+            };
+            // A minimum width, so a chip emptied down to its caret is still
+            // a rectangle somebody can see and aim at.
+            let w = (font.size * 0.62 * text.chars().count() as f32 + 6.0).max(font.size * 2.2);
+            let chip = Rect::from_min_size(
+                Pos2::new(x, l.meter_strip.top()),
+                Vec2::new(w, l.meter_strip.height()),
+            );
+            painter.rect_filled(chip, 2.0, if typing.is_some() { p.select } else { p.face });
+            painter.text(
+                chip.center(),
+                Align2::CENTER_CENTER,
+                &text,
+                font.clone(),
+                p.engrave,
+            );
         }
     }
 
@@ -2227,7 +2608,8 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     }
 
     // The corner cell over the header, where the ruler has no numbers —
-    // and the TOOLBAR standing in it: the click, the magnet, the grid.
+    // and the TOOLBAR standing in it: the click, the magnet, the tempo
+    // lane's switch, the grid.
     painter.rect_filled(
         Rect::from_min_max(rect.min, Pos2::new(l.header.right(), l.ruler.bottom())),
         0.0,
@@ -2247,6 +2629,26 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             if view.metronome_on { p.engrave } else { p.hdr_face.gamma_multiply(0.7) },
             if view.metronome_on { p.hdr_face } else { p.hdr_lane },
         );
+    }
+    // The tempo lane's switch: a small line that steps, which is what the
+    // lane draws. A metronome would be the click's own sign twice over.
+    if tool(painter, l.tool_tempo, view.show_tempo_lane) {
+        let m = l.tool_tempo.shrink(3.5);
+        let ink = if view.show_tempo_lane {
+            p.engrave
+        } else {
+            p.hdr_face.gamma_multiply(0.7)
+        };
+        let w = (m.width() * 0.14).clamp(1.2, 2.2);
+        let (lo, hi) = (m.bottom() - m.height() * 0.18, m.top() + m.height() * 0.18);
+        let mid = m.left() + m.width() * 0.5;
+        for pair in [
+            [Pos2::new(m.left(), lo), Pos2::new(mid, lo)],
+            [Pos2::new(mid, lo), Pos2::new(mid, hi)],
+            [Pos2::new(mid, hi), Pos2::new(m.right(), hi)],
+        ] {
+            painter.line_segment(pair, Stroke::new(w, ink));
+        }
     }
     if tool(painter, l.tool_snap, view.snap_on) {
         // The magnet: a U with its two poles, the sign every DAW uses.
@@ -2447,6 +2849,8 @@ LaneView {
     fn a_view<'a>(clips: &'a [ClipView<'a>]) -> ArrangeView<'a> {
 ArrangeView {
             show_tempo_lane: false,
+            tempo_hot: None,
+            meter_edit: None,
             fx_strip: (0xE3, 0xD9, 0xBD),
             meter_bg: (0x0B, 0x0E, 0x0A),
             header_w: None,
@@ -2467,9 +2871,11 @@ ArrangeView {
             view_len_s: 120.0,
             song_s: 120.0,
             playhead_s: 15.0,
-            bpm: 120.0,
-            sig_top: 4,
-            sig_bottom: 4,
+            tempo: crate::tempo::TempoMap::constant(120.0),
+            meter: crate::tempo::MeterMap::constant(crate::recorder::TimeSignature {
+                beats: 4,
+                unit: 4,
+            }),
             dark_mode: true,
             wood: (0x4A, 0x3B, 0x2C),
         }
@@ -2763,6 +3169,106 @@ ArrangeView {
             auto_y_of(thin, 1.0) <= auto_y_of(thin, 0.0),
             "a thin row runs backwards"
         );
+    }
+
+    /// The tempo lane's scale is monotonic, logarithmic, and reversible.
+    #[test]
+    fn the_tempo_lane_reads_both_ways() {
+        let row = Rect::from_min_max(Pos2::new(0.0, 100.0), Pos2::new(400.0, 160.0));
+        let (lo, hi) = TEMPO_LANE_BPM;
+        assert!(tempo_y_of(row, hi) < tempo_y_of(row, lo), "faster is not up");
+        for bpm in [lo, 60.0, 90.0, 120.0, 174.0, hi] {
+            let back = tempo_bpm_at(row, tempo_y_of(row, bpm));
+            assert!(
+                (back - bpm).abs() / bpm < 0.01,
+                "{bpm} came back as {back}"
+            );
+        }
+        // **Logarithmic**: the middle of the travel is the GEOMETRIC mean of
+        // the ends, not their average. A linear lane would put the whole
+        // useful range of tempos in its bottom third.
+        let mid = tempo_bpm_at(row, (tempo_y_of(row, lo) + tempo_y_of(row, hi)) * 0.5);
+        assert!(
+            (mid - (lo * hi).sqrt()).abs() < 1.0,
+            "halfway up the lane is {mid}, not {}",
+            (lo * hi).sqrt()
+        );
+        // Out of range clamps rather than running off the row.
+        assert!(tempo_y_of(row, 1.0) <= row.bottom());
+        assert!(tempo_y_of(row, 10_000.0) >= row.top());
+        assert!(tempo_y_of(row, f64::NAN).is_finite());
+        assert!(tempo_bpm_at(row, f32::NAN).is_finite());
+        // A degenerate row answers a number rather than a NaN — the guard
+        // `auto_band` exists for.
+        assert!(tempo_y_of(Rect::NOTHING, 120.0).is_finite());
+        assert!(tempo_bpm_at(Rect::NOTHING, 10.0).is_finite());
+    }
+
+    /// **The tempo lane and the signature chips draw at every zoom**, with a
+    /// map in them, without asking the painter for a coordinate it cannot
+    /// use — and a press anywhere answers something sane.
+    ///
+    /// The ruler now WALKS bars rather than stepping seconds, so a
+    /// pathological map is a loop bound rather than an arithmetic slip: this
+    /// is what says a one-beat bar at a ten-million-second zoom finishes.
+    #[test]
+    fn the_tempo_lane_paints_at_every_size_and_zoom() {
+        use crate::recorder::TimeSignature;
+        use crate::tempo::{MeterMap, MeterPoint, TempoMap, TempoPoint};
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        let tempo = TempoMap::sanitised(
+            (0..40)
+                .map(|i| TempoPoint {
+                    at_beat: f64::from(i) * 7.0,
+                    bpm: 40.0 + f64::from(i % 11) * 22.0,
+                    ramp: i % 3 == 0,
+                })
+                .collect(),
+        );
+        let meter = MeterMap::sanitised(vec![
+            MeterPoint { at_bar: 0, sig: TimeSignature { beats: 4, unit: 4 } },
+            MeterPoint { at_bar: 5, sig: TimeSignature { beats: 7, unit: 8 } },
+            // **A one-beat bar**, which is the shape that turns "walk the
+            // bars" into an unbounded loop if nothing bounds it.
+            MeterPoint { at_bar: 9, sig: TimeSignature { beats: 1, unit: 16 } },
+            MeterPoint { at_bar: 40, sig: TimeSignature { beats: 3, unit: 4 } },
+        ]);
+        for size in [
+            Vec2::new(1300.0, 420.0),
+            Vec2::new(320.0, 120.0),
+            Vec2::new(60.0, 40.0),
+            Vec2::new(4000.0, 1400.0),
+        ] {
+            for (start, len) in [
+                (0.0_f64, 30.0_f64),
+                (0.0, 1e-4),
+                (0.0, 1e7),
+                (5_000.0, 10.0),
+            ] {
+                for exp in [-4i8, 0, 3] {
+                    let mut v = a_view(&[]);
+                    v.visible_lanes = 8;
+                    v.view_start_s = start;
+                    v.view_len_s = len;
+                    v.show_tempo_lane = true;
+                    v.grid_exp = exp;
+                    v.tempo = tempo.clone();
+                    v.meter = meter.clone();
+                    v.tempo_hot = Some(2);
+                    v.meter_edit = Some((5, "7/"));
+                    let r = Rect::from_min_size(Pos2::ZERO, size);
+                    ctx.run(Default::default(), |ctx| {
+                        egui::Area::new("tempo-probe".into()).show(ctx, |ui| {
+                            draw(ui.painter(), r, &v);
+                        });
+                    });
+                    for at in [r.center(), r.min, r.max, Pos2::new(r.right(), r.top())] {
+                        let _ = hit_test(r, &v, at);
+                    }
+                }
+            }
+        }
     }
 
     /// The curve draws at every zoom and every size, without panicking and
@@ -3214,6 +3720,7 @@ ArrangeView {
             (l.tool_met, Hit::ToolMetronome),
             (l.tool_snap, Hit::ToolSnap),
             (l.tool_grid, Hit::ToolGrid),
+        (l.tool_tempo, Hit::ToolTempoLane),
         ] {
             assert!(cell.is_positive(), "{want:?} has no room in the corner");
             assert_eq!(hit_test(r, &v, cell.center()), Some(want));

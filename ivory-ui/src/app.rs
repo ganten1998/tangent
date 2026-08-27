@@ -238,6 +238,10 @@ pub struct IvoryApp {
     arr_auto_params: std::collections::HashMap<usize, crate::automation::AutoParam>,
     /// The point under the pointer or being dragged: `(lane, index)`.
     arr_auto_hot: Option<(usize, usize)>,
+    /// The tempo point under the pointer, if any. Drawn a size larger.
+    arr_tempo_hot: Option<usize>,
+    /// The tempo point being dragged, if any.
+    arr_tempo_drag: Option<usize>,
     /// Each lane's automation mode. Absent is [`crate::automation::AutoMode`]'s
     /// default, Read. Session-only — see the type, where the reason is a
     /// safety one.
@@ -949,6 +953,10 @@ enum ArrDrag {
     /// neighbour re-sorts the curve and the old index would then name
     /// somebody else's point.
     AutoPoint(usize, usize),
+    /// A tempo point being carried, by index — re-derived after every move
+    /// for the reason above it: dragging one past its neighbour re-sorts the
+    /// map and the old index would name somebody else's point.
+    TempoPoint(usize),
     /// The right button's selection band over the lanes.
     ClipBand,
     /// A track being carried to another row, by its number.
@@ -1681,6 +1689,8 @@ impl IvoryApp {
             arr_auto_open: std::collections::HashSet::new(),
             arr_auto_params: std::collections::HashMap::new(),
             arr_auto_hot: None,
+            arr_tempo_hot: None,
+            arr_tempo_drag: None,
             arr_auto_modes: std::collections::HashMap::new(),
             arr_auto_latched: std::collections::HashSet::new(),
             arr_auto_last: std::collections::HashMap::new(),
@@ -3008,6 +3018,28 @@ impl IvoryApp {
             follow_tempo: false,
         });
         self.arrangement = arr;
+        // **A tempo map and a signature change, for the row to have
+        // something in it.** A lane drawn empty proves the layout and
+        // nothing else; the ritardando and the 6/8 are what say whether a
+        // ramp reads as a ramp and whether a chip collides with a bar
+        // number.
+        self.arrangement.tempo = crate::tempo::TempoMap::sanitised(vec![
+            crate::tempo::TempoPoint { at_beat: 0.0, bpm: 132.0, ramp: false },
+            crate::tempo::TempoPoint { at_beat: 32.0, bpm: 132.0, ramp: true },
+            crate::tempo::TempoPoint { at_beat: 48.0, bpm: 76.0, ramp: false },
+            crate::tempo::TempoPoint { at_beat: 80.0, bpm: 108.0, ramp: false },
+        ]);
+        self.arrangement.meter = crate::tempo::MeterMap::sanitised(vec![
+            crate::tempo::MeterPoint {
+                at_bar: 0,
+                sig: crate::recorder::TimeSignature { beats: 4, unit: 4 },
+            },
+            crate::tempo::MeterPoint {
+                at_bar: 12,
+                sig: crate::recorder::TimeSignature { beats: 6, unit: 8 },
+            },
+        ]);
+        self.settings.arr_tempo_lane = true;
         let wave = |n: usize, seed: f32| -> Vec<f32> {
             (0..n)
                 .map(|i| {
@@ -6476,23 +6508,59 @@ impl IvoryApp {
         if !self.settings.arr_snap {
             return t.max(0.0);
         }
-        let quarters = self.arr_grid_quarters();
-        if quarters <= 0.0 {
-            return t.max(0.0);
-        }
-        let map = self.live_tempo_map();
-        let at = map.beat_at_seconds(t.max(0.0));
-        map.seconds_at_beat((at / quarters).round() * quarters).max(0.0)
+        let tempo = self.live_tempo_map();
+        let meter = self.live_meter_map();
+        let q = tempo.beat_at_seconds(t.max(0.0));
+        let exp = self.settings.arr_grid_exp as i8;
+        tempo.seconds_at_beat(Self::snap_quarter(&meter, q, exp)).max(0.0)
     }
 
-    /// The grid's spacing in QUARTER NOTES — the unit the maps speak.
+    /// The nearest grid line to `q`, in quarters.
     ///
-    /// A bar of the signature, times the gridbox's power of two.
-    fn arr_grid_quarters(&self) -> f64 {
-        let sig = self.time_signature();
-        let bar = f64::from(sig.beats.max(1)) * (4.0 / f64::from(sig.unit.max(1)));
-        let exp = self.settings.arr_grid_exp.clamp(-5, 3) as i32;
-        bar * 2.0f64.powi(exp)
+    /// **Divides the BAR the position is in**, rather than stepping a fixed
+    /// number of quarters from zero — which is what
+    /// `arrangement_panel::draw` does, and the two have to be the same
+    /// arithmetic or the magnet lands where there is no line. Two ways they
+    /// used to disagree: after a 3/4 bar, a quarter-note grid stepped from
+    /// zero is a beat out for the rest of the song; and a multi-bar grid
+    /// stepped in seconds walks away from the bars entirely once a tempo
+    /// change is in front of it.
+    ///
+    /// A pure function of the map, the position and the gridbox, so the test
+    /// can drive it without an app.
+    pub fn snap_quarter(meter: &crate::tempo::MeterMap, q: f64, exp: i8) -> f64 {
+        if !q.is_finite() || q <= 0.0 {
+            return 0.0;
+        }
+        let exp = i32::from(exp.clamp(-6, 6));
+        let bar = meter.bar_beat_at_quarter(q).0;
+        if exp >= 0 {
+            // A multi-bar grid: the nearest of the two bar lines this
+            // position sits between. Both are asked of the map, because
+            // "every four bars" is four bars of whatever length they are.
+            let every = 1u32 << exp.min(20);
+            let lo_bar = (bar / every) * every;
+            let hi_bar = lo_bar.saturating_add(every);
+            let lo = meter.quarter_at_bar(lo_bar);
+            let hi = meter.quarter_at_bar(hi_bar);
+            // **A tie goes UP**, which is what `f64::round` does and what
+            // every other snap in this app therefore does. Landing a
+            // dead-centre drop on the earlier line instead is a half-bar
+            // jump backwards that only shows on exact midpoints — the
+            // hardest kind of inconsistency to notice and the most annoying
+            // to work with.
+            if (q - lo).abs() < (hi - q).abs() { lo } else { hi }
+        } else {
+            // A sub-bar grid: THIS bar, divided. Rounding to `div` lands on
+            // the next bar's downbeat, which is right and is why the clamp
+            // allows it.
+            let div = 1u32 << (-exp).min(20);
+            let q0 = meter.quarter_at_bar(bar);
+            let qn = meter.quarters_in_bar(bar).max(1.0e-9);
+            let step = qn / f64::from(div);
+            let k = ((q - q0) / step).round().clamp(0.0, f64::from(div));
+            q0 + k * step
+        }
     }
 
     /// Clamp a steered window into the song's neighbourhood and keep it.
@@ -6807,6 +6875,214 @@ impl IvoryApp {
             .put(Point { at_s, value: v.clamp(0.0, 1.0), shape });
         self.arr_save_edits();
         self.arr_auto_index(lane, at_s)
+    }
+
+    // ── the tempo lane ──────────────────────────────────────────────────
+    //
+    // The same three verbs an automation lane has — put, drag, remove — over
+    // the tempo map instead of a curve. What differs is the UNIT: the map is
+    // indexed in QUARTERS and the lane is drawn in seconds, so every one of
+    // these converts through the map itself. Converting through a bpm
+    // anywhere would be the bug the map exists to prevent.
+
+    /// Put a tempo point at `t` seconds, at `bpm`. Answers where it landed.
+    fn arr_put_tempo_point(&mut self, t: f64, bpm: f64) -> Option<usize> {
+        let map = self.live_tempo_map();
+        let at_beat = Self::snap_quarter(
+            &self.live_meter_map(),
+            map.beat_at_seconds(t.max(0.0)),
+            self.settings.arr_grid_exp as i8,
+        );
+        let mut pts = map.points().to_vec();
+        // **A point that lands on an existing one REPLACES it**, which is
+        // what `sanitised` does with duplicates anyway (it keeps the last)
+        // and is the only sane reading of dropping a point on top of one.
+        pts.push(crate::tempo::TempoPoint {
+            at_beat,
+            bpm: bpm.clamp(
+                crate::arrangement_panel::TEMPO_LANE_BPM.0,
+                crate::arrangement_panel::TEMPO_LANE_BPM.1,
+            ),
+            // A new point is a STEP. A ramp is a thing somebody asks for —
+            // right-click — because a map full of accidental ritardandos is
+            // much harder to hear the fault in than a map full of steps.
+            ramp: false,
+        });
+        self.arrangement.tempo = crate::tempo::TempoMap::sanitised(pts);
+        self.arr_save_edits();
+        self.arr_tempo_index(at_beat)
+    }
+
+    /// Where a point at `at_beat` sits in the map now. Re-derived for the
+    /// reason [`Self::arr_auto_index`] gives.
+    fn arr_tempo_index(&self, at_beat: f64) -> Option<usize> {
+        self.arrangement
+            .tempo
+            .points()
+            .iter()
+            .position(|q| (q.at_beat - at_beat).abs() < 1.0e-6)
+    }
+
+    /// Carry a tempo point to `t` seconds and `bpm`.
+    fn arr_drag_tempo_point(&mut self, index: usize, t: f64, bpm: f64) {
+        let map = self.live_tempo_map();
+        let Some(old) = map.points().get(index).copied() else {
+            return;
+        };
+        // **The FIRST point does not move in time.** A map has to say what
+        // the tempo is from the very start of the song; a first point at bar
+        // nine leaves the first eight bars with no tempo at all, and
+        // `sanitised` would have to invent one. Its bpm still drags, which
+        // is the useful half.
+        let at_beat = if index == 0 {
+            0.0
+        } else {
+            // **Converted through the map BEFORE it changes.** Reading the
+            // seconds of a drag against a map this same drag is about to
+            // rewrite is a point that runs away from the pointer.
+            Self::snap_quarter(
+                &self.live_meter_map(),
+                map.beat_at_seconds(t.max(0.0)),
+                self.settings.arr_grid_exp as i8,
+            )
+            .max(0.0)
+        };
+        let mut pts = map.points().to_vec();
+        if let Some(slot) = pts.get_mut(index) {
+            slot.at_beat = at_beat;
+            slot.bpm = bpm.clamp(
+                crate::arrangement_panel::TEMPO_LANE_BPM.0,
+                crate::arrangement_panel::TEMPO_LANE_BPM.1,
+            );
+        }
+        let _ = old;
+        self.arrangement.tempo = crate::tempo::TempoMap::sanitised(pts);
+        self.arr_tempo_hot = self.arr_tempo_index(at_beat);
+        if let Some(i) = self.arr_tempo_hot {
+            self.arr_tempo_drag = Some(i);
+            self.arr_drag = Some(ArrDrag::TempoPoint(i));
+        }
+        // The gesture is what gets saved, not the frame — see
+        // `arr_drag_auto_point`, which learned this the hard way.
+        self.arr_gesture_dirty = true;
+    }
+
+    /// Take a tempo point out. **Never the first**: see the drag.
+    fn arr_remove_tempo_point(&mut self, index: usize) {
+        if index == 0 {
+            return;
+        }
+        let mut pts = self.live_tempo_map().points().to_vec();
+        if index >= pts.len() {
+            return;
+        }
+        pts.remove(index);
+        self.arrangement.tempo = crate::tempo::TempoMap::sanitised(pts);
+        self.arr_tempo_hot = None;
+        self.arr_save_edits();
+    }
+
+    /// Turn the span LEAVING a point into a ramp, or back into a step.
+    ///
+    /// **A property of the point the slide starts FROM** — `TempoPoint::ramp`
+    /// says so and `bpm_at_beat` reads it that way. So the FIRST point can
+    /// ramp (a song that speeds up from bar one is an ordinary thing) and
+    /// the LAST one's ramp has nothing to reach, which the map itself
+    /// documents as holding. It is still stored, because adding a point
+    /// after it should make the ramp mean something rather than needing to
+    /// be set again.
+    fn arr_toggle_tempo_ramp(&mut self, index: usize) {
+        let mut pts = self.live_tempo_map().points().to_vec();
+        let Some(slot) = pts.get_mut(index) else {
+            return;
+        };
+        slot.ramp = !slot.ramp;
+        self.arrangement.tempo = crate::tempo::TempoMap::sanitised(pts);
+        self.arr_save_edits();
+    }
+
+    /// Ask before putting the song back to one tempo.
+    fn arr_ask_flatten_tempo(&mut self) {
+        let map = self.live_tempo_map();
+        if map.is_constant() {
+            return;
+        }
+        let bpm = map.bpm_at_beat(0.0);
+        self.dialog = Some(Dialog::Confirm {
+            title: "Flatten the tempo".to_owned(),
+            body: format!(
+                "The song's {} tempo changes go, and the whole thing plays at                  {bpm:.0} BPM.",
+                map.points().len().saturating_sub(1)
+            ),
+            // **What SURVIVES, said out loud**, which is the rule every
+            // destructive box in this app follows: the clips do not move in
+            // time, so a song flattened from a map is a song that plays at
+            // one speed with everything where it was written.
+            kept: "Your clips keep the seconds they sit at. Nothing is moved                    or deleted."
+                .to_owned(),
+            choices: vec![dialogs::ConfirmChoice::new(
+                "Flatten",
+                dialogs::DialogAction::FlattenTempo,
+                true,
+            )],
+            warn: self.settings.master_knob_color.to_color32(),
+        });
+    }
+
+    /// Put the song back to one tempo. Reached only from the dialog above.
+    pub fn flatten_tempo(&mut self) {
+        let bpm = self.live_tempo_map().bpm_at_beat(0.0);
+        self.arrangement.tempo = crate::tempo::TempoMap::constant(bpm);
+        self.arr_tempo_hot = None;
+        self.arr_save_edits();
+    }
+
+    /// Open the signature at `bar` for typing, in place on the ruler.
+    ///
+    /// **A field on the chip, not a dialog.** A signature is two numbers and
+    /// a slash — the band types it into the knob's own cell for exactly this
+    /// reason — and a modal box over the arrangement to collect six
+    /// characters is a box somebody has to dismiss before they can look at
+    /// the bar they were aiming at.
+    fn arr_edit_meter(&mut self, bar: u32) {
+        let sig = self.live_meter_map().sig_at_bar(bar);
+        self.num_edit = Some(recorder::NumEdit::prefilled(
+            recorder::NumField::MeterAt(bar),
+            format!("{}/{}", sig.beats, sig.unit),
+        ));
+        self.name_focused = false;
+    }
+
+    /// Set — or clear — the signature that starts at `bar`.
+    ///
+    /// **Bar zero cannot be cleared**, for the reason the first tempo point
+    /// cannot be moved: a song has to have a signature from its first bar,
+    /// and a map with no point at zero is one `sanitised` would have to
+    /// invent an answer for.
+    pub fn set_meter_at(&mut self, bar: u32, sig: Option<crate::recorder::TimeSignature>) {
+        // **Bar zero is the BAND's signature, not a change.**
+        //
+        // `live_meter_map` hands back the band's signature whenever the
+        // document's map is constant — which is what makes a song with no
+        // changes follow the dial — so writing a one-point map here would be
+        // thrown away on the very next read. Setting the band is what
+        // actually moves bar zero, and it is right: bar one's signature is
+        // the song's, and the song's is the one the band shows.
+        if bar == 0 {
+            if let Some(sig) = sig {
+                self.set_time_signature(sig);
+            }
+            // Clearing bar zero does nothing, for the reason above the
+            // function: a song must have a signature from its first bar.
+            return;
+        }
+        let mut pts = self.live_meter_map().points().to_vec();
+        match sig {
+            Some(sig) => pts.push(crate::tempo::MeterPoint { at_bar: bar, sig }),
+            None => pts.retain(|p| p.at_bar != bar),
+        }
+        self.arrangement.meter = crate::tempo::MeterMap::sanitised(pts);
+        self.arr_save_edits();
     }
 
     /// Where a point at `at_s` sits in its curve now.
@@ -10472,6 +10748,42 @@ impl IvoryApp {
                     self.arr_clip_menu = Some((id, p));
                     return;
                 }
+                // **The right button REMOVES a point** — on the tempo lane
+                // and on an automation lane both, which is the gesture every
+                // desk has and which neither of these lanes had at all: a
+                // curve you can draw and cannot un-draw is one you have to
+                // reload the project to fix.
+                {
+                    let hit = {
+                        let clips = self.arr_clip_views();
+                        let view = self.arrange_view(&clips);
+                        crate::arrangement_panel::hit_test(rect, &view, p)
+                    };
+                    use crate::arrangement_panel::Hit as A;
+                    match hit {
+                        Some(A::TempoPoint(i)) => {
+                            self.arr_remove_tempo_point(i);
+                            return;
+                        }
+                        Some(A::AutoPoint(lane, _)) => {
+                            let t = {
+                                let clips = self.arr_clip_views();
+                                let view = self.arrange_view(&clips);
+                                crate::arrangement_panel::time_at(rect, &view, p.x)
+                            };
+                            self.arr_remove_auto_point(lane, t);
+                            return;
+                        }
+                        // A signature chip: emptying its field is how one is
+                        // cleared, so the right button opens it too rather
+                        // than being a second, silent way to remove one.
+                        Some(A::MeterChip(bar)) => {
+                            self.arr_edit_meter(bar);
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
                 // **The right button draws the box over the LANES** — the
                 // editor's gesture, on clips: drag selects everything the
                 // band crosses. Shift keeps what stands.
@@ -10727,6 +11039,39 @@ impl IvoryApp {
                     // every desk does and what makes a curve drawable rather
                     // than assembled. It is then dragged, so one gesture
                     // places it and puts it where you meant.
+                    // ── the tempo lane ────────────────────────────────
+                    Some(A::TempoPoint(i)) => {
+                        // **Alt turns the arrival into a RAMP**, or back into
+                        // a step — the difference between "and now it is
+                        // slower" and a ritardando, and the only property a
+                        // tempo point has that dragging cannot reach. Alt
+                        // because the arrangement's other two modifiers are
+                        // taken: shift adds to a selection and the platform
+                        // key zooms.
+                        if ctx.input(|i| i.modifiers.alt) {
+                            self.arr_toggle_tempo_ramp(i);
+                        } else {
+                            self.arr_tempo_hot = Some(i);
+                            self.arr_tempo_drag = Some(i);
+                            self.arr_drag = Some(ArrDrag::TempoPoint(i));
+                        }
+                    }
+                    // A press on empty room makes a point and then drags it,
+                    // the automation lane's own gesture.
+                    Some(A::TempoLane(t, bpm)) => {
+                        if let Some(i) = self.arr_put_tempo_point(t, bpm) {
+                            self.arr_tempo_hot = Some(i);
+                            self.arr_tempo_drag = Some(i);
+                            self.arr_drag = Some(ArrDrag::TempoPoint(i));
+                        }
+                    }
+                    // The header: put the whole song back to one tempo. The
+                    // one destructive thing on this row, so it ASKS first —
+                    // a map somebody spent an evening on is not something to
+                    // lose to a mis-click on a header.
+                    Some(A::TempoHeader) => self.arr_ask_flatten_tempo(),
+                    Some(A::MeterChip(bar)) => self.arr_edit_meter(bar),
+                    Some(A::MeterStrip(bar)) => self.arr_edit_meter(bar),
                     Some(A::AutoLane(n, t, v)) => {
                         if let Some(i) = self.arr_put_auto_point(n, t, v) {
                             self.arr_auto_hot = Some((n, i));
@@ -10808,6 +11153,13 @@ impl IvoryApp {
                     }
                     Some(A::ToolSnap) => {
                         self.settings.arr_snap = !self.settings.arr_snap;
+                        self.save_settings();
+                    }
+                    Some(A::ToolTempoLane) => {
+                        self.settings.arr_tempo_lane = !self.settings.arr_tempo_lane;
+                        // A hidden lane holds no grabbed point.
+                        self.arr_tempo_hot = None;
+                        self.arr_tempo_drag = None;
                         self.save_settings();
                     }
                     Some(A::ToolGrid) => {
@@ -11006,6 +11358,25 @@ impl IvoryApp {
                         };
                         let v = crate::arrangement_panel::auto_value_at(row, p.y);
                         self.arr_drag_auto_point(lane, index, t, v);
+                    }
+                }
+                // The same two functions the drawing uses, for the reason
+                // `AutoPoint` gives above.
+                ArrDrag::TempoPoint(index) => {
+                    let rect = self.arrangement_rect.unwrap_or(Rect::NOTHING);
+                    let (row, t) = {
+                        let clips = self.arr_clip_views();
+                        let view = self.arrange_view(&clips);
+                        let row = crate::arrangement_panel::Layout::new(rect, &view)
+                            .rows
+                            .iter()
+                            .find(|r| r.kind == crate::arrangement_panel::RowKind::Tempo)
+                            .map(|r| r.lane);
+                        (row, crate::arrangement_panel::time_at(rect, &view, p.x))
+                    };
+                    if let Some(row) = row.filter(egui::Rect::is_positive) {
+                        let bpm = crate::arrangement_panel::tempo_bpm_at(row, p.y);
+                        self.arr_drag_tempo_point(index, t, bpm);
                     }
                 }
                 ArrDrag::GridStep { from_y, start } => {
@@ -11281,6 +11652,7 @@ impl IvoryApp {
                 ));
             }
             self.arr_drag = None;
+            self.arr_tempo_drag = None;
             self.arr_move_orig.clear();
             self.arr_stretch_orig.clear();
         }
@@ -11526,7 +11898,12 @@ impl IvoryApp {
         crate::arrangement_panel::ArrangeView {
             // No UI to open it yet — the row exists so the tempo work has
             // somewhere to land.
-            show_tempo_lane: false,
+            show_tempo_lane: self.settings.arr_tempo_lane,
+            tempo_hot: self.arr_tempo_hot,
+            meter_edit: self.num_edit.as_ref().and_then(|e| match e.field {
+                crate::recorder::NumField::MeterAt(bar) => Some((bar, e.text.as_str())),
+                _ => None,
+            }),
             lanes: std::array::from_fn(|n| {
                 let kind = self.channel_kind(n);
                 let open = self.arr_auto_open.contains(&n);
@@ -11608,9 +11985,12 @@ impl IvoryApp {
             view_len_s,
             song_s: self.nav_domain_s(),
             playhead_s: self.recorder.position_s,
-            bpm: f64::from(self.tempo_bpm()),
-            sig_top: u32::from(self.time_signature().beats),
-            sig_bottom: u32::from(self.time_signature().unit),
+            // **The maps, not a bpm and a signature.** They are built from
+            // the document and the export override by the same two accessors
+            // the snap and the click already use, so the grid the eye gets
+            // and the grid the magnet obeys cannot come apart.
+            tempo: self.live_tempo_map(),
+            meter: self.live_meter_map(),
             dark_mode: self.settings.arr_dark,
             wood: {
                 let c = self.settings.recorder_bg_color;
@@ -13534,6 +13914,19 @@ impl IvoryApp {
             // time signature above: they are not a control on the band, they
             // are the reach of one, and there is no `Hit` that carries a
             // range.
+            // **Empty clears the change.** A chip somebody opened and then
+            // emptied is a signature they want gone, which is the only
+            // gesture there is for removing one — and bar zero refuses, in
+            // `set_meter_at`, because a song must have a signature from its
+            // first bar.
+            F::MeterAt(bar) => {
+                if edit.text.trim().is_empty() {
+                    self.set_meter_at(bar, None);
+                } else if let Some(sig) = recorder::TimeSignature::parse(&edit.text) {
+                    self.set_meter_at(bar, Some(sig));
+                }
+                None
+            }
             F::VariMin | F::VariMax => {
                 if let Some(v) = recorder::parse_trim_percent(&edit.text) {
                     let n = v.round().clamp(0.0, f32::from(u16::MAX)) as u16;
@@ -13578,6 +13971,10 @@ impl IvoryApp {
                 } else {
                     format!("{:.1}", 20.0 * g.log10())
                 }
+            }
+            F::MeterAt(bar) => {
+                let sig = self.live_meter_map().sig_at_bar(bar);
+                format!("{}/{}", sig.beats, sig.unit)
             }
             F::VariMin => format!("{}", self.settings.varispeed.min()),
             F::VariMax => format!("{}", self.settings.varispeed.max()),
@@ -14904,6 +15301,10 @@ impl IvoryApp {
             DialogAction::UndoReset => {
                 self.dialog = None;
                 self.pending_undo_reset = true;
+            }
+            DialogAction::FlattenTempo => {
+                self.dialog = None;
+                self.flatten_tempo();
             }
             DialogAction::NewProjectKeeping => {
                 self.dialog = None;
@@ -21328,6 +21729,232 @@ mod tests {
             [60].into_iter().collect::<HashSet<u8>>(),
             "a phantom key lit an interval away from the one playing"
         );
+    }
+
+    /// **The tempo lane's three verbs**, and the two rules that keep a map
+    /// playable.
+    ///
+    /// A map has to say what the tempo is from the very first sample, so the
+    /// first point cannot be moved off zero and cannot be removed. Everything
+    /// else about the lane is the automation lane's own gestures over a
+    /// different unit.
+    #[test]
+    fn the_tempo_lane_edits_the_map_and_protects_its_first_point() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.arr_snap = false;
+        app.settings.record_export.tempo_bpm = 120.0;
+        assert!(app.live_tempo_map().is_constant(), "a fresh song has a map");
+
+        // A point four seconds in — eight quarters at 120 — at 90 bpm.
+        let i = app.arr_put_tempo_point(4.0, 90.0).expect("the point landed");
+        let pts = app.arrangement.tempo.points().to_vec();
+        assert_eq!(pts.len(), 2, "{pts:?}");
+        assert_eq!(i, 1);
+        assert!((pts[1].at_beat - 8.0).abs() < 1e-6, "{:?}", pts[1]);
+        assert!((pts[1].bpm - 90.0).abs() < 1e-6);
+        assert!(!pts[1].ramp, "a new point is a step, not a ritardando");
+
+        // **The first point does not move in time.** Dragging it sideways
+        // moves only its tempo; a map whose first point is at bar nine leaves
+        // the first eight bars with no tempo at all.
+        app.arr_drag_tempo_point(0, 30.0, 100.0);
+        let first = app.arrangement.tempo.points()[0];
+        assert_eq!(first.at_beat, 0.0, "the first point walked off zero");
+        assert!((first.bpm - 100.0).abs() < 1e-6, "its tempo did not follow");
+
+        // ...and cannot be removed.
+        app.arr_remove_tempo_point(0);
+        assert_eq!(app.arrangement.tempo.points().len(), 2, "the first went");
+
+        // The second can be, and is.
+        app.arr_remove_tempo_point(1);
+        assert_eq!(app.arrangement.tempo.points().len(), 1);
+        assert!(app.live_tempo_map().is_constant());
+    }
+
+    /// **A drag reads the map BEFORE the drag changes it.**
+    ///
+    /// The point being carried is the one that decides where seconds land,
+    /// so converting the pointer's position against a map this same gesture
+    /// is about to rewrite is a point that runs away from the hand — slowly
+    /// at first, and further with every frame.
+    #[test]
+    fn dragging_a_tempo_point_does_not_chase_its_own_tail() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.arr_snap = false;
+        app.settings.record_export.tempo_bpm = 120.0;
+        app.arr_put_tempo_point(4.0, 120.0).expect("placed");
+
+        // Hold the pointer still, at the second the point is already at, and
+        // drag the TEMPO right down. Ten frames of a hand not moving
+        // sideways must leave the point where it is.
+        for _ in 0..10 {
+            app.arr_drag_tempo_point(1, 4.0, 60.0);
+        }
+        let at = app.arrangement.tempo.points()[1].at_beat;
+        assert!(
+            (at - 8.0).abs() < 1e-6,
+            "ten frames of a still hand walked the point to quarter {at}"
+        );
+    }
+
+    /// A ramp belongs to the point it slides FROM, so the first point can
+    /// have one and the last one has nothing to reach.
+    #[test]
+    fn a_ramp_is_a_property_of_the_point_it_slides_from() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.arr_snap = false;
+        app.settings.record_export.tempo_bpm = 120.0;
+        app.arr_put_tempo_point(4.0, 60.0).expect("placed");
+        // **The FIRST point's ramp is what makes the first span a slide.**
+        // Ramping the second would be ramping out of it towards nothing.
+        app.arr_toggle_tempo_ramp(0);
+        assert!(app.arrangement.tempo.points()[0].ramp, "the ramp did not take");
+        // Halfway between the two points the tempo is between the two
+        // tempos, which is a ritardando and not a step.
+        let mid = app.arrangement.tempo.bpm_at_beat(4.0);
+        assert!(
+            mid > 60.5 && mid < 119.5,
+            "halfway into the ramp the tempo was {mid}, which is a step"
+        );
+        app.arr_toggle_tempo_ramp(0);
+        assert!(!app.arrangement.tempo.points()[0].ramp);
+        assert!(
+            (app.arrangement.tempo.bpm_at_beat(4.0) - 120.0).abs() < 1e-6,
+            "turning the ramp off did not put the step back"
+        );
+    }
+
+    /// Flattening drops the map and keeps the song's opening tempo.
+    #[test]
+    fn flattening_keeps_the_tempo_the_song_starts_at() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.arr_snap = false;
+        app.settings.record_export.tempo_bpm = 96.0;
+        app.arr_put_tempo_point(4.0, 60.0).expect("placed");
+        app.arr_put_tempo_point(8.0, 150.0).expect("placed");
+        assert!(!app.live_tempo_map().is_constant());
+        app.flatten_tempo();
+        assert!(app.live_tempo_map().is_constant());
+        assert!((app.live_tempo_map().bpm_at_beat(0.0) - 96.0).abs() < 1e-6);
+    }
+
+    /// A signature change is set by bar, and bar zero cannot be cleared.
+    #[test]
+    fn a_signature_change_is_set_by_bar_and_bar_zero_survives() {
+        use crate::recorder::TimeSignature;
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        assert!(app.live_meter_map().is_constant());
+        app.set_meter_at(8, Some(TimeSignature { beats: 6, unit: 8 }));
+        assert_eq!(app.live_meter_map().sig_at_bar(7).beats, 4);
+        assert_eq!(app.live_meter_map().sig_at_bar(8).beats, 6);
+        assert_eq!(app.live_meter_map().sig_at_bar(8).unit, 8);
+        // Bar 8's change goes when its field is emptied...
+        app.set_meter_at(8, None);
+        assert_eq!(app.live_meter_map().sig_at_bar(8).beats, 4);
+        // ...and bar zero's never does, because a song has to have a
+        // signature from its first bar. Bar zero IS the band's signature —
+        // see `set_meter_at` — so setting it moves the dial the whole app
+        // reads, and clearing it does nothing at all.
+        app.set_meter_at(0, Some(TimeSignature { beats: 7, unit: 8 }));
+        assert_eq!(app.time_signature().beats, 7, "bar zero did not reach the band");
+        assert_eq!(app.live_meter_map().sig_at_bar(0).beats, 7);
+        app.set_meter_at(0, None);
+        assert_eq!(app.live_meter_map().sig_at_bar(0).beats, 7);
+    }
+
+    /// **A bar of 3/4 has three beats in it, and the grid divides THAT.**
+    ///
+    /// The snap used to step a fixed number of quarters from zero, so after
+    /// one 3/4 bar every line for the rest of the song was a beat out — and
+    /// stayed out, because nothing ever brought it back. The panel walks bar
+    /// by bar and divides each bar's own length; this is the other half of
+    /// the same arithmetic, and the two are one function apart on purpose.
+    #[test]
+    fn the_grid_divides_each_bar_by_its_own_signature() {
+        use crate::recorder::TimeSignature;
+        use crate::tempo::{MeterMap, MeterPoint};
+        let sig = |beats: u8, unit: u8| TimeSignature { beats, unit };
+        // Two bars of 3/4 (three quarters each), then 4/4.
+        let meter = MeterMap::sanitised(vec![
+            MeterPoint { at_bar: 0, sig: sig(3, 4) },
+            MeterPoint { at_bar: 2, sig: sig(4, 4) },
+        ]);
+        // Bar lines fall at 0, 3, 6, then every 4: 10, 14.
+        for (bar, want) in [(0u32, 0.0), (1, 3.0), (2, 6.0), (3, 10.0), (4, 14.0)] {
+            assert!(
+                (meter.quarter_at_bar(bar) - want).abs() < 1e-9,
+                "bar {bar} starts at {} rather than {want}",
+                meter.quarter_at_bar(bar)
+            );
+        }
+        // A quarter-note grid (exp -2 is a quarter of a bar... in 3/4 that
+        // is not a quarter note, and that is the point: the gridbox says
+        // "divide the bar", so in 3/4 the halves are at 1.5).
+        let half_bar = -1i8;
+        assert!((IvoryApp::snap_quarter(&meter, 0.8, half_bar) - 1.5).abs() < 1e-9);
+        assert!((IvoryApp::snap_quarter(&meter, 2.6, half_bar) - 3.0).abs() < 1e-9);
+        // **And the third bar, which is 4/4**: its halves are at 6 and 8,
+        // not at 7.5 — which is where a fixed 1.5-quarter step from zero
+        // would have put a line, a beat and a half into a bar that has four.
+        assert!((IvoryApp::snap_quarter(&meter, 7.9, half_bar) - 8.0).abs() < 1e-9);
+        assert!((IvoryApp::snap_quarter(&meter, 6.4, half_bar) - 6.0).abs() < 1e-9);
+
+        // A whole-bar grid lands on the bar lines themselves, wherever they
+        // have got to.
+        for (q, want) in [(1.4_f64, 0.0), (1.6, 3.0), (7.9, 6.0), (8.1, 10.0)] {
+            let got = IvoryApp::snap_quarter(&meter, q, 0);
+            assert!((got - want).abs() < 1e-9, "{q} snapped to {got}, not {want}");
+        }
+        // A four-bar grid counts BARS and not quarters: bars 0 and 4 are at
+        // 0 and 14, so anything past the middle of that goes to 14.
+        assert!((IvoryApp::snap_quarter(&meter, 6.0, 2) - 0.0).abs() < 1e-9);
+        assert!((IvoryApp::snap_quarter(&meter, 8.0, 2) - 14.0).abs() < 1e-9);
+    }
+
+    /// The magnet lands on a line the ruler actually drew.
+    ///
+    /// **The two are separate code**, in separate crates' worth of concern —
+    /// `arrangement_panel::draw` walks bars to paint them and this walks
+    /// bars to round to them — and the whole value of either is that they
+    /// agree. A grid you can see and a magnet that ignores it is worse than
+    /// no magnet.
+    #[test]
+    fn every_snap_lands_on_a_line_the_grid_draws() {
+        use crate::recorder::TimeSignature;
+        use crate::tempo::{MeterMap, MeterPoint};
+        let meter = MeterMap::sanitised(vec![
+            MeterPoint { at_bar: 0, sig: TimeSignature { beats: 7, unit: 8 } },
+            MeterPoint { at_bar: 3, sig: TimeSignature { beats: 4, unit: 4 } },
+        ]);
+        for exp in [-3i8, -2, -1, 0, 1, 2] {
+            for step in 0..200 {
+                let q = f64::from(step) * 0.17;
+                let snapped = IvoryApp::snap_quarter(&meter, q, exp);
+                // The line it landed on has to BE a line: either a bar
+                // boundary at a multiple of the grid's bar count, or an even
+                // division of the bar it is in.
+                let bar = meter.bar_beat_at_quarter(snapped + 1e-9).0;
+                let q0 = meter.quarter_at_bar(bar);
+                let qn = meter.quarters_in_bar(bar);
+                let within = snapped - q0;
+                if exp >= 0 {
+                    let every = 1u32 << exp;
+                    assert!(
+                        within.abs() < 1e-6 && bar % every == 0,
+                        "exp {exp}: {q} snapped to {snapped}, which is {within} into bar {bar}"
+                    );
+                } else {
+                    let div = f64::from(1u32 << (-exp));
+                    let k = within / (qn / div);
+                    assert!(
+                        (k - k.round()).abs() < 1e-6,
+                        "exp {exp}: {q} snapped to {snapped}, {k} of the way through bar {bar}"
+                    );
+                }
+                assert!(snapped >= 0.0, "snapped below zero");
+            }
+        }
     }
 
     /// **Snap follows the tempo map, and is unchanged without one.**

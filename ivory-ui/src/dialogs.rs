@@ -704,6 +704,8 @@ pub enum DialogAction {
     ResetTo(crate::settings::ResetScope),
     /// Put the settings back to the copy taken just before the last reset.
     UndoReset,
+    /// Put the whole song back to one tempo, dropping its map.
+    FlattenTempo,
     /// Start a new project, and take the unsaved one's directory with it.
     NewProjectDiscarding,
     /// Start a new project and leave the unsaved one where it is.

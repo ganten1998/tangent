@@ -1926,6 +1926,10 @@ fn num_field_key(f: NumField) -> usize {
         NumField::Varispeed => 106,
         NumField::VariMin => 107,
         NumField::VariMax => 108,
+        // Offset well past the band's own fields: there can be one of these
+        // per bar, and two controls that answer `true` to `is_same_control`
+        // are two controls a drag can slide between.
+        NumField::MeterAt(bar) => 1_000 + bar as usize,
         NumField::Fx(fx) => 200 + fx.index(),
     }
 }
