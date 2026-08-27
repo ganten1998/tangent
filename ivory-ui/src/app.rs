@@ -6326,15 +6326,37 @@ impl IvoryApp {
     }
 
     /// `t`, magnetised: to the nearest grid line while the magnet is on.
+    ///
+    /// **Snapped in QUARTERS and not in seconds.** With one tempo the two are
+    /// the same statement and a modulo was enough. With a tempo map the grid
+    /// lines are not evenly spaced in seconds at all — that is what a tempo
+    /// map IS — so rounding a second to the nearest multiple of a bar's
+    /// length would magnetise to a grid the ruler does not draw, and would do
+    /// it worse the further from the last tempo change you edited.
+    ///
+    /// The constant-tempo answer is unchanged, because the conversion is a
+    /// multiply in that case and this reduces to the modulo it replaces.
     fn arr_snap_t(&self, t: f64) -> f64 {
         if !self.settings.arr_snap {
             return t.max(0.0);
         }
-        let g = self.arr_grid_s();
-        if g <= 0.0 {
+        let quarters = self.arr_grid_quarters();
+        if quarters <= 0.0 {
             return t.max(0.0);
         }
-        ((t / g).round() * g).max(0.0)
+        let map = self.live_tempo_map();
+        let at = map.beat_at_seconds(t.max(0.0));
+        map.seconds_at_beat((at / quarters).round() * quarters).max(0.0)
+    }
+
+    /// The grid's spacing in QUARTER NOTES — the unit the maps speak.
+    ///
+    /// A bar of the signature, times the gridbox's power of two.
+    fn arr_grid_quarters(&self) -> f64 {
+        let sig = self.time_signature();
+        let bar = f64::from(sig.beats.max(1)) * (4.0 / f64::from(sig.unit.max(1)));
+        let exp = self.settings.arr_grid_exp.clamp(-5, 3) as i32;
+        bar * 2.0f64.powi(exp)
     }
 
     /// Clamp a steered window into the song's neighbourhood and keep it.
@@ -12448,6 +12470,35 @@ impl IvoryApp {
     /// count-in is.
     pub fn time_signature(&self) -> recorder::TimeSignature {
         self.settings.time_signature()
+    }
+
+    /// The tempo map the ENGINE should play against.
+    ///
+    /// **The document's map when it has one, and the knob's number when it
+    /// does not.** A bridge, and a deliberate one: `tempo_bpm` above is the
+    /// take's tempo including a session-only Export override, and it is what
+    /// the band's knob and the `.mid` writer have always used. A song with no
+    /// tempo changes must go on behaving exactly like that — the knob moves
+    /// the click, the override moves the click — which it does, because a
+    /// one-point map carries no information the knob does not.
+    ///
+    /// The moment somebody writes a real map it becomes the authority, and it
+    /// has to: there is no single number for the knob to hold any more.
+    pub fn live_tempo_map(&self) -> crate::tempo::TempoMap {
+        if self.arrangement.tempo.is_constant() {
+            crate::tempo::TempoMap::constant(self.tempo_bpm())
+        } else {
+            self.arrangement.tempo.clone()
+        }
+    }
+
+    /// The meter map, on the same bargain as [`Self::live_tempo_map`].
+    pub fn live_meter_map(&self) -> crate::tempo::MeterMap {
+        if self.arrangement.meter.is_constant() {
+            crate::tempo::MeterMap::constant(self.time_signature())
+        } else {
+            self.arrangement.meter.clone()
+        }
     }
 
     /// Count-in length in bars.
@@ -20631,6 +20682,52 @@ mod tests {
             [60].into_iter().collect::<HashSet<u8>>(),
             "a phantom key lit an interval away from the one playing"
         );
+    }
+
+    /// **Snap follows the tempo map, and is unchanged without one.**
+    ///
+    /// The property that makes the map safe to introduce: a song at one tempo
+    /// magnetises exactly where it always did, because the conversion is a
+    /// multiply and this reduces to the modulo it replaces. A song WITH a map
+    /// magnetises to the lines the ruler draws rather than to a spacing that
+    /// only holds until the first tempo change.
+    #[test]
+    fn snapping_follows_the_tempo_map_and_is_unchanged_without_one() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.arr_snap = true;
+        app.settings.arr_grid_exp = 0; // one bar
+        app.settings.record_time_signature = "4/4".into();
+
+        // One tempo: 120 bpm, 4/4 — a bar is two seconds.
+        app.settings.record_export.tempo_bpm = 120.0;
+        assert!((app.arr_snap_t(0.9) - 0.0).abs() < 1e-6, "{}", app.arr_snap_t(0.9));
+        assert!((app.arr_snap_t(1.1) - 2.0).abs() < 1e-6, "{}", app.arr_snap_t(1.1));
+        assert!((app.arr_snap_t(5.0) - 6.0).abs() < 1e-6, "{}", app.arr_snap_t(5.0));
+
+        // Now a map: 120 for four bars (16 quarters), then 60.
+        app.arrangement.tempo = crate::tempo::TempoMap::sanitised(vec![
+            crate::tempo::TempoPoint { at_beat: 0.0, bpm: 120.0, ramp: false },
+            crate::tempo::TempoPoint { at_beat: 16.0, bpm: 60.0, ramp: false },
+        ]);
+        // Before the change nothing moves: bars are still two seconds.
+        assert!((app.arr_snap_t(1.1) - 2.0).abs() < 1e-6, "{}", app.arr_snap_t(1.1));
+        // The change is at 16 quarters = 8 seconds. After it a bar is FOUR
+        // seconds, so the next line is at 12 and not at 10 — which is what a
+        // seconds-modulo would have said.
+        let snapped = app.arr_snap_t(10.5);
+        assert!(
+            (snapped - 12.0).abs() < 1e-6,
+            "past a tempo change, 10.5 snapped to {snapped} rather than 12"
+        );
+        // And every snapped position is really on a bar line of the map.
+        for t in [0.5_f64, 3.0, 7.9, 9.0, 15.0, 21.0] {
+            let at = app.arr_snap_t(t);
+            let q = app.live_tempo_map().beat_at_seconds(at);
+            assert!(
+                (q / 4.0 - (q / 4.0).round()).abs() < 1e-6,
+                "{t} snapped to {at}, which is quarter {q} — not a bar line"
+            );
+        }
     }
 
     /// **A note is spelled so a screen reader can pronounce it.**

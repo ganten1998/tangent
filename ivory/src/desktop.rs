@@ -418,6 +418,10 @@ pub struct DesktopApp {
     /// again — see `screen_reader_attached`, which is not free of side
     /// effects.
     reader_seen: bool,
+    /// The maps the engine was last given. Compared before pushing, because
+    /// `Engine::set_maps` is a ring handover that WAITS for the displaced
+    /// pair to come back — cheap once, and a stall if it ran every frame.
+    pushed_maps: Option<crate::instrument::Maps>,
     /// The DX7 cartridge the built-in is playing out of, if one is loaded.
     ///
     /// **The host holds the voices; the UI holds the names.** Kept here rather
@@ -1769,6 +1773,8 @@ impl DesktopApp {
             self.reconcile_camera(false, ctx);
             self.push_monitor_settings();
         }
+        // Beside the per-frame push and gated on change — see `push_maps`.
+        self.push_maps();
 
         let root = self.app.record_root();
         let name = self.app.take_name().map(str::to_owned);
@@ -3714,6 +3720,15 @@ impl DesktopApp {
             let sig = self.app.time_signature();
             e.set_meter(u32::from(sig.beats), u32::from(sig.unit));
         }
+        // **The maps, in the export mirror too.** `start_offline_bounce`
+        // furnishes a second engine BY HAND and duplicates four things the
+        // live path also does; this is the fifth, and the one whose absence
+        // would be least visible — an export whose bar lines are somewhere
+        // else than the ones you were listening to.
+        e.set_maps(crate::instrument::Maps {
+            tempo: self.app.live_tempo_map(),
+            meter: self.app.live_meter_map(),
+        });
         // The built-in: rendered by the engine itself when a channel's
         // first bay names it — the live walk's own rule.
         let builtin = (0..ivory_ui::recorder::CHANNELS)
@@ -4975,6 +4990,29 @@ impl DesktopApp {
         }
     }
 
+    /// Give the engine the tempo and meter maps, when they have changed.
+    ///
+    /// **On CHANGE and not every frame**, unlike everything else this crate
+    /// pushes. The other setters are atomic stores and cost a comparison; a
+    /// map is a `Vec` crossing on a ring, and `set_maps` waits up to
+    /// `RETIRE_TIMEOUT` for the displaced pair to come back so it can be
+    /// dropped here rather than in the callback. Running that sixty times a
+    /// second would be a stall looking for somewhere to happen.
+    #[cfg(feature = "recorder")]
+    fn push_maps(&mut self) {
+        let want = crate::instrument::Maps {
+            tempo: self.app.live_tempo_map(),
+            meter: self.app.live_meter_map(),
+        };
+        if self.pushed_maps.as_ref() == Some(&want) {
+            return;
+        }
+        if let Some(e) = self.recorder.engine.as_mut() {
+            e.set_maps(want.clone());
+            self.pushed_maps = Some(want);
+        }
+    }
+
     /// What this take is going to be missing, and where to fix it.
     ///
     /// **Only sources that EXIST.** A muted slot with no instrument in it is
@@ -5631,6 +5669,7 @@ impl DesktopApp {
             pending_midi: Some(pending_midi),
             painted_once: false,
             reader_seen: false,
+            pushed_maps: None,
             midi_lane,
             app,
             #[cfg(feature = "recorder")]
