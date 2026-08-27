@@ -480,6 +480,16 @@ pub struct DesktopApp {
     /// sample rate. Entries no clip references leave with the edit.
     #[cfg(feature = "recorder")]
     track_cache: std::collections::HashMap<std::path::PathBuf, Arc<ivory_record::decode::Clip>>,
+    /// Clips that have been time-stretched, by `(file, ratio in millionths,
+    /// mode)`.
+    ///
+    /// **Rendered once and played statelessly**, which is the whole design —
+    /// see `crate::stretch`. The key rounds the ratio to a millionth so a
+    /// drag that lands on the same value twice is one render and not two;
+    /// the tenth of a cent that rounds away is a hundredth of a sample on
+    /// the longest clip anybody will import.
+    stretch_cache:
+        std::collections::HashMap<(std::path::PathBuf, i64, String), Arc<ivory_record::decode::Clip>>,
     /// The drumpad's decoded samples, by resolved path — its own cache,
     /// because `track_cache` evicts by what the ARRANGEMENT references and
     /// a kit is not the arrangement's business. Same rate-keying, same
@@ -4313,6 +4323,8 @@ impl DesktopApp {
                         self.force_insert_reload();
                     }
                     self.track_cache.clear();
+                    self.stretch_cache.clear();
+                self.stretch_cache.clear();
                     self.pad_cache.clear();
                     self.reload_clips();
                     self.reload_pads();
@@ -4463,6 +4475,34 @@ impl DesktopApp {
                     }
                 },
             };
+            // **The stretched copy, if this clip asks for one.**
+            //
+            // Everything below — the trim, the fades, the envelope, the
+            // frame counts — then works on the stretched audio without
+            // knowing it, which is the point of doing it here: a clip
+            // stretched to 1.5 is a clip whose file is half again as long,
+            // and nothing downstream has to hold a second opinion about
+            // where its seconds are.
+            let decoded = if (clip.stretch - 1.0).abs() > 1.0e-9 {
+                let mode = crate::stretch::Mode::from_key(&clip.stretch_mode)
+                    .unwrap_or_default();
+                let key = (
+                    path.clone(),
+                    (clip.stretch * 1.0e6).round() as i64,
+                    mode.key().to_owned(),
+                );
+                match self.stretch_cache.get(&key) {
+                    Some(c) => Arc::clone(c),
+                    None => {
+                        let made =
+                            Arc::new(crate::stretch::stretch(&decoded, clip.stretch, mode));
+                        self.stretch_cache.insert(key, Arc::clone(&made));
+                        made
+                    }
+                }
+            } else {
+                decoded
+            };
             let file_s = decoded.seconds();
             if clip.len_s == 0.0 {
                 fill_len.push((clip.id, (file_s - clip.offset_s).max(0.0)));
@@ -4511,6 +4551,20 @@ impl DesktopApp {
             doc.clips
                 .iter()
                 .any(|c| ivory_ui::arrangement::Arrangement::resolve(&doc_path, &c.path) == *path)
+        });
+        // And the stretched renders with them — including every ratio a drag
+        // passed through on its way to the one that stuck. A drag across a
+        // clip's edge is a hundred frames and a hundred ratios; without
+        // this, that is a hundred whole copies of the file left in memory.
+        self.stretch_cache.retain(|(path, ratio, mode), _| {
+            doc.clips.iter().any(|c| {
+                (c.stretch * 1.0e6).round() as i64 == *ratio
+                    && crate::stretch::Mode::from_key(&c.stretch_mode)
+                        .unwrap_or_default()
+                        .key()
+                        == mode
+                    && ivory_ui::arrangement::Arrangement::resolve(&doc_path, &c.path) == *path
+            })
         });
         if let Some(e) = self.recorder.engine.as_mut() {
             e.set_clips(placed);
@@ -4832,6 +4886,7 @@ impl DesktopApp {
                 // one held, and the decode cache is keyed to one sample rate
                 // — the device that just opened may run another.
                 self.track_cache.clear();
+                self.stretch_cache.clear();
                 self.reload_clips();
                 // And the kit, on the same reasoning: the pad cache is
                 // keyed to a rate this device may not run.
@@ -5847,6 +5902,7 @@ impl DesktopApp {
             browse_extensions: Vec::new(),
             #[cfg(feature = "recorder")]
             track_cache: std::collections::HashMap::new(),
+            stretch_cache: std::collections::HashMap::new(),
             #[cfg(feature = "recorder")]
             pad_cache: std::collections::HashMap::new(),
             scope_buf: Vec::new(),
