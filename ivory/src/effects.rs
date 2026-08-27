@@ -250,6 +250,10 @@ pub struct Params {
     pub plate_predelay: f32,
 
     pub delay_division: Division,
+    /// Which of the twelve Mode Selector positions the machine is on: which
+    /// playback heads are live, and whether the spring is in circuit. See
+    /// [`EchoMode`].
+    pub echo_mode: EchoMode,
     /// How much of each repeat comes back for the next.
     pub delay_feedback: f32,
     /// How much darker each repeat is than the one before it.
@@ -317,6 +321,11 @@ impl Default for Params {
             plate_dispersion: 0.75,
             plate_predelay: 0.12,
             delay_division: Division::DottedEighth,
+            // **Head one alone, no spring.** Eleven of the twelve positions
+            // are a choice about the sound; this is the one where "the
+            // repeat" means exactly one thing, which is what a control next
+            // to a metronome has to mean before anybody goes looking.
+            echo_mode: EchoMode::One,
             delay_feedback: 0.42,
             delay_tone: 0.55,
             delay_width: 0.60,
@@ -896,127 +905,506 @@ impl Plate {
     }
 }
 
-// ── delay ───────────────────────────────────────────────────────────────────
+// ── the tape echo ───────────────────────────────────────────────────────────
+//
+// A tape echo after the Roland RE-201: a free loop of quarter-inch tape in an
+// open chamber, an erase head, a record head, and THREE playback heads at
+// fixed distances down the path.
+//
+// # Why three heads and a table
+//
+// The RE-201's front panel has one control that is not a knob — a twelve-way
+// Mode Selector — and it is the instrument. Each position switches a different
+// combination of the three playback heads, and seven of the twelve also bring
+// in a spring reverb. Two heads at once is not "a delay with more feedback":
+// it is two rhythms against each other from one line, which is the sound
+// people buy these for. See [`EchoMode`], whose table is Roland's own.
+//
+// # Why the heads are not 1:2:3
+//
+// They are meant to be. Measurements on real machines put them nearer
+// **1 : 1.94 : 2.85** — the spacing was never exact and the tape path was
+// never quite straight. An emulation on the round numbers sounds tidier than
+// any RE-201 ever did, and it is the tidiness people notice.
+//
+// # Why the time still follows the tempo
+//
+// The hardware's Repeat Rate is a capstan speed, continuous and unmarked. This
+// file's one real opinion was that a delay next to a metronome should land on
+// the beat, and that opinion is kept: [`Division`] sets the time at head one
+// and the other two follow it by the ratios above. Free is still there for
+// anybody who wants a fixed slapback, and it is what the hardware really was.
+//
+// What is NOT compromised is what happens while the time is moving. On the
+// real machine turning Repeat Rate spins the capstan, so audio already on the
+// tape plays back at the new speed and the pitch slides — Roland's own manual
+// describes it rising and then falling as fresh signal reaches the heads.
+// Reading a delay line at a length that is SLEWING is exactly that, which is
+// why the slew here is a tape transport spinning up rather than a smoothing
+// filter: see [`TAPE_SLEW`].
 
-/// How much of each repeat comes back for the next one, at each end of the
-/// feedback control.
+/// Where each playback head sits, as a multiple of the first head's time.
 ///
-/// The top stops well short of 1.0 on purpose: this is a mix knob on a piano
-/// app, not an oscillator, and a delay that can be set to build for ever is a
-/// delay that will be, once, loudly.
-const DELAY_FEEDBACK: (f32, f32) = (0.0, 0.72);
+/// **Measured, not nominal.** See the section header.
+const HEAD_RATIO: [f32; 3] = [1.0, 1.94, 2.85];
 
-/// One-pole lowpass in the feedback loop, at each end of the tone control, as
-/// a coefficient on the new sample.
+/// Which heads a Mode Selector position switches on, and whether it also
+/// brings in the reverb.
 ///
-/// Each repeat darker than the last, which is what tape did and why tape delay
-/// sits under a piano without competing with it. The control is INVERTED
-/// against this: turning tone up means less damping.
-const DELAY_DAMP: (f32, f32) = (0.0, 0.82);
+/// **This table is Roland's, read off their own documentation rather than
+/// reconstructed.** It cross-checks against their tap-delay ceiling table,
+/// which caps modes 1/5/8/10/11 at one second, 2/4/6/9 at two and 3/7 at
+/// three — exactly the modes whose LOWEST active head is one, two and three.
+/// Two independent tables agreeing is the only reason to trust a twelve-way
+/// switch nobody here has in front of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EchoMode {
+    /// Head 1. The short slap, and the default: it is the one position where
+    /// "the repeat" means one thing, which is what a knob next to a metronome
+    /// wants.
+    #[default]
+    One,
+    /// Head 2.
+    Two,
+    /// Head 3.
+    Three,
+    /// Heads 2 and 3.
+    Four,
+    /// Head 1, with reverb.
+    Five,
+    /// Head 2, with reverb.
+    Six,
+    /// Head 3, with reverb.
+    Seven,
+    /// Heads 1 and 2, with reverb.
+    Eight,
+    /// Heads 2 and 3, with reverb.
+    Nine,
+    /// Heads 1 and 3, with reverb.
+    Ten,
+    /// All three heads, with reverb. The big one.
+    Eleven,
+    /// The spring alone, no tape at all.
+    ReverbOnly,
+}
 
-/// The right channel's delay, as a fraction of the left's, at full width.
+impl EchoMode {
+    /// Every position, in the order the switch turns.
+    pub const ALL: [EchoMode; 12] = [
+        EchoMode::One,
+        EchoMode::Two,
+        EchoMode::Three,
+        EchoMode::Four,
+        EchoMode::Five,
+        EchoMode::Six,
+        EchoMode::Seven,
+        EchoMode::Eight,
+        EchoMode::Nine,
+        EchoMode::Ten,
+        EchoMode::Eleven,
+        EchoMode::ReverbOnly,
+    ];
+
+    /// Which of the three playback heads are live.
+    pub fn heads(self) -> [bool; 3] {
+        match self {
+            EchoMode::One | EchoMode::Five => [true, false, false],
+            EchoMode::Two | EchoMode::Six => [false, true, false],
+            EchoMode::Three | EchoMode::Seven => [false, false, true],
+            EchoMode::Four | EchoMode::Nine => [false, true, true],
+            EchoMode::Eight => [true, true, false],
+            EchoMode::Ten => [true, false, true],
+            EchoMode::Eleven => [true, true, true],
+            EchoMode::ReverbOnly => [false; 3],
+        }
+    }
+
+    /// Whether the spring is in circuit.
+    pub fn reverb(self) -> bool {
+        !matches!(
+            self,
+            EchoMode::One | EchoMode::Two | EchoMode::Three | EchoMode::Four
+        )
+    }
+
+    /// What the row shows. **The heads, not the number**, because the number
+    /// is a position on a switch nobody here is looking at and the heads are
+    /// what it does.
+    pub fn label(self) -> &'static str {
+        match self {
+            EchoMode::One => "1 - head 1",
+            EchoMode::Two => "2 - head 2",
+            EchoMode::Three => "3 - head 3",
+            EchoMode::Four => "4 - heads 2+3",
+            EchoMode::Five => "5 - head 1 + spring",
+            EchoMode::Six => "6 - head 2 + spring",
+            EchoMode::Seven => "7 - head 3 + spring",
+            EchoMode::Eight => "8 - heads 1+2 + spring",
+            EchoMode::Nine => "9 - heads 2+3 + spring",
+            EchoMode::Ten => "10 - heads 1+3 + spring",
+            EchoMode::Eleven => "11 - all three + spring",
+            EchoMode::ReverbOnly => "12 - spring only",
+        }
+    }
+
+    /// How it is written to the settings file, and read back.
+    pub fn key(self) -> &'static str {
+        match self {
+            EchoMode::One => "1",
+            EchoMode::Two => "2",
+            EchoMode::Three => "3",
+            EchoMode::Four => "4",
+            EchoMode::Five => "5",
+            EchoMode::Six => "6",
+            EchoMode::Seven => "7",
+            EchoMode::Eight => "8",
+            EchoMode::Nine => "9",
+            EchoMode::Ten => "10",
+            EchoMode::Eleven => "11",
+            EchoMode::ReverbOnly => "reverb",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<EchoMode> {
+        EchoMode::ALL.into_iter().find(|m| m.key() == key)
+    }
+}
+
+/// How much of each repeat comes back for the next, at each end of Intensity.
 ///
-/// Not the same length, or the repeats are mono and sit on top of the dry
-/// signal. Two thirds puts the right channel on a triplet against the left,
-/// which is a musical relationship rather than a smear.
-const DELAY_RIGHT_RATIO: f32 = 0.667;
+/// **0.90, and the ceiling is a decision rather than a limit.** A Space Echo's
+/// Intensity reaches self-oscillation, and that howl is half of what the box
+/// is famous for. This is a send on a master bus in a piano application, and
+/// the reason written here when the top was 0.72 has not stopped being true:
+/// a control somebody will turn all the way up to hear what it does should not
+/// be an oscillator. What HAS changed is that 0.72 was well short of the long
+/// smeared wash the machine is actually used for.
+///
+/// 0.90 is where it sits because `the_delay_does_not_run_away_at_any_setting`
+/// wants the tail under 35% after five seconds, which at the shipped time is
+/// a touch over thirteen repeats and bounds the coefficient at about 0.924.
+/// The saturation in the loop would hold a higher setting bounded rather than
+/// let it blow up — tape does not explode, it compresses — so this is one
+/// constant away from the hardware if that trade is ever taken.
+const TAPE_FEEDBACK: (f32, f32) = (0.0, 0.90);
 
-/// Longest delay the line can hold, in seconds. Two seconds covers a whole bar
-/// at 30 bpm.
-const MAX_DELAY_SECS: f32 = 2.0;
+/// Longest the line can hold, in seconds. Three heads means the last one wants
+/// nearly three times the first, so this is what bounds head one's time.
+const MAX_TAPE_SECS: f32 = 6.0;
 
-/// A stereo delay whose time follows the session tempo.
-struct Delay {
-    left: Vec<f32>,
-    right: Vec<f32>,
+/// How fast the transport reaches a new speed, as a fraction per sample.
+///
+/// **This is a motor, and the number is why the pitch slides.** A delay whose
+/// length jumps is a click; one whose length ramps is a varispeed, and a
+/// varispeed is what a capstan changing speed IS. Slow enough to hear the
+/// slide, fast enough to arrive inside a bar.
+const TAPE_SLEW: f32 = 0.000_02;
+
+/// Wow: the slow one, in hertz and in fraction of the delay.
+///
+/// Under about 4 Hz by definition. Roland attributes the RE-201's "pleasing
+/// chorus effect" to mechanical friction and tape slip, and this is that.
+const WOW_HZ: f32 = 0.72;
+
+/// Flutter: the fast one. Above 4 Hz, and on the real transport it is the
+/// pinch roller's own rotation — a roller that has been parked against the
+/// capstan for thirty years has a flat on it, and the period of that flat is
+/// the period of the warble everybody is imitating.
+const FLUTTER_HZ: f32 = 6.3;
+
+/// How far the two move the tape, as a fraction of the delay, at full depth.
+const WOW_DEPTH: f32 = 0.0035;
+const FLUTTER_DEPTH: f32 = 0.0011;
+
+/// Where the record amplifier starts to round things off.
+///
+/// Tape does not clip; it compresses, and it starts long before anything a
+/// meter would call overload. The curve is `tanh`, which is what a saturating
+/// magnetic medium's transfer function looks like near the origin and is one
+/// instruction where a hysteresis model is a differential equation.
+const TAPE_DRIVE: f32 = 1.6;
+
+/// The playback loss, as a one-pole corner in hertz at each end of the tone
+/// control.
+///
+/// **Each pass is darker than the last, and that is the whole reason tape echo
+/// sits under a piano.** Head gap loss, spacing loss and the tape's own
+/// self-erasure all take the top off, every trip round the loop, so the
+/// fifteenth repeat is a soft thud where the first was a note.
+const TAPE_TONE_HZ: (f32, f32) = (1_100.0, 7_500.0);
+
+/// The bass lift the record amplifier's head bump puts back, and where.
+///
+/// The RE-201's own Bass control is +10 dB at 100 Hz per the service manual;
+/// this is the fixed part of that character, the low-end thickening that is
+/// there whether or not anybody touches the tone controls.
+const TAPE_BUMP_HZ: f32 = 100.0;
+const TAPE_BUMP: f32 = 0.18;
+
+/// How loud the hiss is, relative to full scale.
+///
+/// **Roland skipped the compander.** Every other bucket-brigade and tape echo
+/// of the era wrapped its delay path in one to bury the noise; the RE-201 got
+/// a noise gate instead, so the hiss arrives with the note and leaves with it.
+/// That is why it is modelled: a silent tape echo is a delay, and the noise
+/// coming up under a held chord as the repeats build is the sound.
+const TAPE_HISS: f32 = 2.2e-5;
+
+/// Read `len` samples back from `at`, interpolating.
+///
+/// Free rather than a method because the chorus reads its own line the same
+/// way, and two implementations of "read backwards with a fraction" is two
+/// chances to get the wraparound wrong.
+#[inline]
+fn tap(buf: &[f32], at: usize, len: f32) -> f32 {
+    let n = buf.len();
+    let whole = len as usize;
+    let frac = len - whole as f32;
+    // `+ n` before the subtraction: `at` is smaller than `whole` for the first
+    // pass through the buffer, and this is unsigned.
+    let a = (at + n - whole.min(n - 1)) % n;
+    let b = (a + n - 1) % n;
+    buf[a] * (1.0 - frac) + buf[b] * frac
+}
+
+/// The spring tank, in parallel with the tape.
+///
+/// **Three springs in a "Z", per Roland**, and they are coupled — each one's
+/// motion drives the others, which is where a spring's chirp and its rattle
+/// both come from. Modelled as three dispersive delay lines with a little
+/// cross-feed rather than as a physical spring: a spring is a dispersive
+/// waveguide and this is the cheap end of that family, which is the right end
+/// for something that is one of twelve positions on a switch.
+struct Spring {
+    line: [Vec<f32>; 3],
     at: usize,
-    /// Feedback lowpass state, one per channel.
-    store: [f32; 2],
-    /// Current delay in samples, smoothed towards the target.
-    len: [f32; 2],
+    /// Two allpasses per spring, which is what makes the chirp rather than an
+    /// echo. A real tank has far more dispersion than this; two is where it
+    /// starts reading as a spring instead of a slap.
+    ap: [[AllPass; 2]; 3],
+    lp: [f32; 3],
+}
+
+/// Spring lengths, in samples at [`DESIGN_RATE`]. Mutually prime, and short —
+/// a tank is a few tens of milliseconds, not a room.
+const SPRING_LEN: [usize; 3] = [1_237, 1_499, 1_783];
+/// How much of each spring's output drives the next. The "Z".
+const SPRING_COUPLE: f32 = 0.22;
+/// How long the tank rings.
+const SPRING_FEEDBACK: f32 = 0.76;
+/// The allpass coefficient that makes the chirp.
+const SPRING_DISPERSION: f32 = -0.62;
+
+impl Spring {
+    fn new(sample_rate: f32) -> Self {
+        let scale = |n: usize| ((n as f32) * sample_rate / DESIGN_RATE).max(1.0) as usize;
+        Self {
+            line: std::array::from_fn(|i| vec![0.0; scale(SPRING_LEN[i])]),
+            at: 0,
+            ap: [[AllPass::default(); 2]; 3],
+            lp: [0.0; 3],
+        }
+    }
+
+    #[inline]
+    fn process(&mut self, x: f32) -> f32 {
+        let mut out = 0.0;
+        let mut prev = 0.0;
+        for i in 0..3 {
+            let n = self.line[i].len();
+            let at = self.at % n;
+            let mut v = self.line[i][at];
+            out += v;
+            // The chirp.
+            for ap in &mut self.ap[i] {
+                v = ap.process(v, SPRING_DISPERSION);
+            }
+            // A tank is not a tweeter.
+            self.lp[i] = flush(v * 0.35 + self.lp[i] * 0.65);
+            v = self.lp[i];
+            self.line[i][at] = flush(x + v * SPRING_FEEDBACK + prev * SPRING_COUPLE);
+            prev = v;
+        }
+        self.at = self.at.wrapping_add(1);
+        out * 0.33
+    }
+
+    fn clear(&mut self) {
+        for l in &mut self.line {
+            l.fill(0.0);
+        }
+        self.at = 0;
+        self.ap = [[AllPass::default(); 2]; 3];
+        self.lp = [0.0; 3];
+    }
+}
+
+/// A three-head tape echo whose first head follows the session tempo.
+struct TapeEcho {
+    /// The tape itself. **One loop, mono**, because that is what is in the
+    /// machine: the three heads read the same magnetisation at three points.
+    tape: Vec<f32>,
+    at: usize,
+    /// Head one's delay in samples, slewed towards the target. The other two
+    /// are this times [`HEAD_RATIO`].
+    len: f32,
+    /// Playback loss state, one per output channel plus one in the loop.
+    loss: f32,
+    /// The head bump's state.
+    bump: f32,
+    /// Where the two modulators are, in turns.
+    wow: f32,
+    flutter: f32,
+    /// Hiss generator. A plain xorshift: this is tape noise, not a random
+    /// number anybody is betting on, and it must not allocate or lock.
+    noise: u32,
+    spring: Spring,
     sample_rate: f32,
 }
 
-/// How fast the delay time slews towards a new tempo, per sample.
-///
-/// A tempo change while notes are ringing must not be a click. Slow enough to
-/// be a tape machine spinning up, fast enough to arrive within a bar.
-const DELAY_SLEW: f32 = 0.00002;
-
-impl Delay {
+impl TapeEcho {
     fn new(sample_rate: f32) -> Self {
-        let cap = (sample_rate * MAX_DELAY_SECS) as usize + 2;
+        let cap = (sample_rate * MAX_TAPE_SECS) as usize + 2;
         Self {
-            left: vec![0.0; cap],
-            right: vec![0.0; cap],
+            tape: vec![0.0; cap],
             at: 0,
-            store: [0.0; 2],
-            len: [sample_rate * FREE_SECS; 2],
+            len: sample_rate * FREE_SECS,
+            loss: 0.0,
+            bump: 0.0,
+            wow: 0.0,
+            flutter: 0.37,
+            noise: 0x1234_5678,
+            spring: Spring::new(sample_rate),
             sample_rate,
         }
     }
 
-    /// Where the delay time is heading, in samples, from the tempo.
-    fn target(&self, bpm: f64, p: &Params) -> [f32; 2] {
+    /// Where head one's time is heading, in samples, from the tempo.
+    ///
+    /// **Head one, and the others follow.** The longest head reaches nearly
+    /// three times this, so the cap has to be taken against that rather than
+    /// against head one, or mode 11 at a slow tempo reads off the end of the
+    /// tape.
+    fn target(&self, bpm: f64, p: &Params) -> f32 {
         let secs = match p.delay_division.beats() {
             Some(beats) if bpm.is_finite() && bpm > 1.0 => (60.0 / bpm) as f32 * beats,
             _ => FREE_SECS,
         };
-        let cap = (self.left.len() - 2) as f32;
-        let l = (secs * self.sample_rate).clamp(1.0, cap);
-        // Width closes the two channels together rather than opening them
-        // apart: at 0 they are the same length, which is a mono delay.
-        let ratio = 1.0 - (1.0 - DELAY_RIGHT_RATIO) * p.delay_width;
-        [l, (l * ratio).clamp(1.0, cap)]
+        let cap = (self.tape.len() - 2) as f32 / HEAD_RATIO[2];
+        (secs * self.sample_rate).clamp(1.0, cap)
     }
 
-    /// Read `len` samples back, interpolating, so a slewing time glides.
-    ///
-    /// Associated rather than a method: the chorus reads its own buffer the
-    /// same way, and two implementations of "read backwards with a fraction"
-    /// is two chances to get the wraparound wrong.
+    /// One frame. `input` is stereo but the tape is mono — the machine has one
+    /// record head — so the two are summed on the way in and the heads are
+    /// spread across the pair on the way out.
     #[inline]
-    fn tap(buf: &[f32], at: usize, len: f32) -> f32 {
-        let n = buf.len();
-        let whole = len as usize;
-        let frac = len - whole as f32;
-        // `+ n` before the subtraction: `at` is smaller than `whole` for the
-        // first pass through the buffer, and this is unsigned.
-        let a = (at + n - whole.min(n - 1)) % n;
-        let b = (a + n - 1) % n;
-        buf[a] * (1.0 - frac) + buf[b] * frac
-    }
+    fn process(&mut self, input: [f32; 2], target: f32, p: &Params) -> [f32; 2] {
+        let mode = p.echo_mode;
+        let heads = mode.heads();
+        let feedback =
+            TAPE_FEEDBACK.0 + (TAPE_FEEDBACK.1 - TAPE_FEEDBACK.0) * p.delay_feedback.clamp(0.0, 1.0);
 
-    #[inline]
-    fn process(&mut self, input: [f32; 2], target: [f32; 2], p: &Params) -> [f32; 2] {
-        let feedback = DELAY_FEEDBACK.0 + (DELAY_FEEDBACK.1 - DELAY_FEEDBACK.0) * p.delay_feedback;
-        // Inverted: tone UP is less damping, which is what a tone control does.
-        let damp = DELAY_DAMP.1 - (DELAY_DAMP.1 - DELAY_DAMP.0) * p.delay_tone;
-        let mut out = [0.0_f32; 2];
-        for ch in 0..2 {
-            self.len[ch] += (target[ch] - self.len[ch]).clamp(
-                -DELAY_SLEW * self.sample_rate,
-                DELAY_SLEW * self.sample_rate,
-            );
-            let buf = if ch == 0 { &self.left } else { &self.right };
-            let wet = Self::tap(buf, self.at, self.len[ch]);
-            self.store[ch] = flush(wet * (1.0 - damp) + self.store[ch] * damp);
-            let write = flush(input[ch] + self.store[ch] * feedback);
-            if ch == 0 {
-                self.left[self.at] = write;
-            } else {
-                self.right[self.at] = write;
-            }
-            out[ch] = wet;
+        // ── the transport ───────────────────────────────────────────────
+        //
+        // The length CHASES rather than jumps, and everything about how this
+        // sounds while it moves comes from that. See `TAPE_SLEW`.
+        let step = TAPE_SLEW * self.sample_rate;
+        self.len += (target - self.len).clamp(-step, step);
+
+        self.wow += WOW_HZ / self.sample_rate;
+        if self.wow >= 1.0 {
+            self.wow -= 1.0;
         }
-        self.at = (self.at + 1) % self.left.len();
-        out
+        self.flutter += FLUTTER_HZ / self.sample_rate;
+        if self.flutter >= 1.0 {
+            self.flutter -= 1.0;
+        }
+        let warble = (std::f32::consts::TAU * self.wow).sin() * WOW_DEPTH
+            + (std::f32::consts::TAU * self.flutter).sin() * FLUTTER_DEPTH;
+
+        // ── the heads ───────────────────────────────────────────────────
+        let mut wet = [0.0_f32; 2];
+        let mut loop_sum = 0.0_f32;
+        let cap = (self.tape.len() - 2) as f32;
+        let width = p.delay_width.clamp(0.0, 1.0);
+        for (i, on) in heads.iter().enumerate() {
+            if !on {
+                continue;
+            }
+            let len = (self.len * HEAD_RATIO[i] * (1.0 + warble)).clamp(1.0, cap);
+            let v = tap(&self.tape, self.at, len);
+            // **The heads spread across the pair, and at width 0 they do not.**
+            // The machine is mono; this is the one liberty taken with it, and
+            // it is a liberty a person can turn off. Head 1 sits left, head 3
+            // right, head 2 in the middle, which puts the rhythm the ratios
+            // make into the image as well as the time.
+            let pan = match i {
+                0 => -1.0,
+                2 => 1.0,
+                _ => 0.0,
+            } * width;
+            wet[0] += v * (1.0 - pan).min(1.0);
+            wet[1] += v * (1.0 + pan).min(1.0);
+            loop_sum += v;
+        }
+
+        // ── the loop ────────────────────────────────────────────────────
+        //
+        // Everything that makes a repeat sound older than the one before it
+        // happens here, once per trip round the tape.
+        //
+        // The playback loss first: gap loss, spacing loss and self-erasure all
+        // take the top off, and the tone control moves where.
+        let tone = p.delay_tone.clamp(0.0, 1.0);
+        let corner = TAPE_TONE_HZ.0 + (TAPE_TONE_HZ.1 - TAPE_TONE_HZ.0) * tone;
+        let a = (-std::f32::consts::TAU * corner / self.sample_rate).exp();
+        self.loss = flush(loop_sum * (1.0 - a) + self.loss * a);
+        let mut back = self.loss;
+
+        // The head bump: a little of the very bottom put back, which is what a
+        // record head's geometry does and why tape echo thickens as it repeats
+        // rather than just darkening.
+        let ba = (-std::f32::consts::TAU * TAPE_BUMP_HZ / self.sample_rate).exp();
+        self.bump = flush(back * (1.0 - ba) + self.bump * ba);
+        back += self.bump * TAPE_BUMP;
+
+        // Hiss, INSIDE the loop, so it builds with the repeats exactly as it
+        // does on the machine. See `TAPE_HISS`.
+        self.noise ^= self.noise << 13;
+        self.noise ^= self.noise >> 17;
+        self.noise ^= self.noise << 5;
+        let hiss = (self.noise as f32 / u32::MAX as f32 - 0.5) * TAPE_HISS;
+
+        // The record amplifier and the tape. `tanh` because magnetic media
+        // compress rather than clip, and because a bounded nonlinearity in a
+        // feedback path is what keeps a high Intensity from becoming a
+        // divergence rather than a howl.
+        let dry = (input[0] + input[1]) * 0.5;
+        let write = (dry + back * feedback + hiss) * TAPE_DRIVE;
+        self.tape[self.at] = flush(write.tanh() / TAPE_DRIVE);
+        self.at += 1;
+        if self.at >= self.tape.len() {
+            self.at = 0;
+        }
+
+        // ── the spring ──────────────────────────────────────────────────
+        //
+        // In PARALLEL with the tape and fed from the dry, which is where
+        // Roland put it: not inside the echo's feedback, so the reverb does
+        // not repeat and the repeats are not reverberated.
+        if mode.reverb() {
+            let s = self.spring.process(dry);
+            wet[0] += s;
+            wet[1] += s;
+        }
+        wet
     }
 
     fn clear(&mut self) {
-        self.left.fill(0.0);
-        self.right.fill(0.0);
-        self.store = [0.0; 2];
+        self.tape.fill(0.0);
+        self.loss = 0.0;
+        self.bump = 0.0;
+        self.spring.clear();
     }
 }
 
@@ -1119,7 +1507,7 @@ impl Chorus {
 
         let mut wet = [0.0_f32; 2];
         for ch in 0..2 {
-            let tapped = Delay::tap(&self.buf[ch], self.at, len);
+            let tapped = tap(&self.buf[ch], self.at, len);
             self.lp[ch] = flush(tapped * (1.0 - a) + self.lp[ch] * a);
             wet[ch] = self.lp[ch];
             self.buf[ch][self.at] = flush(input[ch]);
@@ -1748,7 +2136,7 @@ impl Sends {
 /// The three effects on the instrument bus.
 pub struct Effects {
     plate: Plate,
-    delay: Delay,
+    echo: TapeEcho,
     chorus: Chorus,
     phaser: Phaser,
     hpf: [Filter; 2],
@@ -1806,7 +2194,7 @@ impl Effects {
         Self {
             wet_only,
             plate: Plate::new(sr),
-            delay: Delay::new(sr),
+            echo: TapeEcho::new(sr),
             chorus: Chorus::new(sr),
             phaser: Phaser::new(sr),
             hpf: [Filter::default(); 2],
@@ -1889,7 +2277,7 @@ impl Effects {
             }
             return;
         }
-        let target = self.delay.target(bpm, p);
+        let target = self.echo.target(bpm, p);
         // **Decay changes how long, not how loud**, and the arithmetic is the
         // same one the Freeverb here used to need — only the loop it is
         // solved against has changed.
@@ -2054,7 +2442,7 @@ impl Effects {
             } else {
                 chorused
             };
-            let wet_d = self.delay.process(phased, target, p);
+            let wet_d = self.echo.process(phased, target, p);
             let into_verb = [
                 phased[0] + wet_d[0] * self.mix.delay,
                 phased[1] + wet_d[1] * self.mix.delay,
@@ -2154,7 +2542,7 @@ impl Effects {
     /// Drop every tail. Called when every knob reaches zero, and on a stop.
     pub fn clear(&mut self) {
         self.plate.clear();
-        self.delay.clear();
+        self.echo.clear();
         self.chorus.clear();
         for f in self.hpf.iter_mut().chain(self.lpf.iter_mut()) {
             f.clear();
@@ -3265,6 +3653,308 @@ mod tests {
         }
     }
 
+    /// Where the repeats land, in seconds, for one mode. Feedback off, so
+    /// what comes back is the heads and not a train of them.
+    fn head_arrivals(mode: EchoMode, frames: usize) -> Vec<f32> {
+        let p = Params {
+            echo_mode: mode,
+            delay_feedback: 0.0,
+            // Mono: the heads pan apart at the shipped width, and a test that
+            // measured one channel would find head three quiet for a reason
+            // that has nothing to do with where it is.
+            delay_width: 0.0,
+            ..Params::default()
+        };
+        let mut fx = Effects::new_send(SR);
+        let mut warm = vec![0.0_f32; 2 * 96_000];
+        fx.process(&mut warm, 96_000, 2, sends(0.0, 1.0, 0.0), &p, 120.0);
+        let out = strike_with(&mut fx, frames, sends(0.0, 1.0, 0.0), &p, 120.0);
+
+        let mag: Vec<f32> = out.chunks_exact(2).map(|f| f[0].abs()).collect();
+        let ceiling = mag.iter().skip(64).fold(0.0_f32, |m, v| m.max(*v));
+        // Local maxima that are a real fraction of the loudest arrival, with a
+        // guard so one repeat cannot be counted twice.
+        let mut hits = Vec::new();
+        let mut last = 0usize;
+        for i in 64..mag.len() - 1 {
+            if mag[i] > ceiling * 0.25 && mag[i] >= mag[i - 1] && mag[i] > mag[i + 1] {
+                if i - last > 2_000 {
+                    hits.push(i as f32 / SR);
+                }
+                last = i;
+            }
+        }
+        hits
+    }
+
+    /// **The three heads are not evenly spaced, and the ratios are the sound.**
+    ///
+    /// They were meant to be 1 : 2 : 3 and they are not — measurements on real
+    /// machines put them nearer 1 : 1.94 : 2.85, because the spacing was never
+    /// exact and the tape path was never quite straight. An emulation on the
+    /// round numbers is tidier than any RE-201 ever was, and the tidiness is
+    /// the thing people hear as wrong.
+    #[test]
+    fn the_three_heads_sit_where_the_machine_puts_them() {
+        let hits = head_arrivals(EchoMode::Eleven, 96_000);
+        assert!(
+            hits.len() >= 3,
+            "wanted three arrivals from all three heads, found {hits:?}"
+        );
+        let first = hits[0];
+        for (i, want) in HEAD_RATIO.iter().enumerate() {
+            let got = hits[i] / first;
+            assert!(
+                (got - want).abs() < 0.06,
+                "head {} landed at {got:.3} times the first, wanted {want:.3} \
+                 (arrivals {hits:?})",
+                i + 1
+            );
+        }
+    }
+
+    /// **Every position of the Mode Selector is a different machine.**
+    ///
+    /// Roland's own table, checked one position at a time: the right number of
+    /// arrivals, at the right multiples of head one. A switch whose twelve
+    /// positions were not twelve different things would be a switch nobody
+    /// needed, and this is the only part of the emulation where being wrong is
+    /// silent — a mode that quietly reads the wrong head still makes a repeat.
+    #[test]
+    fn the_mode_selector_switches_the_heads_roland_says_it_does() {
+        // Head one's own time, from the mode that can only be head one.
+        let unit = head_arrivals(EchoMode::One, 96_000)[0];
+        for mode in EchoMode::ALL {
+            let live: Vec<usize> = mode
+                .heads()
+                .iter()
+                .enumerate()
+                .filter(|(_, on)| **on)
+                .map(|(i, _)| i)
+                .collect();
+            if live.is_empty() {
+                // Reverb only: the tape is out of circuit entirely.
+                let hits = head_arrivals(mode, 96_000);
+                assert!(
+                    hits.is_empty() || hits.iter().all(|t| *t < unit * 0.5),
+                    "{} produced tape repeats at {hits:?}",
+                    mode.label()
+                );
+                continue;
+            }
+            let hits = head_arrivals(mode, 144_000);
+            assert_eq!(
+                hits.len(),
+                live.len(),
+                "{} should sound {} head(s), found arrivals at {hits:?}",
+                mode.label(),
+                live.len()
+            );
+            for (hit, head) in hits.iter().zip(&live) {
+                let got = hit / unit;
+                let want = HEAD_RATIO[*head];
+                assert!(
+                    (got - want).abs() < 0.08,
+                    "{} put head {} at {got:.3} units, wanted {want:.3}",
+                    mode.label(),
+                    head + 1
+                );
+            }
+        }
+    }
+
+    /// **The spring is in seven of the twelve, and only those seven.**
+    ///
+    /// Positions one to four are the tape alone and twelve is the spring
+    /// alone. Getting this backwards is inaudible in the code and obvious in
+    /// the room — and `reverb()` is one `matches!` away from covering the
+    /// wrong four.
+    #[test]
+    fn the_spring_is_in_circuit_exactly_where_the_table_says() {
+        // Between head one's time and the shortest repeat: anything here came
+        // from the spring, because no head reads this early.
+        let spring_energy = |mode: EchoMode| {
+            let p = Params {
+                echo_mode: mode,
+                delay_feedback: 0.0,
+                ..Params::default()
+            };
+            let mut fx = Effects::new_send(SR);
+            let out = strike_with(&mut fx, 12_000, sends(0.0, 1.0, 0.0), &p, 120.0);
+            // Head one is at 375 ms; 12 000 frames is 250 ms, so nothing the
+            // tape makes can be in this window at all.
+            peak(&out)
+        };
+        for mode in EchoMode::ALL {
+            let e = spring_energy(mode);
+            if mode.reverb() {
+                assert!(
+                    e > 1.0e-5,
+                    "{} is supposed to have the spring in it and made {e:e}",
+                    mode.label()
+                );
+            } else {
+                assert!(
+                    e < 1.0e-6,
+                    "{} is tape only and something rang at {e:e}",
+                    mode.label()
+                );
+            }
+        }
+    }
+
+    /// **Every repeat is older than the one before it.**
+    ///
+    /// Head gap loss, spacing loss and the tape's own self-erasure take the
+    /// top off on every trip round the loop, which is the whole reason a tape
+    /// echo sits under a piano where a clean digital delay competes with it.
+    /// Measured as a spectral centroid rather than a level: the repeats get
+    /// quieter too, and quieter is not the claim.
+    #[test]
+    fn each_repeat_is_darker_than_the_one_before() {
+        let p = Params {
+            delay_feedback: 0.85,
+            delay_width: 0.0,
+            ..Params::default()
+        };
+        let mut fx = Effects::new_send(SR);
+        let mut warm = vec![0.0_f32; 2 * 96_000];
+        fx.process(&mut warm, 96_000, 2, sends(0.0, 1.0, 0.0), &p, 120.0);
+        let out = strike_with(&mut fx, 96_000, sends(0.0, 1.0, 0.0), &p, 120.0);
+
+        // How much of a window's energy is above a few kilohertz, as a share
+        // of all of it. A one-pole split is plenty to answer "is this darker".
+        let brightness = |from: usize, to: usize| {
+            let a = (-std::f32::consts::TAU * 3_000.0 / SR).exp();
+            let (mut z, mut hi, mut all) = (0.0_f32, 0.0_f64, 0.0_f64);
+            for f in out[from * 2..to * 2].chunks_exact(2) {
+                z = f[0] * (1.0 - a) + z * a;
+                let h = f64::from(f[0] - z);
+                hi += h * h;
+                all += f64::from(f[0]) * f64::from(f[0]);
+            }
+            hi / all.max(1.0e-30)
+        };
+
+        // 375 ms a repeat at 120 bpm: the first around 18 000 frames, the
+        // fourth around 72 000.
+        let first = brightness(16_000, 20_000);
+        let fourth = brightness(70_000, 74_000);
+        assert!(
+            fourth < first * 0.8,
+            "the first repeat was {first:.4} bright and the fourth {fourth:.4}: \
+             the tape is not losing anything"
+        );
+    }
+
+    /// **Tape compresses; it does not clip.** Twenty decibels more going in
+    /// has to come out as less than twenty more, or the record amplifier is a
+    /// wire and the machine is a digital delay with a filter on it.
+    #[test]
+    fn the_tape_saturates_rather_than_clipping() {
+        let level = |amp: f32| {
+            let p = Params {
+                delay_feedback: 0.2,
+                delay_width: 0.0,
+                ..Params::default()
+            };
+            let mut fx = Effects::new_send(SR);
+            let mut warm = vec![0.0_f32; 2 * 96_000];
+            fx.process(&mut warm, 96_000, 2, sends(0.0, 1.0, 0.0), &p, 120.0);
+            let mut out = vec![0.0_f32; 48_000 * 2];
+            out[0] = amp;
+            out[1] = amp;
+            fx.process(&mut out, 48_000, 2, sends(0.0, 1.0, 0.0), &p, 120.0);
+            peak(&out)
+        };
+        let quiet = level(0.05);
+        let loud = level(0.5);
+        let ratio = loud / quiet.max(1.0e-12);
+        assert!(
+            ratio < 9.0,
+            "ten times the input came back {ratio:.2} times as loud: nothing \
+             is saturating"
+        );
+        assert!(
+            ratio > 2.0,
+            "ten times the input came back only {ratio:.2} times as loud: that \
+             is not compression, it is a brick wall"
+        );
+    }
+
+    /// **The transport warbles, and that is the chorus everybody means.**
+    ///
+    /// Roland attribute the RE-201's "pleasing chorus effect" to mechanical
+    /// friction and tape slip rather than to anything they designed in. Wow
+    /// under 4 Hz and flutter above it move the heads, which moves the pitch —
+    /// so a held tone comes back with its own beat against itself.
+    #[test]
+    fn the_tape_warbles() {
+        let p = Params {
+            delay_feedback: 0.0,
+            delay_width: 0.0,
+            ..Params::default()
+        };
+        let mut fx = Effects::new_send(SR);
+        let frames = 96_000;
+        let mut buf = vec![0.0_f32; frames * 2];
+        for (i, f) in buf.chunks_exact_mut(2).enumerate() {
+            let v = (i as f32 * 440.0 * std::f32::consts::TAU / SR).sin() * 0.5;
+            f[0] = v;
+            f[1] = v;
+        }
+        fx.process(&mut buf, frames, 2, sends(0.0, 1.0, 0.0), &p, 120.0);
+
+        // **Measured as phase, not as level**, and the first version of this
+        // test got that wrong: moving a delay line moves the PITCH of what is
+        // coming out of it and leaves the amplitude alone, so an envelope
+        // measurement of a warbling sine reads dead flat. It did — 0.41497
+        // against 0.41498 — and said the tape was running perfectly.
+        //
+        // Timing the upward zero crossings against a perfectly regular grid
+        // integrates the frequency error instead of sampling it, so a
+        // fraction of a percent of speed variation shows up as whole samples
+        // of drift.
+        let y: Vec<f32> = buf.chunks_exact(2).map(|f| f[0]).collect();
+        let mut cross = Vec::new();
+        for i in 24_000..y.len() - 1 {
+            if y[i] <= 0.0 && y[i + 1] > 0.0 {
+                // Linear interpolation, so this is sub-sample and the
+                // measurement is not quantised to the thing being measured.
+                let t = f64::from(-y[i]) / f64::from(y[i + 1] - y[i]);
+                cross.push(i as f64 + t);
+            }
+        }
+        assert!(cross.len() > 200, "not enough tone came back to time");
+
+        // Straight line through the first and last crossing: whatever is left
+        // is the transport moving rather than the tone being at a slightly
+        // different pitch than assumed.
+        let (t0, t1) = (cross[0], cross[cross.len() - 1]);
+        let step = (t1 - t0) / (cross.len() - 1) as f64;
+        let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+        for (k, t) in cross.iter().enumerate() {
+            let d = t - (t0 + step * k as f64);
+            lo = lo.min(d);
+            hi = hi.max(d);
+        }
+        let spread = hi - lo;
+        assert!(
+            spread > 1.0,
+            "the crossings drifted by {spread:.3} samples against a regular \
+             grid: the tape is running perfectly, which no tape does"
+        );
+    }
+
+    /// A mode round-trips through the string the settings file stores.
+    #[test]
+    fn a_mode_round_trips_through_its_key() {
+        for mode in EchoMode::ALL {
+            assert_eq!(EchoMode::from_key(mode.key()), Some(mode), "{mode:?}");
+        }
+        assert_eq!(EchoMode::from_key("nonsense"), None);
+    }
+
     /// **The chorus is wide, and the width control is what makes it wide.**
     /// The CE-1's trick is one delay line inverted into the right channel; at
     /// full width the two outputs must be opposite, and at zero they must not.
@@ -3431,6 +4121,7 @@ mod tests {
                         plate_dispersion: b,
                         plate_predelay: a,
                         delay_division: division,
+                        echo_mode: EchoMode::Eleven,
                         delay_feedback: a,
                         delay_tone: b,
                         delay_width: b,
