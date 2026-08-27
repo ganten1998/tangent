@@ -11054,9 +11054,13 @@ impl IvoryApp {
         let peaks = self.meter_hold;
         let (view_start_s, view_len_s) = self.arr_window_now();
         crate::arrangement_panel::ArrangeView {
+            // No UI to open it yet — the row exists so the tempo work and
+            // the automation lanes have somewhere to land.
+            show_tempo_lane: false,
             lanes: std::array::from_fn(|n| {
                 let kind = self.channel_kind(n);
                 crate::arrangement_panel::LaneView {
+                    automation_open: false,
                     route_count: self.settings.routes.from(n).len(),
                     name: self.channel_display_name(n),
                     input: self.input_chip_text(n),

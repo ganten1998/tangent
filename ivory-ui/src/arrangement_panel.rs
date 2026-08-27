@@ -54,6 +54,8 @@ pub struct LaneView<'a> {
     /// How many routes leave this lane, for the ROUTING chip.
     pub route_count: usize,
     pub muted: bool,
+    /// This lane's automation curve is showing, in a row of its own under it.
+    pub automation_open: bool,
     pub soloed: bool,
     /// Linear, as the mixer fader sits. The header knob is the same value.
     pub gain: f32,
@@ -114,6 +116,8 @@ pub struct ArrangeView<'a> {
     /// A MIDI item being drawn by shift-drag right now: lane, from, to —
     /// ghosted until the button comes up and the document takes it.
     pub pending: Option<(usize, f64, f64)>,
+    /// The tempo and meter map get a lane of their own, above the tracks.
+    pub show_tempo_lane: bool,
     /// The zoom window, in seconds of song.
     pub view_start_s: f64,
     pub view_len_s: f64,
@@ -224,6 +228,18 @@ impl Hit {
 /// under 120.
 const HEADER_W: (f32, f32, f32) = (0.16, 150.0, 220.0);
 
+/// How tall the tempo lane is against a track lane.
+///
+/// Shorter, because it carries one curve and a handful of markers where a
+/// track carries clips with names, waveforms and fades in them. Tall enough
+/// that a tempo point is something you can aim at.
+const TEMPO_LANE_SHARE: f32 = 0.55;
+
+/// The same for an automation sub-lane, and the same reasoning: a curve
+/// needs less room than the clips it belongs under, and the track it hangs
+/// off must not shrink to make space for it.
+const AUTO_LANE_SHARE: f32 = 0.55;
+
 /// The ruler's height in points. Short — it is a scale, not a band.
 const RULER_H: (f32, f32, f32) = (0.06, 16.0, 24.0);
 
@@ -235,6 +251,34 @@ const FADE_W: f32 = 11.0;
 
 /// Where everything is. Fractions of the rect, derived once, read by both
 /// the painter and the hit test.
+/// What one row on the timeline IS.
+///
+/// **The arrangement had exactly one kind of row and the layout said so** —
+/// `lane_rows: [Rect; CHANNELS]`, every row the same height, indexed by
+/// channel. That is the shape a tempo lane and an automation sub-lane both
+/// have to break, and if each broke it separately the second would rewrite
+/// the first. So it breaks once, here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowKind {
+    /// A channel's own lane, carrying its clips. `usize` is the channel.
+    Track(usize),
+    /// The tempo and meter map, above the tracks. One row, whatever the
+    /// song's shape: tempo is a property of the SONG and not of a channel.
+    Tempo,
+    /// An automation curve under the track it belongs to.
+    Automation(usize),
+}
+
+/// One row of the timeline, and where it is on both sides of the grip.
+#[derive(Debug, Clone, Copy)]
+pub struct Row {
+    pub kind: RowKind,
+    /// In `lanes_area` — where the clips or the curve are drawn.
+    pub lane: Rect,
+    /// In `header` — the name, the dials, the buttons.
+    pub header: Rect,
+}
+
 pub struct Layout {
     pub header: Rect,
     pub ruler: Rect,
@@ -248,8 +292,26 @@ pub struct Layout {
     pub lanes_area: Rect,
     /// The draggable seam between headers and lanes.
     pub grip: Rect,
+    /// **Every row, in drawn order — the source of truth.**
+    ///
+    /// `lane_rows` and `header_rows` below are PROJECTIONS of this, kept
+    /// because eight call sites ask "where is channel `i`'s lane" and that is
+    /// a fair question with a direct answer. They are derived in one place
+    /// rather than computed twice, so the two cannot disagree about where a
+    /// row is — which is the failure a parallel layout would have.
+    pub rows: Vec<Row>,
     pub lane_rows: [Rect; CHANNELS],
     pub header_rows: [HeaderRow; CHANNELS],
+}
+
+impl Layout {
+    /// The row a point falls in, if any.
+    pub fn row_at(&self, pos: Pos2) -> Option<Row> {
+        self.rows
+            .iter()
+            .copied()
+            .find(|r| r.lane.contains(pos) || r.header.contains(pos))
+    }
 }
 
 /// One header's cells.
@@ -315,6 +377,7 @@ impl Layout {
                 tool_nav: Rect::NOTHING,
                 lanes_area: Rect::NOTHING,
                 grip: Rect::NOTHING,
+                rows: Vec::new(),
                 lane_rows: [Rect::NOTHING; CHANNELS],
                 header_rows: [HeaderRow::NONE; CHANNELS],
             };
@@ -359,18 +422,68 @@ impl Layout {
         let visible = view.visible_lanes.clamp(1, CHANNELS);
         let lane_h = lanes_area.height() / visible as f32;
         let first = view.lane_scroll.min(CHANNELS.saturating_sub(visible));
-        let row_at = |top: f32, left: f32, right: f32, i: usize| -> Rect {
-            if i < first || i >= first + visible {
-                return Rect::NOTHING;
+
+        // **The rows, stacked in order, and the arrays derived from them.**
+        //
+        // A track row is `lane_h` tall — the height every row used to be —
+        // so a song with nothing expanded lays out exactly as it did before
+        // rows existed. `the_layout_is_unchanged_when_nothing_is_expanded`
+        // is what holds that true, and it is the assertion that matters: a
+        // rewrite of the thing every clip is positioned against has to be a
+        // no-op until somebody asks for the new part.
+        //
+        // A row that would hang off the bottom of the area is `NOTHING`, the
+        // same as a scrolled-off lane always was — not drawn, not hit, and
+        // clips on it resolve to nothing through `clip_rect`'s filter.
+        let mut rows: Vec<Row> = Vec::with_capacity(CHANNELS + 1);
+        let mut y = lanes_area.top();
+        let mut push = |kind: RowKind, h: f32, y: &mut f32, rows: &mut Vec<Row>| {
+            let bottom = *y + h;
+            // Wholly inside, or not at all: a half-height lane at the bottom
+            // edge is a control you cannot read and a clip you cannot aim at.
+            let fits = bottom <= lanes_area.bottom() + 0.5 && h > 0.0;
+            let cut = |left: f32, right: f32| {
+                if fits {
+                    Rect::from_min_max(Pos2::new(left, *y), Pos2::new(right, bottom))
+                } else {
+                    Rect::NOTHING
+                }
+            };
+            rows.push(Row {
+                kind,
+                lane: cut(lanes_area.left(), lanes_area.right()),
+                header: cut(header.left(), header.right()),
+            });
+            if fits {
+                *y = bottom;
             }
-            let y = top + lane_h * (i - first) as f32;
-            Rect::from_min_max(Pos2::new(left, y), Pos2::new(right, y + lane_h))
         };
-        let lane_rows = std::array::from_fn(|i| {
-            row_at(lanes_area.top(), lanes_area.left(), lanes_area.right(), i)
-        });
+        // The tempo lane sits ABOVE the tracks when it is showing: it is a
+        // property of the song, and a song-wide row below the channels would
+        // scroll away from the ruler it belongs to.
+        if view.show_tempo_lane {
+            push(RowKind::Tempo, lane_h * TEMPO_LANE_SHARE, &mut y, &mut rows);
+        }
+        for i in first..CHANNELS {
+            push(RowKind::Track(i), lane_h, &mut y, &mut rows);
+            if view.lanes.get(i).is_some_and(|l| l.automation_open) {
+                push(RowKind::Automation(i), lane_h * AUTO_LANE_SHARE, &mut y, &mut rows);
+            }
+        }
+
+        let lane_of = |want: usize| {
+            rows.iter()
+                .find(|r| r.kind == RowKind::Track(want))
+                .map_or(Rect::NOTHING, |r| r.lane)
+        };
+        let header_of = |want: usize| {
+            rows.iter()
+                .find(|r| r.kind == RowKind::Track(want))
+                .map_or(Rect::NOTHING, |r| r.header)
+        };
+        let lane_rows = std::array::from_fn(lane_of);
         let header_rows = std::array::from_fn(|i| {
-            let row = row_at(header.top(), header.left(), header.right(), i);
+            let row = header_of(i);
             let Some(lane) = view.lanes.get(i).filter(|_| row.is_positive()) else {
                 return HeaderRow::NONE;
             };
@@ -425,6 +538,7 @@ impl Layout {
                 Pos2::new(rect.left() + header_w + GRIP_W, rect.bottom()),
             ),
 
+            rows,
             lane_rows,
             header_rows,
         }
@@ -1986,7 +2100,8 @@ mod tests {
     use super::*;
 
     fn a_lane(used: bool) -> LaneView<'static> {
-        LaneView {
+LaneView {
+            automation_open: false,
             route_count: 0,
             stereo: true,
             inserts: [""; crate::recorder::INSERTS],
@@ -2043,7 +2158,8 @@ mod tests {
     }
 
     fn a_view<'a>(clips: &'a [ClipView<'a>]) -> ArrangeView<'a> {
-        ArrangeView {
+ArrangeView {
+            show_tempo_lane: false,
             fx_strip: (0xE3, 0xD9, 0xBD),
             meter_bg: (0x0B, 0x0E, 0x0A),
             header_w: None,
@@ -2289,6 +2405,109 @@ mod tests {
         match hit_test(r, &v, Pos2::new(x, l.ruler.center().y)) {
             Some(Hit::Ruler(t)) => assert!((t - 60.0).abs() < 0.2, "ruler read {t}"),
             other => panic!("the ruler answered {other:?}"),
+        }
+    }
+
+    /// **The rewrite is a no-op until something is expanded.**
+    ///
+    /// The layout is what every clip is positioned against and every hit is
+    /// resolved through, so replacing the fixed-height array with a row list
+    /// has to change NOTHING while the new row kinds are switched off. This
+    /// reproduces the old arithmetic independently — `lanes_area.height() /
+    /// visible`, stacked from `lane_scroll` — and demands the rows agree,
+    /// rather than comparing the new code against itself.
+    #[test]
+    fn the_layout_is_unchanged_when_nothing_is_expanded() {
+        for visible in [1_usize, 4, 8, CHANNELS] {
+            for scroll in [0_usize, 1, 5] {
+                let mut v = a_view(&[]);
+                v.visible_lanes = visible;
+                v.lane_scroll = scroll;
+                let l = Layout::new(rect(), &v);
+
+                let lane_h = l.lanes_area.height() / visible as f32;
+                let first = scroll.min(CHANNELS.saturating_sub(visible));
+                for i in 0..CHANNELS {
+                    let got = l.lane_rows[i];
+                    if i < first || i >= first + visible {
+                        assert!(
+                            !got.is_positive(),
+                            "lane {i} is laid out at visible={visible} scroll={scroll}"
+                        );
+                        continue;
+                    }
+                    let want_top = l.lanes_area.top() + lane_h * (i - first) as f32;
+                    assert!(
+                        (got.top() - want_top).abs() < 0.5,
+                        "lane {i} moved to {} from {want_top} (visible={visible} \
+                         scroll={scroll})",
+                        got.top()
+                    );
+                    assert!(
+                        (got.height() - lane_h).abs() < 0.5,
+                        "lane {i} is {}pt tall, not {lane_h}",
+                        got.height()
+                    );
+                    // The header row is the same band on the other side of
+                    // the grip — they are one row, and a clip that drew
+                    // against a header a few points out is the whole reason
+                    // both come from one list now.
+                    assert!(
+                        (l.header_rows[i].panel.top() - got.top()).abs() < 0.5,
+                        "lane {i}'s header and lane disagree about where the row is"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A tempo lane and an automation lane push the tracks down, and the
+    /// track keeps its own height.
+    #[test]
+    fn the_new_rows_take_their_room_from_the_area_and_not_from_the_track() {
+        let mut v = a_view(&[]);
+        v.visible_lanes = 8;
+        let plain = Layout::new(rect(), &v);
+        let track_h = plain.lane_rows[0].height();
+
+        v.show_tempo_lane = true;
+        v.lanes[0].automation_open = true;
+        let l = Layout::new(rect(), &v);
+
+        // The tempo row is first, above every track.
+        let first = l.rows.first().expect("no rows");
+        assert_eq!(first.kind, RowKind::Tempo);
+        assert!(
+            first.lane.top() <= l.lane_rows[0].top() + 0.5,
+            "the tempo lane is not above the tracks"
+        );
+        // The automation row sits directly under the track it belongs to.
+        let auto = l
+            .rows
+            .iter()
+            .find(|r| r.kind == RowKind::Automation(0))
+            .expect("no automation row");
+        assert!(
+            (auto.lane.top() - l.lane_rows[0].bottom()).abs() < 0.5,
+            "lane 0's automation is not under lane 0"
+        );
+        // **The track did not shrink.** A sub-lane takes room from the area,
+        // not from the clips it belongs to — a track that got shorter every
+        // time you opened a curve would make the curve unusable and the
+        // clips too.
+        assert!(
+            (l.lane_rows[0].height() - track_h).abs() < 0.5,
+            "opening a curve shrank the track from {track_h} to {}",
+            l.lane_rows[0].height()
+        );
+        // ...so something falls off the bottom instead, and what falls off
+        // is NOTHING rather than a half-height row.
+        for r in &l.rows {
+            assert!(
+                !r.lane.is_positive() || r.lane.bottom() <= l.lanes_area.bottom() + 0.5,
+                "{:?} hangs off the bottom of the area",
+                r.kind
+            );
         }
     }
 
