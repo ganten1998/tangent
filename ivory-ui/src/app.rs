@@ -12074,6 +12074,28 @@ impl IvoryApp {
             return;
         };
         let travel = on.travel();
+        // **An arrow moves a VALUE. A button has none, so an arrow is not
+        // for it.**
+        //
+        // Without this the dispatch below ran anyway: a button carries
+        // `travel: None`, the point fell back to the control's own centre,
+        // `hit_test` found the button sitting at it, and the arrow pressed
+        // it. Reachable that way were the band's Play, Record and Stop, the
+        // desk's mutes and solos — and two that destroy something with no
+        // confirmation, `Hit::ClearTrack` and `Hit::Remove`. That is the
+        // exact class of surprise the confirmations elsewhere on this branch
+        // exist to prevent, arrived at from the other direction.
+        //
+        // **Returned rather than swallowed**, and the difference is
+        // deliberate: this happens BEFORE the event-retain at the end, so the
+        // arrow goes on to whatever else wants it. Up and Down are this app's
+        // transpose, and a key that stopped working because something
+        // invisible had focus would be its own bug. A focused SLIDER still
+        // swallows, which is the ordinary rule — the focused thing takes the
+        // key when the key means something to it.
+        if travel.is_none() && !matches!(gesture, crate::a11y::Gesture::Activate) {
+            return;
+        }
         // What the control reads AFTER the press. `Activate` leaves it alone —
         // pressing a fader is not moving it.
         let want = travel.map(|t| {
@@ -14005,7 +14027,18 @@ impl IvoryApp {
                 self.settings.detached_chord_height = size.y.round() as i64;
             }
         }
-        self.detector.set_note_preference(true);
+        // **What the settings NOW say, not a hardcoded true.**
+        //
+        // This was `true` and it was harmless while a reset meant
+        // `*self = first_launch()`, which set `prefer_flats = true` as well —
+        // the two agreed by accident. Scoped resets break the accident: only
+        // `take_playing` touches `prefer_flats`, deliberately, so a sharps
+        // user resetting their COLOURS would have kept the setting and had
+        // the detector switched to flats underneath it. The chord readout
+        // would spell flats while the menu row, the staff and the new spoken
+        // note all still said sharps, until they toggled the row or
+        // restarted.
+        self.detector.set_note_preference(self.settings.prefer_flats);
         self.manual_notes.clear();
         self.manual_positions.clear();
         self.fret_window_visible = false;
@@ -20884,6 +20917,126 @@ mod tests {
             (moved - crate::a11y::STEP).abs() < 1e-3,
             "one press moved the fader {moved} rather than {}",
             crate::a11y::STEP
+        );
+    }
+
+    /// **An arrow key on a focused BUTTON does not press it.**
+    ///
+    /// The bug this catches was mine and it was live: `nudge_focused` read
+    /// any gesture and dispatched it, checking only whether there was a value
+    /// to move AFTER deciding to act. A button carries `travel: None`, so the
+    /// point fell back to the control's own centre, `hit_test` found the
+    /// button sitting at it, and the arrow pressed it.
+    ///
+    /// Two of the reachable ones destroy something with no confirmation —
+    /// the band's Remove-the-loaded-file and the desk's Remove-channel —
+    /// which is precisely the class of surprise the confirmation work
+    /// elsewhere on this branch exists to prevent.
+    ///
+    /// Arrows still FALL THROUGH rather than being swallowed: Up and Down are
+    /// this app's transpose, and a key that quietly stopped working because
+    /// something invisible had focus would be its own bug.
+    #[test]
+    fn an_arrow_key_on_a_focused_button_does_not_press_it() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        pointer_frame(&ctx, &mut app, Vec::new());
+        let _ = app.take_recorder_request();
+
+        // Play is an ordinary button: no travel, nothing to nudge.
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new(("band", "play"))));
+        pointer_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::ArrowUp,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(
+            app.take_recorder_request().is_none(),
+            "an arrow key pressed a focused button"
+        );
+
+        // ...and Space still does, because that is what Activate means.
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new(("band", "play"))));
+        pointer_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::Space,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(
+            app.take_recorder_request().is_some(),
+            "Space on a focused button did nothing, so the button is unreachable"
+        );
+    }
+
+    /// The same on the DESK, where the destructive one lives.
+    ///
+    /// The desk's arm never even built a point: it passed
+    /// `want.unwrap_or(0.0)` straight to `apply_mixer_hit`, and the
+    /// button-shaped hits ignore the value entirely — `Mute`/`Solo` XOR their
+    /// masks and `Remove` deletes the channel.
+    #[test]
+    fn an_arrow_key_on_a_desk_button_does_not_press_it() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.keytoggle_enabled = false;
+        let _ = run_frame(&ctx, &mut app);
+        app.mixer_open = true;
+        let _ = run_frame(&ctx, &mut app);
+        let rect = app.mixer_rect.expect("mixer did not open");
+
+        // The first channel's mute, found the way the nodes name it.
+        let (id, before) = {
+            let v = app.mixer_view();
+            let nodes = crate::mixer_panel::a11y_nodes(rect, &v);
+            let mute = nodes
+                .iter()
+                .find(|n| n.label.contains("mute"))
+                .expect("no mute node on the desk");
+            (mute.id, app.settings.strip_muted)
+        };
+        ctx.memory_mut(|m| m.request_focus(id));
+        pointer_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::ArrowUp,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(
+            app.settings.strip_muted, before,
+            "an arrow key toggled a focused mute"
+        );
+
+        // ...and Space still does.
+        ctx.memory_mut(|m| m.request_focus(id));
+        pointer_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::Space,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_ne!(
+            app.settings.strip_muted, before,
+            "Space on a focused mute did nothing, so the desk is unreachable"
         );
     }
 
