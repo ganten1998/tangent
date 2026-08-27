@@ -4651,6 +4651,18 @@ impl DesktopApp {
                 // drop it so `reconcile_reastream` takes a fresh one from this
                 // engine. Its thread stops when the socket and consumer drop.
                 self.recorder.reastream = None;
+                // **And it knows nothing about the song's musical time.** A
+                // fresh `Renderer` starts at `Maps::default()` — 120 and 4/4 —
+                // while `push_maps` is change-detected against what the LAST
+                // engine was told. Leaving the cache alone means the equality
+                // check short-circuits on the very next frame and `set_maps`
+                // is never called again, so the click plays 120/4/4 for the
+                // rest of the session while the ruler draws the real bar
+                // lines. Silent, and sticky until somebody edits the tempo.
+                //
+                // Not covered by `set_tempo`: `BarClock` reads `Renderer::maps`
+                // on the audio thread, not the per-frame tempo atomic.
+                self.pushed_maps = None;
                 // A fresh engine has nothing loaded, whatever was loaded in
                 // the one it replaces — forgetting that here is what asks the
                 // reconcile below to fill the bays again.
@@ -6528,6 +6540,49 @@ impl DesktopApp {
 #[cfg(all(test, feature = "recorder"))]
 mod tests {
     use super::*;
+
+    /// **A fresh engine is told the song's musical time.**
+    ///
+    /// `push_maps` is change-detected against `pushed_maps` because
+    /// `set_maps` moves a `Vec` across a ring and blocks until the displaced
+    /// pair comes back — it cannot run per frame. That makes the cache a
+    /// promise about a PARTICULAR engine, and `start_engine` replaces the
+    /// engine: a fresh `Renderer` begins at `Maps::default()`, 120 and 4/4.
+    /// Leaving the cache alone means the equality check short-circuits on the
+    /// next frame and `set_maps` is never called again, so the click plays
+    /// 120/4/4 for the rest of the session while the ruler draws the song's
+    /// real bar lines. Silent, and sticky until somebody edits the tempo.
+    ///
+    /// **A source scan, and the reason is that `DesktopApp` cannot be built
+    /// in a test** — it owns real devices, a window and an engine. The two
+    /// scanning tests in `settings.rs` set the precedent for a rule that
+    /// cannot be expressed as a runtime assertion. It is narrow on purpose:
+    /// it locks in the invalidation somebody would otherwise remove while
+    /// tidying, and it will not notice a NEW engine-scoped cache being
+    /// forgotten, which is a limit worth knowing rather than pretending away.
+    #[test]
+    fn a_restarted_engine_is_told_the_tempo_map_again() {
+        let src = include_str!("desktop.rs");
+        let start = src
+            .find("fn start_engine")
+            .expect("the engine starter is still called that");
+        let body = &src[start..start + 4_000];
+        assert!(
+            body.contains("self.pushed_maps = None;"),
+            "`start_engine` does not invalidate the tempo-map cache, so the new \
+             engine keeps 120/4/4 while the document says otherwise"
+        );
+        // Beside the siblings it belongs with, which is what makes it get
+        // noticed by the next person editing that block.
+        let reastream = body.find("self.recorder.reastream = None;").expect("sibling");
+        let maps = body.find("self.pushed_maps = None;").expect("checked above");
+        let inserts = body.find("self.recorder.inserts_loaded").expect("sibling");
+        assert!(
+            reastream < maps && maps < inserts,
+            "the map invalidation drifted away from the other engine-scoped \
+             resets; keep them together or the next one is forgotten too"
+        );
+    }
 
     /// **The MP3 pass writes a real MPEG stream.** A sine goes in, a file
     /// the app's own decoder accepts comes out — encode and decode meeting
