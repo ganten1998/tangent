@@ -1646,6 +1646,20 @@ impl DesktopApp {
                 .map(|&(st, b)| e.insert_editor_open(st, b))
                 .collect();
             e.poll_editor();
+            // **Ask the open plugins whether their latency moved.**
+            //
+            // Only while a window is (or was, this frame) open: `was` and
+            // not the post-poll state, so the frame an editor closes on is
+            // still covered. A preset click is the thing that changes a
+            // plugin's latency, and clicking presets means looking at it.
+            // See `Engine::poll_latency` for why not a timer and why not
+            // on-close-only.
+            if was.iter().any(|&w| w) && e.poll_latency() {
+                // The engine republishes the alignment from the atomics on
+                // its own next block; this is only so the READOUT catches up
+                // in the same breath rather than on the next mouse move.
+                ctx.request_repaint();
+            }
             // An editor that has just closed is a preset that has just been
             // chosen. Save then, rather than only at quit, because the gap
             // between the two is where a force-quit loses the sound.

@@ -22,7 +22,7 @@ pub mod scan;
 pub mod state;
 
 pub use editor::{Editor, EditorError, EditorHandle};
-pub use instance::{Bus, Control, Instance, Note, Rendered, Setup};
+pub use instance::{Bus, Control, Instance, LatencyHandle, Note, Rendered, Setup};
 pub use ready::{Policy, Readiness, State as ReadyState};
 pub use scan::{discover, discover_in, search_paths, vendor_of, ClassInfo, Module};
 pub use state::{StateHandle, MAX_STATE_BYTES};

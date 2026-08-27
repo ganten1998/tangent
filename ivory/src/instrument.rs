@@ -1637,9 +1637,35 @@ struct Shared {
     /// person can see is the difference between "the mix feels smeared" and
     /// "that compressor is costing you 64 frames". Written every block from
     /// the racks themselves, so a swap cannot leave a stale figure.
+    /// What each BAY's plugin delays by, written by the main thread and read
+    /// by the callback.
+    ///
+    /// **In atomics rather than in the box**, because the figure has two
+    /// authors and they are on different threads: it is first known at load
+    /// and can change whenever a preset does, and only the main thread may
+    /// ask a plugin for it. A voice writes zero — a voice is where the
+    /// signal begins, so its own latency delays nothing upstream.
+    seat_latency: Vec<AtomicU32>,
     lane_latency: [AtomicU32; CHANNELS],
-    /// The graph-wide maximum, which is what everything else is aligned to.
+    /// **What everything is aligned TO** — the largest of the sixteen
+    /// channel chains, and nothing else.
+    ///
+    /// The master is deliberately not in it. Everything passes through the
+    /// master on its way out, so its delay reaches every source equally and
+    /// cannot pull anything out of phase with anything else — but putting it
+    /// in the target made every channel and every clip wait for it FIRST,
+    /// and then the master added it again on the way out. A 30-frame
+    /// mastering limiter cost 60 frames between touching a key and hearing
+    /// it. Nothing was out of alignment; it was just twice as slow to play.
     max_latency: AtomicU32,
+    /// **What is SHOWN** — the whole delay somebody is actually paying,
+    /// master included.
+    ///
+    /// A separate number because a readout that hides latency you are paying
+    /// is worth nothing, and an alignment target that includes a delay
+    /// everything already shares costs you that delay twice. One atomic
+    /// served both and the two wanted different answers.
+    total_latency: AtomicU32,
     soloed: AtomicU32,
     /// The six effect knobs, 0..=1. Three of them are sends on the effects bus
     /// and three are inserts on the master — see `effects.rs`, and see
@@ -1776,8 +1802,10 @@ impl Shared {
             pad_peak: std::array::from_fn(|_| AtomicU32::new(0)),
             muted: AtomicU32::new(0),
             auto_suspend: AtomicU32::new(0),
+            seat_latency: (0..RACK_SEATS * INSERTS).map(|_| AtomicU32::new(0)).collect(),
             lane_latency: std::array::from_fn(|_| AtomicU32::new(0)),
             max_latency: AtomicU32::new(0),
+            total_latency: AtomicU32::new(0),
             soloed: AtomicU32::new(0),
             gr_db: AtomicU32::new(0),
             reverb_mix: AtomicU32::new(0.0f32.to_bits()),
@@ -1923,16 +1951,6 @@ struct Hosted {
     /// `MAX_BLOCK` so `Instance::process`'s internal `resize` never allocates.
     bufs: Vec<Vec<f32>>,
     channels: usize,
-    /// How many frames this plugin delays its output by, asked of it after
-    /// activation and carried IN the box for the reason `voice` gives: the
-    /// audio thread may not trust an index a UI thread wrote about which bay
-    /// holds what.
-    ///
-    /// **Read once at load and again when the plugin says so.** A lookahead
-    /// limiter reports nothing until it has been told its block size, and
-    /// several samplers change the figure on a preset change — which is why
-    /// `kLatencyChanged` is no longer thrown away.
-    latency: u32,
 }
 
 /// The `Instance` on its way into or out of the audio callback.
@@ -2120,16 +2138,24 @@ impl Rack {
     /// Recomputed from the boxes rather than cached, so a swap cannot leave
     /// a stale figure behind — three loads and two adds, once a block, and
     /// there is nowhere for it to go wrong.
-    fn latency(&self) -> u32 {
-        self.slots
-            .iter()
-            .filter_map(|s| s.0.as_ref())
-            // A VOICE is where the signal begins, so whatever it reports is
-            // not a delay imposed on anything upstream — there is no
-            // upstream. Counting it would push every other lane late to
-            // match a delay nobody can hear.
-            .filter(|p| !p.voice)
-            .map(|p| p.latency)
+    /// Record what one bay's plugin delays by. Answers whether it MOVED,
+    /// so a caller polling every frame can do nothing on the frames where
+    /// nothing happened — which is nearly all of them.
+    ///
+    /// Out of range is a silent `false` rather than a panic: this is reached
+    /// from the plugin-load path, and a bay index that does not exist is a
+    /// bay with nothing in it, delaying nothing.
+    fn set_latency(shared: &Shared, seat: usize, bay: usize, frames: u32) -> bool {
+        let Some(cell) = shared.seat_latency.get(seat * INSERTS + bay) else {
+            return false;
+        };
+        cell.swap(frames, Ordering::Relaxed) != frames
+    }
+
+    fn latency(shared: &Shared, seat: usize) -> u32 {
+        (0..INSERTS)
+            .filter_map(|b| shared.seat_latency.get(seat * INSERTS + b))
+            .map(|c| c.load(Ordering::Relaxed))
             .sum()
     }
 
@@ -4147,23 +4173,28 @@ impl Renderer {
     fn publish_latency(&self) {
         let mut max = 0;
         for lane in 0..CHANNELS {
+            // `lane`, emphatically not `STRIPS`. Asking every channel for
+            // the MASTER's figure reads plausibly and is wrong twice over:
+            // the readout says each of the sixteen costs what the master
+            // costs, and a limiter on the master alone drags every channel
+            // into compensating for a delay it does not have.
             let l = self
                 .racks
                 .get(lane)
-                .map_or(0, Rack::latency);
+                .map_or(0, |_| Rack::latency(&self.shared, lane));
             self.shared.lane_latency[lane].store(l, Ordering::Relaxed);
             max = max.max(l);
         }
-        // The master's chain delays everything equally, so it cannot pull
-        // anything out of alignment — but it IS latency somebody is paying,
-        // and the readout is a truthful one or it is worth nothing.
-        let master = self
-            .racks
-            .get(ivory_ui::recorder::STRIPS)
-            .map_or(0, Rack::latency);
+        // **The alignment target is the channels alone.** See `max_latency`:
+        // the master delays every source equally, so aligning to it makes
+        // everything wait for a delay it is going to pay again anyway.
+        self.shared.max_latency.store(max, Ordering::Relaxed);
+        // ...and the READOUT is the whole of it, because a figure that hides
+        // latency somebody is paying is worth nothing.
+        let master = Rack::latency(&self.shared, ivory_ui::recorder::STRIPS);
         self.shared
-            .max_latency
-            .store(max.max(master), Ordering::Relaxed);
+            .total_latency
+            .store(max.saturating_add(master), Ordering::Relaxed);
     }
 
     /// The mute mask with automation folded in.
@@ -5082,7 +5113,7 @@ impl Renderer {
             // plugin off does not leave the lane early by its own latency
             // for one block before the figures catch up.
             {
-                let own = self.racks.get(ch).map_or(0, Rack::latency);
+                let own = Rack::latency(&self.shared, ch);
                 let want = usize::try_from(pdc_max.saturating_sub(own)).unwrap_or(0);
                 if let Some(line) = self.pdc.get_mut(ch) {
                     line.run(&mut self.fx_in, frames, want);
@@ -5472,6 +5503,11 @@ pub struct Engine {
     /// ever had one before, so every effect's knobs and every bay instrument's
     /// preset died with the process.
     insert_state_handles: [[Option<ivory_host::StateHandle>; INSERTS]; RACK_SEATS],
+    /// How to ask each seated plugin its latency again, from THIS thread.
+    ///
+    /// The audio thread holds the instance and may not make the call; it can
+    /// only be told the figure has gone stale. See `poll_latency`.
+    insert_latency_handles: [[Option<ivory_host::LatencyHandle>; INSERTS]; RACK_SEATS],
     /// Why a bay's saved state was not restored, if it was not.
     ///
     /// A stale or hand-edited blob must not stop the plugin loading — the
@@ -5892,6 +5928,7 @@ impl Engine {
             insert_editors: std::array::from_fn(|_| std::array::from_fn(|_| None)),
             insert_editor_handles: std::array::from_fn(|_| std::array::from_fn(|_| None)),
             insert_state_handles: std::array::from_fn(|_| std::array::from_fn(|_| None)),
+            insert_latency_handles: std::array::from_fn(|_| std::array::from_fn(|_| None)),
             insert_state_errors: std::array::from_fn(|_| std::array::from_fn(|_| None)),
             hold: Cell::new((0.0, 0.0)),
             hold_at: Cell::new(Instant::now()),
@@ -5971,6 +6008,17 @@ impl Engine {
             {
                 *h = None;
             }
+            if let Some(h) = self
+                .insert_latency_handles
+                .get_mut(strip)
+                .and_then(|r| r.get_mut(slot))
+            {
+                *h = None;
+            }
+            // An emptied bay delays nothing. Left standing, its old figure
+            // would hold every other lane late forever, waiting on a plugin
+            // that is no longer there.
+            Rack::set_latency(&self.shared, strip, slot, 0);
             // A refused UNLOAD changes nothing worth reporting: the box is
             // empty, and the seat keeps its tenant until the callback drains
             // the ring or the engine is torn down.
@@ -6053,6 +6101,20 @@ impl Engine {
         // every relaunch, which until now they did.
         let editor_handle = inst.editor_handle();
         let state_handle = inst.state_handle();
+        // The third of the three cloned pointers this host keeps once an
+        // instance has gone to the audio thread. See `Instance::latency_handle`.
+        //
+        // **A VOICE gets none of it**, and so is never polled and never
+        // counted: a voice is where the signal begins, so its own delay
+        // holds nothing else up, and counting it would push every other lane
+        // late to match a delay nobody can hear.
+        let latency_handle = (!voice).then(|| inst.latency_handle());
+        // **After activation and after the state was loaded**, which is why
+        // it is read here and not where the instance was made: VST3 says the
+        // figure means nothing before that, a lookahead limiter has nothing
+        // to report until it knows its block size, and a preset restored
+        // from a saved state can change the answer.
+        let latency_now = if voice { 0 } else { inst.latency_samples() };
         let loaded = Loaded {
             bundle: bundle.to_path_buf(),
             class: class.name.clone(),
@@ -6080,17 +6142,17 @@ impl Engine {
         {
             *h = None;
         }
+        if let Some(h) = self
+            .insert_latency_handles
+            .get_mut(strip)
+            .and_then(|r| r.get_mut(slot))
+        {
+            *h = None;
+        }
         if let Some(refused) = self.hand_off_insert(
             strip,
             slot,
             PluginBox(Some(Box::new(Hosted {
-                // **After activation and after the state is loaded**, which
-                // is why it is read here and not where the instance is made.
-                // VST3 says the figure is only meaningful once the processor
-                // is set up and active; a lookahead limiter that has not been
-                // told its block size has nothing to report yet, and a preset
-                // restored from a saved state can change the answer.
-                latency: inst.latency_samples(),
                 inst,
                 module,
                 bufs: vec![vec![0.0; MAX_BLOCK as usize]; channels.max(TAP_CHANNELS)],
@@ -6128,6 +6190,14 @@ impl Engine {
         {
             *h = Some(state_handle);
         }
+        if let Some(h) = self
+            .insert_latency_handles
+            .get_mut(strip)
+            .and_then(|r| r.get_mut(slot))
+        {
+            *h = latency_handle;
+        }
+        Rack::set_latency(&self.shared, strip, slot, latency_now);
         self.inserts_loaded[strip][slot] = Some(loaded.clone());
         if let Some(e) = self
             .insert_state_errors
@@ -6274,6 +6344,49 @@ impl Engine {
             .get(strip)
             .and_then(|r| r.get(slot))
             .is_some_and(Option::is_some)
+    }
+
+    /// Ask any plugin that says its latency changed for the new figure.
+    ///
+    /// **Called while an editor is OPEN, which is when a preset changes.**
+    /// The obvious alternative — a timer — pays for itself sixty times a
+    /// minute for ever to catch something that only happens while somebody
+    /// is looking at a plugin's window. And the obvious cheap version —
+    /// re-reading on editor CLOSE — misses the ordinary case, which is
+    /// clicking through presets with the window still open and then playing.
+    ///
+    /// Nothing can change while no window is open, because this host does
+    /// not forward program changes: `midi_event::parse_message` takes note
+    /// on, note off and CC 64 and nothing else, and a test asserts it. So a
+    /// plugin here cannot be told to change preset behind your back.
+    ///
+    /// A voice is never seen here: it is given no handle at load, so the
+    /// loop below skips it and its bay stays at zero.
+    ///
+    /// Answers whether anything moved, so the caller can push a fresh
+    /// figure rather than doing it every frame.
+    pub fn poll_latency(&mut self) -> bool {
+        let mut moved = false;
+        for strip in 0..RACK_SEATS {
+            for slot in 0..INSERTS {
+                let Some(h) = self
+                    .insert_latency_handles
+                    .get(strip)
+                    .and_then(|r| r.get(slot))
+                    .and_then(Option::as_ref)
+                else {
+                    continue;
+                };
+                if !h.take_dirty() {
+                    continue;
+                }
+                let now = h.latency_samples();
+                if Rack::set_latency(&self.shared, strip, slot, now) {
+                    moved = true;
+                }
+            }
+        }
+        moved
     }
 
     /// Notice windows the user closed and let go of them. Call once a frame.
@@ -7000,12 +7113,18 @@ impl Engine {
     ///
     /// Plain numbers across the firewall, like everything else a panel
     /// learns about the engine.
+    /// What each channel's inserts cost, and the WHOLE delay through the
+    /// desk — master included, because that is what a person is waiting on.
+    ///
+    /// Not `max_latency`, which is the narrower number the aligners use. See
+    /// both fields on `Shared`.
     pub fn latency_frames(&self) -> ([u32; CHANNELS], u32) {
         (
             std::array::from_fn(|i| self.shared.lane_latency[i].load(Ordering::Relaxed)),
-            self.shared.max_latency.load(Ordering::Relaxed),
+            self.shared.total_latency.load(Ordering::Relaxed),
         )
     }
+
 
     pub fn set_auto_suspend(&self, mask: u32) {
         self.shared.auto_suspend.store(mask, Ordering::Relaxed);
@@ -8521,30 +8640,105 @@ mod tests {
         }
     }
 
-    /// A rack's latency is the SUM of its bays, and a voice is not in it.
+    /// Write one bay's figure the way `set_seat_latency` does, without a
+    /// plugin: what is asserted below is the arithmetic and the indexing,
+    /// and a real VST3 would only be a slower way to reach it.
+    fn seat(shared: &Shared, strip: usize, bay: usize, frames: u32) -> bool {
+        Rack::set_latency(shared, strip, bay, frames)
+    }
+
+    /// A rack's latency is the SUM of its bays.
     #[test]
     fn a_chains_latency_is_the_sum_of_what_is_in_it() {
-        // Built by hand rather than through a real plugin, which needs a
-        // module on disk: the arithmetic is what is being asserted.
-        let rack = |lat: [Option<(u32, bool)>; INSERTS]| -> u32 {
-            lat.iter()
-                .flatten()
-                .filter(|(_, voice)| !voice)
-                .map(|(l, _)| l)
-                .sum()
-        };
-        assert_eq!(rack([None, None, None]), 0);
-        assert_eq!(rack([Some((64, false)), None, None]), 64);
+        let shared = Shared::new();
+        assert_eq!(Rack::latency(&shared, 0), 0);
+        assert!(seat(&shared, 0, 0, 64), "0 -> 64 is a change");
+        assert!(!seat(&shared, 0, 0, 64), "and writing it again is not");
+        assert_eq!(Rack::latency(&shared, 0), 64);
         // In SERIES: three plugins looking ahead 64 each delay by 192.
-        assert_eq!(
-            rack([Some((64, false)), Some((64, false)), Some((64, false))]),
-            192
-        );
+        seat(&shared, 0, 1, 64);
+        seat(&shared, 0, 2, 64);
+        assert_eq!(Rack::latency(&shared, 0), 192);
+        // **Each seat is its own**, which is the whole reason the figures
+        // live in an indexed table rather than inside the boxes: a bay is
+        // read by the seat it sits in, and one rack's contents never leak
+        // into another's total.
+        assert_eq!(Rack::latency(&shared, 1), 0, "channel 1 has nothing in it");
         // **A voice is where the signal BEGINS**, so its own figure is not a
-        // delay imposed on anything upstream — there is no upstream.
-        // Counting it would push every other lane late to match a delay
-        // nobody can hear.
-        assert_eq!(rack([Some((512, true)), Some((32, false)), None]), 32);
+        // delay imposed on anything upstream — there is no upstream, and
+        // counting it would push every other lane late to match a delay
+        // nobody can hear. It is kept out at the source: a voice is given no
+        // `LatencyHandle` at load and writes a zero into its bay, so by the
+        // time the sum runs there is nothing to filter.
+        assert!(
+            !seat(&shared, 1, 0, 0),
+            "a bay that was already empty has not moved"
+        );
+        seat(&shared, 1, 1, 32);
+        assert_eq!(Rack::latency(&shared, 1), 32);
+        // A seat past the end of the table is a seat with nothing in it, and
+        // says so instead of panicking: this is reached from the load path.
+        assert!(!seat(&shared, RACK_SEATS, 0, 99));
+    }
+
+    /// **Two figures, because one number cannot answer both questions.**
+    ///
+    /// What everything is ALIGNED to is the channels alone. What is SHOWN is
+    /// the whole delay, master included. A single atomic served both and got
+    /// one of them wrong whichever way it was written: leave the master out
+    /// and the readout lies about latency you are paying; put it in and
+    /// every channel and every clip waits for the master's delay *before*
+    /// the master adds it again on the way out, so a 30-frame mastering
+    /// limiter costs 60 frames between the key and the sound.
+    #[test]
+    fn the_alignment_target_and_the_readout_are_different_numbers() {
+        let shared = Arc::new(Shared::new());
+        let (tap_tx, _tap_rx) = RingBuffer::<f32>::new(1 << 16);
+        let r = test_renderer(Arc::clone(&shared), tap_tx, 2);
+
+        // Nothing loaded: both are zero and there is nothing to tell apart.
+        r.publish_latency();
+        assert_eq!(shared.max_latency.load(Ordering::Relaxed), 0);
+        assert_eq!(shared.total_latency.load(Ordering::Relaxed), 0);
+
+        // A limiter on the MASTER only. Everything downstream of every
+        // channel, so it pulls nothing out of phase with anything.
+        seat(&shared, ivory_ui::recorder::STRIPS, 0, 30);
+        r.publish_latency();
+        assert_eq!(
+            shared.max_latency.load(Ordering::Relaxed),
+            0,
+            "no channel should wait for a delay that is applied after all of them"
+        );
+        assert_eq!(
+            shared.total_latency.load(Ordering::Relaxed),
+            30,
+            "but it is thirty frames somebody is paying, so it must be shown"
+        );
+
+        // Now a lookahead compressor on channel 3 alone.
+        seat(&shared, 3, 1, 128);
+        r.publish_latency();
+        let (lanes, shown) = (
+            std::array::from_fn::<u32, CHANNELS, _>(|i| {
+                shared.lane_latency[i].load(Ordering::Relaxed)
+            }),
+            shared.total_latency.load(Ordering::Relaxed),
+        );
+        // **Per-lane, and the lane it was actually put in.** Asking every
+        // channel for `STRIPS` — the master's seat — reads perfectly
+        // plausibly and is wrong twice: the readout claims all sixteen cost
+        // what the master costs, and one plugin on the master drags every
+        // channel into compensating for a delay it does not have.
+        assert_eq!(lanes[3], 128);
+        assert_eq!(lanes[0], 0, "channel 0 is empty and must say so");
+        assert_eq!(lanes[2], 0);
+        assert_eq!(
+            shared.max_latency.load(Ordering::Relaxed),
+            128,
+            "the other fifteen channels align to the slowest of them"
+        );
+        assert_eq!(shown, 158, "and the readout adds the master's on top");
     }
 
     /// **No site in the render path reads a fader behind automation's back.**
