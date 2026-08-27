@@ -2262,6 +2262,15 @@ pub enum NumField {
     /// `Min: -15` would be a field disagreeing with the label next to it.
     VariMin,
     VariMax,
+    /// The time signature that starts at one BAR of the arrangement, typed
+    /// on its own chip on the ruler.
+    ///
+    /// Carries the bar because there can be many of them, unlike [`Meter`],
+    /// which is the band's one song-wide signature.
+    ///
+    /// **Empty CLEARS the change** — except at bar zero, which a song must
+    /// always have a signature from.
+    MeterAt(u32),
     /// The varispeed dial, typed as a SIGNED PERCENTAGE — the number it
     /// reads. `+15`, `-7.5`, `0`. Typing 115 for fifteen percent up would be
     /// the field disagreeing with the readout directly above it.
