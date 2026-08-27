@@ -263,7 +263,12 @@ fn main() {
     // Settings are read before building the ViewportBuilder so the very first
     // frame is right-sized (DESIGN: fixed-size via Min+Max+Inner triple).
     let settings = Settings::load();
-    let size = ivory_ui::app::initial_window_size(&settings);
+    // Whatever the window was last dragged to, or the size its bands come to
+    // if it never has been. See `Settings::window_size_for_use`, which refuses
+    // a remembered size below the floor rather than clamping to it.
+    let size = settings
+        .window_size_for_use()
+        .unwrap_or_else(|| ivory_ui::app::initial_window_size(&settings));
 
     // The app icon MUST be set here. eframe applies its own embedded default
     // (the egui hexagon) whenever the viewport icon is None, and on macOS a
@@ -275,9 +280,21 @@ fn main() {
         .with_title("Tangent")
         .with_app_id("ivory")
         .with_inner_size(size)
-        .with_min_inner_size(size)
-        .with_max_inner_size(size)
-        .with_resizable(false)
+        // **Resizable, and the min is a floor rather than a pin.**
+        //
+        // It was `min = max = inner` plus `with_resizable(false)`, which is
+        // three ways of saying the same thing: this window has seven sizes,
+        // all of them percentages, and no edge you can drag. The audit called
+        // it out under accessibility and it was right to — a person who needs
+        // the app bigger than 200% or narrower than their screen had no move
+        // to make.
+        //
+        // Nothing about the LAYOUT required it. Every band's height is a pure
+        // function of the window's width, and the two solvers for an arbitrary
+        // rect have been in `app.rs` since the plugin shipped. See the layout
+        // branch in `IvoryApp::frame`.
+        .with_min_inner_size(ivory_ui::settings::MIN_WINDOW)
+        .with_resizable(true)
         .with_decorations(!settings.borderless_mode);
 
     // Reopen where it was last left. Monitors are not enumerable before the

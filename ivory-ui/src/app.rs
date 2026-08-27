@@ -776,6 +776,28 @@ pub struct IvoryApp {
     dialog: Option<Dialog>,
 
     last_sent_size: Option<Vec2>,
+    /// The minimum has been handed to the window manager. Once, not per
+    /// frame — see the send site.
+    min_sent: Option<bool>,
+    /// When the app last asked the window manager for a size — including at
+    /// startup, where the size is baked into the `ViewportBuilder`.
+    ///
+    /// **This is how a drag is told from a tile.** Under a tiling WM the size
+    /// we ask for is simply overruled, and recording the result as if the
+    /// user had chosen it is worse than recording nothing — that is how a
+    /// `detached_chord_height` of 1377 got into a settings file. Size alone
+    /// cannot tell the two apart; only timing can, which is what `WM_GRACE`
+    /// already does for the detached windows. A mismatch inside the grace is
+    /// the window manager; a mismatch after it is a hand on the edge.
+    size_asked_at: Option<Instant>,
+    /// A size the APP is asking for: a percentage preset, or the natural size
+    /// for a window nobody has dragged yet. Cleared when it is sent.
+    ///
+    /// Distinct from `pending_resize`, which is the PLUGIN's road: an editor
+    /// cannot set its own size and has to ask its host. This one is the
+    /// desktop's, and it exists because the window is no longer pinned, so
+    /// "make it the right size" is now a request rather than a standing fact.
+    pending_window_size: Option<Vec2>,
     decorations_sent: Option<bool>,
     /// While set, the size triple re-sends every frame — the decoration
     /// nudge. On X11 under a tiling WM (the owner's i3), toggling
@@ -1545,6 +1567,11 @@ impl IvoryApp {
             pending_welcome: welcome,
             splash_up: false,
             last_sent_size: None,
+            min_sent: None,
+            // The window opens at a size this app chose — see `main.rs` —
+            // so the grace runs from launch.
+            size_asked_at: Some(Instant::now()),
+            pending_window_size: None,
             decorations_sent: None,
             decor_nudge_until: None,
             main_inner_origin: Pos2::ZERO,
@@ -13145,7 +13172,22 @@ impl IvoryApp {
                 // do that itself — the request goes out over the plugin API,
                 // which `ivory-ui` has never heard of — so it records what it
                 // wants and the binary that does know picks it up.
-                if !self.caps.window_sizing {
+                if self.caps.window_sizing {
+                    // **The presets still mean something after free resize.**
+                    // They are the way to say "make the window the size these
+                    // bands actually want", which is the one size a hand on
+                    // the edge cannot find by feel — and it is how somebody
+                    // gets back to a sane shape after dragging into a
+                    // letterbox. It is a request now rather than a pin: the
+                    // window goes there and stays draggable.
+                    self.pending_window_size =
+                        Some(initial_window_size(&self.settings));
+                } else {
+                    // A host that owns the window has to be ASKED. The app
+                    // cannot do that itself — the request goes out over the
+                    // plugin API, which `ivory-ui` has never heard of — so it
+                    // records what it wants and the binary that does know
+                    // picks it up.
                     self.pending_resize = Some(initial_window_size(&self.settings));
                 }
             }
@@ -15404,27 +15446,45 @@ impl IvoryApp {
             self.main_live_pos = live_pos;
             self.geometry_save_at = Some(Instant::now() + GEOMETRY_SAVE_DELAY);
         }
-        self.main_live_size = inner_rect.map(|r| r.size());
+        // The SIZE arms the same debounce, which it never had to before: the
+        // window could not be resized, so the only thing that moved was where
+        // it sat. A drag that changes only the size and not the origin — the
+        // right or bottom edge — would otherwise never be written down.
+        let live_size = inner_rect.map(|r| r.size());
+        if live_size != self.main_live_size {
+            self.main_live_size = live_size;
+            self.geometry_save_at = Some(Instant::now() + GEOMETRY_SAVE_DELAY);
+        }
 
-        // Fixed-size enforcement: Min+Max+Inner triple whenever the target
-        // changes (size %, chord toggle, detach/attach).
-        // The desktop asks for a size and gets it. A plugin is GIVEN one, and
-        // has to lay out inside it — `main_width` would otherwise put a
-        // 1300-point layout into whatever the host opened, and the piano would
-        // run off the right-hand edge.
-        // Fullscreen is its own layout, and it has to be: `layout_sizes` asks
-        // for a WINDOW SIZE and gets it, which is meaningless when the window
-        // is already the screen. Filling is the point — see `fill_bands`.
+        // **The layout follows the pane it is given, everywhere.**
+        //
+        // There used to be three answers here and one of them never looked at
+        // the window at all: the desktop asked `layout_sizes()` for the size
+        // its bands come to and then PINNED the window to it, so "how big is
+        // the window" and "how big is the layout" were the same question by
+        // force. With the pin gone they are two questions, and only the pane
+        // can answer the first.
+        //
+        // **A dragged window is the question a plugin editor has always
+        // asked**, so it gets the same answer: `fit_bands`, which preserves
+        // every band's aspect and scales the whole stack as one unit. Drag an
+        // edge and the layout zooms; it never stretches. That matters because
+        // this layout is aspect-locked by construction — every band's height
+        // is a fixed fraction of the width — so filling a window taller than
+        // natural gives a keyboard 40% too tall for its own width, which is a
+        // stretched picture of a keyboard rather than a bigger one.
+        //
+        // Fullscreen keeps `fill_bands`, for the reason written on it: bars
+        // down both sides ARE the screen you asked for and did not get.
+        //
+        // The PANE and not the context, in both arms: inside a host's
+        // resizable wrapper the two differ by its frame, and laying out to the
+        // context would put the bottom band under the resize corner.
         let fullscreen = self.caps.window_sizing
             && ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false));
         let bands = if fullscreen {
             fill_bands(&self.settings, ui.max_rect().size())
-        } else if self.caps.window_sizing {
-            self.layout_sizes()
         } else {
-            // The PANE, not the context: inside a host's resizable wrapper the
-            // two differ by its frame, and laying out to the context would put
-            // the bottom band under the resize corner.
             fit_bands(&self.settings, ui.max_rect().size())
         };
         let Bands {
@@ -15468,11 +15528,43 @@ impl IvoryApp {
                 self.fullscreen_sent = Some(false);
                 self.last_sent_size = None;
             }
-            if self.last_sent_size != Some(target) {
-                ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(target));
-                ctx.send_viewport_cmd(ViewportCommand::MaxInnerSize(target));
-                ctx.send_viewport_cmd(ViewportCommand::InnerSize(target));
-                self.last_sent_size = Some(target);
+            // **The FLOOR, and nothing else.**
+            //
+            // This was the triple that made the window un-resizable: Min and
+            // Max set to the same value pins it, and Inner then drags it
+            // there. That is what `with_resizable(false)` in `main.rs` was
+            // agreeing with, and between them the app had exactly seven sizes
+            // — the percentage presets — and no way to drag an edge.
+            //
+            // The layout never needed the pin. Every band's height is a pure
+            // function of the window's width (`band_sizes_at`), and two
+            // solvers for arbitrary rects have been in this file for as long
+            // as the plugin has existed: `fit_bands` letterboxes into a
+            // host's editor and `fill_bands` stretches into a fullscreen
+            // screen. A dragged window is the same question a third time.
+            //
+            // So the only constraint sent now is the minimum, once, and it is
+            // measured rather than picked — see `settings::MIN_WINDOW`. The
+            // maximum is released explicitly, because a build that pinned it
+            // may have left one on the window.
+            if self.min_sent != Some(true) {
+                ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(
+                    crate::settings::MIN_WINDOW,
+                ));
+                ctx.send_viewport_cmd(ViewportCommand::MaxInnerSize(Vec2::new(
+                    f32::INFINITY,
+                    f32::INFINITY,
+                )));
+                self.min_sent = Some(true);
+            }
+            // A size the app itself asked for — a percentage preset, or a
+            // band appearing in a window that has never been dragged. Never
+            // per-frame: `pending_window_size` is set by the thing that
+            // wants it and cleared here.
+            if let Some(want) = self.pending_window_size.take() {
+                ctx.send_viewport_cmd(ViewportCommand::InnerSize(want));
+                self.last_sent_size = Some(want);
+                self.size_asked_at = Some(Instant::now());
             }
         }
         // Borderless enforcement; Qt re-sets the title after flag changes.
@@ -15507,11 +15599,22 @@ impl IvoryApp {
         // what keeps the picture in the middle of an editor the user has
         // resized to something else.
         let pane = ui.max_rect();
-        // The app owns every pixel it is given. On the desktop the bands cover
-        // the window exactly and this changes nothing; in a plugin the layout
-        // is centred in whatever the host opened, and without this the gap
-        // shows egui's default panel fill rather than Tangent's background.
-        ui.painter().rect_filled(pane, 0.0, egui::Color32::BLACK);
+        // The app owns every pixel it is given, and it wears the THEME's own
+        // ground rather than black.
+        //
+        // **It used to be black and it used to hardly matter.** The desktop
+        // window was pinned to exactly the size of its bands, so the gap was
+        // always zero pixels wide and only a plugin editor ever saw it. A
+        // window somebody can drag is almost never at the layout's own aspect,
+        // so the gap is now on screen most of the time — and a black frame
+        // round a Porcelain or Centennial desk reads as a rendering fault
+        // rather than as letterboxing.
+        //
+        // `themed_bg` is the same resolution the keyboard's own ground uses:
+        // the theme's `background` role, or its dark twin, derived when the
+        // theme did not name one.
+        ui.painter()
+            .rect_filled(pane, 0.0, crate::piano::themed_bg(&self.settings));
         let origin = Pos2::new(
             pane.min.x + ((pane.width() - w) * 0.5).max(0.0).trunc(),
             pane.min.y + ((pane.height() - target.y) * 0.5).max(0.0).trunc(),
@@ -16747,18 +16850,38 @@ impl IvoryApp {
             if Instant::now() >= deadline {
                 self.geometry_save_at = None;
                 let mut dirty = false;
-                // The main window is not user-resizable, so once it has settled
-                // any disagreement with `target` means something else is
-                // placing it and its position is not worth remembering.
+                // **Is this size ours to remember, or the window manager's?**
+                //
+                // It used to be answerable from the size alone: the window was
+                // pinned, so any disagreement with the size we asked for meant
+                // something else was placing it. A resizable window makes a
+                // disagreement the NORMAL case — it is what dragging an edge
+                // looks like — so the question moved to timing, exactly as it
+                // already had for the detached windows. Inside `WM_GRACE` of
+                // asking, a mismatch is the tiler overruling us at creation;
+                // after it, a mismatch is a hand.
+                let asked_recently = self
+                    .size_asked_at
+                    .is_some_and(|t| Instant::now() < t + WM_GRACE);
                 let ours = self
                     .main_live_size
-                    .is_some_and(|s| !wm_overrode_size(s, target));
+                    .is_some_and(|s| !asked_recently || !wm_overrode_size(s, target));
                 if ours {
                     if let Some(p) = self.main_live_pos {
                         let (x, y) = (p.x.round() as i64, p.y.round() as i64);
                         if self.settings.window_x != Some(x) || self.settings.window_y != Some(y) {
                             self.settings.window_x = Some(x);
                             self.settings.window_y = Some(y);
+                            dirty = true;
+                        }
+                    }
+                    // And the SIZE, which nothing recorded before because
+                    // there was never one worth recording.
+                    if let Some(sz) = self.main_live_size {
+                        let (w, h) = (sz.x.round() as i64, sz.y.round() as i64);
+                        if self.settings.window_w != Some(w) || self.settings.window_h != Some(h) {
+                            self.settings.window_w = Some(w);
+                            self.settings.window_h = Some(h);
                             dirty = true;
                         }
                     }
@@ -22034,10 +22157,14 @@ mod tests {
     /// Saying yes does the narrow thing, and leaves a way back.
     #[test]
     fn a_confirmed_reset_does_its_scope_and_offers_undo() {
-        let dir = std::env::temp_dir()
-            .join(format!("ivory-reset-{}-{:?}", std::process::id(), std::thread::current().id()));
-        let _ = std::fs::create_dir_all(&dir);
-        std::env::set_var("IVORY_SETTINGS_PATH", dir.join("settings.json"));
+        // **No `IVORY_SETTINGS_PATH` here, deliberately.** It is a
+        // process-global, so a test that points it somewhere safe points it
+        // there for every test running beside it — which is exactly how this
+        // one made `a_plugin_does_not_write_the_shared_settings_file` fail
+        // roughly one run in three. `Settings::path()` is already thread-local
+        // and per-process under `cfg(test)` (see `test_path`), so the backup
+        // this reset takes lands somewhere private with nothing to arrange.
+        let _ = std::fs::remove_file(Settings::backup_path());
 
         let mut s = Settings::first_launch();
         s.theme_name = "Iris".into();
@@ -22075,8 +22202,7 @@ mod tests {
             crate::settings::Rgb { r: 9, g: 9, b: 9 }
         );
 
-        std::env::remove_var("IVORY_SETTINGS_PATH");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(Settings::backup_path());
     }
 
     /// Every confirmation draws, in both modes, at every pane it can meet.
@@ -22635,8 +22761,122 @@ mod tests {
         }
     }
 
-    /// ...and the desktop still does all of it, or the gate has quietly turned
-    /// the standalone into a resizable window with no title.
+    /// **The floor is where a band actually gives up.**
+    ///
+    /// Both halves, or the number is just a number nobody checked: every
+    /// surface still draws AT `MIN_WINDOW`, and something stops below it.
+    /// This is the same shape as `theory_panel`'s own
+    /// `the_smallest_window_still_holds_three_diagrams`, which is where the
+    /// width came from.
+    #[test]
+    fn the_floor_is_where_a_band_gives_up() {
+        let min = crate::settings::MIN_WINDOW;
+        // **Every band the app can show, switched on at once** — the worst
+        // case, and the one a floor has to survive. `first_launch` and not
+        // `default`, because that is the state somebody actually installs
+        // into and it already has the chord strip enabled.
+        let settings = Settings {
+            show_fretboard: true,
+            show_recorder: true,
+            show_welcome: false,
+            show_chord_strip: true,
+            chord_detection_enabled: true,
+            theory_order: theory_panel::Views::all().keys(),
+            ..Settings::first_launch()
+        };
+        // At the floor the layout still has a positive height for every band
+        // that is switched on.
+        let at_min = fit_bands(&settings, min);
+        for (name, h) in [
+            ("recorder", at_min.recorder_h),
+            ("theory", at_min.theory_h),
+            ("chord", at_min.chord_h),
+            ("piano", at_min.piano_h),
+            ("fretboard", at_min.fret_h),
+        ] {
+            assert!(h > 0.0, "the {name} band vanishes at the floor {min:?}");
+        }
+        // That the diagrams still have controls to point at is asserted where
+        // the measurement lives — `theory_panel`'s
+        // `the_main_windows_floor_leaves_the_diagrams_something_to_draw`,
+        // beside the `DETACHED_MIN` this floor's width came from.
+    }
+
+    /// A dragged window ZOOMS the layout; it never stretches it.
+    ///
+    /// The whole reason a resizable window is safe here: every band's height
+    /// is a fixed fraction of the width, so the stack has one aspect and
+    /// `fit_bands` keeps it at every size. A window twice as tall as the
+    /// layout wants gives a layout the same shape, centred, not a keyboard
+    /// twice as tall as it should be.
+    #[test]
+    fn dragging_the_window_zooms_the_layout_and_never_stretches_it() {
+        let settings = Settings { show_recorder: true, show_welcome: false, ..Settings::default() };
+        let natural = fit_bands(&settings, Vec2::new(1300.0, 10_000.0));
+        let aspect = natural.total().y / natural.total().x;
+        for pane in [
+            Vec2::new(1300.0, 900.0),  // much taller than natural
+            Vec2::new(2600.0, 700.0),  // much wider
+            Vec2::new(700.0, 700.0),   // square
+            crate::settings::MIN_WINDOW,
+        ] {
+            let b = fit_bands(&settings, pane);
+            let got = b.total();
+            assert!(
+                got.x <= pane.x + 0.5 && got.y <= pane.y + 0.5,
+                "the layout {got:?} does not fit the pane {pane:?}"
+            );
+            assert!(
+                (got.y / got.x - aspect).abs() < 0.02,
+                "the layout was stretched at {pane:?}: {:.4} against a natural {aspect:.4}",
+                got.y / got.x
+            );
+        }
+    }
+
+    /// Fullscreen still FILLS, which is the one place stretching is right.
+    ///
+    /// Bars down both sides are the screen you asked for and did not get.
+    #[test]
+    fn fullscreen_still_fills_both_edges() {
+        let settings = Settings { show_recorder: true, show_welcome: false, ..Settings::default() };
+        let screen = Vec2::new(2560.0, 1440.0);
+        let filled = fill_bands(&settings, screen);
+        let got = filled.total();
+        assert!((got.x - screen.x).abs() < 1.5, "width {got:?} against {screen:?}");
+        assert!((got.y - screen.y).abs() < 1.5, "height {got:?} against {screen:?}");
+    }
+
+    /// A remembered size comes back, and a nonsense one does not.
+    #[test]
+    fn a_remembered_window_size_survives_but_a_useless_one_does_not() {
+        let mut s = Settings::first_launch();
+        assert_eq!(s.window_size_for_use(), None, "a fresh install has no size to restore");
+        s.window_w = Some(1600);
+        s.window_h = Some(980);
+        assert_eq!(s.window_size_for_use(), Some(Vec2::new(1600.0, 980.0)));
+        // Below the floor is REFUSED, not clamped: a window three pixels tall
+        // is indistinguishable from an app that failed to start.
+        s.window_h = Some(3);
+        assert_eq!(s.window_size_for_use(), None);
+        // Half a pair is not a pair.
+        s.window_h = Some(980);
+        s.window_w = None;
+        assert_eq!(s.window_size_for_use(), None);
+    }
+
+    /// ...and the desktop still owns its own window.
+    ///
+    /// **The contract changed when the pin came off, and this is where it is
+    /// written down.** It used to demand an `InnerSize` every time, because
+    /// the desktop pinned its window to the layout on every frame the target
+    /// moved. It does not any more: the window is the user's to drag, so the
+    /// only standing constraint is the floor, the maximum is explicitly
+    /// released, and a size is SENT only when the app is asked for one.
+    ///
+    /// What must not change is that the standalone still dresses its own
+    /// window — title and decorations — and still sets a floor. Losing that
+    /// gate would mean a window with no title that can be dragged to nothing.
     #[test]
     fn the_desktop_still_sizes_and_titles_its_own_window() {
         let (ctx, mut app) = headless(Caps::DESKTOP);
@@ -22644,18 +22884,38 @@ mod tests {
         for _ in 0..4 {
             seen.extend(run_one_frame(&ctx, &mut app, Vec2::new(1300.0, 632.0)));
         }
-        for want in [
-            "MinInnerSize",
-            "MaxInnerSize",
-            "InnerSize",
-            "Decorations",
-            "Title",
-        ] {
+        for want in ["MinInnerSize", "MaxInnerSize", "Decorations", "Title"] {
             assert!(
                 seen.iter().any(|c| c.starts_with(want)),
                 "the desktop stopped sending {want}; saw {seen:?}"
             );
         }
+        // The floor is the measured one, and the ceiling is released — a
+        // leftover maximum from the pinned era would make the window
+        // un-growable while looking resizable.
+        assert!(
+            seen.iter().any(|c| c.contains("MinInnerSize")
+                && c.contains(&format!("{}", crate::settings::MIN_WINDOW.x))),
+            "the floor is not MIN_WINDOW; saw {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|c| c.starts_with("MaxInnerSize") && c.contains("inf")),
+            "the maximum was not released; saw {seen:?}"
+        );
+        // **Idle frames send NOTHING.** The old code re-sent the triple
+        // whenever the target moved, which is what fought a hand on the edge:
+        // drag, and the app drags back.
+        let quiet = run_one_frame(&ctx, &mut app, Vec2::new(1300.0, 632.0));
+        assert!(quiet.is_empty(), "an idle frame fought the window: {quiet:?}");
+
+        // ...and a size preset still produces one, because that is the way
+        // back to the size the bands actually want.
+        app.apply_menu_action(&ctx, MenuAction::SetSizePercent(150));
+        let after = run_one_frame(&ctx, &mut app, Vec2::new(1300.0, 632.0));
+        assert!(
+            after.iter().any(|c| c.starts_with("InnerSize")),
+            "a size preset did not resize the window; saw {after:?}"
+        );
     }
 
     /// A plugin shares `~/.config/ivory/settings.json` with the standalone and

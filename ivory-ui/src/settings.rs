@@ -1110,6 +1110,20 @@ pub struct Settings {
     /// stepped up 8. The host renames their insert-state sidecars once.
     /// Set by `adopt_desk` on an eight-channel-era desk, never serialized.
     pub desk_state_shift_v19: bool,
+    /// The main window's size, if the user has ever chosen one.
+    ///
+    /// **Absent means "the size its bands come to"**, which is what every
+    /// build until now could produce and the only thing `window_size_percent`
+    /// could say. The window was pinned un-resizable (Min = Max = Inner), so
+    /// there was no size to remember: only the position was stored. Now that
+    /// the window can be dragged, forgetting the drag on every launch would
+    /// be the same insult in a new place.
+    ///
+    /// `None` on both, not zero: zero is a legal-looking number that would
+    /// open a window nobody can see, and "never chosen" is a real state that
+    /// wants the natural size rather than a guess.
+    pub window_w: Option<i64>,
+    pub window_h: Option<i64>,
 }
 
 /// Where `Settings::path()` points during tests.
@@ -1170,6 +1184,8 @@ impl Default for Settings {
             desk_state_shift_v14: false,
             pad_state_shift_v18: false,
             desk_state_shift_v19: false,
+            window_w: None,
+            window_h: None,
             dark_roles: std::collections::BTreeMap::new(),
             background_color: Rgb::new(0xE8, 0xE8, 0xE8),
             white_key_idle_color: Rgb::new(0xE8, 0xDC, 0xC0),
@@ -1961,6 +1977,10 @@ impl Settings {
         take_opt_i64(&mut map, "detached_chord_y", &mut s.detached_chord_y);
         take_opt_i64(&mut map, "window_x", &mut s.window_x);
         take_opt_i64(&mut map, "window_y", &mut s.window_y);
+        // Absent in every file written before the window could be resized,
+        // which is what `Option` is for here.
+        take_opt_i64(&mut map, "window_w", &mut s.window_w);
+        take_opt_i64(&mut map, "window_h", &mut s.window_h);
         take_bool(
             &mut map,
             "teach_apply_all_keys",
@@ -3353,6 +3373,16 @@ impl Settings {
             }
             map.insert("dark_roles".into(), Value::Object(d));
         }
+        // **Additive keys go HERE, at the end, ahead only of the preserved
+        // extras.** Written only when there is something to say, so a file
+        // from a build that never resized keeps its byte-for-byte shape and
+        // `unknown_keys_preserved_and_key_order_stable` stays honest.
+        if let Some(w) = self.window_w {
+            map.insert("window_w".into(), Value::Number(w.into()));
+        }
+        if let Some(h) = self.window_h {
+            map.insert("window_h".into(), Value::Number(h.into()));
+        }
         for (k, v) in &self.extra {
             map.insert(k.clone(), v.clone());
         }
@@ -3734,6 +3764,21 @@ impl Settings {
     }
 
     /// Remembered main-window position, if both coordinates are stored.
+    /// The size the main window should open at, if the user has chosen one.
+    ///
+    /// **Refuses anything below the floor rather than clamping to it.** A
+    /// hand-edited or corrupt pair could name a window three pixels tall, and
+    /// an app that opens invisibly is indistinguishable from one that failed
+    /// to start. `None` here means "the size your bands come to", which is
+    /// always a window somebody can see.
+    pub fn window_size_for_use(&self) -> Option<egui::Vec2> {
+        let (w, h) = (self.window_w?, self.window_h?);
+        let size = egui::Vec2::new(w as f32, h as f32);
+        (size.x >= MIN_WINDOW.x && size.y >= MIN_WINDOW.y && size.x.is_finite()
+            && size.y.is_finite())
+        .then_some(size)
+    }
+
     pub fn window_pos_for_use(&self) -> Option<egui::Pos2> {
         match (self.window_x, self.window_y) {
             (Some(x), Some(y)) => Some(egui::Pos2::new(x as f32, y as f32)),
@@ -4004,6 +4049,24 @@ impl Settings {
         }
     }
 }
+
+/// The smallest the main window may be dragged to.
+///
+/// **Measured, not chosen.** It used to be moot: the window was pinned
+/// un-resizable by setting its minimum and maximum to the same size, so
+/// "how small can this get" had no answer. Now that it can be dragged, a
+/// floor is the difference between a small window and a window whose panels
+/// are drawing titles over empty rectangles — which looks like a rendering
+/// fault rather than like "too small", and is the exact failure
+/// `theory_panel::DETACHED_MIN` was measured to prevent.
+///
+/// The width comes from there: the diagrams are the first thing to give up,
+/// and they give up at 540. The height is what the shipped band stack comes
+/// to at that width plus the recorder band. `the_floor_is_where_a_band_gives_up`
+/// asserts both halves — that everything still draws AT the floor, and that
+/// something stops below it, so the number is not merely a number nobody
+/// checked.
+pub const MIN_WINDOW: egui::Vec2 = egui::Vec2::new(560.0, 320.0);
 
 /// Keep a window fully on the monitor it is being placed on. A remembered
 /// position is worthless if the monitor it referred to is gone, which is the

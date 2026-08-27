@@ -1979,6 +1979,178 @@ pub fn setup_rect(rect: Rect, view: &RecorderView<'_>) -> Rect {
     Layout::new(rect, view).setup
 }
 
+/// Everything in the band a keyboard can reach and a screen reader can say.
+///
+/// **Built from `Layout::targets`, which already existed.** That list is the
+/// panel's own enumeration of its controls — it is what `hit_test` searches —
+/// so this is the same walk with a name attached to each rect rather than a
+/// second, parallel description of the band that could drift from it. A
+/// control added to `targets` and not named here comes out as its own debug
+/// spelling, which is ugly and audible; one named here and removed from
+/// `targets` simply disappears. Neither can silently disagree about WHERE a
+/// control is, which is the failure that mattered.
+///
+/// In reading order, because allocation order is tab order.
+pub fn a11y_nodes(rect: Rect, view: &RecorderView<'_>) -> Vec<crate::a11y::Node> {
+    let l = Layout::new(rect, view);
+    let id = |k: &str| egui::Id::new(("band", k));
+    let mut out = Vec::new();
+    for (r, produces) in l.targets() {
+        if !r.is_positive() {
+            continue;
+        }
+        let Some(node) = name_for(produces, r, view, &id) else {
+            continue;
+        };
+        out.push(node);
+    }
+    out
+}
+
+/// The targets that are SURFACES rather than controls.
+///
+/// The meter you click to clear a clip light, the timeline you click to
+/// locate in, the scope. They are named here rather than falling out of
+/// `name_for`'s catch-all so that the partition is explicit and a control
+/// added to `Layout::targets` cannot join them by accident — see
+/// `every_control_in_the_band_can_be_reached_and_says_what_it_is`, which
+/// asserts every positive target is either named or on this list.
+///
+/// `Hit::Type` is here for a different reason: it is the TYPED twin of a dial
+/// that already has a node, and a tab order with both in it walks every knob
+/// twice while a screen reader reads it twice.
+fn is_surface(hit: &Hit) -> bool {
+    matches!(
+        hit,
+        Hit::Type(_)
+            | Hit::DismissClip
+            | Hit::SeekTimeline(_)
+    )
+}
+
+/// The words for one target.
+fn name_for(
+    produces: Produces,
+    r: Rect,
+    view: &RecorderView<'_>,
+    id: &dyn Fn(&str) -> egui::Id,
+) -> Option<crate::a11y::Node> {
+    use crate::a11y::Node;
+    let fx_value = |fx: Fx| {
+        crate::recorder_panel::knob_reading(view.fx_units[fx.index()], view.fx.get(fx))
+    };
+    Some(match produces {
+        Produces::Fixed(hit) => match hit {
+            Hit::Play => Node::button(id("play"), r, "Play"),
+            Hit::Record => Node::button(id("record"), r, "Record"),
+            Hit::Stop => Node::button(id("stop"), r, "Stop"),
+            Hit::Pause => Node::button(id("pause"), r, "Pause"),
+            Hit::Capture => Node::button(id("capture"), r, "Record a take"),
+            Hit::ProjectMenu => Node::button(id("project"), r, "Project menu"),
+            Hit::OpenSetup => Node::button(id("setup"), r, "Take settings"),
+            Hit::TapTempo => Node::button(id("tap"), r, "Tap tempo"),
+            Hit::Export => Node::button(id("export"), r, "Export"),
+            Hit::ChooseFolder => Node::button(id("dest"), r, "Choose the take folder"),
+            Hit::RevealFolder => Node::button(id("reveal"), r, "Show the take folder"),
+            Hit::PickCamera => Node::button(id("camera"), r, "Choose a camera"),
+            Hit::PickAudio => Node::button(id("audio"), r, "Choose an audio input"),
+            Hit::DismissMessage => Node::button(id("dismiss"), r, "Dismiss this message"),
+            Hit::ClearTrack => Node::button(id("cleartrack"), r, "Remove the loaded file"),
+            Hit::EditTimeSignature => Node::readout(
+                id("timesig"),
+                r,
+                "Time signature",
+                format!("{}/{}", view.time_signature.beats, view.time_signature.unit),
+            ),
+            Hit::CycleCountIn => Node::readout(
+                id("countin"),
+                r,
+                "Count-in",
+                if view.count_in_beats == 0 {
+                    "off".to_owned()
+                } else {
+                    format!("{} beats", view.count_in_beats)
+                },
+            ),
+            // **A button and not a toggle, because the view does not carry
+            // its state.** A `Kind::Toggle` whose bool was a guess would have
+            // a screen reader confidently announcing "off" over a ticked box,
+            // which is worse than not announcing it: a wrong readout is the
+            // one kind a person cannot work around. When the view grows the
+            // field, this becomes a toggle and the test below will say so.
+            Hit::ToggleOpenWhenDone => {
+                Node::button(id("openwhendone"), r, "Show the folder when a take finishes")
+            }
+            Hit::ToggleMetronomeInTake => Node::toggle(
+                id("clickintake"),
+                r,
+                "Record the click into the take",
+                view.metronome_in_take,
+            ),
+            Hit::ToggleCountInInTake => {
+                Node::button(id("countinintake"), r, "Record the count-in into the take")
+            }
+            Hit::ToggleInputMonitor => Node::toggle(
+                id("monitor"),
+                r,
+                "Hear the input through the monitors",
+                view.input_monitor,
+            ),
+            Hit::ToggleHideElapsed => {
+                Node::toggle(id("hideelapsed"), r, "Hide the elapsed time", view.hide_elapsed)
+            }
+            Hit::NameField => Node::readout(id("name"), r, "Take name", view.take_name.to_owned()),
+            Hit::CloseSetup => Node::button(id("closesetup"), r, "Close the take settings"),
+            Hit::PluginFolders => Node::button(id("pluginfolders"), r, "Add a plugin folder"),
+            Hit::StreamToObs => Node::button(id("obs"), r, "Stream to OBS"),
+            Hit::ShowAudioStatus => Node::button(id("audiostatus"), r, "Audio status"),
+            // The typed twins of the dials below. A screen reader hearing
+            // both would hear every knob twice, and the dial is the one that
+            // can be nudged with an arrow.
+            Hit::Type(_) => return None,
+            // Surfaces, not controls — see `is_surface`, which is the list
+            // the coverage test checks this catch-all against.
+            _ => return None,
+        },
+        Produces::AlongV(f) => {
+            // Which control this is, asked of the function itself rather than
+            // tracked in a parallel list: `Produces` carries a fn pointer, and
+            // the cheapest honest way to identify it is to see what it makes.
+            match f(0.5) {
+                Hit::SetMaster(_) => Node::slider(
+                    id("master"),
+                    r,
+                    "Master",
+                    f64::from(view.gains.master),
+                    0.0,
+                    1.0,
+                    crate::recorder::gain_text(view.gains.master),
+                ),
+                Hit::SetFx(fx, _) => Node::slider(
+                    id(fx.title()),
+                    r,
+                    fx.title().to_lowercase(),
+                    f64::from(view.fx.get(fx)),
+                    0.0,
+                    1.0,
+                    fx_value(fx),
+                ),
+                Hit::SetTempo(_) => Node::slider(
+                    id("tempo"),
+                    r,
+                    "Tempo",
+                    view.tempo_bpm,
+                    f64::from(MIN_BPM),
+                    f64::from(MAX_BPM),
+                    format!("{:.0} BPM", view.tempo_bpm),
+                ),
+                _ => return None,
+            }
+        }
+        Produces::Along(_) => return None,
+    })
+}
+
 pub fn hit_test(rect: Rect, view: &RecorderView<'_>, pos: Pos2) -> Option<Hit> {
     if !rect.contains(pos) {
         return None;
@@ -4931,6 +5103,119 @@ mod tests {
             for (what, z) in &zones {
                 if z.is_positive() {
                     assert!(l.panel.contains_rect(*z), "{what} is outside the panel at {w}");
+                }
+            }
+        }
+    }
+
+    /// **Every control in the band has words, and they are the words on it.**
+    ///
+    /// The band is one `Painter`; before AccessKit it was one empty rectangle
+    /// to a screen reader, and to a keyboard it did not exist at all. This
+    /// asserts the two things that make the nodes worth having: that the list
+    /// covers the controls (drawn from `Layout::targets`, the panel's own
+    /// enumeration, so it cannot drift from where the controls actually are),
+    /// and that what each one SAYS is a sentence rather than a debug spelling.
+    #[test]
+    fn every_control_in_the_band_can_be_reached_and_says_what_it_is() {
+        let view = furnished();
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, band_height(1300.0)));
+        let nodes = a11y_nodes(rect, &view);
+
+        // **Coverage, against the panel's own enumeration.** Every target
+        // that is really there is either named or on the surfaces list; a
+        // control added to `Layout::targets` and forgotten here fails by
+        // name rather than by a count nobody can interpret.
+        let l = Layout::new(rect, &view);
+        let mut unnamed: Vec<String> = Vec::new();
+        for (r, produces) in l.targets() {
+            if !r.is_positive() {
+                continue;
+            }
+            let hit = produces.hit(r, r.center());
+            if is_surface(&hit) {
+                continue;
+            }
+            if !nodes.iter().any(|n| n.rect == r) {
+                unnamed.push(format!("{hit:?}"));
+            }
+        }
+        assert!(
+            unnamed.is_empty(),
+            "{} control(s) in the band have no words and no reason to be silent: {unnamed:#?}",
+            unnamed.len()
+        );
+
+        for n in &nodes {
+            assert!(!n.label.is_empty(), "a node has no label: {n:?}");
+            // No debug spellings, no snake_case, no enum names leaking out.
+            assert!(
+                !n.label.contains('_') && !n.label.contains("Hit"),
+                "{:?} reads like source rather than English",
+                n.label
+            );
+            assert!(
+                n.rect.is_positive() && rect.contains_rect(n.rect),
+                "{:?} is outside the band it belongs to",
+                n.label
+            );
+        }
+
+        // The transport, the master and all six effect knobs are the controls
+        // somebody reaches for; name them explicitly so a rename is a
+        // decision rather than an accident.
+        let said: Vec<String> = nodes.iter().map(crate::a11y::Node::spoken).collect();
+        for want in ["Play", "Record", "Stop", "Master", "Tempo"] {
+            assert!(
+                said.iter().any(|s| s.starts_with(want)),
+                "nothing in the band says {want:?}; it says {said:#?}"
+            );
+        }
+
+        // A fader reads in dB and a filter in Hz — the number on the panel,
+        // not the 0..1 underneath it. A screen reader saying "0.596" has
+        // announced the implementation.
+        let master = nodes
+            .iter()
+            .find(|n| n.label == "Master")
+            .expect("the master has no node");
+        assert!(
+            master.spoken().contains("dB") || master.spoken().contains("OFF"),
+            "the master reads as {:?} rather than in decibels",
+            master.spoken()
+        );
+        assert!(matches!(master.kind, crate::a11y::Kind::Slider { .. }));
+
+        // Every id is distinct, or focus lands on the wrong control.
+        let mut ids: Vec<_> = nodes.iter().map(|n| n.id).collect();
+        ids.sort_by_key(|i| format!("{i:?}"));
+        let before = ids.len();
+        ids.dedup();
+        assert_eq!(before, ids.len(), "two controls in the band share an id");
+    }
+
+    /// The names survive every state the band has, and every size.
+    ///
+    /// A node built from a rect that collapsed at a small size would put a
+    /// tab stop on nothing; one built while rolling must still be the control
+    /// that is actually there.
+    #[test]
+    fn the_bands_names_hold_at_every_size_and_state() {
+        for view in [idle(), rolling(), furnished(), furnished_rolling()] {
+            for w in [560.0_f32, 900.0, 1300.0, 2600.0] {
+                let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, band_height(w)));
+                for n in a11y_nodes(rect, &view) {
+                    assert!(
+                        n.rect.is_positive(),
+                        "{:?} collapsed at {w}pt",
+                        n.label
+                    );
+                    assert!(
+                        rect.contains_rect(n.rect),
+                        "{:?} left the band at {w}pt: {:?} outside {rect:?}",
+                        n.label,
+                        n.rect
+                    );
                 }
             }
         }
