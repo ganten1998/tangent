@@ -74,6 +74,45 @@ pub struct Node {
     /// the whole story.
     pub value: Option<String>,
     pub enabled: bool,
+    /// How a continuous control moves, for the keyboard. `None` on anything
+    /// that is not draggable.
+    ///
+    /// **This is what lets an arrow key take the mouse's road.** A nudge does
+    /// not compute a new gain and write it somewhere; it works out where the
+    /// pointer WOULD be for the new value and hands that point to the panel's
+    /// own `hit_test`. One path, so the keyboard cannot drift from the mouse
+    /// the first time either changes — and the drift would be silent, because
+    /// the thing still works with a mouse and nobody looks.
+    pub travel: Option<Travel>,
+}
+
+/// Where a continuous control currently stands, and which way is up.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Travel {
+    /// 0..=1 along the control's own axis. NORMALISED and not in the
+    /// control's units, because several of them are not linear in their
+    /// units — the tempo knob maps its sweep through `knob_to_tempo` — and
+    /// the fraction is the only currency every one of them shares.
+    pub norm: f32,
+    /// True when the value rises UP the rect (a fader, a round knob), false
+    /// when it rises to the right.
+    pub up: bool,
+}
+
+impl Travel {
+    /// The point inside `rect` that means `norm`.
+    ///
+    /// The inverse of what `hit_test` does to a pointer, and deliberately
+    /// nothing more: hand this back to `hit_test` and it produces the hit a
+    /// mouse at that value would have produced.
+    pub fn point(self, rect: Rect, norm: f32) -> Pos2 {
+        let n = norm.clamp(0.0, 1.0);
+        if self.up {
+            Pos2::new(rect.center().x, rect.bottom() - rect.height() * n)
+        } else {
+            Pos2::new(rect.left() + rect.width() * n, rect.center().y)
+        }
+    }
 }
 
 impl Node {
@@ -85,6 +124,7 @@ impl Node {
             label: label.into(),
             value: None,
             enabled: true,
+            travel: None,
         }
     }
 
@@ -96,9 +136,14 @@ impl Node {
             label: label.into(),
             value: None,
             enabled: true,
+            travel: None,
         }
     }
 
+    /// A continuous control. `now`/`min`/`max` are in the control's OWN
+    /// units so a reader announcing numerically says something a person
+    /// recognises; `travel` is the normalised position the keyboard moves.
+    #[allow(clippy::too_many_arguments)]
     pub fn slider(
         id: Id,
         rect: Rect,
@@ -107,6 +152,7 @@ impl Node {
         min: f64,
         max: f64,
         reads: impl Into<String>,
+        travel: Travel,
     ) -> Self {
         Self {
             id,
@@ -115,6 +161,7 @@ impl Node {
             label: label.into(),
             value: Some(reads.into()),
             enabled: true,
+            travel: Some(travel),
         }
     }
 
@@ -126,6 +173,7 @@ impl Node {
             label: label.into(),
             value: Some(reads.into()),
             enabled: true,
+            travel: None,
         }
     }
 
@@ -337,7 +385,17 @@ mod tests {
     fn a_node_says_what_it_is_and_what_it_reads() {
         let id = Id::new("x");
         assert_eq!(
-            Node::slider(id, r(), "Track 3 Guitar volume", 0.6, 0.0, 1.0, "-4.5 dB").spoken(),
+            Node::slider(
+                id,
+                r(),
+                "Track 3 Guitar volume",
+                0.6,
+                0.0,
+                1.0,
+                "-4.5 dB",
+                Travel { norm: 0.6, up: true },
+            )
+            .spoken(),
             "Track 3 Guitar volume, -4.5 dB"
         );
         assert_eq!(Node::button(id, r(), "Record").spoken(), "Record");
@@ -377,6 +435,37 @@ mod tests {
         assert!((Gesture::Most.nudged(0.7) - 1.0).abs() < 1e-6);
         // Activate is not a nudge.
         assert!((Gesture::Activate.nudged(0.7) - 0.7).abs() < 1e-6);
+    }
+
+    /// **The point a nudge synthesises is the point a mouse would be at.**
+    ///
+    /// This is what makes the keyboard take the mouse's road rather than a
+    /// parallel one: hand the result to the panel's own `hit_test` and it
+    /// produces the hit a drag to that value would have produced.
+    #[test]
+    fn a_nudge_lands_where_the_pointer_would_have() {
+        let rect = Rect::from_min_size(Pos2::new(10.0, 10.0), Vec2::new(40.0, 100.0));
+        let up = Travel { norm: 0.0, up: true };
+        // Up the rect: 0 at the bottom, 1 at the top.
+        assert!((up.point(rect, 0.0).y - rect.bottom()).abs() < 1e-3);
+        assert!((up.point(rect, 1.0).y - rect.top()).abs() < 1e-3);
+        assert!((up.point(rect, 0.5).y - rect.center().y).abs() < 1e-3);
+        // ...and along the middle, so a round knob is grabbed where it is
+        // widest rather than at an edge the hit test may have carved off.
+        assert!((up.point(rect, 0.5).x - rect.center().x).abs() < 1e-3);
+
+        let along = Travel { norm: 0.0, up: false };
+        assert!((along.point(rect, 0.0).x - rect.left()).abs() < 1e-3);
+        assert!((along.point(rect, 1.0).x - rect.right()).abs() < 1e-3);
+
+        // Every point is INSIDE the rect, or `hit_test` answers about some
+        // other control — or about nothing, and the key does nothing.
+        for n in [-1.0, 0.0, 0.25, 0.5, 1.0, 2.0_f32] {
+            for t in [up, along] {
+                let p = t.point(rect, n);
+                assert!(rect.contains(p), "{n} landed outside the control at {p:?}");
+            }
+        }
     }
 
     /// The ring sits OUTSIDE the control, never over it.

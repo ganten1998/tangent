@@ -1110,6 +1110,26 @@ pub struct Settings {
     /// stepped up 8. The host renames their insert-state sidecars once.
     /// Set by `adopt_desk` on an eight-channel-era desk, never serialized.
     pub desk_state_shift_v19: bool,
+    /// Draw the menu and the dialogs INSIDE the main window, so a screen
+    /// reader can reach them.
+    ///
+    /// **Not a preference so much as a workaround with a good reason.** eframe
+    /// 0.33 attaches its AccessKit adapter to the ROOT viewport only — two
+    /// call sites, both hard-coded — and every dialog and the whole menu are
+    /// child viewports on the desktop. So with a reader attached the painted
+    /// surfaces speak and every dialog is silent, which is the half you need
+    /// to load a plugin, pick a device or export.
+    ///
+    /// `ivory-ui` already knows how to draw them in the canvas: it is what
+    /// the plugin build does, where there are no child windows to have. This
+    /// switches the desktop onto that same path.
+    ///
+    /// Off by default, because native child windows are worth keeping — four
+    /// years of X11 window-type hints, i3 floating, OS focus and the
+    /// born-hidden white-flash fix live on that road. The host turns it on by
+    /// itself when it sees a reader attach; this is the switch for saying so
+    /// by hand.
+    pub screen_reader_mode: bool,
     /// The main window's size, if the user has ever chosen one.
     ///
     /// **Absent means "the size its bands come to"**, which is what every
@@ -1184,6 +1204,7 @@ impl Default for Settings {
             desk_state_shift_v14: false,
             pad_state_shift_v18: false,
             desk_state_shift_v19: false,
+            screen_reader_mode: false,
             window_w: None,
             window_h: None,
             dark_roles: std::collections::BTreeMap::new(),
@@ -1979,6 +2000,7 @@ impl Settings {
         take_opt_i64(&mut map, "window_y", &mut s.window_y);
         // Absent in every file written before the window could be resized,
         // which is what `Option` is for here.
+        take_bool(&mut map, "screen_reader_mode", &mut s.screen_reader_mode);
         take_opt_i64(&mut map, "window_w", &mut s.window_w);
         take_opt_i64(&mut map, "window_h", &mut s.window_h);
         take_bool(
@@ -3377,6 +3399,9 @@ impl Settings {
         // extras.** Written only when there is something to say, so a file
         // from a build that never resized keeps its byte-for-byte shape and
         // `unknown_keys_preserved_and_key_order_stable` stays honest.
+        if self.screen_reader_mode {
+            map.insert("screen_reader_mode".into(), Value::Bool(true));
+        }
         if let Some(w) = self.window_w {
             map.insert("window_w".into(), Value::Number(w.into()));
         }

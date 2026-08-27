@@ -414,6 +414,10 @@ pub struct DesktopApp {
     pending_midi: Option<Option<String>>,
     /// A frame has reached the screen. Deferred startup work waits for it.
     painted_once: bool,
+    /// A screen reader has been seen. Stops the probe below from running
+    /// again — see `screen_reader_attached`, which is not free of side
+    /// effects.
+    reader_seen: bool,
     /// The DX7 cartridge the built-in is playing out of, if one is loaded.
     ///
     /// **The host holds the voices; the UI holds the names.** Kept here rather
@@ -491,10 +495,6 @@ const TRACK_WAVE_BUCKETS: usize = 1000;
 /// a clip is one of many and redrawn on every trim.
 const CLIP_WAVE_BUCKETS: usize = 600;
 
-/// A peak envelope of `len` frames starting `offset` frames into `clip`,
-/// interleaved stereo folded to one magnitude per bucket — the played
-/// span's picture, where `Clip::envelope` is the whole file's.
-#[cfg(feature = "recorder")]
 /// Seconds on the timeline to frames at `rate` — the ONE conversion.
 ///
 /// **It was four hand-written copies of the same closure**, in the live clip
@@ -514,6 +514,10 @@ fn frames_at(rate: f64, seconds: f64) -> u64 {
     (seconds.max(0.0) * rate).round() as u64
 }
 
+/// A peak envelope of `len` frames starting `offset` frames into `clip`,
+/// interleaved stereo folded to one magnitude per bucket — the played
+/// span's picture, where `Clip::envelope` is the whole file's.
+#[cfg(feature = "recorder")]
 fn span_envelope(
     clip: &ivory_record::decode::Clip,
     offset: usize,
@@ -5222,6 +5226,29 @@ fn next_untitled(root: &std::path::Path, taken: &std::path::Path) -> std::path::
     taken.to_path_buf()
 }
 
+/// Whether AccessKit is live — which is to say, whether an assistive
+/// technology has actually attached.
+///
+/// **Lazy on every platform, which is the whole reason this is a question.**
+/// `accesskit_winit` does not build a tree until something asks for one, and
+/// when it does it calls `egui::Context::enable_accesskit`. So this is not
+/// "was the app compiled with accesskit" — it is "is somebody reading the
+/// screen right now", and the app can stay on its native windows until they
+/// are.
+///
+/// Asked by trying to write a node and seeing whether egui had anywhere to
+/// put it: `accesskit_node_builder` answers `None` when accesskit is off.
+/// The id is this function's own and is never drawn.
+///
+/// No feature gate, and that is deliberate: `eframe`'s `accesskit` is taken
+/// unconditionally in `ivory/Cargo.toml`, so a Minimal build has it too. A
+/// person using a screen reader should not have to run the build that can
+/// load arbitrary third-party code in order to be able to read the app.
+fn screen_reader_attached(ctx: &egui::Context) -> bool {
+    ctx.accesskit_node_builder(egui::Id::new("ivory-a11y-probe"), |_| ())
+        .is_some()
+}
+
 fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
@@ -5603,6 +5630,7 @@ impl DesktopApp {
         let mut me = Self {
             pending_midi: Some(pending_midi),
             painted_once: false,
+            reader_seen: false,
             midi_lane,
             app,
             #[cfg(feature = "recorder")]
@@ -5778,6 +5806,22 @@ impl eframe::App for DesktopApp {
         // runs inside `update`, so the window cannot appear until it is done.
         // Skipping it once puts the splash on screen roughly half a second
         // sooner; the app draws from the next pass, behind it.
+        // **Has a screen reader turned up?** Asked HERE and not in the GUI
+        // crate, because the answer only exists behind `egui/accesskit` and
+        // `ivory-ui` may not name a feature — see `scripts/check-firewall.sh`
+        // and the note in `ivory/Cargo.toml`. The answer crosses as a plain
+        // bool, like every other fact this crate pushes into the app.
+        //
+        // **Asked once and then never again**, because the only way to ask is
+        // to WRITE a node and see whether egui had anywhere to put it — so
+        // every probe while a reader is attached puts an extra, nameless node
+        // in the tree that reader is reading. One is a shrug; sixty a second
+        // is a bug. `set_screen_reader` is sticky in the same direction, so
+        // there is nothing to keep watching for.
+        if !self.reader_seen && screen_reader_attached(ctx) {
+            self.reader_seen = true;
+            self.app.set_screen_reader(true);
+        }
         if self.painted_once {
             self.app.frame(ctx);
         }
