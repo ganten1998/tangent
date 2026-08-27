@@ -558,7 +558,12 @@ pub fn factory() -> Vec<Theme> {
             // Bright enough to read on the grey band — the ONE non-grey, and
             // it has to be findable or the discipline costs more than it buys.
             master_knob: c(0xe8, 0x69, 0x5a),
-            varispeed: c(0xEF, 0xEF, 0xEF),
+            // **Mono's one grey that is not the effect knobs' grey.** A theme
+            // built out of near-monochrome has nowhere to go but LIGHTNESS,
+            // and 0xEF was thirteen ΔE from the dials — visibly the same
+            // control in a different mood. 0x80 is twenty-seven away and
+            // still unmistakably Mono.
+            varispeed: c(0x80, 0x80, 0x80),
             meter_bg: c(0x14, 0x14, 0x14),
             scope_draw: c(0xd0, 0xd0, 0xd0),
             fx_strip: c(0x26, 0x26, 0x26),

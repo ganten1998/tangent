@@ -3791,6 +3791,12 @@ impl DesktopApp {
             limiter,
         });
         e.set_effect_params(effect_params_from(self.app.effect_params()));
+        // **And the varispeed, with the same knobs and for the same reason.**
+        // In an EXPORT this reaches the offline renderer exactly as it
+        // reaches the live one — the owner's words were that it "applies to
+        // exports when engaged", and it does so by being one more thing the
+        // desk is pushed rather than a special case anywhere.
+        e.set_varispeed(self.app.varispeed_ratio());
         // **The click stays out of the file**, whatever the band says.
         e.set_metronome_enabled(false);
         e.set_tempo(self.app.tempo_bpm());
@@ -3994,7 +4000,18 @@ impl DesktopApp {
                 }
             }
         }
-        let until = ((span + 2.0) * f64::from(rate)).ceil() as u64;
+        // **Divided by the varispeed ratio, because `span` is PROGRAM time
+        // and this is a count of DEVICE frames.**
+        //
+        // At 115% the piece is over in 87% of its written length, and an
+        // export that still ran for the full span would end in thirteen
+        // percent silence. Slower is the worse half: at 85% the piece needs
+        // eighteen percent longer than it is written, and an export bounded
+        // by the written length would simply stop before the end of the
+        // music. Both are silent failures in a file somebody sends
+        // somewhere.
+        let ratio = f64::from(self.app.varispeed_ratio()).clamp(0.5, 2.0);
+        let until = (((span + 2.0) / ratio) * f64::from(rate)).ceil() as u64;
         self.recorder.take_note = Some(format!(
             "Rendering at full speed… ({} stem writers)",
             stems.len()
@@ -5070,6 +5087,12 @@ impl DesktopApp {
         // it compares before it takes the lock, so pushing the same eleven
         // numbers sixty times a second costs one comparison.
         e.set_effect_params(effect_params_from(self.app.effect_params()));
+        // **And the varispeed, with the same knobs and for the same reason.**
+        // In an EXPORT this reaches the offline renderer exactly as it
+        // reaches the live one — the owner's words were that it "applies to
+        // exports when engaged", and it does so by being one more thing the
+        // desk is pushed rather than a special case anywhere.
+        e.set_varispeed(self.app.varispeed_ratio());
         e.set_metronome_enabled(self.app.metronome_on());
         e.set_metronome_in_take(self.app.metronome_in_take());
         e.set_tempo(self.app.tempo_bpm());

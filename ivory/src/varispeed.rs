@@ -175,6 +175,25 @@ impl Stream {
         self.hist.copy_from_slice(&self.next);
     }
 
+    /// Point this stream at a different channel count.
+    ///
+    /// **The input's width is not known until a device is chosen**, and it
+    /// changes when somebody swaps interfaces mid-session. The history is
+    /// dropped rather than reinterpreted: the same bytes read as a different
+    /// number of channels are a rotation, which is every input on the wrong
+    /// strip — the failure `mix_monitor`'s own whole-frames rule exists to
+    /// prevent. A width that has not changed is left alone, so this is free
+    /// on the common path.
+    pub fn set_channels(&mut self, channels: usize) {
+        let ch = channels.max(1);
+        if ch == self.channels {
+            return;
+        }
+        self.channels = ch;
+        self.hist = vec![0.0; HIST * ch];
+        self.next = vec![0.0; HIST * ch];
+    }
+
     pub fn clear(&mut self) {
         self.hist.fill(0.0);
         self.next.fill(0.0);

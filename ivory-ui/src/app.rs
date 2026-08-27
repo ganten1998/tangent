@@ -11947,6 +11947,17 @@ impl IvoryApp {
         ]
     }
 
+    /// How fast the desk plays, as a multiplier. 1.0 is off.
+    ///
+    /// **The one number the engine needs**, worked out from the dial and its
+    /// range by the model that owns both — see `crate::varispeed`. The host
+    /// is handed a ratio and not a position, because a position means
+    /// nothing without the range and there must not be two places that know
+    /// how to turn one into the other.
+    pub fn varispeed_ratio(&self) -> f32 {
+        self.settings.varispeed.ratio() as f32
+    }
+
     /// What each effect is set to, as the flat map the settings file holds.
     ///
     /// **Untyped on purpose.** `ivory-ui` cannot name an `effects::Params` —
@@ -16018,6 +16029,23 @@ impl IvoryApp {
                     // is being typed into and no hand is on a knob, because
                     // there is no pointer in a video frame.
                     scope: &self.scope,
+                    // **The varispeed and the loudness, from the same two
+                    // places the window reads them.**
+                    //
+                    // They come off `..` otherwise, which is
+                    // `RecorderState::view` — and that carries a DEFAULT
+                    // varispeed and a silent ladder, because neither lives
+                    // there. So a take recorded with the dial at +8% would
+                    // have a video of a band saying `0.0%` over a soundtrack
+                    // eight percent sharp, and a loudness ladder reading
+                    // nothing on a take that was clipping. The one thing this
+                    // whole composite path exists to guarantee is that the
+                    // video shows what the window showed.
+                    varispeed: s.varispeed,
+                    loudness: crate::recorder::Loudness {
+                        window: s.lufs_window,
+                        ..self.recorder.loudness
+                    },
                     ..self.recorder.view(
                         s.record_take_name.as_deref().unwrap_or_default(),
                         false,

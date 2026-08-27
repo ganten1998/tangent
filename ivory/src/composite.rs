@@ -1719,6 +1719,23 @@ mod shot {
         };
         let mut settings = ivory_ui::settings::Settings::default();
         settings.show_recorder = true;
+        // A named theme, so the band can be looked at in the colours a
+        // legibility test only ever measures.
+        //   IVORY_SHOT_THEME=Centennial IVORY_SHOT=/tmp/x.png ...
+        if let Ok(name) = std::env::var("IVORY_SHOT_THEME") {
+            if let Some(t) = ivory_ui::theme::factory().into_iter().find(|t| t.name == name) {
+                t.apply(&mut settings);
+                settings.theme_name = name;
+            } else {
+                eprintln!("no theme called {name}");
+            }
+        }
+        // The varispeed dial off its detent, which is the state its lit word
+        // and its own colours only exist in.
+        //   IVORY_SHOT_VARI=1 ...
+        if std::env::var("IVORY_SHOT_VARI").is_ok() {
+            settings.varispeed.set_pos(0.78);
+        }
         // The neck, for looking at what the solver put where.
         //   IVORY_SHOT_FRET=1 IVORY_DEMO_NOTES=60 ...
         if std::env::var("IVORY_SHOT_FRET").is_ok() {
