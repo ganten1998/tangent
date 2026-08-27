@@ -32,6 +32,9 @@ pub mod smf_read;
 pub mod arrangement_panel;
 pub mod midi_editor;
 pub mod settings;
+/// Musical time: the tempo map, the meter map, and the two conversions
+/// everything else in the app used to do with a multiply.
+pub mod tempo;
 pub mod splash;
 pub mod staff;
 pub mod shell;

@@ -56,7 +56,25 @@ use std::path::PathBuf;
 /// stamp "version 4" on a file still full of version 9's keys, and the build
 /// that wrote them would then run its 4→9 migrations over data that had
 /// already been through them.
-pub const ARRANGEMENT_VERSION: u64 = 4;
+pub const ARRANGEMENT_VERSION: u64 = 5;
+
+/// **Version 5: musical time.**
+///
+/// The document gains a tempo map and a meter map, and every clip gains an
+/// ANCHOR saying whether it is nailed to a wall-clock second or to a bar.
+/// Both maps are top-level; the anchor is per clip, which is what
+/// [`ArrClip::extra`] arrived in version 4's lifetime to make safe.
+///
+/// The migration is real work rather than defaults, and it is the first arm
+/// this document has ever had: a v4 file's single tempo lives on `DeskSnap`,
+/// so v4→v5 is "the desk's one number becomes a map of one point". Without
+/// it a song written at 90 would open at 120.
+///
+/// Every clip's anchor migrates to what v4 BEHAVED as, not to what is best:
+/// v4 had no tempo map, so nothing followed a tempo and every clip was
+/// pinned to seconds. A migration that helpfully made old MIDI musical would
+/// move notes in songs people have already finished.
+const V5_MUSICAL_TIME: u64 = 5;
 
 /// Every key a clip object holds that THIS build understands.
 ///
@@ -65,7 +83,7 @@ pub const ARRANGEMENT_VERSION: u64 = 4;
 /// the keys that belong to a newer build, and
 /// `a_clip_knows_which_of_its_keys_are_its_own` walks a fully-populated clip
 /// through a round trip to prove nothing was left off it.
-const CLIP_KEYS: [&str; 11] = [
+const CLIP_KEYS: [&str; 13] = [
     "kind",
     "lane",
     "path",
@@ -77,6 +95,8 @@ const CLIP_KEYS: [&str; 11] = [
     "len_s",
     "fade_in_s",
     "fade_out_s",
+    "anchor",
+    "follow_tempo",
 ];
 
 /// What a clip is made of.
@@ -117,6 +137,47 @@ pub struct RecordedClip {
     pub notes: Vec<ArrNote>,
 }
 
+/// What a clip's position is measured against.
+///
+/// **The fork the tempo map forces.** With one tempo for the whole song,
+/// "four seconds in" and "bar three" were the same statement and nothing had
+/// to choose. With a map they come apart the moment anybody edits a tempo,
+/// and the right answer is not the same for both kinds of clip.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Anchor {
+    /// Nailed to the wall clock. A tempo edit moves the BAR LINES around it
+    /// and leaves the clip where it is.
+    ///
+    /// The default, and the default for audio: a recording of somebody
+    /// playing exists at the moment they played it, and a tempo change is a
+    /// statement about the grid, not about the performance.
+    #[default]
+    Time,
+    /// Nailed to a bar. A tempo edit moves the clip — and, for MIDI, re-times
+    /// every note inside it — so it keeps its musical seat.
+    ///
+    /// What a MIDI clip wants: a part written on beat three is a part on beat
+    /// three at any tempo, and a ritardando that left the notes where they
+    /// were would not be a ritardando at all.
+    Beat,
+}
+
+impl Anchor {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Time => "time",
+            Self::Beat => "beat",
+        }
+    }
+
+    fn from_key(k: &str) -> Self {
+        match k {
+            "beat" => Self::Beat,
+            _ => Self::Time,
+        }
+    }
+}
+
 /// One piece of audio or MIDI standing on the timeline.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ArrClip {
@@ -146,6 +207,16 @@ pub struct ArrClip {
     /// Stable identity for edits — selection, undo one day. Assigned from
     /// [`Arrangement::next_id`], never reused within a document.
     pub id: u64,
+    /// What this clip's position is measured against. See [`Anchor`].
+    pub anchor: Anchor,
+    /// Stretch this clip to keep its musical length when the tempo moves.
+    ///
+    /// Only meaningful with [`Anchor::Beat`], and only on AUDIO: a
+    /// beat-anchored MIDI clip re-times its notes, which is a different and
+    /// exact operation. Audio has to be re-sampled or time-stretched, so it
+    /// is opt-in per clip rather than a property of the anchor — moving a
+    /// take to keep its bar is cheap and lossless, stretching it is neither.
+    pub follow_tempo: bool,
     /// Keys THIS build does not know, kept so a newer build's clip survives
     /// being opened here.
     ///
@@ -341,6 +412,19 @@ pub struct Arrangement {
     /// Keys this build does not know, kept so a newer build's document
     /// survives being opened here — the settings file's own bargain.
     pub extra: Map<String, Value>,
+    /// Tempo over the whole song, in quarter notes. See
+    /// [`crate::tempo::TempoMap`].
+    ///
+    /// **In the DOCUMENT and not in the settings**, which is a change of
+    /// home as much as of shape. The single `tempo_bpm` lived on
+    /// `ExportSpec` in a preferences file and was mirrored onto `DeskSnap`;
+    /// a tempo is a fact about a SONG, and putting it here also puts it
+    /// inside the undo funnel for free — `undo_state` is the whole
+    /// `Arrangement` serialised, so a tempo edit becomes undoable without a
+    /// line of new code.
+    pub tempo: crate::tempo::TempoMap,
+    /// Time signatures over the whole song, by bar.
+    pub meter: crate::tempo::MeterMap,
     /// The schema version this document is IN, which is never lower than
     /// [`ARRANGEMENT_VERSION`].
     ///
@@ -380,6 +464,8 @@ impl Default for Arrangement {
             named: false,
             extra: Map::new(),
             version: ARRANGEMENT_VERSION,
+            tempo: crate::tempo::TempoMap::default(),
+            meter: crate::tempo::MeterMap::default(),
         }
     }
 }
@@ -484,6 +570,14 @@ impl Arrangement {
                 .unwrap_or(0.0)
         };
         let desk = map.shift_remove("desk").as_ref().and_then(DeskSnap::from_value);
+        // **The version-4 migration, and the document's first real one.**
+        //
+        // A v4 file has no maps and one tempo, which lives on the desk
+        // snapshot. Reading it as a map of one point is the whole migration —
+        // and skipping it would open a song written at 90 at 120, which is
+        // the sort of thing somebody notices as "it sounds wrong" and never
+        // reports as a bug.
+        let (tempo, meter) = Self::read_maps(&mut map, version, desk.as_ref());
         let mut clips = Vec::new();
         if let Some(Value::Array(list)) = map.shift_remove("clips") {
             for item in list {
@@ -542,6 +636,23 @@ impl Arrangement {
                     fade_out_s: secs(&c, "fade_out_s"),
                     name,
                     id: c.get("id").and_then(Value::as_u64).unwrap_or(0),
+                    // **A version-4 clip is TIME-anchored, always.** Not
+                    // because that is the better default for MIDI — it is
+                    // not — but because it is what v4 DID: there was no
+                    // tempo map, so nothing followed a tempo. A migration
+                    // that helpfully made old MIDI musical would move notes
+                    // in songs people have already finished.
+                    anchor: if version >= V5_MUSICAL_TIME {
+                        c.get("anchor")
+                            .and_then(Value::as_str)
+                            .map_or(Anchor::Time, Anchor::from_key)
+                    } else {
+                        Anchor::Time
+                    },
+                    follow_tempo: c
+                        .get("follow_tempo")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
                     // **Whatever is left is somebody else's.** Take the keys
                     // this build understands out of the object and keep the
                     // remainder verbatim; `shift_remove` and not `remove`,
@@ -597,7 +708,66 @@ impl Arrangement {
             // Up, never down. A v1 document has just been migrated by being
             // read; a v9 one keeps the number its own build will look for.
             version: version.max(ARRANGEMENT_VERSION),
+            tempo,
+            meter,
         }
+    }
+
+    /// The two maps, migrated from whatever the file happened to be.
+    fn read_maps(
+        map: &mut Map<String, Value>,
+        version: u64,
+        desk: Option<&DeskSnap>,
+    ) -> (crate::tempo::TempoMap, crate::tempo::MeterMap) {
+        use crate::tempo::{MeterMap, MeterPoint, TempoMap, TempoPoint};
+        let tempo_json = map.shift_remove("tempo_map");
+        let meter_json = map.shift_remove("meter_map");
+        if version < V5_MUSICAL_TIME {
+            // v4 and earlier: one tempo and one signature, both on the desk.
+            let bpm = desk.map_or(crate::recorder::DEFAULT_BPM, |d| d.tempo_bpm);
+            let sig = desk.map_or_else(crate::recorder::TimeSignature::default, |d| {
+                crate::recorder::TimeSignature { beats: d.sig_beats, unit: d.sig_unit }
+            });
+            return (TempoMap::constant(bpm), MeterMap::constant(sig));
+        }
+        let tempo = match tempo_json {
+            Some(Value::Array(list)) => TempoMap::sanitised(
+                list.iter()
+                    .filter_map(|v| {
+                        let o = v.as_object()?;
+                        Some(TempoPoint {
+                            at_beat: o.get("at")?.as_f64()?,
+                            bpm: o.get("bpm")?.as_f64()?,
+                            ramp: o.get("ramp").and_then(Value::as_bool).unwrap_or(false),
+                        })
+                    })
+                    .collect(),
+            ),
+            // A v5 document with no map is one saved at a single tempo, and
+            // the desk still carries it.
+            _ => TempoMap::constant(desk.map_or(crate::recorder::DEFAULT_BPM, |d| d.tempo_bpm)),
+        };
+        let meter = match meter_json {
+            Some(Value::Array(list)) => MeterMap::sanitised(
+                list.iter()
+                    .filter_map(|v| {
+                        let o = v.as_object()?;
+                        Some(MeterPoint {
+                            at_bar: u32::try_from(o.get("at")?.as_u64()?).ok()?,
+                            sig: crate::recorder::TimeSignature {
+                                beats: u8::try_from(o.get("beats")?.as_u64()?).ok()?,
+                                unit: u8::try_from(o.get("unit")?.as_u64()?).ok()?,
+                            },
+                        })
+                    })
+                    .collect(),
+            ),
+            _ => MeterMap::constant(desk.map_or_else(
+                crate::recorder::TimeSignature::default,
+                |d| crate::recorder::TimeSignature { beats: d.sig_beats, unit: d.sig_unit },
+            )),
+        };
+        (tempo, meter)
     }
 
     pub fn to_json(&self) -> String {
@@ -673,6 +843,15 @@ impl Arrangement {
                             );
                         }
                         m.insert("id".into(), Value::Number(c.id.into()));
+                        // Written only when they say something, so a document
+                        // full of ordinary time-anchored clips keeps the shape
+                        // it had in version 4.
+                        if c.anchor != Anchor::Time {
+                            m.insert("anchor".into(), Value::String(c.anchor.key().to_owned()));
+                        }
+                        if c.follow_tempo {
+                            m.insert("follow_tempo".into(), Value::Bool(true));
+                        }
                         for (key, v) in [
                             ("start_s", c.start_s),
                             ("offset_s", c.offset_s),
@@ -700,6 +879,53 @@ impl Arrangement {
                     .collect(),
             ),
         );
+        // **The maps, written only when they SAY something.** A song at one
+        // tempo in one signature — which is every song anybody has made with
+        // this app so far — writes neither key and keeps the exact shape it
+        // had at version 4, apart from its stamp. The desk snapshot still
+        // carries the opening tempo, so such a file also still opens
+        // correctly in a build that predates all of this.
+        if !self.tempo.is_constant() {
+            map.insert(
+                "tempo_map".into(),
+                Value::Array(
+                    self.tempo
+                        .points()
+                        .iter()
+                        .map(|p| {
+                            let mut o = Map::new();
+                            for (k, v) in [("at", p.at_beat), ("bpm", p.bpm)] {
+                                if let Some(n) = serde_json::Number::from_f64(v) {
+                                    o.insert(k.into(), Value::Number(n));
+                                }
+                            }
+                            if p.ramp {
+                                o.insert("ramp".into(), Value::Bool(true));
+                            }
+                            Value::Object(o)
+                        })
+                        .collect(),
+                ),
+            );
+        }
+        if !self.meter.is_constant() {
+            map.insert(
+                "meter_map".into(),
+                Value::Array(
+                    self.meter
+                        .points()
+                        .iter()
+                        .map(|p| {
+                            let mut o = Map::new();
+                            o.insert("at".into(), Value::Number(u64::from(p.at_bar).into()));
+                            o.insert("beats".into(), Value::Number(u64::from(p.sig.beats).into()));
+                            o.insert("unit".into(), Value::Number(u64::from(p.sig.unit).into()));
+                            Value::Object(o)
+                        })
+                        .collect(),
+                ),
+            );
+        }
         // Unknown keys LAST, like the settings file: a newer build's keys win
         // over nothing, and they survive.
         for (k, v) in &self.extra {
@@ -738,6 +964,8 @@ mod tests {
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default(),
             id: 0,
+            anchor: Anchor::Time,
+            follow_tempo: false,
             extra: Map::new(),
         }
     }
@@ -832,13 +1060,19 @@ mod tests {
     /// build's song opened here is not stripped.
     #[test]
     fn a_newer_builds_keys_survive() {
+        // **NOT `tempo_map` any more.** This test used that name as its
+        // example of a key from the future, and version 5 made it a key from
+        // the present — at which point the test would have gone on passing
+        // while proving nothing at all, because `to_json` writes that key
+        // itself. Picking a name no build has is the whole point of the
+        // fixture.
         let text = r#"{"arrangement_version": 9, "clips": [],
-                       "tempo_map": [{"at": 0, "bpm": 121}]}"#;
+                       "groove_map": [{"at": 0, "swing": 121}]}"#;
         let a = Arrangement::from_json(text);
         let out = a.to_json();
         assert!(
-            out.contains("tempo_map") && out.contains("121"),
-            "a newer build's tempo map was stripped: {out}"
+            out.contains("groove_map") && out.contains("121"),
+            "a newer build's key was stripped: {out}"
         );
     }
 
@@ -866,6 +1100,98 @@ mod tests {
         // And the whole document is still equal to itself across the trip,
         // which is what makes an older build safe to open a song in.
         assert_eq!(Arrangement::from_json(&out), a);
+    }
+
+    /// **A version-4 song opens at the tempo it was written at.**
+    ///
+    /// The document's first real migration arm, and the one that would have
+    /// been noticed as "it sounds wrong" rather than reported as a bug: a v4
+    /// file keeps its single tempo on the desk snapshot, so a v5 reader that
+    /// just looked for `tempo_map` and found nothing would open every
+    /// existing song at 120.
+    #[test]
+    fn a_version_four_song_keeps_the_tempo_it_was_written_at() {
+        let v4 = r#"{"arrangement_version": 4,
+                     "desk": {"tempo_bpm": 96.0, "sig_beats": 6, "sig_unit": 8},
+                     "clips": [{"kind": "midi", "lane": 1, "path": "",
+                                "start_s": 4.0, "len_s": 8.0}]}"#;
+        let a = Arrangement::from_json(v4);
+        assert!(a.tempo.is_constant(), "a v4 song gained a tempo map it never had");
+        assert!(
+            (a.tempo.bpm_at_beat(0.0) - 96.0).abs() < 1e-9,
+            "opened at {} rather than 96",
+            a.tempo.bpm_at_beat(0.0)
+        );
+        assert_eq!(
+            a.meter.sig_at_bar(0),
+            crate::recorder::TimeSignature { beats: 6, unit: 8 },
+            "the signature did not come across"
+        );
+        // **And every clip stays TIME-anchored**, which is what v4 behaved
+        // as. Making old MIDI musical on the way in would move notes in
+        // songs that are already finished.
+        assert_eq!(a.clips[0].anchor, Anchor::Time, "a v4 clip changed meaning");
+        assert!(!a.clips[0].follow_tempo);
+        assert_eq!(a.version, ARRANGEMENT_VERSION, "the stamp did not move up");
+    }
+
+    /// A song at one tempo writes no map at all.
+    ///
+    /// The shape every existing document has, kept: a file that says nothing
+    /// about tempo is still readable by a build that predates the map, and
+    /// its desk snapshot still carries the number.
+    #[test]
+    fn one_tempo_writes_no_map_and_a_real_one_round_trips() {
+        let plain = Arrangement::default();
+        let out = plain.to_json();
+        assert!(!out.contains("tempo_map"), "a constant tempo wrote a map: {out}");
+        assert!(!out.contains("meter_map"), "a constant meter wrote a map: {out}");
+
+        let mut a = Arrangement::default();
+        a.tempo = crate::tempo::TempoMap::sanitised(vec![
+            crate::tempo::TempoPoint { at_beat: 0.0, bpm: 120.0, ramp: true },
+            crate::tempo::TempoPoint { at_beat: 16.0, bpm: 72.0, ramp: false },
+        ]);
+        a.meter = crate::tempo::MeterMap::sanitised(vec![
+            crate::tempo::MeterPoint {
+                at_bar: 0,
+                sig: crate::recorder::TimeSignature { beats: 4, unit: 4 },
+            },
+            crate::tempo::MeterPoint {
+                at_bar: 8,
+                sig: crate::recorder::TimeSignature { beats: 3, unit: 4 },
+            },
+        ]);
+        let back = Arrangement::from_json(&a.to_json());
+        assert_eq!(back.tempo, a.tempo, "the tempo map did not survive");
+        assert_eq!(back.meter, a.meter, "the meter map did not survive");
+        // The ritardando's flag is part of it — a ramp read back as a step
+        // is a different piece of music.
+        assert!(back.tempo.points()[0].ramp, "the ramp was flattened");
+    }
+
+    /// An anchor survives, and is only written when it says something.
+    #[test]
+    fn a_clips_anchor_survives_and_costs_nothing_when_ordinary() {
+        let mut a = Arrangement::default();
+        a.add_clip(ArrClip {
+            kind: ClipKind::Midi,
+            anchor: Anchor::Beat,
+            follow_tempo: true,
+            ..a_clip(1, "", 4.0)
+        });
+        a.add_clip(a_clip(2, "/x/take.wav", 8.0));
+        let out = a.to_json();
+        let back = Arrangement::from_json(&out);
+        assert_eq!(back.clips[0].anchor, Anchor::Beat);
+        assert!(back.clips[0].follow_tempo);
+        assert_eq!(back.clips[1].anchor, Anchor::Time);
+        assert!(!back.clips[1].follow_tempo);
+        // The ordinary clip writes neither key: a document of plain audio
+        // keeps the bytes it had at version 4.
+        assert_eq!(out.matches("\"anchor\"").count(), 1, "an ordinary clip wrote an anchor");
+        assert_eq!(out.matches("follow_tempo").count(), 1);
+        assert_eq!(back, a, "the document did not survive its own round trip");
     }
 
     /// The version stamp only ever moves UP.
@@ -917,6 +1243,8 @@ mod tests {
             fade_out_s: 0.2,
             name: "everything set".into(),
             id: 0,
+            anchor: Anchor::Beat,
+            follow_tempo: true,
             extra: Map::new(),
         });
         let Ok(Value::Object(doc)) = serde_json::from_str::<Value>(&a.to_json()) else {

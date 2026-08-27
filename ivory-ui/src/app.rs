@@ -1141,6 +1141,8 @@ fn clip_at(rel_path: &str, lane: usize, start_s: f64) -> crate::arrangement::Arr
             .unwrap_or_default(),
         id: 0,
         extra: Default::default(),
+        anchor: Default::default(),
+        follow_tempo: false,
     }
 }
 
@@ -2889,6 +2891,8 @@ impl IvoryApp {
             name: "Blue Bossa - backing".to_owned(),
             id: 0,
             extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
         });
         let take = arr.add_clip(crate::arrangement::ArrClip {
             kind: crate::arrangement::ClipKind::Audio,
@@ -2903,6 +2907,8 @@ impl IvoryApp {
             name: "take 3".to_owned(),
             id: 0,
             extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
         });
         let solo = arr.add_clip(crate::arrangement::ArrClip {
             kind: crate::arrangement::ClipKind::Audio,
@@ -2917,6 +2923,8 @@ impl IvoryApp {
             name: "solo".to_owned(),
             id: 0,
             extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
         });
         // And a MIDI item with a phrase in it, so the note miniature is in
         // the picture.
@@ -2947,6 +2955,8 @@ impl IvoryApp {
             name: "MIDI".to_owned(),
             id: 0,
             extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
         });
         self.arrangement = arr;
         let wave = |n: usize, seed: f32| -> Vec<f32> {
@@ -4988,6 +4998,8 @@ impl IvoryApp {
             name,
             id: 0,
             extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
         });
         let _ = doc;
         self.arr_save_edits();
@@ -5124,6 +5136,8 @@ impl IvoryApp {
                 name,
                 id: 0,
                 extra: Default::default(),
+                anchor: Default::default(),
+                follow_tempo: false,
             });
             added = Some(id);
         }
@@ -6905,6 +6919,8 @@ impl IvoryApp {
                 name: c.name.clone(),
                 id: 0,
                 extra: Default::default(),
+                anchor: Default::default(),
+                follow_tempo: false,
             });
         }
         if tails.is_empty() {
@@ -10736,6 +10752,8 @@ impl IvoryApp {
                         name: "MIDI".to_owned(),
                         id: 0,
                         extra: Default::default(),
+                        anchor: Default::default(),
+                        follow_tempo: false,
                     });
                     self.arr_save_edits();
                 }
@@ -17965,6 +17983,8 @@ mod tests {
             name: "MIDI".to_owned(),
             id: 0,
             extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
         });
         app.open_midi_editor(id);
         app.me_select_all();
@@ -18085,6 +18105,8 @@ mod tests {
             name: "old".to_owned(),
             id: 0,
             extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
         });
         app.add_recorded_clips(vec![crate::arrangement::RecordedClip {
             lane: 0,
@@ -18139,6 +18161,8 @@ mod tests {
             name: "old".to_owned(),
             id: 0,
             extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
         });
         app.add_recorded_clips(vec![crate::arrangement::RecordedClip {
             lane: 0,
@@ -18180,6 +18204,8 @@ mod tests {
             name: "x".to_owned(),
             id: 0,
             extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
         };
         // One spanning clip 0..20, one swallowed 22..24, one tail-side 25..35.
         app.arrangement.add_clip(clip(1, 0.0, 20.0));
@@ -18360,6 +18386,8 @@ mod tests {
             name: "MIDI".to_owned(),
             id: 0,
             extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
         });
         app.open_midi_editor(id);
         assert!(app.midi_edit.is_some(), "the editor did not open");
@@ -20284,6 +20312,8 @@ mod tests {
             name: "MIDI".to_owned(),
             id: 0,
             extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
         });
         let id = app.arrangement.clips[0].id;
         let _ = run_frame(&ctx, &mut app);
@@ -21007,6 +21037,8 @@ mod tests {
             name: "m".into(),
             id: 0,
             extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
         });
         app.arrangement.add_clip(ArrClip {
             kind: ClipKind::Audio,
@@ -21021,6 +21053,8 @@ mod tests {
             name: "a".into(),
             id: 0,
             extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
         });
         app.apply_recorder_hit(recorder_panel::Hit::SetTempo(180.0));
         let r = 120.0 / 180.0;
@@ -21069,6 +21103,8 @@ mod tests {
             name: "m".into(),
             id: 0,
             extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
         });
         let id = app.arrangement.clips[0].id;
         app.open_midi_editor(id);
