@@ -1785,6 +1785,80 @@ pub const BUILTIN_NAME: &str = "Tangent DX7";
 pub const DRUMPAD_PATH: &str = "@tangent-drums";
 pub const DRUMPAD_NAME: &str = "Tangent Drums";
 
+/// Every effect Tangent ships, as a picker row.
+///
+/// **The same sentinel trick as the DX7 and the drumpad, for the same
+/// reason.** A row here rides the bay through the picker, the settings file
+/// and the saved session without any of those layers learning that there is
+/// such a thing as a built-in effect; the one place that looks is where a bay
+/// is actually filled. Nothing is written to disk and nothing appears in a
+/// plugin scan — these exist only inside the app, which is the whole point.
+///
+/// `(path, name, what it is)`. The third column is the line under the name in
+/// the picker, and it is where the hardware gets named: the row's NAME is
+/// Tangent's, and the reference goes in the description. See
+/// `recorder_panel::Fx::subtitle`, which has done it that way since the
+/// phaser, and see LICENSING.md on why the split matters.
+pub const FX_UNITS: [(&str, &str, &str); 8] = [
+    (
+        "@tangent-plate",
+        "Tangent Plate",
+        "legendary plate, after the EMT-140",
+    ),
+    (
+        "@tangent-echo",
+        "Tangent Echo",
+        "warbling saturation, after the RE-201 Space Echo",
+    ),
+    (
+        "@tangent-chorus",
+        "Tangent Chorus",
+        "true stereo, after the Boss CE-1",
+    ),
+    (
+        "@tangent-phaser",
+        "Tangent Phaser",
+        "four stages, after the MXR Phase 90",
+    ),
+    (
+        "@tangent-hpf",
+        "Tangent HPF",
+        "takes the bottom off, after everything",
+    ),
+    (
+        "@tangent-lpf",
+        "Tangent LPF",
+        "takes the top off - up is darker",
+    ),
+    (
+        "@tangent-gain",
+        "Tangent Gain",
+        "drive into the limiter - it CAN clip",
+    ),
+    (
+        "@tangent-limiter",
+        "Tangent Limiter",
+        "true peak ceiling - no makeup",
+    ),
+];
+
+/// Whether a bay's contents are one of Tangent's own rather than a file.
+///
+/// **The leading `@` is the whole test, and it is the invariant
+/// [`BUILTIN_PATH`] already documents**: no filesystem path starts with one,
+/// so a sentinel can never collide with a bundle somebody has installed.
+///
+/// This exists because the test used to be written out as
+/// `p != BUILTIN_PATH && p != DRUMPAD_PATH` in ten places across three files.
+/// Two sentinels made that survivable; ten does not, and the failure is
+/// silent — a site left on the old two-way test lets an effect through a
+/// filter meant to exclude it, which surfaces as a row that can be "deleted
+/// from disk" or one that turns up in a plugin rescan. One function, and
+/// adding the eleventh sentinel needs no edit here at all.
+pub fn is_builtin(path: &str) -> bool {
+    path.starts_with('@')
+}
+
 /// Said under the list, every time, in full-strength text rather than the faint
 /// grey the other note gets.
 ///
@@ -1956,8 +2030,7 @@ fn plugin_choice<'a>(
     let visible = visible_plugins(plugins, filter);
     if let Some(i) = selected {
         let in_open_folder = plugins.get(i).is_some_and(|p| {
-            p.path == BUILTIN_PATH
-                || p.path == DRUMPAD_PATH
+            is_builtin(&p.path)
                 || !filter.trim().is_empty()
                 || open_folders.iter().any(|f| f == plugin_folder(p))
         });
@@ -2003,7 +2076,7 @@ fn plugin_row(entry: &PluginEntry, current: Option<&str>) -> String {
     } else {
         ' '
     };
-    let builtin = entry.path == BUILTIN_PATH || entry.path == DRUMPAD_PATH;
+    let builtin = is_builtin(&entry.path);
     if !builtin || entry.vendor.trim().is_empty() {
         // The vendor is the FOLDER heading now, not a suffix on every row
         // under it — the owner's ruling.
@@ -2117,7 +2190,7 @@ impl Dialog {
         // preselected, marked row has somewhere to be seen.
         let open_folders = selected
             .and_then(|i| plugins.get(i))
-            .filter(|e| e.path != BUILTIN_PATH && e.path != DRUMPAD_PATH)
+            .filter(|e| !is_builtin(&e.path))
             .map(|e| vec![plugin_folder(e).to_owned()])
             .unwrap_or_default();
         Dialog::PluginPicker {
@@ -3569,7 +3642,7 @@ pub fn show(
                             let installed = plugins
                                 .iter()
                                 .filter(|p| {
-                                    p.path != BUILTIN_PATH && p.path != DRUMPAD_PATH
+                                    !is_builtin(&p.path)
                                 })
                                 .count();
                             if installed == 0 {
@@ -3599,8 +3672,7 @@ pub fn show(
                                             .iter()
                                             .filter(|&&i| {
                                                 plugins.get(i).is_some_and(|p| {
-                                                    p.path != BUILTIN_PATH
-                                                        && p.path != DRUMPAD_PATH
+                                                    !is_builtin(&p.path)
                                                 })
                                             })
                                             .count();
@@ -3653,8 +3725,7 @@ pub fn show(
                                         // folders must not read as a search
                                         // that found nothing. The built-ins
                                         // stand above every folder.
-                                        let builtin = entry.path == BUILTIN_PATH
-                                            || entry.path == DRUMPAD_PATH;
+                                        let builtin = is_builtin(&entry.path);
                                         if !builtin {
                                             let folder = plugin_folder(entry).to_owned();
                                             if seen_folder.as_deref() != Some(folder.as_str()) {
@@ -6923,6 +6994,68 @@ pub fn show(
 #[cfg(test)]
 mod tests {
 
+    /// **Everything Tangent ships is a sentinel, and nothing else is.**
+    ///
+    /// [`is_builtin`] is one `starts_with`, and it replaced the same two-way
+    /// comparison written out in ten places. What it rests on is that no
+    /// filesystem path begins with `@` — so this checks the assumption from
+    /// both ends rather than trusting the sentence on [`BUILTIN_PATH`].
+    #[test]
+    fn every_built_in_is_recognised_and_no_real_path_is() {
+        for path in [super::BUILTIN_PATH, super::DRUMPAD_PATH] {
+            assert!(super::is_builtin(path), "{path} was not recognised");
+        }
+        for (path, ..) in super::FX_UNITS {
+            assert!(super::is_builtin(path), "{path} was not recognised");
+        }
+        for path in [
+            "/Library/Audio/Plug-Ins/VST3/Pianoteq 8.vst3",
+            "C:\\Program Files\\Common Files\\VST3\\Vital.vst3",
+            "~/tangent-plate.vst3",
+            "",
+        ] {
+            assert!(!super::is_builtin(path), "{path:?} was taken for a built-in");
+        }
+    }
+
+    /// **The rows are unique, and their names carry no trademark.**
+    ///
+    /// The second half is the one that matters and it is not decoration. A row
+    /// is the effect's NAME; the hardware it is voiced after belongs in the
+    /// description beside it, where naming it is a reference to somebody
+    /// else's product rather than a claim about this one. That is the
+    /// difference the whole position rests on, it is what
+    /// `recorder_panel::Fx::subtitle` has done since the phaser, and it is one
+    /// careless edit away from being lost — so it is a test and not a comment.
+    #[test]
+    fn no_effect_is_named_after_hardware_it_only_refers_to() {
+        let marks = [
+            "emt", "roland", "space echo", "re-201", "boss", "ce-1", "mxr",
+            "phase 90", "140",
+        ];
+        for (path, name, what) in super::FX_UNITS {
+            let lower = name.to_lowercase();
+            for mark in marks {
+                assert!(
+                    !lower.contains(mark),
+                    "the row for {path} is called {name:?}, which carries \
+                     {mark:?} — that belongs in the description, not the name"
+                );
+            }
+            assert!(
+                name.starts_with("Tangent "),
+                "{name:?} does not say whose effect it is"
+            );
+            assert!(!what.is_empty(), "{name} has nothing under it");
+        }
+        for (i, (path, name, _)) in super::FX_UNITS.iter().enumerate() {
+            for (other, other_name, _) in &super::FX_UNITS[i + 1..] {
+                assert_ne!(path, other, "two rows share the path {path}");
+                assert_ne!(name, other_name, "two rows share the name {name}");
+            }
+        }
+    }
+
     /// **A row of cells and its gaps fit the space it was given.**
     ///
     /// The track dialog's colour grid ran off the right-hand edge of the
@@ -8495,7 +8628,7 @@ mod tests {
                 // in, and it is the one entry that can describe itself.
                 assert!(plugins
                     .iter()
-                    .filter(|p| p.path != BUILTIN_PATH && p.path != DRUMPAD_PATH)
+                    .filter(|p| !is_builtin(&p.path))
                     .all(|p| p.vendor.is_empty()));
                 // Three, not one: the built-ins took the first two rows.
                 assert_eq!(*selected, Some(3), "it did not open on what is loaded");
