@@ -175,11 +175,17 @@ Three ways out, in the order I would take them:
    carry more `FxRow::NONE`.
 2. **Drop `Width` from the plate** and give the row to `plate_dispersion`. The
    figure-of-eight tank decorrelates on its own, so width at its default is
-   already wide; dispersion has no such fallback.
+   already wide; dispersion has no such fallback, and it is the single most
+   characteristic thing about the unit.
 3. **Leave it.** Defensible, and it should then be said in a comment so the
    next person does not think the parameters were forgotten.
 
-You can see the layout and I cannot, so this is yours.
+**Updated after `Fx::A`/`Fx::B` were retired:** `enum Fx` is back to the eight
+at `5e3796d`, so the grid is eight cells in two rows and nothing is competing
+for the space. That removes the reason I hedged here. With a plain eight-dial
+grid I would take (1) — six rows costs one array width and one layout test, and
+it is the only option that does not trade a control away. (2) is the right
+fallback if the panel geometry fights back.
 
 ---
 
@@ -187,30 +193,44 @@ You can see the layout and I cannot, so this is yours.
 
 `dialogs::is_builtin(path)` exists and the seven sites inside `dialogs.rs` are
 converted. Outside it there are **two** places where the two-way test is now
-wrong, both in `desktop.rs`:
+wrong, both in `desktop.rs`. **Named by function and by the line they contain,
+not by line number** — line numbers taken against `5e3796d` will not resolve
+against a tree that is moving.
 
-| Site | What it does | Why it matters |
+Both sites are the identical two lines:
+
+```rust
+let engine_want = want.as_deref().filter(|p| {
+    *p != ivory_ui::dialogs::BUILTIN_PATH && *p != ivory_ui::dialogs::DRUMPAD_PATH
+});
+```
+
+and both want to become:
+
+```rust
+let engine_want = want.as_deref().filter(|p| !ivory_ui::dialogs::is_builtin(p));
+```
+
+| Function | Where in it | Why it matters |
 |---|---|---|
-| `desktop.rs:2242` | filters `engine_want` for a bay-0 **instrument** | An FX sentinel here would be handed to the VST3 loader as a file path. |
-| `desktop.rs:4006` | filters `engine_want` for a **rack bay** | **The critical one.** This is the path an `@tangent-plate` in an insert bay travels. |
+| **`after_frame`** | the `inserts_loaded` walk — right under the comment beginning *"The built-in is not a bundle"*, just before `e.load_insert(i / inserts, i % inserts, path, …)` | **The critical one.** This is the live rack walk across every seat and bay, and it is the path an `@tangent-plate` in an insert bay travels to the VST3 loader. |
+| **`start_offline_bounce`** | under the comment `// ── every configured rack seat, saved state included ──`, just before the second `e.load_insert(` | The export mirror of the same walk. |
 
-Both read:
-
-```rust
-*p != ivory_ui::dialogs::BUILTIN_PATH && *p != ivory_ui::dialogs::DRUMPAD_PATH
-```
-
-and want to become:
-
-```rust
-!ivory_ui::dialogs::is_builtin(p)
-```
+**Both, or neither.** `start_offline_bounce` carries a comment in the tree
+saying it "furnishes a second engine BY HAND and duplicates four things the
+live path also does" — converting only the live one would mean an effect you
+could hear and could not export, which is precisely the class of quiet
+wrongness that comment is warning about.
 
 **Everything else that mentions a sentinel is fine and should be left alone.**
-The other eleven sites ask "is this *the DX7*" or "is this *the drumpad*",
-which is a different question with a correct answer already —
-`desktop.rs:3980`, `:3984`, `:5347`, `:5407`, and `app.rs:1231`, `:1237`,
-`:1240`, `:5668`, `:6370`, `:8783`, `:10124`.
+The other eleven ask "is this *the DX7*" or "is this *the drumpad*" — a
+different question with a correct answer already. They are the
+`set_builtin_strip` / `set_drum_strip` lookups in `after_frame` and
+`start_offline_bounce`, the drumpad's bay-1 rule in `pump_midi`'s neighbourhood,
+and in `app.rs` the `bay0(*n) == BUILTIN_PATH` searches, the drumpad-live
+checks, and the fresh-install assertion. Search for `== …BUILTIN_PATH` and
+`== …DRUMPAD_PATH` rather than for line numbers: **equality against one
+specific sentinel is always correct; only the two-way `!=` pair is wrong.**
 
 I would still ship the conversion as **its own commit that changes no
 behaviour**, then the sentinels on top: the failure mode is silent, and a
@@ -249,16 +269,42 @@ copied.
 
 ## 6. Two decisions I made that are reversible, and one I did not make
 
-**Feedback ceiling, `TAPE_FEEDBACK` = 0.90.** A Space Echo's Intensity reaches
-self-oscillation and that howl is half of what the box is for. The reason
-written here when the top was 0.72 has not stopped being true — a send on a
-master bus should not be an oscillator — but 0.72 was well short of the long
-smeared wash the machine is actually used for. 0.90 is where
-`the_delay_does_not_run_away_at_any_setting` bounds it. The `tanh` in the loop
-would hold a higher setting bounded rather than let it diverge, so this is one
-constant from the hardware if that trade is taken. **I asked about this and got
-no answer before starting; changing a documented decision with a test behind it
-was not mine to do unilaterally.**
+**Feedback ceiling, `TAPE_FEEDBACK` = 1.25. Ruled on: match the hardware.**
+This file argued the other way twice — it shipped at 0.72, then at 0.90, both
+chosen so every setting kept decaying, on the reasoning that a send across a
+master bus is not a place for an oscillator. Ganten's instruction was to match
+the hardware, so it does: an RE-201's Intensity reaches self-oscillation and
+that howl is on the records rather than being an abuse of the control.
+
+Three things had to move with it, and they are the interesting part:
+
+- **The invariant changed, not just the constant.**
+  `the_delay_does_not_run_away_at_any_setting` demanded that the tail decay at
+  *every* Intensity, which is right for a delay and forbids a Space Echo. What
+  tape actually guarantees is not decay but **boundedness** — it compresses
+  rather than diverging. It is `the_echo_stays_bounded_at_every_setting` now:
+  finite, under a generous ceiling, in the worst case of all three heads live;
+  plus a decay assertion at two thirds of the knob, so it still behaves like a
+  delay where somebody looking for repeats would put it.
+  `the_intensity_reaches_self_oscillation` covers the capability the old
+  assertion used to forbid.
+- **1.25, not a hair over 1.0.** Small-signal and large-signal loop gain are
+  different numbers: `tanh(1.6a)/1.6a` is already down to 0.97 once the loop
+  carries a fifth of full scale, so 1.06 self-limits almost immediately and
+  reads as a very long delay. At 1.25 the loop settles where
+  `1.25 · tanh(1.6a)/1.6a = 1`, near 0.68 on the tape — loud, squashed and
+  stable.
+- **The feedback tap is now the head MIX, not the head sum.** Only started
+  mattering once Intensity could pass unity: three heads summing raw would give
+  mode 11 three times mode 1's loop gain, so one knob setting would be a gentle
+  wash on one position of the selector and an instant howl on another. The wet
+  output still carries the full sum — three heads *should* be louder, and that
+  is a level rather than a loop.
+
+**What bounds it is the `tanh`, not the ceiling on the knob.** Worth knowing
+because the master limiter ships bypassed: at the top of the travel this is
+genuinely loud, in the same way the gain dial next to it is documented as one
+that *can* clip. It cannot diverge.
 
 **Tempo sync survives.** `Division` still sets head one's time. The alternative
 — a free-running Repeat Rate, as on the hardware — would have deleted the one
