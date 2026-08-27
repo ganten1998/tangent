@@ -61,6 +61,16 @@ PC
   # there is no ALSA and the stub .pc above does not apply. The Linux-only
   # tests are checked on the Linux box instead.
   #
+  # **`--no-default-features --features ivory/recorder`, exactly as
+  # `package_linux` builds.** Without it the default `mp3` feature drags
+  # `mp3lame-encoder` into a CROSS build, and LAME's autoconf decides its
+  # toolchain by compiling and RUNNING test programs — which a macOS host
+  # cannot do for a Linux target. `check-linux` therefore exited 101 on every
+  # invocation, which means the only pre-release type check for the Linux legs
+  # has not run for as long as the flag has been missing. The packaged build
+  # was always right; only the check was wrong, so nothing shipped broken —
+  # but nothing was being checked either.
+  #
   # Nothing may go between the backslashes below. A comment there ends the
   # continuation, the environment never reaches `cargo`, and the failure is
   # alsa-sys panicking about pkg-config — which reads as a broken toolchain
@@ -68,7 +78,8 @@ PC
   PKG_CONFIG_ALLOW_CROSS=1 \
   PKG_CONFIG_PATH="$pcdir" \
   PKG_CONFIG_SYSROOT_DIR=/ \
-    cargo check --workspace --target "$target"
+    cargo check --workspace --no-default-features --features ivory/recorder \
+      --target "$target"
   local rc=$?
   rm -rf "$pcdir"
   return $rc
