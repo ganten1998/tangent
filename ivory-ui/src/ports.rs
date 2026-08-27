@@ -479,7 +479,24 @@ pub enum SavePurpose {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProjectRequest {
     /// Clone the `default` template into a fresh Untitled and open it.
+    ///
+    /// **Asks first if the scratch it would reclaim holds recordings.** The
+    /// reclaim rule — an Untitled nobody SAVED is taken back, so New lands on
+    /// "Untitled" instead of minting a pile — used to run `remove_dir_all`
+    /// over that folder, `media/` and all, with no warning. A take you
+    /// recorded and did not name is still a take you played, and it is the
+    /// one thing in this app that cannot be made again.
+    ///
+    /// The host answers this with [`ScratchWarning`] instead of acting when
+    /// there is something to lose; the two variants below are what the
+    /// dialog's buttons send back.
     New,
+    /// New, and leave the unsaved scratch exactly where it is — a fresh
+    /// "Untitled 2" rather than a reclaim. The SAFE answer, and the default.
+    NewKeeping,
+    /// New, and reclaim the scratch, recordings included. Reachable only from
+    /// the confirmation.
+    NewDiscarding,
     /// Write everything down now: plugin states to the project's shelf,
     /// the desk into the document.
     Save,
@@ -495,6 +512,18 @@ pub enum ProjectRequest {
     /// The same pass, but every used lane lands in its own WAV under
     /// `<project>/export/stems/`.
     ExportStems,
+}
+
+/// What the host found in the scratch project New would reclaim.
+///
+/// Plain data across the firewall, like everything else a panel displays
+/// about the disk: the host counts, the app asks the question.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScratchWarning {
+    /// The folder's name, so the question can say which session it means.
+    pub name: String,
+    /// How many files are sitting in its `media/`.
+    pub takes: usize,
 }
 
 /// Why a folder is being asked for.

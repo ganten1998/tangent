@@ -3467,6 +3467,21 @@ impl Settings {
     ///
     /// See [`ResetScope`] for why this is five narrow answers and one wide
     /// one rather than the single wide one it used to be.
+    ///
+    /// **Back to what a FRESH INSTALL gets, not to `Settings::default()`.**
+    /// Inherited whole from `reset_to_defaults`, which this replaces, and the
+    /// distinction is a trap somebody already fell into: a new install opens
+    /// with every band showing and the old reset took you to
+    /// keyboard-and-chord, so the app's own reset produced a state the app
+    /// never starts in — and somebody pressing it to get back to how it came
+    /// got LESS, three launches running, and reasonably concluded their
+    /// settings were not being saved. `Settings::default()` remains the
+    /// mechanical meaning: every field's zero value, and what a corrupt file
+    /// falls back to, where rearranging somebody's window on top of a parse
+    /// failure would be the wrong kindness.
+    ///
+    /// `extra` is not mentioned by any scope and so is never touched — the
+    /// old function had to save and restore it by hand.
     pub fn reset(&mut self, scope: ResetScope) {
         let fresh = Self::first_launch();
         let all = scope == ResetScope::Everything;
@@ -3690,31 +3705,6 @@ impl Settings {
         self.reastream_port = fresh.reastream_port;
     }
 
-    /// "Reset Settings to Default" (D-UI-8): resets the 13 parity keys and
-    /// `custom_font_path`, keeps unknown keys.
-    /// **Resets to what a FRESH INSTALL gets, not to `Settings::default()`.**
-    ///
-    /// Those were two different things, and the gap was a real trap: a new
-    /// install opens with every band showing, and "Reset Settings to Default"
-    /// took you to keyboard-and-chord. So the app's own reset produced a state
-    /// the app never starts in — and somebody who pressed it expecting to get
-    /// back to how it came, got less, three launches running, and reasonably
-    /// concluded their settings were not being saved.
-    ///
-    /// One meaning of "default" now. `Settings::default()` remains the
-    /// mechanical one — every field's zero value, and what a corrupt file falls
-    /// back to, where rearranging somebody's window on top of a parse failure
-    /// would be the wrong kindness.
-    pub fn reset_to_defaults(&mut self) {
-        let extra = std::mem::take(&mut self.extra);
-        *self = Self::first_launch();
-        self.extra = extra;
-        // A reset is not a first launch: the migrations have already run, and
-        // re-running them would put video back on for somebody who has just
-        // asked for everything to go back to how it was.
-        self.video_default_applied = true;
-        self.shows_default_applied = true;
-    }
 
     /// Height for the detached chord window (D-UI-1: <= 0 falls back to 50).
     pub fn detached_height_for_use(&self) -> f32 {

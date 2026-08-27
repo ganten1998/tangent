@@ -196,7 +196,10 @@ pub enum MenuAction {
     /// distraction in the piano forums, and no competitor offers the switch.
     ToggleHideElapsed,
     ShowAbout,
-    ResetSettings,
+    /// Put one part of the settings back. Every one of these opens a
+    /// confirmation — see [`crate::settings::ResetScope`], which is also
+    /// where the words on the rows live.
+    Reset(crate::settings::ResetScope),
 }
 
 /// Everything the menu needs to know to render its labels.
@@ -1240,7 +1243,25 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
         ));
     }
     tail.push(item("About", MenuAction::ShowAbout));
-    tail.push(item("Reset Settings to Default", MenuAction::ResetSettings));
+    // **A category, where there was one row.** "Reset Settings to Default"
+    // destroyed all one hundred and sixty-four settings from directly under
+    // About, with no confirmation; see `ResetScope` for why the answer is to
+    // name the scopes rather than to put a speed bump in front of the wide
+    // one. This is a submenu and not six top-level rows for the obvious
+    // reason — and it leaves the top-level row budget one BETTER than it
+    // found it.
+    push_category(
+        &mut tail,
+        "Reset",
+        crate::settings::ResetScope::ALL
+            .iter()
+            .map(|scope| SubItem {
+                label: scope.row().to_owned(),
+                action: MenuAction::Reset(*scope),
+                enabled: true,
+            })
+            .collect(),
+    );
 
     // **The compartments, joined.** A separator between blocks and never two in
     // a row, never one at the top and never one at the bottom — which is the
@@ -2371,7 +2392,7 @@ mod tests {
         );
         assert_eq!(
             category_names(v.clone()),
-            vec!["Window", "Themes", "Colors", "Chords", "Clef", "Key", "Stave"],
+            vec!["Window", "Themes", "Colors", "Chords", "Clef", "Key", "Stave", "Reset"],
             "no fretboard hovers while the fretboard is off"
         );
 
@@ -2388,7 +2409,7 @@ mod tests {
             category_names(v.clone()),
             vec![
                 "Window", "Themes", "Colors", "Chords", "Clef", "Key", "Stave", "Fretboard", "Wood",
-                "Tuning", "Capo"
+                "Tuning", "Capo", "Reset"
             ]
         );
         let wood = sub(v.clone(), "Wood");
@@ -2688,10 +2709,12 @@ mod tests {
             );
         }
         assert_eq!(submenus(v.clone())[0].0, "Window");
-        assert_eq!(
-            rows(v.clone()).last().map(|(_, a, _)| a.clone()),
-            Some(MenuAction::ResetSettings)
-        );
+        // Reset is the last thing on the menu, and it is a CATEGORY now
+        // rather than the one row that destroyed everything.
+        let subs = submenus(v.clone());
+        let (label, _, actions) = subs.last().expect("no submenu at the tail");
+        assert_eq!(label, "Reset");
+        assert_eq!(actions.len(), crate::settings::ResetScope::ALL.len());
     }
 
     /// In a plugin, every row that survives must be one the host can actually
@@ -2805,7 +2828,7 @@ mod tests {
             category_names(v.clone()),
             vec![
                 "Window", "Themes", "Colors", "Chords", "Clef", "Key", "Stave", "Fretboard", "Wood",
-                "Tuning", "Capo"
+                "Tuning", "Capo", "Reset"
             ]
         );
     }
@@ -2898,16 +2921,41 @@ mod tests {
         assert!(pos(MenuAction::ManageTaughtChords) < pos(MenuAction::CorrectChordName));
         assert!(pos(MenuAction::CorrectChordName) < pos(MenuAction::ToggleChordLearning));
 
+        // **About and Reset are still the last two things on the menu** —
+        // but Reset is a submenu, so it is not in `rows`, which lists plain
+        // items only. It used to be the last ROW, and the row directly under
+        // About destroyed all 164 settings with no confirmation; see
+        // `ResetScope`.
         let top = rows(view());
         assert_eq!(
             top.last().map(|(_, a, _)| a.clone()),
-            Some(MenuAction::ResetSettings)
+            Some(MenuAction::ShowAbout),
+            "About is the last plain row"
         );
+        // `all_rows` flattens a category into its items, so the last thing
+        // it sees is the last ROW of the Reset menu.
+        let all = all_rows(view());
         assert_eq!(
-            top.iter().position(|(_, a, _)| *a == MenuAction::ShowAbout),
-            Some(top.len() - 2),
-            "About and Reset are the last two rows"
+            all.last().map(|(_, a, _)| a.clone()),
+            Some(MenuAction::Reset(crate::settings::ResetScope::Everything)),
+            "Reset is not the last thing on the menu"
         );
+        // And every scope is reachable, each one behind its own confirmation.
+        let (_, labels, actions) = submenus(view())
+            .into_iter()
+            .find(|(l, ..)| l == "Reset")
+            .expect("the Reset category went missing");
+        for scope in crate::settings::ResetScope::ALL {
+            assert!(
+                actions.iter().any(|a| *a == MenuAction::Reset(scope)),
+                "{scope:?} is not on the Reset menu"
+            );
+            assert!(
+                labels.iter().any(|l| l == scope.row()),
+                "{scope:?}'s row is not labelled {:?}",
+                scope.row()
+            );
+        }
     }
 
     /// §5: this row is the entire affordance. `show_recorder` is off by default
@@ -2983,9 +3031,12 @@ mod tests {
         }
         // The tail survives whole.
         let rows = all_rows(v);
-        for wanted in ["About", "Reset Settings to Default"] {
-            assert!(rows.iter().any(|(l, ..)| l == wanted), "{wanted} left the tail");
-        }
+        assert!(rows.iter().any(|(l, ..)| l == "About"), "About left the tail");
+        assert!(
+            rows.iter()
+                .any(|(_, a, _)| matches!(a, MenuAction::Reset(_))),
+            "the Reset category left the tail"
+        );
     }
 
     /// **Right-clicking the band leads with the band's own category.**

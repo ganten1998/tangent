@@ -170,6 +170,18 @@ pub struct IvoryApp {
     /// A size the user asked for that the host has not been told about yet.
     /// Only ever set when the host owns the window.
     pending_resize: Option<Vec2>,
+    /// A reset the confirmation said yes to, waiting for the frame loop.
+    ///
+    /// Deferred rather than done on the spot because
+    /// [`Self::apply_dialog_action`] has no `egui::Context` — it is public so
+    /// the host's editor hook can drive it — and putting the font back needs
+    /// one. The same shape as `pending_resize` beside it.
+    pending_reset: Option<crate::settings::ResetScope>,
+    /// The Undo on the box a reset leaves behind was pressed.
+    pending_undo_reset: bool,
+    /// What the host found in the scratch New would reclaim, pushed when it
+    /// declines to act. Cleared as soon as the question is asked.
+    scratch_warning: Option<crate::ports::ScratchWarning>,
     /// The rect the last frame was laid out into. Read when asking a host for
     /// a new size, so the width the user already has is preserved.
     last_pane: Vec2,
@@ -1348,6 +1360,9 @@ impl IvoryApp {
             cameras: None,
             caps,
             pending_resize: None,
+            pending_reset: None,
+            pending_undo_reset: false,
+            scratch_warning: None,
             last_pane: Vec2::ZERO,
             last_drawn: Rect::NOTHING,
             last_band: Rect::NOTHING,
@@ -11248,6 +11263,12 @@ impl IvoryApp {
 
     /// The dialog on screen, if any. The host reads it to keep a slot row in
     /// step with the picker that belongs to it.
+    /// The host declined to reclaim a scratch project because it holds
+    /// recordings. The app turns this into the question.
+    pub fn warn_about_scratch(&mut self, warn: crate::ports::ScratchWarning) {
+        self.scratch_warning = Some(warn);
+    }
+
     pub fn open_dialog(&self) -> Option<&dialogs::Dialog> {
         self.dialog.as_ref()
     }
@@ -12180,6 +12201,7 @@ impl IvoryApp {
     pub fn open_setup_for_shot(&mut self) {
         self.setup_open = true;
     }
+
 
     pub fn open_mixer_for_shot(&mut self) {
         self.mixer_open = true;
@@ -13475,19 +13497,82 @@ impl IvoryApp {
                 })
             }
             MenuAction::ShowAbout => self.dialog = Some(Dialog::About),
-            MenuAction::ResetSettings => self.reset_settings(ctx),
+            MenuAction::Reset(scope) => self.ask_before_resetting(scope),
         }
     }
 
-    /// "Reset Settings to Default" (spec §9, D-UI-8).
-    fn reset_settings(&mut self, ctx: &egui::Context) {
+    /// Put the question before the damage.
+    ///
+    /// **There is no unconfirmed road to a reset any more.** The menu row
+    /// lands here, this opens a dialog, and only its button reaches
+    /// [`Self::reset_settings`] — which is why that function is private and
+    /// takes a scope rather than being the thing a menu row calls.
+    fn ask_before_resetting(&mut self, scope: crate::settings::ResetScope) {
+        self.dialog = Some(Dialog::Confirm {
+            title: scope.title().to_owned(),
+            body: scope.body().to_owned(),
+            kept: scope.kept().to_owned(),
+            choices: vec![dialogs::ConfirmChoice::new(
+                "Reset",
+                dialogs::DialogAction::ResetTo(scope),
+                true,
+            )],
+            warn: self.settings.master_knob_color.to_color32(),
+        });
+    }
+
+    /// What the app says once a reset has happened — and the way back.
+    ///
+    /// **A second box, not a status line.** The whole failure this work is
+    /// undoing is that a destructive action gave no signal at all, and an
+    /// Undo offered in the strip that also carries live errors is one that
+    /// scrolls away while somebody is still working out what just changed.
+    fn report_the_reset(&mut self, scope: crate::settings::ResetScope, undoable: bool) {
+        let kept = if undoable {
+            "A copy of your settings from just before this was kept. Undo puts \
+             it back exactly, including anything this reset did not touch."
+                .to_owned()
+        } else {
+            // Said plainly rather than hidden: an Undo button that might not
+            // work is worse than no Undo button.
+            "The copy of your previous settings could not be written, so this \
+             one cannot be undone."
+                .to_owned()
+        };
+        self.dialog = Some(Dialog::Confirm {
+            title: scope.title().to_owned(),
+            body: format!("{} is done.", scope.title()),
+            kept,
+            choices: if undoable {
+                vec![dialogs::ConfirmChoice::new(
+                    "Undo",
+                    dialogs::DialogAction::UndoReset,
+                    false,
+                )]
+            } else {
+                Vec::new()
+            },
+            warn: self.settings.master_knob_color.to_color32(),
+        });
+    }
+
+    /// "Reset Settings to Default" (spec §9, D-UI-8), one scope at a time.
+    ///
+    /// Private, and reached only from [`Dialog::Confirm`]'s button.
+    fn reset_settings(&mut self, ctx: &egui::Context, scope: crate::settings::ResetScope) {
         let had_custom_font = self.settings.custom_font_path.is_some();
         let live_detached = self
             .detach_window_visible
             .then_some(self.detached_live_size)
             .flatten();
 
-        self.settings.reset_to_defaults();
+        // **The copy comes first, and from memory.** See
+        // `Settings::write_backup`: the file on disk can be one edit behind
+        // the desk being destroyed. Gated on the same capability as every
+        // other write to the settings file, because a plugin instance must
+        // not touch it.
+        let undoable = self.caps.persist_global_settings && self.settings.write_backup();
+        self.settings.reset(scope);
 
         // Closing the detached window re-attaches; Python's close handler then
         // records its live height (overwriting the freshly reset 50).
@@ -13515,11 +13600,35 @@ impl IvoryApp {
             self.request_natural_size();
         }
         self.rebuild_voicing();
-        if had_custom_font {
-            // Settings were reset: back to the bundled default font too.
+        if had_custom_font && self.settings.custom_font_path.is_none() {
+            // The font went back with the colours — but only the scope that
+            // owns it may do that, which is why this now asks whether the
+            // field actually changed rather than only what it used to be.
             crate::fonts::install(ctx, crate::fonts::FontChoice::default(), None);
         }
         self.save_settings();
+        self.report_the_reset(scope, undoable);
+    }
+
+    /// Put the settings back to the copy taken just before the last reset.
+    fn undo_the_reset(&mut self, ctx: &egui::Context) {
+        let Some(back) = crate::settings::Settings::load_backup() else {
+            return;
+        };
+        let font = crate::fonts::FontChoice::from_key(&back.font_choice);
+        let custom = back.custom_font_path.clone();
+        self.settings = back;
+        // Every window the reset closed stays closed: re-opening popouts
+        // from underneath somebody is a second surprise on top of the one
+        // they just undid, and the settings that say where they go are
+        // restored either way.
+        self.detector
+            .set_note_preference(self.settings.prefer_flats);
+        crate::fonts::install(ctx, font, custom.as_deref());
+        self.rebuild_voicing();
+        self.request_natural_size();
+        self.save_settings();
+        self.desk_reload = true;
     }
 
     // ── Teach layer (D-UI-5) ───────────────────────────────────────────────
@@ -13770,6 +13879,25 @@ impl IvoryApp {
             DialogAction::ProjectNew => {
                 self.dialog = None;
                 self.project_request = Some(crate::ports::ProjectRequest::New);
+            }
+            // **The confirmed halves.** None of these four is reachable from a
+            // menu row: each arrives from a button on a [`Dialog::Confirm`],
+            // which is what makes the confirmation impossible to route round.
+            DialogAction::ResetTo(scope) => {
+                self.dialog = None;
+                self.pending_reset = Some(scope);
+            }
+            DialogAction::UndoReset => {
+                self.dialog = None;
+                self.pending_undo_reset = true;
+            }
+            DialogAction::NewProjectKeeping => {
+                self.dialog = None;
+                self.project_request = Some(crate::ports::ProjectRequest::NewKeeping);
+            }
+            DialogAction::NewProjectDiscarding => {
+                self.dialog = None;
+                self.project_request = Some(crate::ports::ProjectRequest::NewDiscarding);
             }
             DialogAction::ProjectOpen => {
                 self.dialog = None;
@@ -16697,6 +16825,45 @@ impl IvoryApp {
             }
         {
             self.apply_dialog_action(action);
+        }
+        // The two answers that need a context to carry out: putting the font
+        // back, and putting it back again. See `pending_reset`.
+        if let Some(scope) = self.pending_reset.take() {
+            self.reset_settings(&ctx, scope);
+        }
+        if std::mem::take(&mut self.pending_undo_reset) {
+            self.undo_the_reset(&ctx);
+        }
+        // **The host declined to reclaim a scratch with recordings in it and
+        // handed the fact back.** Ask, defaulting to keeping them.
+        if let Some(warn) = self.scratch_warning.take() {
+            let takes = warn.takes;
+            let s = if takes == 1 { "" } else { "s" };
+            self.dialog = Some(Dialog::Confirm {
+                title: "Start a new project?".to_owned(),
+                body: format!(
+                    "\u{201c}{}\u{201d} has {takes} recording{s} in it and was never saved \
+                     to a named project.",
+                    warn.name
+                ),
+                kept: "Keep it and the new project starts beside it. Discard it \
+                       and the folder goes, recordings included."
+                    .to_owned(),
+                choices: vec![
+                    // Rightmost, and the one the eye lands on: the safe one.
+                    dialogs::ConfirmChoice::new(
+                        "Keep it",
+                        dialogs::DialogAction::NewProjectKeeping,
+                        false,
+                    ),
+                    dialogs::ConfirmChoice::new(
+                        "Discard it",
+                        dialogs::DialogAction::NewProjectDiscarding,
+                        true,
+                    ),
+                ],
+                warn: self.settings.master_knob_color.to_color32(),
+            });
         }
         // **The export window floats over everything, and is not a dialog.**
         // A dialog is one at a time and answers a question; this answers
@@ -21799,7 +21966,166 @@ mod tests {
         }
     }
 
-    /// A reset must land where a fresh install lands.
+    /// **No menu row resets anything.** Every one of them asks first.
+    ///
+    /// This is the guarantee the whole change exists for, and it is asserted
+    /// from the outside — drive the menu action the way a click does, and
+    /// check that the settings are untouched and a question is on screen.
+    /// Reading the source for the absence of a call would prove nothing; a
+    /// second road to `reset_settings` is exactly the mistake this is here to
+    /// catch.
+    #[test]
+    fn every_reset_row_asks_before_it_does_anything() {
+        for scope in crate::settings::ResetScope::ALL {
+            let mut s = Settings::first_launch();
+            // Something worth losing, in each of the five parts.
+            s.theme_name = "Iris".into();
+            s.window_size_percent = 175;
+            s.fretboard_capo = 3;
+            s.channel_gains[2] = 0.25;
+            s.record_audio_device = Some("Scarlett 18i20".to_owned());
+            let (ctx, mut app) = headless_with(Caps::DESKTOP, s.clone());
+            app.apply_menu_action(&ctx, MenuAction::Reset(scope));
+
+            assert!(
+                matches!(app.open_dialog(), Some(dialogs::Dialog::Confirm { .. })),
+                "{scope:?} did not ask"
+            );
+            assert_eq!(app.settings.theme_name, s.theme_name, "{scope:?} acted anyway");
+            assert_eq!(app.settings.window_size_percent, 175, "{scope:?} acted anyway");
+            assert_eq!(app.settings.fretboard_capo, 3, "{scope:?} acted anyway");
+            assert_eq!(app.settings.channel_gains[2], 0.25, "{scope:?} acted anyway");
+            assert_eq!(
+                app.settings.record_audio_device, s.record_audio_device,
+                "{scope:?} acted anyway"
+            );
+        }
+    }
+
+    /// The question names what dies AND what survives, in every scope.
+    ///
+    /// A destructive dialog that only lists the damage makes somebody cancel
+    /// out of an action that was safe, which teaches them to click through
+    /// the next one. Both halves, always.
+    #[test]
+    fn the_question_says_what_it_keeps() {
+        for scope in crate::settings::ResetScope::ALL {
+            let (ctx, mut app) = headless(Caps::DESKTOP);
+            app.apply_menu_action(&ctx, MenuAction::Reset(scope));
+            let Some(dialogs::Dialog::Confirm { title, body, kept, choices, .. }) =
+                app.open_dialog()
+            else {
+                panic!("{scope:?} did not open a confirmation");
+            };
+            assert!(!title.is_empty(), "{scope:?} has no title");
+            assert!(body.len() > 30, "{scope:?} does not say what it does: {body:?}");
+            assert!(kept.len() > 30, "{scope:?} does not say what it keeps: {kept:?}");
+            assert!(
+                kept.starts_with("Kept:"),
+                "{scope:?} buries the reassurance: {kept:?}"
+            );
+            // Exactly one way forward, and it is marked as the destructive
+            // one. Cancel is drawn by the dialog and is never a choice.
+            assert_eq!(choices.len(), 1, "{scope:?} offers more than one way forward");
+            assert!(choices[0].destructive, "{scope:?}'s button is not marked destructive");
+        }
+    }
+
+    /// Saying yes does the narrow thing, and leaves a way back.
+    #[test]
+    fn a_confirmed_reset_does_its_scope_and_offers_undo() {
+        let dir = std::env::temp_dir()
+            .join(format!("ivory-reset-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::env::set_var("IVORY_SETTINGS_PATH", dir.join("settings.json"));
+
+        let mut s = Settings::first_launch();
+        s.theme_name = "Iris".into();
+        s.background_color = crate::settings::Rgb { r: 9, g: 9, b: 9 };
+        s.record_audio_device = Some("Scarlett 18i20".to_owned());
+        s.channel_gains[2] = 0.25;
+        let (ctx, mut app) = headless_with(Caps::DESKTOP, s);
+
+        app.apply_menu_action(&ctx, MenuAction::Reset(crate::settings::ResetScope::Colours));
+        app.apply_dialog_action(dialogs::DialogAction::ResetTo(
+            crate::settings::ResetScope::Colours,
+        ));
+        run_frame(&ctx, &mut app);
+
+        let fresh = Settings::first_launch();
+        assert_eq!(app.settings.theme_name, fresh.theme_name, "the colours did not go back");
+        assert_eq!(app.settings.background_color, fresh.background_color);
+        // ...and the expensive things are exactly where they were.
+        assert_eq!(app.settings.record_audio_device.as_deref(), Some("Scarlett 18i20"));
+        assert_eq!(app.settings.channel_gains[2], 0.25);
+
+        // The box that reports it offers the way back.
+        let Some(dialogs::Dialog::Confirm { choices, .. }) = app.open_dialog() else {
+            panic!("nothing reported the reset");
+        };
+        assert_eq!(choices.len(), 1);
+        assert!(matches!(choices[0].action, dialogs::DialogAction::UndoReset));
+
+        // And it works, across everything the reset touched.
+        app.apply_dialog_action(dialogs::DialogAction::UndoReset);
+        run_frame(&ctx, &mut app);
+        assert_eq!(app.settings.theme_name, "Iris", "Undo did not put the theme back");
+        assert_eq!(
+            app.settings.background_color,
+            crate::settings::Rgb { r: 9, g: 9, b: 9 }
+        );
+
+        std::env::remove_var("IVORY_SETTINGS_PATH");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every confirmation draws, in both modes, at every pane it can meet.
+    ///
+    /// **Because the ink test only checks the colours it was told about.**
+    /// It measures body, `faint` and the warning against the grounds this
+    /// code picks, which is the right check for the class of bug this app has
+    /// had seven times — but it says nothing about whether the words fit the
+    /// card. This runs the real dialog through a real egui pass, at the
+    /// PLUGIN caps where a dialog is drawn as a layer in the canvas, on the
+    /// smallest pane the app will ever hand it and the largest.
+    ///
+    /// Note for anybody reaching for a picture instead: `shot::window` cannot
+    /// take one. It photographs the composite — what the video records —
+    /// straight from a `&IvoryApp`, and never runs an egui pass at all. The
+    /// real binary under `IVORY_INLINE=menu` is the way to look at a dialog.
+    #[test]
+    fn every_confirmation_draws_at_every_size() {
+        for scope in crate::settings::ResetScope::ALL {
+            for dark in [false, true] {
+                let settings = Settings { dark_mode: dark, show_welcome: false, ..Settings::default() };
+                let (ctx, mut app) = headless_with(Caps::PLUGIN, settings);
+                crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+                app.apply_menu_action(&ctx, MenuAction::Reset(scope));
+                // A cruelly short editor, a plausible one, and a huge one.
+                for pane in [
+                    Vec2::new(380.0, 140.0),
+                    Vec2::new(900.0, 500.0),
+                    Vec2::new(2600.0, 1600.0),
+                ] {
+                    let _ = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, pane)),
+                            ..Default::default()
+                        },
+                        |ctx| app.frame(ctx),
+                    );
+                    // Still up: a dialog that closed itself while being drawn
+                    // is one nobody can answer.
+                    assert!(
+                        matches!(app.open_dialog(), Some(dialogs::Dialog::Confirm { .. })),
+                        "{scope:?} dark={dark} closed itself at {pane:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A reset to EVERYTHING must land where a fresh install lands.
     ///
     /// They were two different states, and the gap was a trap: a new install
     /// shows every band and "Reset Settings to Default" showed two. Somebody
@@ -21811,7 +22137,7 @@ mod tests {
         s.show_fretboard = false;
         s.theory_order = if false { crate::theory_panel::Views::all().keys() } else { String::new() };
         s.dark_mode = true;
-        s.reset_to_defaults();
+        s.reset(crate::settings::ResetScope::Everything);
 
         let fresh = crate::settings::Settings::first_launch();
         assert_eq!(s.show_fretboard, fresh.show_fretboard);

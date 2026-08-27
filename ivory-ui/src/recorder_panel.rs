@@ -267,7 +267,16 @@ pub fn surface_of(face: Color32) -> Surface {
     Surface {
         bg,
         ink,
-        faint: step(ink, bg, 0.34),
+        // **Quieter is a matter of WEIGHT, not of being harder to read.**
+        // This was a flat blend a third of the way toward the ground with no
+        // floor under it, and on the pale themes a third of the way toward a
+        // near-white panel is already a grey nobody reads: the confirmation
+        // dialog's "Kept:" line — the one somebody has to read to learn the
+        // action is SAFE — came out at 3.45:1 on Copper. Blended as asked and
+        // then walked back until it clears the same 4.5 every other word in
+        // the app answers to. `arrangement_panel::quiet` had this right
+        // already; it is here now so every surface gets it.
+        faint: hold_ink(step(ink, bg, 0.34), ink, bg),
         raised: hold(step(bg, up, 0.14)),
         hover: hold(step(bg, up, 0.26)),
         well: step(bg, down, 0.30),
@@ -275,6 +284,62 @@ pub fn surface_of(face: Color32) -> Surface {
     }
 }
 
+
+/// Walk a quieted ink back toward full strength until it clears 4.5:1.
+///
+/// The companion to [`legible_surface`], from the other side: there the
+/// SURFACE moves because neither ink can win on it; here the surface is
+/// already fine and it is the deliberate softening that went too far.
+fn hold_ink(soft: Color32, ink: Color32, bg: Color32) -> Color32 {
+    const FLOOR: f32 = 4.5;
+    if contrast_ratio(soft, bg) >= FLOOR {
+        return soft;
+    }
+    // Back toward the full-strength ink, which is guaranteed to clear —
+    // `bg` came through `legible_surface` — so this always terminates on
+    // something readable.
+    for k in 1u8..=12 {
+        let t = 1.0 - f32::from(k) * (1.0 / 12.0);
+        let f = |x: u8, y: u8| {
+            (f32::from(x) + (f32::from(y) - f32::from(x)) * t) as u8
+        };
+        let out = Color32::from_rgb(
+            f(ink.r(), soft.r()),
+            f(ink.g(), soft.g()),
+            f(ink.b(), soft.b()),
+        );
+        if contrast_ratio(out, bg) >= FLOOR {
+            return out;
+        }
+    }
+    ink
+}
+
+/// CIE76 over D65 — enough to answer "can these two be told apart", which is
+/// the only question ever asked of it.
+///
+/// **The companion to [`contrast_ratio`], and not a substitute for it.**
+/// Contrast ratio is luminance only, so two colours of wildly different hue
+/// at the same lightness score near 1:1 on it while being obviously different
+/// to look at — the "equal luminance is not equal vividness" trap this app
+/// has met before. Use `contrast_ratio` for "can this be READ on that", and
+/// this for "is this a different colour from that".
+pub fn delta_e(a: Color32, b: Color32) -> f32 {
+    fn lab(c: Color32) -> (f32, f32, f32) {
+        let ch = |v: u8| {
+            let v = f32::from(v) / 255.0;
+            if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+        };
+        let (r, g, b) = (ch(c.r()), ch(c.g()), ch(c.b()));
+        let f = |t: f32| if t > 0.008856 { t.cbrt() } else { 7.787 * t + 16.0 / 116.0 };
+        let x = f((r * 0.4124 + g * 0.3576 + b * 0.1805) / 0.95047);
+        let y = f(r * 0.2126 + g * 0.7152 + b * 0.0722);
+        let z = f((r * 0.0193 + g * 0.1192 + b * 0.9505) / 1.08883);
+        (116.0 * y - 16.0, 500.0 * (x - y), 200.0 * (y - z))
+    }
+    let (a, b) = (lab(a), lab(b));
+    ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2) + (a.2 - b.2).powi(2)).sqrt()
+}
 
 /// The nearest shade of `c` that can actually CARRY its own ink at 4.5:1.
 ///

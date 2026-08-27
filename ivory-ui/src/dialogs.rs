@@ -211,6 +211,36 @@ pub enum Dialog {
         /// The tick's live state, committed when the box is closed.
         dont_show: bool,
     },
+    /// **A yes/no in front of something that cannot be taken back.**
+    ///
+    /// One dialog rather than one per action, and the app's first: before
+    /// this there was no "Are you sure" anywhere in it, while "Reset Settings
+    /// to Default" sat one slip below About in every context menu and New
+    /// Project ran `remove_dir_all` over an unsaved session.
+    ///
+    /// **Three lines, and the third is the one that was missing.** What this
+    /// will do, what it will NOT touch, and the buttons. A destructive dialog
+    /// that only names the damage makes somebody cancel out of an action that
+    /// was safe, which teaches them to click through the next one.
+    Confirm {
+        title: String,
+        /// What is about to happen, in the words somebody would use.
+        body: String,
+        /// What SURVIVES, drawn quieter under the body. Empty for none.
+        kept: String,
+        /// The buttons, right to left: `choices[0]` is rightmost and is where
+        /// the eye lands, so the SAFEST answer goes first when there is more
+        /// than one. Cancel is always drawn, leftmost, and is never in here.
+        choices: Vec<ConfirmChoice>,
+        /// The theme's warning colour — `master_knob_color`, the one control
+        /// that can undo every other one — handed in rather than looked up,
+        /// because this module draws and does not read settings.
+        ///
+        /// It goes through `surface_of` before anything is written on it, for
+        /// the reason every surface in this app does: the ink belongs to the
+        /// surface and is measured, never inherited from the role.
+        warn: Color32,
+    },
     NoMidiInput,
     MidiError {
         message: String,
@@ -447,6 +477,29 @@ pub struct LearningStatus {
 /// `TrackPalette` with this means "follow the theme" rather than naming one.
 pub const PALETTE_AUTO: i64 = -1;
 
+/// One button on a [`Dialog::Confirm`].
+pub struct ConfirmChoice {
+    pub label: String,
+    /// What the app does if this one is pressed. An ordinary
+    /// [`DialogAction`], so a confirm is a GATE in front of the action rather
+    /// than a second way of expressing it.
+    pub action: DialogAction,
+    /// Wears the warning colour. At most one choice should be destructive;
+    /// two of them is a dialog with no safe answer, which is a dialog that
+    /// should have had a different question.
+    pub destructive: bool,
+}
+
+impl ConfirmChoice {
+    pub fn new(label: &str, action: DialogAction, destructive: bool) -> Self {
+        Self { label: label.to_owned(), action, destructive }
+    }
+}
+
+/// **`Clone`, so a confirmation can hold one.** Every other action in this
+/// file is produced and consumed in one frame; a [`ConfirmChoice`] has to
+/// keep one alive across the frames the dialog is open.
+#[derive(Clone)]
 pub enum DialogAction {
     /// New session from the `default` template.
     ProjectNew,
@@ -644,6 +697,17 @@ pub enum DialogAction {
     /// from it. This is the "Use these settings for every take" tick, and it
     /// goes to the same place the output folder's "Default" tick does.
     SetExportAndRemember(ExportSpec),
+    /// Put one part of the settings back — the CONFIRMED half of a reset.
+    ///
+    /// There is deliberately no unconfirmed road to this: the menu row opens
+    /// a [`Dialog::Confirm`] and this arrives from its button.
+    ResetTo(crate::settings::ResetScope),
+    /// Put the settings back to the copy taken just before the last reset.
+    UndoReset,
+    /// Start a new project, and take the unsaved one's directory with it.
+    NewProjectDiscarding,
+    /// Start a new project and leave the unsaved one where it is.
+    NewProjectKeeping,
 }
 
 // ── the custom tuning editor ────────────────────────────────────────────────
@@ -2316,6 +2380,9 @@ struct DialogTheme {
     /// TEXT, and on the light theme the button fill is too close to the
     /// ground to read as an input box. See `apply_theme`.
     field_bg: Color32,
+    /// Secondary text: quieter by WEIGHT, never by being harder to read.
+    /// See `Surface::faint`.
+    faint: Color32,
 }
 
 /// A dialog is a floating panel like any other — **made of the desk's own
@@ -2325,6 +2392,12 @@ struct DialogTheme {
 /// theme. Worse, the only caller passed `false` forever, so a dialog never
 /// went dark either — it was a light card over a dark app.
 fn theme(face: Color32) -> DialogTheme {
+    theme_of(face)
+}
+
+/// The same, under a name a test can call while a loop variable is called
+/// `theme`.
+fn theme_of(face: Color32) -> DialogTheme {
     let p = crate::recorder_panel::surface_of(face);
     DialogTheme {
         bg: p.bg,
@@ -2333,6 +2406,7 @@ fn theme(face: Color32) -> DialogTheme {
         button_hover: p.hover,
         button_border: p.edge,
         field_bg: p.well,
+        faint: p.faint,
     }
 }
 
@@ -5405,6 +5479,84 @@ pub fn show(
                 },
             )
         }
+        Dialog::Confirm {
+            title,
+            body,
+            kept,
+            choices,
+            warn,
+        } => {
+            let t = theme(face);
+            // **`faint`, not `gamma_multiply`.** The quieter line here is the
+            // one that says the action is SAFE, and multiplying an ink's
+            // gamma is how this app has repeatedly produced text nobody can
+            // read on a pale ground. `Surface::faint` blends toward the
+            // ground and then walks back to 4.5:1.
+            let dim = t.faint;
+            // **The warning colour, measured.** `surface_of` moves the ground
+            // through `legible_surface` if it landed in the dead zone and
+            // then picks the ink that ground can actually carry — so a
+            // destructive button reads on all sixteen themes in both modes
+            // without any theme having to name a colour for it. Writing the
+            // theme's crimson straight onto the button, or picking white text
+            // by a brightness test, is the mistake this app has now made
+            // seven times.
+            let danger = crate::recorder_panel::surface_of(*warn);
+            // Sized to the words: three lines of prose at a fixed width plus
+            // a button row, and `kept` is usually the longest of the three.
+            let lines = 1 + body.len() / 46 + if kept.is_empty() { 0 } else { 1 + kept.len() / 46 };
+            let height = (108.0 + lines as f32 * 15.0).clamp(150.0, 340.0);
+            show_dialog_viewport(
+                ctx,
+                placement,
+                title,
+                Vec2::new(430.0, height),
+                Vec2::new(380.0, 140.0),
+                |ui, result| {
+                    apply_theme(ui.style_mut(), &t);
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
+                    let bold = |size: f32| FontId::new(size, fonts::courier_bold());
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::same(12))
+                        .show(ui, |ui| {
+                            ui.label(RichText::new(&*body).font(bold(12.0)).color(t.text));
+                            if !kept.is_empty() {
+                                ui.add_space(8.0);
+                                ui.label(RichText::new(&*kept).font(bold(10.5)).color(dim));
+                            }
+                            ui.add_space((ui.available_height() - 30.0).max(6.0));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                // `choices[0]` is rightmost — see the variant.
+                                for choice in choices.iter() {
+                                    let button = if choice.destructive {
+                                        Button::new(
+                                            RichText::new(&choice.label).color(danger.ink),
+                                        )
+                                        .fill(danger.bg)
+                                    } else {
+                                        Button::new(RichText::new(&choice.label).color(t.text))
+                                    };
+                                    if ui.add(button).clicked() {
+                                        action = Some(choice.action.clone());
+                                        result.close = true;
+                                    }
+                                }
+                                // **Cancel is always here and is always last
+                                // in the layout, so it is leftmost** — the
+                                // furthest button from where a hand that came
+                                // to press the destructive one is already
+                                // resting.
+                                if ui
+                                    .add(Button::new(RichText::new("Cancel").color(t.text)))
+                                    .clicked()
+                                {
+                                    result.close = true;
+                                }
+                            });
+                        });
+                },
+            )
+        }
         Dialog::SaveTheme {
             name,
             message,
@@ -6712,6 +6864,101 @@ pub fn show(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Every theme dresses the confirmation legibly, warning and all.**
+    ///
+    /// The destructive button is a NEW SURFACE, and this app has learned the
+    /// same lesson about new surfaces seven times: the ink belongs to the
+    /// surface and is measured, never inherited from a themed role and never
+    /// picked by a brightness threshold. Every one of those seven was found
+    /// by a screenshot rather than a test, so here is the test.
+    ///
+    /// It is also the reason the warning colour needs no theme role of its
+    /// own. `master_knob_color` is already per-theme — it is the one control
+    /// that can undo every other one, which is exactly what a destructive
+    /// button is — and `surface_of` measures whatever that colour turns out
+    /// to be, moving the ground out of the 0.12–0.22 dead zone if it landed
+    /// there.
+    #[test]
+    fn every_theme_dresses_a_confirmation_legibly_in_both_modes() {
+        let mut bad: Vec<String> = Vec::new();
+        let mut warns = std::collections::HashSet::new();
+        for theme in crate::theme::factory() {
+            for dark in [false, true] {
+                let mut set = crate::settings::Settings::default();
+                theme.apply(&mut set);
+                set.dark_mode = dark;
+                let mode = if dark { "dark" } else { "light" };
+                let name = &theme.name;
+
+                // The card itself, from the desk's face like every other
+                // floating panel in the app.
+                let face = set
+                    .dark_role("fx_strip")
+                    .filter(|_| dark)
+                    .map_or_else(
+                        || {
+                            let c = set.fx_strip_color.to_color32();
+                            if dark { crate::mixer_panel::shade_face(c, 0.88) } else { c }
+                        },
+                        |c| c.to_color32(),
+                    );
+                let t = theme_of(face);
+                let body = crate::recorder_panel::contrast_ratio(t.text, t.bg);
+                if body < 4.5 {
+                    bad.push(format!("{name} {mode}: body text {body:.2}:1"));
+                }
+                // The quieter "Kept:" line, which is the one somebody has to
+                // read to know the action is SAFE. Held to the same bar as
+                // the body: a reassurance nobody can read is not one.
+                let kept = crate::recorder_panel::contrast_ratio(t.faint, t.bg);
+                if kept < 4.5 {
+                    bad.push(format!("{name} {mode}: the kept line {kept:.2}:1"));
+                }
+
+                // The destructive button.
+                let danger = crate::recorder_panel::surface_of(
+                    set.master_knob_color.to_color32(),
+                );
+                let label = crate::recorder_panel::contrast_ratio(danger.ink, danger.bg);
+                if label < 4.5 {
+                    bad.push(format!("{name} {mode}: the Reset label {label:.2}:1"));
+                }
+                // And it has to be TELLABLE from the ordinary buttons beside
+                // it, or the warning is decoration.
+                //
+                // **Measured as ΔE and not as a contrast ratio**, and the
+                // first draft of this test got it wrong in exactly the way
+                // this app has been caught before. Contrast ratio is
+                // luminance ONLY, so the theme's crimson against a mid-grey
+                // button scores 1.50:1 on Default — which reads as "these are
+                // nearly the same" while they are plainly a red button and a
+                // grey one. Every theme fails a 3:1 luminance bar here and
+                // every theme passes by an enormous margin perceptually: the
+                // measured range is 53 to 91, where 25 is already "obviously
+                // a different colour". The bar below is the floor of that
+                // range with room to spare.
+                //
+                // Colour is never the ONLY signal: the destructive button
+                // also says what it does ("Reset", "Discard it") and sits
+                // furthest from Cancel, so nothing here depends on being able
+                // to tell red from grey.
+                let apart = crate::recorder_panel::delta_e(danger.bg, t.button_bg);
+                if apart < 25.0 {
+                    bad.push(format!(
+                        "{name} {mode}: the destructive button is only ΔE {apart:.1} from \
+                         an ordinary one"
+                    ));
+                }
+                warns.insert((danger.bg.r(), danger.bg.g(), danger.bg.b()));
+            }
+        }
+        assert!(bad.is_empty(), "{} unreadable confirmations: {bad:#?}", bad.len());
+        assert!(
+            warns.len() > 1,
+            "every theme's warning colour came out the same; the role is not being read"
+        );
+    }
 
     /// A dialog must centre on the WINDOW, and must refuse to guess when the
     /// window's position is not known yet. The welcome note opens on the first
