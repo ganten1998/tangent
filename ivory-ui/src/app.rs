@@ -6755,6 +6755,16 @@ impl IvoryApp {
         if let Some((_, i)) = self.arr_auto_hot {
             self.arr_drag = Some(ArrDrag::AutoPoint(lane, i));
         }
+        // **The gesture is what gets saved, not the frame.** Mouse-up is the
+        // only thing that calls `arr_save_edits` for a drag, and it checks
+        // this flag first — every clip drag sets it and this one did not, so
+        // a point landed on disk where it was first CLICKED and the whole
+        // drag after that was lost on reload. Undo lost it too.
+        //
+        // Not saving per frame, deliberately: a drag is one edit, and a
+        // document written sixty times a second is a document written while
+        // the hand is still moving.
+        self.arr_gesture_dirty = true;
     }
 
     /// Take the point nearest `t` off a lane's curve.
@@ -21376,6 +21386,32 @@ mod tests {
         assert_eq!(app.auto_suspend_mask() & (1 << 2), 1 << 2, "Write is not suspended");
         // ...and nothing else is caught up in it.
         assert_eq!(app.auto_suspend_mask() & !(1 << 2), 0, "a neighbour was suspended");
+    }
+
+    /// **A dragged point survives the reload.**
+    ///
+    /// `arr_save_edits` runs on mouse-UP and only when the gesture marked
+    /// itself dirty. Every clip drag sets that flag; the automation drag did
+    /// not — so the point landed on disk where it was first CLICKED and the
+    /// entire drag after that was lost the next time the document was read.
+    /// Undo lost the gesture too.
+    ///
+    /// Asserted through the flag rather than through a file, because the
+    /// flag is what mouse-up actually consults.
+    #[test]
+    fn dragging_a_point_marks_the_gesture_so_mouse_up_saves_it() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        app.settings.arr_snap = false;
+        let i = app.arr_put_auto_point(0, 4.0, 0.75).expect("no point landed");
+
+        // The initial press saves directly, so clear the flag and prove the
+        // DRAG sets it on its own.
+        app.arr_gesture_dirty = false;
+        app.arr_drag_auto_point(0, i, 9.0, 0.25);
+        assert!(
+            app.arr_gesture_dirty,
+            "the drag did not mark the gesture, so mouse-up will not save it"
+        );
     }
 
     /// A mute curve steps; a level curve ramps.
