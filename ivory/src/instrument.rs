@@ -1657,6 +1657,17 @@ struct Shared {
     /// and then the master added it again on the way out. A 30-frame
     /// mastering limiter cost 60 frames between touching a key and hearing
     /// it. Nothing was out of alignment; it was just twice as slow to play.
+    /// The three loudness readings, as `f32` bits — momentary, short-term,
+    /// integrated. Published ten times a second, which is the rate they can
+    /// actually change at: see `loudness::CELL_S`.
+    lufs: [AtomicU32; 3],
+    /// Bumped by the UI thread to ask for the integrated reading to start
+    /// again. A generation and not a flag, so two presses in one callback are
+    /// still one reset and neither is lost.
+    lufs_reset: AtomicU32,
+    /// The varispeed ratio, as `f32` bits. **1.0 is off**, and the whole
+    /// resampling path is skipped there — see `crate::varispeed`.
+    varispeed: AtomicU32,
     max_latency: AtomicU32,
     /// **What is SHOWN** — the whole delay somebody is actually paying,
     /// master included.
@@ -1667,14 +1678,16 @@ struct Shared {
     /// served both and the two wanted different answers.
     total_latency: AtomicU32,
     soloed: AtomicU32,
-    /// The six effect knobs, 0..=1. Three of them are sends on the effects bus
-    /// and three are inserts on the master — see `effects.rs`, and see
+    /// The eight effect knobs, 0..=1. Four of them are sends on the effects
+    /// bus and four are inserts on the master — see `effects.rs`, and see
     /// `Renderer::render` for which is which and why.
     reverb_mix: AtomicU32,
     delay_mix: AtomicU32,
     chorus_mix: AtomicU32,
+    phaser_mix: AtomicU32,
     hpf_mix: AtomicU32,
     lpf_mix: AtomicU32,
+    gain_mix: AtomicU32,
     limiter_mix: AtomicU32,
     /// What each effect is set to, behind a lock.
     ///
@@ -1804,11 +1817,18 @@ impl Shared {
             auto_suspend: AtomicU32::new(0),
             seat_latency: (0..RACK_SEATS * INSERTS).map(|_| AtomicU32::new(0)).collect(),
             lane_latency: std::array::from_fn(|_| AtomicU32::new(0)),
+            lufs: std::array::from_fn(|_| {
+                AtomicU32::new(crate::loudness::ABSOLUTE_GATE.to_bits())
+            }),
+            lufs_reset: AtomicU32::new(0),
+            varispeed: AtomicU32::new(1.0f32.to_bits()),
             max_latency: AtomicU32::new(0),
             total_latency: AtomicU32::new(0),
             soloed: AtomicU32::new(0),
             gr_db: AtomicU32::new(0),
             reverb_mix: AtomicU32::new(0.0f32.to_bits()),
+            phaser_mix: AtomicU32::new(0.0f32.to_bits()),
+            gain_mix: AtomicU32::new(0.0f32.to_bits()),
             hpf_mix: AtomicU32::new(0.0f32.to_bits()),
             // The low-pass rests at the TOP of its travel, limiter-style:
             // zero here is a 200 Hz filter on an engine nobody touched.
@@ -1897,6 +1917,10 @@ impl Shared {
             .store(sane(sends.delay).to_bits(), Ordering::Relaxed);
         self.chorus_mix
             .store(sane(sends.chorus).to_bits(), Ordering::Relaxed);
+        self.phaser_mix
+            .store(sane(sends.phaser).to_bits(), Ordering::Relaxed);
+        self.gain_mix
+            .store(sane(sends.gain).to_bits(), Ordering::Relaxed);
         self.hpf_mix
             .store(sane(sends.hpf).to_bits(), Ordering::Relaxed);
         self.lpf_mix
@@ -2577,6 +2601,41 @@ struct Renderer {
     /// drops the block, which is the policy: the scope is a picture.
     scope_tx: Producer<f32>,
     scope_scratch: Vec<f32>,
+    /// The loudness meter, fed the same pair the VU faces read.
+    ///
+    /// **Not the same measurement, and deliberately at the same tap.** A
+    /// loudness reading that disagreed with the meter beside it about WHAT it
+    /// was measuring would be two meters arguing; they measure the same
+    /// signal and answer different questions about it. See `crate::loudness`.
+    loudness: crate::loudness::Loudness,
+    /// The reset generation last acted on. See `Shared::lufs_reset`.
+    lufs_seen: u32,
+
+    // ── varispeed ──────────────────────────────────────────────────────────
+    //
+    // Idle these cost one atomic load a callback and nothing else: the whole
+    // path below is skipped at a ratio of 1.0, which the dial's detent
+    // guarantees is reachable. See `crate::varispeed`.
+    /// Where the output side is reading from. ONE phase for all three
+    /// output streams, so the take, the speakers and the scope are the same
+    /// instant.
+    vs_phase: crate::varispeed::Phase,
+    vs_out: crate::varispeed::Stream,
+    vs_tap: crate::varispeed::Stream,
+    vs_scope: crate::varispeed::Stream,
+    vs_reastream: crate::varispeed::Stream,
+    /// The input's own phase, going the other way — see the module note.
+    vs_in_phase: crate::varispeed::Phase,
+    vs_in: crate::varispeed::Stream,
+    /// The device output at PROGRAM rate, before it is squeezed into `out`.
+    vs_dev: Vec<f32>,
+    /// One reusable destination for resampling the three taps in place.
+    vs_dst: Vec<f32>,
+    /// The live input at REAL rate, before it is stretched into the program.
+    vs_in_src: Vec<f32>,
+    /// Whether the last callback was engaged, so the histories can be
+    /// dropped on the way in rather than bleeding a block from before.
+    vs_was_engaged: bool,
     /// The routing table, copied out of `Shared` once per block so the inner
     /// loops read plain values rather than atomics: (from, target, hardware,
     /// stereo, gain).
@@ -2939,6 +2998,17 @@ impl Renderer {
         let mut sumsq_r = 0.0f64;
         let mut clipped = false;
         let mut tap_frames = 0usize;
+
+        // **The reset, taken once per callback and before any of it.** A
+        // press mid-block would otherwise drop the histogram halfway through
+        // and leave the four cells already accumulated in this callback
+        // counted against a measurement that was supposed to start clean.
+        let reset = self.shared.lufs_reset.load(Ordering::Relaxed);
+        if reset != self.lufs_seen {
+            self.lufs_seen = reset;
+            self.loudness.reset_integrated();
+        }
+        let mut lufs_moved = false;
 
         let mut done = 0usize;
         while done < frames {
@@ -3463,11 +3533,13 @@ impl Renderer {
                 reverb: Shared::f32_of(&self.shared.reverb_mix),
                 delay: Shared::f32_of(&self.shared.delay_mix),
                 chorus: Shared::f32_of(&self.shared.chorus_mix),
+                phaser: Shared::f32_of(&self.shared.phaser_mix),
                 // Not on the bus. See the comment above the desk — and note
                 // that the limiter's AND the low-pass's "off" is the TOP of
                 // their travel, so those are 1.0 where the others use 0.0.
                 hpf: 0.0,
                 lpf: 1.0,
+                gain: 0.0,
                 limiter: 1.0,
             };
             if let Some(aux) = self.aux.get_mut(..n * TAP_CHANNELS) {
@@ -3494,8 +3566,10 @@ impl Renderer {
                 reverb: 0.0,
                 delay: 0.0,
                 chorus: 0.0,
+                phaser: 0.0,
                 hpf: Shared::f32_of(&self.shared.hpf_mix),
                 lpf: Shared::f32_of(&self.shared.lpf_mix),
+                gain: Shared::f32_of(&self.shared.gain_mix),
                 limiter: Shared::f32_of(&self.shared.limiter_mix),
             };
             // **The room's mix is made here, one subtraction, while the sum
@@ -3635,6 +3709,16 @@ impl Renderer {
                     if mag >= CLIP_LEVEL {
                         clipped = true;
                     }
+                    // **The loudness meter, from the same pair and only the
+                    // pair.** A device with twelve outputs is still a stereo
+                    // programme: BS.1770 weights the front two at 1.0 and the
+                    // hardware routes below are copies of channels that are
+                    // already on it. Counting them would read a channel
+                    // routed to a headphone amp as a second source and put
+                    // the whole programme three decibels loud.
+                    if c == 1 {
+                        lufs_moved |= self.loudness.push(self.frame[0], self.frame[1]);
+                    }
                     if c == 0 {
                         peak_l = peak_l.max(mag);
                         sumsq_l += f64::from(mag) * f64::from(mag);
@@ -3691,6 +3775,14 @@ impl Renderer {
             let _ = self
                 .reastream_tx
                 .push_entire_slice(&self.reastream_scratch[..tap_frames * 2]);
+        }
+        // Ten times a second at most, which is when a cell closed and the
+        // readings actually moved. See `Loudness::push`.
+        if lufs_moved {
+            let (m, st, i) = self.loudness.read();
+            for (cell, v) in self.shared.lufs.iter().zip([m, st, i]) {
+                cell.store(v.to_bits(), Ordering::Relaxed);
+            }
         }
         self.publish_meters(frames, peak_l, peak_r, sumsq_l, sumsq_r, clipped);
     }
@@ -5846,6 +5938,19 @@ impl Engine {
             stem_scratch: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
             scope_tx,
             scope_scratch: vec![0.0; MAX_CALLBACK_FRAMES * TAP_CHANNELS],
+            loudness: crate::loudness::Loudness::new(rate as f32),
+            lufs_seen: 0,
+            vs_phase: crate::varispeed::Phase::new(),
+            vs_out: crate::varispeed::Stream::new(widest),
+            vs_tap: crate::varispeed::Stream::new(TAP_CHANNELS),
+            vs_scope: crate::varispeed::Stream::new(TAP_CHANNELS),
+            vs_reastream: crate::varispeed::Stream::new(2),
+            vs_in_phase: crate::varispeed::Phase::new(),
+            vs_in: crate::varispeed::Stream::new(widest),
+            vs_dev: vec![0.0; MAX_CALLBACK_FRAMES * widest],
+            vs_dst: vec![0.0; MAX_CALLBACK_FRAMES * widest],
+            vs_in_src: vec![0.0; MAX_CALLBACK_FRAMES * widest],
+            vs_was_engaged: false,
             reastream_tx,
             reastream_scratch: vec![0.0; MAX_CALLBACK_FRAMES * 2],
             route_cache: [(0, 0, false, false, 0.0); MAX_ROUTES],
@@ -6652,6 +6757,18 @@ impl Engine {
     /// their hands when it happened.
     pub fn clear_clip(&self) {
         self.shared.clipped.store(false, Ordering::Relaxed);
+    }
+
+    /// The loudness ladder's three readings, in LUFS.
+    /// `loudness::ABSOLUTE_GATE` means "nothing measured yet".
+    pub fn loudness(&self) -> (f32, f32, f32) {
+        let r = |i: usize| f32::from_bits(self.shared.lufs[i].load(Ordering::Relaxed));
+        (r(0), r(1), r(2))
+    }
+
+    /// Start the integrated reading again. See `Loudness::reset_integrated`.
+    pub fn reset_loudness(&self) {
+        self.shared.lufs_reset.fetch_add(1, Ordering::Relaxed);
     }
 
     // ── health ──────────────────────────────────────────────────────────────
@@ -9241,6 +9358,19 @@ mod tests {
             stem_scratch: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
             scope_tx: RingBuffer::<f32>::new(1 << 15).0,
             scope_scratch: vec![0.0; MAX_CALLBACK_FRAMES * TAP_CHANNELS],
+            loudness: crate::loudness::Loudness::new(48_000.0),
+            lufs_seen: 0,
+            vs_phase: crate::varispeed::Phase::new(),
+            vs_out: crate::varispeed::Stream::new(dev_ch.max(TAP_CHANNELS)),
+            vs_tap: crate::varispeed::Stream::new(TAP_CHANNELS),
+            vs_scope: crate::varispeed::Stream::new(TAP_CHANNELS),
+            vs_reastream: crate::varispeed::Stream::new(2),
+            vs_in_phase: crate::varispeed::Phase::new(),
+            vs_in: crate::varispeed::Stream::new(dev_ch.max(TAP_CHANNELS)),
+            vs_dev: vec![0.0; MAX_CALLBACK_FRAMES * dev_ch.max(TAP_CHANNELS)],
+            vs_dst: vec![0.0; MAX_CALLBACK_FRAMES * dev_ch.max(TAP_CHANNELS)],
+            vs_in_src: vec![0.0; MAX_CALLBACK_FRAMES * dev_ch.max(TAP_CHANNELS)],
+            vs_was_engaged: false,
             reastream_tx: RingBuffer::<f32>::new(1 << 15).0,
             reastream_scratch: vec![0.0; MAX_CALLBACK_FRAMES * 2],
             route_cache: [(0, 0, false, false, 0.0); MAX_ROUTES],

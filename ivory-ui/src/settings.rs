@@ -487,6 +487,13 @@ pub struct Settings {
     pub fx_knob_color: Rgb,
     /// The master, which is its own colour on purpose.
     pub master_knob_color: Rgb,
+    /// The varispeed dial's face.
+    ///
+    /// Its own role rather than a shade of `fx_knob_color`, because it is not
+    /// one of the six: it is the one control on the band that changes the
+    /// PITCH of everything, and a theme has to be able to say so. Ships as
+    /// the app's own ivory, which is what the owner asked the default to be.
+    pub varispeed_color: Rgb,
     /// The well the timecode and oscilloscope sit in.
     pub meter_bg_color: Rgb,
     /// The oscilloscope trace.
@@ -911,10 +918,22 @@ pub struct Settings {
     pub reverb_mix: f64,
     pub delay_mix: f64,
     pub chorus_mix: f64,
+    /// The phaser's wet mix, 0..=1. Off by default like the three above it.
+    pub phaser_mix: f64,
     /// The high-pass corner, 0..=1. 0 is out of the way.
     pub hpf_mix: f64,
     /// The low-pass corner, 0..=1. **Up is darker.**
     pub lpf_mix: f64,
+    /// Output gain into the limiter, 0..=1 across `GAIN_DB`. **0 is unity.**
+    ///
+    /// This is the knob that replaced the limiter's automatic makeup. The
+    /// limiter used to give back exactly what its threshold took, so turning
+    /// the threshold down was the loudness control and the ceiling was never
+    /// somebody's to choose. Now the threshold is a ceiling and this is the
+    /// loudness — which also means it can drive the master into clipping when
+    /// the limiter is bypassed, and that is deliberate: a gain control that
+    /// cannot be misused is not a gain control.
+    pub gain_mix: f64,
     /// The limiter's threshold, 0..=1. **1.0 is bypass** — this is the one
     /// knob in the band whose resting position is the top of its travel,
     /// because that is what a threshold control is.
@@ -941,6 +960,24 @@ pub struct Settings {
     pub master_gain: f64,
     /// The backing track's level, linear.
     pub track_gain: f64,
+    /// Which loudness window the ladder shows. A view preference, so it
+    /// lives with the desk and is restored the way every other one is.
+    pub lufs_window: crate::recorder::LoudnessWindow,
+    /// The varispeed dial: where it sits and how far it reaches.
+    ///
+    /// **Kept as the model, not as three loose numbers.** The range has an
+    /// invariant — normal speed lies between the ends, which is what makes
+    /// twelve o'clock mean OFF — and a settings file is exactly the place a
+    /// hand-edited pair of numbers would break it. Reading goes through
+    /// `Varispeed`'s own setters so a file claiming `min: 150` comes back as
+    /// a dial that still switches off.
+    ///
+    /// It PERSISTS, like every other dial on the band. A varispeed left
+    /// engaged is louder about itself than a master fader left down — the
+    /// readout says `+15.0%` and the well is lit — and a control that quietly
+    /// reset itself while the seven beside it did not is the surprise, not
+    /// the other way round.
+    pub varispeed: crate::varispeed::Varispeed,
     /// What colour each mixer channel is painted, and the master last.
     ///
     /// Indexes [`crate::mixer_panel::STRIP_COLORS`]; zero is the desk's own
@@ -1222,6 +1259,7 @@ impl Default for Settings {
             interval_text_color: Rgb::new(0xE8, 0xDC, 0xC0),
             fx_knob_color: Rgb::new(0x6C, 0x9B, 0xD2),
             master_knob_color: Rgb::new(0xE8, 0x3A, 0x4E),
+            varispeed_color: Rgb::new(0xE8, 0xDC, 0xC0),
             meter_bg_color: Rgb::new(0x0B, 0x0E, 0x0A),
             scope_draw_color: Rgb::new(0xA3, 0xE0, 0x48),
             fx_strip_color: Rgb::new(0xE3, 0xD9, 0xBD),
@@ -1357,14 +1395,18 @@ impl Default for Settings {
             reverb_mix: 0.0,
             delay_mix: 0.0,
             chorus_mix: 0.0,
+            phaser_mix: 0.0,
             hpf_mix: 0.0,
             lpf_mix: 1.0,
+            gain_mix: 0.0,
             limiter_mix: 1.0,
             effect_params: Map::new(),
             dx7_cartridge: String::new(),
             dx7_patch: 0,
             metronome_gain: 0.5,
             master_gain: 1.0,
+            lufs_window: crate::recorder::LoudnessWindow::default(),
+            varispeed: crate::varispeed::Varispeed::default(),
             track_gain: 1.0,
             // **Nothing is hand-painted on a fresh desk — not even the click
             // and the master.** They used to ship holding a literal amber and
@@ -1881,6 +1923,7 @@ impl Settings {
         take_color(&mut map, "interval_text_color", &mut s.interval_text_color);
         take_color(&mut map, "fx_knob_color", &mut s.fx_knob_color);
         take_color(&mut map, "master_knob_color", &mut s.master_knob_color);
+        take_color(&mut map, "varispeed_color", &mut s.varispeed_color);
         take_color(&mut map, "meter_bg_color", &mut s.meter_bg_color);
         take_color(&mut map, "scope_draw_color", &mut s.scope_draw_color);
         take_color(&mut map, "fx_strip_color", &mut s.fx_strip_color);
@@ -2377,8 +2420,10 @@ impl Settings {
             ("reverb_mix", &mut s.reverb_mix),
             ("delay_mix", &mut s.delay_mix),
             ("chorus_mix", &mut s.chorus_mix),
+            ("phaser_mix", &mut s.phaser_mix),
             ("hpf_mix", &mut s.hpf_mix),
             ("lpf_mix", &mut s.lpf_mix),
+            ("gain_mix", &mut s.gain_mix),
             ("limiter_mix", &mut s.limiter_mix),
         ] {
             if let Some(v) = map.shift_remove(key).and_then(|v| v.as_f64()) {
@@ -2423,6 +2468,32 @@ impl Settings {
                 .collect();
         }
         take_gain(&mut map, "master_gain", &mut s.master_gain);
+        if let Some(n) = map.shift_remove("lufs_window").and_then(|v| v.as_u64()) {
+            // By INDEX, and the table is append-only: a saved 2 has to keep
+            // meaning Integrated. Out of range falls back to the default
+            // rather than panicking on a hand-edited file.
+            s.lufs_window = crate::recorder::LoudnessWindow::from_index(n as usize);
+        }
+        // **The range first, then the position.** `set_pos` snaps against
+        // the range it is given, so a position read against the default
+        // 85..115 and then handed a range of 50..200 would be a different
+        // speed than the one that was saved.
+        {
+            let num = |map: &mut Map<String, Value>, key: &str| -> Option<u16> {
+                map.shift_remove(key)
+                    .and_then(|v| v.as_u64())
+                    .and_then(|n| u16::try_from(n).ok())
+            };
+            let lo = num(&mut map, "varispeed_min").unwrap_or(crate::varispeed::DEFAULT_MIN);
+            let hi = num(&mut map, "varispeed_max").unwrap_or(crate::varispeed::DEFAULT_MAX);
+            s.varispeed = crate::varispeed::Varispeed::with_range(lo, hi);
+            if let Some(p) = map.shift_remove("varispeed_pos").and_then(|v| v.as_f64()) {
+                // Through the setter: a NaN or a 12.0 in the file is a dial
+                // that resamples the master by a nonsense ratio, and the one
+                // place to stop it is where it enters.
+                s.varispeed.set_pos(p as f32);
+            }
+        }
         take_gain(&mut map, "track_gain", &mut s.track_gain);
         take_gain(&mut map, "fx_return_gain", &mut s.fx_return_gain);
         take_bool(&mut map, "guitar_intervals", &mut s.guitar_intervals);
@@ -3408,6 +3479,40 @@ impl Settings {
         if let Some(h) = self.window_h {
             map.insert("window_h".into(), Value::Number(h.into()));
         }
+        // **The two knobs the 5.0 band gained, written HERE and not up with
+        // the other six.** Their natural home is that loop, and putting them
+        // in it would shift every key after them in every saved file — which
+        // is the churn `unknown_keys_preserved_and_key_order_stable` exists
+        // to catch. Additive keys go at the end; the order in the file is not
+        // the order on the panel and never was.
+        for (key, v) in [("phaser_mix", self.phaser_mix), ("gain_mix", self.gain_mix)] {
+            if v != 0.0 {
+                if let Some(n) = serde_json::Number::from_f64(v) {
+                    map.insert(key.into(), Value::Number(n));
+                }
+            }
+        }
+        if self.lufs_window != crate::recorder::LoudnessWindow::default() {
+            map.insert(
+                "lufs_window".into(),
+                Value::Number(self.lufs_window.index().into()),
+            );
+        }
+        // Written only when there is something to say, so a file from a
+        // build that never touched the dial keeps its shape.
+        if self.varispeed != crate::varispeed::Varispeed::default() {
+            if let Some(n) = serde_json::Number::from_f64(f64::from(self.varispeed.pos())) {
+                map.insert("varispeed_pos".into(), Value::Number(n));
+            }
+            map.insert(
+                "varispeed_min".into(),
+                Value::Number(self.varispeed.min().into()),
+            );
+            map.insert(
+                "varispeed_max".into(),
+                Value::Number(self.varispeed.max().into()),
+            );
+        }
         for (k, v) in &self.extra {
             map.insert(k.clone(), v.clone());
         }
@@ -3603,6 +3708,7 @@ impl Settings {
         self.strip_colors = fresh.strip_colors;
         self.custom_font_path = fresh.custom_font_path.clone();
         self.font_choice = fresh.font_choice.clone();
+        self.varispeed_color = fresh.varispeed_color;
     }
 
     /// Which bands are showing, where the windows are, how big they are, and
@@ -3711,6 +3817,8 @@ impl Settings {
         self.input_alias = fresh.input_alias.clone();
         self.routes = fresh.routes.clone();
         self.master_gain = fresh.master_gain;
+        self.varispeed = fresh.varispeed;
+        self.lufs_window = fresh.lufs_window;
         self.track_gain = fresh.track_gain;
         self.drums_gain = fresh.drums_gain;
         self.drums_pan = fresh.drums_pan;
@@ -3721,6 +3829,8 @@ impl Settings {
         self.chorus_mix = fresh.chorus_mix;
         self.hpf_mix = fresh.hpf_mix;
         self.lpf_mix = fresh.lpf_mix;
+        self.phaser_mix = fresh.phaser_mix;
+        self.gain_mix = fresh.gain_mix;
         self.limiter_mix = fresh.limiter_mix;
         self.effect_params = fresh.effect_params.clone();
         self.bus_effect = fresh.bus_effect.clone();
@@ -3995,8 +4105,10 @@ impl Settings {
                 reverb: self.reverb_mix as f32,
                 delay: self.delay_mix as f32,
                 chorus: self.chorus_mix as f32,
+                phaser: self.phaser_mix as f32,
                 hpf: self.hpf_mix as f32,
                 lpf: self.lpf_mix as f32,
+                gain: self.gain_mix as f32,
                 limiter: self.limiter_mix as f32,
             },
         }

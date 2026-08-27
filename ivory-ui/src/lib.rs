@@ -37,6 +37,7 @@ pub mod settings;
 /// Musical time: the tempo map, the meter map, and the two conversions
 /// everything else in the app used to do with a multiply.
 pub mod tempo;
+pub mod varispeed;
 pub mod splash;
 pub mod staff;
 pub mod shell;

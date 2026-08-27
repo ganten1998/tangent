@@ -152,6 +152,67 @@ impl Slope {
     }
 }
 
+/// How many all-pass stages the phaser runs.
+///
+/// **These are the pedals.** Two is the MXR Phase 45, four is the Phase 90 —
+/// which is what this is voiced as and what it ships at — and six and eight
+/// are the deeper members of the family. Each PAIR of stages puts one notch
+/// in the spectrum, so the number is not a quality setting: it is how many
+/// notches sweep past.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Stages {
+    /// One notch. Gentle — the Phase 45.
+    Two,
+    /// Two notches. **The Phase 90**, and the sound anybody picturing a
+    /// phaser is picturing.
+    #[default]
+    Four,
+    /// Three notches, thicker.
+    Six,
+    /// Four. Past what any of the pedals did, and there when somebody wants
+    /// the sweep to be the whole part.
+    Eight,
+}
+
+impl Stages {
+    pub const ALL: [Stages; 4] = [Stages::Two, Stages::Four, Stages::Six, Stages::Eight];
+
+    /// The largest, which is what the state array is sized for.
+    pub const MAX: usize = 8;
+
+    pub fn count(self) -> usize {
+        match self {
+            Stages::Two => 2,
+            Stages::Four => 4,
+            Stages::Six => 6,
+            Stages::Eight => 8,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Stages::Two => "2 - Phase 45",
+            Stages::Four => "4 - Phase 90",
+            Stages::Six => "6",
+            Stages::Eight => "8",
+        }
+    }
+
+    /// How it is written to the settings file, and read back.
+    pub fn key(self) -> &'static str {
+        match self {
+            Stages::Two => "2",
+            Stages::Four => "4",
+            Stages::Six => "6",
+            Stages::Eight => "8",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Stages> {
+        Stages::ALL.into_iter().find(|s| s.key() == key)
+    }
+}
+
 /// Seconds per repeat with [`Division::Free`], and the fallback when there is
 /// no sensible tempo to sync to.
 const FREE_SECS: f32 = 0.375;
@@ -196,6 +257,22 @@ pub struct Params {
     /// hardware; up is a cleaner chorus than ever existed in 1976.
     pub chorus_tone: f32,
 
+    /// Sweep speed, mapped across [`PHASER_RATE_HZ`].
+    pub phaser_rate: f32,
+    /// How much of the last stage comes back to the first.
+    ///
+    /// **This is the difference between the two Phase 90s.** The block-logo
+    /// pedal has the feedback resistor and the sharper, more vocal sweep; the
+    /// script logo leaves it out and is softer. Ships in between, nearer the
+    /// block.
+    pub phaser_feedback: f32,
+    /// How many all-pass stages. See [`Stages`].
+    pub phaser_stages: Stages,
+    /// How far up the spectrum the notches travel, across
+    /// [`PHASER_SWEEP_HZ`]. Down is the narrow, mid-focused sweep of the
+    /// pedal; up opens it out over most of the band.
+    pub phaser_range: f32,
+
     pub hpf_slope: Slope,
     /// A lift right at the corner. 0 is flat Butterworth.
     pub hpf_resonance: f32,
@@ -230,6 +307,15 @@ impl Default for Params {
             chorus_depth: 0.55,
             chorus_width: 0.85,
             chorus_tone: 0.45,
+            // **The block-logo Phase 90, near enough.** A slow sweep, most
+            // of the feedback the pedal has, four stages, and the narrow
+            // mid-focused range the JFETs actually cover — a phaser voiced
+            // across the whole spectrum sounds like a flanger with the
+            // delay missing.
+            phaser_rate: 0.22,
+            phaser_feedback: 0.55,
+            phaser_stages: Stages::default(),
+            phaser_range: 0.35,
             hpf_slope: Slope::default(),
             hpf_resonance: 0.0,
             lpf_slope: Slope::default(),
@@ -259,6 +345,9 @@ impl Params {
             &mut self.chorus_depth,
             &mut self.chorus_width,
             &mut self.chorus_tone,
+            &mut self.phaser_rate,
+            &mut self.phaser_feedback,
+            &mut self.phaser_range,
             &mut self.hpf_resonance,
             &mut self.lpf_resonance,
             &mut self.limiter_release,
@@ -787,6 +876,144 @@ const RESONANCE: (f32, f32) = (1.0, 4.0);
 /// for k = 0, 1.
 const BUTTER_Q4: (f32, f32) = (0.541_196_1, 1.306_563);
 
+/// How fast the phaser sweeps, at each end of its knob, in hertz.
+///
+/// **The pedal's own range and a little either side.** A Phase 90's speed
+/// control covers roughly a third of a hertz to eight; below that it stops
+/// reading as movement and above it stops reading as a phaser.
+pub const PHASER_RATE_HZ: (f32, f32) = (0.05, 8.0);
+/// The bottom and top of where the notches travel, in hertz, at the widest
+/// setting of the Range control. The narrow end of Range is a band centred in
+/// the middle of this.
+pub const PHASER_SWEEP_HZ: (f32, f32) = (120.0, 3_600.0);
+
+/// One first-order all-pass: unity magnitude, and the phase turns.
+///
+/// **Nothing here changes how loud anything is**, which is the whole trick:
+/// four of these in series leave the signal untouched to a meter and
+/// completely rearranged in phase, and the notches only appear when the
+/// result is added back to the dry. That is also why the mix knob below can
+/// never reach 100% wet — at fully wet there are no notches at all, only a
+/// signal whose phase has been moved, which is inaudible. See `Phaser::run`.
+#[derive(Debug, Clone, Copy, Default)]
+struct AllPass {
+    x1: f32,
+    y1: f32,
+}
+
+impl AllPass {
+    #[inline]
+    fn process(&mut self, x: f32, a: f32) -> f32 {
+        let y = a * x + self.x1 - a * self.y1;
+        self.x1 = x;
+        self.y1 = y;
+        y
+    }
+}
+
+/// The MXR Phase 90, as a stereo pair sharing one sweep.
+///
+/// **One LFO for both channels, on purpose.** The pedal is mono; two
+/// independent sweeps would be a stereo phaser, which is a different and
+/// much wider-sounding effect and not the one the owner asked for. What the
+/// two channels do NOT share is their all-pass state, because they are
+/// different signals.
+struct Phaser {
+    stages: [[AllPass; Stages::MAX]; 2],
+    /// The last output of each channel's chain, for the feedback path.
+    fb: [f32; 2],
+    /// Where the sweep is, in turns. Kept in `f64` because it accumulates for
+    /// as long as the app is open, and an `f32` phase at 48 kHz has lost the
+    /// bottom of its fraction within the hour.
+    phase: f64,
+    sample_rate: f32,
+}
+
+impl Phaser {
+    fn new(sample_rate: f32) -> Self {
+        Self {
+            stages: [[AllPass::default(); Stages::MAX]; 2],
+            fb: [0.0; 2],
+            phase: 0.0,
+            sample_rate: sample_rate.max(8_000.0),
+        }
+    }
+
+    /// Advance the sweep by one frame and return this frame's all-pass
+    /// coefficient.
+    #[inline]
+    fn step(&mut self, p: &Params) -> f32 {
+        let hz = PHASER_RATE_HZ.0
+            * (PHASER_RATE_HZ.1 / PHASER_RATE_HZ.0).powf(p.phaser_rate.clamp(0.0, 1.0));
+        self.phase += f64::from(hz / self.sample_rate);
+        if self.phase >= 1.0 {
+            self.phase -= self.phase.floor();
+        }
+        // A sine, which is what the pedal's op-amp oscillator makes and what
+        // keeps the sweep from having a corner at each end.
+        let lfo = 0.5 - 0.5 * (std::f32::consts::TAU * self.phase as f32).cos();
+        // **The sweep is EXPONENTIAL in frequency**, because pitch is. A
+        // linear sweep between 120 Hz and 3.6 kHz spends nine tenths of its
+        // travel above a kilohertz and lurches through the bottom octave.
+        let (lo, hi) = PHASER_SWEEP_HZ;
+        let centre = (lo * hi).sqrt();
+        let span = (hi / lo).sqrt().powf(p.phaser_range.clamp(0.0, 1.0).max(0.05));
+        let (lo, hi) = (centre / span, centre * span);
+        let f = lo * (hi / lo).powf(lfo);
+        // **The first-order all-pass whose −90° point is `f`, and the sign
+        // is the whole filter.**
+        //
+        // `(1 - d)/(1 + d)` is the same expression negated, it is what this
+        // shipped as, and it is not an all-pass with a sweep in it — it is
+        // very nearly the identity: its phase moves one degree across the
+        // entire audio band, so the blend below adds a signal to a copy of
+        // itself and there are no notches anywhere. Every "is it transparent"
+        // test passes on it, because an identity filter is perfectly
+        // transparent. What caught it was asking whether a tone in the
+        // sweep's path ever gets quieter.
+        let d = (std::f32::consts::PI * f / self.sample_rate).tan();
+        (d - 1.0) / (d + 1.0)
+    }
+
+    /// One stereo frame in, the WET signal out. The caller does the blend.
+    #[inline]
+    fn run(&mut self, x: [f32; 2], a: f32, p: &Params) -> [f32; 2] {
+        let n = p.phaser_stages.count();
+        // **Kept well under one.** The feedback path runs through four
+        // all-passes whose magnitude is exactly unity, so a coefficient of
+        // 1.0 is a loop with no loss in it at all — an oscillator, at
+        // whatever frequency the sweep happens to be at.
+        //
+        // 0.80 rather than something nearer one because this is across a
+        // MASTER BUS. Feedback is what puts resonant peaks between the
+        // notches — it is the difference between the two Phase 90s and the
+        // reason the block logo sounds vocal — but a peak is a boost, and at
+        // 0.92 the top of the knob added ten decibels to whatever the sweep
+        // was sitting on. Seven is already generous for a control somebody
+        // will turn all the way up to hear what it does.
+        let fb = p.phaser_feedback.clamp(0.0, 1.0) * 0.80;
+        let mut out = [0.0f32; 2];
+        for ch in 0..2 {
+            let mut v = x[ch] + self.fb[ch] * fb;
+            for stage in self.stages[ch].iter_mut().take(n) {
+                v = stage.process(v, a);
+            }
+            // Nothing infinite is allowed back into the loop. A denormal or
+            // a NaN from a stalled buffer would otherwise live in `fb` for
+            // the rest of the session.
+            self.fb[ch] = if v.is_finite() { v.clamp(-4.0, 4.0) } else { 0.0 };
+            out[ch] = v;
+        }
+        out
+    }
+
+    fn clear(&mut self) {
+        self.stages = [[AllPass::default(); Stages::MAX]; 2];
+        self.fb = [0.0; 2];
+        self.phase = 0.0;
+    }
+}
+
 /// One second-order section, transposed direct form II.
 ///
 /// TDF-II because it is the one that behaves when the coefficients move under
@@ -936,6 +1163,17 @@ impl Filter {
 /// makes twelve o'clock -24 dB — the middle of the dial being the middle of
 /// the range only works if the range runs the way the dial does.
 pub const LIMITER_DB: (f32, f32) = (-48.0, 0.0);
+
+/// What the GAIN dial covers, in dB. Unity at rest, and twenty-four decibels
+/// of drive at the top.
+///
+/// **It only goes up, and it is allowed to clip.** This is the control that
+/// replaced the limiter's automatic makeup: with the limiter in circuit it is
+/// the loudness knob, driving the mix into a ceiling somebody chose; with the
+/// limiter bypassed there is nothing above it, and turning it far enough will
+/// clip the master. That is not a gap in the design — a gain control that
+/// cannot be misused is a trim, and the limiter is right there.
+pub const GAIN_DB: (f32, f32) = (0.0, 24.0);
 
 /// Below this many dB of threshold the limiter is doing something.
 ///
@@ -1165,12 +1403,18 @@ pub struct Sends {
     pub reverb: f32,
     pub delay: f32,
     pub chorus: f32,
+    /// The phaser's depth, 0..=1. **1.0 is the pedal's own fifty-fifty
+    /// blend, which is as deep as notches go** — see `Effects::process`.
+    pub phaser: f32,
     /// Corner frequency, across [`HPF_HZ`]. 0 is out of the way.
     pub hpf: f32,
     /// Corner frequency, across [`LPF_HZ`] — **1.0 is out of the way**, like
     /// the limiter: the dial reads in hertz now and a frequency dial where
     /// right meant LOWER was the one everybody got wrong.
     pub lpf: f32,
+    /// Output gain, 0..=1 across [`GAIN_DB`]. **0.0 is unity** — this one
+    /// only ever adds, so its rest is the bottom of its travel.
+    pub gain: f32,
     /// The limiter's threshold, across [`LIMITER_DB`]. **1.0 is bypass**, not
     /// 0.0: see the constant. This is the one field here whose resting value
     /// is the top of its range.
@@ -1184,8 +1428,10 @@ impl Default for Sends {
             reverb: 0.0,
             delay: 0.0,
             chorus: 0.0,
+            phaser: 0.0,
             hpf: 0.0,
             lpf: 1.0,
+            gain: 0.0,
             limiter: 1.0,
         }
     }
@@ -1196,6 +1442,11 @@ impl Sends {
     pub fn threshold_db(limiter: f32) -> f32 {
         LIMITER_DB.0 + (LIMITER_DB.1 - LIMITER_DB.0) * limiter.clamp(0.0, 1.0)
     }
+
+    /// This position's output gain, in dB. 0 dB at rest.
+    pub fn gain_db(gain: f32) -> f32 {
+        GAIN_DB.0 + (GAIN_DB.1 - GAIN_DB.0) * gain.clamp(0.0, 1.0)
+    }
 }
 
 /// The three effects on the instrument bus.
@@ -1203,6 +1454,7 @@ pub struct Effects {
     reverb: [ReverbChannel; 2],
     delay: Delay,
     chorus: Chorus,
+    phaser: Phaser,
     hpf: [Filter; 2],
     lpf: [Filter; 2],
     limiter: Limiter,
@@ -1269,6 +1521,7 @@ impl Effects {
             reverb: Self::build_reverb(sr, p.reverb_width),
             delay: Delay::new(sr),
             chorus: Chorus::new(sr),
+            phaser: Phaser::new(sr),
             hpf: [Filter::default(); 2],
             lpf: [Filter::default(); 2],
             limiter: Limiter::new(sr),
@@ -1308,8 +1561,10 @@ impl Effects {
             reverb: sends.reverb.clamp(0.0, 1.0),
             delay: sends.delay.clamp(0.0, 1.0),
             chorus: sends.chorus.clamp(0.0, 1.0),
+            phaser: sends.phaser.clamp(0.0, 1.0),
             hpf: sends.hpf.clamp(0.0, 1.0),
             lpf: sends.lpf.clamp(0.0, 1.0),
+            gain: sends.gain.clamp(0.0, 1.0),
             limiter: sends.limiter.clamp(0.0, 1.0),
         };
         // Every knob at rest AND every mix arrived there: nothing to do, and
@@ -1322,9 +1577,12 @@ impl Effects {
             m.reverb < OFF
                 && m.delay < OFF
                 && m.chorus < OFF
+                && m.phaser < OFF
                 && m.hpf < OFF
                 // The low-pass rests at the TOP of its travel, limiter-style.
                 && m.lpf > 1.0 - OFF
+                // The gain rests at the BOTTOM of its, like the sends.
+                && m.gain < OFF
                 && Sends::threshold_db(m.limiter) >= LIMITER_IN_AT_DB
         };
         if quiet(&want) && quiet(&self.mix) {
@@ -1404,7 +1662,19 @@ impl Effects {
         // Running while EITHER the knob or the slewed value is up, so a knob
         // dropped to zero glides its corner back out of the way before the
         // filter stops rather than being switched out from under the signal.
+        let phaser_on = want.phaser > OFF || self.mix.phaser > OFF;
+        if !phaser_on {
+            // The all-passes hold a decaying tail through the feedback path;
+            // left standing while the knob is at zero it would be waiting to
+            // be heard the next time somebody turned it up.
+            self.phaser.clear();
+        }
         let hpf_on = want.hpf > OFF || self.mix.hpf > OFF;
+        // **Running while either the knob or the slewed value is up**, the
+        // same rule as the filters: a gain dropped to zero has to glide back
+        // to unity, and switching it out at the top of the glide is a step of
+        // however many decibels were left.
+        let gain_on = want.gain > OFF || self.mix.gain > OFF;
         let lpf_on = want.lpf < 1.0 - OFF || self.mix.lpf < 1.0 - OFF;
         // **The limiter's delay line is emptied while it is not in use.**
         //
@@ -1442,21 +1712,22 @@ impl Effects {
                 self.lpf[ch].clear();
             }
         }
-        // The threshold, and the makeup that pays for it.
+        // **The threshold, and NOTHING that pays for it.**
         //
-        // **Lowering the threshold makes it LOUDER**, which is the whole point
-        // of the control and the reason it is not just an attenuator: whatever
-        // the limiter takes off the top is given back to everything, so the
-        // quiet parts come up and the loud parts stay where the ceiling is.
-        // A limiter you turn down to get less level is one nobody would reach
-        // for twice.
+        // This dial used to carry an automatic makeup exactly equal to the
+        // threshold, so turning it down made the mix louder rather than
+        // quieter and the output always sat at 0 dBTP. That is a one-knob
+        // maximiser, and it meant two things nobody could get at: the CEILING
+        // was never anybody's to choose — every setting landed on full
+        // scale — and there was no way to drive the limiter without also
+        // moving where it caught.
         //
-        // The makeup is exactly the threshold, inverted, so the output sits at
-        // 0 dBTP however far the dial is turned. Trimming below that is the
-        // master's job, which is the next knob along.
+        // The two jobs are two dials now. This one is a ceiling and only a
+        // ceiling; the GAIN beside it is the loudness, and it is applied
+        // BELOW — which is what makes it a drive and what lets it clip the
+        // master when the limiter is out of circuit. See `GAIN_DB`.
         let threshold_db = Sends::threshold_db(self.mix.limiter);
         let threshold = 10f32.powf(threshold_db / 20.0);
-        let makeup = 10f32.powf(-threshold_db / 20.0);
         let knee_db = KNEE_DB.0 + (KNEE_DB.1 - KNEE_DB.0) * p.limiter_knee;
 
         for f in 0..frames {
@@ -1466,9 +1737,19 @@ impl Effects {
             self.mix.reverb += (want.reverb - self.mix.reverb) * KNOB_SLEW;
             self.mix.delay += (want.delay - self.mix.delay) * KNOB_SLEW;
             self.mix.chorus += (want.chorus - self.mix.chorus) * KNOB_SLEW;
+            self.mix.phaser += (want.phaser - self.mix.phaser) * KNOB_SLEW;
             self.mix.hpf += (want.hpf - self.mix.hpf) * KNOB_SLEW;
             self.mix.lpf += (want.lpf - self.mix.lpf) * KNOB_SLEW;
             self.mix.limiter += (want.limiter - self.mix.limiter) * KNOB_SLEW;
+            self.mix.gain += (want.gain - self.mix.gain) * KNOB_SLEW;
+            // Decibels, converted per sample so a drag glides rather than
+            // stepping at each block boundary. `powf` per frame is the price
+            // of that and it is only paid while the dial is off unity.
+            let drive = if gain_on {
+                10f32.powf(Sends::gain_db(self.mix.gain) / 20.0)
+            } else {
+                1.0
+            };
 
             // **Chorus, then delay, then reverb** — the order a pedalboard
             // runs and a desk's sends imply. A chorus AFTER the reverb smears
@@ -1479,10 +1760,32 @@ impl Effects {
                 dry[0] + wet_c[0] * self.mix.chorus,
                 dry[1] + wet_c[1] * self.mix.chorus,
             ];
-            let wet_d = self.delay.process(chorused, target, p);
+            // **The phaser sits between the chorus and the delay**, which
+            // is where it sits on a pedalboard: a phased signal repeating is
+            // a phaser into a delay, and a delay into a phaser sweeps the
+            // repeats and the note together and reads as neither.
+            //
+            // **And it is a BLEND, not an addition, unlike every other send
+            // here.** An all-pass chain has unity magnitude — adding it to
+            // the dry at full strength is where the notches come from, and
+            // adding MORE than the dry starts filling them back in. The
+            // knob's top is the pedal's own fifty-fifty, which is as deep as
+            // a notch goes; past that there is nothing better to reach.
+            let phased = if phaser_on {
+                let a = self.phaser.step(p);
+                let wet_p = self.phaser.run(chorused, a, p);
+                let w = 0.5 * self.mix.phaser;
+                [
+                    chorused[0] * (1.0 - w) + wet_p[0] * w,
+                    chorused[1] * (1.0 - w) + wet_p[1] * w,
+                ]
+            } else {
+                chorused
+            };
+            let wet_d = self.delay.process(phased, target, p);
             let into_verb = [
-                chorused[0] + wet_d[0] * self.mix.delay,
-                chorused[1] + wet_d[1] * self.mix.delay,
+                phased[0] + wet_d[0] * self.mix.delay,
+                phased[1] + wet_d[1] * self.mix.delay,
             ];
             let wet_r = [
                 self.reverb[0].process(into_verb[0], comb_fb, comb_damp) * trim,
@@ -1490,10 +1793,11 @@ impl Effects {
             ];
             let mut out = [0.0f32; 2];
             for ch in 0..2 {
-                out[ch] = chorused[ch] + wet_d[ch] * self.mix.delay + wet_r[ch] * self.mix.reverb;
-                // A send keeps only what it made. See `wet_only`: `chorused`
-                // is `dry + wet_c * chorus`, so taking the dry back out of the
-                // sum leaves exactly the three wet terms.
+                out[ch] = phased[ch] + wet_d[ch] * self.mix.delay + wet_r[ch] * self.mix.reverb;
+                // A send keeps only what it made. See `wet_only`: `phased`
+                // carries the dry through both the chorus's addition and the
+                // phaser's blend, so taking the dry back out of the sum
+                // leaves exactly what the effects contributed.
                 if self.wet_only {
                     out[ch] -= dry[ch];
                 }
@@ -1518,6 +1822,16 @@ impl Effects {
                 }
             }
 
+            // **The gain, and it is BEFORE the limiter.** That is what makes
+            // it a drive: with a ceiling in circuit, turning this up pushes
+            // more of the mix into it and the limiter holds the top. With the
+            // limiter bypassed there is nothing above this at all and enough
+            // of it will clip — see `GAIN_DB`, which says why that is on
+            // purpose.
+            if gain_on {
+                out[0] *= drive;
+                out[1] *= drive;
+            }
             // **Last, and after everything.** A limiter that is not the final
             // stage is not a limiter; it is an effect that something else gets
             // to overshoot afterwards.
@@ -1525,8 +1839,6 @@ impl Effects {
                 out = self
                     .limiter
                     .process(out, threshold, knee_db, p.limiter_release);
-                out[0] *= makeup;
-                out[1] *= makeup;
                 if self.limiter.gain < self.gr {
                     self.gr = self.limiter.gain;
                 }
@@ -1771,10 +2083,11 @@ mod tests {
         fx.process(&mut last, 2_048, 2, sends, &p, 120.0);
         let after = last.iter().fold(0.0f32, |a, b| a.max(b.abs()));
         let reported = fx.gain_reduction_db();
-        // What the LIMITER did, which is what the meter reports — the makeup
-        // gain is a separate stage and is not reduction.
-        let makeup_db = 12.0;
-        let measured = -20.0 * (after / before).log10() + makeup_db;
+        // What the LIMITER did, which is what the meter reports. There is
+        // nothing to add back any more: the automatic makeup is gone and the
+        // reduction the meter shows is the whole of the difference between
+        // what went in and what came out.
+        let measured = -20.0 * (after / before).log10();
         assert!(
             (reported - measured).abs() < 0.5,
             "it reported {reported:.2} dB of reduction and applied {measured:.2}"
@@ -1787,15 +2100,17 @@ mod tests {
         assert_eq!(fx.gain_reduction_db(), 0.0, "the reading did not reset");
     }
 
-    /// **The output brickwalls at 0 dBTP, wherever the threshold is.**
+    /// **The output brickwalls at the THRESHOLD, wherever the threshold is.**
     ///
-    /// The limiter holds the reconstructed peak at the threshold and the
-    /// makeup gives back exactly that much, so what leaves sits at full scale
-    /// however far the dial is turned. Measured on the reconstructed waveform
-    /// rather than on the samples, because that is where the claim lives: a
-    /// buffer whose samples all sit under full scale can still hand a
-    /// converter a curve that goes over, and "true peak" is the promise that
-    /// it does not.
+    /// It used to brickwall at 0 dBTP whatever the dial said, because the
+    /// automatic makeup gave back exactly what the ceiling took. With that
+    /// gone, the dial means what it says: set it to −6 and nothing leaves
+    /// above −6.
+    ///
+    /// Measured on the reconstructed waveform rather than on the samples,
+    /// because that is where the claim lives: a buffer whose samples all sit
+    /// under full scale can still hand a converter a curve that goes over,
+    /// and "true peak" is the promise that it does not.
     #[test]
     fn the_limiter_holds_a_true_peak_ceiling_at_every_threshold() {
         // 7 kHz at 48 k is a little over six samples a cycle: the peaks land
@@ -1821,17 +2136,231 @@ mod tests {
                 }
                 let got_db = 20.0 * worst.log10();
                 assert!(
-                    got_db <= 0.35,
+                    got_db <= want_db + 0.35,
                     "{hz} Hz reconstructed to {got_db:.2} dBTP with a \
                      {want_db:.1} dB threshold"
                 );
-                // And it is passing signal, not just being quiet.
+                // And it is passing signal, not just being quiet. Against the
+                // THRESHOLD, not against full scale: a −36 dB ceiling that
+                // let −3 dBTP through would be no ceiling at all.
                 assert!(
-                    got_db > -3.0,
-                    "{hz} Hz only reached {got_db:.2} dBTP - nothing is getting through"
+                    got_db > want_db - 3.0,
+                    "{hz} Hz only reached {got_db:.2} dBTP against a {want_db:.1} dB \
+                     threshold - nothing is getting through"
                 );
             }
         }
+    }
+
+    // ── the phaser ──────────────────────────────────────────────────────────
+
+    /// Peak level of a tone through the phaser at a given depth.
+    fn phaser_peak(mix: f32, p: &Params, hz: f32) -> f32 {
+        let mut fx = Effects::new(SR);
+        let sends = Sends { phaser: mix, ..Sends::default() };
+        let mut worst = 0.0f32;
+        for block in 0..40 {
+            let mut buf = sine(2_048, hz, 0.5, block * 2_048);
+            fx.process(&mut buf, 2_048, 2, sends, p, 120.0);
+            if block >= 20 {
+                worst = worst.max(buf.iter().fold(0.0f32, |a, b| a.max(b.abs())));
+            }
+        }
+        worst
+    }
+
+    /// **An all-pass chain on its own changes nothing you can hear**, and the
+    /// notches are made by adding it back to the dry.
+    ///
+    /// This is the fact the mix knob is built around and the one that is easy
+    /// to get backwards: a phaser wired like the three sends beside it —
+    /// `dry + wet * knob`, with the knob reaching 1.0 — would get SHALLOWER
+    /// past halfway and vanish entirely at the top, because at equal parts
+    /// dry and all-pass the cancellation is total and past that the dry stops
+    /// dominating. The knob's top is the pedal's own fifty-fifty for exactly
+    /// this reason.
+    #[test]
+    fn the_all_pass_chain_alone_is_inaudible_and_the_notches_come_from_the_blend() {
+        // No feedback, so this is a bare chain of all-passes and nothing
+        // else — the property being asserted is about the filter, not about
+        // the resonance around it.
+        let p = Params { phaser_feedback: 0.0, ..Params::default() };
+        let mut fx = Effects::new(SR);
+        let sends = Sends { phaser: 1.0, ..Sends::default() };
+        // Drive the chain directly and look at what leaves it, rather than
+        // what the blend leaves: `run` is the all-pass chain and `process`
+        // is the pedal.
+        let mut worst_in = 0.0f32;
+        let mut worst_out = 0.0f32;
+        for block in 0..40 {
+            let buf = sine(2_048, 800.0, 0.5, block * 2_048);
+            for f in 0..2_048 {
+                let x = [buf[f * 2], buf[f * 2 + 1]];
+                let a = fx.phaser.step(&p);
+                let y = fx.phaser.run(x, a, &p);
+                if block >= 20 {
+                    worst_in = worst_in.max(x[0].abs());
+                    worst_out = worst_out.max(y[0].abs());
+                }
+            }
+        }
+        let db = 20.0 * (worst_out / worst_in).log10();
+        assert!(
+            db.abs() < 0.5,
+            "four all-passes changed the level by {db:.2} dB - they are not all-pass"
+        );
+        let _ = sends;
+    }
+
+    /// **The notches are there.**
+    ///
+    /// The test above cannot show this and a broken filter proved it: a
+    /// coefficient with the wrong sign made the all-pass very nearly the
+    /// IDENTITY — one degree of phase across the whole audio band — and an
+    /// identity filter is perfectly all-pass, perfectly transparent, and
+    /// passes every "does it change the level" test there is. What it does
+    /// not do is notch. This is the test that asked.
+    ///
+    /// Measured as the quietest 5 ms window over a few seconds of sweep
+    /// against the same tone with the phaser at rest. **Short windows on
+    /// purpose**: a notch is only over a given frequency for a few
+    /// milliseconds at a time, and a block long enough to hold thirty cycles
+    /// of the tone averages straight over it.
+    #[test]
+    fn a_tone_in_the_sweeps_path_is_notched() {
+        // A fast sweep so several notches cross the tone inside the window,
+        // and the wide range so they cross it at all.
+        let p = Params {
+            phaser_rate: 0.8,
+            phaser_range: 1.0,
+            ..Params::default()
+        };
+        let trough = |mix: f32| {
+            let mut fx = Effects::new(SR);
+            let sends = Sends { phaser: mix, ..Sends::default() };
+            let mut lowest = f32::INFINITY;
+            for block in 0..400 {
+                let mut buf = sine(256, 700.0, 0.5, block * 256);
+                fx.process(&mut buf, 256, 2, sends, &p, 120.0);
+                // Once the knob has slewed.
+                if block >= 100 {
+                    let e: f32 = buf.iter().map(|v| v * v).sum::<f32>() / buf.len() as f32;
+                    lowest = lowest.min(e.sqrt());
+                }
+            }
+            lowest
+        };
+        let off = trough(0.0);
+        let on = trough(1.0);
+        let depth = 20.0 * (off / on).log10();
+        assert!(
+            depth > 10.0,
+            "the deepest the sweep got was {depth:.2} dB below the dry tone"
+        );
+    }
+
+    /// **The feedback loop cannot run away.**
+    ///
+    /// Every stage in it has unity magnitude, so a feedback coefficient of
+    /// 1.0 would be a loop with no loss anywhere — an oscillator at whatever
+    /// frequency the sweep happens to be sitting at, which on a master bus is
+    /// a tone nobody asked for at whatever the monitors are set to.
+    #[test]
+    fn the_feedback_never_runs_away_even_at_the_top_of_its_travel() {
+        for stages in Stages::ALL {
+            let p = Params {
+                phaser_feedback: 1.0,
+                phaser_stages: stages,
+                ..Params::default()
+            };
+            let mut fx = Effects::new(SR);
+            let sends = Sends { phaser: 1.0, ..Sends::default() };
+            let mut worst = 0.0f32;
+            for block in 0..200 {
+                // An IMPULSE and then silence: whatever is left ringing is
+                // the loop feeding itself.
+                let mut buf = vec![0.0f32; 2_048 * 2];
+                if block == 0 {
+                    buf[0] = 1.0;
+                    buf[1] = 1.0;
+                }
+                fx.process(&mut buf, 2_048, 2, sends, &p, 120.0);
+                if block >= 100 {
+                    worst = worst.max(buf.iter().fold(0.0f32, |a, b| a.max(b.abs())));
+                }
+                assert!(
+                    buf.iter().all(|v| v.is_finite()),
+                    "{} stages produced a non-finite sample",
+                    stages.count()
+                );
+            }
+            assert!(
+                worst < 0.05,
+                "{} stages were still ringing at {worst:.3} four seconds after one impulse",
+                stages.count()
+            );
+        }
+    }
+
+    /// The phaser at rest costs nothing and passes the signal untouched.
+    #[test]
+    fn the_phaser_at_rest_is_not_in_the_circuit() {
+        let p = Params::default();
+        let mut fx = Effects::new(SR);
+        let mut buf = sine(2_048, 1_000.0, 0.5, 0);
+        let before = buf.clone();
+        fx.process(&mut buf, 2_048, 2, Sends::default(), &p, 120.0);
+        assert_eq!(buf, before, "the phaser did something at zero");
+        assert_eq!(Sends::default().phaser, 0.0);
+        // And the same tone, unchanged, whatever the parameters say — a
+        // parameter cannot switch an effect on that the knob has switched off.
+        let loud = Params {
+            phaser_rate: 1.0,
+            phaser_feedback: 1.0,
+            phaser_range: 1.0,
+            phaser_stages: Stages::Eight,
+            ..Params::default()
+        };
+        let mut buf = sine(2_048, 1_000.0, 0.5, 0);
+        let before = buf.clone();
+        fx.process(&mut buf, 2_048, 2, Sends::default(), &loud, 120.0);
+        assert_eq!(buf, before);
+    }
+
+    /// **More stages means more notches**, and the level never runs away.
+    ///
+    /// Every pair of all-pass stages puts one notch in the spectrum, so the
+    /// number is how many sweep past rather than a quality setting. The
+    /// second half of this is the bound that matters on a master bus: a
+    /// phaser is a blend of a signal with a phase-shifted copy of itself, so
+    /// the sum can peak above either — that is what the resonance between the
+    /// notches IS — and it must not do so by very much.
+    #[test]
+    fn more_stages_notch_more_and_never_run_away() {
+        for stages in Stages::ALL {
+            // **The maximum feedback, which is the worst case for level.**
+            // At rest the resonance is mild; the number worth bounding is
+            // the one somebody reaches by turning the knob to the end.
+            let p = Params {
+                phaser_rate: 0.8,
+                phaser_range: 1.0,
+                phaser_feedback: 1.0,
+                phaser_stages: stages,
+                ..Params::default()
+            };
+            let off = phaser_peak(0.0, &p, 700.0);
+            let on = phaser_peak(1.0, &p, 700.0);
+            assert!(off > 0.0 && on > 0.0);
+            let db = 20.0 * (on / off).log10();
+            assert!(
+                db < 9.0,
+                "{} stages at full feedback made a 700 Hz tone {db:.2} dB louder",
+                stages.count()
+            );
+        }
+        assert_eq!(Stages::Two.count(), 2);
+        assert_eq!(Stages::Four.count(), 4, "the Phase 90 is a four-stage pedal");
+        assert_eq!(Stages::Eight.count(), Stages::MAX);
     }
 
     /// **Fully right is 0 dB, and 0 dB is out of the circuit.**
@@ -1864,26 +2393,24 @@ mod tests {
         );
     }
 
-    /// **Lowering the threshold makes it louder.**
+    /// **The threshold is a CEILING and nothing else.**
     ///
-    /// This is the whole reason the control exists and the thing it was built
-    /// without: what the limiter takes off the top is given back to
-    /// everything, so the quiet parts come up and the loud parts stay at the
-    /// ceiling. A limiter you turn down to get less level is one nobody would
-    /// reach for twice.
+    /// It used to be a loudness control: an automatic makeup exactly equal to
+    /// the threshold meant turning it down made the mix LOUDER and the output
+    /// always landed on full scale. That was one knob doing two jobs, and it
+    /// took the ceiling away from the person who wanted to choose it. The two
+    /// are separate dials now — this and the GAIN — and the test that used to
+    /// assert the makeup asserts its absence.
     #[test]
-    fn lowering_the_threshold_raises_the_level() {
+    fn the_threshold_is_a_ceiling_and_lowering_it_lowers_the_level() {
         let p = Params::default();
-        // A steady tone well under full scale, so there is headroom for the
-        // makeup to use. **No transient bursts**: with a quarter-second
-        // release a spike holds the gain down long after it has gone, which is
-        // the limiter behaving correctly and a terrible way to measure level.
-        let energy = |limiter: f32| {
+        // A steady tone well under full scale. **No transient bursts**: with
+        // a quarter-second release a spike holds the gain down long after it
+        // has gone, which is the limiter behaving correctly and a terrible
+        // way to measure level.
+        let energy = |limiter: f32, gain: f32| {
             let mut fx = Effects::new(SR);
-            let sends = Sends {
-                limiter,
-                ..Sends::default()
-            };
+            let sends = Sends { limiter, gain, ..Sends::default() };
             let mut sum = 0.0f64;
             let mut n = 0u64;
             for block in 0..60 {
@@ -1899,21 +2426,71 @@ mod tests {
             }
             10.0 * (sum / n as f64).max(1e-30).log10()
         };
-        // -12 dBFS in. At rest it comes out at -12; at a -24 dB threshold it
-        // is pulled down 12 and pushed back up 24, so it arrives at the
-        // ceiling — twelve decibels louder for turning the knob left.
-        let off = energy(1.0);
-        let mid = energy(0.5);
+        // −12 dBFS in, and the limiter out of circuit: it comes out at −12.
+        let off = energy(1.0, 0.0);
+        assert!((off - -15.0).abs() < 1.0, "the tone measured {off:.1} dB");
+        // At a −24 dB threshold it is pulled DOWN and stays down. The old
+        // makeup put it back at the ceiling; there is nothing to put it back
+        // now, which is the point.
+        let mid = energy(0.5, 0.0);
         assert!(
-            mid > off + 9.0,
-            "at -24 dB it measured {mid:.1} dB against {off:.1} with the limiter out"
+            mid < off - 6.0,
+            "at -24 dB it measured {mid:.1} dB against {off:.1} with the limiter out - \
+             the automatic makeup is back"
         );
-        // And further down does not make it quieter again, which is the whole
-        // failure this test exists for.
-        let deep = energy(0.0);
+        // And further down is quieter still, monotonically, which is what a
+        // ceiling does and what the old control could not do at all.
+        let deep = energy(0.0, 0.0);
         assert!(
-            deep >= mid - 0.5,
-            "at -48 dB it measured {deep:.1} dB, below the {mid:.1} at -24"
+            deep < mid - 6.0,
+            "at -48 dB it measured {deep:.1} dB, no lower than the {mid:.1} at -24"
+        );
+    }
+
+    /// **The gain is the loudness control now, and it is a drive.**
+    ///
+    /// Turning it up with a ceiling in circuit pushes more of the mix into
+    /// the ceiling; the level arrives at the threshold and stops there. That
+    /// is the behaviour the old one-knob limiter had built in and could not
+    /// be talked out of.
+    #[test]
+    fn the_gain_drives_the_limiter_and_the_ceiling_holds() {
+        let p = Params::default();
+        let peak = |limiter: f32, gain: f32| {
+            let mut fx = Effects::new(SR);
+            let sends = Sends { limiter, gain, ..Sends::default() };
+            let mut worst = 0.0f32;
+            for block in 0..60 {
+                let mut buf = sine(2_048, 220.0, 0.25, block * 2_048);
+                fx.process(&mut buf, 2_048, 2, sends, &p, 120.0);
+                if block >= 50 {
+                    for v in &buf {
+                        worst = worst.max(v.abs());
+                    }
+                }
+            }
+            20.0 * worst.max(1e-9).log10()
+        };
+        // A −6 dB ceiling. Driven hard, the output sits on it.
+        let threshold = 0.875; // -6 dB across LIMITER_DB
+        assert!((Sends::threshold_db(threshold) - -6.0).abs() < 0.01);
+        let driven = peak(threshold, 1.0);
+        assert!(
+            driven < -6.0 + 0.6,
+            "with a -6 dB ceiling and +24 dB of drive the peak reached {driven:.2} dBFS"
+        );
+        assert!(
+            driven > -6.0 - 1.5,
+            "the drive did not reach the ceiling: {driven:.2} dBFS"
+        );
+        // **And with the limiter OUT, the same drive clips.** This is the
+        // property the owner asked for in as many words — "even allowing
+        // clipping in the master if user isn\'t careful" — and it is the
+        // reason the gain sits before the limiter rather than after it.
+        let unlimited = peak(1.0, 1.0);
+        assert!(
+            unlimited >= 0.0,
+            "with the limiter bypassed, +24 dB of drive peaked at only {unlimited:.2} dBFS"
         );
     }
 
@@ -2413,6 +2990,10 @@ mod tests {
                         chorus_depth: b,
                         chorus_width: a,
                         chorus_tone: b,
+                        phaser_rate: a,
+                        phaser_feedback: b,
+                        phaser_stages: Stages::Eight,
+                        phaser_range: a,
                         hpf_slope: Slope::TwentyFour,
                         hpf_resonance: b,
                         lpf_slope: Slope::TwentyFour,

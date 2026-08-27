@@ -21,6 +21,8 @@ mod dx7;
 /// Reverb and delay, on everything the app plays.
 #[cfg(feature = "recorder")]
 mod effects;
+mod loudness;
+mod varispeed;
 /// The monitor engine: the audio OUTPUT stream that plays a hosted VST3
 /// instrument and the metronome. Absent from a Minimal build for the same
 /// reason `record` is (docs/RECORDER-PLAN.md §12a).

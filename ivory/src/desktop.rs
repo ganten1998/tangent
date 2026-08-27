@@ -771,7 +771,7 @@ pub fn effect_defaults_for_shot() -> ivory_ui::ports::EffectDefaults {
 /// and the audio cannot disagree about where a slider starts.
 #[cfg(feature = "recorder")]
 fn effect_defaults() -> ivory_ui::ports::EffectDefaults {
-    use crate::effects::{Division, Params, Sends};
+    use crate::effects::{Division, Params, Sends, Stages};
     let d = Params::default();
     // **The six MIX knobs' own defaults live on `Sends`**, so a reset and the
     // default marker land where the sound ships — not on a fallback. Their
@@ -783,8 +783,10 @@ fn effect_defaults() -> ivory_ui::ports::EffectDefaults {
         ("reverb_mix", m.reverb),
         ("delay_mix", m.delay),
         ("chorus_mix", m.chorus),
+        ("phaser_mix", m.phaser),
         ("hpf_mix", m.hpf),
         ("lpf_mix", m.lpf),
+        ("gain_mix", m.gain),
         ("limiter_mix", m.limiter),
         ("reverb_size", d.reverb_size),
         ("reverb_damp", d.reverb_damp),
@@ -796,6 +798,9 @@ fn effect_defaults() -> ivory_ui::ports::EffectDefaults {
         ("chorus_depth", d.chorus_depth),
         ("chorus_width", d.chorus_width),
         ("chorus_tone", d.chorus_tone),
+        ("phaser_rate", d.phaser_rate),
+        ("phaser_feedback", d.phaser_feedback),
+        ("phaser_range", d.phaser_range),
         ("hpf_resonance", d.hpf_resonance),
         ("lpf_resonance", d.lpf_resonance),
         ("limiter_release", d.limiter_release),
@@ -831,6 +836,16 @@ fn effect_defaults() -> ivory_ui::ports::EffectDefaults {
                     high: crate::effects::LIMITER_DB.1,
                 },
             ),
+            // And so is the gain. **`+12.0 dB` is the reading somebody needs
+            // to see on the one control that can clip the master** — a
+            // percentage would be a number about the knob.
+            (
+                "gain_mix".to_owned(),
+                ivory_ui::ports::KnobUnit::Decibels {
+                    low: crate::effects::GAIN_DB.0,
+                    high: crate::effects::GAIN_DB.1,
+                },
+            ),
         ],
         choices: vec![
             ivory_ui::ports::ChoiceParam {
@@ -843,6 +858,14 @@ fn effect_defaults() -> ivory_ui::ports::EffectDefaults {
             },
             slope_choice("hpf_slope", d.hpf_slope),
             slope_choice("lpf_slope", d.lpf_slope),
+            ivory_ui::ports::ChoiceParam {
+                key: "phaser_stages".to_owned(),
+                options: Stages::ALL
+                    .into_iter()
+                    .map(|x| (x.key().to_owned(), x.label().to_owned()))
+                    .collect(),
+                default: d.phaser_stages.key().to_owned(),
+            },
         ],
     }
 }
@@ -888,6 +911,9 @@ fn effect_params_from(map: &serde_json::Map<String, serde_json::Value>) -> crate
         ("chorus_depth", &mut p.chorus_depth),
         ("chorus_width", &mut p.chorus_width),
         ("chorus_tone", &mut p.chorus_tone),
+        ("phaser_rate", &mut p.phaser_rate),
+        ("phaser_feedback", &mut p.phaser_feedback),
+        ("phaser_range", &mut p.phaser_range),
         ("hpf_resonance", &mut p.hpf_resonance),
         ("lpf_resonance", &mut p.lpf_resonance),
         ("limiter_release", &mut p.limiter_release),
@@ -903,6 +929,13 @@ fn effect_params_from(map: &serde_json::Map<String, serde_json::Value>) -> crate
         .and_then(Division::from_key)
     {
         p.delay_division = d;
+    }
+    if let Some(v) = map
+        .get("phaser_stages")
+        .and_then(serde_json::Value::as_str)
+        .and_then(crate::effects::Stages::from_key)
+    {
+        p.phaser_stages = v;
     }
     for (key, dst) in [
         ("hpf_slope", &mut p.hpf_slope),
@@ -1452,6 +1485,14 @@ impl DesktopApp {
         if let Some(e) = self.recorder.engine.as_ref() {
             state.master = e.meters();
             state.gr_db = e.gain_reduction_db();
+            let (m, st, i) = e.loudness();
+            // **Read every frame and NOT reset on read**, unlike the peaks
+            // above: the two sliding windows are still true between frames
+            // and the integrated one is the whole programme. A read that
+            // cleared them would make the ladder flicker at frame rate.
+            state.loudness.momentary = m;
+            state.loudness.short = st;
+            state.loudness.integrated = i;
             // The desk's own meters. Read-and-reset on the engine's side, so
             // this has to happen exactly once a frame and here is that once.
             state.strip_peaks = e.strip_peaks();
@@ -1476,6 +1517,7 @@ impl DesktopApp {
         } else {
             state.master = ivory_ui::recorder::Meters::SILENT;
             state.gr_db = 0.0;
+            state.loudness = ivory_ui::recorder::Loudness::default();
         }
         // **Levels with nothing plugged in, for looking at the desk.**
         //
@@ -1493,6 +1535,15 @@ impl DesktopApp {
                 *peaks = [l, l * 0.55];
             }
             state.gr_db = 7.5;
+            // A loudness reading to look at too, and a real one: −13.8 is a
+            // master a hair over the streaming target, which is the reading
+            // the ladder most needs to be legible at.
+            state.loudness = ivory_ui::recorder::Loudness {
+                momentary: -11.2,
+                short: -12.6,
+                integrated: -13.8,
+                ..ivory_ui::recorder::Loudness::default()
+            };
             state.master = ivory_ui::recorder::Meters {
                 left: ivory_ui::recorder::Level {
                     peak: 0.79,
@@ -2320,6 +2371,11 @@ impl DesktopApp {
                     self.recorder.session.clear_clip();
                     if let Some(e) = self.recorder.engine.as_ref() {
                         e.clear_clip();
+                    }
+                }
+                R::ResetLoudness => {
+                    if let Some(e) = self.recorder.engine.as_ref() {
+                        e.reset_loudness();
                     }
                 }
                 R::Audition { notes, on } => {
@@ -3723,13 +3779,15 @@ impl DesktopApp {
         self.publish_routes(&e);
         e.set_master_gain(gains.master);
         e.set_fx_return(gains.fx_return);
-        let [reverb, delay, chorus, hpf, lpf, limiter] = self.app.effect_sends();
+        let [reverb, delay, chorus, phaser, hpf, lpf, gain, limiter] = self.app.effect_sends();
         e.set_effects(crate::effects::Sends {
             reverb,
             delay,
             chorus,
+            phaser,
             hpf,
             lpf,
+            gain,
             limiter,
         });
         e.set_effect_params(effect_params_from(self.app.effect_params()));
@@ -4997,13 +5055,15 @@ impl DesktopApp {
         // Pushed every frame with the gains, and for the same reason: the
         // settings are the one live value, so a knob dragged, a project loaded
         // and a settings file hand-edited all arrive by the same path.
-        let [reverb, delay, chorus, hpf, lpf, limiter] = self.app.effect_sends();
+        let [reverb, delay, chorus, phaser, hpf, lpf, gain, limiter] = self.app.effect_sends();
         e.set_effects(crate::effects::Sends {
             reverb,
             delay,
             chorus,
+            phaser,
             hpf,
             lpf,
+            gain,
             limiter,
         });
         // The parameters too, and `set_effect_params` is what makes this cheap:
