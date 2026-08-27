@@ -1112,21 +1112,32 @@ impl EchoMode {
 
 /// How much of each repeat comes back for the next, at each end of Intensity.
 ///
-/// **0.90, and the ceiling is a decision rather than a limit.** A Space Echo's
-/// Intensity reaches self-oscillation, and that howl is half of what the box
-/// is famous for. This is a send on a master bus in a piano application, and
-/// the reason written here when the top was 0.72 has not stopped being true:
-/// a control somebody will turn all the way up to hear what it does should not
-/// be an oscillator. What HAS changed is that 0.72 was well short of the long
-/// smeared wash the machine is actually used for.
+/// **Past unity, because that is what the machine does.** An RE-201's
+/// Intensity reaches self-oscillation, and the howl it builds into is half of
+/// what the box is famous for — it is the sound on the records, not an abuse
+/// of the control.
 ///
-/// 0.90 is where it sits because `the_delay_does_not_run_away_at_any_setting`
-/// wants the tail under 35% after five seconds, which at the shipped time is
-/// a touch over thirteen repeats and bounds the coefficient at about 0.924.
-/// The saturation in the loop would hold a higher setting bounded rather than
-/// let it blow up — tape does not explode, it compresses — so this is one
-/// constant away from the hardware if that trade is ever taken.
-const TAPE_FEEDBACK: (f32, f32) = (0.0, 0.90);
+/// This file argued the other way twice, and the argument was the same both
+/// times: a send on a master bus is not a place for an oscillator. It shipped
+/// at 0.72, then at 0.90, both of them chosen to keep every setting decaying.
+/// The instruction is to match the hardware, so it does.
+///
+/// **What makes that safe is the `tanh` in the loop rather than the ceiling.**
+/// Tape does not diverge; it compresses. Above unity the loop builds until the
+/// saturation catches it and then sits there, loud and squashed and bounded —
+/// which is exactly the behaviour, and is why the invariant that matters is
+/// "never unbounded" and not "always decaying".
+/// `the_echo_stays_bounded_at_every_setting` is that invariant, and
+/// `the_intensity_reaches_self_oscillation` is the capability it protects.
+///
+/// **1.25 rather than a hair over 1.0, and the reason is the `tanh` again.**
+/// Small-signal loop gain and *large*-signal loop gain are not the same
+/// number: `tanh(1.6a)/1.6a` is already down to 0.97 by the time the loop
+/// carries a fifth of full scale, so a ceiling of 1.06 self-limits almost
+/// immediately and reads as a very long delay rather than as oscillation. At
+/// 1.25 the loop settles where `1.25 · tanh(1.6a)/1.6a = 1`, near 0.68 on the
+/// tape — loud, squashed, and stable, which is the howl.
+const TAPE_FEEDBACK: (f32, f32) = (0.0, 1.25);
 
 /// Longest the line can hold, in seconds. Three heads means the last one wants
 /// nearly three times the first, so this is what bounds head one's time.
@@ -1365,6 +1376,7 @@ impl TapeEcho {
         // ── the heads ───────────────────────────────────────────────────
         let mut wet = [0.0_f32; 2];
         let mut loop_sum = 0.0_f32;
+        let mut live = 0.0_f32;
         let cap = (self.tape.len() - 2) as f32;
         let width = p.delay_width.clamp(0.0, 1.0);
         for (i, on) in heads.iter().enumerate() {
@@ -1386,6 +1398,19 @@ impl TapeEcho {
             wet[0] += v * (1.0 - pan).min(1.0);
             wet[1] += v * (1.0 + pan).min(1.0);
             loop_sum += v;
+            live += 1.0;
+        }
+        // **The feedback tap is the head MIX, not the head sum**, and the
+        // difference only started mattering when Intensity was allowed past
+        // unity. Three heads summing raw would make mode 11's loop gain three
+        // times mode 1's, so one Intensity setting would be a gentle wash on
+        // one position of the selector and an instant howl on another. The
+        // machine's Intensity behaves like one control across the switch.
+        //
+        // The WET output keeps the full sum — three heads should be louder
+        // than one, and that is a level, not a loop.
+        if live > 1.0 {
+            loop_sum /= live;
         }
 
         // ── the loop ────────────────────────────────────────────────────
@@ -3871,24 +3896,100 @@ mod tests {
         }
     }
 
-    /// Repeats get quieter, or the knob is an oscillator — at every feedback
-    /// setting the menu can reach.
+    /// **Bounded at every setting, and decaying below the top of the knob.**
+    ///
+    /// This used to demand that the tail decay at *every* Intensity, which is
+    /// the right invariant for a delay and the wrong one for a Space Echo: the
+    /// machine self-oscillates at the top of its travel and that howl is the
+    /// sound, not an abuse of the control. What tape actually guarantees is
+    /// not decay but BOUNDEDNESS — it compresses rather than diverging — so
+    /// that is what is tested here, and
+    /// `the_intensity_reaches_self_oscillation` covers the capability the old
+    /// assertion used to forbid.
+    ///
+    /// The ceiling below is generous on purpose. It is not a level anybody
+    /// should like; it is the difference between "loud and squashed" and
+    /// "climbing until it is a number no converter can take".
     #[test]
-    fn the_delay_does_not_run_away_at_any_setting() {
+    fn the_echo_stays_bounded_at_every_setting() {
         for feedback in [0.0_f32, 0.5, 1.0] {
+            let p = Params {
+                delay_feedback: feedback,
+                // The worst case for a loop: every head live, feeding back.
+                echo_mode: EchoMode::Eleven,
+                ..Params::default()
+            };
+            let mut fx = Effects::new(SR);
+            let out = strike_with(&mut fx, 48_000 * 12, sends(0.0, 1.0, 0.0), &p, 120.0);
+            assert!(
+                out.iter().all(|v| v.is_finite()),
+                "feedback {feedback} went non-finite"
+            );
+            let worst = peak(&out);
+            assert!(
+                worst < 6.0,
+                "feedback {feedback} climbed to {worst:e}: the saturation is \
+                 not catching it"
+            );
+        }
+
+        // Below the top of the travel it still behaves like a delay: put the
+        // knob where somebody looking for repeats would put it and the
+        // repeats have to end.
+        let p = Params {
+            delay_feedback: 0.6,
+            ..Params::default()
+        };
+        let mut fx = Effects::new(SR);
+        let out = strike_with(&mut fx, 48_000 * 6, sends(0.0, 1.0, 0.0), &p, 120.0);
+        let first = peak(&out[..48_000]);
+        let last = peak(&out[48_000 * 10..]);
+        assert!(
+            last < first * 0.35,
+            "at two thirds of the knob it went {first:e} -> {last:e} after \
+             five seconds, which is not a delay any more"
+        );
+    }
+
+    /// **The Intensity knob reaches self-oscillation, because the machine's
+    /// does.**
+    ///
+    /// The howl an RE-201 builds into past unity is on the records; a model
+    /// that stops short of it is a tape delay and not a Space Echo. Ganten's
+    /// instruction was to match the hardware.
+    ///
+    /// What makes it safe is the `tanh` in the loop and not the ceiling on the
+    /// knob: the loop settles where the saturation's own gain brings the round
+    /// trip back to unity, and sits there. So the test is SUSTAIN — one strike
+    /// and then silence, and eleven seconds later it is still going at a level
+    /// that is unmistakably a tone and not a tail. The same strike at two
+    /// thirds of the knob is long gone, which is what says the knob is doing
+    /// it rather than the buffer being long.
+    #[test]
+    fn the_intensity_reaches_self_oscillation() {
+        let after = |feedback: f32| {
             let p = Params {
                 delay_feedback: feedback,
                 ..Params::default()
             };
-            let mut fx = Effects::new(SR);
-            let out = strike_with(&mut fx, 48_000 * 6, sends(0.0, 1.0, 0.0), &p, 120.0);
-            let first = peak(&out[..48_000]);
-            let last = peak(&out[48_000 * 10..]);
-            assert!(
-                last < first * 0.35,
-                "feedback {feedback} went {first:e} -> {last:e} after five seconds"
-            );
-        }
+            let mut fx = Effects::new_send(SR);
+            // One strike, then silence: anything still here is the loop's own.
+            let out = strike_with(&mut fx, 48_000 * 12, sends(0.0, 1.0, 0.0), &p, 120.0);
+            peak(&out[528_000 * 2..])
+        };
+
+        let howling = after(1.0);
+        let dying = after(0.66);
+        assert!(
+            howling > 0.05,
+            "eleven seconds after one strike the top of the knob was down to \
+             {howling:e}: it is a long delay, not an oscillator"
+        );
+        assert!(
+            dying < howling * 0.05,
+            "two thirds of the knob left {dying:e} against the top's \
+             {howling:e}: the knob is not the thing deciding"
+        );
     }
 
     /// Where the repeats land, in seconds, for one mode. Feedback off, so
