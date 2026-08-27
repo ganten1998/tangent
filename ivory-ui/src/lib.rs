@@ -4,6 +4,9 @@
 //! See `Cargo.toml` for why the absent dependencies matter more than the
 //! present ones.
 
+/// Focus, keyboard reach and screen-reader semantics for surfaces made of one
+/// `Painter`. See the module for why every panel needed a second enumerator.
+pub mod a11y;
 pub mod app;
 pub mod chord_strip;
 pub mod dialogs;

@@ -2971,6 +2971,31 @@ mod tests {
     /// reads as a rendering fault rather than as "the window is too small".
     /// `DETACHED_MIN` is where that stops happening, so it is asserted rather
     /// than remembered.
+    /// **And the MAIN window's floor leaves them something to draw too.**
+    ///
+    /// `settings::MIN_WINDOW` took its width from `DETACHED_MIN` — the
+    /// diagrams are the first thing to give up, and they give up at 540 — but
+    /// the main window hands the theory band a row whose HEIGHT is derived
+    /// from the window's width rather than chosen, so the two floors are not
+    /// the same rectangle and the inherited number proves nothing on its own.
+    /// This is the check that the main window's floor is a floor.
+    #[test]
+    fn the_main_windows_floor_leaves_the_diagrams_something_to_draw() {
+        let views = Views::all();
+        let w = crate::settings::MIN_WINDOW.x;
+        let h = band_height(w, &views);
+        assert!(h > 0.0, "the theory band has no height at the window floor");
+        let row = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, h));
+        let at_min = controls(row, &views, c_major());
+        for view in View::ALL.into_iter().filter(|v| *v != View::Staff) {
+            assert!(
+                at_min.iter().any(|(v, _, _)| *v == view),
+                "{view:?} draws nothing in the theory band at the main window's \
+                 floor ({w} x {h})"
+            );
+        }
+    }
+
     #[test]
     fn the_smallest_window_still_holds_three_diagrams() {
         // **Every element the app ships with**, not the three it used to have.

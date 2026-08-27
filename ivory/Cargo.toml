@@ -79,7 +79,15 @@ cpal = { version = "0.16", optional = true }
 rtrb = { version = "0.3", optional = true }
 # Same crate eframe already links; direct dep so modules can `use egui::...`.
 egui = { version = "0.33", default-features = false }
+# `accesskit` is in eframe's OWN default features and was lost to
+# `default-features = false`, which is why the audit found no accesskit
+# anywhere in `Cargo.lock`. It is the platform screen-reader bridge —
+# NSAccessibility on macOS, UIA on Windows, AT-SPI over D-Bus on Linux — and
+# egui feeds it automatically from `Response::widget_info`. See
+# `ivory_ui::a11y` for how surfaces made of one `Painter` get a widget to
+# attach that to.
 eframe = { version = "0.33", default-features = false, features = [
+    "accesskit",
     "default_fonts",
     "glow",
     "wayland",
