@@ -928,6 +928,65 @@ impl Beats {
     }
 }
 
+/// The gain, pan and send an automated lane is actually playing at.
+///
+/// **Free functions rather than methods, and the borrow checker asked for
+/// it.** The live-monitor path holds `&mut self.monitor_scratch` across the
+/// whole mix, so `self.lane_gain(..)` would be an immutable borrow of all of
+/// `self` inside a mutable one. Taking the two fields it actually needs lets
+/// the compiler see they are disjoint — and the methods below stay, because
+/// every other site reads better for having them.
+fn lane_gain_of(auto: &AutoNow, shared: &Shared, lane: usize) -> f32 {
+    match auto.gain.get(lane).copied().flatten() {
+        Some(v) => ivory_ui::recorder::fader_to_gain(v).clamp(0.0, 8.0),
+        None => shared
+            .channel_gains
+            .get(lane)
+            .map_or(1.0, |g| Shared::f32_of(g).clamp(0.0, 8.0)),
+    }
+}
+
+fn lane_pan_of(auto: &AutoNow, shared: &Shared, lane: usize) -> f32 {
+    match auto.pan.get(lane).copied().flatten() {
+        Some(v) => (v * 2.0 - 1.0).clamp(-1.0, 1.0),
+        None => shared.channel_pans.get(lane).map_or(0.0, Shared::f32_of),
+    }
+}
+
+fn lane_send_of(auto: &AutoNow, shared: &Shared, lane: usize) -> f32 {
+    match auto.send.get(lane).copied().flatten() {
+        Some(v) => v.clamp(0.0, 1.0),
+        None => shared
+            .send
+            .get(lane)
+            .map_or(0.0, |g| Shared::f32_of(g).clamp(0.0, 1.0)),
+    }
+}
+
+/// Every automated control's value for one block.
+///
+/// Plain arrays rather than a lookup, because the audio thread asks for
+/// these twelve times a block and an `Option<f32>` in an array is a load and
+/// a branch.
+#[derive(Debug, Clone, Copy)]
+pub struct AutoNow {
+    gain: [Option<f32>; CHANNELS],
+    pan: [Option<f32>; CHANNELS],
+    send: [Option<f32>; CHANNELS],
+    mute: [Option<bool>; CHANNELS],
+}
+
+impl Default for AutoNow {
+    fn default() -> Self {
+        Self {
+            gain: [None; CHANNELS],
+            pan: [None; CHANNELS],
+            send: [None; CHANNELS],
+            mute: [None; CHANNELS],
+        }
+    }
+}
+
 /// The two maps the engine reads, swapped in together.
 ///
 /// One struct because they are one fact: a bar line is where it is because of
@@ -1491,6 +1550,16 @@ struct Shared {
     /// strip does — and reading eight atomics to answer it would be eight
     /// chances for the answer to change halfway through.
     muted: AtomicU32,
+    /// Lanes whose automation must NOT drive their control this block, one
+    /// bit each.
+    ///
+    /// **Two quite different reasons share one mask**, because the audio
+    /// thread's question is the same either way — "does the curve win here?"
+    /// A lane in `AutoMode::Off` keeps its curve and stops obeying it; a
+    /// lane being WRITTEN has a hand on the control, and a curve that fought
+    /// the hand would make the fader jump back under it as each point
+    /// landed. Both mean: leave this one to the fader.
+    auto_suspend: AtomicU32,
     soloed: AtomicU32,
     /// The six effect knobs, 0..=1. Three of them are sends on the effects bus
     /// and three are inserts on the master — see `effects.rs`, and see
@@ -1626,6 +1695,7 @@ impl Shared {
             pad_master: AtomicU32::new(1.0f32.to_bits()),
             pad_peak: std::array::from_fn(|_| AtomicU32::new(0)),
             muted: AtomicU32::new(0),
+            auto_suspend: AtomicU32::new(0),
             soloed: AtomicU32::new(0),
             gr_db: AtomicU32::new(0),
             reverb_mix: AtomicU32::new(0.0f32.to_bits()),
@@ -2294,6 +2364,25 @@ struct Renderer {
     bar_clock: BarClock,
     /// The tempo and meter maps the click and the ruler share.
     maps: Maps,
+    /// **What every automated control reads THIS block.**
+    ///
+    /// Resolved once at the top of `render` and then asked twelve times —
+    /// seven gain reads and five pan reads scattered across the routing
+    /// fold, the live monitor, the arrangement clips, the file preview, the
+    /// drum pads and the three MIDI paths in `mix_channels`. Resolving it
+    /// per site would be twelve binary searches instead of one and, far
+    /// worse, twelve chances to leave one out: a version that automated only
+    /// `mix_clips` would look exactly right on an audio clip and do nothing
+    /// at all to a MIDI lane or a live input.
+    ///
+    /// `None` means nothing automates that control, which is what leaves the
+    /// fader in charge — the automation OVERRIDES the fader while a curve is
+    /// there and is silent otherwise. Not a multiplier: a volume curve is
+    /// the fader's position, the way every desk means it.
+    auto: AutoNow,
+    automation: ivory_ui::automation::Automation,
+    auto_incoming: Consumer<ivory_ui::automation::Automation>,
+    auto_retiring: Producer<ivory_ui::automation::Automation>,
     maps_incoming: Consumer<Maps>,
     maps_retiring: Producer<Maps>,
     /// Frames left during which a count-in click is still SOUNDING.
@@ -2746,6 +2835,12 @@ impl Renderer {
             // the channels know where the timeline stands — the MIDI clips
             // play from here.
             let (at, rolling, jumped) = self.run_transport(n);
+            // **Every automated control, resolved once for this chunk.** It
+            // has to come after `run_transport` — the value depends on where
+            // the playhead now is — and before anything that mixes, because
+            // twelve sites below read it. See `resolve_automation`.
+            self.resolve_automation(at);
+            let muted = self.muted_now(muted);
             let flush = jumped || (self.was_rolling && !rolling);
             if flush && self.sounding != 0 {
                 self.builtin.all_notes_off();
@@ -3187,7 +3282,7 @@ impl Renderer {
                         );
                     }
                     let g = self.lane_gain[dest];
-                    let (pl, pr) = pan_gains(Shared::f32_of(&self.shared.channel_pans[dest]));
+                    let (pl, pr) = pan_gains(self.lane_pan(dest));
                     // **A bus that is itself routed onward does not ALSO go
                     // to the master.** What it passes goes into its stem
                     // below, which is where the destination downstream of it
@@ -3706,7 +3801,7 @@ impl Renderer {
                 self.shared.armed.load(Ordering::Relaxed) & (1 << strip.index().min(31)) != 0;
             let heard = live && strip_is_heard(strip, muted, soloed);
             let target = if heard {
-                Shared::f32_of(&self.shared.channel_gains[strip.index()]).clamp(0.0, 8.0)
+                lane_gain_of(&self.auto, &self.shared, strip.index())
             } else {
                 0.0
             };
@@ -3716,10 +3811,13 @@ impl Renderer {
                 self.monitor_gain[input] = 0.0;
                 continue;
             }
-            let send = Shared::f32_of(&self.shared.send[strip.index()]).clamp(0.0, 1.0);
-            let (pan_l, pan_r) = pan_gains(Shared::f32_of(
-                &self.shared.channel_pans[strip.index().min(CHANNELS - 1)],
-            ));
+            // **The live monitor, which is the path automation would most
+            // easily have been left out of** — it is not the arrangement, so
+            // a version that automated clips would look right and do nothing
+            // to somebody's own playing coming through the desk.
+            let lane = strip.index().min(CHANNELS - 1);
+            let send = lane_send_of(&self.auto, &self.shared, lane);
+            let (pan_l, pan_r) = pan_gains(lane_pan_of(&self.auto, &self.shared, lane));
             let mut peak = [0.0f32; 2];
             // **This strip's own audio first, then its rack, then the fold.**
             //
@@ -3832,6 +3930,106 @@ impl Renderer {
     ///
     /// Returns `(at, rolling, jumped)`. A jump — or the level falling — is what
     /// ends the notes the move strands; see the flush at the call site.
+    /// **The gain lane `i` is actually playing at.**
+    ///
+    /// The automation curve when one is reading, the fader otherwise. This
+    /// is the ONLY place `channel_gains` may be read from inside the render
+    /// path, and `the_render_path_reads_no_fader_directly` is what keeps
+    /// that true — a site that read the atomic itself would be a control
+    /// automation silently did not reach, which is the exact failure this
+    /// whole shape exists to prevent.
+    ///
+    /// The curve carries a fader POSITION, so it goes through the same
+    /// `fader_to_gain` a mouse drag does. Storing amplitude instead would
+    /// have made a -6 dB curve mean something else entirely — the mistake
+    /// already made once on this branch in the keyboard nudge.
+    fn lane_gain(&self, lane: usize) -> f32 {
+        lane_gain_of(&self.auto, &self.shared, lane)
+    }
+
+    /// The same for pan, with the curve's `0..1` laid back onto `-1..1`.
+    fn lane_pan(&self, lane: usize) -> f32 {
+        lane_pan_of(&self.auto, &self.shared, lane)
+    }
+
+    /// The send lane `i` is actually feeding the effects bus at.
+    ///
+    /// Indexed by `Strip::index()` in `Shared`, which is a WIDER space than
+    /// the sixteen channels — the click and the bus have sends too, and
+    /// nothing automates those. Out-of-range lanes fall through to the
+    /// atomic, which is the honest answer for a strip no curve can name.
+    fn lane_send(&self, lane: usize) -> f32 {
+        lane_send_of(&self.auto, &self.shared, lane)
+    }
+
+    /// Resolve every automated control for this block.
+    ///
+    /// Once, at the top of `render`, so the twelve sites below are a load
+    /// and a branch rather than twelve binary searches. Seconds and not
+    /// frames because that is what the document stores — converting here
+    /// costs one divide and avoids a bake that could go stale against the
+    /// curve it came from.
+    fn resolve_automation(&mut self, at: u64) {
+        use ivory_ui::automation::AutoParam;
+        if !self.auto_retiring.is_full() {
+            if let Ok(next) = self.auto_incoming.pop() {
+                let old = std::mem::replace(&mut self.automation, next);
+                let _ = self.auto_retiring.push(old);
+            }
+        }
+        let suspend = self.shared.auto_suspend.load(Ordering::Relaxed);
+        if self.automation.is_empty() {
+            // The overwhelmingly common song. One branch instead of sixty-four
+            // lookups, and it leaves every fader exactly where it was.
+            self.auto = AutoNow::default();
+            return;
+        }
+        let secs = at as f64 / self.rate.max(1.0);
+        for lane in 0..CHANNELS {
+            if suspend & (1 << lane) != 0 {
+                self.auto.gain[lane] = None;
+                self.auto.pan[lane] = None;
+                self.auto.send[lane] = None;
+                self.auto.mute[lane] = None;
+                continue;
+            }
+            self.auto.gain[lane] = self
+                .automation
+                .value_at(lane, AutoParam::Gain, secs)
+                .map(|v| v as f32);
+            self.auto.pan[lane] = self
+                .automation
+                .value_at(lane, AutoParam::Pan, secs)
+                .map(|v| v as f32);
+            self.auto.send[lane] = self
+                .automation
+                .value_at(lane, AutoParam::Send, secs)
+                .map(|v| v as f32);
+            // A switch written as a curve: heard below half, muted above it.
+            self.auto.mute[lane] = self
+                .automation
+                .value_at(lane, AutoParam::Mute, secs)
+                .map(|v| v >= 0.5);
+        }
+    }
+
+    /// The mute mask with automation folded in.
+    ///
+    /// The mask is a `u32` of bits the desk owns; a curve overrides one bit
+    /// without disturbing the others, so a lane nobody has automated goes on
+    /// answering to its own button.
+    fn muted_now(&self, muted: u32) -> u32 {
+        let mut out = muted;
+        for lane in 0..CHANNELS {
+            match self.auto.mute[lane] {
+                Some(true) => out |= 1 << lane,
+                Some(false) => out &= !(1 << lane),
+                None => {}
+            }
+        }
+        out
+    }
+
     fn run_transport(&mut self, frames: usize) -> (u64, bool, bool) {
         let req = self.shared.transport_req.load(Ordering::Acquire);
         let seek = req != self.seen_req;
@@ -3904,12 +4102,12 @@ impl Renderer {
         for lane in 0..CHANNELS {
             let strip = Strip::Channel(lane);
             target[lane] = if strip_is_heard(strip, muted, soloed) {
-                Shared::f32_of(&self.shared.channel_gains[lane]).clamp(0.0, 8.0)
+                self.lane_gain(lane)
             } else {
                 0.0
             };
             send[lane] = Shared::f32_of(&self.shared.send[strip.index()]).clamp(0.0, 1.0);
-            pan[lane] = pan_gains(Shared::f32_of(&self.shared.channel_pans[lane]));
+            pan[lane] = pan_gains(self.lane_pan(lane));
             punch[lane] = self.shared.punch[lane].load(Ordering::Relaxed);
         }
         // Stems and ROUTING share this buffer: a send reads the
@@ -4038,7 +4236,7 @@ impl Renderer {
             .then_some(drum_wanted as usize)
             .filter(|ch| *ch < CHANNELS);
         let bus = match drum_lane {
-            Some(ch) => Shared::f32_of(&self.shared.channel_gains[ch]).clamp(0.0, 8.0),
+            Some(ch) => self.lane_gain(ch),
             None => Shared::f32_of(&self.shared.drums_gain).clamp(0.0, 8.0),
         };
         let master = Shared::f32_of(&self.shared.master_gain);
@@ -4102,14 +4300,14 @@ impl Renderer {
         let bus_strip = drum_lane.map_or(Strip::Drums, Strip::Channel);
         let master = if strip_is_heard(bus_strip, muted, soloed) {
             match drum_lane {
-                Some(ch) => Shared::f32_of(&self.shared.channel_gains[ch]).clamp(0.0, 8.0),
+                Some(ch) => self.lane_gain(ch),
                 None => Shared::f32_of(&self.shared.drums_gain).clamp(0.0, 8.0),
             }
         } else {
             0.0
         };
         let (bus_l, bus_r) = pan_gains(match drum_lane {
-            Some(ch) => Shared::f32_of(&self.shared.channel_pans[ch]),
+            Some(ch) => self.lane_pan(ch),
             None => Shared::f32_of(&self.shared.drums_pan),
         });
         let bus_send = Shared::f32_of(&self.shared.send[bus_strip.index()]).clamp(0.0, 1.0);
@@ -4585,7 +4783,7 @@ impl Renderer {
                     });
                 }
                 let target = if strip_is_heard(Strip::Channel(ch), muted, soloed) {
-                    Shared::f32_of(&self.shared.channel_gains[ch]).clamp(0.0, 8.0)
+                    self.lane_gain(ch)
                 } else {
                     0.0
                 };
@@ -4627,7 +4825,7 @@ impl Renderer {
                 // fader moved during a rest has to have arrived by the next
                 // note, or it comes in at the old level and slides.
                 let target = if strip_is_heard(Strip::Channel(ch), muted, soloed) {
-                    Shared::f32_of(&self.shared.channel_gains[ch]).clamp(0.0, 8.0)
+                    self.lane_gain(ch)
                 } else {
                     0.0
                 };
@@ -4678,7 +4876,7 @@ impl Renderer {
             // The fold: fader, send, peak — the channel's own, exactly as
             // every other strip does it.
             let target = if strip_is_heard(Strip::Channel(ch), muted, soloed) {
-                Shared::f32_of(&self.shared.channel_gains[ch]).clamp(0.0, 8.0)
+                self.lane_gain(ch)
             } else {
                 0.0
             };
@@ -4686,7 +4884,7 @@ impl Renderer {
                 self.shared.send[Strip::Channel(ch).index()].load(Ordering::Relaxed),
             )
             .clamp(0.0, 1.0);
-            let (pan_l, pan_r) = pan_gains(Shared::f32_of(&self.shared.channel_pans[ch]));
+            let (pan_l, pan_r) = pan_gains(self.lane_pan(ch));
             let want = frames * TAP_CHANNELS;
             // Stems and ROUTING share this buffer: a send reads the
             // lane's own audio out of it, so it is filled whenever either
@@ -5018,6 +5216,8 @@ pub struct Engine {
     /// thread that sent its replacement.
     maps_to_audio: Producer<Maps>,
     maps_from_audio: Consumer<Maps>,
+    auto_to_audio: Producer<ivory_ui::automation::Automation>,
+    auto_from_audio: Consumer<ivory_ui::automation::Automation>,
     track_to_audio: Producer<Vec<Placed>>,
     track_from_audio: Consumer<Vec<Placed>>,
     midi_to_audio: Producer<Vec<PlacedMidi>>,
@@ -5276,6 +5476,12 @@ impl Engine {
         // thread.
         let (maps_to_audio, maps_incoming) = RingBuffer::<Maps>::new(2);
         let (maps_retiring, maps_from_audio) = RingBuffer::<Maps>::new(2);
+        // The automation's pair, same protocol, same reason: curves are
+        // `Vec`s and the callback may not free one.
+        let (auto_to_audio, auto_incoming) =
+            RingBuffer::<ivory_ui::automation::Automation>::new(2);
+        let (auto_retiring, auto_from_audio) =
+            RingBuffer::<ivory_ui::automation::Automation>::new(2);
         // The drumpad kit's pair, same capacity, same reason.
         let (pad_to_audio, pad_incoming) = RingBuffer::<PadKit>::new(2);
         let (pad_retiring, pad_from_audio) = RingBuffer::<PadKit>::new(2);
@@ -5330,6 +5536,10 @@ impl Engine {
             maps: Maps::default(),
             maps_incoming,
             maps_retiring,
+            auto: AutoNow::default(),
+            automation: ivory_ui::automation::Automation::default(),
+            auto_incoming,
+            auto_retiring,
             track_incoming,
             track_retiring,
             midi_incoming,
@@ -5444,6 +5654,8 @@ impl Engine {
             insert_handoff,
             maps_to_audio,
             maps_from_audio,
+            auto_to_audio,
+            auto_from_audio,
             track_to_audio,
             track_from_audio,
             midi_to_audio,
@@ -6548,6 +6760,33 @@ impl Engine {
         let deadline = Instant::now() + RETIRE_TIMEOUT;
         while Instant::now() < deadline {
             if let Ok(old) = self.maps_from_audio.pop() {
+                drop(old);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Hand the audio thread every automation curve, whole.
+    ///
+    /// The same swap protocol as [`Engine::set_maps`], for the same reason.
+    /// Which lanes' curves must not drive their controls, one bit each.
+    ///
+    /// An atomic rather than a ring: it is one word, it changes as often as
+    /// a hand touches a fader, and it must take effect on the very next
+    /// block or the control fights the hand.
+    pub fn set_auto_suspend(&self, mask: u32) {
+        self.shared.auto_suspend.store(mask, Ordering::Relaxed);
+    }
+
+    pub fn set_automation(&mut self, auto: ivory_ui::automation::Automation) {
+        while self.auto_from_audio.pop().is_ok() {}
+        if self.auto_to_audio.push(auto).is_err() {
+            return;
+        }
+        let deadline = Instant::now() + RETIRE_TIMEOUT;
+        while Instant::now() < deadline {
+            if let Ok(old) = self.auto_from_audio.pop() {
                 drop(old);
                 return;
             }
@@ -7948,6 +8187,96 @@ mod tests {
         );
     }
 
+    /// **No site in the render path reads a fader behind automation's back.**
+    ///
+    /// The named riskiest failure of the whole automation feature: the gain
+    /// a lane plays at is read in SEVEN places and its pan in FIVE, spread
+    /// across the routing fold, the live monitor, the arrangement clips, the
+    /// file preview, the drum pads and three separate paths inside
+    /// `mix_channels`. A version that automated only `mix_clips` would look
+    /// exactly right on an audio clip and do nothing at all to a MIDI lane
+    /// or to somebody's own playing coming through the desk — and it would
+    /// pass any test that only listened to a clip.
+    ///
+    /// So the atomics are read in ONE place each, and this is what keeps it
+    /// that way. A source scan, following the two in `settings.rs`, because
+    /// the rule is about where code may appear and no runtime assertion can
+    /// say that.
+    #[test]
+    fn the_render_path_reads_no_fader_directly() {
+        let src = include_str!("instrument.rs");
+        // The render path is everything between the `Renderer`'s own impl and
+        // the `Engine`'s — the tests below and the UI-thread setters above
+        // are allowed to touch the atomics, and do.
+        let from = src.find("impl Renderer {").expect("the renderer's impl moved");
+        let to = src.find("impl Engine {").expect("the engine's impl moved");
+        assert!(from < to, "the two impls are not in the order this assumes");
+        let body = &src[from..to];
+
+        for (field, accessor) in [
+            ("channel_gains[", "lane_gain"),
+            ("channel_pans[", "lane_pan"),
+        ] {
+            // The accessors themselves are the exception, and they are free
+            // functions ABOVE the impl — so anything left in here is a site
+            // that went round them.
+            let stray: Vec<&str> = body
+                .lines()
+                .filter(|l| l.contains(field))
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect();
+            assert!(
+                stray.is_empty(),
+                "these lines read `{field}` directly instead of `{accessor}`, so \
+                 automation does not reach them:\n{}",
+                stray.join("\n")
+            );
+        }
+    }
+
+    /// Automation OVERRIDES the fader, and only where there is a curve.
+    #[test]
+    fn a_curve_takes_over_its_control_and_leaves_the_others_alone() {
+        use ivory_ui::automation::{AutoParam, Automation, Curve, Point, Shape};
+        let mut auto = AutoNow::default();
+        let shared = Shared::new();
+        // Fader at full, nothing automated: the fader wins.
+        shared.channel_gains[3].store(1.0f32.to_bits(), Ordering::Relaxed);
+        assert!((lane_gain_of(&auto, &shared, 3) - 1.0).abs() < 1e-6);
+
+        // A curve at half FADER TRAVEL is not half amplitude — it goes
+        // through the same decibel curve a mouse drag does.
+        auto.gain[3] = Some(0.5);
+        let want = ivory_ui::recorder::fader_to_gain(0.5);
+        assert!(
+            (lane_gain_of(&auto, &shared, 3) - want).abs() < 1e-6,
+            "a curve at 0.5 gave {} rather than {want}",
+            lane_gain_of(&auto, &shared, 3)
+        );
+        // ...and the lane beside it is untouched.
+        shared.channel_gains[4].store(0.25f32.to_bits(), Ordering::Relaxed);
+        assert!((lane_gain_of(&auto, &shared, 4) - 0.25).abs() < 1e-6);
+
+        // Pan comes back off 0..1 onto -1..1, centre at half.
+        auto.pan[2] = Some(0.5);
+        assert!(lane_pan_of(&auto, &shared, 2).abs() < 1e-6, "half is not centre");
+        auto.pan[2] = Some(0.0);
+        assert!((lane_pan_of(&auto, &shared, 2) + 1.0).abs() < 1e-6, "zero is not hard left");
+
+        // And the curve really is what feeds it.
+        let mut a = Automation::default();
+        a.set(Curve::sanitised(
+            1,
+            AutoParam::Gain,
+            vec![
+                Point { at_s: 0.0, value: 1.0, shape: Shape::Linear },
+                Point { at_s: 10.0, value: 0.0, shape: Shape::Linear },
+            ],
+        ));
+        let half = a.value_at(1, AutoParam::Gain, 5.0).expect("a value");
+        assert!((half - 0.5).abs() < 1e-9, "halfway down gave {half}");
+    }
+
     /// Walk a `BarClock` over a span of frames and answer where it fired.
     fn locked_beats(maps: &Maps, rate: f64, from: u64, frames: u64) -> Vec<(u64, bool)> {
         let mut c = BarClock::default();
@@ -8433,6 +8762,10 @@ mod tests {
             maps: Maps::default(),
             maps_incoming: RingBuffer::<Maps>::new(2).1,
             maps_retiring: RingBuffer::<Maps>::new(2).0,
+            auto: AutoNow::default(),
+            automation: ivory_ui::automation::Automation::default(),
+            auto_incoming: RingBuffer::<ivory_ui::automation::Automation>::new(2).1,
+            auto_retiring: RingBuffer::<ivory_ui::automation::Automation>::new(2).0,
             count_in_tail: 0,
             chunks: 0,
             metro_gain: 1.0,

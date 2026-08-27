@@ -422,6 +422,10 @@ pub struct DesktopApp {
     /// `Engine::set_maps` is a ring handover that WAITS for the displaced
     /// pair to come back — cheap once, and a stall if it ran every frame.
     pushed_maps: Option<crate::instrument::Maps>,
+    /// The automation the engine was last given, compared before pushing for
+    /// the reason `pushed_maps` gives. Invalidated in `start_engine` beside
+    /// it — a fresh engine has no curves.
+    pushed_auto: Option<ivory_ui::automation::Automation>,
     /// The DX7 cartridge the built-in is playing out of, if one is loaded.
     ///
     /// **The host holds the voices; the UI holds the names.** Kept here rather
@@ -1775,6 +1779,8 @@ impl DesktopApp {
         }
         // Beside the per-frame push and gated on change — see `push_maps`.
         self.push_maps();
+        self.push_automation();
+        self.push_auto_suspend();
 
         let root = self.app.record_root();
         let name = self.app.take_name().map(str::to_owned);
@@ -3729,6 +3735,11 @@ impl DesktopApp {
             tempo: self.app.live_tempo_map(),
             meter: self.app.live_meter_map(),
         });
+        // **And the curves, in the export mirror too.** An export that
+        // ignored the automation would be the same class of quiet wrongness
+        // as one whose bar lines were somewhere else: it plays, it sounds
+        // plausible, and it is not what you were listening to.
+        e.set_automation(self.app.automation().clone());
         // The built-in: rendered by the engine itself when a channel's
         // first bay names it — the live walk's own rule.
         let builtin = (0..ivory_ui::recorder::CHANNELS)
@@ -4663,6 +4674,7 @@ impl DesktopApp {
                 // Not covered by `set_tempo`: `BarClock` reads `Renderer::maps`
                 // on the audio thread, not the per-frame tempo atomic.
                 self.pushed_maps = None;
+                self.pushed_auto = None;
                 // A fresh engine has nothing loaded, whatever was loaded in
                 // the one it replaces — forgetting that here is what asks the
                 // reconcile below to fill the bays again.
@@ -5022,6 +5034,32 @@ impl DesktopApp {
         if let Some(e) = self.recorder.engine.as_mut() {
             e.set_maps(want.clone());
             self.pushed_maps = Some(want);
+        }
+    }
+
+    /// The automation curves, on the same change-detected bargain.
+    #[cfg(feature = "recorder")]
+    fn push_automation(&mut self) {
+        let want = self.app.automation().clone();
+        if self.pushed_auto.as_ref() == Some(&want) {
+            return;
+        }
+        if let Some(e) = self.recorder.engine.as_mut() {
+            e.set_automation(want.clone());
+            self.pushed_auto = Some(want);
+        }
+    }
+
+    /// Which lanes the curves must leave alone, pushed every frame.
+    ///
+    /// Unlike the curves themselves this is one atomic word, so it costs a
+    /// store and must NOT be change-detected: it has to take effect on the
+    /// next block or a fader being written fights the curve under the hand.
+    #[cfg(feature = "recorder")]
+    fn push_auto_suspend(&mut self) {
+        let mask = self.app.auto_suspend_mask();
+        if let Some(e) = self.recorder.engine.as_ref() {
+            e.set_auto_suspend(mask);
         }
     }
 
@@ -5682,6 +5720,7 @@ impl DesktopApp {
             painted_once: false,
             reader_seen: false,
             pushed_maps: None,
+            pushed_auto: None,
             midi_lane,
             app,
             #[cfg(feature = "recorder")]
