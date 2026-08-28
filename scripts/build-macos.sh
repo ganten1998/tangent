@@ -197,6 +197,15 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundlePackageType</key>       <string>APPL</string>
     <key>CFBundleShortVersionString</key> <string>${VERSION_NUM}</string>
     <key>CFBundleVersion</key>           <string>${VERSION_NUM}</string>
+    <!-- **The version with its pre-release suffix intact.** The two keys
+         above cannot carry it: Apple requires dotted integers there, so a
+         beta is stamped 5.0.0 and Finder, Get Info and anything else reading
+         the plist calls a beta a final release. The app itself has always
+         been honest — it prints CARGO_PKG_VERSION — but the INSTALLER read
+         the plist and announced "is 5.0.0" over a beta.9 build, which is how
+         a tester ends up filing bugs against a version that does not exist
+         yet. Private key, ignored by macOS, read by install-macos.sh. -->
+    <key>TangentVersion</key>            <string>${VERSION}</string>
     <key>LSMinimumSystemVersion</key>    <string>11.0</string>
     <key>NSHighResolutionCapable</key>   <true/>
     <key>LSApplicationCategoryType</key> <string>public.app-category.music</string>
