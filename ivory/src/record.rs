@@ -1318,6 +1318,16 @@ impl Session {
         self.take.as_ref().map(|t| t.dir())
     }
 
+    /// Where the take being recorded writes its VIDEO, while one is running.
+    ///
+    /// `{take name}.mp4`, beside the `.wav` and the `.mid` and named the same
+    /// way — see `Take::media`. Asked of the take rather than joined onto
+    /// `take_dir` by the caller, so there is one place that knows the name.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn take_video(&self) -> Option<std::path::PathBuf> {
+        self.take.as_ref().map(ivory_record::take::Take::video)
+    }
+
     pub fn elapsed(&self) -> f64 {
         match (self.state.is_writing(), self.started_instant) {
             (true, Some(at)) => at.elapsed().as_secs_f64(),
@@ -3218,7 +3228,7 @@ mod tests {
                 frames_encoder_dropped: 5,
                 frames_padded: 2,
             },
-            "take.mp4",
+            "2026-08-15_143207_filmed.mp4",
         );
 
         let after: serde_json::Value =
@@ -3237,7 +3247,7 @@ mod tests {
                 .as_array()
                 .expect("files is a list")
                 .iter()
-                .any(|f| f == "take.mp4"),
+                .any(|f| f == "2026-08-15_143207_filmed.mp4"),
             "the video is not in files: {after:#}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -3271,7 +3281,7 @@ mod tests {
                 frames_encoder_dropped: 0,
                 frames_padded: 0,
             },
-            "take.mp4",
+            "2026-08-15_143207_second.mp4",
         );
         s.stop();
         let second = s.last_summary().expect("summary").folder.clone();

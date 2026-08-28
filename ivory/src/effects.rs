@@ -676,10 +676,28 @@ impl ReverbMode {
     }
 
     /// The input diffusers' coefficients.
+    ///
+    /// **Both modes use the plate's.** `Smooth` briefly had its own, higher
+    /// set on the reasoning that denser diffusion "does the work the chirp
+    /// was doing". Measured, it does the opposite at the front: a Schroeder
+    /// allpass emits `-g * x` immediately, so raising g from 0.750 to 0.820
+    /// lifts the chain's direct feed-through by nearly five decibels while
+    /// its first delayed echo falls relative to that spike. It made the
+    /// leading click LOUDER. The density comes from [`SMOOTH_IN_AP`] instead.
     pub fn diffusion(self) -> [f32; 4] {
+        PLATE_IN_G
+    }
+
+    /// The extra input diffusers this mode runs, if any.
+    pub fn extra_diffusion(self) -> bool {
+        matches!(self, ReverbMode::Smooth)
+    }
+
+    /// What the tap sum is scaled by, given how many taps this mode reads.
+    pub fn tap_gain(self) -> f32 {
         match self {
-            ReverbMode::Plate => PLATE_IN_G,
-            ReverbMode::Smooth => PLATE_IN_G_SMOOTH,
+            ReverbMode::Plate => PLATE_TAP_GAIN,
+            ReverbMode::Smooth => PLATE_TAP_GAIN * SMOOTH_TAP_TRIM,
         }
     }
 }
@@ -691,13 +709,6 @@ impl ReverbMode {
 /// plate. Not 1.0 at the top, because a reverb with no HF absorption at all
 /// sounds like a bug rather than like a room; every real space loses treble.
 const SMOOTH_TONE_RATIO: (f32, f32) = (0.55, 0.97);
-
-/// [`ReverbMode::Smooth`]'s input diffusers, against the plate's.
-///
-/// Higher, because with the chirp skipped the early arrivals are countable
-/// and the diffusers have to smear them on their own. Still short of the buzz
-/// the plate comment warns about at one.
-const PLATE_IN_G_SMOOTH: [f32; 4] = [0.820, 0.820, 0.760, 0.760];
 
 /// One trip round the tank, in samples at [`DESIGN_RATE`]. Kept as a constant
 /// rather than summed at runtime so [`Plate::feedback`] is a closed form.
@@ -741,6 +752,48 @@ const PLATE_TAP_SIGN: [f32; 7] = [1.0, 1.0, -1.0, 1.0, -1.0, -1.0, -1.0];
 /// The taps are near enough decorrelated that the sum grows as the root of
 /// their count, so this is 1/sqrt(7).
 const PLATE_TAP_GAIN: f32 = 0.378;
+
+/// **Four more input diffusers, for the SMOOTH mode only.**
+///
+/// Prime, mutually prime with [`PLATE_IN_AP`], and all under 3.6 ms so they
+/// thicken the front without pushing the peak back. They are what actually
+/// makes the smooth mode smooth: measured on the wet impulse response, the
+/// crest factor of the first 5 ms falls from 14.6 to 10.2 with these alone,
+/// and to 3.5 with the short taps below — a dense response reads about 3, a
+/// sparse burst reads high.
+const SMOOTH_IN_AP: [usize; 4] = [43, 67, 103, 157];
+
+/// Their coefficient. One value, unlike the plate's four: these exist to
+/// fill gaps rather than to voice anything.
+const SMOOTH_IN_G: f32 = 0.70;
+
+/// **Three short reads on `d1`, for SMOOTH — the ones that close the hole.**
+///
+/// The tank's `ap2` and `d2` sit downstream of `d1.push`, so they hold
+/// nothing until a whole 661-sample line has gone by: four of the seven taps
+/// cannot fire for the first 15 ms. The only paths shorter than a lap are the
+/// three that read `d1`, at 3.40, 5.31 and 9.57 ms — so every hit opened with
+/// **3.4 ms of exact silence**, then three isolated copies of the diffuser
+/// burst, then a ten-decibel swell over 25 ms. That is the "hole followed by
+/// a blob" [`PLATE_TAPS`] describes; the seven-tap pass shortened it from 15
+/// ms to 3.4 and did not close it.
+///
+/// Far shorter than the 617/661 lines they read, so the "never wrap into a
+/// second lap" rule [`PLATE_TAPS`] states still holds.
+const SMOOTH_TAPS: [usize; 3] = [31, 79, 53];
+
+/// Their signs, and their branches: own, other, other. Kept asymmetric on
+/// purpose — `reverb_makes_a_tail_that_dies` measures that the two channels
+/// differ, and three symmetric reads would narrow that.
+const SMOOTH_TAP_SIGN: [f32; 3] = [1.0, -1.0, 1.0];
+
+/// What ten decorrelated taps want against seven: `sqrt(7/10)`.
+///
+/// Without it the smooth mode arrives about a decibel and a half hot, which
+/// would move the reverb send balance under every project that already
+/// exists — and `size_does_not_change_how_loud_the_reverb_is` is what would
+/// notice.
+const SMOOTH_TAP_TRIM: f32 = 0.837;
 
 /// The tank diffusers' coefficients.
 const PLATE_TANK_G1: f32 = 0.70;
@@ -961,6 +1014,14 @@ struct Plate {
     /// tank is not asked to diffuse something the plate could never carry.
     bandwidth: [Pole; 2],
     in_ap: [[Diffuser; 4]; 2],
+    /// The smooth mode's extra input diffusers. **Allocated always, run only
+    /// in that mode** — the audio thread may not allocate, so switching modes
+    /// has to be a branch and never a `Vec`. Eight short lines, about a
+    /// kilobyte in total. See [`SMOOTH_IN_AP`].
+    smooth_ap: [[Diffuser; 4]; 2],
+    /// [`SMOOTH_TAPS`] at this rate, per channel, clamped inside the lines
+    /// they read — the same treatment `taps` gets.
+    smooth_taps: [[usize; 3]; 2],
     dispersion: [Dispersion; 2],
     ap1: [Diffuser; 2],
     d1: [Line; 2],
@@ -990,6 +1051,12 @@ impl Plate {
             bandwidth: [Pole::default(); 2],
             in_ap: std::array::from_fn(|_| {
                 std::array::from_fn(|i| Diffuser::new(scale(PLATE_IN_AP[i]) as usize))
+            }),
+            // Through the same `scale` closure as every other length here,
+            // or 96 kHz drifts — `the_room_is_the_same_size_at_every_sample_rate`
+            // is what would catch it.
+            smooth_ap: std::array::from_fn(|_| {
+                std::array::from_fn(|i| Diffuser::new(scale(SMOOTH_IN_AP[i]) as usize))
             }),
             dispersion: [Dispersion::new(), Dispersion::new()],
             // The swept pair are allocated for their base length plus the
@@ -1022,6 +1089,16 @@ impl Plate {
                     // clamp is for a rate low enough to round a short line
                     // down onto its own tap.
                     let want = (PLATE_TAPS[i] as f32 * sr / DESIGN_RATE) as usize;
+                    want.clamp(1, (host[i] as usize).saturating_sub(1).max(1))
+                })
+            }),
+            // The short reads, on the same two `d1` lines and through the
+            // same scale-and-clamp. See [`SMOOTH_TAPS`].
+            smooth_taps: std::array::from_fn(|ch| {
+                let o = ch ^ 1;
+                let host = [scale(PLATE_D1[ch]), scale(PLATE_D1[o]), scale(PLATE_D1[o])];
+                std::array::from_fn(|i| {
+                    let want = (SMOOTH_TAPS[i] as f32 * sr / DESIGN_RATE) as usize;
                     want.clamp(1, (host[i] as usize).saturating_sub(1).max(1))
                 })
             }),
@@ -1096,6 +1173,15 @@ impl Plate {
             for (ap, g) in self.in_ap[ch].iter_mut().zip(p.reverb_mode.diffusion()) {
                 v[ch] = ap.process(v[ch], g);
             }
+            // **Four more, on the smooth mode.** Skipped rather than turned
+            // down, exactly as the dispersion below is skipped: this is the
+            // change that makes the mode a different reverb instead of the
+            // same one with different damping.
+            if p.reverb_mode.extra_diffusion() {
+                for ap in &mut self.smooth_ap[ch] {
+                    v[ch] = ap.process(v[ch], SMOOTH_IN_G);
+                }
+            }
             // **The chirp, applied where it is heard.** In the input path the
             // very first arrival already carries it, which is the attack;
             // inside the tank it would only accumulate, and the plate's
@@ -1160,14 +1246,26 @@ impl Plate {
             let o = ch ^ 1;
             let t = self.taps[ch];
             let sg = PLATE_TAP_SIGN;
-            out[ch] = (sg[0] * self.d1[ch].tap(t[0])
+            let mut sum = sg[0] * self.d1[ch].tap(t[0])
                 + sg[1] * self.d1[ch].tap(t[1])
                 + sg[2] * self.ap2[o].tap(t[2])
                 + sg[3] * self.d2[o].tap(t[3])
                 + sg[4] * self.d1[o].tap(t[4])
                 + sg[5] * self.ap2[ch].tap(t[5])
-                + sg[6] * self.d2[ch].tap(t[6]))
-                * PLATE_TAP_GAIN;
+                + sg[6] * self.d2[ch].tap(t[6]);
+            // **Three more, very short, on the smooth mode** — the ones that
+            // close the 3.4 ms of silence every hit used to open with. They
+            // read `d1` because `d1` is the only line holding anything before
+            // a full lap has gone by; see [`SMOOTH_TAPS`]. A tap only reads,
+            // so this costs no state and no allocation.
+            if p.reverb_mode.extra_diffusion() {
+                let st = self.smooth_taps[ch];
+                let ss = SMOOTH_TAP_SIGN;
+                sum += ss[0] * self.d1[ch].tap(st[0])
+                    + ss[1] * self.d1[o].tap(st[1])
+                    + ss[2] * self.d1[o].tap(st[2]);
+            }
+            out[ch] = sum * p.reverb_mode.tap_gain();
         }
         // **Width is a fold, not a delay length.** The two branches already
         // run different lengths, so the pair decorrelates on its own; this
@@ -1189,6 +1287,13 @@ impl Plate {
         self.pre_at = 0;
         for ch in 0..2 {
             self.bandwidth[ch].clear();
+            // **The smooth mode's extra stages flush too.** They hold signal
+            // whether or not the mode is on, and a stage that kept its
+            // contents across a flush would leak the last take's tail into
+            // the next one the moment somebody switched modes.
+            for ap in &mut self.smooth_ap[ch] {
+                ap.clear();
+            }
             for ap in &mut self.in_ap[ch] {
                 ap.clear();
             }
@@ -5089,6 +5194,98 @@ mod tests {
             }
         }
         assert!(!ReverbMode::Plate.label().starts_with('*'));
+    }
+
+    /// **The smooth mode opens DENSE — no hole, no click.**
+    ///
+    /// The owner's report was "smooth mode changes nothing, still slapbacks",
+    /// and he was right: the mode's first cut moved three scalars — the
+    /// dispersion, the tone ratio and the diffuser coefficients — and not one
+    /// of them touches the ONSET, which is where the slapback lives.
+    ///
+    /// Measured on the wet impulse response, every hit used to open with 3.4
+    /// ms of exact silence (the tank's `ap2`/`d2` hold nothing until a whole
+    /// `d1` line has gone by, so four of the seven taps cannot fire), then
+    /// three isolated copies of the diffuser burst, then a swell. Skipping
+    /// the dispersion made it WORSE — the chirp was the only thing filling
+    /// the gaps between those three taps, so removing it exposed two clean
+    /// clicks.
+    ///
+    /// This measures the shape rather than the mechanism: a CREST FACTOR
+    /// (peak over RMS) per 5 ms window, which reads about 3 for a dense
+    /// response and runs to 15 for a sparse burst, plus the envelope of the
+    /// first few milliseconds, which must not be silence.
+    #[test]
+    fn the_smooth_mode_opens_without_a_hole_or_a_click() {
+        let wet = |mode: ReverbMode| -> Vec<f32> {
+            let p = Params {
+                reverb_mode: mode,
+                reverb_size: 0.34,
+                reverb_damp: 0.55,
+                reverb_width: 0.0,
+                plate_predelay: 0.0,
+                ..Params::default()
+            };
+            let mut fx = Effects::new(SR);
+            let frames = 4_096;
+            let mut out = Vec::new();
+            for block in 0..6 {
+                let mut buf = vec![0.0_f32; frames * 2];
+                if block == 0 {
+                    buf[0] = 1.0;
+                    buf[1] = 1.0;
+                }
+                fx.process(&mut buf, frames, 2, sends(1.0, 0.0, 0.0), &p, 120.0);
+                out.extend(buf.chunks_exact(2).map(|f| f[0]));
+            }
+            out
+        };
+        let w = wet(ReverbMode::Smooth);
+        let ms = (SR / 1000.0) as usize;
+
+        // **No HOLE.** The impulse itself is in millisecond zero, so the
+        // wet response is read from millisecond one. What a hole looks like
+        // is a window that falls to nothing while its neighbours are loud —
+        // before this fix the opening measured `0.00 0.00 0.00 0.52 0.00`,
+        // three milliseconds of exact silence and then a lone spike. A
+        // reverb building up is quiet early and that is fine; it must not
+        // stop.
+        let env: Vec<f32> = (1..40)
+            .map(|i| {
+                let seg = &w[i * ms..(i + 1) * ms];
+                (seg.iter().map(|v| v * v).sum::<f32>() / seg.len() as f32).sqrt()
+            })
+            .collect();
+        assert!(env[0] > 0.0, "the smooth reverb is silent a millisecond in");
+        for (i, pair) in env.windows(2).take(10).enumerate() {
+            assert!(
+                pair[1] >= pair[0] * 0.3,
+                "the smooth mode falls into a hole at millisecond {}: {:.2e} after {:.2e}",
+                i + 2,
+                pair[1],
+                pair[0]
+            );
+        }
+
+        // **And no isolated CLICK.** A crest factor — peak over RMS — reads
+        // about three for a dense response and runs past fifteen for a burst
+        // with silence around it, which is what a slapback is. Window zero
+        // holds the dry impulse, so the reading starts after it.
+        let win = (SR * 0.005) as usize;
+        for k in 1..6 {
+            let seg = &w[k * win..(k + 1) * win];
+            let rms =
+                (seg.iter().map(|v| v * v).sum::<f32>() / seg.len() as f32).sqrt();
+            let top = seg.iter().fold(0.0_f32, |m, v| m.max(v.abs()));
+            if rms <= 0.0 {
+                continue;
+            }
+            assert!(
+                top / rms < 6.0,
+                "the smooth mode's window {k} is a spike in silence (crest {:.1})",
+                top / rms
+            );
+        }
     }
 
     /// **Every mode of both machines, bounded.**

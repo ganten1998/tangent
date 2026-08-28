@@ -4299,6 +4299,16 @@ impl Settings {
         Self::chosen(&self.export_dir).unwrap_or_else(|| self.media_root().join("Exports"))
     }
 
+    /// **The three folders Tangent keeps things in**, in the order the cog
+    /// card lists them: takes, projects, exports.
+    ///
+    /// Named in one place because the host creates them at launch and three
+    /// SHOW buttons open them, and a fourth caller that forgot one of the
+    /// three is exactly how the buttons came to open onto nothing.
+    pub fn media_roots(&self) -> [PathBuf; 3] {
+        [self.record_root(), self.project_root(), self.export_root()]
+    }
+
     /// Everything Tangent writes for a person, under one roof.
     ///
     /// **`Documents/Tangent Media`, with `Takes`, `Projects` and `Exports`

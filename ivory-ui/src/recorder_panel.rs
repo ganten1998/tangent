@@ -132,7 +132,7 @@ pub fn band_height(w: f32) -> f32 {
 /// The chord strip's red, so the app has one red rather than two that nearly
 /// match. It reads against both the cream and the near-black background, which
 /// a darker red does not.
-const REC_RED: Color32 = Color32::from_rgb(0xE8, 0x3A, 0x4E);
+pub const REC_RED: Color32 = Color32::from_rgb(0xE8, 0x3A, 0x4E);
 
 struct Palette {
     /// Also the letterbox bars. See [`fit_preview`].
@@ -505,6 +505,64 @@ pub fn selection_rim(under: Color32) -> Color32 {
         out = toward(out, ink, 0.12);
     }
     out
+}
+
+/// **A LIT colour that can be seen on its ground AND written on.**
+///
+/// The theme names one `key_active` and it is drawn on grounds at opposite
+/// ends of the luminance axis: the piano's keys, the theory view's page in
+/// light mode, the same page in dark. Mono is where that breaks — its
+/// `#f0f0f0` measures 16.2:1 on the dark page and **1.25:1** on the light
+/// one, which is a note you cannot see.
+///
+/// And it cannot be fixed in the theme table. `key_active` must clear 3.0:1
+/// against the band (`every_factory_theme_is_readable_on_its_own_background`),
+/// which forces luminance at or above 0.236; clearing 3.0:1 against Mono's
+/// light page forces it at or below 0.196. Those windows do not overlap for
+/// ANY colour, because it is an argument about luminance and not about hue.
+/// So the value stays the theme's and the SURFACE it is drawn as is derived,
+/// which is what every neighbour in these palettes already does.
+///
+/// Two constraints, and the second is load-bearing: the disc has to be
+/// visible on the page, and the note name printed ON the disc has to be
+/// readable. Deriving against the ground alone drops `lit_text` under 4.5:1
+/// on eight theme-and-mode pairs. Because the mid greys are the documented
+/// dead zone — where neither ink clears — the walk has to be allowed to run
+/// straight through them rather than stopping in one.
+pub fn lit_on(c: Color32, ground: Color32) -> Color32 {
+    /// A disc is a graphic, so the non-text threshold applies to the disc.
+    const ON_GROUND: f32 = 3.0;
+    /// The name printed on it is text, so the text threshold applies to that.
+    const ON_ITSELF: f32 = 4.5;
+    let ok = |x: Color32| {
+        let ink = if wants_light_ink(x) { INK_LIGHT } else { INK_DARK };
+        contrast_ratio(x, ground) >= ON_GROUND && contrast_ratio(x, ink) >= ON_ITSELF
+    };
+    if ok(c) {
+        return c;
+    }
+    // Away from the ground: toward black on a pale page, toward white on a
+    // dark one — the direction rule `distinct_surface_at` uses.
+    let away = if wants_light_ink(ground) {
+        Color32::WHITE
+    } else {
+        Color32::BLACK
+    };
+    let mut out = c;
+    for step in 1u8..=40 {
+        out = toward(c, away, f32::from(step) * 0.025_f32);
+        if ok(out) {
+            return out;
+        }
+    }
+    // Nothing on the line satisfied both. Keep the ground's own ink, which is
+    // guaranteed to clear the page even if it is no longer the theme's hue —
+    // a note you can see in the wrong colour beats one you cannot.
+    if wants_light_ink(ground) {
+        INK_LIGHT
+    } else {
+        INK_DARK
+    }
 }
 
 /// [`distinct_surface`] with the floor named by the caller.
@@ -1806,6 +1864,61 @@ impl Layout {
         }
         self.fill_vari(cell);
         self.fill_vari_label();
+        self.centre_lufs_between_the_word_and_the_master();
+    }
+
+    /// **Put the loudness meter midway between the PITCH CONT text and the
+    /// master's own numbers.**
+    ///
+    /// It was spaced one cluster-gap off the master and the dial was spaced
+    /// off IT, which is even by rectangle and not by eye: the word is wider
+    /// than the circle under it, so the space to the word's right was smaller
+    /// than the space to the master, and the meter sat left of where it looks
+    /// like it belongs. Measured from the WORD's right edge, which is the
+    /// last ink on that side.
+    ///
+    /// Run after the dial is placed, because it depends on where the dial
+    /// ended up: the dial is trimmed against the knob group and cannot be
+    /// predicted from a fraction.
+    fn centre_lufs_between_the_word_and_the_master(&mut self) {
+        if !self.lufs_bar.is_positive() || !self.master_bars.is_positive() {
+            return;
+        }
+        let strip =
+            (knob_face(self.vari).map_or(0.0, |k| k.label_h) * 2.0).max(KNOB_LABEL.1);
+        // The left bound: the word if there is one, else the dial's own face.
+        let left = match vari_word_ink(self.vari, self.vari_label, strip) {
+            Some(w) => w.right(),
+            None => knob_face(self.vari).map_or(self.vari.right(), |f| f.face.right()),
+        };
+        let step = self.master_bars.height() / 9.0;
+        let size = fit_text(
+            Rect::from_min_size(
+                self.master_scale[0].min,
+                Vec2::new(self.master_scale[0].width() - 3.0, step),
+            ),
+            MASTER_SCALE_FIT,
+            step * 0.86,
+        );
+        let right = (self.master_scale[0].right() - 2.0 - master_scale_ink_w(size))
+            .max(self.master_scale[0].left());
+        let cluster = self.lufs_ticks.right() - self.lufs_bar.left();
+        if !(right - left).is_finite() || right - left <= cluster {
+            return;
+        }
+        let shift = left + (right - left - cluster) * 0.5 - self.lufs_bar.left();
+        if !shift.is_finite() || shift.abs() < 0.5 {
+            return;
+        }
+        for r in [
+            &mut self.lufs_bar,
+            &mut self.lufs_ticks,
+            &mut self.lufs_readout,
+        ] {
+            if r.is_positive() {
+                *r = r.translate(Vec2::new(shift, 0.0));
+            }
+        }
     }
 
     /// **The word's own strip, reaching into the air either side of the dial.**
@@ -2108,6 +2221,13 @@ pub enum Hit {
     /// The AUDIO tier's door to the plugin-folder picker — the menu's
     /// "Add a Folder...", one click from the cog.
     PluginFolders,
+    /// Scan the plugin folders again, without adding one.
+    ///
+    /// Its own control because the two are different questions: a folder is
+    /// added once and a rescan is wanted every time a plugin is installed.
+    /// The menu has carried a "Rescan for Plugins" row all along; the card
+    /// carried no way to do it at all.
+    RescanPlugins,
     /// The cog's STREAM door: the ReaStream send settings, in the AUDIO tier
     /// by the owner's word ("move it to the settings cog in audio section").
     StreamToObs,
@@ -2302,6 +2422,7 @@ impl Hit {
             Hit::CloseSetup => "Done",
             Hit::ShowAudioStatus => "Setup: the audio system, devices, rate and buffer",
             Hit::PluginFolders => "Add a VST3 folder - Tangent rescans on the pick",
+            Hit::RescanPlugins => "Look through the plugin folders again",
             Hit::StreamToObs => "Stream the master out to OBS over ReaStream",
             Hit::ToggleCountInInTake => "Record the count-in into the take",
             Hit::ToggleHideElapsed => "Hide the elapsed time",
@@ -2863,6 +2984,7 @@ fn name_for(
             Hit::NameField => Node::readout(id("name"), r, "Take name", view.take_name.to_owned()),
             Hit::CloseSetup => Node::button(id("closesetup"), r, "Close the take settings"),
             Hit::PluginFolders => Node::button(id("pluginfolders"), r, "Add a plugin folder"),
+            Hit::RescanPlugins => Node::button(id("pluginrescan"), r, "Rescan for plugins"),
             Hit::StreamToObs => Node::button(id("obs"), r, "Stream to OBS"),
             Hit::ShowAudioStatus => Node::button(id("audiostatus"), r, "Audio status"),
             // **The one control on the band a screen reader most needs to be
@@ -3066,18 +3188,13 @@ pub fn draw(painter: &Painter, rect: Rect, view: &RecorderView<'_>, s: &Settings
         }
     }
 
-    if view.state.is_active() {
-        // A STEADY border, and a steady dot up in the transport. Never
-        // blinking: a blinking indicator measurably degrades performance and
-        // is the most-cited psychological complaint in the piano forums, which
-        // is also why this band owns no animation state at all.
-        painter.rect_stroke(
-            rect.shrink(1.5),
-            0.0,
-            Stroke::new(3.0_f32, p.rec),
-            StrokeKind::Middle,
-        );
-    }
+    // **The recording border is NOT here any more.** It used to ring this
+    // band, which said the wrong thing twice: the take is the WINDOW, so a
+    // border round one band does not mean "recording"; and this function is
+    // the same one the compositor calls, so the border was burned into every
+    // take. It rings the window now, from `IvoryApp::paint`, which the
+    // compositor never calls — see the comment there. The steady dot in
+    // `draw_capture` stays: it is the transport's own light.
 }
 
 /// A control's chrome: a filled box with a hairline, so a thing you can click
@@ -4785,6 +4902,49 @@ fn tempo_text(bpm: f64) -> String {
 }
 
 
+/// **Rescan: a circular arrow.**
+///
+/// Drawn rather than set, like the cog beside it — this crate has no icon
+/// font and a glyph from the text font would be the only one on the card.
+/// An arc most of the way round with a head on the leading end, which is the
+/// sign for "do that again" everywhere; the gap in the arc is what stops it
+/// reading as a plain ring.
+fn draw_resync(painter: &Painter, r: Rect, p: &Palette) {
+    if !r.is_positive() {
+        return;
+    }
+    let c = r.center();
+    let rad = r.width().min(r.height()) * 0.5 * 0.82;
+    // Same bail as the cog: under this the arc and its head merge and it is a
+    // blot, which reads as a fault rather than as a small icon.
+    if rad < 4.0 {
+        return;
+    }
+    let w = (rad * 0.26).max(1.0);
+    let stroke = Stroke::new(w, p.ink);
+    // Three quarters of a turn, opening at the top right where the head goes.
+    const START: f32 = -std::f32::consts::FRAC_PI_2 + 0.55;
+    const SWEEP: f32 = std::f32::consts::TAU * 0.78;
+    const STEPS: usize = 24;
+    let at = |a: f32| c + Vec2::new(a.cos(), a.sin()) * rad;
+    let pts: Vec<Pos2> = (0..=STEPS)
+        .map(|i| at(START + SWEEP * i as f32 / STEPS as f32))
+        .collect();
+    painter.add(egui::Shape::line(pts, stroke));
+    // The head, on the START end, pointing the way the arc runs — back
+    // towards the gap. A filled triangle, because two more strokes at this
+    // size would not resolve.
+    let tip = at(START - 0.30);
+    let base = at(START + 0.22);
+    let out = (base - c).normalized();
+    let head = rad * 0.46;
+    painter.add(egui::Shape::convex_polygon(
+        vec![tip, base + out * head * 0.5, base - out * head * 0.5],
+        p.ink,
+        Stroke::NONE,
+    ));
+}
+
 /// The settings cog: the way into the take-settings popup.
 ///
 /// **Solid, with stubby teeth.** The first cut drew a thin ring and ran eight
@@ -5206,6 +5366,38 @@ fn draw_varispeed(
     }
 }
 
+/// How much taller a line of type is than the size it was asked for.
+///
+/// Measured against the one case that showed it: at the sizes a fullscreen
+/// band gives `PITCH CONT`, the descenders reached about a fifth of the em
+/// below the baseline and landed on the dial. A little clearance on top of
+/// that is what keeps the two apart at every size without moving the word
+/// somewhere it looks lost.
+const WORD_LINE: f32 = 1.22;
+
+/// **Where `PITCH CONT` actually prints**, ink and all.
+///
+/// The word is centred over the DIAL and may be wider than the dial's cell —
+/// it is allowed the air either side (see `Layout::vari_label`) — so its right
+/// edge is further right than the circle's. That edge is what the loudness
+/// meter is centred against, because the eye measures a gap from the last
+/// thing it can see and the last thing it can see here is a letter.
+fn vari_word_ink(cell: Rect, word: Rect, strip: f32) -> Option<Rect> {
+    if !cell.is_positive() || !word.is_positive() {
+        return None;
+    }
+    let size = vari_word_size(word, strip, KNOB_LABEL.1);
+    if size < MIN_TEXT {
+        return None;
+    }
+    let half = PITCH_LABEL.chars().count() as f32 * ADV * size * 0.5;
+    let mid = cell.center().x;
+    Some(Rect::from_min_max(
+        Pos2::new(mid - half, cell.top()),
+        Pos2::new(mid + half, cell.top() + size),
+    ))
+}
+
 /// The word over the pitch dial. The owner's exact wording.
 ///
 /// **Above it, and the only one.** Every other dial in this band prints its
@@ -5247,7 +5439,13 @@ fn vari_face(cell: Rect, word: Rect) -> Option<KnobFace> {
     // What the word actually takes, not the strip it was allotted.
     let strip = (base.label_h * 2.0).max(KNOB_LABEL.1);
     let word = if word.is_positive() { word } else { cell };
-    let label_h = vari_word_size(word, strip, KNOB_LABEL.1) + KNOB_TICK_ROOM;
+    // **The word's LINE, not its point size.** A font's glyphs run taller
+    // than the number they are asked for — ascenders and descenders live
+    // outside the em — so reserving exactly `size` put the bottom of the
+    // letters onto the top of the dial. Only visible at the largest sizes,
+    // which is why it showed up in fullscreen and nowhere else.
+    let label_h =
+        vari_word_size(word, strip, KNOB_LABEL.1) * WORD_LINE + KNOB_TICK_ROOM;
     // **The same foot every other dial's cell keeps.**
     //
     // This ran to `cell.bottom()`, which put the circle lower than the region
@@ -6505,19 +6703,34 @@ mod tests {
             let master_ink_left = (l.master_scale[0].right() - 2.0
                 - master_scale_ink_w(size))
             .max(l.master_scale[0].left());
-            let gaps = [
-                face.face.left() - knobs.right(),
-                l.lufs_bar.left() - face.face.right(),
+            // **The loudness meter is CENTRED between the PITCH CONT text
+            // and the master's numbers**, and the other two gaps are equal.
+            //
+            // The rule used to be three equal gaps measured from the dial's
+            // FACE. The owner's correction: the word is wider than the circle
+            // under it and the word is the last ink on that side, so the space
+            // the eye judges runs from the WORD. Measured from there, three
+            // equal gaps put the meter left of centre.
+            let strip =
+                (knob_face(l.vari).map_or(0.0, |k| k.label_h) * 2.0).max(KNOB_LABEL.1);
+            let word_right = vari_word_ink(l.vari, l.vari_label, strip)
+                .map_or(face.face.right(), |r| r.right());
+            let (before, after) = (
+                l.lufs_bar.left() - word_right,
                 master_ink_left - l.lufs_ticks.right(),
-            ];
-            for g in gaps {
-                assert!(g > 0.0, "two clusters overlap at {w}: {gaps:?}");
-            }
-            let lo = gaps.iter().copied().fold(f32::INFINITY, f32::min);
-            let hi = gaps.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            );
             assert!(
-                hi - lo <= hi * 0.25,
-                "the gaps run {lo:.1} to {hi:.1} at {w}: {gaps:?}"
+                before > 0.0 && after > 0.0,
+                "the loudness meter touches a neighbour at {w}: {before:.1} / {after:.1}"
+            );
+            assert!(
+                (before - after).abs() <= 1.0,
+                "the loudness meter is not centred at {w}: {before:.1} before, {after:.1} after"
+            );
+            // And the dial still sits one clear gap off the knob group.
+            assert!(
+                face.face.left() - knobs.right() > 0.0,
+                "the pitch dial runs into the knobs at {w}"
             );
 
             // **The loudness meter is a fixed share of the master meter's
@@ -6590,9 +6803,26 @@ mod tests {
                 l.vari.right() <= ladder.left(),
                 "the pitch dial runs into the ladder at {w}"
             );
+            // **Against the master's INK, not its cell.** Its dB numbers are
+            // right-aligned inside that cell, so its left third is empty air —
+            // and the loudness meter is now centred in the space between the
+            // PITCH CONT text and where those numbers actually start, which
+            // puts its own cell a hair into that emptiness. What must not
+            // happen is the two sets of ink touching.
+            let step = l.master_bars.height() / 9.0;
+            let size = fit_text(
+                Rect::from_min_size(
+                    l.master_scale[0].min,
+                    Vec2::new(l.master_scale[0].width() - 3.0, step),
+                ),
+                MASTER_SCALE_FIT,
+                step * 0.86,
+            );
+            let master_ink = (l.master_scale[0].right() - 2.0 - master_scale_ink_w(size))
+                .max(l.master_scale[0].left());
             assert!(
-                ladder.right() <= l.master_scale[0].left(),
-                "the ladder runs into the master at {w}"
+                ladder.right() <= master_ink,
+                "the ladder runs into the master's numbers at {w}"
             );
 
             // **Nothing is to the right of the master.** Measured against
@@ -6779,15 +7009,54 @@ mod tests {
         }
     }
 
-    /// **AUDIO above TAKE**, the owner's order: the tier headings exist,
-    /// the audio row sits under its heading, and everything about the take
-    /// sits under the TAKE heading — below all of the audio tier.
+    /// **The PLUGINS row still reads after the resync button took its right
+    /// end**, at every window size the card is drawn at.
+    ///
+    /// `label_text` shrinks its words to fit and DRAWS NOTHING at all below
+    /// `MIN_TEXT`, so taking eight percent of a row's width is not a free
+    /// change: it moves the size at which the row stops existing. The row
+    /// carries the longest caption-plus-value pair on the card, which makes
+    /// it the one that hits the floor first.
     #[test]
-    fn the_settings_tiers_read_audio_then_take() {
+    fn the_plugins_row_still_has_room_for_its_words() {
+        for w in [900.0_f32, 1280.0, 1920.0, 2560.0] {
+            let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, w * 0.56));
+            let anchor = Rect::from_min_size(Pos2::new(40.0, w * 0.3), Vec2::new(20.0, 20.0));
+            let l = SetupLayout::new(screen, anchor);
+            let r = l.plugin_folders;
+            let inset = label_inset(r);
+            let inner = Rect::from_min_max(
+                Pos2::new(r.left() + inset, r.top()),
+                Pos2::new(r.right() - inset, r.bottom()),
+            );
+            let size = fit_text(inner, "PLUGINS Add a folder...", inner.height() * 0.52);
+            assert!(
+                size >= MIN_TEXT,
+                "at {w}pt wide the PLUGINS row draws nothing ({size:.1}pt)"
+            );
+            // And the button beside it is a button, not a sliver.
+            assert!(
+                l.plugin_rescan.width() >= 8.0 && l.plugin_rescan.height() >= 8.0,
+                "at {w}pt wide the resync button is {:.1}x{:.1}",
+                l.plugin_rescan.width(),
+                l.plugin_rescan.height()
+            );
+        }
+    }
+
+    /// **AUDIO, then MEDIA, then TAKE** — the owner's order: the three tier
+    /// headings exist, each tier's rows sit under its own heading, and no
+    /// tier's rows reach into the next one.
+    #[test]
+    fn the_settings_tiers_read_audio_then_media_then_take() {
         let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0));
         let anchor = Rect::from_min_size(Pos2::new(40.0, 300.0), Vec2::new(20.0, 20.0));
         let l = SetupLayout::new(screen, anchor);
-        for (name, r) in [("AUDIO heading", l.audio_head), ("TAKE heading", l.take_head)] {
+        for (name, r) in [
+            ("AUDIO heading", l.audio_head),
+            ("MEDIA heading", l.project_head),
+            ("TAKE heading", l.take_head),
+        ] {
             assert!(r.is_positive(), "{name} has no band");
         }
         assert!(
@@ -6795,8 +7064,18 @@ mod tests {
             "the audio row is not under its heading"
         );
         assert!(
-            l.audio.bottom() <= l.take_head.top() && l.hear_input.bottom() <= l.take_head.top(),
-            "the AUDIO tier does not end before TAKE begins"
+            l.audio.bottom() <= l.project_head.top()
+                && l.hear_input.bottom() <= l.project_head.top(),
+            "the AUDIO tier does not end before MEDIA begins"
+        );
+        assert!(
+            l.project_head.bottom() <= l.proj_dest.top(),
+            "the media rows do not start under their heading"
+        );
+        assert!(
+            l.proj_dest.bottom() <= l.take_head.top()
+                && l.export_dest.bottom() <= l.take_head.top(),
+            "the MEDIA tier does not end before TAKE begins"
         );
         assert!(
             l.take_head.bottom() <= l.name.top(),
@@ -6818,6 +7097,7 @@ mod tests {
                 ("name", l.name),
                 ("project", l.project_row),
                 ("plugin folders", l.plugin_folders),
+                ("plugin rescan", l.plugin_rescan),
                 ("stream", l.stream_row),
                 ("audio count-in", l.audio_count_in),
                 ("audio sig", l.audio_sig),
@@ -9292,7 +9572,7 @@ const SETUP_ASPECT: f32 = 1.16;
 /// — the one that exists because a silent 44.1-against-48 mismatch makes takes
 /// drift — became unreachable from anywhere in the app. It is back, as the last
 /// row, and it is the one row here that is not about a take.
-/// (Kept as the unit the row pitch is derived from; the two section
+/// (Kept as the unit the row pitch is derived from; the three section
 /// headers take about half a row each on top of these.)
 const SETUP_ROWS: usize = 9;
 
@@ -9332,6 +9612,7 @@ struct SetupLayout {
     /// PROJECT dialog and the plugin folders — the owner's cog additions.
     project_row: Rect,
     plugin_folders: Rect,
+    plugin_rescan: Rect,
     /// The STREAM door, on the count-in row's free half — the ReaStream send
     /// settings, moved here from the Project menu by the owner's word.
     stream_row: Rect,
@@ -9373,6 +9654,7 @@ impl SetupLayout {
         audio_sig: Rect::NOTHING,
         project_row: Rect::NOTHING,
         plugin_folders: Rect::NOTHING,
+        plugin_rescan: Rect::NOTHING,
         stream_row: Rect::NOTHING,
     };
 
@@ -9422,7 +9704,7 @@ impl SetupLayout {
             Vec2::new(close_w, title.height() * 0.62),
         );
         let rows = Rect::from_min_max(Pos2::new(body.left(), title.bottom()), body.max);
-        // **Two tiers: AUDIO on top, TAKE below** — the owner's order. The
+        // **Three tiers: AUDIO, then MEDIA, then TAKE** — the owner's order. The
         // same seven rows of controls, walked by a cursor now, with a
         // half-height heading band opening each tier. A real gap between
         // rows: `Rect::contains` is inclusive at both edges, so two rows that
@@ -9444,6 +9726,16 @@ impl SetupLayout {
         let r6 = band(1.0);
         let ra2 = band(1.0);
         let ra3 = band(1.0);
+        // **MEDIA, second.** Where documents go and where exports land — two
+        // questions that used to have no answer here at all, because both
+        // folders were derived from the TAKE folder and moving one moved all
+        // three. It sits directly under AUDIO because it answers the same
+        // kind of question those rows do — where the app keeps things — and
+        // the owner reads the panel top-down as machine, then storage, then
+        // the take being made right now.
+        let project_head = band(HEAD);
+        let rp1 = band(1.0);
+        let rp2 = band(1.0);
         let take_head = band(HEAD);
         let r0 = band(1.0);
         let r1 = band(1.0);
@@ -9454,13 +9746,6 @@ impl SetupLayout {
         let r3 = band(1.0);
         let r4 = band(1.0);
         let r5 = band(1.0);
-        // **A third tier: PROJECT.** Where documents go and where exports
-        // land — two questions that used to have no answer here at all,
-        // because both folders were derived from the TAKE folder and moving
-        // one moved all three.
-        let project_head = band(HEAD);
-        let rp1 = band(1.0);
-        let rp2 = band(1.0);
         Self {
             panel,
             title,
@@ -9508,7 +9793,11 @@ impl SetupLayout {
             // A row of their own: crammed onto the count-in row's free
             // half they were the least legible thing on the card.
             project_row: slice_h(ra3, 0.00, 0.48),
-            plugin_folders: slice_h(ra3, 0.52, 1.00),
+            // Split the way the take's folder row is — a long answer and a
+            // small square button off its right end — because it is the same
+            // idiom: a thing, and one action on it.
+            plugin_folders: slice_h(ra3, 0.52, 0.90),
+            plugin_rescan: slice_h(ra3, 0.92, 1.00),
             // The AUDIO count-in row's free half, which the doors above
             // vacated for legibility; one door fits a half-row fine.
             stream_row: slice_h(ra2, 0.58, 1.00),
@@ -9523,12 +9812,13 @@ impl SetupLayout {
     }
 
     /// Every clickable region and what it means. The popup's [`Layout::targets`].
-    fn targets(&self) -> [(Rect, Hit); 20] {
+    fn targets(&self) -> [(Rect, Hit); 21] {
         [
             (self.audio_count_in, Hit::CycleCountIn),
             (self.audio_sig, Hit::EditTimeSignature),
             (self.project_row, Hit::ProjectMenu),
             (self.plugin_folders, Hit::PluginFolders),
+            (self.plugin_rescan, Hit::RescanPlugins),
             (self.stream_row, Hit::StreamToObs),
             (self.name, Hit::NameField),
             (self.close, Hit::CloseSetup),
@@ -10547,8 +10837,8 @@ pub fn draw_setup(
     // so AUDIO and TAKE read as sections rather than as two more rows.
     for (band, word) in [
         (l.audio_head, "AUDIO"),
+        (l.project_head, "MEDIA"),
         (l.take_head, "TAKE"),
-        (l.project_head, "PROJECT"),
     ] {
         if !band.is_positive() {
             continue;
@@ -10724,6 +11014,7 @@ pub fn draw_setup(
     // plugin folders — the menu's rows, reachable without the menu.
     labelled(painter, l.project_row, "PROJECT", "New / Open / Save...", p.ink, &p);
     labelled(painter, l.plugin_folders, "PLUGINS", "Add a folder...", p.ink, &p);
+    draw_resync(painter, l.plugin_rescan, &p);
     // A readout as well as a way in, like AUDIO SETUP: whether the master is
     // going out over ReaStream right now.
     labelled(
@@ -10873,6 +11164,32 @@ mod spacing_probe {
                 );
                 println!("    vari DRAG   y {:.1}..{:.1}", drag.top(), drag.bottom());
             }
+            {
+                let strip = (knob_face(l.vari).map_or(0.0, |k| k.label_h) * 2.0)
+                    .max(KNOB_LABEL.1);
+                if let Some(w) = vari_word_ink(l.vari, l.vari_label, strip) {
+                    let step = l.master_bars.height() / 9.0;
+                    let sz = fit_text(
+                        Rect::from_min_size(
+                            l.master_scale[0].min,
+                            Vec2::new(l.master_scale[0].width() - 3.0, step),
+                        ),
+                        MASTER_SCALE_FIT,
+                        step * 0.86,
+                    );
+                    let mink = (l.master_scale[0].right() - 2.0 - master_scale_ink_w(sz))
+                        .max(l.master_scale[0].left());
+                    println!(
+                        "    CENTRING word.right {:.1} | lufs {:.1}..{:.1} | master ink {:.1}  => left gap {:.1}, right gap {:.1}",
+                        w.right(),
+                        l.lufs_bar.left(),
+                        l.lufs_ticks.right(),
+                        mink,
+                        l.lufs_bar.left() - w.right(),
+                        mink - l.lufs_ticks.right(),
+                    );
+                }
+            }
             show("lufs_bar", l.lufs_bar);
             show("lufs_ticks", l.lufs_ticks);
             show("master_scale0", l.master_scale[0]);
@@ -10885,5 +11202,359 @@ mod spacing_probe {
             println!("  GAPS: meters->vari {:.1} | vari->lufsbar {:.1} | lufsticks->mscale0 {:.1} | lufsticks->mbars {:.1}",
                 g(l.meter, l.vari), g(l.vari, l.lufs_bar), g(l.lufs_ticks, l.master_scale[0]), g(l.lufs_ticks, l.master_bars));
         }
+    }
+}
+
+#[cfg(test)]
+mod claim_probe {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn probe_word_overlap() {
+        let mut worst_r: f32 = f32::INFINITY;
+        let mut worst_l: f32 = f32::INFINITY;
+        let mut worst_rw = 0.0_f32;
+        let mut worst_lw = 0.0_f32;
+        let mut w = 600.0_f32;
+        while w <= 3840.0 {
+            let r = Rect::from_min_size(Pos2::new(0.0, 350.0), Vec2::new(w, band_height(w)));
+            let v = RecorderView::empty();
+            let l = Layout::new(r, &v);
+            if l.vari.is_positive() && l.lufs_bar.is_positive() {
+                let strip =
+                    (knob_face(l.vari).map_or(0.0, |k| k.label_h) * 2.0).max(KNOB_LABEL.1);
+                if let Some(word) = vari_word_ink(l.vari, l.vari_label, strip) {
+                    let gap_r = l.lufs_bar.left() - word.right();
+                    let gap_l = word.left() - l.meter.right();
+                    if gap_r < worst_r { worst_r = gap_r; worst_rw = w; }
+                    if gap_l < worst_l { worst_l = gap_l; worst_lw = w; }
+                    if gap_r <= 0.0 || gap_l <= 0.0 {
+                        println!("OVERLAP w={w:.0}: gap_r={gap_r:.2} gap_l={gap_l:.2} word={:.1}..{:.1} lufs.left={:.1} meter.right={:.1} vari={:.1}..{:.1} label={:.1}..{:.1}",
+                            word.left(), word.right(), l.lufs_bar.left(), l.meter.right(),
+                            l.vari.left(), l.vari.right(), l.vari_label.left(), l.vari_label.right());
+                    }
+                }
+            }
+            w += 1.0;
+        }
+        println!("WORST right gap {worst_r:.2} at w={worst_rw:.0}; WORST left gap {worst_l:.2} at w={worst_lw:.0}");
+    }
+
+    #[test]
+    #[ignore]
+    fn probe_word_vs_dial() {
+        let mut worst: f32 = f32::INFINITY;
+        let mut at = 0.0_f32;
+        let mut w = 600.0_f32;
+        while w <= 3840.0 {
+            let r = Rect::from_min_size(Pos2::new(0.0, 350.0), Vec2::new(w, band_height(w)));
+            let v = RecorderView::empty();
+            let l = Layout::new(r, &v);
+            if let Some(f) = vari_face(l.vari, l.vari_label) {
+                let strip =
+                    (knob_face(l.vari).map_or(0.0, |k| k.label_h) * 2.0).max(KNOB_LABEL.1);
+                let size = vari_word_size(
+                    if l.vari_label.is_positive() { l.vari_label } else { l.vari },
+                    strip,
+                    KNOB_LABEL.1,
+                );
+                // real ink bottom, assuming the WORD_LINE model
+                let ink_bottom = l.vari.top() + size * WORD_LINE;
+                let circle_top = f.face.center().y - f.radius * RECESS_R;
+                let g = circle_top - ink_bottom;
+                if g < worst { worst = g; at = w; }
+                if g <= 0.0 {
+                    println!("DIAL OVERLAP w={w:.0}: g={g:.2} size={size:.1} ink_bottom={ink_bottom:.1} circle_top={circle_top:.1}");
+                }
+            }
+            w += 1.0;
+        }
+        println!("WORST word->recess gap {worst:.2} at w={at:.0}");
+    }
+
+    /// Sweep: is the LUFS cluster centred between the WORD's ink and the
+    /// master scale's ink at every width, in both layouts?
+    #[test]
+    #[ignore]
+    fn probe_centring_sweep() {
+        for rolling in [false, true] {
+            let mut v = RecorderView::empty();
+            if rolling {
+                v.state = crate::recorder::RecordState::Rolling;
+            }
+            let mut worst_err = 0.0_f32;
+            let mut worst_w = 0.0_f32;
+            let mut bail = 0usize;
+            let mut touch = 0usize;
+            let mut worst_read: f32 = f32::INFINITY;
+            let mut worst_read_w = 0.0_f32;
+            let mut worst_read_over = 0.0_f32;
+            let mut w = 600.0_f32;
+            while w <= 3840.0 {
+                let r = Rect::from_min_size(Pos2::new(0.0, 350.0), Vec2::new(w, band_height(w)));
+                let l = Layout::new(r, &v);
+                if !l.lufs_bar.is_positive() || !l.master_bars.is_positive() {
+                    w += 1.0;
+                    continue;
+                }
+                let strip =
+                    (knob_face(l.vari).map_or(0.0, |k| k.label_h) * 2.0).max(KNOB_LABEL.1);
+                let word_right = match vari_word_ink(l.vari, l.vari_label, strip) {
+                    Some(x) => x.right(),
+                    None => knob_face(l.vari).map_or(l.vari.right(), |f| f.face.right()),
+                };
+                let step = l.master_bars.height() / 9.0;
+                let size = fit_text(
+                    Rect::from_min_size(
+                        l.master_scale[0].min,
+                        Vec2::new(l.master_scale[0].width() - 3.0, step),
+                    ),
+                    MASTER_SCALE_FIT,
+                    step * 0.86,
+                );
+                let mink = (l.master_scale[0].right() - 2.0 - master_scale_ink_w(size))
+                    .max(l.master_scale[0].left());
+                let before = l.lufs_bar.left() - word_right;
+                let after = mink - l.lufs_ticks.right();
+                let err = (before - after).abs();
+                if err > worst_err {
+                    worst_err = err;
+                    worst_w = w;
+                }
+                if before <= 0.0 || after <= 0.0 {
+                    touch += 1;
+                    if touch < 6 {
+                        println!("TOUCH rolling={rolling} w={w:.0} before={before:.2} after={after:.2}");
+                    }
+                }
+                if err > 1.0 {
+                    bail += 1;
+                    if bail < 8 {
+                        println!("OFF-CENTRE rolling={rolling} w={w:.0} before={before:.2} after={after:.2}");
+                    }
+                }
+                // The reading, drawn centred on the BAR (see draw_lufs).
+                if l.lufs_readout.is_positive() {
+                    let text = "M -14.2";
+                    let rs = fit_text(l.lufs_readout, text, l.lufs_readout.height() * 0.78);
+                    if rs >= MIN_TEXT {
+                        let ink = text.chars().count() as f32 * ADV * rs;
+                        let left = l.lufs_bar.center().x - ink * 0.5;
+                        let over = l.lufs_bar.left() - left;
+                        let gap = left - word_right;
+                        if gap < worst_read {
+                            worst_read = gap;
+                            worst_read_w = w;
+                            worst_read_over = over;
+                        }
+                    }
+                }
+                w += 1.0;
+            }
+            println!("rolling={rolling}: worst |before-after| = {worst_err:.2} at w={worst_w:.0}; off-centre widths {bail}; touching {touch}");
+            println!("rolling={rolling}: readout ink nearest the word: gap {worst_read:.2} at w={worst_read_w:.0} (sticks {worst_read_over:.2} left of the bar)");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn probe_free_aspect() {
+        let mut worst_r: f32 = f32::INFINITY;
+        let mut worst_at = (0.0_f32, 0.0_f32);
+        let mut worst_l: f32 = f32::INFINITY;
+        let mut worst_l_at = (0.0_f32, 0.0_f32);
+        let mut worst_d: f32 = f32::INFINITY;
+        let mut worst_d_at = (0.0_f32, 0.0_f32);
+        let mut hits = 0u32;
+        let mut w = 640.0_f32;
+        while w <= 2600.0 {
+            let mut h = 340.0_f32;
+            while h <= 1600.0 {
+                let r = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(w, h));
+                let v = RecorderView::empty();
+                let l = Layout::new(r, &v);
+                if l.vari.is_positive() && l.lufs_bar.is_positive() {
+                    let strip =
+                        (knob_face(l.vari).map_or(0.0, |k| k.label_h) * 2.0).max(KNOB_LABEL.1);
+                    if let Some(word) = vari_word_ink(l.vari, l.vari_label, strip) {
+                        let gap_r = l.lufs_bar.left() - word.right();
+                        let gap_l = word.left() - l.meter.right();
+                        if gap_r < worst_r { worst_r = gap_r; worst_at = (w, h); }
+                        if gap_l < worst_l { worst_l = gap_l; worst_l_at = (w, h); }
+                        if gap_r <= 0.0 || gap_l <= 0.0 {
+                            hits += 1;
+                            if hits < 12 {
+                                println!("OVERLAP {w:.0}x{h:.0}: gap_r={gap_r:.2} gap_l={gap_l:.2} word={:.1}..{:.1} lufs.left={:.1} meter.right={:.1} label={:.1}..{:.1} vari={:.1}..{:.1}",
+                                    word.left(), word.right(), l.lufs_bar.left(), l.meter.right(),
+                                    l.vari_label.left(), l.vari_label.right(), l.vari.left(), l.vari.right());
+                            }
+                        }
+                    }
+                    if let Some(f) = vari_face(l.vari, l.vari_label) {
+                        let size = vari_word_size(
+                            if l.vari_label.is_positive() { l.vari_label } else { l.vari },
+                            strip,
+                            KNOB_LABEL.1,
+                        );
+                        let ink_bottom = l.vari.top() + size * WORD_LINE;
+                        let circle_top = f.face.center().y - f.radius * RECESS_R;
+                        let g = circle_top - ink_bottom;
+                        if g < worst_d { worst_d = g; worst_d_at = (w, h); }
+                    }
+                }
+                h += 4.0;
+            }
+            w += 4.0;
+        }
+        println!("FREE-ASPECT worst right gap {worst_r:.2} at {:?}; worst left gap {worst_l:.2} at {:?}; worst word->recess {worst_d:.2} at {:?}; overlaps {hits}",
+            worst_at, worst_l_at, worst_d_at);
+    }
+
+    #[test]
+    #[ignore]
+    fn probe_font_metrics() {
+        use crate::fonts::{self, FontChoice};
+        for choice in FontChoice::ALL {
+            let ctx = egui::Context::default();
+            fonts::install(&ctx, choice, None);
+            let _ = ctx.run(Default::default(), |_| {});
+            for size in [6.0_f32, 10.0, 14.0, 18.0, 24.0, 30.0] {
+                let (w, h, ink_top, ink_bottom) = ctx.fonts_mut(|f| {
+                    let g = f.layout_no_wrap(
+                        PITCH_LABEL.to_owned(),
+                        font_light(size),
+                        Color32::WHITE,
+                    );
+                    let row = &g.rows[0];
+                    let mut top = f32::INFINITY;
+                    let mut bot = f32::NEG_INFINITY;
+                    for gl in &row.glyphs {
+                        top = top.min(gl.pos.y + gl.uv_rect.offset.y);
+                        bot = bot.max(gl.pos.y + gl.uv_rect.offset.y + gl.uv_rect.size.y);
+                    }
+                    (g.rect.width(), g.rect.height(), top, bot)
+                });
+                let n = PITCH_LABEL.chars().count() as f32;
+                println!(
+                    "{:?} size {size:>4.1}: galley w {w:7.2} (adv/em {:.4}, model {:.4}) h {h:6.2} (h/size {:.3}, WORD_LINE {WORD_LINE:.3}) ink y {ink_top:6.2}..{ink_bottom:6.2} (bottom/size {:.3})",
+                    choice, w / (n * size), ADV, h / size, ink_bottom / size
+                );
+            }
+        }
+    }
+
+    /// Does the word the PAINTER draws match the word the LAYOUT measured?
+    #[test]
+    #[ignore]
+    fn probe_word_size_agreement() {
+        let v = RecorderView::empty();
+        let mut worst = 0.0_f32;
+        let mut worst_w = 0.0_f32;
+        let mut printed = 0usize;
+        let mut w = 600.0_f32;
+        while w <= 3840.0 {
+            let r = Rect::from_min_size(Pos2::new(0.0, 350.0), Vec2::new(w, band_height(w)));
+            let l = Layout::new(r, &v);
+            if !l.vari.is_positive() || !l.lufs_bar.is_positive() {
+                w += 1.0;
+                continue;
+            }
+            // What the painter uses.
+            let dial_label = {
+                let cell = l.cell(Fx::Limiter);
+                knob_face(cell).map_or(KNOB_LABEL.1, |f| {
+                    let bottom = Rect::from_min_max(
+                        Pos2::new(cell.left(), cell.bottom() - f.label_h),
+                        cell.max,
+                    );
+                    fit_text(bottom, Fx::Limiter.title(), f.label_h * 0.9)
+                })
+            };
+            let strip =
+                (knob_face(l.vari).map_or(0.0, |k| k.label_h) * 2.0).max(KNOB_LABEL.1);
+            let word = if l.vari_label.is_positive() { l.vari_label } else { l.vari };
+            let label = Rect::from_min_max(
+                Pos2::new(word.left(), l.vari.top()),
+                Pos2::new(word.right(), l.vari.top() + strip),
+            );
+            let painted = vari_word_size(label, strip, dial_label);
+            let assumed = vari_word_size(word, strip, KNOB_LABEL.1);
+            let d = painted - assumed;
+            if d.abs() > worst {
+                worst = d.abs();
+                worst_w = w;
+            }
+            if d.abs() > 0.05 && printed < 8 {
+                printed += 1;
+                let half_p = PITCH_LABEL.chars().count() as f32 * ADV * painted * 0.5;
+                let mid = l.vari.center().x;
+                println!(
+                    "w={w:.0} dial_label={dial_label:.2} painted={painted:.2} assumed={assumed:.2} \
+                     ink_right painted={:.1} assumed={:.1} lufs_bar.left={:.1}",
+                    mid + half_p,
+                    vari_word_ink(l.vari, l.vari_label, strip).map_or(f32::NAN, |x| x.right()),
+                    l.lufs_bar.left(),
+                );
+            }
+            w += 1.0;
+        }
+        println!("worst painted-vs-assumed word size difference {worst:.2} pt at w={worst_w:.0}");
+    }
+
+    /// The reading under the meter, at its real worst-case string.
+    #[test]
+    #[ignore]
+    fn probe_readout_overhang() {
+        let v = RecorderView::empty();
+        let mut worst_over = 0.0_f32;
+        let mut worst_w = 0.0_f32;
+        let mut ratio_worst = 1.0_f32;
+        let mut ratio_w = 0.0_f32;
+        let mut w = 600.0_f32;
+        while w <= 3840.0 {
+            let r = Rect::from_min_size(Pos2::new(0.0, 350.0), Vec2::new(w, band_height(w)));
+            let l = Layout::new(r, &v);
+            if !l.lufs_readout.is_positive() || !l.lufs_bar.is_positive() || !l.master_bars.is_positive() {
+                w += 1.0;
+                continue;
+            }
+            let strip =
+                (knob_face(l.vari).map_or(0.0, |k| k.label_h) * 2.0).max(KNOB_LABEL.1);
+            let Some(word) = vari_word_ink(l.vari, l.vari_label, strip) else { w += 1.0; continue };
+            let step = l.master_bars.height() / 9.0;
+            let size = fit_text(
+                Rect::from_min_size(
+                    l.master_scale[0].min,
+                    Vec2::new(l.master_scale[0].width() - 3.0, step),
+                ),
+                MASTER_SCALE_FIT,
+                step * 0.86,
+            );
+            let mink = (l.master_scale[0].right() - 2.0 - master_scale_ink_w(size))
+                .max(l.master_scale[0].left());
+            let text = "M 30.0";
+            let rs = fit_text(l.lufs_readout, text, l.lufs_readout.height() * 0.78);
+            if rs < MIN_TEXT {
+                w += 1.0;
+                continue;
+            }
+            let ink = text.chars().count() as f32 * ADV * rs;
+            let left = l.lufs_bar.center().x - ink * 0.5;
+            let right = l.lufs_bar.center().x + ink * 0.5;
+            let over = l.lufs_bar.left() - left;
+            let before = left.min(l.lufs_bar.left()) - word.right();
+            let after = mink - right.max(l.lufs_ticks.right());
+            if over > worst_over { worst_over = over; worst_w = w; }
+            let ratio = if before > 0.0 { after / before } else { f32::INFINITY };
+            if ratio > ratio_worst { ratio_worst = ratio; ratio_w = w; }
+            if (w - 1300.0).abs() < 0.5 || (w - 890.0).abs() < 0.5 || (w - 2560.0).abs() < 0.5 {
+                println!("w={w:.0}: readout size {rs:.2} ink {ink:.1} rect w {:.1} h {:.1} | bar {:.1}..{:.1} | readout ink {left:.1}..{right:.1} | word.right {:.1} | master ink {mink:.1} | before {before:.2} after {after:.2}",
+                    l.lufs_readout.width(), l.lufs_readout.height(),
+                    l.lufs_bar.left(), l.lufs_bar.right(), word.right());
+            }
+            w += 1.0;
+        }
+        println!("worst readout overhang left of the bar {worst_over:.2} at w={worst_w:.0}; worst after/before ratio {ratio_worst:.2} at w={ratio_w:.0}");
     }
 }
