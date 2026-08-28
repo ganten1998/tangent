@@ -149,19 +149,18 @@ fn heart_grid(rect: Rect) -> Option<(egui::Vec2, Pos2)> {
     // The outline reaches `HEART_EDGE` of a cell beyond the sprite on every
     // side, so the sprite has to fit in the rect with that much to spare.
     //
-    // **Each axis on its own.** It used to take the smaller of the two and
-    // use it for both, which keeps the pixels square and makes the BOX's
-    // shape a suggestion the sprite is free to ignore — so asking for a wider
-    // heart got a heart the same shape as before with air either side of it.
-    // The box is the shape now; a caller that wants square pixels asks for a
-    // box at [`HEART_ASPECT`], which the band does.
-    let px = egui::vec2(
-        rect.width() / (cols + HEART_EDGE * 2.0),
-        rect.height() / (rows + HEART_EDGE * 2.0),
-    );
-    if px.x <= 0.0 || px.y <= 0.0 {
+    // **SQUARE pixels, always.** A brief attempt at per-axis sizing let the
+    // box decide the shape, which is a way of stretching pixel art — and this
+    // is pixel art: seven by six cells, and a cell has to be a square or the
+    // whole point of drawing it from a bitmap is gone. So the size is
+    // whichever axis runs out first and the leftover becomes an even margin,
+    // which is also what keeps the heart from being lopsided.
+    let side = (rect.width() / (cols + HEART_EDGE * 2.0))
+        .min(rect.height() / (rows + HEART_EDGE * 2.0));
+    if side <= 0.0 {
         return None;
     }
+    let px = egui::vec2(side, side);
     let used = egui::vec2(cols * px.x, rows * px.y);
     let origin = Pos2::new(
         rect.left() + (rect.width() - used.x) * 0.5,
@@ -181,14 +180,15 @@ const HEART_EDGE: f32 = 0.42;
 /// `n * HEART_BOX` tall.
 pub const HEART_BOX: f32 = (HEART.len() as f32 + HEART_EDGE * 2.0) / HEART.len() as f32;
 
-/// **How much wider than its natural shape the band draws the heart.**
+/// **The heart's box is SQUARE.**
 ///
-/// The sprite is seven by six, which is a heart that reads as slightly narrow
-/// at the size the band shows it — the owner's word. Widening the BOX is what
-/// widens the heart now that `heart_grid` fits each axis on its own, so this
-/// is the one number that says how squat it is, rather than the aspect being
-/// smeared through a size calculation somewhere.
-pub const HEART_WIDEN: f32 = 1.30;
+/// It is pixel art, so its cells must stay square — which means the box's own
+/// shape cannot be the heart's, and a box at [`HEART_ASPECT`] would be a box
+/// that happens to fit with no margin anywhere. A square is the honest
+/// container: the sprite centres in it at the largest square cell that fits,
+/// with the leftover as an even margin, and every caller asks for one number
+/// instead of two.
+pub const HEART_SQUARE: bool = true;
 
 /// Draw the heart to fill `rect`.
 ///

@@ -981,11 +981,18 @@ impl Layout {
             // so a box sized to the sprite alone would draw a sprite an eighth
             // smaller than this band has always shown. The margin is added
             // back here, once, where the box is chosen.
-            // A shade taller than it was, and wider than its natural shape —
-            // the owner's call. `HEART_WIDEN` is where the squatness lives.
-            let sprite = (inner.height() * 0.070).clamp(9.0, 16.0);
-            let h = sprite * crate::chord_strip::HEART_BOX;
-            let w = h * crate::chord_strip::HEART_ASPECT * crate::chord_strip::HEART_WIDEN;
+            // **A SQUARE box**, because the heart is pixel art and its cells
+            // have to stay square — see `chord_strip::heart_grid`. The sprite
+            // is seven wide by six tall, so a square box sizes it by its
+            // WIDTH and leaves a sliver of margin above and below; that
+            // margin is what centres it.
+            //
+            // Ten per cent off what it was: big enough to read as a heart,
+            // small enough not to sit on the master's scale.
+            let sprite = (inner.height() * 0.063).clamp(8.0, 15.0);
+            let side = sprite * crate::chord_strip::HEART_BOX
+                * crate::chord_strip::HEART_ASPECT;
+            let (w, h) = (side, side);
             if w > inner.width() * 0.06 {
                 Rect::NOTHING
             } else {
@@ -1707,10 +1714,9 @@ impl Layout {
             self.fill_vari(Self::vari_cell(vari_col, self.master_knob));
             return;
         }
-        // **The loudness meter is the master meter's width**, the owner's
-        // word — measured off the master rather than stated twice, so the
-        // two cannot drift.
-        let bar_w = self.master_bars.width();
+        // Measured off the master rather than stated twice, so the two cannot
+        // drift — see `LUFS_BAR_OF_MASTER`.
+        let bar_w = self.master_bars.width() * LUFS_BAR_OF_MASTER;
         // **The numbers take what NUMBERS need, not what the bar is wide.**
         //
         // This reserved nine tenths of the bar's width for a column of at most
@@ -1985,15 +1991,10 @@ impl Layout {
             // turns for more — and, on a tape machine, the direction the
             // pitch goes.
             //
-            // **The whole CELL, not `dial(cell)`.** `dial` reserves the foot
-            // of a cell for the reading a knob prints there, which is right
-            // for the eight that have one and wrong for this one: the
-            // varispeed prints its word ABOVE (see `vari_face`) and its
-            // circle runs all the way to the cell's bottom edge. Measured at
-            // 1300: the dial was drawn to y=527 and stopped answering the
-            // hand at y=515, so the bottom twelve points of the control were
-            // decoration. The owner's "drawn below its drag area".
-            (self.vari, AlongV(Hit::SetVarispeed)),
+            // `dial(cell)` here like every other knob: the circle is drawn
+            // inside exactly this region — see `vari_face`, which was what
+            // had drifted below it.
+            (dial(self.vari), AlongV(Hit::SetVarispeed)),
             // **The whole ladder, and the number under it.** A loudness
             // reading is read, not aimed at: the target that cycles the
             // window has to be the thing somebody is already looking at, and
@@ -2705,6 +2706,12 @@ pub fn knob_rect(rect: Rect, view: &RecorderView<'_>, hit: Hit) -> Option<Rect> 
         _ => return None,
     };
     r.is_positive().then_some(r)
+}
+
+/// The room `PITCH CONT` may print in, for a caller that has to reason about
+/// the dial's size — see `vari_face`.
+pub fn vari_word_rect(rect: Rect, view: &RecorderView<'_>) -> Rect {
+    Layout::new(rect, view).vari_label
 }
 
 /// The camera preview, for the right-click that opens the camera picker.
@@ -5049,7 +5056,7 @@ fn draw_varispeed(
     dial_label: f32,
     p: &Palette,
 ) {
-    let Some(KnobFace { face, radius: rad, label_h }) = vari_face(cell) else {
+    let Some(KnobFace { face, radius: rad, label_h }) = vari_face(cell, word) else {
         return;
     };
     let engaged = v.engaged();
@@ -5063,11 +5070,15 @@ fn draw_varispeed(
     // It was there to separate this bay from the row of knobs to its left,
     // and it separates nothing now that the dial has a column of its own —
     // it drew across the loudness column's ladder and read as a fault.
-    let strip = label_h.max(KNOB_LABEL.1);
+    // The strip the word is SIZED against is the cell's own share; where it
+    // is DRAWN is the top of the cell. `label_h` is already the word plus its
+    // clearance — see `vari_face`.
+    let strip = (knob_face(cell).map_or(0.0, |k| k.label_h) * 2.0).max(KNOB_LABEL.1);
     let label = Rect::from_min_max(
         Pos2::new(word.left(), cell.top()),
         Pos2::new(word.right(), cell.top() + strip),
     );
+    let _ = label_h;
     // **As big as the room either side allows.**
     //
     // It was `fit_text` against the CELL — one knob wide — so the nominal
@@ -5077,9 +5088,7 @@ fn draw_varispeed(
     // is what stops it one point short of its neighbours. The nominal is
     // raised to match, and the strip's own height still caps it so a tall
     // band cannot print a word taller than the line it sits on.
-    let size = fit_text(label, PITCH_LABEL, dial_label * 3.4)
-        .min(strip * 0.92)
-        .max(MIN_TEXT);
+    let size = vari_word_size(label, strip, dial_label);
     if size >= MIN_TEXT {
         // Lit when ENGAGED: this is the one control whose resting state has
         // to be unmistakable from across a room.
@@ -5205,6 +5214,24 @@ fn draw_varispeed(
 /// is the dial's own.
 const PITCH_LABEL: &str = "PITCH CONT";
 
+/// **How tall `PITCH CONT` actually prints**, given the room it was allowed.
+///
+/// Shared by the painter and by `vari_face`, because the dial sits directly
+/// under the WORD and not under the strip the word was allotted. Those were
+/// two different numbers: the strip is a fixed share of the cell (thirty
+/// points at 1300) and the word, once it was free to use the air either side,
+/// came out at twelve — so the dial hung twenty points below the thing it
+/// belongs to. One function, so the gap cannot come back.
+fn vari_word_size(word: Rect, strip: f32, dial_label: f32) -> f32 {
+    fit_text(
+        Rect::from_min_size(word.min, Vec2::new(word.width(), strip)),
+        PITCH_LABEL,
+        dial_label * 3.4,
+    )
+    .min(strip * 0.92)
+    .max(MIN_TEXT)
+}
+
 /// The varispeed's own layout, which is not a knob's.
 ///
 /// **It has no readout, so the strip `knob_face` keeps at the foot for one is
@@ -5215,12 +5242,23 @@ const PITCH_LABEL: &str = "PITCH CONT";
 ///
 /// Shared with the hit test — see `on_knob_circle` — so the circle a
 /// right-click has to land on is the circle that was drawn.
-fn vari_face(cell: Rect) -> Option<KnobFace> {
+fn vari_face(cell: Rect, word: Rect) -> Option<KnobFace> {
     let base = knob_face(cell)?;
-    let label_h = base.label_h * 2.0;
+    // What the word actually takes, not the strip it was allotted.
+    let strip = (base.label_h * 2.0).max(KNOB_LABEL.1);
+    let word = if word.is_positive() { word } else { cell };
+    let label_h = vari_word_size(word, strip, KNOB_LABEL.1) + KNOB_TICK_ROOM;
+    // **The same foot every other dial's cell keeps.**
+    //
+    // This ran to `cell.bottom()`, which put the circle lower than the region
+    // that answered the hand — and the first fix went the wrong way round,
+    // dragging the CONTROL down to meet the drawing instead of lifting the
+    // drawing up to the control. The word sits above the dial; the dial
+    // belongs under it, in the room `dial()` has always treated as the
+    // control. So the face ends where that region ends.
     let face = Rect::from_min_max(
-        Pos2::new(cell.left(), cell.top() + label_h + KNOB_TICK_ROOM),
-        Pos2::new(cell.right(), cell.bottom()),
+        Pos2::new(cell.left(), cell.top() + label_h),
+        Pos2::new(cell.right(), cell.bottom() - base.label_h),
     );
     if !face.is_positive() {
         return None;
@@ -5677,7 +5715,20 @@ fn lufs_tick_size(bar_w: f32) -> f32 {
 }
 
 /// The step between the loudness bar and its numbers.
-const LUFS_TICK_GAP: f32 = 3.0;
+///
+/// **Almost touching**, the owner's word: the ladder and the figures beside it
+/// are one object and a gap between them makes two.
+const LUFS_TICK_GAP: f32 = 1.0;
+
+/// How wide the loudness bar is against the master meter's.
+///
+/// **A thinner strip.** It used to be exactly the master's width, measured off
+/// it so the two could not drift — a good rule for the wrong pair. The master
+/// is two ladders reading a stereo output and is READ; the loudness meter is
+/// one figure with a bar behind it, and at the master's width it was the
+/// widest thing at that end of the band. Still measured off the master, so
+/// the two still cannot drift; just not one to one.
+const LUFS_BAR_OF_MASTER: f32 = 0.55;
 
 /// How wide those numbers actually draw, cell padding included.
 ///
@@ -5805,12 +5856,12 @@ fn knob_face(cell: Rect) -> Option<KnobFace> {
 /// rather than anywhere in the knob's cell. The right-click gestures ask
 /// this: a cell is mostly margin, and "right-click the dial" answering a
 /// press two ticks into the empty paint ate the menu everywhere near a knob.
-pub fn on_knob_circle(cell: Rect, pos: Pos2, vari: bool) -> bool {
+pub fn on_knob_circle(cell: Rect, word: Rect, pos: Pos2, vari: bool) -> bool {
     // **The varispeed is laid out differently**, and the right-click that
     // opens its range has to land on the circle that was actually drawn —
     // see `vari_face`. Told rather than guessed, because a rectangle cannot
     // say which control it belongs to.
-    let f = if vari { vari_face(cell) } else { knob_face(cell) };
+    let f = if vari { vari_face(cell, word) } else { knob_face(cell) };
     match f {
         Some(f) => {
             let reach = if vari { RECESS_R } else { 1.26 };
@@ -6435,7 +6486,7 @@ mod tests {
             let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, band_height(w)));
             let v = RecorderView::empty();
             let l = Layout::new(r, &v);
-            let Some(face) = knob_face(l.vari) else { continue };
+            let Some(face) = vari_face(l.vari, l.vari_label) else { continue };
             if !l.lufs_bar.is_positive() || !l.master_bars.is_positive() {
                 continue;
             }
@@ -6469,10 +6520,13 @@ mod tests {
                 "the gaps run {lo:.1} to {hi:.1} at {w}: {gaps:?}"
             );
 
-            // **The loudness meter is the master meter's width**, measured
-            // off it rather than stated twice so the two cannot drift.
+            // **The loudness meter is a fixed share of the master meter's
+            // width**, measured off it rather than stated twice so the two
+            // cannot drift. It was one-to-one; see `LUFS_BAR_OF_MASTER` for
+            // why a thinner strip.
             assert!(
-                (l.lufs_bar.width() - l.master_bars.width()).abs() < 1.0,
+                (l.lufs_bar.width() - l.master_bars.width() * LUFS_BAR_OF_MASTER).abs()
+                    < 1.0,
                 "the loudness meter is {:.1} wide against the master's {:.1} at {w}",
                 l.lufs_bar.width(),
                 l.master_bars.width()
@@ -10794,7 +10848,7 @@ mod spacing_probe {
             println!("band {w} (rect {:.1}..{:.1})", r.left(), r.right());
             show("knobs/meters", l.meter);
             show("vari(pitch)", l.vari);
-            if let Some(f) = vari_face(l.vari) {
+            if let Some(f) = vari_face(l.vari, l.vari_label) {
                 println!("    vari CELL   y {:.1}..{:.1}", l.vari.top(), l.vari.bottom());
                 println!("    vari FACE   y {:.1}..{:.1}  circle y {:.1}..{:.1}",
                     f.face.top(), f.face.bottom(),
@@ -10817,9 +10871,7 @@ mod spacing_probe {
                     l.vari.min,
                     Pos2::new(l.vari.right(), l.vari.bottom() - kf.label_h),
                 );
-                let _ = drag;
-                println!("    vari DRAG   y {:.1}..{:.1}  (now the whole cell)",
-                    l.vari.top(), l.vari.bottom());
+                println!("    vari DRAG   y {:.1}..{:.1}", drag.top(), drag.bottom());
             }
             show("lufs_bar", l.lufs_bar);
             show("lufs_ticks", l.lufs_ticks);

@@ -4295,17 +4295,17 @@ impl IvoryApp {
     /// chosen whole and the band it belongs to is what moves.
     fn heart_wave(&self, phase: f32, t: f64) -> egui::Color32 {
         let n = crate::recorder::CHANNELS;
+        // **The other way.** The wave travelled up and to the left; the
+        // owner's call is down and to the right, which is the direction a
+        // thing being read moves.
         let travel = t / Self::HEART_CYCLE_S * n as f64;
-        let at = f64::from(phase) * f64::from(Self::HEART_BANDS) + travel;
-        // **Through the heart's own palette, not the desk's.** The animated
-        // set is sixteen because there are sixteen auto-palettes, and the
-        // slot is which one — so left-clicking a drifting heart walks it
-        // through Valentine, Hydra, Navi and the rest rather than doing
-        // nothing visible.
-        self.heart_palette_slot_in(
-            self.settings.heart_slot,
-            at.rem_euclid(n as f64) as usize % n,
-        )
+        let at = f64::from(phase) * f64::from(Self::HEART_BANDS) - travel;
+        // **The theme's own palette, always.** There is nothing to choose:
+        // one theme is one heart, animated for a supporter and a single
+        // colour when the drift is off. A heart with sixteen animated
+        // variants and sixteen flat ones was thirty-two decisions about a
+        // sprite seven pixels wide.
+        self.heart_palette_slot(at.rem_euclid(n as f64) as usize % n)
     }
 
     /// One of the active palette's sixteen, as a bright shade for the heart.
@@ -4340,31 +4340,20 @@ impl IvoryApp {
         // colour system is the one thing a key does buy, and it arrives the
         // instant the key goes in because it is derived from the licence
         // every frame rather than latched at startup.
-        if self.license.is_supporter() {
-            // The ANIMATED case has no single colour — every pixel has its own
-            // — so this answers with the head of the wave, which is what the
-            // hover card and anything else asking "what colour is it" wants.
-            return Some(if self.settings.heart_animate {
-                self.heart_wave(0.0, t)
-            } else {
-                self.heart_palette_slot(
-                    self.settings
-                        .heart_slot
-                        .rem_euclid(crate::recorder::CHANNELS as i64) as usize,
-                )
-            });
+        // The ANIMATED case has no single colour — every pixel has its own —
+        // so this answers with the head of the wave, which is what the hover
+        // card and anything else asking "what colour is it" wants.
+        if self.license.is_supporter() && self.settings.heart_animate {
+            return Some(self.heart_wave(0.0, t));
         }
-        // **Drawn for everybody, in the colour they chose.** The heart is the
-        // way into the thanks card, and the people on that card are being
-        // thanked for the app existing rather than for anybody's purchase, so
-        // gating the credit behind a key would be a strange thing to do to
-        // them. It used to be dim for non-supporters and the licence check has
-        // been dropped outright: there is nothing behind a key at all, which
-        // is the point until 5.0 leaves beta.
-        let n = chord_strip::HEART_COLORS.len() as i64;
-        // rem_euclid so a hand-edited negative index still lands in range.
-        let idx = self.settings.heart_color.rem_euclid(n) as usize;
-        Some(chord_strip::HEART_COLORS[idx])
+        // **And when the drift is off, one colour — the theme's.**
+        //
+        // It used to be a seven-colour list the user picked from, and then a
+        // sixteen-slot ring on top of that. Both are gone: the heart is a
+        // credit and a thanks card, not a control, and every other surface in
+        // this app already dresses itself from the theme without being asked.
+        // One theme, one heart.
+        Some(self.heart_palette_slot(0))
     }
 
     /// **The heart has two sets of sixteen, and two gestures.**
@@ -4385,16 +4374,11 @@ impl IvoryApp {
     /// A press on the heart. `true` when it was the heart's, and the caller
     /// must not go on to open a menu or sound a note.
     ///
-    /// One function for both buttons because the TARGET is the fiddly part —
-    /// a small sprite, only on a laid-out band, only for a supporter — and
-    /// two copies of that test is two places for the hit region to drift from
-    /// the drawn one.
-    fn heart_press(
-        &mut self,
-        pos: Pos2,
-        recorder_rect: Option<Rect>,
-        secondary: bool,
-    ) -> bool {
+    /// **One gesture, and only for supporters.** Right-click stops the drift
+    /// or starts it again; there is nothing to walk through, because the
+    /// theme decides both the wave and the single colour it falls back to.
+    /// A left click on the heart is an ordinary press on the band.
+    fn heart_press(&mut self, pos: Pos2, recorder_rect: Option<Rect>) -> bool {
         if !self.license.is_supporter() || !self.settings.show_heart {
             return false;
         }
@@ -4405,25 +4389,11 @@ impl IvoryApp {
         if !hr.is_positive() || !hr.expand(3.0).contains(pos) {
             return false;
         }
-        if secondary {
-            // The other set, keeping your place in it.
-            self.settings.heart_animate = !self.settings.heart_animate;
-        } else {
-            self.settings.heart_slot = Self::heart_step(
-                self.settings.heart_slot,
-                crate::recorder::CHANNELS as i64,
-            );
-        }
+        self.settings.heart_animate = !self.settings.heart_animate;
         self.save_settings();
         true
     }
 
-    fn heart_step(slot: i64, n: i64) -> i64 {
-        let n = n.max(1);
-        // rem_euclid first, so a hand-edited or out-of-range slot rejoins the
-        // ring rather than running off the end of it.
-        (slot.rem_euclid(n) + 1).rem_euclid(n)
-    }
 
     // ── Main-window interaction ────────────────────────────────────────────
 
@@ -4527,7 +4497,7 @@ impl IvoryApp {
                 // because they are the only ones wearing the palette — for
                 // everybody else the heart has no second colour system and the
                 // press should open the band's menu as it always did.
-                if self.heart_press(pos, recorder_rect, true) {
+                if self.heart_press(pos, recorder_rect) {
                     return;
                 }
                 // A right-click ON the Recorder band opens the menu with the
@@ -4865,6 +4835,29 @@ impl IvoryApp {
                     // does nothing, which is exactly how this one behaved.
                     // Anchored on the button rather than the pointer so the
                     // list always hangs off the same corner.
+
+                    // **Empty band space is the window's handle, borderless.**
+                    //
+                    // A borderless window has no title bar, so it needs a
+                    // patch of chrome that means "move me" — and the band has
+                    // the only large empty surface in the app that is not an
+                    // instrument. The fall-through at the end of this
+                    // function already did this for the rest of the window,
+                    // and the band never reached it: every press inside the
+                    // band returns here.
+                    //
+                    // Only on a press that hit NOTHING and grabbed nothing. A
+                    // drag that starts on a fader is a fader move, and a
+                    // native window grab would end that press under egui's
+                    // feet — the same trap the keytoggle branch above records.
+                    if hit.is_none()
+                        && self.grabbed.is_none()
+                        && self.lcd_drag.is_none()
+                        && self.settings.borderless_mode
+                        && self.caps.window_sizing
+                    {
+                        ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+                    }
                     return;
                 }
                 // Clicking anywhere else also drops the field's focus, or the
@@ -4883,17 +4876,6 @@ impl IvoryApp {
                 if self.mixer_rect.is_some_and(|r| r.contains(pos))
                     || self.arrangement_rect.is_some_and(|r| r.contains(pos))
                 {
-                    return;
-                }
-                // **The supporter heart walks its set on a LEFT click.**
-                //
-                // Checked here, before the keytoggle and the piano, because
-                // it sits on top of the band and a press that landed on the
-                // sprite must not also sound a note or open a menu. The right
-                // button — which swaps WHICH set — is handled on the
-                // secondary path; both go through `heart_press`, so the hit
-                // region is decided once.
-                if self.heart_press(pos, recorder_rect, false) {
                     return;
                 }
                 // The transpose arrows, top-left of the chord view. Checked
@@ -5459,7 +5441,10 @@ impl IvoryApp {
         // right-click two ticks into the paint was eaten as the knob's.
         let cell = recorder_panel::knob_rect(r, &view, h)?;
         let vari = matches!(h, recorder_panel::Hit::SetVarispeed(_));
-        recorder_panel::on_knob_circle(cell, pos, vari).then_some(h)
+        // The word's room, which is what decides how much of the pitch dial's
+        // cell the dial itself gets — see `recorder_panel::vari_face`.
+        let word = recorder_panel::vari_word_rect(r, &view);
+        recorder_panel::on_knob_circle(cell, word, pos, vari).then_some(h)
     }
 
     /// Whether `pos` is on a fader — its track, its icon or its number.
@@ -5479,7 +5464,9 @@ impl IvoryApp {
         let view = self.recorder_layout_view();
         recorder_panel::Fx::ALL.into_iter().find(|fx| {
             recorder_panel::knob_rect(band, &view, fx.hit())
-                .is_some_and(|cell| recorder_panel::on_knob_circle(cell, pos, false))
+                .is_some_and(|cell| {
+                    recorder_panel::on_knob_circle(cell, Rect::NOTHING, pos, false)
+                })
         })
     }
 
@@ -7855,10 +7842,20 @@ impl IvoryApp {
                 crate::arrangement_panel::TEMPO_LANE_BPM.0,
                 crate::arrangement_panel::TEMPO_LANE_BPM.1,
             ),
-            // A new point is a STEP. A ramp is a thing somebody asks for —
-            // right-click — because a map full of accidental ritardandos is
-            // much harder to hear the fault in than a map full of steps.
-            ramp: false,
+            // **A new point RAMPS.** It used to be a step, on the argument
+            // that a map full of accidental ritardandos is harder to hear the
+            // fault in than a map full of steps. That reasoning was about
+            // MISTAKES; the owner's is about what the lane IS. It is called
+            // tempo automation and it is drawn as a curve with handles on it,
+            // and every other curve in this app moves smoothly between its
+            // points — so stepping is the surprise, and reaching a ramp meant
+            // knowing to alt-click a node, which nobody guesses.
+            //
+            // The step is still one alt-click away and still drawn
+            // unmistakably (a flat run then a cliff, see the lane's
+            // polyline), so "and now it is slower" has lost nothing but its
+            // place as the default.
+            ramp: true,
         });
         self.arrangement.tempo = crate::tempo::TempoMap::sanitised(pts);
         self.arr_save_edits();
@@ -18179,24 +18176,59 @@ fn fill_bands(settings: &Settings, avail: Vec2) -> Bands {
     if total <= 0.0 || avail.y <= 0.0 {
         return natural;
     }
-    let k = avail.y / total;
+    // **The INSTRUMENTS keep their windowed proportions; the theory band
+    // takes up the slack.**
+    //
+    // This used to scale every band by one factor, which fills the screen and
+    // keeps the bands in proportion to EACH OTHER — and gets the one thing
+    // wrong that matters. A keyboard's height is a fixed fraction of its
+    // width because that is what makes the keys the shape of keys; a neck's
+    // is fixed because that is what puts the frets where a guitarist expects
+    // them. Stretching either is stretching a picture of an instrument, and
+    // the owner watched the piano squash every time the window went full.
+    //
+    // The theory band has no such shape. It is diagrams that divide whatever
+    // rect they are handed (`theory_panel::band_height` is a preference, not
+    // a constraint), so it is the one band that can absorb the difference,
+    // and it does — in both directions.
+    let fixed = natural.recorder_h + natural.chord_h + natural.piano_h + natural.fret_h;
+    let want = avail.y - fixed;
+    // **Only while the theory band can pay.** With it off, or with a screen
+    // shorter than the instruments alone need, there is nothing to take the
+    // difference out of — and a negative theory band is a layout that draws
+    // nothing. Then, and only then, everything scales as it used to, which is
+    // at least a picture that fits.
+    if natural.theory_h <= 0.0 || want < natural.theory_h * 0.25 {
+        let k = avail.y / total;
+        return Bands {
+            w,
+            recorder_h: natural.recorder_h * k,
+            theory_h: natural.theory_h * k,
+            camera_w: (natural.camera_w * k).min(w * 0.45),
+            chord_h: natural.chord_h * k,
+            piano_h: natural.piano_h * k,
+            fret_h: natural.fret_h * k,
+        };
+    }
     Bands {
         w,
-        recorder_h: natural.recorder_h * k,
-        theory_h: natural.theory_h * k,
-        // Scaled by `k` as well, and it has to be. `k` stretches every band's
-        // height to fill the screen, so the theory row ends up `h*k` tall — and
-        // a pane whose width did NOT follow stops being 16:9 and starts putting
-        // bars round the camera. Caught by rendering a real composited frame:
-        // the pane came out 1.32:1 in a 16:9 video.
-        //
-        // Capped, because `k` is unbounded from above: a window far taller than
-        // the layout's natural aspect would otherwise walk the camera across
-        // the picture.
-        camera_w: (natural.camera_w * k).min(w * 0.45),
-        chord_h: natural.chord_h * k,
-        piano_h: natural.piano_h * k,
-        fret_h: natural.fret_h * k,
+        // Every band but the theory one is exactly what a window would give
+        // it, so going fullscreen changes what you can SEE and not what the
+        // instruments look like.
+        recorder_h: natural.recorder_h,
+        theory_h: want,
+        // The camera pane follows the theory ROW's height, since it shares
+        // it — a pane whose width did not follow stops being 16:9 and puts
+        // bars round the picture. Caught by rendering a real composited
+        // frame: the pane came out 1.32:1 in a 16:9 video.
+        camera_w: if natural.theory_h > 0.0 {
+            (natural.camera_w * (want / natural.theory_h)).min(w * 0.45)
+        } else {
+            natural.camera_w
+        },
+        chord_h: natural.chord_h,
+        piano_h: natural.piano_h,
+        fret_h: natural.fret_h,
     }
 }
 
@@ -19076,9 +19108,23 @@ impl IvoryApp {
         // The PANE and not the context, in both arms: inside a host's
         // resizable wrapper the two differ by its frame, and laying out to the
         // context would put the bottom band under the resize corner.
-        let fullscreen = self.caps.window_sizing
-            && ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false));
-        let bands = if fullscreen {
+        //
+        // **MAXIMISED counts as fullscreen here, and it is not a size preset.**
+        // There is no menu row for it and there must not be: maximising is
+        // the window manager's gesture on every platform, and an app that
+        // offered its own would be a second answer to a question the desktop
+        // has already answered. What the app owes it is the same promise
+        // fullscreen gets — everything on screen, nothing cut off — which is
+        // `fill_bands`, and which since the instruments stopped being
+        // stretched means the theory band is what gives. Borderless is
+        // unaffected: it decides whether there is a frame, not how big the
+        // pane is.
+        let filling = self.caps.window_sizing
+            && ui.ctx().input(|i| {
+                let v = i.viewport();
+                v.fullscreen.unwrap_or(false) || v.maximized.unwrap_or(false)
+            });
+        let bands = if filling {
             fill_bands(&self.settings, ui.max_rect().size())
         } else {
             fit_bands(&self.settings, ui.max_rect().size())
@@ -19105,7 +19151,11 @@ impl IvoryApp {
         // cannot be made the size of the screen. Fullscreen was fighting the
         // window manager every frame; it is not a mode you can bolt onto a
         // fixed-size window without saying so here.
-        if self.caps.window_sizing && fullscreen {
+        // `filling` and not `fullscreen`: a window pinned by Min == Max cannot
+        // be made the size of the screen AND cannot be MAXIMISED either, so
+        // the pin has to let go for both. That is what makes the window
+        // manager's own gesture work at all.
+        if self.caps.window_sizing && filling {
             if self.fullscreen_sent != Some(true) {
                 // Let it grow. Sent once on the way in rather than every frame,
                 // because these are the constraints the OS is trying to honour
@@ -24548,7 +24598,10 @@ mod tests {
         assert_eq!(i, 1);
         assert!((pts[1].at_beat - 8.0).abs() < 1e-6, "{:?}", pts[1]);
         assert!((pts[1].bpm - 90.0).abs() < 1e-6);
-        assert!(!pts[1].ramp, "a new point is a step, not a ritardando");
+        // **A new point RAMPS** — the lane is tempo AUTOMATION and every
+        // other curve in this app slides between its points. The step is one
+        // alt-click away; see `arr_put_tempo_point`.
+        assert!(pts[1].ramp, "a new point should slide, not step");
 
         // **The first point does not move in time.** Dragging it sideways
         // moves only its tempo; a map whose first point is at bar nine leaves
@@ -27859,34 +27912,54 @@ mod tests {
         }
     }
 
-    /// The bands keep their proportions relative to EACH OTHER.
+    /// **The INSTRUMENTS keep the shape a window gives them; the theory band
+    /// takes the difference.**
     ///
-    /// One scale factor for all of them, so filling changes each band's own
-    /// aspect a little and never the balance between them — a keyboard that
-    /// grew while the fretboard beside it did not would read as a bug.
+    /// This asserted the opposite for a long time — one scale factor for
+    /// every band, so filling changed each band's own aspect a little and
+    /// never the balance between them. The reasoning was that a keyboard
+    /// which grew while the fretboard beside it did not would read as a bug.
+    /// True, and it misses the larger one: a keyboard's height is a fixed
+    /// fraction of its width because that is what makes the keys the shape of
+    /// keys, and stretching it is stretching a picture of an instrument. The
+    /// owner watched the piano squash every time the window went full.
+    ///
+    /// The theory band has no such shape — its diagrams divide whatever rect
+    /// they are handed — so it is the band that pays.
     #[test]
-    fn filling_scales_every_band_by_the_same_amount() {
+    fn filling_leaves_the_instruments_alone_and_spends_the_theory_band() {
         let s = crate::settings::Settings::first_launch();
         let screen = Vec2::new(2560.0, 1440.0);
         let natural = band_sizes_at(&s, screen.x);
         let filled = fill_bands(&s, screen);
-        let k = filled.total().y / natural.total().y;
         for (name, a, b) in [
             ("piano", natural.piano_h, filled.piano_h),
             ("chord", natural.chord_h, filled.chord_h),
             ("fretboard", natural.fret_h, filled.fret_h),
-            ("theory", natural.theory_h, filled.theory_h),
             ("recorder", natural.recorder_h, filled.recorder_h),
         ] {
             if a <= 0.0 {
                 continue;
             }
             assert!(
-                (b / a - k).abs() < 1e-3,
-                "{name} scaled by {} while the stack scaled by {k}",
-                b / a
+                (b - a).abs() < 0.5,
+                "{name} was resized from {a} to {b} by filling the screen"
             );
         }
+        // **In either direction.** A screen taller than the layout gives the
+        // theory band the slack; one shorter takes it out of the same band —
+        // which is the sacrifice, and the reason the instruments above are
+        // untouched in both cases.
+        assert!(
+            (filled.theory_h - natural.theory_h).abs() > 0.5,
+            "the theory band did not absorb the difference"
+        );
+        assert!(
+            (filled.total().y - screen.y).abs() < 1.0,
+            "the screen was not filled: {} against {}",
+            filled.total().y,
+            screen.y
+        );
     }
 
     /// **No menu row resets anything.** Every one of them asks first.
@@ -29063,39 +29136,82 @@ mod geometry_tests {
 
 #[cfg(test)]
 mod heart_ring_tests {
-    use super::IvoryApp;
+    use super::tests::headless;
+    use super::*;
 
-    /// **Left click walks the set; it never runs off the end.**
+    /// **One theme, one heart.** The wave and the single colour it falls back
+    /// to both come from the theme's own palette, and right-click is the only
+    /// gesture — there is nothing to walk through.
     ///
-    /// The gesture before this was a single seventeen-stop ring on the RIGHT
-    /// button, which itself replaced a one-way door — sixteen slots that
-    /// wrapped to the first for ever, so the drift, once switched off, could
-    /// only be got back by hand-editing `settings.json`. The owner's file was
-    /// found at `heart_animate=false, heart_slot=14`: fourteen presses spent
-    /// looking for a stop that was not on the ring.
+    /// This replaces two earlier designs in a row: a one-way door that could
+    /// only be undone by hand-editing `settings.json`, and then a
+    /// seventeen-stop ring on the right button, and then two sets of sixteen
+    /// on two buttons. All of them were choices about a sprite seven pixels
+    /// wide that the theme was already able to answer.
     #[test]
-    fn a_left_click_walks_the_sixteen_and_comes_back_round() {
-        let n = crate::recorder::CHANNELS as i64;
-        let mut seen = Vec::new();
-        let mut slot = 0_i64;
-        for _ in 0..n {
-            seen.push(slot);
-            slot = IvoryApp::heart_step(slot, n);
-        }
-        assert_eq!(seen, (0..n).collect::<Vec<_>>(), "not every position is reachable");
-        assert_eq!(slot, 0, "the ring did not close");
+    fn right_click_is_the_only_heart_gesture_and_the_theme_picks_the_colour() {
+        let (_c, mut app) = headless(Caps::DESKTOP);
+        app.settings.show_heart = true;
+        let before = app.settings.heart_animate;
+
+        // **No band, no target.** Deliberately not asserting anything about
+        // the LICENCE: these tests run against whatever key is on the machine
+        // — the harness reads the real `license.key` — so a test that assumed
+        // either answer would pass on one developer's box and fail on the
+        // next. What holds for everybody is that a press with nowhere to land
+        // is not the heart's, and does not move the drift.
+        assert!(
+            !app.heart_press(Pos2::ZERO, None),
+            "a press with no band was taken as the heart's"
+        );
+        assert_eq!(app.settings.heart_animate, before, "the drift moved anyway");
+
+        // And the drift is ON out of the box, which is what a supporter sees
+        // the first time they open the app.
+        assert!(
+            Settings::first_launch().heart_animate,
+            "the wave is not the default"
+        );
     }
 
-    /// A slot from a hand-edited or older file rejoins the ring rather than
-    /// running off the end of it.
+    /// The colour follows the THEME, in both states, and the two differ.
     #[test]
-    fn an_out_of_range_heart_slot_rejoins_the_ring() {
-        let n = crate::recorder::CHANNELS as i64;
-        assert_eq!(IvoryApp::heart_step(-1, n), 0, "negative did not rejoin");
-        let s = IvoryApp::heart_step(n + 3, n);
-        assert!((0..n).contains(&s), "slot {s} left the ring");
-        // A degenerate width must not divide by zero or spin.
-        assert_eq!(IvoryApp::heart_step(0, 0), 0);
+    fn the_heart_takes_its_colour_from_the_theme_in_both_states() {
+        let (_c, mut app) = headless(Caps::DESKTOP);
+        app.settings.show_heart = true;
+        let still = app.heart_color(0.0).expect("a heart with show_heart on");
+
+        // A different theme gives a different heart, without anybody choosing.
+        let other = crate::theme::factory()
+            .into_iter()
+            .find(|t| t.name == "Iris")
+            .expect("Iris ships");
+        other.apply(&mut app.settings);
+        let iris = app.heart_color(0.0).expect("still a heart");
+        assert_ne!(still, iris, "the heart did not follow the theme");
+    }
+
+    /// The wave travels, and it travels the way round the owner asked for.
+    #[test]
+    fn the_wave_moves_and_it_moves_the_other_way() {
+        let (_c, app) = headless(Caps::DESKTOP);
+        // Two moments a step apart on the same pixel: the colour must change,
+        // which is what "animated" means at all.
+        let a = app.heart_wave(0.0, 0.0);
+        let b = app.heart_wave(0.0, f64::from(IvoryApp::HEART_CYCLE_S) / 4.0);
+        assert_ne!(a, b, "the wave stood still");
+        // Travelling BACKWARDS along the diagonal: the colour at phase p and
+        // time t is the colour at phase p + d and time t + d's worth. If the
+        // sign were the other way this would be phase p - d.
+        let n = f64::from(crate::recorder::CHANNELS as u32);
+        let step = f64::from(IvoryApp::HEART_CYCLE_S) / n;
+        let bands = f64::from(IvoryApp::HEART_BANDS);
+        let later = app.heart_wave((1.0 / bands) as f32, step);
+        assert_eq!(
+            later,
+            app.heart_wave(0.0, 0.0),
+            "the wave is travelling the old way"
+        );
     }
 }
 
@@ -29512,5 +29628,81 @@ mod folder_tests {
         assert!(app.desk().muted[2]);
         app.set_in_folder(2, false);
         assert!(!app.desk().muted[2], "it stayed silent after leaving the folder");
+    }
+}
+
+#[cfg(test)]
+mod fullscreen_proportion_tests {
+    use super::*;
+
+    /// **Fullscreen must not squash the instruments.**
+    ///
+    /// Every band used to be scaled by one factor to fill the screen, which
+    /// keeps them in proportion to each other and gets the one thing wrong
+    /// that matters: a keyboard's height is a fixed fraction of its width
+    /// because that is what makes the keys the shape of keys, and a neck's is
+    /// fixed because that is what puts the frets where a guitarist expects
+    /// them. The theory band has no such shape, so it takes the difference.
+    #[test]
+    fn the_piano_and_the_neck_keep_their_windowed_shape_in_fullscreen() {
+        let mut s = Settings::first_launch();
+        s.show_piano = true;
+        s.show_fretboard = true;
+        s.fretboard_detached = false;
+        s.theory_detached = false;
+        let w = 1920.0_f32;
+        let windowed = super::band_sizes_at(&s, w);
+        assert!(windowed.piano_h > 0.0 && windowed.fret_h > 0.0, "nothing to test");
+        assert!(windowed.theory_h > 0.0, "the theory band has to be able to pay");
+
+        // A screen far taller than the layout's natural height.
+        for extra in [120.0_f32, 400.0, 900.0] {
+            let avail = Vec2::new(w, windowed.total().y + extra);
+            let full = super::fill_bands(&s, avail);
+            assert!(
+                (full.piano_h - windowed.piano_h).abs() < 0.5,
+                "the piano was stretched from {} to {} with {extra} to spare",
+                windowed.piano_h,
+                full.piano_h
+            );
+            assert!(
+                (full.fret_h - windowed.fret_h).abs() < 0.5,
+                "the neck was stretched from {} to {}",
+                windowed.fret_h,
+                full.fret_h
+            );
+            // And the screen is still filled — the whole point of filling.
+            assert!(
+                (full.total().y - avail.y).abs() < 1.0,
+                "the screen is not filled: {} against {}",
+                full.total().y,
+                avail.y
+            );
+            // The theory band is what grew.
+            assert!(
+                full.theory_h > windowed.theory_h,
+                "the slack did not go to the theory band"
+            );
+        }
+    }
+
+    /// A screen too SHORT for the instruments alone still produces a layout
+    /// that fits, by falling back to scaling everything.
+    #[test]
+    fn a_screen_shorter_than_the_instruments_still_fits() {
+        let mut s = Settings::first_launch();
+        s.show_piano = true;
+        s.show_fretboard = true;
+        let w = 1280.0_f32;
+        let windowed = super::band_sizes_at(&s, w);
+        let avail = Vec2::new(w, windowed.total().y * 0.5);
+        let full = super::fill_bands(&s, avail);
+        assert!(
+            full.total().y <= avail.y + 1.0,
+            "the layout overflowed a short screen: {} against {}",
+            full.total().y,
+            avail.y
+        );
+        assert!(full.piano_h > 0.0, "the piano vanished");
     }
 }
