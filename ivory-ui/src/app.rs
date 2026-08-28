@@ -74,6 +74,13 @@ enum Focused {
         hit: crate::mixer_panel::Hit,
         travel: Option<crate::a11y::Travel>,
     },
+    /// The timeline. Its hit carries everything the keyboard needs, exactly
+    /// as the desk's does — see `arrangement_panel::targets` for why only
+    /// half of that panel's hits can be one.
+    Arrange {
+        hit: crate::arrangement_panel::Hit,
+        travel: Option<crate::a11y::Travel>,
+    },
 }
 
 /// Lay the nodes over a painted panel and answer whichever one has focus.
@@ -81,11 +88,28 @@ enum Focused {
 /// A free function and not a method, because every caller is inside a
 /// borrow of the view it just drew from and `&mut self` here would fight it.
 /// What it needs from the app is one colour.
+///
+/// **`on` is the whole accessibility overlay, and it is off by default.**
+///
+/// Allocating a focusable widget is what creates a TAB STOP, and egui eats
+/// Tab to walk them. This app already had Tab: it is how you go between the
+/// theory view, the desk and the timeline, and there is no second key for
+/// that a hand finds by feel. With the overlay always on, one Tab did the
+/// other thing every time and the owner's verdict was "switching views
+/// every time I want to cycle a button, or vice versa, is bad".
+///
+/// So the overlay follows accessibility mode — the menu row — and in that
+/// mode Tab means what a screen-reader user expects it to mean, while `F6`
+/// cycles the views the way it does in every other program with panes.
 fn offer_nodes<'n>(
     ui: &egui::Ui,
+    on: bool,
     nodes: &'n [crate::a11y::Node],
     accent: egui::Color32,
 ) -> Option<&'n crate::a11y::Node> {
+    if !on {
+        return None;
+    }
     let mut out = None;
     for (node, response) in nodes.iter().zip(crate::a11y::install(ui, nodes)) {
         if !response.has_focus() {
@@ -103,7 +127,9 @@ fn offer_nodes<'n>(
 impl Focused {
     fn travel(self) -> Option<crate::a11y::Travel> {
         match self {
-            Self::Band { travel, .. } | Self::Desk { travel, .. } => travel,
+            Self::Band { travel, .. }
+            | Self::Desk { travel, .. }
+            | Self::Arrange { travel, .. } => travel,
         }
     }
 }
@@ -665,7 +691,25 @@ pub struct IvoryApp {
     menu_hover_top: Option<usize>,
     /// The SELECTED channel — a left-click on a strip or header lights it
     /// slightly. Groundwork the owner asked for; nothing routes off it yet.
+    ///
+    /// **The PRIMARY of [`Self::selected_tracks`], not a second opinion.** It
+    /// is the last track clicked, and every question that wants exactly one
+    /// track asks this one. Kept as its own field rather than derived so the
+    /// dozens of places that already read it did not all have to learn about
+    /// multiple selection to go on working.
     selected_channel: Option<usize>,
+    /// Every selected track, in the order they were added.
+    ///
+    /// Shift extends from [`Self::sel_anchor`]; Cmd on macOS and Ctrl
+    /// elsewhere adds and removes one at a time. Empty means nothing is
+    /// selected, and it always agrees with `selected_channel`: the last entry
+    /// here IS that channel.
+    selected_tracks: Vec<usize>,
+    /// Where a Shift range is measured from: the last track chosen WITHOUT
+    /// Shift. Held separately from the primary because shift-clicking around
+    /// must keep measuring from the same fixed end, which is what makes a
+    /// range feel like a range rather than a chain.
+    sel_anchor: Option<usize>,
     /// An LCD Start/End/Length cell being ridden: row, part, and the y the
     /// current step was measured from.
     lcd_drag: Option<(u8, u8, f32)>,
@@ -756,6 +800,25 @@ pub struct IvoryApp {
     dbg_fret_last: Option<Vec<u8>>,
     /// The × on the status row was pressed. Taken by the host.
     dismiss_message: bool,
+    /// Which stepped parameter's list is open over the effect panel.
+    ///
+    /// A popout, not a step: see `FxHit::OpenChoice`. Held here because the
+    /// panel is a painter and cannot remember anything.
+    fx_choice: Option<&'static str>,
+    /// The VU needles' own positions — input left and right, then the master's
+    /// pair. Held here because ballistics need REAL elapsed time, and the app
+    /// is the only layer that has it. See `recorder::Level::vu`.
+    vu_needle: [f32; 4],
+    /// When the needles were last advanced, in egui's clock.
+    vu_at: f64,
+    /// The band message the notice window was last CLOSED on.
+    ///
+    /// Some messages cannot be cleared by dismissing them — a camera still
+    /// warming up goes on warming up — so without this latch the window would
+    /// reopen on the very next frame and could never be put away. A message
+    /// that CHANGES no longer matches the latch, so genuinely new news opens a
+    /// window again. See `dialogs::show_notice`.
+    notice_dismissed: Option<String>,
     /// The effect panel a right-click on a knob opened, if any.
     ///
     /// One at a time, like `dialog`: three panels at once over a band this
@@ -895,6 +958,10 @@ pub struct IvoryApp {
     /// because turning it into a hit is `hit_test`'s job — see
     /// `nudge_focused`.
     a11y_on: Option<Focused>,
+    /// This session's reader mode came from DETECTION rather than from the
+    /// menu row, so it is not written to the settings file. See
+    /// [`Self::set_screen_reader`].
+    reader_was_detected: bool,
     /// When the app last asked the window manager for a size — including at
     /// startup, where the size is baked into the `ViewportBuilder`.
     ///
@@ -1087,8 +1154,17 @@ enum MeDrag {
     Create { i: usize },
     /// The velocity lane: the bar under the hand follows it vertically.
     Vel,
-    /// Cmd-drag on empty roll: the rubber band.
-    Marquee,
+    /// **Alt-drag on a note's body**: its velocity follows the hand up and
+    /// down, from wherever it stood at the press. Relative, like every other
+    /// drag in this app — a press never makes a value jump to meet the
+    /// pointer.
+    NoteVel { i: usize, from_y: f32 },
+    /// The rubber band. `locate_t` is the press's own time, carried only by
+    /// the PEN-UP left drag: that gesture has to stay a locate when the hand
+    /// does not travel, so the box is armed at the press and the locate is
+    /// paid at the release if it turns out nobody dragged. The right-button
+    /// and Cmd marquees carry `None` — they never meant "locate".
+    Marquee { locate_t: Option<f64> },
     /// Shift-drag from a note's edge: the SELECTION stretches in time.
     /// `orig` is (index, at, dur) at the press; `anchor` is the fixed end.
     Stretch {
@@ -1565,6 +1641,10 @@ impl IvoryApp {
             raise_dialog: false,
             dbg_fret_last: None,
             dismiss_message: false,
+            fx_choice: None,
+            vu_needle: [0.0; 4],
+            vu_at: 0.0,
+            notice_dismissed: None,
             mixer_open: false,
             mixer_scroll: 0,
             arr_lane_scroll: 0,
@@ -1661,6 +1741,8 @@ impl IvoryApp {
             menu_hover_row: None,
             menu_hover_top: None,
             selected_channel: None,
+            selected_tracks: Vec::new(),
+            sel_anchor: None,
             lcd_drag: None,
             input_width: 0,
             cartridge: crate::ports::CartridgeInfo::default(),
@@ -1710,6 +1792,7 @@ impl IvoryApp {
             last_sent_size: None,
             min_sent: None,
             a11y_on: None,
+            reader_was_detected: false,
             arr_auto_open: std::collections::HashSet::new(),
             arr_auto_params: std::collections::HashMap::new(),
             arr_auto_hot: None,
@@ -2143,6 +2226,206 @@ impl IvoryApp {
     }
 
     /// Whether a channel's MIDI reaches the theory view.
+    /// Whether this channel is a folder.
+    pub fn is_folder(&self, ch: usize) -> bool {
+        self.settings.strip_is_folder.get(ch).copied().unwrap_or(false)
+    }
+
+    /// Whether this channel sits inside the folder above it.
+    ///
+    /// **Answered positionally**, so it is false the moment there is no
+    /// folder above — a flag left behind by a reorder draws a flat track
+    /// rather than an orphan indent. See `Settings::strip_in_folder`.
+    pub fn in_folder(&self, ch: usize) -> bool {
+        self.settings.strip_in_folder.get(ch).copied().unwrap_or(false)
+            && self.folder_of(ch).is_some()
+    }
+
+    /// Which folder `ch` belongs to: the nearest folder ABOVE it, with only
+    /// members in between.
+    ///
+    /// The run has to be contiguous. A track marked `in_folder` with a plain
+    /// track between it and the folder is not in that folder — it is a stale
+    /// flag, and treating it as a member would let one reorder swallow every
+    /// track below a folder.
+    pub fn folder_of(&self, ch: usize) -> Option<usize> {
+        if ch == 0 || !self.settings.strip_in_folder.get(ch).copied().unwrap_or(false) {
+            return None;
+        }
+        for n in (0..ch).rev() {
+            if self.settings.strip_is_folder.get(n).copied().unwrap_or(false) {
+                return Some(n);
+            }
+            if !self.settings.strip_in_folder.get(n).copied().unwrap_or(false) {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// Every child of the folder at `ch`, in order. Empty for a plain track.
+    pub fn folder_children(&self, ch: usize) -> Vec<usize> {
+        if !self.is_folder(ch) {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for n in ch + 1..crate::recorder::CHANNELS {
+            if !self.settings.strip_in_folder.get(n).copied().unwrap_or(false) {
+                break;
+            }
+            // A folder closes the run: one level, so a folder is never a
+            // child of another.
+            if self.is_folder(n) {
+                break;
+            }
+            out.push(n);
+        }
+        out
+    }
+
+    /// The tracks a reorder drag actually carries: the selection when the
+    /// grabbed lane is part of one, otherwise just the lane.
+    ///
+    /// The same rule `move_selection` applies, extracted so the folder flags
+    /// are set for exactly the tracks that are about to move — one of them
+    /// deciding differently from the other is how a block ends up half in a
+    /// folder.
+    fn reorder_group(&self, from: usize) -> Vec<usize> {
+        let mut group: Vec<usize> = self
+            .selected_tracks
+            .iter()
+            .copied()
+            .filter(|n| *n < crate::recorder::CHANNELS)
+            .collect();
+        group.sort_unstable();
+        if group.len() < 2 || !group.contains(&from) {
+            return vec![from];
+        }
+        group
+    }
+
+    /// Whether this folder is shut. Meaningless, and false, on a track that
+    /// is not a folder — so a stale flag cannot hide anything.
+    pub fn folder_shut(&self, ch: usize) -> bool {
+        self.is_folder(ch)
+            && self.settings.strip_folder_shut.get(ch).copied().unwrap_or(false)
+    }
+
+    /// Whether this lane is hidden inside a shut folder.
+    pub fn lane_hidden(&self, ch: usize) -> bool {
+        self.folder_of(ch).is_some_and(|f| self.folder_shut(f))
+    }
+
+    /// **Shut a folder, or open it.**
+    ///
+    /// Refused on a track that is not a folder rather than silently setting a
+    /// flag nothing reads: the arrow is only laid out on folders, so reaching
+    /// here otherwise means something else is wrong.
+    fn toggle_folder_shut(&mut self, ch: usize) {
+        if !self.is_folder(ch) {
+            return;
+        }
+        while self.settings.strip_folder_shut.len() < crate::recorder::CHANNELS {
+            self.settings.strip_folder_shut.push(false);
+        }
+        let was = self.folder_shut(ch);
+        if let Some(slot) = self.settings.strip_folder_shut.get_mut(ch) {
+            *slot = !was;
+        }
+        self.save_settings();
+    }
+
+    fn set_is_folder(&mut self, ch: usize, on: bool) {
+        while self.settings.strip_is_folder.len() < crate::recorder::CHANNELS {
+            self.settings.strip_is_folder.push(false);
+        }
+        if let Some(slot) = self.settings.strip_is_folder.get_mut(ch) {
+            *slot = on;
+        }
+    }
+
+    /// **Snap the dragged block into `folder`, at the END of its children.**
+    ///
+    /// Built as an explicit permutation rather than through `move_selection`,
+    /// because that function's `to` means "the row you dropped on" and lands
+    /// a block before or after it depending on which way you dragged. A snap
+    /// has one answer whichever direction the hand came from: after the
+    /// folder's last child.
+    ///
+    /// The flags are set BEFORE the move, on the old indices, so
+    /// `reorder_channels` carries them along with the tracks — the same
+    /// mechanism that keeps gains and colours attached.
+    fn snap_into_folder(&mut self, from: usize, folder: usize) {
+        use crate::recorder::CHANNELS;
+        if folder >= CHANNELS || !self.is_folder(folder) {
+            return;
+        }
+        if self.recorder.state.is_active() || self.recorder.arr_recording {
+            return;
+        }
+        let mut group = self.reorder_group(from);
+        // A folder cannot be dragged into a folder, and cannot be dragged
+        // into ITSELF. Dropping only folders on a folder is a no-op rather
+        // than a structure nothing can draw.
+        group.retain(|n| *n != folder && !self.is_folder(*n));
+        if group.is_empty() {
+            return;
+        }
+        for n in &group {
+            self.set_in_folder(*n, true);
+        }
+        let anchor = self.folder_children(folder).last().copied().unwrap_or(folder);
+        let rest: Vec<usize> = (0..CHANNELS).filter(|n| !group.contains(n)).collect();
+        let at = rest.iter().take_while(|n| **n <= anchor).count();
+        let mut order = rest;
+        for (k, g) in group.iter().enumerate() {
+            order.insert(at + k, *g);
+        }
+        self.reorder_channels(&order);
+    }
+
+    fn set_in_folder(&mut self, ch: usize, on: bool) {
+        while self.settings.strip_in_folder.len() < crate::recorder::CHANNELS {
+            self.settings.strip_in_folder.push(false);
+        }
+        if let Some(slot) = self.settings.strip_in_folder.get_mut(ch) {
+            *slot = on;
+        }
+    }
+
+    /// **The folder box: make this track a folder, or stop it being one.**
+    ///
+    /// Turning it OFF releases the children rather than orphaning them —
+    /// the owner's rule, and the only honest reading of "disable the parent
+    /// track from being a folder altogether". Leaving the flags set would
+    /// leave a row of indented tracks under a track that is no longer their
+    /// parent, which is a picture of a folder that is not one.
+    ///
+    /// A track that is itself inside a folder cannot become one: folders are
+    /// one level deep, so the gesture takes it OUT of its folder first.
+    fn toggle_folder(&mut self, ch: usize) {
+        if ch >= crate::recorder::CHANNELS {
+            return;
+        }
+        while self.settings.strip_is_folder.len() < crate::recorder::CHANNELS {
+            self.settings.strip_is_folder.push(false);
+        }
+        let was = self.is_folder(ch);
+        if was {
+            for n in self.folder_children(ch) {
+                self.set_in_folder(n, false);
+            }
+        } else {
+            // Out of whatever folder it was in — one level.
+            self.set_in_folder(ch, false);
+        }
+        if let Some(slot) = self.settings.strip_is_folder.get_mut(ch) {
+            *slot = !was;
+        }
+        self.save_settings();
+        self.undo_commit();
+    }
+
     pub fn to_theory(&self, ch: usize) -> bool {
         self.settings.strip_to_theory.get(ch).copied().unwrap_or(false)
     }
@@ -2639,7 +2922,7 @@ impl IvoryApp {
             },
             H::Routing(_) => 0.0,
             H::Pan(i) => view.strips.get(i.0).map_or(0.5, |s| (s.pan + 1.0) * 0.5),
-            H::Mute(_) | H::Solo(_) | H::Add(_) | H::Insert(..) | H::ToTheory(_)
+            H::Mono(_) | H::Mute(_) | H::Solo(_) | H::Add(_) | H::Insert(..) | H::ToTheory(_)
             | H::Db(_) | H::Name(_) | H::Remove(_) | H::Arm(_)
             | H::FxMenu(..) | H::InputChip(_) => 0.0,
         }
@@ -2700,7 +2983,129 @@ impl IvoryApp {
     /// and the mixer show the same numbers because there is one copy of each
     /// and both read it — which is the whole reason the band did not have to
     /// change to make room for this.
+    /// The OTHER selected tracks a gesture on `n` should carry with it.
+    ///
+    /// Empty unless `n` is itself in a selection of more than one, which is
+    /// what keeps every ordinary single-track gesture on exactly one track.
+    fn selection_partners(&self, n: usize) -> Vec<usize> {
+        let mut out: Vec<usize> =
+            if self.selected_tracks.len() < 2 || !self.selected_tracks.contains(&n) {
+                Vec::new()
+            } else {
+                self.selected_tracks
+                    .iter()
+                    .copied()
+                    .filter(|x| *x != n && *x < crate::recorder::CHANNELS)
+                    .collect()
+            };
+        out
+    }
+
+    /// `n`, plus everybody selected with it — the set an operation aimed at
+    /// `n` should reach.
+    ///
+    /// [`Self::selection_partners`] answers with the OTHERS, which is what a
+    /// delta-spreading control wants because it has already moved the one it
+    /// was handed. An absolute operation wants the whole set including `n`,
+    /// and computing that at each call site is how two of them came to forget.
+    fn selection_with(&self, n: usize) -> Vec<usize> {
+        let mut all = vec![n];
+        all.extend(self.selection_partners(n));
+        all
+    }
+
+    /// Which channel a mixer hit is aimed at, if it is aimed at one.
+    fn hit_channel(hit: crate::mixer_panel::Hit) -> Option<usize> {
+        match hit.column().strip() {
+            Some(crate::recorder::Strip::Channel(n)) => Some(n),
+            _ => None,
+        }
+    }
+
+    /// **Apply a control to every selected track, not just the one touched.**
+    ///
+    /// Two rules, because two kinds of control:
+    ///
+    /// * A SWITCH — mute, solo, arm, send-to-theory — puts the whole selection
+    ///   into the state the touched one landed in. Toggling each independently
+    ///   would scatter them, which is the opposite of what selecting several
+    ///   and pressing one is for.
+    /// * A LEVEL — fader, pan, send — moves the others by the same DELTA. An
+    ///   absolute value would flatten four carefully balanced tracks onto one
+    ///   number, and nobody drags a group fader hoping for that.
+    ///
+    /// Everything else is a door onto one channel — its name, its number
+    /// field, one of its bays, its input menu — and doors do not spread.
     fn apply_mixer_hit(&mut self, hit: crate::mixer_panel::Hit, value: f32) {
+        use crate::mixer_panel::Hit as H;
+        use crate::recorder::Column;
+        let Some(n) = Self::hit_channel(hit) else {
+            self.apply_mixer_hit_one(hit, value);
+            return;
+        };
+        let others = self.selection_partners(n);
+        if others.is_empty() {
+            self.apply_mixer_hit_one(hit, value);
+            return;
+        }
+        // Read BEFORE the touched track moves, so a level's delta is the
+        // distance it actually travelled.
+        let before = self.mixer_value(hit);
+        self.apply_mixer_hit_one(hit, value);
+        match hit {
+            H::Fader(_) | H::Send(_) | H::Pan(_) => {
+                let delta = self.mixer_value(hit) - before;
+                if delta == 0.0 {
+                    return;
+                }
+                for m in others {
+                    let their = match hit {
+                        H::Fader(_) => H::Fader(Column(m)),
+                        H::Send(_) => H::Send(Column(m)),
+                        _ => H::Pan(Column(m)),
+                    };
+                    let to = (self.mixer_value(their) + delta).clamp(0.0, 1.0);
+                    self.apply_mixer_hit_one(their, to);
+                }
+            }
+            H::Mute(_) | H::Solo(_) | H::Arm(_) | H::ToTheory(_) => {
+                // The state the touched one is now IN, forced onto the rest.
+                // Each of these is a toggle underneath, so a track already
+                // matching is left alone rather than flipped away.
+                let want = self.strip_switch(hit, n);
+                for m in others {
+                    let their = match hit {
+                        H::Mute(_) => H::Mute(Column(m)),
+                        H::Solo(_) => H::Solo(Column(m)),
+                        H::Arm(_) => H::Arm(Column(m)),
+                        _ => H::ToTheory(Column(m)),
+                    };
+                    if self.strip_switch(their, m) != want {
+                        self.apply_mixer_hit_one(their, value);
+                    }
+                }
+            }
+            // Remove spreads inside `remove_selected_channels`, which is
+            // where the ordering that makes it safe lives.
+            H::Remove(_) => {}
+            _ => {}
+        }
+    }
+
+    /// Whether one of the four switches is on for channel `n`.
+    fn strip_switch(&self, hit: crate::mixer_panel::Hit, n: usize) -> bool {
+        use crate::mixer_panel::Hit as H;
+        let bit = crate::recorder::Column(n).desk_index();
+        match hit {
+            H::Mute(_) => self.settings.strip_muted & (1 << bit) != 0,
+            H::Solo(_) => self.settings.strip_soloed & (1 << bit) != 0,
+            H::Arm(_) => self.armed & (1 << n) != 0,
+            H::ToTheory(_) => self.to_theory(n),
+            _ => false,
+        }
+    }
+
+    fn apply_mixer_hit_one(&mut self, hit: crate::mixer_panel::Hit, value: f32) {
         use crate::mixer_panel::Hit as H;
         use crate::recorder::Strip;
         let v = value.clamp(0.0, 1.0);
@@ -2820,7 +3225,8 @@ impl IvoryApp {
             // control lives inside a window nothing opens is an effect you
             // cannot use — which is what a rack was until now.
             H::Insert(i, n) => {
-                self.open_insert_face(i.desk_index(), n);
+                let (seat, bay) = self.slot_seat(i, n);
+                self.open_insert_face(seat, bay);
                 return;
             }
             // Click the number and edit it: the field opens saying exactly
@@ -2873,7 +3279,9 @@ impl IvoryApp {
             // it used to ride retired with the BACKING column.
             H::Remove(i) => {
                 if let Some(Strip::Channel(n)) = i.strip() {
-                    self.remove_channel(n);
+                    // The whole selection, when this track is in one — the ×
+                    // on a strip means the same thing as Delete on it.
+                    self.remove_selected_channels(n);
                 }
                 return;
             }
@@ -2889,6 +3297,14 @@ impl IvoryApp {
                     let on = self.to_theory(n);
                     self.set_to_theory(n, !on);
                 }
+                return;
+            }
+            // **The master's mono fold.** A mix check, remembered across
+            // sessions: somebody who works in mono works in mono all day.
+            // The host pushes it to the engine after the frame.
+            H::Mono(_) => {
+                self.settings.master_mono = !self.settings.master_mono;
+                self.save_settings();
                 return;
             }
             H::Arm(i) => {
@@ -2915,10 +3331,12 @@ impl IvoryApp {
                 self.mixer_fx_menu = None;
                 match action {
                     crate::mixer_panel::FxAction::Delete => {
-                        self.set_insert(i.desk_index(), n, None);
+                        let (seat, bay) = self.slot_seat(i, n);
+                        self.set_insert(seat, bay, None);
                     }
                     crate::mixer_panel::FxAction::Replace => {
-                        self.open_insert_picker(i.desk_index(), n);
+                        let (seat, bay) = self.slot_seat(i, n);
+                        self.open_insert_picker(seat, bay);
                     }
                     crate::mixer_panel::FxAction::Dismiss => {}
                 }
@@ -2939,6 +3357,24 @@ impl IvoryApp {
     /// Leaving any of it behind would make the next thing added here inherit
     /// a stranger's settings, which is worse than either keeping the channel
     /// or losing it.
+    /// Remove `n`, and every other selected track with it.
+    ///
+    /// **Highest index first**, because removing a channel shuffles the ones
+    /// below it up — taking them in ascending order would make every index
+    /// after the first one point at the wrong track. The selection is emptied
+    /// afterwards: half of what it named is gone.
+    fn remove_selected_channels(&mut self, n: usize) {
+        let mut all = self.selection_partners(n);
+        all.push(n);
+        all.sort_unstable_by(|a, b| b.cmp(a));
+        for m in all {
+            self.remove_channel(m);
+        }
+        self.selected_tracks.clear();
+        self.selected_channel = None;
+        self.sel_anchor = None;
+    }
+
     fn remove_channel(&mut self, n: usize) {
         self.settings.tracks_added &= !(1 << n);
         use crate::recorder::Strip;
@@ -3031,6 +3467,14 @@ impl IvoryApp {
         self.open_mixer_for_shot();
         self.mixer_open = false;
         self.arrangement_open = true;
+        // **A folder with two tracks in it, for the photograph.** The box and
+        // the indent are the whole feature and neither shows on a flat list,
+        // so the picture that is supposed to document the timeline has to
+        // contain one.
+        self.set_is_folder(1, true);
+        for n in [2_usize, 3] {
+            self.set_in_folder(n, true);
+        }
         let mut arr = crate::arrangement::Arrangement::default();
         let backing = arr.add_clip(crate::arrangement::ArrClip {
             kind: crate::arrangement::ClipKind::Audio,
@@ -3208,6 +3652,21 @@ impl IvoryApp {
             .map(|c| c.id)
         {
             self.open_midi_editor(id);
+            // **Velocities that SPREAD, for the photograph.**
+            //
+            // The shot's notes were all one velocity, so the velocity lane
+            // came out a row of identical bars in identical colours — which
+            // photographs a gradient without showing one, and a gradient is
+            // exactly the thing that has to be checked by eye here. Ramped
+            // across the clip so the picture carries both ends of the theme's
+            // ramp and everything between.
+            if let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) {
+                let n = clip.notes.len().max(1) - 1;
+                for (i, note) in clip.notes.iter_mut().enumerate() {
+                    let t = if n == 0 { 1.0 } else { i as f32 / n as f32 };
+                    note.vel = (8.0 + t * 119.0).round().clamp(1.0, 127.0) as u8;
+                }
+            }
         }
     }
 
@@ -3357,6 +3816,8 @@ impl IvoryApp {
                 Strip::Fx => ("FX BUS", "reverb · delay · chorus", g.fx_return, false),
             };
             crate::mixer_panel::StripView {
+                // Master only; a channel has no fold of its own.
+                mono: false,
                 to_theory: match s {
                     Strip::Channel(n) => self.to_theory(n),
                     _ => false,
@@ -3392,8 +3853,12 @@ impl IvoryApp {
                     _ => true,
                 },
                 gr_db: 0.0,
+                // **Through `seat_bay`**, which is the one place that knows
+                // a strip's Nth slot may live in another rack — the master's
+                // first three do. Everything else answers itself.
                 inserts: std::array::from_fn(|n| {
-                    self.insert(i, n).map_or("", plugin_display_name)
+                    let (seat, bay) = crate::recorder::seat_bay(i, n);
+                    self.insert(seat, bay).map_or("", plugin_display_name)
                 }),
                 kind,
                 icon,
@@ -3433,6 +3898,7 @@ impl IvoryApp {
             strips: std::array::from_fn(|i| match channels.get(i) {
                 Some(s) => strip(*s),
                 None => crate::mixer_panel::StripView {
+                    mono: self.settings.master_mono,
                     // The master is not a channel and has no MIDI to send.
                     to_theory: false,
                     route_count: 0,
@@ -3455,9 +3921,19 @@ impl IvoryApp {
                     // the master came out the same bone as the empty slots
                     // beside it on every theme including the default.
                     color: self.strip_color(crate::recorder::STRIPS),
+                    // **Through `seat_bay`, like every other strip.** The
+                    // master is the one strip whose six slots do NOT live in
+                    // one rack — its first three are the extra seat appended
+                    // past the pads — and this block filled them by indexing
+                    // straight into `strip_inserts`, which reads its own first
+                    // three twice and then walks into the drum seat's. So the
+                    // rack showed the wrong plugin names in half its bays: the
+                    // top three named the bottom three, and the bottom three
+                    // named something that was never on the master at all.
                     inserts: std::array::from_fn(|n| {
-                        self.insert(crate::recorder::STRIPS, n)
-                            .map_or("", plugin_display_name)
+                        let (seat, bay) =
+                            crate::recorder::seat_bay(crate::recorder::STRIPS, n);
+                        self.insert(seat, bay).map_or("", plugin_display_name)
                     }),
                     kind: None,
                     empty: false,
@@ -3484,6 +3960,7 @@ impl IvoryApp {
                 .mixer_scroll
                 .min(crate::recorder::CHANNELS.saturating_sub(self.mixer_visible())),
             selected: self.selected_channel,
+            selected_tracks: &self.selected_tracks,
             fx_menu: self.mixer_fx_menu,
             typing: self
                 .mixer_typing
@@ -3632,7 +4109,7 @@ impl IvoryApp {
 
     fn menu_view(&self) -> MenuView {
         MenuView {
-            screen_reader: self.settings.screen_reader_mode,
+            screen_reader: self.reader_mode(),
             // The desk's own face, in the mode the app is in — the menu is
             // made of the same material as the surfaces it opens over.
             face: {
@@ -3728,29 +4205,56 @@ impl IvoryApp {
         }
     }
 
-    fn open_menu_at(&mut self, ctx: &egui::Context, global_pos: Pos2) {
-        self.menu_state = Some(MenuState::open(
-            ctx,
-            self.menu_view(),
-            global_pos,
-            self.monitor_size,
-        ));
+    /// The band's own menu, at a point already put through
+    /// [`Self::surface_frame`] by its caller.
+    fn open_menu_at(&mut self, ctx: &egui::Context, anchor: Pos2) {
+        let (_, box_) = self.surface_frame();
+        self.menu_state = Some(MenuState::open(ctx, self.menu_view(), anchor, box_));
     }
 
     /// The GLOBAL cut of the menu — what a right-click on the arrangement
     /// or the MIDI editor opens: Project, Plugin folders, MIDI input,
     /// Window, Colors, and the tail. See `MenuView::global_only`.
+    /// **Where a menu or a dialog is positioned, and in whose coordinates.**
+    ///
+    /// Two different systems, and which is right depends on whether the
+    /// surface is its own OS window or a LAYER inside ours:
+    ///
+    /// * A window is placed on the desktop, so its anchor is in SCREEN
+    ///   points and it is clamped to the monitor.
+    /// * A layer is placed inside our canvas, so its anchor is WINDOW-LOCAL
+    ///   — the coordinates every pointer read in this crate already gives —
+    ///   and it is clamped to the canvas.
+    ///
+    /// Everything used to compute the first unconditionally. That is right
+    /// on the desktop and silently wrong the moment `child_windows` goes
+    /// false, which happens whenever a screen reader is attached: the anchor
+    /// arrived several hundred points too far right and down, the inline
+    /// shell clamped it to the canvas edge, and every menu opened jammed
+    /// into a corner nowhere near the hand. The owner's report — "opens WAY
+    /// off the cursor point... so does the welcome message" — was measured
+    /// at an offset of exactly `(853, 62)`, this window's own origin.
+    ///
+    /// Returns the origin to ADD to a window-local point, and the box to
+    /// clamp the result inside.
+    fn surface_frame(&self) -> (Vec2, Option<Vec2>) {
+        if self.caps.child_windows {
+            (self.main_inner_origin.to_vec2(), self.monitor_size)
+        } else {
+            // `last_pane` is what the app was given to draw in, which is
+            // exactly the box `shell::surface` clamps an inline surface to.
+            (Vec2::ZERO, Some(self.last_pane).filter(|p| p.x > 0.0 && p.y > 0.0))
+        }
+    }
+
     fn open_global_menu_at(&mut self, ctx: &egui::Context, at: Pos2) {
         // `at` is WINDOW-LOCAL — every caller reads the pointer straight
-        // from the egui context. The menu is its own OS window on the
-        // desktop, so the anchor must be SCREEN coordinates, exactly as
-        // the piano's path converts them (`main_inner_origin + pos`).
-        // Passing the local point put the menu at the screen's top-left
-        // corner — or clean off the display, from the editor.
-        let global = self.main_inner_origin + at.to_vec2();
+        // from the egui context. See `surface_frame` for why that is
+        // sometimes the answer and sometimes half of it.
+        let (origin, box_) = self.surface_frame();
         let mut view = self.menu_view();
         view.global_only = true;
-        self.menu_state = Some(MenuState::open(ctx, view, global, self.monitor_size));
+        self.menu_state = Some(MenuState::open(ctx, view, at + origin, box_));
     }
 
     /// Colour of the supporter heart, or None when it should not be drawn.
@@ -3764,12 +4268,91 @@ impl IvoryApp {
     /// and it is written out rather than derived so the two cannot drift.
     fn strip_heart_color(&self) -> Option<egui::Color32> {
         let band_in_window = self.settings.show_recorder && !self.settings.recorder_detached;
-        (!band_in_window).then(|| self.heart_color()).flatten()
+        (!band_in_window).then(|| self.heart_color(0.0)).flatten()
     }
 
-    fn heart_color(&self) -> Option<egui::Color32> {
+    /// How long the supporter heart's wave takes to walk all sixteen colours.
+    ///
+    /// **Fast enough to read as a wave.** The first pass took twenty-four
+    /// seconds on the reasoning that a thing in the corner of a window
+    /// somebody works in for hours should not fidget — but at that rate
+    /// nothing is travelling, it is one colour slowly changing its mind, and
+    /// the owner's word was that it has to move.
+    const HEART_CYCLE_S: f64 = 6.0;
+
+    /// How many of the sixteen are on the heart at once.
+    ///
+    /// The sprite is eleven diagonal steps corner to corner, so four colours
+    /// across it makes bands about three pixels wide — wide enough to be a
+    /// band rather than a dither, narrow enough that several are visible and
+    /// the movement has something to be measured against.
+    const HEART_BANDS: f32 = 4.0;
+
+    /// The bright shade at diagonal `phase` of the heart, at time `t`.
+    ///
+    /// **Stepped, not blended.** A crossfade between neighbouring colours is
+    /// the graceful shift this replaced; a wave needs edges, so the colour is
+    /// chosen whole and the band it belongs to is what moves.
+    fn heart_wave(&self, phase: f32, t: f64) -> egui::Color32 {
+        let n = crate::recorder::CHANNELS;
+        let travel = t / Self::HEART_CYCLE_S * n as f64;
+        let at = f64::from(phase) * f64::from(Self::HEART_BANDS) + travel;
+        // **Through the heart's own palette, not the desk's.** The animated
+        // set is sixteen because there are sixteen auto-palettes, and the
+        // slot is which one — so left-clicking a drifting heart walks it
+        // through Valentine, Hydra, Navi and the rest rather than doing
+        // nothing visible.
+        self.heart_palette_slot_in(
+            self.settings.heart_slot,
+            at.rem_euclid(n as f64) as usize % n,
+        )
+    }
+
+    /// One of the active palette's sixteen, as a bright shade for the heart.
+    /// A colour from a NAMED palette — the animated set's road.
+    fn heart_palette_slot_in(&self, palette: i64, i: usize) -> egui::Color32 {
+        let n = crate::mixer_panel::PALETTES.len();
+        let pal = &crate::mixer_panel::PALETTES[palette.rem_euclid(n as i64) as usize];
+        let idx = pal.slot(i % crate::recorder::CHANNELS);
+        let (r, g, b) = crate::mixer_panel::STRIP_COLORS[idx];
+        crate::recorder_panel::heart_shade(
+            egui::Color32::from_rgb(r, g, b),
+            crate::recorder_panel::band_face(&self.settings),
+        )
+    }
+
+    fn heart_palette_slot(&self, i: usize) -> egui::Color32 {
+        let idx = self.palette().slot(i % crate::recorder::CHANNELS);
+        let (r, g, b) = crate::mixer_panel::STRIP_COLORS[idx];
+        crate::recorder_panel::heart_shade(
+            egui::Color32::from_rgb(r, g, b),
+            crate::recorder_panel::band_face(&self.settings),
+        )
+    }
+
+    fn heart_color(&self, t: f64) -> Option<egui::Color32> {
         if !self.settings.show_heart {
             return None;
+        }
+        // **Supporters get the palette, and get it moving.** The heart is
+        // drawn for everybody — the thanks card behind it is for the people
+        // who made the app exist, not for anybody's purchase — but the
+        // colour system is the one thing a key does buy, and it arrives the
+        // instant the key goes in because it is derived from the licence
+        // every frame rather than latched at startup.
+        if self.license.is_supporter() {
+            // The ANIMATED case has no single colour — every pixel has its own
+            // — so this answers with the head of the wave, which is what the
+            // hover card and anything else asking "what colour is it" wants.
+            return Some(if self.settings.heart_animate {
+                self.heart_wave(0.0, t)
+            } else {
+                self.heart_palette_slot(
+                    self.settings
+                        .heart_slot
+                        .rem_euclid(crate::recorder::CHANNELS as i64) as usize,
+                )
+            });
         }
         // **Drawn for everybody, in the colour they chose.** The heart is the
         // way into the thanks card, and the people on that card are being
@@ -3782,6 +4365,64 @@ impl IvoryApp {
         // rem_euclid so a hand-edited negative index still lands in range.
         let idx = self.settings.heart_color.rem_euclid(n) as usize;
         Some(chord_strip::HEART_COLORS[idx])
+    }
+
+    /// **The heart has two sets of sixteen, and two gestures.**
+    ///
+    /// LEFT click walks the current set. RIGHT click swaps which set you are
+    /// walking. `heart_slot` is the position in whichever one is live, so one
+    /// index serves both and switching sets keeps your place:
+    ///
+    /// * ANIMATED — the travelling wave, drawn through one of the sixteen
+    ///   auto-palettes. The slot chooses the palette.
+    /// * BASE — one flat colour, the slot chooses which of the live palette's
+    ///   sixteen.
+    ///
+    /// This replaces a single seventeen-stop ring on the right button, which
+    /// was the fix for it being a one-way door and was still one gesture doing
+    /// two jobs: you could not reach a particular animated palette without
+    /// walking past every flat colour to get there.
+    /// A press on the heart. `true` when it was the heart's, and the caller
+    /// must not go on to open a menu or sound a note.
+    ///
+    /// One function for both buttons because the TARGET is the fiddly part —
+    /// a small sprite, only on a laid-out band, only for a supporter — and
+    /// two copies of that test is two places for the hit region to drift from
+    /// the drawn one.
+    fn heart_press(
+        &mut self,
+        pos: Pos2,
+        recorder_rect: Option<Rect>,
+        secondary: bool,
+    ) -> bool {
+        if !self.license.is_supporter() || !self.settings.show_heart {
+            return false;
+        }
+        let Some(r) = recorder_rect.filter(|r| r.contains(pos)) else {
+            return false;
+        };
+        let hr = recorder_panel::heart_rect(r, &self.recorder_layout_view());
+        if !hr.is_positive() || !hr.expand(3.0).contains(pos) {
+            return false;
+        }
+        if secondary {
+            // The other set, keeping your place in it.
+            self.settings.heart_animate = !self.settings.heart_animate;
+        } else {
+            self.settings.heart_slot = Self::heart_step(
+                self.settings.heart_slot,
+                crate::recorder::CHANNELS as i64,
+            );
+        }
+        self.save_settings();
+        true
+    }
+
+    fn heart_step(slot: i64, n: i64) -> i64 {
+        let n = n.max(1);
+        // rem_euclid first, so a hand-edited or out-of-range slot rejoins the
+        // ring rather than running off the end of it.
+        (slot.rem_euclid(n) + 1).rem_euclid(n)
     }
 
     // ── Main-window interaction ────────────────────────────────────────────
@@ -3876,7 +4517,19 @@ impl IvoryApp {
                 }
             }
             if let Some(pos) = pointer {
-                let global = self.main_inner_origin + pos.to_vec2();
+                let (menu_origin, _) = self.surface_frame();
+                let global = pos + menu_origin;
+                // **The heart takes the press before the band's menu sees it.**
+                //
+                // **RIGHT click swaps which set of sixteen you are in** —
+                // the travelling wave, or the flat colours. LEFT click walks
+                // whichever one is live; see `heart_press`. Supporters only,
+                // because they are the only ones wearing the palette — for
+                // everybody else the heart has no second colour system and the
+                // press should open the band's menu as it always did.
+                if self.heart_press(pos, recorder_rect, true) {
+                    return;
+                }
                 // A right-click ON the Recorder band opens the menu with the
                 // Recorder at the top. The band is where its own settings
                 // belong: it is a surface with fifteen controls on it, and
@@ -4128,7 +4781,7 @@ impl IvoryApp {
                     // instrument column, so the two can never contend — but
                     // checking first is what keeps that true if the column
                     // ever grows back into it.
-                    if self.heart_color().is_some()
+                    if self.heart_color(0.0).is_some()
                         && recorder_panel::heart_rect(r, &self.recorder_layout_view())
                             .contains(pos)
                     {
@@ -4232,9 +4885,17 @@ impl IvoryApp {
                 {
                     return;
                 }
-                // The supporter heart cycles colour on click. Checked before the
-                // keytoggle hit-test because it sits in the chord strip, not the
-                // keyboard, so the two can never contend.
+                // **The supporter heart walks its set on a LEFT click.**
+                //
+                // Checked here, before the keytoggle and the piano, because
+                // it sits on top of the band and a press that landed on the
+                // sprite must not also sound a note or open a menu. The right
+                // button — which swaps WHICH set — is handled on the
+                // secondary path; both go through `heart_press`, so the hit
+                // region is decided once.
+                if self.heart_press(pos, recorder_rect, false) {
+                    return;
+                }
                 // The transpose arrows, top-left of the chord view. Checked
                 // before the keytoggle hit-test for the same reason the heart
                 // and the capo are: they sit on top, so they take the click.
@@ -4797,7 +5458,8 @@ impl IvoryApp {
         // The DIAL itself, not its cell: the cell is mostly margin, and a
         // right-click two ticks into the paint was eaten as the knob's.
         let cell = recorder_panel::knob_rect(r, &view, h)?;
-        recorder_panel::on_knob_circle(cell, pos).then_some(h)
+        let vari = matches!(h, recorder_panel::Hit::SetVarispeed(_));
+        recorder_panel::on_knob_circle(cell, pos, vari).then_some(h)
     }
 
     /// Whether `pos` is on a fader — its track, its icon or its number.
@@ -4817,7 +5479,7 @@ impl IvoryApp {
         let view = self.recorder_layout_view();
         recorder_panel::Fx::ALL.into_iter().find(|fx| {
             recorder_panel::knob_rect(band, &view, fx.hit())
-                .is_some_and(|cell| recorder_panel::on_knob_circle(cell, pos))
+                .is_some_and(|cell| recorder_panel::on_knob_circle(cell, pos, false))
         })
     }
 
@@ -4893,14 +5555,29 @@ impl IvoryApp {
         if !pressed {
             return;
         }
-        match recorder_panel::fx_hit_test(screen, anchor, fx, pos) {
+        let open = self
+            .fx_choice
+            .map(|k| (k, self.choice_list(k).0.len()));
+        match recorder_panel::fx_hit_test(screen, anchor, fx, pos, open, self.delay_is_free()) {
             Some(recorder_panel::FxHit::Set { key, value }) => {
                 self.fx_drag = Some(key);
                 self.set_effect_param(key, value);
             }
-            Some(recorder_panel::FxHit::NextChoice { key }) => self.next_choice(key),
+            Some(recorder_panel::FxHit::OpenChoice { key }) => {
+                // A second press on the same row puts it away, which is what
+                // every menu in the app does and what a hand expects.
+                self.fx_choice = (self.fx_choice != Some(key)).then_some(key);
+            }
+            Some(recorder_panel::FxHit::PickChoice { key, index }) => {
+                self.pick_choice(key, index);
+                self.fx_choice = None;
+            }
+            Some(recorder_panel::FxHit::CloseChoice) => self.fx_choice = None,
             Some(recorder_panel::FxHit::Reset(fx)) => self.reset_effect(fx),
-            Some(recorder_panel::FxHit::Close) => self.fx_open = None,
+            Some(recorder_panel::FxHit::Close) => {
+                self.fx_open = None;
+                self.fx_choice = None;
+            }
             // A press on the panel's own chrome is swallowed; one outside it
             // closes the panel and does nothing else — SPENT, so the
             // surfaces that read `band_popup_owns` later this frame do not
@@ -5521,7 +6198,7 @@ impl IvoryApp {
 
     /// A fresh, empty project beside the others, opened immediately.
     pub fn new_project(&mut self) {
-        let root = self.record_root().join("Projects");
+        let root = self.project_root();
         let dir = fresh_project_dir(&root);
         let doc = dir.join("project.tangent");
         // **A reclaimed scratch sheds its kit.** An unnamed Untitled gets
@@ -6137,7 +6814,7 @@ impl IvoryApp {
     /// fader, pan, send, mute, solo, arm, bays (the host moves their saved
     /// states), and every clip on its lane. The rows between shift by one.
     pub fn move_channel(&mut self, from: usize, to: usize) {
-        use crate::recorder::{CHANNELS, INSERTS, STRIPS};
+        use crate::recorder::CHANNELS;
         if from >= CHANNELS || to >= CHANNELS || from == to {
             return;
         }
@@ -6152,6 +6829,60 @@ impl IvoryApp {
         let mut order: Vec<usize> = (0..CHANNELS).collect();
         let ch = order.remove(from);
         order.insert(to, ch);
+        self.reorder_channels(&order);
+    }
+
+    /// **Carry the whole SELECTION to the drop, not just the lane grabbed.**
+    ///
+    /// The selected tracks land as one block, in the order they were already
+    /// in, at the row the drop hit. Working out where means counting in terms
+    /// of the lanes that are NOT moving: "the third track down" is a different
+    /// row once three tracks above it have been lifted out, and rotating them
+    /// one at a time with `move_channel` walks the target out from under
+    /// itself after the first one lands.
+    pub fn move_selection(&mut self, from: usize, to: usize) {
+        use crate::recorder::CHANNELS;
+        let mut group: Vec<usize> = self
+            .selected_tracks
+            .iter()
+            .copied()
+            .filter(|n| *n < CHANNELS)
+            .collect();
+        group.sort_unstable();
+        if group.len() < 2 || !group.contains(&from) {
+            self.move_channel(from, to);
+            return;
+        }
+        if self.recorder.state.is_active() || self.recorder.arr_recording {
+            return;
+        }
+        let rest: Vec<usize> = (0..CHANNELS).filter(|n| !group.contains(n)).collect();
+        // **Where a single track would have landed.** `move_channel` removes
+        // the lane and inserts at `to` in what is left, which puts a track
+        // dragged DOWN after the row it was dropped on and one dragged UP
+        // before it. The block has to land in the same place or dragging four
+        // tracks would answer differently from dragging one of them.
+        let at = rest
+            .iter()
+            .take_while(|n| if from < to { **n <= to } else { **n < to })
+            .count();
+        let mut order = rest;
+        for (k, g) in group.iter().enumerate() {
+            order.insert(at + k, *g);
+        }
+        self.reorder_channels(&order);
+    }
+
+    /// Put the channels in `order`, where `order[new] = old`.
+    ///
+    /// Split out of [`Self::move_channel`] so a multiple selection can hand it
+    /// an order it worked out for itself. Everything that names a lane —
+    /// clips, routes, automation, the selection itself — follows.
+    fn reorder_channels(&mut self, order: &[usize]) {
+        use crate::recorder::{CHANNELS, INSERTS, STRIPS};
+        if order.len() != CHANNELS {
+            return;
+        }
         // And the inverse, for everything that NAMES a lane.
         let mut inv = [0usize; crate::recorder::CHANNELS];
         for (new, old) in order.iter().enumerate() {
@@ -6213,7 +6944,32 @@ impl IvoryApp {
         for n in 0..CHANNELS {
             self.settings.strip_sends[n] = sends[order[n]];
         }
-        let full = (STRIPS + 1 + crate::recorder::DRUM_PADS) * INSERTS;
+        // **The per-channel `Vec<bool>` flags, which were being left behind.**
+        //
+        // `strip_to_theory` was not in this function at all: reordering
+        // tracks moved the gains, the colours, the names, the inserts and
+        // every mask — and left the T switches on whichever rows those
+        // channels used to occupy. Silent, because the switch went on drawing
+        // a correct-looking state; it was simply a different track's.
+        //
+        // The two folder flags have the same requirement, and this is where
+        // that requirement is met for all three at once rather than in three
+        // places somebody can forget one of.
+        for v in [
+            &mut self.settings.strip_to_theory,
+            &mut self.settings.strip_is_folder,
+            &mut self.settings.strip_in_folder,
+            &mut self.settings.strip_folder_shut,
+        ] {
+            while v.len() < CHANNELS {
+                v.push(false);
+            }
+            let was = v.clone();
+            for n in 0..CHANNELS {
+                v[n] = was[order[n]];
+            }
+        }
+        let full = crate::recorder::INSERT_SPACE;
         while self.settings.strip_inserts.len() < full {
             self.settings.strip_inserts.push(String::new());
         }
@@ -6236,6 +6992,16 @@ impl IvoryApp {
         self.selected_channel = self.selected_channel.map(|n| {
             if n < CHANNELS { inv[n] } else { n }
         });
+        // The whole selection follows the same map, or a reorder would leave
+        // the rim behind on whichever tracks happened to take those rows.
+        for n in &mut self.selected_tracks {
+            if *n < CHANNELS {
+                *n = inv[*n];
+            }
+        }
+        self.sel_anchor = self.sel_anchor.map(|n| {
+            if n < CHANNELS { inv[n] } else { n }
+        });
         self.input_menu = None;
         self.mixer_naming = None;
         self.mixer_typing = None;
@@ -6254,7 +7020,7 @@ impl IvoryApp {
             }
         }
 
-        self.desk_state_perm = Some(order);
+        self.desk_state_perm = Some(order.to_vec());
         self.save_settings();
         self.arr_save_edits();
     }
@@ -8006,21 +8772,30 @@ impl IvoryApp {
             c.len_s = head;
             c.fade_in_s = c.fade_in_s.min(head);
             c.fade_out_s = 0.0;
-            // A MIDI clip's notes divide at the cut: the tail's move to its
-            // own zero, and a note the blade passes through is clamped to
-            // the head — a note cannot sound across two clips.
-            let tail_notes: Vec<crate::arrangement::ArrNote> = c
-                .notes
-                .iter()
-                .filter(|n| n.at_s >= head)
-                .map(|n| crate::arrangement::ArrNote {
-                    at_s: n.at_s - head,
-                    ..n.clone()
-                })
-                .collect();
-            c.notes.retain(|n| n.at_s < head);
+            // **A MIDI clip's notes divide at the cut, in SOURCE time.**
+            //
+            // A note's `at_s` is a time in the source, and every reader turns
+            // it into a position with `clip.start_s + (n.at_s - clip.offset_s)`
+            // — the editor and the lane miniature both. So the blade falls at
+            // `offset_s + head`, not at `head`: the two are only the same on a
+            // clip that has never been trimmed, which is why this survived.
+            //
+            // The tail's notes therefore keep their source times UNTOUCHED.
+            // They were being rebased to the tail's own zero AND given an
+            // `offset_s` advanced by the same amount, which subtracts the cut
+            // twice: every note in the tail landed `head` seconds early, which
+            // on any real split is before the tail begins — so the notes were
+            // either in the wrong place or filtered out of existence, which is
+            // exactly what the owner saw.
+            //
+            // A note the blade passes through is clamped to the head; a note
+            // cannot sound across two clips.
+            let cut = c.offset_s + head;
+            let tail_notes: Vec<crate::arrangement::ArrNote> =
+                c.notes.iter().filter(|n| n.at_s >= cut).cloned().collect();
+            c.notes.retain(|n| n.at_s < cut);
             for n in &mut c.notes {
-                n.dur_s = n.dur_s.min(head - n.at_s);
+                n.dur_s = n.dur_s.min(cut - n.at_s).max(0.0);
             }
             tails.push(crate::arrangement::ArrClip {
                 kind: c.kind,
@@ -8373,6 +9148,69 @@ impl IvoryApp {
 
     /// The velocity lane: the bar nearest `t` — or the whole selection, if
     /// that bar is in it — follows the hand's height.
+    /// One note's velocity, BY INDEX — the alt-drag's road.
+    ///
+    /// `me_set_vel` finds a note by TIME, which is right for the velocity
+    /// lane (you aim at a bar) and wrong for a drag on a note's body: the
+    /// note under the hand is already known, and re-finding it by the
+    /// pointer's x would hand the drag to a neighbour the moment the hand
+    /// wandered sideways.
+    ///
+    /// The SELECTION moves with it, as it does in the lane: a velocity is
+    /// the one thing people set for a chord at a time.
+    fn me_set_note_vel(&mut self, i: usize, vel: u8) {
+        let Some(st) = self.midi_edit.as_ref() else {
+            return;
+        };
+        let (id, sel) = (st.id, st.selected.clone());
+        let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
+            return;
+        };
+        let vel = vel.clamp(1, 127);
+        // **A selection moves TOGETHER, keeping its shape.**
+        //
+        // Both of these used to write the same absolute number into every
+        // selected note, which is not "edit several at once" — it is FLATTEN
+        // several at once. A phrase with an accent on beat one, selected and
+        // nudged, came back with every note identical and the accent gone.
+        //
+        // So the grabbed note takes the value under the hand and everybody
+        // else takes the same DELTA, exactly as the desk spreads a fader
+        // across a multiple selection (`apply_mixer_hit`). The grabbed note
+        // tracks the pointer perfectly, so re-deriving the delta each frame
+        // accumulates correctly rather than drifting.
+        //
+        // A note that hits an end stops there while its neighbours keep
+        // going; that is what every desk does and the alternative — refusing
+        // the whole gesture because one note is at 127 — is worse.
+        let held = clip.notes.get(i).map(|n| n.vel);
+        let spread = sel.binary_search(&i).is_ok() && sel.len() > 1;
+        let targets: Vec<usize> = if spread { sel } else { vec![i] };
+        let delta = match held {
+            Some(was) if spread => i16::from(vel) - i16::from(was),
+            _ => 0,
+        };
+        let mut changed = false;
+        for j in targets {
+            let Some(n) = clip.notes.get_mut(j) else { continue };
+            let want = if spread && j != i {
+                (i16::from(n.vel) + delta).clamp(1, 127) as u8
+            } else {
+                vel
+            };
+            if n.vel != want {
+                n.vel = want;
+                changed = true;
+            }
+        }
+        if changed {
+            if let Some(st) = self.midi_edit.as_mut() {
+                st.last_vel = vel;
+                st.dirty = true;
+            }
+        }
+    }
+
     fn me_set_vel(&mut self, t: f64, vel: u8) {
         let Some(st) = self.midi_edit.as_ref() else {
             return;
@@ -8396,18 +9234,40 @@ impl IvoryApp {
             return;
         }
         let vel = vel.clamp(1, 127);
-        let targets: Vec<usize> = if sel.binary_search(&i).is_ok() {
-            sel
-        } else {
-            vec![i]
+        // **A selection moves TOGETHER, keeping its shape.**
+        //
+        // Both of these used to write the same absolute number into every
+        // selected note, which is not "edit several at once" — it is FLATTEN
+        // several at once. A phrase with an accent on beat one, selected and
+        // nudged, came back with every note identical and the accent gone.
+        //
+        // So the grabbed note takes the value under the hand and everybody
+        // else takes the same DELTA, exactly as the desk spreads a fader
+        // across a multiple selection (`apply_mixer_hit`). The grabbed note
+        // tracks the pointer perfectly, so re-deriving the delta each frame
+        // accumulates correctly rather than drifting.
+        //
+        // A note that hits an end stops there while its neighbours keep
+        // going; that is what every desk does and the alternative — refusing
+        // the whole gesture because one note is at 127 — is worse.
+        let held = clip.notes.get(i).map(|n| n.vel);
+        let spread = sel.binary_search(&i).is_ok() && sel.len() > 1;
+        let targets: Vec<usize> = if spread { sel } else { vec![i] };
+        let delta = match held {
+            Some(was) if spread => i16::from(vel) - i16::from(was),
+            _ => 0,
         };
         let mut changed = false;
-        for i in targets {
-            if let Some(n) = clip.notes.get_mut(i) {
-                if n.vel != vel {
-                    n.vel = vel;
-                    changed = true;
-                }
+        for j in targets {
+            let Some(n) = clip.notes.get_mut(j) else { continue };
+            let want = if spread && j != i {
+                (i16::from(n.vel) + delta).clamp(1, 127) as u8
+            } else {
+                vel
+            };
+            if n.vel != want {
+                n.vel = want;
+                changed = true;
             }
         }
         if changed {
@@ -8749,12 +9609,30 @@ impl IvoryApp {
     ) -> crate::midi_editor::MidiEditView<'a> {
         let sig = self.time_signature();
         crate::midi_editor::MidiEditView {
+            draw_mode: self.settings.midi_draw_mode,
             fx_strip: {
                 let c = self.settings.fx_strip_color;
                 (c.r, c.g, c.b)
             },
             meter_bg: {
                 let c = self.settings.meter_bg_color;
+                (c.r, c.g, c.b)
+            },
+            // Both through the dark map, because the example file advertises
+            // every role as nameable inside `"dark"` and a role that quietly
+            // ignored it would make the file a liar.
+            vel_loud: {
+                let c = self
+                    .settings
+                    .dark_role_if(self.settings.me_dark, "velocity_loud")
+                    .unwrap_or(self.settings.velocity_loud_color);
+                (c.r, c.g, c.b)
+            },
+            vel_quiet: {
+                let c = self
+                    .settings
+                    .dark_role_if(self.settings.me_dark, "velocity_quiet")
+                    .unwrap_or(self.settings.velocity_quiet_color);
                 (c.r, c.g, c.b)
             },
             name: &clip.name,
@@ -9596,9 +10474,9 @@ impl IvoryApp {
                         // before.** The chips live in seat-indexed insert
                         // space; the host follows with the saved states,
                         // through the same door a channel reorder uses.
-                        use crate::recorder::{pad_insert_index, DRUM_PADS, INSERTS, STRIPS};
+                        use crate::recorder::{pad_insert_index, INSERTS};
                         let (a, b) = (pad_insert_index(from), pad_insert_index(to));
-                        let full = (STRIPS + 1 + DRUM_PADS) * INSERTS;
+                        let full = crate::recorder::INSERT_SPACE;
                         while self.settings.strip_inserts.len() < full {
                             self.settings.strip_inserts.push(String::new());
                         }
@@ -10286,6 +11164,14 @@ impl IvoryApp {
             && self.swing_menu.is_none()
             && !self.text_entry_active();
         if keys_ok && over {
+            // **N puts the pen down and picks it up again.** The editor's
+            // own key, like O for swing — it only answers while the hand is
+            // over the roll, so it cannot collide with anything the
+            // arrangement or the band binds.
+            if ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::N)) {
+                self.settings.midi_draw_mode = !self.settings.midi_draw_mode;
+                self.save_settings();
+            }
             if ctx.input(|i| !i.modifiers.any() && i.key_pressed(egui::Key::O)) {
                 self.settings.midi_swing = !self.settings.midi_swing;
                 if self.settings.midi_swing {
@@ -10505,6 +11391,25 @@ impl IvoryApp {
                     }
                     return;
                 }
+                // **A double-click on empty roll WRITES a note**, which is
+                // how notes go in with the pen up.
+                //
+                // With the pen DOWN a single press already draws one, so this
+                // would be a second note on top of the first. With it up, a
+                // single press locates the playhead and clears the selection
+                // — the gesture the owner asked to keep — and this is the one
+                // that adds a note without taking that away. The two presses
+                // that make the double have already located, so the playhead
+                // is where the note is, which is where a hand expects it.
+                if let Some(crate::midi_editor::Hit::Cell(t, key)) = hit {
+                    if !self.settings.midi_draw_mode {
+                        self.me_create_note(t, key);
+                        if let Some(st) = self.midi_edit.as_mut() {
+                            st.drag = None;
+                        }
+                        return;
+                    }
+                }
             }
         }
         if pressed || secondary {
@@ -10536,6 +11441,10 @@ impl IvoryApp {
                             rect: swing_menu_rect(l.tool_swing, l.panel),
                             typing: None,
                         });
+                    }
+                    Some(H::ToolDraw) if pressed => {
+                        self.settings.midi_draw_mode = !self.settings.midi_draw_mode;
+                        self.save_settings();
                     }
                     Some(H::ToolTriplet) if pressed => {
                         self.settings.midi_triplet = !self.settings.midi_triplet;
@@ -10583,6 +11492,17 @@ impl IvoryApp {
                         self.me_audition(vec![key], true);
                         if let Some(st) = self.midi_edit.as_mut() {
                             st.down_key = Some(key);
+                        }
+                    }
+                    // **Alt+drag a note changes its VELOCITY**, and its
+                    // colour with it — the gradient IS the velocity, so the
+                    // note says what it now is while the hand is still on
+                    // it. The owner's gesture, and it works whether the pen
+                    // is up or down: nothing else on a note body uses Alt.
+                    Some(H::NoteBody(i)) if pressed && alt => {
+                        self.me_select(i, shift);
+                        if let Some(st) = self.midi_edit.as_mut() {
+                            st.drag = Some(MeDrag::NoteVel { i, from_y: p.y });
                         }
                     }
                     Some(H::NoteBody(i)) => {
@@ -10678,7 +11598,7 @@ impl IvoryApp {
                         // modifier to remember. Shift keeps what stands.
                         if let Some(st) = self.midi_edit.as_mut() {
                             st.marquee = Some((p, p));
-                            st.drag = Some(MeDrag::Marquee);
+                            st.drag = Some(MeDrag::Marquee { locate_t: None });
                             if !shift {
                                 st.selected.clear();
                             }
@@ -10687,22 +11607,60 @@ impl IvoryApp {
                     Some(H::Cell(t, key)) if pressed => {
                         if cmd {
                             // The rubber band: Cmd holds the pen back and
-                            // draws a box instead.
+                            // draws a box instead. Still here, because it is
+                            // the only way to draw a box while the pen is
+                            // DOWN.
                             if let Some(st) = self.midi_edit.as_mut() {
                                 st.marquee = Some((p, p));
-                                st.drag = Some(MeDrag::Marquee);
+                                st.drag = Some(MeDrag::Marquee { locate_t: None });
                                 if !shift {
                                     st.selected.clear();
                                 }
                             }
-                        } else {
+                        } else if self.settings.midi_draw_mode {
                             self.me_create_note(t, key);
+                        } else {
+                            // **Pen up: the left button draws the box too.**
+                            //
+                            // Selecting used to need the RIGHT button or Cmd,
+                            // which is a thing to remember on the one mode
+                            // whose whole job is selecting. With the pen up a
+                            // left drag on empty roll is not doing anything
+                            // else, so it is the box — and the press stays a
+                            // LOCATE as long as the hand does not travel,
+                            // which is what keeps the playhead reachable
+                            // inside the editor.
+                            //
+                            // Both halves are decided at the RELEASE, because
+                            // at the press there is no way to know which
+                            // gesture this is yet. `locate_t` is the promise.
+                            if let Some(st) = self.midi_edit.as_mut() {
+                                st.marquee = Some((p, p));
+                                st.drag = Some(MeDrag::Marquee { locate_t: Some(t) });
+                            }
+                            let _ = key;
                         }
                     }
                     _ => {
                         if pressed {
+                            // **Empty space in the velocity lane draws a
+                            // box.** With the pen up `hit_test` only answers
+                            // in that lane when the press is ON a head, so
+                            // everything else there used to be a press that
+                            // cleared the selection and did nothing else —
+                            // which made the one lane you select velocities
+                            // in the one lane you could not select in.
+                            let in_vel = crate::midi_editor::Layout::new(rect)
+                                .vel
+                                .contains(p);
                             if let Some(st) = self.midi_edit.as_mut() {
-                                st.selected.clear();
+                                if in_vel {
+                                    st.marquee = Some((p, p));
+                                    st.drag = Some(MeDrag::Marquee { locate_t: None });
+                                }
+                                if !shift {
+                                    st.selected.clear();
+                                }
                             }
                         }
                     }
@@ -10715,7 +11673,7 @@ impl IvoryApp {
         // The right button carries its own marquee: while one is in flight
         // the right-down keeps it alive exactly as the left would.
         let holding = pointer_down
-            || (secondary_down && matches!(drag_now, Some(MeDrag::Marquee)));
+            || (secondary_down && matches!(drag_now, Some(MeDrag::Marquee { .. })));
         if let (Some(drag), Some(p), true) = (drag_now, pointer, holding) {
             // **Past the roll's edge, the window CRAWLS** — the owner's
             // ask: dragging a note off either side pans the view slowly,
@@ -10788,7 +11746,35 @@ impl IvoryApp {
                     };
                     self.me_set_vel(t_at, vel);
                 }
-                MeDrag::Marquee => {
+                // **Relative, and re-anchored every frame** — the same
+                // contract every other drag in this app keeps, so a press
+                // never makes the value jump and the hand can leave the note
+                // and go on pulling.
+                MeDrag::NoteVel { i, from_y } => {
+                    /// How far the hand travels to sweep a note from silent
+                    /// to full. A note is a few points tall; its velocity is
+                    /// not, and a one-to-one drag would make 127 values live
+                    /// in eight pixels.
+                    const TRAVEL: f32 = 160.0;
+                    let now = self
+                        .arrangement
+                        .clips
+                        .iter()
+                        .find(|c| c.id == id)
+                        .and_then(|c| c.notes.get(i))
+                        .map(|n| n.vel);
+                    if let Some(was) = now {
+                        let moved = (from_y - p.y) / TRAVEL * 127.0;
+                        let want = (f32::from(was) + moved).clamp(1.0, 127.0) as u8;
+                        if want != was {
+                            self.me_set_note_vel(i, want);
+                        }
+                        if let Some(st) = self.midi_edit.as_mut() {
+                            st.drag = Some(MeDrag::NoteVel { i, from_y: p.y });
+                        }
+                    }
+                }
+                MeDrag::Marquee { .. } => {
                     if let Some(st) = self.midi_edit.as_mut() {
                         if let Some((a, _)) = st.marquee {
                             st.marquee = Some((a, p));
@@ -10803,7 +11789,13 @@ impl IvoryApp {
             let took_marquee = self
                 .midi_edit
                 .as_ref()
-                .is_some_and(|m| matches!(m.drag, Some(MeDrag::Marquee)));
+                .is_some_and(|m| matches!(m.drag, Some(MeDrag::Marquee { .. })));
+            // The pen-up left drag's promise: if the hand never travelled,
+            // this press was a click and a click on empty roll locates.
+            let pending_locate = match self.midi_edit.as_ref().and_then(|m| m.drag.clone()) {
+                Some(MeDrag::Marquee { locate_t }) => locate_t,
+                _ => None,
+            };
             // A marquee that never moved was a right CLICK on empty roll:
             // the GLOBAL menu answers, the selection stands untouched.
             if took_marquee {
@@ -10825,12 +11817,32 @@ impl IvoryApp {
                     }
                     return;
                 }
+                // **And the LEFT button's motionless box is the old locate.**
+                //
+                // The box is armed on every pen-up press so that a drag can
+                // become a selection, which means the locate cannot happen
+                // until the release tells us the hand stood still. Shift is
+                // honoured the way it always was: it adds to a selection, so
+                // it must not clear one.
+                if still && !sec_rel {
+                    if let Some(t) = pending_locate {
+                        let to = self.me_snap(t);
+                        self.request_recorder(recorder::RecorderRequest::Locate(to));
+                        if let Some(st) = self.midi_edit.as_mut() {
+                            st.marquee = None;
+                            st.drag = None;
+                            if !shift {
+                                st.selected.clear();
+                            }
+                        }
+                        return;
+                    }
+                }
             }
             if took_marquee {
                 let picked: Vec<usize> = {
                     let st = self.midi_edit.as_ref().unwrap();
                     let Some((a, b)) = st.marquee else {
-                        Vec::new().into_iter().collect::<Vec<usize>>();
                         return;
                     };
                     let band = Rect::from_two_pos(a, b);
@@ -10843,8 +11855,17 @@ impl IvoryApp {
                                 .iter()
                                 .enumerate()
                                 .filter(|(_, n)| {
+                                    // **The roll AND the velocity lane.** A
+                                    // box dragged across the velocity heads
+                                    // is a selection of those notes — the
+                                    // lane is where you go to work on
+                                    // velocities, so it has to be a place you
+                                    // can select in, not only a place you can
+                                    // nudge one bar at a time.
                                     let r = crate::midi_editor::note_rect(&l, &view, n);
-                                    r.is_positive() && r.intersects(band)
+                                    let v = crate::midi_editor::vel_rect(&l, &view, n);
+                                    (r.is_positive() && r.intersects(band))
+                                        || (v.is_positive() && v.intersects(band))
                                 })
                                 .map(|(i, _)| i)
                                 .collect()
@@ -10905,6 +11926,67 @@ impl IvoryApp {
                     st.dirty = false;
                 }
             }
+        }
+    }
+
+    /// What a press on a track ITSELF means, given the modifiers held.
+    ///
+    /// Plain: this track alone. **Shift**: everything between the anchor and
+    /// here, which is the range the second click closes. **Cmd on macOS, Ctrl
+    /// everywhere else**: add this one, or take it back out, and leave the
+    /// rest alone.
+    ///
+    /// `egui`'s `command` IS that platform split, so the rule is written once
+    /// instead of behind a `cfg` that only one machine ever compiles.
+    ///
+    /// Shift wins over Cmd when both are down: the range is the more specific
+    /// request, and it is the one every desk answers with.
+    fn select_track(&mut self, n: usize, mods: egui::Modifiers) {
+        if mods.shift {
+            // **From the ANCHOR, not from the primary.** Shift-clicking around
+            // has to keep measuring from the same fixed end, or the range
+            // walks with each click and stops being a range.
+            let from = self.sel_anchor.unwrap_or(n);
+            let (lo, hi) = if from <= n { (from, n) } else { (n, from) };
+            self.selected_tracks = (lo..=hi).collect();
+            self.sel_anchor = Some(from);
+            self.selected_channel = Some(n);
+        } else if mods.command {
+            match self.selected_tracks.iter().position(|x| *x == n) {
+                Some(at) => {
+                    self.selected_tracks.remove(at);
+                    // Taking the primary out promotes whatever is left, and
+                    // taking the LAST one out leaves nothing selected — which
+                    // is a state the rim has to be able to reach, or a
+                    // selection could never be fully undone.
+                    self.selected_channel = self.selected_tracks.last().copied();
+                }
+                None => {
+                    self.selected_tracks.push(n);
+                    self.selected_channel = Some(n);
+                }
+            }
+            self.sel_anchor = Some(n);
+        } else {
+            self.selected_tracks = vec![n];
+            self.sel_anchor = Some(n);
+            self.selected_channel = Some(n);
+        }
+    }
+
+    /// A press on a track's CONTROL: make it the primary, without disturbing a
+    /// selection it is already part of.
+    ///
+    /// **Reaching for one track's fader must not throw away the four tracks
+    /// somebody just picked** — that is the whole reason a multiple selection
+    /// is worth having. But a control on a track OUTSIDE the selection does
+    /// mean the user has moved on, so that collapses to the one track, which
+    /// is what every desk does.
+    fn touch_track(&mut self, n: usize) {
+        self.selected_channel = Some(n);
+        if !self.selected_tracks.contains(&n) {
+            self.selected_tracks = vec![n];
+            self.sel_anchor = Some(n);
         }
     }
 
@@ -11432,7 +12514,7 @@ impl IvoryApp {
                     | A::Lane(n, _),
                 ) = hit
                 {
-                    self.selected_channel = Some(n);
+                    self.touch_track(n);
                 }
                 match hit {
                     // ── automation ────────────────────────────────────────
@@ -11500,22 +12582,44 @@ impl IvoryApp {
                     Some(A::HdrAdd(n)) => {
                         self.add_bare_track(n);
                     }
-                    // A single press on the NAME does nothing; the rename is
-                    // the double-click, the mixer's own rule.
-                    // The rename is the double-click, handled above on the
-                    // release edge; a single press does nothing.
-                    Some(A::HdrName(_)) => {}
+                    // **No arm for `HdrName` here**, and its absence is the
+                    // point. There was one — "a single press on the NAME
+                    // does nothing; the rename is the double-click" — and
+                    // it sat ABOVE the reorder arm below, which is written
+                    // `HdrNumber(n) | HdrName(n)`. Rust takes the first arm
+                    // that matches, so the name half of the reorder handle
+                    // was dead code and dragging a track by its title did
+                    // nothing on this view while working on the desk. It is
+                    // not an unreachable-pattern warning either, because the
+                    // later arm is only PARTLY covered.
+                    //
+                    // The rename is still the double-click; that is handled
+                    // on the release edge above, which clears `arr_drag`
+                    // before this ever runs.
                     // The same window the mixer's button opens: routing is
                     // one subject, reachable from either view.
+                    // **The MASTER's rack, from the timeline.** Mapped
+                    // through `seat_bay` because the master's six slots live
+                    // in two racks; the panel hands over a slot in strip
+                    // order and this is where that becomes a seat.
+                    Some(A::BusBay(_, slot)) => {
+                        let (seat, bay) =
+                            crate::recorder::seat_bay(crate::recorder::STRIPS, slot);
+                        if self.insert(seat, bay).is_some() {
+                            self.bay_carry = Some((seat, bay, p, false));
+                        } else {
+                            self.open_insert_face(seat, bay);
+                        }
+                    }
                     Some(A::HdrRouting(n)) => {
-                        self.selected_channel = Some(n);
+                        self.touch_track(n);
                         self.dialog = Some(self.routing_dialog(n, None));
                     }
                     Some(A::HdrBay(n, bay)) => {
                         // The mixer's own door, from here: picker when
                         // empty, the plugin's face when loaded, the patch
                         // picker for the DX7, the drumpad for the kit.
-                        self.selected_channel = Some(n);
+                        self.touch_track(n);
                         // **And the mixer's own CARRY**, on the same terms —
                         // see `bay_carry`. A loaded bay arms; the window
                         // still opens on a press that does not travel.
@@ -11540,7 +12644,7 @@ impl IvoryApp {
                     // untouched (it clears the drag before this ever runs).
                     Some(A::HdrNumber(n)) | Some(A::HdrName(n)) => {
                         if self.channel_used(n) {
-                            self.selected_channel = Some(n);
+                            self.select_track(n, ctx.input(|i| i.modifiers));
                             self.arr_drag = Some(ArrDrag::ReorderLane { from: n });
                         }
                     }
@@ -11549,13 +12653,22 @@ impl IvoryApp {
                     Some(A::HeaderGrip) => {
                         self.arr_drag = Some(ArrDrag::HeaderGrip { from_x: p.x });
                     }
+                    // Through the desk, so a multiple selection carries — see
+                    // the arm of the same name in `apply_arrange_hit`.
                     Some(A::ToTheory(n)) => {
-                        let on = self.to_theory(n);
-                        self.set_to_theory(n, !on);
+                        self.apply_mixer_hit(M::ToTheory(Column(n)), 0.0);
                     }
+                    Some(A::HdrFolder(n)) => self.toggle_folder(n),
+                    Some(A::HdrCollapse(n)) => self.toggle_folder_shut(n),
                     Some(A::Mute(n)) => self.apply_mixer_hit(M::Mute(Column(n)), 0.0),
                     Some(A::Solo(n)) => self.apply_mixer_hit(M::Solo(Column(n)), 0.0),
-                    Some(A::Gain(n)) => {
+                    // **The bus rows' levels go through the same drag.**
+                    // `ArrDrag::Gain` carries a COLUMN — it always did, the
+                    // field is merely named for the case where a lane and a
+                    // column are the same number — so the master's and the
+                    // click's reach the desk's own fader with no second
+                    // road to it.
+                    Some(A::Gain(n)) | Some(A::BusGain(n)) => {
                         self.arr_drag = Some(ArrDrag::Gain {
                             lane: n,
                             from_y: p.y,
@@ -11749,7 +12862,7 @@ impl IvoryApp {
                             })
                         };
                         if let Some(n) = row.filter(|n| self.channel_used(*n)) {
-                            self.selected_channel = Some(n);
+                            self.select_track(n, ctx.input(|i| i.modifiers));
                             self.arr_drag = Some(ArrDrag::ReorderLane { from: n });
                         }
                     }
@@ -11985,20 +13098,49 @@ impl IvoryApp {
             // **The carried track lands** on the row under the hand.
             if let Some(ArrDrag::ReorderLane { from }) = self.arr_drag {
                 if let Some(p) = pointer {
-                    let target = {
+                    // **Which row, and whether the hand was on its BOTTOM
+                    // EDGE.** The edge is the folder gesture: a drop in the
+                    // body of a row reorders as it always did, and a drop in
+                    // the last slice of a FOLDER's row snaps into it.
+                    let (target, on_edge) = {
                         let clips = self.arr_clip_views();
                         let view = self.arrange_view(&clips);
                         let l = crate::arrangement_panel::Layout::new(rect, &view);
-                        l.header_rows
-                            .iter()
-                            .position(|row| {
-                                row.panel.is_positive()
-                                    && (row.panel.top()..=row.panel.bottom())
-                                        .contains(&p.y)
+                        let at = l.header_rows.iter().position(|row| {
+                            row.panel.is_positive()
+                                && (row.panel.top()..=row.panel.bottom()).contains(&p.y)
+                        });
+                        let edge = at.is_some_and(|i| {
+                            l.header_rows.get(i).is_some_and(|row| {
+                                let h = row.panel.height();
+                                h > 0.0
+                                    && p.y >= row.panel.bottom()
+                                        - h * crate::arrangement_panel::FOLDER_DROP_EDGE
                             })
+                        });
+                        (at, edge)
                     };
-                    if let Some(to) = target.filter(|t| *t != from) {
-                        self.move_channel(from, to);
+                    if let Some(to) = target {
+                        // The bottom edge of a folder takes the block IN.
+                        if on_edge && self.is_folder(to) {
+                            self.snap_into_folder(from, to);
+                        } else if to != from {
+                            // An ordinary move. Membership is decided by
+                            // where the block LANDS, which is what makes
+                            // dragging out of a folder work without a second
+                            // gesture: drop anywhere that is not inside one
+                            // and the flags come off.
+                            let joins = self.folder_of(to);
+                            let group = self.reorder_group(from);
+                            for n in &group {
+                                self.set_in_folder(*n, joins.is_some());
+                                if joins.is_some() {
+                                    self.set_is_folder(*n, false);
+                                }
+                            }
+                            self.move_selection(from, to);
+                            self.save_settings();
+                        }
                     }
                 }
             }
@@ -12166,8 +13308,7 @@ impl IvoryApp {
             // ask, same as the Track menu's Remove.
             if self.arr_selected.is_none() && self.arr_multi.is_empty() {
                 if let Some(n) = self.selected_channel.filter(|n| self.channel_used(*n)) {
-                    self.remove_channel(n);
-                    self.selected_channel = None;
+                    self.remove_selected_channels(n);
                 }
             } else {
                 self.arr_delete_selected();
@@ -12229,6 +13370,19 @@ impl IvoryApp {
         {
             self.add_track_first_free();
         }
+        // **Ctrl/Cmd+M: show or hide the MASTER row.** It cannot be removed
+        // the way a track can — a bus you can delete and not get back is one
+        // people delete once and then go looking for — so this is the way it
+        // goes away, and it comes back the same way.
+        if keys_ok
+            && self.midi_edit.is_none()
+            && ctx.input(|i| {
+                (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::M)
+            })
+        {
+            self.settings.arr_master_row = !self.settings.arr_master_row;
+            self.save_settings();
+        }
 
         // ── files dropped from the outside world ──────────────────────────
         //
@@ -12276,20 +13430,41 @@ impl IvoryApp {
                 .zip(self.drumpad_rect)
                 .is_some_and(|(p, r)| r.contains(p));
         if !dropped.is_empty() && !pad_claims {
-            // The pointer if it is there, and what the hover worked out if it
-            // is not. Only if BOTH are missing does anything get guessed.
+            // **The HOVER outranks egui's pointer, and that is the whole
+            // rule.** An OS drag does not move egui's pointer, so on the
+            // frame the drop arrives it is stale, gone, or somewhere else
+            // entirely — and "somewhere else" is a place a lane may well be.
+            //
+            // The old order asked egui's pointer first and only fell back to
+            // the hover when the point was outside the arrangement. That was
+            // right by accident: the arrangement was a fitted rectangle with
+            // bands of nothing around it, so a stale pointer usually landed
+            // outside and got rejected. The moment the timeline filled the
+            // window — which is what a DAW view does now — a pointer parked
+            // in the corner became a lane, and the drop landed on row one.
+            //
+            // The host's own query still comes first when there is one: it
+            // asks the OS where the cursor is RIGHT NOW, so it is the only
+            // answer that is not a guess. Then the hover. Then egui's
+            // pointer, which is better than nothing. Then the selection.
             let (lane, t) = self
                 .drag_pointer
-                .or(drop_pos)
                 .filter(|p| rect.contains(*p))
                 .map(|p| landing_now(self, p))
                 .or(self.arr_drop)
+                .or_else(|| {
+                    drop_pos
+                        .filter(|p| rect.contains(*p))
+                        .map(|p| landing_now(self, p))
+                })
                 .unwrap_or_else(|| (self.selected_channel.unwrap_or(0), 0.0));
             self.arr_drop = None;
             // **The lane under the pointer is now the SELECTED one.** The
             // owner asked for the track being dropped onto to select, and it
             // is also what makes the next gesture land where the eye is.
-            self.selected_channel = Some(lane);
+            // A drop is a fresh intention, so it takes the selection with
+            // it rather than joining one: `select_track` with nothing held.
+            self.select_track(lane, egui::Modifiers::NONE);
             // **Through the same fan-out the menu uses.** Dropping four
             // stems at once used to stack all four on the lane under the
             // pointer, at the same instant, which is not a thing anybody
@@ -12375,6 +13550,22 @@ impl IvoryApp {
         let peaks = self.meter_hold;
         let (view_start_s, view_len_s) = self.arr_window_now();
         crate::arrangement_panel::ArrangeView {
+            // **The master's row.** Its level and colour come from the same
+            // place the desk's own strip reads, so the two views cannot
+            // disagree about how loud the master is or what it looks like.
+            master_gain: self.settings.master_gain as f32,
+            master_peak: [
+                self.recorder.master.left.peak,
+                self.recorder.master.right.peak,
+            ],
+            master_color: self.strip_color(crate::recorder::MASTER_SEAT),
+            show_master_row: self.settings.arr_master_row,
+            // The master's two racks, in strip order — `seat_bay` is the one
+            // place that knows which of its six slots lives where.
+            master_inserts: std::array::from_fn(|n| {
+                let (seat, bay) = crate::recorder::seat_bay(crate::recorder::STRIPS, n);
+                self.insert(seat, bay).map_or("", plugin_display_name)
+            }),
             // No UI to open it yet — the row exists so the tempo work has
             // somewhere to land.
             show_tempo_lane: self.settings.arr_tempo_lane,
@@ -12420,6 +13611,22 @@ impl IvoryApp {
                     muted: desk.muted[n],
                     soloed: desk.soloed[n],
                     to_theory: self.to_theory(n),
+                    is_folder: self.is_folder(n),
+                    in_folder: self.in_folder(n),
+                    folder_shut: self.folder_shut(n),
+                    folder_count: self.folder_children(n).len(),
+                    hidden: self.lane_hidden(n),
+                    // A folder's own mute dims the folder AND its children;
+                    // a track muted on its own is left alone, because its
+                    // switch already says so.
+                    folder_silent: {
+                        let by_parent = self
+                            .folder_of(n)
+                            .is_some_and(|f| self.settings.strip_muted & (1 << f) != 0);
+                        let own_group = self.is_folder(n)
+                            && self.settings.strip_muted & (1 << n) != 0;
+                        by_parent || own_group
+                    },
                     gain: g.channels.get(n).copied().unwrap_or(1.0),
                     send: desk.send[n],
                     pan: self.channel_pan(n),
@@ -12450,6 +13657,7 @@ impl IvoryApp {
             },
             time_sel: self.time_sel,
             selected_channel: self.selected_channel,
+            selected_tracks: &self.selected_tracks,
             naming: self
                 .mixer_naming
                 .as_ref()
@@ -12606,6 +13814,42 @@ impl IvoryApp {
     }
 
     /// Step a named parameter to the next value in its list, and wrap.
+    /// Every label a stepped parameter offers, and which one is set.
+    fn choice_list(&self, key: &str) -> (Vec<String>, usize) {
+        let Some(c) = self.fx_defaults.choices.iter().find(|c| c.key == key) else {
+            return (Vec::new(), 0);
+        };
+        let now = self.choice_key(key);
+        let at = c.options.iter().position(|(k, _)| *k == now).unwrap_or(0);
+        (c.options.iter().map(|(_, label)| label.clone()).collect(), at)
+    }
+
+    /// Set a stepped parameter to the `index`th of its list.
+    fn pick_choice(&mut self, key: &str, index: usize) {
+        let Some(c) = self.fx_defaults.choices.iter().find(|c| c.key == key) else {
+            return;
+        };
+        let Some((k, _)) = c.options.get(index) else {
+            return;
+        };
+        let k = k.clone();
+        self.settings
+            .effect_params
+            .insert(key.to_owned(), serde_json::Value::from(k));
+        self.save_settings();
+    }
+
+    #[allow(dead_code)]
+    /// Whether the delay's time is on its FREE position.
+    ///
+    /// By the stored KEY, never by the label: the label is what a person reads
+    /// and is free to change, and a panel that decided which rows exist from a
+    /// display string would lose a control to a rewording.
+    fn delay_is_free(&self) -> bool {
+        self.choice_key("delay_division") == "free"
+    }
+
+    #[allow(dead_code)]
     fn next_choice(&mut self, key: &str) {
         let Some(c) = self.fx_defaults.choices.iter().find(|c| c.key == key) else {
             return;
@@ -12656,7 +13900,7 @@ impl IvoryApp {
     /// parameter that is not in the settings is a parameter at its default,
     /// which is the same rule that makes an old file load without a migration.
     fn reset_effect(&mut self, fx: recorder_panel::Fx) {
-        for recorder_panel::FxRow { key, .. } in fx.rows() {
+        for recorder_panel::FxRow { key, .. } in fx.rows(true) {
             if !key.is_empty() {
                 self.settings.effect_params.shift_remove(key);
             }
@@ -12746,10 +13990,46 @@ impl IvoryApp {
             H::SetTempo(_) => recorder_panel::tempo_knob_position(
                 self.settings.record_export.tempo_bpm,
             ),
+            // **The varispeed, and it was missing.** Falling through to the
+            // arm below gave every drag a starting position of 0.0 — the
+            // BOTTOM of the range — so the first frame of a drag threw the
+            // dial from twelve o'clock to -15% before the hand had moved a
+            // centimetre. Leaving the detent now costs about a percent, the
+            // way leaving it should.
+            H::SetVarispeed(_) => self.settings.varispeed.pos(),
             // Nothing else is dragged, so nothing else needs somewhere to
             // start from.
             _ => 0.0,
         }
+    }
+
+    /// Everything this app believes about where it is, for the geometry
+    /// probe in the binary crate. Diagnostic only; nothing reads it in a
+    /// release the user runs.
+    pub fn debug_geometry(&self) -> String {
+        format!(
+            "inner_origin={:?} known={} last_drawn={:?} pane={:?} monitor={:?} \
+             live_pos={:?} live_size={:?} child_windows={} reader={}",
+            self.main_inner_origin,
+            self.main_origin_known,
+            self.last_drawn,
+            self.last_pane,
+            self.monitor_size,
+            self.main_live_pos,
+            self.main_live_size,
+            self.caps.child_windows,
+            self.reader_mode(),
+        )
+    }
+
+    /// Whether this session is being read out loud, whoever decided so.
+    ///
+    /// The SETTING is the user's own answer, from the menu row, and is the
+    /// only half written to disk. The other half is this session's
+    /// detection, which is deliberately not remembered — see
+    /// [`Self::set_screen_reader`].
+    pub fn reader_mode(&self) -> bool {
+        self.settings.screen_reader_mode || self.reader_was_detected
     }
 
     /// The dialog on screen, if any. The host reads it to keep a slot row in
@@ -12767,16 +14047,21 @@ impl IvoryApp {
     /// setting that stays where it was put, and the row in the menu is how it
     /// goes back.
     pub fn set_screen_reader(&mut self, attached: bool) {
-        if !attached || self.settings.screen_reader_mode {
+        if !attached || self.reader_mode() {
             return;
         }
-        self.settings.screen_reader_mode = true;
+        self.reader_was_detected = true;
         self.caps.child_windows = false;
         // Anything already out in a window comes home, or it is a surface a
         // reader cannot reach and the app cannot close.
         self.dialog = None;
         self.menu_state = None;
-        self.save_settings();
+        // **Not written to disk.** A DETECTED reader changes this session
+        // and nothing beyond it; only the menu row, which is somebody
+        // saying so, is remembered. The distinction exists because the
+        // detection was wrong once and the wrongness was permanent: every
+        // Mac reported a reader attached, the flag was saved, and the file
+        // went on saying so on every later launch with nothing to undo it.
     }
 
     /// The host declined to reclaim a scratch project because it holds
@@ -12814,6 +14099,12 @@ impl IvoryApp {
     /// is handed a ratio and not a position, because a position means
     /// nothing without the range and there must not be two places that know
     /// how to turn one into the other.
+    /// Whether the master is folded to mono on the way out. The host pushes
+    /// it to the engine; see `Settings::master_mono`.
+    pub fn master_mono(&self) -> bool {
+        self.settings.master_mono
+    }
+
     pub fn varispeed_ratio(&self) -> f32 {
         self.settings.varispeed.ratio() as f32
     }
@@ -13412,6 +14703,7 @@ impl IvoryApp {
     ) {
         if let Some(node) = offer_nodes(
             ui,
+            self.reader_mode(),
             nodes,
             // The colour a held key wears — the app's own "this one is live"
             // accent, already a theme role in every palette. It is decoration
@@ -13491,12 +14783,136 @@ impl IvoryApp {
                 // exactly what its pointer path passes.
                 self.apply_mixer_hit(hit, want.unwrap_or(0.0));
             }
+            Focused::Arrange { hit, .. } => {
+                self.apply_arrange_key(hit, want);
+            }
         }
         // The key was ours; nobody else gets it. Without this an arrow over a
         // focused fader also scrolls whatever is behind it.
         ctx.input_mut(|i| {
             i.events.retain(|e| !matches!(e, egui::Event::Key { pressed: true, .. }));
         });
+    }
+
+    /// A keyboard press on a control in the ARRANGEMENT.
+    ///
+    /// **Why this is not the pointer's own dispatch, when the band and the
+    /// desk both are.** Those two hand a hit straight to `hit_test`'s
+    /// caller, because every arm of their dispatch is a value or a door.
+    /// The timeline's arms are mostly DRAGS — a carry, a trim, a stretch, a
+    /// grid step — and each one arms `arr_drag` and waits for a button that
+    /// a keyboard never presses. Routing a key through there would leave a
+    /// drag armed with nothing to end it: the next mouse move would carry a
+    /// track, and the user would never learn why.
+    ///
+    /// So this is the discrete half, and it delegates rather than
+    /// reimplements: the three dials and the three switches are the DESK's
+    /// controls, reached from here, and go through `apply_mixer_hit` — the
+    /// same one line the pointer path uses, so an automation pass records a
+    /// keyboard nudge exactly as it records a drag.
+    fn apply_arrange_key(
+        &mut self,
+        hit: crate::arrangement_panel::Hit,
+        want: Option<f32>,
+    ) {
+        use crate::arrangement_panel::Hit as A;
+        use crate::mixer_panel::Hit as M;
+        use crate::recorder::Column;
+        let v = want.unwrap_or(0.0);
+        match hit {
+            // The desk's own, by the desk's own hits.
+            A::Arm(n) => self.apply_mixer_hit(M::Arm(Column(n)), 0.0),
+            A::Mute(n) => self.apply_mixer_hit(M::Mute(Column(n)), 0.0),
+            A::Solo(n) => self.apply_mixer_hit(M::Solo(Column(n)), 0.0),
+            A::Gain(n) | A::BusGain(n) => self.apply_mixer_hit(M::Fader(Column(n)), v),
+            A::Send(n) => self.apply_mixer_hit(M::Send(Column(n)), v),
+            A::Pan(n) => self.apply_mixer_hit(M::Pan(Column(n)), v),
+            // **Through the desk, like the three switches beside it.**
+            //
+            // T was the one switch on this header that toggled its own lane
+            // directly instead of going through `apply_mixer_hit`, so M, S and
+            // R spread across a multiple selection and T silently did not —
+            // select four tracks, press M and four mute, press T and one
+            // changes. The mixer's T already went the right way, which is what
+            // made the two panels disagree about the same switch.
+            A::ToTheory(n) => self.apply_mixer_hit(M::ToTheory(Column(n)), 0.0),
+            A::HdrFolder(n) => self.toggle_folder(n),
+            A::HdrCollapse(n) => self.toggle_folder_shut(n),
+            A::HdrAdd(n) => self.add_bare_track(n),
+            A::HdrRouting(n) => {
+                self.touch_track(n);
+                self.dialog = Some(self.routing_dialog(n, None));
+            }
+            A::HdrInput(n) => {
+                // The menu opens where the CHIP is, since there is no
+                // pointer to open it under.
+                self.touch_track(n);
+                self.open_input_menu(n);
+            }
+            A::BusBay(_, slot) => {
+                let (seat, bay) = crate::recorder::seat_bay(crate::recorder::STRIPS, slot);
+                self.open_insert_face(seat, bay);
+            }
+            A::HdrBay(n, bay) => {
+                self.touch_track(n);
+                self.open_insert_face(n, bay);
+            }
+            A::AutoParamPick(n) => self.arr_cycle_auto_param(n),
+            A::TempoHeader => self.arr_ask_flatten_tempo(),
+            A::ToolMetronome => {
+                self.settings.metronome_on = !self.settings.metronome_on;
+                self.save_settings();
+            }
+            A::ToolSnap => {
+                self.settings.arr_snap = !self.settings.arr_snap;
+                self.save_settings();
+            }
+            A::ToolTempoLane => {
+                self.settings.arr_tempo_lane = !self.settings.arr_tempo_lane;
+                self.arr_tempo_hot = None;
+                self.arr_tempo_drag = None;
+                self.save_settings();
+            }
+            // **The grid box is the one control here the arrows move**, and
+            // it is why it is a slider and not a button: a press that only
+            // ever steps FINER walks a keyboard down to 1/32 and leaves it
+            // there. `want` is the exponent laid onto 0..1.
+            A::ToolGrid => {
+                if let Some(w) = want {
+                    let exp = i64::from((w * 8.0).round() as i8) - 5;
+                    self.settings.arr_grid_exp = exp.clamp(-5, 3);
+                    self.save_settings();
+                }
+            }
+            // A clip is SELECTED, which is what puts the clip commands —
+            // delete, normalise, the clip menu — within reach of a keyboard.
+            // Never carried: see this function's own note about `arr_drag`.
+            A::ClipBody(id) => {
+                self.arr_multi.clear();
+                self.arr_selected = Some(id);
+                self.arr_resolve_len(id);
+            }
+            // The pointer-only half, named rather than caught by `_` so a
+            // new hit has to be decided about here as well as in
+            // `a11y_nodes`.
+            A::HdrNumber(_)
+            | A::HdrName(_)
+            | A::HeaderGrip
+            | A::ToolNav
+            | A::ClipLeft(_)
+            | A::ClipRight(_)
+            | A::FadeIn(_)
+            | A::FadeOut(_)
+            | A::Lane(..)
+            | A::Ruler(_)
+            | A::AutoPoint(..)
+            | A::AutoLane(..)
+            | A::AutoFold(_)
+            | A::TempoPoint(_)
+            | A::TempoLane(..)
+            | A::MeterChip(_)
+            | A::MeterStrip(_) => {}
+        }
     }
 
     fn apply_recorder_hit(&mut self, hit: recorder_panel::Hit) {
@@ -13562,7 +14978,6 @@ impl IvoryApp {
             // **Requested, not done here.** The message belongs to the host —
             // it is the one that knows a take dropped frames — and this crate
             // cannot reach it. Same shape as `take_reveal_request`.
-            Hit::DismissMessage => self.dismiss_message = true,
             Hit::ShowAudioStatus => self.open_audio_setup(),
             Hit::ToggleCountInInTake => {
                 self.settings.record_count_in_in_take = !self.settings.record_count_in_in_take;
@@ -13574,6 +14989,18 @@ impl IvoryApp {
             }
             Hit::ChooseFolder => self.ask_for_a_folder(),
             Hit::RevealFolder => self.reveal_record_folder(None),
+            Hit::ChooseProjectFolder => {
+                self.ask_for_a_media_folder(crate::ports::DirPurpose::ProjectRoot);
+            }
+            Hit::RevealProjectFolder => {
+                self.reveal_request = Some(self.settings.project_root());
+            }
+            Hit::ChooseExportFolder => {
+                self.ask_for_a_media_folder(crate::ports::DirPurpose::ExportRoot);
+            }
+            Hit::RevealExportFolder => {
+                self.reveal_request = Some(self.settings.export_root());
+            }
             Hit::ToggleOpenWhenDone => {
                 self.settings.record_open_when_done = !self.settings.record_open_when_done;
                 self.save_settings();
@@ -13865,6 +15292,17 @@ impl IvoryApp {
         self.settings.record_root()
     }
 
+    /// Where PROJECTS are written. Its own folder now, not a subfolder of
+    /// wherever the takes go — see `Settings::project_root`.
+    pub fn project_root(&self) -> std::path::PathBuf {
+        self.settings.project_root()
+    }
+
+    /// Where an EXPORT lands when the dialog does not name a folder.
+    pub fn export_root(&self) -> std::path::PathBuf {
+        self.settings.export_root()
+    }
+
     /// The typed take name, if any.
     pub fn take_name(&self) -> Option<&str> {
         self.settings.record_take_name.as_deref()
@@ -13983,9 +15421,47 @@ impl IvoryApp {
     pub fn desk(&self) -> recorder::Desk {
         recorder::Desk {
             send: std::array::from_fn(|i| self.settings.strip_sends[i] as f32),
-            muted: std::array::from_fn(|i| self.settings.strip_muted & (1 << i) != 0),
-            soloed: std::array::from_fn(|i| self.settings.strip_soloed & (1 << i) != 0),
+            muted: std::array::from_fn(|i| self.heard_as_muted(i)),
+            soloed: std::array::from_fn(|i| self.heard_as_soloed(i)),
         }
+    }
+
+    /// **What the ENGINE is told about this strip's mute — folders included.**
+    ///
+    /// A folder is not a bus: its children still reach the master on their
+    /// own, so muting the folder track alone would silence the folder's own
+    /// clips and leave the group playing. That is not what a folder means.
+    ///
+    /// **And it is answered HERE rather than by moving the children's own
+    /// switches**, which is the whole distinction. A child of a muted folder
+    /// is not muted — its switch is off, it draws off, and opening the folder
+    /// again gives it back exactly as it was. It is simply not heard, because
+    /// the thing containing it is not heard. Writing the mute into the child
+    /// would destroy whatever the child had chosen: mute the folder, unmute
+    /// it, and a track that was muted on its own comes back audible.
+    ///
+    /// `desk()` is the single crossing to the engine and the take's own
+    /// record of what was heard, so folding it in at that one point makes it
+    /// true of playback, monitoring and the file together.
+    fn heard_as_muted(&self, i: usize) -> bool {
+        if self.settings.strip_muted & (1 << i) != 0 {
+            return true;
+        }
+        self.folder_of(i)
+            .is_some_and(|f| self.settings.strip_muted & (1 << f) != 0)
+    }
+
+    /// The same for solo: soloing a folder solos the GROUP.
+    ///
+    /// Solo is exclusive here — with anything soloed, only the soloed are
+    /// heard — so a folder whose children were left out would solo itself
+    /// and silence the very tracks it groups.
+    fn heard_as_soloed(&self, i: usize) -> bool {
+        if self.settings.strip_soloed & (1 << i) != 0 {
+            return true;
+        }
+        self.folder_of(i)
+            .is_some_and(|f| self.settings.strip_soloed & (1 << f) != 0)
     }
 
     /// The user effect the host should put across the effects bus, if any.
@@ -13997,6 +15473,17 @@ impl IvoryApp {
     ///
     /// `strip` is `Strip::index`, with the master at `STRIPS`. See
     /// `Settings::strip_inserts`.
+    /// **The seat and bay a MIXER SLOT means**, which is not always itself.
+    ///
+    /// The master's strip shows six bays across two racks — see
+    /// `recorder::seat_bay`. Every place that turns a `Hit::Insert(col, n)`
+    /// into a rack address goes through here, so none of them has to know
+    /// the rule; the ones that already hold a SEAT (the host's reconcile
+    /// loop, the pads) never call it and are unaffected.
+    fn slot_seat(&self, col: crate::recorder::Column, n: usize) -> (usize, usize) {
+        crate::recorder::seat_bay(col.desk_index(), n)
+    }
+
     pub fn insert(&self, strip: usize, slot: usize) -> Option<&str> {
         self.settings
             .strip_inserts
@@ -14183,6 +15670,20 @@ impl IvoryApp {
         self.save_settings();
     }
 
+    /// Where PROJECTS are written from now on.
+    pub fn set_project_dir(&mut self, dir: std::path::PathBuf) {
+        self.settings.project_dir = Some(dir.to_string_lossy().into_owned());
+        self.save_settings();
+    }
+
+    /// Where EXPORTS land when the export dialog names no folder. The
+    /// standing default, not one export's destination — that is
+    /// `set_export_dir`, which writes the spec.
+    pub fn set_export_root(&mut self, dir: std::path::PathBuf) {
+        self.settings.export_dir = Some(dir.to_string_lossy().into_owned());
+        self.save_settings();
+    }
+
     // No `set_audio_uid` / `set_camera_uid` here, deliberately.
     //
     // There were two, `pub`, with no callers — so no `dead_code` warning — and
@@ -14258,7 +15759,21 @@ impl IvoryApp {
     /// insert and `usize::MAX` meant "the bus", which stops being expressible
     /// the moment there are thirty-nine of them.
     fn open_insert_picker(&mut self, strip: usize, slot: usize) {
-        if !self.caps.capture_devices || strip > recorder::STRIPS || slot >= recorder::INSERTS {
+        // **Bounded by the INSERT SPACE, not by the strip count.**
+        //
+        // The master's second rack is seated past the drum pads — see
+        // `recorder::MASTER_EXTRA_SEAT` — so its index is far beyond `STRIPS`,
+        // and this guard threw it away without a sound. Those are the master's
+        // FIRST three bays in both views: the owner found them unresponsive in
+        // the arrange strip while the last three worked, and the same three
+        // were dead on the mixer's master strip for exactly as long.
+        //
+        // `MASTER_SEAT` is `STRIPS` itself, which is why a `>` let the other
+        // three through and made this look like a rack that half worked.
+        if !self.caps.capture_devices
+            || slot >= recorder::INSERTS
+            || strip * recorder::INSERTS + slot >= recorder::INSERT_SPACE
+        {
             return;
         }
         self.picker_insert = Some((strip, slot));
@@ -14616,14 +16131,43 @@ impl IvoryApp {
     }
 
     fn ask_for_a_folder(&mut self) {
-        if !self.caps.capture_devices || !self.caps.native_file_dialogs {
+        self.ask_for_a_media_folder(crate::ports::DirPurpose::RecordRoot);
+    }
+
+    /// One of the three standing folders — takes, projects, exports.
+    ///
+    /// **The takes' guard applies to all three**, and it is not about
+    /// recording: `native_file_dialogs` is what says this host may raise an
+    /// OS panel at all, and a plugin editor may not.
+    fn ask_for_a_media_folder(&mut self, purpose: crate::ports::DirPurpose) {
+        use crate::ports::DirPurpose as P;
+        if !self.caps.native_file_dialogs {
             return;
         }
+        let (start, title) = match purpose {
+            P::ProjectRoot => (
+                self.settings.project_root(),
+                "Where should Tangent keep your projects?",
+            ),
+            P::ExportRoot => (
+                self.settings.export_root(),
+                "Where should Tangent put your exports?",
+            ),
+            _ => {
+                if !self.caps.capture_devices {
+                    return;
+                }
+                (
+                    self.settings.record_root(),
+                    "Where should Tangent put your takes?",
+                )
+            }
+        };
         self.native_panel_up = true;
         self.dir_request = Some(crate::ports::DirRequest {
-            start_at: Some(self.settings.record_root()),
-            title: "Where should Tangent put your takes?".to_owned(),
-            purpose: crate::ports::DirPurpose::RecordRoot,
+            start_at: Some(start),
+            title: title.to_owned(),
+            purpose,
         });
     }
 
@@ -15380,13 +16924,19 @@ impl IvoryApp {
                     focus: true,
                 })
             }
-            // **Both ways, by hand.** The host turns this on when it sees a
-            // reader attach and never turns it off — see
-            // `set_screen_reader` — so this row is how somebody says
-            // otherwise in either direction.
+            // **Both ways, by hand, and the only half that is REMEMBERED.**
+            // The host turns this on for a session when it sees a reader
+            // attach and never writes that down — see `set_screen_reader`
+            // — so this row is both how somebody says otherwise and how
+            // they say it for good.
             MenuAction::ToggleScreenReaderMode => {
-                let on = !self.settings.screen_reader_mode;
+                let on = !self.reader_mode();
                 self.settings.screen_reader_mode = on;
+                // Turning it OFF also overrules this session's detection —
+                // otherwise the row would look dead on a machine that had
+                // guessed wrong, which is exactly the machine somebody
+                // would be reaching for the row on.
+                self.reader_was_detected = false;
                 self.caps.child_windows = !on;
                 // Whatever is open is open in the WRONG kind of surface now.
                 self.dialog = None;
@@ -15855,11 +17405,25 @@ impl IvoryApp {
             }
             DialogAction::TrackRemove(lane) => {
                 self.dialog = None;
-                self.remove_channel(lane);
+                self.remove_selected_channels(lane);
             }
+            // **The badge and the paint reach the whole selection.**
+            //
+            // Remove already did (`remove_selected_channels`) and the four
+            // switches already did (`apply_mixer_hit`); these two wrote to the
+            // one lane whose menu was open, so picking four tracks and
+            // painting them painted one. A selection that some operations
+            // honour and others quietly ignore is worse than no selection at
+            // all, because there is no way to tell which you are getting.
+            //
+            // Absolute rather than a delta, like the switches: a colour has no
+            // meaningful "one step along", so the whole selection takes what
+            // was chosen.
             DialogAction::TrackIcon(lane, icon) => {
-                if let Some(slot) = self.settings.channel_icons.get_mut(lane) {
-                    *slot = icon.min(3);
+                for n in self.selection_with(lane) {
+                    if let Some(slot) = self.settings.channel_icons.get_mut(n) {
+                        *slot = icon.min(3);
+                    }
                 }
                 self.save_settings();
                 self.undo_commit();
@@ -15869,8 +17433,10 @@ impl IvoryApp {
                 }
             }
             DialogAction::TrackColor(lane, idx) => {
-                if let Some(c) = self.settings.strip_colors.get_mut(lane) {
-                    *c = idx.clamp(0, 26);
+                for n in self.selection_with(lane) {
+                    if let Some(c) = self.settings.strip_colors.get_mut(n) {
+                        *c = idx.clamp(0, 26);
+                    }
                 }
                 self.save_settings();
                 self.undo_commit();
@@ -17078,8 +18644,65 @@ impl IvoryApp {
     /// themselves.
     pub const CLEAR_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 
+    /// How long a VU needle takes to reach 99% of a step, in seconds.
+    ///
+    /// **The number that makes a VU a VU.** The instrument is defined by its
+    /// ballistics before anything else: 300 ms to 99% of full deflection, and
+    /// the same coming back. Anything quicker is a peak meter wearing a round
+    /// face, which is what this was — it followed a window that reset every
+    /// repaint, so its integration time was the frame interval.
+    const VU_RISE_S: f32 = 0.300;
+
+    /// **Where 0 VU sits, expressed as a SINE.**
+    ///
+    /// A VU is an average-reading instrument calibrated against a tone: 0 VU
+    /// is a sine whose PEAK is at the reference, and such a sine has an RMS
+    /// 3.01 dB below that. Comparing the raw RMS against a peak reference
+    /// therefore reads every signal three decibels low before crest factor is
+    /// even considered, which is half of why the owner found it sitting well
+    /// under what was going in.
+    const VU_SINE: f32 = std::f32::consts::SQRT_2;
+
+    /// Advance every needle by the time that has actually passed.
+    ///
+    /// A one-pole whose coefficient is computed from `dt` rather than assumed,
+    /// so the needle behaves the same at thirty frames a second as at a
+    /// hundred and twenty — and does not lurch when a frame is late.
+    fn advance_vu(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        // Clamped: a first frame, or a window that was not drawn for a while,
+        // must not teleport the needles or freeze them.
+        let dt = (now - self.vu_at).clamp(0.0, 0.25) as f32;
+        self.vu_at = now;
+        if dt <= 0.0 {
+            return;
+        }
+        // 99% of a step in `VU_RISE_S` is a time constant of that over ln(100).
+        let tau = Self::VU_RISE_S / 4.605;
+        let a = 1.0 - (-dt / tau).exp();
+        let targets = [
+            self.recorder.meters.left.rms * Self::VU_SINE,
+            self.recorder.meters.right.rms * Self::VU_SINE,
+            self.recorder.master.left.rms * Self::VU_SINE,
+            self.recorder.master.right.rms * Self::VU_SINE,
+        ];
+        for (n, target) in self.vu_needle.iter_mut().zip(targets) {
+            *n += (target - *n) * a;
+        }
+        self.recorder.meters.left.vu = self.vu_needle[0];
+        self.recorder.meters.right.vu = self.vu_needle[1];
+        self.recorder.master.left.vu = self.vu_needle[2];
+        self.recorder.master.right.vu = self.vu_needle[3];
+        // A needle that is still moving is a repaint that has to happen, or it
+        // freezes wherever the last mouse move left it.
+        if self.vu_needle.iter().zip(targets).any(|(n, t)| (n - t).abs() > 1.0e-4) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+    }
+
     fn paint(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        self.advance_vu(&ctx);
         self.shift_down = ctx.input(|i| i.modifiers.shift);
         self.alt_down = ctx.input(|i| i.modifiers.alt);
         self.menu_ate_press = false;
@@ -17520,15 +19143,46 @@ impl IvoryApp {
             // measured rather than picked — see `settings::MIN_WINDOW`. The
             // maximum is released explicitly, because a build that pinned it
             // may have left one on the window.
-            if self.min_sent != Some(true) {
-                ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(
-                    crate::settings::MIN_WINDOW,
-                ));
-                ctx.send_viewport_cmd(ViewportCommand::MaxInnerSize(Vec2::new(
-                    f32::INFINITY,
-                    f32::INFINITY,
-                )));
-                self.min_sent = Some(true);
+            if crate::settings::RESIZABLE {
+                if self.min_sent != Some(true) {
+                    ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(
+                        crate::settings::MIN_WINDOW,
+                    ));
+                    ctx.send_viewport_cmd(ViewportCommand::MaxInnerSize(Vec2::new(
+                        f32::INFINITY,
+                        f32::INFINITY,
+                    )));
+                    self.min_sent = Some(true);
+                }
+            } else {
+                // **The PIN**, which is what an un-resizable window is made
+                // of: a minimum and a maximum that are the same size, and an
+                // inner size that drags the window to meet them. See
+                // `settings::RESIZABLE` for why it is back and what it costs.
+                //
+                // The size is the NATURAL one for the current percentage and
+                // the bands that are on — never `target`, which in a DAW
+                // view is the pane. Pressing Tab has to change what is drawn
+                // and not one pixel of geometry; a view that resized the
+                // window would be a view nobody could Tab back out of on a
+                // small screen.
+                //
+                // Sent only when it CHANGES. Re-sending a size every frame
+                // is how a window fights a tiling manager sixty times a
+                // second, and `size_asked_at` is what tells the geometry
+                // write-back that the next mismatch is the tiler's doing and
+                // not a hand's.
+                let want = initial_window_size(&self.settings);
+                if self.last_sent_size != Some(want) {
+                    ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(want));
+                    ctx.send_viewport_cmd(ViewportCommand::MaxInnerSize(want));
+                    ctx.send_viewport_cmd(ViewportCommand::InnerSize(want));
+                    self.last_sent_size = Some(want);
+                    self.size_asked_at = Some(Instant::now());
+                }
+                // The presets ask for exactly this size, so the request has
+                // already been answered by the pin above.
+                self.pending_window_size = None;
             }
             // A size the app itself asked for — a percentage preset, or a
             // band appearing in a window that has never been dragged. Never
@@ -17588,10 +19242,48 @@ impl IvoryApp {
         // theme did not name one.
         ui.painter()
             .rect_filled(pane, 0.0, crate::piano::themed_bg(&self.settings));
-        let origin = Pos2::new(
-            pane.min.x + ((pane.width() - w) * 0.5).max(0.0).trunc(),
-            pane.min.y + ((pane.height() - target.y) * 0.5).max(0.0).trunc(),
-        );
+        // **A DAW view FILLS the window; the theory view is aspect-locked.**
+        //
+        // The two are different questions and they were being given one
+        // answer. A piano is a picture of a thing with a shape, so its stack
+        // is fitted and centred and a window at the wrong aspect gets bands
+        // of the theme's ground — that is letterboxing and it is correct.
+        // A mixer and a timeline have no shape: they are grids that want
+        // every pixel of height they can get, and centring them in a
+        // fitted rectangle left an eight-hundred-point band of nothing above
+        // and below on the owner's own screen while the timeline showed
+        // eight lanes.
+        //
+        // So in those two views the band keeps its NATURAL height for the
+        // full window width — its proportions are the one thing that must
+        // not change between views, the owner's word — and the panel below
+        // takes everything that is left. No bars, and the band is the same
+        // band it is everywhere else.
+        //
+        // This is also what fullscreen wanted: `fill_bands` scales every
+        // band by one factor, which in a DAW view stretched the transport to
+        // make room for a timeline that would rather have had the room.
+        let daw_view = self.mixer_open || self.arrangement_open;
+        let (w, recorder_h, origin, target) = if daw_view && pane.is_positive() {
+            let full = pane.width().max(1.0).trunc();
+            let band_h = band_sizes_at(&self.settings, full).recorder_h;
+            (
+                full,
+                band_h,
+                pane.min,
+                Vec2::new(full, pane.height()),
+            )
+        } else {
+            (
+                w,
+                recorder_h,
+                Pos2::new(
+                    pane.min.x + ((pane.width() - w) * 0.5).max(0.0).trunc(),
+                    pane.min.y + ((pane.height() - target.y) * 0.5).max(0.0).trunc(),
+                ),
+                target,
+            )
+        };
         self.last_pane = pane.size();
         self.last_drawn = Rect::from_min_size(origin, target);
         let band_at = |top: f32, h: f32| {
@@ -17701,10 +19393,34 @@ impl IvoryApp {
             // The CARD it raises is not drawn here. It is taller than the band
             // and hangs down over whatever is below, so it is painted after
             // every other band — see the end of this function.
-            if let Some(c) = self.heart_color() {
+            let now = ui.input(|i| i.time);
+            if let Some(c) = self.heart_color(now) {
                 let hr = recorder_panel::heart_rect(rect, &self.recorder_layout_view());
                 if hr.is_positive() {
-                    chord_strip::draw_heart(ui.painter(), hr, c);
+                    // **Asked for, not assumed.** egui only paints when
+                    // something says it must; without this the wave advances
+                    // one step per mouse move and looks broken rather than
+                    // slow. Only while it is actually drifting — a still
+                    // heart must not hold a repaint loop open, and on a
+                    // laptop that is the difference between a fan and none.
+                    if self.settings.heart_animate && self.license.is_supporter() {
+                        ui.ctx().request_repaint_after(
+                            std::time::Duration::from_millis(33),
+                        );
+                    }
+                    if self.settings.heart_animate && self.license.is_supporter() {
+                        chord_strip::draw_heart_wave(ui.painter(), hr, &|phase| {
+                            let fill = self.heart_wave(phase, now);
+                            (fill, recorder_panel::heart_border(fill))
+                        });
+                    } else {
+                        chord_strip::draw_heart_bordered(
+                            ui.painter(),
+                            hr,
+                            c,
+                            Some(recorder_panel::heart_border(c)),
+                        );
+                    }
                     // The hover rect is the GLYPH's own pixels — the drawn
                     // sprite, not the layout cell it was carved from. Every
                     // pixel you can see answers the hand now.
@@ -17782,6 +19498,7 @@ impl IvoryApp {
             };
             let on_desk = offer_nodes(
                 ui,
+                self.reader_mode(),
                 &nodes,
                 self.settings.white_key_active_color.to_color32(),
             )
@@ -17838,6 +19555,39 @@ impl IvoryApp {
             crate::arrangement_panel::draw(ui.painter(), rect, &view);
             self.draw_clip_menu(ui.painter());
             self.draw_bay_carry(ui.painter(), ui.ctx().pointer_interact_pos());
+            // The timeline's tab stops, on the desk's own terms. See
+            // `ivory_ui::a11y`, and `arrangement_panel::targets` for why
+            // only half of this panel's hits can be one.
+            //
+            // **Not while the MIDI editor is up.** It floats over the lanes
+            // and owns every key; leaving the timeline's nodes allocated
+            // under it would put focus on controls a person cannot see.
+            let on_arr = if self.midi_edit.is_some() {
+                None
+            } else {
+                let (nodes, hits) = {
+                    let nodes = crate::arrangement_panel::a11y_nodes(rect, &view);
+                    let hits = crate::arrangement_panel::targets(rect, &view);
+                    (nodes, hits)
+                };
+                offer_nodes(
+                    ui,
+                    self.reader_mode(),
+                    &nodes,
+                    self.settings.white_key_active_color.to_color32(),
+                )
+                    .and_then(|node| {
+                        // Back to the hit by RECT, the desk's own map-back:
+                        // both lists come out of `targets`, so they cannot
+                        // disagree without having disagreed about the layout.
+                        hits.iter()
+                            .find(|(r, _)| *r == node.rect)
+                            .map(|(_, hit)| Focused::Arrange {
+                                hit: *hit,
+                                travel: node.travel,
+                            })
+                    })
+            };
             // A track mid-carry: the target row lights under the hand.
             if let Some(ArrDrag::ReorderLane { from }) = self.arr_drag {
                 let l = crate::arrangement_panel::Layout::new(rect, &view);
@@ -17870,6 +19620,13 @@ impl IvoryApp {
                         }
                     }
                 }
+            }
+            // **After the view's borrow is done with**, exactly as on the
+            // desk: the reorder overlay above still needs `view`, and
+            // assigning into `self` mid-borrow is what the compiler objects
+            // to.
+            if on_arr.is_some() {
+                self.a11y_on = on_arr;
             }
             // The right-drag selection band, while a hand draws one.
             if matches!(self.arr_drag, Some(ArrDrag::ClipBand)) {
@@ -17956,6 +19713,7 @@ impl IvoryApp {
         let musical = self.musical_nodes(&display, piano_rect, chord_rect_for_hit, fret_rect_for_hit);
         if let Some(node) = offer_nodes(
             ui,
+            self.reader_mode(),
             &musical,
             self.settings.white_key_active_color.to_color32(),
         ) {
@@ -17982,6 +19740,9 @@ impl IvoryApp {
         // The effect panels, on the same terms and for the same reasons.
         if let Some(fx) = self.fx_open {
             let anchor = self.fx_anchor(fx);
+            // Held out here so the slice handed to the painter outlives the
+            // call: the labels are built per frame and the panel borrows them.
+            let open_list;
             if anchor.is_positive() {
                 recorder_panel::draw_fx(
                     ui.painter(),
@@ -17990,6 +19751,12 @@ impl IvoryApp {
                     fx,
                     &|key| self.effect_param(key),
                     &|key| self.choice_label(key),
+                    {
+                        let list = self.fx_choice.map(|k| (k, self.choice_list(k)));
+                        open_list = list;
+                        open_list.as_ref().map(|(k, (labels, at))| (*k, labels.as_slice(), *at))
+                    },
+                    self.delay_is_free(),
                     &self.settings,
                 );
             } else {
@@ -18323,8 +20090,7 @@ impl IvoryApp {
                 })
             {
                 if let Some(n) = self.selected_channel.filter(|n| self.channel_used(*n)) {
-                    self.remove_channel(n);
-                    self.selected_channel = None;
+                    self.remove_selected_channels(n);
                 }
             }
             // **What is being typed into a decibel field.**
@@ -18360,7 +20126,8 @@ impl IvoryApp {
                         // settings went away by accident. The menu offers the
                         // deed and its gentler sibling: delete, or replace.
                         Some(crate::mixer_panel::Hit::Insert(i, n)) => {
-                            if self.insert(i.desk_index(), n).is_some() {
+                            let (seat, bay) = self.slot_seat(i, n);
+                            if self.insert(seat, bay).is_some() {
                                 self.mixer_fx_menu = Some((i, n));
                             } else if i.strip().is_some_and(|s| matches!(
                                 s,
@@ -18487,7 +20254,7 @@ impl IvoryApp {
                     let pressed_strip = crate::mixer_panel::strip_at(rect, &view, pos)
                         .and_then(|c| c.strip());
                     if let Some(crate::recorder::Strip::Channel(n)) = pressed_strip {
-                        self.selected_channel = Some(n);
+                        self.select_track(n, ui.input(|i| i.modifiers));
                     }
                     let view = self.mixer_view();
                     match crate::mixer_panel::hit_test(rect, &view, pos) {
@@ -18498,7 +20265,10 @@ impl IvoryApp {
                         // channel. An empty bay has nothing to carry and
                         // keeps the immediate picker.
                         Some(crate::mixer_panel::Hit::Insert(i, n))
-                            if self.insert(i.desk_index(), n).is_some() =>
+                            if {
+                                let (seat, bay) = self.slot_seat(i, n);
+                                self.insert(seat, bay).is_some()
+                            } =>
                         {
                             self.bay_carry = Some((i.desk_index(), n, pos, false));
                         }
@@ -18508,6 +20278,15 @@ impl IvoryApp {
                         | crate::mixer_panel::Hit::Insert(..)
                         | crate::mixer_panel::Hit::Remove(_)
                         | crate::mixer_panel::Hit::Arm(_)
+                        // **T and the master's mono fold.** Both were laid
+                        // out, both were hit-tested, and neither was in this
+                        // list — so a press fell through to the drag branch
+                        // and did nothing, while the strip went on drawing
+                        // the state correctly. A switch that shows the truth
+                        // and refuses to change it is the hardest kind to
+                        // notice.
+                        | crate::mixer_panel::Hit::ToTheory(_)
+                        | crate::mixer_panel::Hit::Mono(_)
                         | crate::mixer_panel::Hit::FxMenu(..)
                         | crate::mixer_panel::Hit::InputChip(_)
                         // A door, not a fader: without this it fell through
@@ -18584,7 +20363,7 @@ impl IvoryApp {
                         };
                         if let Some(crate::recorder::Strip::Channel(to)) = target {
                             if to != from {
-                                self.move_channel(from, to);
+                                self.move_selection(from, to);
                             }
                         }
                     }
@@ -18873,7 +20652,7 @@ impl IvoryApp {
                 self.main_focused,
                 self.current_chord.as_deref(),
                 self.settings.chord_text_color.to_color32(),
-                self.heart_color(),
+                self.heart_color(ctx.input(|i| i.time)),
                 self.transpose_view(),
             );
             // A tiling WM overrules the size we asked for the moment the window
@@ -19010,11 +20789,20 @@ impl IvoryApp {
             // top-left of the SCREEN. On this machine that put the welcome card
             // at x = (1300 - 470) / 2 = 415, which looks deliberate and is a
             // window-sized coincidence.
-            parent: self
-                .main_origin_known
-                .then(|| self.last_drawn.translate(self.main_inner_origin.to_vec2()))
-                .filter(|r: &Rect| r.is_positive()),
-            monitor: self.monitor_size,
+            //
+            // **In the coordinates the surface will actually be placed in**
+            // — see `surface_frame`. A dialog drawn as a LAYER lives inside
+            // our own canvas, so a parent rect translated onto the desktop
+            // sent it several hundred points off and the inline shell then
+            // clamped it into a corner. The welcome card was the visible
+            // one, because it is the dialog somebody meets first.
+            parent: {
+                let (origin, _) = self.surface_frame();
+                (self.main_origin_known || !self.caps.child_windows)
+                    .then(|| self.last_drawn.translate(origin))
+                    .filter(|r: &Rect| r.is_positive())
+            },
+            monitor: self.surface_frame().1,
         };
         if let Some(action) =
             {
@@ -19024,6 +20812,25 @@ impl IvoryApp {
             }
         {
             self.apply_dialog_action(action);
+        }
+        // **The band's message, as a window.** The status line along the foot
+        // of the record band is gone; this is where those messages went. The
+        // notice keeps its own surface, so it neither closes the dialog above
+        // nor is closed by it.
+        let msg = self.recorder.message.clone();
+        if msg.is_some() && msg != self.notice_dismissed {
+            if let Some(text) = msg.as_deref() {
+                if dialogs::show_notice(&ctx, placement, text) {
+                    self.notice_dismissed = msg.clone();
+                    // The host owns the errors behind the message, and this is
+                    // what puts them away — the same path the old × used.
+                    self.dismiss_message = true;
+                }
+            }
+        }
+        if msg.is_none() {
+            // Nothing to say, so nothing to remember having said.
+            self.notice_dismissed = None;
         }
         // The two answers that need a context to carry out: putting the font
         // back, and putting it back again. See `pending_reset`.
@@ -19139,7 +20946,7 @@ mod tests {
         assert_send::<IvoryApp>();
     }
 
-    fn headless(caps: Caps) -> (egui::Context, IvoryApp) {
+    pub(super) fn headless(caps: Caps) -> (egui::Context, IvoryApp) {
         headless_with(caps, Settings::default())
     }
 
@@ -20165,6 +21972,394 @@ mod tests {
             }
             other => panic!("a press on the ghost answered {other:?}"),
         }
+    }
+
+    /// **Shift takes a range; Cmd or Ctrl takes them one at a time.**
+    ///
+    /// The two gestures every desk has, and the parts worth pinning: a range
+    /// measures from the ANCHOR rather than from the last track touched, so
+    /// shift-clicking around keeps the same fixed end instead of walking; and
+    /// Cmd can empty the selection completely, which the rim has to be able to
+    /// show or a selection could never be fully undone.
+    #[test]
+    fn shift_takes_a_range_and_cmd_takes_them_one_at_a_time() {
+        use egui::Modifiers;
+        let cmd = Modifiers::COMMAND;
+        let shift = Modifiers::SHIFT;
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+
+        // Plain: this one alone.
+        app.select_track(3, Modifiers::NONE);
+        assert_eq!(app.selected_tracks, vec![3]);
+        assert_eq!(app.selected_channel, Some(3));
+
+        // Shift: everything between, and the clicked end is the primary.
+        app.select_track(6, shift);
+        assert_eq!(app.selected_tracks, vec![3, 4, 5, 6]);
+        assert_eq!(app.selected_channel, Some(6));
+
+        // **Still measured from 3.** A second shift-click re-cuts the range
+        // from the anchor rather than extending from 6.
+        app.select_track(5, shift);
+        assert_eq!(app.selected_tracks, vec![3, 4, 5]);
+
+        // And backwards over the anchor.
+        app.select_track(1, shift);
+        assert_eq!(app.selected_tracks, vec![1, 2, 3]);
+        assert_eq!(app.selected_channel, Some(1), "the clicked end is primary");
+
+        // Cmd adds one without disturbing the rest.
+        app.select_track(9, cmd);
+        assert_eq!(app.selected_tracks, vec![1, 2, 3, 9]);
+        assert_eq!(app.selected_channel, Some(9));
+
+        // Cmd again on the same track takes it back out.
+        app.select_track(9, cmd);
+        assert_eq!(app.selected_tracks, vec![1, 2, 3]);
+        assert_eq!(app.selected_channel, Some(3), "the primary was promoted");
+
+        // Down to nothing, which is a state that has to be reachable.
+        for n in [1, 2, 3] {
+            app.select_track(n, cmd);
+        }
+        assert!(app.selected_tracks.is_empty());
+        assert_eq!(app.selected_channel, None);
+
+        // A plain press starts over.
+        app.select_track(7, Modifiers::NONE);
+        assert_eq!(app.selected_tracks, vec![7]);
+    }
+
+    /// **Reaching for one track's control does not throw the selection away.**
+    ///
+    /// Picking four tracks and then touching one of their faders has to leave
+    /// the four picked; that is the entire point of having a selection. A
+    /// control on a track OUTSIDE the selection is somebody moving on, and
+    /// collapses to that one.
+    #[test]
+    fn a_control_on_a_selected_track_leaves_the_selection_alone() {
+        use egui::Modifiers;
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.select_track(2, Modifiers::NONE);
+        app.select_track(5, Modifiers::SHIFT);
+        assert_eq!(app.selected_tracks, vec![2, 3, 4, 5]);
+
+        app.touch_track(4);
+        assert_eq!(
+            app.selected_tracks,
+            vec![2, 3, 4, 5],
+            "a fader inside the selection cleared it"
+        );
+        assert_eq!(app.selected_channel, Some(4), "it is still the primary");
+
+        app.touch_track(11);
+        assert_eq!(
+            app.selected_tracks,
+            vec![11],
+            "a control outside the selection did not take over"
+        );
+    }
+
+    /// **The heart's wave travels, and it travels DIAGONALLY.**
+    ///
+    /// The first pass crossfaded the whole sprite between neighbouring palette
+    /// colours, which is a graceful shift and not a wave: every pixel was the
+    /// same colour as every other at any instant, so there was nothing to
+    /// travel. Both halves are checked, because a wave that does not move and
+    /// a colour that changes without a wave both look "animated" in a
+    /// screenshot.
+    #[test]
+    fn the_supporter_heart_is_a_travelling_diagonal_wave() {
+        let (_ctx, app) = headless_with(Caps::DESKTOP, Settings::default());
+        let rgb = |c: egui::Color32| (c.r(), c.g(), c.b());
+
+        // Across the sprite at ONE instant: several distinct bands.
+        let across: std::collections::HashSet<_> = (0..=10)
+            .map(|d| rgb(app.heart_wave(d as f32 / 10.0, 0.0)))
+            .collect();
+        assert!(
+            across.len() >= 3,
+            "the heart is {} colour(s) across its diagonal, so nothing is \
+             travelling",
+            across.len()
+        );
+
+        // At ONE place over time: the bands walk past it.
+        let over_time: std::collections::HashSet<_> = (0..8)
+            .map(|k| {
+                rgb(app.heart_wave(0.0, IvoryApp::HEART_CYCLE_S * f64::from(k) / 8.0))
+            })
+            .collect();
+        assert!(
+            over_time.len() >= 4,
+            "one point of the heart sees {} colour(s) in a whole cycle",
+            over_time.len()
+        );
+
+        // And it is a CYCLE: a full period lands back where it started.
+        assert_eq!(
+            rgb(app.heart_wave(0.25, 0.0)),
+            rgb(app.heart_wave(0.25, IvoryApp::HEART_CYCLE_S)),
+            "the wave does not close on itself"
+        );
+    }
+
+    /// **A selection is something you can OPERATE, not just something you can
+    /// see.**
+    ///
+    /// Switches take the whole selection to the state the touched one landed
+    /// in; levels move the rest by the same DELTA, because four tracks
+    /// balanced against each other must stay balanced. An absolute value would
+    /// flatten them onto one number, which is what nobody drags a group fader
+    /// hoping for.
+    #[test]
+    fn a_gesture_on_one_selected_track_carries_the_others() {
+        use crate::mixer_panel::Hit as M;
+        use crate::recorder::Column;
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+
+        // Four tracks, deliberately at different levels.
+        for (n, g) in [(2usize, 0.9_f64), (3, 0.5), (4, 0.25), (5, 0.7)] {
+            app.settings.channel_gains[n] = g;
+        }
+        app.select_track(2, egui::Modifiers::NONE);
+        app.select_track(5, egui::Modifiers::SHIFT);
+        assert_eq!(app.selected_tracks, vec![2, 3, 4, 5]);
+
+        // ── a SWITCH takes them all ──────────────────────────────────────
+        app.apply_mixer_hit(M::Mute(Column(3)), 0.0);
+        for n in [2usize, 3, 4, 5] {
+            assert!(
+                app.strip_switch(M::Mute(Column(n)), n),
+                "track {n} did not follow the mute"
+            );
+        }
+        // And pressing it again takes them all back.
+        app.apply_mixer_hit(M::Mute(Column(3)), 0.0);
+        for n in [2usize, 3, 4, 5] {
+            assert!(!app.strip_switch(M::Mute(Column(n)), n), "track {n} stayed muted");
+        }
+
+        // ── a LEVEL moves them by the same distance ──────────────────────
+        let before: Vec<f32> = (2..=5).map(|n| app.mixer_value(M::Fader(Column(n)))).collect();
+        let to = before[1] - 0.1;
+        app.apply_mixer_hit(M::Fader(Column(3)), to);
+        let after: Vec<f32> = (2..=5).map(|n| app.mixer_value(M::Fader(Column(n)))).collect();
+        let moved = after[1] - before[1];
+        for (k, n) in (2..=5).enumerate() {
+            assert!(
+                (after[k] - before[k] - moved).abs() < 0.01,
+                "track {n} moved {} where the one dragged moved {moved}",
+                after[k] - before[k]
+            );
+        }
+        // **Balance kept**, which is the whole reason it is a delta: the
+        // tracks come out in the same order they went in, loudest still
+        // loudest, rather than flattened onto one number.
+        let rank = |v: &[f32]| {
+            let mut idx: Vec<usize> = (0..v.len()).collect();
+            idx.sort_by(|a, b| v[*a].partial_cmp(&v[*b]).unwrap());
+            idx
+        };
+        assert_eq!(
+            rank(&before),
+            rank(&after),
+            "the tracks were re-ordered by level: {before:?} became {after:?}"
+        );
+
+        // ── and an UNSELECTED track is left alone ────────────────────────
+        let bystander = app.mixer_value(M::Fader(Column(9)));
+        app.apply_mixer_hit(M::Fader(Column(3)), to - 0.1);
+        assert!(
+            (app.mixer_value(M::Fader(Column(9))) - bystander).abs() < 1.0e-6,
+            "a track outside the selection followed the drag"
+        );
+    }
+
+    /// **A reorder carries the whole selection**, as one block, in order.
+    ///
+    /// Rotating them one at a time with `move_channel` does not work: the
+    /// first one to land shifts every lane after it, so the target walks out
+    /// from under the rest. The order is worked out once, against the lanes
+    /// that are NOT moving.
+    #[test]
+    fn a_reorder_carries_the_whole_selection_as_one_block() {
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        // Give the lanes distinct levels so they can be followed across it.
+        for n in 0..8 {
+            app.settings.channel_gains[n] = 0.1 + n as f64 * 0.1;
+        }
+        app.select_track(1, egui::Modifiers::NONE);
+        app.select_track(3, egui::Modifiers::SHIFT);
+        assert_eq!(app.selected_tracks, vec![1, 2, 3]);
+
+        app.move_selection(1, 6);
+        let at = |n: usize| ((app.settings.channel_gains[n] - 0.1) * 10.0).round() as usize;
+        // 0, 4, 5, 6 keep their order; the block lands together behind them.
+        assert_eq!(
+            (0..8).map(at).collect::<Vec<_>>(),
+            vec![0, 4, 5, 6, 1, 2, 3, 7],
+            "the block did not land in one piece"
+        );
+        // And the selection followed the tracks it names.
+        assert_eq!(app.selected_tracks, vec![4, 5, 6]);
+    }
+
+    /// **Splitting a MIDI clip keeps every note, where it was.**
+    ///
+    /// A note's `at_s` is a time in the SOURCE, and every reader turns it into
+    /// a position with `start_s + (at_s - offset_s)`. The split rebased the
+    /// tail's notes to the tail's own zero and ALSO advanced its `offset_s` by
+    /// the same amount, subtracting the cut twice — so the tail's notes landed
+    /// `head` seconds early, usually before the tail itself begins, and were
+    /// drawn in the wrong place or not at all. The bounds had the same
+    /// confusion, comparing a source time against a duration, which is only
+    /// harmless on a clip that has never been trimmed.
+    ///
+    /// **Trimmed on purpose**, because an untrimmed clip is exactly the case
+    /// where the bug hides.
+    #[test]
+    fn splitting_a_midi_clip_keeps_its_notes_where_they_were() {
+        use crate::arrangement::{ArrClip, ArrNote, ClipKind};
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        let note = |at: f64, dur: f64, key: u8| ArrNote { at_s: at, dur_s: dur, key, vel: 100 };
+        // Source times 2..6; the clip shows source 2..6 starting at song time 10.
+        let clip = ArrClip {
+            kind: ClipKind::Midi,
+            notes: vec![
+                note(2.0, 0.5, 60),
+                note(3.0, 0.5, 62),
+                note(5.0, 0.5, 64),
+                note(5.5, 0.5, 65),
+            ],
+            lane: 0,
+            start_s: 10.0,
+            offset_s: 2.0,
+            len_s: 4.0,
+            id: 7,
+            ..Default::default()
+        };
+        app.arrangement.clips.push(clip);
+
+        // Where a reader puts a note, which is the thing that must not move.
+        let sounds_at = |a: &IvoryApp, id: u64| -> Vec<(u8, f64)> {
+            let c = a.arrangement.clips.iter().find(|c| c.id == id).unwrap();
+            c.notes
+                .iter()
+                .map(|n| (n.key, c.start_s + (n.at_s - c.offset_s)))
+                .collect()
+        };
+        let before = sounds_at(&app, 7);
+
+        // Cut two seconds in: song time 12, source time 4.
+        app.recorder.position_s = 12.0;
+        app.arr_selected = Some(7);
+        app.arr_split_at_playhead();
+
+        assert_eq!(app.arrangement.clips.len(), 2, "the split did not make a tail");
+        let head = app.arrangement.clips.iter().find(|c| c.id == 7).unwrap().clone();
+        let tail = app
+            .arrangement
+            .clips
+            .iter()
+            .find(|c| c.id != 7)
+            .expect("no tail")
+            .clone();
+
+        // **Nothing lost.** Two notes each side of source time 4.
+        assert_eq!(head.notes.len(), 2, "the head lost notes: {:?}", head.notes);
+        assert_eq!(tail.notes.len(), 2, "the tail lost notes: {:?}", tail.notes);
+
+        // **Nothing moved.** Every note still sounds where it did.
+        let mut after = sounds_at(&app, 7);
+        after.extend(sounds_at(&app, tail.id));
+        after.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        assert_eq!(before, after, "the split moved notes");
+
+        // And the tail reads from where the blade fell.
+        assert!(
+            (tail.offset_s - 4.0).abs() < 1.0e-9,
+            "the tail reads from {} rather than the cut at 4",
+            tail.offset_s
+        );
+    }
+
+    /// **Every one of the master's six bays opens a picker.**
+    ///
+    /// `open_insert_picker` bounded its strip by `STRIPS`, and the master's
+    /// second rack is seated past the drum pads — so the master's FIRST three
+    /// bays were thrown away without a sound in both views, while the last
+    /// three worked because `MASTER_SEAT` IS `STRIPS` and the check was a `>`.
+    /// A rack that half works is harder to spot than one that does not.
+    #[test]
+    fn every_master_bay_opens_its_picker() {
+        use crate::recorder::{seat_bay, INSERTS, STRIPS};
+        for slot in 0..INSERTS * 2 {
+            let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+            let (seat, bay) = seat_bay(STRIPS, slot);
+            app.open_insert_picker(seat, bay);
+            assert!(
+                app.picker_insert.is_some(),
+                "master slot {slot} (seat {seat}, bay {bay}) opened nothing"
+            );
+        }
+    }
+
+    /// **The mixer's T and mono switches answer a press.**
+    ///
+    /// Both were laid out and both were hit-tested; neither was in the press
+    /// dispatch, so they drew the right state and refused to change it.
+    #[test]
+    fn the_theory_and_mono_switches_are_wired() {
+        use crate::mixer_panel::Hit as M;
+        use crate::recorder::Column;
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        let before = app.to_theory(3);
+        app.apply_mixer_hit(M::ToTheory(Column(3)), 0.0);
+        assert_ne!(app.to_theory(3), before, "T did not switch");
+
+        let mono = app.settings.master_mono;
+        app.apply_mixer_hit(M::Mono(Column(crate::recorder::CHANNELS)), 0.0);
+        assert_ne!(app.settings.master_mono, mono, "the mono fold did not switch");
+    }
+
+    /// **T carries a multiple selection, on BOTH panels.**
+    ///
+    /// The timeline's T was the one switch on its header that toggled its own
+    /// lane directly instead of going through the desk, so M, S and R spread
+    /// across four selected tracks and T changed exactly one — the two panels
+    /// disagreeing about the same switch.
+    #[test]
+    fn the_theory_switch_spreads_across_a_selection_from_either_panel() {
+        use crate::arrangement_panel::Hit as A;
+        use crate::mixer_panel::Hit as M;
+        use crate::recorder::Column;
+        let picked = [2_usize, 3, 4, 5];
+
+        // From the TIMELINE header.
+        let (_c1, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.select_track(2, egui::Modifiers::NONE);
+        app.select_track(5, egui::Modifiers::SHIFT);
+        assert_eq!(app.selected_tracks, picked.to_vec());
+        for n in picked {
+            assert!(!app.to_theory(n), "track {n} started switched on");
+        }
+        app.apply_arrange_key(A::ToTheory(3), None);
+        for n in picked {
+            assert!(app.to_theory(n), "the timeline's T missed track {n}");
+        }
+        assert!(!app.to_theory(9), "the timeline's T reached outside the selection");
+
+        // And from the MIXER, which already went this way — the two must land
+        // in the same place or the switch means two things.
+        let (_c2, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.select_track(2, egui::Modifiers::NONE);
+        app.select_track(5, egui::Modifiers::SHIFT);
+        app.apply_mixer_hit(M::ToTheory(Column(3)), 0.0);
+        for n in picked {
+            assert!(app.to_theory(n), "the mixer's T missed track {n}");
+        }
+        assert!(!app.to_theory(9), "the mixer's T reached outside the selection");
     }
 
     fn headless_with(caps: Caps, settings: Settings) -> (egui::Context, IvoryApp) {
@@ -21559,7 +23754,7 @@ mod tests {
         // hold a key and on CI machines that do not, and the answer has to be
         // the same on both: there is nothing behind a key at all.
         assert!(
-            app.heart_color().is_some(),
+            app.heart_color(0.0).is_some(),
             "the heart is hidden (supporter: {})",
             app.license.is_supporter()
         );
@@ -22975,6 +25170,10 @@ mod tests {
     #[test]
     fn a_focused_knob_answers_the_arrow_keys() {
         let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        // **The overlay is accessibility mode's**, off by default so that
+        // Tab goes on cycling the views — see `offer_nodes`. These tests are
+        // about the overlay, so they switch it on.
+        app.settings.screen_reader_mode = true;
         app.settings.master_gain = 0.5;
         // One frame so the nodes exist and egui has heard of their ids.
         pointer_frame(&ctx, &mut app, Vec::new());
@@ -23059,6 +25258,10 @@ mod tests {
     #[test]
     fn an_arrow_key_on_a_focused_button_does_not_press_it() {
         let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        // **The overlay is accessibility mode's**, off by default so that
+        // Tab goes on cycling the views — see `offer_nodes`. These tests are
+        // about the overlay, so they switch it on.
+        app.settings.screen_reader_mode = true;
         pointer_frame(&ctx, &mut app, Vec::new());
         let _ = app.take_recorder_request();
 
@@ -23108,6 +25311,10 @@ mod tests {
     #[test]
     fn an_arrow_key_on_a_desk_button_does_not_press_it() {
         let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        // **The overlay is accessibility mode's**, off by default so that
+        // Tab goes on cycling the views — see `offer_nodes`. These tests are
+        // about the overlay, so they switch it on.
+        app.settings.screen_reader_mode = true;
         app.settings.keytoggle_enabled = false;
         let _ = run_frame(&ctx, &mut app);
         app.mixer_open = true;
@@ -23704,7 +25911,10 @@ mod tests {
                 ("reverb_size", 0.62),
                 ("reverb_damp", 0.35),
                 ("reverb_width", 0.70),
+                ("plate_dispersion", 0.75),
+                ("plate_predelay", 0.12),
                 ("delay_feedback", 0.42),
+                ("delay_free_hz", 0.5),
                 ("delay_tone", 0.55),
                 ("delay_width", 0.60),
                 ("chorus_rate", 0.28),
@@ -23719,12 +25929,38 @@ mod tests {
             .map(|(k, v)| (k.to_owned(), serde_json::Value::from(v)))
             .collect(),
             choices: vec![
+                // The Space Echo's mode selector, as the host supplies it —
+                // three of the twelve, which is all a test needs to prove a
+                // press steps.
+                crate::ports::ChoiceParam {
+                    key: "echo_mode".to_owned(),
+                    options: [("1", "1"), ("2", "2"), ("3", "3")]
+                        .into_iter()
+                        .map(|(k, l)| (k.to_owned(), l.to_owned()))
+                        .collect(),
+                    default: "1".to_owned(),
+                },
+                // The reverb's own selector. Both positions, because there
+                // are only two and the test steps to the NEXT one.
+                crate::ports::ChoiceParam {
+                    key: "reverb_mode".to_owned(),
+                    options: [("plate", "plate - EMT 140"), ("smooth", "* smooth")]
+                        .into_iter()
+                        .map(|(k, l)| (k.to_owned(), l.to_owned()))
+                        .collect(),
+                    default: "plate".to_owned(),
+                },
                 crate::ports::ChoiceParam {
                     key: "delay_division".to_owned(),
+                    // **`free` LAST, as the host has it.** The row that sets
+                    // the free rate only exists on that position, so a list
+                    // without it is a list that cannot reach the row — which
+                    // is how the sweep below came to skip a control silently.
                     options: [
                         ("quarter", "1/4"),
                         ("dotted-eighth", "1/8 dotted"),
                         ("eighth", "1/8"),
+                        ("free", "free"),
                     ]
                     .into_iter()
                     .map(|(k, l)| (k.to_owned(), l.to_owned()))
@@ -23927,14 +26163,15 @@ mod tests {
             app.apply_recorder_hit(reset);
         }
         for fx in recorder_panel::Fx::ALL {
-            // The limiter and the LPF rest fully clockwise — threshold above
-            // everything, cutoff wide open at 20 kHz — matching
-            // `Sends::default()`. The owner met the old 0.0 LPF reset as
-            // "double-click slams the filter shut".
-            let rest = if matches!(fx, recorder_panel::Fx::Limiter | recorder_panel::Fx::Lpf) {
-                1.0
-            } else {
-                0.0
+            // The LPF rests fully clockwise — cutoff wide open at 20 kHz.
+            // The owner met the old 0.0 LPF reset as "double-click slams the
+            // filter shut". The LIMITER rests where it SHIPS, which is in
+            // circuit at −1 dBFS and no longer the same as "not applied" —
+            // see `recorder::LIMITER_SHIPS_AT`.
+            let rest = match fx {
+                recorder_panel::Fx::Lpf => 1.0,
+                recorder_panel::Fx::Limiter => crate::recorder::LIMITER_SHIPS_AT,
+                _ => 0.0,
             };
             assert_eq!(app.fx_value(fx), rest, "{} did not go back", fx.title());
         }
@@ -24184,11 +26421,307 @@ mod tests {
                 found.is_same_control(hit),
                 "{at:?} is over {found:?}, not {hit:?}"
             );
+            // **Except the pitch dial**, which prints no number and so has
+            // no field to open — the owner's design call, so that the pitch
+            // is found by ear rather than typed at. Its right-click opens
+            // the RANGE panel instead, which is where its numbers live.
+            if found.is_same_control(recorder_panel::Hit::SetVarispeed(0.0)) {
+                assert!(
+                    recorder_panel::num_field(found).is_none(),
+                    "the pitch dial grew a number field again"
+                );
+                continue;
+            }
             assert!(recorder_panel::num_field(found).is_some());
         }
         // And nothing is a knob between them.
         assert_eq!(app.knob_under(Some(band), band.left_bottom()), None);
         assert_eq!(app.knob_under(None, band.center()), None);
+    }
+
+    /// **A track is dragged by its TITLE on the timeline too.**
+    ///
+    /// It was, then it was not: an arm reading "a single press on the NAME
+    /// does nothing" sat above the reorder arm, which is written
+    /// `HdrNumber(n) | HdrName(n)`, and Rust takes the first arm that
+    /// matches. Half the reorder handle was dead code — and not an
+    /// unreachable-pattern warning, because the arm below is only PARTLY
+    /// shadowed. The owner found it: "fixed on mixer view, but regressed on
+    /// arrange view".
+    #[test]
+    fn a_track_on_the_timeline_is_dragged_by_its_title() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.keytoggle_enabled = false;
+        app.settings.arr_visible = 8;
+        let _ = run_frame(&ctx, &mut app);
+        app.arrangement_open = true;
+        let _ = run_frame(&ctx, &mut app);
+        let rect = app.arrangement_rect.expect("arrangement did not open");
+
+        // The NAME cell of the first used lane, straight out of the layout
+        // the panel just drew — never a guessed point.
+        let at = {
+            let clips = app.arr_clip_views();
+            let view = app.arrange_view(&clips);
+            let l = crate::arrangement_panel::Layout::new(rect, &view);
+            let row = l.header_rows[0];
+            assert!(row.name.is_positive(), "the first lane has no name cell");
+            // And it really is the name that answers there, not a
+            // neighbour the layout has drifted over.
+            assert_eq!(
+                crate::arrangement_panel::hit_test(rect, &view, row.name.center()),
+                Some(crate::arrangement_panel::Hit::HdrName(0)),
+                "the name cell is not what a press on it means"
+            );
+            row.name.center()
+        };
+        assert!(app.channel_used(0), "lane 1 is not a track to drag");
+        press(&ctx, &mut app, at);
+        assert!(
+            matches!(app.arr_drag, Some(ArrDrag::ReorderLane { from: 0 })),
+            "a press on the track title started {:?} instead of a reorder",
+            app.arr_drag
+        );
+    }
+
+    /// **A DAW view fills the window; the theory view keeps its shape.**
+    ///
+    /// The owner's own screen showed a 553-point layout centred in a
+    /// 1377-point window: eight hundred points of theme-coloured nothing
+    /// above and below a timeline showing eight lanes. A mixer and a
+    /// timeline are grids with no shape of their own and should take the
+    /// room; a piano is a picture of a thing and should not be stretched.
+    ///
+    /// **And the band is the same band in both**, which is the property that
+    /// matters most — it is the one surface that stays put across every
+    /// view.
+    #[test]
+    fn a_daw_view_fills_the_window_and_the_band_does_not_change() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.keytoggle_enabled = false;
+        // A window much taller than the layout's own aspect — the shape that
+        // produced the bars.
+        let tall = Vec2::new(1300.0, 1400.0);
+        let _ = run_one_frame(&ctx, &mut app, tall);
+
+        // Theory view: fitted and centred, so the picture keeps its aspect.
+        let theory_drawn = app.last_drawn;
+        assert!(
+            theory_drawn.height() < tall.y - 1.0,
+            "the theory view stretched to fill a tall window"
+        );
+        let band_in_theory = app.last_band;
+
+        // Arrange view: the same band, and the timeline takes the rest.
+        app.arrangement_open = true;
+        let _ = run_one_frame(&ctx, &mut app, tall);
+        let arr = app.arrangement_rect.expect("the arrangement did not open");
+        let band_in_arr = app.last_band;
+
+        assert!(
+            (band_in_arr.height() - band_in_theory.height()).abs() < 0.51,
+            "the band changed height between views: {} then {}",
+            band_in_theory.height(),
+            band_in_arr.height()
+        );
+        assert!(
+            (band_in_arr.width() - band_in_theory.width()).abs() < 0.51,
+            "the band changed width between views"
+        );
+        // No bars: the band starts at the top and the timeline reaches the
+        // bottom.
+        assert!(band_in_arr.top() <= 0.51, "a bar above the band: {band_in_arr:?}");
+        assert!(
+            arr.bottom() >= tall.y - 0.51,
+            "the timeline stopped {} points short of the window",
+            tall.y - arr.bottom()
+        );
+        // And it really did gain room over the fitted layout.
+        assert!(
+            arr.height() > theory_drawn.height() * 0.9,
+            "the timeline is no taller than the fitted stack was"
+        );
+    }
+
+    /// **Tab means one thing at a time.**
+    ///
+    /// The accessibility overlay allocates a focusable widget per control,
+    /// and egui takes Tab to walk them — which is right in accessibility
+    /// mode and wrong outside it, where Tab is how this app goes between the
+    /// theory view, the desk and the timeline. The owner's verdict on having
+    /// both: "switching views every time I want to cycle a button, or vice
+    /// versa, is bad."
+    #[test]
+    fn tab_stops_exist_only_in_accessibility_mode() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        pointer_frame(&ctx, &mut app, Vec::new());
+        let master = egui::Id::new(("band", "master"));
+        ctx.memory_mut(|m| m.request_focus(master));
+        pointer_frame(&ctx, &mut app, Vec::new());
+        assert!(
+            !ctx.memory(|m| m.has_focus(master)),
+            "the band has tab stops with accessibility mode off"
+        );
+
+        app.settings.screen_reader_mode = true;
+        pointer_frame(&ctx, &mut app, Vec::new());
+        ctx.memory_mut(|m| m.request_focus(master));
+        pointer_frame(&ctx, &mut app, Vec::new());
+        assert!(
+            ctx.memory(|m| m.has_focus(master)),
+            "accessibility mode has no tab stops"
+        );
+    }
+
+    /// And the view cycle survives in that mode, on the key every other
+    /// program with panes uses.
+    #[test]
+    fn f6_cycles_the_views_when_tab_is_walking_the_controls() {
+        let ctx = egui::Context::default();
+        let gates = crate::keys::Gates {
+            recorder_shown: true,
+            recorder_available: true,
+            window_sizing: true,
+        };
+        let with = |key: egui::Key| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    events: vec![egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |_| {},
+            );
+            crate::keys::pressed(&ctx, gates)
+        };
+        assert_eq!(
+            with(egui::Key::F6),
+            Some(crate::keys::KeyAction::ToggleMixer),
+            "F6 does not reach the view cycle"
+        );
+        // And Tab still does it, for everybody not in accessibility mode.
+        assert_eq!(with(egui::Key::Tab), Some(crate::keys::KeyAction::ToggleMixer));
+    }
+
+    /// **A menu opens where the hand is, in whichever coordinates the
+    /// surface it will be drawn in uses.**
+    ///
+    /// This is the bug the owner reported as "everywhere, opens WAY off the
+    /// cursor point -- so does the welcome message", and it was measured: a
+    /// window at (853, 62) with a screen reader believed to be attached, so
+    /// every dialog and menu was a LAYER inside the canvas, while the anchor
+    /// was still being translated onto the desktop. Every menu arrived 853
+    /// points to the right of the click and was then clamped to the canvas
+    /// edge.
+    #[test]
+    fn a_menu_is_anchored_in_the_coordinates_it_will_be_drawn_in() {
+        let (_, mut app) = headless_with_fx(Caps::DESKTOP);
+        app.main_inner_origin = Pos2::new(853.0, 62.0);
+        app.main_origin_known = true;
+        app.last_pane = Vec2::new(853.0, 1377.0);
+        app.monitor_size = Some(Vec2::new(2560.0, 1440.0));
+
+        // A real OS window: the anchor is on the DESKTOP, so the window
+        // origin is added and the monitor is what bounds it.
+        app.caps.child_windows = true;
+        let (origin, bounds) = app.surface_frame();
+        assert_eq!(origin, Vec2::new(853.0, 62.0));
+        assert_eq!(bounds, Some(Vec2::new(2560.0, 1440.0)));
+
+        // A layer inside our own canvas: the anchor is the window-local
+        // point the pointer already gave us, unmoved, and the canvas is
+        // what bounds it.
+        app.caps.child_windows = false;
+        let (origin, bounds) = app.surface_frame();
+        assert_eq!(
+            origin,
+            Vec2::ZERO,
+            "an inline surface was handed a desktop coordinate"
+        );
+        assert_eq!(bounds, Some(Vec2::new(853.0, 1377.0)));
+    }
+
+    /// A reader the HOST guessed at is this session's business and nobody
+    /// else's; only the menu row is written down.
+    #[test]
+    fn a_detected_screen_reader_is_never_remembered() {
+        let (_, mut app) = headless_with_fx(Caps::DESKTOP);
+        assert!(!app.reader_mode());
+        assert!(app.caps.child_windows, "the desktop does not own its windows");
+        app.set_screen_reader(true);
+        assert!(app.reader_mode(), "the detection did not take effect");
+        assert!(
+            !app.settings.screen_reader_mode,
+            "a guess was written into the settings file"
+        );
+        assert!(!app.caps.child_windows, "the dialogs did not come inline");
+        // And the row overrules it, in the direction somebody would reach
+        // for the row in.
+        let ctx = egui::Context::default();
+        app.apply_menu_action(&ctx, crate::menu::MenuAction::ToggleScreenReaderMode);
+        assert!(!app.reader_mode(), "the row could not turn off a wrong guess");
+        assert!(app.caps.child_windows, "the windows did not come back");
+    }
+
+    /// **A drag that has not moved must not move the control.**
+    ///
+    /// Every band knob is dragged RELATIVELY, from wherever it already
+    /// stands: `control_value` supplies that starting point, and a control
+    /// missing an arm there silently starts from 0.0 — the bottom of its
+    /// own range. That is not a subtle failure. The varispeed had it, and
+    /// the first frame of any drag threw the dial from twelve o'clock to
+    /// -15% before the hand had moved a centimetre.
+    ///
+    /// Generic rather than per-knob, because the failure is a MISSING match
+    /// arm and a per-knob test only ever covers the arms somebody
+    /// remembered to write.
+    #[test]
+    fn a_drag_that_has_not_moved_leaves_every_knob_where_it_was() {
+        let (_, mut app) = headless_with_fx(Caps::DESKTOP);
+        // Somewhere that is not a default, so a control that resets to its
+        // default rather than staying put is caught too.
+        app.settings.master_gain = 0.42;
+        app.settings.varispeed.set_percent(107.0);
+        app.settings.record_export.tempo_bpm = 96.0;
+        for hit in recorder_panel::Hit::ALL.into_iter().filter(|h| h.is_knob()) {
+            let before = app.control_value(hit);
+            app.apply_recorder_hit(hit.with_value(before));
+            let after = app.control_value(hit);
+            assert!(
+                (before - after).abs() < 1.0e-4,
+                "{hit:?} starts a drag at {before} but sits at {after} — a \
+                 press that never moved has turned it"
+            );
+        }
+    }
+
+    /// Leaving the varispeed's detent costs about a percent, not fifteen.
+    #[test]
+    fn engaging_the_varispeed_moves_it_one_percent_and_not_to_the_floor() {
+        let (_, mut app) = headless_with_fx(Caps::DESKTOP);
+        assert!(!app.settings.varispeed.engaged(), "it does not ship at rest");
+        // The drag loop, as `update` runs it: a frame's worth of motion,
+        // then re-anchor on the UNSNAPPED position — which is what carries
+        // a hand out of the detent instead of stalling in it.
+        let travel = recorder_panel::KNOB_TRAVEL;
+        let mut anchor = app.control_value(recorder_panel::Hit::SetVarispeed(0.0));
+        let mut frames = 0;
+        while !app.settings.varispeed.engaged() {
+            anchor = (anchor + TAP_SLOP / travel).clamp(0.0, 1.0);
+            app.apply_recorder_hit(recorder_panel::Hit::SetVarispeed(anchor));
+            frames += 1;
+            assert!(frames < 40, "the dial never leaves the detent at all");
+        }
+        let pct = app.settings.varispeed.percent() - crate::varispeed::OFF;
+        assert!(
+            (0.5..2.0).contains(&pct),
+            "engaging the varispeed put it at {pct:+.1}% after {frames} frames"
+        );
     }
 
     /// **The master knob is a fader wearing a knob**, and it lands in the
@@ -24254,7 +26787,12 @@ mod tests {
         let anchor = app.fx_anchor(fx);
         assert!(anchor.is_positive(), "the panel has nothing to hang off");
 
-        for recorder_panel::FxRow { key, step, .. } in fx.rows() {
+        // **The empty tail is not a row.** `FX_ROWS` is six because the
+        // plate and the tape echo want five; an effect with fewer leaves the
+        // rest `NONE`, and an empty key is what says so.
+        for recorder_panel::FxRow { key, step, .. } in
+            fx.rows(true).into_iter().filter(|r| !r.key.is_empty())
+        {
             assert!(!step, "this test only knows how to drag a sliding row");
             // The row is found by ASKING the panel, not by guessing: the
             // layout owns where the rows are and this test must not restate
@@ -24297,23 +26835,69 @@ mod tests {
                 "{} has no knob to hang off",
                 fx.title()
             );
-            for recorder_panel::FxRow { key, step, .. } in fx.rows() {
+            for recorder_panel::FxRow { key, step, .. } in fx.rows(true) {
                 if key.is_empty() {
                     continue;
                 }
                 if step {
-                    // A stepped row moves to a different named value, and the
-                    // host is what decides which values exist.
+                    // **A named row OPENS its list**, and a press on a row of
+                    // that list is what sets the value. It used to step to the
+                    // next one, which for the Space Echo's twelve positions
+                    // meant reading one word at a time and pressing eight
+                    // times past the one you wanted.
                     let before = app.choice_key(key);
                     let at = row_probe(screen, anchor, fx, key, 0.5);
                     app.press_in_fx_panel(screen, fx, at, true);
                     app.fx_drag = None;
+                    assert_eq!(
+                        app.fx_choice,
+                        Some(key),
+                        "{key} did not open its list when its row was pressed"
+                    );
+                    assert_eq!(
+                        app.choice_key(key),
+                        before,
+                        "{key} changed on the press that only opens the list"
+                    );
+                    // **The row AFTER the one that is set**, wrapping —
+                    // picking a fixed row proves nothing when it is already
+                    // the one selected, which is how `hpf_slope` (whose
+                    // default is its last option) passed by not moving.
+                    let (labels, at) = app.choice_list(key);
+                    // **Named, rather than a modulo panic.** A step row whose
+                    // key the host never offered comes back with no options,
+                    // and `% rows.len()` then fails with "divisor of zero" —
+                    // which says nothing about which row is missing. This is
+                    // the assertion that failure should have been.
+                    assert!(
+                        !labels.is_empty(),
+                        "{key} is a step row on {} but no choice list offers it",
+                        fx.title()
+                    );
+                    let rows =
+                        recorder_panel::fx_choice_list(screen, anchor, fx, key, labels.len());
+                    let want = rows[(at + 1) % rows.len()];
+                    app.press_in_fx_panel(screen, fx, want.center(), true);
+                    app.fx_drag = None;
+                    assert_eq!(app.fx_choice, None, "{key}'s list stayed open");
                     assert_ne!(
                         app.choice_key(key),
                         before,
-                        "{key} did not step when its row was pressed"
+                        "{key} did not take the value that was picked"
                     );
                     continue;
+                }
+                // **The rate row only exists on FREE**, so put the delay
+                // there before asking whether the row answers — the step row
+                // above has moved the division on to something else by now.
+                if key == "delay_free_hz" {
+                    let (labels, _) = app.choice_list("delay_division");
+                    let free = labels
+                        .iter()
+                        .position(|l| l == "free")
+                        .expect("the division list has no free position");
+                    app.pick_choice("delay_division", free);
+                    assert!(app.delay_is_free(), "the delay did not go to free");
                 }
                 let at = row_probe(screen, anchor, fx, key, 1.0);
                 app.press_in_fx_panel(screen, fx, at, true);
@@ -24388,6 +26972,10 @@ mod tests {
         assert_eq!(app.choice_label("delay_division"), "1/8 dotted");
         app.next_choice("delay_division");
         assert_eq!(app.choice_label("delay_division"), "1/8");
+        // The free position is the last of the four the harness offers, as it
+        // is the last of the six the host does — the rate row hangs off it.
+        app.next_choice("delay_division");
+        assert_eq!(app.choice_label("delay_division"), "free");
         app.next_choice("delay_division");
         assert_eq!(app.choice_label("delay_division"), "1/4", "it did not wrap");
 
@@ -26102,26 +28690,50 @@ mod tests {
                 "the desktop stopped sending {want}; saw {seen:?}"
             );
         }
-        // The floor is the measured one, and the ceiling is released — a
-        // leftover maximum from the pinned era would make the window
-        // un-growable while looking resizable.
-        assert!(
-            seen.iter().any(|c| c.contains("MinInnerSize")
-                && c.contains(&format!("{}", crate::settings::MIN_WINDOW.x))),
-            "the floor is not MIN_WINDOW; saw {seen:?}"
-        );
-        assert!(
-            seen.iter().any(|c| c.starts_with("MaxInnerSize") && c.contains("inf")),
-            "the maximum was not released; saw {seen:?}"
-        );
-        // **Idle frames send NOTHING.** The old code re-sent the triple
-        // whenever the target moved, which is what fought a hand on the edge:
-        // drag, and the app drags back.
-        let quiet = run_one_frame(&ctx, &mut app, Vec2::new(1300.0, 632.0));
-        assert!(quiet.is_empty(), "an idle frame fought the window: {quiet:?}");
+        // **Both regimes, and the constant chooses.** See
+        // `settings::RESIZABLE`: the draggable window is retired rather than
+        // deleted, so the half that is switched off has to keep its test or
+        // it rots in the dark and the flag stops being a flag.
+        if crate::settings::RESIZABLE {
+            // The floor is the measured one, and the ceiling is released — a
+            // leftover maximum from the pinned era would make the window
+            // un-growable while looking resizable.
+            assert!(
+                seen.iter().any(|c| c.contains("MinInnerSize")
+                    && c.contains(&format!("{}", crate::settings::MIN_WINDOW.x))),
+                "the floor is not MIN_WINDOW; saw {seen:?}"
+            );
+            assert!(
+                seen.iter().any(|c| c.starts_with("MaxInnerSize") && c.contains("inf")),
+                "the maximum was not released; saw {seen:?}"
+            );
+            // **Idle frames send NOTHING.** The old code re-sent the triple
+            // whenever the target moved, which is what fought a hand on the
+            // edge: drag, and the app drags back.
+            let quiet = run_one_frame(&ctx, &mut app, Vec2::new(1300.0, 632.0));
+            assert!(quiet.is_empty(), "an idle frame fought the window: {quiet:?}");
+        } else {
+            // A pin is a minimum and a maximum that AGREE, and they agree on
+            // the size the bands actually want.
+            let want = initial_window_size(&app.settings);
+            let says = |kind: &str| {
+                seen.iter().any(|c| {
+                    c.starts_with(kind)
+                        && c.contains(&format!("{}", want.x))
+                        && c.contains(&format!("{}", want.y))
+                })
+            };
+            assert!(says("MinInnerSize"), "the pin has no floor; saw {seen:?}");
+            assert!(says("MaxInnerSize"), "the pin has no ceiling; saw {seen:?}");
+            assert!(says("InnerSize"), "nothing dragged the window to the pin");
+            assert!(
+                !seen.iter().any(|c| c.starts_with("MaxInnerSize") && c.contains("inf")),
+                "the ceiling was released under a pin; saw {seen:?}"
+            );
+        }
 
-        // ...and a size preset still produces one, because that is the way
-        // back to the size the bands actually want.
+        // ...and a size preset still moves the window, because that is the
+        // way to the size the bands actually want.
         app.apply_menu_action(&ctx, MenuAction::SetSizePercent(150));
         let after = run_one_frame(&ctx, &mut app, Vec2::new(1300.0, 632.0));
         assert!(
@@ -26448,3 +29060,457 @@ mod geometry_tests {
 
 
 
+
+#[cfg(test)]
+mod heart_ring_tests {
+    use super::IvoryApp;
+
+    /// **Left click walks the set; it never runs off the end.**
+    ///
+    /// The gesture before this was a single seventeen-stop ring on the RIGHT
+    /// button, which itself replaced a one-way door — sixteen slots that
+    /// wrapped to the first for ever, so the drift, once switched off, could
+    /// only be got back by hand-editing `settings.json`. The owner's file was
+    /// found at `heart_animate=false, heart_slot=14`: fourteen presses spent
+    /// looking for a stop that was not on the ring.
+    #[test]
+    fn a_left_click_walks_the_sixteen_and_comes_back_round() {
+        let n = crate::recorder::CHANNELS as i64;
+        let mut seen = Vec::new();
+        let mut slot = 0_i64;
+        for _ in 0..n {
+            seen.push(slot);
+            slot = IvoryApp::heart_step(slot, n);
+        }
+        assert_eq!(seen, (0..n).collect::<Vec<_>>(), "not every position is reachable");
+        assert_eq!(slot, 0, "the ring did not close");
+    }
+
+    /// A slot from a hand-edited or older file rejoins the ring rather than
+    /// running off the end of it.
+    #[test]
+    fn an_out_of_range_heart_slot_rejoins_the_ring() {
+        let n = crate::recorder::CHANNELS as i64;
+        assert_eq!(IvoryApp::heart_step(-1, n), 0, "negative did not rejoin");
+        let s = IvoryApp::heart_step(n + 3, n);
+        assert!((0..n).contains(&s), "slot {s} left the ring");
+        // A degenerate width must not divide by zero or spin.
+        assert_eq!(IvoryApp::heart_step(0, 0), 0);
+    }
+}
+
+#[cfg(test)]
+mod velocity_selection_tests {
+    use super::tests::headless;
+    use super::*;
+    use crate::arrangement::{ArrClip, ArrNote, ClipKind};
+
+    fn setup(vels: &[u8]) -> (IvoryApp, u64) {
+        let (_, mut app) = headless(Caps::DESKTOP);
+        let notes: Vec<ArrNote> = vels
+            .iter()
+            .enumerate()
+            .map(|(i, v)| ArrNote {
+                at_s: i as f64 * 0.25,
+                dur_s: 0.25,
+                key: 60 + i as u8,
+                vel: *v,
+            })
+            .collect();
+        app.arrangement.add_clip(ArrClip {
+            kind: ClipKind::Midi,
+            notes,
+            lane: 0,
+            path: String::new(),
+            start_s: 0.0,
+            offset_s: 0.0,
+            len_s: 4.0,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name: "m".into(),
+            id: 0,
+            extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
+            gain: 1.0,
+        });
+        let id = app.arrangement.clips[0].id;
+        app.open_midi_editor(id);
+        (app, id)
+    }
+
+    fn select(app: &mut IvoryApp, which: &[usize]) {
+        if let Some(st) = app.midi_edit.as_mut() {
+            st.selected = which.to_vec();
+        }
+    }
+
+    fn vels(app: &IvoryApp, id: u64) -> Vec<u8> {
+        app.arrangement
+            .clips
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| c.notes.iter().map(|n| n.vel).collect())
+            .unwrap_or_default()
+    }
+
+    /// **A selected phrase keeps its shape when its velocities move.**
+    ///
+    /// Both velocity paths used to write one absolute number into every
+    /// selected note, so selecting a phrase with an accent on beat one and
+    /// nudging it returned identical notes and no accent. Editing several at
+    /// once has to mean moving them together, not levelling them.
+    #[test]
+    fn a_velocity_drag_moves_a_selection_without_flattening_it() {
+        let (mut app, id) = setup(&[100, 60, 80]);
+        select(&mut app, &[0, 1, 2]);
+        // Grab note 0 (100) and pull it to 110: everybody rises by ten.
+        app.me_set_note_vel(0, 110);
+        assert_eq!(vels(&app, id), vec![110, 70, 90], "the phrase was flattened");
+        // And back down past where one of them started.
+        app.me_set_note_vel(0, 90);
+        assert_eq!(vels(&app, id), vec![90, 50, 70]);
+    }
+
+    /// One note outside the selection is edited alone, and absolutely.
+    #[test]
+    fn a_velocity_drag_on_an_unselected_note_touches_only_that_note() {
+        let (mut app, id) = setup(&[100, 60]);
+        select(&mut app, &[1]);
+        app.me_set_note_vel(0, 40);
+        assert_eq!(
+            vels(&app, id),
+            vec![40, 60],
+            "an unselected note dragged its neighbour"
+        );
+    }
+
+    /// A single-note selection stays absolute: the one note you selected has
+    /// to land exactly where the hand is.
+    #[test]
+    fn a_selection_of_one_is_still_an_absolute_move() {
+        let (mut app, id) = setup(&[100]);
+        select(&mut app, &[0]);
+        app.me_set_note_vel(0, 33);
+        assert_eq!(vels(&app, id), vec![33]);
+    }
+
+    /// A note that hits the ceiling stops there while its neighbours carry
+    /// on — the desk's own rule for a fader spread across a selection.
+    #[test]
+    fn a_note_at_the_ceiling_stops_and_the_rest_keep_going() {
+        let (mut app, id) = setup(&[120, 40]);
+        select(&mut app, &[0, 1]);
+        app.me_set_note_vel(1, 60);
+        let v = vels(&app, id);
+        assert_eq!(v[1], 60);
+        assert_eq!(v[0], 127, "the loud note should clamp, not refuse the gesture");
+    }
+
+    /// **Painting and badging reach the whole selection, like removing does.**
+    ///
+    /// Remove spread, the four switches spread, and these two did not — so
+    /// selecting four tracks and choosing a colour coloured one of them. The
+    /// failure is quiet: the dialog closes, something changes, and only a
+    /// second look at the desk shows three tracks untouched.
+    #[test]
+    fn painting_and_badging_reach_every_selected_track() {
+        use crate::dialogs::DialogAction;
+        let (_c, mut app) = headless(Caps::DESKTOP);
+        app.select_track(2, egui::Modifiers::NONE);
+        app.select_track(5, egui::Modifiers::SHIFT);
+        assert_eq!(app.selected_tracks, vec![2, 3, 4, 5]);
+
+        app.apply_dialog_action(DialogAction::TrackColor(3, 9));
+        for n in [2, 3, 4, 5] {
+            assert_eq!(
+                app.settings.strip_colors.get(n).copied(),
+                Some(9),
+                "track {n} was not painted"
+            );
+        }
+        assert_ne!(app.settings.strip_colors.get(9).copied(), Some(9), "paint escaped the selection");
+
+        app.apply_dialog_action(DialogAction::TrackIcon(4, 2));
+        for n in [2, 3, 4, 5] {
+            assert_eq!(
+                app.settings.channel_icons.get(n).copied(),
+                Some(2),
+                "track {n} did not take the badge"
+            );
+        }
+    }
+
+    /// A track OUTSIDE any selection is still painted alone.
+    #[test]
+    fn painting_an_unselected_track_touches_only_it() {
+        use crate::dialogs::DialogAction;
+        let (_c, mut app) = headless(Caps::DESKTOP);
+        app.select_track(2, egui::Modifiers::NONE);
+        app.select_track(5, egui::Modifiers::SHIFT);
+        app.apply_dialog_action(DialogAction::TrackColor(9, 7));
+        assert_eq!(app.settings.strip_colors.get(9).copied(), Some(7));
+        for n in [2, 3, 4, 5] {
+            assert_ne!(
+                app.settings.strip_colors.get(n).copied(),
+                Some(7),
+                "track {n} was painted by a menu on another track"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod folder_tests {
+    use super::tests::headless;
+    use super::*;
+
+    fn app() -> IvoryApp {
+        let (_, app) = headless(Caps::DESKTOP);
+        app
+    }
+
+    /// The box makes a folder, and pressing it again releases the children
+    /// rather than orphaning them under a track that is no longer their
+    /// parent.
+    #[test]
+    fn a_folder_releases_its_children_when_it_stops_being_one() {
+        let mut a = app();
+        a.toggle_folder(2);
+        assert!(a.is_folder(2));
+        for n in [3, 4] {
+            a.set_in_folder(n, true);
+        }
+        assert_eq!(a.folder_children(2), vec![3, 4]);
+        assert_eq!(a.folder_of(3), Some(2));
+        assert_eq!(a.folder_of(4), Some(2));
+
+        a.toggle_folder(2);
+        assert!(!a.is_folder(2));
+        assert!(!a.in_folder(3) && !a.in_folder(4), "the children were orphaned");
+        assert!(a.folder_children(2).is_empty());
+    }
+
+    /// **Membership is positional, so it cannot dangle.** A flag with no
+    /// folder above it draws a flat track, and the run must be contiguous —
+    /// a plain track between a folder and a flagged one closes the folder.
+    #[test]
+    fn membership_needs_a_folder_above_and_an_unbroken_run() {
+        let mut a = app();
+        // A flag with nothing above it.
+        a.set_in_folder(5, true);
+        assert_eq!(a.folder_of(5), None);
+        assert!(!a.in_folder(5), "an orphan flag drew an indent");
+
+        // A gap breaks the run: 6 is flagged, 5 is not, so 6 is not in 4.
+        a.set_in_folder(5, false);
+        a.toggle_folder(4);
+        a.set_in_folder(6, true);
+        assert_eq!(a.folder_of(6), None, "the run jumped a plain track");
+        assert_eq!(a.folder_children(4), Vec::<usize>::new());
+
+        // Close the gap and both join.
+        a.set_in_folder(5, true);
+        assert_eq!(a.folder_children(4), vec![5, 6]);
+    }
+
+    /// A second folder closes the first: folders are one level deep.
+    #[test]
+    fn a_folder_closes_the_run_of_the_folder_above_it() {
+        let mut a = app();
+        a.toggle_folder(0);
+        a.set_in_folder(1, true);
+        a.toggle_folder(2);
+        a.set_in_folder(2, true); // even flagged, 2 is a folder
+        a.set_in_folder(3, true);
+        assert_eq!(a.folder_children(0), vec![1], "the second folder was swallowed");
+        assert_eq!(a.folder_children(2), vec![3]);
+    }
+
+    /// **The snap lands the block at the END of the folder's children**, and
+    /// the flags travel with the tracks through the permutation.
+    #[test]
+    fn a_snap_puts_the_block_at_the_end_of_the_folder() {
+        let mut a = app();
+        // Give the tracks distinguishable colours so the permutation is
+        // observable — the flags alone cannot prove the right track moved.
+        for n in 0..8 {
+            a.settings.strip_colors[n] = (n + 1) as i64;
+        }
+        a.toggle_folder(1);
+        a.set_in_folder(2, true);
+        assert_eq!(a.folder_children(1), vec![2]);
+
+        // Drag track 6 onto folder 1's bottom edge.
+        a.snap_into_folder(6, 1);
+        // It should now sit at index 3 — after the existing child.
+        assert_eq!(a.settings.strip_colors[3], 7, "track 6 did not land after the child");
+        assert_eq!(a.folder_children(1), vec![2, 3]);
+        assert!(a.in_folder(3));
+        // And the folder itself is untouched.
+        assert_eq!(a.settings.strip_colors[1], 2);
+        assert!(a.is_folder(1));
+    }
+
+    /// A folder cannot be snapped into a folder, nor into itself.
+    #[test]
+    fn a_folder_is_never_snapped_inside_another() {
+        let mut a = app();
+        a.toggle_folder(1);
+        a.toggle_folder(5);
+        let before = a.settings.strip_colors;
+        a.snap_into_folder(5, 1);
+        assert!(!a.in_folder(5), "a folder became a child");
+        assert_eq!(a.settings.strip_colors, before, "the desk moved anyway");
+        // And onto itself.
+        a.snap_into_folder(1, 1);
+        assert!(!a.in_folder(1));
+    }
+
+    /// **The per-channel flags follow a reorder.** `strip_to_theory` did not,
+    /// which left the T switches on whichever rows those channels vacated.
+    #[test]
+    fn the_per_channel_flags_follow_their_tracks_through_a_reorder() {
+        let mut a = app();
+        a.settings.strip_to_theory = vec![false; crate::recorder::CHANNELS];
+        a.settings.strip_to_theory[3] = true;
+        a.toggle_folder(3);
+        a.set_in_folder(4, true);
+
+        // Move track 3 to the top.
+        a.move_channel(3, 0);
+        assert!(a.settings.strip_to_theory[0], "T did not follow its track");
+        assert!(!a.settings.strip_to_theory[3], "T was left behind");
+        assert!(a.is_folder(0), "the folder flag did not follow");
+        assert!(!a.is_folder(3));
+    }
+
+    /// **A child's header steps right and a folder's does not.** The indent
+    /// is the only thing that says "contained", so it is worth an assertion
+    /// rather than a squint at a screenshot: at header widths this app opens
+    /// at, ten points is a difference the eye can miss and a test cannot.
+    #[test]
+    fn a_track_in_a_folder_has_an_indented_header() {
+        let (_, mut app) = headless(Caps::DESKTOP);
+        for n in 0..5 {
+            app.add_bare_track(n);
+        }
+        app.toggle_folder(1);
+        app.set_in_folder(2, true);
+        assert_eq!(app.folder_children(1), vec![2]);
+
+        let rect = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::Vec2::new(1300.0, 700.0),
+        );
+        let clips = app.arr_clip_views();
+        let view = app.arrange_view(&clips);
+        assert!(view.lanes[2].in_folder, "the view never learned track 3 is a child");
+        assert!(view.lanes[1].is_folder, "the view never learned track 2 is a folder");
+        assert!(!view.lanes[1].in_folder, "the folder indented itself");
+
+        let l = crate::arrangement_panel::Layout::new(rect, &view);
+        let plain = l.header_rows[0].name.left();
+        let folder = l.header_rows[1].name.left();
+        let child = l.header_rows[2].name.left();
+        assert!(
+            (folder - plain).abs() < 0.5,
+            "the folder was indented: {folder} vs {plain}"
+        );
+        assert!(
+            child > plain + 5.0,
+            "the child was not indented: {child} vs {plain}"
+        );
+        // And the folder box exists on a used track, at the bottom-left.
+        let box_r = l.header_rows[1].folder;
+        assert!(box_r.is_positive(), "the folder box was not laid out");
+        assert!(
+            box_r.bottom() <= l.header_rows[1].panel.bottom() + 0.5,
+            "the box is not at the bottom"
+        );
+        assert!(
+            box_r.left() < l.header_rows[1].name.left(),
+            "the box is not at the left"
+        );
+    }
+
+    /// **A muted folder silences its children without muting them.**
+    ///
+    /// The distinction is the whole feature: the child's own switch stays
+    /// off, it draws off, and it comes back exactly as it was — it is simply
+    /// inside something that is not heard. Muting the child instead would
+    /// destroy whatever the child had chosen.
+    #[test]
+    fn a_muted_folder_silences_its_children_without_muting_them() {
+        let (_, mut app) = headless(Caps::DESKTOP);
+        app.toggle_folder(1);
+        for n in [2_usize, 3] {
+            app.set_in_folder(n, true);
+        }
+        assert_eq!(app.folder_children(1), vec![2, 3]);
+
+        // Mute the folder alone.
+        app.settings.strip_muted |= 1 << 1;
+        let desk = app.desk();
+        assert!(desk.muted[1], "the folder itself is not muted");
+        assert!(desk.muted[2] && desk.muted[3], "the children are still heard");
+        assert!(!desk.muted[4], "a track outside the folder was silenced");
+
+        // ...and the children's OWN switches never moved.
+        assert_eq!(app.settings.strip_muted & (1 << 2), 0, "a child was muted");
+        assert_eq!(app.settings.strip_muted & (1 << 3), 0, "a child was muted");
+
+        // Unmuting the folder gives them straight back.
+        app.settings.strip_muted &= !(1 << 1);
+        let desk = app.desk();
+        assert!(!desk.muted[2] && !desk.muted[3], "the children stayed silent");
+    }
+
+    /// A child muted on its OWN keeps that when the folder is unmuted — the
+    /// thing a cascade would have destroyed.
+    #[test]
+    fn a_childs_own_mute_survives_the_folder_being_muted_and_unmuted() {
+        let (_, mut app) = headless(Caps::DESKTOP);
+        app.toggle_folder(1);
+        for n in [2_usize, 3] {
+            app.set_in_folder(n, true);
+        }
+        app.settings.strip_muted |= 1 << 2; // the child, on its own
+        app.settings.strip_muted |= 1 << 1; // then the folder
+        app.settings.strip_muted &= !(1 << 1); // and off again
+
+        let desk = app.desk();
+        assert!(desk.muted[2], "the child's own mute was destroyed");
+        assert!(!desk.muted[3], "the other child did not come back");
+    }
+
+    /// **Soloing a folder solos the GROUP.** Solo is exclusive, so a folder
+    /// that soloed only itself would silence the very tracks it groups.
+    #[test]
+    fn a_soloed_folder_solos_its_children_too() {
+        let (_, mut app) = headless(Caps::DESKTOP);
+        app.toggle_folder(1);
+        for n in [2_usize, 3] {
+            app.set_in_folder(n, true);
+        }
+        app.settings.strip_soloed |= 1 << 1;
+        let desk = app.desk();
+        assert!(desk.soloed[1] && desk.soloed[2] && desk.soloed[3]);
+        assert!(!desk.soloed[4], "a track outside the folder was soloed");
+        assert_eq!(app.settings.strip_soloed & (1 << 2), 0, "a child's switch moved");
+    }
+
+    /// Membership drives it, so releasing a track releases its silence.
+    #[test]
+    fn a_track_dragged_out_of_a_muted_folder_is_heard_again() {
+        let (_, mut app) = headless(Caps::DESKTOP);
+        app.toggle_folder(1);
+        app.set_in_folder(2, true);
+        app.settings.strip_muted |= 1 << 1;
+        assert!(app.desk().muted[2]);
+        app.set_in_folder(2, false);
+        assert!(!app.desk().muted[2], "it stayed silent after leaving the folder");
+    }
+}

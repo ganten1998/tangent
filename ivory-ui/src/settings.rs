@@ -494,6 +494,16 @@ pub struct Settings {
     /// PITCH of everything, and a theme has to be able to say so. Ships as
     /// the app's own ivory, which is what the owner asked the default to be.
     pub varispeed_color: Rgb,
+    /// **The velocity lane's two ends**: the colour a note at 127 wears and
+    /// the colour one at 1 does, with every velocity between them on the line.
+    ///
+    /// Theme roles (`velocity_loud` / `velocity_quiet`), so a theme file can
+    /// name both. The drawing side never trusts them blind — see
+    /// `midi_editor::velocity_hue`, which pushes whatever it is handed away
+    /// from the roll until it can be seen, so a hand-written theme naming two
+    /// invisible colours still gets a lane somebody can read.
+    pub velocity_loud_color: Rgb,
+    pub velocity_quiet_color: Rgb,
     /// The well the timecode and oscilloscope sit in.
     pub meter_bg_color: Rgb,
     /// The oscilloscope trace.
@@ -745,6 +755,35 @@ pub struct Settings {
     ///
     /// [`record_root`]: Settings::record_root
     pub record_dir: Option<String>,
+    /// Where PROJECTS are written. Absent means [`Settings::media_root`]'s
+    /// `Projects`.
+    ///
+    /// **Its own setting, and that is the point.** Projects used to be a
+    /// subfolder of wherever takes went, so choosing a take folder moved the
+    /// projects with it and there was no way to keep a session's documents
+    /// on one disk and its video on another — which is the ordinary shape of
+    /// a machine with a fast small drive and a big slow one.
+    pub project_dir: Option<String>,
+    /// Where an export lands when the export dialog does not name a folder.
+    /// Absent means [`Settings::media_root`]'s `Exports`.
+    pub export_dir: Option<String>,
+    /// Whether this file has been through the move to `Documents/Tangent
+    /// Media`.
+    ///
+    /// A one-off, and it needs a marker rather than a filesystem guess on
+    /// every launch: the migration PINS an existing install to where its
+    /// takes already are, and re-running it would re-pin a folder the user
+    /// had since moved.
+    pub media_root_v20: bool,
+    /// Whether this file has been through the one-shot clearing of a
+    /// `screen_reader_mode` that nobody asked for. See
+    /// [`Settings::clear_guessed_reader_mode`].
+    pub reader_mode_v20: bool,
+    /// **The master is folded to mono on the way out.** A mix check: what a
+    /// phone speaker, a club PA or an AM radio will do to a wide image. Off
+    /// by default, and remembered, because somebody who works in mono works
+    /// in mono all session.
+    pub master_mono: bool,
     /// Whether the "a chosen camera means video" default has already been
     /// applied to this settings file.
     ///
@@ -1076,6 +1115,32 @@ pub struct Settings {
     /// per-channel setting here is, and a saved file that gains a channel
     /// should not have to be re-encoded.
     pub strip_to_theory: Vec<bool>,
+    /// **This channel is a FOLDER**: the tracks under it are its children.
+    ///
+    /// Arrange-view only, deliberately. The desk is a rack of strips side by
+    /// side and a folder is a statement about VERTICAL order; there is no
+    /// mixer gesture it could correspond to.
+    pub strip_is_folder: Vec<bool>,
+    /// **This channel sits INSIDE the folder above it.**
+    ///
+    /// Positional rather than a stored parent index, which is the decision
+    /// that makes this survive a reorder. A parent index has to be remapped
+    /// through the permutation on every move — and every array that forgets
+    /// to be remapped is a silent bug of exactly the kind `strip_to_theory`
+    /// already was. Membership here is "the nearest folder above me", so
+    /// moving a track is moving its membership, with nothing to keep in step.
+    ///
+    /// Self-healing by construction: a `true` with no folder above it is a
+    /// track that simply draws flat, never a dangling pointer.
+    pub strip_in_folder: Vec<bool>,
+    /// **This folder is SHUT**: its children are hidden and the timeline
+    /// shows one row where there were several.
+    ///
+    /// Separate from `strip_is_folder` because they are separate questions —
+    /// "is this a group" and "am I looking at it right now" — and folding
+    /// them into one flag would mean un-collapsing a folder to stop it being
+    /// one. Meaningless on a track that is not a folder, and harmless there.
+    pub strip_folder_shut: Vec<bool>,
     /// The tempo lane is showing above the tracks. OFF out of the box: a
     /// song at one tempo has nothing to put in it, and the row would cost a
     /// track's worth of height to say so.
@@ -1119,6 +1184,32 @@ pub struct Settings {
     /// standard shuffle, 50 is straight. One decimal, the SWG menu's rule.
     pub midi_swing_pct: f64,
     pub midi_triplet: bool,
+    /// **The MIDI editor's draw mode**, and it ships OFF.
+    ///
+    /// The editor always drew a note wherever you pressed on empty roll,
+    /// which is a pen you cannot put down: every attempt to move the
+    /// playhead, or to click past a note, left a note behind. With this off
+    /// a press on empty roll locates and notes are selected, dragged and
+    /// re-velocitied; the pencil on the strip — and `N` — puts the pen back
+    /// in your hand.
+    pub midi_draw_mode: bool,
+    /// **The MASTER's row on the timeline**, shown by default.
+    ///
+    /// `Cmd`/`Ctrl+M` hides it. It cannot be REMOVED — a session always has
+    /// an output, and a row you can delete and not get back is a row people
+    /// delete once and then look for — so hiding is the only thing the
+    /// keystroke does.
+    pub arr_master_row: bool,
+    /// **Supporters only:** the heart drifts through the active palette's
+    /// sixteen colours instead of sitting on one.
+    ///
+    /// On by default, so a key that has just been entered shows itself
+    /// immediately rather than hiding behind a preference nobody was told
+    /// about. A right-click puts it away.
+    pub heart_animate: bool,
+    /// Which of the palette's sixteen the heart wears once the drift is off.
+    /// Advanced by each further right-click, so the whole set is reachable.
+    pub heart_slot: i64,
     /// Transpose, in semitones, applied to every note the display and the
     /// chord detector see.
     ///
@@ -1278,6 +1369,8 @@ impl Default for Settings {
             fx_knob_color: Rgb::new(0x6C, 0x9B, 0xD2),
             master_knob_color: Rgb::new(0xE8, 0x3A, 0x4E),
             varispeed_color: Rgb::new(0xE8, 0xDC, 0xC0),
+            velocity_loud_color: Rgb::new(0xff, 0x8d, 0x89),
+            velocity_quiet_color: Rgb::new(0x40, 0xbd, 0x51),
             meter_bg_color: Rgb::new(0x0B, 0x0E, 0x0A),
             scope_draw_color: Rgb::new(0xA3, 0xE0, 0x48),
             fx_strip_color: Rgb::new(0xE3, 0xD9, 0xBD),
@@ -1364,6 +1457,11 @@ impl Default for Settings {
             recorder_win_x: None,
             recorder_win_y: None,
             record_dir: None,
+            project_dir: None,
+            export_dir: None,
+            media_root_v20: false,
+            reader_mode_v20: false,
+            master_mono: false,
             video_default_applied: false,
             shows_default_applied: false,
             record_open_when_done: false,
@@ -1417,7 +1515,8 @@ impl Default for Settings {
             hpf_mix: 0.0,
             lpf_mix: 1.0,
             gain_mix: 0.0,
-            limiter_mix: 1.0,
+            // In circuit at a −1 dBFS ceiling; see the constant for why.
+            limiter_mix: f64::from(crate::recorder::LIMITER_SHIPS_AT),
             effect_params: Map::new(),
             dx7_cartridge: String::new(),
             dx7_patch: 0,
@@ -1449,12 +1548,7 @@ impl Default for Settings {
             // Channel 0's bay 1 holds the built-in — the pre-added DX7 that
             // is a fresh install's sound. See `channel_kinds` above.
             strip_inserts: {
-                let mut v =
-                    vec![
-                        String::new();
-                        (crate::recorder::STRIPS + 1 + crate::recorder::DRUM_PADS)
-                            * crate::recorder::INSERTS
-                    ];
+                let mut v = vec![String::new(); crate::recorder::INSERT_SPACE];
                 v[0] = crate::dialogs::BUILTIN_PATH.to_owned();
                 // And channel 1's bay 0 is the drumpad — see `channel_kinds`.
                 v[1 * crate::recorder::INSERTS] =
@@ -1474,6 +1568,9 @@ impl Default for Settings {
                 v[0] = true;
                 v
             },
+            strip_is_folder: vec![false; crate::recorder::CHANNELS],
+            strip_in_folder: vec![false; crate::recorder::CHANNELS],
+            strip_folder_shut: vec![false; crate::recorder::CHANNELS],
             // 1/4 out of the box, both grids — the owner's default.
             arr_grid_exp: -2,
             arr_header_w: 0.0,
@@ -1498,6 +1595,10 @@ impl Default for Settings {
             me_dark: true,
             midi_swing_pct: 66.7,
             midi_triplet: false,
+            midi_draw_mode: false,
+            arr_master_row: true,
+            heart_animate: true,
+            heart_slot: 0,
             transpose: 0,
             show_transpose: true,
             metronome_on: false,
@@ -1742,6 +1843,10 @@ impl Settings {
             let mut s = Self::first_launch();
             s.video_default_applied = true;
             s.shows_default_applied = true;
+            // Nothing on disk to keep and nothing wrong written down yet, so
+            // both one-shots are done before they start.
+            s.media_root_v20 = true;
+            s.reader_mode_v20 = true;
             return s;
         }
         // **A file that will not parse is moved aside, not overwritten.**
@@ -1768,10 +1873,22 @@ impl Settings {
             let mut s = Self::first_launch();
             s.video_default_applied = true;
             s.shows_default_applied = true;
+            // Nothing on disk to keep and nothing wrong written down yet, so
+            // both one-shots are done before they start.
+            s.media_root_v20 = true;
+            s.reader_mode_v20 = true;
             return s;
         };
         s.apply_video_default();
         s.apply_shows_default();
+        // An install with work already in the old place keeps it — see
+        // `pin_legacy_media_root`. Saved right away, because the pin is only
+        // right while the old folder is still where it was.
+        let pinned = s.pin_legacy_media_root();
+        let cleared = s.clear_guessed_reader_mode();
+        if pinned || cleared {
+            s.save();
+        }
         s
     }
 
@@ -1948,6 +2065,8 @@ impl Settings {
         take_color(&mut map, "fx_knob_color", &mut s.fx_knob_color);
         take_color(&mut map, "master_knob_color", &mut s.master_knob_color);
         take_color(&mut map, "varispeed_color", &mut s.varispeed_color);
+        take_color(&mut map, "velocity_loud_color", &mut s.velocity_loud_color);
+        take_color(&mut map, "velocity_quiet_color", &mut s.velocity_quiet_color);
         take_color(&mut map, "meter_bg_color", &mut s.meter_bg_color);
         take_color(&mut map, "scope_draw_color", &mut s.scope_draw_color);
         take_color(&mut map, "fx_strip_color", &mut s.fx_strip_color);
@@ -2173,6 +2292,11 @@ impl Settings {
             }
         };
         take_opt_str(&mut map, "record_dir", &mut s.record_dir);
+        take_opt_str(&mut map, "project_dir", &mut s.project_dir);
+        take_opt_str(&mut map, "export_dir", &mut s.export_dir);
+        take_bool(&mut map, "media_root_v20", &mut s.media_root_v20);
+        take_bool(&mut map, "reader_mode_v20", &mut s.reader_mode_v20);
+        take_bool(&mut map, "master_mono", &mut s.master_mono);
         take_bool(
             &mut map,
             "record_open_when_done",
@@ -2533,6 +2657,19 @@ impl Settings {
             }
             s.strip_to_theory = out;
         }
+        for (key, dst) in [
+            ("strip_is_folder", &mut s.strip_is_folder),
+            ("strip_in_folder", &mut s.strip_in_folder),
+            ("strip_folder_shut", &mut s.strip_folder_shut),
+        ] {
+            if let Some(Value::Array(v)) = map.shift_remove(key) {
+                let mut out = vec![false; crate::recorder::CHANNELS];
+                for (slot, val) in out.iter_mut().zip(v.iter()) {
+                    *slot = val.as_bool().unwrap_or(false);
+                }
+                *dst = out;
+            }
+        }
         if let Some(n) = map.shift_remove("arr_grid_exp").and_then(|v| v.as_i64()) {
             s.arr_grid_exp = n.clamp(-5, 3);
         }
@@ -2574,6 +2711,14 @@ impl Settings {
             }
         }
         take_bool(&mut map, "midi_triplet", &mut s.midi_triplet);
+        take_bool(&mut map, "midi_draw_mode", &mut s.midi_draw_mode);
+        take_bool(&mut map, "arr_master_row", &mut s.arr_master_row);
+        take_bool(&mut map, "heart_animate", &mut s.heart_animate);
+        if let Some(v) = map.shift_remove("heart_slot") {
+            if let Some(n) = v.as_i64() {
+                s.heart_slot = n;
+            }
+        }
         if let Some(Value::String(path)) = map.shift_remove("track_path") {
             s.track_path = path;
         }
@@ -2722,10 +2867,10 @@ impl Settings {
         }
         if !desk.inserts.is_empty() {
             self.strip_inserts = desk.inserts;
-            self.strip_inserts.truncate(
-                (crate::recorder::STRIPS + 1 + crate::recorder::DRUM_PADS)
-                    * crate::recorder::INSERTS,
-            );
+            // **`INSERT_SPACE`, which includes the master's second rack.**
+            // Truncating to the old length would drop the three bays that
+            // live past the pads every time a session was loaded.
+            self.strip_inserts.truncate(crate::recorder::INSERT_SPACE);
         }
         if !desk.names.is_empty() {
             self.strip_names = desk.names;
@@ -3565,6 +3710,69 @@ impl Settings {
                 Value::Number(self.varispeed.max().into()),
             );
         }
+        // The two folders that joined `record_dir`, and the marker that says
+        // this file has been through the move to `Documents/Tangent Media`.
+        // Additive, so they go here rather than up in the loop `record_dir`
+        // lives in.
+        for (key, value) in [
+            ("project_dir", &self.project_dir),
+            ("export_dir", &self.export_dir),
+        ] {
+            if let Some(v) = value.as_ref().filter(|v| !v.is_empty()) {
+                map.insert(key.into(), Value::String(v.clone()));
+            }
+        }
+        if self.media_root_v20 {
+            map.insert("media_root_v20".into(), Value::Bool(true));
+        }
+        if self.reader_mode_v20 {
+            map.insert("reader_mode_v20".into(), Value::Bool(true));
+        }
+        if self.master_mono {
+            map.insert("master_mono".into(), Value::Bool(true));
+        }
+        if self.midi_draw_mode {
+            map.insert("midi_draw_mode".into(), Value::Bool(true));
+        }
+        // Written only when HIDDEN, since shown is how it ships.
+        if !self.arr_master_row {
+            map.insert("arr_master_row".into(), Value::Bool(false));
+        }
+        // **Additive keys go at the END.** See the note on `to_map`: a key
+        // inserted in the middle reorders everybody's file on the next save.
+        //
+        // Written only when OFF, since the drift is how it ships.
+        if !self.heart_animate {
+            map.insert("heart_animate".into(), Value::Bool(false));
+        }
+        if self.heart_slot != 0 {
+            map.insert("heart_slot".into(), Value::Number(self.heart_slot.into()));
+        }
+        // Written only when somebody has actually made a folder, so a
+        // settings file from an install that never used them stays
+        // byte-identical — the rule every optional key here follows.
+        for (key, v) in [
+            ("strip_is_folder", &self.strip_is_folder),
+            ("strip_in_folder", &self.strip_in_folder),
+            ("strip_folder_shut", &self.strip_folder_shut),
+        ] {
+            if v.iter().any(|b| *b) {
+                map.insert(
+                    key.into(),
+                    Value::Array(v.iter().map(|b| Value::Bool(*b)).collect()),
+                );
+            }
+        }
+        // Additive, so they go HERE — last of our own keys, ahead only of
+        // the preserved extras. See the note above `settings_version`.
+        map.insert(
+            "velocity_loud_color".into(),
+            Value::String(self.velocity_loud_color.to_hex()),
+        );
+        map.insert(
+            "velocity_quiet_color".into(),
+            Value::String(self.velocity_quiet_color.to_hex()),
+        );
         for (k, v) in &self.extra {
             map.insert(k.clone(), v.clone());
         }
@@ -3868,6 +4076,19 @@ impl Settings {
         self.strip_sends = fresh.strip_sends;
         self.strip_muted = fresh.strip_muted;
         self.strip_soloed = fresh.strip_soloed;
+        // **Which channels EXIST**, and its absence here is why "Reset
+        // Everything" left a channel standing.
+        //
+        // Every other thing a channel is was being put back — its name, its
+        // colour, its input, its inserts, its send, its fader — so the row
+        // came back blank and stayed on the desk, because `channel_used`
+        // also asks this mask and this mask still had its bit. The owner
+        // found it as "a stale channel on 8".
+        self.tracks_added = fresh.tracks_added;
+        // The per-channel T switch, for the same reason: it is a property of
+        // a channel and the reset empties channels.
+        self.strip_to_theory = fresh.strip_to_theory.clone();
+        self.master_mono = fresh.master_mono;
         self.input_alias = fresh.input_alias.clone();
         self.routes = fresh.routes.clone();
         self.master_gain = fresh.master_gain;
@@ -4047,16 +4268,123 @@ impl Settings {
     /// a take written next to the executable is one nobody finds again and one
     /// that fails outright inside a signed `.app`.
     pub fn record_root(&self) -> PathBuf {
-        if let Some(d) = &self.record_dir {
-            let p = PathBuf::from(d);
-            if !p.as_os_str().is_empty() {
-                return p;
+        Self::chosen(&self.record_dir).unwrap_or_else(|| self.media_root().join("Takes"))
+    }
+
+    /// Where PROJECTS are written.
+    pub fn project_root(&self) -> PathBuf {
+        Self::chosen(&self.project_dir).unwrap_or_else(|| self.media_root().join("Projects"))
+    }
+
+    /// Where an EXPORT lands when the dialog does not name a folder.
+    pub fn export_root(&self) -> PathBuf {
+        Self::chosen(&self.export_dir).unwrap_or_else(|| self.media_root().join("Exports"))
+    }
+
+    /// Everything Tangent writes for a person, under one roof.
+    ///
+    /// **`Documents/Tangent Media`, with `Takes`, `Projects` and `Exports`
+    /// inside it.** It used to be the platform's VIDEO folder with a
+    /// `Tangent` subfolder, projects nested inside that, and exports beside
+    /// whichever project made them — three kinds of thing in two places,
+    /// with the documents filed under video because the takes happened to be
+    /// mp4s.
+    ///
+    /// `dirs::document_dir` is the right call on all three platforms: it
+    /// reads `FOLDERID_Documents` on Windows and `$XDG_DOCUMENTS_DIR` on
+    /// Linux rather than assuming an English folder name, which is the bug
+    /// in every hardcoded `~/Documents`.
+    ///
+    /// **Never the Desktop and never the bundle directory.** The fallback
+    /// when the platform has no documents folder at all is the home
+    /// directory, because a take written next to the executable is one
+    /// nobody finds again and one that fails outright inside a signed
+    /// `.app`.
+    pub fn media_root(&self) -> PathBuf {
+        dirs::document_dir()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Tangent Media")
+    }
+
+    /// A folder the user actually chose, or nothing. An empty string is not
+    /// a choice.
+    fn chosen(d: &Option<String>) -> Option<PathBuf> {
+        d.as_deref()
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from)
+    }
+
+    /// Where takes went before the move to `Documents/Tangent Media`.
+    ///
+    /// Kept so [`Self::pin_legacy_media_root`] can find an install that
+    /// already has work in it.
+    fn legacy_record_root() -> PathBuf {
+        dirs::video_dir()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Tangent")
+    }
+
+    /// **An install with takes already in the old place keeps them.**
+    ///
+    /// Changing a default silently relocates everybody who never chose: the
+    /// next launch would open on an empty Takes folder and a project list
+    /// with nothing in it, with the old work still on disk and no sign of
+    /// where. So the move applies to people who have nothing to move, and
+    /// anybody else is PINNED to where their work already is — which they
+    /// can then change from the Project section of the settings panel, on
+    /// purpose, knowing what is where.
+    ///
+    /// Runs once; `media_root_v20` is the marker.
+    /// **Throw away a `screen_reader_mode` that the app guessed at.**
+    ///
+    /// The detection asked egui whether it was building an accesskit tree,
+    /// which is true whenever the feature is compiled in — so on macOS it
+    /// said "a reader is attached" on every launch, with VoiceOver off, and
+    /// the answer was WRITTEN TO THIS FILE. A saved value outlives the fix:
+    /// the probe is honest now, but every file it already poisoned still
+    /// says yes, and the visible symptom is that Tab walks a hidden
+    /// accessibility overlay instead of switching views.
+    ///
+    /// Clearing it by hand was tried and is not enough — a running instance
+    /// held the old value in memory and saved it straight back over the
+    /// edit. It has to be the file's own business, once, on load.
+    ///
+    /// **Once**, so somebody who turns it on from the menu afterwards keeps
+    /// it. `reader_mode_v20` is the marker.
+    pub fn clear_guessed_reader_mode(&mut self) -> bool {
+        if self.reader_mode_v20 {
+            return false;
+        }
+        self.reader_mode_v20 = true;
+        self.screen_reader_mode = false;
+        true
+    }
+
+    pub fn pin_legacy_media_root(&mut self) -> bool {
+        if self.media_root_v20 {
+            return false;
+        }
+        self.media_root_v20 = true;
+        let old = Self::legacy_record_root();
+        let has_work = std::fs::read_dir(&old).is_ok_and(|mut d| d.next().is_some());
+        if !has_work {
+            return true;
+        }
+        if self.record_dir.is_none() {
+            self.record_dir = Some(old.to_string_lossy().into_owned());
+        }
+        // Projects lived INSIDE the take folder, so they are pinned to that
+        // same nested place rather than to the new one.
+        if self.project_dir.is_none() {
+            let nested = old.join("Projects");
+            if nested.is_dir() {
+                self.project_dir = Some(nested.to_string_lossy().into_owned());
             }
         }
-        let base = dirs::video_dir()
-            .or_else(dirs::home_dir)
-            .unwrap_or_else(|| PathBuf::from("."));
-        base.join("Tangent")
+        true
     }
 
     /// Count-in length, clamped to what the UI can actually offer.
@@ -4267,6 +4595,30 @@ impl Settings {
 /// checked.
 pub const MIN_WINDOW: egui::Vec2 = egui::Vec2::new(560.0, 320.0);
 
+/// **Can the window's edges be dragged?**
+///
+/// Retired at the owner's word, and RETIRED rather than deleted: every piece
+/// of machinery a draggable window needs is still here and still tested —
+/// `fit_bands`, `fill_bands`, the pane-filling DAW layout, `MIN_WINDOW`, the
+/// geometry write-back and its tiling-WM guard. Flipping this to `true` puts
+/// it all back, and the plugin editor exercises the same solvers on every
+/// launch, so it cannot rot while it is off.
+///
+/// **Why it is off.** The layout is aspect-locked by construction: every
+/// band's height is a fixed fraction of the window's width, so a window at
+/// any other aspect gets bands of the theme's ground above and below the
+/// picture. That is correct letterboxing and it still looked wrong — the
+/// owner's screen showed a 553-point layout centred in a 1377-point window.
+/// The recorder band is the one thing that stays put across every view, and
+/// the presets, fullscreen and maximise cover the sizes anybody needs.
+///
+/// **What it costs.** The 5.0 audit called the fixed-size window out under
+/// accessibility, and it was right to: a person who needs the app bigger has
+/// the seven percentage presets and fullscreen and no edge to drag. That is
+/// the trade this constant records, so the next person to read it knows a
+/// choice was made rather than that nobody thought about it.
+pub const RESIZABLE: bool = false;
+
 /// Keep a window fully on the monitor it is being placed on. A remembered
 /// position is worthless if the monitor it referred to is gone, which is the
 /// normal state of affairs for anyone who ever undocks a laptop.
@@ -4287,6 +4639,137 @@ pub fn clamp_to_monitor(
 
 #[cfg(test)]
 mod tests {
+
+    /// **Three kinds of thing, three folders, one roof.**
+    ///
+    /// Takes used to go to the platform's VIDEO folder, projects to a
+    /// subfolder of that, and exports beside whichever project made them —
+    /// so choosing where takes went silently moved the documents too, and
+    /// there was no answer at all to "where are my exports".
+    #[test]
+    fn the_three_media_folders_are_separate_and_default_under_documents() {
+        let s = super::Settings::default();
+        let root = s.media_root();
+        assert!(
+            root.ends_with("Tangent Media"),
+            "the media root is {}",
+            root.display()
+        );
+        assert_eq!(s.record_root(), root.join("Takes"));
+        assert_eq!(s.project_root(), root.join("Projects"));
+        assert_eq!(s.export_root(), root.join("Exports"));
+        // All three are DIFFERENT places, which is the whole point.
+        assert_ne!(s.record_root(), s.project_root());
+        assert_ne!(s.project_root(), s.export_root());
+        assert_ne!(s.record_root(), s.export_root());
+    }
+
+    /// Each folder is chosen on its own, and choosing one moves nothing else.
+    #[test]
+    fn choosing_one_folder_leaves_the_other_two_alone() {
+        let mut s = super::Settings::default();
+        let projects = s.project_root();
+        let exports = s.export_root();
+        s.record_dir = Some("/tmp/somewhere-else".to_owned());
+        assert_eq!(s.record_root(), std::path::PathBuf::from("/tmp/somewhere-else"));
+        assert_eq!(s.project_root(), projects, "the projects followed the takes");
+        assert_eq!(s.export_root(), exports, "the exports followed the takes");
+        // An empty string is not a choice: it falls back rather than
+        // resolving to the current directory.
+        s.project_dir = Some("   ".to_owned());
+        assert_eq!(s.project_root(), projects);
+    }
+
+    /// **Resetting the desk leaves NO channel standing.**
+    ///
+    /// It left one: every other thing a channel is was put back — name,
+    /// colour, input, inserts, send, fader — but `tracks_added`, the mask
+    /// that says a channel EXISTS, was not in the list. So the row came back
+    /// blank and stayed on the desk. The owner found it as "a stale channel
+    /// on 8", which is exactly what a bit nobody cleared looks like.
+    ///
+    /// Written against the WHOLE struct rather than against a list of
+    /// fields, so the next thing somebody adds to a channel is caught here
+    /// if they forget the reset — which is how this one got through.
+    #[test]
+    fn resetting_the_desk_leaves_no_channel_behind() {
+        use super::ResetScope;
+        let mut s = super::Settings::first_launch();
+        // A track on slot 8, the way `add_bare_track` makes one, plus the
+        // other per-channel marks.
+        s.tracks_added |= 1 << 8;
+        s.strip_to_theory = vec![true; crate::recorder::CHANNELS];
+        s.master_mono = true;
+        while s.strip_names.len() <= 8 {
+            s.strip_names.push(String::new());
+        }
+        s.strip_names[8] = "GHOST".to_owned();
+
+        s.reset(ResetScope::Desk);
+
+        let fresh = super::Settings::first_launch();
+        assert_eq!(
+            s.tracks_added, fresh.tracks_added,
+            "a channel survived the reset: mask {:b}",
+            s.tracks_added
+        );
+        assert_eq!(s.strip_to_theory, fresh.strip_to_theory);
+        assert_eq!(s.master_mono, fresh.master_mono);
+        assert_eq!(
+            s.strip_names.get(8).map(String::as_str).unwrap_or(""),
+            fresh.strip_names.get(8).map(String::as_str).unwrap_or(""),
+            "a channel kept its name through the reset"
+        );
+
+        // And "Everything" is at least as thorough as "The Desk".
+        let mut all = super::Settings::first_launch();
+        all.tracks_added |= 1 << 8;
+        all.reset(ResetScope::Everything);
+        assert_eq!(all.tracks_added, fresh.tracks_added);
+    }
+
+    /// **A `screen_reader_mode` the app guessed at is thrown away once.**
+    ///
+    /// The detection was wrong and the wrong answer was SAVED, so fixing the
+    /// probe fixes nothing for a file that already says yes. The visible
+    /// symptom was Tab walking a hidden accessibility overlay instead of
+    /// switching views.
+    #[test]
+    fn a_guessed_reader_mode_is_cleared_once_and_then_left_alone() {
+        let mut s = super::Settings::default();
+        s.screen_reader_mode = true;
+        assert!(s.clear_guessed_reader_mode(), "the one-shot did not run");
+        assert!(!s.screen_reader_mode, "the guess survived");
+        assert!(s.reader_mode_v20);
+
+        // **And then never again.** Somebody who turns it on from the menu
+        // afterwards keeps it — that is a choice, not a guess.
+        s.screen_reader_mode = true;
+        assert!(!s.clear_guessed_reader_mode(), "the one-shot ran twice");
+        assert!(s.screen_reader_mode, "a real choice was thrown away");
+    }
+
+    /// **An install with work in the old place keeps it.**
+    ///
+    /// Changing a default silently relocates everybody who never chose. The
+    /// migration pins them instead, once.
+    #[test]
+    fn an_existing_install_is_pinned_to_where_its_takes_already_are() {
+        let mut s = super::Settings::default();
+        assert!(!s.media_root_v20);
+        // Runs once and says so.
+        assert!(s.pin_legacy_media_root());
+        assert!(s.media_root_v20);
+        assert!(!s.pin_legacy_media_root(), "the migration ran twice");
+        // A file that has already been through it is left alone, whatever
+        // is on disk: re-pinning would undo a folder the user had since
+        // moved.
+        let mut chosen = super::Settings::default();
+        chosen.media_root_v20 = true;
+        chosen.record_dir = Some("/tmp/mine".to_owned());
+        assert!(!chosen.pin_legacy_media_root());
+        assert_eq!(chosen.record_dir.as_deref(), Some("/tmp/mine"));
+    }
 
     /// A first launch shows the whole app; a corrupt file does not get
     /// rearranged behind the user's back. Both matter, and they are one line
@@ -5813,8 +6296,7 @@ mod tests {
         // the clamp is wider than the strips — what matters is the FRONT
         // never slid.
         assert!(
-            s.strip_inserts.len()
-                <= (STRIPS + 1 + crate::recorder::DRUM_PADS) * INSERTS
+            s.strip_inserts.len() <= crate::recorder::INSERT_SPACE
         );
         for i in 0..((STRIPS + 1) * INSERTS).min(s.strip_inserts.len()) {
             assert_eq!(s.strip_inserts[i], format!("/x/p{i}.vst3"), "bay {i} moved");

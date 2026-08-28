@@ -10,7 +10,7 @@
 //! [`Layout::targets`] is the single source of truth both are derived from. No
 //! state, no `egui::Ui`, and nothing here can open a device or read a file.
 
-use crate::recorder::{gain_text, gain_to_fader, ChannelKind, Column, Strip, CHANNELS, INSERTS};
+use crate::recorder::{gain_text, gain_to_fader, Column, Strip, CHANNELS, INSERTS};
 use egui::{Color32, FontId, Painter, Pos2, Rect, Stroke, Vec2};
 
 /// One channel, as the painter sees it.
@@ -30,7 +30,10 @@ pub struct StripView<'a> {
     /// A user effect across this strip, by name. Empty for none.
     /// What is in each of this channel's three insert slots, by short name.
     /// Empty for an empty slot, which is drawn as somewhere to put one.
-    pub inserts: [&'a str; INSERTS],
+    /// **Six, because the master has two racks.** A channel fills the first
+    /// three and leaves the rest empty. See `recorder::seat_bay`, which is
+    /// the one place that knows a slot's real seat.
+    pub inserts: [&'a str; INSERTS * 2],
     /// How many routes leave this channel, for the strips under the button.
     /// The routes THEMSELVES live on the view, not the strip: one borrow for
     /// the whole desk beats a list per column rebuilt every frame.
@@ -57,6 +60,9 @@ pub struct StripView<'a> {
     pub send: f32,
     /// The channel's pan, -1..1, centre 0.
     pub pan: f32,
+    /// **Master only**: the output is folded to mono. Meaningless on a
+    /// channel and ignored there.
+    pub mono: bool,
     /// The loudest thing it made since the last frame, left and right.
     pub peak: [f32; 2],
     /// Whether it is a stereo source. A mono one draws ONE bar, because two
@@ -148,7 +154,14 @@ pub struct MixerView<'a> {
     /// same frame, hit-tested first, dismissed by a press anywhere else.
     pub fx_menu: Option<(Column, usize)>,
     /// The selected channel: its strip wears a faint light rim.
+    ///
+    /// The PRIMARY — the last one clicked. Everything selected is in
+    /// [`Self::selected_tracks`], and that is what the rim is drawn from.
     pub selected: Option<usize>,
+    /// Every selected channel. Shift takes a range, Cmd or Ctrl takes them one
+    /// at a time; all of them wear the rim, because a selection you cannot see
+    /// the extent of is not one.
+    pub selected_tracks: &'a [usize],
 }
 
 impl MixerView<'_> {
@@ -187,6 +200,8 @@ pub enum Hit {
     Add(Column),
     /// **T** — send this channel's MIDI to the theory view, or stop.
     ToTheory(Column),
+    /// **Master only**: fold the output to mono, or stop. A mix check.
+    Mono(Column),
     /// One of the three insert chips: put an effect in it, or take one out.
     /// The second field is the BAY, which is not a channel of anything.
     Insert(Column, usize),
@@ -243,6 +258,7 @@ impl Hit {
             | Hit::Remove(i)
             | Hit::Arm(i)
             | Hit::ToTheory(i)
+            | Hit::Mono(i)
             | Hit::FxMenu(i, ..)
             | Hit::InputChip(i)
             | Hit::Routing(i)
@@ -266,7 +282,7 @@ impl Hit {
             Hit::RouteGain(..) => Some(DragAxis::Horizontal),
             Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(..)
             | Hit::Db(_) | Hit::Name(_) | Hit::Remove(_) | Hit::Arm(_) | Hit::ToTheory(_)
-            | Hit::FxMenu(..) | Hit::InputChip(_) | Hit::Routing(_) => None,
+            | Hit::Mono(_) | Hit::FxMenu(..) | Hit::InputChip(_) | Hit::Routing(_) => None,
         }
     }
 
@@ -279,7 +295,7 @@ impl Hit {
             Hit::RouteGain(..) => Some(SEND_TRAVEL),
             Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(..)
             | Hit::Db(_) | Hit::Name(_) | Hit::Remove(_) | Hit::Arm(_) | Hit::ToTheory(_)
-            | Hit::FxMenu(..) | Hit::InputChip(_) | Hit::Routing(_) => None,
+            | Hit::Mono(_) | Hit::FxMenu(..) | Hit::InputChip(_) | Hit::Routing(_) => None,
         }
     }
 }
@@ -604,8 +620,14 @@ pub struct StripStrip {
     /// The T switch: send this track's MIDI to the theory view. `NOTHING`
     /// on everything but a general channel, for the same reason.
     pub theory: Rect,
+    /// **The master's mono fold**, at the foot of its strip and nowhere
+    /// else. `NOTHING` on every channel.
+    pub mono: Rect,
     /// A user effect plugin across this strip. Only the bus has one today.
-    pub inserts: [Rect; INSERTS],
+    /// **Six, because the master has two racks.** A channel uses the first
+    /// three and leaves the rest `NOTHING`; `recorder::bays_on` says how
+    /// many a strip actually draws. See `recorder::MASTER_EXTRA_SEAT`.
+    pub inserts: [Rect; INSERTS * 2],
     /// The Routing button, under the insert bays — the owner's placement.
     pub routing: Rect,
     /// One small strip per route: a label and its own fader. `NOTHING` past
@@ -624,6 +646,7 @@ impl StripStrip {
     /// INSIDE small windows — a target you can press by accident.
     const NONE: Self = Self {
         theory: Rect::NOTHING,
+        mono: Rect::NOTHING,
         panel: Rect::NOTHING,
         icon: Rect::NOTHING,
         name: Rect::NOTHING,
@@ -637,7 +660,7 @@ impl StripStrip {
         mute: Rect::NOTHING,
         solo: Rect::NOTHING,
         arm: Rect::NOTHING,
-        inserts: [Rect::NOTHING; INSERTS],
+        inserts: [Rect::NOTHING; INSERTS * 2],
         routing: Rect::NOTHING,
         routes: [Rect::NOTHING; STRIP_ROUTES],
         add: Rect::NOTHING,
@@ -809,9 +832,21 @@ impl Layout {
         // **Shorter than it was, to make room for the Routing button under
         // it** - the owner's call about what gives when something new needs
         // a place: the bays first.
-        let rack = cut(0.195, 0.345);
-        let inserts: [Rect; INSERTS] = std::array::from_fn(|i| {
-            let h = rack.height() / INSERTS as f32;
+        // **The master's rack is twice as tall, because it holds twice as
+        // many.** Its three extra bays took the empty paint between the
+        // title and the original three — the owner's spot for them. A
+        // channel's rack is exactly where it was.
+        let rack = if view.strip.is_none() && !view.empty {
+            cut(0.100, 0.345)
+        } else {
+            cut(0.195, 0.345)
+        };
+        let bays = crate::recorder::bays_on(view.strip);
+        let inserts: [Rect; INSERTS * 2] = std::array::from_fn(|i| {
+            if !rack.is_positive() || i >= bays {
+                return Rect::NOTHING;
+            }
+            let h = rack.height() / bays as f32;
             let y = rack.top() + h * i as f32;
             Rect::from_min_max(
                 Pos2::new(rack.left() + 2.0, y + 1.0),
@@ -819,6 +854,20 @@ impl Layout {
             )
         });
         let switches = if switchable { cut(0.902, 0.975) } else { Rect::NOTHING };
+        // **The MONO fold, on the master and nowhere else.** It takes the
+        // switch row that a channel spends on M/S/R — the master has none of
+        // those, so the row was empty paint at the foot of the one strip
+        // that had nothing there. A mix check belongs at the end of the
+        // signal path, which is where this strip is.
+        let mono = if view.strip.is_none() && !view.empty {
+            let row = cut(0.902, 0.975);
+            Rect::from_min_max(
+                Pos2::new(row.left() + 2.0, row.top()),
+                Pos2::new(row.right() - 2.0, row.bottom()),
+            )
+        } else {
+            Rect::NOTHING
+        };
         // **M S R on a general channel; M S on the click.** Arm is
         // record-ready AND live — a thing only a channel can be. Three
         // switches share the row the pair had; the letters carry them at the
@@ -860,26 +909,26 @@ impl Layout {
         // press one and get the other.
         // Every channel has an insert row now, so every channel's travel
         // starts below it — a send is what still moves the line.
-        // **The routing band, and it comes out of the fader.** Routes are
-        // drawn only where they exist, so a channel that routes nowhere is
-        // exactly the strip it always was; each one that does costs the
-        // fader a slice, which is the honest price of putting them here.
-        let route_n = view.route_count.min(STRIP_ROUTES);
+        // **The ROUTING button stays; the route strips are gone.**
+        //
+        // Each route a channel had drew its own little level strip under the
+        // button, and the fader gave up a slice of its travel for every one
+        // — so a channel's shape changed as you routed it, and the strips
+        // that appeared were three more things to aim at on a column that is
+        // already wall-to-wall controls. The owner's call: keep the button
+        // that summons the routing window, drop the strips that only appear
+        // after a route is added. The levels are set in that window, which
+        // is where the routes themselves are chosen.
+        //
+        // The fader gets its full travel back, and it is the SAME travel on
+        // every channel whatever it routes.
         let routing = if matches!(view.strip, Some(Strip::Channel(_))) && !view.empty {
             cut(0.352, 0.398)
         } else {
             Rect::NOTHING
         };
-        const ROUTE_H: f32 = 0.043;
-        let route_top = if sends { 0.55 } else { 0.42 };
-        let routes: [Rect; STRIP_ROUTES] = std::array::from_fn(|i| {
-            if i >= route_n {
-                return Rect::NOTHING;
-            }
-            let y = route_top + ROUTE_H * i as f32;
-            cut(y + 0.004, y + ROUTE_H - 0.004)
-        });
-        let travel = cut(route_top + ROUTE_H * route_n as f32, 0.82);
+        let routes: [Rect; STRIP_ROUTES] = [Rect::NOTHING; STRIP_ROUTES];
+        let travel = cut(if sends { 0.55 } else { 0.42 }, 0.82);
         // The meter takes the left third and the fader the rest, so the fader
         // still sits near the middle of the strip where a hand expects it.
         let split = travel.left() + travel.width() * 0.42;
@@ -967,6 +1016,7 @@ impl Layout {
             solo,
             arm,
             theory,
+            mono,
             inserts,
             // **The same target as the plus on an empty one**, because it is
             // the same question: what is on this channel. An empty slot draws
@@ -995,6 +1045,7 @@ impl Layout {
                 (s.solo, Hit::Solo(i)),
                 (s.arm, Hit::Arm(i)),
                 (s.theory, Hit::ToTheory(i)),
+                (s.mono, Hit::Mono(i)),
                 (s.add, Hit::Add(i)),
                 (s.inserts[0], Hit::Insert(i, 0)),
                 (s.inserts[1], Hit::Insert(i, 1)),
@@ -1094,6 +1145,7 @@ pub fn a11y_nodes(rect: Rect, view: &MixerView<'_>) -> Vec<crate::a11y::Node> {
                 format!("{who} sends its MIDI to the theory view"),
                 s.to_theory,
             ),
+            Hit::Mono(_) => Node::toggle(id, r, "Master folded to mono", s.mono),
             Hit::Add(_) => Node::button(id, r, format!("Add a channel at slot {}", col.0 + 1)),
             Hit::Remove(_) => Node::button(id, r, format!("Remove {who}")),
             Hit::Name(_) => Node::readout(id, r, format!("{who} name"), who.clone()),
@@ -1152,6 +1204,7 @@ fn hit_column(hit: Hit) -> Option<Column> {
         | Hit::Solo(i)
         | Hit::Arm(i)
         | Hit::ToTheory(i)
+        | Hit::Mono(i)
         | Hit::Add(i)
         | Hit::Routing(i)
         | Hit::Db(i)
@@ -1162,7 +1215,11 @@ fn hit_column(hit: Hit) -> Option<Column> {
 }
 
 /// "L64", "C", "R20" — where a pan sits, in the words the desk uses.
-fn pan_text(pan: f32) -> String {
+///
+/// `pub(crate)` because the arrangement's header carries the same three
+/// dials and its screen reader must say the same words about them; a second
+/// copy over there is a second chance to disagree about what "centre" is.
+pub(crate) fn pan_text(pan: f32) -> String {
     let p = (pan.clamp(-1.0, 1.0) * 100.0).round() as i32;
     match p {
         0 => "centre".to_owned(),
@@ -1312,15 +1369,24 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MixerView<'_>) {
         let typed = view.typing.filter(|(at, _)| at.0 == i).map(|(_, b)| b);
         let naming = view.naming.filter(|(at, _)| at.0 == i).map(|(_, b)| b);
         strip(painter, s, v, &p, view.routes, heard, typed, naming);
-        // The selected channel's faint rim — the owner's slight light.
+        // The selected channels' faint rim — the owner's slight light.
         if view
-            .selected
-            .is_some_and(|n| v.strip == Some(Strip::Channel(n)))
+            .selected_tracks
+            .iter()
+            .any(|n| v.strip == Some(Strip::Channel(*n)))
         {
+            // Measured against THIS strip's own plate, which a painted
+            // channel chooses for itself. See `selection_rim`.
+            let under = if v.color != 0 {
+                let (r, g, b) = STRIP_COLORS[v.color.min(STRIP_COLORS.len() - 1)];
+                Color32::from_rgb(r, g, b)
+            } else {
+                p.face
+            };
             painter.rect_stroke(
                 s.panel,
                 3.0,
-                Stroke::new(1.2, Color32::from_rgba_unmultiplied(0xFF, 0xF4, 0xE0, 80)),
+                Stroke::new(1.2, crate::recorder_panel::selection_rim(under)),
                 egui::StrokeKind::Inside,
             );
         }
@@ -1371,7 +1437,14 @@ fn strip(
     naming: Option<&str>,
 ) {
     if v.empty {
-        empty_slot(painter, l, p);
+        // The slot's own NUMBER, so an empty desk still says which column is
+        // which — the mixer had none at all, and the arrange view's have been
+        // there all along.
+        let number = match v.strip {
+            Some(Strip::Channel(n)) => Some(n + 1),
+            _ => None,
+        };
+        empty_slot(painter, l, p, number);
         return;
     }
     // **A painted channel keeps its own face for the labels.** The whole panel
@@ -1778,6 +1851,36 @@ fn strip(
     if l.arm.is_positive() {
         switch(painter, l.arm, "R", v.armed, p.arm, p);
     }
+    // **T, and it was laid out and hit-tested and never drawn.** A control
+    // you can press and cannot see is worse than one that is missing: the
+    // owner found it by pressing the empty paint beside R.
+    //
+    // On the theme's own INK rather than a light of its own, exactly as the
+    // timeline's header carries it — it is neither a mute nor a solo, and a
+    // third red on a strip is one of the other two being misread.
+    // **The master's mono fold**, at the foot of the one strip that has no
+    // M/S/R row to put there. It says what it IS rather than what pressing
+    // it does — a switch that reads MONO while the output is stereo is a
+    // switch nobody can read at a glance.
+    if l.mono.is_positive() {
+        switch(
+            painter,
+            l.mono,
+            if v.mono { "MONO" } else { "ST" },
+            v.mono,
+            p.engrave,
+            p,
+        );
+    }
+    if l.theory.is_positive() {
+        // **A letter, not a glyph.** A drawn note was tried and a music
+        // character was measured for: `\u{266A}` exists in exactly one of the
+        // three bundled faces (Terminess, which is a Nerd Font), so two
+        // thirds of users would get a tofu box. The letter matches the
+        // timeline header's own T, which is the switch a hand has already
+        // learned. See `the_bundled_fonts_have_no_music_glyph_to_use`.
+        switch(painter, l.theory, "T", v.to_theory, p.engrave, p);
+    }
 }
 
 /// The two rows of an open insert menu: delete on top, replace under it.
@@ -1824,16 +1927,56 @@ fn fx_menu_over(l: &StripStrip, bay: usize) -> [Rect; 2] {
 /// and drawing it like one would be five faders that do nothing. The rack on
 /// the right of the band says "empty (click to load)"; this says the same
 /// thing in the shape a mixer says it in.
-fn empty_slot(painter: &Painter, l: &StripStrip, p: &Ink) {
+/// The ground an unoccupied slot paints, fixed on every theme.
+///
+/// Named because the ink on it is measured against it — see `empty_slot_ink`.
+pub const EMPTY_GROUND: Color32 = Color32::from_rgb(0x2E, 0x2E, 0x2E);
+
+/// What is printed on [`EMPTY_GROUND`]: the circled plus, and the slot number.
+///
+/// **One value for both**, because they sit on the same ground half an inch
+/// apart and two answers is two chances for one of them to be wrong. The
+/// theme's face, quietened — the value the plus has always used and which the
+/// owner confirmed reads — and then pushed until it clears the ground, which
+/// costs nothing on the themes where it already did.
+/// [`empty_slot_ink`] from the face alone, for the test that walks the themes.
+pub fn empty_slot_ink_for(face: Color32) -> Color32 {
+    crate::recorder_panel::distinct_surface_at(face.gamma_multiply(0.55), EMPTY_GROUND, 3.0)
+}
+
+fn empty_slot_ink(p: &Ink) -> Color32 {
+    empty_slot_ink_for(p.face)
+}
+
+fn empty_slot(painter: &Painter, l: &StripStrip, p: &Ink, number: Option<usize>) {
     // The empty slot's own ground — the owner's near-black grey — under
     // the circled plus and the quiet space around it.
-    painter.rect_filled(l.panel, 3.0, Color32::from_rgb(0x2E, 0x2E, 0x2E));
+    painter.rect_filled(l.panel, 3.0, EMPTY_GROUND);
     painter.rect_stroke(
         l.panel,
         3.0,
         Stroke::new(1.0, p.face.gamma_multiply(0.22)),
         egui::StrokeKind::Inside,
     );
+    // **The number at the top**, in the same ink the plus below it wears —
+    // which is the value that already reads on this ground on every theme, so
+    // there is no second answer to keep in step with the first.
+    if let Some(n) = number {
+        let cap = Rect::from_min_max(
+            l.panel.min,
+            Pos2::new(l.panel.right(), l.panel.top() + (l.panel.height() * 0.09).min(16.0)),
+        );
+        if cap.is_positive() {
+            let size = (cap.height() * 0.78).clamp(7.0, 12.0);
+            painter.text(
+                Pos2::new(cap.center().x, cap.center().y),
+                egui::Align2::CENTER_CENTER,
+                format!("{n}"),
+                FontId::new(size, crate::fonts::courier()),
+                empty_slot_ink(p),
+            );
+        }
+    }
     let r = l.add;
     if !r.is_positive() {
         return;
@@ -1843,7 +1986,7 @@ fn empty_slot(painter: &Painter, l: &StripStrip, p: &Ink) {
     // what says "this much is pressable" on a panel that otherwise only
     // answers the right-click.
     let c = r.center();
-    let ink = p.face.gamma_multiply(0.55);
+    let ink = empty_slot_ink(p);
     let radius = r.width().min(r.height()) * 0.5 - 1.0;
     let w = (radius * 0.11).clamp(1.2, 2.5);
     painter.circle_stroke(c, radius, Stroke::new(w, ink));
@@ -1917,7 +2060,9 @@ fn meter(
         painter.text(
             Pos2::new(r.left() + scale_w - 3.0, y),
             egui::Align2::RIGHT_CENTER,
-            format!("{db:.0}"),
+            // Unsigned: the ladder descends from 0 and draws it. See
+            // `recorder::meter_number`.
+            crate::recorder::meter_number(db),
             font.clone(),
             print_on(face, p).gamma_multiply(0.62),
         );
@@ -2137,23 +2282,42 @@ fn fader(painter: &Painter, r: Rect, gain: f32, face: Color32, p: &Ink) {
     );
 }
 
-fn switch(painter: &Painter, r: Rect, label: &str, on: bool, lit: Color32, p: &Ink) {
-    if !r.is_positive() {
-        return;
-    }
-    // **A lit switch is deepened until its letter fits on it.**
-    //
-    // The solo crimson and the record red both land in the dead zone where
-    // neither ink clears 4.5:1 — 4.27 and 3.66 — so S and R were the two
-    // least readable things on the desk, on every theme, and had been since
-    // they were drawn. They stay recognisably the same lights; they are just
-    // taken far enough down to carry a letter. The meters and the playhead
-    // keep the undimmed reds, because nothing is printed on those.
+/// The ground a switch is filled with, and the ink that can be printed on
+/// it.
+///
+/// **A lit switch is deepened until what is on it fits.**
+///
+/// The solo crimson and the record red both land in the dead zone where
+/// neither ink clears 4.5:1 — 4.27 and 3.66 — so S and R were the two least
+/// readable things on the desk, on every theme, and had been since they were
+/// drawn. They stay recognisably the same lights; they are just taken far
+/// enough down to carry a letter. The meters and the playhead keep the
+/// undimmed reds, because nothing is printed on those.
+///
+/// The ink is then measured against THAT ground rather than inherited from
+/// anywhere: the rule this app has now learned eight times.
+///
+/// Its own function because the T switch carries a drawn glyph rather than a
+/// letter and must land on exactly the same two colours.
+fn switch_face(on: bool, lit: Color32, p: &Ink) -> (Color32, Color32) {
     let ground = if on {
         crate::recorder_panel::legible_surface(lit)
     } else {
         p.track
     };
+    let ink = if crate::recorder_panel::wants_light_ink(ground) {
+        crate::recorder_panel::INK_LIGHT
+    } else {
+        crate::recorder_panel::INK_DARK
+    };
+    (ground, ink)
+}
+
+fn switch(painter: &Painter, r: Rect, label: &str, on: bool, lit: Color32, p: &Ink) {
+    if !r.is_positive() {
+        return;
+    }
+    let (ground, ink) = switch_face(on, lit, p);
     painter.rect_filled(r, 2.0, ground);
     let size = (r.height() * 0.62).clamp(8.0, 13.0);
     centred(
@@ -2161,22 +2325,7 @@ fn switch(painter: &Painter, r: Rect, label: &str, on: bool, lit: Color32, p: &I
         r,
         label,
         FontId::new(size, crate::fonts::courier_bold()),
-        // **Measured against the SWITCH, not against the strip.**
-        //
-        // Both branches were wrong. Lit, it took `engrave` — which is the ink
-        // for the strip FACE, not for the mute's amber or the arm's red, and
-        // an ivory M on amber is not a letter anybody reads. Unlit, it took
-        // `p.face`: the themed strip colour used AS INK, which is the same
-        // mistake `print_on` was carrying, and it goes dark-on-near-black the
-        // moment a theme picks a dark face.
-        //
-        // A switch is a surface like any other. What can be printed on it is
-        // a property of the colour it was just filled with.
-        if crate::recorder_panel::wants_light_ink(ground) {
-            crate::recorder_panel::INK_LIGHT
-        } else {
-            crate::recorder_panel::INK_DARK
-        },
+        ink,
     );
 }
 
@@ -2309,15 +2458,99 @@ fn cut_to_fit(painter: &Painter, width: f32, text: &str, font: &FontId) -> Strin
 mod tests {
     use super::*;
 
+    /// **The T switch is legible on every theme, lit and at rest.**
+    ///
+    /// The standing rule for anything new on a surface: sixteen palettes,
+    /// both modes, and the glyph measured against the ground it is actually
+    /// filled onto rather than inherited from a themed role. The note is
+    /// drawn in the same ink `switch` prints its letters in, so proving the
+    /// ink proves the glyph.
+    #[test]
+    fn every_theme_dresses_the_mixer_theory_switch_legibly() {
+        let mut bad: Vec<String> = Vec::new();
+        for theme in crate::theme::factory() {
+            let mut set = crate::settings::Settings::default();
+            theme.apply(&mut set);
+            let mut v = a_view();
+            v.wood = {
+                let c = set.recorder_bg_color;
+                (c.r, c.g, c.b)
+            };
+            v.fx_strip = set.fx_strip_color.to_color32();
+            let p = ink(&v);
+            for (state, on) in [("lit", true), ("at rest", false)] {
+                let (ground, glyph) = switch_face(on, p.engrave, &p);
+                let ratio = crate::recorder_panel::contrast_ratio(glyph, ground);
+                if ratio < 4.5 {
+                    bad.push(format!("{} T {state}: {ratio:.2}:1", theme.name));
+                }
+            }
+            // And it must not be mistaken for the three beside it. Measured
+            // on the GROUNDS, which is what a person actually sees.
+            let t = switch_face(true, p.engrave, &p).0;
+            for (name, other) in
+                [("the mute", p.mute), ("the solo", p.solo), ("the arm", p.arm)]
+            {
+                let lit = switch_face(true, other, &p).0;
+                let d = crate::recorder_panel::delta_e(t, lit);
+                if d < 25.0 {
+                    bad.push(format!(
+                        "{}: a lit T is {d:.1} from {name} — too close to tell apart",
+                        theme.name
+                    ));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "the T switch is not readable:\n  {}", bad.join("\n  "));
+    }
+
+    /// **Every cell the layout carves is one something draws into.**
+    ///
+    /// The T switch was laid out, hit-tested, and never painted: a control
+    /// you can press and cannot see, which is worse than one that is
+    /// missing. The owner found it by pressing the empty paint beside R.
+    ///
+    /// Source-scanned rather than rendered because what is being asserted is
+    /// that a NAME is used, and the alternative — sifting a tessellated
+    /// shape list for a rectangle in the right place — proved to be a test
+    /// about egui's internals rather than about this panel.
+    #[test]
+    fn every_cell_the_layout_carves_is_drawn() {
+        let src = include_str!("mixer_panel.rs");
+        // The painter for one strip: from its signature to the start of the
+        // next item.
+        let from = src.find("\nfn strip(").expect("no strip painter");
+        let body = &src[from..];
+        let end = body
+            .find("\n/// The two rows of an open insert menu")
+            .expect("the strip painter's end moved");
+        let body = &body[..end];
+        let mut missing: Vec<&str> = Vec::new();
+        for cell in [
+            "theory", "mute", "solo", "arm", "fader", "pan", "send", "name",
+            "db", "meter", "panel",
+        ] {
+            if !body.contains(&format!("l.{cell}")) {
+                missing.push(cell);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "the strip painter never touches: {missing:?} — laid out, \
+             pressable, invisible"
+        );
+    }
+
     fn a_strip(strip: Option<Strip>, empty: bool) -> StripView<'static> {
         StripView {
+            mono: false,
             to_theory: false,
             route_count: 0,
             icon: 0,
             strip,
             name: "CHANNEL",
             detail: "",
-            inserts: [""; INSERTS],
+            inserts: [""; INSERTS * 2],
             // A used general channel in the tests is MIDI unless a test says
             // otherwise; track/click/master ignore it.
             kind: (!empty && matches!(strip, Some(Strip::Channel(_))))
@@ -2342,6 +2575,7 @@ mod tests {
     fn a_view() -> MixerView<'static> {
         let channels = Strip::shown();
         MixerView {
+            selected_tracks: &[],
             routes: &[],
             fx_strip: Color32::from_rgb(0xE3, 0xD9, 0xBD),
             input_chip: Color32::from_rgb(0xE3, 0xD9, 0xBD),
@@ -2511,22 +2745,42 @@ mod tests {
         }
     }
 
-    /// **A channel that routes gets a button and a strip for each route.**
+    /// **A channel that routes gets the BUTTON and nothing else.**
     ///
-    /// The report was "the level strips are nowhere to be found", so this
-    /// asks the layout directly rather than by eye.
+    /// It used to grow a little level strip per route, and the fader gave up
+    /// a slice of its travel for each one — so a column changed shape as you
+    /// routed it. The owner's call: keep the button that summons the routing
+    /// window, drop the strips that only appeared after a route was added.
+    /// The levels are set in that window, beside the routes themselves.
     #[test]
-    fn a_channel_with_routes_gets_a_button_and_a_strip_for_each() {
+    fn routing_is_a_button_and_the_fader_never_gives_up_travel_for_it() {
+        let mut none = a_view();
+        none.strips[1].route_count = 0;
+        let unrouted = Layout::new(rect(), &none).strips[1];
+
         let mut v = a_view();
-        v.strips[1].route_count = 2;
-        let l = Layout::new(rect(), &v);
-        let s = &l.strips[1];
+        v.strips[1].route_count = 3;
+        let s = Layout::new(rect(), &v).strips[1];
+
         assert!(s.routing.is_positive(), "no ROUTING button rect");
-        assert!(s.routes[0].is_positive(), "no rect for the first route");
-        assert!(s.routes[1].is_positive(), "no rect for the second route");
-        assert!(!s.routes[2].is_positive(), "a third rect for two routes");
-        assert!(!s.routes[0].intersects(s.routes[1]), "route strips overlap");
-        assert!(!s.routes[0].intersects(s.fader), "a route strip is on the fader");
+        for n in 0..STRIP_ROUTES {
+            assert!(
+                !s.routes[n].is_positive(),
+                "route {n} still draws a strip on the desk"
+            );
+        }
+        // **The same fader whatever it routes**, which is the point.
+        assert!(
+            (s.fader.height() - unrouted.fader.height()).abs() < 0.51,
+            "routing cost the fader {} points of travel",
+            unrouted.fader.height() - s.fader.height()
+        );
+        // And a routed channel is still a pressable button.
+        assert_eq!(
+            hit_test(rect(), &v, s.routing.center()),
+            Some(Hit::Routing(Column(1))),
+            "the routing button cannot be pressed"
+        );
     }
 
     /// **Every control can be pressed, and presses where it is drawn.**
@@ -3315,3 +3569,4 @@ mod tests {
         }
     }
 }
+

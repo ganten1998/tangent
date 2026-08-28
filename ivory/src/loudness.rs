@@ -250,15 +250,7 @@ impl Loudness {
     /// infinity, which stores into an atomic perfectly happily and then
     /// paints a ladder whose fill is `NaN`.
     fn window_loudness(&self, n: usize) -> Option<f64> {
-        let mut sum = [0.0f64; 2];
-        let mut frames = 0u64;
-        for k in 0..n {
-            let i = (self.at + CELLS - k) % CELLS;
-            for ch in 0..2 {
-                sum[ch] += self.cells[i][ch];
-            }
-            frames += u64::from(self.counts[i]);
-        }
+        let (sum, frames) = self.window_energy(n);
         if frames == 0 {
             return None;
         }
@@ -268,6 +260,39 @@ impl Loudness {
         // performed.
         let mean = (sum[0] + sum[1]) / frames as f64;
         (mean > 0.0).then(|| OFFSET + 10.0 * mean.log10())
+    }
+
+    /// One CHANNEL's loudness over the newest `n` cells.
+    ///
+    /// **Not half of the pair's reading.** The pair's is the sum of both
+    /// channels' energy against one frame count; a channel's own is its
+    /// energy alone against the same count, which for a correlated stereo
+    /// programme comes out about 3 LU below the pair. That is what every
+    /// per-channel loudness meter shows and it is why the two bars sit lower
+    /// than the number under them.
+    fn channel_loudness(&self, n: usize, ch: usize) -> Option<f64> {
+        let (sum, frames) = self.window_energy(n);
+        if frames == 0 || ch >= 2 {
+            return None;
+        }
+        let mean = sum[ch] / frames as f64;
+        (mean > 0.0).then(|| OFFSET + 10.0 * mean.log10())
+    }
+
+    /// The per-channel energy in the newest `n` cells, and how many frames
+    /// went into it. The half `window_loudness` and `channel_loudness`
+    /// share, so the two cannot disagree about which cells a window is.
+    fn window_energy(&self, n: usize) -> ([f64; 2], u64) {
+        let mut sum = [0.0f64; 2];
+        let mut frames = 0u64;
+        for k in 0..n {
+            let i = (self.at + CELLS - k) % CELLS;
+            for ch in 0..2 {
+                sum[ch] += self.cells[i][ch];
+            }
+            frames += u64::from(self.counts[i]);
+        }
+        (sum, frames)
     }
 
     /// The integrated reading: the mean of the blocks that clear both gates.
@@ -311,6 +336,27 @@ impl Loudness {
     /// The three readings, in LUFS. [`ABSOLUTE_GATE`] means "nothing yet".
     pub fn read(&self) -> (f32, f32, f32) {
         (self.momentary, self.short, self.integrated)
+    }
+
+    /// **The stereo pair, per channel, for the two sliding windows.**
+    ///
+    /// `[momentary L, momentary R, short L, short R]`, in LUFS, with
+    /// [`ABSOLUTE_GATE`] for "nothing measured".
+    ///
+    /// There is no integrated pair, and its absence is deliberate: the
+    /// standard's integrated reading is gated on the PROGRAMME — a block
+    /// counts or does not count for the whole measurement — so a per-channel
+    /// integrated figure would be a number this app invented and no other
+    /// meter would agree with. The bars fall back to the pair's own reading
+    /// on that window; see `draw_lufs`.
+    pub fn read_stereo(&self) -> [f32; 4] {
+        let f = |v: Option<f64>| v.map_or(ABSOLUTE_GATE, |x| x as f32);
+        [
+            f(self.channel_loudness(BLOCK_CELLS, 0)),
+            f(self.channel_loudness(BLOCK_CELLS, 1)),
+            f(self.channel_loudness(CELLS, 0)),
+            f(self.channel_loudness(CELLS, 1)),
+        ]
     }
 
     /// Start the INTEGRATED reading again, leaving the two sliding windows

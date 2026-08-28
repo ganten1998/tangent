@@ -271,6 +271,12 @@ struct Recorder {
     /// sixty times a second for the rest of the session. The band shows the
     /// error either way.
     engine_retry: Option<(std::time::Instant, u8)>,
+    /// An `open_audio_path` that arrived while a take was running.
+    ///
+    /// See that function: the reopen is REFUSED during a take, not queued
+    /// behind it, so without this a device change mid-take would leave the
+    /// engine down for the rest of the session. Cleared by the take ending.
+    audio_path_deferred: bool,
     /// The count-in downbeat the session has already been armed with.
     ///
     /// See the use site: `count_in_done` is a latch, so without this the same
@@ -323,6 +329,7 @@ struct Recorder {
 /// slice of a second per UI frame — the machine renders as fast as it can
 /// while the window stays alive. The owner's default; realtime is the
 /// option now.
+#[cfg(feature = "recorder")]
 struct OfflineBounce {
     e: crate::instrument::Engine,
     spec: ivory_ui::ports::ProjectExportSpec,
@@ -340,6 +347,7 @@ struct OfflineBounce {
     peaks: Vec<(f32, f32)>,
 }
 
+#[cfg(feature = "recorder")]
 struct Bounce {
     /// Stop when the playhead passes this — the span plus a tail for the
     /// reverbs to ring out.
@@ -427,6 +435,8 @@ pub struct DesktopApp {
     pending_midi: Option<Option<String>>,
     /// A frame has reached the screen. Deferred startup work waits for it.
     painted_once: bool,
+    /// Frames counted by the `IVORY_GEOM_PROBE` diagnostic. See `update`.
+    probe_frames: u32,
     /// A screen reader has been seen. Stops the probe below from running
     /// again — see `screen_reader_attached`, which is not free of side
     /// effects.
@@ -434,6 +444,7 @@ pub struct DesktopApp {
     /// The maps the engine was last given. Compared before pushing, because
     /// `Engine::set_maps` is a ring handover that WAITS for the displaced
     /// pair to come back — cheap once, and a stall if it ran every frame.
+    #[cfg(feature = "recorder")]
     pushed_maps: Option<crate::instrument::Maps>,
     /// The automation the engine was last given, compared before pushing for
     /// the reason `pushed_maps` gives. Invalidated in `start_engine` beside
@@ -501,6 +512,7 @@ pub struct DesktopApp {
     /// drag that lands on the same value twice is one render and not two;
     /// the tenth of a cent that rounds away is a hundredth of a sample on
     /// the longest clip anybody will import.
+    #[cfg(feature = "recorder")]
     stretch_cache:
         std::collections::HashMap<(std::path::PathBuf, i64, String), Arc<ivory_record::decode::Clip>>,
     /// The drumpad's decoded samples, by resolved path — its own cache,
@@ -664,7 +676,7 @@ fn wave_span(
 fn the_host_offers_a_choice_for_every_stepped_row() {
     let d = effect_defaults();
     for fx in ivory_ui::recorder_panel::Fx::ALL {
-        for row in fx.rows() {
+        for row in fx.rows(true) {
             if !row.step {
                 continue;
             }
@@ -684,7 +696,7 @@ fn the_host_offers_a_choice_for_every_stepped_row() {
     }
     // And every sliding row has a default value, for the same reason.
     for fx in ivory_ui::recorder_panel::Fx::ALL {
-        for row in fx.rows() {
+        for row in fx.rows(true) {
             if row.step || row.key.is_empty() {
                 continue;
             }
@@ -867,7 +879,7 @@ pub fn effect_defaults_for_shot() -> ivory_ui::ports::EffectDefaults {
 /// and the audio cannot disagree about where a slider starts.
 #[cfg(feature = "recorder")]
 fn effect_defaults() -> ivory_ui::ports::EffectDefaults {
-    use crate::effects::{Division, Params, Sends, Stages};
+    use crate::effects::{Division, EchoMode, Params, Sends, Stages};
     let d = Params::default();
     // **The six MIX knobs' own defaults live on `Sends`**, so a reset and the
     // default marker land where the sound ships — not on a fallback. Their
@@ -887,9 +899,13 @@ fn effect_defaults() -> ivory_ui::ports::EffectDefaults {
         ("reverb_size", d.reverb_size),
         ("reverb_damp", d.reverb_damp),
         ("reverb_width", d.reverb_width),
+        // The plate's own two, from `fx-dsp`. See docs/FX-DSP-HANDOFF.md §1.
+        ("plate_dispersion", d.plate_dispersion),
+        ("plate_predelay", d.plate_predelay),
         ("delay_feedback", d.delay_feedback),
         ("delay_tone", d.delay_tone),
         ("delay_width", d.delay_width),
+        ("delay_free_hz", d.delay_free_hz),
         ("chorus_rate", d.chorus_rate),
         ("chorus_depth", d.chorus_depth),
         ("chorus_width", d.chorus_width),
@@ -944,6 +960,27 @@ fn effect_defaults() -> ivory_ui::ports::EffectDefaults {
             ),
         ],
         choices: vec![
+            // The Space Echo's twelve-way mode selector: which heads are
+            // live and whether the spring is in. It is the instrument, not a
+            // setting — see the handoff's §1.
+            ivory_ui::ports::ChoiceParam {
+                key: "echo_mode".to_owned(),
+                options: EchoMode::ALL
+                    .into_iter()
+                    .map(|x| (x.key().to_owned(), x.label().to_owned()))
+                    .collect(),
+                default: d.echo_mode.key().to_owned(),
+            },
+            // The reverb's own selector: the plate, or the smooth tail that
+            // is nobody's hardware. See `effects::ReverbMode`.
+            ivory_ui::ports::ChoiceParam {
+                key: "reverb_mode".to_owned(),
+                options: crate::effects::ReverbMode::ALL
+                    .into_iter()
+                    .map(|x| (x.key().to_owned(), x.label().to_owned()))
+                    .collect(),
+                default: d.reverb_mode.key().to_owned(),
+            },
             ivory_ui::ports::ChoiceParam {
                 key: "delay_division".to_owned(),
                 options: Division::ALL
@@ -989,7 +1026,7 @@ fn slope_choice(key: &str, default: crate::effects::Slope) -> ivory_ui::ports::C
 /// migration, and one written by a newer build load without an error.
 #[cfg(feature = "recorder")]
 fn effect_params_from(map: &serde_json::Map<String, serde_json::Value>) -> crate::effects::Params {
-    use crate::effects::{Division, Params};
+    use crate::effects::{Division, EchoMode, Params};
     let mut p = Params::default();
     let num = |key: &str| {
         map.get(key)
@@ -1000,9 +1037,12 @@ fn effect_params_from(map: &serde_json::Map<String, serde_json::Value>) -> crate
         ("reverb_size", &mut p.reverb_size),
         ("reverb_damp", &mut p.reverb_damp),
         ("reverb_width", &mut p.reverb_width),
+        ("plate_dispersion", &mut p.plate_dispersion),
+        ("plate_predelay", &mut p.plate_predelay),
         ("delay_feedback", &mut p.delay_feedback),
         ("delay_tone", &mut p.delay_tone),
         ("delay_width", &mut p.delay_width),
+        ("delay_free_hz", &mut p.delay_free_hz),
         ("chorus_rate", &mut p.chorus_rate),
         ("chorus_depth", &mut p.chorus_depth),
         ("chorus_width", &mut p.chorus_width),
@@ -1025,6 +1065,23 @@ fn effect_params_from(map: &serde_json::Map<String, serde_json::Value>) -> crate
         .and_then(Division::from_key)
     {
         p.delay_division = d;
+    }
+    // **The crossing that matters.** Without this the mode selector moves
+    // and the audio does not — the silent failure this file already warns
+    // about twice.
+    if let Some(m) = map
+        .get("echo_mode")
+        .and_then(serde_json::Value::as_str)
+        .and_then(EchoMode::from_key)
+    {
+        p.echo_mode = m;
+    }
+    if let Some(m) = map
+        .get("reverb_mode")
+        .and_then(serde_json::Value::as_str)
+        .and_then(crate::effects::ReverbMode::from_key)
+    {
+        p.reverb_mode = m;
     }
     if let Some(v) = map
         .get("phaser_stages")
@@ -1164,6 +1221,13 @@ impl DesktopApp {
     /// device or a filesystem and must not learn how.
     fn fill_recorder_state(&mut self, ctx: &egui::Context) {
         use ivory_record::take;
+
+        // The take that refused a reopen has ended, so take it now. Deferring
+        // rather than dropping it is what keeps a device change made mid-take
+        // from leaving the monitor dead for the rest of the session.
+        if self.recorder.audio_path_deferred && !self.recorder.session.state().is_active() {
+            self.open_audio_path(ctx);
+        }
 
         let root = self.app.record_root();
         let spec = self.app.export_spec();
@@ -1609,6 +1673,11 @@ impl DesktopApp {
                 self.app.scope_feed(&self.scope_buf, dt, rate);
             }
         }
+        // **Read before the state is borrowed mutably.** Both are pure
+        // functions of the settings, so hoisting them changes nothing but
+        // the borrow.
+        let project_dest = shorten_home(&self.app.project_root());
+        let export_dest = shorten_home(&self.app.export_root());
         let state = self.app.recorder_state_mut();
         state.preview = preview;
         state.camera_name = self
@@ -1635,6 +1704,7 @@ impl DesktopApp {
             state.loudness.momentary = m;
             state.loudness.short = st;
             state.loudness.integrated = i;
+            state.loudness.pair = e.loudness_stereo();
             // What the timeline is playing, lane by lane — the half the
             // theory view could never see. See `Engine::lane_sounding`.
             state.lane_sounding = e.lane_sounding();
@@ -1695,17 +1765,24 @@ impl DesktopApp {
                     peak: 0.79,
                     rms: 0.5,
                     hold: 0.9,
+                    vu: 0.0,
                 },
                 right: ivory_ui::recorder::Level {
                     peak: 0.44,
                     rms: 0.3,
                     hold: 0.55,
+                    vu: 0.0,
                 },
                 mono: false,
                 clipped: false,
             };
         }
         state.dest = shorten_home(&root);
+        // The other two standing folders, for the settings panel's PROJECT
+        // tier. Shortened the same way, because a full path in a half-row
+        // box is a path nobody can read the end of.
+        state.project_dest = project_dest;
+        state.export_dest = export_dest;
         state.folder_preview = take::folder_name(
             &take::WallTime::now_utc(),
             name.as_deref().and_then(take::sanitise_slug).as_deref(),
@@ -2214,6 +2291,13 @@ impl DesktopApp {
         // BEFORE the reconcile below, or the racks reload against the old
         // rows' knobs. Live states written down first, so what moves is
         // what was sounding.
+        // **The master's mono fold**, pushed like every other desk setting:
+        // the app owns the choice, the engine owns the buffer. Cheap enough
+        // to send unconditionally — one relaxed store against a branch and a
+        // compare.
+        if let Some(e) = self.recorder.engine.as_ref() {
+            e.set_master_mono(self.app.master_mono());
+        }
         if let Some(order) = self.app.take_desk_state_perm() {
             self.save_plugin_states_as_loaded();
             permute_insert_states_in(
@@ -2223,7 +2307,18 @@ impl DesktopApp {
                 &order,
             );
             permute_insert_states_in(self.project_state_dir(), &order);
-            self.force_insert_reload();
+            // **Only the rows that MOVED**, which is why this is not
+            // `force_insert_reload`.
+            //
+            // That marks every one of the ~450 bays on the desk — sixteen
+            // channels, the buses, the master and 128 drum pads — and the
+            // reconcile below reloads exactly one mismatched bay per frame.
+            // So a reorder tore down and re-instantiated every plugin in the
+            // session, one per frame, each one scanning a bundle and
+            // restoring its state: the owner's "when a reorder occurs of any
+            // kind -- massive delay". A row that did not move has the same
+            // plugin with the same state and nothing to do.
+            self.force_insert_reload_for(&order);
         }
         let inserts = ivory_ui::recorder::INSERTS;
         let want_at = |i: usize| self.app.insert(i / inserts, i % inserts).map(str::to_owned);
@@ -2238,9 +2333,7 @@ impl DesktopApp {
                 // saved and named by the same code — but the ENGINE renders it
                 // in `mix_channels`, not in the rack, so the bay itself is
                 // handed nothing. See `set_builtin_strip`, pushed each frame.
-                let engine_want = want.as_deref().filter(|p| {
-                    *p != ivory_ui::dialogs::BUILTIN_PATH && *p != ivory_ui::dialogs::DRUMPAD_PATH
-                });
+                let engine_want = want.as_deref().filter(|p| !ivory_ui::dialogs::is_builtin(p));
                 let path = engine_want.map(std::path::Path::new);
                 // **With the bay's saved preset, when one belongs to this
                 // plugin.** The same bargain the instrument slots have had for
@@ -2992,7 +3085,7 @@ impl DesktopApp {
             .set_file_name(&request.suggested)
             // **Start in the Projects folder** — the owner's word — and
             // let the panel wander anywhere from there.
-            .set_directory(self.app.record_root().join("Projects"));
+            .set_directory(self.app.project_root());
         dialog = dialog.set_parent(frame);
         let file = dialog.save_file();
         self.app.native_panel_closed();
@@ -3010,7 +3103,7 @@ impl DesktopApp {
     /// anybody's real music folder, so only the host bootstraps.
     #[cfg(feature = "recorder")]
     fn open_project_at_launch(&mut self) {
-        let root = self.app.record_root().join("Projects");
+        let root = self.app.project_root();
         self.app.bootstrap_project(&root);
         // The default template exists from the start — the folder New
         // clones, and the one "Save As Template" named `default` replaces.
@@ -3025,6 +3118,8 @@ impl DesktopApp {
             ivory_ui::ports::DirPurpose::RecordRoot => self.app.set_record_dir(dir),
             ivory_ui::ports::DirPurpose::ExportDir => self.app.set_export_dir(dir),
             ivory_ui::ports::DirPurpose::PluginFolder => self.app.add_plugin_folder(dir),
+            ivory_ui::ports::DirPurpose::ProjectRoot => self.app.set_project_dir(dir),
+            ivory_ui::ports::DirPurpose::ExportRoot => self.app.set_export_root(dir),
         }
     }
 
@@ -3085,63 +3180,6 @@ impl DesktopApp {
         }
     }
 
-
-    /// The pointer during a FILE DRAG, in window-local points — or `None`
-    /// when nothing is being dragged and on platforms that are not asked.
-    ///
-    /// **An OS drag produces no pointer events.** winit reports `HoveredFile`
-    /// when files enter the window and never a `CursorMoved` for the whole
-    /// drag, so `egui`'s pointer is stale or absent for exactly as long as
-    /// somebody is holding a file over the app. The first fix tracked the
-    /// pointer while the file hovered, which tracked nothing at all: there
-    /// was no position to read. So the cursor is asked of the platform.
-    ///
-    /// Only while files hover. Polling the OS for the mouse every frame of
-    /// every session to answer a question nobody asked is not a thing to do
-    /// in a paint loop.
-    fn drag_pointer(ctx: &egui::Context) -> Option<egui::Pos2> {
-        if ctx.input(|i| i.raw.hovered_files.is_empty()) {
-            return None;
-        }
-        let inner = ctx.input(|i| i.viewport().inner_rect)?;
-        let (sx, sy) = Self::os_cursor_points(ctx)?;
-        Some(egui::Pos2::new(sx - inner.min.x, sy - inner.min.y))
-    }
-
-    /// The cursor in SCREEN points, the same unit egui reports the window's
-    /// inner rect in.
-    #[cfg(target_os = "macos")]
-    fn os_cursor_points(_ctx: &egui::Context) -> Option<(f32, f32)> {
-        use core_graphics::event::CGEvent;
-        use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
-        // Core Graphics answers in global display points already — the same
-        // logical unit, Retina or not — so there is no scale to apply.
-        let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState).ok()?;
-        let event = CGEvent::new(source).ok()?;
-        let p = event.location();
-        Some((p.x as f32, p.y as f32))
-    }
-
-    /// Windows answers in physical pixels, so it is divided down.
-    #[cfg(target_os = "windows")]
-    fn os_cursor_points(ctx: &egui::Context) -> Option<(f32, f32)> {
-        use windows_sys::Win32::Foundation::POINT;
-        use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
-        let mut p = POINT { x: 0, y: 0 };
-        // SAFETY: `p` is a valid, owned POINT for the duration of the call.
-        if unsafe { GetCursorPos(&mut p) } == 0 {
-            return None;
-        }
-        let ppp = ctx.pixels_per_point().max(0.1);
-        Some((p.x as f32 / ppp, p.y as f32 / ppp))
-    }
-
-    /// Left alone elsewhere: X11 and Wayland want their own query, and the
-    /// existing pointer path is what those builds keep until one is written.
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    fn os_cursor_points(_ctx: &egui::Context) -> Option<(f32, f32)> {
-        None
-    }
 
     /// Whether a picker has to wait for the window to leave fullscreen first.
     ///
@@ -3866,9 +3904,23 @@ impl DesktopApp {
         if !spec.dir.trim().is_empty() {
             return Some(std::path::PathBuf::from(spec.dir.trim()));
         }
-        self.app
+        // **The Exports folder, in a room of the project's own.**
+        //
+        // Exports used to land in `export/` beside the project document,
+        // which put finished work in among the session's scratch and made
+        // "where are my exports" a per-project answer. They go under one
+        // roof now — see `Settings::media_root` — with a subfolder per
+        // project, because two projects both writing `master.wav` into one
+        // folder is one of them overwriting the other.
+        let name = self
+            .app
             .project_doc()
-            .and_then(|d| d.parent().map(|p| p.join("export")))
+            .and_then(|d| d.file_stem().map(|s| s.to_string_lossy().into_owned()))
+            .filter(|s| !s.is_empty());
+        Some(match name {
+            Some(n) => self.app.export_root().join(n),
+            None => self.app.export_root(),
+        })
     }
 
     /// Start a full-speed export: an OFFLINE engine, furnished exactly like
@@ -4002,9 +4054,7 @@ impl DesktopApp {
             let seat = i / inserts;
             let bay = i % inserts;
             let want = self.app.insert(seat, bay).map(str::to_owned);
-            let engine_want = want.as_deref().filter(|p| {
-                *p != ivory_ui::dialogs::BUILTIN_PATH && *p != ivory_ui::dialogs::DRUMPAD_PATH
-            });
+            let engine_want = want.as_deref().filter(|p| !ivory_ui::dialogs::is_builtin(p));
             let Some(path) = engine_want else { continue };
             let state = saved_insert_state(seat, bay, path);
             if let Err(err) = e.load_insert(
@@ -4320,7 +4370,7 @@ impl DesktopApp {
 
     /// The template shelf: `<record_root>/Projects/Templates`.
     fn templates_dir(&self) -> std::path::PathBuf {
-        self.app.record_root().join("Projects").join("Templates")
+        self.app.project_root().join("Templates")
     }
 
     /// Run whatever project action the app asked for this frame. The host
@@ -4405,7 +4455,7 @@ impl DesktopApp {
                 // nothing ever saved over it.
                 let template = self.templates_dir().join("default");
                 self.app.seed_template(&template);
-                let root = self.app.record_root().join("Projects");
+                let root = self.app.project_root();
                 // The scratch rule: an Untitled nobody SAVED is reclaimed,
                 // so New lands on "Untitled" instead of minting a pile.
                 let dir = ivory_ui::app::fresh_project_dir(&root);
@@ -4530,6 +4580,18 @@ impl DesktopApp {
     /// Make the insert reconcile revisit EVERY bay — load, reload with new
     /// state, or unload, one per frame as it always works. The sentinel can
     /// never equal a real path or an empty bay, so every slot mismatches.
+    /// The reload sentinel on the bays of the rows a permutation MOVED.
+    ///
+    /// `order[new] = old`, so a row with `order[n] == n` is a row whose
+    /// plugin, state and bays are all exactly where they were.
+    fn force_insert_reload_for(&mut self, order: &[usize]) {
+        for i in reload_slots_for(order, ivory_ui::recorder::INSERTS) {
+            if let Some(slot) = self.recorder.inserts_loaded.get_mut(i) {
+                *slot = Some("\u{1f}reload".to_owned());
+            }
+        }
+    }
+
     fn force_insert_reload(&mut self) {
         for slot in &mut self.recorder.inserts_loaded {
             *slot = Some("\u{1f}reload".to_owned());
@@ -5034,6 +5096,28 @@ impl DesktopApp {
     /// Every path that starts the engine goes through here, because a rule
     /// about ordering that only two of three callers follow is not a rule.
     fn open_audio_path(&mut self, ctx: &egui::Context) {
+        // **Refused outright while a take is running, because the ordering
+        // above CANNOT be honoured then.**
+        //
+        // `close_input` is a no-op during a take, and it has to be: swapping
+        // the device out from under a recording ends the recording. So the
+        // first line silently does nothing, `start_engine` builds an output
+        // unit with the input's IO proc still live, and that is exactly the
+        // AB-BA above — main thread inside `AudioComponentInstanceNew`
+        // holding the component lock and waiting on the HAL's, input proc
+        // holding the HAL's and waiting on the component's inside
+        // `AudioUnitGetProperty`. Both threads park forever; the window is
+        // the app, and it has to be force-quit.
+        //
+        // Nothing is lost by refusing. `open_input` declines during a take
+        // too, so the only line that would have run is the one that
+        // deadlocks — and a take cannot outlive its engine anyway, since the
+        // capture rings live in it.
+        if self.recorder.session.state().is_active() {
+            self.recorder.audio_path_deferred = true;
+            return;
+        }
+        self.recorder.audio_path_deferred = false;
         self.recorder.session.close_input();
         self.start_engine(ctx);
         self.reconcile_audio(true);
@@ -5772,17 +5856,59 @@ fn next_untitled(root: &std::path::Path, taken: &std::path::Path) -> std::path::
 /// screen right now", and the app can stay on its native windows until they
 /// are.
 ///
-/// Asked by trying to write a node and seeing whether egui had anywhere to
-/// put it: `accesskit_node_builder` answers `None` when accesskit is off.
-/// The id is this function's own and is never drawn.
+/// Asked of the PLATFORM where the platform has an answer, and not at all
+/// where it does not. See the body: the old form asked egui whether it was
+/// building an accesskit tree, which is a question about the build and not
+/// about the user.
 ///
 /// No feature gate, and that is deliberate: `eframe`'s `accesskit` is taken
 /// unconditionally in `ivory/Cargo.toml`, so a Minimal build has it too. A
 /// person using a screen reader should not have to run the build that can
 /// load arbitrary third-party code in order to be able to read the app.
-fn screen_reader_attached(ctx: &egui::Context) -> bool {
-    ctx.accesskit_node_builder(egui::Id::new("ivory-a11y-probe"), |_| ())
-        .is_some()
+fn screen_reader_attached(_ctx: &egui::Context) -> bool {
+    // **macOS: no.** The accesskit probe below is meaningless here — the
+    // adapter builds a tree whenever the feature is compiled in, so it said
+    // "a reader is attached" on every Mac, always. It was believed: this
+    // machine has VoiceOver switched off and had `screen_reader_mode: true`
+    // written into its settings file, which turned every dialog into an
+    // inline layer, disabled the detached windows, and (with the anchors
+    // still computed in screen points) threw every menu into a corner.
+    //
+    // There is no dependency-free way to ask AppKit whether VoiceOver is
+    // running — `NSWorkspace.isVoiceOverEnabled` needs objc2, which this
+    // crate does not take — so macOS does not guess. The menu row is how
+    // somebody says so, and it is a row that was always there.
+    #[cfg(target_os = "macos")]
+    {
+        false
+    }
+    // **Windows asks the system, which has a real answer.**
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            SystemParametersInfoW, SPI_GETSCREENREADER,
+        };
+        let mut on: i32 = 0;
+        // SAFETY: `on` is a valid, owned i32 for the duration of the call,
+        // and SPI_GETSCREENREADER writes exactly a BOOL through the pointer.
+        let ok = unsafe {
+            SystemParametersInfoW(
+                SPI_GETSCREENREADER,
+                0,
+                std::ptr::from_mut(&mut on).cast(),
+                0,
+            )
+        };
+        ok != 0 && on != 0
+    }
+    // **Elsewhere the probe means what it says.** On Linux egui's accesskit
+    // tree is built when AT-SPI asks for it, so Orca being up is exactly
+    // what makes this true.
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        _ctx.accesskit_node_builder(egui::Id::new("ivory-a11y-probe"), |_| ())
+            .is_some()
+    }
 }
 
 fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
@@ -5802,6 +5928,24 @@ fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result
 /// Rename the channel rows' `insert-state-<strip>-<bay>.bin` files in `dir`
 /// to follow a reorder: `order[new] = old`. Read whole, then write whole —
 /// a rename chain would eat itself on any rotation.
+/// Which insert slots a permutation actually disturbs.
+///
+/// `order[new] = old`, so a row with `order[n] == n` kept its plugin, its
+/// state and its bays and has nothing to reload. Its own function because
+/// the alternative — marking the whole desk — is what made a reorder take
+/// seconds, and a property that costs seconds when it is wrong deserves a
+/// test that does not need a window.
+fn reload_slots_for(order: &[usize], bays: usize) -> Vec<usize> {
+    let mut out = Vec::new();
+    for (new, old) in order.iter().enumerate() {
+        if new == *old {
+            continue;
+        }
+        out.extend((0..bays).map(|b| new * bays + b));
+    }
+    out
+}
+
 fn permute_insert_states_in(dir: Option<std::path::PathBuf>, order: &[usize]) {
     let Some(dir) = dir else {
         return;
@@ -5882,6 +6026,7 @@ fn deliver_formats(
 /// As [`deliver_formats`]; `rewrite_depth` re-encodes the WAVs at the
 /// spec's word size — the REALTIME pass records float and delivers copies,
 /// where the offline writers already wrote the asked depth directly.
+#[cfg(feature = "recorder")]
 fn deliver_formats_inner(
     paths: &[std::path::PathBuf],
     spec: &ivory_ui::ports::ProjectExportSpec,
@@ -6018,6 +6163,63 @@ fn shorten_home(path: &std::path::Path) -> String {
 }
 
 impl DesktopApp {
+    /// The pointer during a FILE DRAG, in window-local points — or `None`
+    /// when nothing is being dragged and on platforms that are not asked.
+    ///
+    /// The cursor in SCREEN points, the same unit egui reports the window's
+    /// inner rect in.
+    #[cfg(target_os = "macos")]
+    fn os_cursor_points(_ctx: &egui::Context) -> Option<(f32, f32)> {
+        use core_graphics::event::CGEvent;
+        use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+        // Core Graphics answers in global display points already — the same
+        // logical unit, Retina or not — so there is no scale to apply.
+        let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState).ok()?;
+        let event = CGEvent::new(source).ok()?;
+        let p = event.location();
+        Some((p.x as f32, p.y as f32))
+    }
+
+    /// Windows answers in physical pixels, so it is divided down.
+    #[cfg(target_os = "windows")]
+    fn os_cursor_points(ctx: &egui::Context) -> Option<(f32, f32)> {
+        use windows_sys::Win32::Foundation::POINT;
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+        let mut p = POINT { x: 0, y: 0 };
+        // SAFETY: `p` is a valid, owned POINT for the duration of the call.
+        if unsafe { GetCursorPos(&mut p) } == 0 {
+            return None;
+        }
+        let ppp = ctx.pixels_per_point().max(0.1);
+        Some((p.x as f32 / ppp, p.y as f32 / ppp))
+    }
+
+    /// Left alone elsewhere: X11 and Wayland want their own query, and the
+    /// existing pointer path is what those builds keep until one is written.
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    fn os_cursor_points(_ctx: &egui::Context) -> Option<(f32, f32)> {
+        None
+    }
+
+    /// **An OS drag produces no pointer events.** winit reports `HoveredFile`
+    /// when files enter the window and never a `CursorMoved` for the whole
+    /// drag, so `egui`'s pointer is stale or absent for exactly as long as
+    /// somebody is holding a file over the app. The first fix tracked the
+    /// pointer while the file hovered, which tracked nothing at all: there
+    /// was no position to read. So the cursor is asked of the platform.
+    ///
+    /// Only while files hover. Polling the OS for the mouse every frame of
+    /// every session to answer a question nobody asked is not a thing to do
+    /// in a paint loop.
+    fn drag_pointer(ctx: &egui::Context) -> Option<egui::Pos2> {
+        if ctx.input(|i| i.raw.hovered_files.is_empty()) {
+            return None;
+        }
+        let inner = ctx.input(|i| i.viewport().inner_rect)?;
+        let (sx, sy) = Self::os_cursor_points(ctx)?;
+        Some(egui::Pos2::new(sx - inner.min.x, sy - inner.min.y))
+    }
+
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         settings: Settings,
@@ -6150,6 +6352,7 @@ impl DesktopApp {
                 video_tried: false,
                 camera_rgba: None,
                 engine_retry: None,
+                audio_path_deferred: false,
                 armed_downbeat: None,
                 // Seeded from the settings, not left at None: these are the
                 // values the streams are about to be opened with, and a
@@ -6166,7 +6369,9 @@ impl DesktopApp {
         let mut me = Self {
             pending_midi: Some(pending_midi),
             painted_once: false,
+            probe_frames: 0,
             reader_seen: false,
+            #[cfg(feature = "recorder")]
             pushed_maps: None,
             pushed_auto: None,
             midi_lane,
@@ -6198,6 +6403,7 @@ impl DesktopApp {
             browse_extensions: Vec::new(),
             #[cfg(feature = "recorder")]
             track_cache: std::collections::HashMap::new(),
+            #[cfg(feature = "recorder")]
             stretch_cache: std::collections::HashMap::new(),
             #[cfg(feature = "recorder")]
             pad_cache: std::collections::HashMap::new(),
@@ -6215,22 +6421,30 @@ impl DesktopApp {
         // patch, which is what a fresh install plays anyway.
         #[cfg(feature = "recorder")]
         me.load_cartridge_at_launch();
+        #[cfg(feature = "recorder")]
         me.open_project_at_launch();
         // The one-launch sidecar shuffle, BEFORE any engine exists to load a
         // bay: the settings just crossed the v13 desk change and the
         // insert-state files are named by indices that moved.
+        // **All FOUR shuffles under one gate.** The attribute was on the
+        // first `if` alone, and an attribute on an `if` covers that `if` —
+        // so the three below it were compiled into a Minimal build that has
+        // none of the functions they call. The braces make the scope
+        // explicit rather than leaving it to the next reader to count.
         #[cfg(feature = "recorder")]
-        if me.app.take_desk_state_shift() {
-            shift_insert_states_for_v13();
-        }
-        if me.app.take_desk_state_shift_v14() {
-            shift_insert_states_for_v14();
-        }
-        if me.app.take_pad_state_shift_v18() {
-            shift_insert_states_for_v18();
-        }
-        if me.app.take_desk_state_shift_v19() {
-            shift_insert_states_for_v19();
+        {
+            if me.app.take_desk_state_shift() {
+                shift_insert_states_for_v13();
+            }
+            if me.app.take_desk_state_shift_v14() {
+                shift_insert_states_for_v14();
+            }
+            if me.app.take_pad_state_shift_v18() {
+                shift_insert_states_for_v18();
+            }
+            if me.app.take_desk_state_shift_v19() {
+                shift_insert_states_for_v19();
+            }
         }
         me
     }
@@ -6368,6 +6582,33 @@ impl eframe::App for DesktopApp {
         self.after_frame(ctx, frame);
         self.paint_splash(ctx);
         self.painted_once = true;
+        // **The geometry probe.** `IVORY_GEOM_PROBE=1` prints, once the
+        // window has settled, everything the app believes about where it is
+        // — then closes itself through the ordinary quit path, because an
+        // audio client that is killed rather than quit wedges CoreAudio for
+        // the whole machine. Diagnostic; costs one branch otherwise.
+        // Read ONCE, not sixty times a second: `var_os` walks the
+        // environment and allocates, and a diagnostic that costs something
+        // when it is off is a diagnostic that gets deleted.
+        static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *PROBE.get_or_init(|| std::env::var_os("IVORY_GEOM_PROBE").is_some()) {
+            self.probe_frames += 1;
+            if self.probe_frames == 120 {
+                let vp = ctx.input(|i| {
+                    (
+                        i.viewport().inner_rect,
+                        i.viewport().outer_rect,
+                        i.viewport().monitor_size,
+                        i.screen_rect(),
+                    )
+                });
+                eprintln!("GEOM egui inner={:?} outer={:?} mon={:?} screen={:?}", vp.0, vp.1, vp.2, vp.3);
+                eprintln!("GEOM app  {}", self.app.debug_geometry());
+                eprintln!("GEOM ppp  {}", ctx.pixels_per_point());
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            ctx.request_repaint();
+        }
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -7031,6 +7272,40 @@ impl DesktopApp {
 
 #[cfg(all(test, feature = "recorder"))]
 mod tests {
+
+    /// **A reorder reloads the rows that moved and nothing else.**
+    ///
+    /// The whole desk used to be marked — sixteen channels, the buses, the
+    /// master and 128 drum pads, some 450 bays — and the reconcile loop
+    /// reloads exactly one mismatched bay per frame, each one instantiating
+    /// a plugin and restoring its state. Dragging one track past its
+    /// neighbour therefore tore down and rebuilt every plugin in the
+    /// session: the owner's "when a reorder occurs of any kind -- massive
+    /// delay".
+    #[test]
+    fn a_reorder_only_reloads_the_rows_that_moved() {
+        let bays = 3;
+        // Track 0 dragged to position 2: rows 0, 1 and 2 move, the rest do
+        // not.
+        let mut order: Vec<usize> = (0..16).collect();
+        let ch = order.remove(0);
+        order.insert(2, ch);
+        let hit = super::reload_slots_for(&order, bays);
+        let rows: std::collections::BTreeSet<usize> =
+            hit.iter().map(|i| i / bays).collect();
+        assert_eq!(
+            rows,
+            [0usize, 1, 2].into_iter().collect(),
+            "a reorder of three rows touched {rows:?}"
+        );
+        assert_eq!(hit.len(), 3 * bays, "not every bay of a moved row moved");
+        // Nothing at all when nothing moved.
+        let still: Vec<usize> = (0..16).collect();
+        assert!(super::reload_slots_for(&still, bays).is_empty());
+        // And never past the rows the permutation names — the drum pads
+        // above the channels are not part of a channel reorder.
+        assert!(hit.iter().all(|i| i / bays < 16));
+    }
     use super::*;
 
     /// **A clip's picture covers what is on screen, at the pixels it

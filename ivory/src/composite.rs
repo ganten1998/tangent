@@ -1762,11 +1762,13 @@ mod shot {
                         peak: 0.79,
                         rms: 0.5,
                         hold: 0.9,
+                        vu: 0.5,
                     },
                     right: Level {
                         peak: 0.28,
                         rms: 0.2,
                         hold: 0.35,
+                        vu: 0.2,
                     },
                     mono: false,
                     clipped: false,

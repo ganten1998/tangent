@@ -563,6 +563,12 @@ pub enum DirPurpose {
     RecordRoot,
     /// Another place to look for VST3 bundles.
     PluginFolder,
+    /// Where PROJECTS are written — the settings panel's Project tier, and a
+    /// standing choice rather than one export's destination.
+    ProjectRoot,
+    /// Where an export lands when the export dialog names no folder. The
+    /// standing default; [`DirPurpose::ExportDir`] is this one export.
+    ExportRoot,
 }
 
 /// A source of MIDI the app picks for itself.

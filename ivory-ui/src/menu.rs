@@ -1490,16 +1490,7 @@ impl MenuState {
             }
         }
 
-        // Best-effort clamp to the monitor.
-        let mut pos = global_pos;
-        if let Some(mon) = monitor_size {
-            if pos.x + width > mon.x {
-                pos.x = (mon.x - width).max(0.0);
-            }
-            if pos.y + height > mon.y {
-                pos.y = (mon.y - height).max(0.0);
-            }
-        }
+        let pos = place(global_pos, Vec2::new(width, height), monitor_size);
 
         Self {
             pos,
@@ -1521,6 +1512,33 @@ impl MenuState {
             caps: view.caps,
         }
     }
+}
+
+/// Where a menu of `size` goes when it is summoned at `at`.
+///
+/// **Nudged onto the screen, never flipped.**
+///
+/// Flipping about the pointer — hanging the menu's bottom edge from the
+/// click when it will not fit below — is what a context menu does on most
+/// platforms, and it was tried here. It is strictly WORSE: pinning moves the
+/// menu by exactly its overflow, flipping moves it by its whole height, and
+/// the overflow is smaller than the height by definition. On the owner's
+/// screen a 478-point menu clicked forty points too low moves forty points
+/// when pinned and 478 when flipped.
+///
+/// Its own function because it is what the tests assert against, and because
+/// `open` needs a live `egui::Context` to measure text with — the arithmetic
+/// needs neither.
+pub fn place(at: Pos2, size: Vec2, monitor: Option<Vec2>) -> Pos2 {
+    let mut pos = at;
+    let Some(mon) = monitor else { return pos };
+    if pos.x + size.x > mon.x {
+        pos.x = (mon.x - size.x).max(0.0);
+    }
+    if pos.y + size.y > mon.y {
+        pos.y = (mon.y - size.y).max(0.0);
+    }
+    pos
 }
 
 /// The clickable rows, in draw order, for a test that wants to click one.
@@ -1945,6 +1963,67 @@ mod tests {
     ) -> bool {
         settle_submenu(open, pending, hovered, plain, armed, still, false, now)
     }
+
+    /// The REAL menu, at the size it really measures out at, on the owner's
+    /// own screen — the case the arithmetic above is abstract about.
+    #[test]
+    fn the_app_menu_opens_under_the_hand_on_a_real_screen() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        let _ = ctx.run(Default::default(), |_| {});
+        let mon = Vec2::new(2560.0, 1440.0);
+        let mut v = view();
+        // The band, the fretboard and the notation all ON — the shape the
+        // owner's own window is in, and the tallest the menu gets.
+        v.recorder_on = true;
+        v.fretboard_on = true;
+        v.staff_on = true;
+        v.chord_strip = true;
+        v.camera_pane_on = true;
+        let m = MenuState::open(&ctx, v, Pos2::new(900.0, 1000.0), Some(mon));
+        // Whatever it measures out at, it may not sit further from the hand
+        // than the amount by which it overflows the screen.
+        let overflow = (1000.0 + m.size.y - mon.y).max(0.0);
+        assert!(
+            1000.0 - m.pos.y <= overflow + 0.5,
+            "a {}-point menu summoned at y=1000 opened at y={} on a {}-point \
+             screen: {} points away, with {overflow} of overflow",
+            m.size.y,
+            m.pos.y,
+            mon.y,
+            1000.0 - m.pos.y
+        );
+    }
+
+    /// **A menu stays as near the hand as the screen allows.**
+    ///
+    /// It moves by its OVERFLOW and no further. Flipping about the pointer
+    /// was tried and is strictly worse: it moves the menu by its whole
+    /// height where pinning moves it by the part that does not fit.
+    #[test]
+    fn a_menu_moves_no_further_than_it_has_to() {
+        let mon = Some(Vec2::new(2560.0, 1440.0));
+        let size = Vec2::new(300.0, 560.0);
+        // Room below: it opens exactly where it was asked to.
+        let at = Pos2::new(400.0, 200.0);
+        assert_eq!(place(at, size, mon), at);
+        // No room: on screen, and moved by exactly the overflow.
+        let low = Pos2::new(400.0, 1200.0);
+        let p = place(low, size, mon);
+        assert!((p.y + size.y - 1440.0).abs() < 0.5, "{p:?} is not on the screen");
+        assert!((low.y - p.y - 320.0).abs() < 0.5, "moved further than it had to");
+        // The other axis, the same rule.
+        let right = Pos2::new(2500.0, 200.0);
+        assert!((place(right, size, mon).x + size.x - 2560.0).abs() < 0.5);
+        // A menu taller than the screen is pinned to the top rather than
+        // pushed off it.
+        let huge = Vec2::new(300.0, 1600.0);
+        assert!(place(Pos2::new(400.0, 900.0), huge, mon).y >= 0.0);
+        // No monitor known: nothing is moved. A guess is worse than the
+        // place the user pointed at.
+        assert_eq!(place(low, size, None), low);
+    }
+
 
     fn view() -> MenuView {
         MenuView {

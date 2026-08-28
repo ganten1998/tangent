@@ -61,6 +61,30 @@ pub struct LaneView<'a> {
     pub soloed: bool,
     /// This lane's MIDI is sent to the theory view — the **T** switch.
     pub to_theory: bool,
+    /// **This lane is a FOLDER** — the little box at its bottom-left is lit
+    /// and the tracks under it are its children.
+    pub is_folder: bool,
+    /// **This lane is INSIDE the folder above it** — the one thing that draws
+    /// an indent. A folder itself never carries one: the indent says "I am
+    /// contained", and the container is not.
+    pub in_folder: bool,
+    /// This lane is a folder and it is SHUT: its children are not drawn and
+    /// the arrow points right.
+    pub folder_shut: bool,
+    /// How many children this folder holds — written beside a shut one, so a
+    /// closed group says what it is hiding rather than just vanishing.
+    pub folder_count: usize,
+    /// **This lane is not drawn at all**: it lives inside a shut folder. Its
+    /// row is never pushed, so nothing is laid out, hit or painted for it.
+    pub hidden: bool,
+    /// **Silent because the folder holding it is muted** — or, on a folder,
+    /// because the folder itself is.
+    ///
+    /// Its own M switch is untouched and draws untouched; this only dims the
+    /// lane. Without it a child of a muted folder is a track that makes no
+    /// sound with its mute clearly off, which reads as a fault rather than as
+    /// a group.
+    pub folder_silent: bool,
     /// Linear, as the mixer fader sits. The header knob is the same value.
     pub gain: f32,
     /// 0..=1, the strip's send — the second dial.
@@ -119,6 +143,21 @@ pub struct AutoView<'a> {
 /// Everything the arrangement draws, pushed in.
 pub struct ArrangeView<'a> {
     pub lanes: [LaneView<'a>; CHANNELS],
+    /// The MASTER's level — linear, as the desk's fader sits.
+    pub master_gain: f32,
+    /// What it is making right now, for the slim meter beside the knob.
+    pub master_peak: [f32; 2],
+    /// Its colour, as an index into `STRIP_COLORS` — the same plate its
+    /// mixer strip wears, so the two views agree about what the master is.
+    pub master_color: usize,
+    /// Whether the master's row is drawn. `Cmd`/`Ctrl+M`; shown by default.
+    pub show_master_row: bool,
+    /// The master rack's six short names — empty for an empty bay.
+    ///
+    /// Six, not three: the master carries two racks. Which of its slots lives
+    /// in which is `recorder::seat_bay`'s business and not this panel's, so
+    /// what arrives here is already in strip order, top to bottom.
+    pub master_inserts: [&'a str; crate::recorder::INSERTS * 2],
     /// The first lane shown — the arrangement has more lanes than fit, so a
     /// window of them shows and this says which. Clamped by the app.
     pub lane_scroll: usize,
@@ -178,7 +217,12 @@ pub struct ArrangeView<'a> {
     /// The time selection, drawn over lanes and ruler.
     pub time_sel: Option<(f64, f64)>,
     /// The selected channel: its header lights slightly.
+    ///
+    /// The PRIMARY. Everything selected is in [`Self::selected_tracks`].
     pub selected_channel: Option<usize>,
+    /// Every selected channel, all of which wear the rim. See
+    /// `recorder_panel::selection_rim`.
+    pub selected_tracks: &'a [usize],
     /// The band's own wood, so the two surfaces are one instrument.
     pub wood: (u8, u8, u8),
     /// The strip face — the same theme role the mixer's bays wear, so a
@@ -196,6 +240,10 @@ pub struct ArrangeView<'a> {
 pub enum Hit {
     /// The NUMBER cell: the reorder handle — drag a track to another row.
     HdrNumber(usize),
+    /// The folder box: make this track a folder, or stop it being one.
+    HdrFolder(usize),
+    /// The arrow beside it: hide this folder's children, or show them.
+    HdrCollapse(usize),
     /// One of a track's three insert BAYS — the mixer's own door, here.
     HdrBay(usize, usize),
     /// The Routing button under a lane's dials: open the routing window.
@@ -204,6 +252,15 @@ pub enum Hit {
     Arm(usize),
     Mute(usize),
     Solo(usize),
+    /// One of the MASTER row's six bays: `(column, slot)`.
+    ///
+    /// Its own variant rather than `HdrBay(MASTER_COLUMN, ..)`, because every
+    /// `HdrBay` handler reads its first field as a strip index — and the
+    /// master's column number is a perfectly valid one belonging to somebody
+    /// else, so overloading it would have silently edited another rack's
+    /// plugins. The slot is in STRIP order; `recorder::seat_bay` turns it into
+    /// the rack it actually lives in.
+    BusBay(usize, usize),
     /// The header's gain knob — draggable, vertical, the mixer fader's twin.
     Gain(usize),
     /// A clip's body: select it, and a drag MOVES it along its lane.
@@ -273,6 +330,10 @@ pub enum Hit {
     HeaderGrip,
     /// The circled plus on an EMPTY lane's header: add a bare track here.
     HdrAdd(usize),
+    /// A BUS row's level — the master's or the click's. Carries the MIXER
+    /// COLUMN, so the drag goes through the desk's own fader hit rather
+    /// than a second road to the same number. See [`Bus::column`].
+    BusGain(usize),
 }
 
 impl Hit {
@@ -308,6 +369,19 @@ const TEMPO_LANE_SHARE: f32 = 0.55;
 /// off must not shrink to make space for it.
 const AUTO_LANE_SHARE: f32 = 0.55;
 
+/// The master row's height, as a fraction of a track's.
+///
+/// **Half, at the owner's word.** It carries a name, a level and a rack and
+/// none of the things that make a track tall — no clips land on it, and there
+/// is no waveform to look at. Every point it does not take is a point the
+/// tracks get back.
+const MASTER_ROW_SHARE: f32 = 0.5;
+
+/// The MIXER COLUMN the master is, so its level goes through the desk's own
+/// fader hit rather than a second road to the same number. See
+/// `recorder::Column::desk_index`, where the convention is written down.
+pub const MASTER_COLUMN: usize = CHANNELS + 1;
+
 /// The ruler's height in points. Short — it is a scale, not a band.
 const RULER_H: (f32, f32, f32) = (0.06, 16.0, 24.0);
 
@@ -335,7 +409,39 @@ pub enum RowKind {
     Tempo,
     /// An automation curve under the track it belongs to.
     Automation(usize),
+    /// **The MASTER, above the tracks.**
+    ///
+    /// The desk draws a strip for it and the timeline drew none, so a
+    /// session's output level was reachable from one view and not the other.
+    /// A FULL track's height, wearing the mixer's own colours, and it cannot
+    /// be removed — a session always has an output.
+    ///
+    /// **The CLICK had a row here and lost it.** It was tried at half height
+    /// beside the master, and the owner's call was that the metronome is not
+    /// a thing you arrange against; the desk is where its level lives.
+    ///
+    /// `Cmd`/`Ctrl+M` hides it. Shown by default, because a control nobody
+    /// can find is a control nobody has.
+    Master,
 }
+
+/// **How far a track inside a folder steps to the right.**
+///
+/// Small on purpose. The indent is the ONLY thing that says "contained", so
+/// it has to be legible at a glance — but the header is already tight enough
+/// that the shedding rules exist, and every point spent here is a point the
+/// name gives up. Ten reads clearly beside an un-indented neighbour and costs
+/// the title roughly one character.
+pub const FOLDER_INDENT: f32 = 10.0;
+
+/// **How much of a folder's row counts as its bottom EDGE** — the strip a
+/// track is dropped on to snap into it, as a fraction of the row's height.
+///
+/// A quarter. Small enough that an ordinary reorder onto a folder row still
+/// reorders, which is the gesture somebody arriving without knowing about
+/// folders will make; large enough to hit without aiming, which is the
+/// gesture somebody who knows will make.
+pub const FOLDER_DROP_EDGE: f32 = 0.25;
 
 /// One row of the timeline, and where it is on both sides of the grip.
 #[derive(Debug, Clone, Copy)]
@@ -379,6 +485,113 @@ pub struct Layout {
     pub rows: Vec<Row>,
     pub lane_rows: [Rect; CHANNELS],
     pub header_rows: [HeaderRow; CHANNELS],
+    /// The master's header cells. `NONE` when the row is hidden.
+    pub master_row: BusRow,
+}
+
+
+/// A bus row's header: what it is, and the one control it has.
+///
+/// **A name and a level, and nothing else.** A track's header carries an
+/// arm, a mute, a solo, three dials and a rack because a track is a source;
+/// these two are the ends of the signal path and the only thing anybody
+/// reaches for on either is how loud it is. Half a track's height would not
+/// hold the rest anyway.
+#[derive(Debug, Clone, Copy)]
+pub struct BusRow {
+    pub panel: Rect,
+    pub name: Rect,
+    pub knob: Rect,
+    /// The word "VOL" beside the dial. The track rows write their dial's
+    /// name under it; this row is half a track tall and has no room below,
+    /// so it sits to the left of the meter instead.
+    pub vol_label: Rect,
+    pub meter: Rect,
+    /// The master's rack, in strip order. `Rect::NOTHING` where the row is too
+    /// short or too narrow to carry one — the same rule the track headers use,
+    /// so a rack that cannot be read is not drawn rather than drawn as a smudge.
+    pub bays: [Rect; crate::recorder::INSERTS * 2],
+}
+
+impl BusRow {
+    const NONE: Self = Self {
+        panel: Rect::NOTHING,
+        name: Rect::NOTHING,
+        knob: Rect::NOTHING,
+        vol_label: Rect::NOTHING,
+        meter: Rect::NOTHING,
+        bays: [Rect::NOTHING; crate::recorder::INSERTS * 2],
+    };
+
+    fn of(row: Rect) -> Self {
+        let r = row.shrink2(Vec2::new(3.0, 1.0));
+        if !r.is_positive() {
+            return Self { panel: row, ..Self::NONE };
+        }
+        let h = r.height();
+        // The knob keeps the right end, the meter stands inside it, and the
+        // name takes what is left — the track header's own order, so the two
+        // kinds of row read as one list.
+        let d = (h * 0.86).clamp(9.0, 20.0);
+        let knob = Rect::from_center_size(
+            Pos2::new(r.right() - d * 0.5 - 2.0, r.center().y),
+            Vec2::splat(d),
+        );
+        let meter = Rect::from_min_max(
+            Pos2::new(knob.left() - 8.0, r.top() + h * 0.18),
+            Pos2::new(knob.left() - 3.0, r.bottom() - h * 0.18),
+        );
+        // Shed below a width that cannot carry the word, like every other
+        // label on this panel.
+        let vol_label = {
+            let w = 22.0_f32;
+            let left = meter.left() - 3.0 - w;
+            if left > r.left() + 30.0 {
+                Rect::from_min_max(
+                    Pos2::new(left, r.top() + h * 0.18),
+                    Pos2::new(meter.left() - 3.0, r.bottom() - h * 0.18),
+                )
+            } else {
+                Rect::NOTHING
+            }
+        };
+        // **The name keeps the left, the rack takes the middle.** A track's
+        // header stacks its name over its bays; this row is half a track tall
+        // and has no room to stack anything, so the two sit side by side —
+        // which is also how the mixer strip reads left to right.
+        let left = Rect::from_min_max(
+            Pos2::new(r.left(), r.top()),
+            Pos2::new(
+                if vol_label.is_positive() { vol_label.left() } else { meter.left() } - 4.0,
+                r.bottom(),
+            ),
+        );
+        let n = crate::recorder::INSERTS * 2;
+        let name_w = (left.width() * 0.28).min(70.0);
+        let name = Rect::from_min_max(
+            left.min,
+            Pos2::new(left.left() + name_w, left.bottom()),
+        );
+        let rack = Rect::from_min_max(
+            Pos2::new(name.right() + 4.0, left.top() + h * 0.14),
+            Pos2::new(left.right(), left.bottom() - h * 0.14),
+        );
+        let bays = std::array::from_fn(|b| {
+            let w = (rack.width() - 2.0 * (n as f32 - 1.0)) / n as f32;
+            // Below this a chip carries no readable word, and six unreadable
+            // chips are worse than none: they take the presses a rack would
+            // and say nothing about what is in them.
+            if w < 14.0 || !rack.is_positive() {
+                return Rect::NOTHING;
+            }
+            let x0 = rack.left() + b as f32 * (w + 2.0);
+            Rect::from_min_max(
+                Pos2::new(x0, rack.top()),
+                Pos2::new(x0 + w, rack.bottom()),
+            )
+        });
+        Self { panel: row, name, knob, vol_label, meter, bays }
+    }
 }
 
 impl Layout {
@@ -424,6 +637,22 @@ pub struct HeaderRow {
     pub routing: Rect,
     /// The circled plus, on empty lanes alone.
     pub add: Rect,
+    /// **The collapse arrow**, on a FOLDER only, immediately right of the box.
+    /// `NOTHING` on every other track.
+    ///
+    /// A second target rather than a second meaning for the box: the box is
+    /// "is this a group", the arrow is "am I looking at it". One control that
+    /// did both would mean un-collapsing a folder to stop it being one.
+    pub collapse: Rect,
+    /// **The FOLDER box, at the header's bottom-left.**
+    ///
+    /// Bottom-left because it is the only corner nothing else claims — the
+    /// number and the arm keep fixed seats at the top-left, the dials and
+    /// the switches own the right, and the input chip runs under the name.
+    /// It is also where a hand goes looking for structure rather than for a
+    /// control: below the track's own row of things, at the edge the indent
+    /// is measured from.
+    pub folder: Rect,
 }
 
 impl HeaderRow {
@@ -432,6 +661,8 @@ impl HeaderRow {
         number: Rect::NOTHING,
         arm: Rect::NOTHING,
         theory: Rect::NOTHING,
+        folder: Rect::NOTHING,
+        collapse: Rect::NOTHING,
         name: Rect::NOTHING,
         knob: Rect::NOTHING,
         send: Rect::NOTHING,
@@ -466,6 +697,7 @@ impl Layout {
                 rows: Vec::new(),
                 lane_rows: [Rect::NOTHING; CHANNELS],
                 header_rows: [HeaderRow::NONE; CHANNELS],
+                master_row: BusRow::NONE,
             };
         }
         let (share, lo, hi) = HEADER_W;
@@ -515,7 +747,18 @@ impl Layout {
         // the window is `NOTHING` — not drawn, not hit, and clips on it
         // resolve to nothing through `clip_rect`'s `is_positive` filter.
         let visible = view.visible_lanes.clamp(1, CHANNELS);
-        let lane_h = lanes_area.height() / visible as f32;
+        // **The bus rows are ADDED to the stack, not taken out of it.**
+        //
+        // The master and the click are half a track each — one track's
+        // height between them — and dividing the area by `visible` alone
+        // would have spent that height on them, so a window set to show one
+        // lane showed none at all. `visible` still means TRACKS; the pair
+        // costs every track a slice of its height instead, which is the same
+        // bargain an open automation row already makes.
+        let lane_h =
+            lanes_area.height()
+                / (visible as f32
+                    + if view.show_master_row { MASTER_ROW_SHARE } else { 0.0 });
         let first = view.lane_scroll.min(CHANNELS.saturating_sub(visible));
 
         // **The rows, stacked in order, and the arrays derived from them.**
@@ -559,7 +802,20 @@ impl Layout {
         if view.show_tempo_lane {
             push(RowKind::Tempo, lane_h * TEMPO_LANE_SHARE, &mut y, &mut rows);
         }
+        // **The master and the click, above the channels.** Half a track
+        // each, so the two together take exactly one track's height and the
+        // pair reads as one band rather than as two short tracks.
+        if view.show_master_row {
+            push(RowKind::Master, lane_h * MASTER_ROW_SHARE, &mut y, &mut rows);
+        }
         for i in first..CHANNELS {
+            // A track inside a SHUT folder is not laid out at all: no row, so
+            // nothing is drawn, nothing is hit, and its clips resolve to
+            // nothing through `clip_rect`'s own `is_positive` filter — the
+            // same road a scrolled-off lane already takes.
+            if view.lanes.get(i).is_some_and(|l| l.hidden) {
+                continue;
+            }
             push(RowKind::Track(i), lane_h, &mut y, &mut rows);
             if view.lanes.get(i).is_some_and(|l| l.automation_open) {
                 push(RowKind::Automation(i), lane_h * AUTO_LANE_SHARE, &mut y, &mut rows);
@@ -576,13 +832,22 @@ impl Layout {
                 .find(|r| r.kind == RowKind::Track(want))
                 .map_or(Rect::NOTHING, |r| r.header)
         };
+        let master_row = rows
+            .iter()
+            .find(|r| r.kind == RowKind::Master)
+            .filter(|r| r.header.is_positive())
+            .map_or(BusRow::NONE, |r| BusRow::of(r.header));
         let lane_rows = std::array::from_fn(lane_of);
         let header_rows = std::array::from_fn(|i| {
             let row = header_of(i);
             let Some(lane) = view.lanes.get(i).filter(|_| row.is_positive()) else {
                 return HeaderRow::NONE;
             };
-            Self::header_row(row, lane.used)
+            Self::header_row(
+                row,
+                lane.used,
+                if lane.in_folder { FOLDER_INDENT } else { 0.0 },
+            )
         });
         // **The toolbar, in the corner cell** — the room above the track
         // list, before the ruler's first tick. Four small controls: the
@@ -639,13 +904,26 @@ impl Layout {
             rows,
             lane_rows,
             header_rows,
+            master_row,
         }
     }
 
     /// The cells across one header, REAPER's row at Tangent's density:
     /// number, arm dot, name, gain knob, slim meter, M/S.
-    fn header_row(row: Rect, used: bool) -> HeaderRow {
+    fn header_row(row: Rect, used: bool, indent: f32) -> HeaderRow {
+        // **The indent moves the CONTENTS, and `panel` keeps the whole row.**
+        //
+        // The panel is what a press is tested against and what the plate is
+        // drawn from; indenting it would make the strip of wood on the left
+        // dead to the pointer, so a track's own row would stop answering
+        // along the edge that says it is in a folder. The contents step
+        // right; the row is still the row.
         let r = row.shrink2(Vec2::new(3.0, 2.0));
+        let r = if indent > 0.0 && r.width() > indent + 40.0 {
+            Rect::from_min_max(Pos2::new(r.left() + indent, r.top()), r.max)
+        } else {
+            r
+        };
         if !r.is_positive() {
             return HeaderRow { panel: row, ..HeaderRow::NONE };
         }
@@ -667,13 +945,6 @@ impl Layout {
             return HeaderRow { panel: row, input, add, ..HeaderRow::NONE };
         }
         let h = r.height();
-        let cut = |a: f32, b: f32| {
-            Rect::from_min_max(
-                Pos2::new(r.left() + r.width() * a, r.top()),
-                Pos2::new(r.left() + r.width() * b, r.bottom()),
-            )
-        };
-        let square = |cell: Rect, s: f32| Rect::from_center_size(cell.center(), Vec2::splat(s));
         // The number and the arm keep FIXED seats at the left — the
         // proportional cuts walked the dot into the track title whenever
         // the header widened.
@@ -825,8 +1096,39 @@ impl Layout {
                 Pos2::new(x0 + w, bays_row.bottom()),
             )
         });
+        // **The folder box: bottom-left, under the number.**
+        //
+        // Sized off the row like every other switch, and SHED like them too —
+        // a header squeezed short enough that the box would collide with the
+        // number's own cell gets no box rather than an overlapping one. The
+        // shedding order this file already keeps drops dials, then bays, then
+        // the chip, never the name; this joins at the front of that list
+        // because it is structure rather than a control you reach for while
+        // playing.
+        let folder = {
+            let d = (h * 0.30).clamp(8.0, 12.0);
+            let top = r.bottom() - d;
+            if top > number.top() + 2.0 && d >= 8.0 {
+                Rect::from_min_size(Pos2::new(r.left(), top), Vec2::splat(d))
+            } else {
+                Rect::NOTHING
+            }
+        };
+        // The arrow, immediately right of the box and the same height. Only
+        // laid out where the box was — they shed together, because an arrow
+        // with no folder beside it is a control for a thing that is not there.
+        let collapse = if folder.is_positive() && r.width() > 60.0 {
+            Rect::from_min_size(
+                Pos2::new(folder.right() + 2.0, folder.top()),
+                folder.size(),
+            )
+        } else {
+            Rect::NOTHING
+        };
         HeaderRow {
             theory,
+            folder,
+            collapse,
             panel: row,
             number,
             arm,
@@ -845,6 +1147,79 @@ impl Layout {
             routing,
             add: Rect::NOTHING,
         }
+    }
+}
+/// **One dial**, the timeline's own: a ring, a coloured cap, and a needle
+/// through 270 degrees from the seven-o'clock position.
+///
+/// A free function rather than the closure it used to be, because the MASTER
+/// wants exactly this control and is drawn before the header loop the closure
+/// lived in. It was a white bar in a slot up there — the one control on the
+/// timeline that looked like nothing else on it — and the owner's word is
+/// that the master's level is a level like any other.
+fn dial(painter: &Painter, cell: Rect, t: f32, cap: Color32, ring: Color32, needle: Color32) {
+    if !cell.is_positive() {
+        return;
+    }
+    let kc = cell.center();
+    let kr = cell.width() * 0.5;
+    painter.circle_filled(kc, kr, ring);
+    painter.circle_filled(kc, kr * 0.82, cap);
+    let sweep = std::f32::consts::PI * 1.5;
+    let a = std::f32::consts::PI * 0.75 + sweep * t.clamp(0.0, 1.0);
+    painter.line_segment(
+        [kc, Pos2::new(kc.x + a.cos() * kr * 0.8, kc.y + a.sin() * kr * 0.8)],
+        Stroke::new((kr * 0.22).max(1.5), needle),
+    );
+}
+
+/// The blue a VOLUME dial wears, wherever one is drawn.
+const DIAL_VOLUME: Color32 = Color32::from_rgb(0x1C, 0x6F, 0xD6);
+
+/// The MASTER's cap. Black, and the only dial on the timeline that is.
+///
+/// Not pure black: the needle drawn across it is the row's own ink, and on a
+/// dark theme an ink-on-black needle is a needle nobody can find. This is
+/// dark enough to read as black beside the channels' blue and light enough
+/// that the needle still stands off it.
+const DIAL_MASTER: Color32 = Color32::from_rgb(0x14, 0x13, 0x12);
+
+
+/// One bus row's level dial: the track headers' own dial, drawn from a
+/// free function because the bus rows are painted before the header loop
+/// that owns the closure version.
+/// The master's level, as a black slot with a white bar in it.
+///
+/// **Not a dial**, at the owner's word. The master's plate is its own colour —
+/// red by default — and a dial drawn in the plate's ink sat on that red as one
+/// more round red thing. A slot reads as a level at a glance and at half a
+/// track's height, where a dial that small is a dot with a scratch on it.
+///
+/// The two colours are FIXED, the way `VU_FACE` is and for the same reason:
+/// this is an instrument let into the panel rather than a region of it, and a
+/// near-black slot with a near-white bar means the same thing on all sixteen
+/// themes. They are not the theme's ink, so they cannot be dragged dark-on-dark
+/// by a plate somebody painted.
+fn bus_strip(painter: &Painter, cell: Rect, t: f32) {
+    /// The slot, and the bar in it.
+    const SLOT: Color32 = Color32::from_rgb(0x0E, 0x0D, 0x0C);
+    const BAR: Color32 = Color32::from_rgb(0xF2, 0xEE, 0xE4);
+    let slot = cell.shrink2(Vec2::new(cell.width() * 0.18, 1.5));
+    if !slot.is_positive() {
+        return;
+    }
+    painter.rect_filled(slot, 1.5, SLOT);
+    // Fills upward, the way a fader reads.
+    let h = slot.height() * t.clamp(0.0, 1.0);
+    if h > 0.5 {
+        painter.rect_filled(
+            Rect::from_min_max(
+                Pos2::new(slot.left() + 1.0, slot.bottom() - h),
+                Pos2::new(slot.right() - 1.0, slot.bottom() - 1.0),
+            ),
+            1.0,
+            BAR,
+        );
     }
 }
 
@@ -987,6 +1362,30 @@ pub fn clip_rect(rect: Rect, view: &ArrangeView<'_>, clip: &ClipView<'_>) -> Rec
 /// Clips first, smallest target first — fade corner, then edge, then body —
 /// then the ruler and the lane's empty room. Later clips win over earlier
 /// ones where they overlap, because later is what was added on top.
+/// **The band at the top of a clip that the NAME occupies.**
+///
+/// The name is drawn at `r.top() + 2.0` in a font sized off the row, and the
+/// note miniature filled the whole clip — so on a MIDI item the notes ran
+/// straight through the letters and neither could be read. One function, used
+/// by the name, the miniature and the empty item's dashed staff, so the three
+/// cannot disagree about where the title ends.
+///
+/// Zero when there is no name drawn (a clip too narrow for one) or when
+/// reserving the band would leave nothing to draw notes in — a squeezed clip
+/// is better as a readable smear of notes than as a title with no picture.
+fn clip_name_band(r: Rect) -> f32 {
+    if r.width() < 30.0 {
+        return 0.0;
+    }
+    let font = (r.height() * 0.22).clamp(8.0, 11.0);
+    let band = 2.0 + font + 1.5;
+    if r.height() - band < 6.0 {
+        0.0
+    } else {
+        band
+    }
+}
+
 /// The clip's notes as a miniature: pitch spread across the clip's height
 /// (padded to at least an octave so one note does not fill the box), each
 /// note a small bar over its own span of the drawn length.
@@ -1020,7 +1419,16 @@ fn draw_note_miniature(
         }
     }
     let span = f32::from(hi - lo).max(1.0);
-    let inner = r.shrink(2.0);
+    // **Under the title, not through it.** See `clip_name_band`.
+    let inner = {
+        let base = r.shrink(2.0);
+        let band = clip_name_band(r);
+        if band > 0.0 && base.height() > band {
+            Rect::from_min_max(Pos2::new(base.left(), base.top() + band), base.max)
+        } else {
+            base
+        }
+    };
     if !inner.is_positive() {
         return;
     }
@@ -1068,6 +1476,16 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
     if l.grip.is_positive() && l.grip.contains(pos) {
         return Some(Hit::HeaderGrip);
     }
+    // **The bus rows first**, before the tracks: they sit above them and a
+    // press on one must not fall through to the lane beneath.
+    if l.master_row.knob.is_positive() && l.master_row.knob.contains(pos) {
+        return Some(Hit::BusGain(MASTER_COLUMN));
+    }
+    for (b, cell) in l.master_row.bays.iter().enumerate() {
+        if cell.is_positive() && cell.contains(pos) {
+            return Some(Hit::BusBay(MASTER_COLUMN, b));
+        }
+    }
     for (i, row) in l.header_rows.iter().enumerate() {
         for (r, hit) in [
             (row.arm, Hit::Arm(i)),
@@ -1080,6 +1498,12 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
             (row.input, Hit::HdrInput(i)),
             (row.add, Hit::HdrAdd(i)),
             (row.name, Hit::HdrName(i)),
+            // **Before the NUMBER, and the order is load-bearing.** The box
+            // sits at the header's bottom-left, inside the number cell's own
+            // column; the number is the reorder handle, so a box tested after
+            // it would never be reached and clicking it would start a drag.
+            (row.folder, Hit::HdrFolder(i)),
+            (row.collapse, Hit::HdrCollapse(i)),
             (row.number, Hit::HdrNumber(i)),
         ] {
             if r.is_positive() && r.contains(pos) {
@@ -1284,6 +1708,373 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
     None
 }
 
+
+/// **Every DISCRETE control on the timeline, in reading order.**
+///
+/// The arrangement's `hit_test` cannot be walked backwards the way the
+/// desk's can: half of what it answers is COMPUTED from the point — a
+/// second on a lane, a bar under the chip strip, a bpm on the tempo
+/// curve — and those have no rectangle to hand a keyboard. What is left
+/// does: the toolbar, the header cells, and the clips.
+///
+/// So this enumerates that half, and it is checked against `hit_test`
+/// rather than trusted: `every_target_is_the_hit_it_claims` presses each
+/// rect's centre and asserts the panel answers with the hit named here.
+/// A cell that moves in one and not the other fails that test.
+///
+/// Reading order, because **allocation order is tab order**: the toolbar,
+/// then each row from the top — a track's header cells left to right,
+/// then the clips standing on it.
+pub fn targets(rect: Rect, view: &ArrangeView<'_>) -> Vec<(Rect, Hit)> {
+    let l = Layout::new(rect, view);
+    let mut out: Vec<(Rect, Hit)> = Vec::new();
+    let mut push = |r: Rect, hit: Hit| {
+        if r.is_positive() {
+            out.push((r, hit));
+        }
+    };
+    for (r, hit) in [
+        (l.tool_met, Hit::ToolMetronome),
+        (l.tool_snap, Hit::ToolSnap),
+        (l.tool_tempo, Hit::ToolTempoLane),
+        (l.tool_grid, Hit::ToolGrid),
+        (l.tool_nav, Hit::ToolNav),
+        (l.grip, Hit::HeaderGrip),
+    ] {
+        push(r, hit);
+    }
+    push(l.master_row.knob, Hit::BusGain(MASTER_COLUMN));
+    for (b, cell) in l.master_row.bays.iter().enumerate() {
+        push(*cell, Hit::BusBay(MASTER_COLUMN, b));
+    }
+    for row in &l.rows {
+        match row.kind {
+            RowKind::Tempo => push(row.header, Hit::TempoHeader),
+            RowKind::Master => {}
+            RowKind::Automation(lane) => push(row.header, Hit::AutoParamPick(lane)),
+            RowKind::Track(i) => {
+                let Some(hdr) = l.header_rows.get(i) else { continue };
+                // Left to right across the header: the handle, the two
+                // dots, the name column, the dials, then the switches at
+                // the right end.
+                for (r, hit) in [
+                    (hdr.number, Hit::HdrNumber(i)),
+                    (hdr.folder, Hit::HdrFolder(i)),
+                    (hdr.collapse, Hit::HdrCollapse(i)),
+                    (hdr.arm, Hit::Arm(i)),
+                    (hdr.theory, Hit::ToTheory(i)),
+                    (hdr.add, Hit::HdrAdd(i)),
+                    (hdr.name, Hit::HdrName(i)),
+                    (hdr.input, Hit::HdrInput(i)),
+                ] {
+                    push(r, hit);
+                }
+                for (b, r) in hdr.bays.iter().enumerate() {
+                    push(*r, Hit::HdrBay(i, b));
+                }
+                for (r, hit) in [
+                    (hdr.pan, Hit::Pan(i)),
+                    (hdr.knob, Hit::Gain(i)),
+                    (hdr.send, Hit::Send(i)),
+                    (hdr.routing, Hit::HdrRouting(i)),
+                    (hdr.mute, Hit::Mute(i)),
+                    (hdr.solo, Hit::Solo(i)),
+                ] {
+                    push(r, hit);
+                }
+                // The clips standing on this lane, left to right. A clip
+                // being RECORDED is a picture and not a row — `hit_test`
+                // refuses it too.
+                let mut on_lane: Vec<&ClipView<'_>> = view
+                    .clips
+                    .iter()
+                    .filter(|c| c.lane == i && !c.recording)
+                    .collect();
+                on_lane.sort_by(|a, b| {
+                    a.start_s.partial_cmp(&b.start_s).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                for clip in on_lane {
+                    // **The BODY's own rectangle, not the clip's.** The
+                    // trim edges and the fade corners are cut out of the
+                    // ends, and a centre offered as "the clip" that landed
+                    // on an edge would hand a keyboard a trim it never
+                    // asked for. A clip too narrow to have a body is one
+                    // there is nothing to press.
+                    let r = clip_rect(rect, view, clip);
+                    if !r.is_positive() {
+                        continue;
+                    }
+                    let edge = EDGE_W.min(r.width() * 0.2);
+                    let body = Rect::from_min_max(
+                        Pos2::new(r.left() + edge + 0.5, r.top()),
+                        Pos2::new(r.right() - edge - 0.5, r.bottom()),
+                    );
+                    push(body, Hit::ClipBody(clip.id));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Everything on the timeline a keyboard can reach and a screen reader can
+/// say.
+///
+/// Built from [`targets`], so this cannot disagree with `hit_test` about
+/// where a control is.
+///
+/// **Named by their TRACK, always** — the desk's rule, and the arrangement
+/// needs it more: sixteen rows of identical dials read as sixteen identical
+/// labels, and the row is the only thing that tells them apart.
+///
+/// Two things here are READ rather than operated, and they are the half that
+/// makes the view useful rather than merely operable: the clips, which are
+/// the song, and the dial readouts. A timeline a blind student cannot read
+/// the shape of has been made navigable and not useful.
+pub fn a11y_nodes(rect: Rect, view: &ArrangeView<'_>) -> Vec<crate::a11y::Node> {
+    use crate::a11y::{Node, Travel};
+    let mut out = Vec::new();
+    let up = |norm: f32| Travel { norm: norm.clamp(0.0, 1.0), up: true };
+    // The name a person would use for a row, whether or not it is a track
+    // yet. Never an empty string — a node labelled "" is a node a reader
+    // announces as nothing at all.
+    let who = |i: usize| -> String {
+        match view.lanes.get(i) {
+            Some(l) if !l.name.is_empty() => l.name.to_owned(),
+            _ => format!("Track {}", i + 1),
+        }
+    };
+    // Where a clip sits, in the bars the ruler prints — never in seconds.
+    // "36.4 seconds" is a readout that has to be decoded.
+    let bars = |from_s: f64, len_s: f64| {
+        let a = bar_of(view, from_s) + 1;
+        let b = bar_of(view, from_s + len_s.max(0.0)) + 1;
+        if a == b {
+            format!("bar {a}")
+        } else {
+            format!("bar {a} to {b}")
+        }
+    };
+    for (r, hit) in targets(rect, view) {
+        let id = egui::Id::new(("arrangement", format!("{hit:?}")));
+        let node = match hit {
+            // ── the toolbar ───────────────────────────────────────────
+            Hit::ToolMetronome => Node::toggle(id, r, "Metronome", view.metronome_on),
+            Hit::ToolSnap => Node::toggle(id, r, "Snap to grid", view.snap_on),
+            Hit::ToolTempoLane => Node::toggle(id, r, "Tempo lane", view.show_tempo_lane),
+            // **A slider and not a button**, so both arrows reach it: a
+            // control that only ever steps one way walks a keyboard down to
+            // 1/32 and strands it there. The announced value is the grid the
+            // box prints; the travel is the exponent laid onto 0..1.
+            Hit::ToolGrid => Node::slider(
+                id,
+                r,
+                "Grid",
+                f64::from(view.grid_exp),
+                -5.0,
+                3.0,
+                grid_spoken(view.grid_exp),
+                Travel {
+                    norm: (f32::from(view.grid_exp) + 5.0) / 8.0,
+                    up: false,
+                },
+            ),
+            Hit::ToolNav => Node::readout(
+                id,
+                r,
+                "Visible span",
+                bars(view.view_start_s, view.view_len_s),
+            ),
+            // The seam is a drag and nothing else: there is no press of it
+            // that means anything, so it is not a tab stop.
+            Hit::HeaderGrip => continue,
+            // ── the rows' own headers ─────────────────────────────────
+            Hit::TempoHeader => Node::button(id, r, "Song tempo, flatten to one tempo"),
+            Hit::AutoParamPick(i) => Node::button(
+                id,
+                r,
+                format!(
+                    "{} automation, {}",
+                    who(i),
+                    view.lanes
+                        .get(i)
+                        .and_then(|l| l.automation.as_ref())
+                        .map_or("none", |a| a.param.label())
+                ),
+            ),
+            // The NUMBER is the reorder handle and carries no press worth
+            // announcing; the name beside it says which row this is.
+            Hit::HdrNumber(_) => continue,
+            Hit::Arm(i) => Node::toggle(
+                id,
+                r,
+                format!("{} record arm", who(i)),
+                view.lanes.get(i).is_some_and(|l| l.armed),
+            ),
+            Hit::Mute(i) => Node::toggle(
+                id,
+                r,
+                format!("{} mute", who(i)),
+                view.lanes.get(i).is_some_and(|l| l.muted),
+            ),
+            Hit::Solo(i) => Node::toggle(
+                id,
+                r,
+                format!("{} solo", who(i)),
+                view.lanes.get(i).is_some_and(|l| l.soloed),
+            ),
+            Hit::ToTheory(i) => Node::toggle(
+                id,
+                r,
+                format!("{} sends its MIDI to the theory view", who(i)),
+                view.lanes.get(i).is_some_and(|l| l.to_theory),
+            ),
+            Hit::HdrFolder(i) => Node::toggle(
+                id,
+                r,
+                format!("{} is a folder", who(i)),
+                view.lanes.get(i).is_some_and(|l| l.is_folder),
+            ),
+            Hit::HdrCollapse(i) => Node::toggle(
+                id,
+                r,
+                format!("{} shows its tracks", who(i)),
+                !view.lanes.get(i).is_some_and(|l| l.folder_shut),
+            ),
+            Hit::HdrAdd(i) => Node::button(id, r, format!("Add a track at row {}", i + 1)),
+            Hit::HdrName(i) => Node::readout(id, r, format!("{} name", who(i)), who(i)),
+            Hit::HdrInput(i) => Node::readout(
+                id,
+                r,
+                format!("{} input", who(i)),
+                match view.lanes.get(i) {
+                    Some(l) if !l.input.is_empty() => l.input.clone(),
+                    _ => "none".to_owned(),
+                },
+            ),
+            Hit::HdrBay(i, bay) => {
+                let what = view.lanes.get(i).map_or("", |l| l.inserts[bay]);
+                Node::readout(
+                    id,
+                    r,
+                    format!("{} insert {}", who(i), bay + 1),
+                    if what.is_empty() { "empty".to_owned() } else { what.to_owned() },
+                )
+            }
+            Hit::HdrRouting(i) => Node::button(id, r, format!("{} routing", who(i))),
+            // The two rows above the tracks. Their level is the desk's own,
+            // so it reads in the desk's own words.
+            Hit::BusBay(_, slot) => {
+                let word = view.master_inserts.get(slot).copied().unwrap_or("");
+                Node::button(
+                    id,
+                    r,
+                    if word.is_empty() {
+                        format!("Master insert {}, empty", slot + 1)
+                    } else {
+                        format!("Master insert {}, {word}", slot + 1)
+                    },
+                )
+            }
+            Hit::BusGain(_) => {
+                let g = view.master_gain;
+                Node::slider(
+                    id,
+                    r,
+                    "Master volume".to_owned(),
+                    f64::from(g),
+                    0.0,
+                    1.0,
+                    crate::recorder::gain_text(g),
+                    up(crate::recorder::gain_to_fader(g)),
+                )
+            }
+            // ── the three dials ───────────────────────────────────────
+            //
+            // The same values, words and travel the desk's own controls
+            // carry: they ARE the desk's controls, reached from here.
+            Hit::Gain(i) => {
+                let g = view.lanes.get(i).map_or(0.0, |l| l.gain);
+                Node::slider(
+                    id,
+                    r,
+                    format!("{} volume", who(i)),
+                    f64::from(g),
+                    0.0,
+                    1.0,
+                    crate::recorder::gain_text(g),
+                    // The dial's POSITION, not its amplitude — the two are
+                    // equal only at the ends.
+                    up(crate::recorder::gain_to_fader(g)),
+                )
+            }
+            Hit::Send(i) => {
+                let s = view.lanes.get(i).map_or(0.0, |l| l.send);
+                Node::slider(
+                    id,
+                    r,
+                    format!("{} send", who(i)),
+                    f64::from(s),
+                    0.0,
+                    1.0,
+                    format!("{:.0}%", s * 100.0),
+                    up(s),
+                )
+            }
+            Hit::Pan(i) => {
+                let p = view.lanes.get(i).map_or(0.0, |l| l.pan);
+                Node::slider(
+                    id,
+                    r,
+                    format!("{} pan", who(i)),
+                    f64::from(p),
+                    -1.0,
+                    1.0,
+                    crate::mixer_panel::pan_text(p),
+                    up((p + 1.0) * 0.5),
+                )
+            }
+            // ── the song itself ───────────────────────────────────────
+            //
+            // A clip is READ — where it is, how long, and whether it is in
+            // the selection. Enter selects it, which is what makes the
+            // clip commands (delete, normalise, the clip menu) reachable
+            // without a mouse.
+            Hit::ClipBody(clip_id) => {
+                let Some(c) = view.clips.iter().find(|c| c.id == clip_id) else {
+                    continue;
+                };
+                let name = if c.name.is_empty() { "Untitled" } else { c.name };
+                let mut says = format!("{}, {}", bars(c.start_s, c.len_s), who(c.lane));
+                if c.midi {
+                    says.push_str(", MIDI");
+                }
+                if c.selected {
+                    says.push_str(", selected");
+                }
+                Node::readout(id, r, format!("Clip {name}"), says)
+            }
+            // Everything `targets` does not enumerate. Named rather than
+            // caught by `_`, so a new hit has to be decided about here.
+            Hit::ClipLeft(_)
+            | Hit::ClipRight(_)
+            | Hit::FadeIn(_)
+            | Hit::FadeOut(_)
+            | Hit::Lane(..)
+            | Hit::Ruler(_)
+            | Hit::AutoPoint(..)
+            | Hit::AutoLane(..)
+            | Hit::AutoFold(_)
+            | Hit::TempoPoint(_)
+            | Hit::TempoLane(..)
+            | Hit::MeterChip(_)
+            | Hit::MeterStrip(_) => continue,
+        };
+        out.push(node);
+    }
+    out
+}
+
 // ── painting ───────────────────────────────────────────────────────────────
 
 struct Ink {
@@ -1312,6 +2103,40 @@ struct Ink {
     solo: Color32,
     meter: Color32,
     select: Color32,
+}
+
+/// One rack chip: a plugin's short name, or a plus for an empty bay.
+///
+/// **The same surface the mixer's bays are**, and the same ink. These were a
+/// hard-coded bone panel with hard-coded near-black on it — the shipped desk's
+/// colours, frozen — so on every theme but the default the input, FX and
+/// routing chips stayed white modules on a desk that had moved. `hdr_face` IS
+/// the mixer's strip face, and `engrave` is what that face can carry.
+///
+/// A free function rather than a closure inside the header loop, because the
+/// MASTER row grew a rack of its own and two racks drawn by two pieces of code
+/// is two racks that drift apart.
+fn bay_chip(painter: &Painter, r: Rect, word: &str, has: bool, p: &Ink) {
+    if !r.is_positive() {
+        return;
+    }
+    let bone = p.hdr_face;
+    let ink = p.engrave;
+    painter.rect_filled(r, 2.0, bone);
+    painter.rect_stroke(
+        r,
+        2.0,
+        Stroke::new(1.0, ink.gamma_multiply(0.4)),
+        egui::StrokeKind::Inside,
+    );
+    let font = FontId::new((r.height() * 0.62).clamp(7.0, 10.0), crate::fonts::courier());
+    painter.text(
+        r.center(),
+        Align2::CENTER_CENTER,
+        cut_to(painter, r.width() - 4.0, word, &font),
+        font,
+        quiet(ink, bone, if has { 0.08 } else { 0.34 }),
+    );
 }
 
 fn ink(view: &ArrangeView<'_>) -> Ink {
@@ -1518,6 +2343,20 @@ pub fn grid_label(exp: i8) -> String {
         format!("{}", 1u32 << exp.min(6) as u32)
     } else {
         format!("1/{}", 1u32 << (-exp).min(6) as u32)
+    }
+}
+
+/// The same grid, in the words a person would say it in.
+///
+/// The box prints "1" and "1/4" because it is a box the width of a thumb.
+/// A screen reader announcing "Grid, 1" has said nothing: the unit is the
+/// whole content, and a readout that has to be decoded has not been made
+/// accessible. So the spoken form carries it.
+fn grid_spoken(exp: i8) -> String {
+    match exp {
+        0 => "1 bar".to_owned(),
+        e if e > 0 => format!("{} bars", 1u32 << e.min(6) as u32),
+        e => format!("1/{} bar", 1u32 << (-e).min(6) as u32),
     }
 }
 
@@ -2107,7 +2946,10 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         // staff that says "MIDI, nothing played yet".
         if clip.midi && r.width() >= 8.0 {
             if clip.notes.is_empty() {
-                let mid = r.center().y;
+                // The dashed staff sits under the title too, or an empty
+                // MIDI item's line runs through its own name.
+                let band = clip_name_band(r);
+                let mid = (r.top() + band + r.bottom()) * 0.5;
                 let mut x = r.left() + 3.0;
                 while x < r.right() - 3.0 {
                     painter.line_segment(
@@ -2249,6 +3091,37 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         );
     }
 
+    // ── SILENCED BY A FOLDER: a veil over the row ────────────────────────
+    //
+    // **After the clips, so the clips dim too**, and before the playhead and
+    // the time selection, which are about where you are rather than about
+    // what is heard.
+    //
+    // The child's own M switch is off and stays off — a folder does not mute
+    // its children, it contains them, and unmuting the folder gives every
+    // child back exactly as it was. But a track that makes no sound with its
+    // mute clearly off reads as a fault, so the lane says it plainly. The
+    // FOLDER dims too: it is silent for the same reason and a group half
+    // dimmed would look like a bug in the dimming.
+    for (i, row) in l.lane_rows.iter().enumerate() {
+        let Some(lane) = view.lanes.get(i).filter(|l| l.folder_silent) else {
+            continue;
+        };
+        let _ = lane;
+        if row.is_positive() {
+            painter.rect_filled(*row, 0.0, Color32::from_black_alpha(96));
+        }
+    }
+    for (i, row) in l.header_rows.iter().enumerate() {
+        let Some(lane) = view.lanes.get(i).filter(|l| l.folder_silent) else {
+            continue;
+        };
+        let _ = lane;
+        if row.panel.is_positive() {
+            painter.rect_filled(row.panel, 0.0, Color32::from_black_alpha(96));
+        }
+    }
+
     // ── the TIME SELECTION: a veil over the span, on ruler and lanes ──────
     // AFTER the clips, deliberately: the veil and its boundary lines are
     // about the material inside the span, and painting them first let
@@ -2342,6 +3215,119 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         Stroke::new(1.0, p.engrave.gamma_multiply(0.5)),
     );
     let num_font = FontId::new(10.0, crate::fonts::courier());
+    // **The MASTER, above the tracks, in the mixer's own colours.**
+    //
+    // The desk draws a strip for it and the timeline drew none, so a
+    // session's output level was reachable from one view and not the other.
+    // A full track's height, and it wears the SAME painted plate its mixer
+    // strip does — `master_color` is that strip's own index — so the two
+    // views cannot disagree about what the master looks like on a theme.
+    {
+        let r = l.master_row;
+        if r.panel.is_positive() {
+            // The strip's colour as a plate, and the ink measured against
+            // it — the mixer's rule, and the same one the track headers
+            // below follow: any colour, and the text still reads.
+            let face = if view.master_color != 0 {
+                let (cr, cg, cb) =
+                    crate::mixer_panel::STRIP_COLORS[view.master_color.min(
+                        crate::mixer_panel::STRIP_COLORS.len() - 1,
+                    )];
+                crate::recorder_panel::legible_surface(Color32::from_rgb(cr, cg, cb))
+            } else {
+                p.hdr_face
+            };
+            let ink = if crate::recorder_panel::wants_light_ink(face) {
+                crate::recorder_panel::INK_LIGHT
+            } else {
+                crate::recorder_panel::INK_DARK
+            };
+            painter.rect_filled(r.panel, 0.0, face);
+            painter.line_segment(
+                [
+                    Pos2::new(r.panel.left(), r.panel.bottom()),
+                    Pos2::new(r.panel.right(), r.panel.bottom()),
+                ],
+                Stroke::new(1.0, ink.gamma_multiply(0.35)),
+            );
+            if r.name.is_positive() {
+                let size = (r.name.height() * 0.42).clamp(6.0, 11.0);
+                painter.text(
+                    Pos2::new(r.name.left() + 4.0, r.name.center().y),
+                    Align2::LEFT_CENTER,
+                    "MASTER",
+                    FontId::new(size, crate::fonts::courier()),
+                    ink,
+                );
+            }
+            if r.meter.is_positive() {
+                painter.rect_filled(r.meter, 1.0, ink.gamma_multiply(0.18));
+                for (k, v) in view.master_peak.iter().enumerate() {
+                    let w = r.meter.width() * 0.5;
+                    let x = r.meter.left() + w * k as f32;
+                    let h = r.meter.height() * v.clamp(0.0, 1.0);
+                    if h > 0.5 {
+                        painter.rect_filled(
+                            Rect::from_min_max(
+                                Pos2::new(x, r.meter.bottom() - h),
+                                Pos2::new(x + w - 0.5, r.meter.bottom()),
+                            ),
+                            0.0,
+                            p.meter,
+                        );
+                    }
+                }
+            }
+            // **The master's own rack, six bays wide.** The same chips the
+            // track headers carry and the same door behind them, so the
+            // output chain is reachable from the timeline as well as the desk.
+            for (b, cell) in r.bays.iter().enumerate() {
+                let word = view.master_inserts.get(b).copied().unwrap_or("");
+                bay_chip(
+                    painter,
+                    *cell,
+                    if word.is_empty() { "+" } else { word },
+                    !word.is_empty(),
+                    &p,
+                );
+            }
+            if r.knob.is_positive() {
+                // **The desk's own dial, in the desk's own volume blue.** The
+                // ring is the master's plate rather than the lane field the
+                // track dials sit on, so it reads as raised out of THIS row.
+                dial(
+                    painter,
+                    r.knob,
+                    crate::recorder::gain_to_fader(view.master_gain),
+                    // **Black, and only here.** The channels' volume dials
+                    // wear the blue; the master is the one control that can
+                    // undo every other one, and the desk already marks it out
+                    // by colour rather than by position — see
+                    // `mixer_panel::MASTER_COLOR`, which is a crimson no
+                    // palette uses. A cap that matched the channels made the
+                    // master's row read as a seventeenth track.
+                    DIAL_MASTER,
+                    crate::recorder_panel::legible_surface(shade(face, 0.82)),
+                    ink,
+                );
+            }
+            // The word under the meter, saying what the dial is — the track
+            // rows write theirs under the knob and this row has no room
+            // below, so it goes beside.
+            if r.vol_label.is_positive() {
+                painter.text(
+                    r.vol_label.center(),
+                    Align2::CENTER_CENTER,
+                    "VOL",
+                    FontId::new(
+                        (r.vol_label.height() * 0.62).clamp(6.0, 9.0),
+                        crate::fonts::courier(),
+                    ),
+                    quiet(ink, face, 0.28),
+                );
+            }
+        }
+    }
     for (i, row) in l.header_rows.iter().enumerate() {
         let Some(lane) = view.lanes.get(i) else { continue };
         // The strip's own colour as a plate behind the header, the mixer's
@@ -2352,17 +3338,29 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         } else {
             p.hdr_face
         };
-        let plate = row.panel.shrink2(Vec2::new(2.0, 1.5));
+        let plate = {
+            let base = row.panel.shrink2(Vec2::new(2.0, 1.5));
+            // The same step the controls took, so the plate and what stands
+            // on it agree about where this track begins.
+            if lane.in_folder && base.width() > FOLDER_INDENT + 40.0 {
+                Rect::from_min_max(
+                    Pos2::new(base.left() + FOLDER_INDENT, base.top()),
+                    base.max,
+                )
+            } else {
+                base
+            }
+        };
         if !plate.is_positive() {
             continue;
         }
         if lane.used {
             painter.rect_filled(plate, 2.0, face);
-            if view.selected_channel == Some(i) {
+            if view.selected_tracks.contains(&i) {
                 painter.rect_stroke(
                     plate,
                     2.0,
-                    Stroke::new(1.2, Color32::from_rgba_unmultiplied(0xFF, 0xF4, 0xE0, 90)),
+                    Stroke::new(1.2, crate::recorder_panel::selection_rim(face)),
                     egui::StrokeKind::Inside,
                 );
             }
@@ -2391,41 +3389,22 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             if lane.used {
                 quiet(ink_on, face, 0.30)
             } else {
-                // Tucked faint on the dark ground, clear of the + circle.
-                p.hdr_face.gamma_multiply(0.30)
+                // **Measured against the EMPTY ground, like the + beside it.**
+                //
+                // This was `hdr_face` dimmed to a third — the themed STRIP
+                // colour, used as ink, on a ground it has nothing to do with.
+                // On every theme whose strip is dark that is a dark number on
+                // a dark ground, and the row numbers were unreadable on most
+                // of the sixteen. The + circle two inches away had the right
+                // answer the whole time.
+                quiet(on_ink(p.empty_ground), p.empty_ground, 0.22)
             },
         );
         // The input chip draws on EVERY lane — binding an input is how a
         // bare lane becomes a track — in bone whatever the theme, so the
         // words read on a painted header and on the grey field alike.
-        let chip = |painter: &Painter, r: Rect, word: &str, has: bool| {
-            if !r.is_positive() {
-                return;
-            }
-            // **The same surface the mixer's bays are**, and the same ink.
-            // These were a hard-coded bone panel with hard-coded near-black
-            // on it — the shipped desk's colours, frozen — so on every theme
-            // but the default the input, FX and routing chips stayed white
-            // modules on a desk that had moved. `hdr_face` IS the mixer's
-            // strip face, and `engrave` is what that face can carry.
-            let bone = p.hdr_face;
-            let ink = p.engrave;
-            painter.rect_filled(r, 2.0, bone);
-            painter.rect_stroke(
-                r,
-                2.0,
-                Stroke::new(1.0, ink.gamma_multiply(0.4)),
-                egui::StrokeKind::Inside,
-            );
-            let font = FontId::new((r.height() * 0.62).clamp(7.0, 10.0), crate::fonts::courier());
-            painter.text(
-                r.center(),
-                Align2::CENTER_CENTER,
-                cut_to(painter, r.width() - 4.0, word, &font),
-                font,
-                quiet(ink, bone, if has { 0.08 } else { 0.34 }),
-            );
-        };
+        let chip =
+            |painter: &Painter, r: Rect, word: &str, has: bool| bay_chip(painter, r, word, has, &p);
         if !lane.used {
             if row.add.is_positive() {
                 let c = row.add.center();
@@ -2522,19 +3501,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         // with its number under it — a dial this small needs the readout to
         // be a control you can trust.
         let dial = |painter: &Painter, cell: Rect, t: f32, cap: Color32| {
-            if !cell.is_positive() {
-                return;
-            }
-            let kc = cell.center();
-            let kr = cell.width() * 0.5;
-            painter.circle_filled(kc, kr, p.lane);
-            painter.circle_filled(kc, kr * 0.82, cap);
-            let sweep = std::f32::consts::PI * 1.5;
-            let a = std::f32::consts::PI * 0.75 + sweep * t.clamp(0.0, 1.0);
-            painter.line_segment(
-                [kc, Pos2::new(kc.x + a.cos() * kr * 0.8, kc.y + a.sin() * kr * 0.8)],
-                Stroke::new((kr * 0.22).max(1.5), p.clip_ink),
-            );
+            self::dial(painter, cell, t, cap, p.lane, p.clip_ink);
         };
         let readout = |painter: &Painter, cell: Rect, text: String| {
             if !cell.is_positive() || cell.height() < 7.0 {
@@ -2555,12 +3522,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 ink_on,
             );
         };
-        dial(
-            painter,
-            row.knob,
-            crate::recorder::gain_to_fader(lane.gain),
-            Color32::from_rgb(0x1C, 0x6F, 0xD6),
-        );
+        dial(painter, row.knob, crate::recorder::gain_to_fader(lane.gain), DIAL_VOLUME);
         // Compact: the unit has no room at this size, and a number under a
         // VOLUME dial needs none.
         let db = if lane.gain <= 0.001 {
@@ -2675,6 +3637,75 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 if on { on_ink(lit) } else { quiet(on_ink(p.hdr_lane), p.hdr_lane, 0.18) },
             );
         }
+        // **The FOLDER box, bottom-left.**
+        //
+        // A drawn folder rather than a letter: the row already carries three
+        // lettered switches (M, S, T) and a fourth would be read as a fourth
+        // of the same kind. This one is not a per-track setting about signal
+        // — it is a statement about the LIST — so it says so by not looking
+        // like its neighbours.
+        //
+        // Two rectangles: a tab on top of a body, which is the smallest
+        // shape that reads as a folder at eleven points. Lit in the theme's
+        // own selection ink when it is on, outlined when it is not.
+        if row.folder.is_positive() {
+            let fr = row.folder;
+            let on = lane.is_folder;
+            let ink = if on { p.select } else { quiet(on_ink(p.hdr_lane), p.hdr_lane, 0.30) };
+            let body = Rect::from_min_max(
+                Pos2::new(fr.left(), fr.top() + fr.height() * 0.28),
+                Pos2::new(fr.right(), fr.bottom()),
+            );
+            let tab = Rect::from_min_max(
+                Pos2::new(fr.left(), fr.top()),
+                Pos2::new(fr.left() + fr.width() * 0.46, body.top()),
+            );
+            if on {
+                painter.rect_filled(tab, 1.0, ink);
+                painter.rect_filled(body, 1.0, ink);
+            } else {
+                painter.rect_stroke(tab, 1.0, Stroke::new(1.0, ink), egui::StrokeKind::Inside);
+                painter.rect_stroke(body, 1.0, Stroke::new(1.0, ink), egui::StrokeKind::Inside);
+            }
+        }
+        // **The collapse arrow, and what a shut folder is hiding.**
+        //
+        // Down when the group is open, right when it is shut — the direction
+        // every file list has used for forty years, so it needs no legend.
+        // The count is written beside it only when SHUT: an open folder's
+        // children are on screen and counting them out loud says nothing.
+        if row.collapse.is_positive() && lane.is_folder {
+            let cr = row.collapse;
+            let ink = quiet(on_ink(p.hdr_lane), p.hdr_lane, 0.22);
+            let c = cr.center();
+            let a = cr.width() * 0.30;
+            let tri = if lane.folder_shut {
+                [
+                    Pos2::new(c.x - a * 0.6, c.y - a),
+                    Pos2::new(c.x - a * 0.6, c.y + a),
+                    Pos2::new(c.x + a * 0.8, c.y),
+                ]
+            } else {
+                [
+                    Pos2::new(c.x - a, c.y - a * 0.6),
+                    Pos2::new(c.x + a, c.y - a * 0.6),
+                    Pos2::new(c.x, c.y + a * 0.8),
+                ]
+            };
+            painter.add(egui::Shape::convex_polygon(tri.to_vec(), ink, Stroke::NONE));
+            if lane.folder_shut && lane.folder_count > 0 {
+                painter.text(
+                    Pos2::new(cr.right() + 3.0, c.y),
+                    Align2::LEFT_CENTER,
+                    format!("{}", lane.folder_count),
+                    FontId::new(
+                        (cr.height() * 0.82).clamp(7.0, 10.0),
+                        crate::fonts::courier_bold(),
+                    ),
+                    ink,
+                );
+            }
+        }
     }
     // **A MIDI item being drawn right now**: a ghost until the button comes
     // up and the document takes it.
@@ -2706,30 +3737,46 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         0.0,
         p.hdr_wood,
     );
-    let tool = |painter: &Painter, r: Rect, on: bool| {
+    // **A tool button, and the ink it must be drawn with.**
+    //
+    // Returning the ink rather than a bool is the fix for the owner's "the
+    // met and the snap are basically invisible when disabled". Every caller
+    // worked its own out as `p.hdr_face.gamma_multiply(0.7)` — the STRIP's
+    // colour, made transparent, painted on the LANE's. Two things wrong with
+    // that and both were doing damage: `gamma_multiply` lowers ALPHA, so the
+    // glyph composites into whatever is behind it (the bug this file's
+    // `quiet` already exists to replace), and `hdr_face` is a plate colour
+    // that on many themes is a near neighbour of `hdr_lane` — a faint version
+    // of a colour that already matched the ground.
+    //
+    // So the OFF state is the ground's own ink pulled back a little, which is
+    // legible by construction on any theme, and the ON state is a COLOUR
+    // change rather than an appearance from nothing: the desk's green, held
+    // clear of whichever ground it lands on.
+    let tool = |painter: &Painter, r: Rect, on: bool| -> Option<Color32> {
         if !r.is_positive() {
-            return false;
+            return None;
         }
-        painter.rect_filled(r, 2.0, if on { p.hdr_face } else { p.hdr_lane });
-        true
+        let ground = if on { p.hdr_face } else { p.hdr_lane };
+        painter.rect_filled(r, 2.0, ground);
+        Some(if on {
+            crate::recorder_panel::distinct_surface_at(p.meter, ground, 3.0)
+        } else {
+            quiet(on_ink(ground), ground, 0.16)
+        })
     };
-    if tool(painter, l.tool_met, view.metronome_on) {
+    if let Some(ink) = tool(painter, l.tool_met, view.metronome_on) {
         crate::recorder_panel::draw_metronome_on(
             painter,
             l.tool_met.shrink(2.0),
-            if view.metronome_on { p.engrave } else { p.hdr_face.gamma_multiply(0.7) },
+            ink,
             if view.metronome_on { p.hdr_face } else { p.hdr_lane },
         );
     }
     // The tempo lane's switch: a small line that steps, which is what the
     // lane draws. A metronome would be the click's own sign twice over.
-    if tool(painter, l.tool_tempo, view.show_tempo_lane) {
+    if let Some(ink) = tool(painter, l.tool_tempo, view.show_tempo_lane) {
         let m = l.tool_tempo.shrink(3.5);
-        let ink = if view.show_tempo_lane {
-            p.engrave
-        } else {
-            p.hdr_face.gamma_multiply(0.7)
-        };
         let w = (m.width() * 0.14).clamp(1.2, 2.2);
         let (lo, hi) = (m.bottom() - m.height() * 0.18, m.top() + m.height() * 0.18);
         let mid = m.left() + m.width() * 0.5;
@@ -2741,10 +3788,9 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             painter.line_segment(pair, Stroke::new(w, ink));
         }
     }
-    if tool(painter, l.tool_snap, view.snap_on) {
+    if let Some(ink) = tool(painter, l.tool_snap, view.snap_on) {
         // The magnet: a U with its two poles, the sign every DAW uses.
         let m = l.tool_snap.shrink(3.5);
-        let ink = if view.snap_on { p.engrave } else { p.hdr_face.gamma_multiply(0.7) };
         let w = (m.width() * 0.18).clamp(1.5, 3.0);
         let cx = m.center().x;
         let radius = m.width() * 0.5 - w * 0.5;
@@ -2781,7 +3827,10 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             );
         }
     }
-    if tool(painter, l.tool_grid, true) {
+    // The GRID box is always "on" — it is a readout, not a switch — so it
+    // takes the lit ground and prints in the panel's own ink rather than the
+    // green a switch uses to say it is engaged.
+    if tool(painter, l.tool_grid, true).is_some() {
         painter.text(
             l.tool_grid.center(),
             Align2::CENTER_CENTER,
@@ -2790,7 +3839,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 (l.tool_grid.height() * 0.55).clamp(8.0, 11.0),
                 crate::fonts::courier_bold(),
             ),
-            p.engrave,
+            on_ink(p.hdr_face),
         );
     }
     // The NAVIGATOR: the whole song as a recessed box, the window as a lit
@@ -2881,6 +3930,12 @@ mod tests {
     fn a_lane(used: bool) -> LaneView<'static> {
 LaneView {
     to_theory: false,
+    is_folder: false,
+    in_folder: false,
+    folder_shut: false,
+    folder_count: 0,
+    hidden: false,
+    folder_silent: false,
             automation_open: false,
             automation: None,
             route_count: 0,
@@ -2944,6 +3999,11 @@ LaneView {
 
     fn a_view<'a>(clips: &'a [ClipView<'a>]) -> ArrangeView<'a> {
 ArrangeView {
+            master_gain: 1.0,
+            master_peak: [0.0; 2],
+            master_color: 0,
+            show_master_row: true,
+            master_inserts: [""; crate::recorder::INSERTS * 2],
             show_tempo_lane: false,
             tempo_hot: None,
             meter_edit: None,
@@ -2953,6 +4013,7 @@ ArrangeView {
             naming: None,
             time_sel: None,
             selected_channel: None,
+            selected_tracks: &[],
             lanes: std::array::from_fn(|i| a_lane(i < 3)),
             lane_scroll: 0,
             visible_lanes: VISIBLE_LANES,
@@ -2983,6 +4044,350 @@ ArrangeView {
 
     /// The time mapping round-trips, which is what keeps a clip drawn where
     /// it is grabbed.
+
+
+    /// **The MASTER heads the track list, at a full track's height, in the
+    /// mixer's own colours — and `Cmd`/`Ctrl+M` hides it.**
+    ///
+    /// The desk draws a strip for it and the timeline drew none, so a
+    /// session's output level was reachable from one view and not the other.
+    /// The CLICK had a row here too and lost it: the metronome is not a
+    /// thing you arrange against.
+    #[test]
+    fn the_master_heads_the_track_list_and_can_be_hidden() {
+        let cs: Vec<ClipView<'_>> = Vec::new();
+        let mut v = a_view(&cs);
+        v.show_tempo_lane = true;
+        let l = Layout::new(rect(), &v);
+
+        let masters: Vec<&Row> = l
+            .rows
+            .iter()
+            .filter(|r| r.kind == RowKind::Master)
+            .collect();
+        assert_eq!(masters.len(), 1, "the master's row is not laid out once");
+        // Above every track, and below the tempo lane, which is a property
+        // of the song rather than a channel.
+        let first_track = l
+            .rows
+            .iter()
+            .find(|r| matches!(r.kind, RowKind::Track(_)))
+            .expect("no tracks");
+        let tempo = l
+            .rows
+            .iter()
+            .find(|r| r.kind == RowKind::Tempo)
+            .expect("no tempo lane");
+        assert!(tempo.lane.bottom() <= masters[0].lane.top() + 0.5);
+        assert!(masters[0].lane.bottom() <= first_track.lane.top() + 0.5);
+
+        // **HALF a track's height**, at the owner's word. It went from half
+        // (beside the click) to full when it became a track in its own right,
+        // and back to half once it was clear what it actually carries: a name,
+        // a level and a rack, and no clips at all. Every point it gives up is
+        // a point the tracks get back.
+        let want = first_track.lane.height() * MASTER_ROW_SHARE;
+        assert!(
+            (masters[0].lane.height() - want).abs() < 0.6,
+            "the master's row is {}pt against a {}pt track, wanted {want}pt",
+            masters[0].lane.height(),
+            first_track.lane.height()
+        );
+
+        // Its level is the DESK's own column, so the two views cannot
+        // disagree about how loud the master is.
+        let knob = l.master_row.knob;
+        assert!(knob.is_positive(), "the master's row has no level");
+        assert_eq!(
+            hit_test(rect(), &v, knob.center()),
+            Some(Hit::BusGain(MASTER_COLUMN)),
+            "the master's level cannot be pressed"
+        );
+        assert_eq!(MASTER_COLUMN, crate::recorder::CHANNELS + 1);
+
+        // **Hidden, and the tracks take the room back.** Not removed: a
+        // session always has an output.
+        let mut off = a_view(&cs);
+        off.show_tempo_lane = true;
+        off.show_master_row = false;
+        let l2 = Layout::new(rect(), &off);
+        assert!(
+            !l2.rows.iter().any(|r| r.kind == RowKind::Master),
+            "the master's row survived being hidden"
+        );
+        assert!(!l2.master_row.knob.is_positive());
+        let hidden_track = l2
+            .rows
+            .iter()
+            .find(|r| matches!(r.kind, RowKind::Track(_)))
+            .expect("no tracks with the master hidden");
+        assert!(
+            hidden_track.lane.height() > first_track.lane.height(),
+            "hiding the master gave the tracks no room back"
+        );
+    }
+
+    /// **Every enumerated target IS the hit it claims.**
+    ///
+    /// `targets` is a second walk of the same layout `hit_test` walks, and a
+    /// second walk is a second thing to get out of step. This presses each
+    /// rect's own centre and asks the panel what it means, so a cell that
+    /// moves in one and not the other fails here rather than as a screen
+    /// reader announcing the wrong control.
+    #[test]
+    fn every_target_is_the_hit_it_claims() {
+        let cs = clips();
+        let mut v = a_view(&cs);
+        v.show_tempo_lane = true;
+        let mut bad: Vec<String> = Vec::new();
+        for (r, want) in targets(rect(), &v) {
+            let got = hit_test(rect(), &v, r.center());
+            let agrees = match (want, got) {
+                // The lane hits carry a computed second, so they compare by
+                // their variant and their lane rather than by value.
+                (a, Some(b)) => a == b,
+                (_, None) => false,
+            };
+            if !agrees {
+                bad.push(format!("{want:?} at {r:?} answers {got:?}"));
+            }
+        }
+        assert!(bad.is_empty(), "targets disagrees with hit_test:\n  {}", bad.join("\n  "));
+    }
+
+    /// Nothing is enumerated twice, and nothing shares a rect: the map from
+    /// a focused node back to its hit is BY RECT, so two controls at one
+    /// rectangle would hand the keyboard whichever came first.
+    #[test]
+    fn no_two_targets_share_a_rectangle() {
+        let cs = clips();
+        let mut v = a_view(&cs);
+        v.show_tempo_lane = true;
+        let all = targets(rect(), &v);
+        for (i, (a, ha)) in all.iter().enumerate() {
+            for (b, hb) in all.iter().skip(i + 1) {
+                assert!(
+                    a != b,
+                    "{ha:?} and {hb:?} are both at {a:?} — the map back is by rect"
+                );
+            }
+        }
+    }
+
+    /// **Every node can be reached, says what it is, and reads in words.**
+    ///
+    /// The whole point of the module: a label a reader announces as nothing,
+    /// or a value that is a raw fraction, is a control that has been made
+    /// operable and not accessible.
+    #[test]
+    fn every_node_in_the_timeline_says_what_it_is() {
+        let cs = clips();
+        let mut v = a_view(&cs);
+        v.show_tempo_lane = true;
+        // **A window tall enough to hold the whole header.** A short row
+        // sheds the insert bays and then the routing button — deliberately,
+        // and there are tests for it — so a fixture that sheds them cannot
+        // tell "this node is missing because the panel dropped the cell"
+        // from "this node is missing because the walk is broken".
+        v.visible_lanes = 4;
+        let tall = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0));
+        let nodes = a11y_nodes(tall, &v);
+        // **A floor, not merely non-empty.** The first cut of this test
+        // passed with the loop nearly empty; a walk that finds three things
+        // is a walk that is broken and silent about it. Three used lanes,
+        // thirteen cells each, plus the toolbar, the tempo header and two
+        // clips.
+        assert!(
+            nodes.len() >= 30,
+            "the timeline offers only {} tab stops: {:?}",
+            nodes.len(),
+            nodes.iter().map(|n| n.label.clone()).collect::<Vec<_>>()
+        );
+        for want in [
+            "Metronome",
+            "Snap to grid",
+            "Grid",
+            "Song tempo, flatten to one tempo",
+            "KEYS volume",
+            "KEYS routing",
+            // **Not the insert BAYS.** At every header width this app
+            // actually opens at, the name column is under the 54 points
+            // three bays need and they are dropped — the T switch was added
+            // between the arm and the column without `dials_fit` learning
+            // about it, so the guard still measures from the arm dot and
+            // passes on a column 32 points wide. Written down here rather
+            // than asserted, because asserting it would be asserting the
+            // bug.
+            "KEYS input",
+            "Clip backing",
+        ] {
+            assert!(
+                nodes.iter().any(|n| n.label == want),
+                "no node labelled {want}"
+            );
+        }
+        let mut ids = std::collections::HashSet::new();
+        for n in &nodes {
+            assert!(!n.label.trim().is_empty(), "a node with no label: {n:?}");
+            assert!(
+                n.rect.is_positive(),
+                "{} has no rectangle to focus",
+                n.label
+            );
+            assert!(
+                tall.contains_rect(n.rect),
+                "{} is outside the panel at {:?}",
+                n.label,
+                n.rect
+            );
+            assert!(
+                ids.insert(n.id),
+                "two nodes share the id behind {} — focus would jump",
+                n.label
+            );
+            // No raw fraction anywhere: a value a person has to decode has
+            // not been made accessible, only made noisy.
+            if let Some(val) = &n.value {
+                assert!(!val.trim().is_empty(), "{} reads as nothing", n.label);
+                assert!(
+                    val.parse::<f32>().is_err(),
+                    "{} reads the bare number {val} instead of words",
+                    n.label
+                );
+            }
+            if let crate::a11y::Kind::Slider { .. } = n.kind {
+                assert!(n.travel.is_some(), "{} cannot be nudged", n.label);
+            }
+        }
+    }
+
+    /// Every dial's travel is its POSITION, not its amplitude — the mistake
+    /// that once sent one arrow press on the master from -6 dB to -20.4.
+    #[test]
+    fn a_headers_dials_travel_where_the_dial_stands() {
+        let cs: Vec<ClipView<'_>> = Vec::new();
+        let mut v = a_view(&cs);
+        // A gain well below unity, where amplitude and fader position are
+        // furthest apart.
+        v.lanes[0].gain = 0.25;
+        v.lanes[0].send = 0.4;
+        v.lanes[0].pan = -0.5;
+        let nodes = a11y_nodes(rect(), &v);
+        let of = |label: &str| {
+            nodes
+                .iter()
+                .find(|n| n.label == label)
+                .unwrap_or_else(|| panic!("no node labelled {label}"))
+                .clone()
+        };
+        let vol = of("KEYS volume");
+        let want = crate::recorder::gain_to_fader(0.25);
+        assert!(
+            (vol.travel.unwrap().norm - want).abs() < 1e-6,
+            "the volume dial travels on amplitude, not position"
+        );
+        assert_eq!(vol.value.as_deref(), Some(crate::recorder::gain_text(0.25).as_str()));
+        assert!((of("KEYS send").travel.unwrap().norm - 0.4).abs() < 1e-6);
+        // -1..1 laid onto the 0..1 the keyboard moves.
+        assert!((of("KEYS pan").travel.unwrap().norm - 0.25).abs() < 1e-6);
+        assert_eq!(of("KEYS pan").value.as_deref(), Some("left 50"));
+    }
+
+    /// A clip reads as WHERE IT IS, in bars — never in seconds.
+    #[test]
+    fn a_clip_reads_as_bars_and_says_whether_it_is_selected() {
+        let cs = clips();
+        let v = a_view(&cs);
+        let nodes = a11y_nodes(rect(), &v);
+        let backing = nodes
+            .iter()
+            .find(|n| n.label == "Clip backing")
+            .expect("the first clip has no node");
+        let said = backing.spoken();
+        assert!(said.contains("bar "), "a clip reads as {said}");
+        assert!(!said.contains("selected"), "an unselected clip claims it is");
+        let solo = nodes
+            .iter()
+            .find(|n| n.label == "Clip solo")
+            .expect("the second clip has no node");
+        assert!(solo.spoken().ends_with("selected"), "{}", solo.spoken());
+    }
+
+    /// The switches read their own state rather than a fixed one — the bug
+    /// that a toggle built from the layout and not the view would have.
+    #[test]
+    fn the_header_switches_read_the_track() {
+        let cs: Vec<ClipView<'_>> = Vec::new();
+        let mut v = a_view(&cs);
+        v.lanes[0].muted = true;
+        v.lanes[0].soloed = false;
+        v.lanes[0].armed = true;
+        v.lanes[0].to_theory = true;
+        let nodes = a11y_nodes(rect(), &v);
+        let said = |label: &str| {
+            nodes
+                .iter()
+                .find(|n| n.label == label)
+                .map(crate::a11y::Node::spoken)
+                .unwrap_or_else(|| panic!("no node labelled {label}"))
+        };
+        assert_eq!(said("KEYS mute"), "KEYS mute, on");
+        assert_eq!(said("KEYS solo"), "KEYS solo, off");
+        assert_eq!(said("KEYS record arm"), "KEYS record arm, on");
+        assert_eq!(
+            said("KEYS sends its MIDI to the theory view"),
+            "KEYS sends its MIDI to the theory view, on"
+        );
+    }
+
+    /// An UNUSED row offers its two controls and none of a track's.
+    #[test]
+    fn an_empty_row_offers_only_the_way_to_fill_it() {
+        let cs: Vec<ClipView<'_>> = Vec::new();
+        let v = a_view(&cs);
+        let nodes = a11y_nodes(rect(), &v);
+        // Lane 3 upward is unused in the fixture.
+        let has = |s: &str| nodes.iter().any(|n| n.label == s);
+        assert!(has("Add a track at row 4"), "an empty row cannot be filled");
+        assert!(
+            !nodes.iter().any(|n| n.label == "Track 4 volume"),
+            "an empty row offers a dial it does not draw"
+        );
+    }
+
+    /// A row scrolled out of the window is not a tab stop: every node's
+    /// rect is inside the lanes the panel actually drew.
+    #[test]
+    fn scrolled_away_rows_are_not_reachable() {
+        let cs: Vec<ClipView<'_>> = Vec::new();
+        let mut v = a_view(&cs);
+        v.visible_lanes = 2;
+        let nodes = a11y_nodes(rect(), &v);
+        assert!(
+            !nodes.iter().any(|n| n.label.starts_with("Track 8")),
+            "a row below the window is still a tab stop"
+        );
+    }
+
+    /// The grid box is a slider so both arrows reach it, and it reads the
+    /// grid the box PRINTS.
+    #[test]
+    fn the_grid_box_can_be_stepped_both_ways() {
+        let cs: Vec<ClipView<'_>> = Vec::new();
+        let mut v = a_view(&cs);
+        v.grid_exp = -2;
+        let nodes = a11y_nodes(rect(), &v);
+        let g = nodes.iter().find(|n| n.label == "Grid").expect("no grid node");
+        assert_eq!(g.value.as_deref(), Some("1/4 bar"));
+        // The BOX still prints its own terse form; only the spoken one is
+        // spelled out.
+        assert_eq!(grid_label(-2), "1/4");
+        let t = g.travel.expect("the grid box cannot be nudged");
+        assert!((t.norm - 3.0 / 8.0).abs() < 1e-6, "{}", t.norm);
+        // Both ends are reachable, and neither runs off the rails.
+        assert!(crate::a11y::Gesture::Least.nudged(t.norm) <= 0.0);
+        assert!(crate::a11y::Gesture::Most.nudged(t.norm) >= 1.0);
+    }
 
     /// **The arrangement wears the THEME, in both modes, legibly.**
     ///
@@ -3663,8 +5068,22 @@ ArrangeView {
                 v.lane_scroll = scroll;
                 let l = Layout::new(rect(), &v);
 
-                let lane_h = l.lanes_area.height() / visible as f32;
+                // **Measured from the first TRACK row**, not from the top
+                // of the area: the master and the click stand above them
+                // now — see `BUS_ROW_SHARE` — and what this test is about is
+                // that the tracks are evenly spaced and the window is the
+                // right one, both of which the bus rows leave alone.
+                // The master's row stands above the tracks and takes HALF a
+                // track's height — see `MASTER_ROW_SHARE` — so the tracks
+                // divide what is left of the area after its share.
+                let lane_h =
+                    l.lanes_area.height() / (visible as f32 + MASTER_ROW_SHARE);
                 let first = scroll.min(CHANNELS.saturating_sub(visible));
+                let top = l
+                    .rows
+                    .iter()
+                    .find(|r| matches!(r.kind, RowKind::Track(_)) && r.lane.is_positive())
+                    .map_or(l.lanes_area.top(), |r| r.lane.top());
                 for i in 0..CHANNELS {
                     let got = l.lane_rows[i];
                     if i < first || i >= first + visible {
@@ -3674,7 +5093,7 @@ ArrangeView {
                         );
                         continue;
                     }
-                    let want_top = l.lanes_area.top() + lane_h * (i - first) as f32;
+                    let want_top = top + lane_h * (i - first) as f32;
                     assert!(
                         (got.top() - want_top).abs() < 0.5,
                         "lane {i} moved to {} from {want_top} (visible={visible} \
@@ -3772,10 +5191,18 @@ ArrangeView {
         let l = Layout::new(r, &v);
         assert!(l.lane_rows[CHANNELS - 1].is_positive(), "the last lane never shows");
         assert!(!l.lane_rows[0].is_positive(), "lane 0 should be scrolled off");
-        // The first visible lane sits at the top of the lane area.
+        // The first visible lane sits at the top of the TRACKS — under the
+        // master's row, which is not a track and does not scroll.
+        let buses: f32 = l
+            .rows
+            .iter()
+            .filter(|r| r.kind == RowKind::Master)
+            .map(|r| r.lane.height())
+            .sum();
         assert!(
-            (l.lane_rows[CHANNELS - VISIBLE_LANES].top() - l.lanes_area.top()).abs() < 0.5,
-            "the scrolled window does not start at the top"
+            (l.lane_rows[CHANNELS - VISIBLE_LANES].top() - l.lanes_area.top() - buses).abs()
+                < 0.5,
+            "the scrolled window does not start at the top of the tracks"
         );
     }
 
@@ -3919,3 +5346,4 @@ ArrangeView {
         assert_eq!(clip_rect(rect(), &v, &c[0]), Rect::NOTHING);
     }
 }
+

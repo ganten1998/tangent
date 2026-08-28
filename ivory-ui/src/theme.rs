@@ -86,6 +86,19 @@ pub struct Theme {
     /// because it is not one of the effects: it is the one control that
     /// changes the PITCH of everything, and a theme should be able to say so.
     pub varispeed: Option<Rgb>,
+
+    // ── the velocity gradient ──────────────────────────────────────────────
+    /// **The loudest end of the MIDI editor's velocity lane**, and its
+    /// quietest. A pair rather than one colour, because a gradient needs two
+    /// ends and deriving the second from the first is how you get a ramp that
+    /// is a shade of one hue instead of a reading.
+    ///
+    /// Hot for loud and cool for quiet in every theme — the meaning is fixed
+    /// for the same reason the record light is one red everywhere — and WHICH
+    /// hot and WHICH cool is the theme's to say. Designed by
+    /// `scripts/velgen.py` against each theme's own roll, in both modes.
+    pub velocity_loud: Option<Rgb>,
+    pub velocity_quiet: Option<Rgb>,
     /// The well the timecode and the oscilloscope sit in.
     pub meter_bg: Option<Rgb>,
     /// The oscilloscope's trace — the green, on a stock install.
@@ -121,7 +134,7 @@ pub struct Theme {
 
 /// Every role a theme can name, in the spelling a theme FILE uses. One list,
 /// so the writer, the reader, the example and the dark map cannot drift.
-pub const ROLES: [&str; 19] = [
+pub const ROLES: [&str; 21] = [
     "background",
     "white_key",
     "black_key",
@@ -141,6 +154,11 @@ pub const ROLES: [&str; 19] = [
     "input_chip",
     "fretboard",
     "string",
+    // Appended, and appended is the rule: `ROLES` is walked by the tests and
+    // written into every example file, so inserting in the middle rewrites a
+    // document somebody may be reading beside their own.
+    "velocity_loud",
+    "velocity_quiet",
 ];
 
 /// A `const`-friendly colour literal, because `Rgb::new` is not const and a
@@ -199,6 +217,8 @@ impl Theme {
             input_chip: c(0xE3, 0xD9, 0xBD),
             fretboard: c(0x4a, 0x2b, 0x22),
             string: c(0xC9, 0xC4, 0xBC),
+            velocity_loud: c(0xff, 0x8d, 0x89),
+            velocity_quiet: c(0x40, 0xbd, 0x51),
             channel_palette: Some(0),
             dark: dark_of(&[("background", (0x1a, 0x1a, 0x1a))]),
         }
@@ -222,6 +242,8 @@ impl Theme {
             fx_knob: Some(s.fx_knob_color),
             master_knob: Some(s.master_knob_color),
             varispeed: Some(s.varispeed_color),
+            velocity_loud: Some(s.velocity_loud_color),
+            velocity_quiet: Some(s.velocity_quiet_color),
             meter_bg: Some(s.meter_bg_color),
             scope_draw: Some(s.scope_draw_color),
             fx_strip: Some(s.fx_strip_color),
@@ -287,6 +309,12 @@ impl Theme {
         if let Some(v) = self.varispeed {
             s.varispeed_color = v;
         }
+        if let Some(v) = self.velocity_loud {
+            s.velocity_loud_color = v;
+        }
+        if let Some(v) = self.velocity_quiet {
+            s.velocity_quiet_color = v;
+        }
         if let Some(v) = self.meter_bg {
             s.meter_bg_color = v;
         }
@@ -316,6 +344,43 @@ impl Theme {
         s.theme_name = self.name.clone();
     }
 
+    /// One role by the name a theme FILE uses.
+    ///
+    /// **So that a caller can walk [`ROLES`] instead of keeping a second list
+    /// beside it.** There was such a second list — a hard-coded seventeen
+    /// inside `every_non_default_factory_theme_fills_every_role` — and it had
+    /// already fallen behind: `varispeed` went into `ROLES`, into all sixteen
+    /// factory themes and into the reader, and the test that exists to catch a
+    /// half-filled theme was not checking it. A role added to `ROLES` and
+    /// forgotten here is a compile error; a role forgotten in a `match` arm is
+    /// not, so this is exhaustive on purpose and takes no `_` arm.
+    pub fn role(&self, name: &str) -> Option<Rgb> {
+        match name {
+            "background" => self.background,
+            "white_key" => self.white_key,
+            "black_key" => self.black_key,
+            "key_active" => self.key_active,
+            "sustain" => self.sustain,
+            "key_separator" => self.key_separator,
+            "text" => self.text,
+            "theory_line" => self.theory_line,
+            "interval_text" => self.interval_text,
+            "recorder_bg" => self.recorder_bg,
+            "fx_knob" => self.fx_knob,
+            "master_knob" => self.master_knob,
+            "varispeed" => self.varispeed,
+            "meter_bg" => self.meter_bg,
+            "scope_draw" => self.scope_draw,
+            "fx_strip" => self.fx_strip,
+            "input_chip" => self.input_chip,
+            "fretboard" => self.fretboard,
+            "string" => self.string,
+            "velocity_loud" => self.velocity_loud,
+            "velocity_quiet" => self.velocity_quiet,
+            _ => None,
+        }
+    }
+
     /// Serialise to the JSON a user theme file holds. Unset roles are simply
     /// absent, so a captured theme and a hand-written two-line one round-trip
     /// through the same reader.
@@ -340,6 +405,8 @@ impl Theme {
         put("fx_knob", self.fx_knob);
         put("master_knob", self.master_knob);
         put("varispeed", self.varispeed);
+        put("velocity_loud", self.velocity_loud);
+        put("velocity_quiet", self.velocity_quiet);
         put("meter_bg", self.meter_bg);
         put("scope_draw", self.scope_draw);
         put("fx_strip", self.fx_strip);
@@ -391,6 +458,8 @@ impl Theme {
             fx_knob: get("fx_knob"),
             master_knob: get("master_knob"),
             varispeed: get("varispeed"),
+            velocity_loud: get("velocity_loud"),
+            velocity_quiet: get("velocity_quiet"),
             meter_bg: get("meter_bg"),
             background: get("background"),
             scope_draw: get("scope_draw"),
@@ -475,6 +544,8 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x4c, 0xc7, 0xa4),
             fretboard: c(0x25, 0x15, 0x24),
             string: c(0xa3, 0x76, 0x8f),
+                        velocity_loud: c(0xff, 0x70, 0x83),
+            velocity_quiet: c(0x19, 0xb3, 0x84),
             channel_palette: Some(1),
             dark: dark_of(&[("background", (0x25, 0x15, 0x24))]),
         },
@@ -502,6 +573,8 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x4f, 0xd4, 0x9a),
             fretboard: c(0x10, 0x24, 0x28),
             string: c(0x6a, 0x8c, 0x88),
+                        velocity_loud: c(0xfe, 0x88, 0x56),
+            velocity_quiet: c(0x1b, 0xbf, 0x82),
             channel_palette: Some(2),
             dark: dark_of(&[("background", (0x10, 0x24, 0x28))]),
         },
@@ -533,6 +606,8 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x55, 0x78, 0xff),
             fretboard: c(0x0a, 0x1c, 0x34),
             string: c(0x78, 0x98, 0xb8),
+                        velocity_loud: c(0xfe, 0x6c, 0x56),
+            velocity_quiet: c(0x18, 0xad, 0x8f),
             channel_palette: Some(3),
             dark: dark_of(&[("background", (0x0a, 0x1c, 0x34))]),
         },
@@ -570,6 +645,8 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x8a, 0x8a, 0x8a),
             fretboard: c(0x1a, 0x1a, 0x1a),
             string: c(0x78, 0x78, 0x78),
+                        velocity_loud: c(0xff, 0x70, 0x70),
+            velocity_quiet: c(0x29, 0xab, 0x3f),
             channel_palette: Some(4),
             dark: dark_of(&[("background", (0x14, 0x14, 0x14))]),
         },
@@ -600,6 +677,8 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x7f, 0xa0, 0x5a),
             fretboard: c(0x27, 0x24, 0x20),
             string: c(0xa8, 0x98, 0x80),
+                        velocity_loud: c(0xff, 0x7e, 0x57),
+            velocity_quiet: c(0x80, 0xb1, 0x5f),
             channel_palette: Some(5),
             dark: dark_of(&[("background", (0x19, 0x17, 0x14))]),
         },
@@ -627,6 +706,8 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0xa9, 0x7b, 0xf0),
             fretboard: c(0x1e, 0x21, 0x30),
             string: c(0x6b, 0x72, 0x90),
+                        velocity_loud: c(0xff, 0x70, 0xa5),
+            velocity_quiet: c(0x1a, 0xb8, 0x63),
             channel_palette: Some(6),
             dark: dark_of(&[("background", (0x12, 0x14, 0x1b))]),
         },
@@ -662,6 +743,8 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x7d, 0x8f, 0x5a),
             fretboard: c(0xc9, 0xb5, 0x96),
             string: c(0x6b, 0x5c, 0x48),
+                        velocity_loud: c(0xc6, 0x3e, 0x1c),
+            velocity_quiet: c(0x31, 0x85, 0x13),
             channel_palette: Some(7),
             dark: dark_of(&[("background", (0x4a, 0x3f, 0x34))]),
         },
@@ -691,6 +774,8 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x5d, 0x6b, 0x78),
             fretboard: c(0x3a, 0x3a, 0x40),
             string: c(0xc9, 0xc9, 0xcf),
+                        velocity_loud: c(0xff, 0xa3, 0xab),
+            velocity_quiet: c(0x47, 0xd0, 0x67),
             channel_palette: Some(8),
             dark: dark_of(&[("background", (0x26, 0x26, 0x2a))]),
         },
@@ -717,6 +802,8 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x6f, 0xc3, 0xb8),
             fretboard: c(0x13, 0x2b, 0x47),
             string: c(0x8f, 0xa8, 0xc0),
+                        velocity_loud: c(0xfe, 0x7d, 0x3d),
+            velocity_quiet: c(0x2b, 0xb4, 0xaa),
             channel_palette: Some(9),
             dark: dark_of(&[("background", (0x0d, 0x1c, 0x33))]),
         },
@@ -744,6 +831,8 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x5a, 0x8a, 0x7a),
             fretboard: c(0x39, 0x42, 0x4e),
             string: c(0xc2, 0xc8, 0xd0),
+                        velocity_loud: c(0xff, 0xa3, 0xb6),
+            velocity_quiet: c(0x33, 0xd7, 0x7a),
             channel_palette: Some(10),
             dark: dark_of(&[("background", (0x2a, 0x33, 0x40))]),
         },
@@ -771,6 +860,8 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x7f, 0xae, 0x94),
             fretboard: c(0x1d, 0x27, 0x18),
             string: c(0x9a, 0xa8, 0x8c),
+                        velocity_loud: c(0xff, 0x8a, 0x3d),
+            velocity_quiet: c(0x1b, 0xbe, 0x9d),
             channel_palette: Some(11),
             dark: dark_of(&[("background", (0x13, 0x1a, 0x12))]),
         },
@@ -798,6 +889,8 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x8f, 0xa0, 0x6a),
             fretboard: c(0x24, 0x1d, 0x18),
             string: c(0xb8, 0xac, 0x98),
+                        velocity_loud: c(0xff, 0x67, 0x57),
+            velocity_quiet: c(0x18, 0xad, 0x71),
             channel_palette: Some(12),
             dark: dark_of(&[("background", (0x16, 0x13, 0x11))]),
         },
@@ -824,6 +917,8 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0xc0, 0x8a, 0x5a),
             fretboard: c(0x1b, 0x2f, 0x2b),
             string: c(0xa8, 0xb8, 0xb2),
+                        velocity_loud: c(0xff, 0x83, 0x57),
+            velocity_quiet: c(0x1a, 0xbb, 0x90),
             channel_palette: Some(13),
             dark: dark_of(&[("background", (0x14, 0x20, 0x1d))]),
         },
@@ -851,6 +946,8 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x8f, 0x7f, 0xd0),
             fretboard: c(0x22, 0x1b, 0x3a),
             string: c(0x9a, 0x90, 0xb8),
+                        velocity_loud: c(0xff, 0x70, 0x96),
+            velocity_quiet: c(0x19, 0xb3, 0x99),
             channel_palette: Some(14),
             dark: dark_of(&[("background", (0x16, 0x12, 0x28))]),
         },
@@ -878,6 +975,8 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x9f, 0x7f, 0xd8),
             fretboard: c(0x25, 0x18, 0x40),
             string: c(0xa8, 0x98, 0xc0),
+                        velocity_loud: c(0xff, 0x57, 0xab),
+            velocity_quiet: c(0x18, 0xae, 0x4a),
             channel_palette: Some(15),
             dark: dark_of(&[("background", (0x19, 0x10, 0x26))]),
         },
@@ -952,6 +1051,14 @@ pub const EXAMPLE: &str = r##"{
   "fretboard": "",
   "string": "",
 
+  "_comment_velocity": "The MIDI editor's velocity lane: the colour a note at",
+  "_comment_velocity2": "127 wears and the colour one at 1 does; every velocity",
+  "_comment_velocity3": "between them is on the line. Both are pushed away from the",
+  "_comment_velocity4": "roll until they can be seen, so a hard-to-read pair still",
+  "_comment_velocity5": "gives you a lane you can read.",
+  "velocity_loud": "",
+  "velocity_quiet": "",
+
   "_comment_dark": "DARK MODE. Any role above can be named again in here, and",
   "_comment_dark2": "what you name WINS. Leave a role out and it is derived, the",
   "_comment_dark3": "way dark mode has always worked - the keyboard inverts, the",
@@ -976,7 +1083,9 @@ pub const EXAMPLE: &str = r##"{
     "fx_strip": "",
     "input_chip": "",
     "fretboard": "",
-    "string": ""
+    "string": "",
+    "velocity_loud": "",
+    "velocity_quiet": ""
   },
 
   "_comment4": "channel_palette picks what the SIXTEEN channels wear, plus the",
@@ -1233,26 +1342,18 @@ mod tests {
         // A half-filled factory theme reads as a bug on somebody's screen:
         // half the app in the new colours, half in the old ones.
         for t in factory().into_iter().skip(1) {
-            for (role, set) in [
-                ("white_key", t.white_key.is_some()),
-                ("black_key", t.black_key.is_some()),
-                ("key_active", t.key_active.is_some()),
-                ("sustain", t.sustain.is_some()),
-                ("key_separator", t.key_separator.is_some()),
-                ("text", t.text.is_some()),
-                ("theory_line", t.theory_line.is_some()),
-                ("interval_text", t.interval_text.is_some()),
-                ("recorder_bg", t.recorder_bg.is_some()),
-                ("fx_knob", t.fx_knob.is_some()),
-                ("master_knob", t.master_knob.is_some()),
-                ("meter_bg", t.meter_bg.is_some()),
-                ("scope_draw", t.scope_draw.is_some()),
-                ("fx_strip", t.fx_strip.is_some()),
-                ("input_chip", t.input_chip.is_some()),
-                ("fretboard", t.fretboard.is_some()),
-                ("string", t.string.is_some()),
-            ] {
-                assert!(set, "{} leaves {role} unset", t.name);
+            // **Walked from `ROLES`, never from a list written here.** The
+            // list that used to live in this test held seventeen names and
+            // `ROLES` held nineteen, so `varispeed` — a role in every factory
+            // theme and in the reader — was going unchecked. A test that
+            // keeps its own copy of the thing it is checking will always
+            // eventually check the copy.
+            for role in ROLES {
+                assert!(
+                    t.role(role).is_some(),
+                    "{} leaves {role} unset",
+                    t.name
+                );
             }
         }
     }

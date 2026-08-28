@@ -331,7 +331,7 @@ pub const PADS: usize = ivory_ui::recorder::DRUM_PADS;
 /// the pads' bays ride the same index space as everything else, seats
 /// `STRIPS + 1 ..`, so loading, editors and state sidecars need no second
 /// machinery. See `pad_rack_index`.
-pub const RACK_SEATS: usize = STRIPS + 1 + PADS;
+pub const RACK_SEATS: usize = ivory_ui::recorder::MASTER_EXTRA_SEAT + 1;
 
 /// Where pad `i`'s bays live in the insert space.
 pub const fn pad_rack_index(pad: usize) -> usize {
@@ -1566,6 +1566,12 @@ struct Shared {
     /// device mix after this, which is why the master and the click behave
     /// like two faders on a desk rather than one inside the other.
     master_gain: AtomicU32,
+    /// **Fold the master to MONO on the way out.** A mix check, not a mix
+    /// decision: it is what you press to hear what a phone speaker, a club
+    /// PA or an AM radio will do to a wide stereo image. The take and the
+    /// speakers both get it, because a fold you cannot record is a fold you
+    /// cannot compare against.
+    master_mono: AtomicBool,
     /// Decibels of gain reduction the limiter has applied since the UI last
     /// looked — a positive number, zero for none. Read and reset.
     gr_db: AtomicU32,
@@ -1660,7 +1666,11 @@ struct Shared {
     /// The three loudness readings, as `f32` bits — momentary, short-term,
     /// integrated. Published ten times a second, which is the rate they can
     /// actually change at: see `loudness::CELL_S`.
-    lufs: [AtomicU32; 3],
+    /// **Seven now, not three.** `[momentary, short, integrated]` as
+    /// before, then the stereo pair for the two sliding windows —
+    /// `[mom L, mom R, short L, short R]`. Appended rather than
+    /// interleaved, so every existing index still means what it did.
+    lufs: [AtomicU32; 7],
     /// Bumped by the UI thread to ask for the integrated reading to start
     /// again. A generation and not a flag, so two presses in one callback are
     /// still one reset and neither is lost.
@@ -1805,6 +1815,7 @@ impl Shared {
             drums_gain: AtomicU32::new(1.0f32.to_bits()),
             drums_pan: AtomicU32::new(0.0f32.to_bits()),
             master_gain: AtomicU32::new(1.0f32.to_bits()),
+            master_mono: AtomicBool::new(false),
             // The first channel — the desk's default instrument — sends
             // everything and nothing else sends anything, which is the same
             // sound the old five-slots-send-all default made. See the UI's
@@ -3631,8 +3642,17 @@ impl Renderer {
             // **The master's own rack, before the master's built-in insert.**
             // The limiter stays last on the way out, which is what a limiter
             // is for: an effect after it would undo the ceiling it just made.
+            // **The master's SECOND rack, first.** Its three bays are drawn
+            // above the original three on the strip, and a rack runs top to
+            // bottom — so they run before them. That order is also what
+            // keeps an existing session sounding the same: its plugins are
+            // still in the seat they were in, in the same place in the
+            // chain, with three empty bays added in front of them (and an
+            // empty rack returns immediately).
+            self.run_insert_chain(ivory_ui::recorder::MASTER_EXTRA_SEAT, false, n);
             self.run_insert_chain(STRIPS, false, n);
             let master = Shared::f32_of(&self.shared.master_gain);
+            let mono = self.shared.master_mono.load(Ordering::Relaxed);
             if let Some(mix) = self.mix.get_mut(..n * TAP_CHANNELS) {
                 self.master_effects.process(
                     mix,
@@ -3650,6 +3670,7 @@ impl Renderer {
                         *v *= master;
                     }
                 }
+                fold_mono(mix, mono);
             }
             // The speakers' own insert, the same settings, its own state —
             // and only while the two mixes differ. Idle it costs nothing; a
@@ -3669,6 +3690,7 @@ impl Renderer {
                             *v *= master;
                         }
                     }
+                    fold_mono(room, mono);
                 }
             }
             // How hard the limiter worked, for the meter beside it. Kept as
@@ -3690,6 +3712,22 @@ impl Renderer {
                 let frame_index = done + i;
                 let at2 = i * TAP_CHANNELS;
                 let take = &self.mix[at2..at2 + TAP_CHANNELS];
+                // **The loudness meter reads the TAKE'S mix, post-master.**
+                //
+                // It is a readout about the FILE — what a streaming service
+                // will normalise, what the export will measure at — so it
+                // has to be the programme that gets written down. That means
+                // after the master's inserts, after the limiter, after the
+                // master fader and after the mono fold, which is exactly
+                // where `self.mix` stands by this point.
+                //
+                // And `self.mix` rather than the pair below: when monitoring
+                // is withholding an input the speakers get `self.room`, and
+                // measuring that would report a number for a mix nobody is
+                // exporting. The click is not in it either — it joins the
+                // tape separately, at its own level — which is right for the
+                // same reason.
+                lufs_moved |= self.loudness.push(take[0], take[1]);
 
                 map_frame(take, &mut self.frame[..TAP_CHANNELS]);
                 let tap_at = tap_frames * TAP_CHANNELS;
@@ -3742,16 +3780,6 @@ impl Renderer {
                     let mag = self.frame[c].abs();
                     if mag >= CLIP_LEVEL {
                         clipped = true;
-                    }
-                    // **The loudness meter, from the same pair and only the
-                    // pair.** A device with twelve outputs is still a stereo
-                    // programme: BS.1770 weights the front two at 1.0 and the
-                    // hardware routes below are copies of channels that are
-                    // already on it. Counting them would read a channel
-                    // routed to a headphone amp as a second source and put
-                    // the whole programme three decibels loud.
-                    if c == 1 {
-                        lufs_moved |= self.loudness.push(self.frame[0], self.frame[1]);
                     }
                     if c == 0 {
                         peak_l = peak_l.max(mag);
@@ -3808,7 +3836,8 @@ impl Renderer {
         // readings actually moved. See `Loudness::push`.
         if lufs_moved {
             let (m, st, i) = self.loudness.read();
-            for (cell, v) in self.shared.lufs.iter().zip([m, st, i]) {
+            let [ml, mr, sl, sr] = self.loudness.read_stereo();
+            for (cell, v) in self.shared.lufs.iter().zip([m, st, i, ml, mr, sl, sr]) {
                 cell.store(v.to_bits(), Ordering::Relaxed);
             }
         }
@@ -5864,6 +5893,26 @@ pub struct Engine {
     hold_at: Cell<Instant>,
 }
 
+/// Sum an interleaved stereo buffer to mono, in place.
+///
+/// **A no-op when it is off**, and the branch is outside the loop: this runs
+/// on the audio callback for every frame that leaves the desk.
+///
+/// Halved rather than summed. Two identical channels added together are 6 dB
+/// louder than either, so a fold that summed would make every mono check
+/// clip and teach the user that mono is loud rather than what mono does to
+/// their image.
+fn fold_mono(buf: &mut [f32], on: bool) {
+    if !on {
+        return;
+    }
+    for f in buf.chunks_exact_mut(TAP_CHANNELS) {
+        let m = (f[0] + f[1]) * 0.5;
+        f[0] = m;
+        f[1] = m;
+    }
+}
+
 impl Engine {
     /// Open the default output device (or `out_device` by name) and start it.
     ///
@@ -7008,11 +7057,14 @@ impl Engine {
                 peak: peak_l,
                 rms: rms_l,
                 hold: hold.0,
+                // Ballistics are the app's — see `Level::vu`.
+                vu: 0.0,
             },
             right: ivory_ui::recorder::Level {
                 peak: if mono { peak_l } else { peak_r },
                 rms: if mono { rms_l } else { rms_r },
                 hold: if mono { hold.0 } else { hold.1 },
+                vu: 0.0,
             },
             mono,
             clipped: s.clipped.load(Ordering::Relaxed),
@@ -7050,6 +7102,13 @@ impl Engine {
     pub fn loudness(&self) -> (f32, f32, f32) {
         let r = |i: usize| f32::from_bits(self.shared.lufs[i].load(Ordering::Relaxed));
         (r(0), r(1), r(2))
+    }
+
+    /// The stereo pair behind the ladder: `[mom L, mom R, short L, short R]`.
+    /// See `loudness::Loudness::read_stereo` for why there is no integrated
+    /// pair.
+    pub fn loudness_stereo(&self) -> [f32; 4] {
+        std::array::from_fn(|i| f32::from_bits(self.shared.lufs[i + 3].load(Ordering::Relaxed)))
     }
 
     /// Start the integrated reading again. See `Loudness::reset_integrated`.
@@ -7455,6 +7514,11 @@ impl Engine {
         self.shared
             .fx_return
             .store(linear.clamp(0.0, 8.0).to_bits(), Ordering::Relaxed);
+    }
+
+    /// Fold the master to mono, or stop. See [`Shared::master_mono`].
+    pub fn set_master_mono(&self, on: bool) {
+        self.shared.master_mono.store(on, Ordering::Relaxed);
     }
 
     /// The master, as a linear gain. See [`Shared::master_gain`].
@@ -8599,6 +8663,32 @@ impl Default for StallWatch {
 
 #[cfg(test)]
 mod tests {
+
+    /// **The mono fold sums to the MEAN, not the sum.**
+    ///
+    /// Two identical channels added together are 6 dB louder than either, so
+    /// a fold that summed would clip every mono check and teach the user
+    /// that mono is loud rather than what mono does to their image.
+    #[test]
+    fn folding_to_mono_keeps_the_level() {
+        // Hard left, nothing right: the fold puts half of it in both.
+        let mut buf = [1.0f32, 0.0, 0.5, -0.5, 0.3, 0.3];
+        super::fold_mono(&mut buf, true);
+        assert!((buf[0] - 0.5).abs() < 1e-6, "{buf:?}");
+        assert!((buf[1] - 0.5).abs() < 1e-6, "{buf:?}");
+        // Out of phase cancels, which is the whole reason to press it.
+        assert!(buf[2].abs() < 1e-6, "{buf:?}");
+        assert!(buf[3].abs() < 1e-6, "{buf:?}");
+        // Already mono comes out UNCHANGED — not 6 dB louder.
+        assert!((buf[4] - 0.3).abs() < 1e-6, "{buf:?}");
+        assert!((buf[5] - 0.3).abs() < 1e-6, "{buf:?}");
+
+        // Off is a no-op, and the branch is outside the loop for a reason:
+        // this runs on the audio callback.
+        let mut same = [1.0f32, 0.0];
+        super::fold_mono(&mut same, false);
+        assert_eq!(same, [1.0, 0.0]);
+    }
     use super::*;
 
     // ── the output stall watchdog ──────────────────────────────────────────
