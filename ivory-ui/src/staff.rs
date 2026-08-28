@@ -740,7 +740,10 @@ fn palette(s: &Settings) -> Palette {
     } else {
         crate::recorder_panel::INK_DARK
     };
-    let lit = s.white_key_active_color.to_color32();
+    // Derived against the page — see `recorder_panel::lit_on`. One themed
+    // lit colour serves the keyboard and both modes of this page, and Mono's
+    // is white on paper.
+    let lit = crate::recorder_panel::lit_on(s.white_key_active_color.to_color32(), bg);
     Palette {
         bg,
         ink,
@@ -867,6 +870,14 @@ impl Frame {
     // what the app shows for every second nobody is playing. The name goes in
     // the gutter the staff leaves, and appears and disappears there without
     // moving anything.
+    //
+    // **That was true of the RECT and false of the MUSIC**, and the gap
+    // between the two is the whole of this note. The staff gets the full
+    // panel here, and then `Frame::new` centred the staff-plus-name BLOCK
+    // inside it — so the music itself sat half a name box left of centre
+    // whether or not a name was showing. Centring is done on the STAFF now,
+    // and the name box only pushes it when there would otherwise be no room
+    // for the name; see the `slack` there.
     let staff_rect = match has_readout {
         true if wide => rect,
         true => {
@@ -917,7 +928,23 @@ impl Frame {
     } else {
         0.0
     };
-    let left = staff_rect.left() + (staff_rect.width() - used_w - name_box) * 0.5;
+    // **Centre the STAFF, and only give ground when the name would not fit.**
+    //
+    // This centred the staff-plus-name BLOCK, which displaces the music left
+    // by half the name box — about eighty points on a grand staff at 1300 —
+    // for the whole time nothing is sounding, which is most of the time. On a
+    // panel showing the staff ALONE that reads as a page pinned to the left
+    // with an empty gutter beside it, and the comments above still describe
+    // the centring this replaced.
+    //
+    // So: true centre, unless centring would push the name box off the right
+    // edge, in which case sit as far right as still leaves room for it. On a
+    // wide panel the first term wins and the name lives in the gutter beside
+    // centred music; near the `wide` threshold the second takes over and the
+    // shape degrades to what it was rather than clipping the name.
+    let slack = staff_rect.width() - used_w;
+    let left = staff_rect.left()
+        + (slack * 0.5).min((slack - name_box - space).max(0.0));
     let top = staff_rect.top() + (staff_rect.height() - used_h) * 0.5;
     // A margin that grows with the staff rather than with the window, so the
     // clef sits the same distance from the edge at every size.
@@ -1750,6 +1777,12 @@ mod tests {
                 for (what, fg, floor) in [
                     ("staff ink", p.ink, 4.5),
                     ("ledger", p.faint, 3.0),
+                    // **The lit note, against the page.** The pair below
+                    // already checked that the note's NAME reads on the disc;
+                    // nothing checked that the disc reads on the paper. Mono's
+                    // white key_active measured 1.25:1 on its own light page
+                    // and passed every audit in this file.
+                    ("lit note", p.lit, 3.0),
                 ] {
                     let r = crate::recorder_panel::contrast_ratio(fg, p.bg);
                     if r < floor {
@@ -2388,6 +2421,76 @@ mod tests {
     /// needs its own ledger room and the gap is wider. Getting this backwards
     /// produces a grand staff with a chasm down the middle, which is what the
     /// first version drew.
+    /// **Sheet music alone sits in the middle of its panel.**
+    ///
+    /// It used to centre the staff-plus-name BLOCK, which pushes the music
+    /// left by half the reserved name box — about eighty points on a grand
+    /// staff at 1300 — for the whole time nothing is sounding, which is most
+    /// of the time. With the staff as the only theory element on screen that
+    /// reads as a page pinned to the left with an empty gutter beside it.
+    ///
+    /// Three real panel shapes, and the two regimes the formula has. Where
+    /// there is room, the margins are EQUAL. Where the staff nearly fills the
+    /// panel there is nothing to centre in, and the rule is that it gives
+    /// ground leftward to keep the name box on screen — never rightward, and
+    /// never past the edges of the body.
+    #[test]
+    fn the_staff_centres_when_there_is_room_and_never_leaves_its_body() {
+        for (wname, ww, wh, set) in [
+            ("1540x1190 treble", 1540.0_f32, 1190.0_f32, "treble"),
+            ("970x1190 grand", 970.0, 1190.0, "grand"),
+            ("1300x375 grand", 1300.0, 375.0, "grand"),
+        ] {
+            let mut s = Settings::default();
+            set.clone_into(&mut s.staff_set);
+            s.staff_key = 0;
+            let cell = Rect::from_min_size(Pos2::ZERO, Vec2::new(ww, wh));
+            let body = crate::theory_panel::staff_body(cell);
+            let f = Frame::new(body, true, &s).expect("fits");
+            let left_margin = f.left - body.left();
+            let right_margin = body.right() - (f.left + f.used_w);
+
+            assert!(
+                left_margin >= -0.01,
+                "{wname}: the staff starts {left_margin:.2} left of its body"
+            );
+            assert!(
+                right_margin >= -0.01,
+                "{wname}: the staff runs {:.2} past the right edge",
+                -right_margin
+            );
+            // The one-sided rule. Equal is centred; less is the degraded
+            // regime holding the name box on screen. More would mean it had
+            // pushed the music RIGHT of centre, which nothing asks for.
+            assert!(
+                left_margin <= right_margin + 0.01,
+                "{wname}: the staff sits right of centre ({left_margin:.2} vs {right_margin:.2})"
+            );
+        }
+    }
+
+    /// The regime where centring is actually possible: a short, wide panel,
+    /// where the staff is a fraction of the width and the margins must match.
+    #[test]
+    fn a_staff_with_room_around_it_is_truly_centred() {
+        let mut s = Settings::default();
+        "grand".clone_into(&mut s.staff_set);
+        s.staff_key = 0;
+        let cell = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 375.0));
+        let body = crate::theory_panel::staff_body(cell);
+        let f = Frame::new(body, true, &s).expect("fits");
+        let left_margin = f.left - body.left();
+        let right_margin = body.right() - (f.left + f.used_w);
+        assert!(
+            f.used_w < body.width() * 0.5,
+            "this shape no longer has room to centre in; pick another"
+        );
+        assert!(
+            (left_margin - right_margin).abs() < 1.0,
+            "the staff is not centred: {left_margin:.2} left, {right_margin:.2} right"
+        );
+    }
+
     #[test]
     fn the_band_is_tall_enough_for_what_is_on_it() {
         let empty = StaffSet::Custom(Vec::new());

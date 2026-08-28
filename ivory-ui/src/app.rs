@@ -152,6 +152,13 @@ fn wm_overrode_size(observed: Vec2, requested: Vec2) -> bool {
 /// between two pixels, and snapping there is still snapping mid-drag.
 const SETTLE_FRAMES: u8 = 2;
 
+/// How thick the recording line round the window is.
+///
+/// Two, down from the three the band's border wore: round a whole window the
+/// same weight reads as heavier, and this has to be unmistakable without
+/// being the thing you look at while playing.
+const REC_OUTLINE_W: f32 = 2.0;
+
 /// How many timeline tracks a full-screen or tiled window shows.
 ///
 /// Ten rather than sixteen: a track row carries a name, three dials, a meter,
@@ -5466,6 +5473,28 @@ impl IvoryApp {
     }
 
     /// The folders the user has added, for the host's scanner.
+    /// **The three media folders, made real.** For the host to call once at
+    /// launch.
+    ///
+    /// Takes, Projects and Exports under `Documents/Tangent Media` are
+    /// RESOLVED rather than stored, and until now nothing created them: they
+    /// appeared when the first take was written, the first project saved, the
+    /// first export run. Every SHOW button on the cog card therefore did
+    /// nothing at all on a fresh install, and "Save As" opened a panel at a
+    /// folder that was not there.
+    ///
+    /// **Not in `Settings::load` and not in `IvoryApp::new`**, which is why
+    /// it is a method the host calls rather than something that happens on
+    /// its own: the VST3 loads settings too, and a plugin scanned by some
+    /// other DAW's background scanner must not create folders in the user's
+    /// Documents. `create_dir_all` succeeds on a directory already there, so
+    /// this is a no-op on every launch after the first.
+    pub fn make_media_folders(&self) {
+        for root in self.settings.media_roots() {
+            let _ = std::fs::create_dir_all(&root);
+        }
+    }
+
     pub fn plugin_folders(&self) -> Vec<std::path::PathBuf> {
         self.settings
             .plugin_paths
@@ -5479,6 +5508,30 @@ impl IvoryApp {
     /// Latched and drained, exactly like every other request this crate makes:
     /// the UI records that it wants one, the host does it after the frame, and
     /// nothing between those two points opens a directory.
+    /// **"Add a folder..." — opened at HOME.**
+    ///
+    /// Both doors into this — the cog card's PLUGINS row and the menu's
+    /// "Add a Folder..." — used to send `start_at: None`, and the host only
+    /// calls `set_directory` when there is a Some, so the panel opened
+    /// wherever the OS happened to have left it. That is a poor first frame
+    /// for a question about a folder: plugins live in a handful of places
+    /// under the user's own account, and home is the one directory every
+    /// answer is reachable from.
+    ///
+    /// One method rather than two identical bodies, which is how the two
+    /// drifted in the first place.
+    fn open_plugin_folder_picker(&mut self) {
+        if !self.caps.native_file_dialogs {
+            return;
+        }
+        self.native_panel_up = true;
+        self.dir_request = Some(crate::ports::DirRequest {
+            start_at: Some(dirs_home()),
+            title: "Where else should Tangent look for VST3 plugins?".to_owned(),
+            purpose: crate::ports::DirPurpose::PluginFolder,
+        });
+    }
+
     pub fn take_plugin_rescan(&mut self) -> bool {
         std::mem::take(&mut self.plugin_rescan)
     }
@@ -15463,14 +15516,12 @@ impl IvoryApp {
                 // The menu's "Add a Folder...", from the cog. The pick
                 // lands through the same DirRequest door and the scan
                 // follows it.
-                if self.caps.native_file_dialogs {
-                    self.native_panel_up = true;
-                    self.dir_request = Some(crate::ports::DirRequest {
-                        start_at: None,
-                        title: "Where else should Tangent look for VST3 plugins?".to_owned(),
-                        purpose: crate::ports::DirPurpose::PluginFolder,
-                    });
-                }
+                self.open_plugin_folder_picker();
+            }
+            Hit::RescanPlugins => {
+                // The same latch the menu's "Rescan for Plugins" sets; the
+                // host reads it after the frame and does the scan.
+                self.plugin_rescan = true;
             }
             Hit::CloseSetup => self.setup_open = false,
             // **Requested, not done here.** The message belongs to the host —
@@ -15490,15 +15541,11 @@ impl IvoryApp {
             Hit::ChooseProjectFolder => {
                 self.ask_for_a_media_folder(crate::ports::DirPurpose::ProjectRoot);
             }
-            Hit::RevealProjectFolder => {
-                self.reveal_request = Some(self.settings.project_root());
-            }
+            Hit::RevealProjectFolder => self.reveal_folder(self.settings.project_root(), true),
             Hit::ChooseExportFolder => {
                 self.ask_for_a_media_folder(crate::ports::DirPurpose::ExportRoot);
             }
-            Hit::RevealExportFolder => {
-                self.reveal_request = Some(self.settings.export_root());
-            }
+            Hit::RevealExportFolder => self.reveal_folder(self.settings.export_root(), true),
             Hit::ToggleOpenWhenDone => {
                 self.settings.record_open_when_done = !self.settings.record_open_when_done;
                 self.save_settings();
@@ -16622,10 +16669,36 @@ impl IvoryApp {
     /// chooses. A take's own folder is passed explicitly, because a take that
     /// has finished is a more useful thing to be shown than the place takes go.
     fn reveal_record_folder(&mut self, path: Option<std::path::PathBuf>) {
+        match path {
+            Some(p) => self.reveal_folder(p, false),
+            None => self.reveal_folder(self.settings.record_root(), true),
+        }
+    }
+
+    /// **SHOW: the one door for all three folder buttons.**
+    ///
+    /// `make` says this is a ROOT — one of the three folders Tangent keeps
+    /// things in — and those are created if they are not there. The host
+    /// creates all three at launch, so this only bites when the owner has
+    /// just pointed one at somewhere new: the pick is saved immediately and
+    /// the folder itself does not exist until something is written into it,
+    /// which left SHOW doing nothing at all with no way to tell why.
+    ///
+    /// A take's own folder passes `false`. That one either exists because the
+    /// take was recorded or is gone because it was deleted, and conjuring an
+    /// empty directory named after a take that is no longer there would be a
+    /// lie about what is on the disk.
+    ///
+    /// Capability-gated like every other host errand: in the VST3 there is no
+    /// file manager to open and nothing here may write into Documents.
+    fn reveal_folder(&mut self, path: std::path::PathBuf, make: bool) {
         if !self.caps.capture_devices || !self.caps.native_file_dialogs {
             return;
         }
-        self.reveal_request = Some(path.unwrap_or_else(|| self.settings.record_root()));
+        if make {
+            let _ = std::fs::create_dir_all(&path);
+        }
+        self.reveal_request = Some(path);
     }
 
     fn ask_for_a_folder(&mut self) {
@@ -17318,16 +17391,7 @@ impl IvoryApp {
             MenuAction::RescanPlugins => {
                 self.plugin_rescan = true;
             }
-            MenuAction::AddPluginFolder => {
-                if self.caps.native_file_dialogs {
-                    self.native_panel_up = true;
-        self.dir_request = Some(crate::ports::DirRequest {
-                        start_at: None,
-                        title: "Where else should Tangent look for VST3 plugins?".to_owned(),
-                        purpose: crate::ports::DirPurpose::PluginFolder,
-                    });
-                }
-            }
+            MenuAction::AddPluginFolder => self.open_plugin_folder_picker(),
             MenuAction::ClearPluginFolders => {
                 self.settings.plugin_paths.clear();
                 self.save_settings();
@@ -21199,6 +21263,34 @@ impl IvoryApp {
             );
         }
 
+        // **RECORDING: a red line round the WHOLE WINDOW.**
+        //
+        // The one deliberate exception to "the take is the window". It used
+        // to ring the recorder BAND, from inside `recorder_panel::draw` — and
+        // that is the shared painter the COMPOSITOR calls, so the border went
+        // into every take. A viewer watching the video saw a red box round a
+        // strip of controls, which says nothing to them and is the one thing
+        // the recordist needs to see while playing.
+        //
+        // Drawn HERE, in `paint`, and that is the whole mechanism: the
+        // compositor renders takes through `paint_composite`, which never
+        // calls this function. So the line is on screen and absent from the
+        // file by construction — there is no `for_take` flag to thread
+        // anywhere, and the next person to reach for one should read this
+        // instead.
+        //
+        // Last of the in-canvas layers so it sits over the help card and the
+        // panels; `StrokeKind::Inside` on the un-shrunk rect so all of it
+        // lands in the client area rather than half under the window edge.
+        if self.recorder.state.is_active() {
+            ui.painter().rect_stroke(
+                ui.max_rect(),
+                0.0,
+                egui::Stroke::new(REC_OUTLINE_W, crate::recorder_panel::REC_RED),
+                egui::StrokeKind::Inside,
+            );
+        }
+
         // The popped-out neck. `caps.detachable` gates the DRAWING, not just
         // the menu row: `fretboard_detached` is a persisted setting, so a
         // settings file written by the standalone would otherwise have a
@@ -23364,6 +23456,43 @@ mod tests {
             app.take_recorder_request(),
             Some(recorder::RecorderRequest::OpenInsertEditor(0, 1))
         );
+    }
+
+    /// **The three media folders exist after the host asks for them**, and
+    /// the SHOW buttons therefore have somewhere to open.
+    ///
+    /// On a fresh install nothing created them: they appeared when the first
+    /// take, project or export was written, and until then every SHOW button
+    /// on the cog card silently did nothing.
+    #[test]
+    fn the_host_can_make_the_three_media_folders() {
+        let root = std::env::temp_dir().join(format!(
+            "tangent-media-roots-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut settings = Settings::default();
+        settings.record_dir = Some(root.join("t").to_string_lossy().into_owned());
+        settings.project_dir = Some(root.join("p").to_string_lossy().into_owned());
+        settings.export_dir = Some(root.join("e").to_string_lossy().into_owned());
+        let (_, app) = headless_with(Caps::DESKTOP, settings);
+
+        let roots = app.settings.media_roots();
+        assert_eq!(roots.len(), 3, "the three folders are not all named");
+        for r in &roots {
+            assert!(!r.exists(), "{} was there before anything made it", r.display());
+        }
+        app.make_media_folders();
+        for r in &roots {
+            assert!(r.is_dir(), "{} was not made", r.display());
+        }
+        // A second launch is a no-op rather than an error.
+        app.make_media_folders();
+        for r in &roots {
+            assert!(r.is_dir(), "{} did not survive a second launch", r.display());
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// **What was picked is what somebody wants to look at now.** Choosing a

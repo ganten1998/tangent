@@ -436,7 +436,6 @@ fn shade_line(c: Color32, k: f32) -> Color32 {
 }
 
 fn palette(s: &Settings) -> Palette {
-    let lit = s.white_key_active_color.to_color32();
     // `faint` and `line` carry the outlines, the roman numerals and the key
     // signatures — everything that says what the shapes MEAN. They were
     // pitched as background texture and were hard to read in both modes: a
@@ -450,6 +449,13 @@ fn palette(s: &Settings) -> Palette {
     // backgrounds, which is what the owner saw: "ivory on every light mode,
     // black on every dark mode".
     let bg = crate::piano::themed_bg(s);
+    // **Derived against THIS page**, like the line and the ground beside it.
+    // The theme names one lit colour and it is drawn on the keyboard, on the
+    // light page and on the dark one; Mono's is white, which is 1.25:1 on its
+    // own light page. See `recorder_panel::lit_on` for why the theme table
+    // cannot fix that for any colour.
+    let lit = crate::recorder_panel::lit_on(s.white_key_active_color.to_color32(), bg);
+
     let ink = if crate::recorder_panel::wants_light_ink(bg) {
         crate::recorder_panel::INK_LIGHT
     } else {
@@ -1864,6 +1870,13 @@ mod tests {
                     ("ink", p.ink, 4.5),
                     ("faint", p.faint, 3.0),
                     ("line", p.line, 1.7),
+                    // **The lit disc, against the page it sits on.** Not
+                    // measured here until Mono showed why: its `key_active`
+                    // is white, which is 16:1 on the dark page and 1.25:1 on
+                    // the light one — an active note nobody could see, on the
+                    // one theme, in the one mode, and nothing in this file
+                    // was looking. Three, because a disc is a graphic.
+                    ("lit", p.lit, 3.0),
                 ] {
                     let r = crate::recorder_panel::contrast_ratio(fg, p.bg);
                     if r < floor {

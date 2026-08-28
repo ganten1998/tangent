@@ -635,6 +635,16 @@ impl Take {
         self.media("", "mid")
     }
 
+    /// `{take name}.mp4`.
+    ///
+    /// It was `take.mp4` — a constant, in the one folder whose whole point is
+    /// that its contents leave it. The `.wav` and the `.mid` beside it have
+    /// carried the take name since this module was written and the doc comment
+    /// on `media` gives the reason; the video simply never went through it.
+    pub fn video(&self) -> PathBuf {
+        self.media("", "mp4")
+    }
+
     /// `{dir}/take.json`.
     pub fn manifest_path(&self) -> PathBuf {
         self.dir.join(MANIFEST_NAME)
@@ -1756,6 +1766,12 @@ mod tests {
         let n = "2026-08-15_143207_nocturne";
         assert!(take.wav().ends_with(format!("{n}.wav")));
         assert!(take.midi().ends_with(format!("{n}.mid")));
+        // **The video, which this test did not name and so did not protect.**
+        // The rule was written here and honoured by the audio and the MIDI;
+        // the compositor joined a constant `take.mp4` onto the folder without
+        // ever coming through `media`, and nothing here noticed for the whole
+        // life of the recorder.
+        assert!(take.video().ends_with(format!("{n}.mp4")));
         assert!(take.media("-camera", "mp4").ends_with(format!("{n}-camera.mp4")));
         // Ten browser tabs called `video.mp4` is the failure this prevents; the
         // sidecar is exempt because it is only ever read in place.

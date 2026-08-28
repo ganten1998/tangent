@@ -6353,6 +6353,11 @@ impl DesktopApp {
             // default and is then torn down and restarted, which is a five-
             // second instrument reload at every launch.
             ivory_record::audio::set_system(app.audio_system().as_deref());
+            // **Takes, Projects and Exports, made real.** Once, here, in the
+            // host — see `make_media_folders`. Doing it at launch rather than
+            // at first write is what makes the three SHOW buttons on the cog
+            // card work on a machine Tangent has never recorded on.
+            app.make_media_folders();
             // Every installed VST3, by path and file name. This is a DIRECTORY
             // LISTING, not a scan: nothing is opened, so it costs milliseconds
             // even with 112 of them, and no plugin gets the chance to crash the
@@ -6818,7 +6823,7 @@ impl DesktopApp {
         // The folder FIRST, and the flag only after it. Setting the flag before
         // this check is what turned "the take is not ready yet" into "this take
         // will never have video" — a one-frame condition becoming permanent.
-        let Some(dir) = self.recorder.session.take_dir().map(|d| d.to_path_buf()) else {
+        let Some(path) = self.recorder.session.take_video() else {
             return;
         };
         self.recorder.video_tried = true;
@@ -6836,7 +6841,6 @@ impl DesktopApp {
                 Some("the video has neither the camera nor the display in it".to_owned());
             return;
         }
-        let path = dir.join("take.mp4");
         let video = ivory_record::encode::VideoSpec {
             width: w,
             height: h,

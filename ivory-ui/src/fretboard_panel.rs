@@ -430,11 +430,26 @@ fn palette(s: &Settings, wood: Wood) -> Palette {
         inlay,
         // Whatever a held key looks like on the piano is what a held note
         // looks like here. The user already chose this colour once.
-        dot: s.white_key_active_color.to_color32(),
+        // **Derived against the BOARD**, which is a different ground from the
+        // theory page's — so this lands on a different value, and that is
+        // right rather than a drift. See `recorder_panel::lit_on`.
+        dot: crate::recorder_panel::lit_on(s.white_key_active_color.to_color32(), board),
         dot_text: {
-            let c = s.white_key_active_color.to_color32();
-            let bright = u32::from(c.r()) + u32::from(c.g()) + u32::from(c.b()) > 3 * 140;
-            if bright { Color32::from_gray(0x18) } else { Color32::from_gray(0xF0) }
+            // **Measured, not thresholded.** This picked its ink by summing
+            // the channels against 3 * 140 — a brightness threshold, which is
+            // the exact way this app has produced unreadable text seven times
+            // and has removed everywhere else. The ink a surface carries is a
+            // property of that surface, and `wants_light_ink` is where it is
+            // decided.
+            let c = crate::recorder_panel::lit_on(
+                s.white_key_active_color.to_color32(),
+                board,
+            );
+            if crate::recorder_panel::wants_light_ink(c) {
+                crate::recorder_panel::INK_LIGHT
+            } else {
+                crate::recorder_panel::INK_DARK
+            }
         },
         dot_edge: wood.pale().then(|| Color32::from_rgb(0x3a, 0x2c, 0x1a)),
         on_board,
