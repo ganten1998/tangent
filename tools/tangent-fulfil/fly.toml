@@ -16,7 +16,7 @@ primary_region = "iad"
 # without this it lives in the container and vanishes on every deploy, taking
 # idempotency (and your ability to re-send a key) with it.
 [[mounts]]
-  source = "ivory_data"
+  source = "tangent_data"
   destination = "/data"
 
 [http_service]
