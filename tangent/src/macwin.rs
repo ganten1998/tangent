@@ -1,0 +1,324 @@
+//! **Two AppKit facts winit does not surface, and one hook it does not install.**
+//!
+//! The app's layout is aspect-locked by construction: every band's height is a
+//! fixed fraction of the window's width, so there is exactly one height per
+//! width and every other height is empty ground. Keeping a window on that
+//! curve has, until now, meant watching the size until it stopped moving and
+//! then teleporting the window onto the curve — which cannot track a hand by
+//! construction, and which fights a tiling window manager forever because the
+//! tiler re-tiles and the correction fires again.
+//!
+//! Two things fix that, and neither is reachable from `tangent-ui`:
+//!
+//! 1. **`-[NSWindow inLiveResize]`** answers "is a hand on our edge right
+//!    now", which is the difference between a user dragging and a window
+//!    manager placing us. `egui::ViewportInfo` has no such field and winit
+//!    0.30 emits no event for `windowWillStartLiveResize:`.
+//! 2. **`windowWillResize:toSize:`** is asked by AppKit for every intermediate
+//!    size during a live resize, and whatever it returns is what the window
+//!    becomes. Answering it puts the OS itself on the aspect curve, so there
+//!    is no wrong size to correct and no correction to see.
+//!
+//! `NSWindow.contentAspectRatio` would be the obvious API and is dead here:
+//! winit's own `windowWillStartLiveResize:` calls `setContentResizeIncrements`,
+//! which zeroes the aspect at the instant a drag begins.
+//!
+//! **Why a class patch rather than our own delegate.** The window's delegate
+//! belongs to winit and drives its whole event loop; replacing it breaks the
+//! app. winit's `WinitWindowDelegate` does not implement
+//! `windowWillResize:toSize:` at all, so the method can simply be ADDED to the
+//! class — no swizzling, nothing displaced. If a future winit implements it,
+//! `class_addMethod` returns false, the hook is reported as unavailable, and
+//! the app's own correction stays armed.
+//!
+//! # Safety
+//!
+//! The callback runs inside AppKit's nested event-tracking run loop, on the
+//! main thread, while the user's mouse button is down. A Rust panic unwinding
+//! across the Objective-C boundary is undefined behaviour, and a crash there
+//! is a crash mid-drag. So the callback allocates nothing, locks nothing,
+//! logs nothing, and calls no fallible API without a total fallback: every
+//! path that cannot answer returns the size AppKit proposed, unchanged.
+
+#![cfg(target_os = "macos")]
+
+use std::sync::atomic::{AtomicPtr, Ordering};
+
+use objc2::runtime::{AnyClass, AnyObject, Bool, Sel};
+use objc2::{sel, ClassType};
+use objc2_app_kit::{NSEvent, NSView, NSWindow};
+use objc2_foundation::NSSize;
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+/// What the host can see, for [`tangent_ui::host::Gesture`] and the aspect lock.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Facts {
+    pub gesture: tangent_ui::host::Gesture,
+    pub os_aspect_lock: bool,
+}
+
+/// The window the hook is allowed to touch.
+///
+/// Every winit window in the process shares the delegate CLASS, so the patch
+/// reaches the detached recorder, the fretboard, chord and theory viewports
+/// and the Welcome card too. This pointer is the only thing that keeps their
+/// resizes untouched, so it is compared before anything else happens.
+static TARGET: AtomicPtr<NSWindow> = AtomicPtr::new(std::ptr::null_mut());
+
+/// The height curve, as a table the callback can read without allocating.
+static CURVE: AtomicPtr<Curve> = AtomicPtr::new(std::ptr::null_mut());
+
+thread_local! {
+    /// **A strong reference, so `TARGET` can never dangle.**
+    ///
+    /// The obvious mistake here is to store the raw pointer alone; then the
+    /// window can be released and the callback compares against freed memory.
+    static WINDOW: std::cell::RefCell<Option<objc2::rc::Retained<NSWindow>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Whether the class patch has been attempted, and what it answered.
+    static HOOKED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Content height at content width `w_min + i`, in whole points.
+///
+/// A table rather than a call, because the callback cannot reach back into the
+/// GUI crate: it runs while AppKit owns the thread, and `IvoryApp` is behind a
+/// `&mut self` the caller is already holding.
+struct Curve {
+    w_min: u32,
+    h: Box<[f32]>,
+}
+
+/// The widest window this table covers. Beyond it the callback declines.
+const W_MAX: u32 = 8192;
+
+impl Curve {
+    fn clamp_w(&self, w: f32) -> f32 {
+        let hi = self.w_min + self.h.len().saturating_sub(1) as u32;
+        (w.round().max(self.w_min as f32)).min(hi as f32)
+    }
+
+    fn height_at(&self, w: f32) -> f32 {
+        let i = (self.clamp_w(w) as u32).saturating_sub(self.w_min) as usize;
+        self.h.get(i).copied().unwrap_or(0.0)
+    }
+
+    /// The width whose height is closest to `target`.
+    ///
+    /// A seeded scan rather than a binary search: the height curve truncates
+    /// per band and clamps the theory term, so it is not something to assume
+    /// monotone. The seed gets within a point or two and the scan settles it
+    /// exactly, which is better than the ratio-solve-then-remeasure the app's
+    /// own arithmetic uses — that only approximates the truncation staircase.
+    fn width_for_height(&self, target: f32) -> f32 {
+        if self.h.is_empty() {
+            return self.w_min as f32;
+        }
+        let seed = match self.h.partition_point(|&h| h < target) {
+            i if i >= self.h.len() => self.h.len() - 1,
+            i => i,
+        };
+        let lo = seed.saturating_sub(16);
+        let hi = (seed + 16).min(self.h.len() - 1);
+        let mut best = seed;
+        let mut best_d = f32::INFINITY;
+        for i in lo..=hi {
+            let d = (self.h[i] - target).abs();
+            if d < best_d {
+                best_d = d;
+                best = i;
+            }
+        }
+        (self.w_min + best as u32) as f32
+    }
+}
+
+/// **Called once a frame from the desktop app.**
+///
+/// Resolves the window, installs the hook on first success, refreshes the
+/// curve when the layout's answer has moved, and reports what the OS can see.
+pub fn publish(
+    frame: &eframe::Frame,
+    height_at: &dyn Fn(f32) -> f32,
+    w_floor: f32,
+) -> Facts {
+    let Some(window) = resolve(frame) else {
+        return Facts::default();
+    };
+    refresh_curve(height_at, w_floor);
+    let hooked = install(&window);
+    Facts {
+        gesture: tangent_ui::host::Gesture {
+            live_resize: window.inLiveResize(),
+            // A global check, not an egui one: during a native window drag
+            // AppKit does not deliver mouse events to the content view at all,
+            // so egui believes nothing is pressed.
+            mouse_down: NSEvent::pressedMouseButtons() != 0,
+            // The whole point of this module: `live_resize` is a real answer
+            // here, so "a size nobody asked for" may be read as a window
+            // manager. Everywhere else that inference is unsafe.
+            resize_known: true,
+        },
+        os_aspect_lock: hooked,
+    }
+}
+
+/// The `NSWindow` behind eframe's frame, cached and kept alive.
+fn resolve(frame: &eframe::Frame) -> Option<objc2::rc::Retained<NSWindow>> {
+    if let Some(w) = WINDOW.with(|w| w.borrow().clone()) {
+        return Some(w);
+    }
+    let handle = frame.window_handle().ok()?;
+    let RawWindowHandle::AppKit(h) = handle.as_raw() else {
+        return None;
+    };
+    // SAFETY: eframe hands us a live `NSView` pointer for the window it is
+    // drawing, valid for as long as that window exists.
+    let view: &NSView = unsafe { h.ns_view.cast::<NSView>().as_ref() };
+    let window = view.window()?;
+    TARGET.store(
+        objc2::rc::Retained::as_ptr(&window).cast_mut(),
+        Ordering::Release,
+    );
+    WINDOW.with(|w| *w.borrow_mut() = Some(window.clone()));
+    Some(window)
+}
+
+/// Rebuild the table when the layout's answer has moved.
+///
+/// Probes the live function at four widths and compares against the table's
+/// own entries, so a band added later cannot be forgotten — unlike a
+/// hand-written fingerprint of whichever settings fields are believed to
+/// matter today.
+fn refresh_curve(height_at: &dyn Fn(f32) -> f32, w_floor: f32) {
+    let w_min = (w_floor.max(1.0) as u32).min(W_MAX - 1);
+    let cur = CURVE.load(Ordering::Acquire);
+    let stale = if cur.is_null() {
+        true
+    } else {
+        // SAFETY: `CURVE` only ever holds a leaked `Box<Curve>`, never freed.
+        let c = unsafe { &*cur };
+        c.w_min != w_min
+            || [w_min, w_min + 200, 1300, 2560].iter().any(|&w| {
+                let w = w.clamp(c.w_min, c.w_min + c.h.len().saturating_sub(1) as u32);
+                (c.height_at(w as f32) - height_at(w as f32)).abs() > 0.5
+            })
+    };
+    if !stale {
+        return;
+    }
+    let h: Box<[f32]> = (w_min..=W_MAX).map(|w| height_at(w as f32)).collect();
+    let next = Box::into_raw(Box::new(Curve { w_min, h }));
+    // Leaked on purpose. It is rebuilt a handful of times in a session, the
+    // callback may be reading the old one on another stack frame right now,
+    // and thirty kilobytes is a smaller price than a use-after-free inside
+    // AppKit's event loop.
+    CURVE.store(next, Ordering::Release);
+}
+
+/// Add `windowWillResize:toSize:` to winit's delegate class, once.
+///
+/// Answers whether the hook is live — which is what the app uses to decide
+/// whether to keep its own correction armed.
+fn install(window: &NSWindow) -> bool {
+    if let Some(done) = HOOKED.with(std::cell::Cell::get) {
+        return done;
+    }
+    if std::env::var("IVORY_ASPECT_HOOK").as_deref() == Ok("0") {
+        HOOKED.with(|h| h.set(Some(false)));
+        return false;
+    }
+    let ok = (|| {
+        let delegate = window.delegate()?;
+        let raw: *const AnyObject = objc2::rc::Retained::as_ptr(&delegate).cast();
+        // SAFETY: a live delegate object; `class` reads its isa pointer.
+        let cls: &AnyClass = unsafe { (*raw).class() };
+        // **Refuse anything that is not the class we studied.** A future winit
+        // that renames its delegate, or implements this selector itself, must
+        // not be patched blind.
+        if cls.name().to_str().ok()? != "WinitWindowDelegate" {
+            return None;
+        }
+        // SAFETY: `will_resize` has exactly the signature the encoding
+        // describes, and `Imp` is `extern "C-unwind"` — declaring the callback
+        // `extern "C"` would compile and then be wrong at the ABI boundary.
+        let added = unsafe {
+            objc2::ffi::class_addMethod(
+                (cls as *const AnyClass).cast_mut().cast(),
+                sel!(windowWillResize:toSize:),
+                std::mem::transmute::<
+                    unsafe extern "C-unwind" fn(*mut AnyObject, Sel, *mut NSWindow, NSSize) -> NSSize,
+                    unsafe extern "C-unwind" fn(),
+                >(will_resize),
+                c"{CGSize=dd}@:@{CGSize=dd}".as_ptr(),
+            )
+        };
+        if !added.as_bool() {
+            return None;
+        }
+        // AppKit caches which selectors a delegate responds to when the
+        // delegate is set, and winit set this one long before we patched its
+        // class. Re-setting the same object forces that cache to be rebuilt.
+        // Harmless: winit holds the strong reference, the property is weak.
+        unsafe { window.setDelegate(Some(&delegate)) };
+        Some(())
+    })()
+    .is_some();
+    HOOKED.with(|h| h.set(Some(ok)));
+    ok
+}
+
+/// **The hook. A table lookup and nothing else.**
+///
+/// # Safety
+///
+/// Runs on the main thread inside AppKit's nested event-tracking loop with the
+/// mouse button down. Nothing here allocates, locks, logs, panics, or calls
+/// back into the app; every path that cannot answer returns `proposed`.
+unsafe extern "C-unwind" fn will_resize(
+    _this: *mut AnyObject,
+    _cmd: Sel,
+    sender: *mut NSWindow,
+    proposed: NSSize,
+) -> NSSize {
+    // Not our window. Every other winit window shares this delegate class, so
+    // this is what keeps the detached recorder and the theory viewports free.
+    if sender.is_null() || !std::ptr::eq(sender, TARGET.load(Ordering::Acquire)) {
+        return proposed;
+    }
+    let curve = CURVE.load(Ordering::Acquire);
+    if curve.is_null() {
+        return proposed;
+    }
+    // SAFETY: `CURVE` holds a leaked `Box<Curve>`; `sender` is a live window.
+    let (curve, win) = unsafe { (&*curve, &*sender) };
+
+    // **Chrome measured, never assumed.** It is about 32 points with
+    // decorations and exactly 0 in borderless mode, which is toggleable at
+    // runtime — so a hardcoded number drifts by a title bar per drag.
+    let frame = win.frame();
+    let content = win.contentRectForFrameRect(frame);
+    let chrome_w = frame.size.width - content.size.width;
+    let chrome_h = frame.size.height - content.size.height;
+    if !chrome_w.is_finite() || !chrome_h.is_finite() {
+        return proposed;
+    }
+    let want_w = proposed.width - chrome_w;
+    let want_h = proposed.height - chrome_h;
+
+    // Whichever edge moved leads, measured against the window's CURRENT
+    // content rect — AppKit gives us both, so unlike the app's own arithmetic
+    // there is nothing to remember and nothing to get out of step.
+    let height_led = (want_h - content.size.height).abs()
+        > (want_w - content.size.width).abs() + 0.5;
+    let w = if height_led {
+        curve.width_for_height(want_h as f32)
+    } else {
+        curve.clamp_w(want_w as f32)
+    };
+    let h = curve.height_at(w);
+    if !w.is_finite() || !h.is_finite() || h <= 0.0 {
+        return proposed;
+    }
+    NSSize::new(f64::from(w) + chrome_w, f64::from(h) + chrome_h)
+}

@@ -220,6 +220,36 @@ egui-wgpu = { version = "0.33", default-features = false, features = [
     "macos-window-resize-jitter-fix",
 ] }
 
+# **The one AppKit fact winit will not tell us, and the one hook it does not
+# install.** `-[NSWindow inLiveResize]` distinguishes a hand on our own edge
+# from a tiling window manager placing us — a difference nothing in egui or
+# winit exposes, and the difference between correcting a drag and fighting a
+# tiler. `windowWillResize:toSize:` then lets the OS apply this layout's
+# aspect DURING the drag instead of the app teleporting the window after it.
+#
+# Not new crates: tangent-host already puts these exact versions in the lock
+# file. Named here because a transitive dependency is not a nameable one.
+#
+# **UNCONDITIONAL, not behind `recorder`.** `check-firewall.sh` runs
+# `cargo check -p tangent --no-default-features`, and tangent-host is optional
+# — so a feature-gated dependency here breaks the Minimal build, and that
+# failure only shows up in the slow firewall run people skip.
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSEvent",
+    "NSResponder",
+    "NSView",
+    "NSWindow",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSGeometry",
+] }
+# eframe does NOT re-export this, and the trait has to be nameable to be used.
+# Already in the lock at 0.6.2, the same copy eframe itself resolves.
+raw-window-handle = "0.6"
+
 [target.'cfg(unix)'.dependencies]
 # `statvfs`, the other half of the same question. Already in the tree via cpal;
 # named here because a transitive dependency is not a nameable one.

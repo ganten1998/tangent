@@ -11,6 +11,12 @@
 #[cfg(feature = "recorder")]
 mod composite;
 mod desktop;
+/// Two AppKit facts winit does not surface, and the hook that lets the OS
+/// keep this aspect-locked layout on its curve DURING a drag. A target gate,
+/// not a feature gate — the convention against `#[cfg(feature)]` outside this
+/// crate is about features, and this is a platform.
+#[cfg(target_os = "macos")]
+mod macwin;
 #[cfg(feature = "recorder")]
 mod devices;
 /// Six-operator FM, and real DX7 cartridges to feed it. The instrument the app

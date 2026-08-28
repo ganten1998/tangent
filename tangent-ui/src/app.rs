@@ -187,6 +187,13 @@ fn wm_overrode_size(observed: Vec2, requested: Vec2) -> bool {
 /// bottom edges impossible to resize at all.
 const SETTLE_QUIET: Duration = Duration::from_millis(90);
 
+/// How many refusals in a row mean a window manager owns this window.
+///
+/// Two, not one. See the refusal branch in `aspect_snap`: one refusal is a
+/// clamp at a screen edge on an ordinary desktop, and most people are on an
+/// ordinary desktop. A tiler refuses every time and reaches two at once.
+const SNAP_REFUSALS_TO_LATCH: u8 = 2;
+
 /// How long a size we asked for has to be honoured before silence is refusal.
 ///
 /// A window manager that intends to overrule us does so within a frame or
@@ -1130,6 +1137,8 @@ pub struct IvoryApp {
     /// The size most recently asked for, and when. Used to tell an honoured
     /// request from a refused one from one still in flight.
     snap_asked: Option<(Vec2, Instant)>,
+    /// Consecutive refusals. One is a fluke; a tiler refuses every time.
+    snap_refusals: u8,
     /// Draw at full rate until this instant — armed by any geometry change.
     gesture_until: Option<Instant>,
     /// How many `InnerSize` commands have gone out. Probe only.
@@ -1958,6 +1967,7 @@ impl IvoryApp {
             os_aspect_lock: false,
             main_wm_managed: false,
             snap_asked: None,
+            snap_refusals: 0,
             gesture_until: None,
             inner_size_sends: 0,
         };
@@ -8032,10 +8042,31 @@ impl IvoryApp {
         // tiler re-tiles, the size changes, the settle fires, forever. That
         // is the violent shifting between a filled half-screen and the
         // layout's own aspect.
-        if self.os_aspect_lock || self.main_wm_managed {
+        if self.os_aspect_lock {
             self.pane_seen = None;
             self.pane_settled = None;
             self.snap_asked = None;
+            return None;
+        }
+        if self.main_wm_managed {
+            self.pane_seen = None;
+            self.pane_settled = None;
+            self.snap_asked = None;
+            // **A way back that costs no fighting.** If the window is already
+            // the shape this layout wants, whoever is placing it agrees with
+            // us and there is nothing to own — so stop treating it as owned.
+            // A tiler's sizes are never on the aspect, so this never fires
+            // under one; an ordinary desktop that refused once and then let
+            // the user drag back to a sane shape recovers for free.
+            let on_aspect = ctx
+                .input(|i| i.viewport().inner_rect.map(|r| r.size()))
+                .is_some_and(|now| {
+                    Self::aspect_snap_for(&self.settings, None, now).is_none()
+                });
+            if on_aspect {
+                self.main_wm_managed = false;
+                self.snap_refusals = 0;
+            }
             return None;
         }
         let (full, size) = ctx.input(|i| {
@@ -8064,16 +8095,31 @@ impl IvoryApp {
         // from a user who dragged again, so it asks, is overruled, asks again.
         if let Some((want, at)) = self.snap_asked {
             if !wm_overrode_size(now, want) {
-                // Honoured. Measure the next drag from REALITY.
+                // Honoured. Measure the next drag from REALITY, and forget any
+                // earlier refusal — whatever it was, it was not a tiler.
                 self.snap_asked = None;
+                self.snap_refusals = 0;
                 self.pane_settled = Some(now);
             } else if at.elapsed() > SNAP_ANSWER_WINDOW {
-                // Refused. Latch, and never argue with this window again.
+                // **Refused — but once is a fluke.**
+                //
+                // Most people do not run a tiling window manager, and on an
+                // ordinary desktop a single refusal is a window clamped at a
+                // screen edge or against a maximum size, not a manager taking
+                // ownership. Latching on that one event would disable the
+                // aspect snap for the rest of the session over a fluke, and
+                // nothing short of a size preset would bring it back. A real
+                // tiler refuses every single time, so it reaches two almost
+                // immediately and costs one extra correction to detect.
                 self.snap_asked = None;
-                self.main_wm_managed = true;
-                self.pane_seen = None;
-                self.pane_settled = None;
-                return None;
+                self.snap_refusals = self.snap_refusals.saturating_add(1);
+                if self.snap_refusals >= SNAP_REFUSALS_TO_LATCH {
+                    self.main_wm_managed = true;
+                    self.pane_seen = None;
+                    self.pane_settled = None;
+                    return None;
+                }
+                self.pane_settled = Some(now);
             } else {
                 return None;
             }
@@ -14896,6 +14942,18 @@ impl IvoryApp {
         self.os_aspect_lock = on;
     }
 
+    /// **The layout's height at width `w`**, for a host that has to answer the
+    /// OS mid-drag. A `&self` forwarder because `settings` is private and the
+    /// whole contract across the seam is meant to be one scalar function.
+    pub fn aspect_height_at(&self, w: f32) -> f32 {
+        aspect_height_at(&self.settings, w)
+    }
+
+    /// The narrowest width this layout should ever be asked to be.
+    pub fn aspect_width_floor(&self) -> f32 {
+        aspect_width_floor(&self.settings)
+    }
+
     /// How many window-size commands have gone out. For `IVORY_PACE_PROBE`.
     pub fn debug_inner_size_sends(&self) -> u64 {
         self.inner_size_sends
@@ -18773,11 +18831,21 @@ pub fn aspect_height_at(settings: &Settings, w: f32) -> f32 {
 /// `aspect_snap_for`, which used to floor at `MIN_WINDOW.x` alone.
 pub fn aspect_width_floor(settings: &Settings) -> f32 {
     let floor = crate::settings::MIN_WINDOW;
+    // **Bounded, and the bound is the point.** With few bands showing this
+    // layout is SHORT — 150 points tall at 1300 wide with everything off — so
+    // an unbounded search for "the width whose height clears 320" runs to
+    // 2774, and since the caller floors every candidate at this number, every
+    // drag would slam the window out to 2774 wide. A layout that is short by
+    // nature is letterboxed at its minimum height whatever we do here, which
+    // is exactly what the theory band absorbing the difference already means.
+    // So: raise the floor only when raising it is CHEAP, and otherwise leave
+    // it where it was and accept the OS clamp at the very smallest size.
+    let ceiling = floor.x * 2.0;
     let mut w = floor.x;
-    while w < 4096.0 && aspect_height_at(settings, w) < floor.y {
+    while w < ceiling && aspect_height_at(settings, w) < floor.y {
         w += 1.0;
     }
-    w
+    if w >= ceiling { floor.x } else { w }
 }
 
 /// The stacked bands, top to bottom: theory, chord strip, piano, fretboard,
@@ -30796,36 +30864,101 @@ mod fullscreen_proportion_tests {
 mod aspect_snap_tests {
     use super::*;
 
-    /// **The width floor is the width whose HEIGHT clears the floor.**
+    /// **A tiler latches; an ordinary desktop does not.**
     ///
-    /// `MIN_WINDOW` is 560x320, and the layout's height at 560 wide is not
-    /// 320 — the bands truncate, so the two floors are unrelated numbers.
-    /// AppKit applies `setContentMinSize:` around whatever a resize delegate
-    /// returns, so a width below this gets its height clamped by the OS and
-    /// the aspect silently breaks at the small end with no error anywhere.
+    /// The two are told apart only by how often a size request is refused, so
+    /// the threshold is the whole safety margin for the majority of users —
+    /// most people do not run a tiling window manager, and on an ordinary
+    /// desktop a refusal is a window clamped at a screen edge, not a manager
+    /// taking ownership. Latching on one would disable the aspect snap for
+    /// the session over a fluke.
     #[test]
-    fn the_width_floor_is_tall_enough_to_survive_the_os_minimum() {
+    fn one_refusal_is_a_fluke_and_two_is_a_window_manager() {
+        assert_eq!(
+            SNAP_REFUSALS_TO_LATCH, 2,
+            "one refusal must not be enough to disable the snap for a session"
+        );
+        // A tiler refuses every time, so it reaches the threshold at once and
+        // costs exactly one extra correction to detect.
+        let mut refusals: u8 = 0;
+        let mut latched = false;
+        for _ in 0..4 {
+            refusals = refusals.saturating_add(1);
+            if refusals >= SNAP_REFUSALS_TO_LATCH {
+                latched = true;
+                break;
+            }
+        }
+        assert!(latched, "a tiler must be detected");
+        assert_eq!(refusals, 2, "a tiler took more than two refusals to detect");
+    }
+
+    /// **The way back out of the latch costs no fighting.**
+    ///
+    /// A window already on this layout's aspect is one whoever placed it
+    /// agrees about, so there is nothing to own. A tiler's sizes are never on
+    /// the aspect — that is what makes it a tiler — so this can only ever
+    /// release an ordinary desktop that refused once.
+    #[test]
+    fn a_window_on_its_own_aspect_releases_the_latch() {
         let settings = Settings::default();
+        // A size the layout itself produces is by definition on-aspect.
+        let w = 1300.0_f32;
+        let on = Vec2::new(w, aspect_height_at(&settings, w));
+        assert!(
+            Self_aspect_none(&settings, on),
+            "a size straight off the curve was not recognised as on-aspect"
+        );
+        // A half-screen tile is not, so a tiler never escapes this way.
+        let tiled = Vec2::new(1280.0, 1415.0);
+        assert!(
+            !Self_aspect_none(&settings, tiled),
+            "a tiled shape looked on-aspect, which would release the latch \
+             under a tiling window manager"
+        );
+    }
+
+    fn Self_aspect_none(settings: &Settings, now: Vec2) -> bool {
+        IvoryApp::aspect_snap_for(settings, None, now).is_none()
+    }
+
+    /// **The width floor is bounded, and that bound is load-bearing.**
+    ///
+    /// AppKit applies `setContentMinSize:` around whatever a resize delegate
+    /// returns, so a width whose height is under `MIN_WINDOW.y` gets its
+    /// height clamped and the aspect silently breaks at the small end. The
+    /// obvious fix — search upward for a width tall enough — is a trap: with
+    /// few bands showing this layout is only 150 points tall at 1300 wide, so
+    /// the search runs to 2774 and, because every candidate is floored at the
+    /// answer, EVERY drag would slam the window out to 2774 wide.
+    ///
+    /// So the floor rises only while rising is cheap, and a layout that is
+    /// short by nature keeps `MIN_WINDOW.x` and is letterboxed at its minimum
+    /// height — which is what the theory band absorbing the difference has
+    /// always meant.
+    #[test]
+    fn the_width_floor_is_bounded_and_never_moves_the_window_far() {
         let floor = crate::settings::MIN_WINDOW;
+        let settings = Settings::default();
         let w = aspect_width_floor(&settings);
+        assert!(w >= floor.x, "the floor {w} is under MIN_WINDOW.x {}", floor.x);
         assert!(
-            w >= floor.x,
-            "the width floor {w} is under MIN_WINDOW.x {}",
-            floor.x
+            w < floor.x * 2.0,
+            "the floor {w} is far enough out to move a window on every drag"
         );
-        assert!(
-            aspect_height_at(&settings, w) >= floor.y,
-            "at the width floor {w} the layout is {} tall, under MIN_WINDOW.y {}",
-            aspect_height_at(&settings, w),
-            floor.y
-        );
-        // And it is the SMALLEST such width — one point narrower must fail,
-        // unless the floor is MIN_WINDOW.x itself and already tall enough.
-        if w > floor.x {
-            assert!(
-                aspect_height_at(&settings, w - 1.0) < floor.y,
-                "the floor {w} is not tight: {} also clears it",
-                w - 1.0
+        if aspect_height_at(&settings, w) >= floor.y {
+            // A floor was found: it must be the SMALLEST such width.
+            if w > floor.x {
+                assert!(
+                    aspect_height_at(&settings, w - 1.0) < floor.y,
+                    "the floor {w} is not tight"
+                );
+            }
+        } else {
+            // No cheap floor exists, so it fell back rather than running away.
+            assert_eq!(
+                w, floor.x,
+                "a short layout must keep MIN_WINDOW.x, not a searched width"
             );
         }
     }

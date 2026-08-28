@@ -1255,6 +1255,17 @@ impl Drop for Reprobe {
     }
 }
 
+/// The non-macOS stand-in for `macwin::Facts`.
+///
+/// A struct rather than a type alias so the two `window_facts` arms have the
+/// same shape on every platform.
+#[cfg(not(target_os = "macos"))]
+#[derive(Default)]
+struct WindowFacts {
+    gesture: tangent_ui::host::Gesture,
+    os_aspect_lock: bool,
+}
+
 #[cfg(feature = "recorder")]
 impl DesktopApp {
     /// Everything the band shows, refreshed from what is actually true.
@@ -6266,6 +6277,27 @@ impl DesktopApp {
     /// Only while files hover. Polling the OS for the mouse every frame of
     /// every session to answer a question nobody asked is not a thing to do
     /// in a paint loop.
+    /// What the host can see about a live resize — see `macwin`.
+    ///
+    /// macOS can answer; nothing else can, and a host that cannot must say so
+    /// rather than guess, because "a size nobody asked for" only means "a
+    /// window manager placed us" where a live resize is actually visible.
+    #[cfg(target_os = "macos")]
+    fn window_facts(frame: &eframe::Frame, app: &IvoryApp) -> crate::macwin::Facts {
+        crate::macwin::publish(
+            frame,
+            &|w| app.aspect_height_at(w),
+            app.aspect_width_floor(),
+        )
+    }
+
+    /// Everywhere else: all-false, which keeps `aspect_snap` armed and the
+    /// immediate window-manager latch disarmed.
+    #[cfg(not(target_os = "macos"))]
+    fn window_facts(_frame: &eframe::Frame, _app: &IvoryApp) -> WindowFacts {
+        WindowFacts::default()
+    }
+
     fn drag_pointer(ctx: &egui::Context) -> Option<egui::Pos2> {
         if ctx.input(|i| i.raw.hovered_files.is_empty()) {
             return None;
@@ -6612,6 +6644,15 @@ impl eframe::App for DesktopApp {
         // **Where the cursor is during a FILE DRAG.** Asked of the OS,
         // because the window toolkit will not say — see `drag_pointer`.
         self.app.set_drag_pointer(Self::drag_pointer(ctx));
+        // **What the OS can see about a gesture on our window.** Asked here
+        // and not in the GUI crate for the same reason as `drag_pointer`
+        // above: `tangent-ui` may not reach the host at all.
+        //
+        // Computed into an owned value first — the closure borrows `self.app`
+        // immutably and the setters need it mutably.
+        let facts = Self::window_facts(frame, &self.app);
+        self.app.set_host_gesture(facts.gesture);
+        self.app.set_os_aspect_lock(facts.os_aspect_lock);
         // **The first frame is the SPLASH and nothing else.**
         //
         // The app's first `frame` costs about a second — the font atlas is
