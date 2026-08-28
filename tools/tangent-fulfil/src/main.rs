@@ -232,7 +232,14 @@ fn email_body(key: &str) -> String {
 /// Overridable, but it defaults to a real inbox rather than to `from`, because
 /// the failure is invisible from this end: nothing bounces, nothing logs, the
 /// reply just never arrives.
-const DEFAULT_REPLY_TO: &str = "ganten1998@gmail.com";
+///
+/// **A mailbox, deliberately, and not the branded address.** The branded
+/// `keys@tangentdaw.org` is the right thing to SHOW a buyer and it is what
+/// `MAIL_REPLY_TO` should be set to — but it only receives while a forwarding
+/// rule at the registrar keeps working, and this constant is the fallback for
+/// when configuration has already gone wrong. A fallback that depends on the
+/// same DNS as the thing it is falling back from is not a fallback.
+const DEFAULT_REPLY_TO: &str = "tangentdaw@gmail.com";
 
 fn send_email(api_key: &str, from: &str, to: &str, name: &str, key: &str) -> Result<(), String> {
     let body = email_body(key);
