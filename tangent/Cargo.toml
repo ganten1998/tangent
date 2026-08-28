@@ -208,7 +208,17 @@ wgpu = { version = "27", default-features = false, features = ["metal"] }
 # the plugin-editor flicker fix made Metal the default renderer, and under wgpu
 # `Frame::gl()` returns None. Re-introducing a second GL context to satisfy the
 # old plan would re-introduce the flicker it was written before.
-egui-wgpu = { version = "0.33", default-features = false }
+#
+# **`macos-window-resize-jitter-fix` is why this line names a feature.** It is
+# in egui-wgpu's own DEFAULT set and this build turned defaults off to keep the
+# renderer honest, so it has been absent from every macOS build — and it is the
+# feature whose entire job is to stop the surface being presented at the old
+# size for a frame while an edge is dragged. That is one of the two independent
+# causes of a resize that stretches and lurches instead of tracking the hand.
+# It needs nothing but `wgpu/metal`, which is already on the line above.
+egui-wgpu = { version = "0.33", default-features = false, features = [
+    "macos-window-resize-jitter-fix",
+] }
 
 [target.'cfg(unix)'.dependencies]
 # `statvfs`, the other half of the same question. Already in the tree via cpal;

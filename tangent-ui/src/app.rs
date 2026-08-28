@@ -146,11 +146,29 @@ fn wm_overrode_size(observed: Vec2, requested: Vec2) -> bool {
         || (observed.y - requested.y).abs() > WM_SIZE_TOLERANCE
 }
 
-/// How many still frames mean the hand has let go of the window's edge.
+/// How long the size must sit still before the hand counts as let go.
 ///
-/// Two, not one: a drag can report the same size twice while the pointer sits
-/// between two pixels, and snapping there is still snapping mid-drag.
-const SETTLE_FRAMES: u8 = 2;
+/// **Wall-clock, not a frame count.** It was two frames, which is a duration
+/// only at a fixed frame rate: about 66 ms while the window drew at 30 fps,
+/// and about 8 ms once the window is paced to a 240 Hz display — which is
+/// well INSIDE a live drag. A settle that fires mid-drag is the fight this
+/// whole mechanism exists to avoid, and it is what once made the top and
+/// bottom edges impossible to resize at all.
+const SETTLE_QUIET: Duration = Duration::from_millis(90);
+
+/// How long a size we asked for has to be honoured before silence is refusal.
+///
+/// A window manager that intends to overrule us does so within a frame or
+/// two; this is generous enough for a slow round trip on a floating window
+/// and short enough that one wrong-shaped frame does not linger.
+const SNAP_ANSWER_WINDOW: Duration = Duration::from_millis(250);
+
+/// How long after a geometry change the window keeps drawing at full rate.
+///
+/// The hand has let go when the geometry stops changing, but a moment of
+/// continued drawing after it is what makes the last frame of a drag land
+/// rather than being the one that stutters.
+const PACE_HOLD: Duration = Duration::from_millis(250);
 
 /// How thick the recording line round the window is.
 ///
@@ -1001,7 +1019,7 @@ pub struct IvoryApp {
     /// until the button comes up. On a bottom or top edge it was worse than
     /// cosmetic: the height is a function of the width, so snapping it back
     /// meant the drag could never resize anything at all.
-    pane_seen: Option<(Vec2, u8)>,
+    pane_seen: Option<(Vec2, Instant)>,
     /// The last size the window SETTLED on, which is the only thing that can
     /// say which edge a drag moved. Comparing the two candidate answers to
     /// each other cannot: both are derived from where the window is now, and
@@ -1069,6 +1087,22 @@ pub struct IvoryApp {
     /// took its sizing over. See `wm_overrode_size` and `WM_GRACE`.
     detached_shown_at: Option<Instant>,
     detached_wm_managed: bool,
+    /// What the host can see about a gesture on the MAIN window — see
+    /// [`crate::host::Gesture`]. All-false where the host cannot say.
+    host_gesture: crate::host::Gesture,
+    /// The host OS is constraining live resizes to this layout's aspect, so
+    /// the app must not correct anything afterwards.
+    os_aspect_lock: bool,
+    /// A window manager owns the main window's geometry. Latched, and never
+    /// argued with — see `aspect_snap`.
+    main_wm_managed: bool,
+    /// The size most recently asked for, and when. Used to tell an honoured
+    /// request from a refused one from one still in flight.
+    snap_asked: Option<(Vec2, Instant)>,
+    /// Draw at full rate until this instant — armed by any geometry change.
+    gesture_until: Option<Instant>,
+    /// How many `InnerSize` commands have gone out. Probe only.
+    inner_size_sends: u64,
 }
 
 /// A band control the pointer is holding.
@@ -1889,6 +1923,12 @@ impl IvoryApp {
             main_live_size: None,
             detached_shown_at: None,
             detached_wm_managed: false,
+            host_gesture: crate::host::Gesture::default(),
+            os_aspect_lock: false,
+            main_wm_managed: false,
+            snap_asked: None,
+            gesture_until: None,
+            inner_size_sends: 0,
         };
         // The panels draw from the rendered labels, so a session that loads
         // with routes has to arrive with them already rendered — otherwise
@@ -7949,8 +7989,24 @@ impl IvoryApp {
     /// answer is rounded to whole points, and a window on a fractional size
     /// is a window drawing its glyphs on half-pixels.
     ///
-    /// `None` while full or tiled: a screen's shape is not ours to argue with.
+    /// `None` while full, tiled, or while the OS is doing this for us.
     fn aspect_snap(&mut self, ctx: &egui::Context) -> Option<Vec2> {
+        // **Somebody else owns this window's geometry.**
+        //
+        // Either the host is constraining the drag for us — macOS answers
+        // `windowWillResize:toSize:` and the OS never offers a wrong size in
+        // the first place — or a window manager has already overruled a size
+        // we asked for. Correcting in either case is the fight this function
+        // was written to avoid, and under a TILER it does not terminate: the
+        // tiler re-tiles, the size changes, the settle fires, forever. That
+        // is the violent shifting between a filled half-screen and the
+        // layout's own aspect.
+        if self.os_aspect_lock || self.main_wm_managed {
+            self.pane_seen = None;
+            self.pane_settled = None;
+            self.snap_asked = None;
+            return None;
+        }
         let (full, size) = ctx.input(|i| {
             let v = i.viewport();
             (
@@ -7962,18 +8018,43 @@ impl IvoryApp {
             self.pane_seen = None;
             return None;
         }
+        // **A hand is on the edge right now.** The size going quiet used to be
+        // the only evidence available. Where the host can actually say, ask it
+        // rather than inferring — inference cannot tell a slow drag from a
+        // finished one.
+        if self.host_gesture.live_resize {
+            self.pane_seen = None;
+            return None;
+        }
         let now = size?;
-        // **Still for two frames means the hand has let go.** One is not
-        // enough: a drag can report the same size twice while the pointer is
-        // between two pixels, and snapping there would still be mid-drag.
+        // **Was the last request honoured, refused, or is it still in flight?**
+        //
+        // Without this the app cannot tell a window manager that overruled it
+        // from a user who dragged again, so it asks, is overruled, asks again.
+        if let Some((want, at)) = self.snap_asked {
+            if !wm_overrode_size(now, want) {
+                // Honoured. Measure the next drag from REALITY.
+                self.snap_asked = None;
+                self.pane_settled = Some(now);
+            } else if at.elapsed() > SNAP_ANSWER_WINDOW {
+                // Refused. Latch, and never argue with this window again.
+                self.snap_asked = None;
+                self.main_wm_managed = true;
+                self.pane_seen = None;
+                self.pane_settled = None;
+                return None;
+            } else {
+                return None;
+            }
+        }
+        // **Still for `SETTLE_QUIET` means the hand has let go.** Wall-clock,
+        // because a frame count is a duration only at a fixed frame rate.
         let settled = match self.pane_seen {
-            Some((was, n)) if (was - now).length() < 0.5 => {
-                let n = n.saturating_add(1);
-                self.pane_seen = Some((now, n));
-                n >= SETTLE_FRAMES
+            Some((was, since)) if (was - now).length() < 0.5 => {
+                since.elapsed() >= SETTLE_QUIET
             }
             _ => {
-                self.pane_seen = Some((now, 1));
+                self.pane_seen = Some((now, Instant::now()));
                 false
             }
         };
@@ -7987,10 +8068,16 @@ impl IvoryApp {
             self.pane_settled = Some(now);
             return None;
         };
-        // Remember what we are about to ask for, so the size that comes back
-        // reads as settled rather than as a fresh drag.
-        self.pane_seen = Some((want, SETTLE_FRAMES));
-        self.pane_settled = Some(want);
+        // **Record the REQUEST, never the answer.**
+        //
+        // This used to set `pane_settled = Some(want)` — a size the window had
+        // not received and might never receive. The next round then measured
+        // "which edge moved" against a fiction, concluded the opposite edge
+        // had led, and asked for the opposite size. That is the arithmetic
+        // engine of a two-step limit cycle: the window oscillates between two
+        // sizes forever, each one "correcting" the other.
+        self.pane_seen = None;
+        self.snap_asked = Some((want, Instant::now()));
         Some(want)
     }
 
@@ -8013,9 +8100,13 @@ impl IvoryApp {
         // The stack's height at a known width, which is what makes the inverse
         // a multiply — the same trick `fit_bands` uses.
         let probe = band_sizes_at(settings, 1300.0).total().y.max(1.0);
+        // One definition of the curve, shared with the host's live-resize
+        // hook — and floored at a width whose HEIGHT clears MIN_WINDOW, not
+        // at MIN_WINDOW.x, which is the flaw described on `aspect_width_floor`.
+        let w_floor = aspect_width_floor(settings);
         let from_width = |w: f32| {
-            let w = w.max(floor.x).round();
-            Vec2::new(w, band_sizes_at(settings, w).total().y.round())
+            let w = w.max(w_floor).round();
+            Vec2::new(w, aspect_height_at(settings, w))
         };
         let by_width = from_width(now.x);
         // What width would want this height. Solved off the ratio and then
@@ -14755,6 +14846,35 @@ impl IvoryApp {
         self.drag_pointer = at;
     }
 
+    /// What the host can see about a gesture on our window — see
+    /// [`crate::host::Gesture`]. Pushed every frame; all-false is the honest
+    /// answer wherever the host cannot tell.
+    pub fn set_host_gesture(&mut self, g: crate::host::Gesture) {
+        self.host_gesture = g;
+    }
+
+    /// **The host OS is constraining live resizes to this layout's aspect**,
+    /// so the app must not correct the size afterwards.
+    ///
+    /// Set by the desktop binary when the AppKit `windowWillResize:toSize:`
+    /// hook is installed and live; false everywhere it is not, which is where
+    /// `aspect_snap` still earns its keep. Revocable per frame on purpose:
+    /// installing the hook can fail, and a build that believed it had the OS
+    /// doing this while it did not would correct nothing and drag square.
+    pub fn set_os_aspect_lock(&mut self, on: bool) {
+        self.os_aspect_lock = on;
+    }
+
+    /// How many window-size commands have gone out. For `IVORY_PACE_PROBE`.
+    pub fn debug_inner_size_sends(&self) -> u64 {
+        self.inner_size_sends
+    }
+
+    /// Whether a window manager owns the main window. For `IVORY_PACE_PROBE`.
+    pub fn debug_wm_managed(&self) -> bool {
+        self.main_wm_managed
+    }
+
     /// Take a pending "choose a file" request. Same contract again.
     pub fn take_file_request(&mut self) -> Option<crate::ports::FileRequest> {
         self.file_request.take()
@@ -18599,6 +18719,36 @@ pub fn initial_window_size(settings: &Settings) -> Vec2 {
     band_sizes(settings).total()
 }
 
+/// **The height this layout wants at width `w`**, rounded to whole points.
+///
+/// Public because the height curve has TWO consumers on two platforms now —
+/// `aspect_snap_for` in this crate, and the host's live-resize hook, which has
+/// to answer the OS mid-drag. The way two consumers stop agreeing is by each
+/// computing it, so there is one function and one answer.
+pub fn aspect_height_at(settings: &Settings, w: f32) -> f32 {
+    band_sizes_at(settings, w.max(1.0).trunc()).total().y.round()
+}
+
+/// The smallest width whose height already clears `MIN_WINDOW.y`.
+///
+/// **Not `MIN_WINDOW.x`.** AppKit applies `setContentMinSize:` AROUND whatever
+/// a resize delegate returns, so handing back a width whose height is under
+/// the floor gets the HEIGHT clamped by the OS and the aspect silently breaks
+/// at the small end — no error, just a window that stops being the right
+/// shape when it gets small. Computed rather than asserted: the height curve
+/// truncates per band, so the answer is not `MIN_WINDOW.y` scaled by anything.
+///
+/// Costs a few hundred iterations once, and closes the same latent flaw in
+/// `aspect_snap_for`, which used to floor at `MIN_WINDOW.x` alone.
+pub fn aspect_width_floor(settings: &Settings) -> f32 {
+    let floor = crate::settings::MIN_WINDOW;
+    let mut w = floor.x;
+    while w < 4096.0 && aspect_height_at(settings, w) < floor.y {
+        w += 1.0;
+    }
+    w
+}
+
 /// The stacked bands, top to bottom: theory, chord strip, piano, fretboard,
 /// plus the window width. A hidden band is 0.0.
 ///
@@ -19701,6 +19851,27 @@ impl IvoryApp {
         if live_size != self.main_live_size {
             self.main_live_size = live_size;
             self.geometry_save_at = Some(Instant::now() + GEOMETRY_SAVE_DELAY);
+            // Anything that moves the geometry is a gesture worth drawing at
+            // full rate for a moment afterwards — see `PACE_HOLD`.
+            self.gesture_until = Some(Instant::now() + PACE_HOLD);
+            // **Who changed this size?**
+            //
+            // Gated on `resize_known` because it is only answerable where the
+            // host can see a live resize. On Windows and Linux `live_resize`
+            // is permanently false, so without this gate an ordinary edge drag
+            // would read as "nobody asked, no hand: a window manager placed
+            // us" and permanently disable the aspect snap for the session —
+            // a regression no amount of macOS testing would ever find.
+            if self.caps.window_sizing && self.host_gesture.resize_known {
+                let ours = self.snap_asked.is_some() || self.pending_window_size.is_some();
+                if self.host_gesture.live_resize {
+                    // A hand on OUR edge: this window is ours again.
+                    self.main_wm_managed = false;
+                } else if !ours {
+                    // Nobody asked and no hand is on it: a WM placed us.
+                    self.main_wm_managed = true;
+                }
+            }
         }
 
         // **The layout follows the pane it is given, everywhere.**
@@ -19767,10 +19938,26 @@ impl IvoryApp {
             let v = i.viewport();
             (
                 v.fullscreen.unwrap_or(false) || v.maximized.unwrap_or(false),
-                v.monitor_size.map(|m| m.x),
+                v.monitor_size,
             )
         });
-        self.screen_sized = self.caps.window_sizing && full;
+        // **A window filling the screen is screen-sized however it got there.**
+        //
+        // This read `full` alone, and on macOS egui-winit does not report
+        // `maximized` at all — so a window a TILER had made full-screen showed
+        // one timeline lane and one mixer strip, the small-window layout, on a
+        // 2560-wide screen. Measured against the monitor rather than asked,
+        // because the tiler leaves a menu bar and a gap and the question is
+        // "is this effectively the whole screen", not "is a flag set".
+        let pane_now = self.main_live_size;
+        self.screen_sized = self.caps.window_sizing
+            && (full
+                || (self.main_wm_managed
+                    && match (pane_now, monitor) {
+                        (Some(p), Some(m)) => p.y + 60.0 >= m.y && p.x + 8.0 >= m.x,
+                        _ => false,
+                    }));
+        let monitor = monitor.map(|m| m.x);
         // **Learn the monitor's width, once.** The percentages are shares of
         // it now (see `main_width`), and the very first window of a launch is
         // built before any monitor can be enumerated — so what this run
@@ -19899,6 +20086,7 @@ impl IvoryApp {
                 // theory band absorbs the difference instead; see the layout
                 // branch.
                 if let Some(want) = self.aspect_snap(&ctx) {
+                    self.inner_size_sends += 1;
                     ctx.send_viewport_cmd(ViewportCommand::InnerSize(want));
                 }
             } else {
@@ -19936,6 +20124,17 @@ impl IvoryApp {
             // per-frame: `pending_window_size` is set by the thing that
             // wants it and cleared here.
             if let Some(want) = self.pending_window_size.take() {
+                // **A size the USER asked for gets one honest attempt**, even
+                // if a window manager has been overruling us. Clearing the
+                // latch here is what stops "tiled once" meaning "the size
+                // menu does nothing for the rest of the session"; recording
+                // the request means `aspect_snap`'s verifier re-latches within
+                // `SNAP_ANSWER_WINDOW` if the tiler overrules this one too.
+                // So a user request costs exactly one correction, never a
+                // cycle.
+                self.main_wm_managed = false;
+                self.snap_asked = Some((want, Instant::now()));
+                self.inner_size_sends += 1;
                 ctx.send_viewport_cmd(ViewportCommand::InnerSize(want));
                 self.last_sent_size = Some(want);
                 self.size_asked_at = Some(Instant::now());
@@ -21493,9 +21692,15 @@ impl IvoryApp {
                 let asked_recently = self
                     .size_asked_at
                     .is_some_and(|t| Instant::now() < t + WM_GRACE);
-                let ours = self
-                    .main_live_size
-                    .is_some_and(|s| !asked_recently || !wm_overrode_size(s, target));
+                // **And never while a window manager owns us.** `asked_recently`
+                // expires 600 ms after launch, so without this a tiled size was
+                // written into `window_w`/`window_h` and followed the user into
+                // the next, untiled session — a window that opens half-width
+                // forever because it was tiled once.
+                let ours = !self.main_wm_managed
+                    && self
+                        .main_live_size
+                        .is_some_and(|s| !asked_recently || !wm_overrode_size(s, target));
                 if ours {
                     if let Some(p) = self.main_live_pos {
                         let (x, y) = (p.x.round() as i64, p.y.round() as i64);
@@ -30522,6 +30727,54 @@ mod fullscreen_proportion_tests {
 #[cfg(test)]
 mod aspect_snap_tests {
     use super::*;
+
+    /// **The width floor is the width whose HEIGHT clears the floor.**
+    ///
+    /// `MIN_WINDOW` is 560x320, and the layout's height at 560 wide is not
+    /// 320 — the bands truncate, so the two floors are unrelated numbers.
+    /// AppKit applies `setContentMinSize:` around whatever a resize delegate
+    /// returns, so a width below this gets its height clamped by the OS and
+    /// the aspect silently breaks at the small end with no error anywhere.
+    #[test]
+    fn the_width_floor_is_tall_enough_to_survive_the_os_minimum() {
+        let settings = Settings::default();
+        let floor = crate::settings::MIN_WINDOW;
+        let w = aspect_width_floor(&settings);
+        assert!(
+            w >= floor.x,
+            "the width floor {w} is under MIN_WINDOW.x {}",
+            floor.x
+        );
+        assert!(
+            aspect_height_at(&settings, w) >= floor.y,
+            "at the width floor {w} the layout is {} tall, under MIN_WINDOW.y {}",
+            aspect_height_at(&settings, w),
+            floor.y
+        );
+        // And it is the SMALLEST such width — one point narrower must fail,
+        // unless the floor is MIN_WINDOW.x itself and already tall enough.
+        if w > floor.x {
+            assert!(
+                aspect_height_at(&settings, w - 1.0) < floor.y,
+                "the floor {w} is not tight: {} also clears it",
+                w - 1.0
+            );
+        }
+    }
+
+    /// **One curve, two consumers.** `aspect_snap_for` and the host's
+    /// live-resize hook must agree exactly, or a drag constrained by the OS
+    /// lands somewhere the app then "corrects".
+    #[test]
+    fn the_height_curve_answers_the_same_everywhere() {
+        let settings = Settings::default();
+        for w in [600.0_f32, 900.0, 1300.0, 1920.0, 2560.0] {
+            let a = aspect_height_at(&settings, w);
+            let b = band_sizes_at(&settings, w.trunc()).total().y.round();
+            assert_eq!(a, b, "the curve disagrees with the bands at {w}");
+            assert_eq!(a, a.round(), "the height at {w} is not a whole point");
+        }
+    }
 
     /// **A drag on any edge comes out diagonal.**
     ///
