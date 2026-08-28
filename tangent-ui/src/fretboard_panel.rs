@@ -569,7 +569,7 @@ pub fn draw(
         }
         painter.line_segment(
             [Pos2::new(x, board.top()), Pos2::new(x, board.bottom())],
-            Stroke::new(1.5_f32, p.wire),
+            Stroke::new(1.0_f32, p.wire),
         );
     }
     for &f in fretboard::INLAY_FRETS {
@@ -646,7 +646,7 @@ pub fn draw(
                         Pos2::new(x + w * 0.5, g.y(b.lo_string) + g.dot_r()),
                     ),
                     w * 0.5,
-                    Stroke::new(1.5_f32, edge),
+                    Stroke::new(1.0_f32, edge),
                     StrokeKind::Inside,
                 );
             }
@@ -665,7 +665,7 @@ pub fn draw(
                 painter.circle_stroke(
                     Pos2::new(g.press_x(pos.fret), g.y(pos.string)),
                     g.dot_r() * 0.8,
-                    Stroke::new(1.5_f32, p.on_board),
+                    Stroke::new(1.0_f32, p.on_board),
                 );
             }
         }
@@ -739,6 +739,12 @@ pub fn draw(
             let c = Pos2::new(g.press_x(pos.fret), y);
             painter.circle_filled(c, r, p.dot);
             if let Some(edge) = p.dot_edge {
+                // **Left at 1.5 deliberately.** The straight rules on this
+                // panel went to 1.0 because epaint pixel-snaps them and 1.5
+                // is the width it snaps worst — half coverage on two rows.
+                // A CIRCLE is not snapped at all, so the same number is not
+                // the same bug here, and narrowing it would be a look change
+                // rather than a fix.
                 painter.circle_stroke(c, r, Stroke::new(1.5_f32, edge));
             }
             // The letter, inside the dot it belongs to. Opt-in, and drawn only

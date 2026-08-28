@@ -110,6 +110,23 @@ const SPACE_AT_1300: f64 = 7.5;
 /// The chord allowance is three notehead columns plus three accidental
 /// columns, which is the worst case `Column::place` can produce for a hand-sized
 /// chord: a chromatic cluster with an accidental on every note.
+/// **A rule width that lands on the pixel grid.**
+///
+/// epaint puts a stroke on a pixel CENTRE when the nearest integer width is
+/// odd and on a pixel BOUNDARY when it is even, so a rule is crisp only near
+/// a whole number and softest at exactly 1.5 or 2.5. Every rule here is a
+/// fraction of the staff space, which is itself a fraction of the window
+/// width — so as the window widens the staff rule sweeps 1.05 (crisp) to
+/// 1.62 (two rows at four-fifths coverage, visibly soft) to 2.07 (crisp
+/// again). That crisp-soft-crisp cycle is what "certain sizes look slightly
+/// blurry" actually is.
+///
+/// The scale is what has to be quantised, not the position: epaint already
+/// pixel-snaps every position it draws.
+fn rule_px(w: f32) -> f32 {
+    w.round().max(1.0)
+}
+
 fn staff_w_spaces(key: i32) -> f32 {
     let clef = 3.6;
     let n = key.unsigned_abs().min(MAX_KEY as u32) as f32;
@@ -1104,7 +1121,7 @@ pub fn draw(
         for x in [left, right] {
             painter.line_segment(
                 [Pos2::new(x, brace_top), Pos2::new(x, bottom)],
-                Stroke::new((space * 0.14).max(1.0), p.ink),
+                Stroke::new(rule_px(space * 0.14), p.ink),
             );
         }
     }
@@ -1119,7 +1136,7 @@ pub fn draw(
 fn draw_brace(painter: &Painter, x: f32, top: f32, bottom: f32, space: f32, p: &Palette) {
     let mid = (top + bottom) * 0.5;
     let w = space * 0.85;
-    let stroke = Stroke::new((space * 0.16).max(1.0), p.ink);
+    let stroke = Stroke::new(rule_px(space * 0.16), p.ink);
     for (from, to) in [(top, mid), (bottom, mid)] {
         let dir = (to - from).signum();
         let path = bezier(
@@ -1312,7 +1329,7 @@ fn draw_notehead(painter: &Painter, c: Pos2, space: f32, fill: Color32, named: b
     let edge = ellipse(c, space * HEAD_RX, space * 0.5, -0.35);
     painter.add(egui::Shape::closed_line(
         edge,
-        Stroke::new((space * 0.07).max(0.8), p.ink),
+        Stroke::new(rule_px(space * 0.07), p.ink),
     ));
 }
 
@@ -1331,7 +1348,7 @@ fn ellipse(c: Pos2, rx: f32, ry: f32, tilt: f32) -> Vec<Pos2> {
 
 /// The short lines a note stands on when it has left the staff.
 fn draw_ledgers(painter: &Painter, g: Geometry, pos: i32, cx: f32, head_w: f32, p: &Palette) {
-    let hair = (g.space * 0.11).max(1.0);
+    let hair = rule_px(g.space * 0.11);
     let half = head_w * 0.78;
     let line = |pos: i32| {
         let y = g.y(pos);
@@ -1406,7 +1423,7 @@ fn draw_octave_signs(
             let end = (dx + dash).min(to);
             painter.line_segment(
                 [Pos2::new(dx, y), Pos2::new(end, y)],
-                Stroke::new((g.space * 0.1).max(1.0), p.ink),
+                Stroke::new(rule_px(g.space * 0.1), p.ink),
             );
             dx += dash * 2.0;
         }
@@ -1415,7 +1432,7 @@ fn draw_octave_signs(
                 Pos2::new(to, y),
                 Pos2::new(to, y + dir as f32 * g.space * 0.7),
             ],
-            Stroke::new((g.space * 0.1).max(1.0), p.ink),
+            Stroke::new(rule_px(g.space * 0.1), p.ink),
         );
     }
 }
@@ -1423,8 +1440,8 @@ fn draw_octave_signs(
 /// A sharp or a flat, drawn rather than typeset — the same bargain the whole
 /// app makes with glyphs it cannot rely on a font to carry.
 fn draw_accidental(painter: &Painter, c: Pos2, space: f32, alter: i8, ink: Color32) {
-    let thin = Stroke::new((space * 0.1).max(1.0), ink);
-    let thick = Stroke::new((space * 0.22).max(1.2), ink);
+    let thin = Stroke::new(rule_px(space * 0.1), ink);
+    let thick = Stroke::new(rule_px(space * 0.22), ink);
     if alter == 0 {
         // A natural: two uprights that do not meet, joined by two thick bars.
         // The gaps are the point -- a natural whose stems ran the whole way
@@ -1748,6 +1765,38 @@ fn bezier(a: Pos2, b: Pos2, c: Pos2, d: Pos2, steps: usize) -> Vec<Pos2> {
 
 #[cfg(test)]
 mod tests {
+
+    /// **Every rule lands on the pixel grid at every window width.**
+    ///
+    /// epaint puts a stroke on a pixel centre when the nearest integer width
+    /// is odd and on a boundary when it is even, so a fractional width is
+    /// drawn as two rows at partial coverage — soft. The staff rule is a
+    /// fraction of the staff space, which is a fraction of the window width,
+    /// so before `rule_px` it swept through 1.5 as the window widened and got
+    /// visibly soft around 2000 points and crisp again either side.
+    #[test]
+    fn rules_are_whole_pixels_at_every_width() {
+        for w in [560.0_f32, 900.0, 1300.0, 1600.0, 2000.0, 2200.0, 2560.0, 3840.0] {
+            let space = 7.5 * w / 1300.0;
+            for frac in [0.07_f32, 0.1, 0.11, 0.14, 0.16, 0.22] {
+                let px = rule_px(space * frac);
+                assert_eq!(
+                    px,
+                    px.round(),
+                    "at {w} wide the {frac} rule is {px}, not a whole pixel"
+                );
+                assert!(px >= 1.0, "at {w} wide the {frac} rule vanished to {px}");
+            }
+        }
+        // The case that was actually soft: a 0.14 rule at 2000 points wide
+        // came to 1.615 - the worst value epaint has.
+        let soft = 7.5_f32 * 2000.0 / 1300.0 * 0.14;
+        assert!(
+            (soft - 1.615).abs() < 0.01,
+            "the regression case moved: {soft}"
+        );
+        assert_eq!(rule_px(soft), 2.0, "the soft width did not quantise");
+    }
     use super::*;
     use egui::{Pos2, Rect, Vec2};
 
