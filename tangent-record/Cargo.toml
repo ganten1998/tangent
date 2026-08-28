@@ -1,0 +1,196 @@
+[package]
+# The recorder: clock, capture, encode, mux, and the files a take produces.
+#
+# WHAT IS NOT HERE IS AS DELIBERATE AS IN `tangent-ui`, but the rule is the
+# opposite one. `tangent-ui` exists so that platform things are UNREACHABLE from
+# shared GUI code. This crate exists so that platform things have somewhere to
+# live that is NOT the GUI: cpal, a camera, an encoder and a file writer all
+# belong to a desktop and none of them belong in a VST3 editor.
+#
+# So: `ivory` depends on this crate; `tangent-ui` and `tangent-core` must NEVER.
+# `scripts/check-firewall.sh` asserts that, and see docs/RECORDER-PLAN.md §10
+# item 5 for why that assertion needs `--target all` to mean anything.
+#
+# No egui here either. The recorder produces bytes; drawing them is `tangent-ui`'s
+# job and compositing them is `ivory`'s (RECORDER-PLAN §6).
+name = "tangent-record"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# `default-features = false, features = ["std"]` turns OFF `parallel`, which is
+# the only thing that would pull `rayon`. With it off midly has ZERO transitive
+# dependencies: one line in Cargo.lock, one Unlicense entry in
+# THIRD-PARTY-LICENSES. `parallel` only accelerates PARSING, which a recorder
+# never does.
+midly = { version = "0.5", default-features = false, features = ["std"] }
+
+# Audio I/O. Apache-2.0. `default = []` upstream, so the ASIO feature stays OFF
+# and the Windows backend is WASAPI — which matters because ASIO went the
+# OPPOSITE way from VST3 and is now GPLv3-or-proprietary.
+cpal = "0.16"
+
+# Lock-free SPSC ring, MIT OR Apache-2.0. The audio callback must never
+# allocate, never lock and never touch a file; this is how samples leave it.
+rtrb = "0.3"
+
+# **For reading `pw-dump`, and for nothing else.** MIT OR Apache-2.0, pure
+# Rust, already built for this workspace by `tangent-ui`'s settings file — so it
+# costs no build time and links no system library.
+#
+# It is here because on a PipeWire machine ALSA cannot enumerate the interfaces
+# at all (see `audio::pipewire_sources`), and the alternative was `pipewire-rs`,
+# which needs libpipewire's headers at build time. The Linux artifacts are
+# cross-compiled from a Mac; that dependency would have traded a working
+# release process for a tidier lookup.
+serde_json = "1"
+
+# ── the camera, macOS only ──────────────────────────────────────────────────
+#
+# TARGET-GATED, NOT HOST-GATED, and the distinction is the release. Windows
+# builds go through `cargo xwin` FROM a Mac and Linux is cross-compiled too, so
+# anything written as a plain `[dependencies]` entry — or gated on a *host*
+# condition — would be pulled into the Windows link and fail there. The gate is
+# on `target_os`, and `scripts/check-firewall.sh --target all` is where that
+# stays true. Verify by hand with:
+#
+#   cargo tree -p tangent-record --target x86_64-pc-windows-msvc | grep -i objc
+#
+# Zlib OR Apache-2.0 OR MIT, all four. `default-features = false` matters more
+# than usual here: objc2-av-foundation's default feature set is EVERY class in
+# AVFoundation (~500 modules, a multi-minute build). The list below is the
+# capture pipeline and nothing else.
+#
+# These are not new to the dependency graph: cpal 0.16 already links
+# objc2 0.6, objc2-core-audio, objc2-core-audio-types and objc2-core-foundation
+# for its CoreAudio backend, so the camera adds four crates to a tree that was
+# already objc2-shaped rather than introducing a second FFI style.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSDictionary",
+    "NSEnumerator",
+    "NSError",
+    "NSObject",
+    "NSProcessInfo",
+    "NSString",
+    "NSValue",
+] }
+# No `block2`: the only AVFoundation entry point that needs it is
+# `requestAccessForMediaType:completionHandler:`, and we deliberately do not
+# call it. AVFoundation raises the TCC prompt by itself when an
+# AVCaptureDeviceInput is created, so the prompt happens at Open Camera — the
+# one moment where the user has just asked for a camera and the dialog is not a
+# non-sequitur. See `permission_status` in `camera.rs`.
+#
+# The ENCODER half of this list (`AVAssetWriter`, `AVAssetWriterInput`,
+# `AVVideoSettings`) is what turns camera frames into an `.mp4`. It is a handful
+# of classes rather than the whole of AVFoundation for the same reason as
+# above: the default feature set is ~500 modules and a multi-minute build.
+objc2-av-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "AVAssetWriter",
+    "AVAssetWriterInput",
+    "AVCaptureDevice",
+    "AVCaptureInput",
+    "AVCaptureOutput",
+    "AVCaptureOutputBase",
+    "AVCaptureSession",
+    "AVCaptureVideoDataOutput",
+    "AVMediaFormat",
+    "AVVideoSettings",
+    # `AVAudioSettings` is enabled for completeness, but note that the crate
+    # generates NOTHING for it: the settings-dictionary keys the AAC input
+    # needs (`AVFormatIDKey` and friends) have no bindings, so `encode/macos.rs`
+    # links the symbols itself rather than hard-coding their string values.
+    "AVAudioSettings",
+    "dispatch2",
+    "objc2-core-media",
+    # Without this the pixel-buffer adaptor has no `pixelBufferPool` and no
+    # `appendPixelBuffer:withPresentationTime:` — both are gated on the
+    # CoreVideo dep, and their absence reads as "no method named
+    # appendPixelBuffer" rather than as a missing feature.
+    "objc2-core-video",
+] }
+objc2-core-media = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2",
+    # Without this, `CMSampleBuffer::image_buffer()` does not exist — the
+    # accessor is feature-gated on the CoreVideo dep, and its absence reads as
+    # "no method named image_buffer" rather than as a missing feature.
+    "objc2-core-video",
+    "CMBase",
+    # The audio half of a take's video file. `CMBlockBuffer` holds the PCM and
+    # `objc2-core-audio-types` is where `AudioStreamBasicDescription` lives —
+    # without the latter, `CMAudioFormatDescriptionCreate` and
+    # `CMAudioSampleBufferCreateReadyWithPacketDescriptions` are both absent
+    # and the absence reads as a missing function rather than a missing
+    # feature.
+    "CMBlockBuffer",
+    "objc2-core-audio-types",
+    "CMFormatDescription",
+    "CMSampleBuffer",
+    "CMTime",
+] }
+# Already in the tree via cpal's CoreAudio backend; named here because a
+# transitive dependency is not a nameable one.
+objc2-core-audio-types = { version = "0.3", default-features = false, features = [
+    "std",
+] }
+objc2-core-video = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2",
+    "CVBase",
+    "CVBuffer",
+    "CVImageBuffer",
+    "CVPixelBuffer",
+    # The encoder's frames come from the adaptor's own pool rather than being
+    # allocated per frame: at 1080p30 that is 250 MB a second of malloc/free
+    # that the pool exists to avoid.
+    "CVPixelBufferPool",
+    "CVReturn",
+] }
+# The delegate must be handed a SERIAL queue or AVFoundation makes no ordering
+# promise about frames (`setSampleBufferDelegate:queue:` documents exactly
+# that). `DispatchQueue::new(label, None)` is serial — a null attr is the
+# serial attr.
+dispatch2 = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2",
+] }
+
+# ── the camera, Linux ───────────────────────────────────────────────────────
+#
+# Target-gated exactly like the macOS block above and for the same reason: the
+# Windows build must never see these. `linuxvideo` is the crate
+# RECORDER-PLAN §4 names — 0BSD, pure Rust ioctl wrappers, no bindgen, no
+# libclang — so the V4L2 backend adds no C toolchain requirement to the build.
+[target.'cfg(target_os = "linux")'.dependencies]
+# **Vendored, and the patch is the point.** 0.3.5 hardcodes two buffers behind
+# a `pub(crate)` constructor and never surfaces `v4l2_buffer.sequence`, so
+# upstream we can neither ask for a deeper queue nor SEE the frames a shallow
+# one loses. `vendor/linuxvideo` adds `into_stream_with`, `buffer_count` and
+# `sequence` and changes nothing else; `vendor/README.md` carries the diff and
+# the upstream issue. Drop this back to a registry version once that lands.
+linuxvideo = { path = "vendor/linuxvideo" }
+# MJPEG. Most UVC webcams offer their full frame rate only compressed — the
+# 2012 FaceTime HD this was written against does YUYV at 30 fps up to 640x480
+# and needs MJPG for 1280x720 at 30 — so a backend without a JPEG decoder is a
+# backend that silently caps most cameras at VGA. Pure Rust,
+# MIT/Apache-2.0/Zlib — and 0.5 specifically because eframe already carries
+# zune-jpeg 0.5 transitively (image → tiff), so this pins to the version that
+# is in the tree anyway rather than adding a second copy of the decoder.
+zune-jpeg = "0.5"
+
+[lints]
+workspace = true
+
+[features]
+# The Steinberg ASIO backend, Windows only in practice. Off by default:
+# building it needs the ASIO SDK on disk (CPAL_ASIO_DIR) and the SDK's
+# licence accepted — see docs/RELEASE.md.
+asio = ["cpal/asio"]

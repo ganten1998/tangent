@@ -84,7 +84,7 @@ nag. Keys have no expiry and cover every version, past and future.
 
 You are buying the thing being made, not a thing you receive.
 
-**Download:** <https://github.com/ganten1998/ivory/releases/latest>
+**Download:** <https://github.com/ganten1998/tangent/releases/latest>
 
 ---
 
@@ -101,7 +101,7 @@ You are buying the thing being made, not a thing you receive.
 > reply to this message and it can be reissued to this address.
 >
 > The app itself is always at
-> <https://github.com/ganten1998/ivory/releases/latest>.
+> <https://github.com/ganten1998/tangent/releases/latest>.
 >
 > Ganten
 

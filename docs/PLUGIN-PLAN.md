@@ -18,12 +18,12 @@ Everything below was checked against the tree and against the dependency sources
 | `KeyCapture` default | **`CaptureAll`** (`egui-baseview/src/window.rs:91-94`, `#[default]`). An untreated plugin eats the DAW's spacebar. `Queue::set_key_capture` is public (`window.rs:60`). |
 | `MidiCCs` cost | **2080 parameters.** `VST3_MIDI_CCS = 130` × `VST3_MIDI_CHANNELS = 16`, `nih-plug/src/wrapper/vst3/util.rs`. `MidiConfig::Basic` has no CC64, so no sustain. |
 | nih-plug rev | Must be **exactly** `28b149ec4d62757d0b448809148a0c3ca6e09a95` (what `11f487f`'s `[workspace.dependencies]` pins). A different rev of the same URL = two `nih_plug` packages = "expected Editor, found Editor". It is already in `~/.cargo/git/db`, so the first build resolves offline. Their side takes it `default-features = false` (dropping `vst3`); we must enable `vst3` ourselves. |
-| `gen-third-party-licenses.sh` | Runs `cargo license --json` at the workspace root, unfiltered, with `skip = {"ivory", "ivory-core"}` hardcoded. **If `ivory-plugin` is a root workspace member, the MIT standalone ships a licence manifest listing GPLv3 `vst3-sys`.** This is the single strongest argument for the quarantine. |
+| `gen-third-party-licenses.sh` | Runs `cargo license --json` at the workspace root, unfiltered, with `skip = {"ivory", "tangent-core"}` hardcoded. **If `tangent-plugin` is a root workspace member, the MIT standalone ships a licence manifest listing GPLv3 `vst3-sys`.** This is the single strongest argument for the quarantine. |
 | `a_submenu_near_the_bottom_is_pulled_back_onto_the_screen` (menu.rs:896) | **Tests a local copy of the clamp, not `menu.rs`.** The clamp is currently unguarded. |
 | `process_midi_events` (app.rs:269-303) | **Zero test coverage.** `midi.rs` tests `parse_message` and `pick_auto_port` only. |
 | `Settings::save_to` (settings.rs:434-442) | Bare `fs::write`. `load_from` returns **all defaults** on any parse error. `OverrideStore::save` is already tmp+rename (`overrides.rs:262-268`) with a no-debris test. |
 | Test count | **213** `#[test]`, of which 48 in `ivory/src/*.rs` and 1 in `ivory/tests/`. |
-| `target/` | Already a symlink to `~/Library/Caches/ivory-target` because Dropbox breaks build-script linking. The plugin needs the same. |
+| `target/` | Already a symlink to `~/Library/Caches/tangent-target` because Dropbox breaks build-script linking. The plugin needs the same. |
 
 ---
 
@@ -35,33 +35,33 @@ Everything below was checked against the tree and against the dependency sources
 
 ```toml
 [workspace]
-members  = ["ivory-core", "ivory-ui", "ivory"]
+members  = ["tangent-core", "tangent-ui", "ivory"]
 exclude  = ["plugin"]
 resolver = "2"
 ```
 
-**`ivory-core`** — LIB, MIT. Untouched except for `OverrideStore::save_merged` (step 9).
+**`tangent-core`** — LIB, MIT. Untouched except for `OverrideStore::save_merged` (step 9).
 
-**`ivory-ui`** — NEW LIB (rlib), MIT. The shared GUI. Deps: `egui 0.33` (default-features off), `ivory-core = { path = "../ivory-core", features = ["learning", "license"] }`, `serde`, `serde_json`, `dirs`, `log`. Dev-dep `ttf-parser 0.25`.
+**`tangent-ui`** — NEW LIB (rlib), MIT. The shared GUI. Deps: `egui 0.33` (default-features off), `tangent-core = { path = "../tangent-core", features = ["learning", "license"] }`, `serde`, `serde_json`, `dirs`, `log`. Dev-dep `ttf-parser 0.25`.
 
 Received by `git mv` from `ivory/src/`, **with no renames**: `app.rs`, `piano.rs`, `chord_strip.rs`, `fretboard_panel.rs`, `menu.rs`, `dialogs.rs`, `fonts.rs`, `settings.rs`, `shell.rs`. Plus new `notes.rs` (holding `MidiEvent`, `parse_message` and the `MidiPorts` trait) and new `inline_shell.rs`.
 
 `IvoryApp` keeps its name. `app.rs` keeps its name. Renaming the file that carries the D-UI-11 geometry machinery costs `git log -L` continuity on the code with the AeroSpace 853x1377 story attached, for nothing.
 
-Explicitly **not** dependencies: `eframe`, `midir`, `rfd`, `fd-lock`, `windows-sys`. This is the enforcement mechanism, and it is stronger than any feature flag: `#![windows_subsystem]`, `process::exit`, `rfd` modals and the single-instance lock are unreachable from shared code because the compiler cannot see them. **No `#[cfg(feature = ...)]` anywhere in `ivory-ui`.** Both host paths compile in every build.
+Explicitly **not** dependencies: `eframe`, `midir`, `rfd`, `fd-lock`, `windows-sys`. This is the enforcement mechanism, and it is stronger than any feature flag: `#![windows_subsystem]`, `process::exit`, `rfd` modals and the single-instance lock are unreachable from shared code because the compiler cannot see them. **No `#[cfg(feature = ...)]` anywhere in `tangent-ui`.** Both host paths compile in every build.
 
 > Why not P1's `[lib]` + `[[bin]]` in one package behind a `desktop` feature: it puts the first `#[cfg]` into shared GUI code, which is the seed of the two-GUI fork that the 0.33 pin exists to prevent (HANDOFF §2c), and it relies on nobody ever feature-unifying eframe back in. The three hazards this costs us (see below) are one-line fixes.
 
 Three consequences to handle in the same commit that creates the crate:
-- `gen-third-party-licenses.sh`: `skip = {"ivory", "ivory-core", "ivory-ui"}` in **both** the cargo-license and the `cargo metadata` branch (the latter already filters by `workspace_members`, so only the first needs it).
-- `dialogs.rs:442`'s `env!("CARGO_PKG_VERSION")` now reads `ivory-ui`'s version. `ivory-ui` uses `version.workspace = true`, so it is the same string. Add `pub const VERSION: &str = env!("CARGO_PKG_VERSION");` in `ivory-ui/src/lib.rs` and have About use it, so the coupling is named rather than incidental.
-- The `features = ["learning", "license"]` line **moves** to `ivory-ui/Cargo.toml`, and `ivory/tests/license_feature.rs` moves to `ivory-ui/tests/license_feature.rs`. Keep a copy in `ivory/tests/` as well. This is the trap that has already bitten once.
+- `gen-third-party-licenses.sh`: `skip = {"ivory", "tangent-core", "tangent-ui"}` in **both** the cargo-license and the `cargo metadata` branch (the latter already filters by `workspace_members`, so only the first needs it).
+- `dialogs.rs:442`'s `env!("CARGO_PKG_VERSION")` now reads `tangent-ui`'s version. `tangent-ui` uses `version.workspace = true`, so it is the same string. Add `pub const VERSION: &str = env!("CARGO_PKG_VERSION");` in `tangent-ui/src/lib.rs` and have About use it, so the coupling is named rather than incidental.
+- The `features = ["learning", "license"]` line **moves** to `tangent-ui/Cargo.toml`, and `tangent/tests/license_feature.rs` moves to `tangent-ui/tests/license_feature.rs`. Keep a copy in `ivory/tests/` as well. This is the trap that has already bitten once.
 
-`include_bytes!("../../assets/fonts/...")` still resolves: `ivory-ui/src` is at the same depth as `ivory/src`.
+`include_bytes!("../../assets/fonts/...")` still resolves: `tangent-ui/src` is at the same depth as `ivory/src`.
 
 **`ivory`** — BIN, MIT, package name and `[[bin]] name = "tangent"` unchanged. Keeps `main.rs`, `midi.rs` (midir half + `pick_auto_port`), `build.rs`. Gains `desktop_shell.rs` (`ViewportShell`, `DesktopApp`, `impl eframe::App for DesktopApp`).
 
-The orphan rule forces the wrapper: `impl eframe::App for ivory_ui::IvoryApp` is illegal in crate `ivory`. So:
+The orphan rule forces the wrapper: `impl eframe::App for tangent_ui::IvoryApp` is illegal in crate `ivory`. So:
 
 ```rust
 // ivory/src/desktop_shell.rs
@@ -84,22 +84,22 @@ Two disjoint fields, so the borrow works.
 #
 # This is the structural guarantee that NIH-plug's GPLv3 VST3 bindings can
 # never reach the MIT standalone:
-#   - `cargo build -p ivory-plugin` from the repo root cannot resolve it,
+#   - `cargo build -p tangent-plugin` from the repo root cannot resolve it,
 #   - nih_plug / vst3-sys / baseview never enter the root Cargo.lock,
 #   - so they never appear in THIRD-PARTY-LICENSES or any release artifact.
 # It is a promise enforced by cargo, not by discipline.
 [workspace]
-members = ["ivory-plugin", "xtask"]
+members = ["tangent-plugin", "xtask"]
 ```
 
-That comment is the one already in `tools/ivory-keygen/Cargo.toml`, with `vst3-sys` in place of `ed25519-compact`. It is the repo's own established mechanism for exactly this problem.
+That comment is the one already in `tools/tangent-keygen/Cargo.toml`, with `vst3-sys` in place of `ed25519-compact`. It is the repo's own established mechanism for exactly this problem.
 
-**`ivory-plugin`** — `crate-type = ["cdylib"]`. Source MIT (`license = "MIT"` written literally, not inherited, with a header comment stating the artifact is GPL-3.0-or-later).
+**`tangent-plugin`** — `crate-type = ["cdylib"]`. Source MIT (`license = "MIT"` written literally, not inherited, with a header comment stating the artifact is GPL-3.0-or-later).
 
 ```toml
 [dependencies]
-ivory-ui   = { path = "../../ivory-ui" }
-ivory-core = { path = "../../ivory-core", features = ["learning", "license"] }
+tangent-ui   = { path = "../../tangent-ui" }
+tangent-core = { path = "../../tangent-core", features = ["learning", "license"] }
 egui       = { version = "0.33", default-features = false }
 # The rev MUST equal the one nih_plug_egui pins (11f487f's [workspace.dependencies]).
 # A different rev of the same URL builds TWO nih_plug crates and you get
@@ -120,29 +120,29 @@ Keep `nih_plug_egui`'s default features (`opengl`, `default_fonts`). `default_fo
 **`xtask`** — three lines wrapping `nih_plug_xtask::main()`. Plus `plugin/bundler.toml`:
 
 ```toml
-[ivory-plugin]
+[tangent-plugin]
 name = "Tangent"
 ```
 
 Cross-workspace path deps are fine. `plugin/Cargo.lock` is committed and is the GPL "exact revision" record.
 
-**Dependency direction, asserted in CI:** `ivory-plugin → ivory-ui → ivory-core`, and `ivory → ivory-ui → ivory-core`. Never the reverse. Nothing depends on `ivory-plugin`.
+**Dependency direction, asserted in CI:** `tangent-plugin → tangent-ui → tangent-core`, and `ivory → tangent-ui → tangent-core`. Never the reverse. Nothing depends on `tangent-plugin`.
 
 ```bash
 # in scripts/build-plugin.sh and in the release script
 cargo metadata --format-version 1 --locked | grep -q nih_plug && exit 1   # root is clean
-cargo tree -p ivory-ui | grep -Eq 'eframe|midir|rfd|fd-lock' && exit 1    # ui is clean
-grep -rn 'process::exit\|rfd::' ivory-ui/src ivory-core/src && exit 1     # no DAW killers
-grep -rn 'send_viewport_cmd' ivory-ui/src && exit 1                       # no host commands
+cargo tree -p tangent-ui | grep -Eq 'eframe|midir|rfd|fd-lock' && exit 1    # ui is clean
+grep -rn 'process::exit\|rfd::' tangent-ui/src tangent-core/src && exit 1     # no DAW killers
+grep -rn 'send_viewport_cmd' tangent-ui/src && exit 1                       # no host commands
 ```
 
-**`ivory-ui` must stay an rlib.** Never `dylib`, never `cdylib`. A shared dynamic library between the two binaries is the one thing the GPLv3 §5 aggregation argument cannot survive. Add this line to LICENSING.md.
+**`tangent-ui` must stay an rlib.** Never `dylib`, never `cdylib`. A shared dynamic library between the two binaries is the one thing the GPLv3 §5 aggregation argument cannot survive. Add this line to LICENSING.md.
 
 ---
 
 ## 2. `Shell` and `Caps`
 
-All of this lives in `ivory-ui/src/shell.rs`. `viewport_ui` stays exactly as it is, tests included: it is still the root bridge for all three entry points, and its test is what proves a `CentralPanel` did not gain a margin.
+All of this lives in `tangent-ui/src/shell.rs`. `viewport_ui` stays exactly as it is, tests included: it is still the root bridge for all three entry points, and its test is what proves a `CentralPanel` did not gain a margin.
 
 ```rust
 // ── capabilities ───────────────────────────────────────────────────────────
@@ -167,7 +167,7 @@ pub struct Caps {
     pub own_midi_ports: bool,
     /// One process, one instance: the lock file and the welcome dialog.
     pub single_instance: bool,
-    /// ~/.config/ivory/settings.json is ours to write.
+    /// ~/.config/tangent/settings.json is ours to write.
     pub owns_settings_file: bool,
 }
 
@@ -219,7 +219,7 @@ pub struct SurfaceReport {
     pub context_menu_at: Option<egui::Pos2>,
 }
 
-/// What the body wants done to its surface. `ivory-ui` contains zero
+/// What the body wants done to its surface. `tangent-ui` contains zero
 /// `send_viewport_cmd` calls; this is the only way out.
 #[derive(Clone, Copy, Default)]
 pub struct SurfaceOut { pub start_drag: bool }
@@ -266,7 +266,7 @@ pub trait Shell {
     /// citizen and a plugin that eats the DAW's spacebar.
     fn keyboard_wanted(&mut self, wanted: bool);
 
-    /// The ONLY path from `ivory-ui` to persisted settings. Desktop writes
+    /// The ONLY path from `tangent-ui` to persisted settings. Desktop writes
     /// settings.json; the plugin writes its own VST3 state and never the file.
     fn persist(&mut self, settings: &Settings);
 }
@@ -318,7 +318,7 @@ Ids stay byte-identical: `"ivory-menu"`, `"ivory-menu-sub"`, `"ivory-dialog"`, `
 
 `bounds()` = `Rect::from_min_size(Pos2::ZERO, mon)` when the monitor is known, `Rect::EVERYTHING` otherwise. `to_bounds(p)` = `inner_origin + p.to_vec2()`.
 
-### `InlineShell` (in `ivory-ui/src/inline_shell.rs`)
+### `InlineShell` (in `tangent-ui/src/inline_shell.rs`)
 
 It lives in the library, not in the plugin crate, so it is testable headlessly and reachable from the desktop binary under `IVORY_INLINE=1`.
 
@@ -388,11 +388,11 @@ fn surface(&mut self, ctx, spec, add) -> SurfaceReport {
 
 **Click-through, which nobody costed.** On the desktop the menu is its own window and `handle_main_interaction` (app.rs:429-440) closes it on `primary_pressed` and `return`s, so the click does *not* land on a key. Inline, the same thing happens for free: `handle_main_interaction` still returns early while `menu_state.is_some()`, and `menu_state` is only cleared later in `paint()` by `menu::show`. Identical behaviour, zero extra code. For dialogs, `Modal`'s backdrop senses `CLICK | DRAG` (verified, `modal.rs:94-98`) and swallows the click; keep app.rs:415's `if self.dialog.is_some() { return; }` as well, belt and braces.
 
-### `HeadlessShell` (in `ivory-ui/tests/`)
+### `HeadlessShell` (in `tangent-ui/tests/`)
 
 An `InlineShell` over `egui::Context::default()` at a fixed `bounds`, plus a recording fake that captures every `SurfaceSpec`. This is a real gain: `menu::show` and `dialogs::show` cannot be unit-tested today because they create OS windows.
 
-**Static assertion, in `ivory-ui/src/lib.rs`:**
+**Static assertion, in `tangent-ui/src/lib.rs`:**
 
 ```rust
 // nih_plug_egui::create_egui_editor requires T: 'static + Send. Without this
@@ -421,7 +421,7 @@ Each is `if shell.caps().x { <existing code verbatim> }`, no restructuring insid
 
 1. `new()` L164-166 + L180-181: both `startup_*_detach_at` gated on `detachable`.
 2. `new()` L171: `let welcome = (caps.single_instance && settings.show_welcome).then(...)`. **This one is a trap, not a nicety.** `handle_main_interaction` returns early while `self.dialog.is_some()` (L415-417), and `show_welcome` defaults true, so gating only the *render* leaves the plugin with a piano that is permanently dead to clicks and no visible cause. Gate the **creation**.
-3. `new()` L158-161: the midir connect leaves `IvoryApp` entirely; `ivory/src/main.rs` does it and calls `app.set_ports(...)`.
+3. `new()` L158-161: the midir connect leaves `IvoryApp` entirely; `tangent/src/main.rs` does it and calls `app.set_ports(...)`.
 4. `paint()` L1146-1183: both startup-restore blocks, `detachable`.
 5. `paint()` L1190-1207: the `i.viewport()` inner/outer/monitor read and `main_inner_origin` tracking, `remembers_geometry`. Otherwise `main_inner_origin = ui.max_rect().min; main_origin_known = true;`.
 6. `paint()` L1208-1214: the offscreen rescue, `remembers_geometry`.
@@ -509,7 +509,7 @@ Two accepted costs, stated so nobody reports them as bugs: the plugin shows a sm
 
 One state machine, two producers, and the audio thread never touches `egui::Context` or allocates.
 
-`MidiEvent` moves to `ivory-ui/src/notes.rs` and gains one variant:
+`MidiEvent` moves to `tangent-ui/src/notes.rs` and gains one variant:
 
 ```rust
 pub enum MidiEvent { NoteOn { note: u8, velocity: u8 }, NoteOff { note: u8 },
@@ -533,7 +533,7 @@ That is the entire change to the app's MIDI code. **The desktop's `mpsc` inbox i
 ### The plugin side
 
 ```rust
-// plugin/ivory-plugin/src/shared.rs
+// plugin/tangent-plugin/src/shared.rs
 pub struct NoteBridge {
     /// Exact ordering, preserved. Allocated once in Plugin::default().
     queue:   ArrayQueue<MidiEvent>,     // crossbeam-queue, capacity 8192
@@ -592,10 +592,10 @@ The audio thread never calls `ctx.request_repaint()`: `nih_plug_egui`'s update c
 
 `MidiConfig::MidiCCs` registers 2080 hidden parameters (`kIsReadOnly | kIsHidden`, `wrapper.rs:558`). Accepted deliberately: `Basic` silently loses the sustain pedal, which would make the plugin behave differently from the app it ships beside. Measure plugin-scan and project-load time in Cubase and Studio One; document it.
 
-`ivory/src/midi.rs` keeps midir, `pick_auto_port` and its tests, and implements:
+`tangent/src/midi.rs` keeps midir, `pick_auto_port` and its tests, and implements:
 
 ```rust
-// ivory-ui/src/notes.rs
+// tangent-ui/src/notes.rs
 pub trait MidiPorts {
     fn list(&self) -> Vec<String>;
     fn current(&self) -> Option<&str>;
@@ -614,14 +614,14 @@ pub trait MidiPorts {
 
 | Thing | Behaviour | Why |
 |---|---|---|
-| **Settings** | The plugin reads `~/.config/ivory/settings.json` **once**, at `Plugin::default()`, as a read-only **seed**. Thereafter its settings live in `#[persist = "settings"] Arc<Mutex<String>>` (the serialised `Settings`), which nih-plug saves with the host project and restores on session recall. The plugin **never writes the file** during ordinary use. | A fresh instance looks like the user's standalone. A reopened session is byte-exact. Two instances on two tracks can hold different capos, tunings and colours. And instance B cannot silently overwrite what instance A chose, which is exactly what a shared last-writer-wins file does today (`Settings::save()` rewrites the whole file, `Settings::load()` runs once per process). |
+| **Settings** | The plugin reads `~/.config/tangent/settings.json` **once**, at `Plugin::default()`, as a read-only **seed**. Thereafter its settings live in `#[persist = "settings"] Arc<Mutex<String>>` (the serialised `Settings`), which nih-plug saves with the host project and restores on session recall. The plugin **never writes the file** during ordinary use. | A fresh instance looks like the user's standalone. A reopened session is byte-exact. Two instances on two tracks can hold different capos, tunings and colours. And instance B cannot silently overwrite what instance A chose, which is exactly what a shared last-writer-wins file does today (`Settings::save()` rewrites the whole file, `Settings::load()` runs once per process). |
 | **Escape hatch** | One new menu row, built only when `!caps.owns_settings_file`: **"Save Appearance as Default"**. It does a single read-modify-write of the appearance keys only (colours, dark mode, font, wood, tuning, capo, heart), never geometry. | Otherwise the flow is one-way and a user who perfects their colours in a plugin cannot get them back to the app. |
 | **Keys meaningless in a plugin** | `window_x/y`, `detached_*`, `fretboard_win_*`, `borderless_mode`, `window_size_percent` are never consulted and round-trip untouched through `#[persist]`, the same way `Settings::extra` already preserves unknown keys. | |
-| **Taught chords + learned weights** | **Global and shared**, in `~/.config/ivory/overrides.json`. This is the user's musical data, not per-session appearance. `OverrideStore::save` is already tmp+rename; add `save_merged()` (reload from disk, merge, write) so two writers cannot clobber each other's teaching. | Scoping taught names per-instance would be worse than sharing them. |
-| **Single-instance lock** | The plugin **never takes it** (`caps.single_instance = false`). `acquire_single_instance` stays in `ivory/src/main.rs` and is unreachable from `ivory-ui` because `fd-lock` is not a dependency. | The standalone and any number of plugin instances coexist. |
+| **Taught chords + learned weights** | **Global and shared**, in `~/.config/tangent/overrides.json`. This is the user's musical data, not per-session appearance. `OverrideStore::save` is already tmp+rename; add `save_merged()` (reload from disk, merge, write) so two writers cannot clobber each other's teaching. | Scoping taught names per-instance would be worse than sharing them. |
+| **Single-instance lock** | The plugin **never takes it** (`caps.single_instance = false`). `acquire_single_instance` stays in `tangent/src/main.rs` and is unreachable from `tangent-ui` because `fd-lock` is not a dependency. | The standalone and any number of plugin instances coexist. |
 | **Welcome dialog** | Never created in the plugin (guard point 2). | A welcome note on first insert is wrong, and an invisible one deadlocks the piano. |
 | **The `#[persist]` caveat** | Hosts mark a project dirty when a **parameter** changes, not when a `#[persist]` field does. A user who recolours and closes without saving loses it. Say so in the release notes; "Save Appearance as Default" covers the case that matters. | |
-| **Panics** | `ivory-plugin` installs **no** panic hook (nih-plug installs its own at `wrapper/util.rs`, which logs rather than exits) and wraps the frame in `catch_unwind` into a poisoned flag that paints a static message. `main.rs`'s `process::exit(1)` hook is unreachable because `rfd` and `fd-lock` are not `ivory-ui` deps. | A process-global exit hook inside a DAW takes the host and the user's unsaved session with it. |
+| **Panics** | `tangent-plugin` installs **no** panic hook (nih-plug installs its own at `wrapper/util.rs`, which logs rather than exits) and wraps the frame in `catch_unwind` into a poisoned flag that paints a static message. `main.rs`'s `process::exit(1)` hook is unreachable because `rfd` and `fd-lock` are not `tangent-ui` deps. | A process-global exit hook inside a DAW takes the host and the user's unsaved session with it. |
 
 `Settings::save_to` becomes atomic (tmp + rename in the same directory) regardless, mirroring `overrides.rs:262-268`. It must keep failing **silently** on a read-only or full config dir and must leave no `.tmp` behind; copy `save_is_atomic_and_leaves_no_temp_file`.
 
@@ -634,7 +634,7 @@ pub trait MidiPorts {
 ```rust
 Plugin::NAME    = "Tangent";        // never "Tangent VST"
 Plugin::VENDOR  = "ganten";
-Plugin::VERSION = ivory_ui::VERSION;
+Plugin::VERSION = tangent_ui::VERSION;
 const AUDIO_IO_LAYOUTS: &[AudioIOLayout] = &[stereo_in_out, mono_in_out];
 const MIDI_INPUT:  MidiConfig = MidiConfig::MidiCCs;
 const MIDI_OUTPUT: MidiConfig = MidiConfig::None;
@@ -654,13 +654,13 @@ Fonts: `fonts::install` and `fonts::apply_text_styles` run in `create_egui_edito
 
 ### `scripts/build-plugin.sh`
 
-1. `export CARGO_TARGET_DIR=~/Library/Caches/ivory-plugin-target`. **Non-negotiable.** The root `target` is already a symlink out of Dropbox because Dropbox breaks build-script linking with "Operation not permitted"; `plugin/target` would be a brand-new Dropbox subdirectory hitting the same wall.
-2. Assert: root `cargo metadata` mentions no `nih_plug`; `cargo tree -p ivory-ui` mentions no `eframe`/`midir`/`rfd`; `plugin/Cargo.lock` is clean; the two workspace versions agree; the `egui` version in `./Cargo.lock` equals the one in `plugin/Cargo.lock` (fail otherwise, and escalate to `=0.33.x` pins if it ever fires).
-3. macOS: `cargo xtask bundle ivory-plugin --release --target aarch64-apple-darwin` and `--target x86_64-apple-darwin`, then `lipo` into `Contents/MacOS/Tangent`. Hosts still run under Rosetta and an arm64-only plugin is invisible in those.
-4. **Rewrite the Info.plist.** `nih_plug_xtask` hardcodes `CFBundleIdentifier = com.nih-plug.{package}` and `CFBundleShortVersionString = 1.0.0`. Write `CFBundleIdentifier = org.codeberg.ganten1998.ivory.plugin` (the app's `org.codeberg.ganten1998.ivory` is untouched; two bundles must not share one identifier, and `.plugin` rather than `.vst3` keeps Steinberg's mark out of every string we choose), `CFBundleName`/`CFBundleDisplayName`/`CFBundleExecutable = Tangent`, `CFBundlePackageType = BNDL`, the numeric core of the workspace version (same truncation `build-macos.sh` does), `LSMinimumSystemVersion = 11.0`, `NSHighResolutionCapable = true`.
+1. `export CARGO_TARGET_DIR=~/Library/Caches/tangent-plugin-target`. **Non-negotiable.** The root `target` is already a symlink out of Dropbox because Dropbox breaks build-script linking with "Operation not permitted"; `plugin/target` would be a brand-new Dropbox subdirectory hitting the same wall.
+2. Assert: root `cargo metadata` mentions no `nih_plug`; `cargo tree -p tangent-ui` mentions no `eframe`/`midir`/`rfd`; `plugin/Cargo.lock` is clean; the two workspace versions agree; the `egui` version in `./Cargo.lock` equals the one in `plugin/Cargo.lock` (fail otherwise, and escalate to `=0.33.x` pins if it ever fires).
+3. macOS: `cargo xtask bundle tangent-plugin --release --target aarch64-apple-darwin` and `--target x86_64-apple-darwin`, then `lipo` into `Contents/MacOS/Tangent`. Hosts still run under Rosetta and an arm64-only plugin is invisible in those.
+4. **Rewrite the Info.plist.** `nih_plug_xtask` hardcodes `CFBundleIdentifier = com.nih-plug.{package}` and `CFBundleShortVersionString = 1.0.0`. Write `CFBundleIdentifier = org.codeberg.ganten1998.tangent.plugin` (the app's `org.codeberg.ganten1998.tangent` is untouched; two bundles must not share one identifier, and `.plugin` rather than `.vst3` keeps Steinberg's mark out of every string we choose), `CFBundleName`/`CFBundleDisplayName`/`CFBundleExecutable = Tangent`, `CFBundlePackageType = BNDL`, the numeric core of the workspace version (same truncation `build-macos.sh` does), `LSMinimumSystemVersion = 11.0`, `NSHighResolutionCapable = true`.
 5. Install into `Tangent.vst3/Contents/Resources/`: `LICENSE-GPL-3.0`, `LICENSE` (MIT), a plugin-scoped `THIRD-PARTY-LICENSES` generated from `plugin/Cargo.lock`, `OFL.txt` + `font-licenses/` (the OFL obligation is **larger** here: `default_fonts` statically embeds Ubuntu-Light, Noto Emoji, Hack and emoji-icon-font, the same four `build-macos.sh` already covers), and `SOURCE.txt` generated from `plugin/Cargo.lock` naming the **public GitHub** URL (the Codeberg origin is private), the release commit SHA, and the exact `nih_plug`, `nih_plug_egui`/`egui-baseview`, `baseview` and `vst3-sys` revisions.
 6. **Verify and exit non-zero** if any of those files is missing from the assembled bundle. LICENSING.md's own words: "If that step is ever dropped, the release is non-compliant, quietly."
-7. **Re-sign**, replacing the xtask's ad-hoc signature: `codesign --force --options runtime --timestamp -s "$SIGN_ID"` on `Contents/MacOS/Tangent` then on the bundle, then `codesign --verify --strict --verbose=2`. Reuse `IVORY_SIGN_ID` and the `Developer ID Application` auto-discovery from `build-macos.sh:199`. An ad-hoc-signed `.vst3` is refused by more hosts than an ad-hoc app.
+7. **Re-sign**, replacing the xtask's ad-hoc signature: `codesign --force --options runtime --timestamp -s "$SIGN_ID"` on `Contents/MacOS/Tangent` then on the bundle, then `codesign --verify --strict --verbose=2`. Reuse `TANGENT_SIGN_ID` and the `Developer ID Application` auto-discovery from `build-macos.sh:199`. An ad-hoc-signed `.vst3` is refused by more hosts than an ad-hoc app.
 8. Notarize: `ditto -c -k --sequesterRsrc --keepParent`, `xcrun notarytool submit --keychain-profile "$NOTARY_PROFILE" --wait`, `xcrun stapler staple Tangent.vst3`, `stapler validate`.
 9. `install` / `uninstall` subcommands that `rm -rf ~/Library/Audio/Plug-Ins/VST3/Tangent.vst3` and then `ditto` a fresh copy. **New inode every iteration.** After an in-place re-sign, syspolicyd serves the cached rejection and the DAW keeps refusing a bundle that is actually fine; `xattr -cr` plus a fresh signature is not enough. This is the same trap this machine already hit with Vesktop and it reads as a code bug for an afternoon.
 
@@ -674,15 +674,15 @@ Delivery: a **separate download** per platform, never fused into the DMG. `scrip
 
 ## 9. How the crate graph satisfies LICENSING.md conditions 1-3
 
-**Condition 1, "the plugin stays optional."** Two artifacts, two scripts, two downloads. `scripts/build-macos.sh` produces `Tangent.app`; `scripts/build-plugin.sh` produces `Tangent.vst3`. The installer offers it as a checkbox. Nothing in `ivory` or `ivory-ui` references `ivory-plugin`, and the standalone is fully functional with no `.vst3` anywhere.
+**Condition 1, "the plugin stays optional."** Two artifacts, two scripts, two downloads. `scripts/build-macos.sh` produces `Tangent.app`; `scripts/build-plugin.sh` produces `Tangent.vst3`. The installer offers it as a checkbox. Nothing in `ivory` or `tangent-ui` references `tangent-plugin`, and the standalone is fully functional with no `.vst3` anywhere.
 
-**Condition 2, "they never link."** Enforced by cargo, not by care. `plugin/Cargo.toml` carries the empty `[workspace]` table and the root carries `exclude = ["plugin"]`, so `cargo build -p ivory-plugin` from the repo root does not resolve, and `nih_plug`/`vst3-sys`/`baseview` never enter the root `Cargo.lock` and therefore never enter the app's `THIRD-PARTY-LICENSES`. `ivory-ui` is an rlib linked **statically** into two independent executables, which is compile-time sharing, exactly what LICENSING.md permits. No shared dynamic library exists. The plugin does not take the lock file, does not open a socket, does not launch or detect the app, and does not require it. The one thing that could be argued is that both read `~/.config/ivory/settings.json` and `overrides.json`; that is two unrelated programs reading one dotfile, not IPC, and the design has the plugin never write settings.json in ordinary use, which removes even the appearance of coupling. **Add a fourth bullet to LICENSING.md: the plugin must be fully functional with the standalone absent** (missing files already fall back to `Settings::default()` and an empty `OverrideStore`), and never "improve" this into a daemon or a shared dylib without redoing the analysis.
+**Condition 2, "they never link."** Enforced by cargo, not by care. `plugin/Cargo.toml` carries the empty `[workspace]` table and the root carries `exclude = ["plugin"]`, so `cargo build -p tangent-plugin` from the repo root does not resolve, and `nih_plug`/`vst3-sys`/`baseview` never enter the root `Cargo.lock` and therefore never enter the app's `THIRD-PARTY-LICENSES`. `tangent-ui` is an rlib linked **statically** into two independent executables, which is compile-time sharing, exactly what LICENSING.md permits. No shared dynamic library exists. The plugin does not take the lock file, does not open a socket, does not launch or detect the app, and does not require it. The one thing that could be argued is that both read `~/.config/tangent/settings.json` and `overrides.json`; that is two unrelated programs reading one dotfile, not IPC, and the design has the plugin never write settings.json in ordinary use, which removes even the appearance of coupling. **Add a fourth bullet to LICENSING.md: the plugin must be fully functional with the standalone absent** (missing files already fall back to `Settings::default()` and an empty `OverrideStore`), and never "improve" this into a daemon or a shared dylib without redoing the analysis.
 
 **Condition 3, "each carries its own licence."** `LICENSE` (MIT) beside the app as today; `LICENSE-GPL-3.0` inside `Tangent.vst3/Contents/Resources/`, placed by build-plugin.sh step 5 and asserted by step 6, which exits non-zero rather than warning. Source availability = this repo at the release commit plus the pinned revs, recorded in `SOURCE.txt` **generated from the lockfile** rather than typed by hand, pointing at the public GitHub mirror. Verify the GitHub repo itself is public before the first `.vst3` ships.
 
 **Trademark.** Product name is "Tangent" everywhere a human reads it: `Plugin::NAME`, `CFBundleName`, `CFBundleDisplayName`, the installer checkbox, the release title, the asset name (`Tangent-2.4.0-plugin-macos-universal.zip`, **not** `Tangent-VST3-*`). `Plugin::VENDOR` must not contain "VST" either. The word appears only in the `.vst3` folder extension, in the Windows payload filename, in install paths the OS requires, and in descriptive prose of the form "Tangent plugin (VST3 format)".
 
-Add one row to LICENSING.md's table: `ivory-core`, `ivory-ui`, `ivory`, `ivory-plugin` and every other crate in this repo | MIT | Source, not binaries.
+Add one row to LICENSING.md's table: `tangent-core`, `tangent-ui`, `ivory`, `tangent-plugin` and every other crate in this repo | MIT | Source, not binaries.
 
 ---
 
@@ -706,7 +706,7 @@ Acceptance: `cargo test --workspace` goes from 213 to 218; `cargo build --worksp
 
 ### Step 2 — Atomic `Settings::save_to`. Ships on its own.
 
-`settings.rs:434-442` becomes tmp + rename in the same directory, mirroring `ivory-core/src/overrides.rs:262-268`:
+`settings.rs:434-442` becomes tmp + rename in the same directory, mirroring `tangent-core/src/overrides.rs:262-268`:
 
 ```rust
 fn save_to(&self, path: &std::path::Path) {
@@ -723,31 +723,31 @@ fn save_to(&self, path: &std::path::Path) {
 
 This is a desktop bug fix today: 22 call sites in `app.rs` truncate the file in place, and `load_from` treats any parse error as "return every default", so a crash or a concurrent read mid-write costs the user every colour they ever picked. It becomes routine the moment a second process exists.
 
-New tests: a truncated file is not mistaken for valid empty settings; no `.tmp` is left behind (copy `save_is_atomic_and_leaves_no_temp_file`); the write still fails silently on a read-only directory. `unknown_keys_preserved_and_key_order_stable`, `garbage_file_yields_defaults`, `window_geometry_round_trips_including_negative_coordinates`, `half_written_position_is_ignored_rather_than_half_applied` and `wrong_typed_keys_fall_back_per_key` must stay green untouched. `~/.config/ivory` is not on Dropbox, so there is no dataless-file hazard.
+New tests: a truncated file is not mistaken for valid empty settings; no `.tmp` is left behind (copy `save_is_atomic_and_leaves_no_temp_file`); the write still fails silently on a read-only directory. `unknown_keys_preserved_and_key_order_stable`, `garbage_file_yields_defaults`, `window_geometry_round_trips_including_negative_coordinates`, `half_written_position_is_ignored_rather_than_half_applied` and `wrong_typed_keys_fall_back_per_key` must stay green untouched. `~/.config/tangent` is not on Dropbox, so there is no dataless-file hazard.
 
-### Step 3 — Carve out `ivory-ui`. Pure move, nothing else in the commit.
+### Step 3 — Carve out `tangent-ui`. Pure move, nothing else in the commit.
 
 ```bash
-mkdir -p ivory-ui/src ivory-ui/tests
-git mv ivory/src/{app,piano,chord_strip,fretboard_panel,menu,dialogs,fonts,settings,shell}.rs ivory-ui/src/
-git mv ivory/tests/license_feature.rs ivory-ui/tests/
+mkdir -p tangent-ui/src tangent-ui/tests
+git mv ivory/src/{app,piano,chord_strip,fretboard_panel,menu,dialogs,fonts,settings,shell}.rs tangent-ui/src/
+git mv tangent/tests/license_feature.rs tangent-ui/tests/
 ```
 
-- New `ivory-ui/src/lib.rs`: nine `pub mod` lines, `pub mod notes;`, and `pub const VERSION`.
-- New `ivory-ui/src/notes.rs`: `MidiEvent` and `parse_message` cut from `ivory/src/midi.rs` **with their tests**, plus the `MidiPorts` trait (unimplemented for now).
-- New `ivory-ui/Cargo.toml` with `version.workspace = true`, `license.workspace = true`, the `ivory-core = { features = ["learning", "license"] }` line **moved** from `ivory/Cargo.toml:29`, `egui`, `serde`, `serde_json`, `dirs`, `log`, and `[dev-dependencies] ttf-parser = "0.25"` (moved; `fonts::embedded_fonts_cover_delta_and_oslash` needs it, and a missing dev-dep fails loudly rather than silently).
+- New `tangent-ui/src/lib.rs`: nine `pub mod` lines, `pub mod notes;`, and `pub const VERSION`.
+- New `tangent-ui/src/notes.rs`: `MidiEvent` and `parse_message` cut from `tangent/src/midi.rs` **with their tests**, plus the `MidiPorts` trait (unimplemented for now).
+- New `tangent-ui/Cargo.toml` with `version.workspace = true`, `license.workspace = true`, the `tangent-core = { features = ["learning", "license"] }` line **moved** from `tangent/Cargo.toml:29`, `egui`, `serde`, `serde_json`, `dirs`, `log`, and `[dev-dependencies] ttf-parser = "0.25"` (moved; `fonts::embedded_fonts_cover_delta_and_oslash` needs it, and a missing dev-dep fails loudly rather than silently).
 - New `ivory/src/desktop_shell.rs`: `DesktopApp { app, shell }` + `impl eframe::App` (the block moved from `app.rs:1118-1136`), because the orphan rule forbids implementing a foreign trait on a foreign type.
-- `ivory/src/main.rs`: drop the nine `mod` lines, `use ivory_ui::{app::IvoryApp, settings::Settings};`, keep `#![windows_subsystem]`, the CLI, the logger, the panic hook, the lock, the icon, `run_native`.
-- Root `Cargo.toml`: add `ivory-ui` to `members`, add `exclude = ["plugin"]` now so it never gets forgotten.
-- `scripts/gen-third-party-licenses.sh`: `skip = {"ivory", "ivory-core", "ivory-ui"}`. Regenerate `THIRD-PARTY-LICENSES` and check the diff is empty apart from crate count.
+- `tangent/src/main.rs`: drop the nine `mod` lines, `use tangent_ui::{app::IvoryApp, settings::Settings};`, keep `#![windows_subsystem]`, the CLI, the logger, the panic hook, the lock, the icon, `run_native`.
+- Root `Cargo.toml`: add `tangent-ui` to `members`, add `exclude = ["plugin"]` now so it never gets forgotten.
+- `scripts/gen-third-party-licenses.sh`: `skip = {"ivory", "tangent-core", "tangent-ui"}`. Regenerate `THIRD-PARTY-LICENSES` and check the diff is empty apart from crate count.
 - HANDOFF §3 (repo layout) and §5 (commands) updated **in this commit**, not afterwards.
 - Copy `license_feature.rs` back into `ivory/tests/` as well. One file, and it catches a future direct dep.
 
-Acceptance, and this is the tripwire that matters: **`cargo test --workspace` must report the identical count**, 218, with the 48 unit tests appearing under the `ivory-ui` target instead of the `ivory` target. Record the exact before/after per-target counts in the commit message. A module accidentally omitted from `lib.rs` makes its tests vanish while the suite stays green. Also add and run the four firewall greps from §1. `cargo run --bin tangent` must be indistinguishable; take a `screencapture -x -o` before and after and decode both.
+Acceptance, and this is the tripwire that matters: **`cargo test --workspace` must report the identical count**, 218, with the 48 unit tests appearing under the `tangent-ui` target instead of the `ivory` target. Record the exact before/after per-target counts in the commit message. A module accidentally omitted from `lib.rs` makes its tests vanish while the suite stays green. Also add and run the four firewall greps from §1. `cargo run --bin tangent` must be indistinguishable; take a `screencapture -x -o` before and after and decode both.
 
 ### Steps 4 onward
 
-4. **`Shell` / `Caps` / `SurfaceSpec` / `SurfaceReport` / `SurfaceOut` in `ivory-ui/src/shell.rs`, plus `ViewportShell` in `ivory/src/desktop_shell.rs`.** Route all five `show_viewport_immediate` sites and all nine `send_viewport_cmd` sites through it; add the eleven guard points with `Caps::DESKTOP`; add the `Caps::DESKTOP` all-true / `Caps::PLUGIN` all-false test and the `assert_send::<IvoryApp>()` static assertion. Desktop behaviour unchanged. **Review this commit harder than any other**, field by field against the old `ViewportBuilder`s: the submenu's `with_active(false)` (lose it and Escape-to-close breaks in a way nobody notices until a tester reports it), dialogs' `with_always_on_top`, `with_decorations(!borderless)`, and the `last_sent_size` / `decorations_sent` latches (lose either and the app sends three viewport commands every frame forever). Add a counting fake `Shell` asserting one triple per change and zero per steady frame. `a_tiling_wm_is_detected_but_ordinary_jitter_is_not` does not move and does not change; the Caps guard goes **around** the call, never inside the predicate.
+4. **`Shell` / `Caps` / `SurfaceSpec` / `SurfaceReport` / `SurfaceOut` in `tangent-ui/src/shell.rs`, plus `ViewportShell` in `ivory/src/desktop_shell.rs`.** Route all five `show_viewport_immediate` sites and all nine `send_viewport_cmd` sites through it; add the eleven guard points with `Caps::DESKTOP`; add the `Caps::DESKTOP` all-true / `Caps::PLUGIN` all-false test and the `assert_send::<IvoryApp>()` static assertion. Desktop behaviour unchanged. **Review this commit harder than any other**, field by field against the old `ViewportBuilder`s: the submenu's `with_active(false)` (lose it and Escape-to-close breaks in a way nobody notices until a tester reports it), dialogs' `with_always_on_top`, `with_decorations(!borderless)`, and the `last_sent_size` / `decorations_sent` latches (lose either and the app sends three viewport commands every frame forever). Add a counting fake `Shell` asserting one triple per change and zero per steady frame. `a_tiling_wm_is_detected_but_ordinary_jitter_is_not` does not move and does not change; the Caps guard goes **around** the call, never inside the predicate.
 
 5. **`monitor: Option<Vec2>` → `bounds: Rect` everywhere placement is clamped**: `menu.rs:471`, the extracted `clamp_submenu`, `dialogs::Placement`, `settings::clamp_to_monitor` → `clamp_to_bounds`, `app.rs`'s `monitor_size`. Desktop passes `Rect(0,0..monitor)` so nothing moves; `Rect::EVERYTHING` preserves the "unknown" semantics. Clamp to `bounds.min`, not to 0.0. Step 1's real-clamp test and `a_dialog_centres_on_the_window_or_declines_to_place_itself` must both stay green.
 
@@ -757,9 +757,9 @@ Acceptance, and this is the tripwire that matters: **`cargo test --workspace` mu
 
 8. **`band_sizes_for_width` + `MidiEvent::AllNotesOff` + `MidiPorts`.** The additive layout branch, the one new `process_midi_events` arm, and moving the midir connect out of `IvoryApp::new` into `main.rs` behind the trait. `size_math_matches_python_int_truncation` and `the_fretboard_band_joins_the_stack_at_every_size` stay green **and unedited**.
 
-9. **`OverrideStore::save_merged`** in `ivory-core` (reload, merge, write, still tmp+rename), used by the teach and correct paths. One test: two stores teaching different chords both survive.
+9. **`OverrideStore::save_merged`** in `tangent-core` (reload, merge, write, still tmp+rename), used by the teach and correct paths. One test: two stores teaching different chords both survive.
 
-10. **Create `plugin/`. `Plugin` impl only, no editor.** The quarantined workspace with the ivory-keygen comment, `bundler.toml`, `xtask`, `.cargo/config.toml` with the `xtask` alias, the `CARGO_TARGET_DIR` symlink created now rather than discovered later. `NoteBridge`, `process()`, `reset()`, `deactivate()`, the Bypass param, the two `#[persist]` fields, `nih_export_vst3!`. Mirror `license_feature.rs` into `plugin/ivory-plugin/tests/`. **Milestone: `cargo xtask bundle ivory-plugin --release` produces `Tangent.vst3`, a validator and Reaper both scan and load it, audio passes through unchanged, the parameter list is sane, and `nih_log!` shows note events arriving.**
+10. **Create `plugin/`. `Plugin` impl only, no editor.** The quarantined workspace with the tangent-keygen comment, `bundler.toml`, `xtask`, `.cargo/config.toml` with the `xtask` alias, the `CARGO_TARGET_DIR` symlink created now rather than discovered later. `NoteBridge`, `process()`, `reset()`, `deactivate()`, the Bypass param, the two `#[persist]` fields, `nih_export_vst3!`. Mirror `license_feature.rs` into `plugin/tangent-plugin/tests/`. **Milestone: `cargo xtask bundle tangent-plugin --release` produces `Tangent.vst3`, a validator and Reaper both scan and load it, audio passes through unchanged, the parameter list is sane, and `nih_log!` shows note events arriving.**
 
 11. **Wire the editor.** `create_egui_editor` with `fonts::install` + `apply_text_styles` in the **build** callback; `ResizableWindow::show` in the update callback; drain the bridge into `midi_tx`; `IvoryApp::paint(ui, &mut PluginShell)`; `catch_unwind`; `keyboard_wanted` → `Queue::set_key_capture`; `queue.bg_color(BLACK)`; settings seeded from `#[persist]` if present, else from the file, else defaults. **This is v1's payload.**
 
@@ -783,7 +783,7 @@ Acceptance, and this is the tripwire that matters: **`cargo test --workspace` mu
 - **A second exported Instrument class.** Step 15, after measurement.
 - **AU, CLAP, AAX, standalone-via-nih-plug.** VST3 only, one deliverable.
 - **The desktop switching to `InlineShell` by default.** `IVORY_INLINE=1` is a developer switch. `ViewportShell` is and stays the desktop.
-- **Any change to `ivory-core`'s engine.** The chord engine, the voicing solver, the 13,133-row differential, `acceptance.rs`, `voicing_acceptance.rs` and `voicing_stress.rs` see no diff. The only `ivory-core` change in the whole plan is `save_merged`.
+- **Any change to `tangent-core`'s engine.** The chord engine, the voicing solver, the 13,133-row differential, `acceptance.rs`, `voicing_acceptance.rs` and `voicing_stress.rs` see no diff. The only `tangent-core` change in the whole plan is `save_merged`.
 
 ---
 
@@ -792,7 +792,7 @@ Acceptance, and this is the tripwire that matters: **`cargo test --workspace` mu
 | Trap | Prevention |
 |---|---|
 | Tests silently disappearing when nine modules change crate | Step 3 is a pure move whose commit message records the exact before/after per-target counts. A count that drops is a missing `pub mod`. |
-| The `license` feature line left behind in `ivory/Cargo.toml` | It moves with the dependency, the test moves with it, a copy stays in `ivory/tests/`, and `plugin/ivory-plugin/tests/` gets its own. Otherwise every supporter key is rejected inside the DAW while all 218 tests stay green. This has bitten once already. |
+| The `license` feature line left behind in `tangent/Cargo.toml` | It moves with the dependency, the test moves with it, a copy stays in `ivory/tests/`, and `plugin/tangent-plugin/tests/` gets its own. Otherwise every supporter key is rejected inside the DAW while all 218 tests stay green. This has bitten once already. |
 | A dropped `ViewportBuilder` field in step 4 | `SurfaceSpec`'s fields are exactly the union of the five existing builders, so a dropped field is a missing struct field. Plus the recording fake asserting `with_active(false)` on the submenu and `always_on_top` on dialogs. |
 | The geometry latches turning into per-frame commands | `last_sent_size` and `decorations_sent` move **into** `ViewportShell`; a counting fake asserts one triple per change, zero per steady frame. |
 | `clamp_to_bounds` snapping negative-coordinate multi-monitor setups to the primary origin | Clamp to `bounds.min`, not 0.0; `Rect::EVERYTHING` for unknown; the existing round-trip test stays green. |
@@ -801,11 +801,11 @@ Acceptance, and this is the tripwire that matters: **`cargo test --workspace` mu
 | `11f487f` being rebased away | Both revs are already in `~/.cargo/git/db` and in `plugin/Cargo.lock`. Mirror both repos to Codeberg as pinned read-only forks the moment the first release ships. Last resort is vendoring `editor.rs` + `lib.rs` + `resizable_window.rs` (about 400 lines, MIT, attribution retained). |
 | Two lockfiles drifting to different `0.33.x` patch releases | The version tripwire in build-plugin.sh; escalate to `=0.33.x` if it fires. |
 | `plugin/target` inside Dropbox reproducing "Operation not permitted" | `CARGO_TARGET_DIR` symlink created in step 10, not discovered in step 12. |
-| A panic unwinding through baseview's objc/Win32 FFI (UB, takes the DAW) | No panic hook in the plugin, `catch_unwind` around the frame into a poisoned flag, and the CI grep that `ivory-ui` and `ivory-core` contain no `process::exit` and no `rfd`. `voicing_stress.rs` exists because a real overflow panic was found in the solver; that panic is now a DAW crash. |
+| A panic unwinding through baseview's objc/Win32 FFI (UB, takes the DAW) | No panic hook in the plugin, `catch_unwind` around the frame into a poisoned flag, and the CI grep that `tangent-ui` and `tangent-core` contain no `process::exit` and no `rfd`. `voicing_stress.rs` exists because a real overflow panic was found in the solver; that panic is now a DAW crash. |
 | macOS library validation | A DAW running hardened **without** `com.apple.security.cs.disable-library-validation` refuses a plugin not signed by its own team. Most carry it. Developer ID + hardened runtime + notarize + staple, or expect "it doesn't show up in my plugin list" reports indistinguishable from a scan failure. |
 | The re-sign cache trap on Tahoe | `install`/`uninstall` subcommands that `rm -rf` then `ditto`. New inode every iteration. |
 | `IVORY_DEMO_NOTES` read every frame | `app.rs:312` calls `std::env::var` inside `display_notes()`: a process-global lock plus an allocation, per instance, sixty times a second. Read it once at construction. One line, do it in step 8. |
-| "Just save it, it's one line" reopening settings.json writes from the plugin | `Shell::persist` is the **only** path to disk from `ivory-ui`; do not re-expose `Settings::save` there. |
+| "Just save it, it's one line" reopening settings.json writes from the plugin | `Shell::persist` is the **only** path to disk from `tangent-ui`; do not re-expose `Settings::save` there. |
 | Scope creep back into column reflow or dialog rewrites | The arithmetic is written down here: a 545pt menu in a 200pt editor is not moved UI, it is new UI, and the editor is resizable. |
 
 ---
@@ -915,19 +915,19 @@ it then saves over the wreckage — one torn write costs every setting the user
 ever chose. Now write-then-rename. Rare with one writer; routine once several
 plugin instances share the file.
 
-**3. `ivory-ui` extracted (`441bcfd`).** Nine modules moved by `git mv`,
-unchanged. The set was already closed: they reference each other and `ivory-core`
+**3. `tangent-ui` extracted (`441bcfd`).** Nine modules moved by `git mv`,
+unchanged. The set was already closed: they reference each other and `tangent-core`
 and nothing else, and not one mentioned eframe, midir, rfd or fd-lock.
-**229 tests before, 229 after** — `ivory-ui` 53, the binary 11. `app.rs` stays in
+**229 tests before, 229 after** — `tangent-ui` 53, the binary 11. `app.rs` stays in
 the binary for now because it still owns eframe.
 
 `scripts/check-firewall.sh` is the enforcement, and it was verified to FAIL:
-planting a `process::exit` in `ivory-ui` makes it exit non-zero and name the
+planting a `process::exit` in `tangent-ui` makes it exit non-zero and name the
 line. Two things it caught in passing:
-`gen-third-party-licenses.sh` had a hardcoded skip list, so `ivory-ui` would have
+`gen-third-party-licenses.sh` had a hardcoded skip list, so `tangent-ui` would have
 shipped in the MIT app's `THIRD-PARTY-LICENSES` as a third-party dependency of
-itself; and `dialogs.rs`'s `env!("CARGO_PKG_VERSION")` now reads `ivory-ui`'s
-version, so `ivory_ui::VERSION` names that coupling.
+itself; and `dialogs.rs`'s `env!("CARGO_PKG_VERSION")` now reads `tangent-ui`'s
+version, so `tangent_ui::VERSION` names that coupling.
 
 **4a. `Caps` (`host.rs`), and the menu consumes it.** Plain data, not a trait:
 every field is a fact the UI needs at a branch point, and a struct of bools can
@@ -960,7 +960,7 @@ macOS and Windows. See `docs/HANDOFF.md` §2f for the state and what is left.
 
 **Step 5 was smaller than this plan assumed, and the reason matters.**
 `send_viewport_cmd` is `egui`, not `eframe`, so no `Shell` trait was needed to
-route it — `app.rs` moved into `ivory-ui` keeping every call, gated on `caps`.
+route it — `app.rs` moved into `tangent-ui` keeping every call, gated on `caps`.
 The `Shell`/`SurfaceSpec` design in §2 was therefore NOT implemented as
 written. What replaced it is smaller and is already proven by the 4b work:
 `shell::surface(ctx, caps, spec, add)`, one function that draws a pane either
@@ -970,9 +970,9 @@ all eleven dialogs. `Caps` stayed at five fields, not eight.
 The real seam was three things:
   * `eframe::CreationContext` -> `&egui::Context` (nothing else was used),
   * `midir` -> the `ports::MidiPorts` trait, with `MidiEvent` and
-    `parse_message` moved to `ivory-ui`; the mpsc channel is deliberately NOT
+    `parse_message` moved to `tangent-ui`; the mpsc channel is deliberately NOT
     behind the trait, because a plugin fills the same one from `process()`,
-  * `impl eframe::App` -> `ivory/src/desktop.rs`, which the orphan rule forces
+  * `impl eframe::App` -> `tangent/src/desktop.rs`, which the orphan rule forces
     and which is the compiler stating that eframe is the binary's business.
 
 **Step 6-7** landed as described: quarantined workspace, `nih_export_vst3!`,
@@ -989,7 +989,7 @@ plus `installer/{macos,windows,linux}/`.
 
 * §2's `Shell` trait, `SurfaceSpec`, `SurfaceReport`, `InlineShell`,
   `ViewportShell` and `HeadlessShell` were **not built**. Read
-  `ivory-ui/src/shell.rs` instead; it is 300 lines including tests.
+  `tangent-ui/src/shell.rs` instead; it is 300 lines including tests.
 * §6's MIDI section describes `self.active_notes` / `self.notes_to_release`,
   which the `NoteState` extraction replaced before this round began.
 * The `moduleinfo.json` question is settled: nih-plug never writes one (zero

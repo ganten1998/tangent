@@ -143,14 +143,14 @@ build_macos() {
   # status of its command substitution, and `grep` with no match exits 1 — so
   # the script would die at exactly the point it is trying to detect that
   # something is absent, with no message at all.
-  installer_id="${IVORY_INSTALLER_ID:-$(security find-identity -v 2>/dev/null \
+  installer_id="${TANGENT_INSTALLER_ID:-$(security find-identity -v 2>/dev/null \
     | grep 'Developer ID Installer' | head -1 | sed -E 's/.*"(.*)"/\1/' || true)}"
 
   if [ -n "$installer_id" ]; then
     echo "    signing as: $installer_id"
     productsign --sign "$installer_id" "$WORK/macos/unsigned.pkg" "$out"
     pkgutil --check-signature "$out" | sed 's/^/    /'
-    local profile="${IVORY_NOTARY_PROFILE:-ivory-notary}"
+    local profile="${TANGENT_NOTARY_PROFILE:-tangent-notary}"
     if xcrun notarytool history --keychain-profile "$profile" >/dev/null 2>&1; then
       echo "    notarizing"
       if xcrun notarytool submit "$out" --keychain-profile "$profile" --wait; then
@@ -215,13 +215,13 @@ build_windows() {
 
   # The installer wears the app's logo. Same icon build.rs embeds into the
   # exe; the setup, the app, and the Add/Remove entry are one mark.
-  need "$ROOT/assets/ivory.ico" "the app icon is missing"
+  need "$ROOT/assets/tangent.ico" "the app icon is missing"
   local out="dist/$NAME-$VERSION-windows-setup.exe"
   makensis -NOCD \
     "-DVERSION=$VERSION" \
     "-DNUMVERSION=${VERSION%%-*}" \
     "-DSRCDIR=$WORK/windows" \
-    "-DICON=$ROOT/assets/ivory.ico" \
+    "-DICON=$ROOT/assets/tangent.ico" \
     "-DOUTFILE=$ROOT/$out" \
     installer/windows/tangent.nsi | sed 's/^/    /'
 

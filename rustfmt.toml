@@ -2,7 +2,7 @@
 #
 # ⚠️  DO NOT run `cargo fmt --all` on the existing tree before 2.1.0 ships.
 # Measured 2026-08-11 on this exact tree: default rustfmt rewrites 4,170 lines
-# across 171 hunks in 16 files — 90 hunks in ivory-core/src/detector.rs alone.
+# across 171 hunks in 16 files — 90 hunks in tangent-core/src/detector.rs alone.
 # It is semantics-preserving (all 13,133 differential rows would still pass),
 # but it explodes the deliberately compact engine style: single-line iterator
 # chains become 6-line ladders, inline `if/else` become blocks, and every
@@ -12,7 +12,7 @@
 # This file exists so that IF the project ever adopts `cargo fmt`, the result is
 # deterministic and pinned rather than toolchain-dependent. Recommended path:
 # land it now (inert), and if you want a formatted tree, do it as ONE isolated
-# commit AFTER release, followed by `cargo test -p ivory-core --release
+# commit AFTER release, followed by `cargo test -p tangent-core --release
 # --all-features -- --ignored` (full differential + blast_radius) to prove the
 # reformat changed nothing.
 #

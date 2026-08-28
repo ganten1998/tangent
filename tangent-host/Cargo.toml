@@ -1,0 +1,95 @@
+[package]
+# The plugin host. Separate from `tangent-record` on purpose: it is the largest
+# risk in the feature, it is the only part that loads FOREIGN CODE into the
+# process, and keeping it a crate of its own means it can be cut, feature-gated
+# or moved out of process without touching the recorder.
+#
+# MIT, and that is newly possible: Steinberg relicensed the VST3 SDK from
+# GPLv3-or-proprietary to MIT on 2025-10-29 (VST 3.8). See LICENSING.md.
+name = "tangent-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# MIT OR Apache-2.0. Ships a pre-generated `bindings.rs` (~670 KB) rather than
+# running bindgen, so there is NO build-time libclang, no SDK download and no C
+# toolchain — which is what lets `cargo xwin` keep cross-building Windows from
+# this Mac. That property is worth more here than any convenience wrapper.
+vst3 = "0.3"
+
+# ── the editor window, macOS only ────────────────────────────────────────────
+#
+# TARGET-GATED, and that is not tidiness. This crate is cross-compiled to
+# Windows with `cargo xwin`, and an unconditional AppKit dependency would fail
+# to resolve there rather than simply going unused. `check-firewall.sh` and
+# `cargo tree -p tangent-host --target x86_64-pc-windows-msvc` must both stay
+# free of every line below.
+#
+# All three versions are ALREADY in the lock file (eframe/winit pull the 0.2
+# line, arboard/glutin/rfd pull this 0.3 one), so this adds no new crate to the
+# graph and no new compile. Deliberately on the 0.3/objc2-0.6 line rather than
+# winit's 0.2/objc2-0.5: two Rust wrappers over the same Objective-C classes
+# coexist without trouble — they are both just `objc_msgSend` — and matching
+# the newer line is what the rest of the workspace's leaves already do.
+#
+# Features are enumerated rather than defaulted: `default` on objc2-app-kit is
+# *every* AppKit header, which is a minute of compile time for a window and a
+# view.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSApplication",
+    "NSEvent",
+    "NSGraphics",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSView",
+    "NSWindow",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSDate",
+    "NSGeometry",
+    "NSNotification",
+    "NSObject",
+    "NSRunLoop",
+    "NSString",
+] }
+
+# ── the editor window, Windows ───────────────────────────────────────────────
+#
+# The 0.60 line is ALREADY in the lock file (winit's own windowing pulls it),
+# so this adds no new crate. Features enumerated for the same reason AppKit's
+# are: each one is a header's worth of compile time.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# ── the editor window, Linux ─────────────────────────────────────────────────
+#
+# `x11rb` is a pure-Rust X11 client: no libX11, no C toolchain, which is what
+# lets cargo-zigbuild keep cross-building Linux from the Mac — the same
+# property the vst3 crate was chosen for. Already in the lock (arboard pulls
+# it). `libc` is for `poll(2)` over the fds a plugin registers with the
+# host's IRunLoop; nothing in std polls a foreign fd without blocking.
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = "0.13"
+libc = "0.2"
+
+[dev-dependencies]
+# Examples only, and `check-firewall.sh` walks `--edges normal`, so this does
+# not put the recorder into the host's shipped dependency graph. It is here so
+# the spike can write a REAL take file with the real writer rather than a
+# throwaway WAV — proving the two lanes compose, and giving something to listen
+# to rather than a peak number to trust.
+tangent-record = { path = "../tangent-record" }
+
+[lints]
+workspace = true

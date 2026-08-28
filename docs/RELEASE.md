@@ -6,7 +6,7 @@ is in `DESIGN.md`; historical CI war stories are in `spec/product-docs.md` §3.
 ## Store links: check them, then swap them
 
 `scripts/check-store-links.sh` fetches every `releases/latest/download/` URL in
-`README.md`, `docs/STORE-CONTENT.md` and `tools/ivory-fulfil/src/main.rs`. They
+`README.md`, `docs/STORE-CONTENT.md` and `tools/tangent-fulfil/src/main.rs`. They
 resolve by EXACT asset name against whatever release is currently latest, so a
 new name 404s until it has shipped.
 
@@ -17,7 +17,7 @@ over at release time, not before — the swap is written out in
 
 1. `scripts/publish-github.sh` (assets exist)
 2. `scripts/check-store-links.sh` (still green)
-3. swap the two links in `STORE-CONTENT.md` and `tools/ivory-fulfil`
+3. swap the two links in `STORE-CONTENT.md` and `tools/tangent-fulfil`
 4. `scripts/check-store-links.sh` again (now green with the new names)
 5. paste the store block, deploy fulfil, send the announcement
 
@@ -29,7 +29,7 @@ latest. Both times the text was right and the release was not.
 ## Hard gates before any public release
 
 1. **Icon — informational, NOT a gate** (kept in this list so nobody re-files
-   it as one). `assets/ivory.png` is the historical 543-byte, 128x128 art —
+   it as one). `assets/tangent.png` is the historical 543-byte, 128x128 art —
    verified 2026-08-04 to be **byte-identical to the Python app's**
    `icons/ivory.png` (sha256 `0dc37a25…`), i.e. the original piano-keys icon,
    which the owner wants kept. It was mislabelled a "placeholder" in earlier
@@ -51,20 +51,20 @@ latest. Both times the text was right and the release was not.
    misses two things:
    - `differential::full` (the 13,133-row golden sweep) is `#[ignore]`d, so
      `--workspace` runs only `differential::fast_subset`, the first 1500 rows.
-   - `--workspace` unifies features, so `ivory-core` is always compiled WITH
+   - `--workspace` unifies features, so `tangent-core` is always compiled WITH
      `learning`; the stock engine path is never exercised.
 
    All three must be green:
 
    ```sh
    cargo test --workspace                                     # 14 GUI + 59 engine + 3 acceptance + 10 learning + differential(fast)
-   cargo test -p ivory-core                                   # stock engine, no learning: 55 unit + 3 acceptance + differential(fast)
-   cargo test -p ivory-core --test differential -- --ignored   # full 13,133-row golden sweep (~16 s)
+   cargo test -p tangent-core                                   # stock engine, no learning: 55 unit + 3 acceptance + differential(fast)
+   cargo test -p tangent-core --test differential -- --ignored   # full 13,133-row golden sweep (~16 s)
    ```
 
-   `ivory-core/tests/blast_radius.rs` is `#[ignore]`d too, but it is a
+   `tangent-core/tests/blast_radius.rs` is `#[ignore]`d too, but it is a
    measurement rather than a gate — run it only when the learning re-ranker
-   changed: `cargo test -p ivory-core --features learning --test blast_radius
+   changed: `cargo test -p tangent-core --features learning --test blast_radius
    --release -- --ignored --nocapture`.
 4. **THIRD-PARTY-LICENSES current.** Regenerate after any dependency change:
    `scripts/gen-third-party-licenses.sh`.
@@ -158,7 +158,7 @@ real proof is a first launch on a real Windows machine.
 ### Linux
 
 No signing story required. tar.gz now; `.deb` (with a proper
-`/usr/share/doc/ivory/copyright` folding MIT + OFL) once the tar.gz path is
+`/usr/share/doc/tangent/copyright` folding MIT + OFL) once the tar.gz path is
 proven.
 
 **Cross-build blocker (verified 2026-07-29):** `midir` links **ALSA** on Linux,
@@ -202,7 +202,7 @@ tarball under ~1 MB, it is empty: check it with `tar -tzvf` before uploading.
   redistributing Monotype's font software is not. See
   `spec/font-licensing.md`.
 - **Fonts, part 2 — the egui defaults.** `eframe`'s `default_fonts` feature
-  (enabled in `ivory/Cargo.toml`) statically embeds FOUR more fonts in the
+  (enabled in `tangent/Cargo.toml`) statically embeds FOUR more fonts in the
   binary via `epaint_default_fonts`: **Ubuntu Light** (Ubuntu Font Licence
   1.0), **Noto Emoji** (OFL 1.1), **Hack** (MIT + Bitstream Vera), and
   **emoji-icon-font** (MIT). `lto` + `strip` do NOT remove them — all four are
@@ -216,7 +216,7 @@ tarball under ~1 MB, it is empty: check it with `tar -tzvf` before uploading.
 
 ## Settings one-way caveat (release-notes item)
 
-2.0 reads Python 1.1.0's `~/.config/ivory/settings.json` in place — upgrade
+2.0 reads Python 1.1.0's `~/.config/tangent/settings.json` in place — upgrade
 is seamless. **Downgrading back to Python 1.1.0 rewrites the file with its
 fixed key set**, discarding `custom_font_path` and any unknown keys. Taught
 chords (`overrides.json`) are untouched by Python. State this in the release
@@ -255,8 +255,8 @@ zip/dmg.
 2. **Regenerate licenses**: `scripts/gen-third-party-licenses.sh`; commit if
    changed.
 3. **Test**: all three commands from gate 3 — `cargo test --workspace`, then
-   `cargo test -p ivory-core` (stock engine, no `learning` feature), then
-   `cargo test -p ivory-core --test differential -- --ignored` (the full
+   `cargo test -p tangent-core` (stock engine, no `learning` feature), then
+   `cargo test -p tangent-core --test differential -- --ignored` (the full
    13,133-row golden sweep; `#[ignore]`d, so `--workspace` never runs it).
 4. **Build macOS**: `scripts/build-macos.sh` (host arm64) and/or
    `ARCH=universal scripts/build-macos.sh`. The small-icon NOTE is expected
@@ -294,7 +294,7 @@ zip/dmg.
 9. **GitHub release** (public download channel):
    `scripts/publish-github.sh --notes-file <notes>`.
    It uploads every artifact **twice** — version-scoped, and again under the
-   version-less alias (`Ivory-macos-arm64.dmg`, `ivory-windows-x86_64.zip`, …)
+   version-less alias (`Ivory-macos-arm64.dmg`, `tangent-windows-x86_64.zip`, …)
    plus a bare `SHA256SUMS`. Those aliases are what
    `releases/latest/download/<name>` resolves by exact name, and that permalink
    is the download link handed to customers on the Gumroad post-purchase page,

@@ -115,7 +115,7 @@ Everything structural is missing: no web/Chromebook build (Chromebook fleets dom
 ### Lacks (strongest evidence for each)
 
 1. **No automation lanes and no MIDI CC lanes** (velocity lane only, midi_editor.rs:687; zero hits for automation anywhere). Disqualifying for serious mixing; every competitor has it.
-2. **No plugin-delay compensation** (ivory-host never queries plugin latency; one passing comment at instance.rs:760). Any lookahead plugin silently smears the mix.
+2. **No plugin-delay compensation** (tangent-host never queries plugin latency; one passing comment at instance.rs:760). Any lookahead plugin silently smears the mix.
 3. **No comping and no audio time-stretch** (MIDI clips do stretch; audio does not). All five competitors have both.
 4. **Worst-in-field extensibility.** VST3-only, `INSERTS: usize = 3` fixed (recorder.rs:491), one send to one bus, no groups, no scripting, no ARA.
 5. **No tempo track or time-signature changes** — one global BPM (20-300), one signature per project. A theory-teaching app that cannot represent a ritardando or a 4/4→3/4 change undercuts its own curriculum ambition.
@@ -151,13 +151,13 @@ Everything structural is missing: no web/Chromebook build (Chromebook fleets dom
 
 ## 4. Proprietary Candidates
 
-**The governing fact, verified on disk:** the entire repo is MIT (LICENSE, © 2025-2026 Ganten) — including the chord engine (`ivory-core/src/detector.rs`, `patterns.rs`, `overrides.rs`), the golden corpus (`tests/golden/corpus.json`), the acceptance contract (`ivory-core/tests/acceptance.rs`, `examples/diffcorpus.rs`), the keygen/fulfilment tools (`tools/ivory-keygen`, `tools/ivory-fulfil`), and Factory Bank 01 (`ivory/assets/Tangent-01-Tines-and-Boxes.syx`). MIT is irrevocable for everything already shipped. "Becoming proprietary" can therefore only mean: (a) *future* work kept out of the repo, (b) assets that never enter it, (c) non-copyright moats (trademark, services, private keys). `LICENSING.md`'s trademark section covers only Steinberg's VST mark; there is **no Tangent trademark claim anywhere**.
+**The governing fact, verified on disk:** the entire repo is MIT (LICENSE, © 2025-2026 Ganten) — including the chord engine (`tangent-core/src/detector.rs`, `patterns.rs`, `overrides.rs`), the golden corpus (`tests/golden/corpus.json`), the acceptance contract (`tangent-core/tests/acceptance.rs`, `examples/diffcorpus.rs`), the keygen/fulfilment tools (`tools/tangent-keygen`, `tools/tangent-fulfil`), and Factory Bank 01 (`ivory/assets/Tangent-01-Tines-and-Boxes.syx`). MIT is irrevocable for everything already shipped. "Becoming proprietary" can therefore only mean: (a) *future* work kept out of the repo, (b) assets that never enter it, (c) non-copyright moats (trademark, services, private keys). `LICENSING.md`'s trademark section covers only Steinberg's VST mark; there is **no Tangent trademark claim anywhere**.
 
 Candidates, ranked by value-per-goodwill:
 
 1. **Name + visual identity (trademark) — do first, before 5.0.** MIT licenses code, not the mark. What it takes: a clearance search (note real collision risk — "Tangent" is an existing audio-hardware brand in the color-grading/controller space), a registration (~$250-350/class DIY), and a TRADEMARK.md stating that forks must rename. Goodwill cost: zero — this is the Ardour/Firefox norm, universally accepted in FOSS. This is the single move that makes "official binaries + supporter keys" a durable business even though the source is free, and it is the Ardour model the competitive analysis already ranks as Tangent's licensing peer. **Worth it, unambiguously.**
 
-2. **Supporter-key/fulfilment infrastructure — already proprietary-in-practice.** The tools are public MIT, but the moat was never the code: it is the Ed25519 private seeds (in `~/.ivory-signing`, currently unbacked-up — an operational risk worth more attention than any licensing question) and the live Fly fulfilment service. Goodwill cost: zero; nobody expects payment plumbing either open or closed. **Worth it (it already is), and it is the payment rail every other candidate rides on.**
+2. **Supporter-key/fulfilment infrastructure — already proprietary-in-practice.** The tools are public MIT, but the moat was never the code: it is the Ed25519 private seeds (in `~/.tangent-signing`, currently unbacked-up — an operational risk worth more attention than any licensing question) and the live Fly fulfilment service. Goodwill cost: zero; nobody expects payment plumbing either open or closed. **Worth it (it already is), and it is the payment rail every other candidate rides on.**
 
 3. **DX7 patch banks — the cleanest paid-content candidate.** Bank 01 is already MIT-shipped; Banks 02+ simply never enter the repo. The authoring methodology exists (originality measured against 42,291 corpus voices, DX7-BANK-01.md) and is itself a private asset. Goodwill cost: near zero — free-core + paid-content is the community-validated model (Vital). Honest caveat: free DX7 cartridges number in the thousands, so banks sell on curation and originality; expect supporter-tier revenue, not a product line. **Worth it as supporter content, not as a standalone SKU.**
 
@@ -244,7 +244,7 @@ Cleanest revenue story, and Gumroad's paid bucket removes all hosting constraint
 
 | # | Item | Why it cannot wait |
 |---|---|---|
-| 1 | **Back up `~/.ivory-signing`** (encrypted, two locations) before touching fulfilment | The private seeds are currently unbacked-up; everything downstream depends on them |
+| 1 | **Back up `~/.tangent-signing`** (encrypted, two locations) before touching fulfilment | The private seeds are currently unbacked-up; everything downstream depends on them |
 | 2 | **Azure Artifact Signing, Basic** ($9.99/mo): create paid Azure sub (Individual billing matching government ID), AU10TIX identity validation, cert profile, wire `signtool` + dlib into the Windows build (sign inner exe, `!uninstfinalize`, `!finalize`; signing must run on the Windows box or a CI Windows job since makensis on macOS cannot invoke signtool) | Identity validation takes days; **SmartScreen reputation takes weeks of clean installs and accrues on the certificate**. Ship a **signed 4.93 point release 3-4 weeks before 5.0** so the cert walks into launch with reputation instead of starting the "unrecognized app" clock on launch day |
 | 3 | **Gumroad account:** complete identity verification early (drops payout threshold from $100 to $10), set the 30-day refund policy explicitly, fill Discover category (Music & Sound Design → Plugins) and tags (DAW, VST, chord, MIDI, music theory) | Verification and payout plumbing should never be debugged during launch week |
 | 4 | **Fulfilment service:** `/redeem` page + `licenses/verify` client + `sale_id` table + refund/dispute resource subscriptions on the Fly app; Ping endpoint as accelerator; decide seed placement (dedicated Gumroad-channel seed on the server for instant fulfilment, per the Gumroad report) | Mind the known `license` feature-flag trap when 5.0 wires key checking |
@@ -592,7 +592,7 @@ Creator crossover: [TwitchTracker Music category](https://twitchtracker.com/game
 
 # Tangent — exhaustive user-facing feature catalog (through 4.92.0)
 
-Compiled from a read-only sweep of `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/docs/` — primarily ARRANGEMENT.md (per-release log 4.43–4.92), HANDOFF.md (2.0–4.29), CHANGELOG.md (1.0–4.5), release/4.2 and release/4.4 notes, DRUMPAD.md, DX7-BANK-01.md, DESIGN.md, STORE-CONTENT.md, RECORDER-PLAN.md, plus release-commit messages for the 4.30–4.42 gap (which no doc covers). Versions cited where the docs state them.
+Compiled from a read-only sweep of `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/docs/` — primarily ARRANGEMENT.md (per-release log 4.43–4.92), HANDOFF.md (2.0–4.29), CHANGELOG.md (1.0–4.5), release/4.2 and release/4.4 notes, DRUMPAD.md, DX7-BANK-01.md, DESIGN.md, STORE-CONTENT.md, RECORDER-PLAN.md, plus release-commit messages for the 4.30–4.42 gap (which no doc covers). Versions cited where the docs state them.
 
 ---
 
@@ -795,7 +795,7 @@ Versions **4.30–4.42** have no doc-level changelog; from release-commit messag
 
 # Tangent (Ivory) UI Catalog - every view, control, dialog, shortcut, and mouse gesture
 
-Sources: `ivory-ui/src/` - `keys.rs`, `recorder_panel.rs`, `mixer_panel.rs`, `arrangement_panel.rs`, `midi_editor.rs`, `drumpad_panel.rs`, `dialogs.rs`, `settings.rs`, `chord_strip.rs`, `theory_panel.rs`, `fretboard_panel.rs`, `staff.rs`, `piano.rs`, `menu.rs`, plus gesture handlers in `app.rs`. All paths relative to `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/`.
+Sources: `tangent-ui/src/` - `keys.rs`, `recorder_panel.rs`, `mixer_panel.rs`, `arrangement_panel.rs`, `midi_editor.rs`, `drumpad_panel.rs`, `dialogs.rs`, `settings.rs`, `chord_strip.rs`, `theory_panel.rs`, `fretboard_panel.rs`, `staff.rs`, `piano.rs`, `menu.rs`, plus gesture handlers in `app.rs`. All paths relative to `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/`.
 
 The app has **no menu bar and no preferences window**. The entire chrome is: the right-click context menu, the recorder band's buttons/cog, dialogs, and single-key shortcuts. Toggle rows in menus rename themselves (no checkmarks); the current choice in a list is marked with a bullet.
 
@@ -1105,7 +1105,7 @@ All of the above choices persist in one settings file: theme, key/chord/recorder
 
 # Tangent UX review (read-only, from code)
 
-Scope: `ivory-ui/src` (all 29 modules) plus `ivory/src/desktop.rs` and supporting spots in `ivory/src/main.rs`, `ivory-host/src/editor.rs`. Version reviewed: 4.92.0 working tree.
+Scope: `tangent-ui/src` (all 29 modules) plus `tangent/src/desktop.rs` and supporting spots in `tangent/src/main.rs`, `tangent-host/src/editor.rs`. Version reviewed: 4.92.0 working tree.
 
 ## Strengths (specific, with evidence)
 
@@ -1156,7 +1156,7 @@ Scope: `ivory-ui/src` (all 29 modules) plus `ivory/src/desktop.rs` and supportin
 | Capsule claim | Verdict | Evidence |
 |---|---|---|
 | No automation lanes | **Confirmed** | Zero hits for automation anywhere; no CC/controller lanes either - the MIDI editor has a velocity lane only (midi_editor.rs:687) |
-| No plugin-delay compensation | **Confirmed** | ivory-host never queries or applies plugin latency (one passing comment, instance.rs:760) |
+| No plugin-delay compensation | **Confirmed** | tangent-host never queries or applies plugin latency (one passing comment, instance.rs:760) |
 | Fixed 3 inserts/strip | **Confirmed** | `pub const INSERTS: usize = 3` (recorder.rs:491) |
 | No time-stretch | **Needs correction** | Audio time-stretch: absent. But MIDI clips DO stretch (shift-drag edge scales notes and all, in arrange and editor, app.rs:800-803) |
 | No comping | **Confirmed** | Takes land in timestamped folders; no take lanes/comping infrastructure |
@@ -1205,14 +1205,14 @@ Scope: `ivory-ui/src` (all 29 modules) plus `ivory/src/desktop.rs` and supportin
 
 ## 1. Repo fact-check
 
-**`/Users/ganten/Dropbox/Projects/Apps/ivory/ivory-host/Cargo.toml`** uses exactly one VST3-related crate:
+**`/Users/ganten/Dropbox/Projects/Apps/tangent/tangent-host/Cargo.toml`** uses exactly one VST3-related crate:
 
 - `vst3 = "0.3"` (resolves to `vst3 0.3.0` in `Cargo.lock`), the coupler-rs binding (`MIT OR Apache-2.0`, repo `https://github.com/coupler-rs/vst3-rs`). The Cargo.toml comment is explicit that it was chosen because it ships a pre-generated `bindings.rs` (~670 KB), so there is no build-time libclang, no SDK download, no C toolchain, which keeps `cargo xwin` cross-builds working. It is NOT Steinberg's C++ SDK and NOT the GPLv3 `vst3-sys` crate (that one is only reached by the separate `Tangent.vst3` plugin via NIH-plug, not by the host).
 - The Cargo.toml header comment already states: "MIT, and that is newly possible: Steinberg relicensed the VST3 SDK from GPLv3-or-proprietary to MIT on 2025-10-29 (VST 3.8). See LICENSING.md."
 
-**`/Users/ganten/Dropbox/Projects/Apps/ivory/LICENSING.md`** documents the split: standalone app MIT, `Tangent.vst3` plugin GPLv3 (because of `vst3-sys` via NIH-plug), the GPLv3 section 5 "aggregate" analysis for shipping both in one installer, and a correction dated 2026-08-15 recording the Steinberg MIT relicensing, verified against `steinbergmedia/vst3sdk` and `steinbergmedia/vst3_pluginterfaces` LICENSE files. It also carries a trademark section ("VST" must not appear in the product name) and a "not legal advice" note suggesting counsel before the first paid release.
+**`/Users/ganten/Dropbox/Projects/Apps/tangent/LICENSING.md`** documents the split: standalone app MIT, `Tangent.vst3` plugin GPLv3 (because of `vst3-sys` via NIH-plug), the GPLv3 section 5 "aggregate" analysis for shipping both in one installer, and a correction dated 2026-08-15 recording the Steinberg MIT relicensing, verified against `steinbergmedia/vst3sdk` and `steinbergmedia/vst3_pluginterfaces` LICENSE files. It also carries a trademark section ("VST" must not appear in the product name) and a "not legal advice" note suggesting counsel before the first paid release.
 
-**`/Users/ganten/Dropbox/Projects/Apps/ivory/THIRD-PARTY-LICENSES`** lists `vst3 0.3.0` (license: MIT OR Apache-2.0) and `com-scrape-types 0.1.1`, both from `coupler-rs/vst3-rs`. **Gap found: there is no Steinberg entry anywhere in the file** (no "Steinberg" match at all). See checklist item 2 below.
+**`/Users/ganten/Dropbox/Projects/Apps/tangent/THIRD-PARTY-LICENSES`** lists `vst3 0.3.0` (license: MIT OR Apache-2.0) and `com-scrape-types 0.1.1`, both from `coupler-rs/vst3-rs`. **Gap found: there is no Steinberg entry anywhere in the file** (no "Steinberg" match at all). See checklist item 2 below.
 
 I independently verified LICENSING.md's claims during this research; they are accurate.
 
@@ -1259,7 +1259,7 @@ Selling the standalone host commercially requires **no permission, no agreement,
 
 ### Action checklist
 
-- [ ] Add a Steinberg entry to `/Users/ganten/Dropbox/Projects/Apps/ivory/THIRD-PARTY-LICENSES`: "VST 3 API / pluginterfaces, Copyright (c) Steinberg Media Technologies GmbH, MIT License (bindings in the `vst3` crate are generated from the VST 3.8 SDK headers)", with the MIT text or a pointer to it.
+- [ ] Add a Steinberg entry to `/Users/ganten/Dropbox/Projects/Apps/tangent/THIRD-PARTY-LICENSES`: "VST 3 API / pluginterfaces, Copyright (c) Steinberg Media Technologies GmbH, MIT License (bindings in the `vst3` crate are generated from the VST 3.8 SDK headers)", with the MIT text or a pointer to it.
 - [ ] Audit every place "VST" appears in shipped/published text (about box, README, CHANGELOG, Gumroad listing, website): first use gets ®, and add the credit line "VST is a registered trademark of Steinberg Media Technologies GmbH" to the about box and docs.
 - [ ] Confirm the Gumroad listing never uses "VST" in the product title or any stylized branding; "hosts VST3 plug-ins" in the body copy is the safe pattern.
 - [ ] Decide on the VST Compatible Logo: either adopt it per the guidelines (about box + product webpage) or deliberately don't use the logo at all; don't half-use it.
@@ -1298,13 +1298,13 @@ Selling the standalone host commercially requires **no permission, no agreement,
 
 ### Whose ffmpeg build is shipped (not an own compile; two third-party GPL builds)
 
-`/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/scripts/fetch-ffmpeg.sh` downloads pinned, sha256-verified upstream builds into `dist/vendor/`, renames the binary to `tangent-ffmpeg` / `tangent-ffmpeg.exe`, and stages a `ffmpeg-licenses/` folder (upstream license text plus a generated `SOURCE.txt` with the exact URL and checksum) beside it:
+`/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/scripts/fetch-ffmpeg.sh` downloads pinned, sha256-verified upstream builds into `dist/vendor/`, renames the binary to `tangent-ffmpeg` / `tangent-ffmpeg.exe`, and stages a `ffmpeg-licenses/` folder (upstream license text plus a generated `SOURCE.txt` with the exact URL and checksum) beside it:
 
 | Platform | Build | Source | License |
 |---|---|---|---|
 | Windows x64 | **BtbN autobuild** `ffmpeg-n8.1.2-44-g7c533d0f86-win64-gpl-8.1.zip`, immutable tag `autobuild-2026-08-17-13-05` | github.com/BtbN/FFmpeg-Builds | **GPL** ("gpl" variant; `--enable-gpl --enable-version3` so effectively **GPLv3**) |
 | Linux x86_64 / arm64 | **John Van Sickle static build** ffmpeg 7.0.2 | johnvansickle.com/ffmpeg | **GPLv3** (his page says so explicitly; tarball ships `GPLv3.txt`) |
-| macOS | **none**: video via AVFoundation/`AVAssetWriter` (`ivory-record/src/encode/macos.rs`), no ffmpeg in the artifact | n/a | n/a |
+| macOS | **none**: video via AVFoundation/`AVAssetWriter` (`tangent-record/src/encode/macos.rs`), no ffmpeg in the artifact | n/a | n/a |
 
 I extracted the configure lines from the binaries actually cached in `dist/vendor/`:
 
@@ -1320,9 +1320,9 @@ So both bundled binaries are GPL builds, and because `--enable-version3` is set,
 - `scripts/build-installer.sh` (lines 265-269, 307-308) stages the Linux sidecar and asserts `ffmpeg-licenses/GPLv3.txt` is in the artifact.
 - `THIRD-PARTY-LICENSES` (generated by `scripts/gen-third-party-licenses.sh`) has a "Bundled video encoder" section naming the GPL builds, the trademark, the provenance note, and the separate-process reasoning.
 
-### How it is invoked (`ivory-record/src/encode/ffmpeg.rs`, `encode.rs`, `proc.rs`, `camera/windows.rs`)
+### How it is invoked (`tangent-record/src/encode/ffmpeg.rs`, `encode.rs`, `proc.rs`, `camera/windows.rs`)
 
-Everything is a spawned subprocess via `std::process::Command` (wrapped by `crate::proc::command`, which only adds `CREATE_NO_WINDOW` on Windows). Resolution order in `program()`: `IVORY_FFMPEG` env var, then exe-adjacent `tangent-ffmpeg(.exe)`, then bare `ffmpeg` on PATH.
+Everything is a spawned subprocess via `std::process::Command` (wrapped by `crate::proc::command`, which only adds `CREATE_NO_WINDOW` on Windows). Resolution order in `program()`: `TANGENT_FFMPEG` env var, then exe-adjacent `tangent-ffmpeg(.exe)`, then bare `ffmpeg` on PATH.
 
 1. **Video takes** (`encode/ffmpeg.rs::Encoder::create`, line 230): raw BGRA frames piped to stdin, **`-c:v libx264 -preset veryfast -pix_fmt yuv420p -movflags +faststart`**. **libx264 is hardcoded as the H.264 encoder** on Windows and Linux. The mux pass (line 550) uses `-c:v copy -c:a aac -b:a 192k`: AAC comes from FFmpeg's **built-in native AAC encoder** (part of LGPL libavcodec, no external lib).
 2. **MP3 export** (`encode.rs::encode_mp3_via_ffmpeg`, line 266): `-c:a libmp3lame -b:a 320k`. This path is compiled off macOS and used where the in-process encoder is absent, which in shipping builds is **Windows only** (see LAME finding below).
@@ -1332,11 +1332,11 @@ Communication is exec + command-line args + byte pipes (raw BGRA in, rgba out). 
 
 ### Side finding: the app itself statically links LGPL LAME on macOS and Linux
 
-`ivory/Cargo.toml`: `default = ["recorder", "mp3"]`, `mp3 = ["dep:mp3lame-encoder"]`. The Windows build passes `--no-default-features` (build-cross.sh line 406) so it has no in-process LAME, but the **macOS and Linux builds compile `mp3lame-sys` 0.1.11, which vendors and statically links `lame-3.100`**. The crates declare `LGPL-3.0`; the vendored LAME itself is LGPL with an explicit "commercial use is fine under LGPL restrictions, acknowledge LAME" note. **`THIRD-PARTY-LICENSES` currently has no LAME/mp3lame entry at all** (grep confirms), so the MIT app binaries on two platforms embed LGPL code that the attribution file does not mention. This is a real, fixable gap (see checklist).
+`tangent/Cargo.toml`: `default = ["recorder", "mp3"]`, `mp3 = ["dep:mp3lame-encoder"]`. The Windows build passes `--no-default-features` (build-cross.sh line 406) so it has no in-process LAME, but the **macOS and Linux builds compile `mp3lame-sys` 0.1.11, which vendors and statically links `lame-3.100`**. The crates declare `LGPL-3.0`; the vendored LAME itself is LGPL with an explicit "commercial use is fine under LGPL restrictions, acknowledge LAME" note. **`THIRD-PARTY-LICENSES` currently has no LAME/mp3lame entry at all** (grep confirms), so the MIT app binaries on two platforms embed LGPL code that the attribution file does not mention. This is a real, fixable gap (see checklist).
 
 ### Two more repo facts that matter
 
-- The `ivory` repo **is public on GitHub** (`github.com/ganten1998/ivory` returns 200 unauthenticated; Codeberg copy is private). That makes LGPL relink/source obligations for the app satisfiable by pointing at the repo.
+- The `ivory` repo **is public on GitHub** (`github.com/ganten1998/tangent` returns 200 unauthenticated; Codeberg copy is private). That makes LGPL relink/source obligations for the app satisfiable by pointing at the repo.
 - `docs/RECORDER-PLAN.md` (lines 1091-1140) contains an earlier analysis that *rejected* bundling GPL ffmpeg and analyzed openh264 (including why Cisco's patent grant does not cover a self-compiled openh264). The shipped 4.x implementation went the other way (GPL sidecar); the two documents now disagree and 5.0 should reconcile them.
 
 ## Part 2: What the licenses actually require
@@ -1378,9 +1378,9 @@ The separate thing x264 genuinely carries is **patents**: distributing an AVC en
 
 Ship-blocking (do before 5.0):
 
-1. **Host the Corresponding Source and link it "next to the object code."** Create a `tangent-ffmpeg source` location you control (GitHub release on `ganten1998/ivory`, or a Codeberg release; the repo is already public) containing, per bundled build: (a) the JVS `release-source` bundle for ffmpeg 7.0.2 as fetched from johnvansickle.com, and (b) for the BtbN build, the FFmpeg-Builds repo archived at tag `autobuild-2026-08-17-13-05` plus the ffmpeg source at `7c533d0f86` (the tag's `scripts.d/` pins every library commit; archiving the fetched sources too is the gold-plated version). Then put the URL: on the **Gumroad product page** (the "place" the object code is offered), in **`SOURCE.txt`** inside `ffmpeg-licenses/`, and in **`THIRD-PARTY-LICENSES`**. Keep it up as long as 5.0 is sold plus a safety margin.
+1. **Host the Corresponding Source and link it "next to the object code."** Create a `tangent-ffmpeg source` location you control (GitHub release on `ganten1998/tangent`, or a Codeberg release; the repo is already public) containing, per bundled build: (a) the JVS `release-source` bundle for ffmpeg 7.0.2 as fetched from johnvansickle.com, and (b) for the BtbN build, the FFmpeg-Builds repo archived at tag `autobuild-2026-08-17-13-05` plus the ffmpeg source at `7c533d0f86` (the tag's `scripts.d/` pins every library commit; archiving the fetched sources too is the gold-plated version). Then put the URL: on the **Gumroad product page** (the "place" the object code is offered), in **`SOURCE.txt`** inside `ffmpeg-licenses/`, and in **`THIRD-PARTY-LICENSES`**. Keep it up as long as 5.0 is sold plus a safety margin.
 2. **Pin the archives forever.** `dist/vendor/*.tar.xz|zip` are already cached and sha256-pinned; also copy them (and the source bundles) somewhere durable outside Dropbox sync accidents, since you must be *able* to produce the source for as long as you distribute the binaries.
-3. **Add LAME to `THIRD-PARTY-LICENSES`** (and the LGPL text to the artifact license folder) for the macOS and Linux apps: "This application incorporates the LAME MP3 encoder (lame-3.100, LGPL), statically linked; complete source including build scripts at github.com/ganten1998/ivory" plus the acknowledgment/link LAME's own LICENSE asks for. Investigate why `gen-third-party-licenses.sh` (cargo-license over Cargo.lock) missed `mp3lame-encoder`/`mp3lame-sys` and regenerate.
+3. **Add LAME to `THIRD-PARTY-LICENSES`** (and the LGPL text to the artifact license folder) for the macOS and Linux apps: "This application incorporates the LAME MP3 encoder (lame-3.100, LGPL), statically linked; complete source including build scripts at github.com/ganten1998/tangent" plus the acknowledgment/link LAME's own LICENSE asks for. Investigate why `gen-third-party-licenses.sh` (cargo-license over Cargo.lock) missed `mp3lame-encoder`/`mp3lame-sys` and regenerate.
 4. **Scope the EULA/click-through.** One sentence in the Gumroad description and installer text: the bundled `tangent-ffmpeg` is a separate GPLv3 program, not covered by Tangent's terms, license and source in `ffmpeg-licenses/`. (This is also exactly the "form" the FSF asks for in GPLInProprietarySystem: make the free program's status clear.)
 5. **Keep the three aggregate-preserving rules in `LICENSING.md`** true for the sidecar as well: the app must keep degrading gracefully without `tangent-ffmpeg` (it does: audio+MIDI still record), no linking, license text beside each part.
 
@@ -1406,7 +1406,7 @@ Recommendation: keep the current GPL sidecar for 5.0, execute checklist items 1-
 
 ## Sources
 
-- Repo: `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/scripts/fetch-ffmpeg.sh`, `scripts/build-cross.sh`, `scripts/build-installer.sh`, `scripts/gen-third-party-licenses.sh`, `installer/windows/tangent.nsi`, `ivory-record/src/encode/ffmpeg.rs`, `ivory-record/src/encode.rs`, `ivory-record/src/proc.rs`, `ivory-record/src/camera/windows.rs`, `LICENSING.md`, `THIRD-PARTY-LICENSES`, `docs/RECORDER-PLAN.md`, `dist/vendor/*` (configure lines extracted from the binaries), `ivory/Cargo.toml`, `~/.cargo/registry/.../mp3lame-sys-0.1.11`
+- Repo: `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/scripts/fetch-ffmpeg.sh`, `scripts/build-cross.sh`, `scripts/build-installer.sh`, `scripts/gen-third-party-licenses.sh`, `installer/windows/tangent.nsi`, `tangent-record/src/encode/ffmpeg.rs`, `tangent-record/src/encode.rs`, `tangent-record/src/proc.rs`, `tangent-record/src/camera/windows.rs`, `LICENSING.md`, `THIRD-PARTY-LICENSES`, `docs/RECORDER-PLAN.md`, `dist/vendor/*` (configure lines extracted from the binaries), `tangent/Cargo.toml`, `~/.cargo/registry/.../mp3lame-sys-0.1.11`
 - [FFmpeg License and Legal Considerations](https://www.ffmpeg.org/legal.html)
 - [GNU GPL FAQ: MereAggregation](https://www.gnu.org/licenses/gpl-faq.en.html#MereAggregation), [GPLInProprietarySystem](https://www.gnu.org/licenses/gpl-faq.en.html#GPLInProprietarySystem), [DoesTheGPLAllowMoney](https://www.gnu.org/licenses/gpl-faq.en.html#DoesTheGPLAllowMoney), [UnchangedJustBinary](https://www.gnu.org/licenses/gpl-faq.en.html#UnchangedJustBinary), [SourceAndBinaryOnDifferentSites](https://www.gnu.org/licenses/gpl-faq.en.html#SourceAndBinaryOnDifferentSites), [DoesTheGPLAllowDownloadFee](https://www.gnu.org/licenses/gpl-faq.en.html#DoesTheGPLAllowDownloadFee)
 - GPLv3 section 6 text (repo copy at `LICENSE-GPL-3.0`; canonical at [gnu.org/licenses/gpl-3.0](https://www.gnu.org/licenses/gpl-3.0.en.html))
@@ -1575,7 +1575,7 @@ Two viable patterns; **redeem-pull is the primary path**, with the Ping as an op
 
 **Optional accelerator — Ping (push):** point Gumroad's Ping at `https://<fly-app>/gumroad-ping`; on receipt, *don't trust the payload* (it's unsigned) — take its `license_key`/`sale_id`, run the same `licenses/verify` confirmation, then mint and email the supporter key proactively so most buyers never need the redeem page. Idempotency on `sale_id` covers Ping retries/duplicates.
 
-**Operational notes:** the Fly service needs a signing key — either move a *dedicated Gumroad-channel* Ed25519 seed there (and finally back up `~/.ivory-signing`, which is currently unbacked-up), or keep seeds off the server and have the service queue requests for a local `announce`-style batch signer; the former is the only way fulfilment is instant. Mind the existing `license` feature-flag trap in the codebase when 5.0 wires in key checking. Total new surface: one webhook route, one redeem route, one `licenses/verify` client, one table keyed on `sale_id`.
+**Operational notes:** the Fly service needs a signing key — either move a *dedicated Gumroad-channel* Ed25519 seed there (and finally back up `~/.tangent-signing`, which is currently unbacked-up), or keep seeds off the server and have the service queue requests for a local `announce`-style batch signer; the former is the only way fulfilment is instant. Mind the existing `license` feature-flag trap in the codebase when 5.0 wires in key checking. Total new surface: one webhook route, one redeem route, one `licenses/verify` client, one table keyed on `sale_id`.
 
 ## Sources
 
@@ -1719,7 +1719,7 @@ Developer ID signing + notarization + stapling is the complete, final story for 
 
 # FreeBSD-port worklist — platform-seam sweep of the ivory workspace
 
-Repo root: `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory` (all paths below are absolute). Assumed FreeBSD runtime: cpal's ALSA host via the alsa-lib-over-OSS shim, X11 (no Wayland), V4L2 via webcamd, ffmpeg from ports. Verified against the locked crate versions in `Cargo.lock` (cpal 0.16.0, midir 0.11.0, rfd 0.15.4, winit 0.30.13).
+Repo root: `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent` (all paths below are absolute). Assumed FreeBSD runtime: cpal's ALSA host via the alsa-lib-over-OSS shim, X11 (no Wayland), V4L2 via webcamd, ffmpeg from ports. Verified against the locked crate versions in `Cargo.lock` (cpal 0.16.0, midir 0.11.0, rfd 0.15.4, winit 0.30.13).
 
 Two upstream facts frame everything:
 
@@ -1731,19 +1731,19 @@ Two upstream facts frame everything:
 ## A. Hard build breaks (the port does not compile until these are fixed)
 
 ### A1. midir has no FreeBSD backend — `ivory` crate fails to build
-- `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/ivory/Cargo.toml:93` — `midir = "0.11"`, unconditional.
+- `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/tangent/Cargo.toml:93` — `midir = "0.11"`, unconditional.
 - On FreeBSD: no cfg arm in midir's backend table matches → missing types/modules → compile error in midir itself.
 - Options: (a) build midir with its `jack` feature (needs libjack from ports; JACK is healthy on FreeBSD); (b) vendor-patch midir to widen its ALSA arm to FreeBSD — **but** note the linux backend uses the ALSA *sequencer* API, and FreeBSD's alsa-lib shim sits over OSS; whether `snd_seq_*` works through it needs a runtime probe before committing to that route.
 - **Risk: BREAKS (build).**
 
-### A2. `CONTENTS_SUBDIR` has no FreeBSD arm — `ivory-host` fails to build
-- `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/ivory-host/src/scan.rs:48-57` — the VST3 bundle binary subdir const is defined only for macos / windows(x86_64,aarch64) / linux(x86_64,aarch64).
+### A2. `CONTENTS_SUBDIR` has no FreeBSD arm — `tangent-host` fails to build
+- `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/tangent-host/src/scan.rs:48-57` — the VST3 bundle binary subdir const is defined only for macos / windows(x86_64,aarch64) / linux(x86_64,aarch64).
 - On FreeBSD: no arm matches, the const does not exist, every use is E0425. This is the exact "4th OS" trap class named in the brief, in its hardest form.
 - Port needs an arm (plugins built on FreeBSD conventionally use `x86_64-linux`-style naming or a `x86_64-freebsd` dir — decide with whatever FreeBSD VST3 builds actually ship, e.g. from audio/ ports).
 - **Risk: BREAKS (build).**
 
 ### A3. `Library::open`'s init-symbol name is only defined for windows/linux
-- `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/ivory-host/src/scan.rs:667-683` — inside the `#[cfg(not(target_os = "macos"))]` block, `let name: &[u8]` exists only under `#[cfg(target_os = "windows")]` (`InitDll`) and `#[cfg(target_os = "linux")]` (`ModuleEntry`); line 677 then uses `name`.
+- `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/tangent-host/src/scan.rs:667-683` — inside the `#[cfg(not(target_os = "macos"))]` block, `let name: &[u8]` exists only under `#[cfg(target_os = "windows")]` (`InitDll`) and `#[cfg(target_os = "linux")]` (`ModuleEntry`); line 677 then uses `name`.
 - On FreeBSD: `name` is undeclared → compile error. Fix: widen the linux arm (FreeBSD VST3s use `ModuleEntry`, same ELF convention).
 - The rest of the loader is fine on FreeBSD: `load()` at scan.rs:732-771 is `#[cfg(not(windows))]` dlopen with `RTLD_NOW=2`/`RTLD_LOCAL=0` (correct values on FreeBSD), `find_symbol` at :831-839 is dlsym.
 - **Risk: BREAKS (build).**
@@ -1755,54 +1755,54 @@ Two upstream facts frame everything:
 ## B. Known-trap class: else-arm written for another platform, FreeBSD runs ALSA/X11
 
 ### B1. `BUFFER_PERIODS` — the named trap, and it is real
-- `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/ivory/src/instrument.rs:6044-6056` — linux=4, windows=2, **else=1**.
+- `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/tangent/src/instrument.rs:6044-6056` — linux=4, windows=2, **else=1**.
 - FreeBSD falls into the else arm (1), but FreeBSD runs cpal's **ALSA host**, which reads `Fixed(v)` as the whole ring and carves it into 4 periods (the very behavior the linux=4 arm compensates for). Result: asking for 256 produces 64-frame callbacks at 4x the intended rate on a non-RT thread — the measured 2012-MBA config that produced 6 underruns/30s *with* the fix absent. Also `pick_buffer` (:6111-6116) will then report the ring as the period to the Audio Status panel.
 - Fix: the linux arm must become "any OS where cpal picks the ALSA host" (linux|freebsd|dragonfly|netbsd).
 - **Risk: wrong-behavior (severe: audio underruns/breakup, the app's core function).**
-- Related and consistent: the input-side arm `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/ivory-record/src/audio.rs:2246-2268` (`not(macos)`) already gives FreeBSD the Linux/ALSA mapping — fine as-is once B1 is fixed.
+- Related and consistent: the input-side arm `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/tangent-record/src/audio.rs:2246-2268` (`not(macos)`) already gives FreeBSD the Linux/ALSA mapping — fine as-is once B1 is fixed.
 
 ### B2. `native_dialogs_work()` — the silent dead Save/Load/Export buttons come back
-- `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/ivory/src/desktop.rs:2759-2825` (linux probe: portal bus / zenity), `:2827-2830` else-arm returns `true`.
+- `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/tangent/src/desktop.rs:2759-2825` (linux probe: portal bus / zenity), `:2827-2830` else-arm returns `true`.
 - FreeBSD hits the else arm: the app assumes a native rfd dialog will appear. On a FreeBSD box without xdg-desktop-portal or zenity, `rfd::pick_file` returns `None` — indistinguishable from Cancel — so file buttons silently do nothing. This is exactly the diagnosed Void/XFCE bug (docs/LINUX-4.16-FINDINGS.md) reintroduced. The fallback probe even checks `/usr/local/share/xdg-desktop-portal/portals` (:2811), which is the FreeBSD prefix — the *probe* would work there; only the gate excludes it.
 - **Risk: wrong-behavior (high: core UI actions silently no-op).**
 
 ### B3. `picker_needs_windowed()` — fullscreen file-picker freeze under tiling WMs
-- `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/ivory/src/desktop.rs:2682-2690` — linux: leave fullscreen before a blocking picker; else-arm: `false`.
+- `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/tangent/src/desktop.rs:2682-2690` — linux: leave fullscreen before a blocking picker; else-arm: `false`.
 - FreeBSD X11 with i3/sway-class WMs has the identical `_NET_WM_STATE_FULLSCREEN` problem → modal opens under the fullscreen window, app appears frozen, force-quit territory.
 - **Risk: wrong-behavior (app-freeze UX under tiling WMs).**
 
 ### B4. Compositor: owned-GL accelerator and all its guards are linux-only
-- `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/ivory/src/composite.rs:50` (`mod glctx`), `:98-99` (gl field), `:109-113` (Drop guard), `:177-180` (`owned_gl_is_hardware` probe), `:315-319` (`on_owned_gl` first), `:380-443`, `:524`, `:597`, `:752` (make-current guards).
+- `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/tangent/src/composite.rs:50` (`mod glctx`), `:98-99` (gl field), `:109-113` (Drop guard), `:177-180` (`owned_gl_is_hardware` probe), `:315-319` (`on_owned_gl` first), `:380-443`, `:524`, `:597`, `:752` (make-current guards).
 - On FreeBSD none of this exists; `standalone()` (:310-368) goes straight to wgpu, **refuses any GL adapter wgpu found itself** (:357-364, correctly — the eglMakeCurrent-unbind hazard is not linux-specific), so video compositing works **only with a Vulkan driver** (hardware or lavapipe). A GL-only FreeBSD box gets "no video" where an identical Linux box gets hardware GL. Also the error hint at `:337-343` is `cfg!(target_os = "linux")`-gated, so FreeBSD gets the error *without* the "install lavapipe" advice; `renders_on_the_cpu` (:172-205) skips the owned-GL probe and may wrongly lower defaults to 720p/15 on a machine with good GL but software Vulkan.
-- Note the wgpu dependency itself is gated correctly: `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/ivory/Cargo.toml:150-152` uses `cfg(all(unix, not(target_os = "macos")))` — FreeBSD **is** included. The Cargo.toml got the seam right; composite.rs narrowed it to linux.
+- Note the wgpu dependency itself is gated correctly: `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/tangent/Cargo.toml:150-152` uses `cfg(all(unix, not(target_os = "macos")))` — FreeBSD **is** included. The Cargo.toml got the seam right; composite.rs narrowed it to linux.
 - **Risk: wrong-behavior (no video / degraded defaults on non-Vulkan machines; audio+MIDI still record).**
 
 ### B5. Camera: FreeBSD gets the stub, though webcamd speaks V4L2
-- `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/ivory-record/src/camera.rs:113-116` — `not(macos|linux|windows)` → `mod stub` → every open returns `CameraError::Unsupported`.
-- Linux backend: `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/ivory-record/src/camera/linux.rs` (enumerates `/dev/video{0..3}` at :156-167 — webcamd creates exactly these via cuse) over the **vendored** `linuxvideo` crate, gated at `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/ivory-record/Cargo.toml:172-187` (`target_os = "linux"`, plus `zune-jpeg` for MJPEG).
+- `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/tangent-record/src/camera.rs:113-116` — `not(macos|linux|windows)` → `mod stub` → every open returns `CameraError::Unsupported`.
+- Linux backend: `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/tangent-record/src/camera/linux.rs` (enumerates `/dev/video{0..3}` at :156-167 — webcamd creates exactly these via cuse) over the **vendored** `linuxvideo` crate, gated at `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/tangent-record/Cargo.toml:172-187` (`target_os = "linux"`, plus `zune-jpeg` for MJPEG).
 - Porting caveat: `linuxvideo` is pure-Rust ioctl wrappers encoding **Linux** `_IOC` numbers; FreeBSD's ioctl bit layout differs (3-bit dir/13-bit size vs Linux 2/14), and webcamd+v4l_compat expects FreeBSD-encoded numbers. The vendored crate likely needs its ioctl constants re-derived for FreeBSD — verify against `multimedia/v4l_compat` headers before assuming the linux backend "just works". The EACCES message at linux.rs:168-173 ("add your user to the 'video' group") also needs FreeBSD wording (`webcamd`/`operator` group / devfs rules).
 - Also `camera/vaapi.rs` (dlopen'd libva, `/dev/dri/renderD128` default at :688) is linux-only; FreeBSD has libva in ports — optional follow-on, not required (it is strictly an accelerator).
 - **Risk: wrong-behavior (whole camera feature absent; UI at least says so honestly).**
 
 ### B6. VST3 search paths: FreeBSD searches nothing
-- `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/ivory-host/src/scan.rs:104-111` — the `~/.vst3`, `/usr/lib/vst3`, `/usr/local/lib/vst3` list is `target_os = "linux"`. On FreeBSD only `VST3_PATH` (:69-71) contributes → plugin picker is always empty. FreeBSD wants `~/.vst3` + `/usr/local/lib/vst3` (ports prefix).
-- Compounding it, the empty-list help text `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/ivory-ui/src/dialogs.rs:1857-1871` else-arm tells the user "Linux keeps them in ~/.vst3 and /usr/lib/vst3" — folders the scanner never looked in on FreeBSD.
+- `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/tangent-host/src/scan.rs:104-111` — the `~/.vst3`, `/usr/lib/vst3`, `/usr/local/lib/vst3` list is `target_os = "linux"`. On FreeBSD only `VST3_PATH` (:69-71) contributes → plugin picker is always empty. FreeBSD wants `~/.vst3` + `/usr/local/lib/vst3` (ports prefix).
+- Compounding it, the empty-list help text `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/tangent-ui/src/dialogs.rs:1857-1871` else-arm tells the user "Linux keeps them in ~/.vst3 and /usr/lib/vst3" — folders the scanner never looked in on FreeBSD.
 - **Risk: wrong-behavior (plugin hosting unusable without env var; help text lies).**
 
 ### B7. Plugin editor window: stub despite a working X11 backend
-- `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/ivory-host/src/editor.rs:88-91` (`x11::Window` is linux; FreeBSD → `stub::Window`), `:98-102` (`EDITORS_SUPPORTED` = false on FreeBSD), `:325-328` (`pump` no-op), `:1161` (x11 module), `:1649` (stub module).
-- The x11 backend is `x11rb` + `libc::poll` (`/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/ivory-host/Cargo.toml:82-84`, also linux-gated) — both fully portable to FreeBSD; widening the gates should be enough.
+- `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/tangent-host/src/editor.rs:88-91` (`x11::Window` is linux; FreeBSD → `stub::Window`), `:98-102` (`EDITORS_SUPPORTED` = false on FreeBSD), `:325-328` (`pump` no-op), `:1161` (x11 module), `:1649` (stub module).
+- The x11 backend is `x11rb` + `libc::poll` (`/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/tangent-host/Cargo.toml:82-84`, also linux-gated) — both fully portable to FreeBSD; widening the gates should be enough.
 - **Risk: wrong-behavior (feature degraded to "Unsupported" needlessly).**
 
 ### B8. PipeWire enumeration/binding — else-arm is acceptable, with a footnote
-- `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/ivory-record/src/audio.rs:419-471` (`pw-dump` subprocess, linux) / `:474-477` (else: empty) and `:498-508` (`PIPEWIRE_NODE` env wrap) / `:510-513` (else: passthrough).
+- `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/tangent-record/src/audio.rs:419-471` (`pw-dump` subprocess, linux) / `:474-477` (else: empty) and `:498-508` (`PIPEWIRE_NODE` env wrap) / `:510-513` (else: passthrough).
 - FreeBSD else-arms fall back to plain cpal-ALSA enumeration — correct for the OSS-shim setup. Footnote: PipeWire does exist on FreeBSD; if a user runs it, they get the degraded single-`pipewire`-device behavior the linux path was built to fix.
 - **Risk: fine (minor wrong-behavior only under PipeWire-on-FreeBSD).**
 
 ### B9. Misleading per-OS user text (else-arms name the wrong OS)
-- `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/ivory-ui/src/dialogs.rs:1543-1561` — `nothing_found` else-arm is the **macOS** text: FreeBSD users are told to check "System Settings > Privacy & Security" for camera/mic access. (linux arm :1524-1541 is the right template — its `/dev/video*`/'video' group wording needs FreeBSD-ization per B5.)
-- `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/ivory-record/src/encode/ffmpeg.rs:127-136` — `how_to_install` else-arm suggests `sudo apt install ffmpeg`; FreeBSD wants `pkg install ffmpeg`.
-- `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/ivory/src/desktop.rs:1234-1244` — camera-silent hint: FreeBSD gets the generic arm; fine.
+- `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/tangent-ui/src/dialogs.rs:1543-1561` — `nothing_found` else-arm is the **macOS** text: FreeBSD users are told to check "System Settings > Privacy & Security" for camera/mic access. (linux arm :1524-1541 is the right template — its `/dev/video*`/'video' group wording needs FreeBSD-ization per B5.)
+- `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/tangent-record/src/encode/ffmpeg.rs:127-136` — `how_to_install` else-arm suggests `sudo apt install ffmpeg`; FreeBSD wants `pkg install ffmpeg`.
+- `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/tangent/src/desktop.rs:1234-1244` — camera-silent hint: FreeBSD gets the generic arm; fine.
 - **Risk: wrong-behavior (cosmetic/support-load).**
 
 ---
@@ -1811,46 +1811,46 @@ Two upstream facts frame everything:
 
 | Binary | Where spawned | Located how | FreeBSD status |
 |---|---|---|---|
-| `tangent-ffmpeg` / `ffmpeg` | `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/ivory-record/src/encode/ffmpeg.rs:107-120` (`program()`), used for encode (ffmpeg.rs:587-…), decode/import (`decode.rs:256`), mux | 1) `IVORY_FFMPEG` env; 2) `tangent-ffmpeg` beside the exe (BUNDLED const :97-101, non-windows name); 3) bare `ffmpeg` on PATH | **fine** — port should depend on ports ffmpeg (PATH fallback) or install an exe-adjacent `tangent-ffmpeg`; fix the apt hint (B9). Release currently bundles it via `scripts/fetch-ffmpeg.sh` (build-cross.sh:305-319) — a native port skips that. |
-| `/usr/bin/afconvert` | `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/ivory-record/src/decode.rs:341` | absolute path, **macOS-only cfg** | not compiled on FreeBSD — fine |
-| `pw-dump` | `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/ivory-record/src/audio.rs:421` | PATH, linux-only cfg, absence = clean fallback | not compiled — fine (B8) |
-| `dbus-send` | `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/ivory/src/desktop.rs:2783` | PATH, linux-only cfg | not compiled on FreeBSD — which is B2's bug: the probe that *should* run there doesn't |
-| `open` / `explorer` / `xdg-open` | `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/ivory/src/desktop.rs:5323-5341` | PATH; FreeBSD correctly takes the `all(unix, not(macos))` xdg-open arm | fine (port should depend on xdg-utils) |
+| `tangent-ffmpeg` / `ffmpeg` | `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/tangent-record/src/encode/ffmpeg.rs:107-120` (`program()`), used for encode (ffmpeg.rs:587-…), decode/import (`decode.rs:256`), mux | 1) `TANGENT_FFMPEG` env; 2) `tangent-ffmpeg` beside the exe (BUNDLED const :97-101, non-windows name); 3) bare `ffmpeg` on PATH | **fine** — port should depend on ports ffmpeg (PATH fallback) or install an exe-adjacent `tangent-ffmpeg`; fix the apt hint (B9). Release currently bundles it via `scripts/fetch-ffmpeg.sh` (build-cross.sh:305-319) — a native port skips that. |
+| `/usr/bin/afconvert` | `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/tangent-record/src/decode.rs:341` | absolute path, **macOS-only cfg** | not compiled on FreeBSD — fine |
+| `pw-dump` | `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/tangent-record/src/audio.rs:421` | PATH, linux-only cfg, absence = clean fallback | not compiled — fine (B8) |
+| `dbus-send` | `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/tangent/src/desktop.rs:2783` | PATH, linux-only cfg | not compiled on FreeBSD — which is B2's bug: the probe that *should* run there doesn't |
+| `open` / `explorer` / `xdg-open` | `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/tangent/src/desktop.rs:5323-5341` | PATH; FreeBSD correctly takes the `all(unix, not(macos))` xdg-open arm | fine (port should depend on xdg-utils) |
 | `ffprobe` | encode.rs:402,549; ffmpeg.rs:720; composite.rs:1271 | PATH — **test code only** (inside `#[cfg(test)]`) | fine |
-| resource compilers (`llvm-rc` etc.) | `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/ivory/build.rs:116-117,157` | hardcoded Homebrew paths + PATH — **only when `CARGO_CFG_TARGET_OS == "windows"`** (:33-35) | no-op for a native FreeBSD build — fine |
+| resource compilers (`llvm-rc` etc.) | `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/tangent/build.rs:116-117,157` | hardcoded Homebrew paths + PATH — **only when `CARGO_CFG_TARGET_OS == "windows"`** (:33-35) | no-op for a native FreeBSD build — fine |
 
-All runtime spawns go through `crate::proc::command` (`/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/ivory-record/src/proc.rs:23-33`, `CREATE_NO_WINDOW` under `#[cfg(windows)]` only) — fine on FreeBSD.
+All runtime spawns go through `crate::proc::command` (`/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/tangent-record/src/proc.rs:23-33`, `CREATE_NO_WINDOW` under `#[cfg(windows)]` only) — fine on FreeBSD.
 
 ## D. Paths & path assumptions
 
-- Config: literal `~/.config/ivory/` on every platform, deliberately (settings.rs:1339-1369, overrides.rs:153-156, license.rs:324-327, main.rs:216 lock file, desktop.rs:2353). **fine** on FreeBSD.
-- Take destination: `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/ivory-record/src/take.rs:453-484` — FreeBSD takes the `not(any(windows, macos))` arm: `$XDG_VIDEOS_DIR`/`~/.config/user-dirs.dirs`/`~/Videos`. **fine**.
-- Disk-free: `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/ivory/src/record.rs:2227-2247` `cfg(unix)` statvfs (f_frsize handling correct for FreeBSD). **fine**.
-- Clean exit: `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/ivory/src/main.rs:373-376` `cfg(unix)` `libc::_exit(0)`. **fine** (and wanted — same plugin-atexit hazard applies).
+- Config: literal `~/.config/tangent/` on every platform, deliberately (settings.rs:1339-1369, overrides.rs:153-156, license.rs:324-327, main.rs:216 lock file, desktop.rs:2353). **fine** on FreeBSD.
+- Take destination: `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/tangent-record/src/take.rs:453-484` — FreeBSD takes the `not(any(windows, macos))` arm: `$XDG_VIDEOS_DIR`/`~/.config/user-dirs.dirs`/`~/Videos`. **fine**.
+- Disk-free: `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/tangent/src/record.rs:2227-2247` `cfg(unix)` statvfs (f_frsize handling correct for FreeBSD). **fine**.
+- Clean exit: `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/tangent/src/main.rs:373-376` `cfg(unix)` `libc::_exit(0)`. **fine** (and wanted — same plugin-atexit hazard applies).
 - App icon: main.rs:295-296 `not(macos)` full-bleed PNG. **fine**. Renderer: main.rs:328-329 `not(macos)` → Glow. **fine** on X11/mesa.
 - Portal dirs fallback desktop.rs:2810-2811 includes `/usr/local/share/...` — already FreeBSD-friendly once B2's gate is widened.
-- `/proc/self/stat` reads exist only in test/example code (composite.rs:1437 test, ivory-record examples) — dev-only; would return 0s on FreeBSD without procfs. **fine**.
+- `/proc/self/stat` reads exist only in test/example code (composite.rs:1437 test, tangent-record examples) — dev-only; would return 0s on FreeBSD without procfs. **fine**.
 - `cpu_seconds` instrument.rs:6262-6278 `cfg(unix)` getrusage. **fine**.
-- keygen chmod 600 tools/ivory-keygen/src/main.rs:83 `cfg(unix)`. **fine** (not shipped).
+- keygen chmod 600 tools/tangent-keygen/src/main.rs:83 `cfg(unix)`. **fine** (not shipped).
 - `flush_denormals` audio.rs:944 / instrument.rs:996 — `target_arch = "x86_64"`, OS-independent. **fine** (aarch64 FreeBSD gets the same no-op as aarch64 Linux).
 
 ## E. Platform-conditional dependencies (per Cargo.toml)
 
 | Manifest | Gate | FreeBSD effect |
 |---|---|---|
-| `ivory/Cargo.toml:114` windows-sys | `cfg(windows)` | skipped — fine |
-| `ivory/Cargo.toml:146-148` wgpu vulkan+gles | `cfg(target_os = "windows")` | skipped |
-| `ivory/Cargo.toml:150-152` wgpu vulkan+gles + egui-wgpu | `cfg(all(unix, not(macos)))` | **included — correct** (the one gate written the right way) |
-| `ivory/Cargo.toml:154-193` eframe/wgpu Metal | macos | skipped — fine |
-| `ivory/Cargo.toml:195-198` libc (statvfs) | `cfg(unix)` | included — fine |
-| `ivory/Cargo.toml:93` **midir** | unconditional | **A1 build break** |
-| `ivory/Cargo.toml:102` mp3lame-encoder (builds LAME C) | via `mp3` default feature | should compile with clang on FreeBSD; **verify**, else ship without `mp3` (WAV fallback is honest) |
-| `ivory-record/Cargo.toml:70-164` objc2 stack | macos | skipped — fine |
-| `ivory-record/Cargo.toml:172-187` **linuxvideo (vendored) + zune-jpeg** | linux | skipped → camera stub (B5) |
-| `ivory-host/Cargo.toml:40-60` objc2-app-kit | macos | skipped |
-| `ivory-host/Cargo.toml:67-73` windows-sys | windows | skipped |
-| `ivory-host/Cargo.toml:82-84` **x11rb + libc** | linux | skipped → editor stub (B7); widen to freebsd |
-| eframe features `ivory/Cargo.toml:82-87` include `x11` (+`wayland`) | — | winit 0.30 supports FreeBSD X11 — fine |
+| `tangent/Cargo.toml:114` windows-sys | `cfg(windows)` | skipped — fine |
+| `tangent/Cargo.toml:146-148` wgpu vulkan+gles | `cfg(target_os = "windows")` | skipped |
+| `tangent/Cargo.toml:150-152` wgpu vulkan+gles + egui-wgpu | `cfg(all(unix, not(macos)))` | **included — correct** (the one gate written the right way) |
+| `tangent/Cargo.toml:154-193` eframe/wgpu Metal | macos | skipped — fine |
+| `tangent/Cargo.toml:195-198` libc (statvfs) | `cfg(unix)` | included — fine |
+| `tangent/Cargo.toml:93` **midir** | unconditional | **A1 build break** |
+| `tangent/Cargo.toml:102` mp3lame-encoder (builds LAME C) | via `mp3` default feature | should compile with clang on FreeBSD; **verify**, else ship without `mp3` (WAV fallback is honest) |
+| `tangent-record/Cargo.toml:70-164` objc2 stack | macos | skipped — fine |
+| `tangent-record/Cargo.toml:172-187` **linuxvideo (vendored) + zune-jpeg** | linux | skipped → camera stub (B5) |
+| `tangent-host/Cargo.toml:40-60` objc2-app-kit | macos | skipped |
+| `tangent-host/Cargo.toml:67-73` windows-sys | windows | skipped |
+| `tangent-host/Cargo.toml:82-84` **x11rb + libc** | linux | skipped → editor stub (B7); widen to freebsd |
+| eframe features `tangent/Cargo.toml:82-87` include `x11` (+`wayland`) | — | winit 0.30 supports FreeBSD X11 — fine |
 
 ---
 
@@ -1858,17 +1858,17 @@ All runtime spawns go through `crate::proc::command` (`/Users/ganten/Library/Clo
 
 | # | Item | Location | FreeBSD else-arm result | Risk |
 |---|---|---|---|---|
-| 1 | midir has no FreeBSD backend | ivory/Cargo.toml:93 (midir 0.11 backend table) | crate fails to compile — no binary at all | **breaks (build)** |
-| 2 | `CONTENTS_SUBDIR` undefined | ivory-host/src/scan.rs:48-57 | E0425 — ivory-host fails to compile | **breaks (build)** |
-| 3 | `let name` only for win/linux in `Library::open` | ivory-host/src/scan.rs:667-683 | undefined variable — fails to compile | **breaks (build)** |
-| 4 | `BUFFER_PERIODS` else=1 on an ALSA host | ivory/src/instrument.rs:6044-6056 | 4x callback rate, measured-underrun territory | **wrong-behavior (severe)** |
-| 5 | `native_dialogs_work()` else=true | ivory/src/desktop.rs:2827-2830 | Save/Load/Export silently no-op without portal/zenity | **wrong-behavior (severe)** |
-| 6 | Camera → stub despite webcamd V4L2 | ivory-record/src/camera.rs:113-116 (+ vendored linuxvideo ioctl encoding) | no camera; port needs gate widening **and** ioctl-encoding verification | **wrong-behavior (feature gone)** |
-| 7 | VST3 search paths empty + dialog names unsearched dirs | ivory-host/src/scan.rs:104-111; ivory-ui/src/dialogs.rs:1857-1871 | plugin hosting unusable without `VST3_PATH` | **wrong-behavior** |
-| 8 | Compositor: no owned-GL path, GL adapter refused | ivory/src/composite.rs:50,315-364 | video requires Vulkan; wrong hint text; possibly wrongly lowered defaults | **wrong-behavior** |
-| 9 | Plugin editor → stub though x11rb backend is portable | ivory-host/src/editor.rs:88-91,1649 | editors "Unsupported" needlessly | **wrong-behavior** |
-| 10 | Fullscreen picker freeze under tiling WMs | ivory/src/desktop.rs:2682-2690 | apparent hang, force-quit | **wrong-behavior** |
-| 11 | Misleading OS text (macOS privacy panel, `apt install`) | ivory-ui/src/dialogs.rs:1543-1561; ivory-record/src/encode/ffmpeg.rs:127-136 | wrong instructions shown | wrong-behavior (cosmetic) |
+| 1 | midir has no FreeBSD backend | tangent/Cargo.toml:93 (midir 0.11 backend table) | crate fails to compile — no binary at all | **breaks (build)** |
+| 2 | `CONTENTS_SUBDIR` undefined | tangent-host/src/scan.rs:48-57 | E0425 — tangent-host fails to compile | **breaks (build)** |
+| 3 | `let name` only for win/linux in `Library::open` | tangent-host/src/scan.rs:667-683 | undefined variable — fails to compile | **breaks (build)** |
+| 4 | `BUFFER_PERIODS` else=1 on an ALSA host | tangent/src/instrument.rs:6044-6056 | 4x callback rate, measured-underrun territory | **wrong-behavior (severe)** |
+| 5 | `native_dialogs_work()` else=true | tangent/src/desktop.rs:2827-2830 | Save/Load/Export silently no-op without portal/zenity | **wrong-behavior (severe)** |
+| 6 | Camera → stub despite webcamd V4L2 | tangent-record/src/camera.rs:113-116 (+ vendored linuxvideo ioctl encoding) | no camera; port needs gate widening **and** ioctl-encoding verification | **wrong-behavior (feature gone)** |
+| 7 | VST3 search paths empty + dialog names unsearched dirs | tangent-host/src/scan.rs:104-111; tangent-ui/src/dialogs.rs:1857-1871 | plugin hosting unusable without `VST3_PATH` | **wrong-behavior** |
+| 8 | Compositor: no owned-GL path, GL adapter refused | tangent/src/composite.rs:50,315-364 | video requires Vulkan; wrong hint text; possibly wrongly lowered defaults | **wrong-behavior** |
+| 9 | Plugin editor → stub though x11rb backend is portable | tangent-host/src/editor.rs:88-91,1649 | editors "Unsupported" needlessly | **wrong-behavior** |
+| 10 | Fullscreen picker freeze under tiling WMs | tangent/src/desktop.rs:2682-2690 | apparent hang, force-quit | **wrong-behavior** |
+| 11 | Misleading OS text (macOS privacy panel, `apt install`) | tangent-ui/src/dialogs.rs:1543-1561; tangent-record/src/encode/ffmpeg.rs:127-136 | wrong instructions shown | wrong-behavior (cosmetic) |
 
 The repeating pattern for the fix pass: nearly every `target_os = "linux"` gate in this codebase actually means either "cpal's ALSA host" (items 4, B8), "X11" (9, 10), "XDG desktop" (5, 7, take-paths), or "V4L2" (6) — all of which FreeBSD shares — while the genuinely correct seams already use `cfg(unix)` / `cfg(all(unix, not(macos)))` (exit path, statvfs, xdg-open, the wgpu dependency). The port is mostly a systematic widening of `linux` → `any(linux, freebsd)` plus the three build breaks and the two vendored/external verifications (linuxvideo ioctls, midir backend).
 
@@ -1879,23 +1879,23 @@ The repeating pattern for the fix pass: nearly every `target_os = "linux"` gate 
 
 # Release machinery review (read-only) — ivory/Tangent, toward a paid 5.0
 
-Repo root: `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory` (all `file:line` refs below are relative to it). Current `Cargo.toml` version: **4.92.0**. `dist/` currently holds the 4.92 set: macOS universal zip+dmg, Windows setup.exe, Linux x86_64 tarball, `Tangent.app` — **no .pkg, no Windows zip, no SHA256SUMS**.
+Repo root: `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent` (all `file:line` refs below are relative to it). Current `Cargo.toml` version: **4.92.0**. `dist/` currently holds the 4.92 set: macOS universal zip+dmg, Windows setup.exe, Linux x86_64 tarball, `Tangent.app` — **no .pkg, no Windows zip, no SHA256SUMS**.
 
 ## Findings (most severe first)
 
 ### 1. CONFIRMED: versionless Windows zip permalink dies on the next stable publish
 - **Where:** `scripts/publish-github.sh:17-18` (header still lists `tangent-windows-x86_64.zip` as part of the "release contract"); `scripts/build-cross.sh:435-446` (the zip is now explicitly "a TRANSIENT installer input" and is `rm -f`'d the moment the NSIS installer exists); `README.md:52` (live clickable link to `releases/latest/download/tangent-windows-x86_64.zip`); `docs/STORE-CONTENT.md:34` (contract table still lists the zip); `docs/RELEASE.md:238,297` (same).
-- **What:** `releases/latest/download/<name>` resolves by exact asset name **against the latest release only**. The alias-upload code in publish-github.sh is generic (it derives aliases from whatever is in `dist/`), so with no zip built, no `tangent-windows-x86_64.zip` alias and no legacy `ivory-windows-x86_64.zip` alias gets uploaded. The moment the 5.0 release becomes latest, both URLs 404 — for README visitors and for **every pre-3.0 supporter-key email already sent** (those used the `ivory-*` zip name). The script's own permalink verification (`publish-github.sh:223-239`) only iterates over names it uploaded, so it structurally cannot notice a contract name that went missing.
+- **What:** `releases/latest/download/<name>` resolves by exact asset name **against the latest release only**. The alias-upload code in publish-github.sh is generic (it derives aliases from whatever is in `dist/`), so with no zip built, no `tangent-windows-x86_64.zip` alias and no legacy `tangent-windows-x86_64.zip` alias gets uploaded. The moment the 5.0 release becomes latest, both URLs 404 — for README visitors and for **every pre-3.0 supporter-key email already sent** (those used the `ivory-*` zip name). The script's own permalink verification (`publish-github.sh:223-239`) only iterates over names it uploaded, so it structurally cannot notice a contract name that went missing.
 - **Fix direction:** either (a) drop the zip from the contract — remove README.md:52's portable link, fix STORE-CONTENT.md:34 and publish-github.sh's header, and accept that ancient ivory-zip email links die; or (b) keep shipping the zip (stop deleting it in build-cross.sh, or alias the setup.exe under the zip name is NOT acceptable — wrong file type for the name); plus (c) give publish-github.sh a hard-coded required-alias manifest checked against UPLOADS before upload, so a missing contract name fails the publish instead of the buyer.
 
 ### 2. The Linux tarball buyers get has no install.sh and no bundled ffmpeg — and the script that injects them can never succeed
 - **Where:** `scripts/build-linux-native.sh:39-52` (stages binary, fonts, licenses, README — **no `install.sh`, no `tangent-ffmpeg`**); `scripts/build-linux-remote.sh:160` ("Next: scripts/release.sh --sums-only, then scripts/publish-github.sh" — skips the installer step entirely); `scripts/build-installer.sh:258` vs `:307-323` (`build_linux` deletes the retired VST3 (`rm -rf "$dir/$NAME.vst3"`) and then its own verification **requires** `Tangent.vst3/Contents/x86_64-linux/Tangent.so` to be present exactly once — so `build-installer.sh linux` now always exits 1).
 - **Proof:** the actual `dist/tangent-4.92.0-linux-x86_64.tar.gz` contains neither `install.sh` nor `tangent-ffmpeg` (verified by `tar -tzf`; 19 entries, 11 MB).
-- **Why it matters for paid 5.0:** the supporter email a buyer receives says "the tarball has an install.sh that needs no root" (`tools/ivory-fulfil/src/main.rs:214`, `docs/STORE-CONTENT.md:162`), and the README.txt **inside the tarball** tells them to run `./install.sh` (`docs/ARTIFACT-README.md:37`). Video recording silently falls back to distro ffmpeg, i.e. breaks on clean machines — the exact 4.11 regression the cross-build path (`build-cross.sh` `package_linux`, lines 304-345) was hardened against; the native path (the documented "recommended Linux path") regressed it.
+- **Why it matters for paid 5.0:** the supporter email a buyer receives says "the tarball has an install.sh that needs no root" (`tools/tangent-fulfil/src/main.rs:214`, `docs/STORE-CONTENT.md:162`), and the README.txt **inside the tarball** tells them to run `./install.sh` (`docs/ARTIFACT-README.md:37`). Video recording silently falls back to distro ffmpeg, i.e. breaks on clean machines — the exact 4.11 regression the cross-build path (`build-cross.sh` `package_linux`, lines 304-345) was hardened against; the native path (the documented "recommended Linux path") regressed it.
 - **Fix direction:** stage `installer/linux/install.sh`, `tangent-ffmpeg` + `ffmpeg-licenses` in build-linux-native.sh (fetch-ffmpeg.sh is portable and checksum-pinned but downloads a Linux binary — simplest is to inject on the Mac after rsync-back, i.e. fix and re-enable `build-installer.sh linux` by deleting its three VST3 assertions at 307-323); and add `install.sh` + `tangent-ffmpeg` to release.sh's Linux artifact checks (see finding 6).
 
 ### 3. The primary macOS buyer link (`Tangent-macos.pkg`) is built by nothing in the release path
-- **Where:** `scripts/release.sh:85-105` (Darwin branch runs `build-macos.sh` + `build-cross.sh` only; `build-installer.sh macos` is never invoked by any script); `docs/RELEASE.md` release procedure steps 1-10 never mention `build-installer.sh` at all; `docs/STORE-CONTENT.md:157`, `tools/ivory-fulfil/src/main.rs:183`, `README.md:51` all hand out `Tangent-macos.pkg` as the **first** macOS link.
+- **Where:** `scripts/release.sh:85-105` (Darwin branch runs `build-macos.sh` + `build-cross.sh` only; `build-installer.sh macos` is never invoked by any script); `docs/RELEASE.md` release procedure steps 1-10 never mention `build-installer.sh` at all; `docs/STORE-CONTENT.md:157`, `tools/tangent-fulfil/src/main.rs:183`, `README.md:51` all hand out `Tangent-macos.pkg` as the **first** macOS link.
 - **What:** the pkg exists only if the owner remembers a by-hand step that no checklist names. release.sh's pkg inspection (`release.sh:126-143`) runs only *if* a pkg is already in `dist/`; publish-github.sh publishes happily without one (ARTIFACTS is non-empty from the zip/dmg). `dist/` today has no 4.92 pkg. The only net that catches it is `check-store-links.sh` **after** publishing — a 404 window on the top buyer link.
 - **Fix direction:** have release.sh's Darwin branch run `scripts/build-installer.sh macos` after build-macos.sh, and add the pkg to a required-artifact list; document the step in RELEASE.md. Note the ordering constraint: the pkg must exist before `release.sh --sums-only`, or publish-github.sh's sums-coverage check (`publish-github.sh:112-115`) correctly refuses it.
 
@@ -1905,7 +1905,7 @@ Repo root: `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory` (all
 - **Fix direction:** call `sign_windows_exe` on `$out` at the end of `build_windows()` (jsign signs any PE, the machinery already exists in build-cross.sh — hoist it into a shared helper), and for a paid release consider making unsigned-Windows a refuse-to-package gate like the macOS notarization gate at `build-macos.sh:359-378`.
 
 ### 5. Buyer-facing copy still sells the retired VST3, including inside the installer UI
-- **Where:** `installer/windows/tangent.nsi:74` — the components page a buyer sees says "Tangent comes in two pieces. Install either, or both." above a list with exactly **one** component; `tangent.nsi:1-19` header comments describe two components. `tools/ivory-fulfil/src/main.rs:209` — the supporter email body: "VST3 plugin as separate choices, so you can take either or both". `docs/STORE-CONTENT.md:123,153` — same claim in the store page copy. (`main.rs:177` comment too.)
+- **Where:** `installer/windows/tangent.nsi:74` — the components page a buyer sees says "Tangent comes in two pieces. Install either, or both." above a list with exactly **one** component; `tangent.nsi:1-19` header comments describe two components. `tools/tangent-fulfil/src/main.rs:209` — the supporter email body: "VST3 plugin as separate choices, so you can take either or both". `docs/STORE-CONTENT.md:123,153` — same claim in the store page copy. (`main.rs:177` comment too.)
 - **Why:** a paid product whose install screen and receipt email describe a component that does not exist reads as broken or bait; the plugin was retired 2026-08-24 by owner ruling (`build-installer.sh:2-4`).
 - **Fix direction:** reword tangent.nsi's components text (or drop the components page for a single-section install), and update the email body + STORE-CONTENT block before the fulfil service is redeployed for 5.0. There is a test asserting on `email_body`, so the fixture updates with it.
 
@@ -1920,7 +1920,7 @@ Repo root: `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory` (all
 - **Fix direction:** when writing SHA256SUMS, append alias-named duplicate lines (same hash, alias filename), or generate the alias lines in publish-github.sh where the alias names are already computed.
 
 ### 8. Settings migrations: upgrade path is solid; downgrade-then-upgrade is destructive
-- **Where:** `ivory-ui/src/settings.rs:38` (`SETTINGS_VERSION = 19`), `:2986-2989` (every save unconditionally re-stamps with the **running build's** version), `:2346` (v15 migration flips `lpf_mix = 1.0 - lpf_mix`, non-idempotent), `:2359-2367` (v18 pad-seat move: re-running takes now-empty seats and overwrites seats 48..63, wiping user-placed pad inserts).
+- **Where:** `tangent-ui/src/settings.rs:38` (`SETTINGS_VERSION = 19`), `:2986-2989` (every save unconditionally re-stamps with the **running build's** version), `:2346` (v15 migration flips `lpf_mix = 1.0 - lpf_mix`, non-idempotent), `:2359-2367` (v18 pad-seat move: re-running takes now-empty seats and overwrites seats 48..63, wiping user-placed pad inserts).
 - **What's good for 5.0:** fresh install with no file skips migration cleanly (`load()`, :1391-1398); unreadable files are renamed aside, not overwritten (:1418-1424); unknown keys survive round-trips via `extra`; the Windows uninstaller deliberately preserves `%USERPROFILE%\.config\ivory` (`tangent.nsi:147-149`) — taught chords and the supporter key survive uninstall/reinstall. Upgrade 4.x → 5.0 is well covered.
 - **The risk:** a buyer who keeps an old build around (old installer on disk, second machine, portable copy) launches old-then-new: the old build re-stamps the file to its lower version, and the new build then **re-runs** migrations 15..19 against an already-migrated file — the low-pass dial audibly inverts and pad inserts get cleared. Plausible in a paid population that hoards installers.
 - **Fix direction:** never lower the stamp — in `from_map` keep `max(file_stamp, SETTINGS_VERSION)` around (e.g. carry a higher-than-known stamp through `extra` or a dedicated field) so a newer file passing through an older build keeps its version. That's a change for 5.0's settings.rs, cheap now, impossible to retrofit into builds already shipped.
@@ -1951,10 +1951,10 @@ Repo root: `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory` (all
 | Every permalink in the supporter email, store page and README resolving after publish | Aliases derived from whatever is in `dist/`; verification checks only what was uploaded | `tangent-windows-x86_64.zip` (and legacy `ivory-*.zip`) will 404; add a required-alias manifest to publish-github.sh, or retire the zip links first |
 | Linux tarball containing `install.sh` + `tangent-ffmpeg` as the email promises | Native/remote path (the recommended one) ships neither; the injection script (`build-installer.sh linux`) always fails on retired-VST3 assertions | Fix staging + assertions; extend release.sh's tarball checks |
 | `SHA256SUMS` a buyer can actually run `shasum -c` against | Version-scoped filenames only; alias-named downloads unverifiable; no sums generated for the current dist at all | Emit alias-named lines; run `release.sh --sums-only` after ALL artifacts (incl. pkg) exist |
-| Truthful purchase-moment copy (installer UI, receipt email, store page) | Still advertises the retired VST3 "either or both" on all three surfaces | Reword before redeploying ivory-fulfil for 5.0 |
+| Truthful purchase-moment copy (installer UI, receipt email, store page) | Still advertises the retired VST3 "either or both" on all three surfaces | Reword before redeploying tangent-fulfil for 5.0 |
 | Safe upgrade for existing users; safe uninstall | Settings migration v0..19 solid; uninstaller preserves settings; Windows upgrade over a running app fails ugly; downgrade-then-upgrade corrupts lpf/pad settings | Running-app check in NSI; version-stamp floor in settings.rs before 5.0 ships |
 | A checklist that produces all of the above when followed | docs/RELEASE.md predates the rename, the installers and the zip retirement | Rewrite the artifact table + procedure for the 5.0 set |
 
-Key files: `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/scripts/publish-github.sh`, `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/scripts/build-installer.sh`, `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/scripts/build-linux-native.sh`, `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/scripts/release.sh`, `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/installer/windows/tangent.nsi`, `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/ivory-ui/src/settings.rs`, `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/tools/ivory-fulfil/src/main.rs`, `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/docs/RELEASE.md`, `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory/docs/STORE-CONTENT.md`.
+Key files: `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/scripts/publish-github.sh`, `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/scripts/build-installer.sh`, `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/scripts/build-linux-native.sh`, `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/scripts/release.sh`, `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/installer/windows/tangent.nsi`, `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/tangent-ui/src/settings.rs`, `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/tools/tangent-fulfil/src/main.rs`, `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/docs/RELEASE.md`, `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent/docs/STORE-CONTENT.md`.
 
 ---

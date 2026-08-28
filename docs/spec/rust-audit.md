@@ -1,7 +1,7 @@
 # Audit: abandoned Rust rewrite of Ivory (`ivory-rust`)
 
 Audited 2026-07-28.
-Rust code: `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/ivory-rust/`
+Rust code: `/Users/ganten/Library/CloudStorage/Dropbox/Projects/Apps/tangent-rust/`
 Python original: `/Users/ganten/Library/CloudStorage/Dropbox/Archive/Ivory/` (PySide6, `ivory.py` 2035 lines, `chord_detector.py` 2153 lines)
 
 Repo state: single git commit ("Initial commit: Ivory Rust rewrite"), clean tree, remote `dropbox`.
@@ -12,7 +12,7 @@ Repo state: single git commit ("Initial commit: Ivory Rust rewrite"), clean tree
 
 **Layout: sound.** Two-crate workspace:
 
-- `ivory-core` — pure, zero-dependency library (patterns.rs 391 lines, detector.rs 1265 lines incl. 42 unit tests). Fully testable without a GUI. This separation is the single best structural decision in the attempt and should be kept in any rewrite.
+- `tangent-core` — pure, zero-dependency library (patterns.rs 391 lines, detector.rs 1265 lines incl. 42 unit tests). Fully testable without a GUI. This separation is the single best structural decision in the attempt and should be kept in any rewrite.
 - `ivory` — binary: `main.rs` (20 lines), `app.rs` (317), `piano_widget.rs` (184), `midi.rs` (67), `settings.rs` (95).
 
 **Dependencies (Cargo.toml → locked → current on crates.io):**
@@ -22,7 +22,7 @@ Repo state: single git commit ("Initial commit: Ivory Rust rewrite"), clean tree
 | egui / eframe | 0.29 | 0.29.1 | **0.35.0** | Right library, badly stale. 6 minor versions behind with real API churn (`Frame::none()`→`Frame::NONE`, `ui.close_menu()` removed, `rect_stroke` gained `StrokeKind`, menu API rework). Upgrading is a mechanical but nontrivial port. |
 | midir | 0.9 | 0.9.1 | **0.11.0** | Right crate (CoreMIDI backend on macOS); 2 versions behind, small API surface, easy bump. |
 | serde / serde_json | 1 | — | 1 | Fine. |
-| dirs-next | 2 | — | deprecated | Dead fork; use `dirs` 6.0 (or keep hard-coded `~/.config/ivory` for Python parity — the Python app hard-codes that path too). |
+| dirs-next | 2 | — | deprecated | Dead fork; use `dirs` 6.0 (or keep hard-coded `~/.config/tangent` for Python parity — the Python app hard-codes that path too). |
 
 Edition 2021 (2024 is current). No release profile tuning, no app bundle / icon story (macOS .app packaging never addressed).
 
@@ -60,7 +60,7 @@ Verified by mechanical comparison (script over both sources):
 
 ## 3. The "failing tests" — README is stale
 
-README claims `cargo test -p ivory-core` → "33/42 pass (9 known detection bugs)".
+README claims `cargo test -p tangent-core` → "33/42 pass (9 known detection bugs)".
 
 **Actual result (run 2026-07-28, rustc stable): `42 passed; 0 failed`.**
 
@@ -74,15 +74,15 @@ Caveat: 42 tests is thin coverage for a 95-pattern engine whose behavior is defi
 
 **Reuse as-is (high value, done, verified):**
 
-- `ivory-core/src/patterns.rs` — the entire data layer: 95 chord patterns in priority order, essential/optional tables, 28 scales, mode lists. This encodes many hours of tuning against the Python. (Restore the `7` in `altered` or document its removal.)
-- `ivory-core/src/detector.rs` — the whole detection engine incl. its 42 tests. It is a *superset* of the Python's correctness. Port more Python test cases into it rather than re-porting the engine.
-- `ivory/src/midi.rs` — small, correct (velocity-0 = NoteOff, sustain CC64 threshold 64, RAII guard). Needs only: midir 0.9→0.11 bump, port *selection* (currently first-port-only), reconnect handling.
+- `tangent-core/src/patterns.rs` — the entire data layer: 95 chord patterns in priority order, essential/optional tables, 28 scales, mode lists. This encodes many hours of tuning against the Python. (Restore the `7` in `altered` or document its removal.)
+- `tangent-core/src/detector.rs` — the whole detection engine incl. its 42 tests. It is a *superset* of the Python's correctness. Port more Python test cases into it rather than re-porting the engine.
+- `tangent/src/midi.rs` — small, correct (velocity-0 = NoteOff, sustain CC64 threshold 64, RAII guard). Needs only: midir 0.9→0.11 bump, port *selection* (currently first-port-only), reconnect handling.
 - `ivory/src/piano_widget.rs` — correct 88-key geometry (A0 edge cases handled), hit-testing, aspect-ratio helper. Keep the math; the draw function needs its signature widened (see gaps).
 
 **Rewrite / discard:**
 
 - `ivory/src/app.rs` — keep as a reference skeleton only. It has two real rendering bugs (below), an unconditional-repaint busy loop, a no-op font setup (`FontDefinitions::default()` then `set_fonts` — comment claims it installs Unicode-capable fonts; it installs nothing), and it targets egui 0.29 APIs that no longer exist (`Frame::none`, `close_menu`).
-- `ivory/src/settings.rs` — rewrite. It reads/writes the **same file as the Python app** (`~/.config/ivory/settings.json`) but with an incompatible color encoding (`{r,g,b}` object vs Python's `"#rrggbb"` string): loading a Python-written file fails silently → defaults → Save clobbers the user's Python settings. Either serialize colors as hex strings for round-trip compatibility or use a different path. Also `chord_window_detached` key is missing, and four of its fields (window_size_percent, borderless_mode, detached_chord_height) are loaded but wired to nothing.
+- `ivory/src/settings.rs` — rewrite. It reads/writes the **same file as the Python app** (`~/.config/tangent/settings.json`) but with an incompatible color encoding (`{r,g,b}` object vs Python's `"#rrggbb"` string): loading a Python-written file fails silently → defaults → Save clobbers the user's Python settings. Either serialize colors as hex strings for round-trip compatibility or use a different path. Also `chord_window_detached` key is missing, and four of its fields (window_size_percent, borderless_mode, detached_chord_height) are loaded but wired to nothing.
 - `main.rs`, workspace Cargo.tomls — trivial, recreate.
 
 **Known bugs in the GUI crate (found in this audit):**
@@ -118,11 +118,11 @@ Python `ivory.py` features absent from the Rust GUI:
 
 ## 6. Verdict
 
-**Reuse-as-base for `ivory-core`; fresh-start the GUI crate with the old one open as a reference.**
+**Reuse-as-base for `tangent-core`; fresh-start the GUI crate with the old one open as a reference.**
 
 Reasoning:
 
-- `ivory-core` is finished, verified work: byte-for-byte-faithful data tables, a scoring engine that matches the Python's numerology exactly where it matters and deliberately improves it where the Python was wrong, and a green 42-test suite documenting intended behavior. Re-porting this from the 2153-line Python again would be pure waste and would likely re-introduce the bugs the Rust already fixed. Carry the crate forward unchanged (fix/document the `altered` pattern diff, rename lint-offending tests, port more Python test cases).
+- `tangent-core` is finished, verified work: byte-for-byte-faithful data tables, a scoring engine that matches the Python's numerology exactly where it matters and deliberately improves it where the Python was wrong, and a green 42-test suite documenting intended behavior. Re-porting this from the 2153-line Python again would be pure waste and would likely re-introduce the bugs the Rust already fixed. Carry the crate forward unchanged (fix/document the `altered` pattern diff, rename lint-offending tests, port more Python test cases).
 - The GUI crate is ~25% of the Python app's surface, pinned to a dead egui API (0.29 vs 0.35), with two real rendering bugs, a settings file that corrupts the Python app's config, a busy-loop repaint, and none of the windowing features that define the app (detached chord window, MIDI selection, color pickers, borderless). Upgrading egui 0.29→0.35 already forces touching most lines of `app.rs`; combined with the missing feature list, starting `app.rs`/`settings.rs` clean on current eframe (multi-viewport for the chord window) is less work than incrementally patching. Keep `midi.rs` and the `piano_widget.rs` geometry/hit-test math — both are small, correct, and toolkit-agnostic in spirit.
 - Update the README first thing: the "33/42, 9 known bugs" claim is false for the committed code and will mislead any future reader (it misled this audit's premise).
 

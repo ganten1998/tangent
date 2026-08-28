@@ -158,7 +158,7 @@ What you do get:
 That is the honest list. You are buying the thing being made, not a thing you
 receive.
 
-**Download:** <https://github.com/ganten1998/ivory/releases/latest>
+**Download:** <https://github.com/ganten1998/tangent/releases/latest>
 
 ---
 
@@ -182,7 +182,7 @@ receive.
 > paid, this is where it will arrive.
 >
 > The app itself is always at
-> <https://github.com/ganten1998/ivory/releases/latest>.
+> <https://github.com/ganten1998/tangent/releases/latest>.
 >
 > Ganten
 

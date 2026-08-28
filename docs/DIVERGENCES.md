@@ -12,14 +12,14 @@ mismatch is classified once — scripted heuristics plus hand audit — and
 committed as `tests/golden/classified-divergences.json` mapping note-set →
 D-rule ID (covering both naming preferences). **What actually enforces this
 today** (corrected 2026-08-11 — there is no CI yet; see `docs/RELEASE.md` § CI):
-`ivory-core/tests/differential.rs` pins the engine to
+`tangent-core/tests/differential.rs` pins the engine to
 `tests/golden/rust-golden.json`, the frozen post-audit baseline, so any
 behavior change turns it red and forces a deliberate regeneration.
 `classified-divergences.json` is a point-in-time audit artifact, **not** an
 assertion — no test reads it, and it is re-derived by hand with
 `tests/golden/classify.py`. It was last generated **2026-07-29 (5,057 rows)**
 and is stale: after D22–D26 the live mismatch is **5,540 rows** (`cargo run -p
-ivory-core --example diffcorpus --release`). Re-run `classify.py` before
+tangent-core --example diffcorpus --release`). Re-run `classify.py` before
 trusting any per-rule breakdown.
 
 This policy was adversarially reviewed by a three-lens critic panel
@@ -246,7 +246,7 @@ renderings of every affected row.
   that exist right now; the dialog prints `Current: <port name>` taken from the
   live `MidiConnection` — the name it was opened with, never a status — and
   pre-selects nothing. If the port dies, events simply stop arriving
-  (`ivory/src/midi.rs`: "No reconnect logic (parity): if the port dies, events
+  (`tangent/src/midi.rs`: "No reconnect logic (parity): if the port dies, events
   just stop") and the app keeps drawing its last state until the user re-picks.
   Picking a port drops the old connection before opening the new one, and a
   failed open raises the `MIDI Error` dialog.
@@ -276,7 +276,7 @@ renderings of every affected row.
   partial nudge. Learning state stays in overrides.json (never
   settings.json). The `learning` cargo feature is now always enabled by the
   `ivory` GUI crate, so every packaged binary ships the option; the engine
-  crate keeps the feature gate so `cargo test -p ivory-core` still
+  crate keeps the feature gate so `cargo test -p tangent-core` still
   exercises the stock path.
 - **D-UI-6**: About dialog shows "Version &lt;crate version&gt;" (read from
   `CARGO_PKG_VERSION` since 2.1.0 — it was hardcoded "2.0.0") and adds one 8pt
@@ -383,7 +383,7 @@ it is scoped so that everything above it is untouched.
   window that visibly jumps on the first frame.
 - **The view is dumb.** Every choice (which of a pitch's five positions, what is
   a barre, what folded an octave, what could not fit) belongs to
-  `ivory_core::voicing`; `fretboard_panel.rs` only draws the answer. The app
+  `tangent_core::voicing`; `fretboard_panel.rs` only draws the answer. The app
   owns exactly one `VoicingSession`, so no two surfaces can disagree about the
   shape, and it is re-solved on the same 100ms gate as chord detection rather
   than per frame.

@@ -248,7 +248,7 @@ QMenu::separator { height: 1px; background-color: <sep>; margin: 1px 0px 1px 0px
 
 ## 8. Settings persistence
 
-- File: **`~/.config/ivory/settings.json`** (all platforms — literally `Path.home()/".config"/"ivory"/"settings.json"`; parent dirs created on save). JSON, `indent=2`. Read once at startup; **any** parse/read error ⇒ all defaults. Written after every mutation (each toggle, color pick, size change, detach/attach, reset). Write errors silently ignored.
+- File: **`~/.config/tangent/settings.json`** (all platforms — literally `Path.home()/".config"/"ivory"/"settings.json"`; parent dirs created on save). JSON, `indent=2`. Read once at startup; **any** parse/read error ⇒ all defaults. Written after every mutation (each toggle, color pick, size change, detach/attach, reset). Write errors silently ignored.
 - Keys (exact names), types, defaults:
 
 | key | type | default |

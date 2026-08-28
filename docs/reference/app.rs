@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use eframe::egui;
 use egui::{Color32, FontId, RichText, Vec2};
-use ivory_core::ChordDetector;
+use tangent_core::ChordDetector;
 
 use crate::midi::{MidiEvent, MidiThread};
 use crate::piano_widget;

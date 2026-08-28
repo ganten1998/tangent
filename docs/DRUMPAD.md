@@ -43,15 +43,15 @@ and it is draggable by its title strip.
 
 | Piece | File | Notes |
 |---|---|---|
-| Panel painter | `ivory-ui/src/drumpad_panel.rs` | pure painter + `Layout`/`targets`-style `hit_test`, geometry tests |
-| Kit document | `ivory-ui/src/drumpad.rs` | `drumpad.json` sidecar, write-then-rename, lenient load, tests |
-| Shared contract | `ivory-ui/src/recorder.rs` | `DRUM_PADS`, `DRUM_PAD_BASE`, `DRUM_PAD_VELOCITY`, `DrumPadParams`, `DrumKitParams`, `RecorderRequest::PadHit` |
-| Host→UI status | `ivory-ui/src/ports.rs` | `PadStatus { loaded, missing, wave }` |
-| App wiring | `ivory-ui/src/app.rs` | state fields by `midi_edit`'s; the method cluster sits just above `close_midi_editor`; draw call after `draw_setup`; `drumpad_input` runs before `midi_editor_input` |
-| Key | `ivory-ui/src/keys.rs` | `W` → `ToggleDrumpad`, gated on `recorder_shown`, clustered with Enter/Space at the table's end |
-| Engine | `ivory/src/instrument.rs` | `PadKit` (clips' swap protocol exactly), `PadVoice`/`PadPlay`, channel-10 branch in `collect_notes`, `mix_pads` between `mix_monitor` and the click, `Shared` pad atomics, `Engine::{set_pad_kit, set_pad_params, pad_peaks}`; render tests at the bottom |
-| Host | `ivory/src/desktop.rs` | `reload_pads` (+ its own `pad_cache` — `track_cache` evicts by what the ARRANGEMENT references), `PadHit` arm by `Audition`'s, params push in `push_monitor_settings`, peaks read in `after_frame`, the live mirror in the `pump_midi` closure |
-| Screenshot | `ivory/src/composite.rs` | `shot::drumpad` — `IVORY_SHOT=/tmp/dp.png cargo test -p ivory --bins shot::drumpad -- --ignored --nocapture` |
+| Panel painter | `tangent-ui/src/drumpad_panel.rs` | pure painter + `Layout`/`targets`-style `hit_test`, geometry tests |
+| Kit document | `tangent-ui/src/drumpad.rs` | `drumpad.json` sidecar, write-then-rename, lenient load, tests |
+| Shared contract | `tangent-ui/src/recorder.rs` | `DRUM_PADS`, `DRUM_PAD_BASE`, `DRUM_PAD_VELOCITY`, `DrumPadParams`, `DrumKitParams`, `RecorderRequest::PadHit` |
+| Host→UI status | `tangent-ui/src/ports.rs` | `PadStatus { loaded, missing, wave }` |
+| App wiring | `tangent-ui/src/app.rs` | state fields by `midi_edit`'s; the method cluster sits just above `close_midi_editor`; draw call after `draw_setup`; `drumpad_input` runs before `midi_editor_input` |
+| Key | `tangent-ui/src/keys.rs` | `W` → `ToggleDrumpad`, gated on `recorder_shown`, clustered with Enter/Space at the table's end |
+| Engine | `tangent/src/instrument.rs` | `PadKit` (clips' swap protocol exactly), `PadVoice`/`PadPlay`, channel-10 branch in `collect_notes`, `mix_pads` between `mix_monitor` and the click, `Shared` pad atomics, `Engine::{set_pad_kit, set_pad_params, pad_peaks}`; render tests at the bottom |
+| Host | `tangent/src/desktop.rs` | `reload_pads` (+ its own `pad_cache` — `track_cache` evicts by what the ARRANGEMENT references), `PadHit` arm by `Audition`'s, params push in `push_monitor_settings`, peaks read in `after_frame`, the live mirror in the `pump_midi` closure |
+| Screenshot | `tangent/src/composite.rs` | `shot::drumpad` — `IVORY_SHOT=/tmp/dp.png cargo test -p tangent --bins shot::drumpad -- --ignored --nocapture` |
 
 The seams follow the house pattern end to end: the UI marks
 `drumpad_dirty`, the host drains `take_drumpad_dirty` and re-decodes;

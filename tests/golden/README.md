@@ -1,6 +1,6 @@
 # tests/golden — differential harness against the Python engine
 
-Ivory 2.0 (the Rust `ivory-core` engine) is validated against the *shipped*
+Ivory 2.0 (the Rust `tangent-core` engine) is validated against the *shipped*
 Python `ChordDetector` by diffing both over a large corpus of note-sets and
 classifying every divergence to a documented rule in
 [`docs/DIVERGENCES.md`](../../docs/DIVERGENCES.md). This directory holds the
@@ -18,7 +18,7 @@ corpus, the frozen engine baseline, the classification, and the audit.
 | `UNEXPLAINED.md` | hand-audit of the 365 rows no heuristic ties to a rule: family verdicts, the 28-row regression-concern shortlist, and a cross-rule "rust-correct / Python-buggy" confirmation table. |
 
 The engine-side self-consistency guard lives in
-[`ivory-core/tests/differential.rs`](../../ivory-core/tests/differential.rs).
+[`tangent-core/tests/differential.rs`](../../tangent-core/tests/differential.rs).
 
 ## Divergence summary
 
@@ -26,7 +26,7 @@ The engine-side self-consistency guard lives in
 > (1) The table below sums to 5,195, but the `classified-divergences.json`
 > committed beside it holds **5,057** records — the JSON came from a later
 > `classify.py` run than the table. (2) The live mismatch after D22–D26 is
-> **5,540 of 13,133** (verified 2026-08-11 with `cargo run -p ivory-core
+> **5,540 of 13,133** (verified 2026-08-11 with `cargo run -p tangent-core
 > --example diffcorpus --release`), and D22–D26 have no rows here at all,
 > because `classify.py` has not been re-run since 2026-07-29. Re-run it
 > (step 3 under Regenerate) before citing any of this.
@@ -78,16 +78,16 @@ mislabel a clean, complete, common chord Python got right.
 python3 tests/golden/gen_corpus.py tests/golden/corpus.json
 
 # 2. Rust baseline + live mismatch counts
-cargo run -p ivory-core --example diffcorpus --release -- \
+cargo run -p tangent-core --example diffcorpus --release -- \
     --json tests/golden/rust-golden.json
-cargo run -p ivory-core --example diffcorpus --release -- --dump   # list mismatches
+cargo run -p tangent-core --example diffcorpus --release -- --dump   # list mismatches
 
 # 3. Re-classify
 python3 tests/golden/classify.py
 
 # 4. Self-consistency guard
-cargo test -p ivory-core --test differential                 # fast subset (default)
-cargo test -p ivory-core --test differential -- --ignored    # full 13,133-row sweep
+cargo test -p tangent-core --test differential                 # fast subset (default)
+cargo test -p tangent-core --test differential -- --ignored    # full 13,133-row sweep
 ```
 
 ## Audit method

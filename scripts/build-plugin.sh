@@ -119,7 +119,7 @@ build_macos() {
   # an ad-hoc signature is enough for the machine that built it, which is what
   # matters for a local test. Distribution needs the Developer ID.
   local sign_id
-  sign_id="${IVORY_SIGN_ID:-$(security find-identity -v -p codesigning 2>/dev/null \
+  sign_id="${TANGENT_SIGN_ID:-$(security find-identity -v -p codesigning 2>/dev/null \
     | grep 'Developer ID Application' | head -1 | sed -E 's/.*"(.*)"/\1/')}"
   if [ -n "$sign_id" ]; then
     echo "    signing as: $sign_id"

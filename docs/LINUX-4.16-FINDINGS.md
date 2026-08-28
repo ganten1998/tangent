@@ -32,7 +32,7 @@ containing `[preferred]` / `default=gtk` (XFCE needs it). zenity is no longer a
 light fallback — on current Void it drags in GTK4 + libadwaita + **webkitgtk**.
 
 The real hardening fix is app-side, and the pattern already exists:
-`PluginPicker` in `ivory-ui/src/dialogs.rs` is documented as "a directory
+`PluginPicker` in `tangent-ui/src/dialogs.rs` is documented as "a directory
 listing and nothing more." Add an in-app egui file browser as the fallback,
 probe availability up front (does `org.freedesktop.portal.Desktop` have a bus
 owner — zbus is already in the dep tree via rfd — or is zenity on PATH), and

@@ -2,7 +2,7 @@
 #
 # The empty `[workspace]` table below is the whole point of this file. It makes
 # this crate its own workspace with its own Cargo.lock, exactly like
-# tools/ivory-keygen, and that is a structural guarantee rather than tidiness:
+# tools/tangent-keygen, and that is a structural guarantee rather than tidiness:
 #
 #   * `cargo build` from the repo root cannot reach it,
 #   * nih_plug, vst3-sys and baseview never enter the root Cargo.lock, and
@@ -16,8 +16,8 @@
 
 [package]
 # GPL-3.0-or-later, and ONLY this crate is. The VST3 bindings reached through
-# `nih_export_vst3!` are GPLv3, so the .vst3 binary inherits it; ivory-core,
-# ivory-ui and the standalone stay MIT. See LICENSING.md.
+# `nih_export_vst3!` are GPLv3, so the .vst3 binary inherits it; tangent-core,
+# tangent-ui and the standalone stay MIT. See LICENSING.md.
 name = "tangent-vst3"
 version = "3.10.0"
 edition = "2021"
@@ -34,8 +34,8 @@ crate-type = ["cdylib"]
 [dependencies]
 # The shared GUI and engine. Both MIT; linking them into a GPLv3 binary is
 # exactly what MIT permits, and the arrow only points this way.
-ivory-core = { path = "../ivory-core", features = ["learning", "license"] }
-ivory-ui = { path = "../ivory-ui" }
+tangent-core = { path = "../tangent-core", features = ["learning", "license"] }
+tangent-ui = { path = "../tangent-ui" }
 egui = { version = "0.33", default-features = false }
 
 # ── the dependency recipe, settled by compiling it ─────────────────────────

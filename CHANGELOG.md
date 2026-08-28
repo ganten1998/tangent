@@ -314,7 +314,7 @@ take is now simply the window it was played in.
   sounds, which is what the display does with a held note.
 - The binary is now `tangent`; artifacts are `Tangent-<version>-macos-*`,
   `tangent-<version>-windows-*` and `tangent-<version>-linux-*`.
-- Nothing you have is affected. `~/.config/ivory/` keeps your settings and
+- Nothing you have is affected. `~/.config/tangent/` keeps your settings and
   taught chords, existing supporter keys keep working, and downloads published
   under the old `Ivory-*` names keep resolving.
 
@@ -433,7 +433,7 @@ Python runtime, no Qt, a single self-contained executable per platform.
 
 - **Teach Chord Name…** — pin your own name to an exact voicing, optionally in
   all keys. Taught names are consulted before detection and stored in
-  `~/.config/ivory/overrides.json`, separate from your settings.
+  `~/.config/tangent/overrides.json`, separate from your settings.
 - **Manage Taught Chords…** — review and delete taught names.
 - **Reset Settings to Default** in the context menu.
 - `custom_font_path` — an optional settings key pointing at any TTF/OTF on your
@@ -473,10 +473,10 @@ Python runtime, no Qt, a single self-contained executable per platform.
 - Courier New is never bundled or redistributed. Courier Prime replaces it.
 
 > **One-way caveat when downgrading.** Ivory 2.x reads Python 1.1.0's
-> `~/.config/ivory/settings.json` in place, so upgrading is seamless. Going back
+> `~/.config/tangent/settings.json` in place, so upgrading is seamless. Going back
 > to Python 1.1.0 is not: it rewrites that file with its own fixed set of 13
 > keys, discarding `custom_font_path` and any other key it does not recognize.
-> Taught chord names live in a separate file, `~/.config/ivory/overrides.json`,
+> Taught chord names live in a separate file, `~/.config/tangent/overrides.json`,
 > which the Python app never touches.
 
 ## [1.1.0] - 2025-12-31
@@ -512,7 +512,7 @@ First tagged release, ported from the original GTK3 prototype to Qt.
 - MIDI device selection, and a flats/sharps preference.
 - Window size presets (50%, 75%, 100%, 125%, 150%, 175%, 200%) and borderless
   mode with drag support.
-- Settings persistence at `~/.config/ivory/settings.json`.
+- Settings persistence at `~/.config/tangent/settings.json`.
 - Cross-platform builds for Linux, Windows and macOS.
 
 ### Changed

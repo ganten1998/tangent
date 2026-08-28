@@ -6,7 +6,7 @@ is written down once, precisely, rather than reconstructed from memory later.
 | Artifact | Licence | Why |
 |---|---|---|
 | `Tangent.app` / `tangent` / `tangent.exe` (standalone) | **MIT** | Links nothing copyleft. |
-| `ivory-core`, `ivory` and every other crate in this repo | **MIT** | Source, not binaries. |
+| `tangent-core`, `ivory` and every other crate in this repo | **MIT** | Source, not binaries. |
 | `Tangent.vst3` (the plugin) | **GPL-3.0-or-later** | Links NIH-plug's VST3 bindings. |
 
 ## Why the plugin is GPLv3 and the app is not

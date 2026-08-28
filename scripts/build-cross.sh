@@ -2,7 +2,7 @@
 # Cross-build Tangent release artifacts for Linux and Windows from a macOS host.
 #
 #   scripts/build-cross.sh        # builds + packages everything into dist/
-#   scripts/build-cross.sh ico    # regenerate assets/ivory.ico only (dry-test hook)
+#   scripts/build-cross.sh ico    # regenerate assets/tangent.ico only (dry-test hook)
 #   scripts/build-cross.sh check-linux   # TYPE-CHECK the Linux target from macOS
 #
 # Requirements (all via Homebrew/cargo):
@@ -19,7 +19,7 @@ cd "$ROOT"
 
 VERSION="$(grep '^version' Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
 GLIBC="2.32"   # floor for released Linux binaries
-ICON_SRC="assets/ivory.png"
+ICON_SRC="assets/tangent.png"
 
 TOOLCHAIN_BIN="$(rustup which cargo 2>/dev/null | xargs dirname || true)"
 [ -n "$TOOLCHAIN_BIN" ] && export PATH="$TOOLCHAIN_BIN:$HOME/.cargo/bin:$PATH"
@@ -61,7 +61,7 @@ PC
   # there is no ALSA and the stub .pc above does not apply. The Linux-only
   # tests are checked on the Linux box instead.
   #
-  # **`--no-default-features --features ivory/recorder`, exactly as
+  # **`--no-default-features --features tangent/recorder`, exactly as
   # `package_linux` builds.** Without it the default `mp3` feature drags
   # `mp3lame-encoder` into a CROSS build, and LAME's autoconf decides its
   # toolchain by compiling and RUNNING test programs — which a macOS host
@@ -78,7 +78,7 @@ PC
   PKG_CONFIG_ALLOW_CROSS=1 \
   PKG_CONFIG_PATH="$pcdir" \
   PKG_CONFIG_SYSROOT_DIR=/ \
-    cargo check --workspace --no-default-features --features ivory/recorder \
+    cargo check --workspace --no-default-features --features tangent/recorder \
       --target "$target"
   local rc=$?
   rm -rf "$pcdir"
@@ -90,12 +90,12 @@ if [ "${1:-}" = "check-linux" ]; then
   exit $?
 fi
 
-# gen_ico — produce assets/ivory.ico from assets/ivory.png so ivory/build.rs
-# (winres) can embed it in ivory.exe. ImageMagick when available (BMP frames
+# gen_ico — produce assets/tangent.ico from assets/tangent.png so tangent/build.rs
+# (winres) can embed it in tangent.exe. ImageMagick when available (BMP frames
 # for small sizes = maximum shell compatibility), else sips + a hand-packed
 # ICO of PNG frames (valid on Windows Vista+).
 gen_ico() {
-  local out="assets/ivory.ico" tmp px
+  local out="assets/tangent.ico" tmp px
   if [ "$(stat -f%z "$ICON_SRC")" -lt 4096 ]; then
     echo "NOTE: $ICON_SRC is the original 128x128 piano-keys icon (identical to"
     echo "      the Python app's). Frames above 128px are upscaled and look"
@@ -146,7 +146,7 @@ mkdir -p dist
 # Windows icon must exist BEFORE cargo builds so build.rs embeds it.
 gen_ico
 
-# sign_windows_exe <path/to/ivory.exe> — Authenticode-sign via Azure Artifact
+# sign_windows_exe <path/to/tangent.exe> — Authenticode-sign via Azure Artifact
 # Signing (formerly Trusted Signing) using jsign, which unlike Microsoft's
 # signtool runs on macOS/Linux. No certificate ever touches this machine: jsign
 # sends the file hash to Azure, Microsoft's HSM signs it and returns the
@@ -300,7 +300,7 @@ package_linux() { # $1 = rust target, $2 = artifact arch name
   PKG_CONFIG_SYSROOT_DIR="$sysroot" \
   PKG_CONFIG_PATH="$sysroot/usr/lib/$multiarch/pkgconfig" \
   RUSTFLAGS="-L $sysroot/usr/lib/$multiarch" \
-    cargo zigbuild --release --target "${target}.${GLIBC}" -p ivory \
+    cargo zigbuild --release --target "${target}.${GLIBC}" -p tangent \
       --no-default-features --features recorder || return 1
   if [ ! -f "target/${target}/release/tangent" ]; then
     echo "!! no binary at target/${target}/release/tangent"
@@ -308,8 +308,8 @@ package_linux() { # $1 = rust target, $2 = artifact arch name
   fi
   mkdir -p "$stage/fonts" || return 1
   cp "target/${target}/release/tangent" "$stage/" || { rm -rf "$stage"; return 1; }
-  cp assets/ivory.desktop "$stage/tangent.desktop" || { rm -rf "$stage"; return 1; }
-  cp assets/ivory.png "$stage/tangent.png" || { rm -rf "$stage"; return 1; }
+  cp assets/tangent.desktop "$stage/tangent.desktop" || { rm -rf "$stage"; return 1; }
+  cp assets/tangent.png "$stage/tangent.png" || { rm -rf "$stage"; return 1; }
   cp assets/fonts/CourierPrime-Regular.ttf assets/fonts/CourierPrime-Bold.ttf \
      assets/fonts/OFL.txt "$stage/fonts/" || { rm -rf "$stage"; return 1; }
   # Licences for the four fonts eframe's `default_fonts` embeds in the binary.
@@ -420,7 +420,7 @@ if [ -n "$ASIO_DIR" ]; then
 else
   echo "==> ASIO SDK not found under vendor/ — Windows build is WASAPI-only"
 fi
-cargo xwin build --release --target x86_64-pc-windows-msvc -p ivory --no-default-features --features "$WIN_FEATURES"
+cargo xwin build --release --target x86_64-pc-windows-msvc -p tangent --no-default-features --features "$WIN_FEATURES"
 WINSTAGE="dist/tangent-${VERSION}-windows-x86_64"
 WINZIP="${WINSTAGE}.zip"
 rm -rf "$WINSTAGE" "$WINZIP"
@@ -433,7 +433,7 @@ if [ -n "${CPAL_ASIO_DIR:-}" ]; then
 fi
 cp LICENSE THIRD-PARTY-LICENSES "$WINSTAGE/"
 cp assets/fonts/OFL.txt "$WINSTAGE/"
-# Licences for the four fonts eframe's `default_fonts` embeds in ivory.exe.
+# Licences for the four fonts eframe's `default_fonts` embeds in tangent.exe.
 mkdir -p "$WINSTAGE/font-licenses"
 cp assets/font-licenses/*.txt "$WINSTAGE/font-licenses/"
 # The bundled encoder, so video needs nothing installed — the app looks for

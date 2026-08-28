@@ -118,7 +118,7 @@ channels play back their clips and nothing else. "Ready to play" and
 
 ## The machinery underneath (implementation shape)
 
-- **Doc** (`ivory-ui/src/arrangement.rs`, already stubbed: versioned,
+- **Doc** (`tangent-ui/src/arrangement.rs`, already stubbed: versioned,
   atomic save, `IVORY_ARRANGEMENT_PATH`): clips carry
   `(lane, start_s, len_s, source, source_offset_s, fade_in_s, fade_out_s,
   name, id)`. Lanes are plain indices — variable count later stays cheap.
@@ -130,7 +130,7 @@ channels play back their clips and nothing else. "Ready to play" and
   track did.
 - **Recording path**: armed channels tee into clip writers during
   arrangement record; files finalised and doc updated on stop.
-- **View** (`ivory-ui/src/arrangement_panel.rs`, new): pure painter +
+- **View** (`tangent-ui/src/arrangement_panel.rs`, new): pure painter +
   `Layout::targets`/`hit_test` single-source-of-truth, exactly like every
   other panel; the firewall stays intact (file drops arrive as PATHS via
   a port; decode is the host's).
@@ -216,7 +216,7 @@ channels play back their clips and nothing else. "Ready to play" and
     REAPER-style LCD cluster from the owner's screenshot — big
     bars|beats|thousandths playhead, min:sec under it, Start/End/Length of
     the selected clip beside it, all in tape-green on black.
-  - **THE MIDI EDITOR, v1** (`ivory-ui/src/midi_editor.rs`): double-click
+  - **THE MIDI EDITOR, v1** (`tangent-ui/src/midi_editor.rs`): double-click
     a MIDI item opens a piano-roll popup over the arrangement (a rim of
     lanes stays visible; a press outside, Esc or the × closes it, saving).
     Notes: click/drag draws (one grid step, snapped, vel 100), body-drag
@@ -452,7 +452,7 @@ channels play back their clips and nothing else. "Ready to play" and
   hold — MIDI never lands on an audio channel, audio never on a MIDI
   one, an unused lane takes either), and `.mid`/`.midi`/`.smf` files
   DROP IN from the outside world as MIDI clips — a hand-rolled SMF
-  reader in `ivory-ui/src/smf_read.rs` (format 0/1, running status,
+  reader in `tangent-ui/src/smf_read.rs` (format 0/1, running status,
   tempo map, metrical division only; the firewall keeps `midly` out),
   notes inline in the document, nothing copied to `media/`. Audio
   drops keep their existing road.

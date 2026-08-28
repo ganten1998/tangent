@@ -60,7 +60,7 @@ VIAddVersionKey "FileVersion" "${VERSION}"
 VIAddVersionKey "LegalCopyright" "MIT"
 
 ; **The installer and uninstaller wear the app's own logo**, not NSIS's
-; default. The caller passes the icon (`-DICON=…/assets/ivory.ico`); the
+; default. The caller passes the icon (`-DICON=…/assets/tangent.ico`); the
 ; same `ivory.ico` build.rs embeds into `tangent.exe`, so the setup, the app
 ; and the Add/Remove entry are one mark. Falls back to the app icon staged
 ; beside the binary if the caller says nothing.

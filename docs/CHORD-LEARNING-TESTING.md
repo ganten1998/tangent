@@ -80,7 +80,7 @@ all 13,133 exactly in testing.
   many corrections you have made, and what it has picked up. **Forget Learning**
   wipes all of it and restores stock behaviour.
 - Right-click → **Disable Chord Learning** silences it without erasing anything.
-- Nothing is sent anywhere. Everything lives in `~/.config/ivory/overrides.json`
+- Nothing is sent anywhere. Everything lives in `~/.config/tangent/overrides.json`
   (on Windows: `C:\Users\<you>\.config\ivory\overrides.json`). Deleting that file
   is a full reset.
 

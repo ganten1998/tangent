@@ -1800,90 +1800,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
-name = "ivory"
-version = "5.0.0-beta.9"
-dependencies = [
- "core-graphics",
- "cpal",
- "dirs",
- "eframe",
- "egui",
- "egui-wgpu",
- "fd-lock",
- "ivory-core",
- "ivory-host",
- "ivory-record",
- "ivory-ui",
- "libc",
- "log",
- "midir",
- "mp3lame-encoder",
- "rfd",
- "rtrb",
- "serde",
- "serde_json",
- "ttf-parser",
- "wgpu",
- "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "ivory-core"
-version = "5.0.0-beta.9"
-dependencies = [
- "dirs",
- "ed25519-compact",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "ivory-host"
-version = "5.0.0-beta.9"
-dependencies = [
- "ivory-record",
- "libc",
- "objc2 0.6.4",
- "objc2-app-kit 0.3.2",
- "objc2-foundation 0.3.2",
- "vst3",
- "windows-sys 0.60.2",
- "x11rb",
-]
-
-[[package]]
-name = "ivory-record"
-version = "5.0.0-beta.9"
-dependencies = [
- "cpal",
- "dispatch2",
- "linuxvideo",
- "midly",
- "objc2 0.6.4",
- "objc2-av-foundation",
- "objc2-core-audio-types",
- "objc2-core-media",
- "objc2-core-video",
- "objc2-foundation 0.3.2",
- "rtrb",
- "serde_json",
- "zune-jpeg",
-]
-
-[[package]]
-name = "ivory-ui"
-version = "5.0.0-beta.9"
-dependencies = [
- "dirs",
- "egui",
- "ivory-core",
- "log",
- "serde",
- "serde_json",
- "ttf-parser",
-]
-
-[[package]]
 name = "java-locator"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3469,6 +3385,90 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "tangent"
+version = "5.0.0-beta.9"
+dependencies = [
+ "core-graphics",
+ "cpal",
+ "dirs",
+ "eframe",
+ "egui",
+ "egui-wgpu",
+ "fd-lock",
+ "libc",
+ "log",
+ "midir",
+ "mp3lame-encoder",
+ "rfd",
+ "rtrb",
+ "serde",
+ "serde_json",
+ "tangent-core",
+ "tangent-host",
+ "tangent-record",
+ "tangent-ui",
+ "ttf-parser",
+ "wgpu",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "tangent-core"
+version = "5.0.0-beta.9"
+dependencies = [
+ "dirs",
+ "ed25519-compact",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "tangent-host"
+version = "5.0.0-beta.9"
+dependencies = [
+ "libc",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
+ "tangent-record",
+ "vst3",
+ "windows-sys 0.60.2",
+ "x11rb",
+]
+
+[[package]]
+name = "tangent-record"
+version = "5.0.0-beta.9"
+dependencies = [
+ "cpal",
+ "dispatch2",
+ "linuxvideo",
+ "midly",
+ "objc2 0.6.4",
+ "objc2-av-foundation",
+ "objc2-core-audio-types",
+ "objc2-core-media",
+ "objc2-core-video",
+ "objc2-foundation 0.3.2",
+ "rtrb",
+ "serde_json",
+ "zune-jpeg",
+]
+
+[[package]]
+name = "tangent-ui"
+version = "5.0.0-beta.9"
+dependencies = [
+ "dirs",
+ "egui",
+ "log",
+ "serde",
+ "serde_json",
+ "tangent-core",
+ "ttf-parser",
 ]
 
 [[package]]

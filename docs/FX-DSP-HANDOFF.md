@@ -1,7 +1,7 @@
 # The plate, the tape echo and the pedals: what is done, and what is owed
 
-Branch `fx-dsp`, off `5e3796d`. Two files changed, `ivory/src/effects.rs` and
-`ivory-ui/src/dialogs.rs`, chosen because they were the only two clean in the
+Branch `fx-dsp`, off `5e3796d`. Two files changed, `tangent/src/effects.rs` and
+`tangent-ui/src/dialogs.rs`, chosen because they were the only two clean in the
 other session's tree. Five commits, +2053/−364.
 
 **Workspace green: 23 suites, 1455 tests, 0 failures. `effects.rs` and the code
@@ -83,7 +83,7 @@ In the `values` table, beside the other `d.*` rows:
 In `choices`, beside the `delay_division` entry:
 
 ```rust
-ivory_ui::ports::ChoiceParam {
+tangent_ui::ports::ChoiceParam {
     key: "echo_mode".to_owned(),
     options: EchoMode::ALL
         .into_iter()
@@ -201,14 +201,14 @@ Both sites are the identical two lines:
 
 ```rust
 let engine_want = want.as_deref().filter(|p| {
-    *p != ivory_ui::dialogs::BUILTIN_PATH && *p != ivory_ui::dialogs::DRUMPAD_PATH
+    *p != tangent_ui::dialogs::BUILTIN_PATH && *p != tangent_ui::dialogs::DRUMPAD_PATH
 });
 ```
 
 and both want to become:
 
 ```rust
-let engine_want = want.as_deref().filter(|p| !ivory_ui::dialogs::is_builtin(p));
+let engine_want = want.as_deref().filter(|p| !tangent_ui::dialogs::is_builtin(p));
 ```
 
 | Function | Where in it | Why it matters |
