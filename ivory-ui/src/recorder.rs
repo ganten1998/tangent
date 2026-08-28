@@ -85,6 +85,21 @@ pub struct Level {
     pub rms: f32,
     /// Slow-falling peak hold, linear. Drawn as a line, not a fill.
     pub hold: f32,
+    /// **What the NEEDLE shows**: the level with a VU's own ballistics on it.
+    ///
+    /// Its own field because `rms` cannot do this job. The window `rms` is
+    /// measured over is whatever arrived between two repaints — it is reset by
+    /// every publish — so its integration time is the frame interval, sixteen
+    /// milliseconds on a good day and whatever the machine felt like on a bad
+    /// one. A needle driven straight off that follows the waveform instead of
+    /// the level, which is the flailing the owner reported, and it flails
+    /// differently depending on how busy the app is.
+    ///
+    /// Filled by the app, which is the only layer that knows how much real
+    /// time passed. Zero everywhere else, including in the host's conversion:
+    /// a meter with no ballistics applied should read nothing rather than
+    /// quietly show an unsmoothed number.
+    pub vu: f32,
 }
 
 /// The whole meter, plus the one bit that survives the take.
@@ -108,11 +123,13 @@ impl Meters {
             peak: 0.0,
             rms: 0.0,
             hold: 0.0,
+            vu: 0.0,
         },
         right: Level {
             peak: 0.0,
             rms: 0.0,
             hold: 0.0,
+            vu: 0.0,
         },
         mono: false,
         clipped: false,
@@ -225,6 +242,10 @@ pub struct RecorderView<'a> {
     pub gr_db: f32,
     /// The output directory, already shortened for display (`~/Movies/Tangent`).
     pub dest: &'a str,
+    /// The PROJECT folder and the EXPORT folder, shortened the same way.
+    /// Empty strings are legal and read as "the default".
+    pub project_dest: &'a str,
+    pub export_dest: &'a str,
     /// The typed take name. May be empty — the timestamp guarantees uniqueness.
     pub take_name: &'a str,
     /// The name field has keyboard focus, so it draws a caret and the app's
@@ -349,6 +370,8 @@ impl RecorderView<'_> {
             master: Meters::SILENT,
             gr_db: 0.0,
             dest: "",
+            project_dest: "",
+            export_dest: "",
             take_name: "",
             name_focused: false,
             editing: None,
@@ -493,6 +516,27 @@ impl ChannelKind {
 /// than not drawn.
 pub const CHANNELS: usize = 16;
 
+/// **Where the limiter's threshold ships**, as a knob position.
+///
+/// `limiter_mix` is 0..=1 across `effects::LIMITER_DB` = (−48, 0) dB, so
+/// 47/48 is a −1 dBFS ceiling.
+///
+/// **In circuit, not bypassed.** It shipped fully clockwise, which the
+/// engine treats as genuinely out — so nothing stood between the master and
+/// full scale. That was defensible while every effect on the desk decayed;
+/// the tape echo's Intensity reaches self-oscillation now, by design and
+/// after the hardware, and a control that can run away wants a backstop that
+/// ships on.
+///
+/// −1 dBFS rather than 0: it is the delivery ceiling every streaming service
+/// asks for, it is where a true-peak limiter is useful rather than nominal,
+/// and it takes nothing off a mix that was not already at the top.
+///
+/// **One constant, read by the settings default AND by the knob's own
+/// reset**, so a double-click cannot quietly put the guard rail back in the
+/// drawer — which is exactly what "reset to not applied" would have done.
+pub const LIMITER_SHIPS_AT: f32 = 47.0 / 48.0;
+
 /// How many effect inserts a channel has room for.
 ///
 /// **Three, on every channel, and the number never changes.** A desk where one
@@ -516,6 +560,57 @@ pub const INPUTS: usize = 4;
 
 /// How many channels the desk has, master aside.
 pub const STRIPS: usize = CHANNELS + 3;
+
+/// The master's own seat in the insert space. Seats `0..STRIPS` are the
+/// channels and the buses; this is the one after them.
+pub const MASTER_SEAT: usize = STRIPS;
+
+/// **The master's SECOND rack.**
+///
+/// A seat of its own, past the pads, holding the master's extra three bays.
+///
+/// **Why a seat and not six bays on one.** `INSERTS` is the stride of the
+/// persisted `strip_inserts` array and of the `insert-state-<seat>-<bay>.bin`
+/// sidecars; raising it to six would change the stride for every strip on
+/// the desk, need a migration for every saved session, and hand the
+/// arrangement's track headers six bays they have no room to draw. An extra
+/// seat is three more entries appended to an array that already grows by
+/// appending, one more rack in the engine, and no other file learns
+/// anything.
+pub const MASTER_EXTRA_SEAT: usize = STRIPS + 1 + DRUM_PADS;
+
+/// How many bays a strip shows. The master has two racks' worth.
+pub fn bays_on(strip: Option<Strip>) -> usize {
+    if strip.is_none() {
+        INSERTS * 2
+    } else {
+        INSERTS
+    }
+}
+
+/// **Which rack seat and which bay a strip's Nth slot really is.**
+///
+/// Everything but the master answers itself. The master's first three slots
+/// are its EXTRA rack and its last three are its original one, and that
+/// order is deliberate: the new bays were added above the old ones on the
+/// strip, a rack runs top to bottom, and a session that already had plugins
+/// in the master must keep hearing them in the same place in the chain.
+///
+/// One function, because the alternative is every call site remembering the
+/// rule — and a call site that forgets it edits somebody else's plugin.
+pub fn seat_bay(desk_index: usize, slot: usize) -> (usize, usize) {
+    if desk_index == MASTER_SEAT && slot >= INSERTS {
+        (MASTER_SEAT, slot - INSERTS)
+    } else if desk_index == MASTER_SEAT {
+        (MASTER_EXTRA_SEAT, slot)
+    } else {
+        (desk_index, slot)
+    }
+}
+
+/// How long the whole insert space is: every strip, the master, every pad,
+/// and the master's second rack at the end.
+pub const INSERT_SPACE: usize = (MASTER_EXTRA_SEAT + 1) * INSERTS;
 
 // ── The drumpad ─────────────────────────────────────────────────────────────
 
@@ -924,6 +1019,10 @@ pub struct RecorderState {
     pub lane_sounding: [u128; CHANNELS],
     /// The output directory, shortened for display.
     pub dest: String,
+    /// The PROJECT and EXPORT folders, likewise. See the same two fields on
+    /// [`RecorderView`].
+    pub project_dest: String,
+    pub export_dest: String,
     /// What the next take's folder will be called, from `ivory_record::take`.
     pub folder_preview: String,
     pub camera_name: Option<String>,
@@ -991,6 +1090,8 @@ impl RecorderState {
             master: self.master,
             gr_db: self.gr_db,
             dest: &self.dest,
+            project_dest: &self.project_dest,
+            export_dest: &self.export_dest,
             take_name,
             name_focused,
             editing,
@@ -1145,11 +1246,18 @@ impl LoudnessWindow {
 
 /// **Where the ladder ends, in LUFS.**
 ///
-/// The bottom is quieter than any mix anybody would keep and the top is above
-/// full scale — a loudness meter that stops at 0 hides exactly the case it is
-/// there to warn about, because loudness is a MEAN and a mean can pass 0 LUFS
-/// on material that has been squashed hard enough.
-pub const LUFS_RANGE: (f32, f32) = (-40.0, 3.0);
+/// The top is above full scale — a loudness meter that stops at 0 hides
+/// exactly the case it is there to warn about, because loudness is a MEAN
+/// and a mean can pass 0 LUFS on material that has been squashed hard
+/// enough.
+///
+/// **The floor came up from −40 to −30.** Forty was quieter than any mix
+/// anybody would keep, and it cost the useful part of the ladder its
+/// resolution: the whole span anybody actually works in — roughly −24 to −6
+/// — was squeezed into two fifths of the bar. Thirty-three LU across the
+/// column puts a labelled tick every two, which is close enough to read a
+/// number off the bar itself.
+pub const LUFS_RANGE: (f32, f32) = (-30.0, 3.0);
 
 /// Silence, and anything close enough to it. Below the standard's own
 /// absolute gate there is no useful reading, only a number falling towards
@@ -1162,20 +1270,34 @@ pub const LUFS_SILENCE: f32 = -70.0;
 /// to hit a number somebody else chose, and the numbers are public: a
 /// meter that made you look them up would be a meter you look up once and
 /// then guess at for ever.
-pub const LUFS_MARKS: [(f32, &str); 5] = [
-    // The club/CD-loud end. Not a target anybody publishes — it is where
-    // masters that fight the loudness war land, and it is on the ladder so
-    // you can see when you are there.
-    (-9.0, "-9"),
-    // Spotify, YouTube, Amazon, Tidal: the streaming consensus.
-    (-14.0, "-14"),
-    // Apple Music, and the podcast norm.
-    (-16.0, "-16"),
-    // The broadcast mixes that sit between the two.
-    (-18.0, "-18"),
-    // EBU R128 / ATSC A/85: European and American broadcast.
-    (-23.0, "-23"),
-];
+/// **A meter's number, without its sign.**
+///
+/// Every ladder in this app descends from 0 and draws the 0, so the minus in
+/// front of every other number says what the top of the scale already says.
+/// The owner's rule: "so long as 0 is visible, they are unnecessary."
+///
+/// **Not for a CONTROL's value.** A fader reads −4.5 dB and the gain dial
+/// reads +6, and there the sign is the whole difference between cutting and
+/// boosting — nothing on the scale says which way that one goes.
+///
+/// `abs` rather than trimming a character: `format!("{:.0}", -0.0)` is "-0",
+/// and a meter that prints minus zero at the top of its ladder is worse than
+/// one that prints the minus everywhere.
+pub fn meter_number(v: f32) -> String {
+    format!("{:.0}", v.abs())
+}
+
+/// **Where the bar turns red**, in LUFS.
+///
+/// The club/CD-loud end: not a target anybody publishes, it is where masters
+/// that fight the loudness war land. Past it the meter says so.
+///
+/// It was one of four named marks — CD, STREAM, PODCAST, BROADCAST — drawn
+/// as words down the side of the ladder. The words are gone (the owner's
+/// call: with a labelled tick every two LU the numbers say where you are,
+/// and anybody who cares about −14 already knows it is −14), and this is the
+/// half of them that was doing work.
+pub const LUFS_HOT: f32 = -9.0;
 
 /// The three readings, as the ladder shows them.
 ///
@@ -1192,6 +1314,14 @@ pub struct Loudness {
     pub integrated: f32,
     /// Which one the ladder is showing.
     pub window: LoudnessWindow,
+    /// **The stereo pair**, per channel, for the two sliding windows:
+    /// `[mom L, mom R, short L, short R]`.
+    ///
+    /// The ladder is two bars tied together — one stereo meter with a seam
+    /// down it, the master's own shape — and this is what fills them. There
+    /// is no integrated pair on purpose: see
+    /// `ivory::loudness::Loudness::read_stereo`.
+    pub pair: [f32; 4],
 }
 
 impl Default for Loudness {
@@ -1202,6 +1332,7 @@ impl Default for Loudness {
             short: LUFS_SILENCE,
             integrated: LUFS_SILENCE,
             window: LoudnessWindow::default(),
+            pair: [LUFS_SILENCE; 4],
         }
     }
 }
@@ -1230,10 +1361,35 @@ impl Loudness {
         Some(((v - lo) / (hi - lo)).clamp(0.0, 1.0))
     }
 
+    /// **What the two bars stand at**, left and right, as fractions of the
+    /// ladder — `None` where a channel is silent.
+    ///
+    /// On the INTEGRATED window both answer with the programme's own
+    /// reading: an integrated figure is gated on the whole programme, so a
+    /// per-channel one would be a number this app invented. The meter still
+    /// reads as a stereo meter there; it simply has nothing to say about
+    /// balance, which is honest, because neither does the standard.
+    pub fn bars(self) -> [Option<f32>; 2] {
+        let scale = |v: f32| {
+            if !v.is_finite() || v <= LUFS_SILENCE {
+                return None;
+            }
+            let (lo, hi) = LUFS_RANGE;
+            Some(((v - lo) / (hi - lo)).clamp(0.0, 1.0))
+        };
+        match self.window {
+            LoudnessWindow::Momentary => [scale(self.pair[0]), scale(self.pair[1])],
+            LoudnessWindow::ShortTerm => [scale(self.pair[2]), scale(self.pair[3])],
+            LoudnessWindow::Integrated => [self.fraction(), self.fraction()],
+        }
+    }
+
     /// What the number under the ladder says.
     pub fn text(self) -> String {
         match self.fraction() {
-            Some(_) => format!("{:.1}", self.now()),
+            // Unsigned, like every number on the ladder above it — see
+            // `meter_number`. The scale descends from 0 and shows the 0.
+            Some(_) => format!("{:.1}", self.now().abs()),
             None => "--".to_owned(),
         }
     }
@@ -2742,6 +2898,141 @@ pub fn disk_text(minutes: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// **A meter's numbers carry no sign, and 0 is not minus zero.**
+    ///
+    /// Every ladder descends from 0 and draws it, so the minus in front of
+    /// every other number says what the top of the scale already says — the
+    /// owner's rule. The `abs` matters: `format!("{:.0}", -0.0)` is "-0",
+    /// which is the one number on the ladder that would still have a sign.
+    #[test]
+    fn a_meters_numbers_carry_no_sign() {
+        use super::meter_number;
+        assert_eq!(meter_number(0.0), "0");
+        assert_eq!(meter_number(-0.0), "0", "minus zero reached the ladder");
+        assert_eq!(meter_number(-6.0), "6");
+        assert_eq!(meter_number(-24.0), "24");
+        assert_eq!(meter_number(-0.4), "0");
+        // A positive number keeps its digits and gains no sign either.
+        assert_eq!(meter_number(3.0), "3");
+
+        // And the loudness reading follows the ladder it sits under.
+        let l = super::Loudness {
+            momentary: -14.2,
+            short: -14.2,
+            integrated: -14.2,
+            window: super::LoudnessWindow::Momentary,
+            pair: [-14.2; 4],
+        };
+        assert_eq!(l.text(), "14.2", "the reading kept its sign");
+        // Silence still says so rather than printing a number.
+        let quiet = super::Loudness::default();
+        assert_eq!(quiet.text(), "--");
+    }
+
+    /// **The master has six bays across two racks, and nothing else moved.**
+    ///
+    /// The extra three live past the pads — see `MASTER_EXTRA_SEAT` — so
+    /// that `INSERTS` stays the stride of the persisted array and of the
+    /// state sidecars. The mapping is the one thing that can go wrong: a
+    /// call site that resolves a slot to the wrong seat edits somebody
+    /// else's plugin, silently.
+    #[test]
+    fn the_masters_six_bays_live_in_two_racks_and_nobody_elses_move() {
+        use super::{
+            bays_on, seat_bay, Strip, INSERTS, INSERT_SPACE, MASTER_EXTRA_SEAT, MASTER_SEAT,
+        };
+        assert_eq!(bays_on(None), INSERTS * 2, "the master lost its second rack");
+        assert_eq!(bays_on(Some(Strip::Channel(0))), INSERTS);
+
+        // **The first three are the EXTRA rack and the last three the
+        // original**, because the new bays were drawn ABOVE the old ones and
+        // a rack runs top to bottom — so a session that already had plugins
+        // in the master hears them in the same place in the chain.
+        for n in 0..INSERTS {
+            assert_eq!(seat_bay(MASTER_SEAT, n), (MASTER_EXTRA_SEAT, n));
+            assert_eq!(seat_bay(MASTER_SEAT, n + INSERTS), (MASTER_SEAT, n));
+        }
+        // Six distinct addresses, no collisions.
+        let mut seen: Vec<(usize, usize)> =
+            (0..INSERTS * 2).map(|n| seat_bay(MASTER_SEAT, n)).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), INSERTS * 2, "two master bays share a seat");
+
+        // **Everything else answers itself.** Channels, the buses and every
+        // pad are untouched by the rule.
+        for seat in [0usize, 1, 5, Strip::Click.index(), Strip::Fx.index()] {
+            for n in 0..INSERTS {
+                assert_eq!(seat_bay(seat, n), (seat, n), "seat {seat} was remapped");
+            }
+        }
+        for pad in [0usize, 1, 127] {
+            // `pad_insert_index` already answers in SEATS.
+            let seat = super::pad_insert_index(pad);
+            assert_ne!(seat, MASTER_EXTRA_SEAT, "pad {pad} collides with the master");
+            for n in 0..INSERTS {
+                assert_eq!(seat_bay(seat, n), (seat, n), "pad {pad} was remapped");
+            }
+        }
+
+        // And the insert space is long enough to hold the last of them.
+        let (seat, bay) = seat_bay(MASTER_SEAT, INSERTS * 2 - 1);
+        assert!(
+            seat * INSERTS + bay < INSERT_SPACE,
+            "the master's last bay is past the end of the insert space"
+        );
+    }
+
+    /// **The ladder is a stereo pair, and the two bars are the CHANNELS.**
+    ///
+    /// A single bar said what the programme was doing and nothing about
+    /// which side was doing it. On the two sliding windows the bars are
+    /// measured per channel; on the integrated one they both answer with the
+    /// programme's own reading, because an integrated figure is gated on the
+    /// whole programme and a per-channel one would be invented.
+    #[test]
+    fn the_loudness_ladder_reads_as_a_stereo_pair() {
+        use super::{Loudness, LoudnessWindow, LUFS_SILENCE};
+        let l = Loudness {
+            momentary: -14.0,
+            short: -18.0,
+            integrated: -16.0,
+            window: LoudnessWindow::Momentary,
+            // Left louder than right, and different again on the 3 s window.
+            pair: [-15.0, -21.0, -19.0, -20.0],
+        };
+        let frac = |v: f32| {
+            let (lo, hi) = super::LUFS_RANGE;
+            (v - lo) / (hi - lo)
+        };
+        let near = |a: Option<f32>, b: f32| a.is_some_and(|x| (x - b).abs() < 1e-4);
+
+        let [left, right] = l.bars();
+        assert!(near(left, frac(-15.0)), "momentary left is {left:?}");
+        assert!(near(right, frac(-21.0)), "momentary right is {right:?}");
+        assert!(left > right, "the louder channel does not stand higher");
+
+        let s = Loudness { window: LoudnessWindow::ShortTerm, ..l };
+        let [left, right] = s.bars();
+        assert!(near(left, frac(-19.0)));
+        assert!(near(right, frac(-20.0)));
+
+        // Integrated: both bars are the programme, and they AGREE — a
+        // stereo meter with nothing to say about balance says the same
+        // thing twice rather than making something up.
+        let i = Loudness { window: LoudnessWindow::Integrated, ..l };
+        let [left, right] = i.bars();
+        assert_eq!(left, right);
+        assert!(near(left, frac(-16.0)));
+
+        // Silence draws nothing rather than a bar at the floor.
+        let quiet = Loudness {
+            pair: [LUFS_SILENCE; 4],
+            ..l
+        };
+        assert_eq!(quiet.bars(), [None, None]);
+    }
     use super::*;
 
     #[test]

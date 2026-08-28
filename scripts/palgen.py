@@ -90,9 +90,15 @@ def _at_luminance(hue, sat, target):
 CHROMA_MAX = 42.0
 
 
-def make(hue, sat, tone, cmax=CHROMA_MAX):
-    """A colour at `hue` sitting on TONES[tone], no more vivid than `cmax`."""
-    target = TONES[tone]
+def make(hue, sat, tone, cmax=CHROMA_MAX, lum=None):
+    """A colour at `hue` sitting on TONES[tone], no more vivid than `cmax`.
+
+    `lum` overrides the tone with an explicit luminance, which is what the
+    gradients need: a ramp does not land on four named steps, it lands
+    wherever it is along the ramp.
+    """
+    hue = hue % 360.0
+    target = TONES[tone] if lum is None else lum
     c = _at_luminance(hue, sat, target)
     while chroma(c) > cmax and sat > 0.06:
         sat -= 0.02
@@ -181,6 +187,162 @@ PALETTES = {
 }
 
 
+# ── the gradients ──────────────────────────────────────────────────────────
+#
+# **A palette is now one sweep rather than eight pairs**, which is what the
+# owner asked for and what every desk a musician has already used looks like.
+# The rack reads top to bottom as a single ramp: luminance climbs steadily
+# from track one to track sixteen and the hue walks a single arc.
+#
+# The arc has to be WIDE, and that is arithmetic rather than taste. Sixteen
+# colours have to fit inside one ink-safe luminance band, which is about 35
+# points of L* end to end, or 2.4 per step -- so lightness alone can never put
+# neighbouring tracks the 10 dE apart that "tellable apart" means. The rest
+# has to come from hue, and at this chroma ceiling a step buys 2*C*sin(dh/2),
+# so ten points wants something near fourteen degrees a step. Fifteen steps of
+# that is a two-hundred degree arc.
+#
+# So each palette starts on its own theme's hue and walks from there, and the
+# WIDTH is found rather than chosen: the arc opens a little at a time until
+# the tightest neighbouring pair clears the floor, and stops. Every palette is
+# therefore as close to its own theme as the rule permits, instead of all
+# sixteen being the same rainbow rotated.
+# **Linear in LUMINANCE, not in lightness, and that is load-bearing.**
+#
+# L* is a cube root, so an even walk in luminance takes big L* strides down at
+# the black end and small ones up at the top. That is precisely the shape this
+# needs: chroma collapses towards black, so at the dark end hue can buy almost
+# no dE and lightness has to carry the separation -- while at the light end
+# chroma is at its ceiling and hue carries it easily. Ramping evenly in L*
+# instead spreads the lightness budget uniformly and starves the dark end,
+# which fails every palette. Measured both ways.
+GRADIENT_LUM = (0.006, 0.108)
+SPANS = {}
+
+
+def gradient(h0, sat=0.72, lo=None, hi=None, cmax=CHROMA_MAX, floor=10.0,
+             span=150.0, way=1):
+    """Sixteen colours on one monotone ramp from `h0`, widened until every
+    neighbouring pair clears `floor`."""
+    lo = GRADIENT_LUM[0] if lo is None else lo
+    hi = GRADIENT_LUM[1] if hi is None else hi
+    # **Two dials, tried in that order.** Widening the arc is the cheap move
+    # and keeps the palette's own colour; raising the saturation is the
+    # expensive one, because it takes the whole ramp further from the theme's
+    # own muted cast. So the arc opens first, and only a palette too pale for
+    # any arc to separate -- the ones whose chroma had collapsed at the dark
+    # end -- reaches for more colour.
+    out = []
+    start = span
+    for _ in range(12):
+        span = start
+        for _ in range(90):
+            out = []
+            for i in range(16):
+                t = i / 15.0
+                out.append(
+                    make(h0 + way * span * t, sat, None, cmax, lum=lo + (hi - lo) * t)
+                )
+            if all(de(a, b) >= floor for a, b in zip(out, out[1:])):
+                SPANS[h0] = (span, sat)
+                return out
+            span += 6.0
+        sat = min(sat + 0.04, 0.98)
+    return out
+
+
+def grey_gradient(h0=214, h1=32, sat=0.30, floor=2.2):
+    """MONO's ramp: sixteen greys, the tint drifting cool to warm ACROSS the
+    sweep rather than alternating every strip. The old one zig-zagged the
+    tint to buy dE; a gradient cannot do that and stay a gradient, so this
+    one leans on the tint travelling in one direction the whole way."""
+    out = []
+    for i in range(16):
+        t = i / 15.0
+        out.append(
+            make(h0 + (h1 - h0) * t, sat, None, cmax=18.0,
+                 lum=0.004 + t * (0.112 - 0.004))
+        )
+    return out
+
+
+# Each palette's own hue, taken from the theme it dresses.
+GRADIENTS = {
+    "Default":    dict(h0=16,  sat=0.72),
+    "Valentine":  dict(h0=336, sat=0.70),
+    "Hydra":      dict(h0=168, sat=0.72),
+    "Navi":       dict(h0=212, sat=0.70),
+    "Mono":       None,  # grey_gradient
+    "Studio":     dict(h0=40,  sat=0.66),
+    "Aurora":     dict(h0=146, sat=0.74),
+    "Sandstone":  dict(h0=28,  sat=0.62),
+    "Centennial": dict(h0=196, sat=0.68),
+    "Blueprint":  dict(h0=218, sat=0.72),
+    "Porcelain":  dict(h0=200, sat=0.52),
+    "Moss":       dict(h0=96,  sat=0.68),
+    "Rhodes":     dict(h0=284, sat=0.66),
+    "Copper":     dict(h0=22,  sat=0.74),
+    "Dusk":       dict(h0=252, sat=0.68),
+    "Iris":       dict(h0=272, sat=0.70),
+}
+
+
+def build_gradients():
+    out = {}
+    for name, kw in GRADIENTS.items():
+        slots = grey_gradient() if kw is None else gradient(**kw)
+        floor = 2.2 if kw is None else 10.0
+        # The click is the one thing on the desk that is NOT on the ramp, so
+        # it is taken well off it: a mid warm neutral for every palette but
+        # Mono, whose greys need something chromatic to stand clear of.
+        click = make(48, 0.30, 1) if kw is None or True else None
+        out[name] = (slots, click, MASTER, floor)
+    return out
+
+
+def report_gradients():
+    bad = 0
+    for name, (slots, click, master, floor) in build_gradients().items():
+        errs = []
+        for i, c in enumerate(slots + [click, master]):
+            r = ink_contrast(c)
+            if r < 4.5:
+                errs.append(f"slot {i} {hexs(c)} ink {r:.2f}:1")
+            if not wants_light_ink(c):
+                errs.append(f"slot {i} {hexs(c)} takes DARK ink")
+        if len(set(slots)) != 16:
+            errs.append("repeats a colour")
+        ds = [de(a, b) for a, b in zip(slots, slots[1:])]
+        for i, d in enumerate(ds):
+            if d < floor:
+                errs.append(f"slots {i}/{i+1} dE {d:.1f} < {floor}")
+        # The ramp has to actually RAMP, or it is not a gradient.
+        ls = [luminance(c) for c in slots]
+        if any(b <= a for a, b in zip(ls, ls[1:])):
+            errs.append("luminance does not climb the whole way")
+        for label, c in (("click", click), ("master", master)):
+            near = min(de(c, s) for s in slots)
+            if near < 8.0:
+                errs.append(f"{label} only dE {near:.1f} from a channel")
+        if de(click, master) < 20.0:
+            errs.append(f"click~master dE {de(click, master):.1f}")
+        cs = [chroma(c) for c in slots]
+        print(
+            f"{name:11s} {'FAIL' if errs else 'ok':4s} "
+            f"dE {min(ds):4.1f}-{max(ds):4.1f}  "
+            f"chroma {min(cs):4.1f}-{max(cs):4.1f}  "
+            f"lum {min(ls):.3f}-{max(ls):.3f}  "
+            f"ink {min(ink_contrast(c) for c in slots):.1f}:1+  "
+            f"arc {SPANS.get(GRADIENTS[name]['h0'], ('-', '-'))[0] if GRADIENTS[name] else '-'}"
+        )
+        for e in errs:
+            print(f"            - {e}")
+        bad += bool(errs)
+    print()
+    print("GRADIENTS FAILING" if bad else "ALL GRADIENTS PASS")
+    return bad
+
+
 def hexs(c):
     return f"#{c[0]:02x}{c[1]:02x}{c[2]:02x}"
 
@@ -240,7 +402,24 @@ def emit():
         print(f"//   click {hexs(click)}  master {hexs(master)}")
 
 
+def emit_gradients():
+    print("\n// ---- gradients generated by palgen.py ----")
+    for name, (slots, click, master, _) in build_gradients().items():
+        print(f"    // {name}")
+        print("    ", end="")
+        for c in slots:
+            print(f"({c[0]:#04x}, {c[1]:#04x}, {c[2]:#04x}), ", end="")
+        print()
+        print(f"    ({click[0]:#04x}, {click[1]:#04x}, {click[2]:#04x}), // {name} click")
+
+
 if __name__ == "__main__":
+    import sys
+    if "--gradients" in sys.argv:
+        rc = report_gradients()
+        if not rc:
+            emit_gradients()
+        raise SystemExit(1 if rc else 0)
     rc = report()
     if not rc:
         emit()

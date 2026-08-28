@@ -21,8 +21,19 @@ mod dx7;
 /// Reverb and delay, on everything the app plays.
 #[cfg(feature = "recorder")]
 mod effects;
+/// Loudness to BS.1770-4, for the ladder beside the master. Inside
+/// `recorder` because the only thing that feeds it is the engine's output.
+#[cfg(feature = "recorder")]
 mod loudness;
+/// True varispeed: the resampler that sits between the program clock and the
+/// device's. Inside `recorder` for the same reason — there is no device in a
+/// Minimal build for it to sit between.
+#[cfg(feature = "recorder")]
 mod varispeed;
+/// Time-stretching a clip. Inside `recorder` because it takes an
+/// `ivory_record::decode::Clip`, and a Minimal build does not link that crate
+/// at all.
+#[cfg(feature = "recorder")]
 mod stretch;
 /// The monitor engine: the audio OUTPUT stream that plays a hosted VST3
 /// instrument and the metronome. Absent from a Minimal build for the same
@@ -35,6 +46,10 @@ mod midi;
 /// anyone can flip (docs/RECORDER-PLAN.md §12a).
 #[cfg(feature = "recorder")]
 mod record;
+/// The playhead and the play switch. Inside `recorder` because its one
+/// owner is `Recorder`, and because it speaks to an `Engine` — neither of
+/// which a Minimal build has.
+#[cfg(feature = "recorder")]
 mod transport;
 
 use ivory_ui::settings::Settings;
@@ -297,7 +312,7 @@ fn main() {
         // rect have been in `app.rs` since the plugin shipped. See the layout
         // branch in `IvoryApp::frame`.
         .with_min_inner_size(ivory_ui::settings::MIN_WINDOW)
-        .with_resizable(true)
+        .with_resizable(ivory_ui::settings::RESIZABLE)
         .with_decorations(!settings.borderless_mode);
 
     // Reopen where it was last left. Monitors are not enumerable before the

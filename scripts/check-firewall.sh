@@ -104,6 +104,25 @@ else
   say "ivory-ui does not depend on the binary" "ok"
 fi
 
+# ââ The Minimal build still compiles âââââââââââââââââââââââââââââ
+# `ivory` with NO features is the chord display alone: no recorder, no camera,
+# no plugin host. It is a real configuration â the fallback when a platform
+# cannot carry the rest â and it had stopped compiling, because nothing in the
+# repo ever built it. Every other script builds `--features recorder`.
+#
+# This is the only stage here that invokes the compiler. It is a `check`, not a
+# build, and it shares the workspace target dir, so it is seconds once warm.
+# Set NO_MINIMAL=1 to skip it when iterating on the structural checks alone.
+if [ "${NO_MINIMAL:-0}" = 1 ]; then
+  say "Minimal build check skipped (NO_MINIMAL=1)" "--"
+elif cargo check -q -p ivory --no-default-features 2>/dev/null; then
+  say "the Minimal build (no features) compiles" "ok"
+else
+  say "the Minimal build (no features) must compile" "FAIL"
+  echo "      re-run: cargo check -p ivory --no-default-features" >&2
+  fail=1
+fi
+
 if [ "$fail" = 0 ]; then
   echo "  firewall intact"
 else

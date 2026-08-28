@@ -246,6 +246,39 @@ impl Stages {
 /// no sensible tempo to sync to.
 const FREE_SECS: f32 = 0.375;
 
+/// Where the free rate sweeps, in hertz — slowest first.
+///
+/// **A RATE, not a length**, because that is what the control says and what a
+/// repeat is counted in: two and a half a second is a flutter and a fifth of
+/// one is a slapback, and the ear reads the difference as speed. The span
+/// covers a bar at a very slow tempo up to faster than the shortest head can
+/// resolve, so the tape's own cap is what stops it rather than the dial.
+const FREE_HZ: (f32, f32) = (0.4, 20.0);
+
+/// Seconds per repeat at a position of the free-rate control.
+///
+/// **Geometric**, because pitch and rate are heard as ratios: half the
+/// travel is the geometric middle of the span, not the arithmetic one, and a
+/// linear sweep spends most of its length in the last two hertz where nothing
+/// changes.
+pub fn free_secs(pos: f32) -> f32 {
+    let t = pos.clamp(0.0, 1.0);
+    let hz = FREE_HZ.0 * (FREE_HZ.1 / FREE_HZ.0).powf(t);
+    1.0 / hz
+}
+
+/// Where the free-rate control rests: exactly [`FREE_SECS`].
+///
+/// **Solved, not typed.** A session that was on the free position before this
+/// control existed has to sound the same until somebody moves it, and a
+/// hand-picked 0.53 put it at 313 ms — near enough to look right in a
+/// screenshot and wrong by a fifth, which the tempo test caught. Derived from
+/// the two constants, so moving either of them cannot leave this behind.
+pub fn free_default() -> f32 {
+    let hz = 1.0 / FREE_SECS;
+    ((hz / FREE_HZ.0).ln() / (FREE_HZ.1 / FREE_HZ.0).ln()).clamp(0.0, 1.0)
+}
+
 /// Everything about the three effects a person can change.
 ///
 /// **One struct, sent whole.** The alternative is an atomic per field, and
@@ -279,10 +312,22 @@ pub struct Params {
     pub plate_predelay: f32,
 
     pub delay_division: Division,
+    /// The repeat RATE with [`Division::Free`], in hertz, as 0..=1 across
+    /// [`FREE_HZ`].
+    ///
+    /// **Only `Free` reads it.** Every other division is a musical length and
+    /// takes its time from the tempo; this is the one position that is not
+    /// synced to anything, and it used to be a fixed 375 ms with no way to
+    /// change it — a "free" setting that was free of the tempo and of the user
+    /// alike.
+    pub delay_free_hz: f32,
     /// Which of the twelve Mode Selector positions the machine is on: which
     /// playback heads are live, and whether the spring is in circuit. See
     /// [`EchoMode`].
     pub echo_mode: EchoMode,
+    /// Which reverb is in the bay: the plate, or the smooth tail that is
+    /// nobody's hardware. See [`ReverbMode`].
+    pub reverb_mode: ReverbMode,
     /// How much of each repeat comes back for the next.
     pub delay_feedback: f32,
     /// How much darker each repeat is than the one before it.
@@ -348,13 +393,21 @@ impl Default for Params {
             reverb_damp: 0.55,
             reverb_width: 0.80,
             plate_dispersion: 0.75,
-            plate_predelay: 0.12,
+            // **None, because the plate has none.** The tail starts the
+            // instant the coil moves; the air in front of a plate on a record
+            // came from a tape machine an engineer patched in, which is what
+            // this control is. Shipping it wound on gave every hit a gap
+            // before the reverb arrived, and a gap before a reverb is a
+            // slapback however good the tail behind it is.
+            plate_predelay: 0.0,
             delay_division: Division::DottedEighth,
+            delay_free_hz: free_default(),
             // **Head one alone, no spring.** Eleven of the twelve positions
             // are a choice about the sound; this is the one where "the
             // repeat" means exactly one thing, which is what a control next
             // to a metronome has to mean before anybody goes looking.
             echo_mode: EchoMode::One,
+            reverb_mode: ReverbMode::Plate,
             delay_feedback: 0.42,
             delay_tone: 0.55,
             delay_width: 0.60,
@@ -540,9 +593,154 @@ const PLATE_D1: [usize; 2] = [661, 617];
 const PLATE_AP2: [usize; 2] = [293, 359];
 const PLATE_D2: [usize; 2] = [557, 509];
 
+
+/// **What the reverb IS**: the steel plate, or a smooth tail that no piece of
+/// hardware in this file is answerable to.
+///
+/// # Why a mode and not another dial
+///
+/// `plate_dispersion` already reaches zero, and a plate with the chirp out is
+/// still a plate: seventy-five milliseconds of tank, no early reflections, and
+/// a top that dies three times faster than the middle because that is what a
+/// damped sheet of steel does. Those are the three things somebody means when
+/// they say a plate does not suit the part, and no single dial turns them off
+/// together.
+///
+/// # What SMOOTH actually changes, and what it does not
+///
+/// Three parameters, no new state and no new buffers — so it can be switched
+/// under a rolling take without an allocation on the audio thread, which is
+/// the constraint every other control in this file is built to:
+///
+/// 1. **The chirp comes out of circuit entirely** — not turned down, skipped,
+///    so the twelve allpass stages are not run at all. This is most of what
+///    "not a plate" means and it is the cheapest of the three.
+/// 2. **The top of the band stops dying first.** [`SMOOTH_TONE_RATIO`] keeps
+///    the treble decay near the mid-band's instead of at a fifth of it.
+/// 3. **The input smear gets denser** ([`PLATE_IN_G_SMOOTH`]), because with
+///    the dispersion gone the first arrivals are audible as arrivals and the
+///    diffusers have to do the work the chirp was doing.
+///
+/// The tank, the taps, the width fold and the decay dial are untouched. This
+/// is the same reverb wearing different damping, not a second algorithm — a
+/// second algorithm would be a second thing to keep alive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReverbMode {
+    /// The EMT 140, and the default. Everything this file measures.
+    #[default]
+    Plate,
+    /// **Not the hardware, and the label says so.** See [`ReverbMode::label`].
+    Smooth,
+}
+
+impl ReverbMode {
+    pub const ALL: [ReverbMode; 2] = [ReverbMode::Plate, ReverbMode::Smooth];
+
+    /// **The asterisk means "not answerable to a measurement".**
+    ///
+    /// Everything else in this file is voiced against a real unit and the
+    /// comments say which. A mode that is nobody's hardware has to be marked
+    /// or it borrows the credibility of the ones that are — the same reason
+    /// `EchoMode::ThreeDry` carries one.
+    pub fn label(self) -> &'static str {
+        match self {
+            ReverbMode::Plate => "plate - EMT 140",
+            ReverbMode::Smooth => "* smooth",
+        }
+    }
+
+    /// How it is written to the settings file, and read back.
+    pub fn key(self) -> &'static str {
+        match self {
+            ReverbMode::Plate => "plate",
+            ReverbMode::Smooth => "smooth",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<ReverbMode> {
+        ReverbMode::ALL.into_iter().find(|m| m.key() == key)
+    }
+
+    /// Whether the plate's dispersion is in circuit at all.
+    pub fn disperses(self) -> bool {
+        matches!(self, ReverbMode::Plate)
+    }
+
+    /// Where the treble decay sits relative to the mid-band, at each end of
+    /// the tone control.
+    pub fn tone_ratio(self) -> (f32, f32) {
+        match self {
+            ReverbMode::Plate => PLATE_TONE_RATIO,
+            ReverbMode::Smooth => SMOOTH_TONE_RATIO,
+        }
+    }
+
+    /// The input diffusers' coefficients.
+    pub fn diffusion(self) -> [f32; 4] {
+        match self {
+            ReverbMode::Plate => PLATE_IN_G,
+            ReverbMode::Smooth => PLATE_IN_G_SMOOTH,
+        }
+    }
+}
+
+/// [`ReverbMode::Smooth`]'s treble decay, against the plate's (0.22, 0.85).
+///
+/// **A tail whose top lasts as long as its middle is what the plate comment
+/// calls a spring** — and that is the point: this mode is not trying to be a
+/// plate. Not 1.0 at the top, because a reverb with no HF absorption at all
+/// sounds like a bug rather than like a room; every real space loses treble.
+const SMOOTH_TONE_RATIO: (f32, f32) = (0.55, 0.97);
+
+/// [`ReverbMode::Smooth`]'s input diffusers, against the plate's.
+///
+/// Higher, because with the chirp skipped the early arrivals are countable
+/// and the diffusers have to smear them on their own. Still short of the buzz
+/// the plate comment warns about at one.
+const PLATE_IN_G_SMOOTH: [f32; 4] = [0.820, 0.820, 0.760, 0.760];
+
 /// One trip round the tank, in samples at [`DESIGN_RATE`]. Kept as a constant
 /// rather than summed at runtime so [`Plate::feedback`] is a closed form.
 const PLATE_LOOP: f32 = 3_300.0;
+
+/// Where the output is picked up off the tank, in samples at [`DESIGN_RATE`].
+///
+/// **Seven points, not one, and this is what "instant density" has to mean in
+/// a delay network.**
+///
+/// Read the tank at a single point and the output cannot begin until the
+/// signal has physically reached that point. The old tap sat after `d1` — a
+/// pure delay of fifteen milliseconds — so every hit began with fifteen
+/// milliseconds of silence and then SWELLED, over about another twenty-five,
+/// as the longer paths arrived. A hole followed by a blob is a slapback, and
+/// with the predelay on top it was a fifty-millisecond one: the owner heard
+/// "a delay or echo, not a smooth reverb", which is exactly what that is.
+///
+/// A plate has no build-up at all. The band crosses it in a millisecond, so
+/// the echoes are already too dense to count by the time anybody hears them.
+/// Seven taps, drawn from BOTH branches at different depths, is how a delay
+/// network says that: the shallow ones answer immediately, the deep ones fill
+/// in behind them, and there is no gap left between.
+///
+/// The signs matter as much as the positions. All-positive taps agree with
+/// each other at the frequencies their spacings share, which is a comb by
+/// another name; the alternation breaks that agreement.
+///
+/// Positions are prime and shorter than the shortest line each is read from,
+/// so they stay taps and never wrap into a second lap.
+///
+/// Order, per channel, with `o` the other branch:
+/// `d1[ch]`, `d1[ch]`, `ap2[o]`, `d2[o]`, `d1[o]`, `ap2[ch]`, `d2[ch]`.
+const PLATE_TAPS: [usize; 7] = [149, 421, 179, 331, 233, 97, 271];
+
+/// The signs the seven are summed with. See [`PLATE_TAPS`].
+const PLATE_TAP_SIGN: [f32; 7] = [1.0, 1.0, -1.0, 1.0, -1.0, -1.0, -1.0];
+
+/// What the seven-tap sum is scaled by to land where the single tap did.
+///
+/// The taps are near enough decorrelated that the sum grows as the root of
+/// their count, so this is 1/sqrt(7).
+const PLATE_TAP_GAIN: f32 = 0.378;
 
 /// The tank diffusers' coefficients.
 const PLATE_TANK_G1: f32 = 0.70;
@@ -596,6 +794,14 @@ impl Line {
         out
     }
 
+    /// Read `back` samples behind the write point, without disturbing it.
+    /// The plate's output is seven of these. See [`PLATE_TAPS`].
+    #[inline]
+    fn tap(&self, back: usize) -> f32 {
+        let n = self.buf.len();
+        self.buf[(self.at + n - back.min(n - 1) - 1) % n]
+    }
+
     fn clear(&mut self) {
         self.buf.fill(0.0);
         self.at = 0;
@@ -642,6 +848,13 @@ impl Diffuser {
             self.at = 0;
         }
         buffered - v * g
+    }
+
+    /// Read `back` samples behind the write point. See [`Line::tap`].
+    #[inline]
+    fn tap(&self, back: usize) -> f32 {
+        let n = self.buf.len();
+        self.buf[(self.at + n - back.min(n - 1) - 1) % n]
     }
 
     fn clear(&mut self) {
@@ -760,6 +973,9 @@ struct Plate {
     lfo: f32,
     /// Base lengths of the swept pair, in samples at this rate.
     ap1_base: [f32; 2],
+    /// [`PLATE_TAPS`] at this rate, per channel, each clamped inside the line
+    /// it reads from.
+    taps: [[usize; 7]; 2],
     sample_rate: f32,
 }
 
@@ -788,6 +1004,27 @@ impl Plate {
             cross: [0.0; 2],
             lfo: 0.0,
             ap1_base: std::array::from_fn(|i| scale(PLATE_AP1[i])),
+            taps: std::array::from_fn(|ch| {
+                let o = ch ^ 1;
+                // The line each of the seven reads from, in `PLATE_TAPS` order.
+                let host = [
+                    scale(PLATE_D1[ch]),
+                    scale(PLATE_D1[ch]),
+                    scale(PLATE_AP2[o]),
+                    scale(PLATE_D2[o]),
+                    scale(PLATE_D1[o]),
+                    scale(PLATE_AP2[ch]),
+                    scale(PLATE_D2[ch]),
+                ];
+                std::array::from_fn(|i| {
+                    // Scaled with the lines, so a tap written shorter than its
+                    // line at the design rate stays shorter at every rate. The
+                    // clamp is for a rate low enough to round a short line
+                    // down onto its own tap.
+                    let want = (PLATE_TAPS[i] as f32 * sr / DESIGN_RATE) as usize;
+                    want.clamp(1, (host[i] as usize).saturating_sub(1).max(1))
+                })
+            }),
             sample_rate: sr,
         }
     }
@@ -836,10 +1073,19 @@ impl Plate {
             * self.sample_rate) as usize;
         let cap = self.pre[0].len();
         let pre_len = pre_len.min(cap - 1);
-        let read = (self.pre_at + cap - pre_len) % cap;
-        let mut v = [self.pre[0][read], self.pre[1][read]];
+        // **Written before it is read, and that is a bug fix, not a style.**
+        //
+        // Reading first meant the slot at `pre_at` still held the sample from
+        // a whole buffer ago, so a predelay of ZERO — the one setting the
+        // plate itself actually has — came out as the LONGEST delay the line
+        // can hold: 150 ms of silence and then the tail, which is a slapback
+        // and was heard as one. Every other setting was right, which is what
+        // kept it hidden: the control worked all the way down and then fell
+        // off the end.
         self.pre[0][self.pre_at] = flush(input[0]);
         self.pre[1][self.pre_at] = flush(input[1]);
+        let read = (self.pre_at + cap - pre_len) % cap;
+        let mut v = [self.pre[0][read], self.pre[1][read]];
         self.pre_at += 1;
         if self.pre_at >= cap {
             self.pre_at = 0;
@@ -847,14 +1093,21 @@ impl Plate {
 
         for ch in 0..2 {
             v[ch] = self.bandwidth[ch].lp(v[ch], 0.18);
-            for (ap, g) in self.in_ap[ch].iter_mut().zip(PLATE_IN_G) {
+            for (ap, g) in self.in_ap[ch].iter_mut().zip(p.reverb_mode.diffusion()) {
                 v[ch] = ap.process(v[ch], g);
             }
             // **The chirp, applied where it is heard.** In the input path the
             // very first arrival already carries it, which is the attack;
             // inside the tank it would only accumulate, and the plate's
             // signature is on the front of the note.
-            v[ch] = self.dispersion[ch].process(v[ch], p.plate_dispersion.clamp(0.0, 1.0));
+            // **Skipped, not turned down, on the smooth mode.** Twelve
+            // first-order sections per channel per sample is the most
+            // expensive thing in this reverb, and a mode that does not want
+            // them should not pay for them.
+            if p.reverb_mode.disperses() {
+                v[ch] =
+                    self.dispersion[ch].process(v[ch], p.plate_dispersion.clamp(0.0, 1.0));
+            }
         }
 
         // ── the tank ────────────────────────────────────────────────────
@@ -867,7 +1120,8 @@ impl Plate {
         // Inverted against the control: turning tone UP is a brighter tail,
         // which means a HIGHER corner and a ratio nearer one.
         let corner = PLATE_TONE_HZ.0 + (PLATE_TONE_HZ.1 - PLATE_TONE_HZ.0) * tone;
-        let ratio = PLATE_TONE_RATIO.0 + (PLATE_TONE_RATIO.1 - PLATE_TONE_RATIO.0) * tone;
+        let (rat_lo, rat_hi) = p.reverb_mode.tone_ratio();
+        let ratio = rat_lo + (rat_hi - rat_lo) * tone;
         // A one-pole whose corner is `corner`, expressed as its pole.
         let damp_a = (-std::f32::consts::TAU * corner / self.sample_rate).exp();
         // How much of the damped signal is mixed back in. At ratio 1 the
@@ -892,12 +1146,28 @@ impl Plate {
             let low = self.damp[ch].lp(x, damp_a);
             x = x - (x - low) * damp_mix;
             x = self.ap2[ch].process(x, PLATE_TANK_G2);
-            // The tap. Taken BEFORE the second delay so the two channels are
-            // hearing different points on the loop rather than the same point
-            // one delay apart, which is what makes them decorrelate.
-            out[ch] = x;
             x = self.d2[ch].push(x);
             self.cross[ch] = flush(x * g);
+        }
+        // **Read in seven places, after BOTH branches have moved.**
+        //
+        // A second pass rather than a tap inside the first, because four of
+        // the seven read the other branch: taking them mid-loop would have
+        // channel 0 hearing channel 1 as it was a sample ago and channel 1
+        // hearing channel 0 as it is now, which is a half-sample of stereo
+        // skew nobody asked for. See [`PLATE_TAPS`].
+        for ch in 0..2 {
+            let o = ch ^ 1;
+            let t = self.taps[ch];
+            let sg = PLATE_TAP_SIGN;
+            out[ch] = (sg[0] * self.d1[ch].tap(t[0])
+                + sg[1] * self.d1[ch].tap(t[1])
+                + sg[2] * self.ap2[o].tap(t[2])
+                + sg[3] * self.d2[o].tap(t[3])
+                + sg[4] * self.d1[o].tap(t[4])
+                + sg[5] * self.ap2[ch].tap(t[5])
+                + sg[6] * self.d2[ch].tap(t[6]))
+                * PLATE_TAP_GAIN;
         }
         // **Width is a fold, not a delay length.** The two branches already
         // run different lengths, so the pair decorrelates on its own; this
@@ -1023,6 +1293,20 @@ pub enum EchoMode {
     Eleven,
     /// The spring alone, no tape at all.
     ReverbOnly,
+    /// **All three heads with the spring OUT — and Roland's switch has no
+    /// such position.**
+    ///
+    /// Every dry combination the machine offers is one head or the pair 2+3;
+    /// the moment a third head comes in, so does the spring. That is a fact
+    /// about the wiring rather than about the sound, and the sound of three
+    /// heads without a tank underneath them is a thing people build the
+    /// machine's clone to get.
+    ///
+    /// **The asterisk on its label is load-bearing.** Everything else in this
+    /// file is answerable to a measurement of the real unit; this is not, and
+    /// a row that quietly sat among the twelve would make the other twelve
+    /// less trustworthy. See `EchoMode::label`.
+    ThreeDry,
 }
 
 // See the note on the enum: this whole group is the host's interface and is
@@ -1030,7 +1314,7 @@ pub enum EchoMode {
 #[allow(dead_code)]
 impl EchoMode {
     /// Every position, in the order the switch turns.
-    pub const ALL: [EchoMode; 12] = [
+    pub const ALL: [EchoMode; 13] = [
         EchoMode::One,
         EchoMode::Two,
         EchoMode::Three,
@@ -1043,6 +1327,10 @@ impl EchoMode {
         EchoMode::Ten,
         EchoMode::Eleven,
         EchoMode::ReverbOnly,
+        // Appended, and after the twelve: `ALL` is the order the panel steps
+        // through, so the machine's own selector stays a contiguous run and
+        // the one invention sits at the end where it reads as an addition.
+        EchoMode::ThreeDry,
     ];
 
     /// Which of the three playback heads are live.
@@ -1054,7 +1342,7 @@ impl EchoMode {
             EchoMode::Four | EchoMode::Nine => [false, true, true],
             EchoMode::Eight => [true, true, false],
             EchoMode::Ten => [true, false, true],
-            EchoMode::Eleven => [true, true, true],
+            EchoMode::Eleven | EchoMode::ThreeDry => [true, true, true],
             EchoMode::ReverbOnly => [false; 3],
         }
     }
@@ -1063,7 +1351,11 @@ impl EchoMode {
     pub fn reverb(self) -> bool {
         !matches!(
             self,
-            EchoMode::One | EchoMode::Two | EchoMode::Three | EchoMode::Four
+            EchoMode::One
+                | EchoMode::Two
+                | EchoMode::Three
+                | EchoMode::Four
+                | EchoMode::ThreeDry
         )
     }
 
@@ -1084,6 +1376,10 @@ impl EchoMode {
             EchoMode::Ten => "10 - heads 1+3 + spring",
             EchoMode::Eleven => "11 - all three + spring",
             EchoMode::ReverbOnly => "12 - spring only",
+            // **The asterisk means "not on the real machine".** No number,
+            // because a number here would claim a position on a switch that
+            // does not have one.
+            EchoMode::ThreeDry => "* all three, no spring",
         }
     }
 
@@ -1102,6 +1398,7 @@ impl EchoMode {
             EchoMode::Ten => "10",
             EchoMode::Eleven => "11",
             EchoMode::ReverbOnly => "reverb",
+            EchoMode::ThreeDry => "3dry",
         }
     }
 
@@ -1339,6 +1636,10 @@ impl TapeEcho {
     fn target(&self, bpm: f64, p: &Params) -> f32 {
         let secs = match p.delay_division.beats() {
             Some(beats) if bpm.is_finite() && bpm > 1.0 => (60.0 / bpm) as f32 * beats,
+            // **`Free` is now a rate the user sets**, not a fixed 375 ms.
+            // `FREE_SECS` remains what a division with no usable tempo falls
+            // back to, which is a different question.
+            None => free_secs(p.delay_free_hz),
             _ => FREE_SECS,
         };
         let cap = (self.tape.len() - 2) as f32 / HEAD_RATIO[2];
@@ -4632,14 +4933,22 @@ mod tests {
         for a in extremes {
             for b in extremes {
                 for division in Division::ALL {
+                    // The two machines' MODES get their own sweep below, at a
+                    // shorter length: crossing them into this loop multiplied
+                    // it by twenty-six and turned a two-second test into a
+                    // coffee break, which is how a bounded-ness test stops
+                    // being run.
+                    let (reverb_mode, echo_mode) = (ReverbMode::Plate, EchoMode::Eleven);
                     let p = Params {
+                        reverb_mode,
                         reverb_size: a,
                         reverb_damp: b,
                         reverb_width: a,
                         plate_dispersion: b,
                         plate_predelay: a,
                         delay_division: division,
-                        echo_mode: EchoMode::Eleven,
+                        delay_free_hz: a,
+                        echo_mode,
                         delay_feedback: a,
                         delay_tone: b,
                         delay_width: b,
@@ -4676,19 +4985,167 @@ mod tests {
                         fx.process(&mut buf, frames, 2, sends(1.0, 1.0, 1.0), &p, 120.0);
                         assert!(
                             buf.iter().all(|s| s.is_finite()),
-                            "{} produced a non-finite sample",
-                            division.label()
+                            "{} / {} / {} produced a non-finite sample",
+                            division.label(),
+                            echo_mode.label(),
+                            reverb_mode.label()
                         );
                         // Generous, because everything open on a full-scale
                         // input is not a mix anybody would use. What this
                         // catches is a runaway, not a hot setting.
                         assert!(
                             peak(&buf) < 12.0,
-                            "{} reached {} with everything open",
+                            "{} / {} / {} reached {} with everything open",
                             division.label(),
+                            echo_mode.label(),
+                            reverb_mode.label(),
                             peak(&buf)
                         );
                     }
+                }
+            }
+        }
+    }
+
+    /// **The smooth mode is audibly not the plate**, and in the direction
+    /// it claims: its treble outlasts the plate's.
+    ///
+    /// A mode that measured the same as the one beside it would be a row in
+    /// a menu that does nothing — the exact failure the `ThreeDry` label's
+    /// asterisk is there to avoid claiming.
+    #[test]
+    fn the_smooth_mode_keeps_the_top_of_the_band_longer_than_the_plate() {
+        /// The tail's energy above `HF_HZ`, after `skip` seconds of decay.
+        fn hf_tail(mode: ReverbMode) -> f32 {
+            let p = Params {
+                reverb_mode: mode,
+                reverb_size: 0.8,
+                // Tone at the top of its travel for both, so the only thing
+                // differing is the ratio each mode maps it through.
+                reverb_damp: 1.0,
+                reverb_width: 0.0,
+                plate_dispersion: 0.0,
+                plate_predelay: 0.0,
+                ..Params::default()
+            };
+            let mut fx = Effects::new(SR);
+            // One short bright burst in, then silence while it rings.
+            let frames = 2_048;
+            let mut first = vec![0.0_f32; frames * 2];
+            let mut phase = 0.0_f32;
+            for f in first.chunks_exact_mut(2) {
+                phase += 6_000.0 * std::f32::consts::TAU / SR;
+                let v = phase.sin() * 0.5;
+                f[0] = v;
+                f[1] = v;
+            }
+            fx.process(&mut first, frames, 2, sends(1.0, 0.0, 0.0), &p, 120.0);
+            // Ring out, and measure a block well into the tail.
+            let mut last = Vec::new();
+            for _ in 0..14 {
+                let mut buf = vec![0.0_f32; frames * 2];
+                fx.process(&mut buf, frames, 2, sends(1.0, 0.0, 0.0), &p, 120.0);
+                last = buf;
+            }
+            // High-frequency energy, as the mean absolute first difference:
+            // a one-pole difference is a high-pass, and this needs a
+            // comparison rather than a calibrated number.
+            let mono: Vec<f32> = last.chunks_exact(2).map(|f| f[0]).collect();
+            let hf: f32 = mono.windows(2).map(|w| (w[1] - w[0]).abs()).sum();
+            hf / mono.len() as f32
+        }
+        let plate = hf_tail(ReverbMode::Plate);
+        let smooth = hf_tail(ReverbMode::Smooth);
+        assert!(
+            smooth > plate * 1.2,
+            "the smooth tail kept {smooth} of its top where the plate kept {plate}"
+        );
+    }
+
+    /// The thirteenth echo position is what its label says: three heads, and
+    /// no spring. It is the one combination Roland's switch cannot make.
+    #[test]
+    fn the_three_head_position_is_every_head_and_no_spring() {
+        assert_eq!(EchoMode::ThreeDry.heads(), [true, true, true]);
+        assert!(!EchoMode::ThreeDry.reverb(), "the spring came in uninvited");
+        // And it is genuinely absent from the machine: every OTHER position
+        // with all three heads brings the tank with it.
+        for m in EchoMode::ALL {
+            if m != EchoMode::ThreeDry && m.heads() == [true, true, true] {
+                assert!(
+                    m.reverb(),
+                    "{} is a second dry three-head position, so ThreeDry is not an addition",
+                    m.label()
+                );
+            }
+        }
+        // Both inventions are marked, and nothing else is.
+        for label in [EchoMode::ThreeDry.label(), ReverbMode::Smooth.label()] {
+            assert!(label.starts_with('*'), "{label} is unmarked");
+        }
+        for m in EchoMode::ALL {
+            if m != EchoMode::ThreeDry {
+                assert!(!m.label().starts_with('*'), "{} is falsely marked", m.label());
+            }
+        }
+        assert!(!ReverbMode::Plate.label().starts_with('*'));
+    }
+
+    /// **Every mode of both machines, bounded.**
+    ///
+    /// The sweep above moves every continuous parameter and holds the two
+    /// selectors still; this one holds the parameters at their worst and
+    /// moves the selectors, which is the half that matters for a new mode.
+    ///
+    /// `ReverbMode::Smooth` runs different damping and different diffusion
+    /// from the plate, and `EchoMode::ThreeDry` is the ONLY echo position
+    /// that opens all three heads with no spring in circuit to soak up what
+    /// comes back — with Intensity at self-oscillation, which this file
+    /// deliberately allows. If anything in here is going to run away, that
+    /// pair is it.
+    #[test]
+    fn every_mode_of_both_machines_stays_bounded() {
+        for reverb_mode in ReverbMode::ALL {
+            for echo_mode in EchoMode::ALL {
+                let p = Params {
+                    reverb_mode,
+                    echo_mode,
+                    // Everything that feeds a loop, wide open.
+                    reverb_size: 1.0,
+                    reverb_damp: 1.0,
+                    reverb_width: 1.0,
+                    plate_dispersion: 1.0,
+                    plate_predelay: 0.0,
+                    delay_feedback: 1.0,
+                    delay_tone: 1.0,
+                    delay_width: 1.0,
+                    ..Params::default()
+                };
+                let mut fx = Effects::new(SR);
+                let frames = 8_000;
+                let mut phase = 0.0_f32;
+                for _ in 0..12 {
+                    let mut buf = vec![0.0_f32; frames * 2];
+                    for f in buf.chunks_exact_mut(2) {
+                        phase += 110.0 * std::f32::consts::TAU / SR;
+                        let v = phase.sin();
+                        f[0] = v;
+                        f[1] = -v;
+                    }
+                    fx.process(&mut buf, frames, 2, sends(1.0, 1.0, 1.0), &p, 120.0);
+                    assert!(
+                        buf.iter().all(|s| s.is_finite()),
+                        "{} / {} produced a non-finite sample",
+                        reverb_mode.label(),
+                        echo_mode.label()
+                    );
+                    assert!(
+                        peak(&buf) < 12.0,
+                        "{} / {} reached {} with everything open",
+                        reverb_mode.label(),
+                        echo_mode.label(),
+                        peak(&buf)
+                    );
                 }
             }
         }
@@ -4718,4 +5175,115 @@ mod tests {
         }
         assert_eq!(Division::from_key("nonsense"), None);
     }
+    /// The first window, in milliseconds, carrying `frac` of the peak.
+    #[cfg(test)]
+    fn plate_onset_ms(pre: f32, frac: f64) -> usize {
+        let mut fx = Effects::new_send(SR);
+        let p = Params {
+            plate_predelay: pre,
+            ..Params::default()
+        };
+        let out = strike_with(&mut fx, 48_000, sends(1.0, 0.0, 0.0), &p, 120.0);
+        let w = (SR / 1000.0) as usize;
+        let env: Vec<f64> = (0..400)
+            .map(|k| {
+                let i = k * w;
+                let s: f64 = out[i * 2..(i + w) * 2]
+                    .iter()
+                    .map(|v| f64::from(*v) * f64::from(*v))
+                    .sum();
+                (s / (w * 2) as f64).sqrt()
+            })
+            .collect();
+        let peak = env.iter().cloned().fold(0.0_f64, f64::max);
+        env.iter().position(|v| *v > peak * frac).unwrap_or(9_999)
+    }
+
+    /// **Turning the predelay off must not turn it all the way up.**
+    ///
+    /// The line was read before it was written, so the slot the read landed on
+    /// at a delay of zero still held the sample from a whole buffer ago: the
+    /// one setting the plate itself has came out as the LONGEST delay the line
+    /// can hold, 150 ms of silence and then the tail. Every other position of
+    /// the control was correct, which is what kept it hidden — it worked all
+    /// the way down and then fell off the end.
+    #[test]
+    fn turning_the_predelay_off_does_not_turn_it_up() {
+        let off = plate_onset_ms(0.0, 0.05);
+        let half = plate_onset_ms(0.5, 0.05);
+        let full = plate_onset_ms(1.0, 0.05);
+        assert!(
+            off < 12,
+            "a predelay of zero held the tail off for {off} ms, and a plate's \
+             tail starts when the coil moves"
+        );
+        assert!(
+            off < half && half < full,
+            "the predelay does not run in order: off {off} ms, half {half} ms, \
+             full {full} ms"
+        );
+        assert!(
+            (100..200).contains(&full),
+            "the predelay tops out at {full} ms, not the {} it is documented \
+             to reach",
+            PLATE_PREDELAY_MS.1
+        );
+    }
+
+    /// **The plate opens at once. It does not swell.**
+    ///
+    /// A plate has no early reflections and no build-up: the band crosses it in
+    /// a millisecond, so the echoes are too dense to count by the time anybody
+    /// hears them. Read at ONE point, the tank could not answer until the
+    /// signal reached that point — which sat behind a fifteen-millisecond
+    /// delay line — so every hit began with a hole and then swelled into it.
+    /// That is a slapback, and it is what the owner heard. See [`PLATE_TAPS`].
+    #[test]
+    fn the_plate_opens_without_a_hole_in_front_of_it() {
+        let mut fx = Effects::new_send(SR);
+        let p = Params::default();
+        let out = strike_with(&mut fx, 48_000, sends(1.0, 0.0, 0.0), &p, 120.0);
+        let w = (SR / 1000.0) as usize;
+        let env: Vec<f64> = (0..300)
+            .map(|k| {
+                let i = k * w;
+                let s: f64 = out[i * 2..(i + w) * 2]
+                    .iter()
+                    .map(|v| f64::from(*v) * f64::from(*v))
+                    .sum();
+                (s / (w * 2) as f64).sqrt()
+            })
+            .collect();
+        let peak = env.iter().cloned().fold(0.0_f64, f64::max);
+        // Eight milliseconds in, there has to be a plate there.
+        let early = env[8] / peak.max(1.0e-30);
+        assert!(
+            early > 0.03,
+            "eight milliseconds after the hit the plate is at {early:.3} of its \
+             peak, which is a hole in front of the reverb"
+        );
+    }
+    /// **The free position rests where it always was.**
+    ///
+    /// It was a fixed 375 ms before it had a control; putting a rate slider
+    /// under it must not move every session that was already on it. The
+    /// default is solved from the span rather than typed, and the first
+    /// hand-picked value was a fifth out — near enough to look right and wrong
+    /// enough to hear.
+    #[test]
+    fn the_free_rate_rests_on_the_time_it_used_to_be_fixed_at() {
+        let got = free_secs(free_default());
+        assert!(
+            (got - FREE_SECS).abs() < 0.001,
+            "free rests at {got}s, not the {FREE_SECS}s it was nailed to"
+        );
+        // And it SWEEPS, slowest to fastest, without turning over.
+        let ends = [free_secs(0.0), free_secs(1.0)];
+        assert!(ends[0] > ends[1], "the rate runs backwards: {ends:?}");
+        for k in 1..=20 {
+            let (a, b) = (free_secs((k - 1) as f32 / 20.0), free_secs(k as f32 / 20.0));
+            assert!(a > b, "the rate is not monotone at {k}: {a} then {b}");
+        }
+    }
+
 }

@@ -2456,6 +2456,10 @@ fn visible_patches(voices: &[String], filter: &str) -> Vec<usize> {
 /// one id serves them all and the window keeps its place between dialogs.
 const DIALOG_ID: &str = "ivory-dialog";
 
+/// The notice window's own identity, kept apart from [`DIALOG_ID`] so a notice
+/// and a dialog can be on screen at once.
+const NOTICE_ID: &str = "ivory-notice";
+
 pub fn color_pick_title(target: ColorTarget) -> &'static str {
     match target {
         ColorTarget::WhiteIdle => "Choose White Key Color",
@@ -2798,6 +2802,62 @@ pub fn show_export_progress(
                 });
         },
     );
+}
+
+/// The band's message, as its own window. Returns true when the user closed it.
+///
+/// **The one window in this file that is NOT modal, and that is the whole
+/// reason it is not a `Dialog`.**
+///
+/// These messages replaced the status line that used to run along the foot of
+/// the record band. Some of them are transient and arrive while the user is in
+/// the middle of something — "starting the camera - this can take a few
+/// seconds" is the clearest case — and every `Dialog` here is modal, because
+/// `handle_main_interaction` drops every event while one is up. Routing a
+/// camera warm-up through that machinery would have frozen the app for the
+/// several seconds it takes a USB webcam to wake, with a window on screen
+/// saying, accurately, that it was starting.
+///
+/// So this one takes its own surface id, does not take focus, does not dim
+/// what is behind it, and does not block a thing. It also does not steal the
+/// dialog slot: a notice arriving while the export window is open leaves the
+/// export window exactly where it was.
+pub fn show_notice(ctx: &egui::Context, placement: Placement, text: &str) -> bool {
+    let inline = !placement.caps.child_windows;
+    let size = Vec2::new(460.0, 168.0);
+    let mut closed = false;
+    let spec = crate::shell::SurfaceSpec {
+        id: NOTICE_ID,
+        title: "Tangent",
+        size,
+        min_size: Vec2::new(280.0, 120.0),
+        pos: placement.position_for(size),
+        decorated: true,
+        resizable: true,
+        // **Not focus-taking**, or a message arriving mid-edit would move the
+        // caret out of whatever field somebody was typing in.
+        takes_focus: false,
+        modal: false,
+        on_top: !placement.native_panel_up,
+        window_type: Some(egui::X11WindowType::Dialog),
+        ..Default::default()
+    };
+    let report = crate::shell::surface(ctx, placement.caps, &spec, &mut |ui, want_close| {
+        if inline {
+            ui.painter()
+                .rect_filled(ui.max_rect(), 4.0, ui.style().visuals.window_fill);
+        }
+        ui.add_space(8.0);
+        ui.label(RichText::new(text));
+        ui.add_space(12.0);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui.button("  Close  ").clicked() {
+                closed = true;
+                *want_close = true;
+            }
+        });
+    });
+    closed || report.close
 }
 
 pub fn show(

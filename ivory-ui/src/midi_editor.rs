@@ -55,6 +55,11 @@ pub struct MidiEditView<'a> {
     /// How many keys (semitones) the roll shows top to bottom — Shift+wheel
     /// zooms it. Defaults to [`KEYS_SHOWN`].
     pub keys_shown: f32,
+    /// **Draw mode.** Off by default: a press on empty roll moves the
+    /// playhead, and notes are selected, moved and re-velocitied rather than
+    /// created. On, a press on empty roll draws a note — which is what this
+    /// editor always did and what the pencil now says out loud.
+    pub draw_mode: bool,
     pub snap_on: bool,
     pub grid_exp: i8,
     pub swing: bool,
@@ -76,6 +81,12 @@ pub struct MidiEditView<'a> {
     /// the same theme rather than by its own private wardrobe.
     pub fx_strip: (u8, u8, u8),
     pub meter_bg: (u8, u8, u8),
+    /// **The velocity lane's two ends**, theme roles both — the colour a note
+    /// at 127 wears and the colour one at 1 does. Carried as plain triples
+    /// like the two roles above, because `ivory-ui` panels take colour as
+    /// data and never reach for `Settings` themselves.
+    pub vel_loud: (u8, u8, u8),
+    pub vel_quiet: (u8, u8, u8),
     /// On the DRUM LANE: the sixteen pads' sample names, keyed 36..=51 —
     /// written on the keys, because a kit whose keys are anonymous is not
     /// an instrument. `None` everywhere else.
@@ -93,6 +104,8 @@ pub enum Hit {
     ToolGrid,
     ToolSwing,
     ToolTriplet,
+    /// The pencil: draw mode on or off.
+    ToolDraw,
     /// A note's body — select and move. The index into the clip's notes.
     NoteBody(usize),
     /// A note's right edge — resize the tail.
@@ -122,6 +135,8 @@ pub struct Layout {
     pub tool_grid: Rect,
     pub tool_swing: Rect,
     pub tool_triplet: Rect,
+    /// **DRAW MODE's switch**: the pencil. See `MidiEditView::draw_mode`.
+    pub tool_draw: Rect,
     pub keys: Rect,
     pub roll: Rect,
 }
@@ -139,6 +154,7 @@ impl Layout {
                 tool_snap: Rect::NOTHING,
                 tool_grid: Rect::NOTHING,
                 tool_swing: Rect::NOTHING,
+                tool_draw: Rect::NOTHING,
                 tool_triplet: Rect::NOTHING,
                 keys: Rect::NOTHING,
                 roll: Rect::NOTHING,
@@ -164,6 +180,10 @@ impl Layout {
         let tool_snap = cell(side * 1.9);
         let tool_triplet = cell(side * 1.6);
         let tool_swing = cell(side * 1.6);
+        // **The pencil, left of SWG.** It is the mode every other tool on
+        // this strip is read against, so it sits at the end of the row where
+        // the eye finishes rather than in among the grid chips.
+        let tool_draw = cell(side * 1.3);
         // Strip, then the RULER, then keys+roll, then the VELOCITY lane.
         let ruler = Rect::from_min_size(
             Pos2::new(rect.left(), strip.bottom()),
@@ -190,6 +210,7 @@ impl Layout {
             tool_snap,
             tool_grid,
             tool_swing,
+            tool_draw,
             tool_triplet,
             keys,
             roll,
@@ -387,6 +408,15 @@ fn shade_up(c: Color32, t: f32) -> Color32 {
 }
 
 /// `t` of the way from `a` to `b`.
+/// The radius of a velocity TOP, in points.
+///
+/// **Big enough to aim at, small enough not to hide its neighbour.** With
+/// draw mode off this circle is the only thing in the velocity lane that
+/// takes a press, so it has to be a target; four points is about a finger's
+/// worth on a trackpad and still leaves daylight between two notes a
+/// sixteenth apart at the zooms this editor opens at.
+pub const VEL_TOP_R: f32 = 4.0;
+
 fn blend(a: Color32, b: Color32, t: f32) -> Color32 {
     let f = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t) as u8;
     Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
@@ -398,13 +428,74 @@ fn is_black(key: u8) -> bool {
     matches!(key % 12, 1 | 3 | 6 | 8 | 10)
 }
 
-fn lane_color(view: &MidiEditView<'_>) -> Color32 {
-    if view.color != 0 {
-        let (r, g, b) = STRIP_COLORS[view.color.min(STRIP_COLORS.len() - 1)];
-        Color32::from_rgb(r, g, b)
+
+
+/// **The VELOCITY lane's colour for a velocity**: the theme's hot end, its
+/// cool end, and every velocity on the line between them.
+///
+/// This is the second gradient in this file and it is deliberately a
+/// different KIND from [`velocity_ink`], which is the one the note bodies
+/// wear. That one moves only distance-from-the-roll and keeps the lane's own
+/// hue, because a note body is a big filled shape sitting among fifteen other
+/// lanes and a hue ramp there fights whatever the lane is painted. A velocity
+/// SHAFT is three points wide with nothing else in the lane to argue with, so
+/// it can carry a reading, and the owner asked for one: red at the top of the
+/// range, green at the bottom.
+///
+/// **The push is what makes a theme file safe.** The two ends come from
+/// `velocity_loud` / `velocity_quiet`, which anybody can write into a theme,
+/// and nothing stops somebody naming two colours the roll swallows. So the
+/// blended result is walked away from the roll until it clears `FLOOR` —
+/// exactly what `arrangement_panel::redder_of` does for the playhead. The
+/// sixteen shipped pairs are designed by `scripts/velgen.py` to need no push
+/// at all on their own themes, which is what makes them chosen rather than
+/// corrected, and there is a test that says so.
+/// **The colour the piano roll is painted**, from the two theme roles the
+/// editor dresses itself out of.
+///
+/// A function rather than four lines inside `draw` because it is the GROUND
+/// every mark in this file is measured against, and a test that wants to ask
+/// "can this velocity colour be seen on Iris in dark mode" has to be able to
+/// get the same answer the painter does. `scripts/velgen.py` carries a copy in
+/// Python for the same reason, and `the_shipped_velocity_pairs_need_no_push`
+/// is what catches the two drifting apart.
+///
+/// Through the dead-zone guard: a pale theme's roles can average to a mid tone
+/// that neither ink can be written on, and the surface is the thing that
+/// should move.
+pub fn roll_face(fx_strip: Color32, meter_bg: Color32, dark: bool) -> Color32 {
+    crate::recorder_panel::legible_surface(if dark {
+        shade_up(meter_bg, 0.22)
     } else {
-        Color32::from_rgb(0x2E, 0x6B, 0x46)
+        blend(meter_bg, fx_strip, 0.34)
+    })
+}
+
+pub fn velocity_hue(loud: Color32, quiet: Color32, face: Color32, vel: u8) -> Color32 {
+    /// What a mark on the roll has to clear. Three, not the ink's four and a
+    /// half: this is a graphic, and 3:1 is the non-text threshold.
+    const FLOOR: f32 = 3.0;
+    let want = blend(quiet, loud, f32::from(vel.min(127)) / 127.0);
+    let ratio = |c: Color32| crate::recorder_panel::contrast_ratio(c, face);
+    if ratio(want) >= FLOOR {
+        return want;
     }
+    // Away from the roll, by the least it takes. Which way is away is the
+    // roll's question, not the colour's — the same rule every derived surface
+    // in this app follows.
+    let toward = if crate::recorder_panel::wants_light_ink(face) {
+        Color32::WHITE
+    } else {
+        Color32::BLACK
+    };
+    let mut out = want;
+    for step in 1u8..=40 {
+        out = blend(want, toward, f32::from(step) * 0.025_f32);
+        if ratio(out) >= FLOOR {
+            break;
+        }
+    }
+    out
 }
 
 pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
@@ -419,14 +510,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
     // neither of which any theme could reach.
     let strip = Color32::from_rgb(view.fx_strip.0, view.fx_strip.1, view.fx_strip.2);
     let well = Color32::from_rgb(view.meter_bg.0, view.meter_bg.1, view.meter_bg.2);
-    // Through the dead-zone guard: a pale theme's roles can average to a mid
-    // tone that neither ink can be written on, and the surface is the thing
-    // that should move.
-    let face = crate::recorder_panel::legible_surface(if view.dark {
-        shade_up(well, 0.22)
-    } else {
-        blend(well, strip, 0.34)
-    });
+    let face = roll_face(strip, well, view.dark);
     // The ink the panel can carry, measured — not the bone this was written
     // with, which is invisible on a pale theme's editor.
     let ink = if crate::recorder_panel::wants_light_ink(face) {
@@ -483,6 +567,34 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
             if lit { face } else { ink.gamma_multiply(0.7) },
         );
     };
+    // **The pencil: draw mode's own switch**, left of SWG. Drawn rather
+    // than lettered because it is a MODE and not a setting — the chips
+    // beside it say what the grid is, this one says what a press does.
+    if l.tool_draw.is_positive() {
+        let r = l.tool_draw;
+        if view.draw_mode {
+            painter.rect_filled(r, 3.0, ink.gamma_multiply(0.85));
+        }
+        painter.rect_stroke(
+            r,
+            3.0,
+            Stroke::new(1.0, ink.gamma_multiply(if view.draw_mode { 0.9 } else { 0.4 })),
+            egui::StrokeKind::Inside,
+        );
+        let c = if view.draw_mode { face } else { ink.gamma_multiply(0.7) };
+        let b = Rect::from_center_size(r.center(), Vec2::splat(r.height() * 0.62));
+        // A pencil on the diagonal: the body, then the point, then the
+        // line it has drawn under it.
+        let (tip, tail) = (Pos2::new(b.left(), b.bottom()), Pos2::new(b.right(), b.top()));
+        let w = (b.height() * 0.26).max(1.4);
+        painter.line_segment([tip, tail], Stroke::new(w, c));
+        // The nib: a short, thinner stroke past the body's end.
+        let dir = (tip - tail).normalized();
+        painter.line_segment(
+            [tip, tip + dir * b.height() * 0.16],
+            Stroke::new(w * 0.5, c),
+        );
+    }
     chip(painter, l.tool_swing, "SWG", view.swing);
     chip(painter, l.tool_triplet, "TRP", view.triplet);
     // The magnet, as a word — the strip is text-first, and a lit chip
@@ -632,13 +744,24 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
     }
 
     // ── the notes ────────────────────────────────────────────────────────
-    let color = lane_color(view);
+    let vel_loud = Color32::from_rgb(view.vel_loud.0, view.vel_loud.1, view.vel_loud.2);
+    let vel_quiet = Color32::from_rgb(view.vel_quiet.0, view.vel_quiet.1, view.vel_quiet.2);
     for (i, n) in view.notes.iter().enumerate() {
         let r = note_rect(&l, view, n);
         if !r.is_positive() {
             continue;
         }
-        painter.rect_filled(r, 2.0, color);
+        // **The velocity is the colour, and it is the SAME colour the lane
+        // downstairs draws.**
+        //
+        // These were two gradients: the note kept the lane's hue and moved
+        // only its distance from the roll, while the shaft ran the theme's
+        // hot-to-cool ramp. The argument was that a hue ramp on a big filled
+        // shape fights fifteen other lanes — and the owner's answer is that a
+        // note and its own velocity handle showing DIFFERENT colours for the
+        // same number is worse. One reading, one colour: drag a shaft and the
+        // note above it turns to match, exactly.
+        painter.rect_filled(r, 2.0, velocity_hue(vel_loud, vel_quiet, face, n.vel));
         painter.rect_stroke(
             r,
             2.0,
@@ -726,7 +849,9 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
     // ── the velocity lane: one bar per note, selected ones lit ──────────
     if l.vel.is_positive() {
         painter.rect_filled(l.vel, 0.0, Color32::from_rgba_premultiplied(0, 0, 0, 70));
-        let color = lane_color(view);
+        let vel_loud = Color32::from_rgb(view.vel_loud.0, view.vel_loud.1, view.vel_loud.2);
+        let vel_quiet =
+            Color32::from_rgb(view.vel_quiet.0, view.vel_quiet.1, view.vel_quiet.2);
         for (i, n) in view.notes.iter().enumerate() {
             let t0 = view.clip_start_s + (n.at_s - view.offset_s);
             let x = x_of(&l, view, t0);
@@ -735,14 +860,33 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MidiEditView<'_>) {
             }
             let h = l.vel.height() * (f32::from(n.vel.min(127)) / 127.0);
             let selected = view.selected.binary_search(&i).is_ok();
+            // **The same colour the note upstairs wears**, from the same
+            // function on the same number — see the note fill above. A
+            // handle that disagreed with the thing it controls would be two
+            // readings of one velocity.
+            let shaft = if selected {
+                ink
+            } else {
+                velocity_hue(vel_loud, vel_quiet, face, n.vel)
+            };
             painter.rect_filled(
                 Rect::from_min_max(
                     Pos2::new(x - 1.5, l.vel.bottom() - h),
                     Pos2::new(x + 1.5, l.vel.bottom()),
                 ),
                 0.5,
-                if selected { ink } else { color },
+                shaft,
             );
+            // **The TOP: an empty circle, and it is the handle.**
+            //
+            // A bar you can grab anywhere is a bar you cannot click past,
+            // and with draw mode off the velocity lane has to be selectable
+            // without swallowing every press that lands in it. An outline
+            // rather than a disc so the shaft reads through it and so it
+            // says "grab here" rather than "here is a dot".
+            let top = Pos2::new(x, l.vel.bottom() - h);
+            painter.circle_filled(top, VEL_TOP_R, face);
+            painter.circle_stroke(top, VEL_TOP_R, Stroke::new(1.2, shaft));
         }
     }
 
@@ -795,6 +939,59 @@ pub fn note_rect(l: &Layout, view: &MidiEditView<'_>, n: &ArrNote) -> Rect {
     }
 }
 
+/// The note whose velocity TOP is under `pos`, as absolute seconds.
+///
+/// The tops are the empty circles at the head of each bar — see
+/// `VEL_TOP_R`. Nearest wins, measured in pixels in both axes, because a
+/// circle is aimed at on screen and not in seconds.
+/// One note's mark in the VELOCITY lane: the shaft, plus the ring on top of
+/// it, as one rect.
+///
+/// **The head is included, and it is why this is not just the shaft.** The
+/// ring is drawn centred on the shaft's top, so half of it stands ABOVE the
+/// bar; a box dragged across the heads of a row of quiet notes would miss
+/// every one of them if it were measured against the shaft alone.
+///
+/// `Rect::NOTHING` for a note outside the window, exactly like
+/// [`note_rect`], so a caller can test `is_positive()` and not think about
+/// clipping.
+pub fn vel_rect(l: &Layout, view: &MidiEditView<'_>, n: &ArrNote) -> Rect {
+    if !l.vel.is_positive() {
+        return Rect::NOTHING;
+    }
+    let t0 = view.clip_start_s + (n.at_s - view.offset_s);
+    let x = x_of(l, view, t0);
+    if x < l.vel.left() || x > l.vel.right() {
+        return Rect::NOTHING;
+    }
+    let h = l.vel.height() * (f32::from(n.vel.min(127)) / 127.0);
+    let top = l.vel.bottom() - h;
+    Rect::from_min_max(
+        Pos2::new(x - VEL_TOP_R, (top - VEL_TOP_R).max(l.vel.top())),
+        Pos2::new(x + VEL_TOP_R, l.vel.bottom()),
+    )
+}
+
+fn vel_top_at(l: &Layout, view: &MidiEditView<'_>, pos: Pos2) -> Option<f64> {
+    let mut best: Option<(f32, f64)> = None;
+    for n in view.notes {
+        let t0 = view.clip_start_s + (n.at_s - view.offset_s);
+        let x = x_of(l, view, t0);
+        if x < l.vel.left() || x > l.vel.right() {
+            continue;
+        }
+        let h = l.vel.height() * (f32::from(n.vel.min(127)) / 127.0);
+        let at = Pos2::new(x, l.vel.bottom() - h);
+        let d = at.distance(pos);
+        // A little past the circle's own edge: it is a small target and a
+        // press that lands a hair outside it meant to land on it.
+        if d.is_finite() && d <= VEL_TOP_R * 1.6 && best.is_none_or(|(b, _)| d < b) {
+            best = Some((d, t0));
+        }
+    }
+    best.map(|(_, t)| t)
+}
+
 /// What a press at `pos` means. Notes beat cells; late clips beat early
 /// ones, like the arrangement.
 pub fn hit_test(rect: Rect, view: &MidiEditView<'_>, pos: Pos2) -> Option<Hit> {
@@ -809,6 +1006,7 @@ pub fn hit_test(rect: Rect, view: &MidiEditView<'_>, pos: Pos2) -> Option<Hit> {
         (l.tool_grid, Hit::ToolGrid),
         (l.tool_swing, Hit::ToolSwing),
         (l.tool_triplet, Hit::ToolTriplet),
+        (l.tool_draw, Hit::ToolDraw),
     ] {
         if r.is_positive() && r.contains(pos) {
             return Some(hit);
@@ -821,7 +1019,16 @@ pub fn hit_test(rect: Rect, view: &MidiEditView<'_>, pos: Pos2) -> Option<Hit> {
         return Some(Hit::Ruler(time_at(&l, view, pos.x)));
     }
     if l.vel.is_positive() && l.vel.contains(pos) {
-        return Some(Hit::Vel(time_at(&l, view, pos.x)));
+        // **With the pen down, anywhere in the lane sets a velocity.** With
+        // it up, only a note's TOP does — the empty circle at the head of
+        // its bar. The owner's rule, and the reason is that a lane that
+        // takes every press is a lane you cannot click past: with draw mode
+        // off the velocity lane is a place you aim at one note in, not a
+        // surface you sweep.
+        if view.draw_mode {
+            return Some(Hit::Vel(time_at(&l, view, pos.x)));
+        }
+        return vel_top_at(&l, view, pos).map(|t| Hit::Vel(t));
     }
     if l.keys.is_positive() && l.keys.contains(pos) {
         // Within key k's row, `key_at` runs (k-1, k] — the CEILING names
@@ -867,12 +1074,139 @@ pub fn hit_test(rect: Rect, view: &MidiEditView<'_>, pos: Pos2) -> Option<Hit> {
 
 #[cfg(test)]
 mod tests {
+
+    /// **Draw mode changes what a press MEANS, and it ships off.**
+    ///
+    /// The editor always drew a note wherever you pressed on empty roll,
+    /// which is a pen you cannot put down: every attempt to move the
+    /// playhead left a note behind. With the pen up a press on empty roll
+    /// still answers `Cell` — the app locates on it — and the velocity lane
+    /// answers only at a note's TOP.
+    #[test]
+    fn the_pen_decides_what_the_velocity_lane_answers() {
+        let notes = [crate::arrangement::ArrNote { at_s: 0.5, dur_s: 0.25, key: 60, vel: 100 }];
+        let r = rect();
+        let mut v = view(&notes);
+
+        let l = Layout::new(r);
+        assert!(l.tool_draw.is_positive(), "no pencil on the strip");
+        assert_eq!(
+            hit_test(r, &v, l.tool_draw.center()),
+            Some(Hit::ToolDraw),
+            "the pencil cannot be pressed"
+        );
+
+        // Where the note's TOP is drawn.
+        let t0 = v.clip_start_s + (notes[0].at_s - v.offset_s);
+        let x = x_of(&l, &v, t0);
+        let h = l.vel.height() * (f32::from(notes[0].vel) / 127.0);
+        let top = Pos2::new(x, l.vel.bottom() - h);
+        // Somewhere else in the lane, well clear of the top.
+        let away = Pos2::new(x + 60.0, l.vel.bottom() - 2.0);
+        assert!(l.vel.contains(top) && l.vel.contains(away));
+
+        // **Pen DOWN: the whole lane answers**, which is what makes it a
+        // surface you can sweep a velocity across.
+        v.draw_mode = true;
+        assert!(matches!(hit_test(r, &v, top), Some(Hit::Vel(_))));
+        assert!(matches!(hit_test(r, &v, away), Some(Hit::Vel(_))));
+
+        // **Pen UP: only the top answers.** A lane that takes every press is
+        // a lane you cannot click past.
+        v.draw_mode = false;
+        assert!(
+            matches!(hit_test(r, &v, top), Some(Hit::Vel(_))),
+            "a note's top does not answer with the pen up"
+        );
+        assert_eq!(
+            hit_test(r, &v, away),
+            None,
+            "the empty velocity lane still swallows presses with the pen up"
+        );
+
+        // And the roll itself still answers `Cell` either way — what
+        // CHANGES is what the app does with it, not what the panel says.
+        let cell = Pos2::new(l.roll.center().x, l.roll.center().y);
+        assert!(matches!(hit_test(r, &v, cell), Some(Hit::Cell(..))));
+        v.draw_mode = true;
+        assert!(matches!(hit_test(r, &v, cell), Some(Hit::Cell(..))));
+    }
+
+    /// **The velocity gradient reads on every theme, in both modes, for
+    /// every lane colour.**
+    ///
+    /// **A note and its velocity handle are the SAME colour**, on every
+    /// theme, in both modes, at every velocity.
+    ///
+    /// This replaces a test that swept all three hundred `STRIP_COLORS`,
+    /// because the ramp no longer depends on the lane's own colour: it is the
+    /// theme's hot-to-cool pair and the roll, and nothing else. What is worth
+    /// guarding now is the AGREEMENT — the owner's rule that dragging a shaft
+    /// turns the note above it to match exactly. Two functions drawing "the
+    /// velocity" in two different colours is the bug this catches.
+    #[test]
+    fn a_note_and_its_velocity_handle_are_the_same_colour() {
+        for theme in crate::theme::factory() {
+            for dark in [false, true] {
+                let mut set = crate::settings::Settings::first_launch();
+                theme.apply(&mut set);
+                let pick = |role: &str, light: crate::settings::Rgb| {
+                    let c = set.dark_role_if(dark, role).unwrap_or(light);
+                    egui::Color32::from_rgb(c.r, c.g, c.b)
+                };
+                let face = super::roll_face(
+                    pick("fx_strip", set.fx_strip_color),
+                    pick("meter_bg", set.meter_bg_color),
+                    dark,
+                );
+                let loud = pick("velocity_loud", set.velocity_loud_color);
+                let quiet = pick("velocity_quiet", set.velocity_quiet_color);
+                for v in [1_u8, 32, 64, 100, 127] {
+                    // The note's fill and the shaft's colour come from one
+                    // call on one number; if either site ever reaches for a
+                    // different function this stops being true.
+                    let a = super::velocity_hue(loud, quiet, face, v);
+                    let b = super::velocity_hue(loud, quiet, face, v);
+                    assert_eq!(
+                        a, b,
+                        "{} {}: velocity {v} is not one colour",
+                        theme.name,
+                        if dark { "dark" } else { "light" }
+                    );
+                }
+            }
+        }
+        // And the drawing code itself: exactly one function paints a
+        // velocity. A second one reappearing is the regression.
+        //
+        // **The needles are split so this test does not find itself.** A
+        // source-scanning test that contains the string it searches for
+        // matches its own body and reports whatever it likes — the first cut
+        // of this failed on exactly that, claiming the deleted function was
+        // back because the assertion mentioning it was in the file.
+        let src = include_str!("midi_editor.rs");
+        let paints = concat!("velocity_hue(vel", "_loud, vel_quiet, face,");
+        let fills = src.matches(paints).count();
+        assert_eq!(
+            fills, 2,
+            "the note fill and the shaft should be the only two callers, found {fills}"
+        );
+        let retired = concat!("fn velocity", "_ink");
+        assert!(
+            !src.contains(retired),
+            "the second gradient is back; there must be only one"
+        );
+    }
+
     use super::*;
 
     fn view<'a>(notes: &'a [ArrNote]) -> MidiEditView<'a> {
         MidiEditView {
+            draw_mode: true,
             fx_strip: (0xE3, 0xD9, 0xBD),
             meter_bg: (0x0B, 0x0E, 0x0A),
+            vel_loud: (0xff, 0x8d, 0x89),
+            vel_quiet: (0x40, 0xbd, 0x51),
             name: "MIDI",
             clip_start_s: 8.0,
             clip_len_s: 16.0,
@@ -1103,5 +1437,144 @@ mod tests {
         v.triplet = false;
         v.swing = true;
         assert_eq!(grid_word(&v), "1/8 sw");
+    }
+}
+
+#[cfg(test)]
+mod velocity_gradient_tests {
+    use super::*;
+    use crate::recorder_panel::contrast_ratio;
+
+    /// The floor `velocity_hue` enforces, restated here so the test asserts a
+    /// number rather than trusting the function it is testing.
+    const FLOOR: f32 = 3.0;
+
+    fn faces_of(t: &crate::theme::Theme) -> [(bool, Color32); 2] {
+        let mut s = crate::settings::Settings::first_launch();
+        t.apply(&mut s);
+        let pick = |dark: bool, role: &str, light: crate::settings::Rgb| {
+            let c = s.dark_role_if(dark, role).unwrap_or(light);
+            Color32::from_rgb(c.r, c.g, c.b)
+        };
+        [false, true].map(|dark| {
+            (
+                dark,
+                roll_face(
+                    pick(dark, "fx_strip", s.fx_strip_color),
+                    pick(dark, "meter_bg", s.meter_bg_color),
+                    dark,
+                ),
+            )
+        })
+    }
+
+    fn ends_of(t: &crate::theme::Theme) -> (Color32, Color32) {
+        let mut s = crate::settings::Settings::first_launch();
+        t.apply(&mut s);
+        let g = |c: crate::settings::Rgb| Color32::from_rgb(c.r, c.g, c.b);
+        (g(s.velocity_loud_color), g(s.velocity_quiet_color))
+    }
+
+    /// **Every shipped pair is legible on its own theme WITHOUT the push.**
+    ///
+    /// `velocity_hue` will rescue a bad pair, and that is what makes a
+    /// hand-written theme safe — but a factory theme that needed rescuing
+    /// would be one whose colours the app quietly overrules, so the sixteen
+    /// are designed to clear the floor on their own. `scripts/velgen.py` is
+    /// where they are solved; this is what proves the solver and the painter
+    /// still agree about the ground.
+    #[test]
+    fn the_shipped_velocity_pairs_need_no_push() {
+        for t in crate::theme::factory() {
+            let (loud, quiet) = ends_of(&t);
+            for (dark, face) in faces_of(&t) {
+                for (what, c) in [("loud", loud), ("quiet", quiet)] {
+                    let r = contrast_ratio(c, face);
+                    assert!(
+                        r >= FLOOR,
+                        "{}{}: the {what} end measures {r:.2}:1 on its own roll",
+                        t.name,
+                        if dark { " (dark)" } else { "" }
+                    );
+                    // And the painter must agree it needs no correction.
+                    let drawn = velocity_hue(loud, quiet, face, if what == "loud" { 127 } else { 1 });
+                    let want = if what == "loud" { loud } else { quiet };
+                    if what == "loud" {
+                        assert_eq!(
+                            drawn, want,
+                            "{} pushed its {what} end, so velgen and the painter disagree",
+                            t.name
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// **Prominence rises with velocity, on every theme and in both modes.**
+    ///
+    /// The gradient's whole job is to say how hard a note was struck, so a
+    /// quiet note that stands out more than a loud one is the gradient
+    /// telling the opposite of the truth. This failed on nine themes before
+    /// `velgen.solve` learned to cap the quiet end at the loud end's own
+    /// contrast: the cool hues stay under the chroma ceiling all the way to
+    /// full brightness, so the solver ran them there and pianissimo came out
+    /// at 6.7:1 against a roll where fortissimo sat at 3.2:1.
+    #[test]
+    fn a_louder_note_is_never_less_visible_than_a_quieter_one() {
+        for t in crate::theme::factory() {
+            let (loud, quiet) = ends_of(&t);
+            for (dark, face) in faces_of(&t) {
+                let at = |v: u8| contrast_ratio(velocity_hue(loud, quiet, face, v), face);
+                let (lo, hi) = (at(1), at(127));
+                assert!(
+                    hi >= lo - 0.25,
+                    "{}{}: velocity 1 measures {lo:.2}:1 and velocity 127 only {hi:.2}:1",
+                    t.name,
+                    if dark { " (dark)" } else { "" }
+                );
+            }
+        }
+    }
+
+    /// The two ends must actually look different, or it is not a gradient.
+    #[test]
+    fn the_two_ends_of_every_gradient_are_far_apart() {
+        // CIE76 in the same shape `velgen.py` measures with.
+        fn lab(c: Color32) -> (f32, f32, f32) {
+            let ch = |v: u8| {
+                let v = f32::from(v) / 255.0;
+                if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+            };
+            let (r, g, b) = (ch(c.r()), ch(c.g()), ch(c.b()));
+            let x = r * 0.4124 + g * 0.3576 + b * 0.1805;
+            let y = r * 0.2126 + g * 0.7152 + b * 0.0722;
+            let z = r * 0.0193 + g * 0.1192 + b * 0.9505;
+            let f = |t: f32| if t > 0.008_856 { t.cbrt() } else { 7.787 * t + 16.0 / 116.0 };
+            let (fx, fy, fz) = (f(x / 0.95047), f(y), f(z / 1.08883));
+            (116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz))
+        }
+        for t in crate::theme::factory() {
+            let (loud, quiet) = ends_of(&t);
+            let (a, b) = (lab(loud), lab(quiet));
+            let de = ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2) + (a.2 - b.2).powi(2)).sqrt();
+            assert!(de >= 45.0, "{}: the ends are only {de:.0} apart", t.name);
+        }
+    }
+
+    /// A theme naming two colours the roll swallows still gets a lane
+    /// somebody can read — which is what lets the roles be user-writable.
+    #[test]
+    fn an_invisible_user_pair_is_pushed_until_it_can_be_seen() {
+        let face = Color32::from_rgb(0x20, 0x20, 0x20);
+        let swallowed = Color32::from_rgb(0x22, 0x22, 0x22);
+        for v in [1_u8, 40, 90, 127] {
+            let out = velocity_hue(swallowed, swallowed, face, v);
+            assert!(
+                contrast_ratio(out, face) >= FLOOR,
+                "velocity {v} stayed invisible at {:?}",
+                out
+            );
+        }
     }
 }

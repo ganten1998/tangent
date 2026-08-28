@@ -121,21 +121,180 @@ pub fn heart_rect(rect: Rect) -> Rect {
     )
 }
 
+/// **Where each pixel of the sprite goes inside `rect`**, and how big it is.
+///
+/// One function, because three drawing passes used to work it out for
+/// themselves as `rect.height() / 6` and lay the columns out from
+/// `rect.left()`. Two things go wrong with that and both were visible:
+///
+/// * The sprite is seven wide and six tall, so a rect that is not exactly
+///   [`HEART_ASPECT`] gets a heart as wide as seven of its own height —
+///   wider than the box it was given. The last column then falls outside and
+///   is clipped by whatever the caller's clip rect is, which is a heart with
+///   its **right side shorter than its left**.
+/// * The outline pass grows every cell by `0.42` of a pixel, so even at the
+///   exact aspect the silhouette is a fifth of a pixel wider than the rect on
+///   each side, and only the side nearest a clip edge loses it.
+///
+/// So the size comes from whichever dimension runs out FIRST, the outline's
+/// growth is paid for out of the sprite rather than out of the rect, and what
+/// is left over becomes an even margin on both sides. A heart drawn through
+/// here cannot be lopsided, whatever it is handed.
+fn heart_grid(rect: Rect) -> Option<(egui::Vec2, Pos2)> {
+    if !rect.is_positive() {
+        return None;
+    }
+    let cols = HEART[0].len() as f32;
+    let rows = HEART.len() as f32;
+    // The outline reaches `HEART_EDGE` of a cell beyond the sprite on every
+    // side, so the sprite has to fit in the rect with that much to spare.
+    //
+    // **Each axis on its own.** It used to take the smaller of the two and
+    // use it for both, which keeps the pixels square and makes the BOX's
+    // shape a suggestion the sprite is free to ignore — so asking for a wider
+    // heart got a heart the same shape as before with air either side of it.
+    // The box is the shape now; a caller that wants square pixels asks for a
+    // box at [`HEART_ASPECT`], which the band does.
+    let px = egui::vec2(
+        rect.width() / (cols + HEART_EDGE * 2.0),
+        rect.height() / (rows + HEART_EDGE * 2.0),
+    );
+    if px.x <= 0.0 || px.y <= 0.0 {
+        return None;
+    }
+    let used = egui::vec2(cols * px.x, rows * px.y);
+    let origin = Pos2::new(
+        rect.left() + (rect.width() - used.x) * 0.5,
+        rect.top() + (rect.height() - used.y) * 0.5,
+    );
+    Some((px, origin))
+}
+
+/// How far the outline grows past each cell, as a fraction of one.
+const HEART_EDGE: f32 = 0.42;
+
+/// How much bigger a heart's BOX has to be than the sprite it holds.
+///
+/// The outline reaches [`HEART_EDGE`] of a cell past the sprite on every side,
+/// and `heart_grid` fits all of that inside the rect rather than letting it
+/// overhang. A caller that wants a sprite `n` tall therefore asks for a box
+/// `n * HEART_BOX` tall.
+pub const HEART_BOX: f32 = (HEART.len() as f32 + HEART_EDGE * 2.0) / HEART.len() as f32;
+
+/// **How much wider than its natural shape the band draws the heart.**
+///
+/// The sprite is seven by six, which is a heart that reads as slightly narrow
+/// at the size the band shows it — the owner's word. Widening the BOX is what
+/// widens the heart now that `heart_grid` fits each axis on its own, so this
+/// is the one number that says how squat it is, rather than the aspect being
+/// smeared through a size calculation somewhere.
+pub const HEART_WIDEN: f32 = 1.30;
+
 /// Draw the heart to fill `rect`.
 ///
 /// **Public because the heart no longer lives only here.** It sits in the
 /// recorder band's bottom-right corner now, since the strip is off by default
 /// in 5.0 and a heart nobody can see thanks nobody. One sprite, two homes.
+/// The heart as a travelling DIAGONAL wave.
+///
+/// **Per pixel, not per sprite.** Crossfading the whole heart between palette
+/// colours is a graceful shift and reads as one colour slowly changing its
+/// mind; what the owner asked for is a wave, and a wave has to have somewhere
+/// to travel. The sprite is seven by six, so the diagonal `row + col` runs
+/// eleven steps across it — enough for several bands of colour to be on the
+/// heart at once and to move visibly from one corner to the other.
+///
+/// `shade` is handed that diagonal as 0..=1 and answers with the fill and the
+/// outline for it. Both come from the caller because both are measured against
+/// the band, which this file knows nothing about.
+pub fn draw_heart_wave(painter: &Painter, rect: Rect, shade: &dyn Fn(f32) -> (Color32, Color32)) {
+    if !rect.is_positive() {
+        return;
+    }
+    let Some((px, origin)) = heart_grid(rect) else {
+        return;
+    };
+    let span = (HEART.len() + HEART[0].len() - 2) as f32;
+    // Two passes: every outline first, then every fill. One pass would let a
+    // later pixel's outline sit on top of an earlier pixel's fill, which
+    // stipples the inside of the heart with the colour of the ring.
+    for pass in 0..2 {
+        for (row, line) in HEART.iter().enumerate() {
+            for (col, ch) in line.chars().enumerate() {
+                if ch != 'X' {
+                    continue;
+                }
+                let (fill, edge) = shade((row + col) as f32 / span);
+                let p = Pos2::new(origin.x + col as f32 * px.x, origin.y + row as f32 * px.y);
+                let cell = Rect::from_min_size(p, px);
+                if pass == 0 {
+                    painter.rect_filled(cell.expand2(px * HEART_EDGE), 0.0, edge);
+                } else {
+                    painter.rect_filled(cell, 0.0, fill);
+                }
+            }
+        }
+    }
+}
+
+/// The heart with an outline around it.
+///
+/// **The outline is not decoration.** The supporter heart wears a colour taken
+/// from the live palette, and a palette colour is a STRIP colour — chosen to be
+/// dark enough to carry light text printed on it. Several of them land close
+/// enough to the band's own face that the sprite disappears into it. The
+/// outline is what keeps the shape readable whatever colour is passing through
+/// it, which is why it is drawn first and underneath rather than on top.
+pub fn draw_heart_bordered(
+    painter: &Painter,
+    rect: Rect,
+    color: Color32,
+    border: Option<Color32>,
+) {
+    if !rect.is_positive() {
+        return;
+    }
+    let Some((px, origin)) = heart_grid(rect) else {
+        return;
+    };
+    if let Some(b) = border {
+        // Each lit pixel, grown by a little under half a cell. The grown
+        // squares merge into one silhouette a hair larger than the heart,
+        // which is an outline without needing to work out where the edges are.
+        for (row, line) in HEART.iter().enumerate() {
+            for (col, ch) in line.chars().enumerate() {
+                if ch != 'X' {
+                    continue;
+                }
+                let p = Pos2::new(origin.x + col as f32 * px.x, origin.y + row as f32 * px.y);
+                let cell = Rect::from_min_size(p, px);
+                painter.rect_filled(cell.expand2(px * HEART_EDGE), 0.0, b);
+            }
+        }
+    }
+    draw_heart(painter, rect, color);
+}
+
 pub fn draw_heart(painter: &Painter, rect: Rect, color: Color32) {
-    let hr = heart_rect(rect);
-    let px = hr.height() / HEART.len() as f32;
+    // **`rect` IS the heart**, filled, and this used to compute a second one
+    // inside it: `heart_rect(rect)` again, which places a sprite in the TOP
+    // corner of whatever it is given with a margin around it. The chord
+    // strip passed the whole strip, so the answer was right there by
+    // accident. The band passes the heart's own rectangle — and got a
+    // smaller heart, drawn high inside it, while the hover region and the
+    // accessibility node stayed where the layout put them. That is the
+    // "renders too high up" the owner saw, and this function's own doc
+    // sentence said what it was supposed to do all along.
+    let Some((px, origin)) = heart_grid(rect) else {
+        return;
+    };
     for (row, line) in HEART.iter().enumerate() {
         for (col, ch) in line.chars().enumerate() {
             if ch != 'X' {
                 continue;
             }
-            let p = Pos2::new(hr.left() + col as f32 * px, hr.top() + row as f32 * px);
-            painter.rect_filled(Rect::from_min_size(p, egui::vec2(px, px)), 0.0, color);
+            let p = Pos2::new(origin.x + col as f32 * px.x, origin.y + row as f32 * px.y);
+            painter.rect_filled(Rect::from_min_size(p, px), 0.0, color);
         }
     }
 }
@@ -228,6 +387,38 @@ pub fn draw_thanks(
 #[cfg(test)]
 mod thanks_tests {
     use super::*;
+
+    /// **The heart is drawn where it is told, filling the rect it is
+    /// handed.**
+    ///
+    /// `draw_heart` used to compute a second rectangle inside the one it was
+    /// given — the sprite came out smaller and higher than the region the
+    /// hover and the accessibility node used. It went unnoticed for as long
+    /// as the only caller passed the whole chord strip, where a heart in the
+    /// top-right corner is exactly what was wanted; the band passes the
+    /// heart's own place and got the offset.
+    #[test]
+    fn the_heart_fills_the_rectangle_it_is_given() {
+        // A rect at the sprite's own aspect fills exactly, in both axes —
+        // which is what makes "fill it" honest rather than "fill its height
+        // and hope".
+        let h = 24.0_f32;
+        let r = Rect::from_min_size(Pos2::new(100.0, 200.0), egui::vec2(h * HEART_ASPECT, h));
+        let px = r.height() / HEART.len() as f32;
+        let drawn_w = px * HEART[0].len() as f32;
+        assert!(
+            (drawn_w - r.width()).abs() < 1e-3,
+            "the sprite is {drawn_w} wide in a {} rect",
+            r.width()
+        );
+        // And the OLD behaviour is gone: `heart_rect` of a heart-sized rect
+        // would put it somewhere else entirely, which is the bug.
+        let nested = heart_rect(r);
+        assert!(
+            nested.min != r.min || (nested.width() - r.width()).abs() > 0.5,
+            "heart_rect is idempotent, so this test proves nothing"
+        );
+    }
 
     /// The card stays on screen wherever the heart is, and says what it is for.
     #[test]
@@ -378,7 +569,7 @@ pub fn draw(
     }
     // Drawn before the early return so it shows even with no chord sounding.
     if let Some(hc) = heart {
-        draw_heart(painter, rect, hc);
+        draw_heart(painter, heart_rect(rect), hc);
     }
     let Some(text) = chord else { return };
     if text.is_empty() {
@@ -644,5 +835,76 @@ mod tests {
             );
             assert!(hr.center().y < strip.center().y, "heart should hug the top");
         }
+    }
+}
+
+#[cfg(test)]
+mod heart_geometry_tests {
+    use super::*;
+
+    /// **The sprite is centred in its box and never overhangs it** — at any
+    /// aspect, including the ones a clamp can produce.
+    ///
+    /// The owner's report was "lopsided, right side shorter than left at 100
+    /// percent". The cause: the size came from the HEIGHT alone
+    /// (`rect.height() / 6`), so a box narrower than [`HEART_ASPECT`] laid
+    /// seven columns across more width than it had and the last one fell
+    /// outside, where the caller's clip took it. The outline pass made it
+    /// worse by growing every cell a fifth of a pixel past the sprite on all
+    /// four sides — invisible on three of them and clipped on the fourth.
+    #[test]
+    fn the_heart_is_centred_and_inside_its_box_at_every_aspect() {
+        let cols = HEART[0].len() as f32;
+        let rows = HEART.len() as f32;
+        for (w, h) in [
+            (14.0_f32, 12.0_f32),  // the exact aspect
+            (12.0, 12.0),          // square: width-bound
+            (30.0, 12.0),          // wide: height-bound
+            (12.0, 30.0),          // tall
+            (9.0, 8.0),            // the smallest the band draws
+            (140.0, 120.0),        // and a large one
+        ] {
+            let rect = Rect::from_min_size(Pos2::new(17.0, 5.0), egui::vec2(w, h));
+            let (px, origin) = heart_grid(rect).expect("a positive box has a grid");
+            // The silhouette, outline included.
+            let (ex, ey) = (px.x * HEART_EDGE, px.y * HEART_EDGE);
+            let left = origin.x - ex;
+            let right = origin.x + cols * px.x + ex;
+            let top = origin.y - ey;
+            let bottom = origin.y + rows * px.y + ey;
+            assert!(
+                left >= rect.left() - 0.01 && right <= rect.right() + 0.01,
+                "{w}x{h}: the heart overhangs horizontally ({left} .. {right} in {:?})",
+                rect
+            );
+            assert!(
+                top >= rect.top() - 0.01 && bottom <= rect.bottom() + 0.01,
+                "{w}x{h}: the heart overhangs vertically"
+            );
+            // Centred: the margins match on both sides, which is what
+            // "lopsided" means when it is wrong.
+            let (ml, mr) = (left - rect.left(), rect.right() - right);
+            assert!(
+                (ml - mr).abs() < 0.01,
+                "{w}x{h}: left margin {ml} but right margin {mr}"
+            );
+            let (mt, mb) = (top - rect.top(), rect.bottom() - bottom);
+            assert!((mt - mb).abs() < 0.01, "{w}x{h}: top {mt} but bottom {mb}");
+        }
+    }
+
+    /// A box asked for through [`HEART_BOX`] draws the sprite at the size the
+    /// caller wanted, rather than an eighth smaller.
+    #[test]
+    fn the_box_constant_gives_back_the_sprite_size_asked_for() {
+        let sprite_h = 12.0_f32;
+        let h = sprite_h * HEART_BOX;
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(h * HEART_ASPECT, h));
+        let (px, _) = heart_grid(rect).expect("grid");
+        let drawn = px.y * HEART.len() as f32;
+        assert!(
+            (drawn - sprite_h).abs() < 0.05,
+            "asked for a {sprite_h}pt sprite and got {drawn}"
+        );
     }
 }

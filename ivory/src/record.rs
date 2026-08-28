@@ -893,6 +893,8 @@ fn levels_of(meters: &Arc<Mutex<AudioMeters>>) -> UiMeters {
         peak: m.peak.get(c).copied().unwrap_or(0.0),
         rms: m.rms.get(c).copied().unwrap_or(0.0),
         hold: m.hold.get(c).copied().unwrap_or(0.0),
+        // The needle's ballistics are the app's to apply — see `Level::vu`.
+        vu: 0.0,
     };
     UiMeters {
         left: at(0),

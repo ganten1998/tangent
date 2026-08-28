@@ -224,6 +224,14 @@ const BINDINGS: &[(Key, &str, KeyAction, bool)] = &[
     // place you go, and Tab is what a program with more than one screen uses
     // to go there.
     (Key::Tab, "Tab", KeyAction::ToggleMixer, true),
+    // **F6 is the same key, and it is the one that still works in
+    // accessibility mode.** There, Tab walks the controls — that is what a
+    // screen-reader user presses it for and egui takes it before this table
+    // ever sees it — so the view cycle needs a key of its own. F6 is what
+    // every other program with panes uses for exactly this, which makes it
+    // the one alias somebody might already know. Unlisted, like F11: the
+    // help card names Tab, which is the key almost everybody presses.
+    (Key::F6, "F6", KeyAction::ToggleMixer, false),
     (Key::Enter, "Enter", KeyAction::StartRecording, true),
     (Key::Space, "Space", KeyAction::StopRecording, true),
     // Escape only closes the card; it is not worth a row of its own.
