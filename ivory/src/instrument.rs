@@ -2273,6 +2273,21 @@ impl Rack {
 /// keep what they had, and a plugin that answers with fewer channels than it
 /// was given has its last one read twice rather than leaving a silent side —
 /// the same rule the bus insert has always followed.
+/// A rack with no automation on it — six of the seven `run_rack` call sites.
+///
+/// Named rather than written out, so a site that SHOULD carry automation is
+/// visibly different from one that has none rather than differing by an
+/// easily-missed `&[]`.
+/// How many automated parameters one bay may carry in a block.
+///
+/// The cap exists because the audio thread may not allocate, so the vectors
+/// are grown once and never past their capacity. Sixteen is well past what
+/// any song has automated on a single effect, and going over it costs the
+/// SEVENTEENTH parameter its movement rather than costing the block.
+const AUTO_PARAMS_PER_BAY: usize = 16;
+
+const NO_AUTOMATION: &[&[ivory_host::ParamPoint]; INSERTS] = &[&[]; INSERTS];
+
 fn run_rack(
     rack: &mut Rack,
     planar: &mut [Vec<f32>],
@@ -2280,11 +2295,16 @@ fn run_rack(
     out: &mut [Vec<f32>],
     notes: &[ivory_host::Note],
     controls: &[ivory_host::Control],
+    // **Automation for this block, per BAY.** Indexed by the slot's position
+    // in the rack, because a parameter id means nothing without knowing which
+    // plugin it belongs to and two bays can hold the same effect.
+    params: &[&[ivory_host::ParamPoint]; INSERTS],
 ) {
-    for slot in &mut rack.slots {
+    for (bay, slot) in rack.slots.iter_mut().enumerate() {
         let Some(p) = slot.0.as_mut() else {
             continue;
         };
+        let bay_params = params.get(bay).copied().unwrap_or(&[]);
         if p.voice {
             // **A voice renders into its OWN buffers and replaces the
             // channel.** Its own, because `fx_out` is TAP_CHANNELS wide and an
@@ -2302,7 +2322,11 @@ fn run_rack(
             {
                 continue;
             }
-        } else if p.inst.process_effect(planar, frames, out).is_err() {
+        } else if p
+            .inst
+            .process_effect_automated(planar, bay_params, frames, out)
+            .is_err()
+        {
             // A refused block leaves the audio ALONE rather than replacing it
             // with whatever was in the output buffers: a faulted insert is a
             // channel that stops being processed, not one that starts making
@@ -2581,6 +2605,15 @@ struct Renderer {
     /// delays everything equally, so it has nothing to be aligned against.
     pdc: Vec<DelayLine>,
     automation: ivory_ui::automation::Automation,
+    /// **This block's plugin-parameter automation**, one list per bay,
+    /// indexed `lane * INSERTS + bay`.
+    ///
+    /// Pre-grown in `start_inner` and only ever `clear`ed and `push`ed, so
+    /// the audio thread never allocates — the rule every buffer in this file
+    /// follows. A curve that names more parameters than a bay has room for
+    /// simply stops being read past the cap, which is a parameter that does
+    /// not move rather than a block that does not render.
+    auto_params: Vec<Vec<ivory_host::ParamPoint>>,
     auto_incoming: Consumer<ivory_ui::automation::Automation>,
     auto_retiring: Producer<ivory_ui::automation::Automation>,
     maps_incoming: Consumer<Maps>,
@@ -2755,6 +2788,14 @@ impl Renderer {
                 }
             }
         }
+        // The bays' own automation for this block. Read before the rack is
+        // borrowed mutably: two different fields, so the borrows are disjoint,
+        // but only if they are taken in one expression each.
+        let params: [&[ivory_host::ParamPoint]; INSERTS] = std::array::from_fn(|b| {
+            self.auto_params
+                .get(at * INSERTS + b)
+                .map_or(&[][..], Vec::as_slice)
+        });
         let Some(rack) = self.racks.get_mut(at) else {
             return;
         };
@@ -2765,6 +2806,7 @@ impl Renderer {
             &mut self.fx_out,
             notes,
             controls,
+            &params,
         );
         let dst = if buf_is_aux {
             self.aux.get_mut(..n)
@@ -3377,6 +3419,7 @@ impl Renderer {
                         &mut self.fx_out,
                         notes,
                         controls,
+                    NO_AUTOMATION,
                     );
                 }
                 // Back into BOTH buffers, and the take's keeps its gate: a
@@ -3539,6 +3582,7 @@ impl Renderer {
                             &mut self.fx_out,
                             &[],
                             &[],
+                            NO_AUTOMATION,
                         );
                     }
                     let g = self.lane_gain[dest];
@@ -4363,6 +4407,7 @@ impl Renderer {
                     &mut self.fx_out,
                     notes,
                     controls,
+                NO_AUTOMATION,
                 );
             }
             let mut room = room_from;
@@ -4485,6 +4530,9 @@ impl Renderer {
             }
         }
         let suspend = self.shared.auto_suspend.load(Ordering::Relaxed);
+        for q in &mut self.auto_params {
+            q.clear();
+        }
         if self.automation.is_empty() {
             // The overwhelmingly common song. One branch instead of sixty-four
             // lookups, and it leaves every fader exactly where it was.
@@ -4492,6 +4540,44 @@ impl Renderer {
             return;
         }
         let secs = at as f64 / self.rate.max(1.0);
+        // **The plugin parameters, walked from the CURVES rather than probed.**
+        //
+        // A song has a handful of automated parameters and a desk has four
+        // hundred and forty-four bays; asking every bay whether it has a curve
+        // would be four hundred lookups a block to find three. The curve list
+        // is the source of truth and it is already sorted.
+        for curve in self.automation.curves() {
+            let AutoParam::Plugin { bay, id } = curve.param else {
+                continue;
+            };
+            let lane = curve.lane;
+            if lane >= CHANNELS || suspend & (1 << lane) != 0 {
+                continue;
+            }
+            let bay = usize::from(bay);
+            if bay >= INSERTS {
+                continue;
+            }
+            let Some(value) = curve.value_at(secs) else {
+                continue;
+            };
+            let Some(q) = self.auto_params.get_mut(lane * INSERTS + bay) else {
+                continue;
+            };
+            // The cap is the pre-grown capacity: pushing past it would
+            // allocate, which is the one thing this thread may not do.
+            if q.len() < q.capacity() {
+                q.push(ivory_host::ParamPoint {
+                    // One point at the head of the block. A parameter is not
+                    // audio — a plugin smooths its own — and a point per
+                    // frame would be five hundred COM writes a block for a
+                    // value nobody can hear move that fast.
+                    offset: 0,
+                    id,
+                    value,
+                });
+            }
+        }
         for lane in 0..CHANNELS {
             if suspend & (1 << lane) != 0 {
                 self.auto.gain[lane] = None;
@@ -5029,6 +5115,7 @@ impl Renderer {
                     &mut self.fx_out,
                     &[],
                     &[],
+                NO_AUTOMATION,
                 );
                 for c in 0..TAP_CHANNELS.min(2) {
                     let src = &self.pad_io[c];
@@ -5062,6 +5149,7 @@ impl Renderer {
                 &mut self.fx_out,
                 &[],
                 &[],
+            NO_AUTOMATION,
             );
         }
         // The fold: the DRUMS strip's fader, pan, send and peak, exactly as
@@ -5468,6 +5556,7 @@ impl Renderer {
                     &mut self.fx_out,
                     &lane_notes,
                     controls,
+                NO_AUTOMATION,
                 );
             }
             // **And the lane waits for the slowest of its neighbours.**
@@ -6195,6 +6284,13 @@ impl Engine {
             auto: AutoNow::default(),
             pdc: (0..CHANNELS).map(|_| DelayLine::new()).collect(),
             automation: ivory_ui::automation::Automation::default(),
+            // **Grown once, here.** Sixteen parameters a bay is more than any
+            // song has ever automated on one effect, and the whole table is
+            // 444 short vectors — a few kilobytes bought at load time so the
+            // audio thread never asks for memory.
+            auto_params: (0..CHANNELS * INSERTS)
+                .map(|_| Vec::with_capacity(AUTO_PARAMS_PER_BAY))
+                .collect(),
             auto_incoming,
             auto_retiring,
             track_incoming,
@@ -6922,6 +7018,22 @@ impl Engine {
             .get(slot)?
             .as_ref()
             .and_then(|h| h.save().ok())
+    }
+
+    /// **What one insert offers an automation lane.** `None` for an empty
+    /// bay or a plugin with no edit controller, which is legal — a plugin
+    /// that publishes no parameters has nothing to automate.
+    ///
+    /// Read through the same main-thread handle `save_insert_state` uses, so
+    /// it obeys the same rule: never from the audio thread, and only while
+    /// the instance is alive.
+    pub fn insert_parameters(&self, strip: usize, slot: usize) -> Vec<ivory_host::ParamInfo> {
+        self.insert_state_handles
+            .get(strip)
+            .and_then(|r| r.get(slot))
+            .and_then(Option::as_ref)
+            .map(ivory_host::StateHandle::parameters)
+            .unwrap_or_default()
     }
 
     pub fn output(&self) -> &OutputInfo {
@@ -9854,6 +9966,13 @@ mod tests {
             auto: AutoNow::default(),
             pdc: (0..CHANNELS).map(|_| DelayLine::new()).collect(),
             automation: ivory_ui::automation::Automation::default(),
+            // **Grown once, here.** Sixteen parameters a bay is more than any
+            // song has ever automated on one effect, and the whole table is
+            // 444 short vectors — a few kilobytes bought at load time so the
+            // audio thread never asks for memory.
+            auto_params: (0..CHANNELS * INSERTS)
+                .map(|_| Vec::with_capacity(AUTO_PARAMS_PER_BAY))
+                .collect(),
             auto_incoming: RingBuffer::<ivory_ui::automation::Automation>::new(2).1,
             auto_retiring: RingBuffer::<ivory_ui::automation::Automation>::new(2).0,
             count_in_tail: 0,

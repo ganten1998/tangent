@@ -1003,6 +1003,48 @@ fn effect_defaults() -> ivory_ui::ports::EffectDefaults {
     }
 }
 
+/// **Read one strip's three bays and hand the app what they can automate.**
+///
+/// A free function because it is called from two arms of the same match and
+/// borrows the app and the engine at once; a method on `DesktopApp` would be
+/// borrowing `self` twice.
+///
+/// The plugin's short name comes from the app's own bay text rather than from
+/// the module, so the menu says exactly what the bay chip says.
+#[cfg(feature = "recorder")]
+fn push_fx_params(
+    app: &mut ivory_ui::app::IvoryApp,
+    engine: &crate::instrument::Engine,
+    strip: usize,
+    inserts: usize,
+) {
+    let bays: [ivory_ui::ports::FxParams; ivory_ui::recorder::INSERTS] =
+        std::array::from_fn(|bay| {
+            if bay >= inserts {
+                return ivory_ui::ports::FxParams::default();
+            }
+            let params: Vec<ivory_ui::ports::FxParam> = engine
+                .insert_parameters(strip, bay)
+                .into_iter()
+                .map(|p| ivory_ui::ports::FxParam {
+                    id: p.id,
+                    title: p.title,
+                    units: p.units,
+                    default_normalised: p.default_normalised,
+                    step_count: p.step_count,
+                })
+                .collect();
+            if params.is_empty() {
+                return ivory_ui::ports::FxParams::default();
+            }
+            ivory_ui::ports::FxParams {
+                name: app.insert_short_name(strip, bay),
+                params,
+            }
+        });
+    app.set_fx_params(strip, bays);
+}
+
 /// One filter's slope, as a choice the panel can step through.
 #[cfg(feature = "recorder")]
 fn slope_choice(key: &str, default: crate::effects::Slope) -> ivory_ui::ports::ChoiceParam {
@@ -2345,6 +2387,16 @@ impl DesktopApp {
                 match e.load_insert(i / inserts, i % inserts, path, state.as_deref()) {
                     Ok(_) => {
                         self.recorder.engine_error = None;
+                        // **What the bay now offers an automation lane**, read
+                        // once, HERE.
+                        //
+                        // This is the only place a bay's contents change, so
+                        // it is the only place the parameter list can go
+                        // stale — and reading it per frame would be a COM
+                        // call per parameter per plugin per frame, on the
+                        // main thread, for a list that changes when somebody
+                        // loads a plugin.
+                        push_fx_params(&mut self.app, e, i / inserts, inserts);
                         // **The window, the moment the load lands.** Only for
                         // the pick that just happened — the app's flag answers
                         // once and never for a launch restore — and only when
@@ -2362,6 +2414,9 @@ impl DesktopApp {
                     Err(err) => {
                         // The auto-open belongs to a load that happened.
                         let _ = self.app.take_open_insert_on_load(i / inserts, i % inserts);
+                        // A failed load leaves the bay empty, so the menu must
+                        // not go on offering the last plugin's parameters.
+                        push_fx_params(&mut self.app, e, i / inserts, inserts);
                         let which = want
                             .as_deref()
                             .and_then(|p| p.rsplit(['/', '\\']).next())

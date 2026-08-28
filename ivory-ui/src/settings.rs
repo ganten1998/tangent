@@ -543,6 +543,15 @@ pub struct Settings {
     pub show_piano_note_names: bool,
     pub show_fret_note_names: bool,
     pub window_size_percent: i64,
+    /// **The width of the monitor the app was last on**, in points. Zero
+    /// until a window has existed long enough to ask.
+    ///
+    /// Remembered because the very first window is built before any monitor
+    /// can be enumerated — `main.rs` says so — so the size a launch opens at
+    /// has to come from what the LAST run saw. A machine whose display has
+    /// changed since gets one launch at the old scale and is right from then
+    /// on, which is the same bargain the remembered window position makes.
+    pub monitor_width: i64,
     pub borderless_mode: bool,
     pub chord_window_detached: bool,
     pub detached_chord_height: i64,
@@ -1386,6 +1395,7 @@ impl Default for Settings {
             show_piano_note_names: false,
             show_fret_note_names: false,
             window_size_percent: 100,
+            monitor_width: 0,
             borderless_mode: false,
             chord_window_detached: false,
             detached_chord_height: 50,
@@ -2087,6 +2097,11 @@ impl Settings {
             }
         }
 
+        if let Some(n) = map.shift_remove("monitor_width").and_then(|v| v.as_i64()) {
+            // A stored width outside anything a display has is a file to
+            // ignore rather than a window to open off-screen.
+            s.monitor_width = if (320..=32_768).contains(&n) { n } else { 0 };
+        }
         if let Some(v) = map.shift_remove("window_size_percent") {
             if let Some(n) = v.as_i64() {
                 if n > 0 {
@@ -3763,6 +3778,9 @@ impl Settings {
                 );
             }
         }
+        if self.monitor_width > 0 {
+            map.insert("monitor_width".into(), Value::from(self.monitor_width));
+        }
         // Additive, so they go HERE — last of our own keys, ahead only of
         // the preserved extras. See the note above `settings_version`.
         map.insert(
@@ -4597,27 +4615,31 @@ pub const MIN_WINDOW: egui::Vec2 = egui::Vec2::new(560.0, 320.0);
 
 /// **Can the window's edges be dragged?**
 ///
-/// Retired at the owner's word, and RETIRED rather than deleted: every piece
-/// of machinery a draggable window needs is still here and still tested —
-/// `fit_bands`, `fill_bands`, the pane-filling DAW layout, `MIN_WINDOW`, the
-/// geometry write-back and its tiling-WM guard. Flipping this to `true` puts
-/// it all back, and the plugin editor exercises the same solvers on every
-/// launch, so it cannot rot while it is off.
+/// **Back on, and the reason it was off has gone.** It was retired at the
+/// owner's word because the layout is aspect-locked by construction — every
+/// band's height is a fixed fraction of the window's width — so a window at
+/// any other aspect got bands of the theme's ground above and below the
+/// picture. Correct letterboxing, and it still looked wrong: a 553-point
+/// layout centred in a 1377-point window.
 ///
-/// **Why it is off.** The layout is aspect-locked by construction: every
-/// band's height is a fixed fraction of the window's width, so a window at
-/// any other aspect gets bands of the theme's ground above and below the
-/// picture. That is correct letterboxing and it still looked wrong — the
-/// owner's screen showed a 553-point layout centred in a 1377-point window.
-/// The recorder band is the one thing that stays put across every view, and
-/// the presets, fullscreen and maximise cover the sizes anybody needs.
+/// That is fixed rather than worked around. `fill_bands` no longer scales
+/// every band by one factor: the piano and the neck keep the height a window
+/// gives them, because their heights are what make the keys the shape of keys
+/// and put the frets where a guitarist expects them, and the THEORY band
+/// absorbs the difference in both directions. So a window at any aspect is
+/// the instruments at their own shape with more or fewer diagrams above them,
+/// which is not a letterbox at all.
 ///
-/// **What it costs.** The 5.0 audit called the fixed-size window out under
-/// accessibility, and it was right to: a person who needs the app bigger has
-/// the seven percentage presets and fullscreen and no edge to drag. That is
-/// the trade this constant records, so the next person to read it knows a
-/// choice was made rather than that nobody thought about it.
-pub const RESIZABLE: bool = false;
+/// **And this is what makes MAXIMISE work.** macOS has tiled windows by
+/// dragging them to an edge since Sequoia, and it will not tile a window
+/// whose resizable style mask is clear — so `false` here did not merely
+/// remove an edge to drag, it made the OS's own maximise gesture silently do
+/// nothing. This comment used to claim "the presets, fullscreen and maximise
+/// cover the sizes anybody needs", and two of those three were true.
+///
+/// The 5.0 audit called the fixed-size window out under accessibility. It
+/// was right to, and this is the answer.
+pub const RESIZABLE: bool = true;
 
 /// Keep a window fully on the monitor it is being placed on. A remembered
 /// position is worthless if the monitor it referred to is gone, which is the

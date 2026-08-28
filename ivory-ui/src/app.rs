@@ -146,6 +146,20 @@ fn wm_overrode_size(observed: Vec2, requested: Vec2) -> bool {
         || (observed.y - requested.y).abs() > WM_SIZE_TOLERANCE
 }
 
+/// How many still frames mean the hand has let go of the window's edge.
+///
+/// Two, not one: a drag can report the same size twice while the pointer sits
+/// between two pixels, and snapping there is still snapping mid-drag.
+const SETTLE_FRAMES: u8 = 2;
+
+/// How many timeline tracks a full-screen or tiled window shows.
+///
+/// Ten rather than sixteen: a track row carries a name, three dials, a meter,
+/// four switches and a rack, and sixteen of them on a laptop screen is a row
+/// too short to read any of that. The desk's strips are columns and have no
+/// such floor, so the mixer shows all sixteen.
+const ARR_LANES_FULL: usize = 10;
+
 /// How long after the detached window appears a size mismatch still counts as
 /// the window manager's doing rather than the user's. A tiling WM overrules
 /// the requested size at creation; a person reaching for the window edge takes
@@ -260,7 +274,16 @@ pub struct IvoryApp {
     /// that reopened with four rows unfolded because of what somebody did
     /// last Tuesday would be the same species of surprise as a window that
     /// remembers a tiling manager's geometry.
-    arr_auto_open: std::collections::HashSet<usize>,
+    /// **Which automation lanes are showing**, as `(lane, parameter)`.
+    ///
+    /// A set of PAIRS rather than a set of lanes with one chosen parameter
+    /// each, which is what it was: mixing a track means watching its volume
+    /// and its send at once, and a row that could only show one of them made
+    /// that a thing you toggled between rather than saw.
+    arr_auto_open: std::collections::HashSet<(usize, crate::automation::AutoParam)>,
+    /// Per strip, what each of its three bays offers an automation lane.
+    /// Pushed by the host — see [`Self::set_fx_params`].
+    fx_params: std::collections::HashMap<usize, [crate::ports::FxParams; crate::recorder::INSERTS]>,
     arr_auto_params: std::collections::HashMap<usize, crate::automation::AutoParam>,
     /// The point under the pointer or being dragged: `(lane, index)`.
     arr_auto_hot: Option<(usize, usize)>,
@@ -268,6 +291,17 @@ pub struct IvoryApp {
     arr_tempo_hot: Option<usize>,
     /// The tempo point being dragged, if any.
     arr_tempo_drag: Option<usize>,
+    /// **The tempo map as it was when a drag started.**
+    ///
+    /// A tempo drag reads the pointer in SECONDS and has to answer in beats,
+    /// and the map that converts the one to the other is the map the drag is
+    /// rewriting. With a step that is harmless — lowering a point's tempo
+    /// cannot change where the seconds before it fall — but a RAMP slopes the
+    /// span leading in, so dragging the tempo down slowed everything before it
+    /// and the point walked away from the pointer. Converting through the map
+    /// as it was at the press is the fix, and it is the same reason
+    /// `MeDrag::Move` snapshots its selection.
+    arr_tempo_drag_from: Option<crate::tempo::TempoMap>,
     /// Each lane's automation mode. Absent is [`crate::automation::AutoMode`]'s
     /// default, Read. Session-only — see the type, where the reason is a
     /// safety one.
@@ -951,6 +985,30 @@ pub struct IvoryApp {
     /// The minimum has been handed to the window manager. Once, not per
     /// frame — see the send site.
     min_sent: Option<bool>,
+    /// **The window's size as the OS last reported it, and how many frames it
+    /// has sat still.**
+    ///
+    /// The aspect snap waits for the drag to STOP. Sending a size while the
+    /// user is still dragging is a fight the app cannot win — the OS moves the
+    /// edge, the app moves it back, and the window flashes between the two
+    /// until the button comes up. On a bottom or top edge it was worse than
+    /// cosmetic: the height is a function of the width, so snapping it back
+    /// meant the drag could never resize anything at all.
+    pane_seen: Option<(Vec2, u8)>,
+    /// The last size the window SETTLED on, which is the only thing that can
+    /// say which edge a drag moved. Comparing the two candidate answers to
+    /// each other cannot: both are derived from where the window is now, and
+    /// where it is now is exactly what the hand changed.
+    pane_settled: Option<Vec2>,
+    /// **The window is the screen** — full, or tiled by the window manager.
+    ///
+    /// Read once per frame from the viewport and kept, because the two things
+    /// that ask (`mixer_visible`, `arr_visible`) are called from inside view
+    /// builders that have no context to ask with.
+    screen_sized: bool,
+    /// The monitor width already written down this run, so the settings file
+    /// is not saved every frame for a number that never changes.
+    monitor_saved: Option<i64>,
     /// Which painted surface the keyboard is standing on, and which control.
     ///
     /// Set while a node laid over a panel holds egui's focus, and cleared the
@@ -1038,7 +1096,9 @@ enum ArrDrag {
     /// re-derived after every move, because moving a point past its
     /// neighbour re-sorts the curve and the old index would then name
     /// somebody else's point.
-    AutoPoint(usize, usize),
+    /// `(lane, row, point)` — which lane, which of its open rows, and which
+    /// point on that row's curve.
+    AutoPoint(usize, usize, usize),
     /// A tempo point being carried, by index — re-derived after every move
     /// for the reason above it: dragging one past its neighbour re-sorts the
     /// map and the old index would name somebody else's point.
@@ -1791,13 +1851,19 @@ impl IvoryApp {
             splash_up: false,
             last_sent_size: None,
             min_sent: None,
+            pane_seen: None,
+            pane_settled: None,
+            screen_sized: false,
+            monitor_saved: None,
             a11y_on: None,
             reader_was_detected: false,
             arr_auto_open: std::collections::HashSet::new(),
+            fx_params: std::collections::HashMap::new(),
             arr_auto_params: std::collections::HashMap::new(),
             arr_auto_hot: None,
             arr_tempo_hot: None,
             arr_tempo_drag: None,
+            arr_tempo_drag_from: None,
             arr_auto_modes: std::collections::HashMap::new(),
             arr_auto_latched: std::collections::HashSet::new(),
             arr_auto_last: std::collections::HashMap::new(),
@@ -7761,33 +7827,252 @@ impl IvoryApp {
 
     // ── automation lanes ───────────────────────────────────────────────────
 
-    /// Which parameter a lane's automation row is showing.
-    fn arr_auto_param(&self, lane: usize) -> crate::automation::AutoParam {
-        self.arr_auto_params
-            .get(&lane)
-            .copied()
-            .unwrap_or(crate::automation::AutoParam::Gain)
+    /// **Every parameter this lane is showing a row for**, in the order the
+    /// rows appear.
+    ///
+    /// Sorted, and the order is the point: rows that jumped about as a set
+    /// re-hashed would be rows whose position means nothing. The desk's four
+    /// come first in their own declared order, then the plugins' by bay and
+    /// then by id — which is the order the menu offers them in, so the rows
+    /// and the menu read the same way down.
+    fn arr_auto_rows(&self, lane: usize) -> Vec<crate::automation::AutoParam> {
+        use crate::automation::AutoParam;
+        let mut out: Vec<AutoParam> = self
+            .arr_auto_open
+            .iter()
+            .filter(|(l, _)| *l == lane)
+            .map(|(_, p)| *p)
+            .collect();
+        let rank = |p: &AutoParam| match p {
+            AutoParam::Plugin { bay, id } => (1u8, u32::from(*bay), *id),
+            other => (
+                0,
+                AutoParam::ALL.iter().position(|q| q == other).unwrap_or(0) as u32,
+                0,
+            ),
+        };
+        out.sort_by_key(rank);
+        out
     }
 
-    /// Show or hide a lane's automation row.
-    fn arr_toggle_automation(&mut self, lane: usize) {
-        if !self.arr_auto_open.remove(&lane) {
-            self.arr_auto_open.insert(lane);
+    /// Which parameter the row at `slot` on this lane is showing.
+    fn arr_auto_param_at(
+        &self,
+        lane: usize,
+        slot: usize,
+    ) -> Option<crate::automation::AutoParam> {
+        self.arr_auto_rows(lane).get(slot).copied()
+    }
+
+    /// Show or hide ONE parameter's row on a lane — the menu's checkbox.
+    fn arr_toggle_automation_param(
+        &mut self,
+        lane: usize,
+        param: crate::automation::AutoParam,
+    ) {
+        if !self.arr_auto_open.remove(&(lane, param)) {
+            self.arr_auto_open.insert((lane, param));
         }
         self.arr_auto_hot = None;
     }
 
-    /// Step to the next parameter on this lane's row.
+    /// **The size a dragged window should settle on**, or `None` to leave it.
     ///
-    /// A cycle rather than a menu, matching the gridbox and the clef: one
-    /// press, one step, and nothing to aim at in a row this short.
-    fn arr_cycle_auto_param(&mut self, lane: usize) {
+    /// The layout is aspect-locked by construction — every band's height is a
+    /// fixed fraction of the window's width — so there is one height per width
+    /// and every other height is empty ground. Rather than let somebody drag
+    /// into one, the window is put back on its own aspect: every drag comes
+    /// out diagonal.
+    ///
+    /// **After the drag, never during it.** The first cut sent a size every
+    /// frame the aspect was wrong, which is a fight with the window manager:
+    /// the OS moves the edge, the app moves it back, and the window flashes
+    /// between the two until the button comes up. Dragging a TOP or BOTTOM
+    /// edge was worse than ugly — those change only the height, the app put
+    /// the height straight back, and the window could not be resized at all.
+    ///
+    /// So the size is watched until it stops moving, and the snap happens
+    /// once, on the settle. Which is also what keeps the text sharp: the
+    /// answer is rounded to whole points, and a window on a fractional size
+    /// is a window drawing its glyphs on half-pixels.
+    ///
+    /// `None` while full or tiled: a screen's shape is not ours to argue with.
+    fn aspect_snap(&mut self, ctx: &egui::Context) -> Option<Vec2> {
+        let (full, size) = ctx.input(|i| {
+            let v = i.viewport();
+            (
+                v.fullscreen.unwrap_or(false) || v.maximized.unwrap_or(false),
+                v.inner_rect.map(|r| r.size()),
+            )
+        });
+        if full {
+            self.pane_seen = None;
+            return None;
+        }
+        let now = size?;
+        // **Still for two frames means the hand has let go.** One is not
+        // enough: a drag can report the same size twice while the pointer is
+        // between two pixels, and snapping there would still be mid-drag.
+        let settled = match self.pane_seen {
+            Some((was, n)) if (was - now).length() < 0.5 => {
+                let n = n.saturating_add(1);
+                self.pane_seen = Some((now, n));
+                n >= SETTLE_FRAMES
+            }
+            _ => {
+                self.pane_seen = Some((now, 1));
+                false
+            }
+        };
+        if !settled {
+            return None;
+        }
+        let Some(want) = Self::aspect_snap_for(&self.settings, self.pane_settled, now)
+        else {
+            // Already on its aspect: this IS the settled size, and the next
+            // drag is measured from here.
+            self.pane_settled = Some(now);
+            return None;
+        };
+        // Remember what we are about to ask for, so the size that comes back
+        // reads as settled rather than as a fresh drag.
+        self.pane_seen = Some((want, SETTLE_FRAMES));
+        self.pane_settled = Some(want);
+        Some(want)
+    }
+
+    /// The arithmetic half, without a context — see [`Self::aspect_snap`].
+    ///
+    /// **Whichever edge moved is the one that leads.** Dragging a side changes
+    /// the width and the height follows; dragging the top or bottom changes
+    /// the height and the WIDTH follows. Both come out diagonal, which is the
+    /// only way a vertical edge can resize a layout whose height is decided by
+    /// its width.
+    fn aspect_snap_for(
+        settings: &Settings,
+        from: Option<Vec2>,
+        now: Vec2,
+    ) -> Option<Vec2> {
+        if !now.x.is_finite() || !now.y.is_finite() {
+            return None;
+        }
+        let floor = crate::settings::MIN_WINDOW;
+        // The stack's height at a known width, which is what makes the inverse
+        // a multiply — the same trick `fit_bands` uses.
+        let probe = band_sizes_at(settings, 1300.0).total().y.max(1.0);
+        let from_width = |w: f32| {
+            let w = w.max(floor.x).round();
+            Vec2::new(w, band_sizes_at(settings, w).total().y.round())
+        };
+        let by_width = from_width(now.x);
+        // What width would want this height. Solved off the ratio and then
+        // re-measured, because the bands clamp and the 16:9 correction is not
+        // linear.
+        let by_height = from_width(now.y.max(floor.y) * 1300.0 / probe);
+        // **Which edge moved, measured against where the window WAS.**
+        //
+        // The first cut compared the two candidates to each other, which
+        // cannot answer this: both are derived from where the window is now,
+        // and where it is now is precisely what the hand changed. So a
+        // bottom-edge drag looked like a width answer and got put straight
+        // back — the window flashed and never resized.
+        //
+        // With nothing to measure against — the first settle after launch —
+        // the width leads, which is the layout's own natural reading.
+        let height_led = from.is_some_and(|was| {
+            (now.y - was.y).abs() > (now.x - was.x).abs() + 0.5
+        });
+        let want = if height_led { by_height } else { by_width };
+        if !want.x.is_finite() || !want.y.is_finite() || want.y <= 0.0 {
+            return None;
+        }
+        // Already there, within a point — re-sending a size the window has is
+        // how a settle becomes a stutter.
+        if (now - want).length() <= 1.0 {
+            return None;
+        }
+        Some(want)
+    }
+
+    /// **Open the A menu for a track**, built from what its bays hold right    /// **Open the A menu for a track**, built from what its bays hold right
+    /// now.
+    ///
+    /// Built at OPEN rather than kept: a plugin loaded or unloaded while the
+    /// menu is up would leave a list describing a desk that no longer exists,
+    /// and rebuilding is a handful of strings.
+    fn arr_open_automation_menu(&mut self, lane: usize) {
         use crate::automation::AutoParam;
-        let now = self.arr_auto_param(lane);
-        let i = AutoParam::ALL.iter().position(|p| *p == now).unwrap_or(0);
-        let next = AutoParam::ALL[(i + 1) % AutoParam::ALL.len()];
-        self.arr_auto_params.insert(lane, next);
-        self.arr_auto_hot = None;
+        if lane >= crate::recorder::CHANNELS {
+            return;
+        }
+        let desk = dialogs::AutoGroup {
+            name: "Desk".to_owned(),
+            rows: AutoParam::ALL
+                .into_iter()
+                .map(|p| dialogs::AutoRow {
+                    key: p.key(),
+                    label: p.label(),
+                    on: self.arr_auto_is_open(lane, p),
+                })
+                .collect(),
+        };
+        let mut groups = vec![desk];
+        for bay in 0..crate::recorder::INSERTS {
+            let Some(fx) = self.fx_params(lane, bay) else {
+                continue;
+            };
+            let name = if fx.name.is_empty() {
+                format!("Bay {}", bay + 1)
+            } else {
+                fx.name.clone()
+            };
+            let rows: Vec<dialogs::AutoRow> = fx
+                .params
+                .iter()
+                .map(|q| {
+                    let p = AutoParam::Plugin {
+                        bay: bay as u8,
+                        id: q.id,
+                    };
+                    dialogs::AutoRow {
+                        key: p.key(),
+                        label: if q.units.is_empty() {
+                            q.title.clone()
+                        } else {
+                            format!("{} ({})", q.title, q.units)
+                        },
+                        on: self.arr_auto_is_open(lane, p),
+                    }
+                })
+                .collect();
+            groups.push(dialogs::AutoGroup { name, rows });
+        }
+        self.dialog = Some(dialogs::Dialog::Automation {
+            lane,
+            who: {
+                // What the header calls it, so the menu's title and the row
+                // it hangs off say the same word.
+                let name = self
+                    .settings
+                    .strip_names
+                    .get(lane)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                if name.is_empty() {
+                    format!("Track {}", lane + 1)
+                } else {
+                    name.to_owned()
+                }
+            },
+            groups,
+            // The desk open, the plugins shut — see `AutoGroup`.
+            open_groups: vec!["Desk".to_owned()],
+        });
+    }
+
+    /// Whether a lane is showing a row for this parameter.
+    fn arr_auto_is_open(&self, lane: usize, param: crate::automation::AutoParam) -> bool {
+        self.arr_auto_open.contains(&(lane, param))
     }
 
     /// Put a point on a lane's curve, answering where it landed.
@@ -7796,9 +8081,14 @@ impl IvoryApp {
     /// grid and the same magnet everything else on this surface obeys; the
     /// vertical one is a level, and a level that could only take sixteen
     /// values would be a worse control than the fader it automates.
-    fn arr_put_auto_point(&mut self, lane: usize, t: f64, v: f64) -> Option<usize> {
+    fn arr_put_auto_point(
+        &mut self,
+        lane: usize,
+        param: crate::automation::AutoParam,
+        t: f64,
+        v: f64,
+    ) -> Option<usize> {
         use crate::automation::{Point, Shape};
-        let param = self.arr_auto_param(lane);
         let at_s = self.arr_snap_t(t);
         // A switch steps; a level ramps. Choosing the shape from the
         // parameter rather than asking is what makes a mute curve behave
@@ -7813,7 +8103,7 @@ impl IvoryApp {
             .entry(lane, param)
             .put(Point { at_s, value: v.clamp(0.0, 1.0), shape });
         self.arr_save_edits();
-        self.arr_auto_index(lane, at_s)
+        self.arr_auto_index(lane, param, at_s)
     }
 
     // ── the tempo lane ──────────────────────────────────────────────────
@@ -7857,7 +8147,30 @@ impl IvoryApp {
             // place as the default.
             ramp: true,
         });
-        self.arrangement.tempo = crate::tempo::TempoMap::sanitised(pts);
+        // **And the span LEADING IN slides too.**
+        //
+        // A ramp is a property of the point it slides FROM — `TempoPoint::ramp`
+        // says so — so a new point that ramps only affects what comes AFTER
+        // it. The map starts as one point at beat zero with `ramp: false`
+        // (`TempoMap::constant`), which meant dropping a point gave a flat run
+        // and then a cliff: the ritardando the owner asked for lived entirely
+        // in the segment nobody had touched.
+        //
+        // So inserting a point turns on the ramp of the point before it. The
+        // gesture is "the tempo changes over this span", and the span is the
+        // one that ends here.
+        let mut map = crate::tempo::TempoMap::sanitised(pts);
+        if let Some(i) = map.points().iter().position(|q| (q.at_beat - at_beat).abs() < 1e-9)
+        {
+            if i > 0 {
+                let mut pts = map.points().to_vec();
+                if let Some(prev) = pts.get_mut(i - 1) {
+                    prev.ramp = true;
+                }
+                map = crate::tempo::TempoMap::sanitised(pts);
+            }
+        }
+        self.arrangement.tempo = map;
         self.arr_save_edits();
         self.arr_tempo_index(at_beat)
     }
@@ -7878,6 +8191,14 @@ impl IvoryApp {
         let Some(old) = map.points().get(index).copied() else {
             return;
         };
+        // **The first frame of a drag anchors it.** Set by the press as well,
+        // but established here too so that the anchor is a property of the
+        // DRAG rather than of remembering to arm one — a caller that reaches
+        // this function by another road still gets a point that does not run
+        // away from the pointer.
+        if self.arr_tempo_drag_from.is_none() {
+            self.arr_tempo_drag_from = Some(map.clone());
+        }
         // **The FIRST point does not move in time.** A map has to say what
         // the tempo is from the very start of the song; a first point at bar
         // nine leaves the first eight bars with no tempo at all, and
@@ -7889,9 +8210,13 @@ impl IvoryApp {
             // **Converted through the map BEFORE it changes.** Reading the
             // seconds of a drag against a map this same drag is about to
             // rewrite is a point that runs away from the pointer.
+            // Through the map as it was at the PRESS — see
+            // `arr_tempo_drag_from`. Falling back to the live one keeps a
+            // drag that somehow started without an anchor working as it did.
+            let convert = self.arr_tempo_drag_from.as_ref().unwrap_or(&map);
             Self::snap_quarter(
                 &self.live_meter_map(),
-                map.beat_at_seconds(t.max(0.0)),
+                convert.beat_at_seconds(t.max(0.0)),
                 self.settings.arr_grid_exp as i8,
             )
             .max(0.0)
@@ -7908,6 +8233,11 @@ impl IvoryApp {
         self.arrangement.tempo = crate::tempo::TempoMap::sanitised(pts);
         self.arr_tempo_hot = self.arr_tempo_index(at_beat);
         if let Some(i) = self.arr_tempo_hot {
+            // **The drag re-arms; the ANCHOR does not.** Re-taking the map
+            // here would take the one this frame has just rewritten, which is
+            // the anchor defeating itself: the conversion would follow the
+            // tempo it is changing and the point would walk away from the
+            // pointer, ramp or no ramp.
             self.arr_tempo_drag = Some(i);
             self.arr_drag = Some(ArrDrag::TempoPoint(i));
         }
@@ -8039,8 +8369,12 @@ impl IvoryApp {
     /// Re-derived rather than remembered, because `put` keeps the curve
     /// sorted: dragging a point past its neighbour changes its index, and a
     /// carried index would then be moving somebody else's point.
-    fn arr_auto_index(&self, lane: usize, at_s: f64) -> Option<usize> {
-        let param = self.arr_auto_param(lane);
+    fn arr_auto_index(
+        &self,
+        lane: usize,
+        param: crate::automation::AutoParam,
+        at_s: f64,
+    ) -> Option<usize> {
         self.arrangement
             .automation
             .get(lane, param)?
@@ -8050,9 +8384,15 @@ impl IvoryApp {
     }
 
     /// Move the point being dragged to where the pointer is.
-    fn arr_drag_auto_point(&mut self, lane: usize, index: usize, t: f64, v: f64) {
+    fn arr_drag_auto_point(
+        &mut self,
+        lane: usize,
+        param: crate::automation::AutoParam,
+        index: usize,
+        t: f64,
+        v: f64,
+    ) {
         use crate::automation::Point;
-        let param = self.arr_auto_param(lane);
         let Some(old) = self
             .arrangement
             .automation
@@ -8067,9 +8407,18 @@ impl IvoryApp {
         // along the curve leaves a trail of points behind it.
         curve.remove_near(old.at_s, 1e-9);
         curve.put(Point { at_s, value: v.clamp(0.0, 1.0), shape: old.shape });
-        self.arr_auto_hot = self.arr_auto_index(lane, at_s).map(|i| (lane, i));
+        self.arr_auto_hot = self.arr_auto_index(lane, param, at_s).map(|i| (lane, i));
         if let Some((_, i)) = self.arr_auto_hot {
-            self.arr_drag = Some(ArrDrag::AutoPoint(lane, i));
+            // Which ROW this parameter is on, re-derived rather than passed:
+            // the drag re-arms itself every frame and the row it is on cannot
+            // change under it, so deriving is cheaper than threading a second
+            // index through four call sites.
+            let slot = self
+                .arr_auto_rows(lane)
+                .iter()
+                .position(|p| *p == param)
+                .unwrap_or(0);
+            self.arr_drag = Some(ArrDrag::AutoPoint(lane, slot, i));
         }
         // **The gesture is what gets saved, not the frame.** Mouse-up is the
         // only thing that calls `arr_save_edits` for a drag, and it checks
@@ -8084,8 +8433,12 @@ impl IvoryApp {
     }
 
     /// Take the point nearest `t` off a lane's curve.
-    fn arr_remove_auto_point(&mut self, lane: usize, t: f64) {
-        let param = self.arr_auto_param(lane);
+    fn arr_remove_auto_point(
+        &mut self,
+        lane: usize,
+        param: crate::automation::AutoParam,
+        t: f64,
+    ) {
         let reach = (self.arr_window_now().1 * 0.01).max(0.01);
         if self
             .arrangement
@@ -12254,13 +12607,15 @@ impl IvoryApp {
                             self.arr_remove_tempo_point(i);
                             return;
                         }
-                        Some(A::AutoPoint(lane, _)) => {
+                        Some(A::AutoPoint(lane, row, _)) => {
                             let t = {
                                 let clips = self.arr_clip_views();
                                 let view = self.arrange_view(&clips);
                                 crate::arrangement_panel::time_at(rect, &view, p.x)
                             };
-                            self.arr_remove_auto_point(lane, t);
+                            if let Some(param) = self.arr_auto_param_at(lane, row) {
+                                self.arr_remove_auto_point(lane, param, t);
+                            }
                             return;
                         }
                         // A signature chip: emptying its field is how one is
@@ -12518,11 +12873,14 @@ impl IvoryApp {
                     //
                     // The fold arrow and the parameter picker are the row's
                     // own chrome; the lane itself makes and moves points.
-                    Some(A::AutoFold(n)) => self.arr_toggle_automation(n),
-                    Some(A::AutoParamPick(n)) => self.arr_cycle_auto_param(n),
-                    Some(A::AutoPoint(n, i)) => {
+                    Some(A::AutoMenu(n)) => self.arr_open_automation_menu(n),
+                    // A press on the row's own header opens the same menu
+                    // the A button does, with this row's box already ticked —
+                    // which is how you take a row away again.
+                    Some(A::AutoParamPick(n, _)) => self.arr_open_automation_menu(n),
+                    Some(A::AutoPoint(n, row, i)) => {
                         self.arr_auto_hot = Some((n, i));
-                        self.arr_drag = Some(ArrDrag::AutoPoint(n, i));
+                        self.arr_drag = Some(ArrDrag::AutoPoint(n, row, i));
                     }
                     // **A press on empty room MAKES a point**, which is what
                     // every desk does and what makes a curve drawable rather
@@ -12542,6 +12900,8 @@ impl IvoryApp {
                         } else {
                             self.arr_tempo_hot = Some(i);
                             self.arr_tempo_drag = Some(i);
+                            self.arr_tempo_drag_from = Some(self.live_tempo_map());
+            self.arr_tempo_drag_from = Some(self.live_tempo_map());
                             self.arr_drag = Some(ArrDrag::TempoPoint(i));
                         }
                     }
@@ -12551,6 +12911,8 @@ impl IvoryApp {
                         if let Some(i) = self.arr_put_tempo_point(t, bpm) {
                             self.arr_tempo_hot = Some(i);
                             self.arr_tempo_drag = Some(i);
+                            self.arr_tempo_drag_from = Some(self.live_tempo_map());
+            self.arr_tempo_drag_from = Some(self.live_tempo_map());
                             self.arr_drag = Some(ArrDrag::TempoPoint(i));
                         }
                     }
@@ -12561,10 +12923,23 @@ impl IvoryApp {
                     Some(A::TempoHeader) => self.arr_ask_flatten_tempo(),
                     Some(A::MeterChip(bar)) => self.arr_edit_meter(bar),
                     Some(A::MeterStrip(bar)) => self.arr_edit_meter(bar),
-                    Some(A::AutoLane(n, t, v)) => {
-                        if let Some(i) = self.arr_put_auto_point(n, t, v) {
+                    // **A press on empty room makes a point only with ALT
+                    // held**; a plain press moves the playhead, like every
+                    // other empty surface on this timeline. The owner's
+                    // gesture: alt-click adds a node, and the drag that
+                    // follows places it.
+                    Some(A::AutoLane(n, row, t, v)) => {
+                        let Some(param) = self.arr_auto_param_at(n, row) else {
+                            return;
+                        };
+                        if !ctx.input(|i| i.modifiers.alt) {
+                            let to = self.arr_snap_t(t);
+                            self.request_recorder(recorder::RecorderRequest::Locate(to));
+                            return;
+                        }
+                        if let Some(i) = self.arr_put_auto_point(n, param, t, v) {
                             self.arr_auto_hot = Some((n, i));
-                            self.arr_drag = Some(ArrDrag::AutoPoint(n, i));
+                            self.arr_drag = Some(ArrDrag::AutoPoint(n, row, i));
                         }
                     }
                     // The header's switches are the mixer strip's own, by
@@ -12701,6 +13076,7 @@ impl IvoryApp {
                         // A hidden lane holds no grabbed point.
                         self.arr_tempo_hot = None;
                         self.arr_tempo_drag = None;
+                        self.arr_tempo_drag_from = None;
                         self.save_settings();
                     }
                     Some(A::ToolGrid) => {
@@ -12882,27 +13258,33 @@ impl IvoryApp {
                 // two functions the drawing uses.** A drag that computed the
                 // value itself would be a third mapping, and the one that
                 // drifts — see `auto_y_of`.
-                ArrDrag::AutoPoint(lane, index) => {
+                ArrDrag::AutoPoint(lane, slot, index) => {
                     let rect = self.arrangement_rect.unwrap_or(Rect::NOTHING);
-                    let row = {
+                    let band = {
                         let clips = self.arr_clip_views();
                         let view = self.arrange_view(&clips);
                         crate::arrangement_panel::Layout::new(rect, &view)
                             .rows
                             .iter()
                             .find(|r| {
-                                r.kind == crate::arrangement_panel::RowKind::Automation(lane)
+                                r.kind
+                                    == crate::arrangement_panel::RowKind::Automation(
+                                        lane, slot,
+                                    )
                             })
                             .map(|r| r.lane)
                     };
-                    if let Some(row) = row.filter(egui::Rect::is_positive) {
+                    if let (Some(band), Some(param)) = (
+                        band.filter(egui::Rect::is_positive),
+                        self.arr_auto_param_at(lane, slot),
+                    ) {
                         let t = {
                             let clips = self.arr_clip_views();
                             let view = self.arrange_view(&clips);
                             crate::arrangement_panel::time_at(rect, &view, p.x)
                         };
-                        let v = crate::arrangement_panel::auto_value_at(row, p.y);
-                        self.arr_drag_auto_point(lane, index, t, v);
+                        let v = crate::arrangement_panel::auto_value_at(band, p.y);
+                        self.arr_drag_auto_point(lane, param, index, t, v);
                     }
                 }
                 // The same two functions the drawing uses, for the reason
@@ -13251,6 +13633,7 @@ impl IvoryApp {
             }
             self.arr_drag = None;
             self.arr_tempo_drag = None;
+            self.arr_tempo_drag_from = None;
             self.arr_move_orig.clear();
             self.arr_stretch_orig.clear();
         }
@@ -13573,21 +13956,25 @@ impl IvoryApp {
             }),
             lanes: std::array::from_fn(|n| {
                 let kind = self.channel_kind(n);
-                let open = self.arr_auto_open.contains(&n);
                 crate::arrangement_panel::LaneView {
-                    automation_open: open,
-                    automation: open.then(|| {
-                        let param = self.arr_auto_param(n);
-                        crate::arrangement_panel::AutoView {
+                    automation: self
+                        .arr_auto_rows(n)
+                        .into_iter()
+                        .map(|param| crate::arrangement_panel::AutoView {
                             param,
+                            label: self.auto_param_label(n, param),
+                            resting: self.auto_resting(n, param),
                             points: self
                                 .arrangement
                                 .automation
                                 .get(n, param)
                                 .map_or(&[][..], crate::automation::Curve::points),
-                            hot: self.arr_auto_hot.filter(|(l, _)| *l == n).map(|(_, i)| i),
-                        }
-                    }),
+                            hot: self
+                                .arr_auto_hot
+                                .filter(|(l, _)| *l == n)
+                                .map(|(_, i)| i),
+                        })
+                        .collect(),
                     route_count: self.settings.routes.from(n).len(),
                     name: self.channel_display_name(n),
                     input: self.input_chip_text(n),
@@ -13808,6 +14195,105 @@ impl IvoryApp {
 
     pub fn set_effect_defaults(&mut self, defaults: crate::ports::EffectDefaults) {
         self.fx_defaults = defaults;
+    }
+
+    /// **What the plugins in one strip's bays offer an automation lane.**
+    ///
+    /// Pushed in by the host, which is the only side that can read a VST3
+    /// edit controller — and which reads it on the main thread, once, when
+    /// the bay changes. Polling it per frame would be a COM call per
+    /// parameter per plugin per frame.
+    pub fn set_fx_params(&mut self, strip: usize, bays: [crate::ports::FxParams; crate::recorder::INSERTS]) {
+        if strip < crate::recorder::STRIPS + 1 {
+            self.fx_params.insert(strip, bays);
+        }
+    }
+
+    /// The word a bay's chip shows, for anything that has to name the plugin
+    /// in it — the automation menu says exactly what the chip says.
+    pub fn insert_short_name(&self, strip: usize, bay: usize) -> String {
+        self.insert(strip, bay)
+            .map(plugin_display_name)
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    /// **Where a control is standing right now**, normalised — the level an
+    /// untouched automation lane draws.
+    ///
+    /// The same normalisation the curve stores, so a lane with no points and
+    /// a lane whose first point was just dropped on that line agree about
+    /// where the line is. A plugin parameter answers with the plugin's own
+    /// default, which is where the knob rests until somebody moves it; there
+    /// is no way to read a live parameter back from here, and guessing a
+    /// middle would draw a line the plugin is not on.
+    fn auto_resting(&self, lane: usize, param: crate::automation::AutoParam) -> f64 {
+        use crate::automation::AutoParam;
+        match param {
+            AutoParam::Gain => {
+                let g = self.settings.channel_gains.get(lane).copied().unwrap_or(1.0);
+                f64::from(recorder::gain_to_fader(g as f32))
+            }
+            // Pan is stored −1..1 and laid onto 0..1, centre at a half —
+            // `AutoParam::Pan` says so.
+            AutoParam::Pan => f64::from(self.channel_pan(lane) + 1.0) * 0.5,
+            AutoParam::Send => {
+                f64::from(self.settings.strip_sends.get(lane).copied().unwrap_or(0.0) as f32)
+            }
+            // A switch written as a curve: muted above half. It rests where
+            // the switch is.
+            AutoParam::Mute => {
+                if self.settings.strip_muted & (1 << lane) != 0 {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            AutoParam::Plugin { bay, id } => self
+                .fx_params(lane, usize::from(bay))
+                .and_then(|fx| fx.params.iter().find(|p| p.id == id))
+                .map_or(0.5, |p| p.default_normalised.clamp(0.0, 1.0)),
+        }
+    }
+
+    /// **What to call an automated parameter on this lane.**
+    ///
+    /// A desk parameter names itself. A plugin's is a bay and an id, and the
+    /// word lives with the plugin — so this is where the two are joined, and
+    /// it is the only place that knows how. A parameter whose plugin has
+    /// since been unloaded still gets a name, because a curve outlives the
+    /// plugin that made it and a lane labelled with nothing is a lane
+    /// somebody deletes by mistake.
+    pub fn auto_param_label(
+        &self,
+        lane: usize,
+        param: crate::automation::AutoParam,
+    ) -> String {
+        let Some(bay) = param.bay() else {
+            return param.label();
+        };
+        let crate::automation::AutoParam::Plugin { id, .. } = param else {
+            return param.label();
+        };
+        match self.fx_params(lane, bay) {
+            Some(fx) => match fx.params.iter().find(|p| p.id == id) {
+                Some(p) if fx.name.is_empty() => p.title.clone(),
+                Some(p) => format!("{}: {}", fx.name, p.title),
+                // The plugin is there but no longer publishes this id — a
+                // version that dropped a knob. Say the address, so the lane
+                // can be found and removed.
+                None => format!("{} (gone: {id})", fx.name),
+            },
+            None => param.label(),
+        }
+    }
+
+    /// What one bay offers, for the automation menu.
+    pub fn fx_params(&self, strip: usize, bay: usize) -> Option<&crate::ports::FxParams> {
+        self.fx_params
+            .get(&strip)
+            .and_then(|bays| bays.get(bay))
+            .filter(|b| !b.params.is_empty())
     }
 
     /// Step a named parameter to the next value in its list, and wrap.
@@ -14471,11 +14957,25 @@ impl IvoryApp {
     /// How many mixer channels / arrange lanes / MIDI keys show at once —
     /// Shift+wheel zooms each, clamped to a legible band. Read from settings
     /// so the choice survives a relaunch.
+    ///
+    /// **A big window shows more.** Full or tiled, the desk shows every
+    /// channel and the timeline ten tracks — the stored counts are what a
+    /// WINDOW shows, and a screen is not a window. It is a floor rather than
+    /// an override: somebody who has zoomed PAST these keeps what they chose,
+    /// because the setting is the thing they asked for and this is only the
+    /// room the screen happens to have.
     fn mixer_visible(&self) -> usize {
-        (self.settings.mixer_visible as usize).clamp(1, crate::recorder::CHANNELS)
+        let want = (self.settings.mixer_visible as usize).max(if self.screen_sized {
+            crate::recorder::CHANNELS
+        } else {
+            0
+        });
+        want.clamp(1, crate::recorder::CHANNELS)
     }
     fn arr_visible(&self) -> usize {
-        (self.settings.arr_visible as usize).clamp(1, crate::recorder::CHANNELS)
+        let want = (self.settings.arr_visible as usize)
+            .max(if self.screen_sized { ARR_LANES_FULL } else { 0 });
+        want.clamp(1, crate::recorder::CHANNELS)
     }
     fn midi_keys_visible(&self) -> f32 {
         (self.settings.midi_keys_visible as f32).clamp(12.0, 96.0)
@@ -14854,7 +15354,7 @@ impl IvoryApp {
                 self.touch_track(n);
                 self.open_insert_face(n, bay);
             }
-            A::AutoParamPick(n) => self.arr_cycle_auto_param(n),
+            A::AutoParamPick(n, _) => self.arr_open_automation_menu(n),
             A::TempoHeader => self.arr_ask_flatten_tempo(),
             A::ToolMetronome => {
                 self.settings.metronome_on = !self.settings.metronome_on;
@@ -14868,6 +15368,7 @@ impl IvoryApp {
                 self.settings.arr_tempo_lane = !self.settings.arr_tempo_lane;
                 self.arr_tempo_hot = None;
                 self.arr_tempo_drag = None;
+                self.arr_tempo_drag_from = None;
                 self.save_settings();
             }
             // **The grid box is the one control here the arrows move**, and
@@ -14904,7 +15405,7 @@ impl IvoryApp {
             | A::Ruler(_)
             | A::AutoPoint(..)
             | A::AutoLane(..)
-            | A::AutoFold(_)
+            | A::AutoMenu(_)
             | A::TempoPoint(_)
             | A::TempoLane(..)
             | A::MeterChip(_)
@@ -17400,6 +17901,35 @@ impl IvoryApp {
                     purpose: crate::ports::SavePurpose::Template,
                 });
             }
+            // **The menu stays OPEN on a tick.** Exposing three lanes is
+            // three ticks, and a box that closed the window each time would
+            // be three trips back to the A button.
+            DialogAction::AutomationToggle(lane, key) => {
+                let Some(param) = crate::automation::AutoParam::from_key(&key) else {
+                    return;
+                };
+                self.arr_toggle_automation_param(lane, param);
+                if let Some(dialogs::Dialog::Automation { groups, .. }) =
+                    self.dialog.as_mut()
+                {
+                    for g in groups.iter_mut() {
+                        for row in g.rows.iter_mut().filter(|r| r.key == key) {
+                            row.on = !row.on;
+                        }
+                    }
+                }
+            }
+            DialogAction::AutomationGroup(name) => {
+                if let Some(dialogs::Dialog::Automation { open_groups, .. }) =
+                    self.dialog.as_mut()
+                {
+                    if let Some(at) = open_groups.iter().position(|g| *g == name) {
+                        open_groups.remove(at);
+                    } else {
+                        open_groups.push(name);
+                    }
+                }
+            }
             DialogAction::TrackRemove(lane) => {
                 self.dialog = None;
                 self.remove_selected_channels(lane);
@@ -17970,9 +18500,34 @@ impl IvoryApp {
     }
 }
 
+/// The window's width at the current percentage.
+///
+/// **A share of the MONITOR, not a fixed number of points.** It was 1300 at
+/// 100%, which is a comfortable window on the display this app was written on
+/// and a postage stamp on a 6K one — the percentages were percentages of
+/// nothing in particular. They are percentages of half the screen now, so
+/// 100% is the same SHAPE of window on every machine and the ladder above and
+/// below it means the same thing everywhere.
+///
+/// Half, because that is what 1300 was on the 2560-wide display the ladder
+/// was chosen against: the default is the window this app has always opened
+/// at, expressed as a rule rather than as a number.
+///
+/// Falls back to the old constant while no monitor has been seen — the very
+/// first launch on a new machine, before a window has existed long enough to
+/// ask. See `Settings::monitor_width`.
 fn main_width(settings: &Settings) -> f32 {
-    (1300.0 * settings.window_size_percent as f64 / 100.0).trunc() as f32
+    let base = if settings.monitor_width >= 320 {
+        settings.monitor_width as f64 * BASE_OF_MONITOR
+    } else {
+        1300.0
+    };
+    let want = base * settings.window_size_percent as f64 / 100.0;
+    (want.trunc() as f32).max(crate::settings::MIN_WINDOW.x)
 }
+
+/// What 100% is, as a share of the monitor's width. See [`main_width`].
+const BASE_OF_MONITOR: f64 = 0.5;
 
 /// Initial fixed window size for the ViewportBuilder, computed from settings
 /// before the event loop starts (spec §3.2).
@@ -19119,15 +19674,65 @@ impl IvoryApp {
         // stretched means the theory band is what gives. Borderless is
         // unaffected: it decides whether there is a frame, not how big the
         // pane is.
-        let filling = self.caps.window_sizing
-            && ui.ctx().input(|i| {
-                let v = i.viewport();
-                v.fullscreen.unwrap_or(false) || v.maximized.unwrap_or(false)
-            });
+        //
+        // **Measured, not asked.** The first cut of this read the viewport's
+        // `fullscreen` and `maximized` flags — and would have been wrong on
+        // the owner's own desk. AeroSpace's `fullscreen` command RESIZES the
+        // window; it sets no macOS flag, so both would have read false and a
+        // maximised Tangent would have letterboxed inside a screen it had
+        // been given all of. Every tiling manager behaves that way.
+        //
+        // The second cut asked "is there more height here than the layout
+        // wants" — and was worse, because on a 16:9 screen the answer is NO:
+        // this stack is TALLER than 16:9, so fullscreen would have started
+        // letterboxing where it never used to.
+        //
+        // The question that is actually being asked is "can the theory band
+        // absorb the difference, whichever way it runs?" If it can, the
+        // instruments keep the shape a window gives them and the diagrams
+        // take the change — which is right for fullscreen, for a tiled
+        // window, and for an edge dragged by hand, because it is the same
+        // situation each time. If it cannot, `fit_bands` scales the whole
+        // stack as one unit: smaller, never stretched.
+        let pane = ui.max_rect().size();
+        // **Is this window the screen?** Asked here, where the pane is already
+        // in hand, and remembered for the view builders — which are called
+        // from inside `arrange_view` and `mixer_view` and have no context to
+        // ask with. See `mixer_visible` and `arr_visible`.
+        let (full, monitor) = ui.ctx().input(|i| {
+            let v = i.viewport();
+            (
+                v.fullscreen.unwrap_or(false) || v.maximized.unwrap_or(false),
+                v.monitor_size.map(|m| m.x),
+            )
+        });
+        self.screen_sized = self.caps.window_sizing && full;
+        // **Learn the monitor's width, once.** The percentages are shares of
+        // it now (see `main_width`), and the very first window of a launch is
+        // built before any monitor can be enumerated — so what this run
+        // measures is what the NEXT one opens at.
+        if self.caps.window_sizing {
+            if let Some(w) = monitor.filter(|w| (320.0..=32_768.0).contains(w)) {
+                let w = w.round() as i64;
+                if self.monitor_saved != Some(w) && self.settings.monitor_width != w {
+                    self.settings.monitor_width = w;
+                    self.monitor_saved = Some(w);
+                    self.save_settings();
+                }
+            }
+        }
+        let filling = self.caps.window_sizing && {
+            let natural = band_sizes_at(&self.settings, pane.x.max(1.0).trunc());
+            let fixed = natural.recorder_h
+                + natural.chord_h
+                + natural.piano_h
+                + natural.fret_h;
+            natural.theory_h > 0.0 && pane.y - fixed >= natural.theory_h * 0.25
+        };
         let bands = if filling {
-            fill_bands(&self.settings, ui.max_rect().size())
+            fill_bands(&self.settings, pane)
         } else {
-            fit_bands(&self.settings, ui.max_rect().size())
+            fit_bands(&self.settings, pane)
         };
         let Bands {
             w,
@@ -19151,11 +19756,19 @@ impl IvoryApp {
         // cannot be made the size of the screen. Fullscreen was fighting the
         // window manager every frame; it is not a mode you can bolt onto a
         // fixed-size window without saying so here.
-        // `filling` and not `fullscreen`: a window pinned by Min == Max cannot
-        // be made the size of the screen AND cannot be MAXIMISED either, so
-        // the pin has to let go for both. That is what makes the window
-        // manager's own gesture work at all.
-        if self.caps.window_sizing && filling {
+        // **The pin lets go for the flags, whatever the layout decided.**
+        //
+        // `filling` is measured off the pane and so cannot be the trigger
+        // here: a window pinned by Min == Max can never GROW, so the pane
+        // would never become taller and the test would never fire — the pin
+        // would hold itself shut. The flags are the right question for this
+        // one, and a manager that resizes without setting them is not fighting
+        // a pin in the first place, because it does not ask permission.
+        let wants_to_grow = ui.ctx().input(|i| {
+            let v = i.viewport();
+            v.fullscreen.unwrap_or(false) || v.maximized.unwrap_or(false)
+        });
+        if self.caps.window_sizing && wants_to_grow {
             if self.fullscreen_sent != Some(true) {
                 // Let it grow. Sent once on the way in rather than every frame,
                 // because these are the constraints the OS is trying to honour
@@ -19203,6 +19816,26 @@ impl IvoryApp {
                         f32::INFINITY,
                     )));
                     self.min_sent = Some(true);
+                }
+                // **DIAGONAL only: the height follows the width.**
+                //
+                // The layout is aspect-locked by construction — every band's
+                // height is a fixed fraction of the window's width — so there
+                // is exactly one height that fits any given width, and every
+                // other height is bands of empty ground. Rather than let
+                // somebody drag into one and then explain the bars, the
+                // window is put back on its own aspect: drag any edge and it
+                // resizes diagonally.
+                //
+                // **Not while the window is FULL or TILED.** A screen's shape
+                // is not ours to argue with, and snapping the height back
+                // would fight the window manager every frame — the fight this
+                // app has already lost once, which is what
+                // `wm_overrode_size` exists to remember. In those states the
+                // theory band absorbs the difference instead; see the layout
+                // branch.
+                if let Some(want) = self.aspect_snap(&ctx) {
+                    ctx.send_viewport_cmd(ViewportCommand::InnerSize(want));
                 }
             } else {
                 // **The PIN**, which is what an un-resizable window is made
@@ -24655,10 +25288,15 @@ mod tests {
         app.settings.arr_snap = false;
         app.settings.record_export.tempo_bpm = 120.0;
         app.arr_put_tempo_point(4.0, 60.0).expect("placed");
-        // **The FIRST point's ramp is what makes the first span a slide.**
-        // Ramping the second would be ramping out of it towards nothing.
-        app.arr_toggle_tempo_ramp(0);
-        assert!(app.arrangement.tempo.points()[0].ramp, "the ramp did not take");
+        // **The FIRST point's ramp is what makes the first span a slide**, and
+        // dropping a point turns it on: a ramp belongs to the point it slides
+        // FROM, so a new point that ramps only affects what comes after it,
+        // and the span somebody actually drew ends AT the new point. Without
+        // this the gesture produced a flat run and then a cliff.
+        assert!(
+            app.arrangement.tempo.points()[0].ramp,
+            "dropping a point did not make the span into it a slide"
+        );
         // Halfway between the two points the tempo is between the two
         // tempos, which is a ritardando and not a step.
         let mid = app.arrangement.tempo.bpm_at_beat(4.0);
@@ -24666,12 +25304,15 @@ mod tests {
             mid > 60.5 && mid < 119.5,
             "halfway into the ramp the tempo was {mid}, which is a step"
         );
+        // Alt-click turns it back into a step, and back again.
         app.arr_toggle_tempo_ramp(0);
         assert!(!app.arrangement.tempo.points()[0].ramp);
         assert!(
             (app.arrangement.tempo.bpm_at_beat(4.0) - 120.0).abs() < 1e-6,
             "turning the ramp off did not put the step back"
         );
+        app.arr_toggle_tempo_ramp(0);
+        assert!(app.arrangement.tempo.points()[0].ramp, "the ramp did not come back");
     }
 
     /// Flattening drops the map and keeps the song's opening tempo.
@@ -24865,7 +25506,7 @@ mod tests {
         app.settings.arr_snap = false; // the magnet is its own test
 
         // A point where there was none.
-        let i = app.arr_put_auto_point(0, 4.0, 0.75).expect("no point landed");
+        let i = app.arr_put_auto_point(0, crate::automation::AutoParam::Gain, 4.0, 0.75).expect("no point landed");
         let c = app
             .arrangement
             .automation
@@ -24876,7 +25517,7 @@ mod tests {
         assert!((c.points()[i].value - 0.75).abs() < 1e-9);
 
         // Moving it leaves ONE point, not a trail.
-        app.arr_drag_auto_point(0, i, 9.0, 0.25);
+        app.arr_drag_auto_point(0, crate::automation::AutoParam::Gain, i, 9.0, 0.25);
         let c = app.arrangement.automation.get(0, AutoParam::Gain).expect("no curve");
         assert_eq!(c.points().len(), 1, "the drag left a trail: {:?}", c.points());
         assert!((c.points()[0].at_s - 9.0).abs() < 1e-9);
@@ -24884,8 +25525,8 @@ mod tests {
 
         // A second point, and moving the first PAST it keeps both and
         // re-sorts — the case a carried index would get wrong.
-        app.arr_put_auto_point(0, 12.0, 0.5);
-        app.arr_drag_auto_point(0, 0, 20.0, 0.1);
+        app.arr_put_auto_point(0, crate::automation::AutoParam::Gain, 12.0, 0.5);
+        app.arr_drag_auto_point(0, crate::automation::AutoParam::Gain, 0, 20.0, 0.1);
         let c = app.arrangement.automation.get(0, AutoParam::Gain).expect("no curve");
         assert_eq!(c.points().len(), 2, "{:?}", c.points());
         assert!(
@@ -24895,8 +25536,8 @@ mod tests {
         );
 
         // Undrawing both takes the curve out of the document entirely.
-        app.arr_remove_auto_point(0, 20.0);
-        app.arr_remove_auto_point(0, 12.0);
+        app.arr_remove_auto_point(0, crate::automation::AutoParam::Gain, 20.0);
+        app.arr_remove_auto_point(0, crate::automation::AutoParam::Gain, 12.0);
         assert!(
             app.arrangement.automation.is_empty(),
             "an emptied curve was kept: {:?}",
@@ -25069,12 +25710,12 @@ mod tests {
     fn dragging_a_point_marks_the_gesture_so_mouse_up_saves_it() {
         let (_ctx, mut app) = headless(Caps::DESKTOP);
         app.settings.arr_snap = false;
-        let i = app.arr_put_auto_point(0, 4.0, 0.75).expect("no point landed");
+        let i = app.arr_put_auto_point(0, crate::automation::AutoParam::Gain, 4.0, 0.75).expect("no point landed");
 
         // The initial press saves directly, so clear the flag and prove the
         // DRAG sets it on its own.
         app.arr_gesture_dirty = false;
-        app.arr_drag_auto_point(0, i, 9.0, 0.25);
+        app.arr_drag_auto_point(0, crate::automation::AutoParam::Gain, i, 9.0, 0.25);
         assert!(
             app.arr_gesture_dirty,
             "the drag did not mark the gesture, so mouse-up will not save it"
@@ -25091,15 +25732,15 @@ mod tests {
         use crate::automation::{AutoParam, Shape};
         let (_ctx, mut app) = headless(Caps::DESKTOP);
         app.settings.arr_snap = false;
-        app.arr_auto_params.insert(0, AutoParam::Mute);
-        app.arr_put_auto_point(0, 1.0, 1.0);
+        // The parameter is an ARGUMENT now, not a per-lane mode — a track
+        // shows several at once, so there is no "the lane's parameter" to set.
+        app.arr_put_auto_point(0, AutoParam::Mute, 1.0, 1.0);
         assert_eq!(
             app.arrangement.automation.get(0, AutoParam::Mute).expect("curve").points()[0].shape,
             Shape::Hold,
             "a mute point ramps"
         );
-        app.arr_auto_params.insert(1, AutoParam::Gain);
-        app.arr_put_auto_point(1, 1.0, 1.0);
+        app.arr_put_auto_point(1, AutoParam::Gain, 1.0, 1.0);
         assert_eq!(
             app.arrangement.automation.get(1, AutoParam::Gain).expect("curve").points()[0].shape,
             Shape::Linear,
@@ -25107,28 +25748,70 @@ mod tests {
         );
     }
 
-    /// The row opens, cycles its parameter, and closes.
+    /// **Several rows at once, and the boxes are independent.**
+    ///
+    /// This used to be one row per lane whose parameter you CYCLED — press to
+    /// step from volume to pan to send to mute and round. Mixing a track
+    /// means watching its volume and its send together, so the cycle is gone
+    /// and each parameter is its own tick.
     #[test]
-    fn a_lanes_automation_row_folds_and_cycles() {
+    fn a_lane_shows_as_many_automation_rows_as_are_ticked() {
         use crate::automation::AutoParam;
         let (_ctx, mut app) = headless(Caps::DESKTOP);
-        assert!(!app.arr_auto_open.contains(&2));
-        app.arr_toggle_automation(2);
-        assert!(app.arr_auto_open.contains(&2), "the row did not open");
-        assert_eq!(app.arr_auto_param(2), AutoParam::Gain, "it did not open on volume");
-        // Every parameter is reachable, and the cycle comes home.
-        for want in [AutoParam::Pan, AutoParam::Send, AutoParam::Mute, AutoParam::Gain] {
-            app.arr_cycle_auto_param(2);
-            assert_eq!(app.arr_auto_param(2), want);
-        }
-        app.arr_toggle_automation(2);
-        assert!(!app.arr_auto_open.contains(&2), "the row did not close");
-        // Folding a row away does NOT throw its curve out — it is a view,
-        // not the document.
-        app.arr_put_auto_point(2, 1.0, 0.5);
-        app.arr_toggle_automation(2);
-        app.arr_toggle_automation(2);
+        assert!(app.arr_auto_rows(2).is_empty(), "a fresh track shows a row");
+
+        app.arr_toggle_automation_param(2, AutoParam::Gain);
+        app.arr_toggle_automation_param(2, AutoParam::Send);
+        assert_eq!(
+            app.arr_auto_rows(2),
+            vec![AutoParam::Gain, AutoParam::Send],
+            "two ticks should be two rows, in the desk's own order"
+        );
+        // Row order is stable and matches the menu's, whatever order the
+        // boxes were ticked in.
+        app.arr_toggle_automation_param(2, AutoParam::Pan);
+        assert_eq!(
+            app.arr_auto_rows(2),
+            vec![AutoParam::Gain, AutoParam::Pan, AutoParam::Send]
+        );
+        assert_eq!(app.arr_auto_param_at(2, 1), Some(AutoParam::Pan));
+
+        // A plugin's parameter sorts after the desk's, by bay then id.
+        let fx = AutoParam::Plugin { bay: 1, id: 77 };
+        app.arr_toggle_automation_param(2, fx);
+        assert_eq!(app.arr_auto_rows(2).last(), Some(&fx));
+
+        // Untick one and only that row goes.
+        app.arr_toggle_automation_param(2, AutoParam::Pan);
+        assert!(!app.arr_auto_is_open(2, AutoParam::Pan));
+        assert!(app.arr_auto_is_open(2, AutoParam::Gain));
+
+        // **A row is a VIEW.** Hiding one does not throw its curve out.
+        app.arr_put_auto_point(2, AutoParam::Gain, 1.0, 0.5);
+        app.arr_toggle_automation_param(2, AutoParam::Gain);
+        app.arr_toggle_automation_param(2, AutoParam::Gain);
         assert!(app.arrangement.automation.get(2, AutoParam::Gain).is_some());
+
+        // And one track's rows are its own.
+        assert!(app.arr_auto_rows(3).is_empty(), "the rows leaked to another track");
+    }
+
+    /// A plugin parameter round-trips through the key a document stores.
+    #[test]
+    fn a_plugin_parameter_survives_its_own_spelling() {
+        use crate::automation::AutoParam;
+        for p in [
+            AutoParam::Gain,
+            AutoParam::Mute,
+            AutoParam::Plugin { bay: 0, id: 0 },
+            AutoParam::Plugin { bay: 2, id: 4_000_000_000 },
+        ] {
+            assert_eq!(AutoParam::from_key(&p.key()), Some(p), "{p:?} did not survive");
+        }
+        // Rubbish is refused rather than guessed at.
+        for bad in ["fx:", "fx:1", "fx:x:1", "fx:1:x", "gainn", ""] {
+            assert_eq!(AutoParam::from_key(bad), None, "{bad:?} was accepted");
+        }
     }
 
     /// **A note is spelled so a screen reader can pronounce it.**
@@ -29704,5 +30387,132 @@ mod fullscreen_proportion_tests {
             avail.y
         );
         assert!(full.piano_h > 0.0, "the piano vanished");
+    }
+}
+
+#[cfg(test)]
+mod aspect_snap_tests {
+    use super::*;
+
+    /// **A drag on any edge comes out diagonal.**
+    ///
+    /// The layout is aspect-locked by construction — every band's height is a
+    /// fixed fraction of the window's width — so there is exactly one height
+    /// that fits a given width and every other height is bands of empty
+    /// ground above and below the picture. That letterbox is the reason a
+    /// draggable window was retired once; putting the window back on its own
+    /// aspect is the answer that keeps the drag.
+    #[test]
+    fn a_dragged_edge_snaps_the_other_one_to_match() {
+        let s = Settings::first_launch();
+        let natural = super::band_sizes_at(&s, 1300.0);
+        let right = natural.total().y;
+
+        // Dragged TALLER than the layout wants: the height comes back.
+        let got = IvoryApp::aspect_snap_for(&s, None, Vec2::new(1300.0, right + 400.0))
+            .expect("a wrong height should snap");
+        assert!((got.x - 1300.0).abs() < 1.0, "the width moved: {}", got.x);
+        assert!((got.y - right).abs() < 1.0, "height {} is not {right}", got.y);
+
+        // And shorter.
+        let got = IvoryApp::aspect_snap_for(&s, None, Vec2::new(1300.0, right - 200.0))
+            .expect("a wrong height should snap");
+        assert!((got.y - right).abs() < 1.0);
+
+        // A WIDER window keeps its width and takes the height that goes with
+        // it — which is what makes the gesture diagonal rather than a snap
+        // back to one size.
+        let wide = super::band_sizes_at(&s, 1800.0).total().y;
+        let got = IvoryApp::aspect_snap_for(&s, None, Vec2::new(1800.0, right))
+            .expect("a wider window should snap its height");
+        assert!((got.x - 1800.0).abs() < 1.0, "the width was taken back");
+        assert!((got.y - wide).abs() < 1.0, "height {} is not {wide}", got.y);
+    }
+
+    /// **Dragging a TOP or BOTTOM edge resizes the window**, by taking the
+    /// width with it.
+    ///
+    /// This is the case that was broken outright rather than merely ugly: the
+    /// height is a function of the width, so a snap that always recomputed the
+    /// height from the width put a vertical drag straight back where it
+    /// started. The window flashed and never resized. Whichever edge MOVED has
+    /// to lead.
+    #[test]
+    fn dragging_a_vertical_edge_takes_the_width_with_it() {
+        let s = Settings::first_launch();
+        let natural = super::band_sizes_at(&s, 1300.0).total().y;
+
+        // The hand pulled the bottom edge down 300 points: the width is
+        // untouched, so the height is the only thing that moved.
+        let was = Vec2::new(1300.0, natural);
+        let got =
+            IvoryApp::aspect_snap_for(&s, Some(was), Vec2::new(1300.0, natural + 300.0))
+                .expect("a vertical drag should resize");
+        assert!(
+            got.x > 1300.0 + 50.0,
+            "the width did not follow the height: {} (was 1300)",
+            got.x
+        );
+        // And the answer is on the aspect: its height is the one its width wants.
+        let want = super::band_sizes_at(&s, got.x).total().y;
+        assert!(
+            (got.y - want).abs() <= 1.5,
+            "the answer is off its own aspect: {} against {want}",
+            got.y
+        );
+        // Pulled UP, the window gets smaller rather than refusing.
+        let got =
+            IvoryApp::aspect_snap_for(&s, Some(was), Vec2::new(1300.0, natural - 120.0))
+                .expect("a vertical drag should resize");
+        assert!(got.x < 1300.0, "the width did not shrink: {}", got.x);
+        assert!(got.x >= crate::settings::MIN_WINDOW.x);
+    }
+
+    /// The answer is always whole points, because a window on a fractional
+    /// size draws its glyphs on half-pixels and the text goes soft.
+    #[test]
+    fn the_settled_size_is_whole_points() {
+        let s = Settings::first_launch();
+        for probe in [
+            Vec2::new(1301.4, 700.6),
+            Vec2::new(999.9, 1200.3),
+            Vec2::new(1777.7, 300.2),
+        ] {
+            if let Some(got) = IvoryApp::aspect_snap_for(&s, None, probe) {
+                assert_eq!(got.x, got.x.round(), "width {} is fractional", got.x);
+                assert_eq!(got.y, got.y.round(), "height {} is fractional", got.y);
+            }
+        }
+    }
+
+    /// A window already on its aspect is left alone — re-sending a size the
+    /// window already has is how a resize becomes a stutter.
+    #[test]
+    fn a_window_already_on_its_aspect_is_not_touched() {
+        let s = Settings::first_launch();
+        let right = super::band_sizes_at(&s, 1300.0).total().y;
+        assert_eq!(IvoryApp::aspect_snap_for(&s, None, Vec2::new(1300.0, right)), None);
+        // Within a point, for a scaled display's fractional sizes.
+        assert_eq!(
+            IvoryApp::aspect_snap_for(&s, None, Vec2::new(1300.4, right - 0.6)),
+            None
+        );
+    }
+
+    /// Nonsense from the OS never resizes the window.
+    #[test]
+    fn a_bad_size_is_refused_rather_than_acted_on() {
+        let s = Settings::first_launch();
+        for bad in [
+            Vec2::new(f32::NAN, 700.0),
+            Vec2::new(1300.0, f32::NAN),
+            Vec2::new(f32::INFINITY, 700.0),
+        ] {
+            assert_eq!(IvoryApp::aspect_snap_for(&s, None, bad), None, "{bad:?} was acted on");
+        }
+        // Absurdly narrow: the floor applies, and the answer is still sane.
+        let got = IvoryApp::aspect_snap_for(&s, None, Vec2::new(1.0, 1.0)).expect("a size");
+        assert!(got.x >= crate::settings::MIN_WINDOW.x, "below the floor");
+        assert!(got.y > 0.0 && got.y.is_finite());
     }
 }

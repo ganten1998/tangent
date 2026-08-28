@@ -554,6 +554,31 @@ pub struct StateHandle {
     not_send: std::marker::PhantomData<*const ()>,
 }
 
+/// One of a plugin's automatable parameters, as plain data.
+///
+/// **Read on the main thread, carried everywhere as this.** A `ParameterInfo`
+/// is a COM struct full of UTF-16 arrays and flag bits; nothing outside this
+/// crate should ever see one, and nothing outside this crate CAN — the
+/// firewall (`scripts/check-firewall.sh`) keeps `vst3` out of `ivory-ui`. So
+/// the interesting fields come across as owned Rust and the rest is dropped.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParamInfo {
+    /// The plugin's own id, which is what `Control` and the automation
+    /// document both address it by. **Not an index**: ids are stable across
+    /// versions of a plugin and indices are not, so a saved curve that stored
+    /// a position would point at a different knob after an update.
+    pub id: u32,
+    pub title: String,
+    /// "dB", "Hz", "%" — empty when the plugin does not say.
+    pub units: String,
+    /// Where the knob rests, normalised 0..1. A curve with no points reads
+    /// as this.
+    pub default_normalised: f64,
+    /// 0 for a continuous parameter; otherwise how many steps it has, which
+    /// is what makes a switch draw as one.
+    pub step_count: i32,
+}
+
 impl StateHandle {
     pub(crate) fn new(
         component: ComPtr<IComponent>,
@@ -570,6 +595,68 @@ impl StateHandle {
     /// it. Main thread only.
     pub fn save(&self) -> Result<Vec<u8>, String> {
         save(&self.component, self.controller.as_ref())
+    }
+
+    /// **Every parameter this plugin will let a host automate.** Main thread
+    /// only, like everything else here.
+    ///
+    /// Empty when the plugin exports no edit controller, which is legal and
+    /// not rare — a plugin with no editor and no published parameters simply
+    /// has nothing to offer an automation lane.
+    ///
+    /// **The read-only and hidden ones are dropped**, because a lane that
+    /// cannot move its parameter is a lane that draws a curve nothing
+    /// obeys. `kIsReadOnly` says so outright; `kIsHidden` says the plugin
+    /// does not want it in a list. What is left is what a person could
+    /// reasonably reach for.
+    ///
+    /// Sorted by title, because `getParameterInfo` returns them in whatever
+    /// order the plugin declared them and a picker is read alphabetically.
+    /// The ORDER of this vector is never persisted — a curve stores the
+    /// parameter's own `id` — so sorting it costs nothing later.
+    pub fn parameters(&self) -> Vec<ParamInfo> {
+        use vst3::Steinberg::Vst::{ParameterInfo_::ParameterFlags_ as Flags, ParameterInfo};
+        let Some(controller) = self.controller.as_ref() else {
+            return Vec::new();
+        };
+        // SAFETY: a live controller on the thread that owns it — the whole
+        // reason this handle is `!Send`.
+        let count = unsafe { controller.getParameterCount() };
+        if count <= 0 {
+            return Vec::new();
+        }
+        // A plugin that reports an absurd count is a plugin with a bug, and
+        // reserving against it is how a host runs out of memory on somebody
+        // else's mistake.
+        let count = count.min(4096);
+        let mut out = Vec::new();
+        for i in 0..count {
+            // SAFETY: `info` is a valid out-parameter and `i` is in range.
+            let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
+            // SAFETY: as above.
+            if unsafe { controller.getParameterInfo(i, &mut info) } != kResultOk {
+                continue;
+            }
+            let flags = info.flags;
+            let hidden = flags & Flags::kIsHidden as int32 != 0;
+            let read_only = flags & Flags::kIsReadOnly as int32 != 0;
+            if hidden || read_only {
+                continue;
+            }
+            let title = crate::instance::utf16_to_string(&info.title);
+            if title.is_empty() {
+                continue;
+            }
+            out.push(ParamInfo {
+                id: info.id,
+                title,
+                units: crate::instance::utf16_to_string(&info.units),
+                default_normalised: info.defaultNormalizedValue,
+                step_count: info.stepCount,
+            });
+        }
+        out.sort_by(|a, b| a.title.cmp(&b.title).then(a.id.cmp(&b.id)));
+        out
     }
 }
 

@@ -390,6 +390,39 @@ pub struct ChoiceParam {
     pub default: String,
 }
 
+/// **One automatable parameter of a plugin in a bay**, as plain data.
+///
+/// The host reads these off the edit controller on the main thread and pushes
+/// them in; `ivory-ui` cannot see a VST3 type and must not — the firewall
+/// (`scripts/check-firewall.sh`) is what keeps it that way. So a parameter is
+/// an id, a word and a unit, and everything COM about it stays behind the
+/// boundary.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FxParam {
+    /// The plugin's own id. **Not an index**: ids survive a plugin update and
+    /// positions do not, and this is what an automation curve stores.
+    pub id: u32,
+    pub title: String,
+    /// "dB", "Hz", "%" — empty when the plugin does not say.
+    pub units: String,
+    /// Where the knob rests, normalised. A lane with no points reads as this.
+    pub default_normalised: f64,
+    /// 0 for a continuous parameter, otherwise how many steps it has.
+    pub step_count: i32,
+}
+
+/// What one insert bay offers an automation lane.
+///
+/// Kept per BAY rather than as one flat list, because the menu is read that
+/// way — a plugin's name and then its parameters under it — and because two
+/// bays can hold the same plugin, whose ids would then collide in a flat list.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FxParams {
+    /// The plugin's short name, for the menu row the parameters hang under.
+    pub name: String,
+    pub params: Vec<FxParam>,
+}
+
 /// One editable parameter of a patch.
 ///
 /// **Untyped on purpose, like every other thing the host pushes in.**
