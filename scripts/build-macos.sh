@@ -31,12 +31,12 @@ VERSION="$(grep '^version' Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
 VERSION_NUM="${VERSION%%-*}"; VERSION_NUM="${VERSION_NUM%%+*}"
 # macOS icons are rounded squircles with padding, not full-bleed squares — using
 # the raw square art makes Tangent look oversized next to every other Dock icon.
-# assets/ivory-macos.png is the same artwork pre-composited into that shape.
-# (build-cross.sh keeps assets/ivory.png: Windows/Linux want the square.)
-ICON_SRC="assets/ivory-macos.png"
+# assets/tangent-macos.png is the same artwork pre-composited into that shape.
+# (build-cross.sh keeps assets/tangent.png: Windows/Linux want the square.)
+ICON_SRC="assets/tangent-macos.png"
 
 warn_placeholder_icon() {
-  # assets/ivory.png is the ORIGINAL piano-keys icon, byte-identical to the
+  # assets/tangent.png is the ORIGINAL piano-keys icon, byte-identical to the
   # Python app's icons/ivory.png (verified 2026-08-04) — not placeholder art.
   # It is only 128x128, so Dock/Finder sizes above that are upscaled.
   if [ -f "$ICON_SRC" ] && [ "$(stat -f%z "$ICON_SRC")" -lt 4096 ]; then
@@ -55,7 +55,7 @@ make_icns() {
   local out="$1" tmp iconset spec px name
   warn_placeholder_icon
   tmp="$(mktemp -d)"
-  iconset="$tmp/ivory.iconset"
+  iconset="$tmp/tangent.iconset"
   mkdir -p "$iconset"
   for spec in 16:icon_16x16.png 32:icon_16x16@2x.png 32:icon_32x32.png \
               64:icon_32x32@2x.png 128:icon_128x128.png \
@@ -139,13 +139,13 @@ mkdir -p dist
 # ── Build ────────────────────────────────────────────────────────────────────
 case "$ARCH" in
   host)
-    cargo build --release -p ivory
+    cargo build --release -p tangent
     BIN="target/release/tangent"
     ;;
   universal)
     rustup target add x86_64-apple-darwin aarch64-apple-darwin >/dev/null 2>&1 || true
-    cargo build --release -p ivory --target x86_64-apple-darwin
-    cargo build --release -p ivory --target aarch64-apple-darwin
+    cargo build --release -p tangent --target x86_64-apple-darwin
+    cargo build --release -p tangent --target aarch64-apple-darwin
     mkdir -p target/universal/release
     BIN="target/universal/release/tangent"
     # `tangent`, not `ivory`: the [[bin]] name changed at 2.3.0 and this line
@@ -192,7 +192,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleExecutable</key>        <string>tangent</string>
     <key>CFBundleIconFile</key>          <string>AppIcon</string>
     <key>CFBundleIconName</key>          <string>AppIcon</string>
-    <key>CFBundleIdentifier</key>        <string>org.codeberg.ganten1998.ivory</string>
+    <key>CFBundleIdentifier</key>        <string>org.codeberg.ganten1998.tangent</string>
     <key>CFBundleInfoDictionaryVersion</key> <string>6.0</string>
     <key>CFBundlePackageType</key>       <string>APPL</string>
     <key>CFBundleShortVersionString</key> <string>${VERSION_NUM}</string>
@@ -266,11 +266,11 @@ verify_entitlements() {
 # right-click-Open bypass is gone as of macOS 15). Most people read that as
 # "this app is broken" and give up.
 #
-# Override the identity with IVORY_SIGN_ID; otherwise the first installed
+# Override the identity with TANGENT_SIGN_ID; otherwise the first installed
 # "Developer ID Application" certificate wins. With none installed the build
 # still succeeds ad-hoc — better than unsigned, which Apple Silicon kills
 # outright — but the artifact is NOT release-grade, and says so loudly.
-SIGN_ID="${IVORY_SIGN_ID:-$(security find-identity -v -p codesigning 2>/dev/null \
+SIGN_ID="${TANGENT_SIGN_ID:-$(security find-identity -v -p codesigning 2>/dev/null \
   | grep "Developer ID Application" | head -1 \
   | sed -E 's/.*\) ([0-9A-F]{40}) ".*/\1/' || true)}"
 
@@ -310,9 +310,9 @@ fi
 # even with no network. Notarization happens BEFORE packaging so the zip and
 # dmg below both carry the stapled app; stapling the archives instead does
 # nothing. Create the keychain profile once with:
-#   xcrun notarytool store-credentials "ivory-notary" \
+#   xcrun notarytool store-credentials "tangent-notary" \
 #     --apple-id <id> --team-id <team> --password <app-specific-password>
-NOTARY_PROFILE="${IVORY_NOTARY_PROFILE:-ivory-notary}"
+NOTARY_PROFILE="${TANGENT_NOTARY_PROFILE:-tangent-notary}"
 if [ "$SIGNED_RELEASE" = 1 ] \
    && xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null 2>&1; then
   echo "==> Notarizing (waits on Apple; typically 1–5 minutes)"
@@ -357,8 +357,8 @@ fi
 # and installable at this point, so the local workflow survives an abort — what
 # is refused is the distributables.
 if [ "$SIGNED_RELEASE" = 1 ] && ! xcrun stapler validate "$APP" >/dev/null 2>&1; then
-  if [ "${IVORY_ALLOW_UNNOTARIZED:-0}" = 1 ]; then
-    echo "warn: PACKAGING AN UN-NOTARIZED RELEASE — IVORY_ALLOW_UNNOTARIZED=1."
+  if [ "${TANGENT_ALLOW_UNNOTARIZED:-0}" = 1 ]; then
+    echo "warn: PACKAGING AN UN-NOTARIZED RELEASE — TANGENT_ALLOW_UNNOTARIZED=1."
     echo "      These artifacts will be refused on every Mac but this one."
   else
     echo "" >&2
@@ -372,7 +372,7 @@ if [ "$SIGNED_RELEASE" = 1 ] && ! xcrun stapler validate "$APP" >/dev/null 2>&1;
     echo "     xcrun notarytool store-credentials $NOTARY_PROFILE \\" >&2
     echo "       --apple-id <id> --team-id <team>" >&2
     echo "" >&2
-    echo "   To package anyway: IVORY_ALLOW_UNNOTARIZED=1 $0" >&2
+    echo "   To package anyway: TANGENT_ALLOW_UNNOTARIZED=1 $0" >&2
     exit 1
   fi
 fi
@@ -401,7 +401,7 @@ ditto -c -k --sequesterRsrc --keepParent "$STAGE" "$ZIP"
 # ditto writes an AppleDouble stub for every entry (macOS 14+ stamps an
 # unremovable com.apple.provenance xattr, and this tree lives in Dropbox, which
 # adds more), which Windows/Linux users see as junk. KEEP --sequesterRsrc:
-# without it those stubs land INLINE as "._ivory" beside the real files, which
+# without it those stubs land INLINE as "._tangent" beside the real files, which
 # is worse; xattr -cr does not help either (provenance survives it). Delete the
 # sequestered copy instead — verified the signature still validates after both
 # `ditto -x -k` and `unzip`. zip -d exits 12 when nothing matches, hence || true.

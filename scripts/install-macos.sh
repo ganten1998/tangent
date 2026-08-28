@@ -4,7 +4,7 @@
 #
 # ONE short command, and that is the whole point of it:
 #
-#     cd ~/Dropbox/Projects/Apps/ivory && ./scripts/install-macos.sh
+#     cd ~/Dropbox/Projects/Apps/tangent && ./scripts/install-macos.sh
 #
 # The three-line copy-paste this replaces was
 #

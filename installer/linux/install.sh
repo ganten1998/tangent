@@ -218,7 +218,7 @@ have_va_driver() {
 
 # **Probe the ffmpeg the app will actually run, not the one on PATH.**
 #
-# `encode::ffmpeg::program()` resolves `$IVORY_FFMPEG`, then the `tangent-ffmpeg`
+# `encode::ffmpeg::program()` resolves `$TANGENT_FFMPEG`, then the `tangent-ffmpeg`
 # sitting beside the installed binary, and only then the bare name — so the
 # BUNDLED copy wins over PATH. Checking `command -v ffmpeg` therefore answers a
 # question nobody asked: a machine with a perfect system ffmpeg and a bundled
@@ -230,8 +230,8 @@ have_va_driver() {
 FFMPEG_TESTED=""
 have_vaapi_ffmpeg() {
     FFMPEG_TESTED=""
-    if [ -n "${IVORY_FFMPEG:-}" ] && [ -x "${IVORY_FFMPEG:-}" ]; then
-        FFMPEG_TESTED="$IVORY_FFMPEG"
+    if [ -n "${TANGENT_FFMPEG:-}" ] && [ -x "${TANGENT_FFMPEG:-}" ]; then
+        FFMPEG_TESTED="$TANGENT_FFMPEG"
     elif [ -x "$BIN_DIR/tangent-ffmpeg" ]; then
         FFMPEG_TESTED="$BIN_DIR/tangent-ffmpeg"
     elif [ -x "$SELF_DIR/tangent-ffmpeg" ]; then
@@ -383,7 +383,7 @@ media_prereqs() {
         echo "        beside its own binary before anything on PATH, so that copy"
         echo "        is the one that decides. Use a build of 4.39.0 or later, or"
         echo "        point Tangent at an encoder that has VA-API:"
-        echo "          IVORY_FFMPEG=/usr/bin/ffmpeg tangent"
+        echo "          TANGENT_FFMPEG=/usr/bin/ffmpeg tangent"
     fi
 
     # Nothing a package manager can supply — everything outstanding has been
@@ -483,7 +483,7 @@ if [ "$UNINSTALL" = "1" ]; then
                 >/dev/null 2>&1 || true
     fi
     echo
-    echo "Removed. Your settings are still in ~/.config/ivory — taught chord"
+    echo "Removed. Your settings are still in ~/.config/tangent — taught chord"
     echo "names and a supporter key live there, so uninstalling does not throw"
     echo "them away. Delete that directory yourself if you want them gone."
     exit 0

@@ -23,10 +23,10 @@ Two other things were needed and were fetched rather than guessed:
 
 - **The algorithm table.** Decoded from Dexed's `algorithms[32]` opcode table and
   verified against the corpus. It agrees with the chart on the front of the instrument
-  and with `ivory/src/dx7/algorithms.rs`, which is a useful independent check on that
+  and with `tangent/src/dx7/algorithms.rs`, which is a useful independent check on that
   transcription — the file's own doc comment says a wrong entry there does not fail,
   it just plays the wrong patch.
-- **A renderer.** Tangent's own `ivory/src/dx7` engine, lifted into a standalone
+- **A renderer.** Tangent's own `tangent/src/dx7` engine, lifted into a standalone
   harness so every claim below is measured rather than asserted. Nothing in the
   repository was modified.
 

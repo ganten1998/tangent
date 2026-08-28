@@ -48,13 +48,13 @@ the plugin as separate choices and puts the plugin where your DAW already
 looks, so there is nothing to drag anywhere.
 
   macOS 11 or later, Apple Silicon or Intel
-  https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos.pkg
+  https://github.com/ganten1998/tangent/releases/latest/download/Tangent-macos.pkg
 
   Windows 10 or later
-  https://github.com/ganten1998/ivory/releases/latest/download/Tangent-windows-setup.exe
+  https://github.com/ganten1998/tangent/releases/latest/download/Tangent-windows-setup.exe
 
   Linux x86_64 — the tarball has an install.sh that needs no root
-  https://github.com/ganten1998/ivory/releases/latest/download/tangent-linux-x86_64.tar.gz
+  https://github.com/ganten1998/tangent/releases/latest/download/tangent-linux-x86_64.tar.gz
 
 If you would rather unpack it yourself, the .dmg, .zip and .tar.gz are all
 still there on the release page.
@@ -75,10 +75,10 @@ The buyer list exists in exactly one place, the fulfil ledger, so sending lives
 there too:
 
 ```sh
-flyctl ssh sftp get /data/ledger.jsonl -a ivory-fulfil     # 1. fetch the list
+flyctl ssh sftp get /data/ledger.jsonl -a tangent-fulfil     # 1. fetch the list
 sed -n '/^Hello,$/,/^Ganten$/p' docs/RELEASE-EMAIL-3.0.0.md > /tmp/body.txt
 
-cd tools/ivory-fulfil                                       # 2. DRY RUN first
+cd tools/tangent-fulfil                                       # 2. DRY RUN first
 cargo run -- announce --subject "..." --body /tmp/body.txt --ledger ~/ledger.jsonl
 
 RESEND_API_KEY=... MAIL_FROM='Tangent <keys@ivorymidi.com>' \
@@ -102,6 +102,6 @@ three URLs every future announcement uses. What changes is the prose.
       universal build renamed the artifact, and `publish-github.sh` uploads the
       arm64-named aliases so older emails keep working. Check both.
 - [ ] The fulfil service is redeployed, so NEW buyers get the installer links
-      (`tools/ivory-fulfil`, then `fly deploy`)
+      (`tools/tangent-fulfil`, then `fly deploy`)
 - [ ] Reply-To set to an inbox that exists
 - [ ] Sent to the existing purchasers only

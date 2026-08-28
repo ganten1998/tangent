@@ -11,7 +11,7 @@
 # "install it with your package manager" is exactly the step the packaging
 # requirement says a user must never need. The app looks for `tangent-ffmpeg`
 # beside its own binary before falling back to PATH — see `program()` in
-# ivory-record/src/encode/ffmpeg.rs, including why the name is prefixed.
+# tangent-record/src/encode/ffmpeg.rs, including why the name is prefixed.
 #
 # PINNED BY CHECKSUM, CACHED IN dist/vendor. A moving "latest" URL is a supply
 # chain risk and an unreproducible build in one; these are exact versioned

@@ -51,9 +51,9 @@ esac
 
 # Cargo.lock records the workspace version too; if it disagrees the lockfile was
 # never refreshed after the bump and a --locked build would fail.
-LOCK_VERSION="$(awk '/^name = "ivory"$/{getline; gsub(/[",]/,""); print $3; exit}' Cargo.lock)"
+LOCK_VERSION="$(awk '/^name = "tangent"$/{getline; gsub(/[",]/,""); print $3; exit}' Cargo.lock)"
 [ "$LOCK_VERSION" = "$VERSION" ] || note \
-  "Cargo.lock says ivory $LOCK_VERSION, Cargo.toml says $VERSION — run 'cargo check' and commit the lockfile"
+  "Cargo.lock says tangent $LOCK_VERSION, Cargo.toml says $VERSION — run 'cargo check' and commit the lockfile"
 [ -z "$(git status --porcelain 2>/dev/null)" ] \
   || echo "    NOTE: working tree is dirty — these artifacts match no commit"
 git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null 2>&1 \

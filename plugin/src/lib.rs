@@ -1,7 +1,7 @@
 //! Tangent as a VST3 plugin.
 //!
 //! This crate is a shell. Everything you see when it opens is
-//! `ivory_ui::app::IvoryApp` — the same code the standalone runs, not a
+//! `tangent_ui::app::IvoryApp` — the same code the standalone runs, not a
 //! lookalike — and everything this file does is answer the three questions a
 //! DAW asks that a desktop window never does:
 //!
@@ -10,11 +10,11 @@
 //!      because the editor holds its state behind a mutex for a whole frame
 //!      and the audio thread must never wait on that.
 //!   2. **Where does the state live?** In the DAW project, not in
-//!      `~/.config/ivory/settings.json`. That file is shared by the standalone
+//!      `~/.config/tangent/settings.json`. That file is shared by the standalone
 //!      and by every other instance; a plugin that wrote it would let the last
 //!      window you touched decide everyone's colours.
 //!   3. **Who owns the window?** The host. `Caps::PLUGIN` says so, and
-//!      `ivory-ui` reads it at every branch point — menus and dialogs draw in
+//!      `tangent-ui` reads it at every branch point — menus and dialogs draw in
 //!      the canvas instead of opening windows, and not one
 //!      `ViewportCommand` is sent.
 //!
@@ -25,10 +25,10 @@
 
 use baseview::PhySize;
 use crossbeam::queue::ArrayQueue;
-use ivory_ui::app::IvoryApp;
-use ivory_ui::host::Caps;
-use ivory_ui::midi_event::MidiEvent;
-use ivory_ui::settings::Settings;
+use tangent_ui::app::IvoryApp;
+use tangent_ui::host::Caps;
+use tangent_ui::midi_event::MidiEvent;
+use tangent_ui::settings::Settings;
 use nih_plug::params::persist::PersistentField;
 use nih_plug::prelude::*;
 use nih_plug_egui::{create_egui_editor, EguiState};
@@ -127,7 +127,7 @@ impl Default for TangentParams {
             // Seeded from the user's own settings, so a first insert looks
             // like the app they already know. Read once, never written back.
             editor_state: EguiState::from_size(EDITOR_W, {
-                let h = ivory_ui::app::natural_size(&settings, EDITOR_W as f32).y;
+                let h = tangent_ui::app::natural_size(&settings, EDITOR_W as f32).y;
                 h.round().clamp(80.0, 2000.0) as u32
             }),
             settings: Mutex::new(settings.to_json()),

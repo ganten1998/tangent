@@ -20,7 +20,7 @@ cd "$ROOT"
 # What a buyer meets TODAY. Deliberately not the release-email draft: that one
 # is written to be sent after publishing, so its links are supposed to 404
 # until then, and it carries its own checklist.
-SOURCES=(docs/STORE-CONTENT.md tools/ivory-fulfil/src/main.rs README.md)
+SOURCES=(docs/STORE-CONTENT.md tools/tangent-fulfil/src/main.rs README.md)
 
 # Fenced code blocks are skipped. STORE-CONTENT.md documents the swap to the
 # 3.0.0 installer links inside a fence, and those are instructions for later

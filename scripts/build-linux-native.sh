@@ -34,13 +34,13 @@ ARCH="$(uname -m)"   # x86_64 or aarch64
 [ -f THIRD-PARTY-LICENSES ] || scripts/gen-third-party-licenses.sh
 
 echo "==> Tangent $VERSION — Linux $ARCH (native)"
-cargo build --release -p ivory
+cargo build --release -p tangent
 
 STAGE="dist/tangent-${VERSION}-linux-${ARCH}"
 rm -rf "$STAGE"; mkdir -p "$STAGE/fonts"
 cp target/release/tangent "$STAGE/"
-cp assets/ivory.desktop "$STAGE/tangent.desktop"
-cp assets/ivory.png "$STAGE/tangent.png"
+cp assets/tangent.desktop "$STAGE/tangent.desktop"
+cp assets/tangent.png "$STAGE/tangent.png"
 cp assets/fonts/CourierPrime-Regular.ttf assets/fonts/CourierPrime-Bold.ttf \
    assets/fonts/OFL.txt "$STAGE/fonts/"
 # Licences for the four fonts eframe's `default_fonts` embeds in the binary.

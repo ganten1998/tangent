@@ -27,17 +27,17 @@ defect**: see §10 item 6.
 | Hosting VST3 forces an MIT app to become GPLv3 | **FALSE, as of 2025-10-29.** Steinberg relicensed the VST3 SDK to **MIT** with VST 3.8. `steinbergmedia/vst3sdk/LICENSE.txt` is plain MIT, "Copyright (c) 2026, Steinberg Media Technologies GmbH"; the GitHub API reports `spdx_id: MIT`; the README states "Licensing under GPLv3 and the Steinberg proprietary license is no longer available." Verified directly, not via an agent. `plugin/` stays GPLv3 anyway, but for a different reason: the *Rust crate* `vst3-sys` declares `license = "GPL-3.0"`, a choice its authors made when the SDK forced it. **`LICENSING.md` was corrected in the same session that produced this plan** — it now states the crate-not-SDK cause and carries a dated correction block. No further edit is owed. |
 | There is a maintained Rust VST3 **host** library | Effectively no. `vst3` 0.3.0 (MIT OR Apache-2.0, 2025-12-07, 45,557 downloads) is raw bindings for **both** sides and ships a pre-generated 670 KB `bindings.rs`, so there is no build-time `libclang` and cross-compilation survives. `vst3-host` 0.9.0 (MIT, first released 2026-06-20) is the only host library and is **one author, eight weeks old**; its egui feature requires egui 0.34 and is unusable under the 0.33 pin. |
 | CLAP hosting is the cheap escape hatch | True technically, useless practically. `clack-host` 0.1.1 (MIT OR Apache-2.0, 2026-07-29) is feature-complete, and CLAP's `gui.create(..., is_floating: true)` means **zero NSView/HWND/XEmbed code**. But there are almost no free CLAP pianos; the good ones ship VST3/AU. CLAP is a cheap *second* format, never the first. |
-| MIDI timestamps are available today | **They are received and thrown away.** `ivory/src/midi.rs:65` names midir's stamp `_stamp`. Discarding it is the single most expensive line in the repo for this feature. **Unit, corrected by review:** midir's callback stamp is **MICROSECONDS on every backend** — its public contract says so (`src/common.rs:101-104`, `src/lib.rs:42-44`), and the CoreMIDI backend is literally `AudioConvertHostTimeToNanos(timestamp) as u64 / 1000` (`src/backend/coremidi/mod.rs:104-105`). The mach *domain* is shared with CoreAudio and `Instant`; the *scale* is not. Every conversion needs `× 1000`, expressed as the anchor's `a` coefficient (§3), never as an identity. |
+| MIDI timestamps are available today | **They are received and thrown away.** `tangent/src/midi.rs:65` names midir's stamp `_stamp`. Discarding it is the single most expensive line in the repo for this feature. **Unit, corrected by review:** midir's callback stamp is **MICROSECONDS on every backend** — its public contract says so (`src/common.rs:101-104`, `src/lib.rs:42-44`), and the CoreMIDI backend is literally `AudioConvertHostTimeToNanos(timestamp) as u64 / 1000` (`src/backend/coremidi/mod.rs:104-105`). The mach *domain* is shared with CoreAudio and `Instant`; the *scale* is not. Every conversion needs `× 1000`, expressed as the anchor's `a` coefficient (§3), never as an identity. |
 | Camera and audio timestamps need no latency term | **FALSE, and this is the biggest hole the review found.** Sharing a clock *domain* is not sharing an *origin*. Apple's `AVCaptureSession.h` guarantees only that sample timestamps are on the master clock **timebase**; AVFoundation exposes no capture-latency query, so a UVC webcam's sensor→ISP→USB→host delay is uncompensated and audio leads video by it. cpal 0.18.1's CoreAudio input does subtract `kAudioDevicePropertyLatency + kAudioDevicePropertySafetyOffset` (`macos/device.rs:781-785`) but each is `.unwrap_or(0)` and `kAudioStreamPropertyLatency` appears nowhere, so it is an estimate with a silent zero fallback. §3a is the section that did not exist before review. |
 | `MFSampleExtension_DeviceTimestamp` is QPC-comparable as-is | Domain yes, unit no. Microsoft's page reads "in the MFTIME domain, sharing an epoch with query performance counter (QPC) time and **always expressed in 100ns units**." The Windows camera anchor needs `× 100`. Same error class as the midir row above. |
-| `MidiEvent` can be widened to carry a recording | **No — do not try.** `ivory-ui/src/midi_event.rs:14-19` is three variants by design: channels merged at `:26`, only CC64 survives at `:35`, and its own test asserts pitch bend returns `None` at `:74`. That is exactly right for the chord engine. The recorder must **tee the raw `&[u8]` before `parse_message` runs**, not extend the shared type. |
-| midir ignores nothing by default | True. `ivory/src/midi.rs:54` never calls `.ignore()`, and midir's default is `Ignore::None` (`src/common.rs:68-69`). A keyboard sending Active Sensing every ~300 ms bloats a `.mid` roughly 10×. `input.ignore(Ignore::TimeAndActiveSense)` fixes it and keeps SysEx. |
-| The app can already put a background thread on screen | Yes, and it is the pattern to copy: `ivory/src/midi.rs:68` calls `ctx.request_repaint_of(ViewportId::ROOT)` from the midir callback thread with a cloned `egui::Context`. There is otherwise **exactly one** background thread in the whole tree and no `std::thread::spawn` anywhere. |
+| `MidiEvent` can be widened to carry a recording | **No — do not try.** `tangent-ui/src/midi_event.rs:14-19` is three variants by design: channels merged at `:26`, only CC64 survives at `:35`, and its own test asserts pitch bend returns `None` at `:74`. That is exactly right for the chord engine. The recorder must **tee the raw `&[u8]` before `parse_message` runs**, not extend the shared type. |
+| midir ignores nothing by default | True. `tangent/src/midi.rs:54` never calls `.ignore()`, and midir's default is `Ignore::None` (`src/common.rs:68-69`). A keyboard sending Active Sensing every ~300 ms bloats a `.mid` roughly 10×. `input.ignore(Ignore::TimeAndActiveSense)` fixes it and keeps SysEx. |
+| The app can already put a background thread on screen | Yes, and it is the pattern to copy: `tangent/src/midi.rs:68` calls `ctx.request_repaint_of(ViewportId::ROOT)` from the midir callback thread with a cloned `egui::Context`. There is otherwise **exactly one** background thread in the whole tree and no `std::thread::spawn` anywhere. |
 | The app has ever uploaded a texture | **Never.** Zero occurrences of `load_texture`, `TextureHandle`, `ColorImage`, `ImageData`, `PaintCallback` across all four crates. The app draws with `rect_filled` ×18, `text` ×14, `line_segment` ×11 and three `convex_polygon`s. The camera preview is the first image the app has ever drawn. |
 | Every panel is a pure painter | **Yes, and this is the fact the compositor is built on.** `piano::draw`, `chord_strip::draw`, `fretboard_panel::draw` and `theory_panel::draw` all take `&egui::Painter` + `Rect` and paint absolutely. **None of them allocates a widget.** So the same code can paint the 88-key piano into a 1920×1080 offscreen surface at video resolution with no changes at all. §6. |
 | The layout can absorb a 16:9 band | **No.** `band_sizes_at` (`app.rs:1724-1745`) makes every height a fixed fraction of the width. Full-width 16:9 at w=1300 is **731 pt tall**, larger than the entire app at maximum (632). Nothing clamps total height against the monitor; the window is `with_resizable(false)` (`main.rs:214`). The preview must be letterboxed into a width-proportional band via `Painter::image`'s `uv` argument, so the camera's aspect never reaches the window. |
-| `Caps` has a field that covers recording | No. `persist_global_settings` is about `~/.config/ivory/settings.json` specifically; conflating it with "may write a 2 GB video into Movies" is exactly the mistake `host.rs:13-16` warns against. New fields needed. Blast radius is **2 consts plus 1 test** — there are no other `Caps` literals in the tree. |
-| `rfd` can be called from `ivory-ui` | No, and the firewall says so. Use the `take_pending_*` request pattern that `pending_resize` already establishes (`app.rs:150-152, 383-386`), not a blocking trait call. *Corrected by review:* only `main.rs:188` and `:252` are outside the event loop — `:138` is inside the **panic hook**, so it fires wherever the panic does, overwhelmingly inside `IvoryApp::frame`. And the request pattern alone does not move a modal out of the egui pass, because eframe calls `App::update` from inside `egui_ctx.run`. See the §14 row. |
+| `Caps` has a field that covers recording | No. `persist_global_settings` is about `~/.config/tangent/settings.json` specifically; conflating it with "may write a 2 GB video into Movies" is exactly the mistake `host.rs:13-16` warns against. New fields needed. Blast radius is **2 consts plus 1 test** — there are no other `Caps` literals in the tree. |
+| `rfd` can be called from `tangent-ui` | No, and the firewall says so. Use the `take_pending_*` request pattern that `pending_resize` already establishes (`app.rs:150-152, 383-386`), not a blocking trait call. *Corrected by review:* only `main.rs:188` and `:252` are outside the event loop — `:138` is inside the **panic hook**, so it fires wherever the panic does, overwhelmingly inside `IvoryApp::frame`. And the request pattern alone does not move a modal out of the egui pass, because eframe calls `App::update` from inside `egui_ctx.run`. See the §14 row. |
 | The macOS build can access a camera | **No, and it fails silently.** `scripts/build-macos.sh:217-218` signs with `--options runtime` and **passes no `--entitlements` at all** — `grep -rn "entitlement"` over the repo returns zero hits, and `codesign -d --entitlements -` on the shipped 3.0.0 bundle prints no entitlements dictionary. Without `com.apple.security.device.camera` the request is refused with **no prompt and no System Settings row**. Separately, a missing `NSCameraUsageDescription` is not a denial — TCC **kills the process**. |
 | `cargo run` is a valid camera test on macOS | **No.** TCC attributes a child process's request to the responsible ancestor, so `cargo run` from Ghostty is checked against *Ghostty's* Info.plist and *Ghostty's* grant. The dev loop must be build-the-`.app`, sign with entitlements, `open` it. Budget for this. |
 | Raw frames now, encode at stop | **Not a design, a bug.** One 20-minute 1080p30 take is **112 GB** as NV12 and needs 89 MiB/s sustained. Encode-while-recording is the only viable shape: ~1.5 MB/s to disk and the file is finished when Stop is pressed. |
@@ -108,19 +108,19 @@ plugin-hosting workstream and is deliberately last (§8).
 ## 2. Crate layout
 
 **Two new crates, both MIT, both in the root workspace, neither reachable from
-`ivory-ui`.** No new quarantined workspace is needed: every dependency named in
+`tangent-ui`.** No new quarantined workspace is needed: every dependency named in
 this plan is MIT, Apache-2.0, Zlib, BSD-2/3 or 0BSD. The GPL story stays exactly
 what `LICENSING.md` describes — one quarantined `plugin/` — and nothing here
 touches it.
 
 ```toml
 [workspace]
-members  = ["ivory-core", "ivory-ui", "ivory", "ivory-record", "ivory-host"]
+members  = ["tangent-core", "tangent-ui", "ivory", "tangent-record", "tangent-host"]
 exclude  = ["plugin"]
 resolver = "2"
 ```
 
-### `ivory-record` — capture, clock, encode, mux, files
+### `tangent-record` — capture, clock, encode, mux, files
 
 Depended on **only** by `ivory`. It owns everything platform and everything
 real-time:
@@ -214,9 +214,9 @@ slip; it is not acceptable on macOS. If taken, it must be
 `mozjpeg-sys`, which needs `nasm` and a C compiler on **every** target and ends
 the Windows cross-build.
 
-### `ivory-host` — the plugin host
+### `tangent-host` — the plugin host
 
-Separate from `ivory-record` on purpose. It is the largest risk in the feature,
+Separate from `tangent-record` on purpose. It is the largest risk in the feature,
 it is the only part that loads foreign code into the process, and keeping it a
 separate crate means it can be cut, feature-gated, or moved out of process
 without touching the recorder. Depended on only by `ivory`.
@@ -247,11 +247,11 @@ bridging and no pin violation.
 
 ### What does not change
 
-`ivory-core` is untouched. `ivory-ui` gains modules and traits but **no new
+`tangent-core` is untouched. `tangent-ui` gains modules and traits but **no new
 dependencies**, so `scripts/check-firewall.sh` stays green without editing it.
 Add `cpal`, `nokhwa`, `vst3` and `objc2` to that script's forbidden list anyway
 — the list is a literal allowlist of crate names, so a camera crate added to
-`ivory-ui` would pass it today. That hole should be closed in the same commit
+`tangent-ui` would pass it today. That hole should be closed in the same commit
 that opens the possibility.
 
 ---
@@ -576,7 +576,7 @@ positions use. nokhwa leaves this on the table and uses stream-relative time.
 
 ### MIDI
 
-**Tee the raw bytes.** `ivory/src/midi.rs`'s callback becomes:
+**Tee the raw bytes.** `tangent/src/midi.rs`'s callback becomes:
 
 ```rust
 // `tap` is an Arc<RawMidiTap> CLONED IN before `connect`, and it is ALWAYS
@@ -630,12 +630,12 @@ Two rules that are not obvious:
   `× 1000`, through the anchor's `a` coefficient. The epoch is unspecified and
   per-connection, so **every** source anchors — including macOS MIDI, whose
   domain is right and whose origin still is not.
-- **Where `DeviceMidi` holds the tap.** `ivory/src/desktop.rs:26-30` gains an
+- **Where `DeviceMidi` holds the tap.** `tangent/src/desktop.rs:26-30` gains an
   `Arc<RawMidiTap>` field, cloned into each `connect_by_name` closure. Switching
   ports drops the old connection and makes a new closure holding a clone of the
   *same* `Arc`, so a port switch mid-session does not lose the ring or the
   controller-state snapshot. **This is entirely inside the `ivory` crate** —
-  `MidiPorts` and `ivory-ui` do not change.
+  `MidiPorts` and `tangent-ui` do not change.
 - Add `input.ignore(Ignore::TimeAndActiveSense)` at `midi.rs:54`. Keeps SysEx,
   drops the ~300 ms Active Sensing heartbeat that would otherwise dominate the
   file.
@@ -655,7 +655,7 @@ The window is a stack of bands whose heights are pure functions of width, fixed
 size, `with_resizable(false)`, and there is **no menu bar** — the right-click
 context menu is the entire chrome. Any design that fights that loses.
 
-`ivory-ui/src/recorder_panel.rs`, following `fretboard_panel.rs` and
+`tangent-ui/src/recorder_panel.rs`, following `fretboard_panel.rs` and
 `theory_panel.rs` exactly: a `BAND_H_AT_1300: f64 = 200.0`, a
 `band_height(w) -> f32`, a `draw(painter, rect, state, settings)`, a
 `hit_test(rect, pos) -> Option<Hit>`, an edge trim, and a detached variant.
@@ -691,7 +691,7 @@ touched no size test.
 `show_recorder` on the local `settings` copy in `IvoryApp::new(ctx, mut
 settings, caps)`, exactly as `app.rs:257-260` already clears
 `chord_window_detached` and `fretboard_detached`. Every plugin path goes through
-it (`plugin/src/lib.rs:194`, `ivory/src/desktop.rs:92`, and the test helper at
+it (`plugin/src/lib.rs:194`, `tangent/src/desktop.rs:92`, and the test helper at
 `app.rs:2261-2263`).
 
 **Two layouts, switched by state**, because no other tool knows the user is a
@@ -862,7 +862,7 @@ Four decisions in there that are not arbitrary:
 
 ### Settings keys
 
-Additive keys in `~/.config/ivory/settings.json`, written in the hand-rolled
+Additive keys in `~/.config/tangent/settings.json`, written in the hand-rolled
 serde at `settings.rs:417-420` (read) and `:531-539` (write) — a new key must be
 added in **both** or it silently vanishes on save. All are absent-means-default
 so an older build never chokes and unknown keys are already preserved.
@@ -905,7 +905,7 @@ be exactly zero when `!caps.capture_devices`**, or `fit_bands` will shrink the
 piano to make room for a band the plugin must never populate.
 
 The directory picker uses the **request pattern**, not a blocking trait call:
-`pending_directory_request: Option<DirRequest>` in `ivory-ui` with a
+`pending_directory_request: Option<DirRequest>` in `tangent-ui` with a
 `take_directory_request()` drained by `impl eframe::App for DesktopApp` **after**
 `self.0.frame(ctx)` returns, exactly as `pending_resize` is drained by the
 plugin at `plugin/src/lib.rs:251`. That keeps `NSOpenPanel`'s nested run loop out
@@ -937,30 +937,30 @@ compositor no crate, no module, and no route to the state it must paint. Every
 field of `IvoryApp` is private (`app.rs:130-232`) and every helper that produces
 a draw argument is a private `fn` — `display_notes` (`:595`), `theory_input`
 (`:627`), `barre_to_draw` (`:549`), `heart_color` (`:762`). From outside
-`ivory-ui` there was nothing to paint.
+`tangent-ui` there was nothing to paint.
 
 **It splits at a pure-`egui` seam that already exists**, and the split is what
 keeps the firewall intact:
 
 | side | crate | what it owns |
 |---|---|---|
-| the pass | `ivory-ui/src/composite.rs` | the offscreen `Context::run` closure and the band painting. Sees only `egui`. |
-| the surface | `ivory/src/composite.rs` (new module) | the offscreen `Context`, an `egui_glow::Painter`, the FBO, the PBOs, the readback |
+| the pass | `tangent-ui/src/composite.rs` | the offscreen `Context::run` closure and the band painting. Sees only `egui`. |
+| the surface | `tangent/src/composite.rs` (new module) | the offscreen `Context`, an `egui_glow::Painter`, the FBO, the PBOs, the readback |
 
 That works because **no eframe type crosses the seam**:
 `eframe::Frame::gl()` (`epi.rs:749-751`) returns `Option<&Arc<glow::Context>>` —
 a *glow* type — and `egui_glow::Painter::paint_and_update_textures`
 (`painter.rs:356`) consumes only `&[egui::ClippedPrimitive]` and
-`&egui::TexturesDelta`, i.e. no application state at all. So `ivory-ui` needs
+`&egui::TexturesDelta`, i.e. no application state at all. So `tangent-ui` needs
 neither `egui_glow` nor `glow`, `check-firewall.sh` stays green, and §2's
-"`ivory-ui` gains no new dependencies" holds. `egui_glow 0.33.3` is already in
+"`tangent-ui` gains no new dependencies" holds. `egui_glow 0.33.3` is already in
 the root `Cargo.lock` via eframe's `glow` feature.
 
 **The new public API is one method**, beside the existing `pub fn paint_into`
 (`app.rs:1816`):
 
 ```rust
-// ivory-ui/src/app.rs
+// tangent-ui/src/app.rs
 pub fn paint_composite(&self, painter: &egui::Painter, rect: Rect, opts: &CompositeOpts)
 ```
 
@@ -979,7 +979,7 @@ checkboxes override the live panel toggles for the video only.
 
 A public `RenderSnapshot` type exporting `Voicing`, `FretboardSpec`, `Wood`,
 `Barre` and `theory_panel::Input` was considered and rejected: `&self` reaches
-all of it in-crate, and the snapshot would widen `ivory-ui`'s public surface for
+all of it in-crate, and the snapshot would widen `tangent-ui`'s public surface for
 no gain.
 
 **Fonts.** The offscreen context has its own atlas and must be seeded with
@@ -1254,8 +1254,8 @@ exists to say what that costs and to keep it from blocking everything else.
 
 Written before any of the design below was committed to, because "can a real
 VST3 be loaded in-process from Rust at all" is the question that would have
-invalidated everything else. `ivory-host/src/scan.rs` and
-`cargo run -p ivory-host --example scanvst`.
+invalidated everything else. `tangent-host/src/scan.rs` and
+`cargo run -p tangent-host --example scanvst`.
 
 **Result: 112 of 112 plugins on this machine loaded. Zero failures.** Including
 **the modelled piano**, which reports three classes — `Plugin Compatibility
@@ -1302,11 +1302,11 @@ Four things the spike settled that reading could not:
 
 ### Spike 2, same day: a plugin instantiated and rendered audio
 
-`ivory-host/src/instance.rs` and
-`cargo run -p ivory-host --example playnote -- the modelled piano`.
+`tangent-host/src/instance.rs` and
+`cargo run -p tangent-host --example playnote -- the modelled piano`.
 
 **the modelled piano rendered a middle C from Rust**, peak 0.342 / RMS 0.046, written
-through `ivory-record`'s own BWF writer and played back — which also proves the
+through `tangent-record`'s own BWF writer and played back — which also proves the
 two lanes compose, since the host and the recorder were built independently.
 
 The sequence, which is a state machine plugins enforce rather than a list of
@@ -1355,7 +1355,7 @@ Three findings, each of which would have shipped as a bug:
 
 ### Milestone, 2026-08-16: a complete take, recorded from a hosted plugin
 
-`cargo run -p ivory-host --example record_plugin -- the modelled piano`
+`cargo run -p tangent-host --example record_plugin -- the modelled piano`
 
 A four-chord ii-V-I played into the modelled piano produced a real take directory — a
 1.2 MB 24-bit BWF `.wav`, a 202-byte format-1 `.mid`, and a `take.json` — with
@@ -1370,7 +1370,7 @@ placed by `Timeline::file_sample`, the same function that decides where it lands
 in the `.mid`. A demo that fires notes at block boundaries proves nothing about
 sync, and sync is the feature.
 
-**And it is verified, not asserted.** `ivory-host/tests/plugin_take_sync.rs`
+**And it is verified, not asserted.** `tangent-host/tests/plugin_take_sync.rs`
 (`#[ignore]`d, needs a real instrument) asks whether the exported audio has an
 attack at every instant the exported MIDI names:
 
@@ -1623,13 +1623,13 @@ next launch sees `"complete": false`, finalises what is there and offers it.
 5. **`scripts/check-firewall.sh` — the fix is `--target`, not more names.**
    *Corrected by review.* Lines 25 and 52 run `cargo tree -p "$crate" --edges
    normal --prefix none` with no `--target`, and **`cargo tree` filters to the
-   host platform by default**. Proof already in this repo: `ivory/Cargo.toml:64`
+   host platform by default**. Proof already in this repo: `tangent/Cargo.toml:64`
    declares `windows-sys` under `[target.'cfg(windows)'.dependencies]`, and the
    script's exact idiom finds nothing on this Mac while `--target all` finds it
-   (43 crates versus 53 for `ivory-ui`). So a Windows-gated camera crate added to
-   `ivory-ui` would pass the firewall on the owner's machine forever. Add
+   (43 crates versus 53 for `tangent-ui`). So a Windows-gated camera crate added to
+   `tangent-ui` would pass the firewall on the owner's machine forever. Add
    `--target all` **first**, then add `cpal`, `vst3`, `objc2`, `windows`,
-   `nokhwa`, `ivory-record` and `ivory-host` to the list. Of those, only
+   `nokhwa`, `tangent-record` and `tangent-host` to the list. Of those, only
    `windows` is currently invisible without the flag — but it is the one that
    matters, since the Windows backend is the one nobody can test locally.
 6. **`THIRD-PARTY-LICENSES` is regenerated by nothing and checked by nothing —
@@ -1685,7 +1685,7 @@ next launch sees `"complete": false`, finalises what is there and offers it.
    `dist/Tangent.app` with and without the camera/audio entitlements produces
    **byte-identical requirement blobs** (`codesign -d -r`, sha256 `9fd42590…`
    both times); only the CDHash changes. The designated requirement is
-   `identifier "org.codeberg.ganten1998.ivory" and anchor apple generic and
+   `identifier "org.codeberg.ganten1998.tangent" and anchor apple generic and
    certificate 1[…6.2.6] and certificate leaf[…6.1.13] and certificate
    leaf[subject.OU] = "6GFLLR9599"` — bundle id, Apple anchor, Developer ID
    marker OIDs, team OU. **No entitlement term, and no specific leaf.** So
@@ -1829,8 +1829,8 @@ see something** — which is also why the menu row cannot slip to a later step.
 real synced `.mp4`. **Test B on macOS**, plus the §3a camera-latency calibration,
 which is the one thing no automated test covers.
 
-**Step 7 — the compositor.** `ivory-ui::app::paint_composite` and the `&self`
-refactor of the band arithmetic, `ivory/src/composite.rs` with the offscreen
+**Step 7 — the compositor.** `tangent-ui::app::paint_composite` and the `&self`
+refactor of the band arithmetic, `tangent/src/composite.rs` with the offscreen
 context, FBO, PBO readback **and the vertical flip**, the composition layouts,
 and the Export dialog with its selector. This is the step that delivers the
 headline deliverable.
@@ -1925,22 +1925,22 @@ Size is the weakest argument for a Minimal build. Three better ones survive:
 ### How it is built, and where the `cfg` is allowed to live
 
 ```toml
-# ivory/Cargo.toml
+# tangent/Cargo.toml
 [features]
 default       = ["recorder"]
-recorder      = ["dep:ivory-record", "dep:ivory-host"]
+recorder      = ["dep:tangent-record", "dep:tangent-host"]
 
 [dependencies]
-ivory-record = { path = "../ivory-record", optional = true }
-ivory-host   = { path = "../ivory-host",   optional = true }
+tangent-record = { path = "../tangent-record", optional = true }
+tangent-host   = { path = "../tangent-host",   optional = true }
 ```
 
 **`#[cfg(feature = ...)]` goes in the `ivory` binary crate and NOWHERE else.**
-That is not a preference; `ivory-ui` has a standing rule against feature cfgs
+That is not a preference; `tangent-ui` has a standing rule against feature cfgs
 (PLUGIN-PLAN §1) precisely because they are the seed of the two-GUI fork the
 egui 0.33 pin exists to prevent. So:
 
-* **`ivory-ui` compiles the Recorder band in every build**, and it is switched
+* **`tangent-ui` compiles the Recorder band in every build**, and it is switched
   off the way the plugin already switches off everything it cannot do — through
   `Caps`. A third const joins `DESKTOP` and `PLUGIN`:
 
@@ -1962,7 +1962,7 @@ egui 0.33 pin exists to prevent. So:
   the same rule the plugin follows.
 * **The `ivory` binary** does not link `cpal`, `vst3`, `objc2-av-foundation` or
   any camera code in a Minimal build. The exclusion is the compiler's, not a
-  flag's — which is the same argument the `ivory-ui` firewall rests on.
+  flag's — which is the same argument the `tangent-ui` firewall rests on.
 
 ### What ships
 
@@ -1979,7 +1979,7 @@ Full set; Minimal passes no `--entitlements` at all, exactly as 3.0.0 does.
 models the app and the VST3 plugin as separate selectable choices, and the NSIS
 script already has components — so this is a third choice in an existing
 mechanism, not new machinery. Minimal and Full are **mutually exclusive**: they
-are the same bundle id (`org.codeberg.ganten1998.ivory`, which must never
+are the same bundle id (`org.codeberg.ganten1998.tangent`, which must never
 change) and the same settings file, so installing one must replace the other.
 That exclusivity has to be stated in the installer, or a user ends up with two
 Tangents and no way to tell which one Finder will launch.
@@ -2014,13 +2014,13 @@ the megabyte.
 | App notarizes, launches, finds no camera, reports nothing | The entitlements file. Assert its presence in `release.sh` with `codesign -d --entitlements -`. |
 | Launch breaks on macOS 11–13 after the camera lands | objc2 emits macOS-14 device-type statics as non-weak imports. Link only 10.15 symbols; build 14+ type strings at runtime. |
 | The **recorder band** makes the window taller than the screen | The band's height stays a pure function of width and the camera aspect is absorbed by `Painter::image`'s `uv` — 200 pt instead of 731. Assert it in the existing `app.rs` geometry tests. **Scoped by review:** this bounds the recorder's own contribution, not the stack's total, and nothing in the tree bounds the total. At 200% with theory and fretboard on, **shipped 3.0.0 is already 1264 pt tall** with no recorder at all. That is a pre-existing gap this feature discloses rather than introduces, and closing it (clamp `window_size_percent` against `monitor_size`) is its own small change that should not be smuggled in here. |
-| `NSOpenPanel` is raised from inside an egui pass | *Corrected by review — the first draft's mechanism was wrong.* eframe calls `App::update` from **inside** `egui_ctx.run` (`native/epi_integration.rs:273-282`), so draining a request in `impl eframe::App for DesktopApp` after `self.0.frame(ctx)` returns is **still inside the egui pass**. The request pattern is still right for keeping `ivory-ui` free of `rfd`, but it does not by itself move the modal out of the frame. Use `rfd::AsyncFileDialog` and deliver the result back over a channel, so nothing blocks the main thread inside `run`. (Also correct the §0 row: `main.rs:138`'s dialog is in the **panic hook**, which fires wherever the panic does — overwhelmingly inside `IvoryApp::frame`. Only `:188` and `:252` are genuinely outside the loop. It survives today because with no parent set, rfd 0.15.4 routes it to the out-of-process `CFUserNotificationDisplayAlert` rather than a nested `NSRunLoop`.) |
+| `NSOpenPanel` is raised from inside an egui pass | *Corrected by review — the first draft's mechanism was wrong.* eframe calls `App::update` from **inside** `egui_ctx.run` (`native/epi_integration.rs:273-282`), so draining a request in `impl eframe::App for DesktopApp` after `self.0.frame(ctx)` returns is **still inside the egui pass**. The request pattern is still right for keeping `tangent-ui` free of `rfd`, but it does not by itself move the modal out of the frame. Use `rfd::AsyncFileDialog` and deliver the result back over a channel, so nothing blocks the main thread inside `run`. (Also correct the §0 row: `main.rs:138`'s dialog is in the **panic hook**, which fires wherever the panic does — overwhelmingly inside `IvoryApp::frame`. Only `:188` and `:252` are genuinely outside the loop. It survives today because with no parent set, rfd 0.15.4 routes it to the out-of-process `CFUserNotificationDisplayAlert` rather than a nested `NSRunLoop`.) |
 | The plugin build gains a camera | Band height must be exactly 0 when `!caps.capture_devices`, or `fit_bands` shrinks the piano for a band the plugin never draws. Test it under `Caps::PLUGIN`. |
 | 20-minute takes drift by ~60 ms | The `(1+ε)` map, and Test A's assertion **at t=1200 s specifically**. An assertion only at t=0 passes on a broken pipeline. |
 | A `.mid` with hanging notes or a stuck pedal | The stop sequence in §7, counter-based held tracking keyed on `(channel, key)`, and the explicit tests. |
 | A dropped frame becomes silent drift | Count two ways — expected `(T1−T0)·fps` versus received, **and** timestamp gaps > 1.5 frame intervals — and put both in `take.json`. |
 | `set_partial` uploads three times in one pass | `TextureManager` de-duplicates full deltas only. Call it exactly once per pass, from the paint body. |
-| Adding a convenient dependency to `ivory-ui` | `check-firewall.sh` needs **`--target all`** before it needs more names — see §10 item 5. Without it the script cannot see any target-gated dependency, which is exactly how a Windows-only camera crate would get in. |
+| Adding a convenient dependency to `tangent-ui` | `check-firewall.sh` needs **`--target all`** before it needs more names — see §10 item 5. Without it the script cannot see any target-gated dependency, which is exactly how a Windows-only camera crate would get in. |
 | A GPL dependency reaching the root lock file | Every crate in §2 verified permissive. But `gen-third-party-licenses.sh` **never runs** (§10 item 6) and cannot see vendored C++ or a bundled binary regardless. Fix the regeneration gate before adding any dependency at all. |
 | The composite comes out upside down, or with red and blue swapped | Both are certain, not possible: egui_glow's shader is unconditionally y-flipped, and its upload path is RGBA-only while macOS capture is forced to BGRA. §6 names both fixes. |
 | A hosted plugin loads and then dies in its allocator | `disable-library-validation` is not sufficient; `allow-jit` is also required. §8. |
@@ -2127,7 +2127,7 @@ decoded belongs in the menu, where there is room for a sentence.**
 
 §12 scheduled the host last, as lane 1's tail. In practice "I can't load VSTs, I
 don't see that option" is what a pianist hits first: without an instrument the
-app has nothing to record. The picker is a directory LISTING (`ivory_host::discover`),
+app has nothing to record. The picker is a directory LISTING (`tangent_host::discover`),
 never a scan — 112 bundles are listed in milliseconds and a bundle is opened only
 when it is chosen, so no plugin gets to crash the process before the window has
 appeared. Vendor is therefore usually blank in the list, and that is correct

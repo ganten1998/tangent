@@ -2,7 +2,7 @@
 
 **Play. Tangent writes it down, explains it, and hands you the video.**
 
-### [⬇ Download](https://github.com/ganten1998/ivory/releases/latest) &nbsp;·&nbsp; [♥ Support Tangent](https://ganten.gumroad.com/l/ivory)
+### [⬇ Download](https://github.com/ganten1998/tangent/releases/latest) &nbsp;·&nbsp; [♥ Support Tangent](https://ganten.gumroad.com/l/ivory)
 
 ![Tangent naming a C major 13, with the circle of fifths, a Tonnetz and the harmonic triangles above it](docs/img/screenshot-theory.png)
 
@@ -48,9 +48,9 @@ your DAW already looks.
 
 | Platform | Installer | Or unpack it yourself |
 |---|---|---|
-| macOS 11+ | [`.pkg`](https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos.pkg) | [`.dmg`](https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos-universal.dmg) · [`.zip`](https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos-universal.zip) |
-| Windows 10+ | [`setup.exe`](https://github.com/ganten1998/ivory/releases/latest/download/Tangent-windows-setup.exe) | [`.zip`](https://github.com/ganten1998/ivory/releases/latest/download/tangent-windows-x86_64.zip) |
-| Linux x86_64 | `install.sh`, inside the tarball | [`.tar.gz`](https://github.com/ganten1998/ivory/releases/latest/download/tangent-linux-x86_64.tar.gz) |
+| macOS 11+ | [`.pkg`](https://github.com/ganten1998/tangent/releases/latest/download/Tangent-macos.pkg) | [`.dmg`](https://github.com/ganten1998/tangent/releases/latest/download/Tangent-macos-universal.dmg) · [`.zip`](https://github.com/ganten1998/tangent/releases/latest/download/Tangent-macos-universal.zip) |
+| Windows 10+ | [`setup.exe`](https://github.com/ganten1998/tangent/releases/latest/download/Tangent-windows-setup.exe) | [`.zip`](https://github.com/ganten1998/tangent/releases/latest/download/tangent-windows-x86_64.zip) |
+| Linux x86_64 | `install.sh`, inside the tarball | [`.tar.gz`](https://github.com/ganten1998/tangent/releases/latest/download/tangent-linux-x86_64.tar.gz) |
 
 macOS builds are universal from 3.0.0, Apple Silicon and Intel, and signed
 and notarized. The Linux `install.sh` needs no root by default and takes
@@ -106,7 +106,7 @@ up differently.
   own name to the voicing you are holding. Tick *Apply in all keys* to make the
   name follow the shape through every transposition. *Manage Taught Chords…*
   lists and deletes taught names. Overrides are consulted before detection and
-  stored in `~/.config/ivory/overrides.json`.
+  stored in `~/.config/tangent/overrides.json`.
 - **Chord Learning.** *Correct Chord Name…* shows the readings Tangent actually
   weighed for the voicing you are holding, with their scores. Pick the one you
   would rather see and Tangent learns a general leaning, so similar voicings shift
@@ -167,7 +167,7 @@ use the app.
 ## Privacy
 
 Tangent makes no network connections and collects no data. Your settings and your
-taught chords stay on your machine, in `~/.config/ivory/`. There is no telemetry,
+taught chords stay on your machine, in `~/.config/tangent/`. There is no telemetry,
 no update check, and no account. Supporter keys are verified offline with a
 signature check, so no server is contacted then either. The only link anywhere in
 the app, the author's site in the About box, hands the address to your browser if
@@ -176,7 +176,7 @@ you click it. Tangent itself never opens a socket.
 ## A note on the name
 
 Tangent was called **Ivory** until 2.3.0, and "ivory" survives as the internal
-codename throughout the source: the crate names, `~/.config/ivory/`, the macOS
+codename throughout the source: the crate names, `~/.config/tangent/`, the macOS
 bundle identifier, and the `IVORY_*` developer switches. That is deliberate, not
 leftovers. Changing the bundle identifier would reset Gatekeeper's trust in every
 signed build, and changing the config path would orphan every existing user's
@@ -270,7 +270,7 @@ TTF or OTF installed on your own machine instead.
 ## Settings compatibility with Tangent 1.1.0
 
 Tangent reads and writes the same settings file as the Python app,
-`~/.config/ivory/settings.json`, at that literal path on **all** platforms, with
+`~/.config/tangent/settings.json`, at that literal path on **all** platforms, with
 the same keys and formats. Upgrading from Python Tangent 1.1.0 carries all your
 settings over untouched. Tangent 2.x adds a single optional key
 (`custom_font_path`, edited by hand, since there is no UI for it) and preserves

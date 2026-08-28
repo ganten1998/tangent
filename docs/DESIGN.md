@@ -20,7 +20,7 @@ priority order:
 
 Reference specs live in `docs/spec/` (extracted and machine-verified from the
 Python source at `~/Dropbox/Archive/Ivory`). The prior Rust attempt
-(`ivory-rust`) was audited; its `ivory-core` is the engine base (42 green
+(`ivory-rust`) was audited; its `tangent-core` is the engine base (42 green
 tests), its GUI is reference-only (`docs/reference/`). This design was
 adversarially reviewed by a three-lens critic panel; decisions below are
 post-review.
@@ -29,8 +29,8 @@ post-review.
 
 ```
 ivory/
-├── Cargo.toml            workspace: ivory-core, ivory
-├── ivory-core/           pure engine — no GUI deps, fully testable
+├── Cargo.toml            workspace: tangent-core, ivory
+├── tangent-core/           pure engine — no GUI deps, fully testable
 │   └── src/
 │       ├── lib.rs        public API: ChordDetector, Detection, prefs
 │       ├── patterns.rs   chord patterns (95 − 2 hygiene deletions, D14),
@@ -48,16 +48,16 @@ ivory/
 │       ├── menu.rs       context menu (parity order) + teach items
 │       ├── dialogs.rs    MIDI picker, color modals, About, teach dialogs
 │       ├── midi.rs       midir thread → mpsc, auto-connect priority chain
-│       ├── settings.rs   ~/.config/ivory/settings.json — Python-compatible
+│       ├── settings.rs   ~/.config/tangent/settings.json — Python-compatible
 │       └── fonts.rs      embed Courier Prime (two families), custom font
-├── ivory/build.rs        Windows-only: icon + version resource (winres)
+├── tangent/build.rs        Windows-only: icon + version resource (winres)
 ├── assets/               ivory.png (128×128), ivory.ico, ivory.desktop, fonts/{CourierPrime-*.ttf, OFL.txt}
 ├── tests/                golden corpus + differential harness
 ├── scripts/              build-macos.sh, build-cross.sh, build-linux-native.sh (navi pattern)
 └── docs/                 DESIGN.md, DIVERGENCES.md, RELEASE.md, spec/, reference/
 ```
 
-## Engine (`ivory-core`)
+## Engine (`tangent-core`)
 
 - **API**: `ChordDetector::detect(&self, notes: &[u8]) -> Option<Detection>`
   where `Detection { label, kind: Chord|Interval|Scale, root, bass,
@@ -83,7 +83,7 @@ ivory/
      each flip annotated with its D-rule.
   3. **Differential harness** (`tests/golden/`): runs the engine over
      `corpus.json` (13,133 sets × flat/sharp). The *enforced* invariant is
-     `ivory-core/tests/differential.rs` vs the frozen `rust-golden.json`
+     `tangent-core/tests/differential.rs` vs the frozen `rust-golden.json`
      baseline — a 1500-row fast subset by default, with the full sweep behind
      `#[ignore]` (see RELEASE.md gate 3). `classified-divergences.json`
      (note-set → D-rule, both naming prefs) is a hand-audited snapshot
@@ -96,7 +96,7 @@ ivory/
   recognizable note name and "apply in all keys" is checked, the root is
   parameterized (transposition-invariant); otherwise literal for that
   voicing. Consulted *before* detection scoring. Persisted to
-  `~/.config/ivory/overrides.json` (schema versioned; also carries
+  `~/.config/tangent/overrides.json` (schema versioned; also carries
   `learning_mode` — Python never touches this file).
 - **Learned re-ranker (cargo feature `learning`; since 2.1.0 always enabled
   by the `ivory` GUI crate, and OFF at runtime until the user turns it on)**:
@@ -164,7 +164,7 @@ ivory/
   weight). Build-time cmap test (ttf-parser dev-dep) asserts Δ/ø coverage
   in both. `custom_font_path` (settings.json) loads a user TTF/OTF at top
   priority in both families. No Courier New file is ever shipped.
-- **Settings**: literal `~/.config/ivory/settings.json` on ALL platforms
+- **Settings**: literal `~/.config/tangent/settings.json` on ALL platforms
   (Python hard-codes Path.home()/.config — do not "improve" to
   dirs::config_dir() or carryover fails). Same 13 keys, lowercase #rrggbb
   color strings (parse case-insensitively), `serde_json` pretty 2-space
@@ -199,7 +199,7 @@ ivory/
 - `scripts/build-cross.sh`: navi-proven — `cargo zigbuild` for
   x86_64/aarch64 Linux (glibc 2.32 floor) → tar.gz with .desktop, icon,
   license files; `cargo xwin` for Windows x86_64 → zip. `.deb` (with
-  proper /usr/share/doc/ivory/copyright folding MIT + OFL) after the
+  proper /usr/share/doc/tangent/copyright folding MIT + OFL) after the
   tar.gz path works.
 - THIRD-PARTY-LICENSES generated via cargo-about/cargo-license; ships in
   every artifact alongside LICENSE (MIT) and OFL.txt.

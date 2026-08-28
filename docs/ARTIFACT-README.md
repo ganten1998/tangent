@@ -130,10 +130,10 @@ everything back.
 
 Tangent keeps two files, at the same path on every platform:
 
-    ~/.config/ivory/settings.json    appearance and window preferences
-    ~/.config/ivory/overrides.json   taught chords and learned leanings
+    ~/.config/tangent/settings.json    appearance and window preferences
+    ~/.config/tangent/overrides.json   taught chords and learned leanings
 
-On Windows that folder is C:\Users\<you>\.config/ivory\. Deleting one of these
+On Windows that folder is C:\Users\<you>\.config/tangent\. Deleting one of these
 files resets that part of Tangent and nothing else.
 
 

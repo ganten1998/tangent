@@ -57,17 +57,17 @@ Everything else you already had is still there and unchanged: the VST3 plugin,
 the guitar neck, the chords you have taught it, your colours, your tunings.
 
   macOS 11 or later, Apple Silicon or Intel
-  https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos.pkg
+  https://github.com/ganten1998/tangent/releases/latest/download/Tangent-macos.pkg
 
   Windows 10 or later
-  https://github.com/ganten1998/ivory/releases/latest/download/Tangent-windows-setup.exe
+  https://github.com/ganten1998/tangent/releases/latest/download/Tangent-windows-setup.exe
 
   Linux x86_64. The tarball has an install.sh that needs no root
-  https://github.com/ganten1998/ivory/releases/latest/download/tangent-linux-x86_64.tar.gz
+  https://github.com/ganten1998/tangent/releases/latest/download/tangent-linux-x86_64.tar.gz
 
 The .dmg, .zip and .tar.gz are all still on the release page if you would
 rather unpack it yourself:
-https://github.com/ganten1998/ivory/releases/latest
+https://github.com/ganten1998/tangent/releases/latest
 
 Your settings carry over untouched. One thing will look different on purpose:
 the sheet music panel is on, so the chord strip that used to sit under the
@@ -88,10 +88,10 @@ The buyer list exists in exactly one place, the fulfil ledger, so sending lives
 there too:
 
 ```sh
-flyctl ssh sftp get /data/ledger.jsonl -a ivory-fulfil      # 1. fetch the list
+flyctl ssh sftp get /data/ledger.jsonl -a tangent-fulfil      # 1. fetch the list
 sed -n '/^Hello,$/,/^Ganten$/p' docs/release/4.2/RELEASE-EMAIL-4.2.md > /tmp/body.txt
 
-cd tools/ivory-fulfil                                        # 2. DRY RUN first
+cd tools/tangent-fulfil                                        # 2. DRY RUN first
 cargo run -- announce --subject "Tangent 4.2 writes down what you play" \
   --body /tmp/body.txt --ledger ~/ledger.jsonl
 

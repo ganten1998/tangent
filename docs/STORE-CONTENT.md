@@ -7,7 +7,7 @@ There are two surfaces, and only one of them is inside this repo:
 | surface | who owns it | how it is edited |
 |---|---|---|
 | Post-purchase page ("View content") | Gumroad | web UI, paste the block below |
-| Supporter-key email | us | `tools/ivory-fulfil/src/main.rs`, `email_body()` |
+| Supporter-key email | us | `tools/tangent-fulfil/src/main.rs`, `email_body()` |
 
 Gumroad's own receipt email is not customisable in any useful way, so the
 supporter-key email is where the download links have to be. It is the one
@@ -16,7 +16,7 @@ message a buyer keeps.
 ## The links, and why they are shaped this way
 
 Every download link points at
-`https://github.com/ganten1998/ivory/releases/latest/download/<name>`, which
+`https://github.com/ganten1998/tangent/releases/latest/download/<name>`, which
 GitHub resolves by **exact asset name** against whatever release is currently
 latest. Nothing here is version-pinned, so a page written today still hands out
 2.9.0 in two years without being touched.
@@ -114,7 +114,7 @@ scripts/check-store-links.sh
 ```
 
 It pulls every `releases/latest/download/` URL out of this file and out of
-`tools/ivory-fulfil/src/main.rs` and fetches each one. Run it after publishing
+`tools/tangent-fulfil/src/main.rs` and fetches each one. Run it after publishing
 and before pasting.
 
 ## The 3.0.0 swap — done
@@ -122,7 +122,7 @@ and before pasting.
 The block below hands out the **installers** rather than the archives, because
 each one offers the app and the plugin as separate choices and puts the plugin
 where the DAW already looks. Those assets first existed at 3.0.0, published
-2026-08-14; `tools/ivory-fulfil/src/main.rs` was swapped at the same moment and
+2026-08-14; `tools/tangent-fulfil/src/main.rs` was swapped at the same moment and
 must be redeployed for a NEW buyer to get them.
 
 The order that keeps this honest, and the one that was got wrong twice:
@@ -154,19 +154,19 @@ Each installer offers the app and the VST3 plugin as separate choices, so you
 can take either or both. The plugin goes where your DAW already looks.
 
 macOS 11 or later, Apple Silicon or Intel
-https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos.pkg
+https://github.com/ganten1998/tangent/releases/latest/download/Tangent-macos.pkg
 
 Windows 10 or later
-https://github.com/ganten1998/ivory/releases/latest/download/Tangent-windows-setup.exe
+https://github.com/ganten1998/tangent/releases/latest/download/Tangent-windows-setup.exe
 
 Linux x86_64 (the tarball has an install.sh that needs no root)
-https://github.com/ganten1998/ivory/releases/latest/download/tangent-linux-x86_64.tar.gz
+https://github.com/ganten1998/tangent/releases/latest/download/tangent-linux-x86_64.tar.gz
 
 Prefer to unpack it yourself? The .dmg, .zip and .tar.gz are all on the release
-page: https://github.com/ganten1998/ivory/releases/latest
+page: https://github.com/ganten1998/tangent/releases/latest
 
 Checksums:
-https://github.com/ganten1998/ivory/releases/latest/download/SHA256SUMS
+https://github.com/ganten1998/tangent/releases/latest/download/SHA256SUMS
 
 YOUR SUPPORTER KEY
 
@@ -205,7 +205,7 @@ Plug your MIDI keyboard in before you start Tangent. Everything in the app
 lives in the right-click menu, and holding H shows every keyboard shortcut.
 
 Source code and release notes:
-https://github.com/ganten1998/ivory
+https://github.com/ganten1998/tangent
 
 ---
 
@@ -213,7 +213,7 @@ https://github.com/ganten1998/ivory
 
 The email and the page say the same things about activation and first launch. If
 you change one, change the other. The email version is
-`email_body()` in `tools/ivory-fulfil/src/main.rs`; its tests assert the three
+`email_body()` in `tools/tangent-fulfil/src/main.rs`; its tests assert the three
 download links are present and unpinned, so deleting a link fails the build
 rather than quietly shipping a page with nothing on it.
 

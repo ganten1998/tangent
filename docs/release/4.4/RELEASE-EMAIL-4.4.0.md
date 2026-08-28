@@ -91,19 +91,19 @@ Right-click and choose Show Chord Strip if you want it back.
 Each installer offers the app and the VST3 plugin as separate choices.
 
   macOS 11 or later, Apple Silicon or Intel
-  https://github.com/ganten1998/ivory/releases/latest/download/Tangent-macos.pkg
+  https://github.com/ganten1998/tangent/releases/latest/download/Tangent-macos.pkg
 
   Windows 10 or later
-  https://github.com/ganten1998/ivory/releases/latest/download/Tangent-windows-setup.exe
+  https://github.com/ganten1998/tangent/releases/latest/download/Tangent-windows-setup.exe
 
   Linux x86_64. The tarball has an install.sh that needs no root
-  https://github.com/ganten1998/ivory/releases/latest/download/tangent-linux-x86_64.tar.gz
+  https://github.com/ganten1998/tangent/releases/latest/download/tangent-linux-x86_64.tar.gz
 
   Checksums
-  https://github.com/ganten1998/ivory/releases/latest/download/SHA256SUMS
+  https://github.com/ganten1998/tangent/releases/latest/download/SHA256SUMS
 
 Release notes and source:
-https://github.com/ganten1998/ivory/releases/latest
+https://github.com/ganten1998/tangent/releases/latest
 
 Thank you for paying for something that is free. It is still free, and it is
 better because a few people did that anyway.
@@ -118,11 +118,11 @@ The buyer list exists in exactly one place, the fulfil ledger, so sending lives
 there too:
 
 ```sh
-flyctl ssh sftp get /data/ledger.jsonl -a ivory-fulfil      # 1. fetch the list
+flyctl ssh sftp get /data/ledger.jsonl -a tangent-fulfil      # 1. fetch the list
 sed -n '/^Hello,$/,/^Ganten$/p' \
   docs/release/4.4/RELEASE-EMAIL-4.4.0.md > /tmp/body.txt
 
-cd tools/ivory-fulfil                                        # 2. DRY RUN first
+cd tools/tangent-fulfil                                        # 2. DRY RUN first
 cargo run -- announce --subject "Tangent 4.4 writes down what you play" \
   --body /tmp/body.txt --ledger ~/ledger.jsonl
 
