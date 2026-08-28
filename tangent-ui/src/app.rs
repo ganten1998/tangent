@@ -1,10 +1,16 @@
 //! The eframe App: fixed-size window mechanics, timers, MIDI state, and the
 //! wiring between piano, chord strip, menu, and dialogs.
 //!
-//! Timing model (D-UI-3): no busy loop. `request_repaint_after(50ms)` gives
-//! the Qt GUI-timer cadence, MIDI events wake the context immediately, and
-//! chord detection runs on its own 100ms gate (with immediate off-cadence
+//! Timing model (D-UI-3): no busy loop AT REST. `request_repaint_after(50ms)`
+//! gives the Qt GUI-timer cadence, MIDI events wake the context immediately,
+//! and chord detection runs on its own 100ms gate (with immediate off-cadence
 //! runs after keytoggle clicks and note-preference changes).
+//!
+//! **While a gesture is in flight the window is paced to the display instead**
+//! — a bare `request_repaint`, which puts eframe's loop in `Poll` and lets
+//! vsync do the throttling. A delay cannot express a fast panel: egui
+//! subtracts a hard-coded 1/60 s from every deadline, so asking for a shorter
+//! delay could never produce more than about 30 frames a second. See `Pace`.
 
 use crate::chord_strip;
 use crate::dialogs::{self, Dialog, DialogAction, LearningStatus};
@@ -28,6 +34,31 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const GUI_TICK: Duration = Duration::from_millis(50);
+
+/// How hard the window is driven — see the pacing decision at the end of
+/// `paint`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pace {
+    /// The old behaviour: a 50 ms tick and nothing else.
+    Off,
+    /// Refresh-locked while a hand is on something, 50 ms at rest.
+    Gesture,
+    /// Refresh-locked always. Costs battery; measure before choosing it.
+    Always,
+}
+
+/// `IVORY_PACE=off|gesture|always`, read once.
+///
+/// An escape hatch rather than a setting: if pacing turns out to cost more
+/// than it buys on some machine, it has to be answerable without a rebuild.
+fn pace_mode() -> Pace {
+    static MODE: std::sync::OnceLock<Pace> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("IVORY_PACE").as_deref() {
+        Ok("off") => Pace::Off,
+        Ok("always") => Pace::Always,
+        _ => Pace::Gesture,
+    })
+}
 const DETECT_TICK: Duration = Duration::from_millis(100);
 const DEBOUNCE_100MS: Duration = Duration::from_millis(100);
 /// Quiet period after a move or resize before window geometry is written back.
@@ -19505,6 +19536,13 @@ impl IvoryApp {
         let ctx = ui.ctx().clone();
         self.advance_vu(&ctx);
         self.shift_down = ctx.input(|i| i.modifiers.shift);
+        // **A hand on a fader is a gesture too.** The window frame is not the
+        // only thing that felt choppy; a drag anywhere wants the same rate,
+        // and the hold outlives the gesture by `PACE_HOLD` so the last frame
+        // of it lands rather than being the one that stutters.
+        if ctx.input(|i| i.pointer.any_down() || i.raw_scroll_delta != Vec2::ZERO) {
+            self.gesture_until = Some(Instant::now() + PACE_HOLD);
+        }
         self.alt_down = ctx.input(|i| i.modifiers.alt);
         self.menu_ate_press = false;
 
@@ -21861,8 +21899,38 @@ impl IvoryApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
 
-        // 50ms GUI cadence; MIDI events wake us sooner via request_repaint_of.
-        ctx.request_repaint_after(GUI_TICK);
+        // **Refresh-locked while a gesture is in flight; 50 ms otherwise.**
+        //
+        // A DELAY cannot express a fast display at all: egui subtracts a
+        // hard-coded `predicted_dt` of 1/60 s from every deadline, so this
+        // 50 ms tick actually arrived as 33 ms and anything under 16 ms
+        // collapsed to "immediately" — there was no way to ask for 240 Hz by
+        // asking for a shorter delay. A BARE `request_repaint` is different
+        // in kind: it makes eframe choose `ControlFlow::Poll` rather than
+        // `WaitUntil`, and AutoVsync resolves to Fifo on the Metal layer, so
+        // the loop self-throttles to the panel instead of free-running. That
+        // is what makes a drag track a 240 Hz screen.
+        //
+        // Only while something is actually happening. A DAW that repaints at
+        // 240 Hz with a stopped playhead is a laptop with its fans on for no
+        // reason, and `window_sizing` keeps a plugin editor from ever doing
+        // it inside somebody else's host.
+        let paced = match pace_mode() {
+            Pace::Off => false,
+            Pace::Always => self.caps.window_sizing,
+            Pace::Gesture => {
+                self.caps.window_sizing
+                    && (self.host_gesture.active()
+                        || self.gesture_until.is_some_and(|t| Instant::now() < t)
+                        || ctx.is_using_pointer())
+            }
+        };
+        if paced {
+            ctx.request_repaint();
+        } else {
+            // 50ms GUI cadence; MIDI events wake us sooner via request_repaint_of.
+            ctx.request_repaint_after(GUI_TICK);
+        }
     }
 }
 
