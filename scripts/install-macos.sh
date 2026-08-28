@@ -60,13 +60,21 @@ if ! codesign --verify --strict "$APP" >/dev/null 2>&1; then
   exit 1
 fi
 
-VERSION=$(defaults read "$PWD/$APP/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null || echo "?")
+# The FULL version, pre-release suffix and all. `TangentVersion` is written
+# by build-macos.sh precisely because CFBundleShortVersionString cannot hold a
+# suffix; fall back to it for apps built before that key existed.
+app_version() {
+  defaults read "$1/Contents/Info.plist" TangentVersion 2>/dev/null \
+    || defaults read "$1/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null \
+    || echo "?"
+}
+VERSION=$(app_version "$PWD/$APP")
 
 # Replace, rather than copy over the top. `ditto` merges, so a file that
 # existed in the old version and not in the new one would survive into the
 # installed bundle and break its signature.
 if [ -d "$DEST" ]; then
-  OLD=$(defaults read "$DEST/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null || echo "?")
+  OLD=$(app_version "$DEST")
   # The retired plugin, wherever an old dev-install or pkg left it. The
   # user-level copy goes quietly; a root-owned /Library copy is named so the
   # owner can remove it with sudo.
@@ -93,4 +101,4 @@ else
   echo "    signed but NOT notarized — fine on this machine, refused on any other"
 fi
 
-echo "==> $DEST is $(defaults read "$DEST/Contents/Info.plist" CFBundleShortVersionString)"
+echo "==> $DEST is $(app_version "$DEST")"
