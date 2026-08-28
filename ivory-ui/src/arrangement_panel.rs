@@ -54,10 +54,12 @@ pub struct LaneView<'a> {
     /// How many routes leave this lane, for the ROUTING chip.
     pub route_count: usize,
     pub muted: bool,
-    /// This lane's automation curve is showing, in a row of its own under it.
-    pub automation_open: bool,
-    /// What that row holds. `None` while the row is closed.
-    pub automation: Option<AutoView<'a>>,
+    /// **Every automation row this lane is showing**, in row order, top to
+    /// bottom under the track.
+    ///
+    /// A list rather than one optional row: a track can expose its volume and
+    /// its send at once, which is what mixing a track means.
+    pub automation: Vec<AutoView<'a>>,
     pub soloed: bool,
     /// This lane's MIDI is sent to the theory view — the **T** switch.
     pub to_theory: bool,
@@ -135,9 +137,25 @@ pub struct ClipView<'a> {
 /// cannot leave a stale coordinate behind.
 pub struct AutoView<'a> {
     pub param: crate::automation::AutoParam,
+    /// **What to CALL it**, resolved by the app.
+    ///
+    /// A desk parameter names itself, but a plugin's is a bay and an id here
+    /// and a word over in `ports::FxParams` — so the app, which holds both,
+    /// does the joining and the panel is handed the answer. The same rule
+    /// every other colour and number in this struct follows.
+    pub label: String,
     pub points: &'a [crate::automation::Point],
     /// The point under the pointer or being dragged, so it can be drawn lit.
     pub hot: Option<usize>,
+    /// **Where the control is standing right now**, normalised, for a curve
+    /// with no points on it yet.
+    ///
+    /// An empty lane used to draw NOTHING — an empty stripe with a name
+    /// nobody had written, which reads as a lane that is broken rather than
+    /// one that is untouched. A flat line at the control's own value says
+    /// what automation would do if it were switched on, and is the line the
+    /// first alt-click lands on.
+    pub resting: f64,
 }
 
 /// Everything the arrangement draws, pushed in.
@@ -287,14 +305,18 @@ pub enum Hit {
     /// The toolbar: the click on and off.
     /// A point on an automation curve, by lane and by index into that
     /// curve's points. Grabbed to drag, or pressed to select.
-    AutoPoint(usize, usize),
+    /// `(lane, row, point)`.
+    AutoPoint(usize, usize, usize),
     /// Empty room on an automation lane: `(lane, seconds, value)`. A press
     /// here MAKES a point, which is how every DAW draws one.
-    AutoLane(usize, f64, f64),
+    /// `(lane, row, seconds, value)`.
+    AutoLane(usize, usize, f64, f64),
     /// The sub-lane's own header: which parameter it shows.
-    AutoParamPick(usize),
+    /// One automation ROW's header — `(lane, row)`.
+    AutoParamPick(usize, usize),
     /// The header's fold arrow: show or hide this lane's automation.
-    AutoFold(usize),
+    /// The **A** button on a track's header: open the automation menu.
+    AutoMenu(usize),
     /// **T** — send this track's MIDI to the theory view, or stop.
     ToTheory(usize),
     /// A point on the tempo curve, by index. Grabbed to drag.
@@ -408,7 +430,10 @@ pub enum RowKind {
     /// song's shape: tempo is a property of the SONG and not of a channel.
     Tempo,
     /// An automation curve under the track it belongs to.
-    Automation(usize),
+    /// An automation curve under the track it belongs to. `usize` is the
+    /// channel; the second is WHICH of its open rows, counting down from the
+    /// track — a lane can show several parameters at once now.
+    Automation(usize, usize),
     /// **The MASTER, above the tracks.**
     ///
     /// The desk draws a strip for it and the timeline drew none, so a
@@ -628,6 +653,10 @@ pub struct HeaderRow {
     /// per-track switch about where the track goes. Same size, so a hand
     /// that has learned M and S finds it without looking.
     pub theory: Rect,
+    /// **A** — this track's automation lanes. Directly under the T, because
+    /// the two are the same kind of question about the same track and a hand
+    /// that has found one has found the other.
+    pub automation: Rect,
     /// The input chip, under the name — every lane wears one now: binding
     /// an input is how a bare lane BECOMES a track.
     pub input: Rect,
@@ -661,6 +690,7 @@ impl HeaderRow {
         number: Rect::NOTHING,
         arm: Rect::NOTHING,
         theory: Rect::NOTHING,
+        automation: Rect::NOTHING,
         folder: Rect::NOTHING,
         collapse: Rect::NOTHING,
         name: Rect::NOTHING,
@@ -817,8 +847,17 @@ impl Layout {
                 continue;
             }
             push(RowKind::Track(i), lane_h, &mut y, &mut rows);
-            if view.lanes.get(i).is_some_and(|l| l.automation_open) {
-                push(RowKind::Automation(i), lane_h * AUTO_LANE_SHARE, &mut y, &mut rows);
+            // One row per parameter this lane is showing, in the order the
+            // view lists them — which is the order the menu offers them, so
+            // the rows and the menu read the same way down.
+            let shown = view.lanes.get(i).map_or(0, |l| l.automation.len());
+            for slot in 0..shown {
+                push(
+                    RowKind::Automation(i, slot),
+                    lane_h * AUTO_LANE_SHARE,
+                    &mut y,
+                    &mut rows,
+                );
             }
         }
 
@@ -982,12 +1021,31 @@ impl Layout {
         // It also reads better there. The arm decides whether this track
         // records what you play; this decides whether what you play reaches
         // the chord readout. They are two questions about the same signal.
-        let theory = {
-            let d = (h * 0.42).clamp(9.0, 15.0);
-            Rect::from_center_size(
-                Pos2::new(arm.right() + 3.0 + d * 0.5, r.center().y),
-                Vec2::splat(d),
-            )
+        //
+        // **T and A are a PAIR, stacked, straddling the centre.** T alone sat
+        // on the row's middle; putting A under it and leaving T where it was
+        // would push the pair off-centre, so the two are placed together and
+        // the centre falls between them.
+        let (theory, automation) = {
+            let d = (h * 0.34).clamp(8.0, 13.0);
+            let x = arm.right() + 3.0 + d * 0.5;
+            let gap = 1.5;
+            let top = r.center().y - d - gap * 0.5;
+            let mk = |y: f32| Rect::from_min_size(Pos2::new(x - d * 0.5, y), Vec2::splat(d));
+            // Shed together and below the same floor: an A with no T beside
+            // it is a switch nobody would recognise.
+            if d >= 8.0 && r.height() >= d * 2.0 + gap {
+                (mk(top), mk(top + d + gap))
+            } else {
+                let one = (h * 0.42).clamp(9.0, 15.0);
+                (
+                    Rect::from_center_size(
+                        Pos2::new(arm.right() + 3.0 + one * 0.5, r.center().y),
+                        Vec2::splat(one),
+                    ),
+                    Rect::NOTHING,
+                )
+            }
         };
         // **Two dials now — volume, then send — a shade smaller than the
         // one was**, each with a readout under it: the number is the other
@@ -1127,6 +1185,7 @@ impl Layout {
         };
         HeaderRow {
             theory,
+            automation,
             folder,
             collapse,
             panel: row,
@@ -1492,6 +1551,7 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
             (row.mute, Hit::Mute(i)),
             (row.solo, Hit::Solo(i)),
             (row.theory, Hit::ToTheory(i)),
+            (row.automation, Hit::AutoMenu(i)),
             (row.knob, Hit::Gain(i)),
             (row.send, Hit::Send(i)),
             (row.pan, Hit::Pan(i)),
@@ -1589,16 +1649,16 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
     // a press on the top of a handle belongs to the point rather than to
     // whatever row that pixel is technically in.
     for row in &l.rows {
-        let RowKind::Automation(lane) = row.kind else {
+        let RowKind::Automation(lane, slot) = row.kind else {
             continue;
         };
         if row.header.is_positive() && row.header.contains(pos) {
-            return Some(Hit::AutoParamPick(lane));
+            return Some(Hit::AutoParamPick(lane, slot));
         }
         if !row.lane.is_positive() {
             continue;
         }
-        let Some(auto) = view.lanes.get(lane).and_then(|l| l.automation.as_ref()) else {
+        let Some(auto) = view.lanes.get(lane).and_then(|l| l.automation.get(slot)) else {
             continue;
         };
         // The row plus a handle's radius: a press on the top of a point
@@ -1641,7 +1701,7 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
             .filter(|(_, d)| d.is_finite() && *d <= AUTO_POINT_R * 2.0)
             .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         if let Some((i, _)) = near {
-            return Some(Hit::AutoPoint(lane, i));
+            return Some(Hit::AutoPoint(lane, slot, i));
         }
         // **Empty room, but only room that is really in this row.**
         //
@@ -1659,6 +1719,7 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
         if row.lane.contains(pos) {
             return Some(Hit::AutoLane(
                 lane,
+                slot,
                 time_at(rect, view, pos.x),
                 auto_value_at(row.lane, pos.y),
             ));
@@ -1751,7 +1812,9 @@ pub fn targets(rect: Rect, view: &ArrangeView<'_>) -> Vec<(Rect, Hit)> {
         match row.kind {
             RowKind::Tempo => push(row.header, Hit::TempoHeader),
             RowKind::Master => {}
-            RowKind::Automation(lane) => push(row.header, Hit::AutoParamPick(lane)),
+            RowKind::Automation(lane, slot) => {
+                push(row.header, Hit::AutoParamPick(lane, slot));
+            }
             RowKind::Track(i) => {
                 let Some(hdr) = l.header_rows.get(i) else { continue };
                 // Left to right across the header: the handle, the two
@@ -1763,6 +1826,7 @@ pub fn targets(rect: Rect, view: &ArrangeView<'_>) -> Vec<(Rect, Hit)> {
                     (hdr.collapse, Hit::HdrCollapse(i)),
                     (hdr.arm, Hit::Arm(i)),
                     (hdr.theory, Hit::ToTheory(i)),
+                    (hdr.automation, Hit::AutoMenu(i)),
                     (hdr.add, Hit::HdrAdd(i)),
                     (hdr.name, Hit::HdrName(i)),
                     (hdr.input, Hit::HdrInput(i)),
@@ -1890,7 +1954,7 @@ pub fn a11y_nodes(rect: Rect, view: &ArrangeView<'_>) -> Vec<crate::a11y::Node> 
             Hit::HeaderGrip => continue,
             // ── the rows' own headers ─────────────────────────────────
             Hit::TempoHeader => Node::button(id, r, "Song tempo, flatten to one tempo"),
-            Hit::AutoParamPick(i) => Node::button(
+            Hit::AutoParamPick(i, slot) => Node::button(
                 id,
                 r,
                 format!(
@@ -1898,10 +1962,13 @@ pub fn a11y_nodes(rect: Rect, view: &ArrangeView<'_>) -> Vec<crate::a11y::Node> 
                     who(i),
                     view.lanes
                         .get(i)
-                        .and_then(|l| l.automation.as_ref())
-                        .map_or("none", |a| a.param.label())
+                        .and_then(|l| l.automation.get(slot))
+                        .map_or_else(|| "none".to_owned(), |a| a.label.clone())
                 ),
             ),
+            Hit::AutoMenu(i) => {
+                Node::button(id, r, format!("{} automation lanes", who(i)))
+            }
             // The NUMBER is the reorder handle and carries no press worth
             // announcing; the name beside it says which row this is.
             Hit::HdrNumber(_) => continue,
@@ -2064,7 +2131,7 @@ pub fn a11y_nodes(rect: Rect, view: &ArrangeView<'_>) -> Vec<crate::a11y::Node> 
             | Hit::Ruler(_)
             | Hit::AutoPoint(..)
             | Hit::AutoLane(..)
-            | Hit::AutoFold(_)
+            | Hit::AutoMenu(_)
             | Hit::TempoPoint(_)
             | Hit::TempoLane(..)
             | Hit::MeterChip(_)
@@ -2413,7 +2480,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     // being a darker version of its parent's is what says "part of that
     // one" without a line or a label doing the work.
     for row in &l.rows {
-        let RowKind::Automation(lane) = row.kind else {
+        let RowKind::Automation(lane, slot) = row.kind else {
             continue;
         };
         if !row.lane.is_positive() {
@@ -2421,6 +2488,33 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         }
         let base = if lane % 2 == 0 { p.lane } else { p.lane_alt };
         painter.rect_filled(row.lane, 0.0, shade(base, 0.88));
+        // **The row says what it controls.** It said nothing at all: a stripe
+        // under a track, with no way to tell a volume lane from a send one
+        // except by watching which fader moved. The header is the track's own
+        // strip face, so the word is measured against that and not against
+        // the lane.
+        if row.header.is_positive() {
+            let Some(auto) = view.lanes.get(lane).and_then(|v| v.automation.get(slot))
+            else {
+                continue;
+            };
+            let face = shade(p.hdr_face, 0.92);
+            painter.rect_filled(row.header, 0.0, face);
+            let ink = on_ink(face);
+            let size = (row.header.height() * 0.46).clamp(7.0, 11.0);
+            let pad = FOLDER_INDENT;
+            let room = row.header.width() - pad - 4.0;
+            if size >= 7.0 && room > 20.0 {
+                let font = FontId::new(size, crate::fonts::courier());
+                painter.text(
+                    Pos2::new(row.header.left() + pad, row.header.center().y),
+                    Align2::LEFT_CENTER,
+                    cut_to(painter, room, &auto.label, &font),
+                    font,
+                    quiet(ink, face, 0.10),
+                );
+            }
+        }
     }
 
     // ── the grid: bar lines through the lanes, numbers on the ruler ───────
@@ -2653,13 +2747,13 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     // palette, and it means a volume curve under the guitar track is the
     // guitar's green — identifiable at a glance in a stack of them.
     for row in &l.rows {
-        let RowKind::Automation(lane) = row.kind else {
+        let RowKind::Automation(lane, slot) = row.kind else {
             continue;
         };
         if !row.lane.is_positive() {
             continue;
         }
-        let Some(auto) = view.lanes.get(lane).and_then(|v| v.automation.as_ref()) else {
+        let Some(auto) = view.lanes.get(lane).and_then(|v| v.automation.get(slot)) else {
             continue;
         };
         let (cr, cg, cb) = STRIP_COLORS[view
@@ -2698,6 +2792,22 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         let hi = auto.points.partition_point(|q| q.at_s <= to_s);
         let hi = (hi + 1).min(auto.points.len());
         let shown = &auto.points[lo.min(hi)..hi];
+
+        // **An untouched lane draws its control's resting level**, flat, all
+        // the way across — see `AutoView::resting`. Without it a freshly
+        // exposed lane was an empty stripe, which reads as broken rather than
+        // as untouched, and gave the first alt-click nothing to aim at.
+        if auto.points.is_empty() {
+            let y = auto_y_of(row.lane, auto.resting);
+            painter.line_segment(
+                [Pos2::new(row.lane.left(), y), Pos2::new(row.lane.right(), y)],
+                // Dashed would say "not real"; this level IS what plays. It
+                // is drawn quieter than a written curve because nothing has
+                // been written yet.
+                Stroke::new(1.2, curve.gamma_multiply(0.55)),
+            );
+            continue;
+        }
 
         // The polyline, built in ONE pass. A hold contributes the step
         // across before the next point's own vertex, which is the whole
@@ -3622,6 +3732,9 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         // wearing two colours is one of them being mistaken for another.
         for (r, label, on, lit) in [
             (row.theory, "T", lane.to_theory, p.select),
+            // **A** — lit when this track is showing any automation row, so
+            // the header says at a glance that the rows below belong to it.
+            (row.automation, "A", !lane.automation.is_empty(), p.select),
             (row.mute, "M", lane.muted, p.mute),
             (row.solo, "S", lane.soloed, p.solo),
         ] {
@@ -3936,8 +4049,7 @@ LaneView {
     folder_count: 0,
     hidden: false,
     folder_silent: false,
-            automation_open: false,
-            automation: None,
+            automation: Vec::new(),
             route_count: 0,
             stereo: true,
             inserts: [""; crate::recorder::INSERTS],
@@ -4058,6 +4170,15 @@ ArrangeView {
         let cs: Vec<ClipView<'_>> = Vec::new();
         let mut v = a_view(&cs);
         v.show_tempo_lane = true;
+        // One automation row on lane 0. A lane shows as many as are ticked
+        // now, so the view has to say so rather than a flag.
+        v.lanes[0].automation = vec![AutoView {
+            param: crate::automation::AutoParam::Gain,
+            label: "volume".to_owned(),
+            resting: 0.5,
+            points: &[],
+            hot: None,
+        }];
         let l = Layout::new(rect(), &v);
 
         let masters: Vec<&Row> = l
@@ -4868,12 +4989,13 @@ ArrangeView {
                 v.visible_lanes = 8;
                 v.view_start_s = start;
                 v.view_len_s = len;
-                v.lanes[0].automation_open = true;
-                v.lanes[0].automation = Some(AutoView {
+                v.lanes[0].automation = vec![AutoView {
+                    label: "volume".to_owned(),
+            resting: 0.5,
                     param: AutoParam::Gain,
                     points: &pts,
                     hot: Some(3),
-                });
+                }];
                 let r = Rect::from_min_size(Pos2::ZERO, size);
                 // Painting is the assertion: a NaN or an inverted rect
                 // panics in egui's tessellator rather than drawing wrong.
@@ -4909,17 +5031,18 @@ ArrangeView {
         v.visible_lanes = 8;
         v.view_start_s = 2_000.0;
         v.view_len_s = 4.0;
-        v.lanes[0].automation_open = true;
-        v.lanes[0].automation = Some(AutoView {
+        v.lanes[0].automation = vec![AutoView {
+                    label: "volume".to_owned(),
+            resting: 0.5,
             param: AutoParam::Gain,
             points: &pts,
             hot: None,
-        });
+        }];
         let l = Layout::new(rect(), &v);
         let row = l
             .rows
             .iter()
-            .find(|r| r.kind == RowKind::Automation(0))
+            .find(|r| r.kind == RowKind::Automation(0, 0))
             .expect("no automation row")
             .lane;
         // **The point under the pointer is the RIGHT one**, four thousand
@@ -4932,7 +5055,7 @@ ArrangeView {
         );
         assert_eq!(
             hit_test(rect(), &v, at),
-            Some(Hit::AutoPoint(0, want)),
+            Some(Hit::AutoPoint(0, 0, want)),
             "the index came back offset by the cull"
         );
     }
@@ -4947,31 +5070,32 @@ ArrangeView {
         ];
         let mut v = a_view(&[]);
         v.visible_lanes = 8;
-        v.lanes[0].automation_open = true;
-        v.lanes[0].automation = Some(AutoView {
+        v.lanes[0].automation = vec![AutoView {
+                    label: "volume".to_owned(),
+            resting: 0.5,
             param: AutoParam::Gain,
             points: &pts,
             hot: None,
-        });
+        }];
         let l = Layout::new(rect(), &v);
         let row = l
             .rows
             .iter()
-            .find(|r| r.kind == RowKind::Automation(0))
+            .find(|r| r.kind == RowKind::Automation(0, 0))
             .expect("no automation row")
             .lane;
         assert!(row.is_positive());
 
         // Straight at the first point.
         let at = Pos2::new(x_of(rect(), &v, 2.0), auto_y_of(row, 0.75));
-        assert_eq!(hit_test(rect(), &v, at), Some(Hit::AutoPoint(0, 0)));
+        assert_eq!(hit_test(rect(), &v, at), Some(Hit::AutoPoint(0, 0, 0)));
         // A little off it, still within the handle's reach.
         let near = Pos2::new(at.x + 2.0, at.y - 2.0);
-        assert_eq!(hit_test(rect(), &v, near), Some(Hit::AutoPoint(0, 0)));
+        assert_eq!(hit_test(rect(), &v, near), Some(Hit::AutoPoint(0, 0, 0)));
         // Well away from both: empty room, and it says WHERE.
         let empty = Pos2::new(x_of(rect(), &v, 4.0), row.center().y);
         match hit_test(rect(), &v, empty) {
-            Some(Hit::AutoLane(0, t, val)) => {
+            Some(Hit::AutoLane(0, 0, t, val)) => {
                 assert!((t - 4.0).abs() < 0.2, "the press landed at {t}s");
                 assert!((val - 0.5).abs() < 0.1, "the middle of the row read as {val}");
             }
@@ -4979,7 +5103,7 @@ ArrangeView {
         }
         // The nearer of two points wins, not the first.
         let second = Pos2::new(x_of(rect(), &v, 6.0), auto_y_of(row, 0.25));
-        assert_eq!(hit_test(rect(), &v, second), Some(Hit::AutoPoint(0, 1)));
+        assert_eq!(hit_test(rect(), &v, second), Some(Hit::AutoPoint(0, 0, 1)));
     }
 
     /// **A press just above an automation row does not make a point in it.**
@@ -4997,17 +5121,18 @@ ArrangeView {
         let pts = [Point { at_s: 2.0, value: 0.5, shape: Shape::Linear }];
         let mut v = a_view(&[]);
         v.visible_lanes = 8;
-        v.lanes[0].automation_open = true;
-        v.lanes[0].automation = Some(AutoView {
+        v.lanes[0].automation = vec![AutoView {
+                    label: "volume".to_owned(),
+            resting: 0.5,
             param: AutoParam::Gain,
             points: &pts,
             hot: None,
-        });
+        }];
         let l = Layout::new(rect(), &v);
         let row = l
             .rows
             .iter()
-            .find(|r| r.kind == RowKind::Automation(0))
+            .find(|r| r.kind == RowKind::Automation(0, 0))
             .expect("no automation row")
             .lane;
 
@@ -5024,13 +5149,13 @@ ArrangeView {
         // made the lane unusable instead of safe.
         let inside = Pos2::new(x_of(rect(), &v, 20.0), row.center().y);
         assert!(
-            matches!(hit_test(rect(), &v, inside), Some(Hit::AutoLane(0, ..))),
+            matches!(hit_test(rect(), &v, inside), Some(Hit::AutoLane(0, 0, ..))),
             "the row stopped accepting presses"
         );
         // A handle overhanging the edge is still grabbable, which is the
         // whole reason the grab area is expanded.
         let handle = Pos2::new(x_of(rect(), &v, 2.0), auto_y_of(row, 0.5));
-        assert_eq!(hit_test(rect(), &v, handle), Some(Hit::AutoPoint(0, 0)));
+        assert_eq!(hit_test(rect(), &v, handle), Some(Hit::AutoPoint(0, 0, 0)));
     }
 
     /// A closed row is not hit at all, and its clips still are.
@@ -5040,7 +5165,7 @@ ArrangeView {
         v.visible_lanes = 8;
         let l = Layout::new(rect(), &v);
         assert!(
-            !l.rows.iter().any(|r| matches!(r.kind, RowKind::Automation(_))),
+            !l.rows.iter().any(|r| matches!(r.kind, RowKind::Automation(..))),
             "a closed lane laid out an automation row"
         );
         // The lane under the pointer is still the track's own.
@@ -5128,7 +5253,15 @@ ArrangeView {
         let track_h = plain.lane_rows[0].height();
 
         v.show_tempo_lane = true;
-        v.lanes[0].automation_open = true;
+        // One automation row on lane 0. A lane shows as many as are ticked
+        // now, so the view has to say so rather than a flag.
+        v.lanes[0].automation = vec![AutoView {
+            param: crate::automation::AutoParam::Gain,
+            label: "volume".to_owned(),
+            resting: 0.5,
+            points: &[],
+            hot: None,
+        }];
         let l = Layout::new(rect(), &v);
 
         // The tempo row is first, above every track.
@@ -5142,7 +5275,7 @@ ArrangeView {
         let auto = l
             .rows
             .iter()
-            .find(|r| r.kind == RowKind::Automation(0))
+            .find(|r| r.kind == RowKind::Automation(0, 0))
             .expect("no automation row");
         assert!(
             (auto.lane.top() - l.lane_rows[0].bottom()).abs() < 0.5,

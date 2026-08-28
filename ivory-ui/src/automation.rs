@@ -44,36 +44,81 @@ pub enum AutoParam {
     /// because a separate kind of lane for the switches would be a second
     /// editor to build and learn for one bit of information.
     Mute,
+    /// **A parameter of the plugin in one of this lane's bays.**
+    ///
+    /// `bay` is the insert slot, `id` the plugin's OWN parameter id — never
+    /// an index. Ids survive a plugin update and positions do not, so a curve
+    /// that stored a position would point at a different knob after the user
+    /// installed a new version of the same effect.
+    ///
+    /// Carrying the bay as well as the id is what keeps two bays holding the
+    /// SAME plugin apart: their parameter ids are identical, and a curve that
+    /// named only the id would move both.
+    Plugin { bay: u8, id: u32 },
 }
 
 impl AutoParam {
-    /// Every parameter, in the order a lane offers them.
+    /// Every DESK parameter, in the order a lane offers them.
+    ///
+    /// The plugin ones are not here and cannot be: they depend on what is
+    /// loaded in the bays right now, which is a question for
+    /// `IvoryApp::fx_params` and not a constant.
     pub const ALL: [AutoParam; 4] =
         [AutoParam::Gain, AutoParam::Pan, AutoParam::Send, AutoParam::Mute];
 
     /// The spelling in the document. **Append-only, and never re-spelled:**
     /// these strings are in files people already have.
-    pub fn key(self) -> &'static str {
+    pub fn key(self) -> String {
         match self {
-            Self::Gain => "gain",
-            Self::Pan => "pan",
-            Self::Send => "send",
-            Self::Mute => "mute",
+            Self::Gain => "gain".to_owned(),
+            Self::Pan => "pan".to_owned(),
+            Self::Send => "send".to_owned(),
+            Self::Mute => "mute".to_owned(),
+            // **`fx:<bay>:<id>`**, and the shape is deliberate: it cannot
+            // collide with any of the four names above, it is readable in a
+            // hand-edited document, and it round-trips through
+            // `from_key` without a table. A parameter id is a `u32` and is
+            // written in decimal because that is what a plugin's own
+            // documentation prints.
+            Self::Plugin { bay, id } => format!("fx:{bay}:{id}"),
         }
     }
 
     pub fn from_key(k: &str) -> Option<Self> {
+        if let Some(rest) = k.strip_prefix("fx:") {
+            let (bay, id) = rest.split_once(':')?;
+            return Some(Self::Plugin {
+                bay: bay.parse().ok()?,
+                id: id.parse().ok()?,
+            });
+        }
         Self::ALL.into_iter().find(|p| p.key() == k)
+    }
+
+    /// Which bay this parameter lives in, if it is a plugin's.
+    pub fn bay(self) -> Option<usize> {
+        match self {
+            Self::Plugin { bay, .. } => Some(usize::from(bay)),
+            _ => None,
+        }
     }
 
     /// What a person calls it — the lane's label, and what a screen reader
     /// says.
-    pub fn label(self) -> &'static str {
+    /// What a person calls it — the lane's label, and what a screen reader
+    /// says.
+    ///
+    /// A plugin parameter has no name of its own here: the NAME lives with
+    /// the plugin and reaches the app through `ports::FxParams`, so this
+    /// answers with the address and the caller that has the list puts the
+    /// word in. See `IvoryApp::auto_param_label`.
+    pub fn label(self) -> String {
         match self {
-            Self::Gain => "volume",
-            Self::Pan => "pan",
-            Self::Send => "send",
-            Self::Mute => "mute",
+            Self::Gain => "volume".to_owned(),
+            Self::Pan => "pan".to_owned(),
+            Self::Send => "send".to_owned(),
+            Self::Mute => "mute".to_owned(),
+            Self::Plugin { bay, id } => format!("bay {} parameter {id}", bay + 1),
         }
     }
 }
@@ -525,7 +570,7 @@ mod tests {
         assert_eq!(AutoParam::Send.key(), "send");
         assert_eq!(AutoParam::Mute.key(), "mute");
         for p in AutoParam::ALL {
-            assert_eq!(AutoParam::from_key(p.key()), Some(p), "{p:?} does not round trip");
+            assert_eq!(AutoParam::from_key(&p.key()), Some(p), "{p:?} does not round trip");
         }
         assert_eq!(AutoParam::from_key("nonesuch"), None);
         assert_eq!(Shape::from_key(Shape::Hold.key()), Shape::Hold);

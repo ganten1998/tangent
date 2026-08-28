@@ -241,6 +241,21 @@ pub enum Dialog {
         /// surface and is measured, never inherited from the role.
         warn: Color32,
     },
+    /// **Which automation lanes a track shows** — the A button's menu.
+    ///
+    /// Checkboxes rather than a picker, because a track can show several at
+    /// once: mixing means watching a volume and a send together, and a
+    /// control that could only show one made that a thing you toggled
+    /// between rather than saw.
+    Automation {
+        lane: usize,
+        /// What the track is called, for the title.
+        who: String,
+        groups: Vec<AutoGroup>,
+        /// Which headings are expanded. The desk's is in here when the menu
+        /// opens; the plugins' are not.
+        open_groups: Vec<String>,
+    },
     NoMidiInput,
     MidiError {
         message: String,
@@ -503,6 +518,27 @@ pub fn cells_across(available: f32, count: usize, gap: f32) -> f32 {
 }
 
 /// One button on a [`Dialog::Confirm`].
+/// One row in the automation menu: a parameter, and whether its lane shows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AutoRow {
+    /// `AutoParam::key()` — the address, not the position.
+    pub key: String,
+    pub label: String,
+    pub on: bool,
+}
+
+/// One heading in the automation menu, with its rows under it.
+///
+/// **The desk first, then a group per loaded bay.** The desk's four are what
+/// anybody opening this is most likely to want, so they are expanded when the
+/// menu opens; a plugin with sixty parameters is a list you go looking in, so
+/// its group starts shut.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AutoGroup {
+    pub name: String,
+    pub rows: Vec<AutoRow>,
+}
+
 pub struct ConfirmChoice {
     pub label: String,
     /// What the app does if this one is pressed. An ordinary
@@ -526,6 +562,10 @@ impl ConfirmChoice {
 /// keep one alive across the frames the dialog is open.
 #[derive(Clone)]
 pub enum DialogAction {
+    /// Show or hide one automation lane. The `String` is `AutoParam::key()`.
+    AutomationToggle(usize, String),
+    /// Expand or collapse one heading in the automation menu.
+    AutomationGroup(String),
     /// New session from the `default` template.
     ProjectNew,
     /// Open the project picker.
@@ -5742,6 +5782,160 @@ pub fn show(
                                 {
                                     result.close = true;
                                 }
+                            });
+                        });
+                },
+            )
+        }
+        // **The A button's menu: which lanes this track exposes.**
+        //
+        // A dialog rather than a popup list, and the reason is the FX half: a
+        // compressor publishes forty parameters and a synth two hundred, so
+        // this needs a scroll and headings to scroll between. Ticks rather
+        // than a picker, because a track shows several at once.
+        Dialog::Automation {
+            lane,
+            who,
+            groups,
+            open_groups,
+        } => {
+            let t = theme(face);
+            let lane = *lane;
+            let dim = t.faint;
+            show_dialog_viewport(
+                ctx,
+                placement,
+                &format!("{who} \u{2014} Automation"),
+                Vec2::new(430.0, 460.0),
+                Vec2::new(360.0, 260.0),
+                |ui, result| {
+                    apply_theme(ui.style_mut(), &t);
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
+                    let bold = |size: f32| FontId::new(size, fonts::courier_bold());
+                    let plain = |size: f32| FontId::new(size, fonts::courier());
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::same(12))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new("Which lanes this track shows:")
+                                    .font(bold(12.0))
+                                    .color(t.text),
+                            );
+                            ui.add_space(6.0);
+                            egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .max_height(ui.available_height() - 40.0)
+                                .show(ui, |ui| {
+                                    for g in groups.iter() {
+                                        let shown =
+                                            open_groups.iter().any(|n| *n == g.name);
+                                        let lit = g.rows.iter().filter(|r| r.on).count();
+                                        // The heading: an arrow, the name, and
+                                        // how many of its rows are showing —
+                                        // so a shut group still says whether
+                                        // anything inside it is on.
+                                        let head = format!(
+                                            "{} {}{}",
+                                            if shown { "\u{25be}" } else { "\u{25b8}" },
+                                            g.name,
+                                            if lit > 0 {
+                                                format!("  ({lit})")
+                                            } else {
+                                                String::new()
+                                            },
+                                        );
+                                        if ui
+                                            .add(
+                                                egui::Button::new(
+                                                    RichText::new(head)
+                                                        .font(bold(12.0))
+                                                        .color(t.text),
+                                                )
+                                                .fill(t.field_bg)
+                                                .min_size(Vec2::new(
+                                                    ui.available_width(),
+                                                    0.0,
+                                                )),
+                                            )
+                                            .clicked()
+                                        {
+                                            action = Some(
+                                                DialogAction::AutomationGroup(
+                                                    g.name.clone(),
+                                                ),
+                                            );
+                                        }
+                                        if !shown {
+                                            ui.add_space(3.0);
+                                            continue;
+                                        }
+                                        for row in &g.rows {
+                                            let mark =
+                                                if row.on { "[x]" } else { "[ ]" };
+                                            let colour =
+                                                if row.on { t.text } else { dim };
+                                            if ui
+                                                .add(
+                                                    egui::Button::new(
+                                                        RichText::new(format!(
+                                                            "  {mark} {}",
+                                                            row.label
+                                                        ))
+                                                        .font(plain(12.0))
+                                                        .color(colour),
+                                                    )
+                                                    .fill(t.bg)
+                                                    .min_size(Vec2::new(
+                                                        ui.available_width(),
+                                                        0.0,
+                                                    )),
+                                                )
+                                                .clicked()
+                                            {
+                                                action = Some(
+                                                    DialogAction::AutomationToggle(
+                                                        lane,
+                                                        row.key.clone(),
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                        ui.add_space(6.0);
+                                    }
+                                    if groups.len() == 1 {
+                                        ui.add_space(4.0);
+                                        ui.label(
+                                            RichText::new(
+                                                "No plugin in this track's bays \
+                                                 publishes parameters to automate.",
+                                            )
+                                            .font(plain(11.0))
+                                            .color(dim),
+                                        );
+                                    }
+                                });
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(
+                                        "Alt-click a lane to add a point.",
+                                    )
+                                    .font(plain(11.0))
+                                    .color(dim),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .add(egui::Button::new(
+                                                RichText::new("Done").color(t.text),
+                                            ))
+                                            .clicked()
+                                        {
+                                            result.close = true;
+                                        }
+                                    },
+                                );
                             });
                         });
                 },

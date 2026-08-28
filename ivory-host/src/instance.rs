@@ -1192,7 +1192,23 @@ impl Instance {
         frames: usize,
         out: &mut [Vec<f32>],
     ) -> Result<usize, String> {
-        self.process_through(&[], &[], input, frames, out)
+        self.process_through(&[], &[], &[], input, frames, out)
+            .map(|r| r.frames)
+    }
+
+    /// The effect path with **parameter automation for this block**.
+    ///
+    /// The one an insert rack uses when the lane has a curve on it. Separate
+    /// from `process_effect` so the seven call sites that carry no automation
+    /// cannot accidentally hand it somebody else's.
+    pub fn process_effect_automated(
+        &mut self,
+        input: &[Vec<f32>],
+        params: &[ParamPoint],
+        frames: usize,
+        out: &mut [Vec<f32>],
+    ) -> Result<usize, String> {
+        self.process_through(&[], &[], params, input, frames, out)
             .map(|r| r.frames)
     }
 
@@ -1447,7 +1463,23 @@ impl Instance {
         frames: usize,
         out: &mut [Vec<f32>],
     ) -> Result<Rendered, String> {
-        self.process_through(events, controls, &[], frames, out)
+        self.process_through(events, controls, &[], &[], frames, out)
+    }
+
+    /// The same, plus **parameter automation for this block**.
+    ///
+    /// A separate entry rather than a fifth argument on every caller: only
+    /// the insert racks carry automation, and an instrument slot passing an
+    /// empty slice at four call sites is four chances to pass the wrong one.
+    pub fn process_with_automation(
+        &mut self,
+        events: &[Note],
+        controls: &[Control],
+        params: &[ParamPoint],
+        frames: usize,
+        out: &mut [Vec<f32>],
+    ) -> Result<Rendered, String> {
+        self.process_through(events, controls, params, &[], frames, out)
     }
 
     /// The one `process` call. Notes, controls, audio in, audio out.
@@ -1460,6 +1492,7 @@ impl Instance {
         &mut self,
         events: &[Note],
         controls: &[Control],
+        params: &[ParamPoint],
         input: &[Vec<f32>],
         frames: usize,
         out: &mut [Vec<f32>],
@@ -1494,6 +1527,18 @@ impl Instance {
         // Reused, not rebuilt. The list is a COM object the plugin calls into
         // during `process`, and it used to be `ComWrapper::new`d — an `Arc`
         // allocation and a refcounted free, per block, on the audio thread.
+        // **Automation first, so a curve and a CC that name the same
+        // parameter land in one queue in time order.** `queue_for` returns the
+        // SAME queue for an id it has already seen this block, and a plugin
+        // reads a queue as a list of points — so the two roads to a parameter
+        // meet here rather than fighting over it.
+        for a in params {
+            let offset = a.offset.clamp(0, frames.saturating_sub(1) as i32);
+            if let Some(q) = self.changes.queue_for(a.id) {
+                q.push(offset, a.value.clamp(0.0, 1.0));
+            }
+        }
+
         self.scratch.events.clear();
         for n in events {
             self.scratch.events.push_note(n);
@@ -1713,6 +1758,24 @@ pub struct Note {
     pub velocity: f32,
     pub on: bool,
 }
+
+/// **One automation point for a plugin parameter, inside this block.**
+///
+/// The same shape a [`Control`] has and for the same reason: a block's worth
+/// of changes is a slice the audio thread walks, never a map it looks things
+/// up in.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ParamPoint {
+    /// Frames from the start of the block, clamped into it by
+    /// `process_through` — a `sampleOffset` past `numSamples` is out of
+    /// contract and some plugins index with it.
+    pub offset: i32,
+    /// The plugin's own parameter id, from `StateHandle::parameters`.
+    pub id: u32,
+    /// Normalised, `0.0..=1.0`. VST3 has no other kind.
+    pub value: f64,
+}
+
 
 /// One control change to deliver during a `process` call. The sustain pedal is
 /// this.
@@ -2741,7 +2804,7 @@ fn bytes_to_tuid(cid: [u8; 16]) -> TUID {
     out
 }
 
-fn utf16_to_string(raw: &[u16]) -> String {
+pub(crate) fn utf16_to_string(raw: &[u16]) -> String {
     let units: Vec<u16> = raw.iter().take_while(|c| **c != 0).copied().collect();
     String::from_utf16_lossy(&units).trim().to_string()
 }
