@@ -213,3 +213,41 @@ mod tests {
         }
     }
 }
+
+/// What the HOST can see about a gesture, which the toolkit will not say.
+///
+/// `egui::ViewportInfo` has no live-resize field, and winit 0.30 emits no
+/// event for `windowWillStartLiveResize:`. Without this the app has to INFER
+/// a drag from the size going still, which is what the old frame-counting
+/// settle was — and inference cannot tell a hand on an edge from a tiling
+/// window manager placing the window, because both look like "the size
+/// changed and nobody here asked for it".
+///
+/// **All-false is the correct answer for every host that cannot say** — the
+/// plugin editor, Windows, Linux. Nothing here may be a platform type; the
+/// firewall keeps this crate from seeing winit at all, so the desktop binary
+/// fills this in and hands it across.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Gesture {
+    /// A hand is on a resize edge of the MAIN window right now.
+    pub live_resize: bool,
+    /// A mouse button is down somewhere in the session. Covers a title-bar
+    /// drag, where the geometry changes only after the window has moved.
+    pub mouse_down: bool,
+    /// **`live_resize` is a real answer, not a default.**
+    ///
+    /// This is what makes "a size change nobody asked for" mean "a window
+    /// manager placed us". False on any host that cannot distinguish the two
+    /// — and there, only a REFUSED size request may conclude anything, because
+    /// on a host where `live_resize` is permanently false an ordinary edge
+    /// drag is indistinguishable from a tiler and would otherwise disable the
+    /// aspect snap for the whole session.
+    pub resize_known: bool,
+}
+
+impl Gesture {
+    /// A hand is on the window somehow — dragging an edge or the title bar.
+    pub fn active(self) -> bool {
+        self.live_resize || self.mouse_down
+    }
+}
