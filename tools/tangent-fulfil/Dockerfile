@@ -17,7 +17,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libs
 COPY Cargo.toml ./
 COPY tangent-core ./tangent-core
 COPY tangent-ui ./tangent-ui
-COPY ivory ./ivory
+COPY tangent ./tangent
+COPY tangent-record ./tangent-record
+COPY tangent-host ./tangent-host
 COPY tools/tangent-fulfil ./tools/tangent-fulfil
 WORKDIR /src/tools/tangent-fulfil
 RUN cargo build --release
