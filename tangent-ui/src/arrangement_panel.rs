@@ -122,6 +122,11 @@ pub struct ClipView<'a> {
     /// The clip's notes, source-relative like the document's. Drawn as a
     /// miniature where audio draws its wave; empty draws the dashed staff.
     pub notes: &'a [crate::arrangement::ArrNote],
+    /// **How long the looped section is**, or zero for a clip that does not
+    /// loop. The notes are held once and DRAWN repeatedly, exactly as they
+    /// are scheduled — a clip whose picture stopped after one pass would
+    /// look broken however right it sounded.
+    pub loop_s: f64,
     /// The left trim, for placing the miniature under the drawn span.
     pub offset_s: f64,
     pub selected: bool,
@@ -1587,6 +1592,13 @@ fn draw_note_miniature(
     p: &Ink,
 ) {
     let len = clip.len_s.max(1.0e-9);
+    // How many passes the clip's length holds. One when it does not loop,
+    // which is every clip written before looping existed.
+    let passes: usize = if clip.loop_s > 1.0e-6 {
+        ((clip.len_s / clip.loop_s).ceil() as usize).clamp(1, 512)
+    } else {
+        1
+    };
     let (mut lo, mut hi) = (127u8, 0u8);
     for n in clip.notes {
         lo = lo.min(n.key);
@@ -1620,9 +1632,10 @@ fn draw_note_miniature(
     let bar_h = (inner.height() / span).clamp(1.5, 4.0);
     let (fx0, fx1) = full_x;
     let fw = (fx1 - fx0).max(1.0);
-    for n in clip.notes {
-        let a = (n.at_s - clip.offset_s) / len;
-        let b = (n.at_s + n.dur_s.max(0.02) - clip.offset_s) / len;
+    for (pass, n) in (0..passes).flat_map(|k| clip.notes.iter().map(move |n| (k, n))) {
+        let shift = clip.loop_s * pass as f64;
+        let a = (n.at_s - clip.offset_s + shift) / len;
+        let b = (n.at_s + n.dur_s.max(0.02) - clip.offset_s + shift) / len;
         if b <= 0.0 || a >= 1.0 {
             continue;
         }
@@ -2590,15 +2603,27 @@ fn blend(a: Color32, b: Color32, t: f32) -> Color32 {
 /// quarters, so a quarter of it is a DOTTED EIGHTH — a line on nothing anyone
 /// plays, and a magnet that pulls notes to it. Six beats cannot be divided by
 /// four, and both this panel and the MIDI editor were trying.
-pub fn grid_quarters(exp: i8) -> f64 {
-    4.0 * 2.0f64.powi(i32::from(exp.clamp(-6, 6)))
+pub fn grid_quarters(exp: i8, beats: u8, unit: u8) -> f64 {
+    let beat = 4.0 / f64::from(unit.max(1));
+    let per_bar = f64::from(beats.max(1));
+    let e = i32::from(exp.clamp(-6, 6));
+    if e >= 0 {
+        // Bars, and multiples of them.
+        beat * per_bar * 2.0f64.powi(e)
+    } else {
+        // The BEAT, halved and halved again. A bar is a whole number of
+        // beats, so every one of these divides it exactly — which is the
+        // property the whole rewrite is for.
+        beat / 2.0f64.powi(-e - 1)
+    }
 }
 
 pub fn grid_label(exp: i8) -> String {
-    if exp >= 0 {
-        format!("{}", 1u32 << exp.min(6) as u32)
-    } else {
-        format!("1/{}", 1u32 << (-exp).min(6) as u32)
+    match exp {
+        0 => "1".to_owned(),
+        -1 => "\u{266a}".to_owned(),
+        e if e > 0 => format!("{}", 1u32 << e.min(6) as u32),
+        e => format!("1/{}", 1u32 << (-e - 1).min(6) as u32),
     }
 }
 
@@ -2612,15 +2637,16 @@ fn grid_spoken(exp: i8) -> String {
     // Note values now, because that is what the grid actually steps in. "1/4
     // bar" was both the wrong words and the wrong maths in any meter whose
     // bar is not a power of two of its beat.
+    // In BEATS of the current signature, because that is what the grid steps
+    // in now: a bar is a whole number of beats, so every division of one
+    // divides the bar exactly, in any meter. Naming them in note values was
+    // the previous mistake — a half note does not fit a 6/8 bar, and the
+    // lines came out unevenly spaced, which reads as swing.
     match exp {
-        -2 => "quarter notes".to_owned(),
-        -3 => "eighth notes".to_owned(),
-        -4 => "sixteenth notes".to_owned(),
-        -5 => "thirty-second notes".to_owned(),
-        -1 => "half notes".to_owned(),
-        0 => "whole notes".to_owned(),
-        e if e > 0 => format!("{} whole notes", 1u32 << e.min(6) as u32),
-        e => format!("1/{} notes", 1u32 << ((-e) + 2).min(6) as u32),
+        0 => "1 bar".to_owned(),
+        -1 => "1 beat".to_owned(),
+        e if e > 0 => format!("{} bars", 1u32 << e.min(6) as u32),
+        e => format!("1/{} beat", 1u32 << (-e - 1).min(6) as u32),
     }
 }
 
@@ -2986,7 +3012,8 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 // quarters: divided by four it gives dotted eighths, and
                 // stepped in eighths it gives the six lines the meter
                 // actually has.
-                let step_q = grid_quarters(view.grid_exp);
+                let sig = view.meter.sig_at_bar(n);
+                let step_q = grid_quarters(view.grid_exp, sig.beats, sig.unit);
                 if step_q > 0.0 && bar_px * step_q / qn >= 5.0 {
                     let mut k = 1u32;
                     while (f64::from(k) * step_q) < qn - 1.0e-9 && k < 512 {
@@ -4498,6 +4525,7 @@ LaneView {
                 wave_span_s: 0.0,
                 selected: false,
                 midi: false,
+                loop_s: 0.0,
                 notes: &[],
                 offset_s: 0.0,
                 recording: false,
@@ -4516,6 +4544,7 @@ LaneView {
                 wave_span_s: 0.0,
                 selected: true,
                 midi: false,
+                loop_s: 0.0,
                 notes: &[],
                 offset_s: 0.0,
                 recording: false,
@@ -4918,12 +4947,16 @@ ArrangeView {
         // **Note values, not bar fractions.** "1/4 bar" was both the wrong
         // words and the wrong maths: in 6/8 a quarter of a bar is a dotted
         // eighth. See `grid_quarters`.
-        assert_eq!(g.value.as_deref(), Some("quarter notes"));
+        // **Beats, not note values and not bar fractions.** A bar is a whole
+        // number of beats in every meter, so a division of one always
+        // divides the bar exactly — see `every_grid_step_divides_the_bar`.
+        assert_eq!(g.value.as_deref(), Some("1/2 beat"));
         // The BOX still prints its own terse form; only the spoken one is
         // spelled out.
-        assert_eq!(grid_label(-2), "1/4");
-        // And the step it names is a quarter note, in every meter.
-        assert!((grid_quarters(-2) - 1.0).abs() < 1e-9);
+        assert_eq!(grid_label(-2), "1/2");
+        // Half a beat: half a quarter in 4/4, half an eighth in 6/8.
+        assert!((grid_quarters(-2, 4, 4) - 0.5).abs() < 1e-9);
+        assert!((grid_quarters(-2, 6, 8) - 0.25).abs() < 1e-9);
         let t = g.travel.expect("the grid box cannot be nudged");
         assert!((t.norm - 3.0 / 8.0).abs() < 1e-6, "{}", t.norm);
         // Both ends are reachable, and neither runs off the rails.
@@ -5881,10 +5914,13 @@ ArrangeView {
         assert_eq!(hit_test(r, &v, row.send.center()), Some(Hit::Send(0)));
         assert!(row.knob_readout.is_positive(), "the volume lost its readout");
         assert!(row.send_readout.is_positive(), "the send lost its readout");
+        // The box counts BEATS: 0 is a bar, -1 a beat (the note glyph), and
+        // the rest are fractions of one. See `grid_quarters`.
         assert_eq!(grid_label(0), "1");
         assert_eq!(grid_label(3), "8");
-        assert_eq!(grid_label(-4), "1/16");
-        assert_eq!(grid_label(-5), "1/32");
+        assert_eq!(grid_label(-1), "\u{266a}");
+        assert_eq!(grid_label(-4), "1/8");
+        assert_eq!(grid_label(-5), "1/16");
     }
 
     /// It survives a rect far too small to be useful, and clips off-window

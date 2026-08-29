@@ -266,7 +266,11 @@ pub fn grid_step_s(view: &MidiEditView<'_>) -> f64 {
     // length is still meter-aware and still right; it is simply not what a
     // grid step is measured in.
     let bpm = view.bpm.clamp(20.0, 400.0);
-    let g = crate::arrangement_panel::grid_quarters(view.grid_exp) * (60.0 / bpm);
+    let g = crate::arrangement_panel::grid_quarters(
+        view.grid_exp,
+        view.sig_top.clamp(1, 32) as u8,
+        view.sig_bottom.clamp(1, 32) as u8,
+    ) * (60.0 / bpm);
     if view.triplet {
         g * 2.0 / 3.0
     } else {
@@ -1084,43 +1088,43 @@ pub fn hit_test(rect: Rect, view: &MidiEditView<'_>, pos: Pos2) -> Option<Hit> {
 #[cfg(test)]
 mod tests {
 
-    /// **The grid is a note value in every meter**, which is the whole point
-    /// of the fix: 6/8 gets six eighths in a bar, 4/4 gets eight.
+    /// **Every grid step divides the bar exactly, in every meter.**
     ///
-    /// It used to be the bar divided by a power of two. That IS a quarter
-    /// note in 4/4 — a 4/4 bar is four quarters — so it was right by accident
-    /// for years and wrong the moment a bar stopped being a power of two of
-    /// its own beat. A 6/8 bar is three quarters; divided by four that is a
-    /// dotted eighth, a line on nothing anyone plays and a magnet pulling
-    /// notes onto it.
+    /// This is the property the whole thing exists for, and two earlier
+    /// attempts missed it. Dividing the BAR by a power of two is a quarter
+    /// note in 4/4 by coincidence and a dotted eighth in 6/8. Naming NOTE
+    /// values fixes that and breaks something else: a half note does not fit
+    /// a three-quarter bar, so the lines came out at 2, 1, 2, 1 — evenly
+    /// spaced everywhere except across the bar line, which reads as swing.
+    ///
+    /// A division of the BEAT cannot do either. A bar is a whole number of
+    /// beats by definition, so halving a beat always lands on the grid the
+    /// meter already has.
     #[test]
-    fn the_grid_is_a_note_value_and_not_a_slice_of_the_bar() {
+    fn every_grid_step_divides_the_bar_exactly() {
         use crate::arrangement_panel::grid_quarters;
-        // A quarter note is one quarter, an eighth is half of one, whatever
-        // the meter says.
-        assert!((grid_quarters(-2) - 1.0).abs() < 1e-9, "1/4 is not a quarter");
-        assert!((grid_quarters(-3) - 0.5).abs() < 1e-9, "1/8 is not an eighth");
-        assert!((grid_quarters(-4) - 0.25).abs() < 1e-9, "1/16 is not a sixteenth");
-
-        // The count of lines a bar gets, per meter, at an eighth-note grid.
-        for (top, bottom, want) in [(4u8, 4u8, 8usize), (6, 8, 6), (3, 4, 6), (7, 8, 7)] {
-            let bar_quarters = f64::from(top) * (4.0 / f64::from(bottom));
-            let step = grid_quarters(-3);
-            let lines = (bar_quarters / step).round() as usize;
-            assert_eq!(
-                lines, want,
-                "{top}/{bottom} should get {want} eighth-note lines in a bar, got {lines}"
-            );
-        }
-
-        // And the old maths, for the record: it gave four in every meter,
-        // which is the bug.
-        for (top, bottom) in [(4u8, 4u8), (6, 8), (7, 8)] {
-            let bar_quarters = f64::from(top) * (4.0 / f64::from(bottom));
-            let old_step = bar_quarters * 2.0f64.powi(-2);
+        for (top, bottom) in [(4u8, 4u8), (3, 4), (6, 8), (7, 8), (5, 4), (12, 8), (2, 2)] {
+            let bar = f64::from(top) * (4.0 / f64::from(bottom));
+            for exp in [-1i8, -2, -3, -4] {
+                let step = grid_quarters(exp, top, bottom);
+                assert!(step > 0.0, "{top}/{bottom} exp {exp} gave {step}");
+                let n = bar / step;
+                assert!(
+                    (n - n.round()).abs() < 1e-9,
+                    "{top}/{bottom} at exp {exp}: the bar is {n} steps, not a whole number \
+                     — the lines would bunch against the bar line and read as swing"
+                );
+            }
+            // One beat is one beat: the meter's own count of lines in a bar.
+            let per_bar = bar / grid_quarters(-1, top, bottom);
             assert!(
-                ((bar_quarters / old_step).round() as i32) == 4,
-                "the old grid did not divide {top}/{bottom} into four"
+                (per_bar - f64::from(top)).abs() < 1e-9,
+                "{top}/{bottom} at one-beat spacing drew {per_bar} lines, not {top}"
+            );
+            // And zero is exactly one bar.
+            assert!(
+                (grid_quarters(0, top, bottom) - bar).abs() < 1e-9,
+                "{top}/{bottom} at exp 0 is not one bar"
             );
         }
     }
@@ -1269,7 +1273,11 @@ mod tests {
             top_key: 72.0,
             keys_shown: KEYS_SHOWN,
             snap_on: true,
-            grid_exp: -3,
+            // Half a beat — an eighth note in 4/4, which is 0.25 s at 120 bpm
+            // and what the snap tests below are written around. Under the
+            // old "fraction of a bar" scheme this was -3; the grid steps in
+            // BEATS now, so the same spacing has a different exponent.
+            grid_exp: -2,
             swing: false,
             swing_pct: 0.58,
             triplet: false,
@@ -1350,7 +1358,8 @@ mod tests {
     #[test]
     fn the_grid_snaps_straight_triplet_and_swung() {
         let n: [ArrNote; 0] = [];
-        // 120 bpm, 4/4: bar 2 s; exp -3 → an eighth of a bar = 0.25 s.
+        // 120 bpm, 4/4: a beat is 0.5 s, so half a beat — an eighth note
+        // — is 0.25 s. See `every_grid_step_divides_the_bar_exactly`.
         let mut v = view(&n);
         assert!((grid_step_s(&v) - 0.25).abs() < 1.0e-9);
         assert!((snap_t(&v, 0.13) - 0.25).abs() < 1.0e-9);
@@ -1481,12 +1490,15 @@ mod tests {
     fn the_gridbox_word_carries_the_shape() {
         let n: [ArrNote; 0] = [];
         let mut v = view(&n);
-        assert_eq!(grid_word(&v), "1/8");
+        // "1/2" is half a BEAT — an eighth note in 4/4, a sixteenth in 6/8.
+        // The box counts beats now, because a beat divides every bar exactly
+        // and a note value does not.
+        assert_eq!(grid_word(&v), "1/2");
         v.triplet = true;
-        assert_eq!(grid_word(&v), "1/8T");
+        assert_eq!(grid_word(&v), "1/2T");
         v.triplet = false;
         v.swing = true;
-        assert_eq!(grid_word(&v), "1/8 sw");
+        assert_eq!(grid_word(&v), "1/2 sw");
     }
 }
 

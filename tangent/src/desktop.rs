@@ -1272,6 +1272,57 @@ struct WindowFacts {
 }
 
 #[cfg(feature = "recorder")]
+/// **A MIDI clip's notes, with its loop spelled out**, in frames.
+///
+/// One function because there are two customers — playback in `reload_clips`
+/// and the offline bounce — and a schedule built twice is a schedule that
+/// eventually disagrees with itself. It already had: the loop was expanded
+/// for playback and not for the bounce, so an exported song would have been
+/// missing every repeat after the first.
+///
+/// The notes are held ONCE in the document and expanded here rather than
+/// copied into it, because copies would drift from the pass they came from
+/// the moment one was edited, and would be indistinguishable from notes
+/// somebody meant to write.
+fn midi_clip_notes(
+    clip: &tangent_ui::arrangement::ArrClip,
+    rate: f64,
+) -> Vec<crate::instrument::ClipNote> {
+    let frames = |s: f64| frames_at(rate, s);
+    // Bounded: a clip dragged to an hour over a loop of a sixteenth is not
+    // something to hand the audio thread.
+    let passes: usize = if clip.loop_s > 1.0e-6 {
+        ((clip.len_s / clip.loop_s).ceil() as usize).clamp(1, 4_096)
+    } else {
+        1
+    };
+    let mut out: Vec<crate::instrument::ClipNote> = (0..passes)
+        .flat_map(|pass| {
+            let shift = clip.loop_s * pass as f64;
+            clip.notes.iter().filter_map(move |n| {
+                let at = n.at_s - clip.offset_s + shift;
+                if at < -1.0e-9 {
+                    return None;
+                }
+                // A repeat beginning past the clip's own end is not played:
+                // the last pass is usually a partial one.
+                if clip.loop_s > 1.0e-6 && at >= clip.len_s - 1.0e-9 {
+                    return None;
+                }
+                Some(crate::instrument::ClipNote {
+                    at: frames(at),
+                    dur: frames(n.dur_s).max(1),
+                    key: n.key.min(127),
+                    vel: n.vel.min(127),
+                })
+            })
+        })
+        .collect();
+    // The walk in `mix_channels` needs them sorted.
+    out.sort_by_key(|n| n.at);
+    out
+}
+
 impl DesktopApp {
     /// Everything the band shows, refreshed from what is actually true.
     ///
@@ -4155,23 +4206,7 @@ impl DesktopApp {
             let frames = |s: f64| frames_at(f64::from(rate), s);
             for clip in &doc.clips {
                 if clip.kind == tangent_ui::arrangement::ClipKind::Midi {
-                    let mut notes: Vec<crate::instrument::ClipNote> = clip
-                        .notes
-                        .iter()
-                        .filter_map(|n| {
-                            let at = n.at_s - clip.offset_s;
-                            if at < -1.0e-9 {
-                                return None;
-                            }
-                            Some(crate::instrument::ClipNote {
-                                at: frames(at),
-                                dur: frames(n.dur_s).max(1),
-                                key: n.key.min(127),
-                                vel: n.vel.min(127),
-                            })
-                        })
-                        .collect();
-                    notes.sort_by_key(|n| n.at);
+                    let notes = midi_clip_notes(clip, f64::from(rate));
                     if !notes.is_empty() {
                         midi_placed.push(crate::instrument::PlacedMidi {
                             strip: clip.lane.min(tangent_ui::recorder::CHANNELS - 1),
@@ -4727,43 +4762,9 @@ impl DesktopApp {
             if clip.kind == tangent_ui::arrangement::ClipKind::Midi {
                 span = span.max(clip.start_s + clip.len_s);
                 let frames = |s: f64| frames_at(f64::from(rate), s);
-                // **A looping clip repeats its notes across its length.**
-                //
-                // The notes are held ONCE in the document and expanded here,
-                // because a loop that copied them would drift out of step
-                // with the pass it came from the moment one was edited. Zero
-                // means no loop, which is what every clip written before this
-                // existed says, so those play exactly once as they always did.
-                let passes: usize = if clip.loop_s > 1.0e-6 {
-                    // Bounded: a clip dragged to an hour over a loop of a
-                    // sixteenth is not something to hand the audio thread.
-                    ((clip.len_s / clip.loop_s).ceil() as usize).clamp(1, 4_096)
-                } else {
-                    1
-                };
-                let mut notes: Vec<crate::instrument::ClipNote> = (0..passes)
-                    .flat_map(|pass| {
-                        let shift = clip.loop_s * pass as f64;
-                        clip.notes.iter().filter_map(move |n| {
-                            let at = n.at_s - clip.offset_s + shift;
-                            if at < -1.0e-9 {
-                                return None;
-                            }
-                            // A repeat that begins past the clip's own end is
-                            // not played: the last pass is usually partial.
-                            if at >= clip.len_s - 1.0e-9 && clip.loop_s > 1.0e-6 {
-                                return None;
-                            }
-                            Some(crate::instrument::ClipNote {
-                                at: frames(at),
-                                dur: frames(n.dur_s).max(1),
-                                key: n.key.min(127),
-                                vel: n.vel.min(127),
-                            })
-                        })
-                    })
-                    .collect();
-                notes.sort_by_key(|n| n.at);
+                // The clip's notes with its loop spelled out — one function,
+                // shared with the offline bounce. See `midi_clip_notes`.
+                let notes = midi_clip_notes(clip, f64::from(rate));
                 if !notes.is_empty() {
                     midi_placed.push(crate::instrument::PlacedMidi {
                         strip: clip.lane.min(tangent_ui::recorder::CHANNELS - 1),
