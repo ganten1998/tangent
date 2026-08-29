@@ -38,6 +38,26 @@ pub enum Dialog {
     /// The TRACK menu behind a right-click on a strip or a lane header:
     /// remove it, paint it, or choose the auto-palette everybody unpainted
     /// wears.
+    /// **The click's own panel.** Tempo, signature, how often it sounds, and
+    /// what it sounds like.
+    ///
+    /// One place rather than four scattered ones: these are the four things
+    /// anybody adjusts about a metronome, and three of them lived in
+    /// different corners of the app while the fourth did not exist.
+    Metronome {
+        /// The song's tempo, in bpm.
+        bpm: f64,
+        /// Beats in a bar, and what gets the beat.
+        beats: u8,
+        unit: u8,
+        /// Clicks per beat; 0 is once a bar.
+        div: i64,
+        /// The chosen click file, or empty for the one that ships.
+        sample: String,
+        /// Bumped on every open so egui cannot carry scroll state over from
+        /// the last time — the same guard the Track panel documents.
+        serial: u64,
+    },
     Track {
         lane: usize,
         removable: bool,
@@ -581,6 +601,16 @@ pub enum DialogAction {
     /// Save the session as a template under `Projects/Templates`.
     ProjectTemplate,
     /// Take the channel off the desk.
+    /// Set the song's tempo, in bpm.
+    SetTempo(f64),
+    /// Set the time signature: beats, then the note that gets the beat.
+    SetTimeSignature(u8, u8),
+    /// How often the click sounds, per beat. Zero is once a bar.
+    SetMetronomeDiv(i64),
+    /// Choose a sound file for the click.
+    MetronomeSamplePick,
+    /// Put the bundled click back.
+    MetronomeSampleReset,
     TrackRemove(usize),
     /// Paint one channel by hand — index into `STRIP_COLORS`.
     TrackColor(usize, i64),
@@ -4933,6 +4963,131 @@ pub fn show(
                                 }
                             });
                         });
+                },
+            )
+        }
+        Dialog::Metronome { bpm, beats, unit, div, sample, serial } => {
+            let t = theme(face);
+            let _ = *serial;
+            // Copied out so the closure below borrows nothing from `dialog`.
+            struct Met {
+                bpm: f64,
+                beats: u8,
+                unit: u8,
+                div: i64,
+                sample: String,
+            }
+            let met = Met {
+                bpm: *bpm,
+                beats: *beats,
+                unit: *unit,
+                div: *div,
+                sample: sample.clone(),
+            };
+            show_dialog_viewport(
+                ctx,
+                placement,
+                "Metronome",
+                Vec2::new(320.0, 260.0),
+                Vec2::new(280.0, 200.0),
+                |ui, result| {
+                    // **Tempo.** The song's, not the click's — there is only
+                    // one, and a metronome panel that carried a second would
+                    // be two numbers to keep in step.
+                    ui.label(RichText::new("TEMPO").color(t.text));
+                    let mut bpm = met.bpm;
+                    if ui
+                        .add(egui::Slider::new(&mut bpm, 20.0..=300.0).suffix(" bpm"))
+                        .changed()
+                    {
+                        action = Some(DialogAction::SetTempo(bpm));
+                    }
+                    ui.add_space(8.0);
+
+                    // **Signature.** Two steppers rather than a text field:
+                    // the bottom number is a power of two and a field would
+                    // invite 3.
+                    ui.label(RichText::new("TIME SIGNATURE").color(t.text));
+                    ui.horizontal(|ui| {
+                        let mut beats = i32::from(met.beats);
+                        if ui.add(egui::DragValue::new(&mut beats).range(1..=32)).changed() {
+                            action = Some(DialogAction::SetTimeSignature(
+                                beats.clamp(1, 32) as u8,
+                                met.unit,
+                            ));
+                        }
+                        ui.label(RichText::new("/").color(t.text));
+                        for unit in [2u8, 4, 8, 16] {
+                            let on = met.unit == unit;
+                            if ui
+                                .add(Button::new(
+                                    RichText::new(format!("{unit}"))
+                                        .color(if on { t.text } else { t.button_border }),
+                                ))
+                                .clicked()
+                            {
+                                action =
+                                    Some(DialogAction::SetTimeSignature(met.beats, unit));
+                            }
+                        }
+                    });
+                    ui.add_space(8.0);
+
+                    // **How often it sounds.** In beats of THAT signature,
+                    // because the beat is whatever the signature says: in
+                    // 6/8 it is an eighth. Zero is once a bar, which is the
+                    // compound-meter answer — 6/8 is felt in two, and six
+                    // clicks a bar is unusable in the meter that wants one
+                    // most.
+                    ui.label(RichText::new("CLICK").color(t.text));
+                    ui.horizontal(|ui| {
+                        for (div, word) in
+                            [(0i64, "bar"), (1, "beat"), (2, "1/2"), (3, "1/3"), (4, "1/4")]
+                        {
+                            let on = met.div == div;
+                            if ui
+                                .add(Button::new(
+                                    RichText::new(word)
+                                        .color(if on { t.text } else { t.button_border }),
+                                ))
+                                .clicked()
+                            {
+                                action = Some(DialogAction::SetMetronomeDiv(div));
+                            }
+                        }
+                    });
+                    ui.add_space(8.0);
+
+                    // **The sound.** A file, and always a way back to the one
+                    // that ships — a click nobody can restore is a click
+                    // somebody is stuck with.
+                    ui.label(RichText::new("SOUND").color(t.text));
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(Button::new(RichText::new("Load...").color(t.text)))
+                            .clicked()
+                        {
+                            action = Some(DialogAction::MetronomeSamplePick);
+                        }
+                        if ui
+                            .add(Button::new(RichText::new("Default").color(t.text)))
+                            .clicked()
+                        {
+                            action = Some(DialogAction::MetronomeSampleReset);
+                        }
+                    });
+                    ui.label(
+                        RichText::new(if met.sample.is_empty() {
+                            "built-in".to_owned()
+                        } else {
+                            met.sample.clone()
+                        })
+                        .color(t.button_border),
+                    );
+                    ui.add_space(10.0);
+                    if ui.add(Button::new(RichText::new("Done").color(t.text))).clicked() {
+                        result.close = true;
+                    }
                 },
             )
         }

@@ -667,6 +667,11 @@ pub struct IvoryApp {
     /// The kit's contents changed: the host should re-decode and re-push
     /// the engine's samples. Taken once, like `clips_dirty`.
     drumpad_dirty: bool,
+    /// The click's sound changed: the host should decode
+    /// `settings.click_sample` (or fall back to the bundled asset when it is
+    /// empty or unreadable) and hand it to the engine. Taken once, like
+    /// `clips_dirty`.
+    click_sample_dirty: bool,
     /// The zoom window (start_s, len_s). `None` fits the whole song until
     /// the first wheel, ruler drag or viewport steer.
     arr_window: Option<(f64, f64)>,
@@ -1722,6 +1727,8 @@ impl IvoryApp {
 
         let mut detector = ChordDetector::new();
         detector.set_note_preference(settings.prefer_flats);
+        // Read before the settings move into the struct below.
+        let click_chosen = !settings.click_sample.is_empty();
         // Teach layer: load user overrides (~/.config/tangent/overrides.json).
         // A missing or corrupt file yields an empty store; the detector then
         // behaves exactly like the stock engine until something is taught.
@@ -1878,6 +1885,9 @@ impl IvoryApp {
             drumpad_peaks: [0.0; recorder::DRUM_PADS],
             drumpad_midi: true,
             drumpad_dirty: false,
+            // **Marked on the way up**, so a chosen click survives a restart:
+            // the setting holds a path and nothing has decoded it yet.
+            click_sample_dirty: click_chosen,
             arr_window: None,
             arr_selected: None,
             pad_menu: None,
@@ -6125,6 +6135,25 @@ impl IvoryApp {
         std::mem::take(&mut self.clips_dirty)
     }
 
+    /// Whether the click's sound changed since the host last asked.
+    pub fn take_click_sample_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.click_sample_dirty)
+    }
+
+    /// The file the click plays, or empty for the bundled one.
+    pub fn click_sample(&self) -> &str {
+        &self.settings.click_sample
+    }
+
+    /// **The host chose a click sound.** Recorded and marked for the decode;
+    /// the panel is re-read so the row under the buttons names the new file.
+    pub fn set_click_sample(&mut self, path: &str) {
+        self.settings.click_sample = path.to_owned();
+        self.click_sample_dirty = true;
+        self.save_settings();
+        self.refresh_metronome_dialog();
+    }
+
     /// Copy `file` into the project's `media/` and stand it on the timeline.
     ///
     /// The one road audio takes into a project — the import button today,
@@ -9643,6 +9672,27 @@ impl IvoryApp {
 
     /// The CREATE snap: the grid line at or before the click — a note
     /// lands in the cell under the hand, never the next one.
+    /// The first grid line AT or AFTER `t`.
+    ///
+    /// **What a paste anchors to.** Flooring put the notes on the line
+    /// BEFORE the playhead whenever the playhead was not exactly on one —
+    /// which is almost always, since it stops where the transport stopped.
+    /// Pasting behind the cursor is never what anybody meant.
+    fn me_snap_ceil(&self, t: f64) -> f64 {
+        let floor = self.me_snap_floor(t);
+        if floor >= t - 1.0e-9 {
+            return floor;
+        }
+        let Some(st) = self.midi_edit.as_ref() else {
+            return t.max(0.0);
+        };
+        let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == st.id) else {
+            return t.max(0.0);
+        };
+        let view = self.midi_edit_view(st, clip);
+        crate::midi_editor::snap_next_t(&view, floor).max(t)
+    }
+
     fn me_snap_floor(&self, t: f64) -> f64 {
         let Some(st) = self.midi_edit.as_ref() else {
             return t.max(0.0);
@@ -10210,7 +10260,9 @@ impl IvoryApp {
             let inside = play >= clip.start_s && play < clip.start_s + clip.len_s;
             let raw = if inside { play } else { clip.start_s };
             (
-                self.me_snap_floor(raw),
+                // AT or after the playhead — see `me_snap_ceil`. Never
+                // behind it, which is where flooring put every paste.
+                self.me_snap_ceil(raw),
                 clip.start_s,
                 clip.start_s + clip.len_s,
                 clip.offset_s,
@@ -13607,7 +13659,7 @@ impl IvoryApp {
                         // object: whether there is a click, and what it is
                         // counting.
                         if ctx.input(|i| i.pointer.secondary_down()) {
-                            self.cycle_metronome_div();
+                            self.open_metronome_dialog();
                         } else {
                             self.settings.metronome_on = !self.settings.metronome_on;
                             self.save_settings();
@@ -16646,6 +16698,50 @@ impl IvoryApp {
         self.settings.metronome_div.clamp(0, 8) as u32
     }
 
+    /// **Open the metronome's panel.** Tempo, signature, how often it clicks
+    /// and what it clicks WITH — the four questions about the click, in the
+    /// one place a right-click on it reaches.
+    pub fn open_metronome_dialog(&mut self) {
+        let sig = self.time_signature();
+        self.dialog = Some(dialogs::Dialog::Metronome {
+            bpm: self.tempo_bpm(),
+            beats: sig.beats,
+            unit: sig.unit,
+            div: self.settings.metronome_div,
+            sample: self.settings.click_sample.clone(),
+            serial: 0,
+        });
+    }
+
+    /// Re-read the panel from the settings it just wrote.
+    ///
+    /// The dialog holds a COPY — it is drawn from a snapshot so its closure
+    /// borrows nothing — and every setter here goes through the same code a
+    /// keystroke or a toolbar click does, which may clamp or retime. Without
+    /// this the panel would show what was asked for rather than what happened.
+    fn refresh_metronome_dialog(&mut self) {
+        let sig = self.time_signature();
+        let bpm = self.tempo_bpm();
+        let div = self.settings.metronome_div;
+        let sample = self.settings.click_sample.clone();
+        if let Some(dialogs::Dialog::Metronome {
+            bpm: b,
+            beats,
+            unit,
+            div: d,
+            sample: smp,
+            serial,
+        }) = self.dialog.as_mut()
+        {
+            *b = bpm;
+            *beats = sig.beats;
+            *unit = sig.unit;
+            *d = div;
+            *smp = sample;
+            *serial = serial.wrapping_add(1);
+        }
+    }
+
     /// Step the click's division. Wraps, so one key walks the whole set.
     pub fn cycle_metronome_div(&mut self) {
         // 0 (once a bar), 1 (a beat), 2, 3, 4 — the divisions anybody counts
@@ -18639,6 +18735,45 @@ impl IvoryApp {
             // **The confirmed halves.** None of these four is reachable from a
             // menu row: each arrives from a button on a [`Dialog::Confirm`],
             // which is what makes the confirmation impossible to route round.
+            // **The metronome panel's four.** Each routes to the setter that
+            // already existed, so the panel is a second door to them and not
+            // a second copy — a tempo written here that skipped
+            // `retime_arrangement` would move the click and leave the clips.
+            DialogAction::SetTempo(bpm) => {
+                self.apply_recorder_hit(recorder_panel::Hit::SetTempo(bpm));
+                self.refresh_metronome_dialog();
+            }
+            DialogAction::SetTimeSignature(beats, unit) => {
+                self.set_time_signature(recorder::TimeSignature { beats, unit });
+                self.refresh_metronome_dialog();
+            }
+            DialogAction::SetMetronomeDiv(div) => {
+                self.settings.metronome_div = div.clamp(0, 8);
+                self.save_settings();
+                self.refresh_metronome_dialog();
+            }
+            DialogAction::MetronomeSamplePick => {
+                if self.caps.native_file_dialogs {
+                    self.native_panel_up = true;
+                    self.file_request = Some(crate::ports::FileRequest {
+                        start_at: None,
+                        title: "Choose a click sound".to_owned(),
+                        extensions: vec![
+                            "wav".into(), "aif".into(), "aiff".into(), "flac".into(),
+                            "mp3".into(), "m4a".into(), "ogg".into(), "opus".into(),
+                        ],
+                        extension_label: "Audio".to_owned(),
+                        purpose: crate::ports::FilePurpose::ClickSample,
+                        multi: false,
+                    });
+                }
+            }
+            DialogAction::MetronomeSampleReset => {
+                self.settings.click_sample = String::new();
+                self.click_sample_dirty = true;
+                self.save_settings();
+                self.refresh_metronome_dialog();
+            }
             DialogAction::ResetTo(scope) => {
                 self.dialog = None;
                 self.pending_reset = Some(scope);
