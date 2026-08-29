@@ -3108,6 +3108,9 @@ impl IvoryApp {
         use crate::mixer_panel::Hit as H;
         let view = self.mixer_view();
         match hit {
+            H::Phase(i) => {
+                f32::from(u8::from(self.settings.strip_phase & (1 << i.desk_index()) != 0))
+            }
             H::Fader(i) => view
                 .strips
                 .get(i.0)
@@ -3385,6 +3388,10 @@ impl IvoryApp {
                 }
             }
             H::Mute(i) => self.settings.strip_muted ^= 1 << i.desk_index(),
+            // **Polarity.** A bit beside the mute's, because it is the same
+            // kind of switch: one per strip, about the signal, either on or
+            // off. The engine reads the mask and turns it into a sign.
+            H::Phase(i) => self.settings.strip_phase ^= 1 << i.desk_index(),
             H::Solo(i) => self.settings.strip_soloed ^= 1 << i.desk_index(),
             // **The icon, and the plus that stands where it will be.**
             //
@@ -4080,6 +4087,7 @@ impl IvoryApp {
                 },
                 peak: peaks[i],
                 muted: desk.muted[i],
+                phase: self.settings.strip_phase & (1 << i) != 0,
                 soloed: desk.soloed[i],
                 // What the × means, where it means anything: a used general
                 // channel goes back to being an empty slot. The click and
@@ -4102,6 +4110,7 @@ impl IvoryApp {
                 Some(s) => strip(*s),
                 None => crate::mixer_panel::StripView {
                     mono: self.settings.master_mono,
+                    phase: self.settings.strip_phase & (1 << i) != 0,
                     // The master is not a channel and has no MIDI to send.
                     to_theory: false,
                     route_count: 0,
@@ -13252,6 +13261,10 @@ impl IvoryApp {
                     // the A button does, with this row's box already ticked —
                     // which is how you take a row away again.
                     Some(A::AutoParamPick(n, _)) => self.arr_open_automation_menu(n),
+                    Some(A::Phase(n)) => {
+                        self.touch_track(n);
+                        self.apply_mixer_hit(M::Phase(Column(n)), 0.0);
+                    }
                     Some(A::AutoClose(n, slot)) => self.arr_close_auto_row(n, slot),
                     Some(A::AutoArm(n, slot)) => self.arr_toggle_auto_arm(n, slot),
                     Some(A::AutoBypass(n, slot)) => self.arr_toggle_auto_bypass(n, slot),
@@ -14412,6 +14425,7 @@ impl IvoryApp {
                     used: self.channel_used(n),
                     armed: self.armed & (1 << n) != 0,
                     muted: desk.muted[n],
+                    phase: self.settings.strip_phase & (1 << n) != 0,
                     soloed: desk.soloed[n],
                     to_theory: self.to_theory(n),
                     is_folder: self.is_folder(n),
@@ -15896,6 +15910,7 @@ impl IvoryApp {
                 self.open_insert_face(n, bay);
             }
             A::AutoParamPick(n, _) => self.arr_open_automation_menu(n),
+            A::Phase(n) => self.apply_mixer_hit(M::Phase(Column(n)), 0.0),
             A::AutoClose(n, slot) => self.arr_close_auto_row(n, slot),
             A::AutoArm(n, slot) => self.arr_toggle_auto_arm(n, slot),
             A::AutoBypass(n, slot) => self.arr_toggle_auto_bypass(n, slot),
@@ -16437,6 +16452,11 @@ impl IvoryApp {
 
     pub fn metronome_on(&self) -> bool {
         self.settings.metronome_on
+    }
+
+    /// **Which strips are polarity-inverted**, one bit per strip.
+    pub fn strip_phase(&self) -> u32 {
+        self.settings.strip_phase
     }
 
     /// How often the click sounds — see `Settings::metronome_div`.

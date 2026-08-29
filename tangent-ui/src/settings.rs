@@ -1091,6 +1091,12 @@ pub struct Settings {
     /// keys, because "is anything soloed" is a question about all of them at
     /// once and five keys is five chances to answer it from a stale half.
     pub strip_muted: u32,
+    /// **Which strips have their polarity inverted**, one bit per strip.
+    ///
+    /// A mask beside `strip_muted` and `strip_soloed`, because it is the same
+    /// kind of thing: a per-strip switch about the signal, held as bits so a
+    /// whole desk is one number.
+    pub strip_phase: u32,
     pub strip_soloed: u32,
     /// Whether the after-a-take report appears. A take with a PROBLEM ignores
     /// this: see [`crate::dialogs::Dialog::TakeSummary`].
@@ -1578,6 +1584,7 @@ impl Default for Settings {
             },
             input_alias: String::new(),
             strip_muted: 0,
+            strip_phase: 0,
             strip_soloed: 0,
             show_take_summary: true,
             track_path: String::new(),
@@ -2402,6 +2409,9 @@ impl Settings {
         }
         if let Some(Value::String(v)) = map.shift_remove("input_alias") {
             s.input_alias = v;
+        }
+        if let Some(n) = map.shift_remove("strip_phase").and_then(|v| v.as_u64()) {
+            s.strip_phase = n as u32;
         }
         if let Some(n) = map.shift_remove("strip_muted").and_then(|v| v.as_u64()) {
             s.strip_muted = n as u32;
@@ -3809,6 +3819,7 @@ impl Settings {
             Value::String(self.velocity_quiet_color.to_hex()),
         );
         map.insert("metronome_div".into(), Value::from(self.metronome_div));
+        map.insert("strip_phase".into(), Value::from(self.strip_phase));
         for (k, v) in &self.extra {
             map.insert(k.clone(), v.clone());
         }
