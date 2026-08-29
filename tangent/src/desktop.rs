@@ -1441,6 +1441,13 @@ fn audio_clip_passes(
     out
 }
 
+// **This attribute belongs to the IMPL, not to what is above it.** It was
+// stolen once: a helper inserted between it and the block below made every
+// recorder method unconditional, and the Minimal build — `tangent` with no
+// features, the fallback for a platform that cannot carry the rest — stopped
+// compiling with five hundred errors. `scripts/check-firewall.sh` is what
+// says so, and nothing else in the repo ever builds this configuration.
+#[cfg(feature = "recorder")]
 impl DesktopApp {
     /// Everything the band shows, refreshed from what is actually true.
     ///

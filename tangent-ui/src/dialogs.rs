@@ -4997,7 +4997,13 @@ pub fn show(
                     ui.label(RichText::new("TEMPO").color(t.text));
                     let mut bpm = met.bpm;
                     if ui
-                        .add(egui::Slider::new(&mut bpm, 20.0..=300.0).suffix(" bpm"))
+                        // **Whole beats**, like the desk's own dial: a decimal
+                        // tempo is typed, never dragged. See `knob_to_tempo`.
+                        .add(
+                            egui::Slider::new(&mut bpm, 20.0..=300.0)
+                                .step_by(1.0)
+                                .suffix(" bpm"),
+                        )
                         .changed()
                     {
                         action = Some(DialogAction::SetTempo(bpm));

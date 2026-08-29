@@ -4171,6 +4171,11 @@ impl Settings {
         self.dx7_patch = fresh.dx7_patch;
         self.metronome_on = fresh.metronome_on;
         self.metronome_in_take = fresh.metronome_in_take;
+        // The click's SOUND goes back with the click's other switches. A
+        // chosen file that no reset could clear would be a sound somebody is
+        // stuck with — see `the_scopes_together_are_everything`, which is the
+        // test that says so by name.
+        self.click_sample = fresh.click_sample.clone();
         self.plugin_paths = fresh.plugin_paths.clone();
     }
 
