@@ -4082,6 +4082,9 @@ impl DesktopApp {
         {
             let sig = self.app.time_signature();
             e.set_meter(u32::from(sig.beats), u32::from(sig.unit));
+            // Beside the meter, because it is read with it: how many clicks
+            // a beat of that signature carries.
+            e.set_metronome_div(self.app.metronome_div());
         }
         // **The maps, in the export mirror too.** `start_offline_bounce`
         // furnishes a second engine BY HAND and duplicates four things the
@@ -5637,6 +5640,9 @@ impl DesktopApp {
         if !self.recorder.session.is_recording() {
             let sig = self.app.time_signature();
             e.set_meter(u32::from(sig.beats), u32::from(sig.unit));
+            // Beside the meter, because it is read with it: how many clicks
+            // a beat of that signature carries.
+            e.set_metronome_div(self.app.metronome_div());
         }
     }
 

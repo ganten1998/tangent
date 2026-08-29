@@ -1230,6 +1230,17 @@ pub struct Settings {
     pub show_transpose: bool,
     /// The click is running.
     pub metronome_on: bool,
+    /// **How often the click sounds, as a division of the bar's own beat.**
+    ///
+    /// 1 is one click per beat, 2 is twice a beat, and 0 means one per BAR.
+    /// A division rather than a note value, because the beat is whatever the
+    /// signature says it is — in 6/8 that is an eighth, and a click named in
+    /// quarters would be counting something the music is not in.
+    ///
+    /// Compound meters are the reason this exists: 6/8 is felt in two dotted
+    /// quarters, not six eighths, and a click that insists on all six is
+    /// unusable for the meter it is most needed in.
+    pub metronome_div: i64,
     /// The click is mixed into the RECORDING as well as the monitors.
     ///
     /// **False by default and that is the important one.** A click bleeding
@@ -1612,6 +1623,7 @@ impl Default for Settings {
             transpose: 0,
             show_transpose: true,
             metronome_on: false,
+            metronome_div: 1,
             metronome_in_take: false,
             record_hide_elapsed: false,
             record_export: crate::recorder::ExportSpec::default(),
@@ -2750,6 +2762,12 @@ impl Settings {
         }
         take_bool(&mut map, "show_transpose", &mut s.show_transpose);
         take_bool(&mut map, "metronome_on", &mut s.metronome_on);
+        if let Some(v) = map.shift_remove("metronome_div") {
+            if let Some(n) = v.as_i64() {
+                // 0 is "once a bar"; anything past 8 is a buzz, not a click.
+                s.metronome_div = n.clamp(0, 8);
+            }
+        }
         take_bool(&mut map, "metronome_in_take", &mut s.metronome_in_take);
         take_bool(&mut map, "record_hide_elapsed", &mut s.record_hide_elapsed);
         if let Some(v) = map.shift_remove("record_export") {
@@ -3790,6 +3808,7 @@ impl Settings {
             "velocity_quiet_color".into(),
             Value::String(self.velocity_quiet_color.to_hex()),
         );
+        map.insert("metronome_div".into(), Value::from(self.metronome_div));
         for (k, v) in &self.extra {
             map.insert(k.clone(), v.clone());
         }
