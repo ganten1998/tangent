@@ -1337,9 +1337,20 @@ enum MeDrag {
         dt: f64,
         orig: Vec<(usize, f64, u8)>,
     },
-    Resize { i: usize },
-    /// The head: start and duration move together, the end stands still.
-    ResizeLeft { i: usize },
+    /// The tail — and the whole SELECTION's tails with it. `orig` is every
+    /// selected note's (index, duration) at the press; the grabbed note's
+    /// change is applied to the rest as one delta, so a chord keeps the
+    /// lengths that make it a chord rather than being squared off.
+    Resize {
+        i: usize,
+        orig: Vec<(usize, f64)>,
+    },
+    /// The head: start and duration move together, the end stands still —
+    /// and the selection's heads move with it. `orig` is (index, at, dur).
+    ResizeLeft {
+        i: usize,
+        orig: Vec<(usize, f64, f64)>,
+    },
     /// The GRIDBOX being dragged: up is finer, one step a notch.
     GridStep { from_y: f32, start: i64 },
     /// A note being drawn: created at press, its tail follows the hand.
@@ -9843,10 +9854,92 @@ impl IvoryApp {
         }
     }
 
+    /// **Arm a RESIZE, carrying the selection.**
+    ///
+    /// Same shape as [`Self::me_begin_stretch`], and the two are deliberately
+    /// different gestures: a stretch SCALES the selection about its far end
+    /// (shift-drag, "seven notes in the space of four"); a plain edge drag
+    /// moves every selected note's edge by the same DELTA. The delta is what
+    /// keeps a chord a chord — scaling would square off the lengths that
+    /// distinguish its voices.
+    fn me_begin_resize(&mut self, i: usize, from_left: bool) {
+        let Some(st) = self.midi_edit.as_ref() else {
+            return;
+        };
+        let id = st.id;
+        // The selection when the grabbed note is in it, the note alone when
+        // not — `me_select` has already run, so a press outside the selection
+        // has already replaced it.
+        let set: Vec<usize> = if st.selected.contains(&i) {
+            st.selected.clone()
+        } else {
+            vec![i]
+        };
+        let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == id) else {
+            return;
+        };
+        let drag = if from_left {
+            let orig: Vec<(usize, f64, f64)> = set
+                .iter()
+                .filter_map(|&j| clip.notes.get(j).map(|n| (j, n.at_s, n.dur_s)))
+                .collect();
+            if orig.is_empty() {
+                return;
+            }
+            MeDrag::ResizeLeft { i, orig }
+        } else {
+            let orig: Vec<(usize, f64)> = set
+                .iter()
+                .filter_map(|&j| clip.notes.get(j).map(|n| (j, n.dur_s)))
+                .collect();
+            if orig.is_empty() {
+                return;
+            }
+            MeDrag::Resize { i, orig }
+        };
+        if let Some(st) = self.midi_edit.as_mut() {
+            st.drag = Some(drag);
+        }
+    }
+
     /// RESIZE: the tail follows the hand, snapped, never shorter than a
-    /// twentieth and never past the clip's end.
-    fn me_resize_note(&mut self, i: usize, t: f64) {
+    /// twentieth and never past the clip's end — and the rest of the
+    /// selection's tails follow by the same amount.
+    fn me_resize_note(&mut self, i: usize, orig: &[(usize, f64)], t: f64) {
         self.me_resize_note_min(i, t, 0.05);
+        // The grabbed note has landed; everything else moves by what it
+        // moved. Read AFTER, not computed from the pointer, so the snap and
+        // both clamps are honoured once and the selection follows the note
+        // rather than the hand.
+        let Some(st) = self.midi_edit.as_ref() else {
+            return;
+        };
+        let id = st.id;
+        let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
+            return;
+        };
+        let Some(&(_, was)) = orig.iter().find(|(j, _)| *j == i) else {
+            return;
+        };
+        let Some(now) = clip.notes.get(i).map(|n| n.dur_s) else {
+            return;
+        };
+        let delta = now - was;
+        if delta.abs() < 1.0e-9 {
+            return;
+        }
+        let span = clip.start_s + clip.len_s;
+        let (c0, offset) = (clip.start_s, clip.offset_s);
+        for &(j, d0) in orig {
+            if j == i {
+                continue;
+            }
+            let Some(n) = clip.notes.get_mut(j) else {
+                continue;
+            };
+            let abs0 = c0 + (n.at_s - offset);
+            n.dur_s = (d0 + delta).clamp(0.02, (span - abs0).max(0.02));
+        }
     }
 
     /// Arm the STRETCH: shift-drag from an edge scales the whole selection
@@ -9944,7 +10037,45 @@ impl IvoryApp {
     /// RESIZE from the HEAD: the start follows the hand — snapped by the
     /// grid's own state exactly as the tail is — and the END stands still,
     /// so lengthening one side never moves the other.
-    fn me_resize_note_left(&mut self, i: usize, t: f64) {
+    fn me_resize_note_left(&mut self, i: usize, orig: &[(usize, f64, f64)], t: f64) {
+        self.me_resize_note_left_one(i, t);
+        // The rest of the selection's heads, by the grabbed note's delta —
+        // read after the fact for the same reason the tail's is.
+        let Some(st) = self.midi_edit.as_ref() else {
+            return;
+        };
+        let id = st.id;
+        let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
+            return;
+        };
+        let Some(&(_, was, _)) = orig.iter().find(|(j, _, _)| *j == i) else {
+            return;
+        };
+        let Some(now) = clip.notes.get(i).map(|n| n.at_s) else {
+            return;
+        };
+        let delta = now - was;
+        if delta.abs() < 1.0e-9 {
+            return;
+        }
+        let (c0, offset) = (clip.start_s, clip.offset_s);
+        for &(j, a0, d0) in orig {
+            if j == i {
+                continue;
+            }
+            let Some(n) = clip.notes.get_mut(j) else {
+                continue;
+            };
+            // The END stands still — that is what dragging a head means — so
+            // the floor on the duration is also the ceiling on the start.
+            let end_abs = c0 + (a0 - offset) + d0;
+            let start_abs = (c0 + (a0 - offset) + delta).clamp(c0, end_abs - 0.02);
+            n.at_s = a0 + (start_abs - (c0 + (a0 - offset)));
+            n.dur_s = end_abs - start_abs;
+        }
+    }
+
+    fn me_resize_note_left_one(&mut self, i: usize, t: f64) {
         let Some(st) = self.midi_edit.as_ref() else {
             return;
         };
@@ -10242,8 +10373,13 @@ impl IvoryApp {
     }
 
     /// PASTE at the playhead when it stands inside the clip, else at the
-    /// clip's head — snapped to the grid's own floor, pitches kept, the
-    /// fresh notes selected so the next gesture works on them.
+    /// clip's head — snapped to the grid line AT or AFTER it, pitches kept,
+    /// the fresh notes selected so the next gesture works on them.
+    ///
+    /// **Never behind the playhead.** It used to floor, so a playhead
+    /// anywhere between two lines put the paste on the line BEFORE it: the
+    /// owner's "when pasting note selections, they arrive a gridline BEFORE
+    /// the playhead and not AFTER". Paste means "from here on".
     fn me_paste(&mut self) {
         if self.note_clipboard.is_empty() {
             return;
@@ -10448,6 +10584,92 @@ impl IvoryApp {
         }
         if let Some(st) = self.midi_edit.as_mut() {
             st.selected.clear();
+            st.drag = None;
+        }
+        self.arr_save_edits();
+    }
+
+    /// **Cmd+G in the editor: JOIN the selected notes, per pitch.**
+    ///
+    /// The arrangement's glue welds clips into one and swallows the silence
+    /// between them; this is the same gesture one level down. Notes of the
+    /// SAME key become one note running from the earliest start to the latest
+    /// end — the gaps and the overlaps between them included, because that is
+    /// what welding means and because two notes of one pitch overlapping is
+    /// already a thing no instrument can play.
+    ///
+    /// **Pitches are not merged into each other.** A C and an E selected
+    /// together stay a C and an E: there is no single note that is both, and
+    /// silently keeping one would delete the other. So a chord's voices are
+    /// each joined along their own line, which is exactly what joining a
+    /// strummed passage should do.
+    ///
+    /// The survivor keeps the EARLIEST note's velocity — the attack you hear
+    /// is the one the joined note begins with.
+    fn me_glue_selection(&mut self) {
+        let Some(st) = self.midi_edit.as_ref() else {
+            return;
+        };
+        let id = st.id;
+        let sel = st.selected.clone();
+        if sel.len() < 2 {
+            return;
+        }
+        let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
+            return;
+        };
+        // Group by pitch, each group in time order. Indices are collected
+        // first because the removals below renumber everything after them.
+        let mut by_key: std::collections::BTreeMap<u8, Vec<usize>> = Default::default();
+        for &i in &sel {
+            if let Some(n) = clip.notes.get(i) {
+                by_key.entry(n.key).or_default().push(i);
+            }
+        }
+        let mut drop: Vec<usize> = Vec::new();
+        for group in by_key.values() {
+            if group.len() < 2 {
+                continue;
+            }
+            let mut ordered = group.clone();
+            ordered.sort_by(|a, b| {
+                clip.notes[*a]
+                    .at_s
+                    .partial_cmp(&clip.notes[*b].at_s)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let first = ordered[0];
+            let start = clip.notes[first].at_s;
+            let end = ordered
+                .iter()
+                .map(|&j| clip.notes[j].at_s + clip.notes[j].dur_s)
+                .fold(f64::MIN, f64::max);
+            clip.notes[first].dur_s = (end - start).max(0.02);
+            drop.extend(ordered.into_iter().skip(1));
+        }
+        if drop.is_empty() {
+            return;
+        }
+        drop.sort_unstable();
+        drop.dedup();
+        for &i in drop.iter().rev() {
+            if i < clip.notes.len() {
+                clip.notes.remove(i);
+            }
+        }
+        // **The selection is rebuilt from the indices that SURVIVED**, each
+        // shifted down by the number of removals before it. Leaving the old
+        // list would point past the end of a shorter Vec, and clearing it
+        // would lose the joined notes the moment they were made — the next
+        // gesture is usually about them.
+        let kept: Vec<usize> = sel
+            .iter()
+            .filter(|i| !drop.contains(i))
+            .map(|&i| i - drop.iter().take_while(|&&d| d < i).count())
+            .collect();
+        if let Some(st) = self.midi_edit.as_mut() {
+            st.selected = kept;
+            st.selected.sort_unstable();
             st.drag = None;
         }
         self.arr_save_edits();
@@ -12093,6 +12315,16 @@ impl IvoryApp {
             if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::D)) {
                 self.me_duplicate();
             }
+            // **Cmd+G joins notes**, the arrangement's glue one level down.
+            // The arrangement's own binding stands down while the editor is
+            // open, so the chord means one thing at a time.
+            if ctx.input(|i| {
+                (i.modifiers.command || i.modifiers.ctrl)
+                    && !i.modifiers.shift
+                    && i.key_pressed(egui::Key::G)
+            }) {
+                self.me_glue_selection();
+            }
             // The system's own chord — which arrives as an EVENT, not a
             // keypress: the winit layer turns Cmd/Ctrl+C into
             // `Event::Copy` before `key_pressed` ever sees the letter.
@@ -12476,9 +12708,7 @@ impl IvoryApp {
                             self.me_begin_stretch(i, false);
                         } else {
                             self.me_select(i, false);
-                            if let Some(st) = self.midi_edit.as_mut() {
-                                st.drag = Some(MeDrag::Resize { i });
-                            }
+                            self.me_begin_resize(i, false);
                         }
                     }
                     Some(H::NoteLeft(i)) => {
@@ -12490,9 +12720,7 @@ impl IvoryApp {
                             self.me_begin_stretch(i, true);
                         } else {
                             self.me_select(i, false);
-                            if let Some(st) = self.midi_edit.as_mut() {
-                                st.drag = Some(MeDrag::ResizeLeft { i });
-                            }
+                            self.me_begin_resize(i, true);
                         }
                     }
                     Some(H::Cell(..)) if secondary => {
@@ -12614,11 +12842,11 @@ impl IvoryApp {
                 MeDrag::Move { i, dt, orig } => {
                     self.me_move_selection(i, t_at, key_at, dt, &orig);
                 }
-                MeDrag::Resize { i } => self.me_resize_note(i, t_at),
+                MeDrag::Resize { i, orig } => self.me_resize_note(i, &orig, t_at),
                 MeDrag::Stretch { i, from_left, anchor, orig } => {
                     self.me_stretch(i, from_left, anchor, &orig, t_at);
                 }
-                MeDrag::ResizeLeft { i } => self.me_resize_note_left(i, t_at),
+                MeDrag::ResizeLeft { i, orig } => self.me_resize_note_left(i, &orig, t_at),
                 MeDrag::GridStep { from_y, start } => {
                     let steps = f64::from((from_y - p.y) / 14.0).round() as i64;
                     let to = (start - steps).clamp(-6, 3);
@@ -23722,7 +23950,7 @@ mod tests {
         assert_eq!(note.key, 70);
 
         // Stretched past the end: the clip's edge is the wall.
-        app.me_resize_note(0, 30.0);
+        app.me_resize_note(0, &[(0, 0.125)], 30.0);
         let note = app.arrangement.clips[0].notes[0].clone();
         assert!((note.dur_s - 15.0).abs() < 1e-9, "resized to {}", note.dur_s);
 
@@ -23736,6 +23964,210 @@ mod tests {
         let doc = app.project_doc().unwrap().to_path_buf();
         let read = crate::arrangement::Arrangement::load_from(&doc);
         assert!(read.clips[0].notes.is_empty(), "the delete did not save");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **An edge drag resizes the SELECTION**, and by a delta rather than a
+    /// scale.
+    ///
+    /// The owner's "multiselect midi notes, click edge to drag, SHOULD have
+    /// all midi notes drag with the selection". A scale is the OTHER gesture
+    /// — shift-drag, `me_begin_stretch` — and using it here would square off
+    /// the lengths that make a chord a chord.
+    #[test]
+    fn an_edge_drag_resizes_every_selected_note_by_the_same_amount() {
+        let root = project_scratch("meresizesel");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.settings.midi_grid_exp = -3; // a quarter of a beat: 0.125 s
+        let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            notes: Vec::new(),
+            lane: 1,
+            path: String::new(),
+            start_s: 0.0,
+            offset_s: 0.0,
+            len_s: 16.0,
+            loop_s: 0.0,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name: "MIDI".to_owned(),
+            id: 0,
+            extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
+            gain: 1.0,
+        });
+        app.open_midi_editor(id);
+        // Three notes at 1.0, 2.0 and 3.0 — DELIBERATELY unequal lengths, so
+        // a scale and a delta cannot be confused for each other.
+        for (at, dur, key) in [(1.0, 0.5, 60u8), (2.0, 0.25, 64), (3.0, 1.0, 67)] {
+            let c = &mut app.arrangement.clips[0];
+            c.notes.push(crate::arrangement::ArrNote {
+                at_s: at,
+                dur_s: dur,
+                key,
+                vel: 100,
+            });
+        }
+        app.midi_edit.as_mut().unwrap().selected = vec![0, 1, 2];
+
+        // Grab note 0's tail and pull it from 1.5 to 2.0 — half a second.
+        app.me_begin_resize(0, false);
+        let MeDrag::Resize { orig, .. } = app.midi_edit.as_ref().unwrap().drag.clone().unwrap()
+        else {
+            panic!("the resize did not carry the selection");
+        };
+        assert_eq!(orig.len(), 3, "only the grabbed note was captured");
+        app.me_resize_note(0, &orig, 2.0);
+        let n = &app.arrangement.clips[0].notes;
+        assert!((n[0].dur_s - 1.0).abs() < 1e-9, "grabbed: {}", n[0].dur_s);
+        assert!((n[1].dur_s - 0.75).abs() < 1e-9, "second: {}", n[1].dur_s);
+        assert!((n[2].dur_s - 1.5).abs() < 1e-9, "third: {}", n[2].dur_s);
+        // A SCALE would have made these 0.5 and 2.0. The shape is kept.
+
+        // And the heads: drag note 0's head from 1.0 back to 0.75, and every
+        // selected note's start moves a quarter-second earlier with its END
+        // standing still.
+        let ends: Vec<f64> = n.iter().map(|x| x.at_s + x.dur_s).collect();
+        app.me_begin_resize(0, true);
+        let MeDrag::ResizeLeft { orig, .. } =
+            app.midi_edit.as_ref().unwrap().drag.clone().unwrap()
+        else {
+            panic!("the head drag did not carry the selection");
+        };
+        app.me_resize_note_left(0, &orig, 0.75);
+        let n = &app.arrangement.clips[0].notes;
+        assert!((n[0].at_s - 0.75).abs() < 1e-9, "grabbed: {}", n[0].at_s);
+        assert!((n[1].at_s - 1.75).abs() < 1e-9, "second: {}", n[1].at_s);
+        assert!((n[2].at_s - 2.75).abs() < 1e-9, "third: {}", n[2].at_s);
+        for (k, was) in ends.iter().enumerate() {
+            let now = n[k].at_s + n[k].dur_s;
+            assert!((now - was).abs() < 1e-9, "note {k}'s end moved: {was} -> {now}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A paste lands AT or AFTER the playhead, never behind it.**
+    #[test]
+    fn a_paste_never_lands_behind_the_playhead() {
+        let root = project_scratch("mepaste");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.settings.midi_grid_exp = -3; // a quarter of a beat: 0.125 s
+        let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            notes: Vec::new(),
+            lane: 1,
+            path: String::new(),
+            start_s: 0.0,
+            offset_s: 0.0,
+            len_s: 16.0,
+            loop_s: 0.0,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name: "MIDI".to_owned(),
+            id: 0,
+            extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
+            gain: 1.0,
+        });
+        app.open_midi_editor(id);
+        app.note_clipboard = vec![crate::arrangement::ArrNote {
+            at_s: 0.0,
+            dur_s: 0.25,
+            key: 60,
+            vel: 100,
+        }];
+
+        // The playhead BETWEEN two lines — 2.05 s, with lines every 0.125.
+        // Flooring put this at 2.0, which is behind the hand.
+        app.recorder.position_s = 2.05;
+        app.me_paste();
+        let at = app.arrangement.clips[0].notes[0].at_s;
+        assert!(at >= 2.05 - 1e-9, "pasted BEHIND the playhead, at {at}");
+        assert!((at - 2.125).abs() < 1e-9, "not on the next line: {at}");
+
+        // And a playhead already ON a line does not skip forward a step.
+        app.arrangement.clips[0].notes.clear();
+        app.recorder.position_s = 3.0;
+        app.me_paste();
+        let at = app.arrangement.clips[0].notes[0].at_s;
+        assert!((at - 3.0).abs() < 1e-9, "an on-grid paste jumped to {at}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Cmd+G joins notes of the same pitch, and only of the same pitch.**
+    ///
+    /// The owner's "CMD + G or CTRL + G should join/glue midi selections as
+    /// well". A join that merged across pitches would delete a voice; a join
+    /// that skipped the silence between two notes would not be a join.
+    #[test]
+    fn glue_joins_the_selection_along_each_pitch() {
+        let root = project_scratch("meglue");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            notes: Vec::new(),
+            lane: 1,
+            path: String::new(),
+            start_s: 0.0,
+            offset_s: 0.0,
+            len_s: 16.0,
+            loop_s: 0.0,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name: "MIDI".to_owned(),
+            id: 0,
+            extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
+            gain: 1.0,
+        });
+        app.open_midi_editor(id);
+        // Two Cs with a GAP between them, and one E in the middle of it.
+        for (at, dur, key, vel) in [
+            (1.0, 0.5, 60u8, 90u8),
+            (3.0, 0.5, 60, 40),
+            (2.0, 0.5, 64, 100),
+        ] {
+            app.arrangement.clips[0].notes.push(crate::arrangement::ArrNote {
+                at_s: at,
+                dur_s: dur,
+                key,
+                vel,
+            });
+        }
+        app.midi_edit.as_mut().unwrap().selected = vec![0, 1, 2];
+        app.me_glue_selection();
+
+        let n = &app.arrangement.clips[0].notes;
+        assert_eq!(n.len(), 2, "the E was swallowed or nothing joined");
+        let c = n.iter().find(|x| x.key == 60).expect("the C is gone");
+        assert!((c.at_s - 1.0).abs() < 1e-9, "starts at {}", c.at_s);
+        assert!((c.dur_s - 2.5).abs() < 1e-9, "the gap was not welded: {}", c.dur_s);
+        assert_eq!(c.vel, 90, "the joined note took the wrong attack");
+        let e = n.iter().find(|x| x.key == 64).expect("the E is gone");
+        assert!((e.at_s - 2.0).abs() < 1e-9 && (e.dur_s - 0.5).abs() < 1e-9);
+
+        // The selection still points at real notes — it is the next
+        // gesture's subject, and a stale index would be past the end.
+        let sel = app.midi_edit.as_ref().unwrap().selected.clone();
+        assert_eq!(sel.len(), 2, "the survivors were not re-selected");
+        assert!(sel.iter().all(|&i| i < n.len()), "a stale index: {sel:?}");
+
+        // One note alone is nothing to join, and the document is untouched.
+        app.midi_edit.as_mut().unwrap().selected = vec![0];
+        app.me_glue_selection();
+        assert_eq!(app.arrangement.clips[0].notes.len(), 2);
         let _ = std::fs::remove_dir_all(&root);
     }
 
