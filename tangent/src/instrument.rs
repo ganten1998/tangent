@@ -12240,6 +12240,69 @@ mod tests {
         assert_eq!(r.midi_cursor[1], 1);
     }
 
+    /// **Every lane comes back on the loop's wrap, not just some of them.**
+    ///
+    /// The owner: "Looping misses 2/4 tracks when it loops. i can't tell why
+    /// not all of them." Four lanes, one note each at the loop's head, and
+    /// the wrap has to hand all four back — the second pass must look like
+    /// the first.
+    #[test]
+    fn a_loop_wrap_brings_every_lane_back() {
+        let shared = Arc::new(Shared::new());
+        let (tap_tx, _tap_rx) = RingBuffer::<f32>::new(1 << 16);
+        let mut r = test_renderer(Arc::clone(&shared), tap_tx, 2);
+        // A loop over [4096, 8192). One note per lane, right at the head,
+        // half the region long — so each is over before the wrap and each
+        // must be re-struck after it.
+        r.midi_clips = (0..4)
+            .map(|lane| PlacedMidi {
+                strip: lane,
+                start: 0,
+                len: 48_000,
+                notes: Arc::new(vec![ClipNote {
+                    at: 4_096,
+                    dur: 2_048,
+                    key: 60 + lane as u8,
+                    vel: 100,
+                }]),
+            })
+            .collect();
+        r.midi_cursor = vec![0; 4];
+        shared.loop_a.store(4_096, Ordering::Relaxed);
+        shared.loop_b.store(8_192, Ordering::Relaxed);
+        shared.rolling.store(true, Ordering::Relaxed);
+        let mut out = vec![0.0f32; 512 * 2];
+
+        // Roll two whole passes of the region and record which lanes were
+        // struck in each. 512-frame blocks: eight to a pass.
+        let mut passes: Vec<Vec<u8>> = Vec::new();
+        let mut seen: Vec<u8> = Vec::new();
+        let mut was = r.pos;
+        for _ in 0..48 {
+            out.fill(0.0);
+            r.render(&mut out, 0, 0);
+            for a in &r.active_clip {
+                if !seen.contains(&a.lane) {
+                    seen.push(a.lane);
+                }
+            }
+            // A wrap is the position going BACKWARDS; close the pass there.
+            if r.pos < was {
+                seen.sort_unstable();
+                passes.push(std::mem::take(&mut seen));
+            }
+            was = r.pos;
+        }
+        assert!(passes.len() >= 2, "the loop did not wrap twice: {passes:?}");
+        for (n, lanes) in passes.iter().enumerate() {
+            assert_eq!(
+                lanes,
+                &vec![0u8, 1, 2, 3],
+                "pass {n} struck {lanes:?}, not every lane"
+            );
+        }
+    }
+
     #[test]
     fn an_offline_engine_taps_stems_too() {
         use std::sync::Arc;
