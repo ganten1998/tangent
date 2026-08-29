@@ -156,6 +156,99 @@ pub struct AutoView<'a> {
     /// what automation would do if it were switched on, and is the line the
     /// first alt-click lands on.
     pub resting: f64,
+    /// **Armed to WRITE.** Moving the control while the transport rolls lays
+    /// points down on this curve. Off by default: a fader nudged during
+    /// playback should not silently become automation.
+    pub armed: bool,
+    /// **Bypassed.** The curve is drawn, kept and editable, and the engine
+    /// does not apply it — which is what makes it possible to hear the
+    /// difference automation is making without deleting the work.
+    pub bypassed: bool,
+}
+
+/// **One automation row's header cells**, left to right.
+///
+/// A track's strip, at half the height and with the questions an automation
+/// lane actually has: whether to keep looking at it, whether it is writing,
+/// whether it is doing anything, what it controls, and where that control is
+/// standing right now.
+///
+/// Computed by [`auto_header`] and by nothing else — the same rule the rest
+/// of this file follows, so a click cannot land somewhere other than what it
+/// looks like it is on.
+#[derive(Debug, Clone, Copy)]
+pub struct AutoHeader {
+    /// **×**, far left: stop showing this lane. The same thing the parameter
+    /// menu's tick does, put where a hand already is.
+    pub close: Rect,
+    /// The record dot, drawn exactly as a track's is.
+    pub arm: Rect,
+    /// **B** — bypass. A letter, like M and S, because it is the same kind of
+    /// per-lane switch about signal.
+    pub bypass: Rect,
+    /// What this lane controls. Whatever is left in the middle.
+    pub name: Rect,
+    /// The control itself, on the right, so a value can be set without
+    /// drawing a point.
+    pub dial: Rect,
+    /// Its number, ABOVE the dial rather than below as a track's is — half a
+    /// row has no room under one, and above is where the eye already is
+    /// coming from the name.
+    pub readout: Rect,
+}
+
+/// Carve an automation row's header into its cells.
+///
+/// Returns cells that are `Rect::NOTHING` when the row is too short or too
+/// narrow to carry them, so a cramped header degrades to the name alone
+/// rather than to a row of targets nobody can hit.
+pub fn auto_header(header: Rect) -> AutoHeader {
+    let none = AutoHeader {
+        close: Rect::NOTHING,
+        arm: Rect::NOTHING,
+        bypass: Rect::NOTHING,
+        name: header,
+        dial: Rect::NOTHING,
+        readout: Rect::NOTHING,
+    };
+    if !header.is_positive() || header.height() < 12.0 || header.width() < 120.0 {
+        return none;
+    }
+    let h = header.height();
+    let pad = 3.0_f32;
+    // Square switches, sized off the row so they stay the same shape as the
+    // row shrinks, with a floor under which they stop being drawn at all.
+    let b = (h - pad * 2.0).clamp(9.0, 16.0);
+    let cy = header.center().y;
+    let cell = |x: f32, w: f32| {
+        Rect::from_center_size(Pos2::new(x + w * 0.5, cy), Vec2::new(w, b))
+    };
+    let mut x = header.left() + FOLDER_INDENT;
+    let close = cell(x, b);
+    x += b + pad;
+    let arm = cell(x, b);
+    x += b + pad;
+    let bypass = cell(x, b);
+    x += b + pad;
+    // The dial and its number own the right end. A column, not a row: the
+    // number sits over the dial.
+    let dial_w = (h * 1.6).clamp(18.0, 34.0);
+    let right = header.right() - pad;
+    let dial_col = Rect::from_min_max(
+        Pos2::new(right - dial_w, header.top() + 1.0),
+        Pos2::new(right, header.bottom() - 1.0),
+    );
+    let split = dial_col.top() + dial_col.height() * 0.40;
+    let readout = Rect::from_min_max(dial_col.min, Pos2::new(dial_col.right(), split));
+    let dial = Rect::from_min_max(Pos2::new(dial_col.left(), split), dial_col.max);
+    let name = Rect::from_min_max(
+        Pos2::new(x, header.top()),
+        Pos2::new((dial_col.left() - pad).max(x), header.bottom()),
+    );
+    if !name.is_positive() {
+        return none;
+    }
+    AutoHeader { close, arm, bypass, name, dial, readout }
 }
 
 /// Everything the arrangement draws, pushed in.
@@ -314,6 +407,14 @@ pub enum Hit {
     /// The sub-lane's own header: which parameter it shows.
     /// One automation ROW's header — `(lane, row)`.
     AutoParamPick(usize, usize),
+    /// **×** on an automation row: stop showing this lane.
+    AutoClose(usize, usize),
+    /// The record dot on an automation row: arm it to write.
+    AutoArm(usize, usize),
+    /// **B**: bypass this curve without deleting it.
+    AutoBypass(usize, usize),
+    /// The dial on an automation row — sets the control itself.
+    AutoDial(usize, usize),
     /// The header's fold arrow: show or hide this lane's automation.
     /// The **A** button on a track's header: open the automation menu.
     AutoMenu(usize),
@@ -1653,6 +1754,20 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
             continue;
         };
         if row.header.is_positive() && row.header.contains(pos) {
+            // The cells first: the header as a whole still opens the
+            // parameter menu, so a switch has to be asked about before the
+            // room it sits in.
+            let h = auto_header(row.header);
+            for (r, hit) in [
+                (h.close, Hit::AutoClose(lane, slot)),
+                (h.arm, Hit::AutoArm(lane, slot)),
+                (h.bypass, Hit::AutoBypass(lane, slot)),
+                (h.dial, Hit::AutoDial(lane, slot)),
+            ] {
+                if r.is_positive() && r.contains(pos) {
+                    return Some(hit);
+                }
+            }
             return Some(Hit::AutoParamPick(lane, slot));
         }
         if !row.lane.is_positive() {
@@ -1813,6 +1928,11 @@ pub fn targets(rect: Rect, view: &ArrangeView<'_>) -> Vec<(Rect, Hit)> {
             RowKind::Tempo => push(row.header, Hit::TempoHeader),
             RowKind::Master => {}
             RowKind::Automation(lane, slot) => {
+                let h = auto_header(row.header);
+                push(h.close, Hit::AutoClose(lane, slot));
+                push(h.arm, Hit::AutoArm(lane, slot));
+                push(h.bypass, Hit::AutoBypass(lane, slot));
+                push(h.dial, Hit::AutoDial(lane, slot));
                 push(row.header, Hit::AutoParamPick(lane, slot));
             }
             RowKind::Track(i) => {
@@ -1954,6 +2074,26 @@ pub fn a11y_nodes(rect: Rect, view: &ArrangeView<'_>) -> Vec<crate::a11y::Node> 
             Hit::HeaderGrip => continue,
             // ── the rows' own headers ─────────────────────────────────
             Hit::TempoHeader => Node::button(id, r, "Song tempo, flatten to one tempo"),
+            Hit::AutoClose(i, slot) => {
+                Node::button(id, r, &format!("Hide automation row {} on track {}", slot + 1, i + 1))
+            }
+            Hit::AutoArm(i, slot) => Node::toggle(
+                id,
+                r,
+                "Arm this automation lane to write",
+                view.lanes.get(i).and_then(|l| l.automation.get(slot)).is_some_and(|a| a.armed),
+            ),
+            Hit::AutoBypass(i, slot) => Node::toggle(
+                id,
+                r,
+                "Bypass this automation lane",
+                view.lanes.get(i).and_then(|l| l.automation.get(slot)).is_some_and(|a| a.bypassed),
+            ),
+            Hit::AutoDial(i, slot) => Node::button(
+                id,
+                r,
+                &format!("Automation lane {} on track {}", slot + 1, i + 1),
+            ),
             Hit::AutoParamPick(i, slot) => Node::button(
                 id,
                 r,
@@ -2501,18 +2641,99 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             let face = shade(p.hdr_face, 0.92);
             painter.rect_filled(row.header, 0.0, face);
             let ink = on_ink(face);
-            let size = (row.header.height() * 0.46).clamp(7.0, 11.0);
-            let pad = FOLDER_INDENT;
-            let room = row.header.width() - pad - 4.0;
-            if size >= 7.0 && room > 20.0 {
+            let h = auto_header(row.header);
+            // **The × — leave.** A cross rather than a letter: the three
+            // switches beside it are about the SIGNAL and this one is about
+            // the view, so it says so by not looking like them. Drawn, not
+            // set: this crate has no icon font.
+            if h.close.is_positive() {
+                let c = h.close.center();
+                let a = h.close.width() * 0.26;
+                let stroke = Stroke::new(crate::fonts::px(h.close.width() * 0.10), quiet(ink, face, 0.28));
+                painter.line_segment(
+                    [Pos2::new(c.x - a, c.y - a), Pos2::new(c.x + a, c.y + a)],
+                    stroke,
+                );
+                painter.line_segment(
+                    [Pos2::new(c.x - a, c.y + a), Pos2::new(c.x + a, c.y - a)],
+                    stroke,
+                );
+            }
+            // The record dot, exactly as a track's — a hand that has learned
+            // one has learned this.
+            if h.arm.is_positive() {
+                let c = h.arm.center();
+                let rad = h.arm.width() * 0.5;
+                if auto.armed {
+                    painter.circle_filled(c, rad, p.arm);
+                }
+                painter.circle_stroke(c, rad, Stroke::new(1.0, quiet(ink, face, 0.30)));
+            }
+            // **B** — bypass, lettered like M and S because it is the same
+            // kind of per-lane switch about signal. Lit in the mute colour:
+            // a bypassed curve and a muted track are the same statement.
+            if h.bypass.is_positive() {
+                let on = auto.bypassed;
+                let plate = if on { p.mute } else { p.hdr_lane };
+                painter.rect_filled(h.bypass, 2.0, plate);
+                let size = crate::fonts::px((h.bypass.height() * 0.62).clamp(7.0, 11.0));
+                if size >= 7.0 {
+                    painter.text(
+                        h.bypass.center(),
+                        Align2::CENTER_CENTER,
+                        "B",
+                        FontId::new(size, crate::fonts::courier_bold()),
+                        if on { on_ink(plate) } else { quiet(on_ink(plate), plate, 0.18) },
+                    );
+                }
+            }
+            // What it controls.
+            let size = crate::fonts::px((row.header.height() * 0.46).clamp(7.0, 11.0));
+            let room = h.name.width() - 4.0;
+            if h.name.is_positive() && size >= 7.0 && room > 20.0 {
                 let font = FontId::new(size, crate::fonts::courier());
+                // **A bypassed lane says so in its name too.** The B is
+                // eleven points wide and the name is the thing being read.
+                let word_ink = if auto.bypassed {
+                    quiet(ink, face, 0.45)
+                } else {
+                    quiet(ink, face, 0.10)
+                };
                 painter.text(
-                    Pos2::new(row.header.left() + pad, row.header.center().y),
+                    Pos2::new(h.name.left(), h.name.center().y),
                     Align2::LEFT_CENTER,
                     cut_to(painter, room, &auto.label, &font),
                     font,
-                    quiet(ink, face, 0.10),
+                    word_ink,
                 );
+            }
+            // **The control itself, with its number over it.** Under a track
+            // the readouts sit below their dials; half a row has no room
+            // beneath one, and above is where the eye is already coming from
+            // the name.
+            if h.dial.is_positive() {
+                // Same three colours the track's own dials wear, so the
+                // strip below a track reads as part of it.
+                dial(
+                    painter,
+                    h.dial,
+                    auto.resting as f32,
+                    if auto.bypassed { p.hdr_lane } else { DIAL_VOLUME },
+                    p.lane,
+                    p.clip_ink,
+                );
+            }
+            if h.readout.is_positive() {
+                let size = crate::fonts::px((h.readout.height() * 0.86).clamp(6.0, 9.0));
+                if size >= 6.0 {
+                    painter.text(
+                        h.readout.center(),
+                        Align2::CENTER_CENTER,
+                        &format!("{:.0}%", auto.resting * 100.0),
+                        FontId::new(size, crate::fonts::courier()),
+                        quiet(ink, face, 0.22),
+                    );
+                }
             }
         }
     }
@@ -4038,6 +4259,67 @@ fn cut_to(painter: &Painter, width: f32, text: &str, font: &FontId) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// **The automation strip's cells never overlap and never leave the row.**
+    ///
+    /// `Rect::contains` is inclusive at both edges, so two cells that merely
+    /// touch share a line of pixels and a press on it belongs to whichever
+    /// the hit test asks about first — which is exactly how a control ends up
+    /// doing its neighbour's job.
+    #[test]
+    fn the_automation_strip_cells_are_separate_and_inside_the_row() {
+        for w in [140.0_f32, 220.0, 320.0] {
+            for h in [13.0_f32, 18.0, 26.0] {
+                let header = Rect::from_min_size(Pos2::new(10.0, 40.0), Vec2::new(w, h));
+                let a = auto_header(header);
+                let cells = [
+                    ("close", a.close),
+                    ("arm", a.arm),
+                    ("bypass", a.bypass),
+                    ("name", a.name),
+                    ("dial", a.dial),
+                    ("readout", a.readout),
+                ];
+                for (n, r) in cells {
+                    if !r.is_positive() {
+                        continue;
+                    }
+                    assert!(
+                        header.contains(r.min) && header.contains(r.max),
+                        "{n} leaves the row at {w}x{h}: {r:?} not in {header:?}"
+                    );
+                }
+                for (i, (an, ar)) in cells.iter().enumerate() {
+                    for (bn, br) in cells.iter().skip(i + 1) {
+                        // The readout sits directly over the dial by design;
+                        // they are one column and only the dial is a target.
+                        if [*an, *bn].contains(&"readout") && [*an, *bn].contains(&"dial") {
+                            continue;
+                        }
+                        if !ar.is_positive() || !br.is_positive() {
+                            continue;
+                        }
+                        assert!(
+                            !ar.intersects(*br),
+                            "{an} and {bn} overlap at {w}x{h}: {ar:?} / {br:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A row too small to carry switches degrades to the name alone, rather
+    /// than to a row of targets too small to hit.
+    #[test]
+    fn a_cramped_automation_row_keeps_its_name_and_drops_its_switches() {
+        let tiny = Rect::from_min_size(Pos2::ZERO, Vec2::new(80.0, 9.0));
+        let a = auto_header(tiny);
+        assert!(a.name.is_positive(), "the name went with the switches");
+        for (n, r) in [("close", a.close), ("arm", a.arm), ("bypass", a.bypass), ("dial", a.dial)] {
+            assert!(!r.is_positive(), "{n} survived a row too small for it");
+        }
+    }
     use super::*;
 
     fn a_lane(used: bool) -> LaneView<'static> {
@@ -4176,6 +4458,8 @@ ArrangeView {
             param: crate::automation::AutoParam::Gain,
             label: "volume".to_owned(),
             resting: 0.5,
+            armed: false,
+            bypassed: false,
             points: &[],
             hot: None,
         }];
@@ -4992,6 +5276,8 @@ ArrangeView {
                 v.lanes[0].automation = vec![AutoView {
                     label: "volume".to_owned(),
             resting: 0.5,
+            armed: false,
+            bypassed: false,
                     param: AutoParam::Gain,
                     points: &pts,
                     hot: Some(3),
@@ -5034,6 +5320,8 @@ ArrangeView {
         v.lanes[0].automation = vec![AutoView {
                     label: "volume".to_owned(),
             resting: 0.5,
+            armed: false,
+            bypassed: false,
             param: AutoParam::Gain,
             points: &pts,
             hot: None,
@@ -5073,6 +5361,8 @@ ArrangeView {
         v.lanes[0].automation = vec![AutoView {
                     label: "volume".to_owned(),
             resting: 0.5,
+            armed: false,
+            bypassed: false,
             param: AutoParam::Gain,
             points: &pts,
             hot: None,
@@ -5124,6 +5414,8 @@ ArrangeView {
         v.lanes[0].automation = vec![AutoView {
                     label: "volume".to_owned(),
             resting: 0.5,
+            armed: false,
+            bypassed: false,
             param: AutoParam::Gain,
             points: &pts,
             hot: None,
@@ -5259,6 +5551,8 @@ ArrangeView {
             param: crate::automation::AutoParam::Gain,
             label: "volume".to_owned(),
             resting: 0.5,
+            armed: false,
+            bypassed: false,
             points: &[],
             hot: None,
         }];

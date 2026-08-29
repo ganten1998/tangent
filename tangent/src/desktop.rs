@@ -4096,7 +4096,7 @@ impl DesktopApp {
         // ignored the automation would be the same class of quiet wrongness
         // as one whose bar lines were somewhere else: it plays, it sounds
         // plausible, and it is not what you were listening to.
-        e.set_automation(self.app.automation().clone());
+        e.set_automation(self.app.engine_automation());
         // The built-in: rendered by the engine itself when a channel's
         // first bay names it — the live walk's own rule.
         let builtin = (0..tangent_ui::recorder::CHANNELS)
@@ -5643,7 +5643,7 @@ impl DesktopApp {
     /// The automation curves, on the same change-detected bargain.
     #[cfg(feature = "recorder")]
     fn push_automation(&mut self) {
-        let want = self.app.automation().clone();
+        let want = self.app.engine_automation();
         if self.pushed_auto.as_ref() == Some(&want) {
             return;
         }

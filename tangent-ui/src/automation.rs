@@ -282,13 +282,27 @@ impl Curve {
         //
         // Same shape as the point it copies, so the first segment leaves zero
         // exactly as it leaves the point it was derived from.
-        if let Some(first) = kept.first() {
+        let mut me = Self { lane, param, points: kept };
+        me.ensure_zero();
+        me
+    }
+
+    /// Put a node at zero if the curve has points and none of them is there.
+    ///
+    /// **Called by every mutator, not just by `sanitised`.** Seeding only on
+    /// load meant the rule held for a curve read from a file and not for one
+    /// somebody had just drawn — which is the case that matters, because a
+    /// fresh curve is exactly the one whose beginning is unmarked.
+    ///
+    /// Inaudible: `value_at` is flat before the first point, so the seeded
+    /// node holds the value that stretch already had.
+    fn ensure_zero(&mut self) {
+        if let Some(first) = self.points.first() {
             if first.at_s > 0.0 {
                 let seed = Point { at_s: 0.0, value: first.value, shape: first.shape };
-                kept.insert(0, seed);
+                self.points.insert(0, seed);
             }
         }
-        Self { lane, param, points: kept }
     }
 
     pub fn points(&self) -> &[Point] {
@@ -357,6 +371,7 @@ impl Curve {
             Ok(i) => self.points[i] = p,
             Err(i) => self.points.insert(i, p),
         }
+        self.ensure_zero();
     }
 
     /// Take the point nearest `seconds` out, if one is within `reach`.
@@ -372,6 +387,12 @@ impl Curve {
             return false;
         };
         self.points.remove(i);
+        // Taking the FIRST point away would leave the curve beginning
+        // somewhere other than zero, so the next one seeds a new node there.
+        // Deleting the node at zero therefore moves it rather than removing
+        // it — which is what "a curve always begins at zero" has to mean if
+        // it is to be true after an edit as well as before one.
+        self.ensure_zero();
         true
     }
 }
