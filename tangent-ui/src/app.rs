@@ -344,6 +344,12 @@ pub struct IvoryApp {
     /// and its send at once, and a row that could only show one of them made
     /// that a thing you toggled between rather than saw.
     arr_auto_open: std::collections::HashSet<(usize, crate::automation::AutoParam)>,
+    /// Which automation lanes are armed to WRITE. Session state, like
+    /// `arr_auto_open`: arming is a thing you do for the next take, not a
+    /// property of the song.
+    arr_auto_armed: std::collections::HashSet<(usize, crate::automation::AutoParam)>,
+    /// Which are bypassed — kept, drawn, editable, and not applied.
+    arr_auto_bypassed: std::collections::HashSet<(usize, crate::automation::AutoParam)>,
     /// Per strip, what each of its three bays offers an automation lane.
     /// Pushed by the host — see [`Self::set_fx_params`].
     fx_params: std::collections::HashMap<usize, [crate::ports::FxParams; crate::recorder::INSERTS]>,
@@ -1180,6 +1186,15 @@ enum ArrDrag {
     /// `(lane, row, point)` — which lane, which of its open rows, and which
     /// point on that row's curve.
     AutoPoint(usize, usize, usize),
+    /// An automation row's dial being turned. Carries the PARAM rather than
+    /// the slot: opening or closing another row mid-drag renumbers the slots
+    /// and the drag would then be turning somebody else's control.
+    AutoDial {
+        lane: usize,
+        param: crate::automation::AutoParam,
+        from_y: f32,
+        from: f64,
+    },
     /// A tempo point being carried, by index — re-derived after every move
     /// for the reason above it: dragging one past its neighbour re-sorts the
     /// map and the old index would name somebody else's point.
@@ -1939,6 +1954,8 @@ impl IvoryApp {
             a11y_on: None,
             reader_was_detected: false,
             arr_auto_open: std::collections::HashSet::new(),
+            arr_auto_armed: std::collections::HashSet::new(),
+            arr_auto_bypassed: std::collections::HashSet::new(),
             fx_params: std::collections::HashMap::new(),
             arr_auto_params: std::collections::HashMap::new(),
             arr_auto_hot: None,
@@ -8221,6 +8238,41 @@ impl IvoryApp {
     /// Built at OPEN rather than kept: a plugin loaded or unloaded while the
     /// menu is up would leave a list describing a desk that no longer exists,
     /// and rebuilding is a handful of strings.
+    /// **× on an automation row: stop showing it.**
+    ///
+    /// The same thing as un-ticking the parameter in the A menu, put where
+    /// the hand already is. The CURVE is untouched — closing a row is about
+    /// what is on screen, and a lane that deleted its automation because
+    /// somebody tidied the view would be unforgivable.
+    fn arr_close_auto_row(&mut self, lane: usize, slot: usize) {
+        if let Some(param) = self.arr_auto_param_at(lane, slot) {
+            self.arr_auto_open.remove(&(lane, param));
+        }
+    }
+
+    /// Arm this lane to WRITE while the transport rolls.
+    fn arr_toggle_auto_arm(&mut self, lane: usize, slot: usize) {
+        if let Some(param) = self.arr_auto_param_at(lane, slot) {
+            if !self.arr_auto_armed.remove(&(lane, param)) {
+                self.arr_auto_armed.insert((lane, param));
+            }
+        }
+    }
+
+    /// **Bypass: keep the curve, stop applying it.**
+    ///
+    /// Not a delete and not a close. This is the switch that answers "what is
+    /// the automation actually doing", which is a question you ask by taking
+    /// it out and putting it back — and which is unanswerable if the only way
+    /// to take it out is to lose it.
+    fn arr_toggle_auto_bypass(&mut self, lane: usize, slot: usize) {
+        if let Some(param) = self.arr_auto_param_at(lane, slot) {
+            if !self.arr_auto_bypassed.remove(&(lane, param)) {
+                self.arr_auto_bypassed.insert((lane, param));
+            }
+        }
+    }
+
     fn arr_open_automation_menu(&mut self, lane: usize) {
         use crate::automation::AutoParam;
         if lane >= crate::recorder::CHANNELS {
@@ -13099,6 +13151,19 @@ impl IvoryApp {
                     // the A button does, with this row's box already ticked —
                     // which is how you take a row away again.
                     Some(A::AutoParamPick(n, _)) => self.arr_open_automation_menu(n),
+                    Some(A::AutoClose(n, slot)) => self.arr_close_auto_row(n, slot),
+                    Some(A::AutoArm(n, slot)) => self.arr_toggle_auto_arm(n, slot),
+                    Some(A::AutoBypass(n, slot)) => self.arr_toggle_auto_bypass(n, slot),
+                    Some(A::AutoDial(n, slot)) => {
+                        if let Some(param) = self.arr_auto_param_at(n, slot) {
+                            self.arr_drag = Some(ArrDrag::AutoDial {
+                                lane: n,
+                                param,
+                                from_y: p.y,
+                                from: self.auto_resting(n, param),
+                            });
+                        }
+                    }
                     Some(A::AutoPoint(n, row, i)) => {
                         self.arr_auto_hot = Some((n, i));
                         self.arr_drag = Some(ArrDrag::AutoPoint(n, row, i));
@@ -13582,6 +13647,20 @@ impl IvoryApp {
                         v,
                     );
                     self.arr_drag = Some(ArrDrag::Gain { lane, from_y: p.y, from: v });
+                }
+                // The same integrating drag the three header dials use, so a
+                // hand that has turned one has turned this.
+                ArrDrag::AutoDial { lane, param, from_y, from } => {
+                    let fine = if shift { recorder_panel::FINE_DRAG } else { 1.0 };
+                    let v = (from + f64::from(from_y - p.y) / 420.0 * f64::from(fine))
+                        .clamp(0.0, 1.0);
+                    self.auto_set_control(lane, param, v);
+                    self.arr_drag = Some(ArrDrag::AutoDial {
+                        lane,
+                        param,
+                        from_y: p.y,
+                        from: v,
+                    });
                 }
                 ArrDrag::HdrPan { lane, from_y, from } => {
                     let fine = if shift { recorder_panel::FINE_DRAG } else { 1.0 };
@@ -14185,6 +14264,8 @@ impl IvoryApp {
                             param,
                             label: self.auto_param_label(n, param),
                             resting: self.auto_resting(n, param),
+                            armed: self.arr_auto_armed.contains(&(n, param)),
+                            bypassed: self.arr_auto_bypassed.contains(&(n, param)),
                             points: self
                                 .arrangement
                                 .automation
@@ -14475,6 +14556,82 @@ impl IvoryApp {
                 .and_then(|fx| fx.params.iter().find(|p| p.id == id))
                 .map_or(0.5, |p| p.default_normalised.clamp(0.0, 1.0)),
         }
+    }
+
+    /// **Set the control an automation lane names**, normalised.
+    ///
+    /// The exact inverse of [`Self::auto_resting`], and it goes through
+    /// `apply_mixer_hit` for the desk's four rather than writing the settings
+    /// directly — that function is the one crossing to the engine, and a
+    /// second road to a fader is how the desk and the arrangement come to
+    /// disagree about where it is standing.
+    fn auto_set_control(&mut self, lane: usize, param: crate::automation::AutoParam, v: f64) {
+        use crate::automation::AutoParam;
+        use crate::mixer_panel::Hit as M;
+        use crate::recorder::Column;
+        let v = v.clamp(0.0, 1.0);
+        let col = Column(lane);
+        match param {
+            AutoParam::Gain => self.apply_mixer_hit(M::Fader(col), v as f32),
+            AutoParam::Pan => self.apply_mixer_hit(M::Pan(col), v as f32),
+            AutoParam::Send => self.apply_mixer_hit(M::Send(col), v as f32),
+            // A switch written as a curve: above half is muted. Only acted on
+            // when it would CHANGE, because `Mute` is a toggle and re-sending
+            // it every frame of a drag would chatter.
+            AutoParam::Mute => {
+                let want = v >= 0.5;
+                let now = self.settings.strip_muted & (1 << lane) != 0;
+                if want != now {
+                    self.apply_mixer_hit(M::Mute(col), 0.0);
+                }
+            }
+            // **A plugin's own parameter has no dial here to turn.**
+            //
+            // The desk's four are settings this app owns; a plugin's live
+            // inside the plugin, and the only way to move one is its own
+            // editor. So the dial on that row READS — it shows where the
+            // parameter is standing — and the curve is drawn rather than
+            // performed. Writing it from here would mean pushing a value the
+            // plugin has not agreed to, which is how a host and a plugin end
+            // up disagreeing about their own state.
+            AutoParam::Plugin { .. } => return,
+        }
+        self.auto_write_if_armed(lane, param, v);
+    }
+
+    /// **Writing: a move on an armed lane lays a point down.**
+    ///
+    /// Only while the transport is ROLLING, and only on a lane that has been
+    /// armed. Both halves matter: a fader nudged while stopped is somebody
+    /// setting a level, and a fader nudged on an unarmed lane is somebody
+    /// mixing. Writing either would turn ordinary use into automation nobody
+    /// asked for, which is the failure every desk with a global write mode
+    /// has.
+    ///
+    /// The point lands at the playhead, so the curve records when the hand
+    /// moved rather than where the mouse was.
+    fn auto_write_if_armed(
+        &mut self,
+        lane: usize,
+        param: crate::automation::AutoParam,
+        v: f64,
+    ) {
+        if !self.recorder.playing || !self.arr_auto_armed.contains(&(lane, param)) {
+            return;
+        }
+        // NOT snapped: a written point records when the hand actually moved.
+        // Snapping it to the grid would be a lie about the performance, and
+        // the drawn points that DO snap are a different gesture.
+        let at_s = self.playhead_s();
+        let shape = if param == crate::automation::AutoParam::Mute {
+            crate::automation::Shape::Hold
+        } else {
+            crate::automation::Shape::Linear
+        };
+        self.arrangement.automation.entry(lane, param).put(
+            crate::automation::Point { at_s, value: v.clamp(0.0, 1.0), shape },
+        );
+        self.arr_save_edits();
     }
 
     /// **What to call an automated parameter on this lane.**
@@ -15622,6 +15779,10 @@ impl IvoryApp {
                 self.open_insert_face(n, bay);
             }
             A::AutoParamPick(n, _) => self.arr_open_automation_menu(n),
+            A::AutoClose(n, slot) => self.arr_close_auto_row(n, slot),
+            A::AutoArm(n, slot) => self.arr_toggle_auto_arm(n, slot),
+            A::AutoBypass(n, slot) => self.arr_toggle_auto_bypass(n, slot),
+            A::AutoDial(..) => {}
             A::TempoHeader => self.arr_ask_flatten_tempo(),
             A::ToolMetronome => {
                 self.settings.metronome_on = !self.settings.metronome_on;
@@ -16091,6 +16252,31 @@ impl IvoryApp {
     /// Every automation curve in the open song.
     pub fn automation(&self) -> &crate::automation::Automation {
         &self.arrangement.automation
+    }
+
+    /// **The automation the ENGINE should play**, which is not all of it.
+    ///
+    /// A bypassed lane is kept, drawn and editable and simply not applied —
+    /// that is the whole point of a bypass, and it is the switch that answers
+    /// "what is this automation actually doing", a question you ask by taking
+    /// it out and putting it back. So the filtering happens HERE, at the one
+    /// crossing into the engine, rather than on the audio thread: the audio
+    /// thread should never be asking the UI what a switch is set to.
+    ///
+    /// Owned rather than borrowed because it is a different set from the
+    /// document's. The host already clones this to compare against what it
+    /// last pushed, so nothing is copied that was not copied before.
+    pub fn engine_automation(&self) -> crate::automation::Automation {
+        if self.arr_auto_bypassed.is_empty() {
+            return self.arrangement.automation.clone();
+        }
+        let mut out = crate::automation::Automation::default();
+        for c in self.arrangement.automation.curves() {
+            if !self.arr_auto_bypassed.contains(&(c.lane, c.param)) {
+                out.set(c.clone());
+            }
+        }
+        out
     }
 
     /// The tempo map the ENGINE should play against.
@@ -26226,6 +26412,103 @@ mod tests {
     /// **Several rows at once, and the boxes are independent.**
     ///
     /// This used to be one row per lane whose parameter you CYCLED — press to
+    /// **Writing needs BOTH arm and roll**, and neither alone.
+    ///
+    /// This is the rule that decides whether ordinary mixing quietly becomes
+    /// automation. A fader nudged while stopped is somebody setting a level;
+    /// a fader nudged on an unarmed lane is somebody mixing. Writing either
+    /// is the failure every desk with a global write mode has, and it is
+    /// discovered later, in a take that moves on its own.
+    #[test]
+    fn automation_is_written_only_when_armed_and_rolling() {
+        use crate::automation::AutoParam;
+        let points = |a: &IvoryApp| {
+            a.arrangement
+                .automation
+                .get(0, AutoParam::Gain)
+                .map_or(0, |c| c.points().len())
+        };
+
+        let (_, mut app) = headless(Caps::DESKTOP);
+        app.recorder.position_s = 8.0;
+
+        // Neither: mixing on a stopped transport writes nothing.
+        app.recorder.playing = false;
+        app.auto_set_control(0, AutoParam::Gain, 0.7);
+        assert_eq!(points(&app), 0, "a stopped, unarmed move was written");
+
+        // Rolling but NOT armed — the ordinary case, and the one that must
+        // stay silent.
+        app.recorder.playing = true;
+        app.auto_set_control(0, AutoParam::Gain, 0.6);
+        assert_eq!(points(&app), 0, "mixing during playback became automation");
+
+        // Armed but NOT rolling: setting a level before you start.
+        app.recorder.playing = false;
+        app.arr_auto_armed.insert((0, AutoParam::Gain));
+        app.auto_set_control(0, AutoParam::Gain, 0.5);
+        assert_eq!(points(&app), 0, "an armed lane wrote while stopped");
+
+        // Both. Now it writes, at the PLAYHEAD rather than wherever the
+        // pointer was — plus the node at zero every curve carries.
+        app.recorder.playing = true;
+        app.auto_set_control(0, AutoParam::Gain, 0.4);
+        assert_eq!(points(&app), 2, "an armed, rolling move wrote nothing");
+        let c = app.arrangement.automation.get(0, AutoParam::Gain).expect("a curve");
+        assert!(
+            c.points().iter().any(|p| (p.at_s - 8.0).abs() < 1e-9),
+            "the point did not land at the playhead: {:?}",
+            c.points()
+        );
+        assert_eq!(c.value_at(8.0), Some(0.4), "the written value is not the one set");
+    }
+
+    /// **A bypassed lane is kept and not played.**
+    ///
+    /// That is the whole distinction between bypass and the other two
+    /// switches beside it: × stops SHOWING a lane, bypass stops APPLYING one,
+    /// and neither loses the curve. A bypass that deleted the work would make
+    /// "what is this automation doing" a question you can only ask once.
+    ///
+    /// Filtered at the one crossing into the engine rather than on the audio
+    /// thread — the audio thread must never be asking the UI what a switch is
+    /// set to.
+    #[test]
+    fn a_bypassed_lane_keeps_its_curve_and_stops_reaching_the_engine() {
+        use crate::automation::{AutoParam, Point, Shape};
+        let (_, mut app) = headless(Caps::DESKTOP);
+        let pt = |at_s: f64, value: f64| Point { at_s, value, shape: Shape::Linear };
+        app.arrangement.automation.entry(0, AutoParam::Gain).put(pt(4.0, 0.8));
+        app.arrangement.automation.entry(1, AutoParam::Pan).put(pt(4.0, 0.2));
+        assert_eq!(app.engine_automation().curves().len(), 2, "both should play");
+
+        // Bypass the first. The document keeps it; the engine does not get it.
+        app.arr_auto_bypassed.insert((0, AutoParam::Gain));
+        let engine = app.engine_automation();
+        assert_eq!(engine.curves().len(), 1, "the bypassed curve still reached the engine");
+        assert!(
+            engine.value_at(0, AutoParam::Gain, 4.0).is_none(),
+            "a bypassed lane is still being applied"
+        );
+        assert!(
+            engine.value_at(1, AutoParam::Pan, 4.0).is_some(),
+            "bypassing one lane silenced another"
+        );
+        assert_eq!(
+            app.automation().curves().len(),
+            2,
+            "bypass destroyed the curve instead of parking it"
+        );
+
+        // And it comes back, unchanged.
+        app.arr_auto_bypassed.remove(&(0, AutoParam::Gain));
+        assert_eq!(
+            app.engine_automation().value_at(0, AutoParam::Gain, 4.0),
+            Some(0.8),
+            "the curve did not come back as it was"
+        );
+    }
+
     /// step from volume to pan to send to mute and round. Mixing a track
     /// means watching its volume and its send together, so the cycle is gone
     /// and each parameter is its own tick.
