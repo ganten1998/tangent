@@ -9915,7 +9915,7 @@ impl IvoryApp {
             return;
         };
         let id = st.id;
-        let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
+        let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == id) else {
             return;
         };
         let Some(&(_, was)) = orig.iter().find(|(j, _)| *j == i) else {
@@ -9928,17 +9928,38 @@ impl IvoryApp {
         if delta.abs() < 1.0e-9 {
             return;
         }
+        // **Every end goes back on the GRID, not just the grabbed one.**
+        //
+        // The delta is what carries the shape of the selection; the snap is
+        // what makes it land somewhere you can name. Applying the delta
+        // alone put the grabbed note on a bar line and left the rest of the
+        // selection wherever their own lengths happened to fall — so the one
+        // note under the hand read short against its neighbours and there
+        // was no hand position that squared them up. The owner's "hard to
+        // actually get it to the next bar exactly".
+        //
+        // Computed here, before the document is borrowed mutably, because
+        // `me_snap` reads the clip to know where the grid is. With snapping
+        // OFF it is the identity and this is a plain delta again.
         let span = clip.start_s + clip.len_s;
         let (c0, offset) = (clip.start_s, clip.offset_s);
-        for &(j, d0) in orig {
-            if j == i {
-                continue;
+        let ends: Vec<(usize, f64)> = orig
+            .iter()
+            .filter(|(j, _)| *j != i)
+            .filter_map(|&(j, d0)| {
+                let n = clip.notes.get(j)?;
+                let start = c0 + (n.at_s - offset);
+                let end = self.me_snap(start + d0 + delta);
+                Some((j, (end - start).clamp(0.02, (span - start).max(0.02))))
+            })
+            .collect();
+        let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
+            return;
+        };
+        for (j, dur) in ends {
+            if let Some(n) = clip.notes.get_mut(j) {
+                n.dur_s = dur;
             }
-            let Some(n) = clip.notes.get_mut(j) else {
-                continue;
-            };
-            let abs0 = c0 + (n.at_s - offset);
-            n.dur_s = (d0 + delta).clamp(0.02, (span - abs0).max(0.02));
         }
     }
 
@@ -10045,7 +10066,7 @@ impl IvoryApp {
             return;
         };
         let id = st.id;
-        let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
+        let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == id) else {
             return;
         };
         let Some(&(_, was, _)) = orig.iter().find(|(j, _, _)| *j == i) else {
@@ -10059,19 +10080,30 @@ impl IvoryApp {
             return;
         }
         let (c0, offset) = (clip.start_s, clip.offset_s);
-        for &(j, a0, d0) in orig {
-            if j == i {
-                continue;
+        // Snapped, for the tail's own reason — see `me_resize_note`.
+        let heads: Vec<(usize, f64, f64)> = orig
+            .iter()
+            .filter(|(j, _, _)| *j != i)
+            .map(|&(j, a0, d0)| {
+                // The END stands still — that is what dragging a head means
+                // — so the floor on the duration is also the ceiling on the
+                // start.
+                let was_abs = c0 + (a0 - offset);
+                let end_abs = was_abs + d0;
+                let start_abs = self
+                    .me_snap(was_abs + delta)
+                    .clamp(c0, (end_abs - 0.02).max(c0));
+                (j, a0 + (start_abs - was_abs), end_abs - start_abs)
+            })
+            .collect();
+        let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
+            return;
+        };
+        for (j, at, dur) in heads {
+            if let Some(n) = clip.notes.get_mut(j) {
+                n.at_s = at;
+                n.dur_s = dur;
             }
-            let Some(n) = clip.notes.get_mut(j) else {
-                continue;
-            };
-            // The END stands still — that is what dragging a head means — so
-            // the floor on the duration is also the ceiling on the start.
-            let end_abs = c0 + (a0 - offset) + d0;
-            let start_abs = (c0 + (a0 - offset) + delta).clamp(c0, end_abs - 0.02);
-            n.at_s = a0 + (start_abs - (c0 + (a0 - offset)));
-            n.dur_s = end_abs - start_abs;
         }
     }
 
@@ -13339,6 +13371,27 @@ impl IvoryApp {
                     self.save_settings();
                     return;
                 }
+                // **A right-press on the METRONOME opens its panel** — the
+                // tempo, the signature, how often it clicks and what it
+                // clicks with.
+                //
+                // It has to be HERE, beside the gridbox, because this branch
+                // owns the secondary press and returns: the answer used to
+                // sit in the PRIMARY press arm asking `secondary_down()`,
+                // which is a state no right-click alone ever reaches. It fell
+                // through to the app menu instead, which is what shows up.
+                let on_metronome = {
+                    let clips = self.arr_clip_views();
+                    let view = self.arrange_view(&clips);
+                    matches!(
+                        crate::arrangement_panel::hit_test(rect, &view, p),
+                        Some(crate::arrangement_panel::Hit::ToolMetronome)
+                    )
+                };
+                if on_metronome {
+                    self.open_metronome_dialog();
+                    return;
+                }
                 // A LOADED bay answers with its own menu — Delete FX or
                 // Replace FX, the mixer's offer — before the header's
                 // track menu can claim the press. An empty bay stays the
@@ -13902,18 +13955,13 @@ impl IvoryApp {
                     // The toolbar. The click's switch is the settings' own;
                     // the magnet and the grid live beside it.
                     Some(A::ToolMetronome) => {
-                        // **Left switches it on; RIGHT changes how often it
-                        // clicks.** A second control beside it would be a
-                        // second thing to find on a toolbar the width of a
-                        // thumb, and the two questions are about the same
-                        // object: whether there is a click, and what it is
-                        // counting.
-                        if ctx.input(|i| i.pointer.secondary_down()) {
-                            self.open_metronome_dialog();
-                        } else {
-                            self.settings.metronome_on = !self.settings.metronome_on;
-                            self.save_settings();
-                        }
+                        // **Left switches it on; RIGHT opens its panel** —
+                        // and the right press is handled where the secondary
+                        // button actually arrives, at the top of this
+                        // function. A `secondary_down()` test in here is
+                        // unreachable: this arm only runs on a PRIMARY press.
+                        self.settings.metronome_on = !self.settings.metronome_on;
+                        self.save_settings();
                     }
                     Some(A::ToolSnap) => {
                         self.settings.arr_snap = !self.settings.arr_snap;
@@ -24027,6 +24075,18 @@ mod tests {
         assert!((n[1].dur_s - 0.75).abs() < 1e-9, "second: {}", n[1].dur_s);
         assert!((n[2].dur_s - 1.5).abs() < 1e-9, "third: {}", n[2].dur_s);
         // A SCALE would have made these 0.5 and 2.0. The shape is kept.
+        // And every END is on the grid, not only the grabbed note's: the
+        // delta carries the shape, the snap makes it land somewhere you can
+        // name. Without it the grabbed note read short against the rest and
+        // no hand position squared them up.
+        let step = 0.125;
+        for (k, note) in n.iter().enumerate() {
+            let end = note.at_s + note.dur_s;
+            assert!(
+                (end / step - (end / step).round()).abs() < 1e-6,
+                "note {k} ends off the grid at {end}"
+            );
+        }
 
         // And the heads: drag note 0's head from 1.0 back to 0.75, and every
         // selected note's start moves a quarter-second earlier with its END

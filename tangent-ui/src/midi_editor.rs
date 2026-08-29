@@ -31,8 +31,22 @@ pub const SWING_PRESETS: [(&str, &str, f64); 6] = [
     ("Triplet (Shuffle)", "2:1", 66.7),
     ("Dotted (Hard)", "3:1", 75.0),
 ];
-/// The right-edge grab zone of a note, in points.
-const EDGE_W: f32 = 6.0;
+/// A note's edge grab zone, in points, measured INSIDE the note.
+const EDGE_W: f32 = 7.0;
+
+/// **And how far OUTSIDE a note its edge still answers.**
+///
+/// The inside zone alone meant aiming at a band a few points wide that began
+/// under the note's own border, so the hand had to travel INTO the note to
+/// find a handle that looks like it lives on the boundary — the owner's "you
+/// go too far into the note into a special twilight zone". The allowance puts
+/// the target where the eye says it is, straddling the edge.
+///
+/// It is what gives a NARROW note edges at all: those keep their whole face
+/// as a body, so a chord of short notes still MOVES when it is grabbed
+/// (`only the top note moved` is the bug the inside gate answers), and the
+/// resize is reached from just outside instead.
+const EDGE_SLOP: f32 = 4.0;
 
 /// Everything the editor draws, pushed in. Times are ABSOLUTE timeline
 /// seconds — the clip's own trim (`offset_s`) is paid at the boundary, so
@@ -1055,6 +1069,10 @@ pub fn hit_test(rect: Rect, view: &MidiEditView<'_>, pos: Pos2) -> Option<Hit> {
     if !l.roll.is_positive() || !l.roll.contains(pos) {
         return None;
     }
+    // **The note actually UNDER the hand comes first.** Only when nothing is
+    // does the allowance below reach for a neighbour's edge — otherwise two
+    // notes drawn back to back would fight over the boundary between them and
+    // the answer would depend on document order.
     for (i, n) in view.notes.iter().enumerate().rev() {
         let r = note_rect(&l, view, n);
         if !r.is_positive() || !r.contains(pos) {
@@ -1063,6 +1081,8 @@ pub fn hit_test(rect: Rect, view: &MidiEditView<'_>, pos: Pos2) -> Option<Hit> {
         // Edges only claim a hand when the BODY keeps a real share: on a
         // narrow note the whole face is the body, or a chord's grab turned
         // into a one-note resize — the owner's "only the top note moved".
+        // Narrow notes are not left without a resize, though; their edges
+        // are reached from just OUTSIDE, in the pass below.
         let edge = if r.width() >= 14.0 {
             EDGE_W.min(r.width() * 0.3)
         } else {
@@ -1077,6 +1097,24 @@ pub fn hit_test(rect: Rect, view: &MidiEditView<'_>, pos: Pos2) -> Option<Hit> {
             }
         }
         return Some(Hit::NoteBody(i));
+    }
+    // **The allowance**: a hand just past a note's border is reaching for
+    // that border. See `EDGE_SLOP`. Nothing here can shadow a note, because
+    // the pass above already answered for every point inside one.
+    for (i, n) in view.notes.iter().enumerate().rev() {
+        let r = note_rect(&l, view, n);
+        if !r.is_positive() {
+            continue;
+        }
+        if pos.y < r.top() || pos.y > r.bottom() {
+            continue;
+        }
+        if pos.x > r.right() && pos.x <= r.right() + EDGE_SLOP {
+            return Some(Hit::NoteRight(i));
+        }
+        if pos.x < r.left() && pos.x >= r.left() - EDGE_SLOP {
+            return Some(Hit::NoteLeft(i));
+        }
     }
     let key = key_at(&l, view, pos.y).ceil();
     if !(0.0..=127.0).contains(&key) {
@@ -1447,6 +1485,66 @@ mod tests {
         }
         // Outside the panel: nobody's.
         assert_eq!(hit_test(rect(), &v, Pos2::new(2.0, 2.0)), None);
+    }
+
+    /// **A note's edge answers from just OUTSIDE it too**, and a note too
+    /// narrow to spare a body gets its edges that way and no other.
+    ///
+    /// The owner: "the drag to resize in normal midi input mode requires you
+    /// to go too far into the note into a special twilight zone -- it needs
+    /// to be the EDGE of every note's left and right side -- and have some
+    /// allowance."
+    #[test]
+    fn a_notes_edge_answers_from_just_outside_it() {
+        let notes = [ArrNote {
+            at_s: 2.0,
+            dur_s: 1.0,
+            key: 60,
+            vel: 96,
+        }];
+        let v = view(&notes);
+        let l = Layout::new(rect());
+        let r = note_rect(&l, &v, &notes[0]);
+        let y = r.center().y;
+        assert_eq!(
+            hit_test(rect(), &v, Pos2::new(r.right() + 2.0, y)),
+            Some(Hit::NoteRight(0)),
+            "just past the tail is still the tail"
+        );
+        assert_eq!(
+            hit_test(rect(), &v, Pos2::new(r.left() - 2.0, y)),
+            Some(Hit::NoteLeft(0)),
+            "just before the head is still the head"
+        );
+        // And no further: past the allowance it is empty roll again, or the
+        // whole editor would be one enormous handle.
+        assert!(matches!(
+            hit_test(rect(), &v, Pos2::new(r.right() + super::EDGE_SLOP + 3.0, y)),
+            Some(Hit::Cell(..))
+        ));
+
+        // **A NARROW note keeps its whole face as a body** — a chord of short
+        // notes must still MOVE when it is grabbed — and its edges live
+        // entirely in the allowance.
+        let short = [ArrNote {
+            at_s: 2.0,
+            dur_s: 0.02,
+            key: 60,
+            vel: 96,
+        }];
+        let v = view(&short);
+        let r = note_rect(&l, &v, &short[0]);
+        assert!(r.width() < 14.0, "this note is not narrow: {}", r.width());
+        assert_eq!(
+            hit_test(rect(), &v, Pos2::new(r.center().x, y)),
+            Some(Hit::NoteBody(0)),
+            "a narrow note lost its body"
+        );
+        assert_eq!(
+            hit_test(rect(), &v, Pos2::new(r.right() + 2.0, y)),
+            Some(Hit::NoteRight(0)),
+            "a narrow note has no reachable tail at all"
+        );
     }
 
     /// Degenerate rects neither panic nor answer presses.
