@@ -2665,6 +2665,13 @@ struct Renderer {
     /// the room cannot be derived from its output for the file. It runs only
     /// when the two actually differ — see `room_live` — so a rig with no input
     /// pays nothing at all for it.
+    ///
+    /// **And its limiter does not look ahead** — [`crate::effects::Effects::new_live`].
+    /// That is the whole difference between the two instances and the reason
+    /// this one exists at all now: the master's true-peak ceiling holds the
+    /// audio 58 frames (1.2 ms at 48 kHz) while it looks between the samples,
+    /// which is what a delivered file wants and is dead weight on the ears of
+    /// somebody playing into the machine.
     room_effects: crate::effects::Effects,
     /// The room's mix, interleaved like `mix`, valid only while `room_live`.
     room: Vec<f32>,
@@ -2676,7 +2683,10 @@ struct Renderer {
     /// mixes is exactly this. One buffer, filled by the pass that made the
     /// samples in the first place.
     input_dry: Vec<f32>,
-    /// Whether the room and the take differ this block.
+    /// Whether the room and the take differ this block — in CONTENT, because
+    /// monitoring is withholding an input, or in TREATMENT, because a live
+    /// input is being played through and the speakers take the chain that does
+    /// not look ahead. See `mix_monitor`.
     room_live: bool,
     /// How much of the input the room is hearing, slewed 0..1 by
     /// `Shared::monitor_on`.
@@ -4489,6 +4499,19 @@ impl Renderer {
         let room_from = self.room_gain;
         let mut room_to = room_from;
         let mut withheld = 0.0f32;
+        // **Whether anybody is PLAYING through this desk right now.**
+        //
+        // The room used to split from the take only when the two differed in
+        // CONTENT — when monitoring was withholding an input. But they also
+        // differ in what they can afford: the file wants the true-peak ceiling
+        // and the millisecond of lookahead it costs, and a player listening to
+        // their own hands wants neither. So a live input opens the split on its
+        // own, and the room's chain — which carries a limiter that does not
+        // look ahead (`Effects::new_live`) — is what reaches the speakers.
+        //
+        // A rig with nothing armed still pays nothing: no input heard, no
+        // split, one master chain, exactly as before.
+        let mut live_in_room = false;
         // **Every input of the interface, at its own offset in the block.**
         // `Picks` laid them end to end when the stream was opened — a mono
         // input then a stereo pair is one channel then two — and this is the
@@ -4553,6 +4576,7 @@ impl Renderer {
             let live =
                 self.shared.armed.load(Ordering::Relaxed) & (1 << strip.index().min(31)) != 0;
             let heard = live && strip_is_heard(strip, muted, soloed);
+            live_in_room |= heard;
             let target = if heard {
                 lane_gain_of(&self.auto, &self.shared, strip.index())
             } else {
@@ -4669,7 +4693,11 @@ impl Renderer {
         // A hundredth of a decibel of an input still withheld is still two
         // mixes. The threshold is what stops a fully-monitored rig from
         // running a second limiter forever over a rounding error.
-        self.room_live = withheld > 1.0e-4;
+        //
+        // ...and a live input splits them whatever the levels say, so that the
+        // player hears the room's undelayed chain rather than the file's. See
+        // `live_in_room`.
+        self.room_live = withheld > 1.0e-4 || live_in_room;
     }
 
     /// The whole transport: where this chunk starts, and whether it moves.
@@ -6601,7 +6629,7 @@ impl Engine {
             channel_gain: [1.0; CHANNELS],
             effects: crate::effects::Effects::new_send(rate as f32),
             master_effects: crate::effects::Effects::new(rate as f32),
-            room_effects: crate::effects::Effects::new(rate as f32),
+            room_effects: crate::effects::Effects::new_live(rate as f32),
             room: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             input_dry: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             room_live: false,
@@ -10266,7 +10294,7 @@ mod tests {
             fx_in: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             fx_out: vec![vec![0.0; MAX_BLOCK as usize]; TAP_CHANNELS],
             master_effects: crate::effects::Effects::new(RATE as f32),
-            room_effects: crate::effects::Effects::new(RATE as f32),
+            room_effects: crate::effects::Effects::new_live(RATE as f32),
             room: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             input_dry: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             room_live: false,
@@ -11388,6 +11416,113 @@ mod tests {
         assert!(
             routed.abs() < plain.abs() * 1.5,
             "the channel is still being heard twice: {routed} against {plain}"
+        );
+    }
+
+    /// **The speakers must not pay the master limiter's lookahead.**
+    ///
+    /// The limiter ships IN CIRCUIT (`LIMITER_SHIPS_AT`, -1 dBFS) so that a
+    /// tape echo at self-oscillation cannot reach full scale. A true-peak
+    /// limiter earns its ceiling by holding the audio while it looks between
+    /// the samples — `look + TP_CENTRE`, 58 frames, 1.2 ms at 48 kHz — and
+    /// that delay lands on everything leaving the desk, the live monitor
+    /// included. It is the right price for the FILE and the wrong one for
+    /// somebody playing into the machine: at the buffer sizes this app opens,
+    /// 58 frames is a third of the whole round trip, and it arrives as slap
+    /// between a player's hands and their ears.
+    ///
+    /// The room's chain carries a limiter that does not look ahead, so the two
+    /// assertions here are the whole contract: the monitor is immediate
+    /// whether the limiter is in or out, AND the ceiling still holds on the
+    /// room. A "fix" that simply bypassed the limiter for the speakers would
+    /// pass the first and fail the second.
+    ///
+    /// Written after the owner reported monitoring that had been beating
+    /// REAPER by a good margin and was suddenly on par with it; `edb1f78`
+    /// moved `limiter_mix`'s default from 1.0 (bypass) to `LIMITER_SHIPS_AT`
+    /// and nothing else about the audio path changed.
+    #[test]
+    fn the_speakers_do_not_pay_the_master_limiters_lookahead() {
+        const BLOCK: usize = 128;
+        // Frames between an input sample being pushed and it leaving the
+        // desk, plus the loudest thing the speakers were given.
+        let run = |limiter: f32, level: f32| -> (i64, f32) {
+            let shared = Arc::new(Shared::new());
+            let (tap_tx, _tap_rx) = RingBuffer::<f32>::new(1 << 16);
+            let mut r = test_renderer(Arc::clone(&shared), tap_tx, 2);
+            let (mut in_tx, in_rx) = RingBuffer::<f32>::new(1 << 15);
+            r.monitor = Some(in_rx);
+            r.monitor_channels = 1;
+            r.monitor_widths = [1, 0, 0, 0];
+            r.monitor_block = BLOCK;
+            r.monitor_scratch = vec![0.0; 8192];
+            shared.pick_strip[0].store(1, Ordering::Relaxed);
+            shared.midi_off.store(1 << 1, Ordering::Relaxed);
+            shared.channel_gains[1].store(1.0f32.to_bits(), Ordering::Relaxed);
+            r.channel_gain[1] = 1.0;
+            shared.monitor_on.store(true, Ordering::Relaxed);
+            shared.limiter_mix.store(limiter.to_bits(), Ordering::Relaxed);
+            r.room_gain = 1.0;
+
+            let mut out = vec![0.0f32; BLOCK * 2];
+            // Silence until every slew has arrived and the ring has settled,
+            // so what follows measures the path and not the fade-in.
+            for _ in 0..60 {
+                for _ in 0..BLOCK {
+                    let _ = in_tx.push(0.0);
+                }
+                out.fill(0.0);
+                r.render(&mut out, 0, 0);
+            }
+            // One sample, at the head of the block the next callback will
+            // take: zero added latency means it leaves in that same callback.
+            for i in 0..BLOCK {
+                let _ = in_tx.push(if i == 0 { level } else { 0.0 });
+            }
+            let mut at: i64 = -1;
+            let mut peak = 0.0f32;
+            'outer: for b in 0..64 {
+                out.fill(0.0);
+                r.render(&mut out, 0, 0);
+                for f in 0..BLOCK {
+                    let v = out[f * 2].abs().max(out[f * 2 + 1].abs());
+                    peak = peak.max(v);
+                    if v > 1.0e-4 && at < 0 {
+                        at = (b * BLOCK + f) as i64;
+                        break 'outer;
+                    }
+                }
+                for _ in 0..BLOCK {
+                    let _ = in_tx.push(0.0);
+                }
+            }
+            (at, peak)
+        };
+
+        // Out of circuit, which is what it was before `edb1f78`.
+        let (bypassed, _) = run(1.0, 0.5);
+        assert_eq!(bypassed, 0, "the monitor was late with the limiter bypassed");
+
+        // In circuit, as it ships. This is the regression: it measured 58.
+        let ships_at = tangent_ui::recorder::LIMITER_SHIPS_AT;
+        let (shipped, _) = run(ships_at, 0.5);
+        assert_eq!(
+            shipped, 0,
+            "the live monitor is paying the master limiter's lookahead: {shipped} frames"
+        );
+
+        // ...and the ceiling is still a ceiling. A full-scale sample must come
+        // out at the -1 dBFS the dial is set to, or this stopped being a
+        // limiter and became a bypass with extra steps.
+        let (_, loud) = run(ships_at, 1.0);
+        let ceiling = 10f32.powf(crate::effects::Sends::threshold_db(ships_at) / 20.0);
+        assert!(
+            loud > 1.0e-4,
+            "the room heard nothing at all: {loud}"
+        );
+        assert!(
+            loud <= ceiling * 1.02,
+            "the room's limiter let {loud} past a ceiling of {ceiling}"
         );
     }
 

@@ -2641,6 +2641,38 @@ impl Limiter {
         }
     }
 
+    /// The same ceiling for a path somebody is PLAYING THROUGH: no lookahead,
+    /// and therefore no delay at all.
+    ///
+    /// **A limiter that looks ahead has to hold the audio while it looks**, and
+    /// on the master that is `look + TP_CENTRE` — 58 frames, 1.2 ms at 48 kHz —
+    /// paid by everything on the way out, the live monitor included. That is
+    /// the right trade for the FILE, where an inter-sample overshoot is a real
+    /// defect a streaming encoder will find, and the wrong one for the SPEAKERS,
+    /// where it is a millisecond of slap between a player's hands and their
+    /// ears and the overshoot is inaudible.
+    ///
+    /// So the room gets this one: sample peak, instant attack, the same knee
+    /// and the same release. It still catches a runaway — which is the whole
+    /// reason the limiter ships in circuit (see `LIMITER_SHIPS_AT`) — it simply
+    /// does not see between the samples to do it, and does not delay to look.
+    /// The take and the export keep [`Limiter::new`] and its true-peak ceiling.
+    ///
+    /// It is also markedly CHEAPER: `true_peak` is seven phases of a 21-tap
+    /// sinc on two channels, ~294 multiply-adds a frame, and this pays none of
+    /// them.
+    fn new_live(sample_rate: f32) -> Self {
+        let mut me = Self::new(sample_rate);
+        // `look == 0` is what `process` branches on. The two ring buffers
+        // shrink to one slot each: nothing is ever held, so there is nothing
+        // for them to hold, and a zero-length `Vec` would make the modulo a
+        // division by zero rather than a no-op.
+        me.look = 0;
+        me.delay = vec![[0.0; 2]; 1];
+        me.env = vec![1.0; 1];
+        me
+    }
+
     /// The loudest point on the reconstructed curve around the centre tap.
     #[inline]
     fn true_peak(&self) -> f32 {
@@ -2681,6 +2713,13 @@ impl Limiter {
     /// limited.
     #[inline]
     fn process(&mut self, x: [f32; 2], threshold: f32, knee_db: f32, release: f32) -> [f32; 2] {
+        // The room's limiter, which holds nothing back. See `new_live`.
+        // First, because everything below this line assumes there is a
+        // lookahead to plan across — `t = k / self.look` alone would be a NaN
+        // at zero, and a NaN gain is silence for the rest of the session.
+        if self.look == 0 {
+            return self.live(x, threshold, knee_db, release);
+        }
         for (hist, &sample) in self.hist.iter_mut().zip(&x) {
             hist.rotate_right(1);
             hist[0] = sample;
@@ -2723,6 +2762,28 @@ impl Limiter {
         self.env[self.at] = 1.0;
         self.at = (self.at + 1) % n;
         [out[0] * self.gain, out[1] * self.gain]
+    }
+
+    /// One frame through the no-lookahead ceiling.
+    ///
+    /// **Instant attack is what buys the zero delay**, and it is also what
+    /// makes the ceiling hold without one: the gain a sample needs is applied
+    /// to that same sample, so `|out| <= threshold` above the knee by
+    /// construction. The release is the dial's, unchanged, so it recovers at
+    /// the same speed the master does and the two do not sound like different
+    /// limiters when the mix is nowhere near the ceiling — which is almost
+    /// always, because this one ships at -1 dBFS as a backstop.
+    #[inline]
+    fn live(&mut self, x: [f32; 2], threshold: f32, knee_db: f32, release: f32) -> [f32; 2] {
+        let want = Self::wanted(x[0].abs().max(x[1].abs()), threshold, knee_db);
+        if want < self.gain {
+            self.gain = want;
+        } else {
+            let ms = RELEASE_MS.0 + (RELEASE_MS.1 - RELEASE_MS.0) * release.clamp(0.0, 1.0);
+            let coeff = (-1.0 / (ms * 0.001 * self.sample_rate)).exp();
+            self.gain = want + (self.gain - want) * coeff;
+        }
+        [x[0] * self.gain, x[1] * self.gain]
     }
 
     fn clear(&mut self) {
@@ -2856,6 +2917,17 @@ impl Effects {
     /// [`wet_only`]: Effects::wet_only
     pub fn new_send(sample_rate: f32) -> Self {
         Self::build(sample_rate, true)
+    }
+
+    /// An `Effects` for the SPEAKERS: identical, except that its limiter adds
+    /// no delay. See [`Limiter::new_live`].
+    ///
+    /// The room's copy of the master chain, so that monitoring a live input
+    /// costs the player nothing while the take keeps its true-peak ceiling.
+    pub fn new_live(sample_rate: f32) -> Self {
+        let mut me = Self::build(sample_rate, false);
+        me.limiter = Limiter::new_live(me.sample_rate);
+        me
     }
 
     fn build(sample_rate: f32, wet_only: bool) -> Self {
