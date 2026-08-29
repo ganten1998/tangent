@@ -497,6 +497,13 @@ pub enum ChannelKind {
 /// It is one mask rather than a gate per rule because the mask's EDGE is what
 /// releases the notes a silenced lane was holding. A second gate would have no
 /// edge of its own and would strand them sounding.
+///
+/// **Only the CHANNEL bits are ever set.** The engine's `Strip` numbering runs
+/// past the channels — drums, click, fx — and those racks read this same mask
+/// for their own bit. They have never been gated by it and must not start
+/// being: a mask built as "everything off, then open the live ones" reaches
+/// them, where the old "nothing off, then close the dead ones" did not, and
+/// the click's own effect would have gone deaf to the keyboard.
 pub fn live_midi_off(
     kinds: &[Option<ChannelKind>],
     armed: u32,
@@ -505,14 +512,16 @@ pub fn live_midi_off(
 ) -> u32 {
     // Rule 3 short-circuits, but still answers to rule 1: an editor somehow
     // open on an audio lane silences the desk rather than opening it.
+    // The channels' bits, and no others. See the note above.
+    let all = ((1u64 << CHANNELS.min(32)) - 1) as u32;
     if let Some(lane) = editor_lane {
         return if kinds.get(lane).copied().flatten() == Some(ChannelKind::Midi) {
-            !(1u32 << lane.min(31))
+            all & !(1u32 << lane.min(31))
         } else {
-            u32::MAX
+            all
         };
     }
-    let mut off = u32::MAX;
+    let mut off = all;
     for ch in 0..CHANNELS.min(32) {
         let live = kinds.get(ch).copied().flatten() == Some(ChannelKind::Midi)
             && (armed & (1 << ch) != 0 || selected == Some(ch));
@@ -2981,9 +2990,19 @@ mod tests {
         assert!(!off(1, m), "the edited lane went quiet");
         assert!(off(0, m), "the other armed instrument sounded too");
 
-        // And an editor somehow open on an audio lane silences everything
-        // rather than opening the desk up.
-        assert_eq!(live_midi_off(&kinds, 0b11, Some(0), Some(2)), u32::MAX);
+        // And an editor somehow open on an audio lane silences every
+        // CHANNEL rather than opening the desk up.
+        let all = ((1u64 << super::CHANNELS) - 1) as u32;
+        assert_eq!(live_midi_off(&kinds, 0b11, Some(0), Some(2)), all);
+
+        // **The strips past the channels are never in this mask.** Drums,
+        // click and fx read it for their own bit and have never been gated
+        // by it; a mask built as "everything off, then open the live ones"
+        // reaches them where the old one did not.
+        for (armed, sel, ed) in [(0u32, None, None), (0b11, Some(0), Some(1)), (0, Some(0), None)] {
+            let m = live_midi_off(&kinds, armed, sel, ed);
+            assert_eq!(m & !all, 0, "a strip past the channels was gated: {m:#x}");
+        }
     }
 
 

@@ -604,23 +604,79 @@ fn span_envelope(
         // anything with a DC offset on it — reports a minimum of zero and is
         // drawn as though it swung down to silence. Audio crosses zero often
         // enough that it mostly looked right, which is why it would have
-        // survived a glance.
-        let mut lo = f32::INFINITY;
-        let mut hi = f32::NEG_INFINITY;
-        for f in a..b {
-            for ch in 0..2 {
-                let v = clip.samples.get(f * 2 + ch).copied().unwrap_or(0.0);
-                if v.is_finite() {
-                    lo = lo.min(v);
-                    hi = hi.max(v);
-                }
+        // survived a glance. See `frame_range_minmax`.
+        let (lo, hi) = frame_range_minmax(clip, a, b);
+        out[i * 2] = lo;
+        out[i * 2 + 1] = hi;
+    }
+    out
+}
+
+/// The lowest and highest sample across `[a, b)` frames, both channels.
+///
+/// **MIN and MAX, not a peak, and seeded at the infinities** — see
+/// [`span_envelope`], where both of those are explained and where this used to
+/// be inline. It came out so the looped picture below could read the same
+/// numbers rather than a second opinion about them.
+#[cfg(feature = "recorder")]
+fn frame_range_minmax(clip: &tangent_record::decode::Clip, a: usize, b: usize) -> (f32, f32) {
+    let mut lo = f32::INFINITY;
+    let mut hi = f32::NEG_INFINITY;
+    for f in a..b {
+        for ch in 0..2 {
+            let v = clip.samples.get(f * 2 + ch).copied().unwrap_or(0.0);
+            if v.is_finite() {
+                lo = lo.min(v);
+                hi = hi.max(v);
             }
         }
-        // An empty or wholly non-finite bucket is a flat line, which is the
-        // only honest thing to draw for "nothing here".
-        let (lo, hi) = if lo <= hi { (lo, hi) } else { (0.0, 0.0) };
-        out[i * 2] = lo.max(-1.0);
-        out[i * 2 + 1] = hi.min(1.0);
+    }
+    // An empty or wholly non-finite bucket is a flat line, which is the only
+    // honest thing to draw for "nothing here".
+    if lo <= hi {
+        (lo.max(-1.0), hi.min(1.0))
+    } else {
+        (0.0, 0.0)
+    }
+}
+
+/// **A LOOPED clip's picture: the same pass, drawn again and again.**
+///
+/// [`span_envelope`] reads the file straight through, which is right for a
+/// clip that plays once and wrong for one that repeats — an eight-bar clip
+/// looping one bar was drawn as eight bars of the file, so the waveform said
+/// one thing and the speakers said another.
+///
+/// Each bucket's time is folded into the loop before it is looked up. A bucket
+/// that straddles a repeat's seam reads only its first side, which is under a
+/// pixel wide and is what every other bucket in this file does with a range it
+/// cannot fit.
+#[cfg(feature = "recorder")]
+fn looped_span_envelope(
+    clip: &tangent_record::decode::Clip,
+    offset_s: f64,
+    loop_s: f64,
+    into_s: f64,
+    span_s: f64,
+    buckets: usize,
+    rate: f64,
+) -> Vec<f32> {
+    let total = clip.samples.len() / 2;
+    if buckets == 0 || total == 0 || !(loop_s > 1.0e-6) || !(span_s > 0.0) {
+        return Vec::new();
+    }
+    let mut out = vec![0.0f32; buckets * 2];
+    for i in 0..buckets {
+        let t0 = into_s + span_s * i as f64 / buckets as f64;
+        let t1 = into_s + span_s * (i + 1) as f64 / buckets as f64;
+        let folded = t0.rem_euclid(loop_s);
+        let a = frames_at(rate, offset_s + folded) as usize;
+        let width = frames_at(rate, (t1 - t0).max(0.0)).max(1) as usize;
+        let a = a.min(total);
+        let b = (a + width).min(total);
+        let (lo, hi) = frame_range_minmax(clip, a, b.max(a));
+        out[i * 2] = lo;
+        out[i * 2 + 1] = hi;
     }
     out
 }
@@ -1320,6 +1376,68 @@ fn midi_clip_notes(
         .collect();
     // The walk in `mix_channels` needs them sorted.
     out.sort_by_key(|n| n.at);
+    out
+}
+
+#[cfg(feature = "recorder")]
+/// **An audio clip's passes, with its loop spelled out**, one `Placed` each.
+///
+/// The twin of [`midi_clip_notes`], and it exists for the same reason: two
+/// customers (playback and the offline bounce) and a schedule built twice is a
+/// schedule that eventually disagrees with itself.
+///
+/// It had already disagreed with the MIDI one. The loop was spelled out for
+/// MIDI clips and NOT for audio, so a session with two of each looped half its
+/// tracks and played the other half once — the owner's "Looping misses 2/4
+/// tracks when it loops. i can't tell why not all of them."
+///
+/// Every pass reads the SAME `offset` into the file: a repeat is the trimmed
+/// span played again, not the file continuing. The fades belong to the clip
+/// rather than to a pass, so the head fade is on the first and the tail fade
+/// on the last; a fade on every repeat would be a tremolo nobody asked for.
+fn audio_clip_passes(
+    clip: &tangent_ui::arrangement::ArrClip,
+    decoded: &std::sync::Arc<tangent_record::decode::Clip>,
+    rate: f64,
+    gain: f32,
+) -> Vec<crate::instrument::Placed> {
+    let frames = |s: f64| frames_at(rate, s);
+    let len_s = clip.play_len_s(decoded.seconds());
+    // Bounded exactly as the MIDI expansion is: an hour of clip over a
+    // sixteenth of loop is not something to hand the audio thread.
+    let passes: usize = if clip.loop_s > 1.0e-6 {
+        ((len_s / clip.loop_s).ceil() as usize).clamp(1, 4_096)
+    } else {
+        1
+    };
+    let mut out = Vec::with_capacity(passes);
+    for pass in 0..passes {
+        let at = clip.loop_s * pass as f64;
+        // The last pass is usually a PARTIAL one — the clip's own end is
+        // the wall, not the loop's length.
+        let this = if passes > 1 {
+            clip.loop_s.min(len_s - at)
+        } else {
+            len_s
+        };
+        if this <= 1.0e-9 {
+            break;
+        }
+        out.push(crate::instrument::Placed {
+            clip: std::sync::Arc::clone(decoded),
+            strip: clip.lane.min(tangent_ui::recorder::CHANNELS - 1),
+            start: frames(clip.start_s + at),
+            offset: frames(clip.offset_s),
+            len: frames(this),
+            fade_in: if pass == 0 { frames(clip.fade_in_s) } else { 0 },
+            fade_out: if pass + 1 == passes {
+                frames(clip.fade_out_s)
+            } else {
+                0
+            },
+            gain,
+        });
+    }
     out
 }
 
@@ -4243,17 +4361,16 @@ impl DesktopApp {
                         Err(_) => continue,
                     },
                 };
-                let len_s = clip.play_len_s(decoded.seconds());
-                placed.push(crate::instrument::Placed {
-                    clip: Arc::clone(&decoded),
-                    strip: clip.lane.min(tangent_ui::recorder::CHANNELS - 1),
-                    start: frames(clip.start_s),
-                    offset: frames(clip.offset_s),
-                    len: frames(len_s),
-                    fade_in: frames(clip.fade_in_s),
-                    fade_out: frames(clip.fade_out_s),
-                    gain: 1.0,
-                });
+                // **The clip's own gain, which the export used to drop.**
+                // It read `1.0` here while playback read `clip.gain`, so a
+                // clip pulled down on the timeline came back at full level
+                // in the file — the export disagreeing with what was heard.
+                placed.extend(audio_clip_passes(
+                    clip,
+                    &decoded,
+                    f64::from(rate),
+                    clip.gain as f32,
+                ));
             }
             e.set_clips(placed);
             e.set_midi_clips(midi_placed);
@@ -4847,17 +4964,12 @@ impl DesktopApp {
             }
             let len_s = clip.play_len_s(file_s);
             span = span.max(clip.start_s + len_s);
-            let frames = |s: f64| frames_at(f64::from(rate), s);
-            placed.push(crate::instrument::Placed {
-                clip: Arc::clone(&decoded),
-                strip: clip.lane.min(tangent_ui::recorder::CHANNELS - 1),
-                start: frames(clip.start_s),
-                offset: frames(clip.offset_s),
-                len: frames(len_s),
-                fade_in: frames(clip.fade_in_s),
-                fade_out: frames(clip.fade_out_s),
-                gain: clip.gain as f32,
-            });
+            placed.extend(audio_clip_passes(
+                clip,
+                &decoded,
+                f64::from(rate),
+                clip.gain as f32,
+            ));
             if info.is_none() {
                 info = Some(tangent_ui::ports::TrackInfo {
                     name: clip.name.clone(),
@@ -4870,6 +4982,12 @@ impl DesktopApp {
             // at.** Only the visible slice, and only when the arrangement is
             // showing — see `wave_span`, which says why a fixed budget
             // cannot be right at every zoom.
+            let frames = |s: f64| frames_at(f64::from(rate), s);
+            // **A looped clip is drawn as it PLAYS**, the same pass over and
+            // over — see `looped_span_envelope`. Reading the file straight
+            // through would have shown eight bars of audio under a clip that
+            // repeats one.
+            let looped = clip.loop_s > 1.0e-6;
             let (wave, wave_from_s, wave_span_s) = match wave_view.and_then(|(vs, vl, px)| {
                 wave_span(clip.start_s, len_s, vs, vl, px)
             }) {
@@ -4878,30 +4996,50 @@ impl DesktopApp {
                     // are: the drawn second `from` is `from - start_s` into
                     // the played span, past the left trim.
                     let into = (from - clip.start_s).max(0.0);
-                    (
+                    let wave = if looped {
+                        looped_span_envelope(
+                            &decoded,
+                            clip.offset_s,
+                            clip.loop_s,
+                            into,
+                            span,
+                            buckets,
+                            f64::from(rate),
+                        )
+                    } else {
                         span_envelope(
                             &decoded,
                             frames(clip.offset_s + into) as usize,
                             frames(span) as usize,
                             buckets,
-                        ),
-                        from,
-                        span,
-                    )
+                        )
+                    };
+                    (wave, from, span)
                 }
                 // Nothing on screen, or no panel: a coarse whole-clip
                 // picture, which is what the band's own scrubber uses and
                 // what a clip needs before anybody has looked at it.
-                None => (
-                    span_envelope(
-                        &decoded,
-                        frames(clip.offset_s) as usize,
-                        frames(len_s) as usize,
-                        CLIP_WAVE_BUCKETS,
-                    ),
-                    clip.start_s,
-                    len_s,
-                ),
+                None => {
+                    let wave = if looped {
+                        looped_span_envelope(
+                            &decoded,
+                            clip.offset_s,
+                            clip.loop_s,
+                            0.0,
+                            len_s,
+                            CLIP_WAVE_BUCKETS,
+                            f64::from(rate),
+                        )
+                    } else {
+                        span_envelope(
+                            &decoded,
+                            frames(clip.offset_s) as usize,
+                            frames(len_s) as usize,
+                            CLIP_WAVE_BUCKETS,
+                        )
+                    };
+                    (wave, clip.start_s, len_s)
+                }
             };
             clip_infos.push(tangent_ui::ports::ClipInfo {
                 id: clip.id,
@@ -7549,6 +7687,67 @@ impl DesktopApp {
 
 #[cfg(all(test, feature = "recorder"))]
 mod tests {
+
+    /// **A looped AUDIO clip repeats, exactly as a looped MIDI one does.**
+    ///
+    /// The loop was spelled out for MIDI and not for audio, so a session with
+    /// two of each looped half its tracks: the owner's "Looping misses 2/4
+    /// tracks when it loops."
+    #[test]
+    fn a_looped_audio_clip_is_spelled_out_into_passes() {
+        use std::sync::Arc;
+        let audio = |loop_s: f64, len_s: f64| tangent_ui::arrangement::ArrClip {
+            kind: tangent_ui::arrangement::ClipKind::Audio,
+            notes: Vec::new(),
+            lane: 2,
+            path: "a.wav".to_owned(),
+            start_s: 4.0,
+            offset_s: 0.5,
+            len_s,
+            loop_s,
+            fade_in_s: 0.1,
+            fade_out_s: 0.2,
+            name: "A".to_owned(),
+            id: 1,
+            extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
+            gain: 0.5,
+        };
+        let decoded = Arc::new(tangent_record::decode::Clip {
+            samples: vec![0.0; 48_000 * 2 * 10],
+            rate: 48_000,
+            source: std::path::PathBuf::from("a.wav"),
+        });
+
+        // No loop: one pass, unchanged.
+        let one = super::audio_clip_passes(&audio(0.0, 3.0), &decoded, 48_000.0, 0.5);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].start, 4 * 48_000);
+        assert_eq!(one[0].len, 3 * 48_000);
+        assert_eq!(one[0].fade_in, 4_800);
+        assert_eq!(one[0].fade_out, 9_600);
+
+        // A one-second loop under a 2.5 s clip: three passes, the last a
+        // HALF one, each reading the same trim into the file.
+        let many = super::audio_clip_passes(&audio(1.0, 2.5), &decoded, 48_000.0, 0.5);
+        assert_eq!(many.len(), 3, "the loop was not spelled out");
+        for (n, p) in many.iter().enumerate() {
+            assert_eq!(p.start, (4 + n as u64) * 48_000, "pass {n} starts wrong");
+            assert_eq!(p.offset, 24_000, "pass {n} lost the trim");
+            assert_eq!(p.strip, 2);
+            assert!((p.gain - 0.5).abs() < 1e-6, "pass {n} lost the clip's gain");
+        }
+        assert_eq!(many[2].len, 24_000, "the partial last pass was not cut");
+        // The fades belong to the CLIP, not to a repeat: head on the first,
+        // tail on the last, nothing in between. A fade on every pass would
+        // be a tremolo nobody asked for.
+        assert_eq!((many[0].fade_in, many[0].fade_out), (4_800, 0));
+        assert_eq!((many[1].fade_in, many[1].fade_out), (0, 0));
+        assert_eq!((many[2].fade_in, many[2].fade_out), (0, 9_600));
+    }
 
     /// **A reorder reloads the rows that moved and nothing else.**
     ///
