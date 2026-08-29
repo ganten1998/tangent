@@ -235,6 +235,37 @@ pub fn apply_text_styles(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
 
+    /// **Every font size is a whole number, at every window width.**
+    ///
+    /// epaint rasterises unhinted at exactly `size * ppp` with four horizontal
+    /// subpixel bins and none vertical, so a fractional size puts horizontal
+    /// strokes across two pixel rows at partial coverage — soft text, by the
+    /// same mechanism that makes a 1.5-wide rule soft.
+    ///
+    /// It also keeps the glyph atlas from thrashing. epaint keys its cache on
+    /// the scaled metrics, so a size that changes by a hundredth of a point
+    /// every frame is a total cache miss every frame; at the display's refresh
+    /// rate during a drag that is hundreds of glyph sets a second into an
+    /// atlas that doubles, marks itself dirty, and eventually overflows and
+    /// restarts its cursor over live glyphs. That is garbled text, not soft
+    /// text, and it is why this matters more now the window is paced.
+    #[test]
+    fn font_sizes_are_whole_numbers_and_never_vanish() {
+        for w in [560.0_f32, 900.0, 1300.0, 1600.0, 2000.0, 2560.0, 3840.0] {
+            // The shapes the panels actually derive sizes from: a fraction of
+            // a key width, of a staff space, of a dot radius.
+            for frac in [0.115_f32, 0.46, 0.52, 0.62, 0.86, 0.95, 1.15, 1.4, 1.9] {
+                let raw = w / 1300.0 * 7.5 * frac;
+                let got = px(raw);
+                assert_eq!(got, got.round(), "px({raw}) = {got} is not whole");
+                assert!(got >= 1.0, "px({raw}) vanished to {got}");
+            }
+        }
+        // A size already whole is untouched, and a tiny one still draws.
+        assert_eq!(px(12.0), 12.0);
+        assert_eq!(px(0.2), 1.0, "a sub-pixel size must not become zero");
+    }
+
     /// Cycling must REACH every bundled face. It did not: the old
     /// "first face that is not the current one" rule bounced between Courier
     /// Prime and Terminess forever, and JetBrains Mono — compiled into the
@@ -336,4 +367,27 @@ mod tests {
             );
         }
     }
+}
+
+/// **A font size that lands on the raster grid.**
+///
+/// epaint rasterises unhinted at exactly `size * pixels_per_point`, with four
+/// HORIZONTAL subpixel bins and none vertical — so how much coverage a stem or
+/// a crossbar gets is decided purely by the number, and a fractional size puts
+/// horizontal strokes across two rows of pixels at partial coverage. That is
+/// soft text, and it is the same mechanism as a stroke width landing between
+/// pixels.
+///
+/// Almost every size in this app is derived as a raw float off a rect — a key
+/// width, a dot radius, a staff space — so it lands anywhere. Rounding here
+/// costs nothing anyone can see and makes the sizes repeat instead of sweeping.
+///
+/// **It also protects the glyph atlas.** epaint keys its cache on the scaled
+/// metrics, so a fresh fractional size every frame is a total cache miss every
+/// frame; while the window is being dragged at the display's refresh rate that
+/// is hundreds of glyph sets a second into an atlas that doubles, marks itself
+/// entirely dirty, and eventually overflows and restarts its cursor over live
+/// glyphs — garbled text rather than merely soft text.
+pub fn px(size: f32) -> f32 {
+    size.round().max(1.0)
 }

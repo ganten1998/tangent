@@ -1176,14 +1176,18 @@ fn draw_readout(painter: &Painter, strip: Rect, r: Readout<'_>, cap: f32, p: &Pa
     // The two lines together must fit the height: the alternates are just over
     // half the main size, and there is a gap between them.
     let stacked = if alts.is_some() { 1.9 } else { 1.15 };
-    let main = fit(chord, strip.width())
-        .min(alts.as_deref().map_or(f32::MAX, |a| fit(a, strip.width()) / 0.52))
-        .min(strip.height() / stacked)
-        .min(cap);
+    // Rounded before anything is derived from it, so the block height and the
+    // alternates agree with what is actually rasterised.
+    let main = crate::fonts::px(
+        fit(chord, strip.width())
+            .min(alts.as_deref().map_or(f32::MAX, |a| fit(a, strip.width()) / 0.52))
+            .min(strip.height() / stacked)
+            .min(cap),
+    );
     if main < 5.0 {
         return;
     }
-    let alt_size = main * 0.52;
+    let alt_size = crate::fonts::px(main * 0.52);
     let block = if alts.is_some() { main + alt_size * 1.5 } else { main };
     let top = strip.center().y - block * 0.5;
     painter.text(
@@ -1298,7 +1302,7 @@ fn draw_column(
                 Pos2::new(cx, y),
                 Align2::CENTER_CENTER,
                 placed.note.letter,
-                FontId::new(g.space * 0.86, fonts::courier_bold()),
+                FontId::new(crate::fonts::px(g.space * 0.86), fonts::courier_bold()),
                 p.lit_text,
             );
         }
@@ -1405,7 +1409,7 @@ fn draw_octave_signs(
             group.iter().map(|n| n.pos).min().unwrap_or(0).min(0) - OCTAVE_SIGN_GAP
         };
         let y = g.y(edge);
-        let size = g.space * 1.15;
+        let size = crate::fonts::px(g.space * 1.15);
         painter.text(
             Pos2::new(x - head_w * 1.2, y),
             Align2::RIGHT_CENTER,
@@ -1601,7 +1605,7 @@ fn draw_clef(painter: &Painter, g: Geometry, clef: Clef, p: &Palette) -> f32 {
             Pos2::new(x + w * 0.45, anchor + dy),
             Align2::CENTER_CENTER,
             "8",
-            FontId::new(g.space * 1.4, fonts::courier_bold()),
+            FontId::new(crate::fonts::px(g.space * 1.4), fonts::courier_bold()),
             p.ink,
         );
     }

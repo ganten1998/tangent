@@ -14964,6 +14964,11 @@ impl IvoryApp {
         self.main_wm_managed
     }
 
+    /// Whether the HOST is constraining the drag. For the probes.
+    pub fn debug_os_aspect_lock(&self) -> bool {
+        self.os_aspect_lock
+    }
+
     /// Take a pending "choose a file" request. Same contract again.
     pub fn take_file_request(&mut self) -> Option<crate::ports::FileRequest> {
         self.file_request.take()

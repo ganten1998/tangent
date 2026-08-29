@@ -270,6 +270,24 @@ impl Curve {
             }
             kept.push(p);
         }
+        // **A curve always begins with a node at zero.**
+        //
+        // `value_at` is already flat before the first point, so this changes
+        // nothing anyone can HEAR — the value from zero up to that first
+        // point is the same either way. What it changes is what a person can
+        // see and grab: a lane whose curve started at bar 40 drew a flat
+        // stretch with no node on it, which reads as "nothing here yet"
+        // rather than "held at this value", and there was no handle to take
+        // hold of to say otherwise.
+        //
+        // Same shape as the point it copies, so the first segment leaves zero
+        // exactly as it leaves the point it was derived from.
+        if let Some(first) = kept.first() {
+            if first.at_s > 0.0 {
+                let seed = Point { at_s: 0.0, value: first.value, shape: first.shape };
+                kept.insert(0, seed);
+            }
+        }
         Self { lane, param, points: kept }
     }
 
@@ -488,21 +506,59 @@ mod tests {
         assert_eq!(c.value_at(20.0), Some(0.9));
     }
 
+    /// **A curve always begins with a node at zero**, whatever it was built
+    /// from — and adding it changes nothing anyone can hear.
+    ///
+    /// `value_at` was already flat before the first point, so the value from
+    /// zero up to it is identical either way. What the node adds is something
+    /// to SEE and something to grab: a lane whose curve started at bar 40
+    /// drew an unmarked flat stretch, which reads as "nothing here" rather
+    /// than "held at this value".
+    #[test]
+    fn the_curve_always_begins_at_zero() {
+        // Built from a point well into the song.
+        let c = Curve::sanitised(0, AutoParam::Gain, vec![pt(40.0, 0.75)]);
+        assert_eq!(c.points().len(), 2, "{:?}", c.points());
+        assert_eq!(c.points()[0].at_s, 0.0, "no node at the beginning");
+        assert_eq!(
+            c.points()[0].value,
+            0.75,
+            "the seeded node must hold the first point's value, or the sound changed"
+        );
+        assert_eq!(c.points()[0].shape, c.points()[1].shape, "the shape must carry");
+        // Inaudible: the value everywhere before the first real point is what
+        // it always was.
+        for t in [0.0, 1.0, 20.0, 39.9] {
+            assert_eq!(c.value_at(t), Some(0.75), "the curve changed at {t}");
+        }
+
+        // A curve that already starts at zero is untouched.
+        let c = Curve::sanitised(0, AutoParam::Gain, vec![pt(0.0, 0.1), pt(5.0, 0.9)]);
+        assert_eq!(c.points().len(), 2, "a node was added to a curve that had one");
+
+        // An empty curve stays empty — an empty one is not written down at
+        // all, and seeding it would make every lane look automated.
+        let c = Curve::sanitised(0, AutoParam::Gain, Vec::new());
+        assert!(c.is_empty(), "an empty curve was given a point");
+    }
+
     /// Putting a point where one already is replaces it.
     #[test]
     fn a_point_dragged_onto_its_neighbour_does_not_leave_two() {
+        // Three, not two: `sanitised` seeds a node at zero, because a curve
+        // always begins with one. See `the_curve_always_begins_at_zero`.
         let mut c = Curve::sanitised(0, AutoParam::Gain, vec![pt(1.0, 0.2), pt(2.0, 0.8)]);
         c.put(pt(2.0, 0.3));
-        assert_eq!(c.points().len(), 2, "{:?}", c.points());
+        assert_eq!(c.points().len(), 3, "{:?}", c.points());
         assert_eq!(c.value_at(2.0), Some(0.3));
         // ...and a new instant inserts in order.
         c.put(pt(1.5, 0.5));
-        assert_eq!(c.points().len(), 3);
+        assert_eq!(c.points().len(), 4);
         assert!(c.points().windows(2).all(|w| w[0].at_s < w[1].at_s));
         // Removing takes the nearest within reach, and nothing outside it.
         assert!(!c.remove_near(9.0, 0.1), "something far away was removed");
         assert!(c.remove_near(1.55, 0.1));
-        assert_eq!(c.points().len(), 2);
+        assert_eq!(c.points().len(), 3);
     }
 
     /// An emptied curve is removed, not stored empty.

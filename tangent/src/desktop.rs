@@ -437,6 +437,11 @@ pub struct DesktopApp {
     painted_once: bool,
     /// Frames counted by the `IVORY_GEOM_PROBE` diagnostic. See `update`.
     probe_frames: u32,
+    /// `IVORY_PACE_PROBE` accumulators: when the window last reported, how
+    /// many frames since, and the frame times seen in that second.
+    pace_since: Option<std::time::Instant>,
+    pace_frames: u32,
+    pace_dt: Vec<f32>,
     /// A screen reader has been seen. Stops the probe below from running
     /// again — see `screen_reader_attached`, which is not free of side
     /// effects.
@@ -6462,6 +6467,9 @@ impl DesktopApp {
             pending_midi: Some(pending_midi),
             painted_once: false,
             probe_frames: 0,
+            pace_since: None,
+            pace_frames: 0,
+            pace_dt: Vec::new(),
             reader_seen: false,
             #[cfg(feature = "recorder")]
             pushed_maps: None,
@@ -6706,9 +6714,57 @@ impl eframe::App for DesktopApp {
                 eprintln!("GEOM egui inner={:?} outer={:?} mon={:?} screen={:?}", vp.0, vp.1, vp.2, vp.3);
                 eprintln!("GEOM app  {}", self.app.debug_geometry());
                 eprintln!("GEOM ppp  {}", ctx.pixels_per_point());
+                eprintln!(
+                    "GEOM hook os_aspect_lock={} wm_managed={} sends={}",
+                    self.app.debug_os_aspect_lock(),
+                    self.app.debug_wm_managed(),
+                    self.app.debug_inner_size_sends(),
+                );
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             ctx.request_repaint();
+        }
+        // **The pacing probe.** `IVORY_PACE_PROBE=1` prints once a second what
+        // the window is actually doing, because "the drag feels choppy" and
+        // "the drag IS choppy" are different claims and only one of them can
+        // be checked. Same OnceLock discipline as the geometry probe above:
+        // reading the environment every frame is itself a cost.
+        //
+        // `fps` is frames actually drawn. `p99` is the slowest frame in the
+        // second, which is what a stutter is — a mean can hide one 40 ms
+        // frame in 240 good ones. `sends` counts window-size commands: on a
+        // tiling manager that number staying flat is the whole fix.
+        static PACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *PACE.get_or_init(|| std::env::var_os("IVORY_PACE_PROBE").is_some()) {
+            let now = std::time::Instant::now();
+            let since = *self.pace_since.get_or_insert(now);
+            self.pace_frames += 1;
+            let dt = ctx.input(|i| i.unstable_dt);
+            if dt.is_finite() && dt > 0.0 {
+                self.pace_dt.push(dt);
+            }
+            if now.duration_since(since).as_secs_f32() >= 1.0 {
+                let secs = now.duration_since(since).as_secs_f32();
+                self.pace_dt.sort_by(f32::total_cmp);
+                let p99 = self
+                    .pace_dt
+                    .get(self.pace_dt.len().saturating_sub(1).min(
+                        (self.pace_dt.len() as f32 * 0.99) as usize,
+                    ))
+                    .copied()
+                    .unwrap_or(0.0);
+                eprintln!(
+                    "PACE fps={:.0} p99={:.2}ms sends={} wm={} oslock={}",
+                    self.pace_frames as f32 / secs,
+                    p99 * 1000.0,
+                    self.app.debug_inner_size_sends(),
+                    self.app.debug_wm_managed(),
+                    self.app.debug_os_aspect_lock(),
+                );
+                self.pace_since = Some(now);
+                self.pace_frames = 0;
+                self.pace_dt.clear();
+            }
         }
     }
 
