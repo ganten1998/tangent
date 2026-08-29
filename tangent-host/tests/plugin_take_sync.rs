@@ -58,7 +58,7 @@ const CHORDS_MS: [i64; 4] = [0, 913, 1_847, 2_791];
 ///
 /// The preference order is a piano, then anything — a piano being both the
 /// product's subject and the instrument most likely to sound on any pitch.
-fn instrument() -> Option<(Module, tangent_host::ClassInfo)> {
+fn instrument() -> Option<(std::sync::Arc<Module>, tangent_host::ClassInfo)> {
     let wanted = std::env::var("TANGENT_TEST_VST3").ok();
     let bundles = tangent_host::discover();
     let name_of = |p: &std::path::Path| {
@@ -87,7 +87,7 @@ fn instrument() -> Option<(Module, tangent_host::ClassInfo)> {
     }
 
     for bundle in order {
-        let Ok(module) = Module::open(&bundle) else {
+        let Ok(module) = tangent_host::scan::module_for(&bundle) else {
             continue;
         };
         if let Some(class) = module.audio_modules().into_iter().next() {

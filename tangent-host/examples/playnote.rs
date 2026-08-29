@@ -23,7 +23,7 @@ fn main() {
     };
 
     println!("module:   {}", bundle.display());
-    let module = Module::open(&bundle).expect("open module");
+    let module = tangent_host::scan::module_for(&bundle).expect("open module");
     println!("vendor:   {}", module.vendor());
 
     let class = module

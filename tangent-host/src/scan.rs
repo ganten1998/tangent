@@ -449,6 +449,11 @@ impl ClassInfo {
 /// Deliberately not `Clone` and deliberately not `Send`. The SDK requires that
 /// the factory be used from the thread that initialised the bundle, and a
 /// second `Module` for the same path would call `bundleEntry` twice.
+///
+/// **Which is why nothing outside this file should call [`Module::open`].**
+/// Use [`module_for`], which keeps one module per bundle path per thread. Two
+/// bays holding the same plugin is the ordinary case — the owner's report was
+/// two drum lanes — and it used to open the bundle twice.
 pub struct Module {
     path: PathBuf,
     /// Kept alive for as long as the factory is. Dropping this unmaps the
@@ -458,6 +463,69 @@ pub struct Module {
     factory: ComPtr<IPluginFactory>,
     vendor: String,
     url: String,
+}
+
+thread_local! {
+    /// Every bundle this thread has opened, by canonicalised path.
+    ///
+    /// **One `bundleEntry` per bundle, which is what the SDK requires.** A
+    /// plugin is entitled to do real work in `bundleEntry` — the module header
+    /// names Pianoteq and Arturia, which locate their samples and presets
+    /// there — and drum samplers commonly start a shared streaming engine in
+    /// it. Calling it a second time re-runs that initialiser underneath the
+    /// instance that is already using it, and the SDK's own `ModuleHandle`
+    /// refcounts per path for exactly this reason. Measured before this
+    /// existed: two `Module::open` calls on one bundle, two `bundleEntry`
+    /// calls.
+    ///
+    /// **THREAD-LOCAL, and that is load-bearing rather than convenient.** The
+    /// SDK requires the factory be used from the thread that initialised the
+    /// bundle. A process-wide cache would happily hand a module opened on the
+    /// UI thread to some other thread and the rule would be broken silently;
+    /// keyed per thread, a second thread gets its own module and the rule
+    /// cannot be broken by sharing. Every caller is on the UI thread today —
+    /// the audio thread only ever HOLDS an `Arc<Module>` inside a `PluginBox`,
+    /// it never calls into the factory — so in practice there is one map.
+    ///
+    /// **`Arc` and not `Rc`, even though the map is thread-local.** The handle
+    /// itself crosses to the audio thread inside a `PluginBox`, which carries
+    /// an `unsafe impl Send` that would let an `Rc` across just as happily —
+    /// and an `Rc`'s refcount is not atomic, so a decrement there racing a
+    /// clone here corrupts it silently. One atomic per plugin load is not a
+    /// price worth arguing about; the audio thread never touches the count in
+    /// a callback, only when a box is handed over or retired.
+    ///
+    /// **Never emptied.** The entry keeps a strong reference for the life of
+    /// the thread, so the refcount cannot reach zero on the audio thread and
+    /// drop a `ComPtr` there. That matches what `Library`'s `Drop` already
+    /// decided: modules stay loaded for the process, because unmapping one
+    /// from under a thread the plugin spawned is a use-after-free. A failed
+    /// open is NOT cached — a bundle that was not there at startup should load
+    /// once it is.
+    static MODULES: std::cell::RefCell<std::collections::HashMap<PathBuf, std::sync::Arc<Module>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// The module for `bundle`, opening it only if this thread has not already.
+///
+/// This is the only way a caller outside this file should obtain a [`Module`].
+/// See `MODULES` for why it is per thread and why it never releases.
+pub fn module_for(bundle: &Path) -> Result<std::sync::Arc<Module>, String> {
+    // Canonicalised so that two spellings of one bundle — a symlink, a
+    // relative path, a `/private` prefix macOS adds to `/tmp` — are one entry
+    // and not two `bundleEntry` calls wearing different names. A path that
+    // cannot be canonicalised is used as given: it will fail to open in a
+    // moment anyway, and with a better message than this function could give.
+    let key = std::fs::canonicalize(bundle).unwrap_or_else(|_| bundle.to_path_buf());
+    if let Some(hit) = MODULES.with(|m| m.borrow().get(&key).cloned()) {
+        return Ok(hit);
+    }
+    let module = std::sync::Arc::new(Module::open(bundle)?);
+    // `insert` rather than the entry API: `Module::open` is re-entrant in the
+    // sense that it runs somebody else's code, and holding a `RefCell` borrow
+    // across it would panic if that code came back through here.
+    MODULES.with(|m| m.borrow_mut().insert(key, std::sync::Arc::clone(&module)));
+    Ok(module)
 }
 
 /// Hand-written rather than derived: `ComPtr` and the raw handles inside
@@ -484,7 +552,11 @@ impl Module {
     /// with it. That is a known and accepted cost for now — see
     /// `docs/RECORDER-PLAN.md` §8 on moving hosting out of process — but it is
     /// the reason nothing here should ever run while a take is recording.
-    pub fn open(bundle: &Path) -> Result<Self, String> {
+    /// **`pub(crate)`, so that nothing outside can bypass [`module_for`].**
+    /// This is the function that calls `bundleEntry`; calling it twice for one
+    /// bundle is the bug `module_for` exists to prevent, and a visibility rule
+    /// cannot pass vacuously the way a test can.
+    pub(crate) fn open(bundle: &Path) -> Result<Self, String> {
         let binary = binary_in_bundle(bundle)
             .ok_or_else(|| format!("no loadable binary inside {}", bundle.display()))?;
 
@@ -1167,5 +1239,152 @@ mod tests {
         // nothing from the folder that is not there.
         assert_eq!(found, discover());
     }
-}
 
+    /// **One `bundleEntry` per bundle, however many bays hold the plugin.**
+    ///
+    /// Two lanes running the same drum plugin is the ordinary case and it used
+    /// to open the bundle twice. macOS requires `bundleEntry(CFBundleRef)`
+    /// before the factory is usable, plugins are entitled to do real work in
+    /// it — this module's header names Pianoteq and Arturia, which find their
+    /// resources there, and drum samplers commonly start a shared streaming
+    /// engine — and the SDK's own `ModuleHandle` refcounts per path for
+    /// exactly this reason. Re-running that initialiser underneath a live
+    /// instance is undefined at the plugin's discretion.
+    ///
+    /// Measured with the stub below before `module_for` existed: two opens,
+    /// two `bundleEntry` calls. This asserts one.
+    ///
+    /// The stub is built here rather than committed because a checked-in
+    /// dynamic library is a binary nobody can review. If there is no C
+    /// compiler the test says so LOUDLY and returns — a silent skip is a green
+    /// tick for nothing, which this repo has been bitten by once already.
+    #[cfg(unix)]
+    #[test]
+    fn a_bundle_is_initialised_once_however_many_bays_hold_it() {
+        use std::io::Write;
+
+        let cc = std::env::var("CC").unwrap_or_else(|_| "cc".into());
+        if std::process::Command::new(&cc)
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!(
+                "SKIPPED a_bundle_is_initialised_once_however_many_bays_hold_it: \
+                 no C compiler ({cc}); it builds a stub .vst3 to count bundleEntry"
+            );
+            return;
+        }
+
+        // PID in the path: 47 scratch dirs in this repo were once built from a
+        // tag alone, and two concurrent `cargo test` runs deleted each other's
+        // trees mid-run. That is what the "flaky" record tests actually were.
+        let root = std::env::temp_dir().join(format!("tangent-stub-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let inner = root.join("StubCount.vst3").join("Contents").join(CONTENTS_SUBDIR);
+        std::fs::create_dir_all(&inner).expect("make the stub bundle");
+        let log = root.join("entries.txt");
+
+        let src = root.join("stub.c");
+        let mut f = std::fs::File::create(&src).expect("write the stub source");
+        f.write_all(STUB_C.as_bytes()).expect("write the stub source");
+        drop(f);
+
+        // The binary is named exactly like the bundle, which `binary_in_bundle`
+        // prefers first on every platform.
+        let out = inner.join("StubCount.vst3");
+        let built = std::process::Command::new(&cc)
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&out)
+            .arg(&src)
+            .output()
+            .expect("run the compiler");
+        assert!(
+            built.status.success(),
+            "could not build the stub: {}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+
+        // The stub writes one line per entry point call to $TANGENT_STUB_LOG.
+        std::env::set_var("TANGENT_STUB_LOG", &log);
+        let bundle = root.join("StubCount.vst3");
+        let a = module_for(&bundle).expect("the stub bundle should open");
+        let b = module_for(&bundle).expect("the stub bundle should open twice");
+
+        assert!(
+            std::sync::Arc::ptr_eq(&a, &b),
+            "two bays got two different Modules for one bundle"
+        );
+        let entries = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| *l == "entry")
+            .count();
+        assert_eq!(
+            entries, 1,
+            "the bundle was initialised {entries} times for two bays; \
+             a plugin is entitled to do real work in bundleEntry"
+        );
+
+        // A path spelled differently is the same bundle, not a second one.
+        let spelled = root.join(".").join("StubCount.vst3");
+        let c = module_for(&spelled).expect("the same bundle by another name");
+        assert!(
+            std::sync::Arc::ptr_eq(&a, &c),
+            "a different spelling of one path opened it again"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The counting stub: a minimal VST3 whose only job is to say how often it
+    /// was initialised. `GetPluginFactory` returns a real enough
+    /// `IPluginFactory` that `Module::open` succeeds — `getFactoryInfo` is the
+    /// only method it calls.
+    #[cfg(unix)]
+    const STUB_C: &str = r#"
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+static void note(const char *what) {
+    const char *p = getenv("TANGENT_STUB_LOG");
+    if (!p) return;
+    FILE *f = fopen(p, "a");
+    if (!f) return;
+    fprintf(f, "%s\n", what);
+    fclose(f);
+}
+typedef struct { char vendor[64]; char url[256]; char email[128]; int32_t flags; } PFactoryInfo;
+typedef struct Factory Factory;
+typedef struct {
+    int32_t  (*queryInterface)(Factory*, const void*, void**);
+    uint32_t (*addRef)(Factory*);
+    uint32_t (*release)(Factory*);
+    int32_t  (*getFactoryInfo)(Factory*, PFactoryInfo*);
+    int32_t  (*countClasses)(Factory*);
+    int32_t  (*getClassInfo)(Factory*, int32_t, void*);
+    int32_t  (*createInstance)(Factory*, const char*, const char*, void**);
+} FactoryVtbl;
+struct Factory { const FactoryVtbl* vtbl; };
+static int32_t  f_query(Factory* s, const void* i, void** o) { (void)s;(void)i; *o = 0; return -1; }
+static uint32_t f_addref(Factory* s) { (void)s; return 2; }
+static uint32_t f_release(Factory* s) { (void)s; return 1; }
+static int32_t  f_info(Factory* s, PFactoryInfo* i) {
+    (void)s; memset(i, 0, sizeof(*i));
+    strcpy(i->vendor, "Tangent Stub");
+    return 0;
+}
+static int32_t  f_count(Factory* s) { (void)s; return 0; }
+static int32_t  f_class(Factory* s, int32_t n, void* i) { (void)s;(void)n;(void)i; return -1; }
+static int32_t  f_create(Factory* s, const char* c, const char* i, void** o) { (void)s;(void)c;(void)i; *o=0; return -1; }
+static const FactoryVtbl VTBL = { f_query, f_addref, f_release, f_info, f_count, f_class, f_create };
+static Factory FACTORY = { &VTBL };
+__attribute__((visibility("default"))) bool bundleEntry(void *b) { (void)b; note("entry"); return true; }
+__attribute__((visibility("default"))) bool bundleExit(void) { note("exit"); return true; }
+__attribute__((visibility("default"))) bool ModuleEntry(void *h) { (void)h; note("entry"); return true; }
+__attribute__((visibility("default"))) bool ModuleExit(void) { note("exit"); return true; }
+__attribute__((visibility("default"))) void *GetPluginFactory(void) { return &FACTORY; }
+"#;
+}

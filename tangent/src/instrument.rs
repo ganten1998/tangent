@@ -2142,8 +2142,13 @@ struct Hosted {
     /// Held, never read: dropping the module unmaps the library and every
     /// `ComPtr` into it becomes a dangling function table. Declared AFTER
     /// `inst` so it is dropped after it.
+    ///
+    /// **Shared, because two bays holding the same plugin is ordinary** — the
+    /// owner's report was two drum lanes — and a second `Module` for one
+    /// bundle calls `bundleEntry` a second time. See `scan::module_for`, which
+    /// is where the sharing and the one-init-per-bundle rule live.
     #[allow(dead_code, reason = "kept alive for the instance's sake, not read")]
-    module: Module,
+    module: std::sync::Arc<Module>,
     /// One `Vec` per channel of the main output bus, each pre-grown to
     /// `MAX_BLOCK` so `Instance::process`'s internal `resize` never allocates.
     bufs: Vec<Vec<f32>>,
@@ -6868,7 +6873,7 @@ impl Engine {
             }
             return Ok(None);
         };
-        let module = Module::open(bundle)?;
+        let module = tangent_host::scan::module_for(bundle)?;
         let classes = module.audio_modules();
         let class = classes
             .first()

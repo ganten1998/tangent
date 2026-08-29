@@ -48,7 +48,7 @@ fn frame(seconds: f64) -> usize {
 /// A piano, by preference. Copied in spirit from `plugin_take_sync.rs`: "the
 /// first Audio Module Class found" is a terrible default, and a pedal test on a
 /// bass sampler measures nothing at all.
-fn instrument() -> Option<(Module, ClassInfo)> {
+fn instrument() -> Option<(std::sync::Arc<Module>, ClassInfo)> {
     let wanted = std::env::var("TANGENT_TEST_VST3").ok();
     let bundles = tangent_host::discover();
     let name_of = |p: &std::path::Path| {
@@ -73,7 +73,7 @@ fn instrument() -> Option<(Module, ClassInfo)> {
     }
 
     for bundle in order {
-        let Ok(module) = Module::open(&bundle) else {
+        let Ok(module) = tangent_host::scan::module_for(&bundle) else {
             continue;
         };
         if let Some(class) = module.audio_modules().into_iter().next() {

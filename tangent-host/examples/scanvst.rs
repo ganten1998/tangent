@@ -18,7 +18,7 @@ fn main() {
                 continue;
             }
         }
-        match tangent_host::Module::open(bundle) {
+        match tangent_host::scan::module_for(bundle) {
             Ok(m) => {
                 ok += 1;
                 let classes = m.classes();
