@@ -89,7 +89,7 @@ fn main() {
     };
 
     println!("module:   {}", bundle.display());
-    let module = Module::open(&bundle).expect("open module");
+    let module = tangent_host::scan::module_for(&bundle).expect("open module");
     let class = module
         .audio_modules()
         .into_iter()
