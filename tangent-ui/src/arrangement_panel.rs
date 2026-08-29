@@ -1722,7 +1722,7 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
                     .enumerate()
                     .map(|(i, q)| {
                         let at = Pos2::new(
-                            x_of(rect, view, view.tempo.seconds_at_beat(q.at_beat)),
+                            tempo_x_of(rect, view, row.lane, q.at_beat),
                             tempo_y_of(row.lane, q.bpm),
                         );
                         (i, at.distance(pos))
@@ -2545,6 +2545,22 @@ fn blend(a: Color32, b: Color32, t: f32) -> Color32 {
 }
 
 /// What the grid box SAYS: bars as a power of two — "8", "1", "1/16".
+/// **The grid's step in QUARTER NOTES.**
+///
+/// A note value, not a fraction of the bar — which is what the box has always
+/// said and never meant. `exp = -2` is a quarter note, `-3` an eighth, `0` a
+/// whole note; the bar it lands in is irrelevant.
+///
+/// The difference only shows in a meter whose bar is not a power of two of
+/// its own beat. In 4/4 a quarter of a bar IS a quarter note, so dividing the
+/// bar by four was right by accident for years. In 6/8 a bar is three
+/// quarters, so a quarter of it is a DOTTED EIGHTH — a line on nothing anyone
+/// plays, and a magnet that pulls notes to it. Six beats cannot be divided by
+/// four, and both this panel and the MIDI editor were trying.
+pub fn grid_quarters(exp: i8) -> f64 {
+    4.0 * 2.0f64.powi(i32::from(exp.clamp(-6, 6)))
+}
+
 pub fn grid_label(exp: i8) -> String {
     if exp >= 0 {
         format!("{}", 1u32 << exp.min(6) as u32)
@@ -2560,11 +2576,40 @@ pub fn grid_label(exp: i8) -> String {
 /// whole content, and a readout that has to be decoded has not been made
 /// accessible. So the spoken form carries it.
 fn grid_spoken(exp: i8) -> String {
+    // Note values now, because that is what the grid actually steps in. "1/4
+    // bar" was both the wrong words and the wrong maths in any meter whose
+    // bar is not a power of two of its beat.
     match exp {
-        0 => "1 bar".to_owned(),
-        e if e > 0 => format!("{} bars", 1u32 << e.min(6) as u32),
-        e => format!("1/{} bar", 1u32 << (-e).min(6) as u32),
+        -2 => "quarter notes".to_owned(),
+        -3 => "eighth notes".to_owned(),
+        -4 => "sixteenth notes".to_owned(),
+        -5 => "thirty-second notes".to_owned(),
+        -1 => "half notes".to_owned(),
+        0 => "whole notes".to_owned(),
+        e if e > 0 => format!("{} whole notes", 1u32 << e.min(6) as u32),
+        e => format!("1/{} notes", 1u32 << ((-e) + 2).min(6) as u32),
     }
+}
+
+/// **Where a tempo handle is drawn, and grabbed.**
+///
+/// The x it would have, held far enough inside the lane to be a whole dot.
+///
+/// The first point of every map is at beat zero, so with the view at the
+/// start it lands exactly on the lane's left edge: half the handle is drawn
+/// outside the lane, and everything left of that edge belongs to the HEADER,
+/// which the hit test asks about first. That left only the right half of the
+/// dot clickable — "barely or not at all", which is exactly right.
+///
+/// One function because both the drawing and the hit test need the same
+/// answer; two copies of this is how a handle comes to be drawn somewhere it
+/// cannot be pressed.
+fn tempo_x_of(rect: Rect, view: &ArrangeView<'_>, lane: Rect, at_beat: f64) -> f32 {
+    let x = x_of(rect, view, view.tempo.seconds_at_beat(at_beat));
+    if !x.is_finite() {
+        return x;
+    }
+    x.max(lane.left() + AUTO_POINT_R)
 }
 
 /// Where a bar LINE falls, in seconds. Bars count from zero here and from
@@ -2903,13 +2948,19 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     line(x0, 1.0);
                     drawn += 1;
                 }
-                let div = 1u32 << (-exp).min(20);
-                if bar_px / f64::from(div) >= 5.0 {
-                    let step_q = qn / f64::from(div);
-                    for k in 1..div {
+                // **Step in NOTE VALUES across the bar**, rather than
+                // dividing the bar by a power of two. A 6/8 bar is three
+                // quarters: divided by four it gives dotted eighths, and
+                // stepped in eighths it gives the six lines the meter
+                // actually has.
+                let step_q = grid_quarters(view.grid_exp);
+                if step_q > 0.0 && bar_px * step_q / qn >= 5.0 {
+                    let mut k = 1u32;
+                    while (f64::from(k) * step_q) < qn - 1.0e-9 && k < 512 {
                         let t = view.tempo.seconds_at_beat(q0 + f64::from(k) * step_q);
                         line(x_of(rect, view, t), 0.55);
                         drawn += 1;
+                        k += 1;
                     }
                 }
             }
@@ -3153,7 +3204,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 crate::fonts::courier(),
             );
             for (i, q) in pts.iter().enumerate() {
-                let x = x_of(rect, view, view.tempo.seconds_at_beat(q.at_beat));
+                let x = tempo_x_of(rect, view, row.lane, q.at_beat);
                 let at = Pos2::new(x, tempo_y_of(row.lane, q.bpm));
                 if !at.x.is_finite() || !at.y.is_finite() {
                     continue;
@@ -4260,6 +4311,49 @@ fn cut_to(painter: &Painter, width: f32, text: &str, font: &FontId) -> String {
 #[cfg(test)]
 mod tests {
 
+    /// **The first tempo handle can actually be pressed.**
+    ///
+    /// Every map begins at beat zero, so with the view at the song's start
+    /// that handle lands exactly on the lane's left edge — half of it drawn
+    /// outside the lane, and everything to the left of that edge belonging to
+    /// the header, which the hit test asks about first. Only the right half
+    /// was clickable, which is why it read as barely there.
+    #[test]
+    fn the_first_tempo_handle_is_inside_the_lane_and_hittable() {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 600.0));
+        let mut v = a_view(&[]);
+        v.show_tempo_lane = true;
+        v.view_start_s = 0.0;
+        v.view_len_s = 30.0;
+        let l = Layout::new(rect, &v);
+        let row = l
+            .rows
+            .iter()
+            .find(|r| r.kind == RowKind::Tempo)
+            .expect("no tempo row");
+        assert!(row.lane.is_positive(), "the tempo lane has no room");
+
+        // The handle for the point at beat zero.
+        let x = tempo_x_of(rect, &v, row.lane, 0.0);
+        assert!(
+            x >= row.lane.left() + AUTO_POINT_R - 0.01,
+            "the first handle is drawn half outside the lane: x={x} left={}",
+            row.lane.left()
+        );
+        // A whole dot's width of it is inside, so a press anywhere on it lands.
+        for dx in [-AUTO_POINT_R + 0.5, 0.0, AUTO_POINT_R - 0.5] {
+            let at = Pos2::new(x + dx, tempo_y_of(row.lane, v.tempo.points()[0].bpm));
+            assert!(
+                row.lane.expand(AUTO_POINT_R).contains(at),
+                "a point on the first handle at dx={dx} is outside the grab area"
+            );
+            assert!(
+                !row.header.contains(at),
+                "a point on the first handle at dx={dx} belongs to the header"
+            );
+        }
+    }
+
     /// **The automation strip's cells never overlap and never leave the row.**
     ///
     /// `Rect::contains` is inclusive at both edges, so two cells that merely
@@ -4783,10 +4877,15 @@ ArrangeView {
         v.grid_exp = -2;
         let nodes = a11y_nodes(rect(), &v);
         let g = nodes.iter().find(|n| n.label == "Grid").expect("no grid node");
-        assert_eq!(g.value.as_deref(), Some("1/4 bar"));
+        // **Note values, not bar fractions.** "1/4 bar" was both the wrong
+        // words and the wrong maths: in 6/8 a quarter of a bar is a dotted
+        // eighth. See `grid_quarters`.
+        assert_eq!(g.value.as_deref(), Some("quarter notes"));
         // The BOX still prints its own terse form; only the spoken one is
         // spelled out.
         assert_eq!(grid_label(-2), "1/4");
+        // And the step it names is a quarter note, in every meter.
+        assert!((grid_quarters(-2) - 1.0).abs() < 1e-9);
         let t = g.travel.expect("the grid box cannot be nudged");
         assert!((t.norm - 3.0 / 8.0).abs() < 1e-6, "{}", t.norm);
         // Both ends are reachable, and neither runs off the rails.

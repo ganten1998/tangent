@@ -687,6 +687,14 @@ pub struct IvoryApp {
     /// The marquee'd SET of clips, beside the single selection — the
     /// right-drag band fills it, Delete empties it with the clips.
     arr_multi: Vec<u64>,
+    /// The clip selection as it stood at the end of the last frame.
+    ///
+    /// Kept so that "the selection changed" is answerable in one place. A
+    /// clip selection reaches the app through eight or nine different presses
+    /// — the body, the edges, the fades, the marquee, undo — and making each
+    /// of them remember to also select the track is how one of them comes not
+    /// to.
+    arr_sel_seen: (Option<u64>, Vec<u64>),
     /// A selection band in flight, both corners in screen space.
     arr_band: Option<(egui::Pos2, egui::Pos2)>,
     /// A GROUP move's snapshot: `(id, start_s, lane)` for every selected
@@ -1872,6 +1880,7 @@ impl IvoryApp {
             mixer_reorder: None,
             desk_state_perm: None,
             arr_multi: Vec::new(),
+            arr_sel_seen: (None, Vec::new()),
             arr_band: None,
             arr_move_orig: Vec::new(),
             arr_grip_lit: false,
@@ -12579,6 +12588,46 @@ impl IvoryApp {
     ///
     /// Shift wins over Cmd when both are down: the range is the more specific
     /// request, and it is the one every desk answers with.
+    /// **Selecting a clip selects the track it is on.**
+    ///
+    /// Driven by the selection CHANGING rather than called from each of the
+    /// nine places a clip can be selected — the body, either edge, either
+    /// fade, the marquee, a paste, an undo. One of those would eventually be
+    /// added without the call.
+    ///
+    /// Only when the clip selection moves, so choosing tracks by their
+    /// headers is left alone: that is a different gesture about the same
+    /// objects, and syncing on every frame would undo it.
+    fn arr_sync_tracks_to_clips(&mut self) {
+        let now = (self.arr_selected, self.arr_multi.clone());
+        if now == self.arr_sel_seen {
+            return;
+        }
+        self.arr_sel_seen = now;
+        // Every lane the selection touches, in the order the clips name them,
+        // deduplicated — several clips on one track select it once.
+        let mut lanes: Vec<usize> = Vec::new();
+        let ids: Vec<u64> = self
+            .arr_selected
+            .into_iter()
+            .chain(self.arr_multi.iter().copied())
+            .collect();
+        for id in ids {
+            if let Some(c) = self.arrangement.clips.iter().find(|c| c.id == id) {
+                if c.lane < crate::recorder::CHANNELS && !lanes.contains(&c.lane) {
+                    lanes.push(c.lane);
+                }
+            }
+        }
+        if lanes.is_empty() {
+            return;
+        }
+        // The PRIMARY is the last one, which is the contract
+        // `selected_channel` documents: the last entry here IS that channel.
+        self.selected_channel = lanes.last().copied();
+        self.selected_tracks = lanes;
+    }
+
     fn select_track(&mut self, n: usize, mods: egui::Modifiers) {
         if mods.shift {
             // **From the ANCHOR, not from the primary.** Shift-clicking around
@@ -14172,6 +14221,12 @@ impl IvoryApp {
                 self.track.error = e;
             }
         }
+    
+        // **A clip selection selects its track.** Last, after every press and
+        // release above has had its say, so it sees the selection this frame
+        // actually ended with rather than one an earlier branch was midway
+        // through changing.
+        self.arr_sync_tracks_to_clips();
     }
 
     /// The band timeline's overview of the document — every clip a block
@@ -26481,6 +26536,53 @@ mod tests {
             c.points()
         );
         assert_eq!(c.value_at(8.0), Some(0.4), "the written value is not the one set");
+    }
+
+    /// **Selecting a clip selects the track it is on**, and several clips
+    /// select several tracks.
+    ///
+    /// Driven by the selection changing rather than by each of the nine
+    /// presses that can change it, so a tenth cannot be added without it.
+    #[test]
+    fn selecting_clips_selects_their_tracks() {
+        let (_, mut app) = headless(Caps::DESKTOP);
+        let mut mk = |id: u64, lane: usize, at: f64| {
+            app.arrangement.clips.push(crate::arrangement::ArrClip {
+                id,
+                lane,
+                start_s: at,
+                len_s: 1.0,
+                ..Default::default()
+            });
+        };
+        mk(1, 2, 0.0);
+        mk(2, 5, 4.0);
+        mk(3, 5, 8.0);
+
+        // One clip: its track, and it becomes the primary.
+        app.arr_selected = Some(1);
+        app.arr_sync_tracks_to_clips();
+        assert_eq!(app.selected_tracks, vec![2]);
+        assert_eq!(app.selected_channel, Some(2));
+
+        // Several across two tracks: both, in the order named, deduplicated —
+        // two clips on track 5 select it once.
+        app.arr_selected = Some(1);
+        app.arr_multi = vec![2, 3];
+        app.arr_sync_tracks_to_clips();
+        assert_eq!(app.selected_tracks, vec![2, 5], "tracks: {:?}", app.selected_tracks);
+        assert_eq!(app.selected_channel, Some(5), "the primary is not the last named");
+
+        // Choosing tracks by their headers is a different gesture and is left
+        // alone while the clip selection stands still.
+        app.selected_tracks = vec![7];
+        app.selected_channel = Some(7);
+        app.arr_sync_tracks_to_clips();
+        assert_eq!(
+            app.selected_tracks,
+            vec![7],
+            "an unchanged clip selection overwrote a track selection"
+        );
     }
 
     /// **A bypassed lane is kept and not played.**
