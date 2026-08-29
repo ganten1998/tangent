@@ -5056,15 +5056,22 @@ impl Renderer {
         }
         // Silence still flows through LIVE racks — a reverb tail on the
         // bus or a pad outlives the voice that fed it.
-        // Asked about the strip the kit lands on, for the reason the rack
-        // itself is: a tail on the LANE outlives the voice that fed it, and
-        // asking about the hidden bus instead would cut it off.
-        let drum_wanted_early = self.shared.drum_strip.load(Ordering::Relaxed);
-        let early_bus = (drum_wanted_early >= 0)
-            .then_some(drum_wanted_early as usize)
-            .filter(|ch| *ch < CHANNELS)
-            .map_or(Strip::Drums, Strip::Channel);
-        let any_rack = !self.racks[early_bus.index()].is_empty()
+        // **Asked about the PADS' own racks and the hidden bus, and NOT about
+        // the lane the kit lands on.**
+        //
+        // The temptation is to ask about the lane, so that a reverb tail on
+        // it outlives the voice that fed it. That is wrong twice over. A
+        // lane's rack is almost never empty, so asking about it means this
+        // function never returns early — and everything below it runs every
+        // block whether or not a single pad has sounded, which is that
+        // lane's whole plugin chain processing silence at block rate, twice
+        // per block, forever. It made the app measurably laggier the moment
+        // a drumpad was assigned.
+        //
+        // And the tail does not need it: the lane's own pass in `mix_clips`
+        // runs that same rack every block regardless, so whatever is ringing
+        // in it keeps ringing there.
+        let any_rack = !self.racks[Strip::Drums.index()].is_empty()
             || (0..PADS).any(|i| !self.racks[pad_rack_index(i)].is_empty());
         if self.pad_hits.is_empty()
             && self.pad_offs.is_empty()

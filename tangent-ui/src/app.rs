@@ -7788,6 +7788,7 @@ impl IvoryApp {
                     wave_from_s,
                     wave_span_s,
                     id: c.id,
+                    loop_s: c.loop_s,
                     notes: &c.notes,
                     offset_s: c.offset_s,
                     recording: false,
@@ -7830,6 +7831,9 @@ impl IvoryApp {
                         wave: &[],
                         wave_from_s: 0.0,
                         wave_span_s: 0.0,
+                        // A take being recorded does not loop: it is one
+                        // continuous pass, and there is no clip yet to ask.
+                        loop_s: 0.0,
                         notes: if *is_midi { &rec.notes } else { &[] },
                         selected: false,
                         midi: *is_midi,
@@ -13643,6 +13647,34 @@ impl IvoryApp {
                         self.arr_drag = Some(ArrDrag::Nav { last: p, px_w });
                     }
                     Some(A::ClipBody(id)) => {
+                        // **Shift or Cmd ADDS to the selection.** The
+                        // marquee could build a set and a click could not, so
+                        // two clips that are not next to each other — the
+                        // case glue is for — had no way to be chosen
+                        // together. Shift because that is what selects a set
+                        // everywhere else in this app, and Cmd because it is
+                        // what the mixer's own multi-select uses.
+                        //
+                        // A second press on an already-selected clip takes it
+                        // back OUT, which is what makes a mis-click
+                        // recoverable without starting over.
+                        if shift || ctx.input(|i| i.modifiers.command) {
+                            if let Some(prev) = self.arr_selected {
+                                if prev != id && !self.arr_multi.contains(&prev) {
+                                    self.arr_multi.push(prev);
+                                }
+                            }
+                            if let Some(at) = self.arr_multi.iter().position(|c| *c == id) {
+                                self.arr_multi.remove(at);
+                                self.arr_selected = self.arr_multi.last().copied();
+                                self.arr_drag = None;
+                                return;
+                            }
+                            self.arr_multi.push(id);
+                            self.arr_selected = Some(id);
+                            self.arr_drag = None;
+                            return;
+                        }
                         // Grabbing a member of the SELECTED SET carries the
                         // whole set; anything else moves alone and clears
                         // the band's leftovers.
@@ -23061,8 +23093,10 @@ mod tests {
         let root = project_scratch("me-v2");
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
         app.bootstrap_project(&root.join("Projects"));
-        // Pinned: these figures were written against the old 1/16 default.
-        app.settings.midi_grid_exp = -4;
+        // Pinned: a quarter of a BEAT, which is a sixteenth note in 4/4 and
+        // 0.125 s at 120 bpm. The grid steps in beats now, so the spacing
+        // these figures were written against is -3 here.
+        app.settings.midi_grid_exp = -3;
         let note = |at: f64, key: u8| crate::arrangement::ArrNote {
             at_s: at,
             dur_s: 0.3,
@@ -23486,8 +23520,9 @@ mod tests {
         let root = project_scratch("midiedit");
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
         app.bootstrap_project(&root.join("Projects"));
-        // Pinned: these figures were written against the old 1/16 default.
-        app.settings.midi_grid_exp = -4;
+        // Pinned: a quarter of a BEAT — a sixteenth note in 4/4, 0.125 s at
+        // 120 bpm. That spacing was -4 under the old bar-fraction scheme.
+        app.settings.midi_grid_exp = -3;
         let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
             kind: crate::arrangement::ClipKind::Midi,
             notes: Vec::new(),
@@ -23511,7 +23546,7 @@ mod tests {
         app.open_midi_editor(id);
         assert!(app.midi_edit.is_some(), "the editor did not open");
 
-        // Default grid: 1/16 of a 2 s bar = 0.125 s. A press at 10.13
+        // A quarter of a beat = 0.125 s at 120 bpm. A press at 10.13
         // lands on 10.125, one step long, velocity a round hundred.
         app.me_create_note(10.13, 64);
         let note = app.arrangement.clips[0].notes[0].clone();
