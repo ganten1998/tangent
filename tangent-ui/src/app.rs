@@ -733,6 +733,13 @@ pub struct IvoryApp {
     /// The arrange header BAY's right-click menu: (lane, bay, where).
     /// Two rows — Delete FX, Replace FX — the mixer's insert menu, here.
     arr_fx_menu: Option<(usize, usize, egui::Pos2)>,
+    /// **The metronome's panel, while it hangs.** Painted like the dials'
+    /// own right-click panels rather than built as a dialog — see
+    /// `recorder_panel::draw_met`. `Some(())` because it has no state of its
+    /// own: it hangs off the toolbar button, whose rect the layout knows.
+    met_menu: Option<()>,
+    /// A drag along the panel's tempo track, once one has begun.
+    met_drag: bool,
     /// The meters' held picture: rise instant, fall exponential — the
     /// engine hands raw per-frame maxima, and raw maxima flicker.
     meter_hold: [[f32; 2]; crate::recorder::STRIPS],
@@ -1578,6 +1585,18 @@ const SWING_ROW_H: f32 = 24.0;
 
 /// Where the SWG menu stands: hanging under its chip, held inside the
 /// editor's panel.
+/// Where a point falls along the metronome panel's tempo track, 0..=1.
+///
+/// A free function because a DRAG asks it while the panel is not being
+/// hit-tested: once the grab is taken the answer must come from the track's
+/// geometry alone, not from whether the pointer is still over a row.
+fn met_track_fraction(screen: egui::Rect, anchor: egui::Rect, pos: egui::Pos2) -> Option<f32> {
+    let track = crate::recorder_panel::met_tempo_track(screen, anchor);
+    track
+        .is_positive()
+        .then(|| ((pos.x - track.left()) / track.width()).clamp(0.0, 1.0))
+}
+
 fn swing_menu_rect(anchor: egui::Rect, panel: egui::Rect) -> egui::Rect {
     let rows = 1 + crate::midi_editor::SWING_PRESETS.len();
     let size = egui::Vec2::new(238.0, SWING_ROW_H * rows as f32 + 8.0);
@@ -1943,6 +1962,8 @@ impl IvoryApp {
             tap_times: Vec::new(),
             arr_clip_menu: None,
             arr_fx_menu: None,
+            met_menu: None,
+            met_drag: false,
             meter_hold: [[0.0; 2]; crate::recorder::STRIPS],
             history: Vec::new(),
             hist_at: 0,
@@ -6187,7 +6208,6 @@ impl IvoryApp {
         self.settings.click_sample = path.to_owned();
         self.click_sample_dirty = true;
         self.save_settings();
-        self.refresh_metronome_dialog();
     }
 
     /// Copy `file` into the project's `media/` and stand it on the timeline.
@@ -9621,6 +9641,115 @@ impl IvoryApp {
             font,
             egui::Color32::from_rgb(0x24, 0x20, 0x1A),
         );
+    }
+
+    /// The metronome tool's rect, which the panel hangs off.
+    fn met_anchor(&self, rect: egui::Rect) -> egui::Rect {
+        let clips = self.arr_clip_views();
+        let view = self.arrange_view(&clips);
+        crate::arrangement_panel::Layout::new(rect, &view).tool_met
+    }
+
+    /// Draw the metronome's panel, when it is up.
+    fn draw_met_menu(&self, painter: &egui::Painter, rect: egui::Rect) {
+        if self.met_menu.is_none() {
+            return;
+        }
+        let sig = self.time_signature();
+        crate::recorder_panel::draw_met(
+            painter,
+            rect,
+            self.met_anchor(rect),
+            crate::recorder_panel::MetView {
+                bpm: self.tempo_bpm(),
+                beats: sig.beats,
+                unit: sig.unit,
+                div: self.settings.metronome_div,
+                sample: &self.settings.click_sample,
+            },
+            &self.settings,
+        );
+    }
+
+    /// A press or a drag inside the metronome panel. Answers whether the
+    /// panel took it — while it is up it owns every press, so a press on its
+    /// own chrome is swallowed rather than falling through to the lanes.
+    fn met_menu_press(&mut self, rect: egui::Rect, pos: egui::Pos2, pressed: bool) -> bool {
+        use crate::recorder_panel::MetHit;
+        if self.met_menu.is_none() {
+            return false;
+        }
+        let anchor = self.met_anchor(rect);
+        let hit = crate::recorder_panel::met_hit_test(rect, anchor, pos);
+        // **The tempo keeps its grab.** Once a drag starts on the track it
+        // stays on the track, wherever the hand slides to — the rule every
+        // fader on this desk follows, and the reason a drag that wanders off
+        // a two-point well does not stop moving the number.
+        if self.met_drag {
+            if let Some(t) = met_track_fraction(rect, anchor, pos) {
+                self.set_tempo_fraction(t);
+            }
+            return true;
+        }
+        if !pressed {
+            // A move with no button down, inside the panel: swallowed, so
+            // the lanes under it do not hover.
+            return crate::recorder_panel::met_popup_rect(rect, anchor).contains(pos);
+        }
+        match hit {
+            Some(MetHit::Close) => {
+                self.met_menu = None;
+            }
+            Some(MetHit::Tempo(t)) => {
+                self.met_drag = true;
+                self.set_tempo_fraction(t);
+            }
+            Some(MetHit::Beats(d)) => {
+                let sig = self.time_signature();
+                let beats = (i32::from(sig.beats) + i32::from(d)).clamp(1, 32) as u8;
+                self.set_time_signature(recorder::TimeSignature { beats, unit: sig.unit });
+            }
+            Some(MetHit::Unit(unit)) => {
+                let sig = self.time_signature();
+                self.set_time_signature(recorder::TimeSignature { beats: sig.beats, unit });
+            }
+            Some(MetHit::Div(div)) => {
+                self.settings.metronome_div = div.clamp(0, 8);
+                self.save_settings();
+            }
+            Some(MetHit::SoundPick) => {
+                if self.caps.native_file_dialogs {
+                    self.native_panel_up = true;
+                    self.file_request = Some(crate::ports::FileRequest {
+                        start_at: None,
+                        title: "Choose a click sound".to_owned(),
+                        extensions: vec![
+                            "wav".into(), "aif".into(), "aiff".into(), "flac".into(),
+                            "mp3".into(), "m4a".into(), "ogg".into(), "opus".into(),
+                        ],
+                        extension_label: "Audio".to_owned(),
+                        purpose: crate::ports::FilePurpose::ClickSample,
+                        multi: false,
+                    });
+                }
+            }
+            Some(MetHit::SoundReset) => {
+                self.settings.click_sample = String::new();
+                self.click_sample_dirty = true;
+                self.save_settings();
+            }
+            // The panel's own chrome — a title, a gap between rows. Eaten,
+            // because a press inside a panel is never a press on what is
+            // behind it.
+            None => {}
+        }
+        true
+    }
+
+    /// The tempo, from a fraction along the panel's track.
+    fn set_tempo_fraction(&mut self, t: f32) {
+        let bpm = crate::recorder_panel::knob_to_tempo(t);
+        self.apply_recorder_hit(recorder_panel::Hit::SetTempo(bpm));
     }
 
     /// Draw the clip menu — or the bay's FX menu — over the arrangement.
@@ -13386,6 +13515,40 @@ impl IvoryApp {
                 ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::ResizeHorizontal);
             }
         }
+        // **The METRONOME's panel: while it is up it owns every press.**
+        // Before the bay menu and before the lanes, because it is drawn in
+        // front of both — a panel that is painted over something it does not
+        // take presses from is a panel you can click through.
+        if let (true, Some(rect)) = (self.met_menu.is_some(), self.arrangement_rect) {
+            let (down, released, pointer) = ctx.input(|i| {
+                (
+                    i.pointer.primary_pressed(),
+                    !i.pointer.primary_down(),
+                    i.pointer.interact_pos(),
+                )
+            });
+            if released {
+                self.met_drag = false;
+            }
+            if let Some(p) = pointer {
+                // Outside it: the press closes it and is spent, the way
+                // every other menu on this desk dismisses.
+                let inside =
+                    crate::recorder_panel::met_popup_rect(rect, self.met_anchor(rect)).contains(p);
+                if down && !inside && !self.met_drag {
+                    self.met_menu = None;
+                    self.met_drag = false;
+                    self.menu_ate_press = true;
+                    return;
+                }
+                if self.met_menu_press(rect, p, down) {
+                    return;
+                }
+            }
+            if self.met_menu.is_some() {
+                return;
+            }
+        }
         // The BAY's FX menu: while it is up it owns every press.
         if let Some((lane, bay, at)) = self.arr_fx_menu {
             let (pressed, sec, pointer) = ctx.input(|i| {
@@ -13548,7 +13711,8 @@ impl IvoryApp {
                     )
                 };
                 if on_metronome {
-                    self.open_metronome_dialog(Some(p));
+                    self.met_menu = Some(());
+                    self.met_drag = false;
                     return;
                 }
                 // A LOADED bay answers with its own menu — Delete FX or
@@ -14050,8 +14214,13 @@ impl IvoryApp {
                     // does nothing and the double-click that renames is
                     // untouched (it clears the drag before this ever runs).
                     Some(A::HdrNumber(n)) | Some(A::HdrName(n)) => {
+                        // **An EMPTY slot selects too**, and only that: there
+                        // is nothing there to reorder. It is a paste
+                        // destination now, so it has to be able to say it is
+                        // the one chosen — and a press that changed nothing
+                        // on screen read as a press that did not land.
+                        self.select_track(n, ctx.input(|i| i.modifiers));
                         if self.channel_used(n) {
-                            self.select_track(n, ctx.input(|i| i.modifiers));
                             self.arr_drag = Some(ArrDrag::ReorderLane { from: n });
                         }
                     }
@@ -17140,53 +17309,6 @@ impl IvoryApp {
         self.settings.metronome_div.clamp(0, 8) as u32
     }
 
-    /// **Open the metronome's panel.** Tempo, signature, how often it clicks
-    /// and what it clicks WITH — the four questions about the click, in the
-    /// one place a right-click on it reaches.
-    pub fn open_metronome_dialog(&mut self, at: Option<egui::Pos2>) {
-        let sig = self.time_signature();
-        self.dialog_serial = self.dialog_serial.wrapping_add(1);
-        self.dialog = Some(dialogs::Dialog::Metronome {
-            bpm: self.tempo_bpm(),
-            beats: sig.beats,
-            unit: sig.unit,
-            div: self.settings.metronome_div,
-            sample: self.settings.click_sample.clone(),
-            serial: self.dialog_serial,
-            at,
-        });
-    }
-
-    /// Re-read the panel from the settings it just wrote.
-    ///
-    /// The dialog holds a COPY — it is drawn from a snapshot so its closure
-    /// borrows nothing — and every setter here goes through the same code a
-    /// keystroke or a toolbar click does, which may clamp or retime. Without
-    /// this the panel would show what was asked for rather than what happened.
-    fn refresh_metronome_dialog(&mut self) {
-        let sig = self.time_signature();
-        let bpm = self.tempo_bpm();
-        let div = self.settings.metronome_div;
-        let sample = self.settings.click_sample.clone();
-        if let Some(dialogs::Dialog::Metronome {
-            bpm: b,
-            beats,
-            unit,
-            div: d,
-            sample: smp,
-            serial,
-            ..
-        }) = self.dialog.as_mut()
-        {
-            *b = bpm;
-            *beats = sig.beats;
-            *unit = sig.unit;
-            *d = div;
-            *smp = sample;
-            *serial = serial.wrapping_add(1);
-        }
-    }
-
     /// Step the click's division. Wraps, so one key walks the whole set.
     pub fn cycle_metronome_div(&mut self) {
         // 0 (once a bar), 1 (a beat), 2, 3, 4 — the divisions anybody counts
@@ -19180,45 +19302,6 @@ impl IvoryApp {
             // **The confirmed halves.** None of these four is reachable from a
             // menu row: each arrives from a button on a [`Dialog::Confirm`],
             // which is what makes the confirmation impossible to route round.
-            // **The metronome panel's four.** Each routes to the setter that
-            // already existed, so the panel is a second door to them and not
-            // a second copy — a tempo written here that skipped
-            // `retime_arrangement` would move the click and leave the clips.
-            DialogAction::SetTempo(bpm) => {
-                self.apply_recorder_hit(recorder_panel::Hit::SetTempo(bpm));
-                self.refresh_metronome_dialog();
-            }
-            DialogAction::SetTimeSignature(beats, unit) => {
-                self.set_time_signature(recorder::TimeSignature { beats, unit });
-                self.refresh_metronome_dialog();
-            }
-            DialogAction::SetMetronomeDiv(div) => {
-                self.settings.metronome_div = div.clamp(0, 8);
-                self.save_settings();
-                self.refresh_metronome_dialog();
-            }
-            DialogAction::MetronomeSamplePick => {
-                if self.caps.native_file_dialogs {
-                    self.native_panel_up = true;
-                    self.file_request = Some(crate::ports::FileRequest {
-                        start_at: None,
-                        title: "Choose a click sound".to_owned(),
-                        extensions: vec![
-                            "wav".into(), "aif".into(), "aiff".into(), "flac".into(),
-                            "mp3".into(), "m4a".into(), "ogg".into(), "opus".into(),
-                        ],
-                        extension_label: "Audio".to_owned(),
-                        purpose: crate::ports::FilePurpose::ClickSample,
-                        multi: false,
-                    });
-                }
-            }
-            DialogAction::MetronomeSampleReset => {
-                self.settings.click_sample = String::new();
-                self.click_sample_dirty = true;
-                self.save_settings();
-                self.refresh_metronome_dialog();
-            }
             DialogAction::ResetTo(scope) => {
                 self.dialog = None;
                 self.pending_reset = Some(scope);
@@ -21722,6 +21805,9 @@ impl IvoryApp {
             let view = self.arrange_view(&clips);
             crate::arrangement_panel::draw(ui.painter(), rect, &view);
             self.draw_clip_menu(ui.painter());
+            // Over the lanes and over the clip menu: it is the frontmost
+            // thing on this surface while it is up, and it owns every press.
+            self.draw_met_menu(ui.painter(), rect);
             self.draw_bay_carry(ui.painter(), ui.ctx().pointer_interact_pos());
             // The timeline's tab stops, on the desk's own terms. See
             // `tangent_ui::a11y`, and `arrangement_panel::targets` for why
