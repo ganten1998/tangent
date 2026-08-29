@@ -702,7 +702,7 @@ pub fn draw(
                 Pos2::new(x, y),
                 Align2::CENTER_CENTER,
                 arrow,
-                FontId::new((r * 1.5).max(7.0), fonts::courier_bold()),
+                FontId::new(fonts::px((r * 1.5).max(7.0)), fonts::courier_bold()),
                 p.dot,
             );
         } else if pos.fret == g.capo {
@@ -724,7 +724,7 @@ pub fn draw(
             let c = Pos2::new(gutter_x(rect, &g), y);
             painter.circle_stroke(c, r, Stroke::new((r * 0.42).clamp(2.0, 3.5), p.dot));
             if s.show_fret_note_names {
-                let size = r * 0.95;
+                let size = fonts::px(r * 0.95);
                 if size >= 6.0 {
                     painter.text(
                         c,
@@ -752,7 +752,7 @@ pub fn draw(
             // four points is a smudge that makes the board harder to read, not
             // easier, which is the whole failure mode of a teaching label.
             if s.show_fret_note_names {
-                let size = r * 1.05;
+                let size = fonts::px(r * 1.05);
                 if size >= 6.0 {
                     painter.text(
                         c,
@@ -788,7 +788,7 @@ pub fn draw(
             Pos2::new(gutter_x(rect, &g), g.y(st)),
             Align2::CENTER_CENTER,
             "\u{00d7}",
-            FontId::new((g.dot_r() * 1.9).max(8.0), fonts::courier_bold()),
+            FontId::new(fonts::px((g.dot_r() * 1.9).max(8.0)), fonts::courier_bold()),
             colour,
         );
     }
@@ -889,7 +889,7 @@ fn gutter_x(rect: Rect, g: &Geom) -> f32 {
 /// there to be read when something is missing, not to be noticed otherwise,
 /// and above all it must not move the neck to say so.
 fn draw_caption(painter: &Painter, rect: Rect, text: &str, p: &Palette, _s: &Settings) {
-    let size = (rect.height() * 0.115).max(8.0);
+    let size = fonts::px((rect.height() * 0.115).max(8.0));
     painter.text(
         Pos2::new(rect.right() - 6.0, rect.bottom() - 3.0),
         Align2::RIGHT_BOTTOM,
@@ -1072,7 +1072,7 @@ fn draw_intervals(
     // Sized to the strip as well as to the strings: a label wider than the
     // margin it sits in would hang over the last fret.
     let font = FontId::new(
-        (g.spacing * 0.62).clamp(8.0, 15.0).min(rect.width() * 0.52),
+        fonts::px((g.spacing * 0.62).clamp(8.0, 15.0).min(rect.width() * 0.52)),
         crate::fonts::courier_bold(),
     );
     for (string, state) in voicing.strings.iter().enumerate() {

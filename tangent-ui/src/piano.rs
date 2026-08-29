@@ -267,7 +267,7 @@ fn draw_names(
     // Sized off the key, and not drawn at all below the point where the letters
     // would be a grey smear. A label nobody can read is worse than the space it
     // took.
-    let size = (white_key_w as f32 * 0.46).min(rect.height() * 0.12);
+    let size = crate::fonts::px((white_key_w as f32 * 0.46).min(rect.height() * 0.12));
     if size < 6.0 {
         return;
     }

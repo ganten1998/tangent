@@ -532,11 +532,11 @@ fn visible_on(c: Color32, bg: Color32, floor: f32) -> Color32 {
 }
 
 fn font(size: f32) -> FontId {
-    FontId::new(size, fonts::courier_bold())
+    FontId::new(fonts::px(size), fonts::courier_bold())
 }
 
 fn font_light(size: f32) -> FontId {
-    FontId::new(size, fonts::courier())
+    FontId::new(fonts::px(size), fonts::courier())
 }
 
 // ── the band ───────────────────────────────────────────────────────────────

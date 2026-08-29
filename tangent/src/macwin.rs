@@ -103,6 +103,51 @@ impl Curve {
         self.h.get(i).copied().unwrap_or(0.0)
     }
 
+    /// **The point on the curve nearest the rectangle being asked for.**
+    ///
+    /// For a corner drag both dimensions move at once, so there is no single
+    /// input to follow — and following just one of them is what made corners
+    /// feel awful: drag a corner downward, the width barely moves, the window
+    /// barely resizes, the cursor runs away, and then a stray pixel sideways
+    /// snaps the height a long way.
+    ///
+    /// Minimising the distance to the proposed rectangle instead moves the
+    /// answer smoothly as the cursor moves, in any direction, and reduces to
+    /// "follow that edge" when only one dimension has changed. Scanned rather
+    /// than solved because the curve is a truncation staircase, seeded from
+    /// both single-dimension answers so the scan starts near the minimum.
+    fn nearest(&self, want_w: f32, want_h: f32) -> f32 {
+        if self.h.is_empty() {
+            return self.w_min as f32;
+        }
+        let cost = |i: usize| {
+            let w = (self.w_min + i as u32) as f32;
+            let dw = w - want_w;
+            let dh = self.h[i] - want_h;
+            dw * dw + dh * dh
+        };
+        let seeds = [
+            (self.clamp_w(want_w) as u32).saturating_sub(self.w_min) as usize,
+            (self.width_for_height(want_h) as u32).saturating_sub(self.w_min) as usize,
+        ];
+        let last = self.h.len() - 1;
+        let mut best = seeds[0].min(last);
+        let mut best_c = cost(best);
+        for seed in seeds {
+            let seed = seed.min(last);
+            let lo = seed.saturating_sub(64);
+            let hi = (seed + 64).min(last);
+            for i in lo..=hi {
+                let c = cost(i);
+                if c < best_c {
+                    best_c = c;
+                    best = i;
+                }
+            }
+        }
+        (self.w_min + best as u32) as f32
+    }
+
     /// The width whose height is closest to `target`.
     ///
     /// A seeded scan rather than a binary search: the height curve truncates
@@ -293,6 +338,19 @@ unsafe extern "C-unwind" fn will_resize(
     // SAFETY: `CURVE` holds a leaked `Box<Curve>`; `sender` is a live window.
     let (curve, win) = unsafe { (&*curve, &*sender) };
 
+    // **Only ever constrain a HAND on the edge.**
+    //
+    // AppKit asks this delegate for programmatic frame changes as well as for
+    // live resizes — which means every placement a tiling window manager
+    // makes comes through here too. Answering those put the window back on
+    // our aspect, the tiler re-placed it, and the two fought: exactly the
+    // wild jumping this hook was meant to end, moved from the app into the
+    // callback. A window manager's geometry is not ours to argue with; the
+    // app's own `main_wm_managed` latch says the same thing one level up.
+    if !win.inLiveResize() {
+        return proposed;
+    }
+
     // **Chrome measured, never assumed.** It is about 32 points with
     // decorations and exactly 0 in borderless mode, which is toggleable at
     // runtime — so a hardcoded number drifts by a title bar per drag.
@@ -309,11 +367,27 @@ unsafe extern "C-unwind" fn will_resize(
     // Whichever edge moved leads, measured against the window's CURRENT
     // content rect — AppKit gives us both, so unlike the app's own arithmetic
     // there is nothing to remember and nothing to get out of step.
-    let height_led = (want_h - content.size.height).abs()
-        > (want_w - content.size.width).abs() + 0.5;
-    let w = if height_led {
+    // **Which edge leads — and a corner is not a close call between two.**
+    //
+    // This asked "did the height change more than the width", which is right
+    // for a single edge and wrong for a CORNER: dragging one moves both, so
+    // the answer flipped between width-led and height-led from frame to
+    // frame and the window oscillated instead of tracking. Hence the corner
+    // drag being horrific while the edges were fine.
+    //
+    // So the height leads only when the width did not move at all — a pure
+    // top or bottom edge. Everything else, corners included, follows the
+    // width, which is the dimension this layout is actually a function of.
+    let dw = (want_w - content.size.width).abs();
+    let dh = (want_h - content.size.height).abs();
+    let w = if dw >= 0.5 && dh >= 0.5 {
+        // A CORNER: both edges moved, so there is nothing to "follow".
+        curve.nearest(want_w as f32, want_h as f32)
+    } else if dw < 0.5 && dh >= 0.5 {
+        // A pure top or bottom edge: the height leads and the width follows.
         curve.width_for_height(want_h as f32)
     } else {
+        // A pure side, and the do-nothing case: the width leads.
         curve.clamp_w(want_w as f32)
     };
     let h = curve.height_at(w);
