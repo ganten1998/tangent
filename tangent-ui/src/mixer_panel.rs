@@ -71,6 +71,10 @@ pub struct StripView<'a> {
     /// Decibels the limiter took off, for the master alone. Zero for none.
     pub gr_db: f32,
     pub muted: bool,
+    /// **Polarity inverted.** A per-strip switch beside the mute, and the
+    /// one thing on a desk that is inaudible alone and decisive in a pair:
+    /// two mics on one source out of phase cancel, and this is the fix.
+    pub phase: bool,
     pub soloed: bool,
     /// Whether the channel can be taken off the desk — a used general
     /// channel. Decided by the APP; a removable channel wears a small × at
@@ -192,6 +196,8 @@ pub enum Hit {
     /// The input chip under the icon: open the channel's INPUT menu.
     InputChip(Column),
     Mute(Column),
+    /// **Ø** — invert this strip's polarity.
+    Phase(Column),
     Solo(Column),
     /// **What is on this channel**: the plus on an empty slot, and the icon
     /// above the name on a filled one. Both open the same picker — the
@@ -250,6 +256,7 @@ impl Hit {
             | Hit::Send(i)
             | Hit::Pan(i)
             | Hit::Mute(i)
+            | Hit::Phase(i)
             | Hit::Solo(i)
             | Hit::Add(i)
             | Hit::Insert(i, _)
@@ -280,7 +287,7 @@ impl Hit {
             // down, and a control that fills to the right has to be swept to
             // the right or the picture and the hand disagree.
             Hit::RouteGain(..) => Some(DragAxis::Horizontal),
-            Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(..)
+            Hit::Mute(_) | Hit::Phase(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(..)
             | Hit::Db(_) | Hit::Name(_) | Hit::Remove(_) | Hit::Arm(_) | Hit::ToTheory(_)
             | Hit::Mono(_) | Hit::FxMenu(..) | Hit::InputChip(_) | Hit::Routing(_) => None,
         }
@@ -293,7 +300,7 @@ impl Hit {
             Hit::Send(_) => Some(SEND_TRAVEL),
             Hit::Pan(_) => Some(SEND_TRAVEL),
             Hit::RouteGain(..) => Some(SEND_TRAVEL),
-            Hit::Mute(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(..)
+            Hit::Mute(_) | Hit::Phase(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(..)
             | Hit::Db(_) | Hit::Name(_) | Hit::Remove(_) | Hit::Arm(_) | Hit::ToTheory(_)
             | Hit::Mono(_) | Hit::FxMenu(..) | Hit::InputChip(_) | Hit::Routing(_) => None,
         }
@@ -614,6 +621,13 @@ pub struct StripStrip {
     pub fader: Rect,
     pub db: Rect,
     pub mute: Rect,
+    /// **Ø — polarity**, a thin band directly above the switch row.
+    ///
+    /// Above rather than among them because it is a different KIND of switch:
+    /// M, S, R and T are about where a track goes, and this is about the
+    /// waveform itself. Small, because it is set once when two mics disagree
+    /// and then never touched again.
+    pub phase: Rect,
     pub solo: Rect,
     /// The R switch. `NOTHING` on everything but a general channel.
     pub arm: Rect,
@@ -658,6 +672,7 @@ impl StripStrip {
         fader: Rect::NOTHING,
         db: Rect::NOTHING,
         mute: Rect::NOTHING,
+        phase: Rect::NOTHING,
         solo: Rect::NOTHING,
         arm: Rect::NOTHING,
         inserts: [Rect::NOTHING; INSERTS * 2],
@@ -854,6 +869,27 @@ impl Layout {
             )
         });
         let switches = if switchable { cut(0.902, 0.975) } else { Rect::NOTHING };
+        // **Polarity shares the dB row**, at its right end.
+        //
+        // There is no band of its own to have: the gap between the readout
+        // and the switches is under two percent of the strip, which is five
+        // pixels — a target nobody could hit. The readout is centred text
+        // with room at both ends, so the switch takes the right end and the
+        // number keeps the rest. Still above the four switches, which is
+        // where it was asked for.
+        //
+        // Shed with them: a strip too narrow for a legible number is too
+        // narrow for a switch beside it.
+        let db_band = cut(0.83, 0.888);
+        let phase = if switchable && db_band.width() > 46.0 {
+            let d = db_band.height().min(14.0).max(9.0);
+            Rect::from_min_size(
+                Pos2::new(db_band.right() - d - 1.0, db_band.center().y - d * 0.5),
+                Vec2::splat(d),
+            )
+        } else {
+            Rect::NOTHING
+        };
         // **The MONO fold, on the master and nowhere else.** It takes the
         // switch row that a channel spends on M/S/R — the master has none of
         // those, so the row was empty paint at the foot of the one strip
@@ -1011,8 +1047,17 @@ impl Layout {
             send,
             pan,
             fader: Rect::from_min_max(Pos2::new(split, travel.min.y), travel.max),
-            db: cut(0.83, 0.888),
+            // The number keeps everything the polarity switch did not take.
+            db: if phase.is_positive() {
+                Rect::from_min_max(
+                    db_band.min,
+                    Pos2::new(phase.left() - 2.0, db_band.max.y),
+                )
+            } else {
+                db_band
+            },
             mute,
+            phase,
             solo,
             arm,
             theory,
@@ -1042,6 +1087,7 @@ impl Layout {
                 (s.pan, Hit::Pan(i)),
                 (s.input_chip, Hit::InputChip(i)),
                 (s.mute, Hit::Mute(i)),
+                (s.phase, Hit::Phase(i)),
                 (s.solo, Hit::Solo(i)),
                 (s.arm, Hit::Arm(i)),
                 (s.theory, Hit::ToTheory(i)),
@@ -1137,6 +1183,7 @@ pub fn a11y_nodes(rect: Rect, view: &MixerView<'_>) -> Vec<crate::a11y::Node> {
                 travel((s.pan + 1.0) * 0.5, DragAxis::Vertical),
             ),
             Hit::Mute(_) => Node::toggle(id, r, format!("{who} mute"), s.muted),
+            Hit::Phase(_) => Node::toggle(id, r, format!("{who} polarity invert"), s.phase),
             Hit::Solo(_) => Node::toggle(id, r, format!("{who} solo"), s.soloed),
             Hit::Arm(_) => Node::toggle(id, r, format!("{who} record arm"), s.armed),
             Hit::ToTheory(_) => Node::toggle(
@@ -1201,6 +1248,7 @@ fn hit_column(hit: Hit) -> Option<Column> {
         | Hit::Pan(i)
         | Hit::InputChip(i)
         | Hit::Mute(i)
+        | Hit::Phase(i)
         | Hit::Solo(i)
         | Hit::Arm(i)
         | Hit::ToTheory(i)
@@ -1847,6 +1895,16 @@ fn strip(
     if l.mute.is_positive() {
         switch(painter, l.mute, "M", v.muted, p.mute, p);
         switch(painter, l.solo, "S", v.soloed, p.solo, p);
+    }
+    // **Ø — polarity**, above the switch row and drawn like it, so a hand
+    // that has learned M and S reads this without being told.
+    //
+    // On the theme's ENGRAVE ink rather than a light of its own: it is
+    // neither a mute nor a solo, and a third warning colour on a strip that
+    // already carries two would be read as a third kind of danger. The same
+    // choice the T switch below it makes, for the same reason.
+    if l.phase.is_positive() {
+        switch(painter, l.phase, "\u{d8}", v.phase, p.engrave, p);
     }
     if l.arm.is_positive() {
         switch(painter, l.arm, "R", v.armed, p.arm, p);
@@ -2564,6 +2622,7 @@ mod tests {
             pan: 0.0,
             peak: [0.0; 2],
             muted: false,
+    phase: false,
             soloed: false,
             // What the app decides: a used general channel can be removed.
             removable: !empty && matches!(strip, Some(Strip::Channel(_))),

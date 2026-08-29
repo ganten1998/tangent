@@ -4085,6 +4085,8 @@ impl DesktopApp {
             // Beside the meter, because it is read with it: how many clicks
             // a beat of that signature carries.
             e.set_metronome_div(self.app.metronome_div());
+            // Polarity, one bit per strip — see `Shared::strip_phase`.
+            e.set_strip_phase(self.app.strip_phase());
         }
         // **The maps, in the export mirror too.** `start_offline_bounce`
         // furnishes a second engine BY HAND and duplicates four things the
@@ -5643,6 +5645,8 @@ impl DesktopApp {
             // Beside the meter, because it is read with it: how many clicks
             // a beat of that signature carries.
             e.set_metronome_div(self.app.metronome_div());
+            // Polarity, one bit per strip — see `Shared::strip_phase`.
+            e.set_strip_phase(self.app.strip_phase());
         }
     }
 

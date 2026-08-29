@@ -53,6 +53,8 @@ pub struct LaneView<'a> {
     pub inserts: [&'a str; crate::recorder::INSERTS],
     /// How many routes leave this lane, for the ROUTING chip.
     pub route_count: usize,
+    /// Polarity inverted — see `mixer_panel::StripView::phase`.
+    pub phase: bool,
     pub muted: bool,
     /// **Every automation row this lane is showing**, in row order, top to
     /// bottom under the track.
@@ -406,6 +408,8 @@ pub enum Hit {
     AutoLane(usize, usize, f64, f64),
     /// The sub-lane's own header: which parameter it shows.
     /// One automation ROW's header — `(lane, row)`.
+    /// **Ø** — invert this track's polarity.
+    Phase(usize),
     AutoParamPick(usize, usize),
     /// **×** on an automation row: stop showing this lane.
     AutoClose(usize, usize),
@@ -747,6 +751,13 @@ pub struct HeaderRow {
     pub pan_readout: Rect,
     pub meter: Rect,
     pub mute: Rect,
+    /// **Ø — polarity**, directly above the mute, and small.
+    ///
+    /// Above rather than beside: the row is already M and S wall-to-wall at
+    /// the right end, and this is a different kind of switch — M and S are
+    /// about where a track goes, this is about the waveform itself. Set once
+    /// when two mics disagree and then left alone.
+    pub phase: Rect,
     pub solo: Rect,
     /// **T** — send this track's MIDI to the theory view.
     ///
@@ -804,6 +815,7 @@ impl HeaderRow {
         pan_readout: Rect::NOTHING,
         meter: Rect::NOTHING,
         mute: Rect::NOTHING,
+        phase: Rect::NOTHING,
         solo: Rect::NOTHING,
         input: Rect::NOTHING,
         bays: [Rect::NOTHING; crate::recorder::INSERTS],
@@ -1106,6 +1118,18 @@ impl Layout {
             Pos2::new(solo.left() - 2.0 - sw, r.center().y - sw * 0.5),
             Vec2::splat(sw),
         );
+        // Polarity, above the mute and two thirds its size — shed entirely
+        // when the row is too short for it to sit clear of the mute's top
+        // edge, rather than drawn on top of it.
+        let phase = {
+            let d = (sw * 0.62).clamp(8.0, 12.0);
+            let top = mute.top() - 1.5 - d;
+            if d >= 8.0 && top >= r.top() + 1.0 {
+                Rect::from_min_size(Pos2::new(mute.center().x - d * 0.5, top), Vec2::splat(d))
+            } else {
+                Rect::NOTHING
+            }
+        };
         let meter = Rect::from_min_max(
             Pos2::new(mute.left() - 8.0, r.top() + h * 0.15),
             Pos2::new(mute.left() - 3.0, r.bottom() - h * 0.15),
@@ -1301,6 +1325,7 @@ impl Layout {
             pan_readout: readout(pan),
             meter,
             mute,
+            phase,
             solo,
             input,
             bays,
@@ -1650,6 +1675,7 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
         for (r, hit) in [
             (row.arm, Hit::Arm(i)),
             (row.mute, Hit::Mute(i)),
+            (row.phase, Hit::Phase(i)),
             (row.solo, Hit::Solo(i)),
             (row.theory, Hit::ToTheory(i)),
             (row.automation, Hit::AutoMenu(i)),
@@ -1961,6 +1987,7 @@ pub fn targets(rect: Rect, view: &ArrangeView<'_>) -> Vec<(Rect, Hit)> {
                     (hdr.knob, Hit::Gain(i)),
                     (hdr.send, Hit::Send(i)),
                     (hdr.routing, Hit::HdrRouting(i)),
+                    (hdr.phase, Hit::Phase(i)),
                     (hdr.mute, Hit::Mute(i)),
                     (hdr.solo, Hit::Solo(i)),
                 ] {
@@ -2074,6 +2101,12 @@ pub fn a11y_nodes(rect: Rect, view: &ArrangeView<'_>) -> Vec<crate::a11y::Node> 
             Hit::HeaderGrip => continue,
             // ── the rows' own headers ─────────────────────────────────
             Hit::TempoHeader => Node::button(id, r, "Song tempo, flatten to one tempo"),
+            Hit::Phase(i) => Node::toggle(
+                id,
+                r,
+                &format!("Track {} polarity invert", i + 1),
+                view.lanes.get(i).is_some_and(|l| l.phase),
+            ),
             Hit::AutoClose(i, slot) => {
                 Node::button(id, r, &format!("Hide automation row {} on track {}", slot + 1, i + 1))
             }
@@ -4007,6 +4040,10 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             // **A** — lit when this track is showing any automation row, so
             // the header says at a glance that the rows below belong to it.
             (row.automation, "A", !lane.automation.is_empty(), p.select),
+            // Ø on the theme's own selection ink, like T and A above it: it
+            // is neither a mute nor a solo, and a third warning colour on a
+            // header carrying two would read as a third kind of danger.
+            (row.phase, "\u{d8}", lane.phase, p.select),
             (row.mute, "M", lane.muted, p.mute),
             (row.solo, "S", lane.soloed, p.solo),
         ] {
@@ -4436,6 +4473,7 @@ LaneView {
             used,
             armed: false,
             muted: false,
+    phase: false,
             soloed: false,
             gain: 1.0,
             send: 0.0,

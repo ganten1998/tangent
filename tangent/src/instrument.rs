@@ -947,12 +947,26 @@ impl Beats {
 /// the compiler see they are disjoint — and the methods below stay, because
 /// every other site reads better for having them.
 fn lane_gain_of(auto: &AutoNow, shared: &Shared, lane: usize) -> f32 {
-    match auto.gain.get(lane).copied().flatten() {
+    let g = match auto.gain.get(lane).copied().flatten() {
         Some(v) => tangent_ui::recorder::fader_to_gain(v).clamp(0.0, 8.0),
         None => shared
             .channel_gains
             .get(lane)
             .map_or(1.0, |g| Shared::f32_of(g).clamp(0.0, 8.0)),
+    };
+    // **Polarity, here and nowhere else.** Inverting a signal is multiplying
+    // it by minus one, and this is the one function every path through the
+    // mixer already asks for a strip's level — the lane walk, the sends, the
+    // drum bus, the monitor. Doing it anywhere else would mean finding all of
+    // them, and missing one would be a phased strip that is only phased on
+    // some routes, which is worse than not having the switch.
+    //
+    // Automation is respected: a curve names a LEVEL, and the polarity is a
+    // property of the strip that the level passes through.
+    if lane < 32 && shared.strip_phase.load(Ordering::Relaxed) & (1 << lane) != 0 {
+        -g
+    } else {
+        g
     }
 }
 
@@ -1790,6 +1804,14 @@ struct Shared {
     count_in_in_take: AtomicBool,
     bpm: AtomicU64,
     beats_per_bar: AtomicU32,
+    /// **Which strips have their polarity inverted**, one bit per
+    /// `Strip::index`.
+    ///
+    /// A bitmask like `muted` and `soloed` beside it, and applied where the
+    /// gain is resolved: inverting polarity IS multiplying by minus one, so
+    /// there is nothing else to do and no second path through the mixer for
+    /// a phased signal to take.
+    strip_phase: AtomicU32,
     /// **How often the click sounds, per beat of the signature.**
     ///
     /// 1 is one click a beat, 2 is twice a beat, 0 is one a BAR. Held as a
@@ -1937,6 +1959,7 @@ impl Shared {
             count_in_in_take: AtomicBool::new(false),
             bpm: AtomicU64::new(120.0f64.to_bits()),
             beats_per_bar: AtomicU32::new(4),
+            strip_phase: AtomicU32::new(0),
             metronome_div: AtomicU32::new(1),
             beat_unit: AtomicU32::new(4),
             count_in_req: AtomicU64::new(0),
@@ -7870,6 +7893,11 @@ impl Engine {
     /// 6/4, which is a bar and a half of clicks at the wrong speed. They are
     /// still two atomics — a callback can still catch them mid-change — but the
     /// window is one store apart rather than a whole UI frame.
+    /// **Which strips are polarity-inverted**, one bit per `Strip::index`.
+    pub fn set_strip_phase(&self, mask: u32) {
+        self.shared.strip_phase.store(mask, Ordering::Relaxed);
+    }
+
     /// How often the click sounds — see `Shared::metronome_div`.
     pub fn set_metronome_div(&self, div: u32) {
         self.shared.metronome_div.store(div.min(8), Ordering::Relaxed);
@@ -11525,6 +11553,46 @@ mod tests {
     /// what was sounding BEFORE the jump; a note whose on is emitted in the
     /// very block that flushed must keep its ledger entry, or its off is
     /// never owed and the key hangs until the next flush.
+    /// **Polarity inversion is a sign on the gain, and nothing else.**
+    ///
+    /// Applied where the level is resolved, because that is the one function
+    /// every path through the mixer already asks — the lane walk, the sends,
+    /// the drum bus, the monitor. Doing it anywhere else would mean finding
+    /// all of them, and missing one would be a strip that is phased on some
+    /// routes and not others, which is worse than not having the switch.
+    #[test]
+    fn a_phased_strip_comes_out_inverted_and_the_others_do_not() {
+        let shared = Shared::new();
+        let auto = AutoNow::default();
+        // Unity to start, both lanes.
+        shared.channel_gains[0].store(1.0f32.to_bits(), Ordering::Relaxed);
+        shared.channel_gains[1].store(1.0f32.to_bits(), Ordering::Relaxed);
+        assert!(lane_gain_of(&auto, &shared, 0) > 0.0);
+        assert!(lane_gain_of(&auto, &shared, 1) > 0.0);
+
+        // Phase lane 0 alone.
+        shared.strip_phase.store(1, Ordering::Relaxed);
+        let a = lane_gain_of(&auto, &shared, 0);
+        let b = lane_gain_of(&auto, &shared, 1);
+        assert!(a < 0.0, "the phased lane was not inverted: {a}");
+        assert!(b > 0.0, "an unphased lane was inverted with it: {b}");
+        assert!(
+            (a.abs() - b.abs()).abs() < 1e-6,
+            "inverting changed the LEVEL as well as the sign: {a} vs {b}"
+        );
+
+        // Off again, and it comes back exactly as it was.
+        shared.strip_phase.store(0, Ordering::Relaxed);
+        assert!((lane_gain_of(&auto, &shared, 0) - b).abs() < 1e-6);
+
+        // A bit past the mask's width must not panic or wrap onto a real lane.
+        shared.strip_phase.store(u32::MAX, Ordering::Relaxed);
+        for lane in [0usize, 15, 31, 32, 64] {
+            let g = lane_gain_of(&auto, &shared, lane);
+            assert!(g.is_finite(), "lane {lane} gave {g}");
+        }
+    }
+
     #[test]
     fn a_jump_landing_on_a_note_keeps_its_off_owed() {
         use std::sync::Arc;
