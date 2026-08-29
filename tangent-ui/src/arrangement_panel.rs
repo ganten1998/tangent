@@ -3811,6 +3811,22 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             // margin around a dark plate read as two surfaces, the owner's
             // "my bad" screenshot.
             painter.rect_filled(row.panel, 0.0, p.empty_ground);
+            // **And an empty slot wears the rim too**, like the mixer's.
+            //
+            // An empty slot is a destination now — a copied track is pasted
+            // INTO one — so it has to be able to say it is the one chosen.
+            // Without this a press on an empty row changed the selection and
+            // nothing on screen moved, which reads as a press that did not
+            // land. On the panel rather than the plate, because the ground
+            // it is drawn against is the panel.
+            if view.selected_tracks.contains(&i) {
+                painter.rect_stroke(
+                    row.panel.shrink(1.0),
+                    2.0,
+                    Stroke::new(1.2, crate::recorder_panel::selection_rim(p.empty_ground)),
+                    egui::StrokeKind::Inside,
+                );
+            }
         }
         // **The ink is one of the two INKS, not one of the theme's colours.**
         //

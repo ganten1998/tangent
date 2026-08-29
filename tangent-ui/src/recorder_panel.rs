@@ -6662,6 +6662,92 @@ fn painter_border(painter: &Painter, rect: Rect) {
 
 #[cfg(test)]
 mod tests {
+    /// **The metronome panel answers every control it draws.**
+    ///
+    /// It was an egui dialog and read as a foreign object — the owner's "it's
+    /// cut off or looks wonky". Painted like the dials' own panels it is
+    /// themed by construction, but a painted panel has to hit-test itself, so
+    /// this walks every cell it draws and asks what is under it.
+    #[test]
+    fn the_metronome_panel_answers_every_cell_it_draws() {
+        use super::{met_hit_test, met_popup_rect, MetHit, MET_DIVS, MET_UNITS};
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0));
+        let anchor = Rect::from_min_size(Pos2::new(300.0, 80.0), Vec2::splat(22.0));
+        let panel = met_popup_rect(screen, anchor);
+        assert!(panel.is_positive(), "the panel has no room");
+        assert!(screen.contains_rect(panel), "the panel hangs off the surface");
+
+        let l = super::MetLayout::new(screen, anchor);
+        // Every division and every note value is reachable, and each answers
+        // with ITS OWN value rather than a neighbour's.
+        for (cell, (d, _)) in super::MetLayout::cells(l.rows[3], MET_DIVS.len())
+            .iter()
+            .zip(MET_DIVS)
+        {
+            assert_eq!(met_hit_test(screen, anchor, cell.center()), Some(MetHit::Div(d)));
+        }
+        for (cell, u) in super::MetLayout::cells(l.rows[2], MET_UNITS.len()).iter().zip(MET_UNITS) {
+            assert_eq!(met_hit_test(screen, anchor, cell.center()), Some(MetHit::Unit(u)));
+        }
+        // Minus and plus step the beats; the count between them is a READOUT
+        // and pressing it must not change anything.
+        let beats = super::MetLayout::cells(l.rows[1], 3);
+        assert_eq!(met_hit_test(screen, anchor, beats[0].center()), Some(MetHit::Beats(-1)));
+        assert_eq!(met_hit_test(screen, anchor, beats[2].center()), Some(MetHit::Beats(1)));
+        assert_eq!(
+            met_hit_test(screen, anchor, beats[1].center()),
+            None,
+            "the beat count acted like a button"
+        );
+        let sound = super::MetLayout::cells(l.rows[4], 2);
+        assert_eq!(met_hit_test(screen, anchor, sound[0].center()), Some(MetHit::SoundPick));
+        assert_eq!(met_hit_test(screen, anchor, sound[1].center()), Some(MetHit::SoundReset));
+        assert_eq!(met_hit_test(screen, anchor, l.close.center()), Some(MetHit::Close));
+
+        // The tempo answers along its whole ROW, not just the two-point well
+        // — a hand a little high still moves it — and reads 0 at the left end
+        // and 1 at the right.
+        let track = super::met_tempo_track(screen, anchor);
+        let y = l.rows[0].center().y;
+        match met_hit_test(screen, anchor, Pos2::new(track.left() + 0.5, y)) {
+            Some(MetHit::Tempo(t)) => assert!(t < 0.02, "the left end reads {t}"),
+            other => panic!("the tempo track's left end answered {other:?}"),
+        }
+        match met_hit_test(screen, anchor, Pos2::new(track.right() - 0.5, y)) {
+            Some(MetHit::Tempo(t)) => assert!(t > 0.98, "the right end reads {t}"),
+            other => panic!("the tempo track's right end answered {other:?}"),
+        }
+        assert!(
+            matches!(
+                met_hit_test(screen, anchor, Pos2::new(track.center().x, l.rows[0].top() + 1.0)),
+                Some(MetHit::Tempo(_))
+            ),
+            "the tempo row is a two-point target"
+        );
+
+        // Outside the panel is nobody's — the caller is what swallows the
+        // press, and it needs `None` to know the press left.
+        assert_eq!(met_hit_test(screen, anchor, Pos2::new(5.0, 5.0)), None);
+
+        // **It stays on the surface wherever the button is**, including a
+        // button hard against an edge, where a panel centred on it would
+        // otherwise hang half off.
+        for corner in [
+            Pos2::new(0.0, 0.0),
+            Pos2::new(1380.0, 0.0),
+            Pos2::new(0.0, 880.0),
+            Pos2::new(1380.0, 880.0),
+        ] {
+            let a = Rect::from_min_size(corner, Vec2::splat(22.0));
+            let panel = met_popup_rect(screen, a);
+            assert!(screen.contains_rect(panel), "at {corner:?} the panel left the surface");
+        }
+        // And a surface with no room panics on nothing.
+        let tiny = Rect::from_min_size(Pos2::ZERO, Vec2::new(30.0, 20.0));
+        let _ = met_popup_rect(tiny, anchor);
+        let _ = met_hit_test(tiny, anchor, Pos2::new(5.0, 5.0));
+    }
+
     /// **The close box always shows an X.**
     ///
     /// It was a shrunk glyph, and `fit_label` drops text under `MIN_TEXT`
@@ -10313,7 +10399,11 @@ impl FxLayout {
         if !screen.is_positive() || !anchor.is_positive() {
             return Self::NONE;
         }
-        let w = (screen.width() * FX_W.0).clamp(FX_W.1, FX_W.2.min(screen.width()));
+        // The floor bows to the surface — see `MetLayout::new`, where the
+        // same `clamp(min, max)` panic is spelled out. It has always been
+        // reachable here too.
+        let w = (screen.width() * FX_W.0)
+            .clamp(FX_W.1.min(screen.width()), FX_W.2.min(screen.width()));
         let h = (w * FX_ASPECT).min(screen.height() * 0.80);
         // Centred on the knob rather than left-aligned to it: a knob is thirty
         // points wide and a panel is three hundred, so hanging one off the
@@ -10463,6 +10553,376 @@ impl VariLayout {
     /// Where a row's number sits — the part a press opens for typing.
     fn field(row: Rect) -> Rect {
         slice_h(row, 0.52, 1.0)
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// The metronome's panel
+// ───────────────────────────────────────────────────────────────────────────
+
+/// The metronome panel's proportions. See [`draw_met`].
+const MET_W: (f32, f32, f32) = (0.22, 260.0, 380.0);
+const MET_ASPECT: f32 = 1.02;
+/// Where a row's control starts and ends, as a fraction of the row.
+const MET_TRACK: (f32, f32) = (0.32, 0.98);
+/// TEMPO, BEATS, UNIT, CLICK, SOUND.
+const MET_ROWS: usize = 5;
+
+/// **The metronome's right-click panel, built like the dials' own.**
+///
+/// It began as an egui dialog and read as a foreign object: egui's stock style
+/// under this crate's ink, its own idea of spacing, and a window that centred
+/// like a modal rather than hanging off the button — the owner's "it's cut off
+/// or looks wonky". The desk already has a language for "a right-click opened
+/// a small panel about this control", in `draw_fx` and `draw_vari_range`, and
+/// this is that language. Themed by construction, because every colour comes
+/// from `palette(s)` and nothing here asks egui for a style.
+struct MetLayout {
+    panel: Rect,
+    title: Rect,
+    close: Rect,
+    rows: [Rect; MET_ROWS],
+}
+
+impl MetLayout {
+    const NONE: Self = Self {
+        panel: Rect::NOTHING,
+        title: Rect::NOTHING,
+        close: Rect::NOTHING,
+        rows: [Rect::NOTHING; MET_ROWS],
+    };
+
+    fn new(screen: Rect, anchor: Rect) -> Self {
+        if !screen.is_positive() {
+            return Self::NONE;
+        }
+        // **The floor bows to the surface.** `clamp(min, max)` PANICS when
+        // min > max, and a window narrower than the panel's own minimum makes
+        // exactly that: 260 against a 30-point screen. Rare, and reachable —
+        // a plugin editor's inline surface is small, and the first frame of a
+        // resize can be anything.
+        let w = (screen.width() * MET_W.0)
+            .clamp(MET_W.1.min(screen.width()), MET_W.2.min(screen.width()));
+        let h = (w * MET_ASPECT).min(screen.height() * 0.85);
+        // Centred on the button rather than left-aligned to it, and clear of
+        // it — the same placement the effect panels use.
+        let mut panel = Rect::from_min_size(
+            Pos2::new(anchor.center().x - w * 0.5, anchor.bottom() + h * 0.04),
+            Vec2::new(w, h),
+        );
+        let dx = (screen.left() - panel.left()).max(0.0) - (panel.right() - screen.right()).max(0.0);
+        let dy = (screen.top() - panel.top()).max(0.0) - (panel.bottom() - screen.bottom()).max(0.0);
+        panel = panel.translate(Vec2::new(dx, dy));
+
+        let pad = (h * 0.05).clamp(4.0, 14.0);
+        let body = panel.shrink(pad);
+        if !body.is_positive() {
+            return Self { panel, ..Self::NONE };
+        }
+        let title_h = body.height() * 0.17;
+        let title = Rect::from_min_max(body.min, Pos2::new(body.right(), body.top() + title_h));
+        let close_w = (title.height() * 0.52).min(body.width() * 0.16);
+        let close = Rect::from_min_size(
+            Pos2::new(title.right() - close_w, title.top()),
+            Vec2::splat(close_w),
+        );
+        let rest = Rect::from_min_max(Pos2::new(body.left(), title.bottom()), body.max);
+        let pitch = rest.height() / MET_ROWS as f32;
+        let row = |i: usize| {
+            Rect::from_min_size(
+                Pos2::new(rest.left(), rest.top() + pitch * i as f32),
+                Vec2::new(rest.width(), pitch * 0.84),
+            )
+        };
+        Self {
+            panel,
+            title,
+            close,
+            rows: std::array::from_fn(row),
+        }
+    }
+
+    /// A row's control area: everything right of its label.
+    fn track(row: Rect) -> Rect {
+        slice_h(row, MET_TRACK.0, MET_TRACK.1)
+    }
+
+    /// `n` equal boxes across a row's control area.
+    fn cells(row: Rect, n: usize) -> Vec<Rect> {
+        let t = Self::track(row);
+        if n == 0 || !t.is_positive() {
+            return Vec::new();
+        }
+        let gap = (t.width() * 0.025).min(4.0);
+        let each = (t.width() - gap * (n - 1) as f32) / n as f32;
+        if each <= 0.0 {
+            return Vec::new();
+        }
+        (0..n)
+            .map(|i| {
+                Rect::from_min_size(
+                    Pos2::new(t.left() + (each + gap) * i as f32, t.top() + t.height() * 0.12),
+                    Vec2::new(each, t.height() * 0.76),
+                )
+            })
+            .collect()
+    }
+}
+
+/// The click divisions the panel offers, and what each is called.
+///
+/// In beats of the SIGNATURE, because the beat is whatever the signature says:
+/// in 6/8 it is an eighth. Zero is once a bar, which is the compound-meter
+/// answer — 6/8 is felt in two, and six clicks a bar is unusable in the meter
+/// that wants one most.
+pub const MET_DIVS: [(i64, &str); 5] =
+    [(0, "bar"), (1, "beat"), (2, "1/2"), (3, "1/3"), (4, "1/4")];
+
+/// The bottom numbers a signature may have. Buttons rather than a field,
+/// because the bottom number is a power of two and a field would invite 3.
+pub const MET_UNITS: [u8; 4] = [2, 4, 8, 16];
+
+/// What the metronome panel is showing.
+#[derive(Debug, Clone, Copy)]
+pub struct MetView<'a> {
+    pub bpm: f64,
+    pub beats: u8,
+    pub unit: u8,
+    pub div: i64,
+    /// The chosen click file, or empty for the one that ships.
+    pub sample: &'a str,
+}
+
+/// What a press inside the metronome panel means.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MetHit {
+    /// The tempo track, as a fraction along it. Dragged, like a fader.
+    Tempo(f32),
+    /// One beat fewer, or one more.
+    Beats(i8),
+    /// One of [`MET_UNITS`].
+    Unit(u8),
+    /// One of [`MET_DIVS`].
+    Div(i64),
+    /// Choose a click sound.
+    SoundPick,
+    /// Back to the one that ships.
+    SoundReset,
+    Close,
+}
+
+/// Where the panel goes, for a caller that has to swallow presses.
+pub fn met_popup_rect(screen: Rect, anchor: Rect) -> Rect {
+    MetLayout::new(screen, anchor).panel
+}
+
+/// The tempo row's track, for a DRAG that has already taken its grab and must
+/// keep answering from the geometry rather than from what is under the hand.
+pub fn met_tempo_track(screen: Rect, anchor: Rect) -> Rect {
+    MetLayout::track(MetLayout::new(screen, anchor).rows[0])
+}
+
+/// What is under `pos`. `None` is the panel's own chrome, which the caller
+/// still swallows — a press inside a panel never falls through to the app.
+pub fn met_hit_test(screen: Rect, anchor: Rect, pos: Pos2) -> Option<MetHit> {
+    let l = MetLayout::new(screen, anchor);
+    if !l.panel.contains(pos) {
+        return None;
+    }
+    if l.close.contains(pos) {
+        return Some(MetHit::Close);
+    }
+    // TEMPO: anywhere along the row, as a fraction of the track. The whole
+    // ROW answers, not just the well, so a hand a few points high still moves
+    // it — a two-point target is not a control.
+    let track = MetLayout::track(l.rows[0]);
+    if l.rows[0].contains(pos) && track.is_positive() {
+        let t = ((pos.x - track.left()) / track.width()).clamp(0.0, 1.0);
+        return Some(MetHit::Tempo(t));
+    }
+    // BEATS: minus, the count, plus. The count is a READOUT — pressing it
+    // does nothing rather than doing something arbitrary.
+    let beats = MetLayout::cells(l.rows[1], 3);
+    if beats.first().is_some_and(|c| c.contains(pos)) {
+        return Some(MetHit::Beats(-1));
+    }
+    if beats.get(2).is_some_and(|c| c.contains(pos)) {
+        return Some(MetHit::Beats(1));
+    }
+    for (cell, unit) in MetLayout::cells(l.rows[2], MET_UNITS.len()).iter().zip(MET_UNITS) {
+        if cell.contains(pos) {
+            return Some(MetHit::Unit(unit));
+        }
+    }
+    for (cell, (d, _)) in MetLayout::cells(l.rows[3], MET_DIVS.len()).iter().zip(MET_DIVS) {
+        if cell.contains(pos) {
+            return Some(MetHit::Div(d));
+        }
+    }
+    let sound = MetLayout::cells(l.rows[4], 2);
+    if sound.first().is_some_and(|c| c.contains(pos)) {
+        return Some(MetHit::SoundPick);
+    }
+    if sound.get(1).is_some_and(|c| c.contains(pos)) {
+        return Some(MetHit::SoundReset);
+    }
+    None
+}
+
+/// Draw the metronome panel. See [`MetLayout`] for why it is painted rather
+/// than built out of egui widgets.
+pub fn draw_met(
+    painter: &Painter,
+    screen: Rect,
+    anchor: Rect,
+    v: MetView<'_>,
+    s: &Settings,
+) {
+    let l = MetLayout::new(screen, anchor);
+    if !l.panel.is_positive() {
+        return;
+    }
+    let p = palette(s);
+    // The same scrim the effect panels use: it is what says the panel is in
+    // FRONT of the window rather than being another band that appeared.
+    painter.rect_filled(screen, 0.0, Color32::from_black_alpha(96));
+    painter.rect_filled(l.panel, 4.0, p.bg);
+    painter.rect_stroke(l.panel, 4.0, Stroke::new(1.0_f32, p.ink), StrokeKind::Inside);
+
+    if l.title.is_positive() {
+        let size = fit_text(l.title, "METRONOME", l.title.height() * 0.42);
+        if size >= MIN_TEXT {
+            painter.text(
+                Pos2::new(l.title.left(), l.title.top() + l.title.height() * 0.30),
+                Align2::LEFT_CENTER,
+                "METRONOME",
+                font_light(size),
+                p.ink,
+            );
+        }
+        let sub = tempo_text(v.bpm);
+        let sub = format!("{sub} bpm, {}/{}", v.beats.max(1), v.unit.max(1));
+        let size = fit_text(l.title, &sub, l.title.height() * 0.26);
+        if size >= MIN_TEXT {
+            painter.text(
+                Pos2::new(l.title.left(), l.title.top() + l.title.height() * 0.74),
+                Align2::LEFT_CENTER,
+                &sub,
+                font_light(size),
+                p.faint,
+            );
+        }
+        draw_close_x(painter, l.close, &p);
+    }
+
+    let label = |row: Rect, text: &str| {
+        let size = fit_text(slice_h(row, 0.0, MET_TRACK.0), text, row.height() * 0.46);
+        if size >= MIN_TEXT {
+            painter.text(
+                Pos2::new(row.left(), row.center().y),
+                Align2::LEFT_CENTER,
+                text,
+                font_light(size),
+                p.ink,
+            );
+        }
+    };
+    // A box with a word in it, lit when it is the one that is set. The lit
+    // fill is the accent and the ink goes to the panel's ground, because an
+    // accent-on-accent word is the one thing this palette cannot do.
+    let cell = |r: Rect, text: &str, on: bool| {
+        painter.rect_filled(r, 2.0, if on { p.accent } else { p.field });
+        painter.rect_stroke(r, 2.0, Stroke::new(1.0_f32, p.line), StrokeKind::Inside);
+        let size = fit_text(r.shrink(r.width() * 0.08), text, r.height() * 0.56);
+        if size >= MIN_TEXT {
+            painter.text(
+                r.center(),
+                Align2::CENTER_CENTER,
+                text,
+                font_light(size),
+                if on { p.bg } else { p.ink },
+            );
+        }
+    };
+
+    // ── TEMPO: a well with the set part filled, exactly as a fader's is ──
+    let row = l.rows[0];
+    if row.is_positive() {
+        label(row, "TEMPO");
+        let track = MetLayout::track(row);
+        let span = (crate::recorder::MAX_BPM - crate::recorder::MIN_BPM).max(1.0);
+        let t = (((v.bpm - crate::recorder::MIN_BPM) / span) as f32).clamp(0.0, 1.0);
+        let h = (row.height() * 0.22).max(2.0);
+        let well = Rect::from_center_size(track.center(), Vec2::new(track.width(), h));
+        painter.rect_filled(well, h * 0.5, p.well);
+        if t > 0.0 {
+            painter.rect_filled(
+                Rect::from_min_size(well.min, Vec2::new(well.width() * t, h)),
+                h * 0.5,
+                p.accent,
+            );
+        }
+        let knob_w = (row.height() * 0.20).max(3.0);
+        let x = well.left() + well.width() * t;
+        painter.rect_filled(
+            Rect::from_center_size(
+                Pos2::new(x.clamp(well.left() + knob_w * 0.5, well.right() - knob_w * 0.5), well.center().y),
+                Vec2::new(knob_w, row.height() * 0.62),
+            ),
+            1.5,
+            p.ink,
+        );
+    }
+
+    // ── BEATS: minus, the count, plus ──
+    let row = l.rows[1];
+    if row.is_positive() {
+        label(row, "BEATS");
+        let cells = MetLayout::cells(row, 3);
+        if let [minus, count, plus] = cells.as_slice() {
+            cell(*minus, "-", false);
+            cell(*count, &format!("{}", v.beats.max(1)), false);
+            cell(*plus, "+", false);
+        }
+    }
+
+    // ── UNIT: what gets the beat ──
+    let row = l.rows[2];
+    if row.is_positive() {
+        label(row, "NOTE");
+        for (r, unit) in MetLayout::cells(row, MET_UNITS.len()).iter().zip(MET_UNITS) {
+            cell(*r, &format!("{unit}"), v.unit == unit);
+        }
+    }
+
+    // ── CLICK: how often it sounds ──
+    let row = l.rows[3];
+    if row.is_positive() {
+        label(row, "CLICK");
+        for (r, (d, word)) in MetLayout::cells(row, MET_DIVS.len()).iter().zip(MET_DIVS) {
+            cell(*r, word, v.div == d);
+        }
+    }
+
+    // ── SOUND: a file, and always a way back to the one that ships ──
+    let row = l.rows[4];
+    if row.is_positive() {
+        label(row, "SOUND");
+        let cells = MetLayout::cells(row, 2);
+        if let [pick, reset] = cells.as_slice() {
+            // The file's own NAME, not its path: a panel this wide cannot
+            // show a path and a truncated one names nothing.
+            let name = if v.sample.is_empty() {
+                "built-in".to_owned()
+            } else {
+                std::path::Path::new(v.sample)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| v.sample.to_owned())
+            };
+            cell(*pick, &name, !v.sample.is_empty());
+            cell(*reset, "default", v.sample.is_empty());
+        }
     }
 }
 

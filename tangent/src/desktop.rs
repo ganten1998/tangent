@@ -2571,6 +2571,38 @@ impl DesktopApp {
             // plugin with the same state and nothing to do.
             self.force_insert_reload_for(&order);
         }
+        // **A pasted track's plugin STATE — BEFORE the bay reconcile below.**
+        //
+        // The copy itself is the app's (kind, levels, bays, clips), but the
+        // state a plugin saved lives in a file keyed by (strip, bay) and
+        // nothing in `tangent-ui` may reach a file.
+        //
+        // The ORDER is the whole of it. This sat a hundred lines further
+        // down, after the reconcile that loads the bay — so the pasted
+        // instance was created, handed `saved_insert_state` for a file that
+        // did not exist yet, and came up at the plugin's DEFAULTS. And it
+        // stayed there: the reconcile only fires when a bay's WANTED path
+        // stops matching its loaded one, and a state file appearing later
+        // changes neither. A pasted drum sampler with no kit takes MIDI,
+        // lights its pads and makes no sound.
+        if let Some((from, to)) = self.app.take_insert_state_copy() {
+            let (from, to) = (
+                tangent_ui::recorder::Strip::Channel(from).index(),
+                tangent_ui::recorder::Strip::Channel(to).index(),
+            );
+            for bay in 0..tangent_ui::recorder::INSERTS {
+                let src = insert_state_path(from, bay);
+                let dst = insert_state_path(to, bay);
+                // A bay the source never used leaves the destination's own
+                // file alone rather than deleting it: the paste has already
+                // cleared that bay through `set_insert`, and a stale file
+                // whose owner does not match is ignored by
+                // `saved_insert_state` anyway.
+                if src.exists() {
+                    let _ = std::fs::copy(&src, &dst);
+                }
+            }
+        }
         let inserts = tangent_ui::recorder::INSERTS;
         let want_at = |i: usize| self.app.insert(i / inserts, i % inserts).map(str::to_owned);
         if let Some(i) = (0..self.recorder.inserts_loaded.len())
@@ -2665,30 +2697,6 @@ impl DesktopApp {
             self.reload_click();
         }
 
-        // **A pasted track's plugin STATE, on the same bargain.** The copy
-        // itself is the app's — kind, levels, bays, clips — but the state a
-        // plugin saved lives in a file keyed by (strip, bay) and nothing in
-        // `tangent-ui` may reach a file. Without this the pasted bays load
-        // the same plugin at its DEFAULTS, which is a different instrument
-        // wearing the same name.
-        if let Some((from, to)) = self.app.take_insert_state_copy() {
-            let (from, to) = (
-                tangent_ui::recorder::Strip::Channel(from).index(),
-                tangent_ui::recorder::Strip::Channel(to).index(),
-            );
-            for bay in 0..tangent_ui::recorder::INSERTS {
-                let src = insert_state_path(from, bay);
-                let dst = insert_state_path(to, bay);
-                // A bay the source never used leaves the destination's own
-                // file alone rather than deleting it: the paste has already
-                // cleared that bay through `set_insert`, and a stale file
-                // whose owner does not match is ignored by
-                // `saved_insert_state` anyway.
-                if src.exists() {
-                    let _ = std::fs::copy(&src, &dst);
-                }
-            }
-        }
 
         // **The shipped bank, put back.** The same call a first launch makes,
         // which is the point: there is one definition of "the cartridge that
