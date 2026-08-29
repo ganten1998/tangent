@@ -1357,7 +1357,9 @@ fn period_frames(rate: f64, bpm: f64, unit: u32) -> f64 {
 /// clips' contract, so there is no resampling and no channel mapping down
 /// here — and swapped in WHOLE behind the racks' own protocol. The audio
 /// thread never allocates a kit and never frees one.
-#[derive(Debug)]
+/// `Clone` is cheap and is what lets one kit reach every drum lane: the pads
+/// are `Arc`s, so a clone shares the samples rather than copying them.
+#[derive(Debug, Clone)]
 pub struct PadKit {
     pub pads: [Option<Arc<tangent_record::decode::Clip>>; PADS],
 }
@@ -1400,6 +1402,14 @@ struct PadHit {
     offset: i32,
     pad: usize,
     velocity: f32,
+    /// **The drum lane this strike belongs to.**
+    ///
+    /// A drum instrument loads a full instance per channel, so a strike is
+    /// not just "pad 36" any more — it is pad 36 OF a particular lane's kit,
+    /// and it sounds through that lane's voices, fader and meter. Without
+    /// this the second drum track's notes reached the one shared voice set
+    /// and were heard, if at all, on the first track's strip.
+    lane: usize,
 }
 
 /// One pad voice sounding: a position, a rate and a fade.
@@ -1556,7 +1566,25 @@ struct Shared {
     /// Which general channel is the DRUMPAD's — its notes are pad strikes,
     /// not pitches. `-1` is nobody's. The host computes it from bay 1's
     /// sentinel, exactly as `builtin_strip`.
-    drum_strip: AtomicI64,
+    /// **Every channel the drumpad is on**, one bit each — the mask that
+    /// replaces `drum_strip`'s single index.
+    ///
+    /// A drum instrument loads a FULL instance per channel, the way every
+    /// industry sampler does: SD3, Battery and Kontakt all do, and a host
+    /// that allows one is a host that cannot be used the way people expect.
+    /// `drum_strip` was `.find()` — first lane wins — so duplicating a drum
+    /// track produced a lane that took MIDI, lit the shared pads, and made
+    /// no sound.
+    ///
+    /// What it costs to run sixteen of them is the person who loaded sixteen
+    /// of them's business. What it must NOT cost is anything at all when
+    /// none are loaded, which is why the per-block work below is gated on
+    /// what is live rather than on the size of this mask.
+    drum_strips: AtomicU32,
+    /// Every channel the built-in DX7 is on. Same story, same bug: one
+    /// `Builtin`, one index, `builtin.is_none()` in the host's walk, so the
+    /// second lane holding it was silent too.
+    builtin_strips: AtomicU32,
     /// Which general channel each capture PICK feeds: desk indices, -1 for an
     /// unbound pick. The k-th AUDIO channel takes pick k — the HOST computes
     /// the order, the callback only reads it, which is the same trust split
@@ -1744,22 +1772,32 @@ struct Shared {
     /// The drumpad's knobs — per-pad gain, pan and tune as f32 bits, the
     /// choke group as a small integer — and the kit's own fader. Plain
     /// stores read once per chunk, exactly the channel gains' shape.
-    pad_gain: [AtomicU32; PADS],
-    pad_pan: [AtomicU32; PADS],
-    pad_tune: [AtomicU32; PADS],
-    pad_choke: [AtomicU32; PADS],
+    ///
+    /// **Per LANE, because a drum instrument loads a full instance per
+    /// channel.** Lane 3's pad 36 and lane 7's pad 36 are two different
+    /// sounds; a gain, a tune or a trim shared between them would mean
+    /// editing one kit reached into another. Sixteen channels of a hundred
+    /// and twenty-eight pads is 64 KB an array — nothing beside what the
+    /// samples themselves cost.
+    pad_gain: [[AtomicU32; PADS]; CHANNELS],
+    pad_pan: [[AtomicU32; PADS]; CHANNELS],
+    pad_tune: [[AtomicU32; PADS]; CHANNELS],
+    pad_choke: [[AtomicU32; PADS]; CHANNELS],
     /// Bit `i`: pad `i` OBEYS NOTE-OFFS — a release fades the voice.
     /// One bit per pad, two words for the 128 of them: word `pad >> 6`,
-    /// bit `pad & 63`.
-    pad_obey: [AtomicU64; 2],
+    /// bit `pad & 63`. Per lane, like the knobs above.
+    pad_obey: [[AtomicU64; 2]; CHANNELS],
     /// The playable window, fractions of the sample, f32 bits each.
-    pad_trim_start: [AtomicU32; PADS],
-    pad_trim_end: [AtomicU32; PADS],
+    pad_trim_start: [[AtomicU32; PADS]; CHANNELS],
+    pad_trim_end: [[AtomicU32; PADS]; CHANNELS],
     pad_master: AtomicU32,
     /// The loudest sample each pad made since the UI last looked, f32 bits,
     /// read-and-reset like `strip_peak` above — it is what lights a pad from
     /// the audio rather than from the gesture, so a MIDI strike shows too.
-    pad_peak: [AtomicU32; PADS],
+    ///
+    /// Per lane too: the window lights the pads of the kit it is SHOWING,
+    /// and a shared meter would light lane 3's pads for lane 7's playing.
+    pad_peak: [[AtomicU32; PADS]; CHANNELS],
     /// One bit per strip. See [`Strip`].
     ///
     /// **Two masks rather than a flag each**, because solo is a question about
@@ -1943,7 +1981,8 @@ impl Shared {
             channel_gains: std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
             channel_pans: std::array::from_fn(|_| AtomicU32::new(0.0f32.to_bits())),
             builtin_strip: AtomicI64::new(-1),
-            drum_strip: AtomicI64::new(-1),
+            drum_strips: AtomicU32::new(0),
+            builtin_strips: AtomicU32::new(0),
             pick_strip: std::array::from_fn(|_| AtomicI64::new(-1)),
             punch: std::array::from_fn(|_| AtomicU64::new(u64::MAX)),
             metro_gain: AtomicU32::new(0.7f32.to_bits()),
@@ -1987,15 +2026,15 @@ impl Shared {
             }),
             fx_return: AtomicU32::new(1.0f32.to_bits()),
             strip_peak: std::array::from_fn(|_| [AtomicU32::new(0), AtomicU32::new(0)]),
-            pad_gain: std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
-            pad_obey: [AtomicU64::new(0), AtomicU64::new(0)],
-            pad_trim_start: std::array::from_fn(|_| AtomicU32::new(0.0f32.to_bits())),
-            pad_trim_end: std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
-            pad_pan: std::array::from_fn(|_| AtomicU32::new(0.0f32.to_bits())),
-            pad_tune: std::array::from_fn(|_| AtomicU32::new(0.0f32.to_bits())),
-            pad_choke: std::array::from_fn(|_| AtomicU32::new(0)),
+            pad_gain: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits()))),
+            pad_obey: std::array::from_fn(|_| [AtomicU64::new(0), AtomicU64::new(0)]),
+            pad_trim_start: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU32::new(0.0f32.to_bits()))),
+            pad_trim_end: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits()))),
+            pad_pan: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU32::new(0.0f32.to_bits()))),
+            pad_tune: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU32::new(0.0f32.to_bits()))),
+            pad_choke: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU32::new(0))),
             pad_master: AtomicU32::new(1.0f32.to_bits()),
-            pad_peak: std::array::from_fn(|_| AtomicU32::new(0)),
+            pad_peak: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU32::new(0))),
             muted: AtomicU32::new(0),
             auto_suspend: AtomicU32::new(0),
             seat_latency: (0..RACK_SEATS * INSERTS).map(|_| AtomicU32::new(0)).collect(),
@@ -2626,22 +2665,41 @@ struct Renderer {
     /// The drumpad. The kit swaps in whole — `pad_incoming`/`pad_retiring`
     /// are the clips' protocol exactly — and the voices are fixed and
     /// reused, like the metronome's.
-    pad_kit: PadKit,
-    pad_incoming: Consumer<PadKit>,
-    pad_retiring: Producer<PadKit>,
+    /// **One kit per channel.** A drum instrument loads a full instance per
+    /// channel, the way every industry sampler does, so lane 3's pad 36 and
+    /// lane 7's pad 36 are two different sounds with two different voices.
+    /// Indexed by channel; a lane with no drumpad holds an empty kit and
+    /// costs one `live()` check.
+    pad_kits: Vec<PadKit>,
+    /// A kit arriving, and the displaced one going back — the lane it
+    /// belongs to travels WITH it, because there is one of these per
+    /// channel now and a bare kit could not say whose it was.
+    pad_incoming: Consumer<(usize, PadKit)>,
+    pad_retiring: Producer<(usize, PadKit)>,
     /// The media explorer's AUDITION: one clip at a time, swapped in like
     /// the kit, played once from the top, summed into the mix.
     preview_incoming: Consumer<Option<Arc<tangent_record::decode::Clip>>>,
     preview_retiring: Producer<Option<Arc<tangent_record::decode::Clip>>>,
     preview: Option<Arc<tangent_record::decode::Clip>>,
     preview_pos: usize,
-    pad_voices: [PadVoice; PADS],
+    /// **One full set of voices per channel.** See `PadHit::lane`.
+    ///
+    /// A `Vec` rather than `[[PadVoice; PADS]; CHANNELS]` because that array
+    /// is a quarter of a megabyte and this struct is built by value and moved
+    /// into the audio callback: an inline copy that size is a stack hazard on
+    /// the way in for no gain. Allocated once, here, and never again —
+    /// indexing it is the same cost either way.
+    pad_voices: Vec<[PadVoice; PADS]>,
     /// This chunk's strikes, filled by `collect_notes` beside the note list.
     pad_hits: Vec<PadHit>,
     /// Note-OFFS for pads that obey them, same frame offsets.
     pad_offs: Vec<PadHit>,
     /// The kit's fader, slewed one-pole like every fader.
-    pad_gain: f32,
+    /// **The kit bus's smoothed fader, per lane.** One of these was shared
+    /// across every drum lane the moment there could be more than one, and
+    /// two lanes fighting over a single one-pole smoother is a fader that
+    /// jumps between two targets every block.
+    pad_gain: Vec<f32>,
     builtin: crate::dx7::Dx7,
     /// The built-in's own output, before its slot gain.
     ///
@@ -3056,7 +3114,34 @@ impl Renderer {
         // Whether channel 10 belongs to the drums this block. Read once: a
         // kit swap lands in `mix_pads`, so this answers for the PREVIOUS
         // chunk's kit — one chunk of grace on a load, never a torn read.
-        let pads_live = self.pad_kit.live();
+        // **Which drum lanes a channel-10 note should reach**, and whether
+        // any does. Live input follows the same rule every other live note
+        // follows: a lane hears the keyboard when it is armed or selected,
+        // which is what `midi_off` already says. A strike is pushed PER such
+        // lane, because each one has its own kit and its own voices now.
+        let midi_off = self.shared.midi_off.load(Ordering::Relaxed);
+        let drum_mask = self.shared.drum_strips.load(Ordering::Relaxed);
+        let mut live_drum_lanes: [usize; CHANNELS] = [0; CHANNELS];
+        let mut live_drum_n = 0usize;
+        for ch in 0..CHANNELS {
+            if drum_mask & (1 << ch.min(31)) != 0
+                && midi_off & (1 << ch.min(31)) == 0
+                && self.pad_kits.get(ch).is_some_and(PadKit::live)
+            {
+                live_drum_lanes[live_drum_n] = ch;
+                live_drum_n += 1;
+            }
+        }
+        // **The BARE drumpad still plays.** With no channel carrying a kit —
+        // the drumpad window opened on its own, which is how the pads worked
+        // before they belonged to lanes at all — lane 0's slot holds it and
+        // is the one that sounds. `mix_pads` falls back to exactly the same
+        // slot for the same case, so the strike and the render agree.
+        if live_drum_n == 0 && self.pad_kits.first().is_some_and(PadKit::live) {
+            live_drum_lanes[0] = 0;
+            live_drum_n = 1;
+        }
+        let pads_live = live_drum_n > 0;
         loop {
             let event = match self.pending.take() {
                 Some(e) => e,
@@ -3094,18 +3179,31 @@ impl Renderer {
                 if event.status & 0xF0 == 0x80 || velocity == 0 {
                     // A RELEASE: only pads that obey note-offs hear it.
                     let pad = usize::from((event.data1 & 0x7F).wrapping_sub(PAD_BASE));
-                    if event.data1 & 0x7F >= PAD_BASE
-                        && pad < PADS
-                        && self.shared.pad_obey[pad >> 6].load(Ordering::Relaxed)
-                            & (1u64 << (pad & 63))
-                            != 0
-                        && self.pad_offs.len() < self.pad_offs.capacity()
-                    {
-                        self.pad_offs.push(PadHit {
-                            offset,
-                            pad,
-                            velocity: 0.0,
-                        });
+                    if event.data1 & 0x7F >= PAD_BASE && pad < PADS {
+                        // One release per live drum lane — each has its own
+                        // voice for this pad and each has to let go of it.
+                        //
+                        // **And each decides for itself whether it obeys.**
+                        // `obey` is a property of a pad OF A KIT, so the test
+                        // belongs inside this walk: one lane's snare can ring
+                        // through a release while another's chokes on it.
+                        for &lane in &live_drum_lanes[..live_drum_n] {
+                            if self.pad_offs.len() >= self.pad_offs.capacity() {
+                                break;
+                            }
+                            if self.shared.pad_obey[lane][pad >> 6].load(Ordering::Relaxed)
+                                & (1u64 << (pad & 63))
+                                == 0
+                            {
+                                continue;
+                            }
+                            self.pad_offs.push(PadHit {
+                                offset,
+                                pad,
+                                velocity: 0.0,
+                                lane,
+                            });
+                        }
                     }
                 } else if event.status & 0xF0 == 0x90 && velocity != 0 {
                     if self.pad_hits.len() == self.pad_hits.capacity() {
@@ -3116,11 +3214,21 @@ impl Renderer {
                     }
                     let pad = usize::from((event.data1 & 0x7F).wrapping_sub(PAD_BASE));
                     if event.data1 & 0x7F >= PAD_BASE && pad < PADS {
-                        self.pad_hits.push(PadHit {
-                            offset,
-                            pad,
-                            velocity: f32::from(velocity) / 127.0,
-                        });
+                        // One strike per live drum lane. A drum controller
+                        // playing channel 10 into two armed kits plays BOTH,
+                        // which is what two armed instruments do everywhere
+                        // else on this desk.
+                        for &lane in &live_drum_lanes[..live_drum_n] {
+                            if self.pad_hits.len() >= self.pad_hits.capacity() {
+                                break;
+                            }
+                            self.pad_hits.push(PadHit {
+                                offset,
+                                pad,
+                                velocity: f32::from(velocity) / 127.0,
+                                lane,
+                            });
+                        }
                     }
                 }
                 continue;
@@ -4749,6 +4857,17 @@ impl Renderer {
     /// `fader_to_gain` a mouse drag does. Storing amplitude instead would
     /// have made a -6 dB curve mean something else entirely — the mistake
     /// already made once on this branch in the keyboard nudge.
+    /// **The lowest-numbered channel carrying a drumpad**, or `None`.
+    ///
+    /// Derived from `drum_strips` rather than stored beside it. There was a
+    /// second field holding this and the two could disagree the moment
+    /// anything set one without the other — which is exactly how a test
+    /// ended up assigning a kit to lane 0 and a lane to channel 7.
+    fn first_drum_lane(&self) -> Option<usize> {
+        let mask = self.shared.drum_strips.load(Ordering::Relaxed);
+        (mask != 0).then(|| mask.trailing_zeros() as usize).filter(|ch| *ch < CHANNELS)
+    }
+
     fn lane_gain(&self, lane: usize) -> f32 {
         lane_gain_of(&self.auto, &self.shared, lane)
     }
@@ -5167,10 +5286,10 @@ impl Renderer {
         // obeys. The drum bus fader (the pads' own strip law) and the master
         // scale it; mute and solo are deliberately ignored — clicking a file
         // is a question, and a muted bus should not eat the answer.
-        let drum_wanted = self.shared.drum_strip.load(Ordering::Relaxed);
-        let drum_lane = (drum_wanted >= 0)
-            .then_some(drum_wanted as usize)
-            .filter(|ch| *ch < CHANNELS);
+        // The FIRST drum lane, derived — an audition is one sound and plays
+        // through one strip, and with several kits loaded the first is the
+        // only defensible choice. See `first_drum_lane`.
+        let drum_lane = self.first_drum_lane();
         let bus = match drum_lane {
             Some(ch) => self.lane_gain(ch),
             None => Shared::f32_of(&self.shared.drums_gain).clamp(0.0, 8.0),
@@ -5199,11 +5318,22 @@ impl Renderer {
         // own protocol: no room to return it, no swap this block. The voices
         // are silenced across a swap; see `PadVoice::silence`.
         if self.pad_retiring.slots() > 0 {
-            if let Ok(next) = self.pad_incoming.pop() {
-                let old = std::mem::replace(&mut self.pad_kit, next);
-                let _ = self.pad_retiring.push(old);
-                for v in &mut self.pad_voices {
-                    v.silence();
+            if let Ok((lane, next)) = self.pad_incoming.pop() {
+                if let Some(slot) = self.pad_kits.get_mut(lane) {
+                    let old = std::mem::replace(slot, next);
+                    let _ = self.pad_retiring.push((lane, old));
+                    // Only THIS lane's voices stop. Another kit on another
+                    // channel is a different instrument and has no reason to
+                    // be interrupted because this one was reloaded.
+                    if let Some(vs) = self.pad_voices.get_mut(lane) {
+                        for v in vs.iter_mut() {
+                            v.silence();
+                        }
+                    }
+                } else {
+                    // A lane the desk does not have: hand it straight back
+                    // rather than dropping a kit on the audio thread.
+                    let _ = self.pad_retiring.push((lane, next));
                 }
             }
         }
@@ -5228,12 +5358,66 @@ impl Renderer {
             || (0..PADS).any(|i| !self.racks[pad_rack_index(i)].is_empty());
         if self.pad_hits.is_empty()
             && self.pad_offs.is_empty()
-            && !self.pad_voices.iter().any(PadVoice::active)
+            && !self
+                .pad_voices
+                .iter()
+                .any(|vs| vs.iter().any(PadVoice::active))
             && !any_rack
         {
             return;
         }
         let coeff = self.gain_coeff;
+        // **Which strips the kits land on, one pass each.**
+        //
+        // A drum instrument loads a full instance per channel, so this is a
+        // LIST now and not a single lane. `None` is the case that has always
+        // existed and must survive: no channel carries a drumpad, the
+        // drumpad window is being played bare, and the hidden `Strip::Drums`
+        // internals rule at unity.
+        let drum_mask = self.shared.drum_strips.load(Ordering::Relaxed);
+        let mut targets: [Option<usize>; CHANNELS] = [None; CHANNELS];
+        let mut target_n = 0usize;
+        for ch in 0..CHANNELS {
+            if drum_mask & (1 << ch.min(31)) != 0 {
+                targets[target_n] = Some(ch);
+                target_n += 1;
+            }
+        }
+        if target_n == 0 {
+            targets[0] = None;
+            target_n = 1;
+        }
+        for t in 0..target_n {
+            self.mix_pad_lane(targets[t], frames, muted, soloed, coeff);
+        }
+    }
+
+    /// **One drum lane's kit, summed onto its own strip.**
+    ///
+    /// Split out of `mix_pads` so the whole of it runs once per channel
+    /// holding a drumpad — a drum instrument loads a full instance per
+    /// channel, the way every industry sampler does, and that means a full
+    /// pass each. `drum_lane` is `None` for the case that predates lanes
+    /// entirely: no channel carries a kit, the drumpad window is being
+    /// played bare, and the hidden `Strip::Drums` internals rule at unity.
+    ///
+    /// `pad_out` is SCRATCH and is reused across lanes rather than
+    /// allocated per lane. It is half a megabyte; sixteen would be eight for
+    /// a case nobody has, and the lanes run one at a time so one buffer is
+    /// all that is ever live.
+    fn mix_pad_lane(
+        &mut self,
+        drum_lane: Option<usize>,
+        frames: usize,
+        muted: u32,
+        soloed: u32,
+        coeff: f32,
+    ) {
+        // The lane whose kit and voices this pass belongs to. The bare
+        // drumpad case has no channel, and borrows lane 0's slot for them —
+        // nothing else can be using it, because a drumpad on channel 0 would
+        // have put channel 0 in the target list instead.
+        let lane_ix = drum_lane.unwrap_or(0);
         // **The DRUM BUS is the pads' strip now**: its fader, pan, mute,
         // solo and send govern the summed kit, and its rack runs over it —
         // bus-wide effects live on the DRUMS channel, exactly as the owner
@@ -5244,10 +5428,9 @@ impl Renderer {
         // retired, and the lane is the one place the drums answer to. The
         // old hidden Drums internals only rule when no lane carries the
         // pad (the drumpad window played bare), where they rest at unity.
-        let drum_wanted = self.shared.drum_strip.load(Ordering::Relaxed);
-        let drum_lane = (drum_wanted >= 0)
-            .then_some(drum_wanted as usize)
-            .filter(|ch| *ch < CHANNELS);
+        // `drum_lane` is this pass's own — the argument, not the shared
+        // first-lane index, which is what made every lane fold onto the
+        // first one's strip.
         let bus_strip = drum_lane.map_or(Strip::Drums, Strip::Channel);
         let master = if strip_is_heard(bus_strip, muted, soloed) {
             match drum_lane {
@@ -5277,20 +5460,23 @@ impl Renderer {
         let mut trim0 = [0.0f32; PADS];
         let mut trim1 = [1.0f32; PADS];
         for i in 0..PADS {
-            trim0[i] = Shared::f32_of(&self.shared.pad_trim_start[i]).clamp(0.0, 1.0);
-            trim1[i] = Shared::f32_of(&self.shared.pad_trim_end[i]).clamp(0.0, 1.0);
+            trim0[i] = Shared::f32_of(&self.shared.pad_trim_start[lane_ix][i]).clamp(0.0, 1.0);
+            trim1[i] = Shared::f32_of(&self.shared.pad_trim_end[lane_ix][i]).clamp(0.0, 1.0);
             if trim1[i] <= trim0[i] + 0.001 {
                 trim0[i] = 0.0;
                 trim1[i] = 1.0;
             }
-            gain[i] = Shared::f32_of(&self.shared.pad_gain[i]).clamp(0.0, 2.0);
-            choke[i] = self.shared.pad_choke[i].load(Ordering::Relaxed).min(255) as u8;
-            let pan = Shared::f32_of(&self.shared.pad_pan[i]).clamp(-1.0, 1.0);
+            gain[i] = Shared::f32_of(&self.shared.pad_gain[lane_ix][i]).clamp(0.0, 2.0);
+            choke[i] = self.shared.pad_choke[lane_ix][i]
+                .load(Ordering::Relaxed)
+                .min(255) as u8;
+            let pan = Shared::f32_of(&self.shared.pad_pan[lane_ix][i]).clamp(-1.0, 1.0);
             // The linear law, not constant-power: a drum sits still, and
             // linear keeps a centred pad at exactly unity.
             pan_l[i] = (1.0 - pan).min(1.0);
             pan_r[i] = (1.0 + pan).min(1.0);
-            let tune = f64::from(Shared::f32_of(&self.shared.pad_tune[i]).clamp(-12.0, 12.0));
+            let tune =
+                f64::from(Shared::f32_of(&self.shared.pad_tune[lane_ix][i]).clamp(-12.0, 12.0));
             step[i] = (tune / 12.0).exp2();
         }
         for c in 0..TAP_CHANNELS {
@@ -5309,10 +5495,12 @@ impl Renderer {
             // voice that ENDED, never the one just born. The hits ran
             // first once, and every legato note on an obeying pad choked.
             for h in &self.pad_offs {
-                if h.offset != f as i32 {
+                // This lane's releases only: another kit's note-off has
+                // nothing to say about this kit's voice for the same pad.
+                if h.offset != f as i32 || h.lane != lane_ix {
                     continue;
                 }
-                if let Some(v) = self.pad_voices.get_mut(h.pad) {
+                if let Some(v) = self.pad_voices[lane_ix].get_mut(h.pad) {
                     v.cut();
                 }
             }
@@ -5320,18 +5508,21 @@ impl Renderer {
             // group fades, the struck pad starts clean. The group is read at
             // the strike, so moving a knob never cuts a voice already gone.
             for h in &self.pad_hits {
-                if h.offset != f as i32 {
+                if h.offset != f as i32 || h.lane != lane_ix {
                     continue;
                 }
                 if choke[h.pad] != 0 {
-                    for (q, v) in self.pad_voices.iter_mut().enumerate() {
+                    // The choke group is this KIT's — an open hat on lane 3
+                    // does not close a hat on lane 7, because they are two
+                    // instruments that happen to share a pad number.
+                    for (q, v) in self.pad_voices[lane_ix].iter_mut().enumerate() {
                         if q != h.pad && choke[q] == choke[h.pad] {
                             v.cut();
                         }
                     }
                 }
-                if let Some(v) = self.pad_voices.get_mut(h.pad) {
-                    let frames = self.pad_kit.pads[h.pad]
+                if let Some(v) = self.pad_voices[lane_ix].get_mut(h.pad) {
+                    let frames = self.pad_kits[lane_ix].pads[h.pad]
                         .as_deref()
                         .map_or(0.0, |c| c.frames() as f64);
                     v.trigger(
@@ -5342,11 +5533,11 @@ impl Renderer {
                     );
                 }
             }
-            for (i, v) in self.pad_voices.iter_mut().enumerate() {
+            for (i, v) in self.pad_voices[lane_ix].iter_mut().enumerate() {
                 if !v.active() {
                     continue;
                 }
-                let Some(clip) = self.pad_kit.pads[i].as_deref() else {
+                let Some(clip) = self.pad_kits[lane_ix].pads[i].as_deref() else {
                     // A voice with no sample is a swap artefact; end it.
                     v.silence();
                     continue;
@@ -5413,7 +5604,7 @@ impl Renderer {
         }
         for (i, pk) in peak.iter().enumerate() {
             if *pk > 0.0 {
-                self.shared.pad_peak[i].fetch_max(pk.to_bits(), Ordering::Relaxed);
+                self.shared.pad_peak[lane_ix][i].fetch_max(pk.to_bits(), Ordering::Relaxed);
             }
         }
         // **The rack of the strip the kit actually lands on**, over the
@@ -5464,8 +5655,8 @@ impl Renderer {
         // route the drum lane to a bus and the kit goes with it.
         let direct = drum_lane.map_or(1.0, |ch| self.route_direct[ch]);
         for f in 0..frames {
-            self.pad_gain += (master - self.pad_gain) * coeff;
-            let g = self.pad_gain;
+            self.pad_gain[lane_ix] += (master - self.pad_gain[lane_ix]) * coeff;
+            let g = self.pad_gain[lane_ix];
             let l = self.fx_in.first().map_or(0.0, |b| b[f]) * g * bus_l;
             let r = self.fx_in.get(1).map_or(0.0, |b| b[f]) * g * bus_r;
             bus_peak[0] = bus_peak[0].max(l.abs());
@@ -5540,8 +5731,12 @@ impl Renderer {
         }
         let wanted = self.shared.builtin_strip.load(Ordering::Relaxed);
         let builtin_at = (wanted >= 0).then_some(wanted as usize);
-        let drum_wanted = self.shared.drum_strip.load(Ordering::Relaxed);
-        let drum_at = (drum_wanted >= 0).then_some(drum_wanted as usize);
+        // **Every lane holding a drumpad**, not the first. A drum instrument
+        // loads a full instance per channel, so each of those lanes turns its
+        // own clip notes into strikes on its OWN kit — which is what makes a
+        // duplicated drum track sound at all.
+        let drum_mask = self.shared.drum_strips.load(Ordering::Relaxed);
+        let is_drum_lane = |ch: usize| drum_mask & (1 << ch.min(31)) != 0;
         let midi_off = self.shared.midi_off.load(Ordering::Relaxed);
         let builtin_armed = builtin_at.is_some_and(|ch| midi_off & (1 << ch.min(31)) == 0);
         // CC 64 is the damper, live input only. Half scale is the switch
@@ -5763,10 +5958,10 @@ impl Renderer {
             // The strikes render in `mix_pads`, on the DRUMS bus; this lane
             // itself carries no signal, but its fader still has to advance
             // so a later un-assignment starts at the written level.
-            if drum_at == Some(ch) && !is_builtin {
+            if is_drum_lane(ch) && !is_builtin {
                 let obey = [
-                    self.shared.pad_obey[0].load(Ordering::Relaxed),
-                    self.shared.pad_obey[1].load(Ordering::Relaxed),
+                    self.shared.pad_obey[ch][0].load(Ordering::Relaxed),
+                    self.shared.pad_obey[ch][1].load(Ordering::Relaxed),
                 ];
                 for n in &lane_notes {
                     let Ok(key) = u8::try_from(n.pitch) else {
@@ -5786,6 +5981,8 @@ impl Renderer {
                                 offset: n.offset,
                                 pad,
                                 velocity: 0.0,
+                                // THIS lane's kit — the clip is on it.
+                                lane: ch,
                             });
                         }
                         continue;
@@ -5797,6 +5994,7 @@ impl Renderer {
                         offset: n.offset,
                         pad,
                         velocity: n.velocity,
+                        lane: ch,
                     });
                 }
                 let target = if strip_is_heard(Strip::Channel(ch), muted, soloed) {
@@ -6259,8 +6457,8 @@ pub struct Engine {
     click_from_audio: Consumer<Click>,
     midi_to_audio: Producer<Vec<PlacedMidi>>,
     midi_from_audio: Consumer<Vec<PlacedMidi>>,
-    pad_to_audio: Producer<PadKit>,
-    pad_from_audio: Consumer<PadKit>,
+    pad_to_audio: Producer<(usize, PadKit)>,
+    pad_from_audio: Consumer<(usize, PadKit)>,
     preview_to_audio: Producer<Option<Arc<tangent_record::decode::Clip>>>,
     preview_from_audio: Consumer<Option<Arc<tangent_record::decode::Clip>>>,
     cap_rx: Vec<Consumer<f32>>,
@@ -6565,8 +6763,8 @@ impl Engine {
         let (auto_retiring, auto_from_audio) =
             RingBuffer::<tangent_ui::automation::Automation>::new(2);
         // The drumpad kit's pair, same capacity, same reason.
-        let (pad_to_audio, pad_incoming) = RingBuffer::<PadKit>::new(2);
-        let (pad_retiring, pad_from_audio) = RingBuffer::<PadKit>::new(2);
+        let (pad_to_audio, pad_incoming) = RingBuffer::<(usize, PadKit)>::new(2);
+        let (pad_retiring, pad_from_audio) = RingBuffer::<(usize, PadKit)>::new(2);
         let (preview_to_audio, preview_incoming) =
             RingBuffer::<Option<Arc<tangent_record::decode::Clip>>>::new(2);
         let (preview_retiring, preview_from_audio) =
@@ -6637,17 +6835,17 @@ impl Engine {
             click_retiring,
             midi_incoming,
             midi_retiring,
-            pad_kit: PadKit::default(),
+            pad_kits: (0..CHANNELS).map(|_| PadKit::default()).collect(),
+            pad_voices: (0..CHANNELS).map(|_| [PadVoice::default(); PADS]).collect(),
             pad_incoming,
             pad_retiring,
             preview_incoming,
             preview_retiring,
             preview: None,
             preview_pos: 0,
-            pad_voices: [PadVoice::default(); PADS],
             pad_hits: Vec::with_capacity(MAX_PAD_HITS_PER_BLOCK),
             pad_offs: Vec::with_capacity(MAX_PAD_HITS_PER_BLOCK * 2),
-            pad_gain: 1.0,
+            pad_gain: vec![1.0; CHANNELS],
             builtin: crate::dx7::Dx7::new(rate as f32),
             builtin_scratch: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             channel_gain: [1.0; CHANNELS],
@@ -7286,14 +7484,29 @@ impl Engine {
             .builtin_strip
             .store(strip.map_or(-1, |s| s as i64), Ordering::Relaxed);
     }
+    /// **Every channel the drumpad is on.** See `Shared::drum_strips`.
+    ///
+    /// The single-index setter above still stands and still names the FIRST
+    /// of them, because the parts of the engine that have not learned about
+    /// lanes yet read it. Both are pushed from the same walk, so they cannot
+    /// disagree about which lane is first.
+    pub fn set_drum_strips(&self, mask: u32) {
+        self.shared.drum_strips.store(mask, Ordering::Relaxed);
+    }
 
-    /// Which general CHANNEL the drumpad belongs to. Its lane's notes —
-    /// live and clip both — strike the sixteen pads instead of sounding a
-    /// pitch, and the kit renders on the DRUMS bus as it always has.
-    pub fn set_drum_strip(&self, strip: Option<usize>) {
-        self.shared
-            .drum_strip
-            .store(strip.map_or(-1, |s| s as i64), Ordering::Relaxed);
+    /// The first drum lane as the RENDERER derives it, for the test that
+    /// pins there being no second copy of that fact to disagree with.
+    #[cfg(test)]
+    pub fn renderer_first_drum_lane(&self) -> Option<usize> {
+        let mask = self.shared.drum_strips.load(Ordering::Relaxed);
+        (mask != 0)
+            .then(|| mask.trailing_zeros() as usize)
+            .filter(|ch| *ch < CHANNELS)
+    }
+
+    /// Every channel the built-in instrument is on.
+    pub fn set_builtin_strips(&self, mask: u32) {
+        self.shared.builtin_strips.store(mask, Ordering::Relaxed);
     }
 
     /// One general channel's fader.
@@ -7734,9 +7947,13 @@ impl Engine {
     /// (a stalled callback) and the kit was NOT delivered: the caller must
     /// retry, or the pads light up over an engine that never got them —
     /// the Windows tester's pads striking the DX7.
-    pub fn set_pad_kit(&mut self, kit: PadKit) -> bool {
+    ///
+    /// **`lane` is which channel's kit this is.** A drum instrument loads a
+    /// full instance per channel, so a bare kit could not say whose it was;
+    /// the lane travels with it on the same ring.
+    pub fn set_pad_kit(&mut self, lane: usize, kit: PadKit) -> bool {
         while self.pad_from_audio.pop().is_ok() {}
-        if self.pad_to_audio.push(kit).is_err() {
+        if self.pad_to_audio.push((lane, kit)).is_err() {
             return false;
         }
         let deadline = Instant::now() + RETIRE_TIMEOUT;
@@ -7772,7 +7989,12 @@ impl Engine {
     /// The drumpad's knobs, pushed whole every frame like the desk.
     /// Sanitised here, on the way in: a NaN survives `clamp` and a NaN in a
     /// gain does not stay in one sample.
-    pub fn set_pad_params(&self, kit: &tangent_ui::recorder::DrumKitParams) {
+    ///
+    /// **`lane` is whose kit these are.** Every knob here belongs to a pad OF
+    /// A KIT, and a drum instrument loads a full instance per channel — so a
+    /// gain shared between lanes would mean editing one kit reached into
+    /// another's sound.
+    pub fn set_pad_params(&self, lane: usize, kit: &tangent_ui::recorder::DrumKitParams) {
         let sane = |v: f32, lo: f32, hi: f32, or: f32| {
             if v.is_finite() {
                 v.clamp(lo, hi)
@@ -7781,23 +8003,30 @@ impl Engine {
             }
         };
         let sh = &self.shared;
+        let Some(pg) = sh.pad_gain.get(lane) else {
+            return;
+        };
         let mut obey = [0u64; 2];
         for (i, p) in kit.pads.iter().enumerate().take(PADS) {
-            sh.pad_gain[i].store(sane(p.gain, 0.0, 2.0, 1.0).to_bits(), Ordering::Relaxed);
-            sh.pad_pan[i].store(sane(p.pan, -1.0, 1.0, 0.0).to_bits(), Ordering::Relaxed);
-            sh.pad_tune[i].store(sane(p.tune, -12.0, 12.0, 0.0).to_bits(), Ordering::Relaxed);
-            sh.pad_choke[i].store(u32::from(p.choke), Ordering::Relaxed);
+            pg[i].store(sane(p.gain, 0.0, 2.0, 1.0).to_bits(), Ordering::Relaxed);
+            sh.pad_pan[lane][i].store(sane(p.pan, -1.0, 1.0, 0.0).to_bits(), Ordering::Relaxed);
+            sh.pad_tune[lane][i]
+                .store(sane(p.tune, -12.0, 12.0, 0.0).to_bits(), Ordering::Relaxed);
+            sh.pad_choke[lane][i].store(u32::from(p.choke), Ordering::Relaxed);
             if p.obey {
                 obey[i >> 6] |= 1u64 << (i & 63);
             }
-            sh.pad_trim_start[i].store(
+            sh.pad_trim_start[lane][i].store(
                 sane(p.trim_start, 0.0, 1.0, 0.0).to_bits(),
                 Ordering::Relaxed,
             );
-            sh.pad_trim_end[i].store(sane(p.trim_end, 0.0, 1.0, 1.0).to_bits(), Ordering::Relaxed);
+            sh.pad_trim_end[lane][i]
+                .store(sane(p.trim_end, 0.0, 1.0, 1.0).to_bits(), Ordering::Relaxed);
         }
-        sh.pad_obey[0].store(obey[0], Ordering::Relaxed);
-        sh.pad_obey[1].store(obey[1], Ordering::Relaxed);
+        sh.pad_obey[lane][0].store(obey[0], Ordering::Relaxed);
+        sh.pad_obey[lane][1].store(obey[1], Ordering::Relaxed);
+        // The kit's own fader is still one number: it is the DRUMPAD's
+        // master, not a lane's, and a lane already has a fader of its own.
         sh.pad_master
             .store(sane_gain(kit.master).to_bits(), Ordering::Relaxed);
     }
@@ -7805,8 +8034,11 @@ impl Engine {
     /// The loudest sample each pad has made since this was last asked —
     /// read-and-reset, the strips' own idiom. What lights a pad from the
     /// audio rather than from the gesture, so a hardware strike shows too.
-    pub fn pad_peaks(&self) -> [f32; PADS] {
-        std::array::from_fn(|i| f32::from_bits(self.shared.pad_peak[i].swap(0, Ordering::Relaxed)))
+    pub fn pad_peaks(&self, lane: usize) -> [f32; PADS] {
+        let Some(row) = self.shared.pad_peak.get(lane) else {
+            return [0.0; PADS];
+        };
+        std::array::from_fn(|i| f32::from_bits(row[i].swap(0, Ordering::Relaxed)))
     }
 
     /// Which input picks tee into the capture rings — a bit per input, zero
@@ -10356,17 +10588,17 @@ mod tests {
             click_retiring: RingBuffer::<Click>::new(2).0,
             midi_incoming: RingBuffer::<Vec<PlacedMidi>>::new(2).1,
             midi_retiring: RingBuffer::<Vec<PlacedMidi>>::new(2).0,
-            pad_kit: PadKit::default(),
-            pad_incoming: RingBuffer::<PadKit>::new(2).1,
-            pad_retiring: RingBuffer::<PadKit>::new(2).0,
+            pad_kits: (0..CHANNELS).map(|_| PadKit::default()).collect(),
+            pad_voices: (0..CHANNELS).map(|_| [PadVoice::default(); PADS]).collect(),
+            pad_incoming: RingBuffer::<(usize, PadKit)>::new(2).1,
+            pad_retiring: RingBuffer::<(usize, PadKit)>::new(2).0,
             preview_incoming: RingBuffer::<Option<Arc<tangent_record::decode::Clip>>>::new(2).1,
             preview_retiring: RingBuffer::<Option<Arc<tangent_record::decode::Clip>>>::new(2).0,
             preview: None,
             preview_pos: 0,
-            pad_voices: [PadVoice::default(); PADS],
             pad_hits: Vec::with_capacity(MAX_PAD_HITS_PER_BLOCK),
             pad_offs: Vec::with_capacity(MAX_PAD_HITS_PER_BLOCK * 2),
-            pad_gain: 1.0,
+            pad_gain: vec![1.0; CHANNELS],
             shared,
             timebase: Timebase::new(),
             rate: RATE,
@@ -10981,6 +11213,167 @@ mod tests {
         kit
     }
 
+    /// **TWO drum tracks both sound, each on its own strip.**
+    ///
+    /// The owner's report: "Have tan drum track, copy all to new track, 2nd
+    /// track doesn't light up meters or make sound, but its pads are visibly
+    /// triggered and THEIR meters light up." One `drum_strip` filled by
+    /// `.find()`, one `PadKit`, one set of voices — so the second lane's
+    /// notes reached nothing and the pads that lit belonged to the first.
+    ///
+    /// A drum instrument loads a full instance per channel, the way every
+    /// industry sampler does. This asks for exactly that: the same kit on
+    /// two lanes, notes on BOTH, and each lane's own fader governing its own
+    /// sound.
+    #[test]
+    fn two_drum_lanes_each_sound_on_their_own_strip() {
+        use std::sync::Arc;
+        // Lane 5 and lane 9, the same kit, a note on each.
+        let clip = |lane: usize| PlacedMidi {
+            strip: lane,
+            start: 0,
+            len: 48_000,
+            notes: Arc::new(vec![ClipNote {
+                at: 0,
+                dur: 2_400,
+                key: PAD_BASE,
+                vel: 100,
+            }]),
+        };
+        // `gain` is applied to lane 9 alone, so a peak that answers to it
+        // proves the sound came through THAT lane and not the other's.
+        let render = |lanes: &[usize], gain: f32| -> f32 {
+            let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+            for &l in lanes {
+                e.set_pad_kit(l, test_kit(&[0], 4_800, 0.5));
+                e.set_channel_gain(l, if l == 9 { gain } else { 1.0 });
+            }
+            e.set_drum_strips(lanes.iter().fold(0u32, |m, l| m | 1 << l));
+            let mut out = vec![0.0f32; 1024 * 2];
+            // **Let the kits LAND before the transport rolls.** The kit ring
+            // hands the callback one kit per block, so with two lanes the
+            // second arrives a block after the first — and a strike that
+            // lands before its kit does finds no sample and silences the
+            // voice. Stopped blocks still swap; the swap runs above the
+            // early-out precisely so a kit can arrive while nothing sounds.
+            e.set_rolling(false);
+            for _ in 0..4 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+            }
+            e.set_midi_clips(lanes.iter().map(|l| clip(*l)).collect());
+            e.set_transport(1, 0);
+            e.set_rolling(true);
+            let mut peak = 0.0f32;
+            for b in 0..4 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                if b == 3 {
+                    peak = out.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+                }
+            }
+            peak
+        };
+
+        let one = render(&[5], 1.0);
+        assert!(one > 0.05, "a single drum lane is silent: {one}");
+
+        // Two lanes: LOUDER than one, because both are sounding. This is the
+        // whole bug — the second used to contribute nothing.
+        let two = render(&[5, 9], 1.0);
+        assert!(
+            two > one * 1.5,
+            "the second drum lane added nothing: {two} against {one} for one lane"
+        );
+
+        // And the second lane answers its OWN fader. Pulling lane 9 down has
+        // to change the sum, or its sound is coming out of lane 5's strip.
+        let quiet = render(&[5, 9], 0.0);
+        assert!(
+            quiet < two * 0.8,
+            "lane 9's fader does not govern lane 9's kit: {quiet} against {two}"
+        );
+        assert!(
+            (quiet - one).abs() < one * 0.25,
+            "with lane 9 silenced the sum is not lane 5 alone: {quiet} against {one}"
+        );
+    }
+
+    /// **Each drum lane's KNOBS are its own.**
+    ///
+    /// A full instance per channel means pad 36 of lane 5 and pad 36 of lane
+    /// 9 are two different sounds, so the gain, pan, tune, trim and choke
+    /// that shape them cannot be shared. They were one array indexed by pad
+    /// alone, which meant editing one kit reached into the other's sound.
+    #[test]
+    fn each_drum_lanes_knobs_belong_to_its_own_kit() {
+        use std::sync::Arc;
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        let lanes = [5usize, 9];
+        for &l in &lanes {
+            e.set_pad_kit(l, test_kit(&[0], 4_800, 0.5));
+        }
+        e.set_drum_strips(lanes.iter().fold(0u32, |m, l| m | 1 << l));
+
+        // Lane 5's pad 0 is pulled to silence; lane 9's is left alone.
+        let mut hushed = tangent_ui::recorder::DrumKitParams::default();
+        hushed.pads[0].gain = 0.0;
+        e.set_pad_params(5, &hushed);
+        e.set_pad_params(9, &tangent_ui::recorder::DrumKitParams::default());
+
+        let mut out = vec![0.0f32; 1024 * 2];
+        e.set_rolling(false);
+        for _ in 0..4 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+        }
+        e.set_midi_clips(
+            lanes
+                .iter()
+                .map(|l| PlacedMidi {
+                    strip: *l,
+                    start: 0,
+                    len: 48_000,
+                    notes: Arc::new(vec![ClipNote {
+                        at: 0,
+                        dur: 2_400,
+                        key: PAD_BASE,
+                        vel: 100,
+                    }]),
+                })
+                .collect(),
+        );
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        let mut peak = 0.0f32;
+        for b in 0..4 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            if b == 3 {
+                peak = out.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+            }
+        }
+        // Lane 9 still sounds — its pad was never touched.
+        assert!(
+            peak > 0.05,
+            "silencing lane 5's pad silenced lane 9's too: {peak}"
+        );
+
+        // And the reverse: hush BOTH and there is nothing left. This is the
+        // control — without it a stuck level would pass the assertion above.
+        e.set_pad_params(9, &hushed);
+        let mut after = 0.0f32;
+        for _ in 0..8 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            after = after.max(out.iter().fold(0.0f32, |a, v| a.max(v.abs())));
+        }
+        assert!(
+            after < peak * 0.5,
+            "hushing both lanes changed nothing: {after} against {peak}"
+        );
+    }
+
     /// **A channel-10 note strikes the pad and spares the piano.**
     ///
     /// End to end through the real renderer: the diversion happens in
@@ -10990,7 +11383,7 @@ mod tests {
     #[test]
     fn a_channel_ten_note_strikes_the_pad_and_spares_the_piano() {
         let (mut r, mut tx, _shared) = renderer_with_midi(2);
-        r.pad_kit = test_kit(&[36], 48_000, 0.5);
+        r.pad_kits[0] = test_kit(&[36], 48_000, 0.5);
 
         queue(&mut tx, 0, [0x99, 36, 100]);
         let mut out = vec![0.0_f32; 2 * 2048];
@@ -11030,9 +11423,9 @@ mod tests {
     #[test]
     fn a_choke_group_cuts_the_other_pad_and_a_retrigger_never_doubles() {
         let (mut r, mut tx, shared) = renderer_with_midi(2);
-        r.pad_kit = test_kit(&[36, 37], 480_000, 0.5);
-        shared.pad_choke[36].store(1, Ordering::Relaxed);
-        shared.pad_choke[37].store(1, Ordering::Relaxed);
+        r.pad_kits[0] = test_kit(&[36, 37], 480_000, 0.5);
+        shared.pad_choke[0][36].store(1, Ordering::Relaxed);
+        shared.pad_choke[0][37].store(1, Ordering::Relaxed);
         let one = 0.5 * 100.0 / 127.0;
 
         let mut out = vec![0.0_f32; 2 * 2048];
@@ -11067,17 +11460,19 @@ mod tests {
     #[test]
     fn a_kit_swap_silences_the_voices_and_returns_the_old_kit() {
         let (mut r, mut tx, _shared) = renderer_with_midi(2);
-        r.pad_kit = test_kit(&[36], 480_000, 0.5);
+        r.pad_kits[0] = test_kit(&[36], 480_000, 0.5);
         let mut out = vec![0.0_f32; 2 * 2048];
         queue(&mut tx, 0, [0x99, 36, 100]);
         r.render(&mut out, 0, 0);
         assert!(out.iter().any(|s| s.abs() > 0.01), "the pad never sounded");
 
-        let (mut to, incoming) = RingBuffer::<PadKit>::new(2);
-        let (retiring, mut from) = RingBuffer::<PadKit>::new(2);
+        let (mut to, incoming) = RingBuffer::<(usize, PadKit)>::new(2);
+        let (retiring, mut from) = RingBuffer::<(usize, PadKit)>::new(2);
         r.pad_incoming = incoming;
         r.pad_retiring = retiring;
-        to.push(test_kit(&[1], 4800, 0.25))
+        // The lane travels with the kit now — this renderer's pads are
+        // lane 0's, which is what `pad_kits[0]` above set up.
+        to.push((0, test_kit(&[1], 4800, 0.25)))
             .expect("room for the kit");
 
         r.render(&mut out, 0, 0);
@@ -11087,7 +11482,9 @@ mod tests {
             "a voice survived the swap into a different kit at {peak}"
         );
         let old = from.pop().expect("the displaced kit came back");
-        assert!(old.pads[36].is_some(), "the wrong kit was returned");
+        // The lane comes back with it, and it is the one that was sent.
+        assert_eq!(old.0, 0, "the retired kit came back on the wrong lane");
+        assert!(old.1.pads[36].is_some(), "the wrong kit was returned");
     }
 
     /// **A hardware route puts a channel on its own jacks, and does not take
@@ -12081,7 +12478,7 @@ mod tests {
     fn a_drum_lane_strikes_the_pads() {
         use std::sync::Arc;
         let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
-        e.set_pad_kit(test_kit(&[0], 4_800, 0.5));
+        e.set_pad_kit(7, test_kit(&[0], 4_800, 0.5));
         e.set_midi_clips(vec![PlacedMidi {
             strip: 7,
             start: 0,
@@ -12093,7 +12490,7 @@ mod tests {
                 vel: 100,
             }]),
         }]);
-        e.set_drum_strip(Some(7));
+        e.set_drum_strips(1 << 7);
         e.set_transport(1, 0);
         e.set_rolling(true);
         let mut out = vec![0.0f32; 1024 * 2];
@@ -12109,7 +12506,7 @@ mod tests {
         // no rack) and the render is silence — the strike path really was
         // the assignment, not some default.
         let mut quiet = Engine::offline(48_000, Timebase::new()).expect("offline");
-        quiet.set_pad_kit(test_kit(&[0], 4_800, 0.5));
+        quiet.set_pad_kit(7, test_kit(&[0], 4_800, 0.5));
         quiet.set_midi_clips(vec![PlacedMidi {
             strip: 7,
             start: 0,
@@ -12156,9 +12553,9 @@ mod tests {
         };
         let render_peak = |mute_lane: bool, gain: f32| {
             let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
-            e.set_pad_kit(test_kit(&[0], 4_800, 0.5));
+            e.set_pad_kit(7, test_kit(&[0], 4_800, 0.5));
             e.set_midi_clips(clip());
-            e.set_drum_strip(Some(7));
+            e.set_drum_strips(1 << 7);
             e.set_channel_gain(7, gain);
             if mute_lane {
                 e.shared
@@ -12202,11 +12599,11 @@ mod tests {
         use std::sync::Arc;
         let render = |obey: bool, trim_end: f32| {
             let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
-            e.set_pad_kit(test_kit(&[0], 48_000, 0.5));
+            e.set_pad_kit(7, test_kit(&[0], 48_000, 0.5));
             let mut kit = tangent_ui::recorder::DrumKitParams::default();
             kit.pads[0].obey = obey;
             kit.pads[0].trim_end = trim_end;
-            e.set_pad_params(&kit);
+            e.set_pad_params(7, &kit);
             e.set_midi_clips(vec![PlacedMidi {
                 strip: 7,
                 start: 0,
@@ -12218,7 +12615,7 @@ mod tests {
                     vel: 100,
                 }]),
             }]);
-            e.set_drum_strip(Some(7));
+            e.set_drum_strips(1 << 7);
             e.set_transport(1, 0);
             e.set_rolling(true);
             let mut out = vec![0.0f32; 1024 * 2];
@@ -12817,6 +13214,58 @@ mod tests {
             "the phase flip did not cancel: {cancelled} against {together} \
              together. Either the switch is not inverting, or the two lanes \
              are not sample-aligned."
+        );
+    }
+
+    /// **Every lane holding a built-in instrument is named, not the first.**
+    ///
+    /// `drum_strip` and `builtin_strip` were single indices filled by
+    /// `.find()`, so a duplicated drum or DX7 track was silent: it took MIDI,
+    /// lit the shared pads, and rendered nothing. The masks are what let a
+    /// full instance live on each channel, the way every industry sampler
+    /// does. The single index survives beside each mask for the parts of the
+    /// engine that have not learned about lanes yet, and must always name
+    /// the mask's FIRST bit or the two would disagree about which lane is
+    /// first.
+    #[test]
+    fn the_builtin_masks_name_every_lane_and_agree_with_the_first() {
+        let e = Engine::offline(48_000, Timebase::new()).expect("offline");
+
+        // Nothing loaded: no lanes, and the legacy index says nobody.
+        assert_eq!(e.shared.drum_strips.load(Ordering::Relaxed), 0);
+        assert_eq!(e.shared.builtin_strips.load(Ordering::Relaxed), 0);
+
+        // Three drum lanes and two DX7 lanes, as a copied session would have.
+        // Built FROM the lanes, not hand-written in binary: a literal is one
+        // typo away from asserting a different set than it names.
+        let drum_lanes = [2usize, 6, 9];
+        let builtin_lanes = [4usize, 5];
+        let mask = |ls: &[usize]| ls.iter().fold(0u32, |m, ch| m | 1 << ch);
+        e.set_drum_strips(mask(&drum_lanes));
+        e.set_builtin_strips(mask(&builtin_lanes));
+        e.set_builtin_strip(builtin_lanes.first().copied());
+
+        let drums = e.shared.drum_strips.load(Ordering::Relaxed);
+        assert_eq!(drums.count_ones(), 3, "a lane went missing from the mask");
+        for ch in drum_lanes {
+            assert!(drums & (1 << ch) != 0, "lane {ch} is not in the drum mask");
+        }
+        // There is no second field to disagree with: the first lane is
+        // DERIVED from the mask. That is the invariant — a stored copy is
+        // what let a kit go to one lane while the strike went to another.
+        assert_eq!(
+            e.renderer_first_drum_lane(),
+            drum_lanes.first().copied(),
+            "the derived first lane is not the mask's lowest bit"
+        );
+        e.set_drum_strips(0);
+        assert_eq!(e.renderer_first_drum_lane(), None, "no lanes, no first lane");
+        e.set_drum_strips(mask(&drum_lanes));
+        let builtins = e.shared.builtin_strips.load(Ordering::Relaxed);
+        assert_eq!(builtins.count_ones(), 2);
+        assert_eq!(
+            e.shared.builtin_strip.load(Ordering::Relaxed),
+            i64::from(builtins.trailing_zeros())
         );
     }
 
