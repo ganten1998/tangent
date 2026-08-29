@@ -1458,6 +1458,7 @@ fn clip_at(rel_path: &str, lane: usize, start_s: f64) -> crate::arrangement::Arr
         start_s,
         offset_s: 0.0,
         len_s: 0.0,
+        loop_s: 0.0,
         fade_in_s: 0.0,
         fade_out_s: 0.0,
         name: std::path::Path::new(rel_path)
@@ -3694,6 +3695,7 @@ impl IvoryApp {
             start_s: 0.0,
             offset_s: 0.0,
             len_s: 95.0,
+            loop_s: 0.0,
             fade_in_s: 1.5,
             fade_out_s: 6.0,
             name: "Blue Bossa - backing".to_owned(),
@@ -3713,6 +3715,7 @@ impl IvoryApp {
             start_s: 16.0,
             offset_s: 2.0,
             len_s: 21.0,
+            loop_s: 0.0,
             fade_in_s: 0.4,
             fade_out_s: 0.4,
             name: "take 3".to_owned(),
@@ -3732,6 +3735,7 @@ impl IvoryApp {
             start_s: 48.0,
             offset_s: 0.0,
             len_s: 30.0,
+            loop_s: 0.0,
             fade_in_s: 0.0,
             fade_out_s: 2.5,
             name: "solo".to_owned(),
@@ -3767,6 +3771,7 @@ impl IvoryApp {
             start_s: 32.0,
             offset_s: 0.0,
             len_s: 16.0,
+            loop_s: 0.0,
             fade_in_s: 0.0,
             fade_out_s: 0.0,
             name: "MIDI".to_owned(),
@@ -6214,6 +6219,7 @@ impl IvoryApp {
             start_s: start_s.max(0.0),
             offset_s: 0.0,
             len_s: import.len_s.max(0.05),
+            loop_s: import.len_s.max(0.05),
             fade_in_s: 0.0,
             fade_out_s: 0.0,
             name,
@@ -6355,6 +6361,7 @@ impl IvoryApp {
                 start_s: r.start_s.max(0.0),
                 offset_s: 0.0,
                 len_s: r.len_s,
+                loop_s: 0.0,
                 fade_in_s: 0.0,
                 fade_out_s: 0.0,
                 name,
@@ -7817,7 +7824,7 @@ impl IvoryApp {
                         len_s: len,
                         max_len_s: f64::INFINITY,
                         offset_s: 0.0,
-                        fade_in_s: 0.0,
+        fade_in_s: 0.0,
                         fade_out_s: 0.0,
                         name: "",
                         wave: &[],
@@ -7979,6 +7986,13 @@ impl IvoryApp {
             .iter()
             .find(|c| c.id == id)
             .and_then(|c| {
+                // **A LOOPING clip has no end to run out of.** The cap is the
+                // file's remaining length, which is the right answer for
+                // audio and meaningless for a MIDI item that repeats: there
+                // is no file, and dragging past one pass is the whole point.
+                if c.loop_s > 0.0 {
+                    return None;
+                }
                 self.clip_infos
                     .get(&c.id)
                     .map(|i| (i.file_s - c.offset_s).max(MIN))
@@ -9119,6 +9133,123 @@ impl IvoryApp {
 
     /// Ask the host to normalise whatever audio is selected.
     ///
+    /// **Glue the selected clips on ONE track into a single clip.**
+    ///
+    /// The escape hatch from the loop: a MIDI item repeats rather than
+    /// revealing empty time, so the way to get one long pass out of several
+    /// is to write them and weld them. Cmd+G on macOS, Ctrl+G elsewhere.
+    ///
+    /// **Silence between them is included.** Gluing two bars a bar apart
+    /// gives four bars, not two — otherwise the result would not line up
+    /// with the song it came out of, and "glue" would mean "close the gaps",
+    /// which is a different and much less useful verb.
+    ///
+    /// One track at a time. Clips on different lanes cannot become one clip,
+    /// and quietly gluing the ones that happen to share a lane would be a
+    /// command that does something other than what was asked.
+    fn arr_glue_selection(&mut self) {
+        let mut ids: Vec<u64> = self.arr_multi.iter().copied().collect();
+        if let Some(one) = self.arr_selected {
+            if !ids.contains(&one) {
+                ids.push(one);
+            }
+        }
+        // MIDI only: welding two audio files means rendering, which is a
+        // different operation with a different cost.
+        let mut picked: Vec<crate::arrangement::ArrClip> = self
+            .arrangement
+            .clips
+            .iter()
+            .filter(|c| ids.contains(&c.id) && c.kind == crate::arrangement::ClipKind::Midi)
+            .cloned()
+            .collect();
+        if picked.len() < 2 {
+            self.report_take(
+                "Select two or more MIDI clips on one track to glue.".to_owned(),
+                false,
+            );
+            return;
+        }
+        let lane = picked[0].lane;
+        if picked.iter().any(|c| c.lane != lane) {
+            self.report_take(
+                "Glue works on one track at a time.".to_owned(),
+                false,
+            );
+            return;
+        }
+        picked.sort_by(|a, b| {
+            a.start_s.partial_cmp(&b.start_s).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let start = picked[0].start_s;
+        let end = picked
+            .iter()
+            .map(|c| c.start_s + c.len_s)
+            .fold(start, f64::max);
+
+        // Every note, at its place on the TIMELINE, with each clip's own
+        // loop already spelled out — gluing a repeating clip has to keep the
+        // repeats, or the sound changes.
+        let mut notes: Vec<crate::arrangement::ArrNote> = Vec::new();
+        for c in &picked {
+            let passes: usize = if c.loop_s > 1.0e-6 {
+                ((c.len_s / c.loop_s).ceil() as usize).clamp(1, 4_096)
+            } else {
+                1
+            };
+            for pass in 0..passes {
+                let shift = c.loop_s * pass as f64;
+                for n in &c.notes {
+                    let at = n.at_s - c.offset_s + shift;
+                    if at < -1.0e-9 {
+                        continue;
+                    }
+                    if c.loop_s > 1.0e-6 && at >= c.len_s - 1.0e-9 {
+                        continue;
+                    }
+                    notes.push(crate::arrangement::ArrNote {
+                        at_s: c.start_s + at - start,
+                        dur_s: n.dur_s,
+                        key: n.key,
+                        vel: n.vel,
+                    });
+                }
+            }
+        }
+        notes.sort_by(|a, b| {
+            a.at_s.partial_cmp(&b.at_s).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let doomed: Vec<u64> = picked.iter().map(|c| c.id).collect();
+        self.arrangement.clips.retain(|c| !doomed.contains(&c.id));
+        self.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            notes,
+            lane,
+            path: String::new(),
+            start_s: start,
+            offset_s: 0.0,
+            len_s: (end - start).max(0.05),
+            // **The glued clip does not loop.** Its whole purpose is to be
+            // one long pass; pinning it would put back the thing it was made
+            // to escape.
+            loop_s: 0.0,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name: "MIDI".to_owned(),
+            id: 0,
+            extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: true,
+            stretch: 1.0,
+            stretch_mode: String::new(),
+            gain: 1.0,
+        });
+        self.arr_multi.clear();
+        self.arr_selected = None;
+        self.arr_save_edits();
+    }
+
     /// **The set, or the one.** The same rule every clip action here follows:
     /// a marquee over eight takes means all eight.
     fn arr_normalize_selection(&mut self) {
@@ -9469,6 +9600,7 @@ impl IvoryApp {
                 start_s: t,
                 offset_s: c.offset_s + head,
                 len_s: len - head,
+                loop_s: 0.0,
                 fade_in_s: 0.0,
                 fade_out_s: tail_fade,
                 name: c.name.clone(),
@@ -14011,6 +14143,12 @@ impl IvoryApp {
                         start_s: t0,
                         offset_s: 0.0,
                         len_s: t1 - t0,
+                        // **Pinned at the length it was drawn, and a LOOP
+                        // from here on.** Dragging the right edge lays down
+                        // another pass rather than revealing empty time,
+                        // which is what a drawn MIDI item is for: a bar or
+                        // two written once and repeated.
+                        loop_s: t1 - t0,
                         fade_in_s: 0.0,
                         fade_out_s: 0.0,
                         name: "MIDI".to_owned(),
@@ -14163,6 +14301,18 @@ impl IvoryApp {
             })
         {
             self.arr_normalize_selection();
+        }
+        // **Ctrl/Cmd+G: GLUE the selected MIDI clips on one track.** The way
+        // out of a loop: write the passes, then weld them into one.
+        if keys_ok
+            && self.midi_edit.is_none()
+            && ctx.input(|i| {
+                (i.modifiers.command || i.modifiers.ctrl)
+                    && !i.modifiers.shift
+                    && i.key_pressed(egui::Key::G)
+            })
+        {
+            self.arr_glue_selection();
         }
         // **Ctrl/Cmd+T: a new track**, bare, on the first free slot — the
         // owner's keyboard twin of the + circle.
@@ -22927,6 +23077,7 @@ mod tests {
             start_s: 8.0,
             offset_s: 0.0,
             len_s: 16.0,
+            loop_s: 0.0,
             fade_in_s: 0.0,
             fade_out_s: 0.0,
             name: "MIDI".to_owned(),
@@ -23052,6 +23203,7 @@ mod tests {
             start_s: 0.0,
             offset_s: 0.0,
             len_s: 10.0,
+            loop_s: 0.0,
             fade_in_s: 0.0,
             fade_out_s: 0.0,
             name: "old".to_owned(),
@@ -23111,6 +23263,7 @@ mod tests {
             start_s: 0.0,
             offset_s: 0.0,
             len_s: 10.0,
+            loop_s: 0.0,
             fade_in_s: 0.0,
             fade_out_s: 0.0,
             name: "old".to_owned(),
@@ -23157,6 +23310,7 @@ mod tests {
             start_s: start,
             offset_s: 0.0,
             len_s: len,
+            loop_s: 0.0,
             fade_in_s: 0.0,
             fade_out_s: 0.0,
             name: "x".to_owned(),
@@ -23342,6 +23496,7 @@ mod tests {
             start_s: 8.0,
             offset_s: 0.0,
             len_s: 16.0,
+            loop_s: 0.0,
             fade_in_s: 0.0,
             fade_out_s: 0.0,
             name: "MIDI".to_owned(),
@@ -25696,6 +25851,7 @@ mod tests {
             start_s: 1.0,
             offset_s: 0.0,
             len_s: 8.0,
+            loop_s: 0.0,
             fade_in_s: 0.0,
             fade_out_s: 0.0,
             name: "MIDI".to_owned(),
@@ -26622,6 +26778,77 @@ mod tests {
         assert_eq!(c.value_at(8.0), Some(0.4), "the written value is not the one set");
     }
 
+    /// **Glue welds the selected MIDI clips on one track, silence included.**
+    ///
+    /// Gluing two one-bar clips a bar apart gives FOUR bars, not two: the
+    /// gap is part of the music's shape, and a glue that closed it would be
+    /// a different and much less useful verb — the result would no longer
+    /// line up with the song it came out of.
+    #[test]
+    fn glue_welds_clips_on_one_track_and_keeps_the_silence() {
+        use crate::arrangement::{ArrClip, ArrNote, ClipKind};
+        let (_, mut app) = headless(Caps::DESKTOP);
+        let mut mk = |id: u64, lane: usize, at: f64, len: f64, note_at: f64| {
+            app.arrangement.clips.push(ArrClip {
+                id,
+                lane,
+                kind: ClipKind::Midi,
+                start_s: at,
+                len_s: len,
+                notes: vec![ArrNote { at_s: note_at, dur_s: 0.25, key: 60, vel: 100 }],
+                ..Default::default()
+            });
+        };
+        // Two one-second clips with a one-second gap between them.
+        mk(1, 3, 0.0, 1.0, 0.0);
+        mk(2, 3, 2.0, 1.0, 0.0);
+        app.arr_multi = vec![1, 2];
+        app.arr_glue_selection();
+
+        assert_eq!(app.arrangement.clips.len(), 1, "the two were not welded");
+        let c = &app.arrangement.clips[0];
+        assert_eq!(c.lane, 3);
+        assert!((c.start_s - 0.0).abs() < 1e-9, "start moved: {}", c.start_s);
+        assert!(
+            (c.len_s - 3.0).abs() < 1e-9,
+            "the silence between them was dropped: {} should be 3",
+            c.len_s
+        );
+        assert_eq!(c.loop_s, 0.0, "the glued clip should not loop");
+        assert_eq!(c.notes.len(), 2, "{:?}", c.notes);
+        assert!((c.notes[0].at_s - 0.0).abs() < 1e-9);
+        assert!(
+            (c.notes[1].at_s - 2.0).abs() < 1e-9,
+            "the second clip's note did not keep its place: {}",
+            c.notes[1].at_s
+        );
+    }
+
+    /// **Glue refuses clips on different tracks** rather than quietly welding
+    /// whichever happen to share a lane.
+    #[test]
+    fn glue_will_not_weld_across_tracks() {
+        use crate::arrangement::{ArrClip, ClipKind};
+        let (_, mut app) = headless(Caps::DESKTOP);
+        for (id, lane) in [(1u64, 0usize), (2, 1)] {
+            app.arrangement.clips.push(ArrClip {
+                id,
+                lane,
+                kind: ClipKind::Midi,
+                start_s: f64::from(u32::try_from(id).unwrap_or(0)),
+                len_s: 1.0,
+                ..Default::default()
+            });
+        }
+        app.arr_multi = vec![1, 2];
+        app.arr_glue_selection();
+        assert_eq!(
+            app.arrangement.clips.len(),
+            2,
+            "clips on two tracks were welded into one"
+        );
+    }
+
     /// **Selecting a clip selects the track it is on**, and several clips
     /// select several tracks.
     ///
@@ -27309,6 +27536,7 @@ mod tests {
             start_s: 2.0,
             offset_s: 0.25,
             len_s: 4.0,
+            loop_s: 0.0,
             fade_in_s: 0.0,
             fade_out_s: 0.0,
             name: "m".into(),
@@ -27328,6 +27556,7 @@ mod tests {
             start_s: 8.0,
             offset_s: 1.0,
             len_s: 3.0,
+            loop_s: 0.0,
             fade_in_s: 0.1,
             fade_out_s: 0.1,
             name: "a".into(),
@@ -27381,6 +27610,7 @@ mod tests {
             start_s: 2.0,
             offset_s: 0.0,
             len_s: 2.0,
+            loop_s: 0.0,
             fade_in_s: 0.0,
             fade_out_s: 0.0,
             name: "m".into(),
@@ -27958,6 +28188,7 @@ mod tests {
                 start_s: 0.0,
                 offset_s: 0.0,
                 len_s: 4.0,
+                loop_s: 0.0,
                 fade_in_s: 0.0,
                 fade_out_s: 0.0,
                 name: String::new(),
@@ -30888,6 +31119,7 @@ mod velocity_selection_tests {
             start_s: 0.0,
             offset_s: 0.0,
             len_s: 4.0,
+            loop_s: 0.0,
             fade_in_s: 0.0,
             fade_out_s: 0.0,
             name: "m".into(),
