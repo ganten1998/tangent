@@ -819,6 +819,8 @@ struct Beat {
 #[derive(Debug)]
 struct Beats {
     period: f64,
+    /// Clicks per beat; 0 means one a bar. See `Shared::metronome_div`.
+    div: u32,
     to_next: f64,
     /// Beats since the phase was last restarted, for the bar accent.
     index: u64,
@@ -838,6 +840,7 @@ impl Beats {
     fn new(rate: f64, bpm: f64) -> Self {
         Self {
             period: period_frames(rate, bpm, 4),
+            div: 1,
             to_next: 0.0,
             index: 0,
             count_in_left: 0,
@@ -892,7 +895,14 @@ impl Beats {
         // prevent.
         self.to_next += self.period - 1.0;
 
-        let bar = beats_per_bar.max(1) as u64;
+        // Ticks in a bar, not beats: at two clicks a beat there are twice as
+        // many before the accent comes round again, and at "once a bar" there
+        // is exactly one. The accent must land on the DOWNBEAT either way.
+        let bar = if self.div == 0 {
+            1
+        } else {
+            (beats_per_bar.max(1) as u64).saturating_mul(u64::from(self.div)).max(1)
+        };
         let accent = self.index % bar == 0;
         self.index += 1;
 
@@ -1089,7 +1099,7 @@ pub struct Maps {
 /// how many beats a bar holds and how long each is, and `(bar, beat)` walks
 /// that correctly by construction while an accumulated quarter would need the
 /// change handled at every place it was read.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct BarClock {
     bar: u32,
     beat: u32,
@@ -1101,9 +1111,43 @@ struct BarClock {
     /// answer to all three is the same: work out where we are from scratch.
     expect: u64,
     armed: bool,
+    /// Clicks per beat of the signature; 0 means one per BAR. Held here so
+    /// `normalise` and `frame_of` cannot disagree about how many there are.
+    div: u32,
+}
+
+impl Default for BarClock {
+    /// **A clock with nothing said to it clicks once a BEAT.**
+    ///
+    /// Not derived, because `div` is a value whose zero means something —
+    /// "once a bar" — rather than an absence. A derived default would have
+    /// handed every fresh clock the sparsest setting there is, which is a
+    /// metronome that appears broken.
+    fn default() -> Self {
+        Self {
+            bar: 0,
+            beat: 0,
+            at_frame: 0.0,
+            expect: 0,
+            armed: false,
+            div: 1,
+        }
+    }
 }
 
 impl BarClock {
+    /// How many clicks a bar carries at this division.
+    ///
+    /// The two callers below both need it, and a bar counted one way and
+    /// timed the other is a click that drifts a whole bar per bar.
+    fn ticks_in_bar(&self, beats: u32) -> u32 {
+        if self.div == 0 {
+            1
+        } else {
+            beats.max(1).saturating_mul(self.div).max(1)
+        }
+    }
+
     /// Re-derive from the transport's actual position.
     fn resync(&mut self, pos: u64, maps: &Maps, rate: f64) {
         let secs = pos as f64 / rate.max(1.0);
@@ -1122,7 +1166,12 @@ impl BarClock {
         // the count-in, where `Beats` sounds the downbeat and the transport
         // starts rolling — the next frame resyncs this clock a frame or two
         // past beat one, and firing there would be a second click on the "go".
-        self.beat = beat.floor() as u32;
+        // `bar_beat_at_quarter` answers in the signature's BEATS; the clock
+        // counts in ticks, which is beats times the division.
+        let sig = maps.meter.sig_at_bar(bar);
+        let per_bar = f64::from(self.ticks_in_bar(u32::from(sig.beats.max(1))));
+        let ticks = beat * per_bar / f64::from(sig.beats.max(1)).max(1.0);
+        self.beat = ticks.floor() as u32;
         self.normalise(maps);
         self.at_frame = self.frame_of(maps, rate);
         if self.at_frame < pos as f64 {
@@ -1138,7 +1187,7 @@ impl BarClock {
     fn normalise(&mut self, maps: &Maps) {
         for _ in 0..64 {
             let sig = maps.meter.sig_at_bar(self.bar);
-            let per_bar = u32::from(sig.beats.max(1));
+            let per_bar = self.ticks_in_bar(u32::from(sig.beats.max(1)));
             if self.beat < per_bar {
                 return;
             }
@@ -1151,9 +1200,15 @@ impl BarClock {
     fn frame_of(&self, maps: &Maps, rate: f64) -> f64 {
         let sig = maps.meter.sig_at_bar(self.bar);
         // Beats of the SIGNATURE into quarters — the one exchange rate, and
-        // the same one `MeterMap::quarters_in_bar` uses.
+        // the same one `MeterMap::quarters_in_bar` uses — then divided by the
+        // clicks the division asks for. Derived from the BAR rather than from
+        // the beat so that "once a bar" is exactly the bar, whatever its
+        // meter, and every other division is an even share of it.
+        let per_bar = f64::from(self.ticks_in_bar(u32::from(sig.beats.max(1))));
+        let bar_quarters =
+            f64::from(sig.beats.max(1)) * (4.0 / f64::from(sig.unit.max(1)));
         let quarter = maps.meter.quarter_at_bar(self.bar)
-            + f64::from(self.beat) * (4.0 / f64::from(sig.unit.max(1)));
+            + f64::from(self.beat) * (bar_quarters / per_bar.max(1.0));
         maps.tempo.seconds_at_beat(quarter) * rate
     }
 
@@ -1735,6 +1790,15 @@ struct Shared {
     count_in_in_take: AtomicBool,
     bpm: AtomicU64,
     beats_per_bar: AtomicU32,
+    /// **How often the click sounds, per beat of the signature.**
+    ///
+    /// 1 is one click a beat, 2 is twice a beat, 0 is one a BAR. Held as a
+    /// division of the SIGNATURE's beat rather than as a note value, because
+    /// the beat is whatever the signature says: in 6/8 it is an eighth, and a
+    /// click named in quarters would be counting something the music is not
+    /// in. Compound meters are why this exists — 6/8 is felt in two dotted
+    /// quarters and a click insisting on all six is unusable.
+    metronome_div: AtomicU32,
     /// The time signature's bottom number: what gets the beat.
     beat_unit: AtomicU32,
 
@@ -1873,6 +1937,7 @@ impl Shared {
             count_in_in_take: AtomicBool::new(false),
             bpm: AtomicU64::new(120.0f64.to_bits()),
             beats_per_bar: AtomicU32::new(4),
+            metronome_div: AtomicU32::new(1),
             beat_unit: AtomicU32::new(4),
             count_in_req: AtomicU64::new(0),
             count_in_beats: AtomicU32::new(0),
@@ -3057,11 +3122,31 @@ impl Renderer {
                 self.bar_clock.armed = false;
             }
         }
-        self.beats.period = period_frames(
+        // **The division, into both clocks, before either is asked.**
+        //
+        // Read once a block like the tempo beside it: it is published at
+        // human speed, and the two clocks disagreeing about how many clicks a
+        // bar holds is a click that drifts a whole bar per bar.
+        let div = self.shared.metronome_div.load(Ordering::Relaxed).min(8);
+        if self.beats.div != div || self.bar_clock.div != div {
+            self.beats.div = div;
+            self.bar_clock.div = div;
+            // The bar lines just moved under it, exactly as a new map does.
+            self.bar_clock.armed = false;
+        }
+        let beat_period = period_frames(
             self.rate,
             f64::from_bits(self.shared.bpm.load(Ordering::Relaxed)),
             self.shared.beat_unit.load(Ordering::Relaxed),
         );
+        // A division of the BEAT, except at zero, where the click is once a
+        // bar and the period is the whole bar's worth of beats.
+        self.beats.period = if div == 0 {
+            beat_period * f64::from(self.shared.beats_per_bar.load(Ordering::Relaxed).max(1))
+        } else {
+            beat_period / f64::from(div)
+        }
+        .max(1.0);
         // Acquire pairs with `start_count_in`'s Release on the bump, so a new
         // generation is seen with its OWN beat count — the beats are read
         // once per generation and a stale zero here is a count-in that never
@@ -4948,7 +5033,15 @@ impl Renderer {
         }
         // Silence still flows through LIVE racks — a reverb tail on the
         // bus or a pad outlives the voice that fed it.
-        let any_rack = !self.racks[Strip::Drums.index()].is_empty()
+        // Asked about the strip the kit lands on, for the reason the rack
+        // itself is: a tail on the LANE outlives the voice that fed it, and
+        // asking about the hidden bus instead would cut it off.
+        let drum_wanted_early = self.shared.drum_strip.load(Ordering::Relaxed);
+        let early_bus = (drum_wanted_early >= 0)
+            .then_some(drum_wanted_early as usize)
+            .filter(|ch| *ch < CHANNELS)
+            .map_or(Strip::Drums, Strip::Channel);
+        let any_rack = !self.racks[early_bus.index()].is_empty()
             || (0..PADS).any(|i| !self.racks[pad_rack_index(i)].is_empty());
         if self.pad_hits.is_empty()
             && self.pad_offs.is_empty()
@@ -5140,16 +5233,33 @@ impl Renderer {
                 self.shared.pad_peak[i].fetch_max(pk.to_bits(), Ordering::Relaxed);
             }
         }
-        // The bus's own rack, over the summed kit.
-        if !self.racks[Strip::Drums.index()].is_empty() {
+        // **The rack of the strip the kit actually lands on**, over the
+        // summed kit.
+        //
+        // This ran `Strip::Drums` — the hidden internal bus — while the sum
+        // below folds into `bus_strip`, which is the LANE a drumpad is
+        // assigned to and has been the normal case since the kit started
+        // belonging to its lane. So a plugin in that channel's bays never saw
+        // the drums: they were summed straight past its inserts to the
+        // master. "The drum rack doesn't feed into subsequent effects" is
+        // exactly that, and the two names being different is the whole bug.
+        //
+        // Running the lane's rack here means it can run twice in a block —
+        // once over the lane's own clips and once over what arrives from the
+        // pads. That is the bargain this engine already makes for SENDS, and
+        // the comment on the send-destination pass says so: a destination's
+        // rack processes what is sent to it, exactly as the drum bus
+        // processes its summed kit. The drums are one more thing arriving.
+        let bus_rack = bus_strip.index();
+        if !self.racks[bus_rack].is_empty() {
             run_rack(
-                &mut self.racks[Strip::Drums.index()],
+                &mut self.racks[bus_rack],
                 &mut self.fx_in,
                 frames,
                 &mut self.fx_out,
                 &[],
                 &[],
-            NO_AUTOMATION,
+                NO_AUTOMATION,
             );
         }
         // The fold: the DRUMS strip's fader, pan, send and peak, exactly as
@@ -7760,6 +7870,11 @@ impl Engine {
     /// 6/4, which is a bar and a half of clicks at the wrong speed. They are
     /// still two atomics — a callback can still catch them mid-change — but the
     /// window is one store apart rather than a whole UI frame.
+    /// How often the click sounds — see `Shared::metronome_div`.
+    pub fn set_metronome_div(&self, div: u32) {
+        self.shared.metronome_div.store(div.min(8), Ordering::Relaxed);
+    }
+
     pub fn set_meter(&self, beats: u32, unit: u32) {
         self.shared.beat_unit.store(
             match unit {
@@ -11449,6 +11564,43 @@ mod tests {
     /// **The drumpad is a lane's instrument now.** A MIDI clip on the drum
     /// strip strikes the pads — the editor's roll plays the kit — and a
     /// lane NOT assigned stays a pitch lane.
+    /// **The click's division decides how many clicks a bar holds**, and the
+    /// accent still lands on the downbeat.
+    ///
+    /// Held as a division of the SIGNATURE's beat rather than as a note
+    /// value, because the beat is whatever the signature says it is: in 6/8
+    /// it is an eighth, and a click named in quarters would be counting
+    /// something the music is not in. Compound meters are why this exists —
+    /// 6/8 is felt in two dotted quarters, and a click insisting on all six
+    /// is unusable in the meter it is most wanted in.
+    #[test]
+    fn the_metronome_division_changes_how_many_clicks_a_bar_holds() {
+        // The maths both clocks agree on, checked directly: ticks in a bar.
+        let ticks = |beats: u32, div: u32| -> u32 {
+            let c = BarClock { bar: 0, beat: 0, at_frame: 0.0, expect: 0, armed: false, div };
+            c.ticks_in_bar(beats)
+        };
+        // One a beat is the meter's own count.
+        assert_eq!(ticks(4, 1), 4, "4/4 at one a beat");
+        assert_eq!(ticks(6, 1), 6, "6/8 at one a beat");
+        assert_eq!(ticks(7, 1), 7, "7/8 at one a beat");
+        // Subdivided.
+        assert_eq!(ticks(4, 2), 8, "4/4 at two a beat");
+        assert_eq!(ticks(6, 2), 12, "6/8 at two a beat");
+        // **Zero is once a BAR**, whatever the meter — the compound-meter
+        // case, where six clicks a bar is the thing being escaped.
+        assert_eq!(ticks(4, 0), 1, "4/4 once a bar");
+        assert_eq!(ticks(6, 0), 1, "6/8 once a bar");
+        assert_eq!(ticks(7, 0), 1, "7/8 once a bar");
+        // Never zero, however the number arrives: a bar of no clicks would
+        // divide by nothing on the audio thread.
+        for beats in [0u32, 1, 32] {
+            for div in [0u32, 1, 8] {
+                assert!(ticks(beats, div) >= 1, "{beats} beats at div {div} gave no ticks");
+            }
+        }
+    }
+
     #[test]
     fn a_drum_lane_strikes_the_pads() {
         use std::sync::Arc;

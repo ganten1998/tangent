@@ -33,6 +33,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+/// **The velocity a note is written at**, and the one a double-click on a
+/// velocity head puts it back to.
+///
+/// One number rather than two: the editor opens holding this, a drawn note
+/// takes it, and a reset returns to it — so "default" means the same thing in
+/// all three places.
+pub const DEFAULT_VELOCITY: u8 = 100;
+
 const GUI_TICK: Duration = Duration::from_millis(50);
 
 /// How hard the window is driven — see the pacing decision at the end of
@@ -10342,7 +10350,7 @@ impl IvoryApp {
             dirty: false,
             down_key: None,
             preview_keys: Vec::new(),
-            last_vel: 100,
+            last_vel: DEFAULT_VELOCITY,
             marquee: None,
         });
     }
@@ -12038,6 +12046,17 @@ impl IvoryApp {
                     }
                     return;
                 }
+                // **A double-click puts a velocity head back**, which is the
+                // app's own rule for every other control — the arrangement's
+                // dials already honour it. Without it the only way back to a
+                // known value was to drag and squint at the number.
+                if let Some(crate::midi_editor::Hit::Vel(t)) = hit {
+                    self.me_set_vel(t, DEFAULT_VELOCITY);
+                    if let Some(st) = self.midi_edit.as_mut() {
+                        st.drag = None;
+                    }
+                    return;
+                }
                 // **A double-click on empty roll WRITES a note**, which is
                 // how notes go in with the pen up.
                 //
@@ -12153,6 +12172,24 @@ impl IvoryApp {
                         }
                     }
                     Some(H::NoteBody(i)) => {
+                        // **With the PEN down, a left click on a note takes
+                        // it away.** Draw to add, click to remove — the
+                        // pencil's own bargain, and the half that was
+                        // missing: the pen could write a note and had no way
+                        // to unwrite one without reaching for the right
+                        // button or a double click.
+                        //
+                        // Only with the pen down. With it up the left button
+                        // is how notes are SELECTED and moved, and a mode
+                        // where clicking a note destroys it is a mode nobody
+                        // can edit in.
+                        if pressed && !secondary && !alt && self.settings.midi_draw_mode {
+                            self.me_delete_note(i);
+                            if let Some(st) = self.midi_edit.as_mut() {
+                                st.drag = None;
+                            }
+                            return;
+                        }
                         if secondary {
                             self.me_delete_note(i);
                         } else {
@@ -13414,8 +13451,18 @@ impl IvoryApp {
                     // The toolbar. The click's switch is the settings' own;
                     // the magnet and the grid live beside it.
                     Some(A::ToolMetronome) => {
-                        self.settings.metronome_on = !self.settings.metronome_on;
-                        self.save_settings();
+                        // **Left switches it on; RIGHT changes how often it
+                        // clicks.** A second control beside it would be a
+                        // second thing to find on a toolbar the width of a
+                        // thumb, and the two questions are about the same
+                        // object: whether there is a click, and what it is
+                        // counting.
+                        if ctx.input(|i| i.pointer.secondary_down()) {
+                            self.cycle_metronome_div();
+                        } else {
+                            self.settings.metronome_on = !self.settings.metronome_on;
+                            self.save_settings();
+                        }
                     }
                     Some(A::ToolSnap) => {
                         self.settings.arr_snap = !self.settings.arr_snap;
@@ -16390,6 +16437,23 @@ impl IvoryApp {
 
     pub fn metronome_on(&self) -> bool {
         self.settings.metronome_on
+    }
+
+    /// How often the click sounds — see `Settings::metronome_div`.
+    pub fn metronome_div(&self) -> u32 {
+        self.settings.metronome_div.clamp(0, 8) as u32
+    }
+
+    /// Step the click's division. Wraps, so one key walks the whole set.
+    pub fn cycle_metronome_div(&mut self) {
+        // 0 (once a bar), 1 (a beat), 2, 3, 4 — the divisions anybody counts
+        // in. Past four a click is a buzz, and the setting still accepts up
+        // to eight for anyone who wants one.
+        const STEPS: [i64; 5] = [0, 1, 2, 3, 4];
+        let now = self.settings.metronome_div;
+        let i = STEPS.iter().position(|s| *s == now).unwrap_or(1);
+        self.settings.metronome_div = STEPS[(i + 1) % STEPS.len()];
+        self.save_settings();
     }
 
     pub fn metronome_in_take(&self) -> bool {
