@@ -549,6 +549,16 @@ impl Strip {
     fn bit(self) -> u32 {
         1 << self.index()
     }
+
+    /// **Whether this strip MAKES sound**, as opposed to carrying somebody
+    /// else's back or counting time. What solo silences; see
+    /// [`strip_is_heard`].
+    const fn is_source(self) -> bool {
+        match self {
+            Strip::Channel(_) | Strip::Drums => true,
+            Strip::Click | Strip::Fx => false,
+        }
+    }
 }
 
 impl From<tangent_ui::recorder::Strip> for Strip {
@@ -574,10 +584,29 @@ impl From<tangent_ui::recorder::Strip> for Strip {
 /// because pressing solo on a muted channel is unambiguously a request to hear
 /// it and the alternative is a solo button that sometimes does nothing.
 fn strip_is_heard(strip: Strip, muted: u32, soloed: u32) -> bool {
-    if soloed != 0 {
-        return soloed & strip.bit() != 0;
+    // Soloed by name: heard, whatever its own mute says. Pressing solo on a
+    // muted channel is unambiguously a request to hear it, and the
+    // alternative is a solo button that sometimes does nothing.
+    if soloed & strip.bit() != 0 {
+        return true;
     }
-    muted & strip.bit() == 0
+    if muted & strip.bit() != 0 {
+        return false;
+    }
+    // **Solo silences SOURCES.** A RETURN is not a source, and neither is the
+    // click.
+    //
+    // Soloing a channel used to take the effects bus down with it, so the
+    // reverb everybody had just dialled in vanished the moment they went to
+    // listen to one track: the owner's "when soloed, the main fx in the
+    // recorder view do not apply themselves". The send is post-fader, so what
+    // comes back while a channel is soloed is that channel's own wet and
+    // nothing else's — the silenced lanes are sending silence.
+    //
+    // The click rides the same exemption for the same reason: it is a
+    // monitoring aid with a switch of its own, not part of the mix, and a
+    // solo that also stops the count is a solo that broke the metronome.
+    !(soloed != 0 && strip.is_source())
 }
 
 /// Add what came back from the effects bus, at the bus's own fader.
@@ -10614,10 +10643,22 @@ mod tests {
             strip_is_heard(Channel(7), Channel(7).bit(), Channel(7).bit()),
             "a soloed channel was silenced by its own mute"
         );
-        // Two soloed: both, and nothing else.
+        // Two soloed: both, and no other SOURCE.
         let two = Channel(7).bit() | Fx.bit();
         assert!(strip_is_heard(Channel(7), none, two) && strip_is_heard(Fx, none, two));
-        assert!(!strip_is_heard(Click, none, two));
+        assert!(!strip_is_heard(Channel(4), none, two));
+        assert!(!strip_is_heard(Drums, none, two), "the pad bus is a source");
+
+        // **A return and the click are NOT sources**, so a solo somewhere
+        // else does not silence them. The effects bus went down with every
+        // solo — the reverb vanishing the moment anybody listened to one
+        // track — and the click stopped counting with it.
+        let one = Channel(7).bit();
+        assert!(strip_is_heard(Fx, none, one), "solo took the effects bus");
+        assert!(strip_is_heard(Click, none, one), "solo stopped the click");
+        // Their MUTES still work, which is what makes them switchable at all.
+        assert!(!strip_is_heard(Fx, Fx.bit(), one));
+        assert!(!strip_is_heard(Click, Click.bit(), one));
         // **Each channel is its own strip.** Muting one must not take its
         // neighbour with it, which is the whole reason the lumped instrument
         // strip had to go.

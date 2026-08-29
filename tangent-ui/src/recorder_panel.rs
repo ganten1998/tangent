@@ -6299,9 +6299,16 @@ fn tempo_to_knob(bpm: f64) -> f32 {
 }
 
 /// The inverse of [`tempo_to_knob`], clamped to what the SMF writer and every
-/// DAW's bar ruler will accept.
+/// DAW's bar ruler will accept — and **rounded to a whole beat**.
+///
+/// Only the DIAL comes through here. A decimal tempo is still a tempo and is
+/// still reachable, by typing it into the field, which goes to `Hit::SetTempo`
+/// through `parse_bpm` and never touches this. But a knob is a hand on a
+/// value: over `KNOB_TRAVEL` points the sweep is about a beat a point, so
+/// every drag landed on 137.4212 and the reading said 137 — a number you could
+/// not put back by hand, and a session file full of tempos nobody chose.
 pub fn knob_to_tempo(t: f32) -> f64 {
-    MIN_BPM + f64::from(t.clamp(0.0, 1.0)) * (MAX_BPM - MIN_BPM)
+    (MIN_BPM + f64::from(t.clamp(0.0, 1.0)) * (MAX_BPM - MIN_BPM)).round()
 }
 
 /// A tick box and its caption: two line segments rather than a glyph, because
@@ -6599,6 +6606,35 @@ fn painter_border(painter: &Painter, rect: Rect) {
 
 #[cfg(test)]
 mod tests {
+    /// **The dial lands on whole beats; the FIELD is where decimals live.**
+    ///
+    /// The owner: "decimal tempos should only be typable in the field --
+    /// draggin the dial should now only read non decimal values". Over
+    /// KNOB_TRAVEL points the sweep is about a beat a point, so every drag
+    /// used to land on something like 137.4212 under a readout that said 137.
+    #[test]
+    fn the_tempo_dial_lands_on_whole_beats() {
+        for step in 0..=200 {
+            let t = step as f32 / 200.0;
+            let bpm = super::knob_to_tempo(t);
+            assert!(
+                (bpm - bpm.round()).abs() < 1e-9,
+                "the dial produced {bpm} at {t}"
+            );
+            assert!(bpm >= f64::from(super::MIN_BPM) - 0.5);
+            assert!(bpm <= f64::from(super::MAX_BPM) + 0.5);
+        }
+        // The ends are exact, not rounded off the edge of the range.
+        assert_eq!(super::knob_to_tempo(0.0), f64::from(super::MIN_BPM).round());
+        assert_eq!(super::knob_to_tempo(1.0), f64::from(super::MAX_BPM).round());
+
+        // And a TYPED decimal survives: it never comes through the knob, and
+        // the readout shows the tenth rather than hiding it.
+        assert_eq!(crate::recorder::parse_bpm("137.5"), Some(137.5));
+        assert_eq!(super::tempo_text(137.5), "137.5");
+        assert_eq!(super::tempo_text(137.0), "137");
+    }
+
 
     /// **The loudness meter is themed end to end: its well, its fill, its
     /// ticks and its numbers.**
@@ -7359,10 +7395,17 @@ mod tests {
         // Both ends, and the round trip through the position it reports.
         assert_eq!(Hit::SetTempo(0.0).with_value(0.0), Hit::SetTempo(MIN_BPM));
         assert_eq!(Hit::SetTempo(0.0).with_value(1.0), Hit::SetTempo(MAX_BPM));
+        // **The round trip is to the nearest WHOLE beat**, because the dial
+        // does not produce decimals any more — see `knob_to_tempo`. A typed
+        // 92.5 still reads back as 92.5 on the knob's FACE; it is only the
+        // hand that cannot land between two numbers.
         for bpm in [40.0_f64, 92.5, 120.0, 200.0] {
             let back = Hit::SetTempo(0.0).with_value(tempo_knob_position(bpm));
             let Hit::SetTempo(got) = back else { panic!() };
-            assert!((got - bpm).abs() < 0.01, "{bpm} came back as {got}");
+            assert!((got - got.round()).abs() < 1e-9, "{got} is not a whole beat");
+            // Within half a beat, not exact: the position is an f32, so a
+            // value on the .5 boundary can fall either side of it.
+            assert!((got - bpm).abs() <= 0.51, "{bpm} came back as {got}");
         }
         // **And every control that travels goes through it.** The tempo was
         // the one that did not, and nothing said so. Two different values, so
