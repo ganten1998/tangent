@@ -4686,9 +4686,19 @@ impl DesktopApp {
     }
 
     fn reload_clips(&mut self) {
-        let Some(doc_path) = self.app.project_doc().map(std::path::Path::to_path_buf) else {
-            return;
-        };
+        // **Not gated on the document being SAVED.**
+        //
+        // This used to return here when there was no file on disk yet, which
+        // meant a project nobody had saved could not push anything to the
+        // engine at all — draw a note, move the playhead back, hear silence.
+        // The path is needed for exactly one thing, resolving an AUDIO clip's
+        // relative filename, and the MIDI branch below `continue`s long before
+        // reaching it. So a MIDI note was being held back by a requirement
+        // that had nothing to do with it.
+        //
+        // An audio clip with no document to resolve against is skipped where
+        // it is read instead, which is the honest place to give up on one.
+        let doc_path = self.app.project_doc().map(std::path::Path::to_path_buf);
         let rate = self
             .recorder
             .engine
@@ -4739,7 +4749,13 @@ impl DesktopApp {
                 }
                 continue;
             }
-            let path = tangent_ui::arrangement::Arrangement::resolve(&doc_path, &clip.path);
+            // An AUDIO clip needs somewhere to resolve its relative path
+            // from. With no saved document there is nowhere, so this one clip
+            // is skipped — the MIDI branch above returned long before here.
+            let Some(doc_path) = doc_path.as_ref() else {
+                continue;
+            };
+            let path = tangent_ui::arrangement::Arrangement::resolve(doc_path, &clip.path);
             let decoded = match self.track_cache.get(&path) {
                 Some(c) => Arc::clone(c),
                 None => match tangent_record::decode::decode(&path, rate) {
@@ -4865,25 +4881,32 @@ impl DesktopApp {
             self.app.note_clip_len(id, len_s);
         }
         // Files no clip references any more leave the cache with the edit.
-        self.track_cache.retain(|path, _| {
-            doc.clips
-                .iter()
-                .any(|c| tangent_ui::arrangement::Arrangement::resolve(&doc_path, &c.path) == *path)
-        });
+        // **Only when there is a document to resolve against.** Without one
+        // nothing can match, and sweeping on that basis would throw away every
+        // decoded file the moment a project became unsaved.
+        if let Some(doc_path) = doc_path.as_ref() {
+            self.track_cache.retain(|path, _| {
+                doc.clips
+                    .iter()
+                    .any(|c| tangent_ui::arrangement::Arrangement::resolve(doc_path, &c.path) == *path)
+            });
+        }
         // And the stretched renders with them — including every ratio a drag
         // passed through on its way to the one that stuck. A drag across a
         // clip's edge is a hundred frames and a hundred ratios; without
         // this, that is a hundred whole copies of the file left in memory.
-        self.stretch_cache.retain(|(path, ratio, mode), _| {
-            doc.clips.iter().any(|c| {
-                (c.stretch * 1.0e6).round() as i64 == *ratio
-                    && crate::stretch::Mode::from_key(&c.stretch_mode)
-                        .unwrap_or_default()
-                        .key()
-                        == mode
-                    && tangent_ui::arrangement::Arrangement::resolve(&doc_path, &c.path) == *path
-            })
-        });
+        if let Some(doc_path) = doc_path.as_ref() {
+            self.stretch_cache.retain(|(path, ratio, mode), _| {
+                doc.clips.iter().any(|c| {
+                    (c.stretch * 1.0e6).round() as i64 == *ratio
+                        && crate::stretch::Mode::from_key(&c.stretch_mode)
+                            .unwrap_or_default()
+                            .key()
+                            == mode
+                        && tangent_ui::arrangement::Arrangement::resolve(doc_path, &c.path) == *path
+                })
+            });
+        }
         if let Some(e) = self.recorder.engine.as_mut() {
             e.set_clips(placed);
             e.set_midi_clips(midi_placed);

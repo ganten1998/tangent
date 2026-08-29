@@ -257,7 +257,16 @@ fn bar_s(view: &MidiEditView<'_>) -> f64 {
 /// One grid step in seconds. Triplet divides the next size UP into three —
 /// an eighth-triplet is a third of a quarter — which is the 2/3 here.
 pub fn grid_step_s(view: &MidiEditView<'_>) -> f64 {
-    let g = bar_s(view) * 2.0f64.powi(i32::from(view.grid_exp.clamp(-6, 3)));
+    // **A NOTE VALUE, not a fraction of the bar.**
+    //
+    // This was `bar_s * 2^exp`, which is a quarter note in 4/4 by coincidence
+    // — a 4/4 bar happens to be four quarters — and a DOTTED EIGHTH in 6/8,
+    // whose bar is three. Six beats cannot be divided by four, so every line
+    // and every snap in a compound meter landed between the notes. The bar
+    // length is still meter-aware and still right; it is simply not what a
+    // grid step is measured in.
+    let bpm = view.bpm.clamp(20.0, 400.0);
+    let g = crate::arrangement_panel::grid_quarters(view.grid_exp) * (60.0 / bpm);
     if view.triplet {
         g * 2.0 / 3.0
     } else {
@@ -1074,6 +1083,47 @@ pub fn hit_test(rect: Rect, view: &MidiEditView<'_>, pos: Pos2) -> Option<Hit> {
 
 #[cfg(test)]
 mod tests {
+
+    /// **The grid is a note value in every meter**, which is the whole point
+    /// of the fix: 6/8 gets six eighths in a bar, 4/4 gets eight.
+    ///
+    /// It used to be the bar divided by a power of two. That IS a quarter
+    /// note in 4/4 — a 4/4 bar is four quarters — so it was right by accident
+    /// for years and wrong the moment a bar stopped being a power of two of
+    /// its own beat. A 6/8 bar is three quarters; divided by four that is a
+    /// dotted eighth, a line on nothing anyone plays and a magnet pulling
+    /// notes onto it.
+    #[test]
+    fn the_grid_is_a_note_value_and_not_a_slice_of_the_bar() {
+        use crate::arrangement_panel::grid_quarters;
+        // A quarter note is one quarter, an eighth is half of one, whatever
+        // the meter says.
+        assert!((grid_quarters(-2) - 1.0).abs() < 1e-9, "1/4 is not a quarter");
+        assert!((grid_quarters(-3) - 0.5).abs() < 1e-9, "1/8 is not an eighth");
+        assert!((grid_quarters(-4) - 0.25).abs() < 1e-9, "1/16 is not a sixteenth");
+
+        // The count of lines a bar gets, per meter, at an eighth-note grid.
+        for (top, bottom, want) in [(4u8, 4u8, 8usize), (6, 8, 6), (3, 4, 6), (7, 8, 7)] {
+            let bar_quarters = f64::from(top) * (4.0 / f64::from(bottom));
+            let step = grid_quarters(-3);
+            let lines = (bar_quarters / step).round() as usize;
+            assert_eq!(
+                lines, want,
+                "{top}/{bottom} should get {want} eighth-note lines in a bar, got {lines}"
+            );
+        }
+
+        // And the old maths, for the record: it gave four in every meter,
+        // which is the bug.
+        for (top, bottom) in [(4u8, 4u8), (6, 8), (7, 8)] {
+            let bar_quarters = f64::from(top) * (4.0 / f64::from(bottom));
+            let old_step = bar_quarters * 2.0f64.powi(-2);
+            assert!(
+                ((bar_quarters / old_step).round() as i32) == 4,
+                "the old grid did not divide {top}/{bottom} into four"
+            );
+        }
+    }
 
     /// **Draw mode changes what a press MEANS, and it ships off.**
     ///
