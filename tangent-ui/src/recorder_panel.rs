@@ -4136,6 +4136,62 @@ fn draw_word_button_sized(
     }
 }
 
+/// **A close box: the button, and an X DRAWN rather than typed.**
+///
+/// It used to go through `draw_word_button_sized` with the letter "X", which
+/// is shrunk to fit and then dropped entirely below `MIN_TEXT`. The corner
+/// square is sized off a title band — `(title.height() * 0.52).min(body.width()
+/// * 0.16)` — so on a narrow panel the glyph fell under five points and the
+/// button drew as an empty square with no indication of what it was for: the
+/// owner's "a blank square to close it".
+///
+/// Two crossing strokes have no floor to fall under and no font to be missing
+/// from, which is the same reasoning `draw_tick` and `draw_resync` already
+/// carry: this crate has no icon font, so its icons are geometry.
+fn draw_close_x(painter: &Painter, r: Rect, p: &Palette) {
+    if !r.is_positive() {
+        return;
+    }
+    painter.rect_filled(r, 2.0, p.field);
+    painter.rect_stroke(r, 2.0, Stroke::new(1.0_f32, p.line), StrokeKind::Inside);
+    let Some((arms, w)) = close_x_arms(r) else {
+        return;
+    };
+    let stroke = Stroke::new(w, p.ink);
+    for arm in arms {
+        painter.line_segment(arm, stroke);
+    }
+}
+
+/// The two arms of a close box's X, and how thick to draw them.
+///
+/// Split out so the shape can be tested without a painter: the property that
+/// matters is that a square of ANY size the layout can hand over comes back
+/// with two diagonals inside it, which is exactly what the glyph version could
+/// not promise. `None` only for a square with no room at all.
+fn close_x_arms(r: Rect) -> Option<([[Pos2; 2]; 2], f32)> {
+    if !r.is_positive() {
+        return None;
+    }
+    // Inset far enough that the arms never touch the border, and never so far
+    // that they vanish: a third of the side, but at most enough to leave a
+    // quarter of it as the mark.
+    let side = r.width().min(r.height());
+    let inset = (side * 0.30).min(side * 0.5 - side * 0.125);
+    let b = r.shrink(inset);
+    if !b.is_positive() {
+        return None;
+    }
+    let w = (side * 0.12).clamp(1.0, 2.0);
+    Some((
+        [
+            [b.left_top(), b.right_bottom()],
+            [b.left_bottom(), b.right_top()],
+        ],
+        w,
+    ))
+}
+
 /// The longest of `choices` that draws at `nominal` without being shrunk.
 ///
 /// Ordered longest first. The last is the fallback and is shrunk to fit like any
@@ -6606,6 +6662,40 @@ fn painter_border(painter: &Painter, rect: Rect) {
 
 #[cfg(test)]
 mod tests {
+    /// **The close box always shows an X.**
+    ///
+    /// It was a shrunk glyph, and `fit_label` drops text under `MIN_TEXT`
+    /// rather than drawing it small — so on a narrow panel the corner square
+    /// came out empty: the owner's "a blank square to close it". Geometry has
+    /// no such floor. This asks every square size the layout can produce for
+    /// two real diagonals.
+    #[test]
+    fn the_close_box_is_never_a_blank_square() {
+        for side in [4.0_f32, 6.0, 9.0, 12.0, 14.7, 20.0, 40.0] {
+            let r = Rect::from_min_size(Pos2::new(10.0, 10.0), Vec2::splat(side));
+            let (arms, w) = super::close_x_arms(r)
+                .unwrap_or_else(|| panic!("a {side}-point close box drew nothing"));
+            assert!(w >= 1.0, "a {side}-point arm is {w} thick");
+            for arm in arms {
+                let d = arm[0] - arm[1];
+                assert!(
+                    d.x.abs() > 0.5 && d.y.abs() > 0.5,
+                    "a {side}-point arm is not diagonal: {arm:?}"
+                );
+                for end in arm {
+                    assert!(r.contains(end), "a {side}-point arm left the box at {end:?}");
+                }
+            }
+            // The two arms cross, or it is a pair of parallel strokes.
+            assert!(
+                (arms[0][0].y - arms[1][0].y).abs() > 0.5,
+                "the {side}-point arms do not cross"
+            );
+        }
+        // And nothing at all for a square with no room.
+        assert!(super::close_x_arms(Rect::NOTHING).is_none());
+    }
+
     /// **The dial lands on whole beats; the FIELD is where decimals live.**
     ///
     /// The owner: "decimal tempos should only be typable in the field --
@@ -10454,7 +10544,7 @@ pub fn draw_vari_range(
                 p.faint,
             );
         }
-        draw_word_button_sized(painter, l.close, &["X"], 0.34, &p);
+        draw_close_x(painter, l.close, &p);
     }
     for (row, (field, label, value)) in l.rows.into_iter().zip([
         (NumField::VariMin, "Min", v.min()),
@@ -10729,7 +10819,7 @@ pub fn draw_fx(
                 p.faint,
             );
         }
-        draw_word_button_sized(painter, l.close, &["X"], 0.34, &p);
+        draw_close_x(painter, l.close, &p);
     }
 
     for (i, FxRow { key, label, step }) in fx.rows(free).into_iter().enumerate() {

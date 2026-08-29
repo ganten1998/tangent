@@ -672,6 +672,11 @@ pub struct IvoryApp {
     /// empty or unreadable) and hand it to the engine. Taken once, like
     /// `clips_dirty`.
     click_sample_dirty: bool,
+    /// A whole track, copied and waiting for an empty slot. See `copy_track`.
+    track_clipboard: Option<TrackCopy>,
+    /// A paste asked the host to copy plugin state from one strip to
+    /// another. Taken once, like `clips_dirty`.
+    insert_state_copy: Option<(usize, usize)>,
     /// The zoom window (start_s, len_s). `None` fits the whole song until
     /// the first wheel, ruler drag or viewport steer.
     arr_window: Option<(f64, f64)>,
@@ -1327,6 +1332,24 @@ struct MidiEdit {
     marquee: Option<(egui::Pos2, egui::Pos2)>,
 }
 
+/// Everything a track is, held by value. See [`IvoryApp::copy_track`].
+#[derive(Clone)]
+struct TrackCopy {
+    /// Which lane it came from — the host needs it to find the plugin state
+    /// files, which are keyed by strip and bay.
+    from: usize,
+    kind: Option<crate::recorder::ChannelKind>,
+    name: String,
+    color: i64,
+    icon: u8,
+    gain: f64,
+    pan: f64,
+    send: f64,
+    input: String,
+    inserts: Vec<String>,
+    clips: Vec<crate::arrangement::ArrClip>,
+}
+
 #[derive(Clone)]
 enum MeDrag {
     /// The grabbed note rides under the same point of the hand — and the
@@ -1899,6 +1922,8 @@ impl IvoryApp {
             // **Marked on the way up**, so a chosen click survives a restart:
             // the setting holds a path and nothing has decoded it yet.
             click_sample_dirty: click_chosen,
+            track_clipboard: None,
+            insert_state_copy: None,
             arr_window: None,
             arr_selected: None,
             pad_menu: None,
@@ -7334,6 +7359,161 @@ impl IvoryApp {
         self.save_settings();
     }
 
+    /// **Everything a track IS**, taken off one lane and put on another.
+    ///
+    /// Held by value rather than as a lane number, because the source can be
+    /// removed, renamed or recoloured between the copy and the paste and the
+    /// clipboard has to mean what it meant when it was filled.
+    ///
+    /// The plugin STATE is not in here: it lives on disk beside the app,
+    /// keyed by (strip, bay), and only the host can reach a file. The paste
+    /// leaves a note in `insert_state_copy` for the host to act on — see
+    /// `take_insert_state_copy`.
+    pub fn copy_track(&mut self, n: usize) {
+        if n >= crate::recorder::CHANNELS {
+            return;
+        }
+        let at = crate::recorder::Strip::Channel(n).index();
+        self.track_clipboard = Some(TrackCopy {
+            from: n,
+            kind: self.channel_kind(n),
+            name: self
+                .settings
+                .strip_names
+                .get(at)
+                .cloned()
+                .unwrap_or_default(),
+            color: self.settings.strip_colors.get(at).copied().unwrap_or(0),
+            icon: self.settings.channel_icons.get(n).copied().unwrap_or(0),
+            gain: self.settings.channel_gains.get(n).copied().unwrap_or(1.0),
+            pan: self.settings.channel_pans.get(n).copied().unwrap_or(0.0),
+            send: self.settings.strip_sends.get(at).copied().unwrap_or(0.0),
+            input: self.channel_input_spec(n).to_owned(),
+            inserts: (0..crate::recorder::INSERTS)
+                .map(|b| self.insert(at, b).unwrap_or_default().to_owned())
+                .collect(),
+            clips: self
+                .arrangement
+                .clips
+                .iter()
+                .filter(|c| c.lane == n)
+                .cloned()
+                .collect(),
+        });
+    }
+
+    /// Whether a track is waiting to be pasted, for a menu that offers it.
+    pub fn track_on_clipboard(&self) -> bool {
+        self.track_clipboard.is_some()
+    }
+
+    /// **Put the copied track on `into`.**
+    ///
+    /// Refuses a lane that is already a track: pasting over one would either
+    /// destroy it silently or merge two tracks into a thing that is neither.
+    /// The menu only offers this on empty slots, and this is the guard that
+    /// makes that a rule rather than a convention.
+    ///
+    /// The clips are cloned with FRESH ids — `add_clip` stamps them — because
+    /// two clips sharing an id is a document that cannot say which one an
+    /// edit meant.
+    pub fn paste_track(&mut self, into: usize) {
+        if into >= crate::recorder::CHANNELS || self.channel_used(into) {
+            return;
+        }
+        let Some(copy) = self.track_clipboard.clone() else {
+            return;
+        };
+        let at = crate::recorder::Strip::Channel(into).index();
+        self.settings.tracks_added |= 1 << into;
+        self.set_channel_kind(into, copy.kind);
+        if let Some(name) = self.settings.strip_names.get_mut(at) {
+            // A copy says so. Two tracks with one name is a mixer nobody can
+            // read, and the owner can rename it in the same gesture that
+            // would have renamed it anyway.
+            *name = if copy.name.is_empty() {
+                String::new()
+            } else {
+                format!("{} 2", copy.name)
+            };
+        }
+        if let Some(c) = self.settings.strip_colors.get_mut(at) {
+            *c = copy.color;
+        }
+        if let Some(i) = self.settings.channel_icons.get_mut(into) {
+            *i = copy.icon;
+        }
+        if let Some(g) = self.settings.channel_gains.get_mut(into) {
+            *g = copy.gain;
+        }
+        if let Some(p) = self.settings.channel_pans.get_mut(into) {
+            *p = copy.pan;
+        }
+        if let Some(sd) = self.settings.strip_sends.get_mut(at) {
+            *sd = copy.send;
+        }
+        if self.settings.channel_inputs.len() <= into {
+            self.settings
+                .channel_inputs
+                .resize(into + 1, String::new());
+        }
+        if let Some(inp) = self.settings.channel_inputs.get_mut(into) {
+            *inp = copy.input.clone();
+        }
+        // Through `set_insert`, so the host's reconcile loads each bay the
+        // same way it loads one picked by hand.
+        for (bay, path) in copy.inserts.iter().enumerate() {
+            let want = (!path.is_empty()).then_some(path.as_str());
+            self.set_insert(at, bay, want);
+        }
+        // The clips, onto the new lane.
+        for clip in &copy.clips {
+            let mut c = clip.clone();
+            c.lane = into;
+            self.arrangement.add_clip(c);
+        }
+        if !copy.clips.is_empty() {
+            self.arr_save_edits();
+        }
+        // The host copies the plugin STATE files; nothing in this crate can
+        // reach a file. Without it the pasted bays load the plugin at its
+        // defaults, which is a different instrument wearing the same name.
+        self.insert_state_copy = Some((copy.from, into));
+        self.selected_channel = Some(into);
+        self.selected_tracks = vec![into];
+        self.save_settings();
+    }
+
+    /// The (from, to) strips whose insert state the host should copy, taken
+    /// once. See `paste_track`.
+    pub fn take_insert_state_copy(&mut self) -> Option<(usize, usize)> {
+        self.insert_state_copy.take()
+    }
+
+    /// **The track menu, from one place.** Four callers open it — the
+    /// arrangement's header, the mixer's two press paths and the keyboard —
+    /// and they had four copies of this literal between them, so a field
+    /// added to the dialog had to be added four times or one door would
+    /// silently offer less than the others.
+    ///
+    /// `removable` is "there is a track here". An empty CHANNEL slot passes
+    /// false and gets the short menu whose one row is Paste Track; the buses
+    /// pass false too and get neither, because `lane` is past the channels.
+    fn open_track_dialog(&mut self, lane: usize, removable: bool) {
+        self.dialog_serial = self.dialog_serial.wrapping_add(1);
+        self.dialog = Some(dialogs::Dialog::Track {
+            palette: self.settings.palette_choice,
+            palette_auto: self.settings.palette_auto,
+            serial: self.dialog_serial,
+            lane,
+            removable,
+            can_paste: !removable
+                && lane < crate::recorder::CHANNELS
+                && self.track_on_clipboard(),
+            icon: self.settings.channel_icons.get(lane).copied().unwrap_or(0),
+        });
+    }
+
     /// Ctrl+T's landing place: the first channel that is not a track yet.
     fn add_track_first_free(&mut self) {
         if let Some(n) = (0..crate::recorder::CHANNELS).find(|n| !self.channel_used(*n)) {
@@ -9906,59 +10086,62 @@ impl IvoryApp {
     /// twentieth and never past the clip's end — and the rest of the
     /// selection's tails follow by the same amount.
     fn me_resize_note(&mut self, i: usize, orig: &[(usize, f64)], t: f64) {
-        self.me_resize_note_min(i, t, 0.05);
-        // The grabbed note has landed; everything else moves by what it
-        // moved. Read AFTER, not computed from the pointer, so the snap and
-        // both clamps are honoured once and the selection follows the note
-        // rather than the hand.
+        // **ONE number moves the whole selection.**
+        //
+        // The grabbed note's snapped end says how far the hand has travelled
+        // since the press; every note in the selection — the grabbed one
+        // INCLUDED — takes that same delta. There is nothing to drift,
+        // because there is nothing to compare: two notes cannot disagree
+        // about a figure neither of them computed.
+        //
+        // It has been wrong twice, in opposite directions. Snapping only the
+        // grabbed note left the rest wherever their own lengths fell, so the
+        // one under the hand read short against its neighbours. Snapping each
+        // note's end SEPARATELY put them back on the grid but let float error
+        // round two identical positions to different lines, so the grabbed
+        // note moved and the others followed a beat later — the owner's "the
+        // one moving can go a short distance before the other ones snap to
+        // it". A delta computed once cannot do either.
         let Some(st) = self.midi_edit.as_ref() else {
             return;
         };
         let id = st.id;
+        let t1 = self.me_snap(t);
         let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == id) else {
             return;
         };
+        let (c0, c1, offset) = (clip.start_s, clip.start_s + clip.len_s, clip.offset_s);
         let Some(&(_, was)) = orig.iter().find(|(j, _)| *j == i) else {
             return;
         };
-        let Some(now) = clip.notes.get(i).map(|n| n.dur_s) else {
+        let Some(abs0) = clip.notes.get(i).map(|n| c0 + (n.at_s - offset)) else {
             return;
         };
-        let delta = now - was;
-        if delta.abs() < 1.0e-9 {
-            return;
-        }
-        // **Every end goes back on the GRID, not just the grabbed one.**
-        //
-        // The delta is what carries the shape of the selection; the snap is
-        // what makes it land somewhere you can name. Applying the delta
-        // alone put the grabbed note on a bar line and left the rest of the
-        // selection wherever their own lengths happened to fall — so the one
-        // note under the hand read short against its neighbours and there
-        // was no hand position that squared them up. The owner's "hard to
-        // actually get it to the next bar exactly".
-        //
-        // Computed here, before the document is borrowed mutably, because
-        // `me_snap` reads the clip to know where the grid is. With snapping
-        // OFF it is the identity and this is a plain delta again.
-        let span = clip.start_s + clip.len_s;
-        let (c0, offset) = (clip.start_s, clip.offset_s);
-        let ends: Vec<(usize, f64)> = orig
+        // The grabbed note lands where the hand does, floored and walled by
+        // the clip — and the difference from where it started is the delta.
+        let grabbed = (t1 - abs0).clamp(0.05, (c1 - abs0).max(0.05));
+        let delta = grabbed - was;
+        let durs: Vec<(usize, f64)> = orig
             .iter()
-            .filter(|(j, _)| *j != i)
             .filter_map(|&(j, d0)| {
                 let n = clip.notes.get(j)?;
                 let start = c0 + (n.at_s - offset);
-                let end = self.me_snap(start + d0 + delta);
-                Some((j, (end - start).clamp(0.02, (span - start).max(0.02))))
+                Some((j, (d0 + delta).clamp(0.02, (c1 - start).max(0.02))))
             })
             .collect();
         let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
             return;
         };
-        for (j, dur) in ends {
+        let mut moved = false;
+        for (j, dur) in durs {
             if let Some(n) = clip.notes.get_mut(j) {
+                moved |= (n.dur_s - dur).abs() > 1.0e-9;
                 n.dur_s = dur;
+            }
+        }
+        if moved {
+            if let Some(st) = self.midi_edit.as_mut() {
+                st.dirty = true;
             }
         }
     }
@@ -10059,73 +10242,49 @@ impl IvoryApp {
     /// grid's own state exactly as the tail is — and the END stands still,
     /// so lengthening one side never moves the other.
     fn me_resize_note_left(&mut self, i: usize, orig: &[(usize, f64, f64)], t: f64) {
-        self.me_resize_note_left_one(i, t);
-        // The rest of the selection's heads, by the grabbed note's delta —
-        // read after the fact for the same reason the tail's is.
-        let Some(st) = self.midi_edit.as_ref() else {
-            return;
-        };
-        let id = st.id;
-        let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == id) else {
-            return;
-        };
-        let Some(&(_, was, _)) = orig.iter().find(|(j, _, _)| *j == i) else {
-            return;
-        };
-        let Some(now) = clip.notes.get(i).map(|n| n.at_s) else {
-            return;
-        };
-        let delta = now - was;
-        if delta.abs() < 1.0e-9 {
-            return;
-        }
-        let (c0, offset) = (clip.start_s, clip.offset_s);
-        // Snapped, for the tail's own reason — see `me_resize_note`.
-        let heads: Vec<(usize, f64, f64)> = orig
-            .iter()
-            .filter(|(j, _, _)| *j != i)
-            .map(|&(j, a0, d0)| {
-                // The END stands still — that is what dragging a head means
-                // — so the floor on the duration is also the ceiling on the
-                // start.
-                let was_abs = c0 + (a0 - offset);
-                let end_abs = was_abs + d0;
-                let start_abs = self
-                    .me_snap(was_abs + delta)
-                    .clamp(c0, (end_abs - 0.02).max(c0));
-                (j, a0 + (start_abs - was_abs), end_abs - start_abs)
-            })
-            .collect();
-        let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
-            return;
-        };
-        for (j, at, dur) in heads {
-            if let Some(n) = clip.notes.get_mut(j) {
-                n.at_s = at;
-                n.dur_s = dur;
-            }
-        }
-    }
-
-    fn me_resize_note_left_one(&mut self, i: usize, t: f64) {
+        // The head's twin of [`Self::me_resize_note`]: one delta, taken from
+        // the grabbed note's snapped start, applied to the whole selection
+        // including the grabbed note. The END stands still — that is what
+        // dragging a head means — so the delta moves the start and shortens
+        // the duration by the same amount.
         let Some(st) = self.midi_edit.as_ref() else {
             return;
         };
         let id = st.id;
         let t1 = self.me_snap(t);
-        let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
+        let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == id) else {
             return;
         };
         let (c0, offset) = (clip.start_s, clip.offset_s);
-        let Some(n) = clip.notes.get_mut(i) else {
+        let Some(&(_, a_i, d_i)) = orig.iter().find(|(j, _, _)| *j == i) else {
             return;
         };
-        let abs0 = c0 + (n.at_s - offset);
-        let end = abs0 + n.dur_s.max(0.02);
-        let ns = t1.clamp(c0, end - 0.02);
-        if (ns - abs0).abs() > 1.0e-9 {
-            n.at_s += ns - abs0;
-            n.dur_s = end - ns;
+        let was_abs = c0 + (a_i - offset);
+        let end_abs = was_abs + d_i;
+        let grabbed = t1.clamp(c0, (end_abs - 0.02).max(c0));
+        let delta = grabbed - was_abs;
+        let heads: Vec<(usize, f64, f64)> = orig
+            .iter()
+            .map(|&(j, a0, d0)| {
+                let from = c0 + (a0 - offset);
+                let end = from + d0;
+                // The floor on the duration is also the ceiling on the start.
+                let start = (from + delta).clamp(c0, (end - 0.02).max(c0));
+                (j, a0 + (start - from), end - start)
+            })
+            .collect();
+        let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
+            return;
+        };
+        let mut moved = false;
+        for (j, at, dur) in heads {
+            if let Some(n) = clip.notes.get_mut(j) {
+                moved |= (n.at_s - at).abs() > 1.0e-9;
+                n.at_s = at;
+                n.dur_s = dur;
+            }
+        }
+        if moved {
             if let Some(st) = self.midi_edit.as_mut() {
                 st.dirty = true;
             }
@@ -13389,7 +13548,7 @@ impl IvoryApp {
                     )
                 };
                 if on_metronome {
-                    self.open_metronome_dialog();
+                    self.open_metronome_dialog(Some(p));
                     return;
                 }
                 // A LOADED bay answers with its own menu — Delete FX or
@@ -13419,28 +13578,13 @@ impl IvoryApp {
                         .position(|row| row.panel.is_positive() && row.panel.contains(p))
                 };
                 if let Some(lane) = lane {
-                    // An EMPTY slot has no track to have a menu about — the
-                    // press falls through to the app menu instead.
-                    if self.channel_used(lane) {
-                        self.dialog = Some(dialogs::Dialog::Track {
-                            palette: self.settings.palette_choice,
-                            palette_auto: self.settings.palette_auto,
-                            serial: {
-                                self.dialog_serial = self.dialog_serial.wrapping_add(1);
-                                self.dialog_serial
-                            },
-                            lane,
-                            removable: true,
-                            icon: self
-                                .settings
-                                .channel_icons
-                                .get(lane)
-                                .copied()
-                                .unwrap_or(0),
-                        });
-                    } else {
-                        self.open_global_menu_at(ctx, p);
-                    }
+                    // **An EMPTY slot has a menu now too** — a short one, and
+                    // the only row on it is the one that fills the slot. It
+                    // used to fall through to the app menu, so there was no
+                    // way to say "put the copied track HERE" and no reason to
+                    // aim at an empty row at all.
+                    let used = self.channel_used(lane);
+                    self.open_track_dialog(lane, used);
                     return;
                 }
                 // **A right-press ON A CLIP opens its own menu** — delete
@@ -16999,15 +17143,17 @@ impl IvoryApp {
     /// **Open the metronome's panel.** Tempo, signature, how often it clicks
     /// and what it clicks WITH — the four questions about the click, in the
     /// one place a right-click on it reaches.
-    pub fn open_metronome_dialog(&mut self) {
+    pub fn open_metronome_dialog(&mut self, at: Option<egui::Pos2>) {
         let sig = self.time_signature();
+        self.dialog_serial = self.dialog_serial.wrapping_add(1);
         self.dialog = Some(dialogs::Dialog::Metronome {
             bpm: self.tempo_bpm(),
             beats: sig.beats,
             unit: sig.unit,
             div: self.settings.metronome_div,
             sample: self.settings.click_sample.clone(),
-            serial: 0,
+            serial: self.dialog_serial,
+            at,
         });
     }
 
@@ -17029,6 +17175,7 @@ impl IvoryApp {
             div: d,
             sample: smp,
             serial,
+            ..
         }) = self.dialog.as_mut()
         {
             *b = bpm;
@@ -19167,6 +19314,14 @@ impl IvoryApp {
                 self.dialog = None;
                 self.remove_selected_channels(lane);
             }
+            DialogAction::TrackCopy(lane) => {
+                self.dialog = None;
+                self.copy_track(lane);
+            }
+            DialogAction::TrackPaste(lane) => {
+                self.dialog = None;
+                self.paste_track(lane);
+            }
             // **The badge and the paint reach the whole selection.**
             //
             // Remove already did (`remove_selected_channels`) and the four
@@ -20616,6 +20771,7 @@ impl IvoryApp {
                 palette: self.settings.palette_choice,
                 palette_auto: self.settings.palette_auto,
                 serial: 1,
+                can_paste: false,
             });
         }
         // **Audio Setup**, which is now where the interface's short name is
@@ -22143,31 +22299,23 @@ impl IvoryApp {
                                 self.mixer_fx_menu = Some((i, n));
                             } else if i.strip().is_some_and(|s| matches!(
                                 s,
-                                crate::recorder::Strip::Channel(n) if !self.channel_used(n)
+                                crate::recorder::Strip::Channel(_)
                             )) {
-                                // An empty slot has no track — but it has
-                                // ROOM: the app menu answers there.
-                                self.open_global_menu_at(&ctx, pos);
-                            } else if let Some(strip) = i.strip() {
-                                self.dialog = Some(dialogs::Dialog::Track {
-                            palette: self.settings.palette_choice,
-                            palette_auto: self.settings.palette_auto,
-                            serial: {
-                                self.dialog_serial = self.dialog_serial.wrapping_add(1);
-                                self.dialog_serial
-                            },
-                                    lane: strip.index(),
-                                    removable: matches!(
+                                // **An empty slot has a menu now** — one row,
+                                // and it is the one that fills the slot. See
+                                // `open_track_dialog`.
+                                if let Some(strip) = i.strip() {
+                                    let used = matches!(
                                         strip,
-                                        crate::recorder::Strip::Channel(_)
-                                    ),
-                                    icon: self
-                                        .settings
-                                        .channel_icons
-                                        .get(strip.index())
-                                        .copied()
-                                        .unwrap_or(0),
-                                });
+                                        crate::recorder::Strip::Channel(n)
+                                            if self.channel_used(n)
+                                    );
+                                    self.open_track_dialog(strip.index(), used);
+                                }
+                            } else if let Some(strip) = i.strip() {
+                                let used =
+                                    matches!(strip, crate::recorder::Strip::Channel(_));
+                                self.open_track_dialog(strip.index(), used);
                             }
                         }
                         // An open overlay owns the surface; the button waits.
@@ -22180,33 +22328,14 @@ impl IvoryApp {
                         _ => {
                             let at = crate::mixer_panel::strip_at(rect, &view, pos)
                                 .and_then(|i| i.strip());
-                            if at.is_some_and(|s| matches!(
-                                s,
-                                crate::recorder::Strip::Channel(n) if !self.channel_used(n)
-                            )) {
-                                // An empty slot has no track — but it has
-                                // ROOM: the app menu answers there.
-                                self.open_global_menu_at(&ctx, pos);
-                            } else if let Some(strip) = at {
-                                self.dialog = Some(dialogs::Dialog::Track {
-                            palette: self.settings.palette_choice,
-                            palette_auto: self.settings.palette_auto,
-                            serial: {
-                                self.dialog_serial = self.dialog_serial.wrapping_add(1);
-                                self.dialog_serial
-                            },
-                                    lane: strip.index(),
-                                    removable: matches!(
-                                        strip,
-                                        crate::recorder::Strip::Channel(_)
-                                    ),
-                                    icon: self
-                                        .settings
-                                        .channel_icons
-                                        .get(strip.index())
-                                        .copied()
-                                        .unwrap_or(0),
-                                });
+                            if let Some(strip) = at {
+                                // Empty channel slots included — their menu is
+                                // the Paste row. See `open_track_dialog`.
+                                let used = matches!(
+                                    strip,
+                                    crate::recorder::Strip::Channel(n) if self.channel_used(n)
+                                );
+                                self.open_track_dialog(strip.index(), used);
                             }
                         }
                     }
@@ -22820,6 +22949,10 @@ impl IvoryApp {
         let placement = dialogs::Placement {
             caps: self.caps,
             native_panel_up: self.native_panel_up,
+            // Filled in by the one dialog that hangs off a point rather than
+            // centring — the metronome's, whose own arm overrides this. See
+            // `Placement::at`.
+            at: None,
             // Taken, so one press asks once. See `SurfaceSpec::raise`.
             raise: std::mem::take(&mut self.raise_dialog),
             // The rect the layout was actually DRAWN into, which is centred in
@@ -24070,28 +24203,44 @@ mod tests {
         };
         assert_eq!(orig.len(), 3, "only the grabbed note was captured");
         app.me_resize_note(0, &orig, 2.0);
-        let n = &app.arrangement.clips[0].notes;
+        let n = app.arrangement.clips[0].notes.clone();
         assert!((n[0].dur_s - 1.0).abs() < 1e-9, "grabbed: {}", n[0].dur_s);
         assert!((n[1].dur_s - 0.75).abs() < 1e-9, "second: {}", n[1].dur_s);
         assert!((n[2].dur_s - 1.5).abs() < 1e-9, "third: {}", n[2].dur_s);
         // A SCALE would have made these 0.5 and 2.0. The shape is kept.
-        // And every END is on the grid, not only the grabbed note's: the
-        // delta carries the shape, the snap makes it land somewhere you can
-        // name. Without it the grabbed note read short against the rest and
-        // no hand position squared them up.
-        let step = 0.125;
-        for (k, note) in n.iter().enumerate() {
-            let end = note.at_s + note.dur_s;
-            assert!(
-                (end / step - (end / step).round()).abs() < 1e-6,
-                "note {k} ends off the grid at {end}"
-            );
+
+        // **And they move in LOCKSTEP, at every hand position.**
+        //
+        // Not just at the ones that happen to land on a line. The grabbed
+        // note snapping while the others did not — and, later, each note
+        // snapping its own end and rounding differently — both showed up as
+        // the grabbed note travelling ahead of the rest. One delta, computed
+        // once, is what makes that unrepresentable.
+        for k in 0..40 {
+            let t = 1.5 + f64::from(k) * 0.037;
+            app.me_resize_note(0, &orig, t);
+            let n = app.arrangement.clips[0].notes.clone();
+            let d = n[0].dur_s - 0.5;
+            for (j, want) in [(1usize, 0.25), (2, 1.0)] {
+                assert!(
+                    (n[j].dur_s - (want + d)).abs() < 1e-9,
+                    "at t={t} note {j} is {}, not {}",
+                    n[j].dur_s,
+                    want + d
+                );
+            }
         }
+        // Back to the state the head drag below expects.
+        app.me_resize_note(0, &orig, 2.0);
 
         // And the heads: drag note 0's head from 1.0 back to 0.75, and every
         // selected note's start moves a quarter-second earlier with its END
         // standing still.
-        let ends: Vec<f64> = n.iter().map(|x| x.at_s + x.dur_s).collect();
+        let ends: Vec<f64> = app.arrangement.clips[0]
+            .notes
+            .iter()
+            .map(|x| x.at_s + x.dur_s)
+            .collect();
         app.me_begin_resize(0, true);
         let MeDrag::ResizeLeft { orig, .. } =
             app.midi_edit.as_ref().unwrap().drag.clone().unwrap()
@@ -24159,6 +24308,101 @@ mod tests {
         app.me_paste();
         let at = app.arrangement.clips[0].notes[0].at_s;
         assert!((at - 3.0).abs() < 1e-9, "an on-grid paste jumped to {at}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A copied track arrives whole on an empty slot.**
+    ///
+    /// The owner: "make copying TRACKS possible -- that means the empty slots
+    /// all have to be clickable on arrange and mixer". Everything the track
+    /// IS has to travel, or the copy is a differently-broken track: leaving
+    /// any of it behind is the same mistake `remove_channel` documents from
+    /// the other direction.
+    #[test]
+    fn a_copied_track_arrives_whole_and_only_on_an_empty_slot() {
+        let root = project_scratch("trackcopy");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        let at = crate::recorder::Strip::Channel(1).index();
+        app.set_channel_kind(1, Some(crate::recorder::ChannelKind::Midi));
+        // `strip_names` is a Vec that grows on demand, so a fresh settings
+        // has none — the same shape `copy_track` reads through `get`.
+        app.settings
+            .strip_names
+            .resize(crate::recorder::STRIPS + 1, String::new());
+        app.settings.strip_names[at] = "Rhodes".to_owned();
+        app.settings.strip_colors[at] = 5;
+        app.settings.channel_icons[1] = 2;
+        app.settings.channel_gains[1] = 0.42;
+        app.settings.channel_pans[1] = -0.3;
+        app.settings.strip_sends[at] = 0.75;
+        app.set_insert(at, 0, Some("/x/Piano.vst3"));
+        let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            notes: vec![crate::arrangement::ArrNote {
+                at_s: 1.0,
+                dur_s: 0.5,
+                key: 60,
+                vel: 100,
+            }],
+            lane: 1,
+            path: String::new(),
+            start_s: 0.0,
+            offset_s: 0.0,
+            len_s: 8.0,
+            loop_s: 0.0,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name: "MIDI".to_owned(),
+            id: 0,
+            extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
+            gain: 1.0,
+        });
+
+        assert!(!app.track_on_clipboard());
+        app.copy_track(1);
+        assert!(app.track_on_clipboard(), "the copy took nothing");
+
+        // **Never over a track that is already there.** The menu only offers
+        // this on empty slots; this is what makes that a rule.
+        app.paste_track(1);
+        assert_eq!(
+            app.arrangement.clips.iter().filter(|c| c.lane == 1).count(),
+            1,
+            "pasting over a live track doubled its clips"
+        );
+
+        let to = 4usize;
+        let to_at = crate::recorder::Strip::Channel(to).index();
+        assert!(!app.channel_used(to));
+        app.paste_track(to);
+        assert!(app.channel_used(to), "the slot is still empty");
+        assert_eq!(app.channel_kind(to), Some(crate::recorder::ChannelKind::Midi));
+        assert_eq!(app.settings.strip_colors[to_at], 5);
+        assert_eq!(app.settings.channel_icons[to], 2);
+        assert!((app.settings.channel_gains[to] - 0.42).abs() < 1e-9, "the fader");
+        assert!((app.settings.channel_pans[to] + 0.3).abs() < 1e-9, "the pan");
+        assert!((app.settings.strip_sends[to_at] - 0.75).abs() < 1e-9, "the send");
+        assert_eq!(app.insert(to_at, 0), Some("/x/Piano.vst3"), "the bay");
+        // Named as a copy: two tracks with one name is a mixer nobody reads.
+        assert_eq!(app.settings.strip_names[to_at], "Rhodes 2");
+
+        // The clips travel, with FRESH ids — two clips sharing an id is a
+        // document that cannot say which one an edit meant.
+        let made: Vec<_> = app.arrangement.clips.iter().filter(|c| c.lane == to).collect();
+        assert_eq!(made.len(), 1, "the clips did not travel");
+        assert_ne!(made[0].id, id, "the copy reused the original's id");
+        assert_eq!(made[0].notes.len(), 1);
+        assert!((made[0].len_s - 8.0).abs() < 1e-9);
+
+        // And the host is told to bring the plugin STATE across, or the bay
+        // loads the same plugin at its defaults.
+        assert_eq!(app.take_insert_state_copy(), Some((1, to)));
+        assert_eq!(app.take_insert_state_copy(), None, "taken twice");
         let _ = std::fs::remove_dir_all(&root);
     }
 

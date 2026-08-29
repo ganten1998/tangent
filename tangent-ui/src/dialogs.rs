@@ -57,6 +57,9 @@ pub enum Dialog {
         /// Bumped on every open so egui cannot carry scroll state over from
         /// the last time — the same guard the Track panel documents.
         serial: u64,
+        /// Where the right-click was, in the main window's coordinates, so
+        /// the panel hangs off the button like a menu. See `Placement::at`.
+        at: Option<Pos2>,
     },
     Track {
         lane: usize,
@@ -73,6 +76,10 @@ pub enum Dialog {
         /// process; the old whole-dialog scroll came up halfway down a strip
         /// somebody had never scrolled.
         serial: u64,
+        /// Whether a track is held on the clipboard, so an EMPTY slot's menu
+        /// can offer to receive it — greyed rather than hidden when it is
+        /// not, so the row always says what the slot is for.
+        can_paste: bool,
     },
     /// The project export: sources, rate, shape, formats, speed — and the
     /// arrange view's time selection, if one stands.
@@ -612,6 +619,11 @@ pub enum DialogAction {
     /// Put the bundled click back.
     MetronomeSampleReset,
     TrackRemove(usize),
+    /// Take this whole track — kind, name, colour, levels, bays and clips —
+    /// and hold it for an empty slot.
+    TrackCopy(usize),
+    /// Put the held track on this EMPTY slot.
+    TrackPaste(usize),
     /// Paint one channel by hand — index into `STRIP_COLORS`.
     TrackColor(usize, i64),
     /// The lane's badge: 0 auto, 1 drum, 2 guitar, 3 bass.
@@ -2673,6 +2685,20 @@ pub struct Placement {
     /// See `SurfaceSpec::raise`. Passed through rather than read here, because
     /// only the app knows a press happened.
     pub raise: bool,
+    /// **Open BESIDE this point rather than centred**, in the main window's
+    /// own coordinates.
+    ///
+    /// A dialog that answers a right-click belongs where the click was: the
+    /// metronome's panel is the toolbar button's menu, and a menu that opens
+    /// in the middle of the screen reads as a different kind of thing
+    /// entirely. Set by the arm that opens such a dialog; every other one
+    /// leaves it `None` and centres as it always has.
+    ///
+    /// Window coordinates, NOT monitor: the point comes from a hit test on
+    /// the main surface, and `position_for` adds the parent's origin. The two
+    /// spaces are not the same and mixing them puts the panel on another
+    /// display.
+    pub at: Option<Pos2>,
 }
 
 impl Placement {
@@ -2696,6 +2722,17 @@ impl Placement {
     /// `None` survives for the case that really has nowhere to go: no parent
     /// AND no monitor, which is a host that has told us nothing at all.
     fn position_for(self, size: Vec2) -> Option<Pos2> {
+        // **Anchored, when something asked to be beside a point.** Offset a
+        // few points down and right of the hand, the way every menu on this
+        // desk hangs off what opened it, and clamped like any other so a
+        // press near the screen's edge does not push it off.
+        if let (Some(at), Some(parent)) = (self.at, self.parent) {
+            return Some(crate::settings::clamp_to_monitor(
+                parent.min + at.to_vec2() + Vec2::new(6.0, 6.0),
+                size,
+                self.monitor,
+            ));
+        }
         let centre = match (self.parent, self.monitor) {
             (Some(parent), _) => parent.center(),
             (None, Some(monitor)) => (monitor * 0.5).to_pos2(),
@@ -4966,9 +5003,16 @@ pub fn show(
                 },
             )
         }
-        Dialog::Metronome { bpm, beats, unit, div, sample, serial } => {
+        Dialog::Metronome { bpm, beats, unit, div, sample, serial, at } => {
             let t = theme(face);
             let _ = *serial;
+            // Beside the button that opened it, not in the middle of the
+            // screen — it is the metronome's menu, and it should read like
+            // one. See `Placement::at`.
+            let placement = Placement {
+                at: *at,
+                ..placement
+            };
             // Copied out so the closure below borrows nothing from `dialog`.
             struct Met {
                 bpm: f64,
@@ -4988,9 +5032,16 @@ pub fn show(
                 ctx,
                 placement,
                 "Metronome",
-                Vec2::new(320.0, 260.0),
-                Vec2::new(280.0, 200.0),
+                Vec2::new(320.0, 300.0),
+                Vec2::new(280.0, 240.0),
                 |ui, result| {
+                    // **The desk's own face, like every other dialog.**
+                    // Without these two the panel wore egui's stock dark
+                    // style under this crate's ink and was, in the owner's
+                    // words, "dark and hard to read" — on every theme,
+                    // because the ground never came from the theme at all.
+                    apply_theme(ui.style_mut(), &t);
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
                     // **Tempo.** The song's, not the click's — there is only
                     // one, and a metronome panel that carried a second would
                     // be two numbers to keep in step.
@@ -5097,10 +5148,16 @@ pub fn show(
                 },
             )
         }
-        Dialog::Track { lane, removable, icon, palette, palette_auto, serial } => {
+        Dialog::Track { lane, removable, icon, palette, palette_auto, serial, can_paste } => {
             let t = theme(face);
             let lane = *lane;
             let removable = *removable;
+            // An EMPTY slot's menu is a different, much smaller thing: there
+            // is no track here to remove, recolour or badge. `removable` is
+            // what says a track exists — it is false for the buses too, which
+            // is why the paste row asks `can_paste` rather than assuming.
+            let empty = !removable;
+            let can_paste = *can_paste;
             let current_icon = *icon;
             let palette_now = *palette;
             let palette_auto = *palette_auto;
@@ -5161,6 +5218,49 @@ pub fn show(
                                     .clicked()
                                 {
                                     action = Some(DialogAction::TrackRemove(lane));
+                                }
+                                ui.add_space(6.0);
+                                // **Copy the whole track**, for an empty slot
+                                // to receive. Under Remove because it is the
+                                // safe one of the pair and the eye lands on
+                                // the destructive row first by design.
+                                if ui
+                                    .add_sized(
+                                        Vec2::new(ui.available_width(), 22.0),
+                                        Button::new(
+                                            RichText::new("Copy Track")
+                                                .font(plain(11.0))
+                                                .color(t.text),
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    action = Some(DialogAction::TrackCopy(lane));
+                                }
+                                ui.add_space(6.0);
+                            }
+                            // **And an EMPTY slot can receive one.** Greyed
+                            // rather than hidden when nothing is held, so the
+                            // slot's menu always says what it is for; a row
+                            // that appears only sometimes is a row nobody
+                            // learns is there.
+                            if empty && lane < crate::recorder::CHANNELS {
+                                let label = if can_paste {
+                                    "Paste Track"
+                                } else {
+                                    "Paste Track (nothing copied)"
+                                };
+                                let btn = ui.add_enabled(
+                                    can_paste,
+                                    Button::new(
+                                        RichText::new(label)
+                                            .font(plain(11.0))
+                                            .color(if can_paste { t.text } else { t.faint }),
+                                    )
+                                    .min_size(Vec2::new(ui.available_width(), 22.0)),
+                                );
+                                if btn.clicked() {
+                                    action = Some(DialogAction::TrackPaste(lane));
                                 }
                                 ui.add_space(6.0);
                             }
@@ -7686,6 +7786,7 @@ mod tests {
         // `None` and let the platform decide, which meant the first thing
         // anybody saw was a window placed wherever.
         let p = Placement {
+            at: None,
             native_panel_up: false,
             raise: false,
             parent: None,
@@ -7701,6 +7802,7 @@ mod tests {
         // Neither: nothing to centre on, so the platform really does decide.
         assert_eq!(
             Placement {
+                at: None,
             native_panel_up: false,
             raise: false,
                 parent: None,
@@ -7714,6 +7816,7 @@ mod tests {
         // Parent known: dead centre of the parent.
         let parent = Rect::from_min_size(Pos2::new(600.0, 400.0), Vec2::new(1300.0, 200.0));
         let p = Placement {
+            at: None,
             native_panel_up: false,
             raise: false,
             parent: Some(parent),
@@ -7735,6 +7838,7 @@ mod tests {
         // A window near an edge still puts the whole dialog on the monitor.
         let edge = Rect::from_min_size(Pos2::new(2400.0, 1380.0), Vec2::new(1300.0, 200.0));
         let p = Placement {
+            at: None,
             native_panel_up: false,
             raise: false,
             parent: Some(edge),
@@ -8142,7 +8246,8 @@ mod tests {
 
         let mut dialog = Some(Dialog::custom_tuning(&Tuning::standard(), true));
         let placement = Placement {
-            native_panel_up: false,
+at: None,
+                        native_panel_up: false,
             raise: false,
             parent: None,
             monitor: None,
@@ -8706,7 +8811,8 @@ mod tests {
         // The post-take case, which is the one with greyed controls in it.
         let mut dialog = Some(Dialog::export(ExportSpec::default(), true, false));
         let placement = Placement {
-            native_panel_up: false,
+at: None,
+                        native_panel_up: false,
             raise: false,
             parent: None,
             monitor: None,
@@ -8809,7 +8915,8 @@ mod tests {
         fonts::install(&ctx, fonts::FontChoice::default(), None);
         fonts::apply_text_styles(&ctx);
         let placement = Placement {
-            native_panel_up: false,
+at: None,
+                        native_panel_up: false,
             raise: false,
             parent: None,
             monitor: None,
@@ -9101,7 +9208,8 @@ mod tests {
         fonts::install(&ctx, fonts::FontChoice::default(), None);
         fonts::apply_text_styles(&ctx);
         let placement = Placement {
-            native_panel_up: false,
+at: None,
+                        native_panel_up: false,
             raise: false,
             parent: None,
             monitor: None,

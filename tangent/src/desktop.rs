@@ -2665,6 +2665,31 @@ impl DesktopApp {
             self.reload_click();
         }
 
+        // **A pasted track's plugin STATE, on the same bargain.** The copy
+        // itself is the app's — kind, levels, bays, clips — but the state a
+        // plugin saved lives in a file keyed by (strip, bay) and nothing in
+        // `tangent-ui` may reach a file. Without this the pasted bays load
+        // the same plugin at its DEFAULTS, which is a different instrument
+        // wearing the same name.
+        if let Some((from, to)) = self.app.take_insert_state_copy() {
+            let (from, to) = (
+                tangent_ui::recorder::Strip::Channel(from).index(),
+                tangent_ui::recorder::Strip::Channel(to).index(),
+            );
+            for bay in 0..tangent_ui::recorder::INSERTS {
+                let src = insert_state_path(from, bay);
+                let dst = insert_state_path(to, bay);
+                // A bay the source never used leaves the destination's own
+                // file alone rather than deleting it: the paste has already
+                // cleared that bay through `set_insert`, and a stale file
+                // whose owner does not match is ignored by
+                // `saved_insert_state` anyway.
+                if src.exists() {
+                    let _ = std::fs::copy(&src, &dst);
+                }
+            }
+        }
+
         // **The shipped bank, put back.** The same call a first launch makes,
         // which is the point: there is one definition of "the cartridge that
         // ships" and both paths read it.
