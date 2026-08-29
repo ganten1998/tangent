@@ -4508,7 +4508,7 @@ LaneView {
                 start_s: 50.0,
                 len_s: 20.0,
                 max_len_s: f64::INFINITY,
-                fade_in_s: 0.0,
+        fade_in_s: 0.0,
                 fade_out_s: 0.0,
                 name: "solo",
                 wave: &[],

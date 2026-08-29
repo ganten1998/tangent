@@ -95,9 +95,8 @@ fn clip_key_is_readable(key: &str, value: Option<&Value>) -> bool {
         "kind" | "path" | "name" | "anchor" | "stretch_mode" => v.is_string(),
         "gain" => v.is_number(),
         "lane" | "id" => v.is_number(),
-        "start_s" | "offset_s" | "len_s" | "fade_in_s" | "fade_out_s" | "stretch" => {
-            v.is_number()
-        }
+        "start_s" | "offset_s" | "len_s" | "fade_in_s" | "fade_out_s" | "stretch"
+        | "loop_s" => v.is_number(),
         "follow_tempo" => v.is_boolean(),
         "notes" => v.is_array(),
         // A name not in the list is not a key this build claims, so nothing
@@ -146,7 +145,7 @@ pub fn stretch_mode_label(key: &str) -> &'static str {
 /// read and `tangent-ui` cannot name a constant that lives with the DSP.
 pub const STRETCH_RATIO: (f64, f64) = (0.25, 4.0);
 
-const CLIP_KEYS: [&str; 16] = [
+const CLIP_KEYS: [&str; 17] = [
     "kind",
     "lane",
     "path",
@@ -163,6 +162,7 @@ const CLIP_KEYS: [&str; 16] = [
     "stretch",
     "stretch_mode",
     "gain",
+    "loop_s",
 ];
 
 /// What a clip is made of.
@@ -264,6 +264,16 @@ pub struct ArrClip {
     /// the file"** — the file's length is the host's fact, filled in after
     /// the decode and saved, so a document written by hand still plays.
     pub len_s: f64,
+    /// **How long the looped section is**, for a MIDI clip. Zero means the
+    /// clip does not loop and its notes play once, which is what every
+    /// document written before this existed says.
+    ///
+    /// A MIDI clip is pinned at the length it was created and REPEATS beyond
+    /// it, so dragging its right edge lays down another pass instead of
+    /// revealing empty time. The notes are held once and expanded where they
+    /// are scheduled — a loop that copied its notes would drift out of step
+    /// with the take it came from the moment one of them was edited.
+    pub loop_s: f64,
     /// Seconds of ramp up from silence at the clip's head. Zero for none.
     pub fade_in_s: f64,
     /// Seconds of ramp down to silence at the clip's tail. Zero for none.
@@ -731,6 +741,7 @@ impl Arrangement {
                     start_s: secs(&c, "start_s"),
                     offset_s: secs(&c, "offset_s"),
                     len_s: secs(&c, "len_s"),
+                    loop_s: secs(&c, "loop_s"),
                     fade_in_s: secs(&c, "fade_in_s"),
                     fade_out_s: secs(&c, "fade_out_s"),
                     name,
@@ -1070,6 +1081,9 @@ impl Arrangement {
                             ("len_s", c.len_s),
                             ("fade_in_s", c.fade_in_s),
                             ("fade_out_s", c.fade_out_s),
+                            // Zero means "does not loop", which is what every
+                            // document written before this said by omission.
+                            ("loop_s", c.loop_s),
                         ] {
                             if let Some(n) = serde_json::Number::from_f64(v) {
                                 m.insert(key.into(), Value::Number(n));
@@ -1205,6 +1219,36 @@ fn Settings_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    /// **A clip's loop length survives the document**, and its absence means
+    /// "does not loop" — which is what every file written before this said.
+    #[test]
+    fn a_loop_length_round_trips_and_absence_means_no_loop() {
+        let mut arr = Arrangement::default();
+        arr.add_clip(ArrClip {
+            kind: ClipKind::Midi,
+            lane: 2,
+            start_s: 1.0,
+            len_s: 8.0,
+            loop_s: 2.0,
+            notes: vec![ArrNote { at_s: 0.0, dur_s: 0.5, key: 60, vel: 100 }],
+            ..Default::default()
+        });
+        let back = Arrangement::from_json(&arr.to_json());
+        assert_eq!(back.clips.len(), 1);
+        assert!(
+            (back.clips[0].loop_s - 2.0).abs() < 1e-9,
+            "the loop length was lost: {}",
+            back.clips[0].loop_s
+        );
+
+        // A document with no `loop_s` at all reads as not looping, rather
+        // than as some default that would start repeating old work.
+        let older = r#"{"version":3,"clips":[{"kind":"midi","lane":0,"start_s":0.0,"len_s":4.0,"notes":[]}]}"#;
+        let old = Arrangement::from_json(older);
+        assert_eq!(old.clips.len(), 1);
+        assert_eq!(old.clips[0].loop_s, 0.0, "an old clip came back looping");
+    }
     use super::*;
 
     fn a_clip(lane: usize, path: &str, start_s: f64) -> ArrClip {
@@ -1216,7 +1260,8 @@ mod tests {
             start_s,
             offset_s: 0.0,
             len_s: 0.0,
-            fade_in_s: 0.0,
+            loop_s: 0.0,
+        fade_in_s: 0.0,
             fade_out_s: 0.0,
             name: std::path::Path::new(path)
                 .file_stem()
@@ -1240,6 +1285,7 @@ mod tests {
         let solo = ArrClip {
             offset_s: 1.25,
             len_s: 30.0,
+            loop_s: 0.0,
             fade_in_s: 0.5,
             fade_out_s: 2.0,
             name: "the solo".into(),
@@ -1603,6 +1649,7 @@ mod tests {
             start_s: 3.0,
             offset_s: 0.25,
             len_s: 9.0,
+            loop_s: 0.0,
             fade_in_s: 0.1,
             fade_out_s: 0.2,
             name: "everything set".into(),

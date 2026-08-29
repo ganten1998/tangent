@@ -4727,19 +4727,39 @@ impl DesktopApp {
             if clip.kind == tangent_ui::arrangement::ClipKind::Midi {
                 span = span.max(clip.start_s + clip.len_s);
                 let frames = |s: f64| frames_at(f64::from(rate), s);
-                let mut notes: Vec<crate::instrument::ClipNote> = clip
-                    .notes
-                    .iter()
-                    .filter_map(|n| {
-                        let at = n.at_s - clip.offset_s;
-                        if at < -1.0e-9 {
-                            return None;
-                        }
-                        Some(crate::instrument::ClipNote {
-                            at: frames(at),
-                            dur: frames(n.dur_s).max(1),
-                            key: n.key.min(127),
-                            vel: n.vel.min(127),
+                // **A looping clip repeats its notes across its length.**
+                //
+                // The notes are held ONCE in the document and expanded here,
+                // because a loop that copied them would drift out of step
+                // with the pass it came from the moment one was edited. Zero
+                // means no loop, which is what every clip written before this
+                // existed says, so those play exactly once as they always did.
+                let passes: usize = if clip.loop_s > 1.0e-6 {
+                    // Bounded: a clip dragged to an hour over a loop of a
+                    // sixteenth is not something to hand the audio thread.
+                    ((clip.len_s / clip.loop_s).ceil() as usize).clamp(1, 4_096)
+                } else {
+                    1
+                };
+                let mut notes: Vec<crate::instrument::ClipNote> = (0..passes)
+                    .flat_map(|pass| {
+                        let shift = clip.loop_s * pass as f64;
+                        clip.notes.iter().filter_map(move |n| {
+                            let at = n.at_s - clip.offset_s + shift;
+                            if at < -1.0e-9 {
+                                return None;
+                            }
+                            // A repeat that begins past the clip's own end is
+                            // not played: the last pass is usually partial.
+                            if at >= clip.len_s - 1.0e-9 && clip.loop_s > 1.0e-6 {
+                                return None;
+                            }
+                            Some(crate::instrument::ClipNote {
+                                at: frames(at),
+                                dur: frames(n.dur_s).max(1),
+                                key: n.key.min(127),
+                                vel: n.vel.min(127),
+                            })
                         })
                     })
                     .collect();
