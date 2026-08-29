@@ -6,11 +6,11 @@
 //! and chord detection runs on its own 100ms gate (with immediate off-cadence
 //! runs after keytoggle clicks and note-preference changes).
 //!
-//! **While a gesture is in flight the window is paced to the display instead**
-//! — a bare `request_repaint`, which puts eframe's loop in `Poll` and lets
-//! vsync do the throttling. A delay cannot express a fast panel: egui
-//! subtracts a hard-coded 1/60 s from every deadline, so asking for a shorter
-//! delay could never produce more than about 30 frames a second. See `Pace`.
+//! `IVORY_PACE=gesture` will instead pace the window to the DISPLAY while a
+//! gesture is in flight — a bare `request_repaint`, which puts eframe's loop
+//! in `Poll` and lets vsync throttle. It is off by default: it costs four to
+//! eight times the frames on the thread that also feeds the engine, which is
+//! the wrong trade in a DAW however good the drag looks. See `Pace`.
 
 use crate::chord_strip;
 use crate::dialogs::{self, Dialog, DialogAction, LearningStatus};
@@ -47,16 +47,31 @@ enum Pace {
     Always,
 }
 
-/// `IVORY_PACE=off|gesture|always`, read once.
+/// `IVORY_PACE=off|gesture|always`, read once. **Off by default.**
 ///
-/// An escape hatch rather than a setting: if pacing turns out to cost more
-/// than it buys on some machine, it has to be answerable without a rebuild.
+/// It shipped as `gesture` and is off again, because it cost more than it
+/// bought. What it bought was a smoother REDRAW during a gesture — about 155
+/// frames a second against thirty. What it cost was four to eight times the
+/// frames, sustained, on the one thread that also feeds the engine's rings
+/// and runs the video compositor; and a session that had been clean for an
+/// hour started degrading audibly while a second DAW on the same interface
+/// stayed clean.
+///
+/// That was never proven to be the pacing. It did not need to be: this is a
+/// DAW, the audio is the product, and spending a core to make a window drag
+/// prettier is the wrong side of that trade even when it is innocent.
+///
+/// **None of the resize work depended on this.** The window tracks the hand
+/// because the OS holds the aspect during a live resize, and it stops
+/// fighting a tiler because of the `main_wm_managed` latch. Both are
+/// untouched. Kept behind the variable rather than deleted so the experiment
+/// can be re-run on a machine with headroom.
 fn pace_mode() -> Pace {
     static MODE: std::sync::OnceLock<Pace> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("IVORY_PACE").as_deref() {
-        Ok("off") => Pace::Off,
+        Ok("gesture") => Pace::Gesture,
         Ok("always") => Pace::Always,
-        _ => Pace::Gesture,
+        _ => Pace::Off,
     })
 }
 const DETECT_TICK: Duration = Duration::from_millis(100);
@@ -26166,37 +26181,42 @@ mod tests {
         let (_ctx, mut app) = headless(Caps::DESKTOP);
         app.settings.arr_snap = false; // the magnet is its own test
 
-        // A point where there was none.
+        // A point where there was none — plus the node at zero every curve
+        // carries, which holds the same value and so changes nothing audible.
         let i = app.arr_put_auto_point(0, crate::automation::AutoParam::Gain, 4.0, 0.75).expect("no point landed");
         let c = app
             .arrangement
             .automation
             .get(0, AutoParam::Gain)
             .expect("no curve");
-        assert_eq!(c.points().len(), 1);
+        assert_eq!(c.points().len(), 2, "{:?}", c.points());
+        assert_eq!(c.points()[0].at_s, 0.0, "no node at the beginning");
         assert!((c.points()[i].at_s - 4.0).abs() < 1e-9);
         assert!((c.points()[i].value - 0.75).abs() < 1e-9);
 
-        // Moving it leaves ONE point, not a trail.
+        // Moving it leaves ONE drawn point, not a trail — the zero node stays.
         app.arr_drag_auto_point(0, crate::automation::AutoParam::Gain, i, 9.0, 0.25);
         let c = app.arrangement.automation.get(0, AutoParam::Gain).expect("no curve");
-        assert_eq!(c.points().len(), 1, "the drag left a trail: {:?}", c.points());
-        assert!((c.points()[0].at_s - 9.0).abs() < 1e-9);
-        assert!((c.points()[0].value - 0.25).abs() < 1e-9);
+        assert_eq!(c.points().len(), 2, "the drag left a trail: {:?}", c.points());
+        assert!((c.points()[1].at_s - 9.0).abs() < 1e-9);
+        assert!((c.points()[1].value - 0.25).abs() < 1e-9);
 
         // A second point, and moving the first PAST it keeps both and
         // re-sorts — the case a carried index would get wrong.
         app.arr_put_auto_point(0, crate::automation::AutoParam::Gain, 12.0, 0.5);
-        app.arr_drag_auto_point(0, crate::automation::AutoParam::Gain, 0, 20.0, 0.1);
+        app.arr_drag_auto_point(0, crate::automation::AutoParam::Gain, 1, 20.0, 0.1);
         let c = app.arrangement.automation.get(0, AutoParam::Gain).expect("no curve");
-        assert_eq!(c.points().len(), 2, "{:?}", c.points());
+        assert_eq!(c.points().len(), 3, "{:?}", c.points());
         assert!(
             c.points().windows(2).all(|w| w[0].at_s < w[1].at_s),
             "the curve is out of order: {:?}",
             c.points()
         );
 
-        // Undrawing both takes the curve out of the document entirely.
+        // Undrawing the DRAWN points takes the curve out of the document
+        // entirely. The seeded node at zero goes with the last of them rather
+        // than needing its own removal: a lone point at zero says only "hold
+        // this value", which is what no curve at all already says.
         app.arr_remove_auto_point(0, crate::automation::AutoParam::Gain, 20.0);
         app.arr_remove_auto_point(0, crate::automation::AutoParam::Gain, 12.0);
         assert!(

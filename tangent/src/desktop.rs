@@ -6282,6 +6282,21 @@ impl DesktopApp {
     /// Only while files hover. Polling the OS for the mouse every frame of
     /// every session to answer a question nobody asked is not a thing to do
     /// in a paint loop.
+    /// How many times the live-resize height table has been rebuilt.
+    ///
+    /// It is supposed to be a handful in a session; it is checked because
+    /// that was an assertion in a comment and the table used to be LEAKED on
+    /// every rebuild.
+    #[cfg(target_os = "macos")]
+    fn curve_rebuilds() -> u64 {
+        crate::macwin::REBUILDS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn curve_rebuilds() -> u64 {
+        0
+    }
+
     /// What the host can see about a live resize — see `macwin`.
     ///
     /// macOS can answer; nothing else can, and a host that cannot must say so
@@ -6754,12 +6769,13 @@ impl eframe::App for DesktopApp {
                     .copied()
                     .unwrap_or(0.0);
                 eprintln!(
-                    "PACE fps={:.0} p99={:.2}ms sends={} wm={} oslock={}",
+                    "PACE fps={:.0} p99={:.2}ms sends={} wm={} oslock={} curve_rebuilds={}",
                     self.pace_frames as f32 / secs,
                     p99 * 1000.0,
                     self.app.debug_inner_size_sends(),
                     self.app.debug_wm_managed(),
                     self.app.debug_os_aspect_lock(),
+                    Self::curve_rebuilds(),
                 );
                 self.pace_since = Some(now);
                 self.pace_frames = 0;

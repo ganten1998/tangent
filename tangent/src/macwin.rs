@@ -68,6 +68,23 @@ static TARGET: AtomicPtr<NSWindow> = AtomicPtr::new(std::ptr::null_mut());
 /// The height curve, as a table the callback can read without allocating.
 static CURVE: AtomicPtr<Curve> = AtomicPtr::new(std::ptr::null_mut());
 
+/// The table the CURVE pointer held one generation ago.
+///
+/// **This is what stops the rebuild being a leak.** The callback may be
+/// holding the pointer it read a moment ago, so a table cannot be freed the
+/// instant it is replaced — but keeping every one of them forever is a leak
+/// of thirty kilobytes per rebuild, and `refresh_curve` runs every frame. One
+/// generation of delay is enough: by the time a table reaches here and is
+/// displaced again, two whole swaps have happened on this thread and nothing
+/// can still be reading it.
+static RETIRED: AtomicPtr<Curve> = AtomicPtr::new(std::ptr::null_mut());
+
+/// How many times the table has been rebuilt. Read by `IVORY_PACE_PROBE`.
+///
+/// A number rather than a belief: the comment that used to sit on the leak
+/// asserted "a handful of times in a session", and nothing measured it.
+pub static REBUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 thread_local! {
     /// **A strong reference, so `TARGET` can never dangle.**
     ///
@@ -254,11 +271,21 @@ fn refresh_curve(height_at: &dyn Fn(f32) -> f32, w_floor: f32) {
     }
     let h: Box<[f32]> = (w_min..=W_MAX).map(|w| height_at(w as f32)).collect();
     let next = Box::into_raw(Box::new(Curve { w_min, h }));
-    // Leaked on purpose. It is rebuilt a handful of times in a session, the
-    // callback may be reading the old one on another stack frame right now,
-    // and thirty kilobytes is a smaller price than a use-after-free inside
-    // AppKit's event loop.
-    CURVE.store(next, Ordering::Release);
+    REBUILDS.fetch_add(1, Ordering::Relaxed);
+    // **Swap, retire, and free the one before that.**
+    //
+    // The callback may still hold the pointer it read a moment ago, so the
+    // displaced table cannot be freed here — but it must be freed eventually,
+    // because this function runs every frame and thirty kilobytes a frame is
+    // four megabytes a second at the rate this window now draws. One
+    // generation of delay costs one spare table and bounds the whole thing.
+    let prev = CURVE.swap(next, Ordering::Release);
+    let older = RETIRED.swap(prev, Ordering::Release);
+    if !older.is_null() {
+        // SAFETY: `older` was displaced from CURVE a full generation ago, on
+        // this same thread, so no reader can still be holding it.
+        drop(unsafe { Box::from_raw(older) });
+    }
 }
 
 /// Add `windowWillResize:toSize:` to winit's delegate class, once.
