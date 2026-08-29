@@ -1099,7 +1099,19 @@ impl Layout {
                 Pos2::new(add.right() + 6.0, r.center().y - ch_h * 0.5),
                 Vec2::new(r.width() * 0.40, ch_h),
             );
-            return HeaderRow { panel: row, input, add, ..HeaderRow::NONE };
+            // **And the rest of the row is the slot itself.** An empty lane
+            // had no `name` and no `number`, so `hit_test` could not name it
+            // and a press on it produced nothing — which meant an empty slot
+            // could not be SELECTED, so it could not wear the rim and could
+            // not be a paste destination you had pointed at. The + circle and
+            // the input chip keep their own seats; what is left over answers
+            // for the slot.
+            let name = Rect::from_min_max(
+                Pos2::new(input.right() + 6.0, r.top()),
+                Pos2::new(r.right(), r.bottom()),
+            );
+            let name = if name.width() > 4.0 { name } else { Rect::NOTHING };
+            return HeaderRow { panel: row, input, add, name, ..HeaderRow::NONE };
         }
         let h = r.height();
         // The number and the arm keep FIXED seats at the left — the
@@ -4390,6 +4402,32 @@ fn cut_to(painter: &Painter, width: f32, text: &str, font: &FontId) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// **An empty slot can be pointed at.**
+    ///
+    /// It had no `name` and no `number` rect, so `hit_test` answered nothing
+    /// over most of its row — which meant it could not be selected, could not
+    /// wear the selection rim, and could not be the paste destination you had
+    /// aimed at. The + circle and the input chip keep their seats; the rest of
+    /// the row is the slot.
+    #[test]
+    fn an_empty_slot_answers_a_press_on_its_row() {
+        // `a_view` makes lanes 0..3 used and the rest empty.
+        let clips: [ClipView<'_>; 0] = [];
+        let l = Layout::new(rect(), &a_view(&clips));
+        let row = l.header_rows[4];
+        assert!(row.panel.is_positive(), "the empty row has no panel");
+        assert!(row.add.is_positive(), "the + circle lost its seat");
+        assert!(row.input.is_positive(), "the input chip lost its seat");
+        assert!(
+            row.name.is_positive(),
+            "an empty slot still has nowhere to be pressed"
+        );
+        // The three do not overlap: pressing the + must make a track and
+        // pressing the chip must bind an input, not select.
+        assert!(row.add.right() <= row.input.left());
+        assert!(row.input.right() <= row.name.left());
+    }
+
 
     /// **The first tempo handle can actually be pressed.**
     ///
