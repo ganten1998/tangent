@@ -4658,10 +4658,15 @@ impl IvoryApp {
     /// A press on the heart. `true` when it was the heart's, and the caller
     /// must not go on to open a menu or sound a note.
     ///
-    /// **One gesture, and only for supporters.** Right-click stops the drift
+    /// **One gesture, and only for supporters.** A LEFT click stops the drift
     /// or starts it again; there is nothing to walk through, because the
     /// theme decides both the wave and the single colour it falls back to.
-    /// A left click on the heart is an ordinary press on the band.
+    ///
+    /// It was the right button, which is the wrong one: right-click on this
+    /// band means "open the menu about this thing" everywhere else on it, and
+    /// a plain click is what anybody tries on a small toggle first. The
+    /// right-click now falls through to the band's menu as it does over any
+    /// other part of the strip.
     fn heart_press(&mut self, pos: Pos2, recorder_rect: Option<Rect>) -> bool {
         if !self.license.is_supporter() || !self.settings.show_heart {
             return false;
@@ -4773,17 +4778,6 @@ impl IvoryApp {
             if let Some(pos) = pointer {
                 let (menu_origin, _) = self.surface_frame();
                 let global = pos + menu_origin;
-                // **The heart takes the press before the band's menu sees it.**
-                //
-                // **RIGHT click swaps which set of sixteen you are in** —
-                // the travelling wave, or the flat colours. LEFT click walks
-                // whichever one is live; see `heart_press`. Supporters only,
-                // because they are the only ones wearing the palette — for
-                // everybody else the heart has no second colour system and the
-                // press should open the band's menu as it always did.
-                if self.heart_press(pos, recorder_rect) {
-                    return;
-                }
                 // A right-click ON the Recorder band opens the menu with the
                 // Recorder at the top. The band is where its own settings
                 // belong: it is a surface with fifteen controls on it, and
@@ -5035,12 +5029,18 @@ impl IvoryApp {
                     // instrument column, so the two can never contend — but
                     // checking first is what keeps that true if the column
                     // ever grows back into it.
-                    if self.heart_color(0.0).is_some()
-                        && recorder_panel::heart_rect(r, &self.recorder_layout_view())
-                            .contains(pos)
-                    {
-                        self.settings.heart_color = self.settings.heart_color.wrapping_add(1);
-                        self.save_settings();
+                    //
+                    // **And it TOGGLES THE DRIFT.** It used to step
+                    // `heart_color` through a ring of colours — a ring that
+                    // was retired when the theme took over both the wave and
+                    // the flat colour it falls back to (see `heart_color`).
+                    // So the press walked a number nothing reads and the
+                    // heart did not change, which is a control that looks
+                    // broken. The drift switch was on the RIGHT button, which
+                    // is the wrong one: right-click means "the menu about
+                    // this" everywhere else on this band, and a plain click
+                    // is what anybody tries on a small toggle first.
+                    if self.heart_press(pos, recorder_rect) {
                         return;
                     }
                     // The LCD's part cells: a press takes the number by
@@ -9796,6 +9796,19 @@ impl IvoryApp {
     }
 
     fn arr_copy(&mut self) {
+        // **No clips selected, a TRACK selected: copy the track.**
+        //
+        // The chord is the same one, and which it means is decided by what is
+        // under the selection — clips when clips are chosen, the track when
+        // none are. There is no ambiguity to resolve: a clip selection and an
+        // empty one are the two states, and only one of them has a clip to
+        // copy.
+        if self.arr_multi.is_empty() && self.arr_selected.is_none() {
+            if let Some(n) = self.selected_channel.filter(|n| self.channel_used(*n)) {
+                self.copy_track(n);
+            }
+            return;
+        }
         let mut ids = self.arr_multi.clone();
         if let Some(id) = self.arr_selected {
             if !ids.contains(&id) {
@@ -9826,6 +9839,16 @@ impl IvoryApp {
     /// relative lanes, clamped. Anywhere goes — a MIDI clip on an audio
     /// channel simply does not sound, which is the neat kind of nothing.
     fn arr_paste(&mut self) {
+        // **A track on the clipboard and an EMPTY slot selected: paste the
+        // track.** `paste_track` refuses a lane that is already a track, so
+        // aiming at a live one falls through to the clips below rather than
+        // destroying it.
+        if self.track_on_clipboard() {
+            if let Some(n) = self.selected_channel.filter(|n| !self.channel_used(*n)) {
+                self.paste_track(n);
+                return;
+            }
+        }
         if self.clip_clipboard.is_empty() {
             return;
         }
@@ -12413,6 +12436,34 @@ impl IvoryApp {
     /// The editor's EAR: on the DRUM LANE the keys are PADS, and every
     /// audition strikes the kit — one that reached the DX7 while editing
     /// drums was the owner's bug. Everywhere else, the ordinary audition.
+    /// **Let go of whatever the editor is sounding.**
+    ///
+    /// Every path that leaves the press handler EARLY has to call this. The
+    /// release below is what normally matches a preview's note-on with its
+    /// note-off, and a branch that returns before reaching it strands the
+    /// note sounding for ever — the owner's "the double click deletes the
+    /// note, BUT auditions the second click and rings out this time".
+    ///
+    /// The note is already gone from the document by then, so nothing else
+    /// will ever think to release it.
+    fn me_quiet_preview(&mut self) {
+        let mut quiet: Vec<u8> = self
+            .midi_edit
+            .as_ref()
+            .map(|m| m.preview_keys.clone())
+            .unwrap_or_default();
+        if let Some(k) = self.midi_edit.as_ref().and_then(|m| m.down_key) {
+            quiet.push(k);
+        }
+        if !quiet.is_empty() {
+            self.me_audition(quiet, false);
+        }
+        if let Some(st) = self.midi_edit.as_mut() {
+            st.down_key = None;
+            st.preview_keys.clear();
+        }
+    }
+
     fn me_audition(&mut self, notes: Vec<u8>, on: bool) {
         let drum_lane = (0..crate::recorder::CHANNELS)
             .find(|n| self.insert(*n, 0) == Some(dialogs::DRUMPAD_PATH));
@@ -12812,6 +12863,11 @@ impl IvoryApp {
                 };
                 if let Some(crate::midi_editor::Hit::NoteBody(i)) = hit {
                     self.me_delete_note(i);
+                    // The press that opened this double click auditioned the
+                    // note. It has to be released HERE, because this branch
+                    // returns before the release that would have done it and
+                    // the note it belongs to no longer exists.
+                    self.me_quiet_preview();
                     if let Some(st) = self.midi_edit.as_mut() {
                         st.drag = None;
                     }
@@ -12956,6 +13012,7 @@ impl IvoryApp {
                         // can edit in.
                         if pressed && !secondary && !alt && self.settings.midi_draw_mode {
                             self.me_delete_note(i);
+                            self.me_quiet_preview();
                             if let Some(st) = self.midi_edit.as_mut() {
                                 st.drag = None;
                             }
@@ -12963,6 +13020,7 @@ impl IvoryApp {
                         }
                         if secondary {
                             self.me_delete_note(i);
+                            self.me_quiet_preview();
                         } else {
                             self.me_select(i, shift);
                             let in_sel = self
@@ -13348,22 +13406,9 @@ impl IvoryApp {
                     self.save_settings_soon();
                 }
             }
-            // Every sounding preview lets go.
-            let mut quiet: Vec<u8> = self
-                .midi_edit
-                .as_ref()
-                .map(|m| m.preview_keys.clone())
-                .unwrap_or_default();
-            if let Some(k) = self.midi_edit.as_ref().and_then(|m| m.down_key) {
-                quiet.push(k);
-            }
-            if !quiet.is_empty() {
-                self.me_audition(quiet, false);
-            }
-            if let Some(st) = self.midi_edit.as_mut() {
-                st.down_key = None;
-                st.preview_keys.clear();
-            }
+            // Every sounding preview lets go. See `me_quiet_preview`, which
+            // the early-returning delete paths call for the same reason.
+            self.me_quiet_preview();
             let dirty = self
                 .midi_edit
                 .as_ref()
@@ -24498,6 +24543,76 @@ mod tests {
         // loads the same plugin at its defaults.
         assert_eq!(app.take_insert_state_copy(), Some((1, to)));
         assert_eq!(app.take_insert_state_copy(), None, "taken twice");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **Cmd+C and Cmd+V carry a whole TRACK when no clip is selected.**
+    ///
+    /// The owner asked for the chord to work on tracks, and it has to share
+    /// with the clips it already served. What is under the selection decides:
+    /// clips when clips are chosen, the track when none are — and a paste
+    /// only lands on an EMPTY slot, so a live track can never be destroyed by
+    /// aiming at it.
+    #[test]
+    fn the_copy_chord_carries_a_track_when_no_clip_is_selected() {
+        let root = project_scratch("trackchord");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.settings
+            .strip_names
+            .resize(crate::recorder::STRIPS + 1, String::new());
+        app.set_channel_kind(1, Some(crate::recorder::ChannelKind::Midi));
+        app.settings.channel_gains[1] = 0.33;
+
+        // A track selected, no clips: the chord takes the track.
+        app.selected_channel = Some(1);
+        app.selected_tracks = vec![1];
+        app.arr_copy();
+        assert!(app.track_on_clipboard(), "the chord did not copy the track");
+
+        // Aimed at a LIVE track, paste must not touch it — it falls through
+        // to the clip path, which has nothing, so nothing happens.
+        let before = app.settings.channel_gains[1];
+        app.arr_paste();
+        assert!((app.settings.channel_gains[1] - before).abs() < 1e-9);
+
+        // Aimed at an EMPTY slot, the track lands.
+        app.selected_channel = Some(6);
+        app.selected_tracks = vec![6];
+        assert!(!app.channel_used(6));
+        app.arr_paste();
+        assert!(app.channel_used(6), "the chord did not paste the track");
+        assert!((app.settings.channel_gains[6] - 0.33).abs() < 1e-9, "the fader");
+        assert_eq!(app.channel_kind(6), Some(crate::recorder::ChannelKind::Midi));
+
+        // And with a CLIP selected the chord still means clips: the track
+        // clipboard is not disturbed and the clip one fills.
+        let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            notes: Vec::new(),
+            lane: 1,
+            path: String::new(),
+            start_s: 0.0,
+            offset_s: 0.0,
+            len_s: 4.0,
+            loop_s: 0.0,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name: "MIDI".to_owned(),
+            id: 0,
+            extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
+            gain: 1.0,
+        });
+        app.arr_selected = Some(id);
+        app.arr_copy();
+        assert!(
+            !app.clip_clipboard.is_empty(),
+            "with a clip selected the chord stopped meaning clips"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

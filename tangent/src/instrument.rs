@@ -12749,6 +12749,77 @@ mod tests {
         );
     }
 
+    /// **THE PHASE NULL — the standard test for a polarity switch.**
+    ///
+    /// Two identical signals on two lanes, one of them flipped, must cancel
+    /// to silence. If it does not, either the switch is not inverting or the
+    /// two lanes are not sample-aligned, and this test cannot tell you which
+    /// is wrong without saying so — hence the unflipped sum first: it proves
+    /// the two lanes ARE aligned and at equal level before the flip is asked
+    /// to cancel them.
+    #[test]
+    fn two_identical_lanes_cancel_when_one_is_phase_flipped() {
+        use std::sync::Arc;
+        // A signal with no DC and plenty of edges: a square wave nulls
+        // loudly when it does not null at all, where a sine can look nearly
+        // cancelled while being a sample out.
+        let samples: Vec<f32> = (0..96_000)
+            .map(|i| if (i / 64) % 2 == 0 { 0.4 } else { -0.4 })
+            .collect();
+        let clip = Arc::new(tangent_record::decode::Clip {
+            samples,
+            rate: 48_000,
+            source: std::path::PathBuf::from("s.wav"),
+        });
+        let placed = |strip: usize| Placed {
+            clip: Arc::clone(&clip),
+            strip,
+            start: 0,
+            offset: 0,
+            len: 48_000,
+            fade_in: 0,
+            fade_out: 0,
+            gain: 1.0,
+        };
+        let run = |phase: u32| -> f32 {
+            let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+            e.set_clips(vec![placed(0), placed(1)]);
+            e.set_strip_phase(phase);
+            e.set_transport(1, 0);
+            e.set_rolling(true);
+            let mut out = vec![0.0f32; 512 * 2];
+            let mut peak = 0.0f32;
+            // The faders slew from zero, so measure only once they have
+            // settled — a flipped lane travels from +1 to -1 and there is no
+            // null on the way. Twenty blocks is a quarter of a second.
+            for b in 0..20 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                if b >= 16 {
+                    peak = peak.max(out.iter().fold(0.0f32, |a, v| a.max(v.abs())));
+                }
+            }
+            peak
+        };
+
+        // In phase: the two sum. This is the control — without it a null
+        // proves nothing, because two silent lanes also cancel.
+        let together = run(0);
+        assert!(
+            together > 0.2,
+            "the two lanes are not both sounding: peak {together}"
+        );
+
+        // Lane 1 flipped: silence.
+        let cancelled = run(1 << 1);
+        assert!(
+            cancelled < together / 500.0,
+            "the phase flip did not cancel: {cancelled} against {together} \
+             together. Either the switch is not inverting, or the two lanes \
+             are not sample-aligned."
+        );
+    }
+
     #[test]
     fn an_offline_engine_taps_stems_too() {
         use std::sync::Arc;
