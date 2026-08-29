@@ -5561,12 +5561,12 @@ impl DesktopApp {
         // which of them, which one holds the built-in, and which are NOT fed
         // MIDI — four views of one fact, the channel_kinds array, pushed
         // together so the callback can never see them disagree for long.
-        let mut midi_off = 0u32;
         let mut picks: [Option<usize>; tangent_ui::recorder::INPUTS] =
             [None; tangent_ui::recorder::INPUTS];
         let mut next_pick = 0usize;
         let mut builtin: Option<usize> = None;
         let armed = self.app.armed_mask();
+        let selected = self.app.selected_channel();
         // **The desk's EXPLICIT input bindings, when any channel has one.**
         // The strip's own menu names inputs now; the moment one channel
         // does, the whole desk routes explicitly — bound channels take
@@ -5583,13 +5583,11 @@ impl DesktopApp {
             e.set_channel_pan(ch, self.app.channel_pan(ch));
             match self.app.channel_kind(ch) {
                 Some(tangent_ui::recorder::ChannelKind::Midi) => {
-                    // **Arm is the live switch.** An unarmed MIDI channel
-                    // takes no live notes — riding `midi_off` on purpose,
-                    // because that mask's edge is what releases the keys a
-                    // disarm would otherwise leave sounding.
-                    if armed & (1 << ch) == 0 {
-                        midi_off |= 1 << ch;
-                    }
+                    // Which MIDI lanes hear the keyboard is decided WHOLE by
+                    // `recorder::live_midi_off`, below this loop. Three rules
+                    // that read each other, one of which silences all the
+                    // rest — not a decision to make a bit at a time in the
+                    // middle of the input picks.
                     if builtin.is_none()
                         && self.app.insert(ch, 0) == Some(tangent_ui::dialogs::BUILTIN_PATH)
                     {
@@ -5597,7 +5595,6 @@ impl DesktopApp {
                     }
                 }
                 Some(tangent_ui::recorder::ChannelKind::Audio) => {
-                    midi_off |= 1 << ch;
                     if any_explicit {
                         if let Some((a, b)) =
                             IvoryApp::parse_input_spec(self.app.channel_input_spec(ch))
@@ -5616,9 +5613,20 @@ impl DesktopApp {
                         next_pick += 1;
                     }
                 }
-                None => midi_off |= 1 << ch,
+                None => {}
             }
         }
+        // **Armed, selected, or alone in the editor** — the whole rule, in
+        // one place, tested there. See `recorder::live_midi_off`.
+        let kinds: Vec<_> = (0..tangent_ui::recorder::CHANNELS)
+            .map(|ch| self.app.channel_kind(ch))
+            .collect();
+        let midi_off = tangent_ui::recorder::live_midi_off(
+            &kinds,
+            armed,
+            selected,
+            self.app.midi_editor_lane(),
+        );
         crate::devices::set_channel_picks(&self.recorder.audio, explicit);
         e.set_midi_off(midi_off);
         e.set_armed(armed);

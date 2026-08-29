@@ -10522,6 +10522,28 @@ impl IvoryApp {
 
     /// Open the editor on a MIDI clip: the window is the clip with a bar of
     /// air each side, the roll centred on what was played (C4 for silence).
+    /// **The track that has the desk's attention**, or `None` when nothing is
+    /// selected. See `selected_channel`: the last one clicked.
+    ///
+    /// The host reads this to decide which MIDI lane hears the keyboard when
+    /// no lane is armed.
+    pub fn selected_channel(&self) -> Option<usize> {
+        self.selected_channel
+    }
+
+    /// **The lane the MIDI editor is open on**, or `None` when it is closed.
+    ///
+    /// The host aims live notes at this one lane while it is open: an
+    /// audition in the editor is about ONE clip, and a desk with two armed
+    /// instruments played both of them from a single key — the owner's "Mini
+    /// v4 on track one, pianoteq on track 2, audition note, it triggers
+    /// BOTH".
+    pub fn midi_editor_lane(&self) -> Option<usize> {
+        let id = self.midi_edit.as_ref()?.id;
+        let clip = self.arrangement.clips.iter().find(|c| c.id == id)?;
+        (clip.lane < crate::recorder::CHANNELS).then_some(clip.lane)
+    }
+
     fn open_midi_editor(&mut self, id: u64) {
         let Some(clip) = self.arrangement.clips.iter().find(|c| c.id == id) else {
             return;
