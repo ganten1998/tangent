@@ -117,12 +117,78 @@ pub const BAND_H_AT_1300: f64 = 190.0;
 /// [`fit_preview`], where it belongs.
 /// Where the camera preview ends — the separator the arrange header's
 /// default width lines up with, by the owner's word.
+/// **Where the timecode cluster ends and the oscilloscope begins**, as a
+/// fraction of the LCD box.
+///
+/// It was a flat 0.475 — an even split — and that is right only while the box
+/// keeps its shape. Maximised it does not: the band's height is damped (see
+/// [`band_height`]) while its width still follows the window, so the box goes
+/// from about four times as wide as it is tall to more than six. An even
+/// split spent all of that on digits that do not need it.
+///
+/// The cluster is a STACK OF NUMBERS, so what it needs is set by its height.
+/// Holding its aspect constant and giving the surplus to the scope is the
+/// owner's "that extra horizontal room? let the oscillator grow
+/// horizontally". The scope goes from about half the box to two thirds of it
+/// on a wide screen, and nothing moves at the sizes anybody works in.
+///
+/// One function because FOUR places need this number — the cluster's paint,
+/// the rule between the halves, the scope's own rect, and two hit tests — and
+/// a hit test that disagrees with the paint is a control you can see and
+/// cannot press.
+fn lcd_split(r: Rect) -> f32 {
+    // 1.909 is 0.475 times the box's width-to-height ratio at the reference,
+    // so the split is exactly what it always was at those sizes.
+    if r.width() <= 0.0 {
+        return 0.475;
+    }
+    (1.909 * r.height() / r.width()).clamp(0.28, 0.475)
+}
+
 pub fn camera_split_x(rect: Rect, view: &RecorderView<'_>) -> f32 {
     Layout::new(rect, view).preview.right()
 }
 
+/// Above this width the band stops growing in step with the window. See
+/// [`band_height`].
+const BAND_DAMP_FROM: f64 = 1600.0;
+
+/// The most of its linear height the band may give back. See [`band_height`].
+const BAND_DAMP_FLOOR: f64 = 0.70;
+
 pub fn band_height(w: f32) -> f32 {
-    (BAND_H_AT_1300 * w as f64 / 1300.0).trunc() as f32
+    // **The band stops growing in step with the window once the window is
+    // wide.**
+    //
+    // Every band's height is a fraction of the WIDTH, which is right while a
+    // window is a window: the whole layout scales together and the app looks
+    // the same at any size. Maximised it stops being right. The band holds a
+    // fixed set of controls — eight knobs, a fader, a meter, a timeline —
+    // and none of them needs to be half again as tall because the screen got
+    // wider. The owner: at 100 percent "the app feels perfect visually", and
+    // full-screened the recorder "NEEDS to be around 15-30 percent shorter".
+    //
+    // So the law is linear up to `BAND_DAMP_FROM` — every window anybody
+    // works in, unchanged, which is the part that must not move — and grows
+    // with the SQUARE ROOT of the width above it. Square root because it is
+    // the honest middle: linear is what is wrong, constant would make the
+    // band shrink to a sliver on a wide screen, and the root gives back
+    // roughly a fifth at 2560 and a quarter at 3000.
+    //
+    //   1600 →  0%      1920 →  9%      2560 → 21%      3440 → 30% (floored)
+    //
+    // The floor is what stops a 5K or an ultrawide from taking half the band
+    // away: past a point the controls do need their room, and "shorter" was
+    // asked for as a range and not as a direction to keep going in.
+    let w = f64::from(w);
+    let linear = BAND_H_AT_1300 * w / 1300.0;
+    let h = if w > BAND_DAMP_FROM {
+        let at_ref = BAND_H_AT_1300 * BAND_DAMP_FROM / 1300.0;
+        (at_ref * (w / BAND_DAMP_FROM).sqrt()).max(linear * BAND_DAMP_FLOOR)
+    } else {
+        linear
+    };
+    h.trunc() as f32
 }
 
 // ── palette ────────────────────────────────────────────────────────────────
@@ -3902,9 +3968,14 @@ fn draw_timecode_cluster(painter: &Painter, r: Rect, view: &RecorderView<'_>, p:
     // big musical position with the clock beside it on top, the viewport's
     // Start/End/Length rows under them — every part still draggable. The
     // scope keeps the right half.
-    let half = slice_h(r, 0.02, 0.475);
+    let split = lcd_split(r);
+    let half = slice_h(r, 0.02, split);
     let main = slice_v(half, 0.02, 0.52);
-    painter.rect_filled(rule_x(r, r.left() + r.width() * 0.49), 0.0, p.line.gamma_multiply(0.5));
+    painter.rect_filled(
+        rule_x(r, r.left() + r.width() * (split + 0.015)),
+        0.0,
+        p.line.gamma_multiply(0.5),
+    );
     // **The LCD's own face**, and not the band's: this is a seven-segment
     // readout and egui's monospace is what makes the digits line up in a
     // column. Renamed from `font` because the band's own `font` helper was
@@ -4042,7 +4113,7 @@ fn draw_timecode_cluster(painter: &Painter, r: Rect, view: &RecorderView<'_>, p:
     // **The right half is the OSCILLOSCOPE** — the sibling session's
     // widget, the owner's pick: the speakers' mix without the click, on
     // the same black glass the timecode is behind.
-    let scope_side = slice_h(r, 0.50, 0.99);
+    let scope_side = slice_h(r, lcd_split(r) + 0.025, 0.99);
     let scope_r = slice_v(scope_side, 0.07, 0.93).shrink2(egui::vec2(2.0, 0.0));
     view.scope.draw(painter, scope_r, &crate::scope::ScopeStyle::themed(p.lcd, p.lcd_face));
 }
@@ -4050,7 +4121,7 @@ fn draw_timecode_cluster(painter: &Painter, r: Rect, view: &RecorderView<'_>, p:
 /// Start, End, Length of the arrangement's viewport — each value in three
 /// draggable cells, in the CLUSTER's left half beside the clock.
 pub fn lcd_part_cells(lcd: Rect) -> [[Rect; 3]; 3] {
-    let half = slice_h(lcd, 0.02, 0.475);
+    let half = slice_h(lcd, 0.02, lcd_split(lcd));
     let side = slice_v(half, 0.54, 0.98);
     std::array::from_fn(|row| {
         let r = slice_v(side, row as f32 / 3.0, (row as f32 + 1.0) / 3.0);
@@ -4064,7 +4135,7 @@ pub fn lcd_part_cells(lcd: Rect) -> [[Rect; 3]; 3] {
 /// The PLAYHEAD's own three cells over the big number — bars, beats,
 /// thousandths — draggable like everything else on this glass.
 pub fn lcd_playhead_cells(lcd: Rect) -> [Rect; 3] {
-    let half = slice_h(lcd, 0.02, 0.475);
+    let half = slice_h(lcd, 0.02, lcd_split(lcd));
     let main = slice_v(half, 0.02, 0.52);
     let big = slice_h(main, 0.0, 0.66);
     // **Cut where the CHARACTERS fall.** The glass is monospaced, so the
@@ -6662,6 +6733,74 @@ fn painter_border(painter: &Painter, rect: Rect) {
 
 #[cfg(test)]
 mod tests {
+    /// **A maximised window gets a shorter band, and the scope gets the room.**
+    ///
+    /// The owner: at 100 percent "the app feels perfect visually", but
+    /// full-screened the recorder "NEEDS to be around 15-30 percent shorter",
+    /// and "that extra horizontal room? let the oscillator grow
+    /// horizontally".
+    ///
+    /// Both halves are here because they are one change: the band's height
+    /// stops following the width, which makes the LCD box relatively wider,
+    /// and the scope takes what the digits do not need.
+    #[test]
+    fn a_wide_window_shortens_the_band_and_widens_the_scope() {
+        // **Nothing moves at the sizes anybody works in.** This is the
+        // assertion that protects the view the owner already likes.
+        for w in [900.0f32, 1300.0, 1600.0] {
+            let linear = (super::BAND_H_AT_1300 * f64::from(w) / 1300.0).trunc() as f32;
+            assert_eq!(
+                super::band_height(w),
+                linear,
+                "the band changed at {w}, which is a window and not a screen"
+            );
+        }
+
+        // Wide: shorter, and inside the range that was asked for.
+        for (w, lo, hi) in [(2560.0f32, 0.15, 0.30), (3440.0, 0.15, 0.31)] {
+            let linear = super::BAND_H_AT_1300 * f64::from(w) / 1300.0;
+            let got = f64::from(super::band_height(w));
+            let cut = 1.0 - got / linear;
+            assert!(
+                cut >= lo && cut <= hi,
+                "at {w} the band is {:.1}% shorter, outside {:.0}-{:.0}%",
+                cut * 100.0,
+                lo * 100.0,
+                hi * 100.0
+            );
+        }
+        // And never more than the floor, however wide the screen.
+        for w in [5120.0f32, 7680.0] {
+            let linear = super::BAND_H_AT_1300 * f64::from(w) / 1300.0;
+            let cut = 1.0 - f64::from(super::band_height(w)) / linear;
+            assert!(cut <= 0.31, "at {w} the band lost {:.0}%", cut * 100.0);
+        }
+
+        // **The scope grows.** Measured as its share of the LCD box, which is
+        // what "grow horizontally" means when the box itself is growing.
+        let share = |w: f32| -> f32 {
+            let r = Rect::from_min_size(
+                Pos2::ZERO,
+                Vec2::new(w, super::band_height(w)),
+            );
+            let l = Layout::new(r, &RecorderView::empty());
+            1.0 - super::lcd_split(l.lcd)
+        };
+        let at_1600 = share(1600.0);
+        let at_2560 = share(2560.0);
+        let at_3440 = share(3440.0);
+        assert!(
+            (at_1600 - 0.525).abs() < 0.01,
+            "the split moved at a working size: scope has {at_1600}"
+        );
+        assert!(
+            at_2560 > at_1600 + 0.05,
+            "the scope did not take the extra room: {at_1600} then {at_2560}"
+        );
+        assert!(at_3440 > at_2560, "wider still and the scope stopped growing");
+        assert!(at_3440 <= 0.72, "the scope crowded the digits out: {at_3440}");
+    }
+
     /// **The metronome panel answers every control it draws.**
     ///
     /// It was an egui dialog and read as a foreign object — the owner's "it's

@@ -154,6 +154,11 @@ pub struct AutoView<'a> {
     pub points: &'a [crate::automation::Point],
     /// The point under the pointer or being dragged, so it can be drawn lit.
     pub hot: Option<usize>,
+    /// **The keyboard is aimed at this row**, so Delete would close it.
+    ///
+    /// Drawn as the rim a chosen track wears, for the same reason: a thing
+    /// the Delete key will act on has to look chosen before it is pressed.
+    pub selected: bool,
     /// **Where the control is standing right now**, normalised, for a curve
     /// with no points on it yet.
     ///
@@ -496,10 +501,21 @@ const HEADER_W: (f32, f32, f32) = (0.16, 150.0, 220.0);
 /// that a tempo point is something you can aim at.
 const TEMPO_LANE_SHARE: f32 = 0.55;
 
-/// The same for an automation sub-lane, and the same reasoning: a curve
-/// needs less room than the clips it belongs under, and the track it hangs
-/// off must not shrink to make space for it.
-const AUTO_LANE_SHARE: f32 = 0.55;
+/// The same for an automation sub-lane: a curve needs less room than the
+/// clips it belongs under.
+///
+/// **Exactly HALF, and the half is load-bearing now.** It was 0.55, justified
+/// by a rule that no longer holds — "the track it hangs off must not shrink
+/// to make space for it" — and the owner replaced that rule with this one:
+/// every half strip of automation is absorbed by the tracks getting shorter,
+/// and every WHOLE strip's worth costs one track its place in the window.
+///
+/// Two lanes have to be exactly one track for that to work. At 0.55 they are
+/// 1.1, so two lanes evicted a track AND left the rest a tenth short — the
+/// heights never came back to where they started and the arithmetic drifted
+/// further with every lane. See
+/// `automation_rows_shrink_the_tracks_then_evict_one_and_repeat`.
+const AUTO_LANE_SHARE: f32 = 0.5;
 
 /// The master row's height, as a fraction of a track's.
 ///
@@ -903,11 +919,52 @@ impl Layout {
         // lane showed none at all. `visible` still means TRACKS; the pair
         // costs every track a slice of its height instead, which is the same
         // bargain an open automation row already makes.
-        let lane_h =
-            lanes_area.height()
-                / (visible as f32
-                    + if view.show_master_row { MASTER_ROW_SHARE } else { 0.0 });
         let first = view.lane_scroll.min(CHANNELS.saturating_sub(visible));
+        // **Automation rows shrink the tracks until they have cost a whole
+        // one, and then a track leaves.**
+        //
+        // The divisor counted the tracks and the master's half and nothing
+        // else, so opening a curve made the stack taller than the area —
+        // and `push` drops a row that does not WHOLLY fit, which left half a
+        // strip of dead space at the bottom with a track missing. That is
+        // the owner's "leaves half a strip of empty space at the bottom".
+        //
+        // The rule he asked for, and it scales: eight tracks, open a volume
+        // lane and all eight shrink to make room for the extra half strip;
+        // open a pan lane on the same track and the two halves are a whole
+        // track's worth, so the last channel leaves the window and the rest
+        // return to full height. Three lanes shrink again, four evict a
+        // second, and so on.
+        //
+        // `visible - floor(share)` is that rule exactly, and the remainder
+        // rides in the divisor so the stack always ends flush with the
+        // bottom — no dead space at any count.
+        let auto_of = |shown: usize| -> f32 {
+            (first..CHANNELS)
+                .filter(|i| !view.lanes.get(*i).is_some_and(|l| l.hidden))
+                .take(shown)
+                .map(|i| view.lanes.get(i).map_or(0, |l| l.automation.len()) as f32)
+                .sum::<f32>()
+                * AUTO_LANE_SHARE
+        };
+        // Settles: evicting a track can only REMOVE automation from the
+        // count, which can only let tracks back in, so `shown` walks down
+        // and stops. Bounded by the channel count regardless.
+        let mut shown = visible;
+        let mut auto_share = auto_of(shown);
+        for _ in 0..CHANNELS {
+            let want = visible.saturating_sub(auto_share.floor() as usize).max(1);
+            if want >= shown {
+                break;
+            }
+            shown = want;
+            auto_share = auto_of(shown);
+        }
+        let lane_h = lanes_area.height()
+            / (shown as f32
+                + auto_share
+                + if view.show_tempo_lane { TEMPO_LANE_SHARE } else { 0.0 }
+                + if view.show_master_row { MASTER_ROW_SHARE } else { 0.0 });
 
         // **The rows, stacked in order, and the arrays derived from them.**
         //
@@ -2756,6 +2813,14 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             };
             let face = shade(p.hdr_face, 0.92);
             painter.rect_filled(row.header, 0.0, face);
+            if auto.selected {
+                painter.rect_stroke(
+                    row.header.shrink(1.0),
+                    2.0,
+                    Stroke::new(1.2, crate::recorder_panel::selection_rim(face)),
+                    egui::StrokeKind::Inside,
+                );
+            }
             let ink = on_ink(face);
             let h = auto_header(row.header);
             // **The × — leave.** A cross rather than a letter: the three
@@ -4675,6 +4740,7 @@ ArrangeView {
             resting: 0.5,
             armed: false,
             bypassed: false,
+            selected: false,
             points: &[],
             hot: None,
         }];
@@ -5498,7 +5564,8 @@ ArrangeView {
                 v.view_start_s = start;
                 v.view_len_s = len;
                 v.lanes[0].automation = vec![AutoView {
-                    label: "volume".to_owned(),
+selected: false,
+                                        label: "volume".to_owned(),
             resting: 0.5,
             armed: false,
             bypassed: false,
@@ -5542,7 +5609,8 @@ ArrangeView {
         v.view_start_s = 2_000.0;
         v.view_len_s = 4.0;
         v.lanes[0].automation = vec![AutoView {
-                    label: "volume".to_owned(),
+selected: false,
+                                        label: "volume".to_owned(),
             resting: 0.5,
             armed: false,
             bypassed: false,
@@ -5583,7 +5651,8 @@ ArrangeView {
         let mut v = a_view(&[]);
         v.visible_lanes = 8;
         v.lanes[0].automation = vec![AutoView {
-                    label: "volume".to_owned(),
+selected: false,
+                                        label: "volume".to_owned(),
             resting: 0.5,
             armed: false,
             bypassed: false,
@@ -5636,7 +5705,8 @@ ArrangeView {
         let mut v = a_view(&[]);
         v.visible_lanes = 8;
         v.lanes[0].automation = vec![AutoView {
-                    label: "volume".to_owned(),
+selected: false,
+                                        label: "volume".to_owned(),
             resting: 0.5,
             armed: false,
             bypassed: false,
@@ -5777,6 +5847,7 @@ ArrangeView {
             resting: 0.5,
             armed: false,
             bypassed: false,
+            selected: false,
             points: &[],
             hot: None,
         }];
@@ -5799,24 +5870,229 @@ ArrangeView {
             (auto.lane.top() - l.lane_rows[0].bottom()).abs() < 0.5,
             "lane 0's automation is not under lane 0"
         );
-        // **The track did not shrink.** A sub-lane takes room from the area,
-        // not from the clips it belongs to — a track that got shorter every
-        // time you opened a curve would make the curve unusable and the
-        // clips too.
+        // **The track SHRANK, and that is the point.**
+        //
+        // This used to assert the opposite — a sub-lane took its room from
+        // the area and never from the track — and the consequence was that
+        // opening a curve made the stack taller than the area, so `push`
+        // dropped whatever no longer wholly fitted and left half a strip of
+        // dead space at the bottom with a track missing. The owner asked for
+        // the other trade by name: "it still takes half a strip, but tracks
+        // ALWAYS fit such that there is never dead space when they are
+        // added."
+        //
+        // So every open row is in the divisor and the tracks give up a slice
+        // each. A curve costs half a track's height spread across all of
+        // them, rather than one whole track falling off the end.
         assert!(
-            (l.lane_rows[0].height() - track_h).abs() < 0.5,
-            "opening a curve shrank the track from {track_h} to {}",
-            l.lane_rows[0].height()
+            l.lane_rows[0].height() < track_h,
+            "opening a curve did not cost the tracks anything: still {track_h}"
         );
-        // ...so something falls off the bottom instead, and what falls off
-        // is NOTHING rather than a half-height row.
+
+        // **And NOTHING hangs off the bottom, which is the whole ask.**
+        let mut lowest = l.lanes_area.top();
         for r in &l.rows {
             assert!(
                 !r.lane.is_positive() || r.lane.bottom() <= l.lanes_area.bottom() + 0.5,
                 "{:?} hangs off the bottom of the area",
                 r.kind
             );
+            if r.lane.is_positive() {
+                lowest = lowest.max(r.lane.bottom());
+            }
         }
+        // No dead space either: the stack reaches the bottom. A row short of
+        // it is the gap the owner was looking at.
+        assert!(
+            (l.lanes_area.bottom() - lowest).abs() < 1.0,
+            "the rows stop {} points above the bottom — that is the dead space",
+            l.lanes_area.bottom() - lowest
+        );
+
+        // And every row that SHOULD exist does: nothing was dropped to make
+        // the rest fit.
+        assert!(
+            l.rows
+                .iter()
+                .any(|r| r.kind == RowKind::Automation(0, 0) && r.lane.is_positive()),
+            "the automation row itself fell off"
+        );
+    }
+
+    /// **Automation shrinks the tracks, then evicts one, and repeats.**
+    ///
+    /// The owner's rule, in his words: "Start with 8 tracks visible, enable
+    /// vol auto lane on channel 1, all tracks shrink height equally to fit an
+    /// extra halfstrip; add a second lane, pan on channel one, now volume and
+    /// pan (equivalent of 1 channel height) exist, push the last channel out
+    /// of view." And it "repeats and scales with 3 and 4 inserts and beyond".
+    ///
+    /// So: every half strip of automation is absorbed by the tracks getting
+    /// shorter, and every WHOLE strip's worth costs one track its place.
+    /// Nothing ever hangs off the bottom and nothing ever leaves a gap.
+    #[test]
+    fn automation_rows_shrink_the_tracks_then_evict_one_and_repeat() {
+        let c = clips();
+        let lanes_shown = |l: &Layout| {
+            l.rows
+                .iter()
+                .filter(|r| matches!(r.kind, RowKind::Track(_)) && r.lane.is_positive())
+                .count()
+        };
+        let track_h = |l: &Layout| {
+            l.rows
+                .iter()
+                .find(|r| matches!(r.kind, RowKind::Track(_)) && r.lane.is_positive())
+                .map_or(0.0, |r| r.lane.height())
+        };
+        // The stack must always END flush with the area: a row short of the
+        // bottom IS the dead space this is about.
+        let flush = |l: &Layout, n: usize| {
+            let lowest = l
+                .rows
+                .iter()
+                .filter(|r| r.lane.is_positive())
+                .fold(l.lanes_area.top(), |m, r| m.max(r.lane.bottom()));
+            assert!(
+                (l.lanes_area.bottom() - lowest).abs() < 1.0,
+                "with {n} automation rows the stack stops {} points short — dead space",
+                l.lanes_area.bottom() - lowest
+            );
+            for r in &l.rows {
+                assert!(
+                    !r.lane.is_positive() || r.lane.bottom() <= l.lanes_area.bottom() + 0.5,
+                    "with {n} rows, {:?} hangs off the bottom",
+                    r.kind
+                );
+            }
+        };
+
+        let auto = |n: usize| -> Vec<AutoView<'static>> {
+            (0..n)
+                .map(|_| AutoView {
+                    param: crate::automation::AutoParam::Gain,
+                    label: "Volume".to_owned(),
+                    resting: 0.5,
+                    armed: false,
+                    bypassed: false,
+                    selected: false,
+                    points: &[],
+                    hot: None,
+                })
+                .collect()
+        };
+
+        // No automation: the baseline both counts are measured against.
+        let mut v = a_view(&c);
+        v.show_tempo_lane = false;
+        v.show_master_row = false;
+        let base = Layout::new(rect(), &v);
+        let (base_n, base_h) = (lanes_shown(&base), track_h(&base));
+        assert!(base_n >= 4, "too few lanes visible to test eviction: {base_n}");
+        flush(&base, 0);
+
+        let mut last_n = base_n;
+        let mut last_h = base_h;
+        for n in 1..=5usize {
+            let mut v = a_view(&c);
+            v.show_tempo_lane = false;
+            v.show_master_row = false;
+            let rows = auto(n);
+            v.lanes[0].automation = rows;
+            let l = Layout::new(rect(), &v);
+            flush(&l, n);
+
+            let want_n = base_n - n / 2;
+            assert_eq!(
+                lanes_shown(&l),
+                want_n,
+                "with {n} automation rows {} tracks show, not {want_n}",
+                lanes_shown(&l)
+            );
+            // An ODD count leaves half a strip over, so the tracks are
+            // shorter than the baseline; an EVEN one is a whole track's
+            // worth and they come back to full height.
+            if n % 2 == 0 {
+                assert!(
+                    (track_h(&l) - base_h).abs() < 0.5,
+                    "{n} rows is a whole track's worth, so the tracks should be \
+                     back to {base_h}, not {}",
+                    track_h(&l)
+                );
+            } else {
+                assert!(
+                    track_h(&l) < base_h - 0.5,
+                    "{n} rows left half a strip over and the tracks did not shrink"
+                );
+            }
+            // Never grows a track back while also keeping every lane: the
+            // sequence only ever costs.
+            assert!(
+                lanes_shown(&l) <= last_n,
+                "adding a row put a track BACK on screen"
+            );
+            last_n = lanes_shown(&l);
+            last_h = track_h(&l);
+        }
+        let _ = last_h;
+    }
+
+    /// **An automation row's header has every cell it is supposed to.**
+    ///
+    /// The owner reported the lanes as having "no labels, and no x button to
+    /// close them". Every one of them is drawn — so if they are missing, the
+    /// header they are carved out of is degenerate. This asks for each cell
+    /// at the size a real row actually gets.
+    #[test]
+    fn an_automation_rows_header_has_its_switches_label_and_dial() {
+        let c = clips();
+        let rows = vec![AutoView {
+            param: crate::automation::AutoParam::Gain,
+            label: "Volume".to_owned(),
+            resting: 0.5,
+            armed: false,
+            bypassed: false,
+            selected: false,
+            points: &[],
+            hot: None,
+        }];
+        let mut v = a_view(&c);
+        v.lanes[0].automation = rows;
+        let l = Layout::new(rect(), &v);
+        let row = l
+            .rows
+            .iter()
+            .find(|r| r.kind == RowKind::Automation(0, 0))
+            .expect("no automation row");
+        assert!(row.header.is_positive(), "the row has no header to carve");
+
+        let h = auto_header(row.header);
+        assert!(h.close.is_positive(), "no × to close the lane");
+        assert!(h.arm.is_positive(), "no record arm");
+        assert!(h.bypass.is_positive(), "no bypass");
+        assert!(h.name.is_positive(), "nowhere to write the label");
+        assert!(h.dial.is_positive(), "no dial");
+        assert!(h.readout.is_positive(), "no readout");
+
+        // The label needs ROOM, not just a rect: the draw refuses under
+        // twenty points and would leave the lane looking unnamed.
+        assert!(
+            h.name.width() > 24.0,
+            "the label has {} points to print in — it will not draw",
+            h.name.width()
+        );
+        // And nothing overlaps: a switch under the label is a switch that
+        // cannot be pressed.
+        for (a, an) in [(h.close, "close"), (h.arm, "arm"), (h.bypass, "bypass")] {
+            assert!(
+                a.right() <= h.name.left() + 0.5,
+                "the {an} switch runs into the label"
+            );
+        }
+        assert!(
+            h.name.right() <= h.dial.left() + 0.5,
+            "the label runs into the dial"
+        );
     }
 
     /// **Eight lanes show; the rest scroll.** With more lanes than fit, only

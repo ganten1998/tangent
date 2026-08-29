@@ -4455,26 +4455,28 @@ impl DesktopApp {
         }
         // ── the pads, decoded at the export rate ──
         {
-            let mut kit = crate::instrument::PadKit::default();
-            for (i, path) in self.app.drumpad_paths().iter().enumerate() {
-                let Some(path) = path else { continue };
-                if let (Ok(c), Some(slot)) = (
-                    tangent_record::decode::decode(path, rate),
-                    kit.pads.get_mut(i),
-                ) {
-                    *slot = Some(Arc::new(c));
+            // **Each drum lane's own kit**, decoded at the export rate. The
+            // live path does the same; an export that gave every lane one
+            // kit would render a song nobody was listening to.
+            for lane in (0..tangent_ui::recorder::CHANNELS)
+                .filter(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::DRUMPAD_PATH))
+            {
+                let mut kit = crate::instrument::PadKit::default();
+                for (i, path) in self.app.drumpad_paths_of(lane).iter().enumerate() {
+                    let Some(path) = path else { continue };
+                    if let (Ok(c), Some(slot)) = (
+                        tangent_record::decode::decode(path, rate),
+                        kit.pads.get_mut(i),
+                    ) {
+                        *slot = Some(Arc::new(c));
+                    }
                 }
-            }
-            // Every drum lane, as the live path does.
-            for lane in (0..tangent_ui::recorder::CHANNELS)
-                .filter(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::DRUMPAD_PATH))
-            {
-                e.set_pad_kit(lane, kit.clone());
+                e.set_pad_kit(lane, kit);
             }
             for lane in (0..tangent_ui::recorder::CHANNELS)
                 .filter(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::DRUMPAD_PATH))
             {
-                e.set_pad_params(lane, &self.app.drum_kit_params());
+                e.set_pad_params(lane, &self.app.drum_kit_params_of(lane));
             }
         }
         e.set_stems(spec.stems);
@@ -5225,7 +5227,18 @@ impl DesktopApp {
             .engine
             .as_ref()
             .map_or(48_000, |e| e.output().sample_rate);
-        let paths = self.app.drumpad_paths();
+        // **Each drum lane's OWN kit.** A drum instrument loads a full
+        // instance per channel, so this decodes once per lane — the cache
+        // below means two lanes naming the same file decode it once and
+        // share the `Arc`.
+        let lanes: Vec<usize> = (0..tangent_ui::recorder::CHANNELS)
+            .filter(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::DRUMPAD_PATH))
+            .collect();
+        // The window's own lane is the one whose load STATUS the pads show.
+        let shown = self.app.drumpad_lane();
+        let mut delivered_all = !lanes.is_empty();
+        for lane in lanes.iter().copied() {
+        let paths = self.app.drumpad_paths_of(lane);
         let mut kit = crate::instrument::PadKit::default();
         let mut status: [tangent_ui::ports::PadStatus; crate::instrument::PADS] =
             std::array::from_fn(|_| tangent_ui::ports::PadStatus::default());
@@ -5255,35 +5268,33 @@ impl DesktopApp {
                 _ => {}
             }
         }
-        // Files no pad references any more leave the cache with the edit.
-        self.pad_cache
-            .retain(|path, _| paths.iter().flatten().any(|p| p == path));
         // **The pads only LIGHT once the kit actually LANDED.** A full ring
         // under a stalled callback — or no engine at all — used to drop the
         // kit silently while the ghosts drew anyway, and the Windows
         // tester's pads struck the DX7. Undelivered = try again next frame,
         // until the audio thread really has it.
-        // **To EVERY lane holding a drumpad.** A drum instrument loads a
-        // full instance per channel, so each of them gets the kit and renders
-        // it through its own voices, fader and meter. The samples are `Arc`s,
-        // so the clones share them.
-        //
-        // They all get the SAME kit for now, because the document still
-        // carries one. Per-lane kits are the document's half of this and
-        // change nothing here: this loop already hands each lane its own.
-        let lanes: Vec<usize> = (0..tangent_ui::recorder::CHANNELS)
-            .filter(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::DRUMPAD_PATH))
-            .collect();
-        let delivered = self.recorder.engine.as_mut().is_some_and(|e| {
-            // Every lane must land, or the pads light over an engine that
-            // only got some of them — the same reason this reports at all.
-            lanes
-                .iter()
-                .fold(true, |ok, &lane| e.set_pad_kit(lane, kit.clone()) && ok)
-        }) && !lanes.is_empty();
-        if delivered {
+        let landed = self
+            .recorder
+            .engine
+            .as_mut()
+            .is_some_and(|e| e.set_pad_kit(lane, kit));
+        delivered_all &= landed;
+        // The status belongs to the kit the WINDOW is showing: it is what
+        // draws those pads' names, waveforms and missing-file marks.
+        if landed && lane == shown {
             self.app.set_drumpad_status(status);
-        } else {
+        }
+        }
+        // Files no pad references any more leave the cache with the edit —
+        // asked across EVERY lane, or loading a second kit would evict the
+        // first one's samples.
+        let live: Vec<std::path::PathBuf> = lanes
+            .iter()
+            .flat_map(|l| self.app.drumpad_paths_of(*l))
+            .flatten()
+            .collect();
+        self.pad_cache.retain(|path, _| live.iter().any(|p| p == path));
+        if !delivered_all {
             self.recorder.pads_retry = true;
         }
     }
@@ -5794,7 +5805,7 @@ impl DesktopApp {
         for lane in (0..tangent_ui::recorder::CHANNELS)
             .filter(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::DRUMPAD_PATH))
         {
-            e.set_pad_params(lane, &self.app.drum_kit_params());
+            e.set_pad_params(lane, &self.app.drum_kit_params_of(lane));
         }
         // **The microphone fader, and it goes to ONE place now.** It used to
         // go to two — the session's writer thread and the engine — because the
