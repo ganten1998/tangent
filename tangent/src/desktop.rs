@@ -2517,6 +2517,12 @@ impl DesktopApp {
             self.reload_pads();
         }
 
+        // **The click's sound, on the same bargain.** Decoded here, off the
+        // audio thread, and handed over on the engine's own ring.
+        if self.app.take_click_sample_dirty() {
+            self.reload_click();
+        }
+
         // **The shipped bank, put back.** The same call a first launch makes,
         // which is the point: there is one definition of "the cartridge that
         // ships" and both paths read it.
@@ -3283,6 +3289,14 @@ impl DesktopApp {
         }
         if purpose == tangent_ui::ports::FilePurpose::Project {
             self.switch_project(file);
+            return;
+        }
+        if purpose == tangent_ui::ports::FilePurpose::ClickSample {
+            // Only the PATH is stored — the decode happens on the flag below
+            // this frame, on the same road the bundled asset takes, so a file
+            // that has since moved falls back to the built-in click rather
+            // than to silence.
+            self.app.set_click_sample(&file.to_string_lossy());
             return;
         }
         match crate::dx7::Cartridge::load(file) {
@@ -4946,6 +4960,35 @@ impl DesktopApp {
     /// The drumpad's samples: decode every slot at the engine's rate, push
     /// the kit whole, and tell the app what each pad turned out to be.
     /// `reload_clips`'s little sibling, with its own cache — see `pad_cache`.
+    /// **Decode the chosen click and hand it to the engine.**
+    ///
+    /// An empty setting, a file that has moved, a file the decoder cannot
+    /// read: all three end at the bundled click rather than at silence, and
+    /// the setting is LEFT alone in the failure cases — a sound file living
+    /// on a drive that is not plugged in today should come back tomorrow, not
+    /// be forgotten because it was missing once.
+    #[cfg(feature = "recorder")]
+    fn reload_click(&mut self) {
+        let path = self.app.click_sample().to_owned();
+        let Some(engine) = self.recorder.engine.as_mut() else {
+            return;
+        };
+        if path.is_empty() {
+            engine.set_click(None);
+            return;
+        }
+        match tangent_record::decode::decode(std::path::Path::new(&path), engine.output().sample_rate) {
+            Ok(clip) => engine.set_click(Some(&clip.samples)),
+            Err(e) => {
+                engine.set_click(None);
+                self.app.set_track_info(tangent_ui::ports::TrackInfo {
+                    error: format!("that click sound would not load: {e}"),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
     fn reload_pads(&mut self) {
         /// Columns in a pad's waveform ghost. A pad is fifty-odd points
         /// wide at most; forty-eight columns is under a point each.

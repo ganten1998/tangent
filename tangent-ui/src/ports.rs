@@ -500,6 +500,10 @@ pub struct CartridgeInfo {
 pub enum FilePurpose {
     /// A DX7 cartridge to load into the built-in FM instrument.
     Cartridge,
+    /// **A sound for the metronome.** Any file the decoder reads; it is
+    /// resampled and used for both the beat and the accent. Empty means the
+    /// bundled click, which is always one button away.
+    ClickSample,
     /// An audio file to play along to.
     BackingTrack,
     /// A project document (`project.tangent`) to open.

@@ -717,13 +717,44 @@ impl Click {
                 spec.channels
             ));
         }
-        let src = f64::from(spec.sample_rate);
-        Ok(Self {
-            normal: resample_linear(&samples, src, rate),
-            accent: resample_linear(&samples, src * ACCENT_RATE_RATIO, rate),
-        })
+        Ok(Self::from_mono(&samples, f64::from(spec.sample_rate), rate))
+    }
+
+    /// **A click built from a file the owner picked.**
+    ///
+    /// The decoder hands back interleaved stereo already at the device rate.
+    /// The click is summed into every output channel from ONE buffer, so the
+    /// two sides are folded here rather than played as a pair — a stereo click
+    /// would arrive as interleaved garbage at double speed, which is the same
+    /// trap `load` guards the bundled asset against.
+    ///
+    /// Long files are CUT. A metronome whose sound outlasts the beat is a drone
+    /// with a pulse in it, and at four clicks a beat at 200 bpm the beat is
+    /// 75 ms; the cap is generous next to that and exists so that picking a
+    /// whole song by mistake costs a second of audio, not a minute of it.
+    fn from_stereo(samples: &[f32], rate: f64) -> Self {
+        let cap = (rate * MAX_CLICK_SECONDS).max(1.0) as usize;
+        let mono: Vec<f32> = samples
+            .chunks_exact(2)
+            .take(cap)
+            .map(|f| (f[0] + f[1]) * 0.5)
+            .collect();
+        Self::from_mono(&mono, rate, rate)
+    }
+
+    /// Both voices from one mono source. The accent is the same sound read
+    /// faster — see [`ACCENT_RATE_RATIO`] — so a custom click accents itself
+    /// and there is no second file to pick.
+    fn from_mono(samples: &[f32], src: f64, rate: f64) -> Self {
+        Self {
+            normal: resample_linear(samples, src, rate),
+            accent: resample_linear(samples, src * ACCENT_RATE_RATIO, rate),
+        }
     }
 }
+
+/// The longest a chosen click may sound. See [`Click::from_stereo`].
+const MAX_CLICK_SECONDS: f64 = 1.5;
 
 /// Linear interpolation, which is the right tool exactly once.
 ///
@@ -2663,6 +2694,14 @@ struct Renderer {
     frame: Vec<f32>,
 
     click: Click,
+    /// **A click sound arriving, and the displaced one going back.**
+    ///
+    /// The clip list's bargain, for the same reason: a `Click` owns two
+    /// `Vec`s, the callback may not free one, so what it puts down leaves on
+    /// the return ring and is dropped by the thread that sent the
+    /// replacement.
+    click_incoming: Consumer<Click>,
+    click_retiring: Producer<Click>,
     voice: Voice,
     beats: Beats,
     /// The click while the transport ROLLS. See [`BarClock`]: derived from
@@ -3128,6 +3167,16 @@ impl Renderer {
         let muted = self.shared.muted.load(Ordering::Relaxed);
         let soloed = self.shared.soloed.load(Ordering::Relaxed);
         let metro_target = Shared::f32_of(&self.shared.metro_gain).clamp(0.0, 8.0);
+        // A chosen click arriving — and the one it displaces going back, by
+        // the clip list's protocol. No room to return the old one, no swap
+        // this block; the click that is already loaded keeps playing, which
+        // is the right failure.
+        if self.click_retiring.slots() > 0 {
+            if let Ok(next) = self.click_incoming.pop() {
+                let old = std::mem::replace(&mut self.click, next);
+                let _ = self.click_retiring.push(old);
+            }
+        }
         let metro_on = self.shared.metro_on.load(Ordering::Relaxed);
         let in_take = self.shared.metro_in_take.load(Ordering::Relaxed);
         let count_in_recorded = self.shared.count_in_in_take.load(Ordering::Relaxed);
@@ -6062,6 +6111,9 @@ pub struct Engine {
     auto_from_audio: Consumer<tangent_ui::automation::Automation>,
     track_to_audio: Producer<Vec<Placed>>,
     track_from_audio: Consumer<Vec<Placed>>,
+    /// The click sound's pair. See [`Engine::set_click`].
+    click_to_audio: Producer<Click>,
+    click_from_audio: Consumer<Click>,
     midi_to_audio: Producer<Vec<PlacedMidi>>,
     midi_from_audio: Consumer<Vec<PlacedMidi>>,
     pad_to_audio: Producer<PadKit>,
@@ -6353,6 +6405,8 @@ impl Engine {
         // lets the swap check for room, exactly as a slot's.
         let (track_to_audio, track_incoming) = RingBuffer::<Vec<Placed>>::new(2);
         let (track_retiring, track_from_audio) = RingBuffer::<Vec<Placed>>::new(2);
+        let (click_to_audio, click_incoming) = RingBuffer::<Click>::new(2);
+        let (click_retiring, click_from_audio) = RingBuffer::<Click>::new(2);
         let (midi_to_audio, midi_incoming) = RingBuffer::<Vec<PlacedMidi>>::new(2);
         let (midi_retiring, midi_from_audio) = RingBuffer::<Vec<PlacedMidi>>::new(2);
         // The maps' pair. A map is a growable `Vec` and the callback may not
@@ -6435,6 +6489,8 @@ impl Engine {
             auto_retiring,
             track_incoming,
             track_retiring,
+            click_incoming,
+            click_retiring,
             midi_incoming,
             midi_retiring,
             pad_kit: PadKit::default(),
@@ -6564,6 +6620,8 @@ impl Engine {
             auto_from_audio,
             track_to_audio,
             track_from_audio,
+            click_to_audio,
+            click_from_audio,
             midi_to_audio,
             midi_from_audio,
             pad_to_audio,
@@ -7451,6 +7509,42 @@ impl Engine {
     /// comes back on `track_from_audio` and is dropped by the caller that sent
     /// its replacement — never by the audio thread, whose `drop` of a
     /// hundred-megabyte `Vec` was a measured, reachable stall.
+    /// **Give the metronome a different sound**, or `None` for the one that
+    /// ships.
+    ///
+    /// `samples` is interleaved stereo at the engine's rate — whatever
+    /// `tangent_record::decode` produced — and is folded to mono here. The
+    /// bundled click is rebuilt rather than kept around: it is a few
+    /// kilobytes and decoding it twice a session costs nothing next to
+    /// holding a second copy alive for a swap that may never come.
+    ///
+    /// The displaced click dies on THIS thread, by the clip list's bargain.
+    pub fn set_click(&mut self, samples: Option<&[f32]>) {
+        let rate = f64::from(self.output().sample_rate);
+        let next = match samples {
+            Some(s) => Click::from_stereo(s, rate),
+            None => match Click::load(rate) {
+                Ok(c) => c,
+                // The asset is compiled in and decoded at startup, so this is
+                // unreachable in practice. Keeping the click that is playing
+                // beats going silent over it.
+                Err(_) => return,
+            },
+        };
+        while self.click_from_audio.pop().is_ok() {}
+        if self.click_to_audio.push(next).is_err() {
+            return;
+        }
+        let deadline = Instant::now() + RETIRE_TIMEOUT;
+        while Instant::now() < deadline {
+            if let Ok(old) = self.click_from_audio.pop() {
+                drop(old);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     pub fn set_clips(&mut self, clips: Vec<Placed>) {
         // Whatever came back earlier is dropped first, so the ring always has
         // room and two rapid loads cannot wedge.
@@ -9781,6 +9875,40 @@ mod tests {
 
     // ── the click ──────────────────────────────────────────────────────────
 
+    /// A chosen click is folded to MONO and CUT.
+    ///
+    /// The callback sums one buffer into every output channel, so a stereo
+    /// buffer handed over as-is plays interleaved at double speed — the exact
+    /// trap `Click::load` rejects the bundled asset for. And a click that
+    /// outlasts the beat is a drone: at four clicks a beat the beat can be
+    /// 75 ms, so the cap is what stops somebody who picked a whole song from
+    /// hearing it.
+    #[test]
+    fn a_chosen_click_is_folded_to_mono_and_cut() {
+        // Left is 1.0, right is -1.0: a fold that took one side keeps a
+        // signal, and only the average lands on zero.
+        let stereo: Vec<f32> = (0..96_000).flat_map(|_| [1.0f32, -1.0]).collect();
+        let c = Click::from_stereo(&stereo, 48_000.0);
+        assert!(
+            c.normal.iter().all(|v| v.abs() < 1e-6),
+            "the two sides were not averaged"
+        );
+        let cap = (48_000.0 * MAX_CLICK_SECONDS) as usize;
+        assert_eq!(c.normal.len(), cap, "two seconds of audio was not cut");
+
+        // The accent is the same sound read faster, so it is SHORTER and it
+        // exists — a custom click that accented with silence would lose the
+        // downbeat.
+        assert!(!c.accent.is_empty());
+        assert!(c.accent.len() < c.normal.len());
+
+        // And the fold is a real average, not a mute: one side alone survives
+        // at half.
+        let one_side: Vec<f32> = (0..1_000).flat_map(|_| [1.0f32, 0.0]).collect();
+        let c = Click::from_stereo(&one_side, 48_000.0);
+        assert!((c.normal[10] - 0.5).abs() < 1e-6, "got {}", c.normal[10]);
+    }
+
     #[test]
     fn the_click_asset_decodes_and_is_prepared_at_the_devices_rate() {
         let at_48 = Click::load(48_000.0).expect("assets/click.wav must decode");
@@ -10072,6 +10200,8 @@ mod tests {
             // and push fills to capacity, which is all a test needs.
             track_incoming: RingBuffer::<Vec<Placed>>::new(2).1,
             track_retiring: RingBuffer::<Vec<Placed>>::new(2).0,
+            click_incoming: RingBuffer::<Click>::new(2).1,
+            click_retiring: RingBuffer::<Click>::new(2).0,
             midi_incoming: RingBuffer::<Vec<PlacedMidi>>::new(2).1,
             midi_retiring: RingBuffer::<Vec<PlacedMidi>>::new(2).0,
             pad_kit: PadKit::default(),

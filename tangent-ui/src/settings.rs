@@ -1247,6 +1247,12 @@ pub struct Settings {
     /// quarters, not six eighths, and a click that insists on all six is
     /// unusable for the meter it is most needed in.
     pub metronome_div: i64,
+    /// **The click's sound file**, or empty for the one that ships.
+    ///
+    /// A path rather than the samples: a settings file is not where audio
+    /// belongs, and a file that has moved should fall back to the built-in
+    /// rather than to silence.
+    pub click_sample: String,
     /// The click is mixed into the RECORDING as well as the monitors.
     ///
     /// **False by default and that is the important one.** A click bleeding
@@ -1631,6 +1637,7 @@ impl Default for Settings {
             show_transpose: true,
             metronome_on: false,
             metronome_div: 1,
+            click_sample: String::new(),
             metronome_in_take: false,
             record_hide_elapsed: false,
             record_export: crate::recorder::ExportSpec::default(),
@@ -2772,6 +2779,9 @@ impl Settings {
         }
         take_bool(&mut map, "show_transpose", &mut s.show_transpose);
         take_bool(&mut map, "metronome_on", &mut s.metronome_on);
+        if let Some(s2) = map.shift_remove("click_sample").and_then(|v| v.as_str().map(str::to_owned)) {
+            s.click_sample = s2;
+        }
         if let Some(v) = map.shift_remove("metronome_div") {
             if let Some(n) = v.as_i64() {
                 // 0 is "once a bar"; anything past 8 is a buzz, not a click.
@@ -3820,6 +3830,7 @@ impl Settings {
         );
         map.insert("metronome_div".into(), Value::from(self.metronome_div));
         map.insert("strip_phase".into(), Value::from(self.strip_phase));
+        map.insert("click_sample".into(), Value::String(self.click_sample.clone()));
         for (k, v) in &self.extra {
             map.insert(k.clone(), v.clone());
         }
@@ -5789,6 +5800,26 @@ mod tests {
     }
 
     /// same symptom — Setup opens showing something other than what is running.
+    #[test]
+    /// The click's sound is a PATH in the settings file, and the file is the
+    /// only place it lives — a build that lost it on save would put the
+    /// built-in click back every launch, silently.
+    #[test]
+    fn the_chosen_click_sound_round_trips() {
+        let mut s = Settings::default();
+        assert!(s.click_sample.is_empty(), "the default is the bundled click");
+        s.click_sample = "/Users/x/Sounds/rim.wav".to_owned();
+        let back = Settings::from_json(&s.to_json());
+        assert_eq!(back.click_sample, "/Users/x/Sounds/rim.wav");
+
+        // And back to the built-in, which is an EMPTY string rather than a
+        // missing key: the reset writes it, and a reader that treated absent
+        // and empty differently would keep the old path.
+        let mut off = back;
+        off.click_sample = String::new();
+        assert!(Settings::from_json(&off.to_json()).click_sample.is_empty());
+    }
+
     #[test]
     fn the_audio_path_settings_round_trip() {
         let mut s = Settings::default();
