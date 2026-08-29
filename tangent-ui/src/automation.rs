@@ -387,11 +387,24 @@ impl Curve {
             return false;
         };
         self.points.remove(i);
-        // Taking the FIRST point away would leave the curve beginning
-        // somewhere other than zero, so the next one seeds a new node there.
-        // Deleting the node at zero therefore moves it rather than removing
-        // it — which is what "a curve always begins at zero" has to mean if
-        // it is to be true after an edit as well as before one.
+        // **A lone node at zero is not a curve.**
+        //
+        // Seeding after every removal made a curve impossible to un-draw: the
+        // one point somebody had drawn came out, the seeded node at zero
+        // stayed, and the lane stayed automated by a flat line nobody put
+        // there. A single point at zero says only "hold this value", which is
+        // exactly what NO curve already says — `value_at` answers None and the
+        // control sits where it sits. So the last one goes too, and the lane
+        // is genuinely clear.
+        if self.points.len() == 1 && self.points[0].at_s <= 0.0 {
+            self.points.clear();
+            return true;
+        }
+        // Otherwise the rule holds: taking the first point away would leave
+        // the curve beginning somewhere other than zero, so the next one
+        // seeds a node there. Deleting the node at zero therefore MOVES it,
+        // which is what "always begins at zero" has to mean after an edit as
+        // well as before one.
         self.ensure_zero();
         true
     }
