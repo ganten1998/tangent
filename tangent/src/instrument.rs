@@ -221,7 +221,7 @@
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{
-    AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+    AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -331,12 +331,12 @@ pub const PADS: usize = tangent_ui::recorder::DRUM_PADS;
 /// the pads' bays ride the same index space as everything else, seats
 /// `STRIPS + 1 ..`, so loading, editors and state sidecars need no second
 /// machinery. See `pad_rack_index`.
-pub const RACK_SEATS: usize = tangent_ui::recorder::MASTER_EXTRA_SEAT + 1;
+pub const RACK_SEATS: usize = tangent_ui::recorder::TOTAL_SEATS;
 
-/// Where pad `i`'s bays live in the insert space.
-pub const fn pad_rack_index(pad: usize) -> usize {
-    STRIPS + 1 + pad
-}
+/// Where channel `ch`'s pad `i` keeps its bays. Declared in the UI beside
+/// the rest of the seat map; re-exported here so the engine names it the
+/// way it always has.
+pub use tangent_ui::recorder::pad_rack_index;
 
 /// Pad 0's MIDI note; pad `n` answers `PAD_BASE + n`. See the UI's
 /// `DRUM_PAD_BASE` — one constant, declared there, read here.
@@ -1688,6 +1688,12 @@ struct Shared {
     /// How much audio the monitor ring is holding, in frames: the monitoring
     /// path's own latency, on top of the two device buffers, as a number.
     monitor_backlog: AtomicU32,
+    /// **How many plugin hand-offs are in flight.** Bumped by the host
+    /// before it pushes into a seat's ring, drained by the callback as it
+    /// takes them. Zero means `swap_plugins` can skip the whole seat map,
+    /// which is what keeps a two-thousand-seat map free when nothing is
+    /// loading. See `swap_plugins`.
+    pending_swaps: AtomicU32,
     /// **The frames the output callback is ACTUALLY handed**, as opposed to
     /// the number that was asked for.
     ///
@@ -2004,6 +2010,7 @@ impl Shared {
             pending_monitor_layout: std::sync::Mutex::new(None),
             monitor_slip: AtomicU64::new(0),
             monitor_backlog: AtomicU32::new(0),
+            pending_swaps: AtomicU32::new(0),
             out_block_seen: AtomicU32::new(0),
             midi_off: AtomicU32::new(0),
             armed: AtomicU32::new(u32::MAX),
@@ -2628,6 +2635,9 @@ struct Renderer {
     /// fast-forward every cursor to the end again, leaving the head of the
     /// loop silent. Audio clips read straight off `at` and never needed this;
     /// the note scheduler is cursor-based and does.
+    /// Whether ANY pad rack anywhere holds a plugin. See `swap_plugins`,
+    /// which is the only place it can change.
+    pad_racks_live: bool,
     pending_flush: bool,
     /// **The loop's HEAD, when the flush above is a wrap rather than a seek.**
     ///
@@ -2795,7 +2805,16 @@ struct Renderer {
     /// with its own hand-off and its own function; a bus is a channel with a
     /// send instead of a fader, and one mechanism that every channel uses is
     /// worth more than a special case that only the bus understands.
-    racks: [Rack; RACK_SEATS],
+    /// **A `Vec`, and it has to be.**
+    ///
+    /// One rack per seat, and a seat per pad of every channel: two thousand
+    /// of them. Inline that is well over half a megabyte living in a struct
+    /// that is BUILT BY VALUE and moved into the audio callback — which
+    /// overflowed the stack the moment the pad blocks went per channel, in a
+    /// test thread first and in anything with a smaller stack after. The
+    /// contents are identical; only where they live changes, and indexing a
+    /// `Vec` costs the callback nothing over indexing an array.
+    racks: Vec<Rack>,
     /// Deinterleaved in and out for it. Preallocated, like everything else the
     /// audio thread touches.
     fx_in: Vec<Vec<f32>>,
@@ -3087,6 +3106,22 @@ impl Renderer {
     }
 
     fn swap_plugins(&mut self) -> usize {
+        // **Nothing in flight, nothing to walk.**
+        //
+        // This scanned every seat every block. That was fine at a hundred
+        // and fifty; it is not at two thousand, which is what a pad block
+        // per channel costs — and it would be pure waste, because the scan
+        // exists only to notice an ARRIVAL and almost every block has none.
+        //
+        // The host bumps `pending_swaps` before it pushes into any seat's
+        // ring, so a session with nothing loading pays one atomic read a
+        // block, whatever the seat map's size. What sixteen loaded drum
+        // instances cost is then what sixteen loaded drum instances cost,
+        // which is the person who loaded them's business — but an empty
+        // desk must not pay for the possibility of them.
+        if self.shared.pending_swaps.load(Ordering::Acquire) == 0 {
+            return 0;
+        }
         // Every rack, by one protocol: whatever arrives replaces what is
         // there and the old one goes back to be dropped on the thread that
         // made it.
@@ -3098,6 +3133,21 @@ impl Renderer {
             self.shared
                 .swaps
                 .fetch_add(swapped as u64, Ordering::Relaxed);
+            // **Saturating.** A miscount that wrapped this to four billion
+            // would turn the gate permanently on — the old behaviour, so
+            // harmless, but it would hide the bug that caused it for ever.
+            let _ = self.shared.pending_swaps.fetch_update(
+                Ordering::Release,
+                Ordering::Relaxed,
+                |n| Some(n.saturating_sub(swapped as u32)),
+            );
+            // **And whether any PAD rack is live, decided here.** It is the
+            // one place a rack's contents change, so it is the one place
+            // that can answer without walking two thousand seats — see the
+            // early-out in `mix_pads`.
+            self.pad_racks_live = (0..CHANNELS).any(|ch| {
+                (0..PADS).any(|i| !self.racks[pad_rack_index(ch, i)].is_empty())
+            });
         }
         swapped
     }
@@ -5354,8 +5404,12 @@ impl Renderer {
         // And the tail does not need it: the lane's own pass in `mix_clips`
         // runs that same rack every block regardless, so whatever is ringing
         // in it keeps ringing there.
-        let any_rack = !self.racks[Strip::Drums.index()].is_empty()
-            || (0..PADS).any(|i| !self.racks[pad_rack_index(i)].is_empty());
+        // **Cached, not walked.** With a pad block per channel this is two
+        // thousand seats, and asking every block — when the answer changes
+        // only on a plugin load — is the audio thread doing a full scan of
+        // an empty map at block rate. `swap_plugins` sets it, because a
+        // rack's contents change nowhere else.
+        let any_rack = !self.racks[Strip::Drums.index()].is_empty() || self.pad_racks_live;
         if self.pad_hits.is_empty()
             && self.pad_offs.is_empty()
             && !self
@@ -5561,7 +5615,7 @@ impl Renderer {
         // **Each pad's own bays, over its voice alone** — then the bus sum.
         // A pad with an empty rack skips the copy and sums straight across.
         for i in 0..PADS {
-            let rack_at = pad_rack_index(i);
+            let rack_at = pad_rack_index(lane_ix, i);
             let rack_live = !self.racks[rack_at].is_empty();
             // A live rack processes even silence — its tail is its own.
             if !sounded[i] && !rack_live {
@@ -6441,7 +6495,9 @@ pub struct Engine {
     hw_midi_tx: Option<Producer<MidiEvent>>,
 
     /// The UI thread's ends of every rack's hand-offs. See `Rack`.
-    insert_handoff: [[Handoff; INSERTS]; RACK_SEATS],
+    /// Heap, for the reason `Renderer::racks` gives: a seat per pad of
+    /// every channel is too much to carry inline through a move.
+    insert_handoff: Vec<[Handoff; INSERTS]>,
     /// The clip's two rings, in the plugin handoff's exact shape and for its
     /// exact reason: the audio thread must never free a hundred megabytes of
     /// samples, so the displaced clip comes BACK here and is dropped by the
@@ -6468,7 +6524,9 @@ pub struct Engine {
     /// engine when streaming is switched on. `None` after it has been taken.
     reastream_rx: Option<Consumer<f32>>,
     /// What is in each of them, for the desk to name.
-    inserts_loaded: [[Option<Loaded>; INSERTS]; RACK_SEATS],
+    /// Heap, for the reason `Renderer::racks` gives: a seat per pad of
+    /// every channel is too much to carry inline through a move.
+    inserts_loaded: Vec<[Option<Loaded>; INSERTS]>,
 
     tap: Option<RecorderTap>,
     fault: Arc<Mutex<Option<String>>>,
@@ -6484,22 +6542,33 @@ pub struct Engine {
     /// controller built its view. Declared **before** `insert_editor_handles`
     /// so that even a plain `drop(engine)` releases every window and its
     /// `IPlugView` before the controller references that made them.
-    insert_editors: [[Option<tangent_host::Editor>; INSERTS]; RACK_SEATS],
+    /// Heap, for the reason `Renderer::racks` gives: a seat per pad of
+    /// every channel is too much to carry inline through a move.
+    insert_editors: Vec<[Option<tangent_host::Editor>; INSERTS]>,
     /// Each loaded insert's edit controller, taken in [`Engine::load_insert`]
     /// **before** the instance leaves for the audio thread — the one moment
     /// there is an `&Instance` on this thread. See [`Engine::open_editor`].
-    insert_editor_handles: [[Option<tangent_host::EditorHandle>; INSERTS]; RACK_SEATS],
+    /// Heap, for the reason `Renderer::racks` gives. These two were the
+    /// last of them and much the largest: a seat per pad of every
+    /// channel put a QUARTER OF A MEGABYTE inline in `Engine`, and a
+    /// test that opens two engines in one frame ran a debug build's
+    /// moves straight off the end of a 2 MiB test stack.
+    insert_editor_handles: Vec<[Option<tangent_host::EditorHandle>; INSERTS]>,
     /// Each loaded insert's processor reference, taken beside the editor's and
     /// for the same reason: after the handoff there is no `&Instance` to ask.
     /// This is what lets a bay's settings survive a relaunch — no insert has
     /// ever had one before, so every effect's knobs and every bay instrument's
     /// preset died with the process.
-    insert_state_handles: [[Option<tangent_host::StateHandle>; INSERTS]; RACK_SEATS],
+    /// Heap, for the reason `Renderer::racks` gives: a seat per pad of
+    /// every channel is too much to carry inline through a move.
+    insert_state_handles: Vec<[Option<tangent_host::StateHandle>; INSERTS]>,
     /// How to ask each seated plugin its latency again, from THIS thread.
     ///
     /// The audio thread holds the instance and may not make the call; it can
     /// only be told the figure has gone stale. See `poll_latency`.
-    insert_latency_handles: [[Option<tangent_host::LatencyHandle>; INSERTS]; RACK_SEATS],
+    /// Heap, for the reason `Renderer::racks` gives: a seat per pad of
+    /// every channel is too much to carry inline through a move.
+    insert_latency_handles: Vec<[Option<tangent_host::LatencyHandle>; INSERTS]>,
     /// Why a bay's saved state was not restored, if it was not.
     ///
     /// A stale or hand-edited blob must not stop the plugin loading — the
@@ -6508,7 +6577,12 @@ pub struct Engine {
     /// [`Engine::insert_state_error`] can put it in front of someone.
     /// Silently ignoring it is how "it keeps forgetting my piano" becomes
     /// unreportable.
-    insert_state_errors: [[Option<String>; INSERTS]; RACK_SEATS],
+    /// Heap, for the reason `Renderer::racks` gives. These two were the
+    /// last of them and much the largest: a seat per pad of every
+    /// channel put a QUARTER OF A MEGABYTE inline in `Engine`, and a
+    /// test that opens two engines in one frame ran a debug build's
+    /// moves straight off the end of a 2 MiB test stack.
+    insert_state_errors: Vec<[Option<String>; INSERTS]>,
 
     /// Meter hold, decayed on the UI thread because that is where it is read.
     hold: Cell<(f32, f32)>,
@@ -6706,7 +6780,11 @@ impl Engine {
         // waits for the return before it starts another — and the spare
         // element is what lets `Rack::swap` check for room before it commits.
         let mut rack_ends: Vec<[Handoff; INSERTS]> = Vec::with_capacity(RACK_SEATS);
-        let racks: [Rack; RACK_SEATS] = std::array::from_fn(|_| {
+        // Collected into the `Vec` rather than an array: an array of a
+        // rack per pad of every channel is BUILT ON THE STACK before it
+        // moves into the struct, which is the overflow the field moved to
+        // the heap to avoid. `collect` never forms the array at all.
+        let racks: Vec<Rack> = (0..RACK_SEATS).map(|_| {
             let mut ends: Vec<Handoff> = Vec::with_capacity(INSERTS);
             let mut incoming = Vec::with_capacity(INSERTS);
             let mut retiring = Vec::with_capacity(INSERTS);
@@ -6731,10 +6809,11 @@ impl Engine {
                 incoming: std::array::from_fn(|_| inc.next().expect("one per insert")),
                 retiring: std::array::from_fn(|_| ret.next().expect("one per insert")),
             }
-        });
+        }).collect();
         let mut rack_ends = rack_ends.into_iter();
-        let insert_handoff: [[Handoff; INSERTS]; RACK_SEATS] =
-            std::array::from_fn(|_| rack_ends.next().expect("one set per channel"));
+        let insert_handoff: Vec<[Handoff; INSERTS]> = (0..RACK_SEATS)
+            .map(|_| rack_ends.next().expect("one set per channel"))
+            .collect();
         // The effect across the bus used to have a pair of its own here. It
         // does not any more: the bus is a channel like the others and its
         // effect is `insert_handoff[Strip::Fx.index()]`, so what was left was
@@ -6809,6 +6888,7 @@ impl Engine {
             lane_gain: [1.0; CHANNELS],
             seen_req: 0,
             was_rolling: false,
+            pad_racks_live: false,
             pending_flush: false,
             pending_wrap_from: None,
             clip_parked: false,
@@ -6974,7 +7054,7 @@ impl Engine {
             stem_rx,
             scope_rx,
             reastream_rx: Some(reastream_rx),
-            inserts_loaded: std::array::from_fn(|_| std::array::from_fn(|_| None)),
+            inserts_loaded: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
             tap: Some(RecorderTap {
                 rx: tap_rx,
                 channels: TAP_CHANNELS,
@@ -6982,11 +7062,11 @@ impl Engine {
                 dropped: shared,
             }),
             fault,
-            insert_editors: std::array::from_fn(|_| std::array::from_fn(|_| None)),
-            insert_editor_handles: std::array::from_fn(|_| std::array::from_fn(|_| None)),
-            insert_state_handles: std::array::from_fn(|_| std::array::from_fn(|_| None)),
-            insert_latency_handles: std::array::from_fn(|_| std::array::from_fn(|_| None)),
-            insert_state_errors: std::array::from_fn(|_| std::array::from_fn(|_| None)),
+            insert_editors: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
+            insert_editor_handles: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
+            insert_state_handles: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
+            insert_latency_handles: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
+            insert_state_errors: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
             hold: Cell::new((0.0, 0.0)),
             hold_at: Cell::new(Instant::now()),
         })
@@ -7301,7 +7381,12 @@ impl Engine {
             return Some(next);
         };
         while pair.from_audio.pop().is_ok() {}
+        // **Counted BEFORE the push**, or the callback could take the box
+        // between the push and the count and drain a counter that had not
+        // been raised yet. Put back below if the push is refused.
+        self.shared.pending_swaps.fetch_add(1, Ordering::Release);
         if let Err(rtrb::PushError::Full(refused)) = pair.to_audio.push(next) {
+            self.shared.pending_swaps.fetch_sub(1, Ordering::Release);
             // The seat's two-deep ring already holds two undelivered boxes,
             // which means the callback has stalled. Handing the box back is
             // what lets the caller refuse honestly.
@@ -10356,7 +10441,7 @@ mod tests {
         // shared rather than moved. cpal requires this of the closure it takes,
         // so it is checked here rather than discovered at the call site.
         assert_send::<Rack>();
-        assert_send::<[Rack; RACK_SEATS]>();
+        assert_send::<Vec<Rack>>();
         assert_send::<Renderer>();
     }
 
@@ -10499,7 +10584,11 @@ mod tests {
         let (_, hw_midi) = RingBuffer::<MidiEvent>::new(1024);
         // Empty racks: every test here is about the mixing, and an empty rack
         // is the path every channel takes until somebody loads something.
-        let racks: [Rack; RACK_SEATS] = std::array::from_fn(|_| {
+        // Collected into the `Vec` rather than an array: an array of a
+        // rack per pad of every channel is BUILT ON THE STACK before it
+        // moves into the struct, which is the overflow the field moved to
+        // the heap to avoid. `collect` never forms the array at all.
+        let racks: Vec<Rack> = (0..RACK_SEATS).map(|_| {
             let mut inc = Vec::new();
             let mut ret = Vec::new();
             for _ in 0..INSERTS {
@@ -10515,7 +10604,7 @@ mod tests {
                 incoming: std::array::from_fn(|_| inc.next().expect("one per insert")),
                 retiring: std::array::from_fn(|_| ret.next().expect("one per insert")),
             }
-        });
+        }).collect();
         Renderer {
             monitor: None,
             monitor_channels: 0,
@@ -10576,6 +10665,7 @@ mod tests {
             lane_gain: [1.0; CHANNELS],
             seen_req: 0,
             was_rolling: false,
+            pad_racks_live: false,
             pending_flush: false,
             pending_wrap_from: None,
             clip_parked: false,
@@ -12738,12 +12828,17 @@ mod tests {
     /// and did nothing; this pins that the whole seat map fits `RACK_SEATS`.
     #[test]
     fn pad_seats_are_loadable_rack_indices() {
-        for pad in [0, 1, PADS / 2, PADS - 1] {
-            let seat = pad_rack_index(pad);
-            assert!(
-                seat > STRIPS && seat < RACK_SEATS,
-                "pad {pad} seat {seat} is outside the loadable range 0..{RACK_SEATS}"
-            );
+        // Every CHANNEL's pads now, not just one block: a drum instrument
+        // loads a full instance per channel and each of them needs seats
+        // inside the loadable range.
+        for ch in [0usize, 1, CHANNELS / 2, CHANNELS - 1] {
+            for pad in [0, 1, PADS / 2, PADS - 1] {
+                let seat = pad_rack_index(ch, pad);
+                assert!(
+                    seat > STRIPS && seat < RACK_SEATS,
+                    "channel {ch} pad {pad} seat {seat} is outside 0..{RACK_SEATS}"
+                );
+            }
         }
     }
 
@@ -12757,12 +12852,12 @@ mod tests {
     fn a_pad_seat_reaches_the_editor_door() {
         let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
         assert!(
-            e.open_insert_editor(pad_rack_index(0), 0).is_err(),
+            e.open_insert_editor(pad_rack_index(0, 0), 0).is_err(),
             "pad 0's empty bay answered Ok — the guard is refusing pad seats \
              again, and a pad plugin's window can never open"
         );
         assert!(
-            e.open_insert_editor(pad_rack_index(PADS - 1), INSERTS - 1)
+            e.open_insert_editor(pad_rack_index(CHANNELS - 1, PADS - 1), INSERTS - 1)
                 .is_err(),
             "the last pad's last bay is inside the seat map too"
         );
@@ -14799,5 +14894,59 @@ mod tests {
         // tail and measures both.
         std::thread::sleep(Duration::from_millis(800));
         peak
+    }
+}
+
+#[cfg(test)]
+mod stack_budget {
+    use super::*;
+
+    /// **The regression this exists for cost a whole test binary.**
+    ///
+    /// Every one of these types is built BY VALUE and then moved — into an
+    /// `Arc`, into a callback, out of a constructor through a `Result`. A
+    /// debug build elides none of those moves, so each one memcpys the whole
+    /// thing through a fresh stack slot, and a test thread gets 2 MiB.
+    ///
+    /// When the drum racks went per channel, `RACK_SEATS` went from 149 to
+    /// 2069. Six fields were `[[T; INSERTS]; RACK_SEATS]`, so `Engine` became
+    /// 249 KB — and a test that opens two engines in one frame aborted the
+    /// entire binary with a stack overflow, taking three hundred unrelated
+    /// tests with it. The failure names whichever test happened to run
+    /// first, which is not the one at fault and not where anybody looks.
+    ///
+    /// So: anything indexed by seat lives on the heap. The ceilings below are
+    /// generous against today's sizes; they exist to fail HERE, by name, if a
+    /// per-seat array is ever declared inline again.
+    #[test]
+    fn nothing_indexed_by_a_seat_is_carried_on_the_stack() {
+        use std::mem::size_of;
+        // 2069 seats x 3 inserts: a single inline `Option<String>` per insert
+        // would be 149 KB on its own, so any one slip blows this by 30x.
+        assert!(
+            size_of::<Engine>() <= 8 * 1024,
+            "Engine is {} bytes: something per-seat went back inline",
+            size_of::<Engine>()
+        );
+        assert!(
+            size_of::<Renderer>() <= 64 * 1024,
+            "Renderer is {} bytes: something per-seat went back inline",
+            size_of::<Renderer>()
+        );
+        // `Shared` is reached through an `Arc` and holds the pad parameters
+        // for every channel, so it is allowed more room than the two above --
+        // but not seat-indexed room.
+        assert!(
+            size_of::<Shared>() <= 128 * 1024,
+            "Shared is {} bytes: something per-seat went back inline",
+            size_of::<Shared>()
+        );
+        // The seat count itself is the thing that turns a small array into a
+        // large one. If this ever shrinks back the ceilings above stop
+        // meaning anything, so say so.
+        assert!(
+            RACK_SEATS > 1000,
+            "RACK_SEATS fell to {RACK_SEATS}: re-tighten the ceilings here"
+        );
     }
 }

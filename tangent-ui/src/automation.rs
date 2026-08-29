@@ -282,27 +282,20 @@ impl Curve {
         //
         // Same shape as the point it copies, so the first segment leaves zero
         // exactly as it leaves the point it was derived from.
-        let mut me = Self { lane, param, points: kept };
-        me.ensure_zero();
-        me
-    }
-
-    /// Put a node at zero if the curve has points and none of them is there.
-    ///
-    /// **Called by every mutator, not just by `sanitised`.** Seeding only on
-    /// load meant the rule held for a curve read from a file and not for one
-    /// somebody had just drawn — which is the case that matters, because a
-    /// fresh curve is exactly the one whose beginning is unmarked.
-    ///
-    /// Inaudible: `value_at` is flat before the first point, so the seeded
-    /// node holds the value that stretch already had.
-    fn ensure_zero(&mut self) {
-        if let Some(first) = self.points.first() {
-            if first.at_s > 0.0 {
-                let seed = Point { at_s: 0.0, value: first.value, shape: first.shape };
-                self.points.insert(0, seed);
-            }
-        }
+        // **No seeded node at zero.** A curve begins with exactly the
+        // points somebody drew.
+        //
+        // Every mutator used to call an `ensure_zero` that inserted one at
+        // the start whenever the first point was later — so the very first
+        // alt-click on an empty lane produced TWO nodes, the one under the
+        // hand and a seed before it. The owner's "alt click to add a node
+        // adds that missing first one AND another one".
+        //
+        // Nothing needs the seed: `value_at` is flat before the first point,
+        // so a curve with one node at bar 40 already holds that value from
+        // the beginning of the song. The node was only ever a drawing of a
+        // rule the maths already followed.
+        Self { lane, param, points: kept }
     }
 
     pub fn points(&self) -> &[Point] {
@@ -371,7 +364,6 @@ impl Curve {
             Ok(i) => self.points[i] = p,
             Err(i) => self.points.insert(i, p),
         }
-        self.ensure_zero();
     }
 
     /// Take the point nearest `seconds` out, if one is within `reach`.
@@ -396,16 +388,13 @@ impl Curve {
         // exactly what NO curve already says — `value_at` answers None and the
         // control sits where it sits. So the last one goes too, and the lane
         // is genuinely clear.
+        //
+        // The seeding is gone entirely now (see `sanitised`), so this is the
+        // whole of the rule: a curve holds what was drawn on it, and an empty
+        // one is empty.
         if self.points.len() == 1 && self.points[0].at_s <= 0.0 {
             self.points.clear();
-            return true;
         }
-        // Otherwise the rule holds: taking the first point away would leave
-        // the curve beginning somewhere other than zero, so the next one
-        // seeds a node there. Deleting the node at zero therefore MOVES it,
-        // which is what "always begins at zero" has to mean after an edit as
-        // well as before one.
-        self.ensure_zero();
         true
     }
 }
@@ -540,31 +529,39 @@ mod tests {
         assert_eq!(c.value_at(20.0), Some(0.9));
     }
 
-    /// **A curve always begins with a node at zero**, whatever it was built
-    /// from — and adding it changes nothing anyone can hear.
+    /// **A curve holds exactly the nodes that were drawn on it.**
     ///
-    /// `value_at` was already flat before the first point, so the value from
-    /// zero up to it is identical either way. What the node adds is something
-    /// to SEE and something to grab: a lane whose curve started at bar 40
-    /// drew an unmarked flat stretch, which reads as "nothing here" rather
-    /// than "held at this value".
+    /// Every mutator used to seed a node at zero when the first point was
+    /// later, so the very first alt-click on an empty lane produced TWO
+    /// nodes — the one under the hand and a seed in front of it. The owner:
+    /// "the current bug is no nodes goes to 2 when adding the FIRST".
+    ///
+    /// Nothing is lost by dropping the seed: `value_at` is flat before the
+    /// first point, so a lane with one node at bar 40 already holds that
+    /// value from the beginning of the song. The seed drew a rule the maths
+    /// was following anyway, and charged a spurious node for it.
     #[test]
-    fn the_curve_always_begins_at_zero() {
-        // Built from a point well into the song.
+    fn a_curve_holds_only_the_nodes_that_were_drawn() {
+        // Built from a point well into the song: ONE point, not two.
         let c = Curve::sanitised(0, AutoParam::Gain, vec![pt(40.0, 0.75)]);
-        assert_eq!(c.points().len(), 2, "{:?}", c.points());
-        assert_eq!(c.points()[0].at_s, 0.0, "no node at the beginning");
-        assert_eq!(
-            c.points()[0].value,
-            0.75,
-            "the seeded node must hold the first point's value, or the sound changed"
-        );
-        assert_eq!(c.points()[0].shape, c.points()[1].shape, "the shape must carry");
-        // Inaudible: the value everywhere before the first real point is what
-        // it always was.
+        assert_eq!(c.points().len(), 1, "a node was seeded: {:?}", c.points());
+        // And it still reads as beginning at the beginning, which is what
+        // the seed was there to say.
         for t in [0.0, 1.0, 20.0, 39.9] {
-            assert_eq!(c.value_at(t), Some(0.75), "the curve changed at {t}");
+            assert_eq!(c.value_at(t), Some(0.75), "the curve is not flat at {t}");
         }
+
+        // The FIRST node put on an empty curve is one node.
+        let mut c = Curve::sanitised(0, AutoParam::Gain, Vec::new());
+        assert!(c.is_empty());
+        c.put(pt(40.0, 0.75));
+        assert_eq!(
+            c.points().len(),
+            1,
+            "the first alt-click made {} nodes: {:?}",
+            c.points().len(),
+            c.points()
+        );
 
         // A curve that already starts at zero is untouched.
         let c = Curve::sanitised(0, AutoParam::Gain, vec![pt(0.0, 0.1), pt(5.0, 0.9)]);
@@ -579,20 +576,22 @@ mod tests {
     /// Putting a point where one already is replaces it.
     #[test]
     fn a_point_dragged_onto_its_neighbour_does_not_leave_two() {
-        // Three, not two: `sanitised` seeds a node at zero, because a curve
-        // always begins with one. See `the_curve_always_begins_at_zero`.
+        // Two: nothing is seeded, so the curve holds what it was built
+        // from. See `a_curve_holds_only_the_nodes_that_were_drawn`.
         let mut c = Curve::sanitised(0, AutoParam::Gain, vec![pt(1.0, 0.2), pt(2.0, 0.8)]);
         c.put(pt(2.0, 0.3));
-        assert_eq!(c.points().len(), 3, "{:?}", c.points());
+        assert_eq!(c.points().len(), 2, "{:?}", c.points());
         assert_eq!(c.value_at(2.0), Some(0.3));
         // ...and a new instant inserts in order.
         c.put(pt(1.5, 0.5));
-        assert_eq!(c.points().len(), 4);
+        assert_eq!(c.points().len(), 3);
         assert!(c.points().windows(2).all(|w| w[0].at_s < w[1].at_s));
         // Removing takes the nearest within reach, and nothing outside it.
         assert!(!c.remove_near(9.0, 0.1), "something far away was removed");
         assert!(c.remove_near(1.55, 0.1));
-        assert_eq!(c.points().len(), 3);
+        // Three went in, one came out: two remain. It used to stay at three
+        // because removing re-seeded a node at zero.
+        assert_eq!(c.points().len(), 2, "{:?}", c.points());
     }
 
     /// An emptied curve is removed, not stored empty.
