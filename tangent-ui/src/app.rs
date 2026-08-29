@@ -14004,6 +14004,15 @@ impl IvoryApp {
                         }
                     }
                     Some(A::HdrName(n)) => {
+                        // **Only a track has a name to type into.** An empty
+                        // slot's row answers `HdrName` now — that is what
+                        // makes it selectable and a paste destination — so a
+                        // double click there would otherwise open a rename
+                        // box for a track that does not exist, and typing
+                        // into it would name nothing.
+                        if !self.channel_used(n) {
+                            return;
+                        }
                         let seed = self
                             .settings
                             .strip_names
