@@ -127,6 +127,89 @@ impl DrumpadDoc {
             .unwrap_or_default()
     }
 
+    /// **Every lane's kit from the one sidecar**, `lanes` of them.
+    ///
+    /// A drum instrument loads a full instance per channel, so a project
+    /// carries a kit per lane. The file keeps its ORIGINAL shape at the top
+    /// level — `pads` and `master`, the kit a pre-lanes build wrote and the
+    /// only thing such a build can read — and adds `lane_kits`, an object
+    /// keyed by channel number, for the rest.
+    ///
+    /// The legacy kit lands on the lane named by `lane_kits`' own
+    /// `primary`, or on lane 0 when there is none. That is what makes an old
+    /// project open sounding as it did: its single kit belongs to whichever
+    /// channel was carrying the drumpad, and the app writes that number down
+    /// the first time it saves.
+    pub fn load_all_beside(doc: &std::path::Path, lanes: usize) -> Vec<Self> {
+        let mut out: Vec<Self> = (0..lanes).map(|_| Self::default()).collect();
+        let Ok(text) = std::fs::read_to_string(Self::sidecar(doc)) else {
+            return out;
+        };
+        // The legacy kit, always — it is the whole file for a project
+        // written before this existed.
+        let legacy = Self::from_json(&text);
+        let map = serde_json::from_str::<Value>(&text).ok();
+        let obj = map.as_ref().and_then(Value::as_object);
+        let primary = obj
+            .and_then(|m| m.get("primary_lane"))
+            .and_then(Value::as_u64)
+            .map_or(0usize, |n| n as usize);
+        if primary < out.len() {
+            out[primary] = legacy;
+        }
+        // Then anything the newer key names, which overwrites the legacy
+        // placement when it speaks about the same lane.
+        if let Some(Value::Object(kits)) = obj.and_then(|m| m.get("lane_kits")) {
+            for (key, v) in kits {
+                let Ok(lane) = key.parse::<usize>() else {
+                    continue;
+                };
+                if lane >= out.len() {
+                    continue;
+                }
+                if let Ok(text) = serde_json::to_string(v) {
+                    out[lane] = Self::from_json(&text);
+                }
+            }
+        }
+        out
+    }
+
+    /// **Every lane's kit into the one sidecar.** See `load_all_beside` for
+    /// why the primary kit is also written at the top level.
+    pub fn save_all_beside(kits: &[Self], primary: usize, doc: &std::path::Path) {
+        let mut root = match kits.get(primary) {
+            Some(k) => serde_json::from_str::<Value>(&k.to_json())
+                .ok()
+                .and_then(|v| v.as_object().cloned())
+                .unwrap_or_default(),
+            None => serde_json::Map::new(),
+        };
+        root.insert("primary_lane".into(), Value::from(primary as u64));
+        let mut lane_kits = serde_json::Map::new();
+        for (lane, kit) in kits.iter().enumerate() {
+            // An empty kit is the absence of one; writing it would grow the
+            // file by a lane nobody has for no reading anybody does.
+            if kit.is_empty() {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<Value>(&kit.to_json()) {
+                lane_kits.insert(lane.to_string(), v);
+            }
+        }
+        root.insert("lane_kits".into(), Value::Object(lane_kits));
+
+        let path = Self::sidecar(doc);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let tmp = path.with_extension("json.tmp");
+        let text = serde_json::to_string_pretty(&Value::Object(root)).unwrap_or_default();
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
+
     pub fn save_beside(&self, doc: &std::path::Path) {
         let path = Self::sidecar(doc);
         if let Some(parent) = path.parent() {
@@ -247,6 +330,62 @@ impl DrumpadDoc {
 
 #[cfg(test)]
 mod tests {
+    /// **Every lane's kit round-trips, and an OLD project still opens right.**
+    ///
+    /// A drum instrument loads a full instance per channel, so the sidecar
+    /// carries a kit per lane. It must do that WITHOUT breaking a project
+    /// written before lanes existed: those files have one kit at the top
+    /// level, and it belongs to whichever channel was carrying the drumpad.
+    #[test]
+    fn every_lanes_kit_round_trips_and_a_pre_lanes_project_still_opens() {
+        let dir = std::env::temp_dir().join(format!(
+            "tangent-drumkits-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let doc = dir.join("project.tangent");
+
+        let kit = |name: &str| {
+            let mut k = DrumpadDoc::default();
+            k.pads[36].path = format!("media/{name}.wav");
+            k.pads[36].params.gain = 0.5;
+            k
+        };
+        let mut kits: Vec<DrumpadDoc> = (0..16).map(|_| DrumpadDoc::default()).collect();
+        kits[3] = kit("kick");
+        kits[7] = kit("snare");
+
+        DrumpadDoc::save_all_beside(&kits, 3, &doc);
+        let back = DrumpadDoc::load_all_beside(&doc, 16);
+        assert_eq!(back.len(), 16);
+        assert_eq!(back[3].pads[36].path, "media/kick.wav", "lane 3's kit");
+        assert_eq!(back[7].pads[36].path, "media/snare.wav", "lane 7's kit");
+        assert!(back[0].is_empty(), "a lane with no kit came back with one");
+        assert!((back[7].pads[36].params.gain - 0.5).abs() < 1e-6, "the knobs");
+
+        // **An OLD sidecar — one kit, no lane keys — lands on lane 0.**
+        // That is the only lane a pre-lanes build could have meant, and a
+        // project that opened silent because its kit went nowhere would be
+        // the worst possible way to ship this.
+        let legacy = kit("legacy");
+        std::fs::write(DrumpadDoc::sidecar(&doc), legacy.to_json()).expect("write legacy");
+        let back = DrumpadDoc::load_all_beside(&doc, 16);
+        assert_eq!(
+            back[0].pads[36].path, "media/legacy.wav",
+            "a pre-lanes kit did not survive the upgrade"
+        );
+
+        // And the top level still says what an old build would read, so a
+        // project saved here does not come up empty over there.
+        DrumpadDoc::save_all_beside(&kits, 3, &doc);
+        let old_reader = DrumpadDoc::load_beside(&doc);
+        assert_eq!(
+            old_reader.pads[36].path, "media/kick.wav",
+            "an older build would open this project with no kit at all"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     /// A newer build's kit is not flattened by a save from this one.

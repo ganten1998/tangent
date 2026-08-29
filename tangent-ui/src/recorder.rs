@@ -660,9 +660,41 @@ pub fn seat_bay(desk_index: usize, slot: usize) -> (usize, usize) {
     }
 }
 
-/// How long the whole insert space is: every strip, the master, every pad,
-/// and the master's second rack at the end.
-pub const INSERT_SPACE: usize = (MASTER_EXTRA_SEAT + 1) * INSERTS;
+/// **Where the pads of drum lanes past the FIRST block begin.**
+///
+/// A drum instrument loads a full instance per channel, so every channel
+/// that carries a drumpad needs its own hundred and twenty-eight pad racks.
+/// They are APPENDED, after everything that already had a seat — the note on
+/// `MASTER_EXTRA_SEAT` says why that is the safe direction: an appended seat
+/// changes no index anybody has already written down, and this array grows
+/// by appending.
+///
+/// Channel 0 keeps the ORIGINAL pad block at `STRIPS + 1`. That is what a
+/// project written before lanes existed used, and `Settings::from_json`
+/// moves it when such a project's drumpad turns out to be on another
+/// channel. See `pad_rack_index`.
+pub const EXTRA_PAD_SEATS: usize = MASTER_EXTRA_SEAT + 1;
+
+/// Every rack seat: strips, master, the first pad block, the master's extra,
+/// and a pad block for each channel after the first.
+pub const TOTAL_SEATS: usize = EXTRA_PAD_SEATS + (CHANNELS - 1) * DRUM_PADS;
+
+/// **Where channel `ch`'s pad `pad` keeps its bays.**
+///
+/// One function, because the alternative is every call site remembering
+/// that channel 0 is the odd one out — and a call site that forgets edits
+/// somebody else's plugin.
+pub const fn pad_rack_index(ch: usize, pad: usize) -> usize {
+    if ch == 0 {
+        STRIPS + 1 + pad
+    } else {
+        EXTRA_PAD_SEATS + (ch - 1) * DRUM_PADS + pad
+    }
+}
+
+/// How long the whole insert space is: every strip, the master, every pad of
+/// every channel, and the master's second rack.
+pub const INSERT_SPACE: usize = TOTAL_SEATS * INSERTS;
 
 // ── The drumpad ─────────────────────────────────────────────────────────────
 
@@ -2976,6 +3008,42 @@ pub fn disk_text(minutes: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// **Every pad of every channel gets its own seat, and no old seat moved.**
+    ///
+    /// A drum instrument loads a full instance per channel, so the pad racks
+    /// are per channel. The seats for channels past the first are APPENDED —
+    /// the direction `MASTER_EXTRA_SEAT`'s own note calls safe — because an
+    /// index that shifts is a project whose plugins move to somebody else's
+    /// pad.
+    #[test]
+    fn every_channels_pads_have_their_own_seats_and_nothing_moved() {
+        use super::{pad_rack_index, CHANNELS, DRUM_PADS, MASTER_EXTRA_SEAT, STRIPS, TOTAL_SEATS};
+        // Channel 0 keeps the ORIGINAL block. This is the assertion that
+        // stops a saved session's pad plugins from moving.
+        for pad in [0usize, 36, 127] {
+            assert_eq!(pad_rack_index(0, pad), STRIPS + 1 + pad);
+        }
+        // And the master's extra rack is where it always was.
+        assert_eq!(MASTER_EXTRA_SEAT, STRIPS + 1 + DRUM_PADS);
+
+        // No two (channel, pad) pairs share a seat, and none collides with a
+        // strip, the master or the master's extra.
+        let mut seen = std::collections::HashSet::new();
+        for ch in 0..CHANNELS {
+            for pad in 0..DRUM_PADS {
+                let seat = pad_rack_index(ch, pad);
+                assert!(seat < TOTAL_SEATS, "ch {ch} pad {pad} is past the map");
+                assert!(
+                    seat > STRIPS || seat == STRIPS + 1,
+                    "ch {ch} pad {pad} landed on a strip's seat"
+                );
+                assert_ne!(seat, MASTER_EXTRA_SEAT, "ch {ch} pad {pad} took the master's");
+                assert!(seen.insert(seat), "ch {ch} pad {pad} shares seat {seat}");
+            }
+        }
+        assert_eq!(seen.len(), CHANNELS * DRUM_PADS);
+    }
+
     /// **The panel reports what is RUNNING, not what was asked for.**
     ///
     /// A device's buffer size belongs to the device, not to the client: on

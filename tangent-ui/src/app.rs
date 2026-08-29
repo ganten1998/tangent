@@ -379,6 +379,14 @@ pub struct IvoryApp {
     arr_auto_params: std::collections::HashMap<usize, crate::automation::AutoParam>,
     /// The point under the pointer or being dragged: `(lane, index)`.
     arr_auto_hot: Option<(usize, usize)>,
+    /// **The automation row the keyboard is aimed at**, `(lane, slot)`.
+    ///
+    /// A row can be closed by its × or by Delete, and Delete needs to know
+    /// WHICH — so pressing a row's name chooses it, exactly as pressing a
+    /// clip chooses that. Cleared whenever a clip or a track is chosen
+    /// instead, because two things claiming the Delete key is a Delete key
+    /// nobody can predict.
+    arr_auto_sel: Option<(usize, usize)>,
     /// The tempo point under the pointer, if any. Drawn a size larger.
     arr_tempo_hot: Option<usize>,
     /// The tempo point being dragged, if any.
@@ -644,7 +652,17 @@ pub struct IvoryApp {
     /// Where its strip drag left it. `None` centres it.
     drumpad_pos: Option<Pos2>,
     /// The kit document: paths and knobs, saved beside the arrangement.
-    drumpad: crate::drumpad::DrumpadDoc,
+    /// **One kit per channel.** A drum instrument loads a full instance per
+    /// channel, so the kits are per lane and the panel edits ONE of them —
+    /// see `drumpad_lane` and the `drumpad()` pair, which are the only way
+    /// this is reached. A `Vec` indexed by channel; lanes with no drumpad
+    /// hold the empty kit and cost nothing.
+    drumpad_kits: Vec<crate::drumpad::DrumpadDoc>,
+    /// Which lane's kit the drumpad window is showing and editing.
+    ///
+    /// Not a second copy of anything: the kits live in `drumpad_kits` and
+    /// this only says which one has the panel's attention.
+    drumpad_lane: usize,
     /// The pad the inspector describes.
     drumpad_sel: usize,
     /// The pad the mouse is holding down — the release owes a `PadHit off`.
@@ -1928,7 +1946,10 @@ impl IvoryApp {
             drumpad_open: false,
             drumpad_rect: None,
             drumpad_pos: None,
-            drumpad: crate::drumpad::DrumpadDoc::default(),
+            drumpad_kits: (0..crate::recorder::CHANNELS)
+                .map(|_| crate::drumpad::DrumpadDoc::default())
+                .collect(),
+            drumpad_lane: 0,
             drumpad_sel: 36,
             drumpad_down: None,
             drumpad_grab: None,
@@ -2059,6 +2080,7 @@ impl IvoryApp {
             fx_params: std::collections::HashMap::new(),
             arr_auto_params: std::collections::HashMap::new(),
             arr_auto_hot: None,
+            arr_auto_sel: None,
             arr_tempo_hot: None,
             arr_tempo_drag: None,
             arr_tempo_drag_from: None,
@@ -3983,7 +4005,7 @@ impl IvoryApp {
             ("media/Ride Bell.wav", 0.85, 0.5, 0.0, 0),
         ];
         for (i, (path, gain, pan, tune, choke)) in kit.into_iter().enumerate() {
-            self.drumpad.pads[i] = crate::drumpad::PadSlot {
+            self.drumpad_mut().pads[i] = crate::drumpad::PadSlot {
                 path: path.to_owned(),
                 name: String::new(),
                 params: recorder::DrumPadParams {
@@ -4013,7 +4035,7 @@ impl IvoryApp {
             };
         }
         // The pad whose file a tidy-up moved: the red dress.
-        self.drumpad.pads[11] = crate::drumpad::PadSlot {
+        self.drumpad_mut().pads[11] = crate::drumpad::PadSlot {
             path: "media/Cowbell.wav".to_owned(),
             name: String::new(),
             params: recorder::DrumPadParams::default(),
@@ -7727,7 +7749,11 @@ impl IvoryApp {
         self.save_settings();
         // The kit's sidecar is part of the project and copies with it — its
         // samples already came along inside `media/`.
-        self.drumpad.save_beside(&doc);
+        crate::drumpad::DrumpadDoc::save_all_beside(
+            &self.drumpad_kits,
+            self.drumpad_lane,
+            &doc,
+        );
         // The engine's schedule is unchanged — same clips, new home — but
         // the paths the host resolves against moved with the document.
         self.clips_dirty = true;
@@ -8543,6 +8569,15 @@ impl IvoryApp {
     /// the hand already is. The CURVE is untouched — closing a row is about
     /// what is on screen, and a lane that deleted its automation because
     /// somebody tidied the view would be unforgivable.
+    /// Aim the keyboard at one automation row. See `arr_auto_sel`.
+    fn arr_select_auto_row(&mut self, lane: usize, slot: usize) {
+        self.arr_auto_sel = Some((lane, slot));
+        // One subject at a time: a Delete that might mean a clip OR a curve
+        // is a Delete nobody presses twice.
+        self.arr_selected = None;
+        self.arr_multi.clear();
+    }
+
     fn arr_close_auto_row(&mut self, lane: usize, slot: usize) {
         if let Some(param) = self.arr_auto_param_at(lane, slot) {
             self.arr_auto_open.remove(&(lane, param));
@@ -9892,6 +9927,13 @@ impl IvoryApp {
     }
 
     fn arr_delete_selected(&mut self) {
+        // **A chosen automation row goes first.** It is the only thing
+        // selected when it is selected — see `arr_select_auto_row` — so this
+        // can never take a clip somebody meant to keep.
+        if let Some((lane, slot)) = self.arr_auto_sel.take() {
+            self.arr_close_auto_row(lane, slot);
+            return;
+        }
         let mut doomed = std::mem::take(&mut self.arr_multi);
         if let Some(id) = self.arr_selected.take() {
             if !doomed.contains(&id) {
@@ -11227,7 +11269,7 @@ impl IvoryApp {
                     params: recorder::DrumPadParams::default(),
                 };
             }
-            let slot = &self.drumpad.pads[key];
+            let slot = &self.drumpad().pads[key];
             let status = &self.drumpad_status[key];
             crate::drumpad_panel::PadView {
                 label: if slot.name.is_empty() {
@@ -11261,7 +11303,7 @@ impl IvoryApp {
             loaded_keys: {
                 // One bit per loaded key, for the bank strip's occupancy.
                 let mut bits = 0u128;
-                for (k, p) in self.drumpad.pads.iter().enumerate() {
+                for (k, p) in self.drumpad().pads.iter().enumerate() {
                     if k < 128 && !p.path.is_empty() {
                         bits |= 1u128 << k;
                     }
@@ -11413,10 +11455,25 @@ impl IvoryApp {
     /// wherever the arrangement itself loads, so the two can never describe
     /// different projects.
     fn load_drumpad_doc(&mut self) {
-        self.drumpad = match self.project_doc() {
-            Some(doc) => crate::drumpad::DrumpadDoc::load_beside(doc),
-            None => crate::drumpad::DrumpadDoc::default(),
+        // **Every lane's kit, from the one sidecar.** See
+        // `DrumpadDoc::load_all_beside`: the file's top-level `pads` is the
+        // kit a pre-lanes project wrote, and it lands on whichever channel
+        // holds the drumpad so those projects open sounding as they did.
+        self.drumpad_kits = match self.project_doc() {
+            Some(doc) => crate::drumpad::DrumpadDoc::load_all_beside(doc, crate::recorder::CHANNELS),
+            None => (0..crate::recorder::CHANNELS)
+                .map(|_| crate::drumpad::DrumpadDoc::default())
+                .collect(),
         };
+        // The panel opens on the first lane that has one, so a project with
+        // its kit on channel 7 does not show channel 0's empty pads.
+        self.drumpad_lane = (0..crate::recorder::CHANNELS)
+            .find(|ch| {
+                self.drumpad_kits
+                    .get(*ch)
+                    .is_some_and(|k| !k.is_empty())
+            })
+            .unwrap_or(0);
         self.drumpad_status = std::array::from_fn(|_| crate::ports::PadStatus::default());
         // The classic kit's C1, not key 0 — no page even shows key 0 (the
         // pages anchor at 4), so a selection there was invisible.
@@ -11443,11 +11500,15 @@ impl IvoryApp {
                     .unwrap_or_default()
             ));
         };
-        self.drumpad.pads[pad].path = rel;
-        self.drumpad.pads[pad].name.clear();
+        self.drumpad_mut().pads[pad].path = rel;
+        self.drumpad_mut().pads[pad].name.clear();
         self.drumpad_status[pad] = crate::ports::PadStatus::default();
         self.drumpad_sel = pad;
-        self.drumpad.save_beside(&doc);
+        crate::drumpad::DrumpadDoc::save_all_beside(
+            &self.drumpad_kits,
+            self.drumpad_lane,
+            &doc,
+        );
         self.drumpad_dirty = true;
         Ok(())
     }
@@ -11456,10 +11517,10 @@ impl IvoryApp {
     /// must never delete something a clip may also be standing on.
     fn drumpad_clear_selected(&mut self) {
         let pad = self.drumpad_sel.min(recorder::DRUM_PADS - 1);
-        if self.drumpad.pads[pad].path.is_empty() {
+        if self.drumpad().pads[pad].path.is_empty() {
             return;
         }
-        self.drumpad.pads[pad] = crate::drumpad::PadSlot::default();
+        self.drumpad_mut().pads[pad] = crate::drumpad::PadSlot::default();
         self.drumpad_status[pad] = crate::ports::PadStatus::default();
         self.drumpad_save();
         self.drumpad_dirty = true;
@@ -11467,14 +11528,18 @@ impl IvoryApp {
 
     fn drumpad_save(&mut self) {
         if let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) {
-            self.drumpad.save_beside(&doc);
+            crate::drumpad::DrumpadDoc::save_all_beside(
+            &self.drumpad_kits,
+            self.drumpad_lane,
+            &doc,
+        );
         }
     }
 
     /// One knob's current value, in its own units.
     fn drumpad_get(&self, p: crate::drumpad_panel::Param) -> f32 {
         use crate::drumpad_panel::Param as P;
-        let sel = &self.drumpad.pads[self.drumpad_sel.min(recorder::DRUM_PADS - 1)].params;
+        let sel = &self.drumpad().pads[self.drumpad_sel.min(recorder::DRUM_PADS - 1)].params;
         match p {
             P::Gain => sel.gain,
             P::Pan => sel.pan,
@@ -11484,16 +11549,12 @@ impl IvoryApp {
 
     /// A pad's short name: the sample's file stem, or nothing.
     fn pad_label(&self, pad: usize) -> &str {
-        if let Some(slot) = self.drumpad.pads.get(pad) {
+        if let Some(slot) = self.drumpad().pads.get(pad) {
             if !slot.name.is_empty() {
                 return slot.name.as_str();
             }
         }
-        let path = self
-            .drumpad
-            .pads
-            .get(pad)
-            .map_or("", |p| p.path.as_str());
+        let path = self.drumpad().pads.get(pad).map_or("", |p| p.path.as_str());
         let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
         name.rfind('.').map_or(name, |dot| &name[..dot])
     }
@@ -11507,9 +11568,9 @@ impl IvoryApp {
         let v = if v.is_finite() { v.clamp(lo, hi) } else { p.default_value() };
         let sel = self.drumpad_sel.min(recorder::DRUM_PADS - 1);
         match p {
-            P::Gain => self.drumpad.pads[sel].params.gain = v,
-            P::Pan => self.drumpad.pads[sel].params.pan = v,
-            P::Tune => self.drumpad.pads[sel].params.tune = v,
+            P::Gain => self.drumpad_mut().pads[sel].params.gain = v,
+            P::Pan => self.drumpad_mut().pads[sel].params.pan = v,
+            P::Tune => self.drumpad_mut().pads[sel].params.tune = v,
         }
     }
 
@@ -11759,7 +11820,7 @@ impl IvoryApp {
                 }
                 if commit || cancel {
                     if commit {
-                        self.drumpad.pads[pad].name = buf.trim().to_owned();
+                        self.drumpad_mut().pads[pad].name = buf.trim().to_owned();
                         self.drumpad_save();
                     }
                     self.pad_name_typing = None;
@@ -11776,7 +11837,7 @@ impl IvoryApp {
                     if let Some(p) = pointer {
                         let f = ((p.x - wave.left()) / wave.width().max(1.0))
                             .clamp(0.0, 1.0);
-                        let params = &mut self.drumpad.pads[pad].params;
+                        let params = &mut self.drumpad_mut().pads[pad].params;
                         if end {
                             params.trim_end = f.max(params.trim_start + 0.02);
                         } else {
@@ -11804,14 +11865,14 @@ impl IvoryApp {
                 }
                 if wave.contains(p) {
                     // The nearer handle takes the hand.
-                    let params = &self.drumpad.pads[pad].params;
+                    let params = &self.drumpad().pads[pad].params;
                     let x0 = wave.left() + wave.width() * params.trim_start;
                     let x1 = wave.left() + wave.width() * params.trim_end;
                     self.pad_trim_drag = Some((p.x - x1).abs() < (p.x - x0).abs());
                     return;
                 }
                 if pad_menu_obey(menu).contains(p) {
-                    let params = &mut self.drumpad.pads[pad].params;
+                    let params = &mut self.drumpad_mut().pads[pad].params;
                     params.obey = !params.obey;
                     self.drumpad_save();
                     return;
@@ -11905,7 +11966,7 @@ impl IvoryApp {
                     {
                         // The whole slot rides: path AND knobs, and the
                         // two pads trade places — nothing is lost either way.
-                        self.drumpad.pads.swap(from, to);
+                        self.drumpad_mut().pads.swap(from, to);
                         self.drumpad_status.swap(from, to);
                         self.drumpad_peaks.swap(from, to);
                         self.drumpad_sel = to;
@@ -11975,7 +12036,7 @@ impl IvoryApp {
                     let Some(i) = self.drumpad_key_of(slot) else {
                         return;
                     };
-                    if !self.drumpad.pads[i].path.is_empty() {
+                    if !self.drumpad().pads[i].path.is_empty() {
                         self.drumpad_sel = i;
                         self.pad_menu = Some(i);
                         // The strike and the carry a held press left in
@@ -12062,7 +12123,7 @@ impl IvoryApp {
                 // empty pad only selects — there is nothing to sound. The
                 // press also ARMS the carry: really moving the hand drags
                 // the clip to another pad.
-                if !self.drumpad.pads[i].path.is_empty() {
+                if !self.drumpad().pads[i].path.is_empty() {
                     self.drumpad_down = Some(i);
                     self.pad_carry = Some((i, p, false));
                     self.request_recorder(recorder::RecorderRequest::PadHit {
@@ -12093,7 +12154,7 @@ impl IvoryApp {
             }
             Some(H::Choke) => {
                 let sel = self.drumpad_sel.min(recorder::DRUM_PADS - 1);
-                let g = &mut self.drumpad.pads[sel].params.choke;
+                let g = &mut self.drumpad_mut().pads[sel].params.choke;
                 *g = (*g + 1) % (crate::drumpad_panel::CHOKE_GROUPS + 1);
                 self.drumpad_save();
             }
@@ -12114,9 +12175,66 @@ impl IvoryApp {
 
     /// Every pad's file, resolved against the open project. `None` for an
     /// empty pad.
+    /// **The kit the panel is editing.** Every reader goes through here, so
+    /// there is one place that decides which lane that is.
+    fn drumpad(&self) -> &crate::drumpad::DrumpadDoc {
+        self.drumpad_kits
+            .get(self.drumpad_lane)
+            .unwrap_or(&self.drumpad_kits[0])
+    }
+
+    fn drumpad_mut(&mut self) -> &mut crate::drumpad::DrumpadDoc {
+        let lane = self.drumpad_lane.min(self.drumpad_kits.len().saturating_sub(1));
+        &mut self.drumpad_kits[lane]
+    }
+
+    /// **Which lane's kit the drumpad window shows.** Set when the window is
+    /// opened from a lane, and clamped to a channel that exists.
+    pub fn set_drumpad_lane(&mut self, lane: usize) {
+        if lane < self.drumpad_kits.len() {
+            self.drumpad_lane = lane;
+        }
+    }
+
+    pub fn drumpad_lane(&self) -> usize {
+        self.drumpad_lane
+    }
+
+    /// Every lane's kit, for the host's push. Empty kits included, because
+    /// a lane that LOST its drumpad has to be told so.
+    pub fn drumpad_kit_of(&self, lane: usize) -> Option<&crate::drumpad::DrumpadDoc> {
+        self.drumpad_kits.get(lane)
+    }
+
+    /// **One LANE's sample paths**, for the host to decode into its kit.
+    /// Every drum lane is asked separately, because each has its own kit.
+    pub fn drumpad_paths_of(
+        &self,
+        lane: usize,
+    ) -> [Option<std::path::PathBuf>; recorder::DRUM_PADS] {
+        let Some(kit) = self.drumpad_kits.get(lane) else {
+            return std::array::from_fn(|_| None);
+        };
+        std::array::from_fn(|i| {
+            let slot = &kit.pads[i];
+            if slot.path.is_empty() {
+                return None;
+            }
+            self.project_doc()
+                .map(|doc| crate::drumpad::resolve(doc, &slot.path))
+        })
+    }
+
+    /// One lane's knobs, for the engine's push.
+    pub fn drum_kit_params_of(&self, lane: usize) -> recorder::DrumKitParams {
+        self.drumpad_kits
+            .get(lane)
+            .map_or_else(recorder::DrumKitParams::default, crate::drumpad::DrumpadDoc::params)
+    }
+
     pub fn drumpad_paths(&self) -> [Option<std::path::PathBuf>; recorder::DRUM_PADS] {
         std::array::from_fn(|i| {
-            let slot = &self.drumpad.pads[i];
+            let slot = &self.drumpad().pads[i];
             if slot.path.is_empty() {
                 return None;
             }
@@ -12127,7 +12245,7 @@ impl IvoryApp {
 
     /// The kit's knobs, whole, for the engine's every-frame push.
     pub fn drum_kit_params(&self) -> recorder::DrumKitParams {
-        self.drumpad.params()
+        self.drumpad().params()
     }
 
     /// Whether live MIDI notes in the pads' range should mirror onto the
@@ -12388,7 +12506,7 @@ impl IvoryApp {
             }
         }
         // The trim: the kept span bright, the cut ends veiled, two handles.
-        let params = &self.drumpad.pads[pad].params;
+        let params = &self.drumpad().pads[pad].params;
         let x0 = wave.left() + wave.width() * params.trim_start;
         let x1 = wave.left() + wave.width() * params.trim_end;
         for (a, b) in [(wave.left(), x0), (x1, wave.right())] {
@@ -13448,6 +13566,11 @@ impl IvoryApp {
     /// headers is left alone: that is a different gesture about the same
     /// objects, and syncing on every frame would undo it.
     fn arr_sync_tracks_to_clips(&mut self) {
+        // A clip selection releases the automation row: one subject for the
+        // Delete key. See `arr_select_auto_row`.
+        if self.arr_selected.is_some() || !self.arr_multi.is_empty() {
+            self.arr_auto_sel = None;
+        }
         let now = (self.arr_selected, self.arr_multi.clone());
         if now == self.arr_sel_seen {
             return;
@@ -13478,6 +13601,7 @@ impl IvoryApp {
     }
 
     fn select_track(&mut self, n: usize, mods: egui::Modifiers) {
+        self.arr_auto_sel = None;
         if mods.shift {
             // **From the ANCHOR, not from the primary.** Shift-clicking around
             // has to keep measuring from the same fixed end, or the range
@@ -14113,7 +14237,11 @@ impl IvoryApp {
                     // A press on the row's own header opens the same menu
                     // the A button does, with this row's box already ticked —
                     // which is how you take a row away again.
-                    Some(A::AutoParamPick(n, _)) => self.arr_open_automation_menu(n),
+                    // **The row's name CHOOSES it**, so Delete has a subject.
+                    // It used to open the automation menu — which the A
+                    // button on the track's own header already does, so the
+                    // menu keeps its door and the row gains one.
+                    Some(A::AutoParamPick(n, slot)) => self.arr_select_auto_row(n, slot),
                     Some(A::Phase(n)) => {
                         self.touch_track(n);
                         self.apply_mixer_hit(M::Phase(Column(n)), 0.0);
@@ -15289,9 +15417,11 @@ impl IvoryApp {
                     automation: self
                         .arr_auto_rows(n)
                         .into_iter()
-                        .map(|param| crate::arrangement_panel::AutoView {
+                        .enumerate()
+                        .map(|(slot, param)| crate::arrangement_panel::AutoView {
                             param,
                             label: self.auto_param_label(n, param),
+                            selected: self.arr_auto_sel == Some((n, slot)),
                             resting: self.auto_resting(n, param),
                             armed: self.arr_auto_armed.contains(&(n, param)),
                             bypassed: self.arr_auto_bypassed.contains(&(n, param)),
@@ -16228,6 +16358,17 @@ impl IvoryApp {
     /// dev hook that took a different path would exercise a path no user has.
     /// Raise the drumpad window — the key, the bay's face and a fresh
     /// load all come through here so the media list is never stale.
+    /// **The window follows the LANE it was opened from.**
+    ///
+    /// A drum instrument loads a full instance per channel, so there is a kit
+    /// per lane and the window shows one of them. Which one is not a new
+    /// question to answer with a new control: both doors into this window are
+    /// a bay on a particular strip, and the kit you meant is that strip's.
+    fn open_drumpad_for(&mut self, strip: usize) {
+        self.set_drumpad_lane(strip);
+        self.open_drumpad();
+    }
+
     fn open_drumpad(&mut self) {
         self.drumpad_open = true;
         // A remembered default folder is where a fresh open LANDS.
@@ -16260,7 +16401,7 @@ impl IvoryApp {
             Some(dialogs::BUILTIN_PATH) => self.open_patch_picker(strip),
             // The drumpad's face is the drumpad: pads, kit and browser in
             // one window, same as its key opens.
-            Some(dialogs::DRUMPAD_PATH) => self.open_drumpad(),
+            Some(dialogs::DRUMPAD_PATH) => self.open_drumpad_for(strip),
             Some(_) => {
                 self.request_recorder(recorder::RecorderRequest::OpenInsertEditor(strip, bay));
             }
@@ -16808,7 +16949,7 @@ impl IvoryApp {
                 self.touch_track(n);
                 self.open_insert_face(n, bay);
             }
-            A::AutoParamPick(n, _) => self.arr_open_automation_menu(n),
+            A::AutoParamPick(n, slot) => self.arr_select_auto_row(n, slot),
             A::Phase(n) => self.apply_mixer_hit(M::Phase(Column(n)), 0.0),
             A::AutoClose(n, slot) => self.arr_close_auto_row(n, slot),
             A::AutoArm(n, slot) => self.arr_toggle_auto_arm(n, slot),
@@ -18474,7 +18615,22 @@ impl IvoryApp {
                 if self.drumpad_open {
                     self.close_drumpad();
                 } else {
-                    self.open_drumpad();
+                    // **The key has no bay to come from**, so it opens the
+                    // kit of the SELECTED track when that track has one, and
+                    // otherwise the first lane carrying a drumpad. Keeping
+                    // whatever lane was last shown would mean the key and the
+                    // bay disagreed about which kit you were looking at.
+                    let want = self
+                        .selected_channel
+                        .filter(|ch| self.insert(*ch, 0) == Some(dialogs::DRUMPAD_PATH))
+                        .or_else(|| {
+                            (0..crate::recorder::CHANNELS)
+                                .find(|ch| self.insert(*ch, 0) == Some(dialogs::DRUMPAD_PATH))
+                        });
+                    match want {
+                        Some(ch) => self.open_drumpad_for(ch),
+                        None => self.open_drumpad(),
+                    }
                 }
             }
             K::TransposeUp => self.transpose_by(1),
@@ -19753,7 +19909,7 @@ impl IvoryApp {
                     // the moment the load lands. See `take_open_insert_on_load`.
                     match path.as_deref() {
                         Some(dialogs::BUILTIN_PATH) => self.open_patch_picker(strip),
-                        Some(dialogs::DRUMPAD_PATH) => self.open_drumpad(),
+                        Some(dialogs::DRUMPAD_PATH) => self.open_drumpad_for(strip),
                         Some(_) => self.open_insert_on_load = Some((strip, at)),
                         None => {}
                     }
@@ -27614,42 +27770,41 @@ mod tests {
         let (_ctx, mut app) = headless(Caps::DESKTOP);
         app.settings.arr_snap = false; // the magnet is its own test
 
-        // A point where there was none — plus the node at zero every curve
-        // carries, which holds the same value and so changes nothing audible.
+        // **A point where there was none, and exactly one of them.** The
+        // first alt-click used to make TWO — the one under the hand and a
+        // node seeded at zero in front of it. See
+        // `a_curve_holds_only_the_nodes_that_were_drawn`.
         let i = app.arr_put_auto_point(0, crate::automation::AutoParam::Gain, 4.0, 0.75).expect("no point landed");
         let c = app
             .arrangement
             .automation
             .get(0, AutoParam::Gain)
             .expect("no curve");
-        assert_eq!(c.points().len(), 2, "{:?}", c.points());
-        assert_eq!(c.points()[0].at_s, 0.0, "no node at the beginning");
+        assert_eq!(c.points().len(), 1, "the first node made {:?}", c.points());
         assert!((c.points()[i].at_s - 4.0).abs() < 1e-9);
         assert!((c.points()[i].value - 0.75).abs() < 1e-9);
 
-        // Moving it leaves ONE drawn point, not a trail — the zero node stays.
+        // Moving it leaves ONE point, not a trail.
         app.arr_drag_auto_point(0, crate::automation::AutoParam::Gain, i, 9.0, 0.25);
         let c = app.arrangement.automation.get(0, AutoParam::Gain).expect("no curve");
-        assert_eq!(c.points().len(), 2, "the drag left a trail: {:?}", c.points());
-        assert!((c.points()[1].at_s - 9.0).abs() < 1e-9);
-        assert!((c.points()[1].value - 0.25).abs() < 1e-9);
+        assert_eq!(c.points().len(), 1, "the drag left a trail: {:?}", c.points());
+        assert!((c.points()[0].at_s - 9.0).abs() < 1e-9);
+        assert!((c.points()[0].value - 0.25).abs() < 1e-9);
 
         // A second point, and moving the first PAST it keeps both and
         // re-sorts — the case a carried index would get wrong.
         app.arr_put_auto_point(0, crate::automation::AutoParam::Gain, 12.0, 0.5);
-        app.arr_drag_auto_point(0, crate::automation::AutoParam::Gain, 1, 20.0, 0.1);
+        app.arr_drag_auto_point(0, crate::automation::AutoParam::Gain, 0, 20.0, 0.1);
         let c = app.arrangement.automation.get(0, AutoParam::Gain).expect("no curve");
-        assert_eq!(c.points().len(), 3, "{:?}", c.points());
+        assert_eq!(c.points().len(), 2, "{:?}", c.points());
         assert!(
             c.points().windows(2).all(|w| w[0].at_s < w[1].at_s),
             "the curve is out of order: {:?}",
             c.points()
         );
 
-        // Undrawing the DRAWN points takes the curve out of the document
-        // entirely. The seeded node at zero goes with the last of them rather
-        // than needing its own removal: a lone point at zero says only "hold
-        // this value", which is what no curve at all already says.
+        // Undrawing every point takes the curve out of the document
+        // entirely — an emptied curve is removed, not stored empty.
         app.arr_remove_auto_point(0, crate::automation::AutoParam::Gain, 20.0);
         app.arr_remove_auto_point(0, crate::automation::AutoParam::Gain, 12.0);
         assert!(
@@ -27903,10 +28058,11 @@ mod tests {
         assert_eq!(points(&app), 0, "an armed lane wrote while stopped");
 
         // Both. Now it writes, at the PLAYHEAD rather than wherever the
-        // pointer was — plus the node at zero every curve carries.
+        // pointer was — ONE point, because nothing is seeded at zero any
+        // more. See `a_curve_holds_only_the_nodes_that_were_drawn`.
         app.recorder.playing = true;
         app.auto_set_control(0, AutoParam::Gain, 0.4);
-        assert_eq!(points(&app), 2, "an armed, rolling move wrote nothing");
+        assert_eq!(points(&app), 1, "an armed, rolling move wrote nothing");
         let c = app.arrangement.automation.get(0, AutoParam::Gain).expect("a curve");
         assert!(
             c.points().iter().any(|p| (p.at_s - 8.0).abs() < 1e-9),
@@ -31693,19 +31849,29 @@ mod tests {
 
     /// A dragged window ZOOMS the layout; it never stretches it.
     ///
-    /// The whole reason a resizable window is safe here: every band's height
-    /// is a fixed fraction of the width, so the stack has one aspect and
-    /// `fit_bands` keeps it at every size. A window twice as tall as the
-    /// layout wants gives a layout the same shape, centred, not a keyboard
-    /// twice as tall as it should be.
+    /// The property, stated exactly: **the layout's shape is a function of
+    /// its WIDTH and nothing else.** Drag the bottom edge and the bands are
+    /// the same shape, centred, in a taller frame — never a keyboard twice as
+    /// tall as it should be.
+    ///
+    /// This used to be written as "one constant aspect at every size", which
+    /// was the same statement while every band's height was a flat fraction
+    /// of the width. It is not any more: the recorder's height is damped
+    /// above [`recorder_panel::BAND_DAMP_FROM`] so a maximised window does
+    /// not get a band half again as tall as it needs (see `band_height`), and
+    /// a wide layout is therefore a genuinely SHORTER shape than a narrow
+    /// one. That is the intent, so the test asserts the property that
+    /// survives it rather than the coincidence that did not.
+    ///
+    /// Both halves still matter, so both are here: the shape follows the
+    /// width at every pane, AND the aspect really is constant across the
+    /// range of widths where nothing is damped.
     #[test]
     fn dragging_the_window_zooms_the_layout_and_never_stretches_it() {
         let settings = Settings { show_recorder: true, show_welcome: false, ..Settings::default() };
-        let natural = fit_bands(&settings, Vec2::new(1300.0, 10_000.0));
-        let aspect = natural.total().y / natural.total().x;
         for pane in [
             Vec2::new(1300.0, 900.0),  // much taller than natural
-            Vec2::new(2600.0, 700.0),  // much wider
+            Vec2::new(2600.0, 700.0),  // much wider, and past the damping
             Vec2::new(700.0, 700.0),   // square
             crate::settings::MIN_WINDOW,
         ] {
@@ -31715,9 +31881,27 @@ mod tests {
                 got.x <= pane.x + 0.5 && got.y <= pane.y + 0.5,
                 "the layout {got:?} does not fit the pane {pane:?}"
             );
+            // The same width in a pane of unbounded height: if the window's
+            // height had stretched anything, these two would differ.
+            let unbounded = fit_bands(&settings, Vec2::new(got.x, 100_000.0)).total();
+            assert!(
+                (got.y - unbounded.y).abs() < 0.5,
+                "the pane's HEIGHT changed the shape at {pane:?}: {:.2} tall \
+                 against {:.2} for the same width with room to spare",
+                got.y,
+                unbounded.y
+            );
+        }
+        // And below the damping the aspect is flatly constant, which is the
+        // original claim over the range where it is still true. 1600 is
+        // `BAND_DAMP_FROM`; every window anybody works in is under it.
+        let natural = fit_bands(&settings, Vec2::new(1300.0, 10_000.0)).total();
+        let aspect = natural.y / natural.x;
+        for w in [700.0, 900.0, 1100.0, 1300.0, 1500.0, 1600.0] {
+            let got = fit_bands(&settings, Vec2::new(w, 100_000.0)).total();
             assert!(
                 (got.y / got.x - aspect).abs() < 0.02,
-                "the layout was stretched at {pane:?}: {:.4} against a natural {aspect:.4}",
+                "the layout was stretched at {w} wide: {:.4} against a natural {aspect:.4}",
                 got.y / got.x
             );
         }
