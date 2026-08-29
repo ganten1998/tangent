@@ -1365,9 +1365,26 @@ fn midi_clip_notes(
                 if clip.loop_s > 1.0e-6 && at >= clip.len_s - 1.0e-9 {
                     return None;
                 }
+                // **The length is the END minus the START, both rounded
+                // once from absolute time.**
+                //
+                // Rounding `at` and `dur` SEPARATELY and adding them is not
+                // the same number: 6.153846 s rounds to frame 295385 and
+                // 1.025641 s to 49231 frames, so the note went off at
+                // 344616 — while the chord that begins exactly where it ends
+                // rounds to 344615 and went ON one frame EARLIER. Every
+                // pitch the two chords shared was switched off a sample
+                // after it started, which is the owner's "the 3rd chords get
+                // most notes cut off and sound like they're choked."
+                //
+                // Taking the difference of two absolute roundings makes a
+                // note's end land on precisely the frame the next note's
+                // start does, which is the case `mix_channels` already
+                // handles by emitting the offs before the ons.
+                let on = frames(at);
                 Some(crate::instrument::ClipNote {
-                    at: frames(at),
-                    dur: frames(n.dur_s).max(1),
+                    at: on,
+                    dur: frames(at + n.dur_s).saturating_sub(on).max(1),
                     key: n.key.min(127),
                     vel: n.vel.min(127),
                 })

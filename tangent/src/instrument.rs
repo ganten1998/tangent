@@ -2572,6 +2572,22 @@ struct Renderer {
     /// loop silent. Audio clips read straight off `at` and never needed this;
     /// the note scheduler is cursor-based and does.
     pending_flush: bool,
+    /// **The loop's HEAD, when the flush above is a wrap rather than a seek.**
+    ///
+    /// A wrap keeps its phase: `pos` folds to `a + overshoot`, where the
+    /// overshoot is however far into the block the loop's end fell. So the
+    /// block after a wrap begins up to one buffer PAST the loop's head — and
+    /// the clip walk, which skips anything behind the block's start, ate
+    /// every note in that gap. A downbeat sitting exactly on the loop point
+    /// vanished on every pass but the first: the owner's "the first loop
+    /// silences the FIRST NOTES of tracks 1 and 2".
+    ///
+    /// Carrying the head here lets the walk say "due from the loop's start,
+    /// not from where the block happens to begin". Those notes land at
+    /// offset zero, late by less than a buffer, which is what the parked
+    /// note's own overflow already does and is inaudible next to not
+    /// sounding at all.
+    pending_wrap_from: Option<u64>,
     /// The LAST block's clip walk parked a note it could not deliver — the
     /// lane's note list or the sounding ledger was full — and left the
     /// cursor standing on it. `pending`'s idea for the clips: the next
@@ -3321,7 +3337,7 @@ impl Renderer {
             // BEFORE `mix_channels` so the offs land the same block, and so
             // the channels know where the timeline stands — the MIDI clips
             // play from here.
-            let (at, rolling, jumped) = self.run_transport(n);
+            let (at, rolling, jumped, wrap_from) = self.run_transport(n);
             // **Every automated control, resolved once for this chunk.** It
             // has to come after `run_transport` — the value depends on where
             // the playhead now is — and before anything that mixes, because
@@ -3410,7 +3426,7 @@ impl Renderer {
                     st.fill(0.0);
                 }
             }
-            self.mix_channels(n, muted, soloed, at, rolling, flush);
+            self.mix_channels(n, muted, soloed, at, rolling, flush, wrap_from);
 
             // A parameter change, if one is waiting and the lock is free this
             // block. Same shape as the DX7's pending voice, and for the same
@@ -4848,7 +4864,7 @@ impl Renderer {
         out
     }
 
-    fn run_transport(&mut self, frames: usize) -> (u64, bool, bool) {
+    fn run_transport(&mut self, frames: usize) -> (u64, bool, bool, Option<u64>) {
         let req = self.shared.transport_req.load(Ordering::Acquire);
         let seek = req != self.seen_req;
         if seek {
@@ -4860,6 +4876,10 @@ impl Renderer {
         // `at` is the wrapped position and rewinding the cursors lands them
         // at the loop's head. See `pending_flush`.
         let flush = seek || std::mem::take(&mut self.pending_flush);
+        // Taken BEFORE the wrap below can arm it again, so this block reads
+        // the last block's wrap and never its own. A SEEK clears it: landing
+        // somewhere by hand is not a wrap and owes the loop's head nothing.
+        let wrap_from = self.pending_wrap_from.take().filter(|_| !seek);
         let rolling = self.shared.rolling.load(Ordering::Relaxed);
         let at = self.pos;
         if rolling {
@@ -4876,12 +4896,15 @@ impl Renderer {
                 self.pos = a + (self.pos - b) % (b - a);
                 // Arm the flush for the NEXT block, not this one — see the
                 // field. The MIDI cursors must rewind against the wrapped
-                // `at`, which is what the next block carries.
+                // `at`, which is what the next block carries. The loop's
+                // HEAD rides along, because the wrapped `at` is past it and
+                // everything between the two is still due.
                 self.pending_flush = true;
+                self.pending_wrap_from = Some(a);
             }
         }
         self.shared.transport_pos.store(self.pos, Ordering::Relaxed);
-        (at, rolling, flush)
+        (at, rolling, flush, wrap_from)
     }
 
     /// Add the backing track to the bus, if one is loaded and the transport is
@@ -5426,6 +5449,7 @@ impl Renderer {
         at: u64,
         rolling: bool,
         flush: bool,
+        wrap_from: Option<u64>,
     ) {
         // What the slowest chain on the desk costs — read once per block,
         // because it changes when a plugin is loaded and not within a
@@ -5482,6 +5506,12 @@ impl Renderer {
         // read the live list and the clips while filling it.
         let mut lane_notes = std::mem::take(&mut self.lane_notes);
         let coeff = self.gain_coeff;
+        // **The earliest note still due this block.** The block's own start,
+        // except straight after a LOOP WRAP, where the wrap kept its phase
+        // and left the block beginning up to one buffer past the loop's
+        // head. Everything in that gap is still owed. See
+        // `pending_wrap_from`.
+        let due_from = wrap_from.map_or(at, |a| a.min(at));
         for ch in 0..CHANNELS {
             let is_builtin = builtin_at == Some(ch);
             let rack_live = !self.racks[ch].is_empty();
@@ -5571,7 +5601,7 @@ impl Renderer {
                         // The one exception is a note the LAST block parked:
                         // it is behind by a block at most, and it sounds now,
                         // at the top of this one, instead of being dropped.
-                        if (on_f < at && !parked)
+                        if (on_f < due_from && !parked)
                             || nt.at >= mc.len
                             || on_f >= self.shared.punch[ch].load(Ordering::Relaxed)
                         {
@@ -5594,11 +5624,43 @@ impl Renderer {
                             break;
                         }
                         cur += 1;
+                        let offset = on_f.saturating_sub(at) as i32;
+                        // **A pitch cannot start while it is already
+                        // sounding.** If this lane still holds an active clip
+                        // note on this key, its off is emitted HERE, in front
+                        // of the on, and its entry retired — rather than
+                        // being left to fall due later and switch off the
+                        // note that replaced it.
+                        //
+                        // The offs pass above catches the ordinary case,
+                        // where the old note's end is at or before this
+                        // block's end. It cannot catch an OVERLAP: two notes
+                        // of one pitch drawn across each other, or a length
+                        // that rounds a frame past the next attack. Both
+                        // sounded as a chord being choked a sample after it
+                        // spoke.
+                        let mut k = 0;
+                        while k < self.active_clip.len() {
+                            let a = self.active_clip[k];
+                            if usize::from(a.lane) == ch && a.key == nt.key {
+                                if lane_notes.len() < lane_notes.capacity() {
+                                    lane_notes.push(Note {
+                                        offset,
+                                        pitch: i16::from(a.key),
+                                        velocity: 0.0,
+                                        on: false,
+                                    });
+                                }
+                                self.active_clip.swap_remove(k);
+                                continue;
+                            }
+                            k += 1;
+                        }
                         lane_notes.push(Note {
                             // `saturating_sub`, because a parked note's `on_f`
                             // is behind `at` and it lands at offset 0 — late
                             // by a block, which is the price of the park.
-                            offset: on_f.saturating_sub(at) as i32,
+                            offset,
                             pitch: i16::from(nt.key),
                             velocity: f32::from(nt.vel) / 127.0,
                             on: true,
@@ -6498,6 +6560,7 @@ impl Engine {
             seen_req: 0,
             was_rolling: false,
             pending_flush: false,
+            pending_wrap_from: None,
             clip_parked: false,
             sounding: 0,
             bar_clock: BarClock::default(),
@@ -10223,6 +10286,7 @@ mod tests {
             seen_req: 0,
             was_rolling: false,
             pending_flush: false,
+            pending_wrap_from: None,
             clip_parked: false,
             sounding: 0,
             // Abandoned peers, like the MIDI ring above: pop reports empty
@@ -12224,27 +12288,37 @@ mod tests {
         let shared = Arc::new(Shared::new());
         let (tap_tx, _tap_rx) = RingBuffer::<f32>::new(1 << 16);
         let mut r = test_renderer(Arc::clone(&shared), tap_tx, 2);
-        // 256 fillers on lane 0, all striking at frame 0: exactly enough to
-        // fill the sounding ledger before lane 1's walk runs. Their offs
+        // 256 fillers striking at frame 0: exactly enough to fill the
+        // sounding ledger before the victim's lane is walked. Their offs
         // fall due in the SECOND block, which is what makes room.
-        let fillers: Vec<ClipNote> = (0..256)
-            .map(|_| ClipNote {
-                at: 0,
-                dur: 700,
-                key: 60,
-                vel: 100,
-            })
-            .collect();
-        // And the victim on lane 1, due the same first block.
+        //
+        // **DISTINCT pitches, spread over two lanes**, because a pitch
+        // cannot stack on itself any more: pushing an on for a key a lane is
+        // already holding retires the old one first, so a filler of 256
+        // copies of middle C now leaves ONE entry behind and never fills
+        // anything. 128 keys is every pitch there is, hence the second lane.
+        let fillers = |lane: usize| PlacedMidi {
+            strip: lane,
+            start: 0,
+            len: 48_000,
+            notes: Arc::new(
+                (0..128u8)
+                    .map(|key| ClipNote {
+                        at: 0,
+                        dur: 700,
+                        key,
+                        vel: 100,
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+        };
+        // And the victim on lane 2, due the same first block. Its lane is
+        // walked after both fillers', by which time the ledger is full.
         r.midi_clips = vec![
+            fillers(0),
+            fillers(1),
             PlacedMidi {
-                strip: 0,
-                start: 0,
-                len: 48_000,
-                notes: Arc::new(fillers),
-            },
-            PlacedMidi {
-                strip: 1,
+                strip: 2,
                 start: 0,
                 len: 48_000,
                 notes: Arc::new(vec![ClipNote {
@@ -12255,13 +12329,13 @@ mod tests {
                 }]),
             },
         ];
-        r.midi_cursor = vec![0, 0];
+        r.midi_cursor = vec![0, 0, 0];
         shared.rolling.store(true, Ordering::Relaxed);
         let mut out = vec![0.0f32; 512 * 2];
         // Block one: the ledger fills, the victim hits the break.
         r.render(&mut out, 0, 0);
         assert_eq!(
-            r.midi_cursor[1], 0,
+            r.midi_cursor[2], 0,
             "the cursor moved past the withheld note — consumed by the \
              capacity break, delivered by nothing"
         );
@@ -12274,11 +12348,11 @@ mod tests {
             "the withheld clip note never sounded"
         );
         assert!(
-            r.active_clip.iter().any(|a| a.key == 100 && a.lane == 1),
+            r.active_clip.iter().any(|a| a.key == 100 && a.lane == 2),
             "the parked note is missing from the sounding ledger, so its \
              off will never be emitted"
         );
-        assert_eq!(r.midi_cursor[1], 1);
+        assert_eq!(r.midi_cursor[2], 1);
     }
 
     /// **Every lane comes back on the loop's wrap, not just some of them.**
@@ -12335,6 +12409,7 @@ mod tests {
             was = r.pos;
         }
         assert!(passes.len() >= 2, "the loop did not wrap twice: {passes:?}");
+        let _ = &passes;
         for (n, lanes) in passes.iter().enumerate() {
             assert_eq!(
                 lanes,
@@ -12342,6 +12417,170 @@ mod tests {
                 "pass {n} struck {lanes:?}, not every lane"
             );
         }
+    }
+
+    /// **A downbeat ON the loop point survives every wrap.**
+    ///
+    /// The wrap keeps its phase, so `pos` folds to `a + overshoot` and the
+    /// block after it begins up to one buffer PAST the loop's head. The clip
+    /// walk skipped everything behind the block's start, so a note sitting
+    /// exactly on the loop point sounded on the first pass and never again:
+    /// the owner's "the first loop silences the FIRST NOTES of tracks 1 and
+    /// 2". The loop length here is deliberately NOT a whole number of
+    /// blocks, which is what makes the overshoot non-zero.
+    #[test]
+    fn a_note_on_the_loop_point_survives_the_wrap() {
+        let shared = Arc::new(Shared::new());
+        let (tap_tx, _tap_rx) = RingBuffer::<f32>::new(1 << 16);
+        let mut r = test_renderer(Arc::clone(&shared), tap_tx, 2);
+        // Two lanes: one whose downbeat is EXACTLY on the loop point, one
+        // whose first note is a little later. The second is the control —
+        // it always sounded, which is why only two of the owner's four
+        // tracks looked broken.
+        r.midi_clips = vec![
+            PlacedMidi {
+                strip: 0,
+                start: 0,
+                len: 48_000,
+                notes: Arc::new(vec![ClipNote {
+                    at: 0,
+                    dur: 4_000,
+                    key: 60,
+                    vel: 100,
+                }]),
+            },
+            PlacedMidi {
+                strip: 1,
+                start: 0,
+                len: 48_000,
+                notes: Arc::new(vec![ClipNote {
+                    at: 3_000,
+                    dur: 4_000,
+                    key: 64,
+                    vel: 100,
+                }]),
+            },
+        ];
+        r.midi_cursor = vec![0, 0];
+        // From zero, and 9_997 frames long: not a multiple of 512, so every
+        // wrap overshoots by a different amount and the gap is real.
+        shared.loop_a.store(0, Ordering::Relaxed);
+        shared.loop_b.store(9_997, Ordering::Relaxed);
+        shared.rolling.store(true, Ordering::Relaxed);
+        let mut out = vec![0.0f32; 512 * 2];
+
+        let mut struck: Vec<Vec<u8>> = Vec::new();
+        let mut seen: Vec<u8> = Vec::new();
+        let mut was = r.pos;
+        for _ in 0..120 {
+            out.fill(0.0);
+            r.render(&mut out, 0, 0);
+            for a in &r.active_clip {
+                if !seen.contains(&a.key) {
+                    seen.push(a.key);
+                }
+            }
+            if r.pos < was {
+                seen.sort_unstable();
+                struck.push(std::mem::take(&mut seen));
+            }
+            was = r.pos;
+        }
+        assert!(struck.len() >= 4, "too few wraps to judge: {struck:?}");
+        for (n, keys) in struck.iter().enumerate() {
+            assert!(
+                keys.contains(&60),
+                "pass {n} lost the note ON the loop point: {keys:?}"
+            );
+            assert!(keys.contains(&64), "pass {n} lost the later note: {keys:?}");
+        }
+    }
+
+    /// **A chord that begins where the last one ends is not choked.**
+    ///
+    /// From the owner's session: three chords on one lane, the second ending
+    /// exactly where the third begins, sharing three of their six pitches.
+    /// The second chord's note-offs used to land one frame AFTER the third's
+    /// note-ons — `round(at) + round(dur)` is not `round(at + dur)` — so
+    /// every shared pitch was switched off a sample after it spoke: "the 3rd
+    /// chords of each get most notes cut off and sound like they're choked".
+    ///
+    /// The schedule is built by `desktop::midi_clip_notes`, which is not
+    /// reachable from here, so the arithmetic it now does is spelled out and
+    /// the RENDERER's half — offs before ons, and a same-key steal — is what
+    /// this proves.
+    #[test]
+    fn a_chord_landing_on_the_last_ones_end_is_not_choked() {
+        let shared = Arc::new(Shared::new());
+        let (tap_tx, _tap_rx) = RingBuffer::<f32>::new(1 << 16);
+        let mut r = test_renderer(Arc::clone(&shared), tap_tx, 2);
+        let rate = 48_000.0f64;
+        let f = |s: f64| (s * rate).round() as u64;
+        // The real numbers, and the real overlap: chord two's length rounds a
+        // frame PAST chord three's attack, which is the case the steal has to
+        // survive even after the schedule stops producing it.
+        let (c2_at, c2_dur, c3_at) = (6.153_846_153_846_154, 1.025_641_025_641_025_5, 7.179_487_179_487_18);
+        let mut notes = Vec::new();
+        for key in [53u8, 54, 56, 61, 63, 66] {
+            notes.push(ClipNote {
+                at: f(c2_at),
+                dur: f(c2_dur).max(1),
+                key,
+                vel: 100,
+            });
+        }
+        for key in [54u8, 56, 58, 61, 65, 68] {
+            notes.push(ClipNote {
+                at: f(c3_at),
+                dur: f(1.025_641),
+                key,
+                vel: 100,
+            });
+        }
+        notes.sort_by_key(|n| n.at);
+        assert_eq!(
+            f(c2_at) + f(c2_dur),
+            f(c3_at) + 1,
+            "the session's own overlap is not what this test thinks it is"
+        );
+        r.midi_clips = vec![PlacedMidi {
+            strip: 0,
+            start: 0,
+            len: f(8.205_128_205_128_206),
+            notes: Arc::new(notes),
+        }];
+        r.midi_cursor = vec![0];
+        shared.rolling.store(true, Ordering::Relaxed);
+        // Land the transport just before the seam and roll through it.
+        r.pos = f(c2_at) - 128;
+        let mut out = vec![0.0f32; 512 * 2];
+        // Roll from just before chord two's attack to the middle of chord
+        // three: 170 blocks of 512 lands at ~382k, past the seam at 344615
+        // and short of chord three's own end at 393845.
+        for _ in 0..170 {
+            out.fill(0.0);
+            r.render(&mut out, 0, 0);
+        }
+        assert!(r.pos > f(c3_at) && r.pos < f(c3_at) + f(1.0), "rolled to {}", r.pos);
+        // Past the seam and well before chord three's own end: all six of
+        // chord three must be holding, and NOTHING of chord two.
+        let held: std::collections::BTreeSet<u8> = r
+            .active_clip
+            .iter()
+            .filter(|a| a.lane == 0)
+            .map(|a| a.key)
+            .collect();
+        let want: std::collections::BTreeSet<u8> = [54u8, 56, 58, 61, 65, 68].into_iter().collect();
+        assert_eq!(held, want, "chord three is not what is sounding");
+        // And each pitch is held ONCE — a steal that pushed an off without
+        // retiring the entry would leave a second off due later, which is the
+        // same choke a block downstream.
+        assert_eq!(
+            r.active_clip.iter().filter(|a| a.lane == 0).count(),
+            6,
+            "a pitch is held twice: {:?}",
+            r.active_clip.iter().map(|a| a.key).collect::<Vec<_>>()
+        );
     }
 
     #[test]
