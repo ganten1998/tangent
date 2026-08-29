@@ -480,6 +480,49 @@ pub enum ChannelKind {
     Audio,
 }
 
+/// **Which lanes are shut off from LIVE MIDI**, one bit per channel, set = shut
+/// off. The engine's `midi_off`.
+///
+/// Three rules, in order:
+///
+/// 1. A lane that is not a MIDI channel never hears a note.
+/// 2. A MIDI lane hears the keyboard when it is ARMED **or SELECTED**. Arm
+///    used to be the whole of it, which meant trying an instrument out began
+///    by arming a track — and a half-finished take was one keypress away.
+///    Selecting a track is already the gesture that means "this one".
+/// 3. **While the MIDI editor is open it is the ONLY lane that hears.** An
+///    audition there is a question about the clip in front of you; with two
+///    instruments armed, one key played both of them.
+///
+/// It is one mask rather than a gate per rule because the mask's EDGE is what
+/// releases the notes a silenced lane was holding. A second gate would have no
+/// edge of its own and would strand them sounding.
+pub fn live_midi_off(
+    kinds: &[Option<ChannelKind>],
+    armed: u32,
+    selected: Option<usize>,
+    editor_lane: Option<usize>,
+) -> u32 {
+    // Rule 3 short-circuits, but still answers to rule 1: an editor somehow
+    // open on an audio lane silences the desk rather than opening it.
+    if let Some(lane) = editor_lane {
+        return if kinds.get(lane).copied().flatten() == Some(ChannelKind::Midi) {
+            !(1u32 << lane.min(31))
+        } else {
+            u32::MAX
+        };
+    }
+    let mut off = u32::MAX;
+    for ch in 0..CHANNELS.min(32) {
+        let live = kinds.get(ch).copied().flatten() == Some(ChannelKind::Midi)
+            && (armed & (1 << ch) != 0 || selected == Some(ch));
+        if live {
+            off &= !(1u32 << ch);
+        }
+    }
+    off
+}
+
 impl ChannelKind {
     /// The settings byte, and back. See `Settings::channel_kinds`.
     pub fn from_u8(n: u8) -> Option<Self> {
@@ -2898,6 +2941,51 @@ pub fn disk_text(minutes: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// **The three rules that decide which instrument a key plays.**
+    ///
+    /// Every one of them is a bug the owner reported: arming to audition,
+    /// and one key sounding two instruments at once in the editor.
+    #[test]
+    fn live_midi_reaches_armed_selected_and_the_editors_lane_alone() {
+        use super::{live_midi_off, ChannelKind};
+        let off = |ch: usize, m: u32| m & (1 << ch) != 0;
+        let mut kinds = vec![None; super::CHANNELS];
+        kinds[0] = Some(ChannelKind::Midi);
+        kinds[1] = Some(ChannelKind::Midi);
+        kinds[2] = Some(ChannelKind::Audio);
+
+        // Nothing armed, nothing selected: silence, which is what it always
+        // did and what the two rules below are exceptions to.
+        let m = live_midi_off(&kinds, 0, None, None);
+        assert!(off(0, m) && off(1, m) && off(2, m));
+
+        // ARMED sounds.
+        let m = live_midi_off(&kinds, 1 << 1, None, None);
+        assert!(!off(1, m), "an armed MIDI lane takes no notes");
+        assert!(off(0, m));
+
+        // SELECTED sounds, unarmed — the whole point. Trying an instrument
+        // out used to begin by arming a track, one keypress from a take.
+        let m = live_midi_off(&kinds, 0, Some(0), None);
+        assert!(!off(0, m), "a selected MIDI lane still needs arming");
+        assert!(off(1, m));
+
+        // A selected AUDIO lane is still an audio lane.
+        let m = live_midi_off(&kinds, 0, Some(2), None);
+        assert!(off(2, m), "an audio lane was handed a note");
+
+        // **The editor takes the desk.** Both lanes armed, editor open on
+        // lane 1: lane 0 goes quiet. This is "Mini v4 on track one, piano
+        // on track 2, audition note, it triggers BOTH".
+        let m = live_midi_off(&kinds, 0b11, Some(0), Some(1));
+        assert!(!off(1, m), "the edited lane went quiet");
+        assert!(off(0, m), "the other armed instrument sounded too");
+
+        // And an editor somehow open on an audio lane silences everything
+        // rather than opening the desk up.
+        assert_eq!(live_midi_off(&kinds, 0b11, Some(0), Some(2)), u32::MAX);
+    }
+
 
     /// **A meter's numbers carry no sign, and 0 is not minus zero.**
     ///
