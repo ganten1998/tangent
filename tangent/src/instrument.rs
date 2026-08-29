@@ -1660,6 +1660,18 @@ struct Shared {
     /// How much audio the monitor ring is holding, in frames: the monitoring
     /// path's own latency, on top of the two device buffers, as a number.
     monitor_backlog: AtomicU32,
+    /// **The frames the output callback is ACTUALLY handed**, as opposed to
+    /// the number that was asked for.
+    ///
+    /// On macOS the device's buffer size is a property of the DEVICE, not of
+    /// the client: two apps cannot hold one interface at two sizes. So a
+    /// request for 128 while another host already has the same interface open
+    /// at 512 does not get 128 — and every figure the app reported was the
+    /// number it ASKED for, so the panel said 128 and the room said 512, with
+    /// nothing anywhere to catch the difference.
+    ///
+    /// Written every callback. Zero until the first one arrives.
+    out_block_seen: AtomicU32,
     /// Bit `i` set: channel `i`'s rack voices ignore the note stream.
     ///
     /// **The MIDI arm, as one mask**, exactly the shape mute and solo travel
@@ -1953,6 +1965,7 @@ impl Shared {
             pending_monitor_layout: std::sync::Mutex::new(None),
             monitor_slip: AtomicU64::new(0),
             monitor_backlog: AtomicU32::new(0),
+            out_block_seen: AtomicU32::new(0),
             midi_off: AtomicU32::new(0),
             armed: AtomicU32::new(u32::MAX),
             arr_capture: AtomicU32::new(0),
@@ -4137,6 +4150,12 @@ impl Renderer {
             return;
         }
         let dev_frames = (out.len() / dev_ch).min(MAX_CALLBACK_FRAMES);
+        // What the device is REALLY giving us. See `out_block_seen`: the
+        // asked-for number is not the granted one, and until now nothing
+        // measured the difference.
+        self.shared
+            .out_block_seen
+            .store(dev_frames as u32, Ordering::Relaxed);
         let Some(ratio) = self.varispeed_ratio() else {
             if self.vs_was_engaged {
                 // **Dropped on the way OUT, not on the way in.** The
@@ -7907,6 +7926,13 @@ impl Engine {
     /// a session where the output started late used to hold a tenth of a
     /// second and never give it back. It is bounded now — see `mix_monitor` —
     /// and this is what makes the bound visible rather than trusted.
+    /// **The frames per output callback the device is actually delivering**,
+    /// or `None` before the first one. See `Shared::out_block_seen`.
+    pub fn observed_out_block(&self) -> Option<u32> {
+        let n = self.shared.out_block_seen.load(Ordering::Relaxed);
+        (n > 0).then_some(n)
+    }
+
     pub fn monitor_backlog_ms(&self) -> f64 {
         let rate = f64::from(self.output.sample_rate.max(1));
         f64::from(self.shared.monitor_backlog.load(Ordering::Relaxed)) * 1000.0 / rate

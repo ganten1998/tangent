@@ -1266,6 +1266,12 @@ impl Session {
                 sample_rate: a.sample_rate,
                 channels: a.channels,
                 buffer_frames: a.buffer_frames,
+                // **Not measured on this side yet.** The output's is the one
+                // that matters: the round trip is `input + 2 x output`, so a
+                // frame the OUTPUT is really running is worth two of the
+                // input's, and it is the output whose size another host
+                // holding the device would be dictating.
+                observed_frames: None,
             },
         ))
     }
