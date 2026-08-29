@@ -1631,6 +1631,10 @@ impl Instance {
         if r != kResultOk {
             return Err(format!("process returned {r}"));
         }
+        // **And the buses nobody was listening to.** Everything past the first
+        // was rendered into scratch and discarded until now; a drum kit lives
+        // out there. See `Scratch::fold_aux`.
+        self.scratch.fold_aux(channels, frames, out);
         Ok(Rendered {
             frames,
             unmapped,
@@ -2297,6 +2301,74 @@ impl Scratch {
         }
 
         (self.buses.as_mut_ptr(), self.buses.len())
+    }
+
+    /// Add every output bus after the first into the main one.
+    ///
+    /// **Without this, a drum kit is silent and the plugin looks broken.** A
+    /// sampler's individual outs are extra output buses — Kontakt 8 declares
+    /// thirty-two stereo ones — and a kit routes its pads across them by
+    /// default, because that is what individual outs are FOR. `bind` gives
+    /// every one of them real storage so a plugin that sums cannot accumulate
+    /// into the bus we read; this is the other half, and it was missing. The
+    /// aux buffers were written every block and never once read: the meter sat
+    /// flat while the plugin worked perfectly and its pads lit up.
+    ///
+    /// **A mono bus reaches both sides; anything wider keeps its own sides**,
+    /// as far as the main bus goes — the same fold the live monitor uses for an
+    /// input, and for the same reason: this is about hearing what arrived, not
+    /// about auditioning a surround mix.
+    ///
+    /// `silenceFlags` is the plugin's word for "I wrote nothing here", and it
+    /// is honoured rather than trusted-and-summed: thirty-two buses of
+    /// zero-adds every block is real work on the audio thread for a kit that
+    /// uses four of them.
+    ///
+    /// **A caveat worth writing down.** A plugin that mirrors the same signal
+    /// on its main bus AND an individual out is now heard twice. That is rarer
+    /// than the failure this fixes — routing a pad to an individual out
+    /// normally MOVES it — but it is the reason this is a sum rather than a
+    /// choice, and the day somebody meets it the answer is a per-bay bus
+    /// picker with this as its default, not a different rule here.
+    fn fold_aux(&self, channels: usize, frames: usize, out: &mut [Vec<f32>]) {
+        let frames = frames.min(self.max_block);
+        let main = channels.min(out.len());
+        if main == 0 || frames == 0 {
+            return;
+        }
+        let mut at = 0usize;
+        for bus in self.buses.iter().skip(1) {
+            let width = bus.numChannels.max(0) as usize;
+            // One channel goes to both sides; two or more go straight across.
+            let spread = width == 1;
+            for c in 0..width {
+                // Past the main bus's width and not a mono spread: there is
+                // nowhere for it to go, and dropping it is the fold.
+                if !spread && c >= main {
+                    break;
+                }
+                if (bus.silenceFlags >> c.min(63)) & 1 != 0 {
+                    continue;
+                }
+                let Some(src) = self
+                    .aux
+                    .get((at + c) * self.max_block..)
+                    .and_then(|rest| rest.get(..frames))
+                else {
+                    continue;
+                };
+                let last = if spread { main.min(2) } else { c + 1 };
+                for t in (if spread { 0 } else { c })..last {
+                    let Some(dst) = out.get_mut(t).and_then(|v| v.get_mut(..frames)) else {
+                        continue;
+                    };
+                    for (d, s) in dst.iter_mut().zip(src) {
+                        *d += *s;
+                    }
+                }
+            }
+            at += width;
+        }
     }
 }
 
@@ -3266,6 +3338,78 @@ mod tests {
         let mut instrument = Scratch::new(64, &stereo_out, &[]).expect("scratch");
         let (ptr, count) = instrument.bind_inputs(&mono, 8);
         assert!(ptr.is_null() && count == 0, "an instrument was fed audio");
+    }
+
+    /// **A drum kit lives on the buses nobody was reading.**
+    ///
+    /// A sampler's individual outs are extra output buses and a kit routes its
+    /// pads across them by default — that is what they are for. Tangent bound
+    /// real storage for every one of them and then summed only the first, so
+    /// the aux buffers were written every block and never read: a flat meter
+    /// while the plugin worked perfectly and its pads lit up. The owner
+    /// reported it as "one's pads light up while its meter does not".
+    #[test]
+    fn every_output_bus_reaches_the_mix_not_just_the_first() {
+        // Main plus two individual outs, all stereo: a drum sampler's shape.
+        let buses: Vec<Bus> = (0..3)
+            .map(|i| Bus { name: format!("out {i}"), channels: 2, aux: i > 0 })
+            .collect();
+        let mut scratch = Scratch::new(64, &buses, &[]).expect("build the scratch");
+        let mut out: Vec<Vec<f32>> = vec![vec![0.0; 64]; 2];
+        let (_, count) = scratch.bind(2, 64, &mut out);
+        assert_eq!(count, 3);
+
+        // What a plugin does: nothing on the main bus, a kick on out 2 and a
+        // snare on out 3. `bind` has already zeroed the aux storage.
+        out[0][0] = 0.0;
+        out[1][0] = 0.0;
+        scratch.aux[0] = 0.25; // out 2, left
+        scratch.aux[64] = 0.5; // out 2, right
+        scratch.aux[128] = 0.125; // out 3, left
+        scratch.aux[192] = 0.0625; // out 3, right
+
+        scratch.fold_aux(2, 64, &mut out);
+        assert_eq!(out[0][0], 0.375, "the individual outs never reached the mix");
+        assert_eq!(out[1][0], 0.5625, "the individual outs never reached the mix");
+    }
+
+    /// A MONO individual out — a kick drum's own jack — reaches both sides
+    /// rather than only the left. The same fold the live monitor uses.
+    #[test]
+    fn a_mono_output_bus_is_heard_on_both_sides() {
+        let buses = vec![
+            Bus { name: "main".into(), channels: 2, aux: false },
+            Bus { name: "kick".into(), channels: 1, aux: true },
+        ];
+        let mut scratch = Scratch::new(64, &buses, &[]).expect("build the scratch");
+        let mut out: Vec<Vec<f32>> = vec![vec![0.0; 64]; 2];
+        scratch.bind(2, 64, &mut out);
+        scratch.aux[0] = 0.5;
+        scratch.fold_aux(2, 64, &mut out);
+        assert_eq!(out[0][0], 0.5, "a mono out was lost on the left");
+        assert_eq!(out[1][0], 0.5, "a mono out never reached the right");
+    }
+
+    /// `silenceFlags` is the plugin's word for "I wrote nothing here", and a
+    /// kit that uses four of thirty-two buses must not cost twenty-eight
+    /// buses of zero-adds a block. Honoured rather than trusted-and-summed:
+    /// whatever is in a flagged buffer is not audio.
+    #[test]
+    fn a_bus_the_plugin_flagged_silent_is_not_summed() {
+        let buses = vec![
+            Bus { name: "main".into(), channels: 2, aux: false },
+            Bus { name: "out 2".into(), channels: 2, aux: true },
+        ];
+        let mut scratch = Scratch::new(64, &buses, &[]).expect("build the scratch");
+        let mut out: Vec<Vec<f32>> = vec![vec![0.0; 64]; 2];
+        scratch.bind(2, 64, &mut out);
+        // Left flagged silent but not cleared; right genuinely carries audio.
+        scratch.aux[0] = 9.0;
+        scratch.aux[64] = 0.25;
+        scratch.buses[1].silenceFlags = 1;
+        scratch.fold_aux(2, 64, &mut out);
+        assert_eq!(out[0][0], 0.0, "a bus flagged silent was summed anyway");
+        assert_eq!(out[1][0], 0.25, "the flag silenced the wrong channel");
     }
 
     #[test]
