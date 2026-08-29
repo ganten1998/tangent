@@ -4192,10 +4192,26 @@ pub fn show(
                                         ui.label(
                                             RichText::new(name).font(plain(11.0)).color(t.text),
                                         );
-                                        let buf = match (s.buffer_frames, s.buffer_ms()) {
-                                            (Some(f), Some(ms)) => {
+                                        // **What is RUNNING, and — when they
+                                        // differ — what was asked for.**
+                                        //
+                                        // A device's buffer size belongs to
+                                        // the DEVICE: another host holding the
+                                        // same interface dictates it, and the
+                                        // request is simply not granted. The
+                                        // panel used to print the request, so
+                                        // it read 128 while the room ran 512
+                                        // and nothing anywhere said so.
+                                        let real = s.observed_frames.or(s.buffer_frames);
+                                        let buf = match (real, s.buffer_ms()) {
+                                            (Some(f), Some(ms)) if s.honoured() => {
                                                 format!("{f} frames  ({ms:.1} ms)")
                                             }
+                                            (Some(f), Some(ms)) => format!(
+                                                "{f} frames  ({ms:.1} ms)  - asked for {}, \
+                                                 another app owns this device",
+                                                s.buffer_frames.unwrap_or(0)
+                                            ),
                                             // The device chose and did not say
                                             // what it chose — which is what
                                             // cpal's `BufferSize::Default`

@@ -2812,13 +2812,39 @@ pub struct StreamStats {
     /// Frames per callback, when the device is running one it will admit to.
     /// `None` is cpal's `BufferSize::Default` — the device chose, and did not
     /// say what it chose.
+    ///
+    /// **This is what was ASKED for.** See `observed_frames`.
     pub buffer_frames: Option<u32>,
+    /// **What the callback is actually being handed**, counted rather than
+    /// requested. `None` before the first callback, or on a side that does
+    /// not measure it.
+    ///
+    /// On macOS a device's buffer size belongs to the DEVICE, not to the
+    /// client: two apps cannot hold one interface at two sizes. Open a
+    /// session while another host already has the same interface at 512 and
+    /// the request for 128 does not get 128 — and every figure here used to
+    /// be the request, so the panel said one thing and the room said another
+    /// with nothing to catch it. This is the number that cannot lie.
+    pub observed_frames: Option<u32>,
 }
 
 impl StreamStats {
     /// One buffer's worth of time, in milliseconds.
+    /// **Whether the device granted what was asked for.**
+    ///
+    /// `false` means something else owns the interface's buffer size — the
+    /// panel says so rather than repeating a number nobody is running.
+    pub fn honoured(self) -> bool {
+        match (self.buffer_frames, self.observed_frames) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        }
+    }
+
+    /// One buffer's worth of time, in milliseconds — of what is REALLY
+    /// running, not of what was asked for.
     pub fn buffer_ms(self) -> Option<f64> {
-        let frames = self.buffer_frames?;
+        let frames = self.observed_frames.or(self.buffer_frames)?;
         (self.sample_rate > 0).then(|| f64::from(frames) * 1000.0 / f64::from(self.sample_rate))
     }
 }
@@ -2950,6 +2976,60 @@ pub fn disk_text(minutes: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// **The panel reports what is RUNNING, not what was asked for.**
+    ///
+    /// A device's buffer size belongs to the device, not to the client: on
+    /// macOS two apps cannot hold one interface at two sizes, so opening a
+    /// session while another host already has the same interface at 512 does
+    /// not get you 128. Every figure here used to be the REQUEST, so the
+    /// panel said 128 while the room ran 512 — and the estimate built on it
+    /// was wrong by the same factor, in the direction that makes the app look
+    /// faster than it is.
+    #[test]
+    fn the_buffer_reported_is_the_one_the_device_is_running() {
+        use super::{AudioStatus, StreamStats};
+        let stats = |asked, seen| StreamStats {
+            sample_rate: 48_000,
+            channels: 2,
+            buffer_frames: asked,
+            observed_frames: seen,
+        };
+        // Granted: the two agree and nothing is flagged.
+        let ok = stats(Some(128), Some(128));
+        assert!(ok.honoured());
+        assert!((ok.buffer_ms().unwrap() - 2.6667).abs() < 0.001);
+
+        // REFUSED: the observed size wins, and `honoured` says so — that flag
+        // is what the panel prints the explanation from.
+        let taken = stats(Some(128), Some(512));
+        assert!(!taken.honoured(), "a refused request looked granted");
+        assert!(
+            (taken.buffer_ms().unwrap() - 10.6667).abs() < 0.001,
+            "the panel reported the request, not the reality: {:?}",
+            taken.buffer_ms()
+        );
+
+        // Nothing observed yet — the first callback has not run. The request
+        // is the best available answer and is NOT called a mismatch.
+        let early = stats(Some(128), None);
+        assert!(early.honoured());
+        assert!((early.buffer_ms().unwrap() - 2.6667).abs() < 0.001);
+
+        // And the round-trip estimate is built on the real numbers, so it
+        // cannot be quietly flattering. Input 64 asked-and-granted, output
+        // asked 128 but running 512, ring 4 ms.
+        let status = AudioStatus {
+            input: Some(("in".to_owned(), stats(Some(64), Some(64)))),
+            output: Some(("out".to_owned(), stats(Some(128), Some(512)))),
+            monitor_ms: Some(4.0),
+        };
+        let rt = status.round_trip_ms().expect("both sides are open");
+        assert!(
+            (rt - (1.3333 + 10.6667 + 4.0)).abs() < 0.01,
+            "the estimate used the requested buffer: {rt}"
+        );
+    }
+
     /// **The three rules that decide which instrument a key plays.**
     ///
     /// Every one of them is a bug the owner reported: arming to audition,
@@ -3972,7 +4052,8 @@ mod status_tests {
         (
             "device".to_owned(),
             StreamStats {
-                sample_rate: rate,
+observed_frames: None,
+                                sample_rate: rate,
                 channels: 2,
                 buffer_frames: frames,
             },
@@ -3984,13 +4065,15 @@ mod status_tests {
         // 256 frames at 48k is 5.333 ms; at 44.1k it is longer, which is the
         // whole reason the rate is part of the sum.
         let at48 = StreamStats {
-            sample_rate: 48_000,
+observed_frames: None,
+                        sample_rate: 48_000,
             channels: 2,
             buffer_frames: Some(256),
         };
         assert!((at48.buffer_ms().unwrap() - 5.3333).abs() < 1e-3);
         let at44 = StreamStats {
-            sample_rate: 44_100,
+observed_frames: None,
+                        sample_rate: 44_100,
             channels: 2,
             buffer_frames: Some(256),
         };
@@ -4000,7 +4083,8 @@ mod status_tests {
         // inventing a number here would be inventing a latency figure.
         assert_eq!(
             StreamStats {
-                sample_rate: 48_000,
+observed_frames: None,
+                                sample_rate: 48_000,
                 channels: 2,
                 buffer_frames: None,
             }

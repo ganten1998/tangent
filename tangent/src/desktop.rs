@@ -1640,6 +1640,9 @@ impl DesktopApp {
                         sample_rate: o.sample_rate,
                         channels: o.channels,
                         buffer_frames: o.buffer_frames,
+                        // Counted in the callback, not asked for. See
+                        // `StreamStats::observed_frames`.
+                        observed_frames: e.observed_out_block(),
                     },
                 )
             }),
