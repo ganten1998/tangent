@@ -58,11 +58,22 @@ translation cannot pass.
 
 **Yes, and it is the main thing: beta.13 is not pushed.**
 
-`origin/main` is `40103bc`, version `5.0.0-beta.9`. It contains no
-`fold_folders`, no `folder_lat`, no `mix_monitor`, no `param_slot`, no
-`no_writer_runs_a_folders_rack_except_the_fold`, and `run_rack` still ends at
-`params: &[&[ParamPoint]; INSERTS]`. None of the rework you described is
-reachable from here.
+`origin/main` is `40103bc`, version `5.0.0-beta.9`. To be precise about what is
+and is not there, because the distinction matters:
+
+| symbol | on `origin/main` |
+| --- | --- |
+| `fold_folders` | **present** — method at `instrument.rs:6442`, called from `:3857` |
+| `mix_monitor` | **present** — method at `:4671`, called from `:3836` |
+| `folder_lat` | absent |
+| `param_slot` | absent |
+| `no_writer_runs_a_folders_rack_except_the_fold` | absent |
+| `run_rack` signature | old — still ends at `params: &[&[ParamPoint]; INSERTS]` |
+
+So the fold *architecture* is on the remote and predates your rework. What is
+not there is everything beta.13 added on top of it: the delay-compensation term,
+the single automation mapping, the source-scanning guard, and the widened
+`run_rack`. None of the changes you described are reachable from here.
 
 Two consequences. First, I have not been rebasing on it — I could not have been
 — so nothing I mapped earlier is contaminated by the move. Second, I cannot mark
