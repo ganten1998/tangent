@@ -83,6 +83,24 @@ windows-sys = { version = "0.60", features = [
 x11rb = "0.13"
 libc = "0.2"
 
+# **LV2, on the two platforms that have one.**
+#
+# LV2 is the native plugin format of the Linux audio world — lsp-plugins, Calf,
+# x42, Dragonfly, Rubber Band are all LV2 first — and it is very nearly the ONLY
+# format packaged for FreeBSD, where the ports tree has no VST3 plugins at all.
+# A host that speaks only VST3 therefore reaches almost nothing on either.
+#
+# `livi` is a safe wrapper over `lilv`, the reference LV2 host library, which is
+# a system dependency (`audio/lilv`, `pkg-config lilv-0`) rather than a bundled
+# C build. Not offered on macOS or Windows: LV2 has essentially no presence on
+# either, and adding a C library to the cross-build would cost the property that
+# `cargo-zigbuild` exists to preserve.
+#
+# Note this pulls `lv2-sys`, which does not build on FreeBSD unpatched — see the
+# `[patch.crates-io]` in the workspace root.
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+livi = "0.7"
+
 [dev-dependencies]
 # Examples only, and `check-firewall.sh` walks `--edges normal`, so this does
 # not put the recorder into the host's shipped dependency graph. It is here so
