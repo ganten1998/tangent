@@ -10,12 +10,12 @@
 > | `cargo build --release -p tangent --features recorder` | ok, 5m36s |
 > | App launches and draws | ok, glow on X11 |
 > | Audio out, stock system, nothing configured | ok, 0 underruns in 6721 interrupts |
-> | Audio in | **blocked on hardware** — this laptop has no usable input, see §6 |
-> | MIDI in, no server, nothing configured | ok — native `/dev/umidi`, verified against a Kawai MP6, §9 |
+> | Audio in | ok on a USB interface (Scarlett Solo); the laptop's own mic is impossible, §6 |
+> | MIDI in, no server, nothing configured | ok — native `/dev/umidi`, verified against a Kawai MP6, §8 |
 > | `cargo test --workspace --features recorder` | **1619 passed, 0 failed**, 56 ignored |
 > | `scripts/check-firewall.sh` | green, Minimal build included |
-> | Installer | ok — a real `.pkg` plus two offline bundles, §10 |
-> | Latency measured | probe written (`examples/rtlatency.rs`), blocked with audio in |
+> | Installer | ok — a real `.pkg` plus two offline bundles, §9 |
+> | Latency measured | **36.7 ms** round trip on the shim, **28.4 ms** through JACK, §7 |
 
 Test box: HP laptop, GhostBSD 26.1 / FreeBSD 15.0-RELEASE-p2 amd64, i5-1135G7
 (8 threads), 8 GB, Realtek ALC236 via `snd_hda`, Iris Xe with DRI + Intel Vulkan
@@ -126,11 +126,27 @@ honest figures.
 `oss`. cpal consequently enumerates `["default", "oss"]` rather than device
 names. Everything works, but:
 
-* The device picker will show "default" and "oss", not "Realtek ALC236". A
-  cosmetic wart with a real support cost.
 * The shim reports **nonsense ranges**: `buffer_size: 1..=4294967295` and
   sample rates to 4294967295 Hz. This makes `pick_buffer`'s
   `.clamp(*min, *max)` a no-op — harmless today, but see §5.
+* **There can be no device picker on this path, and the reason is in cpal.**
+  Its ALSA enumeration (`host/alsa/enumerate.rs`) tries a hardcoded list —
+  `["default", "pipewire", "pulse", "jack", "oss"]` — and then iterates ALSA
+  *cards* to build `plughw:N` names. It never calls `snd_device_name_hint`.
+  FreeBSD's shim exposes **no cards at all**, so only the built-ins can ever
+  appear.
+
+  This was tested rather than assumed: named PCMs added to `~/.asoundrc` with
+  proper `hint { show on; description "…" }` blocks show up correctly in
+  `aplay -L` — "Focusrite Scarlett Solo" and all — and remain invisible to
+  cpal, because cpal is not looking there. So the choice of device on FreeBSD
+  is a system setting, `sysctl hw.snd.default_unit=N`, and "default" silently
+  means whichever device that names. Plugging the Scarlett in moved it.
+
+  Two honest ways out: run JACK, which enumerates its own ports properly; or
+  teach cpal's ALSA backend to enumerate hints as well as cards, which would be
+  a small, self-contained upstream contribution benefiting custom PCMs on Linux
+  too.
 
 ---
 
@@ -269,7 +285,18 @@ Found and **deliberately left alone**, with reasons:
 
 ---
 
-## 6. Audio in is blocked by the hardware, not by the port
+## 6. Audio in works; the laptop's own microphone cannot
+
+**Resolved with a USB interface.** A Focusrite Scarlett Solo (3rd Gen) is
+claimed by FreeBSD's `uaudio` with no driver work at all — it appears as `pcm3`
+and, because `hw.snd.default_auto` is 2, becomes the default device on plug-in.
+Capture through it is verified with real signal on a wired loopback (§7), and
+playback through it was confirmed by ear.
+
+What follows is why the machine's OWN microphone is not an option, kept because
+it cost an hour and would cost the next person the same.
+
+
 
 `arecord` opens and returns samples, so the capture path works. It returns
 near-silence (peak 79/32768 at 0.9 gain) because **this laptop has no
@@ -292,21 +319,78 @@ Tangent opens (`1r:1v` in `sndstat`) — is already proven.
 
 ---
 
-## 7. What is worth doing next, in order
+## 7. Latency, measured on a wired loopback
 
-1. **Round-trip latency**, once there is an input. `examples/rtlatency.rs` is
-   on the branch: it clicks, listens, and reports min/median/mean against
-   cpal's own reported figures, so a gap between measured and claimed is itself
-   a finding. This is the number that decides whether the shim is good enough
-   or an OSS backend is required.
-2. **Device names.** `["default", "oss"]` in the audio picker is the most
-   visible remaining wart. The MIDI picker no longer has this problem (§9).
-3. Plugin editor and camera, per §5, when there is hardware to test them with.
-4. A FreeBSD **14** artifact. ABI is enforced, so it needs a 14 build host.
+Measured with `examples/rtlatency` against a **Focusrite Scarlett Solo (3rd
+Gen)** — FreeBSD's `uaudio` claims it natively, no driver work needed — with a
+1/4" cable from a line out into the instrument input, so there is no acoustic
+path and no microphone noise floor in the figure. Round trip is app-writes-a-
+sample to app-sees-it-again: output buffering, DAC, cable, ADC, input
+buffering.
+
+| Path | Round trip (median) | Spread |
+|---|---|---|
+| ALSA shim, `BufferSize::Default` | 199.7 ms | 0.3 ms |
+| ALSA shim, `Fixed(1024)` | 37.11 ms | 0.3 ms |
+| ALSA shim, `Fixed(512)` | 37.14 ms | 0.8 ms |
+| ALSA shim, `Fixed(256)` | 37.18 ms | 0.1 ms |
+| ALSA shim, `Fixed(128)` | 37.19 ms | 0.7 ms |
+| **JACK (direct OSS), 256 frames** | **28.40 ms** | 0.6 ms |
+| JACK, 128 frames | driver will not start | — |
+
+### The three things this says
+
+**1. Below 1024 frames, the requested buffer size does not change the
+latency.** Asking for 128 and asking for 1024 both land on ~37 ms. This is the
+same fact the callback-size measurement showed from the other side (§2): the
+shim does not carve a ring into periods and does not honour a period request —
+it hands over whatever is available. So the Audio Setup buffer control is, on
+this path, a control over how much work happens per callback and **not** over
+latency. That is worth knowing before anybody tunes it expecting otherwise.
+
+Changing sample rate to the device's native 48 kHz (removing the `plug`
+resampler) moved it by 0.4 ms. Setting `hw.snd.latency=0` moved it by 0.03 ms.
+Neither knob is where the time goes.
+
+**2. The shim costs about 8 ms.** jackd's OSS driver opens `/dev/dsp3`
+directly, so the JACK figure is the same hardware and the same buffer size with
+the alsa-lib layer removed: 28.4 ms against 36.7 ms. That is the price of the
+translation the handoff was right to be suspicious of — real, consistently
+reproducible, and smaller than the 199 ms a naive default costs.
+
+**3. Jitter is not the problem.** Every configuration held a spread under a
+millisecond across ten to fifteen clicks. The shim adds latency; it does not
+add instability.
+
+### What it means for this app
+
+Tangent's headline path is MIDI in, synth out — and that is **output only**.
+The 37 ms round trip contains both directions plus two conversions, so the
+figure that governs how a played note feels is roughly half of it. The full
+round trip governs monitoring a live input, which is the recorder's use.
+
+For context, the same class of interface reaches roughly 15-20 ms round trip
+under Linux/ALSA and 10-15 ms under CoreAudio, so FreeBSD is about twice the
+latency of the platforms Tangent already ships on. Usable, honestly worse, and
+now a number rather than a worry.
+
+**This is the evidence for a native OSS cpal backend, if one is ever wanted.**
+It would remove the 8 ms the shim costs and — more interestingly — restore
+meaning to the buffer-size control, since OSS itself negotiates fragments
+properly. It remains a genuine upstream contribution and is still not on the
+critical path: JACK already reaches 28 ms today for anyone who needs it, and
+the out-of-the-box path works with nothing configured.
+
+### One caveat on the numbers
+
+256 frames is the floor for jackd's OSS driver on this device — `-p 128` fails
+with "Cannot initialize driver" — and `--excl` (exclusive, direct access,
+bypassing FreeBSD's vchan mixing) changed nothing measurable. So 28 ms is the
+best this box does, not a number to be tuned down further.
 
 ---
 
-## 9. MIDI: FreeBSD reads its own, and stops needing JACK
+## 8. MIDI: FreeBSD reads its own, and stops needing JACK
 
 The port first shipped MIDI through `midir`'s `jack` feature, because that is
 the only arm in midir's backend table not keyed to an OS. It compiled, and it
@@ -377,7 +461,7 @@ busy".
 
 ---
 
-## 10. The installer
+## 9. The installer
 
 Three artifacts from `scripts/build-freebsd.sh`:
 
@@ -431,7 +515,28 @@ into `~/.local`, and owns its own uninstall.
 
 ---
 
-## 8. Reproducing
+## 10. What is worth doing next, in order
+
+1. **A FreeBSD 14 artifact**, if the tester is on 14. ABI is enforced at
+   install time, so it needs a 14 build host — nothing else about the port
+   changes. This is the only item that could block a real user today.
+2. **Device selection.** `["default", "oss"]` is the last visible wart, and §1
+   establishes it cannot be fixed from this side: cpal never asks alsa-lib for
+   hints. Teaching its ALSA backend to enumerate hints as well as cards is a
+   small upstream patch that would also help custom PCMs on Linux. Until then,
+   `sysctl hw.snd.default_unit=N` is the answer and the Audio Setup panel
+   should probably say so.
+3. **A native OSS backend for cpal**, if 37 ms is ever judged too slow. §7 puts
+   a number on what it would buy — about 8 ms, plus a buffer-size control that
+   means something. Still a real upstream contribution, still not on the
+   critical path.
+4. Plugin editor and camera, per §5, when there is hardware to test them with.
+5. The `audio.rs:1027` `max_sample_rate()` landmine in §5, which wants a fix
+   that can be tested rather than a blind one.
+
+---
+
+## 11. Reproducing
 
 ```sh
 pkg install rust git pkgconf alsa-lib alsa-plugins alsa-utils jackit \
