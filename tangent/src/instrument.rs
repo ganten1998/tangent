@@ -3017,6 +3017,13 @@ struct Renderer {
     /// of the alignment — see `publish_latency` — and the master's chain
     /// delays everything equally, so it has nothing to be aligned against.
     pdc: Vec<DelayLine>,
+    /// **The kits' own compensation lines, one per lane and one for the bare
+    /// drumpad bus.**
+    ///
+    /// Separate from `pdc` and not shared with it: a lane's own audio and the
+    /// kit standing on it are two signals arriving in one block, and running
+    /// one ring twice is what made a grouped track buzz. See `DelayLine::run`.
+    pad_pdc: Vec<DelayLine>,
     automation: tangent_ui::automation::Automation,
     /// **This block's plugin-parameter automation**, one list per bay,
     /// indexed `lane * INSERTS + bay`.
@@ -3160,6 +3167,9 @@ struct Renderer {
     /// than stored twice: two facts about which strips are groups is two
     /// facts that can disagree.
     folder_is: [bool; CHANNELS],
+    /// The total latency of every rack a lane is folded THROUGH — its
+    /// folder's, its folder's folder's, and so on. See `read_folder_tree`.
+    folder_lat: [u32; CHANNELS],
     /// Whether there are any groups at all. A desk with none — which is
     /// every desk until somebody makes one — takes none of this work.
     has_folders: bool,
@@ -3689,6 +3699,12 @@ impl Renderer {
             // the playhead now is — and before anything that mixes, because
             // twelve sites below read it. See `resolve_automation`.
             self.resolve_automation(at);
+            // **The tree first, because latency depends on it.** What a lane
+            // costs to align is its own rack plus every rack it is folded
+            // THROUGH, so the shape of the groups has to be known before
+            // anything asks. It used to be read halfway down the routing
+            // preamble, which is after `publish_latency`.
+            self.read_folder_tree();
             self.publish_latency();
             let muted = self.muted_now(muted);
             let flush = jumped || (self.was_rolling && !rolling);
@@ -3763,7 +3779,9 @@ impl Renderer {
                     sa.fill(0.0);
                 }
             }
-            // **The folder tree, and what it does to the routing.**
+            // **What the folder tree does to the ROUTING.** The tree itself
+            // was read at the top of the block — see `read_folder_tree`,
+            // which has to run before anything asks what a lane costs.
             //
             // A channel inside a group does not reach the master on its own
             // — the group does, once, after its rack has run over the sum.
@@ -3776,20 +3794,6 @@ impl Renderer {
             // through its own bus like everything else in it, or a group
             // with a clip on its own row would be heard twice — once raw and
             // once through the group.
-            self.folders = std::array::from_fn(|ch| {
-                self.shared.folder_of[ch].load(Ordering::Relaxed)
-            });
-            self.folder_is = [false; CHANNELS];
-            self.has_folders = false;
-            for ch in 0..CHANNELS {
-                let p = self.folders[ch];
-                if p >= 0 {
-                    self.has_folders = true;
-                    if let Some(f) = self.folder_is.get_mut(p as usize) {
-                        *f = true;
-                    }
-                }
-            }
             for ch in 0..CHANNELS {
                 if self.folders[ch] >= 0 || self.folder_is[ch] {
                     if let Some(d) = self.route_direct.get_mut(ch) {
@@ -5283,6 +5287,55 @@ impl Renderer {
     /// are a hundred and twenty-eight of them, they are struck rather than
     /// played back, and letting one padded with a lookahead limiter drag the
     /// whole desk late would be a strange way to lose a mix.
+    /// **Who is inside whom, and what that costs.**
+    ///
+    /// Three things fall out of one walk: which channels are folders, whether
+    /// there are any at all, and — the reason this is its own step —
+    /// `folder_lat`, the total latency of every rack a lane is folded
+    /// THROUGH on its way to the master.
+    ///
+    /// A child's audio does not go straight out: it lands in its folder's
+    /// bus, that folder's rack runs over the sum, and so on up. Each of those
+    /// racks delays it. `folder_lat` is that sum, and it is what makes a
+    /// group arrive at the same moment as a loose track instead of a bus
+    /// compressor's worth of lookahead late.
+    ///
+    /// Terminates because a parent is always a LOWER index than its child —
+    /// `set_folders` refuses any tree that is not — so walking up strictly
+    /// decreases. The bound is belt and braces on the audio thread.
+    fn read_folder_tree(&mut self) {
+        self.folders =
+            std::array::from_fn(|ch| self.shared.folder_of[ch].load(Ordering::Relaxed));
+        self.folder_is = [false; CHANNELS];
+        self.has_folders = false;
+        for ch in 0..CHANNELS {
+            let p = self.folders[ch];
+            if p >= 0 {
+                self.has_folders = true;
+                if let Some(f) = self.folder_is.get_mut(p as usize) {
+                    *f = true;
+                }
+            }
+        }
+        self.folder_lat = [0; CHANNELS];
+        if !self.has_folders {
+            return;
+        }
+        for ch in 0..CHANNELS {
+            let mut acc: u32 = 0;
+            let mut up = self.folders[ch];
+            for _ in 0..CHANNELS {
+                let Ok(p) = usize::try_from(up) else { break };
+                if p >= CHANNELS {
+                    break;
+                }
+                acc = acc.saturating_add(Rack::latency(&self.shared, p));
+                up = self.folders[p];
+            }
+            self.folder_lat[ch] = acc;
+        }
+    }
+
     fn publish_latency(&self) {
         let mut max = 0;
         for lane in 0..CHANNELS {
@@ -5296,7 +5349,14 @@ impl Renderer {
                 .get(lane)
                 .map_or(0, |_| Rack::latency(&self.shared, lane));
             self.shared.lane_latency[lane].store(l, Ordering::Relaxed);
-            max = max.max(l);
+            // **Plus every rack it is folded THROUGH.** A track in a group
+            // with a lookahead limiter on the group pays that limiter, so
+            // the target everything aligns to has to be big enough to cover
+            // it — otherwise the wait comes out negative, clamps at zero,
+            // and the group is simply late. The READOUT above stays the
+            // lane's own rack: that is what this lane costs, and the bus is
+            // the bus's line.
+            max = max.max(l.saturating_add(self.folder_lat[lane]));
         }
         // **The alignment target is the channels alone.** See `max_latency`:
         // the master delays every source equally, so aligning to it makes
@@ -5432,6 +5492,22 @@ impl Renderer {
         // wait for. Read once per block: it changes when a plugin is loaded,
         // not within a buffer.
         let pdc = self.shared.max_latency.load(Ordering::Relaxed);
+        // **And how much of that each LANE pays for itself.**
+        //
+        // A clip bypasses its channel's rack, so what it does not pay is the
+        // whole of the maximum — unless the lane is in a group, where every
+        // rack it is folded through runs over it after this, or IS a group,
+        // where the folder's own rack does. A single figure for all sixteen
+        // held a grouped clip back for a delay it was about to pay again,
+        // and the group came out late by exactly its bus's lookahead.
+        let hold: [u64; CHANNELS] = std::array::from_fn(|ch| {
+            let after = self.folder_lat[ch].saturating_add(if self.folder_is[ch] {
+                Rack::latency(&self.shared, ch)
+            } else {
+                0
+            });
+            u64::from(pdc.saturating_sub(after))
+        });
         let mut peak = [[0.0f32; 2]; CHANNELS];
         for f in 0..frames {
             for lane in 0..CHANNELS {
@@ -5469,10 +5545,17 @@ impl Renderer {
             // other position a clip does not cover: nothing. The per-lane
             // gain smoothing above has already run, so the fader still
             // settles across these frames.
-            let Some(p) = (at + f as u64).checked_sub(u64::from(pdc)) else {
-                continue;
-            };
+            //
+            // **Per LANE, so a grouped clip is held back only by what it has
+            // not already paid.** The subtraction moved inside the clip loop
+            // for that: it is one `u64` per clip per frame, beside work that
+            // already reads the clip's own fields.
+            let now = at + f as u64;
             for placed in &self.clips {
+                let lane = placed.strip.min(CHANNELS - 1);
+                let Some(p) = now.checked_sub(hold[lane]) else {
+                    continue;
+                };
                 let Some(k) = p.checked_sub(placed.start) else {
                     continue;
                 };
@@ -5967,8 +6050,15 @@ impl Renderer {
         // the comment on the send-destination pass says so: a destination's
         // rack processes what is sent to it, exactly as the drum bus
         // processes its summed kit. The drums are one more thing arriving.
+        // **Not over a kit standing on a FOLDER.** That folder's rack runs
+        // once, in `fold_folders`, over the whole group — see the note in
+        // `mix_channels`. Running it here as well processed the kit twice a
+        // block, which for anything with state is noise: the same double-run
+        // that made a grouped track static, in the one writer that did not
+        // get the rule.
         let bus_rack = bus_strip.index();
-        if !self.racks[bus_rack].is_empty() {
+        let folded_here = drum_lane.is_some_and(|ch| self.folder_is[ch]);
+        if !folded_here && !self.racks[bus_rack].is_empty() {
             run_rack(
                 &mut self.racks[bus_rack],
                 &mut self.fx_in,
@@ -5978,6 +6068,30 @@ impl Renderer {
                 &[],
                 NO_AUTOMATION,
             );
+        }
+        // **The kit waits for the slowest chain, like every other source.**
+        //
+        // It never did. A lane's own audio is held for `max - its own rack`
+        // and the clips are held too, but the kit standing on that lane went
+        // straight out — so with any lookahead plugin loaded anywhere, the
+        // drums played EARLY against everything else by up to the whole
+        // compensation. Same formula as the channel loop's, for the same
+        // reason: wait for what this audio does not pay on its way out.
+        {
+            let ch = drum_lane.unwrap_or(CHANNELS);
+            let own = Rack::latency(&self.shared, bus_rack);
+            let folded = drum_lane.map_or(0, |c| self.folder_lat[c]);
+            let wait = usize::try_from(
+                self.shared
+                    .max_latency
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(own)
+                    .saturating_sub(folded),
+            )
+            .unwrap_or(0);
+            if let Some(line) = self.pad_pdc.get_mut(ch) {
+                line.run(&mut self.fx_in, frames, wait);
+            }
         }
         // The fold: the DRUMS strip's fader, pan, send and peak, exactly as
         // every other strip does it.
@@ -6483,16 +6597,25 @@ impl Renderer {
             // plugin off does not leave the lane early by its own latency
             // for one block before the figures catch up.
             {
-                // A folder's row has passed through NO rack yet — its own
-                // runs over the sum — so it waits the whole of the maximum,
-                // which is exactly what its children's stems have already
-                // waited. Row and children therefore meet aligned.
-                let own = if is_folder {
-                    0
-                } else {
-                    Rack::latency(&self.shared, ch)
-                };
-                let want = usize::try_from(pdc_max.saturating_sub(own)).unwrap_or(0);
+                // **One formula, folder or not: wait for what this lane's
+                // audio does NOT pay on its way out.**
+                //
+                // A wait is additive, so where it is inserted does not
+                // matter — only the total. A loose channel pays its own
+                // rack. A child pays its own rack and then every rack it is
+                // folded through. A folder's own row pays no rack HERE, but
+                // its rack runs over the sum a moment later, so it pays it
+                // just the same. All three come to `own + folded through`,
+                // which is why the special case that used to sit here was
+                // both unnecessary and wrong: it left a group a bus
+                // compressor's lookahead late.
+                let own = Rack::latency(&self.shared, ch);
+                let want = usize::try_from(
+                    pdc_max
+                        .saturating_sub(own)
+                        .saturating_sub(self.folder_lat[ch]),
+                )
+                .unwrap_or(0);
                 if let Some(line) = self.pdc.get_mut(ch) {
                     line.run(&mut self.fx_in, frames, want);
                 }
@@ -7401,6 +7524,7 @@ impl Engine {
             maps_retiring,
             auto: AutoNow::default(),
             pdc: (0..CHANNELS).map(|_| DelayLine::new()).collect(),
+            pad_pdc: (0..=CHANNELS).map(|_| DelayLine::new()).collect(),
             automation: tangent_ui::automation::Automation::default(),
             // **Grown once, here.** Sixteen parameters a bay is more than any
             // song has ever automated on one effect, and the whole table is
@@ -7470,6 +7594,7 @@ impl Engine {
             stem_scratch: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
             folders: [-1; CHANNELS],
             folder_is: [false; CHANNELS],
+            folder_lat: [0; CHANNELS],
             has_folders: false,
             scope_tx,
             scope_scratch: vec![0.0; MAX_CALLBACK_FRAMES * TAP_CHANNELS],
@@ -8211,6 +8336,12 @@ impl Engine {
         failed.sort_unstable();
         failed.dedup();
         failed
+    }
+
+    /// What the aligners are currently aiming at, in frames.
+    #[cfg(test)]
+    fn published_max_latency_for_test(&self) -> u32 {
+        self.shared.max_latency.load(Ordering::Relaxed)
     }
 
     /// How many `row * INSERTS + bay` slots the automation table holds.
@@ -11285,6 +11416,7 @@ mod tests {
             stem_scratch: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
             folders: [-1; CHANNELS],
             folder_is: [false; CHANNELS],
+            folder_lat: [0; CHANNELS],
             has_folders: false,
             scope_tx: RingBuffer::<f32>::new(1 << 15).0,
             scope_scratch: vec![0.0; MAX_CALLBACK_FRAMES * TAP_CHANNELS],
@@ -11389,6 +11521,7 @@ mod tests {
             maps_retiring: RingBuffer::<Maps>::new(2).0,
             auto: AutoNow::default(),
             pdc: (0..CHANNELS).map(|_| DelayLine::new()).collect(),
+            pad_pdc: (0..=CHANNELS).map(|_| DelayLine::new()).collect(),
             automation: tangent_ui::automation::Automation::default(),
             // **Grown once, here.** Sixteen parameters a bay is more than any
             // song has ever automated on one effect, and the whole table is
@@ -12282,6 +12415,153 @@ mod tests {
         assert!(
             e.auto_params_len_for_test() > widest.0 * INSERTS + widest.1,
             "the automation table is smaller than the bays it is handed"
+        );
+    }
+
+    /// **A group waits for the racks it is folded through, and no longer.**
+    ///
+    /// Delay compensation aligns everything to one moment. A loose track
+    /// pays its own rack; a track in a group pays its own rack AND the
+    /// group's, because the group's runs over the sum afterwards. The
+    /// alignment target only counted a lane's own rack, so a bus compressor
+    /// bought the whole group a lookahead's worth of lateness that nothing
+    /// waited for.
+    ///
+    /// Measured through the published figure rather than by ear, because
+    /// what an offline engine can hold is the arithmetic: an empty rack does
+    /// not really delay, so a fixture can state what a chain COSTS but not
+    /// make it cost that.
+    #[test]
+    fn the_alignment_target_counts_the_racks_a_group_folds_through() {
+        let render = |wire: &dyn Fn(&mut Engine)| -> u32 {
+            let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+            wire(&mut e);
+            e.set_rolling(false);
+            let mut out = vec![0.0f32; 256 * 2];
+            e.render_offline(&mut out);
+            e.published_max_latency_for_test()
+        };
+
+        // A loose track with a 64-frame chain: everything waits 64.
+        let flat = render(&|e| {
+            e.set_seat_latency_for_test(4, 0, 64);
+        });
+        assert_eq!(flat, 64, "a loose lane's own rack is the target");
+
+        // The SAME plugin, on a folder with a child under it. The child's
+        // audio passes through that rack on the way out, so the deepest path
+        // is 64 and not zero.
+        let grouped = render(&|e| {
+            e.set_seat_latency_for_test(3, 0, 64);
+            let mut parents = [-1i32; CHANNELS];
+            parents[5] = 3;
+            assert!(e.set_folders(parents), "the tree was refused");
+        });
+        assert_eq!(
+            grouped, 64,
+            "the group's own rack was not counted, so nothing waited for it"
+        );
+
+        // And they ADD: a child with its own chain inside a folder with one
+        // pays both, one after the other.
+        let both = render(&|e| {
+            e.set_seat_latency_for_test(3, 0, 64);
+            e.set_seat_latency_for_test(5, 0, 32);
+            let mut parents = [-1i32; CHANNELS];
+            parents[5] = 3;
+            assert!(e.set_folders(parents), "the tree was refused");
+        });
+        assert_eq!(both, 96, "a child's own rack and its group's did not add");
+
+        // Two levels deep, and the whole chain counts.
+        let nested = render(&|e| {
+            e.set_seat_latency_for_test(1, 0, 16);
+            e.set_seat_latency_for_test(3, 0, 64);
+            e.set_seat_latency_for_test(7, 0, 32);
+            let mut parents = [-1i32; CHANNELS];
+            parents[3] = 1;
+            parents[7] = 3;
+            assert!(e.set_folders(parents), "the nested tree was refused");
+        });
+        assert_eq!(nested, 112, "a folder inside a folder did not add up");
+
+        // Ungrouping puts it back: the tree is read every block, so pulling
+        // a track out of a folder stops it paying that folder's chain.
+        let freed = render(&|e| {
+            e.set_seat_latency_for_test(3, 0, 64);
+            e.set_seat_latency_for_test(5, 0, 32);
+            assert!(e.set_folders([-1i32; CHANNELS]), "the empty tree was refused");
+        });
+        assert_eq!(freed, 64, "a freed lane still paid its old group");
+    }
+
+    /// **A kit is compensated, and a kit on a folder is processed once.**
+    ///
+    /// Two things the drum bus was missing, both of the same shape as the
+    /// bugs above it. It ran no delay line at all, so with any lookahead
+    /// plugin loaded the drums played EARLY against every other source by up
+    /// to the whole compensation. And it ran the lane's rack over the kit
+    /// even when that lane was a folder, whose rack runs again over the
+    /// group — the double-run that reads as static, in the one writer that
+    /// had not been given the rule.
+    ///
+    /// Measured as SILENCE at the head: a kit held back by `n` frames emits
+    /// nothing for those frames, which an offline render can see exactly.
+    #[test]
+    fn a_kit_waits_for_the_graph_like_every_other_source() {
+        use std::sync::Arc;
+        // Frames of silence before the kit's first sample.
+        let head = |wire: &dyn Fn(&mut Engine)| -> usize {
+            let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+            e.set_pad_kit(5, test_kit(&[0], 4_800, 0.5));
+            e.set_drum_strips(1 << 5);
+            e.set_channel_gain(5, 1.0);
+            e.set_master_gain(1.0);
+            wire(&mut e);
+            e.set_rolling(false);
+            let mut out = vec![0.0f32; 1024 * 2];
+            for _ in 0..4 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+            }
+            e.set_midi_clips(vec![PlacedMidi {
+                strip: 5, start: 0, len: 48_000,
+                notes: Arc::new(vec![ClipNote { at: 0, dur: 2_400, key: PAD_BASE, vel: 100 }]),
+            }]);
+            e.set_transport(1, 0);
+            e.set_rolling(true);
+            let mut all = Vec::new();
+            for _ in 0..3 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                all.extend(out.chunks_exact(2).map(|c| c[0]));
+            }
+            all.iter().position(|v| v.abs() > 1.0e-4).unwrap_or(all.len())
+        };
+
+        // Nothing has latency: the kit starts where it always did.
+        let bare = head(&|_| {});
+        assert!(bare < 64, "the fixture does not start promptly: {bare}");
+
+        // Something else in the session is 256 frames late. The kit has to
+        // wait for it, or it arrives 256 frames early against that track.
+        let waited = head(&|e| e.set_seat_latency_for_test(4, 0, 256));
+        assert!(
+            waited >= bare + 250 && waited <= bare + 262,
+            "the kit did not wait for the graph: {waited} against {bare}"
+        );
+
+        // In a group whose bus is what carries the latency, the kit waits
+        // LESS, because it is about to pay that rack on the way through.
+        let grouped = head(&|e| {
+            e.set_seat_latency_for_test(3, 0, 256);
+            let mut parents = [-1i32; CHANNELS];
+            parents[5] = 3;
+            assert!(e.set_folders(parents), "the tree was refused");
+        });
+        assert!(
+            grouped < bare + 64,
+            "a grouped kit waited for a delay it pays again in the fold: {grouped}"
         );
     }
 
