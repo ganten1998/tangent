@@ -98,10 +98,6 @@ eframe = { version = "0.33", default-features = false, features = [
 # context. Without one those go nowhere and a startup failure reports only the
 # LAST thing that broke.
 log = "0.4"
-# MIDI in. **On FreeBSD this line alone does not compile** — see the
-# `target_os = "freebsd"` section below, which adds the one feature that gives
-# midir a backend there at all.
-midir = "0.11"
 rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -164,33 +160,27 @@ egui-wgpu = { version = "0.33", default-features = false }
 wgpu = { version = "27", default-features = false, features = ["vulkan", "gles"] }
 egui-wgpu = { version = "0.33", default-features = false }
 
-# **FreeBSD's MIDI backend, and the reason the port compiles at all.**
+# **MIDI in — everywhere midir actually has a backend.**
 #
 # midir 0.11's backend table (`src/backend/mod.rs`) declares a module for
 # windows / macos / ios / linux / wasm / android and NOTHING ELSE. On FreeBSD no
-# arm matches, so no backend module is declared, every re-export resolves to
-# nothing, and the failure is inside midir rather than here — which is exactly
-# the wall the first FreeBSD tester hit. There is no `cfg` we can write in our
-# own source to work around a dependency that does not build.
+# arm matches, no backend module is declared, every re-export resolves to
+# nothing, and the crate fails to compile — which is the wall the first FreeBSD
+# tester hit, and not something a `cfg` in our own source can work around.
 #
-# The one arm in that table that is NOT keyed to an OS is the JACK one:
+# midir's only OS-agnostic arm is `feature = "jack"`, and the port shipped that
+# way first because it built. It was the wrong shape: it made libjack a
+# link-time dependency of the whole app and it meant NO KEYBOARD WORKED until
+# the user installed JACK and started the server. For a DAW that is a fair ask;
+# for a MIDI keyboard monitor it is the product not working out of the box.
 #
-#     #[cfg(all(feature = "jack", not(target_os = "windows")))]
-#
-# so asking for `jack` gives FreeBSD a real, supported backend instead of a
-# vendored fork of somebody else's crate that we would then own forever. It also
-# means MIDI keeps working rather than being cfg'd out — this app is a MIDI
-# keyboard monitor first, so a build with no MIDI in it is not the app.
-#
-# The cost is honest and worth naming: libjack becomes a build- and link-time
-# dependency of the FreeBSD build (`audio/jack` in ports), and MIDI ports only
-# appear while a JACK server is running. Audio does NOT inherit that constraint
-# — cpal still defaults to ALSA-over-OSS and makes sound with nothing running
-# (see tangent-record/Cargo.toml). The native answer for out-of-the-box MIDI is
-# a `/dev/umidi*` backend, which FreeBSD has and no Rust crate wraps; that is a
-# follow-on, not a blocker.
-[target.'cfg(target_os = "freebsd")'.dependencies]
-midir = { version = "0.11", features = ["jack"] }
+# So FreeBSD is simply not a midir platform any more. `tangent/src/umidi.rs`
+# reads `/dev/umidi*` directly — the native interface, which no Rust crate
+# wraps, which is the real reason midir has no arm for it. That leaves JACK as
+# a pro-audio *option* (cpal still offers the host) rather than a precondition
+# for MIDI existing.
+[target.'cfg(not(target_os = "freebsd"))'.dependencies]
+midir = "0.11"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # **Where the cursor is during a FILE DRAG**, which is the one time the

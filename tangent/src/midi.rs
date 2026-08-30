@@ -17,6 +17,21 @@
 //! So the callback feeds both, and the raw side is teed **before**
 //! `parse_message` runs rather than reconstructed after it.
 
+/// **FreeBSD reads its own MIDI, and everything below this line is unchanged.**
+///
+/// midir 0.11 has no FreeBSD backend — the crate does not compile there — and
+/// its only OS-agnostic arm is JACK, which would mean no keyboard works until
+/// the user installs and starts a JACK server. `crate::umidi` opens
+/// `/dev/umidi*` directly and offers the same five calls this file makes, so
+/// the whole platform difference is this alias: `midir::MidiInput`,
+/// `midir::Ignore` and `midir::MidiInputConnection` below resolve to it.
+///
+/// A local `use` shadows the extern crate name inside this module only, which
+/// is exactly the blast radius wanted — nothing else in the app can reach the
+/// FreeBSD backend by accident.
+#[cfg(target_os = "freebsd")]
+use crate::umidi as midir;
+
 use tangent_ui::midi_event::parse_message;
 pub use tangent_ui::midi_event::MidiEvent;
 use std::collections::VecDeque;
