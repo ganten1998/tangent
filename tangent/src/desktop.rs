@@ -421,6 +421,14 @@ impl ArrRec {
 /// The standalone app: `IvoryApp`, plus the eframe trait impl it cannot carry.
 pub struct DesktopApp {
     app: IvoryApp,
+    /// **Whether the window is currently covering its whole screen** because
+    /// it is borderless AND maximised. See `crate::macwin::cover_screen`.
+    ///
+    /// A latch, not a per-frame call: `setFrame` fires once on the way in and
+    /// the presentation options once on the way out. Sending either every
+    /// frame fights AppKit's own zoom animation, which is the same lesson the
+    /// aspect snap already learned two hundred lines up.
+    covering_screen: bool,
     /// The hardware MIDI fast lane, cloned out of `DeviceMidi` before the
     /// ports box swallows it. `start_engine` seats each fresh engine's ring
     /// here; the midir callback plays through it. See `midi::MidiFastLane`.
@@ -1909,7 +1917,14 @@ impl DesktopApp {
         // once a frame, and pushed before the state borrow below takes the
         // app for the rest of this function.
         if let Some(e) = self.recorder.engine.as_ref() {
-            self.app.note_drumpad_peaks(e.pad_peaks());
+            // **The pads light for the kit the window is SHOWING.** With a
+            // full instance per channel there is a meter per lane, and the
+            // window is looking at one of them — the first, until it learns
+            // to choose.
+            let lane = (0..tangent_ui::recorder::CHANNELS)
+                .find(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::DRUMPAD_PATH))
+                .unwrap_or(0);
+            self.app.note_drumpad_peaks(e.pad_peaks(lane));
         }
         // **The alias replaces the interface's name, once, for all of it.**
         // Read BEFORE the state borrow, like everything else here: the app is
@@ -3469,6 +3484,14 @@ impl DesktopApp {
             self.switch_project(file);
             return;
         }
+        if purpose == tangent_ui::ports::FilePurpose::KitPreset {
+            // The app owns this whole move: it reads the preset, copies each
+            // sample into the project through the same `drumpad_load` a drop
+            // uses, and marks the kit dirty so the reload below this frame
+            // decodes and pushes it.
+            self.app.apply_kit_preset(file);
+            return;
+        }
         if purpose == tangent_ui::ports::FilePurpose::ClickSample {
             // Only the PATH is stored — the decode happens on the flag below
             // this frame, on the same road the bundled asset takes, so a file
@@ -4363,13 +4386,24 @@ impl DesktopApp {
         e.set_automation(self.app.engine_automation());
         // The built-in: rendered by the engine itself when a channel's
         // first bay names it — the live walk's own rule.
-        let builtin = (0..tangent_ui::recorder::CHANNELS)
-            .find(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::BUILTIN_PATH));
+        let builtin_lanes: Vec<usize> = (0..tangent_ui::recorder::CHANNELS)
+            .filter(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::BUILTIN_PATH))
+            .collect();
+        e.set_builtin_strips(builtin_lanes.iter().fold(0u32, |m, ch| m | 1 << ch.min(&31)));
+        let builtin = builtin_lanes.first().copied();
         e.set_builtin_strip(builtin);
-        e.set_drum_strip(
-            (0..tangent_ui::recorder::CHANNELS)
-                .find(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::DRUMPAD_PATH)),
-        );
+        // **Every lane holding the drumpad.**
+        //
+        // `.find()` alone was the bug: a drum instrument loads a full
+        // instance per channel everywhere else, so the second lane was
+        // silent while the shared pads lit up for the first. The mask is the
+        // answer; the single index remains for the parts of the engine that
+        // have not learned about lanes yet, and both come from this one walk
+        // so they cannot disagree about which lane is first.
+        let drum_lanes: Vec<usize> = (0..tangent_ui::recorder::CHANNELS)
+            .filter(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::DRUMPAD_PATH))
+            .collect();
+        e.set_drum_strips(drum_lanes.iter().fold(0u32, |m, ch| m | 1 << ch.min(&31)));
         // The DX7's sound is the SESSION's cartridge — the live engine
         // already carries it, so the export borrows the loaded copy.
         if builtin.is_some() {
@@ -4453,18 +4487,29 @@ impl DesktopApp {
         }
         // ── the pads, decoded at the export rate ──
         {
-            let mut kit = crate::instrument::PadKit::default();
-            for (i, path) in self.app.drumpad_paths().iter().enumerate() {
-                let Some(path) = path else { continue };
-                if let (Ok(c), Some(slot)) = (
-                    tangent_record::decode::decode(path, rate),
-                    kit.pads.get_mut(i),
-                ) {
-                    *slot = Some(Arc::new(c));
+            // **Each drum lane's own kit**, decoded at the export rate. The
+            // live path does the same; an export that gave every lane one
+            // kit would render a song nobody was listening to.
+            for lane in (0..tangent_ui::recorder::CHANNELS)
+                .filter(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::DRUMPAD_PATH))
+            {
+                let mut kit = crate::instrument::PadKit::default();
+                for (i, path) in self.app.drumpad_paths_of(lane).iter().enumerate() {
+                    let Some(path) = path else { continue };
+                    if let (Ok(c), Some(slot)) = (
+                        tangent_record::decode::decode(path, rate),
+                        kit.pads.get_mut(i),
+                    ) {
+                        *slot = Some(Arc::new(c));
+                    }
                 }
+                e.set_pad_kit(lane, kit);
             }
-            e.set_pad_kit(kit);
-            e.set_pad_params(&self.app.drum_kit_params());
+            for lane in (0..tangent_ui::recorder::CHANNELS)
+                .filter(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::DRUMPAD_PATH))
+            {
+                e.set_pad_params(lane, &self.app.drum_kit_params_of(lane));
+            }
         }
         e.set_stems(spec.stems);
         e.set_transport(1, (from_s * f64::from(rate)).round() as u64);
@@ -5214,7 +5259,18 @@ impl DesktopApp {
             .engine
             .as_ref()
             .map_or(48_000, |e| e.output().sample_rate);
-        let paths = self.app.drumpad_paths();
+        // **Each drum lane's OWN kit.** A drum instrument loads a full
+        // instance per channel, so this decodes once per lane — the cache
+        // below means two lanes naming the same file decode it once and
+        // share the `Arc`.
+        let lanes: Vec<usize> = (0..tangent_ui::recorder::CHANNELS)
+            .filter(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::DRUMPAD_PATH))
+            .collect();
+        // The window's own lane is the one whose load STATUS the pads show.
+        let shown = self.app.drumpad_lane();
+        let mut delivered_all = !lanes.is_empty();
+        for lane in lanes.iter().copied() {
+        let paths = self.app.drumpad_paths_of(lane);
         let mut kit = crate::instrument::PadKit::default();
         let mut status: [tangent_ui::ports::PadStatus; crate::instrument::PADS] =
             std::array::from_fn(|_| tangent_ui::ports::PadStatus::default());
@@ -5244,22 +5300,33 @@ impl DesktopApp {
                 _ => {}
             }
         }
-        // Files no pad references any more leave the cache with the edit.
-        self.pad_cache
-            .retain(|path, _| paths.iter().flatten().any(|p| p == path));
         // **The pads only LIGHT once the kit actually LANDED.** A full ring
         // under a stalled callback — or no engine at all — used to drop the
         // kit silently while the ghosts drew anyway, and the Windows
         // tester's pads struck the DX7. Undelivered = try again next frame,
         // until the audio thread really has it.
-        let delivered = self
+        let landed = self
             .recorder
             .engine
             .as_mut()
-            .is_some_and(|e| e.set_pad_kit(kit));
-        if delivered {
+            .is_some_and(|e| e.set_pad_kit(lane, kit));
+        delivered_all &= landed;
+        // The status belongs to the kit the WINDOW is showing: it is what
+        // draws those pads' names, waveforms and missing-file marks.
+        if landed && lane == shown {
             self.app.set_drumpad_status(status);
-        } else {
+        }
+        }
+        // Files no pad references any more leave the cache with the edit —
+        // asked across EVERY lane, or loading a second kit would evict the
+        // first one's samples.
+        let live: Vec<std::path::PathBuf> = lanes
+            .iter()
+            .flat_map(|l| self.app.drumpad_paths_of(*l))
+            .flatten()
+            .collect();
+        self.pad_cache.retain(|path, _| live.iter().any(|p| p == path));
+        if !delivered_all {
             self.recorder.pads_retry = true;
         }
     }
@@ -5764,7 +5831,14 @@ impl DesktopApp {
         e.set_desk(&self.app.desk());
         // The drumpad's knobs, whole, on the desk's own bargain: atomic
         // stores of numbers that only move when a hand is on them.
-        e.set_pad_params(&self.app.drum_kit_params());
+        // **The knobs, to every lane holding a kit.** One document kit still,
+        // so they all get the same numbers; per-lane kits change what is sent
+        // and not this loop.
+        for lane in (0..tangent_ui::recorder::CHANNELS)
+            .filter(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::DRUMPAD_PATH))
+        {
+            e.set_pad_params(lane, &self.app.drum_kit_params_of(lane));
+        }
         // **The microphone fader, and it goes to ONE place now.** It used to
         // go to two — the session's writer thread and the engine — because the
         // writer was where the dry capture became the take. The take is the
@@ -5779,6 +5853,7 @@ impl DesktopApp {
             [None; tangent_ui::recorder::INPUTS];
         let mut next_pick = 0usize;
         let mut builtin: Option<usize> = None;
+        let mut builtin_mask = 0u32;
         let armed = self.app.armed_mask();
         let selected = self.app.selected_channel();
         // **The desk's EXPLICIT input bindings, when any channel has one.**
@@ -5802,10 +5877,15 @@ impl DesktopApp {
                     // that read each other, one of which silences all the
                     // rest — not a decision to make a bit at a time in the
                     // middle of the input picks.
-                    if builtin.is_none()
-                        && self.app.insert(ch, 0) == Some(tangent_ui::dialogs::BUILTIN_PATH)
-                    {
-                        builtin = Some(ch);
+                    // **EVERY lane holding it, not the first.** `is_none()`
+                    // here was the DX7's half of the same bug the drumpad
+                    // had: duplicate a built-in instrument track and the
+                    // copy took MIDI and made no sound.
+                    if self.app.insert(ch, 0) == Some(tangent_ui::dialogs::BUILTIN_PATH) {
+                        builtin_mask |= 1 << ch.min(31);
+                        if builtin.is_none() {
+                            builtin = Some(ch);
+                        }
                     }
                 }
                 Some(tangent_ui::recorder::ChannelKind::Audio) => {
@@ -5868,13 +5948,22 @@ impl DesktopApp {
             }
             e.set_punches(punches);
         }
+        e.set_builtin_strips(builtin_mask);
         e.set_builtin_strip(builtin);
-        // The drumpad's lane, by the same bay-1 sentinel rule — any kind of
+        // The drumpad's lanes, by the same bay-1 sentinel rule — any kind of
         // channel counts, because playback does not ask the arm.
-        e.set_drum_strip(
-            (0..tangent_ui::recorder::CHANNELS)
-                .find(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::DRUMPAD_PATH)),
-        );
+        // **Every lane holding the drumpad.**
+        //
+        // `.find()` alone was the bug: a drum instrument loads a full
+        // instance per channel everywhere else, so the second lane was
+        // silent while the shared pads lit up for the first. The mask is the
+        // answer; the single index remains for the parts of the engine that
+        // have not learned about lanes yet, and both come from this one walk
+        // so they cannot disagree about which lane is first.
+        let drum_lanes: Vec<usize> = (0..tangent_ui::recorder::CHANNELS)
+            .filter(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::DRUMPAD_PATH))
+            .collect();
+        e.set_drum_strips(drum_lanes.iter().fold(0u32, |m, ch| m | 1 << ch.min(&31)));
         // Never read from a settings file — see `IvoryApp::input_monitor`. It
         // is pushed every frame like every other monitor setting, and its value
         // at launch is false because the field it comes from starts false.
@@ -6637,6 +6726,46 @@ impl DesktopApp {
         WindowFacts::default()
     }
 
+    /// **Borderless AND maximised means the whole screen**, and anything
+    /// else means an ordinary window.
+    ///
+    /// Maximised means *the work area* on every platform — the screen minus
+    /// what the shell reserves — and that is right for a window with a title
+    /// bar and wrong for one without. Taking the frame off was the request to
+    /// use the display; keeping a strip of dead desktop along two edges is
+    /// the opposite of it.
+    ///
+    /// Fullscreen is excluded deliberately: the OS is already doing this, and
+    /// a second opinion about the frame arriving mid-animation is a fight.
+    ///
+    /// Latched on `covering_screen` so each direction fires exactly once.
+    #[cfg(target_os = "macos")]
+    fn reconcile_screen_cover(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        let (maximised, fullscreen) = ctx.input(|i| {
+            let v = i.viewport();
+            (v.maximized.unwrap_or(false), v.fullscreen.unwrap_or(false))
+        });
+        let want = self.app.borderless() && maximised && !fullscreen;
+        if want == self.covering_screen {
+            return;
+        }
+        if want {
+            // Only latch if the window was actually found and moved, so a
+            // failure retries next frame rather than latching a lie.
+            self.covering_screen = crate::macwin::cover_screen(frame);
+        } else {
+            crate::macwin::uncover_screen();
+            self.covering_screen = false;
+        }
+    }
+
+    /// No-op off macOS for now. Windows and Linux have the same rule and a
+    /// different mechanism — `ViewportCommand::Fullscreen` with the
+    /// decorations already off is the usual answer there — and neither is
+    /// wired up, so nothing pretends to be.
+    #[cfg(not(target_os = "macos"))]
+    fn reconcile_screen_cover(&mut self, _ctx: &egui::Context, _frame: &eframe::Frame) {}
+
     fn drag_pointer(ctx: &egui::Context) -> Option<egui::Pos2> {
         if ctx.input(|i| i.raw.hovered_files.is_empty()) {
             return None;
@@ -6810,6 +6939,7 @@ impl DesktopApp {
             pushed_auto: None,
             midi_lane,
             app,
+            covering_screen: false,
             #[cfg(feature = "recorder")]
             recorder,
             splash: Some(Splash {
@@ -6995,6 +7125,7 @@ impl eframe::App for DesktopApp {
         let facts = Self::window_facts(frame, &self.app);
         self.app.set_host_gesture(facts.gesture);
         self.app.set_os_aspect_lock(facts.os_aspect_lock);
+        self.reconcile_screen_cover(ctx, frame);
         // **The first frame is the SPLASH and nothing else.**
         //
         // The app's first `frame` costs about a second — the font atlas is

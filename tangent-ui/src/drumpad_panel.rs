@@ -164,6 +164,10 @@ pub enum Hit {
     MediaRow(usize),
     /// Clear the selected pad.
     Clear,
+    /// **SAVE**: write this lane's kit out as a `.tgkit` preset.
+    SaveKit,
+    /// **LOAD**: put a saved preset on this lane.
+    LoadKit,
     /// The title strip's empty run: pick the panel up and move it.
     Strip,
 }
@@ -201,6 +205,9 @@ pub struct Layout {
     pub close: Rect,
     pub midi: Rect,
     pub def: Rect,
+    /// The two kit-preset chips, left of DEF. See [`Hit::SaveKit`].
+    pub save_kit: Rect,
+    pub load_kit: Rect,
     pub grid: Rect,
     pub pads: [Rect; DRUM_PAGE],
     /// The bank band's cells, one per page, top page first.
@@ -228,6 +235,8 @@ impl Layout {
             close: Rect::NOTHING,
             midi: Rect::NOTHING,
             def: Rect::NOTHING,
+            save_kit: Rect::NOTHING,
+            load_kit: Rect::NOTHING,
             grid: Rect::NOTHING,
             pads: [Rect::NOTHING; DRUM_PAGE],
             banks: [Rect::NOTHING; DRUM_PAGES],
@@ -263,6 +272,11 @@ impl Layout {
         let close = cell(side);
         let midi = cell(side * 2.2);
         let def = cell(side * 2.2);
+        // **The kit chips, walking left from DEF.** A kit is a thing you
+        // keep, and until now the only copy of one lived inside whichever
+        // project it was built in.
+        let save_kit = cell(side * 2.2);
+        let load_kit = cell(side * 2.2);
 
         // **The panel is twice the machine now**: pads and inspector on
         // the LEFT half, the media explorer on the right — browse, then
@@ -354,6 +368,8 @@ impl Layout {
             close,
             midi,
             def,
+            save_kit,
+            load_kit,
             grid,
             pads,
             banks,
@@ -568,6 +584,10 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
     chip(painter, l.midi, "MIDI", view.midi_on, INK);
     // DEF: the current folder IS the remembered one while lit.
     chip(painter, l.def, "DEF", view.def_lit, AMBER);
+    // **The kit pair, never lit**: they are actions, not states. MIDI and DEF
+    // light because they say what is true; these two do a thing and are done.
+    chip(painter, l.save_kit, "SAVE", false, INK);
+    chip(painter, l.load_kit, "LOAD", false, INK);
     if l.close.is_positive() {
         let c = l.close.center();
         let a = l.close.width() * 0.28;
@@ -929,6 +949,8 @@ pub fn hit_test(rect: Rect, view: &DrumpadView<'_>, pos: Pos2) -> Option<Hit> {
         (l.close, Hit::Close),
         (l.midi, Hit::Midi),
         (l.def, Hit::Def),
+        (l.save_kit, Hit::SaveKit),
+        (l.load_kit, Hit::LoadKit),
     ] {
         if r.is_positive() && r.contains(pos) {
             return Some(hit);

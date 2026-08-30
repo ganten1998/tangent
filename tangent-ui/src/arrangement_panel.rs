@@ -154,6 +154,23 @@ pub struct AutoView<'a> {
     pub points: &'a [crate::automation::Point],
     /// The point under the pointer or being dragged, so it can be drawn lit.
     pub hot: Option<usize>,
+    /// **The points that are CHOSEN**, by index into `points`.
+    ///
+    /// Separate from `hot`, which is one point and is about the pointer.
+    /// These are what Delete, copy and cut act on, and a thing those keys
+    /// will act on has to look chosen before it is pressed — the same
+    /// argument `selected` makes for the row.
+    ///
+    /// Owned, like `label` beside it: the app resolves this from a selection
+    /// held as `(lane, slot, index)` triples, and there is no slice on its
+    /// side already shaped the way a row wants. A handful of `usize` per
+    /// open row per frame, against a `String` that is already allocated here.
+    pub chosen: Vec<usize>,
+    /// **The keyboard is aimed at this row**, so Delete would close it.
+    ///
+    /// Drawn as the rim a chosen track wears, for the same reason: a thing
+    /// the Delete key will act on has to look chosen before it is pressed.
+    pub selected: bool,
     /// **Where the control is standing right now**, normalised, for a curve
     /// with no points on it yet.
     ///
@@ -218,39 +235,80 @@ pub fn auto_header(header: Rect) -> AutoHeader {
         dial: Rect::NOTHING,
         readout: Rect::NOTHING,
     };
-    if !header.is_positive() || header.height() < 12.0 || header.width() < 120.0 {
+    // **The floor is where a CONTROL stops being one, not where the design
+    // stops being comfortable.**
+    //
+    // It was 12 points tall and 120 wide, and that was wrong by the width of
+    // the whole feature: an automation row is half a track, and a track is
+    // one eighth of an arrangement that gets whatever the recorder band
+    // leaves. Turn the piano, the fretboard and the theory band OFF — which
+    // is exactly what somebody working in the arrangement DOES, to get the
+    // room — and the stack is 150 points tall, a track is 15, and a row is
+    // SEVEN. Every switch, the dial and its number all fell through the floor
+    // together and the header drew one dim word on an empty plate. The
+    // owner: "no draw of the panels occurs, i can't see any of your added
+    // features at all just dead space."
+    //
+    // Measured, not guessed: `every_control_is_drawn_at_every_height_a_row_
+    // can_have` counts the shapes that actually reach the header.
+    let h = header.height();
+    let w = header.width();
+    if !header.is_positive() || h < 7.0 || w < 96.0 {
         return none;
     }
-    let h = header.height();
-    let pad = 3.0_f32;
-    // Square switches, sized off the row so they stay the same shape as the
-    // row shrinks, with a floor under which they stop being drawn at all.
-    let b = (h - pad * 2.0).clamp(9.0, 16.0);
+    // Padding and switch size both follow the row, so a short row gets small
+    // square switches rather than none.
+    let pad = (h * 0.12).clamp(1.0, 3.0);
+    let b = (h - pad * 2.0).clamp(6.0, 16.0).min(h - 1.0);
     let cy = header.center().y;
-    let cell = |x: f32, w: f32| {
-        Rect::from_center_size(Pos2::new(x + w * 0.5, cy), Vec2::new(w, b))
+    let cell = |x: f32, wd: f32| {
+        Rect::from_center_size(Pos2::new(x + wd * 0.5, cy), Vec2::new(wd, b))
     };
-    let mut x = header.left() + FOLDER_INDENT;
+    // The indent is a fraction of the header on a narrow one: a fixed inset
+    // that is fine at 208 points is a sixth of the row at 96.
+    let mut x = header.left() + FOLDER_INDENT.min(w * 0.06);
     let close = cell(x, b);
     x += b + pad;
     let arm = cell(x, b);
     x += b + pad;
     let bypass = cell(x, b);
     x += b + pad;
-    // The dial and its number own the right end. A column, not a row: the
-    // number sits over the dial.
-    let dial_w = (h * 1.6).clamp(18.0, 34.0);
+
+    // **The dial is SQUARE, and that is a fix as well as a shape.**
+    //
+    // Its rect was as wide as the column and as tall as whatever was left,
+    // and `dial` sizes its knob from the WIDTH — so on a 36-point row it
+    // painted a 34-point circle into a 20-point slot and hung six points into
+    // the row below. A square rect cannot do that whatever the row does.
+    //
+    // The number stacks ABOVE it only when there is room for both. Under
+    // about eighteen points there is not, and a row that spent half its
+    // height on a percentage would have no dial worth turning — so the dial
+    // takes the whole column and the number goes. The dial is the control;
+    // the readout is a convenience.
+    let stacked = h >= 18.0;
+    let col_h = h - 2.0;
+    let knob = if stacked { col_h * 0.60 } else { col_h };
+    let side = knob.min((w * 0.22).max(14.0)).min(34.0);
     let right = header.right() - pad;
-    let dial_col = Rect::from_min_max(
-        Pos2::new(right - dial_w, header.top() + 1.0),
-        Pos2::new(right, header.bottom() - 1.0),
+    let dial = Rect::from_center_size(
+        Pos2::new(
+            right - side * 0.5,
+            if stacked { header.bottom() - 1.0 - side * 0.5 } else { cy },
+        ),
+        Vec2::splat(side),
     );
-    let split = dial_col.top() + dial_col.height() * 0.40;
-    let readout = Rect::from_min_max(dial_col.min, Pos2::new(dial_col.right(), split));
-    let dial = Rect::from_min_max(Pos2::new(dial_col.left(), split), dial_col.max);
+    let readout = if stacked {
+        Rect::from_min_max(
+            Pos2::new(dial.left(), header.top() + 1.0),
+            Pos2::new(right, dial.top()),
+        )
+    } else {
+        Rect::NOTHING
+    };
     let name = Rect::from_min_max(
         Pos2::new(x, header.top()),
-        Pos2::new((dial_col.left() - pad).max(x), header.bottom()),
+        Pos2::new((dial.left() - pad).max(x), header.bottom()),
     );
     if !name.is_positive() {
         return none;
@@ -496,10 +554,21 @@ const HEADER_W: (f32, f32, f32) = (0.16, 150.0, 220.0);
 /// that a tempo point is something you can aim at.
 const TEMPO_LANE_SHARE: f32 = 0.55;
 
-/// The same for an automation sub-lane, and the same reasoning: a curve
-/// needs less room than the clips it belongs under, and the track it hangs
-/// off must not shrink to make space for it.
-const AUTO_LANE_SHARE: f32 = 0.55;
+/// The same for an automation sub-lane: a curve needs less room than the
+/// clips it belongs under.
+///
+/// **Exactly HALF, and the half is load-bearing now.** It was 0.55, justified
+/// by a rule that no longer holds — "the track it hangs off must not shrink
+/// to make space for it" — and the owner replaced that rule with this one:
+/// every half strip of automation is absorbed by the tracks getting shorter,
+/// and every WHOLE strip's worth costs one track its place in the window.
+///
+/// Two lanes have to be exactly one track for that to work. At 0.55 they are
+/// 1.1, so two lanes evicted a track AND left the rest a tenth short — the
+/// heights never came back to where they started and the arithmetic drifted
+/// further with every lane. See
+/// `automation_rows_shrink_the_tracks_then_evict_one_and_repeat`.
+const AUTO_LANE_SHARE: f32 = 0.5;
 
 /// The master row's height, as a fraction of a track's.
 ///
@@ -903,11 +972,52 @@ impl Layout {
         // lane showed none at all. `visible` still means TRACKS; the pair
         // costs every track a slice of its height instead, which is the same
         // bargain an open automation row already makes.
-        let lane_h =
-            lanes_area.height()
-                / (visible as f32
-                    + if view.show_master_row { MASTER_ROW_SHARE } else { 0.0 });
         let first = view.lane_scroll.min(CHANNELS.saturating_sub(visible));
+        // **Automation rows shrink the tracks until they have cost a whole
+        // one, and then a track leaves.**
+        //
+        // The divisor counted the tracks and the master's half and nothing
+        // else, so opening a curve made the stack taller than the area —
+        // and `push` drops a row that does not WHOLLY fit, which left half a
+        // strip of dead space at the bottom with a track missing. That is
+        // the owner's "leaves half a strip of empty space at the bottom".
+        //
+        // The rule he asked for, and it scales: eight tracks, open a volume
+        // lane and all eight shrink to make room for the extra half strip;
+        // open a pan lane on the same track and the two halves are a whole
+        // track's worth, so the last channel leaves the window and the rest
+        // return to full height. Three lanes shrink again, four evict a
+        // second, and so on.
+        //
+        // `visible - floor(share)` is that rule exactly, and the remainder
+        // rides in the divisor so the stack always ends flush with the
+        // bottom — no dead space at any count.
+        let auto_of = |shown: usize| -> f32 {
+            (first..CHANNELS)
+                .filter(|i| !view.lanes.get(*i).is_some_and(|l| l.hidden))
+                .take(shown)
+                .map(|i| view.lanes.get(i).map_or(0, |l| l.automation.len()) as f32)
+                .sum::<f32>()
+                * AUTO_LANE_SHARE
+        };
+        // Settles: evicting a track can only REMOVE automation from the
+        // count, which can only let tracks back in, so `shown` walks down
+        // and stops. Bounded by the channel count regardless.
+        let mut shown = visible;
+        let mut auto_share = auto_of(shown);
+        for _ in 0..CHANNELS {
+            let want = visible.saturating_sub(auto_share.floor() as usize).max(1);
+            if want >= shown {
+                break;
+            }
+            shown = want;
+            auto_share = auto_of(shown);
+        }
+        let lane_h = lanes_area.height()
+            / (shown as f32
+                + auto_share
+                + if view.show_tempo_lane { TEMPO_LANE_SHARE } else { 0.0 }
+                + if view.show_master_row { MASTER_ROW_SHARE } else { 0.0 });
 
         // **The rows, stacked in order, and the arrays derived from them.**
         //
@@ -1099,7 +1209,19 @@ impl Layout {
                 Pos2::new(add.right() + 6.0, r.center().y - ch_h * 0.5),
                 Vec2::new(r.width() * 0.40, ch_h),
             );
-            return HeaderRow { panel: row, input, add, ..HeaderRow::NONE };
+            // **And the rest of the row is the slot itself.** An empty lane
+            // had no `name` and no `number`, so `hit_test` could not name it
+            // and a press on it produced nothing — which meant an empty slot
+            // could not be SELECTED, so it could not wear the rim and could
+            // not be a paste destination you had pointed at. The + circle and
+            // the input chip keep their own seats; what is left over answers
+            // for the slot.
+            let name = Rect::from_min_max(
+                Pos2::new(input.right() + 6.0, r.top()),
+                Pos2::new(r.right(), r.bottom()),
+            );
+            let name = if name.width() > 4.0 { name } else { Rect::NOTHING };
+            return HeaderRow { panel: row, input, add, name, ..HeaderRow::NONE };
         }
         let h = r.height();
         // The number and the arm keep FIXED seats at the left — the
@@ -2744,6 +2866,14 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             };
             let face = shade(p.hdr_face, 0.92);
             painter.rect_filled(row.header, 0.0, face);
+            if auto.selected {
+                painter.rect_stroke(
+                    row.header.shrink(1.0),
+                    2.0,
+                    Stroke::new(1.2, crate::recorder_panel::selection_rim(face)),
+                    egui::StrokeKind::Inside,
+                );
+            }
             let ink = on_ink(face);
             let h = auto_header(row.header);
             // **The × — leave.** A cross rather than a letter: the three
@@ -3189,10 +3319,21 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 continue;
             }
             let hot = auto.hot == Some(lo + i);
+            let chosen = auto.chosen.contains(&(lo + i));
             painter.circle_filled(at, if hot { AUTO_POINT_R + 1.0 } else { AUTO_POINT_R }, curve);
             // A ring in the ground's own colour, so two points close
             // together read as two rather than as a blob.
             painter.circle_stroke(at, AUTO_POINT_R, Stroke::new(1.0, ground));
+            // **Chosen wears the selection rim**, the one a chosen track and
+            // a chosen automation row already wear — outside the ground ring
+            // so it reads at the sizes these handles actually are.
+            if chosen {
+                painter.circle_stroke(
+                    at,
+                    AUTO_POINT_R + 2.0,
+                    Stroke::new(1.4, crate::recorder_panel::selection_rim(ground)),
+                );
+            }
         }
     }
 
@@ -4390,6 +4531,32 @@ fn cut_to(painter: &Painter, width: f32, text: &str, font: &FontId) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// **An empty slot can be pointed at.**
+    ///
+    /// It had no `name` and no `number` rect, so `hit_test` answered nothing
+    /// over most of its row — which meant it could not be selected, could not
+    /// wear the selection rim, and could not be the paste destination you had
+    /// aimed at. The + circle and the input chip keep their seats; the rest of
+    /// the row is the slot.
+    #[test]
+    fn an_empty_slot_answers_a_press_on_its_row() {
+        // `a_view` makes lanes 0..3 used and the rest empty.
+        let clips: [ClipView<'_>; 0] = [];
+        let l = Layout::new(rect(), &a_view(&clips));
+        let row = l.header_rows[4];
+        assert!(row.panel.is_positive(), "the empty row has no panel");
+        assert!(row.add.is_positive(), "the + circle lost its seat");
+        assert!(row.input.is_positive(), "the input chip lost its seat");
+        assert!(
+            row.name.is_positive(),
+            "an empty slot still has nowhere to be pressed"
+        );
+        // The three do not overlap: pressing the + must make a track and
+        // pressing the chip must bind an input, not select.
+        assert!(row.add.right() <= row.input.left());
+        assert!(row.input.right() <= row.name.left());
+    }
+
 
     /// **The first tempo handle can actually be pressed.**
     ///
@@ -4613,6 +4780,104 @@ ArrangeView {
         Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 420.0))
     }
 
+    /// **Every control on an automation row is actually PAINTED, at every
+    /// height a row can have.**
+    ///
+    /// The regression this exists for: `auto_header` refused to lay out any
+    /// cell below twelve points of row height, and an automation row is half
+    /// a track of an arrangement that gets whatever the recorder band leaves.
+    /// Switch the piano, the fretboard and the theory band off — which is
+    /// what somebody working in the arrangement does, to get the room — and
+    /// the stack is 150 points, a track is 15 and a row is SEVEN. The ×, the
+    /// arm, the bypass and the dial all vanished at once, leaving one dim
+    /// word on a plate, and nothing failed: the layout said `NOTHING`, the
+    /// paint skipped what the layout omitted, and the hit test agreed with
+    /// both. A cell can be laid out, hit-tested and never drawn.
+    ///
+    /// So this does not ask the layout what it INTENDS. It runs the real
+    /// `draw` and looks at the shapes that came out, which is the only
+    /// question that was ever in doubt.
+    #[test]
+    fn every_control_is_drawn_at_every_height_a_row_can_have() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        crate::fonts::apply_text_styles(&ctx);
+        let pts: Vec<crate::automation::Point> = Vec::new();
+        let mut v = a_view(&[]);
+        v.visible_lanes = 8;
+        v.lanes[0].automation = vec![AutoView {
+            selected: false,
+            label: "volume".to_owned(),
+            resting: 0.5,
+            armed: false,
+            bypassed: false,
+            param: crate::automation::AutoParam::Gain,
+            points: &pts,
+            hot: None,
+            chosen: Vec::new(),
+        }];
+        // 673 is the arrangement with every band on; 150 is the arrangement
+        // with them off, which is the case that was broken. The rest are the
+        // sizes in between that a dragged window passes through.
+        for hh in [673.0f32, 400.0, 300.0, 220.0, 180.0, 150.0] {
+            let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, hh));
+            let l = Layout::new(r, &v);
+            let row = l
+                .rows
+                .iter()
+                .find(|x| x.kind == RowKind::Automation(0, 0))
+                .unwrap_or_else(|| panic!("no automation row at {hh}"));
+            let cells = auto_header(row.header);
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(r),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.set_clip_rect(r);
+                        draw(ui.painter(), r, &v);
+                    });
+                },
+            );
+            // Anything as wide as the header or wider is a backdrop — the
+            // row's own plate, the header column's ground — and proves
+            // nothing about a control.
+            let painted = |cell: Rect| {
+                cell.is_positive()
+                    && out.shapes.iter().any(|cs| {
+                        let b = cs.shape.visual_bounding_rect();
+                        b.is_positive()
+                            && b.width() < row.header.width() * 0.9
+                            && cell.intersects(b)
+                    })
+            };
+            for (what, cell) in [
+                ("the close X", cells.close),
+                ("the record arm", cells.arm),
+                ("the bypass", cells.bypass),
+                ("the name", cells.name),
+                ("the dial", cells.dial),
+            ] {
+                assert!(
+                    painted(cell),
+                    "{what} is not drawn on a {:.1}pt row (arrangement {hh}pt)",
+                    row.header.height()
+                );
+            }
+            // **The dial stays inside its own row.** It used to be sized from
+            // the column's WIDTH into a slot defined by the height, so on a
+            // tall row it painted a 34-point knob into a 20-point space and
+            // hung into the row below.
+            assert!(
+                row.header.contains_rect(cells.dial),
+                "the dial {:?} hangs out of its row {:?}",
+                cells.dial,
+                row.header
+            );
+        }
+    }
+
     /// The time mapping round-trips, which is what keeps a clip drawn where
     /// it is grabbed.
 
@@ -4637,8 +4902,10 @@ ArrangeView {
             resting: 0.5,
             armed: false,
             bypassed: false,
+            selected: false,
             points: &[],
             hot: None,
+            chosen: Vec::new(),
         }];
         let l = Layout::new(rect(), &v);
 
@@ -5460,13 +5727,15 @@ ArrangeView {
                 v.view_start_s = start;
                 v.view_len_s = len;
                 v.lanes[0].automation = vec![AutoView {
-                    label: "volume".to_owned(),
+selected: false,
+                                        label: "volume".to_owned(),
             resting: 0.5,
             armed: false,
             bypassed: false,
                     param: AutoParam::Gain,
                     points: &pts,
                     hot: Some(3),
+                    chosen: Vec::new(),
                 }];
                 let r = Rect::from_min_size(Pos2::ZERO, size);
                 // Painting is the assertion: a NaN or an inverted rect
@@ -5504,13 +5773,15 @@ ArrangeView {
         v.view_start_s = 2_000.0;
         v.view_len_s = 4.0;
         v.lanes[0].automation = vec![AutoView {
-                    label: "volume".to_owned(),
+selected: false,
+                                        label: "volume".to_owned(),
             resting: 0.5,
             armed: false,
             bypassed: false,
             param: AutoParam::Gain,
             points: &pts,
             hot: None,
+            chosen: Vec::new(),
         }];
         let l = Layout::new(rect(), &v);
         let row = l
@@ -5545,13 +5816,15 @@ ArrangeView {
         let mut v = a_view(&[]);
         v.visible_lanes = 8;
         v.lanes[0].automation = vec![AutoView {
-                    label: "volume".to_owned(),
+selected: false,
+                                        label: "volume".to_owned(),
             resting: 0.5,
             armed: false,
             bypassed: false,
             param: AutoParam::Gain,
             points: &pts,
             hot: None,
+            chosen: Vec::new(),
         }];
         let l = Layout::new(rect(), &v);
         let row = l
@@ -5598,13 +5871,15 @@ ArrangeView {
         let mut v = a_view(&[]);
         v.visible_lanes = 8;
         v.lanes[0].automation = vec![AutoView {
-                    label: "volume".to_owned(),
+selected: false,
+                                        label: "volume".to_owned(),
             resting: 0.5,
             armed: false,
             bypassed: false,
             param: AutoParam::Gain,
             points: &pts,
             hot: None,
+            chosen: Vec::new(),
         }];
         let l = Layout::new(rect(), &v);
         let row = l
@@ -5739,8 +6014,10 @@ ArrangeView {
             resting: 0.5,
             armed: false,
             bypassed: false,
+            selected: false,
             points: &[],
             hot: None,
+            chosen: Vec::new(),
         }];
         let l = Layout::new(rect(), &v);
 
@@ -5761,24 +6038,231 @@ ArrangeView {
             (auto.lane.top() - l.lane_rows[0].bottom()).abs() < 0.5,
             "lane 0's automation is not under lane 0"
         );
-        // **The track did not shrink.** A sub-lane takes room from the area,
-        // not from the clips it belongs to — a track that got shorter every
-        // time you opened a curve would make the curve unusable and the
-        // clips too.
+        // **The track SHRANK, and that is the point.**
+        //
+        // This used to assert the opposite — a sub-lane took its room from
+        // the area and never from the track — and the consequence was that
+        // opening a curve made the stack taller than the area, so `push`
+        // dropped whatever no longer wholly fitted and left half a strip of
+        // dead space at the bottom with a track missing. The owner asked for
+        // the other trade by name: "it still takes half a strip, but tracks
+        // ALWAYS fit such that there is never dead space when they are
+        // added."
+        //
+        // So every open row is in the divisor and the tracks give up a slice
+        // each. A curve costs half a track's height spread across all of
+        // them, rather than one whole track falling off the end.
         assert!(
-            (l.lane_rows[0].height() - track_h).abs() < 0.5,
-            "opening a curve shrank the track from {track_h} to {}",
-            l.lane_rows[0].height()
+            l.lane_rows[0].height() < track_h,
+            "opening a curve did not cost the tracks anything: still {track_h}"
         );
-        // ...so something falls off the bottom instead, and what falls off
-        // is NOTHING rather than a half-height row.
+
+        // **And NOTHING hangs off the bottom, which is the whole ask.**
+        let mut lowest = l.lanes_area.top();
         for r in &l.rows {
             assert!(
                 !r.lane.is_positive() || r.lane.bottom() <= l.lanes_area.bottom() + 0.5,
                 "{:?} hangs off the bottom of the area",
                 r.kind
             );
+            if r.lane.is_positive() {
+                lowest = lowest.max(r.lane.bottom());
+            }
         }
+        // No dead space either: the stack reaches the bottom. A row short of
+        // it is the gap the owner was looking at.
+        assert!(
+            (l.lanes_area.bottom() - lowest).abs() < 1.0,
+            "the rows stop {} points above the bottom — that is the dead space",
+            l.lanes_area.bottom() - lowest
+        );
+
+        // And every row that SHOULD exist does: nothing was dropped to make
+        // the rest fit.
+        assert!(
+            l.rows
+                .iter()
+                .any(|r| r.kind == RowKind::Automation(0, 0) && r.lane.is_positive()),
+            "the automation row itself fell off"
+        );
+    }
+
+    /// **Automation shrinks the tracks, then evicts one, and repeats.**
+    ///
+    /// The owner's rule, in his words: "Start with 8 tracks visible, enable
+    /// vol auto lane on channel 1, all tracks shrink height equally to fit an
+    /// extra halfstrip; add a second lane, pan on channel one, now volume and
+    /// pan (equivalent of 1 channel height) exist, push the last channel out
+    /// of view." And it "repeats and scales with 3 and 4 inserts and beyond".
+    ///
+    /// So: every half strip of automation is absorbed by the tracks getting
+    /// shorter, and every WHOLE strip's worth costs one track its place.
+    /// Nothing ever hangs off the bottom and nothing ever leaves a gap.
+    #[test]
+    fn automation_rows_shrink_the_tracks_then_evict_one_and_repeat() {
+        let c = clips();
+        let lanes_shown = |l: &Layout| {
+            l.rows
+                .iter()
+                .filter(|r| matches!(r.kind, RowKind::Track(_)) && r.lane.is_positive())
+                .count()
+        };
+        let track_h = |l: &Layout| {
+            l.rows
+                .iter()
+                .find(|r| matches!(r.kind, RowKind::Track(_)) && r.lane.is_positive())
+                .map_or(0.0, |r| r.lane.height())
+        };
+        // The stack must always END flush with the area: a row short of the
+        // bottom IS the dead space this is about.
+        let flush = |l: &Layout, n: usize| {
+            let lowest = l
+                .rows
+                .iter()
+                .filter(|r| r.lane.is_positive())
+                .fold(l.lanes_area.top(), |m, r| m.max(r.lane.bottom()));
+            assert!(
+                (l.lanes_area.bottom() - lowest).abs() < 1.0,
+                "with {n} automation rows the stack stops {} points short — dead space",
+                l.lanes_area.bottom() - lowest
+            );
+            for r in &l.rows {
+                assert!(
+                    !r.lane.is_positive() || r.lane.bottom() <= l.lanes_area.bottom() + 0.5,
+                    "with {n} rows, {:?} hangs off the bottom",
+                    r.kind
+                );
+            }
+        };
+
+        let auto = |n: usize| -> Vec<AutoView<'static>> {
+            (0..n)
+                .map(|_| AutoView {
+                    param: crate::automation::AutoParam::Gain,
+                    label: "Volume".to_owned(),
+                    resting: 0.5,
+                    armed: false,
+                    bypassed: false,
+                    selected: false,
+                    points: &[],
+                    hot: None,
+                    chosen: Vec::new(),
+                })
+                .collect()
+        };
+
+        // No automation: the baseline both counts are measured against.
+        let mut v = a_view(&c);
+        v.show_tempo_lane = false;
+        v.show_master_row = false;
+        let base = Layout::new(rect(), &v);
+        let (base_n, base_h) = (lanes_shown(&base), track_h(&base));
+        assert!(base_n >= 4, "too few lanes visible to test eviction: {base_n}");
+        flush(&base, 0);
+
+        let mut last_n = base_n;
+        let mut last_h = base_h;
+        for n in 1..=5usize {
+            let mut v = a_view(&c);
+            v.show_tempo_lane = false;
+            v.show_master_row = false;
+            let rows = auto(n);
+            v.lanes[0].automation = rows;
+            let l = Layout::new(rect(), &v);
+            flush(&l, n);
+
+            let want_n = base_n - n / 2;
+            assert_eq!(
+                lanes_shown(&l),
+                want_n,
+                "with {n} automation rows {} tracks show, not {want_n}",
+                lanes_shown(&l)
+            );
+            // An ODD count leaves half a strip over, so the tracks are
+            // shorter than the baseline; an EVEN one is a whole track's
+            // worth and they come back to full height.
+            if n % 2 == 0 {
+                assert!(
+                    (track_h(&l) - base_h).abs() < 0.5,
+                    "{n} rows is a whole track's worth, so the tracks should be \
+                     back to {base_h}, not {}",
+                    track_h(&l)
+                );
+            } else {
+                assert!(
+                    track_h(&l) < base_h - 0.5,
+                    "{n} rows left half a strip over and the tracks did not shrink"
+                );
+            }
+            // Never grows a track back while also keeping every lane: the
+            // sequence only ever costs.
+            assert!(
+                lanes_shown(&l) <= last_n,
+                "adding a row put a track BACK on screen"
+            );
+            last_n = lanes_shown(&l);
+            last_h = track_h(&l);
+        }
+        let _ = last_h;
+    }
+
+    /// **An automation row's header has every cell it is supposed to.**
+    ///
+    /// The owner reported the lanes as having "no labels, and no x button to
+    /// close them". Every one of them is drawn — so if they are missing, the
+    /// header they are carved out of is degenerate. This asks for each cell
+    /// at the size a real row actually gets.
+    #[test]
+    fn an_automation_rows_header_has_its_switches_label_and_dial() {
+        let c = clips();
+        let rows = vec![AutoView {
+            param: crate::automation::AutoParam::Gain,
+            label: "Volume".to_owned(),
+            resting: 0.5,
+            armed: false,
+            bypassed: false,
+            selected: false,
+            points: &[],
+            hot: None,
+            chosen: Vec::new(),
+        }];
+        let mut v = a_view(&c);
+        v.lanes[0].automation = rows;
+        let l = Layout::new(rect(), &v);
+        let row = l
+            .rows
+            .iter()
+            .find(|r| r.kind == RowKind::Automation(0, 0))
+            .expect("no automation row");
+        assert!(row.header.is_positive(), "the row has no header to carve");
+
+        let h = auto_header(row.header);
+        assert!(h.close.is_positive(), "no × to close the lane");
+        assert!(h.arm.is_positive(), "no record arm");
+        assert!(h.bypass.is_positive(), "no bypass");
+        assert!(h.name.is_positive(), "nowhere to write the label");
+        assert!(h.dial.is_positive(), "no dial");
+        assert!(h.readout.is_positive(), "no readout");
+
+        // The label needs ROOM, not just a rect: the draw refuses under
+        // twenty points and would leave the lane looking unnamed.
+        assert!(
+            h.name.width() > 24.0,
+            "the label has {} points to print in — it will not draw",
+            h.name.width()
+        );
+        // And nothing overlaps: a switch under the label is a switch that
+        // cannot be pressed.
+        for (a, an) in [(h.close, "close"), (h.arm, "arm"), (h.bypass, "bypass")] {
+            assert!(
+                a.right() <= h.name.left() + 0.5,
+                "the {an} switch runs into the label"
+            );
+        }
+        assert!(
+            h.name.right() <= h.dial.left() + 0.5,
+            "the label runs into the dial"
+        );
     }
 
     /// **Eight lanes show; the rest scroll.** With more lanes than fit, only

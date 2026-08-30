@@ -379,6 +379,31 @@ pub struct IvoryApp {
     arr_auto_params: std::collections::HashMap<usize, crate::automation::AutoParam>,
     /// The point under the pointer or being dragged: `(lane, index)`.
     arr_auto_hot: Option<(usize, usize)>,
+    /// **The automation row the keyboard is aimed at**, `(lane, slot)`.
+    ///
+    /// A row can be closed by its × or by Delete, and Delete needs to know
+    /// WHICH — so pressing a row's name chooses it, exactly as pressing a
+    /// clip chooses that. Cleared whenever a clip or a track is chosen
+    /// instead, because two things claiming the Delete key is a Delete key
+    /// nobody can predict.
+    arr_auto_sel: Option<(usize, usize)>,
+    /// **Selected automation NODES**, as `(lane, slot, index)`.
+    ///
+    /// Distinct from `arr_auto_sel`, which chooses a whole ROW: one of them
+    /// answers Delete by closing the lane and the other by removing points,
+    /// and a single field could not mean both. Picking either clears the
+    /// other, so there is never a question of which Delete meant.
+    ///
+    /// Indices, not identities — a `Curve`'s points have no ids. Anything
+    /// that reorders a curve therefore has to clear this, which is why every
+    /// mutator below ends by doing so.
+    arr_auto_nodes: Vec<(usize, usize, usize)>,
+    /// Copied nodes, with their times measured from the EARLIEST of them.
+    ///
+    /// Relative because a paste lands at the playhead: absolute times would
+    /// put them back exactly where they were copied from, which is the one
+    /// place a paste is never wanted.
+    auto_clipboard: Vec<crate::automation::Point>,
     /// The tempo point under the pointer, if any. Drawn a size larger.
     arr_tempo_hot: Option<usize>,
     /// The tempo point being dragged, if any.
@@ -644,7 +669,17 @@ pub struct IvoryApp {
     /// Where its strip drag left it. `None` centres it.
     drumpad_pos: Option<Pos2>,
     /// The kit document: paths and knobs, saved beside the arrangement.
-    drumpad: crate::drumpad::DrumpadDoc,
+    /// **One kit per channel.** A drum instrument loads a full instance per
+    /// channel, so the kits are per lane and the panel edits ONE of them —
+    /// see `drumpad_lane` and the `drumpad()` pair, which are the only way
+    /// this is reached. A `Vec` indexed by channel; lanes with no drumpad
+    /// hold the empty kit and cost nothing.
+    drumpad_kits: Vec<crate::drumpad::DrumpadDoc>,
+    /// Which lane's kit the drumpad window is showing and editing.
+    ///
+    /// Not a second copy of anything: the kits live in `drumpad_kits` and
+    /// this only says which one has the panel's attention.
+    drumpad_lane: usize,
     /// The pad the inspector describes.
     drumpad_sel: usize,
     /// The pad the mouse is holding down — the release owes a `PadHit off`.
@@ -746,7 +781,7 @@ pub struct IvoryApp {
     /// The UNDO history: whole document states (clips + desk baked in),
     /// shared by the editor, the arrangement and the mixer — one line of
     /// time, whichever surface wrote it. `hist_at` is where NOW stands.
-    history: Vec<String>,
+    history: Vec<Moment>,
     hist_at: usize,
     /// The NOTE clipboard: times relative to the earliest copied note.
     note_clipboard: Vec<crate::arrangement::ArrNote>,
@@ -1339,6 +1374,27 @@ struct MidiEdit {
     marquee: Option<(egui::Pos2, egui::Pos2)>,
 }
 
+/// **One moment on the undo timeline.**
+///
+/// Two strings and not one, because two documents make a moment: the
+/// arrangement (clips, curves and the desk baked in) and the DRUM KITS, which
+/// live in a sidecar of their own and were therefore not on the timeline at
+/// all. Loading a kit, clearing a pad, retuning one — none of it could be
+/// undone, and an undo taken after one of them put the clips back while the
+/// pads stayed as they were. The owner: "the whole pad logic should be compat
+/// with standard copy paste and cut undo / redo behavior."
+///
+/// One struct rather than two parallel `Vec`s so they cannot fall out of step
+/// — every push, truncate and drain moves both by construction.
+#[derive(Clone, Default, PartialEq)]
+struct Moment {
+    /// `Arrangement::to_json` with `DeskSnap` inside it.
+    doc: String,
+    /// Every non-empty lane kit, compactly — see `DrumpadDoc::compact_json`.
+    /// A hundred moments of the full 128-pad form would be megabytes.
+    kits: String,
+}
+
 /// Everything a track is, held by value. See [`IvoryApp::copy_track`].
 #[derive(Clone)]
 struct TrackCopy {
@@ -1355,6 +1411,20 @@ struct TrackCopy {
     input: String,
     inserts: Vec<String>,
     clips: Vec<crate::arrangement::ArrClip>,
+    /// **The drum kit, when the track has one**, so the paste makes a full
+    /// instance rather than a lane that merely looks like one.
+    ///
+    /// Copying the bays alone put `DRUMPAD_PATH` in bay 0 of the new lane,
+    /// which is all `drum_lanes` looks at — so the engine took MIDI for it,
+    /// the panel drew its pads striking, and it made no sound at all,
+    /// because a lane's samples live in its KIT and the new lane's was
+    /// empty. The owner: "the second is seen as an instance of the 1st that
+    /// follows but does not produce sound."
+    ///
+    /// Held on the clipboard rather than read from the source lane at paste
+    /// time, so a copy survives the track it came from being deleted — the
+    /// same reason `clips` and `inserts` are here rather than looked up.
+    kit: Option<crate::drumpad::DrumpadDoc>,
 }
 
 #[derive(Clone)]
@@ -1928,7 +1998,10 @@ impl IvoryApp {
             drumpad_open: false,
             drumpad_rect: None,
             drumpad_pos: None,
-            drumpad: crate::drumpad::DrumpadDoc::default(),
+            drumpad_kits: (0..crate::recorder::CHANNELS)
+                .map(|_| crate::drumpad::DrumpadDoc::default())
+                .collect(),
+            drumpad_lane: 0,
             drumpad_sel: 36,
             drumpad_down: None,
             drumpad_grab: None,
@@ -2059,6 +2132,9 @@ impl IvoryApp {
             fx_params: std::collections::HashMap::new(),
             arr_auto_params: std::collections::HashMap::new(),
             arr_auto_hot: None,
+            arr_auto_sel: None,
+            arr_auto_nodes: Vec::new(),
+            auto_clipboard: Vec::new(),
             arr_tempo_hot: None,
             arr_tempo_drag: None,
             arr_tempo_drag_from: None,
@@ -3983,7 +4059,7 @@ impl IvoryApp {
             ("media/Ride Bell.wav", 0.85, 0.5, 0.0, 0),
         ];
         for (i, (path, gain, pan, tune, choke)) in kit.into_iter().enumerate() {
-            self.drumpad.pads[i] = crate::drumpad::PadSlot {
+            self.drumpad_mut().pads[i] = crate::drumpad::PadSlot {
                 path: path.to_owned(),
                 name: String::new(),
                 params: recorder::DrumPadParams {
@@ -4013,7 +4089,7 @@ impl IvoryApp {
             };
         }
         // The pad whose file a tidy-up moved: the red dress.
-        self.drumpad.pads[11] = crate::drumpad::PadSlot {
+        self.drumpad_mut().pads[11] = crate::drumpad::PadSlot {
             path: "media/Cowbell.wav".to_owned(),
             name: String::new(),
             params: recorder::DrumPadParams::default(),
@@ -4658,10 +4734,15 @@ impl IvoryApp {
     /// A press on the heart. `true` when it was the heart's, and the caller
     /// must not go on to open a menu or sound a note.
     ///
-    /// **One gesture, and only for supporters.** Right-click stops the drift
+    /// **One gesture, and only for supporters.** A LEFT click stops the drift
     /// or starts it again; there is nothing to walk through, because the
     /// theme decides both the wave and the single colour it falls back to.
-    /// A left click on the heart is an ordinary press on the band.
+    ///
+    /// It was the right button, which is the wrong one: right-click on this
+    /// band means "open the menu about this thing" everywhere else on it, and
+    /// a plain click is what anybody tries on a small toggle first. The
+    /// right-click now falls through to the band's menu as it does over any
+    /// other part of the strip.
     fn heart_press(&mut self, pos: Pos2, recorder_rect: Option<Rect>) -> bool {
         if !self.license.is_supporter() || !self.settings.show_heart {
             return false;
@@ -4773,17 +4854,6 @@ impl IvoryApp {
             if let Some(pos) = pointer {
                 let (menu_origin, _) = self.surface_frame();
                 let global = pos + menu_origin;
-                // **The heart takes the press before the band's menu sees it.**
-                //
-                // **RIGHT click swaps which set of sixteen you are in** —
-                // the travelling wave, or the flat colours. LEFT click walks
-                // whichever one is live; see `heart_press`. Supporters only,
-                // because they are the only ones wearing the palette — for
-                // everybody else the heart has no second colour system and the
-                // press should open the band's menu as it always did.
-                if self.heart_press(pos, recorder_rect) {
-                    return;
-                }
                 // A right-click ON the Recorder band opens the menu with the
                 // Recorder at the top. The band is where its own settings
                 // belong: it is a surface with fifteen controls on it, and
@@ -5035,12 +5105,18 @@ impl IvoryApp {
                     // instrument column, so the two can never contend — but
                     // checking first is what keeps that true if the column
                     // ever grows back into it.
-                    if self.heart_color(0.0).is_some()
-                        && recorder_panel::heart_rect(r, &self.recorder_layout_view())
-                            .contains(pos)
-                    {
-                        self.settings.heart_color = self.settings.heart_color.wrapping_add(1);
-                        self.save_settings();
+                    //
+                    // **And it TOGGLES THE DRIFT.** It used to step
+                    // `heart_color` through a ring of colours — a ring that
+                    // was retired when the theme took over both the wave and
+                    // the flat colour it falls back to (see `heart_color`).
+                    // So the press walked a number nothing reads and the
+                    // heart did not change, which is a control that looks
+                    // broken. The drift switch was on the RIGHT button, which
+                    // is the wrong one: right-click means "the menu about
+                    // this" everywhere else on this band, and a plain click
+                    // is what anybody tries on a small toggle first.
+                    if self.heart_press(pos, recorder_rect) {
                         return;
                     }
                     // The LCD's part cells: a press takes the number by
@@ -7419,6 +7495,14 @@ impl IvoryApp {
                 .filter(|c| c.lane == n)
                 .cloned()
                 .collect(),
+            // Only when there is one to take. A lane with no pads on it
+            // copies `None` and the paste leaves the destination's kit
+            // alone, which matters because every lane HAS a kit document
+            // and most of them are empty.
+            kit: self
+                .drumpad_kit_of(n)
+                .filter(|k| !k.is_empty())
+                .cloned(),
         });
     }
 
@@ -7494,6 +7578,18 @@ impl IvoryApp {
         }
         if !copy.clips.is_empty() {
             self.arr_save_edits();
+        }
+        // **The kit, which is the sound.** Bay 0 naming the drumpad is what
+        // makes the engine treat a lane as drums; the KIT is what it plays.
+        // Copy one without the other and the new lane strikes silently.
+        if let Some(kit) = copy.kit.clone() {
+            if let Some(slot) = self.drumpad_kits.get_mut(into) {
+                *slot = kit;
+            }
+            // The samples have to be decoded for the new lane and the kit
+            // pushed to the audio thread, which is what this asks for.
+            self.drumpad_dirty = true;
+            self.drumpad_edited();
         }
         // The host copies the plugin STATE files; nothing in this crate can
         // reach a file. Without it the pasted bays load the plugin at its
@@ -7727,7 +7823,11 @@ impl IvoryApp {
         self.save_settings();
         // The kit's sidecar is part of the project and copies with it — its
         // samples already came along inside `media/`.
-        self.drumpad.save_beside(&doc);
+        crate::drumpad::DrumpadDoc::save_all_beside(
+            &self.drumpad_kits,
+            self.drumpad_lane,
+            &doc,
+        );
         // The engine's schedule is unchanged — same clips, new home — but
         // the paths the host resolves against moved with the document.
         self.clips_dirty = true;
@@ -8322,8 +8422,56 @@ impl IvoryApp {
     ) {
         if !self.arr_auto_open.remove(&(lane, param)) {
             self.arr_auto_open.insert((lane, param));
+            self.arr_seed_first_node(lane, param);
         }
         self.arr_auto_hot = None;
+    }
+
+    /// **A lane that has just been opened gets ONE node, at the beginning.**
+    ///
+    /// The owner, twice: "every lane spawns with a node at the beginning just
+    /// not two nodes", and then "when a lane is opened, draw the first node
+    /// by default period every time at the very beginning."
+    ///
+    /// Seeded HERE, on opening, and nowhere else. It used to be seeded by an
+    /// `ensure_zero` that every mutator called, which meant the first
+    /// alt-click on an empty lane produced TWO nodes — the one under the hand
+    /// and a seed inserted before it. Removing that call fixed the double and
+    /// created this: a lane that opened with no node at all. The node was
+    /// never wrong; the PLACE it was made was.
+    ///
+    /// Its value is where the control is standing, so the seeded node changes
+    /// nothing that can be heard — it draws the flat line the lane already
+    /// had and gives the first drag something to grab.
+    ///
+    /// Only when the curve is empty. Re-opening a lane somebody has drawn on
+    /// must not touch their work, and a project loaded from a file arrives
+    /// with its curves already made.
+    fn arr_seed_first_node(&mut self, lane: usize, param: crate::automation::AutoParam) {
+        if self
+            .arrangement
+            .automation
+            .get(lane, param)
+            .is_some_and(|c| !c.is_empty())
+        {
+            return;
+        }
+        let value = self.auto_resting(lane, param);
+        self.arrangement.automation.entry(lane, param).put(
+            crate::automation::Point {
+                at_s: 0.0,
+                value,
+                shape: crate::automation::Shape::Linear,
+            },
+        );
+        // **The seed is DOCUMENT state, so it is written down and committed.**
+        //
+        // Without this it existed only in memory: the lane drew its node,
+        // the project was saved without it, and reopening showed an empty
+        // lane again — the same complaint one layer down. It also puts the
+        // seed on the undo timeline, which is the answer to "the nodes must
+        // be subject to all those controls" for the first one.
+        self.arr_save_edits();
     }
 
     /// **The size a dragged window should settle on**, or `None` to leave it.
@@ -8543,6 +8691,174 @@ impl IvoryApp {
     /// the hand already is. The CURVE is untouched — closing a row is about
     /// what is on screen, and a lane that deleted its automation because
     /// somebody tidied the view would be unforgivable.
+    /// Aim the keyboard at one automation row. See `arr_auto_sel`.
+    fn arr_select_auto_row(&mut self, lane: usize, slot: usize) {
+        self.arr_auto_sel = Some((lane, slot));
+        // One subject at a time: a Delete that might mean a clip OR a curve
+        // is a Delete nobody presses twice.
+        self.arr_selected = None;
+        self.arr_multi.clear();
+        self.arr_auto_nodes.clear();
+    }
+
+    // ── automation NODES: select, delete, copy, paste ────────────────────
+    //
+    // **The owner: "the nodes must be subject to all those controls."** A
+    // curve was drawable and draggable and nothing else — no way to choose
+    // several, no way to take a shape off one lane and put it on another,
+    // and Delete meant the whole row. These five methods are the rest of it,
+    // and they sit beside the row's selector on purpose: the two selections
+    // are exclusive and the clearing is easier to keep honest in one place.
+
+    /// One node, alone.
+    fn arr_select_auto_node(&mut self, lane: usize, slot: usize, index: usize) {
+        self.arr_auto_nodes = vec![(lane, slot, index)];
+        self.arr_auto_sel = None;
+        self.arr_selected = None;
+        self.arr_multi.clear();
+    }
+
+    /// Shift-press: in if it was out, out if it was in.
+    fn arr_toggle_auto_node(&mut self, lane: usize, slot: usize, index: usize) {
+        self.arr_auto_sel = None;
+        self.arr_selected = None;
+        self.arr_multi.clear();
+        if let Some(at) = self
+            .arr_auto_nodes
+            .iter()
+            .position(|n| *n == (lane, slot, index))
+        {
+            self.arr_auto_nodes.remove(at);
+        } else {
+            self.arr_auto_nodes.push((lane, slot, index));
+        }
+    }
+
+    /// The selected nodes as `(lane, param, seconds)`, resolved NOW.
+    ///
+    /// Indices are resolved to TIMES before anything is changed, because
+    /// removing a point renumbers every one after it — deleting by index in
+    /// a loop takes the wrong points from the second one on.
+    fn arr_auto_node_times(&self) -> Vec<(usize, crate::automation::AutoParam, f64)> {
+        let mut out = Vec::with_capacity(self.arr_auto_nodes.len());
+        for (lane, slot, index) in &self.arr_auto_nodes {
+            let Some(param) = self.arr_auto_param_at(*lane, *slot) else {
+                continue;
+            };
+            let Some(at) = self
+                .arrangement
+                .automation
+                .get(*lane, param)
+                .and_then(|c| c.points().get(*index))
+                .map(|p| p.at_s)
+            else {
+                continue;
+            };
+            out.push((*lane, param, at));
+        }
+        out
+    }
+
+    /// Take every selected node out.
+    fn arr_delete_auto_nodes(&mut self) {
+        let doomed = self.arr_auto_node_times();
+        self.arr_auto_nodes.clear();
+        if doomed.is_empty() {
+            return;
+        }
+        let mut changed = false;
+        for (lane, param, at) in doomed {
+            // A tight reach: these are exact times read out of the curve a
+            // moment ago, not a guess at what the pointer was near.
+            let curve = self.arrangement.automation.entry(lane, param);
+            if curve.remove_near(at, 1.0e-6) {
+                changed = true;
+            }
+        }
+        if changed {
+            self.arr_save_edits();
+        }
+    }
+
+    /// Copy the selection, times measured from the earliest node.
+    ///
+    /// Returns whether it had anything to do, so `arr_copy` can fall through
+    /// to clips and tracks when no node is chosen.
+    fn arr_copy_auto_nodes(&mut self) -> bool {
+        if self.arr_auto_nodes.is_empty() {
+            return false;
+        }
+        let mut pts: Vec<crate::automation::Point> = Vec::new();
+        for (lane, slot, index) in &self.arr_auto_nodes {
+            let Some(param) = self.arr_auto_param_at(*lane, *slot) else {
+                continue;
+            };
+            if let Some(p) = self
+                .arrangement
+                .automation
+                .get(*lane, param)
+                .and_then(|c| c.points().get(*index))
+            {
+                pts.push(*p);
+            }
+        }
+        if pts.is_empty() {
+            return false;
+        }
+        pts.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
+        let first = pts[0].at_s;
+        for p in &mut pts {
+            p.at_s -= first;
+        }
+        self.auto_clipboard = pts;
+        // **The track clipboard stands down.** Both are consulted by one
+        // chord, and a stale track copy would win a paste the hand meant for
+        // the nodes it had just taken.
+        self.track_clipboard = None;
+        true
+    }
+
+    /// Put the copied shape down at the playhead, on the chosen row.
+    ///
+    /// **Which row**: the one whose node is selected, else the row the
+    /// keyboard is aimed at. With neither there is no answer — a paste onto
+    /// "whichever lane happens to be first" is a paste nobody asked for — so
+    /// it declines and lets the clips have the chord.
+    fn arr_paste_auto_nodes(&mut self) -> bool {
+        if self.auto_clipboard.is_empty() {
+            return false;
+        }
+        let Some((lane, slot)) = self
+            .arr_auto_nodes
+            .first()
+            .map(|(l, s, _)| (*l, *s))
+            .or(self.arr_auto_sel)
+        else {
+            return false;
+        };
+        let Some(param) = self.arr_auto_param_at(lane, slot) else {
+            return false;
+        };
+        let at = self.arr_snap_t(self.playhead_s());
+        let pts = self.auto_clipboard.clone();
+        {
+            let curve = self.arrangement.automation.entry(lane, param);
+            for p in &pts {
+                curve.put(crate::automation::Point {
+                    at_s: (at + p.at_s).max(0.0),
+                    value: p.value,
+                    shape: p.shape,
+                });
+            }
+        }
+        // The indices just moved under it, so the old selection means other
+        // points now. Cleared rather than remapped: a pasted shape is what
+        // the hand is looking at, and re-selecting it is one click.
+        self.arr_auto_nodes.clear();
+        self.arr_save_edits();
+        true
+    }
+
     fn arr_close_auto_row(&mut self, lane: usize, slot: usize) {
         if let Some(param) = self.arr_auto_param_at(lane, slot) {
             self.arr_auto_open.remove(&(lane, param));
@@ -9203,10 +9519,13 @@ impl IvoryApp {
 
     /// The document as UNDO stores it: clips with the desk baked in — one
     /// string, one moment.
-    fn undo_state(&self) -> String {
+    fn undo_state(&self) -> Moment {
         let mut arr = self.arrangement.clone();
         arr.desk = Some(self.desk_snapshot());
-        arr.to_json()
+        Moment {
+            doc: arr.to_json(),
+            kits: crate::drumpad::DrumpadDoc::compact_all(&self.drumpad_kits),
+        }
     }
 
     /// A moment worth keeping: pushed unless it IS the standing moment.
@@ -9240,11 +9559,26 @@ impl IvoryApp {
 
     /// Stand at `at`: the document and the desk become that moment.
     fn undo_apply(&mut self, at: usize) {
-        let Some(json) = self.history.get(at).cloned() else {
+        let Some(moment) = self.history.get(at).cloned() else {
             return;
         };
         self.hist_at = at;
-        let arr = crate::arrangement::Arrangement::from_json(&json);
+        // **The kits first**, so the reload below this frame sees them: the
+        // document's save and the clips-dirty flag both fire in this same
+        // call, and a kit restored after them would wait a frame.
+        let kits = crate::drumpad::DrumpadDoc::from_compact_all(
+            &moment.kits,
+            crate::recorder::CHANNELS,
+        );
+        if kits != self.drumpad_kits {
+            self.drumpad_kits = kits;
+            self.drumpad_dirty = true;
+            // A plain write: this IS the undo, so it must not commit a moment
+            // of its own — that would push the state we just travelled
+            // to onto the top of the stack and make redo unreachable.
+            self.drumpad_save();
+        }
+        let arr = crate::arrangement::Arrangement::from_json(&moment.doc);
         if let Some(desk) = arr.desk.clone() {
             self.apply_desk_snapshot(&desk);
         }
@@ -9796,6 +10130,25 @@ impl IvoryApp {
     }
 
     fn arr_copy(&mut self) {
+        // **Chosen NODES are the most specific thing on this timeline**, so
+        // they answer first — ahead of clips and ahead of the track. Nothing
+        // else can be selected at the same time.
+        if self.arr_copy_auto_nodes() {
+            return;
+        }
+        // **No clips selected, a TRACK selected: copy the track.**
+        //
+        // The chord is the same one, and which it means is decided by what is
+        // under the selection — clips when clips are chosen, the track when
+        // none are. There is no ambiguity to resolve: a clip selection and an
+        // empty one are the two states, and only one of them has a clip to
+        // copy.
+        if self.arr_multi.is_empty() && self.arr_selected.is_none() {
+            if let Some(n) = self.selected_channel.filter(|n| self.channel_used(*n)) {
+                self.copy_track(n);
+            }
+            return;
+        }
         let mut ids = self.arr_multi.clone();
         if let Some(id) = self.arr_selected {
             if !ids.contains(&id) {
@@ -9826,6 +10179,21 @@ impl IvoryApp {
     /// relative lanes, clamped. Anywhere goes — a MIDI clip on an audio
     /// channel simply does not sound, which is the neat kind of nothing.
     fn arr_paste(&mut self) {
+        // Nodes first, and only when the node clipboard is what was filled
+        // last — see `auto_clipboard`.
+        if self.arr_paste_auto_nodes() {
+            return;
+        }
+        // **A track on the clipboard and an EMPTY slot selected: paste the
+        // track.** `paste_track` refuses a lane that is already a track, so
+        // aiming at a live one falls through to the clips below rather than
+        // destroying it.
+        if self.track_on_clipboard() {
+            if let Some(n) = self.selected_channel.filter(|n| !self.channel_used(*n)) {
+                self.paste_track(n);
+                return;
+            }
+        }
         if self.clip_clipboard.is_empty() {
             return;
         }
@@ -9869,6 +10237,21 @@ impl IvoryApp {
     }
 
     fn arr_delete_selected(&mut self) {
+        // **A chosen automation row goes first.** It is the only thing
+        // selected when it is selected — see `arr_select_auto_row` — so this
+        // can never take a clip somebody meant to keep.
+        // **Nodes before the row.** Both cannot be chosen at once — picking
+        // either clears the other — but the order is written down anyway,
+        // because Delete closing a lane somebody meant to thin out would
+        // take the work with it.
+        if !self.arr_auto_nodes.is_empty() {
+            self.arr_delete_auto_nodes();
+            return;
+        }
+        if let Some((lane, slot)) = self.arr_auto_sel.take() {
+            self.arr_close_auto_row(lane, slot);
+            return;
+        }
         let mut doomed = std::mem::take(&mut self.arr_multi);
         if let Some(id) = self.arr_selected.take() {
             if !doomed.contains(&id) {
@@ -11204,7 +11587,7 @@ impl IvoryApp {
                     params: recorder::DrumPadParams::default(),
                 };
             }
-            let slot = &self.drumpad.pads[key];
+            let slot = &self.drumpad().pads[key];
             let status = &self.drumpad_status[key];
             crate::drumpad_panel::PadView {
                 label: if slot.name.is_empty() {
@@ -11238,7 +11621,7 @@ impl IvoryApp {
             loaded_keys: {
                 // One bit per loaded key, for the bank strip's occupancy.
                 let mut bits = 0u128;
-                for (k, p) in self.drumpad.pads.iter().enumerate() {
+                for (k, p) in self.drumpad().pads.iter().enumerate() {
                     if k < 128 && !p.path.is_empty() {
                         bits |= 1u128 << k;
                     }
@@ -11390,14 +11773,49 @@ impl IvoryApp {
     /// wherever the arrangement itself loads, so the two can never describe
     /// different projects.
     fn load_drumpad_doc(&mut self) {
-        self.drumpad = match self.project_doc() {
-            Some(doc) => crate::drumpad::DrumpadDoc::load_beside(doc),
-            None => crate::drumpad::DrumpadDoc::default(),
+        // **Every lane's kit, from the one sidecar.** See
+        // `DrumpadDoc::load_all_beside`: the file's top-level `pads` is the
+        // kit a pre-lanes project wrote, and it lands on whichever channel
+        // holds the drumpad so those projects open sounding as they did.
+        let (kits, saved_lane) = match self.project_doc() {
+            Some(doc) => crate::drumpad::DrumpadDoc::load_all_beside(doc, crate::recorder::CHANNELS),
+            None => (
+                (0..crate::recorder::CHANNELS)
+                    .map(|_| crate::drumpad::DrumpadDoc::default())
+                    .collect(),
+                None,
+            ),
         };
+        self.drumpad_kits = kits;
+        // **The lane that was in front of you when it was saved**, and only
+        // then the first that has a kit.
+        //
+        // The fallback alone was the bug. A session with kits on lanes 0, 3
+        // and 5, left showing 3, reopened on 0 — different samples on every
+        // pad of the panel you had been working in, which is indistinguishable
+        // from the kit having been destroyed. The file had recorded the right
+        // answer on every save since lanes existed; nothing read it.
+        //
+        // Still checked, not trusted: a lane whose kit has since been emptied
+        // would open on blank pads and be the same complaint again.
+        self.drumpad_lane = saved_lane
+            .filter(|ch| {
+                self.drumpad_kits
+                    .get(*ch)
+                    .is_some_and(|k| !k.is_empty())
+            })
+            .or_else(|| {
+                (0..crate::recorder::CHANNELS).find(|ch| {
+                    self.drumpad_kits
+                        .get(*ch)
+                        .is_some_and(|k| !k.is_empty())
+                })
+            })
+            .unwrap_or(0);
         self.drumpad_status = std::array::from_fn(|_| crate::ports::PadStatus::default());
-        // The classic kit's C1, not key 0 — no page even shows key 0 (the
-        // pages anchor at 4), so a selection there was invisible.
-        self.drumpad_sel = 36;
+        // C2, and the page that shows it — see `drumpad_focus`. Not key 0:
+        // no page even shows key 0, the pages anchor at 4.
+        self.drumpad_focus(Self::HOME_KEY);
         self.drumpad_dirty = true;
     }
 
@@ -11420,11 +11838,15 @@ impl IvoryApp {
                     .unwrap_or_default()
             ));
         };
-        self.drumpad.pads[pad].path = rel;
-        self.drumpad.pads[pad].name.clear();
+        self.drumpad_mut().pads[pad].path = rel;
+        self.drumpad_mut().pads[pad].name.clear();
         self.drumpad_status[pad] = crate::ports::PadStatus::default();
         self.drumpad_sel = pad;
-        self.drumpad.save_beside(&doc);
+        crate::drumpad::DrumpadDoc::save_all_beside(
+            &self.drumpad_kits,
+            self.drumpad_lane,
+            &doc,
+        );
         self.drumpad_dirty = true;
         Ok(())
     }
@@ -11433,25 +11855,44 @@ impl IvoryApp {
     /// must never delete something a clip may also be standing on.
     fn drumpad_clear_selected(&mut self) {
         let pad = self.drumpad_sel.min(recorder::DRUM_PADS - 1);
-        if self.drumpad.pads[pad].path.is_empty() {
+        if self.drumpad().pads[pad].path.is_empty() {
             return;
         }
-        self.drumpad.pads[pad] = crate::drumpad::PadSlot::default();
+        self.drumpad_mut().pads[pad] = crate::drumpad::PadSlot::default();
         self.drumpad_status[pad] = crate::ports::PadStatus::default();
-        self.drumpad_save();
+        self.drumpad_edited();
         self.drumpad_dirty = true;
+    }
+
+    /// **The kit CHANGED**: write it down and put the moment on the undo
+    /// timeline.
+    ///
+    /// Separate from `drumpad_save` because the undo path itself has to write
+    /// the sidecar WITHOUT committing — committing there would push the state
+    /// just travelled to onto the top of the stack and strand redo. Every
+    /// other caller means "somebody edited this", and every one of them used
+    /// to call the plain save: loading a kit, clearing a pad, renaming one,
+    /// turning a knob. None of it was undoable, and an undo taken after any
+    /// of it put the clips back and left the pads alone.
+    fn drumpad_edited(&mut self) {
+        self.drumpad_save();
+        self.undo_commit();
     }
 
     fn drumpad_save(&mut self) {
         if let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) {
-            self.drumpad.save_beside(&doc);
+            crate::drumpad::DrumpadDoc::save_all_beside(
+            &self.drumpad_kits,
+            self.drumpad_lane,
+            &doc,
+        );
         }
     }
 
     /// One knob's current value, in its own units.
     fn drumpad_get(&self, p: crate::drumpad_panel::Param) -> f32 {
         use crate::drumpad_panel::Param as P;
-        let sel = &self.drumpad.pads[self.drumpad_sel.min(recorder::DRUM_PADS - 1)].params;
+        let sel = &self.drumpad().pads[self.drumpad_sel.min(recorder::DRUM_PADS - 1)].params;
         match p {
             P::Gain => sel.gain,
             P::Pan => sel.pan,
@@ -11461,16 +11902,12 @@ impl IvoryApp {
 
     /// A pad's short name: the sample's file stem, or nothing.
     fn pad_label(&self, pad: usize) -> &str {
-        if let Some(slot) = self.drumpad.pads.get(pad) {
+        if let Some(slot) = self.drumpad().pads.get(pad) {
             if !slot.name.is_empty() {
                 return slot.name.as_str();
             }
         }
-        let path = self
-            .drumpad
-            .pads
-            .get(pad)
-            .map_or("", |p| p.path.as_str());
+        let path = self.drumpad().pads.get(pad).map_or("", |p| p.path.as_str());
         let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
         name.rfind('.').map_or(name, |dot| &name[..dot])
     }
@@ -11484,9 +11921,9 @@ impl IvoryApp {
         let v = if v.is_finite() { v.clamp(lo, hi) } else { p.default_value() };
         let sel = self.drumpad_sel.min(recorder::DRUM_PADS - 1);
         match p {
-            P::Gain => self.drumpad.pads[sel].params.gain = v,
-            P::Pan => self.drumpad.pads[sel].params.pan = v,
-            P::Tune => self.drumpad.pads[sel].params.tune = v,
+            P::Gain => self.drumpad_mut().pads[sel].params.gain = v,
+            P::Pan => self.drumpad_mut().pads[sel].params.pan = v,
+            P::Tune => self.drumpad_mut().pads[sel].params.tune = v,
         }
     }
 
@@ -11672,7 +12109,7 @@ impl IvoryApp {
                 if commit {
                     if let Ok(v) = buf.parse::<f32>() {
                         self.drumpad_set(param, v);
-                        self.drumpad_save();
+                        self.drumpad_edited();
                     }
                 }
                 self.drumpad_num = None;
@@ -11736,8 +12173,8 @@ impl IvoryApp {
                 }
                 if commit || cancel {
                     if commit {
-                        self.drumpad.pads[pad].name = buf.trim().to_owned();
-                        self.drumpad_save();
+                        self.drumpad_mut().pads[pad].name = buf.trim().to_owned();
+                        self.drumpad_edited();
                     }
                     self.pad_name_typing = None;
                 } else {
@@ -11753,7 +12190,7 @@ impl IvoryApp {
                     if let Some(p) = pointer {
                         let f = ((p.x - wave.left()) / wave.width().max(1.0))
                             .clamp(0.0, 1.0);
-                        let params = &mut self.drumpad.pads[pad].params;
+                        let params = &mut self.drumpad_mut().pads[pad].params;
                         if end {
                             params.trim_end = f.max(params.trim_start + 0.02);
                         } else {
@@ -11762,7 +12199,7 @@ impl IvoryApp {
                     }
                 } else {
                     self.pad_trim_drag = None;
-                    self.drumpad_save();
+                    self.drumpad_edited();
                 }
                 return;
             }
@@ -11781,16 +12218,16 @@ impl IvoryApp {
                 }
                 if wave.contains(p) {
                     // The nearer handle takes the hand.
-                    let params = &self.drumpad.pads[pad].params;
+                    let params = &self.drumpad().pads[pad].params;
                     let x0 = wave.left() + wave.width() * params.trim_start;
                     let x1 = wave.left() + wave.width() * params.trim_end;
                     self.pad_trim_drag = Some((p.x - x1).abs() < (p.x - x0).abs());
                     return;
                 }
                 if pad_menu_obey(menu).contains(p) {
-                    let params = &mut self.drumpad.pads[pad].params;
+                    let params = &mut self.drumpad_mut().pads[pad].params;
                     params.obey = !params.obey;
-                    self.drumpad_save();
+                    self.drumpad_edited();
                     return;
                 }
                 return;
@@ -11852,11 +12289,11 @@ impl IvoryApp {
                 self.drumpad_grab = None;
                 if !grab.moved && !grab.on_number && double {
                     self.drumpad_set(grab.param, grab.param.default_value());
-                    self.drumpad_save();
+                    self.drumpad_edited();
                 } else if !grab.moved && grab.on_number {
                     self.drumpad_num = Some((grab.param, String::new()));
                 } else if grab.moved {
-                    self.drumpad_save();
+                    self.drumpad_edited();
                 }
             }
             return;
@@ -11882,7 +12319,7 @@ impl IvoryApp {
                     {
                         // The whole slot rides: path AND knobs, and the
                         // two pads trade places — nothing is lost either way.
-                        self.drumpad.pads.swap(from, to);
+                        self.drumpad_mut().pads.swap(from, to);
                         self.drumpad_status.swap(from, to);
                         self.drumpad_peaks.swap(from, to);
                         self.drumpad_sel = to;
@@ -11905,7 +12342,7 @@ impl IvoryApp {
                         order.swap(a, b);
                         self.desk_state_perm = Some(order);
                         self.save_settings();
-                        self.drumpad_save();
+                        self.drumpad_edited();
                         self.drumpad_dirty = true;
                     }
                 }
@@ -11952,7 +12389,7 @@ impl IvoryApp {
                     let Some(i) = self.drumpad_key_of(slot) else {
                         return;
                     };
-                    if !self.drumpad.pads[i].path.is_empty() {
+                    if !self.drumpad().pads[i].path.is_empty() {
                         self.drumpad_sel = i;
                         self.pad_menu = Some(i);
                         // The strike and the carry a held press left in
@@ -11981,6 +12418,12 @@ impl IvoryApp {
                     self.media_dir.to_string_lossy().into_owned();
                 self.save_settings();
             }
+            // The kit pair. Both go out through a native panel, because a
+            // preset is a file somebody keeps where they keep files — not
+            // something the app gets to file away in a folder of its own
+            // choosing.
+            Some(H::SaveKit) => self.save_kit_preset(),
+            Some(H::LoadKit) => self.load_kit_preset(),
             // The selected pad's bays: the same door every bay opens —
             // picker when empty, the plugin's own window when loaded.
             Some(H::PadInsert(bay)) => {
@@ -12039,7 +12482,7 @@ impl IvoryApp {
                 // empty pad only selects — there is nothing to sound. The
                 // press also ARMS the carry: really moving the hand drags
                 // the clip to another pad.
-                if !self.drumpad.pads[i].path.is_empty() {
+                if !self.drumpad().pads[i].path.is_empty() {
                     self.drumpad_down = Some(i);
                     self.pad_carry = Some((i, p, false));
                     self.request_recorder(recorder::RecorderRequest::PadHit {
@@ -12070,9 +12513,9 @@ impl IvoryApp {
             }
             Some(H::Choke) => {
                 let sel = self.drumpad_sel.min(recorder::DRUM_PADS - 1);
-                let g = &mut self.drumpad.pads[sel].params.choke;
+                let g = &mut self.drumpad_mut().pads[sel].params.choke;
                 *g = (*g + 1) % (crate::drumpad_panel::CHOKE_GROUPS + 1);
-                self.drumpad_save();
+                self.drumpad_edited();
             }
             Some(H::Clear) => self.drumpad_clear_selected(),
             Some(H::Strip) => self.drumpad_move = Some(p - rect.min),
@@ -12091,9 +12534,66 @@ impl IvoryApp {
 
     /// Every pad's file, resolved against the open project. `None` for an
     /// empty pad.
+    /// **The kit the panel is editing.** Every reader goes through here, so
+    /// there is one place that decides which lane that is.
+    fn drumpad(&self) -> &crate::drumpad::DrumpadDoc {
+        self.drumpad_kits
+            .get(self.drumpad_lane)
+            .unwrap_or(&self.drumpad_kits[0])
+    }
+
+    fn drumpad_mut(&mut self) -> &mut crate::drumpad::DrumpadDoc {
+        let lane = self.drumpad_lane.min(self.drumpad_kits.len().saturating_sub(1));
+        &mut self.drumpad_kits[lane]
+    }
+
+    /// **Which lane's kit the drumpad window shows.** Set when the window is
+    /// opened from a lane, and clamped to a channel that exists.
+    pub fn set_drumpad_lane(&mut self, lane: usize) {
+        if lane < self.drumpad_kits.len() {
+            self.drumpad_lane = lane;
+        }
+    }
+
+    pub fn drumpad_lane(&self) -> usize {
+        self.drumpad_lane
+    }
+
+    /// Every lane's kit, for the host's push. Empty kits included, because
+    /// a lane that LOST its drumpad has to be told so.
+    pub fn drumpad_kit_of(&self, lane: usize) -> Option<&crate::drumpad::DrumpadDoc> {
+        self.drumpad_kits.get(lane)
+    }
+
+    /// **One LANE's sample paths**, for the host to decode into its kit.
+    /// Every drum lane is asked separately, because each has its own kit.
+    pub fn drumpad_paths_of(
+        &self,
+        lane: usize,
+    ) -> [Option<std::path::PathBuf>; recorder::DRUM_PADS] {
+        let Some(kit) = self.drumpad_kits.get(lane) else {
+            return std::array::from_fn(|_| None);
+        };
+        std::array::from_fn(|i| {
+            let slot = &kit.pads[i];
+            if slot.path.is_empty() {
+                return None;
+            }
+            self.project_doc()
+                .map(|doc| crate::drumpad::resolve(doc, &slot.path))
+        })
+    }
+
+    /// One lane's knobs, for the engine's push.
+    pub fn drum_kit_params_of(&self, lane: usize) -> recorder::DrumKitParams {
+        self.drumpad_kits
+            .get(lane)
+            .map_or_else(recorder::DrumKitParams::default, crate::drumpad::DrumpadDoc::params)
+    }
+
     pub fn drumpad_paths(&self) -> [Option<std::path::PathBuf>; recorder::DRUM_PADS] {
         std::array::from_fn(|i| {
-            let slot = &self.drumpad.pads[i];
+            let slot = &self.drumpad().pads[i];
             if slot.path.is_empty() {
                 return None;
             }
@@ -12104,7 +12604,7 @@ impl IvoryApp {
 
     /// The kit's knobs, whole, for the engine's every-frame push.
     pub fn drum_kit_params(&self) -> recorder::DrumKitParams {
-        self.drumpad.params()
+        self.drumpad().params()
     }
 
     /// Whether live MIDI notes in the pads' range should mirror onto the
@@ -12365,7 +12865,7 @@ impl IvoryApp {
             }
         }
         // The trim: the kept span bright, the cut ends veiled, two handles.
-        let params = &self.drumpad.pads[pad].params;
+        let params = &self.drumpad().pads[pad].params;
         let x0 = wave.left() + wave.width() * params.trim_start;
         let x1 = wave.left() + wave.width() * params.trim_end;
         for (a, b) in [(wave.left(), x0), (x1, wave.right())] {
@@ -12413,6 +12913,34 @@ impl IvoryApp {
     /// The editor's EAR: on the DRUM LANE the keys are PADS, and every
     /// audition strikes the kit — one that reached the DX7 while editing
     /// drums was the owner's bug. Everywhere else, the ordinary audition.
+    /// **Let go of whatever the editor is sounding.**
+    ///
+    /// Every path that leaves the press handler EARLY has to call this. The
+    /// release below is what normally matches a preview's note-on with its
+    /// note-off, and a branch that returns before reaching it strands the
+    /// note sounding for ever — the owner's "the double click deletes the
+    /// note, BUT auditions the second click and rings out this time".
+    ///
+    /// The note is already gone from the document by then, so nothing else
+    /// will ever think to release it.
+    fn me_quiet_preview(&mut self) {
+        let mut quiet: Vec<u8> = self
+            .midi_edit
+            .as_ref()
+            .map(|m| m.preview_keys.clone())
+            .unwrap_or_default();
+        if let Some(k) = self.midi_edit.as_ref().and_then(|m| m.down_key) {
+            quiet.push(k);
+        }
+        if !quiet.is_empty() {
+            self.me_audition(quiet, false);
+        }
+        if let Some(st) = self.midi_edit.as_mut() {
+            st.down_key = None;
+            st.preview_keys.clear();
+        }
+    }
+
     fn me_audition(&mut self, notes: Vec<u8>, on: bool) {
         let drum_lane = (0..crate::recorder::CHANNELS)
             .find(|n| self.insert(*n, 0) == Some(dialogs::DRUMPAD_PATH));
@@ -12812,6 +13340,11 @@ impl IvoryApp {
                 };
                 if let Some(crate::midi_editor::Hit::NoteBody(i)) = hit {
                     self.me_delete_note(i);
+                    // The press that opened this double click auditioned the
+                    // note. It has to be released HERE, because this branch
+                    // returns before the release that would have done it and
+                    // the note it belongs to no longer exists.
+                    self.me_quiet_preview();
                     if let Some(st) = self.midi_edit.as_mut() {
                         st.drag = None;
                     }
@@ -12956,6 +13489,7 @@ impl IvoryApp {
                         // can edit in.
                         if pressed && !secondary && !alt && self.settings.midi_draw_mode {
                             self.me_delete_note(i);
+                            self.me_quiet_preview();
                             if let Some(st) = self.midi_edit.as_mut() {
                                 st.drag = None;
                             }
@@ -12963,6 +13497,7 @@ impl IvoryApp {
                         }
                         if secondary {
                             self.me_delete_note(i);
+                            self.me_quiet_preview();
                         } else {
                             self.me_select(i, shift);
                             let in_sel = self
@@ -13348,22 +13883,9 @@ impl IvoryApp {
                     self.save_settings_soon();
                 }
             }
-            // Every sounding preview lets go.
-            let mut quiet: Vec<u8> = self
-                .midi_edit
-                .as_ref()
-                .map(|m| m.preview_keys.clone())
-                .unwrap_or_default();
-            if let Some(k) = self.midi_edit.as_ref().and_then(|m| m.down_key) {
-                quiet.push(k);
-            }
-            if !quiet.is_empty() {
-                self.me_audition(quiet, false);
-            }
-            if let Some(st) = self.midi_edit.as_mut() {
-                st.down_key = None;
-                st.preview_keys.clear();
-            }
+            // Every sounding preview lets go. See `me_quiet_preview`, which
+            // the early-returning delete paths call for the same reason.
+            self.me_quiet_preview();
             let dirty = self
                 .midi_edit
                 .as_ref()
@@ -13403,6 +13925,11 @@ impl IvoryApp {
     /// headers is left alone: that is a different gesture about the same
     /// objects, and syncing on every frame would undo it.
     fn arr_sync_tracks_to_clips(&mut self) {
+        // A clip selection releases the automation row: one subject for the
+        // Delete key. See `arr_select_auto_row`.
+        if self.arr_selected.is_some() || !self.arr_multi.is_empty() {
+            self.arr_auto_sel = None;
+        }
         let now = (self.arr_selected, self.arr_multi.clone());
         if now == self.arr_sel_seen {
             return;
@@ -13433,6 +13960,7 @@ impl IvoryApp {
     }
 
     fn select_track(&mut self, n: usize, mods: egui::Modifiers) {
+        self.arr_auto_sel = None;
         if mods.shift {
             // **From the ANCHOR, not from the primary.** Shift-clicking around
             // has to keep measuring from the same fixed end, or the range
@@ -14004,6 +14532,15 @@ impl IvoryApp {
                         }
                     }
                     Some(A::HdrName(n)) => {
+                        // **Only a track has a name to type into.** An empty
+                        // slot's row answers `HdrName` now — that is what
+                        // makes it selectable and a paste destination — so a
+                        // double click there would otherwise open a rename
+                        // box for a track that does not exist, and typing
+                        // into it would name nothing.
+                        if !self.channel_used(n) {
+                            return;
+                        }
                         let seed = self
                             .settings
                             .strip_names
@@ -14050,6 +14587,18 @@ impl IvoryApp {
                 {
                     self.touch_track(n);
                 }
+                // **A press anywhere but ON a node lets the nodes go.**
+                //
+                // One place rather than a `clear()` in every arm that can
+                // select something else: the arms that DO set another
+                // selection already clear this, and the ones that select
+                // nothing — the playhead, a header switch, empty ground —
+                // are exactly the ones that would have been forgotten. A
+                // selection the eye cannot explain is a Delete that takes
+                // something nobody was looking at.
+                if !matches!(hit, Some(A::AutoPoint(..))) {
+                    self.arr_auto_nodes.clear();
+                }
                 match hit {
                     // ── automation ────────────────────────────────────────
                     //
@@ -14059,7 +14608,11 @@ impl IvoryApp {
                     // A press on the row's own header opens the same menu
                     // the A button does, with this row's box already ticked —
                     // which is how you take a row away again.
-                    Some(A::AutoParamPick(n, _)) => self.arr_open_automation_menu(n),
+                    // **The row's name CHOOSES it**, so Delete has a subject.
+                    // It used to open the automation menu — which the A
+                    // button on the track's own header already does, so the
+                    // menu keeps its door and the row gains one.
+                    Some(A::AutoParamPick(n, slot)) => self.arr_select_auto_row(n, slot),
                     Some(A::Phase(n)) => {
                         self.touch_track(n);
                         self.apply_mixer_hit(M::Phase(Column(n)), 0.0);
@@ -14078,6 +14631,19 @@ impl IvoryApp {
                         }
                     }
                     Some(A::AutoPoint(n, row, i)) => {
+                        // **Shift adds to the selection**, the same modifier
+                        // that adds a clip to one — a hand that has learned
+                        // the timeline has learned this.
+                        if ctx.input(|k| k.modifiers.shift) {
+                            self.arr_toggle_auto_node(n, row, i);
+                        } else if !self.arr_auto_nodes.contains(&(n, row, i)) {
+                            // Pressing a node that is NOT in the selection
+                            // replaces it. Pressing one that IS leaves the
+                            // set alone, so a drag can move several at once
+                            // without the press that starts it collapsing
+                            // them to one.
+                            self.arr_select_auto_node(n, row, i);
+                        }
                         self.arr_auto_hot = Some((n, i));
                         self.arr_drag = Some(ArrDrag::AutoPoint(n, row, i));
                     }
@@ -14955,19 +15521,22 @@ impl IvoryApp {
         // layer delivers as `Event::Copy` / `Event::Paste`, never as a
         // C or V keypress. Clips of any kind.
         if keys_ok && self.midi_edit.is_none() {
-            let (copy_ev, paste_ev) = ctx.input(|i| {
+            let (copy_ev, paste_ev, cut_ev) = ctx.input(|i| {
                 let mut c = false;
                 let mut v = false;
+                let mut x = false;
                 for e in &i.events {
                     match e {
                         egui::Event::Copy => c = true,
                         egui::Event::Paste(_) => v = true,
+                        egui::Event::Cut => x = true,
                         _ => {}
                     }
                 }
                 (
                     c || (i.modifiers.command && i.key_pressed(egui::Key::C)),
                     v || (i.modifiers.command && i.key_pressed(egui::Key::V)),
+                    x || (i.modifiers.command && i.key_pressed(egui::Key::X)),
                 )
             });
             if copy_ev {
@@ -14975,6 +15544,15 @@ impl IvoryApp {
             }
             if paste_ev {
                 self.arr_paste();
+            }
+            // **CUT is copy and then delete** — what it is everywhere else,
+            // and what it was not here: the chord was simply unbound, so X
+            // over the timeline did nothing at all. Written as the pair
+            // rather than as a third path, so cut can never come to mean
+            // something copy does not.
+            if cut_ev {
+                self.arr_copy();
+                self.arr_delete_selected();
             }
         }
         // **Ctrl/Cmd+Shift+N: normalise.**
@@ -15235,9 +15813,11 @@ impl IvoryApp {
                     automation: self
                         .arr_auto_rows(n)
                         .into_iter()
-                        .map(|param| crate::arrangement_panel::AutoView {
+                        .enumerate()
+                        .map(|(slot, param)| crate::arrangement_panel::AutoView {
                             param,
                             label: self.auto_param_label(n, param),
+                            selected: self.arr_auto_sel == Some((n, slot)),
                             resting: self.auto_resting(n, param),
                             armed: self.arr_auto_armed.contains(&(n, param)),
                             bypassed: self.arr_auto_bypassed.contains(&(n, param)),
@@ -15250,6 +15830,12 @@ impl IvoryApp {
                                 .arr_auto_hot
                                 .filter(|(l, _)| *l == n)
                                 .map(|(_, i)| i),
+                            chosen: self
+                                .arr_auto_nodes
+                                .iter()
+                                .filter(|(l, s, _)| *l == n && *s == slot)
+                                .map(|(_, _, i)| *i)
+                                .collect(),
                         })
                         .collect(),
                     route_count: self.settings.routes.from(n).len(),
@@ -15373,7 +15959,117 @@ impl IvoryApp {
                         Some(crate::ports::ProjectRequest::Template(name));
                 }
             }
+            crate::ports::SavePurpose::KitPreset => self.write_kit_preset(path),
         }
+    }
+
+    /// **Ask where to put the showing lane's kit.**
+    ///
+    /// Named for the lane's track, because that is what somebody would call
+    /// it — a kit built on a track named "Verse Drums" suggests exactly that
+    /// and not "kit 1".
+    fn save_kit_preset(&mut self) {
+        let lane = self.drumpad_lane;
+        let suggested = {
+            let at = crate::recorder::Strip::Channel(lane).index();
+            let name = self
+                .settings
+                .strip_names
+                .get(at)
+                .map(String::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            if name.is_empty() { "kit".to_owned() } else { name }
+        };
+        self.save_request = Some(crate::ports::SaveRequest {
+            title: "Save Kit".to_owned(),
+            suggested: format!("{suggested}.{}", crate::drumpad::PRESET_EXT),
+            purpose: crate::ports::SavePurpose::KitPreset,
+        });
+    }
+
+    /// Write it, and say so in the place errors from this panel already go.
+    fn write_kit_preset(&mut self, path: &std::path::Path) {
+        let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) else {
+            self.track.error = "no project is open".to_owned();
+            return;
+        };
+        let name = path
+            .file_stem()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let preset =
+            crate::drumpad::KitPreset::from_kit(&name, self.drumpad(), &doc);
+        if preset.pads.is_empty() {
+            self.track.error = "this kit has no pads to save".to_owned();
+            return;
+        }
+        match preset.save(path) {
+            Ok(_) => self.track.error.clear(),
+            Err(e) => self.track.error = format!("could not save the kit: {e}"),
+        }
+    }
+
+    /// Ask for a kit file to load onto the showing lane.
+    fn load_kit_preset(&mut self) {
+        self.file_request = Some(crate::ports::FileRequest {
+            start_at: None,
+            title: "Load Kit".to_owned(),
+            extensions: vec![crate::drumpad::PRESET_EXT.to_owned()],
+            extension_label: "Tangent kit".to_owned(),
+            purpose: crate::ports::FilePurpose::KitPreset,
+            multi: false,
+        });
+    }
+
+    /// **Put a saved kit on the showing lane.**
+    ///
+    /// Each sample goes through `drumpad_load`, which copies it into the open
+    /// project — so the project stays self-contained and the preset stays a
+    /// recipe rather than a folder of borrowed files.
+    ///
+    /// The pads it replaces are cleared FIRST. Loading a five-pad kit over an
+    /// eight-pad one and leaving three strangers behind is a kit that is
+    /// neither of the two.
+    ///
+    /// A sample that has gone missing costs its own pad and nothing else: the
+    /// rest of the layout is still worth having, and the message names how
+    /// many were lost rather than throwing the kit away.
+    pub fn apply_kit_preset(&mut self, path: &std::path::Path) {
+        let preset = match crate::drumpad::KitPreset::load(path) {
+            Ok(p) => p,
+            Err(e) => {
+                self.track.error = format!("could not read the kit: {e}");
+                return;
+            }
+        };
+        if preset.pads.is_empty() {
+            self.track.error = "that kit has no pads in it".to_owned();
+            return;
+        }
+        for pad in self.drumpad_mut().pads.iter_mut() {
+            *pad = crate::drumpad::PadSlot::default();
+        }
+        self.drumpad_mut().master = preset.master;
+        let mut missing = 0usize;
+        for (key, file, name, params) in &preset.pads {
+            if self.drumpad_load(*key, file).is_err() {
+                missing += 1;
+                continue;
+            }
+            if let Some(slot) = self.drumpad_mut().pads.get_mut(*key) {
+                slot.name = name.clone();
+                slot.params = *params;
+            }
+        }
+        self.drumpad_dirty = true;
+        self.drumpad_edited();
+        self.track.error = if missing == 0 {
+            String::new()
+        } else {
+            format!("{missing} of {} samples could not be found", preset.pads.len())
+        };
     }
 
     /// The backing track's level, for the host to push at the engine.
@@ -16028,6 +16724,13 @@ impl IvoryApp {
     }
 
     /// The playhead, where an insert lands.
+    /// **Whether the window is running without its frame.** The host needs
+    /// it to decide what "maximised" should mean — see
+    /// `DesktopApp::reconcile_screen_cover`.
+    pub fn borderless(&self) -> bool {
+        self.settings.borderless_mode
+    }
+
     pub fn playhead_s(&self) -> f64 {
         self.recorder.position_s.max(0.0)
     }
@@ -16174,8 +16877,51 @@ impl IvoryApp {
     /// dev hook that took a different path would exercise a path no user has.
     /// Raise the drumpad window — the key, the bay's face and a fresh
     /// load all come through here so the media list is never stale.
+    /// **The window follows the LANE it was opened from.**
+    ///
+    /// A drum instrument loads a full instance per channel, so there is a kit
+    /// per lane and the window shows one of them. Which one is not a new
+    /// question to answer with a new control: both doors into this window are
+    /// a bay on a particular strip, and the kit you meant is that strip's.
+    fn open_drumpad_for(&mut self, strip: usize) {
+        self.set_drumpad_lane(strip);
+        self.open_drumpad();
+    }
+
+    /// **C2 is where the drumpad opens.** Every time.
+    ///
+    /// The selection already defaulted to key 36 and the page setting already
+    /// defaulted to the page that holds it — but the PAGE is persisted and the
+    /// selection is not, so the two only agreed until somebody paged away
+    /// once. After that the panel reopened on whatever page it was left on
+    /// with a selection that was not on it, and
+    /// `sel.saturating_sub(base).min(DRUM_PAGE - 1)` clamped the highlight
+    /// onto the last pad of the wrong page. The owner: "Should open with C2
+    /// highlighted by default."
+    ///
+    /// So the page follows the key rather than being remembered separately.
+    /// Paging around inside an open panel still works; it is where a fresh
+    /// open LANDS that is fixed, exactly as the media folder below it is.
+    const HOME_KEY: usize = 36;
+
+    /// Put the selection on `key` and turn to the page that shows it.
+    ///
+    /// One function because the two have to move together: a selection the
+    /// visible page does not contain is a highlight on the wrong pad, which
+    /// is the bug this was written for.
+    fn drumpad_focus(&mut self, key: usize) {
+        let key = key.min(crate::recorder::DRUM_PADS - 1);
+        self.drumpad_sel = key;
+        let page = key
+            .saturating_sub(crate::recorder::DRUM_PAGE_ANCHOR)
+            / crate::recorder::DRUM_PAGE;
+        self.settings.drumpad_page =
+            page.min(crate::recorder::DRUM_PAGES - 1) as u8;
+    }
+
     fn open_drumpad(&mut self) {
         self.drumpad_open = true;
+        self.drumpad_focus(Self::HOME_KEY);
         // A remembered default folder is where a fresh open LANDS.
         let def = std::path::PathBuf::from(&self.settings.media_default_dir);
         if !self.settings.media_default_dir.is_empty()
@@ -16206,7 +16952,7 @@ impl IvoryApp {
             Some(dialogs::BUILTIN_PATH) => self.open_patch_picker(strip),
             // The drumpad's face is the drumpad: pads, kit and browser in
             // one window, same as its key opens.
-            Some(dialogs::DRUMPAD_PATH) => self.open_drumpad(),
+            Some(dialogs::DRUMPAD_PATH) => self.open_drumpad_for(strip),
             Some(_) => {
                 self.request_recorder(recorder::RecorderRequest::OpenInsertEditor(strip, bay));
             }
@@ -16304,6 +17050,22 @@ impl IvoryApp {
             Some(s) => (s.systems(), s.rates()),
             None => (Vec::new(), Vec::new()),
         };
+        // **The name the OUTPUT is actually running under**, not the one the
+        // settings asked for. They differ in the case that matters: the app
+        // opens the system default unless told otherwise, so the request is
+        // usually `None` and only the running stream can say which box that
+        // turned out to be. `None` here means nothing is open, and the probe
+        // falls back to the default — which is what would open next.
+        let out_name = self
+            .audio_status
+            .output
+            .as_ref()
+            .map(|(name, _)| name.clone());
+        let output_path = self
+            .audio_setup
+            .as_ref()
+            .map(|s| s.output_path(out_name.as_deref()))
+            .unwrap_or_default();
         self.dialog = Some(dialogs::Dialog::AudioSetup {
             // A SNAPSHOT, taken when the panel opens. It is refreshed each
             // frame by the host — see `set_audio_status` — because a status
@@ -16322,6 +17084,7 @@ impl IvoryApp {
             // chosen.
             input_channels: self.audio_setup.as_ref().map_or(0, |s| s.input_channels()),
             alias: self.settings.input_alias.clone(),
+            output_path,
         });
     }
 
@@ -16754,7 +17517,7 @@ impl IvoryApp {
                 self.touch_track(n);
                 self.open_insert_face(n, bay);
             }
-            A::AutoParamPick(n, _) => self.arr_open_automation_menu(n),
+            A::AutoParamPick(n, slot) => self.arr_select_auto_row(n, slot),
             A::Phase(n) => self.apply_mixer_hit(M::Phase(Column(n)), 0.0),
             A::AutoClose(n, slot) => self.arr_close_auto_row(n, slot),
             A::AutoArm(n, slot) => self.arr_toggle_auto_arm(n, slot),
@@ -18420,7 +19183,22 @@ impl IvoryApp {
                 if self.drumpad_open {
                     self.close_drumpad();
                 } else {
-                    self.open_drumpad();
+                    // **The key has no bay to come from**, so it opens the
+                    // kit of the SELECTED track when that track has one, and
+                    // otherwise the first lane carrying a drumpad. Keeping
+                    // whatever lane was last shown would mean the key and the
+                    // bay disagreed about which kit you were looking at.
+                    let want = self
+                        .selected_channel
+                        .filter(|ch| self.insert(*ch, 0) == Some(dialogs::DRUMPAD_PATH))
+                        .or_else(|| {
+                            (0..crate::recorder::CHANNELS)
+                                .find(|ch| self.insert(*ch, 0) == Some(dialogs::DRUMPAD_PATH))
+                        });
+                    match want {
+                        Some(ch) => self.open_drumpad_for(ch),
+                        None => self.open_drumpad(),
+                    }
                 }
             }
             K::TransposeUp => self.transpose_by(1),
@@ -19699,7 +20477,7 @@ impl IvoryApp {
                     // the moment the load lands. See `take_open_insert_on_load`.
                     match path.as_deref() {
                         Some(dialogs::BUILTIN_PATH) => self.open_patch_picker(strip),
-                        Some(dialogs::DRUMPAD_PATH) => self.open_drumpad(),
+                        Some(dialogs::DRUMPAD_PATH) => self.open_drumpad_for(strip),
                         Some(_) => self.open_insert_on_load = Some((strip, at)),
                         None => {}
                     }
@@ -21063,9 +21841,16 @@ impl IvoryApp {
                 {
                     self.settings.arr_snap = !self.settings.arr_snap;
                     self.save_settings();
-                } else if self.arrangement_open
+                } else if (self.arrangement_open || self.mixer_open)
                     && action == keys::KeyAction::ManageTaughtChords
                 {
+                    // **M is the metronome on BOTH working surfaces.**
+                    //
+                    // It was the arrangement's alone, and the mixer is the
+                    // other page you set a take up from — the owner: "m must
+                    // toggle met on in mixer, not be bound to change taught
+                    // chords there". Teaching a chord from the mixer is not a
+                    // thing anybody does; reaching for the click is.
                     self.settings.metronome_on = !self.settings.metronome_on;
                     self.save_settings();
                 } else {
@@ -24492,6 +25277,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// **Cmd+C and Cmd+V carry a whole TRACK when no clip is selected.**
+    ///
+    /// The owner asked for the chord to work on tracks, and it has to share
+    /// with the clips it already served. What is under the selection decides:
+    /// clips when clips are chosen, the track when none are — and a paste
+    /// only lands on an EMPTY slot, so a live track can never be destroyed by
+    /// aiming at it.
+    #[test]
+    fn the_copy_chord_carries_a_track_when_no_clip_is_selected() {
+        let root = project_scratch("trackchord");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.bootstrap_project(&root.join("Projects"));
+        app.settings
+            .strip_names
+            .resize(crate::recorder::STRIPS + 1, String::new());
+        app.set_channel_kind(1, Some(crate::recorder::ChannelKind::Midi));
+        app.settings.channel_gains[1] = 0.33;
+
+        // A track selected, no clips: the chord takes the track.
+        app.selected_channel = Some(1);
+        app.selected_tracks = vec![1];
+        app.arr_copy();
+        assert!(app.track_on_clipboard(), "the chord did not copy the track");
+
+        // Aimed at a LIVE track, paste must not touch it — it falls through
+        // to the clip path, which has nothing, so nothing happens.
+        let before = app.settings.channel_gains[1];
+        app.arr_paste();
+        assert!((app.settings.channel_gains[1] - before).abs() < 1e-9);
+
+        // Aimed at an EMPTY slot, the track lands.
+        app.selected_channel = Some(6);
+        app.selected_tracks = vec![6];
+        assert!(!app.channel_used(6));
+        app.arr_paste();
+        assert!(app.channel_used(6), "the chord did not paste the track");
+        assert!((app.settings.channel_gains[6] - 0.33).abs() < 1e-9, "the fader");
+        assert_eq!(app.channel_kind(6), Some(crate::recorder::ChannelKind::Midi));
+
+        // And with a CLIP selected the chord still means clips: the track
+        // clipboard is not disturbed and the clip one fills.
+        let id = app.arrangement.add_clip(crate::arrangement::ArrClip {
+            kind: crate::arrangement::ClipKind::Midi,
+            notes: Vec::new(),
+            lane: 1,
+            path: String::new(),
+            start_s: 0.0,
+            offset_s: 0.0,
+            len_s: 4.0,
+            loop_s: 0.0,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name: "MIDI".to_owned(),
+            id: 0,
+            extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
+            stretch: 1.0,
+            stretch_mode: String::new(),
+            gain: 1.0,
+        });
+        app.arr_selected = Some(id);
+        app.arr_copy();
+        assert!(
+            !app.clip_clipboard.is_empty(),
+            "with a clip selected the chord stopped meaning clips"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// **Cmd+G joins notes of the same pitch, and only of the same pitch.**
     ///
     /// The owner's "CMD + G or CTRL + G should join/glue midi selections as
@@ -27490,42 +28345,41 @@ mod tests {
         let (_ctx, mut app) = headless(Caps::DESKTOP);
         app.settings.arr_snap = false; // the magnet is its own test
 
-        // A point where there was none — plus the node at zero every curve
-        // carries, which holds the same value and so changes nothing audible.
+        // **A point where there was none, and exactly one of them.** The
+        // first alt-click used to make TWO — the one under the hand and a
+        // node seeded at zero in front of it. See
+        // `a_curve_holds_only_the_nodes_that_were_drawn`.
         let i = app.arr_put_auto_point(0, crate::automation::AutoParam::Gain, 4.0, 0.75).expect("no point landed");
         let c = app
             .arrangement
             .automation
             .get(0, AutoParam::Gain)
             .expect("no curve");
-        assert_eq!(c.points().len(), 2, "{:?}", c.points());
-        assert_eq!(c.points()[0].at_s, 0.0, "no node at the beginning");
+        assert_eq!(c.points().len(), 1, "the first node made {:?}", c.points());
         assert!((c.points()[i].at_s - 4.0).abs() < 1e-9);
         assert!((c.points()[i].value - 0.75).abs() < 1e-9);
 
-        // Moving it leaves ONE drawn point, not a trail — the zero node stays.
+        // Moving it leaves ONE point, not a trail.
         app.arr_drag_auto_point(0, crate::automation::AutoParam::Gain, i, 9.0, 0.25);
         let c = app.arrangement.automation.get(0, AutoParam::Gain).expect("no curve");
-        assert_eq!(c.points().len(), 2, "the drag left a trail: {:?}", c.points());
-        assert!((c.points()[1].at_s - 9.0).abs() < 1e-9);
-        assert!((c.points()[1].value - 0.25).abs() < 1e-9);
+        assert_eq!(c.points().len(), 1, "the drag left a trail: {:?}", c.points());
+        assert!((c.points()[0].at_s - 9.0).abs() < 1e-9);
+        assert!((c.points()[0].value - 0.25).abs() < 1e-9);
 
         // A second point, and moving the first PAST it keeps both and
         // re-sorts — the case a carried index would get wrong.
         app.arr_put_auto_point(0, crate::automation::AutoParam::Gain, 12.0, 0.5);
-        app.arr_drag_auto_point(0, crate::automation::AutoParam::Gain, 1, 20.0, 0.1);
+        app.arr_drag_auto_point(0, crate::automation::AutoParam::Gain, 0, 20.0, 0.1);
         let c = app.arrangement.automation.get(0, AutoParam::Gain).expect("no curve");
-        assert_eq!(c.points().len(), 3, "{:?}", c.points());
+        assert_eq!(c.points().len(), 2, "{:?}", c.points());
         assert!(
             c.points().windows(2).all(|w| w[0].at_s < w[1].at_s),
             "the curve is out of order: {:?}",
             c.points()
         );
 
-        // Undrawing the DRAWN points takes the curve out of the document
-        // entirely. The seeded node at zero goes with the last of them rather
-        // than needing its own removal: a lone point at zero says only "hold
-        // this value", which is what no curve at all already says.
+        // Undrawing every point takes the curve out of the document
+        // entirely — an emptied curve is removed, not stored empty.
         app.arr_remove_auto_point(0, crate::automation::AutoParam::Gain, 20.0);
         app.arr_remove_auto_point(0, crate::automation::AutoParam::Gain, 12.0);
         assert!(
@@ -27779,10 +28633,11 @@ mod tests {
         assert_eq!(points(&app), 0, "an armed lane wrote while stopped");
 
         // Both. Now it writes, at the PLAYHEAD rather than wherever the
-        // pointer was — plus the node at zero every curve carries.
+        // pointer was — ONE point, because nothing is seeded at zero any
+        // more. See `a_curve_holds_only_the_nodes_that_were_drawn`.
         app.recorder.playing = true;
         app.auto_set_control(0, AutoParam::Gain, 0.4);
-        assert_eq!(points(&app), 2, "an armed, rolling move wrote nothing");
+        assert_eq!(points(&app), 1, "an armed, rolling move wrote nothing");
         let c = app.arrangement.automation.get(0, AutoParam::Gain).expect("a curve");
         assert!(
             c.points().iter().any(|p| (p.at_s - 8.0).abs() < 1e-9),
@@ -31569,19 +32424,54 @@ mod tests {
 
     /// A dragged window ZOOMS the layout; it never stretches it.
     ///
-    /// The whole reason a resizable window is safe here: every band's height
-    /// is a fixed fraction of the width, so the stack has one aspect and
-    /// `fit_bands` keeps it at every size. A window twice as tall as the
-    /// layout wants gives a layout the same shape, centred, not a keyboard
-    /// twice as tall as it should be.
+    /// The property, stated exactly: **the layout's shape is a function of
+    /// its WIDTH and nothing else.** Drag the bottom edge and the bands are
+    /// the same shape, centred, in a taller frame — never a keyboard twice as
+    /// tall as it should be.
+    ///
+    /// This used to be written as "one constant aspect at every size", which
+    /// was the same statement while every band's height was a flat fraction
+    /// of the width. It is not any more: the recorder's height is damped
+    /// above [`recorder_panel::BAND_DAMP_FROM`] so a maximised window does
+    /// not get a band half again as tall as it needs (see `band_height`), and
+    /// a wide layout is therefore a genuinely SHORTER shape than a narrow
+    /// one. That is the intent, so the test asserts the property that
+    /// survives it rather than the coincidence that did not.
+    ///
+    /// Both halves still matter, so both are here: the shape follows the
+    /// width at every pane, AND the aspect really is constant across the
+    /// range of widths where nothing is damped.
     #[test]
+    #[test]
+    fn probe_arrangement_height() {
+        let settings = Settings {
+            show_fretboard: true,
+            show_recorder: true,
+            show_welcome: false,
+            show_chord_strip: true,
+            chord_detection_enabled: true,
+            theory_order: theory_panel::Views::all().keys(),
+            ..Settings::first_launch()
+        };
+        for w in [1300.0f32, 1600.0, 1920.0, 2560.0, 3440.0] {
+            let b = fit_bands(&settings, Vec2::new(w, 100_000.0));
+            let total = b.total();
+            let arr = total.y - b.recorder_h;
+            eprintln!(
+                "PROBE w={w} total={:.0}x{:.0} recorder_h={:.0} arrangement_h={:.0} -> auto row = {:.1}pt",
+                total.x, total.y, b.recorder_h, arr,
+                // 8 lanes + 1 automation row (0.5) + master row: the divisor
+                // the panel uses.
+                (arr - (arr * 0.10)) / (8.0 + 0.5) * 0.5
+            );
+        }
+    }
+
     fn dragging_the_window_zooms_the_layout_and_never_stretches_it() {
         let settings = Settings { show_recorder: true, show_welcome: false, ..Settings::default() };
-        let natural = fit_bands(&settings, Vec2::new(1300.0, 10_000.0));
-        let aspect = natural.total().y / natural.total().x;
         for pane in [
             Vec2::new(1300.0, 900.0),  // much taller than natural
-            Vec2::new(2600.0, 700.0),  // much wider
+            Vec2::new(2600.0, 700.0),  // much wider, and past the damping
             Vec2::new(700.0, 700.0),   // square
             crate::settings::MIN_WINDOW,
         ] {
@@ -31591,9 +32481,27 @@ mod tests {
                 got.x <= pane.x + 0.5 && got.y <= pane.y + 0.5,
                 "the layout {got:?} does not fit the pane {pane:?}"
             );
+            // The same width in a pane of unbounded height: if the window's
+            // height had stretched anything, these two would differ.
+            let unbounded = fit_bands(&settings, Vec2::new(got.x, 100_000.0)).total();
+            assert!(
+                (got.y - unbounded.y).abs() < 0.5,
+                "the pane's HEIGHT changed the shape at {pane:?}: {:.2} tall \
+                 against {:.2} for the same width with room to spare",
+                got.y,
+                unbounded.y
+            );
+        }
+        // And below the damping the aspect is flatly constant, which is the
+        // original claim over the range where it is still true. 1600 is
+        // `BAND_DAMP_FROM`; every window anybody works in is under it.
+        let natural = fit_bands(&settings, Vec2::new(1300.0, 10_000.0)).total();
+        let aspect = natural.y / natural.x;
+        for w in [700.0, 900.0, 1100.0, 1300.0, 1500.0, 1600.0] {
+            let got = fit_bands(&settings, Vec2::new(w, 100_000.0)).total();
             assert!(
                 (got.y / got.x - aspect).abs() < 0.02,
-                "the layout was stretched at {pane:?}: {:.4} against a natural {aspect:.4}",
+                "the layout was stretched at {w} wide: {:.4} against a natural {aspect:.4}",
                 got.y / got.x
             );
         }
@@ -32279,6 +33187,398 @@ mod folder_tests {
     fn app() -> IvoryApp {
         let (_, app) = headless(Caps::DESKTOP);
         app
+    }
+
+    /// **A lane opens with exactly one node, and alt-click makes it two.**
+    ///
+    /// Both halves of the owner's rule, which took two goes to get right in
+    /// both directions. First there was an `ensure_zero` on every mutator, so
+    /// the first alt-click on an empty lane made TWO nodes — the seed and the
+    /// one under the hand. Removing it fixed that and broke the other half:
+    /// the lane then opened with nothing on it. One node, seeded once, when
+    /// the lane is opened.
+    /// **The drumpad opens on C2, whatever page it was left on.**
+    ///
+    /// The selection and the page are two pieces of state that have to agree,
+    /// and only one of them was persisted — so paging away once and reopening
+    /// put the highlight on the last pad of the wrong page, because
+    /// `sel - base` was clamped into range rather than being out of it.
+    /// **A copied drum track is a full instance, not a follower.**
+    ///
+    /// Copying the bays put `DRUMPAD_PATH` in bay 0 of the new lane, which is
+    /// the whole of what makes the engine treat a lane as drums — so it took
+    /// MIDI, drew its pads striking, and made no sound, because a lane's
+    /// samples live in its KIT and the new lane's was empty. The owner: "the
+    /// second is seen as an instance of the 1st that follows but does not
+    /// produce sound."
+    /// **A pad edit is on the undo timeline like everything else.**
+    ///
+    /// The kits live in a sidecar of their own, and the undo history stored
+    /// the arrangement document alone — so loading a kit, clearing a pad or
+    /// retuning one could not be undone, and an undo taken after one of them
+    /// put the clips back while the pads stayed exactly as they were. The
+    /// owner: "the whole pad logic should be compat with standard copy paste
+    /// and cut undo / redo behavior."
+    /// **Undo actually moves, and redo survives it.**
+    ///
+    /// It did neither, and the cause was one character of arithmetic three
+    /// files away: `Arrangement::to_json` wrote `next_clip_id` raw while
+    /// `from_json` raised it to `max(highest id + 1, 1)`, so a document that
+    /// said 0 read back as 1. Undo compares the live document against the
+    /// moment it stands on, saw that phantom difference, decided something
+    /// had changed, pushed a duplicate moment, TRUNCATED THE REDO TAIL to
+    /// make room for it, and stepped back to precisely where it started.
+    ///
+    /// Nothing failed. Undo simply did nothing, and redo was gone. This
+    /// asserts the movement rather than the arithmetic, because the
+    /// arithmetic is not the point and could be fixed a second way.
+    /// **Automation nodes obey select, delete, copy, cut and paste.**
+    ///
+    /// A curve was drawable and draggable and nothing else: no way to choose
+    /// several, no way to lift a shape off one lane onto another, and Delete
+    /// meant the whole row. The owner: "the nodes must be subject to all
+    /// those controls."
+    #[test]
+    fn automation_nodes_can_be_chosen_copied_and_pasted() {
+        use crate::automation::{AutoParam, Point, Shape};
+        let mut app = app();
+        app.arr_toggle_automation_param(0, AutoParam::Gain);
+        // Three nodes past the seeded one at zero.
+        for (t, v) in [(4.0, 0.2), (8.0, 0.9), (12.0, 0.4)] {
+            app.arrangement.automation.entry(0, AutoParam::Gain).put(Point {
+                at_s: t,
+                value: v,
+                shape: Shape::Linear,
+            });
+        }
+        let count = |a: &IvoryApp| {
+            a.arrangement.automation.get(0, AutoParam::Gain).map_or(0, |c| c.points().len())
+        };
+        assert_eq!(count(&app), 4, "the fixture is not four nodes");
+
+        // **Choosing.** One replaces, shift adds, shift again removes.
+        app.arr_select_auto_node(0, 0, 1);
+        assert_eq!(app.arr_auto_nodes, vec![(0, 0, 1)]);
+        app.arr_toggle_auto_node(0, 0, 2);
+        assert_eq!(app.arr_auto_nodes.len(), 2);
+        app.arr_toggle_auto_node(0, 0, 2);
+        assert_eq!(app.arr_auto_nodes.len(), 1, "shift did not take it back out");
+        // Choosing a node stands the ROW selection down, so Delete cannot
+        // mean two things at once.
+        app.arr_select_auto_row(0, 0);
+        assert!(app.arr_auto_nodes.is_empty(), "the row did not clear the nodes");
+        app.arr_select_auto_node(0, 0, 1);
+        assert!(app.arr_auto_sel.is_none(), "the nodes did not clear the row");
+
+        // **Copy**, then paste at the playhead onto the same row.
+        app.arr_toggle_auto_node(0, 0, 2);
+        assert!(app.arr_copy_auto_nodes(), "copy found nothing");
+        assert_eq!(app.auto_clipboard.len(), 2);
+        // Relative to the earliest, so a paste lands where the head is.
+        assert!(
+            app.auto_clipboard[0].at_s.abs() < 1e-9,
+            "the clipboard kept absolute times"
+        );
+        assert!((app.auto_clipboard[1].at_s - 4.0).abs() < 1e-9, "the gap changed");
+
+        app.recorder.position_s = 20.0;
+        assert!(app.arr_paste_auto_nodes(), "paste declined");
+        assert_eq!(count(&app), 6, "paste did not add two nodes");
+        let pts = app.arrangement.automation.get(0, AutoParam::Gain).unwrap().points().to_vec();
+        assert!(
+            pts.iter().any(|p| (p.at_s - 20.0).abs() < 1e-6),
+            "nothing landed at the playhead: {:?}",
+            pts.iter().map(|p| p.at_s).collect::<Vec<_>>()
+        );
+        assert!(pts.iter().any(|p| (p.at_s - 24.0).abs() < 1e-6), "the second did not follow");
+
+        // **Delete** takes exactly the chosen ones, and by TIME rather than
+        // by index — removing one renumbers the rest, so a loop over indices
+        // takes the wrong points from the second one on.
+        app.arr_auto_nodes = vec![(0, 0, 1), (0, 0, 2)];
+        app.arr_delete_auto_nodes();
+        assert_eq!(count(&app), 4, "delete took the wrong number of nodes");
+        assert!(app.arr_auto_nodes.is_empty(), "the selection outlived the nodes");
+
+        // And it is all undoable, like everything else on this timeline.
+        app.undo();
+        assert_eq!(count(&app), 6, "undo did not bring the deleted nodes back");
+    }
+
+    #[test]
+    fn undo_steps_back_and_leaves_a_redo_to_come_forward_to() {
+        let mut app = app();
+        app.undo_reset();
+        let start = app.hist_at;
+
+        app.settings.master_gain = 0.25;
+        app.arr_save_edits();
+        assert_eq!(app.hist_at, start + 1, "the edit made no moment");
+
+        app.settings.master_gain = 0.75;
+        app.arr_save_edits();
+        assert_eq!(app.hist_at, start + 2, "the second edit made no moment");
+        let depth = app.history.len();
+
+        app.undo();
+        assert_eq!(app.hist_at, start + 1, "undo did not move");
+        assert!((app.settings.master_gain - 0.25).abs() < 1e-9);
+        assert_eq!(
+            app.history.len(),
+            depth,
+            "undo grew the history — it pushed a duplicate moment"
+        );
+
+        app.redo();
+        assert_eq!(app.hist_at, start + 2, "redo did not move");
+        assert!(
+            (app.settings.master_gain - 0.75).abs() < 1e-9,
+            "redo did not restore the later value"
+        );
+
+        // And all the way down, which is where the floored counter bit
+        // hardest: the earliest moment is the one a fresh document writes.
+        app.undo();
+        app.undo();
+        assert_eq!(app.hist_at, start, "undo could not reach the beginning");
+    }
+
+    /// The document is a FIXED POINT: writing what was read gives the same
+    /// text. Undo's whole comparison rests on it.
+    #[test]
+    fn a_document_written_from_one_that_was_read_is_the_same_document() {
+        use crate::arrangement::Arrangement;
+        // The empty arrangement is the case that was broken, and the one
+        // every new project starts from.
+        for arr in [Arrangement::default(), {
+            let mut a = Arrangement::default();
+            // A real clip: an AUDIO clip with no path is dropped on read
+            // as unusable, which is correct and is not what this measures.
+            a.add_clip(crate::arrangement::ArrClip {
+                lane: 0,
+                start_s: 1.0,
+                len_s: 2.0,
+                path: "media/take.wav".to_owned(),
+                ..Default::default()
+            });
+            a
+        }] {
+            let once = arr.to_json();
+            let twice = Arrangement::from_json(&once).to_json();
+            assert_eq!(once, twice, "the document is not a fixed point");
+        }
+    }
+
+    #[test]
+    fn a_pad_edit_can_be_undone_and_redone() {
+        let mut app = app();
+        app.undo_reset();
+
+        app.drumpad_kits[0].pads[36] = crate::drumpad::PadSlot {
+            path: "media/kick.wav".to_owned(),
+            name: "Kick".to_owned(),
+            ..Default::default()
+        };
+        app.drumpad_edited();
+
+        // A second edit, so there is a middle to come back to.
+        app.drumpad_kits[0].pads[40] = crate::drumpad::PadSlot {
+            path: "media/snare.wav".to_owned(),
+            ..Default::default()
+        };
+        app.drumpad_edited();
+        assert_eq!(app.drumpad_kits[0].pads[40].path, "media/snare.wav");
+
+        app.undo();
+        assert_eq!(
+            app.drumpad_kits[0].pads[40].path, "",
+            "undo did not take the snare back off the pad"
+        );
+        assert_eq!(
+            app.drumpad_kits[0].pads[36].path, "media/kick.wav",
+            "undo went back too far"
+        );
+        // The name and knobs ride with it, not just the path.
+        assert_eq!(app.drumpad_kits[0].pads[36].name, "Kick");
+
+        app.redo();
+        assert_eq!(
+            app.drumpad_kits[0].pads[40].path, "media/snare.wav",
+            "redo did not put the snare back"
+        );
+
+        // All the way back, and the kit is empty again.
+        app.undo();
+        app.undo();
+        assert!(
+            app.drumpad_kits[0].is_empty(),
+            "undoing every edit left pads behind"
+        );
+    }
+
+    /// The compact form the timeline stores is a faithful round trip, and it
+    /// is compact — a hundred moments of the full 128-pad form would be
+    /// megabytes of empty slots.
+    #[test]
+    fn the_undo_form_of_a_kit_is_small_and_lossless() {
+        use crate::drumpad::{DrumpadDoc, PadSlot};
+        let mut kits: Vec<DrumpadDoc> = (0..crate::recorder::CHANNELS)
+            .map(|_| DrumpadDoc::default())
+            .collect();
+        kits[3].master = 0.6;
+        kits[3].pads[36] = PadSlot {
+            path: "media/kick.wav".to_owned(),
+            name: "Kick".to_owned(),
+            params: crate::recorder::DrumPadParams {
+                gain: 0.4,
+                pan: -0.3,
+                tune: 2.0,
+                choke: 3,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let text = DrumpadDoc::compact_all(&kits);
+        let back = DrumpadDoc::from_compact_all(&text, crate::recorder::CHANNELS);
+        assert_eq!(back.len(), crate::recorder::CHANNELS);
+        assert_eq!(back[3].pads[36].path, "media/kick.wav");
+        assert_eq!(back[3].pads[36].name, "Kick");
+        assert_eq!(back[3].pads[36].params.choke, 3);
+        assert!((back[3].pads[36].params.gain - 0.4).abs() < 1e-6);
+        assert!((back[3].master - 0.6).abs() < 1e-6);
+        assert!(back[0].is_empty(), "an untouched lane came back with pads");
+
+        // One filled pad across sixteen lanes must not cost anything like
+        // the full form's 24 KB a kit.
+        assert!(
+            text.len() < 1_000,
+            "the compact form is {} bytes for one pad",
+            text.len()
+        );
+
+        // Rubbish is empty kits, never a panic.
+        for bad in ["", "{", "[]", "{\"3\": 7}"] {
+            let out = DrumpadDoc::from_compact_all(bad, crate::recorder::CHANNELS);
+            assert!(out.iter().all(DrumpadDoc::is_empty), "{bad:?} made pads");
+        }
+    }
+
+    #[test]
+    fn copying_a_drum_track_copies_the_kit_that_makes_the_sound() {
+        let mut app = app();
+        // A drum track on lane 0: the instrument in bay 0 and a sample on a
+        // pad, which is what a full kit is made of.
+        app.set_insert(
+            crate::recorder::Strip::Channel(0).index(),
+            0,
+            Some(crate::dialogs::DRUMPAD_PATH),
+        );
+        app.drumpad_kits[0].pads[36] = crate::drumpad::PadSlot {
+            path: "media/kick.wav".to_owned(),
+            ..Default::default()
+        };
+        assert!(!app.drumpad_kits[0].is_empty(), "the fixture kit is empty");
+
+        app.copy_track(0);
+        app.paste_track(3);
+
+        // Bay 0 carried over — this part already worked, and is what made the
+        // lane look like a drum lane.
+        assert_eq!(
+            app.insert(crate::recorder::Strip::Channel(3).index(), 0),
+            Some(crate::dialogs::DRUMPAD_PATH),
+            "the pasted lane is not a drum lane at all"
+        );
+        // And the kit came with it, which is the part that did not.
+        assert_eq!(
+            app.drumpad_kits[3].pads[36].path, "media/kick.wav",
+            "the pasted drum lane has no sample on the pad it was copied from"
+        );
+        assert!(
+            app.take_drumpad_dirty(),
+            "the pasted kit was never handed to the engine"
+        );
+
+        // A track with no pads must not carry an empty kit over something.
+        app.drumpad_kits[5].pads[40] = crate::drumpad::PadSlot {
+            path: "media/snare.wav".to_owned(),
+            ..Default::default()
+        };
+        app.copy_track(1);
+        app.paste_track(5);
+        assert_eq!(
+            app.drumpad_kits[5].pads[40].path, "media/snare.wav",
+            "pasting a non-drum track wiped a kit that was already there"
+        );
+    }
+
+    #[test]
+    fn the_drumpad_opens_on_c2_however_it_was_left() {
+        let mut app = app();
+        // Left on the far end of the keyboard, as a session would leave it.
+        app.settings.drumpad_page = crate::recorder::DRUM_PAGES as u8 - 1;
+        app.drumpad_sel = 120;
+        app.open_drumpad();
+
+        assert_eq!(app.drumpad_sel, 36, "the drumpad did not open on C2");
+        assert_eq!(
+            crate::drumpad_panel::key_name(app.drumpad_sel),
+            "C2",
+            "key 36 is not what this app calls C2"
+        );
+        // And the page SHOWS it: the highlight is computed as sel - base, so
+        // the base has to be at or below the key and within one page of it.
+        let base = crate::drumpad_panel::page_base(usize::from(app.settings.drumpad_page));
+        assert!(
+            (base..base + crate::recorder::DRUM_PAGE).contains(&app.drumpad_sel),
+            "C2 ({}) is not on the page that opened (base {base})",
+            app.drumpad_sel
+        );
+    }
+
+    #[test]
+    fn opening_a_lane_lays_one_node_at_the_start_and_the_next_click_makes_two() {
+        use crate::automation::{AutoParam, Point, Shape};
+        let mut app = app();
+        app.arr_toggle_automation_param(0, AutoParam::Gain);
+
+        let pts = app
+            .arrangement
+            .automation
+            .get(0, AutoParam::Gain)
+            .expect("opening a lane made no curve")
+            .points()
+            .to_vec();
+        assert_eq!(pts.len(), 1, "a freshly opened lane has {} nodes", pts.len());
+        assert!(pts[0].at_s.abs() < 1e-9, "the node is not at the beginning");
+        // And it sits where the control already is, so it is inaudible.
+        let resting = app.auto_resting(0, AutoParam::Gain);
+        assert!(
+            (pts[0].value - resting).abs() < 1e-9,
+            "the seeded node is at {} and the fader is at {resting}",
+            pts[0].value
+        );
+
+        // The first drawn node makes TWO, not three.
+        app.arrangement.automation.entry(0, AutoParam::Gain).put(Point {
+            at_s: 4.0,
+            value: 0.8,
+            shape: Shape::Linear,
+        });
+        assert_eq!(
+            app.arrangement.automation.get(0, AutoParam::Gain).expect("curve").points().len(),
+            2,
+            "drawing one node did not leave two"
+        );
+
+        // Closing and reopening must not touch work already done.
+        app.arr_toggle_automation_param(0, AutoParam::Gain);
+        app.arr_toggle_automation_param(0, AutoParam::Gain);
+        assert_eq!(
+            app.arrangement.automation.get(0, AutoParam::Gain).expect("curve").points().len(),
+            2,
+            "reopening a drawn lane re-seeded it"
+        );
     }
 
     /// The box makes a folder, and pressing it again releases the children

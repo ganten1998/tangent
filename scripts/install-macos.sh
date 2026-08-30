@@ -91,6 +91,32 @@ fi
 
 ditto "$APP" "$DEST"
 
+# **A reinstall silently drops this app out of SoundSource's exclusions.**
+#
+# Replacing the bundle gives /Applications/Tangent.app a new inode, and
+# SoundSource's per-app audio exclusion stores an ALIAS beside the bundle id —
+# a reference to the bundle that was there when the rule was made. The new copy
+# is not that bundle, so the exclusion stops matching, and SoundSource captures
+# a live DAW's output through ARK until it is restarted and re-resolves the
+# alias by path.
+#
+# That cost a week. It read as Tangent's own monitoring getting slower, it
+# survived two sessions of measuring the software path (which finds nothing,
+# because an app-level shim is invisible from inside the process), and six
+# installs in one morning re-broke it six times.
+#
+# Updating the bundle IN PLACE would avoid it, and does not work: macOS refuses
+# writes into a running app's bundle, which is exactly when a dev install
+# happens. So the honest answer is to say so, every time, rather than let it
+# recur in silence.
+if pgrep -xq SoundSource 2>/dev/null; then
+  echo
+  echo "NOTE: SoundSource is running. This install replaced the bundle, so its"
+  echo "      per-app exclusion for Tangent no longer matches and SoundSource"
+  echo "      will process (and delay) Tangent's audio."
+  echo "      Restart SoundSource to re-arm the exclusion."
+fi
+
 # Notarization is a fact about the build, not about this copy, and it is worth
 # saying out loud: a signed-but-unnotarized bundle runs perfectly well here
 # (nothing downloaded it, so it carries no quarantine attribute) and is refused

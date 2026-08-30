@@ -306,8 +306,6 @@ pub fn draw_heart(painter: &Painter, rect: Rect, color: Color32) {
 /// card is small and the space is the whole of what makes it feel like thanks
 /// rather than credits.
 pub const THANKS: &[&str] = &[
-    "Alejandro",
-    "Aiden",
     "Omer",
     "Hatsu",
     "Daniel",
@@ -423,7 +421,7 @@ mod thanks_tests {
     /// The card stays on screen wherever the heart is, and says what it is for.
     #[test]
     fn the_thanks_card_names_everyone_and_stays_on_screen() {
-        assert_eq!(THANKS.len(), 7);
+        assert_eq!(THANKS.len(), 5);
         assert_eq!(THANKS.last(), Some(&"My wonderful mother"));
         // Nobody twice, and nobody blank.
         for (i, n) in THANKS.iter().enumerate() {
