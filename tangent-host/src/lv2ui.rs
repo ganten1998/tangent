@@ -169,6 +169,36 @@ impl Ui {
     /// "this host does not send sample-rate information for LV2 UIs, using
     /// 44100 as fallback (this could be wrong)" and then draws its impulse
     /// response against the wrong axis.
+    /// Whether this plugin ships a UI we can actually embed.
+    ///
+    /// **A metadata read only** — no `dlopen`, no instantiation. It answers the
+    /// question a greyed-out menu item asks, and it must be cheap enough to ask
+    /// once per bay: `Ui::open` loads foreign code, and doing that to decide
+    /// whether a control should be clickable would mean every plugin in the
+    /// rack was resident before anybody opened anything.
+    ///
+    /// `false` for a plugin with no UI at all AND for one whose only UI is a
+    /// GTK or Qt widget, because those are the same fact from where the app is
+    /// standing: no window this host can put on the screen. That is not a
+    /// defeat to hide — a plugin refused here still has every one of its
+    /// control ports in the generic parameter panel, with real units, which is
+    /// more than a host that popped up an empty frame would give.
+    pub fn has_ui(plugin_uri: &str) -> bool {
+        let world = lilv::World::with_load_all();
+        let plugins = world.plugins();
+        let Some(plugin) = plugins
+            .into_iter()
+            .find(|p| p.uri().as_uri() == Some(plugin_uri))
+        else {
+            return false;
+        };
+        let Some(uis) = plugin.uis() else {
+            return false;
+        };
+        let x11 = world.new_uri("http://lv2plug.in/ns/extensions/ui#X11UI");
+        uis.into_iter().any(|u| u.is_a(&x11))
+    }
+
     pub fn open(plugin_uri: &str, parent: u32, sample_rate: f32) -> Result<Option<Ui>, String> {
         let world = lilv::World::with_load_all();
         let plugins = world.plugins();
@@ -517,5 +547,271 @@ mod tests {
                 assert!(e.contains("no LV2 plugin"), "unexpected error: {e}");
             }
         }
+    }
+}
+
+/// An LV2 editor in a window of its own.
+///
+/// **A sibling of `editor::x11::Window`, not a change to it.** That type is
+/// built around a VST3 `IPlugView` and the `IPlugFrame`/`IRunLoop` pair a VST3
+/// plugin expects to be given; an LV2 UI wants none of it and would have to be
+/// threaded through every one of those seams as an absence. Two small windows
+/// that each do one thing are easier to be sure of than one window with a
+/// two-armed hole in the middle, and the public `Editor` above them hides the
+/// difference from callers either way.
+pub struct Lv2Window {
+    conn: x11rb::rust_connection::RustConnection,
+    window: u32,
+    /// **`RefCell`, not a cast.** `closed()` takes `&self` — that is the shape
+    /// the VST3 window has and the app polls through — but idling the UI needs
+    /// `&mut`. Casting the one to the other is undefined behaviour whether or
+    /// not another thread exists, which the compiler says plainly and which no
+    /// amount of `!Send` makes true. Interior mutability is the tool for
+    /// exactly this, and it costs a flag check per frame.
+    /// `Option` so `Drop` can take it out and destroy it BEFORE the parent
+    /// window, without needing a replacement value to put back. It is `Some`
+    /// for the whole of the type's useful life.
+    ui: std::cell::RefCell<Option<Ui>>,
+    wm_delete: u32,
+    closed: std::cell::Cell<bool>,
+    size: std::cell::Cell<(i32, i32)>,
+    resizes: std::cell::Cell<u64>,
+    /// The contract, not an accident: X11 connections and plugin UIs belong to
+    /// the thread that made them.
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl Lv2Window {
+    /// Open `plugin_uri`'s editor in a window of its own.
+    pub fn open(plugin_uri: &str, sample_rate: f32, title: &str) -> Result<Self, String> {
+        use x11rb::connection::Connection;
+        use x11rb::protocol::xproto::*;
+        use x11rb::wrapper::ConnectionExt as _;
+
+        let (conn, screen_num) = x11rb::connect(None).map_err(|e| format!("no X display: {e}"))?;
+        let screen = &conn.setup().roots[screen_num];
+        let window = conn.generate_id().map_err(|e| format!("no window id: {e}"))?;
+        // Opened at a provisional size and corrected below, because the only
+        // authority on how big an LV2 UI wants to be is the UI, and it does not
+        // exist until it has a parent to be created inside.
+        conn.create_window(
+            x11rb::COPY_DEPTH_FROM_PARENT,
+            window,
+            screen.root,
+            0,
+            0,
+            640,
+            400,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            screen.root_visual,
+            &CreateWindowAux::new()
+                .background_pixel(screen.black_pixel)
+                .event_mask(EventMask::STRUCTURE_NOTIFY | EventMask::EXPOSURE),
+        )
+        .map_err(|e| format!("could not create a window: {e}"))?;
+        conn.change_property8(
+            PropMode::REPLACE,
+            window,
+            Atom::from(AtomEnum::WM_NAME),
+            Atom::from(AtomEnum::STRING),
+            title.as_bytes(),
+        )
+        .map_err(|e| format!("could not title the window: {e}"))?;
+
+        // **The close button, which X11 does not give you for free.** Without
+        // registering for WM_DELETE_WINDOW the window manager kills the
+        // connection instead of telling us, which takes the whole app down.
+        let proto = conn
+            .intern_atom(false, b"WM_PROTOCOLS")
+            .map_err(|e| format!("WM_PROTOCOLS: {e}"))?
+            .reply()
+            .map_err(|e| format!("WM_PROTOCOLS: {e}"))?
+            .atom;
+        let wm_delete = conn
+            .intern_atom(false, b"WM_DELETE_WINDOW")
+            .map_err(|e| format!("WM_DELETE_WINDOW: {e}"))?
+            .reply()
+            .map_err(|e| format!("WM_DELETE_WINDOW: {e}"))?
+            .atom;
+        conn.change_property32(
+            PropMode::REPLACE,
+            window,
+            proto,
+            Atom::from(AtomEnum::ATOM),
+            &[wm_delete],
+        )
+        .map_err(|e| format!("could not register the close protocol: {e}"))?;
+
+        conn.map_window(window).map_err(|e| format!("map: {e}"))?;
+        conn.flush().map_err(|e| format!("flush: {e}"))?;
+
+        let ui = match Ui::open(plugin_uri, window, sample_rate) {
+            Ok(Some(ui)) => ui,
+            Ok(None) => {
+                let _ = conn.destroy_window(window);
+                let _ = conn.flush();
+                return Err("this plugin has no X11 editor".to_owned());
+            }
+            Err(e) => {
+                // The window goes before the error does, or a failed open
+                // leaves an empty frame on screen with nothing behind it.
+                let _ = conn.destroy_window(window);
+                let _ = conn.flush();
+                return Err(e);
+            }
+        };
+
+        // Size the frame to whatever the UI made for itself. Asked rather than
+        // assumed: a reverb's editor and a synth's are nothing like the same
+        // shape, and a host that picks for them crops one and strands the other
+        // in a grey margin.
+        let mut size = (640, 400);
+        if ui.window() != 0 {
+            // Two error types, so the cookie and the reply are handled in two
+            // steps rather than chained.
+            let geom = conn.get_geometry(ui.window()).ok().and_then(|c| c.reply().ok());
+            if let Some(g) = geom {
+                let (w, h) = (g.width.max(1), g.height.max(1));
+                let _ = conn.configure_window(
+                    window,
+                    &ConfigureWindowAux::new().width(w as u32).height(h as u32),
+                );
+                size = (w as i32, h as i32);
+            }
+            let _ = conn.map_window(ui.window());
+        }
+        let _ = conn.flush();
+
+        Ok(Lv2Window {
+            conn,
+            window,
+            ui: std::cell::RefCell::new(Some(ui)),
+            wm_delete,
+            closed: std::cell::Cell::new(false),
+            size: std::cell::Cell::new(size),
+            resizes: std::cell::Cell::new(0),
+            _not_send: std::marker::PhantomData,
+        })
+    }
+
+    /// Poll once a frame. This is the editor's heartbeat as well as its close
+    /// check — the same contract the VST3 X11 window has, and for the same
+    /// reason: the UI only draws when it is given time.
+    pub fn closed(&self) -> bool {
+        use x11rb::connection::Connection;
+        use x11rb::protocol::xproto::*;
+        use x11rb::protocol::Event;
+
+        while let Ok(Some(ev)) = self.conn.poll_for_event() {
+            match ev {
+                Event::ClientMessage(m) => {
+                    // The only client message registered for is the close
+                    // button, but check rather than assume: a window manager
+                    // may send others.
+                    if m.data.as_data32().first() == Some(&self.wm_delete) {
+                        self.closed.set(true);
+                    }
+                }
+                Event::ConfigureNotify(c) if c.window == self.window => {
+                    let now = (c.width as i32, c.height as i32);
+                    if now != self.size.get() {
+                        self.size.set(now);
+                        self.resizes.set(self.resizes.get() + 1);
+                        // Keep the plugin's own window filling the frame the
+                        // user just dragged, or it sits at its old size in the
+                        // corner.
+                        let child = self.ui.borrow().as_ref().map_or(0, |u| u.window());
+                        if child != 0 {
+                            let _ = self.conn.configure_window(
+                                child,
+                                &ConfigureWindowAux::new()
+                                    .width(c.width as u32)
+                                    .height(c.height as u32),
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let alive = self
+            .ui
+            .borrow_mut()
+            .as_mut()
+            .map(|ui| ui.idle())
+            .unwrap_or(false);
+        if !alive {
+            // The UI asked to be closed - a plugin with its own close button.
+            self.closed.set(true);
+        }
+        let _ = self.conn.flush();
+        self.closed.get()
+    }
+
+    pub fn focus(&self) {
+        use x11rb::connection::Connection;
+        use x11rb::protocol::xproto::*;
+        let _ = self.conn.configure_window(
+            self.window,
+            &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+        );
+        let _ = self
+            .conn
+            .set_input_focus(InputFocus::PARENT, self.window, x11rb::CURRENT_TIME);
+        let _ = self.conn.flush();
+    }
+
+    /// This window's X id.
+    ///
+    /// For the example that drives a knob with synthetic input: searching for
+    /// the window by title finds stale ids from earlier runs, and a test that
+    /// clicks into the wrong window reports "no edits" while looking exactly
+    /// like a broken editor.
+    pub fn window(&self) -> u32 {
+        self.window
+    }
+
+    pub fn size(&self) -> (i32, i32) {
+        self.size.get()
+    }
+
+    pub fn resizes(&self) -> u64 {
+        self.resizes.get()
+    }
+
+    /// Control changes the user made in the plugin's own window, for the host
+    /// to apply to the running instance.
+    pub fn drain_edits(&mut self) -> Vec<UiEdit> {
+        self.ui
+            .borrow_mut()
+            .as_mut()
+            .map(|ui| ui.drain_edits())
+            .unwrap_or_default()
+    }
+
+    /// Tell the UI a value changed elsewhere, so its knobs follow.
+    pub fn port_changed(&mut self, port: u32, value: f32) {
+        if let Some(ui) = self.ui.borrow_mut().as_mut() {
+            ui.port_changed(port, value);
+        }
+    }
+}
+
+impl Drop for Lv2Window {
+    fn drop(&mut self) {
+        use x11rb::connection::Connection;
+        use x11rb::protocol::xproto::ConnectionExt as _;
+        // **The UI goes before the window, and not the other way round.** The
+        // plugin's window is a child of this one; destroying the parent while
+        // the UI's toolkit still believes its window exists is a use-after-free
+        // inside somebody else's code.
+        //
+        // `Ui`'s own `Drop` calls `cleanup`, and taking the cell's contents
+        // here is what makes that happen NOW rather than after this function
+        // has already destroyed the parent.
+        drop(self.ui.borrow_mut().take());
+        let _ = self.conn.destroy_window(self.window);
+        let _ = self.conn.flush();
     }
 }
