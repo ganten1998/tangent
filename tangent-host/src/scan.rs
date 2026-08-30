@@ -55,37 +55,52 @@ const CONTENTS_SUBDIR: &str = "arm64-win";
 const CONTENTS_SUBDIR: &str = "x86_64-linux";
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 const CONTENTS_SUBDIR: &str = "aarch64-linux";
-// **FreeBSD, and the one arm here written from the spec rather than from a
-// bundle somebody actually shipped.** The VST3 layout is `<cpu>-<os>` with the
-// OS lowercased — that is where every name above comes from — so FreeBSD/amd64
-// is `x86_64-freebsd`. Believe that only as far as it goes: the Steinberg SDK
-// has no BSD arm of its own, so there is no upstream authority to check it
-// against and no meaningful population of FreeBSD-built VST3s to sample. It is
-// the spec-consistent guess, not a verified fact. See the fallback in
-// `binary_in_bundle` for what happens when it is wrong.
+// **FreeBSD says `amd64-linux`, and that is not a typo.**
+//
+// This arm was first written from the spec's `<cpu>-<os>` shape, which gives
+// `x86_64-freebsd`, and that guess was WRONG IN BOTH HALVES. The authority is
+// `audio/vst3sdk` in ports — the SDK a FreeBSD plugin is actually built with —
+// and `module_linux.cpp:149-172` is unambiguous:
+//
+//     // use the Machine Hardware Name (from uname cmd-line) as prefix
+//     auto machine = getCurrentMachineName ();     // uname().machine
+//     modulePath /= *machine + "-linux";
+//
+// The `-linux` suffix is hardcoded, so the OS half is `linux` on any Unix the
+// SDK builds on, FreeBSD included. And the CPU half is `uname -m`, which on
+// FreeBSD/amd64 is **`amd64`** where Linux/x86_64 reports `x86_64` — so the two
+// platforms disagree about the prefix as well.
+//
+// Net: `Contents/amd64-linux/Name.so`, and neither of the two names originally
+// written here would ever have matched. Verified against the installed SDK
+// rather than reasoned about, which is the only reason it is right.
 #[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
-const CONTENTS_SUBDIR: &str = "x86_64-freebsd";
+const CONTENTS_SUBDIR: &str = "amd64-linux";
 #[cfg(all(target_os = "freebsd", target_arch = "aarch64"))]
-const CONTENTS_SUBDIR: &str = "aarch64-freebsd";
+const CONTENTS_SUBDIR: &str = "arm64-linux";
 
-/// The directory a FreeBSD-built bundle lands in when its build system thinks
-/// BSD is Linux, which is the common case rather than the exotic one.
+/// Other directories a FreeBSD-native bundle plausibly lands in, tried in order
+/// after [`CONTENTS_SUBDIR`].
 ///
-/// Frameworks that support FreeBSD at all (JUCE, DPF) mostly reach it by
-/// treating it as a Linux variant, and the VST3 architecture string is usually
-/// derived from a table that stops at `linux`. The result is a bundle holding a
-/// perfectly good FreeBSD ELF in a directory named `x86_64-linux`. Looking only
-/// at the spec-correct name would find nothing in it and report "no plugin"
-/// about a plugin that is right there and would load.
+/// The SDK settles what its own builder produces; it does not settle what every
+/// OTHER build system produces. JUCE and DPF reach FreeBSD by treating it as a
+/// Linux variant and derive the architecture string from their own tables,
+/// which mostly stop at `x86_64-linux` and do not consult `uname`. A bundle
+/// holding a perfectly good FreeBSD ELF under `x86_64-linux` is therefore a
+/// realistic artifact, and looking only at the SDK's name would report "no
+/// plugin" about one that is right there and would load.
 ///
-/// This is safe in the direction that matters: a genuine Linux `.so` cannot be
-/// `dlopen`ed by the FreeBSD runtime linker, so the fallback cannot smuggle in
-/// a foreign binary — it fails at `load()` exactly as it should. The only thing
-/// the fallback can do is find a native plugin that was misfiled.
+/// The `-freebsd` spellings are kept last because they are what a
+/// spec-reading implementation would emit, and this file was one of those.
+///
+/// Safe in the direction that matters: a genuine *Linux* `.so` cannot be
+/// `dlopen`ed by the FreeBSD runtime linker — the ELF OSABI note and the
+/// syscall vector both refuse it — so none of these can smuggle in a foreign
+/// binary. They can only find a native plugin that was filed elsewhere.
 #[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
-const CONTENTS_SUBDIR_MISFILED: &str = "x86_64-linux";
+const CONTENTS_SUBDIR_ALTS: &[&str] = &["x86_64-linux", "amd64-freebsd", "x86_64-freebsd"];
 #[cfg(all(target_os = "freebsd", target_arch = "aarch64"))]
-const CONTENTS_SUBDIR_MISFILED: &str = "aarch64-linux";
+const CONTENTS_SUBDIR_ALTS: &[&str] = &["aarch64-linux", "arm64-freebsd", "aarch64-freebsd"];
 
 /// The standard search paths, in the order the SDK specifies.
 ///
@@ -388,16 +403,21 @@ pub fn binary_in_bundle(bundle: &Path) -> Option<PathBuf> {
         return Some(bundle.to_path_buf());
     }
     let dir = bundle.join("Contents").join(CONTENTS_SUBDIR);
-    // See `CONTENTS_SUBDIR_MISFILED`: on FreeBSD a native bundle is as likely to
-    // be filed under the Linux name as the correct one, and the difference
-    // between the two is the difference between "your plugins work" and "the
-    // picker is permanently empty". Only when the spec-correct directory is
-    // genuinely absent, so a correctly-built bundle is never second-guessed.
+    // See `CONTENTS_SUBDIR_ALTS`: the SDK settles what its own builder emits,
+    // and other build systems on this platform emit other things. The
+    // difference between finding them and not is the difference between "your
+    // plugins work" and "the picker is permanently empty". Tried in order and
+    // only when the SDK's own name is genuinely absent, so a correctly-built
+    // bundle is never second-guessed.
     #[cfg(target_os = "freebsd")]
     let dir = if dir.is_dir() {
         dir
     } else {
-        bundle.join("Contents").join(CONTENTS_SUBDIR_MISFILED)
+        CONTENTS_SUBDIR_ALTS
+            .iter()
+            .map(|alt| bundle.join("Contents").join(alt))
+            .find(|p| p.is_dir())
+            .unwrap_or(dir)
     };
     let entries = std::fs::read_dir(dir).ok()?;
     // Windows bundles ship resource DLLs, `.pdb`s and `moduleinfo.json`
