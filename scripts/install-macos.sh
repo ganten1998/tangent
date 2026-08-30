@@ -70,6 +70,18 @@ app_version() {
 }
 VERSION=$(app_version "$PWD/$APP")
 
+# **Not while it is running.**
+#
+# The install replaces the bundle's contents in place, and macOS refuses
+# writes into a running app's bundle — an earlier attempt at this emptied
+# /Applications/Tangent.app and left nothing behind. Refusing is the whole
+# safeguard: there is no half-install to recover from if it never starts.
+if pgrep -xq tangent 2>/dev/null; then
+  echo "error: Tangent is running. Quit it (normally — never force-kill an" >&2
+  echo "       audio app) and run this again." >&2
+  exit 1
+fi
+
 # Replace, rather than copy over the top. `ditto` merges, so a file that
 # existed in the old version and not in the new one would survive into the
 # installed bundle and break its signature.
@@ -84,37 +96,81 @@ if [ -d "$DEST" ]; then
     echo "      remove it with:  sudo rm -rf /Library/Audio/Plug-Ins/VST3/Tangent.vst3"
   fi
   echo "==> Replacing $OLD with $VERSION"
-  rm -rf "$DEST"
+  # The number the whole exercise is about. Compared after the copy, so the
+  # claim "the alias still resolves" is CHECKED rather than assumed.
+  INODE_BEFORE=$(stat -f %i "$DEST" 2>/dev/null || echo "")
+  # **The bundle DIRECTORY survives; only its contents are replaced.**
+  #
+  # `rm -rf "$DEST"` gave /Applications/Tangent.app a new inode on every
+  # install, and that is what silently dropped the app out of SoundSource's
+  # audio exclusions — the rule stores an ALIAS beside the bundle id, the
+  # alias is a reference to the directory that was there when the rule was
+  # made, and a fresh directory is not that one. See the note further down.
+  #
+  # Emptying it in place keeps the inode, so every alias anyone has made to
+  # this app — SoundSource's exclusion, Loopback's source, a Dock item, a
+  # login item — goes on resolving across updates.
+  #
+  # `find -mindepth 1 -maxdepth 1` rather than a glob, because a glob misses
+  # dotfiles and `"$DEST"/*` with nothing to match expands to a literal that
+  # `rm -rf` would then complain about. Everything inside goes: `ditto`
+  # MERGES, so a file that existed in the old version and not in the new one
+  # would otherwise survive into the installed bundle and break its
+  # signature.
+  find "$DEST" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 else
   echo "==> Installing $VERSION"
 fi
 
 ditto "$APP" "$DEST"
 
+# **Emptying a bundle in place is destructive until the copy lands.**
+#
+# If `ditto` failed, /Applications/Tangent.app is now an empty directory
+# rather than an app, and saying so is the difference between a re-run and a
+# mystery. The source is still in `dist/`, so a re-run fixes it.
+if [ ! -x "$DEST/Contents/MacOS/tangent" ]; then
+  echo "error: the copy did not land — $DEST has no executable." >&2
+  echo "       The build is still in $APP; re-run this script." >&2
+  exit 1
+fi
+
 # **A reinstall silently drops this app out of SoundSource's exclusions.**
 #
 # Replacing the bundle gives /Applications/Tangent.app a new inode, and
 # SoundSource's per-app audio exclusion stores an ALIAS beside the bundle id —
 # a reference to the bundle that was there when the rule was made. The new copy
-# is not that bundle, so the exclusion stops matching, and SoundSource captures
-# a live DAW's output through ARK until it is restarted and re-resolves the
-# alias by path.
+# is not that bundle, so the exclusion stopped matching and SoundSource
+# captured a live DAW's output through ARK.
 #
 # That cost a week. It read as Tangent's own monitoring getting slower, it
 # survived two sessions of measuring the software path (which finds nothing,
 # because an app-level shim is invisible from inside the process), and six
 # installs in one morning re-broke it six times.
 #
-# Updating the bundle IN PLACE would avoid it, and does not work: macOS refuses
-# writes into a running app's bundle, which is exactly when a dev install
-# happens. So the honest answer is to say so, every time, rather than let it
-# recur in silence.
-if pgrep -xq SoundSource 2>/dev/null; then
+# **This install keeps the bundle's inode**, so the alias goes on resolving
+# and the exclusion survives the update. See the replace above.
+#
+# **A restart does NOT repair one that is already broken**, which is what the
+# note here used to claim: restarting re-reads the same stale alias. The
+# owner found the real remedy by hand — remove the app from the exclusions
+# and add it back, which mints a fresh alias — and it takes a restart to
+# take effect, which is why "restart" looked like the fix. Only said when
+# the exclusion cannot be seen to match, because after this change it
+# usually will.
+INODE_AFTER=$(stat -f %i "$DEST" 2>/dev/null || echo "")
+if [ -n "${INODE_BEFORE:-}" ] && [ "$INODE_BEFORE" = "$INODE_AFTER" ]; then
+  echo "    bundle kept its identity (inode $INODE_AFTER) — aliases still resolve"
+fi
+if pgrep -xq SoundSource 2>/dev/null \
+  && [ -n "${INODE_BEFORE:-}" ] && [ "$INODE_BEFORE" != "$INODE_AFTER" ]; then
   echo
-  echo "NOTE: SoundSource is running. This install replaced the bundle, so its"
-  echo "      per-app exclusion for Tangent no longer matches and SoundSource"
-  echo "      will process (and delay) Tangent's audio."
-  echo "      Restart SoundSource to re-arm the exclusion."
+  echo "NOTE: SoundSource is running, and this install changed the bundle's"
+  echo "      identity, so its audio exclusion for Tangent no longer matches"
+  echo "      — SoundSource will process (and delay) Tangent's audio."
+  echo "      Fix: remove Tangent from SoundSource's exclusions and add it"
+  echo "      back, then restart SoundSource. A restart alone re-reads the"
+  echo "      same stale reference and does not help."
 fi
 
 # Notarization is a fact about the build, not about this copy, and it is worth
