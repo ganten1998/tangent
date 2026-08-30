@@ -244,7 +244,8 @@ verify_entitlements() {
   for key in com.apple.security.device.camera \
              com.apple.security.device.audio-input \
              com.apple.security.cs.disable-library-validation \
-             com.apple.security.cs.allow-jit; do
+             com.apple.security.cs.allow-jit \
+             com.apple.security.cs.allow-unsigned-executable-memory; do
     case "$out" in
       *"$key"*) ;;
       *) echo "error: signed bundle is missing entitlement $key" >&2; exit 1 ;;
@@ -265,7 +266,7 @@ verify_entitlements() {
     *"flags="*"runtime"*) ;;
     *) echo "error: signed bundle does not have the hardened runtime" >&2; exit 1 ;;
   esac
-  echo "==> entitlements verified in signature (camera, mic, host x2; runtime on)"
+  echo "==> entitlements verified in signature (camera, mic, host x3; runtime on)"
 }
 
 # ── Sign ─────────────────────────────────────────────────────────────────────

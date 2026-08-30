@@ -7170,6 +7170,11 @@ impl Engine {
             }
             return Ok(None);
         };
+        // **Written down BEFORE control leaves us**, because some of what
+        // happens next cannot be returned from: a plugin whose pages the
+        // kernel refuses takes the whole process with SIGKILL, and the only
+        // thing that survives that is a file. See `crate::plugin_guard`.
+        let _crumb = crate::plugin_guard::Armed::new(bundle);
         let module = tangent_host::scan::module_for(bundle)?;
         let classes = module.audio_modules();
         let class = classes

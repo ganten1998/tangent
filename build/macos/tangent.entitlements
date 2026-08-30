@@ -57,5 +57,36 @@
     -->
     <key>com.apple.security.cs.allow-jit</key>
     <true/>
+
+    <!--
+      AND allow-jit is not sufficient either, which cost the owner a build and
+      an app that would not reopen.
+
+      `allow-jit` grants MAP_JIT — the modern, Apple-sanctioned way to make a
+      page executable, and what a plugin that builds its DSP graph at runtime
+      uses. A plugin that instead loads a Mach-O image it has assembled IN
+      MEMORY does not go near MAP_JIT: it goes through
+      `NSCreateObjectFileImageFromMemory`, and the kernel refuses to run
+      initializers off pages no signature covers.
+
+      The refusal is not an error return. It is SIGKILL, delivered to the HOST,
+      with `CODESIGNING / Invalid Page` and no unwind — so there is nothing to
+      catch, nothing logged on our side, and the app simply vanishes the
+      instant the plugin is chosen. Loading Rhodes Anthology did exactly this,
+      and because the choice is persisted the next launch reloaded it and died
+      again: an app that could not be reopened at all.
+
+        runtime + library-validation + allow-jit  -> SIGKILL on such a plugin
+        runtime + the three below                 -> loads
+
+      **This is a real relaxation and it is chosen deliberately.** It stops the
+      kernel validating executable pages in this process, so a hostile plugin
+      has an easier time here than it would elsewhere. Every serious macOS host
+      ships it for this reason; the honest alternative is not "leave it off",
+      it is out-of-process hosting, where a plugin cannot take the app down at
+      all. That is worth doing and is not this.
+    -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
 </dict>
 </plist>

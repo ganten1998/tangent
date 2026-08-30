@@ -6764,6 +6764,34 @@ impl DesktopApp {
         settings: Settings,
         cli_port: Option<String>,
     ) -> Self {
+        // **Did the last launch die inside a plugin?**
+        //
+        // Asked FIRST, before the settings reach the app and long before any
+        // bay is reconciled, because the answer decides what the app is
+        // allowed to try. A plugin the kernel refuses takes this process with
+        // SIGKILL — see `crate::plugin_guard` — and the choice is persisted,
+        // so the next launch reloads it and dies in the same instruction. The
+        // app could not be reopened at all until the settings file was edited
+        // by hand.
+        let mut settings = settings;
+        let killer = crate::plugin_guard::take_blame();
+        if let Some(bad) = killer.as_ref() {
+            // Out of every bay it sits in, not just the first: the same
+            // plugin on two channels would otherwise take the second launch.
+            let want = bad.to_string_lossy();
+            let mut pulled = 0usize;
+            for slot in settings.strip_inserts.iter_mut() {
+                if *slot == want {
+                    slot.clear();
+                    pulled += 1;
+                }
+            }
+            eprintln!(
+                "tangent: the last launch was killed loading {}; \
+                 removed it from {pulled} bay(s) so this one can start",
+                want
+            );
+        }
         // Dev switch: run the DESKTOP binary through the PLUGIN's capability
         // set, so the in-canvas menu and dialogs can be looked at, screenshot
         // and debugged in a window — without a DAW, a rebuild, an installer
@@ -6785,6 +6813,20 @@ impl DesktopApp {
             Caps::DESKTOP
         };
         let mut app = IvoryApp::new(&cc.egui_ctx, settings, caps);
+        // Said in the window as well as on stderr, which nobody sees. The
+        // bay is empty and the owner has to know WHY, or the next thing they
+        // do is load it again.
+        if let Some(bad) = killer {
+            let name = bad
+                .file_stem()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| bad.to_string_lossy().into_owned());
+            app.set_startup_notice(format!(
+                "{name} crashed Tangent while loading, so it has been taken \
+                 out of its slot. Its settings are kept; load it again to \
+                 retry."
+            ));
+        }
         let mut device = DeviceMidi::new(cc.egui_ctx.clone());
         // Grabbed BEFORE the connection is made and before the session exists,
         // because everything that stamps a time has to share one epoch. Two
