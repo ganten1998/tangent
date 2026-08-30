@@ -628,6 +628,98 @@ into `~/.local`, and owns its own uninstall.
 
 ---
 
+## 9a. Plugins: LV2, because on FreeBSD that is the whole of it
+
+The plugin question has a blunt answer here that it does not have anywhere
+else. **The FreeBSD ports tree contains no VST3 plugins at all.** Not few —
+none. A host that speaks only VST3 arrives on this platform able to load
+nothing a user can install, and `pkg install`-ing a plugin is the only way
+most people will ever get one. So LV2 is not a second format to support
+after the important one; on FreeBSD it *is* the format.
+
+It is now hosted natively, in `tangent-host/src/lv2.rs` and `lv2ui.rs`, and
+gated to `linux` + `freebsd` — the two platforms with an LV2 ecosystem. The
+host reads plugins through `lilv`, the reference library, which is a system
+dependency rather than a bundled C build.
+
+**Fifteen plugins are found on this box** and the picker groups them by
+vendor, derived from the URI authority — `breakfastquay.com` (Rubber Band's
+six pitch shifters), `dragonfly` (three reverbs), `github.com`, `lv2plug.in`.
+Two URI shapes are in the wild, `https://` and `urn:`, and the vendor logic
+handles both; getting that wrong dumped three of the four Dragonfly plugins
+into an unnamed pile.
+
+### The plugin's own window
+
+A plugin that ships an `ui:X11UI` gets its real interface, embedded in one of
+ours — presets, knobs, spectrogram and all. This is a genuinely different
+mechanism from the VST3 editor and shares no code with it: a VST3 plugin
+expects to be handed an `IPlugFrame`/`IRunLoop` pair, and an LV2 UI expects a
+parent window id and an idle callback. `Editor` carries an enum inner so
+callers hold one type over two mechanisms.
+
+One rule is load-bearing and is written into the code: **the UI is destroyed
+before the window, never the other way round.** The plugin's window is a
+child of ours, and tearing down the parent while the UI's toolkit still
+believes its window exists is a use-after-free inside somebody else's code.
+
+A plugin whose only UI is GTK or Qt gets no window, and that is reported as
+"no editor" rather than an empty frame. It still gets the generic parameter
+panel with its real controls and units, which is more than an empty frame
+would have been.
+
+### The knobs have to be carried by the host
+
+This is the half with no VST3 counterpart. A VST3 editor and its processor
+are two halves of one plugin and talk to each other directly, so the host is
+not in the middle and has nothing to forward. **An LV2 UI has no route to the
+DSP at all** — the spec's `write_function` hands the value to the *host*, and
+the host is expected to put it on the port. Without that path the window
+moves, looks right, and changes nothing.
+
+The edits ride the automation road that already existed — same `ParamPoint`,
+same per-bay queues, same `process_effect` — on the grounds that a knob turned
+in a plugin's window and the same knob automated are the same event by the
+time the audio thread sees either. Writing the test for it turned up three
+silent bugs, all of which would have shipped:
+
+- every rack outside the general channels was handed an **empty** parameter
+  queue, so an LV2 effect on a drum pad had a window whose knobs moved and did
+  nothing;
+- the drain sat *after* the empty-song shortcut in `resolve_automation`, so
+  plugin windows would only have worked in songs that happened to have
+  automation drawn — the rarer case, silently;
+- the seat index was a `u8`, which held the 16 channels and quietly folded
+  every pad seat above 255 onto seat 255: one pad's window turning another's
+  knobs.
+
+### Measured, not assumed
+
+Against Dragonfly Hall on this box: the UI embedded at its natural 920×345 and
+tore down clean. Two knobs dragged with synthetic input produced twelve edits
+carrying the right port numbers and **real engineering units** — Decay 0.5 s
+to 3.2 s on port 21, Size 10 m to 21 m on port 9 — every one accepted by
+`set_param`, and the plugin's own spectrogram grew the longer tail to match.
+
+End to end in the app: picker → *Dragonfly Plate Reverb* → Load → its own
+native window opened as the bay's editor.
+
+### What is NOT done
+
+**LV2 state is not wired.** The `state:` extension is a different mechanism
+from a VST3 state blob, and a session saved with an LV2 plugin's settings
+restores the plugin at its defaults. This is *said* rather than silently
+dropped — the bay reports it — but it is the one real gap and it is the next
+thing to do. A per-bay value shadow covers the smaller half of it: closing a
+plugin's window and reopening it redraws the knobs where the user left them,
+which without the shadow would have shown defaults while the DSP used the real
+values.
+
+LV2 latency is a designated output port this does not yet read, so a
+lookahead LV2 limiter will not delay-compensate.
+
+---
+
 ## 10. What is worth doing next, in order
 
 1. **A FreeBSD 14 artifact**, if the tester is on 14. ABI is enforced at
@@ -641,8 +733,12 @@ into `~/.local`, and owns its own uninstall.
 3. **Upstream the OSS host.** It is written and measured (§7); cpal already
    claims FreeBSD as a target, so this fills in a platform rather than adding
    one. Landing it upstream is what removes the vendored copy.
-4. Plugin editor and camera, per §5, when there is hardware to test them with.
-5. The `audio.rs:1027` `max_sample_rate()` landmine in §5, which wants a fix
+4. **LV2 state**, per §9a — the one real gap in plugin support. An LV2
+   plugin's settings do not survive a save/reload; the bay says so rather than
+   pretending, but a user who builds a sound and loses it will not care that
+   the message was honest.
+5. Plugin editor and camera, per §5, when there is hardware to test them with.
+6. The `audio.rs:1027` `max_sample_rate()` landmine in §5, which wants a fix
    that can be tested rather than a blind one.
 
 ---

@@ -90,7 +90,19 @@ STAGE="$WORK/stage"
 PREFIXDIR="$STAGE/usr/local"
 META="$WORK/meta"
 DIST="$ROOT/dist"
-rm -rf "$WORK"
+# **Removed with the same privilege the bundles were fetched with.** `pkg fetch`
+# needs root even with `-o`, so the previous run's fetch directories are owned by
+# root and a plain `rm -rf` fails on them — which made running this script twice
+# in a row an error rather than a rebuild. Only escalating when there is
+# something root-owned to remove keeps the ordinary --pkg-only path from ever
+# asking for a password.
+if [ -d "$WORK" ] && ! rm -rf "$WORK" 2>/dev/null; then
+    if [ "$(id -u)" = 0 ]; then rm -rf "$WORK"
+    elif command -v doas >/dev/null 2>&1; then doas rm -rf "$WORK"
+    elif command -v sudo >/dev/null 2>&1; then sudo rm -rf "$WORK"
+    fi
+    [ -d "$WORK" ] && { echo "could not remove $WORK — it holds root-owned files from an earlier run" >&2; exit 1; }
+fi
 mkdir -p "$PREFIXDIR/bin" \
          "$PREFIXDIR/share/applications" \
          "$PREFIXDIR/share/icons/hicolor/128x128/apps" \
