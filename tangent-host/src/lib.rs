@@ -21,6 +21,11 @@ pub mod instance;
 /// dependency note in `Cargo.toml`. A target gate, not a feature gate.
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub mod lv2;
+/// An LV2 plugin's own editor window, embedded in one of ours. Separate from
+/// `lv2` because a plugin and its UI are two different shared objects that need
+/// not both exist.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+pub mod lv2ui;
 pub mod ready;
 pub mod scan;
 pub mod state;
