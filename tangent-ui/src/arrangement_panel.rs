@@ -334,6 +334,16 @@ pub struct ArrangeView<'a> {
     /// Its colour, as an index into `STRIP_COLORS` — the same plate its
     /// mixer strip wears, so the two views agree about what the master is.
     pub master_color: usize,
+    /// **The theme's own master red**, `settings.master_knob_color`.
+    ///
+    /// Sixteen themes, sixteen of these, every one in the red family and
+    /// none of them shared — which is what makes the master's dial and its
+    /// plate belong to the theme rather than being one fixed crimson laid
+    /// over all of them. The owner: "the dial color for master should be
+    /// black outline with white strip and colored red. It needs to be per
+    /// theme though so all of these must be unique colors that are matched
+    /// to the 16 themes."
+    pub master_knob: (u8, u8, u8),
     /// Whether the master's row is drawn. `Cmd`/`Ctrl+M`; shown by default.
     pub show_master_row: bool,
     /// The master rack's six short names — empty for an empty bay.
@@ -797,6 +807,9 @@ pub struct BusRow {
     /// in the same place relative to the name, because the master's rows are
     /// a track's rows and the way to them should not be a different gesture.
     pub automation: Rect,
+    /// The dial's number, ABOVE it — a track writes its own under the knob,
+    /// and this row is half a track tall with nothing below.
+    pub knob_readout: Rect,
 }
 
 impl BusRow {
@@ -808,6 +821,7 @@ impl BusRow {
         meter: Rect::NOTHING,
         bays: [Rect::NOTHING; crate::recorder::INSERTS * 2],
         automation: Rect::NOTHING,
+        knob_readout: Rect::NOTHING,
     };
 
     fn of(row: Rect) -> Self {
@@ -819,9 +833,30 @@ impl BusRow {
         // The knob keeps the right end, the meter stands inside it, and the
         // name takes what is left — the track header's own order, so the two
         // kinds of row read as one list.
-        let d = (h * 0.86).clamp(9.0, 20.0);
+        // **The dial and its number share a column.** The master had a dial
+        // with no reading at all — the one fader on the desk that can undo
+        // every other one, and no way to see where it was standing without
+        // opening the mixer. The owner asked for a readout atop it; a track
+        // writes its own UNDER the knob, and this row is half a track tall
+        // with nothing below, so it goes above.
+        //
+        // The number is shed first when the row is short: a dial you can
+        // turn beats a number you cannot read.
+        let col_w = (h * 0.86).clamp(9.0, 20.0);
+        let col = Rect::from_min_max(
+            Pos2::new(r.right() - col_w - 2.0, r.top()),
+            Pos2::new(r.right() - 2.0, r.bottom()),
+        );
+        let stacked = h >= 18.0;
+        let split = if stacked { col.top() + col.height() * 0.38 } else { col.top() };
+        let knob_readout = if stacked {
+            Rect::from_min_max(col.min, Pos2::new(col.right(), split))
+        } else {
+            Rect::NOTHING
+        };
+        let d = (col.bottom() - split).min(col_w).max(9.0);
         let knob = Rect::from_center_size(
-            Pos2::new(r.right() - d * 0.5 - 2.0, r.center().y),
+            Pos2::new(col.center().x, (split + col.bottom()) * 0.5),
             Vec2::splat(d),
         );
         let meter = Rect::from_min_max(
@@ -896,7 +931,7 @@ impl BusRow {
                 Pos2::new(x0 + w, rack.bottom()),
             )
         });
-        Self { panel: row, name, knob, vol_label, meter, bays, automation }
+        Self { panel: row, name, knob, vol_label, meter, bays, automation, knob_readout }
     }
 }
 
@@ -1616,6 +1651,34 @@ const DIAL_VOLUME: Color32 = Color32::from_rgb(0x1C, 0x6F, 0xD6);
 /// dark enough to read as black beside the channels' blue and light enough
 /// that the needle still stands off it.
 const DIAL_MASTER: Color32 = Color32::from_rgb(0x14, 0x13, 0x12);
+
+/// The master dial's OUTLINE and its needle. Fixed on every theme — see the
+/// note where they are used, and `bus_strip`, which makes the same bargain.
+const DIAL_MASTER_RING: Color32 = Color32::from_rgb(0x0E, 0x0D, 0x0C);
+const DIAL_MASTER_NEEDLE: Color32 = Color32::from_rgb(0xF2, 0xEE, 0xE4);
+
+/// **The master dial's body: the theme's red, deep enough to carry a white
+/// needle.**
+///
+/// The needle is fixed white on purpose — it is the instrument, not the
+/// panel — and two of the sixteen themes bring a coral pale enough that a
+/// white line across it reads at 2.07:1, which is a needle you have to look
+/// for. Darkening the red until the needle clears keeps both halves of what
+/// was asked for: the colour is still the theme's own and still red, and the
+/// stripe is still white and still visible.
+///
+/// Walked rather than clamped to one shade, so a theme that already has a
+/// deep red is left exactly as it drew it.
+fn master_dial_body(knob: (u8, u8, u8)) -> Color32 {
+    let mut c = Color32::from_rgb(knob.0, knob.1, knob.2);
+    for _ in 0..12 {
+        if crate::recorder_panel::contrast_ratio(DIAL_MASTER_NEEDLE, c) >= 2.3 {
+            break;
+        }
+        c = shade(c, 0.92);
+    }
+    c
+}
 
 
 /// One bus row's level dial: the track headers' own dial, drawn from a
@@ -3096,6 +3159,17 @@ fn draw_auto_headers(
             };
             let face = shade(p.hdr_face, 0.92);
             painter.rect_filled(row.header, 0.0, face);
+            // The header half of the seam above, so a row is one object
+            // across the grip rather than two that stop at it.
+            if slot > 0 {
+                painter.line_segment(
+                    [
+                        Pos2::new(row.header.left(), row.header.top()),
+                        Pos2::new(row.header.right(), row.header.top()),
+                    ],
+                    Stroke::new(1.0, auto_header_seam(&p)),
+                );
+            }
             if auto.selected {
                 painter.rect_stroke(
                     row.header.shrink(1.0),
@@ -3225,6 +3299,25 @@ fn draw_auto_headers(
 /// readout all land on this, and a blend of two themed roles is exactly the
 /// kind of derived colour that lands in the dead zone where neither ink
 /// clears 4.5:1.
+/// **The seam between two stacked automation rows**, derived from the ground
+/// it is drawn on.
+///
+/// `Ink::seam` is separated from the LANE field, and an automation row does
+/// not stand on the lane field — it stands on `auto_ground`, which has been
+/// moved away from it on purpose. A seam that kept the lane's figure was a
+/// line at 1.01:1 against the surface under it on half the themes: drawn,
+/// and not there.
+fn auto_seam(p: &Ink, lane: usize) -> Color32 {
+    separate(auto_ground(p, lane), 0.22)
+}
+
+/// The header half of the same seam. A row is one object across the grip, so
+/// the line has to be visible on both surfaces — and they are different
+/// surfaces, so it is not the same colour.
+fn auto_header_seam(p: &Ink) -> Color32 {
+    separate(shade(p.hdr_face, 0.92), 0.22)
+}
+
 fn auto_ground(p: &Ink, lane: usize) -> Color32 {
     let base = if lane % 2 == 0 { p.lane } else { p.lane_alt };
     // Character first, then DISTANCE. The blend gives the row the ruler's
@@ -3267,6 +3360,21 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             continue;
         }
         painter.rect_filled(row.lane, 0.0, auto_ground(&p, lane));
+        // **A seam between stacked rows.** Two lanes on one track are two
+        // shades of the same recessed ground with nothing between them, so
+        // three open rows read as one tall band and the eye has to count
+        // handles to tell where one parameter ends. Only BETWEEN them —
+        // `slot > 0` — because the boundary with the track above is already
+        // drawn by the track's own plate.
+        if slot > 0 {
+            painter.line_segment(
+                [
+                    Pos2::new(row.lane.left(), row.lane.top()),
+                    Pos2::new(row.lane.right(), row.lane.top()),
+                ],
+                Stroke::new(1.0, auto_seam(&p, lane)),
+            );
+        }
         // **Its HEADER is not drawn here**, and that is the whole point of
         // this comment. See `draw_auto_headers`, called after the header
         // column's wood: painting it in this loop put it UNDER that wood,
@@ -4172,15 +4280,26 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             // The strip's colour as a plate, and the ink measured against
             // it — the mixer's rule, and the same one the track headers
             // below follow: any colour, and the text still reads.
-            let face = if view.master_color != 0 {
+            // **Themed, always.** With a palette on, the master takes its
+            // palette slot like every track. With one off it used to fall
+            // back to the bare header face and read as a strip nobody had
+            // dressed — the owner's "make master 'channel' strip have a
+            // themed background and text subject to the theming of tracks."
+            // The theme's own master red is what it falls back to now: it is
+            // per theme by construction, and it is the same colour its dial
+            // wears, so the row reads as one object.
+            let face = crate::recorder_panel::legible_surface(if view.master_color != 0 {
                 let (cr, cg, cb) =
                     crate::mixer_panel::STRIP_COLORS[view.master_color.min(
                         crate::mixer_panel::STRIP_COLORS.len() - 1,
                     )];
-                crate::recorder_panel::legible_surface(Color32::from_rgb(cr, cg, cb))
+                Color32::from_rgb(cr, cg, cb)
             } else {
-                p.hdr_face
-            };
+                // Darkened toward a PLATE: the knob colour at full strength
+                // is a control's colour, and a whole row of it would shout
+                // over the sixteen tracks it sits above.
+                shade(master_dial_body(view.master_knob), 0.55)
+            });
             let ink = if crate::recorder_panel::wants_light_ink(face) {
                 crate::recorder_panel::INK_LIGHT
             } else {
@@ -4267,17 +4386,42 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     painter,
                     r.knob,
                     crate::recorder::gain_to_fader(view.master_gain),
-                    // **Black, and only here.** The channels' volume dials
-                    // wear the blue; the master is the one control that can
-                    // undo every other one, and the desk already marks it out
-                    // by colour rather than by position — see
-                    // `mixer_panel::MASTER_COLOR`, which is a crimson no
-                    // palette uses. A cap that matched the channels made the
-                    // master's row read as a seventeenth track.
-                    DIAL_MASTER,
-                    crate::recorder_panel::legible_surface(shade(face, 0.82)),
-                    ink,
+                    // **The theme's red, outlined black, with a white
+                    // needle.** The channels' volume dials wear the blue; the
+                    // master is the one control that can undo every other
+                    // one, and it says so in the theme's own master colour
+                    // rather than in a fixed crimson laid over all sixteen.
+                    //
+                    // The outline and the needle are FIXED, the way the bus
+                    // slot's two colours are and for the same reason: they
+                    // are the instrument, not the panel, and a near-black
+                    // ring with a near-white needle means the same thing on
+                    // every theme. Being fixed is also what stops them being
+                    // dragged dark-on-dark by whatever red the theme brought.
+                    master_dial_body(view.master_knob),
+                    DIAL_MASTER_RING,
+                    DIAL_MASTER_NEEDLE,
                 );
+            }
+            // Its number, above the dial. Same shape a track's takes, and
+            // the same compact dB: the unit has no room at this size.
+            if r.knob_readout.is_positive() {
+                let g = view.master_gain;
+                let db = if g <= 0.001 {
+                    "-inf".to_owned()
+                } else {
+                    format!("{:+.1}", 20.0 * g.log10())
+                };
+                let size = crate::fonts::px((r.knob_readout.height() * 0.86).clamp(6.0, 9.0));
+                if size >= 6.0 {
+                    painter.text(
+                        r.knob_readout.center(),
+                        Align2::CENTER_CENTER,
+                        &db,
+                        FontId::new(size, crate::fonts::courier()),
+                        quiet(ink, face, 0.22),
+                    );
+                }
             }
             // The word under the meter, saying what the dial is — the track
             // rows write theirs under the knob and this row has no room
@@ -5129,6 +5273,7 @@ ArrangeView {
             master_gain: 1.0,
             master_peak: [0.0; 2],
             master_color: 0,
+            master_knob: (0xE8, 0x3A, 0x4E),
             show_master_row: true,
             master_inserts: [""; crate::recorder::INSERTS * 2],
             show_tempo_lane: false,
@@ -5821,6 +5966,11 @@ ArrangeView {
                     set.meter_bg_color.g,
                     set.meter_bg_color.b,
                 );
+                v.master_knob = (
+                    set.master_knob_color.r,
+                    set.master_knob_color.g,
+                    set.master_knob_color.b,
+                );
                 let p = ink(&v);
                 let mode = if dark { "dark" } else { "light" };
                 // **The lane's OWN colour is the ground the header text lands
@@ -5871,6 +6021,30 @@ ArrangeView {
                     let parent = if lane % 2 == 0 { p.lane } else { p.lane_alt };
                     check("automation readout", on_ink(g), g, 4.5);
                     check("automation ground against its lane", g, parent, 1.12);
+                    // **The seam between two stacked rows has to be SEEN**,
+                    // or three open lanes read as one tall band. Structure,
+                    // not text: the same "there is an edge here" bar.
+                    check("automation seam", auto_seam(&p, lane), g, 1.12);
+                }
+                // The row's dial stands on its HEADER, not on the lane
+                // ground — checking it against the ground was measuring a
+                // pairing the app never draws, which is the same mistake
+                // this audit was written to catch elsewhere.
+                {
+                    let hface = shade(p.hdr_face, 0.92);
+                    check("automation header seam", auto_header_seam(&p), hface, 1.12);
+                    check("automation dial", DIAL_VOLUME, hface, 1.35);
+                }
+                // **The MASTER's dial, per theme.** Its body is the theme's
+                // own master red and its outline and needle are fixed, so
+                // the pairing is checked on all sixteen rather than assumed
+                // from the one it was drawn against.
+                {
+                    let body = master_dial_body(v.master_knob);
+                    check("master dial needle", DIAL_MASTER_NEEDLE, body, 2.2);
+                    check("master dial outline", DIAL_MASTER_RING, body, 1.6);
+                    let plate = crate::recorder_panel::legible_surface(shade(body, 0.55));
+                    check("master row text", on_ink(plate), plate, 4.5);
                 }
                 // **The chips are the mixer's bays.** Input, FX and routing
                 // were a hard-coded bone panel with hard-coded near-black on
