@@ -3192,6 +3192,13 @@ impl Renderer {
     ///
     /// Returns immediately on an empty rack, so a channel nobody has put an
     /// effect on costs one branch and folds by exactly the path it always did.
+    ///
+    /// **NOT-A-CHANNEL:** every caller hands this a BUS seat — the effects
+    /// bus, or one of the master's two racks — never one of the sixteen. So
+    /// the folder rule below does not reach it, and
+    /// `no_writer_runs_a_folders_rack_except_the_fold` is told as much here
+    /// rather than guessing. A caller that ever passes a channel has to come
+    /// and read this.
     fn run_insert_chain(&mut self, at: usize, buf_is_aux: bool, frames: usize) {
         // **The block's notes, gated by the channel's own arm bit.** A voice
         // in this rack is fed the same list every slot reads — see
@@ -3243,6 +3250,10 @@ impl Renderer {
                 .get(slot_lane * INSERTS + b)
                 .map_or(&[][..], Vec::as_slice)
         });
+        // **NOT-A-CHANNEL:** `at` is always a BUS seat here — the effects
+        // bus, or one of the master's two racks — never one of the sixteen,
+        // so the folder rule the three channel writers follow cannot reach
+        // this call. See the note on this function.
         let Some(rack) = self.racks.get_mut(at) else {
             return;
         };
@@ -4018,6 +4029,9 @@ impl Renderer {
                         == 0;
                     let notes: &[tangent_host::Note] = if armed { &self.notes } else { &[] };
                     let controls: &[tangent_host::Control] = if armed { &self.controls } else { &[] };
+                    // **NOT-A-CHANNEL:** the click's own strip, which can
+                    // never be one of the sixteen and so can never be a
+                    // folder.
                     run_rack(
                         &mut self.racks[Strip::Click.index()],
                         &mut self.fx_in,
@@ -4180,6 +4194,25 @@ impl Renderer {
                                 .unwrap_or(0.0);
                         }
                     }
+                    // **SEND-BARGAIN:** `dest` IS one of the sixteen and can
+                    // be a folder, so this is not covered by the fold rule —
+                    // it is the older bargain this engine already makes, and
+                    // states above: a destination's rack processes what is
+                    // sent to it, as well as its own audio. Each arrival is
+                    // processed once; what a stateful plugin sees is two
+                    // streams, which is true of every destination and not a
+                    // property of groups.
+                    //
+                    // ⚠️ A send into a FOLDER is not heard, and this pass is
+                    // where that is decided. It runs AFTER `fold_folders` —
+                    // it has to, or a send FROM a group would gather the
+                    // folder's raw row instead of the group's output — so by
+                    // the time this audio reaches the folder's stem the fold
+                    // that would carry it has already run, and
+                    // `route_direct` is zero for a folder. It goes nowhere.
+                    // Whether a group should be offerable as a send
+                    // destination at all is a question for the desk, not
+                    // something to answer quietly down here.
                     if !self.racks[dest].is_empty() {
                         run_rack(
                             &mut self.racks[dest],
@@ -4999,8 +5032,23 @@ impl Renderer {
             // a version that automated clips would look right and do nothing
             // to somebody's own playing coming through the desk.
             let lane = strip.index().min(CHANNELS - 1);
-            let send = lane_send_of(&self.auto, &self.shared, lane);
-            let (pan_l, pan_r) = pan_gains(lane_pan_of(&self.auto, &self.shared, lane));
+            // **A live input on a FOLDER goes into the bus raw**, like every
+            // other source standing on one: the folder's rack, pan, send and
+            // meter are the fold's to apply, once, over the whole group.
+            // This is the fourth writer of the four, and the rule holds in
+            // all of them or it holds in none — the two it was missing from
+            // are what made a grouped track static and play at half level.
+            let is_folder = self.folder_is.get(lane).copied().unwrap_or(false);
+            let send = if is_folder {
+                0.0
+            } else {
+                lane_send_of(&self.auto, &self.shared, lane)
+            };
+            let (pan_l, pan_r) = if is_folder {
+                (1.0, 1.0)
+            } else {
+                pan_gains(lane_pan_of(&self.auto, &self.shared, lane))
+            };
             let mut peak = [0.0f32; 2];
             // **This strip's own audio first, then its rack, then the fold.**
             //
@@ -5032,15 +5080,17 @@ impl Renderer {
                     == 0;
                 let notes: &[tangent_host::Note] = if armed { &self.notes } else { &[] };
                 let controls: &[tangent_host::Control] = if armed { &self.controls } else { &[] };
-                run_rack(
-                    &mut self.racks[strip.index()],
-                    &mut self.fx_in,
-                    n,
-                    &mut self.fx_out,
-                    notes,
-                    controls,
-                NO_AUTOMATION,
-                );
+                if !is_folder {
+                    run_rack(
+                        &mut self.racks[strip.index()],
+                        &mut self.fx_in,
+                        n,
+                        &mut self.fx_out,
+                        notes,
+                        controls,
+                        NO_AUTOMATION,
+                    );
+                }
             }
             let mut room = room_from;
             // **A LIVE INPUT is on the lane too, and it routes with it.**
@@ -5093,7 +5143,10 @@ impl Renderer {
                 }
             }
             room_to = room;
-            self.shared.note_strip_peak(strip, peak);
+            // A folder's meter is the GROUP's, and the fold reports it.
+            if !is_folder {
+                self.shared.note_strip_peak(strip, peak);
+            }
         }
         self.room_gain = room_to;
         // A hundredth of a decibel of an input still withheld is still two
@@ -6001,6 +6054,9 @@ impl Renderer {
                         }
                     }
                 }
+                // **NOT-A-CHANNEL:** a PAD's own seat, one of a hundred and
+                // twenty-eight per drum lane — never one of the sixteen, so
+                // never a folder.
                 run_rack(
                     &mut self.racks[rack_at],
                     &mut self.pad_io,
@@ -6753,6 +6809,8 @@ impl Renderer {
                     }
                 }
             }
+            // **THE-FOLD:** the one place a folder's rack runs.
+            //
             // **The group's own plugins, over the group's own audio.** This
             // is the line the owner was asking for: "plugins in the folder
             // do not process that folders audio together." Now they do.
@@ -12563,6 +12621,59 @@ mod tests {
             grouped < bare + 64,
             "a grouped kit waited for a delay it pays again in the fold: {grouped}"
         );
+    }
+
+    /// **Every writer folds a folder ONCE — and there are four of them.**
+    ///
+    /// A folder is a strip, and every part of being one happens in
+    /// `fold_folders`, over the whole group. Four places put a channel's
+    /// audio on the bus — its rack and instrument, its clips, its kit, and
+    /// its LIVE INPUT — and each one has to be told. Two were missed the
+    /// first time round and each miss was a bug the owner heard: a rack
+    /// running twice a block is static, and a fader applied twice is a group
+    /// at half level. The fourth was found by this test.
+    ///
+    /// So the rule is checked against the SOURCE rather than against any one
+    /// writer, and it is deliberately a CHECKLIST: every `run_rack` has to
+    /// carry, within sight of it, either a folder guard or one of two
+    /// markers saying why it does not need one. A new caller fails here
+    /// until somebody decides which it is — which is the whole point, since
+    /// what went wrong twice was a writer nobody thought about.
+    #[test]
+    fn no_writer_runs_a_folders_rack_except_the_fold() {
+        let src = include_str!("instrument.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let calls: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.trim_start().starts_with("run_rack("))
+            .map(|(n, _)| n)
+            .collect();
+        assert!(
+            calls.len() >= 4,
+            "the rack callers moved; this test is reading the wrong thing"
+        );
+        for call in calls {
+            let start = call.saturating_sub(24);
+            let window = lines[start..call].join("\n");
+            let decided = window.contains("is_folder")
+                || window.contains("folded_here")
+                // The fold itself, and the one caller that is handed bus
+                // seats only. Both say so where they are written.
+                || window.contains("THE-FOLD:")
+                || window.contains("NOT-A-CHANNEL:")
+                || window.contains("SEND-BARGAIN:");
+            assert!(
+                decided,
+                "a rack runs at line {} with nothing saying whether it may run \
+                 for a FOLDER. A folder's rack belongs to `fold_folders`, which \
+                 runs it once over the group; running it here as well processes \
+                 the audio twice a block, which for anything with state is \
+                 noise. Guard it, or mark it NOT-A-CHANNEL if it can never be \
+                 handed one.",
+                call + 1
+            );
+        }
     }
 
     /// **A drum track's fader arrives before the next hit.**
