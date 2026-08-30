@@ -159,6 +159,14 @@ pub struct AutoView<'a> {
     /// Separate from `hot`, which is one point and is about the pointer.
     /// These are what Delete, copy and cut act on, and a thing those keys
     /// will act on has to look chosen before it is pressed — the same
+    /// **The point being DRAGGED right now**, which gets its value written
+    /// above it.
+    ///
+    /// Not `hot`: that is the point under the pointer and is set by hovering
+    /// too, so a readout keyed to it would flicker on across a row somebody
+    /// was only crossing. A value you are setting is worth a number; a value
+    /// you are passing over is not.
+    pub moving: Option<usize>,
     /// argument `selected` makes for the row.
     ///
     /// Owned, like `label` beside it: the app resolves this from a selection
@@ -2219,7 +2227,10 @@ pub fn a11y_nodes(rect: Rect, view: &ArrangeView<'_>) -> Vec<crate::a11y::Node> 
                 f64::from(view.grid_exp),
                 -5.0,
                 3.0,
-                grid_spoken(view.grid_exp),
+                {
+                    let sg = view.meter.sig_at_bar(bar_of(view, view.view_start_s));
+                    grid_spoken(view.grid_exp, sg.beats, sg.unit)
+                },
                 Travel {
                     norm: (f32::from(view.grid_exp) + 5.0) / 8.0,
                     up: false,
@@ -2728,25 +2739,116 @@ fn blend(a: Color32, b: Color32, t: f32) -> Color32 {
 pub fn grid_quarters(exp: i8, beats: u8, unit: u8) -> f64 {
     let beat = 4.0 / f64::from(unit.max(1));
     let per_bar = f64::from(beats.max(1));
-    let e = i32::from(exp.clamp(-6, 6));
+    let bar = beat * per_bar;
+    // **-7, not -6.** The ladder gained a rung at the TOP (the half note),
+    // so every division below it moved one place further down the exponent
+    // range; stopping at -6 would have quietly taken the finest grid the app
+    // used to offer away from it.
+    let e = i32::from(exp.clamp(-7, 6));
     if e >= 0 {
         // Bars, and multiples of them.
-        beat * per_bar * 2.0f64.powi(e)
-    } else {
-        // The BEAT, halved and halved again. A bar is a whole number of
-        // beats, so every one of these divides it exactly — which is the
-        // property the whole rewrite is for.
-        beat / 2.0f64.powi(-e - 1)
+        return bar * 2.0f64.powi(e);
     }
+    // **Halve the BAR while a half is still a whole number of beats; below
+    // that, halve from the beat.**
+    //
+    // Anchoring straight to the beat — what this did before — skipped a step
+    // in the commonest meter there is. In 4/4 the ladder went bar, quarter,
+    // eighth: no HALF note anywhere on it, and a jump of four between the
+    // first two rungs. The labels were written for the ladder somebody
+    // expected instead of the one the code walked, so from the second rung
+    // down every one of them was two steps too coarse — the box said "1/2"
+    // and the magnet snapped eighths. The owner found it from the other end:
+    // "there should exist a single state of that button that produces 1/4th
+    // and that's the glyph, placed exactly between 1/8 and 1/2."
+    //
+    // Halving the bar all the way down would bring back the fault the beat
+    // anchor was introduced to fix: in 6/8 a bar is three quarters, so a
+    // quarter of it is a DOTTED EIGHTH — a line on nothing anybody plays.
+    // Hence the condition. A half that lands between beats is refused and
+    // the beat is taken instead, so the ladder never offers one.
+    //
+    //   4/4   1 bar,  1/2,  1/4,  1/8,  1/16, 1/32
+    //   6/8   1 bar,  dotted 1/4,  1/8,  1/16, 1/32
+    //
+    // Every rung still divides the bar exactly, which is the property the
+    // beat anchor was for and which this keeps.
+    let mut v = bar;
+    for _ in 0..(-e) {
+        let half = v * 0.5;
+        let beats_in_half = half / beat;
+        if beats_in_half >= 1.0 && (beats_in_half - beats_in_half.round()).abs() > 1.0e-9 {
+            // Between beats: drop to the beat rather than onto a line
+            // nothing is played on.
+            v = beat;
+        } else {
+            v = half;
+        }
+    }
+    v
 }
 
-pub fn grid_label(exp: i8) -> String {
-    match exp {
-        0 => "1".to_owned(),
-        -1 => "\u{266a}".to_owned(),
-        e if e > 0 => format!("{}", 1u32 << e.min(6) as u32),
-        e => format!("1/{}", 1u32 << (-e - 1).min(6) as u32),
+/// **What the box prints, derived from what the magnet actually does.**
+///
+/// It used to be a formula of its own, written for the ladder somebody
+/// expected rather than the one [`grid_quarters`] walks — so from the second
+/// rung down every label was two steps too coarse: the box said "1/2" while
+/// the magnet snapped eighths, and "1/4" while it snapped sixteenths. Worse,
+/// "1/4" appeared TWICE on the way down, once as the note glyph and once in
+/// numerals, at two different divisions. The owner: "there should exist a
+/// single state of that button that produces 1/4th and that's the glyph."
+///
+/// Reading the value back out is what makes that impossible to reintroduce:
+/// there is now one source of truth and the label is a rendering of it.
+///
+/// The glyph is kept for the quarter note alone, which is what makes it the
+/// single 1/4 state. It stays `\u{266a}` — the character already on screen
+/// and known to render in the panel's font; a "more correct" `\u{2669}` that
+/// the font lacks would draw a hollow box, which is worse than approximate.
+pub fn grid_label(exp: i8, beats: u8, unit: u8) -> String {
+    if exp > 0 {
+        // Multiples of a BAR, and it says so by counting them.
+        return format!("{}", 1u32 << exp.min(6) as u32);
     }
+    note_label(grid_quarters(exp, beats, unit))
+}
+
+/// A length in quarter notes, as a note value.
+///
+/// Whole = 4 quarters, half = 2, quarter = 1, and so on down. A dotted value
+/// is one and a half of the next one up and wears a dot; 6/8's second rung is
+/// a dotted quarter and there is no other honest way to write it.
+fn note_label(q: f64) -> String {
+    if !q.is_finite() || q <= 0.0 {
+        return "1".to_owned();
+    }
+    // The glyph IS the quarter note, and only the quarter note.
+    if (q - 1.0).abs() < 1.0e-9 {
+        return "\u{266a}".to_owned();
+    }
+    let denom = 4.0 / q;
+    let rounded = denom.round();
+    if (denom - rounded).abs() < 1.0e-9 && rounded >= 1.0 {
+        return if rounded <= 1.0 {
+            "1".to_owned()
+        } else {
+            format!("1/{}", rounded as u64)
+        };
+    }
+    // Dotted: one and a half of a clean value.
+    let plain = q * 2.0 / 3.0;
+    let d = 4.0 / plain;
+    let dr = d.round();
+    if (d - dr).abs() < 1.0e-9 && dr >= 1.0 {
+        return if dr <= 1.0 {
+            "1\u{00b7}".to_owned()
+        } else {
+            format!("1/{}\u{00b7}", dr as u64)
+        };
+    }
+    // Nothing nameable — a meter this build has no word for. Say the length
+    // rather than a wrong note value.
+    format!("{q:.3}q")
 }
 
 /// The same grid, in the words a person would say it in.
@@ -2755,20 +2857,33 @@ pub fn grid_label(exp: i8) -> String {
 /// A screen reader announcing "Grid, 1" has said nothing: the unit is the
 /// whole content, and a readout that has to be decoded has not been made
 /// accessible. So the spoken form carries it.
-fn grid_spoken(exp: i8) -> String {
-    // Note values now, because that is what the grid actually steps in. "1/4
-    // bar" was both the wrong words and the wrong maths in any meter whose
-    // bar is not a power of two of its beat.
-    // In BEATS of the current signature, because that is what the grid steps
-    // in now: a bar is a whole number of beats, so every division of one
-    // divides the bar exactly, in any meter. Naming them in note values was
-    // the previous mistake — a half note does not fit a 6/8 bar, and the
-    // lines came out unevenly spaced, which reads as swing.
-    match exp {
-        0 => "1 bar".to_owned(),
-        -1 => "1 beat".to_owned(),
-        e if e > 0 => format!("{} bars", 1u32 << e.min(6) as u32),
-        e => format!("1/{} beat", 1u32 << (-e - 1).min(6) as u32),
+fn grid_spoken(exp: i8, beats: u8, unit: u8) -> String {
+    // **Read off the same division the box prints and the magnet uses.**
+    //
+    // This carried its own third opinion, in BEATS, while the box counted in
+    // note values and the maths did neither — so a reader was told "1/2 beat"
+    // where the box said "1/2" and the grid snapped an eighth. Three
+    // statements, no two of them agreeing. One source now.
+    if exp > 0 {
+        return format!("{} bars", 1u32 << exp.min(6) as u32);
+    }
+    if exp == 0 {
+        return "1 bar".to_owned();
+    }
+    let q = grid_quarters(exp, beats, unit);
+    // Spoken in words rather than in the box's shorthand: a reader saying
+    // "one slash eight" has not said "an eighth note".
+    let label = note_label(q);
+    match label.as_str() {
+        "\u{266a}" => "quarter note".to_owned(),
+        "1/2" => "half note".to_owned(),
+        "1/8" => "eighth note".to_owned(),
+        "1/16" => "sixteenth note".to_owned(),
+        "1/32" => "thirty-second note".to_owned(),
+        "1/64" => "sixty-fourth note".to_owned(),
+        "1/4\u{00b7}" => "dotted quarter note".to_owned(),
+        "1/8\u{00b7}" => "dotted eighth note".to_owned(),
+        other => format!("{other} of a bar"),
     }
 }
 
@@ -2828,23 +2943,19 @@ fn bar_step(view: &ArrangeView<'_>, width: f32) -> u32 {
     step
 }
 
-/// Paint the whole view into `rect`.
-pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
-    let l = Layout::new(rect, view);
-    if !l.lanes_area.is_positive() {
-        return;
-    }
-    let p = ink(view);
-    painter.rect_filled(rect, 0.0, p.wood);
-
-    // ── the lanes' field, striped so eight rows read as eight ─────────────
-    for (i, row) in l.lane_rows.iter().enumerate() {
-        painter.rect_filled(*row, 0.0, if i % 2 == 0 { p.lane } else { p.lane_alt });
-    }
-    // **An automation row takes the ground of the track it belongs to**, a
-    // shade recessed. Its own stripe colour would read as a ninth track;
-    // being a darker version of its parent's is what says "part of that
-    // one" without a line or a label doing the work.
+/// **Every open automation row's header**, drawn over the header column's
+/// wood.
+///
+/// Split out of `draw`'s lane loop for one reason: ORDER. The loop runs long
+/// before the header column is filled with `hdr_wood`, so anything it painted
+/// there was covered. Everything a track's header draws happens after that
+/// fill; these rows have to join it.
+fn draw_auto_headers(
+    painter: &Painter,
+    l: &Layout,
+    view: &ArrangeView<'_>,
+    p: &Ink,
+) {
     for row in &l.rows {
         let RowKind::Automation(lane, slot) = row.kind else {
             continue;
@@ -2852,13 +2963,6 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         if !row.lane.is_positive() {
             continue;
         }
-        let base = if lane % 2 == 0 { p.lane } else { p.lane_alt };
-        painter.rect_filled(row.lane, 0.0, shade(base, 0.88));
-        // **The row says what it controls.** It said nothing at all: a stripe
-        // under a track, with no way to tell a volume lane from a send one
-        // except by watching which fader moved. The header is the track's own
-        // strip face, so the word is measured against that and not against
-        // the lane.
         if row.header.is_positive() {
             let Some(auto) = view.lanes.get(lane).and_then(|v| v.automation.get(slot))
             else {
@@ -2970,6 +3074,41 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 }
             }
         }
+    }
+}
+
+/// Paint the whole view into `rect`.
+pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
+    let l = Layout::new(rect, view);
+    if !l.lanes_area.is_positive() {
+        return;
+    }
+    let p = ink(view);
+    painter.rect_filled(rect, 0.0, p.wood);
+
+    // ── the lanes' field, striped so eight rows read as eight ─────────────
+    for (i, row) in l.lane_rows.iter().enumerate() {
+        painter.rect_filled(*row, 0.0, if i % 2 == 0 { p.lane } else { p.lane_alt });
+    }
+    // **An automation row takes the ground of the track it belongs to**, a
+    // shade recessed. Its own stripe colour would read as a ninth track;
+    // being a darker version of its parent's is what says "part of that
+    // one" without a line or a label doing the work.
+    for row in &l.rows {
+        let RowKind::Automation(lane, slot) = row.kind else {
+            continue;
+        };
+        if !row.lane.is_positive() {
+            continue;
+        }
+        let base = if lane % 2 == 0 { p.lane } else { p.lane_alt };
+        painter.rect_filled(row.lane, 0.0, shade(base, 0.88));
+        // **Its HEADER is not drawn here**, and that is the whole point of
+        // this comment. See `draw_auto_headers`, called after the header
+        // column's wood: painting it in this loop put it UNDER that wood,
+        // and every control on it was invisible while remaining perfectly
+        // hittable. The owner: "still dont draw, but controls are probably
+        // there (i can find the x button i think)."
     }
 
     // ── the grid: bar lines through the lanes, numbers on the ruler ───────
@@ -3309,7 +3448,21 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             }
             painter.line_segment([a, b], Stroke::new(1.5, curve));
         }
-        // The handles, over the line, and only where one can be seen.
+        // **The handles, clipped to their own row.**
+        //
+        // A point at time ZERO sits on the lane's left edge, and a handle is
+        // a disc with a radius — so four points of it spilled left, into the
+        // seven-point resize grip, which is painted later and won over it.
+        // The node a freshly opened lane is given lived exactly there: drawn,
+        // half buried, and read as absent. The owner: "opening a lane doesn't
+        // start with a node at the beginning."
+        //
+        // Clipping rather than nudging the position: a handle drawn a few
+        // points in would be a handle drawn at a time the point is not at,
+        // and the first thing anybody does with it is drag it somewhere
+        // exact. A half disc against the edge is honest and is what every
+        // desk draws there.
+        let painter = &painter.with_clip_rect(row.lane);
         for (i, q) in shown.iter().enumerate() {
             let at = Pos2::new(x_of(rect, view, q.at_s), auto_y_of(row.lane, q.value));
             if !at.x.is_finite() || !at.y.is_finite() {
@@ -3333,6 +3486,38 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     AUTO_POINT_R + 2.0,
                     Stroke::new(1.4, crate::recorder_panel::selection_rim(ground)),
                 );
+            }
+            // **The value, over the point being dragged.**
+            //
+            // A curve is the one editable thing on this timeline whose value
+            // could not be read while it was being set: the height of a dot
+            // in a half-height row is not a number anybody can name, and the
+            // header's readout shows where the CONTROL is standing, not where
+            // the hand has taken this node. The owner asked for it while
+            // moving, so it appears while moving and not on hover.
+            if auto.moving == Some(lo + i) {
+                let size = crate::fonts::px((row.lane.height() * 0.34).clamp(8.0, 12.0));
+                let font = FontId::new(size, crate::fonts::courier_bold());
+                // Above the handle, and pushed back inside the row when the
+                // point is near the top — a readout off the top of the lane
+                // is the same as no readout.
+                let want_y = at.y - AUTO_POINT_R - size * 0.75;
+                let y = want_y.max(row.lane.top() + size * 0.6);
+                // And inside it horizontally, so a node at either end still
+                // shows its number.
+                let half = size * 2.0;
+                let x = at.x.clamp(row.lane.left() + half, row.lane.right() - half);
+                let text = format!("{:.0}%", q.value * 100.0);
+                // A plate under it: the curve, the grid and the clips are all
+                // behind this, and a bare number over them is unreadable on
+                // half the themes.
+                let galley = painter.layout_no_wrap(text, font.clone(), on_ink(ground));
+                let plate = Rect::from_center_size(
+                    Pos2::new(x, y),
+                    galley.size() + Vec2::new(6.0, 2.0),
+                );
+                painter.rect_filled(plate, 2.0, ground);
+                painter.galley(plate.center() - galley.size() * 0.5, galley, on_ink(ground));
             }
         }
     }
@@ -3797,6 +3982,16 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         ],
         Stroke::new(1.0, p.engrave.gamma_multiply(0.5)),
     );
+    // **The automation rows' headers, ON the wood rather than under it.**
+    //
+    // They used to be painted up in the lane loop, hundreds of lines before
+    // the header column gets its `hdr_wood` — so the face, the x, the arm,
+    // the bypass, the name and the dial were all drawn and then covered by a
+    // single rect. Nothing failed and nothing looked broken from the code's
+    // side: the hit test is geometric and went on working, so the controls
+    // could be PRESSED and not seen.
+    draw_auto_headers(painter, &l, view, &p);
+
     let num_font = FontId::new(10.0, crate::fonts::courier());
     // **The MASTER, above the tracks, in the mixer's own colours.**
     //
@@ -4436,11 +4631,15 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     // The GRID box is always "on" — it is a readout, not a switch — so it
     // takes the lit ground and prints in the panel's own ink rather than the
     // green a switch uses to say it is engaged.
+    // The meter at the START of the view: the grid box names a note value,
+    // and in a song that changes meter the one on screen is the one that
+    // matters. `sig_at_bar` is the same lookup the grid lines use.
+    let sig_now = view.meter.sig_at_bar(bar_of(view, view.view_start_s));
     if tool(painter, l.tool_grid, true).is_some() {
         painter.text(
             l.tool_grid.center(),
             Align2::CENTER_CENTER,
-            grid_label(view.grid_exp),
+            grid_label(view.grid_exp, sig_now.beats, sig_now.unit),
             FontId::new(
                 (l.tool_grid.height() * 0.55).clamp(8.0, 11.0),
                 crate::fonts::courier_bold(),
@@ -4780,7 +4979,85 @@ ArrangeView {
         Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 420.0))
     }
 
-    /// **Every control on an automation row is actually PAINTED, at every
+    /// **A node being dragged says what it is worth.**
+    ///
+    /// The one editable thing on this timeline whose value could not be read
+    /// while it was being set: the height of a dot in a half-height row is
+    /// not a number anybody can name. Asserted the same way the header
+    /// controls are — by running the real `draw` and looking for text that
+    /// reaches the row — because "it is in the code" was exactly the claim
+    /// that turned out to be false for the header.
+    #[test]
+    fn the_node_being_dragged_shows_its_value_and_hovering_one_does_not() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        crate::fonts::apply_text_styles(&ctx);
+        let pts = vec![crate::automation::Point {
+            at_s: 8.0,
+            value: 0.75,
+            shape: crate::automation::Shape::Linear,
+        }];
+        let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 673.0));
+
+        let text_in = |moving: Option<usize>, hot: Option<usize>| -> Vec<String> {
+            let mut v = a_view(&[]);
+            v.visible_lanes = 8;
+            v.lanes[0].automation = vec![AutoView {
+                selected: false,
+                label: "volume".to_owned(),
+                resting: 0.5,
+                armed: false,
+                bypassed: false,
+                param: crate::automation::AutoParam::Gain,
+                points: &pts,
+                hot,
+                chosen: Vec::new(),
+                moving,
+            }];
+            let l = Layout::new(r, &v);
+            let row = l
+                .rows
+                .iter()
+                .find(|x| x.kind == RowKind::Automation(0, 0))
+                .expect("no automation row")
+                .lane;
+            let out = ctx.run(
+                egui::RawInput { screen_rect: Some(r), ..Default::default() },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.set_clip_rect(r);
+                        draw(ui.painter(), r, &v);
+                    });
+                },
+            );
+            out.shapes
+                .iter()
+                .filter_map(|cs| match &cs.shape {
+                    egui::Shape::Text(t) if row.intersects(t.visual_bounding_rect()) => {
+                        Some(t.galley.text().to_owned())
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // Dragging it: the value, as a percentage, over the row.
+        let while_moving = text_in(Some(0), Some(0));
+        assert!(
+            while_moving.iter().any(|t| t == "75%"),
+            "the dragged node showed no value: {while_moving:?}"
+        );
+        // Merely hovering it: nothing. A value you are passing over is not
+        // worth a number, and one that appeared on hover would flicker
+        // across every row somebody crossed.
+        let while_hovering = text_in(None, Some(0));
+        assert!(
+            !while_hovering.iter().any(|t| t == "75%"),
+            "hovering drew the readout too: {while_hovering:?}"
+        );
+    }
+
+    /// **Every control on an automation row is actually PAINTED    /// **Every control on an automation row is actually PAINTED, at every
     /// height a row can have.**
     ///
     /// The regression this exists for: `auto_header` refused to lay out any
@@ -4815,6 +5092,7 @@ ArrangeView {
             points: &pts,
             hot: None,
             chosen: Vec::new(),
+            moving: None,
         }];
         // 673 is the arrangement with every band on; 150 is the arrangement
         // with them off, which is the case that was broken. The rest are the
@@ -4840,12 +5118,28 @@ ArrangeView {
                     });
                 },
             );
-            // Anything as wide as the header or wider is a backdrop — the
-            // row's own plate, the header column's ground — and proves
-            // nothing about a control.
+            // **The last thing that COVERS the whole header**, by emission
+            // order. Anything drawn before it is buried.
+            //
+            // This is the assertion the first version of this test was
+            // missing. It counted the shapes that reached the header and was
+            // satisfied, while every one of them was painted hundreds of
+            // lines before the header column's `hdr_wood` and covered by it.
+            // The controls were drawn, and invisible, and still hittable —
+            // so nothing in the code or the hit test could notice.
+            let buried_up_to = out
+                .shapes
+                .iter()
+                .rposition(|cs| {
+                    let b = cs.shape.visual_bounding_rect();
+                    b.is_positive() && b.contains_rect(row.header)
+                })
+                .map_or(0, |i| i + 1);
+            // A control counts only if it is emitted AFTER that, and only if
+            // it is smaller than the header — a backdrop proves nothing.
             let painted = |cell: Rect| {
                 cell.is_positive()
-                    && out.shapes.iter().any(|cs| {
+                    && out.shapes.iter().skip(buried_up_to).any(|cs| {
                         let b = cs.shape.visual_bounding_rect();
                         b.is_positive()
                             && b.width() < row.header.width() * 0.9
@@ -4861,7 +5155,8 @@ ArrangeView {
             ] {
                 assert!(
                     painted(cell),
-                    "{what} is not drawn on a {:.1}pt row (arrangement {hh}pt)",
+                    "{what} is not VISIBLE on a {:.1}pt row (arrangement {hh}pt): \
+                     either it was never drawn, or something painted over it",
                     row.header.height()
                 );
             }
@@ -4906,6 +5201,7 @@ ArrangeView {
             points: &[],
             hot: None,
             chosen: Vec::new(),
+            moving: None,
         }];
         let l = Layout::new(rect(), &v);
 
@@ -5227,19 +5523,16 @@ ArrangeView {
         v.grid_exp = -2;
         let nodes = a11y_nodes(rect(), &v);
         let g = nodes.iter().find(|n| n.label == "Grid").expect("no grid node");
-        // **Note values, not bar fractions.** "1/4 bar" was both the wrong
-        // words and the wrong maths: in 6/8 a quarter of a bar is a dotted
-        // eighth. See `grid_quarters`.
-        // **Beats, not note values and not bar fractions.** A bar is a whole
-        // number of beats in every meter, so a division of one always
-        // divides the bar exactly — see `every_grid_step_divides_the_bar`.
-        assert_eq!(g.value.as_deref(), Some("1/2 beat"));
-        // The BOX still prints its own terse form; only the spoken one is
-        // spelled out.
-        assert_eq!(grid_label(-2), "1/2");
-        // Half a beat: half a quarter in 4/4, half an eighth in 6/8.
-        assert!((grid_quarters(-2, 4, 4) - 0.5).abs() < 1e-9);
-        assert!((grid_quarters(-2, 6, 8) - 0.25).abs() < 1e-9);
+        // **The box, the spoken form and the magnet all name ONE division.**
+        // They used to give three different answers — see `grid_label`.
+        // exp -2 in 4/4 is the quarter note: bar, half, quarter.
+        assert_eq!(g.value.as_deref(), Some("quarter note"));
+        assert_eq!(grid_label(-2, 4, 4), "\u{266a}");
+        assert!((grid_quarters(-2, 4, 4) - 1.0).abs() < 1e-9);
+        // 6/8 cannot halve its bar twice without landing between beats, so
+        // the second rung is the beat itself: an eighth.
+        assert_eq!(grid_label(-2, 6, 8), "1/8");
+        assert!((grid_quarters(-2, 6, 8) - 0.5).abs() < 1e-9);
         let t = g.travel.expect("the grid box cannot be nudged");
         assert!((t.norm - 3.0 / 8.0).abs() < 1e-6, "{}", t.norm);
         // Both ends are reachable, and neither runs off the rails.
@@ -5736,6 +6029,7 @@ selected: false,
                     points: &pts,
                     hot: Some(3),
                     chosen: Vec::new(),
+                    moving: None,
                 }];
                 let r = Rect::from_min_size(Pos2::ZERO, size);
                 // Painting is the assertion: a NaN or an inverted rect
@@ -5782,6 +6076,7 @@ selected: false,
             points: &pts,
             hot: None,
             chosen: Vec::new(),
+            moving: None,
         }];
         let l = Layout::new(rect(), &v);
         let row = l
@@ -5825,6 +6120,7 @@ selected: false,
             points: &pts,
             hot: None,
             chosen: Vec::new(),
+            moving: None,
         }];
         let l = Layout::new(rect(), &v);
         let row = l
@@ -5880,6 +6176,7 @@ selected: false,
             points: &pts,
             hot: None,
             chosen: Vec::new(),
+            moving: None,
         }];
         let l = Layout::new(rect(), &v);
         let row = l
@@ -6018,6 +6315,7 @@ selected: false,
             points: &[],
             hot: None,
             chosen: Vec::new(),
+            moving: None,
         }];
         let l = Layout::new(rect(), &v);
 
@@ -6147,6 +6445,7 @@ selected: false,
                     points: &[],
                     hot: None,
                     chosen: Vec::new(),
+                    moving: None,
                 })
                 .collect()
         };
@@ -6225,6 +6524,7 @@ selected: false,
             points: &[],
             hot: None,
             chosen: Vec::new(),
+            moving: None,
         }];
         let mut v = a_view(&c);
         v.lanes[0].automation = rows;
@@ -6414,13 +6714,15 @@ selected: false,
         assert_eq!(hit_test(r, &v, row.send.center()), Some(Hit::Send(0)));
         assert!(row.knob_readout.is_positive(), "the volume lost its readout");
         assert!(row.send_readout.is_positive(), "the send lost its readout");
-        // The box counts BEATS: 0 is a bar, -1 a beat (the note glyph), and
-        // the rest are fractions of one. See `grid_quarters`.
-        assert_eq!(grid_label(0), "1");
-        assert_eq!(grid_label(3), "8");
-        assert_eq!(grid_label(-1), "\u{266a}");
-        assert_eq!(grid_label(-4), "1/8");
-        assert_eq!(grid_label(-5), "1/16");
+        // **The ladder the owner asked for, in the meter he works in.**
+        // Going finer: 1, 1/2, the glyph, 1/8, 1/16 — one 1/4 state, and it
+        // is the glyph, sitting exactly between 1/8 and 1/2.
+        assert_eq!(grid_label(0, 4, 4), "1");
+        assert_eq!(grid_label(3, 4, 4), "8");
+        assert_eq!(grid_label(-1, 4, 4), "1/2");
+        assert_eq!(grid_label(-2, 4, 4), "\u{266a}");
+        assert_eq!(grid_label(-3, 4, 4), "1/8");
+        assert_eq!(grid_label(-4, 4, 4), "1/16");
     }
 
     /// It survives a rect far too small to be useful, and clips off-window

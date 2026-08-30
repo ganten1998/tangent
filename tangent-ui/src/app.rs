@@ -8029,7 +8029,7 @@ impl IvoryApp {
 
     /// The grid in seconds — the gridbox's bars-as-a-power-of-two.
     fn arr_grid_s(&self) -> f64 {
-        let exp = self.settings.arr_grid_exp.clamp(-5, 3) as i32;
+        let exp = self.settings.arr_grid_exp.clamp(-6, 3) as i32;
         self.arr_bar_s() * 2.0f64.powi(exp)
     }
 
@@ -11424,7 +11424,7 @@ impl IvoryApp {
             top_key: st.top_key,
             keys_shown: self.midi_keys_visible(),
             snap_on: self.settings.midi_snap,
-            grid_exp: self.settings.midi_grid_exp.clamp(-6, 3) as i8,
+            grid_exp: self.settings.midi_grid_exp.clamp(-7, 3) as i8,
             swing: self.settings.midi_swing,
             swing_pct: self.settings.midi_swing_pct.clamp(50.0, 95.0) / 100.0,
             triplet: self.settings.midi_triplet,
@@ -13268,7 +13268,7 @@ impl IvoryApp {
                 if over_grid || (cmd && alt) {
                     if step != 0 {
                         self.settings.midi_grid_exp =
-                            (self.settings.midi_grid_exp + i64::from(step)).clamp(-6, 3);
+                            (self.settings.midi_grid_exp + i64::from(step)).clamp(-7, 3);
                         self.save_settings();
                     }
                 } else if alt {
@@ -13429,7 +13429,7 @@ impl IvoryApp {
                     // click still changes nothing.
                     Some(H::ToolGrid) if secondary => {
                         self.settings.midi_grid_exp =
-                            (self.settings.midi_grid_exp + 1).clamp(-6, 3);
+                            (self.settings.midi_grid_exp + 1).clamp(-7, 3);
                         self.save_settings();
                     }
                     Some(H::ToolGrid) if pressed => {
@@ -13704,7 +13704,7 @@ impl IvoryApp {
                 MeDrag::ResizeLeft { i, orig } => self.me_resize_note_left(i, &orig, t_at),
                 MeDrag::GridStep { from_y, start } => {
                     let steps = f64::from((from_y - p.y) / 14.0).round() as i64;
-                    let to = (start - steps).clamp(-6, 3);
+                    let to = (start - steps).clamp(-7, 3);
                     if to != self.settings.midi_grid_exp {
                         self.settings.midi_grid_exp = to;
                         self.save_settings_soon();
@@ -13879,7 +13879,7 @@ impl IvoryApp {
                 let unmoved = self.settings.midi_grid_exp == start
                     && pointer.is_some_and(|p| (p.y - from_y).abs() < 4.0);
                 if unmoved {
-                    self.settings.midi_grid_exp = (start - 1).clamp(-6, 3);
+                    self.settings.midi_grid_exp = (start - 1).clamp(-7, 3);
                     self.save_settings_soon();
                 }
             }
@@ -14217,7 +14217,7 @@ impl IvoryApp {
                 };
                 if on_gridbox {
                     self.settings.arr_grid_exp =
-                        (self.settings.arr_grid_exp + 1).clamp(-5, 3);
+                        (self.settings.arr_grid_exp + 1).clamp(-6, 3);
                     self.save_settings();
                     return;
                 }
@@ -14456,7 +14456,7 @@ impl IvoryApp {
                     };
                     if step != 0 {
                         self.settings.arr_grid_exp =
-                            (self.settings.arr_grid_exp + step).clamp(-5, 3);
+                            (self.settings.arr_grid_exp + step).clamp(-6, 3);
                         self.save_settings();
                     }
                 } else if alt {
@@ -15111,7 +15111,7 @@ impl IvoryApp {
                 }
                 ArrDrag::GridStep { from_y, start } => {
                     let steps = f64::from((from_y - p.y) / 14.0).round() as i64;
-                    let to = (start - steps).clamp(-5, 3);
+                    let to = (start - steps).clamp(-6, 3);
                     if to != self.settings.arr_grid_exp {
                         self.settings.arr_grid_exp = to;
                         self.save_settings_soon();
@@ -15438,7 +15438,7 @@ impl IvoryApp {
                 let unmoved = self.settings.arr_grid_exp == start
                     && pointer.is_some_and(|p| (p.y - from_y).abs() < 4.0);
                 if unmoved {
-                    self.settings.arr_grid_exp = (start - 1).clamp(-5, 3);
+                    self.settings.arr_grid_exp = (start - 1).clamp(-6, 3);
                     self.save_settings_soon();
                 }
             }
@@ -15836,6 +15836,15 @@ impl IvoryApp {
                                 .filter(|(l, s, _)| *l == n && *s == slot)
                                 .map(|(_, _, i)| *i)
                                 .collect(),
+                            // The DRAG, not the hover — see `AutoView::moving`.
+                            moving: match self.arr_drag {
+                                Some(ArrDrag::AutoPoint(l, s, i))
+                                    if l == n && s == slot =>
+                                {
+                                    Some(i)
+                                }
+                                _ => None,
+                            },
                         })
                         .collect(),
                     route_count: self.settings.routes.from(n).len(),
@@ -17546,7 +17555,7 @@ impl IvoryApp {
             A::ToolGrid => {
                 if let Some(w) = want {
                     let exp = i64::from((w * 8.0).round() as i8) - 5;
-                    self.settings.arr_grid_exp = exp.clamp(-5, 3);
+                    self.settings.arr_grid_exp = exp.clamp(-6, 3);
                     self.save_settings();
                 }
             }
@@ -24564,12 +24573,15 @@ mod tests {
         app.me_select_all();
         assert_eq!(app.midi_edit.as_ref().unwrap().selected, vec![0, 1, 2]);
 
-        // Quantise: default grid 1/16 of a 2 s bar = 0.125 s.
+        // Quantise onto a NAMED grid: -4 is a sixteenth note in 4/4, 0.125 s
+        // at 120 bpm. Named rather than inherited for the reason
+        // `the_midi_editor_edits_the_document` gives.
+        app.settings.midi_grid_exp = -4;
         app.me_quantise();
         let ats: Vec<f64> = app.arrangement.clips[0].notes.iter().map(|n| n.at_s).collect();
         assert!((ats[0] - 0.0).abs() < 1e-9, "{ats:?}");
         assert!((ats[1] - 1.0).abs() < 1e-9);
-        assert!((ats[2] - 2.125).abs() < 1e-9);
+        assert!((ats[2] - 2.125).abs() < 1e-9, "{ats:?}");
 
         // Duplicate: three copies one step later, now the selection.
         app.me_duplicate();
@@ -24983,12 +24995,19 @@ mod tests {
         app.open_midi_editor(id);
         assert!(app.midi_edit.is_some(), "the editor did not open");
 
-        // A quarter of a beat = 0.125 s at 120 bpm. A press at 10.13
-        // lands on 10.125, one step long, velocity a round hundred.
+        // **The grid is SET here, not inherited.** This asserts exact
+        // times, so it has to name the division it is asserting about
+        // rather than ride on whatever the default happens to be — which
+        // is how it came to depend on one and break when the ladder in
+        // `grid_quarters` gained its missing half-note rung.
+        //
+        // -4 is a sixteenth note in 4/4: 0.125 s at 120 bpm. A press at
+        // 10.13 lands on 10.125, one step long, velocity a round hundred.
+        app.settings.midi_grid_exp = -4;
         app.me_create_note(10.13, 64);
         let note = app.arrangement.clips[0].notes[0].clone();
         assert!((note.at_s - 2.125).abs() < 1e-9, "created at {}", note.at_s);
-        assert!((note.dur_s - 0.125).abs() < 1e-9);
+        assert!((note.dur_s - 0.125).abs() < 1e-9, "one step long: {}", note.dur_s);
         assert_eq!((note.key, note.vel), (64, 100));
         assert_eq!(app.midi_edit.as_ref().unwrap().selected, vec![0]);
         assert!(app.midi_edit.as_ref().unwrap().dirty);
@@ -25165,8 +25184,10 @@ mod tests {
             vel: 100,
         }];
 
-        // The playhead BETWEEN two lines — 2.05 s, with lines every 0.125.
-        // Flooring put this at 2.0, which is behind the hand.
+        // -4 is a sixteenth note in 4/4: lines every 0.125 s at 120 bpm.
+        // The playhead BETWEEN two of them — 2.05 s. Flooring put this at
+        // 2.0, which is behind the hand.
+        app.settings.midi_grid_exp = -4;
         app.recorder.position_s = 2.05;
         app.me_paste();
         let at = app.arrangement.clips[0].notes[0].at_s;
