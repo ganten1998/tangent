@@ -583,6 +583,21 @@ impl From<tangent_ui::recorder::Strip> for Strip {
 /// soloed strips are heard — including a soloed strip that is also muted,
 /// because pressing solo on a muted channel is unambiguously a request to hear
 /// it and the alternative is a solo button that sometimes does nothing.
+/// Permute the first `order.len()` rows of a per-seat table: `order[new] =
+/// old`. Rows past the permutation — the buses, the master, the pads — keep
+/// their seats, because nothing about a channel reorder moves them.
+fn permute_rows<T: Default>(rows: &mut [T], order: &[usize]) {
+    let n = order.len().min(rows.len());
+    let mut held: Vec<T> = Vec::with_capacity(n);
+    for new in 0..n {
+        let old = order[new].min(rows.len().saturating_sub(1));
+        held.push(std::mem::take(&mut rows[old]));
+    }
+    for (new, v) in held.into_iter().enumerate() {
+        rows[new] = v;
+    }
+}
+
 fn strip_is_heard(strip: Strip, muted: u32, soloed: u32) -> bool {
     // Soloed by name: heard, whatever its own mute says. Pressing solo on a
     // muted channel is unambiguously a request to hear it, and the
@@ -7673,35 +7688,60 @@ impl Engine {
     /// it were seated. The desk then named a plugin that existed nowhere, and
     /// the auto-open built a view on a terminated controller.
     #[must_use]
-    fn hand_off_insert(&mut self, strip: usize, slot: usize, next: PluginBox) -> Option<PluginBox> {
+    /// **Put `next` in the seat and hand back what it displaced.**
+    ///
+    /// `Err(next)` when the ring refused — the callback has stalled and the
+    /// caller still owns the box it offered. `Ok(None)` when the seat gave
+    /// nothing back in time, which is not the same as "the seat was empty":
+    /// the old box is then sitting in the ring and the seat has to be
+    /// rebuilt from scratch rather than trusted.
+    ///
+    /// This exists so a REORDER can move a plugin instead of rebuilding it.
+    /// Dropping the displaced box — which is all `hand_off_insert` ever
+    /// wanted — is one caller of it, not the shape of the primitive.
+    fn hand_off_exchange(
+        &mut self,
+        strip: usize,
+        slot: usize,
+        next: PluginBox,
+    ) -> Result<Option<PluginBox>, PluginBox> {
         let Some(pair) = self
             .insert_handoff
             .get_mut(strip)
             .and_then(|r| r.get_mut(slot))
         else {
-            return Some(next);
+            return Err(next);
         };
         while pair.from_audio.pop().is_ok() {}
-        // **Counted BEFORE the push**, or the callback could take the box
-        // between the push and the count and drain a counter that had not
-        // been raised yet. Put back below if the push is refused.
+        // Counted BEFORE the push, for the reason `hand_off_insert` gives.
         self.shared.pending_swaps.fetch_add(1, Ordering::Release);
         if let Err(rtrb::PushError::Full(refused)) = pair.to_audio.push(next) {
             self.shared.pending_swaps.fetch_sub(1, Ordering::Release);
-            // The seat's two-deep ring already holds two undelivered boxes,
-            // which means the callback has stalled. Handing the box back is
-            // what lets the caller refuse honestly.
-            return Some(refused);
+            return Err(refused);
         }
         let deadline = Instant::now() + RETIRE_TIMEOUT;
         while Instant::now() < deadline {
             if let Ok(old) = pair.from_audio.pop() {
-                drop(old);
-                break;
+                return Ok(Some(old));
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        None
+        Ok(None)
+    }
+
+    fn hand_off_insert(&mut self, strip: usize, slot: usize, next: PluginBox) -> Option<PluginBox> {
+        // The displaced plugin is DROPPED here, on this thread — never on
+        // the callback, which is the whole reason the box comes back at all.
+        // The seat's two-deep ring being full means the callback has
+        // stalled; handing the box back is what lets the caller refuse
+        // honestly.
+        match self.hand_off_exchange(strip, slot, next) {
+            Ok(old) => {
+                drop(old);
+                None
+            }
+            Err(refused) => Some(refused),
+        }
     }
 
     // ── the plugins' own editors ────────────────────────────────────────────
@@ -7889,6 +7929,111 @@ impl Engine {
     /// model can only produce such an arrangement — membership is the
     /// nearest folder ABOVE — so a violation here is a bug on the way in,
     /// and taking none of it beats taking half.
+    /// **Move a reorder's plugins instead of rebuilding them.**
+    ///
+    /// A track that moves takes its plugins with it. The instance at the old
+    /// seat and the instance the new seat wants are the SAME instance, with
+    /// the same state already in it — so tearing it down and building
+    /// another from the bundle is pure waste, and it is expensive waste: a
+    /// sampler costs a second or more to instantiate and restore, the
+    /// reconcile does one bay per frame, and a folder is inserted ABOVE its
+    /// children so nearly every row moves. The owner, twice: "any and every
+    /// operation regarding dragging children in and out produces spinning
+    /// wheel for 2-5 seconds", then "still 5-10 seconds lag".
+    ///
+    /// Two passes, and the order matters. Everything that moves is taken out
+    /// FIRST, so every moving seat is empty before anything is put back and
+    /// a cycle — two tracks swapping — cannot overwrite one of its own
+    /// members. Nothing that stays is touched at all.
+    ///
+    /// Returns the seats it could NOT move, for the caller to rebuild the
+    /// slow way. A seat is unmovable when the callback has stalled or does
+    /// not hand the box back in time; that is rare, and answering honestly
+    /// beats a silent hole where a plugin used to be.
+    #[must_use]
+    pub fn permute_channel_inserts(&mut self, order: &[usize]) -> Vec<usize> {
+        let mut failed = Vec::new();
+        let mut taken: Vec<(usize, usize, PluginBox)> = Vec::new();
+        // ── take everything that moves ───────────────────────────────────
+        for (new, old) in order.iter().enumerate() {
+            if new == *old || new >= CHANNELS || *old >= CHANNELS {
+                continue;
+            }
+            for bay in 0..INSERTS {
+                // An empty seat has nothing to carry, and asking costs a
+                // round trip through the audio thread.
+                if self
+                    .inserts_loaded
+                    .get(*old)
+                    .and_then(|r| r.get(bay))
+                    .is_none_or(Option::is_none)
+                {
+                    continue;
+                }
+                match self.hand_off_exchange(*old, bay, PluginBox(None)) {
+                    Ok(Some(b)) => taken.push((new, bay, b)),
+                    // Nothing came back, or the ring refused. Either way this
+                    // seat is not carried; the caller rebuilds it.
+                    Ok(None) | Err(_) => failed.push(new),
+                }
+            }
+        }
+        // ── and put it where it now belongs ──────────────────────────────
+        for (new, bay, b) in taken {
+            if let Some(back) = self.hand_off_insert(new, bay, b) {
+                // The destination refused. The plugin is dropped with
+                // `back`, and the seat is named so it is rebuilt.
+                drop(back);
+                failed.push(new);
+            }
+        }
+        // ── everything else keyed to a seat travels with it ──────────────
+        //
+        // The box is only half of what a seat owns. Its latency lives in a
+        // shared per-seat cell the delay compensation reads, and the host
+        // keeps the editor window, the state handle and the loaded name
+        // beside it. A box that moved without them would play through the
+        // wrong compensation and answer to another track's window.
+        let pick = |order: &[usize], n: usize| order.get(n).copied().unwrap_or(n);
+        let lat: Vec<u32> = (0..CHANNELS * INSERTS)
+            .map(|i| {
+                let (seat, bay) = (i / INSERTS, i % INSERTS);
+                self.shared
+                    .seat_latency
+                    .get(pick(order, seat) * INSERTS + bay)
+                    .map_or(0, |c| c.load(Ordering::Relaxed))
+            })
+            .collect();
+        for (i, v) in lat.into_iter().enumerate() {
+            if let Some(c) = self.shared.seat_latency.get(i) {
+                c.store(v, Ordering::Relaxed);
+            }
+        }
+        permute_rows(&mut self.inserts_loaded, order);
+        permute_rows(&mut self.insert_editors, order);
+        permute_rows(&mut self.insert_state_handles, order);
+        permute_rows(&mut self.insert_latency_handles, order);
+        permute_rows(&mut self.insert_state_errors, order);
+        failed.sort_unstable();
+        failed.dedup();
+        failed
+    }
+
+    #[cfg(test)]
+    fn set_seat_latency_for_test(&self, seat: usize, bay: usize, v: u32) {
+        if let Some(c) = self.shared.seat_latency.get(seat * INSERTS + bay) {
+            c.store(v, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(test)]
+    fn seat_latency_for_test(&self, seat: usize, bay: usize) -> u32 {
+        self.shared
+            .seat_latency
+            .get(seat * INSERTS + bay)
+            .map_or(0, |c| c.load(Ordering::Relaxed))
+    }
+
     pub fn set_folders(&self, parents: [i32; CHANNELS]) -> bool {
         for (ch, p) in parents.iter().enumerate() {
             if *p >= 0 && (*p as usize) >= ch {
@@ -11815,6 +11960,40 @@ mod tests {
     /// Every parent must be a lower index than its child. That is what the
     /// settings model produces and what the single descending fold needs;
     /// taking half of a bad one would build a routing graph nobody drew.
+    /// **A reorder carries a seat's record across rather than rebuilding
+    /// it**, which is what stops a folder drag rebuilding the session.
+    ///
+    /// The instances themselves need a live audio callback to move — the
+    /// exchange is a round trip through it — so what an offline engine can
+    /// pin is the bookkeeping every carried plugin depends on: the loaded
+    /// names, the handles and the per-seat latency all land on the new seat.
+    /// A box that moved without them would play through another track's
+    /// delay compensation.
+    #[test]
+    fn a_permutation_carries_a_seats_record_to_its_new_index() {
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        // Latency is the one piece that lives in shared memory rather than
+        // beside the box, so it is the one most easily left behind.
+        e.set_seat_latency_for_test(2, 0, 128);
+        e.set_seat_latency_for_test(5, 1, 64);
+        // Move channel 2 to 3 and 5 to 2, everything else where it was.
+        let mut order: Vec<usize> = (0..CHANNELS).collect();
+        order[3] = 2;
+        order[2] = 5;
+        order[5] = 3;
+        let stranded = e.permute_channel_inserts(&order);
+        // Nothing was loaded, so nothing could fail to move.
+        assert!(stranded.is_empty(), "empty seats were stranded: {stranded:?}");
+        assert_eq!(e.seat_latency_for_test(3, 0), 128, "seat 2's latency did not follow");
+        assert_eq!(e.seat_latency_for_test(2, 1), 64, "seat 5's latency did not follow");
+        assert_eq!(e.seat_latency_for_test(2, 0), 0, "a stale figure was left behind");
+
+        // The identity permutation moves nothing and strands nothing.
+        let same: Vec<usize> = (0..CHANNELS).collect();
+        assert!(e.permute_channel_inserts(&same).is_empty());
+        assert_eq!(e.seat_latency_for_test(3, 0), 128, "identity disturbed a seat");
+    }
+
     #[test]
     fn a_parent_that_is_not_above_its_child_is_refused() {
         let e = Engine::offline(48_000, Timebase::new()).expect("offline");
