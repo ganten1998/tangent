@@ -2384,13 +2384,14 @@ pub fn a11y_nodes(rect: Rect, view: &ArrangeView<'_>) -> Vec<crate::a11y::Node> 
                 id,
                 r,
                 "Arm this automation lane to write",
-                view.lanes.get(i).and_then(|l| l.automation.get(slot)).is_some_and(|a| a.armed),
+                auto_view_of(view, i, slot).is_some_and(|a| a.armed),
             ),
             Hit::AutoBypass(i, slot) => Node::toggle(
                 id,
                 r,
-                "Bypass this automation lane",
-                view.lanes.get(i).and_then(|l| l.automation.get(slot)).is_some_and(|a| a.bypassed),
+                // The word a reader hears matches the letter on screen.
+                "Mute this automation lane",
+                auto_view_of(view, i, slot).is_some_and(|a| a.bypassed),
             ),
             Hit::AutoDial(i, slot) => Node::button(
                 id,
@@ -3132,9 +3133,11 @@ fn draw_auto_headers(
                 }
                 painter.circle_stroke(c, rad, Stroke::new(1.0, quiet(ink, face, 0.30)));
             }
-            // **B** — bypass, lettered like M and S because it is the same
-            // kind of per-lane switch about signal. Lit in the mute colour:
-            // a bypassed curve and a muted track are the same statement.
+            // **M** — the row's mute. It said B for bypass, which is the
+            // same switch under a name only this app used: what it does is
+            // stop the curve reaching the control, and on a strip that is
+            // what M has always meant. The owner asked for the letter people
+            // already know. Lit in the mute colour, as M is everywhere else.
             if h.bypass.is_positive() {
                 let on = auto.bypassed;
                 let plate = if on { p.mute } else { p.hdr_lane };
@@ -3144,7 +3147,7 @@ fn draw_auto_headers(
                     painter.text(
                         h.bypass.center(),
                         Align2::CENTER_CENTER,
-                        "B",
+                        "M",
                         FontId::new(size, crate::fonts::courier_bold()),
                         if on { on_ink(plate) } else { quiet(on_ink(plate), plate, 0.18) },
                     );
@@ -3155,7 +3158,7 @@ fn draw_auto_headers(
             let room = h.name.width() - 4.0;
             if h.name.is_positive() && size >= 7.0 && room > 20.0 {
                 let font = FontId::new(size, crate::fonts::courier());
-                // **A bypassed lane says so in its name too.** The B is
+                // **A muted lane says so in its name too.** The letter is
                 // eleven points wide and the name is the thing being read.
                 let word_ink = if auto.bypassed {
                     quiet(ink, face, 0.45)

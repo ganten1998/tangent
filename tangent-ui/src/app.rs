@@ -7478,6 +7478,79 @@ impl IvoryApp {
             }
         }
 
+        // ── everything else keyed by CHANNEL ─────────────────────────────
+        //
+        // These three arrived with the drum lanes and the automation rows,
+        // and none of them was here: a reorder moved the tracks and left
+        // them behind, so a track that moved played ANOTHER lane's kit and
+        // answered another lane's curves. Folder drags reorder constantly,
+        // which is why it showed up there first — the owner: "if a track
+        // becomes a child, then are removed from the folder, 1/2 n=2 of them
+        // have audio permanently degrade drastically. Add it back? Totally
+        // fine again as long as it's in the folder once more." Moving it
+        // twice can land the kit back under its track, which is exactly what
+        // "fine again" was.
+        //
+        // **The KITS.** A drum instrument loads a full instance per channel
+        // and its samples live in a per-channel document; leaving them
+        // behind is a drum track playing whatever the seat it landed on
+        // happened to hold.
+        {
+            let mut kits: Vec<crate::drumpad::DrumpadDoc> =
+                Vec::with_capacity(self.drumpad_kits.len());
+            for n in 0..CHANNELS {
+                kits.push(
+                    self.drumpad_kits
+                        .get(order[n])
+                        .cloned()
+                        .unwrap_or_default(),
+                );
+            }
+            for (n, k) in kits.into_iter().enumerate() {
+                if let Some(slot) = self.drumpad_kits.get_mut(n) {
+                    *slot = k;
+                }
+            }
+            self.drumpad_lane = inv
+                .get(self.drumpad_lane)
+                .copied()
+                .unwrap_or(self.drumpad_lane);
+            self.drumpad_dirty = true;
+        }
+        // **The CURVES.** They are keyed by lane, so without this a track's
+        // volume automation stays on the seat and starts driving whichever
+        // track moved into it.
+        {
+            let moved: Vec<crate::automation::Curve> = self
+                .arrangement
+                .automation
+                .curves()
+                .iter()
+                .map(|c| {
+                    let lane = if c.lane < CHANNELS { inv[c.lane] } else { c.lane };
+                    crate::automation::Curve::sanitised(lane, c.param, c.points().to_vec())
+                })
+                .collect();
+            self.arrangement.automation =
+                crate::automation::Automation::from_curves(moved);
+        }
+        // **And which rows are OPEN, armed or bypassed**, for the same
+        // reason: they are `(lane, param)` and the lane just changed.
+        let remap = |set: &std::collections::HashSet<(usize, crate::automation::AutoParam)>,
+                     inv: &[usize; CHANNELS]| {
+            set.iter()
+                .map(|(l, p)| (if *l < CHANNELS { inv[*l] } else { *l }, *p))
+                .collect::<std::collections::HashSet<_>>()
+        };
+        self.arr_auto_open = remap(&self.arr_auto_open, &inv);
+        self.arr_auto_armed = remap(&self.arr_auto_armed, &inv);
+        self.arr_auto_bypassed = remap(&self.arr_auto_bypassed, &inv);
+        // The node selection names rows that have just moved. Cleared rather
+        // than remapped: it is a hand's selection, and a reorder is the hand
+        // doing something else.
+        self.arr_auto_nodes.clear();
+        self.arr_auto_sel = None;
+
         self.desk_state_perm = Some(order.to_vec());
         self.save_settings();
         self.arr_save_edits();
@@ -9423,6 +9496,36 @@ impl IvoryApp {
         t: f64,
     ) {
         let reach = (self.arr_window_now().1 * 0.01).max(0.01);
+        // **The BASE node does not come out.**
+        //
+        // A lane opens with one node at the start, and that node is the
+        // lane's level: it is what the row's dial reads and writes, and
+        // `value_at` holds it back to the left edge. Deleting it would leave
+        // a curve resting at a number different from the one its own dial is
+        // showing. The owner: "tied directly to the base level, represented
+        // by the first node, which is NOT SUPPOSED TO BE DELETABLE."
+        //
+        // Here rather than in `Curve::remove_near`, because that is the
+        // mechanism a DRAG also uses to move a point — take it out, put it
+        // back — and guarding it there made the first node immovable and
+        // left a trail behind every drag.
+        // The base is the node AT THE START — which is where opening a lane
+        // puts it, and the only place it can be. Not merely "the first
+        // point": a curve whose earliest drawn node happens to be at bar
+        // forty has no base, and refusing to delete that node would make the
+        // last of somebody's drawn points permanent for no reason.
+        let base_at = self
+            .arrangement
+            .automation
+            .get(lane, param)
+            .and_then(|c| c.points().first())
+            .map(|p| p.at_s)
+            .filter(|at| at.abs() <= 1.0e-9);
+        if base_at.is_some_and(|b| (b - t).abs() <= reach) {
+            // Refused, and silently: an alt-click on the base is a hand
+            // asking for something the lane does not offer, not an error.
+            return;
+        }
         if self
             .arrangement
             .automation
@@ -14627,6 +14730,22 @@ impl IvoryApp {
                         }
                     }
                     Some(A::HdrName(n)) => {
+                        // **A MODIFIED click is never a rename.** Shift and
+                        // the platform key are the two selection modifiers,
+                        // and a track's name is the largest, most obvious
+                        // thing to aim at in its header — so shift-clicking
+                        // it is somebody building a selection, every time.
+                        // It opened the rename box instead and swallowed the
+                        // press, which is why only the free space beside the
+                        // name appeared to work: the owner's "click on the
+                        // name label and it doesn't select. Only the other
+                        // free space."
+                        let mods = ctx.input(|i| i.modifiers);
+                        if mods.shift || mods.command || mods.ctrl {
+                            self.select_track(n, mods);
+                            self.arr_drag = None;
+                            return;
+                        }
                         // **Only a track has a name to type into.** An empty
                         // slot's row answers `HdrName` now — that is what
                         // makes it selectable and a paste destination — so a
@@ -14721,7 +14840,7 @@ impl IvoryApp {
                                 lane: n,
                                 param,
                                 from_y: p.y,
-                                from: self.auto_resting(n, param),
+                                from: self.auto_base(n, param),
                             });
                         }
                     }
@@ -15318,6 +15437,12 @@ impl IvoryApp {
                     let fine = if shift { recorder_panel::FINE_DRAG } else { 1.0 };
                     let v = (from + f64::from(from_y - p.y) / 420.0 * f64::from(fine))
                         .clamp(0.0, 1.0);
+                    // **The dial MOVES THE BASE NODE**, not just the live
+                    // control. It reads that node — see `auto_base` — so
+                    // writing anywhere else would leave the two disagreeing
+                    // the moment the hand let go, and the lane would snap
+                    // back to a level nobody set.
+                    self.auto_set_base(lane, param, v);
                     self.auto_set_control(lane, param, v);
                     self.arr_drag = Some(ArrDrag::AutoDial {
                         lane,
@@ -15971,7 +16096,7 @@ impl IvoryApp {
                     label: self.auto_param_label(crate::arrangement_panel::MASTER_LANE, param),
                     selected: self.arr_auto_sel
                         == Some((crate::arrangement_panel::MASTER_LANE, slot)),
-                    resting: self.auto_resting(crate::arrangement_panel::MASTER_LANE, param),
+                    resting: self.auto_base(crate::arrangement_panel::MASTER_LANE, param),
                     armed: self
                         .arr_auto_armed
                         .contains(&(crate::arrangement_panel::MASTER_LANE, param)),
@@ -16016,7 +16141,13 @@ impl IvoryApp {
                             param,
                             label: self.auto_param_label(n, param),
                             selected: self.arr_auto_sel == Some((n, slot)),
-                            resting: self.auto_resting(n, param),
+                            // **The dial reads the lane's BASE LEVEL** —
+                            // its first node — and only falls back to where
+                            // the control is standing when the lane has no
+                            // node at all. A dial showing the live control
+                            // while the curve drove something else was a
+                            // dial that disagreed with its own lane.
+                            resting: self.auto_base(n, param),
                             armed: self.arr_auto_armed.contains(&(n, param)),
                             bypassed: self.arr_auto_bypassed.contains(&(n, param)),
                             points: self
@@ -16408,6 +16539,42 @@ impl IvoryApp {
     /// default, which is where the knob rests until somebody moves it; there
     /// is no way to read a live parameter back from here, and guessing a
     /// middle would draw a line the plugin is not on.
+    /// **A lane's base level: its first node, or the control if it has none.**
+    ///
+    /// The row's dial shows and sets this. The first node is what the curve
+    /// holds before anything else happens — `value_at` is flat back to the
+    /// left edge — so it IS the lane's resting level, and a dial that showed
+    /// the live control instead would disagree with the lane it sits on the
+    /// moment the curve moved. See `Curve::remove_near`, which refuses to
+    /// delete it for the same reason.
+    fn auto_base(&self, lane: usize, param: crate::automation::AutoParam) -> f64 {
+        self.arrangement
+            .automation
+            .get(lane, param)
+            .and_then(|c| c.points().first())
+            .map_or_else(|| self.auto_resting(lane, param), |p| p.value)
+    }
+
+    /// Move a lane's base node to `v`, if it has one.
+    ///
+    /// Only the first: everything after it is a shape somebody drew, and a
+    /// dial that dragged the whole curve with it would be a dial that
+    /// silently flattens an evening's work.
+    fn auto_set_base(&mut self, lane: usize, param: crate::automation::AutoParam, v: f64) {
+        let at = self
+            .arrangement
+            .automation
+            .get(lane, param)
+            .and_then(|c| c.points().first())
+            .map(|p| (p.at_s, p.shape));
+        let Some((at_s, shape)) = at else {
+            return;
+        };
+        self.arrangement.automation.entry(lane, param).put(
+            crate::automation::Point { at_s, value: v.clamp(0.0, 1.0), shape },
+        );
+    }
+
     fn auto_resting(&self, lane: usize, param: crate::automation::AutoParam) -> f64 {
         use crate::automation::AutoParam;
         // **The master reads its own controls**, not `channel_gains[16]`,
@@ -34043,6 +34210,120 @@ mod folder_tests {
     /// no way to attach below the last child. The owner: "tracks that sit in
     /// folders must inherit this bottom drag area as more folders need to be
     /// added."
+    /// **A reorder carries everything keyed by CHANNEL**, not just the
+    /// settings arrays.
+    ///
+    /// Three things arrived with the drum lanes and the automation rows and
+    /// none of them was in the permutation, so a track that moved played
+    /// ANOTHER lane's kit and answered another lane's curves. Folder drags
+    /// reorder constantly, which is where the owner met it: "if a track
+    /// becomes a child, then are removed from the folder ... have audio
+    /// permanently degrade drastically. Add it back? Totally fine again."
+    /// Moving it twice can land the kit back under its track, which is what
+    /// "fine again" was — the bug hiding itself.
+    /// **The base node is the lane's level, and it cannot be deleted.**
+    ///
+    /// A lane opens with one node at the start; that node is what the row's
+    /// dial reads and writes, and `value_at` is flat back to the left edge
+    /// from it — so it IS the resting level. Deleting it would leave a curve
+    /// whose level before its first point is a different number from the one
+    /// the dial is showing. The owner: "tied directly to the base level,
+    /// represented by the first node, which is NOT SUPPOSED TO BE DELETABLE."
+    #[test]
+    fn the_base_node_is_the_dials_value_and_survives_a_delete() {
+        use crate::automation::{AutoParam, Point, Shape};
+        let mut a = app();
+        a.arr_toggle_automation_param(0, AutoParam::Gain);
+        let count = |a: &IvoryApp| {
+            a.arrangement.automation.get(0, AutoParam::Gain).map_or(0, |c| c.points().len())
+        };
+        assert_eq!(count(&a), 1, "the lane did not open with its base node");
+
+        // The dial reads it, not the live fader.
+        a.arrangement.automation.entry(0, AutoParam::Gain).put(Point {
+            at_s: 0.0,
+            value: 0.2,
+            shape: Shape::Linear,
+        });
+        assert!((a.auto_base(0, AutoParam::Gain) - 0.2).abs() < 1e-9);
+
+        // And the dial WRITES it, so the two cannot disagree.
+        a.auto_set_base(0, AutoParam::Gain, 0.8);
+        assert!((a.auto_base(0, AutoParam::Gain) - 0.8).abs() < 1e-9);
+        assert_eq!(count(&a), 1, "moving the base made a second node");
+
+        // A drawn node on top, then alt-delete on the base: refused.
+        a.arrangement.automation.entry(0, AutoParam::Gain).put(Point {
+            at_s: 4.0,
+            value: 0.3,
+            shape: Shape::Linear,
+        });
+        assert_eq!(count(&a), 2);
+        a.arr_remove_auto_point(0, AutoParam::Gain, 0.0);
+        assert_eq!(count(&a), 2, "the base node was deleted");
+        assert!(
+            (a.auto_base(0, AutoParam::Gain) - 0.8).abs() < 1e-9,
+            "the base moved when a delete was refused"
+        );
+
+        // The one that was drawn still goes.
+        a.arr_remove_auto_point(0, AutoParam::Gain, 4.0);
+        assert_eq!(count(&a), 1, "a drawn node could not be removed");
+    }
+
+    #[test]
+    fn a_reorder_takes_the_kit_and_the_curves_with_the_track() {
+        use crate::automation::{AutoParam, Point, Shape};
+        let mut a = app();
+        for n in [1usize, 2, 3] {
+            a.add_bare_track(n);
+        }
+        // Channel 3 is the one with a kit and a curve on it.
+        a.drumpad_kits[3].pads[36] = crate::drumpad::PadSlot {
+            path: "media/kick.wav".to_owned(),
+            ..Default::default()
+        };
+        a.arr_toggle_automation_param(3, AutoParam::Gain);
+        a.arrangement.automation.entry(3, AutoParam::Gain).put(Point {
+            at_s: 4.0,
+            value: 0.2,
+            shape: Shape::Linear,
+        });
+        assert!(a.arr_auto_is_open(3, AutoParam::Gain));
+
+        // Move 3 up to 1: order[new] = old.
+        let mut order: Vec<usize> = (0..crate::recorder::CHANNELS).collect();
+        order.remove(3);
+        order.insert(1, 3);
+        a.reorder_channels(&order);
+
+        // The kit went with it, and did not stay behind.
+        assert_eq!(
+            a.drumpad_kits[1].pads[36].path, "media/kick.wav",
+            "the kit did not follow its track"
+        );
+        assert!(
+            a.drumpad_kits[3].pads[36].path.is_empty(),
+            "the kit was left behind as well as moved"
+        );
+        // So did the curve — with its points, not just its existence.
+        let moved = a
+            .arrangement
+            .automation
+            .get(1, AutoParam::Gain)
+            .expect("the curve did not follow its track");
+        assert_eq!(moved.points().len(), 2, "the curve lost its points on the way");
+        assert!(
+            a.arrangement.automation.get(3, AutoParam::Gain).is_none(),
+            "the curve is now driving whichever track moved into that seat"
+        );
+        // And the ROW is still open, on the track rather than the seat.
+        assert!(a.arr_auto_is_open(1, AutoParam::Gain), "the row did not follow");
+        assert!(!a.arr_auto_is_open(3, AutoParam::Gain), "the row stayed behind");
+        // Which the engine agrees with.
+        assert_eq!(a.folder_parents().len(), crate::recorder::CHANNELS);
+    }
+
     #[test]
     fn a_folders_bottom_strip_attaches_and_so_does_a_members() {
         let mut a = app();
