@@ -2147,11 +2147,22 @@ impl DesktopApp {
         // window-interaction bug gets reproduced and bisected from a script;
         // driving it by hand makes every measurement a different measurement.
         //   IVORY_OPEN_EDITOR=1 dist/Tangent.app/Contents/MacOS/tangent
-        if !self.recorder.dev_editor_done
-            && matches!(
-                std::env::var("IVORY_OPEN_EDITOR").as_deref(),
-                Ok("1") | Ok("patch")
-            )
+        //
+        // **`=<strip>,<bay>` names a different bay**, because bay 1 of channel
+        // 1 holds the built-in on a fresh desk and therefore opens the PATCH
+        // picker. The plugin picker is only ever reached through an EMPTY bay,
+        // so with the hook pinned to slot 0 there was no way to put it on
+        // screen from a script at all — which is the one thing the hook exists
+        // to make possible.
+        //   IVORY_OPEN_EDITOR=0,1 tangent      # channel 1, bay 2: empty
+        let dev_editor_bay = match std::env::var("IVORY_OPEN_EDITOR").as_deref() {
+            Ok("1") | Ok("patch") => Some((0, 0)),
+            Ok(v) => v.split_once(',').and_then(|(s, b)| {
+                Some((s.trim().parse().ok()?, b.trim().parse().ok()?))
+            }),
+            Err(_) => None,
+        };
+        if let (false, Some((dev_strip, dev_bay))) = (self.recorder.dev_editor_done, dev_editor_bay)
         {
             let due = self
                 .recorder
@@ -2163,7 +2174,7 @@ impl DesktopApp {
                 // so the hook opens whatever a CLICK would open — the built-in's
                 // patch picker as readily as a VST3's window. A hook that called
                 // the engine directly could only ever reproduce half the bugs.
-                self.app.open_insert_face(0, 0);
+                self.app.open_insert_face(dev_strip, dev_bay);
                 // `=patch` goes one further, to the patch EDITOR, which is
                 // otherwise two clicks in and cannot be reached from a script.
                 if std::env::var("IVORY_OPEN_EDITOR").as_deref() == Ok("patch") {
@@ -2172,7 +2183,11 @@ impl DesktopApp {
                             slot: 0,
                         });
                 }
-                eprintln!("IVORY_OPEN_EDITOR: opened slot 1");
+                eprintln!(
+                    "IVORY_OPEN_EDITOR: opened channel {} bay {}",
+                    dev_strip + 1,
+                    dev_bay + 1
+                );
             }
             ctx.request_repaint();
         }
