@@ -8624,6 +8624,14 @@ impl IvoryApp {
         // tiler re-tiles, the size changes, the settle fires, forever. That
         // is the violent shifting between a filled half-screen and the
         // layout's own aspect.
+        // **Free aspect while this is off**: no correction at all, so a
+        // dragged window keeps whatever shape it was given. See
+        // `settings::ASPECT_SNAP`.
+        if !crate::settings::ASPECT_SNAP {
+            self.pane_seen = None;
+            self.pane_settled = None;
+            return None;
+        }
         if self.os_aspect_lock {
             self.pane_seen = None;
             self.pane_settled = None;
@@ -14713,6 +14721,32 @@ impl IvoryApp {
                     self.arr_drag = None;
                     return;
                 }
+                // **The MASTER's dial obeys the same rule.** It is a bus, so
+                // it answers `BusGain` rather than `Gain`, and it was the one
+                // fader on this view that could not be put back.
+                if let Some(A::BusGain(n)) = hit {
+                    self.reset_mixer_hit(crate::mixer_panel::Hit::Fader(
+                        crate::recorder::Column(n),
+                    ));
+                    self.undo_commit();
+                    self.arr_drag = None;
+                    return;
+                }
+                // **And an automation row's dial**, which puts the lane's
+                // BASE back where the control would rest with no curve on it
+                // — see `auto_base`. Not to zero: the base is a level, and
+                // "reset" on a level means the shipped one, which is what
+                // `auto_resting` answers.
+                if let Some(A::AutoDial(lane, slot)) = hit {
+                    if let Some(param) = self.arr_auto_param_at(lane, slot) {
+                        let to = self.auto_resting(lane, param);
+                        self.auto_set_base(lane, param, to);
+                        self.auto_set_control(lane, param, to);
+                        self.arr_save_edits();
+                    }
+                    self.arr_drag = None;
+                    return;
+                }
                 match hit {
                     Some(A::ClipBody(id)) => {
                         let is_midi = self
@@ -16068,6 +16102,10 @@ impl IvoryApp {
                 self.recorder.master.right.peak,
             ],
             master_color: self.strip_color(crate::recorder::MASTER_SEAT),
+            master_knob: {
+                let c = self.settings.master_knob_color;
+                (c.r, c.g, c.b)
+            },
             show_master_row: self.settings.arr_master_row,
             // The master's two racks, in strip order — `seat_bay` is the one
             // place that knows which of its six slots lives where.

@@ -296,6 +296,14 @@ fn install(window: &NSWindow) -> bool {
     if let Some(done) = HOOKED.with(std::cell::Cell::get) {
         return done;
     }
+    // **The OS-side lock follows the app's own switch.** With
+    // `ASPECT_SNAP` off the app makes no correction, and leaving AppKit
+    // answering `windowWillResize:` would keep the window on the aspect
+    // anyway — a free aspect that is not free, and impossible to explain.
+    if !tangent_ui::settings::ASPECT_SNAP {
+        HOOKED.with(|h| h.set(Some(false)));
+        return false;
+    }
     if std::env::var("IVORY_ASPECT_HOOK").as_deref() == Ok("0") {
         HOOKED.with(|h| h.set(Some(false)));
         return false;

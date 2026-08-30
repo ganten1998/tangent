@@ -4780,6 +4780,20 @@ pub const MIN_WINDOW: egui::Vec2 = egui::Vec2::new(560.0, 320.0);
 /// was right to, and this is the answer.
 pub const RESIZABLE: bool = true;
 
+/// **Snap a dragged window back onto the layout's own aspect?**
+///
+/// The layout is aspect-locked by construction — every band's height is a
+/// fixed fraction of the width — so there is one height per width and every
+/// other height is empty ground. Snapping keeps the window on that curve and
+/// keeps the picture edge to edge.
+///
+/// `false` lets a window be dragged to ANY shape, which is what the owner
+/// asked for to test the letterboxing: the bands are fitted and centred and
+/// the surplus is the theme's own ground, so a window off the curve is
+/// legible rather than broken. Off while that is being looked at; the snap
+/// is what makes the window feel machined when it is on.
+pub const ASPECT_SNAP: bool = false;
+
 /// Keep a window fully on the monitor it is being placed on. A remembered
 /// position is worthless if the monitor it referred to is gone, which is the
 /// normal state of affairs for anyone who ever undocks a laptop.
