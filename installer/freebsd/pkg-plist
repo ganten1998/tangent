@@ -5,5 +5,6 @@
 @comment triggers, belong to no package (`pkg which` disowns them), and listing
 @comment a file the package does not own breaks deinstall.
 bin/tangent
+bin/tangent-jack
 share/applications/tangent.desktop
 share/icons/hicolor/128x128/apps/tangent.png

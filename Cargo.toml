@@ -5,8 +5,28 @@ members = ["tangent-core", "tangent-ui", "tangent", "tangent-record", "tangent-h
 # to be either a member or excluded, and excluded is what it should be: it must
 # stay byte-comparable to upstream 0.3.5, which means no workspace lints and no
 # `cargo test --workspace` opinions about someone else's code.
-exclude = ["tangent-record/vendor/linuxvideo"]
+exclude = ["tangent-record/vendor/linuxvideo", "tangent-record/vendor/cpal"]
 resolver = "2"
+
+# **A patched cpal, for one host that upstream does not have.**
+#
+# `tangent-record/vendor/cpal` is cpal 0.16.0 with an OSS host added — FreeBSD's
+# native audio interface, which cpal reaches only through the `audio/alsa-lib`
+# shim. That shim costs about 16 ms of round trip that no setting recovers
+# (`docs/FREEBSD-5.0-FINDINGS.md` §7 has the measurements), and speaking OSS
+# directly is the only way past it.
+#
+# THIS APPLIES TO EVERY PLATFORM, WHICH IS WHY THE PATCH IS SHAPED THE WAY IT IS.
+# `[patch.crates-io]` is not target-conditional, so macOS, Windows and Linux
+# builds compile this copy too. Everything added is behind
+# `#[cfg(target_os = "freebsd")]`, so those platforms compile byte-identical
+# code to upstream 0.16.0 and get an identical binary.
+# `tangent-record/vendor/README.md` carries the diff, the measurements and the
+# upstream issue; keep it that way, because the moment this copy diverges
+# anywhere outside a freebsd cfg it stops being a patch and starts being a fork
+# of everybody's audio.
+[patch.crates-io]
+cpal = { path = "tangent-record/vendor/cpal" }
 
 [workspace.package]
 version = "5.0.0-beta.9"

@@ -84,6 +84,17 @@ fn main() {
     // same hardware down two different paths, and the difference between them
     // is worth being able to measure.
     let want_dev = std::env::var("IVORY_AUDIO_DEVICE").ok().filter(|s| !s.is_empty());
+    // **Raw mode: trust no backend's arithmetic, only the wall clock.**
+    //
+    // The adjusted measurement adds the driver's own `playback` lead and
+    // subtracts its `capture` lag, which is the right answer WHEN THE DRIVER IS
+    // HONEST. Comparing hosts that way compares their bookkeeping as much as
+    // their latency — and on FreeBSD one of them reports a capture buffer
+    // 0.00 ms behind the callback, which cannot be true. In raw mode the clock
+    // starts when the callback that wrote the click returns and stops when the
+    // callback that saw it is entered, so every host is measured by the same
+    // rule: app to app, no claims involved.
+    let raw = std::env::var("IVORY_RAW_TIMING").is_ok();
     let by_name = |name: &str, input: bool| -> Option<cpal::Device> {
         let iter: Vec<cpal::Device> = if input {
             host.input_devices().ok()?.collect()
@@ -161,22 +172,28 @@ fn main() {
     // Measuring the second requires speaking its format, so the click writer
     // and the detector are written once against f32 and converted at the edge.
     let out_stream = match out_base.sample_format() {
+        cpal::SampleFormat::I32 => build_out::<i32>(
+            &out_dev, &out_cfg, out_ch, rate, click_len, click_period,
+            sent.clone(), armed.clone(), frame.clone(), raw),
         cpal::SampleFormat::I16 => build_out::<i16>(
             &out_dev, &out_cfg, out_ch, rate, click_len, click_period,
-            sent.clone(), armed.clone(), frame.clone()),
+            sent.clone(), armed.clone(), frame.clone(), raw),
         _ => build_out::<f32>(
             &out_dev, &out_cfg, out_ch, rate, click_len, click_period,
-            sent.clone(), armed.clone(), frame.clone()),
+            sent.clone(), armed.clone(), frame.clone(), raw),
     }
     .expect("could not open the output stream");
 
     let in_stream = match in_base.sample_format() {
+        cpal::SampleFormat::I32 => build_in::<i32>(
+            &in_dev, &in_cfg, in_ch, rate, sent.clone(), armed.clone(),
+            results.clone(), reported.clone(), peak.clone(), raw),
         cpal::SampleFormat::I16 => build_in::<i16>(
             &in_dev, &in_cfg, in_ch, rate, sent.clone(), armed.clone(),
-            results.clone(), reported.clone(), peak.clone()),
+            results.clone(), reported.clone(), peak.clone(), raw),
         _ => build_in::<f32>(
             &in_dev, &in_cfg, in_ch, rate, sent.clone(), armed.clone(),
-            results.clone(), reported.clone(), peak.clone()),
+            results.clone(), reported.clone(), peak.clone(), raw),
     }
     .expect("could not open the input stream");
 
@@ -242,6 +259,9 @@ impl OutSample for f32 {
 impl OutSample for i16 {
     fn from_f32(v: f32) -> i16 { (v * 32767.0) as i16 }
 }
+impl OutSample for i32 {
+    fn from_f32(v: f32) -> i32 { (v * 2_147_483_000.0) as i32 }
+}
 
 /// A sample this probe can look for a click in.
 trait InSample: cpal::SizedSample + Send + Copy + 'static {
@@ -252,6 +272,9 @@ impl InSample for f32 {
 }
 impl InSample for i16 {
     fn to_f32(self) -> f32 { self as f32 / 32768.0 }
+}
+impl InSample for i32 {
+    fn to_f32(self) -> f32 { self as f32 / 2_147_483_648.0 }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -265,6 +288,7 @@ fn build_out<T: OutSample>(
     sent: Arc<Mutex<Option<Instant>>>,
     armed: Arc<AtomicBool>,
     frame: Arc<AtomicU64>,
+    raw: bool,
 ) -> Result<cpal::Stream, cpal::BuildStreamError> {
     dev.build_output_stream(
         cfg,
@@ -280,6 +304,7 @@ fn build_out<T: OutSample>(
                 .duration_since(&info.timestamp().callback)
                 .map(|d| d.as_secs_f32())
                 .unwrap_or(0.0);
+            let ahead = if raw { 0.0 } else { ahead };
             let start = frame.fetch_add((data.len() / out_ch) as u64, Ordering::Relaxed);
             for (i, f) in data.chunks_mut(out_ch).enumerate() {
                 let pos = (start + i as u64) % click_period;
@@ -317,6 +342,7 @@ fn build_in<T: InSample>(
     results: Arc<Mutex<Vec<f32>>>,
     reported: Arc<Mutex<Option<f32>>>,
     peak: Arc<AtomicU32>,
+    raw: bool,
 ) -> Result<cpal::Stream, cpal::BuildStreamError> {
     dev.build_input_stream(
         cfg,
@@ -332,6 +358,7 @@ fn build_in<T: InSample>(
                 .duration_since(&info.timestamp().capture)
                 .map(|d| d.as_secs_f32())
                 .unwrap_or(0.0);
+            let behind = if raw { 0.0 } else { behind };
             if reported.lock().unwrap().is_none() {
                 *reported.lock().unwrap() = Some(behind * 1000.0);
             }

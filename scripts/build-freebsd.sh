@@ -109,6 +109,10 @@ esac
 
 step "Staging"
 install -m 0755 "$BIN" "$PREFIXDIR/bin/tangent"
+# The low-latency path in one command. Everything measured about periods,
+# block sizes and the uaudio tunable lives inside it, so the knowledge ships
+# with the program rather than in a document.
+install -m 0755 "$ROOT/installer/freebsd/tangent-jack" "$PREFIXDIR/bin/tangent-jack"
 install -m 0644 "$ROOT/assets/tangent.desktop" \
                 "$PREFIXDIR/share/applications/tangent.desktop"
 install -m 0644 "$ROOT/assets/tangent.png" \
