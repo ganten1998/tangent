@@ -132,14 +132,15 @@ LATENCY, IF YOU CARE ABOUT IT
   interface afterwards -- it applies when a device attaches. (install.sh does
   this for you; this note is for anyone who installed the .pkg directly.)
 
-  For lower still, the Audio Setup panel offers JACK when a server is running:
+  For lower still -- 10.9 ms measured -- there is one command:
 
       pkg install jackit
-      jackd -R -d oss -r 48000 -p 96 -C /dev/dsp3 -P /dev/dsp3
+      tangent-jack start
 
-  That measured 10.9 ms round trip. Make the period a MULTIPLE OF 48 -- the OSS
-  block is 48 frames, and periods that are not a multiple of it underrun.
-  Nothing requires JACK; it is an option, not a prerequisite.
+  It picks the right device, a period the OSS block size actually allows, and
+  realtime priority where the system permits it, then `tangent-jack stop` puts
+  it away. Choose "JACK" in the Audio Setup panel once it is running.
+  Nothing requires it; it is the low-latency option, not a prerequisite.
 
 A MIDI KEYBOARD
   Plug it in and Tangent finds it — MIDI is read straight from /dev/umidi, so

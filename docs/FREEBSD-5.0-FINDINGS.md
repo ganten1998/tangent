@@ -15,7 +15,7 @@
 > | `cargo test --workspace --features recorder` | **1619 passed, 0 failed**, 56 ignored |
 > | `scripts/check-firewall.sh` | green, Minimal build included |
 > | Installer | ok — a real `.pkg` plus two offline bundles, §9 |
-> | Latency measured and reduced | **36.7 → 27.6 ms** out of the box, **11.2 ms** through JACK, §7 |
+> | Latency measured and reduced | **36.7 ms → 8.1 ms**: native OSS host, no server needed, §7 |
 
 Test box: HP laptop, GhostBSD 26.1 / FreeBSD 15.0-RELEASE-p2 amd64, i5-1135G7
 (8 threads), 8 GB, Realtek ALC236 via `snd_hda`, Iris Xe with DRI + Intel Vulkan
@@ -408,10 +408,58 @@ device honestly reports `1..=131072` and I16, which is what the hardware
 actually speaks.
 
 **So a native OSS backend for cpal is the only route below ~27 ms without a
-JACK server.** It would be worth roughly 16 ms out of the box and would restore
-meaning to the buffer-size control. That is now a measured conclusion rather
-than a suspicion — and it is still not urgent, because JACK reaches 11.2 ms
-today and the out-of-the-box path works with nothing configured.
+JACK server.** That was the conclusion; it has since been built.
+
+### The OSS host, and what it actually buys
+
+`tangent-record/vendor/cpal` is cpal 0.16.0 with an OSS host added, everything
+behind `#[cfg(target_os = "freebsd")]`. It appears in the Audio Setup panel
+beside ALSA and JACK — `hosts available : ["JACK", "ALSA", "OSS"]` — and it is
+**not** the platform default, for the same reason JACK is not.
+
+Measured app-to-app, at the host's default of two fragments:
+
+| requested buffer | OSS host | alsa-lib shim |
+|---|---|---|
+| 256 frames | **20.7 ms** | 27.5 ms |
+| 128 frames | **12.5 ms** | 27.5 ms |
+| 64 frames | **8.1 ms** | 27.5 ms |
+| 32 frames | 8.1 ms (hardware floor) | 27.5 ms |
+
+Two things there matter more than the headline. The first is that the numbers
+**move at all**: the shim gives 27.5 ms whatever you ask for, so its buffer
+control is decoration. The second is that 8.1 ms beats JACK's 11.2 ms on the
+same hardware, with no server running.
+
+It also fixes the device picker. The host enumerates each `/dev/dsp*` and names
+it from the kernel's own `dev.pcm.N.%desc`, so the panel reads "Focusrite
+Scarlett Solo USB" instead of "default" and "oss", and the reported buffer
+range is probed (`16..=16384`) rather than the shim's `1..=4294967295`.
+
+**A measurement I nearly published and should not have.** The first figure this
+host produced was 5.05 ms, flat across every buffer size — which is the same
+signature as the shim's fake buffer control, and should have been suspicious on
+its face. It was: `SNDCTL_DSP_GETODELAY` reports only the *hardware* queue, not
+the software one the application is actually queued behind, so the host's own
+`playback` timestamp under-reported and the probe believed it. The numbers
+above come from `IVORY_RAW_TIMING=1`, which ignores every backend's latency
+claims and measures wall clock from the callback that wrote the click to the
+callback that saw it — the only way to compare hosts that disagree about their
+own bookkeeping.
+
+**The cost, also measured.** Two fragments is 10.7 ms of slack at 256 frames,
+and slack is what absorbs a late wakeup. Tangent playing a held chord under
+four CPU hogs for 45 seconds:
+
+| | underruns |
+|---|---|
+| alsa-lib shim (27.5 ms of buffer) | 0 |
+| OSS, 2 fragments | 28 |
+| OSS, 3 fragments (driver granted 4) | 7 |
+
+Idle, all three run clean. This is the ordinary low-latency bargain rather than
+a defect, `CPAL_OSS_FRAGMENTS` moves the dial, and the real answer for load
+robustness is realtime scheduling, which FreeBSD has via `mac_priority(4)`.
 
 ### On matching Ardour and REAPER
 
@@ -554,16 +602,14 @@ into `~/.local`, and owns its own uninstall.
 1. **A FreeBSD 14 artifact**, if the tester is on 14. ABI is enforced at
    install time, so it needs a 14 build host — nothing else about the port
    changes. This is the only item that could block a real user today.
-2. **Device selection.** `["default", "oss"]` is the last visible wart, and §1
-   establishes it cannot be fixed from this side: cpal never asks alsa-lib for
-   hints. Teaching its ALSA backend to enumerate hints as well as cards is a
-   small upstream patch that would also help custom PCMs on Linux. Until then,
-   `sysctl hw.snd.default_unit=N` is the answer and the Audio Setup panel
-   should probably say so.
-3. **A native OSS backend for cpal**, if 37 ms is ever judged too slow. §7 puts
-   a number on what it would buy — about 8 ms, plus a buffer-size control that
-   means something. Still a real upstream contribution, still not on the
-   critical path.
+2. **Device selection on the ALSA path.** Fixed on the OSS host, which names
+   devices properly (§7); the shim path still shows `["default", "oss"]` and §1
+   establishes why that cannot be fixed from this side. Teaching cpal's ALSA
+   backend to enumerate hints as well as cards is a small upstream patch that
+   would also help custom PCMs on Linux.
+3. **Upstream the OSS host.** It is written and measured (§7); cpal already
+   claims FreeBSD as a target, so this fills in a platform rather than adding
+   one. Landing it upstream is what removes the vendored copy.
 4. Plugin editor and camera, per §5, when there is hardware to test them with.
 5. The `audio.rs:1027` `max_sample_rate()` landmine in §5, which wants a fix
    that can be tested rather than a blind one.
