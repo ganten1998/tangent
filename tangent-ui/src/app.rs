@@ -16471,6 +16471,24 @@ impl IvoryApp {
         use crate::mixer_panel::Hit as M;
         use crate::recorder::Column;
         let v = v.clamp(0.0, 1.0);
+        // **The master's fader is the MASTER column**, not channel sixteen.
+        // Its row's dial writes through the same `apply_mixer_hit` a track's
+        // does — that is the one road to the engine, and a second one is how
+        // the desk and the arrangement come to disagree about where a fader
+        // is standing.
+        if lane == crate::arrangement_panel::MASTER_LANE {
+            if matches!(param, AutoParam::Gain) {
+                self.apply_mixer_hit(
+                    M::Fader(Column(crate::arrangement_panel::MASTER_COLUMN)),
+                    v as f32,
+                );
+                self.auto_write_if_armed(lane, param, v);
+            }
+            // Everything else the master could name is either a control it
+            // does not have or a plugin's own, which is read-only here for
+            // the reason spelled out below.
+            return;
+        }
         let col = Column(lane);
         match param {
             AutoParam::Gain => self.apply_mixer_hit(M::Fader(col), v as f32),
