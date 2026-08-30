@@ -242,6 +242,72 @@ pub trait AudioSetup: Send {
     /// verbatim in the settings file and handed straight back at startup,
     /// exactly as the chosen device's own uid already is.
     fn set_exposed(&mut self, picks: Vec<(u16, Option<u16>)>) -> Vec<String>;
+
+    /// **What the monitor is really playing into**, for the device opened
+    /// under `device` (`None` being the system default).
+    ///
+    /// Enumerates hardware, so it is snapshotted when the panel opens and
+    /// never pushed per frame — the same rule `rates` follows.
+    fn output_path(&self, device: Option<&str>) -> OutputPath;
+}
+
+/// **What the OS says about the device the monitor plays into.**
+///
+/// The panel could always say how many milliseconds the two buffers hold. It
+/// could not say the thing that actually costs the time: that the "device" is
+/// not hardware, and another application is standing between the mix and the
+/// speakers. That gap cost the owner a week of believing the code had
+/// regressed, while every measurement the app can take of ITSELF came back
+/// clean — because with the device to itself there was nothing to find.
+///
+/// Plain data on purpose. Asking the OS needs CoreAudio on macOS and will
+/// need something else on each other platform, and none of that may cross the
+/// firewall into `tangent-ui`; the host fills this in and the panel only
+/// prints it, exactly as it already does for device names and rates.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OutputPath {
+    /// The device was found and answered. **`false` prints nothing at all** —
+    /// a build or a machine that cannot check must not imply the path is
+    /// clear.
+    pub known: bool,
+    /// The device is published by SOFTWARE, not by hardware
+    /// (`kAudioDeviceTransportTypeVirtual`). True of every interposer rather
+    /// than of one product, which is why the transport is what gets asked
+    /// about and not a list of vendor names to keep up to date.
+    pub virtualised: bool,
+    /// The device is an aggregate. Not a warning — it is how anyone with two
+    /// interfaces runs them on one clock — but it is worth naming, because an
+    /// aggregate has a drift-correction cost a single device does not.
+    pub aggregate: bool,
+    /// The transport in a word: "virtual", "USB", "built-in". Empty when the
+    /// device reports one this build has no word for.
+    pub transport: String,
+    /// Who publishes it, so the line can say WHOSE — the difference between a
+    /// warning and an instruction. Empty when unreported.
+    pub maker: String,
+    /// `kAudioDevicePropertyLatency + kAudioDevicePropertySafetyOffset`, in
+    /// frames. **cpal reads neither on any platform**, so this is real delay
+    /// the round-trip estimate has never included, whatever kind of device is
+    /// open. Zero when unreported.
+    pub extra_frames: u32,
+}
+
+impl OutputPath {
+    /// Those frames as milliseconds at `rate`, when there are any.
+    pub fn extra_ms(&self, rate: u32) -> Option<f64> {
+        (self.known && self.extra_frames > 0 && rate > 0)
+            .then(|| f64::from(self.extra_frames) * 1000.0 / f64::from(rate))
+    }
+
+    /// **Is there anything to SAY?**
+    ///
+    /// A USB interface reporting a normal safety offset is the ordinary case
+    /// and deserves no line. The panel speaks when the path holds something
+    /// the owner did not put there, or when it is holding time the round-trip
+    /// figure does not include.
+    pub fn worth_saying(&self) -> bool {
+        self.known && (self.virtualised || self.aggregate || self.extra_frames > 0)
+    }
 }
 
 /// A folder the app has asked the host to choose.
@@ -512,6 +578,10 @@ pub enum FilePurpose {
     /// the menu was opened on; anything picked past the first goes to a
     /// lane of its own.
     InsertMedia(usize),
+    /// **A saved drum kit to load onto the showing lane.** Every sample it
+    /// names is copied into the open project, exactly as dragging the files
+    /// in one at a time would — see [`crate::drumpad::KitPreset`].
+    KitPreset,
 }
 
 /// A place the app has asked the host to raise a SAVE panel for.
@@ -537,6 +607,10 @@ pub enum SavePurpose {
     /// was pointed, and saving one called `default` replaces the session
     /// every New Project clones.
     Template,
+    /// **Write the showing lane's kit out as a preset.** Unlike a template,
+    /// the whole path is honoured — a kit is a file you keep wherever you
+    /// keep files.
+    KitPreset,
 }
 
 /// A project action the HOST must run whole — it owns the plugin states
@@ -642,6 +716,47 @@ pub trait MidiPorts: Send {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **An unknown path says NOTHING.**
+    ///
+    /// The default is what a Windows or Linux build returns today, and what
+    /// macOS returns when the HAL will not answer. It has to read as "no
+    /// information", never as "the path is clear" — a panel that quietly
+    /// implies the output is direct is the exact false reassurance this
+    /// whole readout exists to end.
+    #[test]
+    fn a_path_that_could_not_be_checked_makes_no_claim() {
+        let unknown = OutputPath::default();
+        assert!(!unknown.worth_saying());
+        assert_eq!(unknown.extra_ms(48_000), None);
+        // And a KNOWN path with nothing remarkable on it is equally silent:
+        // an interface with no reported latency is the ordinary case and
+        // deserves no line.
+        let plain = OutputPath { known: true, transport: "USB".to_owned(), ..Default::default() };
+        assert!(!plain.worth_saying());
+    }
+
+    /// The three things that ARE worth a line, and the arithmetic of the one
+    /// that carries a number.
+    #[test]
+    fn a_virtual_device_and_a_reported_latency_both_speak() {
+        let virt = OutputPath { known: true, virtualised: true, ..Default::default() };
+        assert!(virt.worth_saying());
+
+        let agg = OutputPath { known: true, aggregate: true, ..Default::default() };
+        assert!(agg.worth_saying());
+
+        let slow = OutputPath { known: true, extra_frames: 512, ..Default::default() };
+        assert!(slow.worth_saying());
+        // 512 frames at 48k is 10.666 ms, and the panel prints one decimal.
+        let ms = slow.extra_ms(48_000).expect("512 frames is a duration");
+        assert!((ms - 10.666).abs() < 0.001, "{ms}");
+        // Halve the rate and the same frames are twice the time.
+        let half = slow.extra_ms(24_000).expect("still a duration");
+        assert!((half - 2.0 * ms).abs() < 0.001, "{half} against {ms}");
+        // A rate of zero is a device that is not open. No division by it.
+        assert_eq!(slow.extra_ms(0), None);
+    }
 
     /// A recording fake, which is the other reason this is a trait: the port
     /// dialog and its two menu actions had no way to be tested at all while

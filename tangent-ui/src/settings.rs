@@ -2401,10 +2401,11 @@ impl Settings {
                 .map(|x| x.as_str().unwrap_or_default().to_owned())
                 // The cap covers the PADS too — 128 of them since v18; the
                 // old (65*3) ceiling silently ate the pad seats on load.
-                .take(
-                    (LEGACY_MAX_STRIPS + 1 + crate::recorder::DRUM_PADS)
-                        * crate::recorder::INSERTS,
-                )
+                // The cap covers every seat the map can name — strips, the
+                // master's extra, and the pads of every drum LANE. It has
+                // been too small twice; when the seat map grows, this grows
+                // with it or the tail is silently eaten on load.
+                .take(crate::recorder::INSERT_SPACE)
                 .collect();
         }
         if let Some(Value::Array(v)) = map.shift_remove("strip_names") {
@@ -2830,7 +2831,59 @@ impl Settings {
     /// chance to move anything worth keeping — which is the whole point of
     /// [`LegacyDesk`]. A row that reaches this function and does not fit is a
     /// row the migration decided not to carry.
-    fn adopt_desk(&mut self, mut desk: LegacyDesk) {
+     /// **A pre-lanes project's pad plugins follow their drumpad.**
+    ///
+    /// Before a drum instrument could load on more than one channel, there
+    /// was exactly one drumpad and its hundred and twenty-eight pad racks
+    /// sat at `STRIPS + 1`. That block belongs to CHANNEL 0 now, because a
+    /// per-channel map has to key on something stable and the ordinal among
+    /// drum lanes moves whenever one is added.
+    ///
+    /// So a session whose drumpad was on channel 7 would find its per-pad
+    /// plugins on channel 0's pads — somebody else's kit, or nobody's. This
+    /// moves them once, on load, before anything reads them.
+    ///
+    /// It runs on every load and is a no-op for the overwhelming majority:
+    /// the block is empty unless somebody put a plugin on an individual pad.
+    fn move_legacy_pad_racks(&mut self) {
+        use crate::recorder::{DRUM_PADS, INSERTS, STRIPS};
+        let ins = crate::recorder::INSERTS;
+        // Which channel carries the drumpad, by the same sentinel the engine
+        // reads. Channel 0 already owns the legacy block; nothing to do.
+        let Some(ch) = (1..crate::recorder::CHANNELS).find(|c| {
+            self.strip_inserts
+                .get(c * ins)
+                .is_some_and(|p| p == crate::dialogs::DRUMPAD_PATH)
+        }) else {
+            return;
+        };
+        let legacy = (STRIPS + 1) * INSERTS;
+        let span = DRUM_PADS * INSERTS;
+        if self.strip_inserts.len() < legacy + span
+            || self.strip_inserts[legacy..legacy + span]
+                .iter()
+                .all(String::is_empty)
+        {
+            return;
+        }
+        // The destination has to exist before anything is written into it.
+        if self.strip_inserts.len() < crate::recorder::INSERT_SPACE {
+            self.strip_inserts
+                .resize(crate::recorder::INSERT_SPACE, String::new());
+        }
+        for pad in 0..DRUM_PADS {
+            for bay in 0..INSERTS {
+                let from = (STRIPS + 1 + pad) * INSERTS + bay;
+                let to = crate::recorder::pad_rack_index(ch, pad) * INSERTS + bay;
+                if from == to {
+                    continue;
+                }
+                self.strip_inserts[to] = std::mem::take(&mut self.strip_inserts[from]);
+            }
+        }
+    }
+
+   fn adopt_desk(&mut self, mut desk: LegacyDesk) {
         // **The sixteen-pad era → 128 pads, base 12.** A desk from before the
         // pad rescale carries `(V12_STRIPS+1+16)*V11_INSERTS` insert seats and
         // its pads were keys 36..51. Done on the staging at the FROZEN v18
@@ -2923,6 +2976,15 @@ impl Settings {
             // Truncating to the old length would drop the three bays that
             // live past the pads every time a session was loaded.
             self.strip_inserts.truncate(crate::recorder::INSERT_SPACE);
+            // **Back to full length.** The writer trims trailing empties so
+            // the file does not carry thousands of `""`, which means what
+            // comes back is SHORTER than what went out — and a round trip
+            // that changes the struct is a round trip that will eventually
+            // change something that matters. Padding here makes the file
+            // small and the value identical.
+            self.strip_inserts
+                .resize(crate::recorder::INSERT_SPACE, String::new());
+            self.move_legacy_pad_racks();
         }
         if !desk.names.is_empty() {
             self.strip_names = desk.names;
@@ -3419,10 +3481,24 @@ impl Settings {
             Value::Array(self.strip_sends.iter().map(|v| Value::from(*v)).collect()),
         );
         map.insert("strip_muted".into(), Value::from(self.strip_muted));
+        // **Trailing empties are not written.** The insert space is one seat
+        // per strip, per pad and per drum LANE — thousands of them — and all
+        // but a handful are empty in every real session. Writing the whole
+        // array put tens of kilobytes of `""` in every settings file and
+        // every project desk, and it grows with the seat map.
+        //
+        // Safe because nothing reads this by length: `insert()` uses `get`
+        // and treats a missing seat as empty, and `set_insert` resizes when
+        // it needs a seat past the end.
         map.insert(
             "strip_inserts".into(),
             Value::Array(
                 self.strip_inserts
+                    [..self
+                        .strip_inserts
+                        .iter()
+                        .rposition(|p| !p.is_empty())
+                        .map_or(0, |i| i + 1)]
                     .iter()
                     .map(|p| Value::String(p.clone()))
                     .collect(),
@@ -5809,6 +5885,60 @@ mod tests {
     /// The click's sound is a PATH in the settings file, and the file is the
     /// only place it lives — a build that lost it on save would put the
     /// built-in click back every launch, silently.
+    #[test]
+    fn a_pre_lanes_projects_pad_plugins_follow_their_drumpad() {
+        use crate::recorder::{pad_rack_index, DRUM_PADS, INSERTS, STRIPS};
+        // A session as an older build wrote it: the drumpad on channel 7,
+        // and a plugin on pad 36 sitting in the ONE pad block that existed.
+        // **The default desk already seeds a drumpad on channel 1**, and the
+        // migration takes the LOWEST drum channel — correctly. So the fixture
+        // has to be a bare desk, or it tests channel 1 while claiming to test
+        // channel 7.
+        let bare = || {
+            let mut s = Settings::default();
+            s.strip_inserts.clear();
+            s.strip_inserts
+                .resize(crate::recorder::INSERT_SPACE, String::new());
+            s
+        };
+        let mut s = bare();
+        s.strip_inserts[7 * INSERTS] = crate::dialogs::DRUMPAD_PATH.to_owned();
+        let legacy = (STRIPS + 1 + 36) * INSERTS;
+        s.strip_inserts[legacy] = "/x/Kick.vst3".to_owned();
+
+        s.move_legacy_pad_racks();
+
+        // It followed the drumpad to channel 7's block, and left nothing
+        // behind on channel 0's — which is somebody else's kit now.
+        assert_eq!(
+            s.strip_inserts[pad_rack_index(7, 36) * INSERTS],
+            "/x/Kick.vst3",
+            "the pad plugin did not follow its drumpad"
+        );
+        assert!(
+            s.strip_inserts[legacy].is_empty(),
+            "the plugin was copied rather than moved, so channel 0 now has one too"
+        );
+
+        // A drumpad already on channel 0 is the identity — and running the
+        // migration twice must not undo the first run.
+        let mut z = bare();
+        z.strip_inserts[0] = crate::dialogs::DRUMPAD_PATH.to_owned();
+        z.strip_inserts[legacy] = "/x/Kick.vst3".to_owned();
+        z.move_legacy_pad_racks();
+        z.move_legacy_pad_racks();
+        assert_eq!(z.strip_inserts[legacy], "/x/Kick.vst3", "channel 0 lost its pad plugin");
+
+        // And a session with no per-pad plugins at all is untouched, which
+        // is every session anybody actually has.
+        let mut plain = bare();
+        plain.strip_inserts[7 * INSERTS] = crate::dialogs::DRUMPAD_PATH.to_owned();
+        let before = plain.strip_inserts.clone();
+        plain.move_legacy_pad_racks();
+        assert_eq!(plain.strip_inserts, before, "an empty pad block was rewritten");
+        let _ = DRUM_PADS;
+    }
+
     #[test]
     fn the_chosen_click_sound_round_trips() {
         let mut s = Settings::default();
