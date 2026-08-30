@@ -8430,6 +8430,33 @@ fn resolve_output(host: &cpal::Host, want: Option<&str>) -> Result<cpal::Device,
 /// `docs/LINUX-4.16-FINDINGS.md`.
 const BUFFER_PERIODS: u32 = if cfg!(target_os = "linux") {
     4
+} else if cfg!(target_os = "freebsd") {
+    // **FreeBSD runs cpal's ALSA host and still wants 1, not Linux's 4.** This
+    // arm exists to say that on purpose, because the else-arm below would give
+    // the same number by accident and the next person deserves to know which.
+    //
+    // The Linux reasoning does not transfer, and it is worth being precise
+    // about why. `linux = 4` compensates for cpal's ALSA host reading `Fixed(v)`
+    // as the whole RING and carving it into four periods, so asking for 1024
+    // yields 256-frame callbacks and a ring deep enough to ride out a stall.
+    // FreeBSD reaches ALSA through the `audio/alsa-lib` port, which is a shim
+    // over OSS — and that shim does not carve a ring into fixed periods at all.
+    // It hands the callback whatever `snd_pcm_avail` reports, so the period is
+    // ragged by construction and multiplying the request simply asks for a
+    // bigger, still-ragged one.
+    //
+    // Measured on GhostBSD 26.1 / FreeBSD 15.0 with a Realtek ALC236, 44.1 kHz,
+    // counting real callback sizes:
+    //
+    //     Fixed(256)  -> 205..256 frames, modal 256
+    //     Fixed(1024) -> 264..500 frames, modal 441
+    //
+    // So Linux's multiply-by-four would roughly double the callback size and
+    // the latency with it, which is the opposite of what the constant is for.
+    // What it WOULD buy is a deeper safety ring, and that trade is real — if a
+    // loaded FreeBSD box turns out to underrun at 1, this is the number to
+    // raise, and the ragged callback is the cost to accept knowingly.
+    1
 } else if cfg!(target_os = "windows") {
     // WASAPI treats `Fixed(n)` as the TOTAL shared-mode buffer capacity,
     // and the engine mixes in ~10 ms periods regardless: a 256-frame

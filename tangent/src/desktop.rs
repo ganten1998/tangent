@@ -3510,12 +3510,16 @@ impl DesktopApp {
     /// frame after — the change needs a frame to reach the WM — and fullscreen
     /// goes back when the picker is done. macOS and Windows put a panel in
     /// front of a fullscreen window themselves and are left alone.
-    #[cfg(target_os = "linux")]
+    /// FreeBSD is included because this is an X11 problem, not a Linux one:
+    /// the same window managers run there, `_NET_WM_STATE_FULLSCREEN` means the
+    /// same thing, and `rfd` blocks the main thread identically. Nothing about
+    /// the diagnosis above is kernel-specific.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn picker_needs_windowed(ctx: &egui::Context) -> bool {
         ctx.input(|i| i.viewport().fullscreen.unwrap_or(false))
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     fn picker_needs_windowed(_ctx: &egui::Context) -> bool {
         false
     }
@@ -3595,7 +3599,19 @@ impl DesktopApp {
     /// No new dependency, and wrong only in the direction that costs nothing:
     /// if this says no and a native dialog would have worked, the in-app
     /// browser opens instead and still chooses the file.
-    #[cfg(target_os = "linux")]
+    /// FreeBSD runs this probe too, and needs it more than Linux does.
+    ///
+    /// Nothing in the diagnosis is Linux-specific: `rfd`'s two non-macOS
+    /// backends are the portal and zenity, and a FreeBSD desktop is if anything
+    /// LESS likely to have a portal running than the Void box that produced the
+    /// original report. Left in the else-arm, FreeBSD asserted native dialogs
+    /// always work and got the silent-dead-button bug back verbatim.
+    ///
+    /// The probe itself was already portable — a session bus, `dbus-send` from
+    /// the same dbus package ports installs, `zenity` on `PATH` — and the file
+    /// heuristic below even reads `/usr/local/share/...`, which is the FreeBSD
+    /// prefix and was dead code until this gate included it.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn native_dialogs_work() -> bool {
         fn which_on_path(exe: &str) -> bool {
             std::env::var_os("PATH")
@@ -3662,7 +3678,7 @@ impl DesktopApp {
         chooser || which_on_path("zenity")
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     fn native_dialogs_work() -> bool {
         true
     }
