@@ -782,6 +782,18 @@ pub struct IvoryApp {
     /// shared by the editor, the arrangement and the mixer — one line of
     /// time, whichever surface wrote it. `hist_at` is where NOW stands.
     history: Vec<Moment>,
+    /// The document as it was last written or opened — what `project_dirty`
+    /// measures against. `None` until something has been saved or loaded.
+    saved_state: Option<Moment>,
+    /// **What to do once the unsaved changes are dealt with.**
+    ///
+    /// New, Open and Quit all have to ask the same question first, and all
+    /// three have to CARRY ON afterwards — an app that asks, saves, and then
+    /// forgets what you were doing is worse than one that never asked. See
+    /// `ask_before` and `resume_after_save`.
+    pending_after_save: Option<AfterSave>,
+    /// The prompt has been answered and the window may close.
+    quit_now: bool,
     hist_at: usize,
     /// The NOTE clipboard: times relative to the earliest copied note.
     note_clipboard: Vec<crate::arrangement::ArrNote>,
@@ -1382,6 +1394,17 @@ struct MidiEdit {
     last_vel: u8,
     /// A marquee in flight, both corners in screen space.
     marquee: Option<(egui::Pos2, egui::Pos2)>,
+}
+
+/// What a save prompt is standing in front of.
+#[derive(Clone, Debug, PartialEq)]
+enum AfterSave {
+    /// File > New: the default template again.
+    New,
+    /// File > Open: raise the picker once the question is answered.
+    Open,
+    /// The window is closing.
+    Quit,
 }
 
 /// **One moment on the undo timeline.**
@@ -2049,6 +2072,9 @@ impl IvoryApp {
             met_drag: false,
             meter_hold: [[0.0; 2]; crate::recorder::STRIPS],
             history: Vec::new(),
+            saved_state: None,
+            pending_after_save: None,
+            quit_now: false,
             hist_at: 0,
             note_clipboard: Vec::new(),
             clip_clipboard: Vec::new(),
@@ -3712,7 +3738,76 @@ impl IvoryApp {
             // slots always did.
 
         }
+        // **And a lane whose curve is nothing but its base node follows.**
+        // See `auto_sync_base`: the base IS the level, and this is the road
+        // back from the control to it.
+        self.auto_sync_base(hit);
         self.save_settings_soon();
+    }
+
+    /// **Which automation row a desk control stands on**, if any.
+    ///
+    /// The master's fader is the one that is not a channel: it is the last
+    /// COLUMN, and its row is one past the channels.
+    fn auto_row_of_hit(
+        hit: crate::mixer_panel::Hit,
+    ) -> Option<(usize, crate::automation::AutoParam)> {
+        use crate::automation::AutoParam;
+        use crate::mixer_panel::Hit as H;
+        use crate::recorder::Strip;
+        let channel_of = |i: crate::recorder::Column| match i.strip() {
+            Some(Strip::Channel(n)) => Some(n),
+            _ => None,
+        };
+        let row = match hit {
+            H::Fader(i) => match i.strip() {
+                Some(Strip::Channel(n)) => (n, AutoParam::Gain),
+                None => (crate::arrangement_panel::MASTER_LANE, AutoParam::Gain),
+                _ => return None,
+            },
+            H::Pan(i) => (channel_of(i)?, AutoParam::Pan),
+            H::Send(i) => (channel_of(i)?, AutoParam::Send),
+            H::Mute(i) => (channel_of(i)?, AutoParam::Mute),
+            _ => return None,
+        };
+        Some(row)
+    }
+
+    /// **Moving a control moves the base node of a lane that has only one.**
+    ///
+    /// A lane's first node is its resting level — the owner's "tied directly
+    /// to the base level, represented by the first node" — and the dial on
+    /// the row writes both already. The road BACK was missing, and the
+    /// engine reads a curve in preference to the fader, so a lane carrying
+    /// nothing but a base node had a dead fader.
+    ///
+    /// That is not a small thing when it happens to the master. A session
+    /// went out with `master_gain: 1.0` on the desk and the master row's
+    /// base node at -27.7 dB; the fader read 0.0 dB, every push of it did
+    /// nothing, and the whole mix played 28 dB down with nothing on screen
+    /// to say why — the owner's "audio SUPER quiet overall".
+    ///
+    /// Only while the curve is JUST its base. Past that somebody has drawn a
+    /// shape, the curve is *meant* to overrule the hand, and dragging its
+    /// first node from a fader would silently flatten an evening's work.
+    fn auto_sync_base(&mut self, hit: crate::mixer_panel::Hit) {
+        let Some((lane, param)) = Self::auto_row_of_hit(hit) else {
+            return;
+        };
+        let lone = self
+            .arrangement
+            .automation
+            .get(lane, param)
+            .is_some_and(|c| c.points().len() == 1);
+        if !lone {
+            return;
+        }
+        // Read back rather than passed in: `apply_mixer_hit_one` has just
+        // written the control, and `auto_resting` is the exact inverse of
+        // that write for every one of the four. A value threaded through by
+        // hand would be a second opinion about where the fader is.
+        let v = self.auto_resting(lane, param);
+        self.auto_set_base(lane, param, v);
     }
 
     /// Put one general channel back to an empty slot.
@@ -6679,28 +6774,41 @@ impl IvoryApp {
     /// puts back. Captured on every save, so a session folder always knows
     /// its own instruments.
     fn desk_snapshot(&self) -> crate::arrangement::DeskSnap {
-        let sig = self.time_signature();
+        Self::desk_snapshot_of(&self.settings)
+    }
+
+    /// The same snapshot, taken from ANY settings.
+    ///
+    /// Split out so `template_desk` can build the shipped desk without a
+    /// live app — which is what stops seeding the template from capturing
+    /// whatever session happens to be open.
+    fn desk_snapshot_of(settings: &Settings) -> crate::arrangement::DeskSnap {
+        let s = settings;
+        // Settings own this derivation; taking it from there is what keeps
+        // one answer rather than two that can drift.
+        let sig = s.time_signature();
         crate::arrangement::DeskSnap {
-            kinds: self.settings.channel_kinds.to_vec(),
-            icons: self.settings.channel_icons.to_vec(),
-            names: self.settings.strip_names.clone(),
-            colors: self.settings.strip_colors.to_vec(),
-            inserts: self.settings.strip_inserts.clone(),
-            sends: self.settings.strip_sends.to_vec(),
-            muted: self.settings.strip_muted,
-            soloed: self.settings.strip_soloed,
-            gains: self.settings.channel_gains.to_vec(),
-            pans: self.settings.channel_pans.to_vec(),
-            inputs: self.settings.channel_inputs.clone(),
-            drums_gain: self.settings.drums_gain,
-            drums_pan: self.settings.drums_pan,
-            metronome_gain: self.settings.metronome_gain,
-            master_gain: self.settings.master_gain,
-            fx_return: self.settings.fx_return_gain,
-            tempo_bpm: f64::from(self.settings.record_export.tempo_bpm),
+            kinds: s.channel_kinds.to_vec(),
+            icons: s.channel_icons.to_vec(),
+            names: s.strip_names.clone(),
+            colors: s.strip_colors.to_vec(),
+            inserts: s.strip_inserts.clone(),
+            sends: s.strip_sends.to_vec(),
+            muted: s.strip_muted,
+            soloed: s.strip_soloed,
+            gains: s.channel_gains.to_vec(),
+            pans: s.channel_pans.to_vec(),
+            inputs: s.channel_inputs.clone(),
+            drums_gain: s.drums_gain,
+            drums_pan: s.drums_pan,
+            metronome_gain: s.metronome_gain,
+            master_gain: s.master_gain,
+            fx_return: s.fx_return_gain,
+            tempo_bpm: f64::from(s.record_export.tempo_bpm),
             sig_beats: sig.beats,
             sig_unit: sig.unit,
-            metronome_on: self.settings.metronome_on,
+            metronome_on: s.metronome_on,
+            tracks_added: s.tracks_added as u32,
         }
     }
 
@@ -6838,6 +6946,17 @@ impl IvoryApp {
         self.settings.record_time_signature =
             format!("{}/{}", d.sig_beats.clamp(1, 32), d.sig_unit.clamp(1, 32));
         self.settings.metronome_on = d.metronome_on;
+        // **Which channels EXIST comes from the document too.**
+        //
+        // Without this, opening a project — or making a New one from the
+        // template — applied its levels, names and bays over whatever rows
+        // were already on screen and left the rows themselves behind. Every
+        // session inherited the last one's track count, and New could not
+        // give you the template's desk however faithfully it copied the
+        // folder. The owner: "no channels are deleted ... the default must
+        // be loaded and if something is silently overwriting it, that's a
+        // huge problem."
+        self.settings.tracks_added = i64::from(d.tracks_added);
         self.save_settings();
         self.desk_reload = true;
     }
@@ -7851,8 +7970,48 @@ impl IvoryApp {
         }
         let _ = std::fs::create_dir_all(dir.join("media"));
         let mut arr = crate::arrangement::Arrangement::default();
-        arr.desk = Some(self.desk_snapshot());
+        // **The SHIPPED desk, not the one on screen.**
+        //
+        // This wrote `self.desk_snapshot()` — the live desk — and it is
+        // called on every New. So opening somebody's project and pressing
+        // New re-wrote the default template with THAT project's desk, and
+        // the template quietly became whatever was last open. The owner
+        // suspected exactly this: "if something is silently overwriting it,
+        // that's a huge problem."
+        arr.desk = Some(Self::template_desk());
         arr.save_to(&doc);
+    }
+
+    /// **What a fresh Tangent is**: the shipped desk, with the built-in
+    /// instrument on channel one and the drums on channel two.
+    ///
+    /// Built from `Settings::default()` rather than from whatever is live,
+    /// so it is the same desk on every machine and every launch — and so
+    /// that seeding the template can never capture a session.
+    pub fn template_desk() -> crate::arrangement::DeskSnap {
+        use crate::recorder::{Strip, INSERTS};
+        let mut s = Settings::default();
+        let need = (crate::recorder::STRIPS + 1 + crate::recorder::DRUM_PADS) * INSERTS;
+        if s.strip_inserts.len() < need {
+            s.strip_inserts.resize(need, String::new());
+        }
+        let put = |s: &mut Settings, ch: usize, path: &str| {
+            let at = Strip::Channel(ch).index() * INSERTS;
+            if let Some(slot) = s.strip_inserts.get_mut(at) {
+                *slot = path.to_owned();
+            }
+            if let Some(k) = s.channel_kinds.get_mut(ch) {
+                *k = crate::recorder::ChannelKind::as_u8(Some(
+                    crate::recorder::ChannelKind::Midi,
+                ));
+            }
+        };
+        put(&mut s, 0, crate::dialogs::BUILTIN_PATH);
+        put(&mut s, 1, crate::dialogs::DRUMPAD_PATH);
+        let mut d = Self::desk_snapshot_of(&s);
+        // Two rows, and only two.
+        d.tracks_added = 0b11;
+        d
     }
 
     /// The host's cue to reload every insert with the project's own states.
@@ -7877,7 +8036,41 @@ impl IvoryApp {
         // The kit rides the project: whatever drumpad this directory
         // carries replaces the one in memory.
         self.load_drumpad_doc();
+        self.reconcile_auto_bases();
         self.undo_reset();
+    }
+
+    /// **On open, a lone base node and its control are made to agree.**
+    ///
+    /// They are one value — see `auto_sync_base` — but a document written
+    /// before that was true can hold two different ones, and the engine
+    /// obeys the CURVE. The owner's session came back with the master's
+    /// fader saying 0.0 dB and the master row's base node saying -27.7, so
+    /// every track played 28 dB down and the desk showed nothing wrong.
+    ///
+    /// The NODE wins, because the node is what is being heard. Adopting the
+    /// fader instead would have made the mix loud again and hidden the
+    /// disagreement; this way the fader drops to where the sound actually
+    /// is, the reason is on screen, and one drag — which now carries the
+    /// base with it — puts both right.
+    fn reconcile_auto_bases(&mut self) {
+        use crate::automation::AutoParam;
+        let mut rows = Vec::new();
+        for curve in self.arrangement.automation.curves() {
+            // Only a lone base, and only the controls this desk owns. A
+            // plugin's parameter lives in the plugin and is not ours to set.
+            if curve.points().len() != 1 || matches!(curve.param, AutoParam::Plugin { .. }) {
+                continue;
+            }
+            let Some(v) = curve.points().first().map(|p| p.value) else {
+                continue;
+            };
+            rows.push((curve.lane, curve.param, v));
+        }
+        rows.retain(|(lane, param, v)| (v - self.auto_resting(*lane, *param)).abs() > 1.0e-6);
+        for (lane, param, v) in rows {
+            self.auto_set_control(lane, param, v);
+        }
     }
 
     /// Copy the WHOLE project — document and `media/` — to `target` and
@@ -9714,13 +9907,111 @@ impl IvoryApp {
     /// A gesture's edits, written down: the document saved atomically, the
     /// host told to rebuild the schedule.
     fn arr_save_edits(&mut self) {
-        // The desk rides along on every save, so the folder is a SESSION.
+        // **This no longer writes to disk**, and the name is a leftover from
+        // when it did — forty-three call sites, so it keeps the name and
+        // changes what it means.
+        //
+        // Every edit used to save the document. That is an autosave in all
+        // but name: there was never an unsaved change, so there was nothing
+        // to prompt about and no way to walk away from a session without
+        // keeping it. The owner: "no 'autosave' should be enabled at ANY
+        // form of the process."
+        //
+        // **The cost is real and is the owner's to take**: work between the
+        // last explicit save and a crash is gone, where before it was on
+        // disk within a frame. The undo timeline still records every edit,
+        // and `save_project_doc` is still the one road to the file.
+        //
+        // The desk rides along, because the desk is part of the document —
+        // that has to be true at the moment of the edit, not at the moment
+        // of the save, or an undo would compare against a stale one.
         self.arrangement.desk = Some(self.desk_snapshot());
-        if let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) {
-            self.arrangement.save_to(&doc);
-        }
         self.clips_dirty = true;
         self.undo_commit();
+    }
+
+    /// **Is there anything unsaved?**
+    ///
+    /// Asked rather than tracked: the document as it stands, against the
+    /// document as it was written. A flag set by hand at forty-three edit
+    /// sites is a flag one of them forgets, and the one it forgets is the
+    /// edit somebody loses.
+    ///
+    /// `None` saved yet means anything at all counts as a change.
+    pub fn project_dirty(&self) -> bool {
+        let now = self.undo_state();
+        self.saved_state.as_ref() != Some(&now)
+    }
+
+    /// **Ask before losing anything.** Returns whether the caller should
+    /// stop and wait for the answer.
+    ///
+    /// With the autosave gone, this is the only thing standing between an
+    /// afternoon's work and a keystroke — so it is one function, and New,
+    /// Open and Quit all go through it rather than each growing their own
+    /// version of the question.
+    fn ask_before(&mut self, next: AfterSave) -> bool {
+        if !self.project_dirty() {
+            return false;
+        }
+        self.pending_after_save = Some(next.clone());
+        self.dialog = Some(dialogs::Dialog::SaveChanges {
+            what: match next {
+                AfterSave::New => "starting a new project",
+                AfterSave::Open => "opening another project",
+                AfterSave::Quit => "quitting",
+            }
+            .to_owned(),
+            name: self.project_name(),
+        });
+        true
+    }
+
+    /// Carry on with whatever the prompt interrupted.
+    fn resume_after_save(&mut self) {
+        let Some(next) = self.pending_after_save.take() else {
+            return;
+        };
+        match next {
+            AfterSave::New => {
+                self.project_request = Some(crate::ports::ProjectRequest::New);
+            }
+            AfterSave::Open => {
+                self.native_panel_up = true;
+                self.file_request = Some(crate::ports::FileRequest {
+                    start_at: self
+                        .project_doc()
+                        .and_then(std::path::Path::parent)
+                        .and_then(std::path::Path::parent)
+                        .map(std::path::Path::to_path_buf),
+                    title: "Open a project".to_owned(),
+                    extensions: vec!["tangent".to_owned()],
+                    extension_label: "Tangent project".to_owned(),
+                    purpose: crate::ports::FilePurpose::Project,
+                    multi: false,
+                });
+            }
+            AfterSave::Quit => self.quit_now = true,
+        }
+    }
+
+    /// **The window is closing.** `true` means it must not, yet.
+    pub fn intercept_quit(&mut self) -> bool {
+        if self.quit_now {
+            return false;
+        }
+        self.ask_before(AfterSave::Quit)
+    }
+
+    /// The host's cue that the answer was "go", taken once.
+    pub fn take_quit_now(&mut self) -> bool {
+        std::mem::take(&mut self.quit_now)
+    }
+
+    /// Remember what is on disk, so `project_dirty` has something to
+    /// compare against. Called by every road that writes or opens one.
+    fn mark_project_saved(&mut self) {
+        self.saved_state = Some(self.undo_state());
     }
 
     /// The document as UNDO stores it: clips with the desk baked in — one
@@ -9758,6 +10049,10 @@ impl IvoryApp {
 
     /// A fresh project starts a fresh line of time.
     fn undo_reset(&mut self) {
+        // A fresh line of time is also a fresh baseline for "unsaved": every
+        // road into a document — open, save-as, new, launch — ends here, so
+        // this is the one place that cannot be forgotten.
+        self.saved_state = Some(self.undo_state());
         self.history.clear();
         self.hist_at = 0;
         self.undo_commit();
@@ -9842,6 +10137,7 @@ impl IvoryApp {
     /// changed that the engine needs re-pushed.
     pub fn save_project_doc(&mut self) {
         self.arrangement.desk = Some(self.desk_snapshot());
+        self.mark_project_saved();
         if let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) {
             self.arrangement.save_to(&doc);
         }
@@ -16323,7 +16619,13 @@ impl IvoryApp {
     pub fn finish_save_choice(&mut self, purpose: crate::ports::SavePurpose, path: &std::path::Path) {
         self.native_panel_up = false;
         match purpose {
-            crate::ports::SavePurpose::ProjectCopy => self.save_project_as(path),
+            crate::ports::SavePurpose::ProjectCopy => {
+                self.save_project_as(path);
+                // If a save prompt was standing in front of something, this
+                // is the answer it was waiting for — carry on with it now
+                // that the work is somewhere safe.
+                self.resume_after_save();
+            }
             crate::ports::SavePurpose::Template => {
                 // Only the NAME is honoured — templates have one home.
                 let name = path
@@ -19881,9 +20183,15 @@ impl IvoryApp {
                 self.apply_dialog_action(dialogs::DialogAction::InsertMedia(lane));
             }
             MenuAction::NewProject => {
+                if self.ask_before(AfterSave::New) {
+                    return;
+                }
                 self.project_request = Some(crate::ports::ProjectRequest::New);
             }
             MenuAction::OpenProject => {
+                if self.ask_before(AfterSave::Open) {
+                    return;
+                }
                 self.native_panel_up = true;
                 self.file_request = Some(crate::ports::FileRequest {
                     start_at: self
@@ -20686,6 +20994,32 @@ impl IvoryApp {
     /// script.
     pub fn apply_dialog_action(&mut self, action: DialogAction) {
         match action {
+            // ── the unsaved-changes prompt ───────────────────────────────
+            //
+            // All four answers end the same way: either the thing that was
+            // interrupted happens, or it does not. Nothing here half-does it.
+            DialogAction::SaveChangesSave => {
+                self.save_project_doc();
+                self.resume_after_save();
+            }
+            DialogAction::SaveChangesSaveAs => {
+                // The panel is asynchronous, so the pending action WAITS —
+                // `finish_save_choice` resumes it once a place is chosen,
+                // and a cancelled panel leaves it pending rather than
+                // quitting out from under somebody who backed out.
+                self.native_panel_up = true;
+                let name = self.project_name();
+                self.save_request = Some(crate::ports::SaveRequest {
+                    title: "Save project as".to_owned(),
+                    suggested: name,
+                    purpose: crate::ports::SavePurpose::ProjectCopy,
+                });
+            }
+            DialogAction::SaveChangesDiscard => self.resume_after_save(),
+            DialogAction::SaveChangesCancel => {
+                // The whole point of the answer: nothing happens.
+                self.pending_after_save = None;
+            }
             // The browser asks; the host reads the disk and hands the rows
             // back through `set_browser`.
             DialogAction::ProjectNew => {
@@ -25577,13 +25911,27 @@ mod tests {
             app.take_project_request(),
             Some(crate::ports::ProjectRequest::Template("My Rig".to_owned()))
         );
-        // The seed writes a document with THIS desk on it, once.
+        // **The seed writes the SHIPPED desk, not the one on screen.**
+        //
+        // It used to write the live desk, and it runs on every New — so
+        // opening somebody's session and pressing New re-wrote the default
+        // template with that session's desk, and the template quietly became
+        // whatever was last open. The owner suspected exactly this: "the
+        // default must be loaded and if something is silently overwriting
+        // it, that's a huge problem."
         app.set_channel_kind(3, Some(recorder::ChannelKind::Audio));
         let shelf = root.join("Projects/Templates/default");
         app.seed_template(&shelf);
         let doc = crate::arrangement::Arrangement::load_from(&shelf.join("project.tangent"));
         let desk = doc.desk.expect("the seed left the desk out");
-        assert_eq!(desk.kinds[3], app.settings.channel_kinds[3]);
+        assert_eq!(
+            desk, IvoryApp::template_desk(),
+            "the seed captured the session that was open"
+        );
+        assert_ne!(
+            desk.kinds[3], app.settings.channel_kinds[3],
+            "the fixture did not actually differ from the template"
+        );
         // Seeding again does not overwrite a template that exists.
         app.set_channel_kind(3, None);
         app.seed_template(&shelf);
@@ -25612,7 +25960,10 @@ mod tests {
         app.set_insert(2, 0, Some("/x/EP.vst3"));
         app.settings.channel_gains[2] = 0.42;
         app.settings.record_export.tempo_bpm = 93.0;
-        app.arr_save_edits();
+        // **Saved on purpose.** `arr_save_edits` no longer writes — the
+        // autosave is retired — so a test that reads the disk has to ask for
+        // the save the person would have asked for.
+        app.save_project_doc();
         let doc = app.project_doc().unwrap().to_path_buf();
 
         // The document on disk carries it.
@@ -25719,9 +26070,13 @@ mod tests {
         app.me_create_note(30.0, 60);
         assert_eq!(app.arrangement.clips[0].notes.len(), 1);
 
-        // Delete writes the document down.
+        // Delete edits the SESSION, and a save writes it down. It used to
+        // reach the disk by itself, which is an autosave under another name
+        // — see `arr_save_edits`.
         app.me_delete_selected();
         assert!(app.arrangement.clips[0].notes.is_empty());
+        assert!(app.project_dirty(), "the delete left the project clean");
+        app.save_project_doc();
         let doc = app.project_doc().unwrap().to_path_buf();
         let read = crate::arrangement::Arrangement::load_from(&doc);
         assert!(read.clips[0].notes.is_empty(), "the delete did not save");
@@ -27406,6 +27761,9 @@ mod tests {
         std::fs::write(&file, b"pcm, allegedly").expect("write");
         app.import_audio_at(&file, 4, 10.0).expect("import");
         assert_eq!(app.arrangement().clips.len(), 1);
+        // Kept on purpose before walking away: with the autosave retired,
+        // what a relaunch finds is what was SAVED.
+        app.save_project_doc();
         // "Relaunch": a second app wakes with the remembered project path.
         let mut remembered = Settings::default();
         remembered.project_path = app.settings.project_path.clone();
@@ -27590,10 +27948,11 @@ mod tests {
         assert!((tail.fade_out_s - 5.0).abs() < 1e-9);
         assert_ne!(head.id, tail.id);
 
-        // Delete the tail; the document on disk keeps up.
+        // Delete the tail; a save carries it to the disk.
         app.arr_selected = Some(tail.id);
         app.arr_delete_selected();
         assert_eq!(app.arrangement().clips.len(), 1);
+        app.save_project_doc();
         let doc = app.project_doc().unwrap().to_path_buf();
         assert_eq!(Arrangement::load_from(&doc).clips.len(), 1);
 
@@ -33153,31 +33512,6 @@ mod tests {
     /// width at every pane, AND the aspect really is constant across the
     /// range of widths where nothing is damped.
     #[test]
-    #[test]
-    fn probe_arrangement_height() {
-        let settings = Settings {
-            show_fretboard: true,
-            show_recorder: true,
-            show_welcome: false,
-            show_chord_strip: true,
-            chord_detection_enabled: true,
-            theory_order: theory_panel::Views::all().keys(),
-            ..Settings::first_launch()
-        };
-        for w in [1300.0f32, 1600.0, 1920.0, 2560.0, 3440.0] {
-            let b = fit_bands(&settings, Vec2::new(w, 100_000.0));
-            let total = b.total();
-            let arr = total.y - b.recorder_h;
-            eprintln!(
-                "PROBE w={w} total={:.0}x{:.0} recorder_h={:.0} arrangement_h={:.0} -> auto row = {:.1}pt",
-                total.x, total.y, b.recorder_h, arr,
-                // 8 lanes + 1 automation row (0.5) + master row: the divisor
-                // the panel uses.
-                (arr - (arr * 0.10)) / (8.0 + 0.5) * 0.5
-            );
-        }
-    }
-
     fn dragging_the_window_zooms_the_layout_and_never_stretches_it() {
         let settings = Settings { show_recorder: true, show_welcome: false, ..Settings::default() };
         for pane in [
@@ -34447,6 +34781,226 @@ mod folder_tests {
     /// live in the master's automation, and "the master needs all automation
     /// parameters available for this to work" — this is that lane, built the
     /// same way a track's is so the tempo has somewhere to arrive.
+    /// **The master fader is never dead.**
+    ///
+    /// Taken from the owner's own session, which came back from a morning's
+    /// testing with `master_gain: 1.0` written on the desk and the master
+    /// row's base node at 0.448 — which is -27.7 dB. The engine obeys the
+    /// curve, so every track played 28 dB down; the fader read 0.0 dB and
+    /// pushing it did nothing, because nothing carried the fader back to the
+    /// node it was being overruled by. "Audio SUPER quiet overall."
+    #[test]
+    fn a_fader_moves_the_base_node_it_would_otherwise_be_overruled_by() {
+        use crate::automation::{AutoParam, Point, Shape};
+        use crate::mixer_panel::Hit as M;
+        use crate::recorder::Column;
+        use crate::arrangement_panel::MASTER_LANE;
+        let mut a = app();
+        let base = |a: &IvoryApp, lane: usize, p: AutoParam| {
+            a.arrangement
+                .automation
+                .get(lane, p)
+                .and_then(|c| c.points().first())
+                .map(|q| q.value)
+        };
+
+        // The master's row, with nothing on it but the node the owner's
+        // session had.
+        a.arrangement.automation.entry(MASTER_LANE, AutoParam::Gain).put(Point {
+            at_s: 0.0,
+            value: 0.448,
+            shape: Shape::Linear,
+        });
+        a.settings.master_gain = 1.0;
+
+        // Push the master fader to the top. The node has to come with it, or
+        // the push does nothing at all.
+        a.apply_mixer_hit(M::Fader(Column(crate::arrangement_panel::MASTER_COLUMN)), 1.0);
+        let moved = base(&a, MASTER_LANE, AutoParam::Gain).expect("the node vanished");
+        assert!(
+            (moved - 1.0).abs() < 1.0e-6,
+            "the master fader did not carry its base node: {moved}"
+        );
+
+        // A channel's is the same rule.
+        a.arrangement.automation.entry(2, AutoParam::Gain).put(Point {
+            at_s: 0.0,
+            value: 0.2,
+            shape: Shape::Linear,
+        });
+        a.apply_mixer_hit(M::Fader(Column(2)), 0.75);
+        let moved = base(&a, 2, AutoParam::Gain).expect("the node vanished");
+        assert!((moved - 0.75).abs() < 1.0e-6, "a channel fader left its base behind: {moved}");
+
+        // **But a curve somebody DREW is not dragged about by a fader.**
+        // Past one node the shape is the point, and the curve is meant to
+        // overrule the hand.
+        a.arrangement.automation.entry(3, AutoParam::Gain).put(Point {
+            at_s: 0.0,
+            value: 0.2,
+            shape: Shape::Linear,
+        });
+        a.arrangement.automation.entry(3, AutoParam::Gain).put(Point {
+            at_s: 4.0,
+            value: 0.9,
+            shape: Shape::Linear,
+        });
+        a.apply_mixer_hit(M::Fader(Column(3)), 0.75);
+        let kept = base(&a, 3, AutoParam::Gain).expect("the node vanished");
+        assert!(
+            (kept - 0.2).abs() < 1.0e-6,
+            "a fader flattened a drawn curve's first node: {kept}"
+        );
+    }
+
+    /// **And a session already saved with the two disagreeing opens honest.**
+    ///
+    /// The node wins, because the node is what is being heard: the fader
+    /// drops to where the sound actually is instead of the mix staying
+    /// quiet with nothing on screen to say why.
+    #[test]
+    fn opening_a_session_lands_the_fader_where_the_base_node_is() {
+        use crate::automation::{AutoParam, Point, Shape};
+        use crate::arrangement_panel::MASTER_LANE;
+        let mut a = app();
+        a.settings.master_gain = 1.0;
+        a.arrangement.automation.entry(MASTER_LANE, AutoParam::Gain).put(Point {
+            at_s: 0.0,
+            value: 0.448,
+            shape: Shape::Linear,
+        });
+        a.reconcile_auto_bases();
+        let want = f64::from(recorder::fader_to_gain(0.448));
+        assert!(
+            (a.settings.master_gain - want).abs() < 1.0e-4,
+            "the desk still claimed unity while the curve played {want}: {}",
+            a.settings.master_gain
+        );
+    }
+
+    /// **The default template is a stencil, not a session.**
+    ///
+    /// `seed_template` wrote the LIVE desk into it, and it is called on every
+    /// New — so opening somebody's project and pressing New re-wrote the
+    /// default with that project's desk, and the template quietly became
+    /// whatever was last open. The owner suspected exactly that: "if
+    /// something is silently overwriting it, that's a huge problem."
+    #[test]
+    fn the_template_desk_is_the_shipped_one_whatever_is_on_screen() {
+        use crate::recorder::{Strip, CHANNELS, INSERTS};
+        let d = IvoryApp::template_desk();
+        // Two rows, and only two: the built-in on one, the drums on two.
+        assert_eq!(d.tracks_added, 0b11, "the template is not two tracks");
+        let bay = |ch: usize| d.inserts[Strip::Channel(ch).index() * INSERTS].as_str();
+        assert_eq!(bay(0), crate::dialogs::BUILTIN_PATH, "channel 1 is not the DX7");
+        assert_eq!(bay(1), crate::dialogs::DRUMPAD_PATH, "channel 2 is not the drums");
+        for ch in 2..CHANNELS {
+            assert!(bay(ch).is_empty(), "channel {} came with a plugin", ch + 1);
+        }
+
+        // **And it does not move with the session.** A desk with eight
+        // tracks, renamed and re-plugged, must produce the same stencil.
+        let mut a = app();
+        for n in 0..8 {
+            a.add_bare_track(n);
+        }
+        a.settings.strip_names = vec![String::new(); crate::recorder::STRIPS + 1];
+        a.settings.strip_names[Strip::Channel(3).index()] = "Loud Guitar".to_owned();
+        a.set_insert(Strip::Channel(5).index(), 0, Some("/some/Plugin.vst3"));
+        assert_eq!(
+            IvoryApp::template_desk(),
+            d,
+            "the template captured the session that was open"
+        );
+    }
+
+    /// **Which channels exist is part of the document.**
+    ///
+    /// It was the one part of a desk not written down, so opening a project
+    /// applied its levels and bays over whatever rows were on screen and
+    /// left the rows behind: the owner's "click new track → no channels are
+    /// deleted".
+    #[test]
+    fn a_desk_snapshot_carries_which_channels_exist() {
+        let mut a = app();
+        for n in [0usize, 1, 2, 3, 4] {
+            a.add_bare_track(n);
+        }
+        assert_eq!(a.settings.tracks_added & 0b11111, 0b11111);
+
+        // Applying the template's desk leaves exactly its two rows.
+        let d = IvoryApp::template_desk();
+        a.apply_desk_snapshot(&d);
+        assert_eq!(
+            a.settings.tracks_added, 0b11,
+            "the previous session's rows survived the template"
+        );
+
+        // And it round-trips through the document.
+        let mut arr = crate::arrangement::Arrangement::default();
+        arr.desk = Some(d.clone());
+        let back = crate::arrangement::Arrangement::from_json(&arr.to_json());
+        assert_eq!(
+            back.desk.expect("no desk").tracks_added,
+            d.tracks_added,
+            "the row count did not survive the file"
+        );
+
+        // **A document written before this key existed still opens with its
+        // tracks.** Reconstructed from what the rest of the desk describes,
+        // not assumed empty — that would open every old project bare.
+        let mut older = serde_json::from_str::<serde_json::Value>(&arr.to_json())
+            .expect("valid json");
+        older["desk"].as_object_mut().expect("desk").remove("tracks_added");
+        let back = crate::arrangement::Arrangement::from_json(&older.to_string());
+        assert_eq!(
+            back.desk.expect("no desk").tracks_added,
+            0b11,
+            "an older document lost the tracks it described"
+        );
+    }
+
+    /// **Nothing is written until somebody says so, and leaving asks.**
+    ///
+    /// Every edit used to reach the disk within a frame, which is an
+    /// autosave in all but name: there was never an unsaved change, so the
+    /// question could not arise. The owner: "no 'autosave' should be enabled
+    /// at ANY form of the process."
+    #[test]
+    fn an_edit_is_unsaved_until_it_is_saved_and_quitting_asks() {
+        let mut a = app();
+        a.undo_reset();
+        assert!(!a.project_dirty(), "a freshly opened project is dirty");
+
+        // An edit does not reach the disk, and does say so.
+        a.settings.master_gain = 0.3;
+        a.arr_save_edits();
+        assert!(a.project_dirty(), "an edit left the project clean");
+
+        // Quitting into that asks, and does NOT quit.
+        assert!(a.intercept_quit(), "quitting did not ask");
+        assert!(
+            matches!(a.dialog, Some(dialogs::Dialog::SaveChanges { .. })),
+            "no prompt was raised"
+        );
+        assert!(!a.take_quit_now(), "it quit anyway");
+
+        // Cancel leaves everything exactly as it was.
+        a.apply_dialog_action(dialogs::DialogAction::SaveChangesCancel);
+        assert!(!a.take_quit_now(), "cancel quit the app");
+        assert!(a.project_dirty(), "cancel discarded the change");
+
+        // Discard goes through.
+        assert!(a.intercept_quit());
+        a.apply_dialog_action(dialogs::DialogAction::SaveChangesDiscard);
+        assert!(a.take_quit_now(), "discard did not let the window close");
+
+        // A clean project does not ask at all.
+        a.undo_reset();
+        assert!(!a.project_dirty());
+        assert!(!a.intercept_quit(), "a clean project asked anyway");
+    }
+
     #[test]
     fn the_master_owns_automation_rows_like_a_track_does() {
         use crate::arrangement_panel::MASTER_LANE;

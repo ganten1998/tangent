@@ -423,6 +423,20 @@ pub struct DeskSnap {
     pub sig_beats: u8,
     pub sig_unit: u8,
     pub metronome_on: bool,
+    /// **Which channels EXIST**, one bit each.
+    ///
+    /// A desk is not only how the strips are set — it is which of them are
+    /// there at all, and this was the one part of that not written down. So
+    /// opening a document (or making a New one from a template) applied its
+    /// levels, names and bays over whatever rows happened to be on screen
+    /// and left the rows themselves behind: the owner's "click new track →
+    /// no channels are deleted".
+    ///
+    /// Appended, and absent in every document written before this. See
+    /// `from_value`, which reconstructs it from the rest of the snapshot
+    /// rather than assuming an empty desk — a v4 document that says nothing
+    /// about its rows still knows which ones it described.
+    pub tracks_added: u32,
 }
 
 impl DeskSnap {
@@ -474,6 +488,9 @@ impl DeskSnap {
         m.insert("sig_beats".into(), Value::Number(u64::from(self.sig_beats).into()));
         m.insert("sig_unit".into(), Value::Number(u64::from(self.sig_unit).into()));
         m.insert("metronome_on".into(), Value::Bool(self.metronome_on));
+        // Appended, at the END — the settings file's own rule, and this
+        // struct answers to it for the same reason.
+        m.insert("tracks_added".into(), Value::Number(u64::from(self.tracks_added).into()));
         Value::Object(m)
     }
 
@@ -496,6 +513,21 @@ impl DeskSnap {
                 .map(|a| a.iter().filter_map(Value::as_f64).collect())
                 .unwrap_or_default()
         };
+        // Hoisted for the `tracks_added` fallback below, which reconstructs
+        // the missing bits from what the rest of the snapshot says.
+        let kinds_v: Vec<u8> = m
+            .get("kinds")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n as u8)).collect())
+            .unwrap_or_default();
+        let names_v = strings("names");
+        let inputs_v = strings("inputs");
+        let inserts_v = strings("inserts");
+        let colors_v: Vec<i64> = m
+            .get("colors")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_i64).collect())
+            .unwrap_or_default();
         Some(Self {
             kinds: m
                 .get("kinds")
@@ -532,6 +564,39 @@ impl DeskSnap {
                 .get("metronome_on")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            // **Absent in older documents, and reconstructed rather than
+            // assumed empty.** A v4 desk said which rows it described by
+            // describing them: a channel with a kind, a name, a colour, an
+            // input or a plugin in a bay is a channel that was there.
+            // Defaulting to zero would open every old project with no
+            // tracks on it.
+            tracks_added: m
+                .get("tracks_added")
+                .and_then(Value::as_u64)
+                .map_or_else(
+                    || {
+                        let mut bits = 0u32;
+                        for n in 0..crate::recorder::CHANNELS.min(32) {
+                            let kind = kinds_v.get(n).copied().unwrap_or(0) != 0;
+                            let at = crate::recorder::Strip::Channel(n).index();
+                            let named =
+                                names_v.get(at).is_some_and(|s| !s.is_empty());
+                            let coloured = colors_v.get(at).copied().unwrap_or(0) != 0;
+                            let input =
+                                inputs_v.get(n).is_some_and(|s| !s.is_empty());
+                            let bay = (0..crate::recorder::INSERTS).any(|b| {
+                                inserts_v
+                                    .get(at * crate::recorder::INSERTS + b)
+                                    .is_some_and(|p| !p.is_empty())
+                            });
+                            if kind || named || coloured || input || bay {
+                                bits |= 1 << n;
+                            }
+                        }
+                        bits
+                    },
+                    |v| v as u32,
+                ),
         })
     }
 }

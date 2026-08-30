@@ -154,7 +154,30 @@ pub fn camera_split_x(rect: Rect, view: &RecorderView<'_>) -> f32 {
 const BAND_DAMP_FROM: f64 = 1600.0;
 
 /// The most of its linear height the band may give back. See [`band_height`].
-const BAND_DAMP_FLOOR: f64 = 0.70;
+///
+/// **0.63, down from 0.70**, which is the same ten per cent the exponent
+/// takes: without it the floor would have caught the wide screens a few
+/// hundred points past the owner's, and they would have kept the old height
+/// while everything narrower got shorter.
+const BAND_DAMP_FLOOR: f64 = 0.63;
+
+/// How the band grows with width once past [`BAND_DAMP_FROM`].
+///
+/// **0.2758, down from 0.5 (a square root).** Solved, not picked: the owner
+/// asked for "around another 10 percent height reduction" at the size they
+/// actually work at, and this display is 2560 points wide, so the exponent is
+/// whatever makes 2560 come out a tenth shorter than the root did —
+///
+///     (2560/1600)^p = 0.9 * sqrt(2560/1600)   =>   p = ln(0.9*sqrt(1.6))/ln(1.6)
+///
+/// A flat 0.9 multiplier would have been the obvious way to write "ten per
+/// cent shorter" and it is the wrong one: it applies at 1601 points as
+/// hard as at 2560, so the band would SNAP 23 points shorter the moment a
+/// dragged window crossed the threshold. The exponent is continuous there by
+/// construction — at 1600 it is still 1.0 — and the reduction arrives
+/// gradually as the window widens toward maximised, which is the only place
+/// the owner asked for it.
+const BAND_DAMP_EXP: f64 = 0.2758;
 
 pub fn band_height(w: f32) -> f32 {
     // **The band stops growing in step with the window once the window is
@@ -170,21 +193,30 @@ pub fn band_height(w: f32) -> f32 {
     //
     // So the law is linear up to `BAND_DAMP_FROM` — every window anybody
     // works in, unchanged, which is the part that must not move — and grows
-    // with the SQUARE ROOT of the width above it. Square root because it is
-    // the honest middle: linear is what is wrong, constant would make the
-    // band shrink to a sliver on a wide screen, and the root gives back
-    // roughly a fifth at 2560 and a quarter at 3000.
+    // as a FRACTIONAL POWER of the width above it. A power because it is the
+    // honest middle: linear is what is wrong, constant would make the band
+    // shrink to a sliver on a wide screen, and a root gives back a useful
+    // slice while still growing.
     //
-    //   1600 →  0%      1920 →  9%      2560 → 21%      3440 → 30% (floored)
+    // **Steeper since the owner asked for "around another 10 percent" at
+    // maximised** — see [`BAND_DAMP_EXP`] for why that is one exponent and
+    // not a multiplier. What the two versions come to, against the linear
+    // height the band would have had:
     //
-    // The floor is what stops a 5K or an ultrawide from taking half the band
+    //   width   linear   was    now    now vs was
+    //   1600     233     233    233        0%     (nothing that fits a window moves)
+    //   1920     280     256    245       -4%
+    //   2560     374     295    266      -10%     (this display, maximised)
+    //   3440     502     351    316      -10%     (floored, both)
+    //
+    // The floor is what stops a 5K or an ultrawide from taking the whole band
     // away: past a point the controls do need their room, and "shorter" was
     // asked for as a range and not as a direction to keep going in.
     let w = f64::from(w);
     let linear = BAND_H_AT_1300 * w / 1300.0;
     let h = if w > BAND_DAMP_FROM {
         let at_ref = BAND_H_AT_1300 * BAND_DAMP_FROM / 1300.0;
-        (at_ref * (w / BAND_DAMP_FROM).sqrt()).max(linear * BAND_DAMP_FLOOR)
+        (at_ref * (w / BAND_DAMP_FROM).powf(BAND_DAMP_EXP)).max(linear * BAND_DAMP_FLOOR)
     } else {
         linear
     };
@@ -6740,6 +6772,12 @@ mod tests {
     /// and "that extra horizontal room? let the oscillator grow
     /// horizontally".
     ///
+    /// **Then, having lived with it: "lower the max scaling of the master in
+    /// maximized and full screen to be even shorter … by around another 10
+    /// percent height reduction."** So the range asked for is the old one
+    /// times nine tenths — 24 to 37 per cent — and the band at this display's
+    /// maximised width lands in the middle of it.
+    ///
     /// Both halves are here because they are one change: the band's height
     /// stops following the width, which makes the LCD box relatively wider,
     /// and the scope takes what the digits do not need.
@@ -6756,8 +6794,9 @@ mod tests {
             );
         }
 
-        // Wide: shorter, and inside the range that was asked for.
-        for (w, lo, hi) in [(2560.0f32, 0.15, 0.30), (3440.0, 0.15, 0.31)] {
+        // Wide: shorter, and inside the range that was asked for. 3440 sits
+        // on the floor, which is 0.63 of linear and therefore exactly 37%.
+        for (w, lo, hi) in [(2560.0f32, 0.24, 0.32), (3440.0, 0.24, 0.375)] {
             let linear = super::BAND_H_AT_1300 * f64::from(w) / 1300.0;
             let got = f64::from(super::band_height(w));
             let cut = 1.0 - got / linear;
@@ -6773,7 +6812,7 @@ mod tests {
         for w in [5120.0f32, 7680.0] {
             let linear = super::BAND_H_AT_1300 * f64::from(w) / 1300.0;
             let cut = 1.0 - f64::from(super::band_height(w)) / linear;
-            assert!(cut <= 0.31, "at {w} the band lost {:.0}%", cut * 100.0);
+            assert!(cut <= 0.375, "at {w} the band lost {:.0}%", cut * 100.0);
         }
 
         // **The scope grows.** Measured as its share of the LCD box, which is
@@ -8378,6 +8417,52 @@ mod tests {
                 // layout function alone decided.
                 assert_eq!(band_height(w), want);
             }
+        }
+    }
+
+    /// **The damped half of the height law, in numbers.**
+    ///
+    /// The band is linear in width up to [`BAND_DAMP_FROM`] and shorter than
+    /// linear past it, and the owner has now asked for that reduction twice —
+    /// so what it comes to at a maximised window is a decision worth writing
+    /// down. A change to [`BAND_DAMP_EXP`] that moves the sizes people
+    /// actually work at should fail here rather than be noticed on screen.
+    #[test]
+    fn the_band_is_shorter_than_linear_once_the_window_is_wide() {
+        let linear = |w: f64| (190.0 * w / 1300.0).trunc();
+
+        // Nothing at or below the threshold moves. This is the half that must
+        // never change: "at 100 percent the app feels perfect visually".
+        for w in [800.0_f32, 1300.0, 1599.0, 1600.0] {
+            assert_eq!(
+                band_height(w),
+                linear(f64::from(w)) as f32,
+                "the band stopped being linear at {w}pt"
+            );
+        }
+
+        // And past it, the measured law — see the table in `band_height`.
+        for (w, want) in [(1920.0_f32, 245.0), (2560.0, 266.0), (3440.0, 316.0)] {
+            assert_eq!(band_height(w), want, "the damped height moved at {w}pt");
+        }
+
+        // The shape of it, stated as properties rather than as points: it
+        // still GROWS with the window (a band that shrank as the screen got
+        // wider would be a bug, not a preference), it is always shorter than
+        // linear once damped, and it never gives back more than the floor.
+        let mut last = 0.0_f32;
+        let mut w = 400.0_f32;
+        while w <= 5120.0 {
+            let h = band_height(w);
+            assert!(h >= last, "the band shrank going from {}pt to {w}pt", w - 20.0);
+            let lin = linear(f64::from(w)) as f32;
+            assert!(h <= lin, "the band grew past linear at {w}pt");
+            assert!(
+                h >= (lin * BAND_DAMP_FLOOR as f32).trunc() - 1.0,
+                "the band fell through the floor at {w}pt"
+            );
+            last = h;
+            w += 20.0;
         }
     }
 

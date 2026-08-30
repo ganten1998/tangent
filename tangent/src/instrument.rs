@@ -5487,16 +5487,22 @@ impl Renderer {
                 } else {
                     1.0
                 };
-                let g = self.lane_gain[lane] * clip_g;
-                let (l, r) = (cl * env * g * pan[lane].0, cr * env * g * pan[lane].1);
+                // A clip standing on a FOLDER goes into the bus raw — only
+                // its own clip gain — for the reason the channel loop
+                // gives: the strip's fader, pan and send belong to the fold.
+                let folded = self.folder_is[lane];
+                let g = if folded { clip_g } else { self.lane_gain[lane] * clip_g };
+                let (pl, pr) = if folded { (1.0, 1.0) } else { pan[lane] };
+                let (l, r) = (cl * env * g * pl, cr * env * g * pr);
                 peak[lane][0] = peak[lane][0].max(l.abs());
                 peak[lane][1] = peak[lane][1].max(r.abs());
                 // The METER and the STEM still see the whole lane; only the
                 // path to the master closes when the lane feeds a bus.
                 mix[f * TAP_CHANNELS] += l * direct[lane];
                 mix[f * TAP_CHANNELS + 1] += r * direct[lane];
-                aux[f * TAP_CHANNELS] += l * send[lane];
-                aux[f * TAP_CHANNELS + 1] += r * send[lane];
+                let s_lane = if folded { 0.0 } else { send[lane] };
+                aux[f * TAP_CHANNELS] += l * s_lane;
+                aux[f * TAP_CHANNELS + 1] += r * s_lane;
                 if stems {
                     stem[f * CHANNELS * 2 + lane * 2] += l;
                     stem[f * CHANNELS * 2 + lane * 2 + 1] += r;
@@ -5505,7 +5511,9 @@ impl Renderer {
         }
         for (lane, pk) in peak.iter().enumerate() {
             if pk[0] > 0.0 || pk[1] > 0.0 {
-                self.shared.note_strip_peak(Strip::Channel(lane), *pk);
+                if !self.folder_is[lane] {
+                    self.shared.note_strip_peak(Strip::Channel(lane), *pk);
+                }
             }
         }
     }
@@ -5629,6 +5637,45 @@ impl Renderer {
                 .any(|vs| vs.iter().any(PadVoice::active))
             && !any_rack
         {
+            // **The kit's fader advances even while the kit is silent.**
+            //
+            // Leaving early without it is what made a drum track's fader
+            // look broken: a level set during a rest never arrived, so the
+            // next hit came in at the OLD level and slid to the new one over
+            // the smoothing time. Pull a drum track down to nothing between
+            // phrases and the first hit of the next phrase still played, at
+            // full, and ducked away under itself.
+            //
+            // The channel loop has said this in a comment since it was
+            // written — "a fader moved during a rest has to have arrived by
+            // the next note" — and this bus was the one place that did not
+            // do it.
+            let coeff = self.gain_coeff;
+            let drum_mask = self.shared.drum_strips.load(Ordering::Relaxed);
+            for ch in 0..CHANNELS {
+                let target = if drum_mask & (1 << ch.min(31)) != 0 {
+                    if strip_is_heard(Strip::Channel(ch), muted, soloed) {
+                        self.lane_gain(ch)
+                    } else {
+                        0.0
+                    }
+                } else if ch == 0 && drum_mask == 0 {
+                    // The bare drumpad window, which keeps its level in
+                    // slot zero — see `lane_ix`.
+                    if strip_is_heard(Strip::Drums, muted, soloed) {
+                        Shared::f32_of(&self.shared.drums_gain).clamp(0.0, 8.0)
+                    } else {
+                        0.0
+                    }
+                } else {
+                    continue;
+                };
+                if let Some(g) = self.pad_gain.get_mut(ch) {
+                    for _ in 0..frames {
+                        *g += (target - *g) * coeff;
+                    }
+                }
+            }
             return;
         }
         let coeff = self.gain_coeff;
@@ -5919,9 +5966,19 @@ impl Renderer {
         // The kit rides its lane's routing like anything else on that lane:
         // route the drum lane to a bus and the kit goes with it.
         let direct = drum_lane.map_or(1.0, |ch| self.route_direct[ch]);
+        // **A kit standing on a FOLDER goes into the bus raw.** Same rule as
+        // the channel loop's: the folder's fader, pan, send and meter are
+        // the fold's to apply, once, over the whole group. Applied here as
+        // well, a kit on a folder at -6 dB played at -12.
+        let is_folder = drum_lane.is_some_and(|ch| self.folder_is[ch]);
+        let (bus_l, bus_r) = if is_folder { (1.0, 1.0) } else { (bus_l, bus_r) };
+        let bus_send = if is_folder { 0.0 } else { bus_send };
         for f in 0..frames {
+            // The fader still ADVANCES on a folder — it is this lane's own
+            // smoothing state, and letting it stall would land the fader
+            // late the moment the kit came out of the group again.
             self.pad_gain[lane_ix] += (master - self.pad_gain[lane_ix]) * coeff;
-            let g = self.pad_gain[lane_ix];
+            let g = if is_folder { 1.0 } else { self.pad_gain[lane_ix] };
             let l = self.fx_in.first().map_or(0.0, |b| b[f]) * g * bus_l;
             let r = self.fx_in.get(1).map_or(0.0, |b| b[f]) * g * bus_r;
             bus_peak[0] = bus_peak[0].max(l.abs());
@@ -5939,7 +5996,9 @@ impl Renderer {
                 }
             }
         }
-        self.shared.note_strip_peak(bus_strip, bus_peak);
+        if !is_folder {
+            self.shared.note_strip_peak(bus_strip, bus_peak);
+        }
     }
 
     /// The eight general channels: the built-in, the bay voices, and their
@@ -6301,6 +6360,22 @@ impl Renderer {
                 }
             }
 
+            // **A FOLDER's own row does none of this here.**
+            //
+            // A folder is a strip, and every part of being a strip — its
+            // rack, its delay line, its fader, its pan, its send, its meter
+            // — happens once, in `fold_folders`, over the whole group. This
+            // loop walked it like any other channel and did the lot a
+            // SECOND time: the rack ran twice per block, so a stateful
+            // plugin (a reverb, a delay, a compressor) advanced at twice
+            // real time and put out noise — the owner's "dragging track 5
+            // out of folder 3 causes it to static". The fader hit its own
+            // row twice, so a clip standing on a folder at -6 dB played at
+            // -12. And the delay line ran twice on one ring, so every block
+            // came back part group and part row.
+            //
+            // So a folder contributes its RAW row to the bus and stops.
+            let is_folder = self.folder_is[ch];
             // A lane renders when something can SOUND on it: its own live
             // arm, or clips standing on it — through the built-in or a rack.
             let feeds = armed || lane_has_clips || !lane_notes.is_empty();
@@ -6308,13 +6383,19 @@ impl Renderer {
                 // **The gain is advanced whether or not anything renders.** A
                 // fader moved during a rest has to have arrived by the next
                 // note, or it comes in at the old level and slides.
-                let target = if channel_is_heard(ch, &parents, muted, soloed) {
-                    self.lane_gain(ch)
-                } else {
-                    0.0
-                };
-                for _ in 0..frames {
-                    self.channel_gain[ch] += (target - self.channel_gain[ch]) * coeff;
+                //
+                // A folder's is advanced by the FOLD instead, every block
+                // without exception, so advancing it here too would smooth
+                // it twice as fast and land the fader early.
+                if !is_folder {
+                    let target = if channel_is_heard(ch, &parents, muted, soloed) {
+                        self.lane_gain(ch)
+                    } else {
+                        0.0
+                    };
+                    for _ in 0..frames {
+                        self.channel_gain[ch] += (target - self.channel_gain[ch]) * coeff;
+                    }
                 }
                 continue;
             }
@@ -6346,7 +6427,7 @@ impl Renderer {
                     continue;
                 }
             }
-            if rack_live {
+            if rack_live && !is_folder {
                 let controls: &[tangent_host::Control] = if armed { &self.controls } else { &[] };
                 run_rack(
                     &mut self.racks[ch],
@@ -6371,7 +6452,15 @@ impl Renderer {
             // plugin off does not leave the lane early by its own latency
             // for one block before the figures catch up.
             {
-                let own = Rack::latency(&self.shared, ch);
+                // A folder's row has passed through NO rack yet — its own
+                // runs over the sum — so it waits the whole of the maximum,
+                // which is exactly what its children's stems have already
+                // waited. Row and children therefore meet aligned.
+                let own = if is_folder {
+                    0
+                } else {
+                    Rack::latency(&self.shared, ch)
+                };
                 let want = usize::try_from(pdc_max.saturating_sub(own)).unwrap_or(0);
                 if let Some(line) = self.pdc.get_mut(ch) {
                     line.run(&mut self.fx_in, frames, want);
@@ -6384,8 +6473,18 @@ impl Renderer {
             } else {
                 0.0
             };
-            let send = self.lane_send(Strip::Channel(ch).index());
-            let (pan_l, pan_r) = pan_gains(self.lane_pan(ch));
+            // Unity, centre and no send for a folder: the fold owns all
+            // three, and doing them here as well is doing them twice.
+            let send = if is_folder {
+                0.0
+            } else {
+                self.lane_send(Strip::Channel(ch).index())
+            };
+            let (pan_l, pan_r) = if is_folder {
+                (1.0, 1.0)
+            } else {
+                pan_gains(self.lane_pan(ch))
+            };
             let want = frames * TAP_CHANNELS;
             // Stems and ROUTING share this buffer: a send reads the
             // lane's own audio out of it, so it is filled whenever either
@@ -6401,8 +6500,12 @@ impl Renderer {
             };
             let mut peak = [0.0f32; 2];
             for f in 0..frames {
-                self.channel_gain[ch] += (target - self.channel_gain[ch]) * coeff;
-                let g = self.channel_gain[ch];
+                let g = if is_folder {
+                    1.0
+                } else {
+                    self.channel_gain[ch] += (target - self.channel_gain[ch]) * coeff;
+                    self.channel_gain[ch]
+                };
                 let l = self.fx_in.first().map_or(0.0, |b| b[f]) * g * pan_l;
                 let r = self.fx_in.get(1).map_or(0.0, |b| b[f]) * g * pan_r;
                 peak[0] = peak[0].max(l.abs());
@@ -6420,7 +6523,10 @@ impl Renderer {
                     stem[f * CHANNELS * 2 + ch * 2 + 1] += r;
                 }
             }
-            self.shared.note_strip_peak(Strip::Channel(ch), peak);
+            // The folder's meter is the GROUP's, and the fold reports it.
+            if !is_folder {
+                self.shared.note_strip_peak(Strip::Channel(ch), peak);
+            }
         }
         self.lane_notes = lane_notes;
 
@@ -6510,15 +6616,21 @@ impl Renderer {
                     NO_AUTOMATION,
                 );
             }
-            // And it waits for the slowest chain like every other strip, or
-            // a group with a lookahead limiter on it arrives early.
-            {
-                let own = Rack::latency(&self.shared, ch);
-                let wait = usize::try_from(pdc_max.saturating_sub(own)).unwrap_or(0);
-                if let Some(line) = self.pdc.get_mut(ch) {
-                    line.run(&mut self.fx_in, frames, wait);
-                }
-            }
+            // **No wait here, and that is the point.** Everything in this
+            // sum has already waited: a child's stem was held for
+            // `max - its own rack` on the way out, and this folder's own row
+            // for the whole of `max`, because its rack had not run yet. They
+            // met aligned, so delaying the sum would be a third helping —
+            // and it was taken on the SAME ring the row had just used, which
+            // is what made a grouped track buzz.
+            //
+            // What stays uncompensated is a folder's OWN rack: the group
+            // leaves `L` late, where `L` is that rack's latency. Bounded —
+            // the published maximum already counts it — and only audible
+            // with a lookahead plugin on a bus. Fixing it properly means
+            // projecting clips per lane instead of per block, which is a
+            // larger change than this bug earns.
+            let _ = pdc_max;
             let target = if channel_is_heard(ch, &parents, muted, soloed) {
                 self.lane_gain(ch)
             } else {
@@ -11962,6 +12074,189 @@ mod tests {
     /// **A folder inside a folder**, which the single descending fold has to
     /// get right without recursing: the inner one is the higher index, so it
     /// finishes and folds into the outer before the outer's turn comes.
+    /// **A folder does its folding ONCE.**
+    ///
+    /// A folder is a channel, so `mix_channels` walked it like any other —
+    /// running its rack, its delay line, its fader, its pan and its send —
+    /// and then `fold_folders` did the whole lot again over the group. Four
+    /// double-applications on one strip:
+    ///
+    ///   * the RACK ran twice per block, which for a stateful plugin (a
+    ///     reverb, a delay, a compressor) means its state advances at twice
+    ///     real time and its output is garbage — the owner's "dragging track
+    ///     5 out of folder 3 causes it to static";
+    ///   * the DELAY LINE ran twice, so one ring carried two different
+    ///     signals and every block came back part group, part the folder's
+    ///     own row;
+    ///   * the FADER and PAN hit the folder's own row twice, so a clip
+    ///     standing on a folder at -6 dB played at -12;
+    ///   * and the SEND sent it twice.
+    ///
+    /// The rule that fixes all four: in `mix_channels` a folder contributes
+    /// its RAW row and nothing else. Every part of being a strip happens in
+    /// the fold, once, over the sum.
+    #[test]
+    fn a_folders_own_row_is_faded_once_and_not_twice() {
+        use std::sync::Arc;
+        // The clip stands on lane 3 — the folder's OWN row — and lane 5 is
+        // an empty child, which is what makes lane 3 a folder at all.
+        let render = |folded: bool, gain: f32| -> f32 {
+            let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+            e.set_pad_kit(3, test_kit(&[0], 4_800, 0.5));
+            e.set_drum_strips(1 << 3);
+            e.set_master_gain(1.0);
+            e.set_channel_gain(3, gain);
+            if folded {
+                let mut parents = [-1i32; CHANNELS];
+                parents[5] = 3;
+                assert!(e.set_folders(parents), "the tree was refused");
+                e.set_channel_gain(5, 1.0);
+            }
+            e.set_rolling(false);
+            let mut out = vec![0.0f32; 1024 * 2];
+            for _ in 0..4 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+            }
+            e.set_midi_clips(vec![PlacedMidi {
+                strip: 3, start: 0, len: 48_000,
+                notes: Arc::new(vec![ClipNote { at: 0, dur: 2_400, key: PAD_BASE, vel: 100 }]),
+            }]);
+            e.set_transport(1, 0);
+            e.set_rolling(true);
+            let mut peak = 0.0f32;
+            for _ in 0..4 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                peak = peak.max(out.iter().fold(0.0f32, |a, v| a.max(v.abs())));
+            }
+            peak
+        };
+        let flat = render(false, 0.5);
+        assert!(flat > 0.05, "the fixture makes no sound: {flat}");
+        let grouped = render(true, 0.5);
+        assert!(
+            (grouped - flat).abs() < flat * 0.02,
+            "the folder's own row was faded twice: {grouped} against {flat}"
+        );
+    }
+
+    /// **And a group sounds the same as the tracks did loose, latency and
+    /// all.**
+    ///
+    /// Sample for sample, not peak for peak: the delay line running twice
+    /// left the group's audio correct in level and wrong in time — every
+    /// block came back with a slice of the wrong signal in it, which reads
+    /// as a buzz rather than as a level change and which a peak comparison
+    /// cannot see.
+    #[test]
+    fn grouping_changes_nothing_about_the_sound_even_with_latency() {
+        use std::sync::Arc;
+        let render = |folded: bool| -> Vec<f32> {
+            let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+            e.set_pad_kit(5, test_kit(&[0], 4_800, 0.5));
+            e.set_channel_gain(5, 1.0);
+            e.set_drum_strips(1 << 5);
+            e.set_master_gain(1.0);
+            // Somebody's chain is 64 frames late, so every lane waits for it.
+            e.set_seat_latency_for_test(0, 0, 64);
+            if folded {
+                let mut parents = [-1i32; CHANNELS];
+                parents[5] = 3;
+                assert!(e.set_folders(parents), "the tree was refused");
+                e.set_channel_gain(3, 1.0);
+            }
+            e.set_rolling(false);
+            let mut out = vec![0.0f32; 1024 * 2];
+            for _ in 0..4 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+            }
+            e.set_midi_clips(vec![PlacedMidi {
+                strip: 5, start: 0, len: 48_000,
+                notes: Arc::new(vec![ClipNote { at: 0, dur: 2_400, key: PAD_BASE, vel: 100 }]),
+            }]);
+            e.set_transport(1, 0);
+            e.set_rolling(true);
+            let mut all = Vec::new();
+            for _ in 0..8 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                all.extend_from_slice(&out);
+            }
+            all
+        };
+        let flat = render(false);
+        let grouped = render(true);
+        assert!(
+            flat.iter().any(|v| v.abs() > 0.05),
+            "the fixture makes no sound at all"
+        );
+        let worst = flat
+            .iter()
+            .zip(&grouped)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst < 1.0e-6,
+            "a group did not sound like the loose tracks: worst sample differs by {worst}"
+        );
+    }
+
+    /// **A drum track's fader arrives before the next hit.**
+    ///
+    /// The kit's bus left early whenever nothing was sounding — no hits, no
+    /// ringing voices, no rack — and the fader's smoothing went with it. So
+    /// a level set during a rest never arrived: the next hit came in at the
+    /// OLD level and slid to the new one under itself. Pulled to silence
+    /// between phrases, a drum track still played its next hit at full.
+    ///
+    /// Found while measuring something else, which is why it is worth a test
+    /// of its own: the fader LOOKED broken, and every part of it worked
+    /// except the part that runs when there is nothing to hear.
+    #[test]
+    fn a_drum_lanes_fader_arrives_while_the_kit_is_silent() {
+        use std::sync::Arc;
+        let hit_after_a_rest = |gain: f32| -> f32 {
+            let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+            e.set_pad_kit(5, test_kit(&[0], 4_800, 0.5));
+            e.set_drum_strips(1 << 5);
+            e.set_master_gain(1.0);
+            e.set_channel_gain(5, gain);
+            // A rest: eight blocks with the fader at its new level and
+            // nothing at all to hear.
+            e.set_rolling(false);
+            let mut out = vec![0.0f32; 1024 * 2];
+            for _ in 0..8 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+            }
+            // Then the first hit. Its FIRST block is what matters — that is
+            // the one a stale fader plays at the wrong level.
+            e.set_midi_clips(vec![PlacedMidi {
+                strip: 5, start: 0, len: 48_000,
+                notes: Arc::new(vec![ClipNote { at: 0, dur: 2_400, key: PAD_BASE, vel: 100 }]),
+            }]);
+            e.set_transport(1, 0);
+            e.set_rolling(true);
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            out.iter().fold(0.0f32, |a, v| a.max(v.abs()))
+        };
+        let open = hit_after_a_rest(1.0);
+        assert!(open > 0.05, "the fixture makes no sound at all: {open}");
+        let half = hit_after_a_rest(0.5);
+        assert!(
+            (half - open * 0.5).abs() < open * 0.05,
+            "the first hit ignored the fader: {half} against {open} wide open"
+        );
+        let shut = hit_after_a_rest(0.0);
+        assert!(
+            shut < open * 0.01,
+            "a drum track pulled to silence still played: {shut}"
+        );
+    }
+
     #[test]
     fn a_folder_inside_a_folder_reaches_the_master_through_both() {
         use std::sync::Arc;
