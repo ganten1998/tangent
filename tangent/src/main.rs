@@ -19,6 +19,9 @@ mod desktop;
 mod macwin;
 #[cfg(feature = "recorder")]
 mod devices;
+
+/// What else is standing between the mix and the speakers.
+mod outpath;
 /// Six-operator FM, and real DX7 cartridges to feed it. The instrument the app
 /// has when it has no instrument, so a fresh install makes a sound. The default
 /// patch is written in the source: no samples, no data, no licence questions.

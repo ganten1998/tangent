@@ -312,6 +312,10 @@ pub enum Dialog {
         /// of it. Two fields that looked identical did two different things,
         /// and the one that looked local was the global one.
         alias: String,
+        /// **What the monitor is actually playing into.** Snapshotted with
+        /// `systems` and `rates`, and for the same reason: it enumerates
+        /// hardware, so it may not be pushed per frame.
+        output_path: crate::ports::OutputPath,
     },
     /// **Which of an interface's inputs the microphone picker should offer.**
     ///
@@ -1207,6 +1211,28 @@ const WELCOME_LINES: [&str; 14] = [
 /// The Audio Status window. Two device blocks, a round-trip line, and a row of
 /// buffer sizes — measured by `the_audio_status_card_fits_its_own_text`.
 const AUDIO_W: f32 = 430.0;
+
+/// The most characters of a DEVICE MAKER the audio panel will print.
+///
+/// Every other string this panel draws is one it wrote itself, so
+/// `the_audio_status_card_fits_its_own_text` can measure them all and prove
+/// they fit. A manufacturer name is the exception: it comes from whatever
+/// driver is installed, and no measurement of strings we know about says
+/// anything about one we do not. Clipping is what turns it back into a
+/// string the panel controls.
+const MAKER_MAX: usize = 46;
+
+/// `s`, cut to `max` characters with an ellipsis when it was longer.
+///
+/// Counted in CHARACTERS and not bytes: a maker name with an accent in it
+/// would panic a byte slice, and the one string here that comes from outside
+/// is exactly the one that might have one.
+fn clipped(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_owned();
+    }
+    s.chars().take(max.saturating_sub(1)).collect::<String>() + "\u{2026}"
+}
 /// The channel chooser. Wide enough for eight buttons on a row, so a
 /// sixteen-in interface is two rows and not five.
 const CHANNELS_W: f32 = 460.0;
@@ -4122,6 +4148,7 @@ pub fn show(
             input_channels,
             exposed,
             alias,
+            output_path,
         } => {
             let t = theme(face);
             show_dialog_viewport(
@@ -4275,6 +4302,80 @@ pub fn show(
                                 .font(plain(10.0))
                                 .color(dim),
                             );
+
+                            // ── who else is in the path ──────────────────────
+                            //
+                            // **Directly under the round trip, because it is
+                            // the explanation for it.** The estimate above is
+                            // buffers, and the sentence "converters and the
+                            // driver add more" is true and useless on its own:
+                            // it names an unknown. These lines name the
+                            // knowable part of that unknown, and the reason
+                            // they exist at all is that the app once spent a
+                            // week measuring itself while another application
+                            // sat downstream at unity gain, adding delay and
+                            // nothing else to hear.
+                            if output_path.worth_saying() {
+                                let rate = status
+                                    .output
+                                    .as_ref()
+                                    .map_or(0, |(_, s)| s.sample_rate);
+                                if let Some(ms) = output_path.extra_ms(rate) {
+                                    // cpal reads neither of these on any
+                                    // platform, so this is time the figure
+                                    // above has never contained.
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "the device reports {ms:.1} ms more, \
+                                             not counted above"
+                                        ))
+                                        .font(plain(10.0))
+                                        .color(dim),
+                                    );
+                                }
+                                if output_path.virtualised {
+                                    ui.label(
+                                        RichText::new("Output is a VIRTUAL device")
+                                            .font(bold(11.0))
+                                            .color(warn),
+                                    );
+                                    // **The maker on its own line, and
+                                    // clipped.** "a virtual device" is a fact;
+                                    // "Rogue Amoeba" is somewhere to go, so it
+                                    // is worth the line. But the string comes
+                                    // from the DEVICE and can be any length,
+                                    // and a panel 430 points wide cannot
+                                    // promise to fit one it has never seen.
+                                    // `the_audio_status_card_fits_its_own_text`
+                                    // measures the budget; this keeps inside
+                                    // it whatever the driver is called.
+                                    if !output_path.maker.is_empty() {
+                                        ui.label(
+                                            RichText::new(clipped(&output_path.maker, MAKER_MAX))
+                                                .font(plain(10.0))
+                                                .color(warn),
+                                        );
+                                    }
+                                    ui.label(
+                                        RichText::new(
+                                            "another app is between the mix and the hardware",
+                                        )
+                                        .font(plain(10.0))
+                                        .color(dim),
+                                    );
+                                } else if output_path.aggregate {
+                                    // Not a warning. An aggregate is how
+                                    // anyone with two interfaces runs them on
+                                    // one clock, and it is named only because
+                                    // its drift correction is a cost a single
+                                    // device does not have.
+                                    ui.label(
+                                        RichText::new("Output is an aggregate device")
+                                            .font(plain(10.0))
+                                            .color(dim),
+                                    );
+                                }
+                            }
                             ui.add_space(10.0);
 
                             // ── the audio system ─────────────────────────────
@@ -8511,6 +8612,28 @@ at: None,
     /// whose rate line runs under the buffer buttons is one nobody can read the
     /// number off, which is its entire job.
     #[test]
+    /// The maker name is the one string on the audio panel that comes from
+    /// OUTSIDE, so the clip that bounds it is worth its own test — including
+    /// the accented case, which a byte slice would panic on.
+    #[test]
+    fn a_makers_name_is_cut_to_the_panels_budget_and_never_mid_character() {
+        assert_eq!(clipped("Focusrite", 46), "Focusrite");
+        // Exactly at the budget is not cut.
+        let exact = "M".repeat(46);
+        assert_eq!(clipped(&exact, 46), exact);
+        // One over is cut, and the result is the budget: 45 kept plus the
+        // ellipsis, so the measured width still holds.
+        let over = "M".repeat(47);
+        let cut = clipped(&over, 46);
+        assert_eq!(cut.chars().count(), 46);
+        assert!(cut.ends_with('\u{2026}'));
+        // Multi-byte, which is the case a byte slice gets wrong.
+        let accented = "Rögue Amöeba Softwäre, Incörporated, and then some more";
+        let cut = clipped(accented, 20);
+        assert_eq!(cut.chars().count(), 20);
+        assert!(accented.starts_with(cut.trim_end_matches('\u{2026}')));
+    }
+
     fn the_audio_status_card_fits_its_own_text() {
         let ctx = egui::Context::default();
         fonts::install(&ctx, fonts::FontChoice::default(), None);
@@ -8540,6 +8663,16 @@ at: None,
             // the measurement that decides how wide the panel is.
             "what the mixer calls this interface - \"x\" makes \"x - 3\"".to_owned(),
             "the interface's own name".to_owned(),
+            // The output-path lines. The maker is the one string on this
+            // panel that comes from OUTSIDE, so it is measured at exactly the
+            // length the panel will clip it to — `MAKER_MAX` of the widest
+            // character Courier has, which is every character, it being
+            // monospaced.
+            "the device reports 10.7 ms more, not counted above".to_owned(),
+            "Output is a VIRTUAL device".to_owned(),
+            "M".repeat(MAKER_MAX),
+            "another app is between the mix and the hardware".to_owned(),
+            "Output is an aggregate device".to_owned(),
         ];
         let mut widest = 0.0_f32;
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
@@ -8551,6 +8684,10 @@ at: None,
                         2 | 3 | 4 => (11.0, fonts::courier_bold()),
                         // The captions and the small print, at 10.
                         5..=13 => (10.0, fonts::courier()),
+                        // The output-path block: its heading is bold at 11
+                        // and everything under it is small print at 10.
+                        15 => (11.0, fonts::courier_bold()),
+                        14 | 16..=18 => (10.0, fonts::courier()),
                         _ => (11.0, fonts::courier()),
                     };
                     let g = ui.painter().layout_no_wrap(

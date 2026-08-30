@@ -245,7 +245,7 @@ impl Anchor {
 }
 
 /// One piece of audio or MIDI standing on the timeline.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ArrClip {
     pub kind: ClipKind,
     /// A MIDI clip's notes. Empty on audio clips, and on a MIDI item that
@@ -333,6 +333,48 @@ pub struct ArrClip {
     /// which is why the bag arrives BEFORE any of them rather than after the
     /// first one loses somebody's work.
     pub extra: Map<String, Value>,
+}
+
+impl Default for ArrClip {
+    /// **The same clip `from_json` builds from a document that says nothing.**
+    ///
+    /// It was derived, which made `stretch` and `gain` ZERO — and zero is not
+    /// what an unwritten stretch means. The reader raises an absent or
+    /// out-of-range ratio to 1.0, and the writer omits the key when it IS
+    /// 1.0, so a derived clip wrote `"stretch": 0.0`, read back as 1.0, and
+    /// wrote nothing the second time: `to_json(from_json(x)) != x`.
+    ///
+    /// That is undo's comparison, and a document that is not a fixed point
+    /// makes every undo look like an edit. It also aimed a real gun at
+    /// anything that ever builds a clip this way: `desktop.rs` stretches
+    /// whenever the ratio is not 1.0, and `stretch()` CLAMPS 0.0 to the
+    /// smallest ratio it allows rather than to unity — so a clip made from
+    /// `Default` would have been time-stretched to a quarter of itself.
+    /// Every real construction site fills these in by hand, which is the only
+    /// reason it never shipped.
+    fn default() -> Self {
+        Self {
+            kind: ClipKind::default(),
+            notes: Vec::new(),
+            lane: 0,
+            path: String::new(),
+            start_s: 0.0,
+            offset_s: 0.0,
+            len_s: 0.0,
+            loop_s: 0.0,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name: String::new(),
+            id: 0,
+            anchor: Anchor::default(),
+            follow_tempo: false,
+            // The two the reader defaults to unity. See above.
+            stretch: 1.0,
+            gain: 1.0,
+            stretch_mode: String::new(),
+            extra: Map::new(),
+        }
+    }
 }
 
 impl ArrClip {
@@ -984,9 +1026,28 @@ impl Arrangement {
             "arrangement_version".into(),
             Value::Number(self.version.into()),
         );
+        // **Written NORMALISED, so that reading it back is a fixed point.**
+        //
+        // `from_json` raises whatever it finds to `max(highest id + 1, 1)`,
+        // because a document whose counter is behind its clips would hand out
+        // an id that is already taken. Writing the raw value meant a fresh
+        // arrangement wrote 0 and read back 1 — `to_json(from_json(x)) != x`
+        // for the commonest document there is.
+        //
+        // That is not cosmetic. UNDO compares the live document against the
+        // moment it is standing on, and a mismatch means "something changed":
+        // so every undo pushed a moment identical to the one already on top,
+        // truncated the redo tail to make room for it, and then stepped back
+        // to exactly where it started. **Undo did nothing and redo was gone.**
+        // The same expression on both sides is the whole fix.
         map.insert(
             "next_clip_id".into(),
-            Value::Number(self.next_id.into()),
+            Value::Number(
+                self.next_id
+                    .max(self.clips.iter().map(|c| c.id + 1).max().unwrap_or(0))
+                    .max(1)
+                    .into(),
+            ),
         );
         if let Some(desk) = &self.desk {
             map.insert("desk".into(), desk.to_value());

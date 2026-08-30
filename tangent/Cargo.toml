@@ -241,6 +241,12 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSResponder",
     "NSView",
     "NSWindow",
+    # Borderless + maximised has to reach the SCREEN it is on and the
+    # presentation options that own the menu bar and the Dock. See
+    # `macwin::cover_screen`.
+    "NSScreen",
+    "NSApplication",
+    "NSRunningApplication",
 ] }
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",

@@ -154,6 +154,18 @@ pub struct AutoView<'a> {
     pub points: &'a [crate::automation::Point],
     /// The point under the pointer or being dragged, so it can be drawn lit.
     pub hot: Option<usize>,
+    /// **The points that are CHOSEN**, by index into `points`.
+    ///
+    /// Separate from `hot`, which is one point and is about the pointer.
+    /// These are what Delete, copy and cut act on, and a thing those keys
+    /// will act on has to look chosen before it is pressed — the same
+    /// argument `selected` makes for the row.
+    ///
+    /// Owned, like `label` beside it: the app resolves this from a selection
+    /// held as `(lane, slot, index)` triples, and there is no slice on its
+    /// side already shaped the way a row wants. A handful of `usize` per
+    /// open row per frame, against a `String` that is already allocated here.
+    pub chosen: Vec<usize>,
     /// **The keyboard is aimed at this row**, so Delete would close it.
     ///
     /// Drawn as the rim a chosen track wears, for the same reason: a thing
@@ -223,39 +235,80 @@ pub fn auto_header(header: Rect) -> AutoHeader {
         dial: Rect::NOTHING,
         readout: Rect::NOTHING,
     };
-    if !header.is_positive() || header.height() < 12.0 || header.width() < 120.0 {
+    // **The floor is where a CONTROL stops being one, not where the design
+    // stops being comfortable.**
+    //
+    // It was 12 points tall and 120 wide, and that was wrong by the width of
+    // the whole feature: an automation row is half a track, and a track is
+    // one eighth of an arrangement that gets whatever the recorder band
+    // leaves. Turn the piano, the fretboard and the theory band OFF — which
+    // is exactly what somebody working in the arrangement DOES, to get the
+    // room — and the stack is 150 points tall, a track is 15, and a row is
+    // SEVEN. Every switch, the dial and its number all fell through the floor
+    // together and the header drew one dim word on an empty plate. The
+    // owner: "no draw of the panels occurs, i can't see any of your added
+    // features at all just dead space."
+    //
+    // Measured, not guessed: `every_control_is_drawn_at_every_height_a_row_
+    // can_have` counts the shapes that actually reach the header.
+    let h = header.height();
+    let w = header.width();
+    if !header.is_positive() || h < 7.0 || w < 96.0 {
         return none;
     }
-    let h = header.height();
-    let pad = 3.0_f32;
-    // Square switches, sized off the row so they stay the same shape as the
-    // row shrinks, with a floor under which they stop being drawn at all.
-    let b = (h - pad * 2.0).clamp(9.0, 16.0);
+    // Padding and switch size both follow the row, so a short row gets small
+    // square switches rather than none.
+    let pad = (h * 0.12).clamp(1.0, 3.0);
+    let b = (h - pad * 2.0).clamp(6.0, 16.0).min(h - 1.0);
     let cy = header.center().y;
-    let cell = |x: f32, w: f32| {
-        Rect::from_center_size(Pos2::new(x + w * 0.5, cy), Vec2::new(w, b))
+    let cell = |x: f32, wd: f32| {
+        Rect::from_center_size(Pos2::new(x + wd * 0.5, cy), Vec2::new(wd, b))
     };
-    let mut x = header.left() + FOLDER_INDENT;
+    // The indent is a fraction of the header on a narrow one: a fixed inset
+    // that is fine at 208 points is a sixth of the row at 96.
+    let mut x = header.left() + FOLDER_INDENT.min(w * 0.06);
     let close = cell(x, b);
     x += b + pad;
     let arm = cell(x, b);
     x += b + pad;
     let bypass = cell(x, b);
     x += b + pad;
-    // The dial and its number own the right end. A column, not a row: the
-    // number sits over the dial.
-    let dial_w = (h * 1.6).clamp(18.0, 34.0);
+
+    // **The dial is SQUARE, and that is a fix as well as a shape.**
+    //
+    // Its rect was as wide as the column and as tall as whatever was left,
+    // and `dial` sizes its knob from the WIDTH — so on a 36-point row it
+    // painted a 34-point circle into a 20-point slot and hung six points into
+    // the row below. A square rect cannot do that whatever the row does.
+    //
+    // The number stacks ABOVE it only when there is room for both. Under
+    // about eighteen points there is not, and a row that spent half its
+    // height on a percentage would have no dial worth turning — so the dial
+    // takes the whole column and the number goes. The dial is the control;
+    // the readout is a convenience.
+    let stacked = h >= 18.0;
+    let col_h = h - 2.0;
+    let knob = if stacked { col_h * 0.60 } else { col_h };
+    let side = knob.min((w * 0.22).max(14.0)).min(34.0);
     let right = header.right() - pad;
-    let dial_col = Rect::from_min_max(
-        Pos2::new(right - dial_w, header.top() + 1.0),
-        Pos2::new(right, header.bottom() - 1.0),
+    let dial = Rect::from_center_size(
+        Pos2::new(
+            right - side * 0.5,
+            if stacked { header.bottom() - 1.0 - side * 0.5 } else { cy },
+        ),
+        Vec2::splat(side),
     );
-    let split = dial_col.top() + dial_col.height() * 0.40;
-    let readout = Rect::from_min_max(dial_col.min, Pos2::new(dial_col.right(), split));
-    let dial = Rect::from_min_max(Pos2::new(dial_col.left(), split), dial_col.max);
+    let readout = if stacked {
+        Rect::from_min_max(
+            Pos2::new(dial.left(), header.top() + 1.0),
+            Pos2::new(right, dial.top()),
+        )
+    } else {
+        Rect::NOTHING
+    };
     let name = Rect::from_min_max(
         Pos2::new(x, header.top()),
-        Pos2::new((dial_col.left() - pad).max(x), header.bottom()),
+        Pos2::new((dial.left() - pad).max(x), header.bottom()),
     );
     if !name.is_positive() {
         return none;
@@ -3266,10 +3319,21 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 continue;
             }
             let hot = auto.hot == Some(lo + i);
+            let chosen = auto.chosen.contains(&(lo + i));
             painter.circle_filled(at, if hot { AUTO_POINT_R + 1.0 } else { AUTO_POINT_R }, curve);
             // A ring in the ground's own colour, so two points close
             // together read as two rather than as a blob.
             painter.circle_stroke(at, AUTO_POINT_R, Stroke::new(1.0, ground));
+            // **Chosen wears the selection rim**, the one a chosen track and
+            // a chosen automation row already wear — outside the ground ring
+            // so it reads at the sizes these handles actually are.
+            if chosen {
+                painter.circle_stroke(
+                    at,
+                    AUTO_POINT_R + 2.0,
+                    Stroke::new(1.4, crate::recorder_panel::selection_rim(ground)),
+                );
+            }
         }
     }
 
@@ -4716,6 +4780,104 @@ ArrangeView {
         Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 420.0))
     }
 
+    /// **Every control on an automation row is actually PAINTED, at every
+    /// height a row can have.**
+    ///
+    /// The regression this exists for: `auto_header` refused to lay out any
+    /// cell below twelve points of row height, and an automation row is half
+    /// a track of an arrangement that gets whatever the recorder band leaves.
+    /// Switch the piano, the fretboard and the theory band off — which is
+    /// what somebody working in the arrangement does, to get the room — and
+    /// the stack is 150 points, a track is 15 and a row is SEVEN. The ×, the
+    /// arm, the bypass and the dial all vanished at once, leaving one dim
+    /// word on a plate, and nothing failed: the layout said `NOTHING`, the
+    /// paint skipped what the layout omitted, and the hit test agreed with
+    /// both. A cell can be laid out, hit-tested and never drawn.
+    ///
+    /// So this does not ask the layout what it INTENDS. It runs the real
+    /// `draw` and looks at the shapes that came out, which is the only
+    /// question that was ever in doubt.
+    #[test]
+    fn every_control_is_drawn_at_every_height_a_row_can_have() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        crate::fonts::apply_text_styles(&ctx);
+        let pts: Vec<crate::automation::Point> = Vec::new();
+        let mut v = a_view(&[]);
+        v.visible_lanes = 8;
+        v.lanes[0].automation = vec![AutoView {
+            selected: false,
+            label: "volume".to_owned(),
+            resting: 0.5,
+            armed: false,
+            bypassed: false,
+            param: crate::automation::AutoParam::Gain,
+            points: &pts,
+            hot: None,
+            chosen: Vec::new(),
+        }];
+        // 673 is the arrangement with every band on; 150 is the arrangement
+        // with them off, which is the case that was broken. The rest are the
+        // sizes in between that a dragged window passes through.
+        for hh in [673.0f32, 400.0, 300.0, 220.0, 180.0, 150.0] {
+            let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, hh));
+            let l = Layout::new(r, &v);
+            let row = l
+                .rows
+                .iter()
+                .find(|x| x.kind == RowKind::Automation(0, 0))
+                .unwrap_or_else(|| panic!("no automation row at {hh}"));
+            let cells = auto_header(row.header);
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(r),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.set_clip_rect(r);
+                        draw(ui.painter(), r, &v);
+                    });
+                },
+            );
+            // Anything as wide as the header or wider is a backdrop — the
+            // row's own plate, the header column's ground — and proves
+            // nothing about a control.
+            let painted = |cell: Rect| {
+                cell.is_positive()
+                    && out.shapes.iter().any(|cs| {
+                        let b = cs.shape.visual_bounding_rect();
+                        b.is_positive()
+                            && b.width() < row.header.width() * 0.9
+                            && cell.intersects(b)
+                    })
+            };
+            for (what, cell) in [
+                ("the close X", cells.close),
+                ("the record arm", cells.arm),
+                ("the bypass", cells.bypass),
+                ("the name", cells.name),
+                ("the dial", cells.dial),
+            ] {
+                assert!(
+                    painted(cell),
+                    "{what} is not drawn on a {:.1}pt row (arrangement {hh}pt)",
+                    row.header.height()
+                );
+            }
+            // **The dial stays inside its own row.** It used to be sized from
+            // the column's WIDTH into a slot defined by the height, so on a
+            // tall row it painted a 34-point knob into a 20-point space and
+            // hung into the row below.
+            assert!(
+                row.header.contains_rect(cells.dial),
+                "the dial {:?} hangs out of its row {:?}",
+                cells.dial,
+                row.header
+            );
+        }
+    }
+
     /// The time mapping round-trips, which is what keeps a clip drawn where
     /// it is grabbed.
 
@@ -4743,6 +4905,7 @@ ArrangeView {
             selected: false,
             points: &[],
             hot: None,
+            chosen: Vec::new(),
         }];
         let l = Layout::new(rect(), &v);
 
@@ -5572,6 +5735,7 @@ selected: false,
                     param: AutoParam::Gain,
                     points: &pts,
                     hot: Some(3),
+                    chosen: Vec::new(),
                 }];
                 let r = Rect::from_min_size(Pos2::ZERO, size);
                 // Painting is the assertion: a NaN or an inverted rect
@@ -5617,6 +5781,7 @@ selected: false,
             param: AutoParam::Gain,
             points: &pts,
             hot: None,
+            chosen: Vec::new(),
         }];
         let l = Layout::new(rect(), &v);
         let row = l
@@ -5659,6 +5824,7 @@ selected: false,
             param: AutoParam::Gain,
             points: &pts,
             hot: None,
+            chosen: Vec::new(),
         }];
         let l = Layout::new(rect(), &v);
         let row = l
@@ -5713,6 +5879,7 @@ selected: false,
             param: AutoParam::Gain,
             points: &pts,
             hot: None,
+            chosen: Vec::new(),
         }];
         let l = Layout::new(rect(), &v);
         let row = l
@@ -5850,6 +6017,7 @@ selected: false,
             selected: false,
             points: &[],
             hot: None,
+            chosen: Vec::new(),
         }];
         let l = Layout::new(rect(), &v);
 
@@ -5978,6 +6146,7 @@ selected: false,
                     selected: false,
                     points: &[],
                     hot: None,
+                    chosen: Vec::new(),
                 })
                 .collect()
         };
@@ -6055,6 +6224,7 @@ selected: false,
             selected: false,
             points: &[],
             hot: None,
+            chosen: Vec::new(),
         }];
         let mut v = a_view(&c);
         v.lanes[0].automation = rows;

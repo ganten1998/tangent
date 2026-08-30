@@ -613,6 +613,17 @@ impl tangent_ui::ports::AudioSetup for Setup {
             None => tangent_record::audio::input_rates(&tangent_record::audio::InputSelection::Default),
         }
     }
+
+    /// Straight through to [`crate::outpath::probe`].
+    ///
+    /// Nothing to translate: the probe already answers in the port's own
+    /// vocabulary, because the alternative was a second identical struct on
+    /// this side of the firewall for no reader's benefit. The uid grammar
+    /// that `set_exposed` keeps over here is a grammar `tangent-ui` must not
+    /// learn; a transport and a frame count are not.
+    fn output_path(&self, device: Option<&str>) -> tangent_ui::ports::OutputPath {
+        crate::outpath::probe(device)
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────

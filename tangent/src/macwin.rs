@@ -423,3 +423,80 @@ unsafe extern "C-unwind" fn will_resize(
     }
     NSSize::new(f64::from(w) + chrome_w, f64::from(h) + chrome_h)
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// Borderless + maximised
+// ───────────────────────────────────────────────────────────────────────────
+
+/// **Maximised, borderless, and covering the whole screen.**
+///
+/// "Maximised" on every platform means *the work area* — the screen minus
+/// whatever the shell reserves: the taskbar on Windows, the panel on Linux,
+/// the menu bar and the Dock here. That is right for a window with a title
+/// bar to grab, and it is wrong for a borderless one: taking the frame off
+/// was the request to use the whole display, and the app kept a strip of
+/// empty desktop along two edges that nothing could be dragged into.
+///
+/// The owner: "when window state is maximized ... and borderless is turned
+/// on, the window scales up to cover the empty space created by the taskbar,
+/// and that nothing is cutoff anywhere."
+///
+/// **Two things, and both are needed.** Setting the frame to the screen's
+/// full rectangle is not enough on macOS — the menu bar is drawn ABOVE every
+/// ordinary window, so the top of the layout would be behind it: covered, not
+/// cut off, but indistinguishable to the eye and worse than not growing at
+/// all. So the presentation options auto-hide the menu bar and the Dock for
+/// as long as the window is in this state, which is what a borderless
+/// full-screen game does and what makes the frame honest.
+///
+/// Reversed by [`uncover_screen`] the moment either condition stops holding.
+/// Both are idempotent and both are driven by a flag on the caller, so
+/// neither runs per frame: `setFrame` during AppKit's own zoom animation
+/// fights it.
+///
+/// Returns whether the window was found and moved.
+pub fn cover_screen(frame: &eframe::Frame) -> bool {
+    let Some(window) = resolve(frame) else {
+        return false;
+    };
+    let Some(screen) = window.screen() else {
+        return false;
+    };
+    // The FULL frame, not `visibleFrame`: the latter is the work area, which
+    // is exactly the rectangle being escaped.
+    let full = screen.frame();
+    // SAFETY: `sharedApplication` on the main thread, which is the only
+    // thread eframe draws from and therefore the only one that reaches here.
+    unsafe {
+        if let Some(mtm) = objc2_foundation::MainThreadMarker::new() {
+            let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+            app.setPresentationOptions(
+                objc2_app_kit::NSApplicationPresentationOptions::AutoHideDock
+                    | objc2_app_kit::NSApplicationPresentationOptions::AutoHideMenuBar,
+            );
+        }
+        window.setFrame_display(full, true);
+    }
+    true
+}
+
+/// Give the menu bar and the Dock back, and let the window be an ordinary
+/// maximised one again.
+///
+/// The frame is NOT put back here on purpose: leaving the state means either
+/// the window is no longer maximised — in which case AppKit has already
+/// restored the size it remembers — or borderless has just been switched
+/// off, and the size correction that follows a decoration change is already
+/// on its way from the app's own resize pass. Two things moving one window
+/// is how a window ends up flickering between two sizes.
+pub fn uncover_screen() {
+    // SAFETY: as `cover_screen`; main thread only.
+    unsafe {
+        if let Some(mtm) = objc2_foundation::MainThreadMarker::new() {
+            let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+            app.setPresentationOptions(
+                objc2_app_kit::NSApplicationPresentationOptions::Default,
+            );
+        }
+    }
+}
