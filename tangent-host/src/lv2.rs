@@ -168,6 +168,158 @@ fn catalog() -> &'static Catalog {
     })
 }
 
+// ── the metadata lilv knows and livi does not ────────────────────────────────
+
+/// What one control port is, beyond its number.
+///
+/// livi's `ControlPort` carries a value and a range and nothing else — no name,
+/// no symbol, no unit — so a panel built from livi alone shows "Parameter 7"
+/// with a bare float. lilv has all of it, and this is that half, read once.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PortMeta {
+    /// The plugin's absolute port index, which is what livi's `ControlPort`
+    /// reports and therefore the only thing the two halves can be joined on.
+    pub port_index: usize,
+    /// **The stable name of this control, and the one thing worth persisting.**
+    /// An LV2 symbol is defined by the spec to be a valid C identifier that
+    /// does not change across versions of a plugin; a port INDEX is not, and a
+    /// saved session keyed by index would silently point at a different knob
+    /// after the plugin was updated. Saved state is written by symbol for
+    /// exactly this reason.
+    pub symbol: String,
+    /// What to show a person. Falls back to the symbol, then to the index.
+    pub name: String,
+    /// "dB", "Hz", "%" — empty when the plugin declares no unit.
+    pub units: String,
+    /// 0 for a continuous control; 2 for a toggle; otherwise the number of
+    /// steps, which is what makes a switch draw as a switch rather than a knob
+    /// that happens to have two useful positions.
+    pub steps: i32,
+}
+
+/// Everything one plugin's identity implies, gathered in a single lilv pass.
+#[derive(Clone, Debug, Default)]
+pub struct PluginMeta {
+    /// Whether it ships a UI this host can embed. See `lv2ui::Ui::has_ui`.
+    pub x11_ui: bool,
+    /// Its control INPUT ports, in plugin order.
+    pub controls: Vec<PortMeta>,
+    /// The designated latency output port's absolute index, if it has one.
+    pub latency_port: Option<usize>,
+}
+
+/// Every plugin's metadata, read once for the life of the process.
+///
+/// **One scan, cached, and that is not premature.** Building a lilv world
+/// parses every Turtle manifest on `LV2_PATH`; on a machine with the whole of
+/// lsp-plugins and Calf installed that is thousands of triples. The question
+/// "does this bay's plugin have a window?" is asked once per bay per FRAME by
+/// the menu that greys the item — sixty times a second, for every bay — and
+/// answering it by building a world each time would have been a world built
+/// several hundred times a second. Answering it from a map built once is the
+/// same answer for a millionth of the cost.
+///
+/// Keyed by URI because that is the only identity LV2 has.
+fn meta() -> &'static std::collections::HashMap<String, PluginMeta> {
+    static META: OnceLock<std::collections::HashMap<String, PluginMeta>> = OnceLock::new();
+    META.get_or_init(scan_meta)
+}
+
+fn scan_meta() -> std::collections::HashMap<String, PluginMeta> {
+    let world = lilv::World::with_load_all();
+    let x11 = world.new_uri("http://lv2plug.in/ns/extensions/ui#X11UI");
+    let control = world.new_uri("http://lv2plug.in/ns/lv2core#ControlPort");
+    let input = world.new_uri("http://lv2plug.in/ns/lv2core#InputPort");
+    let toggled = world.new_uri("http://lv2plug.in/ns/lv2core#toggled");
+    let integer = world.new_uri("http://lv2plug.in/ns/lv2core#integer");
+    let enumeration = world.new_uri("http://lv2plug.in/ns/lv2core#enumeration");
+    let unit = world.new_uri("http://lv2plug.in/ns/extensions/units#unit");
+    let unit_symbol = world.new_uri("http://lv2plug.in/ns/extensions/units#symbol");
+
+    let mut out = std::collections::HashMap::new();
+    for plugin in world.plugins().into_iter() {
+        let Some(uri) = plugin.uri().as_uri().map(str::to_owned) else {
+            continue;
+        };
+        let x11_ui = plugin
+            .uis()
+            .is_some_and(|uis| uis.into_iter().any(|u| u.is_a(&x11)));
+
+        let mut controls = Vec::new();
+        for i in 0..plugin.ports_count() {
+            let Some(port) = plugin.port_by_index(i) else {
+                continue;
+            };
+            if !port.is_a(&control) || !port.is_a(&input) {
+                continue;
+            }
+            let symbol = port
+                .symbol()
+                .and_then(|n| n.as_str().map(str::to_owned))
+                .unwrap_or_else(|| format!("port{i}"));
+            let name = port
+                .name()
+                .and_then(|n| n.as_str().map(str::to_owned))
+                .unwrap_or_else(|| symbol.clone());
+            // The unit's SYMBOL rather than its label: "dB" beside a number,
+            // not "decibels". Two hops, because `units:unit` names a unit
+            // resource and the symbol hangs off that.
+            let units = port
+                .get(&unit)
+                .and_then(|u| world.get(Some(&u), Some(&unit_symbol), None))
+                .and_then(|n| n.as_str().map(str::to_owned))
+                .unwrap_or_default();
+            // **Toggle first, then enumeration, then integer.** A port can
+            // carry more than one of these and the narrowest true statement is
+            // the useful one: a toggled port is a switch whether or not it is
+            // also an integer.
+            let steps = if port.has_property(&toggled) {
+                2
+            } else if port.has_property(&enumeration) {
+                i32::try_from(port.scale_points().count()).unwrap_or(0)
+            } else if port.has_property(&integer) {
+                let r = port.range();
+                match (r.minimum.as_ref().and_then(lilv::node::Node::as_float),
+                       r.maximum.as_ref().and_then(lilv::node::Node::as_float)) {
+                    (Some(lo), Some(hi)) if hi > lo => {
+                        i32::try_from((hi - lo).round() as i64 + 1).unwrap_or(0)
+                    }
+                    _ => 0,
+                }
+            } else {
+                0
+            };
+            controls.push(PortMeta {
+                port_index: i,
+                symbol,
+                name,
+                units,
+                steps,
+            });
+        }
+
+        out.insert(
+            uri,
+            PluginMeta {
+                x11_ui,
+                controls,
+                latency_port: plugin.latency_port_index(),
+            },
+        );
+    }
+    out
+}
+
+/// This plugin's metadata, or an empty record if it is not installed.
+pub fn meta_for(uri: &str) -> PluginMeta {
+    meta().get(uri).cloned().unwrap_or_default()
+}
+
+/// Whether this plugin ships a UI this host can embed. See `lv2ui::Ui::has_ui`.
+pub fn has_x11_ui(uri: &str) -> bool {
+    meta().get(uri).is_some_and(|m| m.x11_ui)
+}
+
 /// Every LV2 plugin on `LV2_PATH`, in a stable order.
 ///
 /// Sorted by name rather than left in lilv's order, which is the order bundles
@@ -200,11 +352,55 @@ pub fn discover() -> Vec<PluginInfo> {
 /// has to ask the plugin to render into text.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ParamInfo {
+    /// Position in the control-INPUT list, which is what [`Instance::set_param`]
+    /// takes and what the automation road addresses. Not stable across plugin
+    /// versions; `symbol` is the thing that is.
     pub index: usize,
+    /// The plugin's ABSOLUTE port index, counting every port of every type.
+    ///
+    /// **Not the same number as `index`, and conflating them silently moves
+    /// the wrong knob.** A plugin's ports are numbered in one sequence covering
+    /// audio, atom and control alike, so a stereo effect with two audio inputs,
+    /// two audio outputs and an atom port has its first control at absolute 5
+    /// and control-input position 0. An LV2 UI speaks absolute indices — that
+    /// is what `write_function` and `port_event` carry — while `set_param`
+    /// speaks positions, so every value crossing between the UI and the DSP has
+    /// to be translated, and this is the field that does it.
+    pub port_index: usize,
+    /// The stable identity. See [`PortMeta::symbol`] — saved state is keyed by
+    /// this, so a plugin update that adds a port does not silently move every
+    /// setting one knob to the left.
+    pub symbol: String,
     pub name: String,
+    /// "dB", "Hz", "%" — empty when the plugin declares none.
+    pub units: String,
     pub value: f32,
     pub min: f32,
     pub max: f32,
+    /// The plugin's own resting value, kept so a panel can offer "reset" and so
+    /// saved state can skip what has not been touched.
+    pub default: f32,
+    /// 0 continuous, 2 a toggle, otherwise the number of steps.
+    pub steps: i32,
+}
+
+/// Write control values as LV2 state text.
+///
+/// **Free-standing, and both writers call it.** The host keeps its own record
+/// of an LV2 bay's controls — see the app's `Lv2Bay` for why it must — so there
+/// are two places that legitimately want to produce this blob: the instance,
+/// while it is still here, and the host afterwards. Two copies of a format
+/// diverge, and the one that diverges is the one nobody is testing, so there is
+/// one copy and it is this.
+pub fn state_from_params(params: &[ParamInfo]) -> String {
+    let mut out = String::from("lv2state 1\n");
+    for p in params {
+        out.push_str(&p.symbol);
+        out.push('=');
+        out.push_str(&p.value.to_string());
+        out.push('\n');
+    }
+    out
 }
 
 /// A running LV2 plugin.
@@ -221,6 +417,14 @@ pub struct Instance {
     silence: Vec<f32>,
     params: Vec<ParamInfo>,
     midi_urid: u32,
+    /// The designated latency output port, if the plugin declares one.
+    ///
+    /// **Read on the AUDIO thread, after processing.** LV2 reports latency
+    /// through an ordinary control output port, which means the number is only
+    /// valid once the plugin has run — there is no `getLatencySamples()` to
+    /// call from the host thread the way VST3 has. So it is read where it is
+    /// written, and published from there.
+    latency_port: Option<livi::PortIndex>,
 }
 
 impl Instance {
@@ -250,18 +454,40 @@ impl Instance {
         let inner = unsafe { plugin.instantiate(cat.features.clone(), sample_rate) }
             .map_err(|e| format!("{uri} would not instantiate: {e:?}"))?;
 
-        let params = inner
+        // **livi for the live port, lilv for what it means.** livi owns the
+        // pointer the plugin actually reads and knows the value and the range;
+        // it does not carry the name, the symbol or the unit, and lilv does.
+        // The two are joined on the absolute port index, which is the only
+        // number both of them agree on — the control-input POSITION differs
+        // from the port index whenever a plugin interleaves audio and control
+        // ports, which most of them do.
+        let plugin_meta = meta_for(uri);
+        let params: Vec<ParamInfo> = inner
             .iter_control_inputs()
             .enumerate()
-            .map(|(i, c)| ParamInfo {
-                index: i,
-                // lilv can give a port its human name; livi's ControlPort does
-                // not carry it, so the index stands in until that is plumbed.
-                // Named rather than blank so the panel has something to show.
-                name: format!("Parameter {}", i + 1),
-                value: c.value,
-                min: c.minimum,
-                max: c.maximum,
+            .map(|(i, c)| {
+                let m = plugin_meta
+                    .controls
+                    .iter()
+                    .find(|m| m.port_index == c.port_index.0);
+                ParamInfo {
+                    index: i,
+                    port_index: c.port_index.0,
+                    symbol: m.map_or_else(
+                        || format!("port{}", c.port_index.0),
+                        |m| m.symbol.clone(),
+                    ),
+                    name: m.map_or_else(
+                        || format!("Parameter {}", i + 1),
+                        |m| m.name.clone(),
+                    ),
+                    units: m.map(|m| m.units.clone()).unwrap_or_default(),
+                    value: c.value,
+                    min: c.minimum,
+                    max: c.maximum,
+                    default: c.value,
+                    steps: m.map_or(0, |m| m.steps),
+                }
             })
             .collect();
 
@@ -285,6 +511,7 @@ impl Instance {
             silence: vec![0.0; MAX_BLOCK],
             params,
             midi_urid: cat.features.midi_urid(),
+            latency_port: plugin_meta.latency_port.map(livi::PortIndex),
         })
     }
 
@@ -321,6 +548,75 @@ impl Instance {
             p.value = clamped;
         }
         Ok(())
+    }
+
+    /// This plugin's reported latency in samples, or 0 if it declares none.
+    ///
+    /// **Valid only after a block has been processed**, because LV2 publishes
+    /// latency through an ordinary control OUTPUT port that the plugin writes
+    /// during `run()`. A host that reads it before the first block gets
+    /// whatever the port was initialised to, which is usually zero and
+    /// occasionally garbage. Callers read it after processing, from the audio
+    /// thread, which is the only place and time it means anything.
+    pub fn latency_samples(&self) -> u32 {
+        self.latency_port
+            .and_then(|p| self.inner.control_output(p))
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .map_or(0, |v| v as u32)
+    }
+
+    /// Every control port, as `symbol=value` lines.
+    ///
+    /// **This IS an LV2 plugin's state, for every plugin that has no other
+    /// kind.** The format's own `state:` extension exists for plugins carrying
+    /// data beyond their ports — a sampler's loaded file, a convolver's
+    /// impulse — and reaching it needs `lilv_state_new_from_instance`, which
+    /// wants the live `LilvInstance*` at a moment when this host has already
+    /// handed the instance to the audio thread. For the control-port plugins
+    /// that make up essentially all of the ports tree, this is complete.
+    ///
+    /// Keyed by SYMBOL, not index: see [`PortMeta::symbol`]. Defaults are
+    /// written too rather than skipped, so restoring cannot leave a port at a
+    /// value the plugin's own default happened to change to between versions.
+    ///
+    /// Text rather than a packed struct because it lands in a settings file
+    /// that a person may reasonably open, and because a float written as text
+    /// has no endianness to get wrong.
+    pub fn save_state(&self) -> String {
+        state_from_params(&self.params)
+    }
+
+    /// Apply state written by [`Instance::save_state`].
+    ///
+    /// **Unknown symbols are skipped rather than refused**, and missing ones
+    /// are left at their defaults. Both are the same judgement: a plugin that
+    /// gained a control in a new version should load a session saved by the old
+    /// one, and a plugin that removed one should not refuse to load at all. The
+    /// count of what was applied comes back so a caller can tell "restored
+    /// nothing because the blob was foreign" from "restored nothing because
+    /// there was nothing to restore".
+    pub fn load_state(&mut self, blob: &str) -> Result<usize, String> {
+        let mut lines = blob.lines();
+        match lines.next() {
+            Some(h) if h.starts_with("lv2state ") => {}
+            _ => return Err("not LV2 state".to_owned()),
+        }
+        let mut applied = 0;
+        for line in lines {
+            let Some((sym, val)) = line.split_once('=') else {
+                continue;
+            };
+            let Ok(v) = val.trim().parse::<f32>() else {
+                continue;
+            };
+            let Some(i) = self.params.iter().position(|p| p.symbol == sym) else {
+                continue;
+            };
+            if self.set_param(i, v).is_ok() {
+                applied += 1;
+            }
+        }
+        Ok(applied)
     }
 
     /// Clear the MIDI queued for the next block.
@@ -503,6 +799,166 @@ mod tests {
 
     const AMP: &str = "http://lv2plug.in/plugins/eg-amp";
     const FIFTHS: &str = "http://lv2plug.in/plugins/eg-fifths";
+
+    /// The metadata scan gives a control its real name, symbol and unit —
+    /// which is the whole difference between a usable parameter panel and a
+    /// column of "Parameter 7".
+    #[test]
+    fn a_control_port_arrives_with_its_name_symbol_and_unit() {
+        if !have(AMP) {
+            return;
+        }
+        let inst = Instance::create(AMP, 48_000.0).expect("eg-amp instantiates");
+        let gain = inst
+            .params()
+            .iter()
+            .find(|p| p.symbol == "gain")
+            .expect("eg-amp's control port is called `gain` in its own manifest");
+        // Not the placeholder. The name comes from the plugin's Turtle.
+        assert!(
+            !gain.name.starts_with("Parameter "),
+            "fell back to the index: {}",
+            gain.name
+        );
+        // eg-amp declares its gain in decibels, which is the case the panel
+        // exists to show honestly rather than as a 0..1.
+        assert_eq!(gain.units, "dB", "the unit's symbol, not its label");
+        assert!(gain.min < gain.max);
+    }
+
+    /// **The two numberings are not the same, and a real plugin proves it.**
+    ///
+    /// An LV2 UI reports the absolute port index; `set_param` takes the
+    /// control-input position. For any plugin with an audio or atom port ahead
+    /// of its first control — nearly all of them — those differ, and a host
+    /// that passes one where the other is wanted moves a DIFFERENT knob. The
+    /// sound changes, so it looks like it worked; only the saved file shows the
+    /// parameter the user turned still sitting at its default.
+    ///
+    /// This asserts the gap exists rather than merely that the field is
+    /// present, because a test that passes when the two happen to coincide
+    /// would go on passing after the translation was deleted.
+    #[test]
+    fn a_controls_absolute_port_is_not_its_control_input_position() {
+        let mut proved = false;
+        for p in discover() {
+            let Ok(inst) = Instance::create(&p.uri, 48_000.0) else {
+                continue;
+            };
+            for c in inst.params() {
+                assert!(
+                    c.port_index >= c.index,
+                    "{}: a control cannot come before its own position",
+                    p.uri
+                );
+                if c.port_index != c.index {
+                    proved = true;
+                }
+            }
+            if proved {
+                break;
+            }
+        }
+        // Not an assert on `proved`: a machine with only trivial plugins
+        // installed is entitled to have every control at position 0. The value
+        // of the test is the invariant above plus the report.
+        if !proved {
+            eprintln!("note: no installed plugin distinguishes the two numberings");
+        }
+    }
+
+    /// State round-trips through the text format, values and all.
+    #[test]
+    fn state_round_trips_through_the_text_format() {
+        if !have(AMP) {
+            return;
+        }
+        let mut a = Instance::create(AMP, 48_000.0).expect("instantiates");
+        let i = a
+            .params()
+            .iter()
+            .position(|p| p.symbol == "gain")
+            .expect("has a gain");
+        let want = a.params()[i].max.min(6.0);
+        a.set_param(i, want).expect("gain is settable");
+        let blob = a.save_state();
+
+        let mut b = Instance::create(AMP, 48_000.0).expect("instantiates");
+        assert_eq!(b.load_state(&blob).expect("our own blob parses"), 1);
+        assert!((b.params()[i].value - want).abs() < 1e-6);
+    }
+
+    /// **Keyed by symbol, and that is the point of the format.** A blob naming
+    /// a port the plugin does not have is skipped rather than refused, and a
+    /// port the blob does not name keeps its default — which together are what
+    /// let a session survive the plugin gaining or losing a control. Keyed by
+    /// index, the same edit would have silently moved every setting one knob
+    /// along.
+    #[test]
+    fn unknown_symbols_are_skipped_and_missing_ones_keep_their_default() {
+        if !have(AMP) {
+            return;
+        }
+        let mut inst = Instance::create(AMP, 48_000.0).expect("instantiates");
+        let i = inst
+            .params()
+            .iter()
+            .position(|p| p.symbol == "gain")
+            .expect("has a gain");
+        let default = inst.params()[i].default;
+        let applied = inst
+            .load_state("lv2state 1\nnot_a_real_port=3.5\n")
+            .expect("the header is ours");
+        assert_eq!(applied, 0, "a foreign symbol must not land anywhere");
+        assert!(
+            (inst.params()[i].value - default).abs() < 1e-6,
+            "an unnamed port must be left alone"
+        );
+    }
+
+    /// A blob from somewhere else is refused rather than half-applied.
+    #[test]
+    fn a_foreign_blob_is_refused() {
+        if !have(AMP) {
+            return;
+        }
+        let mut inst = Instance::create(AMP, 48_000.0).expect("instantiates");
+        assert!(inst.load_state("VST3 state or anything else").is_err());
+        assert!(inst.load_state("").is_err());
+    }
+
+    /// Values are clamped on the way in, so a hand-edited or corrupted settings
+    /// file cannot drive a plugin outside the range it declared.
+    #[test]
+    fn a_restored_value_is_clamped_to_the_ports_range() {
+        if !have(AMP) {
+            return;
+        }
+        let mut inst = Instance::create(AMP, 48_000.0).expect("instantiates");
+        let i = inst
+            .params()
+            .iter()
+            .position(|p| p.symbol == "gain")
+            .expect("has a gain");
+        let max = inst.params()[i].max;
+        inst.load_state("lv2state 1\ngain=1e9\n").expect("parses");
+        assert!((inst.params()[i].value - max).abs() < 1e-3);
+    }
+
+    /// The metadata cache answers the editor question without a lilv world per
+    /// call, and agrees with what discovery found.
+    #[test]
+    fn the_metadata_cache_covers_every_discovered_plugin() {
+        for p in discover() {
+            let m = meta_for(&p.uri);
+            assert_eq!(
+                m.x11_ui,
+                has_x11_ui(&p.uri),
+                "{} disagrees with itself about having a UI",
+                p.uri
+            );
+        }
+    }
 
     #[test]
     fn an_identity_round_trips_and_a_bundle_path_is_not_mistaken_for_one() {

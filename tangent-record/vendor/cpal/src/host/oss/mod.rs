@@ -66,6 +66,12 @@ const IOCPARM_MASK: u64 = 0x1fff;
 const fn ioc(inout: u64, group: u64, num: u64, len: u64) -> libc::c_ulong {
     (inout | ((len & IOCPARM_MASK) << 16) | (group << 8) | num) as libc::c_ulong
 }
+/// Write-only ioctls. **Kept although nothing here uses one yet**: the three
+/// directions come from `sys/ioccom.h` as a set, and a half-transcribed macro
+/// family is how the next person encodes a request with the wrong direction bit
+/// and gets `ENOTTY` from a call that reads correct. `SNDCTL_DSP_RESET` and
+/// friends are `_IO`/`_IOW`, so the moment this host grows a reset it is here.
+#[allow(dead_code, reason = "the third of a macro family transcribed as a set")]
 const fn iow(group: u64, num: u64, len: u64) -> libc::c_ulong {
     ioc(IOC_IN, group, num, len)
 }

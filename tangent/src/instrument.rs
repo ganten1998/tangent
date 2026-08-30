@@ -2218,7 +2218,7 @@ struct Prepared {
     channels: usize,
     loaded: Loaded,
     editor_handle: Option<tangent_host::editor::EditorHandle>,
-    /// The plugin's URI, when it is an LV2 one.
+    /// The bay record, when this is an LV2 plugin.
     ///
     /// **A string rather than a handle, and that is the format's doing.** A
     /// VST3 editor is built from a reference taken off the live instance — the
@@ -2229,7 +2229,7 @@ struct Prepared {
     /// from that, on demand, long after the instance has gone to the audio
     /// thread.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    lv2_uri: Option<String>,
+    lv2_bay: Option<Lv2Bay>,
     state_handle: Option<tangent_host::StateHandle>,
     latency_handle: Option<tangent_host::instance::LatencyHandle>,
     latency_now: u32,
@@ -2312,6 +2312,21 @@ impl Backend {
                 // A voice reads nothing; `bufs` is both scratch and output.
                 inst.process_planar(frames, &[], bufs)
             }
+        }
+    }
+
+    /// What this plugin says it delays the signal by, when it says it itself.
+    ///
+    /// `None` for VST3, whose figure is read on the main thread through a
+    /// `LatencyHandle` and published from there. LV2 has no such route: the
+    /// number arrives on a designated control OUTPUT port that the plugin
+    /// writes during `run()`, so it can only be read here, on the audio thread,
+    /// immediately after a block. See `lv2::Instance::latency_samples`.
+    fn reported_latency(&self) -> Option<u32> {
+        match self {
+            Backend::Vst3 { .. } => None,
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            Backend::Lv2(inst) => Some(inst.latency_samples()),
         }
     }
 
@@ -2661,6 +2676,42 @@ const AUTO_PARAMS_PER_BAY: usize = 16;
 /// the road that is already there and already tested. A knob turned in the
 /// plugin's window and the same knob automated are the same event by the time
 /// the audio thread sees either.
+/// A control's resting place as a fraction of its travel.
+///
+/// A degenerate range — a port whose minimum equals its maximum, which a few
+/// real plugins declare for a constant — reads as the bottom rather than
+/// dividing by zero.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn normalise(value: f32, min: f32, max: f32) -> f64 {
+    let span = f64::from(max - min);
+    if span.abs() < f64::EPSILON {
+        return 0.0;
+    }
+    (f64::from(value - min) / span).clamp(0.0, 1.0)
+}
+
+/// One LV2 bay: what is in it, and where its controls stand.
+///
+/// **The host is the authority on an LV2 plugin's control values, not the
+/// plugin.** That inverts the VST3 arrangement and it is the format's doing: a
+/// VST3 instance hands its state over on request through a COM reference that
+/// survives the instance moving to the audio thread, while an LV2 instance is
+/// a plain object that goes to the audio thread and cannot be asked anything
+/// afterwards. But the host is also the only WRITER of an LV2 control port —
+/// automation, the plugin's own window, a restore all come through here — so
+/// the host already knows every answer without asking. Keeping the record here
+/// is not a cache of the plugin's truth; it is the truth, and the plugin is
+/// the copy.
+///
+/// This is what makes the parameter panel, the save file and a reopened plugin
+/// window all agree.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+struct Lv2Bay {
+    uri: String,
+    /// Every control input, carrying its CURRENT value.
+    params: Vec<tangent_host::lv2::ParamInfo>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct UiParam {
     /// The SEAT, and `u16` because there are 1939 of them — a channel's worth
@@ -2684,6 +2735,12 @@ fn run_rack(
     // in the rack, because a parameter id means nothing without knowing which
     // plugin it belongs to and two bays can hold the same effect.
     params: &[&[tangent_host::ParamPoint]; INSERTS],
+    // **Which seat this rack is, and the board to publish on.** Only LV2 needs
+    // them: its plugins report latency on an output port that is meaningless
+    // until a block has run, so the figure has to be picked up here rather than
+    // polled from the main thread the way a VST3's is.
+    shared: &Shared,
+    seat: usize,
 ) {
     for (bay, slot) in rack.slots.iter_mut().enumerate() {
         let Some(p) = slot.0.as_mut() else {
@@ -2717,6 +2774,14 @@ fn run_rack(
             // channel that stops being processed, not one that starts making
             // noise.
             continue;
+        }
+        // **After the block, and only for an effect.** Before it the port
+        // holds whatever it was initialised to; and a VOICE's own delay holds
+        // nothing else up, which is the same exemption the VST3 path makes.
+        if !p.voice {
+            if let Some(n) = p.backend.reported_latency() {
+                Rack::set_latency(shared, seat, bay, n);
+            }
         }
         let wrote = p.channels.max(1);
         let src_bufs: &[Vec<f32>] = if p.voice { &p.bufs } else { &out[..] };
@@ -3259,6 +3324,8 @@ impl Renderer {
             notes,
             controls,
             &params,
+            &self.shared,
+            at,
         );
         let dst = if buf_is_aux {
             self.aux.get_mut(..n)
@@ -3998,6 +4065,8 @@ impl Renderer {
                         notes,
                         controls,
                     &seat_params,
+                        &self.shared,
+                        Strip::Click.index(),
                     );
                 }
                 // Back into BOTH buffers, and the take's keeps its gate: a
@@ -4176,6 +4245,8 @@ impl Renderer {
                             &[],
                             &[],
                             &seat_params,
+                            &self.shared,
+                            dest,
                         );
                     }
                     let g = self.lane_gain[dest];
@@ -5036,6 +5107,8 @@ impl Renderer {
                     notes,
                     controls,
                 &seat_params,
+                    &self.shared,
+                    strip.index(),
                 );
             }
             let mut room = room_from;
@@ -5899,6 +5972,8 @@ impl Renderer {
                     &[],
                     &[],
                 &seat_params,
+                    &self.shared,
+                    rack_at,
                 );
                 for c in 0..TAP_CHANNELS.min(2) {
                     let src = &self.pad_io[c];
@@ -5965,6 +6040,8 @@ impl Renderer {
                 &[],
                 &[],
                 &seat_params,
+                &self.shared,
+                bus_rack,
             );
         }
         // The fold: the DRUMS strip's fader, pan, send and peak, exactly as
@@ -6433,6 +6510,8 @@ impl Renderer {
                     &lane_notes,
                     controls,
                 &seat_params,
+                    &self.shared,
+                    ch,
                 );
             }
             // **And the lane waits for the slowest of its neighbours.**
@@ -6850,25 +6929,12 @@ pub struct Engine {
     /// test that opens two engines in one frame ran a debug build's
     /// moves straight off the end of a 2 MiB test stack.
     insert_editor_handles: Vec<[Option<tangent_host::EditorHandle>; INSERTS]>,
-    /// Each loaded insert's LV2 URI, for the bays holding one. See
-    /// `Prepared::lv2_uri`: this is the whole of what opening an LV2 editor
-    /// needs, and it is kept beside the VST3 handles because a bay holds one
-    /// format or the other and every site that clears one must clear both.
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    insert_lv2_uris: Vec<[Option<String>; INSERTS]>,
-    /// What each LV2 bay's controls are set to, indexed by control-port number.
+    /// Each LV2 bay's identity and its controls. See [`Lv2Bay`].
     ///
-    /// **A shadow, and it is not redundant.** The instance itself is on the
-    /// audio thread and cannot be asked; LV2 state restore is not wired, so
-    /// there is no handle to read either. Without this, closing a plugin's
-    /// window and opening it again would draw every knob at its default while
-    /// the DSP went on using the values the user had set — the window and the
-    /// sound disagreeing, with the window looking authoritative.
-    ///
-    /// Written where the edits are drained, so it records exactly what was sent
-    /// and cannot drift from it.
+    /// Kept beside the VST3 handles because a bay holds one format or the
+    /// other and every site that clears one must clear both.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    insert_lv2_values: Vec<[Vec<f32>; INSERTS]>,
+    insert_lv2: Vec<[Option<Lv2Bay>; INSERTS]>,
     /// Each loaded insert's processor reference, taken beside the editor's and
     /// for the same reason: after the handoff there is no `&Instance` to ask.
     /// This is what lets a bay's settings survive a relaunch — no insert has
@@ -7386,11 +7452,7 @@ impl Engine {
             insert_editors: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
             insert_editor_handles: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-            insert_lv2_uris: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
-            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-            insert_lv2_values: (0..RACK_SEATS)
-                .map(|_| std::array::from_fn(|_| Vec::new()))
-                .collect(),
+            insert_lv2: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
             insert_state_handles: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
             insert_latency_handles: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
             insert_state_errors: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
@@ -7539,7 +7601,7 @@ impl Engine {
             loaded,
             editor_handle,
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-            lv2_uri: None,
+            lv2_bay: None,
             state_handle: Some(state_handle),
             latency_handle,
             latency_now,
@@ -7549,18 +7611,25 @@ impl Engine {
 
     /// Prepare an LV2 plugin, named by URI.
     ///
-    /// **Deliberately thinner than the VST3 path, and the gaps are real.** No
-    /// editor handle, no state handle and no latency handle: an LV2 UI is a
-    /// separate shared object with its own embedding protocol, LV2 state is the
-    /// `state:` extension rather than a blob the instance hands over, and
-    /// latency is a designated output port this does not yet read. Each is a
-    /// follow-on; none of them stops a plugin making sound, which is what this
-    /// is for.
+    /// **Thinner than the VST3 path in handles, not in what works.** It takes
+    /// no editor handle, no state handle and no latency handle, and that is the
+    /// format rather than an omission: all three of those are references into a
+    /// live VST3 instance that outlive its move to the audio thread, and an LV2
+    /// instance is a plain object with nothing to take a reference to. Each of
+    /// the three jobs is done by another road instead —
     ///
-    /// What it does do is the whole of the audio contract: the right channel
+    /// - the **editor** is opened from the URI by `lv2ui`, which loads the UI's
+    ///   own shared object and never touches this instance;
+    /// - the **state** is held by the host in [`Lv2Bay`], because the host is
+    ///   the only writer of an LV2 control port and so already knows every
+    ///   answer the instance could give;
+    /// - the **latency** is read on the audio thread from the designated output
+    ///   port, which is the only place LV2 publishes it.
+    ///
+    /// What this does is the whole of the audio contract: the right channel
     /// count, the instrument/effect distinction from the plugin's own class,
-    /// and the same refusal an effect with no audio input gets on the other
-    /// path.
+    /// the saved settings restored before the instance leaves, and the same
+    /// refusal an effect with no audio input gets on the other path.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn prepare_lv2(&self, uri: &str, state: Option<&[u8]>) -> Result<Prepared, String> {
         let info = tangent_host::lv2::discover()
@@ -7596,16 +7665,36 @@ impl Engine {
             ));
         }
         let channels = info.audio_out.max(1);
-        // Said rather than silently dropped. An LV2 plugin restored from a
-        // session saved with its settings will come back at its defaults until
-        // the state extension is wired, and a user who loses a preset deserves
-        // to be told why rather than to think the plugin is broken.
-        let state_error = state.map(|_| {
-            format!(
-                "{}'s saved settings were not restored: LV2 state is not stored yet",
-                info.name
-            )
-        });
+        // **The settings, before the instance leaves.** This is the only moment
+        // there is a mutable instance on this thread; after the hand-off the
+        // audio thread owns it and a restore would have to go through the
+        // parameter ring one value at a time, arriving some blocks later and
+        // audibly.
+        //
+        // A blob that will not parse is REPORTED rather than swallowed, and the
+        // plugin still loads at its defaults: a user whose reverb comes back
+        // wrong needs to know it came back wrong. `load_state` itself is
+        // forgiving about individual ports — see its note on why a plugin that
+        // gained or lost a control should still load an old session.
+        let mut inst = inst;
+        let state_error = match state {
+            Some(bytes) => match std::str::from_utf8(bytes) {
+                Ok(text) => inst.load_state(text).err().map(|e| {
+                    format!("{}'s saved settings were not restored: {e}", info.name)
+                }),
+                Err(_) => Some(format!(
+                    "{}'s saved settings were not restored: the stored block is not text",
+                    info.name
+                )),
+            },
+            None => None,
+        };
+        // Read AFTER the restore, so the record starts where the plugin
+        // actually is rather than where it would have been.
+        let bay = Lv2Bay {
+            uri: uri.to_owned(),
+            params: inst.params().to_vec(),
+        };
         Ok(Prepared {
             display_name: info.name.clone(),
             backend: Backend::Lv2(inst),
@@ -7626,7 +7715,7 @@ impl Engine {
                 sample_rate: self.output.sample_rate,
             },
             editor_handle: None,
-            lv2_uri: Some(uri.to_owned()),
+            lv2_bay: Some(bay),
             state_handle: None,
             latency_handle: None,
             latency_now: 0,
@@ -7661,23 +7750,16 @@ impl Engine {
             {
                 *h = None;
             }
+            // A new tenant's ports are not the old one's, so the whole record
+            // goes rather than just the identity: values left standing would be
+            // pushed into the next plugin's window.
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
             if let Some(h) = self
-                .insert_lv2_uris
+                .insert_lv2
                 .get_mut(strip)
                 .and_then(|r| r.get_mut(slot))
             {
                 *h = None;
-            }
-            // A new tenant's ports are not the old one's. Left standing, the
-            // shadow would push one plugin's numbers into another's window.
-            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-            if let Some(v) = self
-                .insert_lv2_values
-                .get_mut(strip)
-                .and_then(|r| r.get_mut(slot))
-            {
-                v.clear();
             }
             if let Some(h) = self
                 .insert_state_handles
@@ -7729,7 +7811,7 @@ impl Engine {
             loaded,
             editor_handle,
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-            lv2_uri,
+            lv2_bay,
             state_handle,
             latency_handle,
             latency_now,
@@ -7749,23 +7831,16 @@ impl Engine {
         {
             *h = None;
         }
+        // A new tenant's ports are not the old one's, so the whole record
+        // goes rather than just the identity: values left standing would be
+        // pushed into the next plugin's window.
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         if let Some(h) = self
-            .insert_lv2_uris
+            .insert_lv2
             .get_mut(strip)
             .and_then(|r| r.get_mut(slot))
         {
             *h = None;
-        }
-        // A new tenant's ports are not the old one's. Left standing, the
-        // shadow would push one plugin's numbers into another's window.
-        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-        if let Some(v) = self
-            .insert_lv2_values
-            .get_mut(strip)
-            .and_then(|r| r.get_mut(slot))
-        {
-            v.clear();
         }
         if let Some(h) = self
             .insert_state_handles
@@ -7816,11 +7891,11 @@ impl Engine {
         }
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         if let Some(h) = self
-            .insert_lv2_uris
+            .insert_lv2
             .get_mut(strip)
             .and_then(|r| r.get_mut(slot))
         {
-            *h = lv2_uri;
+            *h = lv2_bay;
         }
         if let Some(h) = self
             .insert_state_handles
@@ -7932,17 +8007,17 @@ impl Engine {
             return Ok(());
         }
         // **The LV2 road, taken before the VST3 one and returning early.** An
-        // LV2 bay has no `EditorHandle` and never will — see `Prepared::lv2_uri`
+        // LV2 bay has no `EditorHandle` and never will — see `Prepared::lv2_bay`
         // — so falling through to the check below would report "nothing is
         // loaded" about a plugin that is loaded and running. That is the worst
         // shape a bug can take: a true-sounding message about the wrong thing.
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         if let Some(uri) = self
-            .insert_lv2_uris
+            .insert_lv2
             .get(strip)
             .and_then(|r| r.get(slot))
             .and_then(Option::as_ref)
-            .cloned()
+            .map(|b| b.uri.clone())
         {
             let title = match self.insert(strip, slot) {
                 Some(l) => format!("{} - Tangent, insert {}", l.class, slot + 1),
@@ -7964,15 +8039,11 @@ impl Engine {
             // back to that default. The values come from the same handle the
             // parameter panel reads, so the two agree by construction.
             let mut editor = editor;
-            if let Some(vals) = self
-                .insert_lv2_values
-                .get(strip)
-                .and_then(|r| r.get(slot))
-            {
-                for (id, &v) in vals.iter().enumerate() {
-                    if v.is_finite() {
-                        editor.port_changed(u32::try_from(id).unwrap_or(u32::MAX), v);
-                    }
+            if let Some(bay) = self.insert_lv2.get(strip).and_then(|r| r.get(slot)).and_then(Option::as_ref) {
+                for p in &bay.params {
+                    // `port_index`, not `index`: an LV2 UI addresses ports by
+                    // their absolute number. See `lv2::ParamInfo::port_index`.
+                    editor.port_changed(u32::try_from(p.port_index).unwrap_or(u32::MAX), p.value);
                 }
             }
             if let Some(e) = self
@@ -8032,13 +8103,13 @@ impl Engine {
         // must not be the expensive question. `has_ui` is a metadata read; see
         // its own note on why it does not `dlopen`.
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-        if let Some(uri) = self
-            .insert_lv2_uris
+        if let Some(bay) = self
+            .insert_lv2
             .get(strip)
             .and_then(|r| r.get(slot))
             .and_then(Option::as_ref)
         {
-            return tangent_host::lv2ui::Ui::has_ui(uri);
+            return tangent_host::lv2ui::Ui::has_ui(&bay.uri);
         }
         self.insert_editor_handles
             .get(strip)
@@ -8143,7 +8214,33 @@ impl Engine {
                     let (Ok(lane), Ok(bay)) = (u16::try_from(strip), u8::try_from(bay)) else {
                         continue;
                     };
+                    // **The bay's own port table, because the UI speaks a
+                    // different numbering.** An LV2 UI reports the ABSOLUTE
+                    // port index; `set_param` and the automation road take the
+                    // control-input POSITION. They differ for every plugin with
+                    // an audio or atom port before its first control, which is
+                    // nearly all of them, and using one where the other is
+                    // wanted moves a different knob — the sound changes, so it
+                    // looks like it worked.
+                    let table = self
+                        .insert_lv2
+                        .get(usize::from(lane))
+                        .and_then(|r| r.get(usize::from(bay)))
+                        .and_then(Option::as_ref);
                     for (id, value) in editor.drain_edits() {
+                        let Some(index) = table.and_then(|t| {
+                            t.params
+                                .iter()
+                                .find(|p| p.port_index == id as usize)
+                                .map(|p| p.index)
+                        }) else {
+                            // A port the host has no control entry for: an
+                            // output the UI echoed, or a plugin whose UI writes
+                            // to something that is not a control input. Dropped
+                            // rather than guessed at.
+                            continue;
+                        };
+                        let id = u32::try_from(index).unwrap_or(u32::MAX);
                         pending.push(UiParam {
                             lane,
                             bay,
@@ -8159,24 +8256,21 @@ impl Engine {
                     }
                 }
             }
-            // The shadow, updated from the same list that goes to the audio
-            // thread — one source, so the window's next opening and the sound
-            // cannot disagree. Gaps are `NAN` rather than zero: a port that has
-            // never been touched must be left at the plugin's own default, and
-            // zero is a real value for plenty of controls.
+            // **The bay's record, from the same list that goes to the audio
+            // thread.** One source, so the parameter panel, the next opening of
+            // the window and the saved session cannot disagree with the sound.
             for u in &pending {
-                let Some(v) = self
-                    .insert_lv2_values
+                let Some(bay) = self
+                    .insert_lv2
                     .get_mut(usize::from(u.lane))
                     .and_then(|r| r.get_mut(usize::from(u.bay)))
+                    .and_then(Option::as_mut)
                 else {
                     continue;
                 };
-                let id = u.id as usize;
-                if v.len() <= id {
-                    v.resize(id + 1, f32::NAN);
+                if let Some(p) = bay.params.get_mut(u.id as usize) {
+                    p.value = u.value as f32;
                 }
-                v[id] = u.value as f32;
             }
             if !pending.is_empty() {
                 if let Ok(mut tx) = self.ui_params.try_borrow_mut() {
@@ -8293,6 +8387,21 @@ impl Engine {
     /// or for a plugin whose `getState` failed, which is a preset to choose
     /// again rather than an error to stop on.
     pub fn save_insert_state(&self, strip: usize, slot: usize) -> Option<Vec<u8>> {
+        // **An LV2 bay is saved from the LEDGER, not from the plugin.** See
+        // `Lv2Bay`: the host is the only writer of an LV2 control port, so it
+        // already holds every value, and the instance it would otherwise have
+        // to ask is on the audio thread where it cannot be asked. This is the
+        // same information a VST3 `getState` returns, arrived at from the other
+        // end.
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        if let Some(bay) = self
+            .insert_lv2
+            .get(strip)
+            .and_then(|r| r.get(slot))
+            .and_then(Option::as_ref)
+        {
+            return Some(tangent_host::lv2::state_from_params(&bay.params).into_bytes());
+        }
         self.insert_state_handles
             .get(strip)?
             .get(slot)?
@@ -8308,6 +8417,31 @@ impl Engine {
     /// it obeys the same rule: never from the audio thread, and only while
     /// the instance is alive.
     pub fn insert_parameters(&self, strip: usize, slot: usize) -> Vec<tangent_host::ParamInfo> {
+        // **The LV2 panel, and it is the better one.** A VST3 parameter is a
+        // normalised 0..1 that the host must ask the plugin to render into
+        // text; an LV2 control port declares its range in real engineering
+        // units, so "800 Hz" is arithmetic here rather than a round trip. The
+        // panel wants a normalised default, so that is what is computed —
+        // the range travels with the automation curve, not the panel.
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        if let Some(bay) = self
+            .insert_lv2
+            .get(strip)
+            .and_then(|r| r.get(slot))
+            .and_then(Option::as_ref)
+        {
+            return bay
+                .params
+                .iter()
+                .map(|p| tangent_host::ParamInfo {
+                    id: u32::try_from(p.index).unwrap_or(u32::MAX),
+                    title: p.name.clone(),
+                    units: p.units.clone(),
+                    default_normalised: normalise(p.default, p.min, p.max),
+                    step_count: p.steps,
+                })
+                .collect();
+        }
         self.insert_state_handles
             .get(strip)
             .and_then(|r| r.get(slot))
