@@ -2676,6 +2676,31 @@ const AUTO_PARAMS_PER_BAY: usize = 16;
 /// the road that is already there and already tested. A knob turned in the
 /// plugin's window and the same knob automated are the same event by the time
 /// the audio thread sees either.
+/// What an LV2 bay offers the automation lanes.
+///
+/// **`index`, not `port_index`, is the id.** The lane's id is what the curve
+/// stores and what `process_effect` hands to `set_param`, and `set_param`
+/// counts control inputs — so this is the one place the POSITION is wanted and
+/// the absolute port number would be wrong. The two are different numbers; see
+/// `lv2::ParamInfo::port_index` for what happens when they are confused.
+///
+/// Free-standing so the shape can be pinned by a test: it was a closure inside
+/// the accessor, and the accessor needs a whole `Engine` and an audio device to
+/// call.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn lanes_for_lv2(params: &[tangent_host::lv2::ParamInfo]) -> Vec<tangent_host::ParamInfo> {
+    params
+        .iter()
+        .map(|p| tangent_host::ParamInfo {
+            id: u32::try_from(p.index).unwrap_or(u32::MAX),
+            title: p.name.clone(),
+            units: p.units.clone(),
+            default_normalised: normalise(p.default, p.min, p.max),
+            step_count: p.steps,
+        })
+        .collect()
+}
+
 /// A control's resting place as a fraction of its travel.
 ///
 /// A degenerate range — a port whose minimum equals its maximum, which a few
@@ -8430,17 +8455,7 @@ impl Engine {
             .and_then(|r| r.get(slot))
             .and_then(Option::as_ref)
         {
-            return bay
-                .params
-                .iter()
-                .map(|p| tangent_host::ParamInfo {
-                    id: u32::try_from(p.index).unwrap_or(u32::MAX),
-                    title: p.name.clone(),
-                    units: p.units.clone(),
-                    default_normalised: normalise(p.default, p.min, p.max),
-                    step_count: p.steps,
-                })
-                .collect();
+            return lanes_for_lv2(&bay.params);
         }
         self.insert_state_handles
             .get(strip)
@@ -11565,6 +11580,36 @@ mod tests {
         let mut r = test_renderer(Arc::clone(&shared), tap_tx, dev_ch);
         r.midi = midi_rx;
         (r, midi_tx, shared)
+    }
+
+    /// **What the automation menu will actually read for an LV2 bay.**
+    ///
+    /// Built from a REAL installed plugin rather than a hand-written list, so
+    /// it fails if the metadata scan stops finding names or units — which is
+    /// the failure that would leave the menu full of "Parameter 7" without
+    /// breaking anything else.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn an_lv2_bay_offers_its_controls_to_the_automation_lanes() {
+        const AMP: &str = "http://lv2plug.in/plugins/eg-amp";
+        if !tangent_host::lv2::discover().iter().any(|p| p.uri == AMP) {
+            return;
+        }
+        let inst = tangent_host::lv2::Instance::create(AMP, 48_000.0).expect("instantiates");
+        let lanes = lanes_for_lv2(inst.params());
+        assert!(!lanes.is_empty(), "an LV2 bay must offer something");
+        let gain_index = inst
+            .params()
+            .iter()
+            .find(|p| p.symbol == "gain")
+            .expect("eg-amp has a gain");
+        let lane = lanes
+            .iter()
+            .find(|l| l.id == gain_index.index as u32)
+            .expect("the id is the control-input position, not the port index");
+        assert!(!lane.title.starts_with("Parameter "), "{}", lane.title);
+        assert_eq!(lane.units, "dB");
+        assert!((0.0..=1.0).contains(&lane.default_normalised));
     }
 
     /// A control's resting place as a fraction of its travel — including the
