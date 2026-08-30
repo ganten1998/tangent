@@ -186,6 +186,34 @@ linuxvideo = { path = "vendor/linuxvideo" }
 # is in the tree anyway rather than adding a second copy of the decoder.
 zune-jpeg = "0.5"
 
+# **FreeBSD gets the JACK host as well as ALSA, and this does not change the
+# default.**
+#
+# cpal 0.16 already supports FreeBSD properly — `src/platform/mod.rs` and
+# `src/host/mod.rs` gate the ALSA host on `linux|dragonfly|freebsd|netbsd`, and
+# `Cargo.toml` declares its optional `jack` dependency for that same set — so
+# FreeBSD needs no patched cpal, only the feature turned on.
+#
+# Why turn it on unconditionally here rather than behind our own cargo feature
+# like `asio` is: on FreeBSD libjack is ALREADY a hard dependency of the build,
+# because midir has no other backend there (see tangent/Cargo.toml). Once the
+# library is linked regardless, hiding the audio half of it behind a flag buys
+# nothing and costs the user the pro-audio path.
+#
+# It is safe for the out-of-the-box case, which was the thing worth checking:
+# cpal's `default_host()` for this platform is a hardcoded `AlsaHost::new()`
+# whatever features are on, so JACK never becomes the default by being present.
+# All it does is add "JACK" to `cpal::available_hosts()`, which is precisely
+# what `audio::systems()` enumerates into the Audio Setup panel — so the picker
+# grows a working JACK entry with no UI code, the same way ASIO does on Windows.
+#
+# Measured, not assumed: stock GhostBSD with nothing configured plays and
+# records through the ALSA host over FreeBSD's alsa-lib-to-OSS shim. JACK is the
+# low-latency option on top (`jackd -d oss`), not the thing standing between the
+# user and their first sound.
+[target.'cfg(target_os = "freebsd")'.dependencies]
+cpal = { version = "0.16", features = ["jack"] }
+
 [lints]
 workspace = true
 

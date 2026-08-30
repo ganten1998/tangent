@@ -72,18 +72,49 @@ windows-sys = { version = "0.60", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
-# ── the editor window, Linux ─────────────────────────────────────────────────
+# ── the editor window (X11) and LV2 ──────────────────────────────────────────
 #
 # `x11rb` is a pure-Rust X11 client: no libX11, no C toolchain, which is what
 # lets cargo-zigbuild keep cross-building Linux from the Mac — the same
 # property the vst3 crate was chosen for. Already in the lock (arboard pulls
 # it). `libc` is for `poll(2)` over the fds a plugin registers with the
 # host's IRunLoop; nothing in std polls a foreign fd without blocking.
-[target.'cfg(target_os = "linux")'.dependencies]
+# **LV2, on the two platforms that have one.**
+#
+# LV2 is the native plugin format of the Linux audio world — lsp-plugins, Calf,
+# x42, Dragonfly, Rubber Band are all LV2 first — and it is very nearly the ONLY
+# format packaged for FreeBSD, where the ports tree has no VST3 plugins at all.
+# A host that speaks only VST3 therefore reaches almost nothing on either.
+#
+# `livi` is a safe wrapper over `lilv`, the reference LV2 host library, which is
+# a system dependency (`audio/lilv`, `pkg-config lilv-0`) rather than a bundled
+# C build. Not offered on macOS or Windows: LV2 has essentially no presence on
+# either, and adding a C library to the cross-build would cost the property that
+# `cargo-zigbuild` exists to preserve.
+#
+# Note this pulls `lv2-sys`, which does not build on FreeBSD unpatched — see the
+# `[patch.crates-io]` in the workspace root.
+#
+# **FreeBSD shares this section with Linux for the X11 pieces too**, and that is
+# the same observation twice: the editor backend is X11 and `poll(2)`, neither
+# of which is Linux-specific. The gate said `linux` only because Linux was the
+# one X11 platform in the matrix when it was written.
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+livi = "0.7"
+# `lilv` directly as well as through livi, because livi does not expose plugin
+# UIs and there is nothing to be done about that from outside it: the UI's
+# binary path, bundle path and class all come from lilv's own UI API.
+lilv = "0.2"
+# The LV2 C ABI. Only the UI half is used — `LV2UI_Descriptor`, the idle
+# interface and the feature struct — and it is already in the tree beneath
+# livi, so this names a dependency rather than adding one.
+lv2-sys = "2.0"
 x11rb = "0.13"
 libc = "0.2"
 
 [dev-dependencies]
+# The LV2 editor example needs a window to embed into.
+x11rb = "0.13"
 # Examples only, and `check-firewall.sh` walks `--edges normal`, so this does
 # not put the recorder into the host's shipped dependency graph. It is here so
 # the spike can write a REAL take file with the real writer rather than a

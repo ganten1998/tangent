@@ -2150,11 +2150,22 @@ impl DesktopApp {
         // window-interaction bug gets reproduced and bisected from a script;
         // driving it by hand makes every measurement a different measurement.
         //   IVORY_OPEN_EDITOR=1 dist/Tangent.app/Contents/MacOS/tangent
-        if !self.recorder.dev_editor_done
-            && matches!(
-                std::env::var("IVORY_OPEN_EDITOR").as_deref(),
-                Ok("1") | Ok("patch")
-            )
+        //
+        // **`=<strip>,<bay>` names a different bay**, because bay 1 of channel
+        // 1 holds the built-in on a fresh desk and therefore opens the PATCH
+        // picker. The plugin picker is only ever reached through an EMPTY bay,
+        // so with the hook pinned to slot 0 there was no way to put it on
+        // screen from a script at all — which is the one thing the hook exists
+        // to make possible.
+        //   IVORY_OPEN_EDITOR=0,1 tangent      # channel 1, bay 2: empty
+        let dev_editor_bay = match std::env::var("IVORY_OPEN_EDITOR").as_deref() {
+            Ok("1") | Ok("patch") => Some((0, 0)),
+            Ok(v) => v.split_once(',').and_then(|(s, b)| {
+                Some((s.trim().parse().ok()?, b.trim().parse().ok()?))
+            }),
+            Err(_) => None,
+        };
+        if let (false, Some((dev_strip, dev_bay))) = (self.recorder.dev_editor_done, dev_editor_bay)
         {
             let due = self
                 .recorder
@@ -2166,7 +2177,7 @@ impl DesktopApp {
                 // so the hook opens whatever a CLICK would open — the built-in's
                 // patch picker as readily as a VST3's window. A hook that called
                 // the engine directly could only ever reproduce half the bugs.
-                self.app.open_insert_face(0, 0);
+                self.app.open_insert_face(dev_strip, dev_bay);
                 // `=patch` goes one further, to the patch EDITOR, which is
                 // otherwise two clicks in and cannot be reached from a script.
                 if std::env::var("IVORY_OPEN_EDITOR").as_deref() == Ok("patch") {
@@ -2175,7 +2186,11 @@ impl DesktopApp {
                             slot: 0,
                         });
                 }
-                eprintln!("IVORY_OPEN_EDITOR: opened slot 1");
+                eprintln!(
+                    "IVORY_OPEN_EDITOR: opened channel {} bay {}",
+                    dev_strip + 1,
+                    dev_bay + 1
+                );
             }
             ctx.request_repaint();
         }
@@ -2535,16 +2550,8 @@ impl DesktopApp {
                 );
             }
             self.recorder.take_note = Some(note);
-            self.app.set_plugin_list(
-                report
-                    .found
-                    .into_iter()
-                    .map(|p| {
-                        let v = tangent_host::vendor_of(&p);
-                        (p, v)
-                    })
-                    .collect(),
-            );
+            self.app
+                .set_plugin_list(crate::plugin_catalog_from(report.found));
         }
         // **The user's effect, across the effects bus.**
         //
@@ -3605,12 +3612,16 @@ impl DesktopApp {
     /// frame after — the change needs a frame to reach the WM — and fullscreen
     /// goes back when the picker is done. macOS and Windows put a panel in
     /// front of a fullscreen window themselves and are left alone.
-    #[cfg(target_os = "linux")]
+    /// FreeBSD is included because this is an X11 problem, not a Linux one:
+    /// the same window managers run there, `_NET_WM_STATE_FULLSCREEN` means the
+    /// same thing, and `rfd` blocks the main thread identically. Nothing about
+    /// the diagnosis above is kernel-specific.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn picker_needs_windowed(ctx: &egui::Context) -> bool {
         ctx.input(|i| i.viewport().fullscreen.unwrap_or(false))
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     fn picker_needs_windowed(_ctx: &egui::Context) -> bool {
         false
     }
@@ -3690,7 +3701,19 @@ impl DesktopApp {
     /// No new dependency, and wrong only in the direction that costs nothing:
     /// if this says no and a native dialog would have worked, the in-app
     /// browser opens instead and still chooses the file.
-    #[cfg(target_os = "linux")]
+    /// FreeBSD runs this probe too, and needs it more than Linux does.
+    ///
+    /// Nothing in the diagnosis is Linux-specific: `rfd`'s two non-macOS
+    /// backends are the portal and zenity, and a FreeBSD desktop is if anything
+    /// LESS likely to have a portal running than the Void box that produced the
+    /// original report. Left in the else-arm, FreeBSD asserted native dialogs
+    /// always work and got the silent-dead-button bug back verbatim.
+    ///
+    /// The probe itself was already portable — a session bus, `dbus-send` from
+    /// the same dbus package ports installs, `zenity` on `PATH` — and the file
+    /// heuristic below even reads `/usr/local/share/...`, which is the FreeBSD
+    /// prefix and was dead code until this gate included it.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn native_dialogs_work() -> bool {
         fn which_on_path(exe: &str) -> bool {
             std::env::var_os("PATH")
@@ -3757,7 +3780,7 @@ impl DesktopApp {
         chooser || which_on_path("zenity")
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     fn native_dialogs_work() -> bool {
         true
     }
@@ -7111,13 +7134,7 @@ impl DesktopApp {
             // when the user picks it.
             let extra = app.plugin_folders();
             app.set_plugin_list(
-                tangent_host::discover_in(&extra)
-                    .into_iter()
-                    .map(|p| {
-                        let v = tangent_host::vendor_of(&p);
-                        (p, v)
-                    })
-                    .collect(),
+                crate::plugin_catalog(&extra),
             );
             Recorder {
                 transport: crate::transport::Transport::new(),

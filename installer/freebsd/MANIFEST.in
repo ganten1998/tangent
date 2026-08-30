@@ -1,0 +1,180 @@
+# The FreeBSD package manifest, with @@VERSION@@ filled in by
+# scripts/build-freebsd.sh. UCL, per pkg-create(8).
+#
+# WHY A .pkg AND NOT A SHELL SCRIPT, WHICH IS THE OPPOSITE OF THE LINUX ANSWER
+#
+# installer/linux/install.sh explains at length why Linux gets a script: "a .deb
+# reaches Debian and Ubuntu. The same argument then repeats for rpm, for Arch,
+# and for Void." That argument is about FRAGMENTATION, and it does not survive
+# the crossing. FreeBSD has exactly one package format, and every derivative a
+# musician might be running — GhostBSD, NomadBSD, MidnightBSD's cousins — uses
+# the same `pkg`. One artifact reaches all of them, `pkg install ./tangent.pkg`
+# fetches the dependencies by itself, and `pkg delete tangent` is a complete
+# uninstall the system tracks rather than a script the user has to keep.
+#
+# The tarball path still exists for a no-root install (see install.sh --home),
+# because pkg cannot do one: PKG_DBDIR must be owned by root:wheel and there is
+# no override, so an unprivileged user cannot register a package at all.
+#
+# ABI IS DELIBERATELY ABSENT
+#
+# pkg derives `abi` and `arch` from the build host and enforces them at install
+# time: a FreeBSD:14:amd64 package is refused on a FreeBSD:15 host outright.
+# Setting `abi = "*"` would dodge the check and is tempting for a single
+# artifact — and it is wrong for a package full of native binaries and shared
+# library dependencies, because it converts a clean refusal into a runtime link
+# failure in front of the user. One artifact per FreeBSD major version instead.
+name = "tangent"
+version = "@@VERSION@@"
+origin = "audio/tangent"
+comment = "MIDI keyboard monitor that names what you play in real time"
+maintainer = "ganten1998@gmail.com"
+www = "https://ganten.neocities.org/projects"
+prefix = "/usr/local"
+categories = ["audio"]
+licenselogic = "single"
+licenses = ["MIT"]
+
+desc = <<EOD
+Tangent watches a MIDI keyboard and tells you what you are playing: the chord
+by name, on the staff, around the circle of fifths, on a guitar neck and in a
+Tonnetz lattice, as you play it. It records audio, MIDI and video takes, hosts
+LV2 and VST3 plugins and carries its own FM synthesiser, so it makes a sound
+on a machine with nothing else installed.
+
+On FreeBSD it reads MIDI straight from /dev/umidi and plays audio through the
+alsa-lib-over-OSS shim, so a keyboard and a pair of speakers work with nothing
+configured and no sound server running. JACK is offered in the Audio Setup
+panel for anyone who wants it, and is not required for anything.
+
+Free, offline, no telemetry, no account.
+EOD
+
+# ── Dependencies ─────────────────────────────────────────────────────────────
+#
+# EVERY ENTRY HERE WAS MEASURED, NOT GUESSED. `procstat -v` on a running Tangent
+# gave the 51 shared objects it actually maps, and `pkg which` named the package
+# owning each; this is that list, reduced to the leaves (pkg resolves the rest).
+#
+# What is deliberately NOT here is as important: the build host is GhostBSD,
+# which packages the BASE SYSTEM as GhostBSD-clibs, GhostBSD-runtime,
+# GhostBSD-zlib and GhostBSD-libexecinfo. Those own libc.so.7, libexecinfo.so.1
+# and friends on this machine and own nothing at all on plain FreeBSD, where the
+# same files ship in base. Declaring them would produce a package that installs
+# only on GhostBSD — the exact opposite of the point, given the tester may be on
+# anything.
+#
+# alsa-lib is the one that decides whether the app STARTS: libasound.so.2 is the
+# only ports library the binary links outright, and a stock FreeBSD has no
+# reason to have it. alsa-plugins is what makes it make a SOUND — it provides
+# libasound_module_pcm_oss.so, which is the shim that turns the ALSA API into
+# FreeBSD's native OSS, and the running process maps it.
+#
+# The X11 and mesa entries look redundant with any desktop and are not: this has
+# to work on a machine where somebody installed Xorg and nothing else.
+deps {
+  alsa-lib      { origin = "audio/alsa-lib";        version = "1.2.16.1"; }
+  alsa-plugins  { origin = "audio/alsa-plugins";    version = "1.2.12"; }
+  mesa-dri      { origin = "graphics/mesa-dri";     version = "24.1.7"; }
+  libglvnd      { origin = "graphics/libglvnd";     version = "1.7.0"; }
+  libX11        { origin = "x11/libX11";            version = "1.8.13"; }
+  libXcursor    { origin = "x11/libXcursor";        version = "1.2.3"; }
+  libXi         { origin = "x11/libXi";             version = "1.8.2"; }
+  libXrandr     { origin = "x11/libXrandr";         version = "1.5.4"; }
+  libxkbcommon  { origin = "x11/libxkbcommon";      version = "1.13.1"; }
+  # The file picker. rfd has exactly two backends here — xdg-desktop-portal and
+  # a zenity subprocess — and with neither, `pick_file` returns None, which is
+  # indistinguishable from Cancel, so Save/Load/Export silently do nothing.
+  # That bug has already been diagnosed once on Linux (docs/LINUX-4.16-FINDINGS)
+  # and zenity is the cheap way not to ship it again.
+  zenity        { origin = "x11-toolkits/zenity";   version = "4.0.0"; }
+  # "Open containing folder", and the desktop-integration triggers that rebuild
+  # the menu and icon caches. Those triggers are system-wide and fire for any
+  # package writing to share/applications or share/icons — which is why this
+  # package needs no post-install script of its own.
+  xdg-utils           { origin = "devel/xdg-utils";               version = "1.2.1"; }
+  desktop-file-utils  { origin = "devel/desktop-file-utils";      version = "0.28"; }
+  hicolor-icon-theme  { origin = "misc/hicolor-icon-theme";       version = "0.18"; }
+  # LV2, which is the plugin format FreeBSD actually has. The ports tree
+  # carries no VST3 plugins at all, so on this platform LV2 is not a bonus
+  # format — it is the only one a user can install from pkg, and a host that
+  # cannot read it reaches nothing. `liblilv-0.so` is linked outright by the
+  # binary, so this decides whether the app STARTS, exactly as alsa-lib does.
+  # Measured with `ldd` and `pkg which`, like every other entry; lilv's own
+  # dependencies (serd, sord, sratom, zix) are left to pkg to resolve, which
+  # is the leaves rule this list already follows.
+  lilv          { origin = "audio/lilv";            version = "0.28.0"; }
+  # Video export and import. The app degrades honestly without it — takes still
+  # record audio and MIDI — but a DAW that cannot write a video file when the
+  # user asks is a support ticket, and ffmpeg is a first-class port.
+  ffmpeg        { origin = "multimedia/ffmpeg";     version = "8.1"; }
+}
+
+# ── What the user is told after installing ───────────────────────────────────
+#
+# A `messages` block and NOT a post-install script, deliberately. Users can
+# suppress scripts entirely with `pkg add -I` / `--script-no-exec`, and pkg's
+# Lua scripts cannot call os.execute at all — so anything load-bearing in a
+# script is advice that may never be read. `messages` is the ports-standard
+# mechanism, renders as "Message from tangent-x.y.z" at the end of the install,
+# and cannot be switched off.
+messages [
+  {
+    type = "install"
+    message = <<EOM
+Tangent is installed. Run it from the Multimedia menu, or type: tangent
+
+SOUND, WITH NOTHING TO CONFIGURE
+  Audio plays through FreeBSD's own OSS by way of the alsa-lib shim. There is
+  no sound server to start. If you hear nothing, check the mixer first:
+
+      mixer vol 80 pcm 90
+
+LATENCY, IF YOU CARE ABOUT IT
+  One system setting is worth more than every other tweak combined:
+
+      sysctl hw.usb.uaudio.buffer_ms=1     # and add it to /etc/sysctl.conf
+
+  It is the USB audio driver's buffering delay, 4 by default, range 1 to 8.
+  Measured here with jack_iodelay on a USB interface, at 1 it takes the round
+  trip from 36.7 ms to 27.6 ms and costs nothing in stability. Re-plug the
+  interface afterwards -- it applies when a device attaches. (install.sh does
+  this for you; this note is for anyone who installed the .pkg directly.)
+
+  For lower still -- 10.9 ms measured -- there is one command:
+
+      pkg install jackit
+      tangent-jack start
+
+  It picks the right device, a period the OSS block size actually allows, and
+  realtime priority where the system permits it, then `tangent-jack stop` puts
+  it away. Choose "JACK" in the Audio Setup panel once it is running.
+  Nothing requires it; it is the low-latency option, not a prerequisite.
+
+PLUGINS
+  Tangent hosts LV2 and VST3. On FreeBSD that distinction matters: the ports
+  tree has no VST3 plugins, so LV2 is where everything is. Anything you
+  install from pkg is found automatically the next time Tangent starts --
+  there is nothing to configure and no path to set:
+
+      pkg install dragonfly-reverb calf lsp-plugins x42-plugins
+
+  A plugin with its own window opens it inside Tangent. One without a window
+  Tangent can embed is still fully usable: every control it publishes appears
+  in the automation lanes by name and in its own units -- "Decay, seconds",
+  not "parameter 7". Bays are on every channel.
+
+A MIDI KEYBOARD
+  Plug it in and Tangent finds it — MIDI is read straight from /dev/umidi, so
+  no server or daemon is involved. The device nodes are world-readable by
+  default, so no group membership or devfs rule is needed.
+
+  A MIDI port allows ONE reader at a time. If Tangent says a port is busy,
+  something else is holding it.
+
+VIDEO
+  Recording video needs a Vulkan driver. Hardware is best; mesa's lavapipe
+  works on any GPU. Audio and MIDI takes record without it.
+EOM
+  }
+]
