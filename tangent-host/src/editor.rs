@@ -85,9 +85,9 @@ use crate::instance::Instance;
 use mac::Window as Inner;
 #[cfg(target_os = "windows")]
 use win::Window as Inner;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use x11::Window as Inner;
-#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux", target_os = "freebsd")))]
 use stub::Window as Inner;
 
 /// Whether this build can host a plugin's own window at all.
@@ -98,7 +98,8 @@ use stub::Window as Inner;
 pub const EDITORS_SUPPORTED: bool = cfg!(any(
     target_os = "macos",
     target_os = "windows",
-    target_os = "linux"
+    target_os = "linux",
+    target_os = "freebsd"
 ));
 
 /// Why an editor could not be opened.
@@ -322,9 +323,9 @@ pub fn pump(timeout: Duration) {
     mac::pump(timeout);
     #[cfg(target_os = "windows")]
     win::pump(timeout);
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     x11::pump(timeout);
-    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux", target_os = "freebsd")))]
     let _ = timeout;
 }
 
@@ -1158,7 +1159,7 @@ mod win {
 /// there is no other loop to ride, because winit may be on Wayland while the
 /// plugin is on XWayland and the two share nothing. `pump` services every
 /// live editor for the processes that have no frame loop.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 mod x11 {
     use std::cell::{Cell, RefCell};
     use std::ffi::{c_int, c_void};
@@ -1646,7 +1647,7 @@ mod x11 {
 /// `kPlatformTypeX11EmbedWindowID` and an X11 window, into the same methods —
 /// and nothing in [`Editor`] or in `instance.rs` had to change. What remains
 /// here compiles only for targets the app does not ship on.
-#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux", target_os = "freebsd")))]
 mod stub {
     use super::EditorError;
     use vst3::ComPtr;
@@ -1706,7 +1707,12 @@ mod tests {
         // offers a button whose only outcome is that message.
         assert_eq!(
             EDITORS_SUPPORTED,
-            cfg!(any(target_os = "macos", target_os = "windows", target_os = "linux"))
+            cfg!(any(
+                target_os = "macos",
+                target_os = "windows",
+                target_os = "linux",
+                target_os = "freebsd"
+            ))
         );
         for e in [
             EditorError::Unsupported,
