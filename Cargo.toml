@@ -45,7 +45,7 @@ lilv = { path = "tangent-host/vendor/lilv" }
 livi = { path = "tangent-host/vendor/livi" }
 
 [workspace.package]
-version = "5.0.0-beta.14"
+version = "5.0.0-beta.15"
 edition = "2021"
 rust-version = "1.92"
 license = "MIT"
