@@ -473,6 +473,13 @@ pub enum Hit {
     /// curve's points. Grabbed to drag, or pressed to select.
     /// `(lane, row, point)`.
     AutoPoint(usize, usize, usize),
+    /// **The MASTER row's field**, carrying the time under the pointer.
+    ///
+    /// It is a bus and has no clips, so its whole width was dead ground —
+    /// a strip across the timeline that answered nothing. It locates the
+    /// playhead now, which is what every other empty surface on this
+    /// timeline already does and what a hand crossing it expects.
+    MasterLane(f64),
     /// Empty room on an automation lane: `(lane, seconds, value)`. A press
     /// here MAKES a point, which is how every DAW draws one.
     /// `(lane, row, seconds, value)`.
@@ -2050,6 +2057,13 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
             return Some(Hit::Lane(i, time_at(rect, view, pos.x)));
         }
     }
+    // The master's field, last: its header's own controls are pushed above
+    // and have already answered, so what is left is the ground beside them.
+    if let Some(row) = l.rows.iter().find(|r| r.kind == RowKind::Master) {
+        if row.lane.is_positive() && row.lane.contains(pos) {
+            return Some(Hit::MasterLane(time_at(rect, view, pos.x)));
+        }
+    }
     None
 }
 
@@ -2442,7 +2456,8 @@ pub fn a11y_nodes(rect: Rect, view: &ArrangeView<'_>) -> Vec<crate::a11y::Node> 
             }
             // Everything `targets` does not enumerate. Named rather than
             // caught by `_`, so a new hit has to be decided about here.
-            Hit::ClipLeft(_)
+            Hit::MasterLane(_)
+            | Hit::ClipLeft(_)
             | Hit::ClipRight(_)
             | Hit::FadeIn(_)
             | Hit::FadeOut(_)
@@ -3077,6 +3092,43 @@ fn draw_auto_headers(
     }
 }
 
+/// **The ground an automation row stands on**, and it is not a track's.
+///
+/// It was the parent lane's own stripe, eight per cent darker. That says
+/// "part of the track above" and nothing else, and eight per cent is inside
+/// the range a lane already varies by between its two stripes — so on most
+/// themes the row simply read as a third stripe in the alternation, and on
+/// the dark ones as no boundary at all. The owner asked for the grid under an
+/// automation row to be a distinct colour, per theme.
+///
+/// So it is pulled toward the RULER, which is the surface this app already
+/// uses for "a strip about the song rather than about a track" — a different
+/// character on every theme by construction, because each one derives its
+/// ruler from its own wood. The parent's stripe is still in the mix, so odd
+/// and even rows stay distinguishable and a row still belongs to the lane it
+/// hangs under.
+///
+/// Through `legible_surface` because a curve, its handles and now a value
+/// readout all land on this, and a blend of two themed roles is exactly the
+/// kind of derived colour that lands in the dead zone where neither ink
+/// clears 4.5:1.
+fn auto_ground(p: &Ink, lane: usize) -> Color32 {
+    let base = if lane % 2 == 0 { p.lane } else { p.lane_alt };
+    // Character first, then DISTANCE. The blend gives the row the ruler's
+    // hue so it reads as a strip about something other than a track; on the
+    // themes whose ruler already sits near the lane that blend alone changed
+    // almost nothing, which is what `separate` is for — it moves a colour
+    // away from itself, toward white on a dark field and toward black on a
+    // pale one, by an amount that shows either way. The audit above measures
+    // the result on every theme in both modes rather than trusting it.
+    //
+    // 0.26 and not less: measured across every factory theme in both modes,
+    // 0.14 and 0.20 both left Centennial and Porcelain at 1.02:1 against
+    // their own lane — indistinguishable — and 0.26 is where every theme
+    // clears. Ink still reads at 4.7:1 on the worst of them.
+    crate::recorder_panel::legible_surface(separate(blend(base, p.ruler, 0.35), 0.26))
+}
+
 /// Paint the whole view into `rect`.
 pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     let l = Layout::new(rect, view);
@@ -3101,8 +3153,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         if !row.lane.is_positive() {
             continue;
         }
-        let base = if lane % 2 == 0 { p.lane } else { p.lane_alt };
-        painter.rect_filled(row.lane, 0.0, shade(base, 0.88));
+        painter.rect_filled(row.lane, 0.0, auto_ground(&p, lane));
         // **Its HEADER is not drawn here**, and that is the whole point of
         // this comment. See `draw_auto_headers`, called after the header
         // column's wood: painting it in this loop put it UNDER that wood,
@@ -3362,7 +3413,9 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             .get(lane)
             .map_or(0, |v| v.color)
             .min(STRIP_COLORS.len() - 1)];
-        let ground = shade(if lane % 2 == 0 { p.lane } else { p.lane_alt }, 0.88);
+        // The same surface the row was filled with — one function, so the
+        // curve cannot be contrasted against a colour the row is not.
+        let ground = auto_ground(&p, lane);
         // The curve has to be legible on the ground it is drawn on, and a
         // channel colour is chosen to CARRY ink rather than to be ink. Lift
         // it away from the ground until it reads — the same walk `quiet`
@@ -5074,6 +5127,64 @@ ArrangeView {
     /// So this does not ask the layout what it INTENDS. It runs the real
     /// `draw` and looks at the shapes that came out, which is the only
     /// question that was ever in doubt.
+    /// **The master's field answers a press with the time under it.**
+    ///
+    /// It is a bus, so it holds no clips, and its whole width across the
+    /// timeline was the one horizontal strip here that answered nothing at
+    /// all. The owner asked for it to move the playhead, which is what every
+    /// other empty surface on this timeline already does.
+    #[test]
+    fn the_master_strip_reads_a_time_across_its_width() {
+        let clips: Vec<ClipView<'_>> = Vec::new();
+        let mut v = a_view(&clips);
+        v.visible_lanes = 8;
+        v.show_master_row = true;
+        v.view_start_s = 0.0;
+        v.view_len_s = 120.0;
+        let r = rect();
+        let l = Layout::new(r, &v);
+        let row = l
+            .rows
+            .iter()
+            .find(|x| x.kind == RowKind::Master)
+            .expect("no master row");
+        assert!(row.lane.is_positive(), "the master row has no field");
+
+        // Across the width, the time rises and matches the ruler's own
+        // mapping — the same `time_at` a lane press uses, so the magnet
+        // means the same thing wherever the hand lands.
+        let mut last = f64::NEG_INFINITY;
+        for frac in [0.05f32, 0.3, 0.5, 0.9] {
+            let x = row.lane.left() + row.lane.width() * frac;
+            let at = Pos2::new(x, row.lane.center().y);
+            match hit_test(r, &v, at) {
+                Some(Hit::MasterLane(t)) => {
+                    let want = time_at(r, &v, x);
+                    assert!((t - want).abs() < 1e-6, "read {t}, ruler says {want}");
+                    assert!(t > last, "time did not rise across the strip");
+                    last = t;
+                }
+                other => panic!("the master field answered {other:?} at {frac}"),
+            }
+        }
+
+        // Its own controls still win over the field: the fader is on that
+        // row and pressing it must not move the playhead.
+        assert_eq!(
+            hit_test(r, &v, l.master_row.knob.center()),
+            Some(Hit::BusGain(MASTER_COLUMN)),
+            "the master fader was swallowed by the field"
+        );
+
+        // And with the row switched off there is nothing there to press.
+        v.show_master_row = false;
+        let l2 = Layout::new(r, &v);
+        assert!(
+            !l2.rows.iter().any(|x| x.kind == RowKind::Master),
+            "the master row survived being switched off"
+        );
+    }
+
     #[test]
     fn every_control_is_drawn_at_every_height_a_row_can_have() {
         let ctx = egui::Context::default();
@@ -5607,6 +5718,22 @@ ArrangeView {
                 };
                 // Words have to be readable; structure only has to be seen.
                 check("header text", p.engrave, p.hdr_face, 4.5);
+                // **An automation row's ground, on every theme.** It is a
+                // blend of two themed roles, which is precisely the kind of
+                // derived colour that lands in the dead zone where neither
+                // ink clears — and a value readout is written on it now.
+                //
+                // The second check is not a reading threshold: nothing is
+                // read across that edge. 1.12:1 is the point at which the
+                // edge can be SEEN, which is the whole job — a row that
+                // matches its parent stripe is a third stripe in the
+                // alternation rather than a row about something else.
+                for lane in [0usize, 1] {
+                    let g = auto_ground(&p, lane);
+                    let parent = if lane % 2 == 0 { p.lane } else { p.lane_alt };
+                    check("automation readout", on_ink(g), g, 4.5);
+                    check("automation ground against its lane", g, parent, 1.12);
+                }
                 // **The chips are the mixer's bays.** Input, FX and routing
                 // were a hard-coded bone panel with hard-coded near-black on
                 // it, so on every theme but the default they stayed white
