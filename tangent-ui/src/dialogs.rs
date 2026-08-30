@@ -267,6 +267,18 @@ pub enum Dialog {
         open_groups: Vec<String>,
     },
     NoMidiInput,
+    /// **Something happened that the owner has to be told about**, with
+    /// nothing to decide.
+    ///
+    /// Distinct from `Confirm`, which asks a question and whose buttons carry
+    /// consequences. This one exists because the first thing it had to say —
+    /// that a plugin killed the app and has been taken out of its slot — is
+    /// useless on stderr, and a bay that is silently empty is a bay the owner
+    /// fills with the same plugin again.
+    Notice {
+        title: String,
+        body: String,
+    },
     MidiError {
         message: String,
     },
@@ -4098,6 +4110,35 @@ pub fn show(
                             ui.label(
                                 "No MIDI input ports found!\n\nYou can still use keytoggle mode by enabling it in the context menu.",
                             );
+                            ui.add_space((ui.available_height() - 30.0).max(0.0));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.button("OK").clicked() {
+                                    result.close = true;
+                                }
+                            });
+                        });
+                },
+            )
+        }
+
+        Dialog::Notice { title, body } => {
+            let stock = stock_style(ctx);
+            let title = title.clone();
+            let body = body.clone();
+            show_dialog_viewport(
+                ctx,
+                placement,
+                &title,
+                Vec2::new(440.0, 190.0),
+                Vec2::new(340.0, 150.0),
+                |ui, result| {
+                    *ui.style_mut() = stock.clone();
+                    let bg = ui.style().visuals.window_fill;
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, bg);
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::same(12))
+                        .show(ui, |ui| {
+                            ui.label(body.as_str());
                             ui.add_space((ui.available_height() - 30.0).max(0.0));
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if ui.button("OK").clicked() {

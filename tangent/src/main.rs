@@ -20,6 +20,9 @@ mod macwin;
 #[cfg(feature = "recorder")]
 mod devices;
 
+/// One chance for a plugin that kills the process. See the module docs.
+mod plugin_guard;
+
 /// What else is standing between the mix and the speakers.
 mod outpath;
 /// Six-operator FM, and real DX7 cartridges to feed it. The instrument the app

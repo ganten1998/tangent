@@ -16740,6 +16740,18 @@ impl IvoryApp {
         self.settings.borderless_mode
     }
 
+    /// **Say something once, at startup, that the owner must not miss.**
+    ///
+    /// Its first caller is the plugin guard: a bay that has been emptied
+    /// because its plugin killed the app is a bay the owner would otherwise
+    /// refill with the same plugin.
+    pub fn set_startup_notice(&mut self, body: String) {
+        self.dialog = Some(dialogs::Dialog::Notice {
+            title: "Tangent".to_owned(),
+            body,
+        });
+    }
+
     pub fn playhead_s(&self) -> f64 {
         self.recorder.position_s.max(0.0)
     }
