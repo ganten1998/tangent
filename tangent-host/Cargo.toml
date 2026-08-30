@@ -101,10 +101,20 @@ windows-sys = { version = "0.60", features = [
 # one X11 platform in the matrix when it was written.
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 livi = "0.7"
+# `lilv` directly as well as through livi, because livi does not expose plugin
+# UIs and there is nothing to be done about that from outside it: the UI's
+# binary path, bundle path and class all come from lilv's own UI API.
+lilv = "0.2"
+# The LV2 C ABI. Only the UI half is used — `LV2UI_Descriptor`, the idle
+# interface and the feature struct — and it is already in the tree beneath
+# livi, so this names a dependency rather than adding one.
+lv2-sys = "2.0"
 x11rb = "0.13"
 libc = "0.2"
 
 [dev-dependencies]
+# The LV2 editor example needs a window to embed into.
+x11rb = "0.13"
 # Examples only, and `check-firewall.sh` walks `--edges normal`, so this does
 # not put the recorder into the host's shipped dependency graph. It is here so
 # the spike can write a REAL take file with the real writer rather than a
