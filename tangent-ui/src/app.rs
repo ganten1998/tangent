@@ -936,7 +936,14 @@ pub struct IvoryApp {
     /// reach `tangent-host`, and it is a directory listing rather than a scan —
     /// nothing is LOADED to build this list, which matters when there are 112
     /// of them and any one could crash the process on open.
-    plugin_list: Vec<(std::path::PathBuf, Option<String>)>,
+    /// Path, vendor, and an optional display name.
+    ///
+    /// The name is optional because for a VST3 there is nothing to say: the
+    /// bundle's file stem IS the plugin's name and deriving it is right. LV2
+    /// plugins are named by URI, where the last path segment is at best a
+    /// slug ("dragonfly-reverb" for "Dragonfly Hall Reverb") and at worst the
+    /// whole URN, so those carry their real name explicitly.
+    plugin_list: Vec<(std::path::PathBuf, Option<String>, Option<String>)>,
     /// The band control the pointer grabbed, and where it grabbed it.
     ///
     /// The faders and the tempo are DRAGGED, and `recorder_panel::hit_test` is
@@ -18445,7 +18452,10 @@ impl IvoryApp {
     ///
     /// Called once at startup by the host. Paths and names only — building it
     /// opens nothing.
-    pub fn set_plugin_list(&mut self, bundles: Vec<(std::path::PathBuf, Option<String>)>) {
+    pub fn set_plugin_list(
+        &mut self,
+        bundles: Vec<(std::path::PathBuf, Option<String>, Option<String>)>,
+    ) {
         self.plugin_list = bundles;
     }
 

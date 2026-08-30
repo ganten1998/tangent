@@ -266,7 +266,7 @@ sentence and your notarised macOS build is the place it would show up. If you
 would rather not carry that on main, the LV2 work can be split from the cpal
 work; only `lv2-sys` is needed for LV2 itself.
 
-Also probably worth taking regardless of platform: `rtlatency` (a real
+Also probably worth taking regardless of platform: `rtclick` (a real
 round-trip probe, useful on any OS), and the `audio.rs:1027` landmine, which is
 NOT fixed — `range.max_sample_rate()` is a fallback that returns 4294967295 Hz
 on FreeBSD and is latent everywhere. I left it alone because it touches every
