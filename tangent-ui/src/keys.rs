@@ -403,10 +403,28 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
         BINDINGS
             .iter()
             .filter(|&&(_, _, a, shown)| {
+                // **`Z` is not fullscreen inside the MIDI editor.** It is
+                // general, so it was listed on every card as "fullscreen" —
+                // and with the pointer over the editor `midi_editor_input`
+                // takes bare `Z` for `me_fit_clip` while the fullscreen
+                // action is swallowed. The editor's own section below says
+                // what it really does; listing it twice, once wrongly, is
+                // the failure this file's header names.
+                if matches!(view, HelpView::MidiEdit)
+                    && matches!(a, KeyAction::ToggleFullscreen)
+                {
+                    return false;
+                }
                 shown && available(a, gates) && is_general(a)
             })
             .map(describe_on),
     );
+    // **Undo and redo, which were on no card at all.** They are chords, so
+    // they cannot live in `BINDINGS` — that table is single keys — and being
+    // in neither place meant the two most-pressed shortcuts in any editor
+    // went undocumented on every surface.
+    rows.push(("C-Z", "undo"));
+    rows.push(("C-S-Z", "redo"));
     rows.push(heading(match view {
         HelpView::Piano => "PIANO PANEL",
         HelpView::Mixer => "MIXER PANEL",
@@ -454,6 +472,12 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             ("W", "fit the biggest clip - empty: the shipped zoom"),
             ("S-ARM", "shift+arm: this lane alone - every other arm stands down"),
             ("C-T", "ctrl+T: a new track"),
+            ("C-C/V/X", "copy · paste · cut the selected clips"),
+            ("C-F", "group the selection into a folder"),
+            ("C-G", "glue the selected clips"),
+            ("C-N", "normalise the selection"),
+            ("C-M", "the master row on/off"),
+            ("ESC", "drop the time selection"),
             ("S-1", "shift+1: the theory view"),
             ("S-3", "shift+3: the mixer"),
         ]),
@@ -471,7 +495,10 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             ("C-D", "duplicate one grid step later"),
             ("ARROWS", "nudge: left/right a step · up/down a semitone"),
             ("Z", "fit the clip back in the window"),
+            ("N", "draw mode"),
             ("O", "swing grid on/off"),
+            ("C-G", "glue the selected notes"),
+            ("C-C/V", "copy · paste notes"),
             ("ESC", "close the editor"),
             ("WHEEL", "zoom at the playhead - click a bar, wheel zooms there"),
             ("A-WHL", "alt: move the viewport (the editor's own)"),
@@ -741,6 +768,118 @@ pub fn draw_help(
 mod tests {
     use super::*;
 
+    /// **Every KEY row on a view's card names a key that view actually
+    /// handles.**
+    ///
+    /// This module's header promises one source, so a shortcut cannot work
+    /// unlisted or be listed and not work. `BINDINGS` is what this module
+    /// dispatches; the per-view sections below it are prose, describing keys
+    /// that `midi_editor_input` and `arrangement_input` in `app.rs` handle —
+    /// several of them modifier chords this table cannot spell.
+    ///
+    /// Prose drifts. So the prose is read back against the handler: every row
+    /// whose label names a KEY rather than a gesture has to correspond to a
+    /// `Key::` that view's handler really reads.
+    #[test]
+    fn every_key_row_names_a_key_the_view_handles() {
+        let src = include_str!("app.rs");
+        let body = |name: &str| -> &str {
+            let start = src
+                .find(&format!("fn {name}("))
+                .unwrap_or_else(|| panic!("{name} is gone; this test reads the wrong thing"));
+            let rest = &src[start..];
+            let end = rest[10..].find("\n    fn ").map_or(rest.len(), |e| e + 10);
+            &rest[..end]
+        };
+        // A card label to the `Key::` idents it stands for. `None` is a
+        // GESTURE row — a mouse verb with no key to check.
+        let keys_of = |label: &str| -> Option<Vec<&'static str>> {
+            Some(match label {
+                "-/=" => vec!["Minus", "Equals"],
+                "W" => vec!["W"],
+                "Q" => vec!["Q"],
+                "Z" => vec!["Z"],
+                "N" => vec!["N"],
+                "O" => vec!["O"],
+                "DEL" => vec!["Delete"],
+                "ESC" => vec!["Escape"],
+                "ARROWS" => vec!["ArrowLeft", "ArrowUp"],
+                "C-A" => vec!["A"],
+                "C-D" => vec!["D"],
+                "C-G" => vec!["G"],
+                "C-F" => vec!["F"],
+                "C-N" => vec!["N"],
+                "C-M" => vec!["M"],
+                "C-T" => vec!["T"],
+                "C-C/V" | "C-C/V/X" => vec!["C", "V"],
+                _ => return None,
+            })
+        };
+        let gates = Gates {
+            recorder_shown: true,
+            recorder_available: true,
+            window_sizing: true,
+        };
+        for (view, handler) in [
+            (HelpView::Arrange, "arrangement_input"),
+            (HelpView::MidiEdit, "midi_editor_input"),
+        ] {
+            let hay = body(handler);
+            // Only the view's OWN section. The GENERAL rows above it are
+            // dispatched by this module from `BINDINGS`, not by the view —
+            // `Z` is fullscreen there and the arrangement never sees it.
+            // The panel heading is the boundary, and it is the second
+            // heading on the card.
+            let rows = card_rows(gates, view);
+            let panel = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, (l, _))| l.is_empty())
+                .nth(1)
+                .map_or(rows.len(), |(i, _)| i);
+            for (label, desc) in rows.iter().skip(panel).copied() {
+                let Some(keys) = keys_of(label) else { continue };
+                for k in keys {
+                    assert!(
+                        hay.contains(&format!("Key::{k}")),
+                        "{view:?} offers {label:?} ({desc}), and {handler} never reads Key::{k}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **No card shows one key twice.** Two rows with the same key column is
+    /// either a bind described twice or two binds fighting, and both look
+    /// like a typo until somebody presses it.
+    #[test]
+    fn a_card_never_lists_the_same_key_twice() {
+        let gates = Gates {
+            recorder_shown: true,
+            recorder_available: true,
+            window_sizing: true,
+        };
+        for view in [
+            HelpView::Piano,
+            HelpView::Mixer,
+            HelpView::Arrange,
+            HelpView::MidiEdit,
+        ] {
+            let rows = card_rows(gates, view);
+            let mut seen: Vec<&str> = Vec::new();
+            for (label, desc) in &rows {
+                if label.is_empty() {
+                    continue; // a heading
+                }
+                assert!(
+                    !seen.contains(label),
+                    "{view:?} lists {label:?} twice; the second says {desc:?}"
+                );
+                seen.push(label);
+            }
+        }
+    }
+
     /// **Tab reaches the app, and egui does not eat it.**
     ///
     /// Worth a test rather than a look, because Tab is the one key in this
@@ -856,6 +995,12 @@ mod tests {
         };
         let card = |view: HelpView| card_rows(gates, view);
         let has = |rows: &[(&str, &str)], key: &str| rows.iter().any(|(k, _)| *k == key);
+        let desc_of = |rows: &[(&str, &str)], key: &str| -> String {
+            rows.iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, d)| (*d).to_owned())
+                .unwrap_or_default()
+        };
         fn desc<'a>(rows: &[(&'a str, &'a str)], key: &str) -> &'a str {
             rows.iter()
                 .find(|(k, _)| *k == key)
@@ -869,9 +1014,10 @@ mod tests {
             .iter()
             .filter(|&&(_, _, a, s)| s && available(a, gates))
             .count();
-        // Plus the two view-key gesture rows the piano card now carries,
-        // and the TWO section headings (GENERAL / PIANO PANEL).
-        assert_eq!(piano.len(), shown + 4, "the piano card dropped a live key");
+        // Plus the prose rows every card carries — the two view keys and the
+        // two undo/redo chords, which are not in `BINDINGS` because that
+        // table is single keys — and the TWO section headings.
+        assert_eq!(piano.len(), shown + 6, "the piano card dropped a live key");
 
         for (view, name) in [
             (HelpView::Mixer, "mixer"),
@@ -881,11 +1027,26 @@ mod tests {
             let rows = card(view);
             // The piano-only keys are gone: keytoggle, the staff pair, the
             // theory row, transpose, clear, and the teach block.
-            for dead in ["K", "U", "I", "1-4", "T", "C", "Up", "Down", "R", "N", "E", "L"] {
+            //
+            // `N` is NOT in this list, because it is not one answer for every
+            // view: on the mixer and the arrangement it is the teach key and
+            // dead, and in the MIDI editor it is DRAW MODE — the editor takes
+            // bare `N` for itself, and the teach action is swallowed there
+            // exactly as the magnet and the triplet grid are.
+            for dead in ["K", "U", "I", "1-4", "T", "C", "Up", "Down", "R", "E", "L"] {
                 assert!(
                     !has(&rows, dead),
                     "{name}: `{dead}` is on the card but does nothing there"
                 );
+            }
+            if matches!(view, HelpView::MidiEdit) {
+                assert_eq!(
+                    desc_of(&rows, "N"),
+                    "draw mode",
+                    "the editor's N should be its own"
+                );
+            } else {
+                assert!(!has(&rows, "N"), "{name}: `N` is dead here");
             }
             // The window's own switches stay everywhere.
             for live in ["H", "D", "F", "Z", "Tab", "Enter", "Space"] {
@@ -1057,7 +1218,7 @@ mod tests {
         for gates in [Gates::default(), Gates { recorder_shown: true, recorder_available: true, window_sizing: true }] {
             for (label, _) in card_rows(gates, HelpView::Piano) {
                 // The view-key gesture rows are card prose, not bindings.
-                if matches!(label, "S-1" | "S-2" | "S-3") || label.is_empty() {
+                if matches!(label, "S-1" | "S-2" | "S-3" | "C-Z" | "C-S-Z") || label.is_empty() {
                     // The view-key gesture rows and the section headings
                     // have no table entry to cross-check.
                     continue;
