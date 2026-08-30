@@ -22887,6 +22887,15 @@ impl IvoryApp {
                         self.settings.midi_swing = false;
                     }
                     self.save_settings();
+                } else if editor_focus && action == keys::KeyAction::TeachChordName {
+                    // **`N` is the editor's draw mode, and only that.**
+                    //
+                    // `midi_editor_input` takes bare `N` for draw mode while
+                    // this table still had it as "teach this chord a name" —
+                    // so one press over the editor toggled the mode AND put a
+                    // modal dialog over the clip somebody was drawing in. The
+                    // other keys the editor stole are swallowed here; this one
+                    // was missed, and the help card had never listed it either.
                 } else if editor_focus && action == keys::KeyAction::ShowSupporterKey {
                     // S is the arrangement's SPLIT — cutting a clip you
                     // cannot see, under the editor, is a footgun; the key
