@@ -140,10 +140,20 @@ impl DrumpadDoc {
     /// project open sounding as it did: its single kit belongs to whichever
     /// channel was carrying the drumpad, and the app writes that number down
     /// the first time it saves.
-    pub fn load_all_beside(doc: &std::path::Path, lanes: usize) -> Vec<Self> {
+    /// Every lane's kit, and **which lane was showing when it was saved**.
+    ///
+    /// The second half is not decoration. `primary_lane` is written on every
+    /// save and was read only to place the legacy kit — so the app reopened a
+    /// project on the LOWEST non-empty lane instead of the one that had been
+    /// in front of you. On a session with kits on lanes 0, 3 and 5 and the
+    /// panel left on 3, it came back showing 0: different samples on every
+    /// pad, in the panel you had just been working in, which reads as the
+    /// kit having been destroyed. It had not been; it was on another lane the
+    /// whole time. The owner: "the update clobbered my old drum layouts."
+    pub fn load_all_beside(doc: &std::path::Path, lanes: usize) -> (Vec<Self>, Option<usize>) {
         let mut out: Vec<Self> = (0..lanes).map(|_| Self::default()).collect();
         let Ok(text) = std::fs::read_to_string(Self::sidecar(doc)) else {
-            return out;
+            return (out, None);
         };
         // The legacy kit, always — it is the whole file for a project
         // written before this existed.
@@ -172,7 +182,15 @@ impl DrumpadDoc {
                 }
             }
         }
-        out
+        // Only if the file actually said so. A project written before
+        // `primary_lane` existed has no opinion, and inventing lane 0 for it
+        // would be the same guess the caller already makes.
+        let stated = obj
+            .and_then(|m| m.get("primary_lane"))
+            .and_then(Value::as_u64)
+            .map(|n| n as usize)
+            .filter(|n| *n < out.len());
+        (out, stated)
     }
 
     /// **Every lane's kit into the one sidecar.** See `load_all_beside` for
@@ -356,8 +374,12 @@ mod tests {
         kits[7] = kit("snare");
 
         DrumpadDoc::save_all_beside(&kits, 3, &doc);
-        let back = DrumpadDoc::load_all_beside(&doc, 16);
+        let (back, primary) = DrumpadDoc::load_all_beside(&doc, 16);
         assert_eq!(back.len(), 16);
+        // **The lane that was showing comes back with the kits.** Reading the
+        // kits and forgetting which one was in front of you is how a project
+        // reopens on somebody else's pads.
+        assert_eq!(primary, Some(3), "the saved lane was not restored");
         assert_eq!(back[3].pads[36].path, "media/kick.wav", "lane 3's kit");
         assert_eq!(back[7].pads[36].path, "media/snare.wav", "lane 7's kit");
         assert!(back[0].is_empty(), "a lane with no kit came back with one");
@@ -369,7 +391,10 @@ mod tests {
         // the worst possible way to ship this.
         let legacy = kit("legacy");
         std::fs::write(DrumpadDoc::sidecar(&doc), legacy.to_json()).expect("write legacy");
-        let back = DrumpadDoc::load_all_beside(&doc, 16);
+        let (back, primary) = DrumpadDoc::load_all_beside(&doc, 16);
+        // A file with no opinion says so, rather than claiming lane 0 —
+        // the caller's fallback is the same answer and it knows it guessed.
+        assert_eq!(primary, None, "a pre-lanes file invented a primary lane");
         assert_eq!(
             back[0].pads[36].path, "media/legacy.wav",
             "a pre-lanes kit did not survive the upgrade"
@@ -495,5 +520,377 @@ mod tests {
             std::path::PathBuf::from("/tmp/proj/media/a.wav")
         );
         assert_eq!(resolve(doc, "/abs/b.wav"), std::path::PathBuf::from("/abs/b.wav"));
+    }
+}
+
+impl DrumpadDoc {
+    /// **Every lane's kit, small enough to keep a hundred of.**
+    ///
+    /// The full form writes all 128 pads whether or not they hold anything —
+    /// 24 KB a kit, which is right for a file written once per edit and wrong
+    /// for the undo timeline, where a hundred moments of three kits would be
+    /// several megabytes of mostly empty slots.
+    ///
+    /// So: only the pads that hold something, and only the lanes that hold a
+    /// pad. Everything else is the default and rebuilds itself.
+    ///
+    /// **The one thing this drops** is `extra` on an EMPTY pad — keys a newer
+    /// build wrote on a slot with no sample in it. The sidecar still
+    /// preserves them; only the undo snapshot does not, so the cost of a
+    /// round trip through undo is a stranger's key on a pad that was empty
+    /// anyway. That is worth three orders of magnitude.
+    pub fn compact_all(kits: &[Self]) -> String {
+        let mut root = Map::new();
+        for (lane, kit) in kits.iter().enumerate() {
+            if kit.is_empty() && (kit.master - 1.0).abs() < f32::EPSILON {
+                continue;
+            }
+            let mut k = Map::new();
+            k.insert("master".into(), Value::from(f64::from(kit.master)));
+            let mut pads = Map::new();
+            for (key, pad) in kit.pads.iter().enumerate() {
+                if pad.path.is_empty() {
+                    continue;
+                }
+                let mut m = pad.extra.clone();
+                m.insert("path".into(), Value::from(pad.path.clone()));
+                m.insert("name".into(), Value::from(pad.name.clone()));
+                m.insert("gain".into(), Value::from(f64::from(pad.params.gain)));
+                m.insert("pan".into(), Value::from(f64::from(pad.params.pan)));
+                m.insert("tune".into(), Value::from(f64::from(pad.params.tune)));
+                m.insert("choke".into(), Value::from(u64::from(pad.params.choke)));
+                m.insert("obey".into(), Value::from(pad.params.obey));
+                m.insert(
+                    "trim_start".into(),
+                    Value::from(f64::from(pad.params.trim_start)),
+                );
+                m.insert("trim_end".into(), Value::from(f64::from(pad.params.trim_end)));
+                pads.insert(key.to_string(), Value::Object(m));
+            }
+            k.insert("pads".into(), Value::Object(pads));
+            root.insert(lane.to_string(), Value::Object(k));
+        }
+        serde_json::to_string(&Value::Object(root)).unwrap_or_default()
+    }
+
+    /// The inverse. Unreadable text is `lanes` empty kits, never a panic.
+    pub fn from_compact_all(text: &str, lanes: usize) -> Vec<Self> {
+        let mut out: Vec<Self> = (0..lanes).map(|_| Self::default()).collect();
+        let Ok(Value::Object(root)) = serde_json::from_str::<Value>(text) else {
+            return out;
+        };
+        for (key, v) in &root {
+            let Ok(lane) = key.parse::<usize>() else { continue };
+            if lane >= out.len() {
+                continue;
+            }
+            let Some(k) = v.as_object() else { continue };
+            if let Some(m) = k.get("master").and_then(Value::as_f64) {
+                out[lane].master = m as f32;
+            }
+            let Some(Value::Object(pads)) = k.get("pads") else { continue };
+            for (pk, pv) in pads {
+                let Ok(idx) = pk.parse::<usize>() else { continue };
+                if idx >= DRUM_PADS {
+                    continue;
+                }
+                let Some(o) = pv.as_object() else { continue };
+                let num = |n: &str, d: f32| {
+                    o.get(n).and_then(Value::as_f64).map_or(d, |x| x as f32)
+                };
+                let mut params = DrumPadParams {
+                    gain: num("gain", 1.0),
+                    pan: num("pan", 0.0),
+                    tune: num("tune", 0.0),
+                    trim_start: num("trim_start", 0.0),
+                    trim_end: num("trim_end", 1.0),
+                    ..DrumPadParams::default()
+                };
+                if let Some(c) = o.get("choke").and_then(Value::as_u64) {
+                    params.choke = c as u8;
+                }
+                if let Some(b) = o.get("obey").and_then(Value::as_bool) {
+                    params.obey = b;
+                }
+                let mut extra = o.clone();
+                for k in PAD_KEYS {
+                    extra.shift_remove(k);
+                }
+                out[lane].pads[idx] = PadSlot {
+                    path: o
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    name: o
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    params,
+                    extra,
+                };
+            }
+        }
+        out
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Kit presets
+// ───────────────────────────────────────────────────────────────────────────
+
+/// The extension a saved kit wears.
+pub const PRESET_EXT: &str = "tgkit";
+
+/// **A kit as a THING you can keep**, independent of the project it was
+/// built in.
+///
+/// The sidecar beside a project is not a preset and cannot be made into one:
+/// its paths are `media/<file>` against that project's own folder, so the
+/// same file read from another project points at samples that are not there.
+/// The owner spent a session building a layout, and the only copy of it lived
+/// inside one project directory: "add a system to save a kit in the drum vst,
+/// saving to an actual file which holds which samples go on which pads for
+/// that preset."
+///
+/// So a preset records **absolute** source paths, and loading one copies each
+/// sample into the destination project the same way dragging the file in
+/// would — `IvoryApp::drumpad_load`, one pad at a time. A project stays
+/// self-contained; the preset is the recipe, not the ingredients.
+///
+/// Only the pads that hold something are written. A hundred and twenty-eight
+/// empty slots is most of a 24 KB file saying nothing.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct KitPreset {
+    /// What the kit is called — the file's stem, kept in the file too so a
+    /// renamed file still knows what it was.
+    pub name: String,
+    /// `(key, absolute source, pad name, params)`, in key order.
+    pub pads: Vec<(usize, std::path::PathBuf, String, DrumPadParams)>,
+    /// The kit's own fader.
+    pub master: f32,
+}
+
+impl KitPreset {
+    /// Take a snapshot of `kit`, resolving every pad against `doc`.
+    ///
+    /// A pad whose file has since gone missing is written anyway: the preset
+    /// is a record of the layout, and a sample that is missing today may be
+    /// on the disk the preset is carried to. Loading reports what it could
+    /// not find rather than refusing the whole kit.
+    pub fn from_kit(name: &str, kit: &DrumpadDoc, doc: &std::path::Path) -> Self {
+        Self {
+            name: name.to_owned(),
+            master: kit.master,
+            pads: kit
+                .pads
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| !p.path.is_empty())
+                .map(|(key, p)| {
+                    (key, resolve(doc, &p.path), p.name.clone(), p.params)
+                })
+                .collect(),
+        }
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut root = Map::new();
+        root.insert("version".into(), Value::from(DRUMPAD_VERSION));
+        root.insert("kind".into(), Value::from("tangent-kit"));
+        root.insert("name".into(), Value::from(self.name.clone()));
+        root.insert("master".into(), Value::from(f64::from(self.master)));
+        let pads: Vec<Value> = self
+            .pads
+            .iter()
+            .map(|(key, file, name, params)| {
+                let mut m = Map::new();
+                m.insert("key".into(), Value::from(*key as u64));
+                m.insert("file".into(), Value::from(file.to_string_lossy().into_owned()));
+                m.insert("name".into(), Value::from(name.clone()));
+                m.insert("gain".into(), Value::from(f64::from(params.gain)));
+                m.insert("pan".into(), Value::from(f64::from(params.pan)));
+                m.insert("tune".into(), Value::from(f64::from(params.tune)));
+                m.insert("choke".into(), Value::from(u64::from(params.choke)));
+                m.insert("obey".into(), Value::from(params.obey));
+                m.insert("trim_start".into(), Value::from(f64::from(params.trim_start)));
+                m.insert("trim_end".into(), Value::from(f64::from(params.trim_end)));
+                Value::Object(m)
+            })
+            .collect();
+        root.insert("pads".into(), Value::Array(pads));
+        serde_json::to_string_pretty(&Value::Object(root)).unwrap_or_default()
+    }
+
+    /// **Manners identical to the sidecar's**: anything unreadable is an
+    /// empty preset, never a panic and never a half-applied kit.
+    pub fn from_json(text: &str) -> Self {
+        let Ok(Value::Object(root)) = serde_json::from_str::<Value>(text) else {
+            return Self::default();
+        };
+        let mut out = Self {
+            name: root
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            master: root
+                .get("master")
+                .and_then(Value::as_f64)
+                .map_or(1.0, |v| v as f32),
+            pads: Vec::new(),
+        };
+        let Some(Value::Array(pads)) = root.get("pads") else {
+            return out;
+        };
+        for p in pads {
+            let Some(o) = p.as_object() else { continue };
+            let Some(key) = o.get("key").and_then(Value::as_u64) else {
+                continue;
+            };
+            let key = key as usize;
+            if key >= DRUM_PADS {
+                continue;
+            }
+            let Some(file) = o.get("file").and_then(Value::as_str) else {
+                continue;
+            };
+            let num = |k: &str, d: f32| {
+                o.get(k).and_then(Value::as_f64).map_or(d, |v| v as f32)
+            };
+            let mut params = DrumPadParams {
+                gain: num("gain", 1.0),
+                pan: num("pan", 0.0),
+                tune: num("tune", 0.0),
+                trim_start: num("trim_start", 0.0),
+                trim_end: num("trim_end", 1.0),
+                ..DrumPadParams::default()
+            };
+            if let Some(c) = o.get("choke").and_then(Value::as_u64) {
+                params.choke = c as u8;
+            }
+            if let Some(b) = o.get("obey").and_then(Value::as_bool) {
+                params.obey = b;
+            }
+            out.pads.push((
+                key,
+                std::path::PathBuf::from(file),
+                o.get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                params,
+            ));
+        }
+        out
+    }
+
+    /// Write it, atomically, the way the sidecar is written.
+    ///
+    /// The extension is FORCED: a panel that returned "My Kit" or "My Kit.json"
+    /// still produces a file the open panel's filter will show.
+    pub fn save(&self, path: &std::path::Path) -> Result<std::path::PathBuf, String> {
+        let path = path.with_extension(PRESET_EXT);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let tmp = path.with_extension("tgkit.tmp");
+        std::fs::write(&tmp, self.to_json()).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+        Ok(path)
+    }
+
+    pub fn load(path: &std::path::Path) -> Result<Self, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let mut out = Self::from_json(&text);
+        if out.name.is_empty() {
+            out.name = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod preset_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("tangent-kit-{name}"));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("tmp dir");
+        d
+    }
+
+    /// **A preset carries the layout across projects**, which is the whole
+    /// reason it is not the sidecar: the sidecar's paths are `media/<file>`
+    /// against ONE project folder, so the same file read from anywhere else
+    /// points at samples that are not there.
+    #[test]
+    fn a_kit_saved_in_one_project_names_files_another_can_find() {
+        let dir = tmp("roundtrip");
+        let doc = dir.join("project.tangent");
+        let media = dir.join("media");
+        std::fs::create_dir_all(&media).expect("media");
+        std::fs::write(media.join("kick.wav"), b"riff").expect("sample");
+
+        let mut kit = DrumpadDoc::default();
+        kit.master = 0.75;
+        kit.pads[36] = PadSlot {
+            path: "media/kick.wav".to_owned(),
+            name: "Kick".to_owned(),
+            params: DrumPadParams { gain: 0.5, pan: -0.25, choke: 2, ..Default::default() },
+            extra: Map::new(),
+        };
+
+        let preset = KitPreset::from_kit("My Kit", &kit, &doc);
+        assert_eq!(preset.pads.len(), 1, "only the filled pad is written");
+        let (key, file, name, params) = &preset.pads[0];
+        assert_eq!(*key, 36);
+        assert_eq!(name, "Kick");
+        assert!((params.gain - 0.5).abs() < 1e-6);
+        // **Absolute, and it exists.** A relative path here is the bug this
+        // type was made to avoid.
+        assert!(file.is_absolute(), "the preset kept a relative path: {file:?}");
+        assert!(file.exists(), "the preset points at nothing: {file:?}");
+
+        // Round trip through the file, extension forced.
+        let written = preset.save(&dir.join("My Kit")).expect("save");
+        assert_eq!(written.extension().and_then(|e| e.to_str()), Some(PRESET_EXT));
+        let back = KitPreset::load(&written).expect("load");
+        assert_eq!(back.name, "My Kit");
+        assert!((back.master - 0.75).abs() < 1e-6, "the kit fader");
+        assert_eq!(back.pads.len(), 1);
+        assert_eq!(back.pads[0].0, 36);
+        assert_eq!(back.pads[0].1, *file, "the sample moved");
+        assert_eq!(back.pads[0].3.choke, 2, "the choke group");
+        assert!((back.pads[0].3.pan + 0.25).abs() < 1e-6, "the pan");
+
+        // A name given only by the filename still comes back.
+        let unnamed = KitPreset { name: String::new(), ..back.clone() };
+        let at = unnamed.save(&dir.join("Second Kit")).expect("save");
+        assert_eq!(KitPreset::load(&at).expect("load").name, "Second Kit");
+    }
+
+    /// Rubbish in is an empty preset, never a panic — the sidecar's manners,
+    /// and for its reason: a file somebody hand-edited must not take the app
+    /// down with it.
+    #[test]
+    fn an_unreadable_kit_is_an_empty_one() {
+        for text in ["", "{", "[]", "{\"pads\": 7}", "{\"pads\": [{\"key\": 999}]}"] {
+            let p = KitPreset::from_json(text);
+            assert!(p.pads.is_empty(), "{text:?} produced pads");
+        }
+        // A pad past the keyboard's end is dropped, not clamped onto a real
+        // one — a preset that quietly moved a sample would be worse than one
+        // that lost it.
+        let p = KitPreset::from_json(
+            "{\"pads\": [{\"key\": 500, \"file\": \"/x.wav\"}, {\"key\": 4, \"file\": \"/y.wav\"}]}",
+        );
+        assert_eq!(p.pads.len(), 1);
+        assert_eq!(p.pads[0].0, 4);
     }
 }

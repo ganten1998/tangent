@@ -336,7 +336,9 @@ fn on_card(view: HelpView, a: KeyAction) -> bool {
             HelpView::Piano => true,
             // The supporter card rises over the mixer exactly as it does
             // over the piano; everything else on this card is gestures.
-            HelpView::Mixer => matches!(a, K::ShowSupporterKey),
+            // The mixer keeps the split key and the metronome — see the
+            // arrangement's row below, which now shares the second.
+            HelpView::Mixer => matches!(a, K::ShowSupporterKey | K::ManageTaughtChords),
             // The three the arrangement stole, wearing their meanings HERE.
             HelpView::Arrange => matches!(
                 a,
@@ -383,7 +385,9 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
                     "split the clip at the playhead"
                 }
                 (HelpView::Arrange, KeyAction::ToggleFretboard) => "snap to grid (the magnet)",
-                (HelpView::Arrange, KeyAction::ManageTaughtChords) => "metronome on/off",
+                (HelpView::Arrange | HelpView::Mixer, KeyAction::ManageTaughtChords) => {
+                    "metronome on/off"
+                }
                 (HelpView::MidiEdit, KeyAction::ToggleFretboard) => {
                     "snap to grid (the editor's magnet)"
                 }
@@ -905,7 +909,14 @@ mod tests {
         let mixer = card(HelpView::Mixer);
         assert!(desc(&mixer, "S").contains("supporter"), "S on the mixer is the supporter card");
         assert!(!has(&mixer, "G"), "G's guitar band is hidden under the mixer");
-        assert!(!has(&mixer, "M"), "M's dialog belongs to the piano's card");
+        // **M is the metronome here too**, not the taught-chords dialog. The
+        // mixer is the other page a take is set up from, and reaching for the
+        // click is a thing people do there; teaching a chord is not.
+        assert!(
+            desc(&mixer, "M").contains("metronome"),
+            "M on the mixer should be the metronome, not {:?}",
+            desc(&mixer, "M")
+        );
     }
 
     /// Letters that are ordinary shortcuts must not fire with a modifier held.

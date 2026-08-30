@@ -421,6 +421,14 @@ impl ArrRec {
 /// The standalone app: `IvoryApp`, plus the eframe trait impl it cannot carry.
 pub struct DesktopApp {
     app: IvoryApp,
+    /// **Whether the window is currently covering its whole screen** because
+    /// it is borderless AND maximised. See `crate::macwin::cover_screen`.
+    ///
+    /// A latch, not a per-frame call: `setFrame` fires once on the way in and
+    /// the presentation options once on the way out. Sending either every
+    /// frame fights AppKit's own zoom animation, which is the same lesson the
+    /// aspect snap already learned two hundred lines up.
+    covering_screen: bool,
     /// The hardware MIDI fast lane, cloned out of `DeviceMidi` before the
     /// ports box swallows it. `start_engine` seats each fresh engine's ring
     /// here; the midir callback plays through it. See `midi::MidiFastLane`.
@@ -3474,6 +3482,14 @@ impl DesktopApp {
         }
         if purpose == tangent_ui::ports::FilePurpose::Project {
             self.switch_project(file);
+            return;
+        }
+        if purpose == tangent_ui::ports::FilePurpose::KitPreset {
+            // The app owns this whole move: it reads the preset, copies each
+            // sample into the project through the same `drumpad_load` a drop
+            // uses, and marks the kit dirty so the reload below this frame
+            // decodes and pushes it.
+            self.app.apply_kit_preset(file);
             return;
         }
         if purpose == tangent_ui::ports::FilePurpose::ClickSample {
@@ -6694,6 +6710,46 @@ impl DesktopApp {
         WindowFacts::default()
     }
 
+    /// **Borderless AND maximised means the whole screen**, and anything
+    /// else means an ordinary window.
+    ///
+    /// Maximised means *the work area* on every platform — the screen minus
+    /// what the shell reserves — and that is right for a window with a title
+    /// bar and wrong for one without. Taking the frame off was the request to
+    /// use the display; keeping a strip of dead desktop along two edges is
+    /// the opposite of it.
+    ///
+    /// Fullscreen is excluded deliberately: the OS is already doing this, and
+    /// a second opinion about the frame arriving mid-animation is a fight.
+    ///
+    /// Latched on `covering_screen` so each direction fires exactly once.
+    #[cfg(target_os = "macos")]
+    fn reconcile_screen_cover(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        let (maximised, fullscreen) = ctx.input(|i| {
+            let v = i.viewport();
+            (v.maximized.unwrap_or(false), v.fullscreen.unwrap_or(false))
+        });
+        let want = self.app.borderless() && maximised && !fullscreen;
+        if want == self.covering_screen {
+            return;
+        }
+        if want {
+            // Only latch if the window was actually found and moved, so a
+            // failure retries next frame rather than latching a lie.
+            self.covering_screen = crate::macwin::cover_screen(frame);
+        } else {
+            crate::macwin::uncover_screen();
+            self.covering_screen = false;
+        }
+    }
+
+    /// No-op off macOS for now. Windows and Linux have the same rule and a
+    /// different mechanism — `ViewportCommand::Fullscreen` with the
+    /// decorations already off is the usual answer there — and neither is
+    /// wired up, so nothing pretends to be.
+    #[cfg(not(target_os = "macos"))]
+    fn reconcile_screen_cover(&mut self, _ctx: &egui::Context, _frame: &eframe::Frame) {}
+
     fn drag_pointer(ctx: &egui::Context) -> Option<egui::Pos2> {
         if ctx.input(|i| i.raw.hovered_files.is_empty()) {
             return None;
@@ -6867,6 +6923,7 @@ impl DesktopApp {
             pushed_auto: None,
             midi_lane,
             app,
+            covering_screen: false,
             #[cfg(feature = "recorder")]
             recorder,
             splash: Some(Splash {
@@ -7052,6 +7109,7 @@ impl eframe::App for DesktopApp {
         let facts = Self::window_facts(frame, &self.app);
         self.app.set_host_gesture(facts.gesture);
         self.app.set_os_aspect_lock(facts.os_aspect_lock);
+        self.reconcile_screen_cover(ctx, frame);
         // **The first frame is the SPLASH and nothing else.**
         //
         // The app's first `frame` costs about a second — the font atlas is
