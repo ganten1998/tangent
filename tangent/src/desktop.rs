@@ -429,6 +429,9 @@ pub struct DesktopApp {
     /// frame fights AppKit's own zoom animation, which is the same lesson the
     /// aspect snap already learned two hundred lines up.
     covering_screen: bool,
+    /// The drawable size to restore after a decoration change, and how many
+    /// frames it has been tried for. See `reconcile_decoration_size`.
+    decor_want_content: Option<(f64, f64, u8)>,
     /// The hardware MIDI fast lane, cloned out of `DeviceMidi` before the
     /// ports box swallows it. `start_engine` seats each fresh engine's ring
     /// here; the midir callback plays through it. See `midi::MidiFastLane`.
@@ -6743,6 +6746,38 @@ impl DesktopApp {
         }
     }
 
+    /// **Put the drawable area back after a title bar came or went.**
+    ///
+    /// The app says what it wants; only the host can reach a window. The
+    /// request arrives on the frame after the decoration change and is
+    /// applied for as long as it takes to stick — AppKit does not necessarily
+    /// have the new style mask on the very next frame, and asking early is a
+    /// no-op that would otherwise be the only attempt.
+    #[cfg(target_os = "macos")]
+    fn reconcile_decoration_size(&mut self, frame: &eframe::Frame) {
+        if let Some(want) = self.app.take_decor_keep_content() {
+            self.decor_want_content = Some((f64::from(want.x), f64::from(want.y), 0u8));
+        }
+        let Some((w, h, tries)) = self.decor_want_content else {
+            return;
+        };
+        // Given up after a handful of frames rather than argued about
+        // forever: a manager that keeps overruling this owns the geometry,
+        // and the app's job is to stop asking.
+        if tries >= 12 || crate::macwin::keep_content_size(frame, w, h) {
+            self.decor_want_content = None;
+        } else {
+            self.decor_want_content = Some((w, h, tries + 1));
+        }
+    }
+
+    /// Nothing to do off macOS yet: the same fault exists under i3 and under
+    /// Windows' snap, and neither mechanism is written.
+    #[cfg(not(target_os = "macos"))]
+    fn reconcile_decoration_size(&mut self, _frame: &eframe::Frame) {
+        let _ = self.app.take_decor_keep_content();
+    }
+
     /// No-op off macOS for now. Windows and Linux have the same rule and a
     /// different mechanism — `ViewportCommand::Fullscreen` with the
     /// decorations already off is the usual answer there — and neither is
@@ -6966,6 +7001,7 @@ impl DesktopApp {
             midi_lane,
             app,
             covering_screen: false,
+            decor_want_content: None,
             #[cfg(feature = "recorder")]
             recorder,
             splash: Some(Splash {
@@ -7152,6 +7188,7 @@ impl eframe::App for DesktopApp {
         self.app.set_host_gesture(facts.gesture);
         self.app.set_os_aspect_lock(facts.os_aspect_lock);
         self.reconcile_screen_cover(ctx, frame);
+        self.reconcile_decoration_size(frame);
         // **The first frame is the SPLASH and nothing else.**
         //
         // The app's first `frame` costs about a second — the font atlas is

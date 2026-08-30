@@ -500,3 +500,59 @@ pub fn uncover_screen() {
         }
     }
 }
+
+/// **The content rectangle, in points** — what the app actually gets to draw
+/// in, with any title bar already subtracted.
+pub fn content_size(frame: &eframe::Frame) -> Option<(f64, f64)> {
+    let window = resolve(frame)?;
+    let content = window.contentRectForFrameRect(window.frame());
+    Some((content.size.width, content.size.height))
+}
+
+/// **Keep the content the size it was, across a decoration change.**
+///
+/// Adding or removing a title bar changes what a window CONTAINS without
+/// changing what it occupies: AppKit keeps the frame and moves the boundary,
+/// so the drawable area grows or shrinks by about 28 points. On a window the
+/// app is free to resize that is invisible, because the aspect snap puts it
+/// straight back. Under a tiling manager — AeroSpace here — the app is not
+/// free to resize anything, the snap is latched off on purpose, and the
+/// mismatch simply stays: a strip of window the layout does not cover on the
+/// way out of borderless, and a title bar sitting over the top of the picture
+/// on the way back in. The owner: "toggling on and off borderless adds black
+/// strip and when border is readded, it's drawn over."
+///
+/// Setting the FRAME from the content rectangle is the fix, and it is the
+/// opposite of what the app was doing: it asks for the frame that gives back
+/// the content size that was already there, so the drawable area is invariant
+/// and only the window's outside edge moves. A tiling manager may then re-tile
+/// it, which is its right and its business — the app is no longer arguing
+/// about the size, only about how much of it is drawable.
+pub fn keep_content_size(frame: &eframe::Frame, w: f64, h: f64) -> bool {
+    let Some(window) = resolve(frame) else {
+        return false;
+    };
+    if !(w.is_finite() && h.is_finite() && w > 1.0 && h > 1.0) {
+        return false;
+    }
+    let now = window.frame();
+    let content = window.contentRectForFrameRect(now);
+    // Already right — do not touch it. A `setFrame` during a tiler's own
+    // placement is the fight this whole module exists to avoid.
+    if (content.size.width - w).abs() < 0.5 && (content.size.height - h).abs() < 0.5 {
+        return false;
+    }
+    // The window's TOP edge stays put, which is what a title bar appearing or
+    // disappearing looks like to a person: the picture does not jump.
+    let top = now.origin.y + now.size.height;
+    let wanted_content = objc2_foundation::NSRect::new(
+        objc2_foundation::NSPoint::new(content.origin.x, content.origin.y),
+        objc2_foundation::NSSize::new(w, h),
+    );
+    let mut want = window.frameRectForContentRect(wanted_content);
+    want.origin.y = top - want.size.height;
+    // SAFETY: main thread, as everything else in this module; `want` is a
+    // finite rect derived from the window's own geometry.
+    unsafe { window.setFrame_display(want, true) };
+    true
+}
