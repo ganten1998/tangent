@@ -2584,6 +2584,24 @@ impl DesktopApp {
                     }
                 }
             }
+            // **Carry the plugins across instead of rebuilding them.**
+            //
+            // A track that moves takes its plugins with it, and the instance
+            // the new seat wants is the one the old seat has. Moving it is
+            // two ring pushes; rebuilding it is a bundle scan, an
+            // instantiation and a state restore, one bay per frame — which
+            // is the spinning wheel. Whatever could not be carried comes
+            // back here and is rebuilt the slow way.
+            let stranded: Vec<usize> = self
+                .recorder
+                .engine
+                .as_mut()
+                .map(|e| e.permute_channel_inserts(&order))
+                .unwrap_or_default();
+            // The host's own copy of what sits in each seat travels too, or
+            // the reconcile below compares the new seat against the old
+            // seat's plugin and reloads everything it just carried.
+            permute_loaded_rows(&mut self.recorder.inserts_loaded, &order);
             self.save_plugin_states_as_loaded_for(Some(&moved));
             permute_insert_states_in(
                 insert_state_path(0, 0)
@@ -2603,7 +2621,17 @@ impl DesktopApp {
             // restoring its state: the owner's "when a reorder occurs of any
             // kind -- massive delay". A row that did not move has the same
             // plugin with the same state and nothing to do.
-            self.force_insert_reload_for(&order);
+            // **Only what could not be carried.** A seat whose plugin
+            // moved is already correct: same instance, same state, new
+            // index. Marking it would undo the whole point.
+            let bays = tangent_ui::recorder::INSERTS;
+            for seat in stranded {
+                for b in 0..bays {
+                    if let Some(slot) = self.recorder.inserts_loaded.get_mut(seat * bays + b) {
+                        *slot = Some("\u{1f}reload".to_owned());
+                    }
+                }
+            }
         }
         // **A pasted track's plugin STATE — BEFORE the bay reconcile below.**
         //
@@ -6454,6 +6482,26 @@ fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result
 /// shifts every row below it, so "the rows that moved" is very nearly the
 /// whole desk, and the desk is mostly empty. `loaded` is what each seat has
 /// in it now; a pair of `None`s is a pair of nothing.
+/// The host's per-seat record of what is loaded, permuted with the channels.
+///
+/// Flat `strip * INSERTS + bay`, and only the channel rows move: the buses,
+/// the master and the pads keep their seats.
+fn permute_loaded_rows(rows: &mut [Option<String>], order: &[usize]) {
+    let bays = tangent_ui::recorder::INSERTS;
+    let n = order.len();
+    let mut held: Vec<Option<String>> = Vec::with_capacity(n * bays);
+    for new in 0..n {
+        for b in 0..bays {
+            held.push(rows.get(order[new] * bays + b).and_then(Clone::clone));
+        }
+    }
+    for (i, v) in held.into_iter().enumerate() {
+        if let Some(slot) = rows.get_mut(i) {
+            *slot = v;
+        }
+    }
+}
+
 fn reload_slots_for_loaded(order: &[usize], bays: usize, loaded: &[Option<String>]) -> Vec<usize> {
     let mut out = Vec::new();
     let held = |strip: usize, bay: usize| -> bool {
