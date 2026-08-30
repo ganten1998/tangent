@@ -110,6 +110,22 @@ impl Routes {
             .collect()
     }
 
+    /// **Drop every route pointing INTO one channel.**
+    ///
+    /// Called when a track becomes a folder, because a group cannot be a send
+    /// destination: the fold that would carry the arriving audio has already
+    /// run by the time a send is gathered, so the audio is processed and then
+    /// goes nowhere. Rather than leave a route that silently drops what it
+    /// carries, the route goes — and folders are not offered in the picker in
+    /// the first place. See `IvoryApp::routing_dialog`.
+    ///
+    /// Returns how many were dropped, so a caller can tell somebody.
+    pub fn drop_into(&mut self, channel: usize) -> usize {
+        let before = self.0.len();
+        self.0.retain(|r| r.target != Target::Channel(channel));
+        before - self.0.len()
+    }
+
     pub fn remove(&mut self, index: usize) {
         if index < self.0.len() {
             self.0.remove(index);
