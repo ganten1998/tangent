@@ -46,6 +46,12 @@ mod stretch;
 /// reason `record` is (docs/RECORDER-PLAN.md §12a).
 #[cfg(feature = "recorder")]
 mod instrument;
+/// FreeBSD's MIDI input, because midir has no backend there at all. Shaped as
+/// a drop-in for the handful of midir calls `midi` makes, so the difference is
+/// one `use` and not a second code path. A target gate, not a feature gate —
+/// same reasoning as `macwin` above.
+#[cfg(target_os = "freebsd")]
+mod umidi;
 mod midi;
 /// The recording session. Absent from a Minimal build, where `tangent-record` is
 /// not linked at all — the exclusion the compiler enforces rather than a flag

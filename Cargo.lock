@@ -2125,10 +2125,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77c12e74a8604bc07f9a3fcf3d5889a81bc96ca6e07d6a114d63fc0371f3e5a4"
 dependencies = [
  "alsa 0.10.0",
- "bitflags 2.13.1",
  "cc",
  "coremidi",
- "jack-sys",
  "jni 0.21.1",
  "jni-min-helper",
  "js-sys",
