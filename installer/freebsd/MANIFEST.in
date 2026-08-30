@@ -159,9 +159,10 @@ PLUGINS
 
       pkg install dragonfly-reverb calf lsp-plugins x42-plugins
 
-  Plugins with their own window open it inside Tangent; the rest get a
-  generated panel with their real controls and units. Both are in the bay's
-  menu on any channel.
+  A plugin with its own window opens it inside Tangent. One without a window
+  Tangent can embed is still fully usable: every control it publishes appears
+  in the automation lanes by name and in its own units -- "Decay, seconds",
+  not "parameter 7". Bays are on every channel.
 
 A MIDI KEYBOARD
   Plug it in and Tangent finds it — MIDI is read straight from /dev/umidi, so

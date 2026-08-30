@@ -2349,7 +2349,7 @@ impl Backend {
                 // parameter is the honest approximation: sample-accurate
                 // automation of a control port is not a thing the format
                 // offers, and pretending otherwise would be a lie in the
-                // parameter panel.
+                // automation lanes.
                 for p in params {
                     let _ = inst.set_param(p.id as usize, p.value as f32);
                 }
@@ -2703,7 +2703,7 @@ fn normalise(value: f32, min: f32, max: f32) -> f64 {
 /// is not a cache of the plugin's truth; it is the truth, and the plugin is
 /// the copy.
 ///
-/// This is what makes the parameter panel, the save file and a reopened plugin
+/// This is what makes the automation lanes, the save file and a reopened plugin
 /// window all agree.
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 struct Lv2Bay {
@@ -8037,7 +8037,7 @@ impl Engine {
             // opens knowing nothing; without this every control would show its
             // default and the first touch of any of them would snap the sound
             // back to that default. The values come from the same handle the
-            // parameter panel reads, so the two agree by construction.
+            // automation lanes read, so the two agree by construction.
             let mut editor = editor;
             if let Some(bay) = self.insert_lv2.get(strip).and_then(|r| r.get(slot)).and_then(Option::as_ref) {
                 for p in &bay.params {
@@ -8257,7 +8257,7 @@ impl Engine {
                 }
             }
             // **The bay's record, from the same list that goes to the audio
-            // thread.** One source, so the parameter panel, the next opening of
+            // thread.** One source, so the automation lanes, the next opening of
             // the window and the saved session cannot disagree with the sound.
             for u in &pending {
                 let Some(bay) = self
@@ -8417,12 +8417,12 @@ impl Engine {
     /// it obeys the same rule: never from the audio thread, and only while
     /// the instance is alive.
     pub fn insert_parameters(&self, strip: usize, slot: usize) -> Vec<tangent_host::ParamInfo> {
-        // **The LV2 panel, and it is the better one.** A VST3 parameter is a
+        // **The LV2 list, and it is the better one.** A VST3 parameter is a
         // normalised 0..1 that the host must ask the plugin to render into
         // text; an LV2 control port declares its range in real engineering
         // units, so "800 Hz" is arithmetic here rather than a round trip. The
-        // panel wants a normalised default, so that is what is computed —
-        // the range travels with the automation curve, not the panel.
+        // lane wants a normalised default, so that is what is computed — the
+        // range travels with the automation curve, not with this.
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         if let Some(bay) = self
             .insert_lv2
@@ -11565,6 +11565,24 @@ mod tests {
         let mut r = test_renderer(Arc::clone(&shared), tap_tx, dev_ch);
         r.midi = midi_rx;
         (r, midi_tx, shared)
+    }
+
+    /// A control's resting place as a fraction of its travel — including the
+    /// degenerate range a few real plugins declare for a constant, where the
+    /// obvious arithmetic divides by zero and hands the panel a NaN to draw.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn a_control_normalises_within_its_range_and_survives_a_flat_one() {
+        assert!((normalise(0.0, 0.0, 1.0) - 0.0).abs() < 1e-9);
+        assert!((normalise(1.0, 0.0, 1.0) - 1.0).abs() < 1e-9);
+        assert!((normalise(-6.0, -60.0, 12.0) - 0.75).abs() < 1e-9);
+        // Out of range is clamped rather than allowed off the end of the knob.
+        assert!((normalise(99.0, 0.0, 1.0) - 1.0).abs() < 1e-9);
+        assert!((normalise(-99.0, 0.0, 1.0) - 0.0).abs() < 1e-9);
+        // The flat range: finite, in range, and not a NaN.
+        let flat = normalise(5.0, 5.0, 5.0);
+        assert!(flat.is_finite(), "a constant port must not draw as NaN");
+        assert!((0.0..=1.0).contains(&flat));
     }
 
     /// A knob turned in a plugin's own window reaches the audio thread — and

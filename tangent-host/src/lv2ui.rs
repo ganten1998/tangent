@@ -161,7 +161,8 @@ impl Ui {
     ///
     /// `parent` is an X11 window id. Returns `Ok(None)` when the plugin simply
     /// has no X11 UI, which is not an error — plenty of good plugins have no
-    /// editor at all, and the caller shows its generic parameter panel instead.
+    /// editor at all, and the caller falls back to what a plugin without a window
+    /// still offers: its controls, by name, in the automation lanes.
     ///
     /// `sample_rate` is not decoration. A UI that draws a frequency response,
     /// a delay time in milliseconds or a decay curve computes it from the rate,
@@ -184,8 +185,8 @@ impl Ui {
     /// GTK or Qt widget, because those are the same fact from where the app is
     /// standing: no window this host can put on the screen. That is not a
     /// defeat to hide — a plugin refused here still has every one of its
-    /// control ports in the generic parameter panel, with real units, which is
-    /// more than a host that popped up an empty frame would give.
+    /// control ports published to the automation lanes, by name and in real
+    /// units, which is more than a host that popped up an empty frame gives.
     pub fn has_ui(plugin_uri: &str) -> bool {
         crate::lv2::has_x11_ui(plugin_uri)
     }
