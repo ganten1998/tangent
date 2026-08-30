@@ -2731,6 +2731,15 @@ impl IvoryApp {
         if let Some(slot) = self.settings.strip_is_folder.get_mut(ch) {
             *slot = on;
         }
+        // **A group is not a send destination**, and this is the only place
+        // that has to enforce it, because it is the only place a channel
+        // becomes one. The picker stops offering a folder — see
+        // `routing_dialog` — but a track can be routed to FIRST and made a
+        // folder afterwards, and that route would then carry audio that is
+        // processed and dropped. See `Routes::drop_into`.
+        if on {
+            let _ = self.settings.routes.drop_into(ch);
+        }
     }
 
     /// **Snap the dragged block into `folder`, at the END of its children.**
@@ -2756,7 +2765,7 @@ impl IvoryApp {
         // A folder cannot be dragged into a folder, and cannot be dragged
         // into ITSELF. Dropping only folders on a folder is a no-op rather
         // than a structure nothing can draw.
-        group.retain(|n| *n != folder && !self.is_folder(*n));
+        group.retain(|n| *n != folder);
         if group.is_empty() {
             return;
         }
@@ -2808,9 +2817,9 @@ impl IvoryApp {
             // Out of whatever folder it was in — one level.
             self.set_in_folder(ch, false);
         }
-        if let Some(slot) = self.settings.strip_is_folder.get_mut(ch) {
-            *slot = !was;
-        }
+        // Through the setter, not the field: becoming a folder has a
+        // consequence for routing and there is one place that knows it.
+        self.set_is_folder(ch, !was);
         self.save_settings();
         self.undo_commit();
     }
@@ -16869,8 +16878,15 @@ impl IvoryApp {
             .collect();
         // Used channels only, and never this one: a channel cannot send to
         // itself, and an empty slot is a route to silence.
+        //
+        // **And never a FOLDER.** A group's fold runs before sends are
+        // gathered, so audio sent into one is processed by that group's rack
+        // and fader and then reaches nothing — it was offered, accepted, and
+        // silently inaudible. Not offering it is the owner's call and the
+        // honest one; `set_is_folder` drops any route that already points at
+        // a track being turned into a group.
         let channels = (0..crate::recorder::CHANNELS)
-            .filter(|n| *n != channel && self.channel_used(*n))
+            .filter(|n| *n != channel && self.channel_used(*n) && !self.is_folder(*n))
             .map(|n| {
                 let name = self
                     .settings
@@ -34835,6 +34851,63 @@ mod folder_tests {
     /// live in the master's automation, and "the master needs all automation
     /// parameters available for this to work" — this is that lane, built the
     /// same way a track's is so the tempo has somewhere to arrive.
+    /// **A group is not a send destination**, at both ends.
+    ///
+    /// The fold runs before sends are gathered, so audio routed INTO a folder
+    /// is processed by that group's rack and fader and then reaches nothing:
+    /// offered, accepted, and silently inaudible. The owner's answer was to
+    /// stop offering them — which handles the picker, but not a track that is
+    /// routed to first and made a folder afterwards, and that is the case
+    /// that actually happens, because folders are made out of tracks.
+    #[test]
+    fn a_folder_is_never_offered_as_a_send_and_never_keeps_one() {
+        use crate::routing::{Route, Target};
+        let mut a = app();
+        for n in 0..4 {
+            a.add_bare_track(n);
+        }
+
+        // The picker offers the other used channels...
+        let offered = |a: &IvoryApp| -> Vec<usize> {
+            match a.routing_dialog(0, None) {
+                dialogs::Dialog::Routing { channels, .. } => {
+                    channels.into_iter().map(|(n, _)| n).collect()
+                }
+                _ => panic!("not the routing dialog"),
+            }
+        };
+        assert!(offered(&a).contains(&2), "channel 3 was not offered at all");
+
+        // ...and stops offering one the moment it becomes a group.
+        a.set_is_folder(2, true);
+        assert!(
+            !offered(&a).contains(&2),
+            "a folder was offered as a send destination"
+        );
+        // Never itself, either — that rule is older and still holds.
+        assert!(!offered(&a).contains(&0), "a channel was offered itself");
+
+        // **And a route made BEFORE the folder existed does not survive it.**
+        let mut b = app();
+        for n in 0..4 {
+            b.add_bare_track(n);
+        }
+        assert!(b.settings.routes.add(Route::new(0, Target::Channel(3))));
+        assert!(b.settings.routes.add(Route::new(1, Target::Channel(3))));
+        // One that has nothing to do with channel 4, to prove the sweep is
+        // not simply emptying the table.
+        assert!(b.settings.routes.add(Route::new(0, Target::Channel(2))));
+        assert_eq!(b.settings.routes.0.len(), 3);
+
+        b.set_is_folder(3, true);
+        let left: Vec<Target> = b.settings.routes.0.iter().map(|r| r.target).collect();
+        assert_eq!(
+            left,
+            vec![Target::Channel(2)],
+            "the routes into the new folder were kept, and would drop their audio"
+        );
+    }
+
     /// **The master fader is never dead.**
     ///
     /// Taken from the owner's own session, which came back from a morning's

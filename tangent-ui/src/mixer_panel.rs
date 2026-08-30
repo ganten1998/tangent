@@ -323,7 +323,7 @@ impl Hit {
 /// [`PALETTE_COLUMNS`] is what makes the grid read as hues rather than as
 /// twenty-seven swatches: reading down a column is one tone, across a row is
 /// one colour.
-pub const STRIP_COLORS: [(u8, u8, u8); 300] = [
+pub const STRIP_COLORS: [(u8, u8, u8); 316] = [
     (0x00, 0x00, 0x00), // the desk's own wood — replaced at draw time
     (0x36, 0x33, 0x30), // slate
     (0x56, 0x51, 0x4D), // stone
@@ -445,6 +445,40 @@ pub const STRIP_COLORS: [(u8, u8, u8); 300] = [
     (0x74, 0x4a, 0x89), (0x57, 0x1f, 0x57), (0x50, 0x61, 0x1b), (0x38, 0x2d, 0x6b),
     (0x92, 0x3d, 0x67), (0x16, 0x3b, 0x4d), (0x6c, 0x59, 0x1e), (0x11, 0x3e, 0x2f),
     (0x3d, 0x33, 0x42),
+    // ── each palette's own MASTER, appended 2026-08-30 ────────────────────
+    //
+    // The master used to be one crimson (index 27) shared by all sixteen, on
+    // the argument that it is the strip you go looking for and should not
+    // move. The owner asked for the opposite — "a true color picked per
+    // theme freshly ... for the master lane strip" — so each palette names
+    // its own, and index 27 stays exactly what it was for every desk that
+    // already points at it.
+    //
+    // Generated against three floors rather than eyeballed: the ivory ink
+    // wins on each at 4.5:1 (the rule every colour in this table follows),
+    // each is at least 22 ΔE from its OWN palette's sixteen channels and its
+    // click — a master that reads as track seventeen is no master — and they
+    // are spread from one another, because sixteen palettes derived from
+    // sixteen themes otherwise converge on the same brick red. That last one
+    // is why several of these are not the theme's accent: a palette already
+    // CONTAINS its theme's hues, so the accent collides with the tracks by
+    // construction and the honest answer is the nearest colour that does not.
+    (0x0a, 0x5f, 0xc2), // 300  Default
+    (0xbd, 0x0f, 0x58), // 301  Valentine
+    (0x81, 0x5a, 0x0e), // 302  Hydra
+    (0x91, 0x4c, 0x08), // 303  Navi
+    (0xc2, 0x0a, 0x0a), // 304  Mono
+    (0x34, 0x6e, 0x0c), // 305  Studio
+    (0xc2, 0x0a, 0x3a), // 306  Aurora
+    (0xa5, 0x39, 0x09), // 307  Sandstone
+    (0x24, 0x6b, 0x34), // 308  Centennial
+    (0x9b, 0x34, 0x27), // 309  Blueprint
+    (0xa5, 0x16, 0x09), // 310  Porcelain
+    (0xb8, 0x2d, 0x0a), // 311  Moss
+    (0x24, 0x60, 0x48), // 312  Rhodes
+    (0xaa, 0x2f, 0x18), // 313  Copper
+    (0xa0, 0x22, 0x3d), // 314  Dusk
+    (0x09, 0x71, 0x2c), // 315  Iris
 ];
 
 /// How much of [`STRIP_COLORS`] a person can point at.
@@ -467,6 +501,10 @@ pub struct Palette {
     /// Where this palette's run starts in [`STRIP_COLORS`]: sixteen channel
     /// colours, then its click.
     pub base: usize,
+    /// This palette's own MASTER, appended at the end of the table rather
+    /// than inside the run — the runs are contiguous and every index in them
+    /// is already written into somebody's saved desk. See [`Palette::master`].
+    pub master_at: usize,
 }
 
 impl Palette {
@@ -484,12 +522,20 @@ impl Palette {
         self.base + crate::recorder::CHANNELS
     }
 
-    /// The master's colour — the SAME crimson in every palette.
+    /// **The master's colour, this palette's own.**
     ///
-    /// It is the one strip you go looking for, and a master that changed
-    /// colour with the theme would be a master you had to find twice.
+    /// It was one crimson ([`MASTER_COLOR`]) shared by all sixteen, on the
+    /// argument that the master is the strip you go looking for and a master
+    /// that moved with the theme is one you have to find twice. The owner
+    /// weighed that and asked for the other thing — "a true color picked per
+    /// theme freshly ... for the master lane strip" — so this is per palette
+    /// now, and the trade is deliberate rather than overlooked.
+    ///
+    /// `MASTER_COLOR` itself is untouched and still means what it meant: it
+    /// is a hand-pickable swatch and the migration target for desks written
+    /// before the palettes existed.
     pub fn master(&self) -> usize {
-        MASTER_COLOR
+        self.master_at
     }
 }
 
@@ -504,22 +550,22 @@ impl Palette {
 /// The ORDER is the index `palette_choice` saves, so it matches `factory()`
 /// and must not be shuffled.
 pub const PALETTES: [Palette; 16] = [
-    Palette { name: "Default", base: 28 },
-    Palette { name: "Valentine", base: 45 },
-    Palette { name: "Hydra", base: 62 },
-    Palette { name: "Navi", base: 79 },
-    Palette { name: "Mono", base: 96 },
-    Palette { name: "Studio", base: 113 },
-    Palette { name: "Aurora", base: 130 },
-    Palette { name: "Sandstone", base: 147 },
-    Palette { name: "Centennial", base: 164 },
-    Palette { name: "Blueprint", base: 181 },
-    Palette { name: "Porcelain", base: 198 },
-    Palette { name: "Moss", base: 215 },
-    Palette { name: "Rhodes", base: 232 },
-    Palette { name: "Copper", base: 249 },
-    Palette { name: "Dusk", base: 266 },
-    Palette { name: "Iris", base: 283 },
+    Palette { name: "Default", base: 28, master_at: 300 },
+    Palette { name: "Valentine", base: 45, master_at: 301 },
+    Palette { name: "Hydra", base: 62, master_at: 302 },
+    Palette { name: "Navi", base: 79, master_at: 303 },
+    Palette { name: "Mono", base: 96, master_at: 304 },
+    Palette { name: "Studio", base: 113, master_at: 305 },
+    Palette { name: "Aurora", base: 130, master_at: 306 },
+    Palette { name: "Sandstone", base: 147, master_at: 307 },
+    Palette { name: "Centennial", base: 164, master_at: 308 },
+    Palette { name: "Blueprint", base: 181, master_at: 309 },
+    Palette { name: "Porcelain", base: 198, master_at: 310 },
+    Palette { name: "Moss", base: 215, master_at: 311 },
+    Palette { name: "Rhodes", base: 232, master_at: 312 },
+    Palette { name: "Copper", base: 249, master_at: 313 },
+    Palette { name: "Dusk", base: 266, master_at: 314 },
+    Palette { name: "Iris", base: 283, master_at: 315 },
 ];
 
 /// The drum bus's colour everywhere: dark violet, no palette uses it, so
@@ -3463,6 +3509,55 @@ mod tests {
             }
             let split = delta_e(rgb(pal.click()), rgb(pal.master()));
             assert!(split >= 20.0, "{}: click and master are {split:.1} apart", pal.name);
+        }
+    }
+
+    /// **Every palette's master is its OWN**, which is the whole of the
+    /// change — they used to share one crimson.
+    ///
+    /// Three floors, because dropping any one of them puts the old problem
+    /// back in a new costume: the ivory ink has to win on each (the rule
+    /// every colour in this table follows), each has to stand off its own
+    /// palette's tracks (a master that reads as track seventeen is no
+    /// master — the test above), and they have to stand off EACH OTHER.
+    ///
+    /// That last one is the one worth having. Sixteen palettes derived from
+    /// sixteen themes converge: the theme's accent is already IN its
+    /// palette, so "use the accent" collides with the tracks, and what is
+    /// left over is the same brick red every time. Without this floor the
+    /// sixteen masters came out as six reds and looked exactly like the one
+    /// shared crimson they replaced.
+    #[test]
+    fn each_palette_brings_its_own_master() {
+        const INK: Color32 = crate::recorder_panel::INK_LIGHT;
+        let mut seen: Vec<(&str, usize)> = Vec::new();
+        for pal in &PALETTES {
+            let slot = pal.master();
+            assert!(slot < STRIP_COLORS.len(), "{} runs off the table", pal.name);
+            assert!(
+                slot >= MANUAL_COLORS,
+                "{}'s master is inside the hand-picked swatches",
+                pal.name
+            );
+            // Nobody else's.
+            if let Some((other, _)) = seen.iter().find(|(_, s)| *s == slot) {
+                panic!("{} and {other} share a master slot", pal.name);
+            }
+            // The ink lands on it.
+            let ratio = crate::recorder_panel::contrast_ratio(INK, rgb(slot));
+            assert!(
+                ratio >= 4.5,
+                "{}'s master reads at {ratio:.2}:1 under the ink",
+                pal.name
+            );
+            seen.push((pal.name, slot));
+        }
+        // And they are sixteen colours rather than one repeated.
+        for (i, (an, a)) in seen.iter().enumerate() {
+            for (bn, b) in seen.iter().skip(i + 1) {
+                let d = delta_e(rgb(*a), rgb(*b));
+                assert!(d >= 7.0, "{an} and {bn} have the same master: {d:.1} apart");
+            }
         }
     }
 
