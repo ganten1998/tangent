@@ -2532,16 +2532,8 @@ impl DesktopApp {
                 );
             }
             self.recorder.take_note = Some(note);
-            self.app.set_plugin_list(
-                report
-                    .found
-                    .into_iter()
-                    .map(|p| {
-                        let v = tangent_host::vendor_of(&p);
-                        (p, v)
-                    })
-                    .collect(),
-            );
+            self.app
+                .set_plugin_list(crate::plugin_catalog_from(report.found));
         }
         // **The user's effect, across the effects bus.**
         //
@@ -6865,13 +6857,7 @@ impl DesktopApp {
             // when the user picks it.
             let extra = app.plugin_folders();
             app.set_plugin_list(
-                tangent_host::discover_in(&extra)
-                    .into_iter()
-                    .map(|p| {
-                        let v = tangent_host::vendor_of(&p);
-                        (p, v)
-                    })
-                    .collect(),
+                crate::plugin_catalog(&extra),
             );
             Recorder {
                 transport: crate::transport::Transport::new(),

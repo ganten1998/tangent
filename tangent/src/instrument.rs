@@ -2186,8 +2186,154 @@ impl Shared {
 /// **Field order is load-bearing.** Rust drops fields in declaration order, so
 /// `inst` is declared before `module`: an `Instance` released after the factory
 /// that made it is a call into a `ComPtr` whose owner has gone.
+/// What a bay is actually hosting, since it is no longer always a VST3.
+///
+/// **An enum rather than a trait object, because of where this is used.** The
+/// audio callback reaches exactly two methods on it, both below; a `dyn` would
+/// buy dispatch flexibility nothing here wants and cost an indirection on the
+/// hottest path in the program. It would also make the `Send` argument for
+/// [`PluginBox`] harder to state, because it would rest on whatever implemented
+/// the trait rather than on the two things that actually can.
+///
+/// The VST3 arm keeps `module` beside its instance and AFTER it, because
+/// dropping the module unmaps the library and every `ComPtr` into it becomes a
+/// dangling function table — enum variants drop their fields in declaration
+/// order, same as structs, so the ordering rule survives the move in here.
+///
+/// LV2 needs no such companion: lilv owns the library's lifetime, and
+/// `livi::Instance` is `Send + Sync` on its own account rather than by an
+/// argument this file has to make.
+/// Everything a bay needs before the shared hand-off, whichever format the
+/// plugin is.
+///
+/// **Extracted so the two formats share the tail rather than copying it.**
+/// What follows the preparation — closing the old editor, clearing the three
+/// handle ledgers, the hand-off itself and its refusal path — is delicate,
+/// ordering-sensitive and identical for both. Duplicating it for LV2 would have
+/// been the smaller diff and the larger mistake: two copies of a lifetime rule
+/// diverge, and the one that diverges is the one nobody is testing.
+struct Prepared {
+    backend: Backend,
+    voice: bool,
+    channels: usize,
+    loaded: Loaded,
+    editor_handle: Option<tangent_host::editor::EditorHandle>,
+    state_handle: Option<tangent_host::StateHandle>,
+    latency_handle: Option<tangent_host::instance::LatencyHandle>,
+    latency_now: u32,
+    state_error: Option<String>,
+    /// What to call the plugin in an error message.
+    display_name: String,
+}
+
+enum Backend {
+    Vst3 {
+        inst: Instance,
+        /// Held, never read. See the note above about drop order.
+        #[allow(dead_code, reason = "kept alive for the instance's sake, not read")]
+        module: std::sync::Arc<Module>,
+    },
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    Lv2(tangent_host::lv2::Instance),
+}
+
+impl Backend {
+    /// Render a voice: notes in, the plugin's own buffers out.
+    fn process_voice(
+        &mut self,
+        notes: &[tangent_host::Note],
+        controls: &[tangent_host::Control],
+        frames: usize,
+        bufs: &mut [Vec<f32>],
+    ) -> Result<(), String> {
+        match self {
+            Backend::Vst3 { inst, .. } => inst
+                .process_with_controls(notes, controls, frames, bufs)
+                .map(|_| ()),
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            Backend::Lv2(inst) => {
+                // LV2 takes its notes as an atom sequence built before the run
+                // rather than as an argument to it. Cleared first, or last
+                // block's notes play again — which is exactly what a stuck note
+                // sounds like.
+                inst.clear_midi();
+                // **Back to wire MIDI, which is what LV2 speaks.** These
+                // structs are VST3's shape: a note's velocity is a float
+                // because VST3 made it one, and a pitch bend arrives as a
+                // "controller" because VST3 invented two synthetic controller
+                // numbers for the two channel messages that are not CCs.
+                // Undoing both is the whole of the translation.
+                //
+                // Notes carry no channel here — the display path merges them
+                // and the recorder keeps its own copy — so they go out on
+                // channel 0. Controls do carry one, and it is not decoration:
+                // some instruments publish a different parameter per channel.
+                for n in notes {
+                    let status = if n.on { 0x90 } else { 0x80 };
+                    let pitch = n.pitch.clamp(0, 127) as u8;
+                    let vel = (n.velocity * 127.0).round().clamp(0.0, 127.0) as u8;
+                    let _ = inst.push_midi(n.offset.max(0) as i64, &[status, pitch, vel]);
+                }
+                for c in controls {
+                    let ch = (c.channel.clamp(0, 15)) as u8;
+                    let at = c.offset.max(0) as i64;
+                    let _ = match c.controller {
+                        tangent_host::Control::PITCH_BEND => {
+                            // 0..=16383 back into the two seven-bit halves the
+                            // wire carries, LSB first.
+                            let v = c.value.min(16383);
+                            inst.push_midi(at, &[0xE0 | ch, (v & 0x7F) as u8, (v >> 7) as u8])
+                        }
+                        tangent_host::Control::AFTERTOUCH => {
+                            inst.push_midi(at, &[0xD0 | ch, c.value.min(127) as u8])
+                        }
+                        cc if (0..=127).contains(&cc) => inst.push_midi(
+                            at,
+                            &[0xB0 | ch, cc as u8, c.value.min(127) as u8],
+                        ),
+                        // Any other synthetic controller VST3 grows is not a
+                        // wire message and has nowhere to go. Dropped rather
+                        // than guessed at.
+                        _ => Ok(()),
+                    };
+                }
+                // A voice reads nothing; `bufs` is both scratch and output.
+                inst.process_planar(frames, &[], bufs)
+            }
+        }
+    }
+
+    /// Render an effect: the channel in, the channel out.
+    fn process_effect(
+        &mut self,
+        planar: &mut [Vec<f32>],
+        params: &[tangent_host::ParamPoint],
+        frames: usize,
+        out: &mut [Vec<f32>],
+    ) -> Result<(), String> {
+        match self {
+            Backend::Vst3 { inst, .. } => inst
+                .process_effect_automated(planar, params, frames, out)
+                .map(|_| ()),
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            Backend::Lv2(inst) => {
+                // LV2 automation is a control port written before the block,
+                // not a timed point inside it. Applying the LAST value for each
+                // parameter is the honest approximation: sample-accurate
+                // automation of a control port is not a thing the format
+                // offers, and pretending otherwise would be a lie in the
+                // parameter panel.
+                for p in params {
+                    let _ = inst.set_param(p.id as usize, p.value as f32);
+                }
+                inst.process_planar(frames, planar, out)
+            }
+        }
+    }
+}
+
 struct Hosted {
-    inst: Instance,
+    backend: Backend,
     /// **Whether this plugin GENERATES rather than transforms.**
     ///
     /// Decided once, at load time, from the class's own `subCategories` — and
@@ -2198,16 +2344,6 @@ struct Hosted {
     /// the difference between an instrument and an insert, and it travels
     /// with the instance it describes.
     voice: bool,
-    /// Held, never read: dropping the module unmaps the library and every
-    /// `ComPtr` into it becomes a dangling function table. Declared AFTER
-    /// `inst` so it is dropped after it.
-    ///
-    /// **Shared, because two bays holding the same plugin is ordinary** — the
-    /// owner's report was two drum lanes — and a second `Module` for one
-    /// bundle calls `bundleEntry` a second time. See `scan::module_for`, which
-    /// is where the sharing and the one-init-per-bundle rule live.
-    #[allow(dead_code, reason = "kept alive for the instance's sake, not read")]
-    module: std::sync::Arc<Module>,
     /// One `Vec` per channel of the main output bus, each pre-grown to
     /// `MAX_BLOCK` so `Instance::process`'s internal `resize` never allocates.
     bufs: Vec<Vec<f32>>,
@@ -2528,15 +2664,15 @@ fn run_rack(
             // Replaces rather than mixes: a MIDI channel's signal IS its
             // instrument, and whatever was in `planar` before bay 1 ran is
             // silence or an upstream voice being superseded.
-            if p.inst
-                .process_with_controls(notes, controls, frames, &mut p.bufs)
+            if p.backend
+                .process_voice(notes, controls, frames, &mut p.bufs)
                 .is_err()
             {
                 continue;
             }
         } else if p
-            .inst
-            .process_effect_automated(planar, bay_params, frames, out)
+            .backend
+            .process_effect(planar, bay_params, frames, out)
             .is_err()
         {
             // A refused block leaves the audio ALONE rather than replacing it
@@ -7111,6 +7247,186 @@ impl Engine {
     /// Blocking, like every other load here — `Module::open` runs somebody
     /// else's initialiser — so the host calls it after a frame, never inside
     /// one.
+
+    /// Prepare a VST3 bundle. The body is the code that used to sit inline in
+    /// `load_insert`, moved rather than rewritten.
+    fn prepare_vst3(&self, bundle: &Path, state: Option<&[u8]>) -> Result<Prepared, String> {
+            let module = tangent_host::scan::module_for(bundle)?;
+            let classes = module.audio_modules();
+            let class = classes
+                .first()
+                .ok_or_else(|| format!("{} has no Audio Module Class", bundle.display()))?
+                .clone();
+            // **Any plugin loads in any bay, and there is no refusal left to
+            // word.** The rack used to refuse instruments the way slots refuse
+            // effects; the desk stopped distinguishing, so a bay decides WHAT the
+            // plugin is instead of whether it may exist: a voice is fed the
+            // block's notes and replaces the channel, an effect is fed the channel
+            // and transforms it. See `Hosted::voice` and `run_rack`.
+            let voice = class.kind() == tangent_host::scan::Kind::Instrument;
+            let setup = Setup {
+                sample_rate: f64::from(self.output.sample_rate),
+                max_block: MAX_BLOCK,
+            };
+            let mut inst = Instance::create(&module, &class, setup)?;
+            if !voice && inst.audio_inputs().is_empty() {
+                // Still a real refusal for an EFFECT: with no audio input there is
+                // nothing to send it and it would answer with silence for ever. A
+                // voice has no audio input by design.
+                return Err(format!(
+                        "{} has no audio input, so there is nothing to send to it",
+                        class.name
+                ));
+            }
+            let channels = inst
+                .audio_outputs()
+                .first()
+                .map(|b| b.channels.max(0) as usize)
+                .unwrap_or(0);
+            if channels == 0 {
+                return Err(format!("{} has no audio output channels", class.name));
+            }
+            // **The preset, BEFORE the warm-up**, for the reason the slot path
+            // documents: a preset change makes a sampled instrument reload, and
+            // state that arrives after the gate has closed means the gate waited
+            // for the wrong load. `load_state` also refuses a restore once the
+            // instance has rendered, so this is the only moment it can happen.
+            let state_error = match state {
+                Some(bytes) => inst.load_state(bytes).err(),
+                None => None,
+            };
+            // **A voice warms up like the slot it used to be.** The gate exists so
+            // a sampled piano is not handed to the callback while it still renders
+            // silence; nothing about moving into a bay changed that. An effect
+            // needs no warm-up — see the note on `load` — and gets none.
+            if voice {
+                let gate = tangent_host::ready::warm_up(&mut inst, tangent_host::Policy::default());
+                if gate.state() == tangent_host::ReadyState::Failed {
+                        return Err(gate
+                            .reason()
+                            .unwrap_or("the instrument failed to warm up")
+                            .to_string());
+                }
+            }
+            // Processing on, or the plugin is active and refuses every block.
+            inst.set_processing(true)?;
+            // **The editor's and the state's only chance to get a reference**, for
+            // exactly the reason spelled out in `load_plugin_with_state`: one line
+            // below, `inst` goes into a `Hosted`, into a `PluginBox`, and across a
+            // ring into the audio callback, and after that there is no `&Instance`
+            // on this thread and no safe way to make one. The state handle is what
+            // stops an effect's settings — or a bay instrument's preset — dying at
+            // every relaunch, which until now they did.
+            let editor_handle = inst.editor_handle();
+            let state_handle = inst.state_handle();
+            // The third of the three cloned pointers this host keeps once an
+            // instance has gone to the audio thread. See `Instance::latency_handle`.
+            //
+            // **A VOICE gets none of it**, and so is never polled and never
+            // counted: a voice is where the signal begins, so its own delay
+            // holds nothing else up, and counting it would push every other lane
+            // late to match a delay nobody can hear.
+            let latency_handle = (!voice).then(|| inst.latency_handle());
+            // **After activation and after the state was loaded**, which is why
+            // it is read here and not where the instance was made: VST3 says the
+            // figure means nothing before that, a lookahead limiter has nothing
+            // to report until it knows its block size, and a preset restored
+            // from a saved state can change the answer.
+            let latency_now = if voice { 0 } else { inst.latency_samples() };
+            let loaded = Loaded {
+                bundle: bundle.to_path_buf(),
+                class: class.name.clone(),
+                vendor: module.vendor().to_owned(),
+                channels: u16::try_from(channels).unwrap_or(u16::MAX),
+                sample_rate: self.output.sample_rate,
+            };
+        Ok(Prepared {
+            display_name: class.name.clone(),
+            backend: Backend::Vst3 { inst, module },
+            voice,
+            channels,
+            loaded,
+            editor_handle,
+            state_handle: Some(state_handle),
+            latency_handle,
+            latency_now,
+            state_error,
+        })
+    }
+
+    /// Prepare an LV2 plugin, named by URI.
+    ///
+    /// **Deliberately thinner than the VST3 path, and the gaps are real.** No
+    /// editor handle, no state handle and no latency handle: an LV2 UI is a
+    /// separate shared object with its own embedding protocol, LV2 state is the
+    /// `state:` extension rather than a blob the instance hands over, and
+    /// latency is a designated output port this does not yet read. Each is a
+    /// follow-on; none of them stops a plugin making sound, which is what this
+    /// is for.
+    ///
+    /// What it does do is the whole of the audio contract: the right channel
+    /// count, the instrument/effect distinction from the plugin's own class,
+    /// and the same refusal an effect with no audio input gets on the other
+    /// path.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn prepare_lv2(&self, uri: &str, state: Option<&[u8]>) -> Result<Prepared, String> {
+        let info = tangent_host::lv2::discover()
+            .into_iter()
+            .find(|p| p.uri == uri)
+            .ok_or_else(|| format!("no LV2 plugin with URI {uri} is installed"))?;
+        let inst = tangent_host::lv2::Instance::create(
+            uri,
+            f64::from(self.output.sample_rate),
+        )?;
+        // The plugin's own class decides, exactly as `Kind::Instrument` does
+        // for VST3 - a bay asks what the plugin IS, not what the user meant.
+        let voice = info.is_instrument;
+        if !voice && info.audio_in == 0 {
+            // The same refusal the VST3 path makes, for the same reason: an
+            // effect with no audio input would answer with silence for ever.
+            return Err(format!(
+                "{} has no audio input, so there is nothing to send to it",
+                info.name
+            ));
+        }
+        let channels = info.audio_out.max(1);
+        // Said rather than silently dropped. An LV2 plugin restored from a
+        // session saved with its settings will come back at its defaults until
+        // the state extension is wired, and a user who loses a preset deserves
+        // to be told why rather than to think the plugin is broken.
+        let state_error = state.map(|_| {
+            format!(
+                "{}'s saved settings were not restored: LV2 state is not stored yet",
+                info.name
+            )
+        });
+        Ok(Prepared {
+            display_name: info.name.clone(),
+            backend: Backend::Lv2(inst),
+            voice,
+            channels,
+            loaded: Loaded {
+                bundle: tangent_host::lv2::identity_for(uri),
+                class: info.name,
+                // LV2 has no vendor field of its own; the URI's authority is
+                // the closest honest thing and is what distinguishes two
+                // plugins that share a name.
+                vendor: uri
+                    .split('/')
+                    .nth(2)
+                    .unwrap_or("LV2")
+                    .to_owned(),
+                channels: u16::try_from(channels).unwrap_or(u16::MAX),
+                sample_rate: self.output.sample_rate,
+            },
+            editor_handle: None,
+            state_handle: None,
+            latency_handle: None,
+            latency_now: 0,
+            state_error,
+        })
+    }
+
     pub fn load_insert(
         &mut self,
         strip: usize,
@@ -7170,95 +7486,29 @@ impl Engine {
             }
             return Ok(None);
         };
-        let module = tangent_host::scan::module_for(bundle)?;
-        let classes = module.audio_modules();
-        let class = classes
-            .first()
-            .ok_or_else(|| format!("{} has no Audio Module Class", bundle.display()))?
-            .clone();
-        // **Any plugin loads in any bay, and there is no refusal left to
-        // word.** The rack used to refuse instruments the way slots refuse
-        // effects; the desk stopped distinguishing, so a bay decides WHAT the
-        // plugin is instead of whether it may exist: a voice is fed the
-        // block's notes and replaces the channel, an effect is fed the channel
-        // and transforms it. See `Hosted::voice` and `run_rack`.
-        let voice = class.kind() == tangent_host::scan::Kind::Instrument;
-        let setup = Setup {
-            sample_rate: f64::from(self.output.sample_rate),
-            max_block: MAX_BLOCK,
+        // **Which format this identity names.** VST3 plugins are bundles on
+        // disk; LV2 plugins are URIs, carried here behind `lv2:` — see
+        // `tangent_host::lv2::SCHEME` for why an identity string rather than a
+        // second type threaded through every call site.
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        let prepared = match tangent_host::lv2::uri_of(bundle) {
+            Some(uri) => self.prepare_lv2(&uri, state)?,
+            None => self.prepare_vst3(bundle, state)?,
         };
-        let mut inst = Instance::create(&module, &class, setup)?;
-        if !voice && inst.audio_inputs().is_empty() {
-            // Still a real refusal for an EFFECT: with no audio input there is
-            // nothing to send it and it would answer with silence for ever. A
-            // voice has no audio input by design.
-            return Err(format!(
-                "{} has no audio input, so there is nothing to send to it",
-                class.name
-            ));
-        }
-        let channels = inst
-            .audio_outputs()
-            .first()
-            .map(|b| b.channels.max(0) as usize)
-            .unwrap_or(0);
-        if channels == 0 {
-            return Err(format!("{} has no audio output channels", class.name));
-        }
-        // **The preset, BEFORE the warm-up**, for the reason the slot path
-        // documents: a preset change makes a sampled instrument reload, and
-        // state that arrives after the gate has closed means the gate waited
-        // for the wrong load. `load_state` also refuses a restore once the
-        // instance has rendered, so this is the only moment it can happen.
-        let state_error = match state {
-            Some(bytes) => inst.load_state(bytes).err(),
-            None => None,
-        };
-        // **A voice warms up like the slot it used to be.** The gate exists so
-        // a sampled piano is not handed to the callback while it still renders
-        // silence; nothing about moving into a bay changed that. An effect
-        // needs no warm-up — see the note on `load` — and gets none.
-        if voice {
-            let gate = tangent_host::ready::warm_up(&mut inst, tangent_host::Policy::default());
-            if gate.state() == tangent_host::ReadyState::Failed {
-                return Err(gate
-                    .reason()
-                    .unwrap_or("the instrument failed to warm up")
-                    .to_string());
-            }
-        }
-        // Processing on, or the plugin is active and refuses every block.
-        inst.set_processing(true)?;
-        // **The editor's and the state's only chance to get a reference**, for
-        // exactly the reason spelled out in `load_plugin_with_state`: one line
-        // below, `inst` goes into a `Hosted`, into a `PluginBox`, and across a
-        // ring into the audio callback, and after that there is no `&Instance`
-        // on this thread and no safe way to make one. The state handle is what
-        // stops an effect's settings — or a bay instrument's preset — dying at
-        // every relaunch, which until now they did.
-        let editor_handle = inst.editor_handle();
-        let state_handle = inst.state_handle();
-        // The third of the three cloned pointers this host keeps once an
-        // instance has gone to the audio thread. See `Instance::latency_handle`.
-        //
-        // **A VOICE gets none of it**, and so is never polled and never
-        // counted: a voice is where the signal begins, so its own delay
-        // holds nothing else up, and counting it would push every other lane
-        // late to match a delay nobody can hear.
-        let latency_handle = (!voice).then(|| inst.latency_handle());
-        // **After activation and after the state was loaded**, which is why
-        // it is read here and not where the instance was made: VST3 says the
-        // figure means nothing before that, a lookahead limiter has nothing
-        // to report until it knows its block size, and a preset restored
-        // from a saved state can change the answer.
-        let latency_now = if voice { 0 } else { inst.latency_samples() };
-        let loaded = Loaded {
-            bundle: bundle.to_path_buf(),
-            class: class.name.clone(),
-            vendor: module.vendor().to_owned(),
-            channels: u16::try_from(channels).unwrap_or(u16::MAX),
-            sample_rate: self.output.sample_rate,
-        };
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+        let prepared = self.prepare_vst3(bundle, state)?;
+        let Prepared {
+            backend,
+            voice,
+            channels,
+            loaded,
+            editor_handle,
+            state_handle,
+            latency_handle,
+            latency_now,
+            state_error,
+            display_name,
+        } = prepared;
         // Whatever was in THIS bay is going away, so its window and then its
         // controller and state references go first — the lifetime rule from
         // `editors`.
@@ -7290,8 +7540,7 @@ impl Engine {
             strip,
             slot,
             PluginBox(Some(Box::new(Hosted {
-                inst,
-                module,
+                backend,
                 bufs: vec![vec![0.0; MAX_BLOCK as usize]; channels.max(TAP_CHANNELS)],
                 channels,
                 voice,
@@ -7310,7 +7559,7 @@ impl Engine {
             return Err(format!(
                 "the audio engine did not take {} — the seat's hand-off ring \
                  is full, which means the callback has stalled",
-                class.name
+                display_name
             ));
         }
         if let Some(h) = self
@@ -7325,7 +7574,7 @@ impl Engine {
             .get_mut(strip)
             .and_then(|r| r.get_mut(slot))
         {
-            *h = Some(state_handle);
+            *h = state_handle;
         }
         if let Some(h) = self
             .insert_latency_handles

@@ -96,7 +96,7 @@ JACK on FreeBSD has a native OSS driver (`jackd -d oss -C /dev/dsp0 -P
 /dev/dsp0`), so the pro-audio story is real and not an emulation. Note it wants
 `mac_priority(4)` loaded and the user in the `realtime` group for RT priority.
 
-Confirmed on the box, straight out of `examples/rtlatency`:
+Confirmed on the box, straight out of `examples/rtclick`:
 
 ```
 hosts available : ["JACK", "ALSA"]
@@ -333,7 +333,7 @@ Tangent opens (`1r:1v` in `sndstat`) — is already proven.
 
 ## 7. Latency, measured on a wired loopback
 
-Measured with `jack_iodelay` and `examples/rtlatency` against a **Focusrite
+Measured with `jack_iodelay` and `examples/rtclick` against a **Focusrite
 Scarlett Solo (3rd Gen)** — claimed natively by `uaudio`, no driver work — with
 a 1/4" cable from a line out into the instrument input, so there is no acoustic
 path in the figure. Round trip is app-writes-a-sample to app-sees-it-again.

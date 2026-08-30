@@ -57,6 +57,67 @@ const MAX_BLOCK: usize = 8192;
 /// means something is wrong upstream rather than somebody playing fast.
 const ATOM_CAPACITY: usize = 8192;
 
+/// The prefix that marks a plugin identity as an LV2 URI rather than a bundle
+/// path.
+///
+/// **Why an identity string and not a new type.** Everything from the picker
+/// down to the settings file to `Engine::load_insert` carries a plugin as a
+/// `Path`, and for VST3 that path is a real bundle on disk. LV2 has no such
+/// path — a plugin is identified by URI, its bundle directory is an
+/// implementation detail lilv owns, and two plugins routinely live in one
+/// bundle. Threading a second identity type through every one of those call
+/// sites would touch the settings format, the picker's public API and the
+/// engine's load path to express something a prefix expresses exactly as well.
+///
+/// So an LV2 plugin's identity is `lv2:` followed by its URI, and the one thing
+/// that must stay true is that nothing else can produce that spelling. A
+/// filesystem path cannot: `lv2:` at the start of a path component is legal on
+/// Unix but `discover` only ever yields absolute paths, which begin with `/`.
+pub const SCHEME: &str = "lv2:";
+
+/// The identity to hand the picker and store in settings, for a given URI.
+pub fn identity_for(uri: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{SCHEME}{uri}"))
+}
+
+/// The URI back out of an identity, or `None` if this is a bundle path.
+pub fn uri_of(identity: &std::path::Path) -> Option<String> {
+    identity
+        .to_str()?
+        .strip_prefix(SCHEME)
+        .map(|uri| uri.to_owned())
+}
+
+/// Who to file a plugin under, worked out from its URI.
+///
+/// **LV2 has no vendor field, and the URI is the only thing that carries the
+/// information.** The picker groups by vendor, so every plugin needs an answer;
+/// "" would pile the whole LV2 collection into the unnamed group at the bottom,
+/// which is where things go to be unfindable.
+///
+/// Both URI shapes in the wild are handled, and the second is not hypothetical:
+/// Dragonfly Reverb ships four plugins, one of which is
+/// `https://github.com/michaelwillis/dragonfly-reverb` and three of which are
+/// `urn:dragonfly:room` and friends. An authority-only rule returned nothing
+/// for three quarters of one vendor's output.
+pub fn vendor_of(uri: &str) -> String {
+    // scheme://authority/path — the authority names the publisher.
+    if let Some((_, rest)) = uri.split_once("://") {
+        if let Some(host) = rest.split('/').next().filter(|h| !h.is_empty()) {
+            return host.to_owned();
+        }
+    }
+    // urn:namespace:thing — the namespace is the closest equivalent.
+    if let Some(rest) = uri.strip_prefix("urn:") {
+        if let Some(ns) = rest.split(':').next().filter(|n| !n.is_empty()) {
+            return ns.to_owned();
+        }
+    }
+    // Something else entirely. Grouped together under the format's own name,
+    // which is at least true and keeps it out of the unnamed pile.
+    "LV2".to_owned()
+}
+
 /// What the picker needs to know about one plugin, without instantiating it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PluginInfo {
@@ -299,6 +360,61 @@ impl Instance {
         }
     }
 
+    /// Run one block over the planar buffers an engine actually holds.
+    ///
+    /// The engine's channels are `Vec<f32>` per channel, not the `&[&[f32]]`
+    /// [`Instance::process`] takes, and converting between them at the call
+    /// site is where an allocation would sneak onto the audio thread: building
+    /// a `&mut [&mut [f32]]` out of a `&mut [Vec<f32>]` needs somewhere to put
+    /// the pointers. Done here instead, where `iter_mut().map(..)` is already
+    /// the `ExactSizeIterator` livi wants and nothing is built at all.
+    ///
+    /// Extra channels beyond what the plugin declares are left untouched — the
+    /// caller decides what an unwritten channel means, and for a voice that is
+    /// "copy channel 0 across", which is not this function's business.
+    pub fn process_planar(
+        &mut self,
+        frames: usize,
+        inputs: &[Vec<f32>],
+        outputs: &mut [Vec<f32>],
+    ) -> Result<(), String> {
+        if frames > MAX_BLOCK {
+            return Err(format!("block of {frames} exceeds {MAX_BLOCK}"));
+        }
+        let n_out = self.audio_out.min(32);
+        if outputs.len() < n_out || outputs.iter().take(n_out).any(|c| c.len() < frames) {
+            return Err(format!(
+                "{} output channels of at least {frames} frames needed, {} supplied",
+                n_out,
+                outputs.len()
+            ));
+        }
+        for seq in &mut self.atom_out {
+            seq.clear();
+        }
+
+        let silence = &self.silence[..frames];
+        let mut in_slices: [&[f32]; 32] = [silence; 32];
+        let n_in = self.audio_in.min(32);
+        for (i, slot) in in_slices.iter_mut().enumerate().take(n_in) {
+            if let Some(ch) = inputs.get(i) {
+                if ch.len() >= frames {
+                    *slot = &ch[..frames];
+                }
+            }
+        }
+
+        let ports = livi::EmptyPortConnections::new()
+            .with_audio_inputs(in_slices[..n_in].iter().copied())
+            .with_audio_outputs(outputs[..n_out].iter_mut().map(|c| &mut c[..frames]))
+            .with_atom_sequence_inputs(self.atom_in.iter())
+            .with_atom_sequence_outputs(self.atom_out.iter_mut());
+
+        // SAFETY: every declared port is connected, every buffer is at least
+        // `frames` long (checked above), and `frames <= MAX_BLOCK`.
+        unsafe { self.inner.run(frames, ports) }.map_err(|e| format!("LV2 run failed: {e:?}"))
+    }
+
     /// Run one block.
     ///
     /// **Audio-thread code.** No allocation, no locking, no panicking path: the
@@ -387,6 +503,58 @@ mod tests {
 
     const AMP: &str = "http://lv2plug.in/plugins/eg-amp";
     const FIFTHS: &str = "http://lv2plug.in/plugins/eg-fifths";
+
+    #[test]
+    fn an_identity_round_trips_and_a_bundle_path_is_not_mistaken_for_one() {
+        let id = identity_for("http://lv2plug.in/plugins/eg-amp");
+        assert_eq!(
+            uri_of(&id).as_deref(),
+            Some("http://lv2plug.in/plugins/eg-amp")
+        );
+        // The discriminator has to be airtight in this direction: a VST3 bundle
+        // read as an LV2 URI would be looked up in lilv and reported missing,
+        // which looks like a broken plugin rather than a broken host.
+        for not_lv2 in [
+            "/usr/local/lib/vst3/Foo.vst3",
+            "/home/someone/.vst3/Bar.vst3",
+            "/",
+        ] {
+            assert_eq!(uri_of(std::path::Path::new(not_lv2)), None, "{not_lv2}");
+        }
+    }
+
+    #[test]
+    fn a_vendor_is_found_for_every_uri_shape_in_the_wild() {
+        // Both shapes ship in one product: Dragonfly Reverb publishes one
+        // plugin under a URL and three under URNs, so a rule that handles only
+        // the first files three quarters of a vendor's output as unnamed.
+        assert_eq!(
+            vendor_of("https://github.com/michaelwillis/dragonfly-reverb"),
+            "github.com"
+        );
+        assert_eq!(vendor_of("urn:dragonfly:hall"), "dragonfly");
+        assert_eq!(vendor_of("http://lv2plug.in/plugins/eg-amp"), "lv2plug.in");
+        assert_eq!(
+            vendor_of("http://breakfastquay.com/rdf/lv2-rubberband#mono"),
+            "breakfastquay.com"
+        );
+        // Anything unrecognised still gets a home rather than the unnamed pile.
+        assert_eq!(vendor_of("something-odd"), "LV2");
+        assert_eq!(vendor_of("urn:"), "LV2");
+        assert_eq!(vendor_of("://"), "LV2");
+    }
+
+    #[test]
+    fn every_installed_plugin_gets_a_vendor() {
+        for p in discover() {
+            assert!(
+                !vendor_of(&p.uri).is_empty(),
+                "{} ({}) has nothing to group it under",
+                p.name,
+                p.uri
+            );
+        }
+    }
 
     #[test]
     fn discovery_does_not_panic_without_plugins() {
