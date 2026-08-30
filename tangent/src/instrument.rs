@@ -221,7 +221,7 @@
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{
-    AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+    AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -607,6 +607,68 @@ fn strip_is_heard(strip: Strip, muted: u32, soloed: u32) -> bool {
     // monitoring aid with a switch of its own, not part of the mix, and a
     // solo that also stops the count is a solo that broke the metronome.
     !(soloed != 0 && strip.is_source())
+}
+
+/// **The same question, asked of a channel that may live in a folder.**
+///
+/// A folder is a strip like any other, so mute and solo have to mean what
+/// they mean everywhere — and mean it for the group:
+///
+/// * A muted folder silences everything inside it. Anything else and the
+///   button lies: the rows are drawn as a group and one press does not
+///   silence the group.
+/// * A soloed folder is heard, **and so is everything inside it.** This is
+///   the case the plain test gets exactly backwards: a child is a source, so
+///   `soloed != 0 && is_source()` silences it, and soloing a folder would
+///   have summed silence into the very bus being soloed.
+/// * A child soloed on its own is still heard on its own, which is what
+///   makes soloing one track inside a group work.
+///
+/// `parents` is the renderer's copy of `Shared::folder_of`, read once a
+/// block. The walk terminates because a parent index is always lower than
+/// its child's; `CHANNELS` is the belt-and-braces bound.
+fn channel_is_heard(ch: usize, parents: &[i32; CHANNELS], muted: u32, soloed: u32) -> bool {
+    let bit = |n: usize| 1u32 << n.min(31);
+    // Muted anywhere up the chain: silent, whatever anything else says.
+    // Checked before solo, and deliberately: an explicit solo overrides the
+    // channel's OWN mute, but nothing overrides a group being switched off.
+    let mut up = Some(ch);
+    let mut hops = 0;
+    while let Some(n) = up {
+        if hops > CHANNELS {
+            break;
+        }
+        if muted & bit(n) != 0 && n != ch {
+            return false;
+        }
+        up = parents.get(n).copied().filter(|p| *p >= 0).map(|p| p as usize);
+        hops += 1;
+    }
+    if soloed == 0 {
+        // Nothing soloed: the plain question, which mute has already been
+        // asked up the chain above. Deliberately the STRIP form — calling
+        // this function again here is infinite recursion, and was, for one
+        // memorable run of the suite.
+        return strip_is_heard(Strip::Channel(ch), muted, soloed);
+    }
+    // Something is soloed. This channel is heard if it, or any folder it
+    // sits in, is the thing.
+    let mut up = Some(ch);
+    let mut hops = 0;
+    while let Some(n) = up {
+        if hops > CHANNELS {
+            break;
+        }
+        if soloed & bit(n) != 0 {
+            // Its own mute still stops it when the solo belongs to an
+            // ANCESTOR: soloing a group is not a request to hear the one
+            // track in it somebody switched off.
+            return n == ch || muted & bit(ch) == 0;
+        }
+        up = parents.get(n).copied().filter(|p| *p >= 0).map(|p| p as usize);
+        hops += 1;
+    }
+    false
 }
 
 /// Add what came back from the effects bus, at the bus's own fader.
@@ -1581,6 +1643,22 @@ struct Shared {
     /// none are loaded, which is why the per-block work below is gated on
     /// what is live rather than on the size of this mask.
     drum_strips: AtomicU32,
+    /// **Which folder each channel belongs to**, as an index, or -1 for none.
+    ///
+    /// A folder was two booleans in the arrange view and nothing at all in
+    /// here: the rows were drawn nested, and the audio went straight past to
+    /// the master. So a folder's meter never moved, its fader did nothing,
+    /// and plugins in its bays processed the channel's own (empty) input
+    /// rather than the group's — the owner: "the folder meter containing 2
+    /// active sources should have its meters reflect that. they are dead and
+    /// plugins in the folder do not process that folders audio together."
+    ///
+    /// An INDEX rather than a mask because a folder is a tree and a mask is
+    /// a set. Always LOWER than the channel it belongs to — membership is
+    /// "the nearest folder above me", which is what the settings model
+    /// already encodes — so the graph cannot contain a cycle by
+    /// construction, and a fold that walks parents always terminates.
+    folder_of: [AtomicI32; CHANNELS],
     /// Every channel the built-in DX7 is on. Same story, same bug: one
     /// `Builtin`, one index, `builtin.is_none()` in the host's walk, so the
     /// second lane holding it was silent too.
@@ -1988,6 +2066,7 @@ impl Shared {
             channel_pans: std::array::from_fn(|_| AtomicU32::new(0.0f32.to_bits())),
             builtin_strip: AtomicI64::new(-1),
             drum_strips: AtomicU32::new(0),
+            folder_of: std::array::from_fn(|_| AtomicI32::new(-1)),
             builtin_strips: AtomicU32::new(0),
             pick_strip: std::array::from_fn(|_| AtomicI64::new(-1)),
             punch: std::array::from_fn(|_| AtomicU64::new(u64::MAX)),
@@ -3015,6 +3094,18 @@ struct Renderer {
     reastream_scratch: Vec<f32>,
     /// One block of stems, accumulated by the three mixers and pushed once.
     stem_scratch: Vec<f32>,
+    /// **The folder tree for this block**: each channel's parent, or -1.
+    ///
+    /// Read off `Shared::folder_of` once a block, because it changes when
+    /// somebody makes a group and never inside a buffer.
+    folders: [i32; CHANNELS],
+    /// Which channels something folds INTO. Derived from `folders` rather
+    /// than stored twice: two facts about which strips are groups is two
+    /// facts that can disagree.
+    folder_is: [bool; CHANNELS],
+    /// Whether there are any groups at all. A desk with none — which is
+    /// every desk until somebody makes one — takes none of this work.
+    has_folders: bool,
     /// Each PAD's own block, interleaved stereo — rendered here first so a
     /// pad's rack can run over its voice alone before the bus sums it.
     pad_out: Vec<f32>,
@@ -3603,11 +3694,48 @@ impl Renderer {
                     sa.fill(0.0);
                 }
             }
+            // **The folder tree, and what it does to the routing.**
+            //
+            // A channel inside a group does not reach the master on its own
+            // — the group does, once, after its rack has run over the sum.
+            // That is expressed by closing the SAME `route_direct` gate a
+            // hardware route uses, which is why none of the three places
+            // that fold a channel into the mix had to learn about folders:
+            // they already multiply by this.
+            //
+            // A folder's own channel is closed too. Whatever it carries goes
+            // through its own bus like everything else in it, or a group
+            // with a clip on its own row would be heard twice — once raw and
+            // once through the group.
+            self.folders = std::array::from_fn(|ch| {
+                self.shared.folder_of[ch].load(Ordering::Relaxed)
+            });
+            self.folder_is = [false; CHANNELS];
+            self.has_folders = false;
+            for ch in 0..CHANNELS {
+                let p = self.folders[ch];
+                if p >= 0 {
+                    self.has_folders = true;
+                    if let Some(f) = self.folder_is.get_mut(p as usize) {
+                        *f = true;
+                    }
+                }
+            }
+            for ch in 0..CHANNELS {
+                if self.folders[ch] >= 0 || self.folder_is[ch] {
+                    if let Some(d) = self.route_direct.get_mut(ch) {
+                        *d = 0.0;
+                    }
+                }
+            }
             self.stems_live = self.shared.stems_on.load(Ordering::Relaxed);
             // **Hardware routes need the same per-channel audio stems need.**
             // One buffer, two customers: whichever asks, it is filled and
             // zeroed exactly once.
-            if self.stems_live || self.route_n > 0 {
+            // Groups are the third customer for the per-lane buffer: a
+            // folder sums its children out of it. One buffer, three
+            // customers, filled and zeroed exactly once.
+            if self.stems_live || self.route_n > 0 || self.has_folders {
                 if let Some(st) = self.stem_scratch.get_mut(..n * CHANNELS * 2) {
                     st.fill(0.0);
                 }
@@ -3675,6 +3803,23 @@ impl Renderer {
             // the master — so the pads are limited, mastered, heard and
             // taped exactly like every other source.
             self.mix_pads(n, muted, soloed);
+            // **The groups, after every source that can be in one.**
+            //
+            // A folder sums its children out of the per-lane buffer, and
+            // three separate passes fill that buffer: the channel racks in
+            // `mix_channels`, the timeline in `mix_clips`, and the drum kits
+            // in `mix_pads`. Folding at the end of the first of them read a
+            // buffer two thirds empty and summed silence — a group with a
+            // drum track in it was simply gone. Here, everything is in.
+            //
+            // Before the stem push below, deliberately: a folder REPLACES
+            // its own slot with its output, so a bounced group stem is the
+            // group and not the empty row the folder channel usually is.
+            if self.has_folders {
+                let pdc_max = self.shared.max_latency.load(Ordering::Relaxed);
+                let coeff = self.gain_coeff;
+                self.fold_folders(n, muted, soloed, coeff, pdc_max);
+            }
             if self.stems_live {
                 let want = n * CHANNELS * 2;
                 let room = (self.stem_tx.slots() / (CHANNELS * 2)) * (CHANNELS * 2);
@@ -4846,7 +4991,7 @@ impl Renderer {
                     }
                     // The stem tap hears the lane's LIVE input too — a
                     // bounced stem is everything the lane put on the bus.
-                    if self.stems_live || self.route_n > 0 {
+                    if self.stems_live || self.route_n > 0 || self.has_folders {
                         if let Some(sv) = self
                             .stem_scratch
                             .get_mut(i * CHANNELS * 2 + strip.index() * 2 + c.min(1))
@@ -5175,7 +5320,7 @@ impl Renderer {
         // Stems and ROUTING share this buffer: a send reads the
         // lane's own audio out of it, so it is filled whenever either
         // customer asks.
-        let stems = self.stems_live || self.route_n > 0;
+        let stems = self.stems_live || self.route_n > 0 || self.has_folders;
         // Copied out before the buffers are borrowed: the fold below holds
         // `mix`/`aux`/`stem` mutably, and this has to be readable inside it.
         let direct = self.route_direct;
@@ -5696,7 +5841,7 @@ impl Renderer {
         // Stems and ROUTING share this buffer: a send reads the
         // lane's own audio out of it, so it is filled whenever either
         // customer asks.
-        let stems = self.stems_live || self.route_n > 0;
+        let stems = self.stems_live || self.route_n > 0 || self.has_folders;
         let (Some(mix), Some(aux), Some(stem)) = (
             self.mix.get_mut(..want),
             self.aux.get_mut(..want),
@@ -5802,6 +5947,10 @@ impl Renderer {
                 }
             }
         }
+
+        // The folder tree, copied out of `self` so the audibility test can
+        // be asked while the buffers below are borrowed. Sixteen `i32`.
+        let parents = self.folders;
 
         // The per-lane note list, taken out of `self` so the loop below can
         // read the live list and the clips while filling it.
@@ -6051,7 +6200,7 @@ impl Renderer {
                         lane: ch,
                     });
                 }
-                let target = if strip_is_heard(Strip::Channel(ch), muted, soloed) {
+                let target = if channel_is_heard(ch, &parents, muted, soloed) {
                     self.lane_gain(ch)
                 } else {
                     0.0
@@ -6093,7 +6242,7 @@ impl Renderer {
                 // **The gain is advanced whether or not anything renders.** A
                 // fader moved during a rest has to have arrived by the next
                 // note, or it comes in at the old level and slides.
-                let target = if strip_is_heard(Strip::Channel(ch), muted, soloed) {
+                let target = if channel_is_heard(ch, &parents, muted, soloed) {
                     self.lane_gain(ch)
                 } else {
                     0.0
@@ -6164,7 +6313,7 @@ impl Renderer {
             }
             // The fold: fader, send, peak — the channel's own, exactly as
             // every other strip does it.
-            let target = if strip_is_heard(Strip::Channel(ch), muted, soloed) {
+            let target = if channel_is_heard(ch, &parents, muted, soloed) {
                 self.lane_gain(ch)
             } else {
                 0.0
@@ -6175,7 +6324,7 @@ impl Renderer {
             // Stems and ROUTING share this buffer: a send reads the
             // lane's own audio out of it, so it is filled whenever either
             // customer asks.
-            let stems = self.stems_live || self.route_n > 0;
+            let stems = self.stems_live || self.route_n > 0 || self.has_folders;
             let direct = self.route_direct[ch];
             let (Some(mix), Some(aux), Some(stem)) = (
                 self.mix.get_mut(..want),
@@ -6192,6 +6341,10 @@ impl Renderer {
                 let r = self.fx_in.get(1).map_or(0.0, |b| b[f]) * g * pan_r;
                 peak[0] = peak[0].max(l.abs());
                 peak[1] = peak[1].max(r.abs());
+                // `direct` is zero for anything in a group — see where
+                // `route_direct` is derived. That is what keeps a grouped
+                // channel out of the master without any of the three folds
+                // in this file having to know what a folder is.
                 mix[f * TAP_CHANNELS] += l * direct;
                 mix[f * TAP_CHANNELS + 1] += r * direct;
                 aux[f * TAP_CHANNELS] += l * send;
@@ -6204,6 +6357,146 @@ impl Renderer {
             self.shared.note_strip_peak(Strip::Channel(ch), peak);
         }
         self.lane_notes = lane_notes;
+
+    }
+
+    /// **Every folder's bus, deepest first: rack, fader, and onward.**
+    ///
+    /// Run after the channel loop because a folder's children are numbered
+    /// ABOVE it and have to have folded in before there is a sum to process.
+    /// Descending for the same reason one level up: a folder inside a folder
+    /// is the higher index, so it finishes and folds into its parent's bus
+    /// before that parent's turn comes. One pass, no recursion, no ordering
+    /// to work out — the numbering already is the order.
+    ///
+    /// This is what makes a group a GROUP rather than a drawing: the rack
+    /// here processes the summed children, so a compressor in a folder's bay
+    /// is a bus compressor, and the peak reported is the group's, so the
+    /// meter finally moves.
+    fn fold_folders(
+        &mut self,
+        frames: usize,
+        muted: u32,
+        soloed: u32,
+        coeff: f32,
+        pdc_max: u32,
+    ) {
+        let parents = self.folders;
+        let stride = CHANNELS * 2;
+        for ch in (0..CHANNELS).rev() {
+            if !self.folder_is[ch] {
+                continue;
+            }
+            // **The group's audio, out of the per-lane buffer.**
+            //
+            // Every path that folds a channel — its rack, its clips, its
+            // drum kit — already writes that channel's own post-fader audio
+            // here, which is why none of them had to learn what a folder is.
+            // Summed into the one buffer a rack reads: planar, not
+            // interleaved.
+            //
+            // Its own row is in the sum as well as its children's: a folder
+            // is a strip, and a clip standing on it belongs to the group.
+            for c in 0..TAP_CHANNELS {
+                let Some(dst) = self.fx_in.get_mut(c) else {
+                    continue;
+                };
+                dst[..frames].fill(0.0);
+                for f in 0..frames {
+                    dst[f] += self
+                        .stem_scratch
+                        .get(f * stride + ch * 2 + c)
+                        .copied()
+                        .unwrap_or(0.0);
+                }
+            }
+            for kid in 0..CHANNELS {
+                if parents.get(kid).copied().unwrap_or(-1) != ch as i32 {
+                    continue;
+                }
+                for c in 0..TAP_CHANNELS {
+                    let Some(dst) = self.fx_in.get_mut(c) else {
+                        continue;
+                    };
+                    for f in 0..frames {
+                        dst[f] += self
+                            .stem_scratch
+                            .get(f * stride + kid * 2 + c)
+                            .copied()
+                            .unwrap_or(0.0);
+                    }
+                }
+            }
+            // **The group's own plugins, over the group's own audio.** This
+            // is the line the owner was asking for: "plugins in the folder
+            // do not process that folders audio together." Now they do.
+            //
+            // No live notes and no controls: a folder is a bus, and a bus is
+            // not played.
+            if !self.racks[ch].is_empty() {
+                run_rack(
+                    &mut self.racks[ch],
+                    &mut self.fx_in,
+                    frames,
+                    &mut self.fx_out,
+                    &[],
+                    &[],
+                    NO_AUTOMATION,
+                );
+            }
+            // And it waits for the slowest chain like every other strip, or
+            // a group with a lookahead limiter on it arrives early.
+            {
+                let own = Rack::latency(&self.shared, ch);
+                let wait = usize::try_from(pdc_max.saturating_sub(own)).unwrap_or(0);
+                if let Some(line) = self.pdc.get_mut(ch) {
+                    line.run(&mut self.fx_in, frames, wait);
+                }
+            }
+            let target = if channel_is_heard(ch, &parents, muted, soloed) {
+                self.lane_gain(ch)
+            } else {
+                0.0
+            };
+            let send = self.lane_send(Strip::Channel(ch).index());
+            let (pan_l, pan_r) = pan_gains(self.lane_pan(ch));
+            // A folder inside a folder does not reach the master either: its
+            // parent carries it, and `route_direct` is closed for both.
+            let up = parents.get(ch).copied().unwrap_or(-1);
+            let to_master = up < 0;
+            let want = frames * TAP_CHANNELS;
+            let mut peak = [0.0f32; 2];
+            for f in 0..frames {
+                self.channel_gain[ch] += (target - self.channel_gain[ch]) * coeff;
+                let g = self.channel_gain[ch];
+                let l = self.fx_in.first().map_or(0.0, |b| b[f]) * g * pan_l;
+                let r = self.fx_in.get(1).map_or(0.0, |b| b[f]) * g * pan_r;
+                peak[0] = peak[0].max(l.abs());
+                peak[1] = peak[1].max(r.abs());
+                // **Its own slot becomes its OUTPUT.** It held this folder's
+                // raw row a moment ago and has just been consumed; writing
+                // the post-rack, post-fader result back is what lets the
+                // next folder up read this one as a child, and is what makes
+                // a group's STEM the group rather than an empty row.
+                if let Some(st) = self.stem_scratch.get_mut(..frames * stride) {
+                    st[f * stride + ch * 2] = l;
+                    st[f * stride + ch * 2 + 1] = r;
+                }
+                if to_master {
+                    if let Some(mix) = self.mix.get_mut(..want) {
+                        mix[f * TAP_CHANNELS] += l;
+                        mix[f * TAP_CHANNELS + 1] += r;
+                    }
+                }
+                if let Some(aux) = self.aux.get_mut(..want) {
+                    aux[f * TAP_CHANNELS] += l * send;
+                    aux[f * TAP_CHANNELS + 1] += r * send;
+                }
+            }
+            // **The meter the owner said was dead.** It is the group's now,
+            // and it moves because there is finally something in the bus.
+            self.shared.note_strip_peak(Strip::Channel(ch), peak);
+        }
     }
 
     /// Push the recorder's mix, whole frames only.
@@ -6966,6 +7259,9 @@ impl Engine {
             cap_tx,
             stem_tx,
             stem_scratch: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
+            folders: [-1; CHANNELS],
+            folder_is: [false; CHANNELS],
+            has_folders: false,
             scope_tx,
             scope_scratch: vec![0.0; MAX_CALLBACK_FRAMES * TAP_CHANNELS],
             loudness: crate::loudness::Loudness::new(rate as f32),
@@ -7582,6 +7878,27 @@ impl Engine {
     /// disagree about which lane is first.
     pub fn set_drum_strips(&self, mask: u32) {
         self.shared.drum_strips.store(mask, Ordering::Relaxed);
+    }
+
+    /// **Who each channel folds into.** `-1` is "straight to the master",
+    /// which is every channel until somebody makes a folder.
+    ///
+    /// Refused unless every parent is LOWER than its child: that is what
+    /// makes the graph a forest rather than a graph, and it is what lets the
+    /// renderer fold the deepest first in one descending pass. The settings
+    /// model can only produce such an arrangement — membership is the
+    /// nearest folder ABOVE — so a violation here is a bug on the way in,
+    /// and taking none of it beats taking half.
+    pub fn set_folders(&self, parents: [i32; CHANNELS]) -> bool {
+        for (ch, p) in parents.iter().enumerate() {
+            if *p >= 0 && (*p as usize) >= ch {
+                return false;
+            }
+        }
+        for (ch, p) in parents.iter().enumerate() {
+            self.shared.folder_of[ch].store(*p, Ordering::Relaxed);
+        }
+        true
     }
 
     /// The first drum lane as the RENDERER derives it, for the test that
@@ -10621,6 +10938,9 @@ mod tests {
             cap_tx: Vec::new(),
             stem_tx: RingBuffer::<f32>::new(1 << 16).0,
             stem_scratch: vec![0.0; MAX_BLOCK as usize * CHANNELS * 2],
+            folders: [-1; CHANNELS],
+            folder_is: [false; CHANNELS],
+            has_folders: false,
             scope_tx: RingBuffer::<f32>::new(1 << 15).0,
             scope_scratch: vec![0.0; MAX_CALLBACK_FRAMES * TAP_CHANNELS],
             loudness: crate::loudness::Loudness::new(48_000.0),
@@ -11320,6 +11640,195 @@ mod tests {
     /// industry sampler does. This asks for exactly that: the same kit on
     /// two lanes, notes on BOTH, and each lane's own fader governing its own
     /// sound.
+    /// **A folder is a BUS**: its children sum into it, its fader governs
+    /// the sum, and it reaches the master once.
+    ///
+    /// Groups were two booleans in the arrange view and nothing in the
+    /// engine — the rows drew nested and the audio went straight past to the
+    /// master. So the folder's meter never moved and its fader did nothing.
+    /// The owner: "the folder meter containing 2 active sources should have
+    /// its meters reflect that. they are dead."
+    ///
+    /// Drum lanes are the fixture because they are the cheapest thing in
+    /// this engine that makes a predictable noise on a named channel.
+    #[test]
+    fn a_folder_sums_its_children_and_its_fader_governs_the_group() {
+        use std::sync::Arc;
+        let clip = |lane: usize| PlacedMidi {
+            strip: lane,
+            start: 0,
+            len: 48_000,
+            notes: Arc::new(vec![ClipNote { at: 0, dur: 2_400, key: PAD_BASE, vel: 100 }]),
+        };
+        // Lanes 5 and 6 make the noise; lane 2 is the folder they fold into.
+        let render = |folder: bool, folder_gain: f32| -> f32 {
+            let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+            for l in [5usize, 6] {
+                e.set_pad_kit(l, test_kit(&[0], 4_800, 0.5));
+                e.set_channel_gain(l, 1.0);
+            }
+            e.set_drum_strips((1 << 5) | (1 << 6));
+            if folder {
+                let mut parents = [-1i32; CHANNELS];
+                parents[5] = 2;
+                parents[6] = 2;
+                assert!(e.set_folders(parents), "the tree was refused");
+                e.set_channel_gain(2, folder_gain);
+            }
+            e.set_rolling(false);
+            let mut out = vec![0.0f32; 1024 * 2];
+            for _ in 0..4 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+            }
+            e.set_midi_clips(vec![clip(5), clip(6)]);
+            e.set_transport(1, 0);
+            e.set_rolling(true);
+            let mut peak = 0.0f32;
+            for b in 0..4 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                if b == 3 {
+                    peak = out.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+                }
+            }
+            peak
+        };
+
+        // No folder: the two lanes reach the master themselves.
+        let flat = render(false, 1.0);
+        assert!(flat > 0.05, "the fixture makes no sound at all: {flat}");
+
+        // In a folder at unity: the SAME sound. A group is a place the audio
+        // passes through, not a place it changes.
+        let grouped = render(true, 1.0);
+        assert!(
+            (grouped - flat).abs() < flat * 0.02,
+            "grouping changed the level: {grouped} against {flat}"
+        );
+
+        // **The folder's fader governs both children at once**, which is the
+        // whole of what a group is for and what did not exist before.
+        let half = render(true, 0.5);
+        assert!(
+            (half - flat * 0.5).abs() < flat * 0.05,
+            "the folder fader did not halve the group: {half} against {flat}"
+        );
+        let shut = render(true, 0.0);
+        assert!(shut < 1.0e-6, "the folder fader could not close the group: {shut}");
+    }
+
+    /// **The folder's METER is the group's**, which is the thing the owner
+    /// could see was dead.
+    #[test]
+    fn a_folders_meter_reads_the_sum_of_what_is_in_it() {
+        use std::sync::Arc;
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        for l in [5usize, 6] {
+            e.set_pad_kit(l, test_kit(&[0], 4_800, 0.5));
+            e.set_channel_gain(l, 1.0);
+        }
+        e.set_drum_strips((1 << 5) | (1 << 6));
+        let mut parents = [-1i32; CHANNELS];
+        parents[5] = 2;
+        parents[6] = 2;
+        assert!(e.set_folders(parents));
+        e.set_channel_gain(2, 1.0);
+        e.set_rolling(false);
+        let mut out = vec![0.0f32; 1024 * 2];
+        for _ in 0..4 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+        }
+        e.set_midi_clips(vec![
+            PlacedMidi { strip: 5, start: 0, len: 48_000,
+                notes: Arc::new(vec![ClipNote { at: 0, dur: 2_400, key: PAD_BASE, vel: 100 }]) },
+            PlacedMidi { strip: 6, start: 0, len: 48_000,
+                notes: Arc::new(vec![ClipNote { at: 0, dur: 2_400, key: PAD_BASE, vel: 100 }]) },
+        ]);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        let mut folder_peak = 0.0f32;
+        for _ in 0..4 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            // `strip_peaks` reads and RESETS, so the maximum is accumulated
+            // across the blocks rather than read once at the end.
+            let p = e.strip_peaks()[Strip::Channel(2).index()];
+            folder_peak = folder_peak.max(p[0].max(p[1]));
+        }
+        assert!(
+            folder_peak > 0.05,
+            "the folder's meter never moved: {folder_peak}"
+        );
+    }
+
+    /// **A folder inside a folder**, which the single descending fold has to
+    /// get right without recursing: the inner one is the higher index, so it
+    /// finishes and folds into the outer before the outer's turn comes.
+    #[test]
+    fn a_folder_inside_a_folder_reaches_the_master_through_both() {
+        use std::sync::Arc;
+        let render = |outer_gain: f32| -> f32 {
+            let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+            e.set_pad_kit(7, test_kit(&[0], 4_800, 0.5));
+            e.set_channel_gain(7, 1.0);
+            e.set_drum_strips(1 << 7);
+            // 1 contains 3, 3 contains 7.
+            let mut parents = [-1i32; CHANNELS];
+            parents[3] = 1;
+            parents[7] = 3;
+            assert!(e.set_folders(parents), "the nested tree was refused");
+            e.set_channel_gain(3, 1.0);
+            e.set_channel_gain(1, outer_gain);
+            e.set_rolling(false);
+            let mut out = vec![0.0f32; 1024 * 2];
+            for _ in 0..4 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+            }
+            e.set_midi_clips(vec![PlacedMidi {
+                strip: 7, start: 0, len: 48_000,
+                notes: Arc::new(vec![ClipNote { at: 0, dur: 2_400, key: PAD_BASE, vel: 100 }]),
+            }]);
+            e.set_transport(1, 0);
+            e.set_rolling(true);
+            let mut peak = 0.0f32;
+            for b in 0..4 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                if b == 3 {
+                    peak = out.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+                }
+            }
+            peak
+        };
+        let open = render(1.0);
+        assert!(open > 0.05, "nothing came through two folders: {open}");
+        // The OUTER fader governs a track two levels down.
+        let shut = render(0.0);
+        assert!(shut < 1.0e-6, "the outer folder did not close: {shut}");
+    }
+
+    /// **A tree that is not a forest is refused whole.**
+    ///
+    /// Every parent must be a lower index than its child. That is what the
+    /// settings model produces and what the single descending fold needs;
+    /// taking half of a bad one would build a routing graph nobody drew.
+    #[test]
+    fn a_parent_that_is_not_above_its_child_is_refused() {
+        let e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        let mut bad = [-1i32; CHANNELS];
+        bad[2] = 5;
+        assert!(!e.set_folders(bad), "a child above its parent was accepted");
+        let mut itself = [-1i32; CHANNELS];
+        itself[4] = 4;
+        assert!(!e.set_folders(itself), "a folder inside itself was accepted");
+        let mut good = [-1i32; CHANNELS];
+        good[5] = 2;
+        assert!(e.set_folders(good), "a proper tree was refused");
+    }
+
     #[test]
     fn two_drum_lanes_each_sound_on_their_own_strip() {
         use std::sync::Arc;

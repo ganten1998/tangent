@@ -15578,6 +15578,20 @@ impl IvoryApp {
                 self.arr_copy();
                 self.arr_delete_selected();
             }
+            // **Cmd/Ctrl+F: make a folder.**
+            //
+            // Groups existed and there was no way to make one but a menu.
+            // Two meanings, decided by what is chosen, and both are the
+            // gesture somebody would actually make: several tracks picked
+            // means "group these", an empty slot means "start a group here".
+            // See `make_folder`.
+            if ctx.input(|i| {
+                (i.modifiers.command || i.modifiers.ctrl)
+                    && !i.modifiers.shift
+                    && i.key_pressed(egui::Key::F)
+            }) {
+                self.make_folder();
+            }
         }
         // **Ctrl/Cmd+Shift+N: normalise.**
         //
@@ -16791,6 +16805,135 @@ impl IvoryApp {
     /// `transpose_still_works_but_the_arrows_do_not_reach_it_from_the_desk`.
     fn desk_owns_the_arrows(&self) -> bool {
         self.arrangement_open || self.mixer_open
+    }
+
+    /// **Who each channel folds into**, as an index per channel, or -1.
+    ///
+    /// Derived from the two flags the arrange view already keeps rather than
+    /// stored a third time: `strip_in_folder` says "I am inside the nearest
+    /// folder above me" and `strip_is_folder` says which rows those are.
+    /// That model is positional on purpose — it survives a reorder with
+    /// nothing to remap — and the parent it yields is always a LOWER index,
+    /// which is exactly the property the renderer's single descending fold
+    /// depends on.
+    ///
+    /// A folder is skipped if it has nothing in it: an empty group is a row,
+    /// not a bus, and giving it one would put a silent strip in the mix and
+    /// a meter that never moves next to fifteen that do.
+    /// **Make a folder.** Cmd/Ctrl+F, and it means one of two things.
+    ///
+    /// * With **several tracks chosen**: a folder appears ABOVE the topmost
+    ///   of them and takes the whole run into it. That is the gesture people
+    ///   actually make — pick the drums, group the drums — and it is the one
+    ///   that needed a free row to put the folder ON, because membership
+    ///   here is positional: a folder is a row above its children, so making
+    ///   one means finding a spare channel and moving it into place.
+    /// * With **an empty slot chosen**: that slot becomes an empty folder,
+    ///   ready for tracks to be dragged into.
+    ///
+    /// Returns whether anything happened, so the caller can leave the key
+    /// alone when it did not — a shortcut that silently does nothing on a
+    /// full desk is worse than one that does nothing visibly.
+    pub fn make_folder(&mut self) -> bool {
+        use crate::recorder::CHANNELS;
+        let mut sel: Vec<usize> = self
+            .selected_tracks
+            .iter()
+            .copied()
+            .filter(|n| *n < CHANNELS && self.channel_used(*n))
+            .collect();
+        sel.sort_unstable();
+        sel.dedup();
+
+        // ── an empty slot becomes an empty folder ────────────────────────
+        if sel.len() < 2 {
+            let Some(n) = self
+                .selected_channel
+                .filter(|n| *n < CHANNELS && !self.channel_used(*n))
+            else {
+                return false;
+            };
+            self.set_is_folder(n, true);
+            // A folder is a ROW, so it has to exist as one: without this it
+            // is a flag on a slot nothing draws.
+            self.settings.tracks_added |= 1 << n;
+            self.set_in_folder(n, self.folder_of(n).is_some());
+            self.selected_channel = Some(n);
+            self.selected_tracks = vec![n];
+            self.save_settings();
+            self.arr_save_edits();
+            return true;
+        }
+
+        // ── several tracks: a folder above them ──────────────────────────
+        //
+        // The run is `sel[0]..=sel[last]` INCLUSIVE of anything between the
+        // chosen tracks: a folder is a contiguous stretch of rows by
+        // definition, and a group with a hole in it cannot be expressed at
+        // all in a positional model. Taking the whole run is the honest
+        // reading of "encapsulate both".
+        let top = sel[0];
+        let bottom = *sel.last().unwrap_or(&top);
+        let span = bottom - top + 1;
+        // A spare row to BE the folder, taken from the bottom so the search
+        // never disturbs anything above the group.
+        let Some(free) = (0..CHANNELS)
+            .rev()
+            .find(|n| !self.channel_used(*n) && !(top..=bottom).contains(n))
+        else {
+            return false;
+        };
+        // The permutation: everything in order, with the spare lifted out
+        // and put back at `top`. `reorder_channels` reads `order[new] = old`.
+        let mut order: Vec<usize> = (0..CHANNELS).filter(|n| *n != free).collect();
+        let at = order.iter().position(|n| *n == top).unwrap_or(0);
+        order.insert(at, free);
+        self.reorder_channels(&order);
+        // After the move the folder sits at `at` and its run begins directly
+        // below it.
+        self.set_is_folder(at, true);
+        self.settings.tracks_added |= 1 << at;
+        // The folder itself belongs to whatever folder IT landed in, so
+        // nesting a group inside a group works without a second gesture.
+        self.set_in_folder(at, self.folder_of(at).is_some());
+        for i in 0..span {
+            let ch = at + 1 + i;
+            if ch < CHANNELS {
+                self.set_in_folder(ch, true);
+                // A track cannot be a folder and a member at once here: the
+                // nested case is a folder that is itself in one, and that is
+                // the row above, not these.
+                if self.settings.strip_is_folder.get(ch).copied().unwrap_or(false) {
+                    self.set_in_folder(ch, true);
+                }
+            }
+        }
+        self.selected_channel = Some(at);
+        self.selected_tracks = vec![at];
+        self.save_settings();
+        self.arr_save_edits();
+        true
+    }
+
+    pub fn folder_parents(&self) -> [i32; crate::recorder::CHANNELS] {
+        let mut out = [-1i32; crate::recorder::CHANNELS];
+        let is_folder = |n: usize| {
+            self.settings.strip_is_folder.get(n).copied().unwrap_or(false)
+        };
+        let mut nearest: Option<usize> = None;
+        for ch in 0..crate::recorder::CHANNELS {
+            if self.settings.strip_in_folder.get(ch).copied().unwrap_or(false) {
+                if let Some(p) = nearest {
+                    out[ch] = p as i32;
+                }
+            }
+            // Updated AFTER the lookup: a folder that is itself inside a
+            // folder belongs to the one above it, not to itself.
+            if is_folder(ch) {
+                nearest = Some(ch);
+            }
+        }
+        out
     }
 
     pub fn playhead_s(&self) -> f64 {
@@ -33643,6 +33786,82 @@ mod folder_tests {
     ///
     /// The transposition itself still works — this is about where the KEY is
     /// allowed to reach, and the piano is the view that owns it.
+    /// **Cmd/Ctrl+F makes a folder, and it means two things.**
+    ///
+    /// Groups had no keyboard at all — and, until the bus landed, nothing
+    /// behind them either. Several tracks chosen means "group these", and
+    /// the folder has to appear ABOVE them because membership here is
+    /// positional; an empty slot means "start a group here".
+    #[test]
+    fn cmd_f_folders_a_selection_and_opens_an_empty_one_on_a_free_slot() {
+        use crate::recorder::CHANNELS;
+
+        // ── an empty slot ────────────────────────────────────────────────
+        let mut a = app();
+        a.selected_channel = Some(6);
+        a.selected_tracks = vec![6];
+        assert!(!a.channel_used(6), "the fixture's slot 6 is not free");
+        assert!(a.make_folder(), "an empty slot refused to become a folder");
+        assert!(a.settings.strip_is_folder[6], "slot 6 is not a folder");
+        assert!(a.channel_used(6), "the folder is not a row anything draws");
+
+        // ── several tracks ───────────────────────────────────────────────
+        let mut a = app();
+        for n in [2usize, 3, 4] {
+            a.add_bare_track(n);
+        }
+        a.selected_tracks = vec![2, 4];
+        a.selected_channel = Some(2);
+        assert!(a.make_folder(), "a selection refused to be grouped");
+
+        // The folder sits where the topmost track was, and the run it took
+        // in has moved down by one to sit under it.
+        let folder = a.selected_channel.expect("the folder is not selected");
+        assert!(a.settings.strip_is_folder[folder], "no folder was made");
+        assert_eq!(folder, 2, "the folder did not land above the run");
+        for ch in folder + 1..=folder + 3 {
+            assert!(
+                a.settings.strip_in_folder[ch],
+                "channel {ch} was left out of the group"
+            );
+        }
+        // The row below the run is NOT in it: a group is the run it was
+        // given, not everything after it.
+        assert!(
+            !a.settings.strip_in_folder.get(folder + 4).copied().unwrap_or(false),
+            "the group swallowed the row below it"
+        );
+
+        // **And the engine is told.** A folder the renderer never hears
+        // about is the bug this whole piece of work was about.
+        let parents = a.folder_parents();
+        for ch in folder + 1..=folder + 3 {
+            assert_eq!(
+                parents[ch], folder as i32,
+                "channel {ch} does not fold into the folder"
+            );
+        }
+        assert_eq!(parents[folder], -1, "a top-level folder has a parent");
+
+        // ── a full desk refuses rather than lying ────────────────────────
+        let mut full = app();
+        for n in 0..CHANNELS {
+            full.add_bare_track(n);
+        }
+        full.selected_tracks = vec![1, 2];
+        full.selected_channel = Some(1);
+        assert!(
+            !full.make_folder(),
+            "a full desk pretended to make a folder with no row to put it on"
+        );
+        for ch in 0..CHANNELS {
+            assert!(
+                !full.settings.strip_is_folder.get(ch).copied().unwrap_or(false),
+                "a refused folder still marked channel {ch}"
+            );
+        }
+    }
+
     #[test]
     fn transpose_still_works_but_the_arrows_do_not_reach_it_from_the_desk() {
         let mut app = app();
