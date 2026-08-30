@@ -7378,14 +7378,27 @@ impl Engine {
             uri,
             f64::from(self.output.sample_rate),
         )?;
-        // The plugin's own class decides, exactly as `Kind::Instrument` does
-        // for VST3 - a bay asks what the plugin IS, not what the user meant.
-        let voice = info.is_instrument;
-        if !voice && info.audio_in == 0 {
-            // The same refusal the VST3 path makes, for the same reason: an
-            // effect with no audio input would answer with silence for ever.
+        // **The class decides, and where it does not, the plumbing does.**
+        //
+        // LV2's `InstrumentPlugin` class is the direct equivalent of VST3's
+        // `Kind::Instrument` and is checked first. But the class taxonomy is
+        // advisory and plenty of generators do not claim it: the LV2
+        // specification's own `eg-metro` produces audio from nothing and is
+        // classified as neither, so an is-it-an-instrument test alone refused
+        // it as "an effect with no audio input".
+        //
+        // Which is the tell. Whether a bay feeds a plugin the channel or lets
+        // it replace the channel is not a question about taxonomy, it is a
+        // question about wiring: something with NO AUDIO INPUT cannot be an
+        // insert, because there would be nothing to send it. So no-inputs means
+        // voice, and the refusal below is then unreachable by construction —
+        // kept because a plugin that declares neither audio in nor audio out is
+        // still a thing a bay cannot use.
+        let voice = info.is_instrument || info.audio_in == 0;
+        if info.audio_in == 0 && info.audio_out == 0 {
             return Err(format!(
-                "{} has no audio input, so there is nothing to send to it",
+                "{} has neither audio input nor audio output, so a bay has \
+                 nothing to do with it",
                 info.name
             ));
         }
@@ -9312,16 +9325,28 @@ pub fn plugin_test(filter: Option<String>) {
     const MEASURE_SECONDS: f64 = 3.5;
 
     let filter = filter.unwrap_or_else(|| "Pianoteq".to_string());
-    let Some(bundle) = tangent_host::discover().into_iter().find(|p| {
+    let needle = filter.to_lowercase();
+    // VST3 first, by bundle name, which is what this probe has always matched
+    // on. LV2 second, by the plugin's own name, since an LV2 has no file name
+    // to match — and second rather than first so an existing invocation keeps
+    // finding exactly what it used to.
+    let found = tangent_host::discover().into_iter().find(|p| {
         p.file_name()
-            .map(|n| {
-                n.to_string_lossy()
-                    .to_lowercase()
-                    .contains(&filter.to_lowercase())
-            })
+            .map(|n| n.to_string_lossy().to_lowercase().contains(&needle))
             .unwrap_or(false)
-    }) else {
-        eprintln!("no VST3 matching {filter:?}");
+    });
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    let found = found.or_else(|| {
+        tangent_host::lv2::discover()
+            .into_iter()
+            .find(|p| p.name.to_lowercase().contains(&needle))
+            .map(|p| {
+                println!("LV2: {} ({})", p.name, p.uri);
+                tangent_host::lv2::identity_for(&p.uri)
+            })
+    });
+    let Some(bundle) = found else {
+        eprintln!("no VST3 or LV2 plugin matching {filter:?}");
         std::process::exit(1);
     };
 
