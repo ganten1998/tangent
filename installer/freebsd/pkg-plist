@@ -1,0 +1,9 @@
+@comment Files Tangent owns, relative to /usr/local. See installer/freebsd/MANIFEST.in.
+@comment
+@comment Deliberately NOT listed: mimeinfo.cache and icon-theme.cache. Those are
+@comment written by pkg's own desktop-file-utils and gtk-update-icon-cache
+@comment triggers, belong to no package (`pkg which` disowns them), and listing
+@comment a file the package does not own breaks deinstall.
+bin/tangent
+share/applications/tangent.desktop
+share/icons/hicolor/128x128/apps/tangent.png

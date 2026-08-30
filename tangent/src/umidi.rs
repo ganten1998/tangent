@@ -1027,6 +1027,18 @@ mod tests {
     }
 
     #[test]
+    fn the_connection_is_send_because_the_app_requires_it() {
+        // `MidiPorts: Send` (tangent-ui/src/ports.rs) and `DeviceMidi` holds
+        // the connection inside a `Box<dyn MidiPorts>`, so a connection that
+        // is not `Send` fails to compile at the call site with an error
+        // pointing at desktop.rs rather than here. Assert it where the type
+        // lives.
+        fn assert_send<T: Send>() {}
+        assert_send::<MidiInputConnection<()>>();
+        assert_send::<MidiInputPort>();
+    }
+
+    #[test]
     fn enumeration_does_not_panic_without_hardware() {
         // The test box has no keyboard attached most of the time. This must be
         // an empty list, never a panic.
