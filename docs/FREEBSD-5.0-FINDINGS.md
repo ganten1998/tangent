@@ -15,7 +15,7 @@
 > | `cargo test --workspace --features recorder` | **1619 passed, 0 failed**, 56 ignored |
 > | `scripts/check-firewall.sh` | green, Minimal build included |
 > | Installer | ok — a real `.pkg` plus two offline bundles, §9 |
-> | Latency measured | **36.7 ms** round trip on the shim, **28.4 ms** through JACK, §7 |
+> | Latency measured and reduced | **36.7 → 27.6 ms** out of the box, **11.2 ms** through JACK, §7 |
 
 Test box: HP laptop, GhostBSD 26.1 / FreeBSD 15.0-RELEASE-p2 amd64, i5-1135G7
 (8 threads), 8 GB, Realtek ALC236 via `snd_hda`, Iris Xe with DRI + Intel Vulkan
@@ -76,9 +76,13 @@ Measured on the stock system, nothing configured: `aplay`/`arecord` open the
 default PCM through `pcm.!default → plug:oss`, 128- and 256-frame periods are
 accepted, and Tangent itself ran **6721 interrupts with zero underruns** while
 holding a chord. A native OSS backend for cpal is **not** needed to hit the
-out-of-the-box bar. It remains the right long-term answer if the shim's
-raggedness (§2) ever proves to cost real latency, and it would be a genuine
-upstream contribution, but it is not on the critical path.
+out-of-the-box bar.
+
+It is, however, needed to hit a *low-latency* one, and §7 now puts a number on
+that rather than leaving it a suspicion: the shim has a fixed floor of about
+27.6 ms that no setting reaches, against 11.2 ms for the same hardware through
+JACK. Whether that 16 ms is worth writing and maintaining a cpal backend for is
+a judgement, not a measurement — but the measurement is in.
 
 JACK on FreeBSD has a native OSS driver (`jackd -d oss -C /dev/dsp0 -P
 /dev/dsp0`), so the pro-audio story is real and not an emulation. Note it wants
@@ -321,72 +325,102 @@ Tangent opens (`1r:1v` in `sndstat`) — is already proven.
 
 ## 7. Latency, measured on a wired loopback
 
-Measured with `examples/rtlatency` against a **Focusrite Scarlett Solo (3rd
-Gen)** — FreeBSD's `uaudio` claims it natively, no driver work needed — with a
-1/4" cable from a line out into the instrument input, so there is no acoustic
-path and no microphone noise floor in the figure. Round trip is app-writes-a-
-sample to app-sees-it-again: output buffering, DAC, cable, ADC, input
-buffering.
+Measured with `jack_iodelay` and `examples/rtlatency` against a **Focusrite
+Scarlett Solo (3rd Gen)** — claimed natively by `uaudio`, no driver work — with
+a 1/4" cable from a line out into the instrument input, so there is no acoustic
+path in the figure. Round trip is app-writes-a-sample to app-sees-it-again.
 
-| Path | Round trip (median) | Spread |
+### The headline
+
+| Path | Round trip |
+|---|---|
+| ALSA shim, stock | 36.7 ms |
+| ALSA shim, `buffer_ms=1` | **27.6 ms** |
+| JACK, 256-frame period, stock | 32.9 ms |
+| JACK, 256-frame period, `buffer_ms=1` | 20.9 ms |
+| **JACK, 96-frame period, `buffer_ms=1`, realtime** | **11.2 ms** |
+
+From 36.7 ms to 11.2 ms — a factor of three.
+
+### `hw.usb.uaudio.buffer_ms` is worth more than everything else combined
+
+The USB audio driver's buffering delay ships at **4**, with a documented range
+of 1 to 8. Setting it to **1** is the single biggest win available on this
+platform, and it does two things:
+
+* it takes ~9 ms off the round trip on **every** path, including the
+  out-of-the-box one that no other tuning touches at all;
+* it drops the driver's minimum block from **192 frames to 48**, which is what
+  makes small JACK periods legal in the first place. Before it, `jackd -p 128`
+  refused to start with *"period is too small, minimum is 192 frames"*. It is
+  not merely a saving — it is what unlocks the low-latency configurations.
+
+It costs nothing measurable in stability: 45 seconds of the app playing under
+four CPU hogs ran **68,884 interrupts with zero underruns**. `install.sh`
+therefore applies it by default, as one marked, reversible block in
+`/etc/sysctl.conf`, removed again by `--uninstall` and skipped by `--no-tune`.
+
+The setting takes effect when a device **attaches**, so an interface already
+plugged in keeps its old buffering until re-plugged.
+
+### Make the JACK period a multiple of 48
+
+With `buffer_ms=1` the OSS block is 48 frames, and jackd says so itself:
+*"for best results make period a multiple of 48"*. The relationship is exact:
+
+```
+round trip = 3 x period + 233 frames
+```
+
+| period | round trip | underruns |
 |---|---|---|
-| ALSA shim, `BufferSize::Default` | 199.7 ms | 0.3 ms |
-| ALSA shim, `Fixed(1024)` | 37.11 ms | 0.3 ms |
-| ALSA shim, `Fixed(512)` | 37.14 ms | 0.8 ms |
-| ALSA shim, `Fixed(256)` | 37.18 ms | 0.1 ms |
-| ALSA shim, `Fixed(128)` | 37.19 ms | 0.7 ms |
-| **JACK (direct OSS), 256 frames** | **28.40 ms** | 0.6 ms |
-| JACK, 128 frames | driver will not start | — |
+| 64 | 8.9 ms | **9** — not a multiple of 48, and it shows |
+| **96** | **11.2 ms** | 1 |
+| 144 | 13.9 ms | 1 |
+| 192 | 16.9 ms | 1 |
 
-### The three things this says
+64 frames is faster and unstable; 96 is the sweet spot. The residual 233 frames
+(4.9 ms) is hardware and driver, and `buffer_ms` is already at its documented
+minimum, so that is the floor on this machine.
 
-**1. Below 1024 frames, the requested buffer size does not change the
-latency.** Asking for 128 and asking for 1024 both land on ~37 ms. This is the
-same fact the callback-size measurement showed from the other side (§2): the
-shim does not carve a ring into periods and does not honour a period request —
-it hands over whatever is available. So the Audio Setup buffer control is, on
-this path, a control over how much work happens per callback and **not** over
-latency. That is worth knowing before anybody tunes it expecting otherwise.
+### The shim has a fixed floor that no setting reaches
 
-Changing sample rate to the device's native 48 kHz (removing the `plug`
-resampler) moved it by 0.4 ms. Setting `hw.snd.latency=0` moved it by 0.03 ms.
-Neither knob is where the time goes.
+Four things were tried against the out-of-the-box path and **none** of them
+moved it off ~27.6 ms:
 
-**2. The shim costs about 8 ms.** jackd's OSS driver opens `/dev/dsp3`
-directly, so the JACK figure is the same hardware and the same buffer size with
-the alsa-lib layer removed: 28.4 ms against 36.7 ms. That is the price of the
-translation the handoff was right to be suspicious of — real, consistently
-reproducible, and smaller than the 199 ms a naive default costs.
+* requested buffer size, 128 through 1024 — flat, as §2 predicted;
+* the device's native 48 kHz instead of 44.1 kHz (removing the resampler) —
+  worth 0.4 ms;
+* `hw.snd.latency=0`, `hw.snd.usefrags=1`, `bitperfect=1`, vchans disabled —
+  worth under 1 ms between them;
+* the raw **`oss`** device instead of **`default`**, bypassing the `plug`
+  conversion layer entirely — **identical latency, worse jitter** (max 55 ms
+  against 36.8 ms).
 
-**3. Jitter is not the problem.** Every configuration held a spread under a
-millisecond across ten to fifteen clicks. The shim adds latency; it does not
-add instability.
+That last one is the informative one. `default` and `oss` are the same hardware
+down two different paths, and they land on the same number, so the `plug` layer
+is not the cost — the alsa-lib OSS plugin's own buffering is, and it does not
+expose a knob for it.
 
-### What it means for this app
+Worth noting what the two devices *report*, since the Audio Status panel reads
+it: `default` claims a buffer range of `1..=4294967295` and F32; the raw `oss`
+device honestly reports `1..=131072` and I16, which is what the hardware
+actually speaks.
 
-Tangent's headline path is MIDI in, synth out — and that is **output only**.
-The 37 ms round trip contains both directions plus two conversions, so the
-figure that governs how a played note feels is roughly half of it. The full
-round trip governs monitoring a live input, which is the recorder's use.
+**So a native OSS backend for cpal is the only route below ~27 ms without a
+JACK server.** It would be worth roughly 16 ms out of the box and would restore
+meaning to the buffer-size control. That is now a measured conclusion rather
+than a suspicion — and it is still not urgent, because JACK reaches 11.2 ms
+today and the out-of-the-box path works with nothing configured.
 
-For context, the same class of interface reaches roughly 15-20 ms round trip
-under Linux/ALSA and 10-15 ms under CoreAudio, so FreeBSD is about twice the
-latency of the platforms Tangent already ships on. Usable, honestly worse, and
-now a number rather than a worry.
+### On matching Ardour and REAPER
 
-**This is the evidence for a native OSS cpal backend, if one is ever wanted.**
-It would remove the 8 ms the shim costs and — more interestingly — restore
-meaning to the buffer-size control, since OSS itself negotiates fragments
-properly. It remains a genuine upstream contribution and is still not on the
-critical path: JACK already reaches 28 ms today for anyone who needs it, and
-the out-of-the-box path works with nothing configured.
-
-### One caveat on the numbers
-
-256 frames is the floor for jackd's OSS driver on this device — `-p 128` fails
-with "Cannot initialize driver" — and `--excl` (exclusive, direct access,
-bypassing FreeBSD's vchan mixing) changed nothing measurable. So 28 ms is the
-best this box does, not a number to be tuned down further.
+`jack_iodelay` measures the JACK path itself, so 11.2 ms at a 96-frame period
+is the floor for **any** JACK client on this machine — Ardour and REAPER
+included, since on FreeBSD they reach the same OSS hardware through the same
+server. Tangent offers that path through cpal's JACK host with no extra code,
+so it matches them by construction rather than by effort. Beating them would
+mean beating JACK, which is what a native OSS backend would be for.
 
 ---
 

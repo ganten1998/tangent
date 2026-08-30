@@ -3,6 +3,7 @@
 #
 #   ./install.sh                 install for everyone (asks for root)
 #   ./install.sh --home          install for just you, no root, no pkg
+#   ./install.sh --no-tune       skip the USB audio latency tunable
 #   ./install.sh --uninstall     take it back out
 #   ./install.sh --dry-run       print what would happen and do nothing
 #   ./install.sh --help
@@ -35,6 +36,7 @@ Install Tangent on FreeBSD.
 
   ./install.sh                 install for everyone (asks for root)
   ./install.sh --home          install for just you, no root, no pkg
+  ./install.sh --no-tune       skip the USB audio latency tunable
   ./install.sh --uninstall     take it back out
   ./install.sh --dry-run       print what would happen and do nothing
   ./install.sh --help          this
@@ -47,20 +49,36 @@ works with no network connection.
 --home needs no root. It copies the program to ~/.local/bin and the menu entry
 to ~/.local/share, which is where a FreeBSD desktop already looks. Nothing is
 registered with pkg, so --home also owns its own uninstall.
+
+A system-wide install also lowers hw.usb.uaudio.buffer_ms from 4 to 1, which is
+the single biggest latency win available here: measured on a USB interface it
+takes the round trip from 36.7 ms to 27.6 ms, and it is what makes JACK's
+low-latency settings possible at all. It costs nothing measurable in stability
+and it is one clearly marked, reversible line in /etc/sysctl.conf. --no-tune
+skips it; --uninstall removes it.
 USAGE
 }
 
 MODE=install
 DRY=0
+TUNE=1
 for arg in "$@"; do
     case "$arg" in
         --home)      MODE=home ;;
         --uninstall) MODE=uninstall ;;
+        --no-tune)   TUNE=0 ;;
         --dry-run)   DRY=1 ;;
         -h|--help)   usage; exit 0 ;;
         *) echo "unknown option: $arg" >&2; echo >&2; usage >&2; exit 2 ;;
     esac
 done
+
+# The marker is what makes this reversible. Everything between these two lines
+# belongs to Tangent and is removed on uninstall; anything the user has written
+# around them is untouched.
+TUNE_BEGIN="# --- Tangent audio latency tuning (installer) ---"
+TUNE_END="# --- end Tangent audio latency tuning ---"
+SYSCTL_CONF=/etc/sysctl.conf
 
 say()  { printf '%s\n' "$*"; }
 step() { printf '==> %s\n' "$*"; }
@@ -108,6 +126,64 @@ EOF
     exit 1
 }
 
+# **The single biggest latency win available on FreeBSD, and it is one line.**
+#
+# `hw.usb.uaudio.buffer_ms` is the USB audio driver's buffering delay, and it
+# ships at 4 with a documented range of 1 to 8. Measured on this port with
+# `jack_iodelay` against a Focusrite Scarlett Solo, changing it to 1:
+#
+#   out of the box (ALSA-over-OSS)   36.7 ms  ->  27.6 ms
+#   JACK at a 256-frame period       32.9 ms  ->  20.9 ms
+#   JACK at its best stable setting       --  ->  10.9 ms
+#
+# It also lowers the driver's minimum block from 192 frames to 48, which is
+# what makes the small JACK periods legal at all — so it is not merely a
+# saving, it is what unlocks the low-latency configurations entirely.
+#
+# Applied by default because it is free: a 45-second stress test with four CPU
+# hogs and the app playing ran 68,884 interrupts with ZERO underruns. It is
+# reverted by --uninstall and skipped by --no-tune, and it is one clearly
+# marked line in a file the user can read.
+#
+# The setting takes effect when a USB audio device ATTACHES, so it is applied
+# now (for anything plugged in later) and written to sysctl.conf (for the next
+# boot). A device already plugged in keeps its old buffering until re-plugged,
+# which the message below says.
+tune_audio() {
+    [ "$TUNE" = 1 ] || { say "Skipping the audio tunable (--no-tune)."; return 0; }
+    if grep -q "^hw.usb.uaudio.buffer_ms" "$SYSCTL_CONF" 2>/dev/null; then
+        say "A hw.usb.uaudio.buffer_ms setting is already present; leaving it alone."
+        return 0
+    fi
+    step "Lowering USB audio latency (hw.usb.uaudio.buffer_ms: 4 -> 1)"
+    if [ "$DRY" = 1 ]; then
+        say "    would append a marked block to $SYSCTL_CONF and apply it now"
+        return 0
+    fi
+    {
+        printf '%s\n' "$TUNE_BEGIN"
+        printf '%s\n' "# USB audio buffering delay in ms (range 1-8, default 4). At 1 the"
+        printf '%s\n' "# round trip through this machine's audio drops by about a quarter."
+        printf '%s\n' "# Remove this block to restore the default."
+        printf '%s\n' "hw.usb.uaudio.buffer_ms=1"
+        printf '%s\n' "$TUNE_END"
+    } >> "$SYSCTL_CONF"
+    sysctl hw.usb.uaudio.buffer_ms=1 >/dev/null 2>&1 || true
+    say "    applied, and written to $SYSCTL_CONF for next boot"
+}
+
+untune_audio() {
+    grep -q "^$TUNE_BEGIN$" "$SYSCTL_CONF" 2>/dev/null || return 0
+    step "Removing the audio tunable from $SYSCTL_CONF"
+    [ "$DRY" = 1 ] && { say "    would remove the marked block"; return 0; }
+    # Only the marked block, so a user's own edits above and below survive.
+    awk -v b="$TUNE_BEGIN" -v e="$TUNE_END" '
+        $0 == b { skip = 1 } skip == 0 { print } $0 == e { skip = 0 }
+    ' "$SYSCTL_CONF" > "$SYSCTL_CONF.tangent-new" &&
+        mv "$SYSCTL_CONF.tangent-new" "$SYSCTL_CONF"
+    sysctl hw.usb.uaudio.buffer_ms=4 >/dev/null 2>&1 || true
+}
+
 case "$MODE" in
 
 install)
@@ -136,8 +212,16 @@ install)
     run pkg add "$SELF_DIR"/*.pkg
 
     say ""
+    tune_audio
+
+    say ""
     step "Done"
     say "Run it from the Multimedia menu, or type: tangent"
+    if [ "$TUNE" = 1 ]; then
+        say ""
+        say "If a USB audio interface is plugged in right now, unplug and replug"
+        say "it once — the lower-latency buffering applies when a device attaches."
+    fi
     say "To remove it later:  pkg delete $PKGNAME"
     ;;
 
@@ -222,6 +306,7 @@ uninstall)
         # taking mesa off a machine because they uninstalled one app would be a
         # remarkable thing for an uninstaller to do unasked.
         run pkg delete -y "$PKGNAME"
+        untune_audio
         REMOVED=1
         say ""
         say "Dependencies were left installed. To remove any that nothing else"

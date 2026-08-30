@@ -34,7 +34,7 @@
 //! Audio Setup panel, so the same probe compares backends on one box.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -77,13 +77,42 @@ fn main() {
     println!("hosts available : {:?}", cpal::available_hosts().iter().map(|h| h.name()).collect::<Vec<_>>());
     println!("host            : {}", host.id().name());
 
-    let Some(out_dev) = host.default_output_device() else {
-        eprintln!("no output device");
-        return;
+    // `IVORY_AUDIO_DEVICE` picks a device by name instead of taking the
+    // default, which matters more on FreeBSD than anywhere else: the shim
+    // offers "default" (which asound.conf maps to `plug:oss`, adding a
+    // conversion layer) and "oss" (which is the OSS plugin raw). Those are the
+    // same hardware down two different paths, and the difference between them
+    // is worth being able to measure.
+    let want_dev = std::env::var("IVORY_AUDIO_DEVICE").ok().filter(|s| !s.is_empty());
+    let by_name = |name: &str, input: bool| -> Option<cpal::Device> {
+        let iter: Vec<cpal::Device> = if input {
+            host.input_devices().ok()?.collect()
+        } else {
+            host.output_devices().ok()?.collect()
+        };
+        iter.into_iter()
+            .find(|d| d.name().map(|n| n == name).unwrap_or(false))
     };
-    let Some(in_dev) = host.default_input_device() else {
-        eprintln!("no input device");
-        return;
+
+    let out_dev = match &want_dev {
+        Some(n) => match by_name(n, false) {
+            Some(d) => d,
+            None => { eprintln!("no output device named {n:?}"); return; }
+        },
+        None => match host.default_output_device() {
+            Some(d) => d,
+            None => { eprintln!("no output device"); return; }
+        },
+    };
+    let in_dev = match &want_dev {
+        Some(n) => match by_name(n, true) {
+            Some(d) => d,
+            None => { eprintln!("no input device named {n:?}"); return; }
+        },
+        None => match host.default_input_device() {
+            Some(d) => d,
+            None => { eprintln!("no input device"); return; }
+        },
     };
     let out_base = out_dev.default_output_config().expect("no output config");
     let in_base = in_dev.default_input_config().expect("no input config");
@@ -126,104 +155,30 @@ fn main() {
     // quieter than the threshold. Without it the failure is unactionable.
     let peak = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
-    let out_stream = {
-        let sent = sent.clone();
-        let armed = armed.clone();
-        let frame = frame.clone();
-        out_dev
-            .build_output_stream(
-                &out_cfg,
-                move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
-                    let now = Instant::now();
-                    // How far ahead of "now" this buffer will actually be
-                    // heard, from the driver's own timestamps. Added to the
-                    // send stamp so the measurement starts where the sound
-                    // starts, not where the memcpy happened.
-                    let ahead = info
-                        .timestamp()
-                        .playback
-                        .duration_since(&info.timestamp().callback)
-                        .map(|d| d.as_secs_f32())
-                        .unwrap_or(0.0);
-                    let start = frame.fetch_add((data.len() / out_ch) as u64, Ordering::Relaxed);
-                    for (i, f) in data.chunks_mut(out_ch).enumerate() {
-                        let pos = (start + i as u64) % click_period;
-                        let v = if pos < click_len {
-                            // Alternate sign so the click is a sharp edge
-                            // rather than a tone the room can ring with.
-                            if pos % 2 == 0 { 0.9 } else { -0.9 }
-                        } else {
-                            0.0
-                        };
-                        if pos == 0 {
-                            let at = now
-                                + std::time::Duration::from_secs_f32(
-                                    ahead + i as f32 / rate as f32,
-                                );
-                            *sent.lock().unwrap() = Some(at);
-                            armed.store(true, Ordering::Release);
-                        }
-                        for s in f.iter_mut() {
-                            *s = v;
-                        }
-                    }
-                },
-                |e| eprintln!("output stream error: {e}"),
-                None,
-            )
-            .expect("could not open the output stream")
-    };
+    // **Generic over the sample format, because FreeBSD makes it matter.**
+    // The shim's "default" device converts to f32 and reports a nonsense
+    // buffer range; the raw "oss" device is I16 only and reports a real one.
+    // Measuring the second requires speaking its format, so the click writer
+    // and the detector are written once against f32 and converted at the edge.
+    let out_stream = match out_base.sample_format() {
+        cpal::SampleFormat::I16 => build_out::<i16>(
+            &out_dev, &out_cfg, out_ch, rate, click_len, click_period,
+            sent.clone(), armed.clone(), frame.clone()),
+        _ => build_out::<f32>(
+            &out_dev, &out_cfg, out_ch, rate, click_len, click_period,
+            sent.clone(), armed.clone(), frame.clone()),
+    }
+    .expect("could not open the output stream");
 
-    let in_stream = {
-        let sent = sent.clone();
-        let armed = armed.clone();
-        let results = results.clone();
-        let reported = reported.clone();
-        let peak = peak.clone();
-        in_dev
-            .build_input_stream(
-                &in_cfg,
-                move |data: &[f32], info: &cpal::InputCallbackInfo| {
-                    let now = Instant::now();
-                    let loudest = data.iter().fold(0f32, |m, s| m.max(s.abs()));
-                    let bits = (loudest * 1e6) as u32;
-                    peak.fetch_max(bits, Ordering::Relaxed);
-                    // The mirror of the output's `ahead`: how long ago the
-                    // first sample in this buffer was actually captured.
-                    let behind = info
-                        .timestamp()
-                        .callback
-                        .duration_since(&info.timestamp().capture)
-                        .map(|d| d.as_secs_f32())
-                        .unwrap_or(0.0);
-                    if reported.lock().unwrap().is_none() {
-                        *reported.lock().unwrap() = Some(behind * 1000.0);
-                    }
-                    if !armed.load(Ordering::Acquire) {
-                        return;
-                    }
-                    for (i, f) in data.chunks(in_ch).enumerate() {
-                        if f.iter().any(|s| s.abs() >= DETECT) {
-                            let heard = now
-                                - std::time::Duration::from_secs_f32(behind)
-                                + std::time::Duration::from_secs_f32(i as f32 / rate as f32);
-                            let mut slot = sent.lock().unwrap();
-                            if let Some(at) = slot.take() {
-                                armed.store(false, Ordering::Release);
-                                if heard > at {
-                                    let ms = (heard - at).as_secs_f32() * 1000.0;
-                                    results.lock().unwrap().push(ms);
-                                }
-                            }
-                            break;
-                        }
-                    }
-                },
-                |e| eprintln!("input stream error: {e}"),
-                None,
-            )
-            .expect("could not open the input stream")
-    };
+    let in_stream = match in_base.sample_format() {
+        cpal::SampleFormat::I16 => build_in::<i16>(
+            &in_dev, &in_cfg, in_ch, rate, sent.clone(), armed.clone(),
+            results.clone(), reported.clone(), peak.clone()),
+        _ => build_in::<f32>(
+            &in_dev, &in_cfg, in_ch, rate, sent.clone(), armed.clone(),
+            results.clone(), reported.clone(), peak.clone()),
+    }
+    .expect("could not open the input stream");
 
     out_stream.play().expect("could not start output");
     in_stream.play().expect("could not start input");
@@ -275,4 +230,130 @@ fn main() {
         "  ({:.0} frames at {rate} Hz, median)",
         med / 1000.0 * rate as f32
     );
+}
+
+/// A sample this probe can write a click into.
+trait OutSample: cpal::SizedSample + Send + 'static {
+    fn from_f32(v: f32) -> Self;
+}
+impl OutSample for f32 {
+    fn from_f32(v: f32) -> f32 { v }
+}
+impl OutSample for i16 {
+    fn from_f32(v: f32) -> i16 { (v * 32767.0) as i16 }
+}
+
+/// A sample this probe can look for a click in.
+trait InSample: cpal::SizedSample + Send + Copy + 'static {
+    fn to_f32(self) -> f32;
+}
+impl InSample for f32 {
+    fn to_f32(self) -> f32 { self }
+}
+impl InSample for i16 {
+    fn to_f32(self) -> f32 { self as f32 / 32768.0 }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_out<T: OutSample>(
+    dev: &cpal::Device,
+    cfg: &cpal::StreamConfig,
+    out_ch: usize,
+    rate: u32,
+    click_len: u64,
+    click_period: u64,
+    sent: Arc<Mutex<Option<Instant>>>,
+    armed: Arc<AtomicBool>,
+    frame: Arc<AtomicU64>,
+) -> Result<cpal::Stream, cpal::BuildStreamError> {
+    dev.build_output_stream(
+        cfg,
+        move |data: &mut [T], info: &cpal::OutputCallbackInfo| {
+            let now = Instant::now();
+            // How far ahead of "now" this buffer will actually be heard, from
+            // the driver's own timestamps. Added to the send stamp so the
+            // measurement starts where the sound starts, not where the memcpy
+            // happened.
+            let ahead = info
+                .timestamp()
+                .playback
+                .duration_since(&info.timestamp().callback)
+                .map(|d| d.as_secs_f32())
+                .unwrap_or(0.0);
+            let start = frame.fetch_add((data.len() / out_ch) as u64, Ordering::Relaxed);
+            for (i, f) in data.chunks_mut(out_ch).enumerate() {
+                let pos = (start + i as u64) % click_period;
+                // Alternate sign so the click is a sharp edge rather than a
+                // tone the room can ring with.
+                let v = if pos < click_len {
+                    if pos % 2 == 0 { 0.9 } else { -0.9 }
+                } else {
+                    0.0
+                };
+                if pos == 0 {
+                    let at = now
+                        + std::time::Duration::from_secs_f32(ahead + i as f32 / rate as f32);
+                    *sent.lock().unwrap() = Some(at);
+                    armed.store(true, Ordering::Release);
+                }
+                for s in f.iter_mut() {
+                    *s = T::from_f32(v);
+                }
+            }
+        },
+        |e| eprintln!("output stream error: {e}"),
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_in<T: InSample>(
+    dev: &cpal::Device,
+    cfg: &cpal::StreamConfig,
+    in_ch: usize,
+    rate: u32,
+    sent: Arc<Mutex<Option<Instant>>>,
+    armed: Arc<AtomicBool>,
+    results: Arc<Mutex<Vec<f32>>>,
+    reported: Arc<Mutex<Option<f32>>>,
+    peak: Arc<AtomicU32>,
+) -> Result<cpal::Stream, cpal::BuildStreamError> {
+    dev.build_input_stream(
+        cfg,
+        move |data: &[T], info: &cpal::InputCallbackInfo| {
+            let now = Instant::now();
+            let loudest = data.iter().fold(0f32, |m, s| m.max(s.to_f32().abs()));
+            peak.fetch_max((loudest * 1e6) as u32, Ordering::Relaxed);
+            // The mirror of the output's `ahead`: how long ago the first
+            // sample in this buffer was actually captured.
+            let behind = info
+                .timestamp()
+                .callback
+                .duration_since(&info.timestamp().capture)
+                .map(|d| d.as_secs_f32())
+                .unwrap_or(0.0);
+            if reported.lock().unwrap().is_none() {
+                *reported.lock().unwrap() = Some(behind * 1000.0);
+            }
+            if !armed.load(Ordering::Acquire) {
+                return;
+            }
+            for (i, f) in data.chunks(in_ch).enumerate() {
+                if f.iter().any(|s| s.to_f32().abs() >= DETECT) {
+                    let heard = now - std::time::Duration::from_secs_f32(behind)
+                        + std::time::Duration::from_secs_f32(i as f32 / rate as f32);
+                    let mut slot = sent.lock().unwrap();
+                    if let Some(at) = slot.take() {
+                        armed.store(false, Ordering::Release);
+                        if heard > at {
+                            results.lock().unwrap().push((heard - at).as_secs_f32() * 1000.0);
+                        }
+                    }
+                    break;
+                }
+            }
+        },
+        |e| eprintln!("input stream error: {e}"),
+        None,
+    )
 }

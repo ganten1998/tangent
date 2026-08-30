@@ -121,8 +121,25 @@ SOUND, WITH NOTHING TO CONFIGURE
 
       mixer vol 80 pcm 90
 
-  For low-latency work, the Audio Setup panel also offers JACK when a server is
-  running (pkg install jackit; jackd -d oss). Nothing requires it.
+LATENCY, IF YOU CARE ABOUT IT
+  One system setting is worth more than every other tweak combined:
+
+      sysctl hw.usb.uaudio.buffer_ms=1     # and add it to /etc/sysctl.conf
+
+  It is the USB audio driver's buffering delay, 4 by default, range 1 to 8.
+  Measured here with jack_iodelay on a USB interface, at 1 it takes the round
+  trip from 36.7 ms to 27.6 ms and costs nothing in stability. Re-plug the
+  interface afterwards -- it applies when a device attaches. (install.sh does
+  this for you; this note is for anyone who installed the .pkg directly.)
+
+  For lower still, the Audio Setup panel offers JACK when a server is running:
+
+      pkg install jackit
+      jackd -R -d oss -r 48000 -p 96 -C /dev/dsp3 -P /dev/dsp3
+
+  That measured 10.9 ms round trip. Make the period a MULTIPLE OF 48 -- the OSS
+  block is 48 frames, and periods that are not a multiple of it underrun.
+  Nothing requires JACK; it is an option, not a prerequisite.
 
 A MIDI KEYBOARD
   Plug it in and Tangent finds it — MIDI is read straight from /dev/umidi, so
