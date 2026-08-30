@@ -277,9 +277,9 @@ home)
     esac
     say ""
     say "A home install cannot pull in dependencies — pkg is what does that, and"
-    say "it needs root. If Tangent will not start, the one thing it cannot do"
-    say "without is ALSA:"
-    say "    pkg install alsa-lib alsa-plugins"
+    say "it needs root. If Tangent will not start, these are the two it cannot"
+    say "do without: ALSA for sound, lilv for the plugin format FreeBSD has."
+    say "    pkg install alsa-lib alsa-plugins lilv"
     say ""
     say "To remove it:  $0 --uninstall"
     ;;

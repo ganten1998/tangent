@@ -16,9 +16,12 @@
 #
 # The bundles are for machines with no network, and there are two because the
 # honest gap depends on what is already there. On a box that runs a desktop,
-# Xorg and mesa are present and the only things genuinely missing are ALSA —
-# about two megabytes. On a box where somebody installed FreeBSD, added Xorg and
-# nothing else, the closure is the whole graphics stack and runs to hundreds.
+# Xorg and mesa are present and the only things genuinely missing are ALSA and
+# LV2 — about sixty megabytes, nearly all of it lilv's, which depends on
+# libsndfile and so drags in FLAC, Vorbis, Opus and mpg123 whether this host
+# decodes those formats or not. On a box where somebody installed FreeBSD,
+# added Xorg and nothing else, the closure is the whole graphics stack and runs
+# to hundreds.
 # Shipping only the large one punishes every normal user with a download they
 # do not need; shipping only the small one fails the person this port exists
 # for. Both, then, from one .pkg — they differ ONLY in which dependency
@@ -145,16 +148,20 @@ step "Package: $FINAL ($(size "$FINAL"))"
 # shows up on a clean box. Assert it here instead.
 step "Verifying the package declares what the binary needs"
 MANIFEST_JSON="$(tar -xOf "$FINAL" +COMPACT_MANIFEST 2>/dev/null || true)"
-for want in alsa-lib alsa-plugins; do
+# lilv joins them for the same reason and with the same consequence: the binary
+# links liblilv-0.so outright, so a package that forgets it starts nowhere.
+for want in alsa-lib alsa-plugins lilv; do
     case "$MANIFEST_JSON" in
         *"\"$want\""*) printf '    %-14s declared   ok\n' "$want" ;;
         *) die "the manifest does not declare $want" ;;
     esac
 done
-case "$MANIFEST_JSON" in
-    *libasound.so.2*) printf '    %-14s detected   ok\n' "libasound.so.2" ;;
-    *) die "pkg create did not detect libasound.so.2 — is this the right binary?" ;;
-esac
+for lib in libasound.so.2 liblilv-0.so.0; do
+    case "$MANIFEST_JSON" in
+        *"$lib"*) printf '    %-14s detected   ok\n' "$lib" ;;
+        *) die "pkg create did not detect $lib — is this the right binary?" ;;
+    esac
+done
 # The build host is GhostBSD, which packages the base system. A dependency on
 # one of those would produce something that installs only on GhostBSD.
 case "$MANIFEST_JSON" in
@@ -172,9 +179,14 @@ esac
 # DESKTOP is what a machine running a desktop does not already have. COMPLETE is
 # every declared dependency, closure and all, for a machine that has only ever
 # had Xorg installed.
-DESKTOP_DEPS="alsa-lib alsa-plugins"
-COMPLETE_DEPS="alsa-lib alsa-plugins mesa-dri libglvnd libX11 libXcursor libXi \
-               libXrandr libxkbcommon zenity xdg-utils desktop-file-utils \
+#
+# lilv is in BOTH, and in the desktop one for the same reason alsa-lib is: the
+# binary links liblilv-0.so outright, so a machine without it does not start
+# Tangent at all, and a desktop is no more likely to have an LV2 host library
+# than a bare Xorg install is.
+DESKTOP_DEPS="alsa-lib alsa-plugins lilv"
+COMPLETE_DEPS="alsa-lib alsa-plugins lilv mesa-dri libglvnd libX11 libXcursor \
+               libXi libXrandr libxkbcommon zenity xdg-utils desktop-file-utils \
                hicolor-icon-theme ffmpeg"
 
 # pkg fetch writes to the package cache and wants root for it, even with -o.

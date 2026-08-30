@@ -39,8 +39,8 @@ desc = <<EOD
 Tangent watches a MIDI keyboard and tells you what you are playing: the chord
 by name, on the staff, around the circle of fifths, on a guitar neck and in a
 Tonnetz lattice, as you play it. It records audio, MIDI and video takes, hosts
-VST3 plugins and carries its own FM synthesiser, so it makes a sound on a
-machine with nothing else installed.
+LV2 and VST3 plugins and carries its own FM synthesiser, so it makes a sound
+on a machine with nothing else installed.
 
 On FreeBSD it reads MIDI straight from /dev/umidi and plays audio through the
 alsa-lib-over-OSS shim, so a keyboard and a pair of speakers work with nothing
@@ -95,6 +95,15 @@ deps {
   xdg-utils           { origin = "devel/xdg-utils";               version = "1.2.1"; }
   desktop-file-utils  { origin = "devel/desktop-file-utils";      version = "0.28"; }
   hicolor-icon-theme  { origin = "misc/hicolor-icon-theme";       version = "0.18"; }
+  # LV2, which is the plugin format FreeBSD actually has. The ports tree
+  # carries no VST3 plugins at all, so on this platform LV2 is not a bonus
+  # format — it is the only one a user can install from pkg, and a host that
+  # cannot read it reaches nothing. `liblilv-0.so` is linked outright by the
+  # binary, so this decides whether the app STARTS, exactly as alsa-lib does.
+  # Measured with `ldd` and `pkg which`, like every other entry; lilv's own
+  # dependencies (serd, sord, sratom, zix) are left to pkg to resolve, which
+  # is the leaves rule this list already follows.
+  lilv          { origin = "audio/lilv";            version = "0.28.0"; }
   # Video export and import. The app degrades honestly without it — takes still
   # record audio and MIDI — but a DAW that cannot write a video file when the
   # user asks is a support ticket, and ffmpeg is a first-class port.
@@ -141,6 +150,18 @@ LATENCY, IF YOU CARE ABOUT IT
   realtime priority where the system permits it, then `tangent-jack stop` puts
   it away. Choose "JACK" in the Audio Setup panel once it is running.
   Nothing requires it; it is the low-latency option, not a prerequisite.
+
+PLUGINS
+  Tangent hosts LV2 and VST3. On FreeBSD that distinction matters: the ports
+  tree has no VST3 plugins, so LV2 is where everything is. Anything you
+  install from pkg is found automatically the next time Tangent starts --
+  there is nothing to configure and no path to set:
+
+      pkg install dragonfly-reverb calf lsp-plugins x42-plugins
+
+  Plugins with their own window open it inside Tangent; the rest get a
+  generated panel with their real controls and units. Both are in the bay's
+  menu on any channel.
 
 A MIDI KEYBOARD
   Plug it in and Tangent finds it — MIDI is read straight from /dev/umidi, so
