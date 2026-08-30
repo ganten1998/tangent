@@ -61,6 +61,48 @@ Linux
   Your keyboard has to be plugged in and switched on before Tangent can see it —
   ALSA only creates a port for hardware that is actually there.
 
+  Audio out of the box goes through ALSA, which on a PipeWire desktop means
+  PipeWire — nothing to set up. If you run a pro-audio session, Settings ->
+  Audio Setup has a second entry: JACK. Pick it and Tangent becomes an ordinary
+  client of the graph, under the name "Tangent", so its ports show up in
+  qjackctl, Carla or Patchance next to everything else and can be patched into
+  a DAW. It runs on the server's own period and sample rate, so the buffer-size
+  and sample-rate controls have nothing left to do while it is selected — the
+  Audio Status line reports what the server is actually running.
+
+  Pick it to be part of a session, not to chase a smaller number: measured on
+  the machine this was developed on, JACK was not faster than the ordinary ALSA
+  path, and the reasons are written up in the project's notes.
+
+  What it does fix outright is WHICH interface you record. Through ALSA on a
+  PipeWire machine there is only one device Tangent can open, and it follows
+  whatever your desktop's default input happens to be — so changing that
+  default in your system settings silently changes what Tangent records.
+  Through JACK the ports carry your interface's own name and stay where you put
+  them.
+
+  One thing works differently under JACK, and it is the JACK way round rather
+  than a limitation: the input picker shows a single row, "Tangent_in", because
+  that is what Tangent is on the graph. WHICH interface feeds it is decided by
+  the patchbay, not by the picker. Tangent connects itself to the first
+  hardware capture ports it finds when it starts, so there is sound to record
+  straight away; repatch it in qjackctl and the change is immediate. Under
+  ALSA the picker still lists your interfaces by name, exactly as before.
+
+  This works against real jackd and against PipeWire's JACK layer equally —
+  most distributions install the latter by default now, sometimes as a separate
+  package (pipewire-jack on Debian/Ubuntu, pipewire-jack-audio-connection-kit on
+  Fedora). Nothing is required: libjack is opened only if you choose JACK, so a
+  machine without it is not missing anything and the entry falls back to ALSA
+  rather than leaving you in silence.
+
+  If you picked JACK and got ALSA back, PipeWire's libjack is installed
+  somewhere the dynamic loader does not look — some distributions keep it out
+  of the default path deliberately so that it does not shadow a real jackd.
+  Starting Tangent as `pw-jack tangent` is the supported way round that, and it
+  is what the same distributions tell you to do for every other JACK
+  application.
+
   Installing by hand instead:
 
     install -Dm755 tangent         ~/.local/bin/tangent
