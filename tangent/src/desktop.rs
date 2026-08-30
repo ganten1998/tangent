@@ -3469,11 +3469,39 @@ impl DesktopApp {
     #[cfg(feature = "recorder")]
     fn open_project_at_launch(&mut self) {
         let root = self.app.project_root();
-        self.app.bootstrap_project(&root);
-        // The default template exists from the start — the folder New
-        // clones, and the one "Save As Template" named `default` replaces.
-        self.app
-            .seed_template(&self.templates_dir().join("default"));
+        // **The template first.** It is what a launch opens now, so it has
+        // to exist before anything asks for it — it used to be seeded after
+        // the project was already chosen, which was fine while launch
+        // reopened whatever was last on screen.
+        let template = self.templates_dir().join("default");
+        self.app.seed_template(&template);
+        // **Every launch starts on the default template.**
+        //
+        // It reopened the remembered project, so the app came up on whatever
+        // was last touched and a session leaked into the next one. The owner:
+        // "On open, Tangent should ALWAYS start on the default template --
+        // for now, no exceptions."
+        //
+        // Cloned into the working scratch rather than opened in place: the
+        // template is a stencil, and opening it directly would mean every
+        // edit — and every save — writing over the thing every New is made
+        // from. That is the "silently overwriting it" the owner was afraid
+        // of, and it is one line away at all times.
+        let dir = tangent_ui::app::fresh_project_dir(&root);
+        if dir.exists() {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        if copy_dir_all(&template, &dir).is_ok() {
+            self.app.open_project(&dir.join("project.tangent"));
+            if self.app.take_desk_reload() {
+                self.copy_states_from_project();
+                self.force_insert_reload();
+            }
+        } else {
+            // The clone failed — a full disk, a permission. Fall back to
+            // what the app did before rather than opening nothing.
+            self.app.bootstrap_project(&root);
+        }
     }
 
     /// What to do with a chosen folder, whichever picker chose it.
@@ -4863,8 +4891,29 @@ impl DesktopApp {
                 // played, and it is the only thing in this app that cannot be
                 // made a second time. Everything else in there (the document,
                 // the drumpad, the plugin state) genuinely is scratch.
+                // **The scratch warning is gone from the ordinary path.**
+                //
+                // It existed because New reclaimed the unsaved Untitled and
+                // could take recordings with it, and nothing had asked. The
+                // save prompt asks now — before any of this runs, for New,
+                // Open and Quit alike — so a second question here would be
+                // the same question twice, and answering "keep it" minted
+                // `Untitled 2`, then `3`: the owner's "New should not
+                // continuously form untitled 1 2 3 etc if pressed
+                // consecutively."
+                //
+                // Kept for the one case the prompt cannot cover: a scratch
+                // with takes in it that is NOT the session on screen, which
+                // the prompt was never asked about and which nobody has
+                // agreed to lose.
                 let takes = count_media(&dir);
-                if takes > 0 && !asked {
+                let is_current = self
+                    .app
+                    .project_doc()
+                    .and_then(std::path::Path::parent)
+                    .map(|p| p == dir)
+                    .unwrap_or(false);
+                if takes > 0 && !asked && !is_current {
                     // Ask, and do nothing else this frame. The answer comes
                     // back as `NewKeeping` or `NewDiscarding`.
                     self.app.warn_about_scratch(tangent_ui::ports::ScratchWarning {
@@ -7325,6 +7374,25 @@ impl eframe::App for DesktopApp {
         self.app.set_os_aspect_lock(facts.os_aspect_lock);
         self.reconcile_screen_cover(ctx, frame);
         self.reconcile_decoration_size(frame);
+        // **The window is closing — is that all right?**
+        //
+        // With the autosave gone, a close is the last chance to keep an
+        // afternoon's work, so it is intercepted and handed to the same
+        // prompt New and Open use. `CancelClose` holds the window open while
+        // the question is on screen; the answer either lets it go or does
+        // not. Asked BEFORE the frame is drawn, so the dialog appears in the
+        // same frame the close was requested in.
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if self.app.intercept_quit() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            }
+        }
+        // The prompt said go: close for real. A second `close_requested`
+        // would be intercepted again, so the app's own flag is what carries
+        // the answer across.
+        if self.app.take_quit_now() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         // **The first frame is the SPLASH and nothing else.**
         //
         // The app's first `frame` costs about a second — the font atlas is
@@ -7448,10 +7516,19 @@ impl eframe::App for DesktopApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.recorder.session.stop();
         self.save_plugin_states();
-        // The session folder keeps everything it had: the desk into the
-        // document, the plugins' knobs into its own state shelf.
+        // **The document is NOT written here.**
+        //
+        // It used to be, unconditionally, which meant quitting always kept
+        // the session whether or not that was wanted — an autosave at the
+        // last possible moment, and the one that made "Save changes before
+        // quitting?" a question with no consequences. The prompt owns that
+        // decision now; by the time this runs it has already been answered.
+        //
+        // The plugin STATES still go, because they are not the document:
+        // they are the shelf a loaded plugin keeps its knobs on, and losing
+        // them would mean a project that opens with its instruments reset
+        // even when the answer was Save.
         self.copy_states_to_project();
-        self.app.save_project_doc();
     }
 }
 

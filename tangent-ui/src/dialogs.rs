@@ -279,6 +279,23 @@ pub enum Dialog {
         title: String,
         body: String,
     },
+    /// **Unsaved work is about to be lost.**
+    ///
+    /// New, Open and Quit all raise this and all carry on afterwards. It
+    /// exists because the autosave is gone: every edit used to reach the
+    /// disk within a frame, so there was never a change to lose and never a
+    /// question to ask. Now there is.
+    ///
+    /// Three answers and no fourth. Cancel is the one this dialog must NOT
+    /// have as an afterthought — it is drawn like every other dialog's, and
+    /// it means "I did not mean to do that", which is the commonest reason
+    /// anybody reads this box at all.
+    SaveChanges {
+        /// What is waiting: "quitting", "opening another project".
+        what: String,
+        /// The project's own name, so the question names the thing at risk.
+        name: String,
+    },
     MidiError {
         message: String,
     },
@@ -588,6 +605,11 @@ impl ConfirmChoice {
 /// keep one alive across the frames the dialog is open.
 #[derive(Clone)]
 pub enum DialogAction {
+    /// The unsaved-changes prompt's four answers. See `Dialog::SaveChanges`.
+    SaveChangesSave,
+    SaveChangesSaveAs,
+    SaveChangesDiscard,
+    SaveChangesCancel,
     /// Show or hide one automation lane. The `String` is `AutoParam::key()`.
     AutomationToggle(usize, String),
     /// Expand or collapse one heading in the automation menu.
@@ -4113,6 +4135,57 @@ pub fn show(
                             ui.add_space((ui.available_height() - 30.0).max(0.0));
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if ui.button("OK").clicked() {
+                                    result.close = true;
+                                }
+                            });
+                        });
+                },
+            )
+        }
+
+        Dialog::SaveChanges { what, name } => {
+            let stock = stock_style(ctx);
+            let what = what.clone();
+            let name = name.clone();
+            show_dialog_viewport(
+                ctx,
+                placement,
+                "Unsaved changes",
+                Vec2::new(470.0, 190.0),
+                Vec2::new(360.0, 150.0),
+                |ui, result| {
+                    *ui.style_mut() = stock.clone();
+                    let bg = ui.style().visuals.window_fill;
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, bg);
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::same(12))
+                        .show(ui, |ui| {
+                            ui.label(format!("Save changes to \u{201c}{name}\u{201d} before {what}?"));
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    "Changes since the last save will be lost otherwise.",
+                                )
+                                .weak(),
+                            );
+                            ui.add_space((ui.available_height() - 30.0).max(0.0));
+                            // Right to left: the SAFE answer is rightmost,
+                            // where the eye lands and the hand goes.
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.button("Save").clicked() {
+                                    action = Some(DialogAction::SaveChangesSave);
+                                    result.close = true;
+                                }
+                                if ui.button("Save As...").clicked() {
+                                    action = Some(DialogAction::SaveChangesSaveAs);
+                                    result.close = true;
+                                }
+                                if ui.button("Discard").clicked() {
+                                    action = Some(DialogAction::SaveChangesDiscard);
+                                    result.close = true;
+                                }
+                                if ui.button("Cancel").clicked() {
+                                    action = Some(DialogAction::SaveChangesCancel);
                                     result.close = true;
                                 }
                             });
