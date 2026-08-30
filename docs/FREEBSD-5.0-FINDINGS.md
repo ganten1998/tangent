@@ -98,6 +98,26 @@ callback`** through this shim. A capture path with genuinely zero latency does
 not exist, so the driver's own timestamps are not usable as a latency source
 here. This is exactly why §7's measurement is by click and not by asking.
 
+### JACK, verified end to end
+
+`jackd --no-realtime -d oss -r 48000 -p 1024 -w 16 -C /dev/dsp0 -P /dev/dsp0`
+starts on this box and reports `DSP_CAP_REALTIME`, `DSP_CAP_TRIGGER`,
+`DSP_CAP_MMAP` against "FreeBSD native OSS ABI" — the pro-audio path is a real
+driver, not an emulation. cpal then opens both directions through it:
+
+| | `buffer_size` reported | capture latency claimed |
+|---|---|---|
+| ALSA shim | `1 ..= 4294967295` | `0.00 ms` |
+| JACK | `1024 ..= 1024` | `0.10 ms` |
+
+**JACK tells the truth where the shim does not**, which matters beyond taste:
+the Audio Status panel reads these numbers. It also independently confirms
+`BUFFER_PERIODS = 1`. Under JACK the clamp lands on the real 1024-frame period
+and the app reports 1024. With Linux's `4` the same code would have reported
+`1024 / 4 = 256` for a callback that is genuinely 1024 frames — the panel would
+have been lying by a factor of four on the one backend that had given it
+honest figures.
+
 ### What the shim actually does — measure this, do not assume it
 
 `aplay -l` reports **no soundcards at all**; `aplay -L` offers only `null` and
