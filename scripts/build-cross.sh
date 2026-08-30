@@ -235,12 +235,38 @@ sign_windows_exe() {
 # toolchain and are actually a version skew. Bullseye is glibc 2.31, below the
 # floor, so nothing it references is newer than what we target.
 #
-# Cached, because it is 400 kB a time and nobody wants a download in a release
-# build. Delete the directory to refresh it.
+# **And LILV, since LV2 arrived.** `lilv` is the reference LV2 host library and
+# the crate of that name has a build script that asks pkg-config for `lilv-0`
+# — so from the moment LV2 was hosted, a Linux cross build died in that build
+# script, before the linker was ever reached. (The FreeBSD session's brief
+# predicted a link-time missing `.so`; that is true of `lilv-sys`, which ships
+# pre-generated bindings, but the safe wrapper in the graph is `lilv 0.2.4`
+# and it does run pkg-config.) `lilv-0.pc` in turn requires serd, sord,
+# sratom and the LV2 headers, so all four come too — a missing `Requires:`
+# fails exactly as loudly as a missing library.
+#
+# Cached, because it is a megabyte a time and nobody wants a download in a
+# release build. Delete the directory to refresh it.
 ALSA_CACHE="${ALSA_CACHE:-$HOME/.cache/tangent/alsa}"
+# The runtime halves carry the `.so.N` the linker follows; the `-dev` halves
+# carry the headers, the bare `.so` symlink and the `.pc` files that make
+# pkg-config answer at all. Both halves of each, or the build script finds a
+# library it cannot describe.
+SYSROOT_PKGS="libasound2 libasound2-dev \
+libserd-0-0 libserd-dev libsord-0-0 libsord-dev \
+libsratom-0-0 libsratom-dev liblilv-0-0 liblilv-dev lv2-dev"
 ensure_alsa_sysroot() { # $1 = debian arch (amd64|arm64)
   local darch="$1" root="$ALSA_CACHE/bullseye-$1"
-  if [ -d "$root/usr/include" ]; then echo "$root"; return 0; fi
+  # **The stamp, not the directory.** This asked whether `usr/include` existed,
+  # which an ALSA-only sysroot cached before LV2 also answers yes to — so
+  # adding lilv to the list would have been ignored on every machine that had
+  # ever built Linux before, and the failure would have looked like the list
+  # was wrong rather than stale. The stamp names what was actually fetched.
+  if [ -f "$root/.tangent-sysroot" ] \
+     && [ "$(cat "$root/.tangent-sysroot")" = "$SYSROOT_PKGS" ]; then
+    echo "$root"; return 0
+  fi
+  rm -rf "$root"
   local idx tmp fn base
   tmp="$(mktemp -d)" || return 1
   idx="$tmp/Packages.gz"
@@ -248,10 +274,7 @@ ensure_alsa_sysroot() { # $1 = debian arch (amd64|arm64)
     "http://deb.debian.org/debian/dists/bullseye/main/binary-$darch/Packages.gz" \
     -o "$idx" || { rm -rf "$tmp"; return 1; }
   mkdir -p "$root" || { rm -rf "$tmp"; return 1; }
-  # `libasound2` carries the .so.2, `libasound2-dev` the headers and the
-  # development symlink. Both are needed: the linker follows the symlink and
-  # the build script reads the headers.
-  for pkg in libasound2 libasound2-dev; do
+  for pkg in $SYSROOT_PKGS; do
     fn="$(gunzip -c "$idx" | awk -v p="Package: $pkg" '''$0==p{f=1} f&&/^Filename: /{print $2; exit}''')"
     [ -n "$fn" ] || { rm -rf "$tmp" "$root"; return 1; }
     base="$tmp/$(basename "$fn")"
@@ -261,6 +284,7 @@ ensure_alsa_sysroot() { # $1 = debian arch (amd64|arm64)
       || { rm -rf "$tmp" "$root"; return 1; }
   done
   rm -rf "$tmp"
+  printf '%s' "$SYSROOT_PKGS" > "$root/.tangent-sysroot"
   echo "$root"
 }
 
