@@ -8971,13 +8971,20 @@ impl IvoryApp {
 
     fn arr_open_automation_menu(&mut self, lane: usize) {
         use crate::automation::AutoParam;
-        if lane >= crate::recorder::CHANNELS {
+        let master = lane == crate::arrangement_panel::MASTER_LANE;
+        if lane >= crate::recorder::CHANNELS && !master {
             return;
         }
+        // **The master offers what the master HAS.** It is the end of the
+        // chain: there is nothing past it to pan into and nothing to send
+        // to, and a menu that listed them would be offering two rows that
+        // could never do anything. Its fader is the one desk control it
+        // really has, and its bays are real.
         let desk = dialogs::AutoGroup {
             name: "Desk".to_owned(),
             rows: AutoParam::ALL
                 .into_iter()
+                .filter(|p| !master || matches!(p, AutoParam::Gain))
                 .map(|p| dialogs::AutoRow {
                     key: p.key(),
                     label: p.label(),
@@ -8986,8 +8993,15 @@ impl IvoryApp {
                 .collect(),
         };
         let mut groups = vec![desk];
+        // The master's plugin bays are its own seat's, which is not `lane`
+        // — `MASTER_LANE` is a number for the automation store, not a strip.
+        let bay_owner = if master {
+            crate::recorder::MASTER_SEAT
+        } else {
+            lane
+        };
         for bay in 0..crate::recorder::INSERTS {
-            let Some(fx) = self.fx_params(lane, bay) else {
+            let Some(fx) = self.fx_params(bay_owner, bay) else {
                 continue;
             };
             let name = if fx.name.is_empty() {
@@ -15944,6 +15958,53 @@ impl IvoryApp {
                 crate::recorder::NumField::MeterAt(bar) => Some((bar, e.text.as_str())),
                 _ => None,
             }),
+            // **The master's own automation rows**, built exactly as a
+            // lane's are — same `AutoView`, same resolution of label,
+            // resting value, arm and bypass — so the row that appears under
+            // the master is a track's row in every respect but its subject.
+            master_automation: self
+                .arr_auto_rows(crate::arrangement_panel::MASTER_LANE)
+                .into_iter()
+                .enumerate()
+                .map(|(slot, param)| crate::arrangement_panel::AutoView {
+                    param,
+                    label: self.auto_param_label(crate::arrangement_panel::MASTER_LANE, param),
+                    selected: self.arr_auto_sel
+                        == Some((crate::arrangement_panel::MASTER_LANE, slot)),
+                    resting: self.auto_resting(crate::arrangement_panel::MASTER_LANE, param),
+                    armed: self
+                        .arr_auto_armed
+                        .contains(&(crate::arrangement_panel::MASTER_LANE, param)),
+                    bypassed: self
+                        .arr_auto_bypassed
+                        .contains(&(crate::arrangement_panel::MASTER_LANE, param)),
+                    points: self
+                        .arrangement
+                        .automation
+                        .get(crate::arrangement_panel::MASTER_LANE, param)
+                        .map_or(&[][..], crate::automation::Curve::points),
+                    hot: self
+                        .arr_auto_hot
+                        .filter(|(l, _)| *l == crate::arrangement_panel::MASTER_LANE)
+                        .map(|(_, i)| i),
+                    chosen: self
+                        .arr_auto_nodes
+                        .iter()
+                        .filter(|(l, s, _)| {
+                            *l == crate::arrangement_panel::MASTER_LANE && *s == slot
+                        })
+                        .map(|(_, _, i)| *i)
+                        .collect(),
+                    moving: match self.arr_drag {
+                        Some(ArrDrag::AutoPoint(l, s, i))
+                            if l == crate::arrangement_panel::MASTER_LANE && s == slot =>
+                        {
+                            Some(i)
+                        }
+                        _ => None,
+                    },
+                })
+                .collect(),
             lanes: std::array::from_fn(|n| {
                 let kind = self.channel_kind(n);
                 crate::arrangement_panel::LaneView {
@@ -16349,6 +16410,28 @@ impl IvoryApp {
     /// middle would draw a line the plugin is not on.
     fn auto_resting(&self, lane: usize, param: crate::automation::AutoParam) -> f64 {
         use crate::automation::AutoParam;
+        // **The master reads its own controls**, not `channel_gains[16]`,
+        // which does not exist. Its rows are a track's in every other
+        // respect; this is the one place the subject differs.
+        if lane == crate::arrangement_panel::MASTER_LANE {
+            return match param {
+                AutoParam::Gain => {
+                    f64::from(recorder::gain_to_fader(self.settings.master_gain as f32))
+                }
+                // The master is the end of the chain: it has no pan and
+                // nothing to send to. The rows are not offered — see
+                // `master_auto_params` — and this is the belt to that
+                // brace, so a curve read out of an older document cannot
+                // move a control that is not there.
+                AutoParam::Pan => 0.5,
+                AutoParam::Send => 0.0,
+                AutoParam::Mute => 0.0,
+                AutoParam::Plugin { bay, id } => self
+                    .fx_params(crate::recorder::MASTER_SEAT, usize::from(bay))
+                    .and_then(|fx| fx.params.iter().find(|q| q.id == id))
+                    .map_or(0.5, |q| q.default_normalised.clamp(0.0, 1.0)),
+            };
+        }
         match param {
             AutoParam::Gain => {
                 let g = self.settings.channel_gains.get(lane).copied().unwrap_or(1.0);
@@ -34018,6 +34101,70 @@ mod folder_tests {
             "an inner group's track was cut loose instead of joining the outer one"
         );
         assert_eq!(b.folder_parents()[2], 0, "it did not join the outer folder");
+    }
+
+    /// **The master automates like any track.**
+    ///
+    /// It is a bus, not one of the sixteen channels, so it had no row, no
+    /// menu and nowhere to keep a curve. The owner wants the tempo map to
+    /// live in the master's automation, and "the master needs all automation
+    /// parameters available for this to work" — this is that lane, built the
+    /// same way a track's is so the tempo has somewhere to arrive.
+    #[test]
+    fn the_master_owns_automation_rows_like_a_track_does() {
+        use crate::arrangement_panel::MASTER_LANE;
+        use crate::automation::{AutoParam, Point, Shape};
+        let mut a = app();
+
+        // Nothing showing to begin with.
+        assert!(a.arr_auto_rows(MASTER_LANE).is_empty());
+
+        // Opening one seeds a node at the start, exactly as a track's does.
+        a.arr_toggle_automation_param(MASTER_LANE, AutoParam::Gain);
+        assert_eq!(a.arr_auto_rows(MASTER_LANE), vec![AutoParam::Gain]);
+        let pts = a
+            .arrangement
+            .automation
+            .get(MASTER_LANE, AutoParam::Gain)
+            .expect("the master's curve was not made")
+            .points()
+            .to_vec();
+        assert_eq!(pts.len(), 1, "the master's lane did not open with one node");
+        assert!(pts[0].at_s.abs() < 1e-9);
+
+        // **Its resting value is the MASTER's fader**, not `channel_gains`
+        // at an index that does not exist.
+        a.settings.master_gain = 0.25;
+        let resting = a.auto_resting(MASTER_LANE, AutoParam::Gain);
+        let want = f64::from(recorder::gain_to_fader(0.25));
+        assert!(
+            (resting - want).abs() < 1e-9,
+            "the master's row read {resting}, its fader is at {want}"
+        );
+
+        // The curve is document state and survives a round trip, which is
+        // what puts it on the undo timeline and in the saved project.
+        a.arrangement.automation.entry(MASTER_LANE, AutoParam::Gain).put(Point {
+            at_s: 4.0,
+            value: 0.1,
+            shape: Shape::Linear,
+        });
+        let json = a.arrangement.to_json();
+        let back = crate::arrangement::Arrangement::from_json(&json);
+        assert_eq!(
+            back.automation
+                .get(MASTER_LANE, AutoParam::Gain)
+                .map_or(0, |c| c.points().len()),
+            2,
+            "the master's curve did not survive the document"
+        );
+
+        // And the rows reach the panel, which is what draws them under the
+        // master row.
+        let clips = a.arr_clip_views();
+        let view = a.arrange_view(&clips);
+        assert_eq!(view.master_automation.len(), 1, "the panel was not given the row");
+        assert_eq!(view.master_automation[0].param, AutoParam::Gain);
     }
 
     #[test]
