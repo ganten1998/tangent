@@ -53,8 +53,16 @@ pkg install rust git pkgconf alsa-lib alsa-plugins alsa-utils jackit \
 ## 1. The audio route, and why
 
 **Recommendation: cpal's ALSA host over FreeBSD's alsa-lib-to-OSS shim for
-out-of-the-box, JACK available beside it for pro audio. No new backend, no
-patched cpal.** This is what the branch does.
+out-of-the-box, with a native OSS host and JACK offered beside it.** The Audio
+Setup panel therefore reads `["JACK", "ALSA", "OSS"]`, the default is still
+ALSA, and a user who never opens that panel is unaffected.
+
+That recommendation started as "no new backend, no patched cpal", which was
+right for the out-of-the-box bar and wrong for a latency one. §7 has the
+measurements that changed it: the shim floors at 27.5 ms whatever you ask of
+it, and the OSS host reaches 8.1 ms with no server running. The shim stays the
+default because it mixes — it lets a second application make sound at the same
+time — and that is the right default for a machine somebody just installed.
 
 Two upstream facts decide it, both verified in the vendored crate sources
 rather than taken on trust:
