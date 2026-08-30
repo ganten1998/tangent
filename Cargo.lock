@@ -3389,7 +3389,7 @@ dependencies = [
 
 [[package]]
 name = "tangent"
-version = "5.0.0-beta.9"
+version = "5.0.0-beta.10"
 dependencies = [
  "core-graphics",
  "cpal",
@@ -3421,7 +3421,7 @@ dependencies = [
 
 [[package]]
 name = "tangent-core"
-version = "5.0.0-beta.9"
+version = "5.0.0-beta.10"
 dependencies = [
  "dirs",
  "ed25519-compact",
@@ -3431,7 +3431,7 @@ dependencies = [
 
 [[package]]
 name = "tangent-host"
-version = "5.0.0-beta.9"
+version = "5.0.0-beta.10"
 dependencies = [
  "libc",
  "objc2 0.6.4",
@@ -3445,7 +3445,7 @@ dependencies = [
 
 [[package]]
 name = "tangent-record"
-version = "5.0.0-beta.9"
+version = "5.0.0-beta.10"
 dependencies = [
  "cpal",
  "dispatch2",
@@ -3464,7 +3464,7 @@ dependencies = [
 
 [[package]]
 name = "tangent-ui"
-version = "5.0.0-beta.9"
+version = "5.0.0-beta.10"
 dependencies = [
  "dirs",
  "egui",

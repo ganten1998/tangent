@@ -9243,6 +9243,22 @@ impl IvoryApp {
         }
     }
 
+    /// **Which rack a master automation bay number names.**
+    ///
+    /// The master's strip carries six slots across two seats. Bays 0..2 are
+    /// the ORIGINAL rack's, which is where every curve already written
+    /// points, and 3..5 are the rack that was added later. Appending rather
+    /// than renumbering is what keeps a saved curve on the plugin it was
+    /// drawn for — `AutoParam` keys are persisted, so a bay that changed
+    /// meaning would silently move somebody's automation to another plugin.
+    fn master_bay(bay: usize) -> (usize, usize) {
+        if bay < crate::recorder::INSERTS {
+            (crate::recorder::MASTER_SEAT, bay)
+        } else {
+            (crate::recorder::MASTER_EXTRA_SEAT, bay - crate::recorder::INSERTS)
+        }
+    }
+
     fn arr_open_automation_menu(&mut self, lane: usize) {
         use crate::automation::AutoParam;
         let master = lane == crate::arrangement_panel::MASTER_LANE;
@@ -9267,15 +9283,24 @@ impl IvoryApp {
                 .collect(),
         };
         let mut groups = vec![desk];
-        // The master's plugin bays are its own seat's, which is not `lane`
-        // — `MASTER_LANE` is a number for the automation store, not a strip.
-        let bay_owner = if master {
-            crate::recorder::MASTER_SEAT
-        } else {
-            lane
-        };
-        for bay in 0..crate::recorder::INSERTS {
-            let Some(fx) = self.fx_params(bay_owner, bay) else {
+        // **The master has SIX bays, in two racks, and both are offered.**
+        //
+        // Its strip grew three more (`MASTER_EXTRA_SEAT`) and this menu only
+        // ever walked the original seat, so half of the master's plugins
+        // could not be automated at all — the owner's "expose all of the
+        // master's automations".
+        //
+        // The numbering APPENDS: 0..2 stay the original rack's, exactly
+        // where they have always pointed, and the new rack takes 3..5. A
+        // saved curve therefore still names the plugin it was drawn for.
+        // `master_bay` is the one place that rule lives.
+        for bay in 0..crate::recorder::INSERTS * if master { 2 } else { 1 } {
+            let (bay_owner, seat_bay) = if master {
+                Self::master_bay(bay)
+            } else {
+                (lane, bay)
+            };
+            let Some(fx) = self.fx_params(bay_owner, seat_bay) else {
                 continue;
             };
             let name = if fx.name.is_empty() {
@@ -16398,6 +16423,10 @@ impl IvoryApp {
                 self.recorder.master.right.peak,
             ],
             master_color: self.strip_color(crate::recorder::MASTER_SEAT),
+            accent: {
+                let c = self.settings.white_key_active_color;
+                (c.r, c.g, c.b)
+            },
             master_knob: {
                 let c = self.settings.master_knob_color;
                 (c.r, c.g, c.b)
@@ -16933,8 +16962,10 @@ impl IvoryApp {
                 AutoParam::Pan => 0.5,
                 AutoParam::Send => 0.0,
                 AutoParam::Mute => 0.0,
-                AutoParam::Plugin { bay, id } => self
-                    .fx_params(crate::recorder::MASTER_SEAT, usize::from(bay))
+                AutoParam::Plugin { bay, id } => {
+                    let (seat, b) = Self::master_bay(usize::from(bay));
+                    self.fx_params(seat, b)
+                }
                     .and_then(|fx| fx.params.iter().find(|q| q.id == id))
                     .map_or(0.5, |q| q.default_normalised.clamp(0.0, 1.0)),
             };

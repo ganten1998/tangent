@@ -2175,6 +2175,75 @@ mod shot {
         println!("wrote {out}");
     }
 
+    /// The LAUNCH SPLASH, rendered offscreen exactly as the window draws it.
+    ///
+    ///   IVORY_SHOT=/tmp/splash.png cargo test -p tangent --bins shot::splash \
+    ///     --features recorder -- --ignored --nocapture
+    ///
+    /// Through the same compositor and the same painter the host hands the
+    /// splash at launch, so what lands in the file is the drawing itself
+    /// rather than a redrawing of it. `fade` is 1.0: fully up, which is what
+    /// it looks like for all but its last few frames.
+    #[test]
+    #[ignore = "writes a file; run on purpose"]
+    fn splash() {
+        let Ok(out) = std::env::var("IVORY_SHOT") else {
+            eprintln!("IVORY_SHOT not set");
+            return;
+        };
+        // SAFETY: single-threaded test setup, before any app exists.
+        unsafe {
+            std::env::set_var(
+                "IVORY_SETTINGS_PATH",
+                std::env::temp_dir().join(format!("tangent-shot-settings-{}.json", std::process::id())),
+            );
+        }
+        // The window's own shape at 100%: the splash fills it.
+        let (w, h) = (1300u32, 863u32);
+        let mut c = match Compositor::standalone(w, h) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("no GPU here: {e}");
+                return;
+            }
+        };
+        let settings = tangent_ui::settings::Settings::default();
+        let app = IvoryApp::new(c.context(), settings, tangent_ui::host::Caps::DESKTOP);
+        let mut shoot = |app: &IvoryApp| {
+            let draw = |painter: &egui::Painter, rect: egui::Rect| {
+                // The app's own black under it, exactly as the host paints
+                // before handing the splash its rect — the splash draws no
+                // ground of its own.
+                painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(0x0B, 0x0B, 0x0B));
+                tangent_ui::splash::draw(painter, rect, 1.0);
+            };
+            c.frame_painting(
+                app,
+                Layout::default(),
+                DisplayShows::default(),
+                false,
+                true,
+                None,
+                0,
+                Some(&draw),
+            )
+            .and_then(|_| c.flush())
+            .map(|_| ())
+        };
+        for _ in 0..2 {
+            if let Err(e) = shoot(&app) {
+                eprintln!("frame: {e}");
+                return;
+            }
+        }
+        let Some(px) = c.last_frame() else {
+            eprintln!("nothing came back");
+            return;
+        };
+        write_png(std::path::Path::new(&out), &px[..(h * w * 4) as usize], w, h);
+        println!("wrote {out}");
+    }
+
     /// A minimal RGBA PNG, so this needs no image crate.
     fn write_png(path: &std::path::Path, rgba: &[u8], w: u32, h: u32) {
         fn crc(bytes: &[u8]) -> u32 {
