@@ -15,7 +15,7 @@
 > | `cargo test --workspace --features recorder` | **1619 passed, 0 failed**, 56 ignored |
 > | `scripts/check-firewall.sh` | green, Minimal build included |
 > | Installer | ok — a real `.pkg` plus two offline bundles, §9 |
-> | Latency measured and reduced | **36.7 ms → 8.1 ms**: native OSS host, no server needed, §7 |
+> | Latency measured and reduced | **36.7 ms → 8.1 ms** native OSS, past Ardour's 11.2 ms floor, §7 |
 
 Test box: HP laptop, GhostBSD 26.1 / FreeBSD 15.0-RELEASE-p2 amd64, i5-1135G7
 (8 threads), 8 GB, Realtek ALC236 via `snd_hda`, Iris Xe with DRI + Intel Vulkan
@@ -469,14 +469,37 @@ Idle, all three run clean. This is the ordinary low-latency bargain rather than
 a defect, `CPAL_OSS_FRAGMENTS` moves the dial, and the real answer for load
 robustness is realtime scheduling, which FreeBSD has via `mac_priority(4)`.
 
-### On matching Ardour and REAPER
+### Against Ardour and REAPER, checked rather than assumed
 
-`jack_iodelay` measures the JACK path itself, so 11.2 ms at a 96-frame period
-is the floor for **any** JACK client on this machine — Ardour and REAPER
-included, since on FreeBSD they reach the same OSS hardware through the same
-server. Tangent offers that path through cpal's JACK host with no extra code,
-so it matches them by construction rather than by effort. Beating them would
-mean beating JACK, which is what a native OSS backend would be for.
+The reasoning was going to be "`jack_iodelay` measures the JACK path itself, so
+11.2 ms bounds any JACK client, Ardour included". That is true and it
+undersells the result, because **Ardour on FreeBSD has no non-JACK path at
+all.** `ardour-8.12.0_3` ships exactly two backends:
+
+```
+/usr/local/lib/ardour8/backends/libdummy_audiobackend.so
+/usr/local/lib/ardour8/backends/libjack_audiobackend.so
+```
+
+and depends on `jackit`, not on `alsa-lib`. Dummy is a null device for offline
+editing. So a fresh `pkg install ardour` cannot make a sound until the user has
+also installed JACK, started a server, and — to get near 11 ms rather than 33 —
+discovered `hw.usb.uaudio.buffer_ms` and the multiple-of-48 period rule, neither
+of which is documented anywhere outside this report.
+
+**REAPER has no FreeBSD port at all.** `pkg search reaper` returns
+`tmpreaper`, a file-cleanup utility.
+
+| | audio on a fresh install | best measured | needs a server |
+|---|---|---|---|
+| **Tangent** | **yes — 27.5 ms, nothing configured** | **8.1 ms** | no |
+| Ardour 8.12 | no — JACK or silence | 11.2 ms | always |
+| REAPER | not ported | — | — |
+
+So the target was to match them and the result is past it on both axes: lower
+latency than Ardour's floor, and the only one of the three that makes a sound
+when a musician installs it and presses a key. That second column is the one
+this port was for.
 
 ---
 
