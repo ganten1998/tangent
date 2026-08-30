@@ -407,6 +407,20 @@ fn open_nonblocking(path: &Path) -> Result<libc::c_int, Error> {
     let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
     if fd < 0 {
         let e = std::io::Error::last_os_error();
+        // **A MIDI node takes ONE reader, and this is the error people will
+        // actually hit.** Observed on the test box: a second Tangent, or any
+        // other program holding the port, makes `open` fail with EBUSY. The
+        // bare errno reads "Device busy", which tells a musician nothing about
+        // what to do — so name the cause and the fix instead. Everything else
+        // keeps the OS wording, which is the right level of detail for the
+        // failures nobody can predict.
+        if e.raw_os_error() == Some(libc::EBUSY) {
+            return Err(Error(format!(
+                "{} is open in another program — MIDI ports allow one at a \
+                 time, so close whatever else is using it and reconnect",
+                path.display()
+            )));
+        }
         return Err(Error(format!("cannot open {}: {e}", path.display())));
     }
     Ok(fd)
