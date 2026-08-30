@@ -17,9 +17,12 @@
 # The bundles are for machines with no network, and there are two because the
 # honest gap depends on what is already there. On a box that runs a desktop,
 # Xorg and mesa are present and the only things genuinely missing are ALSA and
-# LV2 — about sixty megabytes, nearly all of it lilv's, which depends on
-# libsndfile and so drags in FLAC, Vorbis, Opus and mpg123 whether this host
-# decodes those formats or not. On a box where somebody installed FreeBSD,
+# LV2 — about sixty megabytes, nearly all of it LV2's. lilv depends on
+# libsndfile, which drags in FLAC, Vorbis, Opus and mpg123 whether this host
+# decodes those formats or not, and on the `lv2` port, which carries the spec
+# bundles the plugins genuinely need at runtime and a Python toolchain they do
+# not. Both are pkg's graph rather than a choice available here. On a box where
+# somebody installed FreeBSD,
 # added Xorg and nothing else, the closure is the whole graphics stack and runs
 # to hundreds.
 # Shipping only the large one punishes every normal user with a download they
