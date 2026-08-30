@@ -1200,6 +1200,16 @@ pub struct IvoryApp {
     /// used to be the next click. Re-pinning the same size is that
     /// configure, sent for a few frames so it lands after the WM settles.
     decor_nudge_until: Option<Instant>,
+    /// **The drawable size to put back after a decoration change**, for the
+    /// host to apply.
+    ///
+    /// Adding or removing a title bar changes what the window CONTAINS
+    /// without changing what it occupies, and under a tiling manager the
+    /// app's usual correction is latched off — so the mismatch stays as a
+    /// strip the layout does not cover, or a title bar over the picture.
+    /// `tangent-ui` cannot reach a window, so it says what it wants and the
+    /// host does it: `macwin::keep_content_size`.
+    decor_keep_content: Option<Vec2>,
     main_inner_origin: Pos2,
     /// Whether `main_inner_origin` has ever been reported by the platform.
     /// Until it has, it is (0, 0) — which is a real position, not a missing
@@ -2148,6 +2158,7 @@ impl IvoryApp {
             pending_window_size: None,
             decorations_sent: None,
             decor_nudge_until: None,
+            decor_keep_content: None,
             main_inner_origin: Pos2::ZERO,
             main_origin_known: false,
             monitor_size: None,
@@ -16752,6 +16763,23 @@ impl IvoryApp {
         });
     }
 
+    /// **The drawable size the host should restore**, taken once.
+    ///
+    /// `None` on every frame but the one after a decoration change.
+    pub fn take_decor_keep_content(&mut self) -> Option<Vec2> {
+        self.decor_keep_content.take()
+    }
+
+    /// **A working surface is up, so Up and Down belong to it** — or to
+    /// nothing — rather than to the instrument's pitch.
+    ///
+    /// One predicate rather than the condition written twice, so the
+    /// arrangement and the mixer cannot come to disagree about it. See
+    /// `transpose_still_works_but_the_arrows_do_not_reach_it_from_the_desk`.
+    fn desk_owns_the_arrows(&self) -> bool {
+        self.arrangement_open || self.mixer_open
+    }
+
     pub fn playhead_s(&self) -> f64 {
         self.recorder.position_s.max(0.0)
     }
@@ -21853,6 +21881,30 @@ impl IvoryApp {
                     // every nudge also TRANSPOSED the instrument (and
                     // saved it), and every fit flipped the window
                     // fullscreen.
+                } else if self.desk_owns_the_arrows()
+                    && matches!(
+                        action,
+                        keys::KeyAction::TransposeUp | keys::KeyAction::TransposeDown
+                    )
+                {
+                    // **The arrows do NOT retune the instrument from here.**
+                    //
+                    // Up and Down are bound to transpose, which is right on
+                    // the piano — that is a view about pitch. On the
+                    // arrangement and the mixer they are navigation keys that
+                    // happen to reach a global, and nothing consumes an egui
+                    // key, so every press moved the whole instrument a
+                    // semitone AND SAVED IT. Silently: the owner worked
+                    // through an evening, pressed Down five times between
+                    // other things, and found every note reading a fourth
+                    // flat — "a 'C' for example now reads as a G a fourth
+                    // below it".
+                    //
+                    // This is the same swallow the MIDI editor already takes
+                    // for the same keys and the same reason, one view wider.
+                    // Arrows are inert here rather than dangerous, which is
+                    // the correct trade for a control that is persistent,
+                    // global and invisible at the moment it fires.
                 } else if self.arrangement_open
                     && action == keys::KeyAction::ShowSupporterKey
                 {
@@ -22257,17 +22309,33 @@ impl IvoryApp {
             ctx.send_viewport_cmd(ViewportCommand::Decorations(decorations));
             ctx.send_viewport_cmd(ViewportCommand::Title("Tangent".to_owned()));
             self.decorations_sent = Some(decorations);
+            // **The drawable size to keep**, captured BEFORE the title bar
+            // comes or goes, because after that it is the wrong number.
+            // Applied by the host, once, when the style mask has actually
+            // changed — see `decor_keep_content`.
+            self.decor_keep_content = Some(self.last_pane);
             // Arm the nudge — see `decor_nudge_until`. Both directions of B
             // left the picture shifted by a title bar under i3 until the
-            // next click; the re-pinned size is the configure that click
-            // was accidentally providing.
-            self.decor_nudge_until = Some(Instant::now() + Duration::from_millis(300));
+            // next click.
+            //
+            // A second and a bit, not 300 ms: a tiling manager answers a
+            // geometry change on its own schedule and AeroSpace's reply
+            // routinely lands after that, leaving the app painting the old
+            // size with nothing to prompt it. The cost is a few frames of
+            // repaint after a keypress.
+            self.decor_nudge_until = Some(Instant::now() + Duration::from_millis(1_200));
         }
         if let Some(t) = self.decor_nudge_until {
             if Instant::now() < t {
-                // Forget the pin so the triple above re-sends next frame,
-                // and make sure that frame comes without waiting for input.
-                self.last_sent_size = None;
+                // **Only re-pin when the app is allowed to.** Forgetting the
+                // pin makes the block above re-send a size, which is the one
+                // thing not to do at a manager that has already overruled us
+                // — see `main_wm_managed`. Under a tiler the repaint alone is
+                // what is wanted: keep drawing until the geometry settles,
+                // and let `decor_keep_content` fix the drawable area.
+                if !self.main_wm_managed {
+                    self.last_sent_size = None;
+                }
                 ctx.request_repaint_after(Duration::from_millis(50));
             } else {
                 self.decor_nudge_until = None;
@@ -33543,6 +33611,43 @@ mod folder_tests {
             app.drumpad_kits[5].pads[40].path, "media/snare.wav",
             "pasting a non-drum track wiped a kit that was already there"
         );
+    }
+
+    /// **The arrows do not retune the instrument from a working view.**
+    ///
+    /// Up and Down are bound to transpose, which is right on the piano and
+    /// wrong everywhere else: on the arrangement and the mixer they are
+    /// navigation keys that reach a global, nothing consumes an egui key, and
+    /// every press moved the whole instrument a semitone AND SAVED IT. The
+    /// owner worked an evening, pressed Down five times between other things,
+    /// and found everything reading a fourth flat: "a 'C' for example now
+    /// reads as a G a fourth below it."
+    ///
+    /// The transposition itself still works — this is about where the KEY is
+    /// allowed to reach, and the piano is the view that owns it.
+    #[test]
+    fn transpose_still_works_but_the_arrows_do_not_reach_it_from_the_desk() {
+        let mut app = app();
+        assert_eq!(app.settings.transpose, 0, "the fixture is not at concert pitch");
+
+        // The action itself is unchanged: this is what the piano's arrows do.
+        app.transpose_by(-1);
+        assert_eq!(app.settings.transpose, -1);
+        app.transpose_by(1);
+        assert_eq!(app.settings.transpose, 0);
+
+        // **The rule the key dispatch follows.** Kept as one predicate so the
+        // two views cannot drift apart, and asserted here because the chain
+        // that consults it runs inside a frame and cannot be driven from a
+        // test.
+        app.arrangement_open = false;
+        app.mixer_open = false;
+        assert!(!app.desk_owns_the_arrows(), "the piano must keep its arrows");
+        app.arrangement_open = true;
+        assert!(app.desk_owns_the_arrows(), "the arrangement still transposed");
+        app.arrangement_open = false;
+        app.mixer_open = true;
+        assert!(app.desk_owns_the_arrows(), "the mixer still transposed");
     }
 
     #[test]
