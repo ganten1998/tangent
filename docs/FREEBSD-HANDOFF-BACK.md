@@ -1,6 +1,6 @@
 # FreeBSD port — handoff back for review
 
-**Branch `freebsd`, 12 commits, `main` untouched.**
+**Branch `freebsd`, `main` untouched.**
 <https://codeberg.org/ganten1998/tangent/compare/main...freebsd>
 
 Real hardware: HP laptop, GhostBSD 26.1 / FreeBSD 15.0-RELEASE-p2 amd64,
@@ -277,3 +277,99 @@ platform and I could not construct the failing case here; it is your call.
 Say when `main` is pushed and I will do the merge, build and verification.
 Nothing in flight blocks it — LV2 stage one is committed and green (1630
 passed), and the plugin-UI work after it is additive.
+
+
+---
+
+# Addendum — LV2, and the one thing it does to your crossbuild
+
+Written after the review above. `main` is merged in; the branch is still
+`main`-untouched in the other direction.
+
+## Why this happened at all
+
+The question was "what is the state of VST3 on BSD". The answer is that the
+FreeBSD ports tree contains **no VST3 plugins at all** — not few, none — so a
+host that speaks only VST3 arrives on this platform able to load nothing a
+user can install. LV2 is not a nice-to-have here; it is the format.
+
+It is gated `linux` + `freebsd`, the two platforms that have an LV2 ecosystem.
+Linux gets it for free and genuinely benefits: lsp-plugins, Calf, x42,
+Dragonfly and Rubber Band are all LV2 first.
+
+## What works
+
+Discovery and the picker (grouped by URI authority, which is the closest thing
+LV2 has to a vendor field), hosting as voice or effect, MIDI in and out,
+automation, the plugin's own X11 UI embedded in one of ours, control values
+carried host-side because the format gives the host no other route, state saved
+and restored by port symbol, the generic parameter panel with real engineering
+units, and latency read from the designated output port.
+
+Verified through the app on this box, not a harness: picker → Dragonfly Plate
+Reverb → Load → the plugin's own window opens as the bay's editor → drag Decay
+to 4.0 s → close the editor → the sidecar reads `decay=3.9639997` → relaunch →
+the knob is at 4.0 s.
+
+Details, including a wrong-knob bug that survived three verifications because
+"the sound changed" looks exactly like "it worked", are in §9a of
+`docs/FREEBSD-5.0-FINDINGS.md`. That one is worth your five minutes.
+
+## **The crossbuild consequence — this is the part for you**
+
+`tangent-host` now links `liblilv-0.so` on Linux as well as FreeBSD. Before you
+kick off a crossbuild, know exactly what that costs, because it is narrower
+than it sounds:
+
+- **No build script, no bindgen, no libclang, no pkg-config.** `lilv-sys` ships
+  pre-generated bindings and a bare `#[link(name = "lilv-0")]`; the vendored
+  `lv2-sys` is the same. So the property `cargo-zigbuild` and `cargo xwin` exist
+  to protect — that building for another target needs no C toolchain — is
+  **intact at compile time**.
+- **The linker still wants the library.** `-llilv-0` has to resolve for the
+  TARGET. Cross-building Linux from the Mac therefore needs a Linux
+  `liblilv-0.so` reachable by the linker; nothing else changed.
+- **Windows and macOS are untouched.** The dependency is target-gated to
+  `cfg(any(target_os = "linux", target_os = "freebsd"))`, so
+  `cargo tree --target x86_64-pc-windows-msvc` is as clean as it was, and
+  `check-firewall.sh` passes unchanged.
+
+Three ways out, in the order I would try them:
+
+1. **Put a Linux `liblilv-0.so` (plus `libserd`, `libsord`, `libsratom`,
+   `libzix`) in the zig sysroot.** Smallest change, keeps one build host,
+   Linux users get LV2.
+2. **Build Linux on Linux.** If there is CI, this stops being a question.
+3. **A `lv2` cargo feature, default-on for FreeBSD and off for a cross-built
+   Linux.** Cheapest to implement and the one I would take last: it ships a
+   Linux binary that cannot load the format most Linux plugins use, and nothing
+   in the UI would explain why the picker is short.
+
+I have not made that call — it is your build, and item 1 depends on how your
+zig sysroot is assembled, which I cannot see from here.
+
+## The artifact
+
+FreeBSD 15 / amd64 only, deliberately, and that is not a limitation to design
+around — `pkg` derives the ABI from the build host and enforces it at install
+time, so one artifact per FreeBSD major is the shape of the problem. A
+FreeBSD 14 artifact needs a FreeBSD 14 build host and nothing else about the
+port changes.
+
+`dist/` holds three files: the `.pkg` on its own for anyone with a network, and
+two offline bundles — `desktop` for a machine that already runs a desktop,
+`complete` for one where somebody installed FreeBSD, added Xorg and stopped.
+
+The package declares `lilv` now. It did not before, and that artifact would
+have failed to start on a clean box: the binary links `liblilv-0.so` outright,
+exactly as it links `libasound`. `scripts/build-freebsd.sh` asserts both.
+
+## What I would still not merge blind
+
+Everything in "What I did not do, and why" above still stands. Added to it:
+
+- **LV2 `state:` for plugins holding data beyond their ports** — a sampler with
+  a loaded file. Control ports are done; that class needs the live instance
+  back across the hand-off. Nothing in the ports tree is in that class today.
+- **The vendored cpal.** Still the largest thing on this branch and still
+  wanting an upstream PR rather than a permanent fork.
