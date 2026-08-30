@@ -3191,9 +3191,13 @@ impl Renderer {
         // The bays' own automation for this block. Read before the rack is
         // borrowed mutably: two different fields, so the borrows are disjoint,
         // but only if they are taken in one expression each.
+        // The seat's own automation block. A channel's is its own index; the
+        // master's sits one past them — see the curve walk in
+        // `refresh_automation`, which files it there.
+        let slot_lane = if at == STRIPS { CHANNELS } else { at };
         let params: [&[tangent_host::ParamPoint]; INSERTS] = std::array::from_fn(|b| {
             self.auto_params
-                .get(at * INSERTS + b)
+                .get(slot_lane * INSERTS + b)
                 .map_or(&[][..], Vec::as_slice)
         });
         let Some(rack) = self.racks.get_mut(at) else {
@@ -5157,9 +5161,22 @@ impl Renderer {
                 continue;
             };
             let lane = curve.lane;
-            if lane >= CHANNELS || suspend & (1 << lane) != 0 {
+            if suspend & (1 << lane.min(31)) != 0 {
                 continue;
             }
+            // **The MASTER's rack is a block past the channels'.**
+            //
+            // Its bays are a real rack — the bus compressor at the end of
+            // the record — and its curves are stored under a lane one past
+            // the channels, so without this the menu offered its parameters
+            // and the engine dropped every one of them on the floor.
+            let slot_lane = if lane == MASTER_AUTO_LANE {
+                CHANNELS
+            } else if lane < CHANNELS {
+                lane
+            } else {
+                continue;
+            };
             let bay = usize::from(bay);
             if bay >= INSERTS {
                 continue;
@@ -5167,7 +5184,7 @@ impl Renderer {
             let Some(value) = curve.value_at(secs) else {
                 continue;
             };
-            let Some(q) = self.auto_params.get_mut(lane * INSERTS + bay) else {
+            let Some(q) = self.auto_params.get_mut(slot_lane * INSERTS + bay) else {
                 continue;
             };
             // The cap is the pre-grown capacity: pushing past it would
@@ -7246,7 +7263,7 @@ impl Engine {
             // song has ever automated on one effect, and the whole table is
             // 444 short vectors — a few kilobytes bought at load time so the
             // audio thread never asks for memory.
-            auto_params: (0..CHANNELS * INSERTS)
+            auto_params: (0..(CHANNELS + 1) * INSERTS)
                 .map(|_| Vec::with_capacity(AUTO_PARAMS_PER_BAY))
                 .collect(),
             auto_incoming,
@@ -11228,7 +11245,7 @@ mod tests {
             // song has ever automated on one effect, and the whole table is
             // 444 short vectors — a few kilobytes bought at load time so the
             // audio thread never asks for memory.
-            auto_params: (0..CHANNELS * INSERTS)
+            auto_params: (0..(CHANNELS + 1) * INSERTS)
                 .map(|_| Vec::with_capacity(AUTO_PARAMS_PER_BAY))
                 .collect(),
             auto_incoming: RingBuffer::<tangent_ui::automation::Automation>::new(2).1,
