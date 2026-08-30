@@ -693,30 +693,65 @@ silent bugs, all of which would have shipped:
   every pad seat above 255 onto seat 255: one pad's window turning another's
   knobs.
 
+### Settings that survive
+
+An LV2 bay's controls are saved and restored. The format's own `state:`
+extension needs the live `LilvInstance*`, which this host has already handed to
+the audio thread — the same wall the editor and latency handles ran into — so
+the state comes from the other end: **the host is the only writer of an LV2
+control port**, so it already knows every value the instance could report. The
+bay record is the source of truth and the plugin holds the copy.
+
+Written as `symbol=value` text. Symbols are stable across versions of a plugin
+and port indices are not, so a session survives the plugin gaining or losing a
+control; keyed by index, a plugin update would have moved every setting one
+knob along, silently. Unknown symbols are skipped and missing ones keep their
+defaults, for the same reason.
+
+The parameter panel works too, and it is the better one of the two: an LV2
+control declares its range in real engineering units, so "800 Hz" is
+arithmetic here rather than a round trip asking the plugin to render a
+normalised 0..1 into text.
+
+Latency is read where LV2 publishes it — a designated control OUTPUT port,
+which means anything only after a block has run — so it is picked up on the
+audio thread rather than polled from the main one the way a VST3's is.
+
+### The bug that three verifications missed
+
+Worth recording because of *how* it survived.
+
+An LV2 UI reports a control by its **absolute port index**; `set_param` and the
+automation road take its **position in the control-input list**. Those differ
+for any plugin with an audio or atom port ahead of its first control, which is
+nearly all of them. The host passed one where the other was wanted, so every
+edit moved a different knob.
+
+It survived a live session of dragging Dragonfly's knobs and watching the
+plugin's own spectrogram grow a longer tail, because *a* parameter really was
+changing — just not the one under the mouse. A sound that changes is what
+"it works" looks like. What it did not survive was writing the state file and
+reading it back: the screen said Decay 4.0 s and the file said `decay=0.4`.
+
+The lesson is narrow and worth keeping: **a change in the output is not
+evidence that the intended change happened.** The test that caught it compared
+two independent descriptions of the same state.
+
 ### Measured, not assumed
 
-Against Dragonfly Hall on this box: the UI embedded at its natural 920×345 and
-tore down clean. Two knobs dragged with synthetic input produced twelve edits
-carrying the right port numbers and **real engineering units** — Decay 0.5 s
-to 3.2 s on port 21, Size 10 m to 21 m on port 9 — every one accepted by
-`set_param`, and the plugin's own spectrogram grew the longer tail to match.
-
-End to end in the app: picker → *Dragonfly Plate Reverb* → Load → its own
-native window opened as the bay's editor.
+Against Dragonfly Plate on this box, through the app rather than a harness:
+picker → Load → the plugin's own native window opens as the bay's editor;
+drag Decay to 4.0 s; close the editor and the sidecar reads
+`decay=3.9639997` beside every other control by symbol; relaunch and the knob
+comes back at 4.0 s.
 
 ### What is NOT done
 
-**LV2 state is not wired.** The `state:` extension is a different mechanism
-from a VST3 state blob, and a session saved with an LV2 plugin's settings
-restores the plugin at its defaults. This is *said* rather than silently
-dropped — the bay reports it — but it is the one real gap and it is the next
-thing to do. A per-bay value shadow covers the smaller half of it: closing a
-plugin's window and reopening it redraws the knobs where the user left them,
-which without the shadow would have shown defaults while the DSP used the real
-values.
-
-LV2 latency is a designated output port this does not yet read, so a
-lookahead LV2 limiter will not delay-compensate.
+**A plugin whose state is more than its ports.** A sampler that has loaded a
+file, a convolver holding an impulse: those keep data the `state:` extension
+carries and control ports do not, and restoring one needs the live instance.
+Nothing in the ports tree that this port was built for is in that class, but a
+user who installs one will find its ports restored and its file forgotten.
 
 ---
 
@@ -733,10 +768,10 @@ lookahead LV2 limiter will not delay-compensate.
 3. **Upstream the OSS host.** It is written and measured (§7); cpal already
    claims FreeBSD as a target, so this fills in a platform rather than adding
    one. Landing it upstream is what removes the vendored copy.
-4. **LV2 state**, per §9a — the one real gap in plugin support. An LV2
-   plugin's settings do not survive a save/reload; the bay says so rather than
-   pretending, but a user who builds a sound and loses it will not care that
-   the message was honest.
+4. **LV2 `state:` for plugins that need it**, per §9a. Control ports are done;
+   what is left is the class of plugin holding data beyond them, which needs
+   the live instance and therefore a way to borrow it back across the hand-off.
+   Nothing in the ports tree is in that class today.
 5. Plugin editor and camera, per §5, when there is hardware to test them with.
 6. The `audio.rs:1027` `max_sample_rate()` landmine in §5, which wants a fix
    that can be tested rather than a blind one.
