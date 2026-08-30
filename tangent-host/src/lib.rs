@@ -17,6 +17,10 @@
 
 pub mod editor;
 pub mod instance;
+/// LV2 hosting, beside VST3. Only where an LV2 ecosystem exists — see the
+/// dependency note in `Cargo.toml`. A target gate, not a feature gate.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+pub mod lv2;
 pub mod ready;
 pub mod scan;
 pub mod state;
