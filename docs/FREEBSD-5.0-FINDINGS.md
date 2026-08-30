@@ -11,8 +11,10 @@
 > | App launches and draws | ok, glow on X11 |
 > | Audio out, stock system, nothing configured | ok, 0 underruns in 6721 interrupts |
 > | Audio in | **blocked on hardware** — this laptop has no usable input, see §6 |
-> | `cargo test --workspace --features recorder` | **1596 passed, 0 failed**, 56 ignored |
+> | MIDI in, no server, nothing configured | ok — native `/dev/umidi`, verified against a Kawai MP6, §9 |
+> | `cargo test --workspace --features recorder` | **1619 passed, 0 failed**, 56 ignored |
 > | `scripts/check-firewall.sh` | green, Minimal build included |
+> | Installer | ok — a real `.pkg` plus two offline bundles, §10 |
 > | Latency measured | probe written (`examples/rtlatency.rs`), blocked with audio in |
 
 Test box: HP laptop, GhostBSD 26.1 / FreeBSD 15.0-RELEASE-p2 amd64, i5-1135G7
@@ -297,15 +299,135 @@ Tangent opens (`1r:1v` in `sndstat`) — is already proven.
    cpal's own reported figures, so a gap between measured and claimed is itself
    a finding. This is the number that decides whether the shim is good enough
    or an OSS backend is required.
-2. **A `/dev/umidi*` MIDI backend.** FreeBSD's native MIDI is raw char devices;
-   no Rust crate wraps them, which is the *real* reason midir has no arm. A
-   small backend reading `/dev/umidi*` would give out-of-the-box MIDI without a
-   JACK server, and it is the one piece that would make this a first-class port
-   rather than a working one. Would mean owning a midir fork or an internal
-   backend — worth a decision, not a drive-by.
-3. **Device names.** `["default", "oss"]` in the picker is the most visible
-   remaining wart.
-4. Plugin editor and camera, per §5, when there is hardware to test them with.
+2. **Device names.** `["default", "oss"]` in the audio picker is the most
+   visible remaining wart. The MIDI picker no longer has this problem (§9).
+3. Plugin editor and camera, per §5, when there is hardware to test them with.
+4. A FreeBSD **14** artifact. ABI is enforced, so it needs a 14 build host.
+
+---
+
+## 9. MIDI: FreeBSD reads its own, and stops needing JACK
+
+The port first shipped MIDI through `midir`'s `jack` feature, because that is
+the only arm in midir's backend table not keyed to an OS. It compiled, and it
+was the wrong shape: libjack became a link-time dependency of the whole
+application, and **no keyboard worked until the user installed JACK and started
+a server**. For a DAW that is a fair ask; for a MIDI keyboard monitor it is the
+product not working when you plug a keyboard in.
+
+`tangent/src/umidi.rs` reads `/dev/umidi*` directly. The whole platform
+difference at the call site is one `use` alias — `midi.rs` is otherwise
+untouched — and midir moves to `cfg(not(target_os = "freebsd"))`.
+
+**The central question was settled by measurement before a line was written**,
+because it had two plausible answers and guessing wrong yields a parser that
+silently drops every message on real hardware. Captured from a Kawai MP6 on
+`/dev/umidi0.0`:
+
+```
+b0 40 11  b0 40 7f  90 47 33  80 47 40  90 4a 3d  ...
+```
+
+That is a **raw MIDI byte stream**, not the USB-MIDI 4-byte event packets the
+USB layer carries (which would read `09 90 47 33`). FreeBSD's driver unpacks
+the USB framing, so what is needed is an ordinary stream parser. The capture is
+`tests/fixtures/kawai-mp6-umidi.raw` — 2628 bytes, 876 messages — and it is a
+test, not a souvenir: every byte must be consumed, every message well formed,
+and the result identical whether the parser is fed 1 byte at a time or 1023,
+because `read(2)` **will** split messages across buffers.
+
+### Two bugs the JACK path was carrying, found on the way out
+
+Worth recording because both were silent, and neither would have been found by
+using the app:
+
+* **midir's JACK backend invokes the callback on JACK's realtime process
+  thread.** Tangent's MIDI callback allocates (`bytes.to_vec()`), takes a
+  `Mutex` and sends on an `mpsc` — three realtime violations per message, on
+  the thread least able to afford them.
+* **midir's JACK backend stores `ignore_flags` and never applies them.** So
+  `input.ignore(Ignore::TimeAndActiveSense)` was a no-op, and every keyboard
+  sending Active Sensing at ~3 Hz would have put roughly four thousand junk
+  messages into a twenty-minute take — the exact bug that call exists to
+  prevent, reintroduced silently by the platform.
+
+### Naming, which the device would not do for us
+
+The MP6 reports `iManufacturer = <no string>` and `iProduct = "USB-MIDI"`. A
+port list saying "USB-MIDI" is barely better than "umidi0.0" and is wrong
+outright with two keyboards attached. The good name `usbconfig` prints comes
+from the USB ID database the system already ships, so the backend does the
+same: vendor and product from the driver's `%pnpinfo` sysctl — no USB ioctls,
+no libusb — resolved against `/usr/share/misc/usb_vendors`. The picker reads
+**"MP6 Stage Piano"**.
+
+### Honestly worse than midir in one place
+
+midir hands the callback a **device** timestamp, and `midi.rs` explains at
+length why that matters. FreeBSD's MIDI device does not offer one: `read(2)`
+returns bytes and there is nowhere in the interface for a timestamp to come
+from. The stamp is therefore taken when the read completes, and every message
+from one read shares it. Bounded and small — 1 kHz USB polling, no work between
+the `poll` wake and the stamp — but not zero, and the recorder timestamps takes
+with these numbers.
+
+Also found: **a MIDI node allows one reader at a time** (`EBUSY` on a second
+open), so the error names the cause and the fix rather than saying "Device
+busy".
+
+---
+
+## 10. The installer
+
+Three artifacts from `scripts/build-freebsd.sh`:
+
+| Artifact | Size | For |
+|---|---|---|
+| `tangent-<v>-freebsd-<abi>.pkg` | 8.3 MB | anyone with a network |
+| `…-desktop.tar.gz` | 8.5 MB, 3 pkgs | offline, on a machine running a desktop |
+| `…-complete.tar.gz` | 653 MB, 167 pkgs | offline, on a machine with only Xorg |
+
+**A package, not a shell script — the opposite of the Linux answer, on
+purpose.** `installer/linux/install.sh` argues its own case: "a .deb reaches
+Debian and Ubuntu. The same argument then repeats for rpm, for Arch, and for
+Void." That reasoning is about fragmentation and it inverts here. FreeBSD has
+exactly one package format and every derivative uses the same `pkg`, so one
+artifact reaches all of them and `pkg delete tangent` is a complete uninstall
+the system tracks. The shipped `install.sh` is a wrapper that calls pkg
+correctly and explains what happened.
+
+**Offline works because of a specific, verified pkg behaviour**: `pkg add`
+never contacts a repository, and when the named package has unmet dependencies
+it searches *the directory the file is in* for archives that satisfy them
+(`pkg-add(8)`). `pkg install ./file.pkg` goes to the network instead — the
+right command for someone who has one, the wrong one for a bundle that already
+carries everything. `pkg install -l` is local-only but does **not** scan the
+directory, so it is the wrong tool despite sounding like the right one.
+
+**The trap that would have broken it on the tester's machine.** The build host
+is GhostBSD, which packages the base system as `GhostBSD-clibs`,
+`GhostBSD-runtime`, `GhostBSD-zlib` and `GhostBSD-libexecinfo`. Those own
+`libc.so.7` and friends *here* and own nothing at all on plain FreeBSD, where
+the same files ship in base. A manifest naming them would install only on
+GhostBSD. `build-freebsd.sh` asserts their absence and refuses to ship
+otherwise — a failure that appears only on a clean machine, which is the
+machine nobody building it is sitting at.
+
+Two smaller things, both found only by running it: a `.pkg` stores its paths
+**absolute**, so a `--home` extraction asking tar for `usr/local` matches
+nothing and silently yields an empty install; and `du` reports *allocated*
+blocks, so on compressed ZFS it called an 8.3 MB package 5.7 MB and a
+just-written tarball 512 bytes.
+
+No post-install script is needed: `update-desktop-database` and
+`gtk-update-icon-cache` are system-wide pkg **triggers** that fire for any
+package writing to `share/applications` or `share/icons`. Advisory text lives
+in a `messages` block instead, because scripts can be suppressed with
+`pkg add -I` and guidance nobody reads is not guidance.
+
+A no-root install cannot go through pkg at all — `PKG_DBDIR` must be owned by
+`root:wheel` with no override — so `install.sh --home` is a plain file copy
+into `~/.local`, and owns its own uninstall.
 
 ---
 
