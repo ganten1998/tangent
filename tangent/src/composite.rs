@@ -143,6 +143,48 @@ fn block_on<F: std::future::Future>(mut f: F) -> F::Output {
     }
 }
 
+/// The instance the compositor probes and composites through.
+///
+/// `InstanceDescriptor::default()` everywhere except FreeBSD, where the GL
+/// backend is EXCLUDED rather than enumerated and then refused.
+///
+/// **This is the difference between the app starting and not.** The refusal at
+/// the end of `standalone` explains why a wgpu-managed GL adapter is unusable:
+/// wgpu-hal brackets its GL work with `eglMakeCurrent(ctx)` /
+/// `eglMakeCurrent(NONE)` on the window's own thread. What that comment does
+/// not say — because on Linux the owned-GL path returns before it can matter —
+/// is that the damage is done during ENUMERATION, before any adapter is handed
+/// back to be refused. Building an adapter is what constructs the EGL context,
+/// and `EglContext::make_current` unwraps its result
+/// (`wgpu-hal/src/gles/egl.rs`).
+///
+/// On FreeBSD, where `owned_gl_is_hardware()` does not exist to short-circuit
+/// the probe, eframe's glow context is already current on this thread when
+/// `request_adapter` reaches the GL backend, EGL permits one current context
+/// per thread, and the call comes back `BAD_ACCESS` into that unwrap. The app
+/// died on the way up with a bare `Err value: BadAccess` and never drew a
+/// frame — the first thing the FreeBSD port did after it compiled.
+///
+/// Excluding the backend costs nothing that was ever available: a GL adapter
+/// reaching the check below is rejected anyway, so the only thing enumeration
+/// could add here is the panic. Vulkan (hardware, or mesa's lavapipe) is what
+/// composites on FreeBSD, exactly as on a Linux box with no owned-GL path.
+fn compositor_instance() -> wgpu::Instance {
+    #[cfg(target_os = "freebsd")]
+    {
+        let mut backends = wgpu::Backends::all();
+        backends.remove(wgpu::Backends::GL);
+        wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends,
+            ..Default::default()
+        })
+    }
+    #[cfg(not(target_os = "freebsd"))]
+    {
+        wgpu::Instance::new(&wgpu::InstanceDescriptor::default())
+    }
+}
+
 /// A software adapter, because the hardware ones came up empty.
 ///
 /// `force_fallback_adapter` picks a CPU device — lavapipe on Linux, WARP on
@@ -180,7 +222,7 @@ pub fn renders_on_the_cpu() -> bool {
     }
     static ANSWER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ANSWER.get_or_init(|| {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let instance = compositor_instance();
         let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter: false,
@@ -318,7 +360,7 @@ impl Compositor {
             Err(why) => log::debug!("compositor: no hardware GL of our own ({why})"),
         }
 
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let instance = compositor_instance();
         let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter: false,
@@ -337,6 +379,14 @@ impl Compositor {
                 if cfg!(target_os = "linux") {
                     " - installing your distribution's software Vulkan driver \
                      (mesa lavapipe) makes video work on any GPU"
+                } else if cfg!(target_os = "freebsd") {
+                    // Same advice, ports spelling. FreeBSD needs it MORE than
+                    // Linux does: there is no owned-GL accelerator to fall back
+                    // on here, so Vulkan is not the second answer, it is the
+                    // only one. lavapipe ships inside mesa-dri.
+                    " - `pkg install vulkan-loader mesa-dri` gives you a Vulkan \
+                     driver (hardware, or lavapipe for any GPU) and video will \
+                     work"
                 } else {
                     ""
                 }

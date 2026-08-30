@@ -139,6 +139,13 @@ pub fn how_to_install() -> &'static str {
     if cfg!(target_os = "windows") {
         "restore the tangent-ffmpeg.exe that shipped next to tangent.exe, \
          install it with `winget install ffmpeg`, or put ffmpeg.exe on PATH"
+    } else if cfg!(target_os = "freebsd") {
+        // Its own arm because the generic one names `apt`, and a FreeBSD user
+        // typing that gets "command not found" from a message whose whole job
+        // is to be the thing you can act on. `pkg` is also right for GhostBSD
+        // and every other FreeBSD derivative, and ffmpeg is a first-class port.
+        "reinstall so the bundled tangent-ffmpeg sits next to the tangent \
+         binary, or install ffmpeg with `pkg install ffmpeg`"
     } else {
         "reinstall so the bundled tangent-ffmpeg sits next to the tangent \
          binary, or install ffmpeg with your package manager, for example \

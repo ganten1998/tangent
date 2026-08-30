@@ -98,6 +98,9 @@ eframe = { version = "0.33", default-features = false, features = [
 # context. Without one those go nowhere and a startup failure reports only the
 # LAST thing that broke.
 log = "0.4"
+# MIDI in. **On FreeBSD this line alone does not compile** — see the
+# `target_os = "freebsd"` section below, which adds the one feature that gives
+# midir a backend there at all.
 midir = "0.11"
 rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
@@ -160,6 +163,34 @@ egui-wgpu = { version = "0.33", default-features = false }
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 wgpu = { version = "27", default-features = false, features = ["vulkan", "gles"] }
 egui-wgpu = { version = "0.33", default-features = false }
+
+# **FreeBSD's MIDI backend, and the reason the port compiles at all.**
+#
+# midir 0.11's backend table (`src/backend/mod.rs`) declares a module for
+# windows / macos / ios / linux / wasm / android and NOTHING ELSE. On FreeBSD no
+# arm matches, so no backend module is declared, every re-export resolves to
+# nothing, and the failure is inside midir rather than here — which is exactly
+# the wall the first FreeBSD tester hit. There is no `cfg` we can write in our
+# own source to work around a dependency that does not build.
+#
+# The one arm in that table that is NOT keyed to an OS is the JACK one:
+#
+#     #[cfg(all(feature = "jack", not(target_os = "windows")))]
+#
+# so asking for `jack` gives FreeBSD a real, supported backend instead of a
+# vendored fork of somebody else's crate that we would then own forever. It also
+# means MIDI keeps working rather than being cfg'd out — this app is a MIDI
+# keyboard monitor first, so a build with no MIDI in it is not the app.
+#
+# The cost is honest and worth naming: libjack becomes a build- and link-time
+# dependency of the FreeBSD build (`audio/jack` in ports), and MIDI ports only
+# appear while a JACK server is running. Audio does NOT inherit that constraint
+# — cpal still defaults to ALSA-over-OSS and makes sound with nothing running
+# (see tangent-record/Cargo.toml). The native answer for out-of-the-box MIDI is
+# a `/dev/umidi*` backend, which FreeBSD has and no Rust crate wraps; that is a
+# follow-on, not a blocker.
+[target.'cfg(target_os = "freebsd")'.dependencies]
+midir = { version = "0.11", features = ["jack"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # **Where the cursor is during a FILE DRAG**, which is the one time the

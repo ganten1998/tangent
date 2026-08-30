@@ -55,6 +55,37 @@ const CONTENTS_SUBDIR: &str = "arm64-win";
 const CONTENTS_SUBDIR: &str = "x86_64-linux";
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 const CONTENTS_SUBDIR: &str = "aarch64-linux";
+// **FreeBSD, and the one arm here written from the spec rather than from a
+// bundle somebody actually shipped.** The VST3 layout is `<cpu>-<os>` with the
+// OS lowercased — that is where every name above comes from — so FreeBSD/amd64
+// is `x86_64-freebsd`. Believe that only as far as it goes: the Steinberg SDK
+// has no BSD arm of its own, so there is no upstream authority to check it
+// against and no meaningful population of FreeBSD-built VST3s to sample. It is
+// the spec-consistent guess, not a verified fact. See the fallback in
+// `binary_in_bundle` for what happens when it is wrong.
+#[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
+const CONTENTS_SUBDIR: &str = "x86_64-freebsd";
+#[cfg(all(target_os = "freebsd", target_arch = "aarch64"))]
+const CONTENTS_SUBDIR: &str = "aarch64-freebsd";
+
+/// The directory a FreeBSD-built bundle lands in when its build system thinks
+/// BSD is Linux, which is the common case rather than the exotic one.
+///
+/// Frameworks that support FreeBSD at all (JUCE, DPF) mostly reach it by
+/// treating it as a Linux variant, and the VST3 architecture string is usually
+/// derived from a table that stops at `linux`. The result is a bundle holding a
+/// perfectly good FreeBSD ELF in a directory named `x86_64-linux`. Looking only
+/// at the spec-correct name would find nothing in it and report "no plugin"
+/// about a plugin that is right there and would load.
+///
+/// This is safe in the direction that matters: a genuine Linux `.so` cannot be
+/// `dlopen`ed by the FreeBSD runtime linker, so the fallback cannot smuggle in
+/// a foreign binary — it fails at `load()` exactly as it should. The only thing
+/// the fallback can do is find a native plugin that was misfiled.
+#[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
+const CONTENTS_SUBDIR_MISFILED: &str = "x86_64-linux";
+#[cfg(all(target_os = "freebsd", target_arch = "aarch64"))]
+const CONTENTS_SUBDIR_MISFILED: &str = "aarch64-linux";
 
 /// The standard search paths, in the order the SDK specifies.
 ///
@@ -107,6 +138,22 @@ pub fn search_paths() -> Vec<PathBuf> {
             out.push(PathBuf::from(&home).join(".vst3"));
         }
         out.push(PathBuf::from("/usr/lib/vst3"));
+        out.push(PathBuf::from("/usr/local/lib/vst3"));
+    }
+    // FreeBSD beside Linux rather than folded into it, because the system path
+    // genuinely differs: ports and packages install under `/usr/local`, and
+    // `/usr/lib` is base-system territory where a VST3 will never be. Listing
+    // `/usr/lib/vst3` here would be a path that cannot exist on this OS.
+    // `~/.vst3` is shared, being an SDK convention rather than a Linux one.
+    //
+    // Without this arm FreeBSD contributed nothing but `VST3_PATH`, so the
+    // plugin picker was empty unless the user had already set an env var they
+    // had no reason to know about.
+    #[cfg(target_os = "freebsd")]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            out.push(PathBuf::from(&home).join(".vst3"));
+        }
         out.push(PathBuf::from("/usr/local/lib/vst3"));
     }
     out
@@ -341,6 +388,17 @@ pub fn binary_in_bundle(bundle: &Path) -> Option<PathBuf> {
         return Some(bundle.to_path_buf());
     }
     let dir = bundle.join("Contents").join(CONTENTS_SUBDIR);
+    // See `CONTENTS_SUBDIR_MISFILED`: on FreeBSD a native bundle is as likely to
+    // be filed under the Linux name as the correct one, and the difference
+    // between the two is the difference between "your plugins work" and "the
+    // picker is permanently empty". Only when the spec-correct directory is
+    // genuinely absent, so a correctly-built bundle is never second-guessed.
+    #[cfg(target_os = "freebsd")]
+    let dir = if dir.is_dir() {
+        dir
+    } else {
+        bundle.join("Contents").join(CONTENTS_SUBDIR_MISFILED)
+    };
     let entries = std::fs::read_dir(dir).ok()?;
     // Windows bundles ship resource DLLs, `.pdb`s and `moduleinfo.json`
     // BESIDE the plugin, and `read_dir` order picked whichever came first.
@@ -753,12 +811,19 @@ impl Library {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            // Windows: InitDll. Linux: ModuleEntry. Both are optional in
-            // practice — many plugins omit them — so a missing symbol is not an
-            // error, unlike macOS's bundleEntry.
+            // Windows: InitDll. Linux and FreeBSD: ModuleEntry. All are optional
+            // in practice — many plugins omit them — so a missing symbol is not
+            // an error, unlike macOS's bundleEntry.
+            //
+            // FreeBSD deliberately shares the Linux spelling rather than getting
+            // an arm of its own: the name is an ELF-platform convention, not a
+            // kernel one, and the SDK emits `ModuleEntry` for every ELF target.
+            // Note this is the arm whose semantics FreeBSD wants — optional, no
+            // error when absent — and NOT macOS's, where a missing `bundleEntry`
+            // is a hard failure.
             #[cfg(target_os = "windows")]
             let name: &[u8] = b"InitDll\0";
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
             let name: &[u8] = b"ModuleEntry\0";
             // SAFETY: freshly loaded handle.
             if let Some(entry) = unsafe { lib.symbol::<unsafe extern "system" fn() -> bool>(name) }
