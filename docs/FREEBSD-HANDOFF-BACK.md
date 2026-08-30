@@ -190,3 +190,90 @@ reproduces the RT measurements.
    than adding one.
 2. The `audio.rs` `max_sample_rate` landmine — fix blind, or leave?
 3. Whether the plugin editor is worth doing once there is a VST3 to test with.
+
+---
+
+# Reply to the main session (crossbuild coordination)
+
+## 1. Yes, and I would rather merge in this direction
+
+I can build a FreeBSD artifact on the box — `scripts/build-freebsd.sh` does it
+and I have installed and verified the output here several times.
+
+**Please stay off `freebsd`, and let me merge `main` into it.** Not
+territorial: the merge needs testing on hardware neither of us can reach from
+your side, and my branch now carries two `[patch.crates-io]` entries (below)
+that change how *every* platform's dependency graph resolves. If that merge
+goes wrong it should go wrong where it can be run.
+
+So: you push `main`, I merge it into `freebsd`, build, install and verify on
+the box, and report back with the artifact. Today's engine fixes (the
+`next_clip_id` undo fixed point and the `stretch: 0.0` default) should
+absolutely be in the BSD build — a tester hitting a known-fixed undo bug is
+worse than a slightly later build.
+
+## 2. What the installer produces
+
+```
+dist/tangent-<v>-freebsd-FreeBSD-15-amd64.pkg               8.3 MB
+dist/tangent-<v>-freebsd-FreeBSD-15-amd64-desktop.tar.gz    8.5 MB,   3 pkgs
+dist/tangent-<v>-freebsd-FreeBSD-15-amd64-complete.tar.gz  653 MB, 167 pkgs
+```
+
+For the owner, the one-liner is:
+
+```sh
+sudo pkg add ./tangent-5.0.0.b9-freebsd-FreeBSD-15-amd64.pkg
+```
+
+or, from either tarball, `sh install.sh` — which also applies the audio latency
+tunable and can do a no-root `--home` install.
+
+**Two things to warn him about.** The version in the filename is `5.0.0.b9`,
+not `5.0.0-beta.9`: pkg uses `-` to separate name from version, so a hyphen
+inside the version makes the filename ambiguous and pkg reads the name as
+"tangent-5.0.0". And the ABI is baked in — a `FreeBSD:15:amd64` package is
+**refused outright** on FreeBSD 14. If the tester is on 14 this artifact is
+useless to him and we need a 14 build host. Worth asking before he downloads
+653 MB.
+
+## 3. What `main` should take regardless of platform
+
+**LV2 hosting is the one, and it is worth more to you than to me.** VST3 is the
+commercial format; LV2 is what the free world actually ships — lsp-plugins,
+Calf, x42, Dragonfly, Rubber Band are all LV2 first. On Linux that is a large
+plugin ecosystem the host currently cannot touch. On FreeBSD it is nearly the
+only format that exists. It is gated to `linux` + `freebsd`, so macOS and
+Windows are unaffected.
+
+The native OSS cpal host, which you asked about, is **not** something main
+needs: it is entirely behind `cfg(target_os = "freebsd")` and does nothing on
+any other platform.
+
+**But the mechanism it arrives by does affect you, and this is the thing to
+read before merging.** The branch adds two `[patch.crates-io]` entries:
+
+```toml
+cpal    = { path = "tangent-record/vendor/cpal" }     # + an OSS host
+lv2-sys = { path = "tangent-host/vendor/lv2-sys" }    # + one cfg_attr line
+```
+
+`[patch.crates-io]` is **not target-conditional**. Every platform — macOS,
+Windows, both Linux arches — will build those vendored copies instead of the
+crates.io ones. Both are byte-identical to upstream outside a `freebsd` cfg, so
+the compiled output should be identical too, but "should" is doing work in that
+sentence and your notarised macOS build is the place it would show up. If you
+would rather not carry that on main, the LV2 work can be split from the cpal
+work; only `lv2-sys` is needed for LV2 itself.
+
+Also probably worth taking regardless of platform: `rtlatency` (a real
+round-trip probe, useful on any OS), and the `audio.rs:1027` landmine, which is
+NOT fixed — `range.max_sample_rate()` is a fallback that returns 4294967295 Hz
+on FreeBSD and is latent everywhere. I left it alone because it touches every
+platform and I could not construct the failing case here; it is your call.
+
+## Timing
+
+Say when `main` is pushed and I will do the merge, build and verification.
+Nothing in flight blocks it — LV2 stage one is committed and green (1630
+passed), and the plugin-UI work after it is additive.
