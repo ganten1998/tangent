@@ -2218,6 +2218,18 @@ struct Prepared {
     channels: usize,
     loaded: Loaded,
     editor_handle: Option<tangent_host::editor::EditorHandle>,
+    /// The plugin's URI, when it is an LV2 one.
+    ///
+    /// **A string rather than a handle, and that is the format's doing.** A
+    /// VST3 editor is built from a reference taken off the live instance — the
+    /// `EditorHandle` above — because only the instance's controller can make
+    /// the view. An LV2 UI is a separate shared object that the host loads by
+    /// itself, from the URI, and it never touches the DSP instance at all. So
+    /// the thing to remember for the bay is the name, and the window is opened
+    /// from that, on demand, long after the instance has gone to the audio
+    /// thread.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    lv2_uri: Option<String>,
     state_handle: Option<tangent_host::StateHandle>,
     latency_handle: Option<tangent_host::instance::LatencyHandle>,
     latency_now: u32,
@@ -2634,7 +2646,32 @@ impl Rack {
 /// SEVENTEENTH parameter its movement rather than costing the block.
 const AUTO_PARAMS_PER_BAY: usize = 16;
 
-const NO_AUTOMATION: &[&[tangent_host::ParamPoint]; INSERTS] = &[&[]; INSERTS];
+/// One knob a plugin's OWN window just turned, on its way to the audio thread.
+///
+/// **Only LV2 needs this, and the reason is structural rather than a gap.** A
+/// VST3 editor and its processor are two halves of one plugin and talk to each
+/// other directly; the host is not in the middle and has nothing to forward. An
+/// LV2 UI is a separate shared object with no route to the DSP at all — the
+/// spec's `write_function` hands the value to the HOST and the host is expected
+/// to put it on the port. Without this the Dragonfly window would move, look
+/// right, and change nothing anybody could hear.
+///
+/// Deliberately the same shape the automation curves already produce, and
+/// merged into the same per-bay queues, so it arrives at `process_effect` by
+/// the road that is already there and already tested. A knob turned in the
+/// plugin's window and the same knob automated are the same event by the time
+/// the audio thread sees either.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct UiParam {
+    /// The SEAT, and `u16` because there are 1939 of them — a channel's worth
+    /// of pads each. A `u8` here held the general channels and quietly folded
+    /// every pad seat above 255 onto seat 255: one drum pad's window turning
+    /// another one's knobs, with nothing anywhere reporting it.
+    lane: u16,
+    bay: u8,
+    id: u32,
+    value: f64,
+}
 
 fn run_rack(
     rack: &mut Rack,
@@ -2716,6 +2753,8 @@ struct Renderer {
     mix: Vec<f32>,
 
     midi: Consumer<MidiEvent>,
+    /// Knobs turned inside plugins' own windows. See [`UiParam`].
+    ui_params: Consumer<UiParam>,
     /// The HARDWARE fast lane: filled from the midir callback thread through
     /// `midi::MidiFastLane`, never from the UI. Its events are stamped in the
     /// far past on purpose, so every one lands at the current block's first
@@ -3936,6 +3975,21 @@ impl Renderer {
                         == 0;
                     let notes: &[tangent_host::Note] = if armed { &self.notes } else { &[] };
                     let controls: &[tangent_host::Control] = if armed { &self.controls } else { &[] };
+                    // **This seat's own parameter queue, not the empty one.** Every rack
+                    // outside the general channels used to be handed an empty queue,
+                    // which was true while the only writer was an automation curve —
+                    // curves address lanes and a pad is not a lane. It stopped being
+                    // true when a plugin's OWN window became a writer: a bay on a pad
+                    // can hold an LV2 effect, that effect can have an editor, and a
+                    // knob turned in it would have moved on screen and changed
+                    // nothing. Taken before the rack is borrowed mutably — two fields,
+                    // so the borrows are disjoint only if each is one expression.
+                    let seat_params: [&[tangent_host::ParamPoint]; INSERTS] =
+                        std::array::from_fn(|b| {
+                            self.auto_params
+                                .get((Strip::Click.index()) * INSERTS + b)
+                                .map_or(&[][..], Vec::as_slice)
+                        });
                     run_rack(
                         &mut self.racks[Strip::Click.index()],
                         &mut self.fx_in,
@@ -3943,7 +3997,7 @@ impl Renderer {
                         &mut self.fx_out,
                         notes,
                         controls,
-                    NO_AUTOMATION,
+                    &seat_params,
                     );
                 }
                 // Back into BOTH buffers, and the take's keeps its gate: a
@@ -4099,6 +4153,21 @@ impl Renderer {
                         }
                     }
                     if !self.racks[dest].is_empty() {
+                        // **This seat's own parameter queue, not the empty one.** Every rack
+                        // outside the general channels used to be handed an empty queue,
+                        // which was true while the only writer was an automation curve —
+                        // curves address lanes and a pad is not a lane. It stopped being
+                        // true when a plugin's OWN window became a writer: a bay on a pad
+                        // can hold an LV2 effect, that effect can have an editor, and a
+                        // knob turned in it would have moved on screen and changed
+                        // nothing. Taken before the rack is borrowed mutably — two fields,
+                        // so the borrows are disjoint only if each is one expression.
+                        let seat_params: [&[tangent_host::ParamPoint]; INSERTS] =
+                            std::array::from_fn(|b| {
+                                self.auto_params
+                                    .get((dest) * INSERTS + b)
+                                    .map_or(&[][..], Vec::as_slice)
+                            });
                         run_rack(
                             &mut self.racks[dest],
                             &mut self.send_io,
@@ -4106,7 +4175,7 @@ impl Renderer {
                             &mut self.fx_out,
                             &[],
                             &[],
-                            NO_AUTOMATION,
+                            &seat_params,
                         );
                     }
                     let g = self.lane_gain[dest];
@@ -4944,6 +5013,21 @@ impl Renderer {
                     == 0;
                 let notes: &[tangent_host::Note] = if armed { &self.notes } else { &[] };
                 let controls: &[tangent_host::Control] = if armed { &self.controls } else { &[] };
+                // **This seat's own parameter queue, not the empty one.** Every rack
+                // outside the general channels used to be handed an empty queue,
+                // which was true while the only writer was an automation curve —
+                // curves address lanes and a pad is not a lane. It stopped being
+                // true when a plugin's OWN window became a writer: a bay on a pad
+                // can hold an LV2 effect, that effect can have an editor, and a
+                // knob turned in it would have moved on screen and changed
+                // nothing. Taken before the rack is borrowed mutably — two fields,
+                // so the borrows are disjoint only if each is one expression.
+                let seat_params: [&[tangent_host::ParamPoint]; INSERTS] =
+                    std::array::from_fn(|b| {
+                        self.auto_params
+                            .get((strip.index()) * INSERTS + b)
+                            .map_or(&[][..], Vec::as_slice)
+                    });
                 run_rack(
                     &mut self.racks[strip.index()],
                     &mut self.fx_in,
@@ -4951,7 +5035,7 @@ impl Renderer {
                     &mut self.fx_out,
                     notes,
                     controls,
-                NO_AUTOMATION,
+                &seat_params,
                 );
             }
             let mut room = room_from;
@@ -5091,6 +5175,33 @@ impl Renderer {
         let suspend = self.shared.auto_suspend.load(Ordering::Relaxed);
         for q in &mut self.auto_params {
             q.clear();
+        }
+        // **Before the early return below, not after it.** A plugin's own
+        // window works in a song with no automation at all — which is most
+        // songs — and draining these after the `is_empty` shortcut would have
+        // meant every LV2 knob was dead until somebody drew a curve.
+        while let Ok(u) = self.ui_params.pop() {
+            let (lane, bay) = (usize::from(u.lane), usize::from(u.bay));
+            // `RACK_SEATS`, not `CHANNELS`: the queues cover every seat now,
+            // and bounding this at the channel count would have dropped every
+            // pad's edits at the last step after carrying them the whole way.
+            if lane >= RACK_SEATS || bay >= INSERTS {
+                continue;
+            }
+            let Some(q) = self.auto_params.get_mut(lane * INSERTS + bay) else {
+                continue;
+            };
+            // The same pre-grown capacity the curves respect, and the same
+            // reason: this thread may not allocate. Overflowing costs the
+            // seventeenth simultaneous knob its movement for one block, and
+            // the next block delivers it.
+            if q.len() < q.capacity() {
+                q.push(tangent_host::ParamPoint {
+                    offset: 0,
+                    id: u.id,
+                    value: u.value,
+                });
+            }
         }
         if self.automation.is_empty() {
             // The overwhelmingly common song. One branch instead of sixty-four
@@ -5765,6 +5876,21 @@ impl Renderer {
                         }
                     }
                 }
+                // **This seat's own parameter queue, not the empty one.** Every rack
+                // outside the general channels used to be handed an empty queue,
+                // which was true while the only writer was an automation curve —
+                // curves address lanes and a pad is not a lane. It stopped being
+                // true when a plugin's OWN window became a writer: a bay on a pad
+                // can hold an LV2 effect, that effect can have an editor, and a
+                // knob turned in it would have moved on screen and changed
+                // nothing. Taken before the rack is borrowed mutably — two fields,
+                // so the borrows are disjoint only if each is one expression.
+                let seat_params: [&[tangent_host::ParamPoint]; INSERTS] =
+                    std::array::from_fn(|b| {
+                        self.auto_params
+                            .get((rack_at) * INSERTS + b)
+                            .map_or(&[][..], Vec::as_slice)
+                    });
                 run_rack(
                     &mut self.racks[rack_at],
                     &mut self.pad_io,
@@ -5772,7 +5898,7 @@ impl Renderer {
                     &mut self.fx_out,
                     &[],
                     &[],
-                NO_AUTOMATION,
+                &seat_params,
                 );
                 for c in 0..TAP_CHANNELS.min(2) {
                     let src = &self.pad_io[c];
@@ -5816,6 +5942,21 @@ impl Renderer {
         // processes its summed kit. The drums are one more thing arriving.
         let bus_rack = bus_strip.index();
         if !self.racks[bus_rack].is_empty() {
+            // **This seat's own parameter queue, not the empty one.** Every rack
+            // outside the general channels used to be handed an empty queue,
+            // which was true while the only writer was an automation curve —
+            // curves address lanes and a pad is not a lane. It stopped being
+            // true when a plugin's OWN window became a writer: a bay on a pad
+            // can hold an LV2 effect, that effect can have an editor, and a
+            // knob turned in it would have moved on screen and changed
+            // nothing. Taken before the rack is borrowed mutably — two fields,
+            // so the borrows are disjoint only if each is one expression.
+            let seat_params: [&[tangent_host::ParamPoint]; INSERTS] =
+                std::array::from_fn(|b| {
+                    self.auto_params
+                        .get((bus_rack) * INSERTS + b)
+                        .map_or(&[][..], Vec::as_slice)
+                });
             run_rack(
                 &mut self.racks[bus_rack],
                 &mut self.fx_in,
@@ -5823,7 +5964,7 @@ impl Renderer {
                 &mut self.fx_out,
                 &[],
                 &[],
-                NO_AUTOMATION,
+                &seat_params,
             );
         }
         // The fold: the DRUMS strip's fader, pan, send and peak, exactly as
@@ -6269,6 +6410,21 @@ impl Renderer {
             }
             if rack_live {
                 let controls: &[tangent_host::Control] = if armed { &self.controls } else { &[] };
+                // **This seat's own parameter queue, not the empty one.** Every rack
+                // outside the general channels used to be handed an empty queue,
+                // which was true while the only writer was an automation curve —
+                // curves address lanes and a pad is not a lane. It stopped being
+                // true when a plugin's OWN window became a writer: a bay on a pad
+                // can hold an LV2 effect, that effect can have an editor, and a
+                // knob turned in it would have moved on screen and changed
+                // nothing. Taken before the rack is borrowed mutably — two fields,
+                // so the borrows are disjoint only if each is one expression.
+                let seat_params: [&[tangent_host::ParamPoint]; INSERTS] =
+                    std::array::from_fn(|b| {
+                        self.auto_params
+                            .get((ch) * INSERTS + b)
+                            .map_or(&[][..], Vec::as_slice)
+                    });
                 run_rack(
                     &mut self.racks[ch],
                     &mut self.fx_in,
@@ -6276,7 +6432,7 @@ impl Renderer {
                     &mut self.fx_out,
                     &lane_notes,
                     controls,
-                NO_AUTOMATION,
+                &seat_params,
                 );
             }
             // **And the lane waits for the slowest of its neighbours.**
@@ -6626,6 +6782,10 @@ pub struct Engine {
     /// `send_midi` must not block. A `RefCell` borrow is a counter check with no
     /// atomics and no waiting.
     midi: RefCell<Producer<MidiEvent>>,
+    /// The writing end of [`UiParam`]. `RefCell` for the reason `midi`'s is:
+    /// pushed from `&self` so the poll that drains the editors need not hold
+    /// the engine mutably.
+    ui_params: RefCell<Producer<UiParam>>,
     /// The hardware fast lane's write end, waiting for the desktop to move it
     /// into the app-lifetime `midi::MidiFastLane` (once, at engine start).
     hw_midi_tx: Option<Producer<MidiEvent>>,
@@ -6690,6 +6850,25 @@ pub struct Engine {
     /// test that opens two engines in one frame ran a debug build's
     /// moves straight off the end of a 2 MiB test stack.
     insert_editor_handles: Vec<[Option<tangent_host::EditorHandle>; INSERTS]>,
+    /// Each loaded insert's LV2 URI, for the bays holding one. See
+    /// `Prepared::lv2_uri`: this is the whole of what opening an LV2 editor
+    /// needs, and it is kept beside the VST3 handles because a bay holds one
+    /// format or the other and every site that clears one must clear both.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    insert_lv2_uris: Vec<[Option<String>; INSERTS]>,
+    /// What each LV2 bay's controls are set to, indexed by control-port number.
+    ///
+    /// **A shadow, and it is not redundant.** The instance itself is on the
+    /// audio thread and cannot be asked; LV2 state restore is not wired, so
+    /// there is no handle to read either. Without this, closing a plugin's
+    /// window and opening it again would draw every knob at its default while
+    /// the DSP went on using the values the user had set — the window and the
+    /// sound disagreeing, with the window looking authoritative.
+    ///
+    /// Written where the edits are drained, so it records exactly what was sent
+    /// and cannot drift from it.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    insert_lv2_values: Vec<[Vec<f32>; INSERTS]>,
     /// Each loaded insert's processor reference, taken beside the editor's and
     /// for the same reason: after the handoff there is no `&Instance` to ask.
     /// This is what lets a bay's settings survive a relaunch — no insert has
@@ -6903,6 +7082,10 @@ impl Engine {
 
         // Every ring is allocated here and never again.
         let (midi_tx, midi_rx) = RingBuffer::<MidiEvent>::new(1024);
+        // 1024, like MIDI's: a dragged knob is about sixty values a second and
+        // the audio thread drains every block, so this holds seconds of the
+        // most furious dragging anybody manages.
+        let (ui_param_tx, ui_param_rx) = RingBuffer::<UiParam>::new(1024);
         let (hw_midi_tx, hw_midi_rx) = RingBuffer::<MidiEvent>::new(1024);
         let tap_frames = (DEFAULT_RING_SECONDS * rate as f32) as usize;
         let (tap_tx, tap_rx) = RingBuffer::<f32>::new(tap_frames.max(4096) * TAP_CHANNELS);
@@ -7012,6 +7195,7 @@ impl Engine {
             // its channels fill up now or in an hour.
             mix: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             midi: midi_rx,
+            ui_params: ui_param_rx,
             hw_midi: hw_midi_rx,
             pending: None,
             notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK),
@@ -7040,7 +7224,7 @@ impl Engine {
             // song has ever automated on one effect, and the whole table is
             // 444 short vectors — a few kilobytes bought at load time so the
             // audio thread never asks for memory.
-            auto_params: (0..CHANNELS * INSERTS)
+            auto_params: (0..RACK_SEATS * INSERTS)
                 .map(|_| Vec::with_capacity(AUTO_PARAMS_PER_BAY))
                 .collect(),
             auto_incoming,
@@ -7170,6 +7354,7 @@ impl Engine {
             shared: Arc::clone(&shared),
             timebase,
             midi: RefCell::new(midi_tx),
+            ui_params: RefCell::new(ui_param_tx),
             hw_midi_tx: Some(hw_midi_tx),
             insert_handoff,
             maps_to_audio,
@@ -7200,6 +7385,12 @@ impl Engine {
             fault,
             insert_editors: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
             insert_editor_handles: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            insert_lv2_uris: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            insert_lv2_values: (0..RACK_SEATS)
+                .map(|_| std::array::from_fn(|_| Vec::new()))
+                .collect(),
             insert_state_handles: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
             insert_latency_handles: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
             insert_state_errors: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
@@ -7347,6 +7538,8 @@ impl Engine {
             channels,
             loaded,
             editor_handle,
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            lv2_uri: None,
             state_handle: Some(state_handle),
             latency_handle,
             latency_now,
@@ -7433,6 +7626,7 @@ impl Engine {
                 sample_rate: self.output.sample_rate,
             },
             editor_handle: None,
+            lv2_uri: Some(uri.to_owned()),
             state_handle: None,
             latency_handle: None,
             latency_now: 0,
@@ -7466,6 +7660,24 @@ impl Engine {
                 .and_then(|r| r.get_mut(slot))
             {
                 *h = None;
+            }
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            if let Some(h) = self
+                .insert_lv2_uris
+                .get_mut(strip)
+                .and_then(|r| r.get_mut(slot))
+            {
+                *h = None;
+            }
+            // A new tenant's ports are not the old one's. Left standing, the
+            // shadow would push one plugin's numbers into another's window.
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            if let Some(v) = self
+                .insert_lv2_values
+                .get_mut(strip)
+                .and_then(|r| r.get_mut(slot))
+            {
+                v.clear();
             }
             if let Some(h) = self
                 .insert_state_handles
@@ -7516,6 +7728,8 @@ impl Engine {
             channels,
             loaded,
             editor_handle,
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            lv2_uri,
             state_handle,
             latency_handle,
             latency_now,
@@ -7534,6 +7748,24 @@ impl Engine {
             .and_then(|r| r.get_mut(slot))
         {
             *h = None;
+        }
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        if let Some(h) = self
+            .insert_lv2_uris
+            .get_mut(strip)
+            .and_then(|r| r.get_mut(slot))
+        {
+            *h = None;
+        }
+        // A new tenant's ports are not the old one's. Left standing, the
+        // shadow would push one plugin's numbers into another's window.
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        if let Some(v) = self
+            .insert_lv2_values
+            .get_mut(strip)
+            .and_then(|r| r.get_mut(slot))
+        {
+            v.clear();
         }
         if let Some(h) = self
             .insert_state_handles
@@ -7581,6 +7813,14 @@ impl Engine {
             .and_then(|r| r.get_mut(slot))
         {
             *h = editor_handle;
+        }
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        if let Some(h) = self
+            .insert_lv2_uris
+            .get_mut(strip)
+            .and_then(|r| r.get_mut(slot))
+        {
+            *h = lv2_uri;
         }
         if let Some(h) = self
             .insert_state_handles
@@ -7691,6 +7931,59 @@ impl Engine {
             editor.focus();
             return Ok(());
         }
+        // **The LV2 road, taken before the VST3 one and returning early.** An
+        // LV2 bay has no `EditorHandle` and never will — see `Prepared::lv2_uri`
+        // — so falling through to the check below would report "nothing is
+        // loaded" about a plugin that is loaded and running. That is the worst
+        // shape a bug can take: a true-sounding message about the wrong thing.
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        if let Some(uri) = self
+            .insert_lv2_uris
+            .get(strip)
+            .and_then(|r| r.get(slot))
+            .and_then(Option::as_ref)
+            .cloned()
+        {
+            let title = match self.insert(strip, slot) {
+                Some(l) => format!("{} - Tangent, insert {}", l.class, slot + 1),
+                None => format!("Insert {} - Tangent", slot + 1),
+            };
+            // The device's rate, not a guess: an LV2 UI that draws a filter
+            // curve computes it from the rate it is told, and a window drawn
+            // against 44100 beside a plugin running at 48000 is a lie the user
+            // reads off the screen.
+            let editor = tangent_host::Editor::open_lv2(
+                &uri,
+                self.output.sample_rate as f32,
+                &title,
+            )
+            .map_err(|e| e.to_string())?;
+            // **The DSP's current values, pushed into the fresh window.** A UI
+            // opens knowing nothing; without this every control would show its
+            // default and the first touch of any of them would snap the sound
+            // back to that default. The values come from the same handle the
+            // parameter panel reads, so the two agree by construction.
+            let mut editor = editor;
+            if let Some(vals) = self
+                .insert_lv2_values
+                .get(strip)
+                .and_then(|r| r.get(slot))
+            {
+                for (id, &v) in vals.iter().enumerate() {
+                    if v.is_finite() {
+                        editor.port_changed(u32::try_from(id).unwrap_or(u32::MAX), v);
+                    }
+                }
+            }
+            if let Some(e) = self
+                .insert_editors
+                .get_mut(strip)
+                .and_then(|r| r.get_mut(slot))
+            {
+                *e = Some(editor);
+            }
+            return Ok(());
+        }
         let Some(handle) = self
             .insert_editor_handles
             .get(strip)
@@ -7735,6 +8028,18 @@ impl Engine {
     /// so the only way to ask is to build a view and throw it away); every
     /// call after that is a cached bool.
     pub fn insert_has_editor(&self, strip: usize, slot: usize) -> bool {
+        // Asked once per bay per frame by the menu that greys the item, so it
+        // must not be the expensive question. `has_ui` is a metadata read; see
+        // its own note on why it does not `dlopen`.
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        if let Some(uri) = self
+            .insert_lv2_uris
+            .get(strip)
+            .and_then(|r| r.get(slot))
+            .and_then(Option::as_ref)
+        {
+            return tangent_host::lv2ui::Ui::has_ui(uri);
+        }
         self.insert_editor_handles
             .get(strip)
             .and_then(|r| r.get(slot))
@@ -7809,6 +8114,79 @@ impl Engine {
             for editor in rack {
                 if editor.as_ref().is_some_and(tangent_host::Editor::closed) {
                     *editor = None;
+                }
+            }
+        }
+        // **And the knobs the user just turned, on their way to the sound.**
+        //
+        // This is the half of an LV2 editor that has no VST3 counterpart: the
+        // window and the DSP are two shared objects with no channel between
+        // them except this one. It is done in the same poll as the close check
+        // because they answer to the same clock — `Editor::closed` is what
+        // pumps the X connection and calls the UI's idle, so the edits this
+        // drains were produced by the call immediately above.
+        //
+        // Empty for a VST3 bay, at no cost: `Editor::drain_edits` returns an
+        // empty `Vec` without asking anything.
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        {
+            let mut pending: Vec<UiParam> = Vec::new();
+            for (strip, rack) in self.insert_editors.iter_mut().enumerate() {
+                for (bay, editor) in rack.iter_mut().enumerate() {
+                    let Some(editor) = editor.as_mut() else {
+                        continue;
+                    };
+                    // Dropped rather than clamped if either index somehow does
+                    // not fit. A saturating conversion here would deliver the
+                    // edit to the WRONG bay, which is worse than not delivering
+                    // it: the user would hear a plugin they were not touching.
+                    let (Ok(lane), Ok(bay)) = (u16::try_from(strip), u8::try_from(bay)) else {
+                        continue;
+                    };
+                    for (id, value) in editor.drain_edits() {
+                        pending.push(UiParam {
+                            lane,
+                            bay,
+                            // Already the plugin's own control-port index:
+                            // `set_param` indexes those, and the port number the
+                            // spec hands the UI's write function is the same
+                            // number. No translation, and none wanted — a
+                            // mapping table here would be a second source of
+                            // truth about which knob is which.
+                            id,
+                            value: f64::from(value),
+                        });
+                    }
+                }
+            }
+            // The shadow, updated from the same list that goes to the audio
+            // thread — one source, so the window's next opening and the sound
+            // cannot disagree. Gaps are `NAN` rather than zero: a port that has
+            // never been touched must be left at the plugin's own default, and
+            // zero is a real value for plenty of controls.
+            for u in &pending {
+                let Some(v) = self
+                    .insert_lv2_values
+                    .get_mut(usize::from(u.lane))
+                    .and_then(|r| r.get_mut(usize::from(u.bay)))
+                else {
+                    continue;
+                };
+                let id = u.id as usize;
+                if v.len() <= id {
+                    v.resize(id + 1, f32::NAN);
+                }
+                v[id] = u.value as f32;
+            }
+            if !pending.is_empty() {
+                if let Ok(mut tx) = self.ui_params.try_borrow_mut() {
+                    for u in pending {
+                        // A full ring drops the value rather than stalling the
+                        // UI thread. The next movement of the same knob carries
+                        // the same information, so the loss is a frame of lag
+                        // on a drag, not a control stuck at the wrong number.
+                        let _ = tx.push(u);
+                    }
                 }
             }
         }
@@ -10882,6 +11260,7 @@ mod tests {
         // abandoned peer (`pop` reports empty, `push` fills to capacity), so a
         // renderer under test needs no partner threads at all.
         let (_, midi) = RingBuffer::<MidiEvent>::new(1024);
+        let (_, ui_params) = RingBuffer::<UiParam>::new(1024);
         let (_, hw_midi) = RingBuffer::<MidiEvent>::new(1024);
         // Empty racks: every test here is about the mixing, and an empty rack
         // is the path every channel takes until somebody loads something.
@@ -10998,6 +11377,7 @@ mod tests {
             builtin_scratch: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             channel_gain: [1.0; CHANNELS],
             midi,
+            ui_params,
             hw_midi,
             pending: None,
             notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK),
@@ -11025,7 +11405,7 @@ mod tests {
             // song has ever automated on one effect, and the whole table is
             // 444 short vectors — a few kilobytes bought at load time so the
             // audio thread never asks for memory.
-            auto_params: (0..CHANNELS * INSERTS)
+            auto_params: (0..RACK_SEATS * INSERTS)
                 .map(|_| Vec::with_capacity(AUTO_PARAMS_PER_BAY))
                 .collect(),
             auto_incoming: RingBuffer::<tangent_ui::automation::Automation>::new(2).1,
@@ -11051,6 +11431,62 @@ mod tests {
         let mut r = test_renderer(Arc::clone(&shared), tap_tx, dev_ch);
         r.midi = midi_rx;
         (r, midi_tx, shared)
+    }
+
+    /// A knob turned in a plugin's own window reaches the audio thread — and
+    /// reaches it on a PAD, which is the seat this road did not used to serve.
+    ///
+    /// Pins two things that were separately wrong. The first: every rack
+    /// outside the general channels was handed an empty parameter queue, so an
+    /// LV2 effect on a pad had a window whose knobs moved and changed nothing.
+    /// The second: the drain sat after `resolve_automation`'s empty-song
+    /// shortcut, which meant plugin windows only worked in songs that happened
+    /// to have automation drawn — the rarer case, silently.
+    #[test]
+    fn ui_edits_reach_every_seat_including_pads() {
+        let (mut r, _midi, _shared) = renderer_with_midi(2);
+        let (mut tx, rx) = RingBuffer::<UiParam>::new(16);
+        r.ui_params = rx;
+        // A seat past the general channels: the pads' rows are exactly what the
+        // widened ledger added, and an off-by-one here would show as a silent
+        // drop rather than a panic.
+        let pad = RACK_SEATS - 1;
+        assert!(pad >= CHANNELS, "the test wants a seat past the channels");
+        tx.push(UiParam {
+            lane: u16::try_from(pad).expect("seat count fits a u16"),
+            bay: 1,
+            id: 7,
+            value: 0.25,
+        })
+        .expect("the ring is empty");
+        // No automation at all — the shortcut path, which is the common song.
+        assert!(r.automation.is_empty());
+        r.resolve_automation(0);
+        let q = &r.auto_params[pad * INSERTS + 1];
+        assert_eq!(q.len(), 1, "the edit did not reach the pad's bay");
+        assert_eq!(q[0].id, 7);
+        assert!((q[0].value - 0.25).abs() < 1e-9);
+        // And it is consumed, not re-applied for ever: a knob is an event.
+        r.resolve_automation(1);
+        assert!(r.auto_params[pad * INSERTS + 1].is_empty());
+    }
+
+    /// A UI edit for a seat or bay that does not exist is dropped, not indexed
+    /// with. The ring carries numbers written by a UI thread, and the audio
+    /// thread trusting one of them is how a panic gets into a callback.
+    #[test]
+    fn ui_edits_out_of_range_are_dropped() {
+        let (mut r, _midi, _shared) = renderer_with_midi(2);
+        let (mut tx, rx) = RingBuffer::<UiParam>::new(16);
+        r.ui_params = rx;
+        for u in [
+            UiParam { lane: u16::MAX, bay: 0, id: 0, value: 1.0 },
+            UiParam { lane: 0, bay: u8::MAX, id: 0, value: 1.0 },
+        ] {
+            tx.push(u).expect("the ring has room");
+        }
+        r.resolve_automation(0);
+        assert!(r.auto_params.iter().all(Vec::is_empty));
     }
 
     fn queue(tx: &mut Producer<MidiEvent>, stamp: Nanos, bytes: [u8; 3]) {

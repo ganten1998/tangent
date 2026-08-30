@@ -244,7 +244,22 @@ impl EditorHandle {
 ///
 /// `!Send` and `!Sync`, because the window is.
 pub struct Editor {
-    inner: Inner,
+    inner: EditorInner,
+}
+
+/// Which kind of plugin window this is.
+///
+/// **An enum here rather than a trait, and not in `x11::Window`.** That type is
+/// built around a VST3 `IPlugView` and the `IPlugFrame`/`IRunLoop` pair a VST3
+/// plugin expects to be handed; an LV2 UI wants none of it. Threading "or
+/// nothing" through every one of those seams would leave a two-armed hole in
+/// the middle of the one window type that already works. Two small windows that
+/// each do one thing, joined at the public type callers actually hold, keeps
+/// the difference in one place.
+enum EditorInner {
+    Plugin(Inner),
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    Lv2(crate::lv2ui::Lv2Window),
 }
 
 impl Editor {
@@ -264,8 +279,48 @@ impl Editor {
         let view = handle.create_view().ok_or(EditorError::NoEditor)?;
         handle.probed.set(Some(true));
         Ok(Self {
-            inner: Inner::open(view, title)?,
+            inner: EditorInner::Plugin(Inner::open(view, title)?),
         })
+    }
+
+    /// Open an LV2 plugin's own editor, by plugin URI.
+    ///
+    /// `sample_rate` is passed to the UI: one that draws a frequency response
+    /// or a decay curve computes it from the rate, and a host that stays silent
+    /// gets guessed at.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub fn open_lv2(plugin_uri: &str, sample_rate: f32, title: &str) -> Result<Self, EditorError> {
+        let win = crate::lv2ui::Lv2Window::open(plugin_uri, sample_rate, title)
+            .map_err(EditorError::Refused)?;
+        Ok(Self {
+            inner: EditorInner::Lv2(win),
+        })
+    }
+
+    /// Tell the plugin's own window what a control is set to.
+    ///
+    /// The host's half of the LV2 UI contract: a UI opens knowing nothing and
+    /// is told its values by `port_event`. A no-op for VST3, whose editor asks
+    /// its own controller.
+    pub fn port_changed(&mut self, id: u32, value: f32) {
+        match &mut self.inner {
+            EditorInner::Plugin(_) => {}
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            EditorInner::Lv2(w) => w.port_changed(id, value),
+        }
+    }
+
+    /// Control changes the user made inside the plugin's own window.
+    ///
+    /// Empty for a VST3, whose editor talks to its controller directly and
+    /// needs no host in the middle. An LV2 UI has no route to the DSP at all
+    /// except through here.
+    pub fn drain_edits(&mut self) -> Vec<(u32, f32)> {
+        match &mut self.inner {
+            EditorInner::Plugin(_) => Vec::new(),
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            EditorInner::Lv2(w) => w.drain_edits().into_iter().map(|e| (e.port, e.value)).collect(),
+        }
     }
 
     /// The user closed the window. The caller should drop this `Editor`.
@@ -283,20 +338,32 @@ impl Editor {
     /// stops painting; the app polls every frame and keeps a frame coming
     /// while any editor is open, which is the whole contract.
     pub fn closed(&self) -> bool {
-        self.inner.closed()
+        match &self.inner {
+            EditorInner::Plugin(w) => w.closed(),
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            EditorInner::Lv2(w) => w.closed(),
+        }
     }
 
     /// Bring the window to the front and give it the keyboard.
     ///
     /// What "open the editor" should do when one is already open.
     pub fn focus(&self) {
-        self.inner.focus();
+        match &self.inner {
+            EditorInner::Plugin(w) => w.focus(),
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            EditorInner::Lv2(w) => w.focus(),
+        }
     }
 
     /// The window's current content size in points, as the plugin last asked
     /// for it.
     pub fn size(&self) -> (i32, i32) {
-        self.inner.size()
+        match &self.inner {
+            EditorInner::Plugin(w) => w.size(),
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            EditorInner::Lv2(w) => w.size(),
+        }
     }
 
     /// How many times the plugin has asked the host to resize it.
@@ -305,7 +372,11 @@ impl Editor {
     /// wired up at all: Pianoteq calls it when its layout changes, so a
     /// non-zero count here is proof the host side of the contract is live.
     pub fn resizes(&self) -> u64 {
-        self.inner.resizes()
+        match &self.inner {
+            EditorInner::Plugin(w) => w.resizes(),
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            EditorInner::Lv2(w) => w.resizes(),
+        }
     }
 }
 
