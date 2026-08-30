@@ -4391,6 +4391,10 @@ impl DesktopApp {
             .filter(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::DRUMPAD_PATH))
             .collect();
         e.set_drum_strips(drum_lanes.iter().fold(0u32, |m, ch| m | 1 << ch.min(&31)));
+        // Groups are part of the mix, so the BOUNCE has them too — an export
+        // that ignored the folder buses would render a different record from
+        // the one being listened to, which is the worst kind of export bug.
+        e.set_folders(self.app.folder_parents());
         // The DX7's sound is the SESSION's cartridge — the live engine
         // already carries it, so the export borrows the loaded copy.
         if builtin.is_some() {
@@ -5951,6 +5955,11 @@ impl DesktopApp {
             .filter(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::DRUMPAD_PATH))
             .collect();
         e.set_drum_strips(drum_lanes.iter().fold(0u32, |m, ch| m | 1 << ch.min(&31)));
+        // **The folder tree**, pushed with everything else so a group made,
+        // broken or reordered takes effect on the next block. Refused whole
+        // if it is not a forest — see `Engine::set_folders` — because half a
+        // tree is a routing graph nobody drew.
+        e.set_folders(self.app.folder_parents());
         // Never read from a settings file — see `IvoryApp::input_monitor`. It
         // is pushed every frame like every other monitor setting, and its value
         // at launch is false because the field it comes from starts false.
