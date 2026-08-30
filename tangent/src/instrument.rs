@@ -2611,6 +2611,31 @@ const AUTO_PARAMS_PER_BAY: usize = 16;
 
 const NO_AUTOMATION: &[&[tangent_host::ParamPoint]; INSERTS] = &[&[]; INSERTS];
 
+/// **Where one lane's bay keeps its automation for the block.**
+///
+/// `auto_params` is a flat table of `row * INSERTS + bay`, and this is the
+/// only place that decides which row a curve belongs to. `None` is a curve
+/// naming something that cannot hold one.
+///
+/// A channel is its own row. The MASTER is two rows past the channels,
+/// because its strip carries six bays in two racks: bays 0..2 are the
+/// original rack's and 3..5 the one added above it. Appended, never
+/// renumbered — `AutoParam` keys are written to the document, so a bay that
+/// changed meaning would silently move somebody's automation onto a
+/// different plugin. `IvoryApp::master_bay` is the same rule on the way in.
+fn param_slot(lane: usize, bay: usize) -> Option<(usize, usize)> {
+    if lane == MASTER_AUTO_LANE {
+        return if bay < INSERTS {
+            Some((CHANNELS, bay))
+        } else if bay < INSERTS * 2 {
+            Some((CHANNELS + 1, bay - INSERTS))
+        } else {
+            None
+        };
+    }
+    (lane < CHANNELS && bay < INSERTS).then_some((lane, bay))
+}
+
 fn run_rack(
     rack: &mut Rack,
     planar: &mut [Vec<f32>],
@@ -3194,7 +3219,15 @@ impl Renderer {
         // The seat's own automation block. A channel's is its own index; the
         // master's sits one past them — see the curve walk in
         // `refresh_automation`, which files it there.
-        let slot_lane = if at == STRIPS { CHANNELS } else { at };
+        // The master's two racks sit one and two past the channels — see
+        // the curve walk in `refresh_automation`, which files them there.
+        let slot_lane = if at == STRIPS {
+            CHANNELS
+        } else if at == tangent_ui::recorder::MASTER_EXTRA_SEAT {
+            CHANNELS + 1
+        } else {
+            at
+        };
         let params: [&[tangent_host::ParamPoint]; INSERTS] = std::array::from_fn(|b| {
             self.auto_params
                 .get(slot_lane * INSERTS + b)
@@ -5170,17 +5203,15 @@ impl Renderer {
             // the record — and its curves are stored under a lane one past
             // the channels, so without this the menu offered its parameters
             // and the engine dropped every one of them on the floor.
-            let slot_lane = if lane == MASTER_AUTO_LANE {
-                CHANNELS
-            } else if lane < CHANNELS {
-                lane
-            } else {
+            //
+            // **And it is TWO blocks**, because the master's strip carries
+            // six bays in two racks. Bays 0..2 are the original rack's and
+            // 3..5 the one added above it — appended, never renumbered, so a
+            // curve already drawn still names its own plugin. See
+            // `IvoryApp::master_bay`, which is the same rule on the way in.
+            let Some((slot_lane, bay)) = param_slot(lane, usize::from(bay)) else {
                 continue;
             };
-            let bay = usize::from(bay);
-            if bay >= INSERTS {
-                continue;
-            }
             let Some(value) = curve.value_at(secs) else {
                 continue;
             };
@@ -7375,7 +7406,7 @@ impl Engine {
             // song has ever automated on one effect, and the whole table is
             // 444 short vectors — a few kilobytes bought at load time so the
             // audio thread never asks for memory.
-            auto_params: (0..(CHANNELS + 1) * INSERTS)
+            auto_params: (0..(CHANNELS + 2) * INSERTS)
                 .map(|_| Vec::with_capacity(AUTO_PARAMS_PER_BAY))
                 .collect(),
             auto_incoming,
@@ -8180,6 +8211,12 @@ impl Engine {
         failed.sort_unstable();
         failed.dedup();
         failed
+    }
+
+    /// How many `row * INSERTS + bay` slots the automation table holds.
+    #[cfg(test)]
+    fn auto_params_len_for_test(&self) -> usize {
+        self.offline.as_ref().map_or(0, |r| r.auto_params.len())
     }
 
     #[cfg(test)]
@@ -11357,7 +11394,7 @@ mod tests {
             // song has ever automated on one effect, and the whole table is
             // 444 short vectors — a few kilobytes bought at load time so the
             // audio thread never asks for memory.
-            auto_params: (0..(CHANNELS + 1) * INSERTS)
+            auto_params: (0..(CHANNELS + 2) * INSERTS)
                 .map(|_| Vec::with_capacity(AUTO_PARAMS_PER_BAY))
                 .collect(),
             auto_incoming: RingBuffer::<tangent_ui::automation::Automation>::new(2).1,
@@ -12200,6 +12237,51 @@ mod tests {
         assert!(
             worst < 1.0e-6,
             "a group did not sound like the loose tracks: worst sample differs by {worst}"
+        );
+    }
+
+    /// **Every bay a lane really has can be automated, the master's six
+    /// included.**
+    ///
+    /// Its strip grew a second rack and the curve walk still rejected any
+    /// bay past the first three, so half the master's plugins could be
+    /// offered, drawn and saved while the engine dropped every point on the
+    /// floor — the owner's "expose all of the master's automations".
+    #[test]
+    fn the_masters_second_rack_has_somewhere_to_keep_its_automation() {
+        // A channel is its own row, and only its own bays exist.
+        assert_eq!(param_slot(0, 0), Some((0, 0)));
+        assert_eq!(param_slot(7, 2), Some((7, 2)));
+        assert_eq!(param_slot(7, INSERTS), None, "a channel grew a fourth bay");
+        assert_eq!(param_slot(CHANNELS + 5, 0), None, "a lane nobody has");
+
+        // The master keeps its original rack exactly where it was — this is
+        // the assertion that stops a saved curve moving to another plugin.
+        for bay in 0..INSERTS {
+            assert_eq!(
+                param_slot(MASTER_AUTO_LANE, bay),
+                Some((CHANNELS, bay)),
+                "the master's original rack moved"
+            );
+        }
+        // And the second rack is APPENDED after it.
+        for bay in 0..INSERTS {
+            assert_eq!(
+                param_slot(MASTER_AUTO_LANE, INSERTS + bay),
+                Some((CHANNELS + 1, bay)),
+                "the master's second rack has no row"
+            );
+        }
+        assert_eq!(param_slot(MASTER_AUTO_LANE, INSERTS * 2), None, "a seventh bay");
+
+        // The table is big enough to hold every row this hands out — the
+        // engine writes through `get_mut`, so a table one row short would
+        // drop the automation silently rather than fail.
+        let e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        let widest = param_slot(MASTER_AUTO_LANE, INSERTS * 2 - 1).expect("no last bay");
+        assert!(
+            e.auto_params_len_for_test() > widest.0 * INSERTS + widest.1,
+            "the automation table is smaller than the bays it is handed"
         );
     }
 

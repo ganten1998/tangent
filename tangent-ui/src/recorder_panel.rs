@@ -168,7 +168,9 @@ const BAND_DAMP_FLOOR: f64 = 0.63;
 /// actually work at, and this display is 2560 points wide, so the exponent is
 /// whatever makes 2560 come out a tenth shorter than the root did —
 ///
-///     (2560/1600)^p = 0.9 * sqrt(2560/1600)   =>   p = ln(0.9*sqrt(1.6))/ln(1.6)
+/// ```text
+/// (2560/1600)^p = 0.9 * sqrt(2560/1600)   =>   p = ln(0.9*sqrt(1.6))/ln(1.6)
+/// ```
 ///
 /// A flat 0.9 multiplier would have been the obvious way to write "ten per
 /// cent shorter" and it is the wrong one: it applies at 1601 points as

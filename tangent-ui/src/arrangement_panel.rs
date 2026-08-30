@@ -344,6 +344,9 @@ pub struct ArrangeView<'a> {
     /// theme though so all of these must be unique colors that are matched
     /// to the 16 themes."
     pub master_knob: (u8, u8, u8),
+    /// **The theme's own accent**, `settings.white_key_active_color`: what
+    /// an automation dial wears. See [`auto_dial_body`].
+    pub accent: (u8, u8, u8),
     /// Whether the master's row is drawn. `Cmd`/`Ctrl+M`; shown by default.
     pub show_master_row: bool,
     /// The master rack's six short names — empty for an empty bay.
@@ -1644,6 +1647,54 @@ fn dial(painter: &Painter, cell: Rect, t: f32, cap: Color32, ring: Color32, need
 /// The blue a VOLUME dial wears, wherever one is drawn.
 const DIAL_VOLUME: Color32 = Color32::from_rgb(0x1C, 0x6F, 0xD6);
 
+/// **An automation dial wears the THEME's accent, not one fixed blue.**
+///
+/// Every automation row on every theme drew the same `DIAL_VOLUME` — a blue
+/// belonging to the Default palette and to no other — so sixteen themes had
+/// one dial between them. The owner: "I want a true color picked per theme
+/// freshly for the automation dials."
+///
+/// Picked, not stated: the theme's own accent is the colour, and it is moved
+/// only as far as it has to be to stay legible where it is actually drawn —
+/// the cap has to read against the header face it sits on, and the needle
+/// drawn ACROSS it has to read against the cap. That last pairing is the one
+/// this app keeps getting wrong: ink is a property of the surface, and a
+/// dial whose colour was chosen against the lane field is a dial nobody
+/// checked against the header.
+///
+/// Walking outward from the accent rather than jumping to a safe value means
+/// a theme that is already legible keeps its colour exactly, and one that is
+/// not gives up the least brightness that works. If nothing does — a
+/// near-white accent on a near-white face — the ink for that face is the
+/// honest answer: it is guaranteed to read, and a dial you can see in the
+/// wrong colour beats one you cannot see in the right one.
+fn auto_dial_body(p: &Ink, accent: (u8, u8, u8)) -> Color32 {
+    let face = shade(p.hdr_face, 0.92);
+    let ok = |c: Color32| {
+        crate::recorder_panel::contrast_ratio(c, face) >= 1.8
+            && crate::recorder_panel::contrast_ratio(p.clip_ink, c) >= 2.0
+    };
+    let base = Color32::from_rgb(accent.0, accent.1, accent.2);
+    if ok(base) {
+        return base;
+    }
+    // Outward in both directions, nearest first, so the answer is the
+    // smallest change to the theme's own colour.
+    for step in 1..=24 {
+        let d = step as f32 * 0.05;
+        for k in [1.0 - d, 1.0 + d] {
+            if k <= 0.0 {
+                continue;
+            }
+            let c = shade(base, k);
+            if ok(c) {
+                return c;
+            }
+        }
+    }
+    on_ink(face)
+}
+
 /// The MASTER's cap. Black, and the only dial on the timeline that is.
 ///
 /// Not pure black: the needle drawn across it is the row's own ink, and on a
@@ -2105,7 +2156,7 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
             // The cells first: the header as a whole still opens the
             // parameter menu, so a switch has to be asked about before the
             // room it sits in.
-            let h = auto_header(row.header);
+            let h = auto_cells(view, lane, row.header);
             for (r, hit) in [
                 (h.close, Hit::AutoClose(lane, slot)),
                 (h.arm, Hit::AutoArm(lane, slot)),
@@ -2284,7 +2335,7 @@ pub fn targets(rect: Rect, view: &ArrangeView<'_>) -> Vec<(Rect, Hit)> {
             RowKind::Tempo => push(row.header, Hit::TempoHeader),
             RowKind::Master => {}
             RowKind::Automation(lane, slot) => {
-                let h = auto_header(row.header);
+                let h = auto_cells(view, lane, row.header);
                 push(h.close, Hit::AutoClose(lane, slot));
                 push(h.arm, Hit::AutoArm(lane, slot));
                 push(h.bypass, Hit::AutoBypass(lane, slot));
@@ -3139,6 +3190,33 @@ fn bar_step(view: &ArrangeView<'_>, width: f32) -> u32 {
 /// before the header column is filled with `hdr_wood`, so anything it painted
 /// there was covered. Everything a track's header draws happens after that
 /// fill; these rows have to join it.
+/// **A child's automation rows step right with the track they belong to.**
+///
+/// The indent is the only thing on screen that says "contained" — see
+/// [`FOLDER_INDENT`] — and an automation row that did not take it left a
+/// folder's children's rows sitting where the FOLDER's own would, so a
+/// column of dials no longer lined up with the tracks they belong to.
+///
+/// The face still fills the whole row, exactly as a track's header does: what
+/// moves is the contents. One function because THREE callers need the same
+/// rect — the paint, the hit test and the tab order — and a hit test that
+/// disagrees with the paint is a control you can see and cannot press.
+fn auto_cells(view: &ArrangeView<'_>, lane: usize, header: Rect) -> AutoHeader {
+    let indent = if view.lanes.get(lane).is_some_and(|l| l.in_folder) {
+        FOLDER_INDENT
+    } else {
+        0.0
+    };
+    if indent > 0.0 && header.width() > indent + 40.0 {
+        auto_header(Rect::from_min_max(
+            Pos2::new(header.left() + indent, header.top()),
+            header.max,
+        ))
+    } else {
+        auto_header(header)
+    }
+}
+
 fn draw_auto_headers(
     painter: &Painter,
     l: &Layout,
@@ -3179,7 +3257,7 @@ fn draw_auto_headers(
                 );
             }
             let ink = on_ink(face);
-            let h = auto_header(row.header);
+            let h = auto_cells(view, lane, row.header);
             // **The × — leave.** A cross rather than a letter: the three
             // switches beside it are about the SIGNAL and this one is about
             // the view, so it says so by not looking like them. Drawn, not
@@ -3258,7 +3336,11 @@ fn draw_auto_headers(
                     painter,
                     h.dial,
                     auto.resting as f32,
-                    if auto.bypassed { p.hdr_lane } else { DIAL_VOLUME },
+                    if auto.bypassed {
+                        p.hdr_lane
+                    } else {
+                        auto_dial_body(p, view.accent)
+                    },
                     p.lane,
                     p.clip_ink,
                 );
@@ -5274,6 +5356,7 @@ ArrangeView {
             master_peak: [0.0; 2],
             master_color: 0,
             master_knob: (0xE8, 0x3A, 0x4E),
+            accent: (0x6C, 0x9B, 0xD2),
             show_master_row: true,
             master_inserts: [""; crate::recorder::INSERTS * 2],
             show_tempo_lane: false,
@@ -5934,13 +6017,15 @@ ArrangeView {
         assert!(crate::a11y::Gesture::Most.nudged(t.norm) >= 1.0);
     }
 
-    /// **The arrangement wears the THEME, in both modes, legibly.**
+    /// **Every theme, in both modes, measured where the paint actually
+    /// lands.**
     ///
-    /// It used to carry two hard-coded wardrobes no theme could reach — warm
-    /// browns for dark, greys for light — so it was the one view that stayed
-    /// put while the rest of the app changed. Now every surface derives from
-    /// the band's wood, the strip face and the well, and this is what keeps
-    /// the derivation honest across all sixteen.
+    /// This view was two hard-coded wardrobes that no theme could reach, and
+    /// what keeps the derivation honest across all sixteen is measuring each
+    /// pairing against the surface it is really drawn on — the header text on
+    /// the strip face, a lane title on that lane's own plate, the automation
+    /// dial on the header rather than on the field below it. Every entry
+    /// here is a pairing that was got wrong once.
     #[test]
     fn every_theme_dresses_the_arrangement_legibly_in_both_modes() {
         let mut bad: Vec<String> = Vec::new();
@@ -6033,7 +6118,18 @@ ArrangeView {
                 {
                     let hface = shade(p.hdr_face, 0.92);
                     check("automation header seam", auto_header_seam(&p), hface, 1.12);
-                    check("automation dial", DIAL_VOLUME, hface, 1.35);
+                    // **The automation dial, in the theme's own accent, measured
+                // against the header face it is DRAWN on** — not against the
+                // lane field below it, which is the mistake this audit
+                // exists to catch and made once already.
+                let cap = auto_dial_body(&p, (
+                    set.white_key_active_color.r,
+                    set.white_key_active_color.g,
+                    set.white_key_active_color.b,
+                ));
+                check("automation dial", cap, hface, 1.35);
+                // And the needle drawn ACROSS it has to read on it.
+                check("automation needle", p.clip_ink, cap, 1.9);
                 }
                 // **The MASTER's dial, per theme.** Its body is the theme's
                 // own master red and its outline and needle are fixed, so
