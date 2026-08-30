@@ -60,13 +60,41 @@ make_icns() {
   tmp="$(mktemp -d)"
   iconset="$tmp/tangent.iconset"
   mkdir -p "$iconset"
+  # **The small sizes are drawn from THICKENED strokes, the big ones are not.**
+  #
+  # The wordmark is a hairline lattice, and a hairline is the one thing that
+  # does not survive being resampled to a menu-bar icon: at 16 px every line
+  # lands between pixels and the whole mark comes back as a black square with
+  # a ghost in it. Dilating first — at full resolution, where the strokes are
+  # still whole — is what keeps the lattice and the three circles legible
+  # once it is small. The FreeBSD session found this the hard way in a MATE
+  # taskbar; `assets/tangent-128.png` is their answer for the square art, and
+  # this is the same answer for the squircle.
+  #
+  # 128 and up are untouched: they have the pixels to show the art as drawn,
+  # and thickening them would be a different logo in the Dock.
+  local small=""
+  if command -v magick >/dev/null 2>&1; then
+    # A radius proportional to the source, so replacing the artwork with a
+    # bigger or smaller file does not silently change how much this thickens.
+    local w r
+    w="$(magick identify -format '%w' "$ICON_SRC" 2>/dev/null || echo 0)"
+    r=$(( w / 150 )); [ "$r" -lt 1 ] && r=1
+    small="$tmp/small.png"
+    magick "$ICON_SRC" -channel RGB -morphology Dilate "Disk:$r" +channel \
+      -modulate 112 "$small" 2>/dev/null || small=""
+  fi
   for spec in 16:icon_16x16.png 32:icon_16x16@2x.png 32:icon_32x32.png \
               64:icon_32x32@2x.png 128:icon_128x128.png \
               256:icon_128x128@2x.png 256:icon_256x256.png \
               512:icon_256x256@2x.png 512:icon_512x512.png \
               1024:icon_512x512@2x.png; do
     px="${spec%%:*}"; name="${spec#*:}"
-    sips -z "$px" "$px" -s format png --out "$iconset/$name" "$ICON_SRC" >/dev/null
+    # No ImageMagick, no thickening — the icon is then what it was before
+    # rather than a build that fails over an icon.
+    local src="$ICON_SRC"
+    if [ -n "$small" ] && [ "$px" -le 64 ]; then src="$small"; fi
+    sips -z "$px" "$px" -s format png --out "$iconset/$name" "$src" >/dev/null
   done
   if iconutil -c icns -o "$out" "$iconset" 2>/dev/null; then
     echo "==> $out (iconutil)"

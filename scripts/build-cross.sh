@@ -102,8 +102,34 @@ gen_ico() {
     echo "NOTE: $ICON_SRC is small; frames above its own size are upscaled"
     echo "      and will look soft. Supply the artwork at 256px or more."
   fi
+  # **Small frames from THICKENED strokes, large ones from the art itself.**
+  #
+  # Same reason the macOS iconset does it (see `make_icns`): the wordmark is a
+  # hairline lattice and a hairline does not survive being resampled to 16 px
+  # — a taskbar got a black square with a ghost in it. `auto-resize` renders
+  # every frame from one source, so the frames are built separately and
+  # combined, which is the only way to hint the small ones differently.
   if command -v magick >/dev/null 2>&1; then
-    magick "$ICON_SRC" -define icon:auto-resize=256,128,64,48,32,16 "$out"
+    local w r small
+    w="$(magick identify -format '%w' "$ICON_SRC" 2>/dev/null || echo 0)"
+    r=$(( w / 150 )); [ "$r" -lt 1 ] && r=1
+    tmp="$(mktemp -d)"
+    small="$tmp/small.png"
+    if magick "$ICON_SRC" -channel RGB -morphology Dilate "Disk:$r" +channel \
+         -modulate 112 "$small" 2>/dev/null; then
+      local frames="" fpx fsrc
+      for fpx in 256 128 64 48 32 16; do
+        fsrc="$ICON_SRC"; [ "$fpx" -le 48 ] && fsrc="$small"
+        magick "$fsrc" -resize "${fpx}x${fpx}" "$tmp/$fpx.png" || { rm -rf "$tmp"; return 1; }
+        frames="$frames $tmp/$fpx.png"
+      done
+      # shellcheck disable=SC2086
+      magick $frames "$out" || { rm -rf "$tmp"; return 1; }
+      rm -rf "$tmp"
+    else
+      rm -rf "$tmp"
+      magick "$ICON_SRC" -define icon:auto-resize=256,128,64,48,32,16 "$out"
+    fi
   elif command -v convert >/dev/null 2>&1; then
     convert "$ICON_SRC" -define icon:auto-resize=256,128,64,48,32,16 "$out"
   else

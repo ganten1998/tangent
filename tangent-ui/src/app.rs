@@ -2679,6 +2679,46 @@ impl IvoryApp {
         out
     }
 
+    /// **Every row that belongs to the folder at `ch`**, as a contiguous run.
+    ///
+    /// Not [`Self::folder_children`], which stops at a nested folder because
+    /// it answers "whose direct children are these". A DRAG has to take the
+    /// whole run: leaving a nested group behind orphans it in the middle of
+    /// somebody else's folder, which is a structure nothing can draw.
+    fn folder_run(&self, ch: usize) -> Vec<usize> {
+        if !self.is_folder(ch) {
+            return Vec::new();
+        }
+        (ch + 1..crate::recorder::CHANNELS)
+            .take_while(|n| {
+                self.settings.strip_in_folder.get(*n).copied().unwrap_or(false)
+            })
+            .collect()
+    }
+
+    /// **What a drag CARRIES** — the leaders, plus everything inside any
+    /// folder among them.
+    ///
+    /// A folder IS its rows. Dragging one and leaving the children behind
+    /// does not move a group, it dissolves one: the children stay where they
+    /// are and silently join whatever folder ends up above them. The owner:
+    /// "make it so folders can drag themselves AND THEIR CHILDREN".
+    ///
+    /// Distinct from [`Self::reorder_group`] on purpose, and the difference
+    /// is what stops the drop from flattening the group — see the drop
+    /// handler. What MOVES is this; what the drop re-decides the membership
+    /// of is the leaders alone.
+    fn drag_block(&self, from: usize) -> Vec<usize> {
+        let leaders = self.reorder_group(from);
+        let mut out = leaders.clone();
+        for n in leaders {
+            out.extend(self.folder_run(n));
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// The tracks a reorder drag actually carries: the selection when the
     /// grabbed lane is part of one, otherwise just the lane.
     ///
@@ -2768,16 +2808,19 @@ impl IvoryApp {
         if self.recorder.state.is_active() || self.recorder.arr_recording {
             return;
         }
-        let mut group = self.reorder_group(from);
-        // A folder cannot be dragged into a folder, and cannot be dragged
-        // into ITSELF. Dropping only folders on a folder is a no-op rather
-        // than a structure nothing can draw.
-        group.retain(|n| *n != folder);
+        let mut group = self.drag_block(from);
+        // A folder cannot be dragged into ITSELF. Dropping only folders on a
+        // folder is a no-op rather than a structure nothing can draw.
+        group.retain(|n| *n != folder && !self.folder_run(folder).contains(n));
         if group.is_empty() {
             return;
         }
-        for n in &group {
-            self.set_in_folder(*n, true);
+        // **Membership is the LEADERS' to change.** A child carried along by
+        // its folder is already in a folder — this one's — and saying so
+        // again about the target would move it up a level and leave the
+        // group flat.
+        for n in self.reorder_group(from) {
+            self.set_in_folder(n, true);
         }
         let anchor = self.folder_children(folder).last().copied().unwrap_or(folder);
         let rest: Vec<usize> = (0..CHANNELS).filter(|n| !group.contains(n)).collect();
@@ -7440,14 +7483,10 @@ impl IvoryApp {
     /// itself after the first one lands.
     pub fn move_selection(&mut self, from: usize, to: usize) {
         use crate::recorder::CHANNELS;
-        let mut group: Vec<usize> = self
-            .selected_tracks
-            .iter()
-            .copied()
-            .filter(|n| *n < CHANNELS)
-            .collect();
-        group.sort_unstable();
-        if group.len() < 2 || !group.contains(&from) {
+        // **The BLOCK, not the selection.** A folder brings its rows with it;
+        // one row on its own is still one row. See `drag_block`.
+        let group = self.drag_block(from);
+        if group.len() < 2 {
             self.move_channel(from, to);
             return;
         }
@@ -15982,12 +16021,18 @@ impl IvoryApp {
                             // dragging out of a folder work without a second
                             // gesture: drop anywhere that is not inside one
                             // and the flags come off.
+                            //
+                            // **The LEADERS' membership, not the block's.** A
+                            // child carried along by its folder is inside
+                            // THAT folder, and re-deciding it here from where
+                            // the block landed is what would dissolve the
+                            // group: dropped outside, every child's flag came
+                            // off and the folder arrived empty.
                             let joins = self.folder_of(to);
-                            let group = self.reorder_group(from);
-                            for n in &group {
-                                self.set_in_folder(*n, joins.is_some());
+                            for n in self.reorder_group(from) {
+                                self.set_in_folder(n, joins.is_some());
                                 if joins.is_some() {
-                                    self.set_is_folder(*n, false);
+                                    self.set_is_folder(n, false);
                                 }
                             }
                             self.move_selection(from, to);
@@ -35405,6 +35450,66 @@ mod folder_tests {
         assert!(!a.is_folder(2));
         assert!(!a.in_folder(3) && !a.in_folder(4), "the children were orphaned");
         assert!(a.folder_children(2).is_empty());
+    }
+
+    /// **A folder drags its children with it.**
+    ///
+    /// It used to move the folder ROW alone. The children stayed where they
+    /// were, and because membership is positional they silently joined
+    /// whatever folder ended up above them — so dragging a group did not
+    /// move a group, it dissolved one and quietly re-homed its tracks. The
+    /// owner: "make it so folders can drag themselves AND THEIR CHILDREN".
+    #[test]
+    fn a_folder_dragged_takes_its_children_and_stays_a_folder() {
+        let mut a = app();
+        for n in 0..6 {
+            a.add_bare_track(n);
+        }
+        // Rows 1..3 are a folder with two children; 0, 4 and 5 are plain.
+        a.toggle_folder(1);
+        for n in [2, 3] {
+            a.set_in_folder(n, true);
+        }
+        // `strip_names` is grown lazily, so it is empty until something
+        // sizes it — the same trap the template test hit.
+        a.settings.strip_names = vec![String::new(); crate::recorder::STRIPS + 1];
+        for n in 0..6 {
+            a.settings.strip_names[crate::recorder::Strip::Channel(n).index()] =
+                format!("t{n}");
+        }
+        let name = |a: &IvoryApp, n: usize| a.settings.strip_names[
+            crate::recorder::Strip::Channel(n).index()
+        ].clone();
+        assert_eq!(a.folder_children(1), vec![2, 3]);
+
+        // The whole block is what a drag carries, folder first.
+        assert_eq!(a.drag_block(1), vec![1, 2, 3], "the children were left behind");
+        // A plain row still carries only itself.
+        assert_eq!(a.drag_block(5), vec![5]);
+
+        // Drag the folder down past the plain tracks.
+        a.selected_tracks = vec![1];
+        a.move_selection(1, 4);
+
+        // The three moved together and kept their order.
+        let names: Vec<String> = (0..6).map(|n| name(&a, n)).collect();
+        let f = names.iter().position(|x| x == "t1").expect("the folder vanished");
+        assert_eq!(
+            &names[f..f + 3],
+            &["t1".to_owned(), "t2".to_owned(), "t3".to_owned()],
+            "the block did not travel together: {names:?}"
+        );
+        // And it is STILL a folder with those two children.
+        assert!(a.is_folder(f), "it stopped being a folder on the way");
+        assert_eq!(
+            a.folder_children(f),
+            vec![f + 1, f + 2],
+            "the group dissolved: {names:?}"
+        );
+        assert!(a.in_folder(f + 1) && a.in_folder(f + 2));
+        // The folder itself is not inside anything — it was dropped in open
+        // ground, and that is the half a carried child must not answer for.
+        assert!(!a.in_folder(f), "the folder joined something by landing");
     }
 
     /// **Membership is positional, so it cannot dangle.** A flag with no
