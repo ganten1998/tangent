@@ -72,17 +72,13 @@ windows-sys = { version = "0.60", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
-# ── the editor window, Linux ─────────────────────────────────────────────────
+# ── the editor window (X11) and LV2 ──────────────────────────────────────────
 #
 # `x11rb` is a pure-Rust X11 client: no libX11, no C toolchain, which is what
 # lets cargo-zigbuild keep cross-building Linux from the Mac — the same
 # property the vst3 crate was chosen for. Already in the lock (arboard pulls
 # it). `libc` is for `poll(2)` over the fds a plugin registers with the
 # host's IRunLoop; nothing in std polls a foreign fd without blocking.
-[target.'cfg(target_os = "linux")'.dependencies]
-x11rb = "0.13"
-libc = "0.2"
-
 # **LV2, on the two platforms that have one.**
 #
 # LV2 is the native plugin format of the Linux audio world — lsp-plugins, Calf,
@@ -98,8 +94,15 @@ libc = "0.2"
 #
 # Note this pulls `lv2-sys`, which does not build on FreeBSD unpatched — see the
 # `[patch.crates-io]` in the workspace root.
+#
+# **FreeBSD shares this section with Linux for the X11 pieces too**, and that is
+# the same observation twice: the editor backend is X11 and `poll(2)`, neither
+# of which is Linux-specific. The gate said `linux` only because Linux was the
+# one X11 platform in the matrix when it was written.
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 livi = "0.7"
+x11rb = "0.13"
+libc = "0.2"
 
 [dev-dependencies]
 # Examples only, and `check-firewall.sh` walks `--edges normal`, so this does
