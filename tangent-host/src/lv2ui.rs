@@ -171,11 +171,14 @@ impl Ui {
     /// response against the wrong axis.
     /// Whether this plugin ships a UI we can actually embed.
     ///
-    /// **A metadata read only** — no `dlopen`, no instantiation. It answers the
-    /// question a greyed-out menu item asks, and it must be cheap enough to ask
-    /// once per bay: `Ui::open` loads foreign code, and doing that to decide
-    /// whether a control should be clickable would mean every plugin in the
-    /// rack was resident before anybody opened anything.
+    /// **A map lookup** — no `dlopen`, no instantiation, and no lilv world.
+    /// It answers the question a greyed-out menu item asks, which the menu asks
+    /// once per bay per frame, so the cost has to be nil: `Ui::open` loads
+    /// foreign code, and doing that to decide whether a control should be
+    /// clickable would mean every plugin in the rack was resident before
+    /// anybody opened anything — while building a lilv world to answer it,
+    /// which is what this did first, meant reparsing every manifest on the
+    /// system several hundred times a second. See `lv2::meta`.
     ///
     /// `false` for a plugin with no UI at all AND for one whose only UI is a
     /// GTK or Qt widget, because those are the same fact from where the app is
@@ -184,19 +187,7 @@ impl Ui {
     /// control ports in the generic parameter panel, with real units, which is
     /// more than a host that popped up an empty frame would give.
     pub fn has_ui(plugin_uri: &str) -> bool {
-        let world = lilv::World::with_load_all();
-        let plugins = world.plugins();
-        let Some(plugin) = plugins
-            .into_iter()
-            .find(|p| p.uri().as_uri() == Some(plugin_uri))
-        else {
-            return false;
-        };
-        let Some(uis) = plugin.uis() else {
-            return false;
-        };
-        let x11 = world.new_uri("http://lv2plug.in/ns/extensions/ui#X11UI");
-        uis.into_iter().any(|u| u.is_a(&x11))
+        crate::lv2::has_x11_ui(plugin_uri)
     }
 
     pub fn open(plugin_uri: &str, parent: u32, sample_rate: f32) -> Result<Option<Ui>, String> {
@@ -712,6 +703,18 @@ impl Lv2Window {
                     if m.data.as_data32().first() == Some(&self.wm_delete) {
                         self.closed.set(true);
                     }
+                }
+                // **The window went away without asking.** A window manager
+                // killing the client, an X session ending, or a plugin toolkit
+                // destroying the frame from underneath us all land here rather
+                // than as a polite WM_DELETE_WINDOW. Without this the editor
+                // stays "open" for the rest of the session: the bay's control
+                // does nothing because it thinks the window is already up, and
+                // — worse — the host never runs the save that closing an editor
+                // is supposed to trigger, so the settings the user just made
+                // are lost with no error anywhere.
+                Event::DestroyNotify(d) if d.window == self.window => {
+                    self.closed.set(true);
                 }
                 Event::ConfigureNotify(c) if c.window == self.window => {
                     let now = (c.width as i32, c.height as i32);
