@@ -664,9 +664,11 @@ child of ours, and tearing down the parent while the UI's toolkit still
 believes its window exists is a use-after-free inside somebody else's code.
 
 A plugin whose only UI is GTK or Qt gets no window, and that is reported as
-"no editor" rather than an empty frame. It still gets the generic parameter
-panel with its real controls and units, which is more than an empty frame
-would have been.
+"no editor" rather than an empty frame. Its controls are still reachable: they
+appear in the AUTOMATION lanes by name and in the plugin's own units. That is
+not the same as a generic knob panel — there is no such panel in Tangent for
+either format, and a plugin with no embeddable window has no click-and-turn
+surface — so it is worth saying plainly rather than implying one exists.
 
 ### The knobs have to be carried by the host
 
@@ -708,10 +710,12 @@ control; keyed by index, a plugin update would have moved every setting one
 knob along, silently. Unknown symbols are skipped and missing ones keep their
 defaults, for the same reason.
 
-The parameter panel works too, and it is the better one of the two: an LV2
-control declares its range in real engineering units, so "800 Hz" is
-arithmetic here rather than a round trip asking the plugin to render a
-normalised 0..1 into text.
+The parameter list an LV2 bay offers the automation lanes works too, and it is
+the better of the two formats' lists: an LV2 control declares its range in real
+engineering units, so "800 Hz" is arithmetic here rather than a round trip
+asking the plugin to render a normalised 0..1 into text. It returned empty
+before this, because it read the VST3 state handle — so an LV2 plugin could not
+be automated at all.
 
 Latency is read where LV2 publishes it — a designated control OUTPUT port,
 which means anything only after a block has run — so it is picked up on the
