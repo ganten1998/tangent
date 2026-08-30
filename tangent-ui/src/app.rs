@@ -794,6 +794,10 @@ pub struct IvoryApp {
     pending_after_save: Option<AfterSave>,
     /// The prompt has been answered and the window may close.
     quit_now: bool,
+    /// **The answer, kept.** `quit_now` is a one-shot cue to the host and is
+    /// taken; this is the standing fact that the question has been asked and
+    /// answered, and it is never cleared. See `intercept_quit`.
+    quit_allowed: bool,
     hist_at: usize,
     /// The NOTE clipboard: times relative to the earliest copied note.
     note_clipboard: Vec<crate::arrangement::ArrNote>,
@@ -2075,6 +2079,7 @@ impl IvoryApp {
             saved_state: None,
             pending_after_save: None,
             quit_now: false,
+            quit_allowed: false,
             hist_at: 0,
             note_clipboard: Vec::new(),
             clip_clipboard: Vec::new(),
@@ -10016,13 +10021,24 @@ impl IvoryApp {
                     multi: false,
                 });
             }
-            AfterSave::Quit => self.quit_now = true,
+            AfterSave::Quit => {
+                self.quit_now = true;
+                self.quit_allowed = true;
+            }
         }
     }
 
     /// **The window is closing.** `true` means it must not, yet.
     pub fn intercept_quit(&mut self) -> bool {
-        if self.quit_now {
+        // **Asked and answered stays answered.**
+        //
+        // This tested `quit_now`, which the host TAKES — so the flag was
+        // already gone by the time the close it triggered came back round.
+        // Discard therefore asked again, and again: the prompt reappeared
+        // for ever and the app could not be quit at all. Save escaped it by
+        // accident, because saving makes the project clean and the second
+        // ask returns false on its own.
+        if self.quit_allowed {
             return false;
         }
         self.ask_before(AfterSave::Quit)
@@ -10031,6 +10047,13 @@ impl IvoryApp {
     /// The host's cue that the answer was "go", taken once.
     pub fn take_quit_now(&mut self) -> bool {
         std::mem::take(&mut self.quit_now)
+    }
+
+    /// Whether the question has been asked and answered "go". Sticky, and
+    /// the reason a discarded quit actually quits — see `intercept_quit`.
+    #[cfg(test)]
+    fn quit_allowed_for_test(&self) -> bool {
+        self.quit_allowed
     }
 
     /// Remember what is on disk, so `project_dirty` has something to
@@ -35025,6 +35048,33 @@ mod folder_tests {
         assert!(a.intercept_quit());
         a.apply_dialog_action(dialogs::DialogAction::SaveChangesDiscard);
         assert!(a.take_quit_now(), "discard did not let the window close");
+
+        // **And the close it just asked for is not intercepted AGAIN.**
+        //
+        // This is the half the first version of this test missed, and it was
+        // the whole bug: the host takes `quit_now` to send its Close, so by
+        // the time the window manager comes back saying "closing" the flag
+        // is gone, the project is STILL dirty, and the prompt goes up once
+        // more. It could not be dismissed, because discarding just put it
+        // back — the owner: "the discard on exit option doesn't allow you to
+        // quit". Save escaped it only by accident, having made the project
+        // clean on the way past.
+        assert!(a.project_dirty(), "discard is not supposed to save anything");
+        assert!(
+            !a.intercept_quit(),
+            "the window asked again after the answer was given"
+        );
+        assert!(
+            a.quit_allowed_for_test(),
+            "the answer did not survive the host taking its cue"
+        );
+        // The prompt itself is dismissed by `dialogs::show`, which clears it
+        // on `result.close` — this test drives `apply_dialog_action`
+        // directly and so never goes past that. What matters here is that
+        // asking again RAISES nothing, which the check above states.
+        a.dialog = None;
+        assert!(!a.intercept_quit(), "a later close asked all over again");
+        assert!(a.dialog.is_none(), "a second prompt went up over an agreed quit");
 
         // A clean project does not ask at all.
         a.undo_reset();

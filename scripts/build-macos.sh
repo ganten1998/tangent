@@ -36,14 +36,17 @@ VERSION_NUM="${VERSION%%-*}"; VERSION_NUM="${VERSION_NUM%%+*}"
 ICON_SRC="assets/tangent-macos.png"
 
 warn_placeholder_icon() {
-  # assets/tangent.png is the ORIGINAL piano-keys icon, byte-identical to the
-  # Python app's icons/ivory.png (verified 2026-08-04) — not placeholder art.
-  # It is only 128x128, so Dock/Finder sizes above that are upscaled.
+  # The icon is the app's own Tonnetz wordmark — the same lattice the splash
+  # and the theory band draw — supplied at 2048px pre-composited into the
+  # macOS squircle, with the corners transparent (2026-08-30). The piano-keys
+  # art it replaced is kept in assets/icons-archive/.
+  #
+  # The guard stays: anything under 4K here is a small source being upscaled
+  # into every Dock size, which is exactly how the old 128px icon shipped
+  # soft for months without anyone noticing.
   if [ -f "$ICON_SRC" ] && [ "$(stat -f%z "$ICON_SRC")" -lt 4096 ]; then
-    echo "NOTE: $ICON_SRC is the original 128x128 icon; sizes above 128 are"
-    echo "      upscaled and will look soft in the Dock. A nearest-neighbour"
-    echo "      1024px re-render of the same art would fix that (see"
-    echo "      docs/RELEASE.md); the artwork itself is intentional."
+    echo "NOTE: $ICON_SRC is small; Dock/Finder sizes above it are upscaled"
+    echo "      and will look soft. Supply the artwork at 1024px or more."
   fi
 }
 

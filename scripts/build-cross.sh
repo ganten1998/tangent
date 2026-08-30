@@ -96,10 +96,11 @@ fi
 # ICO of PNG frames (valid on Windows Vista+).
 gen_ico() {
   local out="assets/tangent.ico" tmp px
+  # The square, full-bleed cut of the Tonnetz wordmark — Windows and Linux
+  # want the whole tile, where macOS wants the squircle (see build-macos.sh).
   if [ "$(stat -f%z "$ICON_SRC")" -lt 4096 ]; then
-    echo "NOTE: $ICON_SRC is the original 128x128 piano-keys icon (identical to"
-    echo "      the Python app's). Frames above 128px are upscaled and look"
-    echo "      soft; the artwork itself is intentional."
+    echo "NOTE: $ICON_SRC is small; frames above its own size are upscaled"
+    echo "      and will look soft. Supply the artwork at 256px or more."
   fi
   if command -v magick >/dev/null 2>&1; then
     magick "$ICON_SRC" -define icon:auto-resize=256,128,64,48,32,16 "$out"
