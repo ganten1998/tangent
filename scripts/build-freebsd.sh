@@ -104,7 +104,13 @@ if [ -d "$WORK" ] && ! rm -rf "$WORK" 2>/dev/null; then
     elif command -v doas >/dev/null 2>&1; then doas rm -rf "$WORK"
     elif command -v sudo >/dev/null 2>&1; then sudo rm -rf "$WORK"
     fi
-    [ -d "$WORK" ] && { echo "could not remove $WORK — it holds root-owned files from an earlier run" >&2; exit 1; }
+    [ -d "$WORK" ] && {
+        echo "could not remove $WORK" >&2
+        echo "It holds root-owned files from an earlier bundle build (pkg fetch" >&2
+        echo "needs root). Remove it as root and run this again:" >&2
+        echo "    sudo rm -rf $WORK" >&2
+        exit 1
+    }
 fi
 mkdir -p "$PREFIXDIR/bin" \
          "$PREFIXDIR/share/applications" \
