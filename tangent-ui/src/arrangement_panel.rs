@@ -662,6 +662,24 @@ pub const FOLDER_INDENT: f32 = 10.0;
 /// gesture somebody who knows will make.
 pub const FOLDER_DROP_EDGE: f32 = 0.25;
 
+/// **The strip along a row's bottom that takes a dropped track INTO it.**
+///
+/// One function because three things need the same rectangle — the hit that
+/// arms it, the paint that shows it, and the drop that acts on it — and a
+/// drop zone you can see in one place and hit in another is worse than none.
+///
+/// It had no paint at all: the gesture existed, was documented, and was
+/// invisible, so the only feedback during a drag was the row highlight at the
+/// TOP of the target. The owner: "the highlight edge shows ATOP the folder or
+/// last child instead of where it's ATTACHING to, the bottom."
+pub fn folder_drop_strip(row: Rect) -> Rect {
+    if !row.is_positive() {
+        return Rect::NOTHING;
+    }
+    let h = (row.height() * FOLDER_DROP_EDGE).max(2.0);
+    Rect::from_min_max(Pos2::new(row.left(), row.bottom() - h), row.max)
+}
+
 /// One row of the timeline, and where it is on both sides of the grip.
 #[derive(Debug, Clone, Copy)]
 pub struct Row {
