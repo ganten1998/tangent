@@ -359,6 +359,16 @@ pub struct ArrangeView<'a> {
     /// A file is being dragged over this lane right now: it lights, so the
     /// drop lands somewhere the eye already picked.
     pub drop_lane: Option<usize>,
+    /// **The MASTER's own automation rows.**
+    ///
+    /// Separate from `lanes` because `lanes` is the sixteen CHANNELS and the
+    /// master is not one of them — it is a bus, with its own row above them
+    /// and its own strip on the desk. Everything else about these rows is a
+    /// track's: the same `AutoView`, the same header, the same curve, the
+    /// same gestures. They are addressed as lane [`MASTER_LANE`] so that one
+    /// `RowKind::Automation` still covers every automation row in the
+    /// timeline and the drawing, hit-testing and editing do not fork.
+    pub master_automation: Vec<AutoView<'a>>,
     /// A MIDI item being drawn by shift-drag right now: lane, from, to —
     /// ghosted until the button comes up and the document takes it.
     pub pending: Option<(usize, f64, f64)>,
@@ -653,6 +663,41 @@ pub enum RowKind {
 /// the title roughly one character.
 pub const FOLDER_INDENT: f32 = 10.0;
 
+/// **The lane number the MASTER's automation rows answer to.**
+///
+/// One past the channels, so it can never collide with one, and so a single
+/// `RowKind::Automation(lane, slot)` still describes every automation row on
+/// the timeline. The alternative was a second row kind, which would have
+/// forked the layout, the paint, the hit test, the selection, the clipboard
+/// and the keyboard — six places to keep in step for one bus.
+pub const MASTER_LANE: usize = CHANNELS;
+
+/// The `AutoView` for a row, wherever it lives.
+///
+/// One lookup, because `lanes` holds the channels and the master's rows sit
+/// beside it — and a caller that reached for `lanes[lane]` directly would
+/// silently find nothing for the master and draw an empty row.
+pub fn auto_view_of<'a>(
+    view: &'a ArrangeView<'a>,
+    lane: usize,
+    slot: usize,
+) -> Option<&'a AutoView<'a>> {
+    if lane == MASTER_LANE {
+        return view.master_automation.get(slot);
+    }
+    // The CHANNELS' own table. Deliberately spelled out rather than routed
+    // back through this function — that is infinite recursion, and was.
+    view.lanes.get(lane).and_then(|l| l.automation.get(slot))
+}
+
+/// How many automation rows a lane is showing, master included.
+fn auto_rows_of(view: &ArrangeView<'_>, lane: usize) -> usize {
+    if lane == MASTER_LANE {
+        return view.master_automation.len();
+    }
+    view.lanes.get(lane).map_or(0, |l| l.automation.len())
+}
+
 /// **How much of a folder's row counts as its bottom EDGE** — the strip a
 /// track is dropped on to snap into it, as a fraction of the row's height.
 ///
@@ -748,6 +793,10 @@ pub struct BusRow {
     /// short or too narrow to carry one — the same rule the track headers use,
     /// so a rack that cannot be read is not drawn rather than drawn as a smudge.
     pub bays: [Rect; crate::recorder::INSERTS * 2],
+    /// **A**, the automation menu — the same button a track header wears and
+    /// in the same place relative to the name, because the master's rows are
+    /// a track's rows and the way to them should not be a different gesture.
+    pub automation: Rect,
 }
 
 impl BusRow {
@@ -758,6 +807,7 @@ impl BusRow {
         vol_label: Rect::NOTHING,
         meter: Rect::NOTHING,
         bays: [Rect::NOTHING; crate::recorder::INSERTS * 2],
+        automation: Rect::NOTHING,
     };
 
     fn of(row: Rect) -> Self {
@@ -805,12 +855,31 @@ impl BusRow {
         );
         let n = crate::recorder::INSERTS * 2;
         let name_w = (left.width() * 0.28).min(70.0);
-        let name = Rect::from_min_max(
+        let full_name = Rect::from_min_max(
             left.min,
             Pos2::new(left.left() + name_w, left.bottom()),
         );
+        // The A button takes the right end of the name cell, square and
+        // centred on the row — the same shape it has on a track, so a hand
+        // that has learned one has learned this. It sheds when the row is
+        // too small to carry a readable letter, like every other switch here.
+        let side = (h * 0.5).clamp(8.0, 14.0);
+        let (name, automation) = if full_name.width() > side + 24.0 {
+            (
+                Rect::from_min_max(
+                    full_name.min,
+                    Pos2::new(full_name.right() - side - 3.0, full_name.bottom()),
+                ),
+                Rect::from_center_size(
+                    Pos2::new(full_name.right() - side * 0.5, full_name.center().y),
+                    Vec2::splat(side),
+                ),
+            )
+        } else {
+            (full_name, Rect::NOTHING)
+        };
         let rack = Rect::from_min_max(
-            Pos2::new(name.right() + 4.0, left.top() + h * 0.14),
+            Pos2::new(full_name.right() + 4.0, left.top() + h * 0.14),
             Pos2::new(left.right(), left.bottom() - h * 0.14),
         );
         let bays = std::array::from_fn(|b| {
@@ -827,7 +896,7 @@ impl BusRow {
                 Pos2::new(x0 + w, rack.bottom()),
             )
         });
-        Self { panel: row, name, knob, vol_label, meter, bays }
+        Self { panel: row, name, knob, vol_label, meter, bays, automation }
     }
 }
 
@@ -1026,11 +1095,20 @@ impl Layout {
         // rides in the divisor so the stack always ends flush with the
         // bottom — no dead space at any count.
         let auto_of = |shown: usize| -> f32 {
-            (first..CHANNELS)
+            // The master's rows are counted whatever the scroll is doing:
+            // the master row itself is always at the top, so its automation
+            // is always on screen and always costs its half strip.
+            let master = if view.show_master_row {
+                view.master_automation.len() as f32
+            } else {
+                0.0
+            };
+            ((first..CHANNELS)
                 .filter(|i| !view.lanes.get(*i).is_some_and(|l| l.hidden))
                 .take(shown)
                 .map(|i| view.lanes.get(i).map_or(0, |l| l.automation.len()) as f32)
                 .sum::<f32>()
+                + master)
                 * AUTO_LANE_SHARE
         };
         // Settles: evicting a track can only REMOVE automation from the
@@ -1098,6 +1176,16 @@ impl Layout {
         // pair reads as one band rather than as two short tracks.
         if view.show_master_row {
             push(RowKind::Master, lane_h * MASTER_ROW_SHARE, &mut y, &mut rows);
+            // **Its automation hangs under it**, exactly as a track's does,
+            // and by the same row kind — see `MASTER_LANE`.
+            for slot in 0..view.master_automation.len() {
+                push(
+                    RowKind::Automation(MASTER_LANE, slot),
+                    lane_h * AUTO_LANE_SHARE,
+                    &mut y,
+                    &mut rows,
+                );
+            }
         }
         for i in first..CHANNELS {
             // A track inside a SHUT folder is not laid out at all: no row, so
@@ -1111,7 +1199,7 @@ impl Layout {
             // One row per parameter this lane is showing, in the order the
             // view lists them — which is the order the menu offers them, so
             // the rows and the menu read the same way down.
-            let shown = view.lanes.get(i).map_or(0, |l| l.automation.len());
+            let shown = auto_rows_of(view, i);
             for slot in 0..shown {
                 push(
                     RowKind::Automation(i, slot),
@@ -1831,6 +1919,9 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
     }
     // **The bus rows first**, before the tracks: they sit above them and a
     // press on one must not fall through to the lane beneath.
+    if l.master_row.automation.is_positive() && l.master_row.automation.contains(pos) {
+        return Some(Hit::AutoMenu(MASTER_LANE));
+    }
     if l.master_row.knob.is_positive() && l.master_row.knob.contains(pos) {
         return Some(Hit::BusGain(MASTER_COLUMN));
     }
@@ -1967,7 +2058,7 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
         if !row.lane.is_positive() {
             continue;
         }
-        let Some(auto) = view.lanes.get(lane).and_then(|l| l.automation.get(slot)) else {
+        let Some(auto) = auto_view_of(view, lane, slot) else {
             continue;
         };
         // The row plus a handle's radius: a press on the top of a point
@@ -2120,6 +2211,7 @@ pub fn targets(rect: Rect, view: &ArrangeView<'_>) -> Vec<(Rect, Hit)> {
     ] {
         push(r, hit);
     }
+    push(l.master_row.automation, Hit::AutoMenu(MASTER_LANE));
     push(l.master_row.knob, Hit::BusGain(MASTER_COLUMN));
     for (b, cell) in l.master_row.bays.iter().enumerate() {
         push(*cell, Hit::BusBay(MASTER_COLUMN, b));
@@ -2997,7 +3089,7 @@ fn draw_auto_headers(
             continue;
         }
         if row.header.is_positive() {
-            let Some(auto) = view.lanes.get(lane).and_then(|v| v.automation.get(slot))
+            let Some(auto) = auto_view_of(view, lane, slot)
             else {
                 continue;
             };
@@ -3423,7 +3515,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         if !row.lane.is_positive() {
             continue;
         }
-        let Some(auto) = view.lanes.get(lane).and_then(|v| v.automation.get(slot)) else {
+        let Some(auto) = auto_view_of(view, lane, slot) else {
             continue;
         };
         let (cr, cg, cb) = STRIP_COLORS[view
@@ -4099,6 +4191,30 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 ],
                 Stroke::new(1.0, ink.gamma_multiply(0.35)),
             );
+            // **A** — its automation menu, the same button a track wears,
+            // lit while the master is showing any row. Drawn against the
+            // master's own plate rather than the header face, because that
+            // plate is a palette colour and the ink was measured against it
+            // two lines up.
+            if r.automation.is_positive() {
+                let on = !view.master_automation.is_empty();
+                painter.rect_filled(
+                    r.automation,
+                    2.0,
+                    if on { p.select } else { ink.gamma_multiply(0.14) },
+                );
+                let size = crate::fonts::px((r.automation.height() * 0.68).clamp(7.0, 11.0));
+                if size >= 7.0 {
+                    let plate = if on { p.select } else { face };
+                    painter.text(
+                        r.automation.center(),
+                        Align2::CENTER_CENTER,
+                        "A",
+                        FontId::new(size, crate::fonts::courier_bold()),
+                        on_ink(plate),
+                    );
+                }
+            }
             if r.name.is_positive() {
                 let size = (r.name.height() * 0.42).clamp(6.0, 11.0);
                 painter.text(
@@ -5030,6 +5146,7 @@ ArrangeView {
             snap_on: true,
             grip_lit: false,
             drop_lane: None,
+            master_automation: Vec::new(),
             grid_exp: 0,
             pending: None,
             view_start_s: 0.0,

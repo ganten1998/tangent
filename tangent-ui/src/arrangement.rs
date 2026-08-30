@@ -990,7 +990,14 @@ impl Arrangement {
                 // DROPPED rather than clamped onto channel 15: a level
                 // landing on the wrong instrument is worse than one that
                 // does not land at all, and it would be silent.
-                if lane >= crate::recorder::CHANNELS {
+                //
+                // **The MASTER is one past the channels and is real.** It is
+                // a bus rather than one of the sixteen, and it keeps its
+                // curves under `arrangement_panel::MASTER_LANE` — so the
+                // bound is "past the master", not "past the channels", or
+                // the master's automation is silently discarded every time
+                // the document is read back.
+                if lane > crate::recorder::CHANNELS {
                     return None;
                 }
                 let param = AutoParam::from_key(o.get("param")?.as_str()?)?;

@@ -333,6 +333,14 @@ pub const PADS: usize = tangent_ui::recorder::DRUM_PADS;
 /// machinery. See `pad_rack_index`.
 pub const RACK_SEATS: usize = tangent_ui::recorder::TOTAL_SEATS;
 
+/// **The lane the MASTER's automation curves are stored under.**
+///
+/// One past the channels, and the same number `tangent_ui`'s
+/// `arrangement_panel::MASTER_LANE` uses — the document is written by one
+/// and read by the other, so the two have to agree and this is where that is
+/// said on this side.
+pub const MASTER_AUTO_LANE: usize = CHANNELS;
+
 /// Where channel `ch`'s pad `i` keeps its bays. Declared in the UI beside
 /// the rest of the seat map; re-exported here so the engine names it the
 /// way it always has.
@@ -1205,6 +1213,14 @@ pub struct AutoNow {
     pan: [Option<f32>; CHANNELS],
     send: [Option<f32>; CHANNELS],
     mute: [Option<bool>; CHANNELS],
+    /// **The MASTER's fader**, when a curve is driving it.
+    ///
+    /// Its own field rather than a seventeenth element of `gain`: the arrays
+    /// above are indexed by CHANNEL everywhere in this file, and widening
+    /// them by one for a bus would make every one of those loops one longer
+    /// and every bound one easier to get wrong. The master is one control,
+    /// so it is one field.
+    master_gain: Option<f32>,
 }
 
 impl Default for AutoNow {
@@ -1214,6 +1230,7 @@ impl Default for AutoNow {
             pan: [None; CHANNELS],
             send: [None; CHANNELS],
             mute: [None; CHANNELS],
+            master_gain: None,
         }
     }
 }
@@ -4243,7 +4260,13 @@ impl Renderer {
             // empty rack returns immediately).
             self.run_insert_chain(tangent_ui::recorder::MASTER_EXTRA_SEAT, false, n);
             self.run_insert_chain(STRIPS, false, n);
-            let master = Shared::f32_of(&self.shared.master_gain);
+            // **A curve on the master overrides its fader**, exactly as a
+            // channel's does — see `lane_gain_of`. The stored position is
+            // what the hand left; the curve is what the song says.
+            let master = match self.auto.master_gain {
+                Some(pos) => tangent_ui::recorder::fader_to_gain(pos).clamp(0.0, 8.0),
+                None => Shared::f32_of(&self.shared.master_gain),
+            };
             let mono = self.shared.master_mono.load(Ordering::Relaxed);
             if let Some(mix) = self.mix.get_mut(..n * TAP_CHANNELS) {
                 self.master_effects.process(
@@ -5187,6 +5210,17 @@ impl Renderer {
                 .value_at(lane, AutoParam::Mute, secs)
                 .map(|v| v >= 0.5);
         }
+        // **The master's own curve**, read at the lane the UI addresses it
+        // by — one past the channels. Suspended by the same rule a channel
+        // is: a fader being HELD is the hand talking, and a curve must not
+        // argue with it mid-gesture.
+        self.auto.master_gain = if suspend & (1 << MASTER_AUTO_LANE.min(31)) != 0 {
+            None
+        } else {
+            self.automation
+                .value_at(MASTER_AUTO_LANE, AutoParam::Gain, secs)
+                .map(|v| v as f32)
+        };
     }
 
     /// Tell the desk what each chain is costing.
@@ -11969,6 +12003,80 @@ mod tests {
     /// names, the handles and the per-seat latency all land on the new seat.
     /// A box that moved without them would play through another track's
     /// delay compensation.
+    /// **A curve on the master moves the master**, which is the half of
+    /// "the master automates like a track" that lives down here.
+    ///
+    /// Its lane number is one past the channels, and the loop that reads
+    /// automation runs `0..CHANNELS` — so without its own read the curve is
+    /// written, saved, drawn, and silently does nothing.
+    #[test]
+    fn a_curve_on_the_master_lane_moves_the_master_fader() {
+        use std::sync::Arc;
+        use tangent_ui::automation::{AutoParam, Automation, Curve, Point, Shape};
+        let render = |auto: Option<Automation>| -> f32 {
+            let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+            e.set_pad_kit(5, test_kit(&[0], 4_800, 0.5));
+            e.set_channel_gain(5, 1.0);
+            e.set_drum_strips(1 << 5);
+            e.set_master_gain(1.0);
+            if let Some(a) = auto {
+                e.set_automation(a);
+            }
+            e.set_rolling(false);
+            let mut out = vec![0.0f32; 1024 * 2];
+            for _ in 0..4 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+            }
+            e.set_midi_clips(vec![PlacedMidi {
+                strip: 5,
+                start: 0,
+                len: 48_000,
+                notes: Arc::new(vec![ClipNote { at: 0, dur: 2_400, key: PAD_BASE, vel: 100 }]),
+            }]);
+            e.set_transport(1, 0);
+            e.set_rolling(true);
+            let mut peak = 0.0f32;
+            for b in 0..4 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                if b == 3 {
+                    peak = out.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+                }
+            }
+            peak
+        };
+
+        let open = render(None);
+        assert!(open > 0.05, "the fixture makes no sound: {open}");
+
+        // A curve that holds the master's fader at the bottom for the whole
+        // song. `MASTER_AUTO_LANE` is the number the UI writes it under.
+        let shut = Automation::from_curves(vec![Curve::sanitised(
+            MASTER_AUTO_LANE,
+            AutoParam::Gain,
+            vec![Point { at_s: 0.0, value: 0.0, shape: Shape::Linear }],
+        )]);
+        let quiet = render(Some(shut));
+        assert!(
+            quiet < open * 0.05,
+            "the master's curve did not close the fader: {quiet} against {open}"
+        );
+
+        // And a curve on a channel's number must NOT be mistaken for it —
+        // the master is one PAST the channels, not the last of them.
+        let elsewhere = Automation::from_curves(vec![Curve::sanitised(
+            CHANNELS - 1,
+            AutoParam::Gain,
+            vec![Point { at_s: 0.0, value: 0.0, shape: Shape::Linear }],
+        )]);
+        let unaffected = render(Some(elsewhere));
+        assert!(
+            (unaffected - open).abs() < open * 0.02,
+            "a curve on the last channel moved the master: {unaffected} against {open}"
+        );
+    }
+
     #[test]
     fn a_permutation_carries_a_seats_record_to_its_new_index() {
         let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
