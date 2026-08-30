@@ -44,14 +44,24 @@ use std::time::Instant;
 const CLICK_MS: f32 = 1.0;
 /// Far enough apart that a click's own echo has died before the next one.
 const CLICK_EVERY_MS: f32 = 500.0;
-/// A click is full-scale; room noise and speaker rumble are not. Anything past
-/// this is the click and not the room.
-const DETECT: f32 = 0.25;
+/// A click is full-scale; room noise, speaker rumble and an open instrument
+/// input are not. Anything past this is the click and not the room.
+///
+/// Low enough to survive a quiet monitoring level or a conservative input gain,
+/// because the failure this guards against is not a false positive — a
+/// mis-detected room noise would show up instantly as an absurd round trip —
+/// but a run that reports nothing and cannot say why.
+const DETECT: f32 = 0.10;
 
 fn main() {
     let mut args = std::env::args().skip(1);
     let secs: f32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(6.0);
     let buffer: Option<u32> = args.next().and_then(|s| s.parse().ok());
+    // The third argument is the sample rate, and it is here because the
+    // DEFAULT is not always the device's own. FreeBSD's alsa-lib shim reports
+    // 44100 whatever the hardware runs at, so asking for the default can put
+    // a resampler in a path being measured for latency without saying so.
+    let rate_arg: Option<u32> = args.next().and_then(|s| s.parse().ok());
 
     let host = match std::env::var("IVORY_AUDIO_SYSTEM").ok().filter(|s| !s.is_empty()) {
         Some(want) => cpal::available_hosts()
@@ -83,7 +93,7 @@ fn main() {
     // One rate for both directions or the arithmetic below is comparing frames
     // of different lengths. The output's native rate is the one the speakers
     // will not resample.
-    let rate = out_base.sample_rate().0;
+    let rate = rate_arg.unwrap_or_else(|| out_base.sample_rate().0);
     let mut out_cfg: cpal::StreamConfig = out_base.clone().into();
     let mut in_cfg: cpal::StreamConfig = in_base.clone().into();
     in_cfg.sample_rate = cpal::SampleRate(rate);
@@ -111,6 +121,10 @@ fn main() {
     let results: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
     // cpal's own opinion, sampled once so the print below is not a race.
     let reported: Arc<Mutex<Option<f32>>> = Arc::new(Mutex::new(None));
+    // The loudest thing the input ever saw, kept so that "no click" can say
+    // whether the input was silent (nothing patched, gain down) or merely
+    // quieter than the threshold. Without it the failure is unactionable.
+    let peak = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
     let out_stream = {
         let sent = sent.clone();
@@ -165,11 +179,15 @@ fn main() {
         let armed = armed.clone();
         let results = results.clone();
         let reported = reported.clone();
+        let peak = peak.clone();
         in_dev
             .build_input_stream(
                 &in_cfg,
                 move |data: &[f32], info: &cpal::InputCallbackInfo| {
                     let now = Instant::now();
+                    let loudest = data.iter().fold(0f32, |m, s| m.max(s.abs()));
+                    let bits = (loudest * 1e6) as u32;
+                    peak.fetch_max(bits, Ordering::Relaxed);
                     // The mirror of the output's `ahead`: how long ago the
                     // first sample in this buffer was actually captured.
                     let behind = info
@@ -219,13 +237,25 @@ fn main() {
         println!("cpal says its capture buffer is {ms:.2} ms behind the callback");
     }
     if r.is_empty() {
+        let seen = peak.load(Ordering::Relaxed) as f32 / 1e6;
         println!(
             "\nNo click was ever heard, so there is no round trip to report.\n\
-             That is a result about the PATH, not about the latency: check that\n\
-             the output is audible and that the input is not muted (`mixer` on\n\
-             FreeBSD — `mic` and `rec` both need level, and `mic` must be the\n\
-             recording source). Re-run once a click is audible."
+             That is a result about the PATH, not about the latency.\n\n\
+             The loudest thing the input saw was {seen:.4} of full scale, \
+             against a threshold of {DETECT}."
         );
+        if seen < 0.001 {
+            println!(
+                "That is silence: nothing is reaching the input at all. Check the\n\
+                 cable is in the INPUT and not a headphone socket, that the gain\n\
+                 is up, and — on an instrument input — that INST is engaged."
+            );
+        } else {
+            println!(
+                "So the path works and the level is merely low: turn the input\n\
+                 gain up, or the monitoring level if this is an acoustic loop."
+            );
+        }
         return;
     }
     r.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -238,7 +268,11 @@ fn main() {
         r[n - 1]
     );
     println!(
-        "  ({:.0} frames at {rate} Hz, median; includes the acoustic flight)",
+        // No claim about WHICH loop is patched, because this cannot tell: a
+        // cable and a speaker-to-microphone path both arrive here. The
+        // difference is under a millisecond of flight time either way, and
+        // saying which one it was is the operator's job, not the probe's.
+        "  ({:.0} frames at {rate} Hz, median)",
         med / 1000.0 * rate as f32
     );
 }
