@@ -378,23 +378,29 @@ impl Curve {
         else {
             return false;
         };
+        // **No base-node rule here.** Protecting the first point is a
+        // decision about a GESTURE — an alt-click that means "delete this" —
+        // and this is the mechanism underneath it, which a DRAG also uses to
+        // move a point by taking it out and putting it back. Refusing here
+        // made the first point immovable and left a trail behind every drag.
+        // The guard lives in `IvoryApp::arr_remove_auto_point`.
         self.points.remove(i);
-        // **A lone node at zero is not a curve.**
+        // **A lone node at the start USED to be swept away with the rest.**
         //
-        // Seeding after every removal made a curve impossible to un-draw: the
-        // one point somebody had drawn came out, the seeded node at zero
-        // stayed, and the lane stayed automated by a flat line nobody put
-        // there. A single point at zero says only "hold this value", which is
-        // exactly what NO curve already says — `value_at` answers None and the
-        // control sits where it sits. So the last one goes too, and the lane
-        // is genuinely clear.
+        // That rule existed because the node at zero was seeded, not drawn:
+        // taking out the one point somebody had actually placed left a flat
+        // line nobody put there, and a lane that could not be un-drawn.
         //
-        // The seeding is gone entirely now (see `sanitised`), so this is the
-        // whole of the rule: a curve holds what was drawn on it, and an empty
-        // one is empty.
-        if self.points.len() == 1 && self.points[0].at_s <= 0.0 {
-            self.points.clear();
-        }
+        // The base node is not that. It is the lane's LEVEL — what the row's
+        // dial reads and writes, and what `value_at` holds back to the left
+        // edge — so a lane that has had its drawn points removed is a lane
+        // resting at the level its dial is showing, which is exactly right
+        // and is not "automated by a flat line nobody put there".
+        //
+        // Clearing it here would also fight the refusal above: the base
+        // cannot be deleted directly, and deleting it as a side effect of
+        // removing the last drawn point would be the same deletion by
+        // another road.
         true
     }
 }
