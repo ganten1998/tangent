@@ -412,7 +412,13 @@ pub fn grid_lines(view: &MidiEditView<'_>, from: f64, to: f64, mut f: impl FnMut
 /// The gridbox's word: the arrangement's bars-as-a-power-of-two, with the
 /// grid's shape appended — `1/8T`, `1/8 sw`.
 pub fn grid_word(view: &MidiEditView<'_>) -> String {
-    let base = crate::arrangement_panel::grid_label(view.grid_exp);
+    // The editor's own meter, so the word matches the magnet here too —
+    // see `grid_label`, which now derives the name from the division.
+    let base = crate::arrangement_panel::grid_label(
+        view.grid_exp,
+        view.sig_top.clamp(1, 32) as u8,
+        view.sig_bottom.clamp(1, 32) as u8,
+    );
     if view.triplet {
         format!("{base}T")
     } else if view.swing {
@@ -1153,16 +1159,44 @@ mod tests {
                      — the lines would bunch against the bar line and read as swing"
                 );
             }
-            // One beat is one beat: the meter's own count of lines in a bar.
-            let per_bar = bar / grid_quarters(-1, top, bottom);
-            assert!(
-                (per_bar - f64::from(top)).abs() < 1e-9,
-                "{top}/{bottom} at one-beat spacing drew {per_bar} lines, not {top}"
-            );
+            // **The ladder only ever gets FINER.** It used to anchor to the
+            // beat, so exp -1 was one beat and the rung above it was a whole
+            // bar — a jump of four in 4/4 with no half note anywhere on it.
+            // It halves the bar now while a half is still a whole number of
+            // beats, so what has to hold is that each rung is shorter than
+            // the last and none of them repeats.
+            let mut prev = grid_quarters(0, top, bottom);
+            for exp in [-1i8, -2, -3, -4, -5] {
+                let step = grid_quarters(exp, top, bottom);
+                assert!(
+                    step < prev - 1e-12,
+                    "{top}/{bottom}: exp {exp} is {step}, not finer than {prev}"
+                );
+                prev = step;
+            }
             // And zero is exactly one bar.
             assert!(
                 (grid_quarters(0, top, bottom) - bar).abs() < 1e-9,
                 "{top}/{bottom} at exp 0 is not one bar"
+            );
+        }
+        // **The ladder the owner asked for, in 4/4**, which is the meter the
+        // complaint came from: 1, 1/2, 1/4, 1/8, 1/16 — one quarter-note
+        // rung, between the eighth and the half.
+        for (exp, want) in [(-1i8, 2.0), (-2, 1.0), (-3, 0.5), (-4, 0.25)] {
+            let got = grid_quarters(exp, 4, 4);
+            assert!(
+                (got - want).abs() < 1e-9,
+                "4/4 exp {exp} is {got} quarters, wanted {want}"
+            );
+        }
+        // And 6/8 still never offers a dotted eighth — the fault the beat
+        // anchor was introduced to fix, which this must not reintroduce.
+        for exp in [-1i8, -2, -3, -4, -5] {
+            let q = grid_quarters(exp, 6, 8);
+            assert!(
+                (q - 0.75).abs() > 1e-9,
+                "6/8 exp {exp} is a dotted eighth, the line nobody plays on"
             );
         }
     }
@@ -1315,7 +1349,9 @@ mod tests {
             // and what the snap tests below are written around. Under the
             // old "fraction of a bar" scheme this was -3; the grid steps in
             // BEATS now, so the same spacing has a different exponent.
-            grid_exp: -2,
+            // An EIGHTH note, as it always was here — see the settings
+            // default, which moved with the ladder.
+            grid_exp: -3,
             swing: false,
             swing_pct: 0.58,
             triplet: false,
@@ -1396,8 +1432,8 @@ mod tests {
     #[test]
     fn the_grid_snaps_straight_triplet_and_swung() {
         let n: [ArrNote; 0] = [];
-        // 120 bpm, 4/4: a beat is 0.5 s, so half a beat — an eighth note
-        // — is 0.25 s. See `every_grid_step_divides_the_bar_exactly`.
+        // 120 bpm, 4/4: a quarter is 0.5 s, so an eighth note is 0.25 s.
+        // See `every_grid_step_divides_the_bar_exactly`.
         let mut v = view(&n);
         assert!((grid_step_s(&v) - 0.25).abs() < 1.0e-9);
         assert!((snap_t(&v, 0.13) - 0.25).abs() < 1.0e-9);
@@ -1588,15 +1624,15 @@ mod tests {
     fn the_gridbox_word_carries_the_shape() {
         let n: [ArrNote; 0] = [];
         let mut v = view(&n);
-        // "1/2" is half a BEAT — an eighth note in 4/4, a sixteenth in 6/8.
-        // The box counts beats now, because a beat divides every bar exactly
-        // and a note value does not.
-        assert_eq!(grid_word(&v), "1/2");
+        // **The word names the note the grid actually steps in.** It used to
+        // name a different one: "1/2" while the magnet snapped eighths. See
+        // `arrangement_panel::grid_label`.
+        assert_eq!(grid_word(&v), "1/8");
         v.triplet = true;
-        assert_eq!(grid_word(&v), "1/2T");
+        assert_eq!(grid_word(&v), "1/8T");
         v.triplet = false;
         v.swing = true;
-        assert_eq!(grid_word(&v), "1/2 sw");
+        assert_eq!(grid_word(&v), "1/8 sw");
     }
 }
 

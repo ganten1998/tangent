@@ -1617,7 +1617,13 @@ impl Default for Settings {
             midi_editor_floating: false,
             midi_snap: true,
             // 1/4, matching the arrange grid's own default.
-            midi_grid_exp: -2,
+            // **-3, and it is the same grid it always was.** The ladder in
+            // `grid_quarters` gained a half-note rung, so every division
+            // below it moved one place down the exponent; -3 is now the
+            // eighth note that -2 used to be. The editor opens on exactly
+            // what it opened on before — only the box's label changed, and
+            // it changed from a lie to the truth.
+            midi_grid_exp: -3,
             midi_swing: false,
             // DARK ships as the default for the arrange field and the
             // editor; the theory surfaces stay light.
@@ -2715,7 +2721,8 @@ impl Settings {
             }
         }
         if let Some(n) = map.shift_remove("arr_grid_exp").and_then(|v| v.as_i64()) {
-            s.arr_grid_exp = n.clamp(-5, 3);
+            // -6: see `grid_quarters`, whose ladder gained a rung.
+            s.arr_grid_exp = n.clamp(-6, 3);
         }
         if let Some(n) = map.shift_remove("arr_header_w").and_then(|v| v.as_f64()) {
             s.arr_header_w = n.clamp(0.0, 1000.0);
@@ -2738,7 +2745,8 @@ impl Settings {
         }
         take_bool(&mut map, "midi_snap", &mut s.midi_snap);
         if let Some(n) = map.shift_remove("midi_grid_exp").and_then(|v| v.as_i64()) {
-            s.midi_grid_exp = n.clamp(-6, 3);
+            // -7: see `grid_quarters`, whose ladder gained a rung.
+            s.midi_grid_exp = n.clamp(-7, 3);
         }
         take_bool(&mut map, "midi_swing", &mut s.midi_swing);
         take_bool(&mut map, "arr_dark", &mut s.arr_dark);
