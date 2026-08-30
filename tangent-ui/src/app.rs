@@ -15026,6 +15026,19 @@ impl IvoryApp {
                             ));
                         }
                     }
+                    // **The master's field locates too.** It is a bus, so it
+                    // holds no clips and its width was dead ground — the one
+                    // horizontal strip on this timeline that answered a press
+                    // with nothing. Same snap as a lane, so the magnet means
+                    // the same thing wherever the hand lands.
+                    Some(A::MasterLane(t)) => {
+                        self.arr_selected = None;
+                        self.arr_multi.clear();
+                        self.arr_auto_nodes.clear();
+                        self.request_recorder(recorder::RecorderRequest::Locate(
+                            self.arr_snap_t(t),
+                        ));
+                    }
                     // The ruler: locate on the press (snapped, like the
                     // lanes), zoom on the drag — the zoom anchor stays on
                     // the finger, unsnapped, or the zoom would jump.
@@ -17530,6 +17543,11 @@ impl IvoryApp {
         let v = want.unwrap_or(0.0);
         match hit {
             // The desk's own, by the desk's own hits.
+            // The master's field is a PRESS, not a value: it locates,
+            // and `apply_arr_hit` is the drag/keyboard road. Named rather
+            // than left to a catch-all so a hit that grows a value later
+            // has to be decided about here.
+            A::MasterLane(_) => {}
             A::Arm(n) => self.apply_mixer_hit(M::Arm(Column(n)), 0.0),
             A::Mute(n) => self.apply_mixer_hit(M::Mute(Column(n)), 0.0),
             A::Solo(n) => self.apply_mixer_hit(M::Solo(Column(n)), 0.0),
