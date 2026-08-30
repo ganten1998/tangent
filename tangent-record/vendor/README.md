@@ -72,12 +72,14 @@ directory, drop the `exclude` line from the root `Cargo.toml`, and put
 # Vendored `cpal`
 
 `cpal/` is [`cpal` 0.16.0](https://github.com/RustAudio/cpal) (Apache-2.0) with
-**one host added and nothing else changed**. Everything new is behind
-`#[cfg(target_os = "freebsd")]`, so macOS, Windows and Linux compile the same
-code they compiled from crates.io and produce the same binary. That constraint
-is the whole discipline here: `[patch.crates-io]` is not target-conditional, so
-this copy is what *every* platform builds, and the moment it diverges outside a
-freebsd cfg it stops being a patch and becomes a fork of everybody's audio.
+**one host added and one string changed**. The host is behind
+`#[cfg(target_os = "freebsd")]`; the string is in the JACK backend, which
+compiles only where the `jack` feature is on. So macOS and Windows compile the
+same code they compiled from crates.io and produce the same binary. That
+constraint is the whole discipline here: `[patch.crates-io]` is not
+target-conditional, so this copy is what *every* platform builds, and the moment
+it diverges where an unfeatured platform can see it, it stops being a patch and
+becomes a fork of everybody's audio.
 
 ## Why
 
@@ -137,6 +139,28 @@ that crackles, which is the right direction for an escape hatch: the default is
 fast, the override is safe. The real answer for load robustness is realtime
 scheduling, which FreeBSD has via `mac_priority(4)`.
 
+## The second change: what the JACK client is called
+
+`host/jack/mod.rs` seeds `Host::name` with `"Tangent"` where upstream has
+`"cpal_client"`. cpal appends `_in`/`_out` per client, so this is the
+difference between a patchbay showing `Tangent_out:out_0` and showing
+`cpal_client_out:out_0` — the name of a library the user has never heard of, on
+the ports they are being asked to connect. Naming your client is not an
+oversight upstream: `Host::input_device_with_name` exists for exactly this. It
+is unreachable here, because it is a method on the concrete backend and
+`cpal::Host` is an opaque enum, so an app that gets its host from
+`host_from_id` — which is every app that lets the user choose an audio system —
+can only take the constant.
+
+It is one line and it touches no behaviour: JACK resolves name collisions
+itself and cpal already reads the granted name back out of the client
+(`device.rs`, `client.name()`), so two Tangents on one graph work exactly as two
+cpal_clients did.
+
+This one wants an upstream fix rather than an upstream copy of the string — a
+name on `HostId::Jack` at `host_from_id` time, or a `Host::with_name`. Until
+then the constant is the only place it fits.
+
 ## Upstream
 
 This should go back: <https://github.com/RustAudio/cpal>. FreeBSD is a
@@ -145,3 +169,25 @@ first-class cpal target already — the ALSA host is selected there deliberately
 adding a new one. When it lands, delete this directory, drop the `exclude` and
 `[patch.crates-io]` lines from the root `Cargo.toml`, and go back to
 `cpal = "0.x"`.
+
+
+---
+
+# Vendored `jack-sys`
+
+`jack-sys/` is [`jack-sys` 0.5.1](https://github.com/RustAudio/rust-jack)
+(MIT OR Apache-2.0) with **one conditional added to `build.rs`** and no other
+change. It has its own `PATCH.md`, because unlike the two above it is not about
+a platform building — it is about what ends up in the artifact's `DT_NEEDED`.
+
+The short version: `dynamic_loading` is a default feature of the `jack` crate
+and means libjack is `dlopen`ed at run time, which is the only reason a shipped
+binary can offer JACK without requiring it. `jack-sys`'s build script probed
+pkg-config for libjack anyway and `unwrap()`ed the result on Linux, which both
+made the build need development files it never reads and — worse, because it is
+silent — emitted `cargo:rustc-link-lib=jack`, putting the library back in
+`DT_NEEDED` and producing an artifact that will not start on a desktop without
+it. The probe now runs only when `dynamic_loading` is off.
+
+Verified on the Linux x86_64 artifact: `readelf -d` gains nothing, and
+`jack_sys::library()` opens `libjack.so.0` at run time where one exists.
