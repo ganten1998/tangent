@@ -2571,7 +2571,20 @@ impl DesktopApp {
             e.set_master_mono(self.app.master_mono());
         }
         if let Some(order) = self.app.take_desk_state_perm() {
-            self.save_plugin_states_as_loaded();
+            // **Only the rows this permutation touches.** See
+            // `save_plugin_states_as_loaded_for`.
+            let mut moved = vec![false; tangent_ui::recorder::STRIPS + 1];
+            for (new, old) in order.iter().enumerate() {
+                if new != *old {
+                    if let Some(m) = moved.get_mut(new) {
+                        *m = true;
+                    }
+                    if let Some(m) = moved.get_mut(*old) {
+                        *m = true;
+                    }
+                }
+            }
+            self.save_plugin_states_as_loaded_for(Some(&moved));
             permute_insert_states_in(
                 insert_state_path(0, 0)
                     .parent()
@@ -4939,7 +4952,12 @@ impl DesktopApp {
     /// `order[new] = old`, so a row with `order[n] == n` is a row whose
     /// plugin, state and bays are all exactly where they were.
     fn force_insert_reload_for(&mut self, order: &[usize]) {
-        for i in reload_slots_for(order, tangent_ui::recorder::INSERTS) {
+        let marks = reload_slots_for_loaded(
+            order,
+            tangent_ui::recorder::INSERTS,
+            &self.recorder.inserts_loaded,
+        );
+        for i in marks {
             if let Some(slot) = self.recorder.inserts_loaded.get_mut(i) {
                 *slot = Some("\u{1f}reload".to_owned());
             }
@@ -5463,9 +5481,21 @@ impl DesktopApp {
     /// the settings are already the NEW layout when it saves, and a state
     /// tagged with the new occupant's name is a state its own plugin
     /// rejects after the files move.
-    fn save_plugin_states_as_loaded(&mut self) {
+    /// Every loaded plugin's state to disk, keyed by where it is LOADED.
+    ///
+    /// `only` narrows it to a set of strips. A reorder needs the states of
+    /// the rows it is about to move and no others — asking a sampler for its
+    /// state is not free, and there are four hundred and fifty seats on this
+    /// desk. Before this took an argument, making a folder saved the whole
+    /// session's plugins to ask about a handful of rows.
+    fn save_plugin_states_as_loaded_for(&mut self, only: Option<&[bool]>) {
         let bays = tangent_ui::recorder::INSERTS;
         for i in 0..self.recorder.inserts_loaded.len() {
+            if let Some(want) = only {
+                if !want.get(i / bays).copied().unwrap_or(false) {
+                    continue;
+                }
+            }
             let Some(bundle) = self
                 .recorder
                 .inserts_loaded
@@ -6410,15 +6440,48 @@ fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result
 /// the alternative — marking the whole desk — is what made a reorder take
 /// seconds, and a property that costs seconds when it is wrong deserves a
 /// test that does not need a window.
-fn reload_slots_for(order: &[usize], bays: usize) -> Vec<usize> {
+/// **The bays a reorder really has to reload.**
+///
+/// A moved row is not enough. The forced reload exists because a plugin's
+/// STATE travels with its track — two channels holding the same plugin can
+/// swap, leaving the path identical at both seats and the settings wrong at
+/// both — so a bay whose path is unchanged still has to be re-instantiated.
+/// But a bay that is EMPTY on both sides of the move has no plugin and no
+/// state and nothing to do, and marking it makes the reconcile spend a frame
+/// finding that out.
+///
+/// That mattered because a folder is inserted ABOVE its children: making one
+/// shifts every row below it, so "the rows that moved" is very nearly the
+/// whole desk, and the desk is mostly empty. `loaded` is what each seat has
+/// in it now; a pair of `None`s is a pair of nothing.
+fn reload_slots_for_loaded(order: &[usize], bays: usize, loaded: &[Option<String>]) -> Vec<usize> {
     let mut out = Vec::new();
+    let held = |strip: usize, bay: usize| -> bool {
+        loaded
+            .get(strip * bays + bay)
+            .and_then(|b| b.as_deref())
+            .is_some_and(|b| !b.is_empty())
+    };
     for (new, old) in order.iter().enumerate() {
         if new == *old {
             continue;
         }
-        out.extend((0..bays).map(|b| new * bays + b));
+        for b in 0..bays {
+            // Something was here, or something is coming here. Either way
+            // the seat changes; anything else is two empties trading places.
+            if held(new, b) || held(*old, b) {
+                out.push(new * bays + b);
+            }
+        }
     }
     out
+}
+
+#[cfg(test)]
+fn reload_slots_for(order: &[usize], bays: usize) -> Vec<usize> {
+    let loaded: Vec<Option<String>> =
+        (0..order.len() * bays).map(|_| Some("x".to_owned())).collect();
+    reload_slots_for_loaded(order, bays, &loaded)
 }
 
 fn permute_insert_states_in(dir: Option<std::path::PathBuf>, order: &[usize]) {
@@ -6427,9 +6490,20 @@ fn permute_insert_states_in(dir: Option<std::path::PathBuf>, order: &[usize]) {
     };
     let name = |strip: usize, bay: usize| dir.join(format!("insert-state-{strip}-{bay}.bin"));
     let bays = tangent_ui::recorder::INSERTS;
+    // **Only the rows that MOVED.** A row whose files are already where they
+    // belong is read and written back byte for byte otherwise, and a plugin
+    // state can be megabytes — a sampler's especially. Making a folder shifts
+    // most of the desk, so this ran over nearly every file in the session,
+    // twice (two directories), on every drag: the owner's "any and every
+    // operation regarding dragging children in and out produces spinning
+    // wheel for 2-5 seconds".
     let mut held: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
     for new in 0..order.len() {
         let old = order[new];
+        if old == new {
+            held.push(Vec::new());
+            continue;
+        }
         let mut row = Vec::with_capacity(bays);
         for b in 0..bays {
             match std::fs::read(name(old, b)) {
@@ -6444,6 +6518,11 @@ fn permute_insert_states_in(dir: Option<std::path::PathBuf>, order: &[usize]) {
         held.push(row);
     }
     for (new, row) in held.into_iter().enumerate() {
+        // An untouched row was never read; writing it back would be writing
+        // what is already there.
+        if row.is_empty() {
+            continue;
+        }
         for (b, data) in row.into_iter().enumerate() {
             match data {
                 Some(bytes) => {

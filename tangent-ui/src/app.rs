@@ -3741,6 +3741,40 @@ impl IvoryApp {
     }
 
     fn remove_channel(&mut self, n: usize) {
+        // **A folder takes its membership with it.**
+        //
+        // Membership is positional — "the nearest folder above me" — so
+        // deleting a folder does not free its children: the flag stays on
+        // them and they either attach to whatever folder is further up or,
+        // with none, draw indented under an empty row belonging to nothing.
+        // The owner: "when deleted, a track with children leaves them in
+        // 'foldered' state, indented below an empty channel."
+        //
+        // Done BEFORE the row is cleared, while it is still knowable that
+        // this was a folder and which rows were in it. The run ends at the
+        // next folder or at the first row that is not a member, which is the
+        // same rule that decides the group everywhere else.
+        if self.settings.strip_is_folder.get(n).copied().unwrap_or(false) {
+            // Where this folder itself sat, so its children are handed UP
+            // rather than simply cut loose: deleting an inner group should
+            // leave its tracks in the outer one, not at the top level.
+            let up = self.folder_of(n).is_some();
+            for ch in n + 1..crate::recorder::CHANNELS {
+                if !self.settings.strip_in_folder.get(ch).copied().unwrap_or(false) {
+                    break;
+                }
+                let nested = self.settings.strip_is_folder.get(ch).copied().unwrap_or(false);
+                self.set_in_folder(ch, up);
+                if nested {
+                    // A folder inside the one being deleted keeps being a
+                    // folder; only its membership changes. Its own children
+                    // are below it and belong to it, so the walk stops here.
+                    break;
+                }
+            }
+            self.set_is_folder(n, false);
+        }
+        self.set_in_folder(n, false);
         self.settings.tracks_added &= !(1 << n);
         use crate::recorder::Strip;
         let d = Settings::default();
@@ -8703,6 +8737,42 @@ impl IvoryApp {
     /// what is on screen, and a lane that deleted its automation because
     /// somebody tidied the view would be unforgivable.
     /// Aim the keyboard at one automation row. See `arr_auto_sel`.
+    /// **Would a track dropped here attach to a folder, and to which one?**
+    ///
+    /// The bottom strip of a FOLDER's row attaches to that folder — and so
+    /// does the bottom strip of a row that is already IN one, which is the
+    /// half the owner asked for: "tracks that sit in folders must inherit
+    /// this bottom drag area as more folders need to be added." Without it a
+    /// group of eight has exactly one place you can aim at, at the top,
+    /// and attaching below the last child is impossible.
+    ///
+    /// One function for the hover that lights the strip and the release that
+    /// acts on it, so what is shown and what happens cannot disagree.
+    fn folder_drop_target(&self, row: usize, on_edge: bool) -> Option<usize> {
+        if !on_edge {
+            return None;
+        }
+        if self.is_folder(row) {
+            return Some(row);
+        }
+        // A member's strip attaches to the folder the member is in.
+        self.folder_of(row)
+    }
+
+    /// The row under `p` and whether the hand is on its bottom strip.
+    fn arr_row_under(&self, rect: egui::Rect, p: egui::Pos2) -> Option<(usize, bool)> {
+        let clips = self.arr_clip_views();
+        let view = self.arrange_view(&clips);
+        let l = crate::arrangement_panel::Layout::new(rect, &view);
+        let at = l.header_rows.iter().position(|row| {
+            row.panel.is_positive() && (row.panel.top()..=row.panel.bottom()).contains(&p.y)
+        })?;
+        let edge = l.header_rows.get(at).is_some_and(|row| {
+            crate::arrangement_panel::folder_drop_strip(row.panel).contains(p)
+        });
+        Some((at, edge))
+    }
+
     fn arr_select_auto_row(&mut self, lane: usize, slot: usize) {
         self.arr_auto_sel = Some((lane, slot));
         // One subject at a time: a Delete that might mean a clip OR a curve
@@ -14642,6 +14712,25 @@ impl IvoryApp {
                         }
                     }
                     Some(A::AutoPoint(n, row, i)) => {
+                        // **ALT removes it.** The owner's pairing: shift
+                        // makes a node, alt takes one away, and neither
+                        // needs a second gesture or a menu.
+                        if ctx.input(|k| k.modifiers.alt) {
+                            if let Some(param) = self.arr_auto_param_at(n, row) {
+                                let at = self
+                                    .arrangement
+                                    .automation
+                                    .get(n, param)
+                                    .and_then(|c| c.points().get(i))
+                                    .map(|q| q.at_s);
+                                if let Some(at) = at {
+                                    self.arr_remove_auto_point(n, param, at);
+                                }
+                            }
+                            self.arr_auto_nodes.clear();
+                            self.arr_auto_hot = None;
+                            return;
+                        }
                         // **Shift adds to the selection**, the same modifier
                         // that adds a clip to one — a hand that has learned
                         // the timeline has learned this.
@@ -14664,26 +14753,40 @@ impl IvoryApp {
                     // places it and puts it where you meant.
                     // ── the tempo lane ────────────────────────────────
                     Some(A::TempoPoint(i)) => {
-                        // **Alt turns the arrival into a RAMP**, or back into
-                        // a step — the difference between "and now it is
+                        // **ALT removes it**, as on an automation node — one
+                        // rule for both lanes. The ramp toggle it used to be
+                        // has moved to a plain double-click, because delete
+                        // is the commoner want and alt is now the app's
+                        // remove modifier.
+                        if ctx.input(|k| k.modifiers.alt) {
+                            self.arr_remove_tempo_point(i);
+                            self.arr_tempo_hot = None;
+                            return;
+                        }
+                        // **SHIFT turns the arrival into a RAMP**, or back
+                        // into a step — the difference between "and now it is
                         // slower" and a ritardando, and the only property a
-                        // tempo point has that dragging cannot reach. Alt
-                        // because the arrangement's other two modifiers are
-                        // taken: shift adds to a selection and the platform
-                        // key zooms.
-                        if ctx.input(|i| i.modifiers.alt) {
+                        // tempo point has that dragging cannot reach. It was
+                        // alt; alt is the remove now, so it moved to the
+                        // modifier that was still free on a point.
+                        if ctx.input(|i| i.modifiers.shift) {
                             self.arr_toggle_tempo_ramp(i);
                         } else {
                             self.arr_tempo_hot = Some(i);
                             self.arr_tempo_drag = Some(i);
                             self.arr_tempo_drag_from = Some(self.live_tempo_map());
-            self.arr_tempo_drag_from = Some(self.live_tempo_map());
                             self.arr_drag = Some(ArrDrag::TempoPoint(i));
                         }
                     }
                     // A press on empty room makes a point and then drags it,
                     // the automation lane's own gesture.
                     Some(A::TempoLane(t, bpm)) => {
+                        // Shift adds here too, so one hand learns one rule.
+                        if !ctx.input(|i| i.modifiers.shift) {
+                            let to = self.arr_snap_t(t);
+                            self.request_recorder(recorder::RecorderRequest::Locate(to));
+                            return;
+                        }
                         if let Some(i) = self.arr_put_tempo_point(t, bpm) {
                             self.arr_tempo_hot = Some(i);
                             self.arr_tempo_drag = Some(i);
@@ -14708,7 +14811,13 @@ impl IvoryApp {
                         let Some(param) = self.arr_auto_param_at(n, row) else {
                             return;
                         };
-                        if !ctx.input(|i| i.modifiers.alt) {
+                        // **SHIFT adds a node.** It was alt, and alt is the
+                        // key this timeline uses for taking things AWAY —
+                        // which is what the owner asked it to mean here too,
+                        // so the two could not both stay. Shift is the add
+                        // now, on the automation lane and the tempo lane
+                        // alike, and a plain press still locates.
+                        if !ctx.input(|i| i.modifiers.shift) {
                             let to = self.arr_snap_t(t);
                             self.request_recorder(recorder::RecorderRequest::Locate(to));
                             return;
@@ -15322,28 +15431,18 @@ impl IvoryApp {
                     // EDGE.** The edge is the folder gesture: a drop in the
                     // body of a row reorders as it always did, and a drop in
                     // the last slice of a FOLDER's row snaps into it.
-                    let (target, on_edge) = {
-                        let clips = self.arr_clip_views();
-                        let view = self.arrange_view(&clips);
-                        let l = crate::arrangement_panel::Layout::new(rect, &view);
-                        let at = l.header_rows.iter().position(|row| {
-                            row.panel.is_positive()
-                                && (row.panel.top()..=row.panel.bottom()).contains(&p.y)
-                        });
-                        let edge = at.is_some_and(|i| {
-                            l.header_rows.get(i).is_some_and(|row| {
-                                let h = row.panel.height();
-                                h > 0.0
-                                    && p.y >= row.panel.bottom()
-                                        - h * crate::arrangement_panel::FOLDER_DROP_EDGE
-                            })
-                        });
-                        (at, edge)
+                    let under = self.arr_row_under(rect, p);
+                    let (target, on_edge) = match under {
+                        Some((at, edge)) => (Some(at), edge),
+                        None => (None, false),
                     };
                     if let Some(to) = target {
-                        // The bottom edge of a folder takes the block IN.
-                        if on_edge && self.is_folder(to) {
-                            self.snap_into_folder(from, to);
+                        // **The bottom strip attaches**, whether it belongs
+                        // to the folder itself or to a track already in one
+                        // — see `folder_drop_target`, which the hover that
+                        // lit the strip used to decide the same thing.
+                        if let Some(folder) = self.folder_drop_target(to, on_edge) {
+                            self.snap_into_folder(from, folder);
                         } else if to != from {
                             // An ordinary move. Membership is decided by
                             // where the block LANDS, which is what makes
@@ -22894,17 +22993,61 @@ impl IvoryApp {
                             && (row.panel.top()..=row.panel.bottom()).contains(&p.y)
                     })
                 }) {
-                    if t != from {
+                    // **Where it will ATTACH, not what it is over.**
+                    //
+                    // The only feedback was a line along the TOP of the
+                    // target row, which is right for an ordinary reorder —
+                    // the block lands above that row — and exactly wrong for
+                    // the folder gesture, which is the bottom strip. So a
+                    // drop into a group showed its line at the far end of
+                    // the group from the place it was aiming at. The owner:
+                    // "the highlight edge shows ATOP the folder or last
+                    // child instead of where it's ATTACHING to, the bottom."
+                    let on_edge = at.is_some_and(|p| {
+                        l.header_rows.get(t).is_some_and(|row| {
+                            crate::arrangement_panel::folder_drop_strip(row.panel)
+                                .contains(p)
+                        })
+                    });
+                    let joins = self.folder_drop_target(t, on_edge);
+                    let lit = egui::Color32::from_rgb(0xC9, 0x8B, 0x3D);
+                    if let Some(folder) = joins {
+                        // The strip itself, filled, on the row the hand is
+                        // on — and the folder it joins named by lighting its
+                        // own row's left edge, so a group of eight says
+                        // WHICH group is about to take the track.
+                        if let Some(row) = l.header_rows.get(t) {
+                            let strip =
+                                crate::arrangement_panel::folder_drop_strip(row.panel);
+                            if strip.is_positive() {
+                                ui.painter().rect_filled(strip, 0.0, lit.gamma_multiply(0.35));
+                                ui.painter().line_segment(
+                                    [
+                                        egui::Pos2::new(rect.left(), strip.bottom() - 1.0),
+                                        egui::Pos2::new(rect.right(), strip.bottom() - 1.0),
+                                    ],
+                                    egui::Stroke::new(2.0, lit),
+                                );
+                            }
+                        }
+                        if let Some(head) = l.header_rows.get(folder) {
+                            ui.painter().rect_filled(
+                                egui::Rect::from_min_max(
+                                    head.panel.min,
+                                    egui::Pos2::new(head.panel.left() + 3.0, head.panel.bottom()),
+                                ),
+                                0.0,
+                                lit,
+                            );
+                        }
+                    } else if t != from {
                         if let Some(row) = l.header_rows.get(t) {
                             ui.painter().line_segment(
                                 [
                                     egui::Pos2::new(rect.left(), row.panel.top()),
                                     egui::Pos2::new(rect.right(), row.panel.top()),
                                 ],
-                                egui::Stroke::new(
-                                    2.0,
-                                    egui::Color32::from_rgb(0xC9, 0x8B, 0x3D),
-                                ),
+                                egui::Stroke::new(2.0, lit),
                             );
                         }
                     }
@@ -33792,6 +33935,91 @@ mod folder_tests {
     /// behind them either. Several tracks chosen means "group these", and
     /// the folder has to appear ABOVE them because membership here is
     /// positional; an empty slot means "start a group here".
+    /// **The bottom strip attaches — a folder's own, and its members'.**
+    ///
+    /// The gesture existed and only a folder's own row answered it, so a
+    /// group of eight had exactly one place you could aim at and there was
+    /// no way to attach below the last child. The owner: "tracks that sit in
+    /// folders must inherit this bottom drag area as more folders need to be
+    /// added."
+    #[test]
+    fn a_folders_bottom_strip_attaches_and_so_does_a_members() {
+        let mut a = app();
+        for n in [1usize, 2, 3, 5] {
+            a.add_bare_track(n);
+        }
+        // A folder at 1 holding 2 and 3; 5 is outside it.
+        a.set_is_folder(1, true);
+        a.set_in_folder(2, true);
+        a.set_in_folder(3, true);
+
+        // The folder's own strip attaches to it.
+        assert_eq!(a.folder_drop_target(1, true), Some(1));
+        // A MEMBER's strip attaches to the same folder — this is the half
+        // that did not exist, and it is what makes the bottom of a group
+        // reachable.
+        assert_eq!(a.folder_drop_target(2, true), Some(1));
+        assert_eq!(a.folder_drop_target(3, true), Some(1));
+        // A row outside attaches to nothing: its strip is an ordinary
+        // reorder, which is what somebody who has never heard of folders
+        // will be doing.
+        assert_eq!(a.folder_drop_target(5, true), None);
+        // And nowhere attaches without the edge: the body of a row is a
+        // reorder wherever it is.
+        for row in [1usize, 2, 3, 5] {
+            assert_eq!(a.folder_drop_target(row, false), None, "row {row} body attached");
+        }
+    }
+
+    /// **Deleting a folder frees its children.**
+    ///
+    /// Membership is positional, so the flag outlived the folder: the tracks
+    /// stayed indented under an empty row, belonging to nothing or silently
+    /// joining whatever group was further up. The owner: "when deleted, a
+    /// track with children leaves them in 'foldered' state, indented below
+    /// an empty channel."
+    #[test]
+    fn deleting_a_folder_lets_its_children_go() {
+        let mut a = app();
+        for n in [1usize, 2, 3, 4] {
+            a.add_bare_track(n);
+        }
+        a.set_is_folder(1, true);
+        a.set_in_folder(2, true);
+        a.set_in_folder(3, true);
+        // 4 is outside the group and must be left alone.
+        assert_eq!(a.folder_parents()[2], 1);
+
+        a.remove_channel(1);
+        assert!(!a.settings.strip_is_folder[1], "the row is still a folder");
+        for ch in [2usize, 3] {
+            assert!(
+                !a.settings.strip_in_folder[ch],
+                "channel {ch} is still foldered under a row that is gone"
+            );
+        }
+        assert_eq!(a.folder_parents()[2], -1, "the engine still folds it somewhere");
+        assert!(!a.settings.strip_in_folder[4], "an outsider was changed");
+
+        // **A nested group is handed UP, not cut loose.** Deleting the outer
+        // folder should leave its tracks where they visibly are — inside
+        // whatever contained the outer one — rather than at the top level.
+        let mut b = app();
+        for n in [0usize, 1, 2, 3] {
+            b.add_bare_track(n);
+        }
+        b.set_is_folder(0, true);
+        b.set_in_folder(1, true);
+        b.set_is_folder(1, true);
+        b.set_in_folder(2, true);
+        b.remove_channel(1);
+        assert!(
+            b.settings.strip_in_folder[2],
+            "an inner group's track was cut loose instead of joining the outer one"
+        );
+        assert_eq!(b.folder_parents()[2], 0, "it did not join the outer folder");
+    }
+
     #[test]
     fn cmd_f_folders_a_selection_and_opens_an_empty_one_on_a_free_slot() {
         use crate::recorder::CHANNELS;
