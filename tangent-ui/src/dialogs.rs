@@ -2034,18 +2034,28 @@ impl PluginEntry {
     pub const OWN_PLUGIN_STEM: &'static str = "Tangent";
 
     pub fn from_bundle(path: &Path) -> PluginEntry {
-        Self::from_bundle_with_vendor(path, None)
+        Self::from_bundle_with_vendor(path, None, None)
     }
 
     /// The picker's own builder: the vendor rides in from the scan, and an
     /// unnamed one stays empty — the bottom group, per the owner.
-    pub fn from_bundle_with_vendor(path: &Path, vendor: Option<&str>) -> PluginEntry {
+    pub fn from_bundle_with_vendor(
+        path: &Path,
+        vendor: Option<&str>,
+        // Given when the caller knows a better name than the path carries -
+        // see `App::plugin_list`. `None` keeps the original behaviour exactly.
+        display: Option<&str>,
+    ) -> PluginEntry {
         let stem = path
             .file_stem()
             .map(|s| s.to_string_lossy().trim().to_owned())
             .filter(|s| !s.is_empty());
         let full = path.to_string_lossy().into_owned();
-        let name = stem.unwrap_or_else(|| full.clone());
+        let name = display
+            .map(|d| d.trim().to_owned())
+            .filter(|d| !d.is_empty())
+            .or(stem)
+            .unwrap_or_else(|| full.clone());
         // Said in the row rather than hidden from it. The file IS on the disk,
         // and somebody who has just built it should see it where they put it —
         // what they should not do is choose it and be told the app is broken.
@@ -2252,12 +2262,14 @@ impl Dialog {
     /// unsorted. And the loaded plugin is preselected, so the dialog opens on
     /// the answer to "what am I playing through", not on row one.
     pub fn plugin_picker(
-        bundles: &[(PathBuf, Option<String>)],
+        bundles: &[(PathBuf, Option<String>, Option<String>)],
         current: Option<String>,
     ) -> Dialog {
         let mut plugins: Vec<PluginEntry> = bundles
             .iter()
-            .map(|(p, v)| PluginEntry::from_bundle_with_vendor(p, v.as_deref()))
+            .map(|(p, v, n)| {
+                PluginEntry::from_bundle_with_vendor(p, v.as_deref(), n.as_deref())
+            })
             .collect();
         // **By DEVELOPER, the owner's ruling**: the named vendors in
         // alphabetical order, each one's plugins alphabetical inside it, and
@@ -9205,7 +9217,7 @@ at: None,
     /// also does. This runs the frame inline, the way a plugin editor draws it.
     #[test]
     fn the_loaded_plugin_opens_preselected_and_marked() {
-        let bundles: Vec<(PathBuf, Option<String>)> = [
+        let bundles: Vec<(PathBuf, Option<String>, Option<String>)> = [
             "/Library/Audio/Plug-Ins/VST3/Vital.vst3",
             // Lower case on purpose: `discover` sorts paths, so a byte sort
             // would file this after "Vital" and a user would call the list
@@ -9214,7 +9226,7 @@ at: None,
             "/Users/x/Library/Audio/Plug-Ins/VST3/Pianoteq 8.vst3",
         ]
         .iter()
-        .map(|p| (PathBuf::from(p), None))
+        .map(|p| (PathBuf::from(p), None, None))
         .collect();
         let loaded = "/Users/x/Library/Audio/Plug-Ins/VST3/Pianoteq 8.vst3".to_owned();
 
@@ -9324,8 +9336,12 @@ at: None,
         let loaded = "/Users/x/Library/Audio/Plug-Ins/VST3/Pianoteq 8.vst3".to_owned();
         let mut dialog = Some(Dialog::plugin_picker(
             &[
-                (PathBuf::from("/Library/Audio/Plug-Ins/VST3/Vital.vst3"), None),
-                (PathBuf::from(&loaded), None),
+                (
+                    PathBuf::from("/Library/Audio/Plug-Ins/VST3/Vital.vst3"),
+                    None,
+                    None,
+                ),
+                (PathBuf::from(&loaded), None, None),
             ],
             Some(loaded.clone()),
         ));

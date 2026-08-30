@@ -1,0 +1,181 @@
+#!/bin/sh
+# tangent-jack — start a JACK server tuned for this machine, in one command.
+#
+#   tangent-jack start [-p frames] [-r rate] [-d pcmN]
+#   tangent-jack stop
+#   tangent-jack status
+#
+# WHY THIS EXISTS
+#
+# Tangent does not need JACK. It plays and records through FreeBSD's own OSS
+# with nothing running, and that is the path most people should use. What JACK
+# buys is latency: measured on this port with `jack_iodelay`, the out-of-the-box
+# path is about 27.6 ms round trip and JACK at a 96-frame period is 11.2 ms.
+#
+# Getting there by hand means knowing four things that are not obvious and are
+# not in any FreeBSD JACK documentation, because they came out of measuring
+# this port:
+#
+#   1. `hw.usb.uaudio.buffer_ms` must be 1, not its default of 4. Otherwise the
+#      OSS minimum block is 192 frames and jackd REFUSES to start below that.
+#   2. The period must be a MULTIPLE OF THE OSS BLOCK — 48 frames once (1) is
+#      set. jackd says so itself, and a period that is not a multiple underruns
+#      badly: 64 frames took nine underruns where 96 took one.
+#   3. The device is /dev/dspN where N is `hw.snd.default_unit`, which changes
+#      when you plug an interface in.
+#   4. A JACK server left running at realtime priority is how you wedge the
+#      machine. This one writes a pidfile and `stop` means it.
+#
+# So: the knowledge is here rather than in a README nobody reads.
+set -eu
+
+PIDFILE=/var/run/tangent-jack.pid
+[ -w /var/run ] 2>/dev/null || PIDFILE="${TMPDIR:-/tmp}/tangent-jack.$(id -u).pid"
+
+PERIOD=96
+RATE=48000
+UNIT=""
+
+usage() {
+    cat <<'USAGE'
+Start a JACK server tuned for low latency on FreeBSD.
+
+  tangent-jack start [-p frames] [-r rate] [-d pcmN]
+  tangent-jack stop
+  tangent-jack status
+
+  -p  frames per period (default 96). Must be a multiple of the OSS block
+      size, which this checks for you.
+  -r  sample rate (default 48000)
+  -d  which sound device, as pcmN. Defaults to the system's current one.
+
+Then choose "JACK" in Tangent's Audio Setup panel. Nothing else is needed, and
+nothing about Tangent requires this — it is the low-latency option, not a
+prerequisite.
+USAGE
+}
+
+say()  { printf '%s\n' "$*"; }
+die()  { printf 'tangent-jack: %s\n' "$*" >&2; exit 1; }
+
+running() {
+    [ -f "$PIDFILE" ] || return 1
+    pid=$(cat "$PIDFILE" 2>/dev/null) || return 1
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+cmd="${1:-}"
+[ $# -gt 0 ] && shift || true
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -p) PERIOD="$2"; shift 2 ;;
+        -r) RATE="$2";   shift 2 ;;
+        -d) UNIT="${2#pcm}"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) die "unknown option: $1" ;;
+    esac
+done
+
+case "$cmd" in
+
+start)
+    command -v jackd >/dev/null 2>&1 || die "jackd is not installed. pkg install jackit"
+    running && die "already running (pid $(cat "$PIDFILE")). Use: tangent-jack stop"
+
+    [ -n "$UNIT" ] || UNIT=$(sysctl -n hw.snd.default_unit 2>/dev/null || echo 0)
+    DSP="/dev/dsp$UNIT"
+    [ -c "$DSP" ] || die "$DSP is not a device. Try -d pcmN; see /dev/sndstat"
+
+    # **The tunable that decides whether any of this is possible.** At the
+    # default of 4 the OSS block is 192 frames and jackd will not accept a
+    # period below it; at 1 the block is 48 and 96-frame periods work.
+    BUF=$(sysctl -n hw.usb.uaudio.buffer_ms 2>/dev/null || echo 4)
+    if [ "$BUF" != 1 ]; then
+        say "note: hw.usb.uaudio.buffer_ms is $BUF. At 1 the round trip is"
+        say "      about 9 ms shorter and small periods become possible:"
+        say ""
+        say "          sysctl hw.usb.uaudio.buffer_ms=1"
+        say ""
+        say "      then unplug and replug the interface — it applies on attach."
+        say ""
+    fi
+
+    # A period that is not a multiple of the OSS block underruns, and the
+    # failure looks like a crackle rather than an error, so it is caught here.
+    # 48 is the block at buffer_ms=1; 192 at the default. Checking against the
+    # smaller one is right either way, since 192 is itself a multiple of 48.
+    if [ $((PERIOD % 48)) -ne 0 ]; then
+        die "period $PERIOD is not a multiple of 48. The OSS block is 48 frames
+             and a period that is not a multiple of it underruns. Try 96, 144
+             or 192."
+    fi
+
+    # Realtime scheduling needs mac_priority(4) and membership of the realtime
+    # group. Without them jackd runs anyway, just without priority, so this is
+    # a preference and not a requirement — and asking for realtime and not
+    # getting it is worse than not asking, because the underruns then look
+    # like a Tangent bug.
+    RT="--no-realtime"
+    if kldstat -q -m mac_priority 2>/dev/null; then
+        if id -Gn 2>/dev/null | grep -qw realtime || [ "$(id -u)" = 0 ]; then
+            RT="-R"
+        fi
+    fi
+    [ "$RT" = "-R" ] || say "note: starting without realtime priority. For it:
+      kldload mac_priority && pw groupmod realtime -m $(id -un)   (then re-login)"
+
+    say "Starting JACK: $DSP, ${RATE} Hz, ${PERIOD}-frame period, $RT"
+    jackd $RT -d oss -r "$RATE" -p "$PERIOD" -w 16 -C "$DSP" -P "$DSP" \
+        > "${TMPDIR:-/tmp}/tangent-jack.log" 2>&1 &
+    pid=$!
+    printf '%s\n' "$pid" > "$PIDFILE"
+
+    # jackd forks and can die on its own; a pidfile pointing at a corpse is
+    # worse than no pidfile, so confirm it is actually up before claiming so.
+    sleep 3
+    if ! kill -0 "$pid" 2>/dev/null; then
+        rm -f "$PIDFILE"
+        say "jackd failed to start:"
+        grep -aiE "minimum is|too small|cannot|error" "${TMPDIR:-/tmp}/tangent-jack.log" \
+            | head -3 | sed 's/^/    /'
+        exit 1
+    fi
+    say "Running (pid $pid). Choose \"JACK\" in Tangent's Audio Setup panel."
+    say "Stop it with: tangent-jack stop"
+    ;;
+
+stop)
+    running || { say "Not running."; rm -f "$PIDFILE"; exit 0; }
+    pid=$(cat "$PIDFILE")
+    say "Stopping JACK (pid $pid)"
+    kill "$pid" 2>/dev/null || true
+    # A realtime process that will not die is the thing that hangs machines,
+    # so this escalates rather than hoping.
+    n=0
+    while kill -0 "$pid" 2>/dev/null && [ $n -lt 10 ]; do sleep 1; n=$((n + 1)); done
+    if kill -0 "$pid" 2>/dev/null; then
+        say "  did not stop; sending KILL"
+        kill -9 "$pid" 2>/dev/null || true
+        sleep 1
+    fi
+    rm -f "$PIDFILE"
+    kill -0 "$pid" 2>/dev/null && die "could not stop pid $pid" || say "Stopped."
+    ;;
+
+status)
+    if running; then
+        pid=$(cat "$PIDFILE")
+        say "JACK is running (pid $pid)."
+        command -v jack_lsp >/dev/null 2>&1 &&
+            say "Ports:" && jack_lsp 2>/dev/null | sed 's/^/    /'
+    else
+        say "JACK is not running."
+        say "Tangent still plays and records without it, through OSS."
+    fi
+    ;;
+
+*)
+    usage
+    [ -n "$cmd" ] && exit 2 || exit 0
+    ;;
+esac

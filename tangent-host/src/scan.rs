@@ -55,6 +55,52 @@ const CONTENTS_SUBDIR: &str = "arm64-win";
 const CONTENTS_SUBDIR: &str = "x86_64-linux";
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 const CONTENTS_SUBDIR: &str = "aarch64-linux";
+// **FreeBSD says `amd64-linux`, and that is not a typo.**
+//
+// This arm was first written from the spec's `<cpu>-<os>` shape, which gives
+// `x86_64-freebsd`, and that guess was WRONG IN BOTH HALVES. The authority is
+// `audio/vst3sdk` in ports — the SDK a FreeBSD plugin is actually built with —
+// and `module_linux.cpp:149-172` is unambiguous:
+//
+//     // use the Machine Hardware Name (from uname cmd-line) as prefix
+//     auto machine = getCurrentMachineName ();     // uname().machine
+//     modulePath /= *machine + "-linux";
+//
+// The `-linux` suffix is hardcoded, so the OS half is `linux` on any Unix the
+// SDK builds on, FreeBSD included. And the CPU half is `uname -m`, which on
+// FreeBSD/amd64 is **`amd64`** where Linux/x86_64 reports `x86_64` — so the two
+// platforms disagree about the prefix as well.
+//
+// Net: `Contents/amd64-linux/Name.so`, and neither of the two names originally
+// written here would ever have matched. Verified against the installed SDK
+// rather than reasoned about, which is the only reason it is right.
+#[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
+const CONTENTS_SUBDIR: &str = "amd64-linux";
+#[cfg(all(target_os = "freebsd", target_arch = "aarch64"))]
+const CONTENTS_SUBDIR: &str = "arm64-linux";
+
+/// Other directories a FreeBSD-native bundle plausibly lands in, tried in order
+/// after [`CONTENTS_SUBDIR`].
+///
+/// The SDK settles what its own builder produces; it does not settle what every
+/// OTHER build system produces. JUCE and DPF reach FreeBSD by treating it as a
+/// Linux variant and derive the architecture string from their own tables,
+/// which mostly stop at `x86_64-linux` and do not consult `uname`. A bundle
+/// holding a perfectly good FreeBSD ELF under `x86_64-linux` is therefore a
+/// realistic artifact, and looking only at the SDK's name would report "no
+/// plugin" about one that is right there and would load.
+///
+/// The `-freebsd` spellings are kept last because they are what a
+/// spec-reading implementation would emit, and this file was one of those.
+///
+/// Safe in the direction that matters: a genuine *Linux* `.so` cannot be
+/// `dlopen`ed by the FreeBSD runtime linker — the ELF OSABI note and the
+/// syscall vector both refuse it — so none of these can smuggle in a foreign
+/// binary. They can only find a native plugin that was filed elsewhere.
+#[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
+const CONTENTS_SUBDIR_ALTS: &[&str] = &["x86_64-linux", "amd64-freebsd", "x86_64-freebsd"];
+#[cfg(all(target_os = "freebsd", target_arch = "aarch64"))]
+const CONTENTS_SUBDIR_ALTS: &[&str] = &["aarch64-linux", "arm64-freebsd", "aarch64-freebsd"];
 
 /// The standard search paths, in the order the SDK specifies.
 ///
@@ -107,6 +153,22 @@ pub fn search_paths() -> Vec<PathBuf> {
             out.push(PathBuf::from(&home).join(".vst3"));
         }
         out.push(PathBuf::from("/usr/lib/vst3"));
+        out.push(PathBuf::from("/usr/local/lib/vst3"));
+    }
+    // FreeBSD beside Linux rather than folded into it, because the system path
+    // genuinely differs: ports and packages install under `/usr/local`, and
+    // `/usr/lib` is base-system territory where a VST3 will never be. Listing
+    // `/usr/lib/vst3` here would be a path that cannot exist on this OS.
+    // `~/.vst3` is shared, being an SDK convention rather than a Linux one.
+    //
+    // Without this arm FreeBSD contributed nothing but `VST3_PATH`, so the
+    // plugin picker was empty unless the user had already set an env var they
+    // had no reason to know about.
+    #[cfg(target_os = "freebsd")]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            out.push(PathBuf::from(&home).join(".vst3"));
+        }
         out.push(PathBuf::from("/usr/local/lib/vst3"));
     }
     out
@@ -341,6 +403,22 @@ pub fn binary_in_bundle(bundle: &Path) -> Option<PathBuf> {
         return Some(bundle.to_path_buf());
     }
     let dir = bundle.join("Contents").join(CONTENTS_SUBDIR);
+    // See `CONTENTS_SUBDIR_ALTS`: the SDK settles what its own builder emits,
+    // and other build systems on this platform emit other things. The
+    // difference between finding them and not is the difference between "your
+    // plugins work" and "the picker is permanently empty". Tried in order and
+    // only when the SDK's own name is genuinely absent, so a correctly-built
+    // bundle is never second-guessed.
+    #[cfg(target_os = "freebsd")]
+    let dir = if dir.is_dir() {
+        dir
+    } else {
+        CONTENTS_SUBDIR_ALTS
+            .iter()
+            .map(|alt| bundle.join("Contents").join(alt))
+            .find(|p| p.is_dir())
+            .unwrap_or(dir)
+    };
     let entries = std::fs::read_dir(dir).ok()?;
     // Windows bundles ship resource DLLs, `.pdb`s and `moduleinfo.json`
     // BESIDE the plugin, and `read_dir` order picked whichever came first.
@@ -753,12 +831,19 @@ impl Library {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            // Windows: InitDll. Linux: ModuleEntry. Both are optional in
-            // practice — many plugins omit them — so a missing symbol is not an
-            // error, unlike macOS's bundleEntry.
+            // Windows: InitDll. Linux and FreeBSD: ModuleEntry. All are optional
+            // in practice — many plugins omit them — so a missing symbol is not
+            // an error, unlike macOS's bundleEntry.
+            //
+            // FreeBSD deliberately shares the Linux spelling rather than getting
+            // an arm of its own: the name is an ELF-platform convention, not a
+            // kernel one, and the SDK emits `ModuleEntry` for every ELF target.
+            // Note this is the arm whose semantics FreeBSD wants — optional, no
+            // error when absent — and NOT macOS's, where a missing `bundleEntry`
+            // is a hard failure.
             #[cfg(target_os = "windows")]
             let name: &[u8] = b"InitDll\0";
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
             let name: &[u8] = b"ModuleEntry\0";
             // SAFETY: freshly loaded handle.
             if let Some(entry) = unsafe { lib.symbol::<unsafe extern "system" fn() -> bool>(name) }

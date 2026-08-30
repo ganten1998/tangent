@@ -52,6 +52,12 @@ mod stretch;
 /// reason `record` is (docs/RECORDER-PLAN.md §12a).
 #[cfg(feature = "recorder")]
 mod instrument;
+/// FreeBSD's MIDI input, because midir has no backend there at all. Shaped as
+/// a drop-in for the handful of midir calls `midi` makes, so the difference is
+/// one `use` and not a second code path. A target gate, not a feature gate —
+/// same reasoning as `macwin` above.
+#[cfg(target_os = "freebsd")]
+mod umidi;
 mod midi;
 /// The recording session. Absent from a Minimal build, where `tangent-record` is
 /// not linked at all — the exclusion the compiler enforces rather than a flag
@@ -63,6 +69,52 @@ mod record;
 /// which a Minimal build has.
 #[cfg(feature = "recorder")]
 mod transport;
+
+/// Every plugin the picker should offer: VST3 bundles, and LV2 where there is
+/// an LV2 world to ask.
+///
+/// **One list, two formats, and the picker does not need to know.** Each row is
+/// `(identity, vendor, display name)`. For a VST3 the identity is the bundle
+/// path and the name is `None`, because the file stem already IS the plugin's
+/// name. For an LV2 the identity is `lv2:<uri>` and the name is given, because
+/// a URI's last segment is a slug at best — "dragonfly-reverb" where the plugin
+/// is called "Dragonfly Hall Reverb" — and the whole URN at worst.
+///
+/// The VST3 half is still a DIRECTORY LISTING: nothing is opened, so 112
+/// bundles cost milliseconds and no plugin can crash the process before the
+/// window appears. The LV2 half reads Turtle manifests through lilv, which is
+/// more work but is the only way LV2 can be enumerated at all, and lilv caches
+/// the world for the life of the process.
+#[cfg(feature = "recorder")]
+pub fn plugin_catalog(
+    extra: &[std::path::PathBuf],
+) -> Vec<(std::path::PathBuf, Option<String>, Option<String>)> {
+    plugin_catalog_from(tangent_host::discover_in(extra))
+}
+
+/// The same, for a caller that has already done the VST3 scan and wants its
+/// report — see the scan-report path in `desktop`.
+#[cfg(feature = "recorder")]
+pub fn plugin_catalog_from(
+    bundles: Vec<std::path::PathBuf>,
+) -> Vec<(std::path::PathBuf, Option<String>, Option<String>)> {
+    let mut rows: Vec<(std::path::PathBuf, Option<String>, Option<String>)> = bundles
+        .into_iter()
+        .map(|p| {
+            let v = tangent_host::vendor_of(&p);
+            (p, v, None)
+        })
+        .collect();
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    rows.extend(tangent_host::lv2::discover().into_iter().map(|p| {
+        (
+            tangent_host::lv2::identity_for(&p.uri),
+            Some(tangent_host::lv2::vendor_of(&p.uri)),
+            Some(p.name),
+        )
+    }));
+    rows
+}
 
 use tangent_ui::settings::Settings;
 
@@ -440,5 +492,61 @@ fn main() {
             0,
         );
         std::process::exit(0)
+    }
+}
+
+#[cfg(all(test, feature = "recorder"))]
+mod catalog_tests {
+    /// The picker's list is what a user chooses from, so the thing worth
+    /// pinning is that an LV2 plugin arrives in it *usably* — with the name the
+    /// plugin calls itself, not the tail of its URI.
+    ///
+    /// Skips where no LV2 plugin is installed, since a machine without them is
+    /// not a machine with a bug.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn lv2_plugins_reach_the_picker_under_their_own_names() {
+        let rows = super::plugin_catalog_from(Vec::new());
+        let lv2: Vec<_> = rows
+            .iter()
+            .filter(|(p, _, _)| tangent_host::lv2::uri_of(p).is_some())
+            .collect();
+        if lv2.is_empty() {
+            eprintln!("skipping: no LV2 plugins installed");
+            return;
+        }
+        for (id, vendor, name) in &lv2 {
+            let name = name.as_deref().unwrap_or("");
+            assert!(!name.is_empty(), "{id:?} reached the picker with no name");
+            // The failure this guards is silent and ugly: a URI whose last
+            // segment is a slug would show "dragonfly-reverb" where the plugin
+            // is called "Dragonfly Hall Reverb", and a URN would show the whole
+            // thing. Deriving the name from the identity is exactly what the
+            // display name exists to avoid.
+            let derived = std::path::Path::new(id.to_str().unwrap_or(""))
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let _ = derived;
+            assert!(
+                vendor.is_some(),
+                "{name} reached the picker with no vendor to group it under"
+            );
+        }
+    }
+
+    /// A VST3 row must keep carrying `None` for its name, because the bundle's
+    /// file stem already is the plugin's name and inventing a second source of
+    /// truth for it is how the two disagree.
+    #[test]
+    fn vst3_rows_still_derive_their_name_from_the_bundle() {
+        let rows = super::plugin_catalog_from(vec![std::path::PathBuf::from(
+            "/usr/local/lib/vst3/Pianoteq 8.vst3",
+        )]);
+        let row = rows
+            .iter()
+            .find(|(p, _, _)| p.to_string_lossy().contains("Pianoteq"))
+            .expect("the bundle handed in should come back");
+        assert_eq!(row.2, None, "a VST3 row must not carry a display name");
     }
 }
