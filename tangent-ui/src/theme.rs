@@ -987,6 +987,12 @@ pub fn factory() -> Vec<Theme> {
 /// rather than reported: a themes folder is somewhere people put junk, and one
 /// bad file must not cost the menu.
 pub fn user_themes() -> Vec<Theme> {
+    // This IS "the first time the app looks", so the example goes in here —
+    // `seed_example` sat fully written and never called, which meant the
+    // folder the menu told people about was empty when they opened it. Best
+    // effort and cheap: one `exists()` stat once the file is there, and a
+    // read-only config dir costs a shrug rather than the menu.
+    seed_example();
     let dir = user_dir();
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
@@ -1003,6 +1009,16 @@ pub fn user_themes() -> Vec<Theme> {
             let text = std::fs::read_to_string(p).ok()?;
             let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned())?;
             Theme::from_json(&text, &stem)
+        })
+        // A theme that sets NOTHING is a template, not a theme — which is
+        // exactly what the seeded example is until somebody edits it. In the
+        // menu it would be a row that does nothing, and it would do nothing
+        // under whatever name the file happens to carry. The moment one role
+        // is filled in, it earns its row.
+        .filter(|t| {
+            t.channel_palette.is_some()
+                || !t.dark.is_empty()
+                || ROLES.iter().any(|r| t.role(r).is_some())
         })
         .collect()
 }
@@ -1077,7 +1093,6 @@ pub const EXAMPLE: &str = r##"{
     "fx_knob": "",
     "master_knob": "",
     "varispeed": "",
-  "varispeed": "",
     "meter_bg": "",
     "scope_draw": "",
     "fx_strip": "",
@@ -1088,11 +1103,16 @@ pub const EXAMPLE: &str = r##"{
     "velocity_quiet": ""
   },
 
-  "_comment4": "channel_palette picks what the SIXTEEN channels wear, plus the",
-  "_comment5": "click and the master. A number, not a colour:",
-  "_comment6": "0 IVORY (full spectrum)  1 EMBER (warm)   2 TIDE (cool)",
-  "_comment7": "3 MOSS (greens)          4 NEON (vivid)   5 ASH (near-monochrome)",
-  "_comment8": "6 BLOOM (violet)         7 PATINA (teal and copper)",
+  "_comment4": "channel_palette picks which theme's auto-palette the sixteen",
+  "_comment5": "channels, the click and the master wear. A number, not a colour,",
+  "_comment6": "one palette per factory theme, in the menu's order:",
+  "_comment7": "0 Default     1 Valentine   2 Hydra       3 Navi",
+  "_comment8": "4 Mono        5 Studio      6 Aurora      7 Sandstone",
+  "_comment9": "8 Centennial  9 Blueprint  10 Porcelain  11 Moss",
+  "_comment10": "12 Rhodes    13 Copper    14 Dusk       15 Iris",
+  "_comment11": "It only takes effect while the track menu's palette is on AUTO;",
+  "_comment12": "a palette picked by hand there outlives any theme. Leave it out",
+  "_comment13": "and the channels keep dressing for whichever theme is applied.",
   "channel_palette": ""
 }
 "##;
@@ -1493,6 +1513,55 @@ mod tests {
         assert_eq!(t.white_key, None, "an empty value must not become a colour");
         assert_eq!(t.scope_draw, None);
         assert_eq!(t.channel_palette, None);
+    }
+
+    /// **The example's palette list is the shipped palette list.**
+    ///
+    /// It described the eight retired abstract palettes for a full release
+    /// after the sixteen theme-named ones replaced them — nobody noticed
+    /// because the file it documents was never being written. Walked from
+    /// `PALETTES` so the list cannot go quietly stale again.
+    #[test]
+    fn the_example_names_every_palette_by_its_current_name() {
+        for (i, p) in crate::mixer_panel::PALETTES.iter().enumerate() {
+            assert!(
+                EXAMPLE.contains(&format!("{i} {}", p.name)),
+                "the example does not list palette {i} as {}",
+                p.name
+            );
+        }
+        assert!(
+            !EXAMPLE.contains("IVORY"),
+            "the retired abstract palette names are back in the example"
+        );
+    }
+
+    /// **The example file exists once the app has looked, and stays out of
+    /// the menu.** `seed_example` was written, documented and never called;
+    /// the folder the menu advertised was empty when people opened it. It
+    /// seeds on the first listing now — and the untouched template, which
+    /// sets nothing, must not become a "My Theme" row that does nothing.
+    #[test]
+    fn the_example_appears_the_first_time_the_app_looks() {
+        let path = user_dir().join("example.json");
+        let _ = std::fs::remove_file(&path);
+        let listed = user_themes();
+        assert!(path.exists(), "looking did not leave the example behind");
+        let text = std::fs::read_to_string(&path).expect("the example reads back");
+        assert_eq!(text, EXAMPLE, "something other than the example was seeded");
+        assert!(
+            !listed.iter().any(|t| t.name == "My Theme"),
+            "the untouched template took a row in the menu"
+        );
+        // Filled in — one role is enough — it earns its row.
+        let mut mine = Theme::from_json(EXAMPLE, "example").expect("parses");
+        mine.sustain = Some(Rgb::new(0x12, 0x34, 0x56));
+        std::fs::write(&path, mine.to_json()).expect("the edit lands");
+        assert!(
+            user_themes().iter().any(|t| t.name == "My Theme"),
+            "an edited template is a real theme and must be listed"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

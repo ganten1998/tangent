@@ -1946,7 +1946,10 @@ fn draw_note_miniature(
     r: Rect,
     full_x: (f32, f32),
     clip: &ClipView<'_>,
-    p: &Ink,
+    // The ink of the CLIP this miniature sits inside, measured there by the
+    // caller — not `Ink`, because handing the whole wardrobe in is how a
+    // miniature ends up printed in an ink its own clip cannot carry.
+    ink: Color32,
 ) {
     let len = clip.len_s.max(1.0e-9);
     // How many passes the clip's length holds. One when it does not loop,
@@ -2006,7 +2009,7 @@ fn draw_note_miniature(
         painter.rect_filled(
             Rect::from_min_max(Pos2::new(x0, y), Pos2::new(x1.max(x0 + 1.5), y + bar_h)),
             1.0,
-            p.clip_ink.gamma_multiply(0.8),
+            ink.gamma_multiply(0.8),
         );
     }
 }
@@ -2838,7 +2841,11 @@ fn ink(view: &ArrangeView<'_>) -> Ink {
         // Clips wear PALETTE colours, and every one of those is generated
         // dark enough to carry the ivory ink at 4.5:1 — that is the palette's
         // own contract, held by `every_auto_palette_colour_can_carry_the_ink`.
-        // So the ink on a clip answers to the clip, not to the field behind it.
+        // So the ink on a clip answers to the clip, not to the field behind
+        // it — and the clip loop MEASURES its own (`on_ink` on the guarded
+        // clip colour), because a hand-painted lane can reach the grid's
+        // three dead-zone tones the palettes' contract never covered. This
+        // constant is what the automation dials' needles still wear.
         clip_ink: crate::recorder_panel::INK_LIGHT,
         // The semantic lights are the desk's, everywhere, in every theme:
         // a record light that changed colour with the wallpaper would be a
@@ -2854,6 +2861,14 @@ fn ink(view: &ArrangeView<'_>) -> Ink {
         meter: Color32::from_rgb(0x3D, 0xC0, 0x5A),
         select: on(lane),
     }
+}
+
+/// The empty timeline's hint ink: the lane's own ink, quieted the knob
+/// readout's amount. One function so the draw and the test cannot measure
+/// two different colours — and the hint is DRAWN on a lane-coloured row,
+/// because this is measured against `p.lane` and nothing else.
+fn empty_hint_ink(p: &Ink) -> Color32 {
+    quiet(on_ink(p.lane), p.lane, 0.22)
 }
 
 /// A quieter ink: pulled toward the ground it sits on, never made
@@ -3418,6 +3433,12 @@ fn auto_ground(p: &Ink, lane: usize) -> Color32 {
 }
 
 /// Paint the whole view into `rect`.
+/// What a timeline with nothing on it says. One line, because the person it
+/// is for has been in the app for a minute and the person it is not for has
+/// a thousand hours; a paragraph would condescend to both. The two clauses
+/// are the two doors material actually comes through: a file, or a take.
+pub const EMPTY_TIMELINE_HINT: &str = "Drop audio here, or arm a channel and record";
+
 pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     let l = Layout::new(rect, view);
     if !l.lanes_area.is_positive() {
@@ -4051,19 +4072,30 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         if !r.is_positive() {
             continue;
         }
-        let color = view
-            .lanes
-            .get(clip.lane)
-            .map(|lane| lane.color)
-            .filter(|c| *c != 0)
-            .map(|c| {
-                let (cr, cg, cb) = STRIP_COLORS[c.min(STRIP_COLORS.len() - 1)];
-                Color32::from_rgb(cr, cg, cb)
-            })
-            // An unpainted lane's clips are the desk's green — the timeline
-            // wave's own colour, so the two surfaces agree what audio looks
-            // like.
-            .unwrap_or(Color32::from_rgb(0x2E, 0x6B, 0x46));
+        // Through the dead-zone guard, like the strip and the header plate:
+        // a hand-painted lane can point its clips at the grid's three
+        // unreadable third tones, and the auto palettes' contract does not
+        // cover the hand grid.
+        let color = crate::recorder_panel::legible_surface(
+            view.lanes
+                .get(clip.lane)
+                .map(|lane| lane.color)
+                .filter(|c| *c != 0)
+                .map(|c| {
+                    let (cr, cg, cb) = STRIP_COLORS[c.min(STRIP_COLORS.len() - 1)];
+                    Color32::from_rgb(cr, cg, cb)
+                })
+                // An unpainted lane's clips are the desk's green — the
+                // timeline wave's own colour, so the two surfaces agree what
+                // audio looks like.
+                .unwrap_or(Color32::from_rgb(0x2E, 0x6B, 0x46)),
+        );
+        // Measured on THIS clip rather than taken from `p`: the guard can
+        // move an olive to the side of the dead zone where the dark ink is
+        // the one that reads, and `p.clip_ink` is the light one. Everything
+        // printed inside the clip — name, staff, wave, fades, handles —
+        // takes this ink, so the clip cannot half-agree with itself.
+        let clip_ink = on_ink(color);
         painter.rect_filled(r, 3.0, color);
         // A MIDI item draws its NOTES in miniature — the arrangement can
         // read what the editor will say. An empty item keeps the dashed
@@ -4078,7 +4110,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 while x < r.right() - 3.0 {
                     painter.line_segment(
                         [Pos2::new(x, mid), Pos2::new((x + 4.0).min(r.right() - 3.0), mid)],
-                        Stroke::new(1.0, p.clip_ink.gamma_multiply(0.5)),
+                        Stroke::new(1.0, clip_ink.gamma_multiply(0.5)),
                     );
                     x += 8.0;
                 }
@@ -4087,7 +4119,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                     x_of(rect, view, clip.start_s),
                     x_of(rect, view, clip.start_s + clip.len_s),
                 );
-                draw_note_miniature(painter, r, full_x, clip, &p);
+                draw_note_miniature(painter, r, full_x, clip, clip_ink);
             }
         }
         // ── the wave ──────────────────────────────────────────────────────
@@ -4112,7 +4144,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             let t0 = time_at(rect, view, r.left());
             let t1 = time_at(rect, view, r.left() + 1.0);
             let dt = (t1 - t0).abs().max(1.0e-9);
-            let ink = p.clip_ink.gamma_multiply(0.62);
+            let ink = clip_ink.gamma_multiply(0.62);
             for i in 0..cols {
                 let x = r.left() + i as f32;
                 if x > r.right() {
@@ -4160,7 +4192,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             ));
             painter.line_segment(
                 [Pos2::new(r.left(), r.bottom()), Pos2::new(fx, r.top())],
-                Stroke::new(1.0, p.clip_ink),
+                Stroke::new(1.0, clip_ink),
             );
         }
         if clip.fade_out_s > 0.0 {
@@ -4173,7 +4205,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             ));
             painter.line_segment(
                 [Pos2::new(fx, r.top()), Pos2::new(r.right(), r.bottom())],
-                Stroke::new(1.0, p.clip_ink),
+                Stroke::new(1.0, clip_ink),
             );
         }
         // A clip being recorded wears the record's own red, and no handles:
@@ -4189,7 +4221,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         // The fade HANDLES, only at a size where they are grabbable.
         if !clip.recording && r.width() >= FADE_W * 3.0 {
             for x in [r.left() + FADE_W * 0.5, r.right() - FADE_W * 0.5] {
-                painter.circle_filled(Pos2::new(x, r.top() + FADE_W * 0.4), 2.0, p.clip_ink);
+                painter.circle_filled(Pos2::new(x, r.top() + FADE_W * 0.4), 2.0, clip_ink);
             }
         }
         // The name, cut to the clip.
@@ -4200,7 +4232,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
                 Align2::LEFT_TOP,
                 cut_to(painter, r.width() - FADE_W * 2.0 - 4.0, clip.name, &font),
                 font,
-                p.clip_ink,
+                clip_ink,
             );
         }
         painter.rect_stroke(
@@ -4213,6 +4245,37 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             },
             egui::StrokeKind::Inside,
         );
+    }
+
+    // ── the empty timeline says what it is waiting for ────────────────────
+    //
+    // A pane of striped lanes with nothing on them reads as a broken view to
+    // somebody meeting the app, and as Tuesday to somebody who lives in it.
+    // One quiet line serves the first and costs the second nothing: it is in
+    // the lane's own lowered ink, and the first clip — including a take the
+    // moment recording starts — makes it never have existed. Before the
+    // veils and the playhead, which are about state and place and belong on
+    // top of everything, hints included.
+    if view.clips.is_empty() {
+        // On a LANE-coloured row near the middle, not at the area's centre:
+        // the alternate stripe is `separate`d toward the ink, and on the
+        // themes whose lane parks right at the dead-zone guard's exit even
+        // the full-strength ink cannot clear 4.5:1 there. The hint stands on
+        // the ground its ink is measured against, or it is a pairing nobody
+        // checked — the mistake this app has stopped making.
+        let mid = {
+            let i = l.lane_rows.len() / 2;
+            i - i % 2
+        };
+        if let Some(row) = l.lane_rows.get(mid).filter(|r| r.is_positive()) {
+            painter.text(
+                Pos2::new(l.lanes_area.center().x, row.center().y),
+                Align2::CENTER_CENTER,
+                EMPTY_TIMELINE_HINT,
+                FontId::new(12.0, crate::fonts::courier()),
+                empty_hint_ink(&p),
+            );
+        }
     }
 
     // ── SILENCED BY A FOLDER: a veil over the row ────────────────────────
@@ -4525,10 +4588,14 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     for (i, row) in l.header_rows.iter().enumerate() {
         let Some(lane) = view.lanes.get(i) else { continue };
         // The strip's own colour as a plate behind the header, the mixer's
-        // rule: any colour, and the text still reads.
+        // rule: any colour, and the text still reads. Through the dead-zone
+        // guard for the same reason the mixer's strip goes through it: three
+        // of the hand-picking grid's third tones sit where neither ink
+        // clears, and the indices are saved in desks so the SURFACE moves at
+        // draw time rather than the table.
         let face = if lane.color != 0 {
             let (cr, cg, cb) = STRIP_COLORS[lane.color.min(STRIP_COLORS.len() - 1)];
-            Color32::from_rgb(cr, cg, cb)
+            crate::recorder_panel::legible_surface(Color32::from_rgb(cr, cg, cb))
         } else {
             p.hdr_face
         };
@@ -5114,10 +5181,6 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             );
         }
     }
-}
-
-fn luma(c: Color32) -> f32 {
-    0.299 * f32::from(c.r()) + 0.587 * f32::from(c.g()) + 0.114 * f32::from(c.b())
 }
 
 fn cut_to(painter: &Painter, width: f32, text: &str, font: &FontId) -> String {
@@ -6214,6 +6277,78 @@ ArrangeView {
             bad.join("\n  ")
         );
     }
+
+    /// **Any swatch a hand can paint a lane carries measured ink here.**
+    ///
+    /// The header plate and the clip body both wear `STRIP_COLORS` raw when a
+    /// lane is painted, and the hand-picking grid holds three third tones in
+    /// the dead zone where neither ink clears. Both surfaces now go through
+    /// `legible_surface` and then MEASURE their ink, so this walks the whole
+    /// table through exactly that pipeline. Raw, indices 11, 14 and 17 fail.
+    #[test]
+    fn a_painted_lane_reads_whatever_swatch_the_hand_picked() {
+        for (i, &(r, g, b)) in STRIP_COLORS.iter().enumerate() {
+            let surface =
+                crate::recorder_panel::legible_surface(Color32::from_rgb(r, g, b));
+            let ink = on_ink(surface);
+            let c = crate::recorder_panel::contrast_ratio(ink, surface);
+            assert!(
+                c >= 4.5,
+                "swatch {i} ({r:02x}{g:02x}{b:02x}): plate and clip ink at {c:.2}:1"
+            );
+        }
+    }
+
+    /// **An empty timeline offers its one line, and the line can be read.**
+    ///
+    /// The wording is the contract: one line, no em dash — it is published
+    /// prose on the screen, not a comment. The ink is the same lowered lane
+    /// ink the draw uses, checked against the lane ground the hint actually
+    /// stands on — the draw pins it to a lane-coloured row on purpose —
+    /// across every factory theme in both modes, at the 4.5:1 every other
+    /// word answers to.
+    #[test]
+    fn an_empty_timeline_says_where_material_comes_from() {
+        assert!(!EMPTY_TIMELINE_HINT.contains('\u{2014}'), "an em dash crept in");
+        assert!(!EMPTY_TIMELINE_HINT.contains('\n'), "the hint grew a second line");
+        let mut bad: Vec<String> = Vec::new();
+        for theme in crate::theme::factory() {
+            for dark in [false, true] {
+                let mut set = crate::settings::Settings::default();
+                theme.apply(&mut set);
+                let clips: Vec<ClipView<'_>> = Vec::new();
+                let mut v = a_view(&clips);
+                v.dark_mode = dark;
+                v.wood = (
+                    set.recorder_bg_color.r,
+                    set.recorder_bg_color.g,
+                    set.recorder_bg_color.b,
+                );
+                v.fx_strip = (
+                    set.fx_strip_color.r,
+                    set.fx_strip_color.g,
+                    set.fx_strip_color.b,
+                );
+                v.meter_bg = (
+                    set.meter_bg_color.r,
+                    set.meter_bg_color.g,
+                    set.meter_bg_color.b,
+                );
+                let p = ink(&v);
+                let hint = empty_hint_ink(&p);
+                let c = crate::recorder_panel::contrast_ratio(hint, p.lane);
+                if c < 4.5 {
+                    bad.push(format!(
+                        "{} {}: hint on lane {c:.2}:1",
+                        theme.name,
+                        if dark { "dark" } else { "light" }
+                    ));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "the hint hides:\n  {}", bad.join("\n  "));
+    }
+
     #[test]
     fn the_time_axis_round_trips() {
         let c = clips();

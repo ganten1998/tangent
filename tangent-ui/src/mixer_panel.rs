@@ -315,10 +315,14 @@ impl Hit {
 /// thing that must not be missed. So: nine rows of three.
 ///
 /// The first row is the neutrals, and index 0 is the band's own wood — a
-/// channel nobody has coloured is not a colour choice at all. Every value is
-/// dark enough to carry the face's text, because this paints the whole strip
-/// and not a dot on it; the labels sit on plates of their own for the same
-/// reason.
+/// channel nobody has coloured is not a colour choice at all. Nearly every
+/// value is dark enough to carry the face's text, because this paints the
+/// whole strip and not a dot on it; the labels sit on plates of their own for
+/// the same reason. NEARLY: the third tones of olive, green and teal sit in
+/// the dead zone where neither ink clears 4.5:1, which is why every surface
+/// painted from this table goes through `legible_surface` on its way to the
+/// screen — the indices are saved in desks and cannot move, so the paint
+/// deepens or lifts at draw time instead.
 ///
 /// [`PALETTE_COLUMNS`] is what makes the grid read as hues rather than as
 /// twenty-seven swatches: reading down a column is one tone, across a row is
@@ -1470,10 +1474,12 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MixerView<'_>) {
             .any(|n| v.strip == Some(Strip::Channel(*n)))
         {
             // Measured against THIS strip's own plate, which a painted
-            // channel chooses for itself. See `selection_rim`.
+            // channel chooses for itself. See `selection_rim`. Through the
+            // same dead-zone guard the strip runs its face through, or the
+            // rim would be measured against a colour the strip is not.
             let under = if v.color != 0 {
                 let (r, g, b) = STRIP_COLORS[v.color.min(STRIP_COLORS.len() - 1)];
-                Color32::from_rgb(r, g, b)
+                crate::recorder_panel::legible_surface(Color32::from_rgb(r, g, b))
             } else {
                 p.face
             };
@@ -1549,7 +1555,14 @@ fn strip(
     let painted = v.color != 0;
     let face = if painted {
         let (r, g, b) = STRIP_COLORS[v.color.min(STRIP_COLORS.len() - 1)];
-        Color32::from_rgb(r, g, b)
+        // Through the dead-zone guard, because the hand-picking grid predates
+        // it: three of its third tones — olive, green, teal — sit where
+        // NEITHER ink clears 4.5:1, so a channel painted one of them carried
+        // unreadable text on every theme, the solo/record failure class over
+        // again. The table itself is append-only and saved into desks, so the
+        // swatch keeps its index and the SURFACE moves at draw time — the
+        // compliant 313 come through untouched.
+        crate::recorder_panel::legible_surface(Color32::from_rgb(r, g, b))
     } else if heard {
         p.face
     } else {
@@ -2502,14 +2515,6 @@ fn flatten(c: Color32, under: Color32) -> Color32 {
     )
 }
 
-/// Perceived luminance, 0..=255.
-///
-/// Weighted rather than averaged: at equal numbers green reads far lighter
-/// than blue, and a desk with twenty-seven paints on it has several of both.
-fn luma(c: Color32) -> f32 {
-    0.299 * f32::from(c.r()) + 0.587 * f32::from(c.g()) + 0.114 * f32::from(c.b())
-}
-
 /// Ink that can be read on `bg`, whatever somebody painted the channel.
 ///
 /// `bg` must be a colour that is really on screen — see [`flatten`].
@@ -3152,6 +3157,50 @@ mod tests {
         }
     }
 
+    /// Perceived luminance, 0..=255, for the scale test below — weighted
+    /// rather than averaged, because at equal numbers green reads far lighter
+    /// than blue. Test-only: the panel itself measures with `contrast_ratio`.
+    fn luma(c: Color32) -> f32 {
+        0.299 * f32::from(c.r()) + 0.587 * f32::from(c.g()) + 0.114 * f32::from(c.b())
+    }
+
+    /// **Every swatch in the table can carry measured ink, once guarded.**
+    ///
+    /// The hand-picking grid predates the dead-zone rule, and three of its
+    /// third tones — olive, green, teal — sit at the luminance where neither
+    /// ink clears 4.5:1. Raw, they fail this test; through `legible_surface`,
+    /// the way the strip and the arrangement now paint them, every index in
+    /// the table carries its measured ink. The wrap must also leave the
+    /// compliant colours untouched — a guard that repainted the whole table
+    /// would be a silent palette change on every saved desk.
+    #[test]
+    fn every_swatch_carries_its_ink_once_the_dead_zone_guard_runs() {
+        let v = a_view();
+        let p = ink(&v);
+        let mut moved = Vec::new();
+        for (i, &(r, g, b)) in STRIP_COLORS.iter().enumerate() {
+            let raw = Color32::from_rgb(r, g, b);
+            let face = crate::recorder_panel::legible_surface(raw);
+            let ink = print_on(flatten(face, p.wood), &p);
+            let c = crate::recorder_panel::contrast_ratio(ink, face);
+            assert!(
+                c >= 4.5,
+                "swatch {i} ({r:02x}{g:02x}{b:02x}) carries its ink at {c:.2}:1"
+            );
+            if face != raw {
+                moved.push(i);
+            }
+        }
+        // Exactly the three dead-zone tones, and no more: olive3, green3,
+        // teal3. A fourth entry moving means somebody appended a swatch the
+        // guard has to repaint, which palgen's --check exists to catch first.
+        assert_eq!(
+            moved,
+            vec![11, 14, 17],
+            "the guard moved a different set of swatches than the known three"
+        );
+    }
+
     /// **The scale beside a meter can be read on every channel.**
     ///
     /// The numbers were a faded ivory, chosen against the walnut the desk sits
@@ -3177,7 +3226,8 @@ mod tests {
                     0 => "colour 0",
                     _ => "a painted strip",
                 },
-                Color32::from_rgb(r, g, b),
+                // Through the guard, because that is what the panel paints.
+                crate::recorder_panel::legible_surface(Color32::from_rgb(r, g, b)),
             ));
         }
         for (what, face) in faces {

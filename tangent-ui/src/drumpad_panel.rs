@@ -70,19 +70,65 @@ pub const KNOB_TRAVEL: f32 = 150.0;
 /// How many choke groups the cycle offers. 0 is "none"; A–D are 1..=4.
 pub const CHOKE_GROUPS: u8 = 4;
 
-// The popup family's face and ink — the MIDI editor's exact pair, because
-// two popups in two palettes would read as two apps.
+// The popup family's dress. The comment here used to say "the MIDI editor's
+// exact pair, because two popups in two palettes would read as two apps" —
+// and then the MIDI editor stopped being a pair at all: its face is derived
+// from the theme through `roll_face`, and the drumpad kept the frozen browns.
+// Two popups in two wardrobes, the exact failure the old comment warned
+// about, with the roles reversed. The derivation is now SHARED — `face_of`
+// calls the editor's `roll_face` rather than copying it — and the ink is
+// measured on the face it lands on, never inherited.
+//
+// The shipped pair below survives only as the UNDRESSED door's wardrobe:
+// `draw` keeps rendering exactly what it always did until the app's call
+// sites hand a `Dress` to `draw_dressed`.
 // Lifted from 0x18120F: the owner called the old shades "too dark to be
 // legibly discerned" — the face, the pads and the explorer all sat within
 // a few sRGB steps of each other.
-const FACE: Color32 = Color32::from_rgb(0x24, 0x1C, 0x16);
-const INK: Color32 = Color32::from_rgb(0xFF, 0xF4, 0xE0);
+const SHIPPED_FACE: Color32 = Color32::from_rgb(0x24, 0x1C, 0x16);
+const SHIPPED_INK: Color32 = Color32::from_rgb(0xFF, 0xF4, 0xE0);
 /// The app's one red, for CLEAR and for a pad whose file went missing.
+/// Fixed in every theme — a record light you had to learn twice would be
+/// worse than a themed one — but pushed off the face at draw time where a
+/// pale theme's face would swallow it.
 const REC_RED: Color32 = Color32::from_rgb(0xE8, 0x3A, 0x4E);
-/// The meter green every meter in the app wears.
+/// The meter green every meter in the app wears. Fixed, guarded, same deal.
 const METER_GREEN: Color32 = Color32::from_rgb(0x3D, 0xC0, 0x5A);
 /// Tape amber, the capture cassette's colour — here it badges a choke group.
 const AMBER: Color32 = Color32::from_rgb(0xC9, 0x8B, 0x3D);
+
+/// The three theme roles the popup dresses from — the same trio the MIDI
+/// editor and the arrangement derive their surfaces from, carried as plain
+/// data because `tangent-ui` panels take colour as data and never reach for
+/// `Settings` themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Dress {
+    pub fx_strip: (u8, u8, u8),
+    pub meter_bg: (u8, u8, u8),
+    pub dark: bool,
+}
+
+/// The popup's face for a dress: the MIDI editor's own derivation, CALLED
+/// rather than copied, so the two sibling popups can never again disagree
+/// about what the theme looks like. `roll_face` already runs the dead-zone
+/// guard, so the answer is always a surface one of the two inks can carry.
+pub fn face_of(d: Dress) -> Color32 {
+    crate::midi_editor::roll_face(
+        Color32::from_rgb(d.fx_strip.0, d.fx_strip.1, d.fx_strip.2),
+        Color32::from_rgb(d.meter_bg.0, d.meter_bg.1, d.meter_bg.2),
+        d.dark,
+    )
+}
+
+/// The ink the face can carry, measured — a property of the surface, never
+/// of the theme that suggested it.
+pub fn ink_of(face: Color32) -> Color32 {
+    if crate::recorder_panel::wants_light_ink(face) {
+        crate::recorder_panel::INK_LIGHT
+    } else {
+        crate::recorder_panel::INK_DARK
+    }
+}
 
 /// One pad, as the app knows it.
 #[derive(Debug, Clone, Copy)]
@@ -499,11 +545,19 @@ pub fn choke_word(group: u8) -> &'static str {
 /// One inspector knob to the desk standard: the VALUE on top, the label
 /// on the bottom, and a thin travel line between them showing where in
 /// its range the value stands.
-fn knob(painter: &Painter, r: Rect, label: &str, word: &str, frac: f32, active: bool) {
+fn knob(
+    painter: &Painter,
+    r: Rect,
+    label: &str,
+    word: &str,
+    frac: f32,
+    active: bool,
+    ink: Color32,
+) {
     if !r.is_positive() {
         return;
     }
-    let ink = if active { INK } else { INK.gamma_multiply(0.35) };
+    let ink = if active { ink } else { ink.gamma_multiply(0.35) };
     painter.text(
         Pos2::new(r.center().x, r.top() + 1.0),
         Align2::CENTER_TOP,
@@ -530,8 +584,10 @@ fn knob(painter: &Painter, r: Rect, label: &str, word: &str, frac: f32, active: 
     );
 }
 
-/// The chip idiom, the editor's exact one.
-fn chip(painter: &Painter, r: Rect, word: &str, lit: bool, lit_ink: Color32) {
+/// The chip idiom, the editor's exact one. A lit chip's word is written in
+/// the FACE colour — the engraved look — which is why the face rides along:
+/// the fill is the chip's own ink at strength, so the face always reads on it.
+fn chip(painter: &Painter, r: Rect, word: &str, lit: bool, lit_ink: Color32, face: Color32) {
     if !r.is_positive() {
         return;
     }
@@ -551,50 +607,73 @@ fn chip(painter: &Painter, r: Rect, word: &str, lit: bool, lit_ink: Color32) {
             Align2::CENTER_CENTER,
             word,
             font(size),
-            if lit { FACE } else { lit_ink.gamma_multiply(0.7) },
+            if lit { face } else { lit_ink.gamma_multiply(0.7) },
         );
     }
 }
 
+/// The undressed door: the shipped pair, rendered exactly as it always was.
+/// The app's call sites still come through here; moving them onto
+/// [`draw_dressed`] with the three roles the MIDI editor's view already
+/// carries is the app's half of this work, and lives in `app.rs`.
 pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
+    draw_with(painter, rect, view, SHIPPED_FACE, SHIPPED_INK);
+}
+
+/// The popup, dressed by the live theme.
+pub fn draw_dressed(painter: &Painter, rect: Rect, view: &DrumpadView<'_>, dress: Dress) {
+    let face = face_of(dress);
+    draw_with(painter, rect, view, face, ink_of(face));
+}
+
+fn draw_with(painter: &Painter, rect: Rect, view: &DrumpadView<'_>, face: Color32, ink: Color32) {
     let l = Layout::new(rect);
     if !l.panel.is_positive() {
         return;
     }
+    // Which way the face leans decides every wash below: the fixed lights
+    // are pushed off the face until they read, and the veils that recess a
+    // region thin out on a pale face where a full black wash is a bruise —
+    // the editor's own darker-rows rule.
+    let light_ink = crate::recorder_panel::wants_light_ink(face);
+    let rec_red = crate::recorder_panel::distinct_surface_at(REC_RED, face, 3.0);
+    let green = crate::recorder_panel::distinct_surface_at(METER_GREEN, face, 3.0);
+    let amber = crate::recorder_panel::distinct_surface_at(AMBER, face, 3.0);
+    let recess = Color32::from_black_alpha(if light_ink { 60 } else { 26 });
     // A popup over whatever is open: its own face, a firm border, and a
     // clip so nothing leaks onto the view below.
     let painter = &painter.with_clip_rect(l.panel.expand(1.0));
-    painter.rect_filled(l.panel, 4.0, FACE);
+    painter.rect_filled(l.panel, 4.0, face);
     painter.rect_stroke(
         l.panel,
         4.0,
-        Stroke::new(1.5_f32, INK.gamma_multiply(0.5)),
+        Stroke::new(1.5_f32, ink.gamma_multiply(0.5)),
         egui::StrokeKind::Inside,
     );
 
     // ── the strip ─────────────────────────────────────────────────────────
-    painter.rect_filled(l.strip, 4.0, Color32::from_rgba_premultiplied(0, 0, 0, 60));
+    painter.rect_filled(l.strip, 4.0, recess);
     painter.text(
         Pos2::new(l.strip.left() + 8.0, l.strip.center().y),
         Align2::LEFT_CENTER,
         "DRUMPAD",
         font(STRIP_H * 0.45),
-        INK,
+        ink,
     );
-    chip(painter, l.midi, "MIDI", view.midi_on, INK);
+    chip(painter, l.midi, "MIDI", view.midi_on, ink, face);
     // DEF: the current folder IS the remembered one while lit.
-    chip(painter, l.def, "DEF", view.def_lit, AMBER);
+    chip(painter, l.def, "DEF", view.def_lit, amber, face);
     // **The kit pair, never lit**: they are actions, not states. MIDI and DEF
     // light because they say what is true; these two do a thing and are done.
-    chip(painter, l.save_kit, "SAVE", false, INK);
-    chip(painter, l.load_kit, "LOAD", false, INK);
+    chip(painter, l.save_kit, "SAVE", false, ink, face);
+    chip(painter, l.load_kit, "LOAD", false, ink, face);
     if l.close.is_positive() {
         let c = l.close.center();
         let a = l.close.width() * 0.28;
         for s in [-1.0f32, 1.0] {
             painter.line_segment(
                 [Pos2::new(c.x - a, c.y - a * s), Pos2::new(c.x + a, c.y + a * s)],
-                Stroke::new(1.5_f32, INK.gamma_multiply(0.7)),
+                Stroke::new(1.5_f32, ink.gamma_multiply(0.7)),
             );
         }
     }
@@ -622,20 +701,22 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
             // keyboard's last key, dimmer still. This is the strip's whole
             // job — showing which 4×4 group holds the kit's loaded pads.
             let occupied = key < DRUM_PADS && view.loaded_keys & (1u128 << key) != 0;
+            // The dots are MARKS, so they are drawn in the ink and flip with
+            // it — a white dot on a pale face is a dot nobody sees.
             let alpha = if key >= DRUM_PADS {
-                8
+                0.03
             } else if occupied {
-                150
+                0.59
             } else {
-                26
+                0.10
             };
-            painter.rect_filled(dot, 1.0, Color32::from_white_alpha(alpha));
+            painter.rect_filled(dot, 1.0, ink.gamma_multiply(alpha));
         }
         if view.page == k {
             painter.rect_stroke(
                 cell,
                 2.0,
-                Stroke::new(1.5_f32, METER_GREEN),
+                Stroke::new(1.5_f32, green),
                 egui::StrokeKind::Inside,
             );
         }
@@ -651,7 +732,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
         // neatness padding. Drawn, not skipped — a hole in the grid reads
         // as a bug.
         if base + i >= DRUM_PADS {
-            painter.rect_filled(r, 3.0, Color32::from_white_alpha(7));
+            painter.rect_filled(r, 3.0, ink.gamma_multiply(0.03));
             continue;
         }
         let pad = &view.pads[i];
@@ -660,10 +741,20 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
 
         // A loaded pad is a solid key; an empty one is an outline you can
         // see through — the RS5k rack's own honesty about where work is.
+        // On the dark faces that is a firm recess against a faint white
+        // lift; on a pale face white is invisible and a full black wash is
+        // a bruise, so both marks go the SAME way — down — and are told
+        // apart by weight, the way ink on paper is.
         if pad.loaded || pad.missing {
-            painter.rect_filled(r, 3.0, Color32::from_rgba_premultiplied(0, 0, 0, 70));
-        } else {
+            painter.rect_filled(
+                r,
+                3.0,
+                Color32::from_black_alpha(if light_ink { 70 } else { 30 }),
+            );
+        } else if light_ink {
             painter.rect_filled(r, 3.0, Color32::from_white_alpha(14));
+        } else {
+            painter.rect_filled(r, 3.0, Color32::from_black_alpha(10));
         }
 
         // The pad's NOTE NAME, top-left and faint — the reference image's
@@ -675,7 +766,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
                 egui::Align2::LEFT_TOP,
                 key_name(base + i),
                 font((r.height() * 0.16).clamp(7.0, 10.0)),
-                INK.gamma_multiply(0.45),
+                ink.gamma_multiply(0.45),
             );
         }
 
@@ -690,30 +781,45 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
                 let a = (v.clamp(0.0, 1.0)) * half;
                 painter.line_segment(
                     [Pos2::new(x, mid - a), Pos2::new(x, mid + a)],
-                    Stroke::new(step.max(1.0), INK.gamma_multiply(0.13)),
+                    Stroke::new(step.max(1.0), ink.gamma_multiply(0.13)),
                 );
             }
         }
 
         // The strike, from the audio: the engine's peak lights the pad.
+        // It goes the way the ink goes — on paper a flash of white is
+        // nothing, and the mark that reads is the one that darkens.
         let light = if down { 0.16 } else { 0.0 } + peak * 0.30;
         if light > 0.0 {
+            let a = (light * 255.0) as u8;
             painter.rect_filled(
                 r,
                 3.0,
-                Color32::from_white_alpha((light * 255.0) as u8),
+                if light_ink {
+                    Color32::from_white_alpha(a)
+                } else {
+                    Color32::from_black_alpha(a)
+                },
             );
         }
 
         // A file drag standing over this pad.
         if view.drop_hover == Some(i) {
-            painter.rect_filled(r, 3.0, Color32::from_white_alpha(24));
-            painter.rect_stroke(r, 3.0, Stroke::new(2.0_f32, INK), egui::StrokeKind::Inside);
+            painter.rect_filled(
+                r,
+                3.0,
+                if light_ink {
+                    Color32::from_white_alpha(24)
+                } else {
+                    Color32::from_black_alpha(18)
+                },
+            );
+            painter.rect_stroke(r, 3.0, Stroke::new(2.0_f32, ink), egui::StrokeKind::Inside);
         } else if view.selected == i {
             painter.rect_stroke(
                 r,
                 3.0,
-                Stroke::new(1.5_f32, INK.gamma_multiply(0.9)),
+                Stroke::new(1.5_f32, ink.gamma_multiply(0.9)),
                 egui::StrokeKind::Inside,
             );
         } else {
@@ -732,7 +838,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
                 Align2::RIGHT_TOP,
                 choke_word(pad.params.choke),
                 font((r.height() * 0.16).clamp(7.0, 10.0)),
-                AMBER,
+                amber,
             );
         }
 
@@ -746,7 +852,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
                     Align2::CENTER_CENTER,
                     pad.label,
                     font(size),
-                    REC_RED,
+                    rec_red,
                 );
             }
         } else if pad.loaded {
@@ -757,7 +863,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
                     Align2::CENTER_CENTER,
                     pad.label,
                     font(size),
-                    INK.gamma_multiply(0.85),
+                    ink.gamma_multiply(0.85),
                 );
             }
         }
@@ -771,7 +877,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
                     Pos2::new(r.right() - 2.0, r.bottom() - 4.0),
                 ),
                 0.0,
-                METER_GREEN.gamma_multiply(0.85),
+                green.gamma_multiply(0.85),
             );
         }
     }
@@ -782,7 +888,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
             Pos2::new(l.panel.left() + GAP, l.inspector.top()),
             Pos2::new(l.panel.right() - GAP, l.inspector.top()),
         ],
-        Stroke::new(1.0_f32, INK.gamma_multiply(0.2)),
+        Stroke::new(1.0_f32, ink.gamma_multiply(0.2)),
     );
     let sel = &view.pads[view.selected.min(DRUM_PAGE - 1)];
     let has = sel.loaded || sel.missing;
@@ -805,6 +911,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
         &word_for(Param::Gain, db_word(sel.params.gain)),
         frac(sel.params.gain, Param::Gain),
         has,
+        ink,
     );
     knob(
         painter,
@@ -813,6 +920,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
         &word_for(Param::Pan, pan_word(sel.params.pan)),
         frac(sel.params.pan, Param::Pan),
         has,
+        ink,
     );
     knob(
         painter,
@@ -821,20 +929,23 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
         &word_for(Param::Tune, tune_word(sel.params.tune)),
         frac(sel.params.tune, Param::Tune),
         has,
+        ink,
     );
     chip(
         painter,
         l.choke,
         &format!("CHK {}", choke_word(sel.params.choke)),
         has && sel.params.choke != 0,
-        if has { AMBER } else { AMBER.gamma_multiply(0.4) },
+        if has { amber } else { amber.gamma_multiply(0.4) },
+        face,
     );
     chip(
         painter,
         l.clear,
         "CLEAR",
         false,
-        if has { REC_RED } else { REC_RED.gamma_multiply(0.4) },
+        if has { rec_red } else { rec_red.gamma_multiply(0.4) },
+        face,
     );
     // The selected pad's three bays — the master left for the DRUMS
     // channel on the desk, which is where bus-wide effects live now.
@@ -849,16 +960,17 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
             *r,
             if filled { word } else { "+" },
             false,
-            if filled { AMBER } else { INK.gamma_multiply(0.35) },
+            if filled { amber } else { ink.gamma_multiply(0.35) },
+            face,
         );
     }
 
     // ── the media explorer ───────────────────────────────────────────────
     if l.media.is_positive() {
-        painter.rect_filled(l.media, 2.0, Color32::from_rgba_premultiplied(0, 0, 0, 60));
+        painter.rect_filled(l.media, 2.0, recess);
         // The header: UP, then where we stand.
         if l.media_up.is_positive() {
-            chip(painter, l.media_up, "..", false, INK.gamma_multiply(0.6));
+            chip(painter, l.media_up, "..", false, ink.gamma_multiply(0.6), face);
         }
         let label = Rect::from_min_max(
             Pos2::new(l.media_up.right() + 4.0, l.media_head.top()),
@@ -870,7 +982,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
                 Align2::LEFT_CENTER,
                 cut_text(painter, label.width(), view.media_dir, &font(10.5)),
                 font(10.5),
-                INK.gamma_multiply(0.55),
+                ink.gamma_multiply(0.55),
             );
         }
         let rows = l.media_rows();
@@ -882,10 +994,12 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
                 *r,
                 1.5,
                 if view.media_sel == Some(view.media_scroll + row) {
-                    // The clicked file: lit, so the audition has a face.
+                    // The clicked file: lit, so the audition has a face. A
+                    // dark olive, and it stays dark on purpose — over the
+                    // dark faces it lifts, over a pale one it is a plate.
                     Color32::from_rgba_premultiplied(0x3D, 0x50, 0x2A, 120)
                 } else if row % 2 == 0 {
-                    Color32::from_rgba_premultiplied(0, 0, 0, 40)
+                    Color32::from_black_alpha(if light_ink { 40 } else { 16 })
                 } else {
                     Color32::TRANSPARENT
                 },
@@ -900,7 +1014,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
                 Align2::LEFT_CENTER,
                 cut_text(painter, r.width() - 10.0, &word, &font(11.0)),
                 font(11.0),
-                if e.dir { INK.gamma_multiply(0.85) } else { METER_GREEN.gamma_multiply(0.9) },
+                if e.dir { ink.gamma_multiply(0.85) } else { green.gamma_multiply(0.9) },
             );
         }
         // More below? A quiet count, so a long folder says so.
@@ -910,7 +1024,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &DrumpadView<'_>) {
                 Align2::RIGHT_BOTTOM,
                 format!("+{}", view.media.len() - view.media_scroll - rows.len()),
                 font(8.0),
-                INK.gamma_multiply(0.4),
+                ink.gamma_multiply(0.4),
             );
         }
     }
@@ -1159,6 +1273,59 @@ mod tests {
             let _ = hit_test(r, &v, r.center());
             let _ = pad_at(r, r.center());
         }
+    }
+
+    /// **The popup dresses from every theme and stays readable, both modes.**
+    ///
+    /// The face comes through the editor's `roll_face` — dead-zone guarded —
+    /// so the measured ink must clear 4.5:1 on it everywhere; the fixed
+    /// lights (record red, meter green, choke amber) go through the distinct
+    /// guard and must clear the 3:1 mark floor on whatever face the theme
+    /// produced. The undressed door is pinned too: the shipped pair must
+    /// keep rendering until the app's call sites hand a dress over.
+    #[test]
+    fn the_popup_wears_every_theme_legibly() {
+        let mut bad: Vec<String> = Vec::new();
+        for theme in crate::theme::factory() {
+            for dark in [false, true] {
+                let mut set = crate::settings::Settings::default();
+                theme.apply(&mut set);
+                let dress = Dress {
+                    fx_strip: (
+                        set.fx_strip_color.r,
+                        set.fx_strip_color.g,
+                        set.fx_strip_color.b,
+                    ),
+                    meter_bg: (
+                        set.meter_bg_color.r,
+                        set.meter_bg_color.g,
+                        set.meter_bg_color.b,
+                    ),
+                    dark,
+                };
+                let face = face_of(dress);
+                let ink = ink_of(face);
+                let mode = if dark { "dark" } else { "light" };
+                let ratio = crate::recorder_panel::contrast_ratio(ink, face);
+                if ratio < 4.5 {
+                    bad.push(format!("{} {mode}: ink {ratio:.2}:1", theme.name));
+                }
+                for (what, c) in [("red", REC_RED), ("green", METER_GREEN), ("amber", AMBER)] {
+                    let lit = crate::recorder_panel::distinct_surface_at(c, face, 3.0);
+                    let r = crate::recorder_panel::contrast_ratio(lit, face);
+                    if r < 3.0 {
+                        bad.push(format!("{} {mode}: {what} {r:.2}:1", theme.name));
+                    }
+                }
+            }
+        }
+        assert!(bad.is_empty(), "the popup goes blind:\n  {}", bad.join("\n  "));
+        // The undressed pair still holds itself: the door the app uses today
+        // must not quietly become unreadable either.
+        assert!(
+            crate::recorder_panel::contrast_ratio(SHIPPED_INK, SHIPPED_FACE) >= 4.5,
+            "the shipped pair stopped carrying its own ink"
+        );
     }
 
     /// The placement clamps back onto the screen however it is thrown.
