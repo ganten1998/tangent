@@ -10,14 +10,23 @@ nowhere it was not already installed. A guard that only runs where binutils
 happens to exist is a guard that is off on the machine that cuts releases.
 
 Prints DT_NEEDED entries to stdout. `--runpath` prints DT_RUNPATH/DT_RPATH
-instead, empty when there is none. Exits non-zero, with a reason on stderr, if
-the file is not an ELF64 it can read.
+instead, empty when there is none. `--max-glibc` prints the highest
+GLIBC_x.y version the binary's version-requirement table (DT_VERNEED)
+references, bare ("2.30"), or nothing for a binary with no glibc refs — the
+number a user's too-old distro would print in its loader error, and therefore
+the artifact's REAL glibc floor regardless of what any script or README
+claims. `check-linux-deps.sh` compares it against the floor build-cross.sh
+targets, because the two disagreed for every 5.0 beta and nothing measured it.
+Exits non-zero, with a reason on stderr, if the file is not an ELF64 it can
+read.
 """
 
+import re
 import struct
 import sys
 
 DT_NULL, DT_NEEDED, DT_RPATH, DT_STRTAB, DT_RUNPATH = 0, 1, 15, 5, 29
+DT_VERNEED, DT_VERNEEDNUM = 0x6FFFFFFE, 0x6FFFFFFF
 PT_LOAD, PT_DYNAMIC = 1, 2
 
 
@@ -42,7 +51,7 @@ def read(path):
 
     dyn = next(((o, sz) for k, o, _, sz in segments() if k == PT_DYNAMIC), None)
     if dyn is None:
-        return [], ""
+        return [], "", []
     dyn_off, dyn_sz = dyn
 
     entries, strtab = [], None
@@ -56,17 +65,21 @@ def read(path):
     if strtab is None:
         raise SystemExit(f"{path}: a dynamic section with no string table")
 
-    # DT_STRTAB is a virtual address. Map it back through the PT_LOADs, which
-    # is the only way to find it in the file: a stripped binary has no section
-    # headers to look it up in, and everything we ship is stripped.
-    base = next(
-        (
-            o + (strtab - v)
-            for k, o, v, sz in segments()
-            if k == PT_LOAD and v <= strtab < v + sz
-        ),
-        None,
-    )
+    # DT_STRTAB (and DT_VERNEED below) are virtual addresses. Map them back
+    # through the PT_LOADs, which is the only way to find them in the file: a
+    # stripped binary has no section headers to look them up in, and
+    # everything we ship is stripped.
+    def vaddr_to_offset(vaddr):
+        return next(
+            (
+                o + (vaddr - v)
+                for k, o, v, sz in segments()
+                if k == PT_LOAD and v <= vaddr < v + sz
+            ),
+            None,
+        )
+
+    base = vaddr_to_offset(strtab)
     if base is None:
         raise SystemExit(f"{path}: the string table is in no loadable segment")
 
@@ -78,17 +91,58 @@ def read(path):
     # and the difference matters — RPATH is inherited by a dependency's own
     # lookups and RUNPATH is not. Report whichever is present.
     path_tag = next((string(v) for t, v in entries if t in (DT_RUNPATH, DT_RPATH)), "")
-    return needed, path_tag
+
+    # The version-requirement table: one Verneed per DT_NEEDED library that is
+    # versioned at all, each chaining Vernaux records naming the versions
+    # ("GLIBC_2.30", "GLIBC_2.2.5", ...) this binary's symbols bind to. The
+    # loader refuses the binary when any of them is absent, so the highest one
+    # IS the floor — DT_NEEDED says which libraries, this says how new.
+    versions = []
+    verneed = next((v for t, v in entries if t == DT_VERNEED), None)
+    verneednum = next((v for t, v in entries if t == DT_VERNEEDNUM), 0)
+    if verneed is not None and verneednum:
+        off = vaddr_to_offset(verneed)
+        if off is None:
+            raise SystemExit(f"{path}: DT_VERNEED is in no loadable segment")
+        for _ in range(verneednum):
+            _, vn_cnt = struct.unpack_from(e + "HH", d, off)
+            _, vn_aux, vn_next = struct.unpack_from(e + "III", d, off + 4)
+            aux = off + vn_aux
+            for _ in range(vn_cnt):
+                _, _, _, vna_name, vna_next = struct.unpack_from(e + "IHHII", d, aux)
+                versions.append(string(vna_name))
+                if vna_next == 0:
+                    break
+                aux += vna_next
+            if vn_next == 0:
+                break
+            off += vn_next
+    return needed, path_tag, versions
+
+
+def max_glibc(versions):
+    # Numeric GLIBC_x.y[.z] only: names like GLIBC_ABI_DT_RELR are feature
+    # markers, not floors this comparison could order.
+    best = None
+    for name in versions:
+        m = re.fullmatch(r"GLIBC_(\d+(?:\.\d+)*)", name)
+        if m:
+            t = tuple(int(x) for x in m.group(1).split("."))
+            best = t if best is None or t > best else best
+    return ".".join(str(x) for x in best) if best else ""
 
 
 def main(argv):
     want_runpath = "--runpath" in argv
+    want_max_glibc = "--max-glibc" in argv
     files = [a for a in argv[1:] if not a.startswith("-")]
     if not files:
-        raise SystemExit("usage: elf-needed.py [--runpath] BINARY...")
+        raise SystemExit("usage: elf-needed.py [--runpath|--max-glibc] BINARY...")
     for path in files:
-        needed, runpath = read(path)
-        if want_runpath:
+        needed, runpath, versions = read(path)
+        if want_max_glibc:
+            print(max_glibc(versions))
+        elif want_runpath:
             print(runpath)
         else:
             for lib in needed:

@@ -77,9 +77,43 @@ for lib in $NEEDED; do
   esac
 done
 
+# **The glibc floor, enforced where the artifact is packed — when the caller
+# declares one.** The README advertises a minimum glibc, but the number the
+# loader actually enforces is the highest GLIBC_x.y in the binary's own
+# version-requirement table, and the two disagreed for every 5.0 beta: the
+# build targeted 2.32 while the only genuinely new symbol in the binary was
+# gettid@GLIBC_2.30, so the artifacts refused Ubuntu 20.04, Debian 11 and
+# openSUSE Leap 15.4/15.5 for nothing. A floor that lives in a comment is a
+# floor nobody measures; this turns it into the same packaging-time contract
+# as the DT_NEEDED allowlist above, and catches the next crate that quietly
+# pulls in a 2.31+ symbol.
+#
+# The floor comes from the CALLER (build-cross.sh exports GLIBC_FLOOR from the
+# same variable it hands to zigbuild) rather than living here, because only
+# the cross artifacts make the promise: a native build binds whatever glibc
+# the build box runs and carries that box's floor, so build-linux-native.sh
+# passes nothing and gets the measurement printed instead of enforced.
+GLIBC_MAX="$(python3 "$HERE/elf-needed.py" --max-glibc "$BIN")" || {
+  echo "!! could not read $BIN's version requirements — see scripts/elf-needed.py" >&2
+  exit 1
+}
+if [ -n "${GLIBC_FLOOR:-}" ] && [ -n "$GLIBC_MAX" ]; then
+  if [ "$(printf '%s\n%s\n' "$GLIBC_FLOOR" "$GLIBC_MAX" | sort -V | tail -1)" != "$GLIBC_FLOOR" ]; then
+    echo "!! $BIN requires GLIBC_$GLIBC_MAX but the artifact promises glibc >= $GLIBC_FLOOR." >&2
+    echo "   Either something new in the dependency graph binds a symbol younger" >&2
+    echo "   than the floor (find it: objdump -T | grep GLIBC_$GLIBC_MAX), or the" >&2
+    echo "   floor moved — then raise GLIBC in build-cross.sh AND the user-facing" >&2
+    echo "   claims in README.md, docs/RELEASE.md and docs/ARTIFACT-README.md" >&2
+    echo "   together, because a floor the README understates is a loader error" >&2
+    echo "   on a user's machine with the README insisting it should work." >&2
+    exit 1
+  fi
+fi
+
 # A RUNPATH would change the answer above — the loader would find bundled
 # copies first — so say whether there is one rather than leaving it implied.
 RUNPATH="$(python3 "$HERE/elf-needed.py" --runpath "$BIN" || true)"
-printf '    DT_NEEDED  ok (%s)%s\n' \
+printf '    DT_NEEDED  ok (%s)%s%s\n' \
   "$(echo "$NEEDED" | tr '\n' ' ' | sed 's/ *$//')" \
+  "${GLIBC_MAX:+, max glibc ref $GLIBC_MAX${GLIBC_FLOOR:+ <= floor $GLIBC_FLOOR}}" \
   "${RUNPATH:+, RUNPATH=$RUNPATH}"
