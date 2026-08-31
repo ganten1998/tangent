@@ -59,6 +59,61 @@ LOCK_VERSION="$(awk '/^name = "tangent"$/{getline; gsub(/[",]/,""); print $3; ex
 git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null 2>&1 \
   && echo "    NOTE: tag v${VERSION} exists — you are rebuilding a shipped version"
 
+# ── The three refusals ───────────────────────────────────────────────────────
+#
+# **A version is spent the moment a build carries it, and nothing used to stop
+# that.** Six numbers went in a single day — beta.10 through beta.15 — none
+# tagged, none released, several bumped inline inside a build command. Nothing
+# leaked, because the public tags stopped at beta.9; the burn was simply
+# invisible until somebody counted.
+#
+# So `main` carries `X.Y.Z-dev` and only a deliberate release writes a real
+# version. These three checks are what make that structural rather than a thing
+# to remember. They are `exit 2`, not `note` — a warning that can be scrolled
+# past is how this happened.
+
+# 1. The placeholder is not a release. This is the whole point of `-dev`: a
+#    build on main cannot claim a number, because the number is not a number.
+case "$VERSION" in
+  *-dev|*-dev.*)
+    echo "refusing: Cargo.toml says $VERSION, which is main's placeholder." >&2
+    echo "  Set a real version deliberately, commit it, tag it, then release." >&2
+    exit 2 ;;
+esac
+
+# 2. The tag must already exist. A release is a thing you can go back to; an
+#    artifact built from an untagged commit is a thing you cannot.
+if ! git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null 2>&1; then
+  echo "refusing: no tag v${VERSION}." >&2
+  echo "  git tag -a v${VERSION} -m 'Tangent ${VERSION}'   then run this again." >&2
+  exit 2
+fi
+
+# 3. The changelog must name this version. `publish-github.sh` already refuses
+#    to publish without release notes, and CHANGELOG.md had gone stale at 4.5.0
+#    — which is why 5.0 could not be published at all. Failing HERE means
+#    finding that out before the build rather than after it.
+if ! grep -qE "^#+ +\[?${VERSION//./\.}\]?( |\$|	)" CHANGELOG.md 2>/dev/null; then
+  echo "refusing: CHANGELOG.md has no heading for ${VERSION}." >&2
+  echo "  Add '## ${VERSION} - $(date +%Y-%m-%d)' and what changed under it." >&2
+  exit 2
+fi
+
+# 4. Pre-releases are rc.N, capped at rc.3. Needing rc.4 means the freeze was
+#    not a freeze — the answer is to stop cutting candidates and fix the thing
+#    that keeps moving.
+case "$VERSION" in
+  *-rc.[0-9]*)
+    RC_N="${VERSION##*-rc.}"
+    if [ "${RC_N%%[!0-9]*}" -gt 3 ] 2>/dev/null; then
+      echo "refusing: ${VERSION} is past rc.3." >&2
+      echo "  Four candidates means the freeze was not a freeze. Fix, do not cut." >&2
+      exit 2
+    fi ;;
+  *-beta*|*-alpha*)
+    echo "    NOTE: pre-releases are rc.N now; $VERSION predates that policy" ;;
+esac
+
 # ── Purge artifacts belonging to other versions ──────────────────────────────
 # Left in place they get swept up by any `Tangent-*` / `tangent-*` glob at checksum
 # or upload time. Only the four known artifact name shapes are ever touched.
