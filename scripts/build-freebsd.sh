@@ -139,7 +139,12 @@ install -m 0755 "$BIN" "$PREFIXDIR/bin/tangent"
 install -m 0755 "$ROOT/installer/freebsd/tangent-jack" "$PREFIXDIR/bin/tangent-jack"
 install -m 0644 "$ROOT/assets/tangent.desktop" \
                 "$PREFIXDIR/share/applications/tangent.desktop"
-install -m 0644 "$ROOT/assets/tangent.png" \
+# **The 128x128 directory gets a file that is actually 128x128.** It used to get
+# `assets/tangent.png`, which was 128 px when that line was written and became a
+# 2486x2476 wordmark when the artwork was swapped. hicolor takes the DIRECTORY as
+# the truth: a desktop indexes it as 128, hands the theme a six-megapixel PNG for
+# a taskbar slot, and the hairlines in it scale down to nothing anyway.
+install -m 0644 "$ROOT/assets/tangent-128.png" \
                 "$PREFIXDIR/share/icons/hicolor/128x128/apps/tangent.png"
 
 # ── Manifest ─────────────────────────────────────────────────────────────────

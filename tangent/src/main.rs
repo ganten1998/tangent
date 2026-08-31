@@ -355,6 +355,18 @@ fn shrink_icon_for_x11(icon: egui::IconData) -> egui::IconData {
         eprintln!("the app icon's pixels do not match its size; going without one");
         return egui::IconData { rgba: Vec::new(), width: 0, height: 0 };
     }
+    // **The longest edge goes to 128 and the other keeps the proportion.**
+    //
+    // Not a forced square. The artwork here is 2486×2476, so squaring it would
+    // stretch by four parts in a thousand — invisible, and exactly the sort of
+    // invisible that becomes visible the day somebody ships a wide wordmark
+    // through the same door. `_NET_WM_ICON` carries width and height, so a
+    // non-square icon is perfectly legal and there is nothing to gain by lying.
+    let (dw, dh) = if w >= h {
+        (MAX_EDGE as usize, ((h * MAX_EDGE as usize) / w).max(1))
+    } else {
+        (((w * MAX_EDGE as usize) / h).max(1), MAX_EDGE as usize)
+    };
     // A box filter over the source cell each destination pixel covers.
     // Written out rather than pulled from `image`, which is a transitive
     // dependency here and not a direct one — twenty lines is cheaper than a
@@ -364,12 +376,11 @@ fn shrink_icon_for_x11(icon: egui::IconData) -> egui::IconData {
     // lets a fully transparent pixel's colour — often black, and arbitrary —
     // pull the colour of its opaque neighbours, which is what puts a dark
     // fringe around a scaled-down logo.
-    let edge = MAX_EDGE as usize;
-    let mut out = vec![0u8; edge * edge * 4];
-    for dy in 0..edge {
-        let (y0, y1) = (dy * h / edge, (((dy + 1) * h) / edge).max(dy * h / edge + 1));
-        for dx in 0..edge {
-            let (x0, x1) = (dx * w / edge, (((dx + 1) * w) / edge).max(dx * w / edge + 1));
+    let mut out = vec![0u8; dw * dh * 4];
+    for dy in 0..dh {
+        let (y0, y1) = (dy * h / dh, (((dy + 1) * h) / dh).max(dy * h / dh + 1));
+        for dx in 0..dw {
+            let (x0, x1) = (dx * w / dw, (((dx + 1) * w) / dw).max(dx * w / dw + 1));
             let (mut r, mut g, mut b, mut a, mut n) = (0u64, 0u64, 0u64, 0u64, 0u64);
             for sy in y0..y1.min(h) {
                 for sx in x0..x1.min(w) {
@@ -382,7 +393,7 @@ fn shrink_icon_for_x11(icon: egui::IconData) -> egui::IconData {
                     n += 1;
                 }
             }
-            let d = (dy * edge + dx) * 4;
+            let d = (dy * dw + dx) * 4;
             // `a` is the sum of alphas, so it is also the premultiplied
             // weight; dividing by it is the un-premultiply.
             let (rr, gg, bb) = if a == 0 { (0, 0, 0) } else { (r / a, g / a, b / a) };
@@ -392,7 +403,7 @@ fn shrink_icon_for_x11(icon: egui::IconData) -> egui::IconData {
             out[d + 3] = if n == 0 { 0 } else { (a / n) as u8 };
         }
     }
-    egui::IconData { rgba: out, width: MAX_EDGE, height: MAX_EDGE }
+    egui::IconData { rgba: out, width: dw as u32, height: dh as u32 }
 }
 
 fn main() {
@@ -474,14 +485,25 @@ fn main() {
 
     // macOS wants a rounded-squircle icon with padding around the art; every other
     // platform expects the plain full-bleed square. Both are the same artwork.
+    //
+    // **The small one is DRAWN for small, not merely scaled to it.** The
+    // wordmark is a hairline lattice, and a hairline is the one thing that does
+    // not survive being resampled to 128 px: at a twentieth of its size every
+    // line lands between pixels and comes back as a grey suggestion of itself.
+    // `tangent-128.png` is that artwork with the strokes thickened and the cream
+    // lifted, so the shape still reads in a taskbar. Same drawing, same colour —
+    // the hue is the artwork's own (227,215,187) raised a tenth, not whitened.
     #[cfg(target_os = "macos")]
     let icon_png: &[u8] = &include_bytes!("../../assets/tangent-macos.png")[..];
     #[cfg(not(target_os = "macos"))]
-    let icon_png: &[u8] = &include_bytes!("../../assets/tangent.png")[..];
+    let icon_png: &[u8] = &include_bytes!("../../assets/tangent-128.png")[..];
 
+    // `shrink_icon_for_x11` is a GUARD, not the thing that sizes the icon. The
+    // asset above already fits; this is what stops the next oversized one from
+    // taking the window system down with it. See the note on that function.
     match eframe::icon_data::from_png_bytes(icon_png) {
         Ok(icon) => viewport = viewport.with_icon(shrink_icon_for_x11(icon)),
-        Err(err) => eprintln!("could not decode assets/tangent.png as the app icon: {err}"),
+        Err(err) => eprintln!("could not decode the app icon: {err}"),
     }
 
     // Which renderer draws the window.
@@ -650,24 +672,71 @@ mod icon_tests {
         // the floor worth holding: 262 140 bytes.
         const CLASSIC_MAX_BYTES: usize = 65_535 * 4;
 
-        let png = include_bytes!("../../assets/tangent.png");
-        let decoded = eframe::icon_data::from_png_bytes(png).expect("the shipped icon must decode");
-        let shrunk = shrink_icon_for_x11(decoded);
+        // Both assets: the one the window actually gets, and the full-size
+        // wordmark that caused this. The first proves what ships is safe; the
+        // second proves the guard still catches an oversized one, which is the
+        // case that will come back the next time somebody swaps the artwork.
+        for (name, png) in [
+            ("tangent-128.png", &include_bytes!("../../assets/tangent-128.png")[..]),
+            ("tangent.png", &include_bytes!("../../assets/tangent.png")[..]),
+        ] {
+            let decoded =
+                eframe::icon_data::from_png_bytes(png).expect("the shipped icon must decode");
+            let shrunk = shrink_icon_for_x11(decoded);
 
-        let request = (shrunk.width as usize * shrunk.height as usize + 2) * 4;
-        assert!(
-            request <= CLASSIC_MAX_BYTES,
-            "the app icon needs {request} bytes in one X11 request, over the \
-             {CLASSIC_MAX_BYTES} a server promises without BIG-REQUESTS: \
-             {}x{}",
-            shrunk.width,
-            shrunk.height
-        );
+            let request = (shrunk.width as usize * shrunk.height as usize + 2) * 4;
+            assert!(
+                request <= CLASSIC_MAX_BYTES,
+                "{name} needs {request} bytes in one X11 request, over the \
+                 {CLASSIC_MAX_BYTES} a server promises without BIG-REQUESTS: \
+                 {}x{}",
+                shrunk.width,
+                shrunk.height
+            );
+            assert_eq!(
+                shrunk.rgba.len(),
+                shrunk.width as usize * shrunk.height as usize * 4,
+                "{name}: the buffer does not match the size it reports"
+            );
+        }
+
+        // And the one the window is handed is already the right size, so the
+        // guard is not silently doing the art department's job.
+        let shipped = eframe::icon_data::from_png_bytes(&include_bytes!(
+            "../../assets/tangent-128.png"
+        )[..])
+        .expect("the shipped icon must decode");
         assert_eq!(
-            shrunk.rgba.len(),
-            shrunk.width as usize * shrunk.height as usize * 4,
-            "the scaled icon's buffer does not match the size it reports"
+            (shipped.width, shipped.height),
+            (128, 128),
+            "the icon the window gets should already be 128x128"
         );
+    }
+
+    /// **A wide icon stays wide.** The cap sets the LONGEST edge and the other
+    /// keeps its proportion, so nothing is stretched to fit a square.
+    /// `_NET_WM_ICON` carries width and height, so a non-square icon is legal
+    /// and squaring one would only be a lie that shows.
+    #[test]
+    fn the_aspect_ratio_survives_the_cap() {
+        let (w, h) = (1000u32, 250u32);
+        let icon = egui::IconData {
+            rgba: vec![255u8; w as usize * h as usize * 4],
+            width: w,
+            height: h,
+        };
+        let out = shrink_icon_for_x11(icon);
+        assert_eq!(out.width, 128, "the long edge is what the cap names");
+        assert_eq!(out.height, 32, "the short edge kept 1000:250");
+        assert_eq!(out.rgba.len(), 128 * 32 * 4, "the buffer is not the size reported");
+    }
+
+    /// A tall one, the other way round, so the branch is not half-tested.
+    #[test]
+    fn a_tall_icon_caps_on_its_height() {
+        let icon = egui::IconData { rgba: vec![9u8; 100 * 400 * 4], width: 100, height: 400 };
+        let out = shrink_icon_for_x11(icon);
+        assert_eq!((out.width, out.height), (32, 128));
     }
 
     /// An icon already small enough is handed back untouched — no resampling
