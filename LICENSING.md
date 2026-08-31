@@ -5,7 +5,7 @@ is written down once, precisely, rather than reconstructed from memory later.
 
 | Artifact | Licence | Why |
 |---|---|---|
-| `Tangent.app` / `tangent` / `tangent.exe` (standalone) | **MIT** | Links nothing copyleft. |
+| `Tangent.app` / `tangent` / `tangent.exe` (standalone) | **MIT** | Links no GPL. The LGPL LAME static link (macOS/FreeBSD) adds duties, not a licence change; see below. |
 | `tangent-core`, `ivory` and every other crate in this repo | **MIT** | Source, not binaries. |
 | `Tangent.vst3` (the plugin) | **GPL-3.0-or-later** | Links NIH-plug's VST3 bindings. |
 
@@ -93,12 +93,111 @@ section 5 describes.
 pinned NIH-plug revision inside the bundle. If that step is ever dropped, the
 release is non-compliant, quietly.
 
+## LAME, statically linked into the macOS and FreeBSD standalones
+
+The default `mp3` feature pulls `mp3lame-encoder` 0.2.5, whose `mp3lame-sys`
+0.1.11 vendors the unmodified LAME 3.100 sources
+(https://lame.sourceforge.io/) and links them **statically** into the
+`tangent` binary. That is live wherever the default features build: macOS
+(`build-macos.sh`) and FreeBSD (`build-freebsd.sh`). The Linux and Windows
+artifacts build with `--no-default-features` and do not link LAME at all;
+their MP3 export runs through the separate `tangent-ffmpeg` process.
+
+LAME is licensed under the GNU Library General Public License, version 2 or,
+at your option, any later version. The two wrapper crates declare LGPL-3.0.
+The standalone stays MIT; a weak-copyleft static link does not relicense it,
+but it does attach three obligations to the artifacts that carry the library:
+
+1. **Notice.** Each artifact must say it contains LAME and where the licence
+   texts are. The notice of record is this section plus the LAME entry in
+   THIRD-PARTY-LICENSES once regenerated (see status below).
+2. **Licence texts.** Ship both texts, verbatim, beside the binary: LGPL v2
+   covers LAME itself, LGPL v3 covers the wrapper crates. Until the build
+   scripts ship a `lame-licenses/` folder, the texts live in the vendored
+   crate (`mp3lame-sys-0.1.11/lame-3.100/COPYING`) and at
+   https://www.gnu.org/licenses/old-licenses/lgpl-2.0.txt and
+   https://www.gnu.org/licenses/lgpl-3.0.txt.
+3. **Relink route** (LGPL-2.1 section 6, LGPL-3.0 section 4(d)): a recipient
+   must be able to rebuild the application against a modified LAME. That is
+   available in substance: Tangent's complete source is MIT and public, and
+   `Cargo.lock` pins `mp3lame-sys` 0.1.11, which contains the exact LAME
+   sources that were linked. To relink: check out the release tag, place a
+   modified copy of `mp3lame-sys` (carrying your LAME changes) in the tree,
+   point a `[patch.crates-io]` entry at it, and run
+   `cargo build --release -p tangent`.
+
+**Status, 2026-08-31.** This file is the notice of record today. Still to do,
+and tracked as W30 in the 5.1 audit worklist: add the LAME section to
+`scripts/gen-third-party-licenses.sh` and regenerate THIRD-PARTY-LICENSES
+(stale since before mp3lame entered Cargo.lock, because every build script
+regenerates only when the file is MISSING); add `assets/lame-licenses/` with
+both texts; ship that folder from `build-macos.sh` and `build-freebsd.sh`
+(the FreeBSD tarball currently ships only LICENSE, not even
+THIRD-PARTY-LICENSES).
+
+## ffmpeg: GPL binaries in the Linux and Windows artifacts
+
+`scripts/fetch-ffmpeg.sh` downloads prebuilt **GPL** ffmpeg binaries, pinned
+by sha256, and the Linux tarballs and the Windows artifact ship them as
+`tangent-ffmpeg(.exe)`:
+
+* Linux x86_64 and arm64: johnvansickle.com static ffmpeg **7.0.2**.
+* Windows: BtbN autobuild ffmpeg **n8.1.2-44-g7c533d0f86**, from the
+  immutable tag `autobuild-2026-08-17-13-05` of `BtbN/FFmpeg-Builds`.
+
+macOS and FreeBSD are unaffected (AVFoundation, and the `multimedia/ffmpeg`
+port, respectively). Because the artifacts are handed out through
+paid-adjacent channels (the Gumroad post-purchase page and the supporter
+email), GPLv3 section 6(d) is the only applicable source-offer option, and it
+requires the **complete corresponding source of those exact builds** to be
+available from a designated server that WE keep up, for as long as the
+binaries are offered. Pointing at ffmpeg.org, at BtbN's release page (which
+hosts no source archives), or at johnvansickle.com (a rotating hobbyist
+server) does not meet that.
+
+**The hosting plan**, one mirror per binary pin, as assets on dedicated
+GitHub releases in the same repo the binaries are served from:
+
+* Tag `third-party-src-ffmpeg-7.0.2`: the archives from
+  johnvansickle.com/ffmpeg/release-source/ for the 7.0.2 static build (the
+  builder's GPL source drop for that build, bundled libraries included) plus
+  his build readme. Fetch and hash these promptly; that server rotates old
+  builds out.
+* Tag `third-party-src-ffmpeg-n8.1.2-btbn-2026-08-17`: the FFmpeg source
+  archive at commit `7c533d0f86`, a git archive of `BtbN/FFmpeg-Builds` at
+  tag `autobuild-2026-08-17-13-05`, and the source tarball of every bundled
+  library that tag's `scripts.d/` files pin. "Reconstructible from someone
+  else's repo" is not hosting; the tarballs themselves go in the release.
+* Never delete these source releases while the binaries are offered: the
+  `releases/latest/download` links in old supporter emails keep old binaries
+  on offer indefinitely, so availability is indefinite too.
+
+Follow-up work that lives in scripts, tracked as W31 in the 5.1 worklist and
+not yet done: a `scripts/fetch-ffmpeg-sources.sh` mirroring
+`fetch-ffmpeg.sh`'s pin-by-sha256 style, so bumping the binary pin forces
+bumping the source mirror in the same edit; `provenance()` in
+`fetch-ffmpeg.sh` rewriting SOURCE.txt to name the hosted URL as the
+licence-satisfying one (the upstream URL stays as provenance); the
+THIRD-PARTY-LICENSES ffmpeg section naming the hosted URL; and the hosted
+URLs joining the `check-store-links.sh` sweep so a deleted source release
+fails the same gate that guards download links.
+
+**The uploads themselves are an owner action**: they need release
+credentials, and a standing decision that GitHub remains the hosting venue.
+Until both tags exist with their assets, distribution of the Linux and
+Windows artifacts is out of compliance on this point, and no documentation
+edit changes that.
+
 ## Trademarks, which are separate from all of the above
 
 Steinberg's VST trademark terms are not a copyright matter and apply regardless
 of which SDK licence is used. The relevant one: **"VST" must not appear in the
 product name.** "Tangent" satisfies this. Do not ship anything called
 "Tangent VST".
+
+Tangent's own name and icon are covered by [TRADEMARK.md](TRADEMARK.md) at the
+repo root. That file is the single policy; change it rather than adding
+trademark prose here, so the two cannot drift apart silently.
 
 ## Not legal advice
 

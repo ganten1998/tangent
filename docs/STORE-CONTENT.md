@@ -128,6 +128,12 @@ must be redeployed for a NEW buyer to get them.
 The order that keeps this honest, and the one that was got wrong twice:
 **publish, check, paste, deploy.** Never edit the links in anticipation.
 
+One more gate, same spirit: the post-purchase block below now tells buyers the
+FFmpeg source for the bundled tangent-ffmpeg is available from the releases
+page. That sentence becomes true only once the `third-party-src-ffmpeg-*`
+source releases described in LICENSING.md exist. Do not paste it to Gumroad
+before they do.
+
 ## Post-purchase page
 
 Gumroad → Products → Tangent → **Content** tab → paste, then **Save changes**.
@@ -171,7 +177,7 @@ https://github.com/ganten1998/tangent/releases/latest/download/SHA256SUMS
 YOUR SUPPORTER KEY
 
 The key is emailed to you within about a minute of your purchase, from
-keys@ivorymidi.com. If it has not arrived, search your spam folder for that
+keys@tangentdaw.org. If it has not arrived, search your spam folder for that
 address. If it is still missing, reply to your Gumroad receipt and I will send
 it by hand.
 
@@ -197,6 +203,12 @@ Linux: extract the archive and run ./install.sh, which needs no root and takes
 --app, --vst3 and --uninstall. Or just chmod +x tangent and ./tangent. MIDI goes
 through ALSA, so libasound.so.2 needs to be present. Requires glibc 2.32 or
 newer.
+
+The Windows and Linux downloads include tangent-ffmpeg, a small helper program
+built from FFmpeg and used for audio export. FFmpeg is licensed under the GPL.
+Its licence text ships next to it, and the complete source code for those
+exact builds is available from the project's releases page:
+https://github.com/ganten1998/tangent/releases
 
 The plugin reads the notes on the track it is on and makes no sound of its own,
 so put it on a MIDI or instrument track rather than in an effect slot.
