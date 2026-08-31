@@ -160,6 +160,24 @@ struct Recorder {
     /// Remembered whether or not the load worked, so a plugin that refuses is
     /// asked once — `load_insert` blocks for seconds on a sampler, and a
     /// plugin that refuses must not be retried sixty times a second.
+    /// What each BAY has loaded, flat: `seat * INSERTS + bay`.
+    ///
+    /// **`INSERT_SPACE`, which is EVERY seat — not the strips plus the first
+    /// pad block.** All five places that size this said
+    /// `(STRIPS + 1 + DRUM_PADS) * INSERTS`, which comes to 444 — and
+    /// `MASTER_EXTRA_SEAT` IS seat 148, whose bays are 444, 445 and 446. So
+    /// the reconcile walked `0..444`, never reached them, and a plugin in the
+    /// master's SECOND rack was never handed to the engine: silent in
+    /// playback, and present in the export, because the settings and the
+    /// exporter both size themselves from the right constant.
+    ///
+    /// That divergence is the worst possible symptom. It reads as a broken
+    /// exporter, or a broken plugin, and never as a short array.
+    ///
+    /// `open_insert_picker` carries the same story one layer up: the same
+    /// seat was unreachable there and was fixed only there, which is how this
+    /// survived. Deriving the length from the constant the rest of the app
+    /// already uses is what stops there being a third time.
     inserts_loaded: Vec<Option<String>>,
     /// The drumpad kit could not be handed to the audio thread last frame
     /// (stalled callback, absent engine) — try again this one.
@@ -1699,11 +1717,7 @@ impl DesktopApp {
                 self.recorder.engine = None;
                 self.recorder.engine_error = Some(why);
                 self.recorder.inserts_loaded =
-                    vec![
-                        None;
-                        (tangent_ui::recorder::STRIPS + 1 + tangent_ui::recorder::DRUM_PADS)
-                            * tangent_ui::recorder::INSERTS
-                    ];
+                    vec![None; tangent_ui::recorder::INSERT_SPACE];
                 // **No timed retries here — the reprobe thread owns recovery.**
                 // The yank test proved why: a watchdog-declared death is
                 // usually GONE HARDWARE, and `Engine::start` against a dead
@@ -1794,11 +1808,7 @@ impl DesktopApp {
             // frames, announced as usual.
             self.recorder.engine = None;
             self.recorder.inserts_loaded =
-                vec![
-                    None;
-                    (tangent_ui::recorder::STRIPS + 1 + tangent_ui::recorder::DRUM_PADS)
-                        * tangent_ui::recorder::INSERTS
-                ];
+                vec![None; tangent_ui::recorder::INSERT_SPACE];
             self.open_audio_path(ctx);
         }
 
@@ -2341,11 +2351,7 @@ impl DesktopApp {
                 // Recovery restarts from the open edge like everything else.
                 self.recorder.reprobe = None;
                 self.recorder.inserts_loaded =
-                    vec![
-                        None;
-                        (tangent_ui::recorder::STRIPS + 1 + tangent_ui::recorder::DRUM_PADS)
-                            * tangent_ui::recorder::INSERTS
-                    ];
+                    vec![None; tangent_ui::recorder::INSERT_SPACE];
             }
         } else if open {
             self.reconcile_audio(false);
@@ -5767,11 +5773,7 @@ impl DesktopApp {
                 // the one it replaces — forgetting that here is what asks the
                 // reconcile below to fill the bays again.
                 self.recorder.inserts_loaded =
-                    vec![
-                        None;
-                        (tangent_ui::recorder::STRIPS + 1 + tangent_ui::recorder::DRUM_PADS)
-                            * tangent_ui::recorder::INSERTS
-                    ];
+                    vec![None; tangent_ui::recorder::INSERT_SPACE];
                 // **The tap belongs to the ENGINE, so it is taken when the
                 // engine starts.**
                 //
@@ -7156,13 +7158,7 @@ impl DesktopApp {
                 reprobe: None,
                 reastream: None,
                 pads_retry: false,
-                inserts_loaded: vec![
-                    None;
-                    (tangent_ui::recorder::STRIPS
-                        + 1
-                        + tangent_ui::recorder::DRUM_PADS)
-                        * tangent_ui::recorder::INSERTS
-                ],
+                inserts_loaded: vec![None; tangent_ui::recorder::INSERT_SPACE],
                 camera_opening: false,
                 camera_silent_since: None,
                 preview: None,
@@ -8187,6 +8183,51 @@ impl DesktopApp {
 
 #[cfg(all(test, feature = "recorder"))]
 mod tests {
+
+    /// **Every seat's bays are reachable, the master's second rack included.**
+    ///
+    /// `inserts_loaded` is flat — `seat * INSERTS + bay` — and the reconcile
+    /// walks its whole length. Size it short and the seats past the end are
+    /// never visited, silently: a plugin there is never handed to the engine,
+    /// so it is missing from playback and PRESENT in the export, because
+    /// settings and the exporter size themselves from `INSERT_SPACE`.
+    ///
+    /// It was sized `(STRIPS + 1 + DRUM_PADS) * INSERTS` in FIVE places, which
+    /// is 444 — one seat short of `MASTER_EXTRA_SEAT`, whose bays are 444–446.
+    /// The arithmetic is the whole bug, so the arithmetic is what this asserts.
+    #[test]
+    fn the_insert_table_reaches_every_seat_including_the_masters_second_rack() {
+        use tangent_ui::recorder::{
+            DRUM_PADS, INSERTS, INSERT_SPACE, MASTER_EXTRA_SEAT, MASTER_SEAT, STRIPS, TOTAL_SEATS,
+        };
+        // The size that was wrong, named so the test says what it prevents.
+        let short = (STRIPS + 1 + DRUM_PADS) * INSERTS;
+        assert!(
+            MASTER_EXTRA_SEAT * INSERTS >= short,
+            "the old sizing is no longer short; this test has lost its subject"
+        );
+
+        // Every seat the app can address has all its bays inside the table.
+        for seat in [0, MASTER_SEAT, MASTER_EXTRA_SEAT, TOTAL_SEATS - 1] {
+            for bay in 0..INSERTS {
+                assert!(
+                    seat * INSERTS + bay < INSERT_SPACE,
+                    "seat {seat} bay {bay} falls outside INSERT_SPACE"
+                );
+            }
+        }
+
+        // And the master's second rack specifically is PAST the old bound —
+        // which is the fact that made this invisible rather than a panic.
+        assert!(
+            MASTER_EXTRA_SEAT * INSERTS >= short,
+            "the master's extra rack no longer sits past the old sizing"
+        );
+        assert!(
+            (MASTER_EXTRA_SEAT + 1) * INSERTS <= INSERT_SPACE,
+            "INSERT_SPACE does not cover the master's second rack"
+        );
+    }
 
     /// **A looped AUDIO clip repeats, exactly as a looped MIDI one does.**
     ///

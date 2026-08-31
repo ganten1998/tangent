@@ -1552,21 +1552,28 @@ fn estimate_line(spec: &ExportSpec) -> String {
 
 /// What those encoders cost on the machine this is running on.
 ///
-/// Three simultaneous 1080p30 encodes is nothing for VideoToolbox and Media
-/// Foundation and is genuinely expensive for a software encoder, and somebody
-/// about to run three of them deserves to know which one they have *before*
-/// they find out during a take.
+/// Three simultaneous 1080p30 encodes is nothing for VideoToolbox and is
+/// genuinely expensive for a software encoder, and somebody about to run
+/// three of them deserves to know which one they have *before* they find out
+/// during a take.
+///
+/// **Windows is the SOFTWARE case, and used to be told the opposite.** This
+/// said "runs on Media Foundation, so three 1080p30 streams cost the CPU
+/// almost nothing" — and Windows does not encode through Media Foundation at
+/// all. `encode.rs` is explicit: macOS encodes natively through AVFoundation,
+/// and "Windows and Linux pipe raw frames into `ffmpeg`", which
+/// `encode/ffmpeg.rs` invokes as `-c:v libx264 -preset veryfast`. That is
+/// x264 on the CPU. So the one platform being promised it was free was the
+/// platform that pays most, and the sentence it needed was the one directly
+/// below it.
 ///
 /// `cfg!` and not a probe: this asks about the TARGET, which is where the
 /// dialog will be read, so a Windows build cross-compiled on this Mac still
-/// says Media Foundation.
+/// answers for Windows.
 fn encoder_note() -> &'static str {
     if cfg!(target_os = "macos") {
         "Video encoding here runs on VideoToolbox, so three 1080p30 streams cost the CPU almost \
          nothing."
-    } else if cfg!(target_os = "windows") {
-        "Video encoding here runs on Media Foundation, so three 1080p30 streams cost the CPU \
-         almost nothing."
     } else {
         "Video encoding here is a software encoder: every stream is real CPU, and three 1080p30 \
          streams will be felt while you play."
@@ -7704,6 +7711,46 @@ mod tests {
     /// button is — and `surface_of` measures whatever that colour turns out
     /// to be, moving the ground out of the 0.12–0.22 dead zone if it landed
     /// there.
+    /// **The encoder note tells each platform the truth about its own CPU.**
+    ///
+    /// Windows was told "runs on Media Foundation, so three 1080p30 streams
+    /// cost the CPU almost nothing" — and Windows pipes frames to ffmpeg,
+    /// invoked as `-c:v libx264 -preset veryfast`. x264, on the CPU. The one
+    /// platform promised the encode was free was the one paying most, and the
+    /// warning it needed was already written in the branch next door.
+    ///
+    /// Asserted as a PROPERTY rather than by string, so rewording the note
+    /// does not fail this and changing which platform is hardware does: only
+    /// a target that really encodes in hardware may promise "almost nothing".
+    #[test]
+    fn only_a_hardware_encoder_promises_it_is_free() {
+        let note = encoder_note();
+        // macOS is the only native/hardware path — see `encode.rs`: "macOS
+        // encodes natively: AVFoundation driving VideoToolbox", and "Windows
+        // and Linux pipe raw frames into ffmpeg".
+        let hardware = cfg!(target_os = "macos");
+        let promises_free = note.contains("almost \nnothing")
+            || note.contains("almost nothing")
+            || note.contains("cost the CPU almost");
+        assert_eq!(
+            promises_free, hardware,
+            "this target {} encode in hardware, and the note says {:?}",
+            if hardware { "does" } else { "does NOT" },
+            note
+        );
+        if !hardware {
+            assert!(
+                note.contains("software encoder"),
+                "a software target must say so: {note:?}"
+            );
+        }
+        // And the name of an API this app does not use must not appear.
+        assert!(
+            !note.contains("Media Foundation"),
+            "the note names Media Foundation, which nothing here encodes with"
+        );
+    }
+
     #[test]
     fn every_theme_dresses_a_confirmation_legibly_in_both_modes() {
         let mut bad: Vec<String> = Vec::new();
