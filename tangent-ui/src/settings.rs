@@ -35,7 +35,7 @@ pub struct Rgb {
 /// the migration runs ONCE against a file written before the change, and after
 /// that the same value chosen deliberately is never touched again. A file with
 /// no stamp is version 0 — every file every previous build wrote.
-const SETTINGS_VERSION: u64 = 19;
+const SETTINGS_VERSION: u64 = 20;
 
 /// Where a desk channel written before the INPUT STRIPS ended up.
 ///
@@ -1288,6 +1288,11 @@ pub struct Settings {
     /// stepped up 8. The host renames their insert-state sidecars once.
     /// Set by `adopt_desk` on an eight-channel-era desk, never serialized.
     pub desk_state_shift_v19: bool,
+    /// **The channel count grew 16 -> 24** (the supporter desk), so every
+    /// seat at or above the old channel block stepped up 8. The host
+    /// renames the insert-state sidecars once. Set by `adopt_desk` on a
+    /// sixteen-channel-era desk, never serialized.
+    pub desk_state_shift_v20: bool,
     /// Draw the menu and the dialogs INSIDE the main window, so a screen
     /// reader can reach them.
     ///
@@ -1382,6 +1387,7 @@ impl Default for Settings {
             desk_state_shift_v14: false,
             pad_state_shift_v18: false,
             desk_state_shift_v19: false,
+            desk_state_shift_v20: false,
             screen_reader_mode: false,
             window_w: None,
             window_h: None,
@@ -2965,6 +2971,41 @@ impl Settings {
             // The host renames the seat-numbered insert-state sidecars once:
             // drums/click/fx/master and all 128 pad seats just moved up.
             self.desk_state_shift_v19 = true;
+        }
+        // **A sixteen-channel-era desk, grown to twenty-four.** The next
+        // fingerprint down the years: nineteen sends is 4.82-through-5.0.
+        // Same fold as the eight-era block above; the masks and the whole
+        // seat map (buses, master, every pad block) step up by exactly
+        // eight, which `shift_insert_states_for_v20` mirrors on disk.
+        const V19_CHANNELS: usize = 16;
+        if desk.sends.len() == 19 && crate::recorder::CHANNELS > V19_CHANNELS {
+            let grow = crate::recorder::CHANNELS - V19_CHANNELS;
+            let at = V19_CHANNELS;
+            for _ in 0..grow {
+                if at <= desk.colors.len() {
+                    desk.colors.insert(at, 0);
+                }
+                if at <= desk.names.len() {
+                    desk.names.insert(at, String::new());
+                }
+                if at <= desk.sends.len() {
+                    desk.sends.insert(at, 0.0);
+                }
+            }
+            let ins_at = at * V11_INSERTS;
+            for _ in 0..(grow * V11_INSERTS) {
+                if ins_at <= desk.inserts.len() {
+                    desk.inserts.insert(ins_at, String::new());
+                }
+            }
+            let move_mask = |mask: u32| -> u32 {
+                let keep = mask & ((1u32 << at) - 1);
+                let above = mask >> at;
+                keep | (above << (at + grow))
+            };
+            self.strip_muted = move_mask(self.strip_muted);
+            self.strip_soloed = move_mask(self.strip_soloed);
+            self.desk_state_shift_v20 = true;
         }
 
         for (i, n) in desk.colors.iter().take(crate::recorder::STRIPS + 1).enumerate() {
@@ -5346,6 +5387,64 @@ mod tests {
         assert!(!v19.desk_state_shift_v19, "a v19 file must not re-trigger the shift");
     }
 
+    /// **A sixteen-channel desk file grows to twenty-four whole.** The
+    /// 4.82-through-5.0 era: nineteen sends, buses at 16..18, master at 19,
+    /// pad block base 20. Its master must still be the master and a pad's
+    /// insert still that pad's after the widening - the same promise the
+    /// eight-to-sixteen test above extracts from its own era.
+    #[test]
+    fn a_sixteen_channel_desk_grows_to_twenty_four() {
+        use crate::recorder::{pad_insert_index, Strip, CHANNELS, INSERTS, STRIPS};
+        assert!(CHANNELS >= 24, "this test is about the 16 -> 24 widening");
+        // 16-era shape: STRIPS = 19 (0..15 channels, 16 drums, 17 click,
+        // 18 fx), master at 19, pad-insert base 20.
+        let mut colors = vec![0i64; 20];
+        colors[5] = 14; // a painted channel, stays put
+        colors[16] = 9; // the drum bus
+        colors[18] = 3; // the fx return
+        let mut sends = vec![0.0f64; 19];
+        sends[5] = 0.4;
+        sends[18] = 0.9;
+        let mut names = vec![String::new(); 20];
+        names[16] = "DRUMS".to_owned();
+        names[19] = "OUT".to_owned();
+        let old_pad_base = 20;
+        let mut inserts = vec![String::new(); (old_pad_base + 128 + 1 + 15 * 128) * 3];
+        inserts[0] = "@tangent-dx7".to_owned();
+        inserts[16 * 3] = "/x/Bus-Comp.vst3".to_owned();
+        inserts[19 * 3] = "/x/Pro-L 2.vst3".to_owned();
+        inserts[(old_pad_base + 40) * 3] = "/x/Pad-Verb.vst3".to_owned();
+        let json = format!(
+            r#"{{"settings_version": 19, "strip_colors_v2": {colors:?},
+                 "strip_sends": {sends:?}, "strip_inserts": {inserts:?},
+                 "strip_names": {names:?},
+                 "strip_muted": {}, "strip_soloed": {}}}"#,
+            1u32 << 17, // the click muted
+            1u32 << 5   // channel 5 soloed
+        );
+        let s = Settings::from_json(&json);
+
+        assert_eq!(s.strip_colors[5], 14, "a kept channel's paint moved");
+        assert_eq!(s.strip_soloed, 1 << 5, "a solo below the widening moved");
+        assert_eq!(s.strip_colors[Strip::Drums.index()], 9, "the drum bus");
+        assert_eq!(s.strip_colors[Strip::Fx.index()], 3, "the fx return");
+        assert_eq!(s.strip_muted, 1 << Strip::Click.index(), "the muted click drifted");
+        assert!((s.strip_sends[Strip::Fx.index()] - 0.9).abs() < 1e-9, "the fx send");
+        assert_eq!(s.strip_names[Strip::Drums.index()], "DRUMS");
+        assert_eq!(s.strip_names[STRIPS], "OUT");
+        for ch in 16..CHANNELS {
+            assert_eq!(s.strip_colors[ch], 0, "new channel {ch} came up painted");
+        }
+        let bay = |strip: usize| s.strip_inserts[strip * INSERTS].as_str();
+        assert_eq!(bay(Strip::Drums.index()), "/x/Bus-Comp.vst3");
+        assert_eq!(bay(STRIPS), "/x/Pro-L 2.vst3");
+        assert_eq!(bay(pad_insert_index(40)), "/x/Pad-Verb.vst3", "pad 40's FX moved");
+        assert!(s.desk_state_shift_v20, "the host was not told to shuffle v20");
+        assert!(!s.desk_state_shift_v19, "the sixteen-era file tripped the v19 shift");
+        let v20 = Settings::from_json(r#"{"settings_version": 20}"#);
+        assert!(!v20.desk_state_shift_v20, "a v20 file must not re-trigger the shift");
+    }
+
     /// **A default is not a choice, but a choice is.**
     ///
     /// The click and the master shipped hand-painted — amber and red — and
@@ -5665,7 +5764,7 @@ mod tests {
     ///
     /// `a_reset_does_not_touch_the_bookkeeping` is where these are checked
     /// instead, one at a time and against what they are each supposed to be.
-    const BOOKKEEPING: [&str; 10] = [
+    const BOOKKEEPING: [&str; 11] = [
         "settings_version",
         "video_default_applied",
         "shows_default_applied",
@@ -5675,6 +5774,7 @@ mod tests {
         "desk_state_shift_v13",
         "desk_state_shift_v14",
         "desk_state_shift_v19",
+        "desk_state_shift_v20",
         "pad_state_shift_v18",
     ];
 
@@ -5730,6 +5830,7 @@ mod tests {
             side.desk_state_shift_v13 = false;
             side.desk_state_shift_v14 = false;
             side.desk_state_shift_v19 = false;
+            side.desk_state_shift_v20 = false;
             side.pad_state_shift_v18 = false;
             side.extra = Map::new();
         }

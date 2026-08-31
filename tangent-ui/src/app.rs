@@ -575,6 +575,11 @@ pub struct TangentApp {
     arr_scroll_acc: f32,
     /// The mixer control being dragged, and where the hand started.
     mixer_grab: Option<MixerGrab>,
+    /// The Konami walk. Watched only while the install is FREE - the code
+    /// is a door, and a door already open needs no knocking.
+    konami: crate::keys::Konami,
+    /// When the confetti started, if a party is on. See `confetti::draw`.
+    confetti_at: Option<std::time::Instant>,
     /// An insert bay being carried to another channel: `(strip, bay, where
     /// the press landed, has it really moved)`.
     ///
@@ -1543,6 +1548,23 @@ fn dirs_home() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("/"))
 }
 
+
+/// **Room-aware knob travel** — the answer to "the dial hits the top of the
+/// screen at 60". A knob's standard sweep is its panel's `KNOB_TRAVEL`, but
+/// the screen edge is a wall the cursor pins against, and a drag that needs
+/// more room than the wall allows used to strand the top of the range past
+/// it. So each frame the travel is compressed exactly enough that the
+/// REMAINING range fits the REMAINING room in the direction of motion:
+/// standard feel until the screen would run out, then precisely fast enough
+/// that the range's rail lands at the screen's rail. The 40 px floor keeps
+/// a grab made hard against the edge from turning into a hair trigger.
+fn smart_knob_travel(base: f32, room_px: f32, remaining: f32) -> f32 {
+    if remaining <= f32::EPSILON {
+        return base;
+    }
+    base.min((room_px / remaining).max(40.0))
+}
+
 /// Where a FRESH session lives: `Untitled`, unless somebody literally
 /// SAVED a project by that name — an auto-saved scratch is reclaimed, a
 /// kept one is stepped past to `Untitled 2` and so on.
@@ -2087,6 +2109,8 @@ impl TangentApp {
             arr_lane_scroll: 0,
             arr_scroll_acc: 0.0,
             mixer_grab: None,
+            konami: crate::keys::Konami::default(),
+            confetti_at: None,
             bay_carry: None,
             mixer_typing: None,
             mixer_naming: None,
@@ -4616,6 +4640,8 @@ impl TangentApp {
                 },
             }),
             any_solo: desk.any_solo(),
+            screen_filling: self.screen_sized,
+            active: self.active_channels(),
             visible: self.mixer_visible(),
             scroll_px: self.mixer_scroll_px,
             selected: self.selected_channel,
@@ -6469,6 +6495,10 @@ impl TangentApp {
         std::mem::take(&mut self.settings.desk_state_shift_v19)
     }
 
+    pub fn take_desk_state_shift_v20(&mut self) -> bool {
+        std::mem::take(&mut self.settings.desk_state_shift_v20)
+    }
+
     /// Which channels are armed — record-ready and LIVE — for the host to
     /// push at the engine every frame.
     pub fn armed_mask(&self) -> u32 {
@@ -6609,7 +6639,7 @@ impl TangentApp {
     /// Where un-aimed audio lands: the first unused lane, else the first
     /// AUDIO lane. `None` on a desk that is wall-to-wall MIDI.
     fn lane_for_audio(&self) -> Option<usize> {
-        (0..crate::recorder::CHANNELS)
+        (0..self.active_channels())
             .find(|n| self.channel_kind(*n).is_none())
             .or_else(|| {
                 (0..crate::recorder::CHANNELS)
@@ -7005,26 +7035,31 @@ impl TangentApp {
         // and the drums at their defaults.
         let d = &{
             let mut d = d.clone();
-            if d.sends.len() == crate::recorder::STRIPS - 1 {
-                d.sends.insert(crate::recorder::CHANNELS, 0.0);
-                if d.colors.len() == crate::recorder::STRIPS {
-                    d.colors.insert(crate::recorder::CHANNELS, 0);
+            // Frozen at the ERA's numbers (16 channels, 18 strips), per the
+            // migration rule — this read the LIVE constants and went dead
+            // the day the desk grew to 24, stranding that beta window's
+            // documents unlifted.
+            const V18_CH: usize = 16;
+            if d.sends.len() == 18 {
+                d.sends.insert(V18_CH, 0.0);
+                if d.colors.len() == 19 {
+                    d.colors.insert(V18_CH, 0);
                 }
-                if d.names.len() == crate::recorder::STRIPS {
-                    d.names.insert(crate::recorder::CHANNELS, String::new());
+                if d.names.len() == 19 {
+                    d.names.insert(V18_CH, String::new());
                 }
-                if d.inserts.len() == crate::recorder::STRIPS * crate::recorder::INSERTS {
+                if d.inserts.len() == 19 * crate::recorder::INSERTS {
                     for _ in 0..crate::recorder::INSERTS {
                         d.inserts.insert(
-                            crate::recorder::CHANNELS * crate::recorder::INSERTS,
+                            V18_CH * crate::recorder::INSERTS,
                             String::new(),
                         );
                     }
                 }
                 let move_mask = |mask: u32| -> u32 {
-                    let keep = mask & ((1 << crate::recorder::CHANNELS) - 1);
-                    let above = mask >> crate::recorder::CHANNELS;
-                    keep | (above << (crate::recorder::CHANNELS + 1))
+                    let keep = mask & ((1 << V18_CH) - 1);
+                    let above = mask >> V18_CH;
+                    keep | (above << (V18_CH + 1))
                 };
                 d.muted = move_mask(d.muted);
                 d.soloed = move_mask(d.soloed);
@@ -7081,6 +7116,37 @@ impl TangentApp {
                 // own `state/`. The desk ARRAYS relocate here so plugins load
                 // at the right seats; a moved plugin's saved knobs fall back
                 // to defaults, the same graceful cost every shuffle accepts.
+            }
+            // **A sixteen-channel-era document, grown to twenty-four.** The
+            // 4.82-through-5.0 shape: nineteen sends is its fingerprint.
+            // Same fold, same bargain on the project's own state/ sidecars.
+            const V19_CH: usize = 16;
+            if d.sends.len() == 19 && crate::recorder::CHANNELS > V19_CH {
+                let grow = crate::recorder::CHANNELS - V19_CH;
+                for _ in 0..grow {
+                    if V19_CH <= d.colors.len() {
+                        d.colors.insert(V19_CH, 0);
+                    }
+                    if V19_CH <= d.names.len() {
+                        d.names.insert(V19_CH, String::new());
+                    }
+                    if V19_CH <= d.sends.len() {
+                        d.sends.insert(V19_CH, 0.0);
+                    }
+                }
+                let ins_at = V19_CH * ins3;
+                for _ in 0..(grow * ins3) {
+                    if ins_at <= d.inserts.len() {
+                        d.inserts.insert(ins_at, String::new());
+                    }
+                }
+                let grow_mask = |mask: u32| -> u32 {
+                    let keep = mask & ((1u32 << V19_CH) - 1);
+                    let above = mask >> V19_CH;
+                    keep | (above << (V19_CH + grow))
+                };
+                d.muted = grow_mask(d.muted);
+                d.soloed = grow_mask(d.soloed);
             }
             d
         };
@@ -8048,7 +8114,7 @@ impl TangentApp {
 
     /// Ctrl+T's landing place: the first channel that is not a track yet.
     fn add_track_first_free(&mut self) {
-        if let Some(n) = (0..crate::recorder::CHANNELS).find(|n| !self.channel_used(*n)) {
+        if let Some(n) = (0..self.active_channels()).find(|n| !self.channel_used(*n)) {
             self.add_bare_track(n);
         }
     }
@@ -8808,7 +8874,7 @@ impl TangentApp {
                     .find(|c| c.id == cid)
                     .map(|c| c.kind);
                 let lane_to = (lane0 as i64 + lane_d)
-                    .clamp(0, crate::recorder::CHANNELS as i64 - 1)
+                    .clamp(0, self.active_channels() as i64 - 1)
                     as usize;
                 let lane_ok = match kind {
                     Some(crate::arrangement::ClipKind::Midi) => true,
@@ -11036,8 +11102,14 @@ impl TangentApp {
         let (lo, hi) = pasted.iter().fold((i64::MAX, i64::MIN), |(lo, hi), c| {
             (lo.min(c.lane as i64), hi.max(c.lane as i64))
         });
+        // Bounded by the ACTIVE desk, not the capacity: on a free install
+        // a paste must not invent supporter lanes — but a group copied
+        // FROM those lanes (a wide document opened free) keeps its shape,
+        // because active_channels already widens for a document that
+        // carries them.
+        let edge = self.active_channels() as i64 - 1;
         let lane_d = if lo <= hi {
-            lane_d.clamp(-lo, (crate::recorder::CHANNELS as i64 - 1 - hi).max(-lo))
+            lane_d.clamp(-lo, (edge - hi).max(-lo))
         } else {
             lane_d
         };
@@ -11045,7 +11117,7 @@ impl TangentApp {
         for mut c in pasted {
             c.start_s += at;
             c.lane = (c.lane as i64 + lane_d)
-                .clamp(0, crate::recorder::CHANNELS as i64 - 1)
+                .clamp(0, self.active_channels() as i64 - 1)
                 as usize;
             c.id = 0;
             fresh.push(self.arrangement.add_clip(c));
@@ -13086,10 +13158,28 @@ impl TangentApp {
                         // either order of click-and-shift only slows what
                         // comes next, never re-prices the distance done.
                         let fine = if shift { 0.1 } else { 1.0 };
-                        let v = grab.from_value
-                            + (p.x - grab.from.x) / crate::drumpad_panel::KNOB_TRAVEL
-                                * (hi - lo)
-                                * fine;
+                        // The drumpad's knobs get the same room-aware travel
+                        // as the band's — horizontal, so the walls are the
+                        // screen's sides.
+                        let dpx = p.x - grab.from.x;
+                        let screen = ctx.content_rect();
+                        let room = if dpx > 0.0 {
+                            (screen.right() - p.x).max(0.0)
+                        } else {
+                            (p.x - screen.left()).max(0.0)
+                        };
+                        let range = (hi - lo).max(f32::EPSILON);
+                        let remaining = if dpx > 0.0 {
+                            ((hi - grab.from_value) / range).clamp(0.0, 1.0)
+                        } else {
+                            ((grab.from_value - lo) / range).clamp(0.0, 1.0)
+                        };
+                        let travel = smart_knob_travel(
+                            crate::drumpad_panel::KNOB_TRAVEL,
+                            room,
+                            remaining,
+                        );
+                        let v = grab.from_value + dpx / travel * (hi - lo) * fine;
                         self.drumpad_set(grab.param, v);
                         let landed = self.drumpad_get(grab.param);
                         if let Some(g) = self.drumpad_grab.as_mut() {
@@ -15238,7 +15328,7 @@ impl TangentApp {
                             // stale value above the new max, and wheel-up
                             // went dead for that many notches.
                             self.arr_lane_scroll = self.arr_lane_scroll.min(
-                                crate::recorder::CHANNELS
+                                self.active_channels()
                                     .saturating_sub(self.arr_visible()),
                             );
                             self.save_settings();
@@ -15254,7 +15344,7 @@ impl TangentApp {
                         // until it means it, and nobody gets the old
                         // one-lane-per-micro-tick jump.
                         let max =
-                            crate::recorder::CHANNELS.saturating_sub(self.arr_visible());
+                            self.active_channels().saturating_sub(self.arr_visible());
                         let lane_h = (rect.height()
                             / self.arr_visible().max(1) as f32)
                             .max(24.0);
@@ -16737,6 +16827,7 @@ impl TangentApp {
         let peaks = self.meter_hold;
         let (view_start_s, view_len_s) = self.arr_window_now();
         crate::arrangement_panel::ArrangeView {
+            active: self.active_channels(),
             // **The master's row.** Its level and colour come from the same
             // place the desk's own strip reads, so the two views cannot
             // disagree about how loud the master is or what it looks like.
@@ -16907,7 +16998,7 @@ impl TangentApp {
             }),
             lane_scroll: self
                 .arr_lane_scroll
-                .min(crate::recorder::CHANNELS.saturating_sub(self.arr_visible())),
+                .min(self.active_channels().saturating_sub(self.arr_visible())),
             visible_lanes: self.arr_visible(),
             clips,
             header_w: if self.settings.arr_header_w > 0.0 {
@@ -17811,7 +17902,7 @@ impl TangentApp {
         let mut lane = lane.min(crate::recorder::CHANNELS - 1);
         for (i, path) in files.iter().enumerate() {
             if i > 0 {
-                let Some(free) = (0..crate::recorder::CHANNELS).find(|n| !self.channel_used(*n))
+                let Some(free) = (0..self.active_channels()).find(|n| !self.channel_used(*n))
                 else {
                     errors.push(format!(
                         "no empty track left for {}",
@@ -17945,7 +18036,7 @@ impl TangentApp {
         let span = bottom - top + 1;
         // A spare row to BE the folder, taken from the bottom so the search
         // never disturbs anything above the group.
-        let Some(free) = (0..CHANNELS)
+        let Some(free) = (0..self.active_channels())
             .rev()
             .find(|n| !self.channel_used(*n) && !(top..=bottom).contains(n))
         else {
@@ -18015,6 +18106,13 @@ impl TangentApp {
         self.recorder.position_s.max(0.0)
     }
 
+
+    /// Start the party — the burst behind both roads to a key, the honest
+    /// paste and the Konami walk. Drawn at the end of the frame over
+    /// everything; see `confetti::draw`.
+    fn start_confetti(&mut self) {
+        self.confetti_at = Some(std::time::Instant::now());
+    }
 
     /// The desk's own face for the mode the app is in — what every floating
     /// panel is made of: the menus, the dialogs, the help card, the hover
@@ -18407,18 +18505,38 @@ impl TangentApp {
     /// an override: somebody who has zoomed PAST these keeps what they chose,
     /// because the setting is the thing they asked for and this is only the
     /// room the screen happens to have.
+
+    /// How many channels THIS install works at, the paywall's one number:
+    /// the full twenty-four with a key (or the Konami road), sixteen free -
+    /// except that a DOCUMENT already carrying wider work overrides the
+    /// gate, because a licence question must never hide somebody's music.
+    /// The engine always runs full capacity either way; this gates layout
+    /// and the pickers that start new work.
+    pub fn active_channels(&self) -> usize {
+        use crate::recorder::{CHANNELS, FREE_CHANNELS};
+        if self.license.is_supporter() {
+            return CHANNELS;
+        }
+        let doc_wide = self
+            .arrangement
+            .clips
+            .iter()
+            .any(|c| c.lane >= FREE_CHANNELS)
+            || (FREE_CHANNELS..CHANNELS).any(|ch| self.channel_used(ch));
+        if doc_wide { CHANNELS } else { FREE_CHANNELS }
+    }
+
     fn mixer_visible(&self) -> usize {
-        let want = (self.settings.mixer_visible as usize).max(if self.screen_sized {
-            crate::recorder::CHANNELS
-        } else {
-            0
-        });
-        want.clamp(1, crate::recorder::CHANNELS)
+        let active = self.active_channels();
+        let want = (self.settings.mixer_visible as usize)
+            .max(if self.screen_sized { active } else { 0 });
+        want.clamp(1, active)
     }
     fn arr_visible(&self) -> usize {
+        let active = self.active_channels();
         let want = (self.settings.arr_visible as usize)
-            .max(if self.screen_sized { ARR_LANES_FULL } else { 0 });
-        want.clamp(1, crate::recorder::CHANNELS)
+            .max(if self.screen_sized { ARR_LANES_FULL.min(active) } else { 0 });
+        want.clamp(1, active)
     }
     fn midi_keys_visible(&self) -> f32 {
         (self.settings.midi_keys_visible as f32).clamp(12.0, 96.0)
@@ -21372,6 +21490,12 @@ impl TangentApp {
     /// script.
     pub fn apply_dialog_action(&mut self, action: DialogAction) {
         match action {
+            DialogAction::AcceptCheat => {
+                // The "...": the unlock is real from here on - supporter in
+                // every right, thanked as Cheater until an honest key
+                // replaces the name. See LicenseStore::unlock_cheat.
+                self.license.unlock_cheat();
+            }
             // ── the unsaved-changes prompt ───────────────────────────────
             //
             // All four answers end the same way: either the thing that was
@@ -21985,6 +22109,8 @@ impl TangentApp {
                             .name
                             .clone()
                             .unwrap_or_else(|| "supporter".to_owned());
+                        // A key landing is a party, whichever road it came by.
+                        self.start_confetti();
                         self.dialog = Some(Dialog::SupporterKey {
                             input: String::new(),
                             message: Some(format!("Thank you, {who}. That means a lot.")),
@@ -23122,7 +23248,45 @@ impl TangentApp {
             && self.swing_menu.is_none()
             && !self.text_entry_active()
         {
-            if let Some(action) = keys::pressed(&ctx, self.key_gates()) {
+            // **The code, watched ahead of every ordinary binding.** Only a
+            // FREE install listens; the tail of the walk (B, A, Enter)
+            // consumes the frame's dispatch so B does not flip borderless
+            // and A does not open About mid-cheat. The arrows stay live -
+            // up-up-down-down is harmless on every view.
+            let konami_eats = !self.license.is_supporter() && {
+                let keys: Vec<(egui::Key, bool)> = ctx.input(|i| {
+                    i.events
+                        .iter()
+                        .filter_map(|e| match e {
+                            egui::Event::Key { key, pressed: true, modifiers, .. } => {
+                                Some((*key, modifiers.any()))
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                });
+                let mut eats = false;
+                for (key, modified) in keys {
+                    if modified {
+                        // A modified key is "something else in between".
+                        let _ = self.konami.feed(egui::Key::Escape);
+                        continue;
+                    }
+                    let done = self.konami.feed(key);
+                    if self.konami.progress() >= 9 || done {
+                        eats = true;
+                    }
+                    if done {
+                        self.dialog = Some(dialogs::Dialog::Cheated);
+                        self.start_confetti();
+                    }
+                }
+                eats
+            };
+            if let Some(action) = (!konami_eats)
+                .then(|| keys::pressed(&ctx, self.key_gates()))
+                .flatten()
+            {
                 // The GUITAR toggle answers nowhere but the piano view: on
                 // the desk surfaces the band is not even drawn, and the
                 // window resizing under a mixer was the owner's complaint.
@@ -24451,12 +24615,40 @@ impl TangentApp {
                     // within reach of a hand.
                     let axis = recorder_panel::drag_axis(rect, &view, grab.hit);
                     if let Some(axis) = axis {
-                        let travel = recorder_panel::drag_travel(rect, &view, grab.hit)
-                            .unwrap_or(KNOB_TRAVEL);
+                        let own = recorder_panel::drag_travel(rect, &view, grab.hit);
                         let moved = match axis {
                             recorder_panel::DragAxis::Vertical => grab.from.y - pos.y,
                             recorder_panel::DragAxis::Horizontal => pos.x - grab.from.x,
                         };
+                        // A fader keeps its own one-to-one track; a KNOB gets
+                        // the room-aware travel, integrated frame by frame so
+                        // the compression only ever prices motion still to
+                        // come — see `smart_knob_travel`.
+                        let travel = own.unwrap_or_else(|| {
+                            let screen = ctx.content_rect();
+                            let room = match axis {
+                                recorder_panel::DragAxis::Vertical => {
+                                    if moved > 0.0 {
+                                        (pos.y - screen.top()).max(0.0)
+                                    } else {
+                                        (screen.bottom() - pos.y).max(0.0)
+                                    }
+                                }
+                                recorder_panel::DragAxis::Horizontal => {
+                                    if moved > 0.0 {
+                                        (screen.right() - pos.x).max(0.0)
+                                    } else {
+                                        (pos.x - screen.left()).max(0.0)
+                                    }
+                                }
+                            };
+                            let remaining = if moved > 0.0 {
+                                1.0 - grab.from_value
+                            } else {
+                                grab.from_value
+                            };
+                            smart_knob_travel(KNOB_TRAVEL, room, remaining)
+                        });
                         let fine = if ctx.input(|i| i.modifiers.shift) {
                             recorder_panel::FINE_DRAG
                         } else {
@@ -24539,6 +24731,7 @@ impl TangentApp {
                         let max = crate::mixer_panel::Layout::max_scroll_px(
                             rect,
                             self.mixer_visible(),
+                            self.active_channels(),
                         );
                         self.mixer_scroll_px =
                             (self.mixer_scroll_px - d).clamp(0.0, max);
@@ -25253,7 +25446,19 @@ impl TangentApp {
         // position the OS places them, which on Windows is the top-left of the
         // screen no matter where the user has put the piano.
         let placement = dialogs::Placement {
-            caps: self.caps,
+            caps: {
+                let mut caps = self.caps;
+                // **A fullscreen surface out-ranks any window the OS could
+                // give a dialog.** i3 and Windows 11 both put the save
+                // prompt BEHIND the fullscreen draw while the app dropped
+                // its own input for modality - a hard lock a person ends by
+                // killing the process. Fullscreen draws dialogs in the
+                // canvas instead, the road reader mode already built.
+                if ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)) {
+                    caps.child_windows = false;
+                }
+                caps
+            },
             native_panel_up: self.native_panel_up,
             // Filled in by the one dialog that hangs off a point rather than
             // centring — the metronome's, whose own arm overrides this. See
@@ -25297,6 +25502,31 @@ impl TangentApp {
             }
         {
             self.apply_dialog_action(action);
+        }
+        // **The party, over everything.** A dim veil and the rainbow, drawn
+        // on the Foreground layer so it covers the whole canvas (and sits
+        // over inline dialogs; the desktop's child windows float free, and
+        // the burst filling the main window behind them is the right feel).
+        // Repaints tick while it runs; the state drops itself when
+        // `confetti::draw` says the party ended.
+        if let Some(at) = self.confetti_at {
+            let t = at.elapsed().as_secs_f32();
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("tangent-confetti"),
+            ));
+            let screen = ctx.content_rect();
+            let fade = ((crate::confetti::DURATION_S - t) / 0.8).clamp(0.0, 1.0);
+            painter.rect_filled(
+                screen,
+                0.0,
+                egui::Color32::from_black_alpha((110.0 * fade) as u8),
+            );
+            if crate::confetti::draw(&painter, screen, t) {
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            } else {
+                self.confetti_at = None;
+            }
         }
         // **The band's message, as a window.** The status line along the foot
         // of the record band is gone; this is where those messages went. The
@@ -28379,10 +28609,13 @@ mod tests {
             app.clipboard_stamp.as_deref().is_some_and(|s| s.contains('3')),
             "the copy did not stamp the system clipboard"
         );
-        // Pasting onto the LAST channel: the shift is shortened so the
-        // three lanes keep their spread instead of piling on the bottom.
+        // Pasting onto the LAST channel of the ACTIVE desk (a fresh test
+        // app is a free install, so that is the free edge — the paywall's
+        // whole point): the shift is shortened so the three lanes keep
+        // their spread instead of piling on the bottom.
+        let edge = app.active_channels() - 1;
         app.recorder.position_s = 40.0;
-        app.selected_channel = Some(crate::recorder::CHANNELS - 1);
+        app.selected_channel = Some(edge);
         app.arr_paste();
         let mut lanes: Vec<usize> = app
             .arrangement()
@@ -28394,11 +28627,7 @@ mod tests {
         lanes.sort_unstable();
         assert_eq!(
             lanes,
-            vec![
-                crate::recorder::CHANNELS - 3,
-                crate::recorder::CHANNELS - 2,
-                crate::recorder::CHANNELS - 1
-            ],
+            vec![edge - 2, edge - 1, edge],
             "the pasted group lost its lane spread"
         );
         let _ = std::fs::remove_dir_all(&root);

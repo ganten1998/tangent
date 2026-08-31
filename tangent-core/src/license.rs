@@ -368,6 +368,12 @@ pub struct LicenseStore {
     /// start honoring a file this build could not read.
     raw: Option<String>,
     license: Option<License>,
+    /// **The Konami road.** True when the cheat marker sits beside the key
+    /// file: the install is supporter in every right - the heart, the wide
+    /// desk, the folded mixer - and the thanked name is "Cheater" until a
+    /// legitimate key replaces it. The owner's spec, verbatim spirit: the
+    /// code is a real unlock, not a demo mode.
+    cheat: bool,
 }
 
 impl LicenseStore {
@@ -385,32 +391,64 @@ impl LicenseStore {
     /// Never panics; every failure yields an unlicensed (free) store.
     pub fn load_from(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
+        let cheat = path
+            .parent()
+            .is_some_and(|d| d.join("cheat.unlock").exists());
         let Ok(raw) = std::fs::read_to_string(&path) else {
-            return Self { path, raw: None, license: None };
+            return Self { path, raw: None, license: None, cheat };
         };
         // A genuine key whose `max_major` stops short of this build is not
         // installed — fails open to the free app like every other refusal,
         // and `raw` still keeps the file verbatim (a cap is the ONE refusal a
         // future build cannot cure, but the rule stays: never eat the file).
         let license = verify_key(&raw).ok().filter(License::covers_build_major);
-        Self { path, raw: Some(raw), license }
+        Self { path, raw: Some(raw), license, cheat }
+    }
+
+    /// The Konami unlock: persist the marker and grant supporter standing
+    /// now. Nothing touches `license.key` - a legitimate key installed
+    /// later simply outranks the marker for the NAME, and the marker keeps
+    /// the unlock alive if that key is ever removed. Best-effort on disk
+    /// exactly like `install`'s read-only-config manner: a failed write
+    /// still unlocks the running session.
+    pub fn unlock_cheat(&mut self) {
+        self.cheat = true;
+        if let Some(dir) = self.path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+            let _ = std::fs::write(dir.join("cheat.unlock"), "konami\n");
+        }
+    }
+
+    /// Whether the cheat marker is what carries this install's standing -
+    /// the watcher stops listening once there is nothing left to unlock.
+    pub fn cheated(&self) -> bool {
+        self.cheat
     }
 
     /// Is a valid supporter license installed? Derived every time — never
     /// cached to disk, so there is no boolean to flip and none to corrupt.
     pub fn is_supporter(&self) -> bool {
-        self.license
-            .as_ref()
-            .is_some_and(|l| l.tier >= TIER_SUPPORTER)
+        self.cheat
+            || self
+                .license
+                .as_ref()
+                .is_some_and(|l| l.tier >= TIER_SUPPORTER)
     }
 
     pub fn license(&self) -> Option<&License> {
         self.license.as_ref()
     }
 
-    /// The name to thank in About, if the buyer chose one.
+    /// The name to thank in About, if the buyer chose one. A legitimate
+    /// key's name outranks the Konami road's; with only the marker, the
+    /// name is what the dialog promised: Cheater.
     pub fn display_name(&self) -> Option<&str> {
-        self.license.as_ref().and_then(|l| l.name.as_deref())
+        // A legitimate key suppresses the joke name even when the buyer
+        // left the name blank - an anonymous supporter is not a Cheater.
+        if let Some(l) = self.license.as_ref() {
+            return l.name.as_deref();
+        }
+        if self.cheat { Some("Cheater") } else { None }
     }
 
     pub fn raw(&self) -> Option<&str> {
@@ -671,5 +709,39 @@ mod tests {
         // And not merely absent: where the app is named at all, it is named
         // by what the title bar and the store call it.
         assert!(LicenseError::Malformed.message().contains("Tangent"));
+    }
+}
+
+#[cfg(test)]
+mod cheat_tests {
+    use super::*;
+
+    /// **The Konami road is a real unlock.** The marker beside the key file
+    /// makes the install supporter in every right and names it Cheater; a
+    /// missing marker leaves the free install free; and unlock_cheat is
+    /// what writes the marker, once, durably.
+    #[test]
+    fn the_cheat_marker_is_a_persistent_supporter_standing() {
+        let dir = std::env::temp_dir().join(format!("tangent-cheat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key_path = dir.join("license.key");
+
+        let free = LicenseStore::load_from(&key_path);
+        assert!(!free.is_supporter(), "an empty dir came up licensed");
+        assert!(free.display_name().is_none());
+
+        let mut s = LicenseStore::load_from(&key_path);
+        s.unlock_cheat();
+        assert!(s.is_supporter(), "the unlock did not take in-session");
+        assert_eq!(s.display_name(), Some("Cheater"));
+        assert!(dir.join("cheat.unlock").is_file(), "the marker never hit disk");
+
+        // A fresh load — the next launch — still stands.
+        let again = LicenseStore::load_from(&key_path);
+        assert!(again.is_supporter(), "the unlock did not survive a relaunch");
+        assert_eq!(again.display_name(), Some("Cheater"));
+        assert!(again.cheated());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

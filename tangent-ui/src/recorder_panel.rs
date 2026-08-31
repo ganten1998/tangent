@@ -2829,7 +2829,13 @@ pub fn drag_travel(rect: Rect, view: &RecorderView<'_>, hit: Hit) -> Option<f32>
 /// **Wider than the knob, by a lot.** A knob's cell is a few tens of points;
 /// mapping that to the whole range is a control nobody can land on a number
 /// with. The hand can leave the knob, leave the band, and go on turning.
-pub const KNOB_TRAVEL: f32 = 260.0;
+///
+/// 150 and not the 260 it shipped at: on a trackpad the sweep is the whole
+/// pad, and dragging UP from a band dial met the top of the screen before
+/// the top of the range - the owner had to turn one dial in instalments.
+/// 150 matches the drumpad's knobs, so the two families finally agree on
+/// what a full turn costs the hand.
+pub const KNOB_TRAVEL: f32 = 150.0;
 
 /// How far the pointer must move to sweep a FADER end to end, in points.
 ///

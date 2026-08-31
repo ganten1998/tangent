@@ -360,6 +360,9 @@ pub struct ArrangeView<'a> {
     pub lane_scroll: usize,
     /// How many lanes show at once — Shift+wheel over the headers zooms it.
     pub visible_lanes: usize,
+    /// The paywall's number (`TangentApp::active_channels`): how many lanes
+    /// the field draws and the scroll can reach. Capacity stays CHANNELS.
+    pub active: usize,
     pub clips: &'a [ClipView<'a>],
     /// The toolbar's three facts: the click, the magnet, and the grid as a
     /// power of two in bars (3 = 8 bars … 0 = 1 bar … -5 = 1/32).
@@ -1103,7 +1106,8 @@ impl Layout {
         // and `view.lane_scroll` chooses which window shows. A lane outside
         // the window is `NOTHING` — not drawn, not hit, and clips on it
         // resolve to nothing through `clip_rect`'s `is_positive` filter.
-        let visible = view.visible_lanes.clamp(1, CHANNELS);
+        let active = view.active.clamp(1, CHANNELS);
+        let visible = view.visible_lanes.clamp(1, active);
         // **The bus rows are ADDED to the stack, not taken out of it.**
         //
         // The master and the click are half a track each — one track's
@@ -1112,7 +1116,7 @@ impl Layout {
         // lane showed none at all. `visible` still means TRACKS; the pair
         // costs every track a slice of its height instead, which is the same
         // bargain an open automation row already makes.
-        let first = view.lane_scroll.min(CHANNELS.saturating_sub(visible));
+        let first = view.lane_scroll.min(active.saturating_sub(visible));
         // **Automation rows shrink the tracks until they have cost a whole
         // one, and then a track leaves.**
         //
@@ -1225,7 +1229,7 @@ impl Layout {
                 );
             }
         }
-        for i in first..CHANNELS {
+        for i in first..active {
             // A track inside a SHUT folder is not laid out at all: no row, so
             // nothing is drawn, nothing is hit, and its clips resolve to
             // nothing through `clip_rect`'s own `is_positive` filter — the
@@ -1358,9 +1362,15 @@ impl Layout {
         if !used {
             // The + circle first — pressing it makes the track — then the
             // chip beside it for binding straight away.
-            let d = (r.height() * 0.44).clamp(16.0, 26.0);
+            // Clear of the number's top-left seat, whatever the row
+            // height: at a squeezed row the old full-height centre put the
+            // plus on top of the lane's own number.
+            let d = (r.height() * 0.44).clamp(16.0, 26.0).min((r.height() - 16.0).max(12.0));
             let add = Rect::from_center_size(
-                Pos2::new(r.left() + r.width() * 0.10, r.center().y),
+                Pos2::new(
+                    r.left() + r.width() * 0.10,
+                    r.center().y.max(r.top() + 13.0 + d * 0.5),
+                ),
                 Vec2::splat(d),
             );
             let ch_h = (r.height() * 0.30).clamp(12.0, 16.0);
@@ -5446,6 +5456,7 @@ ArrangeView {
             lanes: std::array::from_fn(|i| a_lane(i < 3)),
             lane_scroll: 0,
             visible_lanes: VISIBLE_LANES,
+            active: CHANNELS,
             clips,
             metronome_on: true,
             snap_on: true,

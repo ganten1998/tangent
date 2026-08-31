@@ -38,6 +38,7 @@ pub mod settings;
 /// everything else in the app used to do with a multiply.
 pub mod tempo;
 pub mod varispeed;
+pub mod confetti;
 pub mod splash;
 pub mod staff;
 pub mod shell;

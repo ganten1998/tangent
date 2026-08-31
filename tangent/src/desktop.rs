@@ -4161,6 +4161,20 @@ impl DesktopApp {
             for (_input, lane, frames) in &rec.audio {
                 let seconds = frames.len() as f64 / 2.0 / rate;
                 if seconds < 0.05 {
+                    // **A dead input is said out loud, never shrugged at.**
+                    // The transport ran a real take but this armed input
+                    // handed over nothing — a stalled capture stream (the
+                    // suspension family), not a blink. Skipping silently
+                    // here was the owner's "record over a clip, silence,
+                    // and the old waveform pops back": no clip landed, no
+                    // carve ran, and nothing said why.
+                    if len_s >= 0.5 {
+                        self.recorder.take_note = Some(format!(
+                            "channel {}: the input delivered no audio for a {:.1}s take -                              nothing was kept and the old clips stand. See Audio Status.",
+                            lane + 1,
+                            len_s
+                        ));
+                    }
                     continue;
                 }
                 let mut n = 1usize;
@@ -7478,6 +7492,9 @@ impl DesktopApp {
             if me.app.take_desk_state_shift_v19() {
                 shift_insert_states_for_v19();
             }
+            if me.app.take_desk_state_shift_v20() {
+                shift_insert_states_for_v20();
+            }
         }
         me
     }
@@ -7528,6 +7545,23 @@ fn shift_insert_states_for_v18() {
 /// literals per the historical-migration rule. The upper bound covers the
 /// old master (11) and all 128 pads (12..139).
 #[cfg(feature = "recorder")]
+/// 16 -> 24 channels: every seat at or above the old channel block —
+/// drums, click, fx, master, master-extra and all the pad blocks — steps
+/// up by exactly eight. Uniform because the seat map appends its classes
+/// in order (channels, buses, pads), so a single +8 over the old range is
+/// provably right for every old seat >= 16. Highest first, or the move
+/// eats itself. The old map's last seat was 2068.
+fn shift_insert_states_for_v20() {
+    for bay in 0..3 {
+        for old in (16..2069).rev() {
+            let from = insert_state_path(old, bay);
+            if from.exists() {
+                let _ = std::fs::rename(&from, insert_state_path(old + 8, bay));
+            }
+        }
+    }
+}
+
 fn shift_insert_states_for_v19() {
     for bay in 0..3 {
         for old in (8..(12 + 128)).rev() {

@@ -568,23 +568,33 @@ impl ChannelKind {
 // the fixed desk below, this is a limit you can feel the shape of, not a
 // feature that has not arrived yet.
 
-/// How many general channels the desk has.
+/// How many general channels the desk can CARRY — the capacity every
+/// engine table, settings array and seat index is sized to.
 ///
-/// **Sixteen, eight in view** — it grew from eight (the owner's original
-/// even count; nine columns was the accident of five slots plus four
-/// inputs) to exactly one more screenful at 4.82.0. Sixteen and not
-/// twenty-four because the desk is still meant to be held in the head:
-/// two pages of eight is a geography, three is an inventory — and sixteen
-/// is the most MIDI itself will address, so every channel can own a MIDI
-/// channel without sharing. Fixed, like everything about the desk's
-/// shape: an app whose strips appear and disappear is a desk that changes
-/// shape under your hands, so an unused channel is drawn as a plus rather
-/// than not drawn.
-///
-/// (The sixteen-not-twenty-four reasoning above is the position as
-/// understood from the layout math and the 4.82.0 commit, not yet the
-/// owner's own word — owner to confirm or amend.)
-pub const CHANNELS: usize = 16;
+/// **Twenty-four as of 2026-08-31, the owner's word** — the supporter desk.
+/// It grew from eight (nine columns was the accident of five slots plus
+/// four inputs) to sixteen at 4.82.0, and to twenty-four with the
+/// supporter unlock. What a given INSTALL shows is [`active_channels`]:
+/// sixteen free, the full twenty-four with a key (or the Konami road).
+/// The engine always runs the full width, so a supporter's session opened
+/// on a free install still SOUNDS whole — a licence must never silence
+/// somebody's music — and the free desk simply cannot start new work past
+/// sixteen. Fixed at each tier, like everything about the desk's shape:
+/// an app whose strips appear and disappear as things load is a desk that
+/// changes shape under your hands, so an unused channel is drawn as a
+/// plus rather than not drawn.
+pub const CHANNELS: usize = 24;
+
+/// The free desk: the sixteen the app has always shown without a key.
+pub const FREE_CHANNELS: usize = 16;
+
+/// How many channels this install works at. The one place the paywall's
+/// arithmetic lives: LAYOUT iteration and new-track pickers ask this;
+/// engine capacity, persistence and permutation walks stay at
+/// [`CHANNELS`] so nothing ever truncates somebody's data.
+pub fn active_channels(licensed: bool) -> usize {
+    if licensed { CHANNELS } else { FREE_CHANNELS }
+}
 
 /// **Where the limiter's threshold ships**, as a knob position.
 ///

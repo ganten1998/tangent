@@ -13,5 +13,13 @@
 [toolchain]
 channel = "1.97.1"
 components = ["clippy", "rustfmt"]
-# Uncomment to have rustup auto-install the cross targets build-cross.sh needs:
-# targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# The cross targets the release scripts need, auto-installed by rustup so a
+# fresh pin bump cannot strand build-cross.sh without them (it did, once,
+# the day this file was born).
+targets = [
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
