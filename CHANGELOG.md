@@ -10,6 +10,68 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ## [Unreleased]
 
+## [5.0.0] - 2026-08-31
+
+The version the arrangement became real in — groups that are buses, automation
+that reaches a plugin, a timeline that keeps its promises, and a fourth
+platform.
+
+### Added
+
+- **Folders are buses.** A group used to be a drawing: it indented its rows and
+  changed nothing about the sound. A folder now sums its children in the
+  engine, runs its own rack over that sum, and its fader, pan, send and meter
+  govern the group — so a compressor in a folder's bay is a bus compressor and
+  the meter finally moves. A folder drags its children with it, and they stay
+  its children when it lands.
+- **Automation across four modes**, with plugin parameters as first-class
+  lanes. The master automates like any track, across all six of its bays.
+- **Delay compensation that understands groups.** Every source waits for what
+  it does not already pay: its own rack, plus every rack it is folded through.
+  Drum kits are compensated too — they never were, so with any lookahead plugin
+  loaded the drums played early against everything else.
+- **LV2 hosting on Linux and FreeBSD**, plugin editor windows included. VST3
+  everywhere.
+- **FreeBSD is a supported platform**, with a native OSS backend for cpal
+  beside the ALSA shim, native MIDI, and a package rather than a script.
+- **Sixteen themes with per-theme palettes**, each carrying its own master
+  colour, its own automation dial and its own strip colours — solved against
+  contrast floors rather than picked by eye.
+
+### Changed
+
+- **Nothing saves itself.** Every edit used to reach the disk within a frame,
+  which is an autosave under another name: there was never an unsaved change,
+  so there was nothing to prompt about and no way to walk away from a session
+  without keeping it. New, Open and Quit now ask before they discard anything.
+- **New starts from the shipped template, always.** Seeding the default wrote
+  the LIVE desk and ran on every New — so opening somebody's session and
+  pressing New quietly re-wrote the default with that session's desk.
+- **The app wears its own wordmark**, the Tonnetz lattice the splash and the
+  theory band already draw, drawn a second time for small sizes because a
+  hairline does not survive being resampled into a taskbar.
+
+### Fixed
+
+- **A curve on a fader no longer makes that fader dead.** A lane carrying
+  nothing but its base node had the engine reading the curve and the desk
+  reading the fader, and the two could disagree for ever: one session played
+  28 dB down while its master read 0.0 dB and pushing it did nothing.
+- **A folder is folded exactly once.** Four places put a channel's audio on the
+  bus and each ran the whole strip again over the group — so a stateful plugin
+  advanced at twice real time and put out noise, and a clip on a folder at
+  -6 dB played at -12.
+- **The window icon fits in one X11 request.** The new artwork asked for 24 MB
+  in a single `_NET_WM_ICON`, which poisons the connection rather than being
+  refused as a property — so the app failed to start on Linux and FreeBSD with
+  an error that named neither X11 nor icons.
+- **Quitting with unsaved changes can be discarded.** The prompt's own Discard
+  answer could not dismiss it: the flag it tested was the one the host consumes
+  to close the window, so the question came straight back for ever.
+- **A group is no longer offered as a send destination**, and a route into a
+  track that becomes one is dropped rather than left carrying audio that
+  reaches nothing.
+
 ## [4.5.0] - 2026-08-18
 
 Tangent makes a sound out of the box, and you can hear what you are looking at.
