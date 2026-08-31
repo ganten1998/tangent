@@ -18,7 +18,23 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 VERSION="$(grep '^version' Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
-GLIBC="2.32"   # floor for released Linux binaries
+# The glibc floor for released Linux binaries, and it is 2.30 because of ONE
+# symbol: `gettid`, which glibc grew in 2.30 and std's thread plumbing calls.
+# The floor LOOKED like 2.32 for every 5.0 beta — `pthread_getattr_np` showed
+# up versioned GLIBC_2.32 in the shipped binaries — but that was the pin
+# talking to itself: the function has existed since glibc 2.2.5 in libpthread,
+# 2.32 merely moved it into libc under a new version, and targeting 2.32 makes
+# zig bind the new home. Target 2.30 and it binds the ancient libpthread one
+# (proven by objdump on both bindings, 2026-08-31), so the requirement
+# vanishes — which buys Ubuntu 20.04, Debian 11 and openSUSE Leap 15.4/15.5,
+# all glibc 2.31, all refused by one digit. Do not chase 2.29 without a real
+# 2.29 box: gettid is a weak ref, but weak is not the same as optional.
+# The floor is ENFORCED at package time — check-linux-deps.sh receives it as
+# GLIBC_FLOOR below and refuses any binary whose version refs exceed it — so
+# raising it is a deliberate act that fails loudly, not a drift. Raise the
+# user-facing claims (README.md, docs/RELEASE.md, docs/ARTIFACT-README.md)
+# in the same commit.
+GLIBC="2.30"
 ICON_SRC="assets/tangent.png"
 
 TOOLCHAIN_BIN="$(rustup which cargo 2>/dev/null | xargs dirname || true)"
@@ -109,6 +125,11 @@ gen_ico() {
   # — a taskbar got a black square with a ghost in it. `auto-resize` renders
   # every frame from one source, so the frames are built separately and
   # combined, which is the only way to hint the small ones differently.
+  # **Purpose-drawn small frames beat any amount of thickening.** The
+  # committed `assets/icon-small-square-{16,32,48}.png` are the bold-dot
+  # cut of the mark (letters and rays dropped), drawn once from
+  # `assets/icon-small-square.svg`; the dilate fallback only runs for a
+  # frame whose file is missing.
   if command -v magick >/dev/null 2>&1; then
     local w r small
     w="$(magick identify -format '%w' "$ICON_SRC" 2>/dev/null || echo 0)"
@@ -119,8 +140,12 @@ gen_ico() {
          -modulate 112 "$small" 2>/dev/null; then
       local frames="" fpx fsrc
       for fpx in 256 128 64 48 32 16; do
-        fsrc="$ICON_SRC"; [ "$fpx" -le 48 ] && fsrc="$small"
-        magick "$fsrc" -resize "${fpx}x${fpx}" "$tmp/$fpx.png" || { rm -rf "$tmp"; return 1; }
+        if [ "$fpx" -le 48 ] && [ -f "assets/icon-small-square-$fpx.png" ]; then
+          cp "assets/icon-small-square-$fpx.png" "$tmp/$fpx.png"
+        else
+          fsrc="$ICON_SRC"; [ "$fpx" -le 48 ] && fsrc="$small"
+          magick "$fsrc" -resize "${fpx}x${fpx}" "$tmp/$fpx.png" || { rm -rf "$tmp"; return 1; }
+        fi
         frames="$frames $tmp/$fpx.png"
       done
       # shellcheck disable=SC2086
@@ -173,77 +198,12 @@ mkdir -p dist
 # Windows icon must exist BEFORE cargo builds so build.rs embeds it.
 gen_ico
 
-# sign_windows_exe <path/to/tangent.exe> — Authenticode-sign via Azure Artifact
-# Signing (formerly Trusted Signing) using jsign, which unlike Microsoft's
-# signtool runs on macOS/Linux. No certificate ever touches this machine: jsign
-# sends the file hash to Azure, Microsoft's HSM signs it and returns the
-# signature.
-#
-# Unconfigured => the exe ships UNSIGNED (today's behavior) and the build says
-# so once. PARTIALLY configured => hard failure, because silently shipping an
-# unsigned binary while believing it is signed is the worst outcome here.
-#
-# Setup (see docs/RELEASE.md § Windows):
-#   brew install jsign            # needs a JRE
-#   brew install azure-cli        # only for the default token path
-#   export TRUSTED_SIGNING_ENDPOINT=https://eus.codesigning.azure.net
-#   export TRUSTED_SIGNING_ACCOUNT=<your-account>
-#   export TRUSTED_SIGNING_PROFILE=<your-certificate-profile>
-#   # token: taken from `az account get-access-token` unless you set
-#   # TRUSTED_SIGNING_TOKEN yourself (e.g. from a CI federated credential).
-sign_windows_exe() {
-  local exe="$1"
-  local set_count=0
-  for v in "${TRUSTED_SIGNING_ENDPOINT:-}" "${TRUSTED_SIGNING_ACCOUNT:-}" \
-           "${TRUSTED_SIGNING_PROFILE:-}"; do
-    [ -n "$v" ] && set_count=$((set_count + 1))
-  done
-
-  if [ "$set_count" = 0 ]; then
-    echo "    (unsigned: TRUSTED_SIGNING_* not set — Windows will show SmartScreen)"
-    return 0
-  fi
-  if [ "$set_count" != 3 ]; then
-    echo "TRUSTED_SIGNING_* is only partially set — refusing to ship a silently" >&2
-    echo "unsigned exe. Set ENDPOINT, ACCOUNT and PROFILE, or none of them." >&2
-    return 1
-  fi
-
-  command -v jsign >/dev/null 2>&1 || {
-    echo "jsign not found (brew install jsign) but TRUSTED_SIGNING_* is set." >&2
-    return 1
-  }
-
-  local token="${TRUSTED_SIGNING_TOKEN:-}"
-  if [ -z "$token" ]; then
-    command -v az >/dev/null 2>&1 || {
-      echo "Need an access token: install azure-cli, or set TRUSTED_SIGNING_TOKEN." >&2
-      return 1
-    }
-    token="$(az account get-access-token \
-      --resource https://codesigning.azure.net \
-      --query accessToken -o tsv)" || {
-      echo "az could not get a token — run 'az login' first." >&2; return 1; }
-  fi
-
-  echo "==> Signing $(basename "$exe") via Azure Artifact Signing"
-  # RFC-3161 timestamp so the signature outlives the short-lived certificate.
-  jsign --storetype TRUSTEDSIGNING \
-        --keystore "$TRUSTED_SIGNING_ENDPOINT" \
-        --storepass "$token" \
-        --alias "${TRUSTED_SIGNING_ACCOUNT}/${TRUSTED_SIGNING_PROFILE}" \
-        --tsaurl http://timestamp.acs.microsoft.com \
-        --name "Tangent" \
-        "$exe" || { echo "jsign failed — exe NOT signed" >&2; return 1; }
-
-  # Best-effort local check; real proof is a first launch on Windows.
-  if command -v osslsigncode >/dev/null 2>&1; then
-    osslsigncode verify "$exe" 2>&1 | grep -iE "signature|signer|timestamp" \
-      | head -4 | sed 's/^/    /' || true
-  else
-    echo "    (install osslsigncode to verify the signature here)"
-  fi
-}
+# Authenticode signing lives in scripts/sign-windows.sh (jsign to Azure
+# Artifact Signing; unconfigured ships unsigned and says so, partially
+# configured is a hard failure). It moved out of this file the day the NSIS
+# setup.exe started being signed too: SmartScreen judges the OUTER installer,
+# so the inner exe and the installer must take the SAME route, and one script
+# with two callers is how they are kept from drifting apart.
 
 # ensure_alsa_sysroot — the thing that made Linux cross-builds impossible here.
 #
@@ -256,10 +216,15 @@ sign_windows_exe() {
 #
 # **Debian BULLSEYE, not bookworm, and that is the entire trick.** Bookworm's
 # libasound is built against glibc 2.36 and its .so references `lstat64@2.33`,
-# `dlsym@2.34` and friends; linking it while targeting the 2.32 floor this
+# `dlsym@2.34` and friends; linking it while targeting the glibc floor this
 # script sets fails with a page of undefined references that look like a broken
-# toolchain and are actually a version skew. Bullseye is glibc 2.31, below the
-# floor, so nothing it references is newer than what we target.
+# toolchain and are actually a version skew. What matters is not the glibc a
+# distro RUNS but the newest symbol version its .so files demand: bullseye
+# ships glibc 2.31, yet its libasound/lilv stack references nothing past
+# GLIBC_2.29 (measured on both arches, 2026-08-31), which is under the 2.30
+# floor — so the sysroot survived the floor's move from 2.32 and would survive
+# 2.30 exactly until somebody swaps the suite, which is what this comment is
+# for.
 #
 # **And LILV, since LV2 arrived.** `lilv` is the reference LV2 host library and
 # the crate of that name has a build script that asks pkg-config for `lilv-0`
@@ -363,7 +328,11 @@ package_linux() { # $1 = rust target, $2 = artifact arch name
   # The list and the reasoning live in one place, shared with
   # `build-linux-native.sh`, because two copies of it would disagree the first
   # time somebody edited one — which is the very failure it guards against.
-  scripts/check-linux-deps.sh "$stage/tangent" || { rm -rf "$stage"; return 1; }
+  # GLIBC_FLOOR makes the check also refuse a binary whose symbol-version refs
+  # exceed the floor zigbuild just targeted — the number the README advertises
+  # and the loader enforces (see the comment at GLIBC= above).
+  GLIBC_FLOOR="$GLIBC" scripts/check-linux-deps.sh "$stage/tangent" \
+    || { rm -rf "$stage"; return 1; }
   cp assets/tangent.desktop "$stage/tangent.desktop" || { rm -rf "$stage"; return 1; }
   cp assets/tangent.png "$stage/tangent.png" || { rm -rf "$stage"; return 1; }
   cp assets/fonts/CourierPrime-Regular.ttf assets/fonts/CourierPrime-Bold.ttf \
@@ -482,7 +451,7 @@ WINZIP="${WINSTAGE}.zip"
 rm -rf "$WINSTAGE" "$WINZIP"
 mkdir -p "$WINSTAGE"
 cp target/x86_64-pc-windows-msvc/release/tangent.exe "$WINSTAGE/"
-sign_windows_exe "$WINSTAGE/tangent.exe"
+scripts/sign-windows.sh "$WINSTAGE/tangent.exe"
 # Steinberg's required notice, when the ASIO backend rode in.
 if [ -n "${CPAL_ASIO_DIR:-}" ]; then
   printf '%s\n' "ASIO is a trademark and software of Steinberg Media Technologies GmbH." > "$WINSTAGE/ASIO-NOTICE.txt"
@@ -505,22 +474,34 @@ cp docs/ARTIFACT-README.md "$WINSTAGE/README.txt"
 # Archive whatever was staged above. A hand-maintained file list silently drops
 # anything newly added — that is how the readme went missing from the macOS
 # artifacts before 2.1.0.
-# **The zip is a TRANSIENT installer input, not a deliverable.** The owner
-# ships Windows as the NSIS setup.exe alone — a portable zip is a second
-# thing to explain to a tester and a second way for the install to go
-# wrong. It is still built here because `build-installer.sh` unzips exactly
-# it (so the installed files can never drift from a staging dir), then it is
-# removed the moment the installer exists.
+# **The zip is a DELIVERABLE again, as well as the installer's input.** It was
+# briefly demoted to a transient — deleted the moment setup.exe existed, on
+# the ruling that one Windows download is one thing to support — but the
+# versionless permalinks derived from it, `tangent-windows-x86_64.zip` and the
+# legacy `ivory-windows-x86_64.zip`, are already printed in README.md, on the
+# store page and in every supporter email sent, and `publish-github.sh` can
+# only upload an alias for a file that actually exists in dist/. Deleting the
+# zip here meant the FIRST stable publish would silently drop both aliases and
+# every one of those links would 404 — for exactly the people who paid (see
+# publish-github.sh's header: uploading the aliases is the release contract).
+# `build-installer.sh` still unzips exactly this file, so the installed files
+# and the portable files can never drift apart.
 (cd "$WINSTAGE" && zip -qr "$ROOT/$WINZIP" . -x '.DS_Store' '._*')
 rm -rf "$WINSTAGE"
+echo "==> $WINZIP"
 if command -v makensis >/dev/null 2>&1; then
   scripts/build-installer.sh windows
-  rm -f "$WINZIP"
-  echo "==> dist/Tangent-${VERSION}-windows-setup.exe  (portable zip removed)"
+  # SmartScreen judges the OUTER PE, so the installer takes the same signing
+  # route as the inner exe. After makensis, necessarily: NSIS writes its
+  # output last, and Authenticode is appended to the finished PE (the NSIS
+  # CRC lives inside it and is untouched — signing post-build is the standard
+  # flow). release.sh refuses an unsigned setup.exe at artifact-check time.
+  scripts/sign-windows.sh "dist/Tangent-${VERSION}-windows-setup.exe"
+  echo "==> dist/Tangent-${VERSION}-windows-setup.exe"
 else
-  # No installer toolchain: keep the zip rather than ship nothing, but say
-  # loudly that the deliverable the owner wants was NOT produced.
-  echo "WARNING: makensis not found — built NO installer and LEFT the portable zip." >&2
+  # No installer toolchain: the zip alone is a real deliverable, but the
+  # setup.exe the store links is NOT produced — say so loudly.
+  echo "WARNING: makensis not found — built NO installer, only the portable zip." >&2
   echo "         Install it with: brew install makensis, then rerun." >&2
 fi
 
