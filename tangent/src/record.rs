@@ -2255,7 +2255,24 @@ impl Session {
                 .audio
                 .frames_expected
                 .saturating_sub(manifest.audio.frames);
-            if short as f64 > SHORT_TOLERANCE_FRAMES * nominal {
+            // **Only against a clock that was actually fitted.**
+            //
+            // `frames_expected` is `duration_seconds` through the timeline, and
+            // `duration_seconds` is only a MEASUREMENT when something was being
+            // sampled by a crystal — which is exactly the distinction
+            // `ClockKind` exists to keep, and which its own doc puts better
+            // than this comment can: "0 ppm from a real fit and 0 ppm from no
+            // fit at all look identical in a number and mean opposite things."
+            //
+            // The same is true one field over. Against a synthetic clock the
+            // duration is not a span anybody measured, and comparing frames to
+            // it produces a confident number about nothing: it reported a take
+            // as 23 s short of a take that lasted a tenth of a second. A
+            // problem raised on that basis would be worse than the silence it
+            // replaced, because it would be believed.
+            if manifest.clock == tangent_record::take::ClockKind::Fitted
+                && short as f64 > SHORT_TOLERANCE_FRAMES * nominal
+            {
                 problem.get_or_insert_with(|| {
                     format!(
                         "the recording is {:.2} s shorter than the take: {} frames \
