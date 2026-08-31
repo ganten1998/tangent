@@ -230,23 +230,37 @@ pub fn surface(
                 report.focused = focused;
                 report.pointer_over = Some(pointer_over);
                 report.close |= close_req || esc;
-                // **Asked for on the reveal, because it was born invisible.**
-                // `with_active` is a creation-time attribute and an invisible
-                // window is not a window anybody can focus, so without this a
-                // dialog could come up unable to hear Escape — which is the
-                // only way some of them close. Only for surfaces that asked to
-                // take focus: the submenu passes `takes_focus: false` because
+                // **The LEVEL is asked for on the reveal, and it is not a focus
+                // matter.**
+                //
+                // `with_window_level` is a creation-time attribute exactly as
+                // `with_active` is, and these surfaces are born INVISIBLE — so
+                // the level set in the builder is applied to a window the
+                // manager has not mapped yet, and on X11 it does not survive
+                // being shown. It has to be asked for again once the window is
+                // real, the same way focus is.
+                //
+                // This used to be inside the focus branch below, which meant a
+                // surface that deliberately does not take focus never asked at
+                // all. The notice was exactly that: `takes_focus: false` so a
+                // message arriving mid-edit cannot move the caret, `on_top:
+                // true` and no way to say so. It landed in the NORMAL layer —
+                // under the Setup window it was reporting on, and under the
+                // desktop's own panels. The owner saw a device-change message
+                // appear below the panel he had just changed the device in.
+                if spec.on_top && (revealing || spec.raise) {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                        egui::WindowLevel::AlwaysOnTop,
+                    ));
+                }
+                // **Focus, separately, and only for surfaces that want it.**
+                // `with_active` is creation-time and an invisible window is not
+                // a window anybody can focus, so without this a dialog could
+                // come up unable to hear Escape — which is the only way some of
+                // them close. The submenu passes `takes_focus: false` because
                 // stealing it from the menu is what closes the menu.
                 if (revealing && spec.takes_focus) || spec.raise {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
-                    // The level as well as the focus: a window manager that
-                    // dropped the request the first time gets asked again, and
-                    // on the one that honoured it this changes nothing.
-                    if spec.on_top {
-                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-                            egui::WindowLevel::AlwaysOnTop,
-                        ));
-                    }
                 }
                 add(ui, &mut body_wants_close);
             });
