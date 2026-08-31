@@ -4346,25 +4346,51 @@ pub fn show(
                                             RichText::new(name).font(plain(11.0)).color(t.text),
                                         );
                                         // **What is RUNNING, and — when they
-                                        // differ — what was asked for.**
+                                        // differ — what was asked for and WHY
+                                        // it was not granted.**
                                         //
-                                        // A device's buffer size belongs to
-                                        // the DEVICE: another host holding the
-                                        // same interface dictates it, and the
-                                        // request is simply not granted. The
-                                        // panel used to print the request, so
-                                        // it read 128 while the room ran 512
-                                        // and nothing anywhere said so.
+                                        // The panel used to print the request,
+                                        // so it read 128 while the room ran 512
+                                        // and nothing anywhere said so. Naming
+                                        // both numbers fixed that and left a
+                                        // worse problem: it also named a CAUSE,
+                                        // "another app owns this device", which
+                                        // is the CoreAudio answer. There,
+                                        // another host holding the interface
+                                        // really does dictate the size.
+                                        //
+                                        // On a PipeWire machine it is the GRAPH,
+                                        // and no second app need exist. One
+                                        // user was told that about a machine
+                                        // running nothing else, while the
+                                        // number that actually decided it sat
+                                        // in a config file the app had never
+                                        // mentioned — so the message was not
+                                        // merely wrong, it pointed away from
+                                        // the only thing that would have helped.
+                                        //
+                                        // So: say the floor when the floor is
+                                        // knowable, and say nothing about cause
+                                        // when it is not. An unexplained number
+                                        // is a smaller failure than a confident
+                                        // wrong explanation.
                                         let real = s.observed_frames.or(s.buffer_frames);
+                                        let asked = s.buffer_frames.unwrap_or(0);
                                         let buf = match (real, s.buffer_ms()) {
                                             (Some(f), Some(ms)) if s.honoured() => {
                                                 format!("{f} frames  ({ms:.1} ms)")
                                             }
-                                            (Some(f), Some(ms)) => format!(
-                                                "{f} frames  ({ms:.1} ms)  - asked for {}, \
-                                                 another app owns this device",
-                                                s.buffer_frames.unwrap_or(0)
-                                            ),
+                                            (Some(f), Some(ms)) => match status.graph_floor {
+                                                Some(floor) if asked < floor => format!(
+                                                    "{f} frames  ({ms:.1} ms)  - asked for \
+                                                     {asked}; this machine's audio graph will \
+                                                     not serve below {floor}"
+                                                ),
+                                                _ => format!(
+                                                    "{f} frames  ({ms:.1} ms)  - asked for \
+                                                     {asked}, and the device gave this instead"
+                                                ),
+                                            },
                                             // The device chose and did not say
                                             // what it chose — which is what
                                             // cpal's `BufferSize::Default`
