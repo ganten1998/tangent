@@ -318,6 +318,83 @@ fn acquire_single_instance() -> bool {
     }
 }
 
+/// **A window icon has to fit in one X11 request, and the artwork does not.**
+///
+/// X11 carries the icon in a single `ChangeProperty` on `_NET_WM_ICON`: two
+/// words of size followed by one 32-bit pixel each. The server here caps a
+/// request at 16 MB even with BIG-REQUESTS negotiated, and the wordmark is
+/// 2486×2476 — about 24.6 MB. Over the line, and not by a little.
+///
+/// What that costs is the whole application, not the icon. winit sets the
+/// icon while it is still building the window, an oversized request is a
+/// CONNECTION error rather than a rejected property, and the connection it
+/// poisons is the one glutin is about to ask for a config. The user sees
+/// "Found no glutin configs matching the template", which names neither X11
+/// nor an icon, and the app never opens.
+///
+/// So it is capped here rather than left to fail: 128 px is what every
+/// desktop actually draws in a titlebar, an alt-tab switcher or a dock, and
+/// scaling artwork nobody sees at full size costs nothing. The ASSET keeps
+/// its resolution — the packaged hicolor icons and the macOS bundle still
+/// ship the real thing.
+///
+/// Not gated to X11. A 24 MB texture is waste on every platform, this is
+/// the one place all of them pass through, and a cap that only exists where
+/// somebody already got hurt is a cap that gets forgotten.
+fn shrink_icon_for_x11(icon: egui::IconData) -> egui::IconData {
+    /// Comfortably inside every limit: 128×128 is 65 544 bytes, under even
+    /// the 262 140-byte classic maximum that applies without BIG-REQUESTS.
+    const MAX_EDGE: u32 = 128;
+    if icon.width <= MAX_EDGE && icon.height <= MAX_EDGE {
+        return icon;
+    }
+    let (w, h) = (icon.width as usize, icon.height as usize);
+    if icon.rgba.len() != w * h * 4 {
+        // The buffer did not match the dimensions it claimed. Nothing safe
+        // to scale, and artwork is never worth refusing to start over.
+        eprintln!("the app icon's pixels do not match its size; going without one");
+        return egui::IconData { rgba: Vec::new(), width: 0, height: 0 };
+    }
+    // A box filter over the source cell each destination pixel covers.
+    // Written out rather than pulled from `image`, which is a transitive
+    // dependency here and not a direct one — twenty lines is cheaper than a
+    // manifest entry for artwork nobody inspects at this size.
+    //
+    // Averaged PREMULTIPLIED, then un-premultiplied. Averaging straight RGBA
+    // lets a fully transparent pixel's colour — often black, and arbitrary —
+    // pull the colour of its opaque neighbours, which is what puts a dark
+    // fringe around a scaled-down logo.
+    let edge = MAX_EDGE as usize;
+    let mut out = vec![0u8; edge * edge * 4];
+    for dy in 0..edge {
+        let (y0, y1) = (dy * h / edge, (((dy + 1) * h) / edge).max(dy * h / edge + 1));
+        for dx in 0..edge {
+            let (x0, x1) = (dx * w / edge, (((dx + 1) * w) / edge).max(dx * w / edge + 1));
+            let (mut r, mut g, mut b, mut a, mut n) = (0u64, 0u64, 0u64, 0u64, 0u64);
+            for sy in y0..y1.min(h) {
+                for sx in x0..x1.min(w) {
+                    let p = (sy * w + sx) * 4;
+                    let al = u64::from(icon.rgba[p + 3]);
+                    r += u64::from(icon.rgba[p]) * al;
+                    g += u64::from(icon.rgba[p + 1]) * al;
+                    b += u64::from(icon.rgba[p + 2]) * al;
+                    a += al;
+                    n += 1;
+                }
+            }
+            let d = (dy * edge + dx) * 4;
+            // `a` is the sum of alphas, so it is also the premultiplied
+            // weight; dividing by it is the un-premultiply.
+            let (rr, gg, bb) = if a == 0 { (0, 0, 0) } else { (r / a, g / a, b / a) };
+            out[d] = rr as u8;
+            out[d + 1] = gg as u8;
+            out[d + 2] = bb as u8;
+            out[d + 3] = if n == 0 { 0 } else { (a / n) as u8 };
+        }
+    }
+    egui::IconData { rgba: out, width: MAX_EDGE, height: MAX_EDGE }
+}
+
 fn main() {
     #[cfg(windows)]
     attach_console();
@@ -403,7 +480,7 @@ fn main() {
     let icon_png: &[u8] = &include_bytes!("../../assets/tangent.png")[..];
 
     match eframe::icon_data::from_png_bytes(icon_png) {
-        Ok(icon) => viewport = viewport.with_icon(icon),
+        Ok(icon) => viewport = viewport.with_icon(shrink_icon_for_x11(icon)),
         Err(err) => eprintln!("could not decode assets/tangent.png as the app icon: {err}"),
     }
 
@@ -548,5 +625,91 @@ mod catalog_tests {
             .find(|(p, _, _)| p.to_string_lossy().contains("Pianoteq"))
             .expect("the bundle handed in should come back");
         assert_eq!(row.2, None, "a VST3 row must not carry a display name");
+    }
+}
+
+#[cfg(test)]
+mod icon_tests {
+    use super::shrink_icon_for_x11;
+
+    /// **The window icon fits in one X11 request.**
+    ///
+    /// `_NET_WM_ICON` is a single `ChangeProperty`: two words of size and then
+    /// one 32-bit pixel each. Go past the server's maximum and X11 answers with
+    /// a CONNECTION error, not a rejected property — which happens while winit
+    /// is still building the window, and poisons the connection glutin is about
+    /// to ask for a config. The app then dies reporting "Found no glutin configs
+    /// matching the template", which names neither the icon nor X11.
+    ///
+    /// That is not hypothetical. `assets/tangent.png` became a 2486×2476
+    /// wordmark, which needs 24.6 MB in one request against a 16 MB ceiling, and
+    /// Tangent stopped launching on FreeBSD/X11 entirely.
+    #[test]
+    fn the_window_icon_fits_in_one_x11_request() {
+        // What a server guarantees WITHOUT BIG-REQUESTS negotiated, which is
+        // the floor worth holding: 262 140 bytes.
+        const CLASSIC_MAX_BYTES: usize = 65_535 * 4;
+
+        let png = include_bytes!("../../assets/tangent.png");
+        let decoded = eframe::icon_data::from_png_bytes(png).expect("the shipped icon must decode");
+        let shrunk = shrink_icon_for_x11(decoded);
+
+        let request = (shrunk.width as usize * shrunk.height as usize + 2) * 4;
+        assert!(
+            request <= CLASSIC_MAX_BYTES,
+            "the app icon needs {request} bytes in one X11 request, over the \
+             {CLASSIC_MAX_BYTES} a server promises without BIG-REQUESTS: \
+             {}x{}",
+            shrunk.width,
+            shrunk.height
+        );
+        assert_eq!(
+            shrunk.rgba.len(),
+            shrunk.width as usize * shrunk.height as usize * 4,
+            "the scaled icon's buffer does not match the size it reports"
+        );
+    }
+
+    /// An icon already small enough is handed back untouched — no resampling
+    /// of artwork that was authored at the right size.
+    #[test]
+    fn a_small_icon_is_left_alone() {
+        let icon = egui::IconData { rgba: vec![7u8; 64 * 64 * 4], width: 64, height: 64 };
+        let out = shrink_icon_for_x11(icon);
+        assert_eq!((out.width, out.height), (64, 64));
+        assert!(out.rgba.iter().all(|b| *b == 7), "the pixels were resampled");
+    }
+
+    /// A transparent border must not darken the art. Averaging straight RGBA
+    /// lets a clear pixel's arbitrary colour bleed into its opaque neighbours,
+    /// which is the fringe that shows up around a scaled-down logo.
+    #[test]
+    fn transparent_pixels_do_not_bleed_into_the_colour() {
+        // Half opaque white, half fully transparent black.
+        let (w, h) = (256usize, 256usize);
+        let mut rgba = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let p = (y * w + x) * 4;
+                if x < w / 2 {
+                    rgba[p] = 255;
+                    rgba[p + 1] = 255;
+                    rgba[p + 2] = 255;
+                    rgba[p + 3] = 255;
+                }
+            }
+        }
+        let out = shrink_icon_for_x11(egui::IconData {
+            rgba,
+            width: w as u32,
+            height: h as u32,
+        });
+        // Sample well inside the opaque half: it must still be white, not grey.
+        let p = ((out.height as usize / 2) * out.width as usize + 8) * 4;
+        assert!(
+            out.rgba[p] > 250 && out.rgba[p + 1] > 250 && out.rgba[p + 2] > 250,
+            "transparent black bled into the opaque white: {:?}",
+            &out.rgba[p..p + 4]
+        );
     }
 }
