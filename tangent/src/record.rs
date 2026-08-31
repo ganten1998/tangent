@@ -2287,6 +2287,41 @@ impl Session {
             // driving the tap by hand — which also sometimes fits a clock
             // from those hand stamps, which is why gating on `Fitted` alone
             // FLAKED: same test, green one run, red the next, on timing.
+            // **A fitted rate far from nominal is not drift — it is the
+            // device not delivering its rate, and the whole take is wrong by
+            // the ratio.** A crystal lies by parts per million; the failure
+            // this catches lies by factors. Measured on the machine it was
+            // written for: a capture ring smaller than the PipeWire graph's
+            // cycle delivered exactly half the frames — stamps honest, every
+            // drop counter clean — and the fit reported −500,000 ppm while a
+            // fifteen-second performance was written as a "7.5-second" take
+            // whose audio plays at double speed against its own video. The
+            // fit measured the fault perfectly and nothing read the number.
+            // `open_input` now sizes the ring so that particular cause is
+            // gone; this alarm is for whatever finds the next way, because
+            // the fit will see that one too. One percent is orders of
+            // magnitude beyond any honest clock and far below any delivery
+            // fault worth waking someone for.
+            if rate_is_a_fault(
+                self.audio.is_some(),
+                manifest.clock,
+                manifest.audio.epsilon_ppm,
+            ) {
+                problem.get_or_insert_with(|| {
+                    format!(
+                        "the input delivered {:.0} Hz against its nominal {:.0} Hz. \
+                         The take's timeline is wrong by that ratio: its duration, \
+                         its audio speed and its sync against the video are all \
+                         off together. Something between the device and the app \
+                         is discarding or inventing frames",
+                        manifest
+                            .audio
+                            .true_rate
+                            .unwrap_or(manifest.audio.nominal_rate),
+                        manifest.audio.nominal_rate,
+                    )
+                });
+            }
             // The incident this check exists for (19 s of audio in a 30 s
             // take, `complete: true`) was device-backed, and stays caught.
             // A desk-side stall still lands in the manifest as data —
@@ -2410,6 +2445,23 @@ pub fn available_bytes(path: &std::path::Path) -> Option<u64> {
         probe = probe.parent()?;
     }
     platform_available_bytes(probe)
+}
+
+/// Whether a take's measured rate is a delivery fault rather than a clock.
+///
+/// The gate in `Session::stop` in a shape a test can hold still. All three
+/// conditions are load-bearing: only a DEVICE-fed take has a delivery to be at
+/// fault (`device_fed` — the desk cannot halve); only a FITTED clock measured
+/// anything (a synthetic epsilon is zero by definition, and alarming on filler
+/// would alarm on every desk-only take); and the threshold sits where no
+/// honest clock can reach and no delivery fault can hide. Crystals drift by
+/// parts per million — hundreds at the very worst — while the fault family
+/// this catches works in ratios of small integers: the measured incident was
+/// −499,993 ppm, a capture ring keeping exactly half of every graph cycle.
+const RATE_ALARM_PPM: f64 = 10_000.0;
+
+fn rate_is_a_fault(device_fed: bool, clock: take::ClockKind, epsilon_ppm: f64) -> bool {
+    device_fed && clock == take::ClockKind::Fitted && epsilon_ppm.abs() > RATE_ALARM_PPM
 }
 
 #[cfg(unix)]
@@ -2814,6 +2866,29 @@ mod tests {
         // it refused, not the ones it took.
         assert!(report.frames > 0, "the file should hold what did fit");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The rate alarm fires on delivery faults and never on clocks.**
+    ///
+    /// Every arm of the gate, pinned: the measured incident (a capture ring
+    /// keeping half of every PipeWire cycle read −499,993 ppm on a device-fed,
+    /// fitted take) must alarm; every honest crystal — which lies by parts per
+    /// million, hundreds at the very worst — must not; a synthetic clock's
+    /// epsilon is zero by definition and even a garbage value there is filler,
+    /// not measurement; and a take with no input device has no delivery to be
+    /// at fault, however strange its numbers. The last two arms are the
+    /// short-take gate's lesson written down before it has to be relearned:
+    /// each guard looks redundant beside its neighbours right up until one of
+    /// them is removed.
+    #[test]
+    fn a_halved_delivery_raises_the_rate_alarm_and_a_crystal_never_does() {
+        use tangent_record::take::ClockKind;
+        assert!(rate_is_a_fault(true, ClockKind::Fitted, -499_992.6));
+        assert!(rate_is_a_fault(true, ClockKind::Fitted, 499_992.6));
+        assert!(!rate_is_a_fault(true, ClockKind::Fitted, 180.0));
+        assert!(!rate_is_a_fault(true, ClockKind::Fitted, -3_000.0));
+        assert!(!rate_is_a_fault(true, ClockKind::Synthetic, -499_992.6));
+        assert!(!rate_is_a_fault(false, ClockKind::Fitted, -499_992.6));
     }
 
     /// The ring is drained even when no take is running, for the reason the
