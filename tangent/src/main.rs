@@ -424,6 +424,9 @@ fn crash_report(msg: &str, location: &str, backtrace: &str) -> String {
 /// unless the user mails the file themselves.
 fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
+        // A dying process still gives the graph clock back — one spawned
+        // pw-metadata, best effort, before anything slower.
+        tangent_record::audio::release_graph_claim();
         let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
             (*s).to_owned()
         } else if let Some(s) = info.payload().downcast_ref::<String>() {
@@ -622,6 +625,14 @@ fn main() {
         log::info!("removed the pre-5.0 ~/.config/tangent");
     }
 
+    // **The graph-clock claim's crash road.** The claim (see
+    // `tangent_record::audio::claim_graph_clock`) releases on every clean
+    // exit; a crash cannot, so each launch checks whether the force still
+    // on the graph is its own predecessor's and takes it off. No-op
+    // everywhere but Linux.
+    tangent_record::audio::set_claim_marker(tangent_core::config::dir().join("graph-claim"));
+    tangent_record::audio::recover_graph_claim();
+
     // The earliest legal moment — see the ordering comment above and the one
     // on the function. Everything the logger says from here on is on disk.
     attach_log_file();
@@ -789,6 +800,9 @@ fn main() {
     // (or falling off `main`) is precisely what detonates.
     //
     // Every serious host does this, for this exact reason.
+    // The graph clock goes back before the process does anything else —
+    // `_exit` skips atexit, so nothing later can put it back for us.
+    tangent_record::audio::release_graph_claim();
     use std::io::Write as _;
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();

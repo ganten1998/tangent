@@ -7963,6 +7963,31 @@ impl Engine {
             ring: buffer_ring,
         } = match dev.as_ref() {
             Some((_, _, supported, rule)) => {
+                // **The output claims the graph clock too.** On a PipeWire
+                // desktop whose floor is coarser than the ask, the OUTPUT
+                // period is what the room hears the latency of — and the
+                // owner's ruling is that the person at the microphone
+                // outranks the machine's config. The claim is idempotent
+                // with the capture side's (one static, finest ask wins) and
+                // every exit road releases it.
+                #[cfg(target_os = "linux")]
+                if *rule == BufferRule::Ring
+                    && tangent_record::audio::pipewire_pcm_route_applies()
+                {
+                    // The same choice chain `pick_buffer` walks — setting,
+                    // then the dev override, then the default — because the
+                    // people this ruling exists for never set a buffer at
+                    // all, and a claim gated on an explicit ask would skip
+                    // exactly them.
+                    let want = asked_buffer
+                        .or_else(|| {
+                            std::env::var("IVORY_OUT_BUFFER")
+                                .ok()
+                                .and_then(|v| v.parse::<u32>().ok())
+                        })
+                        .unwrap_or(WANT_BUFFER_FRAMES);
+                    let _ = tangent_record::audio::claim_graph_clock(want);
+                }
                 pick_buffer(supported.buffer_size(), asked_buffer, *rule)
             }
             // Offline renders in MAX_BLOCK bites; the "buffer" is a label.
