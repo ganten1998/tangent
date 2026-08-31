@@ -36,3 +36,4 @@ build/*
 # Core dumps. FreeBSD writes <progname>.core beside the binary, and one of
 # these is 87 MB of address space that no reader of this repository wants.
 *.core
+__pycache__/
