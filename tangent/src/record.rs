@@ -199,6 +199,10 @@ struct AudioReport {
     /// Read from the source clock, not rebuilt: the anchor, the jitter and the
     /// latency term all belong to the object that measured them.
     source: take::SourceReport,
+    /// How far ahead of its callback the backend said this audio would be
+    /// heard. `None` where it declined to say. See `take::AudioReport` for why
+    /// this is here and not in `source.latency_ns`, which means the opposite.
+    output_delay_ns: Option<Nanos>,
     /// Whatever went wrong, in words meant for the user.
     error: Option<String>,
 }
@@ -594,6 +598,11 @@ impl Writer {
             channels: self.tracker.channels() as u16,
             source: take::SourceReport::from_clock("audio input", self.clock.source())
                 .with_fit(self.clock.fit()),
+            // The desk's ring is always part of this take too — see
+            // `frames_dropped` above — so the delay its half was heard at
+            // belongs in the manifest even when the file is mostly microphone.
+            // `None` when nothing is playing back or the backend declined.
+            output_delay_ns: self.plugin.as_ref().and_then(|t| t.output_delay_ns()),
             error: self.error.take(),
         }
     }
@@ -2203,6 +2212,7 @@ impl Session {
             manifest.audio.frames = r.frames;
             manifest.audio.peak_dbfs = f64::from(audio::dbfs(r.take_peak));
             manifest.audio.clipped = r.clipped_samples > 0;
+            manifest.audio.output_delay_ns = r.output_delay_ns;
             manifest.sources.push(r.source.clone());
             // The device stopped answering. RECORDER-PLAN §4's policy is to
             // finalise what exists and mark it incomplete — a `.wav` of eight
@@ -3990,6 +4000,11 @@ impl PluginWriter {
                 observations,
                 jitter_ns: None,
             },
+            // The engine's own measurement, carried by the tap because the tap
+            // and the engine share one `Shared`. Read here rather than at Start
+            // because it is stored by every callback and Start is before the
+            // first one.
+            output_delay_ns: self.tap.as_ref().and_then(|t| t.output_delay_ns()),
             error: self.error.take(),
         }
     }
