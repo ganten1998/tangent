@@ -12,8 +12,8 @@ landing in spam is the worst failure mode there is.
 Registrar: **Porkbun** (simple, free WHOIS privacy) or **Cloudflare Registrar**
 (sold at cost, no renewal markup — but DNS must live at Cloudflare).
 
-Something like `ivorymidi.com`. Slightly distinctive beats bare "ivory": better
-for search, and a little daylight from Synthogy for free.
+The live one is `tangentdaw.org`. Slightly distinctive beats bare "tangent":
+better for search.
 
 ## 2. Resend (free: 3,000 emails/month)
 
@@ -22,8 +22,11 @@ for search, and a little daylight from Synthogy for free.
    suggestion. Add them at your registrar's DNS panel, verbatim.
 3. Wait for "Verified" (minutes to an hour).
 4. **API Keys → Create** → copy it. This is `RESEND_API_KEY`.
-5. Your sender will be something like `Ivory <keys@ivorymidi.com>` —
-   that is `MAIL_FROM`. The mailbox does not need to exist to SEND.
+5. Your sender will be something like `Tangent <keys@tangentdaw.org>` —
+   that is `MAIL_FROM`. The mailbox does not need to exist to SEND, which is
+   why `MAIL_REPLY_TO` must be an inbox that RECEIVES (the branded
+   `keys@tangentdaw.org` receives only via a registrar forwarding rule; the
+   code falls back to `tangentdaw@gmail.com` when unset).
 
 ## 3. Gumroad access token
 
@@ -34,6 +37,14 @@ verify each sale is real before minting anything.
 Note your **seller id** too (visible in the Ping payload, or your profile URL)
 for `GUMROAD_SELLER_ID` — a cheap first-pass rejection.
 
+Set `GUMROAD_PRODUCT_ID` as well: fetch any real sale with
+`curl "https://api.gumroad.com/v2/sales/<sale_id>?access_token=<token>"` and
+copy its `product_id` (the product permalink also works). Without it, a sale
+of ANY product on the account mints a Tangent supporter key. The service also
+refuses refunded, charged-back and disputed sales outright, and refuses
+Gumroad *test* sales unless `GUMROAD_ALLOW_TEST` is set — the step 6 discount
+purchase is a real sale, not a test sale, so leave that unset.
+
 ## 4. Deploy (~$2/month)
 
 ```sh
@@ -42,20 +53,30 @@ fly auth signup            # or: fly auth login
 cd <repo root>             # IMPORTANT: the Dockerfile needs tangent-core
 
 fly launch --no-deploy --copy-config -c tools/tangent-fulfil/fly.toml
-fly volumes create ivory_data --size 1 -c tools/tangent-fulfil/fly.toml
+fly volumes create tangent_data --size 1 -c tools/tangent-fulfil/fly.toml
 
 fly secrets set -c tools/tangent-fulfil/fly.toml \
   TANGENT_SIGNING_SEED="$(cat ~/.tangent-signing/k2.seed)" \
   TANGENT_HOOK_SECRET="<the secret printed for you>" \
   GUMROAD_TOKEN="..." \
   GUMROAD_SELLER_ID="..." \
+  GUMROAD_PRODUCT_ID="..." \
   RESEND_API_KEY="..." \
-  MAIL_FROM="Ivory <keys@ivorymidi.com>"
+  MAIL_FROM="Tangent <keys@tangentdaw.org>"
 
 fly deploy -c tools/tangent-fulfil/fly.toml --dockerfile tools/tangent-fulfil/Dockerfile
 ```
 
 If `fly launch` claims the app name is taken, change `app =` in fly.toml.
+
+The volume name must be `tangent_data` because that is what fly.toml mounts;
+a volume by any other name is created and then silently ignored, and the
+ledger lands in the container, where a redeploy erases it. And if this app was
+first deployed under the old name: before deploying, `fly volumes list -a
+tangent-fulfil` must show a `tangent_data` volume carrying the historical
+ledger. A fresh, empty volume here means the ledger did not ride across the
+rename, every previously issued key looks unfulfilled, and a Gumroad retry
+would mint duplicates.
 
 **Confirm before going further:**
 
@@ -65,7 +86,7 @@ curl https://<your-app>.fly.dev/health      # want: ok
 ```
 
 That public key must start `23b041e8` — that is k2, and it means the server can
-mint keys this build of Ivory will accept. Anything else and stop.
+mint keys this build of Tangent will accept. Anything else and stop.
 
 ## 5. Point Gumroad at it
 
@@ -81,7 +102,7 @@ https://<your-app>.fly.dev/hook/<your hook secret>
 2. Buy your own product with it, using a **Gmail address** — Gmail is the
    strictest filter and the likeliest inbox for your buyers.
 3. Confirm the key arrives, and **check the spam folder** if it does not.
-4. Paste it into Ivory → expect "Thank you, …".
+4. Paste it into Tangent → expect "Thank you, …".
 5. `fly ssh console -c tools/tangent-fulfil/fly.toml -C "tail -1 /data/ledger.jsonl"`
 6. Re-fire the same ping from Gumroad's dashboard. You must get the **same**
    key back, not a new one. That is the idempotency guarantee doing its job.

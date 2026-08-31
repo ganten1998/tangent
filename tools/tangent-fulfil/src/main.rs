@@ -20,6 +20,11 @@
 //!   TANGENT_HOOK_SECRET    random path segment, e.g. from `openssl rand -hex 16`
 //!   GUMROAD_TOKEN        Gumroad access token, to verify sales
 //!   GUMROAD_SELLER_ID    your seller id, cheap first-pass rejection
+//!   GUMROAD_PRODUCT_ID   optional but recommended: the product_id (or the
+//!                        product_permalink) a sale must carry; without it a
+//!                        sale of ANY product on the account mints a key
+//!   GUMROAD_ALLOW_TEST   set non-empty to fulfil Gumroad test sales too;
+//!                        unset, test sales are refused
 //!   RESEND_API_KEY       email provider key
 //!   MAIL_FROM            e.g. "Tangent <keys@yourdomain>"
 //!   MAIL_REPLY_TO        an inbox that RECEIVES; see below. default below
@@ -112,10 +117,29 @@ fn url_decode(s: &str) -> String {
 }
 
 /// A previously fulfilled sale, recovered from the ledger.
+///
+/// One bad row must never hide the rows after it. This used `?` on the
+/// per-line parse, so a single blank or torn line (a crash mid
+/// `ledger_append`, a hand edit) silently aborted the whole scan: every sale
+/// recorded AFTER the bad row looked unfulfilled, and the handler would mint
+/// a second, different key on the next Gumroad retry — the exact failure the
+/// module doc promises can never happen. Skip the row, loudly, and keep
+/// scanning, the same way `ledger_recipients` already does.
 fn ledger_lookup(path: &str, sale_id: &str) -> Option<String> {
+    // A missing ledger genuinely means nothing fulfilled yet; only the
+    // per-row parse must not abort.
     let text = std::fs::read_to_string(path).ok()?;
     for line in text.lines() {
-        let v: serde_json::Value = serde_json::from_str(line).ok()?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            // Loud on purpose: a malformed row in the money ledger deserves a
+            // log line every time it is stepped over, even while the service
+            // degrades gracefully around it.
+            eprintln!("{path}: skipping malformed ledger row");
+            continue;
+        };
         if v.get("sale_id").and_then(|s| s.as_str()) == Some(sale_id) {
             return v
                 .get("key")
@@ -138,9 +162,32 @@ fn ledger_append(path: &str, entry: &serde_json::Value) -> std::io::Result<()> {
     writeln!(f, "{entry}")
 }
 
-/// Ask Gumroad whether this sale is real. Without this, anyone who guesses the
-/// hook URL mints themselves keys.
-fn sale_is_genuine(token: &str, sale_id: &str) -> bool {
+/// Gumroad sale ids are URL-safe: letters, digits, `-`, `_`, and base64 `=`
+/// padding. The id arrives in an unauthenticated POST and lands in the verify
+/// URL's PATH, so anything outside that alphabet is refused before it can
+/// steer the request (`../`, `?`, `#`).
+fn sale_id_is_wellformed(sale_id: &str) -> bool {
+    !sale_id.is_empty()
+        && sale_id.len() <= 64
+        && sale_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'=')
+}
+
+/// Ask Gumroad for the sale itself. Without this, anyone who guesses the hook
+/// URL mints themselves keys.
+///
+/// Returns the `sale` object only when the API says success; anything else
+/// (network failure, bad JSON, `success: false`, no sale object) is `None`,
+/// and `None` always means "do not mint". The bare `success` boolean is not
+/// enough on its own — it says "a sale with this id exists on this account",
+/// not "an unrefunded sale of THIS product": judging the object is
+/// `sale_acceptable`'s job, kept separate so it can be tested without the API.
+fn fetch_sale(token: &str, sale_id: &str) -> Option<serde_json::Value> {
+    if !sale_id_is_wellformed(sale_id) {
+        eprintln!("gumroad verify: refusing malformed sale id");
+        return None;
+    }
     let url = format!("https://api.gumroad.com/v2/sales/{sale_id}");
     match ureq::get(&url)
         .query("access_token", token)
@@ -148,17 +195,74 @@ fn sale_is_genuine(token: &str, sale_id: &str) -> bool {
         .call()
     {
         Ok(resp) => match resp.into_json::<serde_json::Value>() {
-            Ok(v) => v.get("success").and_then(|s| s.as_bool()).unwrap_or(false),
+            Ok(v) => {
+                if v.get("success").and_then(|s| s.as_bool()) != Some(true) {
+                    return None;
+                }
+                v.get("sale").cloned()
+            }
             Err(e) => {
                 eprintln!("gumroad verify: bad JSON: {e}");
-                false
+                None
             }
         },
         Err(e) => {
             eprintln!("gumroad verify: request failed: {e}");
-            false
+            None
         }
     }
+}
+
+/// The verified sale object, judged. Pure, so the rejection rules are
+/// testable without Gumroad.
+///
+/// Two different defaults, deliberately:
+///   * Deny-flags (`refunded`, `chargedback`, ...) read as FALSE when absent.
+///     Gumroad spells these inconsistently between its APIs and has renamed
+///     fields before; a renamed field must degrade to today's behaviour
+///     (mint for a genuine sale), never start bouncing every real buyer.
+///   * The product check is an affirmative requirement: when a product is
+///     configured and the sale names no matching product, absent fields
+///     included, that is a mismatch. Default-deny is right for "is this even
+///     a sale of Tangent" — before this check, a sale of ANY product on the
+///     account minted a supporter key.
+///
+/// Keys minted before a refund stay valid: they are offline Ed25519 with no
+/// revocation list. This gate only stops NEW minting and re-sending.
+fn sale_acceptable(
+    sale: &serde_json::Value,
+    expect_product: &str,
+    allow_test: bool,
+) -> Result<(), String> {
+    fn flag(sale: &serde_json::Value, key: &str) -> bool {
+        sale.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
+    }
+    // Both chargeback spellings on purpose: Gumroad's sales and license APIs
+    // disagree with each other about which one it is.
+    for key in ["refunded", "partially_refunded", "chargedback", "chargebacked"] {
+        if flag(sale, key) {
+            return Err(format!("sale is {key}"));
+        }
+    }
+    if flag(sale, "disputed") && !flag(sale, "dispute_won") {
+        return Err("sale is disputed and the dispute is not won".into());
+    }
+    if flag(sale, "test") && !allow_test {
+        return Err("test sale (set GUMROAD_ALLOW_TEST=1 to accept these)".into());
+    }
+    if !expect_product.is_empty() {
+        let matches = ["product_id", "product_permalink"]
+            .iter()
+            .any(|k| sale.get(k).and_then(|v| v.as_str()) == Some(expect_product));
+        if !matches {
+            return Err(format!(
+                "sale is not for product {expect_product} (product_id {:?}, product_permalink {:?})",
+                sale.get("product_id"),
+                sale.get("product_permalink"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 // Permanent download links. GitHub resolves `releases/latest/download/<name>`
@@ -432,6 +536,11 @@ fn main() {
     let hook_secret = env("TANGENT_HOOK_SECRET");
     let gumroad_token = env("GUMROAD_TOKEN");
     let seller_id = env_opt("GUMROAD_SELLER_ID", "");
+    let product_id = env_opt("GUMROAD_PRODUCT_ID", "");
+    let allow_test = !env_opt("GUMROAD_ALLOW_TEST", "").is_empty();
+    if product_id.is_empty() {
+        eprintln!("GUMROAD_PRODUCT_ID unset: any product on this account will mint a key");
+    }
     let resend_key = env("RESEND_API_KEY");
     let mail_from = env("MAIL_FROM");
     let ledger = env_opt("LEDGER_PATH", "/data/ledger.jsonl");
@@ -508,8 +617,35 @@ fn main() {
             continue;
         }
 
-        // Idempotency FIRST: Gumroad retries, and a buyer must never receive two
-        // different keys for one purchase.
+        // Verification FIRST, before even the idempotent resend: everything in
+        // the POST body is attacker-writable, and the resend path mails a real
+        // key. When the resend ran unverified, a refunded sale — or anyone
+        // replaying a genuine sale_id — could keep triggering key mail forever.
+        // The cost is one Gumroad API call per retry, which is nothing.
+        let Some(sale) = fetch_sale(&gumroad_token, &sale_id) else {
+            eprintln!("sale {sale_id} did not verify against Gumroad; refusing to mint");
+            let _ = req.respond(tiny_http::Response::from_string("unverified").with_status_code(403));
+            continue;
+        };
+        if let Err(why) = sale_acceptable(&sale, &product_id, allow_test) {
+            eprintln!("sale {sale_id} rejected: {why}");
+            let _ = req.respond(tiny_http::Response::from_string("rejected").with_status_code(403));
+            continue;
+        }
+
+        // Deliver to the address Gumroad verified, not the one the form
+        // posted. The form email is attacker-writable, so a replayed genuine
+        // sale_id must hand the key to the real buyer, not to the poster. The
+        // form value is only the fallback for a sale object without an email.
+        let email = sale
+            .get("email")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .unwrap_or(email);
+
+        // Idempotency: Gumroad retries, and a buyer must never receive two
+        // different keys for one purchase. Verified-but-already-fulfilled
+        // re-sends the ORIGINAL key.
         if let Some(existing) = ledger_lookup(&ledger, &sale_id) {
             eprintln!("sale {sale_id} already fulfilled; re-sending the original key");
             match send_email(&resend_key, &mail_from, &email, "", &existing) {
@@ -522,12 +658,6 @@ fn main() {
                     let _ = req.respond(tiny_http::Response::from_string("mail failed").with_status_code(500));
                 }
             }
-            continue;
-        }
-
-        if !sale_is_genuine(&gumroad_token, &sale_id) {
-            eprintln!("sale {sale_id} did not verify against Gumroad; refusing to mint");
-            let _ = req.respond(tiny_http::Response::from_string("unverified").with_status_code(403));
             continue;
         }
 
@@ -604,6 +734,117 @@ mod tests {
             "each buyer exactly once, case-folded, in the order first seen"
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    /// A crash mid-append or a hand edit leaves a blank or torn row in the
+    /// ledger. `?` on the per-line parse used to abort the whole scan there,
+    /// so every sale recorded AFTER the bad row looked unfulfilled — and the
+    /// handler minted a second, different key on the next Gumroad retry.
+    #[test]
+    fn ledger_lookup_survives_blank_and_malformed_rows() {
+        let path = std::env::temp_dir().join("tangent-fulfil-lookup-test.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"sale_id":"S1","key":"K1"}"#,
+                "\n",
+                "\n", // blank: the file ended with \n and something appended after
+                r#"{"sale_id":"S2","#, // torn: crashed mid-append
+                "\n",
+                r#"{"sale_id":"S3","key":"K3"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let p = path.to_str().unwrap();
+        assert_eq!(
+            ledger_lookup(p, "S3").as_deref(),
+            Some("K3"),
+            "a sale recorded after a bad row must still be seen as fulfilled"
+        );
+        assert_eq!(ledger_lookup(p, "S1").as_deref(), Some("K1"));
+        assert_eq!(ledger_lookup(p, "S9"), None, "absent sale ids still miss");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Refunds, chargebacks (both of Gumroad's spellings) and lost disputes
+    /// must not mint or re-send keys.
+    #[test]
+    fn every_refund_and_dispute_flag_rejects() {
+        for key in [
+            "refunded",
+            "partially_refunded",
+            "chargedback",
+            "chargebacked",
+            "disputed",
+        ] {
+            let s = serde_json::json!({ key: true });
+            assert!(sale_acceptable(&s, "", true).is_err(), "{key}=true must reject");
+        }
+    }
+
+    #[test]
+    fn a_won_dispute_is_acceptable() {
+        let s = serde_json::json!({"disputed": true, "dispute_won": true});
+        assert!(sale_acceptable(&s, "", true).is_ok());
+    }
+
+    /// Gumroad renames flag fields between its APIs. An absent (or false)
+    /// deny-flag must degrade to today's behaviour — mint for a genuine
+    /// sale — never to bouncing every real buyer.
+    #[test]
+    fn absent_flags_read_as_false_not_as_reject() {
+        let bare = serde_json::json!({"email": "buyer@example.com"});
+        assert!(sale_acceptable(&bare, "", false).is_ok());
+        let explicit = serde_json::json!({"refunded": false, "chargedback": false});
+        assert!(sale_acceptable(&explicit, "", false).is_ok());
+    }
+
+    /// The product check is the affirmative half: configured but unmatchable
+    /// means reject, absent fields included. Before it existed, a sale of ANY
+    /// product on the account minted a Tangent supporter key.
+    #[test]
+    fn product_mismatch_and_missing_product_fields_reject() {
+        let other = serde_json::json!({"product_id": "someone-elses-product"});
+        assert!(sale_acceptable(&other, "tangent-id", false).is_err());
+        let nameless = serde_json::json!({});
+        assert!(
+            sale_acceptable(&nameless, "tangent-id", false).is_err(),
+            "a sale naming no product cannot be confirmed as ours: default-deny"
+        );
+    }
+
+    #[test]
+    fn product_matches_by_id_or_permalink() {
+        let by_id = serde_json::json!({"product_id": "tangent-id"});
+        assert!(sale_acceptable(&by_id, "tangent-id", false).is_ok());
+        let by_permalink = serde_json::json!({"product_permalink": "tangent-id"});
+        assert!(sale_acceptable(&by_permalink, "tangent-id", false).is_ok());
+    }
+
+    #[test]
+    fn empty_expected_product_skips_the_product_check() {
+        let s = serde_json::json!({"product_id": "anything"});
+        assert!(sale_acceptable(&s, "", false).is_ok());
+    }
+
+    #[test]
+    fn test_sales_reject_unless_opted_in() {
+        let s = serde_json::json!({"test": true});
+        assert!(sale_acceptable(&s, "", false).is_err());
+        assert!(sale_acceptable(&s, "", true).is_ok());
+    }
+
+    /// The sale id lands in the verify URL's path and arrives from an
+    /// unauthenticated POST; only Gumroad's URL-safe alphabet may pass.
+    #[test]
+    fn sale_ids_outside_the_url_safe_alphabet_are_refused() {
+        assert!(sale_id_is_wellformed("FO8TXN-dvxYabdavG97Y-Q=="));
+        assert!(!sale_id_is_wellformed(""));
+        assert!(!sale_id_is_wellformed("../products"));
+        assert!(!sale_id_is_wellformed("x?access_token=evil"));
+        assert!(!sale_id_is_wellformed("a#b"));
+        assert!(!sale_id_is_wellformed(&"a".repeat(65)));
     }
 
     /// Eyeball the real thing: `cargo test -- --ignored --nocapture print_email`

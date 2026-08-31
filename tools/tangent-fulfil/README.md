@@ -44,8 +44,10 @@ At this price point, with no locked features, that is a proportionate risk.
 | `TANGENT_HOOK_SECRET` | random path segment — `openssl rand -hex 16` |
 | `GUMROAD_TOKEN` | Gumroad access token (Settings → Advanced → Applications) |
 | `GUMROAD_SELLER_ID` | optional, cheap first-pass rejection |
+| `GUMROAD_PRODUCT_ID` | optional but recommended: `product_id` or permalink a sale must carry; without it ANY product on the account mints a key |
+| `GUMROAD_ALLOW_TEST` | set non-empty to fulfil Gumroad test sales; unset, they are refused |
 | `RESEND_API_KEY` | resend.com API key (any provider works; swap `send_email`) |
-| `MAIL_FROM` | e.g. `Ivory <keys@yourdomain>` — must be a verified sender |
+| `MAIL_FROM` | e.g. `Tangent <keys@yourdomain>` — must be a verified sender |
 | `LEDGER_PATH` | default `/data/ledger.jsonl` — **must be on a persistent volume** |
 | `PORT` | default 8080 |
 
@@ -54,11 +56,12 @@ At this price point, with no locked features, that is a proportionate risk.
 ```sh
 cd <repo root>
 fly launch --no-deploy --dockerfile tools/tangent-fulfil/Dockerfile
-fly volumes create ivory_data --size 1          # the ledger lives here
+fly volumes create tangent_data --size 1        # the ledger lives here; the name must match fly.toml's mount
 fly secrets set \
   TANGENT_SIGNING_SEED="$(cat ~/.tangent-signing/k2.seed)" \
   TANGENT_HOOK_SECRET="$(openssl rand -hex 16)" \
-  GUMROAD_TOKEN=... RESEND_API_KEY=... MAIL_FROM='Ivory <keys@yourdomain>'
+  GUMROAD_TOKEN=... GUMROAD_PRODUCT_ID=... \
+  RESEND_API_KEY=... MAIL_FROM='Tangent <keys@yourdomain>'
 fly deploy
 ```
 
