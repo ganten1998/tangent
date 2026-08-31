@@ -1,0 +1,17 @@
+# Pins the toolchain the lint policy (root Cargo.toml, the comment above
+# [workspace.lints]) was last measured on. Bump this and re-measure that
+# policy's numbers together — the pin exists so those numbers stop floating.
+#
+# This is NOT the MSRV: `rust-version = "1.92"` in the root Cargo.toml is the
+# separate floor for what the crates promise to compile on.
+#
+# NOTE: Homebrew's cargo ignores this file — it is a rustup mechanism, and on
+# this machine /opt/homebrew/bin/cargo shadows rustup's on PATH. build-cross.sh
+# already re-prefixes PATH with `rustup which cargo` for exactly that reason;
+# any command that must honour this pin has to run through rustup's cargo the
+# same way.
+[toolchain]
+channel = "1.97.1"
+components = ["clippy", "rustfmt"]
+# Uncomment to have rustup auto-install the cross targets build-cross.sh needs:
+# targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]

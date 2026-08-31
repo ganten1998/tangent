@@ -280,3 +280,15 @@ it. The probe now runs only when `dynamic_loading` is off.
 
 Verified on the Linux x86_64 artifact: `readelf -d` gains nothing, and
 `jack_sys::library()` opens `libjack.so.0` at run time where one exists.
+
+---
+
+# Why `Cargo.toml.orig` and `.cargo_vcs_info.json` are here
+
+`cpal/` and `jack-sys/` are unpacked crates.io `.crate` tarballs, and those
+two files are part of what the tarball ships (`jack-sys` packs only the
+first). They are kept on purpose, not forgotten: the whole discipline of
+these copies is that each one stays diffable against its upstream tarball,
+byte for byte outside the declared patch, and stripping packaging files would
+make every such diff open with noise instead of nothing. Do not tidy them
+away.

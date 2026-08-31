@@ -37,3 +37,10 @@ build/*
 # these is 87 MB of address space that no reader of this repository wants.
 *.core
 __pycache__/
+
+# BSD sed backup droppings. On macOS `sed -i -e s/x/y/ file` does not mean
+# "in place, with an expression" — it means "back the file up with suffix -e",
+# so every such edit quietly leaves a stale `file-e` twin beside the original.
+# Two of those got committed and then drifted out of date. Use `sed -i ''`
+# here instead; this pattern catches the habit when it slips.
+*-e
