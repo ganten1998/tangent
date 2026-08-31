@@ -58,6 +58,17 @@ Linux
   shows up as an ordinary ALSA sequencer port. Wayland and X11 are both
   supported. Requires glibc 2.32 or newer.
 
+  LV2 plugin hosting needs liblilv-0.so.0, and unlike everything above, without
+  it Tangent does not start at all. It arrives with PipeWire or with ffmpeg, so
+  it is already there on Debian, Fedora, Arch, Void, openSUSE, Mint, Pop and
+  every Ubuntu flavour. The one desktop that ships without it is stock Ubuntu
+  GNOME:
+
+      sudo apt install liblilv-0-0
+
+  install.sh checks for it and prints your distribution's command if it is
+  missing.
+
   Your keyboard has to be plugged in and switched on before Tangent can see it —
   ALSA only creates a port for hardware that is actually there.
 

@@ -39,6 +39,11 @@ cargo build --release -p tangent
 STAGE="dist/tangent-${VERSION}-linux-${ARCH}"
 rm -rf "$STAGE"; mkdir -p "$STAGE/fonts"
 cp target/release/tangent "$STAGE/"
+# **What the loader will demand on somebody else's machine.** This box has
+# whatever the build needed installed on it by definition, so "it starts here"
+# proves nothing about the tarball. Shared with `build-cross.sh`, so the list
+# of declared dependencies cannot drift between the two packaging paths.
+scripts/check-linux-deps.sh "$STAGE/tangent"
 cp assets/tangent.desktop "$STAGE/tangent.desktop"
 cp assets/tangent.png "$STAGE/tangent.png"
 cp assets/fonts/CourierPrime-Regular.ttf assets/fonts/CourierPrime-Bold.ttf \
