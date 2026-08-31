@@ -94,21 +94,26 @@ xcrun notarytool store-credentials "tangent-notary" \
 The `.pkg` is signed separately by `build-installer.sh` with a **Developer ID
 Installer** certificate; `release.sh` fails an unsigned pkg at check time.
 
-### Windows: the inner exe can be signed, the installer is not yet
+### Windows: both PEs are signed, and release.sh refuses either unsigned
 
-`sign_windows_exe` in `build-cross.sh` Authenticode-signs `tangent.exe` via
-**jsign** against Azure Artifact Signing (signtool is Windows-only and this
-binary is cross-built from macOS). With none of
+`scripts/sign-windows.sh` Authenticode-signs a PE via **jsign** against
+Azure Artifact Signing (signtool is Windows-only and this binary is
+cross-built from macOS). `build-cross.sh` calls it twice: on the inner
+`tangent.exe` before staging, and on `setup.exe` after makensis writes it,
+because SmartScreen judges the OUTER installer. With none of
 `TRUSTED_SIGNING_ENDPOINT` / `TRUSTED_SIGNING_ACCOUNT` /
-`TRUSTED_SIGNING_PROFILE` set, the exe ships unsigned and the build says so
+`TRUSTED_SIGNING_PROFILE` set, the PEs ship unsigned and the build says so
 once; with only some of them set the build **fails** rather than quietly
 shipping an unsigned binary you believe is signed. A token can be supplied
-directly as `TRUSTED_SIGNING_TOKEN`.
+directly as `TRUSTED_SIGNING_TOKEN`. `release.sh` then verifies both
+signatures at artifact-check time (`scripts/pe-signed.py`) and a Windows
+release runs RED until the Azure account exists, on purpose.
 
-Known gap: the `setup.exe` NSIS wrapper itself is not signed by any script
-yet, so SmartScreen ("Windows protected your PC", More info, Run anyway) is
-still the first-launch experience and must stay in the release notes and the
-README until that changes.
+Account setup, from zero, is `docs/WINDOWS-SIGNING.md` - the one-time Azure
+walkthrough (identity validation takes days; everything else takes minutes).
+
+Known residual: NSIS generates `Uninstall.exe` on the user's machine at
+install time, so it cannot be signed from here. Documented, out of scope.
 
 ### Linux: no signing, but a dependency contract
 
