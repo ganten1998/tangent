@@ -2903,6 +2903,12 @@ pub struct AudioStatus {
     /// guessing. See `ports::AudioSetup::graph_floor_frames` for what the guess
     /// used to be and whose machine it was wrong about.
     pub graph_floor: Option<u32>,
+    /// Dropouts since this stream opened, from whoever can actually count
+    /// them — the graph's own tally where there is one, the client's
+    /// otherwise. `None` means NOBODY COULD SEE, and the panel must render
+    /// that as nothing at all: a zero from "nobody looked" has already been
+    /// believed once on this project, through a take that was half silence.
+    pub dropouts: Option<u64>,
 }
 
 impl AudioStatus {
@@ -3097,6 +3103,7 @@ mod tests {
             output: Some(("out".to_owned(), stats(Some(128), Some(512)))),
             monitor_ms: Some(4.0),
             graph_floor: None,
+            dropouts: None,
         };
         let rt = status.round_trip_ms().expect("both sides are open");
         assert!(
@@ -4176,6 +4183,7 @@ observed_frames: None,
             output: Some(side(48_000, Some(512))),
             monitor_ms: None,
             graph_floor: None,
+            dropouts: None,
         };
         assert!((both.round_trip_ms().unwrap() - 16.0).abs() < 1e-3);
 
@@ -4195,12 +4203,14 @@ observed_frames: None,
                 output: None,
                 monitor_ms: None,
                 graph_floor: None,
+                dropouts: None,
             },
             AudioStatus {
                 input: None,
                 output: Some(side(48_000, Some(256))),
                 monitor_ms: None,
                 graph_floor: None,
+                dropouts: None,
             },
             // And a side that will not say its buffer size cannot contribute
             // half a figure.
@@ -4209,6 +4219,7 @@ observed_frames: None,
                 output: Some(side(48_000, Some(256))),
                 monitor_ms: None,
                 graph_floor: None,
+                dropouts: None,
             },
         ] {
             assert_eq!(one.round_trip_ms(), None);
@@ -4227,7 +4238,8 @@ observed_frames: None,
             input: Some(side(44_100, Some(256))),
             output: Some(side(48_000, Some(256))),
             monitor_ms: None,
-                    graph_floor: None,
+            graph_floor: None,
+            dropouts: None,
         }
         .rates_disagree());
 
@@ -4235,7 +4247,8 @@ observed_frames: None,
             input: Some(side(48_000, Some(256))),
             output: Some(side(48_000, Some(512))),
             monitor_ms: None,
-                    graph_floor: None,
+            graph_floor: None,
+            dropouts: None,
         }
         .rates_disagree());
 
@@ -4244,7 +4257,8 @@ observed_frames: None,
             input: Some(side(44_100, Some(256))),
             output: None,
             monitor_ms: None,
-                    graph_floor: None,
+            graph_floor: None,
+            dropouts: None,
         }
         .rates_disagree());
     }

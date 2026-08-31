@@ -301,6 +301,14 @@ struct Recorder {
     system_open: Option<String>,
     /// Dropouts already reported, so only the new ones are announced.
     xruns_seen: u64,
+    /// The graph's own count of this process's xruns, watched on a timer.
+    ///
+    /// The authority on a PipeWire desktop, where the client-side counter is
+    /// structurally blind — pipewire-alsa absorbs the EPIPE and cpal never
+    /// hears it, verified with a 64-frame buffer the owner called "total
+    /// noise" against an app log with zero backend errors. Off Linux it
+    /// answers `None` forever and starts no thread.
+    graph_dropouts: tangent_record::audio::GraphDropouts,
     /// The graph's floor, refreshed on the same edge that reopens the streams.
     ///
     /// Cached because reading it costs a process (`pw-metadata`), and a panel
@@ -1681,6 +1689,12 @@ impl DesktopApp {
             // that reopens the streams, which is the only moment it can have
             // changed for a reason this app cares about.
             graph_floor: self.recorder.graph_floor,
+            // `None` off Linux and wherever the graph cannot be read — which
+            // the panel must render as nothing, never as zero.
+            dropouts: tangent_record::audio::merge_dropouts(
+                self.recorder.graph_dropouts.latest(),
+                self.recorder.engine.as_ref().map_or(0, |e| e.xruns()),
+            ),
         });
 
         // The buffer size, on the edge. Reopening both streams is expensive —
@@ -1710,7 +1724,20 @@ impl DesktopApp {
             // because this is the line somebody grepping a log after "it
             // crackled" needs to find. It is also the only place the two
             // buffer settings can be told apart by anything other than an ear.
-            let xruns = engine.xruns();
+            // Merged, not preferred: each counter has been measured blind on
+            // one of the two paths this ships on, in opposite directions —
+            // `merge_dropouts`'s doc carries both measurements.
+            let xruns = tangent_record::audio::merge_dropouts(
+                self.recorder.graph_dropouts.latest(),
+                engine.xruns(),
+            )
+            .unwrap_or(0);
+            // A reopen makes NEW nodes with fresh counters, so the number can
+            // legitimately fall; chase it down rather than hiding every
+            // dropout the new stream has until it beats the old one's total.
+            if xruns < self.recorder.xruns_seen {
+                self.recorder.xruns_seen = xruns;
+            }
             if xruns > self.recorder.xruns_seen {
                 log::warn!(
                     "audio dropouts: {} since this stream opened (+{} just now) - \
@@ -7232,6 +7259,7 @@ impl DesktopApp {
                 rate_open: app.sample_rate(),
                 system_open: app.audio_system(),
                 xruns_seen: 0,
+                graph_dropouts: tangent_record::audio::GraphDropouts::start(),
                 graph_floor: tangent_record::audio::graph_clock().map(|g| g.floor()),
                 seen_take: None,
                 dev_editor_done: false,
