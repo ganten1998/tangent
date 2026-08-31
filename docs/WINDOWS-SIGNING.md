@@ -46,6 +46,16 @@ bad month. Nothing you choose avoids that class of event.
 
 Local tooling (already installed here): `jsign`, `azure-cli`.
 
+STATE AS OF 2026-08-31: steps 1, 2 and 5 are DONE - the account exists
+(`tangent` in resource group `tangent-signing`, East US, Basic, endpoint
+https://eus.codesigning.azure.net/), and both roles (Certificate Profile
+Signer + Identity Verifier - Microsoft renamed them from "Trusted" to
+"Artifact" Signing) are assigned to the owner's user by object id, which
+is the reliable way: the personal-account UPN is the #EXT# form and plain
+email lookup fails. What remains: step 3 (identity validation, the
+multi-day one) and step 4 (the certificate profile, five minutes once
+validation completes).
+
 1. **Azure account.** https://portal.azure.com - sign in or create the
    account (Microsoft account, credit card for the subscription; the
    service itself bills $9.99/month once created). Create a subscription
