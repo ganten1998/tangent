@@ -1801,3 +1801,96 @@ mod tests {
         }
     }
 }
+
+// ── the code ───────────────────────────────────────────────────────────────
+
+/// The Konami sequence, watched for once per install: up up down down left
+/// right left right B A Enter, with nothing else in between. The owner's
+/// spec, verbatim, including what it unlocks — see the cheat dialog in the
+/// app. A wrong key resets the walk; a wrong key that happens to be the
+/// sequence's own first step counts as that first step, or two Ups in a
+/// row before the Downs would silently poison the attempt.
+#[derive(Default)]
+pub struct Konami {
+    at: usize,
+}
+
+const KONAMI: [egui::Key; 11] = [
+    egui::Key::ArrowUp,
+    egui::Key::ArrowUp,
+    egui::Key::ArrowDown,
+    egui::Key::ArrowDown,
+    egui::Key::ArrowLeft,
+    egui::Key::ArrowRight,
+    egui::Key::ArrowLeft,
+    egui::Key::ArrowRight,
+    egui::Key::B,
+    egui::Key::A,
+    egui::Key::Enter,
+];
+
+impl Konami {
+    /// How deep the walk stands - the caller consumes the frame's normal
+    /// key dispatch once the letters start (B toggles borderless and A
+    /// opens About; a cheat that opens About mid-code is not a cheat).
+    pub fn progress(&self) -> usize {
+        self.at
+    }
+
+    /// Feed one pressed key; answers true on the press that completes the
+    /// code. The walk resets after completion, though the caller's
+    /// once-per-install latch means that hardly matters.
+    pub fn feed(&mut self, key: egui::Key) -> bool {
+        if key == KONAMI[self.at] {
+            self.at += 1;
+            if self.at == KONAMI.len() {
+                self.at = 0;
+                return true;
+            }
+            return false;
+        }
+        // The restart rule: a mismatch may still BE the first step (an Up
+        // after three Ups is still two Ups deep, but this walk only ever
+        // needs the one-step lookback because no prefix of the code repeats
+        // past its head).
+        self.at = usize::from(key == KONAMI[0]);
+        false
+    }
+}
+
+#[cfg(test)]
+mod konami_tests {
+    use super::*;
+
+    #[test]
+    fn the_code_lands_only_when_entered_exactly() {
+        use egui::Key::*;
+        let mut k = Konami::default();
+        let full = [
+            ArrowUp, ArrowUp, ArrowDown, ArrowDown, ArrowLeft, ArrowRight,
+            ArrowLeft, ArrowRight, B, A, Enter,
+        ];
+        // Clean entry lands on the final press and no earlier one.
+        for (i, key) in full.iter().enumerate() {
+            assert_eq!(k.feed(*key), i == full.len() - 1, "step {i}");
+        }
+        // Anything else in between resets the walk.
+        let mut k = Konami::default();
+        for key in [ArrowUp, ArrowUp, ArrowDown] {
+            assert!(!k.feed(key));
+        }
+        assert!(!k.feed(Space));
+        for (i, key) in full.iter().enumerate() {
+            assert_eq!(k.feed(*key), i == full.len() - 1, "post-reset step {i}");
+        }
+        // An extra Up mid-walk falls back to being the first step, so the
+        // classic fat-finger of three Ups still recovers.
+        let mut k = Konami::default();
+        assert!(!k.feed(ArrowUp));
+        assert!(!k.feed(ArrowUp));
+        assert!(!k.feed(ArrowUp)); // wrong (wanted Down) - but IS step one
+        for (i, key) in full.iter().enumerate().skip(1) {
+            assert_eq!(k.feed(*key), i == full.len() - 1, "recovery step {i}");
+        }
+    }
+}

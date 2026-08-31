@@ -425,7 +425,9 @@ fn crash_report(msg: &str, location: &str, backtrace: &str) -> String {
 fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
         // A dying process still gives the graph clock back — one spawned
-        // pw-metadata, best effort, before anything slower.
+        // pw-metadata, best effort, before anything slower. (The Minimal
+        // build has no audio and no claim to release.)
+        #[cfg(feature = "recorder")]
         tangent_record::audio::release_graph_claim();
         let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
             (*s).to_owned()
@@ -630,8 +632,13 @@ fn main() {
     // exit; a crash cannot, so each launch checks whether the force still
     // on the graph is its own predecessor's and takes it off. No-op
     // everywhere but Linux.
-    tangent_record::audio::set_claim_marker(tangent_core::config::dir().join("graph-claim"));
-    tangent_record::audio::recover_graph_claim();
+    #[cfg(feature = "recorder")]
+    {
+        tangent_record::audio::set_claim_marker(
+            tangent_core::config::dir().join("graph-claim"),
+        );
+        tangent_record::audio::recover_graph_claim();
+    }
 
     // The earliest legal moment — see the ordering comment above and the one
     // on the function. Everything the logger says from here on is on disk.
@@ -802,6 +809,7 @@ fn main() {
     // Every serious host does this, for this exact reason.
     // The graph clock goes back before the process does anything else —
     // `_exit` skips atexit, so nothing later can put it back for us.
+    #[cfg(feature = "recorder")]
     tangent_record::audio::release_graph_claim();
     use std::io::Write as _;
     let _ = std::io::stdout().flush();

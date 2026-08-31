@@ -136,6 +136,15 @@ pub struct MixerView<'a> {
     /// True when anything at all is soloed, so the strips that are not can be
     /// drawn as what they are — silent, not merely unlit.
     pub any_solo: bool,
+    /// The window is effectively the whole screen — fullscreen, maximized,
+    /// or tiled to it. The two-row fold is gated on this, by the owner's
+    /// word: windowed stays one scrolling row however many are asked for.
+    pub screen_filling: bool,
+    /// How many channels this install works at — the paywall's number
+    /// (`TangentApp::active_channels`). Capacity stays [`CHANNELS`]; this
+    /// bounds what the desk DRAWS and how far it scrolls, so a free
+    /// install neither shows nor reaches the supporter lanes.
+    pub active: usize,
     pub dark_mode: bool,
     /// Every route on the desk: source channel, label, fader. Each strip
     /// draws the ones that leave it, in order.
@@ -331,7 +340,7 @@ impl Hit {
 /// [`PALETTE_COLUMNS`] is what makes the grid read as hues rather than as
 /// twenty-seven swatches: reading down a column is one tone, across a row is
 /// one colour.
-pub const STRIP_COLORS: [(u8, u8, u8); 370] = [
+pub const STRIP_COLORS: [(u8, u8, u8); 522] = [
     (0x00, 0x00, 0x00), // the desk's own wood — replaced at draw time
     (0x36, 0x33, 0x30), // slate
     (0x56, 0x51, 0x4D), // stone
@@ -514,6 +523,67 @@ pub const STRIP_COLORS: [(u8, u8, u8); 370] = [
     (0xb6, 0x0f, 0x25), // 367  Carbon
     (0x86, 0x4d, 0x14), // 368  Nocturne
     (0x8e, 0x21, 0x0b), // 369  Phosphor
+    // ── the EXTENSION runs, APPENDED (the rule): channels 17..24 for
+    // every palette, eight per, grown from each run's own hues two tones
+    // away so the new lanes read as family without twinning 1..8. Bases
+    // ride in Palette::ext. Designed and gated by scripts/palgen.py.
+    // Default ext: channels 17..24 at 370..377
+    (0x37, 0x1a, 0x10), (0x5c, 0x46, 0x1a), (0x1f, 0x24, 0x0a), (0x20, 0x54, 0x18),
+    (0x0b, 0x26, 0x21), (0x23, 0x4c, 0x79), (0x2a, 0x1c, 0x38), (0x78, 0x2e, 0x61),
+    // Valentine ext: channels 17..24 at 378..385
+    (0x3c, 0x13, 0x28), (0x6c, 0x34, 0x6c), (0x3d, 0x14, 0x1b), (0x59, 0x3c, 0x7b),
+    (0x35, 0x1b, 0x0f), (0x18, 0x53, 0x40), (0x2b, 0x20, 0x0c), (0x69, 0x36, 0x72),
+    // Hydra ext: channels 17..24 at 386..393
+    (0x0b, 0x26, 0x23), (0x1c, 0x50, 0x61), (0x0b, 0x27, 0x19), (0x57, 0x49, 0x17),
+    (0x3c, 0x14, 0x21), (0x23, 0x4b, 0x77), (0x0d, 0x27, 0x0d), (0x54, 0x3f, 0x7c),
+    // Navi ext: channels 17..24 at 394..401
+    (0x0d, 0x24, 0x30), (0x29, 0x48, 0x87), (0x0b, 0x26, 0x26), (0x67, 0x41, 0x1c),
+    (0x23, 0x1d, 0x3b), (0x18, 0x53, 0x40), (0x33, 0x18, 0x33), (0x2c, 0x53, 0x18),
+    // Mono ext: channels 17..24 at 402..409
+    (0x5b, 0x46, 0x37), (0x39, 0x4b, 0x5e), (0x55, 0x47, 0x33), (0x3b, 0x4a, 0x62),
+    (0x6b, 0x57, 0x40), (0x46, 0x5d, 0x75), (0x6a, 0x58, 0x40), (0x1a, 0x22, 0x2c),
+    // Studio ext: channels 17..24 at 410..417
+    (0x30, 0x1e, 0x0e), (0x59, 0x47, 0x1a), (0x36, 0x1a, 0x0f), (0x4c, 0x4c, 0x16),
+    (0x3c, 0x16, 0x11), (0x35, 0x51, 0x16), (0x3c, 0x14, 0x21), (0x1c, 0x4f, 0x66),
+    // Aurora ext: channels 17..24 at 418..425
+    (0x0b, 0x26, 0x1d), (0x1c, 0x50, 0x61), (0x1d, 0x20, 0x3c), (0x5e, 0x3a, 0x78),
+    (0x3c, 0x13, 0x28), (0x18, 0x54, 0x23), (0x24, 0x23, 0x0a), (0x6c, 0x34, 0x6c),
+    // Sandstone ext: channels 17..24 at 426..433
+    (0x34, 0x1d, 0x0e), (0x5f, 0x45, 0x1a), (0x27, 0x22, 0x0b), (0x3b, 0x50, 0x16),
+    (0x3c, 0x16, 0x11), (0x1b, 0x54, 0x1b), (0x3c, 0x14, 0x21), (0x1c, 0x4f, 0x66),
+    // Centennial ext: channels 17..24 at 434..441
+    (0x28, 0x21, 0x0b), (0x67, 0x41, 0x1c), (0x0f, 0x24, 0x37), (0x54, 0x3f, 0x7c),
+    (0x3c, 0x16, 0x11), (0x35, 0x51, 0x16), (0x38, 0x15, 0x2d), (0x18, 0x52, 0x4a),
+    // Blueprint ext: channels 17..24 at 442..449
+    (0x0f, 0x24, 0x37), (0x30, 0x47, 0x85), (0x0c, 0x26, 0x2a), (0x4c, 0x41, 0x7e),
+    (0x32, 0x1d, 0x0e), (0x18, 0x53, 0x40), (0x33, 0x18, 0x33), (0x1b, 0x54, 0x1b),
+    // Porcelain ext: channels 17..24 at 450..457
+    (0x0f, 0x24, 0x37), (0x38, 0x45, 0x86), (0x0c, 0x26, 0x2a), (0x54, 0x3f, 0x7c),
+    (0x37, 0x1a, 0x0f), (0x18, 0x53, 0x36), (0x38, 0x15, 0x2d), (0x2c, 0x53, 0x18),
+    // Moss ext: channels 17..24 at 458..465
+    (0x17, 0x26, 0x0b), (0x40, 0x4f, 0x16), (0x0b, 0x27, 0x10), (0x18, 0x53, 0x40),
+    (0x28, 0x21, 0x0b), (0x1c, 0x4f, 0x66), (0x35, 0x1b, 0x0f), (0x62, 0x39, 0x76),
+    // Rhodes ext: channels 17..24 at 466..473
+    (0x2d, 0x20, 0x0d), (0x70, 0x3d, 0x20), (0x27, 0x22, 0x0b), (0x7f, 0x30, 0x24),
+    (0x1e, 0x24, 0x0a), (0x1c, 0x4f, 0x66), (0x3c, 0x13, 0x28), (0x54, 0x3f, 0x7c),
+    // Copper ext: channels 17..24 at 474..481
+    (0x32, 0x1d, 0x0e), (0x18, 0x52, 0x4c), (0x2b, 0x20, 0x0c), (0x19, 0x51, 0x5b),
+    (0x3c, 0x16, 0x11), (0x18, 0x53, 0x36), (0x33, 0x18, 0x33), (0x2c, 0x53, 0x18),
+    // Dusk ext: channels 17..24 at 482..489
+    (0x2c, 0x1b, 0x37), (0x6c, 0x34, 0x6c), (0x32, 0x1d, 0x0e), (0x42, 0x42, 0x83),
+    (0x3c, 0x13, 0x28), (0x1c, 0x4f, 0x66), (0x24, 0x23, 0x0a), (0x18, 0x53, 0x40),
+    // Iris ext: channels 17..24 at 490..497
+    (0x2e, 0x1a, 0x37), (0x6c, 0x34, 0x6c), (0x1e, 0x24, 0x0a), (0x4c, 0x41, 0x7e),
+    (0x3c, 0x13, 0x28), (0x1c, 0x4f, 0x66), (0x28, 0x21, 0x0b), (0x18, 0x53, 0x40),
+    // Carbon ext: channels 17..24 at 498..505
+    (0x78, 0x36, 0x25), (0x75, 0x55, 0x22), (0x23, 0x23, 0x0b), (0x2c, 0x3b, 0x12),
+    (0x90, 0x44, 0x31), (0x2c, 0x20, 0x0d), (0x3a, 0x39, 0x12), (0x3d, 0x50, 0x18),
+    // Nocturne ext: channels 17..24 at 506..513
+    (0x23, 0x4c, 0x79), (0x4e, 0x55, 0x96), (0x26, 0x1d, 0x3a), (0x13, 0x3c, 0x44),
+    (0x29, 0x5c, 0x96), (0x1c, 0x1f, 0x3e), (0x3c, 0x30, 0x57), (0x19, 0x51, 0x5b),
+    // Phosphor ext: channels 17..24 at 514..521
+    (0x30, 0x52, 0x1a), (0x53, 0x60, 0x1e), (0x0c, 0x27, 0x11), (0x40, 0x36, 0x13),
+    (0x3e, 0x64, 0x22), (0x20, 0x24, 0x0b), (0x15, 0x3e, 0x1e), (0x55, 0x49, 0x1a),
 ];
 
 /// How much of [`STRIP_COLORS`] a person can point at.
@@ -540,12 +610,25 @@ pub struct Palette {
     /// than inside the run — the runs are contiguous and every index in them
     /// is already written into somebody's saved desk. See [`Palette::master`].
     pub master_at: usize,
+    /// Where this palette's EXTENSION run starts: channels 17..24, eight
+    /// colours appended when the desk grew past the frozen sixteen-slot
+    /// runs. The original runs are append-only history; the extension is
+    /// its own block for the same reason the masters are.
+    pub ext: usize,
 }
 
 impl Palette {
-    /// The colour for channel `i`.
+    /// The colour for channel `i`. The first sixteen live in the frozen
+    /// original run; 17..24 in the palette's extension block. PALETTE_RUN
+    /// and not CHANNELS: the run length is table HISTORY, and history does
+    /// not grow when the desk does.
     pub fn slot(&self, i: usize) -> usize {
-        self.base + i % crate::recorder::CHANNELS
+        let i = i % crate::recorder::CHANNELS;
+        if i < PALETTE_RUN {
+            self.base + i
+        } else {
+            self.ext + (i - PALETTE_RUN)
+        }
     }
 
     /// The click's colour in this palette.
@@ -554,7 +637,7 @@ impl Palette {
     /// not the master either, so it gets the palette's own quiet neutral
     /// rather than a hue out of the set.
     pub fn click(&self) -> usize {
-        self.base + crate::recorder::CHANNELS
+        self.base + PALETTE_RUN
     }
 
     /// **The master's colour, this palette's own.**
@@ -585,25 +668,25 @@ impl Palette {
 /// The ORDER is the index `palette_choice` saves, so it matches `factory()`
 /// and must not be shuffled.
 pub const PALETTES: [Palette; 19] = [
-    Palette { name: "Default", base: 28, master_at: 300 },
-    Palette { name: "Valentine", base: 45, master_at: 301 },
-    Palette { name: "Hydra", base: 62, master_at: 302 },
-    Palette { name: "Navi", base: 79, master_at: 303 },
-    Palette { name: "Mono", base: 96, master_at: 304 },
-    Palette { name: "Studio", base: 113, master_at: 305 },
-    Palette { name: "Aurora", base: 130, master_at: 306 },
-    Palette { name: "Sandstone", base: 147, master_at: 307 },
-    Palette { name: "Centennial", base: 164, master_at: 308 },
-    Palette { name: "Blueprint", base: 181, master_at: 309 },
-    Palette { name: "Porcelain", base: 198, master_at: 310 },
-    Palette { name: "Moss", base: 215, master_at: 311 },
-    Palette { name: "Rhodes", base: 232, master_at: 312 },
-    Palette { name: "Copper", base: 249, master_at: 313 },
-    Palette { name: "Dusk", base: 266, master_at: 314 },
-    Palette { name: "Iris", base: 283, master_at: 315 },
-    Palette { name: "Carbon", base: 316, master_at: 367 },
-    Palette { name: "Nocturne", base: 333, master_at: 368 },
-    Palette { name: "Phosphor", base: 350, master_at: 369 },
+    Palette { name: "Default", base: 28, master_at: 300, ext: 370 },
+    Palette { name: "Valentine", base: 45, master_at: 301, ext: 378 },
+    Palette { name: "Hydra", base: 62, master_at: 302, ext: 386 },
+    Palette { name: "Navi", base: 79, master_at: 303, ext: 394 },
+    Palette { name: "Mono", base: 96, master_at: 304, ext: 402 },
+    Palette { name: "Studio", base: 113, master_at: 305, ext: 410 },
+    Palette { name: "Aurora", base: 130, master_at: 306, ext: 418 },
+    Palette { name: "Sandstone", base: 147, master_at: 307, ext: 426 },
+    Palette { name: "Centennial", base: 164, master_at: 308, ext: 434 },
+    Palette { name: "Blueprint", base: 181, master_at: 309, ext: 442 },
+    Palette { name: "Porcelain", base: 198, master_at: 310, ext: 450 },
+    Palette { name: "Moss", base: 215, master_at: 311, ext: 458 },
+    Palette { name: "Rhodes", base: 232, master_at: 312, ext: 466 },
+    Palette { name: "Copper", base: 249, master_at: 313, ext: 474 },
+    Palette { name: "Dusk", base: 266, master_at: 314, ext: 482 },
+    Palette { name: "Iris", base: 283, master_at: 315, ext: 490 },
+    Palette { name: "Carbon", base: 316, master_at: 367, ext: 498 },
+    Palette { name: "Nocturne", base: 333, master_at: 368, ext: 506 },
+    Palette { name: "Phosphor", base: 350, master_at: 369, ext: 514 },
 ];
 
 /// The drum bus's colour everywhere: dark violet, no palette uses it, so
@@ -786,6 +869,8 @@ const MASTER_EXTRA: f32 = 0.0;
 
 /// How many channel columns the mixer shows at once; the rest scroll. The
 /// click and the master are pinned beside them and are not counted here.
+pub const PALETTE_RUN: usize = 16;
+
 pub const VISIBLE_CHANNELS: usize = 8;
 
 /// The least height a strip row can usefully be — below this, folding the
@@ -806,10 +891,11 @@ impl Layout {
 
     /// The furthest `scroll_px` can legally stand at `rect`: the desk's
     /// off-screen width. Zero when everything fits.
-    pub fn max_scroll_px(rect: Rect, visible: usize) -> f32 {
-        let visible = visible.clamp(1, CHANNELS);
+    pub fn max_scroll_px(rect: Rect, visible: usize, active: usize) -> f32 {
+        let active = active.clamp(1, CHANNELS);
+        let visible = visible.clamp(1, active);
         let (_, pitch) = Self::metrics(rect, visible);
-        (CHANNELS.saturating_sub(visible)) as f32 * pitch
+        (active.saturating_sub(visible)) as f32 * pitch
     }
 
     pub fn new(rect: Rect, view: &MixerView<'_>) -> Self {
@@ -833,7 +919,8 @@ impl Layout {
         // Layout: [ 8 scrolling channels | GAP | click | GAP | master ].
         let click_col = CHANNELS; // column index of the click
         let master_col = COLUMNS - 1;
-        let visible = view.visible.clamp(1, CHANNELS);
+        let active = view.active.clamp(1, CHANNELS);
+        let visible = view.visible.clamp(1, active);
         // **The whole desk folds into two rows of eight, size permitting.**
         // When all sixteen are asked for, sixteen columns across makes
         // toothpicks of every strip; eight over eight keeps each strip at
@@ -841,7 +928,13 @@ impl Layout {
         // that only works when half the height is still a usable strip.
         // The click and the master stay pinned at the right, full height:
         // whatever shape the desk folds into, the master does not move.
-        let two_rows = visible >= CHANNELS && (inner.height() - GAP) / 2.0 >= TWO_ROW_MIN_H;
+        // The fold is the FULL desk folding — twelve over twelve — which
+        // only a supporter's twenty-four can be. A free sixteen stays one
+        // scrolling row everywhere, the owner's paywall ruling.
+        let two_rows = view.screen_filling
+            && active >= CHANNELS
+            && visible >= CHANNELS
+            && (inner.height() - GAP) / 2.0 >= TWO_ROW_MIN_H;
         let cols_across = if two_rows { CHANNELS / 2 } else { visible };
         let (unit, pitch) = Self::metrics(rect, cols_across);
         // The two pinned columns, from the right edge inward.
@@ -862,12 +955,12 @@ impl Layout {
         let max_px = if two_rows {
             0.0
         } else {
-            (CHANNELS.saturating_sub(visible)) as f32 * pitch
+            (active.saturating_sub(visible)) as f32 * pitch
         };
         let px = view.scroll_px.clamp(0.0, max_px.max(0.0));
-        let first = ((px / pitch).floor() as usize).min(CHANNELS.saturating_sub(1));
+        let first = ((px / pitch).floor() as usize).min(active.saturating_sub(1));
         let frac = px - first as f32 * pitch;
-        let last_shown = (first + visible + usize::from(frac > 0.5)).min(CHANNELS);
+        let last_shown = (first + visible + usize::from(frac > 0.5)).min(active);
         let row_h = if two_rows {
             (inner.height() - GAP) / 2.0
         } else {
@@ -928,10 +1021,21 @@ impl Layout {
             // the empty panel is quiet ground where the right-click menu
             // lives. A whole-column button was one mis-aimed press away
             // from a track nobody meant to add.
-            let d = (panel.width() * 0.42).clamp(18.0, 40.0);
+            // Centred in the space BELOW the number's cap, never over it:
+            // on a short panel (the two-row fold, a squeezed window) a
+            // full-panel centre put the plus on top of the slot's own
+            // number. The cap arithmetic mirrors `empty_slot`'s exactly.
+            let cap_h = (panel.height() * 0.09).min(16.0);
+            let below = Rect::from_min_max(
+                Pos2::new(panel.left(), panel.top() + cap_h + 2.0),
+                panel.max,
+            );
+            let d = (panel.width() * 0.42)
+                .clamp(18.0, 40.0)
+                .min((below.height() * 0.8).max(1.0));
             return StripStrip {
                 panel,
-                add: Rect::from_center_size(panel.center(), Vec2::splat(d)),
+                add: Rect::from_center_size(below.center(), Vec2::splat(d)),
                 ..StripStrip::NONE
             };
         }
@@ -2809,6 +2913,8 @@ mod tests {
             }),
             any_solo: false,
             scroll_px: 0.0,
+            screen_filling: false,
+            active: CHANNELS,
             visible: VISIBLE_CHANNELS,
             selected: None,
             typing: None,
@@ -3179,6 +3285,7 @@ mod tests {
         let tall = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 700.0));
         let mut v = a_view();
         v.visible = CHANNELS;
+        v.screen_filling = true;
         let l = Layout::new(tall, &v);
         for n in 0..CHANNELS {
             assert!(l.strips[n].panel.is_positive(), "channel {n} missing from the fold");
@@ -3205,6 +3312,40 @@ mod tests {
         let top = l.strips.iter().filter(|s| s.panel.is_positive()).map(|s| s.panel.top());
         let tops: std::collections::BTreeSet<i64> = top.map(|t| t.round() as i64).collect();
         assert_eq!(tops.len(), 1, "a short window folded anyway");
+    }
+
+    /// **The free desk ends at sixteen, everywhere the layout reaches.**
+    /// The paywall's geometry: with `active` at the free count, the
+    /// supporter lanes are never laid out, the scroll cannot reach them,
+    /// and the fold never fires however big the screen - one scrolling
+    /// row is the free mixer's whole shape, by the owner's word.
+    #[test]
+    fn a_free_desk_never_shows_or_reaches_the_supporter_lanes() {
+        let tall = Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 800.0));
+        let mut v = a_view();
+        v.active = crate::recorder::FREE_CHANNELS;
+        v.screen_filling = true;
+        v.visible = CHANNELS; // asks for everything; the clamp answers
+        v.scroll_px = 1.0e9; // and so does the scroll's rail
+        let l = Layout::new(tall, &v);
+        for n in crate::recorder::FREE_CHANNELS..CHANNELS {
+            assert!(
+                !l.strips[n].panel.is_positive(),
+                "supporter lane {n} was laid out on a free desk"
+            );
+        }
+        // No fold: every visible channel shares one row.
+        let tops: std::collections::BTreeSet<i64> = (0..crate::recorder::FREE_CHANNELS)
+            .filter(|n| l.strips[*n].panel.is_positive())
+            .map(|n| l.strips[n].panel.top().round() as i64)
+            .collect();
+        assert_eq!(tops.len(), 1, "the free desk folded");
+        // And the scroll's ceiling respects the same edge.
+        assert_eq!(
+            Layout::max_scroll_px(tall, VISIBLE_CHANNELS, crate::recorder::FREE_CHANNELS),
+            (crate::recorder::FREE_CHANNELS - VISIBLE_CHANNELS) as f32
+                * Layout::metrics(tall, VISIBLE_CHANNELS).1,
+        );
     }
 
     /// **The visible count is what the view says, not a constant.** Shift+

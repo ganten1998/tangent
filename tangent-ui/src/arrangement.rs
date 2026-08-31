@@ -56,7 +56,7 @@ use std::path::PathBuf;
 /// stamp "version 4" on a file still full of version 9's keys, and the build
 /// that wrote them would then run its 4→9 migrations over data that had
 /// already been through them.
-pub const ARRANGEMENT_VERSION: u64 = 5;
+pub const ARRANGEMENT_VERSION: u64 = 6;
 
 /// **Version 5: musical time.**
 ///
@@ -836,7 +836,16 @@ impl Arrangement {
         // the sort of thing somebody notices as "it sounds wrong" and never
         // reports as a bug.
         let (tempo, meter) = Self::read_maps(&mut map, version, desk.as_ref());
-        let automation = Self::read_automation(&mut map);
+        let mut automation = Self::read_automation(&mut map);
+        // **The master lane moved when the desk grew.** MASTER_LANE is the
+        // channel count, so documents written at sixteen channels keep
+        // their master curves at lane 16 — an ordinary channel on the
+        // twenty-four desk. Version 6 is the stamp that says "my master is
+        // at today's lane"; anything older is lifted here, at the frozen
+        // literal, per the migration rule.
+        if version < 6 {
+            automation.remap_lane(16, crate::recorder::CHANNELS);
+        }
         let mut clips = Vec::new();
         if let Some(Value::Array(list)) = map.shift_remove("clips") {
             for item in list {

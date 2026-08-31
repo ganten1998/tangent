@@ -27,6 +27,9 @@ use tangent_core::patterns::{NOTE_NAMES, NOTE_NAMES_FLAT};
 use tangent_core::OverrideInfo;
 
 pub enum Dialog {
+    /// **The Konami dialog.** Its words and its one button are the owner's
+    /// spec, verbatim; dismissing it is what mints the Cheater unlock.
+    Cheated,
     /// The project menu behind the band's folder button: the session's
     /// name, and the five things you do with sessions.
     Project {
@@ -605,6 +608,8 @@ impl ConfirmChoice {
 /// keep one alive across the frames the dialog is open.
 #[derive(Clone)]
 pub enum DialogAction {
+    /// The "..." on the Konami dialog: accept the unlock.
+    AcceptCheat,
     /// The unsaved-changes prompt's four answers. See `Dialog::SaveChanges`.
     SaveChangesSave,
     SaveChangesSaveAs,
@@ -1225,21 +1230,27 @@ pub const VIDEO_EXPORT_READY: bool = true;
 /// strings: a card whose text overflows its own window is a first impression
 /// nobody recovers from, and it is exactly the sort of thing that breaks when
 /// somebody adds a line.
-const WELCOME_LINES: [&str; 14] = [
-    "Tangent is free, and it stays free.",
+const WELCOME_LINES: [&str; 20] = [
+    "Welcome to the Tangent 5.0 beta!",
     "",
-    "It is made for the love of it. There are no",
-    "locked features, no trial, no account, and",
-    "nothing is sent anywhere.",
-    "",
-    "If it earns a place in your setup, a donation",
-    "is welcome and genuinely helps - but it buys",
-    "you nothing you do not already have.",
-    "",
-    "Hold 'H' to display every keybind in the",
-    "current view. Tab cycles views, and what",
-    "can't be found there lives in the",
+    "Tangent is an attempt to create a seamless",
+    "environment between learning/synthesizing",
+    "musical information, and creating as soon",
+    "as the inspiration strikes. Start off",
+    "exploring with TAB, which cycles between",
+    "three views, or press 'H' for the full",
+    "keybind list, which differs per-view.",
+    "Anything that is extra lives in the",
     "right-click menu.",
+    "",
+    "It may seem like nothing more than eye-candy",
+    "at first, but the substance is there, and I",
+    "want this to evolve into a home for those",
+    "who want to do it all in one place.",
+    "",
+    "More to come,",
+    "",
+    "Ganten",
 ];
 
 /// The Audio Status window. Two device blocks, a round-trip line, and a row of
@@ -1296,7 +1307,7 @@ const AUDIO_H: f32 = 580.0;
 /// `the_welcome_card_fits_its_own_text` now demands [`WELCOME_SLACK`] on top of
 /// what it can measure.
 const WELCOME_W: f32 = 470.0;
-const WELCOME_H: f32 = 396.0;
+const WELCOME_H: f32 = 486.0;
 /// How much more than the measurable text the Welcome card must have.
 ///
 /// The chrome this test cannot see: a checkbox's real height against the 22 it
@@ -4271,6 +4282,34 @@ pub fn show(
             )
         }
 
+        Dialog::Cheated => {
+            let stock = stock_style(ctx);
+            show_dialog_viewport(
+                ctx,
+                placement,
+                "Tangent",
+                Vec2::new(440.0, 170.0),
+                Vec2::new(340.0, 140.0),
+                |ui, result| {
+                    *ui.style_mut() = stock.clone();
+                    let bg = ui.style().visuals.window_fill;
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, bg);
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::same(12))
+                        .show(ui, |ui| {
+                            ui.label("That's not fair, you cheated. >:c");
+                            ui.add_space((ui.available_height() - 30.0).max(0.0));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.button("...").clicked() {
+                                    action = Some(DialogAction::AcceptCheat);
+                                    result.close = true;
+                                }
+                            });
+                        });
+                },
+            )
+        }
+
         Dialog::Notice { title, body } => {
             let stock = stock_style(ctx);
             let title = title.clone();
@@ -5951,8 +5990,17 @@ pub fn show(
                     egui::Frame::NONE
                         .inner_margin(egui::Margin::same(14))
                         .show(ui, |ui| {
-                            for line in WELCOME_LINES {
-                                ui.label(RichText::new(line).font(bold(12.0)).color(t.text));
+                            for (i, line) in WELCOME_LINES.iter().enumerate() {
+                                // The header and the signature carry the
+                                // weight; the body reads in the plain hand.
+                                let font = if i == 0 {
+                                    bold(14.0)
+                                } else if i == WELCOME_LINES.len() - 1 {
+                                    bold(12.0)
+                                } else {
+                                    FontId::new(12.0, fonts::courier())
+                                };
+                                ui.label(RichText::new(*line).font(font).color(t.text));
                             }
                             ui.add_space(8.0);
                             let mut hide = *dont_show_again;

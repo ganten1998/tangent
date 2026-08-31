@@ -419,6 +419,18 @@ impl Automation {
         &self.curves
     }
 
+    /// Move every curve on `from` to `to` — the era lift's tool. The master
+    /// lane IS the channel count, so when the desk grew from sixteen to
+    /// twenty-four every pre-6 document's master curves sat at 16, which is
+    /// an ordinary channel now.
+    pub fn remap_lane(&mut self, from: usize, to: usize) {
+        for c in &mut self.curves {
+            if c.lane == from {
+                c.lane = to;
+            }
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.curves.is_empty()
     }
