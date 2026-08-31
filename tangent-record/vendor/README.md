@@ -72,9 +72,10 @@ directory, drop the `exclude` line from the root `Cargo.toml`, and put
 # Vendored `cpal`
 
 `cpal/` is [`cpal` 0.16.0](https://github.com/RustAudio/cpal) (Apache-2.0) with
-**one host added and one string changed**. The host is behind
-`#[cfg(target_os = "freebsd")]`; the string is in the JACK backend, which
-compiles only where the `jack` feature is on. So macOS and Windows compile the
+**one host added, one string changed, and one notification stopped being
+reported as an error**. The host is behind `#[cfg(target_os = "freebsd")]`; the
+other two are in the JACK backend, which compiles only where the `jack` feature
+is on. So macOS and Windows compile the
 same code they compiled from crates.io and produce the same binary. That
 constraint is the whole discipline here: `[patch.crates-io]` is not
 target-conditional, so this copy is what *every* platform builds, and the moment
@@ -160,6 +161,33 @@ cpal_clients did.
 This one wants an upstream fix rather than an upstream copy of the string — a
 name on `HostId::Jack` at `host_from_id` time, or a `Host::with_name`. Until
 then the constant is the only place it fits.
+
+## The third change: a notification is not an error
+
+`host/jack/stream.rs`'s `NotificationHandler::buffer_size` told the host, through
+the ERROR callback, that the graph's buffer size had changed — having already
+resized its scratch and gone on to return `Control::Continue`. By cpal's own
+account nothing had failed. It reported that way because the JACK backend has no
+notification channel and the error one was the only way out.
+
+**It is not a cosmetic miscategorisation.** A host cannot distinguish it from a
+real fault, and it fires on EVERY activation: `Stream::new_output` seeds
+`buffer_size` from `client.buffer_size()` on a client that has not joined the
+graph yet, and under pipewire-jack that is not the size the graph then runs. An
+app that reads a stream error as "the device is gone" — the correct reading —
+tears its engine down, reopens, and is told the same thing again. Measured here
+before the change: **Tangent's JACK path produced no sound at all**, rebuilding
+its engine about once a second, while a flat meter and a low idle CPU made it
+look like an efficient one.
+
+It now goes to `eprintln!`, which is how this backend already reports (`mod.rs`
+prints its device-creation failures) and which costs no dependency — `cpal` does
+not pull `log`, and adding one to a vendored copy is a wider divergence than the
+message is worth. Deliberately not dropped: losing the fact is a smaller version
+of the same mistake, and a graph that resized under you is worth knowing.
+
+This is the most upstream-able of the three, and the one that is least about us:
+every host embedding cpal's JACK backend has it.
 
 ## Upstream
 
