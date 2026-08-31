@@ -223,18 +223,156 @@ fn parse_cli() -> CliArgs {
 /// Quiet by default; `IVORY_LOG=debug ivory` turns it on. On Windows pair it
 /// with a console — the binary is windows-subsystem and reattaches to the
 /// parent, so running it from a shell shows this output.
+///
+/// Since 5.1 the same records also land in `~/.config/tangent/tangent.log`
+/// (see [`attach_log_file`]) — because the normal launch is a double-click,
+/// where stderr goes nowhere and "it broke on their machine" was previously
+/// unanswerable. Hand-rolled rather than a crate: two sinks and one filter do
+/// not need a dependency tree.
 struct StderrLogger(log::LevelFilter);
+
+/// The file the logger drains to, once [`attach_log_file`] has opened it.
+/// `None` until then, so nothing touches the config directory before the
+/// pre-5.0 purge has had its turn. A mutex because `log::Log` is `&self` from
+/// any thread; acceptable in the log path because nothing on the audio
+/// callback logs, warnings are exceptional, and each record is one
+/// pre-formatted `write_all` — no formatting and no flush loop inside the lock.
+static LOG_FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+
+/// What the file keeps no matter what `IVORY_LOG` says: warnings and errors.
+/// The file exists for the field, where nobody has set an environment
+/// variable — a terminal quieted with `IVORY_LOG=off` must not also blind
+/// the one artifact a user can send after the fact.
+const FILE_LOG_FLOOR: log::LevelFilter = log::LevelFilter::Warn;
+
+/// Rotate at half a megabyte. With exactly one predecessor kept, the pair is
+/// bounded near 1 MB total — attachable to an email, never worth a cleanup
+/// tool. Rotation happens only at startup, so a single very chatty
+/// `IVORY_LOG=debug` run can overshoot until the next launch; bounded per
+/// run, which is bounded enough.
+const MAX_LOG_LEN: u64 = 512 * 1024;
+
+impl StderrLogger {
+    /// The union of what either sink wants — stderr at its `IVORY_LOG` level,
+    /// the file never below [`FILE_LOG_FLOOR`]. `log::set_max_level` must be
+    /// set from this, not from the stderr level, or the `log!` macros drop
+    /// warn records before `log()` ever sees them.
+    fn ceiling(&self) -> log::LevelFilter {
+        self.0.max(FILE_LOG_FLOOR)
+    }
+}
 
 impl log::Log for StderrLogger {
     fn enabled(&self, m: &log::Metadata<'_>) -> bool {
-        m.level() <= self.0
+        m.level() <= self.ceiling()
     }
     fn log(&self, r: &log::Record<'_>) {
-        if self.enabled(r.metadata()) {
+        if r.level() <= self.0 {
             eprintln!("[{}] {}: {}", r.level(), r.target(), r.args());
+        }
+        if r.level() <= self.ceiling() {
+            // Formatted before the lock, written in one call, error dropped:
+            // a full disk or a yanked home directory costs the trail, never
+            // the app.
+            let line = format!(
+                "[{}] [{}] {}: {}\n",
+                utc_timestamp(unix_now()),
+                r.level(),
+                r.target(),
+                r.args()
+            );
+            if let Ok(mut slot) = LOG_FILE.lock() {
+                if let Some(file) = slot.as_mut() {
+                    use std::io::Write as _;
+                    let _ = file.write_all(line.as_bytes());
+                }
+            }
         }
     }
     fn flush(&self) {}
+}
+
+/// Seconds since the Unix epoch, or zero on a clock set before 1970 — a
+/// wrong-but-harmless timestamp beats reasoning about time inside a logger.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Unix seconds to `2026-08-31T15:32:01Z`. Hand-rolled because nothing else
+/// in the tree needs a time crate, and a dependency is the wrong price for
+/// one format. The days-to-civil arithmetic is Howard Hinnant's; exact for
+/// every date the proleptic Gregorian calendar can name, which is a few more
+/// than this log will see.
+fn utc_timestamp(secs: u64) -> String {
+    let days = secs / 86_400;
+    let rem = secs % 86_400;
+    let (hh, mm, ss) = (rem / 3600, (rem / 60) % 60, rem % 60);
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z % 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + u64::from(mo <= 2);
+    format!("{y:04}-{mo:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
+}
+
+/// Over `max_len`, the current log becomes `<name>.1` — replacing the last
+/// backup — and a fresh file starts. One predecessor, not a numbered chain,
+/// because the case that matters is "it crashed, they relaunched, THEN they
+/// asked for help": the tail of the run that died must survive exactly one
+/// relaunch, and anything older than that nobody has ever asked for.
+fn rotate_log(path: &std::path::Path, max_len: u64) {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    if meta.len() <= max_len {
+        return;
+    }
+    let mut backup = path.as_os_str().to_owned();
+    backup.push(".1");
+    let _ = std::fs::rename(path, std::path::PathBuf::from(backup));
+}
+
+/// Open `~/.config/tangent/tangent.log` and hand it to the logger.
+///
+/// Called from `main` AFTER `purge_pre_5_0` — the ordering comment there is
+/// load-bearing, and this is exactly the kind of config-file creation it
+/// exists to forbid, which is why this is not simply part of
+/// [`install_logger`]. Until it runs the logger has only stderr; the handful
+/// of records startup emits before this point go to the terminal as they
+/// always did.
+///
+/// Every failure in here is shrugged off: a read-only home costs the log
+/// file, never the launch.
+fn attach_log_file() {
+    let dir = tangent_core::config::dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("tangent.log");
+    rotate_log(&path, MAX_LOG_LEN);
+    let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
+        return;
+    };
+    // Written directly rather than through `log!` so it lands at every filter
+    // level: the header is what makes a mailed-in log answer "which build, on
+    // what" without a follow-up email.
+    use std::io::Write as _;
+    let _ = writeln!(
+        file,
+        "[{}] tangent {} starting ({} {})",
+        utc_timestamp(unix_now()),
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+    if let Ok(mut slot) = LOG_FILE.lock() {
+        *slot = Some(file);
+    }
 }
 
 fn install_logger() {
@@ -254,11 +392,36 @@ fn install_logger() {
         _ => log::LevelFilter::Warn,
     };
     let logger = Box::leak(Box::new(StderrLogger(level)));
-    let _ = log::set_logger(logger).map(|()| log::set_max_level(level));
+    let ceiling = logger.ceiling();
+    let _ = log::set_logger(logger).map(|()| log::set_max_level(ceiling));
 }
 
-/// Top-level error surface (spec §2.3): any panic shows a critical "Tangent
-/// Error" box with the message and a backtrace, then exits with code 1.
+/// Where a crash report should be sent. The always-receiving support inbox,
+/// not the branded key-fulfilment address — a crash mail must never bounce.
+const CRASH_CONTACT: &str = "tangentdaw@gmail.com";
+
+/// The text of a crash file. Version and platform first, because those are
+/// the two questions support would otherwise have to ask back — the whole
+/// point of the file is that one attachment closes the loop.
+fn crash_report(msg: &str, location: &str, backtrace: &str) -> String {
+    format!(
+        "Tangent {} ({} {})\n{}\n\n{msg}\n  at {location}\n\n{backtrace}\n",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        utc_timestamp(unix_now())
+    )
+}
+
+/// Top-level error surface (spec §2.3): any panic writes a crash file under
+/// the config directory, shows a critical "Tangent Error" box that NAMES that
+/// file, and exits with code 1.
+///
+/// The file is the load-bearing half. Before 5.1 the dialog was all there
+/// was, and a dialog is gone the moment it is dismissed — "it crashed" from
+/// someone else's machine carried no message, no location, no backtrace.
+/// Local disk only: no telemetry, no network, nothing leaves the machine
+/// unless the user mails the file themselves.
 fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
         let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
@@ -272,15 +435,38 @@ fn install_panic_hook() {
             .location()
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_default();
+        // `force_capture` rather than `capture`: the person whose machine
+        // this dies on has never heard of RUST_BACKTRACE, and the hook only
+        // runs when the process is already lost — cost is no objection here.
         let backtrace = std::backtrace::Backtrace::force_capture();
         let body =
             format!("Tangent encountered an error:\n\n{msg}\n  at {location}\n\n{backtrace}");
         eprintln!("{body}");
+        // The hook can fire before `main` has made the config directory, so
+        // make it here too. Epoch seconds in the name keep one file per
+        // crash without a collision to think about.
+        let dir = tangent_core::config::dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("crash-{}.txt", unix_now()));
+        let saved =
+            std::fs::write(&path, crash_report(&msg, &location, &backtrace.to_string())).is_ok();
+        let dialog_body = if saved {
+            eprintln!("crash report saved to {}", path.display());
+            format!(
+                "A crash report was saved to:\n{}\n\nPlease send it to {CRASH_CONTACT}.\n\n{body}",
+                path.display()
+            )
+        } else {
+            // Nowhere to write — a read-only home is not a reason to hide
+            // the error itself, so the dialog falls back to what it always
+            // showed.
+            body
+        };
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             rfd::MessageDialog::new()
                 .set_level(rfd::MessageLevel::Error)
                 .set_title("Tangent Error")
-                .set_description(&body)
+                .set_description(&dialog_body)
                 .set_buttons(rfd::MessageButtons::Ok)
                 .show();
         }));
@@ -316,6 +502,20 @@ fn acquire_single_instance() -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// The window title, composed in exactly one place: `"<project> - Tangent"`,
+/// with a ` *` after the name while there are unsaved changes — the same
+/// convention REAPER uses, so the mark reads on sight — or plain `"Tangent"`
+/// when no project is open. Pure so it can be tested; `pub` so `desktop` can
+/// recompose it per frame through `egui::ViewportCommand::Title` without a
+/// second opinion on the format ever existing — the same split as
+/// `plugin_catalog` above. ASCII hyphen: this string is published UI.
+pub fn window_title(project: &str, dirty: bool) -> String {
+    if project.is_empty() {
+        return "Tangent".to_owned();
+    }
+    format!("{project}{} - Tangent", if dirty { " *" } else { "" })
 }
 
 /// **A window icon has to fit in one X11 request, and the artwork does not.**
@@ -422,6 +622,10 @@ fn main() {
         log::info!("removed the pre-5.0 ~/.config/tangent");
     }
 
+    // The earliest legal moment — see the ordering comment above and the one
+    // on the function. Everything the logger says from here on is on disk.
+    attach_log_file();
+
     if !acquire_single_instance() {
         // **The terminal first**, as the panic hook does. A message box on
         // Linux goes through a portal or a zenity subprocess, and on a box
@@ -455,7 +659,9 @@ fn main() {
     // A decode failure just means no runtime icon: on macOS the bundle icon then
     // applies, so fall back silently rather than killing startup over artwork.
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("Tangent")
+        // No project is open when the window is built; once one is, the title
+        // is recomposed by the same `window_title` so the format cannot fork.
+        .with_title(window_title("", false))
         .with_app_id("tangent")
         .with_inner_size(size)
         // **Resizable, and the min is a floor rather than a pin.**
@@ -521,11 +727,15 @@ fn main() {
     // `IVORY_RENDERER=glow` goes back, because this is the renderer every
     // shipped build until now has used and an escape hatch costs one line.
     //
-    // Windows and Linux stay on glow: their plugin editors are not implemented
-    // (`EditorError::Unsupported`), so no foreign GL context is ever created in
-    // this process, and wgpu is a large dependency tree to add for a problem
-    // those platforms do not have yet. When their editors land, they inherit
-    // this question.
+    // Windows and Linux stay on glow — but NOT because they are safe from the
+    // problem. Plugin editors are implemented on all four platforms (an HWND,
+    // an X11 window id — see `tangent_host::editor`), so a plugin can bring a
+    // foreign GL context into this process there exactly as it can on macOS.
+    // They stay because glow is what every shipped build on those platforms
+    // has used, the flicker has only ever been OBSERVED on macOS, and a
+    // renderer swap deserves its own decision with hardware in front of it
+    // rather than riding along on a comment fix. If the flicker is ever
+    // reproduced on Windows or Linux, the macOS arm above is the template.
     #[cfg(target_os = "macos")]
     let renderer = match std::env::var("IVORY_RENDERER").as_deref() {
         Ok("glow") => eframe::Renderer::Glow,
@@ -780,5 +990,139 @@ mod icon_tests {
             "transparent black bled into the opaque white: {:?}",
             &out.rgba[p..p + 4]
         );
+    }
+}
+
+#[cfg(test)]
+mod diagnosability_tests {
+    use super::{crash_report, rotate_log, utc_timestamp, window_title};
+
+    /// A scratch root per test, in the OS temp directory — same pattern as
+    /// tangent-core's config tests, and for the same reason: a test that
+    /// touches the real `~/.config/tangent` would rotate the log of whoever
+    /// ran it.
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "tangent-log-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).expect("scratch");
+        p
+    }
+
+    /// The point of rotation is that the tail of the run that CRASHED
+    /// survives the relaunch that follows it — so the oversized file must
+    /// move to `.1` intact, not be truncated in place.
+    #[test]
+    fn an_oversized_log_becomes_the_backup_with_its_contents_intact() {
+        let root = scratch("rotate");
+        let path = root.join("tangent.log");
+        std::fs::write(&path, vec![b'x'; 4096]).expect("write");
+
+        rotate_log(&path, 1024);
+
+        assert!(!path.exists(), "the oversized log was left in place");
+        let backup = root.join("tangent.log.1");
+        let kept = std::fs::read(&backup).expect("the backup should exist");
+        assert_eq!(kept.len(), 4096, "the backup lost bytes in the move");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Under the cap nothing moves — and an existing backup is not disturbed,
+    /// because it may still be the only record of the crash being asked about.
+    #[test]
+    fn a_small_log_is_not_rotated() {
+        let root = scratch("small");
+        let path = root.join("tangent.log");
+        std::fs::write(&path, b"short").expect("write");
+        std::fs::write(root.join("tangent.log.1"), b"previous run").expect("backup");
+
+        rotate_log(&path, 1024);
+
+        assert!(path.exists(), "a small log was rotated away");
+        assert_eq!(
+            std::fs::read(root.join("tangent.log.1")).expect("backup"),
+            b"previous run",
+            "the backup was touched for no reason"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A second rotation REPLACES the backup rather than growing a chain —
+    /// one predecessor is the bound that keeps the pair attachable to an
+    /// email forever.
+    #[test]
+    fn a_second_rotation_replaces_the_backup() {
+        let root = scratch("replace");
+        let path = root.join("tangent.log");
+        std::fs::write(&path, vec![b'a'; 2048]).expect("first");
+        rotate_log(&path, 1024);
+        std::fs::write(&path, vec![b'b'; 2048]).expect("second");
+        rotate_log(&path, 1024);
+
+        let kept = std::fs::read(root.join("tangent.log.1")).expect("backup");
+        assert!(
+            kept.iter().all(|b| *b == b'b'),
+            "the backup still holds the older generation"
+        );
+        assert!(
+            !root.join("tangent.log.1.1").exists(),
+            "rotation grew a chain instead of replacing the backup"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A missing log is the first-launch case, not a fault.
+    #[test]
+    fn rotating_a_log_that_is_not_there_does_nothing() {
+        let root = scratch("absent");
+        rotate_log(&root.join("tangent.log"), 1024);
+        assert!(!root.join("tangent.log.1").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The crash file must answer the questions support would otherwise mail
+    /// back: which build, on what, what happened, where.
+    #[test]
+    fn a_crash_report_names_the_build_the_platform_and_the_fault() {
+        let report = crash_report(
+            "index out of bounds",
+            "tangent-ui/src/app.rs:123:4",
+            "0: some::frame",
+        );
+        assert!(report.contains(env!("CARGO_PKG_VERSION")), "no version: {report}");
+        assert!(report.contains(std::env::consts::OS), "no OS: {report}");
+        assert!(report.contains(std::env::consts::ARCH), "no arch: {report}");
+        assert!(report.contains("index out of bounds"), "no message: {report}");
+        assert!(report.contains("tangent-ui/src/app.rs:123:4"), "no location: {report}");
+        assert!(report.contains("0: some::frame"), "no backtrace: {report}");
+    }
+
+    /// The hand-rolled civil-date arithmetic against known answers, including
+    /// both leap cases that break naive versions: a leap year inside a
+    /// century (2024) and the century year that IS a leap year (2000).
+    #[test]
+    fn the_timestamp_matches_the_calendar() {
+        for (secs, want) in [
+            (0u64, "1970-01-01T00:00:00Z"),
+            (951_782_400, "2000-02-29T00:00:00Z"),
+            (1_709_164_800, "2024-02-29T00:00:00Z"),
+            (1_756_654_321, "2025-08-31T15:32:01Z"),
+            (4_102_444_799, "2099-12-31T23:59:59Z"),
+        ] {
+            assert_eq!(utc_timestamp(secs), want, "for {secs}");
+        }
+    }
+
+    /// The title carries the project, the dirty mark carries the star, and a
+    /// build with no project open still answers to its own name.
+    #[test]
+    fn the_window_title_carries_project_and_dirtiness() {
+        assert_eq!(window_title("", false), "Tangent");
+        assert_eq!(window_title("", true), "Tangent", "no project, nothing to be dirty");
+        assert_eq!(window_title("First Song", false), "First Song - Tangent");
+        assert_eq!(window_title("First Song", true), "First Song * - Tangent");
     }
 }

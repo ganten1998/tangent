@@ -481,6 +481,11 @@ pub struct DesktopApp {
     pending_midi: Option<Option<String>>,
     /// A frame has reached the screen. Deferred startup work waits for it.
     painted_once: bool,
+    /// What the title bar says now, so the viewport command is sent only
+    /// when the composed title actually changes — the window title carries
+    /// the project's name and its dirtiness, and re-sending an unchanged
+    /// string every frame is noise some window managers animate.
+    last_title: String,
     /// Frames counted by the `IVORY_GEOM_PROBE` diagnostic. See `update`.
     probe_frames: u32,
     /// `IVORY_PACE_PROBE` accumulators: when the window last reported, how
@@ -7362,6 +7367,7 @@ impl DesktopApp {
         let mut me = Self {
             pending_midi: Some(pending_midi),
             painted_once: false,
+            last_title: crate::window_title("", false),
             probe_frames: 0,
             pace_since: None,
             pace_frames: 0,
@@ -7559,6 +7565,18 @@ impl eframe::App for DesktopApp {
         let facts = Self::window_facts(frame, &self.app);
         self.app.set_host_gesture(facts.gesture);
         self.app.set_os_aspect_lock(facts.os_aspect_lock);
+        // **The title bar knows the session.** Composed in one place
+        // (`crate::window_title`) and sent only on change; project_dirty is
+        // a comparison of two serialisations, cheap at frame rate but not
+        // worth a viewport command when nothing moved.
+        {
+            let want =
+                crate::window_title(&self.app.project_name(), self.app.project_dirty());
+            if want != self.last_title {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Title(want.clone()));
+                self.last_title = want;
+            }
+        }
         self.reconcile_screen_cover(ctx, frame);
         self.reconcile_decoration_size(frame);
         // **The window is closing — is that all right?**
