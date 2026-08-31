@@ -1,7 +1,7 @@
 //! Tangent as a VST3 plugin.
 //!
 //! This crate is a shell. Everything you see when it opens is
-//! `tangent_ui::app::IvoryApp` — the same code the standalone runs, not a
+//! `tangent_ui::app::TangentApp` — the same code the standalone runs, not a
 //! lookalike — and everything this file does is answer the three questions a
 //! DAW asks that a desktop window never does:
 //!
@@ -25,7 +25,7 @@
 
 use baseview::PhySize;
 use crossbeam::queue::ArrayQueue;
-use tangent_ui::app::IvoryApp;
+use tangent_ui::app::TangentApp;
 use tangent_ui::host::Caps;
 use tangent_ui::midi_event::MidiEvent;
 use tangent_ui::settings::Settings;
@@ -100,7 +100,7 @@ struct Tangent {
     /// window would silently reset the tuning, the theory selection and every
     /// note you had placed by hand. Holding it here instead means the window
     /// is a lid, not a lifetime.
-    editor: Arc<Mutex<Option<IvoryApp>>>,
+    editor: Arc<Mutex<Option<TangentApp>>>,
 }
 
 #[derive(Params)]
@@ -191,7 +191,7 @@ impl Plugin for Tangent {
                     let mut slot = home.lock();
                     if slot.is_none() {
                         let settings = Settings::from_json(&params.settings.lock());
-                        *slot = Some(IvoryApp::new(ctx, settings, Caps::PLUGIN));
+                        *slot = Some(TangentApp::new(ctx, settings, Caps::PLUGIN));
                     } else {
                         // A new window means a new GL context and a new font
                         // atlas, so the faces have to go back on.

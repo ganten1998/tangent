@@ -141,7 +141,7 @@ impl Routes {
     /// run by the time a send is gathered, so the audio is processed and then
     /// goes nowhere. Rather than leave a route that silently drops what it
     /// carries, the route goes — and folders are not offered in the picker in
-    /// the first place. See `IvoryApp::routing_dialog`.
+    /// the first place. See `TangentApp::routing_dialog`.
     ///
     /// Returns how many were dropped, so a caller can tell somebody.
     pub fn drop_into(&mut self, channel: usize) -> usize {

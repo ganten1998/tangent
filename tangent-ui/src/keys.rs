@@ -133,7 +133,7 @@ pub struct Gates {
     /// Gates fullscreen. A plugin editor lives inside somebody's DAW and has
     /// no business taking their display.
     pub window_sizing: bool,
-    /// This session is being read out loud — `IvoryApp::reader_mode()`,
+    /// This session is being read out loud — `TangentApp::reader_mode()`,
     /// whoever decided so, the saved setting or this session's detection.
     ///
     /// Not a gate on any binding: it changes what the card ADVERTISES. In

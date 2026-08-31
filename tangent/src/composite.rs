@@ -1,7 +1,7 @@
 //! The video compositor: one offscreen egui pass per output frame.
 //!
 //! This is the surface half of RECORDER-PLAN §6. The other half is
-//! `IvoryApp::paint_composite`, which sees only an `egui::Painter` — that seam
+//! `TangentApp::paint_composite`, which sees only an `egui::Painter` — that seam
 //! is what keeps `tangent-ui` free of every renderer, and it is the reason the
 //! firewall survives a feature that is fundamentally about pixels.
 //!
@@ -50,7 +50,7 @@
 #[cfg(target_os = "linux")]
 mod glctx;
 
-use tangent_ui::app::IvoryApp;
+use tangent_ui::app::TangentApp;
 use tangent_ui::recorder::{DisplayShows, Layout};
 
 /// One offscreen frame's worth of machinery.
@@ -609,7 +609,7 @@ impl Compositor {
     /// regardless of what the camera is doing.
     pub fn frame(
         &mut self,
-        app: &IvoryApp,
+        app: &TangentApp,
         layout: Layout,
         shows: DisplayShows,
         want_camera: bool,
@@ -637,7 +637,7 @@ impl Compositor {
     #[allow(clippy::too_many_arguments)]
     fn frame_painting(
         &mut self,
-        app: &IvoryApp,
+        app: &TangentApp,
         layout: Layout,
         shows: DisplayShows,
         want_camera: bool,
@@ -983,7 +983,7 @@ mod tests {
     /// to write it differently.
     fn compose_one<'a>(
         c: &'a mut Compositor,
-        app: &IvoryApp,
+        app: &TangentApp,
         camera: Option<(&[u8], u32, u32)>,
     ) -> Result<&'a [u8], String> {
         c.frame(
@@ -1088,7 +1088,7 @@ mod tests {
             eprintln!("compositor did not take the owned-GL path - nothing to protect here");
             return;
         }
-        let app = IvoryApp::new(
+        let app = TangentApp::new(
             c.context(),
             tangent_ui::settings::Settings::default(),
             tangent_ui::host::Caps::MINIMAL,
@@ -1203,7 +1203,7 @@ mod tests {
         // since it would be two hundred points of transport it can never
         // populate — and a camera frame is not something such a host can have
         // in the first place.
-        let app = IvoryApp::new(
+        let app = TangentApp::new(
             c.context(),
             tangent_ui::settings::Settings::first_launch(),
             tangent_ui::host::Caps::DESKTOP,
@@ -1278,7 +1278,7 @@ mod tests {
         let path = dir.join("default-layout.mp4");
 
         let mut c = Compositor::on(device, queue, W, H).expect("compositor");
-        let app = IvoryApp::new(
+        let app = TangentApp::new(
             c.context(),
             tangent_ui::settings::Settings::default(),
             tangent_ui::host::Caps::MINIMAL,
@@ -1384,7 +1384,7 @@ mod tests {
             return;
         };
         let mut c = Compositor::on(device, queue, 160, 120).expect("compositor");
-        let app = IvoryApp::new(
+        let app = TangentApp::new(
             c.context(),
             tangent_ui::settings::Settings::default(),
             tangent_ui::host::Caps::MINIMAL,
@@ -1431,7 +1431,7 @@ mod tests {
         const W: u32 = 64;
         const H: u32 = 64;
         let mut c = Compositor::on(device, queue, W, H).expect("compositor");
-        let app = IvoryApp::new(
+        let app = TangentApp::new(
             c.context(),
             tangent_ui::settings::Settings::default(),
             tangent_ui::host::Caps::MINIMAL,
@@ -1545,7 +1545,7 @@ mod cost {
             );
             let mut settings = tangent_ui::settings::Settings::default();
             settings.show_recorder = true;
-            let app = IvoryApp::new(c.context(), settings, tangent_ui::host::Caps::DESKTOP);
+            let app = TangentApp::new(c.context(), settings, tangent_ui::host::Caps::DESKTOP);
             let mut cam = vec![0u8; (w * h * 4) as usize];
             for (i, px) in cam.chunks_exact_mut(4).enumerate() {
                 px[0] = (i % 251) as u8;
@@ -1654,7 +1654,7 @@ mod cost {
         }
         let mut settings = tangent_ui::settings::Settings::default();
         settings.show_recorder = true;
-        let app = IvoryApp::new(c.context(), settings, tangent_ui::host::Caps::DESKTOP);
+        let app = TangentApp::new(c.context(), settings, tangent_ui::host::Caps::DESKTOP);
 
         // A camera frame that is not flat, so nothing can shortcut the upload.
         let mut cam = vec![0u8; (w * h * 4) as usize];
@@ -1732,7 +1732,7 @@ mod shot {
     /// **It photographs the COMPOSITE, not the app's own frame**, and the
     /// distinction costs an hour if you meet it by surprise. `Compositor::frame`
     /// paints what the video records — the bands and the keyboard — from a
-    /// `&IvoryApp`; it never calls `app.frame(ctx)`. So nothing that lives in
+    /// `&TangentApp`; it never calls `app.frame(ctx)`. So nothing that lives in
     /// an egui pass can appear here: no menu, no dialog, no mixer. Dialogs are
     /// child viewports on the desktop besides, which an offscreen compositor
     /// does not run at all.
@@ -1748,7 +1748,7 @@ mod shot {
             eprintln!("IVORY_SHOT not set");
             return;
         };
-        // **Never the real settings file.** This builds an `IvoryApp` and runs
+        // **Never the real settings file.** This builds an `TangentApp` and runs
         // frames, and a frame can save. `tangent-ui` is linked here as an
         // ordinary library, so its own `#[cfg(test)]` guard is not in force —
         // see `Settings::path`.
@@ -1799,7 +1799,7 @@ mod shot {
         settings.limiter_mix = 0.75;
         settings.master_gain = 0.7;
         settings.metronome_gain = 0.5;
-        let mut app = IvoryApp::new(c.context(), settings, tangent_ui::host::Caps::DESKTOP);
+        let mut app = TangentApp::new(c.context(), settings, tangent_ui::host::Caps::DESKTOP);
         app.set_effect_defaults(crate::desktop::effect_defaults_for_shot());
         if std::env::var("IVORY_SHOT_METER").is_ok() {
             use tangent_ui::recorder::{Level, Meters};
@@ -1873,7 +1873,7 @@ mod shot {
         if std::env::var("IVORY_SHOT_ARRANGE").is_ok() {
             app.open_arrangement_for_shot();
         }
-        let mut shoot = |app: &IvoryApp| {
+        let mut shoot = |app: &TangentApp| {
             c.frame(
                 app,
                 Layout::default(),
@@ -1982,9 +1982,9 @@ mod shot {
         };
         let mut settings = tangent_ui::settings::Settings::default();
         settings.show_recorder = true;
-        let mut app = IvoryApp::new(c.context(), settings, tangent_ui::host::Caps::DESKTOP);
+        let mut app = TangentApp::new(c.context(), settings, tangent_ui::host::Caps::DESKTOP);
         app.open_arrangement_for_shot();
-        let mut shoot = |app: &IvoryApp| {
+        let mut shoot = |app: &TangentApp| {
             let draw = |painter: &egui::Painter, rect: egui::Rect| {
                 let clips = app.arrange_clips_for_shot();
                 let view = app.arrange_view_for_shot(&clips);
@@ -2050,9 +2050,9 @@ mod shot {
         };
         let mut settings = tangent_ui::settings::Settings::default();
         settings.show_recorder = true;
-        let mut app = IvoryApp::new(c.context(), settings, tangent_ui::host::Caps::DESKTOP);
+        let mut app = TangentApp::new(c.context(), settings, tangent_ui::host::Caps::DESKTOP);
         app.open_midi_editor_for_shot();
-        let mut shoot = |app: &IvoryApp| {
+        let mut shoot = |app: &TangentApp| {
             let draw = |painter: &egui::Painter, rect: egui::Rect| {
                 let clips = app.arrange_clips_for_shot();
                 let view = app.arrange_view_for_shot(&clips);
@@ -2119,10 +2119,10 @@ mod shot {
         };
         let mut settings = tangent_ui::settings::Settings::default();
         settings.show_recorder = true;
-        let mut app = IvoryApp::new(c.context(), settings, tangent_ui::host::Caps::DESKTOP);
+        let mut app = TangentApp::new(c.context(), settings, tangent_ui::host::Caps::DESKTOP);
         app.open_arrangement_for_shot();
         app.open_drumpad_for_shot();
-        let mut shoot = |app: &IvoryApp| {
+        let mut shoot = |app: &TangentApp| {
             let draw = |painter: &egui::Painter, rect: egui::Rect| {
                 let clips = app.arrange_clips_for_shot();
                 let view = app.arrange_view_for_shot(&clips);
@@ -2187,9 +2187,9 @@ mod shot {
         };
         let mut settings = tangent_ui::settings::Settings::default();
         settings.show_recorder = true;
-        let mut app = IvoryApp::new(c.context(), settings, tangent_ui::host::Caps::DESKTOP);
+        let mut app = TangentApp::new(c.context(), settings, tangent_ui::host::Caps::DESKTOP);
         app.open_mixer_for_shot();
-        let mut shoot = |app: &IvoryApp| {
+        let mut shoot = |app: &TangentApp| {
             let draw = |painter: &egui::Painter, rect: egui::Rect| {
                 tangent_ui::mixer_panel::draw(painter, rect, &app.mixer_view_for_shot());
             };
@@ -2258,8 +2258,8 @@ mod shot {
             }
         };
         let settings = tangent_ui::settings::Settings::default();
-        let app = IvoryApp::new(c.context(), settings, tangent_ui::host::Caps::DESKTOP);
-        let mut shoot = |app: &IvoryApp| {
+        let app = TangentApp::new(c.context(), settings, tangent_ui::host::Caps::DESKTOP);
+        let mut shoot = |app: &TangentApp| {
             let draw = |painter: &egui::Painter, rect: egui::Rect| {
                 // The app's own black under it, exactly as the host paints
                 // before handing the splash its rect — the splash draws no

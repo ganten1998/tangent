@@ -254,7 +254,7 @@ const WM_GRACE: Duration = Duration::from_millis(600);
 
 /// What is sounding, and why (spec §10 semantics).
 ///
-/// Pulled out of `IvoryApp` so it can be TESTED: the rules here have four
+/// Pulled out of `TangentApp` so it can be TESTED: the rules here have four
 /// interacting branches and had no coverage at all, while being the thing every
 /// other display in the app reads from. It is also the piece the plugin build
 /// needs, since a plugin receives note events from the host rather than from a
@@ -323,7 +323,7 @@ impl NoteState {
     }
 }
 
-pub struct IvoryApp {
+pub struct TangentApp {
     settings: Settings,
     detector: ChordDetector,
     /// Supporter license, loaded once at startup. Status is DERIVED from it
@@ -557,10 +557,22 @@ pub struct IvoryApp {
     /// The first channel column the mixer shows — the desk scrolls now that
     /// it has more channels than fit. The click and the master are pinned;
     /// only the channels move. Clamped where the view is built.
-    mixer_scroll: usize,
-    /// The first lane the arrangement shows — the vertical twin of
-    /// `mixer_scroll`, moved by the wheel over the track headers.
+    /// How far the mixer's channel region is scrolled, in pixels — the
+    /// wheel moves it like a web page and `mixer_panel::Layout` clamps it,
+    /// so a stale value after a zoom or resize lands on the nearest legal
+    /// position rather than going dead.
+    mixer_scroll_px: f32,
+    /// The first lane the arrangement shows — the vertical twin of the
+    /// mixer's scroll, moved by the wheel over the track headers. Still a
+    /// whole-lane index: the lane stack distributes exact heights (bus
+    /// half-rows, automation shrinkage) and has no notion of a partial
+    /// lane, so the smoothness lives in `arr_scroll_acc` instead.
     arr_lane_scroll: usize,
+    /// The wheel's unspent pixels against the lane stack. A trackpad flick
+    /// steps as many lanes as it is worth and a slow drag steps none until
+    /// a lane's height of intent has accrued — the web-page feel without
+    /// teaching the stack fractional lanes.
+    arr_scroll_acc: f32,
     /// The mixer control being dragged, and where the hand started.
     mixer_grab: Option<MixerGrab>,
     /// An insert bay being carried to another channel: `(strip, bay, where
@@ -850,7 +862,7 @@ pub struct IvoryApp {
     /// **A waveform is drawn at a zoom**, and a picture computed once at
     /// import is a picture that is right at one zoom and blocky at every
     /// other. The host recomputes when this has moved far enough to matter;
-    /// see `IvoryApp::arr_wave_view`.
+    /// see `TangentApp::arr_wave_view`.
     arr_wave_at: Option<(f64, f64, f32)>,
     /// Where the mixer was last drawn, so a press can be tested against it.
     mixer_rect: Option<Rect>,
@@ -1065,7 +1077,7 @@ pub struct IvoryApp {
     /// a note that outlives the gesture that started it rings forever, and the
     /// only way to stop it is to quit the app.
     /// What the app is currently making the instrument sound, in DISPLAY
-    /// pitches. Reconciled once a frame against [`IvoryApp::wanted_sound`].
+    /// pitches. Reconciled once a frame against [`TangentApp::wanted_sound`].
     ///
     /// **One set for three gestures**, and that is what keeps them from
     /// fighting: a note held down with the mouse, a chord latched by
@@ -1439,7 +1451,7 @@ struct Moment {
     kits: String,
 }
 
-/// Everything a track is, held by value. See [`IvoryApp::copy_track`].
+/// Everything a track is, held by value. See [`TangentApp::copy_track`].
 #[derive(Clone)]
 struct TrackCopy {
     /// Which lane it came from — the host needs it to find the plugin state
@@ -1885,7 +1897,7 @@ fn theory_pitches(hit: theory_panel::Hit) -> Vec<u8> {
 /// to be perfectly still would open the text field about half the time.
 const TAP_SLOP: f32 = 4.0;
 
-impl IvoryApp {
+impl TangentApp {
     /// `ctx` rather than an `eframe::CreationContext`, because eframe is one of
     /// three things that can hand this app a context and the other two have
     /// never heard of it. Everything the old signature used was `cc.egui_ctx`.
@@ -2071,8 +2083,9 @@ impl IvoryApp {
             vu_at: 0.0,
             notice_dismissed: None,
             mixer_open: false,
-            mixer_scroll: 0,
+            mixer_scroll_px: 0.0,
             arr_lane_scroll: 0,
+            arr_scroll_acc: 0.0,
             mixer_grab: None,
             bay_carry: None,
             mixer_typing: None,
@@ -3132,7 +3145,7 @@ impl IvoryApp {
     /// **Both, not one or the other.** The sound follows the CLICK in either
     /// mode — that is what makes every surface here an instrument — and the
     /// toggle decides only whether the note is still lit after the button
-    /// comes up. See [`wanted_sound`](IvoryApp::wanted_sound) for why the
+    /// comes up. See [`wanted_sound`](TangentApp::wanted_sound) for why the
     /// latch does not hold the note down.
     fn place_or_play(&mut self, note: u8) {
         self.sound_while_held([note]);
@@ -3996,7 +4009,16 @@ impl IvoryApp {
             }
             self.set_is_folder(n, false);
         }
-        self.set_in_folder(n, false);
+        // **The emptied row keeps its indent.** Membership is a CONTIGUOUS
+        // run, so clearing the vacated row's flag severed everything below
+        // it from the group — the handed-up children of a deleted inner
+        // folder, and the rest of the run when a middle member left. The
+        // old engine scan ignored the gap, which is exactly the UI/engine
+        // disagreement `folder_parents` no longer permits; the owner's own
+        // ruling already named the right picture: "indented below an empty
+        // channel". An empty row inside a group is an indented plus.
+        let keeps_indent = self.folder_of(n).is_some();
+        self.set_in_folder(n, keeps_indent);
         self.settings.tracks_added &= !(1 << n);
         use crate::recorder::Strip;
         let d = Settings::default();
@@ -4595,9 +4617,7 @@ impl IvoryApp {
             }),
             any_solo: desk.any_solo(),
             visible: self.mixer_visible(),
-            scroll: self
-                .mixer_scroll
-                .min(crate::recorder::CHANNELS.saturating_sub(self.mixer_visible())),
+            scroll_px: self.mixer_scroll_px,
             selected: self.selected_channel,
             selected_tracks: &self.selected_tracks,
             fx_menu: self.mixer_fx_menu,
@@ -5930,7 +5950,7 @@ impl IvoryApp {
     /// lattice, Clear, Space, letting go of the mouse, switching keytoggle
     /// off, or starting a take.
     ///
-    /// [`wanted_sound`]: IvoryApp::wanted_sound
+    /// [`wanted_sound`]: TangentApp::wanted_sound
     fn reconcile_sound(&mut self) {
         let want = self.wanted_sound();
         // **A strike starts from nothing.** Diffing against an empty set makes
@@ -6053,7 +6073,7 @@ impl IvoryApp {
     /// nothing at all on a fresh install, and "Save As" opened a panel at a
     /// folder that was not there.
     ///
-    /// **Not in `Settings::load` and not in `IvoryApp::new`**, which is why
+    /// **Not in `Settings::load` and not in `TangentApp::new`**, which is why
     /// it is a method the host calls rather than something that happens on
     /// its own: the VST3 loads settings too, and a plugin scanned by some
     /// other DAW's background scanner must not create folders in the user's
@@ -9065,6 +9085,18 @@ impl IvoryApp {
             return None;
         }
         if self.os_aspect_lock {
+            self.pane_seen = None;
+            self.pane_settled = None;
+            self.snap_asked = None;
+            return None;
+        }
+        // **A screen-sized window is a destination, not a mistake.** Somebody
+        // zoomed, tiled or dragged the window to fill the monitor; snapping
+        // it back to the layout's aspect is the app arguing with a decision
+        // a hand just made. The layout adapts instead (`screen_sized` shows
+        // the whole desk), and the snap re-arms the moment the window comes
+        // off the screen edge.
+        if self.screen_sized {
             self.pane_seen = None;
             self.pane_settled = None;
             self.snap_asked = None;
@@ -12700,7 +12732,7 @@ impl IvoryApp {
     }
 
     /// Move one knob. The engine reads the document whole every frame
-    /// through [`IvoryApp::drum_kit_params`], so there is nothing to push;
+    /// through [`TangentApp::drum_kit_params`], so there is nothing to push;
     /// the sidecar saves when the gesture ENDS, not sixty times through it.
     fn drumpad_set(&mut self, p: crate::drumpad_panel::Param, v: f32) {
         use crate::drumpad_panel::Param as P;
@@ -15212,12 +15244,37 @@ impl IvoryApp {
                             self.save_settings();
                         }
                     } else {
+                        // **Pixels of intent, spent in whole lanes.** The
+                        // lane stack distributes exact heights — bus
+                        // half-rows, automation shrinkage — and has no
+                        // notion of a partial lane, so the delta ACCRUES
+                        // and steps a lane each time roughly a lane's
+                        // height of it has arrived: a trackpad flick moves
+                        // what it is worth, a slow drag moves nothing
+                        // until it means it, and nobody gets the old
+                        // one-lane-per-micro-tick jump.
                         let max =
                             crate::recorder::CHANNELS.saturating_sub(self.arr_visible());
-                        if d < -0.5 {
+                        let lane_h = (rect.height()
+                            / self.arr_visible().max(1) as f32)
+                            .max(24.0);
+                        self.arr_scroll_acc -= d;
+                        while self.arr_scroll_acc >= lane_h {
+                            self.arr_scroll_acc -= lane_h;
                             self.arr_lane_scroll = (self.arr_lane_scroll + 1).min(max);
-                        } else if d > 0.5 {
+                        }
+                        while self.arr_scroll_acc <= -lane_h {
+                            self.arr_scroll_acc += lane_h;
                             self.arr_lane_scroll = self.arr_lane_scroll.saturating_sub(1);
+                        }
+                        // Unspendable intent dies at the rails rather than
+                        // banking up: holding the wheel at the top must
+                        // not owe the desk a screenful of downward scroll.
+                        if self.arr_lane_scroll == 0 && self.arr_scroll_acc < 0.0 {
+                            self.arr_scroll_acc = 0.0;
+                        }
+                        if self.arr_lane_scroll >= max && self.arr_scroll_acc > 0.0 {
+                            self.arr_scroll_acc = 0.0;
                         }
                     }
                     return;
@@ -17892,6 +17949,18 @@ impl IvoryApp {
             .rev()
             .find(|n| !self.channel_used(*n) && !(top..=bottom).contains(n))
         else {
+            // **Said out loud.** On a busy sixteen-track session there is no
+            // spare row to BE the folder, and a shortcut that silently does
+            // nothing here is worse than one that does nothing visibly —
+            // this fn's own doc said so while the refusal stayed mute.
+            if self.dialog.is_none() {
+                self.dialog = Some(dialogs::Dialog::Notice {
+                    title: "Tangent".to_owned(),
+                    body: "No free channel to hold the folder: all 16 rows \
+                           are in use. Remove a track to make room."
+                        .to_owned(),
+                });
+            }
             return false;
         };
         // The permutation: everything in order, with the spare lifted out
@@ -17926,25 +17995,20 @@ impl IvoryApp {
         true
     }
 
+    /// The engine's folder table, derived from the ONE membership rule.
+    ///
+    /// This used to be its own forward scan that never reset `nearest` when
+    /// a run of members broke — so flag soup a reorder or a stale file left
+    /// behind had the UI (through `folder_of`, which demands a contiguous
+    /// run) drawing a track flat while the engine folded its audio into a
+    /// group. Two derivations of one fact, and only one of them knew the
+    /// contiguity rule that makes the positional model safe. Now the engine
+    /// reads `folder_of` per channel, so the two CANNOT disagree; the
+    /// O(n^2) over sixteen lanes is free.
     pub fn folder_parents(&self) -> [i32; crate::recorder::CHANNELS] {
-        let mut out = [-1i32; crate::recorder::CHANNELS];
-        let is_folder = |n: usize| {
-            self.settings.strip_is_folder.get(n).copied().unwrap_or(false)
-        };
-        let mut nearest: Option<usize> = None;
-        for ch in 0..crate::recorder::CHANNELS {
-            if self.settings.strip_in_folder.get(ch).copied().unwrap_or(false) {
-                if let Some(p) = nearest {
-                    out[ch] = p as i32;
-                }
-            }
-            // Updated AFTER the lookup: a folder that is itself inside a
-            // folder belongs to the one above it, not to itself.
-            if is_folder(ch) {
-                nearest = Some(ch);
-            }
-        }
-        out
+        std::array::from_fn(|ch| {
+            self.folder_of(ch).map_or(-1, |p| p as i32)
+        })
     }
 
     pub fn playhead_s(&self) -> f64 {
@@ -22190,7 +22254,7 @@ fn band_sizes_at(settings: &Settings, w: f32) -> Bands {
     });
     // Zero when hidden AND zero when popped out, like every band above it.
     //
-    // There is no `caps` term here and there must not be: `IvoryApp::new`
+    // There is no `caps` term here and there must not be: `TangentApp::new`
     // already forces `show_recorder` false wherever `capture_devices` is,
     // so a host that cannot record has nothing to zero. Testing caps here as
     // well would put the same rule in two places, and the two would disagree
@@ -22436,7 +22500,7 @@ impl Bands {
     }
 }
 
-impl IvoryApp {
+impl TangentApp {
     /// One frame, from a `Context`.
     ///
     /// All three hosts hand over a context rather than a `Ui` — `eframe::App`
@@ -23348,13 +23412,20 @@ impl IvoryApp {
         // because the tiler leaves a menu bar and a gap and the question is
         // "is this effectively the whole screen", not "is a flag set".
         let pane_now = self.main_live_size;
+        // **Measured, never gated on WHO sized it.** This used to demand the
+        // wm-managed latch as well, so only a detected tiler could unlock the
+        // full desk — a green-button zoom (which macOS never reports as
+        // `maximized`) and a snap from a manager the latch had not caught
+        // yet both showed eight giant strips on a full screen. The question
+        // is "does the window effectively fill the monitor", and the window
+        // and the monitor are both right there to measure. The slack absorbs
+        // the menu bar, a title bar, and a tiler's gaps.
         self.screen_sized = self.caps.window_sizing
             && (full
-                || (self.main_wm_managed
-                    && match (pane_now, monitor) {
-                        (Some(p), Some(m)) => p.y + 60.0 >= m.y && p.x + 8.0 >= m.x,
-                        _ => false,
-                    }));
+                || match (pane_now, monitor) {
+                    (Some(p), Some(m)) => p.y + 96.0 >= m.y && p.x + 40.0 >= m.x,
+                    _ => false,
+                });
         let monitor = monitor.map(|m| m.x);
         // **Learn the monitor's width, once.** The percentages are shares of
         // it now (see `main_width`), and the very first window of a launch is
@@ -24456,25 +24527,21 @@ impl IvoryApp {
                             .clamp(1, crate::recorder::CHANNELS as i64);
                         if next != cur {
                             self.settings.mixer_visible = next as u8;
-                            // Re-clamp the STORE, not just the view's
-                            // copy: zooming in while scrolled deep left
-                            // `mixer_scroll` above the new max, and the
-                            // next wheel-ups spent themselves walking the
-                            // stale value down — dead notches.
-                            self.mixer_scroll = self.mixer_scroll.min(
-                                crate::recorder::CHANNELS
-                                    .saturating_sub(self.mixer_visible()),
-                            );
                             self.save_settings();
                         }
                     } else {
-                        // Plain wheel SCROLLS — one channel per tick.
-                        let max = crate::recorder::CHANNELS.saturating_sub(self.mixer_visible());
-                        if d < 0.0 {
-                            self.mixer_scroll = (self.mixer_scroll + 1).min(max);
-                        } else {
-                            self.mixer_scroll = self.mixer_scroll.saturating_sub(1);
-                        }
+                        // Plain wheel SCROLLS, in PIXELS — the raw delta IS
+                        // pixels of intent, so a trackpad glides and a mouse
+                        // notch moves about half a strip instead of exactly
+                        // one whole one. Clamped here against the same
+                        // arithmetic the layout uses, so the value never
+                        // banks up past the end and goes dead.
+                        let max = crate::mixer_panel::Layout::max_scroll_px(
+                            rect,
+                            self.mixer_visible(),
+                        );
+                        self.mixer_scroll_px =
+                            (self.mixer_scroll_px - d).clamp(0.0, max);
                     }
                 }
             }
@@ -25391,10 +25458,10 @@ mod tests {
     #[test]
     fn the_app_can_be_handed_to_a_plugin_editor() {
         fn assert_send<T: 'static + Send>() {}
-        assert_send::<IvoryApp>();
+        assert_send::<TangentApp>();
     }
 
-    pub(super) fn headless(caps: Caps) -> (egui::Context, IvoryApp) {
+    pub(super) fn headless(caps: Caps) -> (egui::Context, TangentApp) {
         headless_with(caps, Settings::default())
     }
 
@@ -25408,7 +25475,7 @@ mod tests {
     #[test]
     fn tab_puts_the_mixer_where_the_piano_was() {
         let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
-        let run = |ctx: &egui::Context, app: &mut IvoryApp| {
+        let run = |ctx: &egui::Context, app: &mut TangentApp| {
             let _ = ctx.run(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
@@ -25582,7 +25649,7 @@ mod tests {
             channels: 18,
             exposed: Vec::new(),
         });
-        let run = |ctx: &egui::Context, app: &mut IvoryApp| {
+        let run = |ctx: &egui::Context, app: &mut TangentApp| {
             let _ = ctx.run(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(
@@ -25724,7 +25791,7 @@ mod tests {
     #[test]
     fn the_setup_panel_opens_and_draws_and_its_controls_act() {
         let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
-        let run = |ctx: &egui::Context, app: &mut IvoryApp| {
+        let run = |ctx: &egui::Context, app: &mut TangentApp| {
             let _ = ctx.run(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(
@@ -26016,10 +26083,10 @@ mod tests {
         assert_eq!(app.armed & (1 << 3), 0, "a new track armed itself");
         app.set_channel_input_spec(3, "0+1");
         assert_eq!(app.input_chip_text(3), "IN 1/2");
-        assert_eq!(IvoryApp::parse_input_spec("2"), Some((2, None)));
-        assert_eq!(IvoryApp::parse_input_spec("0+1"), Some((0, Some(1))));
-        assert_eq!(IvoryApp::parse_input_spec("midi:all"), None);
-        assert_eq!(IvoryApp::parse_input_spec(""), None);
+        assert_eq!(TangentApp::parse_input_spec("2"), Some((2, None)));
+        assert_eq!(TangentApp::parse_input_spec("0+1"), Some((0, Some(1))));
+        assert_eq!(TangentApp::parse_input_spec("midi:all"), None);
+        assert_eq!(TangentApp::parse_input_spec(""), None);
 
         // NONE clears the binding AND the kind.
         app.set_channel_input_spec(3, "");
@@ -26269,7 +26336,7 @@ mod tests {
         let doc = crate::arrangement::Arrangement::load_from(&shelf.join("project.tangent"));
         let desk = doc.desk.expect("the seed left the desk out");
         assert_eq!(
-            desk, IvoryApp::template_desk(),
+            desk, TangentApp::template_desk(),
             "the seed captured the session that was open"
         );
         assert_ne!(
@@ -27004,7 +27071,7 @@ mod tests {
         // At ONE place over time: the bands walk past it.
         let over_time: std::collections::HashSet<_> = (0..8)
             .map(|k| {
-                rgb(app.heart_wave(0.0, IvoryApp::HEART_CYCLE_S * f64::from(k) / 8.0))
+                rgb(app.heart_wave(0.0, TangentApp::HEART_CYCLE_S * f64::from(k) / 8.0))
             })
             .collect();
         assert!(
@@ -27016,7 +27083,7 @@ mod tests {
         // And it is a CYCLE: a full period lands back where it started.
         assert_eq!(
             rgb(app.heart_wave(0.25, 0.0)),
-            rgb(app.heart_wave(0.25, IvoryApp::HEART_CYCLE_S)),
+            rgb(app.heart_wave(0.25, TangentApp::HEART_CYCLE_S)),
             "the wave does not close on itself"
         );
     }
@@ -27159,7 +27226,7 @@ mod tests {
         app.arrangement.clips.push(clip);
 
         // Where a reader puts a note, which is the thing that must not move.
-        let sounds_at = |a: &IvoryApp, id: u64| -> Vec<(u8, f64)> {
+        let sounds_at = |a: &TangentApp, id: u64| -> Vec<(u8, f64)> {
             let c = a.arrangement.clips.iter().find(|c| c.id == id).unwrap();
             c.notes
                 .iter()
@@ -27279,9 +27346,9 @@ mod tests {
         assert!(!app.to_theory(9), "the mixer's T reached outside the selection");
     }
 
-    fn headless_with(caps: Caps, settings: Settings) -> (egui::Context, IvoryApp) {
+    fn headless_with(caps: Caps, settings: Settings) -> (egui::Context, TangentApp) {
         let ctx = egui::Context::default();
-        let app = IvoryApp::new(&ctx, settings, caps);
+        let app = TangentApp::new(&ctx, settings, caps);
         (ctx, app)
     }
 
@@ -28834,7 +28901,7 @@ mod tests {
     /// defaults to true, the dialog is modal, and shortcuts are suppressed
     /// while one is up. A shortcut test on a plain `headless()` passes for the
     /// wrong reason — it is measuring the welcome screen.
-    fn recorder_app() -> (egui::Context, IvoryApp) {
+    fn recorder_app() -> (egui::Context, TangentApp) {
         headless_with(
             Caps::DESKTOP,
             Settings {
@@ -28845,7 +28912,7 @@ mod tests {
     }
 
     /// One frame with the space bar pressed, returning whatever it started.
-    fn space(ctx: &egui::Context, app: &mut IvoryApp) -> Option<recorder::RecorderRequest> {
+    fn space(ctx: &egui::Context, app: &mut TangentApp) -> Option<recorder::RecorderRequest> {
         let _ = ctx.run(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
@@ -28868,7 +28935,7 @@ mod tests {
     /// An explicit release EVENT, not merely a frame with no events: egui keeps
     /// a key down until it is told otherwise, which is right for real input and
     /// means a quiet frame is not a let-go.
-    fn key_up(ctx: &egui::Context, app: &mut IvoryApp) -> Option<recorder::RecorderRequest> {
+    fn key_up(ctx: &egui::Context, app: &mut TangentApp) -> Option<recorder::RecorderRequest> {
         let _ = ctx.run(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
@@ -28896,7 +28963,7 @@ mod tests {
     fn a_chord_vertex_replaces_the_chord_before_it() {
         let (_, mut app) = headless_with_band(Caps::DESKTOP);
         app.settings.keytoggle_enabled = true;
-        let pcs = |app: &IvoryApp| {
+        let pcs = |app: &TangentApp| {
             let mut v: Vec<u8> = app.manual_notes.iter().map(|n| n % 12).collect();
             v.sort_unstable();
             v.dedup();
@@ -29188,7 +29255,7 @@ mod tests {
         let p = Pos2::new(rect.left() + 12.0, rect.top() + rect.height() * 0.5);
         // Shift held; the OS put the vertical notch on the X axis.
         let shift_wheel = |ctx: &egui::Context,
-                           app: &mut IvoryApp,
+                           app: &mut TangentApp,
                            unit: egui::MouseWheelUnit,
                            delta: Vec2| {
             let _ = ctx.run(
@@ -29750,24 +29817,24 @@ mod tests {
         // is not a quarter note, and that is the point: the gridbox says
         // "divide the bar", so in 3/4 the halves are at 1.5).
         let half_bar = -1i8;
-        assert!((IvoryApp::snap_quarter(&meter, 0.8, half_bar) - 1.5).abs() < 1e-9);
-        assert!((IvoryApp::snap_quarter(&meter, 2.6, half_bar) - 3.0).abs() < 1e-9);
+        assert!((TangentApp::snap_quarter(&meter, 0.8, half_bar) - 1.5).abs() < 1e-9);
+        assert!((TangentApp::snap_quarter(&meter, 2.6, half_bar) - 3.0).abs() < 1e-9);
         // **And the third bar, which is 4/4**: its halves are at 6 and 8,
         // not at 7.5 — which is where a fixed 1.5-quarter step from zero
         // would have put a line, a beat and a half into a bar that has four.
-        assert!((IvoryApp::snap_quarter(&meter, 7.9, half_bar) - 8.0).abs() < 1e-9);
-        assert!((IvoryApp::snap_quarter(&meter, 6.4, half_bar) - 6.0).abs() < 1e-9);
+        assert!((TangentApp::snap_quarter(&meter, 7.9, half_bar) - 8.0).abs() < 1e-9);
+        assert!((TangentApp::snap_quarter(&meter, 6.4, half_bar) - 6.0).abs() < 1e-9);
 
         // A whole-bar grid lands on the bar lines themselves, wherever they
         // have got to.
         for (q, want) in [(1.4_f64, 0.0), (1.6, 3.0), (7.9, 6.0), (8.1, 10.0)] {
-            let got = IvoryApp::snap_quarter(&meter, q, 0);
+            let got = TangentApp::snap_quarter(&meter, q, 0);
             assert!((got - want).abs() < 1e-9, "{q} snapped to {got}, not {want}");
         }
         // A four-bar grid counts BARS and not quarters: bars 0 and 4 are at
         // 0 and 14, so anything past the middle of that goes to 14.
-        assert!((IvoryApp::snap_quarter(&meter, 6.0, 2) - 0.0).abs() < 1e-9);
-        assert!((IvoryApp::snap_quarter(&meter, 8.0, 2) - 14.0).abs() < 1e-9);
+        assert!((TangentApp::snap_quarter(&meter, 6.0, 2) - 0.0).abs() < 1e-9);
+        assert!((TangentApp::snap_quarter(&meter, 8.0, 2) - 14.0).abs() < 1e-9);
     }
 
     /// The magnet lands on a line the ruler actually drew.
@@ -29788,7 +29855,7 @@ mod tests {
         for exp in [-3i8, -2, -1, 0, 1, 2] {
             for step in 0..200 {
                 let q = f64::from(step) * 0.17;
-                let snapped = IvoryApp::snap_quarter(&meter, q, exp);
+                let snapped = TangentApp::snap_quarter(&meter, q, exp);
                 // The line it landed on has to BE a line: either a bar
                 // boundary at a multiple of the grid's bar count, or an even
                 // division of the bar it is in.
@@ -30133,7 +30200,7 @@ mod tests {
     #[test]
     fn automation_is_written_only_when_armed_and_rolling() {
         use crate::automation::AutoParam;
-        let points = |a: &IvoryApp| {
+        let points = |a: &TangentApp| {
             a.arrangement
                 .automation
                 .get(0, AutoParam::Gain)
@@ -31086,7 +31153,7 @@ mod tests {
     }
 
     /// One frame with the pointer released at `pos`.
-    fn release(ctx: &egui::Context, app: &mut IvoryApp, pos: Pos2) {
+    fn release(ctx: &egui::Context, app: &mut TangentApp, pos: Pos2) {
         pointer_frame(
             ctx,
             app,
@@ -31100,7 +31167,7 @@ mod tests {
     }
 
     /// A move with the fine modifier held.
-    fn move_to_fine(ctx: &egui::Context, app: &mut IvoryApp, pos: Pos2) {
+    fn move_to_fine(ctx: &egui::Context, app: &mut TangentApp, pos: Pos2) {
         let _ = ctx.run(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
@@ -31138,7 +31205,7 @@ mod tests {
     /// The Welcome card is a dialog, and a dialog swallows every press in the
     /// main window — so a pointer test on a plain `headless()` passes the press
     /// to nothing at all and asserts about a gesture that never happened.
-    fn headless_with_band(caps: Caps) -> (egui::Context, IvoryApp) {
+    fn headless_with_band(caps: Caps) -> (egui::Context, TangentApp) {
         let mut s = Settings::default();
         s.show_welcome = false;
         s.show_recorder = true;
@@ -31158,14 +31225,14 @@ mod tests {
     /// where the band lands depends on which other bands are showing, and a
     /// test that guessed was pressing empty canvas three hundred points above
     /// the control it meant to grab.
-    fn knob_cell(app: &IvoryApp, hit: recorder_panel::Hit) -> Rect {
+    fn knob_cell(app: &TangentApp, hit: recorder_panel::Hit) -> Rect {
         let band = app.last_band;
         assert!(band.is_positive(), "the band was never drawn");
         let v = app.recorder_layout_view();
         recorder_panel::knob_rect(band, &v, hit).expect("the knob has a rectangle")
     }
 
-    fn pointer_frame(ctx: &egui::Context, app: &mut IvoryApp, events: Vec<egui::Event>) {
+    fn pointer_frame(ctx: &egui::Context, app: &mut TangentApp, events: Vec<egui::Event>) {
         let _ = ctx.run(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
@@ -31178,7 +31245,7 @@ mod tests {
 
     /// Press and HOLD at `pos`. The button is never released, so the frames
     /// after this one still see it down — which is what a drag is.
-    fn press(ctx: &egui::Context, app: &mut IvoryApp, pos: Pos2) {
+    fn press(ctx: &egui::Context, app: &mut TangentApp, pos: Pos2) {
         pointer_frame(
             ctx,
             app,
@@ -31194,7 +31261,7 @@ mod tests {
         );
     }
 
-    fn move_to(ctx: &egui::Context, app: &mut IvoryApp, pos: Pos2) {
+    fn move_to(ctx: &egui::Context, app: &mut TangentApp, pos: Pos2) {
         pointer_frame(ctx, app, vec![egui::Event::PointerMoved(pos)]);
     }
 
@@ -31215,7 +31282,7 @@ mod tests {
         }
     }
 
-    fn headless_with_fx(caps: Caps) -> (egui::Context, IvoryApp) {
+    fn headless_with_fx(caps: Caps) -> (egui::Context, TangentApp) {
         let (ctx, mut app) = headless_with_band(caps);
         app.set_effect_defaults(crate::ports::EffectDefaults {
             units: vec![
@@ -32427,7 +32494,7 @@ mod tests {
     }
 
     /// One frame with no input at all, and whatever it asked for.
-    fn run_frame(ctx: &egui::Context, app: &mut IvoryApp) -> Option<recorder::RecorderRequest> {
+    fn run_frame(ctx: &egui::Context, app: &mut TangentApp) -> Option<recorder::RecorderRequest> {
         let _ = ctx.run(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
@@ -32438,7 +32505,7 @@ mod tests {
         app.take_recorder_request()
     }
 
-    fn run_one_frame(ctx: &egui::Context, app: &mut IvoryApp, size: Vec2) -> Vec<String> {
+    fn run_one_frame(ctx: &egui::Context, app: &mut TangentApp, size: Vec2) -> Vec<String> {
         let out = ctx.run(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
@@ -32665,7 +32732,7 @@ mod tests {
             },
         );
         let pane = Vec2::new(900.0, 137.0);
-        let run = |ctx: &egui::Context, app: &mut IvoryApp| {
+        let run = |ctx: &egui::Context, app: &mut TangentApp| {
             let _ = ctx.run(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, pane)),
@@ -32747,7 +32814,7 @@ mod tests {
         crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
         let size = Vec2::new(900.0, 600.0);
 
-        let run = |ctx: &egui::Context, app: &mut IvoryApp, events: Vec<egui::Event>| {
+        let run = |ctx: &egui::Context, app: &mut TangentApp, events: Vec<egui::Event>| {
             let _ = ctx.run(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
@@ -32769,7 +32836,7 @@ mod tests {
                 modifiers: egui::Modifiers::NONE,
             };
         let click =
-            |ctx: &egui::Context, app: &mut IvoryApp, p: Pos2, button: egui::PointerButton| {
+            |ctx: &egui::Context, app: &mut TangentApp, p: Pos2, button: egui::PointerButton| {
                 run(ctx, app, vec![egui::Event::PointerMoved(p)]);
                 run(ctx, app, vec![button_event(p, button, true)]);
                 run(ctx, app, vec![button_event(p, button, false)]);
@@ -32841,7 +32908,7 @@ mod tests {
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         };
-        let frame = |ctx: &egui::Context, app: &mut IvoryApp, events: Vec<egui::Event>| {
+        let frame = |ctx: &egui::Context, app: &mut TangentApp, events: Vec<egui::Event>| {
             let out = ctx.run(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
@@ -32989,7 +33056,7 @@ mod tests {
         let mut s = Settings::default();
         s.theory_order = if true { crate::theory_panel::Views::all().keys() } else { String::new() };
         s.theory_detached = true;
-        let app = IvoryApp::new(&ctx, s, Caps::PLUGIN);
+        let app = TangentApp::new(&ctx, s, Caps::PLUGIN);
         assert!(
             !app.settings.theory_detached,
             "Caps::PLUGIN must clear it, as it already does for the chord \
@@ -33031,7 +33098,7 @@ mod tests {
         let mut s = Settings::default();
         s.show_recorder = true;
         s.recorder_detached = true;
-        let app = IvoryApp::new(&ctx, s, Caps::PLUGIN);
+        let app = TangentApp::new(&ctx, s, Caps::PLUGIN);
         assert!(!app.settings.show_recorder, "no device, no band");
         assert!(!app.settings.recorder_detached, "and no window for it");
         assert_eq!(band_sizes_at(&app.settings, 1300.0).recorder_h, 0.0);
@@ -33045,7 +33112,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut s = Settings::default();
         s.show_recorder = true;
-        let app = IvoryApp::new(&ctx, s, Caps::MINIMAL);
+        let app = TangentApp::new(&ctx, s, Caps::MINIMAL);
         assert!(!app.settings.show_recorder);
         assert!(
             app.settings.show_fretboard || !app.settings.show_fretboard,
@@ -33400,7 +33467,7 @@ mod tests {
     ///
     /// Note for anybody reaching for a picture instead: `shot::window` cannot
     /// take one. It photographs the composite — what the video records —
-    /// straight from a `&IvoryApp`, and never runs an egui pass at all. The
+    /// straight from a `&TangentApp`, and never runs an egui pass at all. The
     /// real binary under `IVORY_INLINE=menu` is the way to look at a dialog.
     #[test]
     fn every_confirmation_draws_at_every_size() {
@@ -33468,7 +33535,7 @@ mod tests {
         );
     }
 
-    /// One bay of a `Settings`, the way `IvoryApp::insert` reads it.
+    /// One bay of a `Settings`, the way `TangentApp::insert` reads it.
     fn bay_of(s: &crate::settings::Settings, strip: usize, bay: usize) -> Option<&str> {
         s.strip_inserts
             .get(strip * crate::recorder::INSERTS + bay)
@@ -33614,7 +33681,7 @@ mod tests {
         let (_ctx, mut app) = headless(Caps::DESKTOP);
         for (field, read) in [(
             recorder::NumField::Master,
-            (|a: &IvoryApp| a.settings.master_gain) as fn(&IvoryApp) -> f64,
+            (|a: &TangentApp| a.settings.master_gain) as fn(&TangentApp) -> f64,
         )] {
             app.num_edit = Some(recorder::NumEdit {
                 field,
@@ -33842,7 +33909,7 @@ mod tests {
                     },
                 ],
             );
-            let drain = |app: &mut IvoryApp| {
+            let drain = |app: &mut TangentApp| {
                 let mut ons = Vec::new();
                 let mut offs = Vec::new();
                 while let Some(rq) = app.take_recorder_request() {
@@ -34575,14 +34642,14 @@ mod heart_ring_tests {
         // Two moments a step apart on the same pixel: the colour must change,
         // which is what "animated" means at all.
         let a = app.heart_wave(0.0, 0.0);
-        let b = app.heart_wave(0.0, f64::from(IvoryApp::HEART_CYCLE_S) / 4.0);
+        let b = app.heart_wave(0.0, f64::from(TangentApp::HEART_CYCLE_S) / 4.0);
         assert_ne!(a, b, "the wave stood still");
         // Travelling BACKWARDS along the diagonal: the colour at phase p and
         // time t is the colour at phase p + d and time t + d's worth. If the
         // sign were the other way this would be phase p - d.
         let n = f64::from(crate::recorder::CHANNELS as u32);
-        let step = f64::from(IvoryApp::HEART_CYCLE_S) / n;
-        let bands = f64::from(IvoryApp::HEART_BANDS);
+        let step = f64::from(TangentApp::HEART_CYCLE_S) / n;
+        let bands = f64::from(TangentApp::HEART_BANDS);
         let later = app.heart_wave((1.0 / bands) as f32, step);
         assert_eq!(
             later,
@@ -34598,7 +34665,7 @@ mod velocity_selection_tests {
     use super::*;
     use crate::arrangement::{ArrClip, ArrNote, ClipKind};
 
-    fn setup(vels: &[u8]) -> (IvoryApp, u64) {
+    fn setup(vels: &[u8]) -> (TangentApp, u64) {
         let (_, mut app) = headless(Caps::DESKTOP);
         let notes: Vec<ArrNote> = vels
             .iter()
@@ -34635,13 +34702,13 @@ mod velocity_selection_tests {
         (app, id)
     }
 
-    fn select(app: &mut IvoryApp, which: &[usize]) {
+    fn select(app: &mut TangentApp, which: &[usize]) {
         if let Some(st) = app.midi_edit.as_mut() {
             st.selected = which.to_vec();
         }
     }
 
-    fn vels(app: &IvoryApp, id: u64) -> Vec<u8> {
+    fn vels(app: &TangentApp, id: u64) -> Vec<u8> {
         app.arrangement
             .clips
             .iter()
@@ -34761,9 +34828,37 @@ mod folder_tests {
     use super::tests::headless;
     use super::*;
 
-    fn app() -> IvoryApp {
+    fn app() -> TangentApp {
         let (_, app) = headless(Caps::DESKTOP);
         app
+    }
+
+    /// **The UI and the engine can never disagree about membership.** The
+    /// engine's table used to be its own forward scan that never reset its
+    /// `nearest` when a member run broke, so stale flag soup drew a track
+    /// flat while the engine folded its audio into a group. One derivation
+    /// now — this walks the WHOLE 8-channel flag space (65,536 states, the
+    /// upper lanes silent) and demands the engine table equal the UI rule
+    /// at every channel of every state.
+    #[test]
+    fn the_engine_folder_table_agrees_with_the_ui_over_random_flag_soup() {
+        let mut a = app();
+        for is_bits in 0u32..256 {
+            for in_bits in 0u32..256 {
+                for ch in 0..8 {
+                    a.settings.strip_is_folder[ch] = is_bits & (1 << ch) != 0;
+                    a.settings.strip_in_folder[ch] = in_bits & (1 << ch) != 0;
+                }
+                let table = a.folder_parents();
+                for ch in 0..crate::recorder::CHANNELS {
+                    assert_eq!(
+                        table[ch],
+                        a.folder_of(ch).map_or(-1, |p| p as i32),
+                        "engine and UI disagree at ch {ch}, is={is_bits:08b} in={in_bits:08b}"
+                    );
+                }
+            }
+        }
     }
 
     /// **A lane opens with exactly one node, and alt-click makes it two.**
@@ -34828,7 +34923,7 @@ mod folder_tests {
                 shape: Shape::Linear,
             });
         }
-        let count = |a: &IvoryApp| {
+        let count = |a: &TangentApp| {
             a.arrangement.automation.get(0, AutoParam::Gain).map_or(0, |c| c.points().len())
         };
         assert_eq!(count(&app), 4, "the fixture is not four nodes");
@@ -35138,7 +35233,7 @@ mod folder_tests {
         use crate::automation::{AutoParam, Point, Shape};
         let mut a = app();
         a.arr_toggle_automation_param(0, AutoParam::Gain);
-        let count = |a: &IvoryApp| {
+        let count = |a: &TangentApp| {
             a.arrangement.automation.get(0, AutoParam::Gain).map_or(0, |c| c.points().len())
         };
         assert_eq!(count(&a), 1, "the lane did not open with its base node");
@@ -35330,7 +35425,7 @@ mod folder_tests {
         }
 
         // The picker offers the other used channels...
-        let offered = |a: &IvoryApp| -> Vec<usize> {
+        let offered = |a: &TangentApp| -> Vec<usize> {
             match a.routing_dialog(0, None) {
                 dialogs::Dialog::Routing { channels, .. } => {
                     channels.into_iter().map(|(n, _)| n).collect()
@@ -35385,7 +35480,7 @@ mod folder_tests {
         use crate::recorder::Column;
         use crate::arrangement_panel::MASTER_LANE;
         let mut a = app();
-        let base = |a: &IvoryApp, lane: usize, p: AutoParam| {
+        let base = |a: &TangentApp, lane: usize, p: AutoParam| {
             a.arrangement
                 .automation
                 .get(lane, p)
@@ -35477,7 +35572,7 @@ mod folder_tests {
     #[test]
     fn the_template_desk_is_the_shipped_one_whatever_is_on_screen() {
         use crate::recorder::{Strip, CHANNELS, INSERTS};
-        let d = IvoryApp::template_desk();
+        let d = TangentApp::template_desk();
         // Two rows, and only two: the built-in on one, the drums on two.
         assert_eq!(d.tracks_added, 0b11, "the template is not two tracks");
         let bay = |ch: usize| d.inserts[Strip::Channel(ch).index() * INSERTS].as_str();
@@ -35497,7 +35592,7 @@ mod folder_tests {
         a.settings.strip_names[Strip::Channel(3).index()] = "Loud Guitar".to_owned();
         a.set_insert(Strip::Channel(5).index(), 0, Some("/some/Plugin.vst3"));
         assert_eq!(
-            IvoryApp::template_desk(),
+            TangentApp::template_desk(),
             d,
             "the template captured the session that was open"
         );
@@ -35518,7 +35613,7 @@ mod folder_tests {
         assert_eq!(a.settings.tracks_added & 0b11111, 0b11111);
 
         // Applying the template's desk leaves exactly its two rows.
-        let d = IvoryApp::template_desk();
+        let d = TangentApp::template_desk();
         a.apply_desk_snapshot(&d);
         assert_eq!(
             a.settings.tracks_added, 0b11,
@@ -35742,6 +35837,16 @@ mod folder_tests {
                 "a refused folder still marked channel {ch}"
             );
         }
+        // And the refusal SPEAKS — a silent no on a full desk was the bug.
+        match &full.dialog {
+            Some(dialogs::Dialog::Notice { body, .. }) => {
+                assert!(
+                    body.contains("free channel"),
+                    "the refusal does not say what is missing: {body}"
+                );
+            }
+            _ => panic!("a full desk refused without saying why"),
+        }
     }
 
     #[test]
@@ -35884,7 +35989,7 @@ mod folder_tests {
             a.settings.strip_names[crate::recorder::Strip::Channel(n).index()] =
                 format!("t{n}");
         }
-        let name = |a: &IvoryApp, n: usize| a.settings.strip_names[
+        let name = |a: &TangentApp, n: usize| a.settings.strip_names[
             crate::recorder::Strip::Channel(n).index()
         ].clone();
         assert_eq!(a.folder_children(1), vec![2, 3]);
@@ -36276,7 +36381,7 @@ mod aspect_snap_tests {
     }
 
     fn Self_aspect_none(settings: &Settings, now: Vec2) -> bool {
-        IvoryApp::aspect_snap_for(settings, None, now).is_none()
+        TangentApp::aspect_snap_for(settings, None, now).is_none()
     }
 
     /// **The width floor is bounded, and that bound is load-bearing.**
@@ -36349,13 +36454,13 @@ mod aspect_snap_tests {
         let right = natural.total().y;
 
         // Dragged TALLER than the layout wants: the height comes back.
-        let got = IvoryApp::aspect_snap_for(&s, None, Vec2::new(1300.0, right + 400.0))
+        let got = TangentApp::aspect_snap_for(&s, None, Vec2::new(1300.0, right + 400.0))
             .expect("a wrong height should snap");
         assert!((got.x - 1300.0).abs() < 1.0, "the width moved: {}", got.x);
         assert!((got.y - right).abs() < 1.0, "height {} is not {right}", got.y);
 
         // And shorter.
-        let got = IvoryApp::aspect_snap_for(&s, None, Vec2::new(1300.0, right - 200.0))
+        let got = TangentApp::aspect_snap_for(&s, None, Vec2::new(1300.0, right - 200.0))
             .expect("a wrong height should snap");
         assert!((got.y - right).abs() < 1.0);
 
@@ -36363,7 +36468,7 @@ mod aspect_snap_tests {
         // it — which is what makes the gesture diagonal rather than a snap
         // back to one size.
         let wide = super::band_sizes_at(&s, 1800.0).total().y;
-        let got = IvoryApp::aspect_snap_for(&s, None, Vec2::new(1800.0, right))
+        let got = TangentApp::aspect_snap_for(&s, None, Vec2::new(1800.0, right))
             .expect("a wider window should snap its height");
         assert!((got.x - 1800.0).abs() < 1.0, "the width was taken back");
         assert!((got.y - wide).abs() < 1.0, "height {} is not {wide}", got.y);
@@ -36386,7 +36491,7 @@ mod aspect_snap_tests {
         // untouched, so the height is the only thing that moved.
         let was = Vec2::new(1300.0, natural);
         let got =
-            IvoryApp::aspect_snap_for(&s, Some(was), Vec2::new(1300.0, natural + 300.0))
+            TangentApp::aspect_snap_for(&s, Some(was), Vec2::new(1300.0, natural + 300.0))
                 .expect("a vertical drag should resize");
         assert!(
             got.x > 1300.0 + 50.0,
@@ -36402,7 +36507,7 @@ mod aspect_snap_tests {
         );
         // Pulled UP, the window gets smaller rather than refusing.
         let got =
-            IvoryApp::aspect_snap_for(&s, Some(was), Vec2::new(1300.0, natural - 120.0))
+            TangentApp::aspect_snap_for(&s, Some(was), Vec2::new(1300.0, natural - 120.0))
                 .expect("a vertical drag should resize");
         assert!(got.x < 1300.0, "the width did not shrink: {}", got.x);
         assert!(got.x >= crate::settings::MIN_WINDOW.x);
@@ -36418,7 +36523,7 @@ mod aspect_snap_tests {
             Vec2::new(999.9, 1200.3),
             Vec2::new(1777.7, 300.2),
         ] {
-            if let Some(got) = IvoryApp::aspect_snap_for(&s, None, probe) {
+            if let Some(got) = TangentApp::aspect_snap_for(&s, None, probe) {
                 assert_eq!(got.x, got.x.round(), "width {} is fractional", got.x);
                 assert_eq!(got.y, got.y.round(), "height {} is fractional", got.y);
             }
@@ -36431,10 +36536,10 @@ mod aspect_snap_tests {
     fn a_window_already_on_its_aspect_is_not_touched() {
         let s = Settings::first_launch();
         let right = super::band_sizes_at(&s, 1300.0).total().y;
-        assert_eq!(IvoryApp::aspect_snap_for(&s, None, Vec2::new(1300.0, right)), None);
+        assert_eq!(TangentApp::aspect_snap_for(&s, None, Vec2::new(1300.0, right)), None);
         // Within a point, for a scaled display's fractional sizes.
         assert_eq!(
-            IvoryApp::aspect_snap_for(&s, None, Vec2::new(1300.4, right - 0.6)),
+            TangentApp::aspect_snap_for(&s, None, Vec2::new(1300.4, right - 0.6)),
             None
         );
     }
@@ -36448,10 +36553,10 @@ mod aspect_snap_tests {
             Vec2::new(1300.0, f32::NAN),
             Vec2::new(f32::INFINITY, 700.0),
         ] {
-            assert_eq!(IvoryApp::aspect_snap_for(&s, None, bad), None, "{bad:?} was acted on");
+            assert_eq!(TangentApp::aspect_snap_for(&s, None, bad), None, "{bad:?} was acted on");
         }
         // Absurdly narrow: the floor applies, and the answer is still sane.
-        let got = IvoryApp::aspect_snap_for(&s, None, Vec2::new(1.0, 1.0)).expect("a size");
+        let got = TangentApp::aspect_snap_for(&s, None, Vec2::new(1.0, 1.0)).expect("a size");
         assert!(got.x >= crate::settings::MIN_WINDOW.x, "below the floor");
         assert!(got.y > 0.0 && got.y.is_finite());
     }

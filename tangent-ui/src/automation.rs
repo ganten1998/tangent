@@ -62,7 +62,7 @@ impl AutoParam {
     ///
     /// The plugin ones are not here and cannot be: they depend on what is
     /// loaded in the bays right now, which is a question for
-    /// `IvoryApp::fx_params` and not a constant.
+    /// `TangentApp::fx_params` and not a constant.
     pub const ALL: [AutoParam; 4] =
         [AutoParam::Gain, AutoParam::Pan, AutoParam::Send, AutoParam::Mute];
 
@@ -111,7 +111,7 @@ impl AutoParam {
     /// A plugin parameter has no name of its own here: the NAME lives with
     /// the plugin and reaches the app through `ports::FxParams`, so this
     /// answers with the address and the caller that has the list puts the
-    /// word in. See `IvoryApp::auto_param_label`.
+    /// word in. See `TangentApp::auto_param_label`.
     pub fn label(self) -> String {
         match self {
             Self::Gain => "volume".to_owned(),
@@ -383,7 +383,7 @@ impl Curve {
         // and this is the mechanism underneath it, which a DRAG also uses to
         // move a point by taking it out and putting it back. Refusing here
         // made the first point immovable and left a trail behind every drag.
-        // The guard lives in `IvoryApp::arr_remove_auto_point`.
+        // The guard lives in `TangentApp::arr_remove_auto_point`.
         self.points.remove(i);
         // **A lone node at the start USED to be swept away with the rest.**
         //

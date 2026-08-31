@@ -611,7 +611,7 @@ pub enum FilePurpose {
 /// A place the app has asked the host to raise a SAVE panel for.
 ///
 /// The same request pattern as [`FileRequest`]; the answer comes back
-/// through `IvoryApp::finish_save_choice`.
+/// through `TangentApp::finish_save_choice`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SaveRequest {
     pub title: String,
@@ -882,7 +882,7 @@ mod tests {
         );
     }
 
-    /// The trait object has to be `Send`, or `IvoryApp` stops being `Send` and
+    /// The trait object has to be `Send`, or `TangentApp` stops being `Send` and
     /// `create_egui_editor` refuses it with a wall of trait errors in the
     /// plugin crate rather than here.
     #[test]

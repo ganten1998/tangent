@@ -1761,7 +1761,7 @@ struct Shared {
     /// **Input monitoring: hear what the microphone hears.**
     ///
     /// Never persisted, anywhere. It is off at every launch by construction —
-    /// see `IvoryApp::input_monitor` — because the failure mode is a room full
+    /// see `TangentApp::input_monitor` — because the failure mode is a room full
     /// of feedback the moment somebody turns their speakers on after a relaunch
     /// they had forgotten was monitoring.
     monitor_on: AtomicBool,
@@ -2913,7 +2913,7 @@ struct UiParam {
 /// racks: bays 0..2 are its ORIGINAL rack and 3..5 the one added above it.
 /// Appended, never renumbered — `AutoParam` keys are written to the document,
 /// so a bay that changed meaning would silently move somebody's automation
-/// onto a different plugin. `IvoryApp::master_bay` is the same rule on the way
+/// onto a different plugin. `TangentApp::master_bay` is the same rule on the way
 /// in, and this must not drift from it.
 ///
 /// **Not to be confused with `recorder::seat_bay`, which orders the master's
@@ -5272,7 +5272,7 @@ impl Renderer {
         // monitored here, and produced a take with no microphone in it.
         //
         // Feedback is why the room half exists at all and why it is still off
-        // at every launch. See `IvoryApp::input_monitor`.
+        // at every launch. See `TangentApp::input_monitor`.
         //
         // **One switch for every input, and one fader each.** Monitoring is a
         // control-room question and the answer is the same for the whole room;
@@ -5666,7 +5666,7 @@ impl Renderer {
             // six bays in two racks. Bays 0..2 are the original rack's and
             // 3..5 the one added above it — appended, never renumbered, so a
             // curve already drawn still names its own plugin. See
-            // `IvoryApp::master_bay`, which is the same rule on the way in.
+            // `TangentApp::master_bay`, which is the same rule on the way in.
             let Some((slot_lane, bay)) = param_slot(lane, usize::from(bay)) else {
                 continue;
             };

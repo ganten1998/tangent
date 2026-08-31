@@ -1,4 +1,4 @@
-# Ivory formatting config.
+# Tangent formatting config.
 #
 # ⚠️  DO NOT run `cargo fmt --all` on the existing tree before 2.1.0 ships.
 # Measured 2026-08-11 on this exact tree: default rustfmt rewrites 4,170 lines

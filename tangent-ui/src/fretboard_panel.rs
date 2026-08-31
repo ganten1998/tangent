@@ -482,7 +482,7 @@ pub struct Intervals {
     /// Not the detected chord's root. That is right for the circle and the
     /// triangles, which answer "what key am I in"; this column answers "what is
     /// this shape under my hand", and a guitarist reads a shape from the bottom
-    /// string up. See `IvoryApp::guitar_intervals`.
+    /// string up. See `TangentApp::guitar_intervals`.
     ///
     /// **Only the tonic.** Which notes are sounding, and on which STRINGS,
     /// comes from the voicing — the labels line up with the strings they

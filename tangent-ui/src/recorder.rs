@@ -293,7 +293,7 @@ pub struct RecorderView<'a> {
     /// nobody notices until they open the file.
     pub metronome_in_take: bool,
     /// The live input is being heard. Never persisted — see
-    /// `IvoryApp::input_monitor`.
+    /// `TangentApp::input_monitor`.
     pub input_monitor: bool,
     /// Beats and tempo, shared by the click, the count-in and the SMF's tempo
     /// mark — one number, because a click at 90 against a file that says 120
@@ -1113,7 +1113,7 @@ pub struct RecorderState {
     pub gr_db: f32,
     /// The loudness column's three readings, published by the engine ten
     /// times a second. The WINDOW is a setting and is not stored here — see
-    /// `IvoryApp::recorder_layout_view`, which puts the two together.
+    /// `TangentApp::recorder_layout_view`, which puts the two together.
     pub loudness: Loudness,
     /// What each lane's CLIPS are sounding, as a pitch mask. Playback only —
     /// the live notes are already in the app's own hands, because it is the
@@ -1588,7 +1588,7 @@ pub enum RecorderRequest {
     /// A request because the PEAK is host-side: `tangent-ui` holds a path and
     /// a length, and the samples live behind the firewall with the decoder.
     /// The host measures and writes the gain back through
-    /// `IvoryApp::set_clip_gain`.
+    /// `TangentApp::set_clip_gain`.
     NormalizeClips(Vec<u64>),
     /// Start the INTEGRATED loudness reading again from nothing.
     ///
@@ -1616,7 +1616,7 @@ pub enum RecorderRequest {
     /// stamp on the engine side is for.
     Locate(f64),
     /// Open the patch editor on what the built-in is playing: the host
-    /// answers with `IvoryApp::set_patch_edit`.
+    /// answers with `TangentApp::set_patch_edit`.
     EditPatch {
         slot: usize,
     },
@@ -2876,6 +2876,14 @@ pub struct StreamStats {
     /// be the request, so the panel said one thing and the room said another
     /// with nothing to catch it. This is the number that cannot lie.
     pub observed_frames: Option<u32>,
+    /// The ring behind the period, where the host reads a Fixed request as
+    /// a RING and mixes in its own periods regardless (WASAPI, ALSA) — the
+    /// two are different numbers and the difference is buffering the
+    /// millisecond figure above understates. `None` where the request IS
+    /// the callback (CoreAudio, ASIO, JACK): render nothing there, never a
+    /// zero, because naming a ring those hosts do not keep would invent
+    /// one.
+    pub buffer_ring: Option<u32>,
 }
 
 impl StreamStats {
@@ -3091,6 +3099,7 @@ mod tests {
             channels: 2,
             buffer_frames: asked,
             observed_frames: seen,
+            buffer_ring: None,
         };
         // Granted: the two agree and nothing is flagged.
         let ok = stats(Some(128), Some(128));
@@ -4153,7 +4162,8 @@ mod status_tests {
             "device".to_owned(),
             StreamStats {
 observed_frames: None,
-                                sample_rate: rate,
+                buffer_ring: None,
+                sample_rate: rate,
                 channels: 2,
                 buffer_frames: frames,
             },
@@ -4166,14 +4176,16 @@ observed_frames: None,
         // whole reason the rate is part of the sum.
         let at48 = StreamStats {
 observed_frames: None,
-                        sample_rate: 48_000,
+            buffer_ring: None,
+            sample_rate: 48_000,
             channels: 2,
             buffer_frames: Some(256),
         };
         assert!((at48.buffer_ms().unwrap() - 5.3333).abs() < 1e-3);
         let at44 = StreamStats {
 observed_frames: None,
-                        sample_rate: 44_100,
+            buffer_ring: None,
+            sample_rate: 44_100,
             channels: 2,
             buffer_frames: Some(256),
         };
@@ -4184,7 +4196,8 @@ observed_frames: None,
         assert_eq!(
             StreamStats {
 observed_frames: None,
-                                sample_rate: 48_000,
+                buffer_ring: None,
+                sample_rate: 48_000,
                 channels: 2,
                 buffer_frames: None,
             }

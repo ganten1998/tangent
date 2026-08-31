@@ -656,7 +656,7 @@ pub const PRESET_EXT: &str = "tgkit";
 ///
 /// So a preset records **absolute** source paths, and loading one copies each
 /// sample into the destination project the same way dragging the file in
-/// would — `IvoryApp::drumpad_load`, one pad at a time. A project stays
+/// would — `TangentApp::drumpad_load`, one pad at a time. A project stays
 /// self-contained; the preset is the recipe, not the ingredients.
 ///
 /// Only the pads that hold something are written. A hundred and twenty-eight
