@@ -2897,6 +2897,12 @@ pub struct AudioStatus {
     /// up unbounded and never drain; it is bounded now, but bounded is not
     /// zero and the estimate has to say so.
     pub monitor_ms: Option<f64>,
+    /// **The smallest buffer this machine's audio graph will serve.**
+    ///
+    /// Carried so the panel can say why a request was not honoured instead of
+    /// guessing. See `ports::AudioSetup::graph_floor_frames` for what the guess
+    /// used to be and whose machine it was wrong about.
+    pub graph_floor: Option<u32>,
 }
 
 impl AudioStatus {
@@ -3090,6 +3096,7 @@ mod tests {
             input: Some(("in".to_owned(), stats(Some(64), Some(64)))),
             output: Some(("out".to_owned(), stats(Some(128), Some(512)))),
             monitor_ms: Some(4.0),
+            graph_floor: None,
         };
         let rt = status.round_trip_ms().expect("both sides are open");
         assert!(
@@ -4168,6 +4175,7 @@ observed_frames: None,
             input: Some(side(48_000, Some(256))),
             output: Some(side(48_000, Some(512))),
             monitor_ms: None,
+            graph_floor: None,
         };
         assert!((both.round_trip_ms().unwrap() - 16.0).abs() < 1e-3);
 
@@ -4186,11 +4194,13 @@ observed_frames: None,
                 input: Some(side(48_000, Some(256))),
                 output: None,
                 monitor_ms: None,
+                graph_floor: None,
             },
             AudioStatus {
                 input: None,
                 output: Some(side(48_000, Some(256))),
                 monitor_ms: None,
+                graph_floor: None,
             },
             // And a side that will not say its buffer size cannot contribute
             // half a figure.
@@ -4198,6 +4208,7 @@ observed_frames: None,
                 input: Some(side(48_000, None)),
                 output: Some(side(48_000, Some(256))),
                 monitor_ms: None,
+                graph_floor: None,
             },
         ] {
             assert_eq!(one.round_trip_ms(), None);
@@ -4216,6 +4227,7 @@ observed_frames: None,
             input: Some(side(44_100, Some(256))),
             output: Some(side(48_000, Some(256))),
             monitor_ms: None,
+                    graph_floor: None,
         }
         .rates_disagree());
 
@@ -4223,6 +4235,7 @@ observed_frames: None,
             input: Some(side(48_000, Some(256))),
             output: Some(side(48_000, Some(512))),
             monitor_ms: None,
+                    graph_floor: None,
         }
         .rates_disagree());
 
@@ -4231,6 +4244,7 @@ observed_frames: None,
             input: Some(side(44_100, Some(256))),
             output: None,
             monitor_ms: None,
+                    graph_floor: None,
         }
         .rates_disagree());
     }

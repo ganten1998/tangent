@@ -497,6 +497,15 @@ impl tangent_ui::ports::AudioSetup for Setup {
         tangent_record::audio::systems()
     }
 
+    /// The graph's floor, where there is a graph to ask.
+    ///
+    /// Read every time rather than cached: a user who edits their PipeWire
+    /// config to fix exactly the problem this reports should see the panel
+    /// agree with them without restarting the app.
+    fn graph_floor_frames(&self) -> Option<u32> {
+        tangent_record::audio::graph_clock().map(|g| g.floor())
+    }
+
     fn input_channels(&self) -> u16 {
         let want = lock(&self.0).wanted.clone();
         let Some(uid) = want else {

@@ -513,6 +513,197 @@ fn with_pipewire_node<T>(_node: &str, f: impl FnOnce() -> T) -> T {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// The graph's own buffer size
+// ───────────────────────────────────────────────────────────────────────────
+
+/// What the PipeWire graph will actually serve, in frames.
+///
+/// **The buffer control on Linux has been a control that controls nothing, and
+/// this is what it was missing.** A PipeWire graph runs ONE period for every
+/// client, clamped to `clock.min-quantum`, and a client asking for less is not
+/// refused — it is quietly given the floor. So a user who picks 256 on a graph
+/// whose floor is 512 gets 512, and the app has never been able to say so:
+/// `pick_buffer` asks, cpal reports what it got, and the panel guessed at a
+/// reason ("another app owns this device") that is a CoreAudio explanation for
+/// a PipeWire fact and is simply false here.
+///
+/// Worse than false, it is unactionable. The number that decided the outcome is
+/// in `~/.config/pipewire/pipewire.conf.d/`, and nothing in the app pointed
+/// there. Measured on the machine this was written for: at a floor of 512 a
+/// take recorded at 256 came back **48.6 % digital silence** — 726 whole
+/// periods padded out — while the panel showed no fault of any kind.
+///
+/// Read through `pw-metadata`, for exactly the reason [`pipewire_sources`]
+/// reads through `pw-dump`: it ships with PipeWire, it needs no headers at
+/// build time, and the Linux artifacts are cross-compiled. Absent PipeWire it
+/// returns `None` and every caller falls back to what it did before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphClock {
+    /// The period every client on this graph runs at, right now.
+    pub quantum: u32,
+    /// The floor. **A request below this is not honoured and not refused.**
+    pub min_quantum: u32,
+    /// Non-zero when the quantum is pinned, by us or by somebody else.
+    pub forced: u32,
+    pub rate: u32,
+}
+
+impl GraphClock {
+    /// The smallest period this graph will actually serve.
+    ///
+    /// `force-quantum` wins over `min-quantum` when it is set, which is why it
+    /// cannot be read off the floor alone.
+    pub fn floor(&self) -> u32 {
+        if self.forced > 0 {
+            self.forced
+        } else {
+            self.min_quantum.max(1)
+        }
+    }
+
+    /// Whether a request for `frames` can be met as asked.
+    pub fn will_serve(&self, frames: u32) -> bool {
+        frames >= self.floor()
+    }
+}
+
+/// Read the graph's clock, or `None` where there is no PipeWire to ask.
+#[cfg(target_os = "linux")]
+pub fn graph_clock() -> Option<GraphClock> {
+    let out = crate::proc::command("pw-metadata")
+        .args(["-n", "settings"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // Lines read `update: id:0 key:'clock.quantum' value:'512' type:''`. Parsed
+    // by key rather than by position: the set is not ordered and has grown
+    // between PipeWire versions.
+    let field = |key: &str| -> Option<u32> {
+        text.lines()
+            .find(|l| l.contains(&format!("key:'{key}'")))
+            .and_then(|l| l.split("value:'").nth(1))
+            .and_then(|v| v.split('\'').next())
+            .and_then(|v| v.trim().parse().ok())
+    };
+    Some(GraphClock {
+        quantum: field("clock.quantum")?,
+        min_quantum: field("clock.min-quantum").unwrap_or(0),
+        forced: field("clock.force-quantum").unwrap_or(0),
+        rate: field("clock.rate").unwrap_or(48_000),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn graph_clock() -> Option<GraphClock> {
+    None
+}
+
+/// Ask the graph to run at `frames`, or release the request with `None`.
+///
+/// **This is global, and that is the whole reason it is opt-in.** One graph
+/// serves every client, so pinning it moves the DAW in the next window too —
+/// which is precisely why the machine this was written for had it pinned at 512
+/// in the first place, to stop some other client dragging a Qtractor session
+/// down. So it is only ever called from an explicit buffer choice, never
+/// speculatively, and [`release_graph_quantum`] puts it back.
+///
+/// Returns whether the graph took it. `false` is not an error worth a dialog:
+/// it means no PipeWire, no `pw-metadata`, or a graph that declined — and the
+/// stream still opens at whatever the floor turns out to be, exactly as before.
+#[cfg(target_os = "linux")]
+pub fn request_graph_quantum(frames: Option<u32>) -> bool {
+    let value = frames.unwrap_or(0).to_string();
+    crate::proc::command("pw-metadata")
+        .args(["-n", "settings", "0", "clock.force-quantum", &value])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn request_graph_quantum(_frames: Option<u32>) -> bool {
+    false
+}
+
+/// Holds a quantum request for as long as it exists, and gives it back.
+///
+/// **This type exists because of a specific mistake, and its shape is the
+/// apology.** Pinning the graph by hand during an investigation left the
+/// machine's audio disturbed after the investigation ended: `force-quantum` was
+/// released, but **a node that is already running does not renegotiate**, so
+/// the interface stayed on a stale period while the metadata said the graph was
+/// free. The next recordings made on that machine came back with whole periods
+/// missing, and the state that caused it was invisible in every place anybody
+/// would look — `pw-metadata` said `force-quantum: 0`, and it was true, and it
+/// was not the whole truth.
+///
+/// A `set` with a matching `release` somewhere else in the code is the same
+/// trap with better manners. So the request is a VALUE: while it is alive the
+/// graph is pinned, when it is dropped the graph is freed, and there is no path
+/// — early return, error, panic, a window closed, the process quitting — that
+/// releases one without the other.
+///
+/// **Dropping it is not the whole job and the caller must know that.** Freeing
+/// the graph does not move a running node back; only reopening the stream does.
+/// [`GraphQuantum::release_needs_reopen`] says so at the type level rather than
+/// in a comment somebody has to find.
+#[derive(Debug)]
+pub struct GraphQuantum {
+    frames: u32,
+    held: bool,
+}
+
+impl GraphQuantum {
+    /// Ask the graph for `frames`, and hold it until this value is dropped.
+    ///
+    /// `None` when there is no PipeWire to ask or it declined — which is not an
+    /// error: the stream still opens at whatever the graph does serve, exactly
+    /// as it did before any of this existed.
+    pub fn request(frames: u32) -> Option<Self> {
+        if frames == 0 {
+            return None;
+        }
+        request_graph_quantum(Some(frames)).then_some(Self { frames, held: true })
+    }
+
+    /// The size being held.
+    pub fn frames(&self) -> u32 {
+        self.frames
+    }
+
+    /// **Whether letting go is enough.** It is not: a node already running keeps
+    /// the period it was started with, so the caller has to reopen its streams
+    /// to actually leave. Always true; a method rather than a constant so the
+    /// answer is impossible to read past.
+    pub fn release_needs_reopen(&self) -> bool {
+        true
+    }
+}
+
+impl Drop for GraphQuantum {
+    fn drop(&mut self) {
+        if self.held {
+            release_graph_quantum();
+        }
+    }
+}
+
+/// Give the graph back to whatever it was doing.
+///
+/// Called when the app is leaving the buffer alone again — a different audio
+/// system chosen, or the process shutting down. Leaving a machine pinned
+/// because an app exited badly is the kind of thing that gets blamed on the
+/// next program to open.
+pub fn release_graph_quantum() -> bool {
+    request_graph_quantum(None)
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // The audio system
 // ───────────────────────────────────────────────────────────────────────────
 
