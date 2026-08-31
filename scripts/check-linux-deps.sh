@@ -35,13 +35,26 @@ BIN="${1:-}"
 #                    is in main, main may not depend on universe, so Canonical
 #                    builds PipeWire with -Dlv2=disabled (Launchpad #2054223).
 #                    README declares it and install.sh checks for it.
-#   the glibc set    libm/libc/libpthread/libdl and the two loaders. A system
-#                    without these is not a system.
+#   the toolchain    libm/libc/libpthread/libdl, and libgcc_s for unwinding.
+#     runtime        A system without these is not a system. `libpthread` and
+#                    `libdl` are folded into libc from glibc 2.34, so a modern
+#                    native build names neither and an older one names both.
+#
+# **`libgcc_s.so.1` is here because the CROSS artifacts do not name it and the
+# NATIVE ones do.** zigbuild links compiler-rt statically; the gcc toolchain on
+# a Linux box links libgcc_s. The first version of this list was read off the
+# cross-built binaries alone, so it would have refused every native build — the
+# same mistake this whole check exists to catch, made while writing the check.
+# The list has to be the UNION of what every packaging path produces, and it is
+# one file precisely so that union has somewhere to live.
+#
+# No loader entries: the ELF interpreter lives in PT_INTERP, not DT_NEEDED, so
+# `ld-linux-*` can never appear in what `elf-needed.py` reads.
 ALLOWED=" \
   libasound.so.2 \
   liblilv-0.so.0 \
-  libm.so.6 libc.so.6 libpthread.so.0 libdl.so.2 \
-  ld-linux-x86-64.so.2 ld-linux-aarch64.so.1 "
+  libgcc_s.so.1 \
+  libm.so.6 libc.so.6 libpthread.so.0 libdl.so.2 "
 
 HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 NEEDED="$(python3 "$HERE/elf-needed.py" "$BIN")" || {
