@@ -2236,6 +2236,19 @@ fn vst3_locations() -> &'static str {
          C:\\Program Files\\Common Files\\VST3. A folder of .dll plug-ins is VST2, which \
          Tangent does not host (it loads VST3 only). Rescan from the right-click menu after \
          installing a VST3 plug-in."
+    } else if cfg!(target_os = "freebsd") {
+        // The paths the scanner actually walks — `scan.rs` names `~/.vst3`
+        // and `/usr/local/lib/vst3` and deliberately NOT `/usr/lib/vst3`,
+        // because ports install under /usr/local and /usr/lib is base-system
+        // territory where a VST3 cannot exist. This arm used to fall into the
+        // Linux text below and told FreeBSD users to put plugins in a folder
+        // the scan would never open. And LV2 gets a sentence because on
+        // FreeBSD it is not a footnote: the audio ports overwhelmingly ship
+        // LV2, so "no VST3s found" is the EXPECTED state of a machine that
+        // has plenty of instruments to offer.
+        "No VST3 instruments found. FreeBSD keeps them in ~/.vst3 for one user and \
+         /usr/local/lib/vst3 for everybody. Most FreeBSD audio ports ship LV2 rather than VST3; \
+         LV2 plugins from /usr/local/lib/lv2 and ~/.lv2 appear in this same list."
     } else {
         "No VST3 instruments found. Linux keeps them in ~/.vst3 for one user and /usr/lib/vst3 for \
          everybody."
@@ -2647,6 +2660,36 @@ fn theme_of(face: Color32) -> DialogTheme {
     }
 }
 
+/// Where this frame's face is kept for the windows that are NOT dialogs.
+const FACE_ID: &str = "ivory-dialog-face";
+
+/// The face the frozen pair used to be made of, and the answer [`live_face`]
+/// gives on a frame [`show`] has not run yet — which, with `show` called
+/// unconditionally at the top of every update, is no frame at all.
+const FALLBACK_FACE: Color32 = Color32::from_rgb(0xE3, 0xD9, 0xBD);
+
+/// Remember the face [`show`] was handed, so a window that does not come
+/// through `show` can follow the theme too.
+///
+/// The export window is the customer: it is deliberately not a `Dialog` — it
+/// answers no question and takes no turn in the one dialog slot — so it never
+/// sees the `face` parameter and hard-coded the old ivory instead. That held
+/// for exactly as long as ivory was the only face; sixteen themes later it
+/// was the one surface that stayed beige, on screen for minutes at a time.
+/// `show` runs every frame whether or not a dialog is up, and runs before the
+/// export window draws, so what it leaves here is always THIS frame's answer.
+/// One fact, one carrier: a second `face` parameter threaded to the export
+/// call site would be a copy that could drift from the one every dialog gets.
+fn remember_face(ctx: &egui::Context, face: Color32) {
+    ctx.memory_mut(|m| m.data.insert_temp(egui::Id::new(FACE_ID), face));
+}
+
+/// The complement: the face [`show`] last remembered.
+fn live_face(ctx: &egui::Context) -> Color32 {
+    ctx.memory(|m| m.data.get_temp(egui::Id::new(FACE_ID)))
+        .unwrap_or(FALLBACK_FACE)
+}
+
 fn apply_theme(style: &mut egui::Style, t: &DialogTheme) {
     style.spacing.button_padding = egui::vec2(12.0, 4.0); // Qt: padding 4px 12px
     let set = |wv: &mut egui::style::WidgetVisuals, bg: Color32| {
@@ -2881,7 +2924,12 @@ pub fn show_export_progress(
     p: &crate::ports::ExportProgress,
     placement: Placement,
 ) {
-    let t = theme(Color32::from_rgb(0xE3, 0xD9, 0xBD));
+    // The desk's own face, like every dialog — read from the frame's record
+    // rather than taken as a parameter, because this window does not come
+    // through `show`. It hard-coded ivory here long after the dialogs
+    // learned to follow the theme, and it is on screen for minutes at a
+    // stretch. See `remember_face`.
+    let t = theme(live_face(ctx));
     let bold = |size: f32| FontId::new(size, fonts::courier_bold());
     show_dialog_viewport(
         ctx,
@@ -3025,6 +3073,10 @@ pub fn show(
     face: Color32,
     placement: Placement,
 ) -> Option<DialogAction> {
+    // Before the early return, not after: the export window reads this on
+    // the frames when NO dialog is open, which is most of them. See
+    // `remember_face`.
+    remember_face(ctx, face);
     let dialog = dialog_opt.as_mut()?;
     let mut action = None;
 
@@ -5720,8 +5772,8 @@ pub fn show(
                 ctx,
                 placement,
                 "About Tangent",
-                Vec2::new(400.0, 190.0),
-                Vec2::new(400.0, 150.0),
+                Vec2::new(400.0, 220.0),
+                Vec2::new(400.0, 180.0),
                 |ui, result| {
                     apply_theme(ui.style_mut(), &t);
                     ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
@@ -5733,11 +5785,22 @@ pub fn show(
                                 ui.label(
                                     RichText::new("Tangent").font(bold(16.0)).color(t.text),
                                 );
+                                // What 5.0 IS. The line this replaces
+                                // described the 1.x chord monitor — "Simple
+                                // MIDI Keyboard Monitor" — and sat directly
+                                // above a 5.0 version number for the whole of
+                                // the beta run.
+                                ui.label(
+                                    RichText::new("A recording DAW with chord intelligence")
+                                        .font(bold(10.0))
+                                        .color(t.text),
+                                );
                                 ui.label(
                                     RichText::new(
-                                        "Simple MIDI Keyboard Monitor with Advanced Chord Detection",
+                                        "Recorder, 16-channel mixer, arrangement, MIDI editor, \
+                                         drum machine, LV2/VST3",
                                     )
-                                    .font(bold(10.0))
+                                    .font(bold(8.0))
                                     .color(t.text),
                                 );
                                 // The author's own site. It was still the old
@@ -5751,6 +5814,32 @@ pub fn show(
                                         .underline(),
                                     "https://ganten.neocities.org",
                                 );
+                                // Where to say a thing broke — the app's one
+                                // support surface, so it lives where people
+                                // go hunting for one. The gmail address and
+                                // not the branded alias, because the alias
+                                // reaches the same inbox by forwarding, and
+                                // forwarding is one more thing that can rot
+                                // without anyone noticing. A click copies the
+                                // address rather than opening `mailto:`,
+                                // which assumes a configured mail client that
+                                // plenty of studio machines do not have.
+                                let contact = ui
+                                    .add(
+                                        egui::Label::new(
+                                            RichText::new(concat!(
+                                                "Something broken? Write to ",
+                                                "tangentdaw@gmail.com",
+                                            ))
+                                            .font(bold(9.0))
+                                            .color(t.text),
+                                        )
+                                        .sense(egui::Sense::click()),
+                                    )
+                                    .on_hover_text("Click to copy the address");
+                                if contact.clicked() {
+                                    ui.ctx().copy_text("tangentdaw@gmail.com".to_owned());
+                                }
                             });
                             // Stretch, then bottom block.
                             let bottom_h = 62.0;
@@ -6537,8 +6626,8 @@ pub fn show(
                 ctx,
                 placement,
                 "Supporter Key",
-                Vec2::new(460.0, 290.0),
-                Vec2::new(400.0, 250.0),
+                Vec2::new(460.0, 310.0),
+                Vec2::new(400.0, 270.0),
                 |ui, result| {
                     apply_theme(ui.style_mut(), &t);
                     ui.visuals_mut().extreme_bg_color = t.bg;
@@ -6563,6 +6652,21 @@ pub fn show(
                                     RichText::new("A key is a thank-you, nothing more.")
                                         .font(bold(12.0))
                                         .color(t.text),
+                                );
+                                // The store, said out loud. This dialog asks
+                                // for a key and never used to say where one
+                                // comes from — the only purchase link lived
+                                // in the README, which a person inside the
+                                // app is not reading. Still `/l/ivory`: the
+                                // slug is the one commercial URL the rename
+                                // deliberately left alone, because every key
+                                // email ever sent points at it.
+                                ui.hyperlink_to(
+                                    RichText::new("ganten.gumroad.com/l/ivory")
+                                        .font(bold(11.0))
+                                        .color(t.text)
+                                        .underline(),
+                                    "https://ganten.gumroad.com/l/ivory",
                                 );
                             }
                             ui.add_space(8.0);
@@ -9314,6 +9418,19 @@ at: None,
             "{}",
             vst3_locations()
         );
+        // FreeBSD names what `scan.rs` walks — `/usr/local/lib/vst3`, never
+        // `/usr/lib/vst3`, which ports cannot install to — and says LV2 out
+        // loud, because on FreeBSD an empty VST3 list is the ordinary state
+        // of a machine whose instruments are all LV2.
+        #[cfg(target_os = "freebsd")]
+        assert!(
+            vst3_locations().contains("~/.vst3")
+                && vst3_locations().contains("/usr/local/lib/vst3")
+                && !vst3_locations().contains("/usr/lib/vst3")
+                && vst3_locations().contains("LV2"),
+            "{}",
+            vst3_locations()
+        );
 
         let mut dialog = Some(Dialog::plugin_picker(&[], None));
         let (painted, action) = run_picker(&mut dialog);
@@ -9557,6 +9674,150 @@ at: None,
             total <= PLUGIN_FOOTER_H,
             "{PLUGIN_FOOTER_H}pt is reserved for the notes and they need {total}pt, \
              which would push Load off the bottom edge"
+        );
+    }
+
+    /// The About card is the one place the app says what it IS, and it said
+    /// "Simple MIDI Keyboard Monitor" directly above a 5.0 version number for
+    /// the whole beta run. Read as painted: the 5.0 sentence, the support
+    /// address, the composed version — and no trace of the 1.x line.
+    #[test]
+    fn about_describes_the_daw_and_names_the_support_address() {
+        let mut dialog = Some(Dialog::About);
+        let (painted, action) = run_picker(&mut dialog);
+        assert!(action.is_none(), "About asked the app to do something");
+        assert!(
+            painted.contains("A recording DAW with chord intelligence"),
+            "{painted}"
+        );
+        assert!(
+            painted.contains("tangentdaw@gmail.com"),
+            "the support address never reached the screen: {painted}"
+        );
+        assert!(
+            !painted.contains("Simple MIDI Keyboard Monitor"),
+            "the 1.x tagline is back: {painted}"
+        );
+        // Composed from the crate version, never retyped — the assertion
+        // holds across releases precisely because both sides move together.
+        assert!(
+            painted.contains(concat!("Version ", env!("CARGO_PKG_VERSION"))),
+            "{painted}"
+        );
+    }
+
+    /// The key dialog asks for a key, and until 5.1 never said where one
+    /// comes from — the only purchase link lived in the README, which nobody
+    /// inside the app is reading. The pointer shows exactly while there is no
+    /// key installed, and not to a supporter, who has nothing left to buy.
+    #[test]
+    fn the_key_dialog_points_at_the_store_until_a_key_is_installed() {
+        let mut dialog = Some(Dialog::SupporterKey {
+            input: String::new(),
+            message: None,
+            installed_as: None,
+            focus: false,
+        });
+        let (painted, _) = run_picker(&mut dialog);
+        assert!(
+            painted.contains("ganten.gumroad.com/l/ivory"),
+            "no way to buy a key from the dialog that asks for one: {painted}"
+        );
+
+        let mut dialog = Some(Dialog::SupporterKey {
+            input: String::new(),
+            message: None,
+            installed_as: Some("A. Supporter".to_owned()),
+            focus: false,
+        });
+        let (painted, _) = run_picker(&mut dialog);
+        assert!(
+            !painted.contains("gumroad"),
+            "a supporter is being sold a key they already have: {painted}"
+        );
+    }
+
+    /// Every fill a frame painted, for the test that asks about COLOR the way
+    /// [`painted_text`] asks about words.
+    fn painted_fills(output: &egui::FullOutput) -> Vec<Color32> {
+        fn walk(shape: &egui::epaint::Shape, out: &mut Vec<Color32>) {
+            match shape {
+                egui::epaint::Shape::Rect(r) => out.push(r.fill),
+                egui::epaint::Shape::Vec(v) => {
+                    for s in v {
+                        walk(s, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for c in &output.shapes {
+            walk(&c.shape, &mut out);
+        }
+        out
+    }
+
+    /// The export window wears the desk's face, not the retired ivory.
+    ///
+    /// It is not a `Dialog`, so it never sees `show`'s `face` parameter — it
+    /// reads the face `show` remembered this frame instead (see
+    /// [`remember_face`]). This runs the frame the app actually runs — `show`
+    /// first with no dialog open, the export window after — and then asks
+    /// what the window's ground was painted with.
+    #[test]
+    fn the_export_window_wears_the_desks_face_not_ivory() {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        fonts::apply_text_styles(&ctx);
+        // The colors are compared EXACTLY, and an `Area` fades in by
+        // multiplying every color it paints — with the test clock standing
+        // still the fade never finishes and every fill compares unequal at
+        // two-thirds opacity. No animation, no multiplication.
+        ctx.style_mut(|s| s.animation_time = 0.0);
+        // Before `show` has ever run, the historical ivory — a frame the app
+        // cannot produce, because `show` is called unconditionally ahead of
+        // the export window every update.
+        assert_eq!(live_face(&ctx), FALLBACK_FACE);
+
+        let olive = Color32::from_rgb(0x6B, 0x71, 0x3E);
+        let placement = Placement {
+            at: None,
+            native_panel_up: false,
+            raise: false,
+            parent: None,
+            monitor: None,
+            caps: crate::host::Caps::PLUGIN,
+        };
+        let p = crate::ports::ExportProgress {
+            fraction: 0.5,
+            label: "Rendering".to_owned(),
+            peaks: vec![(-0.4, 0.4); 16],
+        };
+        // Three frames for the same reason `run_picker` runs three: the
+        // sizing pass paints nothing.
+        let mut fills = Vec::new();
+        for _ in 0..3 {
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, 520.0))),
+                    ..Default::default()
+                },
+                |ctx| {
+                    show(ctx, &mut None, olive, placement);
+                    show_export_progress(ctx, &p, placement);
+                },
+            );
+            fills = painted_fills(&out);
+        }
+        assert_eq!(live_face(&ctx), olive, "`show` did not record the face");
+        assert!(
+            fills.contains(&theme_of(olive).bg),
+            "the export window's ground is not the desk's face"
+        );
+        assert!(
+            !fills.contains(&theme_of(FALLBACK_FACE).bg),
+            "ivory is still painted somewhere in the export window"
         );
     }
 }
