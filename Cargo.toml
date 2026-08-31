@@ -5,7 +5,7 @@ members = ["tangent-core", "tangent-ui", "tangent", "tangent-record", "tangent-h
 # to be either a member or excluded, and excluded is what it should be: it must
 # stay byte-comparable to upstream 0.3.5, which means no workspace lints and no
 # `cargo test --workspace` opinions about someone else's code.
-exclude = ["tangent-record/vendor/linuxvideo", "tangent-record/vendor/cpal", "tangent-host/vendor/lv2-sys", "tangent-host/vendor/lilv", "tangent-host/vendor/livi"]
+exclude = ["tangent-record/vendor/linuxvideo", "tangent-record/vendor/cpal", "tangent-record/vendor/jack-sys", "tangent-host/vendor/lv2-sys", "tangent-host/vendor/lilv", "tangent-host/vendor/livi"]
 resolver = "2"
 
 # **A patched cpal, for one host that upstream does not have.**
@@ -43,6 +43,16 @@ lilv = { path = "tangent-host/vendor/lilv" }
 # The same two-line class of fix one crate up the LV2 stack — six `i8`s that
 # have to be `c_char`. `tangent-host/vendor/livi/PATCH.md` has the detail.
 livi = { path = "tangent-host/vendor/livi" }
+# **One conditional, so the Linux binary can offer JACK without REQUIRING it.**
+# `jack-sys` 0.5.1 probes pkg-config for libjack and `unwrap()`s the result on
+# Linux — even under `dynamic_loading`, the default feature that exists
+# precisely so libjack is `dlopen`ed at run time instead of linked. The probe
+# emits `cargo:rustc-link-lib=jack` when it succeeds, so a build host with jack
+# development files installed would silently produce an artifact that will not
+# START on a desktop without libjack. `tangent-record/vendor/jack-sys/PATCH.md`
+# has the detail. Inert on macOS and Windows, which never pull `jack-sys`, and
+# inert with `dynamic_loading` off.
+jack-sys = { path = "tangent-record/vendor/jack-sys" }
 
 [workspace.package]
 version = "5.0.0-dev"

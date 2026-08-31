@@ -2234,6 +2234,16 @@ impl Session {
             manifest.audio.channels = r.channels;
             manifest.audio.bits = TAKE_FORMAT.bits();
             manifest.audio.frames = r.frames;
+            // **What the take's own clock says should be in the file, beside
+            // what is.** The video half has reported this pair since §7; the
+            // audio half never has, and a take that came back 19 s long out of
+            // 30 s went out marked `complete: true` because no field could say
+            // otherwise. Same clock as `duration_seconds` — deliberately, so
+            // the two cannot disagree about the length of a second — and the
+            // check below is then a subtraction rather than a judgement.
+            manifest.audio.frames_expected =
+                (manifest.duration_seconds * nominal).max(0.0) as u64;
+            manifest.audio.frames_dropped = r.frames_dropped;
             manifest.audio.peak_dbfs = f64::from(audio::dbfs(r.take_peak));
             manifest.audio.clipped = r.clipped_samples > 0;
             manifest.audio.output_delay_ns = r.output_delay_ns;
@@ -2262,6 +2272,105 @@ impl Session {
             // calling `abort` here would mark the manifest incomplete and send
             // the next launch into the crash-recovery path for a file that is
             // perfectly fine.
+            // **A file SHORTER than the take is not a dropout, and must not be
+            // reported as one.** Dropouts are padded, so they leave the length
+            // right and only this note wrong. Frames that never arrived and
+            // were never padded shorten the file, and that is the fault which
+            // went unnoticed: a take whose `duration_seconds` was 30.17 and
+            // whose WAV held 19.17, complete and unremarked.
+            //
+            // A PROBLEM rather than a note, unlike a dropout, because the file
+            // no longer matches the take: anything aligning the `.wav` against
+            // the `.mid` or the video by the manifest's duration will be wrong
+            // by the whole shortfall, and silently.
+            //
+            // The tolerance is a quarter-second rather than zero. The fit is a
+            // fit, `frames_expected` is derived through it, and the last block
+            // is a partial one — demanding exactness would put a problem on
+            // every honest take.
+            const SHORT_TOLERANCE_FRAMES: f64 = 0.25;
+            let short = manifest
+                .audio
+                .frames_expected
+                .saturating_sub(manifest.audio.frames);
+            // **Only against a clock that was actually fitted.**
+            //
+            // `frames_expected` is `duration_seconds` through the timeline, and
+            // `duration_seconds` is only a MEASUREMENT when something was being
+            // sampled by a crystal — which is exactly the distinction
+            // `ClockKind` exists to keep, and which its own doc puts better
+            // than this comment can: "0 ppm from a real fit and 0 ppm from no
+            // fit at all look identical in a number and mean opposite things."
+            //
+            // The same is true one field over. Against a synthetic clock the
+            // duration is not a span anybody measured, and comparing frames to
+            // it produces a confident number about nothing: it reported a take
+            // as 23 s short of a take that lasted a tenth of a second. A
+            // problem raised on that basis would be worse than the silence it
+            // replaced, because it would be believed.
+            // **And only for a take a DEVICE fed.** "The audio stopped
+            // arriving" is a claim about a capture stream. A desk-only take's
+            // audio is rendered by the engine, and the one context where its
+            // frames legitimately diverge from the take's span is a test
+            // driving the tap by hand — which also sometimes fits a clock
+            // from those hand stamps, which is why gating on `Fitted` alone
+            // FLAKED: same test, green one run, red the next, on timing.
+            // **A fitted rate far from nominal is not drift — it is the
+            // device not delivering its rate, and the whole take is wrong by
+            // the ratio.** A crystal lies by parts per million; the failure
+            // this catches lies by factors. Measured on the machine it was
+            // written for: a capture ring smaller than the PipeWire graph's
+            // cycle delivered exactly half the frames — stamps honest, every
+            // drop counter clean — and the fit reported −500,000 ppm while a
+            // fifteen-second performance was written as a "7.5-second" take
+            // whose audio plays at double speed against its own video. The
+            // fit measured the fault perfectly and nothing read the number.
+            // `open_input` now sizes the ring so that particular cause is
+            // gone; this alarm is for whatever finds the next way, because
+            // the fit will see that one too. One percent is orders of
+            // magnitude beyond any honest clock and far below any delivery
+            // fault worth waking someone for.
+            if rate_is_a_fault(
+                self.audio.is_some(),
+                manifest.clock,
+                manifest.audio.epsilon_ppm,
+            ) {
+                problem.get_or_insert_with(|| {
+                    format!(
+                        "the input delivered {:.0} Hz against its nominal {:.0} Hz. \
+                         The take's timeline is wrong by that ratio: its duration, \
+                         its audio speed and its sync against the video are all \
+                         off together. Something between the device and the app \
+                         is discarding or inventing frames",
+                        manifest
+                            .audio
+                            .true_rate
+                            .unwrap_or(manifest.audio.nominal_rate),
+                        manifest.audio.nominal_rate,
+                    )
+                });
+            }
+            // The incident this check exists for (19 s of audio in a 30 s
+            // take, `complete: true`) was device-backed, and stays caught.
+            // A desk-side stall still lands in the manifest as data —
+            // `frames_expected` against `frames` — where the audit reads it;
+            // it just does not raise this particular alarm.
+            if self.audio.is_some()
+                && manifest.clock == tangent_record::take::ClockKind::Fitted
+                && short as f64 > SHORT_TOLERANCE_FRAMES * nominal
+            {
+                problem.get_or_insert_with(|| {
+                    format!(
+                        "the recording is {:.2} s shorter than the take: {} frames \
+                         were expected and {} were written. The audio stopped \
+                         arriving and was not padded, so the file does not line \
+                         up with the MIDI or the video",
+                        short as f64 / nominal,
+                        manifest.audio.frames_expected,
+                        manifest.audio.frames,
+                    )
+                });
+            }
             if r.frames_dropped > 0 {
                 note = Some(format!(
                     "{} frames were lost to the system and padded with silence",
@@ -2364,6 +2473,23 @@ pub fn available_bytes(path: &std::path::Path) -> Option<u64> {
         probe = probe.parent()?;
     }
     platform_available_bytes(probe)
+}
+
+/// Whether a take's measured rate is a delivery fault rather than a clock.
+///
+/// The gate in `Session::stop` in a shape a test can hold still. All three
+/// conditions are load-bearing: only a DEVICE-fed take has a delivery to be at
+/// fault (`device_fed` — the desk cannot halve); only a FITTED clock measured
+/// anything (a synthetic epsilon is zero by definition, and alarming on filler
+/// would alarm on every desk-only take); and the threshold sits where no
+/// honest clock can reach and no delivery fault can hide. Crystals drift by
+/// parts per million — hundreds at the very worst — while the fault family
+/// this catches works in ratios of small integers: the measured incident was
+/// −499,993 ppm, a capture ring keeping exactly half of every graph cycle.
+const RATE_ALARM_PPM: f64 = 10_000.0;
+
+fn rate_is_a_fault(device_fed: bool, clock: take::ClockKind, epsilon_ppm: f64) -> bool {
+    device_fed && clock == take::ClockKind::Fitted && epsilon_ppm.abs() > RATE_ALARM_PPM
 }
 
 #[cfg(unix)]
@@ -2768,6 +2894,29 @@ mod tests {
         // it refused, not the ones it took.
         assert!(report.frames > 0, "the file should hold what did fit");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The rate alarm fires on delivery faults and never on clocks.**
+    ///
+    /// Every arm of the gate, pinned: the measured incident (a capture ring
+    /// keeping half of every PipeWire cycle read −499,993 ppm on a device-fed,
+    /// fitted take) must alarm; every honest crystal — which lies by parts per
+    /// million, hundreds at the very worst — must not; a synthetic clock's
+    /// epsilon is zero by definition and even a garbage value there is filler,
+    /// not measurement; and a take with no input device has no delivery to be
+    /// at fault, however strange its numbers. The last two arms are the
+    /// short-take gate's lesson written down before it has to be relearned:
+    /// each guard looks redundant beside its neighbours right up until one of
+    /// them is removed.
+    #[test]
+    fn a_halved_delivery_raises_the_rate_alarm_and_a_crystal_never_does() {
+        use tangent_record::take::ClockKind;
+        assert!(rate_is_a_fault(true, ClockKind::Fitted, -499_992.6));
+        assert!(rate_is_a_fault(true, ClockKind::Fitted, 499_992.6));
+        assert!(!rate_is_a_fault(true, ClockKind::Fitted, 180.0));
+        assert!(!rate_is_a_fault(true, ClockKind::Fitted, -3_000.0));
+        assert!(!rate_is_a_fault(true, ClockKind::Synthetic, -499_992.6));
+        assert!(!rate_is_a_fault(false, ClockKind::Fitted, -499_992.6));
     }
 
     /// The ring is drained even when no take is running, for the reason the

@@ -513,6 +513,498 @@ fn with_pipewire_node<T>(_node: &str, f: impl FnOnce() -> T) -> T {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// Dropouts, from the one place on a PipeWire desktop that can see them
+// ───────────────────────────────────────────────────────────────────────────
+
+/// The graph's own xrun count for THIS process's audio nodes, watched from a
+/// timer thread.
+///
+/// **This exists because the client-side count is structurally blind here.**
+/// cpal's ALSA backend now reports every EPIPE it sees — all three sites —
+/// and on a pipewire-alsa desktop it sees none: the plugin absorbs the xrun,
+/// re-prepares, and the error never crosses the plugin boundary. Verified on
+/// the machine this was written for, from both ends at once: a 64-frame
+/// buffer the user described as "total noise", zero backend errors in the
+/// app's log, and PipeWire's own counter for the node climbing 24 → 72 in
+/// the same window. The truth exists in exactly one place, and it is the
+/// server's.
+///
+/// Read the way [`pipewire_sources`] and [`graph_clock`] read — by shelling
+/// to tools that ship with PipeWire — and for the same reason: linking
+/// libpipewire needs headers at build time and the Linux artifacts are
+/// cross-compiled. `pw-dump` maps this process's pid to its node ids;
+/// `pw-top -b` carries the per-node ERR column that `pw-dump` does not.
+///
+/// **Two rules, both scars:**
+///
+/// - **It polls on its own thread, on a timer.** Never from the audio thread
+///   and never per-frame from the UI loop — a process spawn in either is a
+///   new fault of the same family this is trying to observe. The thread
+///   sleeps in slices so dropping the watcher never waits out an interval.
+/// - **Unreadable is `None`, never zero.** A machine without `pw-top`, a
+///   graph that is not PipeWire, a parse that fails on a future format — all
+///   of those are "nobody knows", and reporting 0 for "nobody knows" is the
+///   exact lie `latency_source: "assumed_zero"` exists to avoid one field
+///   over. The counter that read a confident zero through total noise has
+///   already been believed once.
+pub struct GraphDropouts {
+    /// Latest reading: -1 is "unknown", anything else is the count.
+    latest: std::sync::Arc<std::sync::atomic::AtomicI64>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl GraphDropouts {
+    /// How often the graph is asked. Coarse on purpose: a dropout display is
+    /// read by a human, and two spawned processes per poll is a real cost on
+    /// the small machines this matters most on.
+    #[cfg(target_os = "linux")]
+    const POLL: std::time::Duration = std::time::Duration::from_secs(3);
+
+    /// Start watching. On platforms with no PipeWire this returns a watcher
+    /// that answers `None` forever and starts no thread at all.
+    pub fn start() -> Self {
+        use std::sync::atomic::{AtomicBool, AtomicI64};
+        let latest = std::sync::Arc::new(AtomicI64::new(-1));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        #[cfg(target_os = "linux")]
+        {
+            let latest_t = std::sync::Arc::clone(&latest);
+            let stop_t = std::sync::Arc::clone(&stop);
+            let spawned = std::thread::Builder::new()
+                .name("graph-dropouts".to_owned())
+                .spawn(move || {
+                    use std::sync::atomic::Ordering;
+                    let pid = std::process::id();
+                    loop {
+                        let count = read_graph_dropouts(pid);
+                        latest_t.store(count.map_or(-1, |c| c as i64), Ordering::Relaxed);
+                        // Sleep in slices so a drop is honoured within a
+                        // tenth of a second — the same shape `Reprobe` uses,
+                        // and for the same reason.
+                        let slices = Self::POLL.as_millis() / 100;
+                        for _ in 0..slices.max(1) {
+                            if stop_t.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                    }
+                });
+            if spawned.is_err() {
+                // No thread means no readings: `latest` stays -1, which reads
+                // as `None`, which is the honest answer.
+            }
+        }
+        Self { latest, stop }
+    }
+
+    /// The most recent count, or `None` where nothing can see one.
+    ///
+    /// Cheap enough for a per-frame read — one relaxed load — which is the
+    /// point of the thread: the SPAWNING is on a timer, the READING is free.
+    pub fn latest(&self) -> Option<u64> {
+        let v = self.latest.load(std::sync::atomic::Ordering::Relaxed);
+        u64::try_from(v).ok()
+    }
+}
+
+impl Drop for GraphDropouts {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The one number to show, from two counters that are each blind somewhere.
+///
+/// **Neither layer sees the whole fault, and this was measured twice with the
+/// answers reversed.** With a Scarlett at a 64-frame buffer, the graph's ERR
+/// climbed 48 while the client saw zero EPIPEs — pipewire-alsa absorbed them
+/// below cpal. With the built-in card at the same buffer, the CLIENT counted
+/// 246 EPIPEs while the graph's ERR for the same node sat at zero — the
+/// plugin ate the underruns without the node ever missing a cycle. Same
+/// machine, same week, opposite blindnesses.
+///
+/// So preferring either source lets a confident zero from the wrong layer
+/// mask the other's count, which is the exact lie a dropout display exists to
+/// end. Both are lower bounds on "gaps in what was heard"; the max is the
+/// best lower bound available; and only when NEITHER could count is the
+/// answer unknown.
+pub fn merge_dropouts(graph: Option<u64>, client: u64) -> Option<u64> {
+    match graph {
+        Some(g) => Some(g.max(client)),
+        None if client > 0 => Some(client),
+        // A client zero with no graph reading is "nobody could see", not a
+        // clean bill: the client's counter has already been proven blind on
+        // one of the two paths this ships on.
+        None => None,
+    }
+}
+
+/// One poll: this process's nodes by pid, then their ERR total.
+#[cfg(target_os = "linux")]
+fn read_graph_dropouts(pid: u32) -> Option<u64> {
+    let dump = crate::proc::command("pw-dump")
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !dump.status.success() {
+        return None;
+    }
+    let ids = our_audio_nodes(&String::from_utf8_lossy(&dump.stdout), pid);
+    if ids.is_empty() {
+        // No nodes is a real answer while no stream is open, but it is not a
+        // COUNT: reporting 0 here would claim the take was clean when nothing
+        // was measured at all.
+        return None;
+    }
+    let top = crate::proc::command("pw-top")
+        .args(["-b", "-n", "2"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !top.status.success() {
+        return None;
+    }
+    sum_errs(&String::from_utf8_lossy(&top.stdout), &ids)
+}
+
+/// The audio node ids belonging to `pid`, from `pw-dump` JSON.
+///
+/// Matched through the CLIENT rather than trusting the node to carry the pid:
+/// PipeWire puts `application.process.id` on the client object, and the node
+/// points at its client with `client.id`. Nodes that carry the pid directly
+/// are taken too, because pipewire-alsa has done both across versions.
+#[cfg(target_os = "linux")]
+fn our_audio_nodes(dump_json: &str, pid: u32) -> Vec<u64> {
+    let Ok(objects) = serde_json::from_str::<Vec<serde_json::Value>>(dump_json) else {
+        return Vec::new();
+    };
+    let pid_matches = |v: Option<&serde_json::Value>| -> bool {
+        match v {
+            Some(serde_json::Value::Number(n)) => n.as_u64() == Some(u64::from(pid)),
+            Some(serde_json::Value::String(s)) => s.parse::<u32>().ok() == Some(pid),
+            _ => false,
+        }
+    };
+    let mut our_clients = Vec::new();
+    for o in &objects {
+        if o.get("type").and_then(|t| t.as_str()) == Some("PipeWire:Interface:Client")
+            && pid_matches(o.pointer("/info/props/application.process.id"))
+        {
+            if let Some(id) = o.get("id").and_then(serde_json::Value::as_u64) {
+                our_clients.push(id);
+            }
+        }
+    }
+    let mut ids = Vec::new();
+    for o in &objects {
+        if o.get("type").and_then(|t| t.as_str()) != Some("PipeWire:Interface:Node") {
+            continue;
+        }
+        let props = o.pointer("/info/props");
+        let is_audio = props
+            .and_then(|p| p.get("media.class"))
+            .and_then(|c| c.as_str())
+            .is_some_and(|c| c.contains("Audio"));
+        if !is_audio {
+            continue;
+        }
+        let owned = pid_matches(props.and_then(|p| p.get("application.process.id")))
+            || props
+                .and_then(|p| p.get("client.id"))
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|c| our_clients.contains(&c));
+        if owned {
+            if let Some(id) = o.get("id").and_then(serde_json::Value::as_u64) {
+                ids.push(id);
+            }
+        }
+    }
+    ids
+}
+
+/// Total ERR over `ids`, from `pw-top -b` output. `None` when none of the ids
+/// appear — a snapshot that missed every node measured nothing.
+///
+/// The batch format is column-stable enough to split on whitespace: every data
+/// row is `S ID QUANT RATE WAIT BUSY W/Q B/Q ERR ...`, so ERR is the ninth
+/// token wherever the row's id parses. The LAST occurrence of an id wins,
+/// because `-n 2` prints two snapshots and the first is often idle.
+fn sum_errs(top_output: &str, ids: &[u64]) -> Option<u64> {
+    let mut latest: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    for line in top_output.lines() {
+        let mut t = line.split_whitespace();
+        let _state = t.next();
+        let Some(id) = t.next().and_then(|v| v.parse::<u64>().ok()) else {
+            continue;
+        };
+        if !ids.contains(&id) {
+            continue;
+        }
+        // QUANT RATE WAIT BUSY W/Q B/Q and THEN err — six to skip, and the
+        // first version skipped five and read B/Q, whose "0.00" never parses
+        // and quietly turned every row into "unknown". The test below carries
+        // the captured rows precisely so this cannot regress by inspection.
+        if let Some(err) = t.nth(6).and_then(|v| v.parse::<u64>().ok()) {
+            latest.insert(id, err);
+        }
+    }
+    if latest.is_empty() {
+        None
+    } else {
+        Some(latest.values().sum())
+    }
+}
+
+/// Whether the host in use reaches interfaces through the `pipewire` PCM.
+///
+/// **The PipeWire node list is a fix for cpal's ALSA host, and applying it to
+/// any other host is the bug it was written to cure.** [`pipewire_sources`]
+/// exists because PipeWire holds every card exclusively, so through ALSA the
+/// only PCM that opens is `pipewire` and it has to be aimed with
+/// `PIPEWIRE_NODE`. None of that is true of the JACK host: it is a client of
+/// the same graph, its ports carry the interfaces' real names, and it has no
+/// device called `pipewire` at all.
+///
+/// So under JACK the substitution fails twice over. The picker would list nodes
+/// that cannot be opened — [`resolve`] looks for a PCM named `pipewire` in the
+/// host's own devices and a JACK host has one input client and no PCMs — and
+/// because that list REPLACES cpal's rather than joining it, every workable
+/// entry would have been hidden behind entries that all fail. Choosing JACK
+/// would have taken the input away while leaving the output playing, which is
+/// the hardest shape of fault to read from the outside.
+///
+/// Asked of the host actually built rather than of the saved setting, because
+/// [`build_host`] falls back — a settings file naming JACK on a machine with no
+/// server running is running ALSA, and it needs the node list.
+///
+/// Goes through [`with_host`], so on the UI thread — where every caller of this
+/// lives — it reads the cached host and costs nothing. Called from a thread
+/// that has never built one, it would build one, and under JACK that means
+/// cpal registering and immediately dropping a pair of probe clients
+/// (`jack/device.rs` makes one per direction to read the server's rate, and
+/// drops it). Harmless, and not free; keep the callers on the one thread.
+pub fn pipewire_pcm_route_applies() -> bool {
+    !cfg!(target_os = "linux") || with_host(|host| host.id().name() != "JACK")
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// The graph's own buffer size
+// ───────────────────────────────────────────────────────────────────────────
+
+/// What the PipeWire graph will actually serve, in frames.
+///
+/// **The buffer control on Linux has been a control that controls nothing, and
+/// this is what it was missing.** A PipeWire graph runs ONE period for every
+/// client, clamped to `clock.min-quantum`, and a client asking for less is not
+/// refused — it is quietly given the floor. So a user who picks 256 on a graph
+/// whose floor is 512 gets 512, and the app has never been able to say so:
+/// `pick_buffer` asks, cpal reports what it got, and the panel guessed at a
+/// reason ("another app owns this device") that is a CoreAudio explanation for
+/// a PipeWire fact and is simply false here.
+///
+/// Worse than false, it is unactionable. The number that decided the outcome is
+/// in `~/.config/pipewire/pipewire.conf.d/`, and nothing in the app pointed
+/// there. Measured on the machine this was written for: at a floor of 512 a
+/// take recorded at 256 came back **48.6 % digital silence** — 726 whole
+/// periods padded out — while the panel showed no fault of any kind.
+///
+/// Read through `pw-metadata`, for exactly the reason [`pipewire_sources`]
+/// reads through `pw-dump`: it ships with PipeWire, it needs no headers at
+/// build time, and the Linux artifacts are cross-compiled. Absent PipeWire it
+/// returns `None` and every caller falls back to what it did before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphClock {
+    /// The period every client on this graph runs at, right now.
+    pub quantum: u32,
+    /// The floor. **A request below this is not honoured and not refused.**
+    pub min_quantum: u32,
+    /// Non-zero when the quantum is pinned, by us or by somebody else.
+    pub forced: u32,
+    pub rate: u32,
+}
+
+impl GraphClock {
+    /// The smallest period this graph will actually serve.
+    ///
+    /// `force-quantum` wins over `min-quantum` when it is set, which is why it
+    /// cannot be read off the floor alone.
+    pub fn floor(&self) -> u32 {
+        if self.forced > 0 {
+            self.forced
+        } else {
+            self.min_quantum.max(1)
+        }
+    }
+
+    /// Whether a request for `frames` can be met as asked.
+    pub fn will_serve(&self, frames: u32) -> bool {
+        frames >= self.floor()
+    }
+}
+
+/// Read the graph's clock, or `None` where there is no PipeWire to ask.
+#[cfg(target_os = "linux")]
+pub fn graph_clock() -> Option<GraphClock> {
+    let out = crate::proc::command("pw-metadata")
+        .args(["-n", "settings"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // Lines read `update: id:0 key:'clock.quantum' value:'512' type:''`. Parsed
+    // by key rather than by position: the set is not ordered and has grown
+    // between PipeWire versions.
+    let field = |key: &str| -> Option<u32> {
+        text.lines()
+            .find(|l| l.contains(&format!("key:'{key}'")))
+            .and_then(|l| l.split("value:'").nth(1))
+            .and_then(|v| v.split('\'').next())
+            .and_then(|v| v.trim().parse().ok())
+    };
+    Some(GraphClock {
+        quantum: field("clock.quantum")?,
+        min_quantum: field("clock.min-quantum").unwrap_or(0),
+        forced: field("clock.force-quantum").unwrap_or(0),
+        rate: field("clock.rate").unwrap_or(48_000),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn graph_clock() -> Option<GraphClock> {
+    None
+}
+
+/// Ask the graph to run at `frames`, or release the request with `None`.
+///
+/// **This is global, and that is the whole reason it is opt-in.** One graph
+/// serves every client, so pinning it moves the DAW in the next window too —
+/// which is precisely why the machine this was written for had it pinned at 512
+/// in the first place, to stop some other client dragging a Qtractor session
+/// down. So it is only ever called from an explicit buffer choice, never
+/// speculatively, and [`release_graph_quantum`] puts it back.
+///
+/// Returns whether the graph took it. `false` is not an error worth a dialog:
+/// it means no PipeWire, no `pw-metadata`, or a graph that declined — and the
+/// stream still opens at whatever the floor turns out to be, exactly as before.
+#[cfg(target_os = "linux")]
+pub fn request_graph_quantum(frames: Option<u32>) -> bool {
+    let value = frames.unwrap_or(0).to_string();
+    crate::proc::command("pw-metadata")
+        .args(["-n", "settings", "0", "clock.force-quantum", &value])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn request_graph_quantum(_frames: Option<u32>) -> bool {
+    false
+}
+
+/// The ALSA ring a `Fixed` capture request must actually ask for on this graph.
+///
+/// **A ring smaller than the graph's cycle does not underrun — it silently
+/// keeps `ring/quantum` of the audio.** Measured with `takeprobe` on the
+/// machine that lost takes to this (PipeWire, `min-quantum = 512`): a
+/// 44100 Hz stream at `Fixed(256)` delivered a steady 22,016 frames per
+/// second — every graph cycle hands the `pipewire` PCM one 512-frame quantum,
+/// the 256-frame ring keeps what fits, and the rest vanishes with no EPIPE, no
+/// counter and no error on any layer. The stream looked *clean* at exactly
+/// half rate: stamps honest, the rate fit at 22 050 Hz, and a fifteen-second
+/// performance wrote a "7.5-second" take whose audio plays at double speed
+/// against its own video. At `Fixed(512)` and `Fixed(1024)` the same stream
+/// delivered every frame.
+///
+/// Twice the FLOOR is a ring no renegotiation can outgrow: the floor bounds
+/// the served quantum from below, and our own period request — which stays at
+/// the asked-for number's scale, `ring/4 = floor/2 < floor` — caps it from
+/// above, so the graph is never dragged coarser than its floor by this and the
+/// delivered cycle can never exceed `max(floor, ring/4) < ring`. The asked-for
+/// number still decides the request; the ring is protection, and a capture
+/// ring runs nearly empty, so the depth costs memory and not latency.
+pub fn ring_covering_graph(asked: u32, floor: u32) -> u32 {
+    asked.max(floor.saturating_mul(2))
+}
+
+/// Holds a quantum request for as long as it exists, and gives it back.
+///
+/// **This type exists because of a specific mistake, and its shape is the
+/// apology.** Pinning the graph by hand during an investigation left the
+/// machine's audio disturbed after the investigation ended: `force-quantum` was
+/// released, but **a node that is already running does not renegotiate**, so
+/// the interface stayed on a stale period while the metadata said the graph was
+/// free. The next recordings made on that machine came back with whole periods
+/// missing, and the state that caused it was invisible in every place anybody
+/// would look — `pw-metadata` said `force-quantum: 0`, and it was true, and it
+/// was not the whole truth.
+///
+/// A `set` with a matching `release` somewhere else in the code is the same
+/// trap with better manners. So the request is a VALUE: while it is alive the
+/// graph is pinned, when it is dropped the graph is freed, and there is no path
+/// — early return, error, panic, a window closed, the process quitting — that
+/// releases one without the other.
+///
+/// **Dropping it is not the whole job and the caller must know that.** Freeing
+/// the graph does not move a running node back; only reopening the stream does.
+/// [`GraphQuantum::release_needs_reopen`] says so at the type level rather than
+/// in a comment somebody has to find.
+#[derive(Debug)]
+pub struct GraphQuantum {
+    frames: u32,
+    held: bool,
+}
+
+impl GraphQuantum {
+    /// Ask the graph for `frames`, and hold it until this value is dropped.
+    ///
+    /// `None` when there is no PipeWire to ask or it declined — which is not an
+    /// error: the stream still opens at whatever the graph does serve, exactly
+    /// as it did before any of this existed.
+    pub fn request(frames: u32) -> Option<Self> {
+        if frames == 0 {
+            return None;
+        }
+        request_graph_quantum(Some(frames)).then_some(Self { frames, held: true })
+    }
+
+    /// The size being held.
+    pub fn frames(&self) -> u32 {
+        self.frames
+    }
+
+    /// **Whether letting go is enough.** It is not: a node already running keeps
+    /// the period it was started with, so the caller has to reopen its streams
+    /// to actually leave. Always true; a method rather than a constant so the
+    /// answer is impossible to read past.
+    pub fn release_needs_reopen(&self) -> bool {
+        true
+    }
+}
+
+impl Drop for GraphQuantum {
+    fn drop(&mut self) {
+        if self.held {
+            release_graph_quantum();
+        }
+    }
+}
+
+/// Give the graph back to whatever it was doing.
+///
+/// Called when the app is leaving the buffer alone again — a different audio
+/// system chosen, or the process shutting down. Leaving a machine pinned
+/// because an app exited badly is the kind of thing that gets blamed on the
+/// next program to open.
+pub fn release_graph_quantum() -> bool {
+    request_graph_quantum(None)
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // The audio system
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -533,16 +1025,26 @@ static SYSTEM: Mutex<Option<String>> = Mutex::new(None);
 
 /// Every audio system this build can open, in cpal's own order.
 ///
-/// **Usually one, and that is not a bug in this function.** cpal compiles in
+/// **One on macOS and Windows, two on Linux and FreeBSD.** cpal compiles in
 /// exactly one host per platform unless a feature asks for more: CoreAudio on
 /// macOS, ALSA on Linux (which is what PipeWire and PulseAudio both present
-/// themselves as), WASAPI on Windows. JACK and ASIO are cargo features that
-/// each need a development library present at BUILD time — libjack, and the
-/// ASIO SDK plus clang — so turning either on is a change to what the release
-/// scripts can produce on a machine without them, not a change here.
+/// themselves as), WASAPI on Windows — plus JACK wherever the `jack` feature is
+/// on, which `tangent-record/Cargo.toml` turns on for Linux and FreeBSD.
 ///
-/// Listed anyway, from the real enumeration, so the control says what the
-/// build actually has rather than what it was hoped to have.
+/// This doc comment used to say that JACK, like ASIO, "needs a development
+/// library present at BUILD time" and so could not be shipped. **That was
+/// wrong about JACK**, and it is worth recording why rather than just deleting:
+/// `jack` 0.13 enables `dynamic_loading` by default, so libjack is `dlopen`ed
+/// on first use and never linked. The artifact gains no `DT_NEEDED` entry and
+/// runs unchanged on a desktop that has never heard of JACK. ASIO is still
+/// genuinely build-gated — the SDK is a download with a licence to accept —
+/// which is why that one is still a cargo feature and this one is not.
+///
+/// Listed from the real enumeration either way, so the control says what the
+/// build actually has rather than what it was hoped to have. A name appearing
+/// here is not a promise that the system is RUNNING: cpal's
+/// `JackHost::is_available` is a hardcoded `true`, and whether a server
+/// answered is settled in [`build_host`].
 pub fn systems() -> Vec<String> {
     cpal::available_hosts()
         .into_iter()
@@ -579,6 +1081,17 @@ pub fn system() -> Option<String> {
 /// build does not have — which is what a settings file written on a machine
 /// with JACK, opened on one without it, looks like. Silently, because the
 /// alternative is refusing to open any audio at all over a preference.
+///
+/// **And falls back the same way when JACK is named but no server answered.**
+/// cpal's JACK host reports `is_available() == true` unconditionally and its
+/// constructor cannot fail: with no server running it prints its error, creates
+/// no devices, and hands back a perfectly valid `Host` that owns nothing. Seated
+/// on that, the app is silent — no output, no input, no message — and the only
+/// way out is a settings panel the user has no reason to suspect. Since "JACK"
+/// is a name every Linux and FreeBSD build now offers whether or not the
+/// machine runs it, that is a trap the picker would otherwise set on the
+/// majority of desktops. A host with neither an input nor an output device is
+/// not a preference worth honouring, so it is not honoured.
 fn build_host(want: &Option<String>) -> cpal::Host {
     #[cfg(test)]
     HOSTS_BUILT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -587,6 +1100,7 @@ fn build_host(want: &Option<String>) -> cpal::Host {
             .into_iter()
             .find(|id| id.name() == *want)
             .and_then(|id| cpal::host_from_id(id).ok())
+            .filter(|host| host_has_a_device(host))
             .unwrap_or_else(cpal::default_host);
     }
     // **No stated preference: the PLATFORM DEFAULT — WASAPI on Windows.**
@@ -602,6 +1116,32 @@ fn build_host(want: &Option<String>) -> cpal::Host {
     // ASIO is still fully offered — as an explicit CHOICE in settings,
     // where the person picking it knows they have an interface.
     cpal::default_host()
+}
+
+/// Whether a freshly built host owns any device at all.
+///
+/// **Asked of JACK and of nothing else, and that narrowness is the point.**
+/// The question is cheap and side-effect-free for the JACK host — its
+/// constructor has already made its clients and pushed whatever it got into a
+/// `Vec`, so this reads a field. It is neither of those things for ASIO, where
+/// walking the device list is the very operation the `HOST_CACHE` note above
+/// exists to keep away from a live stream: asio-sys's loader is process-global
+/// and enumerating drivers can unload the one currently playing. So a general
+/// "does this host have devices" probe would buy a Linux and FreeBSD
+/// improvement by reintroducing a Windows fault that took a tester's silence
+/// to find. It is matched by NAME rather than by `HostId::Jack` because that
+/// variant only exists where the `jack` feature is compiled in, and this
+/// function should read the same on every platform.
+///
+/// Everything else is trusted: a CoreAudio, WASAPI or ALSA host that enumerates
+/// nothing is a machine with no sound card, and the default host will report
+/// exactly the same nothing. There is no better answer to fall back TO.
+fn host_has_a_device(host: &cpal::Host) -> bool {
+    use cpal::traits::HostTrait;
+    if host.id().name() != "JACK" {
+        return true;
+    }
+    host.default_output_device().is_some() || host.default_input_device().is_some()
 }
 
 /// How many times a host was actually constructed, for the cache test.
@@ -2398,7 +2938,67 @@ pub fn open_input(
             };
             BufferSize::Fixed(clamped)
         }
-        None => BufferSize::Default,
+        // **"Device" is not a size, and letting the backend choose one made it
+        // the WORST setting rather than the safest.**
+        //
+        // The output side has never deferred here: with no stated choice
+        // `pick_buffer` still asks for `WANT_BUFFER_FRAMES`. Only the input
+        // fell through to `BufferSize::Default`, so choosing "Device" and
+        // choosing 256 by hand produced an IDENTICAL output request and two
+        // different input ones — and on Linux the difference was audible.
+        // Reported from the room: default crackles, an explicit 256 is clean,
+        // and every size down to 128 is clean. The two settings a user expects
+        // to be the same thing were not.
+        //
+        // `LINUX-4.16-FINDINGS` §3 already names this shape — "the un-picked
+        // case used to open at `BufferSize::Default` … which is why 'no choice'
+        // was the worst choice" — and it was only ever fixed on the macOS arm
+        // above, which carries its own `INPUT_DEFAULT_FRAMES` for exactly this
+        // reason. This is the same fix on the other side of the cfg.
+        //
+        // **ASIO keeps deferring, and that is not an oversight.** `pick_buffer`'s
+        // ASIO arm answers `None` with `Default` so that both directions land on
+        // the driver's own preferred size; a driver has ONE buffer set, and an
+        // input asking for a number while the output asks for the default
+        // re-grants it underneath the running stream — the "len is 2 but the
+        // index is 2" crash. The equality is the safety, so it stays.
+        None if system().as_deref() == Some("ASIO") => BufferSize::Default,
+        None => {
+            // The same number the output asks for with no choice made, so the
+            // two directions of "Device" mean one thing. Kept here rather than
+            // imported because `WANT_BUFFER_FRAMES` lives in the binary crate
+            // and this is a library — the macOS arm above duplicates it for the
+            // same reason, and the pair must move together.
+            const INPUT_DEFAULT_FRAMES: u32 = 256;
+            match chosen.buffer_size() {
+                cpal::SupportedBufferSize::Range { min, max } if *min <= *max => {
+                    BufferSize::Fixed(INPUT_DEFAULT_FRAMES.clamp(*min, *max))
+                }
+                // A device that will not name a range gets the wish unclamped,
+                // which is still a considered number rather than none at all.
+                _ => BufferSize::Fixed(INPUT_DEFAULT_FRAMES),
+            }
+        }
+    };
+    // **The ring must cover the graph's cycle, or the capture silently
+    // halves.** See [`ring_covering_graph`] for the measurement. Behind the
+    // PCM-route guard because a JACK host owns its own buffers and there is
+    // nothing to cover; behind `graph_clock` because a machine with no
+    // PipeWire has no cycle to be covered from and keeps the asked-for
+    // number exactly. Clamped back into the device's own range last — a ring
+    // the device cannot allocate is a failed open, not protection.
+    #[cfg(target_os = "linux")]
+    let buffer_size = match buffer_size {
+        BufferSize::Fixed(v) if pipewire_pcm_route_applies() => {
+            let ring = graph_clock().map_or(v, |g| ring_covering_graph(v, g.floor()));
+            BufferSize::Fixed(match chosen.buffer_size() {
+                cpal::SupportedBufferSize::Range { min, max } if *min <= *max => {
+                    ring.clamp(*min, *max)
+                }
+                _ => ring,
+            })
+        }
+        other => other,
     };
     let stream_config = StreamConfig {
         channels: chosen.channels(),
@@ -2595,6 +3195,150 @@ mod tests {
         // Put the process-global choice back for whoever runs next.
         set_system(baseline_system.as_deref());
         with_host(|_| ());
+    }
+
+    /// The merge keeps whichever layer could see, and stays silent only when
+    /// neither could.
+    ///
+    /// The pairs below are the two MEASURED cases with the sources reversed —
+    /// Scarlett (graph 48, client 0) and built-in (graph 0, client 246) — and
+    /// the merge must report the seeing layer in both, because each zero here
+    /// was, on the day it was measured, a lie from a blind counter.
+    #[test]
+    fn a_blind_counters_zero_never_masks_the_seeing_ones_count() {
+        assert_eq!(merge_dropouts(Some(48), 0), Some(48), "scarlett path");
+        assert_eq!(merge_dropouts(Some(0), 246), Some(246), "built-in path");
+        assert_eq!(merge_dropouts(Some(3), 5), Some(5), "both saw: best lower bound");
+        assert_eq!(merge_dropouts(None, 7), Some(7), "client alone still counts");
+        // No graph AND a client zero is "nobody could see" — the client has
+        // been proven blind on one shipping path, so its zero alone clears
+        // nothing.
+        assert_eq!(merge_dropouts(None, 0), None);
+    }
+
+    /// **A capture ring smaller than the graph's cycle does not fail — it
+    /// keeps `ring/quantum` of the audio and reports nothing.** Measured with
+    /// `takeprobe`: at a 512-frame floor a `Fixed(256)` stream ran at a steady
+    /// 22,016 frames per second with zero drops on every counter, and three
+    /// real takes came back with their audio at double speed. The rule under
+    /// test is the protection: the ring always covers the widest cycle the
+    /// graph can serve, and never touches a request that already does.
+    #[test]
+    fn the_ring_always_covers_the_cycle_the_graph_can_serve() {
+        // An ordinary desktop floor: the asked-for number stands untouched.
+        assert_eq!(ring_covering_graph(256, 32), 256);
+        // The machine this was measured on: floor 512, asked 256 — the ring
+        // that halved every take. Twice the floor, so a cycle at the floor
+        // and a cycle at our own period both fit with room to spare.
+        assert_eq!(ring_covering_graph(256, 512), 1024);
+        // A graph pinned coarser than anything the app would ask for.
+        assert_eq!(ring_covering_graph(256, 2048), 4096);
+        // A generous ask needs no protection and keeps its number.
+        assert_eq!(ring_covering_graph(4096, 512), 4096);
+        // A pathological floor saturates rather than wrapping to a sliver.
+        assert_eq!(ring_covering_graph(256, u32::MAX), u32::MAX);
+    }
+
+    /// The ERR column survives every row shape `pw-top -b` actually prints.
+    ///
+    /// The rows below are captured from the machine this was built for, not
+    /// composed: a driver row with a format, a follower row whose name is
+    /// pushed right by a `+`, an idle row that prints only dashes, and a JACK
+    /// client row with no format at all. The parser reads the ninth token
+    /// wherever the second parses as an id, and the test exists because the
+    /// first version of the take-audit's WAV reader ALSO "obviously" worked
+    /// on the format it assumed and read the middle of a timestamp.
+    #[test]
+    fn the_err_column_is_found_in_every_row_shape_pw_top_prints() {
+        let captured = "\
+S   ID  QUANT   RATE    WAIT    BUSY   W/Q   B/Q  ERR FORMAT           NAME \n\
+I   31      0      0   0.0us   0.0us  ???   ???     0                  Dummy-Driver\n\
+R   59    128  44100  92.3us   1.2us  0.03  0.00  14646    S32LE 2 44100 alsa_input.usb-Focusrite\n\
+R   58      0      0  12.2us  15.2us  0.00  0.01   13    S32LE 2 44100  + alsa_output.usb-Focusrite\n\
+R  101      0      0  16.9us 470.6us  0.00  0.08    7                   + Tangent_out\n\
+C   77      0      0    ---     ---   ---   ---     0                  alsa_playback.tangent\n";
+        // Ids present sum their LAST value; absent ids measure nothing.
+        assert_eq!(sum_errs(captured, &[58, 101]), Some(20));
+        assert_eq!(sum_errs(captured, &[59]), Some(14646));
+        // An idle row prints dashes for its timings but ERR still prints, and
+        // a real 0 from an idle node is a genuine count — cumulative, per
+        // node, zero because nothing has gone wrong yet. Only absence is
+        // unknown.
+        assert_eq!(sum_errs(captured, &[77]), Some(0));
+        // A snapshot that misses every asked-for node is UNKNOWN, not zero —
+        // the whole module exists because a confident zero was believed once.
+        assert_eq!(sum_errs(captured, &[9999]), None);
+        // Two snapshots in one batch: the later reading wins.
+        let two = format!("{captured}R   58      0      0  12.2us  15.2us  0.00  0.01   21    S32LE 2 44100  + alsa_output.usb-Focusrite\n");
+        assert_eq!(sum_errs(&two, &[58]), Some(21));
+    }
+
+    /// Node ownership is resolved through the client, and directly, and only
+    /// for audio.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn our_nodes_are_found_by_pid_through_either_route() {
+        let dump = r#"[
+          { "id": 40, "type": "PipeWire:Interface:Client",
+            "info": { "props": { "application.process.id": 4242 } } },
+          { "id": 58, "type": "PipeWire:Interface:Node",
+            "info": { "props": { "media.class": "Stream/Output/Audio", "client.id": 40 } } },
+          { "id": 59, "type": "PipeWire:Interface:Node",
+            "info": { "props": { "media.class": "Stream/Input/Audio", "application.process.id": "4242" } } },
+          { "id": 64, "type": "PipeWire:Interface:Node",
+            "info": { "props": { "media.class": "Video/Source", "client.id": 40 } } },
+          { "id": 75, "type": "PipeWire:Interface:Node",
+            "info": { "props": { "media.class": "Audio/Sink", "client.id": 99 } } }
+        ]"#;
+        let ids = our_audio_nodes(dump, 4242);
+        // 58 via its client, 59 via its own pid (as a STRING, which pipewire
+        // has emitted across versions), 64 refused for being video, 75 refused
+        // for belonging to somebody else.
+        assert_eq!(ids, vec![58, 59]);
+        // A pid that owns nothing measures nothing.
+        assert!(our_audio_nodes(dump, 1).is_empty());
+        // Garbage in, empty out — the caller turns empty into None.
+        assert!(our_audio_nodes("not json", 4242).is_empty());
+    }
+
+    /// **The feature flag, asserted rather than assumed.**
+    ///
+    /// `cpal`'s `jack` feature is turned on in `tangent-record/Cargo.toml` per
+    /// target, which is a place a change can silently drop it — a merge, a
+    /// dependency bump, a tidy-up of a table that looks redundant next to the
+    /// unconditional `cpal = "0.16"` three lines up. Nothing would fail to
+    /// build; the Audio Setup panel would just quietly go back to offering one
+    /// entry, and the only symptom is a user on a pro-audio session wondering
+    /// where JACK went. This is deterministic without a server running:
+    /// `JackHost::is_available` is a hardcoded `true`, so the name is listed
+    /// whenever the backend is COMPILED, which is exactly what this asserts.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn the_jack_host_is_compiled_in() {
+        assert!(
+            systems().iter().any(|s| s == "JACK"),
+            "this build should offer JACK; it offers {:?}",
+            systems()
+        );
+    }
+
+    /// The guard rejects only JACK, and never the host it would fall back to.
+    ///
+    /// Guards the ASIO property in [`host_has_a_device`]'s own note: the probe
+    /// must never be the thing that walks a host's device list, because on
+    /// Windows that is what tears down a live driver. A non-JACK host is passed
+    /// through on the strength of its NAME, before anything is enumerated, and
+    /// this holds on every platform including the one where the default host
+    /// genuinely has no devices.
+    #[test]
+    fn the_empty_host_guard_only_asks_jack() {
+        let default = cpal::default_host();
+        assert_ne!(default.id().name(), "JACK", "no platform defaults to JACK");
+        assert!(
+            host_has_a_device(&default),
+            "the default host must pass the guard unenumerated, or build_host \
+             could reject the very host it falls back to"
+        );
     }
 
     fn stats() -> Arc<CaptureStats> {

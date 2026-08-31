@@ -186,6 +186,82 @@ linuxvideo = { path = "vendor/linuxvideo" }
 # is in the tree anyway rather than adding a second copy of the decoder.
 zune-jpeg = "0.5"
 
+# **Linux gets the JACK host too, and it costs the stock desktop NOTHING.**
+#
+# This was left off for years on one premise, written into `audio::systems()`
+# and repeated in the FreeBSD note below: that the `jack` feature "needs a
+# development library present at BUILD time" and therefore puts libjack in the
+# artifact's `DT_NEEDED`. **That premise is false for `jack` 0.13**, which is
+# what cpal 0.16 depends on. `dynamic_loading` is one of that crate's DEFAULT
+# features, and it means every libjack call goes through `libloading` at run
+# time — so the library is `dlopen`ed on first use and its absence is an
+# ordinary `Err`, not a binary that will not start.
+#
+# What was true is that `jack-sys`'s build script defeated its own feature on
+# Linux specifically, by probing pkg-config and emitting a link directive
+# anyway. That is the one conditional in `tangent-record/vendor/jack-sys`; see
+# its `PATCH.md`. With it, the measured result on the Linux x86_64 artifact is
+# that `readelf -d` gains no entry at all.
+#
+# So the trade the FreeBSD note had to reason about does not exist here. A
+# machine with no pro-audio stack installed runs exactly the binary it ran
+# before and never opens the library; a machine with JACK — or with PipeWire,
+# which ships an ABI-compatible libjack that nearly every desktop Linux now has
+# by default — gains the entry in the Audio Setup panel.
+#
+# **Why it is worth having — and it is NOT, on the evidence so far, latency.**
+#
+# The reasoning that motivated this was structural and looked airtight: on a
+# PipeWire desktop the ALSA host reaches the graph through pipewire-alsa, an
+# emulation layer, and carries the four-period ring `BUFFER_PERIODS` had to add
+# for it, where a JACK client is in the graph directly on a thread the server
+# scheduled. Deleting a stage should beat tuning one.
+#
+# **It was measured before it was believed, and it did not survive.**
+# `docs/LINUX-JACK-FINDINGS.md` has the runs. On the dev box, capture to
+# playback through the monitor ring: ALSA 5.6-5.9 ms median, JACK 23.4-26.4 ms.
+# JACK is four times worse on the path Tangent actually uses.
+#
+# Neither number means what it looks like, which is why the doc exists rather
+# than a one-line note. **pipewire-alsa reports a PCM delay of ZERO** — cpal's
+# ALSA host computes `playback = callback + snd_pcm_status_get_delay`, and that
+# addend is 0 on every callback, so the ALSA figure omits the entire output leg
+# and cannot be compared with anything. And JACK's figure carries a full extra
+# graph cycle that is cpal's doing, not the server's: cpal opens two INDEPENDENT
+# clients, `Tangent_in` and `Tangent_out` ("Until we have duplex streams two
+# clients will be created", `host/jack/mod.rs`), and nothing orders them, so the
+# output client can run before the input client every cycle and the ring between
+# them never drains. Settling it needs `rtclick` on a wired loopback, which is
+# the instrument this project already keeps for drivers that misreport.
+#
+# So the case for shipping it is the one that does not need a stopwatch:
+#
+# - **The interface has a name again.** Through JACK the ports are
+#   `Scarlett Solo (3rd Gen.) Pro:capture_AUX0`. Through ALSA on a PipeWire box
+#   there is ONE openable PCM, called `pipewire`, which follows whatever the
+#   desktop's default source happens to be — the fault that once recorded a
+#   laptop microphone with an interface plugged in.
+# - **It can be patched.** Tangent appears in qjackctl, Carla or Patchance and
+#   can be wired into a DAW, sample-synchronous, which is the whole reason a
+#   pro-audio session exists.
+# - **It costs nothing to offer.** libjack is `dlopen`ed, so the artifact gains
+#   no `DT_NEEDED` entry and no new crate enters the graph — `jack` was already
+#   there for FreeBSD. A desktop with no pro-audio stack runs what it ran
+#   before.
+#
+# **It does not become the default.** cpal's `default_host()` on Linux is a
+# hardcoded `AlsaHost::new()` whatever features are on. All this does is add
+# "JACK" to `cpal::available_hosts()`, which is what `audio::systems()` lists —
+# and `audio::build_host` refuses to seat a JACK host that answered with no
+# devices, so choosing it on a machine with no server running gives the user
+# their sound back rather than silence. Given the measurement, that default is
+# now load-bearing rather than merely cautious.
+#
+# `cargo run --release -p tangent-record --example rtlatency` takes the numbers
+# on either host — `SYSTEM=JACK` picks this one, and it now reports the output
+# leg on its own, which is the part the two hosts disagree about.
+cpal = { version = "0.16", features = ["jack"] }
+
 # **FreeBSD gets the JACK host as well as ALSA, and this does not change the
 # default.**
 #
