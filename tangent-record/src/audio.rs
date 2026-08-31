@@ -1004,6 +1004,147 @@ pub fn release_graph_quantum() -> bool {
     request_graph_quantum(None)
 }
 
+// ── the claim: full control, no config files ───────────────────────────────
+//
+// `request_graph_quantum` sat here fully built and called by NOBODY, waiting
+// on the owner's ruling. The ruling came 2026-08-31: **Tangent must be
+// usable by somebody who has never heard of a quantum, on a distro whose
+// audio stack was configured by nobody. Full control, all the time, and the
+// user never edits a config file.** So the claim is policy now: whenever a
+// stream asks for a size the graph will not serve, Tangent takes the clock,
+// holds it while it runs, and puts back exactly what it found on the way
+// out. `pw-metadata` state is LIVE, not configuration — nothing on disk
+// changes, and releasing the claim restores the machine's own settings.
+//
+// FreeBSD needs no twin of this: there is no graph daemon between the app
+// and the driver, so the `Fixed` request already IS the whole authority.
+
+/// What we forced, or 0 when nothing is held. The prior force (somebody
+/// else's pin, put back on release) rides in the high half of a second
+/// atomic so a claim survives being asked twice without stacking.
+static CLAIMED_QUANTUM: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static PRIOR_FORCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Where the claim writes its crash marker, set once by the binary at boot.
+/// A crash cannot release the claim, so the NEXT launch does: if the marker
+/// names the same force the graph still carries, it is ours and it comes
+/// off. In-process exits (quit, panic hook) release directly.
+static CLAIM_MARKER: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+pub fn set_claim_marker(path: std::path::PathBuf) {
+    let _ = CLAIM_MARKER.set(path);
+}
+
+/// What a claim should do, decided purely so every branch is testable on
+/// every platform: the imperative shell below stays four lines per arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimAction {
+    /// The graph already serves the ask (or we already hold this size).
+    Keep,
+    /// Take the clock at this size, remembering `prior` to restore.
+    Force { frames: u32, prior: u32 },
+    /// We hold a claim the new ask no longer needs — give the clock back.
+    Release,
+}
+
+pub fn claim_action(g: GraphClock, asked: u32, held: u32, prior: u32) -> ClaimAction {
+    if held == asked && g.forced == asked {
+        return ClaimAction::Keep;
+    }
+    if held != 0 && g.forced == held {
+        // We hold the clock at some other size. If the graph would serve
+        // the new ask WITHOUT us (its own floor is fine), let go; otherwise
+        // move our claim to the new size, keeping the ORIGINAL prior — the
+        // machine's own state, not our last claim — for the release.
+        let without_us = GraphClock { forced: prior, ..g };
+        return if without_us.will_serve(asked) {
+            ClaimAction::Release
+        } else {
+            ClaimAction::Force { frames: asked, prior }
+        };
+    }
+    if g.will_serve(asked) {
+        ClaimAction::Keep
+    } else {
+        // Somebody else's force pin is overridden too — the ruling is that
+        // the person at the microphone outranks whatever a config file or
+        // another app decided — but it is remembered and restored.
+        ClaimAction::Force { frames: asked, prior: g.forced }
+    }
+}
+
+/// The graph's clock, after TAKING it if it would not serve `asked`.
+///
+/// Returns the post-claim clock, so ring sizing downstream sees the floor
+/// that is actually in force. Every failure degrades to the old behaviour:
+/// no PipeWire, no `pw-metadata`, or a declined write all fall back to
+/// reading whatever is there, and the ring guard covers the rest.
+#[cfg(target_os = "linux")]
+pub fn claim_graph_clock(asked: u32) -> Option<GraphClock> {
+    use std::sync::atomic::Ordering;
+    let g = graph_clock()?;
+    let held = CLAIMED_QUANTUM.load(Ordering::SeqCst);
+    let prior = PRIOR_FORCE.load(Ordering::SeqCst);
+    match claim_action(g, asked, held, prior) {
+        ClaimAction::Keep => Some(g),
+        ClaimAction::Release => {
+            release_graph_claim();
+            graph_clock().or(Some(g))
+        }
+        ClaimAction::Force { frames, prior } => {
+            if !request_graph_quantum(Some(frames)) {
+                return Some(g);
+            }
+            CLAIMED_QUANTUM.store(frames, Ordering::SeqCst);
+            PRIOR_FORCE.store(prior, Ordering::SeqCst);
+            if let Some(m) = CLAIM_MARKER.get() {
+                let _ = std::fs::write(m, frames.to_string());
+            }
+            graph_clock().or(Some(g))
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn claim_graph_clock(_asked: u32) -> Option<GraphClock> {
+    None
+}
+
+/// Put back what the claim displaced: the prior pin if there was one,
+/// nothing if there was not. Safe to call unconditionally on every exit
+/// road — quit, panic, the pre-`_exit` hardening — a no-op when nothing is
+/// held.
+pub fn release_graph_claim() {
+    use std::sync::atomic::Ordering;
+    let held = CLAIMED_QUANTUM.swap(0, Ordering::SeqCst);
+    if held == 0 {
+        return;
+    }
+    let prior = PRIOR_FORCE.swap(0, Ordering::SeqCst);
+    let _ = request_graph_quantum(if prior > 0 { Some(prior) } else { None });
+    if let Some(m) = CLAIM_MARKER.get() {
+        let _ = std::fs::remove_file(m);
+    }
+}
+
+/// The crash road: a launch finding a marker whose value matches the force
+/// the graph still carries is looking at its own predecessor's unreleased
+/// claim, and takes it off. A force that does NOT match is somebody else's
+/// and is left alone; the stale marker goes either way.
+#[cfg(target_os = "linux")]
+pub fn recover_graph_claim() {
+    let Some(m) = CLAIM_MARKER.get() else { return };
+    let Ok(text) = std::fs::read_to_string(m) else { return };
+    let _ = std::fs::remove_file(m);
+    let Ok(was): Result<u32, _> = text.trim().parse() else { return };
+    if graph_clock().is_some_and(|g| g.forced == was && was > 0) {
+        let _ = request_graph_quantum(None);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn recover_graph_claim() {}
+
 // ───────────────────────────────────────────────────────────────────────────
 // The audio system
 // ───────────────────────────────────────────────────────────────────────────
@@ -2990,7 +3131,14 @@ pub fn open_input(
     #[cfg(target_os = "linux")]
     let buffer_size = match buffer_size {
         BufferSize::Fixed(v) if pipewire_pcm_route_applies() => {
-            let ring = graph_clock().map_or(v, |g| ring_covering_graph(v, g.floor()));
+            // CLAIM first, then size the ring to what is actually in force:
+            // on a graph that would not serve `v`, the claim takes the
+            // clock (the owner's full-control ruling — see the claim block
+            // above `claim_graph_clock`), so the floor the ring covers is
+            // usually `v` itself and the person gets the latency they asked
+            // for. Where the claim cannot land, the ring guard still keeps
+            // every frame at the graph's own pace.
+            let ring = claim_graph_clock(v).map_or(v, |g| ring_covering_graph(v, g.floor()));
             BufferSize::Fixed(match chosen.buffer_size() {
                 cpal::SupportedBufferSize::Range { min, max } if *min <= *max => {
                     ring.clamp(*min, *max)
@@ -3218,6 +3366,50 @@ mod tests {
 
     /// **A capture ring smaller than the graph's cycle does not fail — it
     /// keeps `ring/quantum` of the audio and reports nothing.** Measured with
+    /// **The claim takes the clock exactly when the person's ask would not
+    /// be served, and always remembers what it displaced.** The owner's
+    /// full-control ruling, as arithmetic: a graph whose floor is coarser
+    /// than the ask gets forced to the ask; a graph already fine enough is
+    /// left alone; somebody else's pin is overridden but carried in
+    /// `prior` so release puts it back; and a claim we already hold moves
+    /// or releases as the new ask requires.
+    #[test]
+    fn the_claim_forces_exactly_when_the_ask_would_not_be_served() {
+        let g = |quantum, min, forced| GraphClock { quantum, min_quantum: min, forced, rate: 48_000 };
+
+        // An ordinary desktop (floor 32): nothing to take.
+        assert_eq!(claim_action(g(1024, 32, 0), 256, 0, 0), ClaimAction::Keep);
+        // The wound machine: min-quantum pinned 512, ask 256 — taken.
+        assert_eq!(
+            claim_action(g(512, 512, 0), 256, 0, 0),
+            ClaimAction::Force { frames: 256, prior: 0 }
+        );
+        // Somebody else's force pin: overridden, and remembered for release.
+        assert_eq!(
+            claim_action(g(512, 32, 512), 256, 0, 0),
+            ClaimAction::Force { frames: 256, prior: 512 }
+        );
+        // Already holding the ask, and the graph still shows it: nothing to do.
+        assert_eq!(claim_action(g(256, 512, 256), 256, 256, 0), ClaimAction::Keep);
+        // Holding 256, the ask coarsens to 1024, and the machine's own floor
+        // (512, once our force is gone) serves it: let the clock go.
+        assert_eq!(claim_action(g(256, 512, 256), 1024, 256, 0), ClaimAction::Release);
+        // Holding 256 over somebody's 512 pin, ask moves to 128: the pin
+        // still would not serve it, so the claim moves and the PRIOR rides
+        // along — never our own last claim.
+        assert_eq!(
+            claim_action(g(256, 32, 256), 128, 256, 512),
+            ClaimAction::Force { frames: 128, prior: 512 }
+        );
+        // A third hand re-pinned the clock out from under our claim: the
+        // held-branch does not apply (forced != held), and the stranger's
+        // pin is treated like any other — overridden, remembered.
+        assert_eq!(
+            claim_action(g(2048, 32, 2048), 256, 256, 0),
+            ClaimAction::Force { frames: 256, prior: 2048 }
+        );
+    }
+
     /// `takeprobe`: at a 512-frame floor a `Fixed(256)` stream ran at a steady
     /// 22,016 frames per second with zero drops on every counter, and three
     /// real takes came back with their audio at double speed. The rule under
