@@ -56,3 +56,12 @@ When it lands, delete this directory and drop the `exclude` and
 
 Note that upstream `lv2-sys` has not been released since 2020, so the patch may
 outlive the wait. It costs one line to carry.
+
+## Why `Cargo.toml.orig` and `.cargo_vcs_info.json` are here
+
+Every copy under this directory (`lilv/`, `livi/`, `lv2-sys/`) is an unpacked
+crates.io `.crate` tarball, and those two files are part of what the tarball
+ships. They are kept on purpose, not forgotten: the whole discipline of these
+copies is that each one stays diffable against its upstream tarball, byte for
+byte outside the declared patch, and stripping packaging files would make
+every such diff open with noise instead of nothing. Do not tidy them away.

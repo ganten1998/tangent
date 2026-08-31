@@ -214,6 +214,34 @@ ivory/
   Python app's — small, so it upscales soft; explicitly NOT a gate), and the
   settings one-way caveat.
 
+## Deliberate absences
+
+Four things Tangent does not do, on purpose rather than not yet. Each
+rationale below is the position as read from the code and the planning
+documents by the 5.1 audit, written down so it stops living only in the
+code's shape; the owner should approve or amend each one before it is quoted
+anywhere public.
+
+- **Surround.** The desk is stereo from the first insert to the export.
+  Tangent records a person at an instrument for an audience on phones and
+  laptops; surround would multiply every buffer, meter, insert and file
+  format by a speaker layout that audience does not have, and it cannot be
+  retrofitted as a setting. It is an engine rewrite. Not planned.
+- **MIDI output.** MIDI flows in. The instruments Tangent drives are the
+  ones it hosts; driving external hardware means MIDI clock, cross-device
+  latency alignment and a routing matrix, which is a different program
+  (REAPER exists). The take records what was played into Tangent, and that
+  stays true with no out ports to reason about.
+- **Scripting.** No scripting API, deliberately. An API is a permanent
+  compatibility contract, and this project's positioning (no telemetry, no
+  network, one person) depends on promising only surfaces it can actually
+  honour. The developer switches (`IVORY_*`) are switches, not an interface.
+- **ARA.** ARA exists so a DAW can hand its audio timeline to an editor
+  plugin. Tangent has no audio editing for ARA to serve: no comping (the
+  rationale sits beside `CHANNELS` in `tangent-ui/src/recorder.rs`) and no
+  destructive audio editing. ARA before those would be a socket with nothing
+  wired to it. Revisit only if the editing position ever changes.
+
 ## Version
 
 **2.1.0.** The single authority is `[workspace.package] version` in the root
