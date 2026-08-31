@@ -203,6 +203,11 @@ struct AudioReport {
     /// heard. `None` where it declined to say. See `take::AudioReport` for why
     /// this is here and not in `source.latency_ns`, which means the opposite.
     output_delay_ns: Option<Nanos>,
+    /// Frames per output callback, counted; and the ring that was asked for.
+    /// Two numbers because on Linux they differ by four — see
+    /// `take::AudioReport`.
+    output_block_frames: Option<u32>,
+    output_ring_frames: Option<u32>,
     /// Whatever went wrong, in words meant for the user.
     error: Option<String>,
 }
@@ -603,6 +608,8 @@ impl Writer {
             // belongs in the manifest even when the file is mostly microphone.
             // `None` when nothing is playing back or the backend declined.
             output_delay_ns: self.plugin.as_ref().and_then(|t| t.output_delay_ns()),
+            output_block_frames: self.plugin.as_ref().and_then(|t| t.output_block_frames()),
+            output_ring_frames: self.plugin.as_ref().and_then(|t| t.output_ring_frames()),
             error: self.error.take(),
         }
     }
@@ -2213,6 +2220,8 @@ impl Session {
             manifest.audio.peak_dbfs = f64::from(audio::dbfs(r.take_peak));
             manifest.audio.clipped = r.clipped_samples > 0;
             manifest.audio.output_delay_ns = r.output_delay_ns;
+            manifest.audio.output_block_frames = r.output_block_frames;
+            manifest.audio.output_ring_frames = r.output_ring_frames;
             manifest.sources.push(r.source.clone());
             // The device stopped answering. RECORDER-PLAN §4's policy is to
             // finalise what exists and mark it incomplete — a `.wav` of eight
@@ -4005,6 +4014,8 @@ impl PluginWriter {
             // because it is stored by every callback and Start is before the
             // first one.
             output_delay_ns: self.tap.as_ref().and_then(|t| t.output_delay_ns()),
+            output_block_frames: self.tap.as_ref().and_then(|t| t.output_block_frames()),
+            output_ring_frames: self.tap.as_ref().and_then(|t| t.output_ring_frames()),
             error: self.error.take(),
         }
     }

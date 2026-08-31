@@ -1027,6 +1027,26 @@ pub struct AudioReport {
     /// zero and is why this is an `Option` rather than a number with a sentinel.
     /// ALSA declines; CoreAudio and JACK do not.
     pub output_delay_ns: Option<Nanos>,
+    /// Frames per output callback, **counted rather than requested**.
+    ///
+    /// The number that explains a take. A device's buffer size belongs to the
+    /// device — another host holding the same interface dictates it and the
+    /// request is not granted — so the figure that was asked for explains
+    /// nothing, and this one does. `None` before the first callback.
+    pub output_block_frames: Option<u32>,
+    /// The output RING asked of the host, in frames, when the stream opened.
+    ///
+    /// **Recorded beside the block rather than instead of it**, because on
+    /// Linux they differ by four. WASAPI and ALSA read a fixed buffer size as
+    /// the whole ring rather than one period, so the engine asks for `period *
+    /// BUFFER_PERIODS`; a manifest carrying only the period would understate
+    /// its own take's buffering fourfold, and the reader would have to know a
+    /// compile-time constant of ours to correct it.
+    ///
+    /// `None` where no fixed size was asked for at all, which is what ASIO
+    /// gets. That is a different claim from any number, including this one
+    /// being equal to the block.
+    pub output_ring_frames: Option<u32>,
 }
 
 impl Default for AudioReport {
@@ -1041,6 +1061,8 @@ impl Default for AudioReport {
             peak_dbfs: f64::NEG_INFINITY,
             clipped: false,
             output_delay_ns: None,
+            output_block_frames: None,
+            output_ring_frames: None,
         }
     }
 }
@@ -1311,6 +1333,14 @@ impl Manifest {
                     (
                         "output_delay_ns",
                         Json::opt_int(self.audio.output_delay_ns),
+                    ),
+                    (
+                        "output_block_frames",
+                        Json::opt_int(self.audio.output_block_frames.map(i64::from)),
+                    ),
+                    (
+                        "output_ring_frames",
+                        Json::opt_int(self.audio.output_ring_frames.map(i64::from)),
                     ),
                 ]),
             ),
@@ -1969,6 +1999,35 @@ mod tests {
             m.render().contains("\"output_delay_ns\": 5333333"),
             "the one measured latency in the product has to reach the file:\n{}",
             m.render()
+        );
+    }
+
+    /// **The block and the ring are two numbers and the manifest keeps them
+    /// apart.**
+    ///
+    /// On Linux the ring is four periods, so a take recording only the period
+    /// understates its own buffering fourfold — the same defect the Audio
+    /// Status panel has, and not one worth copying into the file that exists
+    /// to explain bad takes. A reader must not have to know one of our
+    /// compile-time constants to correct the number we gave them.
+    #[test]
+    fn the_manifest_keeps_the_output_block_and_the_ring_apart() {
+        let mut m = manifest();
+        assert_eq!(m.audio.output_block_frames, None);
+        assert_eq!(m.audio.output_ring_frames, None);
+        let blank = m.render();
+        assert!(blank.contains("\"output_block_frames\": null"), "{blank}");
+        assert!(blank.contains("\"output_ring_frames\": null"), "{blank}");
+
+        // What Linux looks like: 256 frames a callback, a 1024-frame ring.
+        m.audio.output_block_frames = Some(256);
+        m.audio.output_ring_frames = Some(1024);
+        let out = m.render();
+        assert!(out.contains("\"output_block_frames\": 256"), "{out}");
+        assert!(
+            out.contains("\"output_ring_frames\": 1024"),
+            "the ring is the number that explains the take, and it is not the \
+             block:\n{out}"
         );
     }
 
