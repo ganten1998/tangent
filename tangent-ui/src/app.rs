@@ -1534,9 +1534,26 @@ fn dirs_home() -> std::path::PathBuf {
 /// Where a FRESH session lives: `Untitled`, unless somebody literally
 /// SAVED a project by that name — an auto-saved scratch is reclaimed, a
 /// kept one is stepped past to `Untitled 2` and so on.
+///
+/// **A scratch with a BUILT KIT is not a scratch.** Reclaim used to read
+/// only the `named` flag, so a session where somebody spent an evening
+/// loading samples onto pads — and never thought to Save As, because the
+/// kit saves itself — was handed back as "fresh" and its `drumpad.json`
+/// deleted or overwritten on the next launch or New. Three sessions' kits
+/// went that way before this guard existed. The test is byte-equality
+/// against the template's own kit on disk: every scratch begins life as a
+/// verbatim clone of `Templates/default`, so an identical file is the
+/// clone and a differing one is work. Comparing against the disk template
+/// rather than a shipped constant means a template somebody customised
+/// protects its own clones correctly.
 pub fn fresh_project_dir(root: &std::path::Path) -> std::path::PathBuf {
+    let template_kit = root
+        .join("Templates")
+        .join("default")
+        .join(crate::drumpad::FILE_NAME);
     let keeps = |dir: &std::path::Path| {
         crate::arrangement::Arrangement::load_from(&dir.join("project.tangent")).named
+            || kit_is_custom(&dir.join(crate::drumpad::FILE_NAME), &template_kit)
     };
     let first = root.join("Untitled");
     if !first.exists() || !keeps(&first) {
@@ -1549,6 +1566,21 @@ pub fn fresh_project_dir(root: &std::path::Path) -> std::path::PathBuf {
         }
     }
     first
+}
+
+/// Whether a project's kit holds work of its own: present, and not
+/// byte-for-byte the template's kit. A kit with no template counterpart is
+/// always work — nothing could have cloned it there. An absent kit is never
+/// work, whatever the template has: some roads into a scratch (`new_project`)
+/// deliberately shed the sidecar.
+fn kit_is_custom(kit: &std::path::Path, template_kit: &std::path::Path) -> bool {
+    let Ok(bytes) = std::fs::read(kit) else {
+        return false;
+    };
+    match std::fs::read(template_kit) {
+        Ok(t) => bytes != t,
+        Err(_) => true,
+    }
 }
 
 /// `base`, or `base 2`, `base 3`… — the first directory name not taken.
@@ -8025,6 +8057,18 @@ impl IvoryApp {
                         })
                 });
             if !stock {
+                // A touched template stands — minus one flag. Templates
+                // minted before the save-as-template flow stripped `named`
+                // carry it still, and a clone of a named template is born
+                // "kept": launch never reclaims a scratch again and mints
+                // one new Untitled per launch. Repaired here, at the
+                // template's own home, so existing installs heal on their
+                // next launch.
+                if old.named {
+                    let mut fixed = old;
+                    fixed.named = false;
+                    fixed.save_to(&doc);
+                }
                 return;
             }
         }
@@ -26078,6 +26122,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// **A named template heals at the seed.** Templates minted before the
+    /// save-as-template flow stripped `named` carry the flag of the session
+    /// they were copied from, and a clone of a named template is born
+    /// "kept" — launch never reclaims a scratch and mints one new Untitled
+    /// per launch. The seed strips the flag and keeps everything else.
+    #[test]
+    fn a_named_template_is_healed_by_the_seed_without_losing_its_work() {
+        let root = project_scratch("named-template");
+        let (_ctx, app) = headless_with(Caps::DESKTOP, Settings::default());
+        let shelf = root.join("Projects/Templates/default");
+        // A touched template — clips in it — saved from a NAMED session.
+        let mut arr = crate::arrangement::Arrangement::default();
+        arr.named = true;
+        arr.add_clip(clip_at("media/riff.wav", 0, 0.0));
+        arr.save_to(&shelf.join("project.tangent"));
+        app.seed_template(&shelf);
+        let healed = crate::arrangement::Arrangement::load_from(&shelf.join("project.tangent"));
+        assert!(!healed.named, "the seed left the template named");
+        assert_eq!(healed.clips.len(), 1, "the heal cost the template its work");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// **A session folder knows its own desk, and an explicit open puts it
     /// back.** Kinds, bays, names, colours, faders, tempo — captured on
     /// every save, applied on open (with the host told to reload states),
@@ -33150,6 +33216,45 @@ mod tests {
             )
             .named
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A scratch with a built kit is not a scratch.** An Untitled nobody
+    /// Save-As'd but whose `drumpad.json` differs from the template's holds
+    /// an evening of sample assignment; reclaim must step past it exactly
+    /// as if it were saved. An untouched clone of the template kit is still
+    /// scratch — otherwise every launch would strand a folder.
+    #[test]
+    fn a_scratch_with_a_built_kit_is_not_reclaimed() {
+        let root = std::env::temp_dir().join(format!(
+            "ivory-kit-guard-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let template = root.join("Templates").join("default");
+        std::fs::create_dir_all(&template).unwrap();
+        std::fs::write(template.join(crate::drumpad::FILE_NAME), b"stock kit").unwrap();
+
+        // An unsaved scratch whose kit is a verbatim clone: reclaimed.
+        let scratch = root.join("Untitled");
+        std::fs::create_dir_all(&scratch).unwrap();
+        crate::arrangement::Arrangement::default()
+            .save_to(&scratch.join("project.tangent"));
+        std::fs::write(scratch.join(crate::drumpad::FILE_NAME), b"stock kit").unwrap();
+        assert_eq!(fresh_project_dir(&root), scratch);
+
+        // The same scratch with a kit somebody BUILT: stepped past.
+        std::fs::write(scratch.join(crate::drumpad::FILE_NAME), b"my kit").unwrap();
+        assert_eq!(fresh_project_dir(&root), root.join("Untitled 2"));
+
+        // A kit with no template counterpart is always work.
+        std::fs::remove_file(template.join(crate::drumpad::FILE_NAME)).unwrap();
+        assert_eq!(fresh_project_dir(&root), root.join("Untitled 2"));
+
+        // And an ABSENT kit is never work — `new_project` sheds the
+        // sidecar on purpose, and that must not strand the folder.
+        std::fs::remove_file(scratch.join(crate::drumpad::FILE_NAME)).unwrap();
+        assert_eq!(fresh_project_dir(&root), scratch);
         let _ = std::fs::remove_dir_all(&root);
     }
 
