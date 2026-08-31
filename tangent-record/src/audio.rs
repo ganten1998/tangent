@@ -512,6 +512,250 @@ fn with_pipewire_node<T>(_node: &str, f: impl FnOnce() -> T) -> T {
     f()
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Dropouts, from the one place on a PipeWire desktop that can see them
+// ───────────────────────────────────────────────────────────────────────────
+
+/// The graph's own xrun count for THIS process's audio nodes, watched from a
+/// timer thread.
+///
+/// **This exists because the client-side count is structurally blind here.**
+/// cpal's ALSA backend now reports every EPIPE it sees — all three sites —
+/// and on a pipewire-alsa desktop it sees none: the plugin absorbs the xrun,
+/// re-prepares, and the error never crosses the plugin boundary. Verified on
+/// the machine this was written for, from both ends at once: a 64-frame
+/// buffer the user described as "total noise", zero backend errors in the
+/// app's log, and PipeWire's own counter for the node climbing 24 → 72 in
+/// the same window. The truth exists in exactly one place, and it is the
+/// server's.
+///
+/// Read the way [`pipewire_sources`] and [`graph_clock`] read — by shelling
+/// to tools that ship with PipeWire — and for the same reason: linking
+/// libpipewire needs headers at build time and the Linux artifacts are
+/// cross-compiled. `pw-dump` maps this process's pid to its node ids;
+/// `pw-top -b` carries the per-node ERR column that `pw-dump` does not.
+///
+/// **Two rules, both scars:**
+///
+/// - **It polls on its own thread, on a timer.** Never from the audio thread
+///   and never per-frame from the UI loop — a process spawn in either is a
+///   new fault of the same family this is trying to observe. The thread
+///   sleeps in slices so dropping the watcher never waits out an interval.
+/// - **Unreadable is `None`, never zero.** A machine without `pw-top`, a
+///   graph that is not PipeWire, a parse that fails on a future format — all
+///   of those are "nobody knows", and reporting 0 for "nobody knows" is the
+///   exact lie `latency_source: "assumed_zero"` exists to avoid one field
+///   over. The counter that read a confident zero through total noise has
+///   already been believed once.
+pub struct GraphDropouts {
+    /// Latest reading: -1 is "unknown", anything else is the count.
+    latest: std::sync::Arc<std::sync::atomic::AtomicI64>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl GraphDropouts {
+    /// How often the graph is asked. Coarse on purpose: a dropout display is
+    /// read by a human, and two spawned processes per poll is a real cost on
+    /// the small machines this matters most on.
+    #[cfg(target_os = "linux")]
+    const POLL: std::time::Duration = std::time::Duration::from_secs(3);
+
+    /// Start watching. On platforms with no PipeWire this returns a watcher
+    /// that answers `None` forever and starts no thread at all.
+    pub fn start() -> Self {
+        use std::sync::atomic::{AtomicBool, AtomicI64};
+        let latest = std::sync::Arc::new(AtomicI64::new(-1));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        #[cfg(target_os = "linux")]
+        {
+            let latest_t = std::sync::Arc::clone(&latest);
+            let stop_t = std::sync::Arc::clone(&stop);
+            let spawned = std::thread::Builder::new()
+                .name("graph-dropouts".to_owned())
+                .spawn(move || {
+                    use std::sync::atomic::Ordering;
+                    let pid = std::process::id();
+                    loop {
+                        let count = read_graph_dropouts(pid);
+                        latest_t.store(count.map_or(-1, |c| c as i64), Ordering::Relaxed);
+                        // Sleep in slices so a drop is honoured within a
+                        // tenth of a second — the same shape `Reprobe` uses,
+                        // and for the same reason.
+                        let slices = Self::POLL.as_millis() / 100;
+                        for _ in 0..slices.max(1) {
+                            if stop_t.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                    }
+                });
+            if spawned.is_err() {
+                // No thread means no readings: `latest` stays -1, which reads
+                // as `None`, which is the honest answer.
+            }
+        }
+        Self { latest, stop }
+    }
+
+    /// The most recent count, or `None` where nothing can see one.
+    ///
+    /// Cheap enough for a per-frame read — one relaxed load — which is the
+    /// point of the thread: the SPAWNING is on a timer, the READING is free.
+    pub fn latest(&self) -> Option<u64> {
+        let v = self.latest.load(std::sync::atomic::Ordering::Relaxed);
+        u64::try_from(v).ok()
+    }
+}
+
+impl Drop for GraphDropouts {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The one number to show, from two counters that are each blind somewhere.
+///
+/// **Neither layer sees the whole fault, and this was measured twice with the
+/// answers reversed.** With a Scarlett at a 64-frame buffer, the graph's ERR
+/// climbed 48 while the client saw zero EPIPEs — pipewire-alsa absorbed them
+/// below cpal. With the built-in card at the same buffer, the CLIENT counted
+/// 246 EPIPEs while the graph's ERR for the same node sat at zero — the
+/// plugin ate the underruns without the node ever missing a cycle. Same
+/// machine, same week, opposite blindnesses.
+///
+/// So preferring either source lets a confident zero from the wrong layer
+/// mask the other's count, which is the exact lie a dropout display exists to
+/// end. Both are lower bounds on "gaps in what was heard"; the max is the
+/// best lower bound available; and only when NEITHER could count is the
+/// answer unknown.
+pub fn merge_dropouts(graph: Option<u64>, client: u64) -> Option<u64> {
+    match graph {
+        Some(g) => Some(g.max(client)),
+        None if client > 0 => Some(client),
+        // A client zero with no graph reading is "nobody could see", not a
+        // clean bill: the client's counter has already been proven blind on
+        // one of the two paths this ships on.
+        None => None,
+    }
+}
+
+/// One poll: this process's nodes by pid, then their ERR total.
+#[cfg(target_os = "linux")]
+fn read_graph_dropouts(pid: u32) -> Option<u64> {
+    let dump = crate::proc::command("pw-dump")
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !dump.status.success() {
+        return None;
+    }
+    let ids = our_audio_nodes(&String::from_utf8_lossy(&dump.stdout), pid);
+    if ids.is_empty() {
+        // No nodes is a real answer while no stream is open, but it is not a
+        // COUNT: reporting 0 here would claim the take was clean when nothing
+        // was measured at all.
+        return None;
+    }
+    let top = crate::proc::command("pw-top")
+        .args(["-b", "-n", "2"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !top.status.success() {
+        return None;
+    }
+    sum_errs(&String::from_utf8_lossy(&top.stdout), &ids)
+}
+
+/// The audio node ids belonging to `pid`, from `pw-dump` JSON.
+///
+/// Matched through the CLIENT rather than trusting the node to carry the pid:
+/// PipeWire puts `application.process.id` on the client object, and the node
+/// points at its client with `client.id`. Nodes that carry the pid directly
+/// are taken too, because pipewire-alsa has done both across versions.
+#[cfg(target_os = "linux")]
+fn our_audio_nodes(dump_json: &str, pid: u32) -> Vec<u64> {
+    let Ok(objects) = serde_json::from_str::<Vec<serde_json::Value>>(dump_json) else {
+        return Vec::new();
+    };
+    let pid_matches = |v: Option<&serde_json::Value>| -> bool {
+        match v {
+            Some(serde_json::Value::Number(n)) => n.as_u64() == Some(u64::from(pid)),
+            Some(serde_json::Value::String(s)) => s.parse::<u32>().ok() == Some(pid),
+            _ => false,
+        }
+    };
+    let mut our_clients = Vec::new();
+    for o in &objects {
+        if o.get("type").and_then(|t| t.as_str()) == Some("PipeWire:Interface:Client")
+            && pid_matches(o.pointer("/info/props/application.process.id"))
+        {
+            if let Some(id) = o.get("id").and_then(serde_json::Value::as_u64) {
+                our_clients.push(id);
+            }
+        }
+    }
+    let mut ids = Vec::new();
+    for o in &objects {
+        if o.get("type").and_then(|t| t.as_str()) != Some("PipeWire:Interface:Node") {
+            continue;
+        }
+        let props = o.pointer("/info/props");
+        let is_audio = props
+            .and_then(|p| p.get("media.class"))
+            .and_then(|c| c.as_str())
+            .is_some_and(|c| c.contains("Audio"));
+        if !is_audio {
+            continue;
+        }
+        let owned = pid_matches(props.and_then(|p| p.get("application.process.id")))
+            || props
+                .and_then(|p| p.get("client.id"))
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|c| our_clients.contains(&c));
+        if owned {
+            if let Some(id) = o.get("id").and_then(serde_json::Value::as_u64) {
+                ids.push(id);
+            }
+        }
+    }
+    ids
+}
+
+/// Total ERR over `ids`, from `pw-top -b` output. `None` when none of the ids
+/// appear — a snapshot that missed every node measured nothing.
+///
+/// The batch format is column-stable enough to split on whitespace: every data
+/// row is `S ID QUANT RATE WAIT BUSY W/Q B/Q ERR ...`, so ERR is the ninth
+/// token wherever the row's id parses. The LAST occurrence of an id wins,
+/// because `-n 2` prints two snapshots and the first is often idle.
+fn sum_errs(top_output: &str, ids: &[u64]) -> Option<u64> {
+    let mut latest: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    for line in top_output.lines() {
+        let mut t = line.split_whitespace();
+        let _state = t.next();
+        let Some(id) = t.next().and_then(|v| v.parse::<u64>().ok()) else {
+            continue;
+        };
+        if !ids.contains(&id) {
+            continue;
+        }
+        // QUANT RATE WAIT BUSY W/Q B/Q and THEN err — six to skip, and the
+        // first version skipped five and read B/Q, whose "0.00" never parses
+        // and quietly turned every row into "unknown". The test below carries
+        // the captured rows precisely so this cannot regress by inspection.
+        if let Some(err) = t.nth(6).and_then(|v| v.parse::<u64>().ok()) {
+            latest.insert(id, err);
+        }
+    }
+    if latest.is_empty() {
+        None
+    } else {
+        Some(latest.values().sum())
+    }
+}
+
 /// Whether the host in use reaches interfaces through the `pipewire` PCM.
 ///
 /// **The PipeWire node list is a fix for cpal's ALSA host, and applying it to
@@ -2849,6 +3093,87 @@ mod tests {
         // Put the process-global choice back for whoever runs next.
         set_system(baseline_system.as_deref());
         with_host(|_| ());
+    }
+
+    /// The merge keeps whichever layer could see, and stays silent only when
+    /// neither could.
+    ///
+    /// The pairs below are the two MEASURED cases with the sources reversed —
+    /// Scarlett (graph 48, client 0) and built-in (graph 0, client 246) — and
+    /// the merge must report the seeing layer in both, because each zero here
+    /// was, on the day it was measured, a lie from a blind counter.
+    #[test]
+    fn a_blind_counters_zero_never_masks_the_seeing_ones_count() {
+        assert_eq!(merge_dropouts(Some(48), 0), Some(48), "scarlett path");
+        assert_eq!(merge_dropouts(Some(0), 246), Some(246), "built-in path");
+        assert_eq!(merge_dropouts(Some(3), 5), Some(5), "both saw: best lower bound");
+        assert_eq!(merge_dropouts(None, 7), Some(7), "client alone still counts");
+        // No graph AND a client zero is "nobody could see" — the client has
+        // been proven blind on one shipping path, so its zero alone clears
+        // nothing.
+        assert_eq!(merge_dropouts(None, 0), None);
+    }
+
+    /// The ERR column survives every row shape `pw-top -b` actually prints.
+    ///
+    /// The rows below are captured from the machine this was built for, not
+    /// composed: a driver row with a format, a follower row whose name is
+    /// pushed right by a `+`, an idle row that prints only dashes, and a JACK
+    /// client row with no format at all. The parser reads the ninth token
+    /// wherever the second parses as an id, and the test exists because the
+    /// first version of the take-audit's WAV reader ALSO "obviously" worked
+    /// on the format it assumed and read the middle of a timestamp.
+    #[test]
+    fn the_err_column_is_found_in_every_row_shape_pw_top_prints() {
+        let captured = "\
+S   ID  QUANT   RATE    WAIT    BUSY   W/Q   B/Q  ERR FORMAT           NAME \n\
+I   31      0      0   0.0us   0.0us  ???   ???     0                  Dummy-Driver\n\
+R   59    128  44100  92.3us   1.2us  0.03  0.00  14646    S32LE 2 44100 alsa_input.usb-Focusrite\n\
+R   58      0      0  12.2us  15.2us  0.00  0.01   13    S32LE 2 44100  + alsa_output.usb-Focusrite\n\
+R  101      0      0  16.9us 470.6us  0.00  0.08    7                   + Tangent_out\n\
+C   77      0      0    ---     ---   ---   ---     0                  alsa_playback.tangent\n";
+        // Ids present sum their LAST value; absent ids measure nothing.
+        assert_eq!(sum_errs(captured, &[58, 101]), Some(20));
+        assert_eq!(sum_errs(captured, &[59]), Some(14646));
+        // An idle row prints dashes for its timings but ERR still prints, and
+        // a real 0 from an idle node is a genuine count — cumulative, per
+        // node, zero because nothing has gone wrong yet. Only absence is
+        // unknown.
+        assert_eq!(sum_errs(captured, &[77]), Some(0));
+        // A snapshot that misses every asked-for node is UNKNOWN, not zero —
+        // the whole module exists because a confident zero was believed once.
+        assert_eq!(sum_errs(captured, &[9999]), None);
+        // Two snapshots in one batch: the later reading wins.
+        let two = format!("{captured}R   58      0      0  12.2us  15.2us  0.00  0.01   21    S32LE 2 44100  + alsa_output.usb-Focusrite\n");
+        assert_eq!(sum_errs(&two, &[58]), Some(21));
+    }
+
+    /// Node ownership is resolved through the client, and directly, and only
+    /// for audio.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn our_nodes_are_found_by_pid_through_either_route() {
+        let dump = r#"[
+          { "id": 40, "type": "PipeWire:Interface:Client",
+            "info": { "props": { "application.process.id": 4242 } } },
+          { "id": 58, "type": "PipeWire:Interface:Node",
+            "info": { "props": { "media.class": "Stream/Output/Audio", "client.id": 40 } } },
+          { "id": 59, "type": "PipeWire:Interface:Node",
+            "info": { "props": { "media.class": "Stream/Input/Audio", "application.process.id": "4242" } } },
+          { "id": 64, "type": "PipeWire:Interface:Node",
+            "info": { "props": { "media.class": "Video/Source", "client.id": 40 } } },
+          { "id": 75, "type": "PipeWire:Interface:Node",
+            "info": { "props": { "media.class": "Audio/Sink", "client.id": 99 } } }
+        ]"#;
+        let ids = our_audio_nodes(dump, 4242);
+        // 58 via its client, 59 via its own pid (as a STRING, which pipewire
+        // has emitted across versions), 64 refused for being video, 75 refused
+        // for belonging to somebody else.
+        assert_eq!(ids, vec![58, 59]);
+        // A pid that owns nothing measures nothing.
+        assert!(our_audio_nodes(dump, 1).is_empty());
+        // Garbage in, empty out — the caller turns empty into None.
+        assert!(our_audio_nodes("not json", 4242).is_empty());
     }
 
     /// **The feature flag, asserted rather than assumed.**

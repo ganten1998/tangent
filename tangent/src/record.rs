@@ -2270,7 +2270,20 @@ impl Session {
             // as 23 s short of a take that lasted a tenth of a second. A
             // problem raised on that basis would be worse than the silence it
             // replaced, because it would be believed.
-            if manifest.clock == tangent_record::take::ClockKind::Fitted
+            // **And only for a take a DEVICE fed.** "The audio stopped
+            // arriving" is a claim about a capture stream. A desk-only take's
+            // audio is rendered by the engine, and the one context where its
+            // frames legitimately diverge from the take's span is a test
+            // driving the tap by hand — which also sometimes fits a clock
+            // from those hand stamps, which is why gating on `Fitted` alone
+            // FLAKED: same test, green one run, red the next, on timing.
+            // The incident this check exists for (19 s of audio in a 30 s
+            // take, `complete: true`) was device-backed, and stays caught.
+            // A desk-side stall still lands in the manifest as data —
+            // `frames_expected` against `frames` — where the audit reads it;
+            // it just does not raise this particular alarm.
+            if self.audio.is_some()
+                && manifest.clock == tangent_record::take::ClockKind::Fitted
                 && short as f64 > SHORT_TOLERANCE_FRAMES * nominal
             {
                 problem.get_or_insert_with(|| {

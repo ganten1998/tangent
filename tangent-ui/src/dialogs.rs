@@ -4455,6 +4455,35 @@ pub fn show(
                                 .color(dim),
                             );
 
+                            // ── dropouts ─────────────────────────────────────
+                            //
+                            // **Drawn only when somebody could actually count.**
+                            // `None` is not zero: on a PipeWire desktop the
+                            // client-side counter is structurally blind
+                            // (pipewire-alsa absorbs the underrun before cpal
+                            // hears it), so this number comes from the graph's
+                            // own tally where there is one. A session that was
+                            // audibly "total noise" once showed a clean panel
+                            // because the only counter anybody read could not
+                            // fire — rendering silence for "unknown" is how
+                            // that stays fixed, and rendering 0 for it is how
+                            // it happened.
+                            if let Some(n) = status.dropouts {
+                                let (text, color) = if n == 0 {
+                                    ("no dropouts since this stream opened".to_owned(), dim)
+                                } else {
+                                    (
+                                        format!(
+                                            "{n} dropout{} since this stream opened - each \
+                                             one is a gap in what was heard and recorded",
+                                            if n == 1 { "" } else { "s" }
+                                        ),
+                                        warn,
+                                    )
+                                };
+                                ui.label(RichText::new(text).font(plain(10.0)).color(color));
+                            }
+
                             // ── who else is in the path ──────────────────────
                             //
                             // **Directly under the round trip, because it is

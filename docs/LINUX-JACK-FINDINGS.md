@@ -67,11 +67,20 @@ an unmeasured output stage. This is the same family of fault `rtclick`'s module
 doc already records for FreeBSD's alsa-lib-over-OSS shim ("the driver reports a
 capture buffer `0.00 ms` behind the callback, which cannot be true").
 
-**This has a consequence beyond the comparison.** Anything in Tangent that
-reads the output delay — `Engine::output_delay_ns`, the take manifest's latency
-fields, delay compensation — is being told zero on every PipeWire desktop,
-which is every desktop. That is a bug of its own and is not caused by, or fixed
-by, this work. It is called out here because this is where it was found.
+**This has a consequence beyond the comparison.** `Engine::output_delay_ns` —
+the only measured latency in the product — is being told zero on every PipeWire
+desktop, which is every desktop. That is a bug of its own and is not caused by,
+or fixed by, this work. It is called out here because this is where it was
+found.
+
+(An earlier revision of this paragraph also indicted "the take manifest's
+latency fields". Half-wrong, and corrected from RECORDER-PLAN §3a: the
+manifest's `latency_source: "assumed_zero"` is the REQUIRED answer under cpal
+0.16, which reads no device-latency property on any platform — a claimed
+latency is worse than an absent one. What the manifest was genuinely missing
+was the measured OUTPUT delay, `audio.output_delay_ns`, added separately. Under
+JACK that field carries a real figure, which is the one place this section's
+finding becomes visible in an artifact a user actually sends.)
 
 ### 3b. cpal opens TWO JACK clients, and nothing orders them
 
