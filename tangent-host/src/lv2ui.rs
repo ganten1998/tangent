@@ -91,6 +91,46 @@ fn edits() -> &'static std::sync::Mutex<Vec<(usize, UiEdit)>> {
     EDITS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
+/// Each UI's controller token, minted before `instantiate` so that edits a
+/// UI emits DURING instantiation are already correctly keyed. An integer
+/// masquerading as a pointer, deliberately, rather than a `Box::into_raw`
+/// of anything real: `write_fn` never dereferences it, so a misbehaving
+/// plugin that mangles its controller mis-keys an edit instead of causing
+/// UB — and the token survives the `Ui` being moved, where a pointer into
+/// `self` would dangle the moment `open` returned.
+///
+/// Starts at 1: zero was every UI's key for as long as the controller was
+/// passed as null, and the whole cross-talk bug lived in that collision.
+static NEXT_CONTROLLER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+/// The edits queued for one controller, removed from the queue; everyone
+/// else's stay put for their own drain. The filter `drain_edits` and the
+/// tests share.
+fn drain_for(controller: usize) -> Vec<UiEdit> {
+    let Ok(mut q) = edits().lock() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    q.retain(|(who, e)| {
+        if *who == controller {
+            out.push(*e);
+            false
+        } else {
+            true
+        }
+    });
+    out
+}
+
+/// Drop every queued edit belonging to `controller` — a closed editor's
+/// undrained entries must not sit in the 4096-entry bound for the rest of
+/// the process.
+fn purge_edits(controller: usize) {
+    if let Ok(mut q) = edits().lock() {
+        q.retain(|(who, _)| *who != controller);
+    }
+}
+
 /// # Safety
 /// Called by plugin UIs. Matches `LV2UI_Write_Function`.
 unsafe extern "C" fn write_fn(
@@ -129,6 +169,10 @@ pub struct Ui {
     idle: Option<unsafe extern "C" fn(lv2_sys::LV2UI_Handle) -> i32>,
     /// The X11 window the UI created. A child of the parent it was given.
     window: u32,
+    /// This UI's identity in the edit queue — the value passed as the
+    /// LV2UI_Controller at instantiate, which the spec obliges the UI to
+    /// hand back verbatim on every write.
+    controller: usize,
     /// Kept alive: the UI holds these pointers for its whole life.
     _features: Box<FeatureStore>,
 }
@@ -345,8 +389,18 @@ impl Ui {
         let cplugin = CString::new(plugin_uri).map_err(|_| "plugin URI contains a NUL")?;
         let cbundle = CString::new(bundle).map_err(|_| "bundle path contains a NUL")?;
         let mut widget: lv2_sys::LV2UI_Widget = std::ptr::null_mut();
+        // The controller was passed as NULL here for as long as one editor
+        // was ever open at a time — which keyed every editor's edits to 0,
+        // so two open editors of the same plugin drained each other: the
+        // same EQ on channels 1 and 3, and a knob turned in the second
+        // edited the first. Minted BEFORE instantiate, because some UIs
+        // write their initial control values during it.
+        let controller =
+            NEXT_CONTROLLER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // SAFETY: every argument matches the ABI; the feature array is
-        // null-terminated and outlives the call inside `store`.
+        // null-terminated and outlives the call inside `store`. The
+        // controller is an opaque token the UI must return verbatim, never
+        // dereference — see NEXT_CONTROLLER.
         let handle = unsafe {
             let inst = (*desc).instantiate.ok_or("the UI has no instantiate")?;
             inst(
@@ -354,7 +408,7 @@ impl Ui {
                 cplugin.as_ptr(),
                 cbundle.as_ptr(),
                 Some(write_fn),
-                std::ptr::null_mut(),
+                controller as *mut c_void,
                 &mut widget,
                 store._ptrs.as_ptr(),
             )
@@ -386,6 +440,7 @@ impl Ui {
             handle,
             idle,
             window: widget as usize as u32,
+            controller,
             _features: store,
         }))
     }
@@ -428,26 +483,14 @@ impl Ui {
         }
     }
 
-    /// Everything the UI has asked to change since the last call.
+    /// Everything THIS UI has asked to change since the last call — and only
+    /// this one. Other editors' entries stay queued for their own drains:
+    /// `poll_editor` attributes whatever a drain returns to the bay of the
+    /// editor that returned it, so handing back somebody else's knob turn
+    /// applied it to the wrong instance AND wrote it into the wrong bay's
+    /// saved state.
     pub fn drain_edits(&mut self) -> Vec<UiEdit> {
-        let Ok(mut q) = edits().lock() else {
-            return Vec::new();
-        };
-        let mine = self.handle as usize;
-        let mut out = Vec::new();
-        q.retain(|(who, e)| {
-            // The controller passed at instantiate was null, so every edit is
-            // attributed to the same key; with one editor open that is exact,
-            // and with several the UI that did not move is sent a value it
-            // already has, which is harmless. Threading a real controller
-            // through is the fix and is worth doing when a second editor can
-            // actually be open at once.
-            let _ = who;
-            out.push(*e);
-            false
-        });
-        let _ = mine;
-        out
+        drain_for(self.controller)
     }
 }
 
@@ -480,6 +523,11 @@ impl Drop for LibGuard {
 
 impl Drop for Ui {
     fn drop(&mut self) {
+        // A closed editor's undrained edits go with it — nobody will ever
+        // drain that token again, and the queue's 4096-entry bound must not
+        // silt up with orphans. Same mutex `write_fn` takes, never held
+        // across a foreign call, so no new lock ordering.
+        purge_edits(self.controller);
         // **Cleanup before the library, and before the parent window goes.**
         // The UI's window is a child of the host's; tearing the parent down
         // while the UI's toolkit still believes its window exists is a
@@ -501,6 +549,60 @@ mod tests {
     #[test]
     fn a_missing_plugin_is_an_error_not_a_panic() {
         assert!(Ui::open("urn:definitely:not:a:plugin", 0, 48_000.0).is_err());
+    }
+
+    /// **Two open editors do not cross-talk.** Every UI's controller used
+    /// to be null, so every edit was keyed 0 and any drain took the whole
+    /// queue: the same EQ on channels 1 and 3, and a knob turned in the
+    /// second edited the first — applied to the wrong instance and written
+    /// into the wrong bay's saved state. Each drain now takes exactly its
+    /// own token's entries and leaves the rest queued.
+    ///
+    /// Tokens are minted from the real counter because EDITS is process-
+    /// global and tests run in parallel — fixed literals would collide with
+    /// each other and with any other test touching the queue.
+    #[test]
+    fn each_editor_drains_only_its_own_edits() {
+        use std::sync::atomic::Ordering;
+        let a = NEXT_CONTROLLER.fetch_add(1, Ordering::Relaxed);
+        let b = NEXT_CONTROLLER.fetch_add(1, Ordering::Relaxed);
+        let push = |who: usize, port: u32, value: f32| {
+            let v = value;
+            // SAFETY: write_fn only reads `size` bytes from `buffer`, both
+            // exactly an f32 here; the controller is opaque and never
+            // dereferenced.
+            unsafe {
+                write_fn(
+                    who as *mut c_void,
+                    port,
+                    std::mem::size_of::<f32>() as u32,
+                    0,
+                    (&v as *const f32).cast(),
+                );
+            }
+        };
+        push(a, 1, 0.25);
+        push(b, 7, 0.5);
+        push(a, 2, 0.75);
+
+        let got_a = drain_for(a);
+        assert_eq!(
+            got_a.iter().map(|e| e.port).collect::<Vec<_>>(),
+            vec![1, 2],
+            "a's drain did not return exactly a's edits, in order"
+        );
+        let got_b = drain_for(b);
+        assert_eq!(got_b.len(), 1, "b's edit did not survive a's drain");
+        assert_eq!(got_b[0].port, 7);
+        assert!((got_b[0].value - 0.5).abs() < 1.0e-9);
+        assert!(drain_for(a).is_empty());
+
+        // A closed editor's orphans are purged — only its own.
+        push(a, 3, 0.1);
+        push(b, 9, 0.2);
+        purge_edits(a);
+        assert!(drain_for(a).is_empty(), "the purge missed a's orphan");
+        assert_eq!(drain_for(b).len(), 1, "the purge took b's edit with it");
     }
 
     #[test]
