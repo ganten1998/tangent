@@ -73,6 +73,13 @@ make_icns() {
   #
   # 128 and up are untouched: they have the pixels to show the art as drawn,
   # and thickening them would be a different logo in the Dock.
+  # **Purpose-drawn small frames beat any amount of thickening.** The 2026
+  # mark (the T/A/N lattice) reads down to about 64 px; below that the
+  # committed `assets/icon-small-rounded-{16,32}.png` take over — the same
+  # three circles, drawn as bold dots with the letters and rays dropped,
+  # rendered once from `assets/icon-small-rounded.svg` and checked in so
+  # the build needs no SVG renderer. The dilate fallback below only runs
+  # if those files are ever deleted.
   local small=""
   if command -v magick >/dev/null 2>&1; then
     # A radius proportional to the source, so replacing the artwork with a
@@ -90,6 +97,10 @@ make_icns() {
               512:icon_256x256@2x.png 512:icon_512x512.png \
               1024:icon_512x512@2x.png; do
     px="${spec%%:*}"; name="${spec#*:}"
+    if [ "$px" -le 32 ] && [ -f "assets/icon-small-rounded-$px.png" ]; then
+      cp "assets/icon-small-rounded-$px.png" "$iconset/$name"
+      continue
+    fi
     # No ImageMagick, no thickening — the icon is then what it was before
     # rather than a build that fails over an icon.
     local src="$ICON_SRC"
