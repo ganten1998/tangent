@@ -53,6 +53,11 @@ pub enum KeyAction {
     /// §5: STOP a take. Space, because that is what every transport in every
     /// DAW the user already owns is bound to.
     StopRecording,
+    /// Raise the recorder band, or put it away.
+    ///
+    /// **Menu-only: no key.** `V` was it and retired as unused clutter — see
+    /// the note beside `W` in `BINDINGS`, which the two letters share.
+    /// `the_menu_only_actions_are_in_no_row_of_the_table` holds this true.
     ToggleRecorder,
     /// Swap the piano and the bands under it for the mixer, and back.
     ToggleMixer,
@@ -63,6 +68,8 @@ pub enum KeyAction {
     /// over the arrangement. Gated on the band being open, because the
     /// engine lives and dies with the band and a drumpad with no engine is
     /// sixteen buttons that do nothing.
+    ///
+    /// **Menu-only: no key**, on the same grounds as [`KeyAction::ToggleRecorder`].
     ToggleDrumpad,
     /// Fill the screen, and come back.
     ///
@@ -144,11 +151,24 @@ const BINDINGS: &[(Key, &str, KeyAction, bool)] = &[
     (Key::K, "K", KeyAction::ToggleKeytoggle, true),
     (Key::R, "R", KeyAction::ClearNotes, true),
     (Key::G, "G", KeyAction::ToggleFretboard, true),
-    // **No `W`.** It toggled a second camera pane beside the theory diagrams;
-    // the camera has one home now, the full-height preview at the recorder
-    // band's top-left, which is the inset a recording carries. The pane's code
-    // is still here and switched off — it comes out after the beta — but
-    // nothing reaches it, so the letter is free again.
+    // **No `W` here, and no `V` anywhere.**
+    //
+    // `W` toggled a second camera pane beside the theory diagrams; the camera
+    // has one home now, the full-height preview at the recorder band's
+    // top-left, which is the inset a recording carries. That pane's code is
+    // still here and switched off — it comes out after the beta — but nothing
+    // reaches it. The letter did NOT stay free, though, and the note that said
+    // it did outlived the truth: `arrangement_input` and `midi_editor_input`
+    // both read a bare `W` as "fit", and both cards list it. It is a per-view
+    // key, which is why it is not in this global table — and why binding it
+    // here would quietly take "fit" away from two views.
+    //
+    // `V` was to be the recorder VIEW and never shipped, retired with the
+    // drumpad's key as unused clutter: both bands are opened from the menu,
+    // and a letter that duplicates a menu item nobody presses is a row on the
+    // help card that teaches nothing. `KeyAction::ToggleRecorder` and
+    // `KeyAction::ToggleDrumpad` therefore appear in no row of this table and
+    // are reached only through `menu.rs`. `V` is genuinely free; `W` is not.
     // **U I O, in that order, are the sheet music.** Not one of them is the
     // first letter of what it does, and there was no letter left that was:
     // `S` is the supporter key, `C` the chord detector, `N` the chord namer.
@@ -190,23 +210,6 @@ const BINDINGS: &[(Key, &str, KeyAction, bool)] = &[
     (Key::M, "M", KeyAction::ManageTaughtChords, true),
     (Key::L, "L", KeyAction::ToggleChordLearning, true),
     (Key::P, "P", KeyAction::ToggleNotePreference, true),
-    // §5: one button, not arm-then-record, and Space because that is what every
-    // transport in every DAW the user already owns is bound to.
-    //
-    // LAST of the listed rows on purpose. It is the only gated one, so it is
-    // the only one that can appear and disappear; at the end of the table it
-    // takes the end of the card with it, instead of reflowing every row below
-    // it each time the band opens. It is also the first listed key that is not
-    // a single letter, which is why the key column is measured now rather than
-    // assumed — see `key_col_w`.
-    // `V` for the Recorder VIEW — the owner's own name for the feature. `R` is
-    // the obvious mnemonic and is long since taken by "clear the notes you
-    // placed", which is a thing people press by reflex mid-practice; rebinding
-    // it to something that opens a 200-point band would be a nasty surprise.
-    // The arrows, and the first bindings in this table that are not a letter
-    // or Space. They move the notes you are holding, which is a thing you do
-    // WHILE holding them — so they had to be keys you can reach without
-    // letting go, and the arrow keys are the only ones that are.
     // Fullscreen. `Z` for zoom, which is what the green button does and what
     // macOS calls it; `F` is long since taken by the font cycle, and rebinding
     // that to fill the screen would be a nasty surprise mid-practice.
@@ -217,6 +220,9 @@ const BINDINGS: &[(Key, &str, KeyAction, bool)] = &[
     // fullscreen bound only to it would be one most Mac users cannot press.
     (Key::Z, "Z", KeyAction::ToggleFullscreen, true),
     (Key::F11, "F11", KeyAction::ToggleFullscreen, false),
+    // The arrows move the notes you are HOLDING, which is a thing you do while
+    // still holding them — so they had to be keys reachable without letting
+    // go, and the arrow keys are the only ones that are.
     (Key::ArrowUp, "Up", KeyAction::TransposeUp, true),
     (Key::ArrowDown, "Down", KeyAction::TransposeDown, true),
     // **Tab, and it was free.** Nothing in this app cycled a view before the
@@ -232,6 +238,15 @@ const BINDINGS: &[(Key, &str, KeyAction, bool)] = &[
     // the one alias somebody might already know. Unlisted, like F11: the
     // help card names Tab, which is the key almost everybody presses.
     (Key::F6, "F6", KeyAction::ToggleMixer, false),
+    // §5: one button, not arm-then-record, and Space because that is what every
+    // transport in every DAW the user already owns is bound to.
+    //
+    // LAST of the listed rows on purpose. These are the only GATED ones, so
+    // they are the only ones that can appear and disappear; at the end of the
+    // table they take the end of the card with them, instead of reflowing
+    // every row below them each time the band opens. "Space" is also not a
+    // single letter, which is why the key column is measured rather than
+    // assumed — see `key_col_w`.
     (Key::Enter, "Enter", KeyAction::StartRecording, true),
     (Key::Space, "Space", KeyAction::StopRecording, true),
     // Escape only closes the card; it is not worth a row of its own.
@@ -325,9 +340,7 @@ fn on_card(view: HelpView, a: KeyAction) -> bool {
             | K::CycleFont
             | K::ShowAbout
             | K::ToggleFullscreen
-            | K::ToggleRecorder
             | K::ToggleMixer
-            | K::ToggleDrumpad
             | K::StartRecording
             | K::StopRecording
     );
@@ -767,6 +780,40 @@ pub fn draw_help(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The two menu-only actions are in no row of `BINDINGS`, and the
+    /// comments that say so stay true.**
+    ///
+    /// `V` and `W` were retired as unused clutter and the table's prose says
+    /// so in three places. Prose drifts — the `V` paragraph outlived its row
+    /// and sat there explaining a binding that no longer existed, above rows
+    /// it had nothing to do with. This is the cheap assertion that stops the
+    /// claim from going stale again, and it fails loudly in the one case that
+    /// matters: somebody binds a key and forgets the comments.
+    #[test]
+    fn the_menu_only_actions_are_in_no_row_of_the_table() {
+        for action in [KeyAction::ToggleRecorder, KeyAction::ToggleDrumpad] {
+            assert!(
+                !binding_for_test(action),
+                "{action:?} has a key now — update the note beside `W` in \
+                 BINDINGS, both variants' docs, and `on_card`, which \
+                 deliberately does not list either"
+            );
+        }
+        // And the two letters the note speaks for. `W` is not free: the
+        // arrangement and the MIDI editor both read a bare `W` as "fit" and
+        // both cards say so, so a global row claiming it would take the
+        // gesture away from two views without anything failing.
+        for (key, why) in [
+            (Key::W, "the arrangement and the MIDI editor read bare `W` as fit"),
+            (Key::V, "`V` was retired from this table on purpose"),
+        ] {
+            assert!(
+                !BINDINGS.iter().any(|&(k, ..)| k == key),
+                "{key:?} is bound globally now — {why}"
+            );
+        }
+    }
 
     /// **Every KEY row on a view's card names a key that view actually
     /// handles.**

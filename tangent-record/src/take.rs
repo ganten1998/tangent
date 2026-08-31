@@ -1031,6 +1031,27 @@ pub struct AudioReport {
     /// A latch, not a level: it survives the take and is reported after Stop,
     /// because a clip six seconds in is invisible by the time the meter is read.
     pub clipped: bool,
+    /// How far ahead of its callback the backend said the desk's audio would
+    /// be **heard**, at the end of the take.
+    ///
+    /// **Not a capture latency, and deliberately not in `SourceReport`.** §3a's
+    /// `latency_ns` is the term subtracted from a device stamp to find when an
+    /// event really happened, and it runs the other way: a captured frame is
+    /// older than its stamp. The desk's audio is *rendered*, carries no device
+    /// stamp at all, and is heard one buffer **after** the instant it was
+    /// written. Putting this figure in that field with a flipped sign would
+    /// have been the exact error §3a exists to prevent.
+    ///
+    /// It belongs in the manifest anyway, because it is the only latency in
+    /// the product that is **measured**: everything else here is an assumption
+    /// the plan is honest about. It is also the term that explains a take where
+    /// the player is filmed reacting a few milliseconds late — they were
+    /// playing to what they heard, and this is how much later that was.
+    ///
+    /// `None` means the backend declined to say, which is not the same claim as
+    /// zero and is why this is an `Option` rather than a number with a sentinel.
+    /// ALSA declines; CoreAudio and JACK do not.
+    pub output_delay_ns: Option<Nanos>,
 }
 
 impl Default for AudioReport {
@@ -1046,6 +1067,7 @@ impl Default for AudioReport {
             frames_dropped: 0,
             peak_dbfs: f64::NEG_INFINITY,
             clipped: false,
+            output_delay_ns: None,
         }
     }
 }
@@ -1315,6 +1337,10 @@ impl Manifest {
                     ("frames_dropped", Json::Int(self.audio.frames_dropped as i64)),
                     ("peak_dbfs", Json::Num(self.audio.peak_dbfs)),
                     ("clipped", Json::Bool(self.audio.clipped)),
+                    (
+                        "output_delay_ns",
+                        Json::opt_int(self.audio.output_delay_ns),
+                    ),
                 ]),
             ),
             (
@@ -1979,6 +2005,34 @@ mod tests {
         // The shortfall has to be a SUBTRACTION a reader can do, which is the
         // whole point of carrying both numbers rather than a verdict.
         assert_eq!(m.audio.frames_expected - m.audio.frames, 477_432);
+    }
+
+    /// **A backend that declined to report its output delay writes `null`,
+    /// never `0`.**
+    ///
+    /// The two claims are not the same and the manifest exists to tell them
+    /// apart: zero would say the desk's audio was heard the instant it was
+    /// rendered, which is not physical, while `null` says nobody knew. Every
+    /// other latency in `take.json` is an assumption §3a is honest about;
+    /// this is the one that is measured, and it is worth nothing if a
+    /// declining backend can pass itself off as a measurement.
+    #[test]
+    fn an_unreported_output_delay_is_null_and_not_a_zero_pretending_to_be_measured() {
+        let mut m = manifest();
+        assert_eq!(m.audio.output_delay_ns, None, "nobody has measured yet");
+        assert!(
+            m.render().contains("\"output_delay_ns\": null"),
+            "a backend that said nothing must say nothing here:\n{}",
+            m.render()
+        );
+
+        // What CoreAudio and JACK report: one buffer, ahead of the callback.
+        m.audio.output_delay_ns = Some(5_333_333);
+        assert!(
+            m.render().contains("\"output_delay_ns\": 5333333"),
+            "the one measured latency in the product has to reach the file:\n{}",
+            m.render()
+        );
     }
 
     #[test]
