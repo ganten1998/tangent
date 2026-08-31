@@ -871,8 +871,42 @@ fn process_output(
         match stream.channel.io_bytes().writei(buffer) {
             Err(err) if err.errno() == libc::EPIPE => {
                 // buffer underrun
-                // TODO: Notify the user of this.
-                let _ = stream.channel.try_recover(err, false);
+                //
+                // **PATCH: it is now notified. See
+                // `tangent-record/vendor/README.md`.**
+                //
+                // Upstream's `// TODO: Notify the user of this.` stood here,
+                // and the honesty of it is the problem: somebody knew, and
+                // until it was done an underrun on the ALSA path was audible
+                // at the speakers and INVISIBLE to the application. No error
+                // callback, no counter, nothing to log and nothing to report —
+                // so a host cannot show a glitch it never hears about, and a
+                // session somebody is describing as crackling looks perfectly
+                // healthy from inside the program.
+                //
+                // Note what upstream does two arms down: any OTHER write error
+                // reaches `error_callback`. Only the one that actually happens
+                // in normal use was dropped.
+                //
+                // Reported as `BackendSpecific` because that is the only
+                // channel cpal has, and worded so a host can tell a recovered
+                // glitch from a device that has gone: recovery is attempted
+                // FIRST and the stream continues either way, exactly as
+                // before. A host that treats every stream error as a dead
+                // device will now rebuild on a click — which is a real hazard
+                // and the reason the wording says what it says — but a host
+                // that cannot see the click at all has no move available to it
+                // whatsoever.
+                let recovered = stream.channel.try_recover(err, false).is_ok();
+                error_callback(
+                    BackendSpecificError {
+                        description: format!(
+                            "xrun: output buffer underrun, {}",
+                            if recovered { "recovered" } else { "not recovered" }
+                        ),
+                    }
+                    .into(),
+                );
             }
             Err(err) => {
                 error_callback(err.into());
