@@ -4669,6 +4669,10 @@ impl IvoryApp {
             recorder_shown: self.settings.show_recorder,
             recorder_available: self.caps.capture_devices,
             window_sizing: self.caps.window_sizing,
+            // The one method both halves of the fact go through — the saved
+            // setting OR this session's detection — so the card swaps its
+            // Tab row for F6 exactly when egui starts eating Tab.
+            reader_mode: self.reader_mode(),
         }
     }
 
@@ -13734,10 +13738,15 @@ impl IvoryApp {
             .map(|c| c.lane);
         if lane.is_some() && lane == drum_lane {
             for k in notes {
-                let pad = k.wrapping_sub(crate::recorder::DRUM_PAD_BASE);
-                if k >= crate::recorder::DRUM_PAD_BASE
-                    && usize::from(pad) < crate::recorder::DRUM_PADS
-                {
+                // The guard and the subtraction in one: below the base there
+                // is no pad. (A plain `>=` against a base that is currently 0
+                // is the comparison clippy rightly calls absurd, and it was
+                // the one thing stopping `cargo clippy --workspace` from
+                // completing at all.)
+                let Some(pad) = k.checked_sub(crate::recorder::DRUM_PAD_BASE) else {
+                    continue;
+                };
+                if usize::from(pad) < crate::recorder::DRUM_PADS {
                     self.request_recorder(recorder::RecorderRequest::PadHit {
                         pad,
                         on,
@@ -20434,6 +20443,13 @@ impl IvoryApp {
             }
             K::ToggleDetection => self.apply_menu_action(ctx, MenuAction::ToggleChordDetection),
             K::ToggleBorderless => self.apply_menu_action(ctx, MenuAction::ToggleBorderless),
+            // The keyboard door to the accessibility switch — the menu row's
+            // exact semantics, detection-overrule and save included, because
+            // a key and a click that drift apart here strand a reader user
+            // in whichever mode the wrong one left them.
+            K::ToggleReaderMode => {
+                self.apply_menu_action(ctx, MenuAction::ToggleScreenReaderMode)
+            }
             K::CycleFont => self.apply_menu_action(ctx, MenuAction::CycleFont),
             // These open dialogs. The shortcut gate already refuses to fire
             // while one is up, so A cannot stack a second About on the first.
@@ -31894,6 +31910,7 @@ mod tests {
             recorder_shown: true,
             recorder_available: true,
             window_sizing: true,
+            ..crate::keys::Gates::default()
         };
         let with = |key: egui::Key| {
             let _ = ctx.run(
@@ -31977,6 +31994,40 @@ mod tests {
         let ctx = egui::Context::default();
         app.apply_menu_action(&ctx, crate::menu::MenuAction::ToggleScreenReaderMode);
         assert!(!app.reader_mode(), "the row could not turn off a wrong guess");
+        assert!(app.caps.child_windows, "the windows did not come back");
+    }
+
+    /// **The J key IS the menu row.** The row it mirrors opens from a
+    /// right-click — the gesture the person this switch exists for is least
+    /// able to aim — so the key must carry the row's exact semantics:
+    /// remembered in settings, windows handed over and handed back, and the
+    /// card's gates following along so Tab's row comes off while egui is
+    /// eating the key.
+    #[test]
+    fn the_reader_mode_key_flips_the_setting_and_the_windows_follow() {
+        let (_, mut app) = headless_with_fx(Caps::DESKTOP);
+        let ctx = egui::Context::default();
+        assert!(!app.reader_mode());
+        assert!(app.caps.child_windows, "the desktop does not own its windows");
+        assert!(
+            app.key_gates().window_sizing,
+            "the desktop's gate is shut, so the key could never fire"
+        );
+        assert!(!app.key_gates().reader_mode);
+        app.apply_key_action(&ctx, crate::keys::KeyAction::ToggleReaderMode);
+        assert!(app.reader_mode(), "the key did not enter reader mode");
+        assert!(
+            app.settings.screen_reader_mode,
+            "a choice made by key was not written down as the menu row's is"
+        );
+        assert!(!app.caps.child_windows, "the dialogs did not come inline");
+        assert!(
+            app.key_gates().reader_mode,
+            "the card's gates did not follow, so it still advertises Tab"
+        );
+        // The same key backs out, and the windows come home.
+        app.apply_key_action(&ctx, crate::keys::KeyAction::ToggleReaderMode);
+        assert!(!app.reader_mode(), "the key could not leave reader mode");
         assert!(app.caps.child_windows, "the windows did not come back");
     }
 

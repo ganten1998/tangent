@@ -6649,21 +6649,51 @@ fn next_untitled(root: &std::path::Path, taken: &std::path::Path) -> std::path::
 /// person using a screen reader should not have to run the build that can
 /// load arbitrary third-party code in order to be able to read the app.
 fn screen_reader_attached(_ctx: &egui::Context) -> bool {
-    // **macOS: no.** The accesskit probe below is meaningless here — the
-    // adapter builds a tree whenever the feature is compiled in, so it said
-    // "a reader is attached" on every Mac, always. It was believed: this
-    // machine has VoiceOver switched off and had `screen_reader_mode: true`
-    // written into its settings file, which turned every dialog into an
-    // inline layer, disabled the detached windows, and (with the anchors
-    // still computed in screen points) threw every menu into a corner.
-    //
-    // There is no dependency-free way to ask AppKit whether VoiceOver is
-    // running — `NSWorkspace.isVoiceOverEnabled` needs objc2, which this
-    // crate does not take — so macOS does not guess. The menu row is how
-    // somebody says so, and it is a row that was always there.
+    // **macOS and Windows ask the OS**, which has a real answer with no egui
+    // in hand — see `os_reader_attached`, which `Settings::load` also asks
+    // before any context exists.
+    #[cfg(any(target_os = "macos", windows))]
+    {
+        os_reader_attached()
+    }
+    // **Elsewhere the probe means what it says.** On Linux egui's accesskit
+    // tree is built when AT-SPI asks for it, so Orca being up is exactly
+    // what makes this true.
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        _ctx.accesskit_node_builder(egui::Id::new("ivory-a11y-probe"), |_| ())
+            .is_some()
+    }
+}
+
+/// The OS's own answer to "is a screen reader running right now", askable
+/// with no egui context in hand — which is what lets `main` ask it before
+/// eframe exists, where `Settings::load` needs it to tell a poisoned
+/// pre-v20 `screen_reader_mode` apart from a setting a reader user chose.
+///
+/// **macOS asks AppKit, and used to answer `false` unconditionally.** The
+/// old accesskit probe was meaningless here — the adapter builds a tree
+/// whenever the feature is compiled in, so it said "a reader is attached"
+/// on every Mac, always, and it was believed: this machine has VoiceOver
+/// switched off and had `screen_reader_mode: true` written into its
+/// settings file, which turned every dialog into an inline layer, disabled
+/// the detached windows, and (with the anchors still computed in screen
+/// points) threw every menu into a corner. The hardcoded `false` that
+/// replaced it made no VoiceOver user's dialogs come inline unless they
+/// found the mouse-only menu row. `NSWorkspace.isVoiceOverEnabled` is the
+/// honest question — objc2-app-kit is a dependency this crate already
+/// takes for `macwin`, so there is no longer any reason not to ask it.
+/// A property read with no side effect, safe per the bindings, cheap
+/// enough to poll.
+///
+/// Linux is `false` here on purpose, not an oversight: its real answer
+/// needs the egui context (the AT-SPI-driven probe in
+/// `screen_reader_attached`), and the lazy probe there never persisted a
+/// false positive for the settings one-shot to care about.
+pub(crate) fn os_reader_attached() -> bool {
     #[cfg(target_os = "macos")]
     {
-        false
+        objc2_app_kit::NSWorkspace::sharedWorkspace().isVoiceOverEnabled()
     }
     // **Windows asks the system, which has a real answer.**
     #[cfg(windows)]
@@ -6684,13 +6714,9 @@ fn screen_reader_attached(_ctx: &egui::Context) -> bool {
         };
         ok != 0 && on != 0
     }
-    // **Elsewhere the probe means what it says.** On Linux egui's accesskit
-    // tree is built when AT-SPI asks for it, so Orca being up is exactly
-    // what makes this true.
     #[cfg(not(any(target_os = "macos", windows)))]
     {
-        _ctx.accesskit_node_builder(egui::Id::new("ivory-a11y-probe"), |_| ())
-            .is_some()
+        false
     }
 }
 
@@ -7611,12 +7637,16 @@ impl eframe::App for DesktopApp {
         // and the note in `tangent/Cargo.toml`. The answer crosses as a plain
         // bool, like every other fact this crate pushes into the app.
         //
-        // **Asked once and then never again**, because the only way to ask is
-        // to WRITE a node and see whether egui had anywhere to put it — so
-        // every probe while a reader is attached puts an extra, nameless node
-        // in the tree that reader is reading. One is a shrug; sixty a second
-        // is a bug. `set_screen_reader` is sticky in the same direction, so
-        // there is nothing to keep watching for.
+        // **Polled until the first yes, then never again.** On Linux the only
+        // way to ask is to WRITE a node and see whether egui had anywhere to
+        // put it — so every probe while a reader is attached puts an extra,
+        // nameless node in the tree that reader is reading. One is a shrug;
+        // sixty a second is a bug. On macOS and Windows the poll is a
+        // side-effect-free property read, cheap enough to repeat, and
+        // repeating it is what catches VoiceOver being switched on
+        // mid-session. `set_screen_reader` is sticky in the same direction,
+        // so once it has said yes there is nothing to keep watching for —
+        // and going BACK is the menu row's job, on purpose.
         if !self.reader_seen && screen_reader_attached(ctx) {
             self.reader_seen = true;
             self.app.set_screen_reader(true);

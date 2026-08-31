@@ -268,6 +268,14 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSScreen",
     "NSApplication",
     "NSRunningApplication",
+    # `NSWorkspace.isVoiceOverEnabled` — the one honest way to ask macOS
+    # whether a reader is actually running, so the app can bring its dialogs
+    # inline for a VoiceOver user without guessing. The method lives in the
+    # NSAccessibility module's `impl NSWorkspace`, so it takes BOTH features.
+    # See `desktop::os_reader_attached`. Costs compile time only: the two
+    # features pull nothing but objc2-foundation sub-features already here.
+    "NSAccessibility",
+    "NSWorkspace",
 ] }
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",

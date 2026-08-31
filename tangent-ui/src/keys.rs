@@ -77,6 +77,17 @@ pub enum KeyAction {
     /// window action is: a plugin editor lives inside somebody's DAW and has no
     /// business taking their display.
     ToggleFullscreen,
+    /// Menus and dialogs inline, for a screen reader — the same switch as
+    /// the menu row, reachable without a mouse.
+    ///
+    /// The keyboard door matters more here than anywhere else on this card:
+    /// the menu row it mirrors opens from a RIGHT-CLICK, and the person the
+    /// switch exists for is exactly the person least able to aim one.
+    ///
+    /// Gated on [`Gates::window_sizing`] because the handler follows the
+    /// menu row's semantics, and those hand back `child_windows` when the
+    /// mode goes off — a grant a plugin editor must never receive.
+    ToggleReaderMode,
     TransposeUp,
     TransposeDown,
     CloseHelp,
@@ -122,6 +133,16 @@ pub struct Gates {
     /// Gates fullscreen. A plugin editor lives inside somebody's DAW and has
     /// no business taking their display.
     pub window_sizing: bool,
+    /// This session is being read out loud — `IvoryApp::reader_mode()`,
+    /// whoever decided so, the saved setting or this session's detection.
+    ///
+    /// Not a gate on any binding: it changes what the card ADVERTISES. In
+    /// reader mode egui takes Tab to walk the controls before this module's
+    /// table ever sees it, so the Tab row is a lie there and F6 is the view
+    /// cycle's real key. Carried in `Gates` rather than read at the call
+    /// site so the one struct keeps feeding both `pressed` and the card —
+    /// the module's cannot-disagree invariant.
+    pub reader_mode: bool,
 }
 
 /// Whether a binding is live right now.
@@ -135,6 +156,10 @@ fn available(action: KeyAction, gates: Gates) -> bool {
         }
         KeyAction::ToggleRecorder => gates.recorder_available,
         KeyAction::ToggleFullscreen => gates.window_sizing,
+        // The same gate as the menu row it mirrors — critical, because the
+        // handler grants `child_windows` back when the mode turns off, and a
+        // plugin editor must never receive that grant.
+        KeyAction::ToggleReaderMode => gates.window_sizing,
         _ => true,
     }
 }
@@ -220,6 +245,14 @@ const BINDINGS: &[(Key, &str, KeyAction, bool)] = &[
     // fullscreen bound only to it would be one most Mac users cannot press.
     (Key::Z, "Z", KeyAction::ToggleFullscreen, true),
     (Key::F11, "F11", KeyAction::ToggleFullscreen, false),
+    // **J is the reader-mode switch, and it was free.** No global row took
+    // it and neither view handler reads a bare `J` — checked the same way
+    // `W`'s note above demands. It sits beside the other window switches on
+    // the card because that is what it is: where the menus and dialogs
+    // live. The key matters more than most on this card — the menu row it
+    // mirrors opens from a right-click, and the person this switch exists
+    // for is exactly the person least able to aim one.
+    (Key::J, "J", KeyAction::ToggleReaderMode, true),
     // The arrows move the notes you are HOLDING, which is a thing you do while
     // still holding them — so they had to be keys reachable without letting
     // go, and the arrow keys are the only ones that are.
@@ -302,6 +335,7 @@ fn describe(a: KeyAction) -> &'static str {
         KeyAction::StopRecording => "play / stop (to cursor)",
         KeyAction::ToggleRecorder => "the recorder",
         KeyAction::ToggleFullscreen => "fill the screen",
+        KeyAction::ToggleReaderMode => "screen reader mode (menus inline)",
         KeyAction::TransposeUp => "transpose up a semitone",
         KeyAction::TransposeDown => "transpose down a semitone",
         KeyAction::CloseHelp => "close this card",
@@ -344,6 +378,7 @@ fn on_card(view: HelpView, a: KeyAction) -> bool {
             | K::CycleFont
             | K::ShowAbout
             | K::ToggleFullscreen
+            | K::ToggleReaderMode
             | K::ToggleMixer
             | K::StartRecording
             | K::StopRecording
@@ -378,6 +413,9 @@ fn is_general(a: KeyAction) -> bool {
             | K::CycleFont
             | K::ShowAbout
             | K::ToggleFullscreen
+            // Reader mode moves the menus and dialogs of EVERY surface, so
+            // its key belongs in the section that speaks for all of them.
+            | K::ToggleReaderMode
             | K::ToggleMixer
             | K::StartRecording
             | K::StopRecording
@@ -428,7 +466,7 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
     rows.extend(
         BINDINGS
             .iter()
-            .filter(|&&(_, _, a, shown)| {
+            .filter(|&&(key, _, a, shown)| {
                 // **`Z` is not fullscreen inside the MIDI editor.** It is
                 // general, so it was listed on every card as "fullscreen" —
                 // and with the pointer over the editor `midi_editor_input`
@@ -439,6 +477,14 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
                 if matches!(view, HelpView::MidiEdit)
                     && matches!(a, KeyAction::ToggleFullscreen)
                 {
+                    return false;
+                }
+                // **In reader mode the Tab row is a lie**, and this card is
+                // being read to exactly the audience with the least means of
+                // discovering that: egui takes Tab to walk the controls
+                // before the table ever sees it. The row comes off; F6's
+                // row below carries the view cycle, in its own words.
+                if gates.reader_mode && key == Key::Tab {
                     return false;
                 }
                 shown && available(a, gates) && is_general(a)
@@ -460,7 +506,13 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
     rows.extend(
         BINDINGS
             .iter()
-            .filter(|&&(_, _, a, shown)| {
+            .filter(|&&(key, _, a, shown)| {
+                // The same reader-mode drop as the GENERAL section above, so
+                // the rule survives Tab's action ever moving off the general
+                // list: no card advertises Tab while egui is eating it.
+                if gates.reader_mode && key == Key::Tab {
+                    return false;
+                }
                 shown && available(a, gates) && !is_general(a) && on_card(view, a)
             })
             .map(describe_on),
@@ -993,6 +1045,7 @@ mod tests {
             recorder_shown: true,
             recorder_available: true,
             window_sizing: true,
+            ..Gates::default()
         };
         for (view, handler) in [
             // The piano's own section is all `BINDINGS`; only its shared
@@ -1050,6 +1103,7 @@ mod tests {
             recorder_shown: true,
             recorder_available: true,
             window_sizing: true,
+            ..Gates::default()
         };
         // Keys that are deliberately read and deliberately not rows, each
         // with its reason written where the failure will point.
@@ -1104,6 +1158,7 @@ mod tests {
             recorder_shown: true,
             recorder_available: true,
             window_sizing: true,
+            ..Gates::default()
         };
         for view in [
             HelpView::Piano,
@@ -1200,7 +1255,7 @@ mod tests {
         // A gated binding must be a LISTED one, or the gate hides a shortcut
         // the card was never going to mention in the first place.
         for &(_, label, action, _) in BINDINGS {
-            if !available(action, Gates { recorder_shown: true, recorder_available: true, window_sizing: true }) {
+            if !available(action, Gates { recorder_shown: true, recorder_available: true, window_sizing: true, ..Gates::default() }) {
                 panic!("{label} is dead even with every gate open");
             }
             if !available(action, Gates::default()) {
@@ -1238,6 +1293,7 @@ mod tests {
             recorder_shown: true,
             recorder_available: true,
             window_sizing: true,
+            ..Gates::default()
         };
         let card = |view: HelpView| card_rows(gates, view);
         let has = |rows: &[(&str, &str)], key: &str| rows.iter().any(|(k, _)| *k == key);
@@ -1358,6 +1414,7 @@ mod tests {
             recorder_shown: true,
             recorder_available: true,
             window_sizing: true,
+            ..Gates::default()
         };
         for gates in [Gates::default(), full] {
             for view in [
@@ -1388,6 +1445,87 @@ mod tests {
         }
     }
 
+    /// **In reader mode the card stops advertising Tab and keeps F6.** Tab
+    /// is eaten by egui there — it walks the controls, which is what a
+    /// screen-reader user presses it for — so a card listing it is telling
+    /// a lie to exactly the audience with the least means of discovering
+    /// that. F6's row, which wears the reader-mode words, must survive on
+    /// every card; outside reader mode both rows stand as before.
+    #[test]
+    fn reader_mode_swaps_the_tab_row_for_f6_on_every_card() {
+        for view in [
+            HelpView::Piano,
+            HelpView::Mixer,
+            HelpView::Arrange,
+            HelpView::MidiEdit,
+        ] {
+            let reading = card_rows(
+                Gates { reader_mode: true, ..Gates::default() },
+                view,
+            );
+            assert!(
+                !reading.iter().any(|(k, _)| *k == "Tab"),
+                "{view:?}: the card advertises Tab in reader mode, where egui eats it"
+            );
+            let f6 = reading
+                .iter()
+                .find(|(k, _)| *k == "F6")
+                .unwrap_or_else(|| panic!("{view:?}: reader mode lost the F6 row"));
+            assert!(
+                f6.1.contains("reader"),
+                "{view:?}: F6's row stopped naming reader mode: {:?}",
+                f6.1
+            );
+            // And with the mode off, the ordinary card: both keys listed.
+            let plain = card_rows(Gates::default(), view);
+            assert!(
+                plain.iter().any(|(k, _)| *k == "Tab"),
+                "{view:?}: Tab went missing outside reader mode"
+            );
+            assert!(plain.iter().any(|(k, _)| *k == "F6"));
+        }
+    }
+
+    /// **The reader-mode switch has a key, and only where the window is
+    /// ours.** The menu row it mirrors opens from a right-click — the one
+    /// gesture the person this switch exists for is least able to aim — so
+    /// J is the keyboard door. Gated on `window_sizing` because the
+    /// handler hands `child_windows` back when the mode turns off, a grant
+    /// a plugin editor must never receive.
+    #[test]
+    fn j_toggles_reader_mode_only_where_the_window_is_ours() {
+        let ours = Gates { window_sizing: true, ..Gates::default() };
+        assert_eq!(press(Key::J, ours), Some(KeyAction::ToggleReaderMode));
+        assert_eq!(
+            press(Key::J, Gates::default()),
+            None,
+            "J fired inside a host whose windows are not ours to regrant"
+        );
+        // The card follows the same gate, listed under GENERAL: advertised
+        // exactly where it fires, on every view.
+        for view in [
+            HelpView::Piano,
+            HelpView::Mixer,
+            HelpView::Arrange,
+            HelpView::MidiEdit,
+        ] {
+            let rows = card_rows(ours, view);
+            let j = rows
+                .iter()
+                .find(|(k, _)| *k == "J")
+                .unwrap_or_else(|| panic!("{view:?}: no J row"));
+            assert!(
+                j.1.contains("reader"),
+                "{view:?}: J's description lost its meaning: {:?}",
+                j.1
+            );
+            assert!(
+                !card_rows(Gates::default(), view).iter().any(|(k, _)| *k == "J"),
+                "{view:?}: the card advertises J where it cannot fire"
+            );
+        }
+    }
+
     /// Letters that are ordinary shortcuts must not fire with a modifier held.
     /// Cmd-R and Ctrl-R belong to the OS, and swallowing them would be rude.
     #[test]
@@ -1411,7 +1549,7 @@ mod tests {
             let mut got = Some(KeyAction::ClearNotes);
             // Every gate open, so this is testing the modifier and nothing else.
             let _ = ctx.run(input, |ctx| {
-                got = pressed(ctx, Gates { recorder_shown: true, recorder_available: true, window_sizing: true });
+                got = pressed(ctx, Gates { recorder_shown: true, recorder_available: true, window_sizing: true, ..Gates::default() });
             });
             assert_eq!(got, None, "R fired with {mods:?} held");
         }
@@ -1457,7 +1595,7 @@ mod tests {
             "Space started a take on a recorder the user has never opened"
         );
         assert_eq!(
-            press(Key::Space, Gates { recorder_shown: true, recorder_available: true, window_sizing: true }),
+            press(Key::Space, Gates { recorder_shown: true, recorder_available: true, window_sizing: true, ..Gates::default() }),
             Some(KeyAction::StopRecording)
         );
         // And Enter, which is the other half of the same gate. **Two keys, not
@@ -1466,7 +1604,7 @@ mod tests {
         // you cannot read from the bench.
         assert_eq!(press(Key::Enter, Gates::default()), None);
         assert_eq!(
-            press(Key::Enter, Gates { recorder_shown: true, recorder_available: true, window_sizing: true }),
+            press(Key::Enter, Gates { recorder_shown: true, recorder_available: true, window_sizing: true, ..Gates::default() }),
             Some(KeyAction::StartRecording)
         );
         // The gate is Space's alone: nothing else changes with it.
@@ -1476,7 +1614,7 @@ mod tests {
             (Key::U, KeyAction::ToggleNoteNames),
             (Key::I, KeyAction::CycleClef),
         ] {
-            for gates in [Gates::default(), Gates { recorder_shown: true, recorder_available: true, window_sizing: true }] {
+            for gates in [Gates::default(), Gates { recorder_shown: true, recorder_available: true, window_sizing: true, ..Gates::default() }] {
                 assert_eq!(press(key, gates), Some(want), "{key:?} under {gates:?}");
             }
         }
@@ -1493,6 +1631,7 @@ mod tests {
             recorder_shown: false,
             recorder_available: true,
             window_sizing: true,
+            ..Gates::default()
         };
         let hidden = card_rows(can_record, HelpView::Piano);
         for gone in ["Space", "Enter", "W"] {
@@ -1523,7 +1662,7 @@ mod tests {
             "Space did not appear with the band"
         );
         // And every listed row is a live binding, in both states.
-        for gates in [Gates::default(), Gates { recorder_shown: true, recorder_available: true, window_sizing: true }] {
+        for gates in [Gates::default(), Gates { recorder_shown: true, recorder_available: true, window_sizing: true, ..Gates::default() }] {
             for (label, _) in card_rows(gates, HelpView::Piano) {
                 // The view-key gesture rows are card prose, not bindings.
                 if matches!(label, "S-1" | "S-2" | "S-3" | "C-Z" | "C-S-Z") || label.is_empty() {
@@ -1550,7 +1689,7 @@ mod tests {
         // ~0.62 em per glyph is what the card's own column maths assumes.
         let glyph = size * 0.62;
         for label in card_rows(
-            Gates { recorder_shown: true, recorder_available: true, window_sizing: true },
+            Gates { recorder_shown: true, recorder_available: true, window_sizing: true, ..Gates::default() },
             HelpView::Arrange,
         )
             .iter()
@@ -1578,7 +1717,7 @@ mod tests {
         // The real maximum, taken through the gate rather than off the table:
         // the card is longest with every binding live.
         let shown = card_rows(
-            Gates { recorder_shown: true, recorder_available: true, window_sizing: true },
+            Gates { recorder_shown: true, recorder_available: true, window_sizing: true, ..Gates::default() },
             HelpView::Arrange,
         )
         .len();
@@ -1646,7 +1785,7 @@ mod tests {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     // Both gate states: they are two different row counts, and
                     // the shorter one is the card most users will ever see.
-                    for gates in [Gates::default(), Gates { recorder_shown: true, recorder_available: true, window_sizing: true }] {
+                    for gates in [Gates::default(), Gates { recorder_shown: true, recorder_available: true, window_sizing: true, ..Gates::default() }] {
                         for view in [HelpView::Piano, HelpView::Mixer, HelpView::Arrange] {
                             for t in [0.0, 0.01, 0.5, 0.999, 1.0] {
                                 draw_help(ui.painter(), rect, false, Color32::from_rgb(0xE3, 0xD9, 0xBD), t, gates, view);

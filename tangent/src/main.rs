@@ -644,7 +644,13 @@ fn main() {
 
     // Settings are read before building the ViewportBuilder so the very first
     // frame is right-sized (DESIGN: fixed-size via Min+Max+Inner triple).
-    let settings = Settings::load();
+    //
+    // The OS is asked FIRST whether a screen reader is running, because the
+    // load runs a one-shot that throws away a `screen_reader_mode` the old
+    // probe guessed at — and a file saying yes on a machine where VoiceOver
+    // is provably up right now is somebody's setting, not a guess. Main
+    // thread, before eframe: exactly where an AppKit question may be asked.
+    let settings = Settings::load_with_reader(desktop::os_reader_attached());
     // Whatever the window was last dragged to, or the size its bands come to
     // if it never has been. See `Settings::window_size_for_use`, which refuses
     // a remembered size below the floor rather than clamping to it.

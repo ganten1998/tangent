@@ -2434,6 +2434,13 @@ pub fn a11y_nodes(rect: Rect, view: &ArrangeView<'_>) -> Vec<crate::a11y::Node> 
     // yet. Never an empty string — a node labelled "" is a node a reader
     // announces as nothing at all.
     let who = |i: usize| -> String {
+        // The bus first: `MASTER_LANE` is one PAST the lanes array, so the
+        // lookup below finds nothing there and the fallback would name the
+        // master "Track 17" — which is what a reader heard on every master
+        // automation row. The same word the bus row's own labels use.
+        if i == MASTER_LANE {
+            return "Master".to_owned();
+        }
         match view.lanes.get(i) {
             Some(l) if !l.name.is_empty() => l.name.to_owned(),
             _ => format!("Track {}", i + 1),
@@ -2494,8 +2501,10 @@ pub fn a11y_nodes(rect: Rect, view: &ArrangeView<'_>) -> Vec<crate::a11y::Node> 
                 &format!("Track {} polarity invert", i + 1),
                 view.lanes.get(i).is_some_and(|l| l.phase),
             ),
+            // `who(i)`, not "track {i+1}": the hardcoded number called the
+            // master "track 17" and read a renamed track by its seat.
             Hit::AutoClose(i, slot) => {
-                Node::button(id, r, &format!("Hide automation row {} on track {}", slot + 1, i + 1))
+                Node::button(id, r, &format!("Hide automation row {} on {}", slot + 1, who(i)))
             }
             Hit::AutoArm(i, slot) => Node::toggle(
                 id,
@@ -2513,7 +2522,7 @@ pub fn a11y_nodes(rect: Rect, view: &ArrangeView<'_>) -> Vec<crate::a11y::Node> 
             Hit::AutoDial(i, slot) => Node::button(
                 id,
                 r,
-                &format!("Automation lane {} on track {}", slot + 1, i + 1),
+                &format!("Automation lane {} on {}", slot + 1, who(i)),
             ),
             Hit::AutoParamPick(i, slot) => Node::button(
                 id,
@@ -2521,9 +2530,11 @@ pub fn a11y_nodes(rect: Rect, view: &ArrangeView<'_>) -> Vec<crate::a11y::Node> 
                 format!(
                     "{} automation, {}",
                     who(i),
-                    view.lanes
-                        .get(i)
-                        .and_then(|l| l.automation.get(slot))
+                    // Through `auto_view_of`, which knows where the master's
+                    // rows live — the inline `lanes` lookup this replaces
+                    // found nothing there and read a bound parameter as
+                    // "none".
+                    auto_view_of(view, i, slot)
                         .map_or_else(|| "none".to_owned(), |a| a.label.clone())
                 ),
             ),
@@ -6037,6 +6048,52 @@ ArrangeView {
         assert!(
             !nodes.iter().any(|n| n.label == "Track 4 volume"),
             "an empty row offers a dial it does not draw"
+        );
+    }
+
+    /// **The master's automation rows say "Master", not "Track 17".** The
+    /// bus is addressed as lane `MASTER_LANE`, one past the lanes array, so
+    /// every label site that indexed `lanes` or printed `i + 1` directly
+    /// misnamed it to a reader — and the param row went further, reading a
+    /// bound parameter as "none" because the inline lookup found no lane
+    /// there. Sighted users saw a correctly drawn row the whole time; this
+    /// is the label a reader actually hears.
+    #[test]
+    fn the_master_automation_row_reads_as_master_not_as_a_seventeenth_track() {
+        let cs: Vec<ClipView<'_>> = Vec::new();
+        let mut v = a_view(&cs);
+        v.master_automation = vec![AutoView {
+            selected: false,
+            label: "Master gain".to_owned(),
+            resting: 0.5,
+            armed: false,
+            bypassed: false,
+            param: crate::automation::AutoParam::Gain,
+            points: &[],
+            hot: None,
+            chosen: Vec::new(),
+            moving: None,
+        }];
+        let nodes = a11y_nodes(rect(), &v);
+        let has = |s: &str| nodes.iter().any(|n| n.label == s);
+        // The param picker names the bus AND the parameter it really holds.
+        assert!(
+            has("Master automation, Master gain"),
+            "the master's param row is missing or misnamed; automation rows: {:?}",
+            nodes
+                .iter()
+                .filter(|n| n.label.contains("utomation"))
+                .map(|n| n.label.as_str())
+                .collect::<Vec<_>>()
+        );
+        // The close button and the dial follow the same name.
+        assert!(has("Hide automation row 1 on Master"), "the close row misnames the bus");
+        assert!(has("Automation lane 1 on Master"), "the dial row misnames the bus");
+        // And nothing anywhere in the tree calls the bus a track.
+        let ghost = format!("Track {}", MASTER_LANE + 1);
+        assert!(
+            !nodes.iter().any(|n| n.label.contains(&ghost)),
+            "a node still calls the master {ghost}"
         );
     }
 
