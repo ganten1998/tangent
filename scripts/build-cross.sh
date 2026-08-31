@@ -359,6 +359,11 @@ package_linux() { # $1 = rust target, $2 = artifact arch name
   fi
   mkdir -p "$stage/fonts" || return 1
   cp "target/${target}/release/tangent" "$stage/" || { rm -rf "$stage"; return 1; }
+  # **What the loader will demand on the user's machine, checked here.**
+  # The list and the reasoning live in one place, shared with
+  # `build-linux-native.sh`, because two copies of it would disagree the first
+  # time somebody edited one — which is the very failure it guards against.
+  scripts/check-linux-deps.sh "$stage/tangent" || { rm -rf "$stage"; return 1; }
   cp assets/tangent.desktop "$stage/tangent.desktop" || { rm -rf "$stage"; return 1; }
   cp assets/tangent.png "$stage/tangent.png" || { rm -rf "$stage"; return 1; }
   cp assets/fonts/CourierPrime-Regular.ttf assets/fonts/CourierPrime-Bold.ttf \
