@@ -1816,6 +1816,26 @@ struct Shared {
     ///
     /// Written every callback. Zero until the first one arrives.
     out_block_seen: AtomicU32,
+    /// The RING we asked the host for, in frames — **and only where that is a
+    /// different number from the period.** Zero otherwise.
+    ///
+    /// WASAPI and ALSA read `BufferSize::Fixed(v)` as the whole ring rather
+    /// than one period, so `pick_buffer` asks for `period * BUFFER_PERIODS` —
+    /// four periods on Linux. A take that recorded only the period would
+    /// understate its own buffering fourfold, which is the same bug the Audio
+    /// Status panel has and not one worth copying into the file that exists to
+    /// explain bad takes.
+    ///
+    /// **Zero where the request IS the callback**, which is CoreAudio, ASIO and
+    /// JACK: those ask for the block itself, and reporting a ring equal to the
+    /// period would invent one. That distinction is per HOST and not per
+    /// platform — a Linux build has an ALSA path with a four-period ring and a
+    /// JACK path with none — which is why this is stored at stream open from
+    /// what was actually asked, rather than derived from `BUFFER_PERIODS` by
+    /// whoever reads it.
+    ///
+    /// Written once, when the stream opens.
+    out_ring_asked: AtomicU32,
     /// Bit `i` set: channel `i`'s rack voices ignore the note stream.
     ///
     /// **The MIDI arm, as one mask**, exactly the shape mute and solo travel
@@ -2123,6 +2143,7 @@ impl Shared {
             monitor_backlog: AtomicU32::new(0),
             pending_swaps: AtomicU32::new(0),
             out_block_seen: AtomicU32::new(0),
+            out_ring_asked: AtomicU32::new(0),
             midi_off: AtomicU32::new(0),
             armed: AtomicU32::new(u32::MAX),
             arr_capture: AtomicU32::new(0),
@@ -7507,6 +7528,28 @@ impl RecorderTap {
         (d > 0).then_some(d)
     }
 
+    /// What the output callback is actually being handed, for the writer that
+    /// has a tap and no engine.
+    ///
+    /// **Counted, not requested.** A device's buffer size belongs to the
+    /// device: another host holding the same interface dictates it and the
+    /// request is simply not granted, so this is the only one of the two
+    /// numbers that cannot lie. `None` before the first callback.
+    pub fn output_block_frames(&self) -> Option<u32> {
+        let n = self.dropped.out_block_seen.load(Ordering::Relaxed);
+        (n > 0).then_some(n)
+    }
+
+    /// The ring asked of the host when the stream opened, in frames.
+    ///
+    /// `None` where no fixed size was asked for — which is what ASIO gets, and
+    /// is a different claim from any number. See [`Shared::out_ring_asked`] for
+    /// why this is not the same as [`output_block_frames`](Self::output_block_frames).
+    pub fn output_ring_frames(&self) -> Option<u32> {
+        let n = self.dropped.out_ring_asked.load(Ordering::Relaxed);
+        (n > 0).then_some(n)
+    }
+
     /// Always [`TAP_CHANNELS`], for the life of the engine.
     pub fn channels(&self) -> usize {
         self.channels
@@ -7895,6 +7938,19 @@ impl Engine {
         };
 
         let shared = Arc::new(Shared::new());
+        // What was actually asked of the host, recorded once — see
+        // `Shared::out_ring_asked`. A ring ONLY where it is genuinely a
+        // different number from the period: ASIO asks for the callback size
+        // itself and gets `Fixed(v)` with `v` as the period, so matching on
+        // `Fixed` alone would have written a 512-frame "ring" for a JACK take
+        // whose ring is 512-frame nothing. `Default` asked for no size at all.
+        shared.out_ring_asked.store(
+            match (buffer_size, buffer_frames) {
+                (cpal::BufferSize::Fixed(ring), Some(period)) if ring != period => ring,
+                _ => 0,
+            },
+            Ordering::Relaxed,
+        );
         let fault = Arc::new(Mutex::new(None));
         let click = Click::load(f64::from(rate))?;
 
@@ -12336,6 +12392,90 @@ mod tests {
             "zero is a backend declining, and must never reach `take.json` as \
              a measurement"
         );
+    }
+
+    /// **The block the callback got and the ring we asked for are two
+    /// different numbers, and the tap reports both.**
+    ///
+    /// On Linux `pick_buffer` asks for four periods, so a take recording only
+    /// the block understates its own buffering fourfold. And a stream opened on
+    /// `BufferSize::Default` asked for no ring at all, which is a different
+    /// claim from a ring that happens to equal the block — ASIO gets exactly
+    /// that, and `take.json` has to be able to say so.
+    #[test]
+    fn the_tap_reports_the_block_it_got_and_the_ring_it_asked_for_separately() {
+        let shared = Arc::new(Shared::new());
+        let (tx, rx) = RingBuffer::<f32>::new(1024 * TAP_CHANNELS);
+        let tap = RecorderTap {
+            rx,
+            channels: TAP_CHANNELS,
+            sample_rate: 48_000,
+            dropped: Arc::clone(&shared),
+        };
+        assert_eq!(tap.output_block_frames(), None, "no callback has run");
+        assert_eq!(
+            tap.output_ring_frames(),
+            None,
+            "a stream that asked for no fixed size has no ring to report"
+        );
+
+        // What `Engine::start` stores for a Linux stream: 256 a callback out of
+        // a 1024-frame ring.
+        shared.out_ring_asked.store(1024, Ordering::Relaxed);
+        let mut r = test_renderer(Arc::clone(&shared), tx, 2);
+        // `render`, not `render_program`: the block is counted from the buffer
+        // the DEVICE handed over, which is the outer function's business.
+        // `render_program` takes a frame count it has already been told.
+        let mut out = vec![0.0f32; 256 * 2];
+        r.render(&mut out, 1_000_000_000, 1_000_000_000);
+        assert_eq!(tap.output_block_frames(), Some(256), "counted in the callback");
+        assert_eq!(
+            tap.output_ring_frames(),
+            Some(1024),
+            "the ring is four periods here and must not be reported as one"
+        );
+    }
+
+    /// **A host that asks for the callback size itself has no ring, and the
+    /// take must not invent one.**
+    ///
+    /// ASIO and JACK get `BufferSize::Fixed(v)` where `v` IS the period. A
+    /// store that matched on `Fixed` alone would write `output_ring_frames`
+    /// equal to `output_block_frames` and imply a ring behind it — on exactly
+    /// the configuration whose takes are being compared against ALSA's.
+    #[test]
+    fn a_request_that_is_the_callback_itself_reports_no_ring() {
+        for (asked, supported) in [
+            // ASIO: the period is the request, so ring == period.
+            (Some(512u32), cpal::SupportedBufferSize::Range { min: 16, max: 8192 }),
+            (Some(64), cpal::SupportedBufferSize::Range { min: 16, max: 8192 }),
+        ] {
+            let (size, period) = pick_buffer(&supported, asked, true);
+            let ring = match (size, period) {
+                (cpal::BufferSize::Fixed(r), Some(p)) if r != p => r,
+                _ => 0,
+            };
+            assert_eq!(
+                ring, 0,
+                "an ASIO request of {asked:?} named a ring it does not have"
+            );
+        }
+        // And the other way: the ALSA/WASAPI path asks for a real multiple, so
+        // there is a ring and it must survive.
+        let (size, period) = pick_buffer(
+            &cpal::SupportedBufferSize::Range { min: 16, max: 8192 },
+            Some(256),
+            false,
+        );
+        let ring = match (size, period) {
+            (cpal::BufferSize::Fixed(r), Some(p)) if r != p => r,
+            _ => 0,
+        };
+        if BUFFER_PERIODS > 1 {
+            assert_eq!(ring, 256 * BUFFER_PERIODS, "the real ring was dropped");
+        } else {
+            assert_eq!(ring, 0, "ring and period are one number on this platform");
+        }
     }
 
     // ── the render loop ────────────────────────────────────────────────────
