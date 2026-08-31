@@ -7494,6 +7494,19 @@ impl RecorderTap {
         self.dropped.tap_dropped.load(Ordering::Relaxed)
     }
 
+    /// What [`Engine::output_delay_ns`] last stored, for the writer that has a
+    /// tap and no engine.
+    ///
+    /// The same `Shared` the engine writes it into, so this is the engine's own
+    /// number and not a copy that can go stale. `None` where the backend
+    /// declined to say — which is a different claim from zero, and the whole
+    /// reason `take.json` carries an `Option`. The store happens in
+    /// `render_program`, so this is `None` until the first callback has run.
+    pub fn output_delay_ns(&self) -> Option<Nanos> {
+        let d = self.dropped.delay_ns.load(Ordering::Relaxed);
+        (d > 0).then_some(d)
+    }
+
     /// Always [`TAP_CHANNELS`], for the life of the engine.
     pub fn channels(&self) -> usize {
         self.channels
@@ -12274,6 +12287,55 @@ mod tests {
         let mut out = Vec::new();
         assert_eq!(tap.drain(&mut out), 8, "what did fit is still intact");
         assert_eq!(tap.dropped(), 8);
+    }
+
+    /// **The measured output delay reaches the tap, and a backend that
+    /// declined to say reads as `None` rather than as zero.**
+    ///
+    /// `take.json` carries this number and it is the only latency in the
+    /// product that is measured rather than assumed. RECORDER-PLAN §3a is
+    /// explicit that a claimed latency is worse than an absent one, so the
+    /// distinction between "the backend said 2.7 ms" and "the backend said
+    /// nothing" has to survive all the way to the manifest. CoreAudio and
+    /// JACK answer; ALSA does not.
+    #[test]
+    fn the_tap_reports_the_delay_the_callback_measured_and_none_when_there_was_none() {
+        let shared = Arc::new(Shared::new());
+        let (tx, rx) = RingBuffer::<f32>::new(1024 * TAP_CHANNELS);
+        let tap = RecorderTap {
+            rx,
+            channels: TAP_CHANNELS,
+            sample_rate: 48_000,
+            dropped: Arc::clone(&shared),
+        };
+        assert_eq!(
+            tap.output_delay_ns(),
+            None,
+            "before the first callback nobody has measured anything"
+        );
+
+        let mut r = test_renderer(Arc::clone(&shared), tx, 2);
+        let mut out = vec![0.0f32; 128 * 2];
+        let now = 1_000_000_000;
+        // 128 frames at 48 kHz, which is the shape a healthy backend reports.
+        r.render_program(&mut out, 128, now, now + 2_666_666);
+        assert_eq!(
+            tap.output_delay_ns(),
+            Some(2_666_666),
+            "the tap and the engine share one `Shared`, so this is the \
+             engine's own number"
+        );
+
+        // `heard == now` is what the cpal helper returns when playback is not
+        // after the callback, which is not physical and is how a backend that
+        // says nothing looks from in here.
+        r.render_program(&mut out, 128, now, now);
+        assert_eq!(
+            tap.output_delay_ns(),
+            None,
+            "zero is a backend declining, and must never reach `take.json` as \
+             a measurement"
+        );
     }
 
     // ── the render loop ────────────────────────────────────────────────────
