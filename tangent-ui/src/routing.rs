@@ -1,24 +1,35 @@
-//! Track routing: where a channel goes besides the master.
+//! Track routing: where a channel goes instead of, or as well as, the master.
 //!
-//! Two destinations, and they are genuinely different things:
+//! Two destinations, and they behave differently on purpose:
 //!
-//! - a **hardware output** takes the channel out of the box on its own pair
-//!   of jacks (3/4, 5/6, a single mono jack), which is how somebody feeds a
-//!   headphone amp, a second interface, or a stage monitor;
-//! - a **send** feeds another CHANNEL, which is how somebody turns a channel
-//!   into an effects bus: put a reverb on channel 9, send channels 1, 2 and 3
-//!   to 9, and the three of them share one reverb.
-//!
-//! **A route is additive and never steals.** Adding one does not take the
-//! channel off the master — a channel with three routes is heard four times,
-//! which is what a send IS. Anything else would make "route it" a synonym for
-//! "move it", and moving is what the master fader and mute already do.
+//! - a **hardware output** takes a COPY of the channel out of the box on its
+//!   own pair of jacks (3/4, 5/6, a single mono jack), which is how somebody
+//!   feeds a headphone amp, a second interface, or a stage monitor. The
+//!   channel stays in the master mix; the jacks are extra.
+//! - a **channel route MOVES the channel.** It comes off the master and is
+//!   folded into the destination channel instead, through whatever is loaded
+//!   on it — a submix. The routing dialog says exactly this ("Routing to a
+//!   channel MOVES it there"), and the engine enforces it by closing the
+//!   channel's direct path to the master for as long as such a route exists
+//!   (`route_direct` in `instrument.rs`). For a COPY — the classic reverb
+//!   feed — the strip's SEND knob into the effects bus is the copy; calling
+//!   both of them "send" is how you end up expecting to hear a track twice.
 //!
 //! **No duplicates**, by the owner's word: the same channel to the same
 //! destination twice is two faders fighting over one path, and nobody means
 //! that. [`Routes::add`] refuses it rather than silently merging.
 
 use serde_json::{Map, Value};
+
+/// How many routes the desk carries at most.
+///
+/// The engine's routing table is a fixed array of atomics read on the audio
+/// thread (`MAX_ROUTES` in `instrument.rs`, which must stay this number), and
+/// `set_routes` publishes only this many entries. Sixty-four is four routes
+/// per channel on a sixteen-channel desk, past anything a person builds by
+/// hand — the ceiling exists so the audio thread never allocates, not to
+/// ration anybody.
+pub const MAX_ROUTES: usize = 64;
 
 /// Where a route sends the audio.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,7 +39,8 @@ pub enum Target {
     /// alone — a mono jack is one jack, and sending only the left channel to
     /// it would silently drop half of anything panned.
     Hardware { first: usize, stereo: bool },
-    /// Another desk channel, by index. The classic send.
+    /// Another desk channel, by index. This one MOVES the channel there —
+    /// see the module docs; the copy is the SEND knob, not a route.
     Channel(usize),
 }
 
@@ -85,13 +97,25 @@ impl Route {
 pub struct Routes(pub Vec<Route>);
 
 impl Routes {
-    /// Add a route unless the exact same one already exists.
+    /// Add a route unless the exact same one already exists, or the desk is
+    /// already carrying [`MAX_ROUTES`].
     ///
     /// Returns whether it was added, so the caller can say why nothing
     /// happened. "The exact same one" is source AND destination: channel 3 to
     /// 3/4 and channel 3 to 5/6 are two different routes, and channel 4 to
     /// 3/4 is a third.
+    ///
+    /// The cap is refused HERE, not merely clamped downstream: the engine's
+    /// `set_routes` publishes only the first `MAX_ROUTES` entries to the
+    /// audio thread, so a sixty-fifth route accepted into this list would be
+    /// stored, saved, drawn on the strip — and silently never sound. A fader
+    /// that moves and does nothing, forever, is exactly the failure `prune`'s
+    /// docs warn about, so the refusal happens where the caller can still say
+    /// no out loud.
     pub fn add(&mut self, route: Route) -> bool {
+        if self.0.len() >= MAX_ROUTES {
+            return false;
+        }
         if self.0.iter().any(|r| r.from == route.from && r.target == route.target) {
             return false;
         }
@@ -370,6 +394,31 @@ mod tests {
         assert!(!r.any_hardware(), "a send needs no per-channel device buffer");
         r.add(Route::new(0, Target::Hardware { first: 2, stereo: true }));
         assert!(r.any_hardware());
+    }
+
+    #[test]
+    fn a_sixty_fifth_route_is_refused_rather_than_stored_and_never_sounding() {
+        // The engine publishes only the first MAX_ROUTES entries to the audio
+        // thread, so anything held past that would be a route the settings
+        // file remembers and the desk never plays. `add` must say no while
+        // somebody is still there to hear it.
+        let mut r = Routes::default();
+        for i in 0..MAX_ROUTES {
+            assert!(
+                r.add(Route::new(i % 16, Target::Channel(16 + i))),
+                "route {i} is under the cap and distinct, it should fit"
+            );
+        }
+        // Not a duplicate of anything above — the refusal is the cap alone.
+        assert!(
+            !r.add(Route::new(0, Target::Hardware { first: 0, stereo: true })),
+            "route MAX_ROUTES + 1 must be refused"
+        );
+        assert_eq!(r.0.len(), MAX_ROUTES);
+        // Taking one off makes room again: the cap is a ceiling, not a latch.
+        r.remove(0);
+        assert!(r.add(Route::new(0, Target::Hardware { first: 0, stereo: true })));
+        assert_eq!(r.0.len(), MAX_ROUTES);
     }
 
     #[test]
