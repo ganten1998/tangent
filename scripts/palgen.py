@@ -361,6 +361,43 @@ MASTER_SPREAD_MIN = 6.0
 # draw-time guard was never audited for.
 DEAD_ZONE_HAND = {11, 14, 17}
 
+
+
+# The dark batch's runs, pinned the same way SHIPPED is — frozen data the
+# Rust must match byte for byte. Designed by the `--dark` machinery above.
+DARK_RUNS = {
+    "Carbon": dict(
+        slots=[
+            (0x38, 0x19, 0x11), (0x48, 0x34, 0x15), (0x4d, 0x4b, 0x17), (0x49, 0x62, 0x1e),
+            (0x5a, 0x28, 0x1b), (0x5f, 0x45, 0x1d), (0x5f, 0x5d, 0x1d), (0x1c, 0x25, 0x0b),
+            (0x79, 0x35, 0x24), (0x75, 0x54, 0x23), (0x23, 0x23, 0x0b), (0x2c, 0x3b, 0x12),
+            (0x91, 0x45, 0x31), (0x2c, 0x20, 0x0d), (0x3a, 0x38, 0x11), (0x3c, 0x50, 0x18),
+        ],
+        click=(0x2e, 0x2b, 0x26),
+        master=(0xb6, 0x0f, 0x25),
+    ),
+    "Nocturne": dict(
+        slots=[
+            (0x10, 0x23, 0x38), (0x2a, 0x31, 0x6e), (0x52, 0x3f, 0x7d), (0x1f, 0x63, 0x70),
+            (0x19, 0x38, 0x5b), (0x3d, 0x44, 0x85), (0x63, 0x50, 0x90), (0x0c, 0x26, 0x2b),
+            (0x22, 0x4b, 0x7a), (0x4e, 0x56, 0x97), (0x27, 0x16, 0x50), (0x13, 0x3d, 0x45),
+            (0x2a, 0x5c, 0x96), (0x17, 0x1c, 0x50), (0x3e, 0x2c, 0x68), (0x1a, 0x51, 0x5b),
+        ],
+        click=(0x3a, 0x33, 0x28),
+        master=(0x86, 0x4d, 0x14),
+    ),
+    "Phosphor": dict(
+        slots=[
+            (0x16, 0x26, 0x0c), (0x32, 0x3a, 0x12), (0x19, 0x54, 0x25), (0x6b, 0x59, 0x20),
+            (0x24, 0x3d, 0x12), (0x44, 0x4e, 0x18), (0x23, 0x67, 0x31), (0x28, 0x22, 0x0c),
+            (0x30, 0x52, 0x19), (0x53, 0x60, 0x1d), (0x0c, 0x27, 0x11), (0x40, 0x36, 0x13),
+            (0x3d, 0x64, 0x22), (0x1f, 0x24, 0x0b), (0x13, 0x3f, 0x1c), (0x57, 0x48, 0x1a),
+        ],
+        click=(0x26, 0x2c, 0x22),
+        master=(0x8e, 0x21, 0x0b),
+    ),
+}
+
 MIXER_RS = Path(__file__).resolve().parent.parent / "tangent-ui" / "src" / "mixer_panel.rs"
 
 
@@ -442,13 +479,18 @@ def check(verbose=True):
     # The SHAPE first: 316 entries, sixteen contiguous 17-entry runs from 28,
     # masters appended at 300. Wrong shape means the regexes matched the
     # wrong thing and every later answer would be about the wrong table.
-    if len(cols) != 316:
-        errs.append(f"STRIP_COLORS holds {len(cols)} entries, want 316")
-    if [n for n, _, _ in pals] != list(SHIPPED):
-        errs.append("palette names/order differ between Rust and SHIPPED")
+    if len(cols) != 370:
+        errs.append(f"STRIP_COLORS holds {len(cols)} entries, want 370")
+    if [n for n, _, _ in pals] != list(SHIPPED) + list(DARK_RUNS):
+        errs.append("palette names/order differ between Rust and SHIPPED+DARK_RUNS")
     for i, (name, base, mat) in enumerate(pals):
-        if base != 28 + 17 * i or mat != 300 + i:
-            errs.append(f"{name}: base {base}/master {mat}, want {28 + 17 * i}/{300 + i}")
+        # The first sixteen follow the original formula; the dark batch is
+        # APPENDED after the 300-block masters, so its runs start at 316 and
+        # its masters sit after the last run.
+        want_base = 28 + 17 * i if i < 16 else 316 + 17 * (i - 16)
+        want_mat = 300 + i if i < 16 else 367 + (i - 16)
+        if base != want_base or mat != want_mat:
+            errs.append(f"{name}: base {base}/master {mat}, want {want_base}/{want_mat}")
     if errs:
         for e in errs:
             say(f"  - {e}")
@@ -481,9 +523,19 @@ def check(verbose=True):
     if dead != DEAD_ZONE_HAND:
         errs.append(f"hand-grid dead zone is {sorted(dead)}, expected {sorted(DEAD_ZONE_HAND)}")
 
-    # The gates, palette by palette.
-    masters = [p["master"] for p in SHIPPED.values()]
-    for i, (name, p) in enumerate(SHIPPED.items()):
+    for i, (name, p) in enumerate(DARK_RUNS.items()):
+        base = 316 + 17 * i
+        if p["slots"] != cols[base : base + 16] or p["click"] != cols[base + 16]:
+            errs.append(f"{name}: the embedded dark run has drifted from the Rust")
+        if p["master"] != cols[367 + i]:
+            errs.append(f"{name}: the embedded dark master has drifted from the Rust")
+
+    # The gates, palette by palette — the dark batch held to the same bars.
+    masters = [p["master"] for p in SHIPPED.values()] + [
+        p["master"] for p in DARK_RUNS.values()
+    ]
+    everything = list(SHIPPED.items()) + list(DARK_RUNS.items())
+    for i, (name, p) in enumerate(everything):
         slots, click, master = p["slots"], p["click"], p["master"]
         perrs = []
         if len(set(slots)) != 16:
@@ -832,9 +884,177 @@ def emit_gradients():
         print(f"    ({click[0]:#04x}, {click[1]:#04x}, {click[2]:#04x}), // {name} click")
 
 
+# ── the dark factory themes (W51) ──────────────────────────────────────────
+#
+# **Designed here first, transcribed to Rust second** — the house law since
+# the theme batch. Three dark themes, each grown from values that already
+# live in the codebase rather than invented: Carbon is Default's own dark
+# mode promoted to a theme (the #1a1a1a ground and #0b0e0a meter well are
+# Default's dark constants), Nocturne is Navi's night side worn as the
+# light-mode dress (its ground IS Navi's black_key, its band Navi's band),
+# and Phosphor is the green console the scope always implied.
+#
+# The gates below are the PORT of the Rust acceptance tests in theme.rs —
+# `every_factory_theme_is_readable_on_its_own_background`,
+# `every_band_leaves_room_for_the_parts_derived_from_it`, the theory-ground
+# law — plus the two house rules the tests cannot see: no role that is ever
+# a SURFACE may sit in the ~0.12–0.22 dead zone where neither ink clears
+# 4.5:1, and surfaces obey the same chroma ceiling as the strips. `--dark`
+# must print ALL PASS before any of this is Rust.
+
+# The roles that are painted as SURFACES (things with area, carrying parts
+# or ink), as opposed to marks drawn ON a surface.
+SURFACE_ROLES = [
+    "background", "white_key", "black_key", "recorder_bg",
+    "meter_bg", "fx_strip", "fretboard",
+]
+
+DARK_THEMES = {
+    "Carbon": dict(
+        background=(0x1A, 0x1A, 0x1A),
+        white_key=(0x1A, 0x1A, 0x1A),
+        black_key=(0x0D, 0x0D, 0x0D),
+        key_active=(0xFF, 0x9D, 0x4D),
+        sustain=(0xD4, 0x70, 0x8C),
+        key_separator=(0x38, 0x34, 0x2C),
+        text=(0xE8, 0xDC, 0xC0),
+        theory_line=(0x56, 0x50, 0x44),
+        interval_text=(0xB8, 0xAC, 0x90),
+        recorder_bg=(0x4A, 0x35, 0x27),
+        fx_knob=(0xD0, 0x98, 0x5A),
+        master_knob=(0xFF, 0x3B, 0x5C),
+        varispeed=(0xE8, 0xDC, 0xC0),
+        velocity_loud=(0xFF, 0x70, 0x50),
+        velocity_quiet=(0x3A, 0xA8, 0xA0),
+        meter_bg=(0x0B, 0x0E, 0x0A),
+        scope_draw=(0xA3, 0xE0, 0x48),
+        fx_strip=(0x30, 0x24, 0x1B),
+        input_chip=(0x8A, 0xB0, 0x60),
+        fretboard=(0x0D, 0x0D, 0x0D),
+        string=(0x8A, 0x7F, 0x6A),
+    ),
+    "Nocturne": dict(
+        background=(0x0A, 0x1C, 0x34),
+        white_key=(0x0A, 0x1C, 0x34),
+        black_key=(0x06, 0x12, 0x24),
+        key_active=(0x7F, 0x9B, 0xFF),
+        sustain=(0x40, 0xE8, 0xFF),
+        key_separator=(0x26, 0x50, 0x80),
+        text=(0xE0, 0xF0, 0xFF),
+        theory_line=(0x37, 0x57, 0x82),
+        interval_text=(0xA8, 0xC8, 0xD8),
+        recorder_bg=(0x26, 0x42, 0x6A),
+        fx_knob=(0x00, 0xD8, 0xF8),
+        master_knob=(0xF0, 0x90, 0x30),
+        varispeed=(0xC9, 0xD8, 0xE8),
+        velocity_loud=(0xFE, 0x6C, 0x56),
+        velocity_quiet=(0x18, 0xAD, 0x8F),
+        meter_bg=(0x06, 0x12, 0x24),
+        scope_draw=(0x40, 0xE8, 0xFF),
+        fx_strip=(0x19, 0x2E, 0x48),
+        input_chip=(0x55, 0x78, 0xFF),
+        fretboard=(0x06, 0x12, 0x24),
+        string=(0x78, 0x98, 0xB8),
+    ),
+    "Phosphor": dict(
+        background=(0x0B, 0x0E, 0x0A),
+        white_key=(0x0B, 0x0E, 0x0A),
+        black_key=(0x05, 0x07, 0x05),
+        key_active=(0xA3, 0xE0, 0x48),
+        sustain=(0xD2, 0xA3, 0x6C),
+        key_separator=(0x22, 0x2C, 0x1E),
+        text=(0xC8, 0xE8, 0xB0),
+        theory_line=(0x3A, 0x48, 0x34),
+        interval_text=(0x9A, 0xC0, 0x84),
+        recorder_bg=(0x1C, 0x2C, 0x16),
+        fx_knob=(0x8F, 0xAE, 0x3F),
+        master_knob=(0xE0, 0x58, 0x40),
+        varispeed=(0xC8, 0xE8, 0xB0),
+        velocity_loud=(0xE8, 0x8C, 0x40),
+        velocity_quiet=(0x48, 0xA8, 0x88),
+        meter_bg=(0x05, 0x07, 0x05),
+        scope_draw=(0xA3, 0xE0, 0x48),
+        fx_strip=(0x16, 0x22, 0x12),
+        input_chip=(0x6F, 0xAE, 0x3F),
+        fretboard=(0x05, 0x07, 0x05),
+        string=(0x6A, 0x80, 0x60),
+    ),
+}
+
+INK_LIGHT = (0xE8, 0xDC, 0xC0)
+INK_DARK = (0x1A, 0x1A, 0x1A)
+DEAD_LO, DEAD_HI = 0.12, 0.22
+
+
+def theme_gates(name, t):
+    """The Rust acceptance tests, ported — pass here first, then in Rust."""
+    errs = []
+    band, text = t["recorder_bg"], t["text"]
+    if contrast(text, band) < 4.5:
+        errs.append(f"text on the band {contrast(text, band):.2f}:1 < 4.5")
+    if contrast(t["scope_draw"], t["meter_bg"]) < 3.0:
+        errs.append(
+            f"scope on its well {contrast(t['scope_draw'], t['meter_bg']):.2f}:1 < 3"
+        )
+    for role in ("fx_knob", "master_knob", "key_active"):
+        if contrast(t[role], band) < 3.0:
+            errs.append(f"{role} on the band {contrast(t[role], band):.2f}:1 < 3")
+    if contrast(t["key_active"], t["sustain"]) < 1.25:
+        errs.append(
+            f"active/sustain {contrast(t['key_active'], t['sustain']):.2f}:1 < 1.25"
+        )
+    # The band's derived parts must separate (the terminal-background trap).
+    light_ink = contrast(band, INK_LIGHT) > contrast(band, INK_DARK)
+    shade = lambda c, k: tuple(min(255, round(v * k)) for v in c)
+    well, field = (
+        (shade(band, 0.55), shade(band, 1.35))
+        if light_ink
+        else (shade(band, 0.88), shade(band, 0.94))
+    )
+    if contrast(well, field) < 1.12:
+        errs.append(f"band well/field separate {contrast(well, field):.2f}:1 < 1.12")
+    # The theory-ground law: light ground IS the naturals.
+    if t["background"] != t["white_key"]:
+        errs.append("background != white_key (the theory-ground law)")
+    # House rules the Rust tests cannot see.
+    for role in SURFACE_ROLES:
+        l = luminance(t[role])
+        if DEAD_LO <= l <= DEAD_HI:
+            errs.append(f"{role} {hexs(t[role])} lum {l:.3f} in the dead zone")
+        if chroma(t[role]) > CHROMA_MAX:
+            errs.append(f"{role} {hexs(t[role])} chroma {chroma(t[role]):.1f} > {CHROMA_MAX}")
+    # Text and lines must actually read on the GROUND too.
+    if contrast(text, t["background"]) < 4.5:
+        errs.append(f"text on the ground {contrast(text, t['background']):.2f}:1 < 4.5")
+    if contrast(t["interval_text"], t["background"]) < 4.5:
+        errs.append(
+            f"interval_text on the ground {contrast(t['interval_text'], t['background']):.2f}:1 < 4.5"
+        )
+    if contrast(t["theory_line"], t["background"]) < 1.7:
+        errs.append(
+            f"theory_line on the ground {contrast(t['theory_line'], t['background']):.2f}:1 < 1.7"
+        )
+    return errs
+
+
+def dark_report():
+    bad = 0
+    for name, t in DARK_THEMES.items():
+        errs = theme_gates(name, t)
+        print(f"{name:10s} {'FAIL' if errs else 'ok'}")
+        for e in errs:
+            print(f"           - {e}")
+        bad += len(errs)
+    print()
+    print("ALL PASS" if not bad else f"DARK THEMES FAIL ({bad})")
+    return bad
+
+
 if __name__ == "__main__":
     import sys
 
+    if "--dark" in sys.argv:
+        raise SystemExit(1 if dark_report() else 0)
     if "--gradients" in sys.argv:
         rc = report_gradients()
         if not rc:

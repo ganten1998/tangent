@@ -980,6 +980,102 @@ pub fn factory() -> Vec<Theme> {
             channel_palette: Some(15),
             dark: dark_of(&[("background", (0x19, 0x10, 0x26))]),
         },
+        // ── the dark three. Sixteen light themes and not one dark one was
+        // the audit's finding, so these carry the ground itself dark — which
+        // makes the naturals dark and the sharps darker, the way every dark
+        // instrument panel reads. Each grew from values already living here
+        // rather than invented: Carbon is Default's own dark constants
+        // promoted to a theme, Nocturne is Navi's night side worn in light
+        // mode, Phosphor is the console green the scope always implied.
+        // Designed and gated by `scripts/palgen.py --dark` BEFORE this Rust
+        // existed; the factory-loop tests below are the second lock.
+        //
+        // ── Carbon: Default inverted. Warm near-black, bone ink, embers.
+        Theme {
+            name: "Carbon".to_owned(),
+            background: c(0x1a, 0x1a, 0x1a),
+            white_key: c(0x1a, 0x1a, 0x1a),
+            black_key: c(0x0d, 0x0d, 0x0d),
+            key_active: c(0xff, 0x9d, 0x4d),
+            sustain: c(0xd4, 0x70, 0x8c),
+            key_separator: c(0x38, 0x34, 0x2c),
+            text: c(0xe8, 0xdc, 0xc0),
+            theory_line: c(0x56, 0x50, 0x44),
+            interval_text: c(0xb8, 0xac, 0x90),
+            recorder_bg: c(0x4a, 0x35, 0x27),
+            // Amber and not the bone the ink uses: the varispeed wears the
+            // bone, and the test that keeps them apart wants 25 dE.
+            fx_knob: c(0xd0, 0x98, 0x5a),
+            master_knob: c(0xff, 0x3b, 0x5c),
+            varispeed: c(0xe8, 0xdc, 0xc0),
+            velocity_loud: c(0xff, 0x70, 0x50),
+            velocity_quiet: c(0x3a, 0xa8, 0xa0),
+            meter_bg: c(0x0b, 0x0e, 0x0a),
+            scope_draw: c(0xa3, 0xe0, 0x48),
+            fx_strip: c(0x30, 0x24, 0x1b),
+            input_chip: c(0x8a, 0xb0, 0x60),
+            fretboard: c(0x0d, 0x0d, 0x0d),
+            string: c(0x8a, 0x7f, 0x6a),
+            channel_palette: Some(16),
+            dark: dark_of(&[("background", (0x0d, 0x0d, 0x0d))]),
+        },
+        // ── Nocturne: Navi's night side, worn as the light-mode dress. The
+        // periwinkle and cyan are the same values the Navi theme carries,
+        // already proven against these very surfaces.
+        Theme {
+            name: "Nocturne".to_owned(),
+            background: c(0x0a, 0x1c, 0x34),
+            white_key: c(0x0a, 0x1c, 0x34),
+            black_key: c(0x06, 0x12, 0x24),
+            key_active: c(0x7f, 0x9b, 0xff),
+            sustain: c(0x40, 0xe8, 0xff),
+            key_separator: c(0x26, 0x50, 0x80),
+            text: c(0xe0, 0xf0, 0xff),
+            theory_line: c(0x37, 0x57, 0x82),
+            interval_text: c(0xa8, 0xc8, 0xd8),
+            recorder_bg: c(0x26, 0x42, 0x6a),
+            fx_knob: c(0x00, 0xd8, 0xf8),
+            master_knob: c(0xf0, 0x90, 0x30),
+            varispeed: c(0xc9, 0xd8, 0xe8),
+            velocity_loud: c(0xfe, 0x6c, 0x56),
+            velocity_quiet: c(0x18, 0xad, 0x8f),
+            meter_bg: c(0x06, 0x12, 0x24),
+            scope_draw: c(0x40, 0xe8, 0xff),
+            fx_strip: c(0x19, 0x2e, 0x48),
+            input_chip: c(0x55, 0x78, 0xff),
+            fretboard: c(0x06, 0x12, 0x24),
+            string: c(0x78, 0x98, 0xb8),
+            channel_palette: Some(17),
+            dark: dark_of(&[("background", (0x06, 0x12, 0x24))]),
+        },
+        // ── Phosphor: the green console. Scope-green actives, one warm
+        // amber for the held state, and a warning red-orange master.
+        Theme {
+            name: "Phosphor".to_owned(),
+            background: c(0x0b, 0x0e, 0x0a),
+            white_key: c(0x0b, 0x0e, 0x0a),
+            black_key: c(0x05, 0x07, 0x05),
+            key_active: c(0xa3, 0xe0, 0x48),
+            sustain: c(0xd2, 0xa3, 0x6c),
+            key_separator: c(0x22, 0x2c, 0x1e),
+            text: c(0xc8, 0xe8, 0xb0),
+            theory_line: c(0x3a, 0x48, 0x34),
+            interval_text: c(0x9a, 0xc0, 0x84),
+            recorder_bg: c(0x1c, 0x2c, 0x16),
+            fx_knob: c(0x8f, 0xae, 0x3f),
+            master_knob: c(0xe0, 0x58, 0x40),
+            varispeed: c(0xc8, 0xe8, 0xb0),
+            velocity_loud: c(0xe8, 0x8c, 0x40),
+            velocity_quiet: c(0x48, 0xa8, 0x88),
+            meter_bg: c(0x05, 0x07, 0x05),
+            scope_draw: c(0xa3, 0xe0, 0x48),
+            fx_strip: c(0x16, 0x22, 0x12),
+            input_chip: c(0x6f, 0xae, 0x3f),
+            fretboard: c(0x05, 0x07, 0x05),
+            string: c(0x6a, 0x80, 0x60),
+            channel_palette: Some(18),
+            dark: dark_of(&[("background", (0x05, 0x07, 0x05))]),
+        },
     ]
 }
 
@@ -1110,6 +1206,7 @@ pub const EXAMPLE: &str = r##"{
   "_comment8": "4 Mono        5 Studio      6 Aurora      7 Sandstone",
   "_comment9": "8 Centennial  9 Blueprint  10 Porcelain  11 Moss",
   "_comment10": "12 Rhodes    13 Copper    14 Dusk       15 Iris",
+  "_comment10b": "16 Carbon    17 Nocturne  18 Phosphor",
   "_comment11": "It only takes effect while the track menu's palette is on AUTO;",
   "_comment12": "a palette picked by hand there outlives any theme. Leave it out",
   "_comment13": "and the channels keep dressing for whichever theme is applied.",
@@ -1137,7 +1234,7 @@ mod tests {
     #[test]
     fn the_factory_set_is_sixteen_themes_with_default_first() {
         let f = factory();
-        assert_eq!(f.len(), 16, "Default, seven, and eight more");
+        assert_eq!(f.len(), 19, "Default, fifteen more, and the dark three");
         assert_eq!(f[0].name, "Default");
         // **Default RESTORES rather than declining to speak.** A theme that
         // set nothing left whatever the last theme wrote, so picking Default
