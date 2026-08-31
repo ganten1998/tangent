@@ -2089,6 +2089,16 @@ struct Shared {
     running: AtomicBool,
     callbacks: AtomicU64,
     swaps: AtomicU64,
+    /// **Glitches the backend recovered from, counted rather than latched.**
+    ///
+    /// An xrun is not a dead device and must not be answered like one: tearing
+    /// the engine down and rebuilding it takes seconds and silences every
+    /// instrument, which is a far longer hole than the click that provoked it.
+    /// It is also not nothing, which is what the ALSA path used to make of it —
+    /// see `vendor/cpal/src/host/alsa/mod.rs`, where the underrun arm carried
+    /// `// TODO: Notify the user of this.` and dropped it. Between those two
+    /// answers is this counter.
+    xruns: AtomicU64,
 }
 
 impl Shared {
@@ -2209,6 +2219,7 @@ impl Shared {
             pending_voice: std::sync::Mutex::new(None),
             running: AtomicBool::new(false),
             callbacks: AtomicU64::new(0),
+            xruns: AtomicU64::new(0),
             swaps: AtomicU64::new(0),
         }
     }
@@ -9587,6 +9598,17 @@ impl Engine {
     }
 
     /// One health reading for [`StallWatch`], taken under one lock discipline.
+    /// Glitches the backend recovered from since this engine opened.
+    ///
+    /// Beside [`Engine::health`] deliberately: that pair answers "is it alive",
+    /// and this answers "is it well", and a device can be one without the
+    /// other. Until the ALSA backend was made to report underruns at all
+    /// (`vendor/cpal`), the honest answer to the second question on Linux was
+    /// that nobody knew.
+    pub fn xruns(&self) -> u64 {
+        self.shared.xruns.load(Ordering::Relaxed)
+    }
+
     pub fn health(&self) -> (bool, u64) {
         (self.is_running(), self.callbacks())
     }
@@ -10646,6 +10668,28 @@ where
                 // anything acts on.
                 if matches!(err, cpal::StreamError::DeviceNotAvailable) {
                     shared.running.store(false, Ordering::Relaxed);
+                }
+                // **An xrun is a glitch, and a fault is a funeral.**
+                //
+                // The backend has already recovered and the stream is still
+                // running; what happened is that a block was late. Latching it
+                // as a fault sends `Desktop::update` down the device-is-gone
+                // path — engine dropped, every instrument reloaded, seconds of
+                // silence — in answer to a click. That is the JACK failure
+                // this project has already met once, where a routine
+                // notification arriving through the error channel rebuilt the
+                // engine forever and the app made no sound at all.
+                //
+                // So it is counted. The count is what the Audio Status panel
+                // and the take manifest can report, and what turns "it
+                // crackles" into a number somebody can act on — which is more
+                // than either previous answer offered, since ALSA reported
+                // nothing and JACK reported a catastrophe.
+                if matches!(&err, cpal::StreamError::BackendSpecific { err: inner }
+                    if inner.description.starts_with("xrun"))
+                {
+                    shared.xruns.fetch_add(1, Ordering::Relaxed);
+                    return;
                 }
                 if let Ok(mut slot) = fault.try_lock() {
                     *slot = Some(err.to_string());
