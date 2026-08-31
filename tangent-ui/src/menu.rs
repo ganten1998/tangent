@@ -1262,6 +1262,21 @@ fn build_entries(view: MenuView) -> Vec<Entry> {
             MenuAction::ToggleRecorder,
         ));
     }
+    // **The shortcut card's doorway.** Hold-H is taught exactly once, in a
+    // Welcome card with a "don't show this again" box, and after that the
+    // only way to the card was already knowing the key — one dismissed
+    // dialog and the app's entire keyboard went invisible. This menu is the
+    // whole chrome, so the teaching lives here, permanently. GREYED, which
+    // is this menu's idiom for a heading (see the Themes hover): the card
+    // is held open by design — press to read, let go and it is gone — so
+    // there is nothing for a click to toggle, and the label itself is the
+    // affordance. If the card ever grows a pinned mode, this row is where
+    // its action belongs.
+    tail.push(Entry::Item {
+        label: "Keyboard Shortcuts (hold H)".to_owned(),
+        action: MenuAction::ShowAbout, // never reached; the row is dead
+        enabled: false,
+    });
     tail.push(item("About", MenuAction::ShowAbout));
     // **A category, where there was one row.** "Reset Settings to Default"
     // destroyed all one hundred and sixty-four settings from directly under
@@ -2681,16 +2696,23 @@ mod tests {
         // wanted it to — a submenu holds items, never more submenus
         // (`Entry::Submenu`), so folding it in would flatten eight themes and
         // eight colour pickers into one seventeen-row hover.
+        //
+        // 22: the greyed "Keyboard Shortcuts (hold H)" teaching row. Hold-H
+        // was taught once, in a Welcome card with a "don't show this again"
+        // box, and then never again — one dismissal and the app's entire
+        // keyboard went invisible. This menu is the whole chrome, so the
+        // teaching lives here, in every cut.
         assert!(
-            count(fullest()) <= 21,
+            count(fullest()) <= 22,
             "the fullest menu is back to {} top-level rows",
             count(fullest())
         );
         // The everyday menu: a piano, the notation and no guitar — plus
-        // the recorder band's returned toggle, and Themes (see above), which
-        // is present in every view because appearance is not about a surface.
+        // the recorder band's returned toggle, Themes (see above), and the
+        // shortcuts teaching row, all present in every view because neither
+        // appearance nor the keyboard is about a surface.
         assert!(
-            count(view()) <= 14,
+            count(view()) <= 15,
             "the everyday menu is {} top-level rows",
             count(view())
         );
@@ -3054,6 +3076,47 @@ mod tests {
                 labels.iter().any(|l| l == scope.row()),
                 "{scope:?}'s row is not labelled {:?}",
                 scope.row()
+            );
+        }
+    }
+
+    /// **The menu teaches hold-H, on every cut, forever.** The Welcome card
+    /// taught it once behind a "don't show this again" box, and after that
+    /// dismissal the shortcut card — the app's entire keyboard — was
+    /// discoverable only by someone who already knew it. The row is GREYED,
+    /// this menu's idiom for a heading: the card is held open by design, so
+    /// there is nothing for a click to do and the label is the teaching.
+    /// And it sits directly above About, where the tail's one-shot rows
+    /// live, so the menu still ends About / Reset.
+    #[test]
+    fn the_menu_teaches_the_shortcut_card_on_every_cut() {
+        for v in [
+            view(),
+            fullest(),
+            MenuView {
+                global_only: true,
+                ..view()
+            },
+            MenuView {
+                caps: Caps::PLUGIN,
+                ..view()
+            },
+        ] {
+            let top = rows(v);
+            let idx = top
+                .iter()
+                .position(|(l, ..)| l == "Keyboard Shortcuts (hold H)")
+                .expect("the Keyboard Shortcuts row left the menu");
+            let (_, _, enabled) = &top[idx];
+            assert!(
+                !enabled,
+                "the shortcuts row is a teaching, not a control — it must \
+                 stay greyed until a click has something to do"
+            );
+            assert_eq!(
+                top.get(idx + 1).map(|(l, ..)| l.as_str()),
+                Some("About"),
+                "the shortcuts row moved away from the tail's About"
             );
         }
     }

@@ -235,9 +235,13 @@ const BINDINGS: &[(Key, &str, KeyAction, bool)] = &[
     // screen-reader user presses it for and egui takes it before this table
     // ever sees it — so the view cycle needs a key of its own. F6 is what
     // every other program with panes uses for exactly this, which makes it
-    // the one alias somebody might already know. Unlisted, like F11: the
-    // help card names Tab, which is the key almost everybody presses.
-    (Key::F6, "F6", KeyAction::ToggleMixer, false),
+    // the one alias somebody might already know. LISTED, unlike F11, and
+    // the difference is the audience: F11 duplicates a key the card already
+    // tells the truth about, while in reader mode the Tab row above is a
+    // lie — Tab walks the controls there — and an unlisted F6 left the view
+    // cycle with no key the card was honest about. Its row wears its own
+    // words rather than Tab's; see `card_rows`.
+    (Key::F6, "F6", KeyAction::ToggleMixer, true),
     // §5: one button, not arm-then-record, and Space because that is what every
     // transport in every DAW the user already owns is bound to.
     //
@@ -393,6 +397,15 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
         bool,
     )|
      -> (&'static str, &'static str) {
+            // **F6 wears its own words, not Tab's.** The two keys share
+            // `ToggleMixer`, but this row exists for one situation: in
+            // reader mode egui takes Tab to walk the controls, so the Tab
+            // row above it is a lie there and F6 is the key that still
+            // cycles the views. Repeating "cycle theory / arrange / mixer"
+            // would document the alias and explain nothing.
+            if label == "F6" {
+                return (label, "the view cycle in reader mode - Tab walks controls there");
+            }
             let desc = match (view, action) {
                 (HelpView::Arrange, KeyAction::ShowSupporterKey) => {
                     "split the clip at the playhead"
@@ -471,10 +484,23 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
         HelpView::Arrange => rows.extend([
             ("DRAG", "move a clip · edges trim · corners fade"),
             ("S-DRG", "shift-drag: draw a MIDI item"),
-            ("S-EDG", "shift-drag a MIDI clip's edge: stretch it, notes and all"),
+            // "MIDI or audio", because it said "a MIDI clip" long after
+            // audio stretch shipped — the row understated the feature while
+            // C-G below overstated its own, in the opposite direction.
+            ("S-EDG", "shift-drag an edge: stretch the clip, MIDI or audio"),
+            // **The automation and tempo lanes, which were on no card at
+            // all** — a whole gesture set discoverable only by clicking.
+            // One rule each way, shift puts a node down and alt takes one
+            // away, on both kinds of lane — which is why these rows say "a
+            // lane" and "a node" rather than naming the two surfaces. The
+            // ramp toggle is the one thing a tempo point has that an
+            // automation node does not, so it alone gets a row of its own.
+            ("S-CLK", "shift-click a lane: drop a node · a node: add it to the selection"),
+            ("S-PT", "shift-click a tempo point: ramp or step"),
+            ("DIAL", "an automation row's dial: the lane's base · 2-click resets"),
             ("2-CLK", "double-click a MIDI item: open its editor"),
-            ("DEL", "delete the selected clip - or the selected track"),
-            ("A-CLK", "alt-click an insert: empty the bay"),
+            ("DEL", "delete the selected clips · nodes · track"),
+            ("A-CLK", "alt-click: empty an insert bay · remove a node"),
             ("R-CLK", "empty room: the app menu · header: the track menu · loaded insert: delete / replace"),
             ("WHEEL", "zoom at the playhead - click a bar, wheel zooms there"),
             ("A-WHL", "alt: move the viewport"),
@@ -485,10 +511,15 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             ("W", "fit the biggest clip - empty: the shipped zoom"),
             ("S-ARM", "shift+arm: this lane alone - every other arm stands down"),
             ("C-T", "ctrl+T: a new track"),
-            ("C-C/V/X", "copy · paste · cut the selected clips"),
+            ("C-C/V/X", "copy · paste · cut the selected clips - or nodes"),
             ("C-F", "group the selection into a folder"),
-            ("C-G", "glue the selected clips"),
-            ("C-N", "normalise the selection"),
+            // "MIDI clips", because that is the truth: `arr_glue_selection`
+            // filters to MIDI and refuses everything else — welding audio
+            // means rendering, a different operation with a different cost.
+            ("C-G", "glue the selected MIDI clips into one"),
+            // C-S-N, not C-N: the handler requires shift, and only audio
+            // comes up — a note's velocity is a performance, not a level.
+            ("C-S-N", "normalise the selected audio clips"),
             ("C-M", "the master row on/off"),
             ("ESC", "drop the time selection"),
             ("S-1", "shift+1: the theory view"),
@@ -815,83 +846,251 @@ mod tests {
         }
     }
 
-    /// **Every KEY row on a view's card names a key that view actually
-    /// handles.**
+    /// The source the drift tests read the handlers back from.
+    const APP_SRC: &str = include_str!("app.rs");
+
+    /// The body of `fn {name}` in `app.rs` — from its header to the next
+    /// method at the same indent. A crude slice, kept because it is honest
+    /// about what it is: these tests read code as text, and a parser would
+    /// be rigour spent where drift is cheap to catch textually.
+    fn handler_body(name: &str) -> &'static str {
+        let start = APP_SRC
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("{name} is gone; this test reads the wrong thing"));
+        let rest = &APP_SRC[start..];
+        let end = rest[10..].find("\n    fn ").map_or(rest.len(), |e| e + 10);
+        &rest[..end]
+    }
+
+    /// A card label to the `Key::` idents it stands for. `None` is a
+    /// GESTURE row — a mouse verb with no key to check.
+    fn keys_of(label: &str) -> Option<Vec<&'static str>> {
+        Some(match label {
+            "-/=" => vec!["Minus", "Equals"],
+            "W" => vec!["W"],
+            "Q" => vec!["Q"],
+            "Z" => vec!["Z"],
+            "N" => vec!["N"],
+            "O" => vec!["O"],
+            "DEL" => vec!["Delete"],
+            "ESC" => vec!["Escape"],
+            "ARROWS" => vec!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"],
+            "C-A" => vec!["A"],
+            "C-D" => vec!["D"],
+            "C-G" => vec!["G"],
+            "C-F" => vec!["F"],
+            "C-S-N" => vec!["N"],
+            "C-M" => vec!["M"],
+            "C-T" => vec!["T"],
+            "C-C/V" => vec!["C", "V"],
+            "C-C/V/X" => vec!["C", "V", "X"],
+            // The view chords. Dispatched from `fn paint` rather than from
+            // any view's own handler — the old version of this test filed
+            // every one of them under "gesture" and checked nothing.
+            "C-Z" | "C-S-Z" => vec!["Z"],
+            "S-1" => vec!["Num1", "Exclamationmark"],
+            "S-2" => vec!["Num2"],
+            "S-3" => vec!["Num3"],
+            _ => return None,
+        })
+    }
+
+    /// The labels every card carries that `fn paint` dispatches for all
+    /// views at once: undo/redo and the shift view keys. They sit outside
+    /// the panel section, so the section boundary must not exempt them.
+    const PAINT_CHORDS: &[&str] = &["C-Z", "C-S-Z", "S-1", "S-2", "S-3"];
+
+    /// The modifier words a label promises. "chord" is command-or-ctrl,
+    /// which is how every handler spells it.
+    fn mods_of(label: &str) -> Vec<&'static str> {
+        if label.starts_with("C-S-") {
+            vec!["chord", "shift"]
+        } else if label.starts_with("C-") {
+            vec!["chord"]
+        } else if label.starts_with("S-") {
+            vec!["shift"]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Line numbers of `hay` where `Key::{k}` appears as a whole ident on a
+    /// CODE line. Comment lines are skipped — prose about a key must not
+    /// vouch for it — and the ident boundary matters: the old substring
+    /// check let `Key::Tab` answer for `Key::T`.
+    fn key_lines(hay: &str, k: &str) -> Vec<usize> {
+        let needle = format!("Key::{k}");
+        hay.lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim_start().starts_with("//"))
+            .filter(|(_, line)| {
+                line.match_indices(&needle).any(|(at, _)| {
+                    line[at + needle.len()..]
+                        .chars()
+                        .next()
+                        .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+                })
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Whether some read of `Key::{k}` in `hay` sits in a stretch of code
+    /// that mentions every modifier word the label promises.
+    ///
+    /// Line-windowed and textual on purpose — the same bargain the body
+    /// slice makes. The window reaches twelve lines UP because a guard like
+    /// `if !i.modifiers.shift { None } else if ...` stands at the head of a
+    /// cascade and the last key of the cascade sits eleven lines under it.
+    fn key_read_with_mods(hay: &str, k: &str, mods: &[&'static str]) -> bool {
+        let lines: Vec<&str> = hay.lines().collect();
+        key_lines(hay, k).into_iter().any(|i| {
+            let window = lines[i.saturating_sub(12)..(i + 3).min(lines.len())].join("\n");
+            mods.iter().all(|m| match *m {
+                "chord" => window.contains("command") || window.contains("ctrl"),
+                other => window.contains(other),
+            })
+        })
+    }
+
+    /// Every distinct `Key::` ident a body's CODE lines read.
+    fn key_idents(hay: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for line in hay.lines() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            let mut rest = line;
+            while let Some(at) = rest.find("Key::") {
+                let tail = &rest[at + 5..];
+                let ident: String = tail
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if !ident.is_empty() && !out.contains(&ident) {
+                    out.push(ident);
+                }
+                rest = tail;
+            }
+        }
+        out
+    }
+
+    /// **Every KEY row on a view's card names a key the app really reads,
+    /// with the modifiers the label promises.**
     ///
     /// This module's header promises one source, so a shortcut cannot work
     /// unlisted or be listed and not work. `BINDINGS` is what this module
-    /// dispatches; the per-view sections below it are prose, describing keys
-    /// that `midi_editor_input` and `arrangement_input` in `app.rs` handle —
-    /// several of them modifier chords this table cannot spell.
-    ///
-    /// Prose drifts. So the prose is read back against the handler: every row
-    /// whose label names a KEY rather than a gesture has to correspond to a
-    /// `Key::` that view's handler really reads.
+    /// dispatches; the per-view sections are prose, describing keys that
+    /// `arrangement_input`, `midi_editor_input` and `fn paint` (the mixer's
+    /// own block, and the view chords every surface shares) handle. Prose
+    /// drifts, so it is read back against the handlers. The first version
+    /// of this test checked substrings in two handlers and skipped the
+    /// modifiers; "C-N" passed for years while the handler demanded shift.
     #[test]
     fn every_key_row_names_a_key_the_view_handles() {
-        let src = include_str!("app.rs");
-        let body = |name: &str| -> &str {
-            let start = src
-                .find(&format!("fn {name}("))
-                .unwrap_or_else(|| panic!("{name} is gone; this test reads the wrong thing"));
-            let rest = &src[start..];
-            let end = rest[10..].find("\n    fn ").map_or(rest.len(), |e| e + 10);
-            &rest[..end]
-        };
-        // A card label to the `Key::` idents it stands for. `None` is a
-        // GESTURE row — a mouse verb with no key to check.
-        let keys_of = |label: &str| -> Option<Vec<&'static str>> {
-            Some(match label {
-                "-/=" => vec!["Minus", "Equals"],
-                "W" => vec!["W"],
-                "Q" => vec!["Q"],
-                "Z" => vec!["Z"],
-                "N" => vec!["N"],
-                "O" => vec!["O"],
-                "DEL" => vec!["Delete"],
-                "ESC" => vec!["Escape"],
-                "ARROWS" => vec!["ArrowLeft", "ArrowUp"],
-                "C-A" => vec!["A"],
-                "C-D" => vec!["D"],
-                "C-G" => vec!["G"],
-                "C-F" => vec!["F"],
-                "C-N" => vec!["N"],
-                "C-M" => vec!["M"],
-                "C-T" => vec!["T"],
-                "C-C/V" | "C-C/V/X" => vec!["C", "V"],
-                _ => return None,
-            })
-        };
         let gates = Gates {
             recorder_shown: true,
             recorder_available: true,
             window_sizing: true,
         };
         for (view, handler) in [
-            (HelpView::Arrange, "arrangement_input"),
-            (HelpView::MidiEdit, "midi_editor_input"),
+            // The piano's own section is all `BINDINGS`; only its shared
+            // chord rows have a handler to be read against.
+            (HelpView::Piano, None),
+            // The mixer's DEL and C-T live inline in `fn paint`, inside
+            // the `mixer_rect` block — there is no named handler to slice,
+            // so the whole of `paint` stands for it.
+            (HelpView::Mixer, Some("paint")),
+            (HelpView::Arrange, Some("arrangement_input")),
+            (HelpView::MidiEdit, Some("midi_editor_input")),
         ] {
-            let hay = body(handler);
-            // Only the view's OWN section. The GENERAL rows above it are
-            // dispatched by this module from `BINDINGS`, not by the view —
-            // `Z` is fullscreen there and the arrangement never sees it.
-            // The panel heading is the boundary, and it is the second
-            // heading on the card.
             let rows = card_rows(gates, view);
+            // The GENERAL rows above the second heading are dispatched by
+            // this module from `BINDINGS`, not by the view — except the
+            // chords, which no section boundary excuses.
             let panel = rows
                 .iter()
                 .enumerate()
                 .filter(|(_, (l, _))| l.is_empty())
                 .nth(1)
                 .map_or(rows.len(), |(i, _)| i);
-            for (label, desc) in rows.iter().skip(panel).copied() {
+            for (i, (label, desc)) in rows.iter().enumerate() {
                 let Some(keys) = keys_of(label) else { continue };
-                for k in keys {
+                let hay = if PAINT_CHORDS.contains(label) {
+                    handler_body("paint")
+                } else if i > panel {
+                    match handler {
+                        Some(h) => handler_body(h),
+                        None => continue,
+                    }
+                } else {
+                    continue;
+                };
+                for k in &keys {
                     assert!(
-                        hay.contains(&format!("Key::{k}")),
-                        "{view:?} offers {label:?} ({desc}), and {handler} never reads Key::{k}"
+                        key_read_with_mods(hay, k, &mods_of(label)),
+                        "{view:?} offers {label:?} ({desc}), and no read of \
+                         Key::{k} beside the modifiers the label names exists \
+                         in the handler"
                     );
                 }
+            }
+        }
+    }
+
+    /// **The other direction: every key a surface's handler reads is on
+    /// that surface's card.** The old test only read the card against the
+    /// code, so a gesture that shipped without a row — which is how the
+    /// whole automation set went undocumented — passed in silence. This is
+    /// the assertion that catches the NEXT one.
+    #[test]
+    fn every_key_a_surface_reads_is_on_its_card() {
+        let gates = Gates {
+            recorder_shown: true,
+            recorder_available: true,
+            window_sizing: true,
+        };
+        // Keys that are deliberately read and deliberately not rows, each
+        // with its reason written where the failure will point.
+        let spoken_for: &[(&str, &str)] = &[
+            // The laptop half of the same key, answering wherever Delete
+            // does — an alias, like F1 for help, not a second shortcut.
+            ("Backspace", "DEL's unlisted alias"),
+        ];
+        for (name, views) in [
+            ("arrangement_input", vec![HelpView::Arrange]),
+            ("midi_editor_input", vec![HelpView::MidiEdit]),
+            // `paint` serves every surface at once: the mixer's inline
+            // block plus the shared view chords, so every card's labels
+            // may vouch for it.
+            (
+                "paint",
+                vec![
+                    HelpView::Piano,
+                    HelpView::Mixer,
+                    HelpView::Arrange,
+                    HelpView::MidiEdit,
+                ],
+            ),
+        ] {
+            let hay = handler_body(name);
+            let carded: Vec<&str> = views
+                .iter()
+                .flat_map(|v| card_rows(gates, *v))
+                .filter_map(|(l, _)| keys_of(l))
+                .flatten()
+                .collect();
+            for ident in key_idents(hay) {
+                if spoken_for.iter().any(|(k, _)| *k == ident) {
+                    continue;
+                }
+                assert!(
+                    carded.contains(&ident.as_str()),
+                    "{name} reads Key::{ident} and no card row spells it — \
+                     add the row, or add the key to `spoken_for` with its \
+                     reason"
+                );
             }
         }
     }
@@ -1107,6 +1306,24 @@ mod tests {
         assert!(desc(&arrange, "G").contains("snap"));
         assert!(desc(&arrange, "M").contains("metronome"));
         assert!(!has(&arrange, "P"), "P does nothing on the arrangement");
+        // The automation and tempo lanes have rows now, and they must keep
+        // saying what the one-hand rules say: shift drops a node, a tempo
+        // point's shift is the ramp, and glue is the MIDI-only truth.
+        assert!(
+            desc(&arrange, "S-CLK").contains("node"),
+            "the arrange card lost the automation gestures: {:?}",
+            desc(&arrange, "S-CLK")
+        );
+        assert!(
+            desc(&arrange, "S-PT").contains("ramp"),
+            "the arrange card lost the tempo ramp: {:?}",
+            desc(&arrange, "S-PT")
+        );
+        assert!(
+            desc(&arrange, "C-G").contains("MIDI"),
+            "C-G glues MIDI only, and the card stopped saying so: {:?}",
+            desc(&arrange, "C-G")
+        );
 
         let editor = card(HelpView::MidiEdit);
         assert!(desc(&editor, "G").contains("snap"));
@@ -1125,6 +1342,50 @@ mod tests {
             "M on the mixer should be the metronome, not {:?}",
             desc(&mixer, "M")
         );
+    }
+
+    /// **F6 is listed, and it tells the reader-mode truth.** In
+    /// accessibility mode egui takes Tab to walk the controls — that is
+    /// what a screen-reader user presses it for — so a card whose only
+    /// view-cycle row was Tab lied to exactly the audience with the least
+    /// means of discovering the key that works. F6's row must be on every
+    /// card, beside a Tab row that keeps the ordinary meaning, and it must
+    /// say something Tab's row does not — the same action twice with one
+    /// description is a duplicate that teaches nothing.
+    #[test]
+    fn f6_is_on_every_card_and_names_reader_mode() {
+        let full = Gates {
+            recorder_shown: true,
+            recorder_available: true,
+            window_sizing: true,
+        };
+        for gates in [Gates::default(), full] {
+            for view in [
+                HelpView::Piano,
+                HelpView::Mixer,
+                HelpView::Arrange,
+                HelpView::MidiEdit,
+            ] {
+                let rows = card_rows(gates, view);
+                let of = |key: &str| -> String {
+                    rows.iter()
+                        .find(|(k, _)| *k == key)
+                        .map(|(_, d)| (*d).to_owned())
+                        .unwrap_or_else(|| panic!("{view:?} has no {key} row"))
+                };
+                let f6 = of("F6");
+                assert!(
+                    f6.contains("reader") && f6.contains("Tab"),
+                    "{view:?}: F6's row no longer explains reader mode: {f6:?}"
+                );
+                let tab = of("Tab");
+                assert!(
+                    tab.contains("cycle"),
+                    "{view:?}: Tab's row lost the view cycle: {tab:?}"
+                );
+                assert_ne!(f6, tab, "{view:?}: F6 merely repeats Tab's row");
+            }
+        }
     }
 
     /// Letters that are ordinary shortcuts must not fire with a modifier held.
