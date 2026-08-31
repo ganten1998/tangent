@@ -664,6 +664,16 @@ pub struct Arrangement {
     pub version: u64,
 }
 
+/// What reading a document actually found. The variants a caller may not
+/// conflate: `Damaged` bytes are somebody's song and must never be adopted
+/// as a path to write to.
+pub enum LoadOutcome {
+    Loaded(Arrangement),
+    Missing,
+    Empty,
+    Damaged,
+}
+
 impl Default for Arrangement {
     /// A document this build invented is a document at this build's version.
     ///
@@ -702,10 +712,43 @@ impl Arrangement {
     }
 
     /// Load a document from anywhere — the PROJECT system's road in.
+    ///
+    /// Collapses every failure into an empty document, which is the right
+    /// manner for a template probe or a `named` peek and the WRONG one for
+    /// opening: a caller about to adopt a path must go through `read_from`
+    /// and look at the outcome, or a damaged song opens as an empty one,
+    /// undo baselines on the emptiness, no prompt ever fires, and the next
+    /// writer replaces the damaged file — which was recoverable — with the
+    /// emptiness, which is not.
     pub fn load_from(path: &std::path::Path) -> Self {
-        match std::fs::read_to_string(path) {
-            Ok(text) => Self::from_json(&text),
-            Err(_) => Self::default(),
+        match Self::read_from(path) {
+            LoadOutcome::Loaded(a) => a,
+            _ => Self::default(),
+        }
+    }
+
+    /// Load a document and SAY WHAT HAPPENED. Missing is ordinary (a fresh
+    /// project has no file yet); Empty is a zero-length or whitespace file,
+    /// which no writer here produces — half a crashed write, or an external
+    /// tool; Damaged is bytes that exist and do not parse. Only `Loaded`
+    /// may be silently adopted.
+    pub fn read_from(path: &std::path::Path) -> LoadOutcome {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return LoadOutcome::Missing;
+            }
+            // Unreadable-but-present (permissions, I/O) is indistinguishable
+            // from damage in every way that matters to the caller: the bytes
+            // must not be written over.
+            Err(_) => return LoadOutcome::Damaged,
+        };
+        if text.trim().is_empty() {
+            return LoadOutcome::Empty;
+        }
+        match serde_json::from_str::<Value>(&text) {
+            Ok(Value::Object(map)) => LoadOutcome::Loaded(Self::from_map(map)),
+            _ => LoadOutcome::Damaged,
         }
     }
 
@@ -1352,6 +1395,48 @@ fn Settings_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    /// **Missing, empty and damaged are three different findings**, and only
+    /// a clean parse may be adopted silently. `load_from` keeps collapsing
+    /// them for the probes that only peek; `read_from` is the opening road.
+    #[test]
+    fn read_from_tells_missing_empty_and_damaged_apart() {
+        let dir = std::env::temp_dir()
+            .join(format!("tangent-read-outcome-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let doc = dir.join("project.tangent");
+
+        assert!(matches!(
+            Arrangement::read_from(&doc),
+            LoadOutcome::Missing
+        ));
+        std::fs::write(&doc, "  \n\t ").unwrap();
+        assert!(matches!(Arrangement::read_from(&doc), LoadOutcome::Empty));
+        std::fs::write(&doc, r#"{"clips": ["#).unwrap();
+        assert!(matches!(
+            Arrangement::read_from(&doc),
+            LoadOutcome::Damaged
+        ));
+        // A JSON root that is not an object is damage too, not a document.
+        std::fs::write(&doc, "[1,2,3]").unwrap();
+        assert!(matches!(
+            Arrangement::read_from(&doc),
+            LoadOutcome::Damaged
+        ));
+        let mut arr = Arrangement::default();
+        arr.named = true;
+        arr.save_to(&doc);
+        match Arrangement::read_from(&doc) {
+            LoadOutcome::Loaded(a) => assert!(a.named),
+            _ => panic!("a clean save did not read back Loaded"),
+        }
+        // And load_from still answers a default for every non-Loaded case,
+        // which its ~30 peeking callers rely on.
+        std::fs::write(&doc, "not json").unwrap();
+        assert!(Arrangement::load_from(&doc).clips.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// **A clip's loop length survives the document**, and its absence means
     /// "does not loop" — which is what every file written before this said.

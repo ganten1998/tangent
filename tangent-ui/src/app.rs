@@ -1552,8 +1552,16 @@ pub fn fresh_project_dir(root: &std::path::Path) -> std::path::PathBuf {
         .join("default")
         .join(crate::drumpad::FILE_NAME);
     let keeps = |dir: &std::path::Path| {
-        crate::arrangement::Arrangement::load_from(&dir.join("project.tangent")).named
-            || kit_is_custom(&dir.join(crate::drumpad::FILE_NAME), &template_kit)
+        use crate::arrangement::LoadOutcome;
+        let held = match crate::arrangement::Arrangement::read_from(&dir.join("project.tangent")) {
+            LoadOutcome::Loaded(a) => a.named,
+            // Unreadable bytes are somebody's song until proven otherwise —
+            // reclaiming a folder on the strength of a failed parse is how
+            // a corrupt SAVED project would be deleted outright.
+            LoadOutcome::Damaged => true,
+            LoadOutcome::Missing | LoadOutcome::Empty => false,
+        };
+        held || kit_is_custom(&dir.join(crate::drumpad::FILE_NAME), &template_kit)
     };
     let first = root.join("Untitled");
     if !first.exists() || !keeps(&first) {
@@ -1566,6 +1574,29 @@ pub fn fresh_project_dir(root: &std::path::Path) -> std::path::PathBuf {
         }
     }
     first
+}
+
+/// Move an unreadable document out of every writer's reach:
+/// `project.tangent.damaged`, or `.damaged-2`, `-3`… — the first free name.
+/// No code path in the app ever writes to a `.damaged` name, which is the
+/// entire point: whatever recovery the bytes allow stays possible for ever.
+/// `None` when the rename itself failed, and the caller must then refuse
+/// to adopt the path at all.
+fn quarantine_damaged(doc: &std::path::Path) -> Option<std::path::PathBuf> {
+    for n in 1..1_000u32 {
+        let target = if n == 1 {
+            doc.with_extension("tangent.damaged")
+        } else {
+            doc.with_extension(format!("tangent.damaged-{n}"))
+        };
+        if target.exists() {
+            continue;
+        }
+        // One attempt: a rename that fails on a FREE name is permissions or
+        // I/O, and retrying under other names would fail the same way.
+        return std::fs::rename(doc, &target).ok().map(|()| target);
+    }
+    None
 }
 
 /// Whether a project's kit holds work of its own: present, and not
@@ -6436,8 +6467,13 @@ impl IvoryApp {
         if !self.settings.project_path.is_empty() {
             let doc = std::path::PathBuf::from(&self.settings.project_path);
             if doc.is_file() {
-                self.project_doc = doc.clone();
-                self.arrangement = crate::arrangement::Arrangement::load_from(&doc);
+                // Through the same adoption gate as every explicit open: a
+                // remembered project whose file went bad must be
+                // quarantined, not silently replaced by an empty document
+                // that the first implicit write makes permanent.
+                let (arr, doc) = self.read_for_adoption(&doc);
+                self.project_doc = doc;
+                self.arrangement = arr;
                 self.clips_dirty = true;
                 self.load_drumpad_doc();
                 // **Seed the undo baseline HERE too.** Every road into a
@@ -6718,9 +6754,9 @@ impl IvoryApp {
     /// already wrote the WAVs into `media/`; this adds the rows, selects the
     /// last one and saves — one press, one save, however many lanes.
     pub fn add_recorded_clips(&mut self, recorded: Vec<crate::arrangement::RecordedClip>) {
-        let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) else {
+        if self.project_doc().is_none() {
             return;
-        };
+        }
         let mut added = None;
         let mut carved = false;
         for r in recorded {
@@ -6776,9 +6812,15 @@ impl IvoryApp {
             self.arr_selected = Some(id);
         }
         if added.is_some() || carved {
-            self.arrangement.save_to(&doc);
-            self.clips_dirty = true;
-            self.undo_commit();
+            // **In memory, like every other edit.** This wrote the document
+            // straight to disk — one of four writers that outlived the
+            // autosave's removal, and the one that made "Nothing saves
+            // itself" false the moment a take ended. The take's AUDIO is
+            // already safe in `media/`; its placement is an edit, and edits
+            // wait for a save like everything else. `arr_save_edits` also
+            // refreshes the desk before committing, which the old tail
+            // forgot — an undo from here compared against a stale desk.
+            self.arr_save_edits();
         }
     }
 
@@ -6790,10 +6832,11 @@ impl IvoryApp {
             return;
         }
         self.arrangement.clips.clear();
-        if let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) {
-            self.arrangement.save_to(&doc);
-        }
-        self.clips_dirty = true;
+        // An edit like any other: in memory, undo-committed — the clear
+        // used to write the document immediately AND skip the undo commit,
+        // so it was on disk before the prompt could ever ask and only
+        // accidentally undoable.
+        self.arr_save_edits();
     }
 
     /// The host met the clip's file and knows its length — write it down,
@@ -6801,15 +6844,23 @@ impl IvoryApp {
     /// does NOT mark the clips dirty: this annotates the schedule the host
     /// is already holding, and marking would reload for ever.
     pub fn note_clip_len(&mut self, id: u64, len_s: f64) {
-        let Some(clip) = self.arrangement.clips.iter_mut().find(|c| c.id == id) else {
+        let Some(i) = self.arrangement.clips.iter().position(|c| c.id == id) else {
             return;
         };
-        if clip.len_s != 0.0 || !(len_s > 0.0) {
+        if self.arrangement.clips[i].len_s != 0.0 || !(len_s > 0.0) {
             return;
         }
-        clip.len_s = len_s;
-        if let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) {
-            self.arrangement.save_to(&doc);
+        // A passive annotation must not make a clean project dirty — the
+        // host pushes this after a mere decode, with zero user action, and
+        // a quit prompt over it would ask about work nobody did. It used to
+        // go further and WRITE the document straight to disk, which was the
+        // fourth implicit writer. Now: the annotation lands in memory, and
+        // a project that was clean is re-marked clean around it; the length
+        // is a cache the next explicit save carries to disk.
+        let was_clean = !self.project_dirty();
+        self.arrangement.clips[i].len_s = len_s;
+        if was_clean {
+            self.mark_project_saved();
         }
     }
 
@@ -8035,12 +8086,18 @@ impl IvoryApp {
     /// default should be until the owner saves their own over it.
     pub fn seed_template(&self, dir: &std::path::Path) {
         let doc = dir.join("project.tangent");
-        if doc.is_file() {
+        // A template that cannot be read is nobody's song — it is the
+        // stencil every scratch is cloned from, and a damaged or empty one
+        // poisons every clone with its damage. Unlike a project, it is
+        // fully regenerable, so anything but a clean read falls through to
+        // the reseed below.
+        if let crate::arrangement::LoadOutcome::Loaded(old) =
+            crate::arrangement::Arrangement::read_from(&doc)
+        {
             // A template somebody touched stands. But an UNTOUCHED stock
             // seed — no clips, no names, the desk exactly as an older
             // default wrote it — is re-seeded, so the drumpad's arrival on
             // track 8 reaches templates minted before it shipped.
-            let old = crate::arrangement::Arrangement::load_from(&doc);
             let stock = old.clips.is_empty()
                 && old.next_id <= 1
                 && old.desk.as_ref().is_some_and(|d| {
@@ -8124,8 +8181,9 @@ impl IvoryApp {
     }
 
     pub fn open_project(&mut self, doc: &std::path::Path) {
-        self.arrangement = crate::arrangement::Arrangement::load_from(doc);
-        self.project_doc = doc.to_path_buf();
+        let (arr, doc) = self.read_for_adoption(doc);
+        self.arrangement = arr;
+        self.project_doc = doc.clone();
         self.settings.project_path = doc.to_string_lossy().into_owned();
         self.save_settings();
         self.clips_dirty = true;
@@ -8142,6 +8200,67 @@ impl IvoryApp {
         self.load_drumpad_doc();
         self.reconcile_auto_bases();
         self.undo_reset();
+    }
+
+    /// Read a document for ADOPTION — the road every open takes, because
+    /// adopting a path means every writer from here on targets it, and
+    /// what the read found decides whether that is safe.
+    ///
+    /// `Loaded` and `Missing` behave as they always did: the document, or
+    /// a fresh one at the same path. `Empty` opens fresh too, but says so —
+    /// no writer here produces a zero-byte file, so somebody should hear
+    /// that one did. `Damaged` is the case this function exists for: the
+    /// bytes are somebody's song, so they are renamed aside to
+    /// `project.tangent.damaged` — a name no writer ever targets — before
+    /// an empty document takes the vacant path. A damaged file that opened
+    /// silently as empty was one Ctrl+S from being replaced by it.
+    ///
+    /// If even the rename fails, the path is not adopted at all: the open
+    /// diverts to a fresh scratch and leaves the damaged file exactly as
+    /// it lies.
+    fn read_for_adoption(
+        &mut self,
+        doc: &std::path::Path,
+    ) -> (crate::arrangement::Arrangement, std::path::PathBuf) {
+        use crate::arrangement::{Arrangement, LoadOutcome};
+        match Arrangement::read_from(doc) {
+            LoadOutcome::Loaded(a) => (a, doc.to_path_buf()),
+            LoadOutcome::Missing => (Arrangement::default(), doc.to_path_buf()),
+            LoadOutcome::Empty => {
+                self.set_startup_notice(format!(
+                    "{} existed but held nothing, so this project opened empty. \
+                     If that file was a song, its bytes were already gone.",
+                    doc.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
+                ));
+                (Arrangement::default(), doc.to_path_buf())
+            }
+            LoadOutcome::Damaged => match quarantine_damaged(doc) {
+                Some(kept) => {
+                    self.set_startup_notice(format!(
+                        "This project's document could not be read. The damaged \
+                         file is kept untouched as {} — nothing here will write \
+                         to it. The project opened empty; the takes in media/ \
+                         are unaffected.",
+                        kept.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
+                    ));
+                    (Arrangement::default(), doc.to_path_buf())
+                }
+                None => {
+                    // Could not even move it aside — refuse to stand where a
+                    // save would destroy evidence.
+                    let root = self.project_root();
+                    let dir = fresh_project_dir(&root);
+                    let _ = std::fs::create_dir_all(dir.join("media"));
+                    self.set_startup_notice(format!(
+                        "This project's document could not be read, or moved \
+                         aside. It has not been touched. A fresh project at {} \
+                         opened instead.",
+                        dir.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
+                    ));
+                    (Arrangement::default(), dir.join("project.tangent"))
+                }
+            },
+        }
     }
 
     /// **On open, a lone base node and its control are made to agree.**
@@ -10231,9 +10350,12 @@ impl IvoryApp {
             self.apply_desk_snapshot(&desk);
         }
         self.arrangement = arr;
-        if let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) {
-            self.arrangement.save_to(&doc);
-        }
+        // No document write. Undo and redo used to save the doc to disk on
+        // every step — the loudest of the four implicit writers, and the
+        // one that turned a damaged file's empty stand-in permanent the
+        // moment anybody pressed Ctrl+Z. The KIT save above stays: the kit
+        // sidecar saves itself by design (see the CHANGELOG's exception) —
+        // it is the one piece of a session the owner asked never to lose.
         self.clips_dirty = true;
         // Everything that NAMES what may no longer exist stands down.
         self.arr_selected = None;
@@ -25678,11 +25800,14 @@ mod tests {
         }
     }
 
-    /// **One press, one save, both kinds.** What arrangement record hands
-    /// over lands as document rows — the MIDI lanes' notes as a note clip
-    /// each, the audio standing on its file — and the empty and the blink
-    /// are quietly not clips at all. The host reloads off the dirty flag,
-    /// and a fresh read of the doc holds everything: the save happened.
+    /// **One press, one EDIT, both kinds — and no save.** What arrangement
+    /// record hands over lands as document rows in memory — the MIDI
+    /// lanes' notes as a note clip each, the audio standing on its file —
+    /// and the empty and the blink are quietly not clips at all. The host
+    /// reloads off the dirty flag. The DISK is untouched: a finished take
+    /// used to be one of four implicit writers that made "Nothing saves
+    /// itself" false, so this asserts the placement waits for an explicit
+    /// save (the take's audio is already safe in `media/`).
     #[test]
     fn recorded_clips_land_in_the_document_and_save() {
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
@@ -25727,8 +25852,14 @@ mod tests {
         assert_eq!(audio_path, "media/rec-3-1.wav");
         assert_eq!(app.arr_selected, Some(audio_id));
         assert!(app.take_clips_dirty(), "the host reloads from this flag");
+        assert!(
+            !app.project_doc.exists(),
+            "a finished take wrote the document by itself"
+        );
+        assert!(app.project_dirty(), "the placement is unsaved work to prompt about");
+        app.save_project_doc();
         let read = crate::arrangement::Arrangement::load_from(&app.project_doc);
-        assert_eq!(read.clips.len(), 2, "the press did not SAVE");
+        assert_eq!(read.clips.len(), 2, "the explicit save did not carry the take");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -27599,16 +27730,108 @@ mod tests {
         assert_eq!(media.len(), 1, "the same file was copied twice");
         assert_eq!(app.arrangement().clips.len(), 2);
 
-        // The ×: timeline empty, document saved that way, material kept.
+        // The ×: timeline empty IN MEMORY, undoable, material kept — and
+        // the disk untouched until an explicit save. The clear used to
+        // write the document immediately, one of the four implicit writers
+        // behind "Nothing saves itself" being false.
+        app.save_project_doc();
         app.apply_recorder_hit(Hit::ClearTrack);
         assert!(app.arrangement().clips.is_empty());
+        assert_eq!(
+            Arrangement::load_from(&doc).clips.len(),
+            2,
+            "the clear saved itself"
+        );
+        assert!(app.project_dirty(), "the clear is unsaved work to prompt about");
+        app.undo();
+        assert_eq!(app.arrangement().clips.len(), 2, "the clear was not undoable");
+        app.apply_recorder_hit(Hit::ClearTrack);
+        app.save_project_doc();
         assert!(
             Arrangement::load_from(&doc).clips.is_empty(),
-            "the cleared timeline was not saved"
+            "the explicit save did not carry the clear"
         );
         assert!(
             doc.parent().unwrap().join("media/solo.wav").is_file(),
             "clearing the timeline deleted the material"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A damaged document is quarantined, never overwritten.** Opening a
+    /// project whose file does not parse used to hand back an empty
+    /// document at the same path with a clean undo baseline — no prompt,
+    /// and the first writer replaced the damaged file (recoverable) with
+    /// the emptiness (not). Now the bytes are renamed aside to a name no
+    /// writer targets, the open says so, and even an explicit save lands
+    /// on the vacant path.
+    #[test]
+    fn a_damaged_project_is_quarantined_not_overwritten() {
+        let root = project_scratch("damaged");
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        let dir = root.join("Projects").join("wounded");
+        std::fs::create_dir_all(&dir).unwrap();
+        let doc = dir.join("project.tangent");
+        let garbage = b"{\"clips\": [half a song";
+        std::fs::write(&doc, garbage).unwrap();
+
+        app.open_project(&doc);
+        let kept = dir.join("project.tangent.damaged");
+        assert_eq!(
+            std::fs::read(&kept).ok().as_deref(),
+            Some(garbage.as_slice()),
+            "the damaged bytes were not kept verbatim"
+        );
+        assert!(app.dialog.is_some(), "nobody was told");
+        assert!(app.arrangement.clips.is_empty());
+
+        // The save writes a fresh document at the path; the quarantine
+        // file is untouched by it.
+        app.save_project_doc();
+        assert_eq!(
+            std::fs::read(&kept).ok().as_deref(),
+            Some(garbage.as_slice()),
+            "a save reached the quarantined file"
+        );
+        assert!(
+            matches!(
+                crate::arrangement::Arrangement::read_from(&doc),
+                crate::arrangement::LoadOutcome::Loaded(_)
+            ),
+            "the vacant path did not get a clean document"
+        );
+
+        // A second wounding steps the quarantine name, keeping the first.
+        std::fs::write(&doc, b"also not json").unwrap();
+        app.open_project(&doc);
+        assert!(
+            dir.join("project.tangent.damaged-2").is_file(),
+            "the second quarantine did not step to -2"
+        );
+        assert_eq!(
+            std::fs::read(&kept).ok().as_deref(),
+            Some(garbage.as_slice()),
+            "the second quarantine disturbed the first"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A corrupt saved project is never reclaimed as scratch.** The
+    /// reclaim's `named` peek reads false out of a file it cannot parse,
+    /// and reclaiming on that would delete the folder outright — takes,
+    /// kit and the recoverable bytes together.
+    #[test]
+    fn a_corrupt_saved_project_is_not_reclaimed() {
+        let root = std::env::temp_dir()
+            .join(format!("tangent-corrupt-reclaim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let scratch = root.join("Untitled");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(scratch.join("project.tangent"), b"not a document").unwrap();
+        assert_eq!(
+            fresh_project_dir(&root),
+            root.join("Untitled 2"),
+            "a folder with an unreadable document was offered for reclaim"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
