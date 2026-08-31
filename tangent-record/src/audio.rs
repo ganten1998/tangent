@@ -2619,7 +2619,47 @@ pub fn open_input(
             };
             BufferSize::Fixed(clamped)
         }
-        None => BufferSize::Default,
+        // **"Device" is not a size, and letting the backend choose one made it
+        // the WORST setting rather than the safest.**
+        //
+        // The output side has never deferred here: with no stated choice
+        // `pick_buffer` still asks for `WANT_BUFFER_FRAMES`. Only the input
+        // fell through to `BufferSize::Default`, so choosing "Device" and
+        // choosing 256 by hand produced an IDENTICAL output request and two
+        // different input ones — and on Linux the difference was audible.
+        // Reported from the room: default crackles, an explicit 256 is clean,
+        // and every size down to 128 is clean. The two settings a user expects
+        // to be the same thing were not.
+        //
+        // `LINUX-4.16-FINDINGS` §3 already names this shape — "the un-picked
+        // case used to open at `BufferSize::Default` … which is why 'no choice'
+        // was the worst choice" — and it was only ever fixed on the macOS arm
+        // above, which carries its own `INPUT_DEFAULT_FRAMES` for exactly this
+        // reason. This is the same fix on the other side of the cfg.
+        //
+        // **ASIO keeps deferring, and that is not an oversight.** `pick_buffer`'s
+        // ASIO arm answers `None` with `Default` so that both directions land on
+        // the driver's own preferred size; a driver has ONE buffer set, and an
+        // input asking for a number while the output asks for the default
+        // re-grants it underneath the running stream — the "len is 2 but the
+        // index is 2" crash. The equality is the safety, so it stays.
+        None if system().as_deref() == Some("ASIO") => BufferSize::Default,
+        None => {
+            // The same number the output asks for with no choice made, so the
+            // two directions of "Device" mean one thing. Kept here rather than
+            // imported because `WANT_BUFFER_FRAMES` lives in the binary crate
+            // and this is a library — the macOS arm above duplicates it for the
+            // same reason, and the pair must move together.
+            const INPUT_DEFAULT_FRAMES: u32 = 256;
+            match chosen.buffer_size() {
+                cpal::SupportedBufferSize::Range { min, max } if *min <= *max => {
+                    BufferSize::Fixed(INPUT_DEFAULT_FRAMES.clamp(*min, *max))
+                }
+                // A device that will not name a range gets the wish unclamped,
+                // which is still a considered number rather than none at all.
+                _ => BufferSize::Fixed(INPUT_DEFAULT_FRAMES),
+            }
+        }
     };
     let stream_config = StreamConfig {
         channels: chosen.channels(),
