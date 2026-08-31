@@ -4530,14 +4530,32 @@ pub fn show(
                             }
                             ui.add_space(10.0);
 
+                            // **What these two rows mean under JACK.** The
+                            // server runs one period and one rate for the whole
+                            // graph and tells its clients what they are, so both
+                            // controls below are still worth SHOWING — they are
+                            // what gets used the moment the system goes back to
+                            // ALSA — and are not worth pretending about while
+                            // JACK is selected. Said rather than greyed out
+                            // because this is the saved setting and the engine
+                            // falls back to ALSA when no server answered; the
+                            // Audio Status line reports the period actually
+                            // running either way, and it is the one to believe.
+                            let jack_note = (system.as_deref() == Some("JACK")).then_some(
+                                "JACK sets this for the whole graph; change it in the server",
+                            );
+
                             // ── the audio system ─────────────────────────────
                             // Drawn even when there is one, and saying so.
                             // cpal compiles in a single host per platform
-                            // unless a cargo feature asks for more, so on most
-                            // builds this row is a READOUT — and a readout that
-                            // names the driver stack is worth having, because
-                            // "ALSA" on a PipeWire machine is the sentence that
-                            // explains why the buffer behaves the way it does.
+                            // unless a cargo feature asks for more, so on macOS
+                            // and Windows this row is a READOUT — and a readout
+                            // that names the driver stack is worth having,
+                            // because "ALSA" on a PipeWire machine is the
+                            // sentence that explains why the buffer behaves the
+                            // way it does. On Linux and FreeBSD, where JACK is
+                            // compiled in beside it, the same row is the choice
+                            // between that sentence and the graph itself.
                             ui.label(RichText::new("SYSTEM").font(bold(11.0)).color(t.text));
                             if systems.len() <= 1 {
                                 ui.label(
@@ -4590,9 +4608,9 @@ pub fn show(
                                 }
                             });
                             ui.label(
-                                RichText::new(
+                                RichText::new(jack_note.unwrap_or(
                                     "what the input offers; the output follows where it can",
-                                )
+                                ))
                                 .font(plain(10.0))
                                 .color(dim),
                             );
@@ -4614,9 +4632,11 @@ pub fn show(
                                 }
                             });
                             ui.label(
-                                RichText::new("both streams reopen; not while a take is rolling")
-                                    .font(plain(10.0))
-                                    .color(dim),
+                                RichText::new(jack_note.unwrap_or(
+                                    "both streams reopen; not while a take is rolling",
+                                ))
+                                .font(plain(10.0))
+                                .color(dim),
                             );
                             ui.add_space(10.0);
 

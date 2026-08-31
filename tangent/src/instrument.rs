@@ -407,6 +407,16 @@ pub struct OutputInfo {
     pub sample_rate: u32,
     /// `None` when the device would not accept a fixed size and chose its own.
     pub buffer_frames: Option<u32>,
+    /// The ring behind the period, when the host in use reads a `Fixed`
+    /// request as a ring and the two are therefore different numbers —
+    /// WASAPI and ALSA. `None` under CoreAudio, ASIO and JACK, where the
+    /// request IS the callback and naming a ring would invent one.
+    ///
+    /// Runtime rather than `BUFFER_PERIODS`, because the constant is per
+    /// PLATFORM and this is per HOST: a Linux build has both an ALSA path
+    /// with a four-period ring and a JACK path with none, and the panel is
+    /// read by somebody debugging dropouts on one of them.
+    pub buffer_ring: Option<u32>,
 }
 
 impl OutputInfo {
@@ -420,16 +430,17 @@ impl OutputInfo {
                 f,
                 f as f32 * 1_000.0 / self.sample_rate as f32,
                 self.sample_rate,
-                // **The ring, where it is not the same as the period.** On
-                // Linux the two differ by four (see `BUFFER_PERIODS`), so a
-                // line that named only one of them would be answering a
-                // different question than the one somebody debugging dropouts
-                // is asking. Everywhere else they are the same number and
-                // saying it twice would be noise.
-                if BUFFER_PERIODS > 1 {
-                    format!("  ({} frame ring)", f * BUFFER_PERIODS)
-                } else {
-                    String::new()
+                // **The ring, where it is not the same as the period.**
+                // Through cpal's ALSA host the two differ by four (see
+                // `BUFFER_PERIODS`), so a line that named only one of them
+                // would be answering a different question than the one
+                // somebody debugging dropouts is asking. Where they are the
+                // same number — CoreAudio, ASIO, and JACK, which has no ring
+                // of ours at all — saying it twice would be noise, so the
+                // plan reports `None` and this says nothing.
+                match self.buffer_ring {
+                    Some(ring) => format!("  ({ring} frame ring)"),
+                    None => String::new(),
                 }
             ),
             _ => format!("{} Hz, device buffer size", self.sample_rate),
@@ -7820,7 +7831,7 @@ impl Engine {
             // ASIO teardown bug — a second instance's empty driver-guard
             // lets the SDK unload the driver the first one is playing
             // through. `with_host` is the shared, cached instance.
-            let (device, name, supported, host_is_asio) =
+            let (device, name, supported, host_rule) =
                 tangent_record::audio::with_host(|host| -> Result<_, String> {
                     let device = resolve_output(host, out_device)?;
                     let name = device
@@ -7830,12 +7841,14 @@ impl Engine {
                         .default_output_config()
                         .map_err(|e| format!("{name}: no default output config ({e})"))?;
                     // The backend actually in use, not the setting: the
-                    // setting can name a system this build lacks, and the
-                    // buffer arithmetic must follow the real driver stack.
-                    let asio = host.id().name() == "ASIO";
-                    Ok((device, name, supported, asio))
+                    // setting can name a system this build lacks — or one
+                    // whose server is not running, which `build_host` also
+                    // falls back from — and the buffer arithmetic must follow
+                    // the real driver stack.
+                    let rule = BufferRule::for_host(host.id().name());
+                    Ok((device, name, supported, rule))
                 })?;
-            Some((device, name, supported, host_is_asio))
+            Some((device, name, supported, host_rule))
         };
         let channels = dev.as_ref().map_or(2, |(_, _, c, _)| c.channels());
         // **The rate is asked for, not imposed.** Setup offers only what the
@@ -7849,7 +7862,7 @@ impl Engine {
         // warning with no fix otherwise: the writer drains the instrument's
         // ring at the input's rate while the engine fills it at the output's,
         // and the take drifts.
-        let dev = dev.map(|(device, name, supported, asio)| {
+        let dev = dev.map(|(device, name, supported, rule)| {
             let supported = match asked_rate {
                 // Narrowed through a RANGE rather than rebuilt:
                 // `with_sample_rate` belongs to the range, and taking it
@@ -7872,7 +7885,7 @@ impl Engine {
                     .unwrap_or(supported),
                 None => supported,
             };
-            (device, name, supported, asio)
+            (device, name, supported, rule)
         });
         let rate = dev.as_ref().map_or_else(
             || asked_rate.unwrap_or(48_000),
@@ -7884,12 +7897,20 @@ impl Engine {
         if channels == 0 || rate == 0 {
             return Err(format!("{name} reports {channels} channels at {rate} Hz"));
         }
-        let (buffer_size, buffer_frames) = match dev.as_ref() {
-            Some((_, _, supported, asio)) => {
-                pick_buffer(supported.buffer_size(), asked_buffer, *asio)
+        let BufferPlan {
+            request: buffer_size,
+            period: buffer_frames,
+            ring: buffer_ring,
+        } = match dev.as_ref() {
+            Some((_, _, supported, rule)) => {
+                pick_buffer(supported.buffer_size(), asked_buffer, *rule)
             }
             // Offline renders in MAX_BLOCK bites; the "buffer" is a label.
-            None => (cpal::BufferSize::Default, None),
+            None => BufferPlan {
+                request: cpal::BufferSize::Default,
+                period: None,
+                ring: None,
+            },
         };
 
         let shared = Arc::new(Shared::new());
@@ -8174,6 +8195,7 @@ impl Engine {
                 channels,
                 sample_rate: rate,
                 buffer_frames,
+                buffer_ring,
             },
             shared: Arc::clone(&shared),
             timebase,
@@ -10514,11 +10536,69 @@ const BUFFER_PERIODS: u32 = if cfg!(target_os = "linux") {
 /// same `Some -> Fixed / None -> Default` translation the input side uses on
 /// the same setting, so the two directions request identically, the re-grant
 /// equals the original grant, and the division stays at the channel count.
+/// **How the host in use reads `BufferSize::Fixed`.** Three different things,
+/// and getting the wrong one has cost this project a crash and a lie.
+///
+/// It is a property of the DRIVER STACK, not of the platform, which is why it
+/// is passed in from the open (where the real `host.id()` is known) rather than
+/// read off a `cfg!`. Linux alone can be any of two of these depending on what
+/// the user picked in Audio Setup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BufferRule {
+    /// **WASAPI and ALSA: `Fixed(v)` is the whole RING**, to be carved into
+    /// `BUFFER_PERIODS` callbacks. Ask for the multiple; report the period.
+    Ring,
+    /// **ASIO: `Fixed(v)` IS the callback period.** Multiplying here asks the
+    /// driver for a double-size buffer while the input side asks plain, and an
+    /// ASIO driver has only one buffer set — see the note above `pick_buffer`
+    /// for the crash that followed.
+    Period,
+    /// **JACK: the size is not ours to ask for.** The server's period is the
+    /// client's period; cpal's JACK backend does not even read `conf.buffer_size`
+    /// (`vendor/cpal/src/host/jack/device.rs`, `build_output_stream_raw` checks
+    /// the rate and the format and nothing else). So the honest request is
+    /// `Default` — a `Fixed` here would describe a negotiation that does not
+    /// happen — and the honest REPORT is the server's own number, which the
+    /// device carries as a one-value range.
+    ServerOwned,
+}
+
+impl BufferRule {
+    /// The rule for a host, by the name cpal gives it.
+    ///
+    /// Matched on the host actually in use rather than on the saved setting:
+    /// the setting can name a system this build lacks, or one whose server is
+    /// not running — `audio::build_host` falls back in both cases — and the
+    /// buffer arithmetic has to follow the real driver stack.
+    fn for_host(host_name: &str) -> Self {
+        match host_name {
+            "ASIO" => Self::Period,
+            "JACK" => Self::ServerOwned,
+            _ => Self::Ring,
+        }
+    }
+}
+
+/// What a stream will be opened with, and what to tell the user it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BufferPlan {
+    /// What cpal is actually asked for.
+    request: cpal::BufferSize,
+    /// The callback cadence, which is the number the Audio Status panel is
+    /// talking about. `None` when the device would not name a range and chose
+    /// for itself.
+    period: Option<u32>,
+    /// The ring behind the period, when the host reads the request as a ring
+    /// and the two therefore differ. `None` when they are the same number,
+    /// which is every host but WASAPI and ALSA.
+    ring: Option<u32>,
+}
+
 fn pick_buffer(
     supported: &cpal::SupportedBufferSize,
     asked: Option<u32>,
-    asio: bool,
-) -> (cpal::BufferSize, Option<u32>) {
+    rule: BufferRule,
+) -> BufferPlan {
     // The user's choice first, then the dev override, then the default. The
     // env var stays ahead of the built-in so a debugging session does not have
     // to go through the settings file, and behind the SETTING so that what the
@@ -10528,17 +10608,47 @@ fn pick_buffer(
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
     });
-    if asio {
+    if rule == BufferRule::ServerOwned {
+        // **The choice is not consulted, and that is the finding, not an
+        // omission.** Under JACK the size the user typed cannot be honoured
+        // by anybody: the server runs one period for the whole graph and a
+        // client is told what it is. Asking anyway — `Fixed(choice)` — would
+        // put a number in the request that cpal discards and the panel would
+        // then report a buffer the callback does not run at. The device's
+        // range is `{ min: server, max: server }` (`jack/device.rs` builds it
+        // from `client.buffer_size()`), so the one value in it IS the answer.
+        return match supported {
+            cpal::SupportedBufferSize::Range { min, max } if *min <= *max => BufferPlan {
+                request: cpal::BufferSize::Default,
+                period: Some(*max),
+                ring: None,
+            },
+            _ => BufferPlan {
+                request: cpal::BufferSize::Default,
+                period: None,
+                ring: None,
+            },
+        };
+    }
+    if rule == BufferRule::Period {
         return match (choice, supported) {
             (Some(v), cpal::SupportedBufferSize::Range { min, max }) if *min <= *max => {
                 let v = v.clamp(*min, *max);
-                (cpal::BufferSize::Fixed(v), Some(v))
+                BufferPlan {
+                    request: cpal::BufferSize::Fixed(v),
+                    period: Some(v),
+                    ring: None,
+                }
             }
             // No stated choice: the driver's own preferred size — the value
             // in its control panel, and the one thing every ASIO driver
             // grants without argument. The input's `Default` lands on the
             // same number, which is the equality that matters.
-            _ => (cpal::BufferSize::Default, None),
+            _ => BufferPlan {
+                request: cpal::BufferSize::Default,
+                period: None,
+                ring: None,
+            },
         };
     }
     let want = choice.unwrap_or(WANT_BUFFER_FRAMES);
@@ -10552,9 +10662,20 @@ fn pick_buffer(
             // the callback runs at and the one the Audio Status panel is
             // talking about.
             let period = (ring / BUFFER_PERIODS).max(1);
-            (cpal::BufferSize::Fixed(ring), Some(period))
+            BufferPlan {
+                request: cpal::BufferSize::Fixed(ring),
+                period: Some(period),
+                // Named only where it is a DIFFERENT number: at
+                // BUFFER_PERIODS = 1 the ring is the period and the status
+                // line would be saying it twice.
+                ring: (ring != period).then_some(ring),
+            }
         }
-        _ => (cpal::BufferSize::Default, None),
+        _ => BufferPlan {
+            request: cpal::BufferSize::Default,
+            period: None,
+            ring: None,
+        },
     }
 }
 
@@ -17160,33 +17281,94 @@ mod tests {
         // interface: "len is 2 but the index is 2", a startup crash. Under
         // ASIO the request must be the plain period, identical to the input
         // side's translation of the same setting.
-        let (size, frames) = pick_buffer(&range(16, 1024), Some(256), true);
+        let plan = pick_buffer(&range(16, 1024), Some(256), BufferRule::Period);
         assert!(
-            matches!(size, cpal::BufferSize::Fixed(256)),
-            "asio asked for {size:?}; multiplying is the crash"
+            matches!(plan.request, cpal::BufferSize::Fixed(256)),
+            "asio asked for {:?}; multiplying is the crash",
+            plan.request
         );
-        assert_eq!(frames, Some(256));
+        assert_eq!(plan.period, Some(256));
+        assert_eq!(plan.ring, None, "asio has no ring behind the period");
 
         // No stated choice: Default, the driver's own preferred size — the
         // same place the input's `None` lands, which is the equality that
         // keeps the two directions' grants identical.
-        let (size, frames) = pick_buffer(&range(16, 1024), None, true);
-        assert!(matches!(size, cpal::BufferSize::Default));
-        assert_eq!(frames, None);
+        let plan = pick_buffer(&range(16, 1024), None, BufferRule::Period);
+        assert!(matches!(plan.request, cpal::BufferSize::Default));
+        assert_eq!(plan.period, None);
 
         // A choice outside the device's range is clamped, not a build error.
-        let (size, frames) = pick_buffer(&range(64, 128), Some(256), true);
-        assert!(matches!(size, cpal::BufferSize::Fixed(128)));
-        assert_eq!(frames, Some(128));
+        let plan = pick_buffer(&range(64, 128), Some(256), BufferRule::Period);
+        assert!(matches!(plan.request, cpal::BufferSize::Fixed(128)));
+        assert_eq!(plan.period, Some(128));
+    }
+
+    /// **Under JACK the server's number wins over anything the user typed.**
+    ///
+    /// The failure this locks out is a quiet one: with the ALSA rule applied
+    /// to a JACK device, a 512-frame server and `BUFFER_PERIODS = 4` on Linux
+    /// give `ring = clamp(want * 4, 512, 512) = 512` and therefore a REPORTED
+    /// period of 128 — a number no callback ever runs at, printed in the Audio
+    /// Status panel next to a "2048 frame ring" that does not exist either.
+    /// Everything would still make sound, which is what makes it worth a test.
+    #[test]
+    fn jack_reports_the_server_period_and_asks_for_nothing() {
+        let server = |n| cpal::SupportedBufferSize::Range { min: n, max: n };
+
+        // A stated choice is not a negotiation here, so it is not sent.
+        let plan = pick_buffer(&server(512), Some(256), BufferRule::ServerOwned);
+        assert!(
+            matches!(plan.request, cpal::BufferSize::Default),
+            "asking JACK for a size describes a negotiation that does not happen; \
+             got {:?}",
+            plan.request
+        );
+        assert_eq!(
+            plan.period,
+            Some(512),
+            "the panel must report the period the callback actually runs at"
+        );
+        assert_eq!(plan.ring, None, "a JACK client has no ring of its own");
+
+        // No choice at all lands on the same answer — which is the point:
+        // the ASIO rule's `None -> (Default, None)` would leave the panel with
+        // nothing to say on the common path, since a fresh settings file has
+        // no buffer in it.
+        let plan = pick_buffer(&server(1024), None, BufferRule::ServerOwned);
+        assert!(matches!(plan.request, cpal::BufferSize::Default));
+        assert_eq!(plan.period, Some(1024));
+
+        // And a server whose size cpal could not name is still openable.
+        let plan = pick_buffer(
+            &cpal::SupportedBufferSize::Unknown,
+            Some(256),
+            BufferRule::ServerOwned,
+        );
+        assert!(matches!(plan.request, cpal::BufferSize::Default));
+        assert_eq!(plan.period, None);
+    }
+
+    /// The rule follows the host's name, and the default is the safe one.
+    #[test]
+    fn every_host_gets_the_rule_its_fixed_request_means() {
+        assert_eq!(BufferRule::for_host("ASIO"), BufferRule::Period);
+        assert_eq!(BufferRule::for_host("JACK"), BufferRule::ServerOwned);
+        assert_eq!(BufferRule::for_host("ALSA"), BufferRule::Ring);
+        assert_eq!(BufferRule::for_host("WASAPI"), BufferRule::Ring);
+        assert_eq!(BufferRule::for_host("CoreAudio"), BufferRule::Ring);
+        // An unknown host is treated as the majority case rather than as a
+        // special one: `Ring` at BUFFER_PERIODS = 1 (every platform but Linux)
+        // is the plain `Fixed(want)` that any host understands.
+        assert_eq!(BufferRule::for_host("something new"), BufferRule::Ring);
     }
 
     #[test]
     fn a_device_that_will_not_say_what_buffer_sizes_it_takes_gets_its_own_choice() {
         // `BufferSize::Fixed` outside the supported range is a build error, not
         // a clamp, so guessing is worse than deferring.
-        let (size, frames) = pick_buffer(&cpal::SupportedBufferSize::Unknown, None, false);
-        assert!(matches!(size, cpal::BufferSize::Default));
-        assert_eq!(frames, None);
+        let plan = pick_buffer(&cpal::SupportedBufferSize::Unknown, None, BufferRule::Ring);
+        assert!(matches!(plan.request, cpal::BufferSize::Default));
+        assert_eq!(plan.period, None);
         // **The RING is what is asked for and the PERIOD is what is
         // reported**, and on Linux those differ by four — see
         // `BUFFER_PERIODS`. Written in terms of the constant rather than in
@@ -17199,24 +17381,34 @@ mod tests {
         };
 
         // Roomy device: the ring is the wanted period times the count.
-        let (size, frames) = pick_buffer(&range(16, 8192), Some(256), false);
-        assert_eq!(ring_of(size), 256 * BUFFER_PERIODS);
-        assert_eq!(frames, Some(256), "the period is not what was asked for");
+        let plan = pick_buffer(&range(16, 8192), Some(256), BufferRule::Ring);
+        assert_eq!(ring_of(plan.request), 256 * BUFFER_PERIODS);
+        assert_eq!(plan.period, Some(256), "the period is not what was asked for");
 
         // Clamped up to the minimum, and the period follows the ring.
-        let (size, frames) = pick_buffer(&range(4096, 8192), Some(256), false);
-        assert_eq!(ring_of(size), 4096);
-        assert_eq!(frames, Some(4096 / BUFFER_PERIODS));
+        let plan = pick_buffer(&range(4096, 8192), Some(256), BufferRule::Ring);
+        assert_eq!(ring_of(plan.request), 4096);
+        assert_eq!(plan.period, Some(4096 / BUFFER_PERIODS));
 
         // And down to the maximum.
-        let (size, frames) = pick_buffer(&range(16, 64), Some(256), false);
-        assert_eq!(ring_of(size), 64);
-        assert_eq!(frames, Some(64 / BUFFER_PERIODS));
+        let plan = pick_buffer(&range(16, 64), Some(256), BufferRule::Ring);
+        assert_eq!(ring_of(plan.request), 64);
+        assert_eq!(plan.period, Some(64 / BUFFER_PERIODS));
 
         // A period is never reported as zero, whatever the device says: it is
         // divided into and displayed.
-        let (_, frames) = pick_buffer(&range(1, 2), Some(1), false);
-        assert!(frames.is_some_and(|f| f >= 1));
+        let plan = pick_buffer(&range(1, 2), Some(1), BufferRule::Ring);
+        assert!(plan.period.is_some_and(|f| f >= 1));
+
+        // The ring is named only when it is a different number from the
+        // period — which on a one-period platform it never is, so the status
+        // line does not say everything twice there.
+        let plan = pick_buffer(&range(16, 8192), Some(256), BufferRule::Ring);
+        if BUFFER_PERIODS > 1 {
+            assert_eq!(plan.ring, Some(256 * BUFFER_PERIODS));
+        } else {
+            assert_eq!(plan.ring, None);
+        }
     }
 
     // ── with a real device and a real plugin ───────────────────────────────

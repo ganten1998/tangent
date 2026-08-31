@@ -206,10 +206,12 @@ pub trait CaptureDevices: Send {
 pub trait AudioSetup: Send {
     /// Every audio system this build can open, in the backend's own order.
     ///
-    /// Usually one. cpal compiles in exactly one host per platform unless a
-    /// cargo feature asks for more, and both of the extras — JACK and ASIO —
-    /// need a development library present when the release is BUILT. Listed
-    /// from the real enumeration anyway, so the panel says what this build has.
+    /// One on macOS and Windows; two on Linux and FreeBSD, where JACK is
+    /// compiled in beside ALSA. (It costs those artifacts no dependency:
+    /// libjack is `dlopen`ed on demand. ASIO is the one extra that genuinely
+    /// needs a library present when the release is BUILT, which is why it is
+    /// still behind a cargo feature.) Listed from the real enumeration either
+    /// way, so the panel says what this build has rather than what was hoped.
     fn systems(&self) -> Vec<String>;
 
     /// The rates the input device now selected will actually open at.

@@ -10,6 +10,58 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ## [Unreleased]
 
+### Added
+
+- **JACK on Linux**, beside ALSA, in the Audio Setup panel's SYSTEM row — the
+  row that has been a readout on every Linux build until now. Choosing it makes
+  Tangent an ordinary client of the graph, named `Tangent`, so its ports appear
+  in qjackctl, Carla or Patchance and can be patched into a DAW. It works
+  against real jackd and against PipeWire's JACK layer equally, which is what
+  nearly every desktop Linux is running.
+
+  **It is offered for the routing, not for the latency.** The expectation was
+  the opposite — a JACK client skips pipewire-alsa and the four-period ring
+  `BUFFER_PERIODS` had to add for it — and the measurement did not support it:
+  capture to playback through the monitor ring came out at 23.4 ms against
+  ALSA's 5.6 ms on the dev box. `docs/LINUX-JACK-FINDINGS.md` has the runs and
+  shows why neither figure means what it looks like, the short version being
+  that pipewire-alsa reports a PCM delay of zero (so the ALSA number omits the
+  output leg entirely) and cpal opens two independent JACK clients rather than
+  one duplex client (so the JACK number carries a whole extra graph cycle).
+  Settling it needs `rtclick` on a wired loopback. Until then, JACK is the
+  right answer for being patchable into a session and the wrong one for a
+  smaller number.
+
+  What it does fix outright is **which interface you record.** Through ALSA on
+  a PipeWire machine there is one openable device, called `pipewire`, and it
+  follows whatever the desktop's default source happens to be — the fault that
+  once recorded a laptop microphone with an interface plugged in. Through JACK
+  the ports carry the interface's real name.
+
+  **It costs the artifact nothing.** libjack is `dlopen`ed on demand rather than
+  linked, so `readelf -d` on the Linux binary gains no entry and a desktop with
+  no pro-audio stack installed runs exactly what it ran before. No new crate
+  enters the dependency graph either — `jack` was already there for the FreeBSD
+  build. Choosing JACK on a machine where no server answers falls back to ALSA
+  rather than leaving the app silent.
+
+### Fixed
+
+- **The Audio Status line no longer names a ring that does not exist.** The
+  period and the ring were derived from `BUFFER_PERIODS`, a per-PLATFORM
+  constant, where they are really a property of the HOST in use — so a Linux
+  build had one number for two driver stacks. Under JACK that would have
+  reported a 128-frame period for a 512-frame callback, next to a 2048-frame
+  ring belonging to nobody. `BufferRule` now carries the distinction from the
+  open, where the real host is known.
+- **Under JACK the input picker no longer offers devices it cannot open.** The
+  PipeWire node list is a workaround for cpal's ALSA host, and it REPLACES
+  cpal's own list rather than joining it — so through JACK, where there is no
+  `pipewire` PCM to aim, every row in the picker would have failed to open and
+  the one that works would have been hidden behind them. A saved `pw:` choice
+  from an earlier ALSA session falls back to the host's default instead of
+  resolving to nothing.
+
 ## [4.5.0] - 2026-08-18
 
 Tangent makes a sound out of the box, and you can hear what you are looking at.
