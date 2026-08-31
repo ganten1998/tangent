@@ -299,6 +299,13 @@ struct Recorder {
     /// `reconcile_audio` will settle to "missing" and say so.
     rate_open: Option<u32>,
     system_open: Option<String>,
+    /// The graph's floor, refreshed on the same edge that reopens the streams.
+    ///
+    /// Cached because reading it costs a process (`pw-metadata`), and a panel
+    /// that spawned one every frame would be a worse bug than the one this
+    /// fixes. The edge is the right moment anyway: the floor only matters when
+    /// a buffer is being asked for.
+    graph_floor: Option<u32>,
     /// The last finished take this host has already accounted for.
     ///
     /// Updated whether or not "Show when done" is ticked, which is the point:
@@ -1665,6 +1672,13 @@ impl DesktopApp {
                 .as_ref()
                 .filter(|_| self.app.input_monitor())
                 .map(crate::instrument::Engine::monitor_backlog_ms),
+            // **Read every frame, and cheaply.** `graph_clock` shells to
+            // `pw-metadata` on Linux and answers `None` everywhere else, so
+            // this is a process spawn per frame and that is too much — it is
+            // cached in `Recorder::graph_floor` and refreshed on the same edge
+            // that reopens the streams, which is the only moment it can have
+            // changed for a reason this app cares about.
+            graph_floor: self.recorder.graph_floor,
         });
 
         // The buffer size, on the edge. Reopening both streams is expensive —
@@ -1777,6 +1791,11 @@ impl DesktopApp {
             self.recorder.buffer_open = want_buffer;
             self.recorder.rate_open = want_rate;
             self.recorder.system_open = want_system.clone();
+            // The graph may have been reconfigured since the last open — by
+            // the user editing PipeWire's config to fix exactly what this
+            // reports, which is the case worth getting right.
+            self.recorder.graph_floor =
+                tangent_record::audio::graph_clock().map(|g| g.floor());
             // The system FIRST, and before anything is opened: every device
             // lookup in `tangent_record::audio` goes through it, so setting it
             // after the streams were built would open them on the old stack and
@@ -7184,6 +7203,7 @@ impl DesktopApp {
                 buffer_open: app.buffer_frames(),
                 rate_open: app.sample_rate(),
                 system_open: app.audio_system(),
+                graph_floor: tangent_record::audio::graph_clock().map(|g| g.floor()),
                 seen_take: None,
                 dev_editor_done: false,
             }
