@@ -299,6 +299,8 @@ struct Recorder {
     /// `reconcile_audio` will settle to "missing" and say so.
     rate_open: Option<u32>,
     system_open: Option<String>,
+    /// Dropouts already reported, so only the new ones are announced.
+    xruns_seen: u64,
     /// The graph's floor, refreshed on the same edge that reopens the streams.
     ///
     /// Cached because reading it costs a process (`pw-metadata`), and a panel
@@ -1696,6 +1698,29 @@ impl DesktopApp {
         if let Some(engine) = self.recorder.engine.as_ref() {
             let fault = engine.fault();
             let (running, callbacks) = engine.health();
+            // **The dropout counter, actually read.**
+            //
+            // `Engine::xruns` exists because the ALSA backend used to swallow
+            // underruns entirely (`vendor/cpal/src/host/alsa/mod.rs`), so a
+            // glitch was audible in the room and invisible to the program. It
+            // was then counted and READ BY NOTHING, which is the same failure
+            // one step later: a number nobody looks at is not instrumentation.
+            //
+            // Logged on the edge rather than per frame, and at warn level,
+            // because this is the line somebody grepping a log after "it
+            // crackled" needs to find. It is also the only place the two
+            // buffer settings can be told apart by anything other than an ear.
+            let xruns = engine.xruns();
+            if xruns > self.recorder.xruns_seen {
+                log::warn!(
+                    "audio dropouts: {} since this stream opened (+{} just now) - \
+                     the backend recovered each one, and each is a gap in what \
+                     was heard and recorded",
+                    xruns,
+                    xruns - self.recorder.xruns_seen,
+                );
+                self.recorder.xruns_seen = xruns;
+            }
             let stalled =
                 self.recorder
                     .engine_watch
@@ -1796,6 +1821,9 @@ impl DesktopApp {
             // reports, which is the case worth getting right.
             self.recorder.graph_floor =
                 tangent_record::audio::graph_clock().map(|g| g.floor());
+            // A new stream has a new counter; keeping the old high-water mark
+            // would hide every dropout the next one has until it beat the last.
+            self.recorder.xruns_seen = 0;
             // The system FIRST, and before anything is opened: every device
             // lookup in `tangent_record::audio` goes through it, so setting it
             // after the streams were built would open them on the old stack and
@@ -7203,6 +7231,7 @@ impl DesktopApp {
                 buffer_open: app.buffer_frames(),
                 rate_open: app.sample_rate(),
                 system_open: app.audio_system(),
+                xruns_seen: 0,
                 graph_floor: tangent_record::audio::graph_clock().map(|g| g.floor()),
                 seen_take: None,
                 dev_editor_done: false,

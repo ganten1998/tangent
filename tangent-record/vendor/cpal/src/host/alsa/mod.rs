@@ -604,7 +604,31 @@ fn input_stream_worker(
                 continue;
             }
             PollDescriptorsFlow::XRun => {
-                if let Err(err) = stream.channel.prepare() {
+                // **PATCH: the xrun itself is reported, not only a failure to
+                // recover from it. See `tangent-record/vendor/README.md`.**
+                //
+                // This is the arm underruns actually arrive through —
+                // `snd_pcm_avail` returns EPIPE, the stream is prepared again
+                // and the loop carries on — and upstream reported nothing
+                // unless the RECOVERY failed. So the normal case, the one that
+                // happens whenever a machine is too slow for the buffer it was
+                // given, was silent by construction.
+                //
+                // Measured cost of that silence: a Linux user at a 64-frame
+                // buffer described the output as "total noise" while the
+                // application's own dropout counter read zero, because nothing
+                // in this file had ever told it otherwise.
+                let recovered = stream.channel.prepare();
+                error_callback(
+                    BackendSpecificError {
+                        description: format!(
+                            "xrun: buffer under or overrun, {}",
+                            if recovered.is_ok() { "recovered" } else { "not recovered" }
+                        ),
+                    }
+                    .into(),
+                );
+                if let Err(err) = recovered {
                     error_callback(err.into());
                 }
                 continue;
@@ -655,7 +679,31 @@ fn output_stream_worker(
         match flow {
             PollDescriptorsFlow::Continue => continue,
             PollDescriptorsFlow::XRun => {
-                if let Err(err) = stream.channel.prepare() {
+                // **PATCH: the xrun itself is reported, not only a failure to
+                // recover from it. See `tangent-record/vendor/README.md`.**
+                //
+                // This is the arm underruns actually arrive through —
+                // `snd_pcm_avail` returns EPIPE, the stream is prepared again
+                // and the loop carries on — and upstream reported nothing
+                // unless the RECOVERY failed. So the normal case, the one that
+                // happens whenever a machine is too slow for the buffer it was
+                // given, was silent by construction.
+                //
+                // Measured cost of that silence: a Linux user at a 64-frame
+                // buffer described the output as "total noise" while the
+                // application's own dropout counter read zero, because nothing
+                // in this file had ever told it otherwise.
+                let recovered = stream.channel.prepare();
+                error_callback(
+                    BackendSpecificError {
+                        description: format!(
+                            "xrun: buffer under or overrun, {}",
+                            if recovered.is_ok() { "recovered" } else { "not recovered" }
+                        ),
+                    }
+                    .into(),
+                );
+                if let Err(err) = recovered {
                     error_callback(err.into());
                 }
                 continue;

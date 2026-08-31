@@ -224,6 +224,21 @@ It now reports through `BackendSpecific`, the only channel cpal has. Recovery is
 attempted first and the stream continues either way, exactly as before — the
 behaviour is unchanged, the silence is not.
 
+**There are THREE such sites and the obvious one is the least important.** The
+`writei` arm above is where an underrun is easiest to see when reading the
+file, and it is not where they arrive. The two that matter are the
+`PollDescriptorsFlow::XRun` arms — one per direction — reached when
+`snd_pcm_avail` returns `EPIPE`; upstream prepares the stream again, continues,
+and reports **only if the recovery itself failed**. So the normal case, the one
+that happens whenever a machine cannot keep up with the buffer it was given,
+was silent by construction.
+
+That distinction was not free. Patching only the `writei` arm produced an
+application whose dropout counter read **zero** while its user described the
+output at a 64-frame buffer as "total noise" — an instrument that looked like
+it worked, agreed with a broken theory, and would have been believed. All
+three arms report now.
+
 **This has a sharp edge worth naming.** A host that treats any stream error as a
 dead device will now rebuild on a click, which is worse than the click. That is
 not hypothetical — it is what cpal's JACK backend already does to this app by
