@@ -1,339 +1,283 @@
-# Ivory — Release Checklist & Business Notes
+# Tangent Release Checklist
 
-This is the business/operational side of shipping Ivory 2.x. Technical design
-is in `DESIGN.md`; historical CI war stories are in `spec/product-docs.md` §3.
+The operational side of shipping Tangent. Technical design is in `DESIGN.md`;
+historical CI war stories are in `spec/product-docs.md` §3. This file describes
+what the scripts in `scripts/` actually do; when they change, change this.
 
-## Store links: check them, then swap them
+## The version policy, enforced by `release.sh`
 
-`scripts/check-store-links.sh` fetches every `releases/latest/download/` URL in
-`README.md`, `docs/STORE-CONTENT.md` and `tools/tangent-fulfil/src/main.rs`. They
-resolve by EXACT asset name against whatever release is currently latest, so a
-new name 404s until it has shipped.
+`main` carries `X.Y.Z-dev`. Only a deliberate release writes a real version,
+and `scripts/release.sh` makes that structural rather than a thing to
+remember. It refuses, with `exit 2`, when:
 
-Everything on `main` points at assets that exist. The 3.0.0 installer links
-(`Tangent-macos.pkg`, `Tangent-windows-setup.exe`) are BETTER links and take
-over at release time, not before — the swap is written out in
-`docs/STORE-CONTENT.md`. Order:
+1. **The version is the placeholder.** A build on main cannot claim a number,
+   because `-dev` is not a number.
+2. **No tag `v<version>` exists.** A release is a thing you can go back to; an
+   artifact built from an untagged commit is a thing you cannot. Tag first,
+   build second.
+3. **`CHANGELOG.md` has no heading for the version.** `publish-github.sh`
+   already refuses to publish without release notes; failing here means
+   finding that out before the build rather than after it.
+4. **A pre-release is past `rc.3`.** Pre-releases are `rc.N` now. Needing a
+   fourth candidate means the freeze was not a freeze; fix, do not cut.
+   (`-beta`/`-alpha` predate the policy and only draw a note.)
 
-1. `scripts/publish-github.sh` (assets exist)
-2. `scripts/check-store-links.sh` (still green)
-3. swap the two links in `STORE-CONTENT.md` and `tools/tangent-fulfil`
-4. `scripts/check-store-links.sh` again (now green with the new names)
-5. paste the store block, deploy fulfil, send the announcement
-
-This has gone wrong twice, both times by getting ahead of step 1: the key email
-was once redeployed before its assets and 404'd for ten minutes, and the 3.0.0
-installer names were once written into the store content while 2.3.0 was still
-latest. Both times the text was right and the release was not.
+Why this exists: six version numbers were burnt in a single day, beta.10
+through beta.15, none tagged, none released, several bumped inline inside a
+build command. Nothing leaked; the burn was simply invisible until somebody
+counted. Do not rewrite history to tidy burnt numbers away.
 
 ## Hard gates before any public release
 
-1. **Icon — informational, NOT a gate** (kept in this list so nobody re-files
-   it as one). `assets/tangent.png` is the historical 543-byte, 128x128 art —
-   verified 2026-08-04 to be **byte-identical to the Python app's**
-   `icons/ivory.png` (sha256 `0dc37a25…`), i.e. the original piano-keys icon,
-   which the owner wants kept. It was mislabelled a "placeholder" in earlier
-   docs. Not a hard gate — but it is small, so icons scale up soft (a
-   nearest-neighbour 8× re-render to 1024px would keep the art exactly and
-   sharpen every frame). If a crisper icon is
-   ever wanted, drop a **1024x1024+** PNG at that path and rerun
-   `scripts/build-macos.sh` / `scripts/build-cross.sh` (the `.ico`/`.icns` are
-   regenerated automatically; `build.rs` embeds the `.ico` into `ivory.exe`).
-   The scripts print a size warning while the small art is in place — expected.
-2. **Trademark decision.** "Ivory" collides with **Synthogy Ivory**, a
-   well-known commercial piano VST — the same musicians-with-MIDI-keyboards
-   market this app targets. Distributing a free hobby tool under the name is
-   low-risk; *charging money* under it invites a dispute Synthogy would win on
-   seniority in music software. Before turning on payments, decide: rename,
-   add a qualifier, or knowingly accept the risk. Avoid marketing copy that
-   pairs "Ivory" with "piano" in ways that suggest the VST.
-3. **Test suite green.** `cargo test --workspace` alone is NOT this gate — it
-   misses two things:
-   - `differential::full` (the 13,133-row golden sweep) is `#[ignore]`d, so
-     `--workspace` runs only `differential::fast_subset`, the first 1500 rows.
-   - `--workspace` unifies features, so `tangent-core` is always compiled WITH
-     `learning`; the stock engine path is never exercised.
-
-   All three must be green:
+1. **Test suite green.** `cargo test --workspace` alone is NOT this gate. It
+   misses two things: the full differential sweep is `#[ignore]`d, and
+   `--workspace` unifies features so `tangent-core` is always compiled WITH
+   `learning`, leaving the stock engine path unexercised. All three must pass:
 
    ```sh
-   cargo test --workspace                                     # 14 GUI + 59 engine + 3 acceptance + 10 learning + differential(fast)
-   cargo test -p tangent-core                                   # stock engine, no learning: 55 unit + 3 acceptance + differential(fast)
-   cargo test -p tangent-core --test differential -- --ignored   # full 13,133-row golden sweep (~16 s)
+   cargo test --workspace
+   cargo test -p tangent-core                                    # stock engine, no learning
+   cargo test -p tangent-core --test differential -- --ignored   # full golden sweep
    ```
 
    `tangent-core/tests/blast_radius.rs` is `#[ignore]`d too, but it is a
-   measurement rather than a gate — run it only when the learning re-ranker
-   changed: `cargo test -p tangent-core --features learning --test blast_radius
-   --release -- --ignored --nocapture`.
-4. **THIRD-PARTY-LICENSES current.** Regenerate after any dependency change:
-   `scripts/gen-third-party-licenses.sh`.
+   measurement rather than a gate; run it only when the learning re-ranker
+   changed.
 
-## Code signing & install friction
+   This gate is now ENFORCED: `release.sh` runs `scripts/check.sh` (exactly
+   the three commands above plus the clippy lint policy) and refuses to cut
+   a release on any failure. The checklist entry remains so a human knows
+   what the refusal means.
 
-### macOS — the practical blocker
+2. **THIRD-PARTY-LICENSES current.** Regenerate after any dependency change:
+   `scripts/gen-third-party-licenses.sh`. This gate has been skipped before
+   and the file has drifted badly for it; run it, do not eyeball it. Also
+   ENFORCED now: `release.sh` regenerates and byte-diffs the file, refusing
+   on drift.
 
-Release builds are **ad-hoc signed only** (`codesign --force --deep -s -`,
-done unconditionally by `build-macos.sh` — an unsigned binary is killed
-outright on Apple Silicon). Ad-hoc is not enough for strangers:
+3. **The name is Tangent everywhere a buyer looks.** The old trademark gate
+   here was about "Ivory" colliding with Synthogy Ivory; the 2.3.0 rename
+   retired that collision, and reviving the old name in copy is the only way
+   to get it back. New marketing text, release notes and store edits say
+   Tangent. The Gumroad short link `/l/ivory` and the legacy `Ivory-*` asset
+   aliases are deliberate survivals (published links must keep resolving) and
+   are not an invitation to write the word anywhere new.
 
-- Gatekeeper blocks the first launch of any downloaded, un-notarized app.
-- **macOS 15 (Sequoia) and later removed the right-click → Open bypass.**
-  Users must attempt the launch, then System Settings → Privacy & Security →
-  "Open Anyway", then confirm again. Most non-technical users give up before
-  step two. This is the #1 documented support issue from the Python era.
-- Fix: Apple Developer Program (**$99/year**) → Developer ID Application
-  certificate → sign → `notarytool submit` → staple. Decide before promoting
-  Ivory anywhere strangers will download it. Until then, README carries the
-  Open-Anyway instructions and the zip stays the primary artifact (DMG is
-  best-effort).
+4. **Store links resolve.** See the last section; the check is
+   `scripts/check-store-links.sh` and the rule is publish, check, paste,
+   deploy, never edit links in anticipation.
 
-### Windows
+## Code signing
 
-Unsigned exes trip **SmartScreen** ("Windows protected your PC" → More info →
-Run anyway) and occasionally Defender heuristics. Reputation accrues slowly to
-an unsigned binary and resets on every release. A native Rust exe is far less
-AV-prone than the old PyInstaller onefile bundles were.
+### macOS: signed, notarized, and enforced
 
-**Signing landscape — checked 2026-08-11. None of this is verifiable from this
-repo; it is external, it moves, re-confirm before spending money.**
+`scripts/build-macos.sh` signs with the first installed **Developer ID
+Application** certificate (override with `TANGENT_SIGN_ID`), hardened runtime
+and entitlements included, then notarizes via `notarytool` (keychain profile
+`tangent-notary`, override with `TANGENT_NOTARY_PROFILE`) and staples the
+ticket, so a first launch works with no network and no Gatekeeper prompt.
 
-- **EV no longer buys instant reputation.** Microsoft changed how SmartScreen
-  treats EV code-signing certificates in **March 2024**. EV- and OV-signed
-  builds now both have to accrue reputation like anything else. Do not buy EV
-  expecting the warning to vanish on day one — that advice is pre-2024, and it
-  is the single most common stale claim in signing write-ups (this document
-  carried it until 2026-08-11).
-- **Hardware is mandatory for OV too, not just EV.** Since **1 June 2023** the
-  CA/Browser Forum requires code-signing private keys to be generated and held
-  in a FIPS 140-2 Level 2 / Common Criteria EAL4+ crypto module — a CA-shipped
-  USB token, an HSM, or a CA-hosted signing service. There is no "PFX on the
-  laptop" option any more, so a cert purchase now implies token logistics.
-  Retail OV is roughly **$200–400/yr**, and certificate lifetimes were capped
-  at about one year in early 2026.
-- **The cheap path is Microsoft's own service:** Azure **Trusted Signing**,
-  renamed **Azure Artifact Signing** in 2026. Basic tier is about **$9.99/month**
-  for up to 5,000 signatures; keys live in Microsoft's HSMs, so there is no
-  token to buy, ship, or lose, and it drives `signtool` / CI directly.
-  **Eligibility is the catch and it has changed repeatedly** — it has been
-  restricted to US/Canada entities with at least three years of verifiable
-  history, and individual-developer onboarding (opened Nov 2024) has been
-  paused at least once. A solo author may or may not qualify on any given day:
-  check <https://azure.microsoft.com/en-us/products/artifact-signing> and the
-  Microsoft Learn docs BEFORE planning around it.
+The script **refuses to package** a signed build that carries no notarization
+ticket; the check is `stapler validate` on the bundle, not the exit status of
+the steps, so it catches every path to an unnotarized artifact. The escape
+hatch is `TANGENT_ALLOW_UNNOTARIZED=1` and it is loud. With no certificate
+installed the build falls back to ad-hoc for local use and says, correctly,
+do not publish it.
 
-Recommendation unchanged: ship unsigned initially, keep the SmartScreen steps
-in the README and in the shipped `README.txt`, and revisit if download volume
-grows. If signing does become worth it, price Artifact Signing first — the
-hardware mandate makes a retail cert materially more annoying than it was in
-2022.
-
-**The plumbing is already in place** (`sign_windows_exe` in
-`scripts/build-cross.sh`). It uses **jsign**, not `signtool`: signtool is
-Windows-only, and Ivory's Windows binary is cross-built from macOS, so signtool
-would force a Windows VM or CI runner into the release path. jsign runs on
-macOS/Linux and talks to Artifact Signing directly — the build machine never
-holds a certificate; it sends the file hash and Microsoft's HSM returns the
-signature.
-
-To turn it on:
+Create the notary profile once with:
 
 ```sh
-brew install jsign          # needs a JRE
-brew install azure-cli      # only for the default token path; then: az login
-export TRUSTED_SIGNING_ENDPOINT=https://eus.codesigning.azure.net   # your region
-export TRUSTED_SIGNING_ACCOUNT=<account>
-export TRUSTED_SIGNING_PROFILE=<certificate-profile>
-scripts/build-cross.sh      # or scripts/release.sh
+xcrun notarytool store-credentials "tangent-notary" \
+  --apple-id <id> --team-id <team> --password <app-specific-password>
 ```
 
-With none of those set the exe ships unsigned exactly as before, and the build
-says so once. With *some* of them set the build **fails** rather than quietly
-producing an unsigned binary you believe is signed. A token may be supplied
-directly as `TRUSTED_SIGNING_TOKEN` (e.g. a CI federated credential) instead of
-via `az`. Signatures are RFC-3161 timestamped so they outlive the short-lived
-certificate. `osslsigncode`, if installed, prints a local verification — but the
-real proof is a first launch on a real Windows machine.
+The `.pkg` is signed separately by `build-installer.sh` with a **Developer ID
+Installer** certificate; `release.sh` fails an unsigned pkg at check time.
 
-### Linux
+### Windows: the inner exe can be signed, the installer is not yet
 
-No signing story required. tar.gz now; `.deb` (with a proper
-`/usr/share/doc/tangent/copyright` folding MIT + OFL) once the tar.gz path is
-proven.
+`sign_windows_exe` in `build-cross.sh` Authenticode-signs `tangent.exe` via
+**jsign** against Azure Artifact Signing (signtool is Windows-only and this
+binary is cross-built from macOS). With none of
+`TRUSTED_SIGNING_ENDPOINT` / `TRUSTED_SIGNING_ACCOUNT` /
+`TRUSTED_SIGNING_PROFILE` set, the exe ships unsigned and the build says so
+once; with only some of them set the build **fails** rather than quietly
+shipping an unsigned binary you believe is signed. A token can be supplied
+directly as `TRUSTED_SIGNING_TOKEN`.
 
-**Cross-build blocker (verified 2026-07-29):** `midir` links **ALSA** on Linux,
-and `alsa-sys`'s build script cannot cross-compile from macOS — pkg-config has
-no ALSA sysroot for the Linux target (`cargo zigbuild` fails on `alsa-sys`).
-macOS (native) and Windows (`cargo xwin`, no ALSA) both cross/native-build fine
-from this Mac; only Linux is affected. Fix options, pick one before shipping
-Linux:
-1. **Build Linux on Linux** — a GitHub Actions / Codeberg CI job on
-   `ubuntu-latest` with `libasound2-dev` installed (simplest; recommended, and
-   matches the deferred-CI plan below).
-2. Install an ALSA sysroot for the target and export `PKG_CONFIG_SYSROOT_DIR` +
-   `PKG_CONFIG_PATH` + `PKG_CONFIG_ALLOW_CROSS=1` before `build-cross.sh`.
-3. A prebuilt cross toolchain that bundles ALSA headers (e.g. a `cross` Docker
-   image with `libasound2-dev`).
+Known gap: the `setup.exe` NSIS wrapper itself is not signed by any script
+yet, so SmartScreen ("Windows protected your PC", More info, Run anyway) is
+still the first-launch experience and must stay in the release notes and the
+README until that changes.
 
-**JACK adds nothing to that list, and this is worth stating so nobody adds it.**
-The Linux build offers JACK (`cpal`'s `jack` feature, see
-`tangent-record/Cargo.toml`), and it needs **no libjack, no headers and no
-second sysroot** on the build machine — nor on the user's. `jack` 0.13 enables
-`dynamic_loading` by default, so libjack is `dlopen`ed on first use. The one
-thing that would have broken that is patched out in
-`tangent-record/vendor/jack-sys`: upstream's build script probed pkg-config on
-Linux regardless and emitted a link directive, which would both have required
-the development files here and put `libjack.so.0` in the artifact's
-`DT_NEEDED` — a binary that refuses to start on a desktop without JACK
-installed. Check it the way it was checked:
+### Linux: no signing, but a dependency contract
 
-```sh
-readelf -d dist/.../tangent | grep NEEDED   # no libjack.so.0, ever
-```
+No signature story is required. What is enforced instead is `DT_NEEDED`:
+`scripts/check-linux-deps.sh` refuses any Linux binary that asks the loader
+for a library the shared allowlist does not declare. The allowlist is one
+file used by both packaging paths, deliberately, because two copies would
+disagree the first time somebody edited one. The 5.0 betas shipped a binary
+that silently required `liblilv-0.so.0` and did not start on stock Ubuntu
+GNOME; this check is why that class of failure cannot recur unnoticed.
 
-If that line ever shows libjack, the vendored patch has been lost and the
-artifact is broken for every user without a pro-audio stack.
-`scripts/build-cross.sh` still produces the Windows zip; its Linux stage will
-fail loudly until one of the above is in place.
+## Artifacts and naming
 
-**Fixed 2026-08-04:** that stage used to fail *silently*. `package_linux` is
-called as `package_linux … || handler`, and bash suppresses `set -e` inside the
-left operand of `||`, so the failed `cargo zigbuild` fell through to `tar` and
-emitted an 85 KB `ivory-<v>-linux-<arch>.tar.gz` containing fonts and licences
-but **no binary** — an artifact that looks releasable. Each step is now checked
-explicitly and a failure leaves no archive behind. If you ever see a Linux
-tarball under ~1 MB, it is empty: check it with `tar -tzvf` before uploading.
+Built into `dist/`; the version is read from the root `Cargo.toml`
+(`[workspace.package] version`).
 
-## Licensing & pay-what-you-can
+| Artifact | Name | Built by |
+|---|---|---|
+| macOS installer | `Tangent-<v>-macos.pkg` | `build-installer.sh macos` |
+| macOS app zip (primary) | `Tangent-<v>-macos-universal.zip` | `build-macos.sh` |
+| macOS DMG (best-effort) | `Tangent-<v>-macos-universal.dmg` | `build-macos.sh` |
+| Windows installer | `Tangent-<v>-windows-setup.exe` | `build-cross.sh` (needs `makensis`) |
+| Linux x86_64 | `tangent-<v>-linux-x86_64.tar.gz` | `build-cross.sh` |
+| Linux aarch64 | `tangent-<v>-linux-aarch64.tar.gz` | `build-cross.sh` |
+| Checksums | `SHA256SUMS` | `release.sh` |
 
-- **MIT retention.** The Python releases (through 1.1.0) are public under MIT,
-  and 2.0 keeps MIT for continuity (`LICENSE`, Copyright 2025-2026 Ganten).
-  Implication: anyone may legally rebuild, fork, and redistribute Ivory for
-  free, forever. Pay-what-you-can therefore sells **convenience and
-  goodwill** (prebuilt, signed artifacts; support; the name) — not exclusivity.
-  Do not promise otherwise in marketing. Relicensing later only binds new
-  versions; it cannot recall what's already shipped under MIT.
-- **Fonts.** Courier Prime is OFL 1.1: bundling with sold software is
-  explicitly permitted at any price point, but every artifact must carry
-  `OFL.txt` (all three build outputs do), the fonts may never be sold
-  standalone, and modified/subset fonts would need renaming. **Never ship
-  Courier New files** — referencing the name in a fallback is fine;
-  redistributing Monotype's font software is not. See
-  `spec/font-licensing.md`.
-- **Fonts, part 2 — the egui defaults.** `eframe`'s `default_fonts` feature
-  (enabled in `tangent/Cargo.toml`) statically embeds FOUR more fonts in the
-  binary via `epaint_default_fonts`: **Ubuntu Light** (Ubuntu Font Licence
-  1.0), **Noto Emoji** (OFL 1.1), **Hack** (MIT + Bitstream Vera), and
-  **emoji-icon-font** (MIT). `lto` + `strip` do NOT remove them — all four are
-  byte-for-byte present in `target/release/ivory`. Every artifact must
-  therefore carry `font-licenses/` (all three build scripts do). Note that
-  epaint's own `OFL.txt`/`UFL.txt` contain no copyright line, so the copyright
-  notices those licences require live in `THIRD-PARTY-LICENSES` and
-  `assets/font-licenses/NOTICE.txt`. **Do not turn `default_fonts` off** — the
-  context-menu submenu arrow `⏵` (U+23F5, `menu.rs`) exists in *none* of the
-  other five fonts.
+Notes on the set:
 
-## Settings one-way caveat (release-notes item)
+- **macOS is universal by default** (`ARCH=host` for a quick local build).
+- **The Windows portable zip is a transient installer input, not a
+  deliverable.** `build-cross.sh` builds it, `build-installer.sh` unzips
+  exactly it into the NSIS payload, and then it is deleted. The owner ships
+  Windows as the setup.exe alone. If `makensis` is missing the zip is kept
+  rather than shipping nothing, with a loud warning that the deliverable was
+  not produced.
+- **The VST3 plugin is retired** (2026-08-24, the owner's ruling). No
+  installer may carry a `Tangent.vst3`; `release.sh` fails any that does.
+- **The pkg is not yet in `release.sh`'s build path.** Run
+  `scripts/build-installer.sh macos` yourself after `build-macos.sh`, before
+  checksums. The supporter email hands out the pkg permalink, so a release
+  published without a fresh pkg breaks that link.
+- **FreeBSD** builds via `scripts/build-freebsd.sh` on a FreeBSD host, but is
+  outside the checksum and upload globs; whether its package ships with a
+  release is still an open decision.
 
-2.0 reads Python 1.1.0's `~/.config/tangent/settings.json` in place — upgrade
-is seamless. **Downgrading back to Python 1.1.0 rewrites the file with its
-fixed key set**, discarding `custom_font_path` and any unknown keys. Taught
-chords (`overrides.json`) are untouched by Python. State this in the release
-notes for the **first public 2.x release** — nothing in the 2.x line has
-shipped yet (newest tags are the Python-era `v1.0.0` / `v1.1`), so this caveat
-lands with 2.1.0 or whatever version goes out first.
+Every archive contains `README.txt` (generated from `docs/ARTIFACT-README.md`),
+`LICENSE`, `THIRD-PARTY-LICENSES`, `OFL.txt` and the `font-licenses/` folder.
+The Linux tarballs additionally carry `install.sh`, `tangent.desktop`, the
+icon, and the bundled `tangent-ffmpeg` encoder with its `ffmpeg-licenses/`;
+the Windows payload carries `tangent-ffmpeg.exe` the same way. macOS needs no
+bundled encoder (AVFoundation).
 
-## Release artifacts & naming
+## Cross-building: everything compiles on the Mac now
 
-Built into `dist/` by the scripts; version is read from the root
-`Cargo.toml` (`[workspace.package] version`):
+`scripts/build-cross.sh` builds the Windows installer AND both Linux tarballs
+from the macOS host. The Linux legs use `cargo zigbuild` against a Debian
+bullseye ALSA sysroot the script fetches and caches itself, targeting
+glibc 2.30; the old "Linux cannot be cross-compiled from macOS" era is over,
+and `build-linux-native.sh` remains for building natively on a Linux box when
+that is wanted (a toolchain regression, a glibc question, the suite on Linux).
 
-| Artifact | Name |
-|---|---|
-| macOS app zip (primary) | `Ivory-<v>-macos-<arch>.zip` (`arm64`, `x86_64`, or `universal`) |
-| macOS DMG (best-effort) | `Ivory-<v>-macos-<arch>.dmg` |
-| Linux x86_64 | `ivory-<v>-linux-x86_64.tar.gz` |
-| Linux aarch64 | `ivory-<v>-linux-aarch64.tar.gz` |
-| Windows x86_64 | `ivory-<v>-windows-x86_64.zip` |
-| Checksums | `SHA256SUMS` |
+Details that matter and are easy to lose:
 
-Linux binaries target glibc ≥ 2.32. Every artifact contains `README.txt` (the
-user-facing guide generated from `docs/ARTIFACT-README.md` — per-platform first
-launch, MIDI setup, privacy note), `LICENSE`, `THIRD-PARTY-LICENSES`, `OFL.txt`,
-and the `font-licenses/` folder (four texts for the fonts egui embeds).
-macOS/Linux also carry the Courier Prime TTFs; on Windows all six fonts are
-embedded in the exe only — which is still redistribution, so the licence texts
-ship there too. On macOS the licence files live inside
-`Ivory.app/Contents/Resources/`; `README.txt` sits beside the app in the
-zip/dmg.
+- **The Linux and Windows legs build without `mp3`.** LAME's autotools build
+  compiles and runs test programs, which a macOS host cannot do for a foreign
+  target. Nothing is lost: MP3 delivery goes through the bundled ffmpeg
+  sidecar on both platforms.
+- **ASIO rides into the Windows build** when the Steinberg SDK is present
+  under `vendor/asiosdk_*` (its licence forbids committing it); without it
+  the build is WASAPI-only and says so.
+- **`scripts/build-cross.sh check-linux`** type-checks the Linux target from
+  macOS with a stub `alsa.pc`, so Linux-only code is checked before pushing
+  rather than discovered broken on the Linux box.
+- Requirements: `brew install zig`, `cargo install cargo-zigbuild cargo-xwin`,
+  the three rustup targets (the script header lists them), `brew install
+  makensis` for the installer.
+- **No `libjack.so.0` may ever appear in `DT_NEEDED`.** JACK support is
+  `dlopen`ed on demand via the vendored `jack-sys` patch;
+  `check-linux-deps.sh` is the guard.
+
+## What `release.sh` checks after building
+
+Run on each OS, copy the artifacts into one `dist/`, then
+`scripts/release.sh --sums-only` there so `SHA256SUMS` covers everything.
+(`SKIP_WINDOWS=1` skips the cross leg; `KEEP_STALE=1` keeps other versions'
+artifacts, which are otherwise purged so no stale file rides a checksum or
+upload glob.)
+
+Per artifact, it verifies and refuses to bless a release on failure:
+
+- **pkg**: expands it and requires the app component, NO retired VST3
+  component, a standalone install choice, `relocatable="false"` (so a stray
+  copy elsewhere on the disk cannot swallow the update), and an Installer
+  signature.
+- **setup.exe** (needs `7zz`): requires `tangent.exe`, NO VST3 payload, and
+  `Uninstall.exe`.
+- **every zip/tar.gz**: `README.txt`, `LICENSE`, `OFL.txt`.
+- **macOS zip**: the `Tangent.app` executable present, no `__MACOSX` junk.
+- **Windows zip** (only exists when makensis was missing): `tangent.exe`.
+- **Linux tarballs**: the `tangent` binary (the pre-2.1.0 empty-tarball bug),
+  `install.sh` (the README's first instruction; 4.92.0 shipped without it),
+  and `tangent-ffmpeg` (video on a clean machine; also shipped missing once).
+
+These checks exist because every one of them has actually failed silently at
+least once. Do not publish a run that ends `FINISHED WITH PROBLEMS`.
 
 ## Release procedure
 
-1. **Bump version** in the root `Cargo.toml` (`[workspace.package]`) — the
-   single authority; scripts and the About dialog read it. Commit.
-2. **Regenerate licenses**: `scripts/gen-third-party-licenses.sh`; commit if
-   changed.
-3. **Test**: all three commands from gate 3 — `cargo test --workspace`, then
-   `cargo test -p tangent-core` (stock engine, no `learning` feature), then
-   `cargo test -p tangent-core --test differential -- --ignored` (the full
-   13,133-row golden sweep; `#[ignore]`d, so `--workspace` never runs it).
-4. **Build macOS**: `scripts/build-macos.sh` (host arm64) and/or
-   `ARCH=universal scripts/build-macos.sh`. The small-icon NOTE is expected
-   (gate #1).
-5. **Build Windows** (from mac): `scripts/build-cross.sh` (needs `zig`,
-   `cargo-zigbuild`, `cargo-xwin`, the rustup targets — header lists them). It
-   emits the Windows zip; its Linux stage is expected to fail on the ALSA
-   cross-build (non-fatal).
-   **Build Linux from here in one command** (preferred):
+1. **Version.** On a release commit, replace `-dev` with the real version in
+   the root `Cargo.toml` (`[workspace.package]`), run `cargo check` so
+   `Cargo.lock` follows, commit. `release.sh` cross-checks the lockfile.
+2. **Changelog.** Add the `## [X.Y.Z] - date` heading and what changed;
+   `release.sh` refuses without it. Regenerate licenses if dependencies
+   changed: `scripts/gen-third-party-licenses.sh`.
+3. **Test**: all three commands from gate 1.
+4. **Tag locally**: `git tag -a v<v> -m 'Tangent <v>'`. The tag must exist
+   before the build; pushing it happens in step 8.
+5. **Build**: `scripts/release.sh` on the Mac builds macOS, Windows and both
+   Linux tarballs in one pass, then run `scripts/build-installer.sh macos`
+   for the pkg (see the gap above) and `scripts/release.sh --sums-only` to
+   fold it into the checksums.
+6. **Smoke-test.** `open dist/Tangent.app`. For Linux,
+   `scripts/ship-linux.sh <ssh-host> [x86_64|aarch64]` installs the tarball
+   on a real Linux box and proves it starts, finds ALSA and opens a window,
+   which is the half a cross-build cannot prove. Windows: run the setup.exe
+   in a VM or under CrossOver if available.
+7. **Checksums** are written by `release.sh` itself, version-scoped, so a
+   stale artifact from another version can never ride along.
+8. **Push**: the release commit and the tag, to Codeberg (source of truth)
+   and the GitHub mirror (`git push github main --tags`).
+9. **Publish**: `scripts/publish-github.sh --notes-file <notes>` (the
+   `github` remote is the release channel; `DRY_RUN=1` to rehearse). It
+   uploads every artifact in THREE spellings: version-scoped, the
+   version-less alias (`Tangent-macos.pkg`,
+   `Tangent-windows-setup.exe`, `tangent-linux-x86_64.tar.gz`, ...), and the
+   legacy `Ivory-*` names that every supporter-key email sent before the
+   rename still links. The version-less aliases are what
+   `releases/latest/download/<name>` resolves by exact name, and that
+   permalink is the download link on the Gumroad post-purchase page, in the
+   supporter-key email and in `README.md`; **a release published without the
+   aliases 404s for everyone who has already paid, silently.** The script
+   re-checks every permalink after upload and exits non-zero if one is dead,
+   so a red run is never cosmetic. A version with a pre-release suffix is
+   published as a GitHub pre-release, deliberately: `latest/download`
+   resolves against the latest stable, so a correctly marked beta leaves the
+   permanent links alone. Release notes must include the SmartScreen note.
+   For 5.0.0 specifically they must also say that the pre-5.0
+   `~/.config/ivory/` directory is removed at first launch rather than
+   migrated (a clean break; supporter keys are re-sent by email).
+10. **Verify as a stranger**: download each artifact on a clean machine or VM
+    (quarantine attribute present) and confirm the documented first-launch
+    paths work. Then put `main` back on the next `X.Y.Z-dev`.
 
-   ```sh
-   DEPS=1 scripts/build-linux-remote.sh void   # first time: also installs deps
-   scripts/build-linux-remote.sh void          # afterwards
-   ```
+## Store links: check them, then act in order
 
-   It rsyncs the working tree (so uncommitted changes build too), runs
-   `build-linux-native.sh` over ssh, brings the tarball back into `dist/`, and
-   fails loudly if it contains no binary. `void` is any ssh host — a `Host`
-   block in `~/.ssh/config`, or `user@ip`.
+`scripts/check-store-links.sh` fetches every `releases/latest/download/` URL
+in `README.md`, `docs/STORE-CONTENT.md` and `tools/tangent-fulfil/src/main.rs`.
+They resolve by EXACT asset name against whatever release is currently
+latest, so a new name 404s until it has shipped.
 
-   Or **build Linux natively** on a Linux host (the owner's Void machine):
-   `scripts/build-linux-native.sh` — installs are in that script's header
-   (`alsa-lib-devel` + X11/Wayland/GL `-dev` packages). This is the recommended
-   Linux path; run it once per arch (x86_64, aarch64) on matching hardware.
-6. **Smoke-test locally**: `open dist/Ivory.app`; unzip the Windows artifact
-   under CrossOver if available; `tar -tzf` the Linux archives.
-7. **Checksums** — *version-scoped*. A bare `Ivory-*` sweeps in every previous
-   release still sitting in `dist/`:
-   `cd dist && shasum -a 256 *-<v>-* > SHA256SUMS`.
-   Easier: `scripts/release.sh` does steps 4-7 in one pass — it purges other
-   versions' artifacts, builds what this host can, checks every archive for the
-   binary, readme and licences, and writes `SHA256SUMS` itself.
-8. **Tag**: `git tag v<v> && git push --tags` (push to Codeberg — source of
-   truth — and the GitHub mirror).
-9. **GitHub release** (public download channel):
-   `scripts/publish-github.sh --notes-file <notes>`.
-   It uploads every artifact **twice** — version-scoped, and again under the
-   version-less alias (`Ivory-macos-arm64.dmg`, `tangent-windows-x86_64.zip`, …)
-   plus a bare `SHA256SUMS`. Those aliases are what
-   `releases/latest/download/<name>` resolves by exact name, and that permalink
-   is the download link handed to customers on the Gumroad post-purchase page,
-   in the supporter-key email and in `README.md`. **A release published without
-   the aliases 404s for everyone who has already paid, silently** — nothing logs
-   it. The script re-checks every permalink after upload and exits non-zero if
-   one is dead, so do not treat a red run as cosmetic.
-   Release notes must include the Windows SmartScreen note and (for the first
-   public 2.x release) the settings one-way caveat. The old macOS "Open Anyway"
-   steps no longer apply: since 2.2.0 the build is Developer ID signed and
-   notarized, so telling buyers to expect a Gatekeeper block is now wrong.
-   Mirror the release on Codeberg or link the GitHub release from it.
-10. **Verify as a stranger**: download each artifact on a clean machine/VM
-    (quarantine attribute present!) and confirm the documented first-launch
-    paths actually work.
+The order that keeps this honest: **publish, check, paste, deploy.** It has
+gone wrong twice, both times by getting ahead of the publish: the key email
+was once redeployed before its assets and 404'd for ten minutes, and installer
+names were once written into the store content while an older release was
+still latest. Both times the text was right and the release was not.
 
 ## CI
 
-Deferred until after the first successful local-script release. The scripts in
-`scripts/` are the source of truth and run on this machine. The Python era
-burned ~24 of 30 commits on workflow YAML (framework symlinks, heredoc
-escaping, artifact-action churn — `spec/product-docs.md` §3); when CI returns,
-the workflow must only *call these scripts*, never inline build logic in YAML.
+Deferred. The scripts in `scripts/` are the source of truth and run on the
+owner's machines. The Python era burned ~24 of 30 commits on workflow YAML
+(`spec/product-docs.md` §3); when CI returns, the workflow must only *call
+these scripts*, never inline build logic in YAML.

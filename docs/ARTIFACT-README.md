@@ -2,8 +2,10 @@ Tangent
 =====
 
 Tangent draws all 88 piano keys and lights them from your MIDI keyboard in real
-time. As you play, it names what you are playing — triads and sevenths through
-altered dominants, slash chords, rootless jazz voicings, scales and modes.
+time. As you play, it names what you are playing: triads and sevenths through
+altered dominants, slash chords, rootless jazz voicings, scales and modes. It
+records, mixes and arranges what you play too, and one press writes the audio,
+the MIDI and a video of the window itself.
 
 Everything is in the right-click menu. That is the entire interface.
 
@@ -13,20 +15,23 @@ First launch
 
 macOS
 
-  Open the .dmg (or unzip the .zip) and drag Tangent.app into your Applications
+  The easy way is the installer: open Tangent-macos.pkg and follow it. If you
+  took the .dmg or the .zip instead, drag Tangent.app into your Applications
   folder.
 
   That is all. Tangent is signed with a Developer ID certificate and notarized by
   Apple, with the ticket stapled to the app, so it opens on a double-click with
   no security prompt and without being online.
 
-  Requires macOS 11 (Big Sur) or later, on Apple Silicon.
+  Requires macOS 11 (Big Sur) or later. The build is universal: Apple Silicon
+  and Intel, one download.
 
 Windows
 
-  Unzip the archive anywhere and run tangent.exe. There is no installer.
+  Run Tangent-windows-setup.exe and follow it. It installs the app, puts it in
+  the Start menu, and includes an uninstaller.
 
-  The executable is not code-signed, so SmartScreen shows "Windows protected
+  The installer is not code-signed, so SmartScreen shows "Windows protected
   your PC" the first time. Click "More info", then "Run anyway". Windows
   remembers the choice.
 
@@ -36,9 +41,9 @@ Linux
     cd tangent-<version>-linux-<arch>
     ./install.sh
 
-  That installs the app and the VST3 plugin into your home directory — no root
-  needed — and prints how to undo it (./install.sh --uninstall). Or skip
-  installing entirely: `chmod +x tangent && ./tangent` runs it from the folder.
+  That installs Tangent into your home directory, no root needed, and prints
+  how to undo it (./install.sh --uninstall). Or skip installing entirely:
+  `chmod +x tangent && ./tangent` runs it from the folder.
 
   It asks once whether you want desktop integration: the menu entry and the
   icon, which are what put Tangent in your application menu and in launchers
@@ -52,11 +57,11 @@ Linux
   desktop already has; if yours does not, install.sh notices and prints your
   distribution's one-line fix (mesa's lavapipe works on any GPU).
 
-  MIDI goes through ALSA, so libasound.so.2 needs to be present — package
+  MIDI goes through ALSA, so libasound.so.2 needs to be present: package
   libasound2 on Debian/Ubuntu, alsa-lib elsewhere. It already is on essentially
   every desktop install. PipeWire systems work unchanged: your keyboard still
   shows up as an ordinary ALSA sequencer port. Wayland and X11 are both
-  supported. Requires glibc 2.32 or newer.
+  supported. Requires glibc 2.30 or newer.
 
   LV2 plugin hosting needs liblilv-0.so.0, and unlike everything above, without
   it Tangent does not start at all. It arrives with PipeWire or with ffmpeg, so
@@ -69,16 +74,16 @@ Linux
   install.sh checks for it and prints your distribution's command if it is
   missing.
 
-  Your keyboard has to be plugged in and switched on before Tangent can see it —
-  ALSA only creates a port for hardware that is actually there.
+  Your keyboard has to be plugged in and switched on before Tangent can see it,
+  because ALSA only creates a port for hardware that is actually there.
 
   Audio out of the box goes through ALSA, which on a PipeWire desktop means
-  PipeWire — nothing to set up. If you run a pro-audio session, Settings ->
+  PipeWire, with nothing to set up. If you run a pro-audio session, Settings ->
   Audio Setup has a second entry: JACK. Pick it and Tangent becomes an ordinary
   client of the graph, under the name "Tangent", so its ports show up in
   qjackctl, Carla or Patchance next to everything else and can be patched into
   a DAW. It runs on the server's own period and sample rate, so the buffer-size
-  and sample-rate controls have nothing left to do while it is selected — the
+  and sample-rate controls have nothing left to do while it is selected; the
   Audio Status line reports what the server is actually running.
 
   Pick it to be part of a session, not to chase a smaller number: measured on
@@ -87,7 +92,7 @@ Linux
 
   What it does fix outright is WHICH interface you record. Through ALSA on a
   PipeWire machine there is only one device Tangent can open, and it follows
-  whatever your desktop's default input happens to be — so changing that
+  whatever your desktop's default input happens to be, so changing that
   default in your system settings silently changes what Tangent records.
   Through JACK the ports carry your interface's own name and stay where you put
   them.
@@ -100,15 +105,15 @@ Linux
   straight away; repatch it in qjackctl and the change is immediate. Under
   ALSA the picker still lists your interfaces by name, exactly as before.
 
-  This works against real jackd and against PipeWire's JACK layer equally —
-  most distributions install the latter by default now, sometimes as a separate
+  This works against real jackd and against PipeWire's JACK layer equally.
+  Most distributions install the latter by default now, sometimes as a separate
   package (pipewire-jack on Debian/Ubuntu, pipewire-jack-audio-connection-kit on
   Fedora). Nothing is required: libjack is opened only if you choose JACK, so a
   machine without it is not missing anything and the entry falls back to ALSA
   rather than leaving you in silence.
 
   If you picked JACK and got ALSA back, PipeWire's libjack is installed
-  somewhere the dynamic loader does not look — some distributions keep it out
+  somewhere the dynamic loader does not look; some distributions keep it out
   of the default path deliberately so that it does not shadow a real jackd.
   Starting Tangent as `pw-jack tangent` is the supported way round that, and it
   is what the same distributions tell you to do for every other JACK
@@ -134,7 +139,7 @@ and otherwise simply taking the first port it finds.
 
 If you connected after launching, or you have more than one device:
 right-click > "Select MIDI Input...", choose the port, click OK. Tangent does not
-reconnect by itself if a device is unplugged mid-session — plug it back in and
+reconnect by itself if a device is unplugged mid-session: plug it back in and
 pick it from that list again.
 
 From a terminal:
@@ -161,15 +166,15 @@ are not holding anything, because it acts on what you are playing.
 "Correct Chord Name..." teaches a general preference instead. It lists the
 readings Tangent actually weighed for this voicing, with their scores; pick the
 one you would rather see and click "Learn". Tangent then leans that way
-everywhere, so similar voicings shift too — about one chord in ten, sometimes
+everywhere, so similar voicings shift too: about one chord in ten, sometimes
 in unrelated keys. That is the feature working, not a fault. If the name you
 want is not in the list, Tangent never considered it and cannot be argued into
-it — pin it with "Teach Chord Name..." instead. The first correction that lands
+it, so pin it with "Teach Chord Name..." instead. The first correction that lands
 switches Chord Learning on, which also reactivates any earlier corrections.
 
 "Manage Taught Chords..." lists everything you have pinned, with a Delete button
 beside each, shows whether learning is on and what it has picked up, and offers
-"Forget Learning" — which restores stock chord naming exactly. "Disable Chord
+"Forget Learning", which restores stock chord naming exactly. "Disable Chord
 Learning" in the menu silences learning without erasing anything.
 
 
@@ -195,7 +200,7 @@ Privacy
 
 Tangent makes no network connections and collects no data. Your settings and your
 taught chords stay on your machine. There is no telemetry, no update check, and
-no account. The one link in the app — the author's site, in the About box —
+no account. The one link in the app, the author's site in the About box,
 hands the address to your browser if you click it, and that is the whole of it.
 
 
@@ -218,10 +223,10 @@ If something looks wrong
 Licenses
 --------
 
-Tangent is MIT-licensed — see LICENSE. The Rust libraries it links against are
+Tangent is MIT-licensed; see LICENSE. The Rust libraries it links against are
 listed in THIRD-PARTY-LICENSES. The bundled Courier Prime fonts are
 Copyright 2015 The Courier Prime Project Authors, licensed under the SIL Open
-Font License 1.1 — see OFL.txt.
+Font License 1.1; see OFL.txt.
 
   macOS     inside the app: right-click Tangent.app > Show Package Contents >
             Contents/Resources

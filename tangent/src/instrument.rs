@@ -7601,7 +7601,11 @@ struct Handoff {
 /// A ceiling rather than a `Vec`, because this table is read on the audio
 /// thread: sixty-four is four routes per channel on a sixteen-channel desk,
 /// past anything a person builds by hand, and the whole array is 512 bytes.
-pub const MAX_ROUTES: usize = 64;
+///
+/// THE number, re-exported from the UI's routing module rather than typed a
+/// second time: `Routes::add` refuses at this cap and `set_routes` clamps
+/// to it, and two literals that must agree eventually do not.
+pub const MAX_ROUTES: usize = tangent_ui::routing::MAX_ROUTES;
 
 /// Pack a route into one word the audio thread can read atomically.
 ///

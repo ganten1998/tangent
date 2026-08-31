@@ -4373,11 +4373,23 @@ impl IvoryApp {
         self.drumpad_open = true;
     }
 
+    /// The drumpad's dress: the same three facts the MIDI editor derives
+    /// its face from, so the two sibling popups always agree on the theme.
+    fn drumpad_dress(&self) -> crate::drumpad_panel::Dress {
+        let fx = self.settings.fx_strip_color;
+        let bg = self.settings.meter_bg_color;
+        crate::drumpad_panel::Dress {
+            fx_strip: (fx.r, fx.g, fx.b),
+            meter_bg: (bg.r, bg.g, bg.b),
+            dark: self.settings.me_dark,
+        }
+    }
+
     /// Paint the drumpad exactly as the frame does, for the harness.
     pub fn draw_drumpad_for_shot(&self, painter: &egui::Painter, rect: egui::Rect) {
         let r = crate::drumpad_panel::place(rect, None);
         if r.is_positive() {
-            crate::drumpad_panel::draw(painter, r, &self.drumpad_view());
+            crate::drumpad_panel::draw_dressed(painter, r, &self.drumpad_view(), self.drumpad_dress());
         }
     }
 
@@ -15479,17 +15491,12 @@ impl IvoryApp {
                         self.arr_auto_hot = Some((n, i));
                         self.arr_drag = Some(ArrDrag::AutoPoint(n, row, i));
                     }
-                    // **A press on empty room MAKES a point**, which is what
-                    // every desk does and what makes a curve drawable rather
-                    // than assembled. It is then dragged, so one gesture
-                    // places it and puts it where you meant.
                     // ── the tempo lane ────────────────────────────────
                     Some(A::TempoPoint(i)) => {
                         // **ALT removes it**, as on an automation node — one
                         // rule for both lanes. The ramp toggle it used to be
-                        // has moved to a plain double-click, because delete
-                        // is the commoner want and alt is now the app's
-                        // remove modifier.
+                        // lives on SHIFT now (below), because delete is the
+                        // commoner want and alt is the app's remove modifier.
                         if ctx.input(|k| k.modifiers.alt) {
                             self.arr_remove_tempo_point(i);
                             self.arr_tempo_hot = None;
@@ -21587,11 +21594,23 @@ impl IvoryApp {
             }
             DialogAction::AddRoute { from, target } => {
                 // `add` owns the no-duplicates rule; the picker greys what is
-                // taken, so a refusal here means the desk changed under the
-                // open window rather than that the user did something wrong.
+                // taken, so a duplicate refusal means the desk changed under
+                // the open window rather than that the user did something
+                // wrong. A refusal at the CAP is different: the engine's
+                // table is full, and route sixty-five would be stored, drawn
+                // and never published — a fader that moves and does nothing —
+                // so that one is said out loud.
                 if self.settings.routes.add(crate::routing::Route::new(from, target)) {
                     self.refresh_route_labels();
                     self.save_settings();
+                } else if self.settings.routes.0.len() >= crate::routing::MAX_ROUTES {
+                    self.report_take(
+                        format!(
+                            "The routing table is full at {} routes. Remove one to add another.",
+                            crate::routing::MAX_ROUTES
+                        ),
+                        false,
+                    );
                 }
                 // Back to the two kinds, so adding several routes in a row is
                 // one window rather than one window per route.
@@ -24212,7 +24231,7 @@ impl IvoryApp {
             let r = crate::drumpad_panel::place(ui.max_rect(), self.drumpad_pos);
             if r.is_positive() {
                 let view = self.drumpad_view();
-                crate::drumpad_panel::draw(ui.painter(), r, &view);
+                crate::drumpad_panel::draw_dressed(ui.painter(), r, &view, self.drumpad_dress());
                 self.draw_pad_menu(ui.painter(), r);
                 // A pad mid-carry: the target lights under the hand.
                 // `from` is a KEY; the layout's rects are SLOTS — map

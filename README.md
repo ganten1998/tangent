@@ -6,198 +6,182 @@
 
 ![Tangent naming a C major 13, with the circle of fifths, a Tonnetz and the harmonic triangles above it](docs/img/screenshot-theory.png)
 
-Plug in a MIDI keyboard and play. Tangent renders all 88 keys (A0 to C8) in real
-time while a weighted-scoring chord engine names what you are playing, from
-plain triads to altered dominants, rootless jazz voicings, slash chords, and
-scales. It **engraves it on a staff**, shows you the same notes **on a guitar
-neck** where a player would actually put their fingers, and **as geometry**: on
-the circle of fifths, on a Tonnetz, and as the I-IV-V triangles.
+Tangent is a small recording DAW built around one idea: the app should show
+you what you are playing while you play it, and keep what you played.
 
-Then it records the whole thing. That combination is what Tangent is for, and
-it makes it two things.
+Plug in a MIDI keyboard and play. Tangent renders all 88 keys in real time
+while a weighted-scoring chord engine names what you are holding, from plain
+triads to altered dominants, rootless jazz voicings, slash chords, and scales.
+It **engraves it on a staff**, shows the same notes **on a guitar neck** where
+a player would actually put their fingers, and **as geometry**: the circle of
+fifths, a Tonnetz, and the I-IV-V triangles.
 
-**A teaching tool.** Everything a student needs is on screen at once and in one
-another's terms: the notes under your hands, the name of what they make, the
-notation for it, and the geometry that explains why it sounds like that. Put
-several clefs up at the same time and every staff shows every note, so a
-violist and a cellist read the same chord in their own clefs, side by side, off
-one keyboard. The number keys rearrange the panels mid-lesson. Teach it a chord
-name it does not know and it is yours from then on.
+Then it records the whole thing, and keeps going from there. Tangent 5.0 is
+three tools in one window:
+
+**A teaching tool.** Everything a student needs is on screen at once and in
+one another's terms: the notes under your hands, the name of what they make,
+the notation for it, and the geometry that explains why it sounds like that.
+Put several clefs up at the same time and every staff shows every note, so a
+violist and a cellist read the same chord in their own clefs, side by side,
+off one keyboard. Teach it a chord name it does not know and it is yours from
+then on.
 
 **A recording tool.** One press writes a `.wav`, a `.mid` and a composited
 `.mp4`, and the video **is the window**: the same panels in the same places,
 with your camera already placed in it, at 16:9. There is no scene to build, no
 overlay to align, no second layout to keep in step with the first. What you
-were looking at is what your audience sees. macOS encodes natively; Windows and
-Linux use `ffmpeg`, and a take that cannot find it says so and still writes its
-audio and its MIDI.
+were looking at is what your audience sees. macOS encodes natively; the
+Windows and Linux downloads carry their own encoder, so filming a take needs
+nothing installed. There is a native **Stream to OBS** sender too, for going
+live instead of to a file.
 
-![Tangent in dark mode naming an altered dominant, on an ebony fingerboard](docs/img/screenshot-dark-alt.png)
+**A DAW.** A sixteen-track desk with a mixer, an arrangement view, a MIDI
+editor and a drum machine. Folders are real buses: a group sums its children
+in the engine and runs its own insert rack over the sum. Automation reaches
+track controls and plugin parameters alike, the tempo lane does ramps and
+steps, clips time-stretch from their edges, and delay compensation understands
+groups. It **hosts your plugins**: VST3 on every platform, LV2 on Linux and
+FreeBSD, editor windows included, and a built-in tine electric piano plays
+whenever no instrument is loaded, so the app makes a sound out of the box.
 
-Since 3.0.0 it runs **inside a DAW as well**, as a VST3 plugin with the same
-display. Tangent 2.x and later are a ground-up Rust rewrite of the Python app
-(final Python release: 1.1.0), keeping the same look, behaviors, and settings
-file. It runs on macOS 11 (Big Sur) and later, on Windows, and on Linux
-(glibc 2.32+, ALSA, Wayland or X11).
+It runs on macOS 11 (Big Sur) and later, on Windows 10 and later, and on
+Linux (glibc 2.30+, ALSA, Wayland or X11). It builds and runs on FreeBSD too.
 
 ## Download
-
-The **installer** is the easy option: it offers the app and the VST3 plugin as
-separate choices, so you can take either or both, and it puts the plugin where
-your DAW already looks.
 
 | Platform | Installer | Or unpack it yourself |
 |---|---|---|
 | macOS 11+ | [`.pkg`](https://github.com/ganten1998/tangent/releases/latest/download/Tangent-macos.pkg) | [`.dmg`](https://github.com/ganten1998/tangent/releases/latest/download/Tangent-macos-universal.dmg) · [`.zip`](https://github.com/ganten1998/tangent/releases/latest/download/Tangent-macos-universal.zip) |
-| Windows 10+ | [`setup.exe`](https://github.com/ganten1998/tangent/releases/latest/download/Tangent-windows-setup.exe) | [`.zip`](https://github.com/ganten1998/tangent/releases/latest/download/tangent-windows-x86_64.zip) |
+| Windows 10+ | [`setup.exe`](https://github.com/ganten1998/tangent/releases/latest/download/Tangent-windows-setup.exe) | |
 | Linux x86_64 | `install.sh`, inside the tarball | [`.tar.gz`](https://github.com/ganten1998/tangent/releases/latest/download/tangent-linux-x86_64.tar.gz) |
 
-macOS builds are universal from 3.0.0, Apple Silicon and Intel, and signed
-and notarized. The Linux `install.sh` needs no root by default and takes
-`--app`, `--vst3`, `--system`, `--prefix`, `--uninstall` and `--dry-run`.
-
-### The plugin
-
-Tangent.vst3 shows everything the app does, reading the notes on the track it
-is on. **It produces no audio.** It is a monitor, not an instrument, so put
-it on a MIDI or instrument track rather than in an effect slot. Its settings
-live in the DAW project, so two instances and the standalone can each be set
-up differently.
+macOS builds are universal (Apple Silicon and Intel), signed and notarized.
+The Windows download is the installer; it puts Tangent in the Start menu and
+includes an uninstaller. The Linux `install.sh` needs no root by default and
+takes `--system`, `--prefix`, `--uninstall` and `--dry-run`. Other builds,
+including the Linux aarch64 tarball and checksums, are on the
+[releases page](https://github.com/ganten1998/tangent/releases/latest).
 
 ## Features
 
-- **Real-time 88-key display.** Every key lights as you play it, with
-  sustain-pedal visualization (held notes stay lit and recolor while the pedal
-  is down).
-- **Chord detection, 95 chord patterns against all 12 roots.** Triads
-  (maj/min/dim/aug), sevenths (maj7, m7, dom7, m7b5, dim7), extensions
-  (9/11/13), altered dominants (b9, #9, #11, b13 and combinations), add chords,
-  sus chords (sus2, sus4, 9sus, 13sus), 6 and 6/9, inversions, slash chords,
-  and rootless voicings.
-- **28 scales and modes.** Clustered note runs are named as scales rather than
-  chords: the seven major modes, the melodic and harmonic minor modes, both
-  pentatonics, both blues scales, whole tone, and both diminished scales.
-- **Readable labels** in parenthetical notation: `C(add9)`, `C7(b9,#11)`,
-  `Cm(add9)/G`, `CΔ7`, `6/9`, with lead sheet symbols `Δ`, `°`, `ø` and `+`.
-  Flats and sharps preference toggle.
-- **A theory band.** A tall section above everything else with three ways of
-  seeing what you are playing, in any combination, side by side.
-  - **Circle of fifths.** Each key shaded by how much of what you are playing
-    belongs to it, so keys that are close light up together. A filled disc for
-    every note you are sounding: a triad is a tight cluster, a tritone is a
-    line straight across. Relative minors sit on the same spoke as their major,
-    because they share a key signature.
-  - **Tonnetz.** The lattice where left-to-right is fifths and the diagonals
-    are thirds, so every major triad is a triangle pointing up, every minor
-    triad one pointing down, and two chords that share two notes share an edge.
-  - **Harmonic triangles.** I, IV and V pointing up with i, iv and v inverted
-    through the same centre. Between them those three chords use every note of
-    the key and no others, which is why so many songs need no more.
-
-  It shows what you **put there** rather than what you are playing, so it holds
-  still while your hands are busy: click the piano, the neck or the diagrams
-  themselves. *Follow MIDI* makes it live if you would rather.
-- **Keyboard shortcuts.** Hold **H** for the list. **N** names the chord you are
-  holding. The box opens with the current name selected, so you just type.
-  **E** corrects a reading, **M** opens what you have taught, **T** cycles the
-  theory band, **G** the guitar view, and **K**, **R**, **C**, **D**, **B**,
-  **F**, **L**, **P**, **A**, **S** the rest.
-- **Teach Tangent your names.** Right-click, then *Teach Chord Name…* pins your
-  own name to the voicing you are holding. Tick *Apply in all keys* to make the
-  name follow the shape through every transposition. *Manage Taught Chords…*
-  lists and deletes taught names. Overrides are consulted before detection and
-  stored in `~/.config/tangent/overrides.json`.
-- **Chord Learning.** *Correct Chord Name…* shows the readings Tangent actually
-  weighed for the voicing you are holding, with their scores. Pick the one you
-  would rather see and Tangent learns a general leaning, so similar voicings shift
-  too, a measured ~1 chord in 10 across a 13,133-voicing corpus, often in other
-  keys. *Forget Learning* in *Manage Taught Chords…* restores stock naming
-  exactly. *Disable Chord Learning* silences it without erasing anything.
-- **Guitar view, both ways.** *Show Fretboard* adds a neck under the piano and puts the
-  notes you are holding where a guitarist would actually play them. One MIDI
-  note can be six places on a guitar. Middle C is five of them, and the high E
-  string cannot reach it at all, so Tangent picks the shape a player would use,
-  weighing hand span, open strings and barres, then holds it steady as you add
-  notes rather than jumping around the neck. Seven tunings including a 4-string
-  bass, plus a capo. Notes that will not fit are never quietly missing: an
-  out-of-range note shows as a hollow dot with the octave it moved, a note the
-  guitar cannot sound alongside the others shows as a faint ring where it wanted
-  to go, and anything left off is counted underneath. Three fingerboard woods
-  (rosewood, maple, ebony), and the neck pops out into its own window. The capo
-  cycles black, brushed silver and wood when you click it.
-
-  It is an **input** too: with Keytoggle on, click the neck to place notes and
-  read the chord off the piano above, instead of only the other way round.
-  Shapes stay where you put them. Hold and drag along a fret to lay a barre,
-  which is the only way to get one by hand, so two notes that happen to share a
-  fret stay two notes.
-- **A VST3 plugin.** The same display inside your DAW, reading the notes on the
-  track it is on. It produces no audio, so put it on a MIDI or instrument track.
-  Settings live in the project, so instances can differ from each other and
-  from the standalone. macOS is a signed universal binary.
-- **Detachable chord display.** Pop the chord strip into its own independent
-  window, and close it to reattach.
-- **Dark mode** with theme-aware context menus (ivory-on-black and
-  black-on-ivory), customizable key and note colors.
-- **Flexible window.** Size presets from 50% to 200% (any percentage works in
-  the settings file), borderless mode with drag-anywhere support.
-- **MIDI device picker.** Tangent auto-connects at startup, preferring ports named
-  "USB-MIDI", then "Scarlett" or "USB"+"MIDI", and otherwise the first port it
-  finds. Switch at any time with *Select MIDI Input…*. There is no
-  auto-reconnect, so reopen the picker if a device is unplugged mid-session.
-  CLI flags for scripted setups: `tangent -l` lists MIDI input ports,
-  `tangent -p "<port name>"` connects to a specific one.
-- **Consistent typography everywhere.** The Courier Prime fonts are bundled and
-  embedded, so the app looks identical on all three platforms. Terminess Nerd
-  Font Mono is bundled as an alternative.
+- **The recorder.** One press writes audio, MIDI and video together. The video
+  is the window itself, with the camera composited in; the take's manifest
+  records what was captured, and a take that loses its video still keeps its
+  audio and its MIDI. Software monitoring, a metronome, and input trims live
+  on the recorder band.
+- **The mixer.** Sixteen channels plus a master, each with a fader, pan, a
+  send into the effects bus, an insert rack, and meters. Routing goes two
+  ways: a **hardware output** sends a copy of a channel out of your
+  interface's own jacks (a headphone amp, a stage monitor), and a **channel
+  route** moves a channel through another channel, which is how you build a
+  submix. Folders are buses: a group sums its children and runs its own rack
+  over the sum, so a compressor in a folder's bay is a bus compressor.
+- **The arrangement.** Audio and MIDI clips on a timeline, groups that drag
+  their children with them, automation lanes for track controls and plugin
+  parameters, a tempo lane with ramps and steps, time-stretch from a clip's
+  edge (MIDI re-times, audio renders), and glue for MIDI clips.
+- **The MIDI editor and the drum machine.** A piano-roll editor for MIDI
+  clips, and a pad-based drum machine with its own kits. The kit is the one
+  thing that still saves itself, because a kit is hours of sample assignment
+  and the one thing a session must never lose to a missed save.
+- **Plugin hosting.** VST3 on macOS, Windows, Linux and FreeBSD; LV2 on Linux
+  and FreeBSD; plugin editor windows everywhere. Scanning is recursive, takes
+  folders you add yourself, and rescans without a restart. A built-in tine
+  electric piano plays when no instrument is loaded.
+- **Stream to OBS.** A native ReaStream-compatible sender pushes the master
+  over localhost UDP to the ReaStream plugin in OBS, so a lesson or a
+  performance can go live without an extra audio driver.
+- **Chord detection, 95 chord patterns against all 12 roots.** Triads,
+  sevenths, extensions, altered dominants, add and sus chords, 6 and 6/9,
+  inversions, slash chords, and rootless voicings, plus **28 scales and
+  modes** when you run instead of hold. Readable labels in parenthetical
+  notation (`C7(b9,#11)`, `Cm(add9)/G`) with lead sheet symbols and a
+  flats/sharps preference.
+- **A theory band.** Circle of fifths, Tonnetz, harmonic triangles and a
+  sheet music panel, in any combination, side by side; the number keys
+  `1`-`4` choose what is up and where. The sheet music panel does six clefs,
+  all fifteen key signatures, and stacks several staves at once. The band
+  shows what you **put there** rather than what you are playing, so it holds
+  still while your hands are busy; *Follow MIDI* makes it live if you would
+  rather.
+- **Guitar view, both ways.** A neck under the piano that places what you hold
+  where a guitarist would play it, weighing hand span, open strings and
+  barres, then holds the shape steady as you add notes. Seven tunings, a
+  capo, three fingerboard woods. With Keytoggle on it is an input too: click
+  the neck to build a shape and read the chord off the piano.
+- **Teach Tangent your names.** *Teach Chord Name…* pins your name to the
+  voicing you are holding, in every key if you want. *Correct Chord Name…*
+  teaches a general leaning instead, so similar voicings shift too. *Manage
+  Taught Chords…* lists, deletes, and can forget everything learned.
+- **Sixteen themes.** `T` cycles them; every theme carries its own palette,
+  solved against contrast floors rather than picked by eye. Key and note
+  colors are customizable on top.
+- **Keyboard shortcuts.** Hold **H** and every view's bindings appear. **N**
+  names the chord you are holding; the rest is on the card.
+- **A MIDI device picker** that auto-connects at startup, and CLI flags for
+  scripted setups: `tangent -l` lists MIDI input ports, `tangent -p "<port>"`
+  connects to one.
+- **Consistent typography everywhere.** Courier Prime is bundled and embedded,
+  so the app looks identical on all platforms; Terminess Nerd Font Mono and
+  JetBrains Mono are bundled as alternatives.
 
 The right-click context menu is the primary UI surface. Every feature above is
 reachable from it.
 
 ## Pay what you can
 
-Tangent is free software (MIT) and free to download. Every feature, Chord Learning
-included, is in the free app. Nothing is time-limited and nothing nags you.
+Tangent is free software (MIT) and free to download. Every feature is in the
+free app. Nothing is time-limited and nothing nags you.
 
 A [supporter key](https://ganten.gumroad.com/l/ivory) is a way to say the app
 earned a place in your practice room. It adds a small cosmetic thank-you inside
 the app and nothing else. Pay what you like, and if you cannot afford it, just
 use the app.
 
+## Support
+
+Something broken, or something missing? Open an issue on the
+[tracker](https://github.com/ganten1998/tangent/issues), or email
+<tangentdaw@gmail.com>. Both are read by the author.
+
 ## Privacy
 
-Tangent makes no network connections and collects no data. Your settings and your
-taught chords stay on your machine, in `~/.config/tangent/`. There is no telemetry,
-no update check, and no account. Supporter keys are verified offline with a
-signature check, so no server is contacted then either. The only link anywhere in
-the app, the author's site in the About box, hands the address to your browser if
-you click it. Tangent itself never opens a socket.
+Tangent collects no data. There is no telemetry, no update check, and no
+account. Your settings, your projects and your taught chords stay on your
+machine, in `~/.config/tangent/` and wherever you save your work. Supporter
+keys are verified offline with a signature check, so no server is contacted
+then either. The one network feature is the OBS stream, which is off by
+default and, when you turn it on, sends audio to an address you choose (your
+own machine, unless you say otherwise). Nothing else ever opens a socket.
 
 ## A note on the name
 
-Tangent was called **Ivory** until 2.3.0, and "ivory" survives as the internal
-codename throughout the source: the crate names, `~/.config/tangent/`, the macOS
-bundle identifier, and the `IVORY_*` developer switches. That is deliberate, not
-leftovers. Changing the bundle identifier would reset Gatekeeper's trust in every
-signed build, and changing the config path would orphan every existing user's
-settings and taught chords, both for a string nobody using the app ever sees.
+Tangent was called **Ivory** until 2.3.0. For a while the rename was surface
+deep, and this file used to claim the internals would never follow, so that
+nobody's settings would be orphaned. That stopped being true in 5.0, which
+finished the job deliberately: the crates are `tangent-*`, the macOS bundle
+identifier is Tangent's own, and configuration moved to `~/.config/tangent/`.
+5.0 treats the old `~/.config/ivory/` directory as a clean break rather than
+migrating it, and removes it at first launch; 5.0 was also the point where
+projects, desks and themes made the old files historical. What survives of
+"ivory" in the source (some type names, the `IVORY_*` developer switches) is
+internal and on its way out.
 
-The clavichord's tangent is the brass blade at the back of each key. It strikes
-the string and stays in contact with it for as long as the note sounds, which is
-what the display does with a held note.
+The clavichord's tangent is the brass blade at the back of each key. It
+strikes the string and stays in contact with it for as long as the note
+sounds, which is what the display does with a held note.
 
 Downloads published under the old `Ivory-*` asset names keep working; every
 release uploads those alongside the current ones.
 
 ## Licensing
 
-The standalone app and every crate in this repo are **MIT**. The VST3 plugin
-binary is **GPL-3.0-or-later**, because NIH-plug's VST3 bindings are, and
-copyleft attaches to the binary that links them rather than to the source.
-
-Shipping both in one installer is an aggregate under GPLv3 section 5, so the
-standalone stays MIT. `LICENSING.md` records the reasoning and the three rules
-that keep it true.
+Tangent and every crate in this repo are **MIT**. The Windows and Linux
+artifacts bundle an unmodified GPL build of ffmpeg as a separate program
+(`tangent-ffmpeg`), which is an aggregate, not a combined work; its licenses
+and provenance ship beside it in `ffmpeg-licenses/`. `LICENSING.md` records
+the reasoning.
 
 ## Building from source
 
@@ -206,36 +190,40 @@ Requires a stable Rust toolchain (rustup recommended).
 ```sh
 cargo run --bin tangent         # debug build, run directly
 cargo build --release --bin tangent
-cargo test --workspace        # engine + parity test suite
+cargo test --workspace          # engine + UI + parity test suite
 ```
 
 Release packaging lives in `scripts/`: `build-macos.sh` for the signed and
-notarized macOS bundle, `build-cross.sh` for the Windows cross-build, and
-`build-linux-native.sh` which must be run on a Linux host. Linux cannot be
-cross-compiled from macOS, because `alsa-sys` has no sysroot to find. See
+notarized macOS bundle, and `build-cross.sh`, which cross-builds the Windows
+installer and both Linux tarballs from a macOS host. `build-linux-native.sh`
+builds natively on a Linux machine, and `build-freebsd.sh` on FreeBSD. See
 `docs/RELEASE.md` for the full procedure.
 
 ## Platform notes
 
 - **macOS.** Release builds are signed with a Developer ID certificate and
-  notarized by Apple, with the ticket stapled to the bundle, so the app opens on
-  a double-click with no Gatekeeper prompt and no need to be online.
-- **Windows.** The executable is unsigned, so SmartScreen shows "Windows
+  notarized by Apple, with the ticket stapled to the bundle, so the app opens
+  on a double-click with no Gatekeeper prompt and no need to be online.
+- **Windows.** The installer is unsigned, so SmartScreen shows "Windows
   protected your PC" on first run. Click **More info**, then **Run anyway**.
-  Code-signing certificates for individual developers cost a few hundred a year,
-  and this app is free, so that is on hold for now.
-- **Linux.** Untar the release archive, `chmod +x tangent`, and run `./tangent`.
-  MIDI goes through ALSA, so `libasound.so.2` must be present (`libasound2` on
-  Debian and Ubuntu, `alsa-lib` elsewhere). PipeWire systems work unchanged,
-  since the keyboard still appears as an ordinary ALSA sequencer port. The
-  archive includes `tangent.desktop`, an icon, and the fonts if you want a desktop
-  entry. The fonts themselves are already embedded in the binary. Wayland and
-  X11 are both supported, though some tiling and Wayland compositors treat
-  Tangent's fixed window sizes as advisory.
+  Code-signing certificates for individual developers cost a few hundred a
+  year, and this app is free, so that is on hold for now.
+- **Linux.** The tarball's `install.sh` installs to your home directory with
+  no root. Two system libraries need to be present. MIDI and audio go through
+  ALSA, so `libasound.so.2` is required (`libasound2` on Debian and Ubuntu,
+  `alsa-lib` elsewhere); it is on essentially every desktop already. LV2
+  hosting needs `liblilv-0.so.0`, which arrives with PipeWire or ffmpeg on
+  nearly every distribution; the one common desktop without it is stock
+  Ubuntu GNOME, where it is `sudo apt install liblilv-0-0`. `install.sh`
+  checks both and prints your distribution's command. Filming a take wants a
+  Vulkan driver (mesa's lavapipe works on any GPU). PipeWire systems work
+  unchanged, and JACK is selectable in Audio Setup for pro-audio sessions.
+  Wayland and X11 are both supported, though some tiling compositors treat
+  Tangent's window sizes as advisory.
 
 ## Fonts and licensing
 
-Tangent's executable embeds six font files, all free and libre. Every release
+Tangent's executable embeds ten font files, all free and libre. Every release
 artifact carries the full license text for each one.
 
 **Courier Prime** (Regular and Bold) is the UI typeface, Copyright 2015 The
@@ -244,16 +232,17 @@ Courier Prime Project Authors, licensed under the
 (`OFL.txt`) ships alongside the fonts. Tangent does **not** bundle or
 redistribute Courier New.
 
-**Terminess Nerd Font Mono** is bundled as an optional UI typeface, selectable
-from the context menu. Copyright (C) 2020 Dimitar Toshkov Zhekov and (C) 2023
-Tilman Blumenbach, also under the SIL Open Font License 1.1. Its license text
-ships as `font-licenses/Terminess-OFL-1.1.txt`.
+**Terminess Nerd Font Mono** (Copyright 2020 Dimitar Toshkov Zhekov, 2023
+Tilman Blumenbach) and **JetBrains Mono** (Copyright 2020 The JetBrains Mono
+Project Authors) are bundled as optional UI typefaces, selectable from the
+context menu, both under the SIL Open Font License 1.1. Their license texts
+ship in `font-licenses/`.
 
 Four more fonts come in automatically with eframe/egui's `default_fonts`
 feature (the `epaint_default_fonts` crate) and serve as glyph fallback for
-anything Courier Prime does not cover. The context menu's submenu arrow (⏵), for
-instance, exists only in `emoji-icon-font`. Their license texts ship in the
-`font-licenses/` folder of every artifact:
+anything Courier Prime does not cover. The context menu's submenu arrow (⏵),
+for instance, exists only in `emoji-icon-font`. Their license texts ship in
+the `font-licenses/` folder of every artifact:
 
 | Font | Copyright | License | Text |
 |---|---|---|---|
@@ -263,33 +252,19 @@ instance, exists only in `emoji-icon-font`. Their license texts ship in the
 | emoji-icon-font | 2014 John Slegers | MIT | `font-licenses/emoji-icon-font-MIT.txt` |
 
 No font is modified, subset, or sold standalone. Tangent's own MIT grant
-([LICENSE](LICENSE)) covers Tangent's code only. The embedded fonts remain under
-the licenses above. A `custom_font_path` setting lets you point Tangent at any
-TTF or OTF installed on your own machine instead.
-
-## Settings compatibility with Tangent 1.1.0
-
-Tangent reads and writes the same settings file as the Python app,
-`~/.config/tangent/settings.json`, at that literal path on **all** platforms, with
-the same keys and formats. Upgrading from Python Tangent 1.1.0 carries all your
-settings over untouched. Tangent 2.x adds a single optional key
-(`custom_font_path`, edited by hand, since there is no UI for it) and preserves
-any keys it does not recognize.
-
-One-way caveat: if you later run Python Tangent 1.1.0 again, it rewrites the file
-with its fixed key set, discarding `custom_font_path` and any other additions.
-Taught chord names live in a separate file (`overrides.json`) that the Python app
-never touches.
+([LICENSE](LICENSE)) covers Tangent's code only. The embedded fonts remain
+under the licenses above. A `custom_font_path` setting lets you point Tangent
+at any TTF or OTF installed on your own machine instead.
 
 ## Changes
 
-Release history, including the Python lineage, is in
+Release history, including the original Python lineage, is in
 [CHANGELOG.md](CHANGELOG.md).
 
 ## Thanks
 
-- **Omer**, for the rounded macOS app icon, the one Tangent wears in the Dock
-  and in Finder.
+- **Omer**, for the rounded macOS app icon of the 2.x era; the current icon is
+  the app's own Tonnetz wordmark.
 - **Hatsu**, for extensive Windows testing and feedback, on a platform the
   author does not develop on and could not have got right alone.
 - **Joanne**, for knowing what the sheet music panel had to be before it
