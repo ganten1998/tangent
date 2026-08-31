@@ -72,12 +72,14 @@ directory, drop the `exclude` line from the root `Cargo.toml`, and put
 # Vendored `cpal`
 
 `cpal/` is [`cpal` 0.16.0](https://github.com/RustAudio/cpal) (Apache-2.0) with
-**one host added and nothing else changed**. Everything new is behind
-`#[cfg(target_os = "freebsd")]`, so macOS, Windows and Linux compile the same
-code they compiled from crates.io and produce the same binary. That constraint
-is the whole discipline here: `[patch.crates-io]` is not target-conditional, so
-this copy is what *every* platform builds, and the moment it diverges outside a
-freebsd cfg it stops being a patch and becomes a fork of everybody's audio.
+**one host added and one error that was never reported at all**. The host is
+behind `#[cfg(target_os = "freebsd")]`; the other change is in the ALSA host,
+which macOS and Windows never compile. Those two therefore build the same code
+they built from crates.io and produce the same binary. That constraint is the
+whole discipline here: `[patch.crates-io]` is not target-conditional, so this
+copy is what *every* platform builds, and the moment it diverges where an
+unfeatured platform can see it, it stops being a patch and becomes a fork of
+everybody's audio.
 
 ## Why
 
@@ -136,6 +138,43 @@ Idle, all three run clean. `CPAL_OSS_FRAGMENTS` raises the count for a machine
 that crackles, which is the right direction for an escape hatch: the default is
 fast, the override is safe. The real answer for load robustness is realtime
 scheduling, which FreeBSD has via `mac_priority(4)`.
+
+## The second change: the ALSA host stops swallowing underruns
+
+`host/alsa/mod.rs`'s write path had this, and the honesty of it is the problem:
+
+```rust
+Err(err) if err.errno() == libc::EPIPE => {
+    // buffer underrun
+    // TODO: Notify the user of this.
+    let _ = stream.channel.try_recover(err, false);
+}
+```
+
+**An underrun on the ALSA path was audible at the speakers and invisible to the
+application.** No error callback, no counter, nothing to log. A host cannot
+report a glitch it is never told about, so a session somebody is describing as
+crackling looks perfectly healthy from inside the program — which is what
+happened here, and what made an afternoon of "no xruns measured" mean much less
+than it appeared to.
+
+Note what upstream does two match arms further down: every OTHER write error
+reaches `error_callback`. Only the one that happens in normal use was dropped.
+
+It now reports through `BackendSpecific`, the only channel cpal has. Recovery is
+attempted first and the stream continues either way, exactly as before — the
+behaviour is unchanged, the silence is not.
+
+**This has a sharp edge worth naming.** A host that treats any stream error as a
+dead device will now rebuild on a click, which is worse than the click. That is
+not hypothetical — it is what cpal's JACK backend already does to this app by
+reporting a buffer-size NOTIFICATION through the same channel. So the
+description begins `xrun`, so a host can tell a recovered glitch from a device
+that has gone, and Tangent counts it rather than latching it (`Engine::xruns`).
+A backend that reports nothing leaves a host no move at all; a backend that
+reports everything as fatal leaves it a bad one.
+
+Upstream-able, and the `TODO` says upstream already wanted it.
 
 ## Upstream
 
