@@ -72,12 +72,24 @@ directory, drop the `exclude` line from the root `Cargo.toml`, and put
 # Vendored `cpal`
 
 `cpal/` is [`cpal` 0.16.0](https://github.com/RustAudio/cpal) (Apache-2.0) with
-**one host added and nothing else changed**. Everything new is behind
-`#[cfg(target_os = "freebsd")]`, so macOS, Windows and Linux compile the same
-code they compiled from crates.io and produce the same binary. That constraint
-is the whole discipline here: `[patch.crates-io]` is not target-conditional, so
-this copy is what *every* platform builds, and the moment it diverges outside a
-freebsd cfg it stops being a patch and becomes a fork of everybody's audio.
+**one host added and three things the backends got wrong about their own
+errors**. The host is behind `#[cfg(target_os = "freebsd")]`; of the other
+three, two are in the JACK backend — which compiles only where the `jack`
+feature is on — and one is in the ALSA host, which macOS and Windows never
+compile either. So those two platforms still build the code they built from
+crates.io and produce the same binary. That constraint is the whole discipline
+here: `[patch.crates-io]` is not target-conditional, so this copy is what
+*every* platform builds, and the moment it diverges where an unfeatured
+platform can see it, it stops being a patch and becomes a fork of everybody's
+audio.
+
+The three are one finding wearing three hats, and it is worth saying once
+here: **cpal's error callback is the only channel its backends have, and they
+each use it wrongly.** JACK sends a routine buffer-size NOTIFICATION down it,
+so a host that believes a stream error rebuilds forever. ALSA sends nothing at
+all for an underrun, so a host cannot see a glitch it is never told about. One
+backend cries wolf and the other stays silent, and a host cannot be correct
+against both without knowing this.
 
 ## Why
 
@@ -137,6 +149,107 @@ that crackles, which is the right direction for an escape hatch: the default is
 fast, the override is safe. The real answer for load robustness is realtime
 scheduling, which FreeBSD has via `mac_priority(4)`.
 
+## The second change: what the JACK client is called
+
+`host/jack/mod.rs` seeds `Host::name` with `"Tangent"` where upstream has
+`"cpal_client"`. cpal appends `_in`/`_out` per client, so this is the
+difference between a patchbay showing `Tangent_out:out_0` and showing
+`cpal_client_out:out_0` — the name of a library the user has never heard of, on
+the ports they are being asked to connect. Naming your client is not an
+oversight upstream: `Host::input_device_with_name` exists for exactly this. It
+is unreachable here, because it is a method on the concrete backend and
+`cpal::Host` is an opaque enum, so an app that gets its host from
+`host_from_id` — which is every app that lets the user choose an audio system —
+can only take the constant.
+
+It is one line and it touches no behaviour: JACK resolves name collisions
+itself and cpal already reads the granted name back out of the client
+(`device.rs`, `client.name()`), so two Tangents on one graph work exactly as two
+cpal_clients did.
+
+This one wants an upstream fix rather than an upstream copy of the string — a
+name on `HostId::Jack` at `host_from_id` time, or a `Host::with_name`. Until
+then the constant is the only place it fits.
+
+## The third change: a notification is not an error
+
+`host/jack/stream.rs`'s `NotificationHandler::buffer_size` told the host, through
+the ERROR callback, that the graph's buffer size had changed — having already
+resized its scratch and gone on to return `Control::Continue`. By cpal's own
+account nothing had failed. It reported that way because the JACK backend has no
+notification channel and the error one was the only way out.
+
+**It is not a cosmetic miscategorisation.** A host cannot distinguish it from a
+real fault, and it fires on EVERY activation: `Stream::new_output` seeds
+`buffer_size` from `client.buffer_size()` on a client that has not joined the
+graph yet, and under pipewire-jack that is not the size the graph then runs. An
+app that reads a stream error as "the device is gone" — the correct reading —
+tears its engine down, reopens, and is told the same thing again. Measured here
+before the change: **Tangent's JACK path produced no sound at all**, rebuilding
+its engine about once a second, while a flat meter and a low idle CPU made it
+look like an efficient one.
+
+It now goes to `eprintln!`, which is how this backend already reports (`mod.rs`
+prints its device-creation failures) and which costs no dependency — `cpal` does
+not pull `log`, and adding one to a vendored copy is a wider divergence than the
+message is worth. Deliberately not dropped: losing the fact is a smaller version
+of the same mistake, and a graph that resized under you is worth knowing.
+
+This is the most upstream-able of the three, and the one that is least about us:
+every host embedding cpal's JACK backend has it.
+
+## The fourth change: the ALSA host stops swallowing underruns
+
+`host/alsa/mod.rs`'s write path had this, and the honesty of it is the problem:
+
+```rust
+Err(err) if err.errno() == libc::EPIPE => {
+    // buffer underrun
+    // TODO: Notify the user of this.
+    let _ = stream.channel.try_recover(err, false);
+}
+```
+
+**An underrun on the ALSA path was audible at the speakers and invisible to the
+application.** No error callback, no counter, nothing to log. A host cannot
+report a glitch it is never told about, so a session somebody is describing as
+crackling looks perfectly healthy from inside the program — which is what
+happened here, and what made an afternoon of "no xruns measured" mean much less
+than it appeared to.
+
+Note what upstream does two match arms further down: every OTHER write error
+reaches `error_callback`. Only the one that happens in normal use was dropped.
+
+It now reports through `BackendSpecific`, the only channel cpal has. Recovery is
+attempted first and the stream continues either way, exactly as before — the
+behaviour is unchanged, the silence is not.
+
+**There are THREE such sites and the obvious one is the least important.** The
+`writei` arm above is where an underrun is easiest to see when reading the
+file, and it is not where they arrive. The two that matter are the
+`PollDescriptorsFlow::XRun` arms — one per direction — reached when
+`snd_pcm_avail` returns `EPIPE`; upstream prepares the stream again, continues,
+and reports **only if the recovery itself failed**. So the normal case, the one
+that happens whenever a machine cannot keep up with the buffer it was given,
+was silent by construction.
+
+That distinction was not free. Patching only the `writei` arm produced an
+application whose dropout counter read **zero** while its user described the
+output at a 64-frame buffer as "total noise" — an instrument that looked like
+it worked, agreed with a broken theory, and would have been believed. All
+three arms report now.
+
+**This has a sharp edge worth naming.** A host that treats any stream error as a
+dead device will now rebuild on a click, which is worse than the click. That is
+not hypothetical — it is what cpal's JACK backend already does to this app by
+reporting a buffer-size NOTIFICATION through the same channel. So the
+description begins `xrun`, so a host can tell a recovered glitch from a device
+that has gone, and Tangent counts it rather than latching it (`Engine::xruns`).
+A backend that reports nothing leaves a host no move at all; a backend that
+reports everything as fatal leaves it a bad one.
+
+Upstream-able, and the `TODO` says upstream already wanted it.
+
 ## Upstream
 
 This should go back: <https://github.com/RustAudio/cpal>. FreeBSD is a
@@ -145,3 +258,25 @@ first-class cpal target already — the ALSA host is selected there deliberately
 adding a new one. When it lands, delete this directory, drop the `exclude` and
 `[patch.crates-io]` lines from the root `Cargo.toml`, and go back to
 `cpal = "0.x"`.
+
+
+---
+
+# Vendored `jack-sys`
+
+`jack-sys/` is [`jack-sys` 0.5.1](https://github.com/RustAudio/rust-jack)
+(MIT OR Apache-2.0) with **one conditional added to `build.rs`** and no other
+change. It has its own `PATCH.md`, because unlike the two above it is not about
+a platform building — it is about what ends up in the artifact's `DT_NEEDED`.
+
+The short version: `dynamic_loading` is a default feature of the `jack` crate
+and means libjack is `dlopen`ed at run time, which is the only reason a shipped
+binary can offer JACK without requiring it. `jack-sys`'s build script probed
+pkg-config for libjack anyway and `unwrap()`ed the result on Linux, which both
+made the build need development files it never reads and — worse, because it is
+silent — emitted `cargo:rustc-link-lib=jack`, putting the library back in
+`DT_NEEDED` and producing an artifact that will not start on a desktop without
+it. The probe now runs only when `dynamic_loading` is off.
+
+Verified on the Linux x86_64 artifact: `readelf -d` gains nothing, and
+`jack_sys::library()` opens `libjack.so.0` at run time where one exists.

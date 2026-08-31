@@ -4353,25 +4353,51 @@ pub fn show(
                                             RichText::new(name).font(plain(11.0)).color(t.text),
                                         );
                                         // **What is RUNNING, and — when they
-                                        // differ — what was asked for.**
+                                        // differ — what was asked for and WHY
+                                        // it was not granted.**
                                         //
-                                        // A device's buffer size belongs to
-                                        // the DEVICE: another host holding the
-                                        // same interface dictates it, and the
-                                        // request is simply not granted. The
-                                        // panel used to print the request, so
-                                        // it read 128 while the room ran 512
-                                        // and nothing anywhere said so.
+                                        // The panel used to print the request,
+                                        // so it read 128 while the room ran 512
+                                        // and nothing anywhere said so. Naming
+                                        // both numbers fixed that and left a
+                                        // worse problem: it also named a CAUSE,
+                                        // "another app owns this device", which
+                                        // is the CoreAudio answer. There,
+                                        // another host holding the interface
+                                        // really does dictate the size.
+                                        //
+                                        // On a PipeWire machine it is the GRAPH,
+                                        // and no second app need exist. One
+                                        // user was told that about a machine
+                                        // running nothing else, while the
+                                        // number that actually decided it sat
+                                        // in a config file the app had never
+                                        // mentioned — so the message was not
+                                        // merely wrong, it pointed away from
+                                        // the only thing that would have helped.
+                                        //
+                                        // So: say the floor when the floor is
+                                        // knowable, and say nothing about cause
+                                        // when it is not. An unexplained number
+                                        // is a smaller failure than a confident
+                                        // wrong explanation.
                                         let real = s.observed_frames.or(s.buffer_frames);
+                                        let asked = s.buffer_frames.unwrap_or(0);
                                         let buf = match (real, s.buffer_ms()) {
                                             (Some(f), Some(ms)) if s.honoured() => {
                                                 format!("{f} frames  ({ms:.1} ms)")
                                             }
-                                            (Some(f), Some(ms)) => format!(
-                                                "{f} frames  ({ms:.1} ms)  - asked for {}, \
-                                                 another app owns this device",
-                                                s.buffer_frames.unwrap_or(0)
-                                            ),
+                                            (Some(f), Some(ms)) => match status.graph_floor {
+                                                Some(floor) if asked < floor => format!(
+                                                    "{f} frames  ({ms:.1} ms)  - asked for \
+                                                     {asked}; this machine's audio graph will \
+                                                     not serve below {floor}"
+                                                ),
+                                                _ => format!(
+                                                    "{f} frames  ({ms:.1} ms)  - asked for \
+                                                     {asked}, and the device gave this instead"
+                                                ),
+                                            },
                                             // The device chose and did not say
                                             // what it chose — which is what
                                             // cpal's `BufferSize::Default`
@@ -4435,6 +4461,35 @@ pub fn show(
                                 .font(plain(10.0))
                                 .color(dim),
                             );
+
+                            // ── dropouts ─────────────────────────────────────
+                            //
+                            // **Drawn only when somebody could actually count.**
+                            // `None` is not zero: on a PipeWire desktop the
+                            // client-side counter is structurally blind
+                            // (pipewire-alsa absorbs the underrun before cpal
+                            // hears it), so this number comes from the graph's
+                            // own tally where there is one. A session that was
+                            // audibly "total noise" once showed a clean panel
+                            // because the only counter anybody read could not
+                            // fire — rendering silence for "unknown" is how
+                            // that stays fixed, and rendering 0 for it is how
+                            // it happened.
+                            if let Some(n) = status.dropouts {
+                                let (text, color) = if n == 0 {
+                                    ("no dropouts since this stream opened".to_owned(), dim)
+                                } else {
+                                    (
+                                        format!(
+                                            "{n} dropout{} since this stream opened - each \
+                                             one is a gap in what was heard and recorded",
+                                            if n == 1 { "" } else { "s" }
+                                        ),
+                                        warn,
+                                    )
+                                };
+                                ui.label(RichText::new(text).font(plain(10.0)).color(color));
+                            }
 
                             // ── who else is in the path ──────────────────────
                             //
@@ -4511,14 +4566,32 @@ pub fn show(
                             }
                             ui.add_space(10.0);
 
+                            // **What these two rows mean under JACK.** The
+                            // server runs one period and one rate for the whole
+                            // graph and tells its clients what they are, so both
+                            // controls below are still worth SHOWING — they are
+                            // what gets used the moment the system goes back to
+                            // ALSA — and are not worth pretending about while
+                            // JACK is selected. Said rather than greyed out
+                            // because this is the saved setting and the engine
+                            // falls back to ALSA when no server answered; the
+                            // Audio Status line reports the period actually
+                            // running either way, and it is the one to believe.
+                            let jack_note = (system.as_deref() == Some("JACK")).then_some(
+                                "JACK sets this for the whole graph; change it in the server",
+                            );
+
                             // ── the audio system ─────────────────────────────
                             // Drawn even when there is one, and saying so.
                             // cpal compiles in a single host per platform
-                            // unless a cargo feature asks for more, so on most
-                            // builds this row is a READOUT — and a readout that
-                            // names the driver stack is worth having, because
-                            // "ALSA" on a PipeWire machine is the sentence that
-                            // explains why the buffer behaves the way it does.
+                            // unless a cargo feature asks for more, so on macOS
+                            // and Windows this row is a READOUT — and a readout
+                            // that names the driver stack is worth having,
+                            // because "ALSA" on a PipeWire machine is the
+                            // sentence that explains why the buffer behaves the
+                            // way it does. On Linux and FreeBSD, where JACK is
+                            // compiled in beside it, the same row is the choice
+                            // between that sentence and the graph itself.
                             ui.label(RichText::new("SYSTEM").font(bold(11.0)).color(t.text));
                             if systems.len() <= 1 {
                                 ui.label(
@@ -4571,9 +4644,9 @@ pub fn show(
                                 }
                             });
                             ui.label(
-                                RichText::new(
+                                RichText::new(jack_note.unwrap_or(
                                     "what the input offers; the output follows where it can",
-                                )
+                                ))
                                 .font(plain(10.0))
                                 .color(dim),
                             );
@@ -4595,9 +4668,11 @@ pub fn show(
                                 }
                             });
                             ui.label(
-                                RichText::new("both streams reopen; not while a take is rolling")
-                                    .font(plain(10.0))
-                                    .color(dim),
+                                RichText::new(jack_note.unwrap_or(
+                                    "both streams reopen; not while a take is rolling",
+                                ))
+                                .font(plain(10.0))
+                                .color(dim),
                             );
                             ui.add_space(10.0);
 

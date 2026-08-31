@@ -317,6 +317,23 @@ struct Recorder {
     /// `reconcile_audio` will settle to "missing" and say so.
     rate_open: Option<u32>,
     system_open: Option<String>,
+    /// Dropouts already reported, so only the new ones are announced.
+    xruns_seen: u64,
+    /// The graph's own count of this process's xruns, watched on a timer.
+    ///
+    /// The authority on a PipeWire desktop, where the client-side counter is
+    /// structurally blind — pipewire-alsa absorbs the EPIPE and cpal never
+    /// hears it, verified with a 64-frame buffer the owner called "total
+    /// noise" against an app log with zero backend errors. Off Linux it
+    /// answers `None` forever and starts no thread.
+    graph_dropouts: tangent_record::audio::GraphDropouts,
+    /// The graph's floor, refreshed on the same edge that reopens the streams.
+    ///
+    /// Cached because reading it costs a process (`pw-metadata`), and a panel
+    /// that spawned one every frame would be a worse bug than the one this
+    /// fixes. The edge is the right moment anyway: the floor only matters when
+    /// a buffer is being asked for.
+    graph_floor: Option<u32>,
     /// The last finished take this host has already accounted for.
     ///
     /// Updated whether or not "Show when done" is ticked, which is the point:
@@ -1683,6 +1700,19 @@ impl DesktopApp {
                 .as_ref()
                 .filter(|_| self.app.input_monitor())
                 .map(crate::instrument::Engine::monitor_backlog_ms),
+            // **Read every frame, and cheaply.** `graph_clock` shells to
+            // `pw-metadata` on Linux and answers `None` everywhere else, so
+            // this is a process spawn per frame and that is too much — it is
+            // cached in `Recorder::graph_floor` and refreshed on the same edge
+            // that reopens the streams, which is the only moment it can have
+            // changed for a reason this app cares about.
+            graph_floor: self.recorder.graph_floor,
+            // `None` off Linux and wherever the graph cannot be read — which
+            // the panel must render as nothing, never as zero.
+            dropouts: tangent_record::audio::merge_dropouts(
+                self.recorder.graph_dropouts.latest(),
+                self.recorder.engine.as_ref().map_or(0, |e| e.xruns()),
+            ),
         });
 
         // The buffer size, on the edge. Reopening both streams is expensive —
@@ -1700,6 +1730,42 @@ impl DesktopApp {
         if let Some(engine) = self.recorder.engine.as_ref() {
             let fault = engine.fault();
             let (running, callbacks) = engine.health();
+            // **The dropout counter, actually read.**
+            //
+            // `Engine::xruns` exists because the ALSA backend used to swallow
+            // underruns entirely (`vendor/cpal/src/host/alsa/mod.rs`), so a
+            // glitch was audible in the room and invisible to the program. It
+            // was then counted and READ BY NOTHING, which is the same failure
+            // one step later: a number nobody looks at is not instrumentation.
+            //
+            // Logged on the edge rather than per frame, and at warn level,
+            // because this is the line somebody grepping a log after "it
+            // crackled" needs to find. It is also the only place the two
+            // buffer settings can be told apart by anything other than an ear.
+            // Merged, not preferred: each counter has been measured blind on
+            // one of the two paths this ships on, in opposite directions —
+            // `merge_dropouts`'s doc carries both measurements.
+            let xruns = tangent_record::audio::merge_dropouts(
+                self.recorder.graph_dropouts.latest(),
+                engine.xruns(),
+            )
+            .unwrap_or(0);
+            // A reopen makes NEW nodes with fresh counters, so the number can
+            // legitimately fall; chase it down rather than hiding every
+            // dropout the new stream has until it beats the old one's total.
+            if xruns < self.recorder.xruns_seen {
+                self.recorder.xruns_seen = xruns;
+            }
+            if xruns > self.recorder.xruns_seen {
+                log::warn!(
+                    "audio dropouts: {} since this stream opened (+{} just now) - \
+                     the backend recovered each one, and each is a gap in what \
+                     was heard and recorded",
+                    xruns,
+                    xruns - self.recorder.xruns_seen,
+                );
+                self.recorder.xruns_seen = xruns;
+            }
             let stalled =
                 self.recorder
                     .engine_watch
@@ -1791,6 +1857,14 @@ impl DesktopApp {
             self.recorder.buffer_open = want_buffer;
             self.recorder.rate_open = want_rate;
             self.recorder.system_open = want_system.clone();
+            // The graph may have been reconfigured since the last open — by
+            // the user editing PipeWire's config to fix exactly what this
+            // reports, which is the case worth getting right.
+            self.recorder.graph_floor =
+                tangent_record::audio::graph_clock().map(|g| g.floor());
+            // A new stream has a new counter; keeping the old high-water mark
+            // would hide every dropout the next one has until it beat the last.
+            self.recorder.xruns_seen = 0;
             // The system FIRST, and before anything is opened: every device
             // lookup in `tangent_record::audio` goes through it, so setting it
             // after the streams were built would open them on the old stack and
@@ -7180,6 +7254,9 @@ impl DesktopApp {
                 buffer_open: app.buffer_frames(),
                 rate_open: app.sample_rate(),
                 system_open: app.audio_system(),
+                xruns_seen: 0,
+                graph_dropouts: tangent_record::audio::GraphDropouts::start(),
+                graph_floor: tangent_record::audio::graph_clock().map(|g| g.floor()),
                 seen_take: None,
                 dev_editor_done: false,
             }

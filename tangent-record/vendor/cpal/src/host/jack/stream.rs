@@ -386,11 +386,35 @@ impl jack::ProcessHandler for LocalProcessHandler {
             self.buffer_size = new_size;
             self.temp_input_buffer = vec![0.0; self.in_ports.len() * new_size];
             self.temp_output_buffer = vec![0.0; self.out_ports.len() * new_size];
-            let description = format!("buffer size changed to: {}", new_size);
-            if let Ok(mut mutex_guard) = self.error_callback_ptr.lock() {
-                let err = &mut *mutex_guard;
-                err(BackendSpecificError { description }.into());
-            }
+            // **PATCH: a notification is not an error. See
+            // `tangent-record/vendor/README.md`.**
+            //
+            // Upstream reports this through the ERROR callback — and by its own
+            // account nothing has failed: the two lines above have already
+            // resized the scratch and the handler goes on to return
+            // `Control::Continue`. cpal's JACK backend simply has no
+            // notification channel, so the only way out was the error one.
+            //
+            // A host cannot tell this apart from a real fault, and the cost is
+            // not theoretical. It fires on EVERY activation, because
+            // `Stream::new_output` seeds `buffer_size` from
+            // `client.buffer_size()` on a client that has not joined the graph
+            // yet, and under pipewire-jack that is not the size the graph then
+            // runs. An app that treats a stream error as "the device is gone"
+            // — which is the correct reading of a stream error — tears its
+            // engine down, reopens, and is told again, forever. Measured here
+            // as a JACK path that produced no sound at all while looking, from
+            // the outside, like an efficient one.
+            //
+            // NOT swallowed: losing the fact is a smaller version of the same
+            // mistake, and a graph that changed size under you is worth
+            // knowing. `eprintln!` rather than `log`, because cpal does not
+            // depend on `log` and adding a dependency to a vendored copy is a
+            // wider divergence than this is worth — and because the jack host
+            // already reports this way (`mod.rs` prints its device-creation
+            // errors). It is rare by construction: only a real change reaches
+            // here, the two lines above having filtered the no-ops.
+            eprintln!("cpal jack: buffer size changed to {new_size}");
         }
 
         jack::Control::Continue

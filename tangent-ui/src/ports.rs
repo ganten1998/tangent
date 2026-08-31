@@ -206,10 +206,12 @@ pub trait CaptureDevices: Send {
 pub trait AudioSetup: Send {
     /// Every audio system this build can open, in the backend's own order.
     ///
-    /// Usually one. cpal compiles in exactly one host per platform unless a
-    /// cargo feature asks for more, and both of the extras — JACK and ASIO —
-    /// need a development library present when the release is BUILT. Listed
-    /// from the real enumeration anyway, so the panel says what this build has.
+    /// One on macOS and Windows; two on Linux and FreeBSD, where JACK is
+    /// compiled in beside ALSA. (It costs those artifacts no dependency:
+    /// libjack is `dlopen`ed on demand. ASIO is the one extra that genuinely
+    /// needs a library present when the release is BUILT, which is why it is
+    /// still behind a cargo feature.) Listed from the real enumeration either
+    /// way, so the panel says what this build has rather than what was hoped.
     fn systems(&self) -> Vec<String>;
 
     /// The rates the input device now selected will actually open at.
@@ -249,6 +251,28 @@ pub trait AudioSetup: Send {
     /// Enumerates hardware, so it is snapshotted when the panel opens and
     /// never pushed per frame — the same rule `rates` follows.
     fn output_path(&self, device: Option<&str>) -> OutputPath;
+
+    /// **The smallest buffer the machine's audio graph will actually serve**,
+    /// or `None` where the question does not apply.
+    ///
+    /// A PipeWire graph runs one period for every client at once, clamped to a
+    /// floor set in its configuration. A client asking for less is not refused —
+    /// it is quietly given the floor. So the buffer control could ask for 256,
+    /// be handed 512, and have nothing true to say about why.
+    ///
+    /// What it said instead was "another app owns this device", which is the
+    /// CoreAudio explanation: on that platform another host holding the
+    /// interface really does dictate the size. Here it is the graph, and no
+    /// second app need exist. The panel told one user that about their own
+    /// machine while nothing else was running, and the number that actually
+    /// decided the outcome was one line in a config file the app never
+    /// mentioned.
+    ///
+    /// A plain number, because the firewall means this side cannot ask a graph
+    /// anything and should not learn how.
+    fn graph_floor_frames(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// **What the OS says about the device the monitor plays into.**

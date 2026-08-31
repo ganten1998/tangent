@@ -32,7 +32,16 @@ pub struct Host {
 impl Host {
     pub fn new() -> Result<Self, crate::HostUnavailable> {
         let mut host = Host {
-            name: "cpal_client".to_owned(),
+            // **PATCH: the client's name in the JACK graph. See
+            // `tangent-record/vendor/README.md`.** Upstream is "cpal_client",
+            // which reaches every patchbay on the machine as
+            // `cpal_client_out:out_0` — the name of a library the user has
+            // never heard of, on the ports they are being asked to connect.
+            // cpal offers `Host::input_device_with_name` to change it, but
+            // that method is on the concrete backend and `cpal::Host` is an
+            // opaque enum, so nothing reached through `host_from_id` can call
+            // it. A constant is the only place the fix fits.
+            name: "Tangent".to_owned(),
             connect_ports_automatically: true,
             start_server_automatically: false,
             devices_created: vec![],

@@ -1000,6 +1000,31 @@ pub struct AudioReport {
     pub channels: u16,
     pub bits: u16,
     pub frames: u64,
+    /// **What the take's own duration says there should have been.**
+    ///
+    /// `VideoReport` has carried `frames_expected` beside `frames_received`
+    /// since §7, and the audio half has never had the pair. That asymmetry hid
+    /// a real take: 30.17 s long by its own `duration_seconds`, 845568 frames
+    /// in the file, and every indicator saying `complete: true` with no
+    /// `aborted_reason`. Nineteen seconds of audio for a thirty-second take,
+    /// and no field in the manifest could express the difference.
+    ///
+    /// A dropout does not do this — dropouts are PADDED (see
+    /// `frames_dropped`), so they keep the file sample-accurate and
+    /// full-length. Frames that are never received and never padded are a
+    /// different fault, and until this field existed there was nothing to
+    /// notice it with. Derived from the same clock as `duration_seconds`, so
+    /// the two cannot disagree about what a second is.
+    pub frames_expected: u64,
+    /// **Frames the ring could not hold, and the meter never saw.**
+    ///
+    /// Tracked all along and surfaced only as a sentence in the take summary —
+    /// a number that reaches the user in prose and never reaches the file.
+    /// `clipped` is latched into the manifest precisely because a fault six
+    /// seconds in is invisible by the time anybody looks; this is the same
+    /// argument and has the stronger claim, because these frames are silence
+    /// that will never be heard as missing.
+    pub frames_dropped: u64,
     /// Peak level over the whole take. `-inf` for digital silence, which is why
     /// the JSON writer has to handle a non-finite number.
     pub peak_dbfs: f64,
@@ -1082,6 +1107,8 @@ impl Default for AudioReport {
             channels: 2,
             bits: 24,
             frames: 0,
+            frames_expected: 0,
+            frames_dropped: 0,
             peak_dbfs: f64::NEG_INFINITY,
             clipped: false,
             output_delay_ns: None,
@@ -1354,6 +1381,8 @@ impl Manifest {
                     ("channels", Json::Int(i64::from(self.audio.channels))),
                     ("bits", Json::Int(i64::from(self.audio.bits))),
                     ("frames", Json::Int(self.audio.frames as i64)),
+                    ("frames_expected", Json::Int(self.audio.frames_expected as i64)),
+                    ("frames_dropped", Json::Int(self.audio.frames_dropped as i64)),
                     ("peak_dbfs", Json::Num(self.audio.peak_dbfs)),
                     ("clipped", Json::Bool(self.audio.clipped)),
                     (
@@ -2006,6 +2035,40 @@ mod tests {
         assert!((m.audio.epsilon_ppm - 50.0).abs() < 0.5, "{}", m.audio.epsilon_ppm);
         assert!((m.audio.true_rate.expect("fitted") - 48_002.4).abs() < 0.1);
         assert!((m.duration_seconds - 1_200.0).abs() < 0.2);
+    }
+
+    /// **The audio half reports expected-against-written, as the video half
+    /// always has.**
+    ///
+    /// The asymmetry this closes let a real take through: `duration_seconds`
+    /// 30.17, a WAV holding 19.17 s of it, `complete: true` and no
+    /// `aborted_reason` — eleven seconds gone with no field in the manifest
+    /// able to say so, while three lines further down the video half was
+    /// reporting 112 expected against 59 received without being asked.
+    ///
+    /// A dropout is NOT this: dropouts are padded, so they leave the length
+    /// right. `frames_dropped` is here for its own reason — it was tracked all
+    /// along and reached the user only as a sentence, never as a number in the
+    /// file, which is the same argument `clipped` is latched for.
+    #[test]
+    fn the_audio_half_says_how_many_frames_it_expected_and_not_only_how_many_it_got() {
+        let mut m = manifest();
+        m.duration_seconds = 30.0;
+        m.audio.nominal_rate = 44_100.0;
+        m.audio.frames = 845_568;
+        m.audio.frames_expected = 1_323_000;
+        m.audio.frames_dropped = 128;
+        let out = m.render();
+        for field in [
+            "\"frames\": 845568",
+            "\"frames_expected\": 1323000",
+            "\"frames_dropped\": 128",
+        ] {
+            assert!(out.contains(field), "manifest is missing {field}:\n{out}");
+        }
+        // The shortfall has to be a SUBTRACTION a reader can do, which is the
+        // whole point of carrying both numbers rather than a verdict.
+        assert_eq!(m.audio.frames_expected - m.audio.frames, 477_432);
     }
 
     /// **A backend that declined to report its output delay writes `null`,
