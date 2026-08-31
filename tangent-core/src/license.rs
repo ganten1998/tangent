@@ -1,6 +1,6 @@
 //! Supporter licenses: offline Ed25519 verification.
 //!
-//! Ivory is free. A license unlocks *additive* extras (themes and the like) —
+//! Tangent is free. A license unlocks *additive* extras (themes and the like) —
 //! it never gates anything that works without one. Everything here therefore
 //! **fails open**: a missing, corrupt, truncated, mistyped, unknown-version or
 //! unreadable license yields the free app, never an error the user must clear.
@@ -93,17 +93,17 @@ impl LicenseError {
     pub fn message(self) -> &'static str {
         match self {
             LicenseError::Empty => "No key entered.",
-            LicenseError::Malformed => "That does not look like an Ivory supporter key.",
+            LicenseError::Malformed => "That does not look like a Tangent supporter key.",
             LicenseError::Checksum => {
                 "That key looks mistyped - check for a missing or altered character."
             }
             LicenseError::Truncated => "That key looks incomplete - some of it may be missing.",
             LicenseError::FutureVersion(_) => {
-                "That key was made for a newer version of Ivory. Updating should accept it."
+                "That key was made for a newer version of Tangent. Updating should accept it."
             }
             LicenseError::BadSignature => "That key could not be verified.",
             LicenseError::VersionCapped(_) => {
-                "That key covers an earlier version of Ivory, and this build is past it."
+                "That key covers an earlier version of Tangent, and this build is past it."
             }
             LicenseError::Unsaved => {
                 "That key is genuine, but it could not be saved - it works for \
@@ -646,5 +646,30 @@ mod tests {
         assert!(!p.exists(), "a rejected key must not be written");
         assert!(!s.is_supporter());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn refusal_messages_name_the_app_by_its_current_name() {
+        // "That does not look like an Ivory supporter key" survived the
+        // rename for a year — and it is the first thing a paying supporter
+        // reads when a paste goes wrong, under a window title that says
+        // Tangent. Every message is checked, not just the three that were
+        // wrong, so the next variant added cannot reintroduce the old name.
+        let all = [
+            LicenseError::Empty,
+            LicenseError::Malformed,
+            LicenseError::Checksum,
+            LicenseError::Truncated,
+            LicenseError::FutureVersion(2),
+            LicenseError::BadSignature,
+            LicenseError::VersionCapped(4),
+            LicenseError::Unsaved,
+        ];
+        for e in all {
+            assert!(!e.message().contains("Ivory"), "{e:?}: {}", e.message());
+        }
+        // And not merely absent: where the app is named at all, it is named
+        // by what the title bar and the store call it.
+        assert!(LicenseError::Malformed.message().contains("Tangent"));
     }
 }
