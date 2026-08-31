@@ -1047,6 +1047,30 @@ pub struct AudioReport {
     /// gets. That is a different claim from any number, including this one
     /// being equal to the block.
     pub output_ring_frames: Option<u32>,
+    /// Frames per **input** callback, counted. `None` on a take with no
+    /// capture device, and before the first callback.
+    ///
+    /// The number that would have explained three takes in an afternoon. Under
+    /// pipewire-alsa the delivered cadence is the GRAPH's quantum and has
+    /// nothing to do with what was asked for — so this and
+    /// [`input_ring_frames`](Self::input_ring_frames) are the pair that says
+    /// whether the ring could hold a cycle. It could not, on a machine pinning
+    /// a 512-frame quantum against a 256-frame ring, and the stream reported
+    /// itself perfectly clean at half rate.
+    pub input_block_frames: Option<u32>,
+    /// The **input** ring asked of the host, where that differs from the block.
+    ///
+    /// Recorded separately from the app's *setting* on purpose, because the two
+    /// stopped being the same number: a capture ring has to cover the graph's
+    /// cycle, so the ring actually opened can be deliberately wider than what
+    /// the user chose. A manifest stating only the setting cannot tell a
+    /// widening from a choice, and one stating only the ring cannot say a
+    /// widening happened at all.
+    ///
+    /// `None` where no fixed size was asked for, and `None` where the ring and
+    /// the block are one number — CoreAudio has a device buffer and no ring
+    /// behind it, and naming one there would invent it.
+    pub input_ring_frames: Option<u32>,
 }
 
 impl Default for AudioReport {
@@ -1063,6 +1087,8 @@ impl Default for AudioReport {
             output_delay_ns: None,
             output_block_frames: None,
             output_ring_frames: None,
+            input_block_frames: None,
+            input_ring_frames: None,
         }
     }
 }
@@ -1341,6 +1367,14 @@ impl Manifest {
                     (
                         "output_ring_frames",
                         Json::opt_int(self.audio.output_ring_frames.map(i64::from)),
+                    ),
+                    (
+                        "input_block_frames",
+                        Json::opt_int(self.audio.input_block_frames.map(i64::from)),
+                    ),
+                    (
+                        "input_ring_frames",
+                        Json::opt_int(self.audio.input_ring_frames.map(i64::from)),
                     ),
                 ]),
             ),
@@ -2029,6 +2063,30 @@ mod tests {
             "the ring is the number that explains the take, and it is not the \
              block:\n{out}"
         );
+    }
+
+    /// **The input leg gets the same pair, and a take with no capture device
+    /// says so rather than borrowing the output's numbers.**
+    ///
+    /// This is the pair that would have explained three half-rate takes in an
+    /// afternoon: a 1024-frame ring against a 512-frame block is a ring that
+    /// covers the graph's cycle, and a 256 against a 512 is the wound.
+    #[test]
+    fn the_input_leg_reports_its_own_block_and_ring() {
+        let mut m = manifest();
+        let blank = m.render();
+        assert!(blank.contains("\"input_block_frames\": null"), "{blank}");
+        assert!(blank.contains("\"input_ring_frames\": null"), "{blank}");
+
+        // Post-fix Linux: the graph delivers 512 a cycle into a ring opened
+        // wide enough to hold two of them.
+        m.audio.input_block_frames = Some(512);
+        m.audio.input_ring_frames = Some(1024);
+        let out = m.render();
+        assert!(out.contains("\"input_block_frames\": 512"), "{out}");
+        assert!(out.contains("\"input_ring_frames\": 1024"), "{out}");
+        // And the output pair is still its own: four numbers, no aliasing.
+        assert!(out.contains("\"output_block_frames\": null"), "{out}");
     }
 
     #[test]
