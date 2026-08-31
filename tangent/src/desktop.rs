@@ -1,18 +1,18 @@
 //! The desktop half of the app: an eframe window, and a real MIDI device.
 //!
-//! Everything that draws lives in `tangent_ui::app::IvoryApp`, which the VST3
+//! Everything that draws lives in `tangent_ui::app::TangentApp`, which the VST3
 //! build also uses. What is left here is exactly the three things a standalone
 //! has and a plugin editor does not — an `eframe::App` impl, a `midir`
 //! connection, and a command line — plus the `Caps` value that says so.
 //!
-//! The wrapper struct is not ceremony. `impl eframe::App for IvoryApp` cannot
+//! The wrapper struct is not ceremony. `impl eframe::App for TangentApp` cannot
 //! be written from this crate: the orphan rule forbids implementing a foreign
 //! trait for a foreign type. That is a feature here rather than an obstacle —
 //! it is the compiler stating that eframe is this crate's business and not the
 //! shared crate's.
 
 use crate::midi;
-use tangent_ui::app::IvoryApp;
+use tangent_ui::app::TangentApp;
 use tangent_ui::host::Caps;
 use tangent_ui::midi_event::MidiEvent;
 use tangent_ui::ports::MidiPorts;
@@ -453,9 +453,9 @@ impl ArrRec {
     }
 }
 
-/// The standalone app: `IvoryApp`, plus the eframe trait impl it cannot carry.
+/// The standalone app: `TangentApp`, plus the eframe trait impl it cannot carry.
 pub struct DesktopApp {
-    app: IvoryApp,
+    app: TangentApp,
     /// **Whether the window is currently covering its whole screen** because
     /// it is borderless AND maximised. See `crate::macwin::cover_screen`.
     ///
@@ -509,7 +509,7 @@ pub struct DesktopApp {
     /// The DX7 cartridge the built-in is playing out of, if one is loaded.
     ///
     /// **The host holds the voices; the UI holds the names.** Kept here rather
-    /// than in `IvoryApp` because a `Voice` is a synthesizer's business and
+    /// than in `TangentApp` because a `Voice` is a synthesizer's business and
     /// `tangent-ui` is not allowed to know what one is — the same split as the
     /// plugin picker's paths-not-modules.
     #[cfg(feature = "recorder")]
@@ -530,7 +530,7 @@ pub struct DesktopApp {
     /// A picker deferred by one frame for that reason.
     #[cfg(feature = "recorder")]
     /// A request held back for one frame so the dialogs above it can stand
-    /// down first. See `IvoryApp::native_panel_up`.
+    /// down first. See `TangentApp::native_panel_up`.
     panel_armed: bool,
     /// The SAVE panel's own copy of `panel_armed`. The project menu is a child
     /// viewport, and closing it (`dialog = None`) does not destroy its window
@@ -1125,7 +1125,7 @@ fn effect_defaults() -> tangent_ui::ports::EffectDefaults {
 /// the module, so the menu says exactly what the bay chip says.
 #[cfg(feature = "recorder")]
 fn push_fx_params(
-    app: &mut tangent_ui::app::IvoryApp,
+    app: &mut tangent_ui::app::TangentApp,
     engine: &crate::instrument::Engine,
     strip: usize,
     inserts: usize,
@@ -1736,6 +1736,9 @@ impl DesktopApp {
                         // Counted in the callback, not asked for. See
                         // `StreamStats::observed_frames`.
                         observed_frames: e.observed_out_block(),
+                        // Per HOST, not per platform — None under JACK and
+                        // CoreAudio, where the request IS the callback.
+                        buffer_ring: o.buffer_ring,
                     },
                 )
             }),
@@ -2875,7 +2878,7 @@ impl DesktopApp {
         // waveform is drawn at a zoom: the pictures are made at the pixels
         // the clips occupy, so a view that has travelled needs new ones or
         // the audio is smeared across columns it does not belong in. See
-        // `IvoryApp::arr_waves_stale`, which is the threshold that keeps
+        // `TangentApp::arr_waves_stale`, which is the threshold that keeps
         // this off the frame path during a drag.
         if self.app.take_clips_dirty() || self.app.arr_waves_stale() {
             self.reload_clips();
@@ -2972,7 +2975,7 @@ impl DesktopApp {
         }
 
         // The × on the status row. The message is the host's, so the host is
-        // what puts it away — see `IvoryApp::take_dismiss_message`.
+        // what puts it away — see `TangentApp::take_dismiss_message`.
         if self.app.take_dismiss_message() {
             self.recorder.take_note = None;
             // **And the engine's error, which is what is usually showing.**
@@ -4036,7 +4039,7 @@ impl DesktopApp {
         let mut armed_unbound = false;
         let any_explicit = (0..tangent_ui::recorder::CHANNELS).any(|ch| {
             self.app.channel_kind(ch) == Some(tangent_ui::recorder::ChannelKind::Audio)
-                && IvoryApp::parse_input_spec(self.app.channel_input_spec(ch)).is_some()
+                && TangentApp::parse_input_spec(self.app.channel_input_spec(ch)).is_some()
         });
         for ch in 0..tangent_ui::recorder::CHANNELS {
             match self.app.channel_kind(ch) {
@@ -4053,7 +4056,7 @@ impl DesktopApp {
                 }
                 Some(tangent_ui::recorder::ChannelKind::Audio) => {
                     if any_explicit
-                        && IvoryApp::parse_input_spec(self.app.channel_input_spec(ch)).is_none()
+                        && TangentApp::parse_input_spec(self.app.channel_input_spec(ch)).is_none()
                     {
                         // NO INPUT on an explicit desk: the engine opened no
                         // ring for this lane, so there is nothing to tee.
@@ -6138,7 +6141,7 @@ impl DesktopApp {
         // set up before the menu existed changes under them.
         let any_explicit = (0..tangent_ui::recorder::CHANNELS).any(|ch| {
             self.app.channel_kind(ch) == Some(tangent_ui::recorder::ChannelKind::Audio)
-                && IvoryApp::parse_input_spec(self.app.channel_input_spec(ch)).is_some()
+                && TangentApp::parse_input_spec(self.app.channel_input_spec(ch)).is_some()
         });
         let mut explicit: Vec<tangent_record::audio::ChannelPick> = Vec::new();
         for ch in 0..tangent_ui::recorder::CHANNELS {
@@ -6165,7 +6168,7 @@ impl DesktopApp {
                 Some(tangent_ui::recorder::ChannelKind::Audio) => {
                     if any_explicit {
                         if let Some((a, b)) =
-                            IvoryApp::parse_input_spec(self.app.channel_input_spec(ch))
+                            TangentApp::parse_input_spec(self.app.channel_input_spec(ch))
                         {
                             if next_pick < picks.len() {
                                 picks[next_pick] = Some(ch);
@@ -6243,7 +6246,7 @@ impl DesktopApp {
         // if it is not a forest — see `Engine::set_folders` — because half a
         // tree is a routing graph nobody drew.
         e.set_folders(self.app.folder_parents());
-        // Never read from a settings file — see `IvoryApp::input_monitor`. It
+        // Never read from a settings file — see `TangentApp::input_monitor`. It
         // is pushed every frame like every other monitor setting, and its value
         // at launch is false because the field it comes from starts false.
         e.set_monitor_on(self.app.input_monitor());
@@ -7110,7 +7113,7 @@ impl DesktopApp {
     /// rather than guess, because "a size nobody asked for" only means "a
     /// window manager placed us" where a live resize is actually visible.
     #[cfg(target_os = "macos")]
-    fn window_facts(frame: &eframe::Frame, app: &IvoryApp) -> crate::macwin::Facts {
+    fn window_facts(frame: &eframe::Frame, app: &TangentApp) -> crate::macwin::Facts {
         crate::macwin::publish(
             frame,
             &|w| app.aspect_height_at(w),
@@ -7121,7 +7124,7 @@ impl DesktopApp {
     /// Everywhere else: all-false, which keeps `aspect_snap` armed and the
     /// immediate window-manager latch disarmed.
     #[cfg(not(target_os = "macos"))]
-    fn window_facts(_frame: &eframe::Frame, _app: &IvoryApp) -> WindowFacts {
+    fn window_facts(_frame: &eframe::Frame, _app: &TangentApp) -> WindowFacts {
         WindowFacts::default()
     }
 
@@ -7259,7 +7262,7 @@ impl DesktopApp {
         } else {
             Caps::DESKTOP
         };
-        let mut app = IvoryApp::new(&cc.egui_ctx, settings, caps);
+        let mut app = TangentApp::new(&cc.egui_ctx, settings, caps);
         // Said in the window as well as on stderr, which nobody sees. The
         // bay is empty and the owner has to know WHY, or the next thing they
         // do is load it again.
@@ -7551,7 +7554,7 @@ fn shift_insert_states_for_v14() {
 
 impl eframe::App for DesktopApp {
     /// eframe hands over a Context; everything below wants a Ui, and
-    /// `IvoryApp::frame` is the bridge all three hosts share.
+    /// `TangentApp::frame` is the bridge all three hosts share.
     ///
     /// The recorder brackets it: state in before, requests out after. Nothing
     /// that opens a device, raises a native panel or creates a directory
@@ -7737,7 +7740,7 @@ impl eframe::App for DesktopApp {
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        IvoryApp::CLEAR_COLOR
+        TangentApp::CLEAR_COLOR
     }
 
     /// A take still running when the window is closed is FINISHED, not

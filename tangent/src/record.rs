@@ -1305,6 +1305,9 @@ impl Session {
                 // input's, and it is the output whose size another host
                 // holding the device would be dictating.
                 observed_frames: None,
+                // An output-side concept; the input stream keeps no ring of
+                // ours to name here.
+                buffer_ring: None,
             },
         ))
     }

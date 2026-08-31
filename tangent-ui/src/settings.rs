@@ -1842,7 +1842,7 @@ impl Settings {
         // `#[cfg(test)]` below only applies while `tangent-ui` itself is being
         // compiled for test. A test in the BINARY crate links an ordinary
         // `tangent-ui`, so it takes the branch that finds the real home
-        // directory — and any such test that builds an `IvoryApp` and runs a
+        // directory — and any such test that builds an `TangentApp` and runs a
         // frame writes the user's own settings file. That is not theoretical:
         // an offscreen screenshot test did exactly that and emptied the
         // owner's instrument slots.

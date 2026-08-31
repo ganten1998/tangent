@@ -1,9 +1,11 @@
 [package]
-# The CRATE keeps the codename. "Ivory" stays the internal name throughout:
-# crate names, ~/.config/tangent/, the macOS bundle id, the settings and override
-# file paths, and the IVORY_* developer switches. Changing any of those would
-# reset Gatekeeper trust and orphan every existing user's settings for nothing,
-# since none of it is visible to anyone using the app.
+# What still wears the codename, and why. "Ivory" survives only where
+# changing it would cost a user something real: the macOS bundle id
+# (Gatekeeper trust and every external binding are keyed to it), the settings
+# and override file FORMATS, and the IVORY_* developer switches scripts and
+# muscle memory depend on. The crates, the config dir and the app struct are
+# all tangent-named now; none of what remains is visible to anyone using the
+# app.
 name = "tangent"
 version.workspace = true
 edition.workspace = true
@@ -217,7 +219,7 @@ wgpu = { version = "27", default-features = false, features = ["metal"] }
 # The video compositor renders an OFFSCREEN egui pass into a texture it then
 # reads back and encodes. That is this crate's job, not `tangent-ui`'s: the
 # firewall forbids `tangent-ui` from seeing a renderer at all, which is why the
-# seam is `IvoryApp::paint_composite(&self, painter, rect, shows)` — a pure
+# seam is `TangentApp::paint_composite(&self, painter, rect, shows)` — a pure
 # `egui::Painter` on one side, wgpu on the other.
 #
 # Not a new dependency: eframe's `wgpu` feature already puts this exact version

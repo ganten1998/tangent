@@ -3116,6 +3116,7 @@ pub fn show(
                             let bottom_h = 34.0;
                             let list_h = (ui.available_height() - bottom_h).max(40.0);
                             egui::ScrollArea::vertical()
+                            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                                 .max_height(list_h)
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
@@ -3265,6 +3266,7 @@ pub fn show(
                             let list_h = (ui.available_height() - bottom_h).max(40.0);
                             let mut go: Option<std::path::PathBuf> = None;
                             egui::ScrollArea::vertical()
+                            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                                 .max_height(list_h)
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
@@ -3439,6 +3441,7 @@ pub fn show(
                             let bottom = 30.0;
                             let list_h = (ui.available_height() - bottom).max(60.0);
                             egui::ScrollArea::vertical()
+                            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                                 .max_height(list_h)
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
@@ -3745,6 +3748,7 @@ pub fn show(
                             let list_h = (ui.available_height() - bottom_h).max(40.0);
                             let visible = visible_patches(voices, filter);
                             egui::ScrollArea::vertical()
+                            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                                 .max_height(list_h)
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
@@ -3959,6 +3963,7 @@ pub fn show(
                             let bottom_h = PLUGIN_FOOTER_H + 34.0 + 8.0;
                             let list_h = (ui.available_height() - bottom_h).max(40.0);
                             egui::ScrollArea::vertical()
+                            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                                 .max_height(list_h)
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
@@ -4156,6 +4161,7 @@ pub fn show(
                             let bottom_h = 34.0;
                             let list_h = (ui.available_height() - bottom_h).max(40.0);
                             egui::ScrollArea::vertical()
+                            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                                 .max_height(list_h)
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
@@ -4364,6 +4370,7 @@ pub fn show(
                             // fixed height and its Close button must anyway.
                             let button_row = 34.0;
                             egui::ScrollArea::vertical()
+                            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                                 .max_height((ui.available_height() - button_row).max(0.0))
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
@@ -4456,6 +4463,19 @@ pub fn show(
                                             // means, and pretending otherwise
                                             // would be inventing a number.
                                             _ => "device default".to_owned(),
+                                        };
+                                        // The ring behind the period, where
+                                        // one exists (WASAPI, ALSA): without
+                                        // it the millisecond figure above
+                                        // understates output buffering by
+                                        // the ring factor. Same wording as
+                                        // `OutputInfo::latency_line`, so the
+                                        // band and this panel agree.
+                                        let buf = match s.buffer_ring {
+                                            Some(ring) => {
+                                                format!("{buf}  ({ring} frame ring)")
+                                            }
+                                            None => buf,
                                         };
                                         ui.label(
                                             RichText::new(format!(
@@ -4908,6 +4928,7 @@ pub fn show(
                                         RichText::new("MONO").font(bold(11.0)).color(t.text),
                                     );
                                     egui::ScrollArea::vertical()
+                            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                                         .id_salt("mono-inputs")
                                         .max_height(ui.available_height() - 44.0)
                                         .show(ui, |ui| {
@@ -4934,6 +4955,7 @@ pub fn show(
                                         RichText::new("STEREO").font(bold(11.0)).color(t.text),
                                     );
                                     egui::ScrollArea::vertical()
+                            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                                         .id_salt("stereo-pairs")
                                         .max_height(ui.available_height() - 44.0)
                                         .show(ui, |ui| {
@@ -5647,6 +5669,7 @@ pub fn show(
                                 .corner_radius(3)
                                 .show(ui, |ui| {
                             egui::ScrollArea::vertical()
+                            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                                 .id_salt(("track-palettes", lane, serial))
                                 .max_height(room)
                                 .min_scrolled_height(room)
@@ -6143,6 +6166,7 @@ pub fn show(
                                     );
                                     ui.add_space(6.0);
                                     egui::ScrollArea::vertical()
+                            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                                         .max_height(ui.available_height() - 40.0)
                                         .show(ui, |ui| {
                                             if is_hw {
@@ -6325,6 +6349,7 @@ pub fn show(
                             );
                             ui.add_space(6.0);
                             egui::ScrollArea::vertical()
+                            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                                 .auto_shrink([false, false])
                                 .max_height(ui.available_height() - 40.0)
                                 .show(ui, |ui| {
@@ -6848,6 +6873,7 @@ pub fn show(
                             let bottom_h = 90.0;
                             let list_h = (ui.available_height() - bottom_h).max(40.0);
                             egui::ScrollArea::vertical()
+                            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                                 .max_height(list_h)
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
@@ -7019,6 +7045,7 @@ pub fn show(
                             let bottom_h = 34.0 + footer_h + 6.0;
                             let list_h = (ui.available_height() - bottom_h).max(40.0);
                             egui::ScrollArea::vertical()
+                            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                                 .max_height(list_h)
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
@@ -7284,6 +7311,7 @@ pub fn show(
                             let bottom_h = TUNING_FOOTER_H + 34.0 + 8.0;
                             let list_h = (ui.available_height() - bottom_h).max(40.0);
                             egui::ScrollArea::vertical()
+                            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                                 .max_height(list_h)
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
@@ -7454,6 +7482,7 @@ pub fn show(
                             let bottom_h = EXPORT_FOOTER_H + 34.0 + 8.0;
                             let body_h = (ui.available_height() - bottom_h).max(60.0);
                             egui::ScrollArea::vertical()
+                            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                                 .max_height(body_h)
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {

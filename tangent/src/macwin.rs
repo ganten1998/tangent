@@ -99,7 +99,7 @@ thread_local! {
 /// Content height at content width `w_min + i`, in whole points.
 ///
 /// A table rather than a call, because the callback cannot reach back into the
-/// GUI crate: it runs while AppKit owns the thread, and `IvoryApp` is behind a
+/// GUI crate: it runs while AppKit owns the thread, and `TangentApp` is behind a
 /// `&mut self` the caller is already holding.
 struct Curve {
     w_min: u32,

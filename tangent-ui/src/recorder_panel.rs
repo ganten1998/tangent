@@ -2334,7 +2334,7 @@ pub enum Hit {
     ToggleCountInInTake,
     ToggleHideElapsed,
     /// Hear the live input through the monitors. **Session-only, never
-    /// persisted** — see `IvoryApp::input_monitor`: the failure mode is a
+    /// persisted** — see `TangentApp::input_monitor`: the failure mode is a
     /// room feeding back the moment the app launches. It lived on a
     /// right-click of the band's microphone icon; the icon left with the
     /// input fader when the desk took the inputs, and this panel is where
@@ -3292,7 +3292,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &RecorderView<'_>, s: &Settings
     // band, which said the wrong thing twice: the take is the WINDOW, so a
     // border round one band does not mean "recording"; and this function is
     // the same one the compositor calls, so the border was burned into every
-    // take. It rings the window now, from `IvoryApp::paint`, which the
+    // take. It rings the window now, from `TangentApp::paint`, which the
     // compositor never calls — see the comment there. The steady dot in
     // `draw_capture` stays: it is the transport's own light.
 }
@@ -9876,7 +9876,7 @@ mod tests {
     ///
     /// The needle was fed raw RMS against a scale whose zero is a PEAK level,
     /// so every signal read 3.01 dB low before crest factor was considered —
-    /// the sine correction is what closes that. See `IvoryApp::VU_SINE`.
+    /// the sine correction is what closes that. See `TangentApp::VU_SINE`.
     #[test]
     fn a_sine_at_the_reference_reads_zero_vu() {
         // A sine whose peak is at VU_ZERO_DBFS: its RMS is 3.01 dB lower, and

@@ -682,14 +682,14 @@ fn main() {
         // Nothing about the LAYOUT required it. Every band's height is a pure
         // function of the window's width, and the two solvers for an arbitrary
         // rect have been in `app.rs` since the plugin shipped. See the layout
-        // branch in `IvoryApp::frame`.
+        // branch in `TangentApp::frame`.
         .with_min_inner_size(tangent_ui::settings::MIN_WINDOW)
         .with_resizable(tangent_ui::settings::RESIZABLE)
         .with_decorations(!settings.borderless_mode);
 
     // Reopen where it was last left. Monitors are not enumerable before the
     // window exists, so a position saved on a display that is now unplugged
-    // could land off-screen; `IvoryApp` rescues that on the first frame, once
+    // could land off-screen; `TangentApp` rescues that on the first frame, once
     // it can actually see the monitor.
     if let Some(pos) = settings.window_pos_for_use() {
         viewport = viewport.with_position(pos);

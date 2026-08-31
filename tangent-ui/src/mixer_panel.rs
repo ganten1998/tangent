@@ -122,10 +122,14 @@ pub struct MixerView<'a> {
     /// an app whose strips appear and disappear as things are loaded is a desk
     /// that changes shape under your hands.
     pub strips: [StripView<'a>; COLUMNS],
-    /// The first CHANNEL column shown in the scrolling region — the desk has
-    /// more channels than fit, so a window of them shows and this says which.
-    /// The click and the master are pinned at the right and never scroll.
-    pub scroll: usize,
+    /// How far the CHANNEL region is scrolled, in PIXELS — the desk has more
+    /// channels than fit, so a window of them shows and this says where it
+    /// stands. Pixels and not a column index, so the wheel moves the desk
+    /// the way it moves a web page: continuously, with a half-visible strip
+    /// at the edge instead of a jump. The click and the master are pinned at
+    /// the right and never scroll. Clamped by `Layout`, so any stale value
+    /// lands on the nearest legal position.
+    pub scroll_px: f32,
     /// How many channel columns show at once — Shift+wheel zooms it. The
     /// click and the master are pinned beside them and not counted here.
     pub visible: usize,
@@ -683,6 +687,11 @@ pub const STRIP_ROUTES: usize = 3;
 
 pub struct Layout {
     pub strips: [StripStrip; COLUMNS],
+    /// The scrolling channel region — everything left of the pinned click.
+    /// Channel strips CLIP to it (a half-scrolled strip stops at its edge
+    /// rather than bleeding under the click), and a hit outside it belongs
+    /// to nobody however far a partial strip's rectangle reaches.
+    pub region: Rect,
 }
 
 /// One strip's rectangles.
@@ -779,7 +788,30 @@ const MASTER_EXTRA: f32 = 0.0;
 /// click and the master are pinned beside them and are not counted here.
 pub const VISIBLE_CHANNELS: usize = 8;
 
+/// The least height a strip row can usefully be — below this, folding the
+/// desk into two rows of eight would halve every fader into a nub, so the
+/// sixteen stay on one row and scroll instead.
+const TWO_ROW_MIN_H: f32 = 200.0;
+
 impl Layout {
+    /// The column unit width and pitch (unit + gap) at `rect` with `visible`
+    /// channels showing. One derivation, shared with the wheel handler's
+    /// clamp — two copies of this arithmetic is a scroll that overshoots.
+    pub fn metrics(rect: Rect, visible: usize) -> (f32, f32) {
+        let inner_w = (rect.width() - 2.0 * PAD).max(1.0);
+        let slots = (visible.clamp(1, CHANNELS) + 2) as f32;
+        let unit = ((inner_w - GAP * (slots - 1.0)) / slots).max(1.0);
+        (unit, unit + GAP)
+    }
+
+    /// The furthest `scroll_px` can legally stand at `rect`: the desk's
+    /// off-screen width. Zero when everything fits.
+    pub fn max_scroll_px(rect: Rect, visible: usize) -> f32 {
+        let visible = visible.clamp(1, CHANNELS);
+        let (_, pitch) = Self::metrics(rect, visible);
+        (CHANNELS.saturating_sub(visible)) as f32 * pitch
+    }
+
     pub fn new(rect: Rect, view: &MixerView<'_>) -> Self {
         let inner = Rect::from_min_max(
             Pos2::new(rect.min.x + PAD, rect.min.y + PAD),
@@ -788,12 +820,13 @@ impl Layout {
         if !inner.is_positive() {
             return Self {
                 strips: [StripStrip::NONE; COLUMNS],
+                region: Rect::NOTHING,
             };
         }
         // **Eight channels show; the CLICK and the MASTER are pinned right.**
         // The desk grew past what fits, so the channel columns scroll (see
-        // `MixerView::scroll`) while the two utility strips stay put at the
-        // edge — the master is the one you always want in reach, and the
+        // `MixerView::scroll_px`) while the two utility strips stay put at
+        // the edge — the master is the one you always want in reach, and the
         // click beside it. Every column is one unit wide: a desk where one
         // strip is a different size is a desk with two kinds of strip.
         //
@@ -801,37 +834,79 @@ impl Layout {
         let click_col = CHANNELS; // column index of the click
         let master_col = COLUMNS - 1;
         let visible = view.visible.clamp(1, CHANNELS);
-        // Ten visible slots (eight channels + click + master), nine gaps.
-        let slots = (visible + 2) as f32;
-        let unit = ((inner.width() - GAP * (slots - 1.0)) / slots).max(1.0);
-        let pitch = unit + GAP;
+        // **The whole desk folds into two rows of eight, size permitting.**
+        // When all sixteen are asked for, sixteen columns across makes
+        // toothpicks of every strip; eight over eight keeps each strip at
+        // the width eight-across always had, at half the height — a trade
+        // that only works when half the height is still a usable strip.
+        // The click and the master stay pinned at the right, full height:
+        // whatever shape the desk folds into, the master does not move.
+        let two_rows = visible >= CHANNELS && (inner.height() - GAP) / 2.0 >= TWO_ROW_MIN_H;
+        let cols_across = if two_rows { CHANNELS / 2 } else { visible };
+        let (unit, pitch) = Self::metrics(rect, cols_across);
         // The two pinned columns, from the right edge inward.
         let master_x = inner.right() - unit;
         let click_x = master_x - pitch;
         // The scrolling region ends just left of the click.
         let region_left = inner.left();
-        let first = view.scroll.min(CHANNELS.saturating_sub(visible));
+        let region = Rect::from_min_max(
+            Pos2::new(region_left, inner.top()),
+            Pos2::new(click_x - GAP, inner.bottom()),
+        );
+        // **Pixels, then a window with a remainder.** The scroll lands
+        // wherever the wheel left it; the first fully-or-partly visible
+        // column and how much of it hangs off the left edge both fall out
+        // of one division. One extra column draws on the right when the
+        // remainder exposes it — that half strip is the whole point. In
+        // two-row mode everything fits and the scroll pins itself at zero.
+        let max_px = if two_rows {
+            0.0
+        } else {
+            (CHANNELS.saturating_sub(visible)) as f32 * pitch
+        };
+        let px = view.scroll_px.clamp(0.0, max_px.max(0.0));
+        let first = ((px / pitch).floor() as usize).min(CHANNELS.saturating_sub(1));
+        let frac = px - first as f32 * pitch;
+        let last_shown = (first + visible + usize::from(frac > 0.5)).min(CHANNELS);
+        let row_h = if two_rows {
+            (inner.height() - GAP) / 2.0
+        } else {
+            inner.height()
+        };
         let strips = std::array::from_fn(|i| {
             let Some(v) = view.strips.get(i) else {
                 return StripStrip::NONE;
             };
-            let x = if i == master_col {
-                master_x
+            let (x, y, h) = if i == master_col {
+                (master_x, inner.top(), inner.height())
             } else if i == click_col {
-                click_x
+                (click_x, inner.top(), inner.height())
+            } else if two_rows {
+                // Channel columns, eight over eight: 0..8 on the top row,
+                // 8..16 beneath them, nothing scrolled off.
+                let (row, col) = (i / (CHANNELS / 2), i % (CHANNELS / 2));
+                (
+                    region_left + col as f32 * pitch,
+                    inner.top() + row as f32 * (row_h + GAP),
+                    row_h,
+                )
             } else {
-                // A channel column: only the `visible` window is drawn, laid
-                // out from the region's left. Everything else is off-desk.
-                if i < first || i >= first + visible {
+                // A channel column: only the visible window (plus the
+                // partial at the edge) is laid out. Everything else is
+                // off-desk.
+                if i < first || i >= last_shown {
                     return StripStrip::NONE;
                 }
-                region_left + (i - first) as f32 * pitch
+                (
+                    region_left + (i - first) as f32 * pitch - frac,
+                    inner.top(),
+                    inner.height(),
+                )
             };
-            let panel =
-                Rect::from_min_size(Pos2::new(x, inner.top()), Vec2::new(unit, inner.height()));
+            let panel = Rect::from_min_size(Pos2::new(x, y), Vec2::new(unit, h));
             Self::one(panel, Some(v))
         });
-        Self { strips }
+        Self { strips, region }
     }
 
     /// The rows inside one strip, top to bottom.
@@ -1377,9 +1452,14 @@ pub fn hit_test(rect: Rect, view: &MixerView<'_>, pos: Pos2) -> Option<Hit> {
         }
         return Some(Hit::FxMenu(at, bay, FxAction::Dismiss));
     }
+    // **A press lands only on what is painted.** A half-scrolled channel
+    // strip's rectangles reach past the region it is clipped to; the part a
+    // person cannot see must not answer. The pinned click and master live
+    // to the region's right and keep answering everywhere they draw.
+    let in_bounds = |i: usize| i >= CHANNELS || l.region.contains(pos);
     l.targets()
         .into_iter()
-        .find(|(r, _)| r.contains(pos))
+        .find(|(r, h)| r.contains(pos) && in_bounds(h.column().0))
         .map(|(_, h)| h)
 }
 
@@ -1488,11 +1568,16 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MixerView<'_>) {
     let p = ink(view);
     painter.rect_filled(rect, 0.0, p.wood);
 
+    // Channel strips clip to the scrolling region: a half-scrolled strip
+    // ends at the region's edge instead of bleeding under the pinned click.
+    // The pinned columns keep the raw painter — they never overhang.
+    let clipped = painter.with_clip_rect(l.region);
     for (i, s) in l.strips.iter().enumerate() {
         let Some(v) = view.strips.get(i) else { continue };
         if !s.panel.is_positive() {
             continue;
         }
+        let painter = if i < CHANNELS { &clipped } else { painter };
         let heard = view.heard(i);
         let typed = view.typing.filter(|(at, _)| at.0 == i).map(|(_, b)| b);
         let naming = view.naming.filter(|(at, _)| at.0 == i).map(|(_, b)| b);
@@ -2723,7 +2808,7 @@ mod tests {
                 a_strip(channels.get(i).copied(), false)
             }),
             any_solo: false,
-            scroll: 0,
+            scroll_px: 0.0,
             visible: VISIBLE_CHANNELS,
             selected: None,
             typing: None,
@@ -3004,7 +3089,7 @@ mod tests {
         let r = rect();
         // At rest: channels 0..VISIBLE show, the rest are off-desk.
         let mut v = a_view();
-        v.scroll = 0;
+        v.scroll_px = 0.0;
         let l = Layout::new(r, &v);
         for n in 0..VISIBLE_CHANNELS {
             assert!(l.strips[n].panel.is_positive(), "channel {n} should show");
@@ -3027,7 +3112,7 @@ mod tests {
         }
         // Scrolled to the end: the last channels show, the master still pins.
         let mut v = a_view();
-        v.scroll = CHANNELS - VISIBLE_CHANNELS;
+        v.scroll_px = (CHANNELS - VISIBLE_CHANNELS) as f32 * Layout::metrics(r, VISIBLE_CHANNELS).1;
         let l = Layout::new(r, &v);
         assert!(l.strips[CHANNELS - 1].panel.is_positive(), "the last channel never shows");
         assert!(!l.strips[0].panel.is_positive(), "channel 0 should be scrolled off");
@@ -3035,6 +3120,91 @@ mod tests {
             (l.strips[MASTER].panel.left() - master_x).abs() < 0.5,
             "the master moved when the channels scrolled"
         );
+    }
+
+    /// **The scroll is pixels now, and a half-position shows half strips.**
+    /// Halfway between two columns the first column hangs off the region's
+    /// left edge, an extra column is exposed on the right — and the hidden
+    /// part of a strip answers no press, however far its rectangle reaches.
+    #[test]
+    fn a_half_scrolled_desk_shows_partial_strips_that_do_not_answer_outside() {
+        let r = rect();
+        let (_, pitch) = Layout::metrics(r, VISIBLE_CHANNELS);
+        let mut v = a_view();
+        v.scroll_px = pitch * 0.5;
+        let l = Layout::new(r, &v);
+        // Channel 0 is half off: its panel starts left of the region.
+        assert!(l.strips[0].panel.is_positive(), "the partial column vanished");
+        assert!(
+            l.strips[0].panel.left() < l.region.left() - 0.5,
+            "channel 0 does not overhang, so nothing scrolled by pixels"
+        );
+        // The extra column on the right is exposed.
+        assert!(
+            l.strips[VISIBLE_CHANNELS].panel.is_positive(),
+            "the half position exposed no extra column"
+        );
+        // A press on the overhanging, clipped part of channel 0 lands on
+        // nothing; the same control pressed inside the region still answers.
+        let hidden = Pos2::new(
+            (l.strips[0].panel.left() + l.region.left()) / 2.0 - 0.1,
+            l.strips[0].mute.center().y,
+        );
+        assert!(
+            hit_test(r, &v, hidden).is_none(),
+            "the clipped part of a strip answered a press"
+        );
+        let seen = Pos2::new(l.region.left() + 2.0, l.strips[0].mute.center().y);
+        if l.strips[0].mute.contains(seen) {
+            assert_eq!(hit_test(r, &v, seen), Some(Hit::Mute(Column(0))));
+        }
+        // And the clamp holds: past the end lands at the end, not beyond.
+        let mut v = a_view();
+        v.scroll_px = 1.0e9;
+        let l = Layout::new(r, &v);
+        assert!(l.strips[CHANNELS - 1].panel.is_positive());
+        assert!(
+            l.strips[CHANNELS - 1].panel.right() <= l.region.right() + 0.5,
+            "the clamp let the last channel drift past the region"
+        );
+    }
+
+    /// **All sixteen fold into two rows of eight, size permitting.** The
+    /// pinned click and master keep the full height at the right; every
+    /// channel keeps the width eight-across always had; nothing scrolls
+    /// because nothing is off-desk. Too short for a usable half-height
+    /// strip, and the fold declines.
+    #[test]
+    fn sixteen_channels_fold_into_two_rows_when_the_height_allows() {
+        let tall = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 700.0));
+        let mut v = a_view();
+        v.visible = CHANNELS;
+        let l = Layout::new(tall, &v);
+        for n in 0..CHANNELS {
+            assert!(l.strips[n].panel.is_positive(), "channel {n} missing from the fold");
+        }
+        // Two distinct rows: 8 shares channel 0's top, 8 sit below it.
+        let top = l.strips[0].panel.top();
+        let below = (0..CHANNELS)
+            .filter(|n| l.strips[*n].panel.top() > top + 1.0)
+            .count();
+        assert_eq!(below, CHANNELS / 2, "the fold is not eight over eight");
+        // Same width as eight-across; full-height pinned columns.
+        let (unit, _) = Layout::metrics(tall, CHANNELS / 2);
+        assert!((l.strips[0].panel.width() - unit).abs() < 0.6);
+        assert!(l.strips[MASTER].panel.height() > l.strips[0].panel.height() * 1.8);
+        assert!(
+            (l.strips[MASTER].panel.top() - top).abs() < 0.6,
+            "the master let go of the full height"
+        );
+        // A short window declines the fold and scrolls instead.
+        let short = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 300.0));
+        let l = Layout::new(short, &v);
+        let shown = (0..CHANNELS).filter(|n| l.strips[*n].panel.is_positive()).count();
+        assert!(shown <= CHANNELS, "impossible");
+        let top = l.strips.iter().filter(|s| s.panel.is_positive()).map(|s| s.panel.top());
+        let tops: std::collections::BTreeSet<i64> = top.map(|t| t.round() as i64).collect();
+        assert_eq!(tops.len(), 1, "a short window folded anyway");
     }
 
     /// **The visible count is what the view says, not a constant.** Shift+
@@ -3045,7 +3215,7 @@ mod tests {
         for want in [4usize, 8, 12] {
             let mut v = a_view();
             v.visible = want;
-            v.scroll = 0;
+            v.scroll_px = 0.0;
             let l = Layout::new(r, &v);
             let shown = (0..CHANNELS).filter(|n| l.strips[*n].panel.is_positive()).count();
             assert_eq!(shown, want.min(CHANNELS), "asked for {want}, showed {shown}");
@@ -3732,7 +3902,8 @@ mod tests {
         // window before checking it — the desk is wider than the desk shows.
         for n in 0..crate::recorder::CHANNELS {
             let mut v = a_view();
-            v.scroll = n.min(CHANNELS - VISIBLE_CHANNELS);
+            v.scroll_px = n.min(CHANNELS - VISIBLE_CHANNELS) as f32
+                * Layout::metrics(r, VISIBLE_CHANNELS).1;
             let l = Layout::new(r, &v);
             let s = &l.strips[n];
             assert!(s.arm.is_positive(), "channel {n} has no R switch");

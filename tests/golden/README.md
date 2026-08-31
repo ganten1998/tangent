@@ -1,6 +1,6 @@
 # tests/golden — differential harness against the Python engine
 
-Ivory 2.0 (the Rust `tangent-core` engine) is validated against the *shipped*
+Tangent (written as Ivory 2.0; the Rust `tangent-core` engine) is validated against the *shipped*
 Python `ChordDetector` by diffing both over a large corpus of note-sets and
 classifying every divergence to a documented rule in
 [`docs/DIVERGENCES.md`](../../docs/DIVERGENCES.md). This directory holds the
