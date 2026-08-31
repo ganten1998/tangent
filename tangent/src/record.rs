@@ -2201,6 +2201,16 @@ impl Session {
             manifest.audio.channels = r.channels;
             manifest.audio.bits = TAKE_FORMAT.bits();
             manifest.audio.frames = r.frames;
+            // **What the take's own clock says should be in the file, beside
+            // what is.** The video half has reported this pair since §7; the
+            // audio half never has, and a take that came back 19 s long out of
+            // 30 s went out marked `complete: true` because no field could say
+            // otherwise. Same clock as `duration_seconds` — deliberately, so
+            // the two cannot disagree about the length of a second — and the
+            // check below is then a subtraction rather than a judgement.
+            manifest.audio.frames_expected =
+                (manifest.duration_seconds * nominal).max(0.0) as u64;
+            manifest.audio.frames_dropped = r.frames_dropped;
             manifest.audio.peak_dbfs = f64::from(audio::dbfs(r.take_peak));
             manifest.audio.clipped = r.clipped_samples > 0;
             manifest.sources.push(r.source.clone());
@@ -2224,6 +2234,40 @@ impl Session {
             // calling `abort` here would mark the manifest incomplete and send
             // the next launch into the crash-recovery path for a file that is
             // perfectly fine.
+            // **A file SHORTER than the take is not a dropout, and must not be
+            // reported as one.** Dropouts are padded, so they leave the length
+            // right and only this note wrong. Frames that never arrived and
+            // were never padded shorten the file, and that is the fault which
+            // went unnoticed: a take whose `duration_seconds` was 30.17 and
+            // whose WAV held 19.17, complete and unremarked.
+            //
+            // A PROBLEM rather than a note, unlike a dropout, because the file
+            // no longer matches the take: anything aligning the `.wav` against
+            // the `.mid` or the video by the manifest's duration will be wrong
+            // by the whole shortfall, and silently.
+            //
+            // The tolerance is a quarter-second rather than zero. The fit is a
+            // fit, `frames_expected` is derived through it, and the last block
+            // is a partial one — demanding exactness would put a problem on
+            // every honest take.
+            const SHORT_TOLERANCE_FRAMES: f64 = 0.25;
+            let short = manifest
+                .audio
+                .frames_expected
+                .saturating_sub(manifest.audio.frames);
+            if short as f64 > SHORT_TOLERANCE_FRAMES * nominal {
+                problem.get_or_insert_with(|| {
+                    format!(
+                        "the recording is {:.2} s shorter than the take: {} frames \
+                         were expected and {} were written. The audio stopped \
+                         arriving and was not padded, so the file does not line \
+                         up with the MIDI or the video",
+                        short as f64 / nominal,
+                        manifest.audio.frames_expected,
+                        manifest.audio.frames,
+                    )
+                });
+            }
             if r.frames_dropped > 0 {
                 note = Some(format!(
                     "{} frames were lost to the system and padded with silence",
