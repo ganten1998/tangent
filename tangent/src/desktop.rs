@@ -1504,6 +1504,48 @@ fn audio_clip_passes(
     out
 }
 
+/// The stretched copy of a decoded clip, if the clip asks for one — the ONE
+/// place the answer comes from, for the live path and the offline bounce
+/// alike. It lived inline in `reload_clips` only, so the export rendered the
+/// unstretched audio under the clip's drawn window: wrong speed, wrong
+/// pitch, and an open-ended clip came back at `file_s / ratio` of its heard
+/// length. The same divergence class the export already paid for once with
+/// `clip.gain`.
+///
+/// The cache is the CALLER's: the live path owns `self.stretch_cache`
+/// (retained across reloads, swept beside `track_cache`), the bounce builds
+/// a per-export one — its decodes are at the export rate, and stretched
+/// copies of live-rate audio would be wrong-rate in the file (the rate rule
+/// on the cache fields).
+#[cfg(feature = "recorder")]
+fn stretched_clip_audio(
+    clip: &tangent_ui::arrangement::ArrClip,
+    decoded: std::sync::Arc<tangent_record::decode::Clip>,
+    path: &std::path::Path,
+    cache: &mut std::collections::HashMap<
+        (std::path::PathBuf, i64, String),
+        std::sync::Arc<tangent_record::decode::Clip>,
+    >,
+) -> std::sync::Arc<tangent_record::decode::Clip> {
+    if (clip.stretch - 1.0).abs() <= 1.0e-9 {
+        return decoded;
+    }
+    let mode = crate::stretch::Mode::from_key(&clip.stretch_mode).unwrap_or_default();
+    let key = (
+        path.to_path_buf(),
+        (clip.stretch * 1.0e6).round() as i64,
+        mode.key().to_owned(),
+    );
+    match cache.get(&key) {
+        Some(c) => std::sync::Arc::clone(c),
+        None => {
+            let made = std::sync::Arc::new(crate::stretch::stretch(&decoded, clip.stretch, mode));
+            cache.insert(key, std::sync::Arc::clone(&made));
+            made
+        }
+    }
+}
+
 // **This attribute belongs to the IMPL, not to what is above it.** It was
 // stolen once: a helper inserted between it and the block below made every
 // recorder method unconditional, and the Minimal build — `tangent` with no
@@ -4627,6 +4669,13 @@ impl DesktopApp {
                 std::path::PathBuf,
                 Arc<tangent_record::decode::Clip>,
             > = std::collections::HashMap::new();
+            // Stretched copies, per-export like the decode cache above and
+            // for the same reason: everything in here is at the EXPORT
+            // rate. See `stretched_clip_audio`.
+            let mut stretch_cache: std::collections::HashMap<
+                (std::path::PathBuf, i64, String),
+                Arc<tangent_record::decode::Clip>,
+            > = std::collections::HashMap::new();
             let frames = |s: f64| frames_at(f64::from(rate), s);
             for clip in &doc.clips {
                 if clip.kind == tangent_ui::arrangement::ClipKind::Midi {
@@ -4653,6 +4702,15 @@ impl DesktopApp {
                         Err(_) => continue,
                     },
                 };
+                // **The clip's stretch, which the export used to drop** —
+                // the same divergence the gain comment below records: the
+                // live path rendered the stretched copy, the bounce the
+                // raw decode, so a stretched clip exported at the wrong
+                // speed and an open-ended one at the wrong length. The
+                // cache is per-export and at the EXPORT rate; the live
+                // `self.stretch_cache` holds live-rate audio and must not
+                // feed a file at another rate.
+                let decoded = stretched_clip_audio(clip, decoded, &path, &mut stretch_cache);
                 // **The clip's own gain, which the export used to drop.**
                 // It read `1.0` here while playback read `clip.gain`, so a
                 // clip pulled down on the timeline came back at full level
@@ -5278,27 +5336,10 @@ impl DesktopApp {
             // knowing it, which is the point of doing it here: a clip
             // stretched to 1.5 is a clip whose file is half again as long,
             // and nothing downstream has to hold a second opinion about
-            // where its seconds are.
-            let decoded = if (clip.stretch - 1.0).abs() > 1.0e-9 {
-                let mode = crate::stretch::Mode::from_key(&clip.stretch_mode)
-                    .unwrap_or_default();
-                let key = (
-                    path.clone(),
-                    (clip.stretch * 1.0e6).round() as i64,
-                    mode.key().to_owned(),
-                );
-                match self.stretch_cache.get(&key) {
-                    Some(c) => Arc::clone(c),
-                    None => {
-                        let made =
-                            Arc::new(crate::stretch::stretch(&decoded, clip.stretch, mode));
-                        self.stretch_cache.insert(key, Arc::clone(&made));
-                        made
-                    }
-                }
-            } else {
-                decoded
-            };
+            // where its seconds are. Shared with the offline bounce — see
+            // `stretched_clip_audio`; the sweep below must keep matching
+            // its key construction.
+            let decoded = stretched_clip_audio(clip, decoded, &path, &mut self.stretch_cache);
             let file_s = decoded.seconds();
             if clip.len_s == 0.0 {
                 fill_len.push((clip.id, (file_s - clip.offset_s).max(0.0)));
@@ -6549,6 +6590,7 @@ fn count_media(project_dir: &std::path::Path) -> usize {
 /// verbatim clone and stays one until somebody edits it (every undo writes
 /// the document). A built kit never reaches here: `fresh_project_dir`
 /// refuses those folders outright, for New and launch alike.
+#[cfg(feature = "recorder")]
 fn launch_reclaimable(dir: &std::path::Path, template: &std::path::Path) -> bool {
     count_media(dir) == 0
         && file_eq(
@@ -6558,6 +6600,7 @@ fn launch_reclaimable(dir: &std::path::Path, template: &std::path::Path) -> bool
 }
 
 /// Byte-for-byte equality of two files; an unreadable file equals nothing.
+#[cfg(feature = "recorder")]
 fn file_eq(a: &std::path::Path, b: &std::path::Path) -> bool {
     match (std::fs::read(a), std::fs::read(b)) {
         (Ok(x), Ok(y)) => x == y,
@@ -8394,6 +8437,89 @@ mod tests {
             (MASTER_EXTRA_SEAT + 1) * INSERTS <= INSERT_SPACE,
             "INSERT_SPACE does not cover the master's second rack"
         );
+    }
+
+    /// **The export renders the STRETCHED audio, at the stretched length.**
+    ///
+    /// The live path stretched and the bounce did not, so a stretched clip
+    /// exported at the wrong speed and pitch under its drawn window — and
+    /// an open-ended one at `file_s / ratio` of its heard length. Same
+    /// divergence class the export already paid for once with `clip.gain`.
+    #[test]
+    fn the_bounce_renders_a_stretched_clip_at_its_stretched_length() {
+        use std::sync::Arc;
+        // Two seconds of stereo silence at 8 kHz; a 2.0 tape stretch makes
+        // exactly four ((frames * ratio).round() — tape is length-exact,
+        // which is why it is the mode under test).
+        let decoded = Arc::new(tangent_record::decode::Clip {
+            samples: vec![0.0; 8_000 * 2 * 2],
+            rate: 8_000,
+            source: std::path::PathBuf::from("a.wav"),
+        });
+        let clip = tangent_ui::arrangement::ArrClip {
+            kind: tangent_ui::arrangement::ClipKind::Audio,
+            notes: Vec::new(),
+            lane: 0,
+            path: "a.wav".to_owned(),
+            start_s: 0.0,
+            offset_s: 0.0,
+            // Open-ended: the length comes from the FILE, which is the
+            // case the unstretched bounce got wrong by a factor of the
+            // ratio.
+            len_s: 0.0,
+            loop_s: 0.0,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name: "A".to_owned(),
+            id: 1,
+            extra: Default::default(),
+            anchor: Default::default(),
+            follow_tempo: false,
+            stretch: 2.0,
+            stretch_mode: "tape".to_owned(),
+            gain: 1.0,
+        };
+        let mut cache = std::collections::HashMap::new();
+        let got = super::stretched_clip_audio(
+            &clip,
+            Arc::clone(&decoded),
+            std::path::Path::new("a.wav"),
+            &mut cache,
+        );
+        assert!(
+            (got.seconds() - 4.0).abs() < 1.0e-9,
+            "the stretch did not double the audio: {} s",
+            got.seconds()
+        );
+        // What the offline bounce now schedules: passes over the STRETCHED
+        // copy, so the open-ended clip fills its heard length.
+        let passes = super::audio_clip_passes(&clip, &got, 8_000.0, 1.0);
+        assert_eq!(passes.len(), 1);
+        assert_eq!(
+            passes[0].len,
+            32_000,
+            "the bounce would schedule the unstretched length"
+        );
+        // Memoised: a second ask is the same Arc, not a second render.
+        let again = super::stretched_clip_audio(
+            &clip,
+            Arc::clone(&decoded),
+            std::path::Path::new("a.wav"),
+            &mut cache,
+        );
+        assert!(Arc::ptr_eq(&got, &again), "the cache did not hold the copy");
+        // And an unstretched clip passes through untouched.
+        let plain = tangent_ui::arrangement::ArrClip {
+            stretch: 1.0,
+            ..clip
+        };
+        let through = super::stretched_clip_audio(
+            &plain,
+            Arc::clone(&decoded),
+            std::path::Path::new("a.wav"),
+            &mut cache,
+        );
+        assert!(Arc::ptr_eq(&decoded, &through));
     }
 
     /// **A looped AUDIO clip repeats, exactly as a looped MIDI one does.**
