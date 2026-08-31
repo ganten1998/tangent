@@ -178,6 +178,36 @@ distro_family() {
     )
 }
 
+# **The one library whose absence stops Tangent from starting at all.**
+#
+# LV2 hosting links liblilv-0.so.0 outright, so a machine without it gets a
+# loader error naming a library the user has never heard of, before a single
+# line of the app runs. Everything else this script warns about degrades a
+# feature; this one is the difference between a program and a paperweight.
+#
+# It arrives with PipeWire or with ffmpeg, so it is already present on Debian,
+# Fedora, Arch, Void, openSUSE, Mint, Pop and every Ubuntu *flavour*. The one
+# desktop that ships without it is stock Ubuntu GNOME, for a structural reason
+# rather than an oversight: liblilv is in universe, `ubuntu-desktop` is in main,
+# main may not depend on universe, so Canonical builds PipeWire with
+# `-Dlv2=disabled` (Launchpad #2054223).
+have_lilv() {
+    # ldconfig's cache is the loader's own answer, which beats guessing at
+    # directories on any glibc system.
+    if command -v ldconfig >/dev/null 2>&1; then
+        ldconfig -p 2>/dev/null | grep -q 'liblilv-0\.so\.0' && return 0
+    fi
+    # musl has no ldconfig cache and a minimal container may have no ldconfig
+    # at all, so fall back to looking where the loader looks. `LILV_SEARCH`
+    # overrides the list so this can be exercised on a machine that is not the
+    # one it is written for — the same trick `OS_RELEASE` plays above.
+    for _d in ${LILV_SEARCH:-/usr/lib /usr/lib64 /lib /lib64 /usr/local/lib \
+              /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu}; do
+        [ -e "$_d/liblilv-0.so.0" ] && return 0
+    done
+    return 1
+}
+
 # Which GPU is in the render node, because the driver package differs per
 # vendor and recommending the wrong one is worse than recommending nothing.
 gpu_vendor() {
@@ -637,6 +667,25 @@ if [ "$WANT_VST3" = "1" ]; then
 fi
 
 echo
+# **Before the dry-run exit, on purpose.** `--dry-run` is what a careful person
+# runs first, and this is the one thing on the whole page they would want to
+# learn from it: everything else here degrades a feature, and this decides
+# whether the program starts. Saying it only on the real run tells them after
+# the moment they were asking.
+if [ "$WANT_APP" = "1" ] && ! have_lilv; then
+    echo "  BEFORE YOU RUN IT: liblilv-0.so.0 is not installed, and Tangent"
+    echo "        will not start without it - it is the LV2 plugin host, and"
+    echo "        the program is linked against it. One command fixes it:"
+    case "$(distro_family)" in
+        debian) echo "          sudo apt install liblilv-0-0" ;;
+        fedora) echo "          sudo dnf install lilv-libs" ;;
+        arch)   echo "          sudo pacman -S lilv" ;;
+        void)   echo "          sudo xbps-install lilv" ;;
+        suse)   echo "          sudo zypper install liblilv-0-0" ;;
+        *)      echo "          (install your distribution's lilv package)" ;;
+    esac
+    echo
+fi
 if [ "$DRY" = "1" ]; then
     echo "Nothing was written. Drop --dry-run to install."
     exit 0
