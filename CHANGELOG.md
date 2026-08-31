@@ -123,6 +123,9 @@ platform.
   which is an autosave under another name: there was never an unsaved change,
   so there was nothing to prompt about and no way to walk away from a session
   without keeping it. New, Open and Quit now ask before they discard anything.
+  One deliberate exception: the drum kit sidecar still saves itself, because a
+  kit is hours of sample assignment and the one thing a session must never
+  lose to a missed save.
 - **New starts from the shipped template, always.** Seeding the default wrote
   the LIVE desk and ran on every New — so opening somebody's session and
   pressing New quietly re-wrote the default with that session's desk.
