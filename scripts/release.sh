@@ -10,8 +10,11 @@
 #   scripts/release.sh --sums-only      # re-check + re-emit SHA256SUMS only
 #   SKIP_WINDOWS=1 scripts/release.sh   # macOS: skip build-cross.sh
 #   KEEP_STALE=1 scripts/release.sh     # leave other versions' artifacts in dist/
+#   SKIP_TESTS=1 scripts/release.sh     # skip the test/lint gate (scripts/check.sh)
+#                                       # — for re-runs where this tree just passed
 #
-#   macOS host -> scripts/build-macos.sh + scripts/build-cross.sh (Windows zip)
+#   macOS host -> scripts/build-macos.sh + scripts/build-installer.sh macos
+#                 + scripts/build-cross.sh (Linux tarballs, Windows zip + setup.exe)
 #   Linux host -> scripts/build-linux-native.sh
 #
 # Run it on each OS (and each Linux arch), copy the artifacts into one dist/,
@@ -59,7 +62,7 @@ LOCK_VERSION="$(awk '/^name = "tangent"$/{getline; gsub(/[",]/,""); print $3; ex
 git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null 2>&1 \
   && echo "    NOTE: tag v${VERSION} exists — you are rebuilding a shipped version"
 
-# ── The three refusals ───────────────────────────────────────────────────────
+# ── The refusals ─────────────────────────────────────────────────────────────
 #
 # **A version is spent the moment a build carries it, and nothing used to stop
 # that.** Six numbers went in a single day — beta.10 through beta.15 — none
@@ -68,9 +71,10 @@ git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null 2>&1 \
 # invisible until somebody counted.
 #
 # So `main` carries `X.Y.Z-dev` and only a deliberate release writes a real
-# version. These three checks are what make that structural rather than a thing
-# to remember. They are `exit 2`, not `note` — a warning that can be scrolled
-# past is how this happened.
+# version. These checks are what make that structural rather than a thing to
+# remember. They are `exit 2`, not `note` — a warning that can be scrolled
+# past is how this happened. Ordered cheap-to-expensive, so a wrong version
+# never costs a workspace build.
 
 # 1. The placeholder is not a release. This is the whole point of `-dev`: a
 #    build on main cannot claim a number, because the number is not a number.
@@ -114,6 +118,46 @@ case "$VERSION" in
     echo "    NOTE: pre-releases are rc.N now; $VERSION predates that policy" ;;
 esac
 
+# 5. THIRD-PARTY-LICENSES must match Cargo.lock. The build scripts only test
+#    that the file EXISTS, so a stale one is bundled forever, and regenerating
+#    it was a documented gate that lived in memory (docs/RELEASE.md gate 4) —
+#    which is how 5.0 shipped a licence file 400+ commits stale, with the LV2,
+#    ASIO and accessibility dependency work entirely unlisted. Regenerate into
+#    a temp file and byte-diff; the generator is deterministic given the same
+#    Cargo.lock, which is exactly what makes a byte-diff a fair gate.
+TPL_TMP="$(mktemp)"
+if ! scripts/gen-third-party-licenses.sh "$TPL_TMP" >/dev/null; then
+  rm -f "$TPL_TMP"
+  echo "refusing: could not regenerate THIRD-PARTY-LICENSES to compare" >&2
+  echo "  (scripts/gen-third-party-licenses.sh failed — its output is above)." >&2
+  exit 2
+fi
+if ! diff -q THIRD-PARTY-LICENSES "$TPL_TMP" >/dev/null 2>&1; then
+  rm -f "$TPL_TMP"
+  echo "refusing: THIRD-PARTY-LICENSES is stale against Cargo.lock." >&2
+  echo "  Run scripts/gen-third-party-licenses.sh and commit the result." >&2
+  exit 2
+fi
+rm -f "$TPL_TMP"
+
+# 6. The gate must be green before the build spends the version. The commands
+#    are docs/RELEASE.md gate 3 plus the Cargo.toml lint policy under the
+#    clippy driver, all in scripts/check.sh — one script, so CI can someday
+#    call the same thing instead of restating it in YAML (docs/RELEASE.md's
+#    one hard rule for when CI returns). Skipped on --sums-only, which
+#    re-checks artifacts that already passed this gate when they were built,
+#    and on SKIP_TESTS=1 — which must be TYPED, deliberately, because a
+#    warning that can be scrolled past is how versions got burnt.
+if [ "$SUMS_ONLY" = 0 ] && [ "${SKIP_TESTS:-0}" != "1" ]; then
+  scripts/check.sh || {
+    echo "refusing: the release gate is red (scripts/check.sh, above)." >&2
+    echo "  Fix it, or SKIP_TESTS=1 to state on the record that you did not." >&2
+    exit 2
+  }
+elif [ "${SKIP_TESTS:-0}" = "1" ]; then
+  echo "    NOTE: SKIP_TESTS=1 — the test/lint gate was deliberately skipped"
+fi
+
 # ── Purge artifacts belonging to other versions ──────────────────────────────
 # Left in place they get swept up by any `Tangent-*` / `tangent-*` glob at checksum
 # or upload time. Only the four known artifact name shapes are ever touched.
@@ -141,6 +185,12 @@ if [ "$SUMS_ONLY" = 0 ]; then
   case "$(uname -s)" in
     Darwin)
       scripts/build-macos.sh
+      # The pkg, immediately after the .app it consumes is written. Everything
+      # downstream was already wired for it — the purge glob, the artifact
+      # checks, publish-github.sh's upload glob — and the supporter-key email
+      # hardcodes its permalink, so a release built without this line shipped
+      # every check green and a 404 to exactly the people who paid.
+      scripts/build-installer.sh macos
       if [ "${SKIP_WINDOWS:-0}" = "1" ]; then
         echo "==> Skipping build-cross.sh (SKIP_WINDOWS=1)"
       else
@@ -191,6 +241,11 @@ for a in "${ARTIFACTS[@]}"; do
           || note "$a: the app component is RELOCATABLE (it must not be)"
         pkgutil --check-signature "$a" 2>/dev/null | grep -q 'Status: signed' \
           || note "$a: UNSIGNED (needs a Developer ID Installer certificate)"
+        # Signed-but-unnotarized passes the grep above and still warns on
+        # first open; the staple is a real part of the artifact, so validate
+        # it here rather than trust build-installer.sh's log line.
+        xcrun stapler validate "$a" >/dev/null 2>&1 \
+          || note "$a: signed but NOT stapled (notarization missing or failed)"
       else
         note "$a: could not be expanded — it is not a valid flat package"
       fi
@@ -209,6 +264,19 @@ for a in "${ARTIFACTS[@]}"; do
       else
         note "$a: not inspected (install 7-zip to check: brew install sevenzip)"
       fi
+      # The same refusal the .pkg gets, because SmartScreen judges the OUTER
+      # installer no matter what happened to the inner exe. A presence check
+      # on the PE's certificate table (scripts/pe-signed.py) rather than a
+      # verifier that may not be installed — a gate that only runs where a
+      # tool happens to exist is a gate that is off on the machine that cuts
+      # releases. Exit 1 is a clean-but-unsigned PE; anything else means the
+      # file could not even be read as a PE, which is worse, not better.
+      sig=0; python3 scripts/pe-signed.py "$a" >/dev/null 2>&1 || sig=$?
+      case "$sig" in
+        0) ;;
+        1) note "$a: UNSIGNED (Authenticode) — configure TRUSTED_SIGNING_* and rerun (docs/RELEASE.md § Windows)" ;;
+        *) note "$a: could not read the PE certificate table (pe-signed.py exit $sig)" ;;
+      esac
       continue
       ;;
   esac
