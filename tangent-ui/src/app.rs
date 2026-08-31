@@ -575,6 +575,9 @@ pub struct TangentApp {
     arr_scroll_acc: f32,
     /// The mixer control being dragged, and where the hand started.
     mixer_grab: Option<MixerGrab>,
+    /// The window is genuinely FULLSCREEN this frame (not maximized, not
+    /// tiled) — what the mixer's fold is gated on.
+    fullscreen_now: bool,
     /// The Konami walk. Watched only while the install is FREE - the code
     /// is a door, and a door already open needs no knocking.
     konami: crate::keys::Konami,
@@ -2109,6 +2112,7 @@ impl TangentApp {
             arr_lane_scroll: 0,
             arr_scroll_acc: 0.0,
             mixer_grab: None,
+            fullscreen_now: false,
             konami: crate::keys::Konami::default(),
             confetti_at: None,
             bay_carry: None,
@@ -4640,7 +4644,7 @@ impl TangentApp {
                 },
             }),
             any_solo: desk.any_solo(),
-            screen_filling: self.screen_sized,
+            screen_filling: self.fullscreen_now,
             active: self.active_channels(),
             visible: self.mixer_visible(),
             scroll_px: self.mixer_scroll_px,
@@ -7056,8 +7060,8 @@ impl TangentApp {
                         );
                     }
                 }
-                let move_mask = |mask: u32| -> u32 {
-                    let keep = mask & ((1 << V18_CH) - 1);
+                let move_mask = |mask: u64| -> u64 {
+                    let keep = mask & ((1u64 << V18_CH) - 1);
                     let above = mask >> V18_CH;
                     keep | (above << (V18_CH + 1))
                 };
@@ -7104,8 +7108,8 @@ impl TangentApp {
                         d.inserts.insert(ins_at, String::new());
                     }
                 }
-                let grow_mask = |mask: u32| -> u32 {
-                    let keep = mask & ((1u32 << OLD_CH) - 1);
+                let grow_mask = |mask: u64| -> u64 {
+                    let keep = mask & ((1u64 << OLD_CH) - 1);
                     let above = mask >> OLD_CH;
                     keep | (above << (OLD_CH + grow))
                 };
@@ -7140,8 +7144,8 @@ impl TangentApp {
                         d.inserts.insert(ins_at, String::new());
                     }
                 }
-                let grow_mask = |mask: u32| -> u32 {
-                    let keep = mask & ((1u32 << V19_CH) - 1);
+                let grow_mask = |mask: u64| -> u64 {
+                    let keep = mask & ((1u64 << V19_CH) - 1);
                     let above = mask >> V19_CH;
                     keep | (above << (V19_CH + grow))
                 };
@@ -7727,8 +7731,26 @@ impl TangentApp {
         for n in 0..CHANNELS {
             self.settings.channel_inputs[n] = inputs[order[n]].clone();
         }
+        // The channel block exactly fills a u32 at thirty-two, so the
+        // "everything above the channels" complement has to dodge the
+        // 1<<32 overflow; the strip masks are u64 now (thirty-five strip
+        // seats) and get their own mover.
+        let chan_bits_u32: u32 = if CHANNELS >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << CHANNELS) - 1
+        };
         let move_bits_u32 = |mask: u32| -> u32 {
-            let mut out = mask & !((1u32 << CHANNELS) - 1);
+            let mut out = mask & !chan_bits_u32;
+            for n in 0..CHANNELS {
+                if mask & (1 << order[n]) != 0 {
+                    out |= 1 << n;
+                }
+            }
+            out
+        };
+        let move_bits_u64 = |mask: u64| -> u64 {
+            let mut out = mask & !((1u64 << CHANNELS) - 1);
             for n in 0..CHANNELS {
                 if mask & (1 << order[n]) != 0 {
                     out |= 1 << n;
@@ -7737,8 +7759,8 @@ impl TangentApp {
             out
         };
         self.armed = move_bits_u32(self.armed);
-        self.settings.strip_muted = move_bits_u32(self.settings.strip_muted);
-        self.settings.strip_soloed = move_bits_u32(self.settings.strip_soloed);
+        self.settings.strip_muted = move_bits_u64(self.settings.strip_muted);
+        self.settings.strip_soloed = move_bits_u64(self.settings.strip_soloed);
         {
             let mask = self.settings.tracks_added;
             let mut out = mask & !((1i64 << CHANNELS) - 1);
@@ -18527,16 +18549,14 @@ impl TangentApp {
     }
 
     fn mixer_visible(&self) -> usize {
-        let active = self.active_channels();
-        let want = (self.settings.mixer_visible as usize)
-            .max(if self.screen_sized { active } else { 0 });
-        want.clamp(1, active)
+        // No screen-size forcing: the floor it used to impose was exactly
+        // what killed Shift+wheel zoom in fullscreen — the owner's "track
+        // zoom regressed". The fold no longer reads this either; windowed
+        // or full, the zoom is the user's.
+        (self.settings.mixer_visible as usize).clamp(1, self.active_channels())
     }
     fn arr_visible(&self) -> usize {
-        let active = self.active_channels();
-        let want = (self.settings.arr_visible as usize)
-            .max(if self.screen_sized { ARR_LANES_FULL.min(active) } else { 0 });
-        want.clamp(1, active)
+        (self.settings.arr_visible as usize).clamp(1, self.active_channels())
     }
     fn midi_keys_visible(&self) -> f32 {
         (self.settings.midi_keys_visible as f32).clamp(12.0, 96.0)
@@ -19466,7 +19486,7 @@ impl TangentApp {
     }
 
     /// **Which strips are polarity-inverted**, one bit per strip.
-    pub fn strip_phase(&self) -> u32 {
+    pub fn strip_phase(&self) -> u64 {
         self.settings.strip_phase
     }
 
@@ -20747,6 +20767,19 @@ impl TangentApp {
             MenuAction::ToggleBorderless => {
                 self.settings.borderless_mode = !self.settings.borderless_mode;
                 self.save_settings();
+                // **Under a manager, the toggle must end at the manager's
+                // size.** i3 and AeroSpace both left the window mis-sized in
+                // its tile after the decorations changed - the refill used
+                // to arrive by ACCIDENT, from the aspect snap picking a
+                // fight the manager answered by re-asserting its tile, and
+                // the snap has since learned to stand down. So ask the
+                // question deliberately: request exactly the size we have,
+                // which a tiler answers with the tile.
+                if self.caps.window_sizing && (self.main_wm_managed || self.screen_sized) {
+                    if let Some(sz) = self.main_live_size {
+                        self.pending_window_size = Some(sz);
+                    }
+                }
             }
             MenuAction::SelectMidiInput => {
                 // Unreachable without `caps.midi_ports` — the menu drops the
@@ -23248,12 +23281,14 @@ impl TangentApp {
             && self.swing_menu.is_none()
             && !self.text_entry_active()
         {
-            // **The code, watched ahead of every ordinary binding.** Only a
-            // FREE install listens; the tail of the walk (B, A, Enter)
-            // consumes the frame's dispatch so B does not flip borderless
-            // and A does not open About mid-cheat. The arrows stay live -
-            // up-up-down-down is harmless on every view.
-            let konami_eats = !self.license.is_supporter() && {
+            // **The code, watched ahead of every ordinary binding, on every
+            // install.** A free one earns the unlock; a supporter doing it
+            // again gets the other dialog and the same party - the owner's
+            // "as many times as you want". The tail of the walk (B, A,
+            // Enter) consumes the frame's dispatch so B does not flip
+            // borderless and A does not open About mid-cheat. The arrows
+            // stay live - up-up-down-down is harmless on every view.
+            let konami_eats = {
                 let keys: Vec<(egui::Key, bool)> = ctx.input(|i| {
                     i.events
                         .iter()
@@ -23277,7 +23312,11 @@ impl TangentApp {
                         eats = true;
                     }
                     if done {
-                        self.dialog = Some(dialogs::Dialog::Cheated);
+                        self.dialog = Some(if self.license.is_supporter() {
+                            dialogs::Dialog::CheatFun
+                        } else {
+                            dialogs::Dialog::Cheated
+                        });
                         self.start_confetti();
                     }
                 }
@@ -23590,6 +23629,9 @@ impl TangentApp {
                     (Some(p), Some(m)) => p.y + 96.0 >= m.y && p.x + 40.0 >= m.x,
                     _ => false,
                 });
+        // TRUE fullscreen alone — the mixer's 16-over-16 fold is gated on
+        // this, by the owner's word: maximized and tiled stay one row.
+        self.fullscreen_now = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
         let monitor = monitor.map(|m| m.x);
         // **Learn the monitor's width, once.** The percentages are shares of
         // it now (see `main_width`), and the very first window of a launch is
@@ -23998,12 +24040,26 @@ impl TangentApp {
                     // slow. Only while it is actually drifting — a still
                     // heart must not hold a repaint loop open, and on a
                     // laptop that is the difference between a fan and none.
-                    if self.settings.heart_animate && self.license.is_supporter() {
+                    if self.license.cheated() {
+                        // **The cheater's heart, and only that heart.** The
+                        // owner's word: while the Konami marker stands, the
+                        // black-crackle glow is the whole wardrobe — always
+                        // animated, no wave, no flat fallback, whatever the
+                        // heart settings say. The glow is the theme's own
+                        // master colour: crimson on Default, per spec.
                         ui.ctx().request_repaint_after(
                             std::time::Duration::from_millis(33),
                         );
-                    }
-                    if self.settings.heart_animate && self.license.is_supporter() {
+                        chord_strip::draw_heart_crackle(
+                            ui.painter(),
+                            hr,
+                            self.settings.master_knob_color.to_color32(),
+                            now as f32,
+                        );
+                    } else if self.settings.heart_animate && self.license.is_supporter() {
+                        ui.ctx().request_repaint_after(
+                            std::time::Duration::from_millis(33),
+                        );
                         chord_strip::draw_heart_wave(ui.painter(), hr, &|phase| {
                             let fill = self.heart_wave(phase, now);
                             (fill, recorder_panel::heart_border(fill))

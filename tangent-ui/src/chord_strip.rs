@@ -906,3 +906,71 @@ mod heart_geometry_tests {
         );
     }
 }
+
+/// **The cheater's heart.** A black-bordered heart whose body is black
+/// crackle over smoothly glowing highlights — the Konami unlock's own
+/// mark, worn instead of every other heart while the cheat marker stands.
+/// Per-theme for consistency: the glow is the theme's MASTER colour, which
+/// on the Default theme is crimson — the owner's spec image — and each
+/// theme's own one-colour-you-look-for elsewhere. The crackle and the
+/// border stay black on every theme.
+///
+/// Deterministic like the confetti: the crack pattern is a hash of the
+/// pixel grid, clustered so it reads as veins rather than static, and the
+/// glow phase per cell comes from the same hash so two machines pulse in
+/// the same pattern.
+pub fn draw_heart_crackle(painter: &Painter, rect: Rect, glow: Color32, t: f32) {
+    if !rect.is_positive() {
+        return;
+    }
+    let Some((px, origin)) = heart_grid(rect) else {
+        return;
+    };
+    let black = Color32::from_rgb(0x0a, 0x0a, 0x0a);
+    let h = |a: usize, b: usize, salt: u32| -> f32 {
+        let mut x = (a as u32)
+            .wrapping_mul(2_654_435_761)
+            .wrapping_add((b as u32).wrapping_mul(40_503))
+            .wrapping_add(salt.wrapping_mul(97));
+        x ^= x >> 15;
+        x = x.wrapping_mul(2_246_822_519);
+        x ^= x >> 13;
+        (x & 0xFFFF) as f32 / 65_536.0
+    };
+    // Border first: the black silhouette, same construction as the
+    // bordered heart's.
+    for (row, line) in HEART.iter().enumerate() {
+        for (col, ch) in line.chars().enumerate() {
+            if ch != 'X' {
+                continue;
+            }
+            let p = Pos2::new(origin.x + col as f32 * px.x, origin.y + row as f32 * px.y);
+            painter.rect_filled(
+                Rect::from_min_size(p, px).expand2(px * HEART_EDGE),
+                0.0,
+                black,
+            );
+        }
+    }
+    for (row, line) in HEART.iter().enumerate() {
+        for (col, ch) in line.chars().enumerate() {
+            if ch != 'X' {
+                continue;
+            }
+            // Clustered on the half-grid so cracks come in connected runs —
+            // veins, not noise.
+            let crack = h(row / 2, col / 2, 5) < 0.38;
+            let p = Pos2::new(origin.x + col as f32 * px.x, origin.y + row as f32 * px.y);
+            let cell = Rect::from_min_size(p, px);
+            if crack {
+                painter.rect_filled(cell, 0.0, black);
+            } else {
+                // The smooth glow: each highlight cell breathes on its own
+                // phase, never fully dark, never clipping.
+                let phase = h(row, col, 9) * std::f32::consts::TAU;
+                let pulse = 0.45 + 0.55 * (0.5 + 0.5 * (t * 2.2 + phase).sin());
+                painter.rect_filled(cell, 0.0, glow.gamma_multiply(pulse));
+            }
+        }
+    }
+}

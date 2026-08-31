@@ -565,7 +565,7 @@ impl Strip {
         }
     }
 
-    fn bit(self) -> u32 {
+    fn bit(self) -> u64 {
         1 << self.index()
     }
 
@@ -617,7 +617,7 @@ fn permute_rows<T: Default>(rows: &mut [T], order: &[usize]) {
     }
 }
 
-fn strip_is_heard(strip: Strip, muted: u32, soloed: u32) -> bool {
+fn strip_is_heard(strip: Strip, muted: u64, soloed: u64) -> bool {
     // Soloed by name: heard, whatever its own mute says. Pressing solo on a
     // muted channel is unambiguously a request to hear it, and the
     // alternative is a solo button that sometimes does nothing.
@@ -661,8 +661,8 @@ fn strip_is_heard(strip: Strip, muted: u32, soloed: u32) -> bool {
 /// `parents` is the renderer's copy of `Shared::folder_of`, read once a
 /// block. The walk terminates because a parent index is always lower than
 /// its child's; `CHANNELS` is the belt-and-braces bound.
-fn channel_is_heard(ch: usize, parents: &[i32; CHANNELS], muted: u32, soloed: u32) -> bool {
-    let bit = |n: usize| 1u32 << n.min(31);
+fn channel_is_heard(ch: usize, parents: &[i32; CHANNELS], muted: u64, soloed: u64) -> bool {
+    let bit = |n: usize| 1u64 << n.min(63);
     // Muted anywhere up the chain: silent, whatever anything else says.
     // Checked before solo, and deliberately: an explicit solo overrides the
     // channel's OWN mute, but nothing overrides a group being switched off.
@@ -1119,7 +1119,7 @@ fn lane_gain_of(auto: &AutoNow, shared: &Shared, lane: usize) -> f32 {
     //
     // Automation is respected: a curve names a LEVEL, and the polarity is a
     // property of the strip that the level passes through.
-    if lane < 32 && shared.strip_phase.load(Ordering::Relaxed) & (1 << lane) != 0 {
+    if lane < 64 && shared.strip_phase.load(Ordering::Relaxed) & (1 << lane) != 0 {
         -g
     } else {
         g
@@ -1853,7 +1853,7 @@ struct Shared {
     /// in. Zero is every channel armed, which is the desk this app has always
     /// had — an empty channel armed plays nothing, so five loaded instruments
     /// still layer, and switching a channel to AUDIO is what sets its bit.
-    midi_off: AtomicU32,
+    midi_off: AtomicU64,
     /// Which channels are ARMED — live to the room. Bits over the eight
     /// generals; an unarmed AUDIO channel's input still drains and still
     /// reaches a take, but contributes nothing to the monitor mix. The MIDI
@@ -1951,7 +1951,7 @@ struct Shared {
     /// ALL the strips at once — "is anything soloed" decides what every other
     /// strip does — and reading eight atomics to answer it would be eight
     /// chances for the answer to change halfway through.
-    muted: AtomicU32,
+    muted: AtomicU64,
     /// Lanes whose automation must NOT drive their control this block, one
     /// bit each.
     ///
@@ -1961,7 +1961,7 @@ struct Shared {
     /// lane being WRITTEN has a hand on the control, and a curve that fought
     /// the hand would make the fader jump back under it as each point
     /// landed. Both mean: leave this one to the fader.
-    auto_suspend: AtomicU32,
+    auto_suspend: AtomicU64,
     /// What each channel's insert chain delays its output by, in frames, and
     /// the largest of them.
     ///
@@ -2026,7 +2026,7 @@ struct Shared {
     /// everything already shares costs you that delay twice. One atomic
     /// served both and the two wanted different answers.
     total_latency: AtomicU32,
-    soloed: AtomicU32,
+    soloed: AtomicU64,
     /// The eight effect knobs, 0..=1. Four of them are sends on the effects
     /// bus and four are inserts on the master — see `effects.rs`, and see
     /// `Renderer::render` for which is which and why.
@@ -2068,7 +2068,7 @@ struct Shared {
     /// gain is resolved: inverting polarity IS multiplying by minus one, so
     /// there is nothing else to do and no second path through the mixer for
     /// a phased signal to take.
-    strip_phase: AtomicU32,
+    strip_phase: AtomicU64,
     /// **How often the click sounds, per beat of the signature.**
     ///
     /// 1 is one click a beat, 2 is twice a beat, 0 is one a BAR. Held as a
@@ -2165,7 +2165,7 @@ impl Shared {
             pending_swaps: AtomicU32::new(0),
             out_block_seen: AtomicU32::new(0),
             out_ring_asked: AtomicU32::new(0),
-            midi_off: AtomicU32::new(0),
+            midi_off: AtomicU64::new(0),
             armed: AtomicU32::new(u32::MAX),
             arr_capture: AtomicU32::new(0),
             cap_dropped: AtomicU64::new(0),
@@ -2195,8 +2195,8 @@ impl Shared {
             pad_choke: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU32::new(0))),
             pad_master: AtomicU32::new(1.0f32.to_bits()),
             pad_peak: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU32::new(0))),
-            muted: AtomicU32::new(0),
-            auto_suspend: AtomicU32::new(0),
+            muted: AtomicU64::new(0),
+            auto_suspend: AtomicU64::new(0),
             seat_latency: (0..RACK_SEATS * INSERTS).map(|_| AtomicU32::new(0)).collect(),
             lane_latency: std::array::from_fn(|_| AtomicU32::new(0)),
             lufs: std::array::from_fn(|_| {
@@ -2207,7 +2207,7 @@ impl Shared {
             lane_sounding: (0..CHANNELS * 2).map(|_| AtomicU64::new(0)).collect(),
             max_latency: AtomicU32::new(0),
             total_latency: AtomicU32::new(0),
-            soloed: AtomicU32::new(0),
+            soloed: AtomicU64::new(0),
             gr_db: AtomicU32::new(0),
             reverb_mix: AtomicU32::new(0.0f32.to_bits()),
             phaser_mix: AtomicU32::new(0.0f32.to_bits()),
@@ -2231,7 +2231,7 @@ impl Shared {
             count_in_in_take: AtomicBool::new(false),
             bpm: AtomicU64::new(120.0f64.to_bits()),
             beats_per_bar: AtomicU32::new(4),
-            strip_phase: AtomicU32::new(0),
+            strip_phase: AtomicU64::new(0),
             metronome_div: AtomicU32::new(1),
             beat_unit: AtomicU32::new(4),
             count_in_req: AtomicU64::new(0),
@@ -3533,7 +3533,7 @@ impl Renderer {
         // switched away from MIDI, in which case it is fed nothing and holds
         // its tails. The gate is per CHANNEL and travels as one atomic mask,
         // like mute and solo.
-        let armed = self.shared.midi_off.load(Ordering::Relaxed) & (1 << at.min(31)) == 0;
+        let armed = self.shared.midi_off.load(Ordering::Relaxed) & (1 << at.min(63)) == 0;
         let notes: &[tangent_host::Note] = if armed { &self.notes } else { &[] };
         let controls: &[tangent_host::Control] = if armed { &self.controls } else { &[] };
         let Some(rack) = self.racks.get(at) else {
@@ -4351,7 +4351,7 @@ impl Renderer {
                 }
                 {
                     let armed = self.shared.midi_off.load(Ordering::Relaxed)
-                        & (1 << Strip::Click.index().min(31))
+                        & (1 << Strip::Click.index().min(63))
                         == 0;
                     let notes: &[tangent_host::Note] = if armed { &self.notes } else { &[] };
                     let controls: &[tangent_host::Control] = if armed { &self.controls } else { &[] };
@@ -5095,7 +5095,7 @@ impl Renderer {
     ///
     /// It reaches the SPEAKERS only when somebody asked to hear it, and the
     /// two used to be the same switch. See the gate below.
-    fn mix_monitor(&mut self, frames: usize, muted: u32, soloed: u32) {
+    fn mix_monitor(&mut self, frames: usize, muted: u64, soloed: u64) {
         // Cleared first, so every path out of here that adds nothing to the
         // mix also leaves the room equal to the take.
         self.room_live = false;
@@ -5433,7 +5433,7 @@ impl Renderer {
                 // An input channel's rack can hold a voice too — the desk is
                 // about to stop distinguishing — and the gate is the same one.
                 let armed = self.shared.midi_off.load(Ordering::Relaxed)
-                    & (1 << strip.index().min(31))
+                    & (1 << strip.index().min(63))
                     == 0;
                 let notes: &[tangent_host::Note] = if armed { &self.notes } else { &[] };
                 let controls: &[tangent_host::Control] = if armed { &self.controls } else { &[] };
@@ -5652,7 +5652,7 @@ impl Renderer {
                 continue;
             };
             let lane = curve.lane;
-            if suspend & (1 << lane.min(31)) != 0 {
+            if suspend & (1 << lane.min(63)) != 0 {
                 continue;
             }
             // **The MASTER's rack is a block past the channels'.**
@@ -5829,7 +5829,7 @@ impl Renderer {
     /// The mask is a `u32` of bits the desk owns; a curve overrides one bit
     /// without disturbing the others, so a lane nobody has automated goes on
     /// answering to its own button.
-    fn muted_now(&self, muted: u32) -> u32 {
+    fn muted_now(&self, muted: u64) -> u64 {
         let mut out = muted;
         for lane in 0..CHANNELS {
             match self.auto.mute[lane] {
@@ -5890,7 +5890,7 @@ impl Renderer {
     /// The clip is stereo at the device's rate — `decode` guarantees both — so
     /// there is no resampling and no channel mapping here, which is the whole
     /// reason it is guaranteed there.
-    fn mix_clips(&mut self, at: u64, rolling: bool, frames: usize, muted: u32, soloed: u32) {
+    fn mix_clips(&mut self, at: u64, rolling: bool, frames: usize, muted: u64, soloed: u64) {
         // A clip LIST arriving — and the displaced one going BACK, by the
         // racks' own protocol: no room to return it, no swap this block.
         // Dropping it here would free a hundred megabytes inside the
@@ -6150,7 +6150,7 @@ impl Renderer {
         self.preview_pos += frames;
     }
 
-    fn mix_pads(&mut self, frames: usize, muted: u32, soloed: u32) {
+    fn mix_pads(&mut self, frames: usize, muted: u64, soloed: u64) {
         // A kit arriving — and the displaced one going BACK, by the racks'
         // own protocol: no room to return it, no swap this block. The voices
         // are silenced across a swap; see `PadVoice::silence`.
@@ -6289,8 +6289,8 @@ impl Renderer {
         &mut self,
         drum_lane: Option<usize>,
         frames: usize,
-        muted: u32,
-        soloed: u32,
+        muted: u64,
+        soloed: u64,
         coeff: f32,
     ) {
         // The lane whose kit and voices this pass belongs to. The bare
@@ -6648,8 +6648,8 @@ impl Renderer {
     fn mix_channels(
         &mut self,
         frames: usize,
-        muted: u32,
-        soloed: u32,
+        muted: u64,
+        soloed: u64,
         at: u64,
         rolling: bool,
         flush: bool,
@@ -7211,8 +7211,8 @@ impl Renderer {
     fn fold_folders(
         &mut self,
         frames: usize,
-        muted: u32,
-        soloed: u32,
+        muted: u64,
+        soloed: u64,
         coeff: f32,
         pdc_max: u32,
     ) {
@@ -9427,7 +9427,7 @@ impl Engine {
     /// Pushed whole, like mute and solo: the UI computes it from every
     /// channel's kind and arm switch, and the audio thread reads it per chunk.
     /// Zero is every channel armed, which is the desk as it has always been.
-    pub fn set_midi_off(&self, mask: u32) {
+    pub fn set_midi_off(&self, mask: u64) {
         self.shared.midi_off.store(mask, Ordering::Relaxed);
     }
 
@@ -10121,8 +10121,8 @@ impl Engine {
     /// which is what makes the UI's strip order and this one provably the same
     /// rather than the same by inspection.
     pub fn set_desk(&self, desk: &tangent_ui::recorder::Desk) {
-        let mut muted = 0u32;
-        let mut soloed = 0u32;
+        let mut muted = 0u64;
+        let mut soloed = 0u64;
         let sh = &self.shared;
         for ui in tangent_ui::recorder::Strip::all() {
             let here = Strip::from(ui);
@@ -10254,7 +10254,7 @@ impl Engine {
 
 
     pub fn set_auto_suspend(&self, mask: u32) {
-        self.shared.auto_suspend.store(mask, Ordering::Relaxed);
+        self.shared.auto_suspend.store(u64::from(mask), Ordering::Relaxed);
     }
 
     pub fn set_automation(&mut self, auto: tangent_ui::automation::Automation) {
@@ -10291,7 +10291,7 @@ impl Engine {
     /// still two atomics — a callback can still catch them mid-change — but the
     /// window is one store apart rather than a whole UI frame.
     /// **Which strips are polarity-inverted**, one bit per `Strip::index`.
-    pub fn set_strip_phase(&self, mask: u32) {
+    pub fn set_strip_phase(&self, mask: u64) {
         self.shared.strip_phase.store(mask, Ordering::Relaxed);
     }
 
@@ -13074,7 +13074,7 @@ mod tests {
 
         // Let the tails die, then gate the channel and play again.
         std::thread::sleep(Duration::from_millis(2500));
-        engine.set_midi_off(1 << STRIPS.min(31));
+        engine.set_midi_off(1 << STRIPS.min(63));
         let t = engine.timebase().now();
         for n in [48u8, 60, 64, 67] {
             engine.send_midi(t, &[0x90, n, 100]);
@@ -13334,7 +13334,7 @@ mod tests {
             "muting one channel muted another"
         );
         // Every strip owns a bit of its own, or two of them would mute together.
-        let mut bits: Vec<u32> = all.iter().map(|s| s.bit()).collect();
+        let mut bits: Vec<u64> = all.iter().map(|s| s.bit()).collect();
         let n = bits.len();
         bits.sort_unstable();
         bits.dedup();
@@ -15463,7 +15463,7 @@ mod tests {
         assert!((lane_gain_of(&auto, &shared, 0) - b).abs() < 1e-6);
 
         // A bit past the mask's width must not panic or wrap onto a real lane.
-        shared.strip_phase.store(u32::MAX, Ordering::Relaxed);
+        shared.strip_phase.store(u64::MAX, Ordering::Relaxed);
         for lane in [0usize, 15, 31, 32, 64] {
             let g = lane_gain_of(&auto, &shared, lane);
             assert!(g.is_finite(), "lane {lane} gave {g}");
@@ -16255,7 +16255,7 @@ mod tests {
             fade_out: 0,
             gain: 1.0,
         };
-        let run = |phase: u32| -> f32 {
+        let run = |phase: u64| -> f32 {
             let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
             e.set_clips(vec![placed(0), placed(1)]);
             e.set_strip_phase(phase);
@@ -16551,7 +16551,7 @@ mod tests {
             fade_out: 0,
             gain: 1.0,
         };
-        let run = |muted: u32, soloed: u32| -> f32 {
+        let run = |muted: u64, soloed: u64| -> f32 {
             let (mut r, _tx, shared) = renderer_with_midi(2);
             let (mut to_audio, _from) = r.hijack_track_rings();
             to_audio

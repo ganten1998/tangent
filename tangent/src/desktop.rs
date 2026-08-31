@@ -4565,7 +4565,7 @@ impl DesktopApp {
             e.set_channel_pan(ch, self.app.channel_pan(ch));
         }
         // No live input of any kind: every arm down, every port silent.
-        e.set_midi_off(u32::MAX);
+        e.set_midi_off(u64::MAX);
         e.set_armed(0);
         e.set_monitor_on(false);
         e.set_drums(self.app.drums_gain(), self.app.drums_pan());
@@ -6213,7 +6213,7 @@ impl DesktopApp {
             self.app.midi_editor_lane(),
         );
         crate::devices::set_channel_picks(&self.recorder.audio, explicit);
-        e.set_midi_off(midi_off);
+        e.set_midi_off(u64::from(midi_off));
         e.set_armed(armed);
         e.set_pick_strips(picks);
         // **The live punch**: while the arrangement records over a lane,
@@ -7545,18 +7545,20 @@ fn shift_insert_states_for_v18() {
 /// literals per the historical-migration rule. The upper bound covers the
 /// old master (11) and all 128 pads (12..139).
 #[cfg(feature = "recorder")]
-/// 16 -> 24 channels: every seat at or above the old channel block —
+/// 16 -> today's channels: every seat at or above the old channel block —
 /// drums, click, fx, master, master-extra and all the pad blocks — steps
-/// up by exactly eight. Uniform because the seat map appends its classes
-/// in order (channels, buses, pads), so a single +8 over the old range is
-/// provably right for every old seat >= 16. Highest first, or the move
-/// eats itself. The old map's last seat was 2068.
+/// up by exactly the growth. Uniform because the seat map appends its
+/// classes in order (channels, buses, pads), so one +grow over the old
+/// range is provably right for every old seat >= 16. Highest first, or
+/// the move eats itself. The old map's last seat was 2068 (frozen: the
+/// sixteen-channel era's own arithmetic).
 fn shift_insert_states_for_v20() {
+    let grow = tangent_ui::recorder::CHANNELS - 16;
     for bay in 0..3 {
         for old in (16..2069).rev() {
             let from = insert_state_path(old, bay);
             if from.exists() {
-                let _ = std::fs::rename(&from, insert_state_path(old + 8, bay));
+                let _ = std::fs::rename(&from, insert_state_path(old + grow, bay));
             }
         }
     }

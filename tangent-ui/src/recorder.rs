@@ -571,11 +571,13 @@ impl ChannelKind {
 /// How many general channels the desk can CARRY — the capacity every
 /// engine table, settings array and seat index is sized to.
 ///
-/// **Twenty-four as of 2026-08-31, the owner's word** — the supporter desk.
-/// It grew from eight (nine columns was the accident of five slots plus
-/// four inputs) to sixteen at 4.82.0, and to twenty-four with the
-/// supporter unlock. What a given INSTALL shows is [`active_channels`]:
-/// sixteen free, the full twenty-four with a key (or the Konami road).
+/// **Thirty-two as of 2026-08-31, the owner's word** — the supporter desk
+/// (it was twenty-four for one commit the same evening; the owner went
+/// bigger). It grew from eight (nine columns was the accident of five
+/// slots plus four inputs) to sixteen at 4.82.0, and to thirty-two with
+/// the supporter unlock. What a given INSTALL shows is
+/// [`active_channels`]: sixteen free, the full thirty-two with a key (or
+/// the Konami road).
 /// The engine always runs the full width, so a supporter's session opened
 /// on a free install still SOUNDS whole — a licence must never silence
 /// somebody's music — and the free desk simply cannot start new work past
@@ -583,7 +585,7 @@ impl ChannelKind {
 /// an app whose strips appear and disappear as things load is a desk that
 /// changes shape under your hands, so an unused channel is drawn as a
 /// plus rather than not drawn.
-pub const CHANNELS: usize = 24;
+pub const CHANNELS: usize = 32;
 
 /// The free desk: the sixteen the app has always shown without a key.
 pub const FREE_CHANNELS: usize = 16;
@@ -1097,7 +1099,7 @@ pub struct ArrRecView {
     pub notes: Vec<crate::arrangement::ArrNote>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RecorderState {
     /// The playhead, in seconds from 0:00 — what the readout and the waveform
     /// draw. Filled by the host once a frame; `tangent-ui` never advances a
@@ -1153,6 +1155,43 @@ pub struct RecorderState {
     /// rather than "set up the next one".
     pub last_take_folder: Option<String>,
 }
+
+/// Hand-written because `strip_peaks` is a thirty-five-row array and std
+/// only derives `Default` for arrays up to thirty-two — the desk outgrew
+/// the derive the day it went to thirty-two channels plus its three buses.
+impl Default for RecorderState {
+    fn default() -> Self {
+        Self {
+            position_s: 0.0,
+            playing: false,
+            arr_recording: false,
+            arr_rec: None,
+            state: RecordState::default(),
+            elapsed_s: 0.0,
+            strip_peaks: [[0.0; 2]; STRIPS],
+            meters: Meters::default(),
+            master: Meters::default(),
+            gr_db: 0.0,
+            loudness: Loudness::default(),
+            lane_sounding: [0; CHANNELS],
+            dest: String::new(),
+            project_dest: String::new(),
+            export_dest: String::new(),
+            folder_preview: String::new(),
+            camera_name: None,
+            camera_missing: false,
+            inputs: Default::default(),
+            audio_name: None,
+            audio_missing: false,
+            preview: None,
+            disk_minutes: None,
+            message: None,
+            clip_warning: false,
+            last_take_folder: None,
+        }
+    }
+}
+
 
 impl RecorderState {
     /// Borrow it as the painter wants it.

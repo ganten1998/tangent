@@ -249,8 +249,10 @@ fn migrate_split_desk(s: &mut Settings, desk: &mut LegacyDesk) {
     }
 
     // ── masks, by the same map ──────────────────────────────────────────────
-    let move_mask = |mask: u32| -> u32 {
-        let mut out = 0u32;
+    // Types widened with the fields (u64 holds the 32-channel desk's
+    // strips); the LOGIC stays this era's, per the frozen-migration rule.
+    let move_mask = |mask: u64| -> u64 {
+        let mut out = 0u64;
         for old in 0..=OLD_GENERALS + 3 {
             if mask & (1 << old) != 0 {
                 if let Some(new) = moved(old) {
@@ -312,7 +314,7 @@ fn migrate_retire_track(s: &mut Settings, desk: &mut LegacyDesk) {
     }
     // The masks, by the same move: bits below the track keep their place,
     // the track's own bit is dropped, everything above steps down one.
-    let move_mask = |mask: u32| -> u32 {
+    let move_mask = |mask: u64| -> u64 {
         let keep = mask & ((1 << TRACK) - 1);
         let above = mask >> (TRACK + 1);
         keep | (above << TRACK)
@@ -345,7 +347,7 @@ fn migrate_add_drums(s: &mut Settings, desk: &mut LegacyDesk) {
             desk.inserts.insert(AT * V11_INSERTS, String::new());
         }
     }
-    let move_mask = |mask: u32| -> u32 {
+    let move_mask = |mask: u64| -> u64 {
         let keep = mask & ((1 << AT) - 1);
         let above = mask >> AT;
         keep | (above << (AT + 1))
@@ -384,8 +386,8 @@ fn migrate_desk_channels(s: &mut Settings, desk: &mut LegacyDesk) {
             desk.sends[new] = std::mem::replace(&mut desk.sends[old], 0.0);
         }
     }
-    let move_mask = |mask: u32| {
-        let mut out = 0u32;
+    let move_mask = |mask: u64| {
+        let mut out = 0u64;
         for old in 0..=was {
             if mask & (1 << old) != 0 {
                 out |= 1 << desk_channel_moved(old);
@@ -1090,14 +1092,14 @@ pub struct Settings {
     /// Mute and solo, as bitmasks over the same order. A mask rather than five
     /// keys, because "is anything soloed" is a question about all of them at
     /// once and five keys is five chances to answer it from a stale half.
-    pub strip_muted: u32,
+    pub strip_muted: u64,
     /// **Which strips have their polarity inverted**, one bit per strip.
     ///
     /// A mask beside `strip_muted` and `strip_soloed`, because it is the same
     /// kind of thing: a per-strip switch about the signal, held as bits so a
     /// whole desk is one number.
-    pub strip_phase: u32,
-    pub strip_soloed: u32,
+    pub strip_phase: u64,
+    pub strip_soloed: u64,
     /// Whether the after-a-take report appears. A take with a PROBLEM ignores
     /// this: see [`crate::dialogs::Dialog::TakeSummary`].
     pub show_take_summary: bool,
@@ -1615,8 +1617,8 @@ impl Default for Settings {
             arr_grid_exp: -2,
             arr_header_w: 0.0,
             // Eight of each in view out of the box; Shift+wheel changes it.
-            mixer_visible: 8,
-            arr_visible: 8,
+            mixer_visible: 16,
+            arr_visible: 12,
             // Three octaves of keys, the editor's long-standing default.
             midi_keys_visible: 36,
             tracks_added: 0,
@@ -2448,13 +2450,13 @@ impl Settings {
             s.input_alias = v;
         }
         if let Some(n) = map.shift_remove("strip_phase").and_then(|v| v.as_u64()) {
-            s.strip_phase = n as u32;
+            s.strip_phase = n as u64;
         }
         if let Some(n) = map.shift_remove("strip_muted").and_then(|v| v.as_u64()) {
-            s.strip_muted = n as u32;
+            s.strip_muted = n as u64;
         }
         if let Some(n) = map.shift_remove("strip_soloed").and_then(|v| v.as_u64()) {
-            s.strip_soloed = n as u32;
+            s.strip_soloed = n as u64;
         }
         if let Some(Value::Array(v)) = map.shift_remove("record_extra_inputs") {
             s.record_extra_inputs = v
@@ -2961,8 +2963,8 @@ impl Settings {
             }
             // The masks live on `self`; bits at or above the insert point
             // step up by `grow`. Bits below (the kept channels) stay.
-            let move_mask = |mask: u32| -> u32 {
-                let keep = mask & ((1u32 << at) - 1);
+            let move_mask = |mask: u64| -> u64 {
+                let keep = mask & ((1u64 << at) - 1);
                 let above = mask >> at;
                 keep | (above << (at + grow))
             };
@@ -2998,8 +3000,8 @@ impl Settings {
                     desk.inserts.insert(ins_at, String::new());
                 }
             }
-            let move_mask = |mask: u32| -> u32 {
-                let keep = mask & ((1u32 << at) - 1);
+            let move_mask = |mask: u64| -> u64 {
+                let keep = mask & ((1u64 << at) - 1);
                 let above = mask >> at;
                 keep | (above << (at + grow))
             };
