@@ -1859,7 +1859,24 @@ impl Settings {
         }
     }
 
+    /// Load without an OS answer about screen readers.
+    ///
+    /// The road in for the plugin and for tests, where nobody asked the OS
+    /// anything: `false` is the conservative reading — "no reader is provably
+    /// attached" — under which the pre-v20 one-shot behaves exactly as it
+    /// always has. The desktop binary, which CAN ask, comes in through
+    /// [`Self::load_with_reader`] instead.
     pub fn load() -> Self {
+        Self::load_with_reader(false)
+    }
+
+    /// Load, knowing whether a screen reader is attached right now.
+    ///
+    /// The bool feeds [`Self::clear_guessed_reader_mode`], which must not
+    /// wipe a deliberate pre-v20 `screen_reader_mode` out from under a
+    /// running reader. Plain data across the firewall, like every other
+    /// platform fact this crate is handed.
+    pub fn load_with_reader(reader_attached_now: bool) -> Self {
         // A settings file that has never existed means nobody has arranged
         // anything yet, so show the app off rather than hiding two thirds of
         // it behind a menu nobody has opened.
@@ -1926,7 +1943,7 @@ impl Settings {
         // `pin_legacy_media_root`. Saved right away, because the pin is only
         // right while the old folder is still where it was.
         let pinned = s.pin_legacy_media_root();
-        let cleared = s.clear_guessed_reader_mode();
+        let cleared = s.clear_guessed_reader_mode(reader_attached_now);
         if pinned || cleared {
             s.save();
         }
@@ -3010,6 +3027,14 @@ impl Settings {
     /// stamped on the next save. That is the cost, and it is worth paying: the
     /// alternative is what this app did until now, which is that a default,
     /// once shipped, could never be corrected for anybody who already had it.
+    ///
+    /// **Since 5.0 no file in `~/.config/tangent` can be older than v19** —
+    /// `purge_pre_5_0` deletes the old directory unread — so versions below
+    /// 19 are reachable only through a hand-copied pre-5.0 file or
+    /// `IVORY_SETTINGS_PATH`. They are kept anyway, decided on audit: a
+    /// settings file copied between machines is a supported flow (see the
+    /// `config` module doc), and these migrations are the only code that
+    /// makes an old one land right.
     fn migrate_from(
         &mut self,
         was: u64,
@@ -4511,12 +4536,24 @@ impl Settings {
     ///
     /// **Once**, so somebody who turns it on from the menu afterwards keeps
     /// it. `reader_mode_v20` is the marker.
-    pub fn clear_guessed_reader_mode(&mut self) -> bool {
+    ///
+    /// `reader_attached_now` is the OS's launch-time answer — see
+    /// `desktop::os_reader_attached`, crossing as a plain bool because this
+    /// crate may not name a platform. It exists because the wipe cannot
+    /// otherwise tell the poison apart from a choice: a pre-v20 file saying
+    /// `true` on a machine where a reader is PROVABLY running right now is a
+    /// setting somebody relies on, not a guess to clear, and wiping it would
+    /// silently hand a VoiceOver user detached windows on their first 5.x
+    /// launch. The marker still lands either way, so the question is asked
+    /// exactly once.
+    pub fn clear_guessed_reader_mode(&mut self, reader_attached_now: bool) -> bool {
         if self.reader_mode_v20 {
             return false;
         }
         self.reader_mode_v20 = true;
-        self.screen_reader_mode = false;
+        if !reader_attached_now {
+            self.screen_reader_mode = false;
+        }
         true
     }
 
@@ -4913,15 +4950,34 @@ mod tests {
     fn a_guessed_reader_mode_is_cleared_once_and_then_left_alone() {
         let mut s = super::Settings::default();
         s.screen_reader_mode = true;
-        assert!(s.clear_guessed_reader_mode(), "the one-shot did not run");
+        assert!(s.clear_guessed_reader_mode(false), "the one-shot did not run");
         assert!(!s.screen_reader_mode, "the guess survived");
         assert!(s.reader_mode_v20);
 
         // **And then never again.** Somebody who turns it on from the menu
         // afterwards keeps it — that is a choice, not a guess.
         s.screen_reader_mode = true;
-        assert!(!s.clear_guessed_reader_mode(), "the one-shot ran twice");
+        assert!(!s.clear_guessed_reader_mode(false), "the one-shot ran twice");
         assert!(s.screen_reader_mode, "a real choice was thrown away");
+    }
+
+    /// **A file saying `true` while a reader is provably attached is a
+    /// setting, not a guess.** The one-shot exists to throw away a value the
+    /// old probe invented; a VoiceOver user who turned reader mode on by
+    /// hand before v20 wrote the same bit for the opposite reason, and the
+    /// only fact that tells the two apart is whether a reader is running at
+    /// the moment of the wipe. It is asked, and the setting is kept.
+    #[test]
+    fn a_reader_mode_saved_while_a_reader_is_attached_survives_the_one_shot() {
+        let mut s = super::Settings::default();
+        s.screen_reader_mode = true;
+        assert!(s.clear_guessed_reader_mode(true), "the one-shot did not run");
+        assert!(s.screen_reader_mode, "a reader user's own setting was wiped");
+        assert!(s.reader_mode_v20, "the marker did not land");
+        // The marker sticks whatever the answer was: a later launch with the
+        // reader off must not get a second chance at the wipe.
+        assert!(!s.clear_guessed_reader_mode(false), "the one-shot ran twice");
+        assert!(s.screen_reader_mode, "the kept setting was lost on a re-ask");
     }
 
     /// **An install with work in the old place keeps it.**
