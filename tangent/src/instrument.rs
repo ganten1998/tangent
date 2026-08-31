@@ -7970,19 +7970,19 @@ impl Engine {
         };
 
         let shared = Arc::new(Shared::new());
-        // What was actually asked of the host, recorded once — see
-        // `Shared::out_ring_asked`. A ring ONLY where it is genuinely a
-        // different number from the period: ASIO asks for the callback size
-        // itself and gets `Fixed(v)` with `v` as the period, so matching on
-        // `Fixed` alone would have written a 512-frame "ring" for a JACK take
-        // whose ring is 512-frame nothing. `Default` asked for no size at all.
-        shared.out_ring_asked.store(
-            match (buffer_size, buffer_frames) {
-                (cpal::BufferSize::Fixed(ring), Some(period)) if ring != period => ring,
-                _ => 0,
-            },
-            Ordering::Relaxed,
-        );
+        // What was actually asked of the host, recorded once, **taken from the
+        // plan rather than re-derived from it** — see `Shared::out_ring_asked`.
+        //
+        // `BufferPlan::ring` is already `None` wherever the request IS the
+        // callback, which is CoreAudio, ASIO and JACK; it is decided per HOST
+        // where a constant would only know the platform. This used to match on
+        // `BufferSize::Fixed` here and reach the same answer a worse way, and
+        // two derivations of one fact are two things to disagree — the panel
+        // reads the plan and `take.json` reads this, and they have to be the
+        // same number or the manifest argues with the screen.
+        shared
+            .out_ring_asked
+            .store(buffer_ring.unwrap_or(0), Ordering::Relaxed);
         let fault = Arc::new(Mutex::new(None));
         let click = Click::load(f64::from(rate))?;
 
@@ -12601,45 +12601,30 @@ mod tests {
         );
     }
 
-    /// **A host that asks for the callback size itself has no ring, and the
-    /// take must not invent one.**
+    /// **A host that asks for the callback size itself has no ring, and
+    /// `take.json` must not invent one.**
     ///
-    /// ASIO and JACK get `BufferSize::Fixed(v)` where `v` IS the period. A
-    /// store that matched on `Fixed` alone would write `output_ring_frames`
-    /// equal to `output_block_frames` and imply a ring behind it — on exactly
-    /// the configuration whose takes are being compared against ALSA's.
+    /// `BufferRule::Period` is ASIO: `Fixed(v)` where `v` IS the callback. The
+    /// sibling rules are covered elsewhere — `ServerOwned` by
+    /// `jack_reports_the_server_period_and_asks_for_nothing` and `Ring` by
+    /// `a_device_that_will_not_say_what_buffer_sizes_it_takes_gets_its_own_choice`
+    /// — and this is the third, which had none.
+    ///
+    /// It is here rather than beside them because the consequence is a
+    /// manifest field: `Shared::out_ring_asked` stores `plan.ring` verbatim,
+    /// so a `Some` here would write `output_ring_frames` equal to
+    /// `output_block_frames` and imply a ring standing behind itself — on
+    /// exactly the configuration whose takes get compared against ALSA's.
     #[test]
     fn a_request_that_is_the_callback_itself_reports_no_ring() {
-        for (asked, supported) in [
-            // ASIO: the period is the request, so ring == period.
-            (Some(512u32), cpal::SupportedBufferSize::Range { min: 16, max: 8192 }),
-            (Some(64), cpal::SupportedBufferSize::Range { min: 16, max: 8192 }),
-        ] {
-            let (size, period) = pick_buffer(&supported, asked, true);
-            let ring = match (size, period) {
-                (cpal::BufferSize::Fixed(r), Some(p)) if r != p => r,
-                _ => 0,
-            };
+        let range = cpal::SupportedBufferSize::Range { min: 16, max: 8192 };
+        for asked in [Some(512u32), Some(64), None] {
+            let plan = pick_buffer(&range, asked, BufferRule::Period);
             assert_eq!(
-                ring, 0,
-                "an ASIO request of {asked:?} named a ring it does not have"
+                plan.ring, None,
+                "an ASIO request of {asked:?} named a ring it does not have, so \
+                 a take would report one"
             );
-        }
-        // And the other way: the ALSA/WASAPI path asks for a real multiple, so
-        // there is a ring and it must survive.
-        let (size, period) = pick_buffer(
-            &cpal::SupportedBufferSize::Range { min: 16, max: 8192 },
-            Some(256),
-            false,
-        );
-        let ring = match (size, period) {
-            (cpal::BufferSize::Fixed(r), Some(p)) if r != p => r,
-            _ => 0,
-        };
-        if BUFFER_PERIODS > 1 {
-            assert_eq!(ring, 256 * BUFFER_PERIODS, "the real ring was dropped");
-        } else {
-            assert_eq!(ring, 0, "ring and period are one number on this platform");
         }
     }
 
