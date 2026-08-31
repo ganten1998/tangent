@@ -3574,7 +3574,26 @@ impl DesktopApp {
         // edit — and every save — writing over the thing every New is made
         // from. That is the "silently overwriting it" the owner was afraid
         // of, and it is one line away at all times.
+        //
+        // **Reclaim-by-deletion is for verbatim clones only.** This path
+        // ran `remove_dir_all` over whatever `fresh_project_dir` handed
+        // back, and unlike New it never counted the takes first — a launch
+        // deleted an unsaved session's recordings without a question ever
+        // being asked. A built kit is already `fresh_project_dir`'s
+        // business; takes and the document are decided here, because the
+        // New flow wants take-holding folders back (it has a dialog to ask
+        // about them) and launch has no mouth yet. A document that differs
+        // from the template's is a session somebody edited — every undo
+        // writes it — so both step past to the next free name and nothing
+        // is deleted. Plugin state alone (a preset tweaked in a scratch
+        // with no other change) does not protect a folder: comparing
+        // `state/` churn would strand a stale Untitled per launch.
         let dir = tangent_ui::app::fresh_project_dir(&root);
+        let dir = if dir.exists() && !launch_reclaimable(&dir, &template) {
+            next_untitled(&root, &dir)
+        } else {
+            dir
+        };
         if dir.exists() {
             let _ = std::fs::remove_dir_all(&dir);
         }
@@ -4936,6 +4955,19 @@ impl DesktopApp {
                 let dst = self.templates_dir().join(&name);
                 let _ = std::fs::remove_dir_all(&dst);
                 let _ = copy_dir_all(&src, &dst);
+                // **A template is a stencil, not a saved project.** The
+                // copy carries the session's `named` flag, and a clone of
+                // a named template is born "kept" — so launch could never
+                // reclaim a scratch again and minted "Untitled 6", "7"…
+                // one per launch, the exact pile the reclaim exists to
+                // prevent. The flag comes off the template's own document,
+                // once, here at its minting.
+                let doc = dst.join("project.tangent");
+                let mut arr = tangent_ui::arrangement::Arrangement::load_from(&doc);
+                if arr.named {
+                    arr.named = false;
+                    arr.save_to(&doc);
+                }
             }
             tangent_ui::ports::ProjectRequest::Export(spec) => {
                 self.recorder.take_note = Some(format!(
@@ -5068,7 +5100,6 @@ impl DesktopApp {
                     }
                     self.track_cache.clear();
                     self.stretch_cache.clear();
-                self.stretch_cache.clear();
                     self.pad_cache.clear();
                     self.reload_clips();
                     self.reload_pads();
@@ -6509,6 +6540,29 @@ fn count_media(project_dir: &std::path::Path) -> usize {
         .flatten()
         .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
         .count()
+}
+
+/// Whether the folder a launch reclaim landed on may be deleted and
+/// re-cloned. No takes — a recording nobody named is still the one thing
+/// that cannot be played a second time — and a document still
+/// byte-identical to the template's, because a scratch begins life as a
+/// verbatim clone and stays one until somebody edits it (every undo writes
+/// the document). A built kit never reaches here: `fresh_project_dir`
+/// refuses those folders outright, for New and launch alike.
+fn launch_reclaimable(dir: &std::path::Path, template: &std::path::Path) -> bool {
+    count_media(dir) == 0
+        && file_eq(
+            &dir.join("project.tangent"),
+            &template.join("project.tangent"),
+        )
+}
+
+/// Byte-for-byte equality of two files; an unreadable file equals nothing.
+fn file_eq(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (std::fs::read(a), std::fs::read(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
 }
 
 /// The next free `Untitled n` at or after `taken`, for a New that must not
@@ -8260,6 +8314,42 @@ impl DesktopApp {
 
 #[cfg(all(test, feature = "recorder"))]
 mod tests {
+
+    /// **A launch never deletes a session somebody touched.** The launch
+    /// reclaim runs `remove_dir_all` before cloning the template — the one
+    /// deletion in the app that no dialog ever guards, because at launch
+    /// there is no mouth to ask with. So the predicate that licenses it
+    /// must refuse anything but a verbatim, take-free clone.
+    #[test]
+    fn a_launch_reclaims_only_a_verbatim_take_free_clone() {
+        let root = std::env::temp_dir()
+            .join(format!("tangent-launch-reclaim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let template = root.join("Templates").join("default");
+        std::fs::create_dir_all(&template).unwrap();
+        std::fs::write(template.join("project.tangent"), b"the stencil").unwrap();
+
+        // A verbatim clone with an empty media/: reclaimable.
+        let scratch = root.join("Untitled");
+        std::fs::create_dir_all(scratch.join("media")).unwrap();
+        std::fs::write(scratch.join("project.tangent"), b"the stencil").unwrap();
+        assert!(super::launch_reclaimable(&scratch, &template));
+
+        // One take inside: not for deletion, whatever the document says.
+        std::fs::write(scratch.join("media").join("take.wav"), b"audio").unwrap();
+        assert!(!super::launch_reclaimable(&scratch, &template));
+        std::fs::remove_file(scratch.join("media").join("take.wav")).unwrap();
+
+        // An edited document: somebody worked here.
+        std::fs::write(scratch.join("project.tangent"), b"an edit").unwrap();
+        assert!(!super::launch_reclaimable(&scratch, &template));
+
+        // A document that cannot be read equals nothing — refused, because
+        // deleting what could not be compared is the same wound.
+        std::fs::remove_file(scratch.join("project.tangent")).unwrap();
+        assert!(!super::launch_reclaimable(&scratch, &template));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// **Every seat's bays are reachable, the master's second rack included.**
     ///
