@@ -91,7 +91,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -1114,6 +1114,25 @@ impl DeviceState {
 #[derive(Debug, Default)]
 pub struct CaptureStats {
     frames_captured: AtomicU64,
+    /// Frames per callback, **counted rather than requested**. Zero until the
+    /// first callback arrives.
+    ///
+    /// The input's half of the number the output has carried since the panel
+    /// started disagreeing with the room. It matters more here than it looks:
+    /// under pipewire-alsa the delivered cadence is the GRAPH's quantum and
+    /// has nothing to do with what was asked for, and a capture ring smaller
+    /// than that quantum keeps `ring / quantum` of the audio and reports
+    /// nothing at all — no EPIPE, no xrun, a clean stream at a fraction of the
+    /// rate. This is the number that makes that visible.
+    block_seen: AtomicU32,
+    /// The ring asked of the host when the stream opened, in frames. Zero
+    /// where no fixed size was asked for.
+    ///
+    /// Recorded because it is no longer the same as what the app requested:
+    /// a ring has to cover the graph's cycle, so the opened ring can be
+    /// deliberately wider than the setting. A manifest that states neither
+    /// cannot tell a widening from a user's choice.
+    ring_asked: AtomicU32,
     frames_dropped: AtomicU64,
     xruns: AtomicU64,
     marks_dropped: AtomicU64,
@@ -1132,6 +1151,25 @@ impl CaptureStats {
     /// number of frames in the file.
     pub fn frames_captured(&self) -> u64 {
         self.frames_captured.load(Ordering::Relaxed)
+    }
+
+    /// What the callback was really handed. `None` before the first one.
+    pub fn block_seen(&self) -> Option<u32> {
+        let n = self.block_seen.load(Ordering::Relaxed);
+        (n > 0).then_some(n)
+    }
+
+    /// The ring asked of the host, `None` where none was asked for — which is
+    /// a different claim from a ring that happens to equal the block, and is
+    /// why this is not derived from [`block_seen`](Self::block_seen).
+    pub fn ring_asked(&self) -> Option<u32> {
+        let n = self.ring_asked.load(Ordering::Relaxed);
+        (n > 0).then_some(n)
+    }
+
+    /// Record what the stream was opened with. Called once, from `open_input`.
+    pub fn set_ring_asked(&self, frames: u32) {
+        self.ring_asked.store(frames, Ordering::Relaxed);
     }
 
     /// Frames that never reached the ring. Non-zero means the take has a splice
@@ -1183,6 +1221,13 @@ impl CaptureStats {
         self.xruns.store(0, Ordering::Relaxed);
         self.marks_dropped.store(0, Ordering::Relaxed);
         self.callbacks.store(0, Ordering::Relaxed);
+        // **`block_seen` and `ring_asked` are deliberately NOT cleared.** They
+        // are properties of the open stream rather than counters of a take:
+        // the ring was asked for once when the device opened, and the block is
+        // a rolling observation of a cadence that does not restart. Clearing
+        // them would make the first report of every take say "nobody knows"
+        // until a callback happened to land, which is the shape of answer this
+        // whole family of fields exists to stop giving.
     }
 }
 
@@ -1410,6 +1455,11 @@ impl CaptureSource {
         self.stats
             .frames_captured
             .fetch_add(frames_in as u64, Ordering::Relaxed);
+        // Counted here rather than asked for at open: what the graph delivers
+        // per cycle is its business, not ours. See `CaptureStats::block_seen`.
+        self.stats
+            .block_seen
+            .store(frames_in as u32, Ordering::Relaxed);
         if frames_in == 0 {
             return;
         }
@@ -2366,6 +2416,13 @@ pub fn open_input(
     let mark_slots = (ring_frames / 64).clamp(64, 8192);
 
     let stats = Arc::new(CaptureStats::new());
+    // What was actually asked of the host, recorded once. `Default` asked for
+    // no size at all, and that is a different claim from any number — see
+    // `CaptureStats::ring_asked`.
+    stats.set_ring_asked(match buffer_size {
+        BufferSize::Fixed(n) => n,
+        BufferSize::Default => 0,
+    });
     // **A shallow monitor ring: 120 ms.** Deep enough to ride a scheduling
     // hiccup on either side, shallow enough that what you hear is what is
     // happening. Latency is the two buffers, not this — the ring runs nearly
@@ -3603,6 +3660,37 @@ mod tests {
             },
         });
         assert_eq!(stats.device_state(), DeviceState::Errored);
+    }
+
+    /// **Arming a take must not forget what the stream is.**
+    ///
+    /// `block_seen` and `ring_asked` are properties of the open device, not
+    /// counters of a take: the ring was asked for once when it opened, and the
+    /// cadence does not restart because somebody pressed Record. Clearing them
+    /// in `reset` would make the first report of every take say "nobody knows"
+    /// until a callback happened to land — which is the exact shape of answer
+    /// this family of fields exists to stop giving, and it would look like a
+    /// tidy-up rather than a regression.
+    #[test]
+    fn arming_a_take_does_not_forget_the_block_and_the_ring() {
+        let stats = CaptureStats::new();
+        stats.set_ring_asked(1024);
+        stats.block_seen.store(512, Ordering::Relaxed);
+        stats.frames_captured.fetch_add(48_000, Ordering::Relaxed);
+
+        stats.reset();
+
+        assert_eq!(stats.frames_captured(), 0, "the take's counters do reset");
+        assert_eq!(
+            stats.block_seen(),
+            Some(512),
+            "the delivered cadence is a property of the stream, not of the take"
+        );
+        assert_eq!(
+            stats.ring_asked(),
+            Some(1024),
+            "the ring was asked for once, when the device opened"
+        );
     }
 
     #[test]

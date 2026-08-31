@@ -208,6 +208,11 @@ struct AudioReport {
     /// `take::AudioReport`.
     output_block_frames: Option<u32>,
     output_ring_frames: Option<u32>,
+    /// The same pair for the INPUT leg, where the two numbers have an entirely
+    /// different reason to differ: the delivered cadence is the graph's
+    /// quantum, not ours. `None` on a take with no capture device.
+    input_block_frames: Option<u32>,
+    input_ring_frames: Option<u32>,
     /// Whatever went wrong, in words meant for the user.
     error: Option<String>,
 }
@@ -610,6 +615,18 @@ impl Writer {
             output_delay_ns: self.plugin.as_ref().and_then(|t| t.output_delay_ns()),
             output_block_frames: self.plugin.as_ref().and_then(|t| t.output_block_frames()),
             output_ring_frames: self.plugin.as_ref().and_then(|t| t.output_ring_frames()),
+            input_block_frames: self.sink.stats().block_seen(),
+            // **Only where it is a different number from the block.** The ring
+            // is asked for at open and the block is not known until a callback
+            // has run, so the rule cannot live at the store the way the
+            // output's does — a CoreAudio device buffer would otherwise be
+            // reported as a ring standing behind itself.
+            input_ring_frames: {
+                let stats = self.sink.stats();
+                stats
+                    .ring_asked()
+                    .filter(|ring| Some(*ring) != stats.block_seen())
+            },
             error: self.error.take(),
         }
     }
@@ -2222,6 +2239,8 @@ impl Session {
             manifest.audio.output_delay_ns = r.output_delay_ns;
             manifest.audio.output_block_frames = r.output_block_frames;
             manifest.audio.output_ring_frames = r.output_ring_frames;
+            manifest.audio.input_block_frames = r.input_block_frames;
+            manifest.audio.input_ring_frames = r.input_ring_frames;
             manifest.sources.push(r.source.clone());
             // The device stopped answering. RECORDER-PLAN §4's policy is to
             // finalise what exists and mark it incomplete — a `.wav` of eight
@@ -4016,6 +4035,11 @@ impl PluginWriter {
             output_delay_ns: self.tap.as_ref().and_then(|t| t.output_delay_ns()),
             output_block_frames: self.tap.as_ref().and_then(|t| t.output_block_frames()),
             output_ring_frames: self.tap.as_ref().and_then(|t| t.output_ring_frames()),
+            // No capture device on this path at all, which is a stronger
+            // statement than "nobody measured it" and is why both are None
+            // rather than plumbed from somewhere plausible.
+            input_block_frames: None,
+            input_ring_frames: None,
             error: self.error.take(),
         }
     }
