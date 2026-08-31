@@ -10768,6 +10768,40 @@ where
                 if matches!(err, cpal::StreamError::DeviceNotAvailable) {
                     shared.running.store(false, Ordering::Relaxed);
                 }
+                // **A JACK buffer-size notice is not a fault, and recording it
+                // as one is an infinite loop that ends in silence.**
+                //
+                // cpal's JACK backend has no notification channel of its own,
+                // so it reports a graph buffer-size change through the ERROR
+                // callback (`vendor/cpal/src/host/jack/stream.rs`,
+                // `NotificationHandler::buffer_size`) — after it has already
+                // resized its scratch buffers and carried on. Nothing is wrong
+                // when it arrives.
+                //
+                // It arrives on EVERY activation, because the size cpal reads
+                // from a client before activating it is not the size the graph
+                // then runs: `Stream::new_output` takes `client.buffer_size()`
+                // from a client that has not joined the graph yet, and under
+                // pipewire-jack those differ as a matter of course. So the
+                // notice fires, `Desktop::update` sees a fault, tears the
+                // engine down, reopens, and gets the same notice again.
+                //
+                // Measured on Linux before this guard: the JACK path produced
+                // NO SOUND AT ALL, with `audio output failed: ... buffer size
+                // changed to: 256 - will reopen when the device is back`
+                // repeating in the log and the app silently rebuilding its
+                // engine forever. Every other symptom — a flat meter, a dead
+                // waveform, an idle CPU that looked like efficiency — was that
+                // loop.
+                //
+                // Logged rather than dropped, because a size change the app did
+                // not ask for is worth seeing when reading a log about latency.
+                if let cpal::StreamError::BackendSpecific { err: inner } = &err {
+                    if inner.description.starts_with("buffer size changed to") {
+                        log::info!("audio backend: {}", inner.description);
+                        return;
+                    }
+                }
                 if let Ok(mut slot) = fault.try_lock() {
                     *slot = Some(err.to_string());
                 }
