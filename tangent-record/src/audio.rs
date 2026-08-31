@@ -906,6 +906,31 @@ pub fn request_graph_quantum(_frames: Option<u32>) -> bool {
     false
 }
 
+/// The ALSA ring a `Fixed` capture request must actually ask for on this graph.
+///
+/// **A ring smaller than the graph's cycle does not underrun — it silently
+/// keeps `ring/quantum` of the audio.** Measured with `takeprobe` on the
+/// machine that lost takes to this (PipeWire, `min-quantum = 512`): a
+/// 44100 Hz stream at `Fixed(256)` delivered a steady 22,016 frames per
+/// second — every graph cycle hands the `pipewire` PCM one 512-frame quantum,
+/// the 256-frame ring keeps what fits, and the rest vanishes with no EPIPE, no
+/// counter and no error on any layer. The stream looked *clean* at exactly
+/// half rate: stamps honest, the rate fit at 22 050 Hz, and a fifteen-second
+/// performance wrote a "7.5-second" take whose audio plays at double speed
+/// against its own video. At `Fixed(512)` and `Fixed(1024)` the same stream
+/// delivered every frame.
+///
+/// Twice the FLOOR is a ring no renegotiation can outgrow: the floor bounds
+/// the served quantum from below, and our own period request — which stays at
+/// the asked-for number's scale, `ring/4 = floor/2 < floor` — caps it from
+/// above, so the graph is never dragged coarser than its floor by this and the
+/// delivered cycle can never exceed `max(floor, ring/4) < ring`. The asked-for
+/// number still decides the request; the ring is protection, and a capture
+/// ring runs nearly empty, so the depth costs memory and not latency.
+pub fn ring_covering_graph(asked: u32, floor: u32) -> u32 {
+    asked.max(floor.saturating_mul(2))
+}
+
 /// Holds a quantum request for as long as it exists, and gives it back.
 ///
 /// **This type exists because of a specific mistake, and its shape is the
@@ -2905,6 +2930,26 @@ pub fn open_input(
             }
         }
     };
+    // **The ring must cover the graph's cycle, or the capture silently
+    // halves.** See [`ring_covering_graph`] for the measurement. Behind the
+    // PCM-route guard because a JACK host owns its own buffers and there is
+    // nothing to cover; behind `graph_clock` because a machine with no
+    // PipeWire has no cycle to be covered from and keeps the asked-for
+    // number exactly. Clamped back into the device's own range last — a ring
+    // the device cannot allocate is a failed open, not protection.
+    #[cfg(target_os = "linux")]
+    let buffer_size = match buffer_size {
+        BufferSize::Fixed(v) if pipewire_pcm_route_applies() => {
+            let ring = graph_clock().map_or(v, |g| ring_covering_graph(v, g.floor()));
+            BufferSize::Fixed(match chosen.buffer_size() {
+                cpal::SupportedBufferSize::Range { min, max } if *min <= *max => {
+                    ring.clamp(*min, *max)
+                }
+                _ => ring,
+            })
+        }
+        other => other,
+    };
     let stream_config = StreamConfig {
         channels: chosen.channels(),
         sample_rate: chosen.sample_rate(),
@@ -3112,6 +3157,29 @@ mod tests {
         // been proven blind on one shipping path, so its zero alone clears
         // nothing.
         assert_eq!(merge_dropouts(None, 0), None);
+    }
+
+    /// **A capture ring smaller than the graph's cycle does not fail — it
+    /// keeps `ring/quantum` of the audio and reports nothing.** Measured with
+    /// `takeprobe`: at a 512-frame floor a `Fixed(256)` stream ran at a steady
+    /// 22,016 frames per second with zero drops on every counter, and three
+    /// real takes came back with their audio at double speed. The rule under
+    /// test is the protection: the ring always covers the widest cycle the
+    /// graph can serve, and never touches a request that already does.
+    #[test]
+    fn the_ring_always_covers_the_cycle_the_graph_can_serve() {
+        // An ordinary desktop floor: the asked-for number stands untouched.
+        assert_eq!(ring_covering_graph(256, 32), 256);
+        // The machine this was measured on: floor 512, asked 256 — the ring
+        // that halved every take. Twice the floor, so a cycle at the floor
+        // and a cycle at our own period both fit with room to spare.
+        assert_eq!(ring_covering_graph(256, 512), 1024);
+        // A graph pinned coarser than anything the app would ask for.
+        assert_eq!(ring_covering_graph(256, 2048), 4096);
+        // A generous ask needs no protection and keeps its number.
+        assert_eq!(ring_covering_graph(4096, 512), 4096);
+        // A pathological floor saturates rather than wrapping to a sliver.
+        assert_eq!(ring_covering_graph(256, u32::MAX), u32::MAX);
     }
 
     /// The ERR column survives every row shape `pw-top -b` actually prints.

@@ -10,6 +10,33 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A capture buffer smaller than the PipeWire graph's cycle silently halved
+  the recording**, and on the machine that found it, every ALSA video take
+  came back at double speed against its own video with up to half its frames
+  counted as dropped. The graph hands the `pipewire` PCM one quantum per
+  cycle; a `Fixed(256)` request under a 512-frame `clock.min-quantum` gave the
+  ring 256 of every 512 frames and *discarded the rest below every counter* —
+  no xrun, no error, honest timestamps, a clean-looking stream at exactly half
+  rate. The take's timeline is indexed by device frames, so a fifteen-second
+  performance was written as a "7.5-second" take, and the desk's tap ring —
+  drained at the halved pace — overflowed from the eighth second on, which is
+  where the huge `frames_dropped` numbers actually came from. The input now
+  sizes its ring to cover twice the graph's floor (the request still decides
+  the period, so nobody's graph gets dragged coarser), and `takeprobe` — a new
+  headless instrument that runs the app's own capture drain against a real
+  device — measured the same stream at full rate with the fix and half rate
+  without it. JACK takes were never affected: a JACK client's buffers are the
+  graph's own cycle, so there is no ring to mismatch.
+
+- **A take whose measured rate is far from its nominal one now says so out
+  loud.** The rate fit measured the halving above perfectly — `epsilon_ppm:
+  -499993` sat in every damaged manifest — and nothing read the number. A
+  device-fed take with a fitted clock more than 10,000 ppm off nominal now
+  raises a problem naming both rates: crystals lie by parts per million,
+  delivery faults lie by factors, and there is nothing between.
+
 ### Added
 
 - **JACK on Linux**, beside ALSA, in the Audio Setup panel's SYSTEM row — the
