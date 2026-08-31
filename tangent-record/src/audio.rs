@@ -512,6 +512,38 @@ fn with_pipewire_node<T>(_node: &str, f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// Whether the host in use reaches interfaces through the `pipewire` PCM.
+///
+/// **The PipeWire node list is a fix for cpal's ALSA host, and applying it to
+/// any other host is the bug it was written to cure.** [`pipewire_sources`]
+/// exists because PipeWire holds every card exclusively, so through ALSA the
+/// only PCM that opens is `pipewire` and it has to be aimed with
+/// `PIPEWIRE_NODE`. None of that is true of the JACK host: it is a client of
+/// the same graph, its ports carry the interfaces' real names, and it has no
+/// device called `pipewire` at all.
+///
+/// So under JACK the substitution fails twice over. The picker would list nodes
+/// that cannot be opened — [`resolve`] looks for a PCM named `pipewire` in the
+/// host's own devices and a JACK host has one input client and no PCMs — and
+/// because that list REPLACES cpal's rather than joining it, every workable
+/// entry would have been hidden behind entries that all fail. Choosing JACK
+/// would have taken the input away while leaving the output playing, which is
+/// the hardest shape of fault to read from the outside.
+///
+/// Asked of the host actually built rather than of the saved setting, because
+/// [`build_host`] falls back — a settings file naming JACK on a machine with no
+/// server running is running ALSA, and it needs the node list.
+///
+/// Goes through [`with_host`], so on the UI thread — where every caller of this
+/// lives — it reads the cached host and costs nothing. Called from a thread
+/// that has never built one, it would build one, and under JACK that means
+/// cpal registering and immediately dropping a pair of probe clients
+/// (`jack/device.rs` makes one per direction to read the server's rate, and
+/// drops it). Harmless, and not free; keep the callers on the one thread.
+pub fn pipewire_pcm_route_applies() -> bool {
+    !cfg!(target_os = "linux") || with_host(|host| host.id().name() != "JACK")
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // The graph's own buffer size
 // ───────────────────────────────────────────────────────────────────────────
@@ -724,16 +756,26 @@ static SYSTEM: Mutex<Option<String>> = Mutex::new(None);
 
 /// Every audio system this build can open, in cpal's own order.
 ///
-/// **Usually one, and that is not a bug in this function.** cpal compiles in
+/// **One on macOS and Windows, two on Linux and FreeBSD.** cpal compiles in
 /// exactly one host per platform unless a feature asks for more: CoreAudio on
 /// macOS, ALSA on Linux (which is what PipeWire and PulseAudio both present
-/// themselves as), WASAPI on Windows. JACK and ASIO are cargo features that
-/// each need a development library present at BUILD time — libjack, and the
-/// ASIO SDK plus clang — so turning either on is a change to what the release
-/// scripts can produce on a machine without them, not a change here.
+/// themselves as), WASAPI on Windows — plus JACK wherever the `jack` feature is
+/// on, which `tangent-record/Cargo.toml` turns on for Linux and FreeBSD.
 ///
-/// Listed anyway, from the real enumeration, so the control says what the
-/// build actually has rather than what it was hoped to have.
+/// This doc comment used to say that JACK, like ASIO, "needs a development
+/// library present at BUILD time" and so could not be shipped. **That was
+/// wrong about JACK**, and it is worth recording why rather than just deleting:
+/// `jack` 0.13 enables `dynamic_loading` by default, so libjack is `dlopen`ed
+/// on first use and never linked. The artifact gains no `DT_NEEDED` entry and
+/// runs unchanged on a desktop that has never heard of JACK. ASIO is still
+/// genuinely build-gated — the SDK is a download with a licence to accept —
+/// which is why that one is still a cargo feature and this one is not.
+///
+/// Listed from the real enumeration either way, so the control says what the
+/// build actually has rather than what it was hoped to have. A name appearing
+/// here is not a promise that the system is RUNNING: cpal's
+/// `JackHost::is_available` is a hardcoded `true`, and whether a server
+/// answered is settled in [`build_host`].
 pub fn systems() -> Vec<String> {
     cpal::available_hosts()
         .into_iter()
@@ -770,6 +812,17 @@ pub fn system() -> Option<String> {
 /// build does not have — which is what a settings file written on a machine
 /// with JACK, opened on one without it, looks like. Silently, because the
 /// alternative is refusing to open any audio at all over a preference.
+///
+/// **And falls back the same way when JACK is named but no server answered.**
+/// cpal's JACK host reports `is_available() == true` unconditionally and its
+/// constructor cannot fail: with no server running it prints its error, creates
+/// no devices, and hands back a perfectly valid `Host` that owns nothing. Seated
+/// on that, the app is silent — no output, no input, no message — and the only
+/// way out is a settings panel the user has no reason to suspect. Since "JACK"
+/// is a name every Linux and FreeBSD build now offers whether or not the
+/// machine runs it, that is a trap the picker would otherwise set on the
+/// majority of desktops. A host with neither an input nor an output device is
+/// not a preference worth honouring, so it is not honoured.
 fn build_host(want: &Option<String>) -> cpal::Host {
     #[cfg(test)]
     HOSTS_BUILT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -778,6 +831,7 @@ fn build_host(want: &Option<String>) -> cpal::Host {
             .into_iter()
             .find(|id| id.name() == *want)
             .and_then(|id| cpal::host_from_id(id).ok())
+            .filter(|host| host_has_a_device(host))
             .unwrap_or_else(cpal::default_host);
     }
     // **No stated preference: the PLATFORM DEFAULT — WASAPI on Windows.**
@@ -793,6 +847,32 @@ fn build_host(want: &Option<String>) -> cpal::Host {
     // ASIO is still fully offered — as an explicit CHOICE in settings,
     // where the person picking it knows they have an interface.
     cpal::default_host()
+}
+
+/// Whether a freshly built host owns any device at all.
+///
+/// **Asked of JACK and of nothing else, and that narrowness is the point.**
+/// The question is cheap and side-effect-free for the JACK host — its
+/// constructor has already made its clients and pushed whatever it got into a
+/// `Vec`, so this reads a field. It is neither of those things for ASIO, where
+/// walking the device list is the very operation the `HOST_CACHE` note above
+/// exists to keep away from a live stream: asio-sys's loader is process-global
+/// and enumerating drivers can unload the one currently playing. So a general
+/// "does this host have devices" probe would buy a Linux and FreeBSD
+/// improvement by reintroducing a Windows fault that took a tester's silence
+/// to find. It is matched by NAME rather than by `HostId::Jack` because that
+/// variant only exists where the `jack` feature is compiled in, and this
+/// function should read the same on every platform.
+///
+/// Everything else is trusted: a CoreAudio, WASAPI or ALSA host that enumerates
+/// nothing is a machine with no sound card, and the default host will report
+/// exactly the same nothing. There is no better answer to fall back TO.
+fn host_has_a_device(host: &cpal::Host) -> bool {
+    use cpal::traits::HostTrait;
+    if host.id().name() != "JACK" {
+        return true;
+    }
+    host.default_output_device().is_some() || host.default_input_device().is_some()
 }
 
 /// How many times a host was actually constructed, for the cache test.
@@ -2729,6 +2809,46 @@ mod tests {
         // Put the process-global choice back for whoever runs next.
         set_system(baseline_system.as_deref());
         with_host(|_| ());
+    }
+
+    /// **The feature flag, asserted rather than assumed.**
+    ///
+    /// `cpal`'s `jack` feature is turned on in `tangent-record/Cargo.toml` per
+    /// target, which is a place a change can silently drop it — a merge, a
+    /// dependency bump, a tidy-up of a table that looks redundant next to the
+    /// unconditional `cpal = "0.16"` three lines up. Nothing would fail to
+    /// build; the Audio Setup panel would just quietly go back to offering one
+    /// entry, and the only symptom is a user on a pro-audio session wondering
+    /// where JACK went. This is deterministic without a server running:
+    /// `JackHost::is_available` is a hardcoded `true`, so the name is listed
+    /// whenever the backend is COMPILED, which is exactly what this asserts.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn the_jack_host_is_compiled_in() {
+        assert!(
+            systems().iter().any(|s| s == "JACK"),
+            "this build should offer JACK; it offers {:?}",
+            systems()
+        );
+    }
+
+    /// The guard rejects only JACK, and never the host it would fall back to.
+    ///
+    /// Guards the ASIO property in [`host_has_a_device`]'s own note: the probe
+    /// must never be the thing that walks a host's device list, because on
+    /// Windows that is what tears down a live driver. A non-JACK host is passed
+    /// through on the strength of its NAME, before anything is enumerated, and
+    /// this holds on every platform including the one where the default host
+    /// genuinely has no devices.
+    #[test]
+    fn the_empty_host_guard_only_asks_jack() {
+        let default = cpal::default_host();
+        assert_ne!(default.id().name(), "JACK", "no platform defaults to JACK");
+        assert!(
+            host_has_a_device(&default),
+            "the default host must pass the guard unenumerated, or build_host \
+             could reject the very host it falls back to"
+        );
     }
 
     fn stats() -> Arc<CaptureStats> {

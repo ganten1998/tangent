@@ -174,6 +174,25 @@ Linux:
    `PKG_CONFIG_PATH` + `PKG_CONFIG_ALLOW_CROSS=1` before `build-cross.sh`.
 3. A prebuilt cross toolchain that bundles ALSA headers (e.g. a `cross` Docker
    image with `libasound2-dev`).
+
+**JACK adds nothing to that list, and this is worth stating so nobody adds it.**
+The Linux build offers JACK (`cpal`'s `jack` feature, see
+`tangent-record/Cargo.toml`), and it needs **no libjack, no headers and no
+second sysroot** on the build machine — nor on the user's. `jack` 0.13 enables
+`dynamic_loading` by default, so libjack is `dlopen`ed on first use. The one
+thing that would have broken that is patched out in
+`tangent-record/vendor/jack-sys`: upstream's build script probed pkg-config on
+Linux regardless and emitted a link directive, which would both have required
+the development files here and put `libjack.so.0` in the artifact's
+`DT_NEEDED` — a binary that refuses to start on a desktop without JACK
+installed. Check it the way it was checked:
+
+```sh
+readelf -d dist/.../tangent | grep NEEDED   # no libjack.so.0, ever
+```
+
+If that line ever shows libjack, the vendored patch has been lost and the
+artifact is broken for every user without a pro-audio stack.
 `scripts/build-cross.sh` still produces the Windows zip; its Linux stage will
 fail loudly until one of the above is in place.
 

@@ -280,7 +280,19 @@ impl CaptureDevices for AudioInputs {
         // offering the broken one beside the working one with nothing to tell
         // them apart. An empty answer — no PipeWire, no `pw-dump` — falls
         // through to exactly what every earlier build did.
-        for src in tangent_record::audio::pipewire_sources() {
+        // **Except through JACK, where this same substitution is the fault.**
+        // A JACK host has no `pipewire` PCM to aim, so every row below would
+        // fail to open — and because they REPLACE the cpal list rather than
+        // joining it, they would hide the one entry that works. See
+        // `audio::pipewire_pcm_route_applies`.
+        let pipewire_sources = if tangent_record::audio::pipewire_pcm_route_applies() {
+            tangent_record::audio::pipewire_sources()
+        } else {
+            // Not merely unused: `pw-dump` is a subprocess, and this runs
+            // every time the picker opens.
+            Vec::new()
+        };
+        for src in pipewire_sources {
             let uid = format!("{PIPEWIRE_UID}{}", src.node);
             out.push(DeviceInfo {
                 uid: uid.clone(),
@@ -362,7 +374,18 @@ pub fn audio_selection(shared: &Shared) -> Option<AudioChoice> {
         Some(uid) => {
             let (key, channel) = split_channel(uid);
             let selection = match key.strip_prefix(PIPEWIRE_UID) {
-                Some(node) => InputSelection::PipewireNode(node.to_owned()),
+                // **A saved `pw:` uid outlives the host that could open it.**
+                // Switching to JACK does not rewrite the settings file, so the
+                // uid from the last ALSA session is still what arrives here —
+                // and `resolve` would answer `NotFound` for a PCM the JACK
+                // host has never had, leaving the app with no input and no
+                // explanation. The host's own default is what that uid was
+                // standing in for, so that is what it falls back to; picking
+                // again in Setup writes a uid that means something here.
+                Some(node) if tangent_record::audio::pipewire_pcm_route_applies() => {
+                    InputSelection::PipewireNode(node.to_owned())
+                }
+                Some(_) => InputSelection::Default,
                 None => InputSelection::Key(DeviceKey::from_setting(key)),
             };
             // **The extras, and only the ones on the same box.** A uid from
@@ -516,7 +539,13 @@ impl tangent_ui::ports::AudioSetup for Setup {
         // device's default config. Either way this is what the chooser lays
         // its buttons out from, so a wrong number is a chooser that offers
         // inputs the device does not have.
+        // A `pw:` uid left over from an ALSA session is not a device this
+        // host can see, and its old width would lay the chooser out for one
+        // that is not open. Zero is what "cannot be seen" means here already.
         if let Some(node) = key.strip_prefix(PIPEWIRE_UID) {
+            if !tangent_record::audio::pipewire_pcm_route_applies() {
+                return 0;
+            }
             return tangent_record::audio::pipewire_sources()
                 .into_iter()
                 .find(|s| s.node == node)
@@ -850,6 +879,12 @@ fn seed_rows(key: &str, width: usize) -> Vec<String> {
 /// cannot be seen — a seed from a guess would be a seed to undo.
 fn device_width(key: &str) -> usize {
     if let Some(node) = key.strip_prefix(PIPEWIRE_UID) {
+        // Same as `Setup::input_channels`: through a host with no `pipewire`
+        // PCM this uid names nothing, and a seed from a stale width is a seed
+        // to undo.
+        if !tangent_record::audio::pipewire_pcm_route_applies() {
+            return 0;
+        }
         return tangent_record::audio::pipewire_sources()
             .into_iter()
             .find(|s| s.node == node)

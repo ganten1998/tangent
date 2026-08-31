@@ -29,6 +29,18 @@
 //! The input side follows Tangent's own macOS rule — a quarter of the output,
 //! floor 64 — unless `IN_BUFFER` overrides it. `DEVICE` picks an interface by
 //! substring; the default output and input devices are used otherwise.
+//! `SYSTEM` picks the host by name where a build has more than one — which is
+//! how the Linux and FreeBSD ALSA-versus-JACK numbers are taken:
+//!
+//! ```text
+//! cargo run --release -p tangent-record --example rtlatency -- 512 8
+//! SYSTEM=JACK cargo run --release -p tangent-record --example rtlatency -- 512 8
+//! ```
+//!
+//! Note that JACK ignores the buffer argument on purpose: the server's period
+//! is the client's period, so the number to compare it against is whatever the
+//! server is running (`jack_bufsize`, or `pw-metadata -n settings` on
+//! PipeWire), not whatever was typed here.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -66,6 +78,22 @@ struct Shared {
     hist: [AtomicU64; 128],
     /// Frames the stale-drop threw away, exactly as `mix_monitor` counts them.
     slipped: AtomicU64,
+    /// **The OUTPUT delay on its own: `playback - callback`, per block.**
+    ///
+    /// The round trip above is two streams and a ring between them, and the
+    /// ring's policy is written for an input running at a QUARTER of the
+    /// output — a shape JACK cannot be asked for, since the server runs one
+    /// period for every client. So the round trip does not compare two hosts
+    /// on equal terms, and comparing them is what `SYSTEM` is for.
+    ///
+    /// This does: it is one stream, no ring, no policy — how far ahead of the
+    /// speaker the callback is filling. It is also the number a PLAYER pays
+    /// when the sound starts here rather than at a microphone, which is every
+    /// note struck on a keyboard into Tangent's own instrument.
+    out_ahead_n: AtomicU64,
+    out_ahead_sum: AtomicU64,
+    out_ahead_min: AtomicU64,
+    out_ahead_max: AtomicU64,
 }
 
 fn pick(host: &cpal::Host, want: Option<&str>, output: bool) -> Option<cpal::Device> {
@@ -101,8 +129,34 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| (out_buf / 4).max(64));
     let want_dev = std::env::var("DEVICE").ok();
+    // **`SYSTEM` picks the host, so this instrument can answer the question it
+    // is now being asked.** It was written to compare two SHAPES (two streams
+    // against a duplex callback) on one host, where `default_host` was the only
+    // host there was. On Linux and FreeBSD there are two, and "what does the
+    // ALSA path cost that JACK does not" is a question about the same shape on
+    // different stacks — the same two timestamps, so the same measurement.
+    // Matched by name against the real enumeration, exactly as
+    // `audio::build_host` does it, and unset still means the platform default.
+    let want_system = std::env::var("SYSTEM").ok();
 
-    let host = cpal::default_host();
+    let host = match &want_system {
+        Some(name) => cpal::available_hosts()
+            .into_iter()
+            .find(|id| id.name().eq_ignore_ascii_case(name))
+            .and_then(|id| cpal::host_from_id(id).ok())
+            .unwrap_or_else(|| {
+                eprintln!(
+                    "no host called {name:?}; this build has {:?}",
+                    cpal::available_hosts()
+                        .into_iter()
+                        .map(|id| id.name())
+                        .collect::<Vec<_>>()
+                );
+                std::process::exit(1);
+            }),
+        None => cpal::default_host(),
+    };
+    println!("host   {}", host.id().name());
     let Some(out_dev) = pick(&host, want_dev.as_deref(), true) else {
         eprintln!("no output device");
         std::process::exit(1);
@@ -144,6 +198,10 @@ fn main() {
         max: AtomicU64::new(0),
         hist: std::array::from_fn(|_| AtomicU64::new(0)),
         slipped: AtomicU64::new(0),
+        out_ahead_n: AtomicU64::new(0),
+        out_ahead_sum: AtomicU64::new(0),
+        out_ahead_min: AtomicU64::new(u64::MAX),
+        out_ahead_max: AtomicU64::new(0),
     });
     // The monitor ring, sized as `open_input` sizes it: an eighth of a second.
     let (mut tx, mut rx) = rtrb::RingBuffer::<f32>::new((rate as usize / 8).max(1024));
@@ -205,6 +263,13 @@ fn main() {
                     .duration_since(&info.timestamp().callback)
                     .map(|d| d.as_nanos() as u64)
                     .unwrap_or(0);
+                // The output leg on its own, before the ring has any say.
+                if ahead > 0 {
+                    osh.out_ahead_n.fetch_add(1, Ordering::Relaxed);
+                    osh.out_ahead_sum.fetch_add(ahead, Ordering::Relaxed);
+                    osh.out_ahead_min.fetch_min(ahead, Ordering::Relaxed);
+                    osh.out_ahead_max.fetch_max(ahead, Ordering::Relaxed);
+                }
 
                 // `mix_monitor`'s stale-drop, to the letter: what is
                 // legitimately in flight is this output block plus the input
@@ -297,4 +362,18 @@ fn main() {
         f64::from(in_buf) * 1000.0 / f64::from(rate),
         rate
     );
+
+    // **The output leg on its own — the honest cross-host number.**
+    let oa_n = sh.out_ahead_n.load(Ordering::Relaxed);
+    if oa_n > 0 {
+        println!(
+            "output delay alone (playback - callback), no ring involved:\n  \
+             min {:.2} ms   mean {:.2} ms   max {:.2} ms   over {oa_n} blocks",
+            ms(sh.out_ahead_min.load(Ordering::Relaxed)),
+            ms(sh.out_ahead_sum.load(Ordering::Relaxed) / oa_n),
+            ms(sh.out_ahead_max.load(Ordering::Relaxed)),
+        );
+    } else {
+        println!("output delay alone: this host reports none (playback == callback)");
+    }
 }
