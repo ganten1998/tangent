@@ -30,6 +30,9 @@ pub enum Dialog {
     /// **The Konami dialog.** Its words and its one button are the owner's
     /// spec, verbatim; dismissing it is what mints the Cheater unlock.
     Cheated,
+    /// The code entered by somebody already standing as a supporter - the
+    /// repeat run. Same button, same unlock refresh, different eyebrow.
+    CheatFun,
     /// The project menu behind the band's folder button: the session's
     /// name, and the five things you do with sessions.
     Project {
@@ -4282,7 +4285,12 @@ pub fn show(
             )
         }
 
-        Dialog::Cheated => {
+        Dialog::Cheated | Dialog::CheatFun => {
+            let words = if matches!(dialog, Dialog::CheatFun) {
+                "So now we're just doing it for fun then? Fine."
+            } else {
+                "That's not fair, you cheated. >:c"
+            };
             let stock = stock_style(ctx);
             show_dialog_viewport(
                 ctx,
@@ -4297,7 +4305,7 @@ pub fn show(
                     egui::Frame::NONE
                         .inner_margin(egui::Margin::same(12))
                         .show(ui, |ui| {
-                            ui.label("That's not fair, you cheated. >:c");
+                            ui.label(words);
                             ui.add_space((ui.available_height() - 30.0).max(0.0));
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if ui.button("...").clicked() {
