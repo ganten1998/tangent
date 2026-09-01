@@ -44,3 +44,8 @@ __pycache__/
 # Two of those got committed and then drifted out of date. Use `sed -i ''`
 # here instead; this pattern catches the habit when it slips.
 *-e
+
+# The Keys bench writes its renders beside itself when it is given a bare
+# name. They are measurement output, not source, and the default one is
+# twelve seconds of audio that no clone wants.
+tools/keysrig/*.wav
