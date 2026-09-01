@@ -966,6 +966,12 @@ pub const VISIBLE_CHANNELS: usize = 8;
 /// sixteen stay on one row and scroll instead.
 const TWO_ROW_MIN_H: f32 = 200.0;
 
+/// **The folder chop and the child indent are ONE number** - the owner's
+/// spec: the 90-degree chop off a folder's top-right corner ends exactly
+/// where its children's strips begin, so the eye reads containment as a
+/// step down.
+pub const CHILD_INDENT: f32 = 12.0;
+
 impl Layout {
     /// The column unit width and pitch (unit + gap) at `rect` with `visible`
     /// channels showing. One derivation, shared with the wheel handler's
@@ -1112,6 +1118,14 @@ impl Layout {
                     inner.height(),
                 )
             };
+            // **A child's strip starts where the folder's chop ends** -
+            // the whole panel steps down by the chop's height, which is
+            // the visual indent the desk was missing.
+            let (y, h) = if v.in_folder {
+                (y + CHILD_INDENT, (h - CHILD_INDENT).max(1.0))
+            } else {
+                (y, h)
+            };
             let panel = Rect::from_min_size(Pos2::new(x, y), Vec2::new(unit, h));
             Self::one(panel, Some(v))
         });
@@ -1229,12 +1243,12 @@ impl Layout {
         let rack = if view.strip.is_none() && !view.empty {
             cut(0.100, 0.345)
         } else if view.is_folder && !view.empty {
-            // **A folder's rack is taller too**, like the master's, because
-            // it holds twice as many. Its three extra bays take the DETAIL
-            // band's room — a group has no input to name or pick, so the
-            // chip goes and the bays get legible heights instead of six
-            // slivers in a channel's band.
-            cut(0.152, 0.345)
+            // **A folder's rack IS the master's**: same start, same end,
+            // six bays at every size the master already manages - the
+            // owner's "at 100 percent size, adapt to fit all 6". The name
+            // yields room exactly as the master's does when the strip
+            // shrinks.
+            cut(0.100, 0.345)
         } else {
             cut(0.195, 0.345)
         };
@@ -1330,16 +1344,17 @@ impl Layout {
         // folder cannot carry MIDI of its own, and the owner said so in
         // capitals.
         let theory = if switchable && has_arm {
-            // Below the switch row, never grazing it: the sliver under M S R
-            // is all this button gets, and when the strip is too short to
-            // give it seven points it sheds whole - a control half under
-            // the mute is the overlap class the guard test exists for.
+            // Below the switch row, never grazing it, and on the RIGHT -
+            // the owner's revision - flush with the inserts' right edge at
+            // the strip's foot. Sheds whole when the sliver is under seven
+            // points: a control half under the mute is the overlap class
+            // the guard test exists for.
             let top = switches.bottom() + 2.0;
             let side = ((panel.bottom() - 1.5) - top).min(14.0);
             if side >= 7.0 {
                 Rect::from_min_max(
-                    Pos2::new(panel.left() + 6.0, panel.bottom() - 1.5 - side),
-                    Pos2::new(panel.left() + 6.0 + side, panel.bottom() - 1.5),
+                    Pos2::new(panel.right() - 6.0 - side, panel.bottom() - 1.5 - side),
+                    Pos2::new(panel.right() - 6.0, panel.bottom() - 1.5),
                 )
             } else {
                 Rect::NOTHING
@@ -1490,15 +1505,26 @@ impl Layout {
             theory,
             mono,
             inserts,
-            // **On a FOLDER the icon spot IS the collapse control** - the
-            // owner's ruling: one glyph, one job, hide or show the children.
-            // Everything else keeps the picker door.
-            folder: if view.is_folder { icon } else { Rect::NOTHING },
+            // **The collapse control is the TAB at the name plate's
+            // top-left** - the owner's revision: the icon spot stays free
+            // for a badge of the user's choosing, on folders like any
+            // track, and the little tab that was only drawn is now the
+            // thing you press.
+            folder: if view.is_folder {
+                let full = cut(0.022, 0.078);
+                let side = full.height().clamp(11.0, 17.0);
+                Rect::from_min_size(
+                    Pos2::new(panel.left() + 5.0, full.center().y - side * 0.5),
+                    Vec2::splat(side),
+                )
+            } else {
+                Rect::NOTHING
+            },
             // **The same target as the plus on an empty one**, because it is
             // the same question: what is on this channel. An empty slot draws
             // a plus and a filled one draws its icon, and both open the picker
             // that answers it.
-            add: if view.is_folder { Rect::NOTHING } else { icon },
+            add: icon,
             close,
         }
     }
@@ -2000,6 +2026,32 @@ fn strip(
         Stroke::new(1.0, p.engrave.gamma_multiply(0.30)),
         egui::StrokeKind::Inside,
     );
+    // **A FOLDER is chopped at its top-right** - a 90-degree notch, and
+    // where the chop's underside lands is exactly where its children's
+    // strips begin (`CHILD_INDENT`): the step the eye follows from parent
+    // to child.
+    if v.is_folder {
+        let notch = Rect::from_min_max(
+            Pos2::new(l.panel.right() - l.panel.width() * 0.28, l.panel.top() - 1.0),
+            Pos2::new(l.panel.right() + 1.0, l.panel.top() + CHILD_INDENT),
+        );
+        painter.rect_filled(notch, 0.0, p.wood);
+        let edge = Stroke::new(1.0, p.engrave.gamma_multiply(0.30));
+        painter.line_segment(
+            [
+                Pos2::new(notch.left(), l.panel.top()),
+                Pos2::new(notch.left(), notch.bottom()),
+            ],
+            edge,
+        );
+        painter.line_segment(
+            [
+                Pos2::new(notch.left(), notch.bottom()),
+                Pos2::new(l.panel.right(), notch.bottom()),
+            ],
+            edge,
+        );
+    }
 
     let cap = |size: f32| FontId::new(size, crate::fonts::courier_bold());
     let plain = |size: f32| FontId::new(size, crate::fonts::courier());
@@ -2024,55 +2076,60 @@ fn strip(
     // lane sideways; a vertical strip has no sideways, so the plate and its
     // name drop three points instead — enough to read as "under", too
     // little to cost the layout anything.
-    let drop = if v.in_folder { 3.0 } else { 0.0 };
     let plate = Rect::from_min_max(
-        Pos2::new(l.panel.left() + 3.0, l.name.top() - 2.0 + drop),
-        Pos2::new(l.panel.right() - 3.0, l.name.bottom() + 2.0 + drop),
+        Pos2::new(l.panel.left() + 3.0, l.name.top() - 2.0),
+        Pos2::new(l.panel.right() - 3.0, l.name.bottom() + 2.0),
     );
     // **Under every name, painted or not.** It was drawn only on a coloured
     // channel, where it exists to keep the label legible on any background —
     // but a name is a FIELD now, and a field needs an edge to look like one
     // before it is clicked. The two reasons want the same rectangle.
     let _ = painted;
-    // **A child wears the containment rail**: a quiet bar across the very
-    // top of the strip, with the 3px plate drop under it - the two cues
-    // that say "inside the folder to my left" now that the desk actually
-    // folds.
-    if v.in_folder {
-        painter.rect_filled(
-            Rect::from_min_max(
-                Pos2::new(l.panel.left() + 3.0, l.panel.top() + 1.5),
-                Pos2::new(l.panel.right() - 3.0, l.panel.top() + 3.5),
-            ),
-            1.0,
-            p.engrave.gamma_multiply(0.55),
-        );
-    }
     if plate.is_positive() {
         painter.rect_filled(plate, 2.0, p.face);
-        // **The folder shape, worn on the plate's top-left**: the tab of a
-        // folder over its body — the smallest mark that reads as one, the
-        // arrangement's own glyph brought over.
-        if v.is_folder {
-            let h = (plate.height() * 0.5).clamp(5.0, 9.0);
-            let w = h * 1.5;
-            let at = Pos2::new(plate.left() + 3.0, plate.center().y - h * 0.5);
+        // **The folder TAB, and it is the collapse control now** - top-left
+        // of the plate, where it always sat, with the open/shut arrow
+        // inside its body. The icon spot below stays free for whatever
+        // badge the user chooses.
+        if l.folder.is_positive() {
+            let b = l.folder;
+            let hh = (b.height() * 0.72).clamp(8.0, 13.0);
+            let ww = hh * 1.5;
+            let at = Pos2::new(b.left(), b.center().y - hh * 0.5);
             painter.rect_filled(
-                Rect::from_min_size(at, Vec2::new(w * 0.45, h * 0.35)),
+                Rect::from_min_size(at, Vec2::new(ww * 0.45, hh * 0.32)),
                 1.0,
                 p.engrave,
             );
             painter.rect_filled(
                 Rect::from_min_size(
-                    Pos2::new(at.x, at.y + h * 0.28),
-                    Vec2::new(w, h * 0.72),
+                    Pos2::new(at.x, at.y + hh * 0.26),
+                    Vec2::new(ww, hh * 0.74),
                 ),
                 1.0,
                 p.engrave,
             );
+            // The arrow, in the plate's own face: down = open, right = shut.
+            let cx = at.x + ww * 0.5;
+            let cy = at.y + hh * 0.62;
+            let a = (hh * 0.24).max(2.0);
+            let tri = if v.folder_shut {
+                vec![
+                    Pos2::new(cx - a * 0.5, cy - a),
+                    Pos2::new(cx + a, cy),
+                    Pos2::new(cx - a * 0.5, cy + a),
+                ]
+            } else {
+                vec![
+                    Pos2::new(cx - a, cy - a * 0.5),
+                    Pos2::new(cx + a, cy - a * 0.5),
+                    Pos2::new(cx, cy + a),
+                ]
+            };
+            painter.add(egui::Shape::convex_polygon(tri, p.face, Stroke::NONE));
         }
     }
-    let name_rect = l.name.translate(Vec2::new(0.0, drop));
+    let name_rect = l.name;
     // **The band's own icons, under the names.** The microphone and the
     // waveform are how the input and the backing track are already labelled
     // one band up; drawing them again here is what makes the three kinds of
@@ -2095,54 +2152,18 @@ fn strip(
             p.engrave,
         );
     }
-    // **A FOLDER's icon spot is the collapse control**: the folder shape,
-    // with its children shown or hidden said by the arrow inside it - the
-    // arrangement's own grammar. No kind icon, no badge: a folder is a
-    // grouper, not a track.
-    if v.is_folder && l.folder.is_positive() {
-        let b = l.folder;
-        let hh = (b.height() * 0.52).clamp(7.0, 12.0);
-        let ww = hh * 1.45;
-        let at = Pos2::new(b.center().x - ww * 0.5, b.center().y - hh * 0.5);
-        painter.rect_filled(
-            Rect::from_min_size(at, Vec2::new(ww * 0.45, hh * 0.32)),
-            1.0,
-            ink,
-        );
-        painter.rect_filled(
-            Rect::from_min_size(Pos2::new(at.x, at.y + hh * 0.26), Vec2::new(ww, hh * 0.74)),
-            1.0,
-            ink,
-        );
-        // The arrow, in the panel's own face: down = open, right = shut.
-        let cx = at.x + ww * 0.5;
-        let cy = at.y + hh * 0.63;
-        let a = (hh * 0.26).max(2.0);
-        let tri = if v.folder_shut {
-            vec![
-                Pos2::new(cx - a * 0.5, cy - a),
-                Pos2::new(cx + a, cy),
-                Pos2::new(cx - a * 0.5, cy + a),
-            ]
-        } else {
-            vec![
-                Pos2::new(cx - a, cy - a * 0.5),
-                Pos2::new(cx + a, cy - a * 0.5),
-                Pos2::new(cx, cy + a),
-            ]
-        };
-        painter.add(egui::Shape::convex_polygon(tri, face, Stroke::NONE));
-    }
     // A chosen badge beats the kind's own icon on a channel strip. An
     // unknown code (a NEWER install's desk) falls through to the kind
     // rather than drawing nothing.
-    let badge = !v.is_folder
-        && v.icon != 0
+    let badge = v.icon != 0
         && matches!(v.strip, Some(Strip::Channel(_)))
         && crate::recorder_panel::draw_badge(painter, l.icon, ink, face, v.icon);
-    let named = if v.is_folder {
+    let named = if badge {
         true
-    } else if badge {
+    } else if v.is_folder {
+        // A folder with no chosen badge keeps its icon spot EMPTY - the
+        // owner's "leave the main icon empty for users to choose". The
+        // picker still answers a press there.
         true
     } else {
         match (v.strip, v.kind) {
@@ -2503,7 +2524,9 @@ fn strip(
         // (`\u{266a}`), which renders through egui's fallback face on every
         // platform this app ships to. Drawn like a switch: framed, lit
         // while the channel's MIDI feeds the theory view.
-        switch(painter, l.theory, "\u{266a}", v.to_theory, p.engrave, p);
+        // Lit in the SELECT colour, not engrave: the owner pressed the old
+        // engrave-lit letter and saw nothing change.
+        switch(painter, l.theory, "\u{266a}", v.to_theory, p.lit, p);
     }
 }
 

@@ -7056,6 +7056,11 @@ impl TangentApp {
     /// Move the open session to `name` — the Project window's field, at
     /// its Save. A no-op on an empty or unchanged name; a collision steps
     /// to `name 2` rather than eating somebody else's session.
+    #[cfg(test)]
+    pub fn rename_project_for_test(&mut self, name: &str) {
+        self.rename_project(name);
+    }
+
     fn rename_project(&mut self, name: &str) {
         let clean: String = name
             .chars()
@@ -7077,11 +7082,18 @@ impl TangentApp {
             return;
         };
         let target = unique_dir(&root, &clean);
-        if std::fs::rename(&src, &target).is_err() {
-            return;
+        if src.is_dir() {
+            if std::fs::rename(&src, &target).is_err() {
+                return;
+            }
         }
-        // The DIRECTORY was renamed; the file inside kept its own name -
-        // canonical or legacy - so adopt what is really there.
+        // An UNMATERIALISED scratch renames by repointing alone - there is
+        // no folder yet, which is the whole point ("no untitled folders
+        // PERIOD"): the name chosen here is the name the folder will be
+        // BORN with when the first real writer materialises it.
+        // The DIRECTORY (when it existed) was renamed; the file inside
+        // kept its own name - canonical or legacy - so adopt what is
+        // really there.
         self.project_doc = crate::arrangement::doc_in(&target);
         self.settings.project_path = self.project_doc.to_string_lossy().into_owned();
         self.save_settings();
@@ -8449,6 +8461,49 @@ impl TangentApp {
     /// The host's cue to reload every insert with the project's own states.
     pub fn take_desk_reload(&mut self) -> bool {
         std::mem::take(&mut self.desk_reload)
+    }
+
+    /// **Open the TEMPLATE in memory and point the session at a home that
+    /// does not exist yet.** The owner: "no creating folders called
+    /// untitled PERIOD" - so launch and New write NOTHING; the folder
+    /// materialises at the first thing worth keeping (a take, a kit edit,
+    /// a Save), through `materialize_project_dir`.
+    pub fn adopt_template(&mut self, template_dir: &std::path::Path, dir: &std::path::Path) {
+        self.open_project(&crate::arrangement::doc_in(template_dir));
+        // Repoint at the prospective home - unwritten - and make sure the
+        // template can never be edited in place through this session.
+        self.arrangement.named = false;
+        self.project_doc = dir.join(crate::arrangement::DOC_NAME);
+        self.settings.project_path = self.project_doc.to_string_lossy().into_owned();
+        self.save_settings();
+        self.undo_reset();
+    }
+
+    /// The prospective project folder becomes REAL - called by every
+    /// writer that is about to put something in it. Cheap when it already
+    /// exists.
+    pub fn materialize_project_dir(&self) {
+        if let Some(dir) = self.project_doc.parent() {
+            let _ = std::fs::create_dir_all(dir.join("media"));
+        }
+    }
+
+    /// **Whether a stray scratch folder holds anything anyone could
+    /// miss**: an unnamed document with no clips, no takes beside it (the
+    /// caller counts those), and a kit identical to the template's is the
+    /// litter the launch sweep may clear - the owner's "i hate seeing
+    /// untitled 1 2 3 build up between sessions".
+    pub fn scratch_is_disposable(dir: &std::path::Path, template_dir: &std::path::Path) -> bool {
+        use crate::arrangement::{Arrangement, LoadOutcome};
+        let template_kit = template_dir.join(crate::drumpad::FILE_NAME);
+        if kit_is_custom(&dir.join(crate::drumpad::FILE_NAME), &template_kit) {
+            return false;
+        }
+        match Arrangement::read_from(&crate::arrangement::doc_in(dir)) {
+            LoadOutcome::Missing | LoadOutcome::Empty => true,
+            LoadOutcome::Damaged => false,
+            LoadOutcome::Loaded(a) => !a.named && a.clips.is_empty(),
+        }
     }
 
     pub fn open_project(&mut self, doc: &std::path::Path) {
@@ -10735,6 +10790,8 @@ impl TangentApp {
     /// and any explicit one. Does not touch the clips-dirty flag: nothing
     /// changed that the engine needs re-pushed.
     pub fn save_project_doc(&mut self) {
+        // The folder is born the moment something real is kept.
+        self.materialize_project_dir();
         self.arrangement.desk = Some(self.desk_snapshot());
         self.mark_project_saved();
         if let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) {
@@ -12949,6 +13006,7 @@ impl TangentApp {
         self.drumpad_mut().pads[pad].name.clear();
         self.drumpad_status[pad] = crate::ports::PadStatus::default();
         self.drumpad_sel = pad;
+        self.materialize_project_dir();
         crate::drumpad::DrumpadDoc::save_all_beside(
             &self.drumpad_kits,
             self.drumpad_lane,
@@ -12988,6 +13046,9 @@ impl TangentApp {
 
     fn drumpad_save(&mut self) {
         if let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) {
+            // The kit saves itself, so the kit is a REAL thing: the folder
+            // is born here if it never was.
+            self.materialize_project_dir();
             crate::drumpad::DrumpadDoc::save_all_beside(
             &self.drumpad_kits,
             self.drumpad_lane,
@@ -16296,9 +16357,18 @@ impl TangentApp {
                                 row.panel.is_positive() && row.panel.contains(p)
                             })
                         };
-                        if let Some(n) = row.filter(|n| self.channel_used(*n)) {
+                        if let Some(n) = row {
+                            // An EMPTY row's bare ground selects too - only
+                            // its invisible name zone did, so the left half
+                            // of an unoccupied slot swallowed clicks (the
+                            // owner's "invisible selectable label zone").
+                            // Only a USED row arms the reorder: there is
+                            // nothing to carry off an empty one.
                             self.select_track(n, ctx.input(|i| i.modifiers));
-                            self.arr_drag = Some(ArrDrag::ReorderLane { from: n, moved: false });
+                            if self.channel_used(n) {
+                                self.arr_drag =
+                                    Some(ArrDrag::ReorderLane { from: n, moved: false });
+                            }
                         }
                     }
                 }
@@ -22069,7 +22139,9 @@ impl TangentApp {
             DialogAction::ProjectExportBrowse => {
                 self.native_panel_up = true;
                 self.dir_request = Some(crate::ports::DirRequest {
-                    start_at: None,
+                    // The ASSIGNED export home, never the system's generic
+                    // start - the owner's rule for every save-shaped panel.
+                    start_at: Some(self.export_root()),
                     title: "Where should the export land?".to_owned(),
                     purpose: crate::ports::DirPurpose::ExportDir,
                 });
@@ -32517,6 +32589,229 @@ mod tests {
 
     /// **A track is carried by its NAME as well as by its number.**
     ///
+    /// **Every part of an unoccupied row selects the slot** - the bare
+    /// ground included, which used to swallow the left half of an empty
+    /// row (the owner's "invisible selectable label zone ... is still the
+    /// same"). Driven through real pointer events, whole frames.
+    #[test]
+    fn an_empty_rows_bare_ground_selects_like_the_rest_of_it() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.arrangement_open = true;
+        app.add_bare_track(0);
+        let _ = run_frame(&ctx, &mut app);
+        let rect = app.arrangement_rect.expect("arrange rect");
+        let (row, probes) = {
+            let clips = app.arr_clip_views();
+            let view = app.arrange_view(&clips);
+            let l = crate::arrangement_panel::Layout::new(rect, &view);
+            let row = l.header_rows[3];
+            let probes: Vec<(&str, f32, Option<crate::arrangement_panel::Hit>)> = [
+                ("far left", row.panel.left() + 4.0),
+                ("left-mid", row.panel.left() + row.panel.width() * 0.25),
+                ("centre", row.panel.center().x),
+                ("right", row.panel.left() + row.panel.width() * 0.85),
+            ]
+            .into_iter()
+            .map(|(w, x)| {
+                let p = Pos2::new(x, row.panel.center().y);
+                (w, x, crate::arrangement_panel::hit_test(rect, &view, p))
+            })
+            .collect();
+            (row, probes)
+        };
+        for (what, x, hit) in probes {
+            let p = Pos2::new(x, row.panel.center().y);
+            app.selected_channel = None;
+            app.selected_tracks.clear();
+            app.dialog = None;
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                    events: vec![
+                        egui::Event::PointerMoved(p),
+                        egui::Event::PointerButton {
+                            pos: p,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                        egui::Event::PointerButton {
+                            pos: p,
+                            button: egui::PointerButton::Primary,
+                            pressed: false,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| app.frame(ctx),
+            );
+            assert_eq!(
+                app.selected_channel,
+                Some(3),
+                "{what} (hit {hit:?}) did not select the empty slot"
+            );
+            assert!(!app.channel_used(3), "{what} minted a track");
+            app.input_menu = None;
+        }
+    }
+
+    /// **The mixer's drag really performs the arrangement's grammar** -
+    /// driven as a hand would: press the name plate, travel, release.
+    /// Pins the owner's "wholly not working" report either way.
+    #[test]
+    fn a_mixer_drag_snaps_into_a_folder_and_comes_home_to_eject() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.mixer_open = true;
+        for n in 0..5 {
+            app.add_bare_track(n);
+        }
+        app.toggle_folder(1);
+        let _ = run_frame(&ctx, &mut app);
+        let rect = app.mixer_rect.expect("mixer rect");
+        let frame = |app: &mut TangentApp, events: Vec<egui::Event>| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        Pos2::ZERO,
+                        Vec2::new(1300.0, 900.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.frame(ctx),
+            );
+        };
+        let strips = |app: &mut TangentApp| {
+            let view = app.mixer_view();
+            crate::mixer_panel::Layout::new(rect, &view)
+                .strips
+                .iter()
+                .map(|s| s.panel)
+                .collect::<Vec<_>>()
+        };
+        let press = |pos| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let release = |pos| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+
+        // ── drag track 3 into folder 1, by the name plate ──
+        let panels = strips(&mut app);
+        let grab = {
+            let view = app.mixer_view();
+            crate::mixer_panel::Layout::new(rect, &view).strips[3].name.center()
+        };
+        let drop = crate::mixer_panel::folder_drop_strip(panels[1]).center();
+        frame(&mut app, vec![egui::Event::PointerMoved(grab), press(grab)]);
+        assert!(
+            app.mixer_reorder.is_some(),
+            "the press on the name plate did not arm the carry"
+        );
+        frame(&mut app, vec![egui::Event::PointerMoved(drop)]);
+        frame(&mut app, vec![egui::Event::PointerMoved(drop), release(drop)]);
+        assert!(
+            app.in_folder(2),
+            "the drop on the folder's right quarter did not snap the track in \
+             (children now: {:?})",
+            app.folder_children(1)
+        );
+
+        // ── and the drag that comes home ejects it ──
+        let child = app.folder_children(1)[0];
+        let panels = strips(&mut app);
+        let grab = {
+            let view = app.mixer_view();
+            crate::mixer_panel::Layout::new(rect, &view).strips[child].name.center()
+        };
+        let away = Pos2::new(panels[4].center().x, panels[4].center().y);
+        frame(&mut app, vec![egui::Event::PointerMoved(grab), press(grab)]);
+        frame(&mut app, vec![egui::Event::PointerMoved(away)]);
+        // Home again - the body, not the right-quarter drop strip.
+        let home = Pos2::new(panels[child].left() + panels[child].width() * 0.3, panels[child].center().y);
+        frame(&mut app, vec![egui::Event::PointerMoved(home)]);
+        frame(&mut app, vec![egui::Event::PointerMoved(home), release(home)]);
+        assert!(
+            !app.in_folder(child),
+            "the drag that came home did not eject the child"
+        );
+    }
+
+    /// **The arrangement's eject gesture, driven by real pointer events**:
+    /// grab the child's name, wander off the row, come home, release -
+    /// the child leaves the folder and keeps its lane.
+    #[test]
+    fn an_arrange_drag_that_comes_home_ejects_by_hand() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.arrangement_open = true;
+        for n in 0..5 {
+            app.add_bare_track(n);
+        }
+        app.toggle_folder(1);
+        app.set_in_folder(2, true);
+        let _ = run_frame(&ctx, &mut app);
+        let rect = app.arrangement_rect.expect("arrange rect");
+        let frame = |app: &mut TangentApp, events: Vec<egui::Event>| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        Pos2::ZERO,
+                        Vec2::new(1300.0, 900.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.frame(ctx),
+            );
+        };
+        let (grab, away, home) = {
+            let clips = app.arr_clip_views();
+            let view = app.arrange_view(&clips);
+            let l = crate::arrangement_panel::Layout::new(rect, &view);
+            let child = l.header_rows[2].panel;
+            let other = l.header_rows[4].panel;
+            (
+                l.header_rows[2].name.center(),
+                other.center(),
+                // Home, over the LANES to the right of the header - the
+                // gesture a hand makes dragging "out" sideways.
+                Pos2::new(child.right() + 200.0, child.center().y),
+            )
+        };
+        frame(&mut app, vec![egui::Event::PointerMoved(grab), egui::Event::PointerButton {
+            pos: grab,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        assert!(
+            matches!(app.arr_drag, Some(ArrDrag::ReorderLane { from: 2, .. })),
+            "the press did not arm the carry: {:?}",
+            app.arr_drag
+        );
+        frame(&mut app, vec![egui::Event::PointerMoved(away)]);
+        frame(&mut app, vec![egui::Event::PointerMoved(home)]);
+        frame(&mut app, vec![egui::Event::PointerMoved(home), egui::Event::PointerButton {
+            pos: home,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        assert!(
+            !app.in_folder(2),
+            "the drag that came home did not eject (children: {:?})",
+            app.folder_children(1)
+        );
+        assert!(app.channel_used(2), "the child lost its track");
+    }
+
     /// **A child dragged out lands on its own row** - the owner's "drag a
     /// child on track 6 OUT and have it land on track 6". The run's last
     /// child ejects by flag alone; a middle child steps just past the run.
@@ -32610,8 +32905,8 @@ mod tests {
         let track = &l.strips[0];
         assert!(track.theory.is_positive(), "the track lost its note button");
         assert!(
-            (track.theory.left() - (track.panel.left() + 6.0)).abs() < 0.5,
-            "the note is not on the inserts' left edge"
+            (track.theory.right() - (track.panel.right() - 6.0)).abs() < 0.5,
+            "the note is not on the inserts' RIGHT edge"
         );
         assert!(
             track.theory.bottom() <= track.panel.bottom(),
@@ -32625,13 +32920,28 @@ mod tests {
             !l.strips[1].arm.is_positive(),
             "the folder grew a record arm"
         );
+        // The collapse control is the TAB at the plate's top-left; the
+        // icon spot stays FREE for a badge of the user's choosing.
+        let tab = l.strips[1].folder;
+        assert!(tab.is_positive(), "the folder lost its collapse tab");
         assert!(
-            l.strips[1].folder.is_positive(),
-            "the folder lost its collapse glyph"
+            tab.top() < l.strips[1].panel.top() + l.strips[1].panel.height() * 0.12,
+            "the tab is not at the strip's top"
         );
         assert!(
-            !l.strips[1].add.is_positive(),
-            "the folder's icon spot still opens the picker"
+            l.strips[1].add.is_positive(),
+            "the folder's icon spot no longer offers the picker"
+        );
+        // And a child steps DOWN by the chop's height.
+        app.set_in_folder(2, true);
+        let view = app.mixer_view();
+        let l = crate::mixer_panel::Layout::new(rect, &view);
+        assert!(
+            (l.strips[2].panel.top()
+                - (l.strips[0].panel.top() + crate::mixer_panel::CHILD_INDENT))
+                .abs()
+                < 0.5,
+            "the child did not step down by the chop"
         );
     }
 
@@ -36697,6 +37007,90 @@ mod folder_tests {
             0b11,
             "an older document lost the tracks it described"
         );
+    }
+
+    /// **A fresh session owns NO folder until something real happens** -
+    /// the owner: "no creating folders called untitled PERIOD." Adoption
+    /// writes nothing; the first Save (or kit edit, or take) is the birth.
+    #[test]
+    fn a_fresh_session_owns_no_folder_until_something_real() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        let root = std::env::temp_dir().join(format!("tangent-lazy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let template = root.join("Templates/default");
+        std::fs::create_dir_all(&template).unwrap();
+        app.seed_template(&template);
+        let dir = root.join("Untitled");
+
+        app.adopt_template(&template, &dir);
+        assert!(!dir.exists(), "adopting the template minted a folder");
+        assert!(
+            app.project_doc().is_some_and(|d| d.starts_with(&dir)),
+            "the session is not aimed at its prospective home"
+        );
+
+        // Naming the unmaterialised scratch repoints without touching disk.
+        app.rename_project_for_test("My Song");
+        assert!(!root.join("My Song").exists(), "a rename minted a folder");
+        assert!(
+            app.project_doc().is_some_and(|d| d.starts_with(root.join("My Song"))),
+            "the rename did not repoint the session"
+        );
+
+        // The first real thing births the folder, under the chosen name.
+        app.save_project_doc();
+        assert!(
+            crate::arrangement::doc_in(&root.join("My Song")).is_file(),
+            "Save did not materialise the folder"
+        );
+        assert!(!dir.exists(), "an Untitled appeared anyway");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **What the launch sweep may clear, judged safely**: only a scratch
+    /// that provably holds no work. A name, a clip, or a custom kit each
+    /// protect the folder.
+    #[test]
+    fn the_untitled_sweep_spares_anything_with_work_in_it() {
+        let root = std::env::temp_dir().join(format!("tangent-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let template = root.join("Templates/default");
+        std::fs::create_dir_all(&template).unwrap();
+        let (_ctx, app) = headless(Caps::DESKTOP);
+        app.seed_template(&template);
+
+        // A husk: no doc, stock kit - disposable.
+        let husk = root.join("Untitled 4");
+        std::fs::create_dir_all(&husk).unwrap();
+        assert!(TangentApp::scratch_is_disposable(&husk, &template));
+
+        // A named document protects it.
+        let kept = root.join("Untitled 5");
+        std::fs::create_dir_all(&kept).unwrap();
+        let mut arr = crate::arrangement::Arrangement::default();
+        arr.named = true;
+        arr.save_to(&kept.join(crate::arrangement::DOC_NAME));
+        assert!(!TangentApp::scratch_is_disposable(&kept, &template));
+
+        // A clip protects it.
+        let clips = root.join("Untitled 6");
+        std::fs::create_dir_all(&clips).unwrap();
+        let mut arr = crate::arrangement::Arrangement::default();
+        arr.add_clip(crate::arrangement::ArrClip {
+            lane: 0,
+            kind: crate::arrangement::ClipKind::Midi,
+            len_s: 4.0,
+            notes: vec![crate::arrangement::ArrNote {
+                at_s: 0.0,
+                dur_s: 1.0,
+                key: 60,
+                vel: 100,
+            }],
+            ..Default::default()
+        });
+        arr.save_to(&clips.join(crate::arrangement::DOC_NAME));
+        assert!(!TangentApp::scratch_is_disposable(&clips, &template));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// **New on a pristine scratch is a no-op.** The desktop's handler

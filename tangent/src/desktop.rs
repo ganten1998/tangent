@@ -3650,6 +3650,13 @@ impl DesktopApp {
         // is deleted. Plugin state alone (a preset tweaked in a scratch
         // with no other change) does not protect a folder: comparing
         // `state/` churn would strand a stale Untitled per launch.
+        // **Nothing is cloned and nothing is created** - the owner: "no
+        // creating folders called untitled PERIOD." The template is
+        // adopted IN MEMORY, aimed at a prospective folder that
+        // materialises only at the first thing worth keeping (a take, a
+        // kit edit, a Save). And the litter of past sessions goes: any
+        // stray Untitled that provably holds no work is cleared here.
+        Self::sweep_disposable_untitleds(&root, &template);
         let dir = tangent_ui::app::fresh_project_dir(&root);
         let dir = if dir.exists() && !launch_reclaimable(&dir, &template) {
             next_untitled(&root, &dir)
@@ -3659,19 +3666,13 @@ impl DesktopApp {
         if dir.exists() {
             let _ = std::fs::remove_dir_all(&dir);
         }
-        if copy_dir_all(&template, &dir).is_ok() {
-            // The clone carries whatever name the template holds - canonical
-            // or legacy - so resolve inside the CLONED dir, never a bare join.
-            self.app.open_project(&tangent_ui::arrangement::doc_in(&dir));
-            if self.app.take_desk_reload() {
-                self.copy_states_from_project();
-                self.force_insert_reload();
-            }
-        } else {
-            // The clone failed — a full disk, a permission. Fall back to
-            // what the app did before rather than opening nothing.
-            self.app.bootstrap_project(&root);
-        }
+        self.app.adopt_template(&template, &dir);
+        // The template's own plugin states become the session's globals -
+        // and a template with no shelf CLEARS them, which is what a fresh
+        // session means.
+        self.copy_states_from_shelf(&template.join("state"));
+        self.force_insert_reload();
+        let _ = self.app.take_desk_reload();
     }
 
     /// What to do with a chosen folder, whichever picker chose it.
@@ -5192,36 +5193,34 @@ impl DesktopApp {
                     .and_then(std::path::Path::parent)
                     .map(|p| p == dir)
                     .unwrap_or(false);
-                // **A clean slate.** Reclaiming a folder must not keep the
-                // last scratch's clips, drumpad, media or plugin state — the
-                // template only overwrites the files it HAS, so `drumpad.json`
-                // and `state/` survived a bare copy and New inherited them.
+                // **The outgoing session is stashed FIRST** - unless it is
+                // the very folder being discarded, where a save-back would
+                // rewrite what New just agreed to clear.
+                if !discarding_current {
+                    self.save_plugin_states();
+                    self.copy_states_to_project();
+                    if self.app.project_dirty() {
+                        self.app.save_project_doc();
+                    }
+                }
+                // **A clean slate, and NOTHING new on disk** - the owner's
+                // "no creating folders called untitled PERIOD". A
+                // materialised leftover at the prospective name is cleared
+                // (its takes were counted and asked about above); then the
+                // template is adopted in memory, aimed at the folder that
+                // does not exist yet.
                 if dir.exists() {
                     let _ = std::fs::remove_dir_all(&dir);
                 }
-                if copy_dir_all(&template, &dir).is_err() {
-                    return;
-                }
-                let doc = tangent_ui::arrangement::doc_in(&dir);
-                if discarding_current {
-                    // **Do NOT save the session being discarded back over the
-                    // fresh template.** `switch_project` persists the current
-                    // doc first — into this same folder — which re-wrote the
-                    // very clips (and re-shelved the plugin states) New had
-                    // just cleared. Straight open, no save-back.
-                    self.app.open_project(&doc);
-                    if self.app.take_desk_reload() {
-                        self.copy_states_from_project();
-                        self.force_insert_reload();
-                    }
-                    self.track_cache.clear();
-                    self.stretch_cache.clear();
-                    self.pad_cache.clear();
-                    self.reload_clips();
-                    self.reload_pads();
-                } else {
-                    self.switch_project(&doc);
-                }
+                self.app.adopt_template(&template, &dir);
+                self.copy_states_from_shelf(&template.join("state"));
+                self.force_insert_reload();
+                let _ = self.app.take_desk_reload();
+                self.track_cache.clear();
+                self.stretch_cache.clear();
+                self.pad_cache.clear();
+                self.reload_clips();
+                self.reload_pads();
             }
         }
     }
@@ -5237,6 +5236,13 @@ impl DesktopApp {
         let Some(dir) = self.project_state_dir() else {
             return;
         };
+        // An UNMATERIALISED scratch has no folder and must not grow one
+        // for a state shelf alone - "no untitled folders PERIOD". The
+        // states still live in the global sidecars; a session worth
+        // keeping materialises through a real writer first.
+        if !dir.parent().is_some_and(std::path::Path::is_dir) {
+            return;
+        }
         let _ = std::fs::create_dir_all(&dir);
         // EVERY seat - the master's second rack and the folder-extra seats
         // were both invisible to the old STRIPS+1+DRUM_PADS bound, so a
@@ -5261,6 +5267,12 @@ impl DesktopApp {
         let Some(dir) = self.project_state_dir() else {
             return;
         };
+        self.copy_states_from_shelf(&dir);
+    }
+
+    /// The same copy, from ANY shelf - the template's, at launch and New,
+    /// where the session has no folder yet and must not grow one.
+    fn copy_states_from_shelf(&self, dir: &std::path::Path) {
         for strip in 0..tangent_ui::recorder::TOTAL_SEATS {
             for bay in 0..tangent_ui::recorder::INSERTS {
                 let global = insert_state_path(strip, bay);
@@ -5270,6 +5282,27 @@ impl DesktopApp {
                 } else {
                     let _ = std::fs::remove_file(&global);
                 }
+            }
+        }
+    }
+
+    /// **Clear the Untitled litter** - every stray scratch that provably
+    /// holds no work: no takes in media/, a stock kit, and a document that
+    /// is unnamed and clipless (or missing). Anything with a doubt stays.
+    fn sweep_disposable_untitleds(root: &std::path::Path, template: &std::path::Path) {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let dir = e.path();
+            let name = e.file_name().to_string_lossy().into_owned();
+            if !dir.is_dir() || !(name == "Untitled" || name.starts_with("Untitled ")) {
+                continue;
+            }
+            if count_media(&dir) == 0
+                && tangent_ui::app::TangentApp::scratch_is_disposable(&dir, template)
+            {
+                let _ = std::fs::remove_dir_all(&dir);
             }
         }
     }
