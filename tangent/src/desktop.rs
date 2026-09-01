@@ -7480,6 +7480,14 @@ impl DesktopApp {
             Caps::DESKTOP
         };
         let mut app = TangentApp::new(&cc.egui_ctx, settings, caps);
+        // **How much of the screen this desktop actually leaves a window.**
+        // Asked once, here, because it cannot be asked from `tangent-ui` at
+        // all: the answer is behind Win32 and AppKit and that crate is linked
+        // into a plugin. Without it the layout is sized against the RAW
+        // display and a laptop's taskbar eats the bottom band.
+        if let Some(f) = crate::display::usable_height_fraction() {
+            app.set_display_usable_fraction(f);
+        }
         // Said in the window as well as on stderr, which nobody sees. The
         // bay is empty and the owner has to know WHY, or the next thing they
         // do is load it again.

@@ -1218,7 +1218,20 @@ pub struct TangentApp {
     screen_sized: bool,
     /// The monitor width already written down this run, so the settings file
     /// is not saved every frame for a number that never changes.
-    monitor_saved: Option<i64>,
+    monitor_saved: Option<(i64, i64)>,
+    /// The last size sent to make the window fit its display, so the
+    /// correction is armed once per answer rather than every frame. See the
+    /// send site for why that distinction is the whole safety of it.
+    display_fit_sent: Option<Vec2>,
+    /// The share of the display's height a window may occupy, as the HOST
+    /// measured it: 1.0 until told otherwise, and 1.0 forever on a platform
+    /// that cannot answer. See `tangent::display`, which cannot live in this
+    /// crate — the shared crates may not reach the window server.
+    display_usable_fraction: f32,
+    /// This window's own frame overhead in points — outer height less inner
+    /// height, so a title bar counts and a borderless window's nothing does.
+    /// Measured every frame from the viewport; zero until one is reported.
+    window_chrome_h: f32,
     /// Which painted surface the keyboard is standing on, and which control.
     ///
     /// Set while a node laid over a panel holds egui's focus, and cleared the
@@ -2351,6 +2364,9 @@ impl TangentApp {
             pane_settled: None,
             screen_sized: false,
             monitor_saved: None,
+            display_fit_sent: None,
+            display_usable_fraction: 1.0,
+            window_chrome_h: 0.0,
             a11y_on: None,
             reader_was_detected: false,
             arr_auto_open: std::collections::HashSet::new(),
@@ -5939,7 +5955,10 @@ impl TangentApp {
         // now reopens wherever and however they last left it.
         self.settings.chord_window_detached = true;
         self.detach_window_visible = true;
-        self.detached_builder_size = self.settings.detached_size_for_use();
+        self.detached_builder_size = crate::settings::clamp_size_to_monitor(
+            self.settings.detached_size_for_use(),
+            self.monitor_size,
+        );
         self.detached_builder_pos = self.settings.detached_pos_for_use().map(|p| {
             crate::settings::clamp_to_monitor(p, self.detached_builder_size, self.monitor_size)
         });
@@ -5955,7 +5974,10 @@ impl TangentApp {
     fn detach_fretboard(&mut self) {
         self.settings.fretboard_detached = true;
         self.fret_window_visible = true;
-        self.fret_builder_size = self.settings.fretboard_win_size();
+        self.fret_builder_size = crate::settings::clamp_size_to_monitor(
+            self.settings.fretboard_win_size(),
+            self.monitor_size,
+        );
         self.fret_builder_pos = self.settings.fretboard_win_pos().map(|p| {
             crate::settings::clamp_to_monitor(p, self.fret_builder_size, self.monitor_size)
         });
@@ -5969,7 +5991,10 @@ impl TangentApp {
     fn detach_theory(&mut self) {
         self.settings.theory_detached = true;
         self.theory_window_visible = true;
-        self.theory_builder_size = self.settings.theory_win_size();
+        self.theory_builder_size = crate::settings::clamp_size_to_monitor(
+            self.settings.theory_win_size(),
+            self.monitor_size,
+        );
         self.theory_builder_pos = self.settings.theory_win_pos().map(|p| {
             crate::settings::clamp_to_monitor(p, self.theory_builder_size, self.monitor_size)
         });
@@ -5993,7 +6018,10 @@ impl TangentApp {
     fn detach_recorder(&mut self) {
         self.settings.recorder_detached = true;
         self.recorder_window_visible = true;
-        self.recorder_builder_size = self.settings.recorder_win_size();
+        self.recorder_builder_size = crate::settings::clamp_size_to_monitor(
+            self.settings.recorder_win_size(),
+            self.monitor_size,
+        );
         self.recorder_builder_pos = self.settings.recorder_win_pos().map(|p| {
             crate::settings::clamp_to_monitor(p, self.recorder_builder_size, self.monitor_size)
         });
@@ -13853,6 +13881,20 @@ impl TangentApp {
 
     /// **Which lane's kit the drumpad window shows.** Set when the window is
     /// opened from a lane, and clamped to a channel that exists.
+    /// **What the OS keeps of the display's height**, 0.5..=1.0, told by the
+    /// host once at startup.
+    ///
+    /// It has to come from outside: the answer lives behind Win32 and AppKit,
+    /// and this crate is linked into a plugin that may not reach the window
+    /// server (see `scripts/check-firewall.sh`). Out-of-band values are
+    /// ignored rather than clamped — a number that failed its own sanity
+    /// check upstream is not evidence about anything.
+    pub fn set_display_usable_fraction(&mut self, fraction: f32) {
+        if fraction.is_finite() && (0.5..=1.0).contains(&fraction) {
+            self.display_usable_fraction = fraction;
+        }
+    }
+
     pub fn set_drumpad_lane(&mut self, lane: usize) {
         if lane < self.drumpad_kits.len() {
             self.drumpad_lane = lane;
@@ -22949,7 +22991,70 @@ fn main_width(settings: &Settings) -> f32 {
         1300.0
     };
     let want = base * settings.window_size_percent as f64 / 100.0;
-    (want.trunc() as f32).max(crate::settings::MIN_WINDOW.x)
+    let want = (want.trunc() as f32).max(crate::settings::MIN_WINDOW.x);
+    // Never wider than the screen either. At 200% the share above is the
+    // monitor's whole width, and a window one point wider than the display
+    // is a window with a scroll bar's worth of itself in another county.
+    let want = if settings.monitor_width >= 320 {
+        want.min(settings.monitor_width as f32)
+    } else {
+        want
+    };
+    fit_width_to_display(settings, want)
+}
+
+/// **The widest this layout may be and still fit the screen it opens on.**
+///
+/// Every band's height is a fixed fraction of the window's WIDTH, so the
+/// layout is a one-parameter family: choose a width and the height is decided
+/// for you. For years nothing checked that decided height against anything.
+/// The result is the bug a tester met on a laptop — the window opens taller
+/// than the display, the bottom bands are under the taskbar, and no drag
+/// brings them back because the window is exactly as tall as the layout says
+/// it must be. On a first launch it was worse still: with no remembered
+/// monitor the width falls back to a flat 1300 points, which is wider than
+/// many laptop screens before the height is even considered.
+///
+/// So the width comes down until the stack fits. Height is monotonic in
+/// width, so a bisection finds the largest one that does — and because every
+/// band scales with the width, the same step is what makes the recorder, the
+/// piano and the strips the right size for a small screen rather than a
+/// scaled-down copy of a big one.
+///
+/// Returns `want` unchanged when nothing has been learned about the display
+/// yet: a guess would be worse than the size the user already has.
+pub fn fit_width_to_display(settings: &Settings, want: f32) -> f32 {
+    let usable = settings.monitor_usable_h;
+    if usable < 240 {
+        return want;
+    }
+    let usable = usable as f32;
+    if aspect_height_at(settings, want) <= usable {
+        return want;
+    }
+    // The floor is a real floor: below it the height stops obeying the width
+    // (`aspect_width_floor` documents why), so a screen too short for even
+    // that gets the floor rather than an unbounded shrink.
+    let floor = aspect_width_floor(settings).min(want);
+    if aspect_height_at(settings, floor) >= usable {
+        return floor;
+    }
+    let (mut lo, mut hi) = (floor, want);
+    // Twenty-four halvings settles a point-accurate answer over any width a
+    // display can have; the loop is bounded so a non-monotonic height curve
+    // could never spin here.
+    for _ in 0..24 {
+        let mid = ((lo + hi) * 0.5).trunc();
+        if mid <= lo || mid >= hi {
+            break;
+        }
+        if aspect_height_at(settings, mid) <= usable {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo.trunc().max(crate::settings::MIN_WINDOW.x)
 }
 
 /// What 100% is, as a share of the monitor's width. See [`main_width`].
@@ -23857,7 +23962,10 @@ impl TangentApp {
                 self.startup_fret_detach_at = None;
                 if self.settings.fretboard_detached && self.settings.show_fretboard {
                     self.fret_window_visible = true;
-                    self.fret_builder_size = self.settings.fretboard_win_size();
+                    self.fret_builder_size = crate::settings::clamp_size_to_monitor(
+            self.settings.fretboard_win_size(),
+            self.monitor_size,
+        );
                     self.fret_builder_pos = self.settings.fretboard_win_pos().map(|p| {
                         crate::settings::clamp_to_monitor(
                             p,
@@ -23877,7 +23985,10 @@ impl TangentApp {
                 self.startup_theory_detach_at = None;
                 if self.settings.theory_detached && self.settings.theory_views().any() {
                     self.theory_window_visible = true;
-                    self.theory_builder_size = self.settings.theory_win_size();
+                    self.theory_builder_size = crate::settings::clamp_size_to_monitor(
+            self.settings.theory_win_size(),
+            self.monitor_size,
+        );
                     self.theory_builder_pos = self.settings.theory_win_pos().map(|p| {
                         crate::settings::clamp_to_monitor(
                             p,
@@ -23899,7 +24010,10 @@ impl TangentApp {
                 self.startup_recorder_detach_at = None;
                 if self.settings.recorder_detached && self.settings.show_recorder {
                     self.recorder_window_visible = true;
-                    self.recorder_builder_size = self.settings.recorder_win_size();
+                    self.recorder_builder_size = crate::settings::clamp_size_to_monitor(
+            self.settings.recorder_win_size(),
+            self.monitor_size,
+        );
                     self.recorder_builder_pos = self.settings.recorder_win_pos().map(|p| {
                         crate::settings::clamp_to_monitor(
                             p,
@@ -23921,7 +24035,10 @@ impl TangentApp {
                 self.startup_detach_at = None;
                 if self.settings.chord_window_detached && self.settings.chord_detection_enabled {
                     self.detach_window_visible = true;
-                    self.detached_builder_size = self.settings.detached_size_for_use();
+                    self.detached_builder_size = crate::settings::clamp_size_to_monitor(
+            self.settings.detached_size_for_use(),
+            self.monitor_size,
+        );
                     self.detached_builder_pos = self.settings.detached_pos_for_use().map(|p| {
                         crate::settings::clamp_to_monitor(
                             p,
@@ -24314,21 +24431,90 @@ impl TangentApp {
         // re-maximize below each answer to exactly one of them.
         self.fullscreen_now = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
         self.maximized_now = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-        let monitor = monitor.map(|m| m.x);
-        // **Learn the monitor's width, once.** The percentages are shares of
-        // it now (see `main_width`), and the very first window of a launch is
+        // **This window's own frame, measured rather than assumed.** A title
+        // bar is a different height on every platform, theme and scale, and a
+        // borderless window has none — so the one honest number is the
+        // difference between what the OS drew and what we were given to draw
+        // in. Kept from the last good reading when a viewport reports neither.
+        self.window_chrome_h = ctx.input(|i| {
+            match (i.viewport().outer_rect, i.viewport().inner_rect) {
+                (Some(outer), Some(inner)) => (outer.height() - inner.height()).max(0.0),
+                _ => self.window_chrome_h,
+            }
+        });
+        // **Learn the monitor, once.** The percentages are shares of its
+        // width (see `main_width`), and the very first window of a launch is
         // built before any monitor can be enumerated — so what this run
         // measures is what the NEXT one opens at.
+        //
+        // The USABLE HEIGHT is learned in the same breath and matters more.
+        // `monitor_size` is the raw display: a taskbar or a Dock stands in
+        // front of some of it, and this window wears a title bar on top of
+        // that. Both come off here, so `fit_width_to_display` is comparing
+        // the layout against ground a window can really stand on.
         if self.caps.window_sizing {
-            if let Some(w) = monitor.filter(|w| (320.0..=32_768.0).contains(w)) {
-                let w = w.round() as i64;
-                if self.monitor_saved != Some(w) && self.settings.monitor_width != w {
+            if let Some(m) = monitor.filter(|m| (320.0..=32_768.0).contains(&m.x)) {
+                let w = m.x.round() as i64;
+                // What the OS keeps, measured by the host (`display.rs`) —
+                // 1.0 when nothing could be measured, which leaves the
+                // height honest rather than guessed at.
+                let os_keeps = self.display_usable_fraction.clamp(0.5, 1.0);
+                // And what this window's own frame costs. Measured rather
+                // than assumed: a title bar is a different height on every
+                // platform, theme and scale, and borderless has none at all.
+                let chrome = self.window_chrome_h.clamp(0.0, 200.0);
+                let usable = (m.y * os_keeps - chrome).round() as i64;
+                let usable = if (240..=32_768).contains(&usable) {
+                    usable
+                } else {
+                    0
+                };
+                let changed = self.monitor_saved != Some((w, usable))
+                    && (self.settings.monitor_width != w
+                        || (usable > 0 && self.settings.monitor_usable_h != usable));
+                if changed {
                     self.settings.monitor_width = w;
-                    self.monitor_saved = Some(w);
+                    if usable > 0 {
+                        self.settings.monitor_usable_h = usable;
+                    }
+                    self.monitor_saved = Some((w, usable));
                     self.save_settings();
                 }
             }
         }
+        // **And if this window is already too tall for this screen, fix it
+        // NOW** rather than next launch.
+        //
+        // The remembered size is whatever the window was last dragged to,
+        // which may have been on a bigger display — carry a laptop to a
+        // meeting, or open a session made on a desktop, and the bottom bands
+        // are under the taskbar with no drag that brings them back, because
+        // the window is exactly as tall as the layout says it must be.
+        //
+        // **Once per target, never every frame.** Re-sending a size sixty
+        // times a second is how a window fights a tiling manager, a fight
+        // this app has already lost once (`wm_overrode_size`). The send is
+        // armed only when the fitted answer CHANGES, and is skipped entirely
+        // while something else owns the geometry: full screen and maximised
+        // are the user's own gestures, and a managed window is the tiler's.
+        if self.caps.window_sizing
+            && !self.fullscreen_now
+            && !self.maximized_now
+            && !self.main_wm_managed
+        {
+            if let Some(pane) = pane_now {
+                let fitted = fit_width_to_display(&self.settings, pane.x.max(1.0).trunc());
+                if fitted < pane.x - 0.5 {
+                    let want = Vec2::new(fitted, aspect_height_at(&self.settings, fitted));
+                    if self.display_fit_sent != Some(want) {
+                        self.display_fit_sent = Some(want);
+                        self.inner_size_sends += 1;
+                        ctx.send_viewport_cmd(ViewportCommand::InnerSize(want));
+                    }
+                }
+            }
+        }
+        let monitor = monitor.map(|m| m.x);
         let filling = self.caps.window_sizing && {
             let natural = band_sizes_at(&self.settings, pane.x.max(1.0).trunc());
             let fixed = natural.recorder_h
@@ -38269,6 +38455,110 @@ mod fullscreen_proportion_tests {
 #[cfg(test)]
 mod aspect_snap_tests {
     use super::*;
+
+    /// **The layout is made to fit the screen, not the other way round.**
+    ///
+    /// Every band's height is a fraction of the window's WIDTH, so the height
+    /// is decided by the width and for years was compared against nothing. A
+    /// tester opened Tangent on a laptop and got a window taller than the
+    /// display with its bottom bands under the taskbar — unreachable, because
+    /// the window was exactly as tall as the layout demanded.
+    #[test]
+    fn the_window_narrows_until_its_height_fits_the_display() {
+        // A working layout rather than the bare default: the bug is about a
+        // TALL stack of bands, and the stock settings show almost none of
+        // them. This is the shape a tester actually had on screen.
+        let mut s = Settings::default();
+        s.show_piano = true;
+        s.show_fretboard = true;
+        s.show_chord_strip = true;
+        s.show_recorder = true;
+
+        // Nothing learned about the display yet: the width is left alone,
+        // because a guess would be worse than what the user already has.
+        s.monitor_usable_h = 0;
+        assert_eq!(fit_width_to_display(&s, 1300.0), 1300.0);
+
+        // A display with room to spare changes nothing either.
+        let tall = aspect_height_at(&s, 1300.0);
+        s.monitor_usable_h = (tall + 400.0) as i64;
+        assert_eq!(fit_width_to_display(&s, 1300.0), 1300.0);
+
+        // **A laptop.** Less height than the layout wanted, so the width must
+        // come down — and the result must actually FIT, which is the whole
+        // claim. Not merely smaller: fitting.
+        //
+        // The squeeze stays above the height floor on purpose. Below that no
+        // width fits at all, because the layout has a minimum height of its
+        // own, and the honest answer there is the floor — asserted separately
+        // further down.
+        let floor_h = aspect_height_at(&s, aspect_width_floor(&s));
+        let usable = (tall * 0.75).round().max(floor_h + 10.0);
+        s.monitor_usable_h = usable as i64;
+        let fitted = fit_width_to_display(&s, 1300.0);
+        assert!(fitted < 1300.0, "the width did not come down at all");
+        assert!(
+            aspect_height_at(&s, fitted) <= usable,
+            "fitted to {fitted} wide, which is {} tall, on {usable} of screen",
+            aspect_height_at(&s, fitted)
+        );
+        // And it is the LARGEST such width: one point wider must not fit, or
+        // the window is smaller than it needed to be.
+        assert!(
+            aspect_height_at(&s, fitted + 1.0) > usable || fitted + 1.0 > 1300.0,
+            "a wider window would also have fitted"
+        );
+
+        // **A screen too short for the layout's own minimum** gets the
+        // narrowest legal window rather than an unbounded shrink: below the
+        // floor the height stops following the width at all, so there is
+        // nothing left to trade.
+        s.monitor_usable_h = 240;
+        let squeezed = fit_width_to_display(&s, 1300.0);
+        assert_eq!(
+            squeezed,
+            aspect_width_floor(&s).min(1300.0),
+            "a screen under the floor did not get the floor"
+        );
+        assert!(
+            squeezed >= crate::settings::MIN_WINDOW.x,
+            "squeezed below the floor: {squeezed}"
+        );
+
+        // Idempotent: fitting an already-fitted width is a no-op, which is
+        // what stops the first-frame correction from resizing every frame.
+        s.monitor_usable_h = usable as i64;
+        assert_eq!(fit_width_to_display(&s, fitted), fitted);
+    }
+
+    /// The percentage is a share of the monitor's WIDTH, and was never once
+    /// compared against its height — so on a first launch, with no monitor
+    /// remembered at all, the width fell back to a flat 1300 points. That is
+    /// wider than many laptop screens before the height is even considered,
+    /// and it is what a first-time tester meets.
+    #[test]
+    fn a_first_launch_on_a_small_laptop_still_fits() {
+        let mut s = Settings::default();
+        s.show_piano = true;
+        s.show_fretboard = true;
+        s.show_chord_strip = true;
+        s.show_recorder = true;
+        // A 1280x720 laptop, minus a taskbar and a title bar.
+        s.monitor_width = 1280;
+        s.monitor_usable_h = 648;
+        s.window_size_percent = 100;
+        let size = initial_window_size(&s);
+        assert!(
+            size.y <= 648.0,
+            "the window opens {} tall on 648 of usable screen",
+            size.y
+        );
+        assert!(
+            size.x <= 1280.0,
+            "the window opens {} wide on a 1280 screen",
+            size.x
+        );
+    }
 
     /// **A tiler latches; an ordinary desktop does not.**
     ///
