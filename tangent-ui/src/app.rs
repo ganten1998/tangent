@@ -4790,7 +4790,6 @@ impl TangentApp {
                 },
             }),
             any_solo: desk.any_solo(),
-            screen_filling: self.fullscreen_now || self.maximized_now,
             active: self.active_channels(),
             visible: self.mixer_visible(),
             scroll_px: self.mixer_scroll_px,
@@ -33517,6 +33516,55 @@ mod tests {
     /// **The note button is a channel's alone.** A folder cannot carry its
     /// own MIDI - the owner's capitals - so its strip lays out no theory
     /// button; a plain track's sits at the foot, left edge on the inserts'.
+    /// **If the desk folds, a folded strip is a WHOLE strip.**
+    ///
+    /// The sixteen-over-sixteen fold used to be gated on the window being
+    /// fullscreen or maximised, and the height test beside it was set at less
+    /// than half what a strip needs — the flag was doing all the work. That
+    /// flag is never set on macOS (egui #3494), so the fold could not happen
+    /// there at all; on Windows it IS set for a laptop maximised against a
+    /// taskbar, which is how a tester got sixteen over sixteen in a band with
+    /// no room for them. The flag is gone and the height is the whole test,
+    /// so the height has to be true.
+    ///
+    /// The note button is the canary: it is the last thing laid out and it
+    /// sheds silently when the seven points under the switch row are not
+    /// there. If a strip's furniture ever grows, this fails and
+    /// `TWO_ROW_MIN_H` gets measured again.
+    #[test]
+    fn a_folded_strip_keeps_every_control() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        for n in 0..3 {
+            app.add_bare_track(n);
+        }
+        let view = app.mixer_view();
+        let folded_at = |h: f32| {
+            let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, h));
+            let l = crate::mixer_panel::Layout::new(r, &view);
+            // Two rows means channel 0 and the channel a half-desk later sit
+            // at different tops; one row means every channel shares one.
+            let half = view.active.div_ceil(2);
+            let folded = l.strips[half].panel.is_positive()
+                && (l.strips[half].panel.top() - l.strips[0].panel.top()).abs() > 1.0;
+            (folded, l.strips[0].theory.is_positive())
+        };
+
+        // Just under the threshold: one scrolling row, which is the right
+        // answer for a laptop and was NOT what a maximised one got.
+        let (folded, _) = folded_at(crate::mixer_panel::two_row_min_h() * 2.0);
+        assert!(!folded, "the desk folded into rows too short for a strip");
+
+        // Comfortably over it: the fold happens, and every strip in it is
+        // still a whole strip.
+        let tall = crate::mixer_panel::two_row_min_h() * 2.0 + 40.0;
+        let (folded, whole) = folded_at(tall);
+        assert!(folded, "a desk with the room for two rows stayed on one");
+        assert!(
+            whole,
+            "a folded strip lost its note button: the fold threshold is a lie"
+        );
+    }
+
     #[test]
     fn the_note_button_sits_on_tracks_and_never_on_folders() {
         let (_ctx, mut app) = headless(Caps::DESKTOP);
