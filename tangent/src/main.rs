@@ -11,6 +11,10 @@
 #[cfg(feature = "recorder")]
 mod composite;
 mod desktop;
+/// How much of the screen the OS leaves for a window. One number, asked of
+/// the platform, so the layout can be made to FIT a laptop rather than run
+/// off the bottom of it.
+mod display;
 /// Two AppKit facts winit does not surface, and the hook that lets the OS
 /// keep this aspect-locked layout on its curve DURING a drag. A target gate,
 /// not a feature gate — the convention against `#[cfg(feature)]` outside this

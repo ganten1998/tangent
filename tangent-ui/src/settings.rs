@@ -554,6 +554,21 @@ pub struct Settings {
     /// changed since gets one launch at the old scale and is right from then
     /// on, which is the same bargain the remembered window position makes.
     pub monitor_width: i64,
+    /// **The USABLE height of that monitor**, in points: the screen minus
+    /// whatever the OS keeps for itself (a taskbar, a Dock, a menu bar) and
+    /// minus the window's own title bar. Zero until a window has existed long
+    /// enough to ask.
+    ///
+    /// Remembered for the same reason the width is, and it matters more. Every
+    /// band's height is a fraction of the window's WIDTH, so the layout is a
+    /// one-parameter family and its height is whatever that parameter implies
+    /// — which for years was checked against nothing at all. On a laptop the
+    /// stack of bands runs off the bottom of the screen, the transport and the
+    /// recorder go with it, and no amount of dragging brings them back because
+    /// the window is already as tall as the layout says it must be.
+    ///
+    /// See `app::fit_width_to_display`, which is the only reader.
+    pub monitor_usable_h: i64,
     pub borderless_mode: bool,
     pub chord_window_detached: bool,
     pub detached_chord_height: i64,
@@ -1469,6 +1484,7 @@ impl Default for Settings {
             show_fret_note_names: false,
             window_size_percent: 100,
             monitor_width: 0,
+            monitor_usable_h: 0,
             borderless_mode: false,
             chord_window_detached: false,
             detached_chord_height: 50,
@@ -2204,6 +2220,12 @@ impl Settings {
             // A stored width outside anything a display has is a file to
             // ignore rather than a window to open off-screen.
             s.monitor_width = if (320..=32_768).contains(&n) { n } else { 0 };
+        }
+        if let Some(n) = map.shift_remove("monitor_usable_h").and_then(|v| v.as_i64()) {
+            // Same guard, same reason: a height from a file that has been
+            // hand-edited or carried off another machine must not be able to
+            // pin the window to a hundred points.
+            s.monitor_usable_h = if (240..=32_768).contains(&n) { n } else { 0 };
         }
         if let Some(v) = map.shift_remove("window_size_percent") {
             if let Some(n) = v.as_i64() {
@@ -4075,6 +4097,12 @@ impl Settings {
                 );
             }
         }
+        if self.monitor_usable_h > 0 {
+            map.insert(
+                "monitor_usable_h".into(),
+                Value::from(self.monitor_usable_h),
+            );
+        }
         if self.monitor_width > 0 {
             map.insert("monitor_width".into(), Value::from(self.monitor_width));
         }
@@ -5017,6 +5045,30 @@ pub const ASPECT_SNAP: bool = false;
 /// Keep a window fully on the monitor it is being placed on. A remembered
 /// position is worthless if the monitor it referred to is gone, which is the
 /// normal state of affairs for anyone who ever undocks a laptop.
+/// **A window no bigger than the screen it opens on.**
+///
+/// The sibling of [`clamp_to_monitor`], which places a window and assumes its
+/// size is sane. A remembered size is not: detach a panel on a desktop, carry
+/// the laptop to a meeting, and the window that reopens is the one the desktop
+/// could hold. The position clamp then pins its top-left on screen and the
+/// rest of it hangs off the bottom, which is the same failure the main
+/// window had.
+///
+/// A small reserve comes off both edges so the window lands INSIDE the screen
+/// rather than exactly filling it — a window flush to every edge has no
+/// title bar left to grab.
+pub fn clamp_size_to_monitor(size: egui::Vec2, monitor: Option<egui::Vec2>) -> egui::Vec2 {
+    let Some(m) = monitor else { return size };
+    if m.x <= 0.0 || m.y <= 0.0 {
+        return size;
+    }
+    const RESERVE: f32 = 48.0;
+    egui::Vec2::new(
+        size.x.min((m.x - RESERVE).max(240.0)),
+        size.y.min((m.y - RESERVE).max(160.0)),
+    )
+}
+
 pub fn clamp_to_monitor(
     pos: egui::Pos2,
     size: egui::Vec2,
@@ -6674,6 +6726,19 @@ mod tests {
             clamp_to_monitor(egui::Pos2::new(-800.0, -600.0), size, mon),
             egui::Pos2::ZERO
         );
+        // **And a window bigger than the screen comes down to it.** A size
+        // remembered from a desktop arrives on a laptop in the same file;
+        // clamping only the POSITION pins its corner on screen and lets the
+        // rest hang off the bottom.
+        let huge = egui::Vec2::new(3000.0, 2000.0);
+        let fitted = clamp_size_to_monitor(huge, mon);
+        assert!(fitted.x < mon.unwrap().x, "width not brought in: {fitted:?}");
+        assert!(fitted.y < mon.unwrap().y, "height not brought in: {fitted:?}");
+        // A window that already fits is not touched at all.
+        let small = egui::Vec2::new(400.0, 300.0);
+        assert_eq!(clamp_size_to_monitor(small, mon), small);
+        // No monitor, no opinion.
+        assert_eq!(clamp_size_to_monitor(huge, None), huge);
         // Already on screen: untouched.
         assert_eq!(
             clamp_to_monitor(egui::Pos2::new(100.0, 80.0), size, mon),
