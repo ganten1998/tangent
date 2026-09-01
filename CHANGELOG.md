@@ -77,6 +77,53 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **The window no longer opens bigger than the screen it opens on.** Every
+  band's height in Tangent is a fixed fraction of the window's width, so the
+  layout is a one-parameter family - choose a width and the height is decided
+  for you - and until now nothing compared that decided height to the display.
+  On a laptop the stack ran off the bottom: the transport and the recorder sat
+  under the taskbar, and no drag brought them back, because the window was
+  exactly as tall as the layout said it had to be. On a FIRST launch it was
+  worse, since with no monitor remembered yet the width fell back to a flat
+  1300 points, which is wider than many laptop screens before the height is
+  even considered.
+
+  Tangent now learns how much of the display the OS actually leaves a window -
+  the taskbar on Windows, the Dock and menu bar on macOS, and this window's own
+  title bar, all measured rather than assumed - and narrows the layout until
+  the whole stack fits. A window that is already too big for the screen it
+  finds itself on is corrected on the first frame, so carrying a laptop to a
+  smaller display, or opening a session built on a desktop, no longer hides
+  the bottom of the app. Because every band scales with the width, the same
+  step is what makes the recorder, the piano and the strips the right size for
+  a small screen rather than a big layout with its feet cut off.
+
+  Detached panels get the same treatment: a chord, fretboard, theory or
+  recorder window whose remembered size came from a bigger display is brought
+  down to the screen it actually opens on, rather than having its top-left
+  corner pinned on screen and the rest of it hanging off the bottom.
+
+- **"Default" is now a sample rate you can rely on.** It used to mean "let each
+  stream open at its own device's rate", and on a machine whose microphone and
+  output disagree - most Windows laptops, a 44.1 kHz webcam mic against a
+  48 kHz output - that is two clocks: the writer drains the instrument's ring
+  at the input's rate while the engine fills it at the output's, and the take
+  drifts. The app could only warn about it. Default now resolves to ONE rate
+  before either half opens, taken from the output device, and the input is
+  asked for it explicitly; a device that genuinely cannot reach it still falls
+  back exactly as before. Nobody should have to discover that the setting
+  named Default is the one that cannot be trusted.
+
+- **The mixer's sixteen-over-sixteen fold answers to the space it has**, on
+  every platform, instead of to a window flag. The fold was gated on the
+  window being fullscreen or maximised, which is never reported on macOS
+  (egui #3494) - so the fold was unreachable there however large the display -
+  and IS reported for a laptop maximised against a taskbar, where it folded
+  into two rows with no room for either. The height test beside that flag was
+  set at less than half of what a strip needs, so it was the flag doing all
+  the work. The flag is gone, the threshold has been measured against a real
+  strip, and a test fails if a folded strip ever loses a control.
+
 - **A drum track built before kits were per-lane opened silent.** A project
   whose drumpad sat on any channel but the first handed its one saved kit to
   channel 0 - often a piano track, where nothing strikes a pad - and the drum
