@@ -289,6 +289,28 @@ cpal = { version = "0.16", features = ["jack"] }
 # user and their first sound.
 [target.'cfg(target_os = "freebsd")'.dependencies]
 cpal = { version = "0.16", features = ["jack"] }
+# **The camera, and it is the Linux backend unmodified.**
+#
+# `webcamd` ports the Linux UVC driver into userspace and exposes it through
+# CUSE as `/dev/video*`, so what is behind the node is the same `uvcvideo`
+# talking the same V4L2 ABI — `QUERYCAP` on this laptop answers
+# `driver="uvcvideo"`. The one thing that could have made the numbers differ is
+# the ioctl encoding, since FreeBSD packs the direction in 3 bits over a 13-bit
+# size where Linux uses 2 over 14, and `_IOR`/`_IOW` are SWAPPED between them.
+# `uoctl` — which is where `linuxvideo`'s constants actually come from — already
+# carries `platform/bsd.rs` and cfg-selects it for `target_os = "freebsd"`, so
+# the constants come out right with no patch: `VIDIOC_QUERYCAP` compiles to
+# 0x40685600 here, which is byte for byte what `truss` shows ffmpeg sending.
+#
+# So this is the same `vendor/linuxvideo` the Linux block pins, for the same
+# reasons, and `camera/linux.rs` is shared rather than copied. See that file for
+# the two places FreeBSD diverges (node enumeration, and no VA-API).
+linuxvideo = { path = "vendor/linuxvideo" }
+# MJPEG, exactly as on Linux — a UVC camera that offers 720p at 30 fps offers it
+# compressed, and without a decoder the picker silently caps at VGA. There is no
+# VA-API half on FreeBSD, so this is the only decoder here rather than the
+# fallback one.
+zune-jpeg = "0.5"
 
 [lints]
 workspace = true

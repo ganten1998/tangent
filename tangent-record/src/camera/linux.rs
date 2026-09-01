@@ -122,8 +122,19 @@ struct Offer {
     fract: Fract,
 }
 
-/// Every capture-capable device, sorted by node path for a stable order.
-fn capture_nodes() -> Result<Vec<(PathBuf, Device)>, CameraError> {
+/// Every node that opened, paired with the path it was opened from.
+///
+/// Split out because this is the ONE thing V4L2 cannot do portably.
+/// `linuxvideo::list()` hands back open [`Device`]s and drops the name it
+/// opened them with, so the path has to be recovered afterwards from
+/// `/proc/self/fd/N` — and FreeBSD's procfs has no `fd` directory at all
+/// (`/proc/self` there is `cmdline`, `dbregs`, `etype`, `exe`, `map`, `mem`,
+/// ...). The crate says so itself, in the doc comment on `Device::path`.
+///
+/// So FreeBSD walks `/dev` itself and keeps the path it already had. That is
+/// the same walk `list()` does internally, minus the discard.
+#[cfg(target_os = "linux")]
+fn open_nodes() -> Result<Vec<(PathBuf, Device)>, CameraError> {
     let iter = match linuxvideo::list() {
         Ok(iter) => iter,
         // No /dev/video* at all commonly surfaces as NotFound here; that is
@@ -131,15 +142,51 @@ fn capture_nodes() -> Result<Vec<(PathBuf, Device)>, CameraError> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(CameraError::Enumeration(e.to_string())),
     };
-    let mut nodes = Vec::new();
-    let mut denied: Option<PathBuf> = None;
+    let mut open = Vec::new();
     for dev in iter {
         let Ok(dev) = dev else {
-            // A node that cannot be opened. Remember a permission denial so
-            // that "every camera exists but none is readable" can say why.
+            // A node that cannot be opened. The EACCES pass below names it.
             continue;
         };
         let Ok(path) = dev.path() else { continue };
+        open.push((path, dev));
+    }
+    Ok(open)
+}
+
+#[cfg(target_os = "freebsd")]
+fn open_nodes() -> Result<Vec<(PathBuf, Device)>, CameraError> {
+    let dir = match std::fs::read_dir("/dev") {
+        Ok(dir) => dir,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(CameraError::Enumeration(e.to_string())),
+    };
+    let mut open = Vec::new();
+    for entry in dir.flatten() {
+        // `video*` only. `webcamd` also publishes the metadata node as
+        // `/dev/video1`, but that answers QUERYCAP without VIDEO_CAPTURE and
+        // the shared filter below drops it.
+        if !entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with("video"))
+        {
+            continue;
+        }
+        let path = entry.path();
+        // A node that cannot be opened. The EACCES pass below names it.
+        if let Ok(dev) = Device::open(&path) {
+            open.push((path, dev));
+        }
+    }
+    Ok(open)
+}
+
+/// Every capture-capable device, sorted by node path for a stable order.
+fn capture_nodes() -> Result<Vec<(PathBuf, Device)>, CameraError> {
+    let mut nodes = Vec::new();
+    let mut denied: Option<PathBuf> = None;
+    for (path, dev) in open_nodes()? {
         match dev.capabilities() {
             Ok(caps)
                 if caps
@@ -151,8 +198,8 @@ fn capture_nodes() -> Result<Vec<(PathBuf, Device)>, CameraError> {
             _ => {}
         }
     }
-    // A second pass for the EACCES case: `linuxvideo::list` swallows the open
-    // error per node, so re-open one video node directly to name the failure.
+    // A second pass for the EACCES case: `open_nodes` swallows the open error
+    // per node, so re-open one video node directly to name the failure.
     if nodes.is_empty() {
         for i in 0..4 {
             let path = PathBuf::from(format!("/dev/video{i}"));
@@ -166,9 +213,18 @@ fn capture_nodes() -> Result<Vec<(PathBuf, Device)>, CameraError> {
         }
     }
     if let Some(path) = denied {
+        // The group differs, and so does the command to join it: on FreeBSD the
+        // nodes are CUSE devices owned by `webcamd`, not kernel nodes owned by
+        // `video`, so the Linux sentence would send the user to a group that
+        // does not exist on their machine.
+        #[cfg(target_os = "linux")]
+        let fix = "add your user to the 'video' group \
+                   (usermod -aG video $USER, then log out and back in)";
+        #[cfg(target_os = "freebsd")]
+        let fix = "add your user to the 'webcamd' group \
+                   (pw groupmod webcamd -m $USER, then log out and back in)";
         return Err(CameraError::Enumeration(format!(
-            "no permission to read {} - add your user to the 'video' group \
-             (usermod -aG video $USER, then log out and back in)",
+            "no permission to read {} - {fix}",
             path.display()
         )));
     }
@@ -540,12 +596,21 @@ fn capture_loop(
 /// machines have and some do not, so it is strictly an ACCELERATOR: when it is
 /// missing, or when it declines a particular frame, `zune-jpeg` runs and the
 /// only difference is the cost.
+///
+/// FreeBSD has the software half only. `vaapi.rs` is `cfg(target_os = "linux")`
+/// at the seam, and there is no case for widening it on the strength of an
+/// untested `dlopen`: the accelerator is an optimisation, its absence costs
+/// only CPU, and a decoder that has never been run against a FreeBSD VA-API
+/// driver is a claim rather than a feature. `zune-jpeg` is pure Rust and runs
+/// here unchanged.
 enum MjpegDecoder {
+    #[cfg(target_os = "linux")]
     Hardware(super::vaapi::Decoder),
     Software,
 }
 
 impl MjpegDecoder {
+    #[cfg(target_os = "linux")]
     fn new(width: u32, height: u32, sample: &[u8]) -> Self {
         match super::vaapi::Decoder::new(width, height, sample) {
             Some(d) => MjpegDecoder::Hardware(d),
@@ -553,11 +618,17 @@ impl MjpegDecoder {
         }
     }
 
+    #[cfg(target_os = "freebsd")]
+    fn new(_width: u32, _height: u32, _sample: &[u8]) -> Self {
+        MjpegDecoder::Software
+    }
+
     fn decode(&mut self, bytes: &[u8], width: u32, height: u32, dst: &mut Vec<u8>) -> bool {
         match self {
             // A frame the hardware declines — a sampling it cannot express, a
             // truncated frame, a transient driver error — costs a software
             // decode rather than the frame itself.
+            #[cfg(target_os = "linux")]
             MjpegDecoder::Hardware(d) => {
                 d.decode(bytes, width, height, dst) || decode_mjpg(bytes, width, height, dst)
             }
