@@ -556,7 +556,60 @@ fn shrink_icon_for_x11(icon: egui::IconData) -> egui::IconData {
     /// Comfortably inside every limit: 128×128 is 65 544 bytes, under even
     /// the 262 140-byte classic maximum that applies without BIG-REQUESTS.
     const MAX_EDGE: u32 = 128;
-    if icon.width <= MAX_EDGE && icon.height <= MAX_EDGE {
+    shrink_icon_to(icon, MAX_EDGE)
+}
+
+/// **The runtime icon, put on Apple's grid.**
+///
+/// macOS is the one platform where the icon handed to the window system is
+/// not a window icon at all: eframe passes it to `setApplicationIconImage_`,
+/// so it becomes the DOCK TILE of the running app and overrides the bundle's
+/// own `.icns` for as long as Tangent is open. That is why a correctly padded
+/// bundle icon and a Dock icon that is visibly too big are not a
+/// contradiction, why rebuilding never fixed it, and why clearing the icon
+/// caches never fixed it either: the running app was setting it, every launch.
+///
+/// `build-macos.sh` pads the same artwork to 80.5% of its canvas when it makes
+/// the `.icns`, because Apple's grid puts a squircle at 824 of 1024 and
+/// full-bleed art renders LARGER than every neighbour. This is that step, for
+/// the other path, from the same constant.
+///
+/// The CANVAS grows rather than the art shrinking: no resampling, so the
+/// hairline lattice arrives exactly as drawn.
+#[cfg(target_os = "macos")]
+fn pad_icon_for_dock(icon: egui::IconData) -> egui::IconData {
+    /// The share of the canvas Apple's grid gives the art. `build-macos.sh`
+    /// uses the same number; changing one without the other puts the running
+    /// app's icon a size away from its own bundle's.
+    const ART_FRACTION: f32 = 0.805;
+    let (w, h) = (icon.width as usize, icon.height as usize);
+    if w == 0 || h == 0 || icon.rgba.len() != w * h * 4 {
+        return icon;
+    }
+    let grow = |n: usize| ((n as f32) * (1.0 / ART_FRACTION - 1.0) / 2.0).round() as usize;
+    let (mx, my) = (grow(w), grow(h));
+    if mx == 0 && my == 0 {
+        return icon;
+    }
+    let (nw, nh) = (w + mx * 2, h + my * 2);
+    // Transparent, which is what the corners of a squircle are.
+    let mut out = vec![0u8; nw * nh * 4];
+    for y in 0..h {
+        let src = y * w * 4;
+        let dst = ((y + my) * nw + mx) * 4;
+        out[dst..dst + w * 4].copy_from_slice(&icon.rgba[src..src + w * 4]);
+    }
+    egui::IconData {
+        rgba: out,
+        width: nw as u32,
+        height: nh as u32,
+    }
+}
+
+/// The scaler both of the above stand on: longest edge to `max_edge`, the
+/// other keeping its proportion.
+fn shrink_icon_to(icon: egui::IconData, max_edge: u32) -> egui::IconData {
+    if icon.width <= max_edge && icon.height <= max_edge {
         return icon;
     }
     let (w, h) = (icon.width as usize, icon.height as usize);
@@ -574,9 +627,9 @@ fn shrink_icon_for_x11(icon: egui::IconData) -> egui::IconData {
     // through the same door. `_NET_WM_ICON` carries width and height, so a
     // non-square icon is perfectly legal and there is nothing to gain by lying.
     let (dw, dh) = if w >= h {
-        (MAX_EDGE as usize, ((h * MAX_EDGE as usize) / w).max(1))
+        (max_edge as usize, ((h * max_edge as usize) / w).max(1))
     } else {
-        (((w * MAX_EDGE as usize) / h).max(1), MAX_EDGE as usize)
+        (((w * max_edge as usize) / h).max(1), max_edge as usize)
     };
     // A box filter over the source cell each destination pixel covers.
     // Written out rather than pulled from `image`, which is a transitive
@@ -738,7 +791,18 @@ fn main() {
     // asset above already fits; this is what stops the next oversized one from
     // taking the window system down with it. See the note on that function.
     match eframe::icon_data::from_png_bytes(icon_png) {
-        Ok(icon) => viewport = viewport.with_icon(shrink_icon_for_x11(icon)),
+        Ok(icon) => {
+            // **macOS takes a different road on purpose.** There the icon
+            // becomes the Dock tile of the running app, so it wants Apple's
+            // padding and a resolution a Retina Dock can use — 128 px, the
+            // X11 ceiling, is upscaled twice over on the tile and reads soft.
+            // Everywhere else the X11 guard is the only thing that matters.
+            #[cfg(target_os = "macos")]
+            let icon = pad_icon_for_dock(shrink_icon_to(icon, 512));
+            #[cfg(not(target_os = "macos"))]
+            let icon = shrink_icon_for_x11(icon);
+            viewport = viewport.with_icon(icon);
+        }
         Err(err) => eprintln!("could not decode the app icon: {err}"),
     }
 
