@@ -43,6 +43,10 @@ mod keys;
 /// Reverb and delay, on everything the app plays.
 #[cfg(feature = "recorder")]
 mod effects;
+/// Standalone DSP kernels for the coming plugin suite. Proven here, alone —
+/// nothing reaches them from any panel yet, deliberately. Not inside
+/// `recorder`: they touch no device, no engine and no other crate.
+mod units;
 /// Loudness to BS.1770-4, for the ladder beside the master. Inside
 /// `recorder` because the only thing that feeds it is the engine's output.
 #[cfg(feature = "recorder")]
