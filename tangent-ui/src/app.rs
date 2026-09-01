@@ -1728,6 +1728,45 @@ fn copy_into_media(doc: &std::path::Path, src: &std::path::Path) -> Option<Strin
     Some(format!("media/{chosen}"))
 }
 
+/// **The same thing, for audio that arrives as bytes rather than as a path.**
+///
+/// A shared kit carries its samples inside it, so there is no source file to
+/// copy from — but everything downstream of the copy must be identical, or a
+/// kit loaded from a `.tgkit` would land somewhere a dragged file would not.
+/// Same media folder, same naming, same de-duplication by length.
+fn write_into_media(doc: &std::path::Path, name: &str, bytes: &[u8]) -> Option<String> {
+    let media = doc.parent()?.join("media");
+    std::fs::create_dir_all(&media).ok()?;
+    // A name from someone else's disk is not to be trusted with the path
+    // separators still in it: a kit naming `../../.zshrc` must land in
+    // media/ like everything else.
+    let name = name
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|n| !n.is_empty() && *n != "." && *n != "..")
+        .unwrap_or("sample.wav");
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) => (s.to_owned(), format!(".{e}")),
+        None => (name.to_owned(), String::new()),
+    };
+    let mut chosen = name.to_owned();
+    let mut n = 2;
+    while media.join(&chosen).exists() {
+        // Already here, byte for byte as far as length can tell: the same
+        // kit loaded twice is one copy of each sample, not two.
+        if std::fs::metadata(media.join(&chosen)).is_ok_and(|m| m.len() == bytes.len() as u64) {
+            return Some(format!("media/{chosen}"));
+        }
+        chosen = format!("{stem} {n}{ext}");
+        n += 1;
+        if n > 10_000 {
+            return None;
+        }
+    }
+    std::fs::write(media.join(&chosen), bytes).ok()?;
+    Some(format!("media/{chosen}"))
+}
+
 /// Cheap same-file check for the dedup above: same length is close enough
 /// for "the user imported the same file twice", and a false negative only
 /// costs a numbered copy.
@@ -12955,8 +12994,36 @@ impl TangentApp {
         // `DrumpadDoc::load_all_beside`: the file's top-level `pads` is the
         // kit a pre-lanes project wrote, and it lands on whichever channel
         // holds the drumpad so those projects open sounding as they did.
+        // **Where a pre-lanes kit belongs, when the file does not say.**
+        // Such a sidecar names no lane at all, and lane 0 was the guess: a
+        // project with its drumpad on channel 3 handed its only kit to the
+        // piano and opened with a drum track full of notes over a hundred
+        // and twenty-eight empty pads. The desk knows the answer — the same
+        // sentinel in the same array `move_legacy_pad_racks` reads.
+        //
+        // The DOCUMENT's desk is asked first and the live one second,
+        // because two of the four roads here have not applied the snapshot
+        // yet: at launch `settings` still describes the previous session.
+        let is_drum_bay = |inserts: &[String], ch: &usize| {
+            inserts
+                .get(ch * crate::recorder::INSERTS)
+                .is_some_and(|p| p == crate::dialogs::DRUMPAD_PATH)
+        };
+        let legacy_lane = self
+            .arrangement
+            .desk
+            .as_ref()
+            .and_then(|d| (0..crate::recorder::CHANNELS).find(|ch| is_drum_bay(&d.inserts, ch)))
+            .or_else(|| {
+                (0..crate::recorder::CHANNELS)
+                    .find(|ch| is_drum_bay(&self.settings.strip_inserts, ch))
+            });
         let (kits, saved_lane) = match self.project_doc() {
-            Some(doc) => crate::drumpad::DrumpadDoc::load_all_beside(doc, crate::recorder::CHANNELS),
+            Some(doc) => crate::drumpad::DrumpadDoc::load_all_beside(
+                doc,
+                crate::recorder::CHANNELS,
+                legacy_lane,
+            ),
             None => (
                 (0..crate::recorder::CHANNELS)
                     .map(|_| crate::drumpad::DrumpadDoc::default())
@@ -13015,6 +13082,43 @@ impl TangentApp {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default()
             ));
+        };
+        self.drumpad_mut().pads[pad].path = rel;
+        self.drumpad_mut().pads[pad].name.clear();
+        self.drumpad_status[pad] = crate::ports::PadStatus::default();
+        self.drumpad_sel = pad;
+        self.materialize_project_dir();
+        crate::drumpad::DrumpadDoc::save_all_beside(
+            &self.drumpad_kits,
+            self.drumpad_lane,
+            &doc,
+        );
+        self.drumpad_dirty = true;
+        Ok(())
+    }
+
+    /// **The same, for a sample that came inside a kit file.** Everything
+    /// after the write is `drumpad_load`'s own path, deliberately: a pad
+    /// filled from a shared kit and a pad filled by dragging a file in are
+    /// the same pad, and a project loaded from a kit is as self-contained as
+    /// one built by hand.
+    fn drumpad_load_bytes(
+        &mut self,
+        pad: usize,
+        file_name: &str,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        if pad >= recorder::DRUM_PADS {
+            return Err("no such pad".to_owned());
+        }
+        if bytes.is_empty() {
+            return Err("that pad's sample is empty".to_owned());
+        }
+        let Some(doc) = self.project_doc().map(std::path::Path::to_path_buf) else {
+            return Err("no project is open".to_owned());
+        };
+        let Some(rel) = write_into_media(&doc, file_name, bytes) else {
+            return Err(format!("could not write {file_name} into the project"));
         };
         self.drumpad_mut().pads[pad].path = rel;
         self.drumpad_mut().pads[pad].name.clear();
@@ -17516,14 +17620,22 @@ impl TangentApp {
         }
         self.drumpad_mut().master = preset.master;
         let mut missing = 0usize;
-        for (key, file, name, params) in &preset.pads {
-            if self.drumpad_load(*key, file).is_err() {
+        for pad in &preset.pads {
+            // **The kit's own audio first.** A kit made on someone else's
+            // machine names paths that do not exist here, which is exactly
+            // why the samples travel inside the file; the path is the
+            // fallback for kits saved before they did.
+            let landed = match pad.blob.and_then(|b| preset.media.get(b)) {
+                Some(blob) => self.drumpad_load_bytes(pad.key, &blob.name, &blob.bytes),
+                None => self.drumpad_load(pad.key, &pad.file),
+            };
+            if landed.is_err() {
                 missing += 1;
                 continue;
             }
-            if let Some(slot) = self.drumpad_mut().pads.get_mut(*key) {
-                slot.name = name.clone();
-                slot.params = *params;
+            if let Some(slot) = self.drumpad_mut().pads.get_mut(pad.key) {
+                slot.name = pad.name.clone();
+                slot.params = pad.params;
             }
         }
         self.drumpad_dirty = true;
@@ -28783,6 +28895,142 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("a temp dir");
         root
+    }
+
+    /// **A kit made in one project loads into another with its samples.**
+    ///
+    /// End to end, through the two calls the panel's chips make, with the
+    /// first project deleted between them — which is the shape of somebody
+    /// downloading a kit. Before the samples travelled inside the file this
+    /// produced a hundred and twenty-eight empty pads.
+    #[test]
+    fn a_shared_kit_loads_into_a_project_that_has_never_seen_the_samples() {
+        let root = project_scratch("sharedkit");
+        let made_in = root.join("Projects").join("made in");
+        let media = made_in.join("media");
+        std::fs::create_dir_all(&media).expect("media");
+        std::fs::write(media.join("clap.wav"), vec![5u8; 700]).expect("clap");
+
+        // Build the kit in the first project and write the file.
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        let doc = crate::arrangement::doc_in(&made_in);
+        crate::arrangement::Arrangement::default().save_to(&doc);
+        app.open_project(&doc);
+        app.drumpad_mut().pads[38] = crate::drumpad::PadSlot {
+            path: "media/clap.wav".to_owned(),
+            name: "Clap".to_owned(),
+            params: crate::recorder::DrumPadParams {
+                gain: 0.4,
+                choke: 3,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let kit_file = root.join("Snare Room.tgkit");
+        app.write_kit_preset(&kit_file);
+        assert!(kit_file.is_file(), "no kit file was written");
+
+        // The project it was made in is gone, samples and all.
+        std::fs::remove_dir_all(&made_in).expect("delete the first project");
+
+        // A second project, which has never seen that sample.
+        let opened_in = root.join("Projects").join("opened in");
+        std::fs::create_dir_all(&opened_in).expect("second project");
+        let doc2 = crate::arrangement::doc_in(&opened_in);
+        crate::arrangement::Arrangement::default().save_to(&doc2);
+        app.open_project(&doc2);
+        assert!(
+            app.drumpad().pads[38].path.is_empty(),
+            "the second project already had the pad"
+        );
+
+        app.apply_kit_preset(&kit_file);
+
+        let pad = &app.drumpad().pads[38];
+        assert!(!pad.path.is_empty(), "the pad came back empty: {}", app.track.error);
+        assert_eq!(pad.name, "Clap", "the pad's label");
+        assert_eq!(pad.params.choke, 3, "the choke group");
+        assert!((pad.params.gain - 0.4).abs() < 1e-6, "the pad's gain");
+        // **And the audio is really in the second project**, not a path
+        // pointing at a folder that no longer exists.
+        let landed = opened_in.join(&pad.path);
+        assert!(landed.is_file(), "no sample was written: {landed:?}");
+        assert_eq!(
+            std::fs::metadata(&landed).expect("stat").len(),
+            700,
+            "the sample that landed is not the one that was saved"
+        );
+        assert!(app.track.error.is_empty(), "reported: {}", app.track.error);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A pre-lanes kit opens on the lane that actually holds the drumpad.**
+    ///
+    /// The owner's session, exactly: a DRUMS track on channel 3 carrying two
+    /// clips of ninety-two notes, and a `drumpad.json` from before kits were
+    /// per-lane — one kit at the top level, no `primary_lane`, no
+    /// `lane_kits`. The loader put it on channel 0, the piano lane, and the
+    /// drum track opened over a hundred and twenty-eight empty pads. Nothing
+    /// was lost on disk: the sidecar still held every sample, the notes were
+    /// all in the document, and the session simply played no drums — which
+    /// is indistinguishable, from the chair, from a kit that was destroyed.
+    #[test]
+    fn a_pre_lanes_kit_opens_on_the_lane_that_holds_the_drumpad() {
+        let root = project_scratch("pre-lanes-kit");
+        let dir = root.join("Projects").join("legacy kit");
+        std::fs::create_dir_all(&dir).expect("a project dir");
+        let doc = crate::arrangement::doc_in(&dir);
+
+        // The DOCUMENT's desk puts the drumpad on channel 3. The app's own
+        // settings do not, so landing on 3 proves the document was read —
+        // which matters because two roads into the loader run before the
+        // snapshot is applied.
+        let mut desk_settings = Settings::default();
+        let bay0 = 3 * crate::recorder::INSERTS;
+        assert!(
+            desk_settings.strip_inserts.len() > bay0,
+            "the fixture desk has no channel 3"
+        );
+        // The stock desk already seats a drumpad on channel 1, which would
+        // answer the question before channel 3 was ever asked. Empty every
+        // first bay, then seat exactly one.
+        for ch in 0..crate::recorder::CHANNELS {
+            desk_settings.strip_inserts[ch * crate::recorder::INSERTS].clear();
+        }
+        desk_settings.strip_inserts[bay0] = crate::dialogs::DRUMPAD_PATH.to_owned();
+        let mut arr = crate::arrangement::Arrangement::default();
+        arr.desk = Some(TangentApp::desk_snapshot_of(&desk_settings));
+        arr.save_to(&doc);
+
+        // A sidecar in the shape a pre-lanes build wrote: the kit at the top
+        // level, naming no lane at all.
+        let mut legacy = crate::drumpad::DrumpadDoc::default();
+        legacy.pads[36].path = "media/kick.wav".to_owned();
+        legacy.save_beside(&doc);
+        let text = std::fs::read_to_string(crate::drumpad::DrumpadDoc::sidecar(&doc))
+            .expect("the fixture sidecar");
+        assert!(
+            !text.contains("primary_lane") && !text.contains("lane_kits"),
+            "the fixture is not a pre-lanes sidecar"
+        );
+
+        let (_ctx, mut app) = headless_with(Caps::DESKTOP, Settings::default());
+        app.open_project(&doc);
+
+        assert_eq!(
+            app.drumpad_kits[3].pads[36].path, "media/kick.wav",
+            "the drum lane opened with empty pads — the kit went elsewhere"
+        );
+        assert!(
+            app.drumpad_kits[0].is_empty(),
+            "the kit landed on the piano lane as well"
+        );
+        assert_eq!(
+            app.drumpad_lane(),
+            3,
+            "the panel opened on a lane that holds no kit"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// **The first launch of the project era founds a project and carries
