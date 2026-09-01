@@ -5576,6 +5576,12 @@ pub fn show(
                                 let per_row = all.len().div_ceil(2);
                                 for row in all.chunks(per_row) {
                                     ui.horizontal(|ui| {
+                                        // Thirteen cells at egui's default
+                                        // 8pt gap need 512pt and the frame
+                                        // gives 496: the last cell hung off
+                                        // the edge. A 4pt gap fits the row
+                                        // with air to spare on the right.
+                                        ui.spacing_mut().item_spacing.x = 4.0;
                                         for (code, name) in row {
                                             let chosen = current_icon == *code;
                                             let (rect, resp) = ui.allocate_exact_size(

@@ -1348,7 +1348,13 @@ enum ArrDrag {
     /// The right button's selection band over the lanes.
     ClipBand,
     /// A track being carried to another row, by its number.
-    ReorderLane { from: usize },
+    ReorderLane {
+        from: usize,
+        /// The pointer really travelled: what separates a drag that came
+        /// home (the eject-in-place gesture) from a plain click on the
+        /// name, which must stay inert.
+        moved: bool,
+    },
     /// The GRIDBOX being dragged: up is finer, one step a notch.
     GridStep { from_y: f32, start: i64 },
     /// The seam between headers and lanes: the pointer's x IS the width.
@@ -1600,7 +1606,7 @@ pub fn fresh_project_dir(root: &std::path::Path) -> std::path::PathBuf {
         .join(crate::drumpad::FILE_NAME);
     let keeps = |dir: &std::path::Path| {
         use crate::arrangement::LoadOutcome;
-        let held = match crate::arrangement::Arrangement::read_from(&dir.join("project.tangent")) {
+        let held = match crate::arrangement::Arrangement::read_from(&crate::arrangement::doc_in(dir)) {
             LoadOutcome::Loaded(a) => a.named,
             // Unreadable bytes are somebody's song until proven otherwise —
             // reclaiming a folder on the strength of a failed parse is how
@@ -1630,11 +1636,20 @@ pub fn fresh_project_dir(root: &std::path::Path) -> std::path::PathBuf {
 /// `None` when the rename itself failed, and the caller must then refuse
 /// to adopt the path at all.
 fn quarantine_damaged(doc: &std::path::Path) -> Option<std::path::PathBuf> {
+    // The damaged name keeps the document's REAL extension - with_extension
+    // REPLACES it, so a `project.tan` quarantined under the old literal
+    // would have come back as `project.tangent.damaged`, a name no resolver
+    // recognises as the same document's remains.
+    let ext = doc
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("tangent")
+        .to_owned();
     for n in 1..1_000u32 {
         let target = if n == 1 {
-            doc.with_extension("tangent.damaged")
+            doc.with_extension(format!("{ext}.damaged"))
         } else {
-            doc.with_extension(format!("tangent.damaged-{n}"))
+            doc.with_extension(format!("{ext}.damaged-{n}"))
         };
         if target.exists() {
             continue;
@@ -2967,26 +2982,6 @@ impl TangentApp {
     ///
     /// A track that is itself inside a folder cannot become one: folders are
     /// one level deep, so the gesture takes it OUT of its folder first.
-    /// The mixer's F switch: not-a-folder -> open folder -> shut folder ->
-    /// back to not-a-folder, which releases the children exactly as the
-    /// arrangement's box does. See `toggle_folder`/`toggle_folder_shut` -
-    /// this is only those two, in a circle.
-    fn cycle_folder(&mut self, ch: usize) {
-        if !self.is_folder(ch) {
-            self.toggle_folder(ch);
-            // A shut flag can survive from an earlier folder life (the
-            // arrangement's box never clears it); healed here so the cycle
-            // always lands on OPEN first.
-            if self.folder_shut(ch) {
-                self.toggle_folder_shut(ch);
-            }
-        } else if !self.folder_shut(ch) {
-            self.toggle_folder_shut(ch);
-        } else {
-            self.toggle_folder_shut(ch);
-            self.toggle_folder(ch);
-        }
-    }
 
     fn toggle_folder(&mut self, ch: usize) {
         if ch >= crate::recorder::CHANNELS {
@@ -3497,7 +3492,7 @@ impl TangentApp {
             H::Folder(i) => f32::from(u8::from(
                 i.strip()
                     .and_then(|s| match s {
-                        crate::recorder::Strip::Channel(n) => Some(self.is_folder(n)),
+                        crate::recorder::Strip::Channel(n) => Some(self.folder_shut(n)),
                         _ => None,
                     })
                     .unwrap_or(false),
@@ -3714,12 +3709,13 @@ impl TangentApp {
         self.record_automation_move(hit, v);
         let gain = f64::from(recorder::fader_to_gain(v));
         match hit {
-            // The F switch CYCLES: not-a-folder, open folder, shut folder,
-            // and around. One button where the arrangement has a box and an
-            // arrow, because a strip has one bottom-left.
+            // **The folder glyph COLLAPSES, and does nothing else** - the
+            // owner's ruling: folders are groupers, made and unmade by
+            // Cmd/Ctrl+F alone; the glyph on the strip hides or shows the
+            // children, same as the arrangement's arrow.
             H::Folder(i) => {
                 if let Some(crate::recorder::Strip::Channel(n)) = i.strip() {
-                    self.cycle_folder(n);
+                    self.toggle_folder_shut(n);
                 }
                 return;
             }
@@ -3862,6 +3858,16 @@ impl TangentApp {
             // is edited — "Rhodes" is two characters off "Rhode" — where a
             // figure is replaced.
             H::Name(i) => {
+                // **Only a track has a name to type into** - the arrange
+                // side's own rule, missing here: an EMPTY slot answered the
+                // double-click with a blank rename field, which then sat
+                // over the desk swallowing keys and presses (the owner's
+                // "empty name strip interfering with selection").
+                if let Some(crate::recorder::Strip::Channel(n)) = i.strip() {
+                    if !self.channel_used(n) {
+                        return;
+                    }
+                }
                 // Seeded with what is THERE, default or not: a name is
                 // edited, and starting from the default is how somebody makes
                 // "x - 3" into "x - 3 vox" without typing it twice.
@@ -4573,6 +4579,10 @@ impl TangentApp {
                     Strip::Channel(n) => self.folder_shut(n),
                     _ => false,
                 },
+                hidden: match s {
+                    Strip::Channel(n) => self.lane_hidden(n),
+                    _ => false,
+                },
                 to_theory: match s {
                     Strip::Channel(n) => self.to_theory(n),
                     _ => false,
@@ -4661,6 +4671,7 @@ impl TangentApp {
                     is_folder: false,
                     in_folder: false,
                     folder_shut: false,
+                    hidden: false,
                     route_count: 0,
                     strip: None,
                     icon: 0,
@@ -6631,7 +6642,19 @@ impl TangentApp {
             return;
         }
         if !self.settings.project_path.is_empty() {
-            let doc = std::path::PathBuf::from(&self.settings.project_path);
+            let mut doc = std::path::PathBuf::from(&self.settings.project_path);
+            // A remembered path can go stale by NAME alone - the document
+            // migrated between the canonical and legacy extensions - so a
+            // miss retries the resolver on the same folder before falling
+            // through to a fresh project.
+            if !doc.is_file() {
+                if let Some(dir) = doc.parent() {
+                    let resolved = crate::arrangement::doc_in(dir);
+                    if resolved.is_file() {
+                        doc = resolved;
+                    }
+                }
+            }
             if doc.is_file() {
                 // Through the same adoption gate as every explicit open: a
                 // remembered project whose file went bad must be
@@ -6657,7 +6680,7 @@ impl TangentApp {
             // manner with missing files.
         }
         let dir = fresh_project_dir(projects_root);
-        let doc = dir.join("project.tangent");
+        let doc = crate::arrangement::doc_in(&dir);
         let _ = std::fs::create_dir_all(dir.join("media"));
         let mut arr = crate::arrangement::Arrangement::default();
         let track = std::mem::take(&mut self.settings.track_path);
@@ -7057,7 +7080,9 @@ impl TangentApp {
         if std::fs::rename(&src, &target).is_err() {
             return;
         }
-        self.project_doc = target.join("project.tangent");
+        // The DIRECTORY was renamed; the file inside kept its own name -
+        // canonical or legacy - so adopt what is really there.
+        self.project_doc = crate::arrangement::doc_in(&target);
         self.settings.project_path = self.project_doc.to_string_lossy().into_owned();
         self.save_settings();
     }
@@ -7066,7 +7091,7 @@ impl TangentApp {
     pub fn new_project(&mut self) {
         let root = self.project_root();
         let dir = fresh_project_dir(&root);
-        let doc = dir.join("project.tangent");
+        let doc = crate::arrangement::doc_in(&dir);
         // **A reclaimed scratch sheds its kit.** An unnamed Untitled gets
         // reused, and only `project.tangent` was being rewritten — the old
         // scratch's `drumpad.json` sat beside it, so `open_project`
@@ -8241,6 +8266,23 @@ impl TangentApp {
 
     /// Ctrl+T's landing place: the first channel that is not a track yet.
     fn add_track_first_free(&mut self) {
+        // **The SELECTED slot first, always** - the owner's rule: a hand
+        // that selected an empty slot and pressed the chord meant THERE,
+        // and ignoring it made the keybind land somewhere off-screen. A
+        // used selection falls through to the first free slot AFTER it,
+        // then anywhere.
+        if let Some(sel) = self.selected_channel {
+            if sel < self.active_channels() && !self.channel_used(sel) {
+                self.add_bare_track(sel);
+                return;
+            }
+            if let Some(n) =
+                (sel + 1..self.active_channels()).find(|n| !self.channel_used(*n))
+            {
+                self.add_bare_track(n);
+                return;
+            }
+        }
         if let Some(n) = (0..self.active_channels()).find(|n| !self.channel_used(*n)) {
             self.add_bare_track(n);
         }
@@ -8314,7 +8356,7 @@ impl TangentApp {
     /// THIS desk — at first launch that is the stock desk, which is what a
     /// default should be until the owner saves their own over it.
     pub fn seed_template(&self, dir: &std::path::Path) {
-        let doc = dir.join("project.tangent");
+        let doc = crate::arrangement::doc_in(dir);
         // A template that cannot be read is nobody's song — it is the
         // stencil every scratch is cloned from, and a damaged or empty one
         // poisons every clone with its damage. Unlike a project, it is
@@ -8486,7 +8528,7 @@ impl TangentApp {
                          opened instead.",
                         dir.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
                     ));
-                    (Arrangement::default(), dir.join("project.tangent"))
+                    (Arrangement::default(), crate::arrangement::doc_in(&dir))
                 }
             },
         }
@@ -8530,7 +8572,10 @@ impl TangentApp {
     /// without the `.tangent` the panel's filter appended, it names the new
     /// project DIRECTORY.
     pub fn save_project_as(&mut self, target: &std::path::Path) {
-        let chosen = if target.extension().is_some_and(|e| e == "tangent") {
+        let chosen = if target
+            .extension()
+            .is_some_and(|e| crate::ports::PROJECT_EXTENSIONS.iter().any(|x| e == *x))
+        {
             target.with_extension("")
         } else {
             target.to_path_buf()
@@ -8576,7 +8621,7 @@ impl TangentApp {
                 }
             }
         }
-        let doc = dir.join("project.tangent");
+        let doc = crate::arrangement::doc_in(&dir);
         // A Save As is a name somebody CHOSE: the copy is a kept project,
         // never a scratch a new session may reclaim.
         self.arrangement.named = true;
@@ -10459,6 +10504,16 @@ impl TangentApp {
     /// owner's rule: no changes, no new folder, and the name never
     /// advances - so a New that would rebuild the very session on the desk
     /// does nothing instead.
+    /// How many channel strips the mixer actually SHOWS - the active desk
+    /// minus every child a shut folder has folded away. What the scroll
+    /// range answers to.
+    pub fn mixer_shown_channels(&self) -> usize {
+        (0..self.active_channels())
+            .filter(|n| !self.lane_hidden(*n))
+            .count()
+            .max(1)
+    }
+
     pub fn new_is_noop(&self) -> bool {
         !self.arrangement.named && !self.project_dirty()
     }
@@ -10505,7 +10560,10 @@ impl TangentApp {
                         .and_then(std::path::Path::parent)
                         .map(std::path::Path::to_path_buf),
                     title: "Open a project".to_owned(),
-                    extensions: vec!["tangent".to_owned()],
+                    extensions: crate::ports::PROJECT_EXTENSIONS
+                        .iter()
+                        .map(|e| (*e).to_owned())
+                        .collect(),
                     extension_label: "Tangent project".to_owned(),
                     purpose: crate::ports::FilePurpose::Project,
                     multi: false,
@@ -15976,7 +16034,7 @@ impl TangentApp {
                         // on screen read as a press that did not land.
                         self.select_track(n, ctx.input(|i| i.modifiers));
                         if self.channel_used(n) {
-                            self.arr_drag = Some(ArrDrag::ReorderLane { from: n });
+                            self.arr_drag = Some(ArrDrag::ReorderLane { from: n, moved: false });
                         }
                     }
                     // The seam: drag to resize the header column; a plain
@@ -15989,7 +16047,6 @@ impl TangentApp {
                     Some(A::ToTheory(n)) => {
                         self.apply_mixer_hit(M::ToTheory(Column(n)), 0.0);
                     }
-                    Some(A::HdrFolder(n)) => self.toggle_folder(n),
                     Some(A::HdrCollapse(n)) => self.toggle_folder_shut(n),
                     Some(A::Mute(n)) => self.apply_mixer_hit(M::Mute(Column(n)), 0.0),
                     Some(A::Solo(n)) => self.apply_mixer_hit(M::Solo(Column(n)), 0.0),
@@ -16241,7 +16298,7 @@ impl TangentApp {
                         };
                         if let Some(n) = row.filter(|n| self.channel_used(*n)) {
                             self.select_track(n, ctx.input(|i| i.modifiers));
-                            self.arr_drag = Some(ArrDrag::ReorderLane { from: n });
+                            self.arr_drag = Some(ArrDrag::ReorderLane { from: n, moved: false });
                         }
                     }
                 }
@@ -16319,7 +16376,24 @@ impl TangentApp {
                         self.save_settings_soon();
                     }
                 }
-                ArrDrag::ReorderLane { .. } => {}
+                ArrDrag::ReorderLane { from, moved } => {
+                    // The drag is real once the hand leaves the row it
+                    // pressed on - the eject gesture needs to know the
+                    // difference from a motionless click.
+                    if !moved {
+                        let clips = self.arr_clip_views();
+                        let view = self.arrange_view(&clips);
+                        let l = crate::arrangement_panel::Layout::new(rect, &view);
+                        let home = l
+                            .header_rows
+                            .get(from)
+                            .is_some_and(|r| r.panel.is_positive() && r.panel.contains(p));
+                        if !home {
+                            self.arr_drag =
+                                Some(ArrDrag::ReorderLane { from, moved: true });
+                        }
+                    }
+                }
                 ArrDrag::ClipBand => {
                     if let Some((a, _)) = self.arr_band {
                         self.arr_band = Some((a, p));
@@ -16500,7 +16574,7 @@ impl TangentApp {
         }
         if released {
             // **The carried track lands** on the row under the hand.
-            if let Some(ArrDrag::ReorderLane { from }) = self.arr_drag {
+            if let Some(ArrDrag::ReorderLane { from, moved }) = self.arr_drag {
                 if let Some(p) = pointer {
                     // **Which row, and whether the hand was on its BOTTOM
                     // EDGE.** The edge is the folder gesture: a drop in the
@@ -16518,6 +16592,13 @@ impl TangentApp {
                         // lit the strip used to decide the same thing.
                         if let Some(folder) = self.folder_drop_target(to, on_edge) {
                             self.snap_into_folder(from, folder);
+                        } else if to == from && moved && self.in_folder(from) {
+                            // **The drag that came home EJECTS in place** -
+                            // the owner's "drag a child on track 6 out and
+                            // have it land on track 6". A real drag only
+                            // (`moved`), so a plain click on the name stays
+                            // a click.
+                            self.eject_from_folder(from);
                         } else if to != from {
                             // An ordinary move. Membership is decided by
                             // where the block LANDS, which is what makes
@@ -18183,6 +18264,44 @@ impl TangentApp {
     /// Returns whether anything happened, so the caller can leave the key
     /// alone when it did not — a shortcut that silently does nothing on a
     /// full desk is worse than one that does nothing visibly.
+    /// **Leave the folder, standing still.** The inverse of
+    /// `snap_into_folder`, and the smallest one that keeps the positional
+    /// model coherent: the run's LAST child just drops its flag (its row
+    /// already sits where the folder ends), while a MIDDLE child must also
+    /// step past the run's end - clearing a flag mid-run would sever the
+    /// run and orphan every member below the hole.
+    fn eject_from_folder(&mut self, from: usize) {
+        let Some(folder) = self.folder_of(from) else {
+            return;
+        };
+        let run_end = self
+            .folder_run(folder)
+            .last()
+            .copied()
+            .unwrap_or(folder);
+        let group = self.reorder_group(from);
+        for n in &group {
+            self.set_in_folder(*n, false);
+        }
+        if group.iter().all(|n| *n >= run_end) {
+            // The tail of the run: the flag alone is the exit, and the row
+            // does not move - the owner's "land on track 6".
+            self.save_settings();
+            return;
+        }
+        // A middle child steps just past the run, flags already cleared so
+        // the permutation carries them - snap_into_folder's own manner,
+        // inverted.
+        use crate::recorder::CHANNELS;
+        let mut order: Vec<usize> = (0..CHANNELS).filter(|n| !group.contains(n)).collect();
+        let at = order.iter().take_while(|n| **n <= run_end).count();
+        for (k, n) in group.iter().enumerate() {
+            order.insert(at + k, *n);
+        }
+        self.reorder_channels(&order);
+        self.save_settings();
+    }
+
     pub fn make_folder(&mut self) -> bool {
         use crate::recorder::CHANNELS;
         let mut sel: Vec<usize> = self
@@ -18194,6 +18313,17 @@ impl TangentApp {
         sel.sort_unstable();
         sel.dedup();
 
+        // ── the same chord UN-makes a folder ─────────────────────────────
+        //
+        // The box that used to toggle folder-hood is retired; Cmd/Ctrl+F is
+        // the whole door now, both ways: on a selected FOLDER it releases
+        // the children and the row goes back to being a track.
+        if sel.len() < 2 {
+            if let Some(f) = self.selected_channel.filter(|n| self.is_folder(*n)) {
+                self.toggle_folder(f);
+                return true;
+            }
+        }
         // ── an empty slot becomes an empty folder ────────────────────────
         if sel.len() < 2 {
             let Some(n) = self
@@ -19087,7 +19217,6 @@ impl TangentApp {
             // changes. The mixer's T already went the right way, which is what
             // made the two panels disagree about the same switch.
             A::ToTheory(n) => self.apply_mixer_hit(M::ToTheory(Column(n)), 0.0),
-            A::HdrFolder(n) => self.toggle_folder(n),
             A::HdrCollapse(n) => self.toggle_folder_shut(n),
             A::HdrAdd(n) => self.add_bare_track(n),
             A::HdrRouting(n) => {
@@ -20885,7 +21014,10 @@ impl TangentApp {
                         .and_then(std::path::Path::parent)
                         .map(std::path::Path::to_path_buf),
                     title: "Open a project".to_owned(),
-                    extensions: vec!["tangent".to_owned()],
+                    extensions: crate::ports::PROJECT_EXTENSIONS
+                        .iter()
+                        .map(|e| (*e).to_owned())
+                        .collect(),
                     extension_label: "Tangent project".to_owned(),
                     purpose: crate::ports::FilePurpose::Project,
                     multi: false,
@@ -21776,7 +21908,10 @@ impl TangentApp {
                         .and_then(std::path::Path::parent)
                         .map(std::path::Path::to_path_buf),
                     title: "Open a project".to_owned(),
-                    extensions: vec!["tangent".to_owned()],
+                    extensions: crate::ports::PROJECT_EXTENSIONS
+                        .iter()
+                        .map(|e| (*e).to_owned())
+                        .collect(),
                     extension_label: "Tangent project".to_owned(),
                     purpose: crate::ports::FilePurpose::Project,
                     multi: false,
@@ -21864,14 +21999,17 @@ impl TangentApp {
             DialogAction::TrackIcon(lane, icon) => {
                 for n in self.selection_with(lane) {
                     if let Some(slot) = self.settings.channel_icons.get_mut(n) {
-                        *slot = icon.min(3);
+                        // ICON_MAX, not 3 - the clamp that made every NEW badge write
+                        // "bass": the table grew to twenty-five and this line
+                        // never heard.
+                        *slot = icon.min(crate::recorder_panel::ICON_MAX);
                     }
                 }
                 self.save_settings();
                 self.undo_commit();
                 // The open dialog's lit slot follows the choice at once.
                 if let Some(dialogs::Dialog::Track { icon: cur, .. }) = self.dialog.as_mut() {
-                    *cur = icon.min(3);
+                    *cur = icon.min(crate::recorder_panel::ICON_MAX);
                 }
             }
             DialogAction::TrackColor(lane, idx) => {
@@ -24258,7 +24396,7 @@ impl TangentApp {
                     if self.license.cheated() {
                         // **The cheater's heart, and only that heart.** The
                         // owner's word: while the Konami marker stands, the
-                        // black-crackle glow is the whole wardrobe — always
+                        // glowing, veined heart is the whole wardrobe — always
                         // animated, no wave, no flat fallback, whatever the
                         // heart settings say. The glow is the theme's own
                         // master colour: crimson on Default, per spec.
@@ -24388,20 +24526,75 @@ impl TangentApp {
                     );
                 }
                 let at = ui.ctx().input(|i| i.pointer.interact_pos());
-                if let Some(col) = at.and_then(|p| {
-                    crate::mixer_panel::strip_at(rect, &view, p)
-                }) {
-                    if let (Some(crate::recorder::Strip::Channel(n)), true) =
-                        (col.strip(), col.0 != from)
-                    {
+                let lit = egui::Color32::from_rgb(0xC9, 0x8B, 0x3D);
+                if let (Some(crate::recorder::Strip::Channel(n)), Some(p)) = (
+                    at.and_then(|p| crate::mixer_panel::strip_at(rect, &view, p))
+                        .and_then(crate::recorder::Column::strip)
+                        .map(Some)
+                        .unwrap_or(None),
+                    at,
+                ) {
+                    let on_edge = l.strips.get(n).is_some_and(|s| {
+                        crate::mixer_panel::folder_drop_strip(s.panel).contains(p)
+                    });
+                    let joins = self.folder_drop_target(n, on_edge);
+                    if let Some(folder) = joins {
+                        // The drop strip filled on the column under the
+                        // hand, and the receiving folder named by lighting
+                        // its own TOP edge - the arrangement's left-edge
+                        // fill, turned.
+                        if let Some(dst) = l.strips.get(n) {
+                            let strip =
+                                crate::mixer_panel::folder_drop_strip(dst.panel);
+                            if strip.is_positive() {
+                                ui.painter()
+                                    .rect_filled(strip, 0.0, lit.gamma_multiply(0.35));
+                                ui.painter().line_segment(
+                                    [
+                                        egui::Pos2::new(
+                                            strip.right() - 1.0,
+                                            strip.top(),
+                                        ),
+                                        egui::Pos2::new(
+                                            strip.right() - 1.0,
+                                            strip.bottom(),
+                                        ),
+                                    ],
+                                    egui::Stroke::new(2.0, lit),
+                                );
+                            }
+                        }
+                        if let Some(head) = l.strips.get(folder) {
+                            ui.painter().rect_filled(
+                                egui::Rect::from_min_max(
+                                    head.panel.min,
+                                    egui::Pos2::new(
+                                        head.panel.right(),
+                                        head.panel.top() + 3.0,
+                                    ),
+                                ),
+                                0.0,
+                                lit,
+                            );
+                        }
+                    } else if n != from {
+                        if let Some(dst) = l.strips.get(n) {
+                            ui.painter().line_segment(
+                                [
+                                    egui::Pos2::new(dst.panel.left(), dst.panel.top()),
+                                    egui::Pos2::new(dst.panel.left(), dst.panel.bottom()),
+                                ],
+                                egui::Stroke::new(2.0, lit),
+                            );
+                        }
+                    } else if self.in_folder(from) {
+                        // The drag that came home: release leaves the
+                        // folder, the strip stays put.
                         if let Some(dst) = l.strips.get(n) {
                             ui.painter().rect_stroke(
                                 dst.panel,
                                 4.0,
-                                egui::Stroke::new(
-                                    2.0,
-                                    egui::Color32::from_rgb(0xC9, 0x8B, 0x3D),
-                                ),
+                                egui::Stroke::new(2.0, lit),
                                 egui::StrokeKind::Inside,
                             );
                         }
@@ -24458,7 +24651,7 @@ impl TangentApp {
                     })
             };
             // A track mid-carry: the target row lights under the hand.
-            if let Some(ArrDrag::ReorderLane { from }) = self.arr_drag {
+            if let Some(ArrDrag::ReorderLane { from, moved }) = self.arr_drag {
                 let l = crate::arrangement_panel::Layout::new(rect, &view);
                 if let Some(src) = l.header_rows.get(from) {
                     ui.painter().rect_filled(
@@ -24529,6 +24722,18 @@ impl TangentApp {
                                     egui::Pos2::new(rect.right(), row.panel.top()),
                                 ],
                                 egui::Stroke::new(2.0, lit),
+                            );
+                        }
+                    } else if moved && self.in_folder(from) {
+                        // **The drag that came home says what release will
+                        // do**: leave the folder, stay on this row - an
+                        // outline rather than a line, because nothing moves.
+                        if let Some(row) = l.header_rows.get(t) {
+                            ui.painter().rect_stroke(
+                                row.panel,
+                                2.0,
+                                egui::Stroke::new(2.0, lit),
+                                egui::StrokeKind::Inside,
                             );
                         }
                     }
@@ -25002,7 +25207,7 @@ impl TangentApp {
                         let max = crate::mixer_panel::Layout::max_scroll_px(
                             rect,
                             self.mixer_visible(),
-                            self.active_channels(),
+                            self.mixer_shown_channels(),
                         );
                         self.mixer_scroll_px =
                             (self.mixer_scroll_px - d).clamp(0.0, max);
@@ -25339,14 +25544,44 @@ impl TangentApp {
                     // The release: an ACTIVE carry lands on the column
                     // under the hand; a motionless one was just a press.
                     if active {
-                        let target = {
+                        // **The arrangement's drop grammar, stood upright.**
+                        // A strip's RIGHT quarter is its folder-drop strip
+                        // (the row's bottom quarter, turned); landing there
+                        // snaps into the group; landing on a strip's body
+                        // reorders and takes the landing row's membership;
+                        // and a drag that comes home EJECTS in place - one
+                        // set of rules, both views, the owner's ask.
+                        let (target, on_edge) = {
                             let view = self.mixer_view();
-                            crate::mixer_panel::strip_at(rect, &view, p)
+                            match crate::mixer_panel::strip_at(rect, &view, p)
                                 .and_then(crate::recorder::Column::strip)
+                            {
+                                Some(crate::recorder::Strip::Channel(to)) => {
+                                    let l = crate::mixer_panel::Layout::new(rect, &view);
+                                    let edge = l.strips.get(to).is_some_and(|s| {
+                                        crate::mixer_panel::folder_drop_strip(s.panel)
+                                            .contains(p)
+                                    });
+                                    (Some(to), edge)
+                                }
+                                _ => (None, false),
+                            }
                         };
-                        if let Some(crate::recorder::Strip::Channel(to)) = target {
-                            if to != from {
+                        if let Some(to) = target {
+                            if let Some(folder) = self.folder_drop_target(to, on_edge) {
+                                self.snap_into_folder(from, folder);
+                            } else if to == from && self.in_folder(from) {
+                                self.eject_from_folder(from);
+                            } else if to != from {
+                                let joins = self.folder_of(to);
+                                for n in self.reorder_group(from) {
+                                    self.set_in_folder(n, joins.is_some());
+                                    if joins.is_some() {
+                                        self.set_is_folder(n, false);
+                                    }
+                                }
                                 self.move_selection(from, to);
+                                self.save_settings();
                             }
                         }
                     }
@@ -26906,7 +27141,8 @@ mod tests {
         app.set_channel_kind(3, Some(recorder::ChannelKind::Audio));
         let shelf = root.join("Projects/Templates/default");
         app.seed_template(&shelf);
-        let doc = crate::arrangement::Arrangement::load_from(&shelf.join("project.tangent"));
+        let doc =
+            crate::arrangement::Arrangement::load_from(&crate::arrangement::doc_in(&shelf));
         let desk = doc.desk.expect("the seed left the desk out");
         assert_eq!(
             desk, TangentApp::template_desk(),
@@ -26919,7 +27155,8 @@ mod tests {
         // Seeding again does not overwrite a template that exists.
         app.set_channel_kind(3, None);
         app.seed_template(&shelf);
-        let again = crate::arrangement::Arrangement::load_from(&shelf.join("project.tangent"));
+        let again =
+            crate::arrangement::Arrangement::load_from(&crate::arrangement::doc_in(&shelf));
         assert_eq!(
             again.desk.unwrap().kinds[3],
             desk.kinds[3],
@@ -28347,7 +28584,10 @@ mod tests {
         app.bootstrap_project(&root.join("Projects"));
 
         let doc = app.project_doc().expect("a project exists").to_path_buf();
-        assert!(doc.ends_with("project.tangent"), "{doc:?}");
+        assert!(
+            doc.ends_with(crate::arrangement::DOC_NAME),
+            "a fresh project should mint the canonical name: {doc:?}"
+        );
         assert!(doc.starts_with(root.join("Projects")), "{doc:?}");
         assert_eq!(app.project_name(), "Untitled");
         assert_eq!(app.arrangement().clips.len(), 1, "the backing did not board");
@@ -32277,6 +32517,167 @@ mod tests {
 
     /// **A track is carried by its NAME as well as by its number.**
     ///
+    /// **A child dragged out lands on its own row** - the owner's "drag a
+    /// child on track 6 OUT and have it land on track 6". The run's last
+    /// child ejects by flag alone; a middle child steps just past the run.
+    #[test]
+    fn a_child_ejects_in_place_and_a_middle_child_lands_below_the_run() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        for n in 0..7 {
+            app.add_bare_track(n);
+        }
+        app.toggle_folder(4);
+        app.set_in_folder(5, true);
+        app.set_in_folder(6, true);
+        assert_eq!(app.folder_children(4), vec![5, 6]);
+
+        // The LAST child: out where it stands.
+        app.selected_tracks = vec![6];
+        app.selected_channel = Some(6);
+        app.eject_from_folder(6);
+        assert!(!app.in_folder(6), "the tail child is still inside");
+        assert_eq!(app.folder_children(4), vec![5], "the run did not end early");
+
+        // A MIDDLE child: put it back, grow the run, eject the middle. A
+        // middle child cannot stand still - a hole would sever the
+        // positional run - so it steps just past the run's end, carrying
+        // its name.
+        app.snap_into_folder(6, 4);
+        assert_eq!(app.folder_children(4), vec![5, 6]);
+        app.settings.strip_names[5] = "EJECTME".to_owned();
+        app.selected_tracks = vec![5];
+        app.selected_channel = Some(5);
+        app.eject_from_folder(5);
+        assert_eq!(
+            app.settings.strip_names.get(6).map(String::as_str),
+            Some("EJECTME"),
+            "the middle child did not land just below the run"
+        );
+        assert!(!app.in_folder(6), "the ejected child is still inside");
+        assert_eq!(
+            app.folder_children(4),
+            vec![5],
+            "the folder did not keep exactly its other child"
+        );
+    }
+
+    /// **A shut folder folds its children out of the MIXER row** - the two
+    /// views collapse alike now. Hidden strips get no column, the columns
+    /// behind them close ranks, and reopening restores everything.
+    #[test]
+    fn a_shut_folder_hides_its_children_on_the_desk() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        for n in 0..5 {
+            app.add_bare_track(n);
+        }
+        app.toggle_folder(1);
+        app.set_in_folder(2, true);
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 600.0));
+
+        let open_x = {
+            let view = app.mixer_view();
+            let l = crate::mixer_panel::Layout::new(rect, &view);
+            assert!(l.strips[2].panel.is_positive(), "the open child lost its strip");
+            l.strips[3].panel.left()
+        };
+        app.toggle_folder_shut(1);
+        let view = app.mixer_view();
+        let l = crate::mixer_panel::Layout::new(rect, &view);
+        assert!(
+            !l.strips[2].panel.is_positive(),
+            "the shut folder's child still holds a column"
+        );
+        let shut_x = l.strips[3].panel.left();
+        assert!(
+            shut_x < open_x - 1.0,
+            "the columns did not close ranks: {shut_x} vs {open_x}"
+        );
+    }
+
+    /// **The note button is a channel's alone.** A folder cannot carry its
+    /// own MIDI - the owner's capitals - so its strip lays out no theory
+    /// button; a plain track's sits at the foot, left edge on the inserts'.
+    #[test]
+    fn the_note_button_sits_on_tracks_and_never_on_folders() {
+        let (_ctx, mut app) = headless(Caps::DESKTOP);
+        for n in 0..3 {
+            app.add_bare_track(n);
+        }
+        app.toggle_folder(1);
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 640.0));
+        let view = app.mixer_view();
+        let l = crate::mixer_panel::Layout::new(rect, &view);
+        let track = &l.strips[0];
+        assert!(track.theory.is_positive(), "the track lost its note button");
+        assert!(
+            (track.theory.left() - (track.panel.left() + 6.0)).abs() < 0.5,
+            "the note is not on the inserts' left edge"
+        );
+        assert!(
+            track.theory.bottom() <= track.panel.bottom(),
+            "the note hangs off the strip"
+        );
+        assert!(
+            !l.strips[1].theory.is_positive(),
+            "the folder grew a note button"
+        );
+        assert!(
+            !l.strips[1].arm.is_positive(),
+            "the folder grew a record arm"
+        );
+        assert!(
+            l.strips[1].folder.is_positive(),
+            "the folder lost its collapse glyph"
+        );
+        assert!(
+            !l.strips[1].add.is_positive(),
+            "the folder's icon spot still opens the picker"
+        );
+    }
+
+    /// **An EMPTY slot's whole row answers for the slot, and every part of
+    /// it hit-tests to something that SELECTS.** The owner: "there's an
+    /// empty name strip I think interfering with empty arrange slot
+    /// selection" - this walks the empty row's cells and pins what each
+    /// one answers, so any dead zone shows itself by name.
+    #[test]
+    fn an_empty_slots_row_selects_wherever_it_is_pressed() {
+        let (_ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.arrangement_open = true;
+        app.add_bare_track(0);
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 500.0));
+        app.arrangement_rect = Some(rect);
+        let clips = app.arr_clip_views();
+        let view = app.arrange_view(&clips);
+        let l = crate::arrangement_panel::Layout::new(rect, &view);
+        use crate::arrangement_panel::Hit as A;
+        // Lane 3 is an empty slot in this fixture.
+        let row = l.header_rows[3];
+        assert!(row.panel.is_positive(), "the empty row lost its panel");
+        for (what, r, want_select) in [
+            ("name strip", row.name, true),
+            ("input chip", row.input, false),
+            ("plus circle", row.add, false),
+        ] {
+            if !r.is_positive() {
+                continue;
+            }
+            let hit = crate::arrangement_panel::hit_test(rect, &view, r.center());
+            match (want_select, hit) {
+                (true, Some(A::HdrName(n))) => assert_eq!(n, 3, "{what} names lane {n}"),
+                (true, other) => {
+                    panic!("{what} does not answer as the slot: {other:?}")
+                }
+                (false, Some(A::HdrInput(_) | A::HdrAdd(_))) => {}
+                (false, other) => panic!("{what} answers {other:?}"),
+            }
+        }
+        // And the selecting arm really selects an empty slot.
+        app.select_track(3, egui::Modifiers::NONE);
+        assert_eq!(app.selected_channel, Some(3), "the empty slot did not select");
+        assert_eq!(app.selected_tracks, vec![3]);
+    }
+
     /// The number is twelve points wide on a header full of controls; the
     /// name plate beside it is what a hand actually goes for, and the mixer
     /// has worked that way since its own carry landed.
@@ -32445,7 +32846,7 @@ mod tests {
         assert!(app.channel_used(0), "lane 1 is not a track to drag");
         press(&ctx, &mut app, at);
         assert!(
-            matches!(app.arr_drag, Some(ArrDrag::ReorderLane { from: 0 })),
+            matches!(app.arr_drag, Some(ArrDrag::ReorderLane { from: 0, .. })),
             "a press on the track title started {:?} instead of a reorder",
             app.arr_drag
         );
@@ -35443,6 +35844,19 @@ mod velocity_selection_tests {
                 "track {n} did not take the badge"
             );
         }
+
+        // **And the TOP of the table sticks too** - a `.min(3)` clamp here
+        // once wrote "bass" for every one of the twenty-one new badges, so
+        // clicking a saxophone read as a no-op. Line-in is the last code.
+        app.apply_dialog_action(DialogAction::TrackIcon(
+            4,
+            crate::recorder_panel::ICON_MAX,
+        ));
+        assert_eq!(
+            app.settings.channel_icons.get(4).copied(),
+            Some(crate::recorder_panel::ICON_MAX),
+            "the last badge in the table did not stick"
+        );
     }
 
     /// A track OUTSIDE any selection is still painted alone.
@@ -36796,9 +37210,14 @@ mod folder_tests {
         app.set_in_folder(2, true);
         assert_eq!(app.folder_children(1), vec![2]);
 
+        // Tall enough for the header's three bands and WIDE enough for the
+        // bays' legibility floor - at the default header width the bay
+        // cells shed on every track, folder or not, so a narrow fixture
+        // would only prove the shed.
+        app.settings.arr_header_w = 420.0;
         let rect = egui::Rect::from_min_size(
             egui::Pos2::ZERO,
-            egui::Vec2::new(1300.0, 700.0),
+            egui::Vec2::new(1300.0, 1000.0),
         );
         let clips = app.arr_clip_views();
         let view = app.arrange_view(&clips);
@@ -36818,16 +37237,44 @@ mod folder_tests {
             child > plain + 5.0,
             "the child was not indented: {child} vs {plain}"
         );
-        // And the folder box exists on a used track, at the bottom-left.
-        let box_r = l.header_rows[1].folder;
-        assert!(box_r.is_positive(), "the folder box was not laid out");
+        // The BOX retired with the toggle it carried; the collapse ARROW
+        // holds the bottom-left seat now, on the folder lane alone, and a
+        // folder wears no input selector and no arm - it is a grouper.
         assert!(
-            box_r.bottom() <= l.header_rows[1].panel.bottom() + 0.5,
-            "the box is not at the bottom"
+            !l.header_rows[1].folder.is_positive(),
+            "the retired folder box came back"
+        );
+        let arrow = l.header_rows[1].collapse;
+        assert!(arrow.is_positive(), "the collapse arrow was not laid out");
+        assert!(
+            arrow.bottom() <= l.header_rows[1].panel.bottom() + 0.5,
+            "the arrow is not at the bottom"
         );
         assert!(
-            box_r.left() < l.header_rows[1].name.left(),
-            "the box is not at the left"
+            arrow.left() < l.header_rows[1].name.left(),
+            "the arrow is not at the left"
+        );
+        assert!(
+            !l.header_rows[0].collapse.is_positive(),
+            "a plain track grew a collapse arrow"
+        );
+        assert!(
+            !l.header_rows[1].input.is_positive(),
+            "the folder kept an input selector"
+        );
+        assert!(
+            !l.header_rows[1].arm.is_positive(),
+            "the folder kept a record arm"
+        );
+        // Three on three: all six bays laid out, the second rack's row
+        // strictly above the first's.
+        let bays = l.header_rows[1].bays;
+        for (b, r) in bays.iter().enumerate() {
+            assert!(r.is_positive(), "folder bay {b} was shed at full width");
+        }
+        assert!(
+            bays[3].bottom() <= bays[0].top() + 0.5,
+            "the second rack's row is not above the first's"
         );
     }
 

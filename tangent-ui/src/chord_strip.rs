@@ -907,21 +907,16 @@ mod heart_geometry_tests {
     }
 }
 
-/// **The cheater's heart.** A heart whose surface is the theme's MASTER
-/// colour glowing in slow, out-of-step patches, with a static black
-/// crackle drawn across it and a matching border - the Konami mark, worn
-/// instead of every other heart while the cheat marker stands.
+/// **The cheater's heart, third and final cut - the owner's two-change
+/// spec.** Same size, same colours as before: the theme's MASTER colour
+/// for the body, that colour crushed to a sixth for the border. What
+/// changed: the body is ONE slow iridescent glow - a sheen that drifts
+/// across the face while the whole heart breathes, no per-cell noise,
+/// which is what read as gibberish - and the corruption is exactly THREE
+/// veins, drawn as jagged lines in the border's own colour.
 ///
-/// The owner's spec, precisely: the ONLY thing that animates is the glow,
-/// each region on its own slow interval; the crackle is corruption drawn
-/// ACROSS that glow, never flickering with it. And it is per-theme ALL the
-/// way down - the glow is the master colour (crimson on Default, the spec
-/// image), and the crackle and border are that same colour crushed to a
-/// near-black of itself, because a surface derives its parts and nothing
-/// here is a fixed black.
-///
-/// Deterministic like the confetti: patch phases and the crack pattern are
-/// hashes of the pixel grid, so two machines wear the same heart.
+/// Deterministic: the sheen is a function of time and position alone, and
+/// the veins are authored points, so two machines wear the same heart.
 pub fn draw_heart_crackle(painter: &Painter, rect: Rect, glow: Color32, t: f32) {
     if !rect.is_positive() {
         return;
@@ -929,21 +924,25 @@ pub fn draw_heart_crackle(painter: &Painter, rect: Rect, glow: Color32, t: f32) 
     let Some((px, origin)) = heart_grid(rect) else {
         return;
     };
-    // The corruption's material: the theme's own glow at a sixth of itself.
-    // On Default that is crimson's black; on every other theme, its own.
     let dark = Color32::from_rgb(glow.r() / 6, glow.g() / 6, glow.b() / 6);
-    let h = |a: usize, b: usize, salt: u32| -> f32 {
-        let mut x = (a as u32)
-            .wrapping_mul(2_654_435_761)
-            .wrapping_add((b as u32).wrapping_mul(40_503))
-            .wrapping_add(salt.wrapping_mul(97));
-        x ^= x >> 15;
-        x = x.wrapping_mul(2_246_822_519);
-        x ^= x >> 13;
-        (x & 0xFFFF) as f32 / 65_536.0
+    let cols = HEART[0].len() as f32;
+    let rows = HEART.len() as f32;
+    // Toward white, for the sheen's bright edge - iridescence is the light
+    // moving, not the colour changing.
+    let light = Color32::from_rgb(
+        glow.r().saturating_add((255 - glow.r()) / 3),
+        glow.g().saturating_add((255 - glow.g()) / 3),
+        glow.b().saturating_add((255 - glow.b()) / 3),
+    );
+    let lerp = |a: Color32, b: Color32, k: f32| {
+        let k = k.clamp(0.0, 1.0);
+        Color32::from_rgb(
+            (f32::from(a.r()) + (f32::from(b.r()) - f32::from(a.r())) * k) as u8,
+            (f32::from(a.g()) + (f32::from(b.g()) - f32::from(a.g())) * k) as u8,
+            (f32::from(a.b()) + (f32::from(b.b()) - f32::from(a.b())) * k) as u8,
+        )
     };
-    // Border first: the silhouette, same construction as the bordered
-    // heart's, in the corruption's dark rather than a hardcoded black.
+    // The border first: the silhouette, in the crushed colour.
     for (row, line) in HEART.iter().enumerate() {
         for (col, ch) in line.chars().enumerate() {
             if ch != 'X' {
@@ -957,37 +956,36 @@ pub fn draw_heart_crackle(painter: &Painter, rect: Rect, glow: Color32, t: f32) 
             );
         }
     }
-    // The glow: the whole surface, breathing in coarse patches. Each patch
-    // takes its own phase AND its own slow rate - regions brighten and
-    // settle out of step with one another, eight-to-eighteen-second
-    // cycles, and NOTHING else animates. Per-cell shimmer is what read as
-    // smoke; a patch is big enough to read as light under the surface.
+    // **The glow.** One slow breath for the whole heart (about a
+    // twelve-second cycle), and a sheen that drifts diagonally across the
+    // face on its own slower clock. Both are smooth in position, so the
+    // surface reads as one lit thing.
+    let breath = 0.80 + 0.20 * (t * 0.5).sin();
     for (row, line) in HEART.iter().enumerate() {
         for (col, ch) in line.chars().enumerate() {
             if ch != 'X' {
                 continue;
             }
-            let (pr, pc) = (row / 3, col / 3);
-            let phase = h(pr, pc, 11) * std::f32::consts::TAU;
-            let rate = 0.35 + h(pr, pc, 13) * 0.4;
-            let pulse = 0.58 + 0.42 * (0.5 + 0.5 * (t * rate + phase).sin());
+            let u = (col as f32 / cols + row as f32 / rows) * 0.5;
+            let sheen = 0.5 + 0.5 * (u * 6.0 - t * 0.35).sin();
+            let c = lerp(glow, light, 0.30 * sheen).gamma_multiply(breath);
             let p = Pos2::new(origin.x + col as f32 * px.x, origin.y + row as f32 * px.y);
-            painter.rect_filled(Rect::from_min_size(p, px), 0.0, glow.gamma_multiply(pulse));
+            painter.rect_filled(Rect::from_min_size(p, px), 0.0, c);
         }
     }
-    // The crackle, LAST and static: connected veins on the half-grid,
-    // drawn across the glow - the corruption interrupting the light, not
-    // flickering with it.
-    for (row, line) in HEART.iter().enumerate() {
-        for (col, ch) in line.chars().enumerate() {
-            if ch != 'X' {
-                continue;
-            }
-            if h(row / 2, col / 2, 5) < 0.38 {
-                let p =
-                    Pos2::new(origin.x + col as f32 * px.x, origin.y + row as f32 * px.y);
-                painter.rect_filled(Rect::from_min_size(p, px), 0.0, dark);
-            }
-        }
+    // **Three veins**, authored, jagged, in the border's colour - the
+    // whole of the corruption now. Coordinates are fractions of the
+    // sprite's box.
+    let at = |nx: f32, ny: f32| {
+        Pos2::new(origin.x + nx * cols * px.x, origin.y + ny * rows * px.y)
+    };
+    let w = Stroke::new((px.x * 0.45).max(1.2), dark);
+    for vein in [
+        &[(0.30, 0.10), (0.36, 0.32), (0.30, 0.52), (0.36, 0.74)][..],
+        &[(0.62, 0.16), (0.55, 0.38), (0.61, 0.58), (0.55, 0.72)][..],
+        &[(0.44, 0.34), (0.50, 0.52), (0.46, 0.72), (0.50, 0.88)][..],
+    ] {
+        let pts: Vec<Pos2> = vein.iter().map(|(x, y)| at(*x, *y)).collect();
+        painter.add(egui::Shape::line(pts, w));
     }
 }
