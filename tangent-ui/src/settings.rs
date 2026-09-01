@@ -1005,6 +1005,34 @@ pub struct Settings {
     /// Which of the cartridge's thirty-two patches, 0-based. Meaningless
     /// without `dx7_cartridge`, and ignored when that does not load.
     pub dx7_patch: usize,
+    /// Which of the modelled keyboard's patches is loaded: an index into
+    /// `keys::Patch::ALL`, so 0 is the piano and 1 the electric piano.
+    ///
+    /// An INDEX and not a name, because this file is read by a build that may
+    /// be older than the session that wrote it, and an unknown name would have
+    /// to fail somewhere. An index out of range clamps to the piano, which is
+    /// the same thing `dx7_patch` does with a cartridge that got shorter.
+    ///
+    /// Since the instruments went per-lane this is the SEED for a strip that
+    /// has no entry of its own below — which is exactly what every strip in
+    /// an old session is, so an old session sounds unchanged.
+    pub keys_patch: usize,
+    /// **Per-strip instrument state, one entry per general channel.** The
+    /// in-house instruments load a full instance per lane now, so which
+    /// cartridge, which patch and how the panel knobs sit are facts about a
+    /// STRIP, not about the session. Indexed by channel; the vectors are
+    /// resized to the desk on load, and a missing array (an old session)
+    /// seeds every strip from the session-wide fields above.
+    ///
+    /// The cartridge entries are paths, `""` meaning the bank that ships —
+    /// the same convention `dx7_cartridge` has always used.
+    pub strip_dx7_cartridge: Vec<String>,
+    pub strip_dx7_patch: Vec<usize>,
+    pub strip_keys_patch: Vec<usize>,
+    /// The keyboard panel's knobs, 0..=1 voicing (0.5 is the bench tuning)
+    /// and 0..=1.5 width (1.0 is the stock seating).
+    pub strip_keys_voicing: Vec<f64>,
+    pub strip_keys_width: Vec<f64>,
     pub metronome_gain: f64,
     /// The master, linear. Unity by default: it is a master, and a master that
     /// ships anywhere else is one every user has to put back.
@@ -1562,6 +1590,12 @@ impl Default for Settings {
             effect_params: Map::new(),
             dx7_cartridge: String::new(),
             dx7_patch: 0,
+            keys_patch: 0,
+            strip_dx7_cartridge: vec![String::new(); crate::recorder::CHANNELS],
+            strip_dx7_patch: vec![0; crate::recorder::CHANNELS],
+            strip_keys_patch: vec![0; crate::recorder::CHANNELS],
+            strip_keys_voicing: vec![0.5; crate::recorder::CHANNELS],
+            strip_keys_width: vec![1.0; crate::recorder::CHANNELS],
             metronome_gain: 0.5,
             master_gain: 1.0,
             lufs_window: crate::recorder::LoudnessWindow::default(),
@@ -2664,6 +2698,45 @@ impl Settings {
         // cartridge loads.
         if let Some(n) = map.shift_remove("dx7_patch").and_then(|v| v.as_u64()) {
             s.dx7_patch = (n as usize).min(crate::dialogs::CARTRIDGE_VOICES - 1);
+        }
+        if let Some(n) = map.shift_remove("keys_patch").and_then(|v| v.as_u64()) {
+            s.keys_patch = (n as usize).min(crate::dialogs::KEYS_PATCHES - 1);
+        }
+        // The per-strip instrument state. Parsed AFTER the session-wide
+        // fields above because a missing array seeds from them: an old
+        // session that said "keys_patch 1" gets the EP on every strip that
+        // holds the keyboard, which is the sound it had.
+        let n = crate::recorder::CHANNELS;
+        s.strip_dx7_cartridge = vec![s.dx7_cartridge.clone(); n];
+        s.strip_dx7_patch = vec![s.dx7_patch; n];
+        s.strip_keys_patch = vec![s.keys_patch; n];
+        s.strip_keys_voicing = vec![0.5; n];
+        s.strip_keys_width = vec![1.0; n];
+        if let Some(Value::Array(v)) = map.shift_remove("strip_dx7_cartridge") {
+            for (dst, x) in s.strip_dx7_cartridge.iter_mut().zip(v) {
+                *dst = x.as_str().unwrap_or_default().to_owned();
+            }
+        }
+        if let Some(Value::Array(v)) = map.shift_remove("strip_dx7_patch") {
+            for (dst, x) in s.strip_dx7_patch.iter_mut().zip(v) {
+                *dst = (x.as_u64().unwrap_or(0) as usize)
+                    .min(crate::dialogs::CARTRIDGE_VOICES - 1);
+            }
+        }
+        if let Some(Value::Array(v)) = map.shift_remove("strip_keys_patch") {
+            for (dst, x) in s.strip_keys_patch.iter_mut().zip(v) {
+                *dst = (x.as_u64().unwrap_or(0) as usize).min(crate::dialogs::KEYS_PATCHES - 1);
+            }
+        }
+        if let Some(Value::Array(v)) = map.shift_remove("strip_keys_voicing") {
+            for (dst, x) in s.strip_keys_voicing.iter_mut().zip(v) {
+                *dst = x.as_f64().unwrap_or(0.5).clamp(0.0, 1.0);
+            }
+        }
+        if let Some(Value::Array(v)) = map.shift_remove("strip_keys_width") {
+            for (dst, x) in s.strip_keys_width.iter_mut().zip(v) {
+                *dst = x.as_f64().unwrap_or(1.0).clamp(0.0, 1.5);
+            }
         }
         // Gains are sanitised HERE rather than at the point of use, unlike the
         // tuning and the capo, because a NaN or a negative multiplied into an
@@ -3985,6 +4058,42 @@ impl Settings {
         map.insert("metronome_div".into(), Value::from(self.metronome_div));
         map.insert("strip_phase".into(), Value::from(self.strip_phase));
         map.insert("click_sample".into(), Value::String(self.click_sample.clone()));
+        // **New keys go HERE, at the end, and never in the middle.** The map
+        // preserves insertion order and that order is the file's order; a key
+        // added anywhere else rewrites every line below it the first time an
+        // older settings file is loaded and saved, which turns a one-line
+        // addition into a diff nobody can read and an upgrade nobody can undo.
+        map.insert("keys_patch".into(), Value::from(self.keys_patch));
+        map.insert(
+            "strip_dx7_cartridge".into(),
+            Value::Array(
+                self.strip_dx7_cartridge
+                    .iter()
+                    .map(|p| Value::String(p.clone()))
+                    .collect(),
+            ),
+        );
+        map.insert(
+            "strip_dx7_patch".into(),
+            Value::Array(self.strip_dx7_patch.iter().map(|&p| Value::from(p)).collect()),
+        );
+        map.insert(
+            "strip_keys_patch".into(),
+            Value::Array(self.strip_keys_patch.iter().map(|&p| Value::from(p)).collect()),
+        );
+        map.insert(
+            "strip_keys_voicing".into(),
+            Value::Array(
+                self.strip_keys_voicing
+                    .iter()
+                    .map(|&p| Value::from(p))
+                    .collect(),
+            ),
+        );
+        map.insert(
+            "strip_keys_width".into(),
+            Value::Array(self.strip_keys_width.iter().map(|&p| Value::from(p)).collect()),
+        );
         for (k, v) in &self.extra {
             map.insert(k.clone(), v.clone());
         }
@@ -4323,6 +4432,12 @@ impl Settings {
         self.bus_effect = fresh.bus_effect.clone();
         self.dx7_cartridge = fresh.dx7_cartridge.clone();
         self.dx7_patch = fresh.dx7_patch;
+        self.keys_patch = fresh.keys_patch;
+        self.strip_dx7_cartridge = fresh.strip_dx7_cartridge.clone();
+        self.strip_dx7_patch = fresh.strip_dx7_patch.clone();
+        self.strip_keys_patch = fresh.strip_keys_patch.clone();
+        self.strip_keys_voicing = fresh.strip_keys_voicing.clone();
+        self.strip_keys_width = fresh.strip_keys_width.clone();
         self.metronome_on = fresh.metronome_on;
         self.metronome_in_take = fresh.metronome_in_take;
         // The click's SOUND goes back with the click's other switches. A

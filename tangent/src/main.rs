@@ -30,6 +30,12 @@ mod outpath;
 /// patch is written in the source: no samples, no data, no licence questions.
 #[cfg(feature = "recorder")]
 mod dx7;
+/// A piano and an electric piano, computed rather than recorded. Zero samples
+/// for the same reason the DX7 carries none: a model has no velocity layers to
+/// cross and no loop points to hide, so it is right at every pitch and every
+/// force. Two patches, and both of them are arithmetic.
+#[cfg(feature = "recorder")]
+mod keys;
 /// Reverb and delay, on everything the app plays.
 #[cfg(feature = "recorder")]
 mod effects;

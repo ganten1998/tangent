@@ -1740,6 +1740,14 @@ pub enum RecorderRequest {
         slot: usize,
         index: usize,
     },
+    /// Load `strip`'s own cartridge and push its names to the picker.
+    ///
+    /// Raised when the patch picker opens on a strip: since the instruments
+    /// went per-lane, which thirty-two names the list should show is a fact
+    /// about the STRIP, and the host is the only side that can read a file.
+    LoadStripCartridge {
+        strip: usize,
+    },
     /// **Sound these notes through the loaded instrument.**
     ///
     /// The one way this crate can make a noise. It cannot reach the engine —
