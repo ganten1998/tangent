@@ -49,17 +49,57 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   export bounce mirrors all of it, and old sessions load with every strip
   seeded from the session-wide choice they were saved with.
 
-- **Tangent Keys grew a panel: two sounds, two knobs.** Clicking the bay
-  still lists Piano 1 and EP Mk.1, and beneath them now sit the two controls
-  that survive the argument against knobs on a physical model. Voicing scales
-  the hammer contact the way felt does, mellow to bright, with the centre
-  being exactly the tuning the bench signed; Width moves the per-key stereo
-  seating from a point source to a little wider than stock. Both are per
-  strip, both live on the physics rather than on the output, and choosing a
-  sound no longer closes the window, so you can pick, voice and play in one
-  visit.
+- **Tangent Keys grew a panel: two sounds, eight knobs each.** Clicking the
+  bay still lists Piano 1 and EP Mk.1, and beneath them now sits the sound's
+  own rack. The piano has Voicing, Width, Decay, Brilliance, Unison, Stretch,
+  Release and Soundboard; the electric piano has Voicing, Width, Decay, Bell,
+  Bark, Chime, Release and Tonebar. The lists differ because the instruments
+  differ: one has a course of strings to detune and a soundboard to open, the
+  other has a bell to weigh and a pickup to lean on, and showing one fixed
+  rack with half of it greyed out would be a lie about both.
+
+  Every knob acts on the physics rather than on the output, and every one is
+  centred on the tuning the bench signed off, so an untouched strip and a
+  freshly initialised sound make exactly the sound this release was voiced
+  for. Double-click a knob to put it back; the Initialise button puts the
+  whole sound back and leaves the other sound alone. Settings are per strip
+  AND per sound, so a piano track and a Rhodes track keep their own, and
+  switching a strip between the two finds each as it was left.
+
+- **A kit is a file you can send someone.** Saving a kit from the drumpad
+  writes a `.tgkit` that carries **the samples themselves** alongside the
+  layout - every pad's gain, pan, tune, choke, note-off behaviour and trim -
+  so a kit built on one machine loads on another with no shared folders and
+  no missing samples. Loading one copies the audio into the open project the
+  same way dragging a file in does, so the project stays self-contained.
+  Kits saved before this still open: they name paths, and those paths are
+  still tried.
 
 ### Fixed
+
+- **A drum track built before kits were per-lane opened silent.** A project
+  whose drumpad sat on any channel but the first handed its one saved kit to
+  channel 0 - often a piano track, where nothing strikes a pad - and the drum
+  track came up with a hundred and twenty-eight empty pads under a full
+  arrangement. Nothing had been lost: the samples were in the file the whole
+  time, on the wrong lane. The kit now lands on the channel whose first bay
+  actually holds the drumpad, which is the same question the pad-plugin
+  migration has been asking of the same desk for months.
+
+- **The Dock icon was too big on macOS, and rebuilding never fixed it.** The
+  bundle's icon was correct and had been for weeks; the running app was
+  replacing it. On macOS the icon handed to the window system becomes the
+  Dock tile of the running app, and Tangent was handing over its artwork
+  full-bleed while the bundle's copy is padded onto Apple's grid - so Tangent
+  drew about a quarter larger than every neighbour, every launch, and no
+  amount of clearing icon caches could help. The runtime icon is now padded
+  from the same constant the bundle uses, and it is no longer squeezed
+  through the 128-pixel ceiling that exists for X11, so it is sharp on a
+  Retina Dock as well.
+
+- **Choosing a keyboard sound did not visibly change anything** until the
+  panel was closed and reopened. The row lit up only on the next open, and
+  the knobs under it went on showing the sound that was no longer loaded.
 
 - **A capture buffer smaller than the PipeWire graph's cycle silently halved
   the recording**, and on the machine that found it, every ALSA video take
