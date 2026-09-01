@@ -317,6 +317,15 @@ struct Recorder {
     /// `reconcile_audio` will settle to "missing" and say so.
     rate_open: Option<u32>,
     system_open: Option<String>,
+    /// **What "Default" resolved to**, cached for this driver stack.
+    ///
+    /// `None` is "not asked yet"; `Some(None)` is "asked, and this machine has
+    /// no output to ask" — a distinction that matters because this is read
+    /// from the per-frame path check, and collapsing the two would re-probe
+    /// the audio device sixty times a second on a machine with no sound.
+    /// Thrown away whenever the audio system changes underneath it.
+    /// See `Engine::default_output_rate` for why Default must resolve at all.
+    default_rate: Option<Option<u32>>,
     /// Dropouts already reported, so only the new ones are announced.
     xruns_seen: u64,
     /// The graph's own count of this process's xruns, watched on a timer.
@@ -1922,8 +1931,18 @@ impl DesktopApp {
         // is no state to reconcile and nothing to reopen.
 
         let want_buffer = self.app.buffer_frames();
-        let want_rate = self.app.sample_rate();
         let want_system = self.app.audio_system();
+        // **The driver stack decides what Default resolves to**, so a change
+        // of system throws the cached answer away before it is asked for
+        // again — an ASIO driver and WASAPI do not have to agree about what
+        // the output's own rate is.
+        if self.recorder.system_open != want_system {
+            self.recorder.default_rate = None;
+        }
+        // Resolved, not raw: the change detector has to compare the rate the
+        // streams will actually OPEN at, or a Default that resolves to 48000
+        // reads as "no rate" forever and the reopen never fires.
+        let want_rate = self.effective_sample_rate();
         let path_changed = self.recorder.buffer_open != want_buffer
             || self.recorder.rate_open != want_rate
             || self.recorder.system_open != want_system;
@@ -6077,15 +6096,38 @@ impl DesktopApp {
         }
     }
 
+    /// **The rate BOTH halves of the audio path open at.**
+    ///
+    /// The user's choice when there is one; otherwise the output device's own
+    /// rate, imposed on the input as well. See `Engine::default_output_rate`
+    /// for the failure this exists to end — two devices at two rates make a
+    /// take that drifts, and "Default" used to be the setting that caused it.
+    fn effective_sample_rate(&mut self) -> Option<u32> {
+        if let Some(chosen) = self.app.sample_rate() {
+            return Some(chosen);
+        }
+        if self.recorder.default_rate.is_none() {
+            // One device open, cached until the driver stack changes —
+            // including the "there is no output" answer, which costs the same
+            // probe and would otherwise be paid for every frame.
+            self.recorder.default_rate =
+                Some(crate::instrument::Engine::default_output_rate(None));
+        }
+        self.recorder.default_rate.flatten()
+    }
+
     fn start_engine(&mut self, ctx: &egui::Context) {
         if self.recorder.engine.is_some() {
             return;
         }
+        // The RESOLVED rate, so the output and the input open at one rate
+        // even when the user has chosen none. See `effective_sample_rate`.
+        let rate = self.effective_sample_rate();
         match crate::instrument::Engine::start_sized(
             None,
             self.recorder.session.timebase(),
             self.app.buffer_frames(),
-            self.app.sample_rate(),
+            rate,
         ) {
             Ok(e) => {
                 self.recorder.engine = Some(e);
@@ -6725,6 +6767,12 @@ impl DesktopApp {
                 // a single-client driver's input MUST join the output's
                 // stream set, not open a second one. Ignored on every other
                 // backend. See `tangent_record::audio::open_input`.
+                // **The same rate the ENGINE opened at**, which is the whole
+                // point of resolving Default: the writer drains the ring at
+                // the input's rate while the engine fills it at the output's,
+                // and two devices left to their own defaults drift apart.
+                // Taken before `duplex_with` borrows the engine.
+                let rate = self.effective_sample_rate();
                 let duplex_with = self
                     .recorder
                     .engine
@@ -6734,7 +6782,7 @@ impl DesktopApp {
                     &choice.selection,
                     choice.channels,
                     self.app.buffer_frames(),
-                    self.app.sample_rate(),
+                    rate,
                     duplex_with,
                 );
                 // **The live tap, HELD until there is an engine to play it.**
@@ -7610,6 +7658,7 @@ impl DesktopApp {
                 buffer_open: app.buffer_frames(),
                 rate_open: app.sample_rate(),
                 system_open: app.audio_system(),
+                default_rate: None,
                 xruns_seen: 0,
                 graph_dropouts: tangent_record::audio::GraphDropouts::start(),
                 graph_floor: tangent_record::audio::graph_clock().map(|g| g.floor()),
