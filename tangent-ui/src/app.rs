@@ -18390,37 +18390,51 @@ impl TangentApp {
         self.settings.save();
     }
 
-    /// The keyboard panel's felt knob for one strip, 0 mellow to 1 bright.
-    pub fn keys_voicing_of(&self, strip: usize) -> f32 {
+    /// One knob of the keyboard panel, for one strip and the sound that
+    /// strip currently holds. Normalised 0..=1, like everything in the rack.
+    pub fn keys_param_of(&self, strip: usize, knob: usize) -> f32 {
+        let patch = self.keys_patch_of(strip);
         self.settings
-            .strip_keys_voicing
-            .get(strip)
+            .strip_keys_params
+            .get(dialogs::keys_param_index(strip, patch, knob))
             .copied()
-            .unwrap_or(0.5)
+            .unwrap_or_else(|| f64::from(Self::keys_param_default(patch, knob)))
             .clamp(0.0, 1.0) as f32
     }
 
-    pub fn set_keys_voicing_of(&mut self, strip: usize, value: f32) {
-        if let Some(slot) = self.settings.strip_keys_voicing.get_mut(strip) {
+    /// Where a knob sits when the sound is initialised.
+    pub fn keys_param_default(patch: usize, knob: usize) -> f32 {
+        dialogs::KEYS_PARAM_SPECS
+            .get(patch)
+            .and_then(|specs| specs.get(knob))
+            .map_or(0.5, |spec| spec.2)
+    }
+
+    /// Every knob of the strip's current sound, in the panel's order — what
+    /// the engine is handed each block.
+    pub fn keys_params_of(&self, strip: usize) -> [f32; dialogs::KEYS_PARAMS] {
+        std::array::from_fn(|knob| self.keys_param_of(strip, knob))
+    }
+
+    pub fn set_keys_param_of(&mut self, strip: usize, knob: usize, value: f32) {
+        let patch = self.keys_patch_of(strip);
+        let at = dialogs::keys_param_index(strip, patch, knob);
+        if let Some(slot) = self.settings.strip_keys_params.get_mut(at) {
             *slot = f64::from(value.clamp(0.0, 1.0));
         }
         self.save_settings_soon();
     }
 
-    /// The keyboard panel's width knob for one strip: 0 mono, 1 the stock
-    /// seating, 1.5 leaning wider.
-    pub fn keys_width_of(&self, strip: usize) -> f32 {
-        self.settings
-            .strip_keys_width
-            .get(strip)
-            .copied()
-            .unwrap_or(1.0)
-            .clamp(0.0, 1.5) as f32
-    }
-
-    pub fn set_keys_width_of(&mut self, strip: usize, value: f32) {
-        if let Some(slot) = self.settings.strip_keys_width.get_mut(strip) {
-            *slot = f64::from(value.clamp(0.0, 1.5));
+    /// **Initialise the sound**: every knob of this strip's current patch
+    /// back to the bench's own value. The other patch's knobs are left
+    /// exactly as they are — the button says the SOUND, and it means it.
+    pub fn reset_keys_params_of(&mut self, strip: usize) {
+        let patch = self.keys_patch_of(strip);
+        for knob in 0..dialogs::KEYS_PARAMS {
+            let at = dialogs::keys_param_index(strip, patch, knob);
+            if let Some(slot) = self.settings.strip_keys_params.get_mut(at) {
+                *slot = f64::from(Self::keys_param_default(patch, knob));
+            }
         }
         self.save_settings_soon();
     }
@@ -18991,8 +19005,7 @@ impl TangentApp {
         self.dialog = Some(Dialog::KeysPatch {
             slot,
             selected: self.keys_patch_of(slot),
-            voicing: self.keys_voicing_of(slot),
-            width: self.keys_width_of(slot),
+            params: self.keys_params_of(slot),
         });
     }
 
@@ -22604,12 +22617,40 @@ impl TangentApp {
             }
             DialogAction::ChooseKeysPatch { slot, index } => {
                 self.set_keys_patch_of(slot, index);
+                // **The rack belongs to the SOUND, so it changes with it.**
+                // The panel keeps its own copy of the knobs to make a drag
+                // smooth; leaving that copy alone across a patch change left
+                // the piano's numbers under the electric piano's names until
+                // the window was closed and reopened.
+                let fresh = self.keys_params_of(slot);
+                if let Some(Dialog::KeysPatch {
+                    slot: open_on,
+                    selected,
+                    params,
+                }) = &mut self.dialog
+                {
+                    if *open_on == slot {
+                        *selected = index;
+                        *params = fresh;
+                    }
+                }
             }
-            DialogAction::SetKeysVoicing { slot, value } => {
-                self.set_keys_voicing_of(slot, value);
+            DialogAction::SetKeysParam { slot, knob, value } => {
+                self.set_keys_param_of(slot, knob, value);
             }
-            DialogAction::SetKeysWidth { slot, value } => {
-                self.set_keys_width_of(slot, value);
+            DialogAction::ResetKeysParams { slot } => {
+                self.reset_keys_params_of(slot);
+                let fresh = self.keys_params_of(slot);
+                if let Some(Dialog::KeysPatch {
+                    slot: open_on,
+                    params,
+                    ..
+                }) = &mut self.dialog
+                {
+                    if *open_on == slot {
+                        *params = fresh;
+                    }
+                }
             }
             DialogAction::ChoosePatch { slot, index } => {
                 // `usize::MAX` is the built-in row: no cartridge patch, the one

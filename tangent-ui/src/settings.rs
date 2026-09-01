@@ -1029,10 +1029,23 @@ pub struct Settings {
     pub strip_dx7_cartridge: Vec<String>,
     pub strip_dx7_patch: Vec<usize>,
     pub strip_keys_patch: Vec<usize>,
-    /// The keyboard panel's knobs, 0..=1 voicing (0.5 is the bench tuning)
-    /// and 0..=1.5 width (1.0 is the stock seating).
-    pub strip_keys_voicing: Vec<f64>,
-    pub strip_keys_width: Vec<f64>,
+    /// **The keyboard panel's knob rack, per strip AND per sound**, every
+    /// value 0..=1. Flat, indexed by
+    /// `(channel * KEYS_PATCHES + patch) * KEYS_PARAMS + knob`, because a
+    /// nested array in a settings file is three ways to be ragged and this
+    /// is one length to check.
+    ///
+    /// Per SOUND because the knobs are the sound's own: knob 4 detunes a
+    /// piano's unison and leans on an electric piano's pickup, so carrying
+    /// one across to the other would apply a number to a mechanism that
+    /// never asked for it. Switching patch and switching back finds the
+    /// instrument as it was left.
+    ///
+    /// A session with no array at all — every session written before the
+    /// rack — is seeded from `strip_keys_voicing`/`strip_keys_width`, the
+    /// two knobs that shipped first, which become knobs 0 and 1 of both
+    /// sounds. That is exactly what those two meant.
+    pub strip_keys_params: Vec<f64>,
     pub metronome_gain: f64,
     /// The master, linear. Unity by default: it is a master, and a master that
     /// ships anywhere else is one every user has to put back.
@@ -1594,8 +1607,7 @@ impl Default for Settings {
             strip_dx7_cartridge: vec![String::new(); crate::recorder::CHANNELS],
             strip_dx7_patch: vec![0; crate::recorder::CHANNELS],
             strip_keys_patch: vec![0; crate::recorder::CHANNELS],
-            strip_keys_voicing: vec![0.5; crate::recorder::CHANNELS],
-            strip_keys_width: vec![1.0; crate::recorder::CHANNELS],
+            strip_keys_params: crate::dialogs::keys_params_default(crate::recorder::CHANNELS),
             metronome_gain: 0.5,
             master_gain: 1.0,
             lufs_window: crate::recorder::LoudnessWindow::default(),
@@ -2710,8 +2722,7 @@ impl Settings {
         s.strip_dx7_cartridge = vec![s.dx7_cartridge.clone(); n];
         s.strip_dx7_patch = vec![s.dx7_patch; n];
         s.strip_keys_patch = vec![s.keys_patch; n];
-        s.strip_keys_voicing = vec![0.5; n];
-        s.strip_keys_width = vec![1.0; n];
+        s.strip_keys_params = crate::dialogs::keys_params_default(n);
         if let Some(Value::Array(v)) = map.shift_remove("strip_dx7_cartridge") {
             for (dst, x) in s.strip_dx7_cartridge.iter_mut().zip(v) {
                 *dst = x.as_str().unwrap_or_default().to_owned();
@@ -2728,14 +2739,36 @@ impl Settings {
                 *dst = (x.as_u64().unwrap_or(0) as usize).min(crate::dialogs::KEYS_PATCHES - 1);
             }
         }
+        // **The two knobs that shipped first, read as knobs 0 and 1.** They
+        // were per strip and patch-blind, so they seed BOTH sounds; width
+        // was 0..=1.5 in that build and normalises here, which is the whole
+        // reason the rack made everything 0..=1.
         if let Some(Value::Array(v)) = map.shift_remove("strip_keys_voicing") {
-            for (dst, x) in s.strip_keys_voicing.iter_mut().zip(v) {
-                *dst = x.as_f64().unwrap_or(0.5).clamp(0.0, 1.0);
+            for (ch, x) in v.iter().enumerate().take(n) {
+                let val = x.as_f64().unwrap_or(0.5).clamp(0.0, 1.0);
+                for patch in 0..crate::dialogs::KEYS_PATCHES {
+                    let at = crate::dialogs::keys_param_index(ch, patch, 0);
+                    if let Some(slot) = s.strip_keys_params.get_mut(at) {
+                        *slot = val;
+                    }
+                }
             }
         }
         if let Some(Value::Array(v)) = map.shift_remove("strip_keys_width") {
-            for (dst, x) in s.strip_keys_width.iter_mut().zip(v) {
-                *dst = x.as_f64().unwrap_or(1.0).clamp(0.0, 1.5);
+            for (ch, x) in v.iter().enumerate().take(n) {
+                let val = (x.as_f64().unwrap_or(1.0).clamp(0.0, 1.5)) / 1.5;
+                for patch in 0..crate::dialogs::KEYS_PATCHES {
+                    let at = crate::dialogs::keys_param_index(ch, patch, 1);
+                    if let Some(slot) = s.strip_keys_params.get_mut(at) {
+                        *slot = val;
+                    }
+                }
+            }
+        }
+        // The rack itself, last, so it wins over the two it replaced.
+        if let Some(Value::Array(v)) = map.shift_remove("strip_keys_params") {
+            for (dst, x) in s.strip_keys_params.iter_mut().zip(v) {
+                *dst = x.as_f64().unwrap_or(0.5).clamp(0.0, 1.0);
             }
         }
         // Gains are sanitised HERE rather than at the point of use, unlike the
@@ -4082,17 +4115,8 @@ impl Settings {
             Value::Array(self.strip_keys_patch.iter().map(|&p| Value::from(p)).collect()),
         );
         map.insert(
-            "strip_keys_voicing".into(),
-            Value::Array(
-                self.strip_keys_voicing
-                    .iter()
-                    .map(|&p| Value::from(p))
-                    .collect(),
-            ),
-        );
-        map.insert(
-            "strip_keys_width".into(),
-            Value::Array(self.strip_keys_width.iter().map(|&p| Value::from(p)).collect()),
+            "strip_keys_params".into(),
+            Value::Array(self.strip_keys_params.iter().map(|&p| Value::from(p)).collect()),
         );
         for (k, v) in &self.extra {
             map.insert(k.clone(), v.clone());
@@ -4436,8 +4460,7 @@ impl Settings {
         self.strip_dx7_cartridge = fresh.strip_dx7_cartridge.clone();
         self.strip_dx7_patch = fresh.strip_dx7_patch.clone();
         self.strip_keys_patch = fresh.strip_keys_patch.clone();
-        self.strip_keys_voicing = fresh.strip_keys_voicing.clone();
-        self.strip_keys_width = fresh.strip_keys_width.clone();
+        self.strip_keys_params = fresh.strip_keys_params.clone();
         self.metronome_on = fresh.metronome_on;
         self.metronome_in_take = fresh.metronome_in_take;
         // The click's SOUND goes back with the click's other switches. A

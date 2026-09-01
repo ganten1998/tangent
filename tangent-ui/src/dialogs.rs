@@ -146,10 +146,13 @@ pub enum Dialog {
         slot: usize,
         /// Index into [`KEYS_PATCH_NAMES`].
         selected: usize,
-        /// The felt: 0 mellow, 1 bright, 0.5 the tuning the bench signed.
-        voicing: f32,
-        /// The seating: 0 mono, 1 stock, 1.5 leaning wider.
-        width: f32,
+        /// **The chosen sound's whole rack**, normalised 0..=1 and in the
+        /// order [`KEYS_PARAM_SPECS`] lists it for that sound.
+        ///
+        /// The panel holds its own copy so a drag is smooth, and the app
+        /// re-seeds it whenever the sound changes: the knobs BELONG to the
+        /// sound, so the rack the panel is showing has to change with it.
+        params: [f32; KEYS_PARAMS],
     },
     /// Build a patch by hand: every number a DX7 stores, and a picture of the
     /// algorithm.
@@ -814,16 +817,17 @@ pub enum DialogAction {
         slot: usize,
         index: usize,
     },
-    /// The keyboard panel's felt knob moved, 0..=1. Fired per change so the
-    /// sound follows the drag, exactly as the DX7 editor's rows do.
-    SetKeysVoicing {
+    /// One of the keyboard panel's knobs moved, 0..=1. Fired per change so
+    /// the sound follows the drag, exactly as the DX7 editor's rows do.
+    SetKeysParam {
         slot: usize,
+        knob: usize,
         value: f32,
     },
-    /// The keyboard panel's width knob moved, 0..=1.5.
-    SetKeysWidth {
+    /// **Initialise the sound**: every knob of the strip's current patch back
+    /// to the value the bench signed off. The other sound is untouched.
+    ResetKeysParams {
         slot: usize,
-        value: f32,
     },
     ChoosePatch {
         slot: usize,
@@ -1983,6 +1987,68 @@ pub const KEYS_PATCH_NAMES: [(&str, &str); KEYS_PATCHES] = [
         "tine electric piano, dry - light is bell, hard is bark",
     ),
 ];
+
+/// How many knobs a keyboard sound exposes, and what they are.
+///
+/// **The mirror of `keys::ParamSpec`, for the same reason the names above are
+/// a mirror**: the panel, the settings clamp and the reset button all need
+/// this table and none of them can see the audio crate. A test in that crate
+/// pins the two tables against each other name for name and default for
+/// default, so a knob added there and forgotten here fails a build rather
+/// than shipping a panel that quietly cannot reach half the instrument.
+///
+/// `(name, what it does, where it sits when the sound is initialised)`.
+pub const KEYS_PARAMS: usize = 8;
+pub const KEYS_PARAM_SPECS: [[(&str, &str, f32); KEYS_PARAMS]; KEYS_PATCHES] = [
+    [
+        ("Voicing", "hammer felt: needled soft to lacquered bright", 0.5),
+        ("Width", "how far bass and treble sit apart", 1.0 / 1.5),
+        ("Decay", "how long a struck string rings", 0.5),
+        (
+            "Brilliance",
+            "how long the upper partials outlast the fundamental",
+            0.5,
+        ),
+        (
+            "Unison",
+            "detune between the strings of a course: the beating",
+            0.5,
+        ),
+        ("Stretch", "string stiffness, which pulls the partials sharp", 0.5),
+        ("Release", "how fast the damper stops a string", 0.5),
+        ("Soundboard", "the body under everything, and the pedalled wash", 0.5),
+    ],
+    [
+        ("Voicing", "hammer tip: soft to hard against the tine", 0.5),
+        ("Width", "how far bass and treble sit apart", 1.0 / 1.5),
+        ("Decay", "how long the tine rings", 0.5),
+        ("Bell", "the glassy chime on the attack", 0.5),
+        ("Bark", "how hard the tine leans on the pickup", 0.5),
+        ("Chime", "where the bell partial sits above the note", 0.5),
+        ("Release", "how fast the damper stops the tine", 0.5),
+        ("Tonebar", "the metal the tine is bolted to", 0.5),
+    ],
+];
+
+/// Where strip `ch`'s knob `knob` for `patch` sits in the flat settings
+/// array. One definition, because an index computed in three places is three
+/// chances to write one sound's knob into another's slot.
+pub fn keys_param_index(ch: usize, patch: usize, knob: usize) -> usize {
+    (ch * KEYS_PATCHES + patch) * KEYS_PARAMS + knob
+}
+
+/// A whole desk's worth of knobs at their initialised values.
+pub fn keys_params_default(channels: usize) -> Vec<f64> {
+    let mut out = vec![0.0; channels * KEYS_PATCHES * KEYS_PARAMS];
+    for ch in 0..channels {
+        for (patch, specs) in KEYS_PARAM_SPECS.iter().enumerate() {
+            for (knob, spec) in specs.iter().enumerate() {
+                out[keys_param_index(ch, patch, knob)] = f64::from(spec.2);
+            }
+        }
+    }
+    out
+}
 
 /// Every effect Tangent ships, as a picker row.
 ///
@@ -3430,8 +3496,7 @@ pub fn show(
         Dialog::KeysPatch {
             slot,
             selected,
-            voicing,
-            width,
+            params,
         } => {
             // **The surface derives its own parts.** `surface_of` returns a
             // ground that can carry ink, the ink that holds on it, and the
@@ -3442,12 +3507,15 @@ pub fn show(
             let p = crate::recorder_panel::surface_of(face);
             let slot = *slot;
             let chosen = *selected;
+            let specs = KEYS_PARAM_SPECS
+                .get(chosen)
+                .unwrap_or(&KEYS_PARAM_SPECS[0]);
             show_dialog_viewport(
                 ctx,
                 placement,
                 KEYS_NAME,
-                Vec2::new(360.0, 316.0),
-                Vec2::new(300.0, 280.0),
+                Vec2::new(392.0, 520.0),
+                Vec2::new(330.0, 320.0),
                 |ui, result| {
                     apply_theme(ui.style_mut(), &theme(face));
                     ui.painter().rect_filled(ui.max_rect(), 0.0, p.bg);
@@ -3486,6 +3554,16 @@ pub fn show(
                                     p.faint,
                                 );
                                 if resp.clicked() {
+                                    // **The row lights up NOW.** Firing the
+                                    // action and leaving `selected` alone is
+                                    // what made choosing a sound look like it
+                                    // had done nothing until the window was
+                                    // shut and opened again: the panel is
+                                    // drawn from its own state, so its own
+                                    // state is what has to move. The app
+                                    // re-seeds the knobs behind this, because
+                                    // the rack belongs to the sound.
+                                    *selected = i;
                                     action =
                                         Some(DialogAction::ChooseKeysPatch { slot, index: i });
                                     // Choosing a sound does not close the
@@ -3497,49 +3575,115 @@ pub fn show(
                                 }
                                 ui.add_space(5.0);
                             }
-                            ui.add_space(8.0);
-                            // ── the two knobs, per strip like everything
-                            // else in this panel. Fired per change, so the
-                            // sound follows the drag the way the DX7
-                            // editor's rows do.
+                            ui.add_space(6.0);
+
+                            // ── the rack. Per SOUND: the list comes from the
+                            // patch, so a piano shows an unison and a soundboard
+                            // and an electric piano shows a bell and a pickup,
+                            // rather than one fixed set with half of it lying.
+                            let mut reset_all = false;
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new("Voicing").font(bold(11.0)).color(p.ink));
-                                let mut v = *voicing;
-                                if ui
-                                    .add(egui::Slider::new(&mut v, 0.0..=1.0).show_value(false))
-                                    .changed()
-                                {
-                                    *voicing = v;
-                                    action = Some(DialogAction::SetKeysVoicing { slot, value: v });
-                                }
                                 ui.label(
-                                    RichText::new(if v < 0.34 {
-                                        "mellow"
-                                    } else if v > 0.66 {
-                                        "bright"
-                                    } else {
-                                        "as voiced"
-                                    })
-                                    .font(bold(10.0))
-                                    .color(p.faint),
-                                );
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new("Width  ").font(bold(11.0)).color(p.ink));
-                                let mut w = *width;
-                                if ui
-                                    .add(egui::Slider::new(&mut w, 0.0..=1.5).show_value(false))
-                                    .changed()
-                                {
-                                    *width = w;
-                                    action = Some(DialogAction::SetKeysWidth { slot, value: w });
-                                }
-                                ui.label(
-                                    RichText::new(format!("{:>3.0}%", w * 100.0))
-                                        .font(bold(10.0))
+                                    RichText::new("SOUND")
+                                        .font(FontId::new(10.0, fonts::courier_bold()))
                                         .color(p.faint),
                                 );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        // The explicit one. A knob resets on a
+                                        // double click; the whole sound resets
+                                        // here, because "put it back" should
+                                        // not be eight gestures.
+                                        if ui
+                                            .add(
+                                                egui::Button::new(
+                                                    RichText::new("Initialise")
+                                                        .font(bold(11.0))
+                                                        .color(p.ink),
+                                                )
+                                                .fill(p.raised),
+                                            )
+                                            .on_hover_text(
+                                                "every knob of this sound back to the bench's own",
+                                            )
+                                            .clicked()
+                                        {
+                                            reset_all = true;
+                                        }
+                                    },
+                                );
                             });
+                            ui.add_space(4.0);
+
+                            egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    for (knob, (name, about, default)) in
+                                        specs.iter().enumerate()
+                                    {
+                                        let Some(cur) = params.get_mut(knob) else {
+                                            continue;
+                                        };
+                                        let mut v = *cur;
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                RichText::new(format!("{name:<11}"))
+                                                    .font(bold(11.0))
+                                                    .color(p.ink),
+                                            );
+                                            let resp = ui.add(
+                                                egui::Slider::new(&mut v, 0.0..=1.0)
+                                                    .show_value(false),
+                                            );
+                                            // **Double click puts it back.**
+                                            // On the knob itself, which is
+                                            // where the hand already is.
+                                            if resp.double_clicked() {
+                                                v = *default;
+                                            }
+                                            let resp = resp.on_hover_text(format!(
+                                                "{about}\ndouble-click to reset"
+                                            ));
+                                            if resp.changed() || resp.double_clicked() {
+                                                *cur = v;
+                                                action = Some(DialogAction::SetKeysParam {
+                                                    slot,
+                                                    knob,
+                                                    value: v,
+                                                });
+                                            }
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "{:>3.0}%",
+                                                    f64::from(v) * 100.0
+                                                ))
+                                                .font(FontId::new(10.0, fonts::courier_bold()))
+                                                .color(if (v - *default).abs() < 1.0e-4 {
+                                                    p.faint
+                                                } else {
+                                                    // Moved off the bench's
+                                                    // value, and saying so is
+                                                    // the whole reason a
+                                                    // reset is findable.
+                                                    p.ink
+                                                }),
+                                            );
+                                        });
+                                        ui.label(
+                                            RichText::new(*about)
+                                                .font(FontId::new(9.0, fonts::courier_bold()))
+                                                .color(p.faint),
+                                        );
+                                        ui.add_space(4.0);
+                                    }
+                                });
+                            if reset_all {
+                                for (slot_v, spec) in params.iter_mut().zip(specs.iter()) {
+                                    *slot_v = spec.2;
+                                }
+                                action = Some(DialogAction::ResetKeysParams { slot });
+                            }
                         });
                 },
             )

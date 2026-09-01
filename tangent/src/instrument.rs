@@ -1730,12 +1730,16 @@ struct Shared {
     /// number per lane, so this is a store on one side and a compare on the
     /// other.
     keys_patch: [AtomicU32; CHANNELS],
-    /// The keyboard panel's two knobs, per lane, as f32 bits: VOICING
-    /// (0 mellow, 1 bright, 0.5 the bench tuning) and WIDTH (0 mono, 1 the
-    /// stock seating). Same protocol as the patch: the host stores, the
+    /// **The keyboard panel's whole knob rack, per lane**: `[channel][knob]`,
+    /// each an f32 in 0..=1 as bits, indexed by the loaded patch's
+    /// `ParamSpec` list. Same protocol as the patch: the host stores, the
     /// callback applies before the block's strikes.
-    keys_voicing: [AtomicU32; CHANNELS],
-    keys_width: [AtomicU32; CHANNELS],
+    ///
+    /// The values are per PATCH on the host's side — a piano's Unison is an
+    /// electric piano's Bark at the same index — but only the loaded patch's
+    /// set ever reaches here, so the callback needs no second dimension and
+    /// no idea which sound is up.
+    keys_params: [[AtomicU32; crate::keys::MAX_PARAMS]; CHANNELS],
     /// Which general channel each capture PICK feeds: desk indices, -1 for an
     /// unbound pick. The k-th AUDIO channel takes pick k — the HOST computes
     /// the order, the callback only reads it, which is the same trust split
@@ -2175,8 +2179,10 @@ impl Shared {
             builtin_strips: AtomicU32::new(0),
             keys_strips: AtomicU32::new(0),
             keys_patch: std::array::from_fn(|_| AtomicU32::new(0)),
-            keys_voicing: std::array::from_fn(|_| AtomicU32::new(0.5f32.to_bits())),
-            keys_width: std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
+            keys_params: {
+                let d = crate::keys::Patch::default().defaults();
+                std::array::from_fn(|_| std::array::from_fn(|i| AtomicU32::new(d[i].to_bits())))
+            },
             pick_strip: std::array::from_fn(|_| AtomicI64::new(-1)),
             punch: std::array::from_fn(|_| AtomicU64::new(u64::MAX)),
             metro_gain: AtomicU32::new(0.7f32.to_bits()),
@@ -6871,12 +6877,17 @@ impl Renderer {
                     if let Some(p) = crate::keys::Patch::ALL.get(want) {
                         k.set_patch(*p);
                     }
-                    k.set_voicing(f32::from_bits(
-                        self.shared.keys_voicing[ch].load(Ordering::Relaxed),
-                    ));
-                    k.set_width(f32::from_bits(
-                        self.shared.keys_width[ch].load(Ordering::Relaxed),
-                    ));
+                    // The whole rack every block, like the patch above it:
+                    // a fixed-length copy of eight loads, no queue and no
+                    // allocation, so a knob moved mid-phrase is heard on the
+                    // next strike and never on a held note.
+                    let mut knobs = [0.0_f32; crate::keys::MAX_PARAMS];
+                    for (i, slot) in knobs.iter_mut().enumerate() {
+                        *slot = f32::from_bits(
+                            self.shared.keys_params[ch][i].load(Ordering::Relaxed),
+                        );
+                    }
+                    k.set_params(&knobs);
                     if armed_here {
                         for c in &self.controls {
                             if c.controller == 64 {
@@ -9754,19 +9765,21 @@ impl Engine {
         cell.store(index as u32, Ordering::Relaxed);
     }
 
-    /// The keyboard panel's VOICING knob for lane `ch`: 0 mellow, 1 bright,
-    /// 0.5 the bench tuning. Applied before the block's strikes.
-    pub fn set_keys_voicing(&self, ch: usize, v: f32) {
-        if let Some(cell) = self.shared.keys_voicing.get(ch) {
+    /// One of the keyboard panel's knobs for lane `ch`, normalised 0..=1 and
+    /// indexed by the loaded patch's `ParamSpec` list. Applied before the
+    /// block's strikes.
+    pub fn set_keys_param(&self, ch: usize, index: usize, v: f32) {
+        if let Some(cell) = self.shared.keys_params.get(ch).and_then(|r| r.get(index)) {
             cell.store(v.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
         }
     }
 
-    /// The keyboard panel's WIDTH knob for lane `ch`: 0 mono, 1 the stock
-    /// seating, 1.5 leaning wider.
-    pub fn set_keys_width(&self, ch: usize, w: f32) {
-        if let Some(cell) = self.shared.keys_width.get(ch) {
-            cell.store(w.clamp(0.0, 1.5).to_bits(), Ordering::Relaxed);
+    /// Lane `ch`'s whole rack at once, in the patch's own order. A shorter
+    /// slice leaves the rest alone, which is what a session written by a
+    /// build with fewer knobs hands over.
+    pub fn set_keys_params(&self, ch: usize, values: &[f32]) {
+        for (i, v) in values.iter().enumerate() {
+            self.set_keys_param(ch, i, *v);
         }
     }
 

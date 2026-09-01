@@ -49,9 +49,16 @@ const PICKUP_SWING: f32 = 0.17;
 /// against arithmetic, not a limiter.
 const PICKUP_LIMIT: f32 = 0.55;
 
+/// The damper's time constant as the bench tuned it. Longer than the piano's
+/// because a Rhodes damper is a felt pad on a steel bar, not on wire; the
+/// RELEASE knob scales this and nothing else.
+const DAMP_SECS: f32 = 0.085;
+
 /// Modes per voice. Six covers the fundamental, the low bar modes, and the
 /// bell; more are inaudible under the pickup's own colouring.
 const MODES: usize = 6;
+
+use super::EpKnobs;
 
 /// One mode of the metal, as a decaying sinusoid.
 ///
@@ -129,6 +136,9 @@ pub struct EpVoice {
     pk_comp: f32,
     damp: f32,
     damp_to: f32,
+    /// The damper's time constant in seconds, set at strike time from the
+    /// RELEASE knob.
+    damp_secs: f32,
     env: f32,
     done: bool,
     /// Random sign per strike, so repeated notes are not bit-identical.
@@ -144,6 +154,7 @@ impl EpVoice {
             pk_comp: 1.0,
             damp: 1.0,
             damp_to: 1.0,
+            damp_secs: DAMP_SECS,
             env: 0.0,
             done: true,
             seed: 0x9E37_79B9,
@@ -151,7 +162,12 @@ impl EpVoice {
     }
 
     pub fn strike(&mut self, pitch: u8, velocity: f32) {
-        self.strike_voiced(pitch, velocity, 0.5);
+        self.strike_knobs(pitch, velocity, &EpKnobs::default());
+    }
+
+    /// `strike` with the whole panel: every knob this mechanism answers to.
+    pub fn strike_knobs(&mut self, pitch: u8, velocity: f32, k: &EpKnobs) {
+        self.strike_full(pitch, velocity, k);
     }
 
     /// `strike` with the panel's VOICING knob: it scales the hammer tip's
@@ -159,6 +175,13 @@ impl EpVoice {
     /// lever velocity itself pulls. The exponent form lands 0.5 on exactly
     /// 1.0, so the shipped default is this file's tuning untouched.
     pub fn strike_voiced(&mut self, pitch: u8, velocity: f32, voicing: f32) {
+        let mut k = EpKnobs::default();
+        k.voicing = voicing;
+        self.strike_full(pitch, velocity, &k);
+    }
+
+    fn strike_full(&mut self, pitch: u8, velocity: f32, knobs: &EpKnobs) {
+        let voicing = knobs.voicing;
         let f0 = 440.0 * 2.0_f32.powf((f32::from(pitch) - 69.0) / 12.0);
         let v = velocity.clamp(0.0, 1.0);
         let k = f32::from(pitch);
@@ -169,13 +192,21 @@ impl EpVoice {
         // so the chime sits at a lower multiple in the treble than it does in
         // the bass. Down low it is up around the sixth; at the top it has
         // collapsed towards the fourth and is nearly gone.
-        let bell = (6.6 - 0.030 * (k - 28.0)).clamp(3.6, 6.8);
+        // CHIME slides that whole curve up or down the series — the same
+        // instrument with a longer or shorter tine, not a different tuning.
+        let bell = (6.6 - 0.030 * (k - 28.0) + knobs.chime).clamp(2.2, 9.0);
 
         // Decay. The fundamental rings for many seconds; the bell is gone in
         // under one, and shorter still in the treble. If those two numbers are
         // the same the instrument sounds like an organ.
-        let t60_f = (9.0 * (-(k - 28.0) / 42.0).exp()).clamp(0.9, 11.0);
-        let t60_bell = (0.75 * (-(k - 28.0) / 46.0).exp()).clamp(0.14, 0.9);
+        let t60_f = (9.0 * (-(k - 28.0) / 42.0).exp()).clamp(0.9, 11.0) * knobs.decay;
+        let t60_f = t60_f.clamp(0.1, 40.0);
+        // The bell follows DECAY too, but at its own much shorter scale: if
+        // it did not, a long-decay setting would leave the chime ringing at
+        // the same length while everything under it grew, which is a bell,
+        // not a Rhodes.
+        let t60_bell =
+            ((0.75 * (-(k - 28.0) / 46.0).exp()).clamp(0.14, 0.9) * knobs.decay).clamp(0.03, 4.0);
 
         // **Velocity, mechanism one: contact time.** A hard strike is short and
         // therefore wide-band, so far more of the energy lands in the high
@@ -192,7 +223,9 @@ impl EpVoice {
         // two, the bell sits about thirty decibels below the fundamental at
         // pianissimo and level with it at fortissimo, which is the entire
         // reason this instrument can whisper and shout.
-        let bell_w = 0.045 + 0.95 * v.powf(2.0);
+        // BELL scales that weight: 0 is a tine with no chime at all, 2 is a
+        // glass bell over the note.
+        let bell_w = (0.045 + 0.95 * v.powf(2.0)) * knobs.bell;
 
         let ratios = [1.0, 2.0, 3.0, bell, bell * 1.62, bell * 2.71];
         let weights = [1.0, 0.20, 0.09, bell_w, bell_w * 0.34, bell_w * 0.11];
@@ -258,12 +291,16 @@ impl EpVoice {
         // Taking exactly that back out leaves the ASYMMETRY — the positive
         // half still grows against the negative one — while the note's
         // loudness stays a function of how hard it was hit.
-        let u_max = (swing * PICKUP_SWING).clamp(0.0, PICKUP_LIMIT);
+        // BARK is how far the tine swings against the magnet, which IS the
+        // pickup's nonlinearity: turning it up is leaning on the pickup, not
+        // a distortion after the fact.
+        let u_max = (swing * PICKUP_SWING * knobs.bark).clamp(0.0, PICKUP_LIMIT);
         let gm = 1.0 - u_max;
         self.pk_comp = gm * gm * gm;
 
         self.damp = 1.0;
         self.damp_to = 1.0;
+        self.damp_secs = (DAMP_SECS * knobs.release).clamp(0.004, 1.5);
         self.env = swing;
         self.done = false;
     }
@@ -318,7 +355,7 @@ impl EpVoice {
 
         // The damper: felt, and slow. A Rhodes does not stop dead, and the
         // little thump as the pad lands is part of why it sounds played.
-        let coeff = 1.0 - (-1.0 / (0.085 * self.rate)).exp();
+        let coeff = 1.0 - (-1.0 / (self.damp_secs * self.rate)).exp();
         self.damp += (self.damp_to - self.damp) * coeff;
         // **Headroom for chords, not for one note.** A single note at full
         // velocity peaks near -7 dBFS, which looks quiet on a meter and is

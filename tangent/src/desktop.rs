@@ -4737,8 +4737,7 @@ impl DesktopApp {
         e.set_keys_strips(keys_lanes.iter().fold(0u32, |m, ch| m | 1 << ch.min(&31)));
         for &ch in &keys_lanes {
             e.set_keys_patch(ch, keys_patch_of(self.app.keys_patch_of(ch)));
-            e.set_keys_voicing(ch, self.app.keys_voicing_of(ch));
-            e.set_keys_width(ch, self.app.keys_width_of(ch));
+            e.set_keys_params(ch, &self.app.keys_params_of(ch));
         }
         // Groups are part of the mix, so the BOUNCE has them too — an export
         // that ignored the folder buses would render a different record from
@@ -6422,8 +6421,7 @@ impl DesktopApp {
         for ch in 0..tangent_ui::recorder::CHANNELS {
             if keys_mask & (1 << ch.min(31)) != 0 {
                 e.set_keys_patch(ch, keys_patch_of(self.app.keys_patch_of(ch)));
-                e.set_keys_voicing(ch, self.app.keys_voicing_of(ch));
-                e.set_keys_width(ch, self.app.keys_width_of(ch));
+                e.set_keys_params(ch, &self.app.keys_params_of(ch));
             }
         }
         // The drumpad's lanes, by the same bay-1 sentinel rule — any kind of
@@ -8653,6 +8651,86 @@ impl DesktopApp {
 
 #[cfg(all(test, feature = "recorder"))]
 mod tests {
+
+    /// **The engine's knob table and the panel's are the same table.**
+    ///
+    /// The panel cannot see the audio crate, so `dialogs::KEYS_PARAM_SPECS`
+    /// is a hand-copy of `keys::Patch::params()` — names, one-liners and
+    /// defaults. A knob added on one side and forgotten on the other does not
+    /// fail to compile and does not fail to run: it ships a panel whose
+    /// slider writes into a slot the instrument never reads, or an instrument
+    /// with a knob nothing can reach. This is the only thing standing between
+    /// those two tables.
+    #[test]
+    fn the_panel_knobs_and_the_engine_knobs_are_the_same_knobs() {
+        use tangent_ui::dialogs::{KEYS_PARAMS, KEYS_PARAM_SPECS};
+        assert_eq!(
+            KEYS_PARAM_SPECS.len(),
+            crate::keys::Patch::ALL.len(),
+            "one table has a sound the other does not"
+        );
+        assert_eq!(
+            KEYS_PARAMS,
+            crate::keys::MAX_PARAMS,
+            "the panel and the engine disagree about how many knobs a sound has"
+        );
+        for (index, patch) in crate::keys::Patch::ALL.iter().enumerate() {
+            let engine = patch.params();
+            let panel = &KEYS_PARAM_SPECS[index];
+            assert_eq!(
+                engine.len(),
+                panel.len(),
+                "{patch:?}: knob counts differ"
+            );
+            for (knob, (spec, ui)) in engine.iter().zip(panel.iter()).enumerate() {
+                assert_eq!(spec.name, ui.0, "{patch:?} knob {knob}: name");
+                assert_eq!(spec.about, ui.1, "{patch:?} knob {knob}: description");
+                assert!(
+                    (spec.default - ui.2).abs() < 1.0e-6,
+                    "{patch:?} knob {knob}: the panel would reset to {} and the engine to {}",
+                    ui.2,
+                    spec.default
+                );
+            }
+        }
+    }
+
+    /// **The centre of every knob is the instrument the bench signed off.**
+    ///
+    /// Every mapping in `PianoKnobs`/`EpKnobs` passes through its own tuned
+    /// constant at the default, so a strip nobody has touched, a sound just
+    /// initialised, and the two-knob build that shipped first all make the
+    /// identical sound. A knob whose default multiplies by something other
+    /// than one is a silent retune of both patches.
+    #[test]
+    fn an_initialised_sound_is_the_bench_tuning() {
+        let piano = crate::keys::PianoKnobs::from_params(&crate::keys::Patch::Piano1.defaults());
+        assert!((piano.decay - 1.0).abs() < 1.0e-5, "decay {}", piano.decay);
+        assert!(
+            (piano.brilliance - 0.28).abs() < 1.0e-5,
+            "brilliance {}",
+            piano.brilliance
+        );
+        assert!((piano.unison - 1.0).abs() < 1.0e-5, "unison {}", piano.unison);
+        assert!((piano.stretch - 1.0).abs() < 1.0e-5, "stretch {}", piano.stretch);
+        assert!((piano.release - 1.0).abs() < 1.0e-5, "release {}", piano.release);
+        assert!((piano.body - 1.0).abs() < 1.0e-5, "body {}", piano.body);
+
+        let ep = crate::keys::EpKnobs::from_params(&crate::keys::Patch::EpMk1.defaults());
+        assert!((ep.decay - 1.0).abs() < 1.0e-5, "decay {}", ep.decay);
+        assert!((ep.bell - 1.0).abs() < 1.0e-5, "bell {}", ep.bell);
+        assert!((ep.bark - 1.0).abs() < 1.0e-5, "bark {}", ep.bark);
+        assert!(ep.chime.abs() < 1.0e-5, "chime {}", ep.chime);
+        assert!((ep.release - 1.0).abs() < 1.0e-5, "release {}", ep.release);
+        assert!((ep.body - 1.0).abs() < 1.0e-5, "body {}", ep.body);
+
+        // And WIDTH's default is the stock seating, which is 1.0 of a knob
+        // that runs to 1.5 — the one default that is not the middle.
+        let mut keys = crate::keys::Keys::new(48_000.0);
+        keys.reset_params();
+        let w = keys.params()[crate::keys::P_WIDTH];
+        assert!((w * 1.5 - 1.0).abs() < 1.0e-5, "width {w}");
+    }
 
     /// **A launch never deletes a session somebody touched.** The launch
     /// reclaim runs `remove_dir_all` before cloning the template — the one
