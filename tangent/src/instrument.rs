@@ -8124,6 +8124,38 @@ impl Engine {
     }
 
     /// As [`Engine::start`], with a buffer size and a rate the user chose.
+    /// **What "Default" has to mean when nobody has chosen a rate.**
+    ///
+    /// The setting offers a list plus "Default", and Default used to mean
+    /// "each stream opens at its own device's rate". On a machine where the
+    /// microphone and the speakers disagree — which is most Windows laptops,
+    /// a 44.1 kHz webcam mic against a 48 kHz output — that is two clocks:
+    /// the writer drains the instrument's ring at the input's rate while the
+    /// engine fills it at the output's, and the take drifts. The app could
+    /// only warn about it. A tester lost most of a demo session to exactly
+    /// this and got out of it by discovering that "Default" was the one
+    /// setting he could not trust and typing 48000 in by hand.
+    ///
+    /// So Default resolves to ONE rate before either half opens, and the
+    /// output's is the one to take: it is the engine's clock and what the
+    /// room actually hears. The input is then given it as an explicit ask,
+    /// which `pick_input_config` already honours when the device can reach it
+    /// and already degrades from when it cannot — so the worst case is what
+    /// today's behaviour was, and the ordinary case is two halves in step.
+    ///
+    /// `None` only when there is no output to ask, which is a machine with no
+    /// sound at all; the caller then leaves the wish empty exactly as before.
+    pub fn default_output_rate(out_device: Option<&str>) -> Option<u32> {
+        tangent_record::audio::with_host(|host| {
+            let device = resolve_output(host, out_device).ok()?;
+            device
+                .default_output_config()
+                .ok()
+                .map(|c| c.sample_rate().0)
+                .filter(|r| (8_000..=768_000).contains(r))
+        })
+    }
+
     pub fn start_sized(
         out_device: Option<&str>,
         timebase: Timebase,
