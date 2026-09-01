@@ -10,6 +10,55 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ## [Unreleased]
 
+### Added
+
+- **Tangent Keys: a piano and an electric piano, computed rather than
+  recorded.** A third built-in instrument beside the DX7 and the drumpad, on
+  the sentinel `@tangent-keys`, containing no samples at all. **Piano 1** is a
+  jazz grand voiced for solo playing, built as a digital waveguide — a delay
+  line whose length is the pitch, a frequency-dependent loss filter for the
+  decay, and an all-pass cascade for the stiffness that stretches a piano's
+  partials sharp. **EP Mk.1** is a tine electric piano taken dry, and it is
+  built a completely different way on purpose: a tine is a stiff bar, not a
+  flexible string, so its modes are nowhere near harmonic and a waveguide
+  cannot make them. It is modal instead — a bank of decaying sinusoids, each
+  sitting where the metal actually puts it. Its velocity response is three
+  mechanisms rather than a volume curve: a contact time that shortens with
+  force and therefore feeds the high modes, a neoprene tip that stiffens as it
+  compresses, and an electromagnetic pickup whose output goes as the inverse
+  square of its gap. The last one is why hitting it hard *barks* — the transfer
+  is lopsided only when the tine is swinging wide, so the distortion arrives
+  with force and is simply absent when the note is quiet, which is something a
+  waveshaper on the output could never do without dirtying the soft notes too.
+  Measured on E4 across MIDI velocity 8 to 127, the bell runs from 48 dB under
+  the fundamental to 18 dB under it, and waveform asymmetry from 0.017 to
+  0.382, both monotonically. The whole module is pure `std` and adds no
+  dependency, the same as the DX7's, so it compiles standalone on a bench that
+  renders a scripted performance to a WAV in under a second — which is how all
+  of the above was tuned and how three defects invisible in the source were
+  found. `docs/KEYS.md` has the design notes and the measurement method.
+
+- **The in-house instruments lost their amount limit.** Every strip whose
+  first bay names the DX7 or Tangent Keys now owns a full instance of it, the
+  way every drum lane has always owned its kit. Before this, one shared synth
+  hid behind the mask: a second DX7 track was silent by design, and choosing
+  the Rhodes on one keyboard track silently re-voiced the piano on another.
+  Now eight piano tracks, or a piano and an EP side by side, or two DX7s
+  playing out of two different cartridges, are all just tracks. Which
+  cartridge, which patch and how the panel knobs sit are saved per strip, the
+  export bounce mirrors all of it, and old sessions load with every strip
+  seeded from the session-wide choice they were saved with.
+
+- **Tangent Keys grew a panel: two sounds, two knobs.** Clicking the bay
+  still lists Piano 1 and EP Mk.1, and beneath them now sit the two controls
+  that survive the argument against knobs on a physical model. Voicing scales
+  the hammer contact the way felt does, mellow to bright, with the centre
+  being exactly the tuning the bench signed; Width moves the per-key stereo
+  seating from a point source to a little wider than stock. Both are per
+  strip, both live on the physics rather than on the output, and choosing a
+  sound no longer closes the window, so you can pick, voice and play in one
+  visit.
+
 ### Fixed
 
 - **A capture buffer smaller than the PipeWire graph's cycle silently halved
