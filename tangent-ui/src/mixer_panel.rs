@@ -148,11 +148,6 @@ pub struct MixerView<'a> {
     /// True when anything at all is soloed, so the strips that are not can be
     /// drawn as what they are — silent, not merely unlit.
     pub any_solo: bool,
-    /// The window is effectively the whole screen — fullscreen or
-    /// maximized (the two viewport flags; a tiler sets neither). The
-    /// two-row fold is gated on this, by the owner's word: windowed stays
-    /// one scrolling row however many are asked for.
-    pub screen_filling: bool,
     /// How many channels this install works at — the paywall's number
     /// (`TangentApp::active_channels`). Capacity stays [`CHANNELS`]; this
     /// bounds what the desk DRAWS and how far it scrolls, so a free
@@ -961,10 +956,43 @@ pub const PALETTE_RUN: usize = 16;
 
 pub const VISIBLE_CHANNELS: usize = 8;
 
-/// The least height a strip row can usefully be — below this, folding the
-/// desk into two rows of sixteen would halve every fader into a nub, so the
-/// sixteen stay on one row and scroll instead.
-const TWO_ROW_MIN_H: f32 = 200.0;
+/// **The least height a strip row can carry a WHOLE strip in.**
+///
+/// Below this, folding the desk into two rows would halve every fader into a
+/// nub — and worse than a nub, it silently sheds furniture: the note button
+/// at the strip's foot needs seven points below the switch row and simply
+/// stops being drawn when they are not there, with nothing to say so.
+///
+/// **Measured, not chosen.** At 427 points a folded track strip has no note
+/// button; at 432 it does. The old value was 200, which is less than half of
+/// what a strip needs, and it survived only because the fold ALSO required
+/// the window to be fullscreen or maximised — a screen big enough hid the
+/// fact that the height test was meaningless. When that flag went (it never
+/// fires on macOS and fires wrongly on a maximised laptop), this number
+/// became the only thing standing between a small desk and a folded one, so
+/// it had to become true.
+///
+/// `a_folded_strip_keeps_every_control` pins it: if a strip's furniture ever
+/// grows, that test fails and this number gets measured again.
+const TWO_ROW_MIN_H: f32 = 432.0;
+
+/// The fold threshold, for the test in `app` that pins it. Not a knob.
+pub fn two_row_min_h() -> f32 {
+    TWO_ROW_MIN_H
+}
+
+/// **The least width a channel column can usefully be.**
+///
+/// A strip is a fader, a meter beside it, a name and a row of switches. Below
+/// about this it is a toothpick: the fader is still draggable but the meter is
+/// a hairline and the switches stop being separate targets.
+///
+/// It exists because how many strips to show is a SETTING, and a setting made
+/// on a desktop travels to a laptop inside the same file. Sixteen across a
+/// 1280-point screen is 60 points a strip before the click and the master take
+/// theirs. The setting is not rewritten — taste is not the app's to edit — it
+/// is simply not honoured past what the space can carry.
+const MIN_STRIP_W: f32 = 46.0;
 
 /// **The folder chop and the child indent are ONE number** - the owner's
 /// spec: the 90-degree chop off a folder's top-right corner ends exactly
@@ -1018,6 +1046,16 @@ impl Layout {
         let master_col = COLUMNS - 1;
         let active = view.active.clamp(1, CHANNELS);
         let visible = view.visible.clamp(1, active);
+        // **Never more columns than the width can carry.** See `MIN_STRIP_W`.
+        // Two seats are always spoken for — the click and the master are
+        // pinned at the right and are not part of the scrolling run — which
+        // is the `+ 2` `metrics` also applies.
+        let fits_across = {
+            let inner_w = (rect.width() - 2.0 * PAD).max(1.0);
+            let slots = ((inner_w + GAP) / (MIN_STRIP_W + GAP)).floor() as usize;
+            slots.saturating_sub(2).max(1)
+        };
+        let visible = visible.min(fits_across);
         // **The whole desk folds into two rows of sixteen, size permitting.**
         // When all sixteen are asked for, sixteen columns across makes
         // toothpicks of every strip; sixteen over sixteen keeps each strip at
@@ -1028,12 +1066,15 @@ impl Layout {
         // The fold is the FULL desk folding — sixteen over sixteen — which
         // only a supporter's thirty-two can be. A free sixteen stays one
         // scrolling row everywhere, the owner's paywall ruling.
-        // Fullscreen AND maximized show the WHOLE supporter desk folded,
-        // regardless of the zoom the windowed mixer was left at — the owner
-        // widened the ruling from fullscreen-only.
-        let two_rows = view.screen_filling
-            && active >= CHANNELS
-            && (inner.height() - GAP) / 2.0 >= TWO_ROW_MIN_H;
+        // **Whether it FITS is the whole question.** This used to also
+        // require the window to be fullscreen or maximised, which was a
+        // proxy for "there is room" and wrong on both platforms that matter:
+        // macOS never reports `maximized` at all, so the fold was
+        // unreachable there however large the display; Windows reports it
+        // for a laptop maximised against a taskbar, where there is no room
+        // for two rows and it folded anyway. The mixer knows its own height.
+        // Ask that.
+        let two_rows = active >= CHANNELS && (inner.height() - GAP) / 2.0 >= TWO_ROW_MIN_H;
         // **A shut folder's children do not occupy columns.** Every strip
         // keeps its CHANNEL index in `strips` - identity is baked as
         // column==channel all over the desk - but position runs on RANK
@@ -3228,7 +3269,6 @@ mod tests {
             }),
             any_solo: false,
             scroll_px: 0.0,
-            screen_filling: false,
             active: CHANNELS,
             visible: VISIBLE_CHANNELS,
             selected: None,
@@ -3601,12 +3641,55 @@ mod tests {
     /// channel keeps the width eight-across always had; nothing scrolls
     /// because nothing is off-desk. Too short for a usable half-height
     /// strip, and the fold declines.
+    /// **How many strips to show is a wish, and the width has the last word.**
+    ///
+    /// The count is a saved setting, so one made on a desktop travels to a
+    /// laptop in the same file — and sixteen across a small screen is a row
+    /// of toothpicks with a meter each too thin to read. The setting is left
+    /// alone; it is simply not honoured past what the space can carry.
     #[test]
-    fn sixteen_channels_fold_into_two_rows_when_the_height_allows() {
-        let tall = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 700.0));
+    fn a_narrow_desk_shows_fewer_strips_than_it_was_asked_for() {
+        let narrow = Rect::from_min_size(Pos2::ZERO, Vec2::new(640.0, 320.0));
         let mut v = a_view();
         v.visible = CHANNELS;
-        v.screen_filling = true;
+        let l = Layout::new(narrow, &v);
+        let drawn: Vec<f32> = l
+            .strips
+            .iter()
+            .map(|s| s.panel.width())
+            .filter(|w| *w > 0.0)
+            .collect();
+        assert!(!drawn.is_empty(), "the desk drew nothing at all");
+        for w in &drawn {
+            assert!(
+                *w >= MIN_STRIP_W - 0.5,
+                "a strip came out {w} wide, under the {MIN_STRIP_W} floor"
+            );
+        }
+        // And a desk with room honours the whole wish, so the clamp only
+        // ever takes away what would not have fitted.
+        let wide = Rect::from_min_size(Pos2::ZERO, Vec2::new(2400.0, 320.0));
+        let l = Layout::new(wide, &v);
+        let shown = l.strips.iter().filter(|s| s.panel.width() > 0.0).count();
+        assert!(
+            shown >= CHANNELS,
+            "a wide desk showed only {shown} of {CHANNELS}"
+        );
+    }
+
+    #[test]
+    fn sixteen_channels_fold_into_two_rows_when_the_height_allows() {
+        // Tall enough for TWO WHOLE strips, which is what the threshold now
+        // means. It was 700 here, against a threshold of 200 that no strip
+        // could actually live in — the fold's real gate was the fullscreen
+        // flag beside it, and when that went this number had to become
+        // honest. See `TWO_ROW_MIN_H`.
+        let tall = Rect::from_min_size(
+            Pos2::ZERO,
+            Vec2::new(1200.0, TWO_ROW_MIN_H * 2.0 + GAP + 40.0),
+        );
+        let mut v = a_view();
+        v.visible = CHANNELS;
         let l = Layout::new(tall, &v);
         for n in 0..CHANNELS {
             assert!(l.strips[n].panel.is_positive(), "channel {n} missing from the fold");
@@ -3645,7 +3728,6 @@ mod tests {
         let tall = Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 800.0));
         let mut v = a_view();
         v.active = crate::recorder::FREE_CHANNELS;
-        v.screen_filling = true;
         v.visible = CHANNELS; // asks for everything; the clamp answers
         v.scroll_px = 1.0e9; // and so does the scroll's rail
         let l = Layout::new(tall, &v);
