@@ -2426,6 +2426,11 @@ struct Prepared {
     /// thread.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     lv2_bay: Option<Lv2Bay>,
+    /// The bay record, when this is one of Tangent's own effects — the
+    /// host-side param ledger `save_insert_state` reads, on the LV2 model
+    /// and for the LV2 reason: the instance cannot be asked once it has
+    /// gone to the audio thread, and the host wrote every value anyway.
+    builtin_bay: Option<crate::builtin_fx::BuiltinBay>,
     state_handle: Option<tangent_host::StateHandle>,
     latency_handle: Option<tangent_host::instance::LatencyHandle>,
     latency_now: u32,
@@ -2443,6 +2448,11 @@ enum Backend {
     },
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     Lv2(tangent_host::lv2::Instance),
+    /// One of Tangent's own effects, seated like any plugin. The whole point
+    /// of the variant: the hand-off rings, `run_rack`, the delay compensation
+    /// and the reorder machinery treat our DSP as one more tenant, so none of
+    /// them grow a special case. See `crate::builtin_fx`.
+    Builtin(crate::builtin_fx::BuiltinUnit),
 }
 
 impl Backend {
@@ -2508,6 +2518,10 @@ impl Backend {
                 // A voice reads nothing; `bufs` is both scratch and output.
                 inst.process_planar(frames, &[], bufs)
             }
+            // Unreachable by construction — the loader seats every built-in
+            // with `voice: false` — but an arm that renders silence would
+            // hide the day that changes, and an error names it.
+            Backend::Builtin(_) => Err("a built-in effect takes no notes".to_owned()),
         }
     }
 
@@ -2523,6 +2537,10 @@ impl Backend {
             Backend::Vst3 { .. } => None,
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
             Backend::Lv2(inst) => Some(inst.latency_samples()),
+            // Our own units answer directly — the figure is a property of
+            // the DSP, so reporting it here keeps a unit that one day grows
+            // a lookahead honest without a new road.
+            Backend::Builtin(unit) => Some(unit.latency()),
         }
     }
 
@@ -2550,6 +2568,14 @@ impl Backend {
                     let _ = inst.set_param(p.id as usize, p.value as f32);
                 }
                 inst.process_planar(frames, planar, out)
+            }
+            Backend::Builtin(unit) => {
+                // The LV2 arm's bargain, made explicitly: the last point per
+                // parameter is what the block runs at, and the unit's own
+                // slew keeps the boundary from clicking.
+                unit.apply(params);
+                unit.process(planar, frames, out);
+                Ok(())
             }
         }
     }
@@ -2909,6 +2935,25 @@ fn normalise(value: f32, min: f32, max: f32) -> f64 {
         return 0.0;
     }
     (f64::from(value - min) / span).clamp(0.0, 1.0)
+}
+
+/// What a built-in bay offers the automation lanes.
+///
+/// The `id` is the spec's own — stable for the life of the product, because
+/// the curve persists it as `fx:<bay>:<id>` exactly as it does a VST3
+/// parameter id. Nothing to normalise: built-in parameters live in 0..=1
+/// already, the space every automation value is in.
+fn lanes_for_builtin(spec: &'static crate::builtin_fx::UnitSpec) -> Vec<tangent_host::ParamInfo> {
+    spec.params
+        .iter()
+        .map(|p| tangent_host::ParamInfo {
+            id: p.id,
+            title: p.name.to_owned(),
+            units: p.units.to_owned(),
+            default_normalised: f64::from(p.default),
+            step_count: p.steps,
+        })
+        .collect()
 }
 
 /// One LV2 bay: what is in it, and where its controls stand.
@@ -8059,6 +8104,13 @@ pub struct Engine {
     /// other and every site that clears one must clear both.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     insert_lv2: Vec<[Option<Lv2Bay>; INSERTS]>,
+    /// Each built-in bay's unit and its controls. See
+    /// [`crate::builtin_fx::BuiltinBay`] — the LV2 arrangement, inherited:
+    /// the host's record is the state, because the instance is on the audio
+    /// thread and cannot be asked. Kept beside the other per-format records
+    /// because a bay holds exactly one format and every site that clears one
+    /// must clear them all.
+    insert_builtin: Vec<[Option<crate::builtin_fx::BuiltinBay>; INSERTS]>,
     /// Each loaded insert's processor reference, taken beside the editor's and
     /// for the same reason: after the handoff there is no `&Instance` to ask.
     /// This is what lets a bay's settings survive a relaunch — no insert has
@@ -8690,6 +8742,7 @@ impl Engine {
             insert_editor_handles: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
             insert_lv2: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
+            insert_builtin: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
             insert_state_handles: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
             insert_latency_handles: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
             insert_state_errors: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
@@ -8839,6 +8892,7 @@ impl Engine {
             editor_handle,
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
             lv2_bay: None,
+            builtin_bay: None,
             state_handle: Some(state_handle),
             latency_handle,
             latency_now,
@@ -8953,9 +9007,66 @@ impl Engine {
             },
             editor_handle: None,
             lv2_bay: Some(bay),
+            builtin_bay: None,
             state_handle: None,
             latency_handle: None,
             latency_now: 0,
+            state_error,
+        })
+    }
+
+    /// Prepare one of Tangent's own effects, named by its `@` sentinel.
+    ///
+    /// Thinner than both plugin paths and honestly so: no module to open, no
+    /// warm-up (there is nothing to page in), no editor or state handle
+    /// (there is no COM object to reference — the ledger IS the state), and
+    /// no format translation. What it shares is the contract: the same
+    /// `Prepared` goes through the same delicate tail in `load_insert`, so
+    /// the drop-order rule and the refused-hand-off path are written once.
+    fn prepare_builtin(&self, path: &str, state: Option<&[u8]>) -> Result<Prepared, String> {
+        let spec = crate::builtin_fx::spec_for(path).ok_or_else(|| {
+            // A session from a newer build can name a unit this one lacks;
+            // the bay stays empty and the sentence says why, exactly as a
+            // missing .vst3 would.
+            format!("this build has no built-in effect named {path}")
+        })?;
+        // A blob that will not parse is REPORTED rather than swallowed, and
+        // the unit still loads at its defaults — the same bargain both
+        // plugin formats strike, for the same "it keeps forgetting my
+        // settings" reason.
+        let (values, state_error) = match state {
+            Some(bytes) => match crate::builtin_fx::values_from_state(spec, bytes) {
+                Ok(v) => (v, None),
+                Err(e) => (
+                    spec.defaults(),
+                    Some(format!("{}'s saved settings were not restored: {e}", spec.class)),
+                ),
+            },
+            None => (spec.defaults(), None),
+        };
+        let unit = spec.create(self.output.sample_rate as f32, &values);
+        let latency_now = unit.latency();
+        Ok(Prepared {
+            display_name: spec.class.to_owned(),
+            backend: Backend::Builtin(unit),
+            // Always an effect: a built-in INSTRUMENT is a mask and a
+            // `mix_channels` branch, never a bay tenant. See the module doc.
+            voice: false,
+            channels: TAP_CHANNELS,
+            loaded: Loaded {
+                bundle: PathBuf::from(spec.path),
+                class: spec.class.to_owned(),
+                vendor: "built in".to_owned(),
+                channels: TAP_CHANNELS as u16,
+                sample_rate: self.output.sample_rate,
+            },
+            editor_handle: None,
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            lv2_bay: None,
+            builtin_bay: Some(crate::builtin_fx::BuiltinBay { spec, values }),
+            state_handle: None,
+            latency_handle: None,
+            latency_now,
             state_error,
         })
     }
@@ -8993,6 +9104,13 @@ impl Engine {
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
             if let Some(h) = self
                 .insert_lv2
+                .get_mut(strip)
+                .and_then(|r| r.get_mut(slot))
+            {
+                *h = None;
+            }
+            if let Some(h) = self
+                .insert_builtin
                 .get_mut(strip)
                 .and_then(|r| r.get_mut(slot))
             {
@@ -9041,18 +9159,31 @@ impl Engine {
         // launch down in exactly the same way. The crumb holds the identity
         // string, so an `lv2:` URI comes back out of `take_blame` as the same
         // text `uri_of` reads on the way in.
-        let _crumb = crate::plugin_guard::Armed::new(bundle);
+        // **A sentinel is OUR code, and the guard is for THEIRS.** The crumb
+        // exists because somebody else's shared object can take the process
+        // down with SIGKILL; a built-in cannot, and a quarantine row naming
+        // `@tangent-trim` would refuse Tangent's own DSP on every launch
+        // after any unrelated crash landed between arm and disarm.
+        let builtin = bundle.to_str().filter(|s| s.starts_with('@'));
+        let _crumb = builtin
+            .is_none()
+            .then(|| crate::plugin_guard::Armed::new(bundle));
         // **Which format this identity names.** VST3 plugins are bundles on
-        // disk; LV2 plugins are URIs, carried here behind `lv2:` — see
-        // `tangent_host::lv2::SCHEME` for why an identity string rather than a
-        // second type threaded through every call site.
+        // disk; LV2 plugins are URIs, carried here behind `lv2:`; Tangent's
+        // own effects are `@` sentinels — see `tangent_host::lv2::SCHEME` and
+        // `crate::builtin_fx` for why identity strings rather than a second
+        // type threaded through every call site.
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-        let prepared = match tangent_host::lv2::uri_of(bundle) {
-            Some(uri) => self.prepare_lv2(&uri, state)?,
-            None => self.prepare_vst3(bundle, state)?,
+        let prepared = match (builtin, tangent_host::lv2::uri_of(bundle)) {
+            (Some(name), _) => self.prepare_builtin(name, state)?,
+            (None, Some(uri)) => self.prepare_lv2(&uri, state)?,
+            (None, None) => self.prepare_vst3(bundle, state)?,
         };
         #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-        let prepared = self.prepare_vst3(bundle, state)?;
+        let prepared = match builtin {
+            Some(name) => self.prepare_builtin(name, state)?,
+            None => self.prepare_vst3(bundle, state)?,
+        };
         let Prepared {
             backend,
             voice,
@@ -9061,6 +9192,7 @@ impl Engine {
             editor_handle,
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
             lv2_bay,
+            builtin_bay,
             state_handle,
             latency_handle,
             latency_now,
@@ -9086,6 +9218,13 @@ impl Engine {
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         if let Some(h) = self
             .insert_lv2
+            .get_mut(strip)
+            .and_then(|r| r.get_mut(slot))
+        {
+            *h = None;
+        }
+        if let Some(h) = self
+            .insert_builtin
             .get_mut(strip)
             .and_then(|r| r.get_mut(slot))
         {
@@ -9145,6 +9284,13 @@ impl Engine {
             .and_then(|r| r.get_mut(slot))
         {
             *h = lv2_bay;
+        }
+        if let Some(h) = self
+            .insert_builtin
+            .get_mut(strip)
+            .and_then(|r| r.get_mut(slot))
+        {
+            *h = builtin_bay;
         }
         if let Some(h) = self
             .insert_state_handles
@@ -9715,6 +9861,7 @@ impl Engine {
         }
         permute_rows(&mut self.inserts_loaded, order);
         permute_rows(&mut self.insert_editors, order);
+        permute_rows(&mut self.insert_builtin, order);
         permute_rows(&mut self.insert_state_handles, order);
         permute_rows(&mut self.insert_latency_handles, order);
         permute_rows(&mut self.insert_state_errors, order);
@@ -9892,6 +10039,17 @@ impl Engine {
         {
             return Some(tangent_host::lv2::state_from_params(&bay.params).into_bytes());
         }
+        // A built-in bay is saved from ITS ledger for the same reason the LV2
+        // one is — the instance is on the audio thread, and every durable
+        // value came through the host anyway.
+        if let Some(bay) = self
+            .insert_builtin
+            .get(strip)
+            .and_then(|r| r.get(slot))
+            .and_then(Option::as_ref)
+        {
+            return Some(crate::builtin_fx::state_text(bay.spec, &bay.values).into_bytes());
+        }
         self.insert_state_handles
             .get(strip)?
             .get(slot)?
@@ -9921,6 +10079,14 @@ impl Engine {
             .and_then(Option::as_ref)
         {
             return lanes_for_lv2(&bay.params);
+        }
+        if let Some(bay) = self
+            .insert_builtin
+            .get(strip)
+            .and_then(|r| r.get(slot))
+            .and_then(Option::as_ref)
+        {
+            return lanes_for_builtin(bay.spec);
         }
         self.insert_state_handles
             .get(strip)
@@ -14103,6 +14269,214 @@ mod tests {
             folder_peak > 0.05,
             "the folder's meter never moved: {folder_peak}"
         );
+    }
+
+    // ── Tangent's own effects, seated in ordinary bays ─────────────────────
+
+    /// The drum fixture rendered through the MASTER's first bay, because the
+    /// master rack is the one that runs unconditionally — a channel's runs
+    /// only while its sources do, and a drum LANE carries no signal of its
+    /// own (the strikes render on the DRUMS bus). `insert` is what to seat
+    /// there, with what saved state; `None` is the reference take.
+    fn drums_through_master_bay(insert: Option<(&str, Option<Vec<u8>>)>) -> Vec<f32> {
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        e.set_pad_kit(5, test_kit(&[0], 4_800, 0.5));
+        // Quiet on purpose: the loud test below multiplies this by +24 dB
+        // and the claim is about the ratio, not about what else the master
+        // path might do to a signal near full scale.
+        e.set_channel_gain(5, 0.05);
+        e.set_drum_strips(1 << 5);
+        if let Some((path, state)) = insert {
+            e.load_insert(
+                tangent_ui::recorder::MASTER_SEAT,
+                0,
+                Some(Path::new(path)),
+                state.as_deref(),
+            )
+            .expect("the built-in loads")
+            .expect("the bay reports a tenant");
+        }
+        e.set_rolling(false);
+        let mut out = vec![0.0f32; 1024 * 2];
+        // The warm-up blocks are also where the hand-off ring drains: the
+        // seat takes the unit at the top of the first render, so both the
+        // reference and the loaded take run the same number of blocks.
+        for _ in 0..4 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+        }
+        e.set_midi_clips(vec![PlacedMidi {
+            strip: 5,
+            start: 0,
+            len: 48_000,
+            notes: Arc::new(vec![ClipNote { at: 0, dur: 2_400, key: PAD_BASE, vel: 100 }]),
+        }]);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        let mut heard = Vec::new();
+        for _ in 0..4 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            heard.extend_from_slice(&out);
+        }
+        heard
+    }
+
+    /// **The trim loads like a plugin and the bay says so** — the ledger, the
+    /// chip's names, and the automation lane all answer for a sentinel path
+    /// that never touched the filesystem.
+    #[test]
+    fn the_builtin_trim_loads_into_a_bay_and_the_bay_reports_it() {
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        assert!(e.insert_parameters(2, 0).is_empty());
+        let loaded = e
+            .load_insert(2, 0, Some(Path::new(crate::builtin_fx::TRIM_PATH)), None)
+            .expect("a built-in effect must load")
+            .expect("a load reports what it seated");
+        assert_eq!(loaded.class, "Tangent Trim");
+        assert_eq!(loaded.vendor, "built in");
+        assert_eq!(loaded.bundle, PathBuf::from(crate::builtin_fx::TRIM_PATH));
+        assert_eq!(e.insert(2, 0), Some(&loaded));
+        assert!(e.insert_state_error(2, 0).is_none());
+
+        // What an automation lane would be offered: one continuous Gain in
+        // dB, resting at unity. Ids here are persisted as `fx:<bay>:<id>`,
+        // so this shape is a contract, not a description.
+        let lanes = e.insert_parameters(2, 0);
+        assert_eq!(lanes.len(), 1, "{lanes:?}");
+        assert_eq!(lanes[0].id, 0);
+        assert_eq!(lanes[0].title, "Gain");
+        assert_eq!(lanes[0].units, "dB");
+        assert!((lanes[0].default_normalised - 0.5).abs() < 1e-9);
+        assert_eq!(lanes[0].step_count, 0);
+
+        // And the seat renders: one block through the live rack, finite out.
+        let mut out = vec![0.0f32; 512 * 2];
+        e.render_offline(&mut out);
+        assert!(out.iter().all(|s| s.is_finite()));
+    }
+
+    /// **An untouched trim is a null through the real rack** — planar hand-in,
+    /// process, copy-back and all — because its default is EXACTLY unity.
+    /// Bit-for-bit, not "close": a unit that claims to be at rest and isn't
+    /// is how nulls die quietly.
+    #[test]
+    fn a_trim_at_rest_is_a_null_through_the_master_rack() {
+        let flat = drums_through_master_bay(None);
+        let trimmed = drums_through_master_bay(Some((crate::builtin_fx::TRIM_PATH, None)));
+        assert!(
+            flat.iter().any(|s| s.abs() > 0.001),
+            "the fixture made no sound at all"
+        );
+        assert_eq!(flat.len(), trimmed.len());
+        for (i, (a, b)) in flat.iter().zip(&trimmed).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "sample {i}: {a} without the trim, {b} through it"
+            );
+        }
+    }
+
+    /// **The top of the knob is +24 dB**, restored from state at load so the
+    /// unit starts settled there rather than gliding up from unity.
+    #[test]
+    fn a_trim_at_full_gain_lifts_the_mix_twenty_four_decibels() {
+        let spec = crate::builtin_fx::spec_for(crate::builtin_fx::TRIM_PATH).unwrap();
+        let state = crate::builtin_fx::state_text(spec, &[1.0]).into_bytes();
+        let flat = drums_through_master_bay(None);
+        let loud = drums_through_master_bay(Some((crate::builtin_fx::TRIM_PATH, Some(state))));
+        let peak = |v: &[f32]| v.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        let (flat, loud) = (peak(&flat), peak(&loud));
+        assert!(flat > 0.001, "the fixture made no sound at all: {flat}");
+        let want = 10f32.powf(24.0 / 20.0);
+        assert!(
+            (loud / flat - want).abs() < want * 0.01,
+            "full gain measured {:.3}x, not the +24 dB ({want:.3}x) the mapping promises",
+            loud / flat
+        );
+    }
+
+    /// **A built-in bay's settings survive: state out, unload, state back in,
+    /// no complaint** — the same round trip `a_bays_settings` proves for a
+    /// VST3, here with no plugin installed and no audio device.
+    #[test]
+    fn a_builtin_bays_settings_survive_save_unload_and_reload() {
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        let mut out = vec![0.0f32; 512 * 2];
+        let spec = crate::builtin_fx::spec_for(crate::builtin_fx::TRIM_PATH).unwrap();
+        let sent = crate::builtin_fx::state_text(spec, &[0.75]).into_bytes();
+        e.load_insert(3, 0, Some(Path::new(crate::builtin_fx::TRIM_PATH)), Some(&sent))
+            .expect("load")
+            .expect("loaded");
+        assert!(e.insert_state_error(3, 0).is_none());
+        // A render between the hand-offs, as in life: the ring is two deep
+        // and only the render's swap drains it.
+        e.render_offline(&mut out);
+
+        let saved = e
+            .save_insert_state(3, 0)
+            .expect("a built-in bay answers for its state");
+        assert_eq!(
+            crate::builtin_fx::values_from_state(spec, &saved).unwrap(),
+            vec![0.75],
+            "the ledger lost the restored value"
+        );
+
+        e.load_insert(3, 0, None, None).expect("unload");
+        e.render_offline(&mut out);
+        assert!(e.insert(3, 0).is_none());
+        assert!(
+            e.save_insert_state(3, 0).is_none(),
+            "an empty bay has no state to save"
+        );
+
+        e.load_insert(3, 0, Some(Path::new(crate::builtin_fx::TRIM_PATH)), Some(&saved))
+            .expect("reload with state")
+            .expect("loaded");
+        e.render_offline(&mut out);
+        assert!(e.insert_state_error(3, 0).is_none());
+        assert_eq!(
+            e.save_insert_state(3, 0).unwrap(),
+            saved,
+            "the round trip changed the state"
+        );
+
+        // And the case that will actually happen: a sidecar truncated or
+        // written by another plugin. The unit still loads, at defaults, and
+        // says so — silently accepting it is how "it keeps forgetting my
+        // trim" becomes unreportable.
+        e.load_insert(
+            3,
+            1,
+            Some(Path::new(crate::builtin_fx::TRIM_PATH)),
+            Some(b"vstpreset\x00garbage"),
+        )
+        .expect("a corrupt blob must not stop the unit loading")
+        .expect("loaded");
+        assert!(e.insert_state_error(3, 1).is_some());
+        assert!(e.insert(3, 1).is_some());
+    }
+
+    /// **A sentinel this build does not know is a sentence, not a crash** —
+    /// the reconcile reports it like any failed load and the bay stays
+    /// usable. A session from a newer build reaches exactly this arm.
+    #[test]
+    fn an_unknown_builtin_sentinel_fails_cleanly_and_poisons_nothing() {
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        let err = e
+            .load_insert(0, 0, Some(Path::new("@tangent-nonsense")), None)
+            .expect_err("an unknown sentinel must be refused");
+        assert!(err.contains("@tangent-nonsense"), "{err}");
+        assert!(e.insert(0, 0).is_none());
+        let mut out = vec![0.0f32; 512 * 2];
+        e.render_offline(&mut out);
+        assert!(out.iter().all(|s| s.is_finite()));
+        // The refusal left nothing behind: the same bay takes a real unit.
+        e.load_insert(0, 0, Some(Path::new(crate::builtin_fx::TRIM_PATH)), None)
+            .expect("load")
+            .expect("loaded");
+        assert_eq!(e.insert(0, 0).unwrap().class, "Tangent Trim");
     }
 
     /// **A folder inside a folder**, which the single descending fold has to
