@@ -453,8 +453,6 @@ pub struct ArrangeView<'a> {
 pub enum Hit {
     /// The NUMBER cell: the reorder handle — drag a track to another row.
     HdrNumber(usize),
-    /// The folder box: make this track a folder, or stop it being one.
-    HdrFolder(usize),
     /// The arrow beside it: hide this folder's children, or show them.
     HdrCollapse(usize),
     /// One of a track's three insert BAYS — the mixer's own door, here.
@@ -1402,13 +1400,18 @@ impl Layout {
         // proportional cuts walked the dot into the track title whenever
         // the header widened.
         let number = Rect::from_min_max(r.min, Pos2::new(r.left() + 12.0, r.bottom()));
-        let arm = {
+        // The arm's GEOMETRY stands even where the arm does not: the
+        // theory/automation pair anchors off its right edge, so a folder -
+        // which cannot record and returns NOTHING for the field - still
+        // needs the rect for the chain.
+        let arm_seat = {
             let d = (h * 0.42).clamp(9.0, 15.0);
             Rect::from_center_size(
                 Pos2::new(number.right() + 4.0 + d * 0.5, r.center().y),
                 Vec2::splat(d),
             )
         };
+        let arm = if folder { Rect::NOTHING } else { arm_seat };
         // The switches keep the right end; the meter stands inside them.
         let sw = (h * 0.44).clamp(11.0, 17.0);
         let solo = Rect::from_min_size(
@@ -1454,7 +1457,7 @@ impl Layout {
         // the centre falls between them.
         let (theory, automation) = {
             let d = (h * 0.34).clamp(8.0, 13.0);
-            let x = arm.right() + 3.0 + d * 0.5;
+            let x = arm_seat.right() + 3.0 + d * 0.5;
             let gap = 1.5;
             let top = r.center().y - d - gap * 0.5;
             let mk = |y: f32| Rect::from_min_size(Pos2::new(x - d * 0.5, y), Vec2::splat(d));
@@ -1466,7 +1469,7 @@ impl Layout {
                 let one = (h * 0.42).clamp(9.0, 15.0);
                 (
                     Rect::from_center_size(
-                        Pos2::new(arm.right() + 3.0 + one * 0.5, r.center().y),
+                        Pos2::new(arm_seat.right() + 3.0 + one * 0.5, r.center().y),
                         Vec2::splat(one),
                     ),
                     Rect::NOTHING,
@@ -1508,7 +1511,7 @@ impl Layout {
         // carries the same three dials, so they are the horizontal
         // sacrifice — never the NAME.
         const COL_MIN: f32 = 40.0;
-        let dials_fit = pan.left() - 6.0 - (arm.right() + 4.0) >= COL_MIN;
+        let dials_fit = pan.left() - 6.0 - (arm_seat.right() + 4.0) >= COL_MIN;
         let col_right = if dials_fit { pan.left() } else { meter.left() };
         let (send, knob, pan) = if dials_fit {
             (send, knob, pan)
@@ -1568,27 +1571,42 @@ impl Layout {
             // Only the name survives — the last thing a track cannot do without.
             (slice(0.0, 1.0), Rect::NOTHING, Rect::NOTHING)
         };
-        // **Six across on a FOLDER, three on anything else** — the folder's
-        // second rack rides the same row. The shed floor eases to the
-        // master row's 14 when six must fit; below that the whole row goes,
-        // as it always did.
-        let n_bays = if folder {
-            crate::recorder::INSERTS * 2
-        } else {
-            crate::recorder::INSERTS
-        };
-        let bays = std::array::from_fn(|b| {
-            let w = (bays_row.width() - 3.0 * (n_bays as f32 - 1.0)) / n_bays as f32;
-            let floor = if folder { 14.0 } else { 16.0 };
-            if b >= n_bays || w < floor || !bays_row.is_positive() {
-                return Rect::NOTHING;
+        // **THREE ON THREE for a folder** - the owner's ruling: a folder
+        // is a grouper, not a track, so it has no input to select, and the
+        // second rack takes the input selector's band. Bays 0..2 sit where
+        // every track's bays sit; 3..5 ride the band above. A plain track
+        // keeps its three across the bays band, as ever.
+        let three = |band: Rect, offset: usize, out: &mut [Rect; crate::recorder::INSERTS * 2]| {
+            let n = crate::recorder::INSERTS;
+            let w = (band.width() - 3.0 * (n as f32 - 1.0)) / n as f32;
+            if w < 16.0 || !band.is_positive() {
+                return;
             }
-            let x0 = bays_row.left() + b as f32 * (w + 3.0);
-            Rect::from_min_max(
-                Pos2::new(x0, bays_row.top()),
-                Pos2::new(x0 + w, bays_row.bottom()),
-            )
-        });
+            for b in 0..n {
+                let x0 = band.left() + b as f32 * (w + 3.0);
+                out[offset + b] = Rect::from_min_max(
+                    Pos2::new(x0, band.top()),
+                    Pos2::new(x0 + w, band.bottom()),
+                );
+            }
+        };
+        let mut bays = [Rect::NOTHING; crate::recorder::INSERTS * 2];
+        if folder {
+            if bays_row.is_positive() {
+                three(bays_row, 0, &mut bays);
+                three(input, 3, &mut bays);
+            } else {
+                // The squeezed header keeps one band: the FIRST rack takes
+                // it, the second sheds - the same order a track's controls
+                // shed in.
+                three(input, 0, &mut bays);
+            }
+        } else {
+            three(bays_row, 0, &mut bays);
+        }
+        // And the folder sheds the selector and the arm whole: nothing to
+        // choose, nothing to record.
+        let input = if folder { Rect::NOTHING } else { input };
         // **The folder box: bottom-left, under the number.**
         //
         // Sized off the row like every other switch, and SHED like them too —
@@ -1598,7 +1616,12 @@ impl Layout {
         // the chip, never the name; this joins at the front of that list
         // because it is structure rather than a control you reach for while
         // playing.
-        let folder = {
+        // **The BOX retired** - the owner's ruling: a folder is made and
+        // unmade by Cmd/Ctrl+F alone, so the toggle square is gone and the
+        // collapse ARROW takes its old bottom-left seat. Folder lanes only:
+        // an arrow on a plain track is a control for a thing that is not
+        // there.
+        let collapse = if folder {
             let d = (h * 0.30).clamp(8.0, 12.0);
             let top = r.bottom() - d;
             if top > number.top() + 2.0 && d >= 8.0 {
@@ -1606,22 +1629,14 @@ impl Layout {
             } else {
                 Rect::NOTHING
             }
-        };
-        // The arrow, immediately right of the box and the same height. Only
-        // laid out where the box was — they shed together, because an arrow
-        // with no folder beside it is a control for a thing that is not there.
-        let collapse = if folder.is_positive() && r.width() > 60.0 {
-            Rect::from_min_size(
-                Pos2::new(folder.right() + 2.0, folder.top()),
-                folder.size(),
-            )
         } else {
             Rect::NOTHING
         };
+        let folder_box = Rect::NOTHING;
         HeaderRow {
             theory,
             automation,
-            folder,
+            folder: folder_box,
             collapse,
             panel: row,
             number,
@@ -2089,7 +2104,6 @@ pub fn hit_test(rect: Rect, view: &ArrangeView<'_>, pos: Pos2) -> Option<Hit> {
             // sits at the header's bottom-left, inside the number cell's own
             // column; the number is the reorder handle, so a box tested after
             // it would never be reached and clicking it would start a drag.
-            (row.folder, Hit::HdrFolder(i)),
             (row.collapse, Hit::HdrCollapse(i)),
             (row.number, Hit::HdrNumber(i)),
         ] {
@@ -2376,7 +2390,6 @@ pub fn targets(rect: Rect, view: &ArrangeView<'_>) -> Vec<(Rect, Hit)> {
                 // the right end.
                 for (r, hit) in [
                     (hdr.number, Hit::HdrNumber(i)),
-                    (hdr.folder, Hit::HdrFolder(i)),
                     (hdr.collapse, Hit::HdrCollapse(i)),
                     (hdr.arm, Hit::Arm(i)),
                     (hdr.theory, Hit::ToTheory(i)),
@@ -2591,12 +2604,6 @@ pub fn a11y_nodes(rect: Rect, view: &ArrangeView<'_>) -> Vec<crate::a11y::Node> 
                 r,
                 format!("{} sends its MIDI to the theory view", who(i)),
                 view.lanes.get(i).is_some_and(|l| l.to_theory),
-            ),
-            Hit::HdrFolder(i) => Node::toggle(
-                id,
-                r,
-                format!("{} is a folder", who(i)),
-                view.lanes.get(i).is_some_and(|l| l.is_folder),
             ),
             Hit::HdrCollapse(i) => Node::toggle(
                 id,
@@ -4698,13 +4705,17 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
             chip(painter, row.input, "NO INPUT", false);
             continue;
         }
-        // The arm dot: REAPER's record circle, lit when live.
-        let c = row.arm.center();
-        let rad = row.arm.width() * 0.5;
-        if lane.armed {
-            painter.circle_filled(c, rad, p.arm);
+        // The arm dot: REAPER's record circle, lit when live. A FOLDER has
+        // no arm - its rect is NOTHING - and a stroke from a degenerate
+        // rect is a smudge, so the guard is load-bearing.
+        if row.arm.is_positive() {
+            let c = row.arm.center();
+            let rad = row.arm.width() * 0.5;
+            if lane.armed {
+                painter.circle_filled(c, rad, p.arm);
+            }
+            painter.circle_stroke(c, rad, Stroke::new(1.5, ink_on.gamma_multiply(0.8)));
         }
-        painter.circle_stroke(c, rad, Stroke::new(1.5, ink_on.gamma_multiply(0.8)));
         // The name, on its plate — or the rename field mid-typing.
         if row.name.is_positive() {
             let font = FontId::new(
@@ -4915,35 +4926,6 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         }
         // **The FOLDER box, bottom-left.**
         //
-        // A drawn folder rather than a letter: the row already carries three
-        // lettered switches (M, S, T) and a fourth would be read as a fourth
-        // of the same kind. This one is not a per-track setting about signal
-        // — it is a statement about the LIST — so it says so by not looking
-        // like its neighbours.
-        //
-        // Two rectangles: a tab on top of a body, which is the smallest
-        // shape that reads as a folder at eleven points. Lit in the theme's
-        // own selection ink when it is on, outlined when it is not.
-        if row.folder.is_positive() {
-            let fr = row.folder;
-            let on = lane.is_folder;
-            let ink = if on { p.select } else { quiet(on_ink(p.hdr_lane), p.hdr_lane, 0.30) };
-            let body = Rect::from_min_max(
-                Pos2::new(fr.left(), fr.top() + fr.height() * 0.28),
-                Pos2::new(fr.right(), fr.bottom()),
-            );
-            let tab = Rect::from_min_max(
-                Pos2::new(fr.left(), fr.top()),
-                Pos2::new(fr.left() + fr.width() * 0.46, body.top()),
-            );
-            if on {
-                painter.rect_filled(tab, 1.0, ink);
-                painter.rect_filled(body, 1.0, ink);
-            } else {
-                painter.rect_stroke(tab, 1.0, Stroke::new(1.0, ink), egui::StrokeKind::Inside);
-                painter.rect_stroke(body, 1.0, Stroke::new(1.0, ink), egui::StrokeKind::Inside);
-            }
-        }
         // **The collapse arrow, and what a shut folder is hiding.**
         //
         // Down when the group is open, right when it is shut — the direction

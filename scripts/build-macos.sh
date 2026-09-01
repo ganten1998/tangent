@@ -80,15 +80,31 @@ make_icns() {
   # rendered once from `assets/icon-small-rounded.svg` and checked in so
   # the build needs no SVG renderer. The dilate fallback below only runs
   # if those files are ever deleted.
+  # **Apple's icon grid first.** A macOS icon's art sits inside a margin -
+  # the squircle spans 824 of a 1024 canvas, about 80.5% - and ours filled
+  # the canvas edge to edge, so the Dock drew Tangent visibly LARGER than
+  # every neighbour (the owner's "bigger than all other items"). Scale the
+  # art onto a transparent canvas of the same size before any rendering;
+  # without ImageMagick the icon stays what it was rather than failing the
+  # build.
+  local base="$ICON_SRC"
+  if command -v magick >/dev/null 2>&1; then
+    local padded="$tmp/padded.png"
+    if magick "$ICON_SRC" -resize 80.5% -background none -gravity center \
+        -extent "$(magick identify -format '%wx%h' "$ICON_SRC")" \
+        "$padded" 2>/dev/null; then
+      base="$padded"
+    fi
+  fi
   local small=""
   if command -v magick >/dev/null 2>&1; then
     # A radius proportional to the source, so replacing the artwork with a
     # bigger or smaller file does not silently change how much this thickens.
     local w r
-    w="$(magick identify -format '%w' "$ICON_SRC" 2>/dev/null || echo 0)"
+    w="$(magick identify -format '%w' "$base" 2>/dev/null || echo 0)"
     r=$(( w / 150 )); [ "$r" -lt 1 ] && r=1
     small="$tmp/small.png"
-    magick "$ICON_SRC" -channel RGB -morphology Dilate "Disk:$r" +channel \
+    magick "$base" -channel RGB -morphology Dilate "Disk:$r" +channel \
       -modulate 112 "$small" 2>/dev/null || small=""
   fi
   for spec in 16:icon_16x16.png 32:icon_16x16@2x.png 32:icon_32x32.png \
@@ -98,12 +114,19 @@ make_icns() {
               1024:icon_512x512@2x.png; do
     px="${spec%%:*}"; name="${spec#*:}"
     if [ "$px" -le 32 ] && [ -f "assets/icon-small-rounded-$px.png" ]; then
+      # The purpose-drawn smalls get the same margin, or the icon would
+      # change apparent size between the Dock and a Finder list.
+      if command -v magick >/dev/null 2>&1 && magick \
+          "assets/icon-small-rounded-$px.png" -resize 80.5% -background none \
+          -gravity center -extent "${px}x${px}" "$iconset/$name" 2>/dev/null; then
+        continue
+      fi
       cp "assets/icon-small-rounded-$px.png" "$iconset/$name"
       continue
     fi
     # No ImageMagick, no thickening — the icon is then what it was before
     # rather than a build that fails over an icon.
-    local src="$ICON_SRC"
+    local src="$base"
     if [ -n "$small" ] && [ "$px" -le 64 ]; then src="$small"; fi
     sips -z "$px" "$px" -s format png --out "$iconset/$name" "$src" >/dev/null
   done
@@ -275,7 +298,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
         <key>UTTypeTagSpecification</key>
         <dict>
           <key>public.filename-extension</key>
-          <array><string>tangent</string></array>
+          <array><string>tan</string><string>tangent</string></array>
         </dict>
       </dict>
     </array>

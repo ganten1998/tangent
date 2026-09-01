@@ -356,6 +356,11 @@ pub struct DirRequest {
     pub purpose: DirPurpose,
 }
 
+/// Every extension a project document may wear: the canonical first, the
+/// legacy forever. The Open panels and the fallback browser both consume
+/// this, so both accept both.
+pub const PROJECT_EXTENSIONS: &[&str] = &["tan", "tangent"];
+
 /// A file the app has asked the host to choose.
 ///
 /// The same request pattern as [`DirRequest`], and for the same reason: a
@@ -596,7 +601,7 @@ pub enum FilePurpose {
     ClickSample,
     /// An audio file to play along to.
     BackingTrack,
-    /// A project document (`project.tangent`) to open.
+    /// A project document (`project.tan`; the legacy `.tangent` reads forever).
     Project,
     /// Media to stand on the timeline at the playhead. The lane is the one
     /// the menu was opened on; anything picked past the first goes to a

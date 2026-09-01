@@ -960,8 +960,9 @@ pub struct Settings {
     /// hold a kind this build has no picture for.
     pub channel_kinds: [u8; crate::recorder::CHANNELS],
     /// Each channel's chosen BADGE: 0 follows the kind (instrument, mic,
-    /// waveform), 1 is the drum, 2 the guitar, 3 the bass — the Track
-    /// menu's icon picker writes it.
+    /// waveform); every other code names a row of
+    /// `recorder_panel::ICONS` - twenty-five badges now, drum to line-in -
+    /// and the Track menu's picker writes it.
     pub channel_icons: [u8; crate::recorder::CHANNELS],
     /// The three effect knobs, 0..=1. All off by default: a first launch has to
     /// sound like the instrument, not like a room.
@@ -2610,7 +2611,8 @@ impl Settings {
             Some(Value::Array(items)) => {
                 for (icon, item) in s.channel_icons.iter_mut().zip(items) {
                     if let Some(v) = item.as_u64() {
-                        *icon = v.min(3) as u8;
+                        *icon =
+                            v.min(u64::from(crate::recorder_panel::ICON_MAX)) as u8;
                     }
                 }
             }

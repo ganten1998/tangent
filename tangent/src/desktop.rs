@@ -3660,7 +3660,9 @@ impl DesktopApp {
             let _ = std::fs::remove_dir_all(&dir);
         }
         if copy_dir_all(&template, &dir).is_ok() {
-            self.app.open_project(&dir.join("project.tangent"));
+            // The clone carries whatever name the template holds - canonical
+            // or legacy - so resolve inside the CLONED dir, never a bare join.
+            self.app.open_project(&tangent_ui::arrangement::doc_in(&dir));
             if self.app.take_desk_reload() {
                 self.copy_states_from_project();
                 self.force_insert_reload();
@@ -5054,7 +5056,7 @@ impl DesktopApp {
                 // one per launch, the exact pile the reclaim exists to
                 // prevent. The flag comes off the template's own document,
                 // once, here at its minting.
-                let doc = dst.join("project.tangent");
+                let doc = tangent_ui::arrangement::doc_in(&dst);
                 let mut arr = tangent_ui::arrangement::Arrangement::load_from(&doc);
                 if arr.named {
                     arr.named = false;
@@ -5200,7 +5202,7 @@ impl DesktopApp {
                 if copy_dir_all(&template, &dir).is_err() {
                     return;
                 }
-                let doc = dir.join("project.tangent");
+                let doc = tangent_ui::arrangement::doc_in(&dir);
                 if discarding_current {
                     // **Do NOT save the session being discarded back over the
                     // fresh template.** `switch_project` persists the current
@@ -6673,8 +6675,8 @@ fn count_media(project_dir: &std::path::Path) -> usize {
 fn launch_reclaimable(dir: &std::path::Path, template: &std::path::Path) -> bool {
     count_media(dir) == 0
         && file_eq(
-            &dir.join("project.tangent"),
-            &template.join("project.tangent"),
+            &tangent_ui::arrangement::doc_in(dir),
+            &tangent_ui::arrangement::doc_in(template),
         )
 }
 

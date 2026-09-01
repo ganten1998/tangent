@@ -537,7 +537,7 @@ impl DeskSnap {
             icons: m
                 .get("icons")
                 .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n.min(3) as u8)).collect())
+                .map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n.min(u64::from(crate::recorder_panel::ICON_MAX)) as u8)).collect())
                 .unwrap_or_default(),
             names: strings("names"),
             colors: m
@@ -693,6 +693,29 @@ impl Default for Arrangement {
             automation: crate::automation::Automation::default(),
         }
     }
+}
+
+/// **The document's file name, canonical and legacy.** New sessions write
+/// `project.tan` - the owner's call, and no breach of anything: file
+/// extensions cannot be owned. Every session ever saved as
+/// `project.tangent` keeps opening forever; `doc_in` is the one resolver
+/// both facts route through, so no call site can prefer the wrong one.
+pub const DOC_NAME: &str = "project.tan";
+pub const DOC_NAME_LEGACY: &str = "project.tangent";
+
+/// The project document inside `dir`: the canonical name if that file
+/// exists, else the legacy one if THAT exists, else the canonical - which
+/// is what a writer minting a fresh document wants too.
+pub fn doc_in(dir: &std::path::Path) -> std::path::PathBuf {
+    let new = dir.join(DOC_NAME);
+    if new.is_file() {
+        return new;
+    }
+    let old = dir.join(DOC_NAME_LEGACY);
+    if old.is_file() {
+        return old;
+    }
+    new
 }
 
 impl Arrangement {
