@@ -18,14 +18,41 @@ Load it in any MIDI channel's first bay, exactly as the DX7 loads — in as
 many bays as you like, because every lane owns a full instance of the
 instrument: a piano track and an EP track in one session, or eight of either,
 each with its own settings. Clicking the bay opens a window with the two
-sounds and two knobs, which is the whole interface. The first cut had no
-knobs at all, on the argument that every control on a physical model is a way
-to make the instrument worse; the two that ship are the two that survive that
-argument. **Voicing** scales the hammer's contact the way felt does — needle
-it mellow or lacquer it bright, with the centre being exactly the tuning the
-bench signed off. **Width** is where the strings sit in the stereo field,
-from a point source to a little wider than the stock seating. Both are per
-strip, saved with the session, and neither is a filter over the output.
+sounds and, under whichever is chosen, that sound's own rack of eight.
+
+The first cut had no knobs at all, on the argument that every control on a
+physical model is a way to make the instrument worse. What answers that
+argument is not "users want knobs" but *what the knob is allowed to be*:
+every one of these moves a quantity the physics already had — a hammer's
+contact width, a loss filter's target decay, the cents between the strings of
+a course, how far a tine swings against its magnet — and there is not a filter
+or a saturator among them. Turning one is voicing an instrument, not
+processing a signal.
+
+The lists differ per sound, because the instruments do. The piano has
+**Voicing** (the hammer's felt, needled mellow or lacquered bright), **Width**
+(where the strings sit across the field), **Decay**, **Brilliance** (how long
+the upper partials outlast the fundamental), **Unison** (the detune inside a
+course, which is where the beating comes from), **Stretch** (string stiffness,
+which pulls the partials sharp), **Release** (the damper's speed) and
+**Soundboard**. The electric piano has Voicing, Width, Decay, **Bell** (the
+chime on the attack), **Bark** (how hard the tine leans on the pickup),
+**Chime** (where the bell partial sits above the note), Release and
+**Tonebar**. Showing one fixed rack with half of it inert would be a lie
+about both instruments.
+
+**Every knob's default is the bench's own number.** The mappings are written
+so that the centre lands exactly on the constant this instrument was tuned
+with — decay ×1.000, brilliance 0.28, unison ×1.000 — which is what makes an
+untouched strip, a freshly initialised sound and the two-knob build that
+shipped first all identical. A test asserts it, because a knob whose middle
+multiplies by 1.02 is a silent retune of both patches that no one would ever
+catch by ear.
+
+Double-click a knob to put it back; Initialise puts the whole sound back and
+leaves the other sound alone. Values are per strip **and per sound**, so a
+piano track and a Rhodes track keep their own and switching a strip between
+them finds each as it was left.
 
 ## Why a model and not a recording
 

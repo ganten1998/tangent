@@ -84,7 +84,10 @@ including the Linux aarch64 tarball and checksums, are on the
 - **The MIDI editor and the drum machine.** A piano-roll editor for MIDI
   clips, and a pad-based drum machine with its own kits. The kit is the one
   thing that still saves itself, because a kit is hours of sample assignment
-  and the one thing a session must never lose to a missed save.
+  and the one thing a session must never lose to a missed save. A kit can
+  also be saved out as a single file that carries the samples inside it
+  alongside the layout, so kits can be shared with people who do not have
+  your sample folders.
 - **Plugin hosting.** VST3 on macOS, Windows, Linux and FreeBSD; LV2 on Linux
   and FreeBSD; plugin editor windows everywhere. Scanning is recursive, takes
   folders you add yourself, and rescans without a restart. A built-in tine
