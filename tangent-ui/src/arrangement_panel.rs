@@ -50,7 +50,10 @@ pub struct LaneView<'a> {
     /// mixer strip's own claim, made here too.
     pub stereo: bool,
     /// The three bays' short names — empty for an empty slot.
-    pub inserts: [&'a str; crate::recorder::INSERTS],
+    /// **Six wide, like the mixer's**: a FOLDER lane fills all six (its
+    /// extra rack, `recorder::folder_extra_seat`), everybody else the first
+    /// three and blanks.
+    pub inserts: [&'a str; crate::recorder::INSERTS * 2],
     /// How many routes leave this lane, for the ROUTING chip.
     pub route_count: usize,
     /// Polarity inverted — see `mixer_panel::StripView::phase`.
@@ -989,8 +992,9 @@ pub struct HeaderRow {
     /// The input chip, under the name — every lane wears one now: binding
     /// an input is how a bare lane BECOMES a track.
     pub input: Rect,
-    /// The three insert BAYS — the mixer's slots, reachable from here.
-    pub bays: [Rect; crate::recorder::INSERTS],
+    /// The insert BAYS — the mixer's slots, reachable from here. Six wide
+    /// for a FOLDER lane, three (and three NOTHINGs) for the rest.
+    pub bays: [Rect; crate::recorder::INSERTS * 2],
     /// The Routing button, under the dials. `NOTHING` where they are.
     pub routing: Rect,
     /// The circled plus, on empty lanes alone.
@@ -1035,7 +1039,7 @@ impl HeaderRow {
         phase: Rect::NOTHING,
         solo: Rect::NOTHING,
         input: Rect::NOTHING,
-        bays: [Rect::NOTHING; crate::recorder::INSERTS],
+        bays: [Rect::NOTHING; crate::recorder::INSERTS * 2],
         add: Rect::NOTHING,
     };
 }
@@ -1277,6 +1281,7 @@ impl Layout {
                 row,
                 lane.used,
                 if lane.in_folder { FOLDER_INDENT } else { 0.0 },
+                lane.is_folder,
             )
         });
         // **The toolbar, in the corner cell** — the room above the track
@@ -1340,7 +1345,7 @@ impl Layout {
 
     /// The cells across one header, REAPER's row at Tangent's density:
     /// number, arm dot, name, gain knob, slim meter, M/S.
-    fn header_row(row: Rect, used: bool, indent: f32) -> HeaderRow {
+    fn header_row(row: Rect, used: bool, indent: f32, folder: bool) -> HeaderRow {
         // **The indent moves the CONTENTS, and `panel` keeps the whole row.**
         //
         // The panel is what a press is tested against and what the plate is
@@ -1563,10 +1568,19 @@ impl Layout {
             // Only the name survives — the last thing a track cannot do without.
             (slice(0.0, 1.0), Rect::NOTHING, Rect::NOTHING)
         };
+        // **Six across on a FOLDER, three on anything else** — the folder's
+        // second rack rides the same row. The shed floor eases to the
+        // master row's 14 when six must fit; below that the whole row goes,
+        // as it always did.
+        let n_bays = if folder {
+            crate::recorder::INSERTS * 2
+        } else {
+            crate::recorder::INSERTS
+        };
         let bays = std::array::from_fn(|b| {
-            let w = (bays_row.width() - 3.0 * (crate::recorder::INSERTS as f32 - 1.0))
-                / crate::recorder::INSERTS as f32;
-            if w < 16.0 || !bays_row.is_positive() {
+            let w = (bays_row.width() - 3.0 * (n_bays as f32 - 1.0)) / n_bays as f32;
+            let floor = if folder { 14.0 } else { 16.0 };
+            if b >= n_bays || w < floor || !bays_row.is_positive() {
                 return Rect::NOTHING;
             }
             let x0 = bays_row.left() + b as f32 * (w + 3.0);
@@ -2884,14 +2898,6 @@ fn ink(view: &ArrangeView<'_>) -> Ink {
     }
 }
 
-/// The empty timeline's hint ink: the lane's own ink, quieted the knob
-/// readout's amount. One function so the draw and the test cannot measure
-/// two different colours — and the hint is DRAWN on a lane-coloured row,
-/// because this is measured against `p.lane` and nothing else.
-fn empty_hint_ink(p: &Ink) -> Color32 {
-    quiet(on_ink(p.lane), p.lane, 0.22)
-}
-
 /// A quieter ink: pulled toward the ground it sits on, never made
 /// transparent.
 ///
@@ -3454,11 +3460,6 @@ fn auto_ground(p: &Ink, lane: usize) -> Color32 {
 }
 
 /// Paint the whole view into `rect`.
-/// What a timeline with nothing on it says. One line, because the person it
-/// is for has been in the app for a minute and the person it is not for has
-/// a thousand hours; a paragraph would condescend to both. The two clauses
-/// are the two doors material actually comes through: a file, or a take.
-pub const EMPTY_TIMELINE_HINT: &str = "Drop audio here, or arm a channel and record";
 
 pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
     let l = Layout::new(rect, view);
@@ -4268,36 +4269,6 @@ pub fn draw(painter: &Painter, rect: Rect, view: &ArrangeView<'_>) {
         );
     }
 
-    // ── the empty timeline says what it is waiting for ────────────────────
-    //
-    // A pane of striped lanes with nothing on them reads as a broken view to
-    // somebody meeting the app, and as Tuesday to somebody who lives in it.
-    // One quiet line serves the first and costs the second nothing: it is in
-    // the lane's own lowered ink, and the first clip — including a take the
-    // moment recording starts — makes it never have existed. Before the
-    // veils and the playhead, which are about state and place and belong on
-    // top of everything, hints included.
-    if view.clips.is_empty() {
-        // On a LANE-coloured row near the middle, not at the area's centre:
-        // the alternate stripe is `separate`d toward the ink, and on the
-        // themes whose lane parks right at the dead-zone guard's exit even
-        // the full-strength ink cannot clear 4.5:1 there. The hint stands on
-        // the ground its ink is measured against, or it is a pairing nobody
-        // checked — the mistake this app has stopped making.
-        let mid = {
-            let i = l.lane_rows.len() / 2;
-            i - i % 2
-        };
-        if let Some(row) = l.lane_rows.get(mid).filter(|r| r.is_positive()) {
-            painter.text(
-                Pos2::new(l.lanes_area.center().x, row.center().y),
-                Align2::CENTER_CENTER,
-                EMPTY_TIMELINE_HINT,
-                FontId::new(12.0, crate::fonts::courier()),
-                empty_hint_ink(&p),
-            );
-        }
-    }
 
     // ── SILENCED BY A FOLDER: a veil over the row ────────────────────────
     //
@@ -5374,7 +5345,7 @@ LaneView {
             automation: Vec::new(),
             route_count: 0,
             stereo: true,
-            inserts: [""; crate::recorder::INSERTS],
+            inserts: [""; crate::recorder::INSERTS * 2],
             name: "KEYS",
             input: String::new(),
             color: 0,
@@ -6367,55 +6338,6 @@ ArrangeView {
         }
     }
 
-    /// **An empty timeline offers its one line, and the line can be read.**
-    ///
-    /// The wording is the contract: one line, no em dash — it is published
-    /// prose on the screen, not a comment. The ink is the same lowered lane
-    /// ink the draw uses, checked against the lane ground the hint actually
-    /// stands on — the draw pins it to a lane-coloured row on purpose —
-    /// across every factory theme in both modes, at the 4.5:1 every other
-    /// word answers to.
-    #[test]
-    fn an_empty_timeline_says_where_material_comes_from() {
-        assert!(!EMPTY_TIMELINE_HINT.contains('\u{2014}'), "an em dash crept in");
-        assert!(!EMPTY_TIMELINE_HINT.contains('\n'), "the hint grew a second line");
-        let mut bad: Vec<String> = Vec::new();
-        for theme in crate::theme::factory() {
-            for dark in [false, true] {
-                let mut set = crate::settings::Settings::default();
-                theme.apply(&mut set);
-                let clips: Vec<ClipView<'_>> = Vec::new();
-                let mut v = a_view(&clips);
-                v.dark_mode = dark;
-                v.wood = (
-                    set.recorder_bg_color.r,
-                    set.recorder_bg_color.g,
-                    set.recorder_bg_color.b,
-                );
-                v.fx_strip = (
-                    set.fx_strip_color.r,
-                    set.fx_strip_color.g,
-                    set.fx_strip_color.b,
-                );
-                v.meter_bg = (
-                    set.meter_bg_color.r,
-                    set.meter_bg_color.g,
-                    set.meter_bg_color.b,
-                );
-                let p = ink(&v);
-                let hint = empty_hint_ink(&p);
-                let c = crate::recorder_panel::contrast_ratio(hint, p.lane);
-                if c < 4.5 {
-                    bad.push(format!(
-                        "{} {}: hint on lane {c:.2}:1",
-                        theme.name,
-                        if dark { "dark" } else { "light" }
-                    ));
-                }
-            }
-        }
-        assert!(bad.is_empty(), "the hint hides:\n  {}", bad.join("\n  "));
-    }
 
     #[test]
     fn the_time_axis_round_trips() {

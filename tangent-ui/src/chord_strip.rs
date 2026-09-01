@@ -907,18 +907,21 @@ mod heart_geometry_tests {
     }
 }
 
-/// **The cheater's heart.** A black-bordered heart whose body is black
-/// crackle over smoothly glowing highlights — the Konami unlock's own
-/// mark, worn instead of every other heart while the cheat marker stands.
-/// Per-theme for consistency: the glow is the theme's MASTER colour, which
-/// on the Default theme is crimson — the owner's spec image — and each
-/// theme's own one-colour-you-look-for elsewhere. The crackle and the
-/// border stay black on every theme.
+/// **The cheater's heart.** A heart whose surface is the theme's MASTER
+/// colour glowing in slow, out-of-step patches, with a static black
+/// crackle drawn across it and a matching border - the Konami mark, worn
+/// instead of every other heart while the cheat marker stands.
 ///
-/// Deterministic like the confetti: the crack pattern is a hash of the
-/// pixel grid, clustered so it reads as veins rather than static, and the
-/// glow phase per cell comes from the same hash so two machines pulse in
-/// the same pattern.
+/// The owner's spec, precisely: the ONLY thing that animates is the glow,
+/// each region on its own slow interval; the crackle is corruption drawn
+/// ACROSS that glow, never flickering with it. And it is per-theme ALL the
+/// way down - the glow is the master colour (crimson on Default, the spec
+/// image), and the crackle and border are that same colour crushed to a
+/// near-black of itself, because a surface derives its parts and nothing
+/// here is a fixed black.
+///
+/// Deterministic like the confetti: patch phases and the crack pattern are
+/// hashes of the pixel grid, so two machines wear the same heart.
 pub fn draw_heart_crackle(painter: &Painter, rect: Rect, glow: Color32, t: f32) {
     if !rect.is_positive() {
         return;
@@ -926,7 +929,9 @@ pub fn draw_heart_crackle(painter: &Painter, rect: Rect, glow: Color32, t: f32) 
     let Some((px, origin)) = heart_grid(rect) else {
         return;
     };
-    let black = Color32::from_rgb(0x0a, 0x0a, 0x0a);
+    // The corruption's material: the theme's own glow at a sixth of itself.
+    // On Default that is crimson's black; on every other theme, its own.
+    let dark = Color32::from_rgb(glow.r() / 6, glow.g() / 6, glow.b() / 6);
     let h = |a: usize, b: usize, salt: u32| -> f32 {
         let mut x = (a as u32)
             .wrapping_mul(2_654_435_761)
@@ -937,8 +942,8 @@ pub fn draw_heart_crackle(painter: &Painter, rect: Rect, glow: Color32, t: f32) 
         x ^= x >> 13;
         (x & 0xFFFF) as f32 / 65_536.0
     };
-    // Border first: the black silhouette, same construction as the
-    // bordered heart's.
+    // Border first: the silhouette, same construction as the bordered
+    // heart's, in the corruption's dark rather than a hardcoded black.
     for (row, line) in HEART.iter().enumerate() {
         for (col, ch) in line.chars().enumerate() {
             if ch != 'X' {
@@ -948,28 +953,40 @@ pub fn draw_heart_crackle(painter: &Painter, rect: Rect, glow: Color32, t: f32) 
             painter.rect_filled(
                 Rect::from_min_size(p, px).expand2(px * HEART_EDGE),
                 0.0,
-                black,
+                dark,
             );
         }
     }
+    // The glow: the whole surface, breathing in coarse patches. Each patch
+    // takes its own phase AND its own slow rate - regions brighten and
+    // settle out of step with one another, eight-to-eighteen-second
+    // cycles, and NOTHING else animates. Per-cell shimmer is what read as
+    // smoke; a patch is big enough to read as light under the surface.
     for (row, line) in HEART.iter().enumerate() {
         for (col, ch) in line.chars().enumerate() {
             if ch != 'X' {
                 continue;
             }
-            // Clustered on the half-grid so cracks come in connected runs —
-            // veins, not noise.
-            let crack = h(row / 2, col / 2, 5) < 0.38;
+            let (pr, pc) = (row / 3, col / 3);
+            let phase = h(pr, pc, 11) * std::f32::consts::TAU;
+            let rate = 0.35 + h(pr, pc, 13) * 0.4;
+            let pulse = 0.58 + 0.42 * (0.5 + 0.5 * (t * rate + phase).sin());
             let p = Pos2::new(origin.x + col as f32 * px.x, origin.y + row as f32 * px.y);
-            let cell = Rect::from_min_size(p, px);
-            if crack {
-                painter.rect_filled(cell, 0.0, black);
-            } else {
-                // The smooth glow: each highlight cell breathes on its own
-                // phase, never fully dark, never clipping.
-                let phase = h(row, col, 9) * std::f32::consts::TAU;
-                let pulse = 0.45 + 0.55 * (0.5 + 0.5 * (t * 2.2 + phase).sin());
-                painter.rect_filled(cell, 0.0, glow.gamma_multiply(pulse));
+            painter.rect_filled(Rect::from_min_size(p, px), 0.0, glow.gamma_multiply(pulse));
+        }
+    }
+    // The crackle, LAST and static: connected veins on the half-grid,
+    // drawn across the glow - the corruption interrupting the light, not
+    // flickering with it.
+    for (row, line) in HEART.iter().enumerate() {
+        for (col, ch) in line.chars().enumerate() {
+            if ch != 'X' {
+                continue;
+            }
+            if h(row / 2, col / 2, 5) < 0.38 {
+                let p =
+                    Pos2::new(origin.x + col as f32 * px.x, origin.y + row as f32 * px.y);
+                painter.rect_filled(Rect::from_min_size(p, px), 0.0, dark);
             }
         }
     }

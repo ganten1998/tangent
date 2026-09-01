@@ -663,7 +663,14 @@ pub const MASTER_EXTRA_SEAT: usize = STRIPS + 1 + DRUM_PADS;
 
 /// How many bays a strip shows. The master has two racks' worth.
 pub fn bays_on(strip: Option<Strip>) -> usize {
-    if strip.is_none() {
+    bays_of(strip, false)
+}
+
+/// The same question asked with the one fact `Strip` cannot carry: whether
+/// the channel is currently a FOLDER. A folder shows two racks' worth,
+/// like the master - see `folder_extra_seat`.
+pub fn bays_of(strip: Option<Strip>, folder: bool) -> usize {
+    if strip.is_none() || (folder && matches!(strip, Some(Strip::Channel(_)))) {
         INSERTS * 2
     } else {
         INSERTS
@@ -685,6 +692,12 @@ pub fn seat_bay(desk_index: usize, slot: usize) -> (usize, usize) {
         (MASTER_SEAT, slot - INSERTS)
     } else if desk_index == MASTER_SEAT {
         (MASTER_EXTRA_SEAT, slot)
+    } else if desk_index < CHANNELS && slot >= INSERTS {
+        // A FOLDER's slots 3..5 - and, unlike the master's, in the plain
+        // order: the extra rack goes BELOW the original, so slot and bay
+        // numbering agree with the automation's and no `master_bay` twin
+        // is needed. See `FOLDER_EXTRA_SEATS`.
+        (folder_extra_seat(desk_index), slot - INSERTS)
     } else {
         (desk_index, slot)
     }
@@ -705,9 +718,52 @@ pub fn seat_bay(desk_index: usize, slot: usize) -> (usize, usize) {
 /// channel. See `pad_rack_index`.
 pub const EXTRA_PAD_SEATS: usize = MASTER_EXTRA_SEAT + 1;
 
-/// Every rack seat: strips, master, the first pad block, the master's extra,
-/// and a pad block for each channel after the first.
-pub const TOTAL_SEATS: usize = EXTRA_PAD_SEATS + (CHANNELS - 1) * DRUM_PADS;
+/// **Where the FOLDER extra seats begin** - one appended seat per channel,
+/// so a group can wear six bays the way the master does. Appended after
+/// every pad block, for the reason `MASTER_EXTRA_SEAT` records: an appended
+/// seat changes no index anybody has already written down.
+///
+/// Unlike the master's, a folder's extra bays sit BELOW its original three.
+/// There was no legacy strip to keep the look of, so display order,
+/// automation-bay order and chain order all agree here: slots and bays 0..2
+/// are the channel's own seat, 3..5 the extra one.
+pub const FOLDER_EXTRA_SEATS: usize = EXTRA_PAD_SEATS + (CHANNELS - 1) * DRUM_PADS;
+
+/// Channel `ch`'s folder-extra seat. One function, same reason as
+/// `pad_rack_index`: a call site that recomputes this edits somebody
+/// else's plugin.
+pub const fn folder_extra_seat(ch: usize) -> usize {
+    FOLDER_EXTRA_SEATS + ch
+}
+
+/// Every rack seat: strips, master, the first pad block, the master's
+/// extra, a pad block for each channel after the first, and a folder-extra
+/// seat per channel.
+pub const TOTAL_SEATS: usize = FOLDER_EXTRA_SEATS + CHANNELS;
+
+/// **The channel permutation lifted onto the WHOLE seat space.** Channel
+/// rows move, each folder-extra seat follows its channel, and every other
+/// seat - buses, master, pads, the master's extra - stays put, per the
+/// reorder rule written on the desktop's permute machinery. `order[new] =
+/// old`, and the same here.
+pub fn seat_order(order: &[usize]) -> Vec<usize> {
+    let mut full: Vec<usize> = (0..TOTAL_SEATS).collect();
+    for (new, old) in order.iter().enumerate() {
+        if new < CHANNELS && *old < CHANNELS {
+            full[new] = *old;
+            full[folder_extra_seat(new)] = folder_extra_seat(*old);
+        } else if new != *old {
+            // A SEAT-space entry - the drumpad's pad-FX swap permutes pad
+            // seats directly - passes through untouched. Dropping these to
+            // identity silently parted two pads' plugins from their state
+            // files on every swap.
+            if let (Some(slot), true) = (full.get_mut(new), *old < TOTAL_SEATS) {
+                *slot = *old;
+            }
+        }
+    }
+    full
+}
 
 /// **Where channel `ch`'s pad `pad` keeps its bays.**
 ///
@@ -3327,6 +3383,92 @@ mod tests {
             seat * INSERTS + bay < INSERT_SPACE,
             "the master's last bay is past the end of the insert space"
         );
+    }
+
+    /// **A folder's six slots map plainly, and its extra seat is nobody
+    /// else's.** Unlike the master's swap, slots and bays agree here -
+    /// 0..2 the channel's own seat, 3..5 the appended one - and every
+    /// appended seat is distinct from every seat that already existed.
+    #[test]
+    fn a_folders_six_slots_have_their_own_appended_seats() {
+        use super::{
+            bays_of, folder_extra_seat, pad_rack_index, seat_bay, seat_order, Strip, CHANNELS,
+            DRUM_PADS, INSERTS, INSERT_SPACE, MASTER_EXTRA_SEAT, MASTER_SEAT, STRIPS,
+            TOTAL_SEATS,
+        };
+        // The counts: a folder wears six, a plain channel three, the click
+        // never folds, and the master keeps its six either way.
+        assert_eq!(bays_of(Some(Strip::Channel(3)), true), INSERTS * 2);
+        assert_eq!(bays_of(Some(Strip::Channel(3)), false), INSERTS);
+        assert_eq!(bays_of(Some(Strip::Click), true), INSERTS);
+        assert_eq!(bays_of(None, false), INSERTS * 2);
+
+        // The mapping, plain order, both ends of the desk.
+        for ch in [0usize, 7, CHANNELS - 1] {
+            for slot in 0..INSERTS {
+                assert_eq!(seat_bay(ch, slot), (ch, slot));
+                assert_eq!(
+                    seat_bay(ch, slot + INSERTS),
+                    (folder_extra_seat(ch), slot),
+                    "channel {ch} slot {} went astray",
+                    slot + INSERTS
+                );
+            }
+        }
+
+        // No appended seat collides with anything that already had one.
+        let mut seen = std::collections::HashSet::new();
+        for seat in 0..STRIPS {
+            assert!(seen.insert(seat));
+        }
+        assert!(seen.insert(MASTER_SEAT));
+        assert!(seen.insert(MASTER_EXTRA_SEAT));
+        for ch in 0..CHANNELS {
+            for pad in 0..DRUM_PADS {
+                assert!(seen.insert(pad_rack_index(ch, pad)));
+            }
+        }
+        for ch in 0..CHANNELS {
+            assert!(
+                seen.insert(folder_extra_seat(ch)),
+                "folder seat for channel {ch} collides"
+            );
+        }
+        assert!(seen.iter().all(|s| *s < TOTAL_SEATS), "a seat past the end");
+        let (seat, bay) = seat_bay(CHANNELS - 1, INSERTS * 2 - 1);
+        assert!(
+            seat * INSERTS + bay < INSERT_SPACE,
+            "the last folder bay is past the end of the insert space"
+        );
+
+        // **seat_order carries the extra seat with its channel** and moves
+        // nothing else - four moved rows for one swap, identity elsewhere.
+        let mut order: Vec<usize> = (0..CHANNELS).collect();
+        order.swap(2, 5);
+        let full = seat_order(&order);
+        assert_eq!(full.len(), TOTAL_SEATS);
+        assert_eq!(full[2], 5);
+        assert_eq!(full[5], 2);
+        assert_eq!(full[folder_extra_seat(2)], folder_extra_seat(5));
+        assert_eq!(full[folder_extra_seat(5)], folder_extra_seat(2));
+        assert_eq!(full[MASTER_SEAT], MASTER_SEAT);
+        assert_eq!(full[MASTER_EXTRA_SEAT], MASTER_EXTRA_SEAT);
+        assert_eq!(
+            (0..TOTAL_SEATS).filter(|i| full[*i] != *i).count(),
+            4,
+            "the swap moved more than its own four rows"
+        );
+
+        // And a SEAT-space permutation - the pad-FX swap's shape - passes
+        // through instead of collapsing to identity, which silently parted
+        // two pads' plugins from their state files.
+        let (a, b) = (pad_rack_index(0, 3), pad_rack_index(0, 7));
+        let mut pads: Vec<usize> = (0..TOTAL_SEATS.min(b + 1).max(b + 1)).collect();
+        pads[a] = b;
+        pads[b] = a;
+        let lifted = seat_order(&pads);
+        assert_eq!(lifted[a], b, "the pad swap was dropped");
+        assert_eq!(lifted[b], a, "the pad swap was dropped");
     }
 
     /// **The ladder is a stereo pair, and the two bars are the CHANNELS.**

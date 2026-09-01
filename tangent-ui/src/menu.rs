@@ -109,7 +109,7 @@ pub enum MenuAction {
     /// Raise the picker for a `project.tangent` to open.
     OpenProject,
     /// Copy the whole project — document and media — somewhere, and open
-    /// the copy. What Save As means for a document that autosaves.
+    /// the copy. Save As, spelled honestly: a copy under a new name.
     DuplicateProject,
     /// Look for VST3 bundles again, now.
     RescanPlugins,

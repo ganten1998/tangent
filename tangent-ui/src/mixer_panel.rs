@@ -87,6 +87,15 @@ pub struct StripView<'a> {
     pub armed: bool,
     /// This channel's MIDI goes to the theory view — the **T** switch.
     pub to_theory: bool,
+    /// This channel IS a folder — a group head, wearing six bays like the
+    /// master. See `recorder::folder_extra_seat`.
+    pub is_folder: bool,
+    /// This channel lives inside a folder above it. Drawn a step LOWER —
+    /// the mixer's vertical answer to the arrangement's indent.
+    pub in_folder: bool,
+    /// The folder is shut in the arrangement. Shown on the F switch; the
+    /// mixer itself never hides a strip — the console shows the desk.
+    pub folder_shut: bool,
 }
 
 impl StripView<'_> {
@@ -136,9 +145,10 @@ pub struct MixerView<'a> {
     /// True when anything at all is soloed, so the strips that are not can be
     /// drawn as what they are — silent, not merely unlit.
     pub any_solo: bool,
-    /// The window is effectively the whole screen — fullscreen, maximized,
-    /// or tiled to it. The two-row fold is gated on this, by the owner's
-    /// word: windowed stays one scrolling row however many are asked for.
+    /// The window is effectively the whole screen — fullscreen or
+    /// maximized (the two viewport flags; a tiler sets neither). The
+    /// two-row fold is gated on this, by the owner's word: windowed stays
+    /// one scrolling row however many are asked for.
     pub screen_filling: bool,
     /// How many channels this install works at — the paywall's number
     /// (`TangentApp::active_channels`). Capacity stays [`CHANNELS`]; this
@@ -245,6 +255,10 @@ pub enum Hit {
     /// The R switch: arm the channel — record-ready, and LIVE. The third of
     /// the M S R row, on general channels alone.
     Arm(Column),
+    /// The F switch, leftmost of the row: CYCLE the channel's folder state
+    /// — not a folder, an open folder, a shut folder, and around. The
+    /// owner's one-button answer to the arrangement's box-and-arrow pair.
+    Folder(Column),
     /// One of the two rows of an open insert menu — or, with
     /// [`FxAction::Dismiss`], a press anywhere else while it is up.
     FxMenu(Column, usize, FxAction),
@@ -277,6 +291,7 @@ impl Hit {
             | Hit::Name(i)
             | Hit::Remove(i)
             | Hit::Arm(i)
+            | Hit::Folder(i)
             | Hit::ToTheory(i)
             | Hit::Mono(i)
             | Hit::FxMenu(i, ..)
@@ -301,8 +316,9 @@ impl Hit {
             // the right or the picture and the hand disagree.
             Hit::RouteGain(..) => Some(DragAxis::Horizontal),
             Hit::Mute(_) | Hit::Phase(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(..)
-            | Hit::Db(_) | Hit::Name(_) | Hit::Remove(_) | Hit::Arm(_) | Hit::ToTheory(_)
-            | Hit::Mono(_) | Hit::FxMenu(..) | Hit::InputChip(_) | Hit::Routing(_) => None,
+            | Hit::Db(_) | Hit::Name(_) | Hit::Remove(_) | Hit::Arm(_) | Hit::Folder(_)
+            | Hit::ToTheory(_) | Hit::Mono(_) | Hit::FxMenu(..) | Hit::InputChip(_)
+            | Hit::Routing(_) => None,
         }
     }
 
@@ -314,8 +330,9 @@ impl Hit {
             Hit::Pan(_) => Some(SEND_TRAVEL),
             Hit::RouteGain(..) => Some(SEND_TRAVEL),
             Hit::Mute(_) | Hit::Phase(_) | Hit::Solo(_) | Hit::Add(_) | Hit::Insert(..)
-            | Hit::Db(_) | Hit::Name(_) | Hit::Remove(_) | Hit::Arm(_) | Hit::ToTheory(_)
-            | Hit::Mono(_) | Hit::FxMenu(..) | Hit::InputChip(_) | Hit::Routing(_) => None,
+            | Hit::Db(_) | Hit::Name(_) | Hit::Remove(_) | Hit::Arm(_) | Hit::Folder(_)
+            | Hit::ToTheory(_) | Hit::Mono(_) | Hit::FxMenu(..) | Hit::InputChip(_)
+            | Hit::Routing(_) => None,
         }
     }
 }
@@ -855,6 +872,8 @@ pub struct StripStrip {
     pub pan: Rect,
     /// The input chip — the detail row, pressable on general channels.
     pub input_chip: Rect,
+    /// The F switch — the folder cycle, leftmost of the switch row.
+    pub folder: Rect,
     pub fader: Rect,
     pub db: Rect,
     pub mute: Rect,
@@ -906,6 +925,7 @@ impl StripStrip {
         send: Rect::NOTHING,
         pan: Rect::NOTHING,
         input_chip: Rect::NOTHING,
+        folder: Rect::NOTHING,
         fader: Rect::NOTHING,
         db: Rect::NOTHING,
         mute: Rect::NOTHING,
@@ -939,7 +959,7 @@ pub const PALETTE_RUN: usize = 16;
 pub const VISIBLE_CHANNELS: usize = 8;
 
 /// The least height a strip row can usefully be — below this, folding the
-/// desk into two rows of eight would halve every fader into a nub, so the
+/// desk into two rows of sixteen would halve every fader into a nub, so the
 /// sixteen stay on one row and scroll instead.
 const TWO_ROW_MIN_H: f32 = 200.0;
 
@@ -986,18 +1006,19 @@ impl Layout {
         let master_col = COLUMNS - 1;
         let active = view.active.clamp(1, CHANNELS);
         let visible = view.visible.clamp(1, active);
-        // **The whole desk folds into two rows of eight, size permitting.**
+        // **The whole desk folds into two rows of sixteen, size permitting.**
         // When all sixteen are asked for, sixteen columns across makes
-        // toothpicks of every strip; eight over eight keeps each strip at
+        // toothpicks of every strip; sixteen over sixteen keeps each strip at
         // the width eight-across always had, at half the height — a trade
         // that only works when half the height is still a usable strip.
         // The click and the master stay pinned at the right, full height:
         // whatever shape the desk folds into, the master does not move.
-        // The fold is the FULL desk folding — twelve over twelve — which
-        // only a supporter's twenty-four can be. A free sixteen stays one
+        // The fold is the FULL desk folding — sixteen over sixteen — which
+        // only a supporter's thirty-two can be. A free sixteen stays one
         // scrolling row everywhere, the owner's paywall ruling.
-        // Fullscreen shows the WHOLE supporter desk folded, regardless of
-        // the zoom the windowed mixer was left at — sixteen over sixteen.
+        // Fullscreen AND maximized show the WHOLE supporter desk folded,
+        // regardless of the zoom the windowed mixer was left at — the owner
+        // widened the ruling from fullscreen-only.
         let two_rows = view.screen_filling
             && active >= CHANNELS
             && (inner.height() - GAP) / 2.0 >= TWO_ROW_MIN_H;
@@ -1041,7 +1062,7 @@ impl Layout {
             } else if i == click_col {
                 (click_x, inner.top(), inner.height())
             } else if two_rows {
-                // Channel columns, eight over eight: 0..8 on the top row,
+                // Channel columns, sixteen over sixteen: 0..8 on the top row,
                 // 8..16 beneath them, nothing scrolled off.
                 let (row, col) = (i / (CHANNELS / 2), i % (CHANNELS / 2));
                 (
@@ -1178,10 +1199,17 @@ impl Layout {
         // channel's rack is exactly where it was.
         let rack = if view.strip.is_none() && !view.empty {
             cut(0.100, 0.345)
+        } else if view.is_folder && !view.empty {
+            // **A folder's rack is taller too**, like the master's, because
+            // it holds twice as many. Its three extra bays take the DETAIL
+            // band's room — a group has no input to name or pick, so the
+            // chip goes and the bays get legible heights instead of six
+            // slivers in a channel's band.
+            cut(0.152, 0.345)
         } else {
             cut(0.195, 0.345)
         };
-        let bays = crate::recorder::bays_on(view.strip);
+        let bays = crate::recorder::bays_of(view.strip, view.is_folder);
         let inserts: [Rect; INSERTS * 2] = std::array::from_fn(|i| {
             if !rack.is_positive() || i >= bays {
                 return Rect::NOTHING;
@@ -1207,7 +1235,10 @@ impl Layout {
         // narrow for a switch beside it.
         let db_band = cut(0.83, 0.888);
         let phase = if switchable && db_band.width() > 46.0 {
-            let d = db_band.height().min(14.0).max(9.0);
+            // Bigger than the readout beside it wants to allow: the owner
+            // could not hit the old 9..14 square. It may stand proud of the
+            // band's height - the band has air above and below.
+            let d = (db_band.height() * 1.5).clamp(14.0, 20.0);
             Rect::from_min_size(
                 Pos2::new(db_band.right() - d - 1.0, db_band.center().y - d * 0.5),
                 Vec2::splat(d),
@@ -1238,9 +1269,13 @@ impl Layout {
         // last being "send this track's MIDI to the theory view". A channel
         // is the only thing that can be any of them, so the strips that are
         // not one keep the pair they had.
-        let (mute, solo, arm, theory) = if switchable && has_arm {
+        // **FIVE on a general channel now: F M S R T.** F is the folder
+        // cycle, and it takes the LEFT end because the owner asked for the
+        // folder button at the bottom left — of the strip, which is the
+        // only bottom-left a scrolling desk really has.
+        let (folder, mute, solo, arm, theory) = if switchable && has_arm {
             let gap = 3.0;
-            let w = ((switches.width() - gap * 3.0) / 4.0).max(1.0);
+            let w = ((switches.width() - gap * 4.0) / 5.0).max(1.0);
             let cell = |k: f32| {
                 let left = switches.left() + k * (w + gap);
                 Rect::from_min_max(
@@ -1248,17 +1283,24 @@ impl Layout {
                     Pos2::new(left + w, switches.bottom()),
                 )
             };
-            (cell(0.0), cell(1.0), cell(2.0), cell(3.0))
+            (cell(0.0), cell(1.0), cell(2.0), cell(3.0), cell(4.0))
         } else if switchable {
             let mid = switches.center().x;
             (
+                Rect::NOTHING,
                 Rect::from_min_max(switches.min, Pos2::new(mid - 3.0, switches.max.y)),
                 Rect::from_min_max(Pos2::new(mid + 3.0, switches.min.y), switches.max),
                 Rect::NOTHING,
                 Rect::NOTHING,
             )
         } else {
-            (Rect::NOTHING, Rect::NOTHING, Rect::NOTHING, Rect::NOTHING)
+            (
+                Rect::NOTHING,
+                Rect::NOTHING,
+                Rect::NOTHING,
+                Rect::NOTHING,
+                Rect::NOTHING,
+            )
         };
         // A strip with no send starts its fader where the send would have been,
         // rather than leaving a hole: a hole reads as a control that failed to
@@ -1334,7 +1376,10 @@ impl Layout {
             } else {
                 cut(0.105, 0.180)
             };
-            Rect::from_center_size(r.center(), Vec2::splat(r.height().min(r.width())))
+            // A shade lower than the band's centre - the owner's eye: the
+            // badge floated high against the name above it.
+            let at = Pos2::new(r.center().x, r.center().y + r.height() * 0.12);
+            Rect::from_center_size(at, Vec2::splat(r.height().min(r.width())))
         } else {
             Rect::NOTHING
         };
@@ -1360,10 +1405,20 @@ impl Layout {
                     full
                 }
             },
-            detail: if has_icon { cut(0.152, 0.19) } else { cut(0.086, 0.128) },
+            detail: if view.is_folder {
+                // The folder's extra bays live here now — see `rack`.
+                Rect::NOTHING
+            } else if has_icon {
+                cut(0.152, 0.19)
+            } else {
+                cut(0.086, 0.128)
+            },
             // **The input chip is the detail row on a general channel** —
             // the row already NAMES the input; now pressing it chooses one.
-            input_chip: if matches!(view.strip, Some(Strip::Channel(_))) && !view.empty {
+            input_chip: if matches!(view.strip, Some(Strip::Channel(_)))
+                && !view.empty
+                && !view.is_folder
+            {
                 cut(0.152, 0.19)
             } else {
                 Rect::NOTHING
@@ -1385,6 +1440,7 @@ impl Layout {
             phase,
             solo,
             arm,
+            folder,
             theory,
             mono,
             inserts,
@@ -1407,20 +1463,32 @@ impl Layout {
         for (i, s) in self.strips.iter().enumerate() {
             let i = Column(i);
             for (r, hit) in [
+                // Polarity BEFORE the fader: on short strips the enlarged
+                // switch can graze the fader's band by a pixel, and the
+                // first registered rect wins a contested press - the
+                // smaller control takes the sliver.
+                (s.phase, Hit::Phase(i)),
                 (s.fader, Hit::Fader(i)),
                 (s.send, Hit::Send(i)),
                 (s.pan, Hit::Pan(i)),
                 (s.input_chip, Hit::InputChip(i)),
                 (s.mute, Hit::Mute(i)),
-                (s.phase, Hit::Phase(i)),
                 (s.solo, Hit::Solo(i)),
                 (s.arm, Hit::Arm(i)),
+                (s.folder, Hit::Folder(i)),
                 (s.theory, Hit::ToTheory(i)),
                 (s.mono, Hit::Mono(i)),
                 (s.add, Hit::Add(i)),
                 (s.inserts[0], Hit::Insert(i, 0)),
                 (s.inserts[1], Hit::Insert(i, 1)),
                 (s.inserts[2], Hit::Insert(i, 2)),
+                // Slots 3..5: the master always had these and a FOLDER has
+                // them now — and the master's were laid out, drawn, and
+                // never registered, so its lower rack could not be clicked
+                // in the mixer at all. The same disease the T switch had.
+                (s.inserts[3], Hit::Insert(i, 3)),
+                (s.inserts[4], Hit::Insert(i, 4)),
+                (s.inserts[5], Hit::Insert(i, 5)),
                 (s.routing, Hit::Routing(i)),
                 (s.routes[0], Hit::RouteGain(i, 0)),
                 (s.routes[1], Hit::RouteGain(i, 1)),
@@ -1518,6 +1586,15 @@ pub fn a11y_nodes(rect: Rect, view: &MixerView<'_>) -> Vec<crate::a11y::Node> {
                 s.to_theory,
             ),
             Hit::Mono(_) => Node::toggle(id, r, "Master folded to mono", s.mono),
+            Hit::Folder(_) => Node::toggle(
+                id,
+                r,
+                format!(
+                    "{who} folder cycle{}",
+                    if s.is_folder && s.folder_shut { ", shut" } else { "" }
+                ),
+                s.is_folder,
+            ),
             Hit::Add(_) => Node::button(id, r, format!("Add a channel at slot {}", col.0 + 1)),
             Hit::Remove(_) => Node::button(id, r, format!("Remove {who}")),
             Hit::Name(_) => Node::readout(id, r, format!("{who} name"), who.clone()),
@@ -1582,6 +1659,7 @@ fn hit_column(hit: Hit) -> Option<Column> {
         | Hit::Routing(i)
         | Hit::Db(i)
         | Hit::Name(i)
+        | Hit::Folder(i)
         | Hit::Remove(i) => i,
         Hit::Insert(i, _) | Hit::RouteGain(i, _) | Hit::FxMenu(i, _, _) => i,
     })
@@ -1883,9 +1961,14 @@ fn strip(
     // when there was one, which was a plate sized for two lines on a channel
     // with one — and now the icon sits between them, so a plate that reached
     // the second line would paint over the icon as well.
+    // **A child sits a step lower.** The arrangement indents a grouped
+    // lane sideways; a vertical strip has no sideways, so the plate and its
+    // name drop three points instead — enough to read as "under", too
+    // little to cost the layout anything.
+    let drop = if v.in_folder { 3.0 } else { 0.0 };
     let plate = Rect::from_min_max(
-        Pos2::new(l.panel.left() + 3.0, l.name.top() - 2.0),
-        Pos2::new(l.panel.right() - 3.0, l.name.bottom() + 2.0),
+        Pos2::new(l.panel.left() + 3.0, l.name.top() - 2.0 + drop),
+        Pos2::new(l.panel.right() - 3.0, l.name.bottom() + 2.0 + drop),
     );
     // **Under every name, painted or not.** It was drawn only on a coloured
     // channel, where it exists to keep the label legible on any background —
@@ -1894,7 +1977,29 @@ fn strip(
     let _ = painted;
     if plate.is_positive() {
         painter.rect_filled(plate, 2.0, p.face);
+        // **The folder shape, worn on the plate's top-left**: the tab of a
+        // folder over its body — the smallest mark that reads as one, the
+        // arrangement's own glyph brought over.
+        if v.is_folder {
+            let h = (plate.height() * 0.5).clamp(5.0, 9.0);
+            let w = h * 1.5;
+            let at = Pos2::new(plate.left() + 3.0, plate.center().y - h * 0.5);
+            painter.rect_filled(
+                Rect::from_min_size(at, Vec2::new(w * 0.45, h * 0.35)),
+                1.0,
+                p.engrave,
+            );
+            painter.rect_filled(
+                Rect::from_min_size(
+                    Pos2::new(at.x, at.y + h * 0.28),
+                    Vec2::new(w, h * 0.72),
+                ),
+                1.0,
+                p.engrave,
+            );
+        }
     }
+    let name_rect = l.name.translate(Vec2::new(0.0, drop));
     // **The band's own icons, under the names.** The microphone and the
     // waveform are how the input and the backing track are already labelled
     // one band up; drawing them again here is what makes the three kinds of
@@ -1917,13 +2022,13 @@ fn strip(
             p.engrave,
         );
     }
-    // A chosen badge beats the kind's own icon on a channel strip.
-    let named = if v.icon != 0 && matches!(v.strip, Some(Strip::Channel(_))) {
-        match v.icon {
-            1 => crate::recorder_panel::draw_drum(painter, l.icon, ink, face),
-            2 => crate::recorder_panel::draw_guitar(painter, l.icon, ink, face),
-            _ => crate::recorder_panel::draw_bass(painter, l.icon, ink, face),
-        }
+    // A chosen badge beats the kind's own icon on a channel strip. An
+    // unknown code (a NEWER install's desk) falls through to the kind
+    // rather than drawing nothing.
+    let badge = v.icon != 0
+        && matches!(v.strip, Some(Strip::Channel(_)))
+        && crate::recorder_panel::draw_badge(painter, l.icon, ink, face, v.icon);
+    let named = if badge {
         true
     } else {
         match (v.strip, v.kind) {
@@ -1955,7 +2060,15 @@ fn strip(
     };
     let _ = named;
     if naming.is_none() {
-        centred(painter, l.name, v.name, cap((h * 0.032).clamp(7.5, 12.0)), p.engrave);
+        let mut nr = name_rect;
+        if v.is_folder {
+            // The name slides right of the folder tab rather than under it.
+            nr = Rect::from_min_max(
+                Pos2::new(nr.left() + (nr.height() * 1.5).clamp(9.0, 16.0), nr.top()),
+                nr.max,
+            );
+        }
+        centred(painter, nr, v.name, cap((h * 0.032).clamp(7.5, 12.0)), p.engrave);
     }
     // **The × that takes the channel off the desk.** Subtle — thin strokes in
     // faded ink, on the plate the name shares — but where every window in the
@@ -2175,7 +2288,9 @@ fn strip(
         // The hairline between bays, so three empty ones are three bays and
         // not one tall blank. Not under the last, which would be a line along
         // the bottom edge of the field.
-        if n + 1 < INSERTS {
+        // Against the DRAWN count: gating on INSERTS left the master's
+        // (and now a folder's) bays 2..4 with no line under them.
+        if l.inserts.get(n + 1).is_some_and(|c| c.is_positive()) {
             painter.line_segment(
                 [
                     Pos2::new(cell.left() + 1.0, cell.bottom() + 1.0),
@@ -2252,6 +2367,21 @@ fn strip(
     }
     if l.arm.is_positive() {
         switch(painter, l.arm, "R", v.armed, p.arm, p);
+    }
+    // **F — the folder cycle.** Drawn like its neighbours so a hand that
+    // knows M and S reads it; lit while the channel IS a folder, and shut
+    // shows as a dot beside the letter — the strip never hides, so shut is
+    // a fact worn, not a thing done here.
+    if l.folder.is_positive() {
+        switch(painter, l.folder, "F", v.is_folder, p.engrave, p);
+        if v.is_folder && v.folder_shut {
+            let d = (l.folder.height() * 0.14).clamp(1.5, 3.0);
+            painter.circle_filled(
+                Pos2::new(l.folder.right() - d - 1.5, l.folder.top() + d + 1.5),
+                d,
+                p.engrave,
+            );
+        }
     }
     // **T, and it was laid out and hit-tested and never drawn.** A control
     // you can press and cannot see is worse than one that is missing: the
@@ -2921,8 +3051,8 @@ mod tests {
         let body = &body[..end];
         let mut missing: Vec<&str> = Vec::new();
         for cell in [
-            "theory", "mute", "solo", "arm", "fader", "pan", "send", "name",
-            "db", "meter", "panel",
+            "theory", "mute", "solo", "arm", "folder", "fader", "pan", "send",
+            "name", "db", "meter", "panel",
         ] {
             if !body.contains(&format!("l.{cell}")) {
                 missing.push(cell);
@@ -2939,6 +3069,9 @@ mod tests {
         StripView {
             mono: false,
             to_theory: false,
+            is_folder: false,
+            in_folder: false,
+            folder_shut: false,
             route_count: 0,
             icon: 0,
             strip,
@@ -3347,7 +3480,7 @@ mod tests {
         );
     }
 
-    /// **All sixteen fold into two rows of eight, size permitting.** The
+    /// **All sixteen fold into two rows of sixteen, size permitting.** The
     /// pinned click and master keep the full height at the right; every
     /// channel keeps the width eight-across always had; nothing scrolls
     /// because nothing is off-desk. Too short for a usable half-height
@@ -3367,7 +3500,7 @@ mod tests {
         let below = (0..CHANNELS)
             .filter(|n| l.strips[*n].panel.top() > top + 1.0)
             .count();
-        assert_eq!(below, CHANNELS / 2, "the fold is not eight over eight");
+        assert_eq!(below, CHANNELS / 2, "the fold is not sixteen over sixteen");
         // Same width as eight-across; full-height pinned columns.
         let (unit, _) = Layout::metrics(tall, CHANNELS / 2);
         assert!((l.strips[0].panel.width() - unit).abs() < 0.6);

@@ -248,6 +248,37 @@ cat > "$APP/Contents/Info.plist" <<PLIST
          a tester ends up filing bugs against a version that does not exist
          yet. Private key, ignored by macOS, read by install-macos.sh. -->
     <key>TangentVersion</key>            <string>${VERSION}</string>
+    <!-- **The project document wears the app's rounded mark.** Sessions are
+         .tangent files; with no declared document type Finder stamped them
+         with the blank page. The icon is the AppIcon itself - the squircle -
+         per the owner's "all new projects get the rounded icon by default".
+         Registered with LaunchServices the first time the app runs. -->
+    <key>CFBundleDocumentTypes</key>
+    <array>
+      <dict>
+        <key>CFBundleTypeName</key>       <string>Tangent project</string>
+        <key>CFBundleTypeRole</key>       <string>Editor</string>
+        <key>CFBundleTypeIconFile</key>   <string>AppIcon</string>
+        <key>LSHandlerRank</key>          <string>Owner</string>
+        <key>LSItemContentTypes</key>
+        <array><string>org.codeberg.ganten1998.tangent.project</string></array>
+      </dict>
+    </array>
+    <key>UTExportedTypeDeclarations</key>
+    <array>
+      <dict>
+        <key>UTTypeIdentifier</key>  <string>org.codeberg.ganten1998.tangent.project</string>
+        <key>UTTypeDescription</key> <string>Tangent project</string>
+        <key>UTTypeConformsTo</key>
+        <array><string>public.data</string></array>
+        <key>UTTypeIconFile</key>    <string>AppIcon</string>
+        <key>UTTypeTagSpecification</key>
+        <dict>
+          <key>public.filename-extension</key>
+          <array><string>tangent</string></array>
+        </dict>
+      </dict>
+    </array>
     <key>LSMinimumSystemVersion</key>    <string>11.0</string>
     <key>NSHighResolutionCapable</key>   <true/>
     <key>LSApplicationCategoryType</key> <string>public.app-category.music</string>

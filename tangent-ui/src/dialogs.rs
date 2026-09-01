@@ -5102,7 +5102,7 @@ pub fn show(
                             );
                             ui.label(
                                 RichText::new(
-                                    "the open session - saved as you work; Save keeps this name",
+                                    "the open session - audio takes and the kit write themselves; Save writes the rest, under this name",
                                 )
                                 .font(plain(9.0))
                                 .color(dim),
@@ -5448,8 +5448,9 @@ pub fn show(
                 // scrolling, closing it and opening it on ANOTHER track came
                 // up halfway down somebody else's strip. The content is a
                 // handful of rows; the honest fix is a window that fits it.
-                Vec2::new(360.0, 616.0),
-                Vec2::new(360.0, 616.0),
+                // Widened for the icon table's two rows of thirteen.
+                Vec2::new(520.0, 648.0),
+                Vec2::new(520.0, 648.0),
                 |ui, result| {
                     apply_theme(ui.style_mut(), &t);
                     ui.painter().rect_filled(ui.max_rect(), 0.0, t.bg);
@@ -5565,59 +5566,61 @@ pub fn show(
                                 ui.label(
                                     RichText::new("ICON").font(bold(10.0)).color(dim),
                                 );
-                                ui.horizontal(|ui| {
-                                    for (i, word) in
-                                        ["auto", "drum", "guitar", "bass"].iter().enumerate()
-                                    {
-                                        let chosen = current_icon == i as u8;
-                                        let (rect, resp) = ui.allocate_exact_size(
-                                            Vec2::new(34.0, 26.0),
-                                            egui::Sense::click(),
-                                        );
-                                        ui.painter().rect_filled(
-                                            rect,
-                                            3.0,
-                                            if chosen {
-                                                t.text
-                                            } else {
-                                                egui::Color32::from_black_alpha(40)
-                                            },
-                                        );
-                                        let ink = if chosen { t.bg } else { t.text };
-                                        let b = egui::Rect::from_center_size(
-                                            rect.center(),
-                                            Vec2::splat(20.0),
-                                        );
-                                        match i {
-                                            1 => crate::recorder_panel::draw_drum(
-                                                ui.painter(), b, ink,
-                                                if chosen { t.text } else { t.bg },
-                                            ),
-                                            2 => crate::recorder_panel::draw_guitar(
-                                                ui.painter(), b, ink,
-                                                if chosen { t.text } else { t.bg },
-                                            ),
-                                            3 => crate::recorder_panel::draw_bass(
-                                                ui.painter(), b, ink,
-                                                if chosen { t.text } else { t.bg },
-                                            ),
-                                            _ => {
+                                // **Every badge in the table, two rows** -
+                                // the owner's full kit-room of instruments.
+                                // One source of truth: the cells ARE
+                                // `recorder_panel::ICONS`, drawn by the same
+                                // dispatch the strips use, so the picker can
+                                // never show a badge the desk cannot wear.
+                                let all = crate::recorder_panel::ICONS;
+                                let per_row = all.len().div_ceil(2);
+                                for row in all.chunks(per_row) {
+                                    ui.horizontal(|ui| {
+                                        for (code, name) in row {
+                                            let chosen = current_icon == *code;
+                                            let (rect, resp) = ui.allocate_exact_size(
+                                                Vec2::new(32.0, 26.0),
+                                                egui::Sense::click(),
+                                            );
+                                            ui.painter().rect_filled(
+                                                rect,
+                                                3.0,
+                                                if chosen {
+                                                    t.text
+                                                } else {
+                                                    egui::Color32::from_black_alpha(40)
+                                                },
+                                            );
+                                            let ink = if chosen { t.bg } else { t.text };
+                                            let cell_bg = if chosen { t.text } else { t.bg };
+                                            let b = egui::Rect::from_center_size(
+                                                rect.center(),
+                                                Vec2::splat(22.0),
+                                            );
+                                            if !crate::recorder_panel::draw_badge(
+                                                ui.painter(),
+                                                b,
+                                                ink,
+                                                cell_bg,
+                                                *code,
+                                            ) {
                                                 ui.painter().text(
                                                     rect.center(),
                                                     egui::Align2::CENTER_CENTER,
-                                                    *word,
+                                                    *name,
                                                     plain(8.0),
                                                     ink,
                                                 );
                                             }
+                                            let resp = resp.on_hover_text(*name);
+                                            if resp.clicked() {
+                                                action = Some(DialogAction::TrackIcon(
+                                                    lane, *code,
+                                                ));
+                                            }
                                         }
-                                        if resp.clicked() {
-                                            action = Some(DialogAction::TrackIcon(
-                                                lane, i as u8,
-                                            ));
-                                        }
-                                    }
-                                });
+                                    });
+                                }
                                 ui.add_space(8.0);
                             }
                             ui.label(RichText::new("COLOUR").font(bold(10.0)).color(dim));

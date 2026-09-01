@@ -530,6 +530,9 @@ fn card_rows(gates: Gates, view: HelpView) -> Vec<(&'static str, &'static str)> 
             ("A-CLK", "alt-click an insert: empty the bay"),
             ("DEL", "remove the selected channel"),
             ("C-T", "ctrl+T: a new track"),
+            ("C-F", "ctrl+F: group the selection into a folder"),
+            ("C-C/V/X", "copy the track · paste onto an empty slot · cut"),
+            ("F-SW", "the F switch: folder · shut folder · plain track"),
             ("S-1", "shift+1: the theory view"),
             ("S-2", "shift+2: the arrangement"),
         ]),
@@ -1804,7 +1807,7 @@ mod tests {
 
 // ── the code ───────────────────────────────────────────────────────────────
 
-/// The Konami sequence, watched for once per install: up up down down left
+/// The Konami sequence, watched for on every install: up up down down left
 /// right left right B A Enter, with nothing else in between. The owner's
 /// spec, verbatim, including what it unlocks — see the cheat dialog in the
 /// app. A wrong key resets the walk; a wrong key that happens to be the

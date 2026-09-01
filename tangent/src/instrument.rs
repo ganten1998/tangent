@@ -1232,6 +1232,14 @@ pub struct AutoNow {
     /// and every bound one easier to get wrong. The master is one control,
     /// so it is one field.
     master_gain: Option<f32>,
+    /// The master's BALANCE, when a curve drives it. There is no knob for
+    /// this on the desk - the curve IS the control, which is exactly what
+    /// the owner asked the master's lane to offer. Same 0..1 encoding as a
+    /// channel's pan curve, half is centre.
+    master_pan: Option<f32>,
+    /// The master's mute, curve-driven the same way: heard below half,
+    /// muted above it. No desk switch either - see `master_pan`.
+    master_mute: Option<bool>,
 }
 
 impl Default for AutoNow {
@@ -1242,6 +1250,8 @@ impl Default for AutoNow {
             send: [None; CHANNELS],
             mute: [None; CHANNELS],
             master_gain: None,
+            master_pan: None,
+            master_mute: None,
         }
     }
 }
@@ -2943,6 +2953,13 @@ fn param_slot(lane: usize, bay: usize) -> Option<(usize, usize)> {
         } else {
             None
         };
+    }
+    if lane < CHANNELS && bay >= INSERTS && bay < INSERTS * 2 {
+        // A FOLDER's bays 3..5. Plain order - bay numbering and display
+        // order agree, see `FOLDER_EXTRA_SEATS` - so no `master_bay` twin.
+        // Unconditional on folder-hood on purpose: a curve outlives the
+        // fold, exactly as the plugin state does.
+        return Some((tangent_ui::recorder::folder_extra_seat(lane), bay - INSERTS));
     }
     (lane < CHANNELS && bay < INSERTS).then_some((lane, bay))
 }
@@ -4698,6 +4715,21 @@ impl Renderer {
                 Some(pos) => tangent_ui::recorder::fader_to_gain(pos).clamp(0.0, 8.0),
                 None => Shared::f32_of(&self.shared.master_gain),
             };
+            // **Mute and balance, curve-only controls.** The master has no
+            // mute switch and no pan knob on the desk; when its lane's
+            // curves say so, they ARE the control. Mute is a hard zero -
+            // the fade is the curve author's job - and balance rides the
+            // same equal-power law as a channel, applied here with the
+            // gain, before the mono fold, after the limiter.
+            let master = if self.auto.master_mute == Some(true) {
+                0.0
+            } else {
+                master
+            };
+            let (bal_l, bal_r) = match self.auto.master_pan {
+                Some(pos) => pan_gains(pos * 2.0 - 1.0),
+                None => (1.0, 1.0),
+            };
             let mono = self.shared.master_mono.load(Ordering::Relaxed);
             if let Some(mix) = self.mix.get_mut(..n * TAP_CHANNELS) {
                 self.master_effects.process(
@@ -4711,9 +4743,13 @@ impl Renderer {
                 // **The master, last on the bus and after the limiter.** A
                 // master that fed the limiter would be a second drive control;
                 // this one is what leaves, which is what a master fader is.
-                if (master - 1.0).abs() > 1.0e-6 {
-                    for v in mix.iter_mut() {
-                        *v *= master;
+                let (ml, mr) = (master * bal_l, master * bal_r);
+                if (ml - 1.0).abs() > 1.0e-6 || (mr - 1.0).abs() > 1.0e-6 {
+                    for fr in mix.chunks_exact_mut(TAP_CHANNELS) {
+                        fr[0] *= ml;
+                        if let Some(r) = fr.get_mut(1) {
+                            *r *= mr;
+                        }
                     }
                 }
                 fold_mono(mix, mono);
@@ -5720,13 +5756,24 @@ impl Renderer {
         // by — one past the channels. Suspended by the same rule a channel
         // is: a fader being HELD is the hand talking, and a curve must not
         // argue with it mid-gesture.
-        self.auto.master_gain = if suspend & (1 << MASTER_AUTO_LANE.min(31)) != 0 {
-            None
+        if suspend & (1 << MASTER_AUTO_LANE.min(63)) != 0 {
+            self.auto.master_gain = None;
+            self.auto.master_pan = None;
+            self.auto.master_mute = None;
         } else {
-            self.automation
+            self.auto.master_gain = self
+                .automation
                 .value_at(MASTER_AUTO_LANE, AutoParam::Gain, secs)
-                .map(|v| v as f32)
-        };
+                .map(|v| v as f32);
+            self.auto.master_pan = self
+                .automation
+                .value_at(MASTER_AUTO_LANE, AutoParam::Pan, secs)
+                .map(|v| v as f32);
+            self.auto.master_mute = self
+                .automation
+                .value_at(MASTER_AUTO_LANE, AutoParam::Mute, secs)
+                .map(|v| v >= 0.5);
+        }
     }
 
     /// Tell the desk what each chain is costing.
@@ -5784,6 +5831,10 @@ impl Renderer {
                     break;
                 }
                 acc = acc.saturating_add(Rack::latency(&self.shared, p));
+                acc = acc.saturating_add(Rack::latency(
+                    &self.shared,
+                    tangent_ui::recorder::folder_extra_seat(p),
+                ));
                 up = self.folders[p];
             }
             self.folder_lat[ch] = acc;
@@ -5798,10 +5849,18 @@ impl Renderer {
             // the readout says each of the sixteen costs what the master
             // costs, and a limiter on the master alone drags every channel
             // into compensating for a delay it does not have.
-            let l = self
+            let mut l = self
                 .racks
                 .get(lane)
                 .map_or(0, |_| Rack::latency(&self.shared, lane));
+            // A FOLDER lane's own cost is BOTH its racks - six bays, one
+            // figure, or the readout hides half of what the group pays.
+            if self.folder_is.get(lane).copied().unwrap_or(false) {
+                l = l.saturating_add(Rack::latency(
+                    &self.shared,
+                    tangent_ui::recorder::folder_extra_seat(lane),
+                ));
+            }
             self.shared.lane_latency[lane].store(l, Ordering::Relaxed);
             // **Plus every rack it is folded THROUGH.** A track in a group
             // with a lookahead limiter on the group pays that limiter, so
@@ -5956,7 +6015,11 @@ impl Renderer {
         // and the group came out late by exactly its bus's lookahead.
         let hold: [u64; CHANNELS] = std::array::from_fn(|ch| {
             let after = self.folder_lat[ch].saturating_add(if self.folder_is[ch] {
-                Rack::latency(&self.shared, ch)
+                // BOTH the folder's racks run over its own row at the fold.
+                Rack::latency(&self.shared, ch).saturating_add(Rack::latency(
+                    &self.shared,
+                    tangent_ui::recorder::folder_extra_seat(ch),
+                ))
             } else {
                 0
             });
@@ -7118,7 +7181,15 @@ impl Renderer {
                 // which is why the special case that used to sit here was
                 // both unnecessary and wrong: it left a group a bus
                 // compressor's lookahead late.
-                let own = Rack::latency(&self.shared, ch);
+                let mut own = Rack::latency(&self.shared, ch);
+                if self.folder_is[ch] {
+                    // A folder's own row pays its SECOND rack at the fold
+                    // too - see THE-FOLD - so the wait subtracts both.
+                    own = own.saturating_add(Rack::latency(
+                        &self.shared,
+                        tangent_ui::recorder::folder_extra_seat(ch),
+                    ));
+                }
                 let want = usize::try_from(
                     pdc_max
                         .saturating_sub(own)
@@ -7297,6 +7368,34 @@ impl Renderer {
                     &self.shared,
                     ch,
                 );
+            }
+            // **THE-FOLD: the folder's SECOND rack** - bays 3..5, seated
+            // past everything (`folder_extra_seat`), run here and only here
+            // for the same reason the first one is: this is where the
+            // group's audio exists. Original first, extra after - the strip draws
+            // them top to bottom in that order, so the chain runs as the
+            // eye reads it.
+            {
+                let extra = tangent_ui::recorder::folder_extra_seat(ch);
+                if !self.racks[extra].is_empty() {
+                    let seat_params: [&[tangent_host::ParamPoint]; INSERTS] =
+                        std::array::from_fn(|b| {
+                            self.auto_params
+                                .get(extra * INSERTS + b)
+                                .map_or(&[][..], Vec::as_slice)
+                        });
+                    run_rack(
+                        &mut self.racks[extra],
+                        &mut self.fx_in,
+                        frames,
+                        &mut self.fx_out,
+                        &[],
+                        &[],
+                        &seat_params,
+                        &self.shared,
+                        extra,
+                    );
+                }
             }
             // **No wait here, and that is the point.** Everything in this
             // sum has already waited: a child's stem was held for
@@ -9260,11 +9359,15 @@ impl Engine {
     /// beats a silent hole where a plugin used to be.
     #[must_use]
     pub fn permute_channel_inserts(&mut self, order: &[usize]) -> Vec<usize> {
+        // The channel order, lifted onto the whole seat space: a channel's
+        // folder-extra seat travels WITH it, everything else stays put.
+        let full = tangent_ui::recorder::seat_order(order);
+        let order = full.as_slice();
         let mut failed = Vec::new();
         let mut taken: Vec<(usize, usize, PluginBox)> = Vec::new();
         // ── take everything that moves ───────────────────────────────────
         for (new, old) in order.iter().enumerate() {
-            if new == *old || new >= CHANNELS || *old >= CHANNELS {
+            if new == *old {
                 continue;
             }
             for bay in 0..INSERTS {
@@ -9303,7 +9406,7 @@ impl Engine {
         // beside it. A box that moved without them would play through the
         // wrong compensation and answer to another track's window.
         let pick = |order: &[usize], n: usize| order.get(n).copied().unwrap_or(n);
-        let lat: Vec<u32> = (0..CHANNELS * INSERTS)
+        let lat: Vec<u32> = (0..RACK_SEATS * INSERTS)
             .map(|i| {
                 let (seat, bay) = (i / INSERTS, i % INSERTS);
                 self.shared
@@ -10253,8 +10356,8 @@ impl Engine {
     }
 
 
-    pub fn set_auto_suspend(&self, mask: u32) {
-        self.shared.auto_suspend.store(u64::from(mask), Ordering::Relaxed);
+    pub fn set_auto_suspend(&self, mask: u64) {
+        self.shared.auto_suspend.store(mask, Ordering::Relaxed);
     }
 
     pub fn set_automation(&mut self, auto: tangent_ui::automation::Automation) {
@@ -13799,10 +13902,21 @@ mod tests {
     /// floor — the owner's "expose all of the master's automations".
     #[test]
     fn the_masters_second_rack_has_somewhere_to_keep_its_automation() {
-        // A channel is its own row, and only its own bays exist.
+        // A channel is its own row - and its bays 3..5 are its FOLDER
+        // seat's now, born with the six-bay folder strips. Plain order, no
+        // master_bay twin: bay numbering and display order agree.
         assert_eq!(param_slot(0, 0), Some((0, 0)));
         assert_eq!(param_slot(7, 2), Some((7, 2)));
-        assert_eq!(param_slot(7, INSERTS), None, "a channel grew a fourth bay");
+        assert_eq!(
+            param_slot(7, INSERTS),
+            Some((tangent_ui::recorder::folder_extra_seat(7), 0)),
+            "a channel's fourth bay is its folder seat's first"
+        );
+        assert_eq!(
+            param_slot(7, INSERTS * 2),
+            None,
+            "a channel grew a seventh bay"
+        );
         assert_eq!(param_slot(CHANNELS + 5, 0), None, "a lane nobody has");
 
         // The master keeps its original rack exactly where it was — this is
@@ -14255,6 +14369,133 @@ mod tests {
         assert!(
             (unaffected - open).abs() < open * 0.02,
             "a curve on the last channel moved the master: {unaffected} against {open}"
+        );
+    }
+
+    /// **Mute and balance are the master's other two lanes** — the owner's
+    /// "expose all the master's automations", rendered. A mute curve above
+    /// half silences the bus outright; a balance curve pinned hard left
+    /// keeps the left side and empties the right. Neither has a desk
+    /// control: the curve IS the control.
+    #[test]
+    fn mute_and_balance_curves_on_the_master_lane_are_honoured() {
+        use std::sync::Arc;
+        use tangent_ui::automation::{AutoParam, Automation, Curve, Point, Shape};
+        let render = |auto: Option<Automation>| -> (f32, f32) {
+            let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+            e.set_pad_kit(5, test_kit(&[0], 4_800, 0.5));
+            e.set_channel_gain(5, 1.0);
+            e.set_drum_strips(1 << 5);
+            e.set_master_gain(1.0);
+            if let Some(a) = auto {
+                e.set_automation(a);
+            }
+            e.set_rolling(false);
+            let mut out = vec![0.0f32; 1024 * 2];
+            for _ in 0..4 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+            }
+            e.set_midi_clips(vec![PlacedMidi {
+                strip: 5,
+                start: 0,
+                len: 48_000,
+                notes: Arc::new(vec![ClipNote { at: 0, dur: 2_400, key: PAD_BASE, vel: 100 }]),
+            }]);
+            e.set_transport(1, 0);
+            e.set_rolling(true);
+            let (mut pl, mut pr) = (0.0f32, 0.0f32);
+            for b in 0..4 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                if b == 3 {
+                    for fr in out.chunks_exact(2) {
+                        pl = pl.max(fr[0].abs());
+                        pr = pr.max(fr[1].abs());
+                    }
+                }
+            }
+            (pl, pr)
+        };
+        let (ol, or_) = render(None);
+        assert!(ol > 0.05 && or_ > 0.05, "the fixture is not audible both sides: {ol} {or_}");
+
+        let muted = Automation::from_curves(vec![Curve::sanitised(
+            MASTER_AUTO_LANE,
+            AutoParam::Mute,
+            vec![Point { at_s: 0.0, value: 1.0, shape: Shape::Linear }],
+        )]);
+        let (ml, mr) = render(Some(muted));
+        assert!(
+            ml < 1.0e-6 && mr < 1.0e-6,
+            "the master's mute curve left sound: {ml} {mr}"
+        );
+
+        // Hard LEFT is curve value 0.0 — the same 0..1 encoding a channel's
+        // pan curve uses, half is centre.
+        let left = Automation::from_curves(vec![Curve::sanitised(
+            MASTER_AUTO_LANE,
+            AutoParam::Pan,
+            vec![Point { at_s: 0.0, value: 0.0, shape: Shape::Linear }],
+        )]);
+        let (ll, lr) = render(Some(left));
+        assert!(ll > 0.05, "hard left lost the left side too: {ll}");
+        assert!(lr < 1.0e-6, "hard left kept the right side: {lr}");
+    }
+
+    /// **The master's suspend bit is its OWN — bit 32, not channel 31's.**
+    /// At thirty-two channels the old u32 word aliased the two, so writing
+    /// channel 31's fader suspended the master's curve mid-song. The mask
+    /// is u64 end to end now, and this is what keeps it that way.
+    #[test]
+    fn the_masters_suspend_bit_is_not_channel_31s() {
+        use std::sync::Arc;
+        use tangent_ui::automation::{AutoParam, Automation, Curve, Point, Shape};
+        let render = |suspend: u64| -> f32 {
+            let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+            e.set_pad_kit(5, test_kit(&[0], 4_800, 0.5));
+            e.set_channel_gain(5, 1.0);
+            e.set_drum_strips(1 << 5);
+            e.set_master_gain(1.0);
+            // A curve holding the master's fader shut for the whole song.
+            e.set_automation(Automation::from_curves(vec![Curve::sanitised(
+                MASTER_AUTO_LANE,
+                AutoParam::Gain,
+                vec![Point { at_s: 0.0, value: 0.0, shape: Shape::Linear }],
+            )]));
+            e.set_auto_suspend(suspend);
+            e.set_rolling(false);
+            let mut out = vec![0.0f32; 1024 * 2];
+            for _ in 0..4 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+            }
+            e.set_midi_clips(vec![PlacedMidi {
+                strip: 5,
+                start: 0,
+                len: 48_000,
+                notes: Arc::new(vec![ClipNote { at: 0, dur: 2_400, key: PAD_BASE, vel: 100 }]),
+            }]);
+            e.set_transport(1, 0);
+            e.set_rolling(true);
+            let mut peak = 0.0f32;
+            for b in 0..4 {
+                out.fill(0.0);
+                e.render_offline(&mut out);
+                if b == 3 {
+                    peak = out.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+                }
+            }
+            peak
+        };
+        assert!(render(0) < 1.0e-6, "the master's curve did not hold the fader shut");
+        assert!(
+            render(1u64 << 31) < 1.0e-6,
+            "channel 31's suspend bit silenced the MASTER's curve — the alias is back"
+        );
+        assert!(
+            render(1u64 << MASTER_AUTO_LANE) > 0.05,
+            "the master's own suspend bit did not free its fader"
         );
     }
 
