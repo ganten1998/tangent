@@ -454,6 +454,20 @@ impl ArrRec {
 }
 
 /// The standalone app: `TangentApp`, plus the eframe trait impl it cannot carry.
+/// The settings' patch INDEX, as the engine's patch.
+///
+/// One function, in one place, because an index and an enum that disagree is a
+/// silent wrong instrument rather than an error: the piano would simply come
+/// up when the electric piano was asked for. `dialogs::KEYS_PATCH_NAMES` is
+/// the same list in the same order and the picker reads it, so the two stay
+/// aligned by construction as long as nobody reorders one of them alone.
+fn keys_patch_of(index: usize) -> crate::keys::Patch {
+    crate::keys::Patch::ALL
+        .get(index)
+        .copied()
+        .unwrap_or(crate::keys::Patch::Piano1)
+}
+
 pub struct DesktopApp {
     app: TangentApp,
     /// **Whether the window is currently covering its whole screen** because
@@ -514,6 +528,12 @@ pub struct DesktopApp {
     /// plugin picker's paths-not-modules.
     #[cfg(feature = "recorder")]
     cartridge: Option<crate::dx7::Cartridge>,
+    /// Every cartridge any strip names, loaded once and kept, keyed by path
+    /// with `""` for the bank that ships. Grown on demand: a cartridge is
+    /// kilobytes, a session rarely names more than two, and per-strip DX7s
+    /// mean two strips can be playing out of two different banks at once.
+    #[cfg(feature = "recorder")]
+    cartridges: std::collections::HashMap<String, crate::dx7::Cartridge>,
     /// The patch the editor is working on, if it is open.
     ///
     /// **A copy, not a reference into the cartridge.** Editing is not choosing:
@@ -522,6 +542,10 @@ pub struct DesktopApp {
     /// `SetPatchParam`.
     #[cfg(feature = "recorder")]
     editing: Option<crate::dx7::Voice>,
+    /// Which strip's DX7 the editor is voicing. Since the instruments went
+    /// per-lane, "heard as it is turned" needs an address.
+    #[cfg(feature = "recorder")]
+    editing_strip: usize,
     /// The window was fullscreen when a picker was asked for, so it comes out
     /// of fullscreen, opens the picker next frame, and goes back after. See
     /// `picker_needs_windowed`.
@@ -2826,7 +2850,8 @@ impl DesktopApp {
                 // the bay like any plugin's — that is what lets it be picked,
                 // saved and named by the same code — but the ENGINE renders it
                 // in `mix_channels`, not in the rack, so the bay itself is
-                // handed nothing. See `set_builtin_strip`, pushed each frame.
+                // handed nothing. See `sync_instrument_lanes`, driven by the
+                // masks the per-frame walk pushes.
                 let engine_want = want.as_deref().filter(|p| !tangent_ui::dialogs::is_builtin(p));
                 let path = engine_want.map(std::path::Path::new);
                 // **With the bay's saved preset, when one belongs to this
@@ -2912,16 +2937,16 @@ impl DesktopApp {
         // **The shipped bank, put back.** The same call a first launch makes,
         // which is the point: there is one definition of "the cartridge that
         // ships" and both paths read it.
-        if self.app.take_factory_cartridge() {
+        if let Some(strip) = self.app.take_factory_cartridge() {
             let cart = crate::dx7::factory();
             self.app.set_cartridge(cartridge_info(&cart, "", true));
-            // **And the sound changes now.** Refilling the list without
-            // changing what is playing is a button that appears to do nothing,
-            // which is the complaint this answers. Patch 0, because the
-            // setting was reset to it.
+            // **And the sound changes now — on the strip that asked.**
+            // Refilling the list without changing what is playing is a button
+            // that appears to do nothing, which is the complaint this
+            // answers. Patch 0, because the strip's setting was reset to it.
             if let Some(v) = cart.voices.first().copied() {
                 if let Some(e) = self.recorder.engine.as_mut() {
-                    e.set_builtin_voice(v);
+                    e.set_builtin_voice(strip, v);
                 }
             }
             self.cartridge = Some(cart);
@@ -3247,11 +3272,19 @@ impl DesktopApp {
                         e.set_preview(None);
                     }
                 }
-                R::EditPatch { slot: _ } => {
-                    // Whatever is playing, which is what somebody means by
-                    // "edit this patch". A fresh install starts from the
-                    // default, which is a patch rather than silence.
-                    let v = self.editing.unwrap_or_else(|| self.current_voice());
+                R::EditPatch { slot } => {
+                    // Whatever THAT strip is playing, which is what somebody
+                    // means by "edit this patch". An edit in flight belongs
+                    // to the strip it was opened on; opening the editor on a
+                    // different strip starts from that strip's own sound.
+                    if self.editing_strip != slot {
+                        self.editing = None;
+                    }
+                    self.editing_strip = slot;
+                    let v = match self.editing {
+                        Some(v) => v,
+                        None => self.voice_for_strip(slot),
+                    };
                     self.editing = Some(v);
                     self.push_patch_edit(None);
                 }
@@ -3263,10 +3296,11 @@ impl DesktopApp {
                     if let Some(v) = self.editing.as_mut() {
                         crate::dx7::edit::apply(v, group, index, value);
                         let v = *v;
+                        let strip = self.editing_strip;
                         // **Heard as it is turned.** An editor that only
                         // applied on OK makes every change a guess.
                         if let Some(e) = self.recorder.engine.as_mut() {
-                            e.set_builtin_voice(v);
+                            e.set_builtin_voice(strip, v);
                         }
                         self.push_patch_edit(None);
                     }
@@ -3281,22 +3315,33 @@ impl DesktopApp {
                     let said = self.save_patch();
                     self.push_patch_edit(Some(said));
                 }
-                R::ChoosePatch { slot: _, index } => {
+                R::ChoosePatch { slot, index } => {
                     // `usize::MAX` is the built-in row. Anything else indexes
-                    // the cartridge, and a stale index from a settings file
-                    // written against a cartridge that has since been replaced
-                    // simply finds nothing and leaves the sound alone.
+                    // the STRIP's own cartridge, and a stale index from a
+                    // settings file written against a cartridge that has
+                    // since been replaced simply finds nothing and leaves the
+                    // sound alone.
                     let voice = if index == usize::MAX {
                         Some(crate::dx7::Voice::default())
                     } else {
-                        self.cartridge
-                            .as_ref()
-                            .and_then(|c| c.voices.get(index))
-                            .copied()
+                        let path = self.app.dx7_choice_of(slot).0.to_owned();
+                        self.cartridge_at(&path).voices.get(index).copied()
                     };
                     if let (Some(v), Some(e)) = (voice, self.recorder.engine.as_mut()) {
-                        e.set_builtin_voice(v);
+                        e.set_builtin_voice(slot, v);
                     }
+                }
+                R::LoadStripCartridge { strip } => {
+                    // The picker just opened on this strip: the list must be
+                    // ITS bank's thirty-two names. Nothing is pushed to the
+                    // engine — names are the UI's business, and the sound
+                    // changes when a name is clicked, not when a list fills.
+                    let path = self.app.dx7_choice_of(strip).0.to_owned();
+                    let is_factory = path.is_empty();
+                    let cart = self.cartridge_at(&path).clone();
+                    self.app
+                        .set_cartridge(cartridge_info(&cart, "", is_factory));
+                    self.cartridge = Some(cart);
                 }
                 // An insert's own window. Same one-row-two-names bargain as an
                 // instrument's: press it again and the window that is up goes
@@ -3318,23 +3363,33 @@ impl DesktopApp {
 
     /// The patch the settings point at, if the cartridge has one there.
     ///
-    /// `None` rather than a default, because the caller is deciding whether to
-    /// SEND anything: a patch being edited must not be replaced by the one the
-    /// settings remember every time a device is reopened.
-    fn chosen_voice(&self) -> Option<crate::dx7::Voice> {
-        if self.editing.is_some() {
-            return None;
-        }
-        let (_, patch) = self.app.dx7_choice();
-        self.cartridge.as_ref()?.voices.get(patch).copied()
+    /// The cartridge at `path`, loaded at most once and kept. `""`, or a
+    /// file that has since gone missing, is the bank that ships — the same
+    /// reading launch has always made, so a strip whose cartridge walked off
+    /// a disk still makes a sound.
+    fn cartridge_at(&mut self, path: &str) -> &crate::dx7::Cartridge {
+        self.cartridges.entry(path.to_owned()).or_insert_with(|| {
+            if path.is_empty() {
+                crate::dx7::factory()
+            } else {
+                crate::dx7::Cartridge::load(std::path::Path::new(path))
+                    .unwrap_or_else(|_| crate::dx7::factory())
+            }
+        })
     }
 
-    /// The patch the built-in is playing right now.
-    fn current_voice(&self) -> crate::dx7::Voice {
-        let (_, patch) = self.app.dx7_choice();
-        self.cartridge
-            .as_ref()
-            .and_then(|c| c.voices.get(patch))
+    /// The patch strip `strip`'s DX7 should play, out of its own cartridge.
+    /// A stale index — a settings file written against a bank that got
+    /// shorter — takes the bank's first patch rather than silence.
+    fn voice_for_strip(&mut self, strip: usize) -> crate::dx7::Voice {
+        let (path, patch) = {
+            let (p, i) = self.app.dx7_choice_of(strip);
+            (p.to_owned(), i)
+        };
+        let c = self.cartridge_at(&path);
+        c.voices
+            .get(patch)
+            .or_else(|| c.voices.first())
             .copied()
             .unwrap_or_default()
     }
@@ -3405,8 +3460,7 @@ impl DesktopApp {
     /// sounds, so the worst case is the sound somebody would have had on a
     /// fresh install.
     fn load_cartridge_at_launch(&mut self) {
-        let (path, patch) = self.app.dx7_choice();
-        let (path, patch) = (path.to_owned(), patch);
+        let path = self.app.dx7_choice().0.to_owned();
         // **No cartridge chosen means the one that ships**, not silence and not
         // a single patch. Sixteen electric pianos and sixteen jazz guitars are
         // in the binary; a fresh install has them all without opening a file
@@ -3429,11 +3483,12 @@ impl DesktopApp {
         };
         self.app
             .set_cartridge(cartridge_info(&cart, "", is_factory));
-        if let Some(v) = cart.voices.get(patch).copied() {
-            if let Some(e) = self.recorder.engine.as_mut() {
-                e.set_builtin_voice(v);
-            }
-        }
+        // Into the cache under the path the strips will ask for it by. No
+        // voice is pushed here any more: at launch there is no engine to
+        // hear it, and the per-frame lane sync ships every strip's own
+        // voice the moment its instance lands.
+        self.cartridges
+            .insert(if is_factory { String::new() } else { path }, cart.clone());
         self.cartridge = Some(cart);
     }
 
@@ -3745,9 +3800,21 @@ impl DesktopApp {
         }
         match crate::dx7::Cartridge::load(file) {
             Ok(cart) => {
+                // For the strip whose picker raised the panel — the answer
+                // arrives with a path and no memory of who asked, so the app
+                // remembered. The bank goes into the cache under its path,
+                // the strip's setting starts naming it, and the strip's own
+                // DX7 plays its first patch now.
+                let strip = self.app.cartridge_pick_strip();
+                let path = file.to_string_lossy().into_owned();
                 self.app.set_cartridge(cartridge_info(&cart, "", false));
-                self.app
-                    .set_dx7_cartridge(file.to_string_lossy().into_owned());
+                self.app.set_dx7_cartridge_of(strip, path.clone());
+                if let Some(v) = cart.voices.first().copied() {
+                    if let Some(e) = self.recorder.engine.as_mut() {
+                        e.set_builtin_voice(strip, v);
+                    }
+                }
+                self.cartridges.insert(path, cart.clone());
                 self.cartridge = Some(cart);
             }
             // Reported INTO the dialog rather than as a message box, because
@@ -4647,8 +4714,6 @@ impl DesktopApp {
             .filter(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::BUILTIN_PATH))
             .collect();
         e.set_builtin_strips(builtin_lanes.iter().fold(0u32, |m, ch| m | 1 << ch.min(&31)));
-        let builtin = builtin_lanes.first().copied();
-        e.set_builtin_strip(builtin);
         // **Every lane holding the drumpad.**
         //
         // `.find()` alone was the bug: a drum instrument loads a full
@@ -4661,21 +4726,37 @@ impl DesktopApp {
             .filter(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::DRUMPAD_PATH))
             .collect();
         e.set_drum_strips(drum_lanes.iter().fold(0u32, |m, ch| m | 1 << ch.min(&31)));
+        // **And the modelled keyboard, in the EXPORT walk too.** An instrument
+        // wired into the live engine and forgotten here is the worst kind of
+        // export bug: everything sounds right while it is being played and the
+        // rendered file is missing a track, which nobody finds until the mix
+        // is somewhere else.
+        let keys_lanes: Vec<usize> = (0..tangent_ui::recorder::CHANNELS)
+            .filter(|ch| self.app.insert(*ch, 0) == Some(tangent_ui::dialogs::KEYS_PATH))
+            .collect();
+        e.set_keys_strips(keys_lanes.iter().fold(0u32, |m, ch| m | 1 << ch.min(&31)));
+        for &ch in &keys_lanes {
+            e.set_keys_patch(ch, keys_patch_of(self.app.keys_patch_of(ch)));
+            e.set_keys_voicing(ch, self.app.keys_voicing_of(ch));
+            e.set_keys_width(ch, self.app.keys_width_of(ch));
+        }
         // Groups are part of the mix, so the BOUNCE has them too — an export
         // that ignored the folder buses would render a different record from
         // the one being listened to, which is the worst kind of export bug.
         e.set_folders(self.app.folder_parents());
-        // The DX7's sound is the SESSION's cartridge — the live engine
-        // already carries it, so the export borrows the loaded copy.
-        if builtin.is_some() {
-            let (_, patch) = self.app.dx7_choice();
-            let voice = self
-                .cartridge
-                .as_ref()
-                .and_then(|c| c.voices.get(patch).or_else(|| c.voices.first()))
-                .copied();
-            if let Some(v) = voice {
-                e.set_builtin_voice(v);
+        // Instances for every instrument lane — a fresh offline engine has
+        // none — then each DX7 lane's sound out of its strip's OWN
+        // cartridge. The cache makes that a map lookup; an export whose
+        // second DX7 track rendered with the first track's bank would be the
+        // same class of quiet wrongness as the bar lines being elsewhere.
+        let (made_dx7, _) = e.sync_instrument_lanes(
+            builtin_lanes.iter().fold(0u32, |m, ch| m | 1 << ch.min(&31)),
+            keys_lanes.iter().fold(0u32, |m, ch| m | 1 << ch.min(&31)),
+        );
+        for ch in 0..tangent_ui::recorder::CHANNELS.min(32) {
+            if made_dx7 & (1 << ch) != 0 {
+                let v = self.voice_for_strip(ch);
+                e.set_builtin_voice(ch, v);
             }
         }
         // ── every configured rack seat, saved state included ──
@@ -6078,16 +6159,10 @@ impl DesktopApp {
                 {
                     log::info!("no GPU driver for video: composite defaults lowered to 720p/15");
                 }
-                // **The chosen patch, now that there is something to play it.**
-                // The cartridge is read at construction, long before the band
-                // opens a device, so a voice pushed then goes nowhere — and a
-                // fresh install would play the patch written in the source
-                // rather than the bank it ships with.
-                if let Some(v) = self.chosen_voice() {
-                    if let Some(e) = self.recorder.engine.as_mut() {
-                        e.set_builtin_voice(v);
-                    }
-                }
+                // The chosen patches need no push here any more: a rebuilt
+                // engine has no instrument instances, so the per-frame lane
+                // sync ships fresh ones and follows each with its strip's
+                // own voice — the same road a session load takes.
                 // **The document's clips, now that there is an engine to
                 // hold them.** A rebuilt engine starts empty whatever the old
                 // one held, and the decode cache is keyed to one sample rate
@@ -6235,8 +6310,10 @@ impl DesktopApp {
         let mut picks: [Option<usize>; tangent_ui::recorder::INPUTS] =
             [None; tangent_ui::recorder::INPUTS];
         let mut next_pick = 0usize;
-        let mut builtin: Option<usize> = None;
         let mut builtin_mask = 0u32;
+        // Every lane holding the modelled keyboard, gathered in the same walk
+        // as the DX7's so the two masks cannot disagree about the desk.
+        let mut keys_mask = 0u32;
         let armed = self.app.armed_mask();
         let selected = self.app.selected_channel();
         // **The desk's EXPLICIT input bindings, when any channel has one.**
@@ -6263,12 +6340,14 @@ impl DesktopApp {
                     // **EVERY lane holding it, not the first.** `is_none()`
                     // here was the DX7's half of the same bug the drumpad
                     // had: duplicate a built-in instrument track and the
-                    // copy took MIDI and made no sound.
+                    // copy took MIDI and made no sound. The mask is the
+                    // whole answer now — the first-lane index retired with
+                    // the shared instance it belonged to.
                     if self.app.insert(ch, 0) == Some(tangent_ui::dialogs::BUILTIN_PATH) {
                         builtin_mask |= 1 << ch.min(31);
-                        if builtin.is_none() {
-                            builtin = Some(ch);
-                        }
+                    }
+                    if self.app.insert(ch, 0) == Some(tangent_ui::dialogs::KEYS_PATH) {
+                        keys_mask |= 1 << ch.min(31);
                     }
                 }
                 Some(tangent_ui::recorder::ChannelKind::Audio) => {
@@ -6332,7 +6411,21 @@ impl DesktopApp {
             e.set_punches(punches);
         }
         e.set_builtin_strips(builtin_mask);
-        e.set_builtin_strip(builtin);
+        e.set_keys_strips(keys_mask);
+        // **Every keyboard lane's own state, every frame.** This used to be
+        // one guarded push because a patch change rebuilt the voice pool;
+        // that died when the pool learned to carry both mechanisms, so a
+        // patch is now a flag the engine compares per block, and three
+        // atomic stores per lane per frame is what every fader already
+        // costs. The change-detection state this retires is the point: a
+        // cached "what the engine holds" is one more thing to disagree.
+        for ch in 0..tangent_ui::recorder::CHANNELS {
+            if keys_mask & (1 << ch.min(31)) != 0 {
+                e.set_keys_patch(ch, keys_patch_of(self.app.keys_patch_of(ch)));
+                e.set_keys_voicing(ch, self.app.keys_voicing_of(ch));
+                e.set_keys_width(ch, self.app.keys_width_of(ch));
+            }
+        }
         // The drumpad's lanes, by the same bay-1 sentinel rule — any kind of
         // channel counts, because playback does not ask the arm.
         // **Every lane holding the drumpad.**
@@ -6410,6 +6503,26 @@ impl DesktopApp {
             e.set_metronome_div(self.app.metronome_div());
             // Polarity, one bit per strip — see `Shared::strip_phase`.
             e.set_strip_phase(self.app.strip_phase());
+        }
+        // **The instances themselves, last, with the `&mut` the walk above
+        // never needed.** Everything before this line is an atomic store;
+        // shipping and retiring whole synths is ring work, so it waits for
+        // the shared borrow to end. A DX7 lane born this frame is followed
+        // by its strip's own voice — the cartridge cache makes that a map
+        // lookup, not a file read — and a keyboard lane needs no follow-up,
+        // its patch and knobs being per-lane atomics pushed above.
+        let made_dx7 = self
+            .recorder
+            .engine
+            .as_mut()
+            .map_or(0, |e| e.sync_instrument_lanes(builtin_mask, keys_mask).0);
+        for ch in 0..tangent_ui::recorder::CHANNELS.min(32) {
+            if made_dx7 & (1 << ch) != 0 {
+                let v = self.voice_for_strip(ch);
+                if let Some(e) = self.recorder.engine.as_mut() {
+                    e.set_builtin_voice(ch, v);
+                }
+            }
         }
     }
 
@@ -7524,7 +7637,11 @@ impl DesktopApp {
             #[cfg(feature = "recorder")]
             cartridge: None,
             #[cfg(feature = "recorder")]
+            cartridges: std::collections::HashMap::new(),
+            #[cfg(feature = "recorder")]
             editing: None,
+            #[cfg(feature = "recorder")]
+            editing_strip: 0,
             #[cfg(feature = "recorder")]
             refullscreen: false,
             #[cfg(feature = "recorder")]

@@ -894,7 +894,12 @@ pub struct TangentApp {
     /// front of a floating dialog by any other means.
     native_panel_up: bool,
     /// The user pressed Factory in the patch picker. Taken by the host.
-    factory_cartridge: bool,
+    /// `Some(strip)` when that strip asked for the shipped cartridge back.
+    factory_cartridge: Option<usize>,
+    /// Which strip a raised cartridge file panel belongs to. Remembered
+    /// here because the panel is asynchronous and its answer arrives with a
+    /// path and no memory of who asked.
+    cartridge_pick_strip: usize,
     file_request: Option<crate::ports::FileRequest>,
     /// The in-app browser's three messages to the host: list this, I chose a
     /// file, I chose a folder. See `Dialog::FileBrowser`.
@@ -1789,6 +1794,9 @@ fn plugin_display_name(path: &str) -> &str {
     if path == dialogs::DRUMPAD_PATH {
         return "TANGENT DRUMS";
     }
+    if path == dialogs::KEYS_PATH {
+        return "TANGENT KEYS";
+    }
     // Both separators: a Windows path split on '/' alone came back WHOLE,
     // and the tester's bays read like a registry dump.
     path.rsplit(['/', '\\'])
@@ -2235,7 +2243,8 @@ impl TangentApp {
             open_insert_on_load: None,
             mixer_rect: None,
             native_panel_up: false,
-            factory_cartridge: false,
+            factory_cartridge: None,
+            cartridge_pick_strip: 0,
             file_request: None,
             browse_request: None,
             browsed_file: None,
@@ -6263,13 +6272,18 @@ impl TangentApp {
         std::mem::take(&mut self.plugin_rescan)
     }
 
-    /// The user asked for the shipped cartridge back.
+    /// The user asked for the shipped cartridge back — on this strip.
     ///
-    /// A flag rather than a request with a payload, because there is nothing
-    /// to say: the bank is in the binary and the host already knows how to
-    /// reach it — it does so on every launch that has no cartridge chosen.
-    pub fn take_factory_cartridge(&mut self) -> bool {
-        std::mem::take(&mut self.factory_cartridge)
+    /// The strip travels with the flag now, because every strip owns its own
+    /// DX7: the bank is still in the binary and the host still knows how to
+    /// reach it, but WHOSE sound changes stopped being obvious.
+    pub fn take_factory_cartridge(&mut self) -> Option<usize> {
+        self.factory_cartridge.take()
+    }
+
+    /// Which strip the cartridge file panel that is up was raised for.
+    pub fn cartridge_pick_strip(&self) -> usize {
+        self.cartridge_pick_strip
     }
 
     /// Take a pending "choose a folder" request. Same contract.
@@ -18200,17 +18214,103 @@ impl TangentApp {
         &self.settings.effect_params
     }
 
-    /// The cartridge path and patch the host should restore at launch.
+    /// The cartridge path and patch the host should show at launch — the
+    /// session-wide SEED, which is also what an old build reads. Per-strip
+    /// truth lives in [`TangentApp::dx7_choice_of`].
     pub fn dx7_choice(&self) -> (&str, usize) {
         (&self.settings.dx7_cartridge, self.settings.dx7_patch)
     }
 
-    /// Remember which cartridge is loaded, so the next launch opens it.
-    pub fn set_dx7_cartridge(&mut self, path: String) {
-        self.settings.dx7_cartridge = path;
+    /// The cartridge path and patch strip `strip`'s own DX7 plays. `""` is
+    /// the bank that ships, exactly as the session-wide field spells it.
+    pub fn dx7_choice_of(&self, strip: usize) -> (&str, usize) {
+        (
+            self.settings
+                .strip_dx7_cartridge
+                .get(strip)
+                .map_or("", String::as_str),
+            self.settings
+                .strip_dx7_patch
+                .get(strip)
+                .copied()
+                .unwrap_or(0)
+                .min(dialogs::CARTRIDGE_VOICES - 1),
+        )
+    }
+
+    /// Remember which cartridge strip `strip` has loaded.
+    pub fn set_dx7_cartridge_of(&mut self, strip: usize, path: String) {
+        if let Some(slot) = self.settings.strip_dx7_cartridge.get_mut(strip) {
+            *slot = path;
+        }
         // The patch index belonged to the cartridge that was there before.
-        self.settings.dx7_patch = 0;
+        if let Some(slot) = self.settings.strip_dx7_patch.get_mut(strip) {
+            *slot = 0;
+        }
         self.save_settings();
+    }
+
+    /// Which of its cartridge's patches strip `strip`'s DX7 plays.
+    pub fn set_dx7_patch_of(&mut self, strip: usize, index: usize) {
+        if let Some(slot) = self.settings.strip_dx7_patch.get_mut(strip) {
+            *slot = index.min(dialogs::CARTRIDGE_VOICES - 1);
+        }
+    }
+
+    /// Which of the modelled keyboard's patches strip `strip` plays, as an
+    /// index into `dialogs::KEYS_PATCH_NAMES`. Clamped on the way out, so a
+    /// settings file written by a build that shipped more patches than this
+    /// one cannot ask for an instrument that is not here.
+    pub fn keys_patch_of(&self, strip: usize) -> usize {
+        self.settings
+            .strip_keys_patch
+            .get(strip)
+            .copied()
+            .unwrap_or(0)
+            .min(dialogs::KEYS_PATCHES - 1)
+    }
+
+    /// Choose one, for one strip. Saves, because every other setting does.
+    pub fn set_keys_patch_of(&mut self, strip: usize, index: usize) {
+        if let Some(slot) = self.settings.strip_keys_patch.get_mut(strip) {
+            *slot = index.min(dialogs::KEYS_PATCHES - 1);
+        }
+        self.settings.save();
+    }
+
+    /// The keyboard panel's felt knob for one strip, 0 mellow to 1 bright.
+    pub fn keys_voicing_of(&self, strip: usize) -> f32 {
+        self.settings
+            .strip_keys_voicing
+            .get(strip)
+            .copied()
+            .unwrap_or(0.5)
+            .clamp(0.0, 1.0) as f32
+    }
+
+    pub fn set_keys_voicing_of(&mut self, strip: usize, value: f32) {
+        if let Some(slot) = self.settings.strip_keys_voicing.get_mut(strip) {
+            *slot = f64::from(value.clamp(0.0, 1.0));
+        }
+        self.save_settings_soon();
+    }
+
+    /// The keyboard panel's width knob for one strip: 0 mono, 1 the stock
+    /// seating, 1.5 leaning wider.
+    pub fn keys_width_of(&self, strip: usize) -> f32 {
+        self.settings
+            .strip_keys_width
+            .get(strip)
+            .copied()
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.5) as f32
+    }
+
+    pub fn set_keys_width_of(&mut self, strip: usize, value: f32) {
+        if let Some(slot) = self.settings.strip_keys_width.get_mut(strip) {
+            *slot = f64::from(value.clamp(0.0, 1.5));
+        }
+        self.save_settings_soon();
     }
 
 
@@ -18721,6 +18821,8 @@ impl TangentApp {
             // The drumpad's face is the drumpad: pads, kit and browser in
             // one window, same as its key opens.
             Some(dialogs::DRUMPAD_PATH) => self.open_drumpad_for(strip),
+            // The modelled keyboard's face is its two patches.
+            Some(dialogs::KEYS_PATH) => self.open_keys_picker(strip),
             Some(_) => {
                 self.request_recorder(recorder::RecorderRequest::OpenInsertEditor(strip, bay));
             }
@@ -18771,10 +18873,26 @@ impl TangentApp {
     }
 
     /// Open the patch picker for the built-in in `slot`.
+    /// The modelled keyboard's window: which of the two it is being, and the
+    /// two knobs — all of it the STRIP's own state.
+    fn open_keys_picker(&mut self, slot: usize) {
+        self.dialog = Some(Dialog::KeysPatch {
+            slot,
+            selected: self.keys_patch_of(slot),
+            voicing: self.keys_voicing_of(slot),
+            width: self.keys_width_of(slot),
+        });
+    }
+
     fn open_patch_picker(&mut self, slot: usize) {
+        // The list must be THIS strip's cartridge. The host owns the files,
+        // so ask it; the names arrive next frame and the open dialog refills,
+        // the same road the Factory button has always taken.
+        self.request_recorder(recorder::RecorderRequest::LoadStripCartridge { strip: slot });
+        let (_, patch) = self.dx7_choice_of(slot);
         let selected = (!self.cartridge.voices.is_empty()
-            && self.settings.dx7_patch < self.cartridge.voices.len())
-            .then_some(self.settings.dx7_patch);
+            && patch < self.cartridge.voices.len())
+        .then_some(patch);
         self.dialog = Some(dialogs::Dialog::patch_picker(
             slot,
             self.cartridge.bank.clone(),
@@ -22366,17 +22484,27 @@ impl TangentApp {
                     match path.as_deref() {
                         Some(dialogs::BUILTIN_PATH) => self.open_patch_picker(strip),
                         Some(dialogs::DRUMPAD_PATH) => self.open_drumpad_for(strip),
+                        Some(dialogs::KEYS_PATH) => self.open_keys_picker(strip),
                         Some(_) => self.open_insert_on_load = Some((strip, at)),
                         None => {}
                     }
                 }
+            }
+            DialogAction::ChooseKeysPatch { slot, index } => {
+                self.set_keys_patch_of(slot, index);
+            }
+            DialogAction::SetKeysVoicing { slot, value } => {
+                self.set_keys_voicing_of(slot, value);
+            }
+            DialogAction::SetKeysWidth { slot, value } => {
+                self.set_keys_width_of(slot, value);
             }
             DialogAction::ChoosePatch { slot, index } => {
                 // `usize::MAX` is the built-in row: no cartridge patch, the one
                 // compiled in. A sentinel rather than an `Option` because it
                 // rides the same request the real indices do, and the host has
                 // one arm to read instead of two.
-                self.settings.dx7_patch = if index == usize::MAX { 0 } else { index };
+                self.set_dx7_patch_of(slot, if index == usize::MAX { 0 } else { index });
                 self.save_settings_soon();
                 self.request_recorder(recorder::RecorderRequest::ChoosePatch { slot, index });
             }
@@ -22410,27 +22538,33 @@ impl TangentApp {
             DialogAction::SavePatch => {
                 self.request_recorder(recorder::RecorderRequest::SavePatch);
             }
-            DialogAction::UseFactoryCartridge => {
+            DialogAction::UseFactoryCartridge { slot } => {
                 // **The setting is what selects it.** An empty path is what a
-                // fresh install has and what `load_cartridge_at_launch` reads
-                // as "the one that ships", so putting the cartridge back is
-                // putting the setting back — and the host then loads exactly
-                // what a first launch would.
-                self.settings.dx7_cartridge.clear();
-                self.settings.dx7_patch = 0;
+                // fresh strip has and what the host reads as "the one that
+                // ships", so putting the cartridge back is putting the
+                // STRIP's setting back — and the host then loads exactly what
+                // a fresh lane would.
+                if let Some(p) = self.settings.strip_dx7_cartridge.get_mut(slot) {
+                    p.clear();
+                }
+                if let Some(p) = self.settings.strip_dx7_patch.get_mut(slot) {
+                    *p = 0;
+                }
                 self.save_settings();
-                self.factory_cartridge = true;
+                self.factory_cartridge = Some(slot);
             }
-            DialogAction::LoadCartridge => {
+            DialogAction::LoadCartridge { slot } => {
                 if !self.caps.native_file_dialogs {
                     return;
                 }
                 self.native_panel_up = true;
+                self.cartridge_pick_strip = slot;
+                let (from, _) = self.dx7_choice_of(slot);
                 self.file_request = Some(crate::ports::FileRequest {
                     // Where the last one came from, which is where the next one
                     // almost certainly is: people keep cartridges in one folder
                     // ten thousand files deep.
-                    start_at: std::path::Path::new(&self.settings.dx7_cartridge)
+                    start_at: std::path::Path::new(from)
                         .parent()
                         .filter(|p| p.is_dir())
                         .map(std::path::Path::to_path_buf),
@@ -26467,21 +26601,29 @@ mod tests {
     #[test]
     fn the_shipped_cartridge_can_be_put_back() {
         let mut settings = Settings::default();
-        settings.dx7_cartridge = "/somewhere/ROM1A.syx".to_owned();
-        settings.dx7_patch = 17;
+        settings.strip_dx7_cartridge[2] = "/somewhere/ROM1A.syx".to_owned();
+        settings.strip_dx7_patch[2] = 17;
         let (_ctx, mut app) = headless_with(Caps::DESKTOP, settings);
-        assert_eq!(app.dx7_choice(), ("/somewhere/ROM1A.syx", 17));
+        assert_eq!(app.dx7_choice_of(2), ("/somewhere/ROM1A.syx", 17));
 
-        app.apply_dialog_action(DialogAction::UseFactoryCartridge);
+        app.apply_dialog_action(DialogAction::UseFactoryCartridge { slot: 2 });
         assert_eq!(
-            app.dx7_choice(),
+            app.dx7_choice_of(2),
             ("", 0),
             "the setting still names a file, so the next launch loads it again"
         );
-        // The host is told once, and only once: a flag that stayed set would
-        // reload the bank on every frame for the rest of the session.
-        assert!(app.take_factory_cartridge(), "the host was never told");
-        assert!(!app.take_factory_cartridge(), "the flag latched on");
+        // The host is told once, and only once — and told WHOSE strip: a flag
+        // that stayed set would reload the bank on every frame, and one with
+        // no lane on it would re-voice somebody else's track.
+        assert_eq!(
+            app.take_factory_cartridge(),
+            Some(2),
+            "the host was never told"
+        );
+        assert!(
+            app.take_factory_cartridge().is_none(),
+            "the flag latched on"
+        );
     }
 
     /// **A dialog stops floating while the OS's file panel is up.**
@@ -26496,7 +26638,7 @@ mod tests {
         let (_ctx, mut app) = headless(Caps::DESKTOP);
         assert!(!app.native_panel_up(), "nothing has been asked for yet");
 
-        app.apply_dialog_action(DialogAction::LoadCartridge);
+        app.apply_dialog_action(DialogAction::LoadCartridge { slot: 0 });
         assert!(
             app.take_file_request().is_some(),
             "no panel was asked for at all"
@@ -28537,7 +28679,12 @@ mod tests {
             matches!(app.dialog, Some(dialogs::Dialog::PatchPicker { slot: 0, .. })),
             "the built-in did not open its patches"
         );
-        // And nothing was asked of the host: there is no window to open.
+        // The one thing asked of the host is the STRIP's cartridge names —
+        // never a window, which is the regression this test exists for.
+        assert_eq!(
+            app.take_recorder_request(),
+            Some(recorder::RecorderRequest::LoadStripCartridge { strip: 0 })
+        );
         assert!(app.take_recorder_request().is_none());
 
         app.dialog = None;
@@ -29645,7 +29792,10 @@ mod tests {
             app.take_recorder_request(),
             Some(recorder::RecorderRequest::ChoosePatch { slot: 1, index: 12 })
         );
-        assert_eq!(app.settings.dx7_patch, 12);
+        // Remembered on the STRIP, because the strip owns the instrument;
+        // its neighbours' choices must not move.
+        assert_eq!(app.settings.strip_dx7_patch[1], 12);
+        assert_eq!(app.settings.strip_dx7_patch[0], 0);
 
         // The built-in row. `usize::MAX` is not an index into anything, so it
         // must not be written to the settings as one.
@@ -29660,18 +29810,18 @@ mod tests {
                 index: usize::MAX
             })
         );
-        assert_eq!(app.settings.dx7_patch, 0);
+        assert_eq!(app.settings.strip_dx7_patch[1], 0);
     }
 
     /// A plugin host never raises a file panel, so it never asks for one.
     #[test]
     fn a_plugin_does_not_ask_for_a_cartridge_file() {
         let (_, mut app) = headless(Caps::PLUGIN);
-        app.apply_dialog_action(dialogs::DialogAction::LoadCartridge);
+        app.apply_dialog_action(dialogs::DialogAction::LoadCartridge { slot: 0 });
         assert!(app.take_file_request().is_none());
 
         let (_, mut app) = headless(Caps::DESKTOP);
-        app.apply_dialog_action(dialogs::DialogAction::LoadCartridge);
+        app.apply_dialog_action(dialogs::DialogAction::LoadCartridge { slot: 0 });
         let r = app.take_file_request().expect("the desktop asks");
         assert_eq!(r.purpose, crate::ports::FilePurpose::Cartridge);
         assert!(r.extensions.iter().any(|e| e.eq_ignore_ascii_case("syx")));

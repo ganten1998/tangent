@@ -1672,12 +1672,6 @@ struct Shared {
     /// — the equal-power law is normalised so nothing gets quieter for
     /// having a pan knob it never touched.
     channel_pans: [AtomicU32; CHANNELS],
-    /// Which general channel the built-in DX7 belongs to: a DESK INDEX, or -1
-    /// for none. It stopped being a slot when the slots stopped existing on
-    /// the desk; the migration guarantees a desk with no instrument anywhere
-    /// gets one channel seeded with the built-in, so there is no silent
-    /// fallback left to need.
-    builtin_strip: AtomicI64,
     /// Which general channel is the DRUMPAD's — its notes are pad strikes,
     /// not pitches. `-1` is nobody's. The host computes it from bay 1's
     /// sentinel, exactly as `builtin_strip`.
@@ -1712,10 +1706,36 @@ struct Shared {
     /// already encodes — so the graph cannot contain a cycle by
     /// construction, and a fold that walks parents always terminates.
     folder_of: [AtomicI32; CHANNELS],
-    /// Every channel the built-in DX7 is on. Same story, same bug: one
-    /// `Builtin`, one index, `builtin.is_none()` in the host's walk, so the
-    /// second lane holding it was silent too.
+    /// Every channel the built-in DX7 is on, one bit each — and since the
+    /// amount-limit died, every one of those lanes owns a FULL instance, the
+    /// way the drumpad always has. The mask is the desk's truth; the
+    /// instances travel separately, by ring, because a mask can be stored
+    /// from any thread and a synth cannot.
     builtin_strips: AtomicU32,
+    /// **Every channel the modelled keyboard is on**, one bit each.
+    ///
+    /// A mask and not an index, from the first line rather than after the
+    /// bug: the DX7 and the drumpad both shipped as a single `.find()` and
+    /// both had to be widened after a duplicated track took MIDI and made no
+    /// sound. Each masked lane owns its own `Keys` now — a piano track and
+    /// an EP track in one session, or eight of either, is the ordinary thing
+    /// to want and what the old single instance could never do.
+    keys_strips: AtomicU32,
+    /// **Which of the modelled keyboard's patches each LANE has loaded.**
+    ///
+    /// Atomics and not method calls, because the instruments live on the
+    /// audio thread: the `Renderer` is MOVED into the callback, so the host
+    /// has no `&mut` to reach them with and never will. The DX7 has the same
+    /// problem and solves it with a pending-voice queue; a patch is one small
+    /// number per lane, so this is a store on one side and a compare on the
+    /// other.
+    keys_patch: [AtomicU32; CHANNELS],
+    /// The keyboard panel's two knobs, per lane, as f32 bits: VOICING
+    /// (0 mellow, 1 bright, 0.5 the bench tuning) and WIDTH (0 mono, 1 the
+    /// stock seating). Same protocol as the patch: the host stores, the
+    /// callback applies before the block's strikes.
+    keys_voicing: [AtomicU32; CHANNELS],
+    keys_width: [AtomicU32; CHANNELS],
     /// Which general channel each capture PICK feeds: desk indices, -1 for an
     /// unbound pick. The k-th AUDIO channel takes pick k — the HOST computes
     /// the order, the callback only reads it, which is the same trust split
@@ -2121,12 +2141,15 @@ struct Shared {
     tap_dropped: AtomicU64,
     midi_dropped: AtomicU64,
     pedal_dropped: AtomicU64,
-    /// A patch waiting to be picked up by the renderer.
+    /// Patches waiting to be picked up by the renderer, `(lane, voice)`.
     ///
     /// A mutex, and the audio thread only ever `try_lock`s it: a patch change
     /// that has to wait one block is imperceptible, and a block that has to
-    /// wait for a patch change is a dropout.
-    pending_voice: std::sync::Mutex<Option<crate::dx7::Voice>>,
+    /// wait for a patch change is a dropout. A `Vec` since the lanes
+    /// multiplied, pushed on the UI thread and DRAINED on the audio thread —
+    /// draining frees nothing, `Voice` being 155 inline numbers, so the
+    /// callback stays allocation-free in both directions.
+    pending_voices: std::sync::Mutex<Vec<(usize, crate::dx7::Voice)>>,
     running: AtomicBool,
     callbacks: AtomicU64,
     swaps: AtomicU64,
@@ -2147,10 +2170,13 @@ impl Shared {
         Self {
             channel_gains: std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
             channel_pans: std::array::from_fn(|_| AtomicU32::new(0.0f32.to_bits())),
-            builtin_strip: AtomicI64::new(-1),
             drum_strips: AtomicU32::new(0),
             folder_of: std::array::from_fn(|_| AtomicI32::new(-1)),
             builtin_strips: AtomicU32::new(0),
+            keys_strips: AtomicU32::new(0),
+            keys_patch: std::array::from_fn(|_| AtomicU32::new(0)),
+            keys_voicing: std::array::from_fn(|_| AtomicU32::new(0.5f32.to_bits())),
+            keys_width: std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
             pick_strip: std::array::from_fn(|_| AtomicI64::new(-1)),
             punch: std::array::from_fn(|_| AtomicU64::new(u64::MAX)),
             metro_gain: AtomicU32::new(0.7f32.to_bits()),
@@ -2258,7 +2284,7 @@ impl Shared {
             tap_dropped: AtomicU64::new(0),
             midi_dropped: AtomicU64::new(0),
             pedal_dropped: AtomicU64::new(0),
-            pending_voice: std::sync::Mutex::new(None),
+            pending_voices: std::sync::Mutex::new(Vec::new()),
             running: AtomicBool::new(false),
             callbacks: AtomicU64::new(0),
             xruns: AtomicU64::new(0),
@@ -3190,7 +3216,17 @@ struct Renderer {
     /// two lanes fighting over a single one-pole smoother is a fader that
     /// jumps between two targets every block.
     pad_gain: Vec<f32>,
-    builtin: crate::dx7::Dx7,
+    /// The built-in DX7s: one FULL instance per lane that holds the
+    /// sentinel, `None` everywhere else — the drumpad's arrangement, arrived
+    /// at for the drumpad's reason. One shared instance behind a mask meant
+    /// two DX7 tracks were one synth wearing two names: the second lane was
+    /// silent by design, and a different cartridge per track was not even
+    /// expressible. Instances are built and freed on the UI thread and travel
+    /// by `dx7_incoming`/`dx7_retiring`, the kit's swap protocol exactly,
+    /// because the callback may neither allocate a synth nor drop one.
+    dx7s: Vec<Option<Box<crate::dx7::Dx7>>>,
+    dx7_incoming: Consumer<(usize, Option<Box<crate::dx7::Dx7>>)>,
+    dx7_retiring: Producer<(usize, Option<Box<crate::dx7::Dx7>>)>,
     /// The built-in's own output, before its slot gain.
     ///
     /// **It needs a buffer of its own for the same reason a plugin does.** The
@@ -3199,8 +3235,21 @@ struct Renderer {
     /// separable — and therefore no moment at which a fader can be applied to
     /// it. That is exactly what happened: the DX7's slot fader moved a number
     /// that reached the settings, the engine and the meter, and never once
-    /// reached the audio.
+    /// reached the audio. ONE scratch serves every lane: the walk renders a
+    /// lane, copies it out, and only then moves to the next.
     builtin_scratch: Vec<f32>,
+    /// The modelled keyboards, on the same per-lane terms as the DX7s above.
+    ///
+    /// This one is WHY the per-lane rework happened: with a single `Keys`
+    /// behind a mask, a session could not hold a piano track and an EP track
+    /// at once — the patch was one global number, so choosing the Rhodes on
+    /// lane 5 silently re-voiced the piano on lane 2. A `Keys` is about 3 MB
+    /// of delay lines, so lanes that do not hold one pay nothing but the
+    /// `None`.
+    keys_lanes: Vec<Option<Box<crate::keys::Keys>>>,
+    keys_incoming: Consumer<(usize, Option<Box<crate::keys::Keys>>)>,
+    keys_retiring: Producer<(usize, Option<Box<crate::keys::Keys>>)>,
+    keys_scratch: Vec<f32>,
     /// Where each general channel's fader has slewed to. Per channel, because
     /// the eight move independently — the same treatment every fader gets.
     channel_gain: [f32; CHANNELS],
@@ -4063,7 +4112,9 @@ impl Renderer {
             let muted = self.muted_now(muted);
             let flush = jumped || (self.was_rolling && !rolling);
             if flush && self.sounding != 0 {
-                self.builtin.all_notes_off();
+                for d in self.dx7s.iter_mut().flatten() {
+                    d.all_notes_off();
+                }
                 for pitch in 0..128u8 {
                     if self.sounding & (1 << pitch) != 0 && self.notes.len() < MAX_EVENTS_PER_BLOCK
                     {
@@ -6722,10 +6773,44 @@ impl Renderer {
         // because it changes when a plugin is loaded and not within a
         // buffer. See `publish_latency`.
         let pdc_max = self.shared.max_latency.load(Ordering::Relaxed);
-        // A patch change, if one is waiting and the lock is free this block.
-        if let Ok(mut g) = self.shared.pending_voice.try_lock() {
-            if let Some(v) = g.take() {
-                self.builtin.set_voice(v);
+        // Instrument instances arriving or leaving, by the kit's own swap
+        // protocol: built and freed on the UI thread, installed here by
+        // pointer swap. Whatever a slot held rides back on the retiring ring,
+        // because a displaced synth is megabytes and the callback may not be
+        // the thread that drops them. If the retiring ring is full the
+        // incoming one is left alone too — backpressure, not loss; the host
+        // repeats its diff every frame until it lands.
+        while self.dx7_retiring.slots() > 0 {
+            let Ok((lane, next)) = self.dx7_incoming.pop() else {
+                break;
+            };
+            if let Some(slot) = self.dx7s.get_mut(lane) {
+                let old = std::mem::replace(slot, next);
+                let _ = self.dx7_retiring.push((lane, old));
+            } else {
+                let _ = self.dx7_retiring.push((lane, next));
+            }
+        }
+        while self.keys_retiring.slots() > 0 {
+            let Ok((lane, next)) = self.keys_incoming.pop() else {
+                break;
+            };
+            if let Some(slot) = self.keys_lanes.get_mut(lane) {
+                let old = std::mem::replace(slot, next);
+                let _ = self.keys_retiring.push((lane, old));
+            } else {
+                let _ = self.keys_retiring.push((lane, next));
+            }
+        }
+        // Patch changes, if any are waiting and the lock is free this block.
+        // A drain, not a take: two lanes' voices can land in one block when a
+        // session loads, and `Voice` is inline numbers so dropping the pairs
+        // here frees nothing.
+        if let Ok(mut g) = self.shared.pending_voices.try_lock() {
+            for (lane, v) in g.drain(..) {
+                if let Some(Some(d)) = self.dx7s.get_mut(lane) {
+                    d.set_voice(v);
+                }
             }
         }
         // The note the LAST block's walk parked, if any — taken so it lasts
@@ -6753,22 +6838,63 @@ impl Renderer {
             }
             parked = false;
         }
-        let wanted = self.shared.builtin_strip.load(Ordering::Relaxed);
-        let builtin_at = (wanted >= 0).then_some(wanted as usize);
         // **Every lane holding a drumpad**, not the first. A drum instrument
         // loads a full instance per channel, so each of those lanes turns its
         // own clip notes into strikes on its OWN kit — which is what makes a
         // duplicated drum track sound at all.
         let drum_mask = self.shared.drum_strips.load(Ordering::Relaxed);
         let is_drum_lane = |ch: usize| drum_mask & (1 << ch.min(31)) != 0;
+        // **The DX7 and the keyboard hold to the drumpad's terms now: the
+        // mask says who holds one, and every masked lane renders its OWN
+        // instance.** The old arrangement — one instrument behind the mask,
+        // lowest lane renders, second lane silent by design — is gone,
+        // because "a DX7 track and another DX7 track" is as ordinary a thing
+        // to want as "a DX7 track and a piano track" ever was. A lane whose
+        // instance has not arrived yet renders nothing for a frame or two,
+        // which is the same window a loading kit has.
+        let builtin_mask = self.shared.builtin_strips.load(Ordering::Relaxed);
+        let keys_mask = self.shared.keys_strips.load(Ordering::Relaxed);
         let midi_off = self.shared.midi_off.load(Ordering::Relaxed);
-        let builtin_armed = builtin_at.is_some_and(|ch| midi_off & (1 << ch.min(31)) == 0);
-        // CC 64 is the damper, live input only. Half scale is the switch
-        // point every synth uses.
-        if builtin_armed {
-            for c in &self.controls {
-                if c.controller == 64 {
-                    self.builtin.set_pedal(c.value >= 64);
+        // Per-lane state, applied on the thread that owns the instruments: a
+        // compare per block for the patch (`set_patch` returns immediately on
+        // a match), two plain stores for the panel knobs — and CC 64, live
+        // input only, half scale, per ARMED lane. **A piano without a damper
+        // pedal is not a piano**: the DX7 can live without CC 64 and merely
+        // sound less expressive; a modelled piano loses its sympathetic wash
+        // and half of what makes a jazz voicing hang together.
+        for ch in 0..CHANNELS {
+            let bit = 1u32 << ch.min(31);
+            let armed_here = midi_off & u64::from(bit) == 0;
+            if keys_mask & bit != 0 {
+                if let Some(Some(k)) = self.keys_lanes.get_mut(ch) {
+                    let want = self.shared.keys_patch[ch].load(Ordering::Relaxed) as usize;
+                    if let Some(p) = crate::keys::Patch::ALL.get(want) {
+                        k.set_patch(*p);
+                    }
+                    k.set_voicing(f32::from_bits(
+                        self.shared.keys_voicing[ch].load(Ordering::Relaxed),
+                    ));
+                    k.set_width(f32::from_bits(
+                        self.shared.keys_width[ch].load(Ordering::Relaxed),
+                    ));
+                    if armed_here {
+                        for c in &self.controls {
+                            if c.controller == 64 {
+                                k.set_pedal(c.value >= 64);
+                            }
+                        }
+                    }
+                }
+            }
+            if builtin_mask & bit != 0 {
+                if let Some(Some(d)) = self.dx7s.get_mut(ch) {
+                    if armed_here {
+                        for c in &self.controls {
+                            if c.controller == 64 {
+                                d.set_pedal(c.value >= 64);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -6788,7 +6914,12 @@ impl Renderer {
         // `pending_wrap_from`.
         let due_from = wrap_from.map_or(at, |a| a.min(at));
         for ch in 0..CHANNELS {
-            let is_builtin = builtin_at == Some(ch);
+            // Holding the sentinel is not enough: the INSTANCE has to have
+            // arrived. Between the bay being filled and the ring delivering,
+            // the lane is a lane with nothing loaded, exactly like a kit
+            // still decoding.
+            let is_builtin =
+                builtin_mask & (1 << ch.min(31)) != 0 && self.dx7s.get(ch).is_some_and(Option::is_some);
             let rack_live = !self.racks[ch].is_empty();
             // An AUDIO channel's bit is set and its rack runs in
             // `mix_monitor`, over its input — running it here too would fold
@@ -6986,7 +7117,9 @@ impl Renderer {
             // The strikes render in `mix_pads`, on the DRUMS bus; this lane
             // itself carries no signal, but its fader still has to advance
             // so a later un-assignment starts at the written level.
-            if is_drum_lane(ch) && !is_builtin {
+            let is_keys =
+                keys_mask & (1 << ch.min(31)) != 0 && self.keys_lanes.get(ch).is_some_and(Option::is_some);
+            if is_drum_lane(ch) && !is_builtin && !is_keys {
                 let obey = [
                     self.shared.pad_obey[ch][0].load(Ordering::Relaxed),
                     self.shared.pad_obey[ch][1].load(Ordering::Relaxed),
@@ -7036,25 +7169,46 @@ impl Renderer {
                 continue;
             }
 
-            // The built-in is one synth: its lane's notes — live and clip
-            // both — feed it here, and it goes quiet only when neither is
-            // speaking for it.
+            // THIS lane's synth, fed by THIS lane's notes — live and clip
+            // both — and it goes quiet only when neither is speaking for it.
             if is_builtin {
-                if lane_notes.is_empty()
-                    && !builtin_armed
-                    && !lane_has_clips
-                    && self.builtin.active()
-                {
-                    self.builtin.all_notes_off();
-                } else {
-                    for n in &lane_notes {
-                        let Ok(pitch) = u8::try_from(n.pitch) else {
-                            continue;
-                        };
-                        if n.on {
-                            self.builtin.note_on(pitch, n.velocity);
-                        } else {
-                            self.builtin.note_off(pitch);
+                if let Some(d) = self.dx7s[ch].as_mut() {
+                    if lane_notes.is_empty() && !armed && !lane_has_clips && d.active() {
+                        d.all_notes_off();
+                    } else {
+                        for n in &lane_notes {
+                            let Ok(pitch) = u8::try_from(n.pitch) else {
+                                continue;
+                            };
+                            if n.on {
+                                d.note_on(pitch, n.velocity);
+                            } else {
+                                d.note_off(pitch);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // The modelled keyboard, on the same terms as the DX7 above. It
+            // goes quiet only when nothing is speaking for it AND its own
+            // tails have rung out, which is why the silence test asks the
+            // instrument rather than the note list — a pedalled chord is
+            // still sounding long after the last note-off.
+            if is_keys {
+                if let Some(k) = self.keys_lanes[ch].as_mut() {
+                    if lane_notes.is_empty() && !armed && !lane_has_clips && k.active() {
+                        k.all_notes_off();
+                    } else {
+                        for n in &lane_notes {
+                            let Ok(pitch) = u8::try_from(n.pitch) else {
+                                continue;
+                            };
+                            if n.on {
+                                k.note_on(pitch, n.velocity);
+                            } else {
+                                k.note_off(pitch);
+                            }
                         }
                     }
                 }
@@ -7079,7 +7233,7 @@ impl Renderer {
             // A lane renders when something can SOUND on it: its own live
             // arm, or clips standing on it — through the built-in or a rack.
             let feeds = armed || lane_has_clips || !lane_notes.is_empty();
-            if !feeds || (!is_builtin && !rack_live) {
+            if !feeds || (!is_builtin && !is_keys && !rack_live) {
                 // **The gain is advanced whether or not anything renders.** A
                 // fader moved during a rest has to have arrived by the next
                 // note, or it comes in at the old level and slides.
@@ -7099,14 +7253,40 @@ impl Renderer {
                 }
                 continue;
             }
-            // The channel's own signal, planar for the rack.
-            if is_builtin && self.builtin.active() {
+            // The channel's own signal, planar for the rack. One scratch
+            // serves every lane of an instrument kind: this lane renders,
+            // copies out, and only then does the walk reach the next.
+            if is_builtin && self.dx7s[ch].as_ref().is_some_and(|d| d.active()) {
                 let want = frames * TAP_CHANNELS;
                 let Some(scratch) = self.builtin_scratch.get_mut(..want) else {
                     continue;
                 };
                 scratch.fill(0.0);
-                self.builtin.render(scratch, frames, TAP_CHANNELS);
+                if let Some(d) = self.dx7s[ch].as_mut() {
+                    d.render(scratch, frames, TAP_CHANNELS);
+                }
+                for c in 0..TAP_CHANNELS {
+                    let Some(dst) = self.fx_in.get_mut(c) else {
+                        continue;
+                    };
+                    for f in 0..frames {
+                        dst[f] = scratch[f * TAP_CHANNELS + c];
+                    }
+                }
+            } else if is_keys && self.keys_lanes[ch].as_ref().is_some_and(|k| k.active()) {
+                // Its own scratch, for the reason `builtin_scratch` documents:
+                // the instrument ADDS into what it is handed, so rendering it
+                // onto the bus would leave no moment at which its contribution
+                // is separable and therefore none at which a fader can reach
+                // it. The DX7's slot fader was silent for exactly that reason.
+                let want = frames * TAP_CHANNELS;
+                let Some(scratch) = self.keys_scratch.get_mut(..want) else {
+                    continue;
+                };
+                scratch.fill(0.0);
+                if let Some(k) = self.keys_lanes[ch].as_mut() {
+                    k.render(scratch, frames, TAP_CHANNELS);
+                }
                 for c in 0..TAP_CHANNELS {
                     let Some(dst) = self.fx_in.get_mut(c) else {
                         continue;
@@ -7810,6 +7990,19 @@ pub struct Engine {
     midi_from_audio: Consumer<Vec<PlacedMidi>>,
     pad_to_audio: Producer<(usize, PadKit)>,
     pad_from_audio: Consumer<(usize, PadKit)>,
+    /// The per-lane instruments' rings, and the host's own record of which
+    /// lanes it has shipped one to. The record lives HERE and not in an
+    /// atomic because only this thread creates or removes instances; the
+    /// audio thread's truth is whatever has actually arrived.
+    dx7_to_audio: Producer<(usize, Option<Box<crate::dx7::Dx7>>)>,
+    dx7_from_audio: Consumer<(usize, Option<Box<crate::dx7::Dx7>>)>,
+    keys_to_audio: Producer<(usize, Option<Box<crate::keys::Keys>>)>,
+    keys_from_audio: Consumer<(usize, Option<Box<crate::keys::Keys>>)>,
+    dx7_lanes_have: u32,
+    keys_lanes_have: u32,
+    /// The device rate the renderer was built at, kept so a lane gaining an
+    /// instrument mid-session gets one built for the right clock.
+    inst_rate: f32,
     preview_to_audio: Producer<Option<Arc<tangent_record::decode::Clip>>>,
     preview_from_audio: Consumer<Option<Arc<tangent_record::decode::Clip>>>,
     cap_rx: Vec<Consumer<f32>>,
@@ -8197,6 +8390,17 @@ impl Engine {
         // The drumpad kit's pair, same capacity, same reason.
         let (pad_to_audio, pad_incoming) = RingBuffer::<(usize, PadKit)>::new(2);
         let (pad_retiring, pad_from_audio) = RingBuffer::<(usize, PadKit)>::new(2);
+        // The per-lane instruments' pairs. Deeper than the kit's two, because
+        // a loading session can legitimately raise every lane at once and the
+        // host's diff should land in one frame, not thirty-two.
+        let (dx7_to_audio, dx7_incoming) =
+            RingBuffer::<(usize, Option<Box<crate::dx7::Dx7>>)>::new(CHANNELS + 2);
+        let (dx7_retiring, dx7_from_audio) =
+            RingBuffer::<(usize, Option<Box<crate::dx7::Dx7>>)>::new(CHANNELS + 2);
+        let (keys_to_audio, keys_incoming) =
+            RingBuffer::<(usize, Option<Box<crate::keys::Keys>>)>::new(CHANNELS + 2);
+        let (keys_retiring, keys_from_audio) =
+            RingBuffer::<(usize, Option<Box<crate::keys::Keys>>)>::new(CHANNELS + 2);
         let (preview_to_audio, preview_incoming) =
             RingBuffer::<Option<Arc<tangent_record::decode::Clip>>>::new(2);
         let (preview_retiring, preview_from_audio) =
@@ -8284,8 +8488,14 @@ impl Engine {
             pad_hits: Vec::with_capacity(MAX_PAD_HITS_PER_BLOCK),
             pad_offs: Vec::with_capacity(MAX_PAD_HITS_PER_BLOCK * 2),
             pad_gain: vec![1.0; CHANNELS],
-            builtin: crate::dx7::Dx7::new(rate as f32),
+            dx7s: (0..CHANNELS).map(|_| None).collect(),
+            dx7_incoming,
+            dx7_retiring,
+            keys_lanes: (0..CHANNELS).map(|_| None).collect(),
+            keys_incoming,
+            keys_retiring,
             builtin_scratch: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
+            keys_scratch: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             channel_gain: [1.0; CHANNELS],
             effects: crate::effects::Effects::new_send(rate as f32),
             master_effects: crate::effects::Effects::new(rate as f32),
@@ -8412,6 +8622,13 @@ impl Engine {
             midi_from_audio,
             pad_to_audio,
             pad_from_audio,
+            dx7_to_audio,
+            dx7_from_audio,
+            keys_to_audio,
+            keys_from_audio,
+            dx7_lanes_have: 0,
+            keys_lanes_have: 0,
+            inst_rate: rate as f32,
             preview_to_audio,
             preview_from_audio,
             cap_rx,
@@ -9309,20 +9526,53 @@ impl Engine {
     ///
     /// A slot holding it is not a plugin: nothing is opened, nothing can fail,
     /// and it is playing on the next block.
-    /// Which general CHANNEL the built-in DX7 belongs to. See
-    /// `Shared::builtin_strip`: the host computes it from bay 1's sentinel and
-    /// the channel's kind; the callback only reads it.
-    pub fn set_builtin_strip(&self, strip: Option<usize>) {
-        self.shared
-            .builtin_strip
-            .store(strip.map_or(-1, |s| s as i64), Ordering::Relaxed);
+    /// Make the per-lane instrument instances match the desk's masks.
+    ///
+    /// **This is where the amount-limit died.** Instances are built and freed
+    /// on THIS thread — a `Dx7` is a synth and a `Keys` is 3 MB of delay
+    /// lines, neither of which the callback may allocate or drop — and travel
+    /// by the kit's swap protocol. The host's own `*_lanes_have` masks are
+    /// the diff's memory: a push that does not fit (the rings hold a whole
+    /// desk plus slack, so only a stall could fill them) leaves the bit
+    /// unchanged and the diff simply fires again next frame.
+    ///
+    /// Returns the lanes CREATED this call, `(dx7, keys)`, so the caller can
+    /// follow up with each new lane's cartridge voice — the patch, voicing
+    /// and width need no follow-up, being per-lane atomics a fresh instance
+    /// reads before its first strike.
+    pub fn sync_instrument_lanes(&mut self, dx7_mask: u32, keys_mask: u32) -> (u32, u32) {
+        // The displaced instances come home to die here, not in the callback.
+        while self.dx7_from_audio.pop().is_ok() {}
+        while self.keys_from_audio.pop().is_ok() {}
+        let mut made = (0u32, 0u32);
+        for ch in 0..CHANNELS.min(32) {
+            let bit = 1u32 << ch;
+            let want = dx7_mask & bit != 0;
+            let have = self.dx7_lanes_have & bit != 0;
+            if want && !have {
+                let inst = Box::new(crate::dx7::Dx7::new(self.inst_rate));
+                if self.dx7_to_audio.push((ch, Some(inst))).is_ok() {
+                    self.dx7_lanes_have |= bit;
+                    made.0 |= bit;
+                }
+            } else if !want && have && self.dx7_to_audio.push((ch, None)).is_ok() {
+                self.dx7_lanes_have &= !bit;
+            }
+            let want = keys_mask & bit != 0;
+            let have = self.keys_lanes_have & bit != 0;
+            if want && !have {
+                let inst = Box::new(crate::keys::Keys::new(self.inst_rate));
+                if self.keys_to_audio.push((ch, Some(inst))).is_ok() {
+                    self.keys_lanes_have |= bit;
+                    made.1 |= bit;
+                }
+            } else if !want && have && self.keys_to_audio.push((ch, None)).is_ok() {
+                self.keys_lanes_have &= !bit;
+            }
+        }
+        made
     }
     /// **Every channel the drumpad is on.** See `Shared::drum_strips`.
-    ///
-    /// The single-index setter above still stands and still names the FIRST
-    /// of them, because the parts of the engine that have not learned about
-    /// lanes yet read it. Both are pushed from the same walk, so they cannot
-    /// disagree about which lane is first.
     pub fn set_drum_strips(&self, mask: u32) {
         self.shared.drum_strips.store(mask, Ordering::Relaxed);
     }
@@ -9484,6 +9734,42 @@ impl Engine {
         self.shared.builtin_strips.store(mask, Ordering::Relaxed);
     }
 
+    /// Every channel whose first bay holds the modelled keyboard.
+    pub fn set_keys_strips(&self, mask: u32) {
+        self.shared.keys_strips.store(mask, Ordering::Relaxed);
+    }
+
+    /// Which of the modelled keyboard's patches lane `ch` has loaded, by
+    /// index into `keys::Patch::ALL`. Stores; the callback picks it up next
+    /// block. Per lane, because the instruments are: a piano on lane 2 and
+    /// an EP on lane 5 is the arrangement this whole rework exists for.
+    pub fn set_keys_patch(&self, ch: usize, patch: crate::keys::Patch) {
+        let Some(cell) = self.shared.keys_patch.get(ch) else {
+            return;
+        };
+        let index = crate::keys::Patch::ALL
+            .iter()
+            .position(|p| *p == patch)
+            .unwrap_or(0);
+        cell.store(index as u32, Ordering::Relaxed);
+    }
+
+    /// The keyboard panel's VOICING knob for lane `ch`: 0 mellow, 1 bright,
+    /// 0.5 the bench tuning. Applied before the block's strikes.
+    pub fn set_keys_voicing(&self, ch: usize, v: f32) {
+        if let Some(cell) = self.shared.keys_voicing.get(ch) {
+            cell.store(v.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    /// The keyboard panel's WIDTH knob for lane `ch`: 0 mono, 1 the stock
+    /// seating, 1.5 leaning wider.
+    pub fn set_keys_width(&self, ch: usize, w: f32) {
+        if let Some(cell) = self.shared.keys_width.get(ch) {
+            cell.store(w.clamp(0.0, 1.5).to_bits(), Ordering::Relaxed);
+        }
+    }
+
     /// One general channel's fader.
     pub fn set_channel_gain(&self, ch: usize, linear: f32) {
         self.shared.set_channel_gain(ch, linear);
@@ -9503,14 +9789,17 @@ impl Engine {
         }
     }
 
-    /// Load a patch into the built-in.
+    /// Load a patch into lane `ch`'s built-in DX7.
     ///
     /// Sent as a message rather than written through, because the renderer owns
-    /// it and it is on the audio thread. A voice is 155 small numbers and this
-    /// happens when somebody clicks a name in a list, so the cost is nothing.
-    pub fn set_builtin_voice(&mut self, voice: crate::dx7::Voice) {
-        if let Ok(mut g) = self.shared.pending_voice.lock() {
-            *g = Some(voice);
+    /// the instances and they are on the audio thread. A voice is 155 small
+    /// numbers and this happens when somebody clicks a name in a list, so the
+    /// cost is nothing. One pending voice per lane: a second click on the same
+    /// lane replaces the first rather than queueing behind it.
+    pub fn set_builtin_voice(&mut self, ch: usize, voice: crate::dx7::Voice) {
+        if let Ok(mut g) = self.shared.pending_voices.lock() {
+            g.retain(|(lane, _)| *lane != ch);
+            g.push((ch, voice));
         }
     }
 
@@ -12909,13 +13198,22 @@ mod tests {
             dev_channels: dev_ch,
             mix: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             builtin_scratch: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
+            keys_scratch: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
             channel_gain: [1.0; CHANNELS],
             midi,
             ui_params,
             hw_midi,
             pending: None,
             notes: Vec::with_capacity(MAX_EVENTS_PER_BLOCK),
-            builtin: crate::dx7::Dx7::new(RATE as f32),
+            // Every lane empty, like a fresh desk; a test that wants an
+            // instrument installs one directly, which is the assignment the
+            // host's sync would have made.
+            dx7s: (0..CHANNELS).map(|_| None).collect(),
+            dx7_incoming: RingBuffer::<(usize, Option<Box<crate::dx7::Dx7>>)>::new(2).1,
+            dx7_retiring: RingBuffer::<(usize, Option<Box<crate::dx7::Dx7>>)>::new(2).0,
+            keys_lanes: (0..CHANNELS).map(|_| None).collect(),
+            keys_incoming: RingBuffer::<(usize, Option<Box<crate::keys::Keys>>)>::new(2).1,
+            keys_retiring: RingBuffer::<(usize, Option<Box<crate::keys::Keys>>)>::new(2).0,
             effects: crate::effects::Effects::new_send(RATE as f32),
             effect_params: crate::effects::Params::default(),
             controls: Vec::with_capacity(MAX_CONTROLS_PER_BLOCK),
@@ -12961,12 +13259,14 @@ mod tests {
         let shared = Arc::new(Shared::new());
         // **The fresh desk's own shape**: channel 0 is MIDI with the built-in
         // in bay 1, exactly what `Settings::default` produces and the host
-        // pushes. The silent auto-fallback died with the slots, so a renderer
-        // under test says so the way the app does — by assignment.
-        shared.builtin_strip.store(0, Ordering::Relaxed);
+        // pushes. Mask AND instance, because since the lanes multiplied those
+        // are two facts: the mask is the desk's claim and the instance is
+        // what the host's sync would have shipped.
+        shared.builtin_strips.store(1, Ordering::Relaxed);
         let (tap_tx, _tap_rx) = RingBuffer::<f32>::new(1 << 16);
         let (midi_tx, midi_rx) = RingBuffer::<MidiEvent>::new(1024);
         let mut r = test_renderer(Arc::clone(&shared), tap_tx, dev_ch);
+        r.dx7s[0] = Some(Box::new(crate::dx7::Dx7::new(RATE as f32)));
         r.midi = midi_rx;
         (r, midi_tx, shared)
     }
@@ -13475,9 +13775,8 @@ mod tests {
         let (mut r, mut tx, shared) = renderer_with_midi(2);
         // Every general channel muted: the built-in is on one of them and
         // this is a test about the strip, not about which channel it landed
-        // on. Assigned explicitly — the silent auto-fallback died with the
-        // slots, so a renderer under test says where the DX7 lives.
-        shared.builtin_strip.store(0, Ordering::Relaxed);
+        // on. The helper already put a DX7 on lane 0, mask and instance.
+        shared.builtin_strips.store(1, Ordering::Relaxed);
         let mut mask = 0;
         for i in 0..CHANNELS {
             mask |= Strip::Channel(i).bit();
@@ -14708,7 +15007,7 @@ mod tests {
             "the pad struck at {peak}, wanted {want}"
         );
         assert!(
-            !r.builtin.active(),
+            !r.dx7s[0].as_ref().is_some_and(|d| d.active()),
             "a drum-channel note reached the piano through a loaded kit"
         );
     }
@@ -14726,7 +15025,10 @@ mod tests {
             peak > 0.01,
             "a channel-10 note with no kit loaded produced {peak}"
         );
-        assert!(r.builtin.active(), "the built-in never saw the note");
+        assert!(
+            r.dx7s[0].as_ref().is_some_and(|d| d.active()),
+            "the built-in never saw the note"
+        );
     }
 
     /// **A shared choke group: the second pad ends the first.** The steal
@@ -16017,7 +16319,8 @@ mod tests {
                 },
             ]),
         }]);
-        e.set_builtin_strip(Some(0));
+        e.set_builtin_strips(1);
+        e.sync_instrument_lanes(1, 0);
         e.set_transport(1, 0);
         e.set_rolling(true);
         let mut out = vec![0.0f32; 1024 * 2];
@@ -16134,7 +16437,8 @@ mod tests {
             len: 24_000,
             notes: Arc::new(notes),
         }]);
-        e.set_builtin_strip(Some(0));
+        e.set_builtin_strips(1);
+        e.sync_instrument_lanes(1, 0);
         // Loop the whole clip: [0, 24000). At 512 frames/block that wraps
         // about every 47 blocks.
         e.set_loop(0, 24_000);
@@ -16561,7 +16865,6 @@ mod tests {
         let mask = |ls: &[usize]| ls.iter().fold(0u32, |m, ch| m | 1 << ch);
         e.set_drum_strips(mask(&drum_lanes));
         e.set_builtin_strips(mask(&builtin_lanes));
-        e.set_builtin_strip(builtin_lanes.first().copied());
 
         let drums = e.shared.drum_strips.load(Ordering::Relaxed);
         assert_eq!(drums.count_ones(), 3, "a lane went missing from the mask");
@@ -16581,10 +16884,8 @@ mod tests {
         e.set_drum_strips(mask(&drum_lanes));
         let builtins = e.shared.builtin_strips.load(Ordering::Relaxed);
         assert_eq!(builtins.count_ones(), 2);
-        assert_eq!(
-            e.shared.builtin_strip.load(Ordering::Relaxed),
-            i64::from(builtins.trailing_zeros())
-        );
+        // There is no single-index field left to disagree with the mask: the
+        // index died when every masked lane got its own instance.
     }
 
     #[test]
@@ -17040,9 +17341,10 @@ mod tests {
             detune: 7,
             ..Op::default()
         }; 6];
-        // The path a click takes: through `Shared`, picked up by the renderer.
-        if let Ok(mut g) = r.shared.pending_voice.lock() {
-            *g = Some(organ);
+        // The path a click takes: through `Shared`, picked up by the renderer,
+        // addressed to the lane the helper put the DX7 on.
+        if let Ok(mut g) = r.shared.pending_voices.lock() {
+            g.push((0, organ));
         }
         let after = sound(&mut r, &mut tx);
 

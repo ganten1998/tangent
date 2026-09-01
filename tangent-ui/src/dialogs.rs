@@ -131,6 +131,26 @@ pub enum Dialog {
         /// point of the lenient parser is that this is rare and specific.
         error: String,
     },
+    /// Which instrument the modelled keyboard is being right now.
+    ///
+    /// **Two sounds, two knobs, nothing else.** The first cut of this dialog
+    /// was the two patches alone, on the argument that every knob on a
+    /// physical model is a way to make the instrument worse. The owner asked
+    /// for controls, and the two that ship are the two that survive that
+    /// argument: VOICING is the hammer felt (what a technician's needle
+    /// does, not a filter over the output) and WIDTH is where the strings
+    /// sit in the field. Both are per STRIP — every lane is its own
+    /// instrument now — and neither can reach a value the engine has not
+    /// been voiced for.
+    KeysPatch {
+        slot: usize,
+        /// Index into [`KEYS_PATCH_NAMES`].
+        selected: usize,
+        /// The felt: 0 mellow, 1 bright, 0.5 the tuning the bench signed.
+        voicing: f32,
+        /// The seating: 0 mono, 1 stock, 1.5 leaning wider.
+        width: f32,
+    },
     /// Build a patch by hand: every number a DX7 stores, and a picture of the
     /// algorithm.
     ///
@@ -788,16 +808,37 @@ pub enum DialogAction {
     /// Play this patch of the loaded cartridge now. See [`Dialog::PatchPicker`]:
     /// selecting is auditioning, so this fires on the click and not on a
     /// button.
+    /// Load one of the modelled keyboard's patches, on one strip's own
+    /// instrument.
+    ChooseKeysPatch {
+        slot: usize,
+        index: usize,
+    },
+    /// The keyboard panel's felt knob moved, 0..=1. Fired per change so the
+    /// sound follows the drag, exactly as the DX7 editor's rows do.
+    SetKeysVoicing {
+        slot: usize,
+        value: f32,
+    },
+    /// The keyboard panel's width knob moved, 0..=1.5.
+    SetKeysWidth {
+        slot: usize,
+        value: f32,
+    },
     ChoosePatch {
         slot: usize,
         index: usize,
     },
-    /// Raise a file panel for a `.syx` cartridge. The dialog stays open: the
-    /// answer comes back into it.
-    LoadCartridge,
-    /// Put the shipped cartridge back. The dialog stays open and refills with
-    /// its thirty-two names, exactly as loading a file does.
-    UseFactoryCartridge,
+    /// Raise a file panel for a `.syx` cartridge, for one strip's own DX7.
+    /// The dialog stays open: the answer comes back into it.
+    LoadCartridge {
+        slot: usize,
+    },
+    /// Put the shipped cartridge back on one strip. The dialog stays open
+    /// and refills with its thirty-two names, exactly as loading a file does.
+    UseFactoryCartridge {
+        slot: usize,
+    },
     /// Open the patch editor on whatever the built-in is playing.
     EditPatch {
         slot: usize,
@@ -1920,6 +1961,29 @@ pub const BUILTIN_NAME: &str = "Tangent DX7";
 pub const DRUMPAD_PATH: &str = "@tangent-drums";
 pub const DRUMPAD_NAME: &str = "Tangent Drums";
 
+/// The modelled keyboard's sentinel: a piano and an electric piano that are
+/// computed rather than sampled. Rides a bay exactly as the DX7 does, and for
+/// the same reason — every layer between the picker and the saved session
+/// carries it as a path and none of them has to learn what it is.
+pub const KEYS_PATH: &str = "@tangent-keys";
+pub const KEYS_NAME: &str = "Tangent Keys";
+
+/// How many patches the modelled keyboard ships, and what they are called.
+///
+/// **The names live here rather than only in the engine** because the picker,
+/// the settings clamp and the strip label all need them, and none of those can
+/// see the audio crate. The engine's `keys::Patch::ALL` is the same list in the
+/// same order; the index is the contract between them, which is why the
+/// settings key stores a number.
+pub const KEYS_PATCHES: usize = 2;
+pub const KEYS_PATCH_NAMES: [(&str, &str); KEYS_PATCHES] = [
+    ("Piano 1", "jazz grand, voiced for solo playing"),
+    (
+        "EP Mk.1",
+        "tine electric piano, dry - light is bell, hard is bark",
+    ),
+];
+
 /// Every effect Tangent ships, as a picker row.
 ///
 /// **The same sentinel trick as the DX7 and the drumpad, for the same
@@ -2341,6 +2405,19 @@ impl Dialog {
                 path: DRUMPAD_PATH.to_owned(),
                 name: DRUMPAD_NAME.to_owned(),
                 vendor: "built in, sixteen-pad sampler".to_owned(),
+            },
+        );
+        // The modelled keyboard, third. The description says what it is
+        // modelled on and the NAME does not, which is the same split every
+        // built-in effect has made since the phaser: naming somebody else's
+        // instrument in the product name is a claim, and saying what a model
+        // was built from is a fact about the model. See LICENSING.md.
+        plugins.insert(
+            2,
+            PluginEntry {
+                path: KEYS_PATH.to_owned(),
+                name: KEYS_NAME.to_owned(),
+                vendor: "built in, modelled piano and electric piano".to_owned(),
             },
         );
         let selected = current
@@ -3350,6 +3427,124 @@ pub fn show(
             )
         }
 
+        Dialog::KeysPatch {
+            slot,
+            selected,
+            voicing,
+            width,
+        } => {
+            // **The surface derives its own parts.** `surface_of` returns a
+            // ground that can carry ink, the ink that holds on it, and the
+            // raised shade a selected row sits on with the ink still holding.
+            // Picking a text colour by eye, or by a brightness test on the
+            // theme, is the bug this app has found in a screenshot seven
+            // times: ink is a property of the SURFACE and is never inherited.
+            let p = crate::recorder_panel::surface_of(face);
+            let slot = *slot;
+            let chosen = *selected;
+            show_dialog_viewport(
+                ctx,
+                placement,
+                KEYS_NAME,
+                Vec2::new(360.0, 316.0),
+                Vec2::new(300.0, 280.0),
+                |ui, result| {
+                    apply_theme(ui.style_mut(), &theme(face));
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, p.bg);
+                    let bold = |size: f32| FontId::new(size, fonts::courier_bold());
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::same(PLUGIN_MARGIN))
+                        .show(ui, |ui| {
+                            for (i, (name, about)) in KEYS_PATCH_NAMES.iter().enumerate() {
+                                let resp = ui.allocate_response(
+                                    egui::vec2(ui.available_width(), 42.0),
+                                    egui::Sense::click(),
+                                );
+                                let ground = if i == chosen {
+                                    Some(p.raised)
+                                } else if resp.hovered() {
+                                    Some(p.hover)
+                                } else {
+                                    None
+                                };
+                                if let Some(g) = ground {
+                                    ui.painter().rect_filled(resp.rect, 3.0, g);
+                                }
+                                let at = resp.rect.min + egui::vec2(9.0, 6.0);
+                                ui.painter().text(
+                                    at,
+                                    egui::Align2::LEFT_TOP,
+                                    *name,
+                                    bold(13.0),
+                                    p.ink,
+                                );
+                                ui.painter().text(
+                                    at + egui::vec2(0.0, 18.0),
+                                    egui::Align2::LEFT_TOP,
+                                    *about,
+                                    FontId::new(10.0, fonts::courier_bold()),
+                                    p.faint,
+                                );
+                                if resp.clicked() {
+                                    action =
+                                        Some(DialogAction::ChooseKeysPatch { slot, index: i });
+                                    // Choosing a sound does not close the
+                                    // panel any more: the knobs below are
+                                    // half of why it is open, and hearing a
+                                    // sound then reaching for the felt is
+                                    // one visit, not two.
+                                    result.close = false;
+                                }
+                                ui.add_space(5.0);
+                            }
+                            ui.add_space(8.0);
+                            // ── the two knobs, per strip like everything
+                            // else in this panel. Fired per change, so the
+                            // sound follows the drag the way the DX7
+                            // editor's rows do.
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("Voicing").font(bold(11.0)).color(p.ink));
+                                let mut v = *voicing;
+                                if ui
+                                    .add(egui::Slider::new(&mut v, 0.0..=1.0).show_value(false))
+                                    .changed()
+                                {
+                                    *voicing = v;
+                                    action = Some(DialogAction::SetKeysVoicing { slot, value: v });
+                                }
+                                ui.label(
+                                    RichText::new(if v < 0.34 {
+                                        "mellow"
+                                    } else if v > 0.66 {
+                                        "bright"
+                                    } else {
+                                        "as voiced"
+                                    })
+                                    .font(bold(10.0))
+                                    .color(p.faint),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("Width  ").font(bold(11.0)).color(p.ink));
+                                let mut w = *width;
+                                if ui
+                                    .add(egui::Slider::new(&mut w, 0.0..=1.5).show_value(false))
+                                    .changed()
+                                {
+                                    *width = w;
+                                    action = Some(DialogAction::SetKeysWidth { slot, value: w });
+                                }
+                                ui.label(
+                                    RichText::new(format!("{:>3.0}%", w * 100.0))
+                                        .font(bold(10.0))
+                                        .color(p.faint),
+                                );
+                            });
+                        });
+                },
+            )
+        }
+
         Dialog::PatchEditor {
             slot,
             patch,
@@ -3677,7 +3872,7 @@ pub fn show(
                                         ))
                                         .clicked()
                                     {
-                                        action = Some(DialogAction::LoadCartridge);
+                                        action = Some(DialogAction::LoadCartridge { slot });
                                     }
                                     // **The way back, which there was not
                                     // one of.** Loading somebody else's bank
@@ -3697,7 +3892,7 @@ pub fn show(
                                             ))
                                             .clicked()
                                     {
-                                        action = Some(DialogAction::UseFactoryCartridge);
+                                        action = Some(DialogAction::UseFactoryCartridge { slot });
                                     }
                                     // **Edit what is playing**, which is the
                                     // only patch anybody wants to start from.
@@ -7867,7 +8062,7 @@ mod tests {
     /// both ends rather than trusting the sentence on [`BUILTIN_PATH`].
     #[test]
     fn every_built_in_is_recognised_and_no_real_path_is() {
-        for path in [super::BUILTIN_PATH, super::DRUMPAD_PATH] {
+        for path in [super::BUILTIN_PATH, super::DRUMPAD_PATH, super::KEYS_PATH] {
             assert!(super::is_builtin(path), "{path} was not recognised");
         }
         for (path, ..) in super::FX_UNITS {
@@ -7880,6 +8075,28 @@ mod tests {
             "",
         ] {
             assert!(!super::is_builtin(path), "{path:?} was taken for a built-in");
+        }
+    }
+
+    /// **The patch list and the settings index are one contract.**
+    ///
+    /// `settings.keys_patch` is a NUMBER, and the engine turns it back into an
+    /// instrument by position. Reordering one list without the other does not
+    /// fail to compile and does not fail to run: it silently loads the piano
+    /// when the electric piano was asked for. This pins the length and the
+    /// order, so the reorder shows up here instead of in somebody's ears.
+    #[test]
+    fn keys_patches_are_named_in_engine_order() {
+        assert_eq!(super::KEYS_PATCH_NAMES.len(), super::KEYS_PATCHES);
+        assert_eq!(super::KEYS_PATCH_NAMES[0].0, "Piano 1");
+        assert_eq!(super::KEYS_PATCH_NAMES[1].0, "EP Mk.1");
+        for (name, about) in super::KEYS_PATCH_NAMES {
+            assert!(!name.is_empty() && !about.is_empty());
+            // The reference belongs in the description, never the name. See
+            // LICENSING.md, and the same rule FX_UNITS follows.
+            for claim in ["Rhodes", "Fender", "Wurlitzer", "Steinway", "Mark I"] {
+                assert!(!name.contains(claim), "{name} names somebody else's instrument");
+            }
         }
     }
 
@@ -9578,7 +9795,14 @@ at: None,
                     // The built-in leads, above the sort: it is what a fresh
                     // install plays, and the one entry somebody with no VST3s
                     // installed can still choose.
-                    [BUILTIN_NAME, DRUMPAD_NAME, "analog lab v", "the modelled piano", "Vital"],
+                    [
+                        BUILTIN_NAME,
+                        DRUMPAD_NAME,
+                        KEYS_NAME,
+                        "analog lab v",
+                        "the modelled piano",
+                        "Vital"
+                    ],
                     "sorted the way a byte comparison sorts, not the way a person reads"
                 );
                 // The name is the stem: nobody wants to read ".vst3" 112 times.
@@ -9591,21 +9815,21 @@ at: None,
                     .iter()
                     .filter(|p| !is_builtin(&p.path))
                     .all(|p| p.vendor.is_empty()));
-                // Three, not one: the built-ins took the first two rows.
-                assert_eq!(*selected, Some(3), "it did not open on what is loaded");
+                // Four, not one: the built-ins took the first three rows.
+                assert_eq!(*selected, Some(4), "it did not open on what is loaded");
                 assert_eq!(current.as_deref(), Some(loaded.as_str()));
                 assert!(filter.is_empty() && *focus);
                 assert!(
-                    plugin_row(&plugins[3], Some(&loaded)).starts_with('\u{2022}'),
+                    plugin_row(&plugins[4], Some(&loaded)).starts_with('\u{2022}'),
                     "the loaded plugin is not marked"
                 );
                 assert!(
-                    plugin_row(&plugins[2], Some(&loaded)).starts_with(' '),
+                    plugin_row(&plugins[3], Some(&loaded)).starts_with(' '),
                     "a plugin that is not loaded was marked as if it were"
                 );
                 // A blank vendor leaves no empty brackets behind; a known one
                 // is shown, which is the only reason the field exists.
-                assert_eq!(plugin_row(&plugins[4], None), "  Vital");
+                assert_eq!(plugin_row(&plugins[5], None), "  Vital");
                 // And the built-in describes itself, which is the one row that
                 // can: nothing was opened to find out.
                 assert_eq!(
