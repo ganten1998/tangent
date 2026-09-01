@@ -76,6 +76,249 @@ impl Patch {
     /// them, none of those can see this crate, and two copies of a display
     /// string are two things that can disagree.
     pub const ALL: [Patch; 2] = [Patch::Piano1, Patch::EpMk1];
+
+    /// The knobs this sound answers to, in the order the panel draws them.
+    ///
+    /// **Per SOUND, not per instrument.** A piano and a tine electric piano
+    /// are not the same machine with different numbers in it — one has an
+    /// unison to detune and a soundboard to open, the other has a bell to
+    /// weigh and a pickup to lean on — so the panel asks the patch what it
+    /// has rather than showing a fixed rack with half of it greyed out.
+    ///
+    /// Indices are a CONTRACT with the settings file, exactly as `ALL` is:
+    /// values are stored per strip per patch by POSITION. Append; never
+    /// reorder, and never reuse a retired slot for something else.
+    pub const fn params(self) -> &'static [ParamSpec] {
+        match self {
+            Patch::Piano1 => &PIANO_PARAMS,
+            Patch::EpMk1 => &EP_PARAMS,
+        }
+    }
+
+    /// Every knob of this sound at the value the bench signed off — what the
+    /// panel's Initialise button restores, and what a strip that has never
+    /// been touched holds.
+    pub fn defaults(self) -> [f32; MAX_PARAMS] {
+        let mut out = [0.0; MAX_PARAMS];
+        for (slot, spec) in out.iter_mut().zip(self.params()) {
+            *slot = spec.default;
+        }
+        out
+    }
+}
+
+/// The most knobs any one sound exposes. The store is a fixed array so that
+/// nothing on the audio thread has a length to get wrong.
+pub const MAX_PARAMS: usize = 8;
+
+/// One knob, as the panel needs to draw it and the file needs to keep it.
+pub struct ParamSpec {
+    /// What the panel calls it.
+    pub name: &'static str,
+    /// The one line under the name. What it does to the INSTRUMENT, not what
+    /// it does to the number.
+    pub about: &'static str,
+    /// Where it sits when the sound is initialised.
+    ///
+    /// **Everything that travels is 0..=1** — the file, the atomic and the
+    /// slider all speak the same range, so a knob has exactly one definition
+    /// of "middle" and reset is an assignment rather than a conversion. The
+    /// mapping out of that range into seconds, cents and multipliers lives in
+    /// `PianoKnobs`/`EpKnobs`, next to the physics it feeds.
+    pub default: f32,
+}
+
+/// Voicing is knob 0 and Width is knob 1 in EVERY patch, because they are the
+/// two that mean the same thing whatever the mechanism is: how hard the
+/// contact is, and how far apart the keys sit.
+pub const P_VOICING: usize = 0;
+pub const P_WIDTH: usize = 1;
+/// The body knob — a soundboard on one instrument and a tonebar on the other,
+/// but the same slot and the same meaning: how much of the shared resonator
+/// reaches the bus. `render` reads it directly, which is why it is named here
+/// rather than left to the two knob-mapping structs.
+pub const P_BODY: usize = 7;
+
+/// The stereo spread at the top of the WIDTH knob: a little wider than the
+/// stock seating, which is what 1.0 in the old two-knob panel meant.
+const WIDTH_FULL: f32 = 1.5;
+/// Where WIDTH sits for the stock seating — 1.0 of 1.5, and the reason this
+/// one default is not 0.5.
+const WIDTH_DEFAULT: f32 = 1.0 / WIDTH_FULL;
+
+const PIANO_PARAMS: [ParamSpec; MAX_PARAMS] = [
+    ParamSpec {
+        name: "Voicing",
+        about: "hammer felt: needled soft to lacquered bright",
+        default: 0.5,
+    },
+    ParamSpec {
+        name: "Width",
+        about: "how far bass and treble sit apart",
+        default: WIDTH_DEFAULT,
+    },
+    ParamSpec {
+        name: "Decay",
+        about: "how long a struck string rings",
+        default: 0.5,
+    },
+    ParamSpec {
+        name: "Brilliance",
+        about: "how long the upper partials outlast the fundamental",
+        default: 0.5,
+    },
+    ParamSpec {
+        name: "Unison",
+        about: "detune between the strings of a course: the beating",
+        default: 0.5,
+    },
+    ParamSpec {
+        name: "Stretch",
+        about: "string stiffness, which pulls the partials sharp",
+        default: 0.5,
+    },
+    ParamSpec {
+        name: "Release",
+        about: "how fast the damper stops a string",
+        default: 0.5,
+    },
+    ParamSpec {
+        name: "Soundboard",
+        about: "the body under everything, and the pedalled wash",
+        default: 0.5,
+    },
+];
+
+const EP_PARAMS: [ParamSpec; MAX_PARAMS] = [
+    ParamSpec {
+        name: "Voicing",
+        about: "hammer tip: soft to hard against the tine",
+        default: 0.5,
+    },
+    ParamSpec {
+        name: "Width",
+        about: "how far bass and treble sit apart",
+        default: WIDTH_DEFAULT,
+    },
+    ParamSpec {
+        name: "Decay",
+        about: "how long the tine rings",
+        default: 0.5,
+    },
+    ParamSpec {
+        name: "Bell",
+        about: "the glassy chime on the attack",
+        default: 0.5,
+    },
+    ParamSpec {
+        name: "Bark",
+        about: "how hard the tine leans on the pickup",
+        default: 0.5,
+    },
+    ParamSpec {
+        name: "Chime",
+        about: "where the bell partial sits above the note",
+        default: 0.5,
+    },
+    ParamSpec {
+        name: "Release",
+        about: "how fast the damper stops the tine",
+        default: 0.5,
+    },
+    ParamSpec {
+        name: "Tonebar",
+        about: "the metal the tine is bolted to",
+        default: 0.5,
+    },
+];
+
+/// A knob mapped so that **0.5 is exactly the instrument the bench signed
+/// off**: every curve below passes through its own tuned constant at the
+/// centre, so a strip that has never been touched, a strip reset to defaults
+/// and the two-knob build all make the identical sound.
+fn bipolar(v: f32, octaves: f32) -> f32 {
+    2.0_f32.powf((v.clamp(0.0, 1.0) - 0.5) * 2.0 * octaves)
+}
+
+/// The piano's knobs in the units `PianoVoice` actually uses.
+#[derive(Clone, Copy)]
+pub struct PianoKnobs {
+    /// 0 mellow, 1 bright: the hammer's contact width.
+    pub voicing: f32,
+    /// Multiplier on every partial's t60. 0.38 to 2.6.
+    pub decay: f32,
+    /// The reference partial's t60 as a fraction of the fundamental's — the
+    /// tuned 0.28 at centre, half that when dull, double when singing.
+    pub brilliance: f32,
+    /// Scale on the unison's cents. 0 collapses the course to one string,
+    /// which is a harpsichord's stillness, and 2 is honky-tonk.
+    pub unison: f32,
+    /// Scale on the inharmonicity coefficient.
+    pub stretch: f32,
+    /// Multiplier on the damper's time constant: bigger is slower.
+    pub release: f32,
+    /// How much soundboard. 1.0 is the board as built.
+    pub body: f32,
+}
+
+impl PianoKnobs {
+    pub fn from_params(p: &[f32; MAX_PARAMS]) -> Self {
+        PianoKnobs {
+            voicing: p[P_VOICING].clamp(0.0, 1.0),
+            decay: bipolar(p[2], 1.4),
+            brilliance: (0.28 * bipolar(p[3], 1.0)).clamp(0.05, 0.9),
+            unison: (p[4] * 2.0).clamp(0.0, 2.0),
+            stretch: bipolar(p[5], 1.6),
+            release: bipolar(p[6], 1.7),
+            body: (p[7] * 2.0).clamp(0.0, 2.0),
+        }
+    }
+}
+
+impl Default for PianoKnobs {
+    fn default() -> Self {
+        Self::from_params(&Patch::Piano1.defaults())
+    }
+}
+
+/// The electric piano's knobs, in the units `EpVoice` uses.
+#[derive(Clone, Copy)]
+pub struct EpKnobs {
+    /// 0 soft tip, 1 hard.
+    pub voicing: f32,
+    /// Multiplier on the tine's t60.
+    pub decay: f32,
+    /// Scale on the bell mode's weight against the fundamental.
+    pub bell: f32,
+    /// Scale on how far the tine swings, which is the pickup's nonlinearity
+    /// and therefore the bark.
+    pub bark: f32,
+    /// Shifts the bell partial up or down the series, in partials.
+    pub chime: f32,
+    /// Multiplier on the damper's time constant.
+    pub release: f32,
+    /// How much tonebar body.
+    pub body: f32,
+}
+
+impl EpKnobs {
+    pub fn from_params(p: &[f32; MAX_PARAMS]) -> Self {
+        EpKnobs {
+            voicing: p[P_VOICING].clamp(0.0, 1.0),
+            decay: bipolar(p[2], 1.4),
+            bell: (p[3] * 2.0).clamp(0.0, 2.0),
+            bark: bipolar(p[4], 1.2),
+            chime: (p[5] - 0.5) * 3.0,
+            release: bipolar(p[6], 1.7),
+            body: (p[7] * 2.0).clamp(0.0, 2.0),
+        }
+    }
+}
+
+impl Default for EpKnobs {
+    fn default() -> Self {
+        Self::from_params(&Patch::EpMk1.defaults())
+    }
 }
 
 /// One key, sounding.
@@ -118,11 +361,15 @@ impl Mechanism {
         self.ep.damp();
     }
 
-    fn strike(&mut self, pitch: u8, velocity: f32, voicing: f32) {
+    /// Strike, with **the whole knob store** rather than one number: each
+    /// mechanism maps the shared 0..1 values into its own units, because
+    /// knob 4 is an unison on one instrument and a pickup on the other.
+    fn strike(&mut self, pitch: u8, velocity: f32, params: &[f32; MAX_PARAMS]) {
         if self.is_ep {
-            self.ep.strike_voiced(pitch, velocity, voicing);
+            self.ep.strike_knobs(pitch, velocity, &EpKnobs::from_params(params));
         } else {
-            self.piano.strike_voiced(pitch, velocity, voicing);
+            self.piano
+                .strike_knobs(pitch, velocity, &PianoKnobs::from_params(params));
         }
     }
 
@@ -192,18 +439,16 @@ pub struct Keys {
     notes: Vec<Note>,
     patch: Patch,
     rate: f32,
-    /// The panel's VOICING knob: 0 is felt and mellow, 1 is close and bright,
-    /// 0.5 is the instrument exactly as it was tuned on the bench. It scales
-    /// the hammer's contact width (see `string::PianoVoice::strike_voiced`),
-    /// which is the honest way to voice either mechanism — the same thing a
-    /// technician does with a needle and felt, not a filter over the output.
-    /// Read at strike time, so it may be set from the audio thread.
-    voicing: f32,
-    /// The panel's WIDTH knob: a scale on the per-key stereo spread. 0 folds
-    /// the instrument to a point source, 1.0 is the stock seating, and a
-    /// little more leans the bass and treble further apart. Applied where the
-    /// pan is chosen, so held notes keep their seat and only new strikes move.
-    width: f32,
+    /// **The panel's knobs, all of them, normalised 0..=1**, indexed by the
+    /// current patch's `ParamSpec` list. Every one is read at STRIKE time —
+    /// never per sample — so they may be set from the audio thread and a
+    /// held note keeps the instrument it was struck on, which is what a real
+    /// one does when a technician voices a hammer under your hands.
+    ///
+    /// One array rather than a field per knob: the host pushes the whole
+    /// store every block, and a fixed array has no length for the callback
+    /// to get wrong.
+    params: [f32; MAX_PARAMS],
     /// Sustain pedal, from CC 64.
     pedal: bool,
     /// How many voices are not finished. `render` returns immediately at zero,
@@ -225,8 +470,7 @@ impl Keys {
             notes: Vec::new(),
             patch: Patch::default(),
             rate,
-            voicing: 0.5,
-            width: 1.0,
+            params: Patch::default().defaults(),
             pedal: false,
             sounding: 0,
             strikes: 0,
@@ -273,6 +517,13 @@ impl Keys {
         }
         self.sounding = 0;
         self.body.set_patch(patch);
+        // **The knobs belong to the SOUND.** A piano's Unison is an electric
+        // piano's Bark at the same index, so carrying the numbers across
+        // would apply one instrument's settings to another's mechanism. The
+        // new patch starts at its own defaults; the host, which remembers a
+        // set per strip per patch, pushes the stored ones on the very next
+        // block.
+        self.params = patch.defaults();
     }
 
     /// Whether anything is making a sound.
@@ -280,16 +531,49 @@ impl Keys {
         self.sounding > 0
     }
 
-    /// The VOICING knob, 0 mellow to 1 bright; 0.5 is the bench tuning.
-    /// A plain store read at the next strike — real-time safe by having
-    /// nothing to be unsafe with.
-    pub fn set_voicing(&mut self, v: f32) {
-        self.voicing = v.clamp(0.0, 1.0);
+    /// Set one knob, by its index in the current patch's `ParamSpec` list.
+    ///
+    /// A plain store, read at the next strike — real-time safe by having
+    /// nothing to be unsafe with, which is why the host may call it from the
+    /// callback every block without a queue.
+    pub fn set_param(&mut self, index: usize, value: f32) {
+        if let Some(slot) = self.params.get_mut(index) {
+            *slot = value.clamp(0.0, 1.0);
+        }
     }
 
-    /// The WIDTH knob: 0 mono, 1 stock seating, up to 1.5 leaning wider.
+    /// Every knob at once, in the order the patch lists them. Shorter slices
+    /// leave the rest alone, which is what a build reading a file written by
+    /// an older one hands over.
+    pub fn set_params(&mut self, values: &[f32]) {
+        for (i, v) in values.iter().enumerate() {
+            self.set_param(i, *v);
+        }
+    }
+
+    /// The knobs as they stand.
+    pub fn params(&self) -> &[f32; MAX_PARAMS] {
+        &self.params
+    }
+
+    /// **Initialise the sound**: every knob back to the value the bench
+    /// signed off for the patch that is loaded. What the panel's button does.
+    pub fn reset_params(&mut self) {
+        self.params = self.patch.defaults();
+    }
+
+    /// The VOICING knob, 0 mellow to 1 bright; 0.5 is the bench tuning.
+    /// Knob 0 under an older name, kept because the bench calls it.
+    pub fn set_voicing(&mut self, v: f32) {
+        self.set_param(P_VOICING, v);
+    }
+
+    /// The WIDTH knob in its OLD units — 0 mono, 1.0 stock seating, up to
+    /// 1.5 leaning wider — normalised into knob 1. The panel speaks 0..1
+    /// like every other knob; this exists for the bench and for the two-knob
+    /// call sites that predate the rack.
     pub fn set_width(&mut self, w: f32) {
-        self.width = w.clamp(0.0, 1.5);
+        self.set_param(P_WIDTH, w.clamp(0.0, WIDTH_FULL) / WIDTH_FULL);
     }
 
     /// Strike a key.
@@ -317,14 +601,14 @@ impl Keys {
         };
         self.strikes = self.strikes.wrapping_add(1);
         let age = self.strikes;
-        let pan = pan_for(pitch) * self.width;
+        let pan = pan_for(pitch) * self.params[P_WIDTH] * WIDTH_FULL;
         let note = &mut self.notes[slot];
         let was_done = note.pitch.is_none() || note.mech.finished();
         note.pitch = Some(pitch);
         note.held = true;
         note.pan = pan;
         note.age = age;
-        note.mech.strike(pitch, velocity, self.voicing);
+        note.mech.strike(pitch, velocity, &self.params);
         if was_done {
             self.sounding += 1;
         }
@@ -418,6 +702,9 @@ impl Keys {
             return;
         }
         let n = frames.min(out.len() / channels);
+        // Once per block, not per sample: the knob cannot move inside a
+        // block, and the mapping is a multiply the loop should not repeat.
+        let body_amt = (self.params[P_BODY] * 2.0).clamp(0.0, 2.0);
         for f in 0..n {
             let mut left = 0.0_f32;
             let mut right = 0.0_f32;
@@ -437,9 +724,12 @@ impl Keys {
                 left += s * gl;
                 right += s * gr;
             }
+            // The soundboard/tonebar knob rides here rather than inside the
+            // body, so the board's own decay is untouched and only how much
+            // of it reaches the bus moves.
             let (bl, br) = self.body.tick(drive);
-            left += bl;
-            right += br;
+            left += bl * body_amt;
+            right += br * body_amt;
             let base = f * channels;
             if channels == 1 {
                 out[base] += (left + right) * 0.5;

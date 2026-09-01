@@ -20,12 +20,17 @@
 //! and the pulse's SHAPE matters as much as its width; see `strike` for the
 //! two shapes that failed before the Gaussian.
 
-use super::Patch;
+use super::{Patch, PianoKnobs};
 
 /// Longest delay any string needs: A0 at 27.5 Hz, at 96 kHz, with room for the
 /// fractional part and the tuning correction. Fixed and allocated once, so no
 /// note can ever cause an allocation.
 const MAX_DELAY: usize = 4096;
+
+/// The damper's time constant as the bench tuned it. Felt takes tens of
+/// milliseconds to stop a string and a hard cut sounds like an edit; the
+/// RELEASE knob scales this and nothing else.
+const DAMP_SECS: f32 = 0.055;
 
 /// How many strings a unison has. Real pianos use one in the low bass, two
 /// through the tenor and three above it; three everywhere costs little and the
@@ -217,6 +222,10 @@ pub struct PianoVoice {
     /// Damper: how fast the note is being killed. 1.0 is free.
     damp: f32,
     damp_to: f32,
+    /// The damper's time constant in seconds, set at strike time from the
+    /// RELEASE knob. Felt takes tens of milliseconds to stop a string;
+    /// 0.055 s is the tuned figure and the knob scales it.
+    damp_secs: f32,
     /// A peak follower, for the stealing policy and for `finished`.
     env: f32,
     done: bool,
@@ -235,19 +244,27 @@ impl PianoVoice {
             strike: 8,
             damp: 1.0,
             damp_to: 1.0,
+            damp_secs: DAMP_SECS,
             env: 0.0,
             done: true,
         }
     }
 
     pub fn strike(&mut self, pitch: u8, velocity: f32) {
-        self.strike_full(pitch, velocity, 1.0, 0.5);
+        self.strike_full(pitch, velocity, &PianoKnobs::default());
     }
 
     /// `strike` with the panel's VOICING knob: 0 mellow, 1 bright, 0.5 the
     /// bench tuning exactly. See `strike_full` for what the knob touches.
     pub fn strike_voiced(&mut self, pitch: u8, velocity: f32, voicing: f32) {
-        self.strike_full(pitch, velocity, 1.0, voicing);
+        let mut k = PianoKnobs::default();
+        k.voicing = voicing;
+        self.strike_full(pitch, velocity, &k);
+    }
+
+    /// `strike` with the whole panel: every knob this mechanism answers to.
+    pub fn strike_knobs(&mut self, pitch: u8, velocity: f32, k: &PianoKnobs) {
+        self.strike_full(pitch, velocity, k);
     }
 
     /// `strike`, with the unison detune scaled: 1.0 is the instrument, 0.0
@@ -263,10 +280,16 @@ impl PianoVoice {
     /// t60 column is therefore measured with the unison collapsed, where the
     /// decay is the design and nothing else. `mod.rs` never calls this.
     pub fn strike_spread(&mut self, pitch: u8, velocity: f32, spread: f32) {
-        self.strike_full(pitch, velocity, spread, 0.5);
+        let mut k = PianoKnobs::default();
+        k.unison = spread;
+        self.strike_full(pitch, velocity, &k);
     }
 
-    fn strike_full(&mut self, pitch: u8, velocity: f32, spread: f32, voicing: f32) {
+    fn strike_full(&mut self, pitch: u8, velocity: f32, knobs: &PianoKnobs) {
+        // `k` is the MIDI key number a few lines down and has been since this
+        // file was written; the knobs are `knobs`.
+        let spread = knobs.unison;
+        let voicing = knobs.voicing;
         let f0 = 440.0 * 2.0_f32.powf((f32::from(pitch) - 69.0) / 12.0);
         let total = (self.rate / f0).clamp(4.0, (MAX_DELAY - 4) as f32);
 
@@ -283,6 +306,11 @@ impl PianoVoice {
             // Tenor up: from 2e-4 to about 1e-3 at the top.
             2.0e-4 * 2.0_f32.powf((k - 48.0) / 22.0)
         };
+        // STRETCH scales the measured curve rather than replacing it: the
+        // shape across the keyboard is the grand's, and the knob says how
+        // stiff this instrument's wire is. Clamped where the all-pass fit
+        // stops being a fit.
+        let b = (b * knobs.stretch).clamp(1.0e-6, 8.0e-3);
 
         // Decay, as two designed numbers instead of one guessed coefficient.
         // The fundamental's t60 runs from ~18 s at A0 down to about a second
@@ -294,9 +322,14 @@ impl PianoVoice {
         // this pair puts C4 at n1 4.8 s falling steadily to n7 0.8 s, which
         // decays like felt-damped wire rather than either an organ (flat
         // t60) or a clavinet (no top at all).
+        // DECAY multiplies the whole curve, after the clamp that shapes it,
+        // so the keyboard keeps its slope and the knob only says how long
+        // this instrument rings. BRILLIANCE is the reference partial's share
+        // of that — the tuned 0.28 at centre.
         let t60_f = (18.0 * (-(k - 21.0) / 30.0).exp()).clamp(1.0, 18.0);
+        let t60_f = (t60_f * knobs.decay).clamp(0.12, 60.0);
         let f_hi = (6.0 * f0).min(0.40 * self.rate);
-        let t60_h = (t60_f * 0.28).max(0.08);
+        let t60_h = (t60_f * knobs.brilliance).max(0.05).min(t60_f);
         let w1 = std::f32::consts::TAU * f0 / self.rate;
         let w2 = std::f32::consts::TAU * f_hi / self.rate;
         // Per-pass magnitudes: the loop is traversed f0 times a second, so
@@ -406,6 +439,7 @@ impl PianoVoice {
         self.pulse_amp = 0.35 * v.powf(1.35);
         self.damp = 1.0;
         self.damp_to = 1.0;
+        self.damp_secs = (DAMP_SECS * knobs.release).clamp(0.004, 1.5);
         self.env = self.pulse_amp;
         self.done = false;
     }
@@ -461,7 +495,7 @@ impl PianoVoice {
 
         // The damper is a fast fade, not a gate: felt takes tens of
         // milliseconds to stop a string and a hard cut sounds like an edit.
-        let coeff = 1.0 - (-1.0 / (0.055 * self.rate)).exp();
+        let coeff = 1.0 - (-1.0 / (self.damp_secs * self.rate)).exp();
         self.damp += (self.damp_to - self.damp) * coeff;
         let out = sum * self.damp;
 
