@@ -136,10 +136,26 @@ impl DrumpadDoc {
     /// keyed by channel number, for the rest.
     ///
     /// The legacy kit lands on the lane named by `lane_kits`' own
-    /// `primary`, or on lane 0 when there is none. That is what makes an old
-    /// project open sounding as it did: its single kit belongs to whichever
-    /// channel was carrying the drumpad, and the app writes that number down
-    /// the first time it saves.
+    /// `primary`; failing that, on `legacy_lane` — **the channel whose first
+    /// bay actually holds the drumpad**, which the caller reads off the desk.
+    /// That is what makes an old project open sounding as it did: its single
+    /// kit belongs to whichever channel was carrying the drumpad, and the app
+    /// writes that number down the first time it saves.
+    ///
+    /// **Lane 0 was a guess, and for most real projects it was wrong.** This
+    /// took the caller's hint only after a project with its drumpad on
+    /// channel 3 opened silent: the kit went to channel 0, the piano lane,
+    /// where nothing strikes a pad, and the drum lane came up with a hundred
+    /// and twenty-eight empty slots under a track full of notes. Nothing was
+    /// lost on disk — the sidecar still held every sample — but the session
+    /// played no drums and reads exactly like a kit that has been destroyed.
+    /// `Settings::move_legacy_pad_racks` asks the identical question of the
+    /// identical array for the identical reason; this is the other half of
+    /// that fix, arrived at four months later.
+    ///
+    /// `None` keeps the old behaviour — lane 0 — for a caller with no desk
+    /// to consult, which is only the tests and a project with no drumpad in
+    /// it anywhere.
     /// Every lane's kit, and **which lane was showing when it was saved**.
     ///
     /// The second half is not decoration. `primary_lane` is written on every
@@ -150,7 +166,11 @@ impl DrumpadDoc {
     /// pad, in the panel you had just been working in, which reads as the
     /// kit having been destroyed. It had not been; it was on another lane the
     /// whole time. The owner: "the update clobbered my old drum layouts."
-    pub fn load_all_beside(doc: &std::path::Path, lanes: usize) -> (Vec<Self>, Option<usize>) {
+    pub fn load_all_beside(
+        doc: &std::path::Path,
+        lanes: usize,
+        legacy_lane: Option<usize>,
+    ) -> (Vec<Self>, Option<usize>) {
         let mut out: Vec<Self> = (0..lanes).map(|_| Self::default()).collect();
         let Ok(text) = std::fs::read_to_string(Self::sidecar(doc)) else {
             return (out, None);
@@ -160,10 +180,12 @@ impl DrumpadDoc {
         let legacy = Self::from_json(&text);
         let map = serde_json::from_str::<Value>(&text).ok();
         let obj = map.as_ref().and_then(Value::as_object);
+        // The file's own word first; the desk's answer second; lane 0 only
+        // when neither has an opinion.
         let primary = obj
             .and_then(|m| m.get("primary_lane"))
             .and_then(Value::as_u64)
-            .map_or(0usize, |n| n as usize);
+            .map_or_else(|| legacy_lane.unwrap_or(0), |n| n as usize);
         if primary < out.len() {
             out[primary] = legacy;
         }
@@ -374,7 +396,7 @@ mod tests {
         kits[7] = kit("snare");
 
         DrumpadDoc::save_all_beside(&kits, 3, &doc);
-        let (back, primary) = DrumpadDoc::load_all_beside(&doc, 16);
+        let (back, primary) = DrumpadDoc::load_all_beside(&doc, 16, None);
         assert_eq!(back.len(), 16);
         // **The lane that was showing comes back with the kits.** Reading the
         // kits and forgetting which one was in front of you is how a project
@@ -385,19 +407,42 @@ mod tests {
         assert!(back[0].is_empty(), "a lane with no kit came back with one");
         assert!((back[7].pads[36].params.gain - 0.5).abs() < 1e-6, "the knobs");
 
-        // **An OLD sidecar — one kit, no lane keys — lands on lane 0.**
-        // That is the only lane a pre-lanes build could have meant, and a
-        // project that opened silent because its kit went nowhere would be
-        // the worst possible way to ship this.
+        // **An OLD sidecar — one kit, no lane keys — lands where the DESK
+        // says the drumpad is**, and on lane 0 only when nobody says
+        // otherwise. Lane 0 alone was the original rule and it was a guess:
+        // the project that found this had its drumpad on channel 3, so its
+        // only kit went to the piano lane and the drum track played a
+        // hundred and twenty-eight empty pads under a full arrangement.
         let legacy = kit("legacy");
         std::fs::write(DrumpadDoc::sidecar(&doc), legacy.to_json()).expect("write legacy");
-        let (back, primary) = DrumpadDoc::load_all_beside(&doc, 16);
+        let (back, primary) = DrumpadDoc::load_all_beside(&doc, 16, None);
         // A file with no opinion says so, rather than claiming lane 0 —
         // the caller's fallback is the same answer and it knows it guessed.
         assert_eq!(primary, None, "a pre-lanes file invented a primary lane");
         assert_eq!(
             back[0].pads[36].path, "media/legacy.wav",
             "a pre-lanes kit did not survive the upgrade"
+        );
+        // The hint moves it, and moves it ALONE: no other lane gains a kit.
+        let (back, primary) = DrumpadDoc::load_all_beside(&doc, 16, Some(3));
+        assert_eq!(primary, None, "a hint is not the file speaking");
+        assert_eq!(
+            back[3].pads[36].path, "media/legacy.wav",
+            "the pre-lanes kit ignored the lane that actually holds the drumpad"
+        );
+        assert!(
+            back[0].is_empty(),
+            "the kit was left on lane 0 as well as moved"
+        );
+        // A hint past the end places nothing rather than panicking — the
+        // same guard an out-of-range `primary_lane` has always met. The file
+        // on disk is untouched, so the next load with a sane hint still
+        // finds the kit. The real caller cannot produce this: it searches
+        // the same channel count it asks for.
+        let (back, _) = DrumpadDoc::load_all_beside(&doc, 16, Some(99));
+        assert!(
+            back.iter().all(DrumpadDoc::is_empty),
+            "an out-of-range hint put a kit somewhere"
         );
 
         // And the top level still says what an old build would read, so a
@@ -643,6 +688,11 @@ impl DrumpadDoc {
 /// The extension a saved kit wears.
 pub const PRESET_EXT: &str = "tgkit";
 
+/// The first bytes of a kit file that carries its own samples. Version 2 —
+/// version 1 was the same manifest as bare JSON with no audio at all, and
+/// [`KitPreset::from_bytes`] still reads it.
+const MAGIC: &[u8] = b"TGKIT2\n";
+
 /// **A kit as a THING you can keep**, independent of the project it was
 /// built in.
 ///
@@ -666,10 +716,46 @@ pub struct KitPreset {
     /// What the kit is called — the file's stem, kept in the file too so a
     /// renamed file still knows what it was.
     pub name: String,
-    /// `(key, absolute source, pad name, params)`, in key order.
-    pub pads: Vec<(usize, std::path::PathBuf, String, DrumPadParams)>,
+    /// Every pad that holds something, in key order.
+    pub pads: Vec<KitPad>,
     /// The kit's own fader.
     pub master: f32,
+    /// **The samples themselves.** One entry per distinct source file, in
+    /// the order the pads first reach for them; a pad points at one by index.
+    ///
+    /// Empty for a preset READ from the old path-only form, and for one built
+    /// in memory by a test. Everything downstream therefore treats an absent
+    /// blob as "go and find the file", which is exactly what the old form
+    /// meant.
+    pub media: Vec<KitBlob>,
+}
+
+/// One pad of a saved kit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KitPad {
+    /// Which key it sits on.
+    pub key: usize,
+    /// Where the sample came from, absolute. Kept even when the audio is
+    /// embedded: it is the provenance, and the fallback if the blob is gone.
+    pub file: std::path::PathBuf,
+    /// The pad's own label.
+    pub name: String,
+    /// Gain, pan, tune, choke, obey and the trim — the layout, which is half
+    /// of what makes a kit somebody's rather than a folder of samples.
+    pub params: DrumPadParams,
+    /// Which entry of [`KitPreset::media`] holds this pad's audio, if the
+    /// preset carries it.
+    pub blob: Option<usize>,
+}
+
+/// One embedded sample: what it was called, and its bytes exactly as they sat
+/// on the disk it came from. No transcoding — a kit is a copy, not a render.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KitBlob {
+    /// The original file name, used for the copy made in the destination
+    /// project so a shared kit lands with the names its author gave it.
+    pub name: String,
+    pub bytes: Vec<u8>,
 }
 
 impl KitPreset {
@@ -680,18 +766,40 @@ impl KitPreset {
     /// on the disk the preset is carried to. Loading reports what it could
     /// not find rather than refusing the whole kit.
     pub fn from_kit(name: &str, kit: &DrumpadDoc, doc: &std::path::Path) -> Self {
+        let mut media: Vec<KitBlob> = Vec::new();
+        let mut seen: Vec<std::path::PathBuf> = Vec::new();
+        let mut pads = Vec::new();
+        for (key, p) in kit.pads.iter().enumerate() {
+            if p.path.is_empty() {
+                continue;
+            }
+            let file = resolve(doc, &p.path);
+            // **One blob per distinct file.** A kit with the same hat on two
+            // pads at different tunings is one sample, and a preset that
+            // wrote it twice would be twice the size for nothing.
+            let blob = seen.iter().position(|s| *s == file).or_else(|| {
+                let bytes = std::fs::read(&file).ok()?;
+                let label = file
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| format!("pad-{key}.wav"));
+                seen.push(file.clone());
+                media.push(KitBlob { name: label, bytes });
+                Some(media.len() - 1)
+            });
+            pads.push(KitPad {
+                key,
+                file,
+                name: p.name.clone(),
+                params: p.params,
+                blob,
+            });
+        }
         Self {
             name: name.to_owned(),
             master: kit.master,
-            pads: kit
-                .pads
-                .iter()
-                .enumerate()
-                .filter(|(_, p)| !p.path.is_empty())
-                .map(|(key, p)| {
-                    (key, resolve(doc, &p.path), p.name.clone(), p.params)
-                })
-                .collect(),
+            pads,
+            media,
         }
     }
 
@@ -704,11 +812,15 @@ impl KitPreset {
         let pads: Vec<Value> = self
             .pads
             .iter()
-            .map(|(key, file, name, params)| {
+            .map(|pad| {
+                let params = &pad.params;
                 let mut m = Map::new();
-                m.insert("key".into(), Value::from(*key as u64));
-                m.insert("file".into(), Value::from(file.to_string_lossy().into_owned()));
-                m.insert("name".into(), Value::from(name.clone()));
+                m.insert("key".into(), Value::from(pad.key as u64));
+                m.insert(
+                    "file".into(),
+                    Value::from(pad.file.to_string_lossy().into_owned()),
+                );
+                m.insert("name".into(), Value::from(pad.name.clone()));
                 m.insert("gain".into(), Value::from(f64::from(params.gain)));
                 m.insert("pan".into(), Value::from(f64::from(params.pan)));
                 m.insert("tune".into(), Value::from(f64::from(params.tune)));
@@ -716,10 +828,32 @@ impl KitPreset {
                 m.insert("obey".into(), Value::from(params.obey));
                 m.insert("trim_start".into(), Value::from(f64::from(params.trim_start)));
                 m.insert("trim_end".into(), Value::from(f64::from(params.trim_end)));
+                if let Some(b) = pad.blob {
+                    m.insert("blob".into(), Value::from(b as u64));
+                }
                 Value::Object(m)
             })
             .collect();
         root.insert("pads".into(), Value::Array(pads));
+        // The blob table: names and lengths, in order. Offsets are IMPLICIT —
+        // each blob begins where the last one ended — because an offset
+        // written down is an offset that can disagree with the bytes.
+        if !self.media.is_empty() {
+            root.insert(
+                "blobs".into(),
+                Value::Array(
+                    self.media
+                        .iter()
+                        .map(|b| {
+                            let mut m = Map::new();
+                            m.insert("name".into(), Value::from(b.name.clone()));
+                            m.insert("len".into(), Value::from(b.bytes.len() as u64));
+                            Value::Object(m)
+                        })
+                        .collect(),
+                ),
+            );
+        }
         serde_json::to_string_pretty(&Value::Object(root)).unwrap_or_default()
     }
 
@@ -740,6 +874,7 @@ impl KitPreset {
                 .and_then(Value::as_f64)
                 .map_or(1.0, |v| v as f32),
             pads: Vec::new(),
+            media: Vec::new(),
         };
         let Some(Value::Array(pads)) = root.get("pads") else {
             return out;
@@ -773,15 +908,17 @@ impl KitPreset {
             if let Some(b) = o.get("obey").and_then(Value::as_bool) {
                 params.obey = b;
             }
-            out.pads.push((
+            out.pads.push(KitPad {
                 key,
-                std::path::PathBuf::from(file),
-                o.get("name")
+                file: std::path::PathBuf::from(file),
+                name: o
+                    .get("name")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_owned(),
                 params,
-            ));
+                blob: o.get("blob").and_then(Value::as_u64).map(|b| b as usize),
+            });
         }
         out
     }
@@ -796,14 +933,122 @@ impl KitPreset {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let tmp = path.with_extension("tgkit.tmp");
-        std::fs::write(&tmp, self.to_json()).map_err(|e| e.to_string())?;
+        std::fs::write(&tmp, self.to_bytes()).map_err(|e| e.to_string())?;
         std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
         Ok(path)
     }
 
+    /// **The file, whole**: a text header, the manifest, then every sample's
+    /// bytes end to end.
+    ///
+    /// ```text
+    /// TGKIT2\n
+    /// <manifest length in decimal>\n
+    /// <manifest JSON>
+    /// <blob 0><blob 1>...
+    /// ```
+    ///
+    /// A container and not base64-in-JSON because a kit is mostly audio and
+    /// base64 is a third again as large for it; a container and not a zip
+    /// because a zip is a dependency, and a new crate in this app's lock file
+    /// costs a THIRD-PARTY-LICENSES diff at release time. The header is ASCII
+    /// so `head` on a mystery file says what it is.
+    ///
+    /// Blob ORDER is the contract, not offsets: each begins where the last
+    /// ended. There is nothing to disagree with the bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let manifest = self.to_json();
+        let mut out = Vec::with_capacity(
+            manifest.len() + 64 + self.media.iter().map(|b| b.bytes.len()).sum::<usize>(),
+        );
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(format!("{}\n", manifest.len()).as_bytes());
+        out.extend_from_slice(manifest.as_bytes());
+        for blob in &self.media {
+            out.extend_from_slice(&blob.bytes);
+        }
+        out
+    }
+
+    /// Read a file written by [`Self::to_bytes`], **or** one from before the
+    /// samples travelled with the kit: those are plain JSON, and a preset
+    /// whose pads name absolute paths and carry no blobs is exactly what the
+    /// applying end already knows how to handle.
+    pub fn from_bytes(raw: &[u8]) -> Result<Self, String> {
+        if !raw.starts_with(MAGIC) {
+            // The old form. Anything that is not valid UTF-8 was never one of
+            // ours, and `from_json` answers rubbish with an empty preset, so
+            // the caller's "no pads in it" is the message either way.
+            let text = std::str::from_utf8(raw)
+                .map_err(|_| "not a Tangent kit".to_owned())?;
+            return Ok(Self::from_json(text));
+        }
+        let rest = &raw[MAGIC.len()..];
+        let nl = rest
+            .iter()
+            .position(|b| *b == b'\n')
+            .ok_or_else(|| "the kit's header is truncated".to_owned())?;
+        let len: usize = std::str::from_utf8(&rest[..nl])
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .ok_or_else(|| "the kit's manifest length is not a number".to_owned())?;
+        let body = &rest[nl + 1..];
+        if body.len() < len {
+            return Err("the kit's manifest is truncated".to_owned());
+        }
+        let manifest = std::str::from_utf8(&body[..len])
+            .map_err(|_| "the kit's manifest is not text".to_owned())?;
+        let mut out = Self::from_json(manifest);
+        // The blob table, then the bytes it describes.
+        let table: Vec<(String, usize)> = serde_json::from_str::<Value>(manifest)
+            .ok()
+            .and_then(|v| v.get("blobs").cloned())
+            .and_then(|v| match v {
+                Value::Array(a) => Some(a),
+                _ => None,
+            })
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|b| {
+                let o = b.as_object()?;
+                Some((
+                    o.get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("sample.wav")
+                        .to_owned(),
+                    o.get("len").and_then(Value::as_u64)? as usize,
+                ))
+            })
+            .collect();
+        let mut at = len;
+        for (name, blen) in table {
+            let end = at.saturating_add(blen);
+            if end > body.len() {
+                // Truncated. Keep what parsed — the layout is still worth
+                // having, and every pad whose blob is missing falls back to
+                // looking for the file.
+                break;
+            }
+            out.media.push(KitBlob {
+                name,
+                bytes: body[at..end].to_vec(),
+            });
+            at = end;
+        }
+        // A pad pointing past the end of what actually arrived has no audio
+        // in the file; let it fall back rather than index into nothing.
+        let have = out.media.len();
+        for pad in &mut out.pads {
+            if pad.blob.is_some_and(|b| b >= have) {
+                pad.blob = None;
+            }
+        }
+        Ok(out)
+    }
+
     pub fn load(path: &std::path::Path) -> Result<Self, String> {
-        let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-        let mut out = Self::from_json(&text);
+        let raw = std::fs::read(path).map_err(|e| e.to_string())?;
+        let mut out = Self::from_bytes(&raw)?;
         if out.name.is_empty() {
             out.name = path
                 .file_stem()
@@ -848,7 +1093,7 @@ mod preset_tests {
 
         let preset = KitPreset::from_kit("My Kit", &kit, &doc);
         assert_eq!(preset.pads.len(), 1, "only the filled pad is written");
-        let (key, file, name, params) = &preset.pads[0];
+        let KitPad { key, file, name, params, .. } = &preset.pads[0];
         assert_eq!(*key, 36);
         assert_eq!(name, "Kick");
         assert!((params.gain - 0.5).abs() < 1e-6);
@@ -864,10 +1109,16 @@ mod preset_tests {
         assert_eq!(back.name, "My Kit");
         assert!((back.master - 0.75).abs() < 1e-6, "the kit fader");
         assert_eq!(back.pads.len(), 1);
-        assert_eq!(back.pads[0].0, 36);
-        assert_eq!(back.pads[0].1, *file, "the sample moved");
-        assert_eq!(back.pads[0].3.choke, 2, "the choke group");
-        assert!((back.pads[0].3.pan + 0.25).abs() < 1e-6, "the pan");
+        assert_eq!(back.pads[0].key, 36);
+        assert_eq!(back.pads[0].file, *file, "the sample moved");
+        assert_eq!(back.pads[0].params.choke, 2, "the choke group");
+        assert!((back.pads[0].params.pan + 0.25).abs() < 1e-6, "the pan");
+        // **And the audio came with it.** The whole point of the format:
+        // the bytes that were on the pad are inside the kit file.
+        assert_eq!(back.media.len(), 1, "the kit carried no samples");
+        assert_eq!(back.media[0].name, "kick.wav");
+        assert_eq!(back.media[0].bytes, b"riff", "the sample's bytes changed");
+        assert_eq!(back.pads[0].blob, Some(0), "the pad lost its sample");
 
         // A name given only by the filename still comes back.
         let unnamed = KitPreset { name: String::new(), ..back.clone() };
@@ -891,6 +1142,102 @@ mod preset_tests {
             "{\"pads\": [{\"key\": 500, \"file\": \"/x.wav\"}, {\"key\": 4, \"file\": \"/y.wav\"}]}",
         );
         assert_eq!(p.pads.len(), 1);
-        assert_eq!(p.pads[0].0, 4);
+        assert_eq!(p.pads[0].key, 4);
+    }
+
+    /// **A kit is shareable: the samples travel inside it.**
+    ///
+    /// The test deletes the sources before reading the file back, which is
+    /// the honest simulation of the case this format exists for — a kit
+    /// downloaded from somebody whose disk you have never seen. A preset that
+    /// only recorded paths came back as a hundred and twenty-eight empty
+    /// pads and an apology.
+    #[test]
+    fn a_kit_carries_its_own_samples_and_survives_losing_the_originals() {
+        let dir = tmp("selfcontained");
+        let doc = dir.join("project.tangent");
+        let media = dir.join("media");
+        std::fs::create_dir_all(&media).expect("media");
+        std::fs::write(media.join("kick.wav"), vec![7u8; 900]).expect("kick");
+        std::fs::write(media.join("hat.wav"), vec![3u8; 400]).expect("hat");
+
+        let mut kit = DrumpadDoc::default();
+        let slot = |file: &str| PadSlot {
+            path: format!("media/{file}"),
+            ..Default::default()
+        };
+        kit.pads[36] = slot("kick.wav");
+        kit.pads[42] = slot("hat.wav");
+        // The same sample on two pads at different tunings — one blob, two
+        // pads, which is what the de-duplication is for.
+        kit.pads[44] = PadSlot {
+            path: "media/hat.wav".to_owned(),
+            params: DrumPadParams { tune: 5.0, ..Default::default() },
+            ..Default::default()
+        };
+
+        let preset = KitPreset::from_kit("Shared", &kit, &doc);
+        assert_eq!(preset.media.len(), 2, "the same file was stored twice");
+        let written = preset.save(&dir.join("Shared")).expect("save");
+        // Bigger than its own manifest by the audio it carries.
+        let size = std::fs::metadata(&written).expect("stat").len();
+        assert!(size > 1_300, "the file is too small to hold the samples: {size}");
+
+        // The disk the kit was made on is gone.
+        std::fs::remove_dir_all(&media).expect("delete the sources");
+
+        let back = KitPreset::load(&written).expect("load");
+        assert_eq!(back.pads.len(), 3);
+        assert_eq!(back.media.len(), 2);
+        assert_eq!(back.media[0].bytes.len(), 900, "the kick's bytes");
+        assert_eq!(back.media[1].bytes.len(), 400, "the hat's bytes");
+        assert_eq!(back.pads[1].blob, back.pads[2].blob, "two pads, one sample");
+        assert!(
+            (back.pads[2].params.tune - 5.0).abs() < 1e-6,
+            "the second pad's tuning"
+        );
+        assert!(
+            back.pads.iter().all(|p| p.blob.is_some()),
+            "a pad came back with no audio"
+        );
+    }
+
+    /// The old form still reads: a plain-JSON kit from before the samples
+    /// travelled is a kit whose pads name paths and carry no blobs, which is
+    /// precisely what the applying end falls back to.
+    #[test]
+    fn a_kit_from_before_the_samples_travelled_still_opens() {
+        let dir = tmp("legacyform");
+        let at = dir.join("Old.tgkit");
+        std::fs::write(
+            &at,
+            "{\"name\": \"Old\", \"master\": 1.0, \"pads\": [{\"key\": 38, \"file\": \"/somewhere/snare.wav\", \"gain\": 0.5}]}",
+        )
+        .expect("write");
+        let back = KitPreset::load(&at).expect("load");
+        assert_eq!(back.pads.len(), 1);
+        assert_eq!(back.pads[0].key, 38);
+        assert_eq!(back.pads[0].blob, None, "an old kit invented a blob");
+        assert!(back.media.is_empty());
+        assert_eq!(back.pads[0].file, std::path::Path::new("/somewhere/snare.wav"));
+    }
+
+    /// A truncated file gives up the audio it lost and keeps the layout,
+    /// rather than refusing the kit or indexing into bytes that are not there.
+    #[test]
+    fn a_truncated_kit_keeps_its_layout() {
+        let dir = tmp("truncated");
+        let doc = dir.join("project.tangent");
+        let media = dir.join("media");
+        std::fs::create_dir_all(&media).expect("media");
+        std::fs::write(media.join("kick.wav"), vec![1u8; 500]).expect("kick");
+        let mut kit = DrumpadDoc::default();
+        kit.pads[36] = PadSlot { path: "media/kick.wav".to_owned(), ..Default::default() };
+        let whole = KitPreset::from_kit("Cut", &kit, &doc).to_bytes();
+        let cut = &whole[..whole.len() - 200];
+        let back = KitPreset::from_bytes(cut).expect("a truncated kit still parses");
+        assert_eq!(back.pads.len(), 1, "the layout was lost with the audio");
+        assert!(back.media.is_empty(), "half a sample was kept");
+        assert_eq!(back.pads[0].blob, None, "a pad points at audio that is not there");
     }
 }
