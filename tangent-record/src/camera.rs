@@ -95,9 +95,19 @@ mod macos;
 #[cfg(target_os = "macos")]
 use macos as backend;
 
-#[cfg(target_os = "linux")]
+/// V4L2, and FreeBSD is here too rather than in a file of its own.
+///
+/// `webcamd` runs the Linux UVC driver in userspace and publishes it through
+/// CUSE, so `/dev/video0` on GhostBSD answers `QUERYCAP` with
+/// `driver="uvcvideo"` and streams the same buffers; `uoctl` already encodes
+/// ioctls the BSD way, so the constants need no re-derivation. What is left is
+/// small enough to be two `cfg` branches inside the file — node enumeration,
+/// which cannot use `/proc/self/fd`, and VA-API, which is Linux-only — and a
+/// parallel `freebsd.rs` would have been the same six hundred lines with those
+/// two edits. See the branches in `linux.rs`.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 mod linux;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use linux as backend;
 /// Hardware MJPEG decode, when the machine has it. See the module's own docs:
 /// it is strictly an accelerator, absent it `zune-jpeg` runs unchanged, and
@@ -110,9 +120,19 @@ mod windows;
 #[cfg(target_os = "windows")]
 use windows as backend;
 
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "windows"
+)))]
 mod stub;
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "windows"
+)))]
 use stub as backend;
 
 /// Bytes per pixel in both BGRA and RGBA. Named because a bare `4` in a stride
