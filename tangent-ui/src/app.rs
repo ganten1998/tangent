@@ -576,10 +576,20 @@ pub struct TangentApp {
     /// The mixer control being dragged, and where the hand started.
     mixer_grab: Option<MixerGrab>,
     /// The window is genuinely FULLSCREEN this frame (not maximized, not
-    /// tiled) — what the mixer's fold is gated on.
+    /// tiled) — dialog placement answers to this alone; the mixer's fold
+    /// answers to this OR `maximized_now`.
     fullscreen_now: bool,
-    /// The Konami walk. Watched only while the install is FREE - the code
-    /// is a door, and a door already open needs no knocking.
+    /// Whether the OS says the main window is maximized this frame — read
+    /// with `fullscreen_now`, kept separate because the two gate different
+    /// things (the mixer fold answers to either; dialog placement and the
+    /// borderless re-maximize each answer to exactly one).
+    maximized_now: bool,
+    /// The borderless toggle's walk out of and back into maximized — see
+    /// where it is armed. `Some(step)` is a two-frame countdown.
+    decor_remax: Option<u8>,
+    /// The Konami walk. Watched on EVERY install, always: for the keyless
+    /// it is the door in, and for a paying supporter it is the switch that
+    /// wears the corruption or takes it off - see `DialogAction::AcceptCheat`.
     konami: crate::keys::Konami,
     /// When the confetti started, if a party is on. See `confetti::draw`.
     confetti_at: Option<std::time::Instant>,
@@ -2113,6 +2123,8 @@ impl TangentApp {
             arr_scroll_acc: 0.0,
             mixer_grab: None,
             fullscreen_now: false,
+            maximized_now: false,
+            decor_remax: None,
             konami: crate::keys::Konami::default(),
             confetti_at: None,
             bay_carry: None,
@@ -2955,6 +2967,27 @@ impl TangentApp {
     ///
     /// A track that is itself inside a folder cannot become one: folders are
     /// one level deep, so the gesture takes it OUT of its folder first.
+    /// The mixer's F switch: not-a-folder -> open folder -> shut folder ->
+    /// back to not-a-folder, which releases the children exactly as the
+    /// arrangement's box does. See `toggle_folder`/`toggle_folder_shut` -
+    /// this is only those two, in a circle.
+    fn cycle_folder(&mut self, ch: usize) {
+        if !self.is_folder(ch) {
+            self.toggle_folder(ch);
+            // A shut flag can survive from an earlier folder life (the
+            // arrangement's box never clears it); healed here so the cycle
+            // always lands on OPEN first.
+            if self.folder_shut(ch) {
+                self.toggle_folder_shut(ch);
+            }
+        } else if !self.folder_shut(ch) {
+            self.toggle_folder_shut(ch);
+        } else {
+            self.toggle_folder_shut(ch);
+            self.toggle_folder(ch);
+        }
+    }
+
     fn toggle_folder(&mut self, ch: usize) {
         if ch >= crate::recorder::CHANNELS {
             return;
@@ -3027,9 +3060,8 @@ impl TangentApp {
             }
         }
         // A note being sounded is a note being played, so it lights up like
-        // one. Added AFTER the transpose rather than before: `sounding` is
-        // already in display pitches, and transposing it a second time lit
-        // phantom keys a whole interval above the ones being played.
+        // one. `sounding` holds concert pitches, the same space everything
+        // in this set lives in now that nothing live is projected.
         set.extend(self.sounding.iter().copied());
         // **And what a gesture is asking for RIGHT NOW.**
         //
@@ -3063,20 +3095,22 @@ impl TangentApp {
                 return demo;
             }
         }
-        // **Only what arrived over MIDI is transposed.**
+        // **Nothing LIVE is transposed — the readout tells the truth.**
         //
-        // The transpose exists because a player is in one key and reading in
-        // another: a note comes off the keyboard in concert pitch and the
-        // picture shows it where they want to read it. That applies to notes
-        // the KEYBOARD sent and to nothing else.
+        // The offset used to reach what arrived over MIDI, on the theory
+        // that a player reads in one key and plays in another. The owner
+        // heard where that ends: carry a placed chord up four with the
+        // arrows, then play C major on the controller, and the band names
+        // the chord from the wrong root — a readout lying about the hands.
+        // The arrows move what was PLACED (`transpose_by` rewrites those
+        // notes in place); a hardware note lights the pitch that was
+        // played, always, which is also the pitch that is SOUNDING.
         //
-        // `manual_notes` are already in that space. They came from a click on
-        // the drawn keyboard, the drawn neck, the drawn staff — `piano::
-        // hit_test` answers with the note that key is DRAWN as. Transposing
-        // them again moves the highlight off the key that was clicked: with a
-        // transpose of -11, clicking middle C lit C sharp a major seventh
-        // below it. The same double application had `sounding` lighting
-        // phantom keys until it was moved after this line.
+        // `manual_notes` were never projected either — they light the key
+        // that was clicked; with a transpose of -11, projecting them lit C
+        // sharp a major seventh below middle C. The same double application
+        // had `sounding` lighting phantom keys until it was moved after
+        // this line.
         // **And the per-track switch decides whether the LIVE keyboard is in
         // the picture at all.**
         //
@@ -3091,7 +3125,7 @@ impl TangentApp {
         } else {
             HashSet::new()
         };
-        let mut set = transposed(&held, self.settings.transpose);
+        let mut set = held;
         if self.settings.keytoggle_enabled {
             set.extend(self.manual_notes.iter().copied());
         }
@@ -3460,6 +3494,14 @@ impl TangentApp {
             H::Phase(i) => {
                 f32::from(u8::from(self.settings.strip_phase & (1 << i.desk_index()) != 0))
             }
+            H::Folder(i) => f32::from(u8::from(
+                i.strip()
+                    .and_then(|s| match s {
+                        crate::recorder::Strip::Channel(n) => Some(self.is_folder(n)),
+                        _ => None,
+                    })
+                    .unwrap_or(false),
+            )),
             H::Fader(i) => view
                 .strips
                 .get(i.0)
@@ -3672,6 +3714,15 @@ impl TangentApp {
         self.record_automation_move(hit, v);
         let gain = f64::from(recorder::fader_to_gain(v));
         match hit {
+            // The F switch CYCLES: not-a-folder, open folder, shut folder,
+            // and around. One button where the arrangement has a box and an
+            // arrow, because a strip has one bottom-left.
+            H::Folder(i) => {
+                if let Some(crate::recorder::Strip::Channel(n)) = i.strip() {
+                    self.cycle_folder(n);
+                }
+                return;
+            }
             // The button is a door, not a value: it opens the window and the
             // `value` this call carries means nothing to it.
             H::Routing(i) => {
@@ -4077,9 +4128,12 @@ impl TangentApp {
             self.arr_save_edits();
         }
         // The bays last, through `set_insert` so the host's reconcile unloads
-        // whatever was running in them.
+        // whatever was running in them - the folder-extra seat's included,
+        // or a removed folder's second rack stayed loaded invisibly and
+        // resurfaced in bays 3..5 the next time the row became a folder.
         for bay in 0..crate::recorder::INSERTS {
             self.set_insert(at, bay, None);
+            self.set_insert(crate::recorder::folder_extra_seat(at), bay, None);
         }
         self.save_settings();
     }
@@ -4505,6 +4559,20 @@ impl TangentApp {
             crate::mixer_panel::StripView {
                 // Master only; a channel has no fold of its own.
                 mono: false,
+                // The arrangement's own folder model, worn on the desk —
+                // one source, so the two views can never disagree.
+                is_folder: match s {
+                    Strip::Channel(n) => self.is_folder(n),
+                    _ => false,
+                },
+                in_folder: match s {
+                    Strip::Channel(n) => self.in_folder(n),
+                    _ => false,
+                },
+                folder_shut: match s {
+                    Strip::Channel(n) => self.folder_shut(n),
+                    _ => false,
+                },
                 to_theory: match s {
                     Strip::Channel(n) => self.to_theory(n),
                     _ => false,
@@ -4590,6 +4658,9 @@ impl TangentApp {
                     phase: self.settings.strip_phase & (1 << i) != 0,
                     // The master is not a channel and has no MIDI to send.
                     to_theory: false,
+                    is_folder: false,
+                    in_folder: false,
+                    folder_shut: false,
                     route_count: 0,
                     strip: None,
                     icon: 0,
@@ -4644,7 +4715,7 @@ impl TangentApp {
                 },
             }),
             any_solo: desk.any_solo(),
-            screen_filling: self.fullscreen_now,
+            screen_filling: self.fullscreen_now || self.maximized_now,
             active: self.active_channels(),
             visible: self.mixer_visible(),
             scroll_px: self.mixer_scroll_px,
@@ -4745,18 +4816,9 @@ impl TangentApp {
         if want == self.settings.transpose {
             return;
         }
-        // **Guarded in DISPLAY space, each kind by its own motion.** A
-        // hardware note is RAW and wears the whole offset at display time —
-        // see `lit_notes` — so the NEW offset applies whole; a placed note
-        // already lives in display space and moves only by the STEP. The old
-        // check applied the whole offset to both, which double-counted it on
-        // every placed note: the further a chord had been carried, the
-        // sooner it met a wall that was not MIDI's — the owner's "limited to
-        // 2 octaves".
-        let midi: HashSet<u8> = self.notes.held().iter().copied().collect();
-        if transposed(&midi, want).len() != midi.len() {
-            return;
-        }
+        // **Only the PLACED notes bound the walk.** Live MIDI is not
+        // transposed at all any more — see `lit_notes` — so a note held on
+        // the controller must not stop the arrows carrying a placed chord.
         if self.settings.keytoggle_enabled {
             let placed: HashSet<u8> = self.manual_notes.iter().copied().collect();
             let by = want - self.settings.transpose;
@@ -5465,6 +5527,40 @@ impl TangentApp {
                         &self.recorder_layout_view(),
                         pos,
                     );
+                    // **Empty-LOOKING panels are the window's handle too,
+                    // borderless.** Two targets cover large panels that are
+                    // often showing nothing: the camera pane with no picture
+                    // (one giant "pick a camera" button, a quarter of the
+                    // band) and the VU meter with no clip latched (a dismiss
+                    // with nothing to dismiss). The owner's rule: every
+                    // unoccupied space moves the window. The controls keep
+                    // their meaning the moment they have one - a live
+                    // preview still picks, a lit latch still clears - the
+                    // empty pane keeps its CENTRE as the picker (where its
+                    // own hint sits, see camera_chip), and outside
+                    // borderless nothing changes at all.
+                    let hit = if self.settings.borderless_mode && self.caps.window_sizing {
+                        let (no_picture, latched) = {
+                            let v = self.recorder_layout_view();
+                            (v.preview.is_none(), v.meters.clipped)
+                        };
+                        match hit {
+                            Some(recorder_panel::Hit::PickCamera)
+                                if no_picture
+                                    && !recorder_panel::camera_chip(
+                                        r,
+                                        &self.recorder_layout_view(),
+                                    )
+                                    .contains(pos) =>
+                            {
+                                None
+                            }
+                            Some(recorder_panel::Hit::DismissClip) if !latched => None,
+                            h => h,
+                        }
+                    } else {
+                        hit
+                    };
                     // Remember a dragged control for as long as the button is
                     // held. Only the value-carrying hits are grabbable; a
                     // button does not want a drag.
@@ -7165,7 +7261,8 @@ impl TangentApp {
             }
         } else {
             for (i, ic) in d.icons.iter().take(crate::recorder::CHANNELS).enumerate() {
-                self.settings.channel_icons[i] = (*ic).min(3);
+                self.settings.channel_icons[i] =
+                    (*ic).min(crate::recorder_panel::ICON_MAX);
             }
         }
         for (i, k) in d.kinds.iter().take(crate::recorder::CHANNELS).enumerate() {
@@ -7822,6 +7919,14 @@ impl TangentApp {
             for b in 0..INSERTS {
                 self.settings.strip_inserts[n * INSERTS + b] =
                     inserts[order[n] * INSERTS + b].clone();
+                // And the folder-extra seat, which travels with its
+                // channel - see `recorder::seat_order`.
+                let (dst, src) = (
+                    crate::recorder::folder_extra_seat(n),
+                    crate::recorder::folder_extra_seat(order[n]),
+                );
+                self.settings.strip_inserts[dst * INSERTS + b] =
+                    inserts[src * INSERTS + b].clone();
             }
         }
 
@@ -9624,16 +9729,28 @@ impl TangentApp {
         if lane >= crate::recorder::CHANNELS && !master {
             return;
         }
-        // **The master offers what the master HAS.** It is the end of the
-        // chain: there is nothing past it to pan into and nothing to send
-        // to, and a menu that listed them would be offering two rows that
-        // could never do anything. Its fader is the one desk control it
-        // really has, and its bays are real.
+        // **The master offers what the master HAS** - which grew: fader,
+        // curve-driven mute, curve-driven balance, six bays. Only SEND
+        // stays off the card, because there is truly nothing past the
+        // master to send to.
         let desk = dialogs::AutoGroup {
             name: "Desk".to_owned(),
             rows: AutoParam::ALL
                 .into_iter()
-                .filter(|p| !master || matches!(p, AutoParam::Gain))
+                .filter(|p| {
+                    // The master offers what the master can HONESTLY do:
+                    // its fader, a curve-driven mute, and a curve-driven
+                    // balance (the engine grew both; there is no desk
+                    // switch - the curve is the control). SEND stays out:
+                    // there is nothing past the master to send to, and a
+                    // menu that offers it would be the 'engine drops it on
+                    // the floor' bug in its own words.
+                    !master
+                        || matches!(
+                            p,
+                            AutoParam::Gain | AutoParam::Pan | AutoParam::Mute
+                        )
+                })
                 .map(|p| dialogs::AutoRow {
                     key: p.key(),
                     label: p.label(),
@@ -9653,11 +9770,15 @@ impl TangentApp {
         // where they have always pointed, and the new rack takes 3..5. A
         // saved curve therefore still names the plugin it was drawn for.
         // `master_bay` is the one place that rule lives.
-        for bay in 0..crate::recorder::INSERTS * if master { 2 } else { 1 } {
+        let two_racks = master || self.is_folder(lane);
+        for bay in 0..crate::recorder::INSERTS * if two_racks { 2 } else { 1 } {
             let (bay_owner, seat_bay) = if master {
                 Self::master_bay(bay)
             } else {
-                (lane, bay)
+                // For a channel this is the identity on bays 0..2 and the
+                // folder-extra seat on 3..5 - the plain order, no
+                // `master_bay` twin. See `recorder::seat_bay`.
+                crate::recorder::seat_bay(lane, bay)
             };
             let Some(fx) = self.fx_params(bay_owner, seat_bay) else {
                 continue;
@@ -10178,9 +10299,15 @@ impl TangentApp {
     /// A lane is suspended when it is switched Off, and while it is being
     /// WRITTEN: a curve that fought the hand would make the fader jump back
     /// under it as each point landed.
-    pub fn auto_suspend_mask(&self) -> u32 {
-        let mut mask = 0u32;
-        for lane in 0..crate::recorder::CHANNELS.min(32) {
+    pub fn auto_suspend_mask(&self) -> u64 {
+        let mut mask = 0u64;
+        // The master's lane rides the same word, one past the channels -
+        // which is why this word is 64 bits wide: at thirty-two channels
+        // the master's bit is bit 32, and in a u32 it ALIASED channel 31's,
+        // so writing channel 31's fader suspended the master's curve.
+        for lane in
+            (0..crate::recorder::CHANNELS).chain([crate::arrangement_panel::MASTER_LANE])
+        {
             let mode = self.arr_auto_mode(lane);
             // `true` for touching: a lane whose mode writes on touch is
             // suspended while a hand is on it, and asking the question with
@@ -10325,6 +10452,15 @@ impl TangentApp {
     pub fn project_dirty(&self) -> bool {
         let now = self.undo_state();
         self.saved_state.as_ref() != Some(&now)
+    }
+
+    /// **Whether New would hand back exactly what is already open** - an
+    /// unnamed scratch with nothing changed since it was opened. The
+    /// owner's rule: no changes, no new folder, and the name never
+    /// advances - so a New that would rebuild the very session on the desk
+    /// does nothing instead.
+    pub fn new_is_noop(&self) -> bool {
+        !self.arrangement.named && !self.project_dirty()
     }
 
     /// **Ask before losing anything.** Returns whether the caller should
@@ -15014,7 +15150,8 @@ impl TangentApp {
             }
         }
         // The BAY's FX menu: while it is up it owns every press.
-        if let Some((lane, bay, at)) = self.arr_fx_menu {
+        // The stored pair is a SEAT and bay - resolved at the click.
+        if let Some((seat, bay, at)) = self.arr_fx_menu {
             let (pressed, sec, pointer) = ctx.input(|i| {
                 (
                     i.pointer.primary_pressed(),
@@ -15027,10 +15164,10 @@ impl TangentApp {
                 let rows = Self::clip_menu_rows(at, 2);
                 match pointer {
                     Some(p) if pressed && rows[0].contains(p) => {
-                        self.set_insert(lane, bay, None);
+                        self.set_insert(seat, bay, None);
                     }
                     Some(p) if pressed && rows[1].contains(p) => {
-                        self.open_insert_picker(lane, bay);
+                        self.open_insert_picker(seat, bay);
                     }
                     _ => {
                         self.menu_ate_press = true;
@@ -15192,8 +15329,12 @@ impl TangentApp {
                     }
                 };
                 if let Some((n, b)) = bay_hit {
-                    if self.insert(n, b).is_some() {
-                        self.arr_fx_menu = Some((n, b, p));
+                    // Slots 3..5 are a FOLDER's second rack: resolve to the
+                    // seat HERE, so the menu's delete and replace act on the
+                    // bay that was clicked and never the neighbour's.
+                    let (seat, bay) = crate::recorder::seat_bay(n, b);
+                    if self.insert(seat, bay).is_some() {
+                        self.arr_fx_menu = Some((seat, bay, p));
                         return;
                     }
                 }
@@ -15582,9 +15723,17 @@ impl TangentApp {
                 use crate::arrangement_panel::Hit as A;
                 use crate::mixer_panel::Hit as M;
                 use crate::recorder::Column;
+                // `HdrName` is deliberately NOT here: this pre-pass is
+                // modifier-blind, and `touch_track` resets the shift anchor
+                // - so a shift-click on the NAME collapsed the range to one
+                // track before the shift-aware `select_track` below ever
+                // ran. A click left of the label (the number cell) never
+                // came through here, which is why THAT multi-selected and
+                // the name did not. The HdrName arm below selects on its
+                // own, modifiers honoured.
                 if let Some(
                     A::Arm(n) | A::Mute(n) | A::Solo(n) | A::Gain(n) | A::Send(n)
-                    | A::Pan(n) | A::HdrInput(n) | A::HdrName(n) | A::HdrAdd(n)
+                    | A::Pan(n) | A::HdrInput(n) | A::HdrAdd(n)
                     | A::Lane(n, _),
                 ) = hit
                 {
@@ -15794,13 +15943,16 @@ impl TangentApp {
                         // empty, the plugin's face when loaded, the patch
                         // picker for the DX7, the drumpad for the kit.
                         self.touch_track(n);
+                        // Slots 3..5 are a FOLDER's second rack - resolve
+                        // through the seat map, like every other caller.
+                        let (seat, bay) = crate::recorder::seat_bay(n, bay);
                         // **And the mixer's own CARRY**, on the same terms —
                         // see `bay_carry`. A loaded bay arms; the window
                         // still opens on a press that does not travel.
-                        if self.insert(n, bay).is_some() {
-                            self.bay_carry = Some((n, bay, p, false));
+                        if self.insert(seat, bay).is_some() {
+                            self.bay_carry = Some((seat, bay, p, false));
                         } else {
-                            self.open_insert_face(n, bay);
+                            self.open_insert_face(seat, bay);
                         }
                     }
                     // **The NUMBER is the handle**: press and carry the
@@ -16986,7 +17138,10 @@ impl TangentApp {
                         _ => true,
                     },
                     inserts: std::array::from_fn(|b| {
-                        self.insert(n, b).map_or("", plugin_display_name)
+                        // Slots 3..5 are the folder's second rack - the
+                        // seat map answers for every slot. See seat_bay.
+                        let (seat, bay) = crate::recorder::seat_bay(n, b);
+                        self.insert(seat, bay).map_or("", plugin_display_name)
                     }),
                     color: self.strip_color(n),
                     kind,
@@ -17397,11 +17552,11 @@ impl TangentApp {
                 AutoParam::Gain => {
                     f64::from(recorder::gain_to_fader(self.settings.master_gain as f32))
                 }
-                // The master is the end of the chain: it has no pan and
-                // nothing to send to. The rows are not offered — see
-                // `master_auto_params` — and this is the belt to that
-                // brace, so a curve read out of an older document cannot
-                // move a control that is not there.
+                // Pan and Mute ARE offered on the master now (the engine
+                // grew both; the curve is the control), and these are their
+                // resting points: centre, and heard. Send stays a belt to
+                // the menu's brace - there is nothing past the master to
+                // send to, so an old document's send curve moves nothing.
                 AutoParam::Pan => 0.5,
                 AutoParam::Send => 0.0,
                 AutoParam::Mute => 0.0,
@@ -17433,10 +17588,14 @@ impl TangentApp {
                     0.0
                 }
             }
-            AutoParam::Plugin { bay, id } => self
-                .fx_params(lane, usize::from(bay))
-                .and_then(|fx| fx.params.iter().find(|p| p.id == id))
-                .map_or(0.5, |p| p.default_normalised.clamp(0.0, 1.0)),
+            AutoParam::Plugin { bay, id } => {
+                // Bays 3..5 are the folder's second rack; `fx_params` is
+                // keyed by SEAT, so resolve before looking.
+                let (seat, b) = crate::recorder::seat_bay(lane, usize::from(bay));
+                self.fx_params(seat, b)
+                    .and_then(|fx| fx.params.iter().find(|p| p.id == id))
+                    .map_or(0.5, |p| p.default_normalised.clamp(0.0, 1.0))
+            }
         }
     }
 
@@ -17553,7 +17712,16 @@ impl TangentApp {
         let crate::automation::AutoParam::Plugin { id, .. } = param else {
             return param.label();
         };
-        match self.fx_params(lane, bay) {
+        // `fx_params` is keyed by SEAT: the master's bays live on its two
+        // seats and a channel's 3..5 on its folder seat. Unresolved, the
+        // master's rows (and a folder's lower rack's) fell back to the
+        // address.
+        let (seat, sb) = if lane == crate::arrangement_panel::MASTER_LANE {
+            Self::master_bay(bay)
+        } else {
+            crate::recorder::seat_bay(lane, bay)
+        };
+        match self.fx_params(seat, sb) {
             Some(fx) => match fx.params.iter().find(|p| p.id == id) {
                 Some(p) if fx.name.is_empty() => p.title.clone(),
                 Some(p) => format!("{}: {}", fx.name, p.title),
@@ -18938,7 +19106,8 @@ impl TangentApp {
             }
             A::HdrBay(n, bay) => {
                 self.touch_track(n);
-                self.open_insert_face(n, bay);
+                let (seat, b) = crate::recorder::seat_bay(n, bay);
+                self.open_insert_face(seat, b);
             }
             A::AutoParamPick(n, slot) => self.arr_select_auto_row(n, slot),
             A::Phase(n) => self.apply_mixer_hit(M::Phase(Column(n)), 0.0),
@@ -20775,6 +20944,11 @@ impl TangentApp {
                 // the snap has since learned to stand down. So ask the
                 // question deliberately: request exactly the size we have,
                 // which a tiler answers with the tile.
+                // A tiler can REPORT maximized (i3 marks tiles so, and a
+                // gap-less AeroSpace tile can read zoomed), so the manager
+                // test decides and the flag does not: under a manager the
+                // refill runs; the re-maximize walk is for a real OS
+                // maximize only - see where `decor_remax` is armed.
                 if self.caps.window_sizing && (self.main_wm_managed || self.screen_sized) {
                     if let Some(sz) = self.main_live_size {
                         self.pending_window_size = Some(sz);
@@ -21524,10 +21698,18 @@ impl TangentApp {
     pub fn apply_dialog_action(&mut self, action: DialogAction) {
         match action {
             DialogAction::AcceptCheat => {
-                // The "...": the unlock is real from here on - supporter in
-                // every right, thanked as Cheater until an honest key
-                // replaces the name. See LicenseStore::unlock_cheat.
-                self.license.unlock_cheat();
+                // The "...": for the keyless this is the unlock, real from
+                // here on - supporter in every right, thanked as Cheater
+                // until an honest key replaces the name - and re-entering
+                // the code changes nothing but the dialog's line. For a
+                // PAYING supporter the code is a SWITCH: corruption on,
+                // corruption off, at will, the same line each way. See
+                // LicenseStore::{unlock_cheat, relock_cheat}.
+                if self.license.licensed() && self.license.cheated() {
+                    self.license.relock_cheat();
+                } else {
+                    self.license.unlock_cheat();
+                }
             }
             // ── the unsaved-changes prompt ───────────────────────────────
             //
@@ -23629,9 +23811,12 @@ impl TangentApp {
                     (Some(p), Some(m)) => p.y + 96.0 >= m.y && p.x + 40.0 >= m.x,
                     _ => false,
                 });
-        // TRUE fullscreen alone — the mixer's 16-over-16 fold is gated on
-        // this, by the owner's word: maximized and tiled stay one row.
+        // Fullscreen and maximized, read separately. The mixer's 16-over-16
+        // fold answers to EITHER — the owner widened the ruling from
+        // fullscreen-only — while dialog placement and the borderless
+        // re-maximize below each answer to exactly one of them.
         self.fullscreen_now = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        self.maximized_now = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
         let monitor = monitor.map(|m| m.x);
         // **Learn the monitor's width, once.** The percentages are shares of
         // it now (see `main_width`), and the very first window of a launch is
@@ -23815,17 +24000,47 @@ impl TangentApp {
                 self.size_asked_at = Some(Instant::now());
             }
         }
+        // ── the borderless toggle under a MAXIMIZED window ──
+        //
+        // One frame after the style change (never the same frame — the
+        // decoration command has to land first), leave maximized and
+        // re-enter it. Two commands, two frames, and the OS re-derives the
+        // frame from the work area under the new style. Toggling the border
+        // used to leave the title bar's height unfilled going borderless and
+        // a taskbar-sized black bar coming back: the OS kept the OLD
+        // maximized frame under the NEW style, and a single re-assert is
+        // dropped as a no-op by hosts that believe the state never changed.
+        if self.caps.window_sizing {
+            match self.decor_remax.take() {
+                Some(0) => {
+                    ctx.send_viewport_cmd(ViewportCommand::Maximized(false));
+                    self.decor_remax = Some(1);
+                }
+                Some(_) => ctx.send_viewport_cmd(ViewportCommand::Maximized(true)),
+                None => {}
+            }
+        }
         // Borderless enforcement; Qt re-sets the title after flag changes.
         let decorations = !self.settings.borderless_mode;
         if self.caps.window_sizing && self.decorations_sent != Some(decorations) {
             ctx.send_viewport_cmd(ViewportCommand::Decorations(decorations));
             ctx.send_viewport_cmd(ViewportCommand::Title("Tangent".to_owned()));
             self.decorations_sent = Some(decorations);
-            // **The drawable size to keep**, captured BEFORE the title bar
-            // comes or goes, because after that it is the wrong number.
-            // Applied by the host, once, when the style mask has actually
-            // changed — see `decor_keep_content`.
-            self.decor_keep_content = Some(self.last_pane);
+            if self.maximized_now && !self.main_wm_managed && !self.screen_sized {
+                // **A maximized frame belongs to the OS, not to the pane we
+                // measured.** Keeping the pre-toggle drawable here is what
+                // broke the toggle while maximized; walk the maximize out
+                // and back instead — see `decor_remax` above. Under a
+                // MANAGER the walk stands down (a tiler ignores it and the
+                // refill above already asked the right question).
+                self.decor_remax = Some(0);
+            } else {
+                // **The drawable size to keep**, captured BEFORE the title
+                // bar comes or goes, because after that it is the wrong
+                // number. Applied by the host, once, when the style mask has
+                // actually changed — see `decor_keep_content`.
+                self.decor_keep_content = Some(self.last_pane);
+            }
             // Arm the nudge — see `decor_nudge_until`. Both directions of B
             // left the picture shifted by a title bar under i3 until the
             // next click.
@@ -24803,6 +25018,64 @@ impl TangentApp {
             {
                 self.add_track_first_free();
             }
+            // **Ctrl/Cmd+F: group the selection into a folder**, exactly
+            // the arrangement's chord — same handler, same refusals — so a
+            // hand that learned it there finds it here.
+            if self.dialog.is_none()
+                && !self.text_entry_active()
+                && ctx.input(|i| {
+                    (i.modifiers.command || i.modifiers.ctrl)
+                        && !i.modifiers.shift
+                        && i.key_pressed(egui::Key::F)
+                })
+            {
+                self.make_folder();
+            }
+            // **Ctrl/Cmd+C/V/X: the CHANNEL clipboard**, as the arrangement
+            // does it when no clips are selected - copy the selected track
+            // whole, paste onto a selected EMPTY slot, cut is copy-and-
+            // remove. The mixer has no clips, so the fallback IS the deed.
+            // **The system's own chord events, not the letters** - the
+            // winit layer delivers Cmd/Ctrl+C/V/X as `Event::Copy` /
+            // `Event::Paste` / `Event::Cut` and the keypress never arrives;
+            // the arrangement and the MIDI editor both learned this the
+            // hard way. The key reads stay as the fallback spelling.
+            if self.dialog.is_none() && !self.text_entry_active() {
+                let (copy_ev, paste_ev, cut_ev) = ctx.input(|i| {
+                    let mut c = false;
+                    let mut v = false;
+                    let mut x = false;
+                    for e in &i.events {
+                        match e {
+                            egui::Event::Copy => c = true,
+                            egui::Event::Paste(_) => v = true,
+                            egui::Event::Cut => x = true,
+                            _ => {}
+                        }
+                    }
+                    (
+                        c || (i.modifiers.command && i.key_pressed(egui::Key::C)),
+                        v || (i.modifiers.command && i.key_pressed(egui::Key::V)),
+                        x || (i.modifiers.command && i.key_pressed(egui::Key::X)),
+                    )
+                });
+                if copy_ev {
+                    if let Some(n) = self.selected_channel.filter(|n| self.channel_used(*n)) {
+                        self.copy_track(n);
+                    }
+                }
+                if paste_ev {
+                    if let Some(n) = self.selected_channel {
+                        self.paste_track(n);
+                    }
+                }
+                if cut_ev {
+                    if let Some(n) = self.selected_channel.filter(|n| self.channel_used(*n)) {
+                        self.copy_track(n);
+                        self.remove_selected_channels(n);
+                    }
+                }
+            }
             // **Delete: the SELECTED CHANNEL leaves the desk** — the Track
             // menu's Remove, on the key, as in the arrangement.
             if self.dialog.is_none()
@@ -24966,7 +25239,16 @@ impl TangentApp {
                                 self.insert(seat, bay).is_some()
                             } =>
                         {
-                            self.bay_carry = Some((i.desk_index(), n, pos, false));
+                            // **In SEAT space, like every consumer.** The
+                            // carry was armed with the raw desk index and
+                            // slot while land/draw/CopyInsert all read a
+                            // seat - identical while channels had three
+                            // slots, wrong the frame the master's (and a
+                            // folder's) slots 3..5 became pressable. The
+                            // same resolution the arrangement's HdrBay arm
+                            // makes.
+                            let (seat, bay) = self.slot_seat(i, n);
+                            self.bay_carry = Some((seat, bay, pos, false));
                         }
                         Some(hit @ (crate::mixer_panel::Hit::Mute(_)
                         | crate::mixer_panel::Hit::Solo(_)
@@ -24983,6 +25265,11 @@ impl TangentApp {
                         // notice.
                         | crate::mixer_panel::Hit::ToTheory(_)
                         | crate::mixer_panel::Hit::Mono(_)
+                        // The THIRD instance of this class: polarity was
+                        // laid out, hit-tested, drawn lit - and a click on
+                        // it armed a doomed drag. See the T/Mono note above.
+                        | crate::mixer_panel::Hit::Phase(_)
+                        | crate::mixer_panel::Hit::Folder(_)
                         | crate::mixer_panel::Hit::FxMenu(..)
                         | crate::mixer_panel::Hit::InputChip(_)
                         // A door, not a fader: without this it fell through
@@ -34249,6 +34536,75 @@ mod tests {
         }
     }
 
+    /// **The empty band's big panels yield to the borderless drag.** The
+    /// press handler turns PickCamera into a window drag when the pane has
+    /// no picture (except its centre chip, which keeps picking) and
+    /// DismissClip into one while no clip is latched. This pins the
+    /// geography that translation relies on: the pane's corner IS a
+    /// PickCamera hit, the chip excludes it, and the chip's own centre
+    /// still picks.
+    #[test]
+    fn the_empty_camera_pane_is_mostly_window_handle() {
+        let (_ctx, app) = headless_with(Caps::DESKTOP, Settings::first_launch());
+        let w = main_width(&app.settings);
+        let band =
+            Rect::from_min_size(Pos2::ZERO, Vec2::new(w, recorder_panel::band_height(w)));
+        let view = app.recorder_layout_view();
+        assert!(view.preview.is_none(), "a fresh install grew a camera");
+        assert!(!view.meters.clipped, "a fresh install came up clipped");
+        let chip = recorder_panel::camera_chip(band, &view);
+        assert!(chip.is_positive(), "the empty pane lost its picker chip");
+        assert_eq!(
+            recorder_panel::hit_test(band, &view, chip.center()),
+            Some(recorder_panel::Hit::PickCamera),
+            "the chip's centre stopped picking"
+        );
+        // A point in the pane, left of the chip: a PickCamera hit the
+        // handler will hand to the window.
+        let corner = Pos2::new(chip.left() - chip.width() * 0.5, chip.center().y);
+        assert_eq!(
+            recorder_panel::hit_test(band, &view, corner),
+            Some(recorder_panel::Hit::PickCamera),
+            "the pane's corner is no longer the camera target - update the translation"
+        );
+        assert!(!chip.contains(corner), "the chip swallowed the corner");
+    }
+
+    /// **A controller chord reads at CONCERT PITCH, whatever the
+    /// transpose.** The owner's report: carry a placed chord up four with
+    /// the arrows, then play C major on the controller, and the band named
+    /// it from the wrong root. Live notes are never projected; the arrows
+    /// move only what was placed.
+    #[test]
+    fn a_controller_chord_reads_at_concert_pitch_whatever_the_transpose() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.keytoggle_enabled = true;
+        app.place_or_play(72);
+        app.clicked.clear();
+        let _ = run_frame(&ctx, &mut app);
+        for _ in 0..4 {
+            app.transpose_by(1);
+        }
+        assert_eq!(app.settings.transpose, 4);
+        assert!(
+            app.display_notes().contains(&76),
+            "the placed note was not carried: {:?}",
+            app.display_notes()
+        );
+        // Now the controller plays C major an octave down - and C major,
+        // from C, is what must light.
+        for n in [48u8, 52, 55] {
+            app.feed(crate::midi_event::MidiEvent::NoteOn { note: n, velocity: 100 });
+        }
+        let _ = run_frame(&ctx, &mut app);
+        let lit = app.display_notes();
+        assert_eq!(
+            lit,
+            [76u8, 48, 52, 55].into_iter().collect::<HashSet<u8>>(),
+            "the controller's chord was projected"
+        );
+    }
+
     /// The offset is bounded, or a held-down arrow key walks it somewhere a
     /// chord can never come back from.
     #[test]
@@ -35927,6 +36283,29 @@ mod folder_tests {
             0b11,
             "an older document lost the tracks it described"
         );
+    }
+
+    /// **New on a pristine scratch is a no-op.** The desktop's handler
+    /// returns before touching the disk when this answers true - no new
+    /// folder, and the name never advances. The three states it separates
+    /// are pinned here.
+    #[test]
+    fn new_is_a_noop_only_on_a_pristine_unnamed_session() {
+        let mut a = app();
+        a.undo_reset();
+        assert!(a.new_is_noop(), "a pristine scratch invites a rebuild");
+
+        // An edit makes New real again - there is something to hand over.
+        a.settings.master_gain = 0.3;
+        a.arr_save_edits();
+        assert!(!a.new_is_noop(), "unsaved work would be silently rebuilt");
+
+        // And a NAMED session always steps aside for a fresh scratch,
+        // clean or not.
+        a.undo_reset();
+        assert!(a.new_is_noop(), "the reset did not settle the session");
+        a.arrangement.named = true;
+        assert!(!a.new_is_noop(), "a kept session blocked New");
     }
 
     /// **Nothing is written until somebody says so, and leaving asks.**

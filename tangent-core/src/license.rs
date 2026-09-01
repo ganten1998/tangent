@@ -419,8 +419,29 @@ impl LicenseStore {
         }
     }
 
+    /// The Konami road, walked BACK: a paying supporter toggling the
+    /// corrupted heart off again. Only the marker moves - `license.key` is
+    /// never touched, and standing survives because the key carries it.
+    /// Best-effort on disk exactly like `unlock_cheat`: a failed delete
+    /// still relocks the running session.
+    pub fn relock_cheat(&mut self) {
+        self.cheat = false;
+        if let Some(dir) = self.path.parent() {
+            let _ = std::fs::remove_file(dir.join("cheat.unlock"));
+        }
+    }
+
+    /// A real key, verified - the Konami marker does not count here. This
+    /// is the question "may the code TOGGLE rather than brand": a buyer
+    /// wears the corruption at will, a keyless cheater keeps the mark.
+    pub fn licensed(&self) -> bool {
+        self.license
+            .as_ref()
+            .is_some_and(|l| l.tier >= TIER_SUPPORTER)
+    }
+
     /// Whether the cheat marker is what carries this install's standing -
-    /// the watcher stops listening once there is nothing left to unlock.
+    /// the code stays watched either way - for a supporter it is the SWITCH.
     pub fn cheated(&self) -> bool {
         self.cheat
     }
@@ -742,6 +763,31 @@ mod cheat_tests {
         assert!(again.is_supporter(), "the unlock did not survive a relaunch");
         assert_eq!(again.display_name(), Some("Cheater"));
         assert!(again.cheated());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A buyer's Konami is a switch; a keyless cheater's is a brand.**
+    /// `relock_cheat` walks the marker back off disk, in-session and across
+    /// a relaunch, and a keyless install relocked is simply free again.
+    #[test]
+    fn relock_walks_the_marker_back() {
+        let dir = std::env::temp_dir().join(format!("tangent-relock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key_path = dir.join("license.key");
+
+        let mut s = LicenseStore::load_from(&key_path);
+        assert!(!s.licensed(), "an empty dir counts as a real key");
+        s.unlock_cheat();
+        assert!(s.cheated() && dir.join("cheat.unlock").is_file());
+
+        s.relock_cheat();
+        assert!(!s.cheated(), "relock did not take in-session");
+        assert!(!s.is_supporter(), "keyless and relocked is still supporter");
+        assert!(!dir.join("cheat.unlock").exists(), "the marker survived relock");
+
+        let again = LicenseStore::load_from(&key_path);
+        assert!(!again.cheated() && !again.is_supporter(), "relock did not survive relaunch");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

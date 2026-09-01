@@ -3222,6 +3222,17 @@ pub fn hit_test(rect: Rect, view: &RecorderView<'_>, pos: Pos2) -> Option<Hit> {
         .map(|(r, k)| k.hit(r, pos))
 }
 
+/// The CENTRE of the camera pane — the part that still PICKS a camera
+/// while the pane is empty and the borderless drag owns the rest of it.
+/// A third each way, which is where the empty pane's own hint sits.
+pub fn camera_chip(rect: Rect, view: &RecorderView<'_>) -> Rect {
+    let l = Layout::new(rect, view);
+    if !l.preview.is_positive() {
+        return Rect::NOTHING;
+    }
+    Rect::from_center_size(l.preview.center(), l.preview.size() * 0.34)
+}
+
 /// The seek fraction a pointer at `pos` means, X ONLY.
 ///
 /// The scrub: once a press has landed on the timeline, the locate follows
@@ -4361,69 +4372,672 @@ fn toward(c: Color32, bg: Color32, t: f32) -> Color32 {
 /// mixer's strips have faces of their own, and a pendulum cut in the band's
 /// leather would print the wrong panel through the icon.
 /// A guitar leaning to the right: the waisted body as two lapped discs,
-/// the neck up at an angle, a squared headstock — the icon picker's second
-/// voice.
-pub(crate) fn draw_guitar(painter: &Painter, b: Rect, ink: Color32, bg: Color32) {
+/// the icon picker's table. Every glyph is proportional to `b` and drawn
+/// in `ink` with `bg` for the printed-through details, exactly as the
+/// microphone above.
+///
+/// **An ACOUSTIC guitar**: figure-8 body, sound hole, a pickguard dot -
+/// the dot and the narrow waist are what tell it from the nylon at
+/// sixteen points.
+pub(crate) fn draw_acoustic(painter: &Painter, b: Rect, ink: Color32, bg: Color32) {
     let s = b.width();
     let c = b.center();
-    // The body, low-left: two overlapping discs make the waist.
-    let lower = Pos2::new(c.x - s * 0.18, c.y + s * 0.20);
-    let upper = Pos2::new(c.x - s * 0.02, c.y + s * 0.06);
-    painter.circle_filled(lower, s * 0.24, ink);
-    painter.circle_filled(upper, s * 0.17, ink);
-    // The sound hole, printed in the panel's own face.
-    painter.circle_filled(Pos2::new(c.x - s * 0.10, c.y + s * 0.13), s * 0.07, bg);
-    // The neck, up-right, and its headstock.
+    let lower = Pos2::new(c.x - s * 0.16, c.y + s * 0.20);
+    let upper = Pos2::new(c.x - 0.02 * s, c.y + s * 0.02);
+    painter.circle_filled(lower, s * 0.25, ink);
+    painter.circle_filled(upper, s * 0.16, ink);
+    painter.circle_filled(Pos2::new(c.x - s * 0.09, c.y + s * 0.11), s * 0.075, bg);
+    // The pickguard, printed through.
+    painter.circle_filled(Pos2::new(c.x - s * 0.22, c.y + s * 0.24), s * 0.045, bg);
     let w = (s * 0.09).max(1.2);
     let nock = Pos2::new(c.x + s * 0.30, c.y - s * 0.26);
     painter.line_segment(
-        [Pos2::new(upper.x + s * 0.06, upper.y - s * 0.08), nock],
+        [Pos2::new(upper.x + s * 0.06, upper.y - s * 0.06), nock],
         Stroke::new(w, ink),
     );
     painter.rect_filled(
         Rect::from_center_size(
             Pos2::new(nock.x + s * 0.04, nock.y - s * 0.05),
-            Vec2::new(s * 0.14, s * 0.11),
+            Vec2::new(s * 0.13, s * 0.11),
         ),
         1.0,
         ink,
     );
 }
 
-/// A bass: one slim oblong body and a LONGER neck at a shallower angle —
-/// at sixteen pixels the silhouette difference from the guitar is the
-/// reach of that neck, and two fat string seams say the rest.
-pub(crate) fn draw_bass(painter: &Painter, b: Rect, ink: Color32, bg: Color32) {
+/// A NYLON (classical): the widest waist on the row, a slotted headstock
+/// (two printed-through slots) and the shortest neck.
+pub(crate) fn draw_nylon(painter: &Painter, b: Rect, ink: Color32, bg: Color32) {
     let s = b.width();
     let c = b.center();
-    let body = Pos2::new(c.x - s * 0.22, c.y + s * 0.22);
-    painter.circle_filled(body, s * 0.20, ink);
-    painter.circle_filled(Pos2::new(body.x + s * 0.10, body.y - s * 0.10), s * 0.14, ink);
-    // Two strings across the body, in the face colour.
-    for dy in [-0.02f32, 0.05] {
+    let lower = Pos2::new(c.x - s * 0.13, c.y + s * 0.19);
+    let upper = Pos2::new(c.x - s * 0.03, c.y - s * 0.01);
+    painter.circle_filled(lower, s * 0.27, ink);
+    painter.circle_filled(upper, s * 0.20, ink);
+    painter.circle_filled(Pos2::new(c.x - s * 0.07, c.y + s * 0.08), s * 0.08, bg);
+    let w = (s * 0.09).max(1.2);
+    let nock = Pos2::new(c.x + s * 0.26, c.y - s * 0.24);
+    painter.line_segment(
+        [Pos2::new(upper.x + s * 0.08, upper.y - s * 0.10), nock],
+        Stroke::new(w, ink),
+    );
+    let head = Rect::from_center_size(
+        Pos2::new(nock.x + s * 0.04, nock.y - s * 0.05),
+        Vec2::new(s * 0.15, s * 0.12),
+    );
+    painter.rect_filled(head, 1.0, ink);
+    // The slots.
+    for dx in [-0.03f32, 0.03] {
+        painter.rect_filled(
+            Rect::from_center_size(
+                Pos2::new(head.center().x + s * dx, head.center().y),
+                Vec2::new(s * 0.025, s * 0.07),
+            ),
+            0.5,
+            bg,
+        );
+    }
+}
+
+/// An ELECTRIC: a double-cutaway body - the printed-through notch between
+/// two horns IS the picture - no sound hole, two pickup seams.
+pub(crate) fn draw_electric(painter: &Painter, b: Rect, ink: Color32, bg: Color32) {
+    let s = b.width();
+    let c = b.center();
+    let body = Pos2::new(c.x - s * 0.14, c.y + s * 0.18);
+    painter.circle_filled(body, s * 0.21, ink);
+    painter.circle_filled(Pos2::new(body.x - s * 0.13, body.y - s * 0.15), s * 0.10, ink);
+    painter.circle_filled(Pos2::new(body.x + s * 0.11, body.y - s * 0.17), s * 0.10, ink);
+    // The notch between the horns, carved in the panel's own face.
+    painter.circle_filled(Pos2::new(body.x - s * 0.01, body.y - s * 0.22), s * 0.09, bg);
+    for dy in [0.02f32, 0.10] {
         painter.line_segment(
             [
-                Pos2::new(body.x - s * 0.14, body.y + s * dy),
-                Pos2::new(body.x + s * 0.16, body.y + s * dy - s * 0.08),
+                Pos2::new(body.x - s * 0.12, body.y + s * dy),
+                Pos2::new(body.x + s * 0.12, body.y + s * dy),
             ],
             Stroke::new((s * 0.035).max(1.0), bg),
         );
     }
-    // The long neck to the far corner, and a small square head.
     let w = (s * 0.085).max(1.2);
-    let nock = Pos2::new(c.x + s * 0.38, c.y - s * 0.32);
+    let nock = Pos2::new(c.x + s * 0.34, c.y - s * 0.30);
     painter.line_segment(
-        [Pos2::new(body.x + s * 0.12, body.y - s * 0.12), nock],
+        [Pos2::new(body.x + s * 0.14, body.y - s * 0.10), nock],
         Stroke::new(w, ink),
     );
     painter.rect_filled(
         Rect::from_center_size(
-            Pos2::new(nock.x + s * 0.02, nock.y - s * 0.04),
-            Vec2::new(s * 0.11, s * 0.11),
+            Pos2::new(nock.x + s * 0.03, nock.y - s * 0.04),
+            Vec2::new(s * 0.11, s * 0.10),
         ),
         1.0,
         ink,
     );
+}
+
+/// A BASS: the slimmest body and the LONGEST neck on the row, a big head
+/// with two printed-through tuners, one string seam the whole way.
+pub(crate) fn draw_bass(painter: &Painter, b: Rect, ink: Color32, bg: Color32) {
+    let s = b.width();
+    let c = b.center();
+    let body = Pos2::new(c.x - s * 0.20, c.y + s * 0.24);
+    painter.circle_filled(body, s * 0.17, ink);
+    painter.circle_filled(Pos2::new(body.x + s * 0.11, body.y - s * 0.11), s * 0.13, ink);
+    painter.line_segment(
+        [
+            Pos2::new(body.x - s * 0.11, body.y + s * 0.03),
+            Pos2::new(body.x + s * 0.15, body.y - s * 0.08),
+        ],
+        Stroke::new((s * 0.035).max(1.0), bg),
+    );
+    let w = (s * 0.085).max(1.2);
+    let nock = Pos2::new(c.x + s * 0.40, c.y - s * 0.34);
+    painter.line_segment(
+        [Pos2::new(body.x + s * 0.13, body.y - s * 0.13), nock],
+        Stroke::new(w, ink),
+    );
+    let head = Rect::from_center_size(
+        Pos2::new(nock.x + s * 0.02, nock.y - s * 0.03),
+        Vec2::new(s * 0.13, s * 0.12),
+    );
+    painter.rect_filled(head, 1.0, ink);
+    for dy in [-0.025f32, 0.025] {
+        painter.circle_filled(
+            Pos2::new(head.center().x, head.center().y + s * dy),
+            s * 0.02,
+            bg,
+        );
+    }
+}
+
+/// A SYNTH: a keyboard with a knob row - the knobs are what say "synth"
+/// where the plain keyboard badge says "MIDI".
+pub(crate) fn draw_synth(painter: &Painter, b: Rect, ink: Color32, bg: Color32) {
+    let _ = bg;
+    let s = b.width();
+    let w = (s * 0.07).max(1.0);
+    let body = Rect::from_center_size(
+        Pos2::new(b.center().x, b.center().y + s * 0.06),
+        Vec2::new(s * 0.92, s * 0.56),
+    );
+    painter.rect_stroke(body, 1.0, Stroke::new(w, ink), egui::StrokeKind::Inside);
+    let keys_top = body.top() + body.height() * 0.42;
+    painter.line_segment(
+        [Pos2::new(body.left(), keys_top), Pos2::new(body.right(), keys_top)],
+        Stroke::new(w, ink),
+    );
+    let key = body.width() / 4.0;
+    for i in 1..4 {
+        let x = body.left() + key * i as f32;
+        painter.line_segment(
+            [Pos2::new(x, keys_top), Pos2::new(x, body.bottom())],
+            Stroke::new(w, ink),
+        );
+    }
+    for i in 0..3 {
+        painter.circle_filled(
+            Pos2::new(body.left() + body.width() * (0.22 + 0.28 * i as f32), body.top() + body.height() * 0.20),
+            s * 0.035,
+            ink,
+        );
+    }
+}
+
+/// A CONDENSER: the studio slab - a tall capsule on a stem, grille lines
+/// printed through, a side-address dot. The handheld below leans; this
+/// one stands.
+pub(crate) fn draw_condenser(painter: &Painter, b: Rect, ink: Color32, bg: Color32) {
+    let s = b.width();
+    let c = b.center();
+    let body = Rect::from_center_size(
+        Pos2::new(c.x, c.y - s * 0.08),
+        Vec2::new(s * 0.36, s * 0.58),
+    );
+    painter.rect_filled(body, s * 0.13, ink);
+    for i in 0..2 {
+        let y = body.top() + s * (0.10 + 0.09 * i as f32);
+        painter.line_segment(
+            [Pos2::new(body.left() + s * 0.05, y), Pos2::new(body.right() - s * 0.05, y)],
+            Stroke::new((s * 0.03).max(1.0), bg),
+        );
+    }
+    painter.circle_filled(Pos2::new(c.x, c.y + s * 0.02), s * 0.05, bg);
+    let w = (s * 0.08).max(1.0);
+    painter.line_segment(
+        [Pos2::new(c.x, body.bottom()), Pos2::new(c.x, b.bottom() - s * 0.04)],
+        Stroke::new(w, ink),
+    );
+    painter.line_segment(
+        [
+            Pos2::new(c.x - s * 0.16, b.bottom() - s * 0.04),
+            Pos2::new(c.x + s * 0.16, b.bottom() - s * 0.04),
+        ],
+        Stroke::new(w, ink),
+    );
+}
+
+/// A DYNAMIC: the stage handheld at forty-five degrees - ball and
+/// tapering handle, nothing standing it up.
+pub(crate) fn draw_dynamic(painter: &Painter, b: Rect, ink: Color32, bg: Color32) {
+    let s = b.width();
+    let c = b.center();
+    let ball = Pos2::new(c.x - s * 0.16, c.y - s * 0.16);
+    painter.circle_filled(ball, s * 0.17, ink);
+    // Two grille seams printed through the ball.
+    for k in [-1.0f32, 1.0] {
+        painter.line_segment(
+            [
+                Pos2::new(ball.x - s * 0.10 * k, ball.y - s * 0.10),
+                Pos2::new(ball.x + s * 0.10 * k, ball.y + s * 0.10),
+            ],
+            Stroke::new((s * 0.028).max(1.0), bg),
+        );
+    }
+    painter.line_segment(
+        [
+            Pos2::new(c.x - s * 0.02, c.y - s * 0.02),
+            Pos2::new(c.x + s * 0.24, c.y + s * 0.24),
+        ],
+        Stroke::new((s * 0.15).max(1.5), ink),
+    );
+    painter.line_segment(
+        [
+            Pos2::new(c.x + s * 0.18, c.y + s * 0.18),
+            Pos2::new(c.x + s * 0.28, c.y + s * 0.28),
+        ],
+        Stroke::new((s * 0.10).max(1.2), ink),
+    );
+}
+
+/// A TRIANGLE: the open corner is the instrument - a closed outline reads
+/// as a warning sign. The striker hangs inside.
+pub(crate) fn draw_triangle_perc(painter: &Painter, b: Rect, ink: Color32, bg: Color32) {
+    let _ = bg;
+    let s = b.width();
+    let c = b.center();
+    let w = Stroke::new((s * 0.075).max(1.0), ink);
+    let apex = Pos2::new(c.x, c.y - s * 0.26);
+    let rb = Pos2::new(c.x + 0.26 * s, c.y + s * 0.18);
+    let lb = Pos2::new(c.x - 0.26 * s, c.y + s * 0.18);
+    painter.line_segment([apex, rb], w);
+    painter.line_segment([rb, Pos2::new(lb.x + s * 0.10, lb.y)], w);
+    // The open corner: the last side starts shy of the bottom-left.
+    painter.line_segment([Pos2::new(lb.x + s * 0.045, lb.y - s * 0.075), apex], w);
+    painter.line_segment(
+        [Pos2::new(c.x + s * 0.07, c.y - s * 0.08), Pos2::new(c.x + s * 0.12, c.y + s * 0.14)],
+        Stroke::new((s * 0.055).max(1.0), ink),
+    );
+}
+
+/// A GUIRO: a tilted gourd with its ridges, and the scraper crossing them.
+pub(crate) fn draw_guiro(painter: &Painter, b: Rect, ink: Color32, bg: Color32) {
+    let _ = bg;
+    let s = b.width();
+    let c = b.center();
+    let ang: f32 = -0.45;
+    let (cs, sn) = (ang.cos(), ang.sin());
+    let pt = |u: f32, v: f32| {
+        Pos2::new(c.x + (u * cs - v * sn) * s, c.y + (u * sn + v * cs) * s)
+    };
+    let ellipse: Vec<Pos2> = (0..=20)
+        .map(|i| {
+            let t = std::f32::consts::TAU * i as f32 / 20.0;
+            pt(0.30 * t.cos(), 0.15 * t.sin())
+        })
+        .collect();
+    painter.add(egui::Shape::line(ellipse, Stroke::new((s * 0.07).max(1.0), ink)));
+    for i in 0..4 {
+        let u = -0.12 + 0.08 * i as f32;
+        painter.line_segment(
+            [pt(u, -0.13), pt(u, 0.13)],
+            Stroke::new((s * 0.045).max(1.0), ink),
+        );
+    }
+    painter.line_segment(
+        [pt(0.10, -0.30), pt(0.34, -0.42)],
+        Stroke::new((s * 0.05).max(1.0), ink),
+    );
+}
+
+/// A TAMBOURINE: the ring and its jingles, face on.
+pub(crate) fn draw_tambourine(painter: &Painter, b: Rect, ink: Color32, bg: Color32) {
+    let _ = bg;
+    let s = b.width();
+    let c = b.center();
+    painter.circle_stroke(c, s * 0.28, Stroke::new((s * 0.085).max(1.0), ink));
+    for i in 0..6 {
+        let t = std::f32::consts::TAU * i as f32 / 6.0 + 0.35;
+        painter.circle_filled(
+            Pos2::new(c.x + s * 0.19 * t.cos(), c.y + s * 0.19 * t.sin()),
+            s * 0.035,
+            ink,
+        );
+    }
+}
+
+/// A SHAKER: a tilted capsule with motion beside it - the dashes are what
+/// keep it from reading as a pill.
+pub(crate) fn draw_shaker(painter: &Painter, b: Rect, ink: Color32, bg: Color32) {
+    let _ = bg;
+    let s = b.width();
+    let c = b.center();
+    let p1 = Pos2::new(c.x - s * 0.12, c.y + s * 0.16);
+    let p2 = Pos2::new(c.x + s * 0.08, c.y - s * 0.12);
+    painter.line_segment([p1, p2], Stroke::new((s * 0.24).max(2.0), ink));
+    painter.circle_filled(p1, s * 0.115, ink);
+    painter.circle_filled(p2, s * 0.115, ink);
+    for i in 0..2 {
+        let d = s * (0.06 + 0.09 * i as f32);
+        painter.line_segment(
+            [
+                Pos2::new(c.x + s * 0.20 + d * 0.4, c.y - s * 0.26 + d * 0.2),
+                Pos2::new(c.x + s * 0.26 + d * 0.4, c.y - s * 0.20 + d * 0.2),
+            ],
+            Stroke::new((s * 0.045).max(1.0), ink),
+        );
+    }
+}
+
+/// CLAVES: two sticks crossed - nothing else on the desk is a plain X,
+/// which is the point.
+pub(crate) fn draw_claves(painter: &Painter, b: Rect, ink: Color32, bg: Color32) {
+    let _ = bg;
+    let s = b.width();
+    let c = b.center();
+    let w = Stroke::new((s * 0.11).max(1.4), ink);
+    painter.line_segment(
+        [Pos2::new(c.x - s * 0.24, c.y + s * 0.20), Pos2::new(c.x + s * 0.16, c.y - s * 0.24)],
+        w,
+    );
+    painter.line_segment(
+        [Pos2::new(c.x - s * 0.16, c.y - s * 0.24), Pos2::new(c.x + s * 0.24, c.y + s * 0.20)],
+        w,
+    );
+}
+
+/// A CUICA: the drum seen from the side with the rod coming OUT of the
+/// head - the rod is the instrument.
+pub(crate) fn draw_cuica(painter: &Painter, b: Rect, ink: Color32, bg: Color32) {
+    let s = b.width();
+    let c = b.center();
+    let shell = Rect::from_center_size(
+        Pos2::new(c.x + s * 0.10, c.y),
+        Vec2::new(s * 0.34, s * 0.42),
+    );
+    painter.rect_filled(shell, s * 0.05, ink);
+    painter.circle_filled(Pos2::new(shell.left(), c.y), s * 0.13, ink);
+    painter.circle_filled(Pos2::new(shell.left(), c.y), s * 0.085, bg);
+    painter.line_segment(
+        [Pos2::new(shell.left(), c.y), Pos2::new(c.x - s * 0.34, c.y + s * 0.16)],
+        Stroke::new((s * 0.05).max(1.0), ink),
+    );
+    painter.circle_filled(Pos2::new(c.x - s * 0.34, c.y + s * 0.16), s * 0.045, ink);
+}
+
+/// A VIBRASLAP: ball, bent shaft, rattling wedge - the silhouette nobody
+/// mistakes once they have held one.
+pub(crate) fn draw_vibraslap(painter: &Painter, b: Rect, ink: Color32, bg: Color32) {
+    let _ = bg;
+    let s = b.width();
+    let c = b.center();
+    let ball = Pos2::new(c.x - s * 0.18, c.y + s * 0.20);
+    painter.circle_filled(ball, s * 0.11, ink);
+    let arc: Vec<Pos2> = (0..=8)
+        .map(|i| {
+            let t = i as f32 / 8.0;
+            // A shallow bend from the ball up to the wedge.
+            Pos2::new(
+                c.x + s * (-0.18 + 0.34 * t),
+                c.y + s * (0.20 - 0.42 * t - 0.10 * (std::f32::consts::PI * t).sin()),
+            )
+        })
+        .collect();
+    painter.add(egui::Shape::line(arc, Stroke::new((s * 0.07).max(1.0), ink)));
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            Pos2::new(c.x + s * 0.08, c.y - s * 0.28),
+            Pos2::new(c.x + s * 0.30, c.y - s * 0.16),
+            Pos2::new(c.x + s * 0.10, c.y - s * 0.04),
+        ],
+        ink,
+        Stroke::NONE,
+    ));
+}
+
+/// DRUM BRUSHES: one handle, a fan of wires.
+pub(crate) fn draw_brushes(painter: &Painter, b: Rect, ink: Color32, bg: Color32) {
+    let _ = bg;
+    let s = b.width();
+    let c = b.center();
+    let hinge = Pos2::new(c.x - s * 0.06, c.y + s * 0.06);
+    painter.line_segment(
+        [Pos2::new(c.x - s * 0.26, c.y + s * 0.26), hinge],
+        Stroke::new((s * 0.13).max(1.4), ink),
+    );
+    for (u, v) in [(0.28, -0.20), (0.31, -0.08), (0.30, 0.04), (0.24, 0.15), (0.15, 0.22)] {
+        painter.line_segment(
+            [hinge, Pos2::new(c.x + s * u, c.y + s * v)],
+            Stroke::new((s * 0.04).max(1.0), ink),
+        );
+    }
+}
+
+/// The SAXOPHONE family, one body plan by size. `voice` 0..=3 is
+/// soprano, alto, tenor, baritone: the soprano is the straight one, the
+/// alto and tenor curl (the tenor taller, with the bent neck), and the
+/// baritone wears the extra LOOP - which is how four horns stay four
+/// pictures at sixteen points.
+pub(crate) fn draw_sax(painter: &Painter, b: Rect, ink: Color32, bg: Color32, voice: u8) {
+    let s = b.width();
+    let c = b.center();
+    let w = Stroke::new((s * 0.11).max(1.3), ink);
+    if voice == 0 {
+        // Soprano: a straight taper with a small flare.
+        painter.line_segment(
+            [Pos2::new(c.x - s * 0.18, c.y - s * 0.24), Pos2::new(c.x + s * 0.14, c.y + s * 0.20)],
+            w,
+        );
+        painter.circle_filled(Pos2::new(c.x + s * 0.18, c.y + s * 0.25), s * 0.075, ink);
+        for t in [0.30f32, 0.50, 0.70] {
+            painter.circle_filled(
+                Pos2::new(
+                    c.x - s * 0.18 + s * 0.32 * t,
+                    c.y - s * 0.24 + s * 0.44 * t,
+                ),
+                s * 0.028,
+                bg,
+            );
+        }
+        return;
+    }
+    // The curled three: a vertical tube, a bell curling up-left, keys
+    // printed through. Taller and wider as the voice deepens.
+    let (top, bot, bell_x, bell_r) = match voice {
+        1 => (-0.20f32, 0.12f32, -0.12f32, 0.075f32),
+        2 => (-0.26, 0.16, -0.16, 0.09),
+        _ => (-0.16, 0.18, -0.18, 0.10),
+    };
+    let tube_x = c.x + s * 0.08;
+    painter.line_segment(
+        [Pos2::new(tube_x, c.y + s * top), Pos2::new(tube_x, c.y + s * bot)],
+        w,
+    );
+    let arc: Vec<Pos2> = (0..=8)
+        .map(|i| {
+            let t = std::f32::consts::PI * i as f32 / 8.0;
+            Pos2::new(
+                tube_x + (bell_x * s + (tube_x - (tube_x + bell_x * s))) * 0.0
+                    + (s * bell_x * 0.5) * (1.0 - t.cos()),
+                c.y + s * bot + s * 0.10 * t.sin(),
+            )
+        })
+        .collect();
+    painter.add(egui::Shape::line(arc, w));
+    painter.circle_filled(
+        Pos2::new(tube_x + s * bell_x, c.y + s * (bot - 0.04)),
+        s * bell_r,
+        ink,
+    );
+    // The neck: alto bends a little, tenor dips, bari wears the loop.
+    match voice {
+        1 => {
+            painter.line_segment(
+                [Pos2::new(tube_x, c.y + s * top), Pos2::new(tube_x - s * 0.12, c.y + s * (top - 0.07))],
+                w,
+            );
+        }
+        2 => {
+            painter.line_segment(
+                [Pos2::new(tube_x, c.y + s * top), Pos2::new(tube_x - s * 0.07, c.y + s * (top - 0.09))],
+                w,
+            );
+            painter.line_segment(
+                [
+                    Pos2::new(tube_x - s * 0.07, c.y + s * (top - 0.09)),
+                    Pos2::new(tube_x - s * 0.18, c.y + s * (top - 0.05)),
+                ],
+                w,
+            );
+        }
+        _ => {
+            painter.circle_stroke(
+                Pos2::new(tube_x - s * 0.02, c.y + s * (top - 0.09)),
+                s * 0.095,
+                Stroke::new((s * 0.085).max(1.2), ink),
+            );
+        }
+    }
+    for t in [0.30f32, 0.55, 0.80] {
+        painter.circle_filled(
+            Pos2::new(tube_x, c.y + s * (top + (bot - top) * t)),
+            s * 0.028,
+            bg,
+        );
+    }
+}
+
+/// A MELODICA: the keyboard bar with its mouthpiece - the tube on the end
+/// is what says "blown", against every other keyboard on the row.
+pub(crate) fn draw_melodica(painter: &Painter, b: Rect, ink: Color32, bg: Color32) {
+    let _ = bg;
+    let s = b.width();
+    let c = b.center();
+    let w = (s * 0.065).max(1.0);
+    let body = Rect::from_center_size(
+        Pos2::new(c.x + s * 0.06, c.y + s * 0.02),
+        Vec2::new(s * 0.72, s * 0.32),
+    );
+    painter.rect_stroke(body, 1.5, Stroke::new(w, ink), egui::StrokeKind::Inside);
+    let key = body.width() / 5.0;
+    for i in 1..5 {
+        let x = body.left() + key * i as f32;
+        painter.line_segment(
+            [Pos2::new(x, body.center().y), Pos2::new(x, body.bottom())],
+            Stroke::new(w, ink),
+        );
+    }
+    painter.line_segment(
+        [
+            Pos2::new(body.left(), body.top() + s * 0.04),
+            Pos2::new(body.left() - s * 0.14, body.top() - s * 0.12),
+        ],
+        Stroke::new((s * 0.075).max(1.0), ink),
+    );
+    painter.circle_filled(
+        Pos2::new(body.left() - s * 0.16, body.top() - s * 0.14),
+        s * 0.05,
+        ink,
+    );
+}
+
+/// An AMP: the box, the speaker, the knob row.
+pub(crate) fn draw_amp(painter: &Painter, b: Rect, ink: Color32, bg: Color32) {
+    let _ = bg;
+    let s = b.width();
+    let c = b.center();
+    let w = (s * 0.07).max(1.0);
+    let box_ = Rect::from_center_size(c, Vec2::new(s * 0.78, s * 0.64));
+    painter.rect_stroke(box_, 2.0, Stroke::new(w, ink), egui::StrokeKind::Inside);
+    painter.circle_stroke(
+        Pos2::new(c.x, c.y + s * 0.09),
+        s * 0.16,
+        Stroke::new(w, ink),
+    );
+    painter.circle_filled(Pos2::new(c.x, c.y + s * 0.09), s * 0.045, ink);
+    for i in 0..3 {
+        painter.circle_filled(
+            Pos2::new(c.x - s * 0.20 + s * 0.20 * i as f32, box_.top() + s * 0.10),
+            s * 0.032,
+            ink,
+        );
+    }
+}
+
+/// A CABLE: the quarter-inch jack and its lead curling away - LINE IN.
+pub(crate) fn draw_cable(painter: &Painter, b: Rect, ink: Color32, bg: Color32) {
+    let _ = bg;
+    let s = b.width();
+    let c = b.center();
+    // The tip, a small wedge up-left.
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            Pos2::new(c.x - s * 0.30, c.y - s * 0.30),
+            Pos2::new(c.x - s * 0.18, c.y - s * 0.26),
+            Pos2::new(c.x - s * 0.26, c.y - s * 0.18),
+        ],
+        ink,
+        Stroke::NONE,
+    ));
+    painter.line_segment(
+        [Pos2::new(c.x - s * 0.22, c.y - s * 0.22), Pos2::new(c.x - s * 0.06, c.y - s * 0.06)],
+        Stroke::new((s * 0.11).max(1.3), ink),
+    );
+    painter.line_segment(
+        [Pos2::new(c.x - s * 0.08, c.y - s * 0.08), Pos2::new(c.x + s * 0.02, c.y + s * 0.02)],
+        Stroke::new((s * 0.17).max(1.6), ink),
+    );
+    let lead: Vec<Pos2> = [
+        (0.02f32, 0.02f32),
+        (0.16, 0.12),
+        (0.24, 0.24),
+        (0.14, 0.32),
+        (-0.02, 0.30),
+        (-0.10, 0.22),
+    ]
+    .iter()
+    .map(|(u, v)| Pos2::new(c.x + s * u, c.y + s * v))
+    .collect();
+    painter.add(egui::Shape::line(lead, Stroke::new((s * 0.055).max(1.0), ink)));
+}
+
+/// **Every pickable badge**: the settings byte and the name the picker
+/// shows. APPEND-ONLY - the code is saved in desks and documents, so a
+/// reordered table would re-badge every session ever saved. 0 is "auto":
+/// the channel's KIND draws (keyboard, microphone, waveform).
+pub const ICONS: &[(u8, &str)] = &[
+    (0, "auto"),
+    (1, "drum"),
+    (2, "acoustic"),
+    (3, "bass"),
+    (4, "electric"),
+    (5, "nylon"),
+    (6, "synth"),
+    (7, "condenser"),
+    (8, "dynamic"),
+    (9, "triangle"),
+    (10, "guiro"),
+    (11, "tambourine"),
+    (12, "shaker"),
+    (13, "claves"),
+    (14, "cuica"),
+    (15, "vibraslap"),
+    (16, "brushes"),
+    (17, "soprano sax"),
+    (18, "alto sax"),
+    (19, "tenor sax"),
+    (20, "bari sax"),
+    (21, "wave"),
+    (22, "melodica"),
+    (23, "amp"),
+    (24, "line in"),
+];
+
+/// The highest badge code. What the clamp on loaded desks answers to.
+pub const ICON_MAX: u8 = 24;
+
+/// **Draw badge `code`.** Answers false for 0 and for anything unknown,
+/// so the caller can fall back to the kind's own icon - one dispatch, so
+/// the mixer, the arrangement and the picker can never disagree about
+/// what a code looks like.
+pub(crate) fn draw_badge(painter: &Painter, b: Rect, ink: Color32, bg: Color32, code: u8) -> bool {
+    match code {
+        1 => draw_drum(painter, b, ink, bg),
+        2 => draw_acoustic(painter, b, ink, bg),
+        3 => draw_bass(painter, b, ink, bg),
+        4 => draw_electric(painter, b, ink, bg),
+        5 => draw_nylon(painter, b, ink, bg),
+        6 => draw_synth(painter, b, ink, bg),
+        7 => draw_condenser(painter, b, ink, bg),
+        8 => draw_dynamic(painter, b, ink, bg),
+        9 => draw_triangle_perc(painter, b, ink, bg),
+        10 => draw_guiro(painter, b, ink, bg),
+        11 => draw_tambourine(painter, b, ink, bg),
+        12 => draw_shaker(painter, b, ink, bg),
+        13 => draw_claves(painter, b, ink, bg),
+        14 => draw_cuica(painter, b, ink, bg),
+        15 => draw_vibraslap(painter, b, ink, bg),
+        16 => draw_brushes(painter, b, ink, bg),
+        17 => draw_sax(painter, b, ink, bg, 0),
+        18 => draw_sax(painter, b, ink, bg, 1),
+        19 => draw_sax(painter, b, ink, bg, 2),
+        20 => draw_sax(painter, b, ink, bg, 3),
+        21 => draw_waveform_icon(painter, b, ink),
+        22 => draw_melodica(painter, b, ink, bg),
+        23 => draw_amp(painter, b, ink, bg),
+        24 => draw_cable(painter, b, ink, bg),
+        _ => return false,
+    }
+    true
 }
 
 /// A drum from the side, seen a little from above — the shell as a squat
@@ -6773,6 +7387,40 @@ fn painter_border(painter: &Painter, rect: Rect) {
 
 #[cfg(test)]
 mod tests {
+    /// **The badge table is dense, unique, and every code draws.** The
+    /// picker iterates `ICONS` and the strips dispatch on the code; a code
+    /// that vanished or collided would re-badge every saved session.
+    #[test]
+    fn every_badge_code_is_dense_and_draws() {
+        use super::{draw_badge, ICONS, ICON_MAX};
+        use egui::{Color32, Pos2, Rect, Vec2};
+        assert_eq!(ICONS.len(), usize::from(ICON_MAX) + 1, "the table and the max drifted");
+        for (i, (code, name)) in ICONS.iter().enumerate() {
+            assert_eq!(usize::from(*code), i, "{name} is out of place");
+            assert!(!name.is_empty(), "code {code} has no name");
+        }
+        let ctx = egui::Context::default();
+        ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let b = Rect::from_min_size(Pos2::ZERO, Vec2::splat(20.0));
+                assert!(
+                    !draw_badge(ui.painter(), b, Color32::BLACK, Color32::WHITE, 0),
+                    "auto claimed a picture - the kind draws it"
+                );
+                for code in 1..=ICON_MAX {
+                    assert!(
+                        draw_badge(ui.painter(), b, Color32::BLACK, Color32::WHITE, code),
+                        "code {code} has no picture"
+                    );
+                }
+                assert!(
+                    !draw_badge(ui.painter(), b, Color32::BLACK, Color32::WHITE, ICON_MAX + 1),
+                    "an unknown code claimed a picture"
+                );
+            });
+        });
+    }
+
     /// **A maximised window gets a shorter band, and the scope gets the room.**
     ///
     /// The owner: at 100 percent "the app feels perfect visually", but

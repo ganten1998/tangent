@@ -2710,14 +2710,22 @@ impl DesktopApp {
         if let Some(order) = self.app.take_desk_state_perm() {
             // **Only the rows this permutation touches.** See
             // `save_plugin_states_as_loaded_for`.
-            let mut moved = vec![false; tangent_ui::recorder::STRIPS + 1];
+            let mut moved = vec![false; tangent_ui::recorder::TOTAL_SEATS];
             for (new, old) in order.iter().enumerate() {
                 if new != *old {
-                    if let Some(m) = moved.get_mut(new) {
-                        *m = true;
-                    }
-                    if let Some(m) = moved.get_mut(*old) {
-                        *m = true;
+                    // The channel row, and its folder-extra seat - the
+                    // second rack travels with the track, so its state
+                    // must be written down before the move like the
+                    // first one's.
+                    for seat in [
+                        new,
+                        *old,
+                        tangent_ui::recorder::folder_extra_seat(new),
+                        tangent_ui::recorder::folder_extra_seat(*old),
+                    ] {
+                        if let Some(m) = moved.get_mut(seat) {
+                            *m = true;
+                        }
                     }
                 }
             }
@@ -2738,15 +2746,19 @@ impl DesktopApp {
             // The host's own copy of what sits in each seat travels too, or
             // the reconcile below compares the new seat against the old
             // seat's plugin and reloads everything it just carried.
-            permute_loaded_rows(&mut self.recorder.inserts_loaded, &order);
+            // The channel order lifted onto the whole seat space, so each
+            // folder-extra seat follows its channel through every copy of
+            // the per-seat state - see `recorder::seat_order`.
+            let full = tangent_ui::recorder::seat_order(&order);
+            permute_loaded_rows(&mut self.recorder.inserts_loaded, &full);
             self.save_plugin_states_as_loaded_for(Some(&moved));
             permute_insert_states_in(
                 insert_state_path(0, 0)
                     .parent()
                     .map(std::path::Path::to_path_buf),
-                &order,
+                &full,
             );
-            permute_insert_states_in(self.project_state_dir(), &order);
+            permute_insert_states_in(self.project_state_dir(), &full);
             // **Only the rows that MOVED**, which is why this is not
             // `force_insert_reload`.
             //
@@ -4211,7 +4223,7 @@ impl DesktopApp {
                 }
             }
         }
-        // The app adds the rows, saves, and marks the clips dirty — which is
+        // The app adds the rows and marks the clips dirty — which is
         // what makes `reload_clips` push the new schedule and the new sound.
         self.app.add_recorded_clips(out);
     }
@@ -5093,6 +5105,28 @@ impl DesktopApp {
                 // nothing ever saved over it.
                 let template = self.templates_dir().join("default");
                 self.app.seed_template(&template);
+                // **New on a pristine scratch is a NO-OP.** The session on
+                // the desk already IS what New would hand back: unnamed,
+                // untouched since it was opened, and byte-identical to the
+                // template on disk (the same test launch uses, so an
+                // unnamed-but-SAVED session with real work in it still gets
+                // its fresh scratch). Rebuilding it churned the folder every
+                // press, and before the save-back below was gated on dirt it
+                // minted an abandoned "Untitled N" each time - the owner's
+                // "'new' is making a new 'untitled' session every single
+                // time". No changes: no new folder, and the name never
+                // advances.
+                if !asked && self.app.new_is_noop() {
+                    let pristine = self
+                        .app
+                        .project_doc()
+                        .and_then(std::path::Path::parent)
+                        .map(|d| launch_reclaimable(d, &template))
+                        .unwrap_or(false);
+                    if pristine {
+                        return;
+                    }
+                }
                 let root = self.app.project_root();
                 // The scratch rule: an Untitled nobody SAVED is reclaimed,
                 // so New lands on "Untitled" instead of minting a pile.
@@ -5202,7 +5236,10 @@ impl DesktopApp {
             return;
         };
         let _ = std::fs::create_dir_all(&dir);
-        for strip in 0..tangent_ui::recorder::STRIPS + 1 + tangent_ui::recorder::DRUM_PADS {
+        // EVERY seat - the master's second rack and the folder-extra seats
+        // were both invisible to the old STRIPS+1+DRUM_PADS bound, so a
+        // project carried neither. See the seat-space doc in recorder.rs.
+        for strip in 0..tangent_ui::recorder::TOTAL_SEATS {
             for bay in 0..tangent_ui::recorder::INSERTS {
                 let global = insert_state_path(strip, bay);
                 let mine = dir.join(format!("insert-state-{strip}-{bay}.bin"));
@@ -5222,7 +5259,7 @@ impl DesktopApp {
         let Some(dir) = self.project_state_dir() else {
             return;
         };
-        for strip in 0..tangent_ui::recorder::STRIPS + 1 + tangent_ui::recorder::DRUM_PADS {
+        for strip in 0..tangent_ui::recorder::TOTAL_SEATS {
             for bay in 0..tangent_ui::recorder::INSERTS {
                 let global = insert_state_path(strip, bay);
                 let mine = dir.join(format!("insert-state-{strip}-{bay}.bin"));
@@ -5244,7 +5281,7 @@ impl DesktopApp {
     /// plugin, state and bays are all exactly where they were.
     fn force_insert_reload_for(&mut self, order: &[usize]) {
         let marks = reload_slots_for_loaded(
-            order,
+            &tangent_ui::recorder::seat_order(order),
             tangent_ui::recorder::INSERTS,
             &self.recorder.inserts_loaded,
         );
@@ -5265,9 +5302,24 @@ impl DesktopApp {
     /// states, the new one arrives with its own — instruments included.
     fn switch_project(&mut self, doc: &std::path::Path) {
         // The old session first, while it is still the one on the desk.
+        //
+        // **The plugin states go UNCONDITIONALLY** - a knob turned in a
+        // plugin's own window never dirties the document (the snapshot
+        // stores bundle names, not their insides), and quitting shelves
+        // them regardless, so a switch that skipped them would lose what a
+        // quit keeps. Writing `state/` cannot strand a scratch either: the
+        // reclaim compares only `project.tangent` and the takes.
+        //
+        // **The DOCUMENT answers to dirt.** The unconditional save-back
+        // re-serialized even a pristine clone with the live desk's
+        // defaults, so its bytes stopped matching the template and the
+        // reclaim stopped recognising its own scratch: one abandoned
+        // "Untitled N" per New, forever.
         self.save_plugin_states();
         self.copy_states_to_project();
-        self.app.save_project_doc();
+        if self.app.project_dirty() {
+            self.app.save_project_doc();
+        }
         self.app.open_project(doc);
         // `open_project` applied the document's desk when it carried one;
         // the flag says so, and the states follow the desk.
@@ -5732,7 +5784,12 @@ impl DesktopApp {
     }
 
     fn save_plugin_states(&mut self) {
-        for strip in 0..tangent_ui::recorder::STRIPS + 1 + tangent_ui::recorder::DRUM_PADS {
+        // EVERY seat. The old STRIPS+1+DRUM_PADS bound predates the
+        // master's second rack and the folder-extra seats, so a plugin
+        // dialed in on any of those never got a sidecar and came back at
+        // its defaults - while the project-copy loops below had already
+        // been taught the full space and were copying stale files.
+        for strip in 0..tangent_ui::recorder::TOTAL_SEATS {
             for bay in 0..tangent_ui::recorder::INSERTS {
                 let Some(bundle) = self.app.insert(strip, bay).map(str::to_owned) else {
                     continue;
