@@ -79,6 +79,13 @@ mod record;
 /// which a Minimal build has.
 #[cfg(feature = "recorder")]
 mod transport;
+/// Standalone DSP kernels for the coming plugin suite: compiled and tested
+/// here long before any panel can reach them, because a kernel that must
+/// wait for its UI to exist before it can be proven is a kernel that never
+/// gets proven. Nothing links to these yet — the `allow` goes with the first
+/// wiring.
+#[allow(dead_code)]
+mod units;
 
 /// Every plugin the picker should offer: VST3 bundles, and LV2 where there is
 /// an LV2 world to ask.
