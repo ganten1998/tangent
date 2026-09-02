@@ -352,6 +352,19 @@ pub enum Dialog {
         input_channels: u16,
         /// The inputs of it the picker is offering as rows of their own.
         exposed: Vec<(u16, Option<u16>)>,
+        /// Whether an ordinary take still reports itself when it finishes.
+        ///
+        /// **A setting with no switch is worse than no setting.** The tick
+        /// that wrote this lived on the take summary, which was a modal box
+        /// and is a four-second notification now; the box went and took the
+        /// tick with it, leaving `Settings::show_take_summary` read on every
+        /// take and reachable by nobody — so anybody who had ever turned the
+        /// report off was stuck with it off, for good. It is here because
+        /// this panel is where the recording path is configured and because
+        /// a switch about takes belongs with the device that makes them.
+        /// Snapshotted at open like everything else here but `status`; the
+        /// only writer is `DialogAction::SetShowTakeSummary`.
+        take_summary: bool,
         /// **The interface's short name**, or empty for its real one.
         ///
         /// It lives HERE, beside the device it renames, and not on the mixer
@@ -908,15 +921,16 @@ pub enum DialogAction {
         identifier: String,
         host: String,
     },
-    /// Persist the take summary's "don't show again" choice.
+    /// Persist the take summary's "report every take" choice.
     ///
-    /// **Kept although its tick is gone**, because the CHOICE is not. The tick
-    /// lived on the take summary, which was a modal box with one OK
-    /// button and is a notification now; the setting behind it is still read
-    /// on every take and still obeyed, so this is the one remaining way to
-    /// write it and removing it would strand somebody who had already turned
-    /// the report off. Where the switch should live instead is the owner's
-    /// call — see `Settings::show_take_summary`.
+    /// **Its tick went out with the modal box and now has a home again.** The
+    /// take summary was a dialog with a "Don't show this again" checkbox in
+    /// it; the report is a four-second notification now and the box is gone,
+    /// which left this action with no caller outside a test and the setting
+    /// behind it readable but unwritable — a switch somebody had already
+    /// thrown and could never throw back. The switch is in Setup, under
+    /// REPORTS, beside the device the takes are recorded from. See
+    /// `Settings::show_take_summary`.
     SetShowTakeSummary(bool),
     /// Frames per audio callback, or `None` for the device's own default.
     /// Applies to both streams and reopens them.
@@ -3094,10 +3108,6 @@ fn visible_patches(voices: &[String], filter: &str) -> Vec<usize> {
 /// one id serves them all and the window keeps its place between dialogs.
 const DIALOG_ID: &str = "ivory-dialog";
 
-/// The notice window's own identity, kept apart from [`DIALOG_ID`] so a notice
-/// and a dialog can be on screen at once.
-const NOTICE_ID: &str = "ivory-notice";
-
 pub fn color_pick_title(target: ColorTarget) -> &'static str {
     match target {
         ColorTarget::WhiteIdle => "Choose White Key Color",
@@ -3768,18 +3778,17 @@ fn export_geometry(ctx: &egui::Context, placement: Placement) -> (Vec2, Option<P
 /// waveform would be an invisible question with the app frozen behind it,
 /// which is worse than the covering. See [`crate::shell::SurfaceTier`].
 ///
-/// **What that costs the band's notice, said plainly.** A message raised
-/// during a render — a camera warming up, a device gone — is an
-/// announcement, so it loses, and the two windows are both centred on the
-/// main window with this one the bigger: on the desktop it is behind this
-/// window and in practice entirely hidden by it. It is not dismissed and it
-/// is not destroyed. `show_notice` is called from the message the recorder
-/// is still holding, it takes no focus and hears no Escape while it is
-/// behind, and `App::notice_dismissed` only latches when somebody actually
-/// presses Close — so the notice is still there, still saying the same
-/// thing, the moment the render ends and this window goes. A message that
-/// arrives and is gone again before the export finishes is the one case
-/// nobody sees, and that is a message the recorder itself withdrew.
+/// **What that used to cost the band's notice, and no longer does.** A
+/// message raised during a render — a camera warming up, a device gone — was
+/// a window of its own, an announcement, so it lost the ladder; and since
+/// both windows were centred on the main window with this one the bigger, it
+/// was not merely behind but entirely hidden. That window is gone. Everything
+/// the app SAYS is now `crate::notify`'s column, painted inside the main
+/// window on `Order::Foreground`, which is not in this ladder at all and
+/// cannot lose to anything in it: it is over the desk, this window floats
+/// over the desk beside it, and neither can hide the other. The z-order fight
+/// a message could not win is a fight it no longer enters — which is the
+/// reason that module exists, and is written up in its own header.
 ///
 /// # Checking the z-order by hand
 ///
@@ -3794,10 +3803,13 @@ fn export_geometry(ctx: &egui::Context, placement: Placement) -> (Vec2, Option<P
 ///    the desk, with the waveform drawing itself left to right.
 /// 2. **Drag it aside.** It stays where it is put, for the whole render, and
 ///    does not walk back to the middle when the main window is moved.
-/// 3. **An announcement loses.** With the render running, do something that
-///    raises the band's notice (starting the camera is the easy one). The
-///    notice does NOT come out in front of the waveform. End the render:
-///    the notice is still there, unchanged, and its Close button works.
+/// 3. **A message does not fight this window any more.** With the render
+///    running, do something that says something (starting the camera is the
+///    easy one). It appears in the notification column in the top-left corner
+///    of the main window, NOT as a window, and it neither covers the waveform
+///    nor is covered by it. Move the export window over the column: the
+///    column is inside the main window, so the export window passes in front
+///    of it, and the message is still there when the render ends.
 /// 4. **A question wins.** With the render still running, open Setup from
 ///    the menu. Setup comes to the FRONT of the export window. Click in it,
 ///    type in it, change a device: it responds. The waveform is still
@@ -3813,9 +3825,10 @@ fn export_geometry(ctx: &egui::Context, placement: Placement) -> (Vec2, Option<P
 ///    over the piano and the recorder band, the canvas behind it is NOT
 ///    dimmed (it is reporting, not asking), a click on the window's face
 ///    does not operate a control underneath it, a message raised mid-render
-///    stays behind it, and a dialog opened from the menu paints OVER it and
-///    can be used — including its dropdowns and its hover text, which is
-///    what keeps a question in the band its own popups are drawn in.
+///    appears in the corner column rather than as a second window, and a
+///    dialog opened from the menu paints OVER it and can be used — including
+///    its dropdowns and its hover text, which is what keeps a question in the
+///    band its own popups are drawn in.
 /// 7a. **The raw-pointer hole, now closed.** Inline, `shell` swallows what
 ///    lands on a surface at egui's hit test, which covers every widget and
 ///    the main background's own response. The handlers that read `i.pointer`
@@ -3967,77 +3980,6 @@ pub fn show_export_progress(
             painter.rect_filled(filled, 1.0, t.text);
         }
     });
-}
-
-/// The band's message, as its own window. Returns true when the user closed it.
-///
-/// **The one window in this file that is NOT modal, and that is the whole
-/// reason it is not a `Dialog`.**
-///
-/// These messages replaced the status line that used to run along the foot of
-/// the record band. Some of them are transient and arrive while the user is in
-/// the middle of something — "starting the camera - this can take a few
-/// seconds" is the clearest case — and every `Dialog` here is modal, because
-/// `handle_main_interaction` drops every event while one is up. Routing a
-/// camera warm-up through that machinery would have frozen the app for the
-/// several seconds it takes a USB webcam to wake, with a window on screen
-/// saying, accurately, that it was starting.
-///
-/// So this one takes its own surface id, does not take focus, does not dim
-/// what is behind it, and does not block a thing. It also does not steal the
-/// dialog slot: a notice arriving while the export window is open leaves the
-/// export window exactly where it was.
-///
-/// **And it LOSES to the export window, on purpose.** A notice announces; a
-/// render is being watched; the ladder in [`crate::shell::SurfaceTier`] says
-/// the announcement goes underneath. Both windows are centred on the main
-/// window and this one is the smaller, so during a render it is not merely
-/// behind but in practice completely hidden — which is the honest cost of
-/// the rule and is written down here so nobody has to rediscover it from a
-/// screenshot.
-///
-/// It is not lost, though. Nothing here dismisses it: the text comes from
-/// the message the recorder is still holding, `takes_focus: false` means it
-/// never hears the Escape that would close it, and the caller only latches
-/// `notice_dismissed` when Close is actually pressed. So the notice is still
-/// on screen, still saying the same thing, the moment the render ends and
-/// the export window goes.
-pub fn show_notice(ctx: &egui::Context, placement: Placement, text: &str) -> bool {
-    let inline = !placement.caps.child_windows;
-    let size = Vec2::new(460.0, 168.0);
-    let mut closed = false;
-    let spec = crate::shell::SurfaceSpec {
-        id: NOTICE_ID,
-        title: "Tangent",
-        size,
-        min_size: Vec2::new(280.0, 120.0),
-        pos: placement.position_for(size),
-        decorated: true,
-        resizable: true,
-        // **Not focus-taking**, or a message arriving mid-edit would move the
-        // caret out of whatever field somebody was typing in.
-        takes_focus: false,
-        modal: false,
-        on_top: !placement.native_panel_up,
-        window_type: Some(egui::X11WindowType::Dialog),
-        ..Default::default()
-    };
-    let report = crate::shell::surface(ctx, placement.caps, &spec, &mut |ui, want_close| {
-        if inline {
-            ui.painter()
-                .rect_filled(ui.max_rect(), 4.0, ui.style().visuals.window_fill);
-        }
-        ui.add_space(8.0);
-        ui.label(RichText::new(text));
-        ui.add_space(12.0);
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui.button("  Close  ").clicked() {
-                closed = true;
-                *want_close = true;
-            }
-        });
-    });
-    closed || report.close
 }
 
 // ── the IR wizard's four pages ──────────────────────────────────────────────
@@ -5951,6 +5893,7 @@ pub fn show(
             exposed,
             alias,
             output_path,
+            take_summary,
         } => {
             let t = theme(face);
             show_dialog_viewport(
@@ -6462,6 +6405,44 @@ pub fn show(
                                 )
                                 .font(plain(10.0))
                                 .color(dim),
+                            );
+
+                            ui.add_space(10.0);
+
+                            // ── the take report ──────────────────────────────
+                            //
+                            // **The switch that came back.** It used to be a
+                            // "Don't show this again" tick on the take summary
+                            // itself, which was a modal box; the report is a
+                            // notification in the corner now and the box is
+                            // gone, so for a while the setting was read on
+                            // every take and writable by nobody — anyone who
+                            // had turned the report off was stuck with it off.
+                            // It is here because this is the panel about the
+                            // recording path, and a take is what that path
+                            // makes.
+                            //
+                            // Phrased the POSITIVE way round, unlike the tick
+                            // it replaces: "don't show this again" made sense
+                            // on a box you were reading, and makes none in a
+                            // list of settings, where every other row says
+                            // what it turns on.
+                            ui.label(RichText::new("REPORTS").font(bold(11.0)).color(t.text));
+                            if ui
+                                .checkbox(
+                                    take_summary,
+                                    RichText::new("Say what each take produced")
+                                        .font(plain(11.0))
+                                        .color(t.text),
+                                )
+                                .changed()
+                            {
+                                action = Some(DialogAction::SetShowTakeSummary(*take_summary));
+                            }
+                            ui.label(
+                                RichText::new("a take with a PROBLEM says so either way")
+                                    .font(plain(10.0))
+                                    .color(dim),
                             );
                                 });
 
@@ -10949,13 +10930,6 @@ at: None,
         );
     }
 
-    /// **The Audio Status panel fits the longest line it can produce.**
-    ///
-    /// Its content is generated, not fixed — device names, rates, a warning —
-    /// so the thing to measure is the widest line it could ever draw. A panel
-    /// whose rate line runs under the buffer buttons is one nobody can read the
-    /// number off, which is its entire job.
-    #[test]
     /// The maker name is the one string on the audio panel that comes from
     /// OUTSIDE, so the clip that bounds it is worth its own test — including
     /// the accented case, which a byte slice would panic on.
@@ -10978,6 +10952,23 @@ at: None,
         assert!(accented.starts_with(cut.trim_end_matches('\u{2026}')));
     }
 
+    /// **The Audio Status panel fits the longest line it can produce.**
+    ///
+    /// Its content is generated, not fixed — device names, rates, a warning —
+    /// so the thing to measure is the widest line it could ever draw. A panel
+    /// whose rate line runs under the buffer buttons is one nobody can read the
+    /// number off, which is its entire job.
+    ///
+    /// **It only started measuring anything today.** Its `#[test]` had drifted
+    /// up above the maker-name test's own doc comment, so that function
+    /// carried two attributes — legal, and it simply ran twice — while this
+    /// one was a plain function nothing called. Every doc in this file that
+    /// says the width is measured rather than hoped for was hoping. The
+    /// attribute is back where it belongs, and the budget it enforces turns
+    /// out to have been kept all along. The trap leaves no trace of itself: a
+    /// doubly-attributed test is not an error, and an orphaned function in a
+    /// test module is not either.
+    #[test]
     fn the_audio_status_card_fits_its_own_text() {
         let ctx = egui::Context::default();
         fonts::install(&ctx, fonts::FontChoice::default(), None);
@@ -11017,6 +11008,11 @@ at: None,
             "M".repeat(MAKER_MAX),
             "another app is between the mix and the hardware".to_owned(),
             "Output is an aggregate device".to_owned(),
+            // The take report's block, which is the switch that came back
+            // from the modal box: a heading, a checkbox and its caption.
+            "REPORTS".to_owned(),
+            "Say what each take produced".to_owned(),
+            "a take with a PROBLEM says so either way".to_owned(),
         ];
         let mut widest = 0.0_f32;
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
@@ -11025,13 +11021,13 @@ at: None,
                     // The warning and the headings are bold; the readings are
                     // not. Measured at the size each is actually drawn.
                     let (size, family) = match i {
-                        2 | 3 | 4 => (11.0, fonts::courier_bold()),
+                        2 | 3 | 4 | 19 => (11.0, fonts::courier_bold()),
                         // The captions and the small print, at 10.
                         5..=13 => (10.0, fonts::courier()),
                         // The output-path block: its heading is bold at 11
                         // and everything under it is small print at 10.
                         15 => (11.0, fonts::courier_bold()),
-                        14 | 16..=18 => (10.0, fonts::courier()),
+                        14 | 16..=18 | 21 => (10.0, fonts::courier()),
                         _ => (11.0, fonts::courier()),
                     };
                     let g = ui.painter().layout_no_wrap(
@@ -11039,7 +11035,16 @@ at: None,
                         FontId::new(size, family),
                         Color32::WHITE,
                     );
-                    widest = widest.max(g.rect.width());
+                    // **A checkbox is wider than its words.** The tick box and
+                    // the gap after it are drawn from the same budget as the
+                    // label, so a measurement of the label alone would say a
+                    // row fits that does not. Only row 20 is one.
+                    let furniture = if i == 20 {
+                        ui.spacing().icon_width + ui.spacing().icon_spacing
+                    } else {
+                        0.0
+                    };
+                    widest = widest.max(g.rect.width() + furniture);
                 }
             });
         });
@@ -12380,88 +12385,6 @@ at: None,
             level(EXPORT_ID),
             Some(egui::WindowLevel::AlwaysOnTop),
             "the render never recovered from the question"
-        );
-    }
-
-    /// **A message raised mid-render loses, and is not lost.**
-    ///
-    /// Under the ladder a notice is an announcement and the render outranks
-    /// it, so during an export the notice window is behind — and since both
-    /// are centred on the same parent and this one is the smaller, behind
-    /// means hidden. That is the honest cost of the rule and it is written
-    /// down on `show_notice`.
-    ///
-    /// What must NOT happen is the notice going away. Nothing here dismisses
-    /// it: it takes no focus so it never hears an Escape, it is redrawn from
-    /// the message the recorder is still holding, and it reports "closed"
-    /// only when its own Close is pressed. So it is still there, unchanged,
-    /// when the render ends — which is what this runs enough frames to say.
-    #[test]
-    fn a_message_raised_during_a_render_is_covered_and_not_destroyed() {
-        let ctx = egui::Context::default();
-        fonts::install(&ctx, fonts::FontChoice::default(), None);
-        fonts::apply_text_styles(&ctx);
-        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0));
-        let placement = Placement {
-            at: None,
-            native_panel_up: false,
-            raise: false,
-            parent: None,
-            monitor: Some(screen.size()),
-            caps: crate::host::Caps::PLUGIN,
-            chrome: None,
-        };
-        let p = crate::ports::ExportProgress {
-            fraction: 0.25,
-            label: "Rendering".to_owned(),
-            peaks: vec![(-0.3, 0.3); 8],
-        };
-        let text = "Starting the camera - this can take a few seconds";
-        // Ten frames of a render with a message up, in the order `App::
-        // update` draws them: the message first, the export window after.
-        let mut closed_ever = false;
-        let mut top = None;
-        for _ in 0..10 {
-            let _ = ctx.run(
-                egui::RawInput {
-                    screen_rect: Some(screen),
-                    ..Default::default()
-                },
-                |ctx| {
-                    closed_ever |= show_notice(ctx, placement, text);
-                    show_export_progress(ctx, &p, placement);
-                    top = ctx.layer_id_at(screen.center());
-                },
-            );
-        }
-        assert!(
-            !closed_ever,
-            "the notice reported itself closed while it was merely covered —              the message would have been dismissed with nobody asked"
-        );
-        assert_eq!(
-            top.map(|l| l.id),
-            Some(egui::Id::new(EXPORT_ID)),
-            "the message came out in front of the render after all"
-        );
-        // The render ends. The message is still drawn, still not closed, and
-        // now it is the thing on top — it was never destroyed, only covered.
-        for _ in 0..3 {
-            let _ = ctx.run(
-                egui::RawInput {
-                    screen_rect: Some(screen),
-                    ..Default::default()
-                },
-                |ctx| {
-                    closed_ever |= show_notice(ctx, placement, text);
-                    top = ctx.layer_id_at(screen.center());
-                },
-            );
-        }
-        assert!(!closed_ever, "the notice closed itself when the render ended");
-        assert_eq!(
-            top.map(|l| l.id),
-            Some(egui::Id::new(NOTICE_ID)),
-            "the message did not come back when the render ended"
         );
     }
 
