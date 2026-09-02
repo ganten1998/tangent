@@ -10,6 +10,8 @@ pub mod a11y;
 pub mod app;
 /// Automation curves: a control's value written down as a shape over time.
 pub mod automation;
+/// The busy overlay: what covers a mid-session stall, and says what it is.
+pub mod busy;
 pub mod chord_strip;
 pub mod dialogs;
 pub mod face;
