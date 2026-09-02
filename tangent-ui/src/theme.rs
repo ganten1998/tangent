@@ -622,8 +622,27 @@ pub fn factory() -> Vec<Theme> {
             background: c(0xd8, 0xd8, 0xd8),
             white_key: c(0xd8, 0xd8, 0xd8),
             black_key: c(0x14, 0x14, 0x14),
-            key_active: c(0xf0, 0xf0, 0xf0),
-            sustain: c(0x90, 0x90, 0x90),
+            // **Grey, and the one grey that works.** The owner's rule for
+            // Mono's keys: zero chroma for the struck and the held alike, no
+            // exceptions. That leaves one dial, lightness, with three gates
+            // pulling on it. The struck key must clear the band (0x3c) at
+            // 3:1 and carry its own note name at 4.5:1 — the DARK ink, which
+            // means sitting above the 0.12–0.22 dead zone where neither ink
+            // clears — and both of those push it lighter; against the 0xd8
+            // naturals every step lighter is a step toward the 0xf0 that
+            // shipped and vanished at 1.23:1. 0x88 is the lowest grey that
+            // clears both gates with a margin (3.1:1 on the band, 4.9:1
+            // under the ink) and so reads as well as any grey can on the
+            // naturals, 2.5:1, while standing 5.2:1 off the sharps. One
+            // value paints both key colours, so it is a balance point and
+            // not a taste.
+            key_active: c(0x88, 0x88, 0x88),
+            // The held key goes the other way, BELOW the dead zone, so it
+            // takes the light ink (5.7:1) and stands 2.2:1 from the struck
+            // grey: a held note and a struck one told apart by weight, which
+            // is all a monochrome has. 5.5:1 on the naturals, 2.4:1 on the
+            // sharps.
+            sustain: c(0x52, 0x52, 0x52),
             key_separator: c(0x3a, 0x3a, 0x3a),
             text: c(0xe0, 0xe0, 0xe0),
             theory_line: c(0x5a, 0x5a, 0x5a),
@@ -980,17 +999,24 @@ pub fn factory() -> Vec<Theme> {
             channel_palette: Some(15),
             dark: dark_of(&[("background", (0x19, 0x10, 0x26))]),
         },
-        // ── the dark three. Sixteen light themes and not one dark one was
+        // ── the dark two. Sixteen light themes and not one dark one was
         // the audit's finding, so these carry the ground itself dark — which
         // makes the naturals dark and the sharps darker, the way every dark
         // instrument panel reads. Each grew from values already living here
-        // rather than invented: Carbon is Default's own dark constants
-        // promoted to a theme, Nocturne is Navi's night side worn in light
+        // rather than invented: Nocturne is Navi's night side worn in light
         // mode, Phosphor is the console green the scope always implied.
         // Designed and gated by `scripts/palgen.py --dark` BEFORE this Rust
         // existed; the factory-loop tests below are the second lock.
         //
-        // **These three NAME their own dark keyboard, and they are the only
+        // There were three. Carbon — Default's own dark constants promoted
+        // to a theme — was retired by the owner as a worse version of
+        // Studio. It left by NAME: a saved `theme_name` of "Carbon" falls
+        // back to Default, its palette bytes stay in `STRIP_COLORS` for
+        // every desk that painted a track with them, and only `PALETTES`
+        // closed the gap, so Nocturne and Phosphor point one lower without
+        // a byte of theirs moving.
+        //
+        // **These two NAME their own dark keyboard, and they are the only
         // themes that must.** In dark mode `piano::idle_colors` SWAPS the
         // keys — naturals take the sharps' colour and sharps the naturals' —
         // so a light theme's ivory white key becomes the bright sharp that
@@ -1008,41 +1034,6 @@ pub fn factory() -> Vec<Theme> {
         // lock. `dark.background` still equals `black_key`, the theory-ground
         // rule the sweep beside it checks.
         //
-        // ── Carbon: Default inverted. Warm near-black, bone ink, embers.
-        Theme {
-            name: "Carbon".to_owned(),
-            background: c(0x1a, 0x1a, 0x1a),
-            white_key: c(0x1a, 0x1a, 0x1a),
-            black_key: c(0x0d, 0x0d, 0x0d),
-            key_active: c(0xff, 0x9d, 0x4d),
-            sustain: c(0xd4, 0x70, 0x8c),
-            key_separator: c(0x38, 0x34, 0x2c),
-            text: c(0xe8, 0xdc, 0xc0),
-            theory_line: c(0x56, 0x50, 0x44),
-            interval_text: c(0xb8, 0xac, 0x90),
-            recorder_bg: c(0x4a, 0x35, 0x27),
-            // Amber and not the bone the ink uses: the varispeed wears the
-            // bone, and the test that keeps them apart wants 25 dE.
-            fx_knob: c(0xd0, 0x98, 0x5a),
-            master_knob: c(0xff, 0x3b, 0x5c),
-            varispeed: c(0xe8, 0xdc, 0xc0),
-            velocity_loud: c(0xff, 0x70, 0x50),
-            velocity_quiet: c(0x3a, 0xa8, 0xa0),
-            meter_bg: c(0x0b, 0x0e, 0x0a),
-            scope_draw: c(0xa3, 0xe0, 0x48),
-            fx_strip: c(0x30, 0x24, 0x1b),
-            input_chip: c(0x8a, 0xb0, 0x60),
-            fretboard: c(0x0d, 0x0d, 0x0d),
-            string: c(0x8a, 0x7f, 0x6a),
-            channel_palette: Some(16),
-            // A warm dark keyboard that survives the dark-mode swap: naturals
-            // a warm graphite legible on the 0x0d ground, sharps a step down.
-            dark: dark_of(&[
-                ("background", (0x0d, 0x0d, 0x0d)),
-                ("white_key", (0x58, 0x53, 0x4a)),
-                ("black_key", (0x2c, 0x28, 0x23)),
-            ]),
-        },
         // ── Nocturne: Navi's night side, worn as the light-mode dress. The
         // periwinkle and cyan are the same values the Navi theme carries,
         // already proven against these very surfaces.
@@ -1069,7 +1060,7 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x55, 0x78, 0xff),
             fretboard: c(0x06, 0x12, 0x24),
             string: c(0x78, 0x98, 0xb8),
-            channel_palette: Some(17),
+            channel_palette: Some(16),
             // Navy naturals bright enough to read on the 0x06 ground, sharps
             // a deeper blue below them.
             dark: dark_of(&[
@@ -1103,7 +1094,7 @@ pub fn factory() -> Vec<Theme> {
             input_chip: c(0x6f, 0xae, 0x3f),
             fretboard: c(0x05, 0x07, 0x05),
             string: c(0x6a, 0x80, 0x60),
-            channel_palette: Some(18),
+            channel_palette: Some(17),
             // Phosphor-green naturals lifted off the 0x05 ground, sharps a
             // darker green below them.
             dark: dark_of(&[
@@ -1111,6 +1102,57 @@ pub fn factory() -> Vec<Theme> {
                 ("white_key", (0x4e, 0x5a, 0x40)),
                 ("black_key", (0x1e, 0x28, 0x17)),
             ]),
+        },
+        // ── Silverface: the Dual Showman Reverb's faceplate. The DAW grew
+        // a Fender amp built from the actual AA769 schematic, and this is
+        // the panel that amp wears: brushed aluminum for the ground and the
+        // naturals, the black control panel for the band, Fender turquoise
+        // script for what sounds, blue-sparkle grille cloth for what is
+        // held, and the red jewel pilot lamp on the master — the one thing
+        // on the panel that glows. Nickel-wound strings on the fretboard.
+        // A LIGHT theme, so dark mode is the standard swap onto the
+        // blackface panel and it names only its ground.
+        //
+        // The turquoise is deeper on the real panel (#18808f) and could not
+        // be here: at luminance 0.176 it sits in the dead zone — 2.94:1 on
+        // the band and 3.75:1 under its own note name, failing both sweeps
+        // at once. Lifted to the lowest turquoise that clears both (3.8:1
+        // on the band, 4.8:1 under the dark ink), which keeps the most a
+        // lit key can have against aluminum naturals. Designed and gated by
+        // `scripts/palgen.py --dark`, its desk by `--silverface`.
+        Theme {
+            name: "Silverface".to_owned(),
+            background: c(0xc9, 0xcd, 0xd2),
+            white_key: c(0xc9, 0xcd, 0xd2),
+            black_key: c(0x1b, 0x1d, 0x20),
+            key_active: c(0x1b, 0x94, 0xa6),
+            sustain: c(0x3b, 0x5a, 0x8c),
+            key_separator: c(0x3a, 0x3e, 0x44),
+            text: c(0xd8, 0xde, 0xe6),
+            theory_line: c(0x8a, 0x90, 0x99),
+            interval_text: c(0x9f, 0xb3, 0xc4),
+            recorder_bg: c(0x2a, 0x2e, 0x33),
+            fx_knob: c(0x3f, 0xb8, 0xc9),
+            master_knob: c(0xe0, 0x48, 0x3a),
+            varispeed: c(0xd8, 0xde, 0xe6),
+            // Solved by `scripts/velgen.py`'s solver against this theme's
+            // own roll, hot 12° / cool 190° — the jewel's glow and the
+            // script's turquoise. The panel's deeper pair (#e86048/#3f8fa0)
+            // read 5:1 on the light roll and 2.7:1/2.4:1 on the dark one,
+            // where the well is lifted a fifth toward white: a mark drawn
+            // on that roll has to be BRIGHTER than the panel's paint, not
+            // deeper, so both ends came up until they clear 3:1 in both
+            // modes without the painter's push.
+            velocity_loud: c(0xff, 0x78, 0x57),
+            velocity_quiet: c(0x1d, 0xaf, 0xcd),
+            meter_bg: c(0x14, 0x16, 0x1a),
+            scope_draw: c(0x64, 0xd8, 0xe8),
+            fx_strip: c(0x1f, 0x22, 0x26),
+            input_chip: c(0x8a, 0xa0, 0xb8),
+            fretboard: c(0x14, 0x16, 0x1a),
+            string: c(0x8a, 0x90, 0x99),
+            channel_palette: Some(18),
+            dark: dark_of(&[("background", (0x1b, 0x1d, 0x20))]),
         },
     ]
 }
@@ -1242,7 +1284,7 @@ pub const EXAMPLE: &str = r##"{
   "_comment8": "4 Mono        5 Studio      6 Aurora      7 Sandstone",
   "_comment9": "8 Centennial  9 Blueprint  10 Porcelain  11 Moss",
   "_comment10": "12 Rhodes    13 Copper    14 Dusk       15 Iris",
-  "_comment10b": "16 Carbon    17 Nocturne  18 Phosphor",
+  "_comment10b": "16 Nocturne  17 Phosphor  18 Silverface",
   "_comment11": "It only takes effect while the track menu's palette is on AUTO;",
   "_comment12": "a palette picked by hand there outlives any theme. Leave it out",
   "_comment13": "and the channels keep dressing for whichever theme is applied.",
@@ -1270,7 +1312,11 @@ mod tests {
     #[test]
     fn the_factory_set_is_sixteen_themes_with_default_first() {
         let f = factory();
-        assert_eq!(f.len(), 19, "Default, fifteen more, and the dark three");
+        assert_eq!(
+            f.len(),
+            19,
+            "Default, fifteen more, the dark two, and Silverface"
+        );
         assert_eq!(f[0].name, "Default");
         // **Default RESTORES rather than declining to speak.** A theme that
         // set nothing left whatever the last theme wrote, so picking Default
