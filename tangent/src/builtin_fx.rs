@@ -2144,22 +2144,37 @@ mod tests {
             .collect();
         let input = vec![mono.clone(), mono];
         let spec = spec_for(TAPE_PATH).unwrap();
-        // Drive at the bottom, trim 0.5 unity, every colour off — the
-        // kernel's own neutral recipe. The drive used to read 0.5 here and
-        // was only neutral by accident; it is a record level, and a record
-        // level's off is the end of its travel (`units::tape::DRIVE_TANH`).
-        let mut unit = spec.create(sr, &[0.0, 0.0, 0.0, 0.0, 0.0, 0.5]);
-        let mut out = vec![vec![0.0f32; frames]; 2];
-        unit.process(&input, frames, &mut out);
         let rms = |v: &[f32]| {
             (v.iter().map(|s| f64::from(*s) * f64::from(*s)).sum::<f64>() / v.len() as f64).sqrt()
         };
         // Steady state only: past the envelope settling and the line fill.
         let (lo, hi) = ((sr * 0.25) as usize, (sr * 1.15) as usize);
-        let delta = 20.0 * (rms(&out[0][lo..hi]) / rms(&input[0][lo..hi])).log10();
+        let at = |drive: f32| {
+            let mut unit = spec.create(sr, &[drive, 0.0, 0.0, 0.0, 0.0, 0.5]);
+            let mut out = vec![vec![0.0f32; frames]; 2];
+            unit.process(&input, frames, &mut out);
+            20.0 * (rms(&out[0][lo..hi]) / rms(&input[0][lo..hi])).log10()
+        };
+
+        // Drive at the bottom, trim 0.5 unity, every colour off — the
+        // kernel's own neutral recipe. The drive used to read 0.5 here and
+        // was only neutral by accident; it is a record level, and a record
+        // level's off is the end of its travel (`units::tape::DRIVE_TANH`).
+        let off = at(0.0);
         assert!(
-            delta.abs() < 0.1,
-            "neutral tape moved the broadband level by {delta:.3} dB through the adapter"
+            off.abs() < 0.1,
+            "neutral tape moved the broadband level by {off:.3} dB through the adapter"
+        );
+        // **And at the drive every new bay opens at.** Moving this guard to
+        // the bottom of the travel was right and it also left the SHIPPED
+        // position unwatched, which is how a record level that gave away
+        // 11.8 dB at the top of its travel reached the seat. See
+        // `units::tape::sat_makeup`.
+        let shipped = at(spec.defaults()[0]);
+        assert!(
+            shipped.abs() < 0.4,
+            "the shipped tape moved the broadband level by {shipped:.3} dB \
+             through the adapter"
         );
     }
 
@@ -2559,7 +2574,7 @@ mod tests {
     fn stereo_program(frames: usize) -> Vec<Vec<f32>> {
         let mut a = 0x51DE_0001_u32;
         let mut b = 0x51DE_0002_u32;
-        let mut step = |s: &mut u32| {
+        let step = |s: &mut u32| {
             *s ^= *s << 13;
             *s ^= *s >> 17;
             *s ^= *s << 5;
@@ -2670,6 +2685,7 @@ mod tests {
     /// the other two must bite.
     #[test]
     fn one_microphone_through_the_imager_seat_answers_the_ensemble() {
+        use crate::units::imager::{ensemble_law, ensemble_trim};
         const FRAMES: usize = 24_000;
         const SKIP: usize = 2_400;
         let program = microphone_program(FRAMES);
@@ -2709,14 +2725,21 @@ mod tests {
              {:.1} dB",
             divergence_db(&rest, &widened, SKIP)
         );
-        // And what it made is genuine side, not a level change: the mono
-        // fold is untouched to the bit the kernel promises.
+        // And what it made is genuine side, not a level change: the mono fold
+        // is the mid it was handed, times the one trim both channels took —
+        // and nothing else, to the bit. See `units::imager::ensemble_trim`:
+        // an ensemble adds decorrelated power and the trim takes that power
+        // back out of the pair, so the fold arrives scaled and never altered.
+        // A hole in the mono fold is the one failure this whole unit exists
+        // to make impossible, and a scalar cannot hide one.
+        let trim = ensemble_trim(ensemble_law(1.0));
         for f in 0..FRAMES {
-            let before = 0.5 * (program[0][f] + program[1][f]);
+            let before = 0.5 * (program[0][f] + program[1][f]) * trim;
             let after = 0.5 * (widened[0][f] + widened[1][f]);
             assert!(
                 (before - after).abs() < 1.0e-6,
-                "the ensemble moved the mono fold at frame {f}: {before} -> {after}"
+                "the ensemble put something other than the mid in the mono \
+                 fold at frame {f}: {before} -> {after}"
             );
         }
 
