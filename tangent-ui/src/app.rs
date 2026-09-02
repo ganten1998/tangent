@@ -376,6 +376,13 @@ pub struct TangentApp {
     /// Per strip, what each of its three bays offers an automation lane.
     /// Pushed by the host — see [`Self::set_fx_params`].
     fx_params: std::collections::HashMap<usize, [crate::ports::FxParams; crate::recorder::INSERTS]>,
+    /// Per (SEAT, bay), a loaded built-in effect's spec and current values.
+    /// Pushed by the host on load/change ([`Self::set_builtin_face`]),
+    /// mirrored optimistically by a local drag ([`Self::set_insert_param`]).
+    builtin_faces: std::collections::HashMap<(usize, usize), crate::ports::BuiltinFace>,
+    /// Per (SEAT, bay), the built-in compressor's gain-reduction meter in
+    /// positive dB — forwarded each frame by the host for open faces.
+    insert_gr: std::collections::HashMap<(usize, usize), f32>,
     arr_auto_params: std::collections::HashMap<usize, crate::automation::AutoParam>,
     /// The point under the pointer or being dragged: `(lane, index)`.
     arr_auto_hot: Option<(usize, usize)>,
@@ -2373,6 +2380,8 @@ impl TangentApp {
             arr_auto_armed: std::collections::HashSet::new(),
             arr_auto_bypassed: std::collections::HashSet::new(),
             fx_params: std::collections::HashMap::new(),
+            builtin_faces: std::collections::HashMap::new(),
+            insert_gr: std::collections::HashMap::new(),
             arr_auto_params: std::collections::HashMap::new(),
             arr_auto_hot: None,
             arr_auto_sel: None,
@@ -18106,6 +18115,63 @@ impl TangentApp {
             .get(&strip)
             .and_then(|bays| bays.get(bay))
             .filter(|b| !b.params.is_empty())
+    }
+
+    /// **A built-in bay's face data, pushed by the host** on load and on any
+    /// change of tenant — the `set_fx_params` precedent with values. An
+    /// empty face (no path, no params) CLEARS the entry: the bay unloaded,
+    /// or holds a plugin whose window is the engine's business.
+    pub fn set_builtin_face(&mut self, face: crate::ports::BuiltinFace) {
+        let key = (face.strip, face.slot);
+        if face.path.is_empty() && face.params.is_empty() {
+            self.builtin_faces.remove(&key);
+            self.insert_gr.remove(&key);
+        } else {
+            self.builtin_faces.insert(key, face);
+        }
+    }
+
+    /// The face data for one bay, by SEAT and bay — what a knob panel reads.
+    pub fn builtin_face(&self, strip: usize, slot: usize) -> Option<&crate::ports::BuiltinFace> {
+        self.builtin_faces.get(&(strip, slot))
+    }
+
+    /// **Turn one knob on a built-in bay.** Queues the request the host
+    /// forwards to the engine, and mirrors the value into the local face
+    /// first — optimistically, so the knob under the pointer never waits a
+    /// frame to show its own drag. The engine-side ledger remains the
+    /// durable truth; the next `set_builtin_face` push overwrites this
+    /// mirror with it, and the two agree unless the engine refused the value
+    /// (out-of-range id), in which case the refusal shows by the knob
+    /// snapping back.
+    pub fn set_insert_param(&mut self, strip: usize, slot: usize, id: u32, value: f32) {
+        let value = if value.is_finite() { value.clamp(0.0, 1.0) } else { return };
+        if let Some(face) = self.builtin_faces.get_mut(&(strip, slot)) {
+            if let Some(p) = face.params.iter_mut().find(|p| p.id == id) {
+                p.value = value;
+            }
+        }
+        self.request_recorder(crate::recorder::RecorderRequest::SetInsertParam {
+            strip,
+            slot,
+            id,
+            value,
+        });
+    }
+
+    /// The compressor face's meter for one bay, forwarded per frame by the
+    /// host — positive dB of gain reduction, already max-held over the
+    /// frame's blocks on the engine side.
+    pub fn set_insert_gr(&mut self, strip: usize, slot: usize, gr_db: f32) {
+        if gr_db.is_finite() && gr_db >= 0.0 {
+            self.insert_gr.insert((strip, slot), gr_db);
+        }
+    }
+
+    /// What the meter reads for one bay right now; 0.0 where nothing is
+    /// compressing or nothing is loaded.
+    pub fn insert_gr(&self, strip: usize, slot: usize) -> f32 {
+        self.insert_gr.get(&(strip, slot)).copied().unwrap_or(0.0)
     }
 
     /// Step a named parameter to the next value in its list, and wrap.

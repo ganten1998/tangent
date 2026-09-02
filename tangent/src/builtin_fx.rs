@@ -34,6 +34,15 @@
 /// somebody has installed — `dialogs::is_builtin` recognises it unedited.
 pub const TRIM_PATH: &str = "@tangent-trim";
 
+/// The suite the trim proved the road for: the four kernels under
+/// `crate::units`, each seated by its own sentinel. Same naming law as
+/// [`TRIM_PATH`]; the strings are persisted into every document that loads
+/// one, so they are as append-only as the param ids below.
+pub const EQ_PATH: &str = "@tangent-eq";
+pub const IMAGER_PATH: &str = "@tangent-imager";
+pub const TAPE_PATH: &str = "@tangent-tape";
+pub const COMP_PATH: &str = "@tangent-comp";
+
 /// One parameter a unit publishes: what the automation lane, the state blob
 /// and (one day) a knob panel all address it by.
 ///
@@ -81,17 +90,133 @@ const TRIM_PARAMS: &[ParamSpec] = &[ParamSpec {
     steps: 0,
 }];
 
+/// The EQ face's slice of the kernel: three bands of the eight
+/// `units::eq::EqKernel` carries, five knobs each — on, shape, frequency,
+/// gain, width. Ids run dense from 0 in band-major order, which is what lets
+/// `EqUnit::set_param` decode them by division instead of a lookup; both
+/// spaces are persisted, so bands four to eight, when a bigger face wants
+/// them, take ids 15 upward and never renumber these.
+///
+/// Defaults are the kernel's shipped sound — every band OFF, gain centred,
+/// width at Butterworth — except the frequency parking spots: the kernel's
+/// own default spreads eight handles log-evenly as a ruler, and the first
+/// three rungs of an eight-rung ruler are all in the bass. Three handles get
+/// the three-handle version of the same idea: low, mid, high, at the quarter
+/// points of the sweep (about 112 Hz, 632 Hz and 3.6 kHz).
+const EQ_FACE_PARAMS: &[ParamSpec] = &[
+    ParamSpec { id: 0, symbol: "b1_on", name: "Band 1 On", units: "", default: 0.0, steps: 2 },
+    ParamSpec { id: 1, symbol: "b1_kind", name: "Band 1 Type", units: "", default: 0.0, steps: EQ_KIND_STEPS },
+    ParamSpec { id: 2, symbol: "b1_freq", name: "Band 1 Freq", units: "Hz", default: 0.25, steps: 0 },
+    ParamSpec { id: 3, symbol: "b1_gain", name: "Band 1 Gain", units: "dB", default: 0.5, steps: 0 },
+    ParamSpec { id: 4, symbol: "b1_q", name: "Band 1 Q", units: "", default: crate::units::eq::EQ_Q_BUTTERWORTH, steps: 0 },
+    ParamSpec { id: 5, symbol: "b2_on", name: "Band 2 On", units: "", default: 0.0, steps: 2 },
+    ParamSpec { id: 6, symbol: "b2_kind", name: "Band 2 Type", units: "", default: 0.0, steps: EQ_KIND_STEPS },
+    ParamSpec { id: 7, symbol: "b2_freq", name: "Band 2 Freq", units: "Hz", default: 0.5, steps: 0 },
+    ParamSpec { id: 8, symbol: "b2_gain", name: "Band 2 Gain", units: "dB", default: 0.5, steps: 0 },
+    ParamSpec { id: 9, symbol: "b2_q", name: "Band 2 Q", units: "", default: crate::units::eq::EQ_Q_BUTTERWORTH, steps: 0 },
+    ParamSpec { id: 10, symbol: "b3_on", name: "Band 3 On", units: "", default: 0.0, steps: 2 },
+    ParamSpec { id: 11, symbol: "b3_kind", name: "Band 3 Type", units: "", default: 0.0, steps: EQ_KIND_STEPS },
+    ParamSpec { id: 12, symbol: "b3_freq", name: "Band 3 Freq", units: "Hz", default: 0.75, steps: 0 },
+    ParamSpec { id: 13, symbol: "b3_gain", name: "Band 3 Gain", units: "dB", default: 0.5, steps: 0 },
+    ParamSpec { id: 14, symbol: "b3_q", name: "Band 3 Q", units: "", default: crate::units::eq::EQ_Q_BUTTERWORTH, steps: 0 },
+];
+
+/// How many positions the band-shape menu has. Spelled as a literal so the
+/// table above stays `const`; a test pins it to `NodeKind::ALL.len()`, the
+/// enum it steps through.
+const EQ_KIND_STEPS: i32 = 6;
+
+/// How many of the kernel's bands the face exposes, and how many knobs each
+/// band takes in the id space.
+const EQ_FACE_NODES: usize = 3;
+const EQ_KNOBS_PER_NODE: u32 = 5;
+
+/// One knob per `units::tape::TapeParams` field, ids in declaration order.
+/// Defaults are `TapeParams::default()` verbatim — the shipped 388 at a
+/// healthy record level — and a test holds the two tables together.
+const TAPE_FACE_PARAMS: &[ParamSpec] = &[
+    ParamSpec { id: 0, symbol: "drive", name: "Drive", units: "%", default: 0.6, steps: 0 },
+    ParamSpec { id: 1, symbol: "bump", name: "Bump", units: "dB", default: 0.5, steps: 0 },
+    ParamSpec { id: 2, symbol: "roll", name: "Roll", units: "Hz", default: 0.12, steps: 0 },
+    ParamSpec { id: 3, symbol: "wobble", name: "Wobble", units: "%", default: 0.3, steps: 0 },
+    ParamSpec { id: 4, symbol: "hiss", name: "Hiss", units: "%", default: 0.25, steps: 0 },
+    ParamSpec { id: 5, symbol: "trim", name: "Trim", units: "dB", default: 0.5, steps: 0 },
+];
+
+/// One knob per `units::imager::ImagerParams` field. Defaults are the
+/// kernel's — a wire, because the first thing anybody does with an image
+/// tool is listen for what it ruins.
+const IMAGER_FACE_PARAMS: &[ParamSpec] = &[
+    ParamSpec { id: 0, symbol: "width", name: "Width", units: "%", default: 0.5, steps: 0 },
+    ParamSpec { id: 1, symbol: "ensemble", name: "Ensemble", units: "%", default: 0.0, steps: 0 },
+    ParamSpec { id: 2, symbol: "mono_below", name: "Mono Below", units: "Hz", default: 0.0, steps: 0 },
+];
+
+/// One knob per `units::comp::CompParams` field. Defaults are the kernel's
+/// shipped "held" sound: −18 dB, 4 : 1, 6 ms on, 150 ms off, fully wet.
+const COMP_FACE_PARAMS: &[ParamSpec] = &[
+    ParamSpec { id: 0, symbol: "threshold", name: "Threshold", units: "dB", default: 0.7, steps: 0 },
+    ParamSpec { id: 1, symbol: "ratio", name: "Ratio", units: ":1", default: 0.463, steps: 0 },
+    ParamSpec { id: 2, symbol: "attack", name: "Attack", units: "ms", default: 0.6, steps: 0 },
+    ParamSpec { id: 3, symbol: "release", name: "Release", units: "ms", default: 0.5, steps: 0 },
+    ParamSpec { id: 4, symbol: "makeup", name: "Makeup", units: "dB", default: 0.5, steps: 0 },
+    ParamSpec { id: 5, symbol: "mix", name: "Mix", units: "%", default: 1.0, steps: 0 },
+    ParamSpec { id: 6, symbol: "key_hpf", name: "Key HPF", units: "Hz", default: 0.0, steps: 0 },
+];
+
 fn build_trim(sample_rate: f32) -> BuiltinUnit {
     BuiltinUnit::Trim(Trim::new(sample_rate))
 }
 
+fn build_eq(sample_rate: f32) -> BuiltinUnit {
+    BuiltinUnit::Eq(EqUnit::new(sample_rate))
+}
+
+fn build_imager(sample_rate: f32) -> BuiltinUnit {
+    BuiltinUnit::Imager(ImagerUnit::new(sample_rate))
+}
+
+fn build_tape(sample_rate: f32) -> BuiltinUnit {
+    BuiltinUnit::Tape(TapeUnit::new(sample_rate))
+}
+
+fn build_comp(sample_rate: f32) -> BuiltinUnit {
+    BuiltinUnit::Comp(CompUnit::new(sample_rate))
+}
+
 /// Every effect this build ships. Order is nothing; the path is the key.
-pub const UNITS: &[UnitSpec] = &[UnitSpec {
-    path: TRIM_PATH,
-    class: "Tangent Trim",
-    params: TRIM_PARAMS,
-    build: build_trim,
-}];
+pub const UNITS: &[UnitSpec] = &[
+    UnitSpec {
+        path: TRIM_PATH,
+        class: "Tangent Trim",
+        params: TRIM_PARAMS,
+        build: build_trim,
+    },
+    UnitSpec {
+        path: EQ_PATH,
+        class: "Tangent EQ",
+        params: EQ_FACE_PARAMS,
+        build: build_eq,
+    },
+    UnitSpec {
+        path: IMAGER_PATH,
+        class: "Tangent Imager",
+        params: IMAGER_FACE_PARAMS,
+        build: build_imager,
+    },
+    UnitSpec {
+        path: TAPE_PATH,
+        class: "Tangent Tape",
+        params: TAPE_FACE_PARAMS,
+        build: build_tape,
+    },
+    UnitSpec {
+        path: COMP_PATH,
+        class: "Tangent Comp",
+        params: COMP_FACE_PARAMS,
+        build: build_comp,
+    },
+];
 
 /// The unit a sentinel names, or `None` for a sentinel this build does not
 /// know — which the loader reports rather than swallows, because a session
@@ -194,6 +319,10 @@ pub fn values_from_state(spec: &UnitSpec, bytes: &[u8]) -> Result<Vec<f32>, Stri
 /// audio thread dispatches by match, exactly as it does formats.
 pub enum BuiltinUnit {
     Trim(Trim),
+    Eq(EqUnit),
+    Imager(ImagerUnit),
+    Tape(TapeUnit),
+    Comp(CompUnit),
 }
 
 impl BuiltinUnit {
@@ -203,6 +332,21 @@ impl BuiltinUnit {
         match self {
             // A trim looks at nothing ahead of the sample it is scaling.
             BuiltinUnit::Trim(_) => 0,
+            // Minimum-phase by charter: no lookahead, no pre-ring. See the
+            // module header of `units::eq`.
+            BuiltinUnit::Eq(_) => 0,
+            // Width, floor and velvet all read the sample they write.
+            BuiltinUnit::Imager(_) => 0,
+            // The play head sits a couple of milliseconds behind the record
+            // head (`units::tape::BASE_MS`), but the figure is deliberately
+            // unreported this pass: the head also WANDERS around that point,
+            // so the number is nominal, and the suite ships every unit at
+            // zero. The road for the honest figure already exists —
+            // `Backend::reported_latency` reads this every block — so
+            // reporting it later is one arm here and no new plumbing.
+            BuiltinUnit::Tape(_) => 0,
+            // Feed-forward with no lookahead window.
+            BuiltinUnit::Comp(_) => 0,
         }
     }
 
@@ -216,6 +360,21 @@ impl BuiltinUnit {
                     t.set_gain(value);
                 }
             }
+            BuiltinUnit::Eq(u) => u.set_param(id, value),
+            BuiltinUnit::Imager(u) => u.set_param(id, value),
+            BuiltinUnit::Tape(u) => u.set_param(id, value),
+            BuiltinUnit::Comp(u) => u.set_param(id, value),
+        }
+    }
+
+    /// How hard a unit's gain element has been working since this was last
+    /// asked, in positive dB of reduction — `Some` only for a unit that HAS
+    /// one. Read-and-reset, like the meter it feeds: the engine drains it
+    /// after each block into a per-bay cell, and the face reads the cell.
+    pub fn gain_reduction_db(&mut self) -> Option<f32> {
+        match self {
+            BuiltinUnit::Comp(u) => Some(u.kernel.gain_reduction_db()),
+            _ => None,
         }
     }
 
@@ -237,6 +396,10 @@ impl BuiltinUnit {
     pub fn process(&mut self, input: &[Vec<f32>], frames: usize, out: &mut [Vec<f32>]) {
         match self {
             BuiltinUnit::Trim(t) => t.process(input, frames, out),
+            BuiltinUnit::Eq(u) => u.process(input, frames, out),
+            BuiltinUnit::Imager(u) => u.process(input, frames, out),
+            BuiltinUnit::Tape(u) => u.process(input, frames, out),
+            BuiltinUnit::Comp(u) => u.process(input, frames, out),
         }
     }
 
@@ -246,7 +409,266 @@ impl BuiltinUnit {
     pub fn clear(&mut self) {
         match self {
             BuiltinUnit::Trim(t) => t.clear(),
+            BuiltinUnit::Eq(u) => u.kernel.clear(),
+            BuiltinUnit::Imager(u) => u.kernel.clear(),
+            BuiltinUnit::Tape(u) => u.kernel.clear(),
+            BuiltinUnit::Comp(u) => u.kernel.clear(),
         }
+    }
+}
+
+// ── the planar adapter ──────────────────────────────────────────────────────
+
+/// How many frames of interleaved stereo the per-unit scratch holds — the
+/// engine's own block cap (`MAX_BLOCK` in `instrument.rs`, restated because
+/// this module must stand without that one). Not a correctness bound: a
+/// larger block is CHUNKED through the scratch below, and the kernels cannot
+/// tell — their state carries across calls, which is all a block boundary is.
+const SCRATCH_FRAMES: usize = 512;
+
+/// Run an interleaved in-place stereo kernel over the planar in/out contract
+/// `run_rack` speaks, through a preallocated scratch, allocation-free.
+///
+/// The four kernels under `crate::units` all process interleaved stereo in
+/// place — the `Effects::process` shape they were proven in — while a bay
+/// tenant is handed planar buffers. This is the one bridge: interleave a
+/// chunk, run the kernel, deinterleave into `out`. Fewer than two channels
+/// on either side is a copy-through, the kernels' own "a mono buffer is
+/// returned untouched rather than half-processed" contract restated at the
+/// seam where it must hold.
+fn run_planar(
+    scratch: &mut [f32],
+    input: &[Vec<f32>],
+    frames: usize,
+    out: &mut [Vec<f32>],
+    mut kernel: impl FnMut(&mut [f32], usize),
+) {
+    if input.len() < 2 || out.len() < 2 {
+        for (src, dst) in input.iter().zip(out.iter_mut()) {
+            let n = frames.min(src.len()).min(dst.len());
+            dst[..n].copy_from_slice(&src[..n]);
+        }
+        return;
+    }
+    let step = (scratch.len() / 2).max(1);
+    let mut done = 0usize;
+    while done < frames {
+        let n = step.min(frames - done);
+        for f in 0..n {
+            scratch[f * 2] = input[0].get(done + f).copied().unwrap_or(0.0);
+            scratch[f * 2 + 1] = input[1].get(done + f).copied().unwrap_or(0.0);
+        }
+        kernel(&mut scratch[..n * 2], n);
+        for f in 0..n {
+            if let Some(d) = out[0].get_mut(done + f) {
+                *d = scratch[f * 2];
+            }
+            if let Some(d) = out[1].get_mut(done + f) {
+                *d = scratch[f * 2 + 1];
+            }
+        }
+        done += n;
+    }
+}
+
+/// A knob value with the wire's dirt washed off: clamped into the travel,
+/// and a non-finite reading lands on the SPEC'S default rather than an
+/// arbitrary midpoint — the `ImagerParams::sane` policy, applied once at the
+/// seam so every kernel behind it sees a number.
+fn washed(spec: &ParamSpec, value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        spec.default
+    }
+}
+
+// ── Tangent EQ, seated ──────────────────────────────────────────────────────
+
+/// The EQ kernel behind its face table: three of the kernel's eight bands,
+/// five ids each. Bands the face does not name stay at the kernel's default
+/// — off — forever.
+pub struct EqUnit {
+    kernel: crate::units::eq::EqKernel,
+    params: crate::units::eq::EqParams,
+    scratch: Vec<f32>,
+}
+
+impl EqUnit {
+    fn new(sample_rate: f32) -> Self {
+        let mut params = crate::units::eq::EqParams::default();
+        // The face's parking spots, not the eight-handle ruler's: the specs
+        // are the published defaults, so the kernel must open agreeing with
+        // them or the first `state_text` save would move handles nobody
+        // touched.
+        for (node, spec) in params
+            .nodes
+            .iter_mut()
+            .zip(EQ_FACE_PARAMS.chunks(EQ_KNOBS_PER_NODE as usize))
+        {
+            node.freq = spec[2].default;
+        }
+        Self {
+            kernel: crate::units::eq::EqKernel::new(sample_rate),
+            params,
+            scratch: vec![0.0; SCRATCH_FRAMES * 2],
+        }
+    }
+
+    fn set_param(&mut self, id: u32, value: f32) {
+        use crate::units::eq::NodeKind;
+        let node = (id / EQ_KNOBS_PER_NODE) as usize;
+        if node >= EQ_FACE_NODES {
+            return;
+        }
+        let Some(spec) = EQ_FACE_PARAMS.get(id as usize) else {
+            return;
+        };
+        let v = washed(spec, value);
+        let n = &mut self.params.nodes[node];
+        match id % EQ_KNOBS_PER_NODE {
+            // A toggle reads its upper half as on, the stepped convention.
+            0 => n.on = v >= 0.5,
+            // The menu convention: N positions across the travel, nearest
+            // wins, so 0.0 is the first shape and 1.0 the last.
+            1 => {
+                let last = (NodeKind::ALL.len() - 1) as f32;
+                let at = ((v * last).round() as usize).min(NodeKind::ALL.len() - 1);
+                n.kind = NodeKind::ALL[at];
+            }
+            2 => n.freq = v,
+            3 => n.gain = v,
+            _ => n.q = v,
+        }
+    }
+
+    fn process(&mut self, input: &[Vec<f32>], frames: usize, out: &mut [Vec<f32>]) {
+        let (kernel, params) = (&mut self.kernel, &self.params);
+        run_planar(&mut self.scratch, input, frames, out, |buf, n| {
+            kernel.process(buf, n, 2, params);
+        });
+    }
+}
+
+// ── Tangent Imager, seated ──────────────────────────────────────────────────
+
+pub struct ImagerUnit {
+    kernel: crate::units::imager::Imager,
+    params: crate::units::imager::ImagerParams,
+    scratch: Vec<f32>,
+}
+
+impl ImagerUnit {
+    fn new(sample_rate: f32) -> Self {
+        Self {
+            kernel: crate::units::imager::Imager::new(sample_rate),
+            params: crate::units::imager::ImagerParams::default(),
+            scratch: vec![0.0; SCRATCH_FRAMES * 2],
+        }
+    }
+
+    fn set_param(&mut self, id: u32, value: f32) {
+        let Some(spec) = IMAGER_FACE_PARAMS.get(id as usize) else {
+            return;
+        };
+        let v = washed(spec, value);
+        match id {
+            0 => self.params.width = v,
+            1 => self.params.ensemble = v,
+            _ => self.params.mono_below = v,
+        }
+    }
+
+    fn process(&mut self, input: &[Vec<f32>], frames: usize, out: &mut [Vec<f32>]) {
+        let (kernel, params) = (&mut self.kernel, &self.params);
+        run_planar(&mut self.scratch, input, frames, out, |buf, n| {
+            kernel.process(buf, n, 2, params);
+        });
+    }
+}
+
+// ── Tangent Tape, seated ────────────────────────────────────────────────────
+
+pub struct TapeUnit {
+    kernel: crate::units::tape::Tape,
+    params: crate::units::tape::TapeParams,
+    scratch: Vec<f32>,
+}
+
+impl TapeUnit {
+    fn new(sample_rate: f32) -> Self {
+        Self {
+            kernel: crate::units::tape::Tape::new(sample_rate),
+            params: crate::units::tape::TapeParams::default(),
+            scratch: vec![0.0; SCRATCH_FRAMES * 2],
+        }
+    }
+
+    fn set_param(&mut self, id: u32, value: f32) {
+        let Some(spec) = TAPE_FACE_PARAMS.get(id as usize) else {
+            return;
+        };
+        let v = washed(spec, value);
+        match id {
+            0 => self.params.drive = v,
+            1 => self.params.bump = v,
+            2 => self.params.roll = v,
+            3 => self.params.wobble = v,
+            4 => self.params.hiss = v,
+            _ => self.params.trim = v,
+        }
+    }
+
+    fn process(&mut self, input: &[Vec<f32>], frames: usize, out: &mut [Vec<f32>]) {
+        let (kernel, params) = (&mut self.kernel, &self.params);
+        run_planar(&mut self.scratch, input, frames, out, |buf, n| {
+            kernel.process(buf, n, 2, params);
+        });
+    }
+}
+
+// ── Tangent Comp, seated ────────────────────────────────────────────────────
+
+pub struct CompUnit {
+    kernel: crate::units::comp::Comp,
+    params: crate::units::comp::CompParams,
+    scratch: Vec<f32>,
+}
+
+impl CompUnit {
+    fn new(sample_rate: f32) -> Self {
+        Self {
+            kernel: crate::units::comp::Comp::new(sample_rate),
+            params: crate::units::comp::CompParams::default(),
+            scratch: vec![0.0; SCRATCH_FRAMES * 2],
+        }
+    }
+
+    fn set_param(&mut self, id: u32, value: f32) {
+        let Some(spec) = COMP_FACE_PARAMS.get(id as usize) else {
+            return;
+        };
+        let v = washed(spec, value);
+        match id {
+            0 => self.params.threshold = v,
+            1 => self.params.ratio = v,
+            2 => self.params.attack = v,
+            3 => self.params.release = v,
+            4 => self.params.makeup = v,
+            5 => self.params.mix = v,
+            _ => self.params.key_hpf = v,
+        }
+    }
+
+    fn process(&mut self, input: &[Vec<f32>], frames: usize, out: &mut [Vec<f32>]) {
+        let (kernel, params) = (&mut self.kernel, &self.params);
+        run_planar(&mut self.scratch, input, frames, out, |buf, n| {
+            // No side-chain yet: the kernel takes a key, the bay protocol
+            // does not carry one, and pretending otherwise here would be a
+            // lie in the signature. When cross-lane keying lands it arrives
+            // as a second planar argument, not a change to this call.
+            kernel.process(buf, n, 2, params, None);
+        });
     }
 }
 
@@ -496,6 +918,236 @@ mod tests {
         // But another plugin's state is refused out loud, not defaulted.
         assert!(values_from_state(spec, b"lv2state 1\ngain=0.25\n").is_err());
         assert!(values_from_state(spec, &[0xFF, 0xFE, 0x00]).is_err());
+    }
+
+    /// **The face tables open at the kernels' shipped defaults.** The specs
+    /// are literals — a `const` table cannot call `Default::default()` — so
+    /// this is the one place the two are held together; drift here is a knob
+    /// panel that reads one number while the audio does another, the exact
+    /// disease `ports::EffectDefaults` documents.
+    #[test]
+    fn the_face_tables_open_at_the_kernels_shipped_defaults() {
+        let t = crate::units::tape::TapeParams::default();
+        for (spec, want) in TAPE_FACE_PARAMS
+            .iter()
+            .zip([t.drive, t.bump, t.roll, t.wobble, t.hiss, t.trim])
+        {
+            assert_eq!(spec.default, want, "{} drifted from TapeParams::default", spec.symbol);
+        }
+        let i = crate::units::imager::ImagerParams::default();
+        for (spec, want) in IMAGER_FACE_PARAMS.iter().zip([i.width, i.ensemble, i.mono_below]) {
+            assert_eq!(spec.default, want, "{} drifted from ImagerParams::default", spec.symbol);
+        }
+        let c = crate::units::comp::CompParams::default();
+        for (spec, want) in COMP_FACE_PARAMS.iter().zip([
+            c.threshold, c.ratio, c.attack, c.release, c.makeup, c.mix, c.key_hpf,
+        ]) {
+            assert_eq!(spec.default, want, "{} drifted from CompParams::default", spec.symbol);
+        }
+        // The EQ: kernel defaults for everything except the parking spots,
+        // which are the documented three-handle spread (see EQ_FACE_PARAMS).
+        let n = crate::units::eq::NodeParams::default();
+        assert!(!n.on, "the kernel ships FLAT; the face must too");
+        for (band, chunk) in EQ_FACE_PARAMS.chunks(EQ_KNOBS_PER_NODE as usize).enumerate() {
+            assert_eq!(chunk[0].default, 0.0, "band {band} does not open off");
+            assert_eq!(chunk[1].default, 0.0, "band {band} does not open a bell");
+            assert_eq!(chunk[2].default, [0.25, 0.5, 0.75][band]);
+            assert_eq!(chunk[3].default, n.gain);
+            assert_eq!(chunk[4].default, n.q);
+        }
+        // The shape menu steps across exactly the kernel's enum, ends
+        // inclusive — a literal in the table, pinned to its source here.
+        assert_eq!(
+            EQ_KIND_STEPS as usize,
+            crate::units::eq::NodeKind::ALL.len(),
+            "the kind knob's step count drifted from NodeKind::ALL"
+        );
+    }
+
+    /// A planar in/out pair with awkward values in it — negative zero and a
+    /// denormal included, because "nearly the same" out of a unit that
+    /// claims to be off is how nulls die.
+    fn tricky_planar(frames: usize) -> Vec<Vec<f32>> {
+        let vals = [0.25f32, -0.5, 1.0, -1.0, 0.0, -0.0, 1.0e-38, 3.1e-4];
+        vec![
+            (0..frames).map(|i| vals[i % vals.len()]).collect(),
+            (0..frames).map(|i| -vals[(i + 3) % vals.len()]).collect(),
+        ]
+    }
+
+    /// **An untouched EQ and imager, and a comp with its threshold parked at
+    /// the top, are nulls through the planar road** — interleave, kernel,
+    /// deinterleave and all. Bit-for-bit for the two whose off-path never
+    /// touches the buffer; value-exact for the comp, whose unity gain is a
+    /// multiply (its own kernel tests make the same claim the same way).
+    #[test]
+    fn untouched_eq_imager_and_a_neutral_comp_are_nulls_through_the_planar_road() {
+        let frames = 2_048;
+        let input = tricky_planar(frames);
+
+        for path in [EQ_PATH, IMAGER_PATH] {
+            let spec = spec_for(path).unwrap();
+            let mut unit = spec.create(48_000.0, &spec.defaults());
+            let mut out = vec![vec![7.0f32; frames]; 2];
+            unit.process(&input, frames, &mut out);
+            for (src, dst) in input.iter().zip(&out) {
+                for (s, d) in src.iter().zip(dst) {
+                    assert_eq!(s.to_bits(), d.to_bits(), "{path}: {s} came out {d}");
+                }
+            }
+        }
+
+        // The comp's NEUTRAL is not its default — the shipped default holds
+        // a signal, which is the point of shipping it — it is the threshold
+        // at the top AND the ratio at 1 : 1. Both, because the threshold's
+        // top is 0 dBFS and this signal's near-square shape reads +3 dB on
+        // the detector's sine calibration: over the top threshold, caught,
+        // unless the ratio is a wire too.
+        let spec = spec_for(COMP_PATH).unwrap();
+        let mut neutral = spec.defaults();
+        neutral[0] = 1.0;
+        neutral[1] = 0.0;
+        let mut unit = spec.create(48_000.0, &neutral);
+        let mut out = vec![vec![7.0f32; frames]; 2];
+        unit.process(&input, frames, &mut out);
+        for (src, dst) in input.iter().zip(&out) {
+            assert_eq!(src, dst, "a comp with nothing to catch changed the signal");
+        }
+    }
+
+    /// **Tape at its neutral-null settings is level-transparent through the
+    /// planar road** — the kernel's own tenth-of-a-decibel claim, restated
+    /// through the adapter. Not bit-exact and never will be: the play head
+    /// is a real delay. The 1.2-second call is also more than two full
+    /// scratches of frames, so this is the chunking path proving itself on
+    /// real audio.
+    #[test]
+    fn tape_at_neutral_is_level_transparent_through_the_planar_road() {
+        let sr = 44_100.0f32;
+        let frames = (sr * 1.2) as usize;
+        let mono: Vec<f32> = (0..frames)
+            .map(|i| {
+                let t = i as f32 / sr;
+                0.07 * (std::f32::consts::TAU * 400.0 * t).sin()
+                    + 0.07 * (std::f32::consts::TAU * 1_000.0 * t).sin()
+                    + 0.07 * (std::f32::consts::TAU * 3_300.0 * t).sin()
+            })
+            .collect();
+        let input = vec![mono.clone(), mono];
+        let spec = spec_for(TAPE_PATH).unwrap();
+        // drive 0.5 is the calibrated machine, trim 0.5 unity, every colour
+        // off — the kernel's own neutral recipe.
+        let mut unit = spec.create(sr, &[0.5, 0.0, 0.0, 0.0, 0.0, 0.5]);
+        let mut out = vec![vec![0.0f32; frames]; 2];
+        unit.process(&input, frames, &mut out);
+        let rms = |v: &[f32]| {
+            (v.iter().map(|s| f64::from(*s) * f64::from(*s)).sum::<f64>() / v.len() as f64).sqrt()
+        };
+        // Steady state only: past the envelope settling and the line fill.
+        let (lo, hi) = ((sr * 0.25) as usize, (sr * 1.15) as usize);
+        let delta = 20.0 * (rms(&out[0][lo..hi]) / rms(&input[0][lo..hi])).log10();
+        assert!(
+            delta.abs() < 0.1,
+            "neutral tape moved the broadband level by {delta:.3} dB through the adapter"
+        );
+    }
+
+    /// **A block bigger than the scratch is chunked, not truncated or
+    /// reallocated** — the unit fed 1000 frames in one call must equal the
+    /// bare kernel fed the same 1000 interleaved, because kernel state
+    /// carries across chunk boundaries and that is all a boundary is.
+    #[test]
+    fn a_block_bigger_than_the_scratch_is_chunked_seamlessly() {
+        use crate::units::eq::{EqKernel, EqParams, NodeKind, NodeParams};
+        let frames = 1_000;
+        assert!(frames > SCRATCH_FRAMES, "the case must overflow the scratch");
+        let band = NodeParams { on: true, kind: NodeKind::Bell, freq: 0.5, gain: 0.8, q: 0.5 };
+
+        let spec = spec_for(EQ_PATH).unwrap();
+        let mut unit = spec.create(48_000.0, &spec.defaults());
+        // Through the road, so the test drives the same decoding a face will.
+        unit.set_param(0, 1.0); // on
+        unit.set_param(1, 0.0); // bell
+        unit.set_param(2, band.freq);
+        unit.set_param(3, band.gain);
+        unit.set_param(4, band.q);
+
+        let input = tricky_planar(frames);
+        let mut out = vec![vec![0.0f32; frames]; 2];
+        unit.process(&input, frames, &mut out);
+
+        let mut kernel = EqKernel::new(48_000.0);
+        let mut p = EqParams::default();
+        p.nodes[0] = band;
+        let mut buf = vec![0.0f32; frames * 2];
+        for f in 0..frames {
+            buf[f * 2] = input[0][f];
+            buf[f * 2 + 1] = input[1][f];
+        }
+        kernel.process(&mut buf, frames, 2, &p);
+        for f in 0..frames {
+            assert_eq!(out[0][f].to_bits(), buf[f * 2].to_bits(), "left, frame {f}");
+            assert_eq!(out[1][f].to_bits(), buf[f * 2 + 1].to_bits(), "right, frame {f}");
+        }
+    }
+
+    /// **The kind knob steps across every shape, ends inclusive**, the
+    /// toggle splits at half travel, and an id no spec names moves nothing —
+    /// the stale-curve contract, checked against the ledger a face reads.
+    #[test]
+    fn the_eq_road_decodes_toggles_menus_and_refuses_stale_ids() {
+        use crate::units::eq::NodeKind;
+        let spec = spec_for(EQ_PATH).unwrap();
+        let BuiltinUnit::Eq(mut u) = spec.create(48_000.0, &spec.defaults()) else {
+            panic!("the EQ path built something that is not an EQ");
+        };
+        let last = (NodeKind::ALL.len() - 1) as f32;
+        for (i, want) in NodeKind::ALL.iter().enumerate() {
+            u.set_param(1, i as f32 / last);
+            assert_eq!(u.params.nodes[0].kind, *want, "position {i}");
+        }
+        u.set_param(0, 0.49);
+        assert!(!u.params.nodes[0].on, "0.49 is the lower half of a toggle");
+        u.set_param(0, 0.5);
+        assert!(u.params.nodes[0].on, "0.5 is the upper half of a toggle");
+
+        let before = u.params;
+        u.set_param(99, 0.0);
+        u.set_param(u32::MAX, 1.0);
+        assert_eq!(u.params, before, "an unknown id moved a knob");
+
+        // And a NaN lands on the spec's default, not wherever it was.
+        u.set_param(3, f32::NAN);
+        assert_eq!(u.params.nodes[0].gain, 0.5, "NaN did not read as the default");
+    }
+
+    /// **The comp unit's meter answers through the enum and resets on read**
+    /// — the same read-and-reset the kernel promises, proven where the
+    /// engine will actually call it.
+    #[test]
+    fn the_comp_units_meter_answers_and_resets_on_read() {
+        let spec = spec_for(COMP_PATH).unwrap();
+        let mut squeezed = spec.defaults();
+        squeezed[0] = 0.0; // threshold to the floor: everything is over it
+        let mut unit = spec.create(48_000.0, &squeezed);
+        let frames = 4_800;
+        let loud: Vec<f32> = (0..frames)
+            .map(|i| 0.9 * (i as f32 * 1_000.0 * std::f32::consts::TAU / 48_000.0).sin())
+            .collect();
+        let input = vec![loud.clone(), loud];
+        let mut out = vec![vec![0.0f32; frames]; 2];
+        unit.process(&input, frames, &mut out);
+        let gr = unit.gain_reduction_db().expect("a comp has a meter");
+        assert!(gr > 6.0, "a floored threshold only metered {gr:.1} dB");
+        assert_eq!(
+            unit.gain_reduction_db(),
+            Some(0.0),
+            "the meter did not reset on read"
+        );
+        // Units without a gain element answer None, so the engine's per-block
+        // drain costs the others one match arm and nothing else.
+        let mut eq = spec_for(EQ_PATH).unwrap().create(48_000.0, &spec_for(EQ_PATH).unwrap().defaults());
+        assert_eq!(eq.gain_reduction_db(), None);
     }
 
     #[test]
