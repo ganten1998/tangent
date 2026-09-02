@@ -10994,6 +10994,17 @@ impl Engine {
         Some((bay.spec, &bay.values))
     }
 
+    /// The bay's extra state lines (learned profiles, IR paths) — what the
+    /// face push carries so a panel can SHOW what is loaded.
+    pub fn builtin_extra(&self, strip: usize, slot: usize) -> &[(String, String)] {
+        self.insert_builtin
+            .get(strip)
+            .and_then(|r| r.get(slot))
+            .and_then(|b| b.as_ref())
+            .map(|b| b.extra.as_slice())
+            .unwrap_or(&[])
+    }
+
     /// How many dB of gain reduction one built-in bay applied since the last
     /// read — max-hold, read-and-RESET, the `strip_peaks` contract. Zero for
     /// everything that is not a compressor working, including a bay out of

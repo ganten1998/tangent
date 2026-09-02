@@ -845,6 +845,10 @@ pub struct BuiltinFace {
     /// computed with the audio path's math on the host side. Empty for
     /// units without a curve.
     pub curve_db: Vec<f32>,
+    /// The bay's extra state lines (the denoise's learned profile, the
+    /// IR's file path) - pushed so a face can SHOW what is loaded without
+    /// a second road. Appended; empty for units that carry none.
+    pub extra: Vec<(String, String)>,
     pub strip: usize,
     pub slot: usize,
     /// The unit's sentinel path (`"@tangent-comp"`), which is what routes a

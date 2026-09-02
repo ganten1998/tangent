@@ -1047,6 +1047,9 @@ pub enum DialogAction {
     IrCancel,
     /// Write the finished capture as `IRs/<name>.wav` and refresh the shelf.
     IrSave { name: String },
+    /// The IR face picked an impulse off the shelf; desk terms, the app
+    /// converts and asks the host to rebind the bay.
+    SetInsertIr { strip: usize, slot: usize, path: String },
 }
 
 // ── the custom tuning editor ────────────────────────────────────────────────
@@ -4285,6 +4288,12 @@ pub fn show(
                                     }
                                     crate::faces::FaceAction::OpenPedal { pedal } => {
                                         DialogAction::OpenPedalPicker { strip, slot, pedal }
+                                    }
+                                    crate::faces::FaceAction::OpenWizard => {
+                                        DialogAction::OpenIrWizard
+                                    }
+                                    crate::faces::FaceAction::PickIr { path } => {
+                                        DialogAction::SetInsertIr { strip, slot, path }
                                     }
                                 });
                             }

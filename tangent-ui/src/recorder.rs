@@ -1923,6 +1923,12 @@ pub enum RecorderRequest {
     /// Write the last finished capture into `IRs/<name>.wav` (32-bit float
     /// stereo) and re-push the shelf rows.
     IrSave { name: String },
+    /// Point a loaded Tangent IR bay at another impulse file. `strip` is
+    /// the SEAT (the `SetInsertParam` convention). The host rewrites the
+    /// bay's state sidecar and reloads the bay, because an IR is applied
+    /// to an instance before it crosses to the audio thread - a swap IS a
+    /// reload, honestly.
+    SetInsertIr { strip: usize, slot: usize, path: String },
 }
 
 /// How hard an auditioned note is struck.

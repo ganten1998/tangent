@@ -120,6 +120,9 @@ pub struct FaceLive {
     pub drag: Option<usize>,
     /// The EQ's band under the rows, chosen by the last gesture.
     pub band: usize,
+    /// The IRs shelf, for the convolver's face: what Tangent Media/IRs
+    /// holds, pushed by the host.
+    pub irs: Vec<crate::ports::IrRow>,
     /// The amp face's pedal chips: each pedal's short label, empty for an
     /// empty pedal slot. `None` when the face's seat carries no pedalboard
     /// — the amp on a folder's extra rack, the master or a bus. Filled by
@@ -134,6 +137,10 @@ pub enum FaceAction {
     Set { id: u32, value: f32 },
     SavePreset { name: String },
     LoadPreset { path: String },
+    /// The IR face's magic wand: open the capture wizard.
+    OpenWizard,
+    /// Load this impulse file into the bay.
+    PickIr { path: String },
     /// The amp face's pedal chip: open the picker over pedal `pedal`'s
     /// seat. The face knows only the ordinal; the app owns the seat math.
     OpenPedal { pedal: usize },
@@ -249,6 +256,7 @@ pub fn draw(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option<Fa
         "@tangent-eq" => draw_eq(ui, st, live),
         "@tangent-imager" => draw_imager(ui, st, live),
         "@tangent-comp" => draw_comp(ui, st, live),
+        "@tangent-ir" => draw_ir(ui, st, live),
         crate::faces_amp::AMP_PATH => crate::faces_amp::draw_amp(ui, st, live),
         // The tape, the trim, and anything the suite grows before its face
         // does: every parameter as a row, in id order — sliders for the
@@ -469,6 +477,108 @@ fn draw_eq(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option<Fac
     out = out.or_else(|| row(ui, st, &live.face, base + 2));
     out = out.or_else(|| row(ui, st, &live.face, base + 3));
     out = out.or_else(|| row(ui, st, &live.face, base + 4));
+    out
+}
+
+fn draw_ir(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option<FaceAction> {
+    let mut out = None;
+    // What is loaded, said plainly on the glass.
+    let loaded = live
+        .face
+        .extra
+        .iter()
+        .find(|(k, _)| k == "ir_path")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    let (bar, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), 26.0),
+        egui::Sense::hover(),
+    );
+    face::lcd_glass(ui.painter(), bar, st);
+    let shown = if loaded.is_empty() {
+        "no impulse loaded — a wire".to_owned()
+    } else {
+        std::path::Path::new(&loaded)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or(loaded.clone())
+    };
+    face::lcd_text(
+        ui.painter(),
+        bar.left_center() + Vec2::new(8.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        &shown,
+        face::fit_mono(bar.shrink(6.0), &shown, 11.0),
+        face::LcdTier::Primary,
+        st,
+    );
+    ui.add_space(6.0);
+    // The shelf: everything in Tangent Media/IRs, one click to load. The
+    // wand sits beside the heading — capturing your own is the point.
+    ui.horizontal(|ui| {
+        let bold = |size: f32| egui::FontId::new(size, crate::fonts::courier_bold());
+        ui.label(
+            egui::RichText::new("IMPULSES")
+                .font(bold(10.0))
+                .color(st.s.faint),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .add(
+                    egui::Button::new(
+                        egui::RichText::new("Wizard…").font(bold(10.0)).color(st.s.ink),
+                    )
+                    .fill(st.s.raised),
+                )
+                .on_hover_text("capture an impulse from hardware, level-staged and honest")
+                .clicked()
+            {
+                out = Some(FaceAction::OpenWizard);
+            }
+        });
+    });
+    ui.add_space(2.0);
+    egui::ScrollArea::vertical()
+        .max_height(150.0)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            if live.irs.is_empty() {
+                ui.label(
+                    egui::RichText::new(
+                        "nothing in Tangent Media/IRs yet — the Wizard fills it",
+                    )
+                    .font(egui::FontId::new(10.0, crate::fonts::courier_bold()))
+                    .color(st.s.faint),
+                );
+            }
+            for row_ in &live.irs {
+                let here = row_.path == loaded;
+                let label = format!(
+                    "{} {}   {:.1}s",
+                    if here { "\u{2022}" } else { " " },
+                    row_.name,
+                    row_.seconds
+                );
+                if ui
+                    .selectable_label(
+                        here,
+                        egui::RichText::new(label)
+                            .font(egui::FontId::new(11.0, crate::fonts::courier_bold()))
+                            .color(st.s.ink),
+                    )
+                    .clicked()
+                    && !here
+                {
+                    out = Some(FaceAction::PickIr {
+                        path: row_.path.clone(),
+                    });
+                }
+            }
+        });
+    ui.add_space(6.0);
+    for id in 0..=1 {
+        out = out.or_else(|| row(ui, st, &live.face, id));
+    }
     out
 }
 

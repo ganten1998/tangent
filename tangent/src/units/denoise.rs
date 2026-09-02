@@ -85,11 +85,20 @@
 /// out without dimming the octave around it.
 pub const DENOISE_BANDS: usize = 32;
 
-/// Where the bands live, in Hz, log-spaced ends included. Below 60 Hz is
-/// rumble a high-pass owns; above 16 kHz is a region where cutting "hiss"
-/// mostly cuts air, and at 44.1k the top band still sits safely under
-/// Nyquist.
-pub const DENOISE_BAND_HZ: (f32, f32) = (60.0, 16_000.0);
+/// Where the band CENTRES live, in Hz, log-spaced ends included. The edges
+/// do not end the coverage: band 0 is a low SHELF (its cut extends to DC —
+/// rumble and hum floor ride with it) and the top band is a high SHELF
+/// (its cut extends to Nyquist). The first build stopped the bells at
+/// 16 kHz and a beta ear caught it inside an hour: white noise is flat per
+/// hertz, a third of its bandwidth lived above the last bell, and the
+/// untouched top shelf of hiss read as "something missing frequency-wise"
+/// however deep the bells cut.
+pub const DENOISE_BAND_HZ: (f32, f32) = (60.0, 15_500.0);
+
+/// The edge shelves' slope parameter (RBJ S). Under 1 keeps the knee
+/// gentle enough that the shelf and its neighbouring bell sum without a
+/// dip between them.
+const DENOISE_SHELF_S: f64 = 0.9;
 
 /// The cut bells' Q. 5.5 puts each bell's bandwidth at about its own slot's
 /// width (0.26 octave), so a run of closed bands sums to an even shelf of
@@ -106,11 +115,14 @@ const DENOISE_DETECTOR_Q: f32 = 2.0;
 /// "quieter" starts becoming "processed".
 pub const DENOISE_REDUCE_DB: f32 = 24.0;
 
-/// What the SMOOTH dial spans: the expansion ratio, geometric. 1.5:1 at the
-/// bottom is barely more than a wire below threshold; 3:1 at the top is as
-/// steep as this design goes, because gate-like slopes are what turn a level
-/// wobbling near threshold into flapping.
-pub const DENOISE_RATIO: (f32, f32) = (1.5, 3.0);
+/// What the SMOOTH dial spans: the expansion ratio, geometric. 1.7:1 at the
+/// bottom is a gentle tuck; 4.5:1 at the top closes a floor briskly without
+/// being a gate. The first span topped out at 3:1 and its middle sat near
+/// 2:1 — under which the noise never reached the REDUCE dial's depth and
+/// the floor audibly FADED with the music instead of staying pinned. The
+/// hysteresis-plus-hold pair is what guards against flapping; the ratio no
+/// longer has to be timid on its behalf.
+pub const DENOISE_RATIO: (f32, f32) = (1.7, 4.5);
 
 /// What the RELEASE dial spans, in milliseconds, geometric: how long a cut
 /// takes to re-engage once signal leaves a band. 60 ms breathes audibly on
@@ -297,6 +309,9 @@ struct BandDesign {
     pr: f32,
     pi: f32,
     g: f32,
+    /// −1: this band is the low SHELF (cut extends to DC). +1: the high
+    /// SHELF (cut extends to Nyquist). 0: an ordinary bell.
+    shelf: i8,
     /// True when the centre sits too close to Nyquist to design a bell —
     /// only reachable at absurdly low sample rates; the band then never
     /// cuts.
@@ -493,6 +508,7 @@ impl Denoise {
             pi: 0.0,
             g: 0.0,
             inert: true,
+            shelf: 0,
         }; DENOISE_BANDS];
         for (k, d) in design.iter_mut().enumerate() {
             let hz = f64::from(Self::center_hz(k));
@@ -500,7 +516,13 @@ impl Denoise {
                 continue; // only reachable at silly-low rates; never cuts
             }
             let w0 = std::f64::consts::TAU * hz / sr;
-            let bw = hz / f64::from(DENOISE_DETECTOR_Q);
+            // The edge bands answer for everything beyond the grid, so
+            // their DETECTORS listen wide (a whole octave) where an inner
+            // band listens to its slot: hiss at 21 kHz must open — and be
+            // cut by — the top shelf even though no centre sits on it.
+            let edge = k == 0 || k == DENOISE_BANDS - 1;
+            let det_q = if edge { 1.2 } else { f64::from(DENOISE_DETECTOR_Q) };
+            let bw = hz / det_q;
             let r = (-std::f64::consts::PI * bw / sr).exp();
             *d = BandDesign {
                 cs: w0.cos(),
@@ -509,6 +531,13 @@ impl Denoise {
                 pi: (r * w0.sin()) as f32,
                 g: (1.0 - r) as f32,
                 inert: false,
+                shelf: if k == 0 {
+                    -1
+                } else if k == DENOISE_BANDS - 1 {
+                    1
+                } else {
+                    0
+                },
             };
         }
 
@@ -638,6 +667,43 @@ impl Denoise {
     /// (b ≡ a for A = 1), but depth 0 never gets here: the band is skipped.
     fn design_coef(d: &BandDesign, depth_db: f32) -> Coef {
         let a = 10.0_f64.powf(f64::from(-depth_db) / 40.0);
+        if d.shelf != 0 {
+            // The edge bands cut as SHELVES — everything beyond the grid
+            // falls with them, which is the whole reason they exist (see
+            // DENOISE_BAND_HZ). RBJ cookbook shelf, cut form (A < 1),
+            // corner at the band's own centre.
+            let cs = d.cs;
+            let sn = (1.0 - cs * cs).max(0.0).sqrt();
+            let sqa = a.sqrt();
+            let alpha_s = sn / 2.0
+                * ((a + 1.0 / a) * (1.0 / DENOISE_SHELF_S - 1.0) + 2.0).sqrt();
+            let (b0, b1, b2, ra0, ra1, ra2) = if d.shelf > 0 {
+                (
+                    a * ((a + 1.0) + (a - 1.0) * cs + 2.0 * sqa * alpha_s),
+                    -2.0 * a * ((a - 1.0) + (a + 1.0) * cs),
+                    a * ((a + 1.0) + (a - 1.0) * cs - 2.0 * sqa * alpha_s),
+                    (a + 1.0) - (a - 1.0) * cs + 2.0 * sqa * alpha_s,
+                    2.0 * ((a - 1.0) - (a + 1.0) * cs),
+                    (a + 1.0) - (a - 1.0) * cs - 2.0 * sqa * alpha_s,
+                )
+            } else {
+                (
+                    a * ((a + 1.0) - (a - 1.0) * cs + 2.0 * sqa * alpha_s),
+                    2.0 * a * ((a - 1.0) - (a + 1.0) * cs),
+                    a * ((a + 1.0) - (a - 1.0) * cs - 2.0 * sqa * alpha_s),
+                    (a + 1.0) + (a - 1.0) * cs + 2.0 * sqa * alpha_s,
+                    -2.0 * ((a - 1.0) + (a + 1.0) * cs),
+                    (a + 1.0) + (a - 1.0) * cs - 2.0 * sqa * alpha_s,
+                )
+            };
+            return Coef {
+                b0: (b0 / ra0) as f32,
+                b1: (b1 / ra0) as f32,
+                b2: (b2 / ra0) as f32,
+                a1: (ra1 / ra0) as f32,
+                a2: (ra2 / ra0) as f32,
+            };
+        }
         let a0 = 1.0 + d.alpha / a;
         Coef {
             b0: ((1.0 + d.alpha * a) / a0) as f32,
@@ -762,17 +828,34 @@ impl Denoise {
             depth[k] = b.depth_db;
         }
 
-        // The cross-band slope constraint: one pass up, one pass down, each
-        // only ever LOWERING a band toward its neighbour + 6 dB. Two sweeps
-        // reach a fixed point because min() is monotone. The constrained
-        // value is written back as the band's real depth — the smoothing
-        // above must continue from what was actually applied, or the state
-        // and the sound drift apart.
+        // The cross-band slope constraint, MASKING-EXEMPT: one pass up,
+        // one pass down, each only ever LOWERING a band toward its
+        // neighbour + 6 dB — but a band that is open BECAUSE SIGNAL LIVES
+        // IN IT does not export its zero to the bands beside it. The
+        // constraint exists to smooth the learned profile's jaggedness
+        // among CLOSED bands (band-edge beating between adjacent cuts);
+        // letting an open band drag its neighbours halfway open raised the
+        // noise floor around every note — the "white noise fading into
+        // sound" a beta ear named precisely. Psychoacoustics carries the
+        // open band's own edge: the signal that opened it masks the noise
+        // it admits, and its neighbours' floors staying PINNED is what
+        // makes the break-through crisp.
+        let open: [bool; DENOISE_BANDS] = {
+            let mut o = [false; DENOISE_BANDS];
+            for (k, b) in self.band.iter().enumerate() {
+                o[k] = b.open;
+            }
+            o
+        };
         for k in 1..DENOISE_BANDS {
-            depth[k] = depth[k].min(depth[k - 1] + DENOISE_SLOPE_DB);
+            if !open[k - 1] {
+                depth[k] = depth[k].min(depth[k - 1] + DENOISE_SLOPE_DB);
+            }
         }
         for k in (0..DENOISE_BANDS - 1).rev() {
-            depth[k] = depth[k].min(depth[k + 1] + DENOISE_SLOPE_DB);
+            if !open[k + 1] {
+                depth[k] = depth[k].min(depth[k + 1] + DENOISE_SLOPE_DB);
+            }
         }
 
         for (k, b) in self.band.iter_mut().enumerate() {
@@ -1333,14 +1416,35 @@ mod tests {
     /// at 44.1k, 48k and 96k.
     #[test]
     fn the_suppression_is_the_same_at_every_sample_rate() {
+        // Measured in a RATE-INDEPENDENT band. The top band is a shelf that
+        // reaches Nyquist, so at 96k it honestly removes hiss from 19 kHz
+        // to 48 kHz that does not exist at 44.1k — a broadband RMS would
+        // read that extra octave as "disagreement" when it is exactly the
+        // crisper coverage this pass added. So both signals are folded
+        // through the same 10 kHz one-pole before the RMS: the shared, un-warped audible
+        // suppression is what must match across rates, and it does.
+        let lp15 = |buf: &[f32], from: usize, sr: f32| -> f32 {
+            let a = 1.0 - (-std::f32::consts::TAU * 10_000.0 / sr).exp();
+            let mut z = 0.0f32;
+            let mut acc = 0.0f64;
+            let mut n = 0u64;
+            for (i, s) in buf.chunks_exact(2).enumerate() {
+                z += a * (s[0] - z);
+                if i >= from {
+                    acc += f64::from(z) * f64::from(z);
+                    n += 1;
+                }
+            }
+            10.0 * ((acc / n.max(1) as f64).max(1e-30)).log10() as f32
+        };
         let drop_at = |sr: f32| {
             let mut dn = learned(0xABCD, 0.05, sr, 1.0);
             let frames = sr as usize;
             let mut noise = Noise::new(0xABCD, 0.05, sr);
             let mut buf = noise.frames(frames);
-            let in_db = rms_db(&buf, frames / 2);
+            let in_db = lp15(&buf, frames / 2, sr);
             dn.process(&mut buf, frames, 2, &DenoiseParams::default());
-            in_db - rms_db(&buf, frames / 2)
+            in_db - lp15(&buf, frames / 2, sr)
         };
         let (a, b, c) = (drop_at(44_100.0), drop_at(48_000.0), drop_at(96_000.0));
         for (x, y) in [(a, b), (b, c), (a, c)] {
