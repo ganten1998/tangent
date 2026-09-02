@@ -10,6 +10,7 @@
 //! collide in this file.
 
 pub mod comp;
+pub mod denoise;
 pub mod eq;
 pub mod imager;
 pub mod tape;
