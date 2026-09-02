@@ -185,6 +185,13 @@ const COMP_FACE_PARAMS: &[ParamSpec] = &[
 /// two together. The 32 learned thresholds are NOT knobs: they persist as
 /// the extra-state symbols `t0..t31` (see [`is_extra_symbol`]), because a
 /// threshold is a measurement, not a dial an automation lane should sweep.
+///
+/// `kernel` sits at the END, at id 6, and stays there. Ids and symbols are
+/// persisted forever and a value must never move one knob to the left
+/// because a parameter was added, so a new one takes a new number at the
+/// end of the road — which is also why a session written before this
+/// parameter existed reads it as the spec's default (Spectral Studio) and
+/// not as position zero.
 const DENOISE_FACE_PARAMS: &[ParamSpec] = &[
     ParamSpec { id: 0, symbol: "learn", name: "Learn", units: "", default: 0.0, steps: 2 },
     ParamSpec { id: 1, symbol: "reduce", name: "Reduce", units: "dB", default: 0.5, steps: 0 },
@@ -192,7 +199,13 @@ const DENOISE_FACE_PARAMS: &[ParamSpec] = &[
     ParamSpec { id: 3, symbol: "release", name: "Release", units: "ms", default: 0.5, steps: 0 },
     ParamSpec { id: 4, symbol: "sc_hpf", name: "Detector HPF", units: "Hz", default: 0.0, steps: 0 },
     ParamSpec { id: 5, symbol: "lookahead", name: "Lookahead", units: "", default: 1.0, steps: 2 },
+    ParamSpec { id: 6, symbol: "kernel", name: "Kernel", units: "", default: 0.5, steps: DENOISE_KERNEL_STEPS },
 ];
+
+/// How many positions the denoise's KERNEL menu has. A literal so the table
+/// above stays `const`; a test pins it to `DenoiseKernel::ALL`, the enum it
+/// steps through — the same arrangement the EQ's shape knob uses.
+const DENOISE_KERNEL_STEPS: i32 = crate::units::denoise::DENOISE_KERNEL_STEPS;
 
 /// One knob per panel control of `units::amp`. Ids 0..4 are the top strip
 /// (bright, volume, tone stack), 5..8 the vibrato group. Defaults are
@@ -513,13 +526,17 @@ pub fn describe(path: &str, id: u32, value: f32) -> String {
                         fmt_hz(sweep(DENOISE_SC_HPF_HZ))
                     }
                 }
-                _ => {
+                5 => {
                     if v >= 0.5 {
                         fmt_ms(DENOISE_LOOKAHEAD_MS)
                     } else {
                         "off".to_owned()
                     }
                 }
+                // The engine, in the selector's own words — the same
+                // strings `choices` offers, so the row and the reading can
+                // never disagree about which kernel is in the circuit.
+                _ => DenoiseKernel::from_dial(v).label().to_owned(),
             }
         }
         (AMP_PATH, 0) => (if v >= 0.5 { "on" } else { "off" }).to_owned(),
@@ -589,6 +606,10 @@ pub fn choices(path: &str, id: u32) -> Vec<String> {
         // The learn toggle's positions are the BUTTON's words, not on/off:
         // at rest it offers the verb, engaged it reports the state.
         (DENOISE_PATH, 0) => vec!["Learn".to_owned(), "Listening".to_owned()],
+        (DENOISE_PATH, 6) => crate::units::denoise::DenoiseKernel::ALL
+            .iter()
+            .map(|k| k.label().to_owned())
+            .collect(),
         (DENOISE_PATH, 5) | (AMP_PATH, 0) => {
             vec!["off".to_owned(), "on".to_owned()]
         }
@@ -1350,7 +1371,8 @@ impl DenoiseUnit {
             2 => self.params.smooth = v,
             3 => self.params.release = v,
             4 => self.params.sc_hpf = v,
-            _ => self.params.lookahead = v,
+            5 => self.params.lookahead = v,
+            _ => self.params.kernel = v,
         }
     }
 
@@ -2028,10 +2050,24 @@ mod tests {
         // And the wave-4 nine, same disease, same cure.
         let d = crate::units::denoise::DenoiseParams::default();
         for (spec, want) in DENOISE_FACE_PARAMS.iter().zip([
-            d.learn, d.reduce, d.smooth, d.release, d.sc_hpf, d.lookahead,
+            d.learn, d.reduce, d.smooth, d.release, d.sc_hpf, d.lookahead, d.kernel,
         ]) {
             assert_eq!(spec.default, want, "{} drifted from DenoiseParams::default", spec.symbol);
         }
+        // The kernel menu steps across exactly the kernel's enum, ends
+        // inclusive, and its default position is the one the enum calls
+        // Spectral Studio — a literal in the table, pinned to its source.
+        use crate::units::denoise::DenoiseKernel;
+        assert_eq!(
+            DENOISE_KERNEL_STEPS as usize,
+            DenoiseKernel::ALL.len(),
+            "the kernel knob's step count drifted from DenoiseKernel::ALL"
+        );
+        assert_eq!(
+            DenoiseKernel::from_dial(d.kernel),
+            DenoiseKernel::SpectralStudio,
+            "the shipped denoise no longer opens on Spectral Studio"
+        );
         // The amp's table is nine knobs to the kernel's eight: VIB is a
         // panel SWITCH the wrapper folds into vib_depth (off = depth 0),
         // so the switch and the intensity both rest at zero by design and
@@ -2400,9 +2436,13 @@ mod tests {
         let frames = 512;
         let mut out = vec![vec![0.0f32; frames]; 2];
         let mut seed = 7u32;
-        // Listening: ~160 ms of noise, far past the kernel's minimum pass.
+        // Listening: ~213 ms of noise, past the kernel's 200 ms minimum
+        // pass. This was 15 blocks and 160 ms, which cleared the 10.7 ms
+        // guard the bank shipped with; the guard is 200 ms now, because a
+        // tenth of a second is a mouse bounce and both kernels' learned
+        // statistics are averages that mean nothing over one.
         unit.set_param(0, 1.0);
-        for _ in 0..15 {
+        for _ in 0..20 {
             let input = noise_planar(frames, &mut seed);
             unit.process(&input, frames, &mut out);
         }
