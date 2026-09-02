@@ -23,6 +23,14 @@
 //! because "the IR came back too short" is a question that arrives here
 //! first and the answer is that it was never this.
 //!
+//! **Which makes twenty seconds a ceiling somebody has to hold, and it is
+//! not held here.** This kernel would cheerfully build 28,000 partitions for
+//! a five-minute file and bill the audio callback for them every block,
+//! forever, because nothing in a convolver knows what a reasonable impulse
+//! response is. The road that loads somebody else's IR is where the length
+//! is judged, before a bay is ever pointed at a file:
+//! `desktop::IR_LOAD_MAX_S`, which names this measurement as its reason.
+//!
 //! The partition is FIXED at 512 to match the engine's MAX_BLOCK chunking,
 //! and the engine's variable chunk sizes are absorbed by internal staging:
 //! input collects until a partition is full, output drains from a FIFO

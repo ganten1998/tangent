@@ -702,9 +702,9 @@ pub struct IrWizardState {
     pub live: crate::ports::IrLive,
     /// The Save field.
     pub name: String,
-    /// **A pass fired from THIS wizard is in flight and its result has not
-    /// been shown yet.** The only thing that may pull the wizard to its
-    /// result page.
+    /// **A pass fired from THIS wizard is in flight, and the capture id the
+    /// live picture carried when it was fired.** The only thing that may
+    /// pull the wizard to its result page.
     ///
     /// The host keeps the last finished capture on `IrLive` until a new pass
     /// replaces it, deliberately — closing the wizard mid-thought must not
@@ -714,13 +714,24 @@ pub struct IrWizardState {
     /// the FIRST run's result, and the auto-advance fired the instant the
     /// page was reached: stage 3 flashed past and the wizard showed the old
     /// capture as if it were new. That is "it skips stage 3 if the wizard is
-    /// used again in succession", and this latch is the fix — a result only
-    /// moves the wizard if the wizard is the one that asked for it.
+    /// used again in succession", and the latch is half the fix — a result
+    /// only moves the wizard if the wizard is the one that asked for it.
+    ///
+    /// The other half is the NUMBER, and it is why this is not a bool.
+    /// "The wizard asked" is not the same as "the pass ran": the host's
+    /// `start_ir_capture` gives up before it starts anything when no engine
+    /// is running or the sweep cannot be generated, and a bool latch left
+    /// the wizard armed and waiting over a `result` that still held the
+    /// PREVIOUS capture — which it then showed, and would have SAVED under
+    /// the new name. So what is remembered is `crate::ports::IrLive`'s
+    /// capture id AT THE MOMENT OF ASKING, and the advance waits for that
+    /// number to move. A failed arm never moves it, so a stale result can
+    /// no longer be mistaken for the one being waited on.
     ///
     /// It replaces the older `retried` flag, which said the same thing
     /// inside out (and only for the Retry button, which is why re-entry was
     /// never covered).
-    pub armed: bool,
+    pub armed: Option<u64>,
 }
 
 /// The offered sweep lengths, seconds. 15 is the default (Farina's own
@@ -742,7 +753,7 @@ impl Default for IrWizardState {
             tail_s: 10.0,
             live: crate::ports::IrLive::default(),
             name: String::new(),
-            armed: false,
+            armed: None,
         }
     }
 }
@@ -779,8 +790,61 @@ impl IrWizardState {
     /// the result the moment it was reached.
     pub fn record_another(&mut self) {
         self.stage = IrStage::Sweep;
-        self.armed = false;
+        self.armed = None;
         self.name.clear();
+    }
+
+    /// **Fire a capture through the unit: the pass whose result may move
+    /// this wizard on.** The sweep page's Capture button, and nothing else,
+    /// calls this.
+    ///
+    /// The name field is cleared with it: a second capture must not arrive
+    /// on the result page already named after the first one, one click from
+    /// writing over it.
+    ///
+    /// A METHOD rather than two lines at the button, because
+    /// [`Self::settle_from_live`] is the other end of the same latch and a
+    /// test that cannot press an egui button has to be able to arm the way
+    /// the button arms. Two spellings of one rule is how the rule drifts.
+    pub fn arm_capture(&mut self) {
+        self.armed = Some(self.live.capture_id);
+        self.name.clear();
+    }
+
+    /// **Fire the loop-only reference pass**, which produces no result to
+    /// show and therefore does NOT arm the advance: the wizard stays on the
+    /// sweep page waiting for the pass through the unit.
+    pub fn arm_reference(&mut self) {
+        self.armed = None;
+    }
+
+    /// **A finished capture pulls the wizard to its result page** — the
+    /// deconvolution ran on the host and pushed the outcome; nobody should
+    /// have to click "next" to see what they just measured.
+    ///
+    /// Three things have to be true, and each of them is a bug that was
+    /// reported. The wizard has to be ON the sweep page, or an auto-advance
+    /// would drag somebody off the page they walked back to. It has to have
+    /// ARMED the pass itself, or a reopened wizard advances on the previous
+    /// run's held result. And the host's capture id has to have MOVED past
+    /// the one this wizard saw when it armed, or an arm the host refused —
+    /// no engine, no sweep — leaves the wizard advancing onto the previous
+    /// capture and offering to save it under the new name.
+    ///
+    /// `show` calls exactly this, and so does its test. Lifting it out of
+    /// the frame is the whole point: an auto-advance written once inside an
+    /// egui closure can only be tested by a copy of itself, and a copy
+    /// proves nothing — revert this body to the broken predicate and the
+    /// test that drives it goes red, which is the only reason to trust it.
+    pub fn settle_from_live(&mut self) {
+        let Some(asked_at) = self.armed else { return };
+        if self.stage == IrStage::Sweep
+            && self.live.result.is_some()
+            && self.live.capture_id != asked_at
+        {
+            self.stage = IrStage::Result;
+            self.armed = None;
+        }
     }
 }
 
@@ -1197,6 +1261,16 @@ pub enum DialogAction {
 /// this exact string before treating the value as a file. `desktop.rs`
 /// answers it by raising the chooser and, on an answer, rebinding the bay
 /// through the same code an ordinary path takes.
+///
+/// **The ask is PARKED, never answered in the frame that made it.** The
+/// face closes itself as it asks (below), but a closed viewport is not a
+/// gone window: eframe destroys it a frame later, and the OS's panel is
+/// parented to the MAIN window, so a panel raised now opens underneath a
+/// face that is still on screen and still always-on-top — the app's own
+/// "Save As loads below the menu" bug, wearing a different hat.
+/// `desktop::take_ir_browse` therefore holds the request for the same
+/// settle every other picker in that file takes, and comes out of
+/// fullscreen first on the window managers that need it.
 pub const IR_BROWSE: &str = "\u{1f}browse";
 
 // ── the custom tuning editor ────────────────────────────────────────────────
@@ -4385,7 +4459,7 @@ fn draw_ir_sweep(
     {
         // A reference pass produces no result to show, so it does NOT arm
         // the advance — the wizard stays here waiting for the DUT pass.
-        s.armed = false;
+        s.arm_reference();
         *action = Some(DialogAction::IrCapture {
             out: s.out_pair(),
             inp: s.in_pair(),
@@ -4405,12 +4479,11 @@ fn draw_ir_sweep(
             ))
             .clicked()
     {
-        // THIS is the pass whose result may move the wizard on. The name
-        // field is cleared with it: a second capture must not arrive on the
-        // result page already named after the first one, one click from
-        // writing over it.
-        s.armed = true;
-        s.name.clear();
+        // THIS is the pass whose result may move the wizard on, and what
+        // arming means — the latch, the capture id it is waiting to see
+        // move, the cleared name — is `arm_capture`'s, so the button and
+        // the test arm through one body.
+        s.arm_capture();
         *action = Some(DialogAction::IrCapture {
             out: s.out_pair(),
             inp: s.in_pair(),
@@ -4912,6 +4985,15 @@ pub fn show(
                                         // so the face closes instead: the
                                         // chooser is unmistakably in front,
                                         // and the bay reopens on a click.
+                                        //
+                                        // Closing it is not enough on its
+                                        // own, and saying so here because
+                                        // this line looks like it is: the
+                                        // viewport is torn down a frame
+                                        // AFTER it stops being drawn, so
+                                        // the host holds the ask for that
+                                        // long before it raises anything.
+                                        // See `IR_BROWSE`.
                                         result.close = true;
                                         DialogAction::SetInsertIr {
                                             strip,
@@ -8181,18 +8263,13 @@ pub fn show(
             let (lcd, lcd_glass_c) = live_lcd(ctx);
             let st = crate::face::FaceStyle::new(face, lcd, lcd_glass_c);
             let s: &mut IrWizardState = state.as_mut();
-            // A finished capture pulls the wizard to its result page — the
-            // deconvolution ran on the host and pushed the outcome; nobody
-            // should have to click "next" to see what they just measured.
-            //
-            // **Only a result THIS wizard asked for.** See `armed`: the
-            // host holds the last capture on the live push across a close
-            // and reopen, so without the latch a second run skipped its
-            // sweep page and showed the first run's IR.
-            if s.armed && s.live.result.is_some() && s.stage == IrStage::Sweep {
-                s.stage = IrStage::Result;
-                s.armed = false;
-            }
+            // The auto-advance onto the result page. One line here because
+            // the rule itself lives on the state
+            // (`IrWizardState::settle_from_live`) where a test can drive the
+            // very same code: a predicate written out inside this closure
+            // can only be pinned by a copy of itself, and a copy goes on
+            // passing after the original has been broken.
+            s.settle_from_live();
             show_dialog_viewport(
                 ctx,
                 placement,
@@ -12724,23 +12801,26 @@ at: None,
     /// jumped to stage 4 and showed the FIRST run's IR.
     ///
     /// `armed` is the fix and this is its pin: a result only moves the
-    /// wizard if the wizard is the one that asked for it. The stage walk is
-    /// driven here through the same predicate `show` uses, because a headless
-    /// test cannot press an egui button — the arithmetic is what broke, and
-    /// the arithmetic is what is checked.
+    /// wizard if the wizard is the one that asked for it, AND the host's
+    /// capture id has moved since it asked.
+    ///
+    /// **The walk is driven through the production methods, not a copy of
+    /// them.** A headless test cannot press an egui button, so the
+    /// temptation is to restate `show`'s predicate here and drive that — and
+    /// the first version of this test did exactly that, which is worth
+    /// nothing: break `IrWizardState::settle_from_live` back to the version
+    /// that skipped stage 3 and a test carrying its own copy goes on
+    /// passing. `settle_from_live`, `arm_capture` and `arm_reference` are
+    /// methods for this reason, and every stage move below goes through
+    /// them. Only the HOST's half is written out here, and it is written as
+    /// `desktop::start_ir_capture` and `ir_tick` do it.
     #[test]
     fn the_wizard_walks_the_same_stages_on_every_run_and_record_another_loops() {
-        // The auto-advance, exactly as `Dialog::IrWizard`'s arm applies it.
-        fn settle(s: &mut IrWizardState) {
-            if s.armed && s.live.result.is_some() && s.stage == IrStage::Sweep {
-                s.stage = IrStage::Result;
-                s.armed = false;
-            }
-        }
-        // A pass fired from the wizard, and the host's answer to it.
-        fn arm(s: &mut IrWizardState) {
-            s.armed = true;
-            s.name.clear();
+        // The host's half, and only the host's half. A pass that reaches the
+        // engine counts the capture id up and clears the result; the worker
+        // lands the outcome some frames later.
+        fn host_started(s: &mut IrWizardState) {
+            s.live.capture_id += 1;
             s.live.result = None;
         }
         fn host_finished(s: &mut IrWizardState) {
@@ -12752,24 +12832,27 @@ at: None,
 
         let walk = |s: &mut IrWizardState| -> Vec<IrStage> {
             let mut seen = vec![s.stage];
-            settle(s);
+            s.settle_from_live();
             s.stage = IrStage::Level;
             seen.push(s.stage);
-            settle(s);
+            s.settle_from_live();
             s.stage = IrStage::Sweep;
             seen.push(s.stage);
             // Reaching the sweep page must NOT move on by itself.
-            settle(s);
+            s.settle_from_live();
             assert_eq!(
                 s.stage,
                 IrStage::Sweep,
                 "the sweep page was skipped before anything was armed"
             );
-            arm(s);
-            settle(s);
+            s.arm_capture();
+            s.settle_from_live();
             assert_eq!(s.stage, IrStage::Sweep, "armed is not captured");
+            host_started(s);
+            s.settle_from_live();
+            assert_eq!(s.stage, IrStage::Sweep, "the wizard advanced with no result");
             host_finished(s);
-            settle(s);
+            s.settle_from_live();
             seen.push(s.stage);
             seen
         };
@@ -12812,7 +12895,7 @@ at: None,
         second.tail_s = 20.0;
         second.record_another();
         assert_eq!(second.stage, IrStage::Sweep);
-        assert!(!second.armed);
+        assert!(second.armed.is_none());
         assert!(second.name.is_empty(), "the next capture inherited a name");
         assert_eq!((second.out_sel, second.in_sel), (3, 1), "the loop was lost");
         assert!((second.level_db + 6.0).abs() < 0.01, "the level was lost");
@@ -12820,19 +12903,56 @@ at: None,
         assert!((second.tail_s - 20.0).abs() < 0.01, "the tail was lost");
         // Sitting on the sweep page with the previous result still pushed
         // must not bounce back to it.
-        settle(&mut second);
+        second.settle_from_live();
         assert_eq!(
             second.stage,
             IrStage::Sweep,
             "record-another bounced straight back to the old result"
         );
-        // Arm again and the loop closes: capture, result, capture, result.
-        arm(&mut second);
-        settle(&mut second);
+
+        // **An arm the host REFUSED must not advance onto the last IR.**
+        //
+        // `start_ir_capture` gives up before it starts anything when no
+        // engine is running or the sweep will not generate, and the result
+        // on the live push is deliberately sticky, so the wizard sat armed
+        // over the PREVIOUS capture and showed it — one click from saving
+        // somebody else's measurement under this name. The refused pass
+        // never moves the capture id, so the advance never fires.
+        let stale = second.live.result.clone();
+        assert!(stale.is_some(), "the host is supposed to still hold the last one");
+        second.arm_capture();
+        for _ in 0..10 {
+            second.settle_from_live();
+        }
+        assert_eq!(
+            second.stage,
+            IrStage::Sweep,
+            "a capture the host refused advanced the wizard onto the previous IR"
+        );
+
+        // Arm again, this time with the host actually starting: the loop
+        // closes — capture, result, capture, result.
+        second.arm_capture();
+        host_started(&mut second);
+        second.settle_from_live();
         assert_eq!(second.stage, IrStage::Sweep);
         host_finished(&mut second);
-        settle(&mut second);
+        second.settle_from_live();
         assert_eq!(second.stage, IrStage::Result, "the loop did not come round");
+
+        // And the reference pass, which produces nothing to show, disarms:
+        // it must not leave the wizard primed to jump when the DUT pass's
+        // result lands somewhere else entirely.
+        second.record_another();
+        second.arm_reference();
+        host_started(&mut second);
+        host_finished(&mut second);
+        second.settle_from_live();
+        assert_eq!(
+            second.stage,
+            IrStage::Sweep,
+            "a loop-only reference pass moved the wizard on"
+        );
     }
 
     /// **Every send level the wizard offers is one the engine will honour,
