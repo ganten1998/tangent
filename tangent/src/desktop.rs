@@ -2974,6 +2974,8 @@ impl DesktopApp {
         }
         self.take_cartridge_request(ctx, frame);
         #[cfg(feature = "recorder")]
+        self.take_ir_browse(ctx, frame);
+        #[cfg(feature = "recorder")]
         self.take_save_panel(ctx, frame);
         self.take_project_request(ctx);
         #[cfg(feature = "recorder")]
@@ -3906,28 +3908,20 @@ impl DesktopApp {
                     self.push_ir_rows();
                 }
                 R::SetInsertIr { strip, slot, path } => {
-                    // A swap IS a reload: the IR is bound before the
-                    // instance crosses threads, so rewrite the sidecar
-                    // with the new path and the bay's own current knobs,
-                    // then mark the reload sentinel - the reconcile does
-                    // the rest, state and all.
-                    if let Some(e) = self.recorder.engine.as_ref() {
-                        if let Some((spec, values)) = e.builtin_insert(strip, slot) {
-                            if spec.path == crate::builtin_fx::IR_PATH {
-                                let mut extra = e.builtin_extra(strip, slot).to_vec();
-                                extra.retain(|(k, _)| k != "ir_path");
-                                extra.push(("ir_path".to_owned(), path));
-                                let blob = crate::builtin_fx::state_text(spec, values, &extra)
-                                    .into_bytes();
-                                write_insert_state(strip, slot, spec.path, &blob);
-                                let bays = tangent_ui::recorder::INSERTS;
-                                if let Some(cell) =
-                                    self.recorder.inserts_loaded.get_mut(strip * bays + slot)
-                                {
-                                    *cell = Some("\u{1f}reload".to_owned());
-                                }
-                            }
-                        }
+                    // **The sentinel first.** `IR_BROWSE` is the face's name
+                    // field asking for the system chooser rather than naming
+                    // a file; it is parked for `take_ir_browse` because rfd
+                    // must not be raised inside an egui frame. See the
+                    // constant for why the ask rides this field at all.
+                    if path == tangent_ui::dialogs::IR_BROWSE {
+                        self.ir.browse = Some((strip, slot));
+                        self.ir.browse_settle = IR_BROWSE_SETTLE_FRAMES;
+                        ctx.request_repaint();
+                    } else {
+                        // The shelf's ordinary road. A bay that is no
+                        // longer an IR just does not take it; the shelf is
+                        // drawn from the same face and cannot be stale.
+                        let _ = self.bind_insert_ir(strip, slot, &path);
                     }
                 }
                 R::IrSave { name } => {
@@ -4100,11 +4094,177 @@ impl DesktopApp {
         self.app.set_ir_rows(rows);
     }
 
+    /// Point one IR bay at an impulse file.
+    ///
+    /// A swap IS a reload: the IR is bound before the instance crosses
+    /// threads, so this rewrites the sidecar with the new path and the bay's
+    /// own current knobs, then marks the reload sentinel — the reconcile
+    /// does the rest, state and all. Answers whether the bay took it, so the
+    /// chooser road can say something when it was pointed at a seat that is
+    /// no longer an IR.
+    #[cfg(feature = "recorder")]
+    fn bind_insert_ir(&mut self, strip: usize, slot: usize, path: &str) -> bool {
+        let Some(e) = self.recorder.engine.as_ref() else {
+            return false;
+        };
+        let Some((spec, values)) = e.builtin_insert(strip, slot) else {
+            return false;
+        };
+        if spec.path != crate::builtin_fx::IR_PATH {
+            return false;
+        }
+        let mut extra = e.builtin_extra(strip, slot).to_vec();
+        extra.retain(|(k, _)| k != "ir_path");
+        extra.push(("ir_path".to_owned(), path.to_owned()));
+        let blob = crate::builtin_fx::state_text(spec, values, &extra).into_bytes();
+        write_insert_state(strip, slot, spec.path, &blob);
+        let bays = tangent_ui::recorder::INSERTS;
+        if let Some(cell) = self.recorder.inserts_loaded.get_mut(strip * bays + slot) {
+            *cell = Some("\u{1f}reload".to_owned());
+        }
+        true
+    }
+
+    /// **Raise the system file chooser for an IR bay, and load the answer.**
+    ///
+    /// Out here with the cartridge and folder pickers, and for the same
+    /// reason they are: `rfd` runs a nested run loop, and raising one inside
+    /// an egui frame re-enters the frame already on the stack. The face
+    /// window that asked closed itself as it asked (see `IR_BROWSE`), so by
+    /// the time this runs there is no floating child left for the panel to
+    /// open behind.
+    ///
+    /// The file is READ here rather than just handed on. `IrUnit::load_ir`
+    /// would refuse a bad one on the reload with a sentence nobody is
+    /// looking at, and this is a gesture whose whole content is "did that
+    /// work" — so the WAV is decoded first, the failure is a notification in
+    /// the user's own words, and the bay is only pointed at a file that is
+    /// going to play.
+    ///
+    /// What counts as readable, and what a rate mismatch means, is
+    /// `ir_load_verdict`'s — separated so it can be tested without a panel.
+    #[cfg(feature = "recorder")]
+    fn take_ir_browse(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        let Some((strip, slot)) = self.ir.browse.take() else {
+            return;
+        };
+        // **Out of fullscreen first, and open on a later frame.**
+        //
+        // Not a nicety: `rfd::pick_file` BLOCKS the main thread, and under
+        // i3 — or any X11 WM that honours `_NET_WM_STATE_FULLSCREEN`
+        // properly — a fullscreen window sits above the panel it opened, so
+        // the app waits forever on a dialog nobody can see, focus or
+        // dismiss. That is a hard freeze with nothing in the console, and it
+        // is why every other picker in this file asks the same question.
+        // See `picker_needs_windowed`; `restore_fullscreen` puts it back,
+        // and knows about this request so it cannot put it back early.
+        if Self::picker_needs_windowed(ctx) {
+            self.ir.browse = Some((strip, slot));
+            self.refullscreen = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            return;
+        }
+        // **And the frames the face window needs to actually be gone.** The
+        // face closed itself as it asked, but a closed viewport is not a
+        // gone window — see `IR_BROWSE_SETTLE_FRAMES`.
+        if self.ir.browse_settle > 0 {
+            self.ir.browse_settle -= 1;
+            self.ir.browse = Some((strip, slot));
+            ctx.request_repaint();
+            return;
+        }
+        // **No portal, no zenity, no panel.** Every other picker falls back
+        // to the in-app browser here; that browser answers through
+        // `FilePurpose`, whose arms live in `app.rs`, so this one says what
+        // is true and points at the road that does work everywhere.
+        if !Self::native_dialogs_work() {
+            self.app.notify(
+                Kind::Error,
+                "No system file chooser is available here. Put the impulse in \
+                 Tangent Media/IRs and pick it off the shelf.",
+            );
+            return;
+        }
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Load an impulse response")
+            // Parented to the window that asked, the pickers' law: an
+            // unparented panel can open BEHIND the app on Windows, which
+            // reads as a button that does nothing.
+            .set_parent(frame);
+        // The IRs folder is where the wizard's own captures land, so it is
+        // the one directory this gesture is certainly about — and a chooser
+        // opening wherever the OS last left it is a poor first frame.
+        let irs = self.app.irs_root();
+        if irs.is_dir() {
+            dialog = dialog.set_directory(&irs);
+        }
+        // **The reader's own list.** `wavread` speaks WAV — PCM 16/24/32 and
+        // 32-bit float, plain or WAVE_FORMAT_EXTENSIBLE — and nothing else,
+        // so those are the extensions offered. "All files" second, because a
+        // filter DIMS on macOS and HIDES on Windows, and impulse libraries
+        // in the wild ship `.WAV` in capitals and occasionally no extension
+        // at all: a folder that looks empty is a dialog somebody closes
+        // again, and they are right to.
+        dialog = dialog.add_filter("WAV impulse responses", &["wav", "WAV"]);
+        dialog = dialog.add_filter("All files", &["*"]);
+        let file = dialog.pick_file();
+        self.app.native_panel_closed();
+        self.restore_fullscreen(ctx);
+        let Some(file) = file else { return };
+        // Decoded before it is bound, so a refusal is a sentence and never a
+        // silently dead bay.
+        let wav = match crate::wavread::read(&file) {
+            Ok(w) => w,
+            Err(e) => {
+                self.app.notify(Kind::Error, e);
+                return;
+            }
+        };
+        let name = file
+            .file_stem()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| file.display().to_string());
+        let engine_rate = self
+            .recorder
+            .engine
+            .as_ref()
+            .map_or(0, |e| e.output().sample_rate);
+        let (kind, said) = match ir_load_verdict(&wav, engine_rate, &name) {
+            Ok(v) => v,
+            Err(refusal) => {
+                self.app.notify(Kind::Error, refusal);
+                return;
+            }
+        };
+        if !self.bind_insert_ir(strip, slot, &file.to_string_lossy()) {
+            self.app.notify(
+                Kind::Error,
+                "That bay no longer holds a Tangent IR - reopen it and try again.",
+            );
+            return;
+        }
+        self.app.notify(kind, said);
+    }
+
     /// Arm one sweep pass — the wizard's stage-3 button, and its optional
     /// loop-only reference pass. Everything the engine will touch is built
     /// here: the sweep from the verified math in `units::sweep`, the level
     /// from the stage the meter approved, a second of pre-roll so the noise
     /// floor is measured and the loop's latency never eats the sweep's head.
+    ///
+    /// **It can give up, and the giving up has to be visible.** No engine is
+    /// running, or the rate will not carry a sweep: both leave here having
+    /// started nothing. The wizard is waiting for a result, and the result
+    /// already on the live push is the PREVIOUS capture — held there on
+    /// purpose, so closing the panel mid-thought costs nobody their pass —
+    /// so a wizard that advanced on "a result exists" showed that old IR as
+    /// the new one and offered Save one click away. Writing the wrong file
+    /// silently is the worst thing an archival tool can do.
+    ///
+    /// So `ir.captures` counts up ONLY past the last early return, and rides
+    /// out on `IrLive::capture_id`. A refused arm never moves the number,
+    /// and `IrWizardState::settle_from_live` will not advance until it has
+    /// moved — the mistake is not handled, it is unavailable.
     fn start_ir_capture(
         &mut self,
         out: (usize, usize),
@@ -4168,6 +4328,11 @@ impl DesktopApp {
             duration: sweep_s,
             total,
         });
+        // Past every early return: this pass is real, so it gets the next
+        // id — the wizard's proof that what lands next is ITS capture and
+        // not the one still sitting on the live push.
+        self.ir.captures += 1;
+        self.ir.live.capture_id = self.ir.captures;
         self.ir.live.result = None;
         self.ir.live.capturing = true;
         self.ir.live.progress = 0.0;
@@ -4278,7 +4443,18 @@ impl DesktopApp {
             self.app.set_ir_live(self.ir.live.clone());
             return;
         }
-        let stem = sanitize_file_stem(name);
+        // **Two captures in one session must not overwrite each other.**
+        //
+        // The wizard is now a loop — capture, save, "Record another IR",
+        // repeat — which is how somebody takes a box's whole program list in
+        // an afternoon. The name field is a text box, and typing the same
+        // word twice (or leaving one word in it, which is what used to
+        // happen) wrote straight over the previous file: a measurement that
+        // cost a sweep, a tail and a deconvolution, gone with no question
+        // asked. Nothing here is important enough to justify that, so the
+        // second one becomes "<name> 2" and the phase line says which name
+        // it actually got.
+        let stem = unique_ir_stem(&dir, &sanitize_file_stem(name));
         let path = dir.join(format!("{stem}.wav"));
         let spec = tangent_record::wav::WavSpec {
             sample_rate: f.rate,
@@ -4911,10 +5087,14 @@ impl DesktopApp {
         // straight back while the save was still waiting — the blocking rfd
         // panel then opened under the fullscreen window, which is the buried
         // modal the 4.18.0 note above calls force-quit territory.
+        // **And the IR bay's chooser**, which arrived after the save panel
+        // and sits later still in `after_frame`: same road, same trap, its
+        // own slot to be missed from.
         if self.app.open_dialog().is_some()
             || self.deferred_file.is_some()
             || self.deferred_dir.is_some()
             || self.deferred_save.is_some()
+            || self.ir.browse.is_some()
         {
             return;
         }
@@ -8831,6 +9011,131 @@ fn preset_delete_target(
         .then_some(canon)
 }
 
+/// **The longest impulse response the IR bay will take, in seconds.**
+///
+/// Twenty, and the number is not invented here — it is the one the rest of
+/// the road already lives by, said out loud on the only path that was not
+/// obeying it:
+///
+/// * the wizard's TAIL row tops out at 20 s, and `process_ir_capture` cuts
+///   every capture to that window because nothing past it was recorded, so
+///   20 s is the longest IR Tangent itself can produce;
+/// * `units::convolver`'s
+///   `the_longest_ir_the_wizard_can_produce_is_not_beyond_the_kernel` runs
+///   exactly that length — 1875 partitions of 512 — and measures it at 18x
+///   realtime, per bay, which is the cost this ceiling is buying.
+///
+/// The browse road went around both. `IrUnit::load_ir` has no length
+/// opinion at all, so pointing a bay at a five-minute file built 28,000
+/// partitions and billed the audio callback for them every block, forever,
+/// with nothing said. A refusal here costs one sentence; the alternative
+/// costs the session. Refused rather than silently shortened because this
+/// road only ever POINTS at somebody's file — it does not own it, and an
+/// archival tool that quietly plays four fifths of what you gave it is
+/// worse than one that says no.
+#[cfg(feature = "recorder")]
+const IR_LOAD_MAX_S: f32 = 20.0;
+
+/// **What loading a decoded WAV into an IR bay would mean, as the sentence
+/// the user is going to read.** `Err` refuses and binds nothing; `Ok` binds,
+/// and carries the notification that goes with it.
+///
+/// Separated from `take_ir_browse` because the panel cannot be raised in a
+/// test and this is the half that has the opinions. Every refusal here is
+/// one `IrUnit::load_ir` would ALSO make on the reload — but it would make
+/// it into a per-bay status line, a frame later, after the sidecar had
+/// already been rewritten to name a file that does not play. A gesture whose
+/// entire content is "did that work" answers before it commits.
+///
+/// **A rate mismatch loads and says so**, which is `IrUnit::load_ir`'s
+/// standing decision rather than a new one: the convolution is still
+/// well-defined, only shifted in pitch and time by the ratio, and something
+/// wrong-but-reported beats a refusal in the middle of a session. It is an
+/// `Error` rather than a receipt so it lives long enough to be read
+/// (`Kind::life`) — a wrong-sounding IR nobody was told about is worse than
+/// no IR. Resampling is the archival answer and belongs in the unit, once,
+/// for every road that reaches it; not bolted onto one picker.
+///
+/// **A length ceiling, because this road is the one that had none.** See
+/// [`IR_LOAD_MAX_S`].
+///
+/// `engine_rate` of 0 means no engine is running and there is nothing to
+/// compare against, so no claim is made either way.
+#[cfg(feature = "recorder")]
+fn ir_load_verdict(
+    wav: &crate::wavread::WavData,
+    engine_rate: u32,
+    name: &str,
+) -> Result<(Kind, String), String> {
+    // Guessing which four of six channels form a true-stereo set is how
+    // somebody's surround bounce becomes a mystery reverb — the same
+    // sentence `IrUnit::load_ir` refuses with.
+    if !(1..=2).contains(&wav.channels.len()) {
+        return Err(format!(
+            "{name} has {} channels; an impulse response plays as one or two.",
+            wav.channels.len()
+        ));
+    }
+    if wav.channels.iter().all(Vec::is_empty) {
+        return Err(format!("{name} holds no samples."));
+    }
+    // A file that decodes to nothing but zeros is a wire, and binding it
+    // would look exactly like the load having silently failed.
+    if wav
+        .channels
+        .iter()
+        .all(|c| c.iter().all(|v| !v.is_finite() || *v == 0.0))
+    {
+        return Err(format!("{name} is silent - it would play as a wire."));
+    }
+    let frames = wav.channels.iter().map(Vec::len).max().unwrap_or(0);
+    let seconds = frames as f32 / wav.rate.max(1) as f32;
+    // The ceiling the capture road has always had and this road did not.
+    if seconds > IR_LOAD_MAX_S {
+        return Err(format!(
+            "{name} is {seconds:.1} s long. Tangent plays impulses up to \
+             {IR_LOAD_MAX_S:.0} s - the longest its own wizard can capture, \
+             and the length its convolver is measured at. Trim it on a track \
+             and save the shorter file."
+        ));
+    }
+    if engine_rate != 0 && wav.rate != engine_rate {
+        return Ok((
+            Kind::Error,
+            format!(
+                "Loaded {name} ({seconds:.2} s) - it was made at {} Hz and this \
+                 session runs at {engine_rate} Hz, so it plays shifted.",
+                wav.rate
+            ),
+        ));
+    }
+    Ok((Kind::Success, format!("Loaded {name} ({seconds:.2} s).")))
+}
+
+/// A file stem under `dir` that is not taken: `stem`, else `stem 2`,
+/// `stem 3`… — the Finder's own suffix, so the result reads like something a
+/// person named rather than something a program mangled.
+///
+/// Only ever CONSULTED, never locked: two processes racing for the same name
+/// is not a situation this app can be in (one wizard, one folder), and a
+/// check-then-write is the same shape every other save in here has.
+///
+/// Gives up at a hundred and hands back the plain stem. A hundred files
+/// called the same thing is somebody who wants the overwrite.
+#[cfg(feature = "recorder")]
+fn unique_ir_stem(dir: &std::path::Path, stem: &str) -> String {
+    if !dir.join(format!("{stem}.wav")).exists() {
+        return stem.to_owned();
+    }
+    for n in 2..100u32 {
+        let candidate = format!("{stem} {n}");
+        if !dir.join(format!("{candidate}.wav")).exists() {
+            return candidate;
+        }
+    }
+    stem.to_owned()
+}
+
 #[cfg(feature = "recorder")]
 /// A file stem the filesystem will take: separators out, trimmed, never
 /// empty.
@@ -9027,7 +9332,44 @@ struct IrRoad {
     /// The launch scan has run — once, on the first frame, when the app
     /// exists to receive the rows.
     scanned: bool,
+    /// **A bay whose name field asked for the file chooser**, as (seat,
+    /// bay). Parked here for one frame rather than answered on the spot:
+    /// `rfd` runs a nested run loop and raising one inside an egui frame
+    /// re-enters the frame already on the stack — the same law every other
+    /// picker in this file follows — and the face window that asked has to
+    /// be gone from the screen before a panel parented to the main window
+    /// can be in front of it. `take_ir_browse` picks it up.
+    browse: Option<(usize, usize)>,
+    /// Frames the browse request above still has to sit out before the
+    /// panel may be raised. See [`IR_BROWSE_SETTLE_FRAMES`].
+    browse_settle: u8,
+    /// **How many passes have actually reached the engine**, counted up by
+    /// `start_ir_capture` after the last of its early returns and never
+    /// reset. It rides out on `IrLive::capture_id`, where the wizard uses it
+    /// to tell the result it is waiting for from the one it already saw —
+    /// the difference between showing a fresh capture and silently saving
+    /// somebody's previous one under a new name.
+    captures: u64,
 }
+
+/// How many frames a browse request waits before the file panel is raised.
+///
+/// **Two, and both of them are somebody's bug.** The IR face asks for the
+/// chooser and closes itself in the same frame, but `result.close` only
+/// stops the viewport being DRAWN — eframe tears the window down on the
+/// frame after that, and this runs inside `after_frame`, before the
+/// face-less frame has even been presented. A panel raised now is parented
+/// to the main window and opens UNDERNEATH a face that is still on screen
+/// and still always-on-top: the app's own "Save As loads below the menu",
+/// which reads as a button that does nothing.
+///
+/// So: one frame for the face-less frame to be presented, one for the
+/// window to be gone. It is the same count `take_cartridge_request` reaches
+/// by two separate holds (`take_file_request` then `arm_panel`) and
+/// `take_save_panel` by its own pair, written as a number here because this
+/// road has no dialog-side hold to borrow — the face is already closed, so
+/// `native_panel_up` has nothing left to report.
+const IR_BROWSE_SETTLE_FRAMES: u8 = 2;
 
 /// What `start_ir_capture` remembers about the armed pass.
 struct IrPending {
@@ -9127,15 +9469,60 @@ fn process_ir_capture(
             (probe.ir.clone(), dr.ir, false)
         }
     };
-    // One start for BOTH channels — the earlier foot — so the stereo pair
-    // stays sample-locked (the IRU rule: edits apply across all tracks).
-    let start = ess::find_onset(&l).min(ess::find_onset(&r));
+    // One start for BOTH channels, so the stereo pair stays sample-locked
+    // (the IRU rule: edits apply across all tracks) — and taken only from
+    // the channels that actually carry the capture. `find_onset` walks left
+    // from its OWN channel's peak, so a side with nothing on it answers an
+    // index off in the noise, and the earlier-of-the-two spelling let that
+    // index decide the trim for the pair. See `sweep::set_onset`.
+    let start = ess::set_onset(&[&l, &r]);
     ess::trim_leading(&mut l, start);
     ess::trim_leading(&mut r, start);
     ess::remove_dc(&mut l);
     ess::remove_dc(&mut r);
-    ess::truncate_at_floor(&mut l, floor_db, rate);
-    ess::truncate_at_floor(&mut r, floor_db, rate);
+    // **The truncation threshold is translated into the IR's own scale
+    // first.** The floor above is the RECORDING's dBFS; `l` and `r` came out
+    // of a division and are in no scale the converter ever saw. Handing the
+    // recording's number straight to the truncator was the short-IR bug —
+    // `sweep::recovered_floor_db` carries the measurement that proves it and
+    // does the translation from the one quantity that survives a division,
+    // the capture's own signal-to-noise ratio.
+    //
+    // ONE threshold for the pair, from the SET's peak, for the same reason
+    // `normalize_set` uses one scale: the level difference between the
+    // channels is the stereo image, and a per-channel threshold would cut
+    // the quieter side early and skew it.
+    //
+    // **And no IR is longer than the silence recorded after the sweep.**
+    //
+    // The sweep occupies frames [pre, pre+S) of a (pre+S+T)-frame recording,
+    // so the response to its LAST sample is observed for exactly T more
+    // frames: lags past T were never recorded and nothing after them is the
+    // box. What the deconvolution puts there is its own edge — the classic
+    // route's linear-convolution overhang, the reference route's circular
+    // wrap and regularization ringing — and on a pristine capture, where the
+    // threshold below is never reached, that is what the wizard would ship:
+    // a twenty-six-second "IR" of a three-second plate, measured. Cutting to
+    // T is not a heuristic, it is the edge of the measurement.
+    //
+    // The cut goes through `sweep::cut_with_fade` for both of the reasons
+    // that function exists. It FADES: this is the binding cut on any clean
+    // capture — the level threshold below is never crossed there at all —
+    // and a hard stop at full tail level is a step the convolver rings into
+    // everything it touches. And it CLAMPS: an onset read a shade early
+    // could otherwise put this cut in front of the direct impulse and
+    // delete the measurement, which no length is worth.
+    let window = frames.saturating_sub(pre + sweep.len()).max(1);
+    ess::cut_with_fade(&mut l, window, rate);
+    ess::cut_with_fade(&mut r, window, rate);
+    let capture_peak = left
+        .iter()
+        .chain(right.iter())
+        .fold(0.0f32, |m, &v| m.max(v.abs()));
+    let ir_peak = l.iter().chain(r.iter()).fold(0.0f32, |m, &v| m.max(v.abs()));
+    let ir_floor_db = ess::recovered_floor_db(ir_peak, capture_peak, floor_db);
+    ess::truncate_at_floor(&mut l, ir_floor_db, rate);
+    ess::truncate_at_floor(&mut r, ir_floor_db, rate);
     // Tail lengths equalized by silence, so the pair interleaves cleanly;
     // both ends were just faded to the floor, so the padding is inaudible.
     let len = l.len().max(r.len()).max(1);
@@ -9150,6 +9537,16 @@ fn process_ir_capture(
     let peak_at = ess::linear_peak(&l).min(ess::linear_peak(&r));
     let seconds = (len as f64 / rate) as f32;
     let usable_s = ((len.saturating_sub(peak_at)) as f64 / rate) as f32;
+    // What the capture actually achieved, said in the two numbers that
+    // decide how much tail there was to keep: how hot it ran, and how far
+    // that sat above the loop's own floor. The wizard prints both, because
+    // "the IR came out short" is nearly always one of them being poor and
+    // there is no way to tell which from a length alone.
+    let capture_peak_db = if capture_peak > 0.0 {
+        20.0 * capture_peak.log10()
+    } else {
+        -200.0
+    };
     let outcome = tangent_ui::ports::IrOutcome {
         envelope_db: ir_envelope_db(&l, &r),
         seconds,
@@ -9158,6 +9555,9 @@ fn process_ir_capture(
         thd2_db: thd2,
         thd3_db: thd3,
         has_reference,
+        capture_peak_db,
+        tail_range_db: (capture_peak_db - floor_db)
+            .clamp(0.0, ess::TAIL_RANGE_MAX_DB as f32),
     };
     (l, r, outcome)
 }
@@ -12179,6 +12579,615 @@ mod tests {
         let peak = decoded.samples.iter().fold(0.0f32, |a, b| a.max(b.abs()));
         assert!(peak > 0.3 && peak < 0.8, "the sine came back at {peak}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ── loading somebody else's IR ───────────────────────────────────────────
+
+    /// **The IR chooser follows the pickers' protocol, and the capture
+    /// counter sits past the early returns.**
+    ///
+    /// Both are rules about the SHAPE of a function that cannot be asserted
+    /// at runtime — one needs an X11 window manager and a nested OS run
+    /// loop, the other needs an engine that is not there — so they are read
+    /// off the source, the way `a_restarted_engine_is_told_the_tempo_map_again`
+    /// reads its rule. Narrow on purpose, and worth knowing where the limit
+    /// is: this notices the protocol being REMOVED, not a new picker being
+    /// written without it.
+    ///
+    /// What is being protected:
+    ///
+    /// * `rfd::pick_file` BLOCKS the main thread, and a fullscreen X11
+    ///   window sits above the panel it raised — so the app waits forever on
+    ///   a dialog nobody can see, focus or dismiss. That is a hard freeze on
+    ///   Linux and FreeBSD with nothing in the console, and it is why every
+    ///   picker in this file comes out of fullscreen and opens on a later
+    ///   frame. `take_ir_browse` shipped without it.
+    /// * The face that asked closes itself, but a closed viewport is not a
+    ///   gone window, so the panel needs frames to settle or it opens
+    ///   underneath a face that is still always-on-top.
+    /// * `start_ir_capture` can give up before it starts anything. If the
+    ///   capture counter moved anyway, the wizard would advance onto the
+    ///   PREVIOUS capture and offer to save it under the new name.
+    #[test]
+    fn the_ir_pickers_protocol_and_the_capture_counter_are_where_they_have_to_be() {
+        let src = include_str!("desktop.rs");
+        let body = |from: &str, to: &str| -> &str {
+            let a = src.find(from).unwrap_or_else(|| panic!("{from} is gone"));
+            let b = src[a..].find(to).unwrap_or_else(|| panic!("{to} after {from}"));
+            &src[a..a + b]
+        };
+
+        let browse = body("fn take_ir_browse", "/// Arm one sweep pass");
+        let raise = browse.find(".pick_file()").expect("the chooser is no longer raised");
+        for (needle, why) in [
+            (
+                "Self::picker_needs_windowed(ctx)",
+                "the fullscreen check is gone - a fullscreen Linux or FreeBSD                  window will sit on top of the blocking panel and freeze the app",
+            ),
+            (
+                "self.refullscreen = true;",
+                "nothing asks for fullscreen back, so a load silently leaves                  the window in a shape nobody chose",
+            ),
+            (
+                "egui::ViewportCommand::Fullscreen(false)",
+                "the window never leaves fullscreen",
+            ),
+            (
+                "self.ir.browse_settle",
+                "the settle is gone - the panel opens under the face window                  that asked for it",
+            ),
+        ] {
+            let at = browse
+                .find(needle)
+                .unwrap_or_else(|| panic!("`take_ir_browse` no longer has `{needle}`: {why}"));
+            assert!(at < raise, "`{needle}` moved AFTER the panel is raised: {why}");
+        }
+
+        // And the counter. Everything before the last `return;` is a way out
+        // that started nothing, so the count has to come after all of them.
+        let arm = body("fn start_ir_capture(", "fn ir_tick");
+        let count = arm
+            .find("self.ir.captures += 1;")
+            .expect("`start_ir_capture` no longer counts the passes it starts");
+        let last_return = arm.rfind("            return;\n").expect("the early returns are gone");
+        assert!(
+            last_return < count,
+            "the capture counter moved ahead of an early return: a pass the \
+             host refused would advance the wizard onto the previous IR and \
+             offer to save it under the new name"
+        );
+    }
+
+    /// **Clicking the IR face's name field loads a file from anywhere, and
+    /// every way that can go wrong comes back as a sentence.**
+    ///
+    /// The panel itself cannot be raised in a test — it is a nested OS run
+    /// loop — so what is pinned is the half that decides: `ir_load_verdict`
+    /// runs on files written here and read back through the app's own
+    /// `wavread`, which is the same decode the bay will do. The point of
+    /// deciding BEFORE binding is that a refusal must not first rewrite the
+    /// sidecar to name a file that does not play.
+    #[test]
+    fn an_external_ir_is_judged_before_it_is_bound() {
+        let dir = std::env::temp_dir().join(format!(
+            "tangent-ir-load-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let write = |name: &str, rate: u32, channels: u16, frames: usize, amp: f32| {
+            let path = dir.join(name);
+            let spec = tangent_record::wav::WavSpec {
+                sample_rate: rate,
+                channels,
+                format: tangent_record::wav::SampleFormat::Float32,
+            };
+            let bext = tangent_record::wav::Bext::new(
+                tangent_record::wav::Wallclock::now_utc(),
+                spec,
+            );
+            let mut inter = vec![0.0f32; frames * channels as usize];
+            for (i, v) in inter.iter_mut().enumerate() {
+                *v = if i == 0 { amp } else { amp * 0.01 };
+            }
+            let mut w =
+                tangent_record::wav::WavWriter::create(&path, spec, &bext).expect("create");
+            w.write_interleaved(&inter).expect("write");
+            w.finish().expect("finish");
+            path
+        };
+
+        // The ordinary case: a stereo 48 k impulse into a 48 k session.
+        let good = write("plate.wav", 48_000, 2, 48_000, 0.9);
+        let wav = crate::wavread::read(&good).expect("the writer's own file did not read");
+        let (kind, said) =
+            super::ir_load_verdict(&wav, 48_000, "plate").expect("a plain stereo IR was refused");
+        assert_eq!(kind, tangent_ui::notify::Kind::Success);
+        assert!(said.contains("1.00 s"), "the length was not reported: {said}");
+
+        // A rate mismatch LOADS and says so — the unit's standing decision —
+        // and says it loudly enough to be read.
+        let slow = write("room-44k.wav", 44_100, 2, 44_100, 0.9);
+        let wav = crate::wavread::read(&slow).expect("read");
+        let (kind, said) = super::ir_load_verdict(&wav, 48_000, "room-44k")
+            .expect("a 44.1 k IR was refused rather than loaded shifted");
+        assert_eq!(
+            kind,
+            tangent_ui::notify::Kind::Error,
+            "a shifted IR was announced as a receipt and would vanish unread"
+        );
+        assert!(
+            said.contains("44100") && said.contains("48000") && said.contains("shifted"),
+            "the mismatch was not explained: {said}"
+        );
+        // With no engine running there is nothing to compare against and no
+        // claim is made.
+        assert_eq!(
+            super::ir_load_verdict(&wav, 0, "room-44k").expect("refused").0,
+            tangent_ui::notify::Kind::Success
+        );
+
+        // Six channels: refused, because guessing which four are the
+        // true-stereo set is how a surround bounce becomes a mystery reverb.
+        let wide = write("atmos.wav", 48_000, 6, 4_800, 0.5);
+        let wav = crate::wavread::read(&wide).expect("read");
+        let refusal = super::ir_load_verdict(&wav, 48_000, "atmos")
+            .expect_err("a six-channel file was accepted as an IR");
+        assert!(refusal.contains("6 channels"), "{refusal}");
+
+        // **Too long: refused, with the ceiling and the reason.**
+        //
+        // This road had no length opinion at all — `IrUnit::load_ir` has
+        // none either — so a bay could be pointed at a file minutes long and
+        // the convolver would build a partition for every 512 samples of it
+        // and bill the audio callback for them every block, forever, with
+        // nothing said. The wizard's own captures have always been bounded
+        // (`process_ir_capture` cuts to the recorded window, at most the
+        // 20 s the TAIL row offers); this is the same bound, said on the
+        // road that was going around it. Written at 8 k so the fixture is a
+        // few hundred kilobytes rather than a few megabytes: the verdict
+        // reads SECONDS, and seconds is what is being pinned.
+        let long = write("cathedral.wav", 8_000, 2, 8_000 * 25, 0.9);
+        let wav = crate::wavread::read(&long).expect("read");
+        let refusal = super::ir_load_verdict(&wav, 8_000, "cathedral")
+            .expect_err("a 25 s impulse was bound with no ceiling at all");
+        assert!(
+            refusal.contains("25.0 s") && refusal.contains("20 s"),
+            "the refusal did not state the length and the ceiling: {refusal}"
+        );
+        // And the ceiling itself loads: a bound nobody can reach is not a
+        // bound, it is an off-by-one waiting to be reported.
+        let at_ceiling = write("edge.wav", 8_000, 2, 8_000 * 20, 0.9);
+        let wav = crate::wavread::read(&at_ceiling).expect("read");
+        assert!(
+            super::ir_load_verdict(&wav, 8_000, "edge").is_ok(),
+            "an IR exactly at the {} s ceiling was refused",
+            super::IR_LOAD_MAX_S
+        );
+
+        // Silence is a wire, and binding it looks exactly like the load
+        // having failed without saying so.
+        let mute = write("empty.wav", 48_000, 2, 4_800, 0.0);
+        let wav = crate::wavread::read(&mute).expect("read");
+        assert!(
+            super::ir_load_verdict(&wav, 48_000, "empty")
+                .expect_err("a silent file was bound")
+                .contains("silent")
+        );
+
+        // Not audio at all: the reader refuses first, in its own words, and
+        // the browse road passes those words straight through.
+        let junk = dir.join("notes.txt");
+        std::fs::write(&junk, b"these are not samples").expect("write junk");
+        let err = match crate::wavread::read(&junk) {
+            Err(e) => e,
+            Ok(_) => panic!("a text file read as audio"),
+        };
+        assert!(err.contains("not a WAV"), "{err}");
+        // And a WAV whose data chunk was cut off mid-file.
+        let cut = dir.join("truncated.wav");
+        let whole = std::fs::read(&good).expect("read back");
+        std::fs::write(&cut, &whole[..64]).expect("write truncated");
+        assert!(
+            crate::wavread::read(&cut).is_err(),
+            "a 64-byte fragment decoded as an impulse response"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Two captures in one session cannot overwrite each other silently.**
+    ///
+    /// The wizard is a loop now — capture, save, "Record another IR", repeat
+    /// — so the same name arriving twice is ordinary, not exceptional. It
+    /// used to write straight over the previous file: a measurement that
+    /// cost a sweep, a tail and a deconvolution, gone with nothing asked.
+    #[test]
+    fn a_second_capture_saved_under_the_same_name_does_not_replace_the_first() {
+        let dir = std::env::temp_dir().join(format!(
+            "tangent-ir-stem-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        assert_eq!(super::unique_ir_stem(&dir, "Holmes Plate"), "Holmes Plate");
+        std::fs::write(dir.join("Holmes Plate.wav"), b"x").expect("write");
+        assert_eq!(super::unique_ir_stem(&dir, "Holmes Plate"), "Holmes Plate 2");
+        std::fs::write(dir.join("Holmes Plate 2.wav"), b"x").expect("write");
+        assert_eq!(super::unique_ir_stem(&dir, "Holmes Plate"), "Holmes Plate 3");
+        // A name nobody has used is still itself — the suffix only appears
+        // where it has to.
+        assert_eq!(super::unique_ir_stem(&dir, "Small Room"), "Small Room");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
+    // ── the IR road's tail, end to end ──────────────────────────────────────
+
+    /// A plate-like reverb with a KNOWN decay: dense exponentially-decaying
+    /// noise, band-limited by a pair of one-poles so it is not white to
+    /// Nyquist, with a direct arrival at the front for the onset hunt to
+    /// find. The synthetic stands in for the hardware the wizard exists to
+    /// capture, and its RT60 is the number the round trip has to give back.
+    fn synth_plate(rt60: f64, secs: f64, rate: f64) -> Vec<f32> {
+        let n = (secs * rate) as usize;
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut lp = 0.0f64;
+        let mut hp = 0.0f64;
+        let mut out = vec![0.0f32; n];
+        for (i, v) in out.iter_mut().enumerate() {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let w = ((seed >> 33) as f64 / (1u64 << 31) as f64) - 1.0;
+            lp += 0.35 * (w - lp);
+            hp += 0.004 * (lp - hp);
+            let t = i as f64 / rate;
+            *v = ((lp - hp) * 10.0f64.powf(-3.0 * t / rt60)) as f32;
+        }
+        out[0] = 1.0;
+        out
+    }
+
+    /// RT60 by Schroeder backward integration, read off the T20 span
+    /// (−5 dB to −25 dB) and extrapolated. T20 rather than the full 60 dB on
+    /// purpose: it is the ISO 3382 reading, and it is the one that can be
+    /// taken from a tail that has been honestly truncated — a T60 read would
+    /// be measuring the truncation rather than the decay.
+    fn rt60_of(ir: &[f32], rate: f64) -> f64 {
+        let n = ir.len();
+        let mut tail = vec![0.0f64; n + 1];
+        for i in (0..n).rev() {
+            tail[i] = tail[i + 1] + f64::from(ir[i]) * f64::from(ir[i]);
+        }
+        let total = tail[0];
+        if total <= 0.0 {
+            return 0.0;
+        }
+        let db = |i: usize| 10.0 * (tail[i] / total).max(1e-30).log10();
+        let a = (0..n).find(|&i| db(i) <= -5.0);
+        let b = (0..n).find(|&i| db(i) <= -25.0);
+        match (a, b) {
+            (Some(a), Some(b)) if b > a => (b - a) as f64 / rate * 3.0,
+            _ => 0.0,
+        }
+    }
+
+    /// One synthetic loop pass: the plate, driven by the sweep at
+    /// `send_db`, into a converter whose own floor is `floor_db`. Returns
+    /// the interleaved capture and the matching loop-only reference pass, so
+    /// both deconvolution routes can be measured on the same numbers.
+    fn plate_loop(
+        plate: &[f32],
+        sweep: &[f32],
+        pre: usize,
+        tail: usize,
+        send_db: f32,
+        floor_db: f32,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let frames = pre + sweep.len() + tail;
+        let wet = crate::units::sweep::fft_convolve(sweep, plate);
+        let wet_peak = wet.iter().fold(0.0f32, |a, &b| a.max(b.abs())).max(1e-12);
+        let g = 10.0f32.powf(send_db / 20.0) / wet_peak;
+        let send = 10.0f32.powf(send_db / 20.0);
+        // White noise at the asked-for RMS. A uniform sample has variance
+        // 1/3, so the amplitude that lands on an RMS of `n` is n·√3.
+        let amp = 10.0f32.powf(floor_db / 20.0) * 3.0f32.sqrt();
+        let mut seed = 0xfeed_beef_dead_c0deu64;
+        let mut noise = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (((seed >> 33) as f32 / (1u64 << 31) as f32) - 1.0) * amp
+        };
+        let mut capture = vec![0.0f32; frames * 2];
+        let mut reference = vec![0.0f32; frames * 2];
+        for f in 0..frames {
+            let at = f.checked_sub(pre);
+            let w = at.and_then(|k| wet.get(k)).copied().unwrap_or(0.0) * g;
+            let s = at.and_then(|k| sweep.get(k)).copied().unwrap_or(0.0) * send;
+            capture[f * 2] = w + noise();
+            capture[f * 2 + 1] = w + noise();
+            reference[f * 2] = s + noise();
+            reference[f * 2 + 1] = s + noise();
+        }
+        (capture, reference)
+    }
+
+    /// **The whole road gives a known decay back, and a quiet capture is
+    /// what costs tail.**
+    ///
+    /// This is the regression for the report "even the longer one results in
+    /// only a .6 seconds for my Quadraverb's Holmes' Plate on 100 percent
+    /// wet". The truncator was comparing the deconvolved IR's level against
+    /// a floor measured in the RECORDING's dBFS — two different scales — so
+    /// the cut landed wherever the send level happened to put the IR's own
+    /// scale, and a −20 dBFS capture of a three-second plate came back
+    /// cut at 0.75 s with a recovered RT60 of 1.43 s. Half the decay,
+    /// thrown away by arithmetic. See `sweep::recovered_floor_db`.
+    ///
+    /// What is pinned: on BOTH deconvolution routes and at both send levels,
+    /// the recovered RT60 matches the plate's within 10%, and the IR keeps
+    /// seconds rather than fractions of one. A quiet capture still costs
+    /// something and the last assertion says how much — it buys less tail,
+    /// because a capture 14 dB further down is 14 dB less measurement.
+    #[test]
+    fn a_known_plate_round_trips_its_rt60_and_a_quiet_capture_costs_tail() {
+        let rate = 48_000.0f64;
+        let (f1, f2, dur) = (10.0, 22_000.0f64.min(0.475 * rate), 5.0);
+        let want = 3.0f64;
+        let plate = synth_plate(want, 7.0, rate);
+        let source_rt60 = rt60_of(&plate, rate);
+        assert!(
+            (source_rt60 - want).abs() < 0.1,
+            "the synthetic plate is not the decay it was asked for: {source_rt60}"
+        );
+        let sweep = crate::units::sweep::ess(f1, f2, dur, rate);
+        let pre = rate as usize;
+        let tail = (10.0 * rate) as usize;
+        // A hissy vintage box through a real converter: −80 dBFS is what a
+        // Quadraverb-era output stage actually offers, and it is what makes
+        // the send level worth arguing about at all.
+        let floor = -80.0f32;
+        let mut kept = Vec::new();
+        for &send_db in &[-6.0f32, -20.0] {
+            let (capture, reference) =
+                plate_loop(&plate, &sweep, pre, tail, send_db, floor);
+            for (route, refc) in [("classic", None), ("reference", Some(&reference[..]))] {
+                let (l, r, out) = super::process_ir_capture(
+                    &capture, &sweep, refc, pre, rate, f1, f2, dur,
+                );
+                let got = rt60_of(&l, rate);
+                assert!(
+                    (got - source_rt60).abs() / source_rt60 < 0.10,
+                    "{route} at {send_db} dBFS recovered RT60 {got:.3} s \
+                     against the plate's {source_rt60:.3} s",
+                );
+                assert!(
+                    out.seconds > 2.0,
+                    "{route} at {send_db} dBFS kept only {:.3} s of a \
+                     {source_rt60:.1} s plate",
+                    out.seconds
+                );
+                assert_eq!(l.len(), r.len(), "the pair came back different lengths");
+                // The capture's own numbers ride out with it, because a
+                // short IR is nearly always one of them being poor.
+                assert!(
+                    (out.capture_peak_db - send_db).abs() < 1.5,
+                    "the capture read {} dBFS peak for a {send_db} dBFS send",
+                    out.capture_peak_db
+                );
+                assert!(
+                    (out.tail_range_db - (send_db - floor)).abs() < 2.0,
+                    "the usable range read {} dB for a {} dB capture",
+                    out.tail_range_db,
+                    send_db - floor
+                );
+                if route == "classic" {
+                    kept.push(out.seconds);
+                }
+            }
+        }
+        // **And the level still matters.** Fourteen dB of send is fourteen
+        // dB of signal-to-noise, and the honest truncator spends it on tail:
+        // the hot pass keeps more than the quiet one. This is the sentence
+        // the wizard's level stage exists to make true.
+        assert!(
+            kept[0] > kept[1] + 0.2,
+            "a −6 dBFS capture kept {:.3} s and a −20 dBFS one kept {:.3} s — \
+             the send level bought nothing",
+            kept[0],
+            kept[1]
+        );
+    }
+
+    /// **The post-sweep window is a real bound, and the cut it makes is
+    /// faded.**
+    ///
+    /// This is the test the truncation shipped without. The one next door
+    /// pins the RULE — no IR longer than the silence recorded after the
+    /// sweep — but it does it on a capture the LEVEL threshold also happens
+    /// to cut, so deleting the window cut entirely left it green: the
+    /// behaviour change had no test at all.
+    ///
+    /// So this one is built where only the window can bind. The plate decays
+    /// for twelve seconds and the window is well under one, so the tail
+    /// never sinks anywhere near the threshold inside it and
+    /// `truncate_at_floor` has nothing to say. Measured with the two
+    /// `cut_with_fade` lines removed, both routes hand back 2.60 s for a
+    /// 0.60 s window — four times the length, all of it the deconvolution's
+    /// own edge past the end of the measurement. With them, the length is
+    /// the window to the sample, and it tracks the wizard's TAIL row rather
+    /// than sitting at some fixed number.
+    ///
+    /// And it is FADED, which is the other half. `truncate_at_floor` faded
+    /// only on the path where it found a crossing and returned the buffer
+    /// untouched otherwise, so at default settings — a clean capture, where
+    /// the window is the binding cut — the IR ended at full tail level. A
+    /// convolver rings that step into everything it touches.
+    #[test]
+    fn the_post_sweep_window_bounds_the_ir_and_the_cut_is_faded() {
+        let rate = 48_000.0f64;
+        let (f1, f2, dur) = (10.0, 22_000.0f64.min(0.475 * rate), 2.0);
+        // A decay far longer than any window here, so nothing inside the
+        // window can reach the level threshold and the window is the only
+        // thing that can bind. The loop's floor is put out of reach for the
+        // same reason.
+        let plate = synth_plate(12.0, 4.0, rate);
+        let sweep = crate::units::sweep::ess(f1, f2, dur, rate);
+        let pre = (0.25 * rate) as usize;
+        let fade = (crate::units::sweep::TAIL_FADE_S * rate) as usize;
+        for tail_s in [0.6f64, 1.2] {
+            let tail = (tail_s * rate) as usize;
+            let (capture, reference) = plate_loop(&plate, &sweep, pre, tail, -6.0, -120.0);
+            for (route, refc) in [("classic", None), ("reference", Some(&reference[..]))] {
+                let (l, r, out) = super::process_ir_capture(
+                    &capture, &sweep, refc, pre, rate, f1, f2, dur,
+                );
+                // The bound HOLDS, and it BINDS: the length is the window,
+                // not something shorter the threshold chose and not the
+                // 2.6 s of edge that shipped before.
+                assert_eq!(
+                    l.len(),
+                    tail,
+                    "{route} with a {tail_s} s window came back {} samples long",
+                    l.len()
+                );
+                assert_eq!(r.len(), tail, "{route}: the pair came back different lengths");
+                assert!(
+                    (f64::from(out.seconds) - tail_s).abs() < 0.001,
+                    "{route} reported {} s for a {tail_s} s window",
+                    out.seconds
+                );
+                // The cut is faded to nothing rather than stopped dead. The
+                // half-cosine's mean square is 3/8 of what it fades, so the
+                // last fade-length of the IR has to sit clearly under the
+                // stretch before it, and the final sample has to be all but
+                // gone.
+                let ms = |w: &[f32]| {
+                    w.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>()
+                        / w.len().max(1) as f64
+                };
+                let faded = ms(&l[l.len() - fade..]);
+                let before = ms(&l[l.len() - 2 * fade..l.len() - fade]);
+                assert!(
+                    faded < 0.6 * before,
+                    "{route}: the last {fade} samples read {faded:.3e} against \
+                     {before:.3e} before them - the cut was not faded"
+                );
+                let last = f64::from(l[l.len() - 1].abs());
+                assert!(
+                    last * last < 0.01 * before,
+                    "{route}: the IR ends at {last:.3e}, still at tail level"
+                );
+                // And the impulse it was measuring is still at the front,
+                // whole: a window shorter than the fade would have been
+                // refused rather than allowed to eat it.
+                let peak = crate::units::sweep::linear_peak(&l);
+                assert!(
+                    (peak as f64) < 0.01 * rate,
+                    "{route}: the direct arrival sits {peak} samples in"
+                );
+            }
+        }
+    }
+
+    /// **A box patched into ONE side of the loop still yields an IR, and its
+    /// impulse is still at the front.**
+    ///
+    /// The stereo pair is trimmed by one number so it stays sample-locked,
+    /// and that number was the EARLIER of the two channels' onsets. But
+    /// `find_onset` walks left from its own channel's peak, so a side
+    /// carrying nothing but converter hiss answers an index off in the
+    /// noise — and being early, it won. Half of hardware is mono; a mono box
+    /// in the loop is Tuesday, not an edge case.
+    ///
+    /// What that cost, measured here on the classic route before the fix: a
+    /// two-second plate came back with its direct impulse at sample 239,190
+    /// of 240,000 — the lead-in never trimmed, so the whole decay was pushed
+    /// past the end of the capture window and cut off — and a recovered RT60
+    /// of 0.037 s against the plate's 2.0. Not a short IR: a destroyed one,
+    /// 1.8% of the decay, and 810 samples of luck away from the truncation
+    /// deleting the impulse as well. `sweep::set_onset` is the fix (only
+    /// channels that carry the capture get a vote) and `cut_with_fade` is
+    /// the backstop (no cut may reach the impulse, whatever the onset said).
+    #[test]
+    fn a_box_patched_into_one_side_of_the_loop_still_lands_its_impulse_at_zero() {
+        let rate = 48_000.0f64;
+        let (f1, f2, dur) = (10.0, 22_000.0f64.min(0.475 * rate), 5.0);
+        let want = 2.0f64;
+        let plate = synth_plate(want, 3.0, rate);
+        let sweep = crate::units::sweep::ess(f1, f2, dur, rate);
+        let pre = rate as usize;
+        let tail = (5.0 * rate) as usize;
+        let (mut capture, mut reference) =
+            plate_loop(&plate, &sweep, pre, tail, -6.0, -90.0);
+        // The right side is unplugged: converter hiss and nothing else, on
+        // both the DUT pass and the reference pass.
+        let mut seed = 0xabcd_ef01_2345_6789u64;
+        let mut hiss = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (((seed >> 33) as f32 / (1u64 << 31) as f32) - 1.0) * 5.0e-5
+        };
+        for f in 0..capture.len() / 2 {
+            capture[f * 2 + 1] = hiss();
+            reference[f * 2 + 1] = hiss();
+        }
+        for (route, refc) in [("classic", None), ("reference", Some(&reference[..]))] {
+            let (l, _r, _out) =
+                super::process_ir_capture(&capture, &sweep, refc, pre, rate, f1, f2, dur);
+            let peak = crate::units::sweep::linear_peak(&l);
+            assert!(
+                (peak as f64) < 0.05 * rate,
+                "{route}: the dead side dragged the trim, leaving the direct \
+                 arrival {peak} samples into a {}-sample IR",
+                l.len()
+            );
+            let got = rt60_of(&l, rate);
+            assert!(
+                (got - want).abs() / want < 0.10,
+                "{route}: recovered RT60 {got:.3} s against the plate's {want:.1} s"
+            );
+        }
+    }
+
+    /// **The recovered IR is never longer than the silence after the sweep.**
+    ///
+    /// The sweep occupies frames [pre, pre+S) of a (pre+S+T)-frame recording,
+    /// so the response to its last sample is observed for exactly T more
+    /// frames and no lag past T was ever recorded. Everything the
+    /// deconvolution puts there is its own edge, and on a pristine capture —
+    /// where the level threshold is never reached at all — that edge WAS
+    /// what got shipped: a twenty-six-second IR of a three-second plate.
+    #[test]
+    fn no_capture_yields_more_ir_than_it_recorded_silence_for() {
+        let rate = 48_000.0f64;
+        let (f1, f2, dur) = (10.0, 22_000.0f64.min(0.475 * rate), 2.0);
+        // A near-perfect loop: a floor so low that no threshold derived from
+        // it is ever crossed, which is exactly the case that used to hand
+        // back the whole capture window.
+        let plate = synth_plate(0.4, 1.0, rate);
+        let sweep = crate::units::sweep::ess(f1, f2, dur, rate);
+        let pre = rate as usize;
+        let tail_s = 3.0f64;
+        let tail = (tail_s * rate) as usize;
+        let (capture, _) = plate_loop(&plate, &sweep, pre, tail, -3.0, -140.0);
+        let (l, _r, out) =
+            super::process_ir_capture(&capture, &sweep, None, pre, rate, f1, f2, dur);
+        assert!(
+            out.seconds <= tail_s as f32 + 0.001,
+            "a {tail_s} s window produced a {:.3} s IR",
+            out.seconds
+        );
+        assert!(
+            l.len() <= tail + 1,
+            "{} samples out of a {tail}-sample window",
+            l.len()
+        );
     }
 
     // ── the IR wizard's host half ───────────────────────────────────────────

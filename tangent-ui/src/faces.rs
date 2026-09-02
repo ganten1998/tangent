@@ -144,6 +144,16 @@ pub enum FaceAction {
     /// The amp face's pedal chip: open the picker over pedal `pedal`'s
     /// seat. The face knows only the ordinal; the app owns the seat math.
     OpenPedal { pedal: usize },
+    /// **The IR face's name field was clicked: raise the system file
+    /// chooser and load whatever comes back.** Appended at the END, this
+    /// enum's law.
+    ///
+    /// The shelf below only lists what is in `Tangent Media/IRs`, which is
+    /// where the wizard saves. Everybody else's impulse libraries live
+    /// wherever they were unzipped, and the name field is the obvious place
+    /// to press to change what is loaded — so it is now the door to the
+    /// ordinary chooser, exactly as every other file in this app is picked.
+    BrowseIr,
 }
 
 fn param(face: &BuiltinFace, id: u32) -> Option<&BuiltinFaceParam> {
@@ -509,13 +519,19 @@ fn draw_ir(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option<Fac
         .find(|(k, _)| k == "ir_path")
         .map(|(_, v)| v.clone())
         .unwrap_or_default();
-    let (bar, _) = ui.allocate_exact_size(
+    // **The name field is a button.** Pressing it raises the system file
+    // chooser, because the shelf below can only ever list what is in
+    // `Tangent Media/IRs` and a bought or downloaded impulse library lives
+    // wherever it was unzipped. The bar keeps its LCD look — it is still a
+    // readout of what is loaded — and only gains a click, a hover cursor and
+    // a hover sentence saying so.
+    let (bar, hit) = ui.allocate_exact_size(
         Vec2::new(ui.available_width(), 26.0),
-        egui::Sense::hover(),
+        egui::Sense::click(),
     );
     face::lcd_glass(ui.painter(), bar, st);
     let shown = if loaded.is_empty() {
-        "no impulse loaded — a wire".to_owned()
+        "no impulse loaded — click to load one".to_owned()
     } else {
         std::path::Path::new(&loaded)
             .file_stem()
@@ -531,6 +547,25 @@ fn draw_ir(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option<Fac
         face::LcdTier::Primary,
         st,
     );
+    // The sentence says the panel closes, because it does: the chooser is
+    // parented to the main window and this face floats above it, so the face
+    // steps aside for the answer. Said out loud rather than left as a
+    // surprise — see `dialogs::IR_BROWSE`.
+    let hit = hit.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let hit = if loaded.is_empty() {
+        hit.on_hover_text(
+            "load an impulse response from anywhere on disk\n\
+             (this panel steps aside while the chooser is up)",
+        )
+    } else {
+        hit.on_hover_text(format!(
+            "{loaded}\n\nclick to load a different impulse\n\
+             (this panel steps aside while the chooser is up)"
+        ))
+    };
+    if hit.clicked() {
+        out = Some(FaceAction::BrowseIr);
+    }
     ui.add_space(6.0);
     // The shelf: everything in Tangent Media/IRs, one click to load. The
     // wand sits beside the heading — capturing your own is the point.

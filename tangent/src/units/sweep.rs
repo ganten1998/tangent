@@ -95,6 +95,26 @@ pub const TAIL_FADE_S: f64 = 0.010;
 /// noise; cutting 3 dB shy keeps the last audible tail and drops the hiss.
 pub const TAIL_MARGIN_DB: f64 = 3.0;
 
+/// The furthest under an IR's own peak [`recovered_floor_db`] will ever put
+/// the truncation threshold, in dB.
+///
+/// A deconvolution has enormous processing gain — a fifteen-second sweep
+/// concentrates its whole energy into one impulse — so a clean capture's
+/// recovered noise floor can sit 140 dB or more below the peak, and a
+/// threshold derived from it refuses to cut at all: the IR comes back the
+/// length of the whole capture window, seconds of inaudible nothing that
+/// the convolver then pays for in partitions every block, forever. Measured
+/// on a −3 dBFS synthetic capture through a −96 dBFS loop, the uncapped
+/// threshold produced a twenty-six-second IR of a three-second plate.
+///
+/// 80 dB, for two reasons that happen to agree. It is past the point where
+/// any playback gain lifts a tail back into hearing. And it is about as deep
+/// as [`deconvolve_by_reference`] can actually reach: the Kirkeby
+/// regularization's own ringing settles around 82 dB under the recovered
+/// peak, so a threshold set below that is a threshold no window ever
+/// crosses.
+pub const TAIL_RANGE_MAX_DB: f64 = 80.0;
+
 /// How far below the peak a sample still counts as part of the direct
 /// impulse when hunting for its foot. −40 dB: below the pre-ringing a
 /// bandpassed Dirac carries, above any capture's noise floor.
@@ -515,14 +535,107 @@ pub fn noise_floor_db(silence: &[f32]) -> f32 {
     (10.0 * ms.max(1e-30).log10()) as f32
 }
 
+/// **Where a recovered IR stops being signal, in the IR's OWN scale.**
+///
+/// [`noise_floor_db`] reads the RECORDING, in dBFS at the converter. A
+/// deconvolution is a division, and it lands the recovered IR in a
+/// completely different scale — nothing about the recording's dBFS survives
+/// it. Handing that number straight to [`truncate_at_floor`] compares a
+/// level against a yardstick from another measurement, and the resulting cut
+/// means nothing.
+///
+/// It was doing exactly that, and here is the arithmetic that says so.
+/// A −3 dBFS capture of a three-second plate through a −96 dBFS loop
+/// deconvolves to an IR whose peak is −44 dB in its own units. The threshold
+/// applied was −96 + 3 = −93, so the cut landed 49 dB under the IR's peak
+/// rather than at its noise — and because the classic route's scale tracks
+/// the send level one-for-one, dropping the send to −20 dBFS moved the IR's
+/// peak to −61 dB and moved the cut with it, to 0.75 s. The same plate, the
+/// same loop, the same noise: half the tail, thrown away by a threshold that
+/// had drifted 17 dB relative to the thing it was cutting. That is the
+/// short-IR report, and it is a units bug, not a truncator bug.
+///
+/// The honest translation needs no model of the deconvolution at all. What
+/// the capture could resolve is its own signal-to-noise ratio —
+/// `capture_peak_db − capture_floor_db` — and that ratio is a RATIO, so it
+/// survives any scaling the deconvolution applies. Put the threshold that
+/// far under the recovered IR's own peak and the cut sits where the capture
+/// stopped knowing anything, whatever scale the IR arrived in.
+///
+/// **Deliberately conservative.** The sweep's processing gain pushes the
+/// recovered noise floor tens of dB BELOW this line (it is why the same
+/// −96 dBFS loop leaves a recovered tail still falling at −140 dB), so this
+/// keeps less than the measurement strictly supports and never keeps noise.
+/// Capped at [`TAIL_RANGE_MAX_DB`] for the reason given there.
+///
+/// Peaks arrive as linear magnitudes because that is what the callers
+/// already have; a peak of zero (silence either side) answers −200, the
+/// house reading for "no signal", which no window can fall to and which
+/// therefore leaves the IR uncut.
+pub fn recovered_floor_db(ir_peak: f32, capture_peak: f32, capture_floor_db: f32) -> f32 {
+    if !(ir_peak > 0.0 && capture_peak > 0.0) || !capture_floor_db.is_finite() {
+        return -200.0;
+    }
+    let ir_peak_db = 20.0 * f64::from(ir_peak).log10();
+    let capture_peak_db = 20.0 * f64::from(capture_peak).log10();
+    let snr = (capture_peak_db - f64::from(capture_floor_db)).clamp(0.0, TAIL_RANGE_MAX_DB);
+    (ir_peak_db - snr) as f32
+}
+
+/// **The one place an IR is shortened: cut at `cut`, and fade the last
+/// [`TAIL_FADE_S`] of what is kept with a half-cosine.**
+///
+/// Every truncation on the capture road goes through here, and that is the
+/// point of the function existing at all. There are two cuts — the level
+/// one below, and the capture road's hard window at the end of the recorded
+/// silence — and when the fade lived inside [`truncate_at_floor`], only the
+/// level cut got it: the window cut, which is the BINDING one on any clean
+/// capture, ended the IR at full tail level. A convolver handed a tail that
+/// stops mid-decay rings the discontinuity into everything it touches, and
+/// at default settings that was the ordinary outcome, not an edge case.
+///
+/// **The direct impulse is sacred.** The fade has to live entirely after the
+/// peak sample, so a cut earlier than `peak + 1 + fade` is not a short IR,
+/// it is a deleted impulse — and this refuses it and leaves the buffer
+/// alone. That refusal was already [`truncate_at_floor`]'s rule (it simply
+/// never searched below that index); it is stated here so the window cut
+/// inherits it rather than having to remember it. A cut at or past the end
+/// is likewise nothing to do.
+pub fn cut_with_fade(ir: &mut Vec<f32>, cut: usize, sample_rate: f64) {
+    let len = ir.len();
+    if len == 0 || sample_rate <= 0.0 || cut >= len {
+        return;
+    }
+    let fade = ((TAIL_FADE_S * sample_rate).round() as usize).max(1);
+    // The impulse clamp. Below this there is no honest cut, and a
+    // truncation that would eat the impulse is not a truncation.
+    if cut < linear_peak(ir) + 1 + fade {
+        return;
+    }
+    for i in 0..fade {
+        // Half-cosine down over the kept region's last `fade` samples.
+        let w = 0.5 * (1.0 + (std::f64::consts::PI * (i + 1) as f64 / fade as f64).cos());
+        ir[cut - fade + i] = (f64::from(ir[cut - fade + i]) * w) as f32;
+    }
+    ir.truncate(cut);
+}
+
 /// Truncate the tail where its sliding level ([`TAIL_WINDOW_S`]) sinks to
 /// within [`TAIL_MARGIN_DB`] of `floor_db`, then fade the last
 /// [`TAIL_FADE_S`] of what remains with a half-cosine.
 ///
-/// The direct impulse is sacred: the cut is clamped so the fade begins
-/// strictly AFTER the peak sample, and when the floor is so high (or the IR
-/// so short) that no honest cut exists, the IR is left untouched — a
-/// truncation that would eat the impulse is not a truncation.
+/// **`floor_db` is in `ir`'s OWN scale**, not the recording's. This function
+/// compares a level it computes from these very samples against the number
+/// it is handed, so the two have to be the same kind of number — pass a
+/// recording's dBFS floor and the cut is arbitrary. [`recovered_floor_db`]
+/// exists to make that translation and carries the measurements that show
+/// what the mistake costs.
+///
+/// The direct impulse is sacred: the search starts at the earliest index
+/// whose fade would still fall entirely after the peak, and the cut itself
+/// is made by [`cut_with_fade`], which refuses anything earlier. When the
+/// floor is so high (or the IR so short) that no honest cut exists, the IR
+/// is left untouched.
 pub fn truncate_at_floor(ir: &mut Vec<f32>, floor_db: f32, sample_rate: f64) {
     let len = ir.len();
     if len == 0 || !floor_db.is_finite() || sample_rate <= 0.0 {
@@ -552,12 +665,7 @@ pub fn truncate_at_floor(ir: &mut Vec<f32>, floor_db: f32, sample_rate: f64) {
     let Some(cut) = cut else {
         return; // The tail never reaches the floor inside this buffer.
     };
-    for i in 0..fade.min(cut) {
-        // Half-cosine down over the kept region's last `fade` samples.
-        let w = 0.5 * (1.0 + (std::f64::consts::PI * (i + 1) as f64 / fade as f64).cos());
-        ir[cut - fade + i] = (f64::from(ir[cut - fade + i]) * w) as f32;
-    }
-    ir.truncate(cut);
+    cut_with_fade(ir, cut, sample_rate);
 }
 
 /// The foot of the direct impulse: walking left from the peak, the first
@@ -575,6 +683,44 @@ pub fn find_onset(ir: &[f32]) -> usize {
         i -= 1;
     }
     i
+}
+
+/// **The foot of the direct impulse for a whole SET of channels**, so a
+/// stereo pair can be trimmed by ONE number and stay sample-locked (the IRU
+/// rule: an edit applies across all tracks, or the image moves).
+///
+/// The obvious spelling is the earliest [`find_onset`] over the channels,
+/// and it is wrong. `find_onset` walks left from ITS OWN channel's peak, so
+/// a channel with no signal in it — a mono box patched into one side of the
+/// loop, a dead cable, a return that never came back — has its "peak"
+/// somewhere in the noise, and answers with an index that has nothing to do
+/// with the impulse. A silent channel answers 0. Take the minimum and that
+/// channel decides the trim for the pair: the lead-in stays in, the direct
+/// arrival sits deep inside the IR instead of at t = 0, and every later
+/// bound measured from the front — the capture window, the tail — is
+/// measured from the wrong place.
+///
+/// So only channels that actually CARRY the capture get a vote: within
+/// [`ONSET_FLOOR_DB`] of the set's own peak, the same −40 dB line
+/// `find_onset` uses to decide what still counts as the impulse. Among
+/// those the earliest onset still wins, because a true-stereo pair can
+/// genuinely have its arrivals a few samples apart and clipping the earlier
+/// one would be the very damage this is here to avoid.
+pub fn set_onset(channels: &[&[f32]]) -> usize {
+    let peak = channels
+        .iter()
+        .flat_map(|c| c.iter())
+        .fold(0.0f32, |m, &v| m.max(v.abs()));
+    if peak <= 0.0 {
+        return 0;
+    }
+    let floor = f64::from(peak) * 10.0f64.powf(ONSET_FLOOR_DB / 20.0);
+    channels
+        .iter()
+        .filter(|c| c.iter().any(|&v| f64::from(v.abs()) >= floor))
+        .map(|c| find_onset(c))
+        .min()
+        .unwrap_or(0)
 }
 
 /// Drop `direct` whole samples of lead-in so the direct impulse sits at
@@ -870,6 +1016,221 @@ mod tests {
         truncate_at_floor(&mut short, 0.0, sr);
         assert!(short.len() >= 101, "a high floor ate the direct impulse");
         assert_eq!(short[100], 1.0, "a high floor scaled the direct impulse");
+    }
+
+    /// **The truncation threshold follows the IR's own scale, not the
+    /// recording's.** This is the arithmetic behind the short-IR report.
+    ///
+    /// The same tail, in two scales 20 dB apart, is the same tail: the
+    /// threshold has to move with it, so that the CUT lands in the same
+    /// place. What the wizard was doing instead — handing the recording's
+    /// dBFS floor straight to `truncate_at_floor` — is pinned here too, as
+    /// the thing that moves when it must not.
+    #[test]
+    fn the_truncation_threshold_travels_with_the_irs_own_scale() {
+        // A capture that peaked at −6 dBFS over a −86 dBFS loop: 80 dB of
+        // measurement, whatever scale the deconvolution then lands in.
+        let capture_peak = 10.0f32.powf(-6.0 / 20.0);
+        let floor_db = -86.0f32;
+        let loud = recovered_floor_db(1.0, capture_peak, floor_db);
+        let quiet = recovered_floor_db(0.1, capture_peak, floor_db);
+        assert!(
+            (loud - (-80.0)).abs() < 0.01,
+            "80 dB under a unit-peak IR is {loud}, not -80"
+        );
+        assert!(
+            (quiet - loud - (-20.0)).abs() < 0.01,
+            "an IR 20 dB quieter got a threshold {} dB away, not 20",
+            quiet - loud
+        );
+
+        // And the cut it produces is the SAME cut. One decaying tail, built
+        // once and scaled by a tenth: both truncate at the same sample.
+        let sr = 48_000.0f64;
+        let len = (2.0 * sr) as usize;
+        let mut seed = 7u64;
+        let mut ir = vec![0.0f32; len];
+        ir[0] = 1.0;
+        for i in 1..len {
+            let t = i as f64 / sr;
+            ir[i] = (f64::from(lcg(&mut seed)) * 0.5 * (-t / 0.15).exp()) as f32;
+        }
+        let mut a = ir.clone();
+        let mut b: Vec<f32> = ir.iter().map(|v| v * 0.1).collect();
+        let a_peak = a.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let b_peak = b.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        truncate_at_floor(&mut a, recovered_floor_db(a_peak, capture_peak, floor_db), sr);
+        truncate_at_floor(&mut b, recovered_floor_db(b_peak, capture_peak, floor_db), sr);
+        assert!(a.len() < len, "the tail was never cut at all");
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "the same tail in two scales cut in two different places"
+        );
+
+        // The old road, for the record: the RECORDING's floor against both
+        // scales cuts them in different places, which is the bug.
+        let mut a2 = ir.clone();
+        let mut b2: Vec<f32> = ir.iter().map(|v| v * 0.1).collect();
+        truncate_at_floor(&mut a2, floor_db, sr);
+        truncate_at_floor(&mut b2, floor_db, sr);
+        assert_ne!(
+            a2.len(),
+            b2.len(),
+            "the mismatched comparison was supposed to be scale-dependent"
+        );
+
+        // A capture with no headroom at all cannot be trusted anywhere, and
+        // a silent one answers the house's "no signal" reading rather than
+        // a number a threshold could act on.
+        assert!(recovered_floor_db(1.0, capture_peak, -6.0) >= -0.01);
+        assert!(recovered_floor_db(0.0, capture_peak, floor_db) <= -199.0);
+        // Past the cap the threshold stops descending, or no window ever
+        // crosses it and the whole capture window ships as an "IR".
+        let pristine = recovered_floor_db(1.0, capture_peak, -200.0);
+        assert!(
+            (pristine + TAIL_RANGE_MAX_DB as f32).abs() < 0.01,
+            "a noiseless loop asked for {pristine} dB of range"
+        );
+    }
+
+
+    /// **A hard cut is faded and clamped exactly like the level cut, because
+    /// it is the same function.**
+    ///
+    /// Two faults lived in the capture road's second cut, the hard window at
+    /// the end of the recorded silence. It had no fade, so on any clean
+    /// capture — where the level threshold is never crossed and the window
+    /// is the binding cut — the IR ended at full tail level, a step a
+    /// convolver then rings into everything it touches. And it had no
+    /// clamp, so an onset read a little early could put the cut in front of
+    /// the direct impulse and delete the very thing being measured.
+    /// [`cut_with_fade`] owns both cuts now; this is its contract.
+    #[test]
+    fn a_hard_cut_fades_out_and_refuses_to_eat_the_impulse() {
+        let sr = 48_000.0f64;
+        let fade = (TAIL_FADE_S * sr) as usize;
+        let len = (0.5 * sr) as usize;
+        // A spike at 100 with a tail that is still LOUD where the cut falls
+        // — the case the level cut never sees, because nothing here sinks
+        // anywhere near a floor.
+        let mut ir = vec![0.0f32; len];
+        ir[100] = 1.0;
+        for (i, v) in ir.iter_mut().enumerate().skip(101) {
+            *v = 0.5 * ((i % 7) as f32 - 3.0) / 3.0;
+        }
+        let original = ir.clone();
+
+        let cut = (0.2 * sr) as usize;
+        let mut hard = original.clone();
+        cut_with_fade(&mut hard, cut, sr);
+        assert_eq!(hard.len(), cut, "the cut did not land where it was asked to");
+        // Everything before the fade is bit-identical: a cut is a cut, not a
+        // gain stage.
+        assert_eq!(
+            &hard[..cut - fade],
+            &original[..cut - fade],
+            "the cut reached back past its own fade"
+        );
+        // And the last sample is on its way to nothing rather than hanging
+        // at tail level, which is what shipped.
+        let last = hard[hard.len() - 1].abs();
+        let was = original[cut - 1].abs();
+        assert!(
+            last < was * 0.05 && last < 0.02,
+            "the hard cut ended at {last} against a tail level of {was} - unfaded"
+        );
+
+        // The impulse is sacred. A cut anywhere inside `peak + 1 + fade`
+        // would put the fade over the direct arrival, so it is refused
+        // outright and the buffer is handed back whole.
+        for early in [0usize, 1, 100, 101, 100 + fade] {
+            let mut eaten = original.clone();
+            cut_with_fade(&mut eaten, early, sr);
+            assert_eq!(
+                eaten, original,
+                "a cut at {early} was allowed to touch the direct impulse at 100"
+            );
+        }
+        // One sample past the clamp it is legal again, and the impulse is
+        // still there untouched.
+        let mut just = original.clone();
+        cut_with_fade(&mut just, 101 + fade, sr);
+        assert_eq!(just.len(), 101 + fade, "the first legal cut was refused");
+        assert_eq!(just[100], 1.0, "the first legal cut scaled the impulse");
+        // A cut at or past the end is nothing to do.
+        let mut past = original.clone();
+        cut_with_fade(&mut past, len, sr);
+        assert_eq!(past, original, "a cut at the end rewrote the buffer");
+    }
+
+    /// **A dead channel does not decide where the pair starts.**
+    ///
+    /// The stereo trim is one number for both channels, which is right — the
+    /// level difference between them IS the image, and trimming them apart
+    /// moves it. But the number was the EARLIER of the two channels'
+    /// onsets, and `find_onset` walks left from its own channel's peak: hand
+    /// it a channel with no capture in it and the "peak" is a noise sample,
+    /// so it answers an index that has nothing to do with the impulse, and
+    /// being early it won. A mono box patched into one side of the loop is
+    /// not an exotic setup; it is Tuesday.
+    #[test]
+    fn a_silent_channel_does_not_drag_the_pairs_onset_to_the_front() {
+        let sr = 48_000.0f64;
+        let len = (0.2 * sr) as usize;
+        let at = 900usize;
+        // The channel that actually carries the capture: a lead-in of
+        // nothing, then the arrival.
+        let mut live = vec![0.0f32; len];
+        live[at] = 1.0;
+        for i in 1..400 {
+            live[at + i] = (0.6 * (-(i as f64) / 300.0).exp()) as f32;
+        }
+        assert_eq!(find_onset(&live), at, "the fixture's own onset moved");
+
+        // Dead: nothing at all. Its own `find_onset` answers 0.
+        let dead = vec![0.0f32; len];
+        assert_eq!(find_onset(&dead), 0);
+        assert_eq!(
+            set_onset(&[&live, &dead]),
+            at,
+            "a silent channel dragged the trim to the front of the buffer"
+        );
+        assert_eq!(set_onset(&[&dead, &live]), at, "and the same in the other order");
+
+        // Not dead, just not the capture: a converter hissing 60 dB down,
+        // with its loudest sample early. Still no vote — it is below the
+        // -40 dB line that decides what counts as an impulse at all.
+        let mut hiss = vec![0.0f32; len];
+        let mut seed = 5u64;
+        for v in hiss.iter_mut() {
+            *v = lcg(&mut seed) * 1.0e-3;
+        }
+        hiss[12] = 2.0e-3;
+        assert!(find_onset(&hiss) < at, "the fixture's hiss was supposed to read early");
+        assert_eq!(
+            set_onset(&[&live, &hiss]),
+            at,
+            "a channel 54 dB down decided where the impulse starts"
+        );
+
+        // A genuine stereo pair keeps the EARLIER arrival, though: two
+        // channels of comparable level a few samples apart is a real
+        // capture, and clipping the leading one is the damage this whole
+        // rule exists to avoid.
+        let mut early = vec![0.0f32; len];
+        early[at - 30] = 0.7;
+        for i in 1..400 {
+            early[at - 30 + i] = (0.4 * (-(i as f64) / 300.0).exp()) as f32;
+        }
+        assert_eq!(
+            set_onset(&[&live, &early]),
+            at - 30,
+            "a true-stereo pair lost its leading arrival"
+        );
+        // Nothing anywhere is 0, not a panic.
+        assert_eq!(set_onset(&[&dead, &dead]), 0);
+        assert_eq!(set_onset(&[]), 0);
     }
 
     /// **The inverse filter alone pulls the sweep to a bandpassed click**:
