@@ -802,6 +802,12 @@ pub struct Settings {
     /// Its own key for the same reason `project_dir` is: presets are small
     /// documents somebody may want on a different disk from their video.
     pub preset_dir: Option<String>,
+    /// Where captured IMPULSE RESPONSES live — what the IR wizard writes and
+    /// what the convolver's picker lists. Absent means
+    /// [`Settings::media_root`]'s `IRs`. Its own key for the reason
+    /// `preset_dir` is: an IR library is the kind of folder people already
+    /// keep somewhere, and pointing Tangent at it beats copying it.
+    pub irs_dir: Option<String>,
     /// Whether this file has been through the move to `Documents/Tangent
     /// Media`.
     ///
@@ -1573,6 +1579,7 @@ impl Default for Settings {
             project_dir: None,
             export_dir: None,
             preset_dir: None,
+            irs_dir: None,
             media_root_v20: false,
             reader_mode_v20: false,
             master_mono: false,
@@ -3007,6 +3014,8 @@ impl Settings {
         // The presets' own folder — read at the END, like it is written at
         // the end, because it joined after every key above it.
         take_opt_str(&mut map, "preset_dir", &mut s.preset_dir);
+        // And the IRs' folder, which joined after the presets'.
+        take_opt_str(&mut map, "irs_dir", &mut s.irs_dir);
 
         // Whatever is left, in the order the FILE had it.
         //
@@ -4233,6 +4242,11 @@ impl Settings {
         if !self.insert_keys.0.is_empty() {
             map.insert("insert_keys".into(), self.insert_keys.to_json());
         }
+        // The IR folder override, at the END like every additive key, and
+        // only when somebody chose one — the `preset_dir` rule exactly.
+        if let Some(v) = self.irs_dir.as_ref().filter(|v| !v.is_empty()) {
+            map.insert("irs_dir".into(), Value::String(v.clone()));
+        }
         for (k, v) in &self.extra {
             map.insert(k.clone(), v.clone());
         }
@@ -4763,18 +4777,27 @@ impl Settings {
         Self::chosen(&self.preset_dir).unwrap_or_else(|| self.media_root().join("Presets"))
     }
 
-    /// **The four folders Tangent keeps things in**, in the order the cog
-    /// card lists them: takes, projects, exports, presets.
+    /// Where captured IMPULSE RESPONSES live: what the IR wizard saves and
+    /// what the convolver's shelf scans. Beside `Presets` for the same
+    /// reason presets sit beside projects — a small library of files people
+    /// keep, share, and point other software at.
+    pub fn irs_root(&self) -> PathBuf {
+        Self::chosen(&self.irs_dir).unwrap_or_else(|| self.media_root().join("IRs"))
+    }
+
+    /// **The five folders Tangent keeps things in**, in the order the cog
+    /// card lists them: takes, projects, exports, presets, IRs.
     ///
     /// Named in one place because the host creates them at launch and the
     /// SHOW buttons open them, and a caller that forgot one of them is
     /// exactly how the buttons came to open onto nothing.
-    pub fn media_roots(&self) -> [PathBuf; 4] {
+    pub fn media_roots(&self) -> [PathBuf; 5] {
         [
             self.record_root(),
             self.project_root(),
             self.export_root(),
             self.preset_root(),
+            self.irs_root(),
         ]
     }
 
@@ -5211,7 +5234,10 @@ mod tests {
         assert_eq!(s.project_root(), root.join("Projects"));
         assert_eq!(s.export_root(), root.join("Exports"));
         assert_eq!(s.preset_root(), root.join("Presets"));
-        // All four are DIFFERENT places, which is the whole point.
+        // The IRs joined as the fifth: captured hardware, kept beside the
+        // presets it behaves like.
+        assert_eq!(s.irs_root(), root.join("IRs"));
+        // All five are DIFFERENT places, which is the whole point.
         let roots = s.media_roots();
         for (i, a) in roots.iter().enumerate() {
             for b in &roots[i + 1..] {
@@ -5249,6 +5275,30 @@ mod tests {
             blank.preset_root(),
             blank.media_root().join("Presets")
         );
+    }
+
+    /// The IR folder override is its own key, survives a round trip, and is
+    /// written at the END of the map with the other additive keys — after
+    /// `preset_dir`, which it joined after.
+    #[test]
+    fn the_ir_folder_override_round_trips_at_the_end_of_the_map() {
+        let mut s = super::Settings::default();
+        // Absent until chosen, so an untouched file keeps its shape.
+        assert!(!s.to_map().contains_key("irs_dir"));
+        s.irs_dir = Some("/tmp/my-irs".to_owned());
+        let map = s.to_map();
+        assert_eq!(
+            map.keys().last().map(String::as_str),
+            Some("irs_dir"),
+            "irs_dir is not the last of our own keys"
+        );
+        let back = super::Settings::from_map(map);
+        assert_eq!(back.irs_dir.as_deref(), Some("/tmp/my-irs"));
+        assert_eq!(back.irs_root(), std::path::PathBuf::from("/tmp/my-irs"));
+        // An empty string is not a choice, exactly as for the other four.
+        let mut blank = super::Settings::default();
+        blank.irs_dir = Some("   ".to_owned());
+        assert_eq!(blank.irs_root(), blank.media_root().join("IRs"));
     }
 
     /// Each folder is chosen on its own, and choosing one moves nothing else.

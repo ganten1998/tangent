@@ -147,6 +147,40 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   first in the list, wearing the cluster's colour, and opened FOR you
   exactly once, the first time you ever reach for a plugin slot.
 
+- **Nine more of Tangent's own, and the shelf fills out.** The suite grows
+  from four to thirteen:
+
+  *Tangent Denoise* - noise reduction as thirty-two learned expanders, not
+  spectral surgery: play it a moment of the noise alone, and each band
+  learns where the floor lives; the reduction then breathes with the music
+  instead of gating against it. No spectral processing, no musical noise,
+  no pre-echo - phase moves only in bands being attenuated, exactly as an
+  EQ cut would. What it learns saves with the project and rides presets.
+
+  *Tangent Amp* - a warm, clean tube amp solved from the blackface-family
+  schematic itself: the real tone stack (its mid scoop lands where the
+  circuit puts it), a bright switch that behaves like the actual 120 pF
+  cap (strongest at low volume, gone at full - because that is what the
+  wiring does), a vibrato that is honestly an opto tremolo - neon lamp,
+  lopsided pulse, mono to full stereo throb - and a power section that
+  stays under 1% distortion until you lean on it. And underfoot: SEVEN
+  PEDALS - real insert slots that take any plugin, VST3s included,
+  arriving pre-boarded with the compressor, wah, a new
+  screamer-family overdrive, chorus, a new opto tremolo pedal, echo and
+  plate. The drive and trem also stand alone as their own pedals, and the
+  chorus, echo and plate step out of the fixed chain to become loadable
+  instances anywhere - the day their sentinels were declared for.
+
+  *Tangent IR* - convolution with zero fuss: load an impulse response, or
+  make your own without leaving the app. The **IR Wizard** (in Audio
+  Setup) walks the loop: pick the outs and ins your hardware hangs off,
+  set levels against live meters with test tones, run the sweep, and see
+  the capture drawn on the glass with its usable decay and a distortion
+  estimate - Save drops it in the new Tangent Media/IRs folder, already
+  listed for the next load. It is honest about physics: gated, chorused
+  or pitch-shifting programs cannot round-trip into a static IR, and the
+  wizard says so before you waste a take.
+
 - **Sidechain, done properly.** Route any track into a compressor's key
   input: the bay's right-click menu grows a SIDECHAIN... row on Tangent
   Comp and on any VST3 that reports a key input, opening a picker of your
