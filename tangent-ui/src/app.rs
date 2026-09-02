@@ -15908,7 +15908,11 @@ impl TangentApp {
                         // Same 0.5 notch threshold as the mixer and the midi
                         // editor: a trackpad's inertial tail, or a balanced
                         // diagonal that sums to zero, must not tick a lane.
-                        let cur = self.settings.arr_visible as i64;
+                        // The DISPLAYED count, not the raw field: from the auto
+                        // sentinel (0) the first tick starts at what is on
+                        // screen — the monitor-derived default — and writing a
+                        // concrete number is what turns auto into a choice.
+                        let cur = self.arr_visible() as i64;
                         let next = (cur + if d > 0.0 { 1 } else { -1 })
                             .clamp(1, crate::recorder::CHANNELS as i64);
                         if next != cur {
@@ -19570,14 +19574,31 @@ impl TangentApp {
     }
 
     fn mixer_visible(&self) -> usize {
-        // No screen-size forcing: the floor it used to impose was exactly
-        // what killed Shift+wheel zoom in fullscreen — the owner's "track
-        // zoom regressed". The fold no longer reads this either; windowed
-        // or full, the zoom is the user's.
-        (self.settings.mixer_visible as usize).clamp(1, self.active_channels())
+        // **Zero is the auto sentinel** — the shipped, un-chosen state, the
+        // same idiom `arr_header_w` uses. There it means derive the strip
+        // count from the monitor; a Shift+wheel writes a concrete number and
+        // the derivation steps aside for good (see `default_mixer_visible`).
+        //
+        // No screen-size forcing on the CHOSEN value: the floor it used to
+        // impose was exactly what killed Shift+wheel zoom in fullscreen — the
+        // owner's "track zoom regressed". The fold no longer reads this
+        // either; windowed or full, a chosen zoom is the user's.
+        let want = if self.settings.mixer_visible == 0 {
+            default_mixer_visible(&self.settings)
+        } else {
+            self.settings.mixer_visible as usize
+        };
+        want.clamp(1, self.active_channels())
     }
     fn arr_visible(&self) -> usize {
-        (self.settings.arr_visible as usize).clamp(1, self.active_channels())
+        // Zero is the auto sentinel; see `mixer_visible` and
+        // `default_arr_visible`.
+        let want = if self.settings.arr_visible == 0 {
+            default_arr_visible(&self.settings)
+        } else {
+            self.settings.arr_visible as usize
+        };
+        want.clamp(1, self.active_channels())
     }
     fn midi_keys_visible(&self) -> f32 {
         (self.settings.midi_keys_visible as f32).clamp(12.0, 96.0)
@@ -23612,6 +23633,111 @@ pub fn fit_width_to_display(settings: &Settings, want: f32) -> f32 {
 /// What 100% is, as a share of the monitor's width. See [`main_width`].
 const BASE_OF_MONITOR: f64 = 0.5;
 
+/// **The rungs a DEFAULT track count is allowed to land on.**
+///
+/// A raw "how many fit" division lands on 11, or 13, or 5 — numbers that read
+/// as an accident. Musicians reach for round handfuls: four, six, eight, a
+/// dozen, sixteen. So the derived count is snapped to this ladder rather than
+/// shown exactly, trading a few points of slack for a number that reads as a
+/// decision. The steps widen as they climb — nobody distinguishes a 27-lane
+/// default from a 28-lane one, but 6 versus 8 is a real choice — and it ends at
+/// [`crate::recorder::CHANNELS`], the most lanes the desk has to show.
+const COUNT_LADDER: [usize; 7] = [4, 6, 8, 12, 16, 24, 32];
+
+/// **A comfortable arrangement LANE height, in points.**
+///
+/// The number that turns "how much monitor is there" into "how many lanes".
+/// Solved, not picked: on the display this app was tuned against — 2560 wide,
+/// ~1400 usable after the dock — the usable height less the recorder band is
+/// about 1134 points, and the owner's long-standing default was a dozen lanes,
+/// so a lane's share is ~92. Every other monitor is measured against the same
+/// 92, which is what makes the default a fixed DENSITY rather than a fixed
+/// count: a taller screen shows proportionally more, a laptop proportionally
+/// fewer, and both land on a ladder rung.
+const COMFY_LANE_H: f32 = 92.0;
+
+/// **A comfortable mixer STRIP pitch — the strip's width plus the gap to the
+/// next — in points.**
+///
+/// The desk's counterpart to [`COMFY_LANE_H`], and it keys off WIDTH because
+/// the strips run across, not down. `46` is the width below which a strip stops
+/// being usable ([`crate::mixer_panel`]'s `MIN_STRIP_W`); `70` is that with
+/// breathing room and the 6-point gap folded in, and it reproduces the owner's
+/// sixteen strips at the default window on the reference display. See
+/// [`default_mixer_visible`].
+const COMFY_STRIP_PITCH: f32 = 70.0;
+
+/// **Snap a raw "how many items fit" to a sensible default count.**
+///
+/// `span_px` is the run the items share — lane heights stacked down the
+/// arrangement, strip widths across the mixer — and `item_px` is the smallest
+/// one that stays usable. Their quotient is how many fit; this rounds that to
+/// the nearest [`COUNT_LADDER`] rung and clamps to `[floor, ceil]`.
+///
+/// **Ties break toward the SMALLER count.** A count one too LOW leaves each
+/// lane a little taller than it had to be, which is never wrong; one too HIGH
+/// makes every lane shorter than the comfortable height, which is the thing the
+/// whole calculation exists to avoid. So when a raw value sits exactly between
+/// two rungs, the safe rung wins.
+fn sensible_visible_count(span_px: f32, item_px: f32, floor: usize, ceil: usize) -> usize {
+    let fits = (span_px / item_px.max(1.0)).max(0.0);
+    let mut best = COUNT_LADDER[0];
+    // `<`, not `<=`: the first rung reached at a given distance wins, and the
+    // ladder climbs, so an exact tie keeps the earlier (smaller) rung.
+    let mut best_d = (fits - best as f32).abs();
+    for &rung in &COUNT_LADDER[1..] {
+        let d = (fits - rung as f32).abs();
+        if d < best_d {
+            best = rung;
+            best_d = d;
+        }
+    }
+    best.clamp(floor, ceil)
+}
+
+/// **The arrangement's default visible-LANE count for this monitor.**
+///
+/// Used only while the setting is at its `0` sentinel — the shipped, un-chosen
+/// state; the moment a Shift+wheel writes a concrete count that count is the
+/// user's and this is not consulted (see [`TangentApp::arr_visible`]).
+///
+/// The lanes are worked at a TALL window — the timeline is what a person drags
+/// the window open FOR — so the height that matters is not the short default
+/// window's but the monitor's own usable height, less the one band always
+/// pinned above the lanes: the recorder. That remainder over [`COMFY_LANE_H`],
+/// snapped, is the count.
+///
+/// Falls back to the historical dozen while no monitor has been learned — the
+/// first launch on a new machine, before any window has existed long enough to
+/// measure one. A guess keyed off `monitor_width == 0` would be worse.
+fn default_arr_visible(settings: &Settings) -> usize {
+    if settings.monitor_usable_h < 240 || settings.monitor_width < 320 {
+        return 12;
+    }
+    let recorder = crate::recorder_panel::band_height(settings.monitor_width as f32);
+    let avail = (settings.monitor_usable_h as f32 - recorder).max(0.0);
+    sensible_visible_count(avail, COMFY_LANE_H, 4, crate::recorder::CHANNELS)
+}
+
+/// **The mixer's default visible-STRIP count for this monitor.**
+///
+/// The desk fills the window's WIDTH and the window opens at a fixed share of
+/// the monitor ([`main_width`]), so — unlike the arrangement, whose default
+/// window is too short to speak for it — the default window's own width is a
+/// faithful measure of the room the desk has. Two columns are always pinned at
+/// the right (the click and the master), and the desk keeps a 10-point margin
+/// each side (`mixer_panel`'s `PAD`), so the scrolling run is the width less
+/// both. That run over [`COMFY_STRIP_PITCH`], snapped, is the count.
+///
+/// No monitor guard is needed: with none learned, `main_width` falls back to
+/// its 1300-point window, which lands this on the historical sixteen.
+fn default_mixer_visible(settings: &Settings) -> usize {
+    // 20 = the desk's two 10-point edge margins; `2.0 * COMFY_STRIP_PITCH` =
+    // the two pinned columns that never scroll.
+    let run = (main_width(settings) - 20.0 - 2.0 * COMFY_STRIP_PITCH).max(0.0);
+    sensible_visible_count(run, COMFY_STRIP_PITCH, 4, crate::recorder::CHANNELS)
+}
+
 /// Initial fixed window size for the ViewportBuilder, computed from settings
 /// before the event loop starts (spec §3.2).
 pub fn initial_window_size(settings: &Settings) -> Vec2 {
@@ -26287,7 +26413,11 @@ impl TangentApp {
                         // **Shift+wheel ZOOMS the visible count** — one
                         // channel per tick. Wheel up shows more (each
                         // narrower); down shows fewer (each wider).
-                        let cur = self.settings.mixer_visible as i64;
+                        // The DISPLAYED count, not the raw field — from the auto
+                        // sentinel the first tick starts at the monitor-derived
+                        // default that is on screen. See the arrangement's own
+                        // zoom for the same rule.
+                        let cur = self.mixer_visible() as i64;
                         let next = (cur + if d > 0.0 { 1 } else { -1 })
                             .clamp(1, crate::recorder::CHANNELS as i64);
                         if next != cur {
@@ -34611,6 +34741,85 @@ mod tests {
         );
     }
 
+    /// **The arrange headers and the recorder band's camera column are ONE
+    /// column**, the owner's word: a track header's right edge lines up with
+    /// the seam where the camera preview ends and the timecode begins.
+    ///
+    /// The chain, and every link is asserted here: the band's own layout puts
+    /// that seam at `recorder_panel::camera_split_x`; the arrangement's default
+    /// header width is derived from it (`arrange_view`, the `header_w` else
+    /// arm); and both surfaces share the window's left edge, so the derived
+    /// width lands the header's right edge on the seam plus a hair of gutter.
+    ///
+    /// **Two window sizes, because the tie is LIVE.** A band relayout moves the
+    /// seam — 239 points in at one width, 364 at another — and the header has
+    /// to move WITH it, not sit at a number that was right once. A fixed
+    /// default would pass at one size and drift at the other; only a real tie
+    /// keeps the same seam at both.
+    #[test]
+    fn the_default_track_header_lines_up_with_the_camera_seam() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.keytoggle_enabled = false;
+        // The tie is the DEFAULT — active only while the width is unset.
+        app.settings.arr_header_w = 0.0;
+        app.arrangement_open = true;
+
+        // Both sizes are chosen to sit under the header's 400-point ceiling, so
+        // the tie is exact rather than clamped. The seam sits well right of the
+        // 150-point header floor at each.
+        let mut seams = Vec::new();
+        let mut gutters = Vec::new();
+        for size in [Vec2::new(1000.0, 700.0), Vec2::new(1500.0, 950.0)] {
+            let _ = run_one_frame(&ctx, &mut app, size);
+            let band = app.last_band;
+            let arr = app.arrangement_rect.expect("the arrangement did not open");
+            // Same column origin: the two surfaces share the window's left.
+            assert!(
+                (arr.left() - band.left()).abs() < 0.5,
+                "the band and the timeline start at different x: {} vs {}",
+                band.left(),
+                arr.left()
+            );
+            let seam =
+                crate::recorder_panel::camera_split_x(band, &app.recorder_layout_view());
+            let clips = app.arrange_clips_for_shot();
+            let view = app.arrange_view_for_shot(&clips);
+            let header_right =
+                crate::arrangement_panel::Layout::new(arr, &view).header.right();
+            // The header's right edge is ON the seam, give or take the gutter.
+            assert!(
+                (header_right - seam).abs() <= 8.0,
+                "at {size:?} the header ended at {header_right} but the camera seam is at {seam}"
+            );
+            seams.push(seam);
+            gutters.push(header_right - seam);
+        }
+        // **Live, not lucky.** The seam really moved between the two widths, and
+        // the header kept the SAME gutter to it at both — the mark of a tie, not
+        // of a default that happened to be right once.
+        assert!(
+            (seams[1] - seams[0]).abs() > 40.0,
+            "the camera seam did not move between window sizes: {seams:?}"
+        );
+        assert!(
+            (gutters[1] - gutters[0]).abs() < 0.5,
+            "the header did not track the seam: gutters {gutters:?}"
+        );
+
+        // **A manual width overrides the tie** — the tie is the default and the
+        // reset value, never a cage. A dragged header sits where it was put.
+        app.settings.arr_header_w = 250.0;
+        let _ = run_one_frame(&ctx, &mut app, Vec2::new(1500.0, 950.0));
+        let arr = app.arrangement_rect.expect("the arrangement did not open");
+        let clips = app.arrange_clips_for_shot();
+        let view = app.arrange_view_for_shot(&clips);
+        let header_right = crate::arrangement_panel::Layout::new(arr, &view).header.right();
+        assert!(
+            (header_right - (arr.left() + 250.0)).abs() < 0.5,
+            "a manual header width did not win over the camera tie: {header_right}"
+        );
+    }
+
     /// **Tab means one thing at a time.**
     ///
     /// The accessibility overlay allocates a focusable widget per control,
@@ -39459,6 +39668,114 @@ mod fullscreen_proportion_tests {
 #[cfg(test)]
 mod aspect_snap_tests {
     use super::*;
+
+    /// **The rounding table, pinned.** `sensible_visible_count` turns a raw
+    /// "how many fit" into a musician-friendly rung, ties toward the smaller
+    /// (safe) count, then clamps. Every interesting case is here so a change to
+    /// the ladder or the tie rule has to say so.
+    #[test]
+    fn a_default_count_snaps_to_a_musician_friendly_rung() {
+        // (span, item, floor, ceil) -> count. item 100 keeps the quotient
+        // readable: the span IS the number that fits, times a hundred.
+        let table = [
+            // Exact rungs pass through untouched.
+            (400.0, 100.0, 4, 32, 4),
+            (800.0, 100.0, 4, 32, 8),
+            (1200.0, 100.0, 4, 32, 12),
+            (1600.0, 100.0, 4, 32, 16),
+            // Between rungs: nearest wins.
+            (560.0, 100.0, 4, 32, 6),   // 5.6 -> 6
+            (1100.0, 100.0, 4, 32, 12), // 11 -> 12
+            (2600.0, 100.0, 4, 32, 24), // 26 -> 24 (|26-24|=2 < |26-32|=6)
+            // Dead-centre ties break toward the SMALLER, taller-row count.
+            (500.0, 100.0, 4, 32, 4),   // 5.0 between 4 and 6 -> 4
+            (700.0, 100.0, 4, 32, 6),   // 7.0 between 6 and 8 -> 6
+            (1000.0, 100.0, 4, 32, 8),  // 10 between 8 and 12 -> 8
+            (1400.0, 100.0, 4, 32, 12), // 14 between 12 and 16 -> 12
+            (2000.0, 100.0, 4, 32, 16), // 20 between 16 and 24 -> 16
+            // Below the smallest rung still lands on the smallest rung.
+            (100.0, 100.0, 4, 32, 4),   // 1.0 -> 4
+            (3000.0, 100.0, 4, 32, 32), // 30 -> 32 (|30-32|=2 < |30-24|=6)
+            // The ceiling clamps a huge screen down to what the desk has.
+            (5000.0, 100.0, 4, 16, 16), // 50 -> 32, clamped to 16
+            // The floor lifts a tiny screen up to a taste minimum.
+            (400.0, 100.0, 8, 32, 8), // 4 -> rung 4, lifted to floor 8
+        ];
+        for (span, item, floor, ceil, want) in table {
+            let got = sensible_visible_count(span, item, floor, ceil);
+            assert_eq!(
+                got, want,
+                "sensible_visible_count({span}, {item}, {floor}, {ceil}) = {got}, want {want}"
+            );
+        }
+    }
+
+    /// **The default track counts scale with the MONITOR, and land on the
+    /// owner's historical numbers on the display they were tuned against.**
+    ///
+    /// The reference is the anchor — 2560 wide, ~1400 usable, a dozen lanes and
+    /// sixteen strips, exactly what shipped as the flat default — and every
+    /// other screen is measured against it: a laptop shows strictly fewer, a 5K
+    /// strictly more, and an ULTRAWIDE (same height, more width) keeps the same
+    /// lane count while gaining strips. The exact off-reference numbers are left
+    /// to inequalities on purpose, so tuning the recorder band's height does not
+    /// churn this test.
+    #[test]
+    fn the_default_track_counts_scale_with_the_monitor() {
+        let mon = |w: i64, h: i64| {
+            let mut s = Settings::default();
+            s.monitor_width = w;
+            s.monitor_usable_h = h;
+            s.window_size_percent = 100;
+            s
+        };
+        let chans = crate::recorder::CHANNELS;
+
+        // The anchor: the display this app was tuned on keeps the old defaults.
+        let reference = mon(2560, 1400);
+        assert_eq!(default_arr_visible(&reference), 12, "reference lanes moved");
+        assert_eq!(default_mixer_visible(&reference), 16, "reference strips moved");
+
+        // Nothing learned yet: the historical fallback, so a first launch on a
+        // fresh machine looks exactly as it always did.
+        let blank = mon(0, 0);
+        assert_eq!(default_arr_visible(&blank), 12, "the no-monitor fallback moved");
+        assert_eq!(default_mixer_visible(&blank), 16, "the no-monitor fallback moved");
+
+        // A laptop shows fewer of each; a 5K, more.
+        let laptop = mon(1280, 648);
+        assert!(default_arr_visible(&laptop) < 12, "the laptop showed as many lanes as the reference");
+        assert!(default_mixer_visible(&laptop) < 16, "the laptop showed as many strips as the reference");
+        let five_k = mon(5120, 2800);
+        assert!(default_arr_visible(&five_k) > 12, "the 5K showed no more lanes than the reference");
+        assert!(default_mixer_visible(&five_k) > 16, "the 5K showed no more strips than the reference");
+
+        // An ultrawide is the reference's HEIGHT with far more width: the same
+        // lanes (height decides them), more strips (width decides them).
+        let ultrawide = mon(3440, 1400);
+        assert_eq!(
+            default_arr_visible(&ultrawide),
+            default_arr_visible(&reference),
+            "the ultrawide's equal height did not give equal lanes"
+        );
+        assert!(
+            default_mixer_visible(&ultrawide) > default_mixer_visible(&reference),
+            "the ultrawide's extra width gave no extra strips"
+        );
+
+        // Every answer is a real ladder rung (or the desk's own ceiling), never
+        // an odd raw count.
+        for s in [&reference, &blank, &laptop, &five_k, &ultrawide] {
+            for count in [default_arr_visible(s), default_mixer_visible(s)] {
+                assert!(
+                    COUNT_LADDER.contains(&count) || count == chans,
+                    "a default of {count} is not a ladder rung"
+                );
+                assert!((4..=chans).contains(&count), "a default of {count} is out of bounds");
+            }
+        }
+    }
+
 
     /// **The layout is made to fit the screen, not the other way round.**
     ///

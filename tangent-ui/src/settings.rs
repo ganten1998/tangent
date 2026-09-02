@@ -1243,7 +1243,15 @@ pub struct Settings {
     /// How many channels the MIXER shows at once, and how many LANES the
     /// arrangement shows — Shift+wheel over each surface zooms the count, one
     /// per tick. Persisted, because how dense a desk you want is a taste, not
-    /// a scroll position. Clamped to `[1, CHANNELS]` on load.
+    /// a scroll position.
+    ///
+    /// **Zero is the AUTO sentinel**, the same idiom as `arr_header_w`: at the
+    /// shipped default the count is derived from the monitor (a bigger screen
+    /// shows more, snapped to a musician-friendly rung — see
+    /// `app::default_mixer_visible` / `default_arr_visible`), and the first
+    /// Shift+wheel writes a concrete number that is then the user's for good.
+    /// A concrete value is clamped to `[1, CHANNELS]` on load; `0` is left as
+    /// itself so the derivation still runs.
     pub mixer_visible: u8,
     pub arr_visible: u8,
     /// How many KEYS the MIDI editor shows at once (semitones); Shift+wheel
@@ -1702,9 +1710,12 @@ impl Default for Settings {
             // 1/4 out of the box, both grids — the owner's default.
             arr_grid_exp: -2,
             arr_header_w: 0.0,
-            // Eight of each in view out of the box; Shift+wheel changes it.
-            mixer_visible: 16,
-            arr_visible: 12,
+            // **Auto out of the box** — derived from the monitor, so the box
+            // shows a sensible density on a laptop and on a 5K alike. Zero is
+            // the sentinel; Shift+wheel writes a concrete count and makes it a
+            // choice. See `mixer_visible`'s doc and `app::default_arr_visible`.
+            mixer_visible: 0,
+            arr_visible: 0,
             // Three octaves of keys, the editor's long-standing default.
             midi_keys_visible: 36,
             tracks_added: 0,
@@ -2937,11 +2948,13 @@ impl Settings {
             s.arr_header_w = n.clamp(0.0, 1000.0);
         }
         let chans = crate::recorder::CHANNELS as u64;
+        // Zero survives as itself — the auto sentinel; any other value is a
+        // deliberate count and is clamped to what the desk can show.
         if let Some(n) = map.shift_remove("mixer_visible").and_then(|v| v.as_u64()) {
-            s.mixer_visible = n.clamp(1, chans) as u8;
+            s.mixer_visible = if n == 0 { 0 } else { n.clamp(1, chans) } as u8;
         }
         if let Some(n) = map.shift_remove("arr_visible").and_then(|v| v.as_u64()) {
-            s.arr_visible = n.clamp(1, chans) as u8;
+            s.arr_visible = if n == 0 { 0 } else { n.clamp(1, chans) } as u8;
         }
         if let Some(n) = map.shift_remove("midi_keys_visible").and_then(|v| v.as_u64()) {
             s.midi_keys_visible = n.clamp(12, 96) as u8;
@@ -6434,12 +6447,14 @@ mod tests {
         assert_eq!(back.mixer_visible, 5);
         assert_eq!(back.arr_visible, 12);
         assert_eq!(back.midi_keys_visible, 24);
-        // Out-of-range values from a hand-edited file are clamped on load.
+        // Out-of-range values from a hand-edited file are clamped on load —
+        // but zero is the AUTO sentinel now, not an under-range count, so it
+        // survives untouched to let the monitor-derived default run.
         let wild = Settings::from_json(
             r#"{"mixer_visible": 999, "arr_visible": 0, "midi_keys_visible": 3}"#,
         );
         assert_eq!(wild.mixer_visible as usize, crate::recorder::CHANNELS, "too many clamps down");
-        assert_eq!(wild.arr_visible, 1, "zero clamps up to one");
+        assert_eq!(wild.arr_visible, 0, "zero is the auto sentinel, left as itself");
         assert_eq!(wild.midi_keys_visible, 12, "too few keys clamps to the floor");
     }
 
