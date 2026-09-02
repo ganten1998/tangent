@@ -2926,6 +2926,26 @@ fn live_face(ctx: &egui::Context) -> Color32 {
         .unwrap_or(FALLBACK_FACE)
 }
 
+/// The cluster's glass pair, remembered the same way the face is — the app
+/// stamps it once per frame, and the effect faces build their `FaceStyle`
+/// from it without a `Settings` in reach. Same trick, same reasons, same
+/// lifetime as `remember_face`.
+const LCD_ID: &str = "dialog-lcd";
+
+pub fn remember_lcd(ctx: &egui::Context, lcd: Color32, lcd_face: Color32) {
+    ctx.memory_mut(|m| m.data.insert_temp(egui::Id::new(LCD_ID), (lcd, lcd_face)));
+}
+
+/// The pair last remembered; the shipped tape-green on near-black when the
+/// app has not spoken yet, which is also the settings default.
+pub fn live_lcd(ctx: &egui::Context) -> (Color32, Color32) {
+    ctx.memory(|m| m.data.get_temp(egui::Id::new(LCD_ID)))
+        .unwrap_or((
+            Color32::from_rgb(0xA3, 0xE0, 0x48),
+            Color32::from_rgb(0x0B, 0x0E, 0x0A),
+        ))
+}
+
 fn apply_theme(style: &mut egui::Style, t: &DialogTheme) {
     style.spacing.button_padding = egui::vec2(12.0, 4.0); // Qt: padding 4px 12px
     let set = |wv: &mut egui::style::WidgetVisuals, bg: Color32| {

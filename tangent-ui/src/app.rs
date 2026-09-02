@@ -26668,6 +26668,13 @@ impl TangentApp {
             {
                 // Read BEFORE the dialog is borrowed mutably.
                 let face = self.panel_face();
+                // The effect faces dress their glass in the cluster's own
+                // pair; stamped here so a dialog can reach it themed.
+                dialogs::remember_lcd(
+                    &ctx,
+                    self.settings.scope_draw_color.to_color32(),
+                    self.settings.meter_bg_color.to_color32(),
+                );
                 dialogs::show(&ctx, &mut self.dialog, face, placement)
             }
         {
