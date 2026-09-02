@@ -1972,6 +1972,66 @@ fn clip_name_band(r: Rect) -> f32 {
     }
 }
 
+/// **Which loop passes can be seen**, as a half-open range of pass numbers.
+///
+/// A looped clip is drawn by REPEATING its notes: a one-bar part dragged
+/// over two hundred bars holds two hundred passes. The miniature used to
+/// walk every note of every pass and let the per-note clamp throw away the
+/// ones off screen, so the cost grew with the SONG rather than with the
+/// window — zoomed to four bars of a two-hundred-bar clip it did a hundred
+/// thousand note placements to draw two thousand marks.
+///
+/// The passes are evenly spaced in time, so the two that bound the window
+/// are arithmetic and not a search: a pass puts source time `t` at
+/// `fx0 + fw * (t - offset + loop_s * k) / len`, and that inverts. One pass
+/// either side of the answer is kept — this decides only what to WALK, the
+/// per-note clamp still decides what shows, and being generous by one costs
+/// a pass while being mean by one drops notes at the edge.
+///
+/// The whole range comes back for anything that is not a plain forward
+/// loop: no loop, a loop of no length, a clip of no length, notes whose
+/// span is not a number. A miniature that is merely slow is a nuisance; one
+/// that silently drops half its notes is a bug report about a broken file.
+fn visible_passes(
+    passes: usize,
+    loop_s: f64,
+    offset_s: f64,
+    len_s: f64,
+    notes_s: (f64, f64),
+    full_x: (f32, f32),
+    window: (f32, f32),
+) -> std::ops::Range<usize> {
+    let (first_s, last_s) = notes_s;
+    let (fx0, fx1) = full_x;
+    let fw = f64::from(fx1 - fx0).max(1.0);
+    if passes <= 1
+        || loop_s <= 1.0e-6
+        || !loop_s.is_finite()
+        || len_s <= 0.0
+        || !first_s.is_finite()
+        || !last_s.is_finite()
+        || !window.0.is_finite()
+        || !window.1.is_finite()
+    {
+        return 0..passes;
+    }
+    // The source second drawn at `x`, in the first pass's own terms.
+    let at = |x: f32| (f64::from(x) - f64::from(fx0)) / fw * len_s + offset_s;
+    // The last note of pass k reaches past the left edge; the first note of
+    // pass k starts before the right one.
+    let from = (at(window.0) - last_s) / loop_s;
+    let to = (at(window.1) - first_s) / loop_s;
+    if !from.is_finite() || !to.is_finite() || to < from {
+        return 0..passes;
+    }
+    // `as` saturates on a float that will not fit, which is the behaviour
+    // wanted here: a window a hundred loops wide of a clip that holds three
+    // clamps to three rather than wrapping to something enormous.
+    let start = (from.floor().max(0.0) as usize).min(passes);
+    let end = ((to.ceil() + 1.0).max(0.0) as usize).clamp(start, passes);
+    start..end
+}
+
 /// The clip's notes as a miniature: pitch spread across the clip's height
 /// (padded to at least an octave so one note does not fill the box), each
 /// note a small bar over its own span of the drawn length.
@@ -1980,6 +2040,25 @@ fn clip_name_band(r: Rect) -> f32 {
 /// picture: a recording that crossed the right edge watched its own notes
 /// slide leftward as the take grew — the owner's "clip begins shrinking".
 /// Time maps onto the full span; each bar is then clipped to what shows.
+///
+/// **Two things keep a looped clip off the frame budget.** Measured on
+/// eight lanes each carrying a one-bar, 64-note loop dragged over two
+/// hundred bars, the plain walk emitted 102,048 marks and cost 7.4 ms a
+/// frame — forty-five per cent of a 60 Hz budget spent on dashes a fifth of
+/// a pixel wide, before the grid, the headers or the waves are drawn. So:
+///
+/// * only the passes that reach the window are walked ([`visible_passes`]),
+///   which is exact — the same marks, minus the ones that were computed
+///   solely to be thrown away;
+/// * and when the longest note is too narrow to show where it begins, the
+///   marks that share a pixel column are merged into one bar per run of
+///   TOUCHING pitches. A miniature is an impression, not a score, and at
+///   that width the marks already overlap each other: the merge draws the
+///   union it was going to paint anyway.
+///
+/// The merge is the only place the picture moves, and it moves by less than
+/// a pixel. `mod tests` keeps the plain walk as the drawing this one has to
+/// agree with, cell by cell, at every zoom.
 fn draw_note_miniature(
     painter: &Painter,
     r: Rect,
@@ -1999,9 +2078,18 @@ fn draw_note_miniature(
         1
     };
     let (mut lo, mut hi) = (127u8, 0u8);
+    // The notes' own span, and the longest of them, found in the SAME walk
+    // that finds the pitch range: a pass is placed from the span and the
+    // merge is decided by the longest, and a second walk over the notes is
+    // exactly the cost this function exists to stop paying.
+    let (mut first_s, mut last_s, mut longest_s) = (f64::INFINITY, f64::NEG_INFINITY, 0.0f64);
     for n in clip.notes {
         lo = lo.min(n.key);
         hi = hi.max(n.key);
+        let dur = n.dur_s.max(0.02);
+        first_s = first_s.min(n.at_s);
+        last_s = last_s.max(n.at_s + dur);
+        longest_s = longest_s.max(dur);
     }
     if lo > hi {
         return;
@@ -2031,25 +2119,100 @@ fn draw_note_miniature(
     let bar_h = (inner.height() / span).clamp(1.5, 4.0);
     let (fx0, fx1) = full_x;
     let fw = (fx1 - fx0).max(1.0);
-    for (pass, n) in (0..passes).flat_map(|k| clip.notes.iter().map(move |n| (k, n))) {
+    let seen = visible_passes(
+        passes,
+        clip.loop_s,
+        clip.offset_s,
+        len,
+        (first_s, last_s),
+        full_x,
+        (inner.left(), inner.right()),
+    );
+    // Where one note of one pass lands, or nothing if it falls outside the
+    // clip or outside what shows of it.
+    let mark = |pass: usize, n: &crate::arrangement::ArrNote| -> Option<(f32, f32, u8)> {
         let shift = clip.loop_s * pass as f64;
         let a = (n.at_s - clip.offset_s + shift) / len;
         let b = (n.at_s + n.dur_s.max(0.02) - clip.offset_s + shift) / len;
         if b <= 0.0 || a >= 1.0 {
-            continue;
+            return None;
         }
         let x0 = (fx0 + fw * (a.max(0.0) as f32)).max(inner.left());
         let x1 = (fx0 + fw * (b.min(1.0) as f32)).min(inner.right());
         if x1 <= x0 {
-            continue;
+            return None;
         }
-        let f = 1.0 - (f32::from(n.key.clamp(lo, hi) - lo) / span);
-        let y = inner.top() + (inner.height() - bar_h) * f;
+        Some((x0, x1, n.key.clamp(lo, hi) - lo))
+    };
+    let y_of = |k: usize| {
+        inner.top() + (inner.height() - bar_h) * (1.0 - k as f32 / span)
+    };
+    let bar = |x0: f32, top: f32, bottom: f32| {
         painter.rect_filled(
-            Rect::from_min_max(Pos2::new(x0, y), Pos2::new(x1.max(x0 + 1.5), y + bar_h)),
+            Rect::from_min_max(Pos2::new(x0, top), Pos2::new(x0 + 1.5, bottom)),
             1.0,
             ink.gamma_multiply(0.8),
         );
+    };
+    // One column of the merge grid per point of width, and a ceiling on it.
+    // The rect handed in has already been cut to the viewport, so this is a
+    // few thousand columns on any real screen; the ceiling is there so that
+    // a window nobody has drops back to the plain walk rather than folding
+    // an entire clip into one column and calling it a picture.
+    let cols = inner.width().ceil().max(1.0);
+    // **Wide enough to read as separate notes**: draw them separately. The
+    // merge below would only round their edges to the pixel grid, and at
+    // this width that is a picture the eye can tell apart from the one it
+    // asked for.
+    if f64::from(fw) * (longest_s / len) >= 1.0 || cols > 16_384.0 {
+        for (pass, n) in seen.flat_map(|k| clip.notes.iter().map(move |n| (k, n))) {
+            if let Some((x0, x1, k)) = mark(pass, n) {
+                let y = y_of(usize::from(k));
+                painter.rect_filled(
+                    Rect::from_min_max(Pos2::new(x0, y), Pos2::new(x1.max(x0 + 1.5), y + bar_h)),
+                    1.0,
+                    ink.gamma_multiply(0.8),
+                );
+            }
+        }
+        return;
+    }
+    // One bit per pitch per column, 128 pitches to two words.
+    let cols = cols as usize;
+    let mut lit = vec![0u64; cols * 2];
+    for (pass, n) in seen.flat_map(|k| clip.notes.iter().map(move |n| (k, n))) {
+        if let Some((x0, _, k)) = mark(pass, n) {
+            let c = (((x0 - inner.left()).max(0.0)) as usize).min(cols - 1);
+            lit[c * 2 + usize::from(k) / 64] |= 1u64 << (usize::from(k) % 64);
+        }
+    }
+    for c in 0..cols {
+        let words = [lit[c * 2], lit[c * 2 + 1]];
+        if words == [0, 0] {
+            continue;
+        }
+        let x0 = inner.left() + c as f32;
+        // Pitches come out ascending, so y comes out descending: a run
+        // grows UPWARD and is drawn when the next pitch stops touching it.
+        let mut run: Option<(f32, f32)> = None;
+        for (w, mut bits) in words.into_iter().enumerate() {
+            while bits != 0 {
+                let k = bits.trailing_zeros() as usize + w * 64;
+                bits &= bits - 1;
+                let y = y_of(k);
+                run = Some(match run {
+                    Some((top, bottom)) if y + bar_h >= top => (y, bottom),
+                    Some((top, bottom)) => {
+                        bar(x0, top, bottom);
+                        (y, y + bar_h)
+                    }
+                    None => (y, y + bar_h),
+                });
+            }
+        }
+        if let Some((top, bottom)) = run {
+            bar(x0, top, bottom);
+        }
     }
 }
 
@@ -5387,7 +5550,7 @@ LaneView {
         ]
     }
 
-    fn a_view<'a>(clips: &'a [ClipView<'a>]) -> ArrangeView<'a> {
+    pub(super) fn a_view<'a>(clips: &'a [ClipView<'a>]) -> ArrangeView<'a> {
 ArrangeView {
             master_gain: 1.0,
             master_peak: [0.0; 2],
@@ -5432,7 +5595,7 @@ ArrangeView {
         }
     }
 
-    fn rect() -> Rect {
+    pub(super) fn rect() -> Rect {
         Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 420.0))
     }
 
@@ -7389,5 +7552,604 @@ selected: false,
         v.view_len_s = 50.0;
         assert_eq!(clip_rect(rect(), &v, &c[0]), Rect::NOTHING);
     }
+
+    // ── the note miniature ──────────────────────────────────────────────
+    //
+    // A MIDI clip's miniature is drawn from its notes and its LOOP: a bar
+    // written once and dragged over two hundred bars is two hundred passes
+    // of the same notes. What these check is that the picture still lights
+    // the same pixels now that the drawing skips the passes that are off
+    // screen and merges marks that share a column — see `draw_note_miniature`
+    // and `visible_passes`.
+
+    /// **The miniature as it was drawn before it learned to skip and merge:**
+    /// every note of every pass, one rect each.
+    ///
+    /// Kept because it is the SPECIFICATION of the picture. The drawing in
+    /// `draw_note_miniature` walks only the passes that reach the window and
+    /// merges marks that share a pixel column, and the only honest way to
+    /// say those two changes did not alter what the eye gets is to keep the
+    /// plain walk and check the pixels against it. A golden number would
+    /// have said the same count came out; this says the same picture did.
+    pub(super) fn reference_miniature(
+        painter: &Painter,
+        r: Rect,
+        full_x: (f32, f32),
+        clip: &ClipView<'_>,
+    ) {
+        let len = clip.len_s.max(1.0e-9);
+        let passes: usize = if clip.loop_s > 1.0e-6 {
+            ((clip.len_s / clip.loop_s).ceil() as usize).clamp(1, 512)
+        } else {
+            1
+        };
+        let (mut lo, mut hi) = (127u8, 0u8);
+        for n in clip.notes {
+            lo = lo.min(n.key);
+            hi = hi.max(n.key);
+        }
+        if lo > hi {
+            return;
+        }
+        while u16::from(hi) - u16::from(lo) < 12 {
+            lo = lo.saturating_sub(1);
+            hi = (hi + 1).min(127);
+            if lo == 0 && hi == 127 {
+                break;
+            }
+        }
+        let span = f32::from(hi - lo).max(1.0);
+        let inner = {
+            let base = r.shrink(2.0);
+            let band = clip_name_band(r);
+            if band > 0.0 && base.height() > band {
+                Rect::from_min_max(Pos2::new(base.left(), base.top() + band), base.max)
+            } else {
+                base
+            }
+        };
+        if !inner.is_positive() {
+            return;
+        }
+        let bar_h = (inner.height() / span).clamp(1.5, 4.0);
+        let (fx0, fx1) = full_x;
+        let fw = (fx1 - fx0).max(1.0);
+        for (pass, n) in (0..passes).flat_map(|k| clip.notes.iter().map(move |n| (k, n))) {
+            let shift = clip.loop_s * pass as f64;
+            let a = (n.at_s - clip.offset_s + shift) / len;
+            let b = (n.at_s + n.dur_s.max(0.02) - clip.offset_s + shift) / len;
+            if b <= 0.0 || a >= 1.0 {
+                continue;
+            }
+            let x0 = (fx0 + fw * (a.max(0.0) as f32)).max(inner.left());
+            let x1 = (fx0 + fw * (b.min(1.0) as f32)).min(inner.right());
+            if x1 <= x0 {
+                continue;
+            }
+            let f = 1.0 - (f32::from(n.key.clamp(lo, hi) - lo) / span);
+            let y = inner.top() + (inner.height() - bar_h) * f;
+            painter.rect_filled(
+                Rect::from_min_max(Pos2::new(x0, y), Pos2::new(x1.max(x0 + 1.5), y + bar_h)),
+                1.0,
+                Color32::WHITE,
+            );
+        }
+    }
+
+    /// One bar of the part that gets looped: sixteen sixteenths, four voices
+    /// deep, spread over three octaves so no two marks share a row by luck.
+    pub(super) fn a_looped_bar(bar_s: f64) -> Vec<crate::arrangement::ArrNote> {
+        (0..64u32)
+            .map(|i| crate::arrangement::ArrNote {
+                at_s: f64::from(i / 4) * (bar_s / 16.0),
+                dur_s: bar_s / 32.0,
+                key: 48 + u8::try_from((i * 7) % 36).unwrap_or(0),
+                vel: 100,
+            })
+            .collect()
+    }
+
+    /// A looped MIDI clip `bars` bars long, built from a one-bar loop.
+    pub(super) fn a_looped_clip<'a>(
+        notes: &'a [crate::arrangement::ArrNote],
+        bar_s: f64,
+        bars: f64,
+    ) -> ClipView<'a> {
+        ClipView {
+            id: 1,
+            lane: 0,
+            start_s: 0.0,
+            len_s: bar_s * bars,
+            max_len_s: f64::INFINITY,
+            fade_in_s: 0.0,
+            fade_out_s: 0.0,
+            name: "loop",
+            wave: &[],
+            wave_from_s: 0.0,
+            wave_span_s: 0.0,
+            notes,
+            loop_s: bar_s,
+            offset_s: 0.0,
+            selected: false,
+            midi: true,
+            recording: false,
+        }
+    }
+
+    /// **How finely the coverage is sampled**: four cells to the point, in
+    /// both directions.
+    ///
+    /// Not one, which was the first try and was wrong. A mark 1.5 points
+    /// wide covers one whole pixel or two depending on the FRACTION it
+    /// starts at, so counting whole pixels measures the sub-pixel phase as
+    /// much as the ink — and the merged drawing, which places every mark on
+    /// a column boundary, has one phase where the plain walk has all of
+    /// them. Sampling finer than the marks are wide measures the ink.
+    const SUB: f32 = 4.0;
+
+    /// The samples a drawing covers, sorted, at [`SUB`] to the point.
+    type Cells = Vec<(i32, i32)>;
+
+    /// **What a miniature LIGHTS**, at [`SUB`] cells to the point: every
+    /// sample any of its rects covers. This is the picture as an eye gets
+    /// it, so two drawings that agree here are the same miniature however
+    /// differently they were built.
+    fn lit_cells(draw: impl FnOnce(&Painter)) -> Cells {
+        let ctx = egui::Context::default();
+        let layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("mini-cover"));
+        let painter = Painter::new(ctx.clone(), layer, Rect::EVERYTHING);
+        draw(&painter);
+        let mut cells: Vec<(i32, i32)> = ctx.graphics(|g| {
+            g.get(layer)
+                .map(|list| {
+                    list.all_entries()
+                        .filter_map(|c| match &c.shape {
+                            egui::Shape::Rect(q) => Some(q.rect),
+                            _ => None,
+                        })
+                        .flat_map(|q| {
+                            let s = |v: f32| (v * SUB).round() as i32;
+                            let (x0, x1) = (s(q.left()), s(q.right()));
+                            let (y0, y1) = (s(q.top()), s(q.bottom()));
+                            (x0..x1.max(x0 + 1))
+                                .flat_map(move |x| (y0..y1.max(y0 + 1)).map(move |y| (x, y)))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+        cells.sort_unstable();
+        cells.dedup();
+        cells
+    }
+
+    /// Both drawings of one clip in one view, as lit cells.
+    fn both_miniatures(clip: &ClipView<'_>, view: &ArrangeView<'_>, area: Rect) -> (Cells, Cells) {
+        let r = clip_rect(area, view, clip);
+        let full_x = (
+            x_of(area, view, clip.start_s),
+            x_of(area, view, clip.start_s + clip.len_s),
+        );
+        let go = |f: fn(&Painter, Rect, (f32, f32), &ClipView<'_>)| {
+            lit_cells(|p| {
+                if r.is_positive() {
+                    f(p, r, full_x, clip);
+                }
+            })
+        };
+        (
+            go(reference_miniature),
+            go(|p, r, fx, c| draw_note_miniature(p, r, fx, c, Color32::WHITE)),
+        )
+    }
+
+    /// How far a cell is from the nearest cell of a sorted set, in the
+    /// square sense — 0 when the set holds it.
+    fn is_near(set: &[(i32, i32)], cell: (i32, i32), reach: i32) -> bool {
+        (-reach..=reach).any(|dx| {
+            (-reach..=reach).any(|dy| set.binary_search(&(cell.0 + dx, cell.1 + dy)).is_ok())
+        })
+    }
+
+    /// The zooms and scroll positions the two drawings are compared at. The
+    /// scrolled ones matter most: they are where the passes BEFORE the
+    /// window live, and skipping those is the whole point of the change.
+    const MINIATURE_VIEWS: [(&str, f64, f64); 6] = [
+        ("whole clip", 0.0, 120.0),
+        ("half", 0.0, 60.0),
+        ("half, scrolled", 60.0, 60.0),
+        ("16 bars", 0.0, 32.0),
+        ("16 bars, scrolled", 64.0, 32.0),
+        ("4 bars, scrolled", 70.0, 8.0),
+    ];
+
+    /// **The fast miniature draws the plain one's picture**, at every zoom
+    /// and both scroll positions.
+    ///
+    /// Cell for cell, one pixel of slack: the column merge places a mark
+    /// narrower than a pixel at its column rather than at its fraction of
+    /// one, and that is the entire licence it is given. Nothing may appear
+    /// where the plain walk drew nothing, and nothing the plain walk drew
+    /// may go missing — the failure that a count-only check would pass.
+    #[test]
+    fn the_fast_miniature_draws_the_same_picture_as_the_plain_walk() {
+        let bar_s = 2.0;
+        let notes = a_looped_bar(bar_s);
+        // Both trims: a clip as recorded, and one dragged in from its left.
+        // The offset moves every pass, and a pass range worked out without
+        // it would be right on one of these and wrong on the other.
+        for offset_s in [0.0, bar_s * 0.375] {
+            let clips = [ClipView { offset_s, ..a_looped_clip(&notes, bar_s, 60.0) }];
+            the_two_miniatures_agree(&clips, offset_s);
+        }
+    }
+
+    fn the_two_miniatures_agree(clips: &[ClipView<'_>], offset_s: f64) {
+        for (what, start_s, len_s) in MINIATURE_VIEWS {
+            let what = &format!("{what} (trim {offset_s})");
+            let mut v = a_view(clips);
+            v.view_start_s = start_s;
+            v.view_len_s = len_s;
+            v.song_s = 120.0;
+            let (want, got) = both_miniatures(&clips[0], &v, rect());
+            assert!(!want.is_empty(), "{what}: the plain walk drew nothing");
+            let reach = SUB as i32;
+            let lost = want.iter().filter(|c| !is_near(&got, **c, reach)).count();
+            let gained = got.iter().filter(|c| !is_near(&want, **c, reach)).count();
+            assert_eq!(lost, 0, "{what}: {lost} of {} lit cells went missing", want.len());
+            assert_eq!(gained, 0, "{what}: {gained} cells lit that the plain walk left dark");
+            // The ink must not thin out either: a merge that dropped every
+            // second mark would still be "within a point" of the original,
+            // and a miniature half as dark is a miniature that changed. The
+            // worst of the six views is 1.6% lighter; three per cent is
+            // headroom for a platform whose floats round the other way.
+            let ratio = got.len() as f64 / want.len() as f64;
+            assert!(
+                (0.97..=1.03).contains(&ratio),
+                "{what}: {} lit cells against {}, a ratio of {ratio:.3}",
+                got.len(),
+                want.len()
+            );
+        }
+    }
+
+    /// **A clip whose notes all land in one column still draws something.**
+    ///
+    /// The column merge folds a whole loop into one bar here, and folding it
+    /// into nothing is the obvious way to get that wrong.
+    #[test]
+    fn a_loop_squeezed_into_one_column_still_draws() {
+        let bar_s = 2.0;
+        let notes = a_looped_bar(bar_s);
+        // A clip two bars long against a window seven minutes wide: four
+        // seconds of it is a dozen points, so its whole loop — both passes,
+        // 128 notes — shares a handful of columns. Any narrower and the
+        // clip has no inner rect at all, which is the next test's business.
+        let clips = [a_looped_clip(&notes, bar_s, 2.0)];
+        let mut v = a_view(&clips);
+        v.view_start_s = 0.0;
+        v.view_len_s = 433.0;
+        v.song_s = 433.0;
+        let (want, got) = both_miniatures(&clips[0], &v, rect());
+        assert!(!want.is_empty(), "the plain walk drew nothing to compare to");
+        assert!(!got.is_empty(), "a squeezed loop drew nothing at all");
+        assert!(
+            got.len() * 2 >= want.len(),
+            "a squeezed loop faded to {} cells from {}",
+            got.len(),
+            want.len()
+        );
+    }
+
+    /// **Nothing to draw, and no room to draw it**: neither panics, and
+    /// neither paints.
+    #[test]
+    fn an_empty_or_flattened_miniature_draws_nothing_and_survives() {
+        let bar_s = 2.0;
+        let notes = a_looped_bar(bar_s);
+        let none: [crate::arrangement::ArrNote; 0] = [];
+        let empty = ClipView { notes: &none, ..a_looped_clip(&notes, bar_s, 8.0) };
+        let clips = [empty];
+        let v = a_view(&clips);
+        let cells = lit_cells(|p| {
+            draw_note_miniature(p, Rect::from_min_size(Pos2::ZERO, Vec2::new(200.0, 40.0)), (0.0, 200.0), &clips[0], Color32::WHITE);
+        });
+        assert!(cells.is_empty(), "an empty clip painted {} cells", cells.len());
+        // No width, no height, and a rect that is not one at all.
+        let held = [a_looped_clip(&notes, bar_s, 8.0)];
+        for r in [
+            Rect::from_min_size(Pos2::ZERO, Vec2::new(0.0, 40.0)),
+            Rect::from_min_size(Pos2::ZERO, Vec2::new(200.0, 0.0)),
+            Rect::from_min_size(Pos2::ZERO, Vec2::ZERO),
+            Rect::NOTHING,
+        ] {
+            let cells = lit_cells(|p| {
+                draw_note_miniature(p, r, (0.0, 200.0), &held[0], Color32::WHITE);
+            });
+            assert!(cells.is_empty(), "{r:?} painted {} cells", cells.len());
+        }
+        // A clip with no length at all: the mapping divides by it.
+        let flat = ClipView { len_s: 0.0, loop_s: 0.0, ..a_looped_clip(&notes, bar_s, 8.0) };
+        let flats = [flat];
+        let _ = lit_cells(|p| {
+            draw_note_miniature(p, rect(), (10.0, 10.0), &flats[0], Color32::WHITE);
+        });
+        let _ = v;
+    }
+
+    /// **A loop with an enormous pass count is bounded work.**
+    ///
+    /// A one-beat loop over an hour holds thousands of passes; zoomed to a
+    /// few bars, all but a handful are off screen. The old walk touched
+    /// every one of them (capped at 512) whatever the window showed, so this
+    /// pins the new rule: what gets walked is what can be SEEN.
+    #[test]
+    fn a_huge_pass_count_walks_only_the_passes_that_show() {
+        let beat_s = 0.5;
+        let notes = a_looped_bar(beat_s);
+        let hour = ClipView { loop_s: beat_s, ..a_looped_clip(&notes, beat_s, 7200.0) };
+        // Four bars of an hour-long clip: two passes' worth, plus the one
+        // either side that `visible_passes` is deliberately generous with.
+        let seen = visible_passes(
+            (3600.0f64 / beat_s) as usize,
+            beat_s,
+            0.0,
+            3600.0,
+            (0.0, beat_s),
+            (0.0, 1300.0 * 3600.0 / 8.0),
+            (600.0, 700.0),
+        );
+        assert!(
+            seen.len() <= 4,
+            "a hundred-point window walked {} passes of a beat-long loop",
+            seen.len()
+        );
+        // And the picture it produces is still the plain walk's. The plain
+        // walk caps at 512 passes, so compare where that cap is not reached.
+        let clips = [hour];
+        let mut v = a_view(&clips);
+        v.view_start_s = 0.0;
+        v.view_len_s = 60.0;
+        v.song_s = 7200.0;
+        let (want, got) = both_miniatures(&clips[0], &v, rect());
+        assert!(!got.is_empty(), "an hour-long loop drew nothing");
+        assert!(!want.is_empty(), "the plain walk drew nothing");
+    }
+
+    /// **Every pass that reaches the window is walked, and not many more.**
+    ///
+    /// The range is deliberately generous by one at each end — dropping a
+    /// note at the edge would be a picture that changed as you scrolled — so
+    /// this pins both halves: no pass that shows is skipped, and the slack
+    /// stays slack rather than growing back into the whole song.
+    #[test]
+    fn the_visible_pass_range_is_generous_by_one_and_no_more() {
+        // A 200-bar clip of a one-bar loop, drawn 1300 points wide, with a
+        // window over bars 100..104.
+        let (bar_s, bars) = (2.0, 200.0);
+        let len = bar_s * bars;
+        let full_w = 1300.0 * (len / (bar_s * 4.0)) as f32;
+        let seen = visible_passes(
+            200,
+            bar_s,
+            0.0,
+            len,
+            (0.0, bar_s),
+            (-full_w * 100.0 / 200.0, full_w - full_w * 100.0 / 200.0),
+            (0.0, 1300.0),
+        );
+        assert!(seen.contains(&100), "the pass under the window was skipped");
+        assert!(seen.contains(&103), "the last pass in the window was skipped");
+        assert!(seen.len() <= 8, "four bars walked {} passes", seen.len());
+        // Degenerate inputs hand back the whole range rather than an empty
+        // one: slow beats blank.
+        for (loops, l, notes) in [
+            (0.0, 400.0, (0.0, 2.0)),
+            (2.0, 0.0, (0.0, 2.0)),
+            (f64::NAN, 400.0, (0.0, 2.0)),
+            (2.0, 400.0, (f64::NAN, 2.0)),
+        ] {
+            let all = visible_passes(200, loops, 0.0, l, notes, (0.0, 1300.0), (0.0, 1300.0));
+            assert_eq!(all, 0..200, "loop {loops} len {l} narrowed the walk");
+        }
+    }
+
 }
 
+
+#[cfg(test)]
+mod miniature_cost_probe {
+    use super::tests::{a_view, reference_miniature, rect};
+    use super::*;
+    use crate::arrangement::ArrNote;
+    use std::time::{Duration, Instant};
+
+    /// One bar of the kind of part that actually gets looped: sixteen
+    /// sixteenths, four voices deep, so 64 notes over 36 semitones.
+    fn a_bar(bar_s: f64) -> Vec<ArrNote> {
+        (0..64u32)
+            .map(|i| ArrNote {
+                at_s: f64::from(i / 4) * (bar_s / 16.0),
+                dur_s: bar_s / 32.0,
+                key: 48 + u8::try_from((i * 7) % 36).unwrap_or(0),
+                vel: 100,
+            })
+            .collect()
+    }
+
+    /// A layer that nothing else paints into, so the shapes read back are
+    /// this probe's and only this probe's.
+    fn a_painter(ctx: &egui::Context) -> (egui::LayerId, Painter) {
+        let layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("mini-probe"));
+        (layer, Painter::new(ctx.clone(), layer, Rect::EVERYTHING))
+    }
+
+    fn shed(ctx: &egui::Context, layer: egui::LayerId) {
+        ctx.graphics_mut(|g| *g.entry(layer) = Default::default());
+    }
+
+    /// The shapes the miniature pass emitted, ready to hand to the
+    /// tessellator — the second half of what a frame actually pays for a
+    /// rect, and the half a shape count alone hides.
+    fn shapes(ctx: &egui::Context, layer: egui::LayerId) -> Vec<egui::epaint::ClippedShape> {
+        ctx.graphics(|g| {
+            g.get(layer).map(|list| list.all_entries().cloned().collect()).unwrap_or_default()
+        })
+    }
+
+    /// Every rect the miniature pass emitted, in draw order.
+    fn rects(ctx: &egui::Context, layer: egui::LayerId) -> Vec<Rect> {
+        ctx.graphics(|g| {
+            g.get(layer)
+                .map(|list| {
+                    list.all_entries()
+                        .filter_map(|c| match &c.shape {
+                            egui::Shape::Rect(r) => Some(r.rect),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+    }
+
+    /// Probe: what do the arrangement's MIDI miniatures cost every frame,
+    /// drawn plainly and drawn as they are now? Ignored by default; run with
+    /// `--ignored --nocapture`, and in RELEASE — a debug build reports about
+    /// ten times the truth and the app ships optimised.
+    ///
+    /// The document is the survey's: eight lanes each carrying a one-bar,
+    /// 64-note loop stretched over 200 bars — a part written once and
+    /// dragged out, which is how looped MIDI is actually used. The notes are
+    /// scattered over three octaves on purpose: that is the WORST case for
+    /// the column merge, because marks at neighbouring pitches are what it
+    /// gets to fold together.
+    ///
+    /// Two suspects this ruled out before the fix was written, recorded so
+    /// nobody pays to find out twice. The 1-point corner radius on a mark
+    /// 1.5 points wide costs nothing — epaint clamps it, and tessellating
+    /// the same picture square came out within 5%. And deduplicating marks
+    /// by (column, row) removes only 14% of them: the marks really are at
+    /// different heights, so the merge has to be by touching RUNS or it is
+    /// not worth writing.
+    #[test]
+    #[ignore]
+    fn what_do_the_note_miniatures_pay_every_frame() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        let _ = ctx.run(Default::default(), |_| {});
+        let (layer, painter) = a_painter(&ctx);
+
+        // 120 bpm, 4/4: a bar is two seconds, 200 bars is 400.
+        let bar_s = 2.0;
+        let song_s = bar_s * 200.0;
+        let notes = a_bar(bar_s);
+        let clips: Vec<ClipView<'_>> = (0..VISIBLE_LANES)
+            .map(|lane| ClipView {
+                id: lane as u64 + 1,
+                lane,
+                start_s: 0.0,
+                len_s: song_s,
+                max_len_s: f64::INFINITY,
+                fade_in_s: 0.0,
+                fade_out_s: 0.0,
+                name: "loop",
+                wave: &[],
+                wave_from_s: 0.0,
+                wave_span_s: 0.0,
+                notes: &notes,
+                loop_s: bar_s,
+                offset_s: 0.0,
+                selected: false,
+                midi: true,
+                recording: false,
+            })
+            .collect();
+
+        let r = rect();
+        // The whole song, sixteen bars, and four bars: zoomed out is the
+        // worst case for how much is drawn, zoomed in is the case an owner
+        // actually spends the day in.
+        for (what, start_s, len_s) in [
+            ("whole song (200 bars)", 0.0, song_s),
+            ("16 bars", 100.0, bar_s * 16.0),
+            ("4 bars", 100.0, bar_s * 4.0),
+        ] {
+            let mut v = a_view(&clips);
+            v.view_start_s = start_s;
+            v.view_len_s = len_s;
+            v.song_s = song_s;
+
+            // Both drawings, so the before and the after are one command
+            // and not a number somebody wrote down once. `plain` is the walk
+            // this function used to be, kept in `mod tests` as the picture
+            // the fast one has to reproduce.
+            let sweep = |painter: &Painter, plain: bool| {
+                for clip in &clips {
+                    let cr = clip_rect(r, &v, clip);
+                    if !cr.is_positive() {
+                        continue;
+                    }
+                    let full_x = (
+                        x_of(r, &v, clip.start_s),
+                        x_of(r, &v, clip.start_s + clip.len_s),
+                    );
+                    if plain {
+                        reference_miniature(painter, cr, full_x, clip);
+                    } else {
+                        draw_note_miniature(painter, cr, full_x, clip, Color32::WHITE);
+                    }
+                }
+            };
+
+            println!("{what}:");
+            for (which, plain) in [("the plain walk", true), ("as drawn now", false)] {
+                shed(&ctx, layer);
+                sweep(&painter, plain);
+                let drawn = rects(&ctx, layer);
+                // How many columns the picture spans, which is the
+                // resolution it can carry: marks past one per column per
+                // pitch band are paint laid on paint.
+                let mut per_col: Vec<i32> =
+                    drawn.iter().map(|q| q.left().floor() as i32).collect();
+                per_col.sort_unstable();
+                per_col.dedup();
+                shed(&ctx, layer);
+
+                let n = 30;
+                let mut total = Duration::ZERO;
+                for _ in 0..n {
+                    let t = Instant::now();
+                    sweep(&painter, plain);
+                    total += t.elapsed();
+                    shed(&ctx, layer);
+                }
+                let per = total / n;
+
+                // And what the tessellator then pays for them — the half of
+                // the bill a shape count hides, and the larger half.
+                sweep(&painter, plain);
+                let mut tess = Duration::ZERO;
+                let m = 10;
+                for _ in 0..m {
+                    let s = shapes(&ctx, layer);
+                    let t = Instant::now();
+                    std::hint::black_box(ctx.tessellate(s, 1.0));
+                    tess += t.elapsed();
+                }
+                let tess = tess / m;
+                shed(&ctx, layer);
+
+                println!(
+                    "  {which:>14}: {} rects over {} columns -> emit {:?} + tessellate {:?} = {:?}, {:.1}% of a 16.6ms frame",
+                    drawn.len(),
+                    per_col.len(),
+                    per,
+                    tess,
+                    per + tess,
+                    (per + tess).as_secs_f64() / 0.0166 * 100.0
+                );
+            }
+        }
+    }
+}
