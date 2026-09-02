@@ -1572,3 +1572,159 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod shot {
+    use super::*;
+
+    /// **Render the overlay to a file, so a human can look at it.**
+    ///
+    /// Not a test of anything: an eye. The band is a pure painter, so the real
+    /// drawing code can be tessellated and rasterised here with no window and
+    /// no GPU — every triangle egui would have sent to the card, including the
+    /// text, which arrives as triangles sampling the font atlas like anything
+    /// else. Writes a BMP because that needs no encoder; convert with `sips`.
+    ///
+    ///     cargo test -p tangent-ui --lib shot -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn draw_it() {
+        const SCALE: f32 = 2.0;
+        const W: usize = 1200;
+        const H: usize = 520;
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        // Lay out AND build the font atlas at the render scale, so a glyph is
+        // rasterised at the size it is shown rather than magnified.
+        ctx.set_pixels_per_point(SCALE);
+
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(W as f32 / SCALE, H as f32 / SCALE));
+        let mut busy = Busy::new("Loading project").with_detail("Serum - 3 of 8");
+        busy = busy.with_progress(Progress::Steps { done: 3, total: 8 });
+
+        // **Two passes, and the atlas is accumulated across both.** The
+        // first builds it; the second returns only a PARTIAL delta (a patch at
+        // an offset), so reading the atlas from the second pass alone gives a
+        // fragment and every glyph then samples its neighbour. That is what
+        // made the first version of this render text as blobs.
+        let mut atlas: Option<(usize, usize, Vec<f32>)> = None;
+        let mut soak = |d: &egui::TexturesDelta, atlas: &mut Option<(usize, usize, Vec<f32>)>| {
+            for (id, img) in &d.set {
+                if *id != egui::TextureId::Managed(0) {
+                    continue;
+                }
+                let egui::ImageData::Color(c) = &img.image;
+                let cov: Vec<f32> = c.pixels.iter().map(|p| f32::from(p.a()) / 255.0).collect();
+                match (img.pos, atlas.as_mut()) {
+                    // A patch into the atlas we already hold.
+                    (Some([px, py]), Some((aw, _, ref mut a))) => {
+                        for row in 0..c.size[1] {
+                            for col in 0..c.size[0] {
+                                let dst = (py + row) * *aw + px + col;
+                                if dst < a.len() {
+                                    a[dst] = cov[row * c.size[0] + col];
+                                }
+                            }
+                        }
+                    }
+                    // A whole new atlas.
+                    _ => *atlas = Some((c.size[0], c.size[1], cov)),
+                }
+            }
+        };
+        let first = ctx.run(Default::default(), |_| {});
+        soak(&first.textures_delta, &mut atlas);
+        let out = ctx.run(Default::default(), |c| {
+            let p = egui::Painter::new(c.clone(), egui::LayerId::debug(), rect);
+            // A plausible desk under the scrim, so the veil reads honestly.
+            p.rect_filled(rect, 0.0, Color32::from_rgb(0x2b, 0x2f, 0x35));
+            for i in 0..14 {
+                let y = 18.0 + i as f32 * 26.0;
+                p.rect_filled(
+                    Rect::from_min_size(Pos2::new(24.0, y), egui::vec2(W as f32 / SCALE - 48.0, 16.0)),
+                    2.0,
+                    Color32::from_rgb(0x3a, 0x3f, 0x47),
+                );
+            }
+            busy.draw(&p, rect, Color32::from_rgb(0x2b, 0x2f, 0x35), 0.0);
+        });
+
+        soak(&out.textures_delta, &mut atlas);
+        let prims = ctx.tessellate(out.shapes, SCALE);
+        let mut buf = vec![[0u8; 3]; W * H];
+        for prim in &prims {
+            let egui::epaint::Primitive::Mesh(m) = &prim.primitive else { continue };
+            for tri in m.indices.chunks_exact(3) {
+                let v: Vec<_> = tri.iter().map(|&i| m.vertices[i as usize]).collect();
+                let (x0, x1) = (v.iter().map(|p| p.pos.x).fold(f32::MAX, f32::min),
+                                v.iter().map(|p| p.pos.x).fold(f32::MIN, f32::max));
+                let (y0, y1) = (v.iter().map(|p| p.pos.y).fold(f32::MAX, f32::min),
+                                v.iter().map(|p| p.pos.y).fold(f32::MIN, f32::max));
+                let area = |a: egui::epaint::Vertex, b: egui::epaint::Vertex, px: f32, py: f32| {
+                    (b.pos.x - a.pos.x) * (py - a.pos.y) - (b.pos.y - a.pos.y) * (px - a.pos.x)
+                };
+                let denom = area(v[0], v[1], v[2].pos.x, v[2].pos.y);
+                if denom.abs() < 1e-9 { continue; }
+                for py in (y0.floor().max(0.0) as usize)..=(y1.ceil().min(H as f32 - 1.0) as usize) {
+                    for px in (x0.floor().max(0.0) as usize)..=(x1.ceil().min(W as f32 - 1.0) as usize) {
+                        let (fx, fy) = (px as f32 + 0.5, py as f32 + 0.5);
+                        let w0 = area(v[1], v[2], fx, fy) / denom;
+                        let w1 = area(v[2], v[0], fx, fy) / denom;
+                        let w2 = area(v[0], v[1], fx, fy) / denom;
+                        if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 { continue; }
+                        let col = |f: fn(&egui::epaint::Vertex) -> f32| w0 * f(&v[0]) + w1 * f(&v[1]) + w2 * f(&v[2]);
+                        let (r, g, b, mut a) = (
+                            col(|p| p.color.r() as f32), col(|p| p.color.g() as f32),
+                            col(|p| p.color.b() as f32), col(|p| p.color.a() as f32) / 255.0);
+                        // Text and shapes both arrive as textured triangles; a
+                        // shape samples the atlas's white pixel, text samples a glyph.
+                        // WHITE_UV is (0,0): a plain shape, not a glyph.
+                        let is_glyph = col(|p| p.uv.x) > 1e-4 || col(|p| p.uv.y) > 1e-4;
+                        if let (true, Some((aw, ah, ref px_a))) = (is_glyph, atlas.as_ref().map(|a| (a.0, a.1, &a.2))) {
+                            // BILINEAR, because a glyph is a coverage map and
+                            // point-sampling one turns letters into blocks.
+                            let fu = (col(|p| p.uv.x) * aw as f32 - 0.5).clamp(0.0, aw as f32 - 1.0);
+                            let fv = (col(|p| p.uv.y) * ah as f32 - 0.5).clamp(0.0, ah as f32 - 1.0);
+                            let (u0, v0) = (fu.floor() as usize, fv.floor() as usize);
+                            let (u1, v1) = ((u0 + 1).min(aw - 1), (v0 + 1).min(ah - 1));
+                            let (tu, tv) = (fu - u0 as f32, fv - v0 as f32);
+                            let at = |x: usize, y: usize| px_a[y * aw + x];
+                            let top = at(u0, v0) * (1.0 - tu) + at(u1, v0) * tu;
+                            let bot = at(u0, v1) * (1.0 - tu) + at(u1, v1) * tu;
+                            a *= top * (1.0 - tv) + bot * tv;
+                        }
+                        if a <= 0.002 { continue; }
+                        let d = &mut buf[py * W + px];
+                        for (i, c) in [r, g, b].into_iter().enumerate() {
+                            d[i] = (c * a + d[i] as f32 * (1.0 - a)).round().clamp(0.0, 255.0) as u8;
+                        }
+                    }
+                }
+            }
+        }
+        // BMP: 24-bit, bottom-up, rows padded to 4 bytes.
+        let pad = (4 - (W * 3) % 4) % 4;
+        let size = 54 + (W * 3 + pad) * H;
+        let mut f = Vec::with_capacity(size);
+        f.extend_from_slice(b"BM");
+        f.extend_from_slice(&(size as u32).to_le_bytes());
+        f.extend_from_slice(&0u32.to_le_bytes());
+        f.extend_from_slice(&54u32.to_le_bytes());
+        f.extend_from_slice(&40u32.to_le_bytes());
+        f.extend_from_slice(&(W as i32).to_le_bytes());
+        f.extend_from_slice(&(H as i32).to_le_bytes());
+        f.extend_from_slice(&1u16.to_le_bytes());
+        f.extend_from_slice(&24u16.to_le_bytes());
+        f.extend_from_slice(&[0u8; 24]);
+        for y in (0..H).rev() {
+            for x in 0..W {
+                let p = buf[y * W + x];
+                f.extend_from_slice(&[p[2], p[1], p[0]]);
+            }
+            f.extend(std::iter::repeat(0u8).take(pad));
+        }
+        let path = std::env::var("SHOT").unwrap_or_else(|_| "/tmp/busy.bmp".into());
+        std::fs::write(&path, f).unwrap();
+        println!("wrote {path}");
+    }
+}
