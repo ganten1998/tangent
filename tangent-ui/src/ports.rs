@@ -925,6 +925,27 @@ pub struct IrLive {
     pub has_reference: bool,
     /// The last finished capture's measurements, until a new arm clears it.
     pub result: Option<IrOutcome>,
+    /// **Which capture the picture above belongs to.** Counted up by the
+    /// host once per pass that actually reaches the engine, never reset.
+    /// Appended at the END, this struct's law.
+    ///
+    /// `result` is deliberately sticky — the host keeps the last finished
+    /// capture across a close and reopen of the wizard, so nobody loses a
+    /// pass by shutting the panel mid-thought. That stickiness is also how a
+    /// FAILED arm used to hand the wizard somebody else's IR: press Capture
+    /// with no engine running, `start_ir_capture` returns before it starts
+    /// anything, and the wizard, waiting for a result, found the previous
+    /// one still sitting here — showed it as the new capture, and would have
+    /// SAVED it under the new name. For an archival tool that is the worst
+    /// failure there is, because the wrong file is written silently.
+    ///
+    /// So the id moves only when a pass truly starts. The wizard remembers
+    /// the id it saw when it pressed Capture and refuses to advance until
+    /// this number has moved past it (`IrWizardState::settle_from_live`),
+    /// which makes the mistake impossible to make rather than merely
+    /// handled: a result carrying an id the wizard already knew cannot be
+    /// mistaken for the one it is waiting for.
+    pub capture_id: u64,
 }
 
 #[cfg(test)]
