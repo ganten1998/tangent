@@ -10,14 +10,23 @@
 //! collide in this file.
 
 pub mod amp;
+/// Wraps DSP that lives in the recorder-gated `effects` module, so the
+/// Minimal build — which has no effects chain to borrow from — skips it.
+#[cfg(feature = "recorder")]
 pub mod chorus;
 pub mod comp;
 pub mod convolver;
 pub mod denoise;
 pub mod drive;
+/// Wraps DSP that lives in the recorder-gated `effects` module, so the
+/// Minimal build — which has no effects chain to borrow from — skips it.
+#[cfg(feature = "recorder")]
 pub mod echo;
 pub mod eq;
 pub mod imager;
+/// Wraps DSP that lives in the recorder-gated `effects` module, so the
+/// Minimal build — which has no effects chain to borrow from — skips it.
+#[cfg(feature = "recorder")]
 pub mod plate;
 pub mod sweep;
 pub mod tape;
