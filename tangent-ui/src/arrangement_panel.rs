@@ -3020,6 +3020,30 @@ fn bay_chip(painter: &Painter, r: Rect, word: &str, has: bool, p: &Ink) {
     );
 }
 
+/// **The lane field**: the ground every clip in this view sits on.
+///
+/// In light mode the timecode WELL is lifted toward the strip face so the
+/// lanes read as a surface that clips sit on rather than a hole cut in the
+/// desk; in dark mode it stays near the well and is lifted only enough to
+/// separate from the seams. Through the dead-zone guard either way, for the
+/// reason `legible_surface` gives: the clips and the words that land on this
+/// field have to be readable whatever roles it was derived from.
+///
+/// **Public, and lifted out of [`ink`], because a second thing now needs the
+/// answer.** The notification column is dressed for whatever is under the
+/// window's top-left corner, and in this view that is this field — but the
+/// column is painted at the end of the frame, from the app, with no
+/// `ArrangeView` in reach. A derivation copied there would be a second place
+/// that decides what the arrangement's ground is, and the two would come apart
+/// the first time either was tuned. So there is one, and both callers use it.
+pub fn lane_field(strip: Color32, well: Color32, dark: bool) -> Color32 {
+    crate::recorder_panel::legible_surface(if dark {
+        shade(well, 1.55)
+    } else {
+        blend(well, strip, 0.46)
+    })
+}
+
 fn ink(view: &ArrangeView<'_>) -> Ink {
     // **DERIVED from the theme, in both modes.**
     //
@@ -3037,18 +3061,7 @@ fn ink(view: &ArrangeView<'_>) -> Ink {
     let well = Color32::from_rgb(view.meter_bg.0, view.meter_bg.1, view.meter_bg.2);
     let dark = view.dark_mode;
 
-    // The lane field. In light mode the well is lifted toward the strip so the
-    // lanes read as a SURFACE that clips sit on rather than a hole cut in the
-    // desk; in dark mode it stays near the well and is lifted only enough to
-    // separate from the seams.
-    // Through the dead-zone guard, for the reason `legible_surface` gives:
-    // the clips and the words that land on this field have to be readable
-    // whatever three roles it was derived from.
-    let lane = crate::recorder_panel::legible_surface(if dark {
-        shade(well, 1.55)
-    } else {
-        blend(well, strip, 0.46)
-    });
+    let lane = lane_field(strip, well, dark);
     // **Structure separates from the field PERCEPTUALLY, not by a multiplier.**
     //
     // Scaling brightness is fine on a pale field and does almost nothing on a

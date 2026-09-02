@@ -51,6 +51,13 @@
 //! [`lower`](Notifications::lower)s the condition; without that memory the
 //! message reappears on the very next frame and the click reads as broken.
 //!
+//! **But only the USER's click means that.** The other way a standing message
+//! can leave is the cap taking its slot for a newer arrival, and for a while
+//! the queue could not tell the two apart: a dead input device evicted by four
+//! receipts was silenced for the rest of the session, which is the one thing a
+//! fault message must never be. A dismissal is remembered; an eviction is not,
+//! and the condition puts itself back the moment there is room.
+//!
 //! **And that is the answer to "a message with no natural expiry".** A raised
 //! message is STANDING: it has no clock at all and leaves only when it is
 //! dismissed, when its condition is lowered, or when the cap needs its slot.
@@ -140,6 +147,21 @@ pub const MIN_WIDTH: f32 = 160.0;
 /// The narrowest window that gets a column.
 pub const MIN_WINDOW_W: f32 = MIN_WIDTH + MARGIN * 2.0;
 
+/// A point the top box in `area` is certain to cover.
+///
+/// **The caller has to know what the column will land ON**, because the card
+/// is derived from that face and there is no one answer — the record band in
+/// the ordinary view, the desk's strip or the arrangement's lane field in a
+/// DAW view, the keyboard's own ground where a letterboxed window shows it.
+/// Working that out means hit-testing the app's own bands against a point,
+/// and the point has to be the one this module actually paints over or the
+/// card is dressed for a surface it is not on. So it is answered here, from
+/// the same [`MARGIN`] `plan` lays out with, rather than being a `10.0`
+/// written down twice.
+pub fn probe(area: Rect) -> Pos2 {
+    area.min + Vec2::splat(MARGIN + 1.0)
+}
+
 const TEXT_PT: f32 = 11.0;
 
 /// The most rows a box will grow to.
@@ -200,11 +222,22 @@ impl Kind {
 /// kind because a message's life is no longer only its kind's: the cap can
 /// shorten one, and [`Notifications::lower`] gives a standing message a tail
 /// it never had.
+///
+/// **The tail's start is written as an ADDITION, and that is not a
+/// stylistic choice.** [`Note::retire`] sets a life of `age + FADE_S`, and
+/// asking `age <= life - FADE_S` back afterwards runs the subtraction on the
+/// other side of the rounding: `(age + FADE_S) - FADE_S` comes out a hair
+/// ABOVE `age` at most ages, so a message the cap had just retired reported
+/// itself WHOLE for one more frame and five of them stood where the rule says
+/// four. Written this way the comparison recomputes the very same expression
+/// `retire` stored, with the same operands in the same order, so IEEE
+/// arithmetic makes the two exactly equal and the boundary lands where it was
+/// put. [`Note::leaving`] carries the mirror of this and must keep it.
 pub fn fade_within(age: f64, life: f64) -> f32 {
     if age >= life {
         return 0.0;
     }
-    if age <= life - FADE_S {
+    if age + FADE_S <= life {
         return 1.0;
     }
     (((life - age) / FADE_S) as f32).clamp(0.0, 1.0)
@@ -310,9 +343,13 @@ impl Note {
     /// EXACTLY when it retires a message early: at `>` a retired message tested
     /// as whole, so a burst of five stacked five and the cap did nothing.
     ///
+    /// And written as `age + FADE_S >= life` rather than `age >= life -
+    /// FADE_S`, which is the same inequality on paper and a different one in
+    /// floats — see [`fade_within`], which carries the argument.
+    ///
     /// [`cap`]: Notifications::cap
     pub fn leaving(&self) -> bool {
-        self.life.is_some_and(|life| self.age >= life - FADE_S)
+        self.life.is_some_and(|life| self.age + FADE_S >= life)
     }
 
     pub fn expired(&self) -> bool {
@@ -343,7 +380,31 @@ impl Note {
     /// caller that wants the message to STAND while its condition holds says
     /// so with [`Notifications::raise`], which is the honest way to ask.
     fn refresh(&mut self) {
-        if self.life.is_none() || self.stood >= self.kind.life() {
+        if self.stood >= self.kind.life() {
+            return;
+        }
+        self.renew();
+    }
+
+    /// The clock back to the start with NO bound, for a caller that holds the
+    /// handle.
+    ///
+    /// **Owning the handle is the difference.** [`Self::refresh`] is bounded
+    /// because its caller found this message by its TEXT and may have no idea
+    /// it is already up — that is a duplicate arriving, and a duplicate must
+    /// not be able to keep a message alive forever. An
+    /// [`update`](Notifications::update) is the message's own author saying
+    /// something new about a job still running, and a progress report for a
+    /// scan that takes a minute would otherwise die forty seconds in with the
+    /// scan still going. It cannot become the unkillable message either: a
+    /// dismissal takes the note out of the queue entirely, and there is no
+    /// lookup by id that can bring one back, so the very next update answers
+    /// `false` and the caller has been told to stop.
+    ///
+    /// A standing message has no clock, so this is not something that can be
+    /// done to it.
+    fn renew(&mut self) {
+        if self.life.is_none() {
             return;
         }
         self.age = 0.0;
@@ -378,13 +439,27 @@ pub struct Notifications {
     /// The conditions currently RAISED, whether or not their message is still
     /// on screen.
     ///
-    /// **This is the memory that makes a dismissal stick.** It outlives the
-    /// note, so a caller re-checking its condition sixty times a second cannot
-    /// put back what the user just clicked away; only [`Self::lower`] — the
-    /// condition genuinely ending — forgets a key. These are code-authored
-    /// condition names, one per condition currently true, so the set is small
-    /// and static in a way user text never would be.
+    /// It outlives the note, because a condition is true whether or not
+    /// anything is being said about it. These are code-authored condition
+    /// names, one per condition currently true, so the set is small and static
+    /// in a way user text never would be. Only [`Self::lower`] — the condition
+    /// genuinely ending — forgets a key.
     raised: BTreeSet<String>,
+    /// The conditions whose message the USER took down.
+    ///
+    /// **This is the memory that makes a dismissal stick, and it is a separate
+    /// set for a reason that cost a real fault.** A standing message can leave
+    /// the queue two ways: the user clicks it, or [`Self::cap`] retires it to
+    /// keep the column to four. One of those is a decision and the other is
+    /// housekeeping, and while `raised` alone carried both, a dead input
+    /// device evicted by a burst of receipts went silent FOREVER — every later
+    /// `raise` found the key standing, found no note to update, and answered
+    /// `None` for the rest of the session. So only what the user chose lands
+    /// here, and only that suppresses a re-raise; an eviction leaves the
+    /// condition able to say itself again the moment there is room to. Cleared
+    /// with the condition, so a fault that comes back after genuinely clearing
+    /// is news again.
+    muted: BTreeSet<String>,
 }
 
 impl Notifications {
@@ -409,6 +484,20 @@ impl Notifications {
     /// whose "event" is really a CONDITION being re-checked belongs on
     /// [`Self::raise`], and this door will not pretend otherwise by keeping
     /// its message up forever.
+    ///
+    /// **What that bound does NOT buy, said plainly.** The bound holds one
+    /// NOTE to twice its life; it cannot hold a CALLER to anything. A caller
+    /// that pushes the same error every frame gets a note, watches it expire
+    /// at twice its life, and then mints a fresh one on the very next frame —
+    /// so a minute of per-frame `error(...)` is six successive messages, each
+    /// dismissable and none of them lasting, rather than one message that
+    /// cannot be got rid of. That is deliberate: the alternative is a memory
+    /// of every text ever pushed, keyed by words the user's own filenames and
+    /// device names end up in, and it would silence a receipt somebody really
+    /// did earn twice. **A caller that re-checks a condition every frame must
+    /// use [`Self::raise`]**, which says the thing once, lets a dismissal
+    /// stick, and takes itself down when the condition clears. This door is
+    /// for things that HAPPENED.
     pub fn push(&mut self, kind: Kind, text: impl Into<String>) -> NoteId {
         let text = text.into();
         let id = if let Some(n) = self
@@ -456,10 +545,16 @@ impl Notifications {
     /// which is how a PROGRESSIVE message ("Scanning plugins... 40 of 112")
     /// lives here too.
     ///
-    /// **`None` means the user has already dealt with it**: the condition is
-    /// standing but its message has been taken down, and it stays down until
-    /// the condition genuinely clears. A caller must not treat that as a
-    /// failure and try again.
+    /// **`None` means the condition is standing with nothing on screen for
+    /// it**, and the caller must not treat that as a failure and try again —
+    /// it is already saying so every frame, which is the shape this door is
+    /// built for. Two things produce it, and the difference is the whole point
+    /// of [`Self::muted`]: the user DISMISSED the message, in which case it
+    /// stays down until the condition genuinely clears; or the column is full
+    /// of whole messages and this one is waiting for a slot, in which case it
+    /// comes back by itself on the frame one frees. What cannot happen any
+    /// more is the third case, where a message the cap tidied away was never
+    /// seen again.
     pub fn raise(
         &mut self,
         key: impl Into<String>,
@@ -474,15 +569,36 @@ impl Notifications {
             // key still on it, so a condition that goes bad again straight
             // away has two notes wearing that key for half a second and the
             // live one is the later.
-            let n = self
+            if let Some(n) = self
                 .items
                 .iter_mut()
                 .rev()
-                .find(|n| n.key.as_deref() == Some(key.as_str()))?;
-            if n.text != text {
-                n.text = text;
+                .find(|n| n.key.as_deref() == Some(key.as_str()))
+            {
+                if n.text != text {
+                    n.text = text;
+                }
+                return Some(n.id);
             }
-            return Some(n.id);
+            // Standing, and nothing on screen saying so. The user's own
+            // dismissal is the one thing that keeps it that way.
+            if self.muted.contains(&key) {
+                return None;
+            }
+            // **Only into a free slot.** Re-minting regardless would put the
+            // new message at the top, where the cap would immediately retire
+            // whichever standing message is now oldest — and five conditions
+            // would rotate through four slots twice a second, forever. Waiting
+            // for a slot means the fifth fault appears the moment one of the
+            // four is lowered or clicked away, which is what "the cap needs
+            // its slot" was always supposed to mean.
+            if !self.has_room() {
+                return None;
+            }
+            let id = self.mint();
+            self.items.push(Note::standing(id, kind, text, key));
+            self.cap();
+            return Some(id);
         }
         let id = self.mint();
         self.items
@@ -492,6 +608,13 @@ impl Notifications {
         Some(id)
     }
 
+    /// Whether a message could stand WHOLE right now without putting the
+    /// column over [`VISIBLE`]. What [`Self::cap`] is about to enforce, asked
+    /// before rather than after.
+    fn has_room(&self) -> bool {
+        self.items.iter().filter(|n| !n.leaving()).count() < VISIBLE
+    }
+
     /// The condition has cleared: take its message down.
     ///
     /// It LEAVES rather than blinking out — the same tail everything else gets
@@ -499,6 +622,9 @@ impl Notifications {
     /// message is raised again as new. Answers whether the condition was
     /// actually standing.
     pub fn lower(&mut self, key: &str) -> bool {
+        // The dismissal goes with the condition, always — the user said they
+        // were finished with THIS episode of it, not with the next one.
+        self.muted.remove(key);
         if !self.raised.remove(key) {
             return false;
         }
@@ -516,17 +642,34 @@ impl Notifications {
         self.raised.contains(key)
     }
 
+    /// Whether the USER took this condition's message down, which is the one
+    /// thing that keeps [`Self::raise`] quiet while the condition holds.
+    pub fn is_muted(&self, key: &str) -> bool {
+        self.muted.contains(key)
+    }
+
     /// Change a message's words in PLACE.
     ///
     /// **A progress report is one message, not forty.** "Scanning plugins... 40
     /// of 112" pushed once a file would stack copies until the cap ate the
     /// column and then flicker between the survivors; the same message saying
     /// something new is what actually happened, so that is what this does.
-    /// Answers whether the message was still up — `false` is the caller's cue
-    /// that the user dismissed it and does not want the rest.
     ///
-    /// A terminal message treats new words as news and refreshes its clock (as
-    /// far as [`Note::refresh`] allows); a standing one has no clock to touch.
+    /// **`false` means one thing and one thing only: the user took it down.**
+    /// It used to be able to mean "refused" as well — the clock was put back
+    /// through [`Note::refresh`], whose bound is about DUPLICATES, so a scan
+    /// that ran longer than one lifetime had its report expire underneath it
+    /// at eight seconds and every later update was reporting into a message
+    /// nobody could see. A caller holding a handle is the message's author,
+    /// not a duplicate arriving, so the clock goes back every call — see
+    /// [`Note::renew`] for why that is not the unkillable message. A scan of
+    /// any length is now one line that counts, and the frame it stops being
+    /// one is the frame the user clicked it away.
+    ///
+    /// The clock goes back even when the words have not changed, because a
+    /// scan stuck on one slow plugin for six seconds is still running and its
+    /// report should still be on screen. A standing message has no clock to
+    /// touch and only takes the new words.
     pub fn update(&mut self, id: NoteId, text: impl Into<String>) -> bool {
         let text = text.into();
         let Some(n) = self.items.iter_mut().find(|n| n.id == id) else {
@@ -534,8 +677,8 @@ impl Notifications {
         };
         if n.text != text {
             n.text = text;
-            n.refresh();
         }
+        n.renew();
         // A refresh can make a message whole that the cap had already retired,
         // which is the same hole the duplicate push had: every door that can
         // put a message back on its feet counts the column again.
@@ -589,12 +732,17 @@ impl Notifications {
     /// is that frame. Looking it up afterwards finds nothing, which is what
     /// "taken down" means.
     ///
-    /// A message raised against a condition stays dismissed: its key is still
-    /// raised, so re-raising will not put it back. Only [`Self::lower`]
-    /// forgets a condition.
+    /// A message raised against a condition stays dismissed: the key is
+    /// MUTED here, and re-raising will not put it back until the condition
+    /// clears. Only [`Self::lower`] forgets a mute — see [`Self::muted`] for
+    /// why that memory is not the same one as `raised`.
     pub fn dismiss(&mut self, id: NoteId) -> Option<Note> {
         let i = self.items.iter().position(|n| n.id == id)?;
-        Some(self.items.remove(i))
+        let note = self.items.remove(i);
+        if let Some(key) = note.key.as_deref() {
+            self.muted.insert(key.to_owned());
+        }
+        Some(note)
     }
 
     /// Start over: every message down and every condition forgotten.
@@ -605,6 +753,7 @@ impl Notifications {
     pub fn clear(&mut self) {
         self.items.clear();
         self.raised.clear();
+        self.muted.clear();
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1597,6 +1746,246 @@ mod tests {
         assert!(n
             .raise("midi-in", Kind::Error, "No MIDI input ports found")
             .is_some());
+    }
+
+    /// **A dismissal silences a condition; the CAP must not.**
+    ///
+    /// The two used to be the same act. `raise` remembered a key and refused
+    /// to mint a second message for it, which is exactly right for a message
+    /// the user clicked away — and catastrophic for one the cap tidied away to
+    /// make room for four receipts: a dead input device went quiet for the
+    /// rest of the session, and every later `raise` answered `None` with
+    /// nothing on screen to say why. So the eviction leaves the condition able
+    /// to speak, and only the user's own click does not.
+    #[test]
+    fn the_cap_may_take_a_conditions_slot_but_never_its_voice() {
+        let mut n = Notifications::new();
+        let mut t = 0.0_f64;
+        n.tick(t);
+        let dev = n
+            .raise("dev", Kind::Error, "The input device disappeared")
+            .expect("the fault said nothing at all");
+        // Four receipts land on top of it. None of them is a fault; all of
+        // them are newer; the cap gives them the column.
+        for i in 0..VISIBLE {
+            n.info(format!("Exported take {i}"));
+        }
+        assert!(
+            n.get(dev).is_some_and(Note::leaving),
+            "the cap did not take the standing message's slot"
+        );
+        advance(&mut n, &mut t, 1.0);
+        assert!(n.get(dev).is_none(), "the evicted message never finished leaving");
+        assert!(n.is_raised("dev"), "the condition forgot itself");
+        assert!(!n.is_muted("dev"), "an eviction was recorded as the user's choice");
+        // While the column is still full it waits rather than rotating: five
+        // standing messages through four slots twice a second is a strobe, not
+        // a report.
+        assert_eq!(
+            n.raise("dev", Kind::Error, "The input device disappeared"),
+            None,
+            "the fault shouldered a receipt out of a full column"
+        );
+        assert_eq!(n.len(), VISIBLE, "the column grew past the cap");
+        // The receipts age out, and the fault — still true, still said every
+        // frame — is back.
+        advance(&mut n, &mut t, 5.0);
+        let again = n
+            .raise("dev", Kind::Error, "The input device disappeared")
+            .expect("a fault the cap tidied away was silenced forever");
+        assert_ne!(again, dev, "the evicted note came back from the dead");
+        assert_eq!(n.len(), 1);
+        // The user's own click is the other thing entirely, and it still
+        // sticks for as long as the condition holds.
+        assert!(n.dismiss(again).is_some());
+        assert!(n.is_muted("dev"), "a dismissal was not remembered");
+        for _ in 0..600 {
+            t += 1.0 / 60.0;
+            n.tick(t);
+            assert_eq!(
+                n.raise("dev", Kind::Error, "The input device disappeared"),
+                None,
+                "a dismissed condition came straight back"
+            );
+        }
+        // ...and only until it clears. Then the next failure is news.
+        assert!(n.lower("dev"));
+        assert!(!n.is_muted("dev"), "the mute outlived its condition");
+        assert!(n
+            .raise("dev", Kind::Error, "The input device disappeared")
+            .is_some());
+    }
+
+    /// **The cap's boundary survives a float round trip.**
+    ///
+    /// `retire` sets a life of `age + FADE_S` and `leaving` asks the question
+    /// back. Asked as `age >= life - FADE_S` the subtraction does not return
+    /// where it started — `(age + FADE_S) - FADE_S` lands a hair ABOVE `age`
+    /// at about one age in twenty — so the message the cap had just retired
+    /// reported itself WHOLE for one more frame and five stood where the rule
+    /// says four. It only ever held at age zero, which is exactly where the
+    /// cap's own test had always driven it.
+    #[test]
+    fn a_message_retired_mid_life_is_leaving_on_that_very_frame() {
+        // The cap's real customer: a STANDING message, which has no clock of
+        // its own, so `retire` sets the life outright and the round trip is
+        // the whole of the arithmetic.
+        for step in 0..20_000 {
+            let age = f64::from(step) * 0.0007;
+            let mut n = Note::standing(NoteId(0), Kind::Error, "x".to_owned(), "k".to_owned());
+            n.age = age;
+            n.stood = age;
+            assert!(!n.leaving(), "a standing message was leaving at {age}");
+            n.retire();
+            assert!(n.leaving(), "retired at {age} and still reads whole");
+            assert!(!n.expired(), "retiring at {age} killed it outright");
+            assert_eq!(n.fade(), 1.0, "retired at {age} and jumped mid-fade");
+        }
+        // And a message that HAS a clock, retired before its own tail begins —
+        // where `retire` shortens the life it was already carrying.
+        for step in 0..5_000 {
+            let age = f64::from(step) * 0.0007;
+            if age >= LIFE_S - FADE_S {
+                break;
+            }
+            let mut n = Note::brief(NoteId(0), Kind::Info, "x".to_owned());
+            n.age = age;
+            n.stood = age;
+            n.retire();
+            assert!(n.leaving(), "a brief message retired at {age} reads whole");
+            assert!(!n.expired(), "retiring at {age} killed it outright");
+            assert_eq!(n.fade(), 1.0, "retired at {age} and jumped mid-fade");
+        }
+        // And the same thing where it actually bites: a column capped after a
+        // few frames of ageing rather than on the frame it was filled.
+        let mut n = Notifications::new();
+        let mut t = 0.0_f64;
+        n.tick(t);
+        for i in 0..VISIBLE {
+            n.info(format!("m{i}"));
+        }
+        // Four frames at sixty a second — an age the old subtraction lied
+        // about.
+        advance(&mut n, &mut t, 4.0 / 60.0);
+        n.info("the fifth");
+        assert_eq!(
+            n.notes().iter().filter(|x| !x.leaving()).count(),
+            VISIBLE,
+            "five whole messages stood where the cap allows four"
+        );
+    }
+
+    /// **The `push` door is honest about what its bound does and does not
+    /// buy.**
+    ///
+    /// One NOTE is held to twice its life. The CALLER is not held to anything,
+    /// and cannot be: this door finds its message by the words, and a memory
+    /// of every text ever pushed would be keyed on the user's own filenames
+    /// and would silence a receipt somebody really did earn twice. So a fault
+    /// pushed every frame for a minute is a succession of messages, each one
+    /// dismissable and none of them permanent — never a column, and never one
+    /// box that cannot be got rid of. A caller who wants the message to STAND
+    /// says so with `raise`, and this asserts the difference rather than
+    /// describing it.
+    #[test]
+    fn a_per_frame_push_is_successive_messages_rather_than_one_unkillable_one() {
+        let mut n = Notifications::new();
+        let mut t = 0.0_f64;
+        n.tick(t);
+        let mut minted = 0usize;
+        let mut current: Option<NoteId> = None;
+        for _ in 0..3_600 {
+            t += 1.0 / 60.0;
+            n.tick(t);
+            let id = n.error("The input device disappeared");
+            if current != Some(id) {
+                minted += 1;
+                current = Some(id);
+            }
+            assert_eq!(n.len(), 1, "a per-frame push stacked a column");
+        }
+        // Sixty seconds at twice an error's five is six, and the number is
+        // asserted rather than bounded loosely because it IS the behaviour the
+        // doc promises.
+        assert_eq!(
+            minted, 6,
+            "sixty seconds of pushing the same fault minted {minted} messages"
+        );
+        // And whichever one is up right now goes when it is clicked.
+        let id = n.error("The input device disappeared");
+        assert!(n.dismiss(id).is_some());
+        assert!(n.is_empty(), "a pushed message survived being dismissed");
+        // The honest door for the same caller: one message, for as long as it
+        // is true.
+        let mut n = Notifications::new();
+        let mut t = 0.0_f64;
+        n.tick(t);
+        let first = n
+            .raise("dev", Kind::Error, "The input device disappeared")
+            .unwrap();
+        for _ in 0..3_600 {
+            t += 1.0 / 60.0;
+            n.tick(t);
+            assert_eq!(
+                n.raise("dev", Kind::Error, "The input device disappeared"),
+                Some(first),
+                "the condition was re-minted"
+            );
+        }
+        assert_eq!(n.len(), 1);
+    }
+
+    /// **A progress report outlives the scan it is reporting on.**
+    ///
+    /// `update` used to put the clock back through the DUPLICATE bound, which
+    /// is a rule about the same words arriving twice and has nothing to say
+    /// about a job still running: a plugin scan that took thirty seconds had
+    /// its report expire underneath it at eight, and every count after that
+    /// went into a message nobody could see while `update` still answered
+    /// `true`. A caller holding the handle is the message's author, so the
+    /// clock goes back every call — and `false` now means the one thing it
+    /// should: the user took it down.
+    #[test]
+    fn a_progress_report_outlives_the_scan_it_is_reporting() {
+        let mut n = Notifications::new();
+        let mut t = 0.0_f64;
+        n.tick(t);
+        let id = n.info("Scanning plugins... 0 of 112");
+        for i in 1..=112 {
+            advance(&mut n, &mut t, 30.0 / 112.0);
+            assert!(
+                n.update(id, format!("Scanning plugins... {i} of 112")),
+                "the report died at {i} of 112, {t:.1}s in"
+            );
+            assert_eq!(n.len(), 1, "the report stacked a copy at {i}");
+        }
+        assert!(t > LIFE_S * 6.0, "the scan was not long enough to prove it");
+        assert_eq!(
+            n.get(id).map(|x| x.text.as_str()),
+            Some("Scanning plugins... 112 of 112")
+        );
+        // A stall on one slow plugin is still a scan that is running: the
+        // words stop changing and the report stays up.
+        for _ in 0..3 {
+            advance(&mut n, &mut t, 2.0);
+            assert!(
+                n.update(id, "Scanning plugins... 112 of 112"),
+                "a report whose words stopped moving expired"
+            );
+        }
+        assert_eq!(n.len(), 1);
+        // Let go of it and it goes, on the ordinary clock — this is not the
+        // message with no owner the module refuses to have.
+        advance(&mut n, &mut t, LIFE_S + 0.5);
+        assert!(n.is_empty(), "a report nobody is updating any more stayed up");
+        // `false`, and the only thing it means.
+        let id = n.info("Rendering... 0%");
+        assert!(n.update(id, "Rendering... 10%"));
+        assert!(n.dismiss(id).is_some());
+        assert!(
+            !n.update(id, "Rendering... 20%"),
+            "a dismissed report was still being written to"
+        );
     }
 
     /// **A standing message is not motion.** It sits there at full strength, so

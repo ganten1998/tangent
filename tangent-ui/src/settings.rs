@@ -1173,7 +1173,15 @@ pub struct Settings {
     pub strip_phase: u64,
     pub strip_soloed: u64,
     /// Whether the after-a-take report appears. A take with a PROBLEM ignores
-    /// this: see [`crate::dialogs::Dialog::TakeSummary`].
+    /// this: see `App::report_take`.
+    ///
+    /// **The tick that wrote this is gone with the box it was on.** The report
+    /// was a modal dialog with a "Don't show this again" checkbox in it; it is
+    /// a four-second notification in the corner now, and this setting is still
+    /// read and still obeyed — a user who switched the report off stays
+    /// switched off — but `DialogAction::SetShowTakeSummary` is the only door
+    /// left to it. Somewhere to put that switch is an open question for the
+    /// owner, not a reason to stop honouring the answer somebody already gave.
     pub show_take_summary: bool,
     /// The audio file the backing track plays, or empty for none.
     ///
