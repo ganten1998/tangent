@@ -436,10 +436,30 @@ fn report_partials(patch: Patch) {
 // handle consecutive strikes very well - they audible pop which gets
 // noticeable degraded by any pedal activation". A pop is a discontinuity, and
 // a discontinuity is a number: the largest one-sample step in the output.
-// This report measures that step at the moment of a restrike and compares it
-// with the steepest step a FRESH strike of the same note makes, which is the
-// one edge the ear has already agreed to hear. A restrike that is no sharper
-// than a fresh strike laid over what was ringing is not a pop.
+//
+// The first version of this report measured that step at the moment of a
+// restrike and held it to a LINEAR ceiling: the fresh strike's own edge plus
+// the bed's, a sum superposition can never exceed. That ceiling accused three
+// scenarios that do not pop, and it was wrong for a reason worth writing
+// down. It takes its fresh reference at the worst possible operating point.
+// A fresh strike lands in silence, where the reed's plate is flat and the wah
+// is parked shut; a restrike lands with the reed already deep in the gap and
+// the filter wide open, so the same hammer legitimately makes a steeper edge.
+// The tine's magnet, the reed's plate and the wah are DELIBERATELY nonlinear,
+// and a ceiling that assumes they are not will keep accusing them. Raising it
+// until the print went green was refused, rightly: a threshold relaxed until
+// the output changes proves nothing and blinds the bench to real faults of
+// the same size.
+//
+// So the verdict is the measurement the instruments' own tests already make
+// and pass. Render the performance twice, once WITH the event under test and
+// once without, subtract, and judge what the strike ADDED. That difference is
+// immune to the operating point, because a state-dependent gain scales the
+// whole addition — first difference and second by the SAME factor — while a
+// state cut and re-seeded is a step, and a step is broadband, so it lands in
+// the second difference many times harder than in the first. See `Shape`.
+// Everything the old ceiling printed still prints, because the owner reads
+// those numbers and they are worth reading; they simply no longer decide.
 
 /// The two instruments behind one set of calls, so every scenario below is
 /// written once and played on both.
@@ -646,14 +666,6 @@ struct Fresh {
 /// edge every restrike was then measured against.
 const FRESH_AT: f32 = 0.01;
 
-/// How far over the linear ceiling a restrike may sit before it is called
-/// a pop. The tine's magnet and the reed's plate are not linear: a hammer
-/// landing on metal already displaced toward the pickup makes a slightly
-/// steeper edge than the same hammer from rest, by the pickup's local gain
-/// — measured at 1.4 dB on the reed — and that is the instrument, not a
-/// fault. A cut loop is tens of decibels over.
-const EDGE_TOL_DB: f32 = 3.0;
-
 fn fresh(make: &dyn Fn() -> Box<dyn Rig>, pitch: u8, vel: u8, secs: f32) -> (Fresh, Vec<f32>) {
     let mut rig = make();
     let x = run(
@@ -671,10 +683,14 @@ fn fresh(make: &dyn Fn() -> Box<dyn Rig>, pitch: u8, vel: u8, secs: f32) -> (Fre
 
 /// One restrike, measured. `onset` is where the event landed. The window
 /// runs from 2 ms before it — where a leaked step would already have to be
-/// absent — to 20 ms after, where the waveguide's delayed edge appears. The
-/// ceiling is the fresh strike's own edge PLUS the bed's edge in the 20 ms
-/// before: superposition can never exceed that sum, so a value over it is
-/// energy the strike did not put in.
+/// absent — to 20 ms after, where the waveguide's delayed edge appears.
+///
+/// `over` is the old linear ceiling: this edge against the fresh strike's own
+/// edge PLUS the bed's edge in the 20 ms before. For a linear mechanism that
+/// sum cannot be exceeded, so anything above it would be energy the strike
+/// did not put in — but the pickups are not linear and the sum is not their
+/// ceiling, so it is printed and not judged. `dip` still judges, because it
+/// asks a question no edge test can answer.
 struct Edge {
     d1: f32,
     d2: f32,
@@ -718,17 +734,13 @@ fn edge(x: &[f32], onset: usize, f: &Fresh) -> Edge {
 }
 
 impl Edge {
-    fn ok(&self) -> bool {
-        self.over_d1 <= EDGE_TOL_DB
-            && self.over_d2 <= EDGE_TOL_DB
-            && self.dip_db.is_none_or(|d| d >= DIP_FLOOR_DB)
-    }
-
-    /// The edges alone, for the scenarios where a dip is the physics: a
-    /// rapid repeat lands at whatever phase the note is in, and a landing
-    /// against the motion is quieter, not broken.
-    fn edges_ok(&self) -> bool {
-        self.over_d1 <= EDGE_TOL_DB && self.over_d2 <= EDGE_TOL_DB
+    /// **Did the note go away?** The half of the verdict no edge test can
+    /// make: `over` and the shape test both answer "did something step", and
+    /// a voice cut to silence and re-attacked can leave a hole without
+    /// stepping at all. This is the check that caught the biggest real fault
+    /// of the previous pass, and it is deliberately unchanged.
+    fn dip_ok(&self) -> bool {
+        self.dip_db.is_none_or(|d| d >= DIP_FLOOR_DB)
     }
 
     fn dip(&self) -> String {
@@ -738,6 +750,146 @@ impl Edge {
         }
     }
 }
+
+/// The first and second difference of `got - bed` in one strike's window:
+/// 2 ms before the onset, where a leaked step would already have to be
+/// absent, to 20 ms after, where a waveguide's delayed edge appears.
+fn diff_edge(got: &[f32], bed: &[f32], onset: usize) -> (f32, f32) {
+    let d: Vec<f32> = got.iter().zip(bed).map(|(a, b)| a - b).collect();
+    let (a, b) = (onset.saturating_sub(ms(2.0)), onset + ms(20.0));
+    (d1(&d, a, b), d2(&d, a, b))
+}
+
+/// **What one event ADDED to a take, by rendering it again without that
+/// event.** The bed is the same performance on a fresh instrument minus the
+/// one thing under test, so the difference is exactly what that event
+/// contributed through whatever the mechanism and the amp pass were doing at
+/// the time — a magnet leaned on, a plate the reed is deep inside, a wah
+/// wide open. `got` is the take the rest of the row describes, passed in
+/// rather than rendered again, so the diagnostics and the verdict are two
+/// readings of ONE render and can never disagree about which one they mean.
+///
+/// This is the module's own `added` helper (`tangent/src/keys/mod.rs`, and
+/// the DX7 file keeps its own copy) brought over so the bench and the tests
+/// ask a single question instead of two.
+fn added(
+    make: &dyn Fn() -> Box<dyn Rig>,
+    base: &[(usize, Ev)],
+    got: &[f32],
+    onset: usize,
+) -> (f32, f32) {
+    let bed = run(make().as_mut(), base, got.len());
+    diff_edge(got, &bed, onset)
+}
+
+/// **A hammer is not a step, and the difference is the SHAPE.**
+///
+/// What a landing strike added, as a multiple of what the same strike adds
+/// from silence: `r1` for the first difference, `r2` for the second. Each of
+/// the nonlinear pickups is a gain the strike arrives through, and a gain
+/// multiplies both differences by the SAME number — so however far `r1` and
+/// `r2` travel, and they travel a long way, the RATIO between them stays put.
+/// A state cut and re-seeded does not behave that way: a step is broadband,
+/// so it lands in `r2` many times harder than in `r1`.
+///
+/// The property to hold a landing strike to is therefore not "no louder than
+/// a fresh one", which no nonlinear pickup can promise, but "the same shape
+/// as a fresh one", which every honest superposition can keep whatever gain
+/// it is read through.
+struct Shape {
+    r1: f32,
+    r2: f32,
+}
+
+/// How far `ratio` may drift from one before a landing strike is called a
+/// step rather than a hammer.
+///
+/// **Measured over all thirty-three scenarios, not chosen to make a print
+/// go green.** With every instrument behaving, the ratio spans 0.42 to 1.67.
+/// The three highest — 1.67 on the wah'd clav, 1.62 on the DX7 electric
+/// piano, 1.56 on the pad — are all the RAPID scenario, and all three are
+/// the same effect: the landing strike also moves a state the BED is read
+/// through (the wah's filter, the DX7's LFO and feedback), so the difference
+/// of two takes carries a modulation of the old note as well as the new one.
+/// That is not a discontinuity and it is repeatable; the wah's seven
+/// landings read 1.29 to 1.67 every run. Two and a half leaves half again as
+/// much room above the worst of them, which the wah needs: a knob that opens
+/// the filter further moves this number.
+///
+/// **What it costs, stated plainly.** For any signal the second difference
+/// is at most twice the first, so `ratio` can never exceed twice a fresh
+/// strike's own `d1/d2`. On the tine and the reed a fresh strike's onset IS
+/// a one-sample step — their `fresh` row prints d1 and d2 equal — so their
+/// ceiling is exactly 2.0 and NO tolerance at or above it can ever fire
+/// there. That is not this number's fault and lowering it would not help:
+/// with the historical re-seed put back, those instruments read 1.00, dead
+/// centre, because a step measured against a step has the same shape. The
+/// dip is what catches them, and it does, at 6.8 to 8.0 dB down. Where the
+/// fresh attack is bandlimited the check has real teeth: the piano's
+/// waveguide runs 7.5 to 1 between its own differences, and the same re-seed
+/// fault reads 4.5, 6.9 and 7.9 there.
+const SHAPE_TOL: f32 = 2.5;
+
+/// Below this, the strike put nothing into the window worth reading and the
+/// ratio is two noises divided — the same reason `dip_db` is `None` under a
+/// silent bed. The pad's first five rapid landings are here: sixty
+/// milliseconds into a slow attack a repeat has added less than half a
+/// percent of a fresh strike's edge, and there is no shape in that. The
+/// smallest honest reading anywhere is 0.43, so the floor sits in open
+/// space. A strike that adds nothing AND leaves a hole is still a fault:
+/// the dip sees it, and the dip is judged separately.
+const SHAPE_FLOOR: f32 = 0.01;
+
+impl Shape {
+    fn of((a1, a2): (f32, f32), f: &Fresh) -> Self {
+        Shape {
+            r1: a1 / f.d1.max(1e-12),
+            r2: a2 / f.d2.max(1e-12),
+        }
+    }
+
+    /// One for a strike that arrives through any gain whatsoever, however
+    /// large or small that gain is; far above one for a step.
+    fn ratio(&self) -> f32 {
+        self.r2 / self.r1.max(1e-12)
+    }
+
+    /// Whether there is a shape here at all: see `SHAPE_FLOOR`.
+    fn readable(&self) -> bool {
+        self.r1 >= SHAPE_FLOOR
+    }
+
+    fn ok(&self) -> bool {
+        !self.readable() || self.ratio() <= SHAPE_TOL
+    }
+}
+
+/// The second line of every scenario: what the strike added, and the verdict.
+/// The columns line up under the diagnostics above them on purpose — `added`
+/// d1 beside measured d1 is the comparison the reader is making anyway.
+fn print_added(s: &Shape, ok: bool) {
+    println!(
+        "      added    d1 {:7.2}x  d2 {:7.2}x  shape {:6.2}  {}",
+        s.r1,
+        s.r2,
+        s.ratio(),
+        verdict(ok)
+    );
+}
+
+/// How far above one fresh strike's peak eight of them at sixty milliseconds
+/// may stack.
+///
+/// **Derived, and taken from the module's own contract rather than invented
+/// here.** The strike's energy cap holds a re-struck mode to a quarter over
+/// one strike's own throw — 1.9 dB of DISPLACEMENT — and the pickups are
+/// expansive, so at the output that reads as more than it does on the metal.
+/// The worst measured is the reed piano at 3.2 dB, which is the plate's curve
+/// doing exactly what the growl is, and `STACK_MARGIN` in `keys/mod.rs` is
+/// the round number above it. This figure was 3.0: BELOW the instrument's own
+/// documented worst case, which made it a second false alarm of precisely the
+/// kind this pass came to remove, firing on the same reed piano.
+const STACK_MARGIN_DB: f32 = 4.0;
 
 fn verdict(ok: bool) -> &'static str {
     if ok {
@@ -749,14 +901,25 @@ fn verdict(ok: bool) -> &'static str {
 
 /// **The consecutive-strike report.** For every patch and the DX7: a note
 /// restruck under the pedal, a voice stolen out of a full pool, and eight
-/// strikes at 60 ms. Prints the edge of each against the fresh ceiling and
-/// says which ones pop. Returns how many did, so a script can fail on it.
+/// strikes at 60 ms. Each scenario is rendered twice — with the event under
+/// test and without — so the verdict is the SHAPE of what the strike added
+/// and not the height of an edge read at an operating point the fresh
+/// reference never visits. Returns how many popped, so a script can fail
+/// on it.
+///
+/// Two lines per scenario. The first is diagnostic: the edge as measured,
+/// how it sits against the old linear ceiling, and the dip. The second is
+/// the verdict: what the strike added, as a multiple of a fresh strike's
+/// own first and second differences, and the ratio between those two
+/// multiples. A pop is `shape` far above one, or a dip through the floor.
 fn report_restrike() -> usize {
     const PITCH: u8 = 60;
     const VEL: u8 = 102;
     let mut pops = 0usize;
-    println!("consecutive strikes: edge at the restrike vs a fresh strike's own edge");
-    println!("  over = dB above (fresh + bed); positive is energy no hammer put in");
+    println!("consecutive strikes: the SHAPE of what each strike added, against a fresh strike");
+    println!("  shape = (added d2 / fresh d2) / (added d1 / fresh d1); one is a hammer through");
+    println!("  any gain, large is a step. over = the old LINEAR ceiling, printed but not judged;");
+    println!("  the pickups are nonlinear and it accuses them. dip still judges: a hole is real.");
     for (label, make) in rigs() {
         let (f, _) = fresh(make.as_ref(), PITCH, VEL, 1.0);
         println!("\n  {label}");
@@ -768,64 +931,73 @@ fn report_restrike() -> usize {
         );
 
         // Restrike: key up at 0.25 s under the pedal, down again at 0.5 s.
-        let mut rig = make();
         let onset = at(0.5);
-        let x = run(
-            rig.as_mut(),
-            &[
-                (0, Ev::Pedal(true)),
-                (0, Ev::On(PITCH, VEL)),
-                (at(0.25), Ev::Off(PITCH)),
-                (onset, Ev::On(PITCH, VEL)),
-            ],
-            (1.0 * RATE) as usize,
-        );
+        let frames = (1.0 * RATE) as usize;
+        let base = [
+            (0usize, Ev::Pedal(true)),
+            (0, Ev::On(PITCH, VEL)),
+            (at(0.25), Ev::Off(PITCH)),
+        ];
+        let mut ev = base.to_vec();
+        ev.push((onset, Ev::On(PITCH, VEL)));
+        let x = run(make().as_mut(), &ev, frames);
         let e = edge(&x, onset, &f);
-        pops += usize::from(!e.ok());
+        let s = Shape::of(added(make.as_ref(), &base, &x, onset), &f);
+        let ok = s.ok() && e.dip_ok();
+        pops += usize::from(!ok);
         println!(
-            "    restrike   d1 {:8.5}  d2 {:8.5}  over {:+5.1} {:+5.1} dB  dip {}  {}",
+            "    restrike   d1 {:8.5}  d2 {:8.5}  over {:+5.1} {:+5.1} dB  dip {}",
             e.d1,
             e.d2,
             e.over_d1,
             e.over_d2,
-            e.dip(),
-            verdict(e.ok())
+            e.dip()
         );
+        print_added(&s, ok);
 
         // Steal: fill the pool with held keys, release ONE under the pedal
         // (the stealing policy takes released voices first, so it is the
         // one that goes, and it is still at full level), then a pitch the
         // pool does not hold. On the DX7 the oldest keyed voice goes; the
         // first note struck is the oldest, and it is the same pitch.
+        //
+        // The bed here is the same crowded performance with the newcomer
+        // left out, so the difference carries BOTH halves of a steal: what
+        // the new note added, and what the corpse stopped contributing. A
+        // slot handed over cleanly reads as a hammer; a voice cut mid-cycle
+        // is a step, and it is the step this scenario exists to find.
         let is_dx7 = label.starts_with("DX7");
         let pool = if is_dx7 { dx7::synth::VOICES } else { keys::VOICES };
         let victim = 30u8;
-        let mut ev = vec![(0usize, Ev::Pedal(true))];
-        for i in 0..pool {
-            ev.push((0, Ev::On(24 + i as u8, VEL)));
-        }
-        ev.push((at(0.1), Ev::Off(victim)));
         let newcomer = 100u8;
+        let mut base = vec![(0usize, Ev::Pedal(true))];
+        for i in 0..pool {
+            base.push((0, Ev::On(24 + i as u8, VEL)));
+        }
+        base.push((at(0.1), Ev::Off(victim)));
+        let mut ev = base.clone();
         ev.push((onset, Ev::On(newcomer, VEL)));
         let (fn_, _) = fresh(make.as_ref(), newcomer, VEL, 0.6);
-        let mut rig = make();
-        let x = run(rig.as_mut(), &ev, (0.8 * RATE) as usize);
+        let x = run(make().as_mut(), &ev, (0.8 * RATE) as usize);
         let e = edge(&x, onset, &fn_);
-        pops += usize::from(!e.ok());
+        let s = Shape::of(added(make.as_ref(), &base, &x, onset), &fn_);
+        let ok = s.ok() && e.dip_ok();
+        pops += usize::from(!ok);
         println!(
-            "    steal      d1 {:8.5}  d2 {:8.5}  over {:+5.1} {:+5.1} dB  dip {}  {}",
+            "    steal      d1 {:8.5}  d2 {:8.5}  over {:+5.1} {:+5.1} dB  dip {}",
             e.d1,
             e.d2,
             e.over_d1,
             e.over_d2,
-            e.dip(),
-            verdict(e.ok())
+            e.dip()
         );
+        print_added(&s, ok);
 
         // Rapid repeat: eight strikes 60 ms apart, key up 30 ms after each,
-        // pedal down throughout. Every restrike is held to the ceiling, and
-        // the whole thing to the fresh peak plus 3 dB — superposition that
-        // stacks into clipping is the other way to be wrong.
+        // pedal down throughout. Every landing is judged on its shape, none
+        // may leave a hole, and the whole thing is held to the stacking
+        // margin — superposition that piles into clipping is the other way
+        // to be wrong, and no shape test can see it.
         let mut ev = vec![(0usize, Ev::Pedal(true))];
         let mut onsets = Vec::new();
         for k in 0..8 {
@@ -834,30 +1006,57 @@ fn report_restrike() -> usize {
             ev.push((t, Ev::On(PITCH, VEL)));
             ev.push((at(k as f32 * 0.060 + 0.030), Ev::Off(PITCH)));
         }
-        let mut rig = make();
-        let x = run(rig.as_mut(), &ev, (1.0 * RATE) as usize);
+        let x = run(make().as_mut(), &ev, (1.0 * RATE) as usize);
+
+        // Seven landings need seven beds, and each bed is the next take's
+        // performance one strike shorter — so render the eight prefixes once
+        // and difference them in consecutive pairs rather than rendering
+        // fourteen takes. The eighth prefix is `x` itself over this span.
+        let cut_frames = onsets[7] + ms(25.0);
+        let cuts: Vec<Vec<f32>> = (1..=8)
+            .map(|upto| {
+                let mut e = vec![(0usize, Ev::Pedal(true))];
+                for j in 0..upto {
+                    e.push((onsets[j], Ev::On(PITCH, VEL)));
+                    e.push((at(j as f32 * 0.060 + 0.030), Ev::Off(PITCH)));
+                }
+                run(make().as_mut(), &e, cut_frames)
+            })
+            .collect();
+
         let mut worst1 = f32::MIN;
         let mut worst2 = f32::MIN;
         let mut worst_dip = f32::MAX;
-        let mut edges_ok = true;
-        for &o in &onsets[1..] {
+        let mut dips_ok = true;
+        // `None` until a landing puts something readable into its window:
+        // the pad's early repeats add nothing measurable, and a ratio taken
+        // there would be noise over noise deciding the verdict.
+        let mut worst: Option<Shape> = None;
+        for (k, &o) in onsets.iter().enumerate().skip(1) {
             let e = edge(&x, o, &f);
             worst1 = worst1.max(e.over_d1);
             worst2 = worst2.max(e.over_d2);
             worst_dip = worst_dip.min(e.dip_db.unwrap_or(0.0));
-            edges_ok &= e.ok();
+            dips_ok &= e.dip_ok();
+            let s = Shape::of(diff_edge(&cuts[k], &cuts[k - 1], o), &f);
+            if s.readable() && worst.as_ref().is_none_or(|w| s.ratio() > w.ratio()) {
+                worst = Some(s);
+            }
         }
         let over_peak = analyze::db(peak_in(&x, 0, x.len()) / f.peak.max(1e-12));
-        let ok = edges_ok && over_peak <= 3.0;
+        let ok = worst.as_ref().is_none_or(Shape::ok) && dips_ok && over_peak <= STACK_MARGIN_DB;
         pops += usize::from(!ok);
         println!(
-            "    rapid x8   worst over {:+5.1} {:+5.1} dB  dip {:+6.1} dB  peak {:+5.1} dB vs fresh  {}",
-            worst1,
-            worst2,
-            worst_dip,
-            over_peak,
-            verdict(ok)
+            "    rapid x8   worst over {:+5.1} {:+5.1} dB  dip {:+6.1} dB  peak {:+5.1} dB vs fresh",
+            worst1, worst2, worst_dip, over_peak,
         );
+        match &worst {
+            Some(w) => print_added(w, ok),
+            None => println!(
+                "      added    nothing measurable in any of the seven windows      {}",
+                verdict(ok)
+            ),
+        }
     }
     println!("\n  {pops} scenario(s) pop");
     pops
@@ -1002,7 +1201,10 @@ fn probe_rapid(which: &str) {
     // ratio, because a step is broadband and a gain is not; a state-dependent
     // gain downstream — a pickup leaned on, a wah wide open — moves BOTH by
     // the same factor, which is how to tell the two apart.
-    println!("  strike  d1 diff/fresh   d2 diff/fresh   (equal ratios = a gain, not a step)");
+    // Through the same `Shape` the report's verdict is made of, so the
+    // number the probe shows a reader and the number the bench judged are
+    // the same number and cannot drift apart.
+    println!("  strike  d1 diff/fresh   d2 diff/fresh    shape  (equal ratios = a gain, not a step)");
     for k in 1..8 {
         let cut = |upto: usize| {
             let mut e = vec![(0usize, Ev::Pedal(true))];
@@ -1010,17 +1212,21 @@ fn probe_rapid(which: &str) {
                 e.push((onsets[j], Ev::On(PITCH, VEL)));
                 e.push((at(j as f32 * 0.060 + 0.030), Ev::Off(PITCH)));
             }
-            let mut r = make();
-            run(r.as_mut(), &e, onsets[k] + ms(25.0))
+            run(make().as_mut(), &e, onsets[k] + ms(25.0))
         };
         let bed = cut(k);
         let with = cut(k + 1);
-        let diff: Vec<f32> = with.iter().zip(&bed).map(|(a, b)| a - b).collect();
-        let (a, b) = (onsets[k] - ms(2.0), onsets[k] + ms(20.0));
+        let s = Shape::of(diff_edge(&with, &bed, onsets[k]), &f);
         println!(
-            "    #{k}    {:8.2}        {:8.2}",
-            d1(&diff, a, b) / f.d1,
-            d2(&diff, a, b) / f.d2,
+            "    #{k}    {:8.2}        {:8.2}     {:6.2}{}",
+            s.r1,
+            s.r2,
+            s.ratio(),
+            if s.readable() {
+                ""
+            } else {
+                "   (nothing measurable added; not judged)"
+            }
         );
     }
     // Where the worst second difference of the whole run actually sits, and
