@@ -5382,12 +5382,16 @@ impl TangentApp {
             self.clicked_position = None;
             self.sync_pins();
         }
-        if self.dialog.is_some() {
+        if self.dialog_blocks_pointer(ctx) {
             // **Dropped, but not silently.** A press here is somebody trying
             // to use a window that is waiting on a dialog they may not be able
             // to see — so it asks the dialog to come to the front rather than
-            // going nowhere at all. See `raise_dialog`.
-            if ctx.input(|i| i.pointer.any_pressed()) {
+            // going nowhere at all. See `raise_dialog`. A QUESTION only: a
+            // plugin window is not waited on, and raising it on every press
+            // would take the focus the person just put on the desk.
+            if self.dialog.as_ref().is_some_and(dialogs::Dialog::is_modal)
+                && ctx.input(|i| i.pointer.any_pressed())
+            {
                 self.raise_dialog = true;
             }
             return; // Qt dialogs are modal: main window ignores input.
@@ -6236,7 +6240,7 @@ impl TangentApp {
         // long as the key was down.
         let down = focused
             && !self.text_entry_active()
-            && self.dialog.is_none()
+            && !self.dialog_blocks_keys(ctx)
             && !self.recorder.state.is_active()
             // On the desk's surfaces Space belongs to the TRANSPORT; an
             // invisible piano auditioning under the mixer was the same
@@ -13442,15 +13446,16 @@ impl TangentApp {
         // same context, and only `handle_main_interaction` checked — the
         // pads under the dialog kept striking, and Esc meant for the
         // dialog closed the panel.
-        if self.menu_state.is_some() || self.menu_ate_press || self.dialog.is_some() {
+        if self.menu_state.is_some() || self.menu_ate_press || self.dialog_blocks_pointer(ctx) {
             return;
         }
         if !self.drumpad_open {
             return;
         }
         // Esc peels ONE layer: the typed field, then the pad menu, then
-        // the panel itself.
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        // the panel itself. Not while a dialog holds the keys — inline that
+        // Esc is the dialog's.
+        if !self.dialog_blocks_keys(ctx) && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             if self.pad_name_typing.take().is_some() {
                 return;
             }
@@ -14578,7 +14583,7 @@ impl TangentApp {
         if self.midi_edit.is_none() {
             return;
         }
-        if self.menu_state.is_some() || self.menu_ate_press || self.dialog.is_some() {
+        if self.menu_state.is_some() || self.menu_ate_press || self.dialog_blocks_pointer(ctx) {
             // The menu owns the pointer — and the press that dismissed it
             // is spent, exactly as on the arrangement. A dialog owns it
             // too: inline (plugin build) it draws in this same context,
@@ -14649,7 +14654,7 @@ impl TangentApp {
         }
 
         // ── the keys the editor owns while the hand is on it ─────────────
-        let keys_ok = self.dialog.is_none()
+        let keys_ok = !self.dialog_blocks_keys(ctx)
             && self.menu_state.is_none()
             && self.swing_menu.is_none()
             && !self.text_entry_active();
@@ -15703,7 +15708,7 @@ impl TangentApp {
             }
             return;
         }
-        if self.menu_state.is_some() || self.menu_ate_press || self.dialog.is_some() {
+        if self.menu_state.is_some() || self.menu_ate_press || self.dialog_blocks_pointer(ctx) {
             // The menu owns the pointer; a press elsewhere dismisses it in
             // `menu::show` without also locating the playhead underneath.
             // A dialog the same — inline in the plugin build it floats
@@ -17179,7 +17184,7 @@ impl TangentApp {
         // ── the keys the view owns ────────────────────────────────────────
         // S is handled beside the shortcut table, where it collides with the
         // supporter card; Delete has no other meaning here.
-        let keys_ok = self.dialog.is_none()
+        let keys_ok = !self.dialog_blocks_keys(ctx)
             && self.menu_state.is_none()
             && !self.text_entry_active();
         // **Escape clears the time selection**, and with it the loop. The
@@ -18640,6 +18645,44 @@ impl TangentApp {
         self.dialog.as_ref()
     }
 
+    /// Whether the open dialog owns the POINTER this frame, so the desk
+    /// under it must not read a press.
+    ///
+    /// **Every pointer-side modality decision goes through here**, and the
+    /// answer comes from `Dialog::is_modal`: a question freezes the desk as
+    /// it always has; a plugin window does not. On the desktop a plugin
+    /// window is a separate OS window with a pointer stream of its own, so
+    /// the desk sees nothing of what happens on it and there is nothing to
+    /// drop. Inline it is a layer over the desk, and the one thing to keep
+    /// from the desk is a press that landed ON it — egui shields its own
+    /// widgets, but the handlers that read `i.pointer` directly would see
+    /// straight through the layer to the mixer beneath.
+    fn dialog_blocks_pointer(&self, ctx: &egui::Context) -> bool {
+        match &self.dialog {
+            None => false,
+            Some(d) if d.is_modal() => true,
+            Some(_) => dialogs::pointer_over_dialog(ctx),
+        }
+    }
+
+    /// Whether the open dialog owns the KEYBOARD this frame.
+    ///
+    /// The keyboard half of `dialog_blocks_pointer`, and the two differ
+    /// where the pointer has a position and a key has none. Inline the
+    /// layer on top is the keys' one owner, exactly as before: Esc closes
+    /// it and T cycles the theme from its bar. On the desktop each window
+    /// hears only its own keys, so the main window's shortcuts work
+    /// whenever the main window is the one focused — and are held while it
+    /// is not, which is also what the OS delivers, made explicit so the
+    /// theme key can never cycle twice.
+    fn dialog_blocks_keys(&self, ctx: &egui::Context) -> bool {
+        match &self.dialog {
+            None => false,
+            Some(d) if d.is_modal() => true,
+            Some(_) => dialogs::dialog_drawn_inline(ctx) || !ctx.input(|i| i.focused),
+        }
+    }
+
     /// The three effect sends, 0..=1, for the host to hand the audio thread.
     pub fn effect_sends(&self) -> [f32; recorder_panel::Fx::ALL.len()] {
         // **In `Fx::ALL` order**, which is the order they are drawn and the
@@ -19901,7 +19944,7 @@ impl TangentApp {
             return;
         };
         // A field being typed into owns every key; so does an open dialog.
-        if self.text_entry_active() || self.dialog.is_some() {
+        if self.text_entry_active() || self.dialog_blocks_keys(ctx) {
             return;
         }
         let Some(gesture) = ctx.input(crate::a11y::Gesture::read) else {
@@ -22746,6 +22789,10 @@ impl TangentApp {
                     path,
                 });
             }
+            // The theme key from a plugin window's own bar: exactly the
+            // main window's `K::CycleTheme`, arriving by the only road a
+            // child window's keys have.
+            DialogAction::CycleTheme => self.cycle_theme(),
             DialogAction::SetInsertKeySource { strip, slot, from } => {
                 // A settings write and nothing else — the `SetRouteGain`
                 // pattern, not a request: the desktop publishes the whole
@@ -24797,7 +24844,7 @@ impl TangentApp {
         // "tangent" into a track name and watched T open the about menu, G
         // resize the window and E raise the chord corrector, one letter at a
         // time. One `text_entry_active` answer gates every shortcut path.
-        if self.dialog.is_none()
+        if !self.dialog_blocks_keys(&ctx)
             && self.menu_state.is_none()
             && self.input_menu.is_none()
             && self.swing_menu.is_none()
@@ -26442,7 +26489,7 @@ impl TangentApp {
                     // And a dialog: inline (plugin build) it draws over
                     // the desk in this same context, and a press on its
                     // buttons was also toggling the mute underneath.
-                    && self.dialog.is_none()
+                    && !self.dialog_blocks_pointer(&ctx)
                     && (!drumpad_owns
                         || self.mixer_grab.is_some()
                         || self.mixer_reorder.is_some())
@@ -26492,7 +26539,7 @@ impl TangentApp {
                 }
             }
             // **Ctrl/Cmd+T: a new track**, here as in the arrangement.
-            if self.dialog.is_none()
+            if !self.dialog_blocks_keys(&ctx)
                 && !self.text_entry_active()
                 && ctx.input(|i| {
                     (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::T)
@@ -26503,7 +26550,7 @@ impl TangentApp {
             // **Ctrl/Cmd+F: group the selection into a folder**, exactly
             // the arrangement's chord — same handler, same refusals — so a
             // hand that learned it there finds it here.
-            if self.dialog.is_none()
+            if !self.dialog_blocks_keys(&ctx)
                 && !self.text_entry_active()
                 && ctx.input(|i| {
                     (i.modifiers.command || i.modifiers.ctrl)
@@ -26522,7 +26569,7 @@ impl TangentApp {
             // `Event::Paste` / `Event::Cut` and the keypress never arrives;
             // the arrangement and the MIDI editor both learned this the
             // hard way. The key reads stay as the fallback spelling.
-            if self.dialog.is_none() && !self.text_entry_active() {
+            if !self.dialog_blocks_keys(&ctx) && !self.text_entry_active() {
                 let (copy_ev, paste_ev, cut_ev) = ctx.input(|i| {
                     let mut c = false;
                     let mut v = false;
@@ -26560,7 +26607,7 @@ impl TangentApp {
             }
             // **Delete: the SELECTED CHANNEL leaves the desk** — the Track
             // menu's Remove, on the key, as in the arrangement.
-            if self.dialog.is_none()
+            if !self.dialog_blocks_keys(&ctx)
                 && self.menu_state.is_none()
                 && !self.text_entry_active()
                 && ctx.input(|i| {
@@ -26911,7 +26958,7 @@ impl TangentApp {
         // **The view keys: ctrl+A / ctrl+M / ctrl+V** — arrange, mixer,
         // visualizer, from anywhere a letter is not being typed. CTRL
         // proper, not command: the editor's own Cmd+A keeps select-all.
-        if self.dialog.is_none() && !self.text_entry_active() {
+        if !self.dialog_blocks_keys(&ctx) && !self.text_entry_active() {
             // **Ctrl+Z / Ctrl+Shift+Z — one line of time**, whatever view
             // wrote the moment (Cmd works too, for the muscle that has it).
             let (undo_key, redo_key) = ctx.input(|i| {
@@ -26985,7 +27032,9 @@ impl TangentApp {
         // `text_entry_active` is what stops "HHH" from sliding the card.
         let help = keys::help_progress(
             &ctx,
-            self.dialog.is_none() && self.menu_state.is_none() && !self.text_entry_active(),
+            !self.dialog_blocks_keys(&ctx)
+                && self.menu_state.is_none()
+                && !self.text_entry_active(),
         );
         if help > 0.0 {
             let face = self.panel_face();
@@ -27081,7 +27130,7 @@ impl TangentApp {
             if outcome.close_requested {
                 self.reattach_fretboard(); // close-to-reattach, like the chord window
             } else if let Some(pos) = outcome.context_menu_at {
-                if self.dialog.is_none() {
+                if !self.dialog_blocks_pointer(&ctx) {
                     self.open_menu_at(&ctx, pos);
                 }
             }
@@ -27118,7 +27167,7 @@ impl TangentApp {
                 // rect, which is a different rectangle from the band's.
                 self.toggle_theory_hit(hit);
             } else if let Some(pos) = outcome.context_menu_at {
-                if self.dialog.is_none() {
+                if !self.dialog_blocks_pointer(&ctx) {
                     self.open_menu_at(&ctx, pos);
                 }
             }
@@ -27145,12 +27194,12 @@ impl TangentApp {
             }
             if outcome.close_requested {
                 self.reattach_recorder(); // close-to-reattach, like the other three
-            } else if let Some(hit) = outcome.hit.filter(|_| self.dialog.is_none()) {
+            } else if let Some(hit) = outcome.hit.filter(|_| !self.dialog_blocks_pointer(&ctx)) {
                 // The hit arrives already resolved against the WINDOW's rect,
                 // which is a different rectangle from the band's.
                 //
-                // `dialog.is_none()` because the main window is modal to a
-                // dialog (`handle_main_interaction` returns early) and the
+                // `dialog_blocks_pointer` because the main window is modal to
+                // a QUESTION (`handle_main_interaction` returns early) and the
                 // popout has to be too. Without it, clicking Export in the
                 // detached recorder while the Export dialog is already open
                 // REPLACES it with a fresh one and discards everything typed.
@@ -27159,7 +27208,7 @@ impl TangentApp {
                 self.name_focused = matches!(hit, recorder_panel::Hit::NameField);
                 self.apply_recorder_hit(hit);
             } else if let Some(pos) = outcome.context_menu_at {
-                if self.dialog.is_none() {
+                if !self.dialog_blocks_pointer(&ctx) {
                     self.open_menu_at(&ctx, pos);
                 }
             }
@@ -27204,7 +27253,7 @@ impl TangentApp {
             if outcome.close_requested {
                 self.reattach_chord_window(); // close-to-reattach
             } else if let Some(pos) = outcome.context_menu_at {
-                if self.dialog.is_none() {
+                if !self.dialog_blocks_pointer(&ctx) {
                     self.open_menu_at(&ctx, pos);
                 }
             }
@@ -27321,6 +27370,8 @@ impl TangentApp {
             at: None,
             // Taken, so one press asks once. See `SurfaceSpec::raise`.
             raise: std::mem::take(&mut self.raise_dialog),
+            // `dialogs::show` fills this from the dialog's own kind.
+            chrome: None,
             // The rect the layout was actually DRAWN into, which is centred in
             // the pane and is not the same as one anchored at its corner. With
             // a band turned off, the two differ by half the slack and dialogs
@@ -27464,6 +27515,13 @@ impl TangentApp {
                 dialogs::show(&ctx, &mut self.dialog, face, placement)
             }
         {
+            // The theme key from a plugin window: the desk and the bar both
+            // read settings, so the next frame paints both in the new theme
+            // — asked for now, so there IS a next frame and the bar is not
+            // left a theme behind until something else moves.
+            if matches!(action, DialogAction::CycleTheme) {
+                ctx.request_repaint();
+            }
             self.apply_dialog_action(action);
         }
         // The face closed this frame: take the tap down with it.
@@ -37552,6 +37610,164 @@ mod tests {
                 "window size at {pct}% detached"
             );
         }
+    }
+
+    // ── the plugin windows and the desk ─────────────────────────────────────
+
+    /// A comp in channel 0's first bay, its face pushed as the host pushes
+    /// it, the mixer up, and the face open over it.
+    fn app_with_a_face_over_the_mixer() -> (egui::Context, TangentApp) {
+        let (ctx, mut app) = headless(Caps::DESKTOP);
+        app.set_insert(0, 0, Some("@tangent-comp"));
+        app.set_builtin_face(crate::ports::BuiltinFace {
+            strip: 0,
+            slot: 0,
+            path: "@tangent-comp".to_owned(),
+            params: Vec::new(),
+            curve_db: Vec::new(),
+            extra: Vec::new(),
+        });
+        app.mixer_open = true;
+        pointer_frame(&ctx, &mut app, Vec::new());
+        app.open_unit_face(0, 0);
+        pointer_frame(&ctx, &mut app, Vec::new());
+        assert!(
+            matches!(app.dialog, Some(dialogs::Dialog::InsertFace { .. })),
+            "the face did not open"
+        );
+        (ctx, app)
+    }
+
+    /// Press on channel 0's fader, pull it up fifty points, let go — as a
+    /// hand does, one event at a time. Returns the gain before and after.
+    fn pull_the_first_fader(ctx: &egui::Context, app: &mut TangentApp) -> (f64, f64) {
+        let rect = app.mixer_rect.expect("the mixer is not up");
+        let v = app.mixer_view();
+        let fader = crate::mixer_panel::Layout::new(rect, &v).strips[0].fader;
+        let before = app.settings.channel_gains[0];
+        let grab = fader.center();
+        press(ctx, app, grab);
+        move_to(ctx, app, grab - Vec2::new(0.0, 25.0));
+        move_to(ctx, app, grab - Vec2::new(0.0, 50.0));
+        pointer_frame(
+            ctx,
+            app,
+            vec![egui::Event::PointerButton {
+                pos: grab - Vec2::new(0.0, 50.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        (before, app.settings.channel_gains[0])
+    }
+
+    /// **A face open, the desk still live.** The owner's words: keep the
+    /// Keys tab open and tweak the dials in the recorder, the mixer or the
+    /// arrangement without closing the plugin. Event-level: a real press
+    /// and drag on a mixer fader with the face up, asserted by the gain
+    /// that moved — and the face still open, and still being refreshed,
+    /// afterwards. Then the control: a QUESTION (About) freezes the same
+    /// fader, so the gate is the modality and not gone.
+    #[test]
+    fn a_face_leaves_the_mixer_fader_live_and_a_question_does_not() {
+        let (ctx, mut app) = app_with_a_face_over_the_mixer();
+        let (before, after) = pull_the_first_fader(&ctx, &mut app);
+        assert!(
+            after > before,
+            "the fader did not move under an open face: {before} -> {after}"
+        );
+        match &app.dialog {
+            Some(dialogs::Dialog::InsertFace { live, .. }) => assert_eq!(
+                live.face.path, "@tangent-comp",
+                "the face stopped being refreshed while the desk was driven"
+            ),
+            _ => panic!("the face closed while the fader was pulled"),
+        }
+
+        // The control: a question freezes the desk exactly as before.
+        app.dialog = Some(dialogs::Dialog::About);
+        pointer_frame(&ctx, &mut app, Vec::new());
+        let (before, after) = pull_the_first_fader(&ctx, &mut app);
+        assert!(
+            (after - before).abs() < 1e-9,
+            "a modal dialog let the fader move: {before} -> {after}"
+        );
+        assert!(matches!(app.dialog, Some(dialogs::Dialog::About)));
+    }
+
+    /// **T inside a plugin window cycles the theme ONCE.** The desk and the
+    /// window both know the key; the window carries it back as
+    /// `DialogAction::CycleTheme`, and the desk must not ALSO act on it.
+    /// Two shapes: the desktop, where the face's window holds the keyboard
+    /// and the main window is unfocused — `focused: false` is what the OS
+    /// delivers to it then — and the plugin canvas, where there is one
+    /// keyboard and the layer on top owns it.
+    #[test]
+    fn the_theme_key_inside_a_plugin_window_cycles_once() {
+        for (label, caps, main_focused) in
+            [("desktop", Caps::DESKTOP, false), ("plugin", Caps::PLUGIN, true)]
+        {
+            let (ctx, mut app) = headless(caps);
+            app.open_unit_face(0, 0);
+            pointer_frame(&ctx, &mut app, Vec::new());
+            let all = crate::theme::factory();
+            assert_eq!(
+                app.settings.theme_name, all[0].name,
+                "the test assumes a fresh install wears the first theme"
+            );
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0))),
+                    focused: main_focused,
+                    events: vec![egui::Event::Key {
+                        key: egui::Key::T,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |ctx| app.frame(ctx),
+            );
+            pointer_frame(&ctx, &mut app, Vec::new());
+            assert_eq!(
+                app.settings.theme_name, all[1].name,
+                "{label}: one T inside the face did not cycle exactly once \
+                 (from {} the next theme is {})",
+                all[0].name, all[1].name
+            );
+            assert!(
+                matches!(app.dialog, Some(dialogs::Dialog::InsertFace { .. })),
+                "{label}: the theme key closed the face"
+            );
+        }
+    }
+
+    /// **And in the main window, with a face open, T still cycles — once.**
+    /// The desktop half of the same rule: the main window focused, its own
+    /// key, its own keymap, and the face (whose window never saw the key)
+    /// staying open.
+    #[test]
+    fn the_theme_key_in_the_main_window_still_works_under_a_face() {
+        let (ctx, mut app) = headless(Caps::DESKTOP);
+        app.open_unit_face(0, 0);
+        pointer_frame(&ctx, &mut app, Vec::new());
+        let all = crate::theme::factory();
+        // The desk's own key, exactly as `frame` reads it: the gate is what
+        // is under test, so go through the gate rather than the action.
+        assert!(
+            !app.dialog_blocks_keys(&ctx),
+            "a plugin window took the main window's keys while it was focused"
+        );
+        app.apply_key_action(&ctx, keys::KeyAction::CycleTheme);
+        assert_eq!(app.settings.theme_name, all[1].name);
+        assert!(matches!(app.dialog, Some(dialogs::Dialog::InsertFace { .. })));
+        // A question, and the gate closes as it always did.
+        app.dialog = Some(dialogs::Dialog::About);
+        assert!(app.dialog_blocks_keys(&ctx), "a modal dialog let the shortcuts through");
+        assert!(app.dialog_blocks_pointer(&ctx));
     }
 }
 

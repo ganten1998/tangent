@@ -2,10 +2,14 @@
 //! color modals (egui picker, themed, D-UI-7), MIDI info/error boxes, the
 //! custom tuning editor for the guitar view (D-UI-15), and the recorder's
 //! Export dialog (RECORDER-PLAN §5).
-//! Each dialog is its own decorated immediate viewport, like Qt's top-level
-//! dialogs (the fixed-size main window is too small to host them) — or, in a
-//! plugin, a layer in the canvas. `show_dialog_viewport` is the funnel that
-//! makes that the same code, and nothing here may open a window by itself.
+//! Each dialog is its own immediate viewport, like Qt's top-level dialogs
+//! (the fixed-size main window is too small to host them) — or, in a plugin,
+//! a layer in the canvas. `show_dialog_viewport` is the funnel that makes
+//! that the same code, and nothing here may open a window by itself. A
+//! QUESTION wears the OS's chrome and freezes the desk; a PLUGIN window (a
+//! face, the Keys panel, the pickers they open) wears the in-house bar from
+//! `shell::Chrome` and leaves the desk live — `Dialog::is_modal` is the one
+//! place that says which is which.
 
 use std::path::{Path, PathBuf};
 
@@ -583,6 +587,64 @@ pub enum Dialog {
     IrWizard { state: Box<IrWizardState> },
 }
 
+impl Dialog {
+    /// Whether the main window stands still while this dialog is up.
+    ///
+    /// **The plugin windows do not take the desk away.** A face, the Keys
+    /// panel and the pickers they open are things a person works IN while
+    /// the desk stays live — the owner's words: keep the Keys tab open and
+    /// tweak the dials in the recorder, the mixer or the arrangement
+    /// without closing it. Every other dialog is a QUESTION, and the app
+    /// waits for its answer as it always has.
+    ///
+    /// This is the ONE classification, and every modality decision in the
+    /// app goes through it: `handle_main_interaction`'s event drop, the
+    /// shortcut gates, the inline scrim, the OS chrome. A `match` with no
+    /// wildcard on purpose — a new variant does not compile until somebody
+    /// has said which kind it is.
+    pub fn is_modal(&self) -> bool {
+        match self {
+            Dialog::InsertFace { .. }
+            | Dialog::KeysPatch { .. }
+            | Dialog::PatchPicker { .. }
+            | Dialog::PatchEditor { .. }
+            | Dialog::PluginPicker { .. }
+            | Dialog::InsertKeySource { .. }
+            | Dialog::IrWizard { .. } => false,
+            Dialog::Cheated
+            | Dialog::CheatFun
+            | Dialog::Project { .. }
+            | Dialog::Track { .. }
+            | Dialog::ExportProject { .. }
+            | Dialog::MidiPicker { .. }
+            | Dialog::DevicePicker { .. }
+            | Dialog::FileBrowser { .. }
+            | Dialog::TakeSummary { .. }
+            | Dialog::Confirm { .. }
+            | Dialog::Automation { .. }
+            | Dialog::NoMidiInput
+            | Dialog::Notice { .. }
+            | Dialog::SaveChanges { .. }
+            | Dialog::MidiError { .. }
+            | Dialog::About
+            | Dialog::AudioSetup { .. }
+            | Dialog::InputChannels { .. }
+            | Dialog::Welcome { .. }
+            | Dialog::Routing { .. }
+            | Dialog::SaveTheme { .. }
+            | Dialog::ReaStream { .. }
+            | Dialog::SupporterKey { .. }
+            | Dialog::ColorPick { .. }
+            | Dialog::TeachChord { .. }
+            | Dialog::ManageTaught { .. }
+            | Dialog::CorrectChord { .. }
+            | Dialog::LearnResult { .. }
+            | Dialog::CustomTuning { .. }
+            | Dialog::Export { .. } => true,
+        }
+    }
+}
+
 /// Which page of the IR wizard is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IrStage {
@@ -1050,6 +1112,11 @@ pub enum DialogAction {
     /// The IR face picked an impulse off the shelf; desk terms, the app
     /// converts and asks the host to rebind the bay.
     SetInsertIr { strip: usize, slot: usize, path: String },
+    /// The theme key was pressed inside a plugin window. On the desktop
+    /// that window has its own input and the main window never sees the
+    /// key, so the dialog carries it back and the app cycles exactly as it
+    /// would from its own keymap. Appended at the END, the law.
+    CycleTheme,
 }
 
 // ── the custom tuning editor ────────────────────────────────────────────────
@@ -3194,6 +3261,8 @@ fn stock_style(ctx: &egui::Context) -> egui::Style {
 
 struct VpResult {
     close: bool,
+    /// The theme key, pressed in a plugin window. See `DialogAction::CycleTheme`.
+    cycle_theme: bool,
 }
 
 /// Focus a text field and select everything in it, once.
@@ -3251,6 +3320,12 @@ pub struct Placement {
     /// spaces are not the same and mixing them puts the panel on another
     /// display.
     pub at: Option<Pos2>,
+    /// The in-house bar a PLUGIN window wears, or `None` for OS chrome.
+    ///
+    /// Filled in by [`show`] from [`Dialog::is_modal`] — the one
+    /// classification — so no arm of the big match ever has to say which
+    /// kind of window it is drawing. Callers leave it `None`.
+    pub chrome: Option<crate::shell::Chrome>,
 }
 
 impl Placement {
@@ -3307,29 +3382,40 @@ fn show_dialog_viewport(
     content: impl FnMut(&mut egui::Ui, &mut VpResult),
 ) -> VpResult {
     let mut content = content;
-    let mut result = VpResult { close: false };
+    let mut result = VpResult {
+        close: false,
+        cycle_theme: false,
+    };
 
     // Window or layer — `shell::surface` decides, and it is the only thing in
     // this crate that does. Everything below is what a dialog adds on top:
     // rounded fill on the inline path, because a layer has no title bar and no
     // window edge to tell it apart from the app behind it.
     let inline = !placement.caps.child_windows;
+    // **A plugin window or a question.** The plugin windows (a face, the
+    // Keys panel, their pickers) wear the in-house bar and leave the desk
+    // live; everything else is modal and wears the OS's chrome. Both facts
+    // come from the one `Dialog::is_modal`, carried here in `chrome`.
+    let plugin = placement.chrome.is_some();
     let spec = crate::shell::SurfaceSpec {
         id: DIALOG_ID,
         title,
         size,
         min_size,
-        // These dialogs are MODAL — `handle_main_interaction` drops every event
-        // while one is open — so a dialog that ends up behind the main window
-        // is not merely untidy, it is an app that has stopped responding with
-        // no visible reason why. The welcome note and the supporter key are the
-        // two that open on top of a window the user is already looking at.
+        // The modal dialogs are MODAL — `handle_main_interaction` drops every
+        // event while one is open — so a dialog that ends up behind the main
+        // window is not merely untidy, it is an app that has stopped
+        // responding with no visible reason why. The welcome note and the
+        // supporter key are the two that open on top of a window the user is
+        // already looking at. A plugin window floats for a different reason:
+        // it is the thing being worked in, and it must not vanish behind the
+        // desk it is being worked against.
         pos: placement.position_for(size),
-        decorated: true,
+        decorated: !plugin,
         resizable: true,
         takes_focus: true,
         raise: placement.raise,
-        modal: true,
+        modal: !plugin,
         // Down for as long as the OS's own panel is up. See `on_top`.
         on_top: !placement.native_panel_up,
         // Without this a tiling WM (i3, sway) TILES the dialog — it opens as
@@ -3338,6 +3424,7 @@ fn show_dialog_viewport(
         // an app that has frozen for no visible reason, which is exactly what
         // the comment above `pos` warns about.
         window_type: Some(egui::X11WindowType::Dialog),
+        chrome: placement.chrome,
         ..Default::default()
     };
     let report = crate::shell::surface(ctx, placement.caps, &spec, &mut |ui, want_close| {
@@ -3345,14 +3432,39 @@ fn show_dialog_viewport(
             ui.painter()
                 .rect_filled(ui.max_rect(), 4.0, ui.style().visuals.window_fill);
         }
-        let mut r = VpResult { close: false };
+        let mut r = VpResult {
+            close: false,
+            cycle_theme: false,
+        };
         content(ui, &mut r);
         if r.close {
             *want_close = true;
         }
     });
     result.close = report.close;
+    result.cycle_theme = report.cycle_theme;
     result
+}
+
+/// Whether the pointer is over the dialog drawn IN THE CANVAS last pass.
+///
+/// The app's raw-pointer handlers ask this before touching the desk under a
+/// non-modal dialog: egui's layers shield its own widgets, but a handler
+/// that reads `i.pointer` directly sees straight through an `Area`. On the
+/// desktop the dialog is another window and this is always false — its
+/// presses never reach the main window's input at all.
+pub fn pointer_over_dialog(ctx: &egui::Context) -> bool {
+    crate::shell::inline_rect(ctx, DIALOG_ID)
+        .zip(ctx.pointer_interact_pos())
+        .is_some_and(|(r, p)| r.contains(p))
+}
+
+/// Whether the dialog was drawn IN THE CANVAS last pass, sharing the main
+/// window's keyboard. Inline the keys have one owner and it is the layer on
+/// top; on the desktop each window hears only its own keys, so this is
+/// false and focus decides.
+pub fn dialog_drawn_inline(ctx: &egui::Context) -> bool {
+    crate::shell::inline_rect(ctx, DIALOG_ID).is_some()
 }
 
 /// Render the active dialog. Returns an action for the app to apply;
@@ -3976,6 +4088,13 @@ pub fn show(
     remember_face(ctx, face);
     let dialog = dialog_opt.as_mut()?;
     let mut action = None;
+    // The one place the classification becomes a window: a plugin dialog
+    // gets the in-house bar in this frame's face, a question gets the OS's.
+    // Decided here rather than in each arm so an arm cannot disagree.
+    let placement = Placement {
+        chrome: (!dialog.is_modal()).then(|| crate::shell::Chrome::of(face)),
+        ..placement
+    };
 
     let result = match dialog {
         Dialog::DevicePicker {
@@ -9295,6 +9414,12 @@ pub fn show(
     if result.close {
         *dialog_opt = None;
     }
+    // The arm's own ask first: it is a hand on a control, and the theme key
+    // is one press that can simply be pressed again. Both on one frame is
+    // a T struck mid-drag, which nobody does twice.
+    if result.cycle_theme {
+        action = action.or(Some(DialogAction::CycleTheme));
+    }
     action
 }
 
@@ -9679,6 +9804,7 @@ mod tests {
             parent: None,
             monitor,
             caps: crate::host::Caps::DESKTOP,
+            chrome: None,
         }
         .position_for(size)
         .expect("a known monitor is enough to place a dialog");
@@ -9694,7 +9820,8 @@ mod tests {
             raise: false,
                 parent: None,
                 monitor: None,
-                caps: crate::host::Caps::DESKTOP
+                caps: crate::host::Caps::DESKTOP,
+                chrome: None,
             }
             .position_for(size),
             None
@@ -9709,6 +9836,7 @@ mod tests {
             parent: Some(parent),
             monitor,
             caps: crate::host::Caps::DESKTOP,
+            chrome: None,
         }
         .position_for(size)
         .expect("a known parent must yield a position");
@@ -9731,6 +9859,7 @@ mod tests {
             parent: Some(edge),
             monitor,
             caps: crate::host::Caps::DESKTOP,
+            chrome: None,
         }
         .position_for(size)
         .unwrap();
@@ -10139,6 +10268,7 @@ at: None,
             parent: None,
             monitor: None,
             caps: crate::host::Caps::PLUGIN,
+            chrome: None,
         };
         let mut action = None;
         let _ = ctx.run(
@@ -10740,6 +10870,7 @@ at: None,
             parent: None,
             monitor: None,
             caps: crate::host::Caps::PLUGIN,
+            chrome: None,
         };
         let mut action = None;
         let _ = ctx.run(
@@ -10844,6 +10975,7 @@ at: None,
             parent: None,
             monitor: None,
             caps: crate::host::Caps::PLUGIN,
+            chrome: None,
         };
         let mut action = None;
         let mut painted = String::new();
@@ -11167,6 +11299,7 @@ at: None,
             parent: None,
             monitor: None,
             caps: crate::host::Caps::PLUGIN,
+            chrome: None,
         };
         let held_enter = || egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, 520.0))),
@@ -11397,6 +11530,7 @@ at: None,
             parent: None,
             monitor: None,
             caps: crate::host::Caps::PLUGIN,
+            chrome: None,
         };
         let p = crate::ports::ExportProgress {
             fraction: 0.5,
@@ -11458,5 +11592,170 @@ at: None,
         assert!((fresh.level_db + 18.0).abs() < 0.01);
         assert!((fresh.tail_s - 10.0).abs() < 0.01);
         assert!((fresh.sweep_s() - 15.0).abs() < 0.01);
+    }
+
+    // ── modality ────────────────────────────────────────────────────────────
+
+    /// **A plugin window leaves the desk live; a question freezes it.**
+    ///
+    /// The classification is `Dialog::is_modal`, whose match has no
+    /// wildcard — a NEW variant does not compile until somebody has said
+    /// which kind it is, which is stricter than any test. What this pins is
+    /// the classification itself, by name: every plugin window says
+    /// non-modal, the questions say modal, and a reclassification has to
+    /// come here and say so.
+    #[test]
+    fn plugin_windows_are_not_modal_and_questions_are() {
+        let plugin: Vec<(&str, Dialog)> = vec![
+            (
+                "InsertFace",
+                Dialog::InsertFace {
+                    strip: 0,
+                    slot: 0,
+                    live: Box::default(),
+                },
+            ),
+            (
+                "KeysPatch",
+                Dialog::KeysPatch {
+                    slot: 0,
+                    selected: 0,
+                    params: [0.5; KEYS_PARAMS],
+                },
+            ),
+            (
+                "PatchPicker",
+                Dialog::patch_picker(0, String::new(), false, true, Vec::new(), None),
+            ),
+            (
+                "PatchEditor",
+                Dialog::PatchEditor {
+                    slot: 0,
+                    patch: crate::ports::PatchEdit::default(),
+                    group: 0,
+                    name: String::new(),
+                    note: String::new(),
+                },
+            ),
+            ("PluginPicker", Dialog::plugin_picker(&[], None, false)),
+            (
+                "InsertKeySource",
+                Dialog::InsertKeySource {
+                    strip: 0,
+                    slot: 0,
+                    current: None,
+                    channels: Vec::new(),
+                },
+            ),
+            (
+                "IrWizard",
+                Dialog::IrWizard {
+                    state: Box::default(),
+                },
+            ),
+        ];
+        for (name, d) in &plugin {
+            assert!(!d.is_modal(), "{name} is a plugin window and must not freeze the desk");
+        }
+        let questions: Vec<(&str, Dialog)> = vec![
+            ("About", Dialog::About),
+            ("Cheated", Dialog::Cheated),
+            ("CheatFun", Dialog::CheatFun),
+            ("NoMidiInput", Dialog::NoMidiInput),
+            (
+                "Notice",
+                Dialog::Notice {
+                    title: "Tangent".to_owned(),
+                    body: String::new(),
+                },
+            ),
+            (
+                "MidiError",
+                Dialog::MidiError {
+                    message: String::new(),
+                },
+            ),
+            (
+                "CustomTuning",
+                Dialog::custom_tuning(&Tuning::standard(), true),
+            ),
+        ];
+        for (name, d) in &questions {
+            assert!(d.is_modal(), "{name} is a question and must wait for its answer");
+        }
+    }
+
+    /// **The classification is the only switch.** A plugin dialog goes
+    /// through `show` and comes out borderless, non-modal and wearing the
+    /// bar; a question comes out decorated and modal. Both facts come from
+    /// `is_modal` alone, so an arm of the big match cannot get one of them
+    /// wrong on its own — asserted on the inline path, where the layer's
+    /// memory says what was drawn.
+    #[test]
+    fn a_plugin_dialog_wears_the_bar_and_a_question_does_not() {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        fonts::apply_text_styles(&ctx);
+        let placement = Placement {
+            at: None,
+            native_panel_up: false,
+            raise: false,
+            parent: None,
+            monitor: None,
+            caps: crate::host::Caps::PLUGIN,
+            chrome: None,
+        };
+        let face = Color32::from_rgb(0xE3, 0xD9, 0xBD);
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 700.0));
+        // The theme key inside the Keys panel: carried back as the action,
+        // which is what makes T cycle the theme from a plugin window.
+        let mut dialog = Some(Dialog::KeysPatch {
+            slot: 0,
+            selected: 0,
+            params: [0.5; KEYS_PARAMS],
+        });
+        let mut action = None;
+        for events in [
+            Vec::new(),
+            vec![egui::Event::Key {
+                key: egui::Key::T,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        ] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    action = show(ctx, &mut dialog, face, placement);
+                },
+            );
+        }
+        assert!(
+            matches!(action, Some(DialogAction::CycleTheme)),
+            "T inside the Keys panel did not come back as a theme cycle"
+        );
+        assert!(dialog.is_some(), "the theme key closed the panel");
+        // And the layer is remembered where it was drawn, which is what the
+        // app's raw-pointer handlers read to keep a press on the panel off
+        // the desk underneath.
+        let rect = crate::shell::inline_rect(&ctx, DIALOG_ID).expect("the panel left no rect");
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![egui::Event::PointerMoved(rect.center())],
+                ..Default::default()
+            },
+            |ctx| {
+                assert!(pointer_over_dialog(ctx), "a pointer on the panel reads as off it");
+                assert!(dialog_drawn_inline(ctx));
+                let _ = show(ctx, &mut dialog, face, placement);
+            },
+        );
     }
 }
