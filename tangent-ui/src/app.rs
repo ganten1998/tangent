@@ -6547,6 +6547,14 @@ impl TangentApp {
         self.recorder.gr_db = gr_db;
     }
 
+    /// Open the keyboard's patch panel on a chosen sound. For the
+    /// screenshot hook: the eight-sound grid is layout that can only be
+    /// judged by looking at it.
+    pub fn open_keys_panel_for_shot(&mut self, selected: usize) {
+        self.set_keys_patch_of(0, selected);
+        self.open_keys_picker(0);
+    }
+
     /// Open the patch editor with a patch in it. For the screenshot hook,
     /// which has no host to fill it in.
     pub fn open_patch_editor_for_shot(&mut self) {

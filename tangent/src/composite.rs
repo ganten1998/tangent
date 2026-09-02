@@ -1906,6 +1906,20 @@ mod shot {
                 }
             }
         }
+        // The keyboard's eight-sound panel, on a chosen sound.
+        //   IVORY_SHOT_KEYSPANEL=<0..7> ...
+        // KNOWN GAP: dialogs are egui viewports and this compositor does
+        // not paint child viewports, so the panel does not land in the PNG
+        // yet - the hook stands so a dialog-capable harness can use it.
+        if let Ok(which) = std::env::var("IVORY_SHOT_KEYSPANEL") {
+            app.open_keys_panel_for_shot(which.parse().unwrap_or(0));
+            for _ in 0..2 {
+                if let Err(e) = shoot(&app) {
+                    eprintln!("frame: {e}");
+                    return;
+                }
+            }
+        }
         if let Ok(which) = std::env::var("IVORY_SHOT_FX") {
             app.open_effect_panel(match which.as_str() {
                 "delay" => tangent_ui::recorder_panel::Fx::Delay,
