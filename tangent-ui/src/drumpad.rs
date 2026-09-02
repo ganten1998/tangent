@@ -14,6 +14,7 @@
 
 use serde_json::{Map, Value};
 
+use crate::arrangement::Fingerprint;
 use crate::recorder::{DrumKitParams, DrumPadParams, DRUM_PADS};
 
 /// The sidecar's name, beside the project document.
@@ -616,6 +617,49 @@ impl DrumpadDoc {
             root.insert(lane.to_string(), Value::Object(k));
         }
         serde_json::to_string(&Value::Object(root)).unwrap_or_default()
+    }
+
+    /// **The kits into a [`Fingerprint`]**, walking beside `compact_all`.
+    ///
+    /// The undo timeline compares the COMPACT form, so this hashes exactly
+    /// what that writes and nothing else: a lane the compaction skips is not
+    /// in the number, and neither are the two things it drops — the kit's
+    /// `version` and its kit-level `extra`. Hashing them would report an
+    /// edit the moment nobody could ever undo.
+    ///
+    /// Mixed into a fingerprint the caller already owns rather than
+    /// answering one of its own, so the arrangement and its sidecar make ONE
+    /// number. Two numbers is two things to keep in step.
+    pub fn hash_all_into(kits: &[Self], f: &mut Fingerprint) {
+        for (lane, kit) in kits.iter().enumerate() {
+            if kit.is_empty() && (kit.master - 1.0).abs() < f32::EPSILON {
+                continue;
+            }
+            // The lane's own number and its pad COUNT frame the run, so
+            // "lane 0 holding two pads" cannot read as two lanes holding one.
+            f.len(lane);
+            f.f64(f64::from(kit.master));
+            f.len(kit.pads.iter().filter(|p| !p.path.is_empty()).count());
+            for (key, pad) in kit.pads.iter().enumerate() {
+                if pad.path.is_empty() {
+                    continue;
+                }
+                f.len(key);
+                // The strangers FIRST, because that is the order the
+                // compaction builds the object in — `preserve_order` makes
+                // that order part of the text.
+                f.map(&pad.extra);
+                f.str(&pad.path);
+                f.str(&pad.name);
+                f.f64(f64::from(pad.params.gain));
+                f.f64(f64::from(pad.params.pan));
+                f.f64(f64::from(pad.params.tune));
+                f.u64(u64::from(pad.params.choke));
+                f.bool(pad.params.obey);
+                f.f64(f64::from(pad.params.trim_start));
+                f.f64(f64::from(pad.params.trim_end));
+            }
+        }
     }
 
     /// The inverse. Unreadable text is `lanes` empty kits, never a panic.
@@ -1279,5 +1323,116 @@ mod preset_tests {
         assert_eq!(back.pads.len(), 1, "the layout was lost with the audio");
         assert!(back.media.is_empty(), "half a sample was kept");
         assert_eq!(back.pads[0].blob, None, "a pad points at audio that is not there");
+    }
+}
+
+/// The kits' half of the undo fingerprint. See `Fingerprint` in
+/// [`crate::arrangement`] for the rule these tests exist to hold: two kits
+/// that COMPACT to the same text must fingerprint the same, and two that do
+/// not, must not.
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::*;
+
+    fn mark(kits: &[DrumpadDoc]) -> u64 {
+        let mut f = Fingerprint::new();
+        DrumpadDoc::hash_all_into(kits, &mut f);
+        f.finish()
+    }
+
+    /// Three lanes: one with two pads in it, one silent but with its fader
+    /// moved, one entirely untouched.
+    fn some_kits() -> Vec<DrumpadDoc> {
+        let mut kits = vec![DrumpadDoc::default(), DrumpadDoc::default(), DrumpadDoc::default()];
+        kits[0].pads[0].path = "media/kick.wav".into();
+        kits[0].pads[0].name = "the kick".into();
+        kits[0].pads[0].params.gain = 0.9;
+        kits[0].pads[3].path = "media/snare.wav".into();
+        kits[0].pads[3].params.choke = 2;
+        kits[0].master = 0.8;
+        kits[1].master = 0.5;
+        kits
+    }
+
+    fn moves_both(name: &str, edit: impl Fn(&mut Vec<DrumpadDoc>)) {
+        let kits = some_kits();
+        let (text, fp) = (DrumpadDoc::compact_all(&kits), mark(&kits));
+        let mut k = kits;
+        edit(&mut k);
+        assert_ne!(DrumpadDoc::compact_all(&k), text, "`{name}` changed no kit at all");
+        assert_ne!(mark(&k), fp, "`{name}` changed a kit and the fingerprint stood still");
+    }
+
+    fn moves_neither(name: &str, edit: impl Fn(&mut Vec<DrumpadDoc>)) {
+        let kits = some_kits();
+        let (text, fp) = (DrumpadDoc::compact_all(&kits), mark(&kits));
+        let mut k = kits;
+        edit(&mut k);
+        assert_eq!(DrumpadDoc::compact_all(&k), text, "`{name}` moved a kit after all");
+        assert_eq!(mark(&k), fp, "`{name}` moved no kit and the fingerprint moved");
+    }
+
+    /// **Every kit edit the undo timeline can see, the fingerprint sees.**
+    #[test]
+    fn the_fingerprint_moves_when_a_kit_moves() {
+        moves_both("a sample loaded onto an empty pad", |k| {
+            k[0].pads[7].path = "media/hat.wav".into();
+        });
+        moves_both("a pad cleared", |k| k[0].pads[0].path = String::new());
+        moves_both("a pad renamed", |k| k[0].pads[0].name = "kick 2".into());
+        moves_both("a pad's gain", |k| k[0].pads[0].params.gain = 0.4);
+        moves_both("a pad's pan", |k| k[0].pads[0].params.pan = -0.3);
+        moves_both("a pad's tuning", |k| k[0].pads[3].params.tune = -2.0);
+        moves_both("a choke group", |k| k[0].pads[3].params.choke = 1);
+        moves_both("obeying note-offs", |k| k[0].pads[0].params.obey = true);
+        moves_both("a trim", |k| k[0].pads[0].params.trim_start = 0.1);
+        moves_both("the other trim", |k| k[0].pads[0].params.trim_end = 0.9);
+        moves_both("a kit's fader", |k| k[0].master = 0.6);
+        moves_both("a fader on a SILENT lane", |k| k[1].master = 0.25);
+        moves_both("a whole kit arriving on a new lane", |k| {
+            k[2].pads[0].path = "media/clap.wav".into();
+        });
+        moves_both("a stranger's key on a pad", |k| {
+            k[0].pads[0].extra.insert("reverse".into(), Value::from(true));
+        });
+    }
+
+    /// **And what the compaction throws away cannot move it.**
+    ///
+    /// `compact_all` writes only the pads that hold something and only the
+    /// lanes that hold a pad — the undo timeline compares that form, so a
+    /// fingerprint that saw more than it does would push a moment nobody
+    /// could ever travel back to.
+    #[test]
+    fn the_fingerprint_ignores_what_the_compaction_drops() {
+        moves_neither("a name on an EMPTY pad", |k| {
+            k[0].pads[9].name = "nothing here".into();
+        });
+        moves_neither("a knob on an empty pad", |k| k[0].pads[9].params.gain = 0.1);
+        moves_neither("a stranger's key on an empty pad", |k| {
+            k[0].pads[9].extra.insert("reverse".into(), Value::from(true));
+        });
+        moves_neither("a kit's version stamp", |k| k[0].version = 9);
+        moves_neither("a stranger's key on the KIT", |k| {
+            k[0].extra.insert("swing".into(), Value::from(0.24));
+        });
+        moves_neither("a lane that is empty at unity", |k| {
+            k[2].pads[4].name = "still nothing".into();
+        });
+    }
+
+    /// **A kit that has been through the sidecar fingerprints the same.**
+    /// Otherwise every project would open with its pads looking edited.
+    #[test]
+    fn a_round_trip_through_the_compact_form_keeps_the_fingerprint() {
+        let kits = some_kits();
+        let text = DrumpadDoc::compact_all(&kits);
+        let back = DrumpadDoc::from_compact_all(&text, kits.len());
+        assert_eq!(
+            DrumpadDoc::compact_all(&back),
+            text,
+            "the compact form is not a fixed point"
+        );
+        assert_eq!(mark(&back), mark(&kits), "a round trip moved the fingerprint");
     }
 }
