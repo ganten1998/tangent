@@ -99,6 +99,9 @@ pub struct StripView<'a> {
     /// same disappearance the arrangement performs - the owner unified the
     /// two views' folding.
     pub hidden: bool,
+    /// Which bays wear a sidechain key, for the dot in the chip's corner.
+    /// Same indexing as `inserts`: the strip's visible slots.
+    pub keyed: [bool; INSERTS * 2],
 }
 
 impl StripView<'_> {
@@ -187,6 +190,11 @@ pub struct MixerView<'a> {
     /// at a time; all of them wear the rim, because a selection you cannot see
     /// the extent of is not one.
     pub selected_tracks: &'a [usize],
+    /// Whether the OPEN insert menu's bay can take a sidechain key, which is
+    /// what earns it the third row. On the view rather than per strip
+    /// because at most one menu is up, and the app is the side that can ask
+    /// the host's pushed facts about the bay under it.
+    pub fx_menu_key: bool,
 }
 
 impl MixerView<'_> {
@@ -269,6 +277,9 @@ pub enum FxAction {
     Delete,
     /// Open the picker aimed at this bay, so choosing swaps it in place.
     Replace,
+    /// Open the sidechain source picker on this bay. Offered only when the
+    /// view says the tenant can take a key — see `MixerView::fx_menu_key`.
+    Sidechain,
     /// Anywhere that is not a row: close the menu and do nothing.
     Dismiss,
 }
@@ -1816,12 +1827,14 @@ pub fn hit_test(rect: Rect, view: &MixerView<'_>, pos: Pos2) -> Option<Hit> {
     // exists to prevent is exactly a press that lands somewhere it should not.
     if let Some((at, bay)) = view.fx_menu {
         if let Some(s) = l.strips.get(at.0) {
-            let rows = fx_menu_over(s, bay);
-            if rows[0].contains(pos) {
-                return Some(Hit::FxMenu(at, bay, FxAction::Delete));
-            }
-            if rows[1].contains(pos) {
-                return Some(Hit::FxMenu(at, bay, FxAction::Replace));
+            // The third row exists only where a key can go; the actions
+            // are positional, so the list must match the painter's.
+            let rows = fx_menu_rows(s, bay, if view.fx_menu_key { 3 } else { 2 });
+            let actions = [FxAction::Delete, FxAction::Replace, FxAction::Sidechain];
+            for (r, action) in rows.iter().zip(actions) {
+                if r.contains(pos) {
+                    return Some(Hit::FxMenu(at, bay, action));
+                }
             }
         }
         return Some(Hit::FxMenu(at, bay, FxAction::Dismiss));
@@ -1983,7 +1996,7 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MixerView<'_>) {
     // The insert menu and the kind ask: a veil over
     // the strip they belong to, then their rows on top. `two_rows` because
     // they are the same drawing with different words on it.
-    let two_rows = |anchor: &StripStrip, rows: [Rect; 2], labels: [&str; 2]| {
+    let two_rows = |anchor: &StripStrip, rows: &[Rect], labels: &[&str]| {
         painter.rect_filled(anchor.panel, 3.0, Color32::from_black_alpha(180));
         for (r, label) in rows.iter().zip(labels) {
             if !r.is_positive() {
@@ -2010,7 +2023,16 @@ pub fn draw(painter: &Painter, rect: Rect, view: &MixerView<'_>) {
     };
     if let Some((at, bay)) = view.fx_menu {
         if let Some(s) = l.strips.get(at.0) {
-            two_rows(s, fx_menu_over(s, bay), ["DELETE FX", "REPLACE FX"]);
+            // Row order is the hit test's: the two lists must stay twins.
+            if view.fx_menu_key {
+                two_rows(
+                    s,
+                    &fx_menu_rows(s, bay, 3),
+                    &["DELETE FX", "REPLACE FX", "SIDECHAIN..."],
+                );
+            } else {
+                two_rows(s, &fx_menu_rows(s, bay, 2), &["DELETE FX", "REPLACE FX"]);
+            }
         }
     }
 }
@@ -2493,6 +2515,16 @@ fn strip(
                 font.clone(),
                 p.engrave,
             );
+            // A keyed bay wears a dot in its corner — the loaded-tab's own
+            // light, so "listening to another channel" reads in the same
+            // colour "loaded" does, and the name loses no width to it.
+            if v.keyed.get(n).copied().unwrap_or(false) {
+                painter.circle_filled(
+                    Pos2::new(cell.right() - 4.0, cell.top() + 4.0),
+                    1.7,
+                    p.lit,
+                );
+            }
         } else {
             // Big enough to be an offer. At the chip's own text size it was a
             // speck in the middle of an empty bay, which reads as dirt on the
@@ -2577,9 +2609,17 @@ fn strip(
 /// clamped inside the panel — the palette's rule: a row that overhung the
 /// neighbour would be a menu whose press can land on someone else's fader.
 fn fx_menu_over(l: &StripStrip, bay: usize) -> [Rect; 2] {
+    let rows = fx_menu_rows(l, bay, 2);
+    [rows[0], rows[1]]
+}
+
+/// The same menu with however many rows it needs — a keyed-capable bay
+/// carries a third. One function for any count, so the two-row and
+/// three-row menus cannot disagree about where a row is.
+fn fx_menu_rows(l: &StripStrip, bay: usize, count: usize) -> Vec<Rect> {
     let panel = l.panel;
     if !panel.is_positive() {
-        return [Rect::NOTHING; 2];
+        return vec![Rect::NOTHING; count];
     }
     let anchor = l
         .inserts
@@ -2590,21 +2630,23 @@ fn fx_menu_over(l: &StripStrip, bay: usize) -> [Rect; 2] {
     // Taller than the chip it serves: the chip's height is a reading size,
     // and these are pressing sizes.
     let gap = 3.0;
+    let n = count.max(1) as f32;
     let h = (anchor.height() * 1.6)
         .clamp(16.0, 28.0)
-        .min((panel.height() - 8.0 - gap).max(2.0) * 0.5);
+        .min((panel.height() - 8.0 - gap * (n - 1.0)).max(2.0) / n);
     let w = (panel.width() - 8.0).max(1.0);
-    let total = h * 2.0 + gap;
+    let total = h * n + gap * (n - 1.0);
     let top = anchor
         .top()
         .clamp(panel.top() + 4.0, (panel.bottom() - 4.0 - total).max(panel.top() + 4.0));
-    let row = |i: f32| {
-        Rect::from_min_size(
-            Pos2::new(panel.left() + 4.0, top + (h + gap) * i),
-            Vec2::new(w, h),
-        )
-    };
-    [row(0.0), row(1.0)]
+    (0..count)
+        .map(|i| {
+            Rect::from_min_size(
+                Pos2::new(panel.left() + 4.0, top + (h + gap) * i as f32),
+                Vec2::new(w, h),
+            )
+        })
+        .collect()
 }
 
 
@@ -3253,6 +3295,7 @@ mod tests {
             // What the app decides: a used general channel can be removed.
             removable: !empty && matches!(strip, Some(Strip::Channel(_))),
             armed: false,
+            keyed: [false; INSERTS * 2],
         }
     }
 
@@ -3275,6 +3318,7 @@ mod tests {
             typing: None,
             naming: None,
             fx_menu: None,
+            fx_menu_key: false,
             dark_mode: true,
             wood: (0x4A, 0x3B, 0x2C),
         }
@@ -4414,6 +4458,54 @@ mod tests {
             hit_test(r, &a_view(), l.strips[3].fader.center()),
             Some(Hit::Fader(Column(3)))
         );
+    }
+
+    /// **A key-capable bay's menu grows a third row, and only then.**
+    ///
+    /// The row is positional under the same painter as the other two, so
+    /// what this pins is that the hit test and the row list stay twins:
+    /// three rows when the view says the bay can take a key, and the third
+    /// press means SIDECHAIN — never a mis-aimed DELETE.
+    #[test]
+    fn the_sidechain_row_appears_only_where_a_key_can_go() {
+        let mut v = a_view();
+        v.fx_menu = Some((Column(0), 1));
+        v.fx_menu_key = true;
+        let r = rect();
+        let l = Layout::new(r, &v);
+        let rows = fx_menu_rows(&l.strips[0], 1, 3);
+        for (i, row) in rows.iter().enumerate() {
+            assert!(row.is_positive(), "row {i} has no area");
+            assert!(
+                l.strips[0].panel.contains(row.min) && l.strips[0].panel.contains(row.max),
+                "row {i} hangs outside its own strip"
+            );
+        }
+        assert_eq!(
+            hit_test(r, &v, rows[2].center()),
+            Some(Hit::FxMenu(Column(0), 1, FxAction::Sidechain))
+        );
+        // The first two rows still mean what they always meant.
+        assert_eq!(
+            hit_test(r, &v, rows[0].center()),
+            Some(Hit::FxMenu(Column(0), 1, FxAction::Delete))
+        );
+        // Without the capability the same menu has no third row: the space
+        // where it would sit is a dismissal like any other stray press.
+        v.fx_menu_key = false;
+        let two = fx_menu_over(&l.strips[0], 1);
+        assert_eq!(
+            hit_test(r, &v, two[0].center()),
+            Some(Hit::FxMenu(Column(0), 1, FxAction::Delete))
+        );
+        let below = Pos2::new(two[1].center().x, two[1].bottom() + two[1].height());
+        if !two[0].contains(below) && !two[1].contains(below) {
+            assert_eq!(
+                hit_test(r, &v, below),
+                Some(Hit::FxMenu(Column(0), 1, FxAction::Dismiss)),
+                "a plain bay's menu answered a third row it does not have"
+            );
+        }
     }
 
     /// **Only a removable channel wears the ×, and it can be pressed.**

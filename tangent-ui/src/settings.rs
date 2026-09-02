@@ -522,6 +522,10 @@ pub struct Settings {
     pub theme_name: String,
     /// Where each channel goes besides the master — see `crate::routing`.
     pub routes: crate::routing::Routes,
+    /// Which channel keys each sidechained insert — see
+    /// [`crate::routing::KeyEdges`]. Desk topology like `routes`, addressed
+    /// by (strip, visible slot) so it rides out seat renumbering.
+    pub insert_keys: crate::routing::KeyEdges,
     /// Wrap a saved project in its own folder. **On by default**, because a
     /// project is a DIRECTORY (document plus `media/`) and saving one into a
     /// folder that already has things in it scatters those parts among them.
@@ -1485,6 +1489,7 @@ impl Default for Settings {
             string_color: Rgb::new(0xC9, 0xC4, 0xBC),
             theme_name: "Default".to_owned(),
             routes: crate::routing::Routes::default(),
+            insert_keys: crate::routing::KeyEdges::default(),
             project_subdir: true,
             prefer_flats: true,
             chord_detection_enabled: true,
@@ -2220,6 +2225,11 @@ impl Settings {
         }
         if let Some(v) = map.shift_remove("routes") {
             s.routes = crate::routing::Routes::from_json(&v);
+        }
+        // Beside the routes it belongs with; absent in every file from
+        // before sidechains existed, and absence is simply no keys.
+        if let Some(v) = map.shift_remove("insert_keys") {
+            s.insert_keys = crate::routing::KeyEdges::from_json(&v);
         }
         if let Some(v) = map.shift_remove("theme_name") {
             if let Some(t) = v.as_str() {
@@ -4217,6 +4227,12 @@ impl Settings {
         if let Some(v) = self.preset_dir.as_ref().filter(|v| !v.is_empty()) {
             map.insert("preset_dir".into(), Value::String(v.clone()));
         }
+        // The sidechain key edges, at the END like every additive key, and
+        // only when somebody has made one — so a desk that never keyed
+        // anything keeps its byte-for-byte shape.
+        if !self.insert_keys.0.is_empty() {
+            map.insert("insert_keys".into(), self.insert_keys.to_json());
+        }
         for (k, v) in &self.extra {
             map.insert(k.clone(), v.clone());
         }
@@ -4535,6 +4551,9 @@ impl Settings {
         self.master_mono = fresh.master_mono;
         self.input_alias = fresh.input_alias.clone();
         self.routes = fresh.routes.clone();
+        // The key edges are desk topology like the routes, and a wiped desk
+        // keeping them would key tracks that no longer exist.
+        self.insert_keys = fresh.insert_keys.clone();
         self.master_gain = fresh.master_gain;
         self.varispeed = fresh.varispeed;
         self.lufs_window = fresh.lufs_window;
@@ -6815,6 +6834,34 @@ mod tests {
             Value::Object(m) => m,
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn insert_keys_round_trip_and_stay_absent_until_one_is_made() {
+        // Absent from an untouched desk, so a file from an install that
+        // never keyed anything keeps its byte-for-byte shape.
+        assert!(!Settings::default().to_map().contains_key("insert_keys"));
+
+        let mut s = Settings::default();
+        s.insert_keys.set(3, 1, Some(7));
+        s.insert_keys.set(35, 5, Some(0)); // the master's second rack
+        let out = s.to_map();
+        // Written at the END, ahead only of the preserved extras — the
+        // additive-key law every new key here follows.
+        assert_eq!(out.keys().last().map(String::as_str), Some("insert_keys"));
+        let back = Settings::from_map(out);
+        assert_eq!(back.insert_keys, s.insert_keys);
+
+        // A file with keys AND an unknown future key keeps both.
+        let s2 = Settings::from_map(map_of(
+            r#"{"insert_keys": [{"strip": 2, "slot": 0, "from": 9},
+                                {"strip": 2, "slot": 0, "from": 4},
+                                {"slot": 0, "from": 1}],
+                "future_key": true}"#,
+        ));
+        assert_eq!(s2.insert_keys.get(2, 0), Some(9), "first edge wins the bay");
+        assert_eq!(s2.insert_keys.0.len(), 1, "the malformed row was skipped");
+        assert!(s2.extra.contains_key("future_key"));
     }
 
     #[test]
