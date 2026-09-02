@@ -253,6 +253,227 @@ pub fn inline_rect(ctx: &egui::Context, id: &str) -> Option<Rect> {
         .map(|(_, r)| r)
 }
 
+// ── how high a surface sits ─────────────────────────────────────────────────
+
+/// **How high a surface sits among this app's OWN windows.**
+///
+/// Every child surface here asks to float, and inside one window level the
+/// order is by most-recent order-front — `makeKeyAndOrderFront:` on macOS,
+/// `SetWindowPos` on Windows, a map request on X11. So whichever surface is
+/// revealed or focused LAST is the one in front, and a window that has to
+/// stay visible for the length of a render cannot win a race it re-runs
+/// every time anything else opens. The export window was losing it to the
+/// band's own "Rendering at full speed…" notice, which is born on the same
+/// frame and reveals on the next.
+///
+/// **The rule is an announcement against a question, and it is a LADDER of
+/// three, not a flag.** The first draft of this was a flag — one surface
+/// said "nothing of ours covers me" and every other surface of the app went
+/// down — and that put a modal dialog opened mid-render UNDERNEATH the
+/// render. This app enforces modality by dropping every main-window event
+/// while a question is open (`App::handle_main_interaction` returns early),
+/// so a question pinned under anything is an invisible question with the app
+/// frozen behind it: strictly worse than the covering the flag was fixing.
+///
+/// So a surface that merely ANNOUNCES — a notice, a menu, a tooltip, a
+/// plugin window left open — may be held down under one that is being
+/// watched. A surface that is ASKING may not, ever. The declaration order
+/// below IS the ladder (the `Ord` derive reads it), and a surface floats
+/// unless some OTHER surface holds a STRICTLY higher rung.
+///
+/// **There is no fourth window level to promote into.** `winit` exposes
+/// exactly three (`AlwaysOnBottom`, `Normal`, `AlwaysOnTop`) and `egui`
+/// passes them straight through, so "put this one higher" is not a thing
+/// that can be said. The ladder is therefore expressed from the other end:
+/// the highest rung in play keeps the floating level and everything below it
+/// is put DOWN to `Normal` while it is up. All three window managers order
+/// strictly by level first and front-to-back only WITHIN a level, so a
+/// sibling revealed later cannot come out in front however loudly it orders
+/// itself forward. It is a rule rather than a race, which is the whole
+/// difference: re-asserting the top surface's own level on every sibling
+/// reveal would be the same race run once more, and `-[NSWindow setLevel:]`
+/// with the level it already has is not documented to reorder anything.
+///
+/// **What it costs.** A demoted surface shares the main window's level, so a
+/// press on the main window can put it behind — which is exactly the case
+/// [`SurfaceSpec::raise`] already exists to answer, and the app already asks
+/// for a raise on that press. Note which way round that falls now: it is the
+/// render that goes down under a question, and the render is the one thing
+/// here nobody is waiting on. On Windows the two levels are `HWND_TOPMOST`
+/// and `HWND_NOTOPMOST` and behave the same way. On X11 the level is
+/// `_NET_WM_STATE_ABOVE`, which a window manager MAY ignore: there a demoted
+/// surface can still land in front, and the `_NET_WM_WINDOW_TYPE` hint is
+/// the only other lever. That is a WM already ignoring the float every
+/// dialog in this app asks for, so it is not a new failure.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SurfaceTier {
+    /// **It announces, or it is merely open.** Notices, menus, tooltips, the
+    /// suite's plugin windows. What everything here was before there was a
+    /// tier, and what everything still is unless it says otherwise — none of
+    /// it is a question, and none of it is worth covering a render for.
+    #[default]
+    Ordinary,
+    /// **Nothing that merely announces may cover it while it is up.**
+    ///
+    /// One customer: the export window, which reports on a render that can
+    /// run for minutes and is worth nothing the moment something lands on
+    /// top of it. It does NOT outrank a question — see [`Self::Asking`],
+    /// which is the whole point of the rung above.
+    Uncovered,
+    /// **It is asking the user something, and it always comes forward.**
+    ///
+    /// The modal dialogs. `App::handle_main_interaction` drops every event
+    /// on the main window while one is open, so this is the one surface in
+    /// the app that must never be behind anything: a question the user
+    /// cannot see is an app that has stopped responding for no visible
+    /// reason, and this file has fixed that twice already by other means.
+    /// A render is worth protecting from an announcement and is not worth
+    /// protecting from a question.
+    Asking,
+}
+
+impl SurfaceTier {
+    /// The inline equivalent. A layer has no window level, so the ladder is
+    /// egui's own paint order, which — unlike a window level — is absolute:
+    /// a later `Area` cannot get in front of one in a higher order.
+    ///
+    /// **Only the RENDER moves inline, and it moves both ways.** A question
+    /// has to stay in `Foreground`, the band every menu and dialog here has
+    /// always used, because its own furniture is drawn relative to it: a
+    /// `ComboBox` opens its list in `Foreground` and `on_hover_text` draws
+    /// in `Tooltip`, so a dialog promoted above those is a dialog whose
+    /// dropdowns open behind it and whose hover text never appears. About's
+    /// "Click to copy the address" is exactly that, and About is modal.
+    ///
+    /// So the render takes `Tooltip` — one band above every announcement,
+    /// which is all it needs — and STANDS DOWN to `Middle` when a question
+    /// is up, which is the same ladder read from the other end. Middle is
+    /// where the modal scrim already lives; the render lands above the scrim
+    /// rather than under it, on purpose, because dimming the one window that
+    /// says the app is busy is the invisible-progress bug again.
+    ///
+    /// `by_others` is the highest rung anybody ELSE is standing on — the
+    /// same answer [`level_for`] is given, so the two paths cannot disagree
+    /// about who is on top.
+    fn inline_order(self, asked: egui::Order, by_others: Option<Self>) -> egui::Order {
+        match self {
+            Self::Ordinary | Self::Asking => asked,
+            Self::Uncovered if by_others.is_some_and(|other| other > self) => {
+                egui::Order::Middle
+            }
+            Self::Uncovered => egui::Order::Tooltip,
+        }
+    }
+}
+
+fn tier_claim_id() -> egui::Id {
+    egui::Id::new("surface-tier-claim")
+}
+
+/// The highest rung any of this app's surfaces is standing on, and who is
+/// standing on it.
+///
+/// **One slot, holding the MAXIMUM.** A surface only ever needs to know
+/// whether somebody ELSE outranks it, and the slot always holds the highest
+/// claim in play, so "the slot is somebody else's" answers it. The case
+/// that looks lost — the slot is mine, and I cannot see who is second —
+/// cannot matter: anybody above me would have taken the slot from me.
+///
+/// **Accepted one pass stale, on purpose.** The surfaces of a frame are
+/// drawn in whatever order the app happens to call them, and the export
+/// window is drawn LAST — after the dialogs, after the notice. A claim good
+/// only on the pass it was written would never be seen by the very surfaces
+/// it exists to rank against. One frame late is the right answer instead:
+/// a claim appears a frame after the surface opens and lapses a frame after
+/// it closes, and every surface that makes one repaints continuously.
+fn standing_claim(ctx: &egui::Context, pass: u64) -> Option<(SurfaceTier, egui::Id)> {
+    ctx.memory(|m| m.data.get_temp::<(u64, SurfaceTier, egui::Id)>(tier_claim_id()))
+        .filter(|(p, _, _)| pass.saturating_sub(*p) <= 1)
+        .map(|(_, tier, who)| (tier, who))
+}
+
+/// **The window level a surface asks for**, given its own rung and the
+/// highest rung anybody ELSE is standing on. See [`SurfaceTier`].
+///
+/// A pure table so the decision can be read and tested without a window
+/// manager: everything about the ladder that can be checked headlessly is
+/// checked here, and the ordering it produces on a real screen is not
+/// something a unit test may claim to have proved.
+///
+/// Strictly higher, never equal: two surfaces on the same rung must not put
+/// each other down, and the app is built so there is only ever one of each
+/// rung above `Ordinary` — one export window, one dialog slot. `surface`
+/// asserts that rather than trusting it.
+fn level_for(
+    on_top: bool,
+    tier: SurfaceTier,
+    by_others: Option<SurfaceTier>,
+) -> egui::WindowLevel {
+    let outranked = by_others.is_some_and(|other| other > tier);
+    if on_top && !outranked {
+        egui::WindowLevel::AlwaysOnTop
+    } else {
+        egui::WindowLevel::Normal
+    }
+}
+
+/// **When a surface goes on screen, and which pass counts as its reveal.**
+///
+/// Returns `(visible, revealing)`. A window is created VISIBLE unless told
+/// otherwise, and on Windows a window that exists before anything has been
+/// drawn into it shows one frame of undefined back buffer — white, in
+/// practice. So everything here is born hidden and shown a pass later, which
+/// is what eframe does for the main window (egui#3631, "to fix white flash
+/// on startup") and what a child viewport gets none of.
+///
+/// `born_visible` is the exemption, and it moves the REVEAL forward with the
+/// showing rather than dropping it: the level and the focus are creation-time
+/// attributes applied to a window the manager has not mapped yet, they do not
+/// survive being shown on X11, and a surface that skipped its reveal would
+/// come up unable to hear the Escape that closes it. See
+/// [`SurfaceSpec::born_visible`] for why anything would want to pay the flash.
+///
+/// A pure table, because the alternative is proving it through a window
+/// manager that no headless test can ask.
+fn birth(born_visible: bool, existing: bool, second_pass: bool) -> (bool, bool) {
+    let revealing = if born_visible {
+        !existing
+    } else {
+        existing && second_pass
+    };
+    (existing || born_visible, revealing)
+}
+
+/// **A window sized as a share of the screen it opens on.**
+///
+/// The rule `app::main_width` uses for the main window, said once so the
+/// next window to want it does not open-code it again: a percentage of the
+/// display, floored so it stays usable on a laptop, capped so it does not
+/// eat a 6K, and finally held inside the screen itself — because the floor
+/// can outgrow a small display, and a window bigger than the screen it opens
+/// on is the bug the 5.0 demo session found in the main window.
+///
+/// A fixed point count is a percentage of nothing in particular: it is
+/// comfortable on the display the app was written on and a postage stamp
+/// everywhere else. `monitor` is `None` on the frames before anything has
+/// been measured, and the floor is the honest answer there — a guess about
+/// a screen nobody has looked at is worse than the smallest size the layout
+/// is designed for.
+pub fn share_of_screen(monitor: Option<Vec2>, share: Vec2, floor: Vec2, ceiling: Vec2) -> Vec2 {
+    debug_assert!(
+        floor.x <= ceiling.x && floor.y <= ceiling.y,
+        "a floor {floor:?} above the ceiling {ceiling:?} is not a range"
+    );
+    let Some(m) = monitor.filter(|m| m.x > 0.0 && m.y > 0.0) else {
+        return floor;
+    };
+    let want = Vec2::new(
+        (m.x * share.x).clamp(floor.x, ceiling.x),
+        (m.y * share.y).clamp(floor.y, ceiling.y),
+    );
+    crate::settings::clamp_size_to_monitor(want, Some(m))
+}
+
 /// A pane that is an OS window on the desktop and a floating layer in a plugin.
 ///
 /// The fields are exactly the union of what the real callers set on a
@@ -314,6 +535,35 @@ pub struct SurfaceSpec<'a> {
     /// the desktop window borderless and draws the same bar on both paths,
     /// so they cannot drift; `None` is every surface that was here before.
     pub chrome: Option<Chrome>,
+    /// **How high this one sits among the app's own surfaces** — see
+    /// [`SurfaceTier`]. Distinct from `on_top`, which is a yes/no about
+    /// floating at all: this is which of two floating surfaces wins, and
+    /// `on_top: false` still beats any tier.
+    pub tier: SurfaceTier,
+    /// **Show the window on the pass it is created**, rather than on the
+    /// next one.
+    ///
+    /// Every other surface here is born hidden and revealed a pass later,
+    /// and the comment in `surface` says why: on Windows a window that
+    /// exists before anything has been drawn into it shows one frame of
+    /// undefined back buffer, white in practice, and eframe dodges exactly
+    /// that for the main window (egui#3631, "to fix white flash on
+    /// startup"). A menu that flashes white on the way up is worse than a
+    /// menu one frame late, so late is the default and stays the default.
+    ///
+    /// **The exemption is a surface that has to be on screen before the UI
+    /// thread stops.** A busy overlay put up in front of a call that blocks
+    /// — a device scan, a project load — never gets its second pass: the
+    /// block happens inside the same frame, the reveal is queued behind it,
+    /// and the one thing that was supposed to explain the freeze is the one
+    /// thing that never appeared. There a frame of undefined back buffer is
+    /// not the failure; a frozen app with nothing on screen is. So the
+    /// surface that has to beat a block says so here, and pays the flash.
+    ///
+    /// It costs the surface nothing else: `surface` treats the birth pass as
+    /// the reveal, so the level and the focus are still asked for once the
+    /// window is real, exactly as they are a pass later for everything else.
+    pub born_visible: bool,
 }
 
 impl Default for SurfaceSpec<'_> {
@@ -333,6 +583,8 @@ impl Default for SurfaceSpec<'_> {
             order: egui::Order::Foreground,
             window_type: None,
             chrome: None,
+            tier: SurfaceTier::Ordinary,
+            born_visible: false,
         }
     }
 }
@@ -394,6 +646,43 @@ pub fn surface(
     let mut report = SurfaceReport::default();
     let mut body_wants_close = false;
     let chrome_id = egui::Id::new((spec.id, "chrome"));
+    // **The tier, settled once for both paths.** Read before anything is
+    // drawn, because the answer decides the level this surface is BORN at as
+    // well as the one it is told to hold — and because the claim has to be
+    // stamped whether this surface ends up a window or a layer, or a plugin
+    // editor would leave a stale claim holding every desktop dialog down.
+    let pass = ctx.cumulative_pass_nr();
+    let me = egui::Id::new(spec.id);
+    let standing = standing_claim(ctx, pass);
+    let by_others = standing.filter(|(_, who)| *who != me).map(|(t, _)| t);
+    // **Two surfaces on one rung is the race this exists to end.** The ladder
+    // orders DIFFERENT rungs; equal ones leave both floating and hand the
+    // answer back to whoever reveals last. The app is built so it cannot
+    // happen — one export window, one dialog slot — and this is where that is
+    // checked rather than assumed, because the failure it would cause is
+    // invisible on a screenshot and only shows up as a window that is
+    // sometimes in front.
+    debug_assert!(
+        spec.tier == SurfaceTier::Ordinary || by_others != Some(spec.tier),
+        "two surfaces at {:?} at once: {:?} and {me:?} ({})",
+        spec.tier,
+        standing.map(|(_, who)| who),
+        spec.id
+    );
+    let want_level = level_for(spec.on_top, spec.tier, by_others);
+    // Claimed only while the claim is worth anything, and only by whoever is
+    // highest. A surface that has stood down for the OS's file panel
+    // (`on_top: false`) is not above anything, and holding the rest of the
+    // app at `Normal` on its behalf would cost them their float for no one's
+    // benefit. The slot keeps the maximum: a lower rung must not overwrite a
+    // higher one that is still up, or a modal dialog would lose its standing
+    // to the render window it is asking in front of.
+    if spec.tier > SurfaceTier::Ordinary
+        && want_level == egui::WindowLevel::AlwaysOnTop
+        && standing.is_none_or(|(t, who)| who == me || spec.tier > t)
+    {
+        ctx.memory_mut(|m| m.data.insert_temp(tier_claim_id(), (pass, spec.tier, me)));
+    }
     // **`size` is the BODY's size.** Every caller designed its panel to the
     // points it asked for; a bar of ours on top must be added to the
     // window, not taken out of the panel — taken out, every plugin window
@@ -421,7 +710,6 @@ pub fn surface(
         // Consecutive calls differ by exactly one pass — not drawing a surface
         // is what destroys it — so the gap is a reliable "this is new".
         let life = egui::Id::new(("surface-life", spec.id));
-        let pass = ctx.cumulative_pass_nr();
         // `(the pass it was born on, the last pass it was drawn on)`. Drawn on
         // the previous pass means the window is still there; a gap means this
         // one is brand new, because not drawing a surface is what destroys it.
@@ -431,8 +719,10 @@ pub fn surface(
         let born = alive.map_or(pass, |(b, _)| b);
         ctx.memory_mut(|m| m.data.insert_temp(life, (born, pass)));
         let existing = alive.is_some();
-        // The one pass on which it goes from hidden to shown.
-        let revealing = existing && pass == born + 1;
+        // Whether it is on screen yet, and whether this is the pass that puts
+        // it there — see [`birth`]. Either way the reveal happens exactly
+        // once, and it is what the level and the focus below hang off.
+        let (shown, revealing) = birth(spec.born_visible, existing, pass == born + 1);
         if !existing {
             // The reveal is a second pass, and a menu sitting still would not
             // otherwise ask for one.
@@ -443,13 +733,9 @@ pub fn surface(
             // A bar of ours under the OS's would be two title bars.
             .with_decorations(spec.decorated && spec.chrome.is_none())
             .with_resizable(spec.resizable)
-            .with_window_level(if spec.on_top {
-                egui::WindowLevel::AlwaysOnTop
-            } else {
-                egui::WindowLevel::Normal
-            })
+            .with_window_level(want_level)
             .with_active(spec.takes_focus)
-            .with_visible(existing)
+            .with_visible(shown)
             .with_inner_size(outer(spec.size))
             .with_min_inner_size(outer(spec.min_size));
         if !spec.resizable {
@@ -493,10 +779,22 @@ pub fn surface(
                 // under the Setup window it was reporting on, and under the
                 // desktop's own panels. The owner saw a device-change message
                 // appear below the panel he had just changed the device in.
-                if spec.on_top && (revealing || spec.raise) {
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-                        egui::WindowLevel::AlwaysOnTop,
-                    ));
+                //
+                // **And asked for again whenever the answer CHANGES**, which
+                // is what a tier needs: a surface that was floating and has
+                // been put down under a [`SurfaceTier::Uncovered`] claim must
+                // be told so on a frame that is neither its reveal nor a
+                // raise. Remembering the last level sent keeps that to one
+                // command per transition rather than one every frame.
+                let level_id = egui::Id::new((spec.id, "surface-level"));
+                let sent = ui
+                    .ctx()
+                    .memory(|m| m.data.get_temp::<egui::WindowLevel>(level_id));
+                if revealing || spec.raise || sent != Some(want_level) {
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::WindowLevel(want_level));
+                    ui.ctx()
+                        .memory_mut(|m| m.data.insert_temp(level_id, want_level));
                 }
                 // **Focus, separately, and only for surfaces that want it.**
                 // `with_active` is creation-time and an invisible window is not
@@ -549,7 +847,6 @@ pub fn surface(
     let screen = ctx.content_rect();
     // What the bar and the grip did to this layer on earlier frames — only
     // a chrome surface has either, so only a chrome surface remembers.
-    let pass = ctx.cumulative_pass_nr();
     let state_id = egui::Id::new((spec.id, "inline-chrome"));
     let mut state = spec.chrome.map(|_| {
         ctx.memory(|m| m.data.get_temp::<InlineChromeState>(state_id))
@@ -590,6 +887,14 @@ pub fn surface(
     if spec.modal {
         // Dim the app behind it. Without this the piano behind a plugin dialog
         // looks live when it is not.
+        //
+        // **`Middle`, which is also where a stood-down render lands** — see
+        // [`SurfaceTier::inline_order`] — and the render is drawn after the
+        // dialog, so it comes out ABOVE the dim rather than under it. That is
+        // deliberate: a render is not something the question is waiting on,
+        // and dimming the one window that says the app is busy is the
+        // invisible-progress bug over again. The question itself is above
+        // both.
         egui::Area::new(egui::Id::new((spec.id, "scrim")))
             .order(egui::Order::Middle)
             .fixed_pos(screen.min)
@@ -603,10 +908,43 @@ pub fn surface(
     }
 
     egui::Area::new(egui::Id::new(spec.id))
-        .order(spec.order)
+        // The ladder, inline: a layer's height is its paint order, and
+        // `Order` is absolute in a way a window level is not. See
+        // [`SurfaceTier::inline_order`].
+        .order(spec.tier.inline_order(spec.order, by_others))
         .fixed_pos(rect.min)
         .show(ctx, |ui| {
             ui.set_clip_rect(rect);
+            // **A layer eats what lands on it, modal or not.**
+            //
+            // On the desktop this is free: the surface is another OS window
+            // and a press on it never reaches the main window at all. Inline
+            // it has to be said, and saying it is not the same as being
+            // modal — the export window dims nothing and blocks nothing, and
+            // a press on its face still must not play the piano behind it.
+            // The scrim used to be the only thing doing this, so a surface
+            // that stopped being modal (correctly: it reports, it does not
+            // ask) stopped swallowing too.
+            //
+            // An `Area` on its own does not do it. It registers one widget
+            // over `state.size`, which is the size the CONTENT claimed last
+            // pass — and a body that only paints (the export waveform is
+            // exactly that) claims nothing, so the layer is a hole. This
+            // allocation claims the whole surface, which both blocks and
+            // gives the `Area` its true size.
+            //
+            // Allocated FIRST so it is the bottom of its own layer: egui
+            // reads a big click-and-drag rect with smaller widgets over it
+            // as a background, and hands presses to the widgets. The body's
+            // own buttons are registered after this and keep working.
+            //
+            // It stops everything that goes through egui's hit test, which
+            // is every widget in the app and the main background's own
+            // `Response`. It does NOT stop the handlers that read
+            // `i.pointer` straight off the input — nothing in a layer can,
+            // and the scrim never did either. Those ask `inline_rect` where
+            // a surface is; see it, and `dialogs::pointer_over_dialog`.
+            ui.allocate_rect(rect, egui::Sense::click_and_drag());
             ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
                 if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                     report.close = true;
@@ -909,6 +1247,654 @@ mod tests {
             },
         );
         assert!(report.close, "the body asked to close and was ignored");
+    }
+
+
+    // ── how high a surface sits ─────────────────────────────────────────────
+
+    /// **The ladder's whole rule, as a table.**
+    ///
+    /// A surface floats unless some OTHER surface is standing on a STRICTLY
+    /// higher rung. Three ways to get it wrong, and all three have been in
+    /// this file: leave a sibling floating over the render (the notice
+    /// landing on the export waveform), put the watched surface down under
+    /// its own claim, and — the one that made this a ladder rather than a
+    /// flag — put a QUESTION down under the render, which is an invisible
+    /// question with the app frozen behind it.
+    ///
+    /// A unit test on a level is NOT a proof that the windows stack that way
+    /// on a screen — the window manager has the last word and no headless
+    /// test can ask it. What it does prove is that the right level is asked
+    /// for in every combination, which is the half of this that lives in
+    /// this crate. The other half is the by-hand list on
+    /// `dialogs::show_export_progress`.
+    #[test]
+    fn the_ladder_puts_down_only_what_is_outranked() {
+        use SurfaceTier::{Asking, Ordinary, Uncovered};
+        use egui::WindowLevel::{AlwaysOnTop, Normal};
+        // The declaration order IS the ladder — `level_for` compares the
+        // variants directly — so a variant inserted in the wrong place would
+        // silently reorder the whole app.
+        assert!(Ordinary < Uncovered && Uncovered < Asking, "the ladder is out of order");
+        // Nobody standing anywhere: every floating surface floats, exactly as
+        // before there was a tier at all.
+        for tier in [Ordinary, Uncovered, Asking] {
+            assert_eq!(level_for(true, tier, None), AlwaysOnTop, "{tier:?}");
+        }
+        // An announcement goes down under a render...
+        assert_eq!(level_for(true, Ordinary, Some(Uncovered)), Normal);
+        // ...and under a question.
+        assert_eq!(level_for(true, Ordinary, Some(Asking)), Normal);
+        // **The render goes down under a question.** This is the fix: the
+        // first draft demoted everything but the render, and a modal Setup
+        // opened mid-export was pinned underneath it with no way up while
+        // the app dropped every event waiting on it.
+        assert_eq!(
+            level_for(true, Uncovered, Some(Asking)),
+            Normal,
+            "a question was left underneath the render"
+        );
+        // A question is never put down by anything. There is no rung above
+        // it and there must not be.
+        assert_eq!(level_for(true, Asking, Some(Uncovered)), AlwaysOnTop);
+        assert_eq!(level_for(true, Asking, Some(Ordinary)), AlwaysOnTop);
+        // Nothing is put down by its own rung: two on one rung is a state
+        // the app does not reach (see the `debug_assert` in `surface`), and
+        // if it ever did, demoting both would be the worst possible answer.
+        for tier in [Ordinary, Uncovered, Asking] {
+            assert_eq!(level_for(true, tier, Some(tier)), AlwaysOnTop, "{tier:?}");
+        }
+        // A render still outranks the announcements while it is up.
+        assert_eq!(level_for(true, Uncovered, Some(Ordinary)), AlwaysOnTop);
+        // `on_top: false` beats every rung. It is the one moment a surface
+        // must NOT float — the OS's own file panel is up, parented to the
+        // main window, and nothing else may get in front of it.
+        for tier in [Ordinary, Uncovered, Asking] {
+            for other in [None, Some(Ordinary), Some(Uncovered), Some(Asking)] {
+                assert_eq!(
+                    level_for(false, tier, other),
+                    Normal,
+                    "{tier:?} floated over a native panel (others: {other:?})"
+                );
+            }
+        }
+        // **Inline the ladder is a paint order, and only the render moves.**
+        // A question stays in the band its own `ComboBox` lists and its own
+        // hover text are drawn in — promote it and its dropdowns open behind
+        // it. See `SurfaceTier::inline_order`.
+        let fg = egui::Order::Foreground;
+        assert_eq!(Asking.inline_order(fg, None), fg, "a question left its own band");
+        assert_eq!(Asking.inline_order(fg, Some(Uncovered)), fg);
+        assert_eq!(Ordinary.inline_order(fg, None), fg);
+        assert_eq!(Ordinary.inline_order(fg, Some(Asking)), fg);
+        // The render goes one band up, over every announcement...
+        assert_eq!(Uncovered.inline_order(fg, None), egui::Order::Tooltip);
+        assert_eq!(Uncovered.inline_order(fg, Some(Ordinary)), egui::Order::Tooltip);
+        // ...and one band DOWN when a question is up, which is how a
+        // question drawn earlier in the frame still ends up in front of it.
+        assert_eq!(
+            Uncovered.inline_order(fg, Some(Asking)),
+            egui::Order::Middle,
+            "the render stayed over a question inline"
+        );
+        assert!(
+            egui::Order::Middle < fg && fg < egui::Order::Tooltip,
+            "the inline ladder does not actually stack"
+        );
+        // Every band it uses can still be clicked in — a question drawn in a
+        // band that eats its own presses is the frozen app all over again.
+        for order in [egui::Order::Middle, fg, egui::Order::Tooltip] {
+            assert!(order.allow_interaction(), "{order:?} cannot be interacted with");
+        }
+        // An ordinary surface keeps whatever order it asked for — the
+        // submenu sits above the menu by asking, and the ladder must not
+        // flatten that.
+        assert_eq!(
+            Ordinary.inline_order(egui::Order::Middle, None),
+            egui::Order::Middle
+        );
+    }
+
+    /// Run one `surface` on the desktop path and report the window levels it
+    /// asked the host for on that frame.
+    ///
+    /// `Caps::DESKTOP` takes the window path; with no viewport renderer
+    /// attached egui runs the body inline and the commands land on the
+    /// root's output, which is exactly the list eframe would hand to winit.
+    fn levels_asked_for(ctx: &egui::Context, screen: Rect, spec: &SurfaceSpec<'_>) -> Vec<egui::WindowLevel> {
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| {
+                surface(ctx, Caps::DESKTOP, spec, &mut |_ui, _close| {});
+            },
+        );
+        out.viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|vp| {
+                vp.commands
+                    .iter()
+                    .filter_map(|c| match c {
+                        egui::ViewportCommand::WindowLevel(l) => Some(*l),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// **The claim reaches the sibling, and it lapses.**
+    ///
+    /// The end-to-end half: run `surface` the way the app does and read the
+    /// level it actually asks the host for. The order matters — the app
+    /// draws its dialogs and its notice BEFORE the export window, so a
+    /// sibling reads a claim written on the previous pass, which is why
+    /// `standing_claim` accepts one that is a pass old.
+    ///
+    /// It has to lapse too, or an export that finished would hold every
+    /// dialog in the app at the ordinary level for the rest of the session.
+    #[test]
+    fn a_no_cover_claim_reaches_the_next_frames_siblings_and_then_lapses() {
+        use egui::WindowLevel::{AlwaysOnTop, Normal};
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0));
+        let top = SurfaceSpec {
+            id: "test-uncovered",
+            size: Vec2::new(600.0, 400.0),
+            tier: SurfaceTier::Uncovered,
+            ..Default::default()
+        };
+        let sibling = SurfaceSpec {
+            id: "test-sibling",
+            size: Vec2::new(300.0, 200.0),
+            ..Default::default()
+        };
+        let run = |spec: &SurfaceSpec<'_>| levels_asked_for(&ctx, screen, spec);
+
+        // The claimant asks to float, and stamps the claim.
+        assert_eq!(run(&top), vec![AlwaysOnTop], "the claimant did not float");
+        // The very next frame, a sibling that asked to float is put down.
+        // This is the notice that used to land on the waveform.
+        assert_eq!(
+            run(&sibling),
+            vec![Normal],
+            "a sibling still floated over a surface nothing may cover"
+        );
+        // And with the claimant gone a frame, it comes back up on its own.
+        assert_eq!(
+            run(&sibling),
+            vec![AlwaysOnTop],
+            "the claim outlived the surface that made it"
+        );
+    }
+
+    /// The level a surface last asked the host to put it at.
+    ///
+    /// `surface` records every level it sends so it can send one only on a
+    /// change; reading that back is how a test asks a PARTICULAR surface
+    /// what it wanted, when every viewport command in a headless run lands
+    /// on the one root output with no name on it.
+    fn level_held(ctx: &egui::Context, id: &str) -> Option<egui::WindowLevel> {
+        ctx.memory(|m| {
+            m.data
+                .get_temp::<egui::WindowLevel>(egui::Id::new((id, "surface-level")))
+        })
+    }
+
+    /// **A question opened mid-render is reachable and on top.**
+    ///
+    /// The blocker this ladder exists for, run end to end in the order the
+    /// app draws things: the dialogs first, the notice next, the export
+    /// window last. Setup opens while the render is running and must come
+    /// out in FRONT of it — the app drops every main-window event while a
+    /// modal dialog is open, so a Setup window pinned under the waveform is
+    /// an app frozen with nothing on screen that can answer it.
+    ///
+    /// And it must keep [`SurfaceSpec::raise`], which is the app's answer to
+    /// a press on the main window while a question is waiting. A demoted
+    /// surface would still ask for `Focus`, but it would be asking for it at
+    /// the ordinary level, under every floating sibling — the raise would
+    /// look like it had failed.
+    #[test]
+    fn a_question_opened_mid_render_comes_out_in_front_of_it() {
+        use egui::WindowLevel::{AlwaysOnTop, Normal};
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0));
+        let render = SurfaceSpec {
+            id: "test-render",
+            size: Vec2::new(600.0, 400.0),
+            tier: SurfaceTier::Uncovered,
+            ..Default::default()
+        };
+        let notice = SurfaceSpec {
+            id: "test-notice",
+            size: Vec2::new(300.0, 200.0),
+            takes_focus: false,
+            ..Default::default()
+        };
+        let setup = SurfaceSpec {
+            id: "test-setup",
+            size: Vec2::new(500.0, 400.0),
+            tier: SurfaceTier::Asking,
+            ..Default::default()
+        };
+        // One frame of the app: the question, then the announcement, then
+        // the render — the order `App::update` calls them in, which is the
+        // order that makes a claim one pass old the only one a sibling can
+        // see.
+        let frame = |dialog: Option<&SurfaceSpec<'_>>, msg: bool| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| {
+                    if let Some(d) = dialog {
+                        surface(ctx, Caps::DESKTOP, d, &mut |_ui, _close| {});
+                    }
+                    if msg {
+                        surface(ctx, Caps::DESKTOP, &notice, &mut |_ui, _close| {});
+                    }
+                    surface(ctx, Caps::DESKTOP, &render, &mut |_ui, _close| {});
+                },
+            )
+        };
+        // The render alone: it floats, and it stamps the claim.
+        frame(None, false);
+        assert_eq!(level_held(&ctx, "test-render"), Some(AlwaysOnTop));
+        // A message arrives. It is an announcement, so it goes down and the
+        // render stays up. This is the rule working as designed — and the
+        // notice is not destroyed by losing, it is merely underneath.
+        frame(None, true);
+        assert_eq!(
+            level_held(&ctx, "test-notice"),
+            Some(Normal),
+            "an announcement was left floating over the render"
+        );
+        assert_eq!(level_held(&ctx, "test-render"), Some(AlwaysOnTop));
+        // Setup opens. On the pass it is born it reads a claim written by
+        // the render, and the ladder — not the reveal order — says it wins.
+        // Held for several passes, because a rule that only holds on the
+        // frame something opened is the race this replaced.
+        for pass in 0..4 {
+            frame(Some(&setup), true);
+            assert_eq!(
+                level_held(&ctx, "test-setup"),
+                Some(AlwaysOnTop),
+                "pass {pass}: the question did not float"
+            );
+            assert_eq!(
+                level_held(&ctx, "test-render"),
+                Some(Normal),
+                "pass {pass}: the render stayed on top of a question"
+            );
+            assert_eq!(level_held(&ctx, "test-notice"), Some(Normal), "pass {pass}");
+        }
+        // A press on the main window asks the question to come forward, and
+        // it is still asking at the FLOATING level — not demoted, which is
+        // what would make the raise look like it had done nothing.
+        let raised = SurfaceSpec { raise: true, ..setup };
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| {
+                surface(ctx, Caps::DESKTOP, &raised, &mut |_ui, _close| {});
+                surface(ctx, Caps::DESKTOP, &render, &mut |_ui, _close| {});
+            },
+        );
+        let cmds = &out
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .expect("no root viewport")
+            .commands;
+        assert_eq!(
+            level_held(&ctx, "test-setup"),
+            Some(AlwaysOnTop),
+            "a raised question asked for the ordinary level"
+        );
+        assert!(
+            cmds.iter().any(|c| matches!(c, egui::ViewportCommand::Focus)),
+            "a raised question never asked for the focus"
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, egui::ViewportCommand::WindowLevel(AlwaysOnTop))),
+            "a raised question never re-asserted its level"
+        );
+        // And when the question closes, the render comes back up by itself.
+        //
+        // **It takes three frames, and that is the documented cost.** The
+        // question's claim stays good for one pass after it stops being
+        // written (`standing_claim`); on the pass it finally goes stale the
+        // announcement is drawn BEFORE the render, so for exactly one frame
+        // it reads no claim at all and floats; the render restamps at the
+        // end of that same frame and the announcement is back down on the
+        // next. One frame at the 30 Hz this window repaints at, and the
+        // alternative — every surface re-reading the claim after the frame
+        // is drawn — is a second pass for every frame of every render.
+        for _ in 0..3 {
+            frame(None, true);
+        }
+        assert_eq!(
+            level_held(&ctx, "test-render"),
+            Some(AlwaysOnTop),
+            "the render never recovered from the question"
+        );
+        assert_eq!(
+            level_held(&ctx, "test-notice"),
+            Some(Normal),
+            "the announcement climbed back over the render"
+        );
+    }
+
+    /// **The same answer in the canvas: a question is on top, the render is
+    /// over the announcement, and nothing falls through.**
+    ///
+    /// The plugin path has no window levels at all — a surface is an `Area`
+    /// and its height is its paint order — so the ladder has to be checked
+    /// separately here. The order the app draws them in is the trap: the
+    /// dialog goes first and the export window last, so "whoever is drawn
+    /// last is on top" gets exactly the wrong answer, which is the bug this
+    /// is pinning.
+    #[test]
+    fn the_ladder_stacks_the_same_way_in_the_canvas() {
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 700.0));
+        let render = SurfaceSpec {
+            id: "inline-render",
+            size: Vec2::new(600.0, 400.0),
+            tier: SurfaceTier::Uncovered,
+            ..Default::default()
+        };
+        let notice = SurfaceSpec {
+            id: "inline-notice",
+            size: Vec2::new(400.0, 300.0),
+            takes_focus: false,
+            ..Default::default()
+        };
+        let question = SurfaceSpec {
+            id: "inline-question",
+            size: Vec2::new(500.0, 350.0),
+            tier: SurfaceTier::Asking,
+            modal: true,
+            ..Default::default()
+        };
+        // All three are centred, so the middle of the canvas is inside all
+        // of them and `layer_id_at` there names whichever is on top.
+        let ctx = egui::Context::default();
+        let mut top = None;
+        let frame = |ctx: &egui::Context, ask: bool, top: &mut Option<egui::LayerId>| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| {
+                    // `App::update`'s order: the dialog, then the message,
+                    // then the export window.
+                    if ask {
+                        surface(ctx, Caps::PLUGIN, &question, &mut |_ui, _c| {});
+                    }
+                    surface(ctx, Caps::PLUGIN, &notice, &mut |_ui, _c| {});
+                    surface(ctx, Caps::PLUGIN, &render, &mut |_ui, _c| {});
+                    *top = ctx.layer_id_at(screen.center());
+                },
+            );
+        };
+        // Two passes each way: the claim is read a pass after it is written.
+        for _ in 0..2 {
+            frame(&ctx, false, &mut top);
+        }
+        assert_eq!(
+            top.map(|l| l.id),
+            Some(egui::Id::new(render.id)),
+            "an announcement covered the render in the canvas"
+        );
+        for _ in 0..3 {
+            frame(&ctx, true, &mut top);
+        }
+        assert_eq!(
+            top.map(|l| l.id),
+            Some(egui::Id::new(question.id)),
+            "the render stayed on top of a question in the canvas"
+        );
+        // And the render is back on top once the question goes — three
+        // passes, the same settle the desktop path documents.
+        for _ in 0..3 {
+            frame(&ctx, false, &mut top);
+        }
+        assert_eq!(
+            top.map(|l| l.id),
+            Some(egui::Id::new(render.id)),
+            "the render never came back after the question"
+        );
+    }
+
+    /// **Two surfaces on one rung is caught, not tolerated.**
+    ///
+    /// The ladder orders DIFFERENT rungs. Two on the same one leave each
+    /// other floating and hand the answer back to whoever reveals last,
+    /// which is the race the whole thing replaced. The app is built so it
+    /// cannot happen — one export window, one dialog slot — and `surface`
+    /// says so out loud rather than degrading quietly into the old
+    /// behaviour.
+    #[test]
+    #[should_panic(expected = "two surfaces at Uncovered at once")]
+    fn two_surfaces_on_one_rung_is_caught() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 700.0));
+        let one = SurfaceSpec {
+            id: "rung-one",
+            size: Vec2::new(300.0, 200.0),
+            tier: SurfaceTier::Uncovered,
+            ..Default::default()
+        };
+        let two = SurfaceSpec {
+            id: "rung-two",
+            tier: SurfaceTier::Uncovered,
+            ..one
+        };
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| {
+                surface(ctx, Caps::PLUGIN, &one, &mut |_ui, _c| {});
+                surface(ctx, Caps::PLUGIN, &two, &mut |_ui, _c| {});
+            },
+        );
+    }
+
+    /// **A surface that has to beat a blocking call is born visible.**
+    ///
+    /// Everything else here is born hidden and revealed a pass later, to
+    /// dodge the white flash of an undrawn back buffer. A busy overlay put
+    /// up in front of a call that blocks the UI thread never GETS that
+    /// second pass — the block happens inside the same frame — so it needs
+    /// the window on screen from the first. See `SurfaceSpec::born_visible`.
+    ///
+    /// Born visible must still be a real reveal: the level and the focus are
+    /// creation-time attributes applied to a window the manager has not
+    /// mapped yet, and on X11 they do not survive being shown, so they have
+    /// to be asked for again once the window is real. That is what
+    /// `revealing` carries, and moving the reveal forward must not drop it.
+    #[test]
+    fn a_surface_that_cannot_wait_a_pass_is_born_visible_and_still_reveals() {
+        // The default, unchanged: hidden on the pass it is created, revealed
+        // on the next, and never again.
+        assert_eq!(birth(false, false, false), (false, false), "born visible by default");
+        assert_eq!(birth(false, true, true), (true, true), "the second pass is the reveal");
+        assert_eq!(birth(false, true, false), (true, false), "revealed twice");
+        // The escape: on screen from the first pass, and that pass IS the
+        // reveal — the level and the focus asked for there rather than on a
+        // pass that a blocking call means will never come.
+        assert_eq!(birth(true, false, false), (true, true), "the overlay was born hidden");
+        // ...and it is still only once. A surface that asked for the level
+        // and the focus every frame would fight the user for the focus.
+        assert_eq!(birth(true, true, false), (true, false), "revealed every frame");
+        assert_eq!(birth(true, true, true), (true, false), "revealed twice");
+
+        // End to end: the reveal work really is done on the first pass.
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0));
+        let first_pass_commands = |spec: &SurfaceSpec<'_>| {
+            let ctx = egui::Context::default();
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| {
+                    surface(ctx, Caps::DESKTOP, spec, &mut |_ui, _close| {});
+                },
+            );
+            let cmds = out
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .map(|vp| vp.commands.clone())
+                .unwrap_or_default();
+            (
+                cmds.iter().any(|c| matches!(c, egui::ViewportCommand::Focus)),
+                cmds.iter()
+                    .any(|c| matches!(c, egui::ViewportCommand::WindowLevel(_))),
+            )
+        };
+        let overlay = SurfaceSpec {
+            id: "test-blocking",
+            size: Vec2::new(300.0, 200.0),
+            born_visible: true,
+            ..Default::default()
+        };
+        let (focused, levelled) = first_pass_commands(&overlay);
+        assert!(focused, "the overlay never asked for the focus");
+        assert!(levelled, "the overlay never asked for its window level");
+        // The ordinary surface does ask for its level on the first pass (it
+        // has none recorded yet) but must NOT take the focus there — it is
+        // still hidden, and an invisible window is not one anybody can focus.
+        let ordinary = SurfaceSpec {
+            id: "test-late",
+            size: Vec2::new(300.0, 200.0),
+            ..Default::default()
+        };
+        let (focused, _) = first_pass_commands(&ordinary);
+        assert!(!focused, "a hidden window was told to take the focus");
+    }
+
+    /// **An inline surface eats the clicks that land on it, modal or not.**
+    ///
+    /// On the desktop a surface is another OS window and this is free. Inline
+    /// it is a layer over the desk, and it was the modal scrim doing the
+    /// swallowing — so the export window, which correctly stopped being
+    /// modal (it reports, it does not ask), stopped swallowing with it and a
+    /// press on the waveform reached the piano behind it.
+    ///
+    /// The proof is egui's own hit test: a widget under the surface must not
+    /// be what a click at that point would hit. Which is also the limit of
+    /// what any layer can do — the app's raw `i.pointer` handlers see
+    /// through every layer there has ever been, the scrim included, and they
+    /// ask `inline_rect` instead.
+    #[test]
+    fn an_inline_surface_swallows_the_presses_that_land_on_it() {
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let spec = SurfaceSpec {
+            id: "test-swallow",
+            size: Vec2::new(300.0, 200.0),
+            // Not modal, which is the whole point: no scrim is drawn.
+            modal: false,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let mut desk = None;
+        let mut middle = None;
+        let mut corner = None;
+        // Two passes: egui hit-tests against the layers of the previous one,
+        // so the answer that matters is the second.
+        for _ in 0..2 {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| {
+                    // The desk: one big background widget under everything,
+                    // the shape `App::handle_main_interaction` interacts
+                    // with the main window as.
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        desk = Some(ui.layer_id());
+                        ui.interact(
+                            screen,
+                            egui::Id::new("test-desk"),
+                            egui::Sense::click_and_drag(),
+                        );
+                    });
+                    surface(ctx, Caps::PLUGIN, &spec, &mut |_ui, _close| {});
+                    middle = ctx.layer_id_at(screen.center());
+                    corner = ctx.layer_id_at(screen.min + Vec2::splat(4.0));
+                },
+            );
+        }
+        let desk = desk.expect("the desk never drew");
+        // Centred, so the middle of the canvas is the middle of the surface.
+        let over = middle.expect("nothing at all was under the pointer");
+        assert_ne!(
+            over, desk,
+            "a press in the middle of the surface reached the desk behind it"
+        );
+        assert_eq!(
+            over.id,
+            egui::Id::new(spec.id),
+            "the surface is not the layer under its own middle"
+        );
+        // And the desk is still reachable where the surface is not, or this
+        // would be a scrim by another name.
+        assert_eq!(
+            corner,
+            Some(desk),
+            "the surface swallowed a press nowhere near it"
+        );
+    }
+
+    /// **A share of the screen, with a floor, a ceiling and a last clamp.**
+    ///
+    /// The general rule, tested where it lives rather than inside the one
+    /// window that happens to use it first. All four parts have to bite:
+    /// the share on an ordinary display, the floor on a small one, the
+    /// ceiling on a big one, and the clamp on a display so small the floor
+    /// itself does not fit — which is not a hypothetical, it is a plugin
+    /// editor's canvas.
+    #[test]
+    fn a_window_takes_its_share_of_the_screen_between_a_floor_and_a_ceiling() {
+        let share = Vec2::new(0.46, 0.40);
+        let floor = Vec2::new(560.0, 300.0);
+        let ceiling = Vec2::new(1200.0, 620.0);
+        let at = |m: Vec2| share_of_screen(Some(m), share, floor, ceiling);
+        // Nothing measured yet: the floor, because a guess about a screen
+        // nobody has looked at is worse than the smallest designed size.
+        assert_eq!(share_of_screen(None, share, floor, ceiling), floor);
+        assert_eq!(share_of_screen(Some(Vec2::ZERO), share, floor, ceiling), floor);
+        // The share itself, on a display where neither limit is near.
+        let mid = at(Vec2::new(1920.0, 1080.0));
+        assert!((mid.x - 1920.0 * 0.46).abs() < 0.5 && (mid.y - 1080.0 * 0.40).abs() < 0.5);
+        // The floor, on a small display.
+        assert_eq!(at(Vec2::new(900.0, 600.0)), floor, "the floor never engages");
+        // The ceiling, on a big one.
+        assert_eq!(at(Vec2::new(3008.0, 1692.0)), ceiling, "the ceiling never engages");
+        // And never bigger than the screen, even when that means going under
+        // the floor — the bug the 5.0 demo session found in the main window.
+        let tiny = Vec2::new(400.0, 300.0);
+        let got = at(tiny);
+        assert!(got.x <= tiny.x && got.y <= tiny.y, "{got:?} escapes {tiny:?}");
+        assert!(got.x < floor.x, "the clamp did not take it under the floor");
+        // Monotone: a bigger screen never gets a smaller window.
+        let mut last = Vec2::ZERO;
+        for h in [600.0_f32, 800.0, 900.0, 1080.0, 1400.0, 1440.0, 1692.0, 2160.0] {
+            let got = at(Vec2::new(h * 16.0 / 9.0, h));
+            assert!(got.x >= last.x && got.y >= last.y, "{h} gave {got:?} after {last:?}");
+            last = got;
+        }
     }
 
     // ── the in-house chrome ─────────────────────────────────────────────────
