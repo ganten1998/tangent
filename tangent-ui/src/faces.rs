@@ -19,7 +19,7 @@ use crate::ports::{BuiltinFace, BuiltinFaceParam, PresetRow};
 /// panel, and the line under it. The engine's `builtin_fx::UNITS` is the
 /// same list; the PATH is the contract between them, exactly as
 /// `KEYS_PATCH_NAMES` documents for the keyboard.
-pub const SUITE_UNITS: [(&str, &str, &str); 4] = [
+pub const SUITE_UNITS: [(&str, &str, &str); 13] = [
     ("@tangent-eq", "Tangent EQ", "three bands you can hold in your hand"),
     (
         "@tangent-imager",
@@ -35,6 +35,56 @@ pub const SUITE_UNITS: [(&str, &str, &str); 4] = [
         "@tangent-comp",
         "Tangent Comp",
         "dials, a needle, and nothing to hide behind",
+    ),
+    // The second shelf-filling: nine more kernels, registered in one wave.
+    // Same naming law as `dialogs::FX_UNITS` — the NAME is Tangent's, the
+    // hardware a unit is voiced after lives in the line under it — and the
+    // chorus, echo and plate REUSE that table's sentinels and rows exactly,
+    // because they are the fixed chain's own effects made seatable.
+    (
+        "@tangent-denoise",
+        "Tangent Denoise",
+        "learns your noise, then holds 32 small doors shut",
+    ),
+    (
+        "@tangent-amp",
+        "Tangent Amp",
+        "warm and clean, solved from the blackface schematic",
+    ),
+    (
+        "@tangent-drive",
+        "Tangent Drive",
+        "the green pedal's mid hump, oversampled",
+    ),
+    (
+        "@tangent-trem",
+        "Tangent Trem",
+        "a neon lamp flashing at a photocell",
+    ),
+    (
+        "@tangent-chorus",
+        "Tangent Chorus",
+        "true stereo, after the Boss CE-1",
+    ),
+    (
+        "@tangent-echo",
+        "Tangent Echo",
+        "warbling saturation, after the RE-201 Space Echo",
+    ),
+    (
+        "@tangent-plate",
+        "Tangent Plate",
+        "legendary plate, after the EMT-140",
+    ),
+    (
+        "@tangent-wah",
+        "Tangent Wah",
+        "a touch filter that chases how hard you play",
+    ),
+    (
+        "@tangent-ir",
+        "Tangent IR",
+        "plays any impulse response you can capture",
     ),
 ];
 
@@ -191,12 +241,29 @@ pub fn draw(ui: &mut egui::Ui, st: &FaceStyle, live: &mut FaceLive) -> Option<Fa
         "@tangent-imager" => draw_imager(ui, st, live),
         "@tangent-comp" => draw_comp(ui, st, live),
         // The tape, the trim, and anything the suite grows before its face
-        // does: every continuous parameter as a row, in id order.
+        // does: every parameter as a row, in id order — sliders for the
+        // continuous ones, the cycling button for anything stepped, so a
+        // toggle like the denoise's Learn or the drive's Symmetry wears its
+        // words instead of pretending to be a fader. The amp and the IR
+        // route here DELIBERATELY for now: their real faces (a tolex panel,
+        // an IR browser) are other lanes' work, and generic rows are the
+        // honest floor under them until those land.
         _ => {
             let mut out = None;
-            let ids: Vec<u32> = live.face.params.iter().map(|p| p.id).collect();
-            for id in ids {
-                out = out.or_else(|| row(ui, st, &live.face, id));
+            let ids: Vec<(u32, bool)> = live
+                .face
+                .params
+                .iter()
+                .map(|p| (p.id, p.steps >= 2))
+                .collect();
+            for (id, stepped) in ids {
+                out = out.or_else(|| {
+                    if stepped {
+                        step_row(ui, st, &live.face, id, None)
+                    } else {
+                        row(ui, st, &live.face, id)
+                    }
+                });
             }
             out
         }

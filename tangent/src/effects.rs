@@ -1892,7 +1892,9 @@ impl TapeEcho {
 /// top, which is comfortably inside this. The bottom is a swell you feel
 /// rather than hear; the top is where chorus becomes vibrato and then becomes
 /// seasick.
-const CHORUS_RATE_HZ: (f32, f32) = (0.12, 3.2);
+// `pub(crate)` so `builtin_fx::describe` can print the Hz this dial lands
+// on — visibility only, the same bargain the plate constants struck.
+pub(crate) const CHORUS_RATE_HZ: (f32, f32) = (0.12, 3.2);
 
 /// The shortest the bucket brigade ever gets, in milliseconds.
 ///
@@ -1949,7 +1951,8 @@ const CHORUS_GATE_FLOOR: f32 = 8.0e-4;
 /// **A BBD is dark, and that is most of what a CE-1 sounds like.** The chips
 /// clock at a few tens of kHz and every stage loses treble; a chorus that
 /// returns the top end intact sounds like a plugin, not like the pedal.
-const CHORUS_LP_HZ: (f32, f32) = (2_600.0, 9_000.0);
+// `pub(crate)` for `builtin_fx::describe`, as `CHORUS_RATE_HZ` above.
+pub(crate) const CHORUS_LP_HZ: (f32, f32) = (2_600.0, 9_000.0);
 
 /// A stereo chorus after the Boss CE-1.
 ///

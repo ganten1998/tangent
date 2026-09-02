@@ -2273,6 +2273,15 @@ impl DesktopApp {
                 }
             }
         }
+        // **The denoise learn drain**, same cadence and same reason as the
+        // needles above: while a learn runs (and on the frame after it
+        // freezes) the audio thread publishes thresholds into one shared
+        // slot, and this pulls them into the bay's durable ledger so the
+        // next save — or the session's autosave — carries what was learned.
+        // Idle cost is one atomic swap answering "nobody".
+        if let Some(e) = self.recorder.engine.as_mut() {
+            e.adopt_learned_thresholds();
+        }
         // **The INSERT tap, drained dry once a frame — but only while a face
         // has it armed.** Disarmed, the engine pushes nothing and this skips
         // even the empty pop-loop, so an idle session pays nothing at all.

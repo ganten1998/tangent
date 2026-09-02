@@ -53,6 +53,9 @@ mod units;
 /// effect sentinels the engine seats in a rack rather than rendering by mask.
 #[cfg(feature = "recorder")]
 mod builtin_fx;
+/// The hand-rolled WAV reader the IR unit loads its impulse responses with.
+#[cfg(feature = "recorder")]
+mod wavread;
 /// Loudness to BS.1770-4, for the ladder beside the master. Inside
 /// `recorder` because the only thing that feeds it is the engine's output.
 #[cfg(feature = "recorder")]
