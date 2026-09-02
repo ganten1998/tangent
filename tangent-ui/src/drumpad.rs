@@ -685,8 +685,16 @@ impl DrumpadDoc {
 // Kit presets
 // ───────────────────────────────────────────────────────────────────────────
 
-/// The extension a saved kit wears.
-pub const PRESET_EXT: &str = "tgkit";
+/// The extension a NEW saved kit wears. It was `tgkit`; the owner wanted
+/// `.kit`, and the container's magic is what actually identifies the file —
+/// so saves changed name and loads never will: [`PRESET_EXT_OLD`] stays in
+/// every file filter forever, and [`KitPreset::from_bytes`] sniffs the bytes
+/// whatever the name says.
+pub const PRESET_EXT: &str = "kit";
+
+/// The extension every kit saved before 5.0 wears. Read forever, written
+/// never again.
+pub const PRESET_EXT_OLD: &str = "tgkit";
 
 /// The first bytes of a kit file that carries its own samples. Version 2 —
 /// version 1 was the same manifest as bare JSON with no audio at all, and
@@ -932,7 +940,7 @@ impl KitPreset {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        let tmp = path.with_extension("tgkit.tmp");
+        let tmp = path.with_extension("kit.tmp");
         std::fs::write(&tmp, self.to_bytes()).map_err(|e| e.to_string())?;
         std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
         Ok(path)
@@ -1220,6 +1228,38 @@ mod preset_tests {
         assert_eq!(back.pads[0].blob, None, "an old kit invented a blob");
         assert!(back.media.is_empty());
         assert_eq!(back.pads[0].file, std::path::Path::new("/somewhere/snare.wav"));
+    }
+
+    /// **The extension changed; no file did.** New saves wear `.kit`, and a
+    /// byte-identical TGKIT2 blob opens under either name because
+    /// [`KitPreset::from_bytes`] reads the magic, never the filename — which
+    /// is what makes the rename safe to make and impossible to regret.
+    #[test]
+    fn the_same_kit_bytes_open_under_both_extensions_forever() {
+        let dir = tmp("dualext");
+        let doc = dir.join("project.tangent");
+        let media = dir.join("media");
+        std::fs::create_dir_all(&media).expect("media");
+        std::fs::write(media.join("kick.wav"), vec![9u8; 300]).expect("kick");
+        let mut kit = DrumpadDoc::default();
+        kit.pads[36] = PadSlot { path: "media/kick.wav".to_owned(), ..Default::default() };
+        let blob = KitPreset::from_kit("Dual", &kit, &doc).to_bytes();
+
+        // One set of bytes, the old name and the new.
+        let old = dir.join("Dual.tgkit");
+        let new = dir.join("Dual.kit");
+        std::fs::write(&old, &blob).expect("write .tgkit");
+        std::fs::write(&new, &blob).expect("write .kit");
+        let from_old = KitPreset::load(&old).expect("a .tgkit still opens");
+        let from_new = KitPreset::load(&new).expect("a .kit opens");
+        assert_eq!(from_old, from_new, "the name changed what the bytes meant");
+        assert_eq!(from_old.pads.len(), 1);
+        assert_eq!(from_old.media.len(), 1, "the audio did not survive the name");
+
+        // And a fresh save wears the new name.
+        assert_eq!(PRESET_EXT, "kit");
+        let written = from_new.save(&dir.join("Fresh")).expect("save");
+        assert_eq!(written.extension().and_then(|e| e.to_str()), Some("kit"));
     }
 
     /// A truncated file gives up the audio it lost and keeps the layout,
