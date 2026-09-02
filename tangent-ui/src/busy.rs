@@ -600,20 +600,20 @@ const MARGIN: f32 = 16.0;
 /// The card's nominal width, and the narrowest it may be squeezed to before
 /// the overlay gives up and shows the scrim alone. A plugin editor is a small
 /// window and this has to be sane inside one.
-const CARD_W: f32 = 300.0;
+const CARD_W: f32 = 354.0;
 const CARD_MIN_W: f32 = 160.0;
 /// The card's inner margin.
-const PAD: f32 = 18.0;
+const PAD: f32 = 21.0;
 /// The lattice band's height, the gap under it, and the two text rows.
-const MARK_H: f32 = 38.0;
-const GAP: f32 = 12.0;
-const LABEL_H: f32 = 20.0;
-const DETAIL_GAP: f32 = 4.0;
-const DETAIL_H: f32 = 16.0;
+const MARK_H: f32 = 45.0;
+const GAP: f32 = 14.0;
+const LABEL_H: f32 = 24.0;
+const DETAIL_GAP: f32 = 5.0;
+const DETAIL_H: f32 = 19.0;
 /// The meter row: tall enough for the reading beside the bar, with the bar
 /// itself centred in it.
-const METER_ROW_H: f32 = 14.0;
-const METER_H: f32 = 10.0;
+const METER_ROW_H: f32 = 17.0;
+const METER_H: f32 = 12.0;
 /// The card's corner, and the meter's.
 const CARD_R: f32 = 4.0;
 
@@ -823,10 +823,10 @@ fn paint(painter: &Painter, rect: Rect, face: Color32, busy: &Busy, time: f64) {
     );
 
     if let Some(mark) = l.mark {
-        draw_mark(&p, mark, d.ink, d.lattice);
+        draw_mark(&p, mark, d.ink, d.lattice, d.card);
     }
 
-    let label_font = FontId::new(14.0, fonts::courier_bold());
+    let label_font = FontId::new(16.5, fonts::courier_bold());
     p.with_clip_rect(l.label).text(
         l.label.center(),
         Align2::CENTER_CENTER,
@@ -835,7 +835,7 @@ fn paint(painter: &Painter, rect: Rect, face: Color32, busy: &Busy, time: f64) {
         d.ink,
     );
     if let (Some(r), Some(text)) = (l.detail, busy.detail.as_deref()) {
-        let font = FontId::new(11.0, fonts::courier());
+        let font = FontId::new(13.0, fonts::courier());
         p.with_clip_rect(r).text(
             r.center(),
             Align2::CENTER_CENTER,
@@ -858,7 +858,7 @@ fn paint(painter: &Painter, rect: Rect, face: Color32, busy: &Busy, time: f64) {
 /// Two inks, both measured on the card: `ink` for the nodes, `lattice` for the
 /// lines, which is the app's own hairline and therefore a weight the theme
 /// already decided rather than a number picked here.
-fn draw_mark(painter: &Painter, rect: Rect, ink: Color32, lattice: Color32) {
+fn draw_mark(painter: &Painter, rect: Rect, ink: Color32, lattice: Color32, card: Color32) {
     if !rect.is_positive() {
         return;
     }
@@ -869,14 +869,19 @@ fn draw_mark(painter: &Painter, rect: Rect, ink: Color32, lattice: Color32) {
     let h = a * 0.866_025_4; // equilateral: a * sqrt(3)/2
     let r = a * NODE_R;
     let c = rect.center();
-    // Hung off the triangle's own centroid, so the band is balanced rather
-    // than the top row being.
-    let top = Pos2::new(c.x, c.y - h / 3.0);
+    // **Point UP, and the three nodes spell the name.** T at the apex, A at
+    // the bottom left, N at the bottom right - the owner's arrangement, and
+    // the reason the triangle points the other way from `splash.rs`'s pair of
+    // rows. Hung off the triangle's own centroid (which sits a third of the
+    // height above the base) so the band is balanced rather than the base
+    // being.
+    let base_y = c.y + h / 3.0;
     let nodes = [
-        Pos2::new(top.x - a * 0.5, top.y),
-        Pos2::new(top.x + a * 0.5, top.y),
-        Pos2::new(top.x, top.y + h),
+        Pos2::new(c.x, base_y - h),
+        Pos2::new(c.x - a * 0.5, base_y),
+        Pos2::new(c.x + a * 0.5, base_y),
     ];
+    const LETTERS: [char; 3] = ['T', 'A', 'N'];
     let dirs = [
         Vec2::new(a, 0.0),
         Vec2::new(-a, 0.0),
@@ -898,11 +903,21 @@ fn draw_mark(painter: &Painter, rect: Rect, ink: Color32, lattice: Color32) {
             }
         }
     }
-    // Nodes last, filled with the card under them, so the circles trim every
-    // line back to their own edge without any arithmetic here — `splash.rs`'s
-    // trick and the theory band's.
-    for n in nodes {
+    // **Nodes last, and genuinely FILLED with the card** - which is what makes
+    // the ring trim every lattice line back to its own edge with no arithmetic
+    // here, `splash.rs`'s trick and the theory band's. The old code only
+    // stroked, so the lines ran on through the middle of each node; harmless
+    // when the node was empty, and impossible now that a letter lives there.
+    //
+    // The letter is sized from the node itself rather than from a constant, so
+    // it stays inside the ring at every size the band can be squeezed to. 1.15
+    // is the largest multiple of the radius at which a capital in this face
+    // still clears the stroke on both sides.
+    let glyph = FontId::new((r * 1.15).max(6.0), fonts::courier_bold());
+    for (n, ch) in nodes.into_iter().zip(LETTERS) {
+        p.circle_filled(n, r, card);
         p.circle_stroke(n, r, Stroke::new(1.2_f32, ink));
+        p.text(n, Align2::CENTER_CENTER, ch, glyph.clone(), ink);
     }
 }
 
@@ -1157,22 +1172,44 @@ mod tests {
         let none = Busy::new("Loading").with_progress(Progress::Steps { done: 0, total: 0 });
         assert!(layout(rect, &none).expect("fits").reading.is_none());
 
-        // A short window gives up the mark, then the detail, and never the
-        // label or the meter.
+        // **A short window sheds in a fixed ORDER, and the order is the
+        // contract - not the heights it happens to shed at.** This used to
+        // assert at three hand-picked heights and broke the moment the card
+        // was made bigger, which taught it nothing about the rule it was
+        // guarding. So walk every height instead and check the sequence.
         let full = Busy::new("Loading project")
             .with_detail("Serum")
             .with_progress(Progress::Indeterminate);
-        let short = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 150.0));
-        let l = layout(short, &full).expect("a short window still fits the message");
-        assert!(l.mark.is_none(), "the picture goes first");
-        assert!(l.detail.is_some(), "and the detail outlives it");
-        assert!(l.meter.is_some(), "the meter is the message and never goes");
-        let shorter = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 120.0));
-        let l = layout(shorter, &full).expect("fits");
-        assert!(l.mark.is_none() && l.detail.is_none(), "the detail goes second");
-        assert!(l.meter.is_some());
-        // And below that there is no honest card at all, only the scrim.
-        assert!(layout(Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 100.0)), &full).is_none());
+        let (mut saw_mark, mut saw_detail, mut saw_gone) = (false, false, false);
+        for h in (60..=400).rev() {
+            let r = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, h as f32));
+            let Some(l) = layout(r, &full) else {
+                saw_gone = true;
+                continue;
+            };
+            assert!(
+                !saw_gone,
+                "a card came back at {h} pt after the overlay had given up"
+            );
+            // The label and the meter are the message: neither may ever go
+            // while there is a card at all.
+            assert!(l.meter.is_some(), "the meter went at {h} pt");
+            assert!(l.label.height() > 0.0, "the label went at {h} pt");
+            if l.mark.is_some() {
+                assert!(!saw_mark, "the picture came back at {h} pt");
+                assert!(l.detail.is_some(), "the detail went before the picture");
+            } else {
+                saw_mark = true;
+            }
+            if l.detail.is_none() {
+                saw_detail = true;
+            } else {
+                assert!(!saw_detail, "the detail came back at {h} pt");
+            }
+        }
+        assert!(saw_mark, "the picture never went, so nothing was tested");
+        assert!(saw_detail, "the detail never went");
+        assert!(saw_gone, "the overlay never gave up, so its floor is untested");
     }
 
     /// The readings, in the words a person reads them in.
