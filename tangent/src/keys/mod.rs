@@ -1337,14 +1337,26 @@ impl Keys {
                 left += s * gl;
                 right += s * gr;
             }
-            // The voices on their way out: a straight line to zero, which
-            // at four milliseconds is a slope no pitch hears as an edge.
-            // They still drive the body — a fading string is a string.
+            // The voices on their way out. They still drive the body — a
+            // fading string is a string.
+            //
+            // **Not a straight line: a straight line has two corners.** The
+            // fade starts at full gain and ends at zero, and a ramp's ends
+            // are slope discontinuities — small in the first difference,
+            // louder in the second, and the Clav patches have a resonant
+            // filter downstream that rings whatever corner it is handed.
+            // `t^2 (3 - 2t)` leaves and arrives with zero slope, so there is
+            // no corner at either end. Worth two multiplies: it is not what
+            // the bench's steal figures were about — those are the pickups'
+            // own gain, and this moved them by a fraction of a percent — but
+            // a corner is a corner and there is no reason to hand one to a
+            // filter.
             for c in &mut self.corpses {
                 if c.left == 0 {
                     continue;
                 }
-                let s = c.mech.tick() * (c.left as f32 / c.total as f32);
+                let t = c.left as f32 / c.total as f32;
+                let s = c.mech.tick() * t * t * (3.0 - 2.0 * t);
                 c.left -= 1;
                 drive += s;
                 let (gl, gr) = pan_gains(c.pan);
@@ -1824,5 +1836,275 @@ mod tests {
             .map(|(a, b)| f64::from((a - b).abs()))
             .sum();
         assert!(diff > 1.0, "the tremolo knob did nothing to a held note");
+    }
+
+    // ── consecutive strikes ─────────────────────────────────────────────
+
+    /// One event in a scripted performance, at a fixed velocity: these tests
+    /// are about WHEN a key goes down, never how hard.
+    #[derive(Clone, Copy)]
+    enum Ev {
+        On(u8),
+        Off(u8),
+        Pedal(bool),
+    }
+
+    const SR: f32 = 48_000.0;
+    const BLOCK: usize = 128;
+    const VEL: f32 = 0.8;
+
+    /// Seconds to a block boundary at or before that instant — where the
+    /// loop below will actually apply an event, and therefore where a
+    /// measurement window has to be centred.
+    fn at(secs: f32) -> usize {
+        (secs * SR) as usize / BLOCK * BLOCK
+    }
+
+    fn ms(m: f32) -> usize {
+        (m * 0.001 * SR) as usize
+    }
+
+    /// Mono render of a scripted performance, driven in the same block size
+    /// the callback uses so that a fault at a block boundary happens here too.
+    fn script(patch: Patch, events: &[(usize, Ev)], frames: usize) -> Vec<f32> {
+        let mut k = Keys::new(SR);
+        k.set_patch(patch);
+        let mut events = events.to_vec();
+        events.sort_by_key(|e| e.0);
+        let mut out = Vec::with_capacity(frames);
+        let mut scratch = [0.0f32; BLOCK * 2];
+        let mut next = 0;
+        let mut frame = 0;
+        while frame < frames {
+            while next < events.len() && events[next].0 < frame + BLOCK {
+                match events[next].1 {
+                    Ev::On(p) => k.note_on(p, VEL),
+                    Ev::Off(p) => k.note_off(p),
+                    Ev::Pedal(d) => k.set_pedal(d),
+                }
+                next += 1;
+            }
+            scratch.fill(0.0);
+            k.render(&mut scratch, BLOCK, 2);
+            out.extend(scratch.chunks_exact(2).map(|f| (f[0] + f[1]) * 0.5));
+            frame += BLOCK;
+        }
+        out
+    }
+
+    /// Largest one-sample step in a window: the plain measure of an edge.
+    fn d1(x: &[f32], a: usize, b: usize) -> f32 {
+        let b = b.min(x.len());
+        (a.max(1)..b).fold(0.0f32, |m, n| m.max((x[n] - x[n - 1]).abs()))
+    }
+
+    /// Largest second difference. A sinusoid's is its first scaled by the
+    /// tiny angle per sample, so a STEP — whose second difference is the
+    /// whole step — stands clear of a loud low bed that the first difference
+    /// alone would let it hide under.
+    fn d2(x: &[f32], a: usize, b: usize) -> f32 {
+        let b = b.min(x.len());
+        (a.max(2)..b).fold(0.0f32, |m, n| {
+            m.max((x[n] - 2.0 * x[n - 1] + x[n - 2]).abs())
+        })
+    }
+
+    fn rms(x: &[f32], a: usize, b: usize) -> f32 {
+        let b = b.min(x.len());
+        if b <= a {
+            return 0.0;
+        }
+        let e: f64 = x[a..b].iter().map(|s| f64::from(*s) * f64::from(*s)).sum();
+        (e / (b - a) as f64).sqrt() as f32
+    }
+
+    /// How far a landing strike's shape may drift from a fresh strike's
+    /// before it is called a pop, as a ratio. Three decibels — the same
+    /// figure the bench uses.
+    const EDGE_TOL: f32 = 1.413;
+
+    /// How far above a single fresh strike's peak eight of them at sixty
+    /// milliseconds may stack, as a ratio: four decibels.
+    ///
+    /// **Derived, not chosen.** The strike's energy cap holds a re-struck
+    /// mode to a quarter over one strike's own throw — 1.9 dB of
+    /// DISPLACEMENT — and the pickups are expansive, so at the output that
+    /// reads as more than it does on the metal. The worst measured is the
+    /// reed piano at 3.2 dB, which is the plate's curve doing exactly what
+    /// the growl is; four is the round number above it, and it is a long way
+    /// under the clamp every mechanism ends its tick with.
+    const STACK_MARGIN: f32 = 1.585;
+
+    /// A fresh strike of `pitch` from silence: what every landing strike is
+    /// measured against.
+    fn fresh_edge(patch: Patch, pitch: u8, secs: f32) -> (f32, f32, f32) {
+        let x = script(
+            patch,
+            &[(0, Ev::Pedal(true)), (at(0.01), Ev::On(pitch))],
+            (secs * SR) as usize,
+        );
+        let peak = x.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        (d1(&x, 0, x.len()), d2(&x, 0, x.len()), peak)
+    }
+
+    /// **What a landing strike ADDED, against the same strike from silence.**
+    ///
+    /// The performance is rendered twice, once with the event and once
+    /// without, and the difference is exactly what that strike contributed
+    /// through whatever the amp pass was doing at the time.
+    fn added(patch: Patch, base: &[(usize, Ev)], event: (usize, Ev), frames: usize) -> (f32, f32) {
+        let bed = script(patch, base, frames);
+        let mut with = base.to_vec();
+        with.push(event);
+        let got = script(patch, &with, frames);
+        let diff: Vec<f32> = got.iter().zip(&bed).map(|(a, b)| a - b).collect();
+        let (a, b) = (event.0.saturating_sub(ms(2.0)), event.0 + ms(20.0));
+        (d1(&diff, a, b), d2(&diff, a, b))
+    }
+
+    /// **A hammer is not a step, and the difference is the SHAPE.**
+    ///
+    /// A magnet leaned on, a wah wide open, a plate the reed is deep inside:
+    /// each is a gain the strike arrives through, and a gain multiplies the
+    /// first and second differences by the SAME number. A state cut and
+    /// re-seeded does not — a step is broadband, so it lands in the second
+    /// difference many times harder than in the first. So the property to
+    /// hold a landing strike to is not "no louder than a fresh one", which
+    /// no nonlinear pickup can promise; it is "the same shape as a fresh
+    /// one", which every honest superposition can, whatever gain it is read
+    /// through. Measured: a straight sum reads 1.00 against 1.00, the reed
+    /// deep in its plate reads 1.63 against 1.75, and the faults this module
+    /// was written for read tenfold.
+    fn assert_same_shape(what: &str, patch: Patch, added: (f32, f32), fresh: (f32, f32)) {
+        let r1 = added.0 / fresh.0.max(1e-12);
+        let r2 = added.1 / fresh.1.max(1e-12);
+        assert!(
+            r2 <= r1 * EDGE_TOL,
+            "{patch:?} {what}: what the strike added is {r1:.2}x a fresh strike's first \
+             difference but {r2:.2}x its second — that ratio is a step, not a hammer"
+        );
+    }
+
+    /// A key struck again while its own note is still ringing under the
+    /// pedal adds a hammer, not a step — on every patch.
+    #[test]
+    fn a_restrike_under_the_pedal_adds_what_a_fresh_strike_adds() {
+        for &patch in &Patch::ALL {
+            let (f1, f2, _) = fresh_edge(patch, 60, 0.1);
+            let base = [
+                (0usize, Ev::Pedal(true)),
+                (0, Ev::On(60)),
+                (at(0.1), Ev::Off(60)),
+            ];
+            let a = added(patch, &base, (at(0.2), Ev::On(60)), at(0.25));
+            assert_same_shape("restrike", patch, a, (f1, f2));
+        }
+    }
+
+    /// The pool full and one voice buried: the newcomer landing on the slot
+    /// the corpse vacated adds a hammer, not a step.
+    #[test]
+    fn a_steal_adds_what_a_fresh_strike_adds() {
+        for &patch in &Patch::ALL {
+            let (f1, f2, _) = fresh_edge(patch, 100, 0.06);
+            let mut base = vec![(0usize, Ev::Pedal(true))];
+            for i in 0..VOICES {
+                base.push((0, Ev::On(24 + i as u8)));
+            }
+            // A released voice is what the stealing policy takes first, and
+            // under the pedal it is still at full level: the worst case.
+            base.push((at(0.02), Ev::Off(30)));
+            let a = added(patch, &base, (at(0.1), Ev::On(100)), at(0.14));
+            assert_same_shape("steal", patch, a, (f1, f2));
+        }
+    }
+
+    /// **Eight strikes at sixty milliseconds, pedal down.** Superposition
+    /// that stacks without bound is one way to be wrong and a strike that
+    /// cancels the note it landed on is the other: neither may the peak run
+    /// away nor may a repeat leave a hole where the note was.
+    #[test]
+    fn eight_pedalled_repeats_neither_stack_nor_leave_a_hole() {
+        for &patch in &Patch::ALL {
+            let (_, _, fresh_peak) = fresh_edge(patch, 60, 0.1);
+            let mut ev = vec![(0usize, Ev::Pedal(true))];
+            let mut onsets = Vec::new();
+            for k in 0..8 {
+                let t = at(k as f32 * 0.060);
+                onsets.push(t);
+                ev.push((t, Ev::On(60)));
+                ev.push((at(k as f32 * 0.060 + 0.030), Ev::Off(60)));
+            }
+            let x = script(patch, &ev, at(0.52));
+            let peak = x.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+            assert!(
+                peak <= fresh_peak * STACK_MARGIN,
+                "{patch:?} stacked to {peak} against a fresh strike's {fresh_peak}"
+            );
+            // The quietest four milliseconds in the twelve after each strike,
+            // against the four before it. A landing hammer mostly adds; one
+            // landing against the motion takes energy out, which is why this
+            // floor is not zero. A voice cut to silence and re-attacked is
+            // tens of decibels down, and one capped into cancellation — the
+            // fault this test was written for — was ten.
+            for &o in &onsets[1..] {
+                let before = rms(&x, o.saturating_sub(ms(4.0)), o);
+                if before <= 1.0e-3 {
+                    continue;
+                }
+                let mut worst = f32::MAX;
+                let mut a = o;
+                while a + ms(4.0) <= o + ms(12.0) {
+                    worst = worst.min(rms(&x, a, a + ms(4.0)));
+                    a += ms(1.0);
+                }
+                assert!(
+                    worst >= before * 0.5,
+                    "{patch:?} lost {:.1} dB of the note it was struck on",
+                    20.0 * (worst / before).log10()
+                );
+            }
+        }
+    }
+
+    /// **The first-strike pin.** One hash per mechanism of a strike from
+    /// silence, so a change meant for CONSECUTIVE strikes cannot quietly
+    /// retune the instruments on its way past.
+    ///
+    /// A hash rather than a tolerance: "unchanged" is the claim, and a
+    /// tolerance lets a retune through one commit at a time. If this fails
+    /// and the change to the sound was meant, `keysrig pin` prints the same
+    /// figure for every patch at both ends of every knob, so the diff of two
+    /// printouts says exactly what moved.
+    #[test]
+    fn a_first_strike_from_silence_is_unchanged() {
+        fn fnv(x: &[f32]) -> u64 {
+            let mut h = 0xcbf2_9ce4_8422_2325_u64;
+            for s in x {
+                for b in s.to_bits().to_le_bytes() {
+                    h ^= u64::from(b);
+                    h = h.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+            h
+        }
+        // One patch per mechanism: piano, tine, tangent, reed.
+        for (patch, want) in [
+            (Patch::Piano1, 13_384_888_044_078_809_756),
+            (Patch::EpMk1, 12_512_648_127_811_904_030),
+            (Patch::Clav, 12_849_073_543_764_444_369),
+            (Patch::Wurli200, 17_503_137_568_396_613_258),
+        ] {
+            let x = script(
+                patch,
+                &[
+                    (0, Ev::Pedal(true)),
+                    (0, Ev::On(60)),
+                    (at(0.15), Ev::Off(60)),
+                ],
+                at(0.25),
+            );
+            assert_eq!(fnv(&x), want, "{patch:?} first strike moved");
+        }
     }
 }
