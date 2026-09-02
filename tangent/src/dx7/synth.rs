@@ -197,10 +197,55 @@ impl Eg {
         self.holding = false;
     }
 
+    /// Whether this envelope is down past `floor` dB of attenuation AND is
+    /// not going to come back up on its own.
+    ///
+    /// **The level alone is half the question.** An envelope that has not
+    /// started its attack is sitting at silence too, and it is about to be
+    /// the note; reading the level alone would call every note dead on the
+    /// sample it was struck. And a patch is free to write a level of zero
+    /// into a MIDDLE stage — a gated sound, silent for a moment and then
+    /// back — so "quiet now" is not "quiet from now on". Every stage it has
+    /// left to visit has to be down there too.
+    fn decayed_past(&self, floor: f32) -> bool {
+        self.done
+            || (self.level >= floor && self.target[self.stage..].iter().all(|t| *t >= floor))
+    }
+
+    /// Nothing left: this envelope has reached silence and will not come
+    /// back up.
+    ///
+    /// **Not "the release ran".** This asked for stage 3, and a key
+    /// released under the pedal never reaches it: `note_off` leaves the
+    /// envelope in its SUSTAIN stage, so a patch whose sustain level is zero
+    /// — every percussive patch ever written — decays to nothing and sits
+    /// there, silent, with the flag false. Its slot was then never reclaimed
+    /// and `sounding` never decremented, so a re-struck key kept finding the
+    /// husk and re-keying it: for a sync patch that meant the repeat kept
+    /// the dead note's oscillator phase and lost the aligned attack the
+    /// patch exists for, measured on the bench at ten decibels of second
+    /// difference over what a fresh strike is allowed.
     fn finished(&self) -> bool {
-        !self.bipolar && (self.done || (self.stage == 3 && self.level >= RANGE_DB - 0.01))
+        !self.bipolar && self.decayed_past(RANGE_DB - 0.01)
+    }
+
+    /// Past hearing, if not yet past arithmetic: down [`SPENT_DB`] on its own
+    /// strike. See `Dx7::note_on` for what a repeat does about it.
+    fn spent(&self) -> bool {
+        self.decayed_past(SPENT_DB)
     }
 }
+
+/// How far an operator has to have decayed before a repeat of its key counts
+/// as a NEW note rather than another hammer on the same one: 40 dB, a
+/// hundredth of the amplitude the strike put there.
+///
+/// **This threshold cannot cut anything**, which is why it can be this
+/// generous. A spent voice is not silenced, re-seeded or faded — it is left
+/// exactly as it is, ringing itself out, while the repeat goes to a slot of
+/// its own. The only thing a too-eager reading costs is a voice out of
+/// sixteen for as long as the husk takes to reach the floor.
+const SPENT_DB: f32 = 40.0;
 
 /// One sounding note.
 #[derive(Clone, Copy)]
@@ -323,16 +368,38 @@ impl Dx7 {
         // sitting right there, and the `sounding` ledger below counted the
         // stolen slot as newly occupied: one phantom voice per steal, and
         // `active()` never false again until a flush.
+        // **And a repeat of a pitch whose voice has already died away takes a
+        // NEW voice, which is what the hardware does with all sixteen of
+        // them.** Re-keying is for a string still under the damper; a note
+        // that has decayed past hearing is finished, and starting the repeat
+        // on top of its husk is what made a rapid pedalled repeat sound
+        // unlike the patch — the envelope generator picks up from wherever
+        // the husk left it, so the attack is as much shorter as the husk is
+        // loud, and a percussive patch's attack is the patch. Nothing is cut
+        // to do this: the husk is left alone to ring itself out, and the
+        // repeat is a first strike, to the bit.
+        //
+        // Only ever into a slot that is genuinely free — never a steal — so
+        // that a full pool degrades to re-keying rather than to chopping
+        // somebody's held chord.
         let damper_held = |n: &Note| !n.on && n.age & (1 << 63) != 0;
+        let dest = DEST[usize::from(self.voice.algorithm.min(31))];
+        // A voice speaks through its CARRIERS. A modulator at silence still
+        // shapes; a carrier at silence is the note being over.
+        let spent = |n: &Note| {
+            n.age == 0 || (0..6).all(|i| dest[i] != OUT || n.eg[i].spent())
+        };
+        let mine = |n: &Note| n.pitch == pitch && (n.on || damper_held(n));
         let slot = self
             .notes
             .iter()
-            .position(|n| n.pitch == pitch && (n.on || damper_held(n)))
+            .position(|n| mine(n) && !spent(n))
             .or_else(|| {
                 self.notes
                     .iter()
                     .position(|n| !n.on && n.eg.iter().all(Eg::finished))
             })
+            .or_else(|| self.notes.iter().position(mine))
             .unwrap_or_else(|| {
                 let mut best = 0;
                 for (i, n) in self.notes.iter().enumerate() {
@@ -368,8 +435,10 @@ impl Dx7 {
             age: self.clock.wrapping_add(1),
             // The two samples of feedback history stay: the self-modulating
             // operator keeps its own recent past, and zeroing it is a kink
-            // in whatever it was making.
-            fb: old.fb,
+            // in whatever it was making. From silence there is nothing to
+            // keep, and starting at exactly zero is what makes a repeat on
+            // a dead slot the same sound as a first strike, to the bit.
+            fb: if silent { [0.0; 2] } else { old.fb },
             ..Note::SILENT
         };
         self.clock = n.age;
@@ -1123,5 +1192,265 @@ mod tests {
             soft < loud * 0.6,
             "soft {soft} was not quieter than loud {loud}"
         );
+    }
+
+    // ── consecutive strikes ─────────────────────────────────────────────
+
+    const SR: f32 = 48_000.0;
+    const BLOCK: usize = 128;
+
+    #[derive(Clone, Copy)]
+    enum Ev {
+        On(u8),
+        Off(u8),
+        Pedal(bool),
+    }
+
+    fn at(secs: f32) -> usize {
+        (secs * SR) as usize / BLOCK * BLOCK
+    }
+
+    fn ms(m: f32) -> usize {
+        (m * 0.001 * SR) as usize
+    }
+
+    /// Mono render of a scripted performance in the callback's own block
+    /// size.
+    fn script(v: Voice, events: &[(usize, Ev)], frames: usize) -> Vec<f32> {
+        let mut d = Dx7::new(SR);
+        d.set_voice(v);
+        let mut events = events.to_vec();
+        events.sort_by_key(|e| e.0);
+        let mut out = Vec::with_capacity(frames);
+        let mut scratch = [0.0_f32; BLOCK * 2];
+        let mut next = 0;
+        let mut frame = 0;
+        while frame < frames {
+            while next < events.len() && events[next].0 < frame + BLOCK {
+                match events[next].1 {
+                    Ev::On(p) => d.note_on(p, 0.8),
+                    Ev::Off(p) => d.note_off(p),
+                    Ev::Pedal(x) => d.set_pedal(x),
+                }
+                next += 1;
+            }
+            scratch.fill(0.0);
+            d.render(&mut scratch, BLOCK, 2);
+            out.extend(scratch.chunks_exact(2).map(|f| (f[0] + f[1]) * 0.5));
+            frame += BLOCK;
+        }
+        out
+    }
+
+    fn d1(x: &[f32], a: usize, b: usize) -> f32 {
+        let b = b.min(x.len());
+        (a.max(1)..b).fold(0.0_f32, |m, n| m.max((x[n] - x[n - 1]).abs()))
+    }
+
+    fn d2(x: &[f32], a: usize, b: usize) -> f32 {
+        let b = b.min(x.len());
+        (a.max(2)..b).fold(0.0_f32, |m, n| {
+            m.max((x[n] - 2.0 * x[n - 1] + x[n - 2]).abs())
+        })
+    }
+
+    /// A percussive patch with oscillator sync and feedback: the shape whose
+    /// whole character is six operators starting together, and therefore the
+    /// one a re-key can most obviously get wrong.
+    fn sync_bell() -> Voice {
+        let mut v = Voice::default();
+        v.osc_sync = true;
+        v.feedback = 6;
+        for op in &mut v.ops {
+            op.rate = [99, 72, 50, 80];
+            op.level = [99, 60, 0, 0];
+        }
+        v.ops[1].coarse = 3;
+        v.ops[1].output_level = 86;
+        v.ops[3].coarse = 7;
+        v.ops[3].output_level = 70;
+        v.ops[5].coarse = 11;
+        v.ops[5].output_level = 75;
+        v
+    }
+
+    /// A free-running patch that sustains: no sync, slow envelopes, so a
+    /// repeat lands on a voice that has NOT yet come up. It must keep
+    /// climbing, not start over.
+    fn free_pad() -> Voice {
+        let mut v = Voice::default();
+        v.osc_sync = false;
+        v.feedback = 0;
+        for op in &mut v.ops {
+            op.rate = [48, 60, 40, 55];
+            op.level = [99, 95, 90, 0];
+        }
+        v
+    }
+
+    /// **A repeat of a key whose note has already died is a FIRST STRIKE, to
+    /// the bit.** The hardware gives a repeat one of its sixteen voices and
+    /// never re-zeroes a sounding one; here a spent voice is left to ring
+    /// itself out and the repeat gets a slot of its own, so a sync patch's
+    /// repeat is the sound the patch is for and not a re-key of a husk.
+    ///
+    /// This is where the ten-decibel second difference lived: the envelopes
+    /// of a key released under the pedal never reach the RELEASE stage, so
+    /// the slot looked occupied forever and the repeat inherited a dead
+    /// note's oscillator phase.
+    #[test]
+    fn a_repeat_of_a_dead_note_is_a_first_strike() {
+        let v = sync_bell();
+        let frames = at(0.2);
+        let fresh = script(v, &[(0, Ev::Pedal(true)), (0, Ev::On(60))], frames);
+        // Struck, key up under the pedal, and struck again a second later —
+        // by which time the bell has long since decayed to nothing.
+        let onset = at(1.0);
+        let again = script(
+            v,
+            &[
+                (0, Ev::Pedal(true)),
+                (0, Ev::On(60)),
+                (at(0.25), Ev::Off(60)),
+                (onset, Ev::On(60)),
+            ],
+            onset + frames,
+        );
+        let tail = &again[onset..];
+        assert_eq!(tail.len(), fresh.len());
+        let worst = fresh
+            .iter()
+            .zip(tail)
+            .fold(0.0_f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(
+            worst < 1.0e-6,
+            "the repeat differs from a first strike by {worst}"
+        );
+    }
+
+    /// A voice that decayed to silence under the pedal gives its slot back.
+    /// It never did: `finished` asked whether the release stage had run, and
+    /// under the pedal it does not — sixteen percussive notes and the pool
+    /// was gone.
+    #[test]
+    fn a_percussive_note_held_by_the_pedal_frees_its_slot() {
+        let mut d = Dx7::new(SR);
+        d.set_voice(sync_bell());
+        d.set_pedal(true);
+        d.note_on(60, 0.8);
+        d.note_off(60);
+        let mut out = vec![0.0_f32; BLOCK * 2];
+        for _ in 0..(at(1.0) / BLOCK) {
+            out.fill(0.0);
+            d.render(&mut out, BLOCK, 2);
+        }
+        assert!(
+            !d.active(),
+            "a bell that decayed to silence under the pedal still holds its voice"
+        );
+    }
+
+    /// **A hammer is not a step, and the difference is the SHAPE.** What a
+    /// landing strike adds may be louder or quieter than a fresh one — an
+    /// envelope re-keyed from part way up is a shorter attack, and that is
+    /// the generator doing what the hardware's does — but a gain moves the
+    /// first and second differences together. A state cut and re-seeded does
+    /// not: a step is broadband, so it lands in the second difference many
+    /// times harder than in the first.
+    fn assert_same_shape(what: &str, v: Voice, base: &[(usize, Ev)], onset: usize, frames: usize) {
+        let fresh = script(v, &[(0, Ev::Pedal(true)), (at(0.01), Ev::On(100))], at(0.06));
+        let (ff1, ff2) = (d1(&fresh, 0, fresh.len()), d2(&fresh, 0, fresh.len()));
+        let bed = script(v, base, frames);
+        let mut with = base.to_vec();
+        with.push((onset, Ev::On(100)));
+        let got = script(v, &with, frames);
+        let diff: Vec<f32> = got.iter().zip(&bed).map(|(a, b)| a - b).collect();
+        let (a, b) = (onset.saturating_sub(ms(2.0)), onset + ms(20.0));
+        let r1 = d1(&diff, a, b) / ff1.max(1e-12);
+        let r2 = d2(&diff, a, b) / ff2.max(1e-12);
+        assert!(
+            r2 <= r1 * 1.413,
+            "{what}: what the strike added is {r1:.2}x a fresh strike's first difference \
+             but {r2:.2}x its second — that ratio is a step, not a key going down"
+        );
+    }
+
+    /// A voice taken out from under a full pool, and the newcomer that took
+    /// it: what the newcomer adds is what a fresh strike adds.
+    #[test]
+    fn a_steal_adds_what_a_fresh_strike_adds() {
+        for (name, v) in [("bell", sync_bell()), ("pad", free_pad())] {
+            let mut base = vec![(0usize, Ev::Pedal(true))];
+            for i in 0..VOICES {
+                base.push((0, Ev::On(24 + i as u8)));
+            }
+            base.push((at(0.02), Ev::Off(30)));
+            assert_same_shape(name, v, &base, at(0.1), at(0.14));
+        }
+    }
+
+    /// A key struck again while its own note is still ringing under the
+    /// pedal: same rule.
+    #[test]
+    fn a_restrike_under_the_pedal_adds_what_a_fresh_strike_adds() {
+        for (name, v) in [("bell", sync_bell()), ("pad", free_pad())] {
+            let base = [
+                (0usize, Ev::Pedal(true)),
+                (0, Ev::On(100)),
+                (at(0.05), Ev::Off(100)),
+            ];
+            assert_same_shape(name, v, &base, at(0.1), at(0.14));
+        }
+    }
+
+    /// **Eight strikes at sixty milliseconds, pedal down.** A repeat that
+    /// allocates rather than re-keys must not stack the pool's output either.
+    #[test]
+    fn eight_pedalled_repeats_do_not_stack() {
+        for (name, v) in [("bell", sync_bell()), ("pad", free_pad())] {
+            let fresh = script(v, &[(0, Ev::Pedal(true)), (0, Ev::On(60))], at(0.5));
+            let fresh_peak = fresh.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+            let mut ev = vec![(0usize, Ev::Pedal(true))];
+            for k in 0..8 {
+                ev.push((at(k as f32 * 0.060), Ev::On(60)));
+                ev.push((at(k as f32 * 0.060 + 0.030), Ev::Off(60)));
+            }
+            let x = script(v, &ev, at(0.52));
+            let peak = x.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+            assert!(
+                peak <= fresh_peak * 1.585,
+                "{name} stacked to {peak} against a fresh strike's {fresh_peak}"
+            );
+        }
+    }
+
+    /// **The first-strike pin.** One hash per shape of a strike from
+    /// silence — the shipped electric piano, a percussive sync patch with
+    /// feedback, a free-running pad — so a change meant for CONSECUTIVE
+    /// strikes cannot quietly retune the engine on its way past.
+    #[test]
+    fn a_first_strike_from_silence_is_unchanged() {
+        fn fnv(x: &[f32]) -> u64 {
+            let mut h = 0xcbf2_9ce4_8422_2325_u64;
+            for s in x {
+                for b in s.to_bits().to_le_bytes() {
+                    h ^= u64::from(b);
+                    h = h.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+            h
+        }
+        for (name, v, want) in [
+            ("E.PIANO 1", Voice::default(), 15_203_663_575_639_289_799),
+            ("SYNC BELL", sync_bell(), 5_675_424_527_636_297_463),
+            ("FREE PAD", free_pad(), 4_397_977_957_930_456_023),
+        ] {
+            let x = script(
+                v,
+                &[(0, Ev::Pedal(true)), (0, Ev::On(60)), (at(0.15), Ev::Off(60))],
+                at(0.25),
+            );
+            assert_eq!(fnv(&x), want, "{name} first strike moved");
+        }
     }
 }
