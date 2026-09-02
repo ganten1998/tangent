@@ -742,6 +742,55 @@ pub trait MidiPorts: Send {
     fn auto_connect(&mut self, _tx: mpsc::Sender<MidiEvent>) {}
 }
 
+// ── built-in insert faces ───────────────────────────────────────────────────
+// Appended as a section of its own: two sibling lanes edit this file in
+// parallel worktrees, and a block at the end merges where an insertion
+// mid-file conflicts.
+
+/// One knob of a built-in effect's face, current value included.
+///
+/// The [`FxParam`] idea with the state key and the live value added: an
+/// automation menu only needs identity and a default, but a face DRAWS the
+/// knob, so it needs where the knob stands now — and the host owns that
+/// number (the engine-side ledger is the durable truth), so it crosses the
+/// firewall as plain data like everything else a panel displays.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BuiltinFaceParam {
+    /// The unit's own stable id — what `RecorderRequest::SetInsertParam`
+    /// names, and what automation persists as `fx:<bay>:<id>`.
+    pub id: u32,
+    /// The state blob's key. Carried so a face can be tested against the
+    /// spec without reaching across the firewall for it.
+    pub symbol: String,
+    pub name: String,
+    /// "dB", "Hz", "%" — what the value READS in. Empty for a plain 0..=1.
+    pub units: String,
+    /// Where the knob rests, normalised.
+    pub default: f32,
+    /// 0 continuous, 2 a toggle, otherwise the number of steps.
+    pub steps: i32,
+    /// Where the knob stands now, normalised — the host's ledger reading,
+    /// refreshed on load and mirrored optimistically on a local drag.
+    pub value: f32,
+}
+
+/// Everything one built-in insert bay's face needs to draw itself, pushed by
+/// the host whenever the bay loads or changes — the `push_fx_params`
+/// precedent, with values.
+///
+/// `strip` is the SEAT (the flat rack-seat space, stride `INSERTS`), the
+/// addressing every insert road here already speaks. An empty `params` with
+/// an empty `path` clears the entry: the bay unloaded or holds a plugin.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BuiltinFace {
+    pub strip: usize,
+    pub slot: usize,
+    /// The unit's sentinel path (`"@tangent-comp"`), which is what routes a
+    /// click on the chip to the right face.
+    pub path: String,
+    pub params: Vec<BuiltinFaceParam>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

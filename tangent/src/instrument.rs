@@ -2012,6 +2012,13 @@ struct Shared {
     /// ask a plugin for it. A voice writes zero — a voice is where the
     /// signal begins, so its own latency delays nothing upstream.
     seat_latency: Vec<AtomicU32>,
+    /// What each BAY's built-in gain element has been taking, in positive dB
+    /// of reduction, as f32 bits — `fetch_max` since the UI last read it, the
+    /// `strip_peak` idiom exactly. Written by the callback right after a
+    /// block runs a comp bay ([`run_rack`]), read-and-RESET by
+    /// [`Engine::insert_gr_db`] once a frame for the face's meter. Same row
+    /// law as `seat_latency` above: `seat * INSERTS + bay`.
+    seat_gr: Vec<AtomicU32>,
     lane_latency: [AtomicU32; CHANNELS],
     /// **What everything is aligned TO** — the largest of the sixteen
     /// channel chains, and nothing else.
@@ -2240,6 +2247,7 @@ impl Shared {
             muted: AtomicU64::new(0),
             auto_suspend: AtomicU64::new(0),
             seat_latency: (0..RACK_SEATS * INSERTS).map(|_| AtomicU32::new(0)).collect(),
+            seat_gr: (0..RACK_SEATS * INSERTS).map(|_| AtomicU32::new(0)).collect(),
             lane_latency: std::array::from_fn(|_| AtomicU32::new(0)),
             lufs: std::array::from_fn(|_| {
                 AtomicU32::new(crate::loudness::ABSOLUTE_GATE.to_bits())
@@ -3098,6 +3106,23 @@ fn run_rack(
         if !p.voice {
             if let Some(n) = p.backend.reported_latency() {
                 Rack::set_latency(shared, seat, bay, n);
+            }
+            // **And the meter, for a built-in with a gain element.** The
+            // unit's own read resets its max-hold, so this drains it every
+            // block; `fetch_max` on the bits — non-negative dB, the
+            // `strip_peak` trick — accumulates across the blocks of one UI
+            // frame, and the UI's read (`Engine::insert_gr_db`) resets the
+            // cell. A zero is not written: the swap-on-read is what decays
+            // the meter, and writing zeroes would be a race with it for no
+            // information.
+            if let Backend::Builtin(unit) = &mut p.backend {
+                if let Some(gr) = unit.gain_reduction_db() {
+                    if gr > 0.0 {
+                        if let Some(cell) = shared.seat_gr.get(seat * INSERTS + bay) {
+                            cell.fetch_max(gr.to_bits(), Ordering::Relaxed);
+                        }
+                    }
+                }
             }
         }
         let wrote = p.channels.max(1);
@@ -9134,6 +9159,11 @@ impl Engine {
             // would hold every other lane late forever, waiting on a plugin
             // that is no longer there.
             Rack::set_latency(&self.shared, strip, slot, 0);
+            // And its meter reads nothing: one stale fetch_max would flash
+            // the next tenant's needle with the old compressor's work.
+            if let Some(cell) = self.shared.seat_gr.get(strip * INSERTS + slot) {
+                cell.store(0, Ordering::Relaxed);
+            }
             // A refused UNLOAD changes nothing worth reporting: the box is
             // empty, and the seat keeps its tenant until the callback drains
             // the ring or the engine is torn down.
@@ -10094,6 +10124,87 @@ impl Engine {
             .and_then(Option::as_ref)
             .map(tangent_host::StateHandle::parameters)
             .unwrap_or_default()
+    }
+
+    /// **One knob of one built-in bay, turned live from a face.**
+    ///
+    /// The LV2 window's road, driven from the other end: the LEDGER is
+    /// written first — `insert_builtin` is what `save_insert_state` reads, so
+    /// the durable truth never lags the sound — and then the same value rides
+    /// the `ui_params` ring the plugin windows already use, to be merged into
+    /// the bay's per-block automation queue and applied by
+    /// `Backend::process_effect` before the next block. No locks anywhere on
+    /// the way: an SPSC ring in, an atomic-free ledger on this thread.
+    ///
+    /// `false` when nothing moved: a seat or bay out of range, a bay that is
+    /// not a built-in, an id its spec does not name (a face built against a
+    /// newer unit must move NOTHING rather than the wrong knob), or a value
+    /// that is not a number. A full ring still answers `true` — the ledger
+    /// took the value, and the next movement of the same knob re-sends it,
+    /// so the loss is a frame of lag on a drag.
+    pub fn set_insert_param(&mut self, strip: usize, slot: usize, id: u32, value: f32) -> bool {
+        if !value.is_finite() {
+            return false;
+        }
+        let value = value.clamp(0.0, 1.0);
+        let Some(bay) = self
+            .insert_builtin
+            .get_mut(strip)
+            .and_then(|r| r.get_mut(slot))
+            .and_then(Option::as_mut)
+        else {
+            return false;
+        };
+        let Some(at) = bay.spec.params.iter().position(|p| p.id == id) else {
+            return false;
+        };
+        bay.values[at] = value;
+        // Dropped rather than clamped on a conversion that cannot fit, the
+        // `poll_editor` rule: a saturated index delivers the edit to the
+        // WRONG bay, which is worse than not delivering it. (The guards
+        // above make this unreachable today; the conversion is still not
+        // trusted.)
+        let (Ok(lane), Ok(bay8)) = (u16::try_from(strip), u8::try_from(slot)) else {
+            return true;
+        };
+        if let Ok(mut tx) = self.ui_params.try_borrow_mut() {
+            let _ = tx.push(UiParam {
+                lane,
+                bay: bay8,
+                id,
+                value: f64::from(value),
+            });
+        }
+        true
+    }
+
+    /// The built-in unit seated in one bay, as its spec and its current
+    /// values — what the host pushes across the firewall as a face. `None`
+    /// for an empty bay or a plugin bay; the values are the ledger's, which
+    /// is the durable truth ([`crate::builtin_fx::BuiltinBay`]).
+    pub fn builtin_insert(
+        &self,
+        strip: usize,
+        slot: usize,
+    ) -> Option<(&'static crate::builtin_fx::UnitSpec, &[f32])> {
+        let bay = self
+            .insert_builtin
+            .get(strip)?
+            .get(slot)?
+            .as_ref()?;
+        Some((bay.spec, &bay.values))
+    }
+
+    /// How many dB of gain reduction one built-in bay applied since the last
+    /// read — max-hold, read-and-RESET, the `strip_peaks` contract. Zero for
+    /// everything that is not a compressor working, including a bay out of
+    /// range. Read once a frame by the host and forwarded to the open face;
+    /// reading it twice a frame would flatten the needle.
+    pub fn insert_gr_db(&self, strip: usize, slot: usize) -> f32 {
+        let Some(cell) = self.shared.seat_gr.get(strip * INSERTS + slot) else {
+            return 0.0;
+        };
+        f32::from_bits(cell.swap(0, Ordering::Relaxed))
     }
 
     pub fn output(&self) -> &OutputInfo {
@@ -14477,6 +14588,150 @@ mod tests {
             .expect("load")
             .expect("loaded");
         assert_eq!(e.insert(0, 0).unwrap().class, "Tangent Trim");
+    }
+
+    /// **Every suite unit loads like a plugin and the bay says so** — the
+    /// four kernels behind their sentinels, each answering the ledger, the
+    /// face accessor and the automation lanes, and each rendering finite
+    /// audio through a real rack. One walk, because the row count is the
+    /// contract: a unit that stops publishing its params is a face with no
+    /// knobs and an automation menu with a hole in it.
+    #[test]
+    fn every_suite_unit_loads_into_a_bay_and_answers_its_lanes() {
+        use crate::builtin_fx::{COMP_PATH, EQ_PATH, IMAGER_PATH, TAPE_PATH};
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        let cases: [(&str, &str, usize); 4] = [
+            (EQ_PATH, "Tangent EQ", 15),
+            (IMAGER_PATH, "Tangent Imager", 3),
+            (TAPE_PATH, "Tangent Tape", 6),
+            (COMP_PATH, "Tangent Comp", 7),
+        ];
+        for (i, (path, class, lanes)) in cases.iter().enumerate() {
+            // One per seat, bay 0 — four different racks holding the whole
+            // suite at once, which is also what a real desk will do.
+            let seat = 4 + i;
+            let loaded = e
+                .load_insert(seat, 0, Some(Path::new(path)), None)
+                .expect("a suite unit must load")
+                .expect("a load reports what it seated");
+            assert_eq!(loaded.class, *class);
+            assert_eq!(loaded.vendor, "built in");
+            let offered = e.insert_parameters(seat, 0);
+            assert_eq!(offered.len(), *lanes, "{path} offers {} lanes", offered.len());
+            let (spec, values) = e.builtin_insert(seat, 0).expect("a face to push");
+            assert_eq!(spec.path, *path);
+            assert_eq!(values, spec.defaults(), "{path} did not open at its defaults");
+        }
+        let mut out = vec![0.0f32; 512 * 2];
+        e.render_offline(&mut out);
+        assert!(out.iter().all(|s| s.is_finite()));
+    }
+
+    /// **An untouched EQ is a null through the real rack** — every band off
+    /// is the shipped default, and the planar hand-in, interleave adapter
+    /// and copy-back must not cost a bit.
+    #[test]
+    fn an_untouched_eq_is_a_null_through_the_master_rack() {
+        let flat = drums_through_master_bay(None);
+        let through = drums_through_master_bay(Some((crate::builtin_fx::EQ_PATH, None)));
+        assert!(flat.iter().any(|s| s.abs() > 0.001), "the fixture made no sound");
+        assert_eq!(flat.len(), through.len());
+        for (i, (a, b)) in flat.iter().zip(&through).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "sample {i}: {a} flat, {b} through the EQ");
+        }
+    }
+
+    /// **The live road moves the sound, the ledger and the sidecar** — a
+    /// knob turned through `set_insert_param` reaches the audio thread over
+    /// the ring (the compressor's meter proves the squeeze), lands in the
+    /// durable ledger (`save_insert_state` carries it), and survives an
+    /// unload and a reload. An id the unit does not have moves nothing,
+    /// which is what lets a face outlive the unit it was built against.
+    #[test]
+    fn the_live_road_moves_the_comp_and_the_meter_answers() {
+        use crate::builtin_fx::COMP_PATH;
+        let seat = tangent_ui::recorder::MASTER_SEAT;
+        let spec = crate::builtin_fx::spec_for(COMP_PATH).unwrap();
+
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        e.set_pad_kit(5, test_kit(&[0], 4_800, 0.5));
+        e.set_channel_gain(5, 1.0);
+        e.set_drum_strips(1 << 5);
+        // Loaded NEUTRAL — threshold at the top, ratio a wire — so whatever
+        // gain reduction appears later is the road's doing and nobody
+        // else's.
+        let mut neutral = spec.defaults();
+        neutral[0] = 1.0;
+        neutral[1] = 0.0;
+        let state = crate::builtin_fx::state_text(spec, &neutral).into_bytes();
+        e.load_insert(seat, 0, Some(Path::new(COMP_PATH)), Some(&state))
+            .expect("the comp loads")
+            .expect("the bay reports it");
+
+        // Warm-up: the hand-off ring drains at the top of the first render.
+        let mut out = vec![0.0f32; 1024 * 2];
+        for _ in 0..4 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+        }
+        e.set_midi_clips(vec![PlacedMidi {
+            strip: 5,
+            start: 0,
+            len: 48_000,
+            notes: Arc::new(vec![ClipNote { at: 0, dur: 2_400, key: PAD_BASE, vel: 100 }]),
+        }]);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        for _ in 0..4 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+        }
+        let idle = e.insert_gr_db(seat, 0);
+        assert!(idle < 0.5, "a neutral comp metered {idle:.2} dB of reduction");
+
+        // The road: an unknown id first, which must move NOTHING —
+        assert!(!e.set_insert_param(seat, 0, 999, 0.0), "an unknown id was accepted");
+        assert_eq!(
+            e.builtin_insert(seat, 0).unwrap().1,
+            neutral.as_slice(),
+            "an unknown id moved a knob in the ledger"
+        );
+        // — then the real ones: threshold to the floor, ratio up to 4:1.
+        assert!(e.set_insert_param(seat, 0, 0, 0.0));
+        assert!(e.set_insert_param(seat, 0, 1, 0.463));
+
+        e.set_transport(1, 0);
+        let mut gr = 0.0f32;
+        for _ in 0..6 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            gr = gr.max(e.insert_gr_db(seat, 0));
+        }
+        assert!(
+            gr > 6.0,
+            "the floored threshold only squeezed {gr:.2} dB — the road went nowhere"
+        );
+        // Read-and-reset: no render between two reads, the second is empty.
+        let _ = e.insert_gr_db(seat, 0);
+        assert_eq!(e.insert_gr_db(seat, 0), 0.0, "the meter did not reset on read");
+
+        // The ledger is the durable truth: the sidecar carries the move…
+        let saved = e.save_insert_state(seat, 0).expect("a built-in bay answers");
+        let values = crate::builtin_fx::values_from_state(spec, &saved).unwrap();
+        assert_eq!(values[0], 0.0, "the threshold move never reached the state");
+        assert_eq!(values[1], 0.463, "the ratio move never reached the state");
+
+        // …and a reload restores it.
+        e.load_insert(seat, 0, None, None).expect("unload");
+        e.render_offline(&mut out);
+        e.load_insert(seat, 0, Some(Path::new(COMP_PATH)), Some(&saved))
+            .expect("reload")
+            .expect("loaded");
+        assert_eq!(
+            e.builtin_insert(seat, 0).unwrap().1,
+            values.as_slice(),
+            "the reload lost the moved knobs"
+        );
     }
 
     /// **A folder inside a folder**, which the single descending fold has to

@@ -1212,6 +1212,51 @@ fn push_fx_params(
     app.set_fx_params(strip, bays);
 }
 
+/// **Read one seat's bays and hand the app every built-in face on it** —
+/// the `push_fx_params` precedent with the values included, called from the
+/// same place for the same reason: the reconcile is the only spot a bay's
+/// contents change, so it is the only spot the face data can go stale.
+///
+/// All three bays every time rather than just the one that moved, because an
+/// unload must CLEAR its face (the empty `BuiltinFace` is the tombstone) and
+/// the caller only knows which flat index changed, not what it used to hold.
+#[cfg(feature = "recorder")]
+fn push_builtin_faces(
+    app: &mut tangent_ui::app::TangentApp,
+    engine: &crate::instrument::Engine,
+    strip: usize,
+) {
+    for slot in 0..tangent_ui::recorder::INSERTS {
+        let face = match engine.builtin_insert(strip, slot) {
+            Some((spec, values)) => tangent_ui::ports::BuiltinFace {
+                strip,
+                slot,
+                path: spec.path.to_owned(),
+                params: spec
+                    .params
+                    .iter()
+                    .zip(values)
+                    .map(|(p, v)| tangent_ui::ports::BuiltinFaceParam {
+                        id: p.id,
+                        symbol: p.symbol.to_owned(),
+                        name: p.name.to_owned(),
+                        units: p.units.to_owned(),
+                        default: p.default,
+                        steps: p.steps,
+                        value: *v,
+                    })
+                    .collect(),
+            },
+            None => tangent_ui::ports::BuiltinFace {
+                strip,
+                slot,
+                ..Default::default()
+            },
+        };
+        app.set_builtin_face(face);
+    }
+}
+
 /// One filter's slope, as a choice the panel can step through.
 #[cfg(feature = "recorder")]
 fn slope_choice(key: &str, default: crate::effects::Slope) -> tangent_ui::ports::ChoiceParam {
@@ -2144,6 +2189,21 @@ impl DesktopApp {
                 self.app.scope_feed(&self.scope_buf, dt, rate);
             }
         }
+        // **The comp faces' gain-reduction needles**, one read per frame per
+        // loaded comp bay — the read RESETS the engine-side max-hold, so it
+        // must happen exactly once a frame and here is that once (the
+        // `strip_peaks` rule, per bay). The walk is over the same ledger the
+        // reconcile diffs every frame anyway, and a desk has a handful of
+        // comps on twelve thousand mostly-`None` rows.
+        if let Some(e) = self.recorder.engine.as_ref() {
+            let inserts = tangent_ui::recorder::INSERTS;
+            for (i, loaded) in self.recorder.inserts_loaded.iter().enumerate() {
+                if loaded.as_deref() == Some(crate::builtin_fx::COMP_PATH) {
+                    self.app
+                        .set_insert_gr(i / inserts, i % inserts, e.insert_gr_db(i / inserts, i % inserts));
+                }
+            }
+        }
         // **Read before the state is borrowed mutably.** Both are pure
         // functions of the settings, so hoisting them changes nothing but
         // the borrow.
@@ -2846,6 +2906,17 @@ impl DesktopApp {
                     }
                 }
             }
+            // **The faces follow their seats.** The app's face mirror is
+            // keyed by seat, and a carried instance changed seat without a
+            // reload — nothing below will re-push it. Only the moved rows;
+            // an unmoved face is already right.
+            if let Some(e) = self.recorder.engine.as_ref() {
+                for (seat, m) in moved.iter().enumerate() {
+                    if *m {
+                        push_builtin_faces(&mut self.app, e, seat);
+                    }
+                }
+            }
         }
         // **A pasted track's plugin STATE — BEFORE the bay reconcile below.**
         //
@@ -2917,6 +2988,11 @@ impl DesktopApp {
                         // main thread, for a list that changes when somebody
                         // loads a plugin.
                         push_fx_params(&mut self.app, e, i / inserts, inserts);
+                        // And the built-in faces on the same seat, values
+                        // included — the face data has exactly the staleness
+                        // window the parameter list has, so it travels with
+                        // it.
+                        push_builtin_faces(&mut self.app, e, i / inserts);
                         // **The window, the moment the load lands.** Only for
                         // the pick that just happened — the app's flag answers
                         // once and never for a launch restore — and only when
@@ -2937,6 +3013,8 @@ impl DesktopApp {
                         // A failed load leaves the bay empty, so the menu must
                         // not go on offering the last plugin's parameters.
                         push_fx_params(&mut self.app, e, i / inserts, inserts);
+                        // Nor its face: the tombstone push clears it.
+                        push_builtin_faces(&mut self.app, e, i / inserts);
                         let which = want
                             .as_deref()
                             .and_then(|p| p.rsplit(['/', '\\']).next())
@@ -3397,6 +3475,17 @@ impl DesktopApp {
                             self.recorder.engine_error =
                                 Some(format!("could not open the effect's window: {err}"));
                         }
+                    }
+                }
+                // A built-in face's knob, on its way to the sound. The app
+                // already mirrored the value into its own face; the engine
+                // writes the durable ledger and rides the lock-free ring to
+                // the audio thread. A refused value (unknown id, stale seat)
+                // moves nothing anywhere, which is the contract — the next
+                // face push snaps the optimistic mirror back.
+                R::SetInsertParam { strip, slot, id, value } => {
+                    if let Some(e) = self.recorder.engine.as_mut() {
+                        e.set_insert_param(strip, slot, id, value);
                     }
                 }
             }
