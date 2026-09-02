@@ -470,6 +470,7 @@ impl ArrRec {
 /// up when the electric piano was asked for. `dialogs::KEYS_PATCH_NAMES` is
 /// the same list in the same order and the picker reads it, so the two stay
 /// aligned by construction as long as nobody reorders one of them alone.
+#[cfg(feature = "recorder")]
 fn keys_patch_of(index: usize) -> crate::keys::Patch {
     crate::keys::Patch::ALL
         .get(index)
