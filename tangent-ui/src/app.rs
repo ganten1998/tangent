@@ -387,6 +387,11 @@ pub struct TangentApp {
     /// pending value shields its param until the echo matches or a grace
     /// period passes (a refused edit must not shield forever).
     pending_inserts: std::collections::HashMap<(usize, usize, u32), (f32, u8)>,
+    /// Accrued wheel intent for the three stepped consumers - see
+    /// [`WheelSteps`] for why stepping per event was the trackpad's ruin.
+    wheel_mixer_zoom: WheelSteps,
+    wheel_arr_zoom: WheelSteps,
+    wheel_media: WheelSteps,
     /// Per (SEAT, bay), the built-in compressor's gain-reduction meter in
     /// positive dB — forwarded each frame by the host for open faces.
     insert_gr: std::collections::HashMap<(usize, usize), f32>,
@@ -1346,6 +1351,42 @@ pub struct TangentApp {
     gesture_until: Option<Instant>,
     /// How many `InnerSize` commands have gone out. Probe only.
     inner_size_sends: u64,
+}
+
+/// Pixels of wheel intent, spent in whole STEPS - the arrange lane
+/// scroll's accrual rule, packaged for every stepped wheel consumer.
+/// `raw_scroll_delta` speaks two dialects: a mouse notch lands as one
+/// ~40-point event, a trackpad flick spreads the same worth across
+/// dozens of small ones plus an inertial tail after the fingers lift.
+/// Stepping once per EVENT over a half-point threshold made the pad
+/// slam a zoom from end to end on one flick; stepping once per ~36
+/// accrued points makes both dialects mean the same amount. The carry
+/// decays whenever the wheel goes quiet, so a fading tail can never
+/// bank a phantom step for the next gesture.
+#[derive(Default)]
+struct WheelSteps {
+    carry: f32,
+}
+
+impl WheelSteps {
+    /// About a mouse notch's worth of raw points.
+    const NOTCH: f32 = 36.0;
+
+    /// Feed this frame's delta over the consumer's hotspot (zero when the
+    /// wheel is quiet there); take back how many whole steps it earned.
+    fn steps(&mut self, delta: f32) -> i32 {
+        if delta == 0.0 {
+            self.carry *= 0.75;
+            if self.carry.abs() < 1.0 {
+                self.carry = 0.0;
+            }
+            return 0;
+        }
+        self.carry += delta;
+        let n = (self.carry / Self::NOTCH).trunc();
+        self.carry -= n * Self::NOTCH;
+        n as i32
+    }
 }
 
 /// A band control the pointer is holding.
@@ -2413,6 +2454,9 @@ impl TangentApp {
             fx_params: std::collections::HashMap::new(),
             builtin_faces: std::collections::HashMap::new(),
             pending_inserts: std::collections::HashMap::new(),
+            wheel_mixer_zoom: WheelSteps::default(),
+            wheel_arr_zoom: WheelSteps::default(),
+            wheel_media: WheelSteps::default(),
             insert_gr: std::collections::HashMap::new(),
             arr_auto_params: std::collections::HashMap::new(),
             arr_auto_hot: None,
@@ -13470,18 +13514,21 @@ impl TangentApp {
                 self.media_drag = None;
             }
         }
-        // The wheel walks the listing, three rows a notch, over its pane.
+        // The wheel walks the listing, three rows a NOTCH of accrued
+        // intent (see WheelSteps) — per event it walked three rows thirty
+        // times per trackpad flick.
         let scroll_y = ctx.input(|i| i.raw_scroll_delta.y);
-        if scroll_y.abs() > 0.5 {
-            if let Some(p) = hover_pos {
-                let l = crate::drumpad_panel::Layout::new(rect);
-                if l.media.is_positive() && l.media.contains(p) {
-                    let step = if scroll_y < 0.0 { 3isize } else { -3 };
-                    let max = self.media_entries.len().saturating_sub(1);
-                    self.media_scroll =
-                        (self.media_scroll as isize + step).clamp(0, max as isize) as usize;
-                }
-            }
+        let over_media = hover_pos.is_some_and(|p| {
+            let l = crate::drumpad_panel::Layout::new(rect);
+            l.media.is_positive() && l.media.contains(p)
+        });
+        let steps = self
+            .wheel_media
+            .steps(if over_media { scroll_y } else { 0.0 });
+        if steps != 0 {
+            let max = self.media_entries.len().saturating_sub(1);
+            self.media_scroll = (self.media_scroll as isize - 3 * steps as isize)
+                .clamp(0, max as isize) as usize;
         }
         // **`pad_at` answers a panel SLOT (0..16); the kit speaks KEYS
         // (0..128).** Both drop paths passed the slot straight to
@@ -15903,13 +15950,14 @@ impl TangentApp {
                     // it, exactly as the mixer's zoom already does.
                     let d = scroll.x + scroll.y;
                     if shift && d.abs() > 0.5 {
-                        // **Shift+wheel ZOOMS the lane count** — one lane per
-                        // tick, the mixer's own gesture on the vertical desk.
-                        // Same 0.5 notch threshold as the mixer and the midi
-                        // editor: a trackpad's inertial tail, or a balanced
-                        // diagonal that sums to zero, must not tick a lane.
+                        // **Shift+wheel ZOOMS the lane count** — one lane
+                        // per NOTCH of accrued intent (see WheelSteps): the
+                        // 0.5-point threshold kept a balanced diagonal out
+                        // but let a trackpad flick tick once per EVENT, and
+                        // a flick is thirty events plus a tail.
+                        let steps = self.wheel_arr_zoom.steps(d);
                         let cur = self.settings.arr_visible as i64;
-                        let next = (cur + if d > 0.0 { 1 } else { -1 })
+                        let next = (cur + i64::from(steps))
                             .clamp(1, crate::recorder::CHANNELS as i64);
                         if next != cur {
                             self.settings.arr_visible = next as u8;
@@ -26285,10 +26333,12 @@ impl TangentApp {
                 if d.abs() > 0.5 {
                     if shift {
                         // **Shift+wheel ZOOMS the visible count** — one
-                        // channel per tick. Wheel up shows more (each
-                        // narrower); down shows fewer (each wider).
+                        // channel per NOTCH of accrued intent, not per
+                        // event: a trackpad flick used to slam this from
+                        // eight to thirty-two on its inertial tail alone.
+                        let steps = self.wheel_mixer_zoom.steps(d);
                         let cur = self.settings.mixer_visible as i64;
-                        let next = (cur + if d > 0.0 { 1 } else { -1 })
+                        let next = (cur + i64::from(steps))
                             .clamp(1, crate::recorder::CHANNELS as i64);
                         if next != cur {
                             self.settings.mixer_visible = next as u8;
@@ -39144,6 +39194,36 @@ mod folder_tests {
         // And onto itself.
         a.snap_into_folder(1, 1);
         assert!(!a.in_folder(1));
+    }
+
+    /// **A trackpad flick is worth its points, not its event count.** The
+    /// stepped wheel consumers accrue intent and spend it in whole notches:
+    /// thirty small events summing to one notch step ONCE, a fading
+    /// inertial tail banks nothing, and a mouse notch still steps exactly
+    /// once. This is the difference between a zoom and a slot machine.
+    #[test]
+    fn a_trackpad_flick_steps_by_its_worth_not_its_event_count() {
+        let mut w = WheelSteps::default();
+        // One mouse notch: one event, one step.
+        assert_eq!(w.steps(40.0), 1);
+        // A flick: thirty 4-point events = 120 points = 3 notches TOTAL.
+        let mut total = 0;
+        for _ in 0..30 {
+            total += w.steps(4.0);
+        }
+        assert_eq!(total, 3, "a 120-point flick is worth three notches");
+        // The inertial tail: sub-notch dribble, then quiet - the carry
+        // decays and no phantom step fires later.
+        for _ in 0..6 {
+            total += w.steps(2.0);
+        }
+        for _ in 0..30 {
+            total += w.steps(0.0);
+        }
+        assert_eq!(total, 3, "the tail banked a phantom step");
+        assert_eq!(w.steps(40.0), 1, "a fresh notch after quiet still steps once");
+        // And direction reverses cleanly.
+        assert_eq!(w.steps(-80.0), -2);
     }
 
     /// **The per-channel flags follow a reorder.** `strip_to_theory` did not,
