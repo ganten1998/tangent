@@ -15890,7 +15890,7 @@ mod tests {
             (IMAGER_PATH, "Tangent Imager", 3),
             (TAPE_PATH, "Tangent Tape", 6),
             (COMP_PATH, "Tangent Comp", 7),
-            (DENOISE_PATH, "Tangent Denoise", 6),
+            (DENOISE_PATH, "Tangent Denoise", 7),
             (AMP_PATH, "Tangent Amp", 9),
             (DRIVE_PATH, "Tangent Drive", 4),
             (TREM_PATH, "Tangent Trem", 3),
