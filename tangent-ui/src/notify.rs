@@ -37,7 +37,9 @@
 //! - **Level-triggered.** "No MIDI input ports found", "the input device
 //!   disappeared". Not an event: a CONDITION, true until it stops being true,
 //!   and re-checked every frame by a caller that has no idea whether it has
-//!   said this before. [`Notifications::raise`] and [`Notifications::lower`].
+//!   said this before. [`Notifications::raise`] and [`Notifications::lower`],
+//!   with [`Notifications::insist`] for the caller that is not re-checking at
+//!   all — a menu row, a button — and must be answered the once it asks.
 //! - **Progressive.** "Scanning plugins... 40 of 112" — one message whose TEXT
 //!   changes. [`Notifications::update`], or simply raising the same key again
 //!   with new words.
@@ -50,6 +52,15 @@
 //! until the device comes back and the caller
 //! [`lower`](Notifications::lower)s the condition; without that memory the
 //! message reappears on the very next frame and the click reads as broken.
+//!
+//! **Unless the user ASKS again, which is not the same as the app repeating
+//! itself.** A dismissal answers one asking of the question, and both MIDI
+//! conditions are asked by a press rather than by a per-frame check — so
+//! choosing MIDI Input from the menu after dismissing "No MIDI input ports
+//! found" got no answer of any kind, for the rest of the session. That door
+//! is [`Notifications::insist`]: same key, same standing message, but the
+//! mute goes and the words appear, because a request the user made by hand
+//! has to produce something.
 //!
 //! **But only the USER's click means that.** The other way a standing message
 //! can leave is the cap taking its slot for a newer arrival, and for a while
@@ -443,7 +454,8 @@ pub struct Notifications {
     /// anything is being said about it. These are code-authored condition
     /// names, one per condition currently true, so the set is small and static
     /// in a way user text never would be. Only [`Self::lower`] — the condition
-    /// genuinely ending — forgets a key.
+    /// genuinely ending — forgets a key; [`Self::insist`] adds one, because a
+    /// user asking by hand is an episode of the condition too.
     raised: BTreeSet<String>,
     /// The conditions whose message the USER took down.
     ///
@@ -458,7 +470,12 @@ pub struct Notifications {
     /// here, and only that suppresses a re-raise; an eviction leaves the
     /// condition able to say itself again the moment there is room to. Cleared
     /// with the condition, so a fault that comes back after genuinely clearing
-    /// is news again.
+    /// is news again — and cleared by [`Self::insist`], because a user who
+    /// asks the question a second time is owed the answer a second time.
+    ///
+    /// **Only a key that is still RAISED may be muted.** See [`Self::dismiss`]:
+    /// a note lives on through its fade after its condition is lowered, so a
+    /// click during that tail was writing a mute nothing would ever clear.
     muted: BTreeSet<String>,
 }
 
@@ -555,6 +572,11 @@ impl Notifications {
     /// comes back by itself on the frame one frees. What cannot happen any
     /// more is the third case, where a message the cap tidied away was never
     /// seen again.
+    ///
+    /// **So this door is only for a caller that will ask again next frame.**
+    /// An event-driven one — a menu row, a Connect button — asks once, and
+    /// `None` reaches it as "the app did nothing at all". Those callers want
+    /// [`Self::insist`], which cannot answer `None`.
     pub fn raise(
         &mut self,
         key: impl Into<String>,
@@ -615,6 +637,65 @@ impl Notifications {
         self.items.iter().filter(|n| !n.leaving()).count() < VISIBLE
     }
 
+    /// Say a condition NOW, because the user just asked to be told.
+    ///
+    /// **The door [`Self::raise`] cannot be, and the reason both exist.**
+    /// `raise` is built for a caller that re-checks its condition every frame:
+    /// it answers `None` while the message is muted or the column is full,
+    /// and that is right, because such a caller is already saying so on the
+    /// next frame and every frame after. Both of this app's MIDI conditions
+    /// have callers of the OTHER shape — a menu row, a picker's Connect
+    /// button — which are EVENT-driven and ask exactly once. For them `None`
+    /// is not "already covered", it is silence: the user picked MIDI Input
+    /// from the menu, having dismissed "No MIDI input ports found" an hour
+    /// ago, and the app did nothing whatsoever. Forever, because only
+    /// [`Self::lower`] forgot a mute and nothing was ever going to lower a
+    /// condition that never stopped being true.
+    ///
+    /// **An explicit request must always produce an answer**, so this one
+    /// does: the mute goes, because the user has just asked the same question
+    /// again and a dismissal answers the LAST asking of it; and the message
+    /// is minted whether or not there is a free slot, letting [`Self::cap`]
+    /// retire the oldest as it does for any other arrival. That is safe here
+    /// in a way it would not be in `raise`: this is one message per press,
+    /// not five conditions rotating through four slots sixty times a second.
+    ///
+    /// Everything else is `raise`'s: the message STANDS with no clock, it is
+    /// one message however often it is asked for, and [`Self::lower`] is
+    /// still what ends it when the condition genuinely clears. A note already
+    /// on screen for this key takes the new words and keeps its identity — a
+    /// note on its way OUT does not, because handing an explicit request back
+    /// a box that is already fading is the same silence in slower motion.
+    pub fn insist(
+        &mut self,
+        key: impl Into<String>,
+        kind: Kind,
+        text: impl Into<String>,
+    ) -> NoteId {
+        let key = key.into();
+        let text = text.into();
+        self.muted.remove(&key);
+        self.raised.insert(key.clone());
+        // Newest first and never one that is leaving, for the reason `raise`
+        // reads the stack backwards: a condition lowered a moment ago still
+        // has a note wearing its key while its tail runs.
+        if let Some(n) = self
+            .items
+            .iter_mut()
+            .rev()
+            .find(|n| n.key.as_deref() == Some(key.as_str()) && !n.leaving())
+        {
+            if n.text != text {
+                n.text = text;
+            }
+            return n.id;
+        }
+        let id = self.mint();
+        self.items.push(Note::standing(id, kind, text, key));
+        self.cap();
+        id
+    }
+
     /// The condition has cleared: take its message down.
     ///
     /// It LEAVES rather than blinking out — the same tail everything else gets
@@ -655,16 +736,24 @@ impl Notifications {
     /// column and then flicker between the survivors; the same message saying
     /// something new is what actually happened, so that is what this does.
     ///
-    /// **`false` means one thing and one thing only: the user took it down.**
-    /// It used to be able to mean "refused" as well — the clock was put back
-    /// through [`Note::refresh`], whose bound is about DUPLICATES, so a scan
-    /// that ran longer than one lifetime had its report expire underneath it
-    /// at eight seconds and every later update was reporting into a message
-    /// nobody could see. A caller holding a handle is the message's author,
-    /// not a duplicate arriving, so the clock goes back every call — see
-    /// [`Note::renew`] for why that is not the unkillable message. A scan of
-    /// any length is now one line that counts, and the frame it stops being
-    /// one is the frame the user clicked it away.
+    /// **`false` means the message is no longer in the queue, and there are
+    /// two ways for that to be true.** Usually it is the user: they clicked
+    /// the box away, and a report nobody wants to see is a report that should
+    /// stop being written. But the cap can take it as well — a burst past
+    /// `VISIBLE + 1` drops what is already leaving and then the oldest, and a
+    /// progress report that has been sitting still while fifty errors landed
+    /// on top of it can be that oldest. So `false` is "it is gone", not "the
+    /// user is finished with it", and a caller that wants to distinguish the
+    /// two has to ask [`Self::is_empty`] or look at what else it has been
+    /// pushing. **What `false` no longer means is "refused".** The clock used
+    /// to be put back through [`Note::refresh`], whose bound is about
+    /// DUPLICATES, so a scan that ran longer than one lifetime had its report
+    /// expire underneath it at eight seconds and every later update was
+    /// reporting into a message nobody could see. A caller holding a handle is
+    /// the message's author, not a duplicate arriving, so the clock goes back
+    /// every call — see [`Note::renew`] for why that is not the unkillable
+    /// message. A scan of any length is one line that counts, and it takes
+    /// something outside the scan to end it.
     ///
     /// The clock goes back even when the words have not changed, because a
     /// scan stuck on one slow plugin for six seconds is still running and its
@@ -734,12 +823,25 @@ impl Notifications {
     ///
     /// A message raised against a condition stays dismissed: the key is
     /// MUTED here, and re-raising will not put it back until the condition
-    /// clears. Only [`Self::lower`] forgets a mute — see [`Self::muted`] for
-    /// why that memory is not the same one as `raised`.
+    /// clears. Only [`Self::lower`] and [`Self::insist`] forget a mute — see
+    /// [`Self::muted`] for why that memory is not the same one as `raised`.
+    ///
+    /// **Only a dismissal of a condition that is still STANDING may mute it,
+    /// and that qualifier cost the same fault twice.** [`Self::lower`] retires
+    /// a note rather than deleting it — the tail is how a message leaves — so
+    /// for the half-second after a condition clears there is still a box on
+    /// screen wearing its key, and it is still clickable. Muting on that click
+    /// wrote a mute for a key nothing had raised, and since only `lower`
+    /// forgets a mute and the condition was already lowered, the NEXT episode
+    /// of that fault was silenced before it happened: the device came back,
+    /// went again, and said nothing at all. So the key is consulted first.
+    /// Clicking a message on its way out means "I have read it", which is what
+    /// the fade was already saying; it cannot mean "and do not tell me next
+    /// time", because there is no condition left for next time to be about.
     pub fn dismiss(&mut self, id: NoteId) -> Option<Note> {
         let i = self.items.iter().position(|n| n.id == id)?;
         let note = self.items.remove(i);
-        if let Some(key) = note.key.as_deref() {
+        if let Some(key) = note.key.as_deref().filter(|k| self.raised.contains(*k)) {
             self.muted.insert(key.to_owned());
         }
         Some(note)
@@ -1814,6 +1916,156 @@ mod tests {
         assert!(n
             .raise("dev", Kind::Error, "The input device disappeared")
             .is_some());
+    }
+
+    /// **A request the user made by hand is always answered.**
+    ///
+    /// `raise` goes quiet while a key is muted, which is exactly right for the
+    /// caller it was built for — one that re-checks its condition every frame
+    /// and is therefore already saying so. Both MIDI callers are the other
+    /// shape: a menu row and a picker's Connect button, each asking once. So
+    /// dismissing "No MIDI input ports found" and then choosing MIDI Input
+    /// from the menu produced nothing at all — no message, no picker, no
+    /// answer — and went on producing nothing for the rest of the session,
+    /// because the only thing that forgot a mute was a `lower` nothing was
+    /// ever going to call for a condition that never stopped being true.
+    #[test]
+    fn an_explicit_request_is_answered_however_often_it_was_dismissed() {
+        let mut n = Notifications::new();
+        n.tick(0.0);
+        let first = n.insist("midi-in", Kind::Error, "No MIDI input ports found");
+        assert!(n.is_raised("midi-in"), "an insisted condition forgot itself");
+        assert!(
+            n.get(first).is_some_and(Note::is_standing),
+            "a condition was given a clock"
+        );
+        // Asking again while it stands is one message with new words, exactly
+        // as `raise` would have it.
+        assert_eq!(
+            n.insist("midi-in", Kind::Error, "No MIDI input ports found, still"),
+            first,
+            "a second asking minted a second message"
+        );
+        assert_eq!(n.len(), 1);
+        assert_eq!(
+            n.get(first).map(|x| x.text.as_str()),
+            Some("No MIDI input ports found, still")
+        );
+
+        // The user takes it down. `raise` must stay quiet — that is its whole
+        // contract and the reason a dismissal feels like a dismissal.
+        assert!(n.dismiss(first).is_some());
+        assert!(n.is_muted("midi-in"), "a dismissal was not remembered");
+        assert_eq!(
+            n.raise("midi-in", Kind::Error, "No MIDI input ports found"),
+            None,
+            "a re-check spoke over a dismissal"
+        );
+
+        // ...and the user asks again, by hand. That has to say something.
+        let again = n.insist("midi-in", Kind::Error, "No MIDI input ports found");
+        assert_ne!(again, first, "the dismissed message came back from the dead");
+        assert!(!n.is_muted("midi-in"), "the mute survived the asking");
+        assert!(
+            n.get(again).is_some_and(Note::is_standing),
+            "the answer to an explicit request was not on screen"
+        );
+
+        // And a full column is not an answer either. `raise` waits for a slot
+        // because five conditions rotating through four of them is a strobe;
+        // one press is not a strobe, so it takes a slot the way any arrival
+        // does and the cap retires the oldest.
+        n.clear();
+        for i in 0..VISIBLE {
+            n.info(format!("Exported take {i}"));
+        }
+        let crowded = n.insist("midi-in", Kind::Error, "No MIDI input ports found");
+        assert!(
+            n.get(crowded).is_some_and(|x| !x.leaving()),
+            "the answer to an explicit request waited for a slot that a menu \
+             press will never come back for"
+        );
+        // Still the condition's own message, so the condition still ends it.
+        assert!(n.lower("midi-in"));
+        assert!(!n.is_raised("midi-in"));
+    }
+
+    /// **A message dismissed on its way OUT must not mute the next episode.**
+    ///
+    /// `lower` retires the note rather than deleting it — the tail is how
+    /// everything here leaves — so for half a second after a condition clears
+    /// there is still a box on screen wearing its key, and it is still
+    /// clickable. Muting on that click wrote a mute for a key nothing had
+    /// raised, and since only `lower` forgets a mute and the condition had
+    /// already been lowered, the mute outlived everything: the device came
+    /// back, went again, and said nothing at all.
+    #[test]
+    fn a_click_on_a_leaving_message_does_not_silence_the_next_one() {
+        let mut n = Notifications::new();
+        let mut t = 0.0_f64;
+        n.tick(t);
+        let id = n
+            .raise("dev", Kind::Error, "The input device disappeared")
+            .expect("the fault said nothing at all");
+        // The device comes back: the condition clears and the box starts to go.
+        assert!(n.lower("dev"));
+        assert!(!n.is_raised("dev"));
+        assert!(
+            n.get(id).is_some_and(Note::leaving),
+            "a lowered message vanished between frames"
+        );
+        // The user clicks the fading box — "I have read it", which the fade
+        // was already saying. It cannot mean "and not next time", because
+        // there is no condition left for next time to be about.
+        assert!(n.dismiss(id).is_some(), "the leaving box was not clickable");
+        assert!(
+            !n.is_muted("dev"),
+            "dismissing a message whose condition had already cleared muted a \
+             key nothing had raised"
+        );
+        // So the next episode is news, and says itself.
+        advance(&mut n, &mut t, 1.0);
+        let next = n.raise("dev", Kind::Error, "The input device disappeared");
+        assert!(
+            next.is_some(),
+            "the next time the device went, the app said nothing"
+        );
+        // And a dismissal of a STANDING message still sticks, which is the
+        // half of this that must not be lost.
+        assert!(n.dismiss(next.expect("the fault said nothing")).is_some());
+        assert!(n.is_muted("dev"), "a real dismissal stopped being remembered");
+        assert_eq!(
+            n.raise("dev", Kind::Error, "The input device disappeared"),
+            None
+        );
+    }
+
+    /// **`false` from `update` means gone, and the user is only one of the
+    /// ways to be gone.**
+    ///
+    /// The doc said in bold that it meant the user took the message down. The
+    /// cap can take it too — the hard ceiling drops what is leaving and then
+    /// the oldest — so a progress report sitting still under a burst of device
+    /// errors is exactly the note that disappears without anybody clicking
+    /// anything.
+    #[test]
+    fn the_cap_can_be_the_reason_an_update_finds_nothing() {
+        let mut n = Notifications::new();
+        n.tick(0.0);
+        let scan = n.info("Scanning plugins... 1 of 112");
+        assert!(
+            n.update(scan, "Scanning plugins... 2 of 112"),
+            "the report was not there"
+        );
+        // A burst past the hard ceiling. Nobody clicked anything.
+        for i in 0..20 {
+            n.error(format!("input {i} went away"));
+        }
+        assert!(n.get(scan).is_none(), "the ceiling kept the progress note");
+        assert!(
+            !n.update(scan, "Scanning plugins... 40 of 112"),
+            "update claimed to have reached a message the cap had dropped"
+        );
     }
 
     /// **The cap's boundary survives a float round trip.**

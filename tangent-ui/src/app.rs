@@ -271,6 +271,18 @@ const WM_GRACE: Duration = Duration::from_millis(600);
 /// that stands until somebody looks again is the honest shape for a fault
 /// nothing is watching for.
 ///
+/// **And because nothing polls them, both go up through
+/// [`TangentApp::notify_insist`] rather than `notify_raise`.** A raise is
+/// allowed to answer "already covered" — it is built for a caller that will
+/// say the same thing again on the next frame, and that is what lets a
+/// dismissal stick without the message flickering back. Neither of these has
+/// such a caller: one is a menu row and the other is a picker's Connect
+/// button, each asking exactly once. Refusing them is not thrift, it is the
+/// app going silent on a press — dismiss "No MIDI input ports found" and the
+/// menu row did nothing whatsoever, for the rest of the session. The
+/// dismissal still sticks, because nothing re-raises these between presses;
+/// it just does not outlive the next asking.
+///
 /// There is no MIDI input port at all.
 const MIDI_IN_KEY: &str = "midi-in-missing";
 
@@ -1106,6 +1118,9 @@ pub struct TangentApp {
     /// The last displayed set written by `log_fret_state`. Dev hook only.
     dbg_fret_last: Option<Vec<u8>>,
     /// The × on the status row was pressed. Taken by the host.
+    ///
+    /// Nothing sets it any longer — see `take_dismiss_message`, which is where
+    /// the reasoning lives and why the door stays open.
     dismiss_message: bool,
     /// Which stepped parameter's list is open over the effect panel.
     ///
@@ -1141,14 +1156,29 @@ pub struct TangentApp {
     /// where it is filled, at the end of `paint`, for why it has to be last
     /// frame's geometry and why it is the boxes and not their union.
     notify_boxes: Vec<Rect>,
-    /// The band message the notice window was last CLOSED on.
+    /// Who the gesture in flight belongs to, decided by where its press
+    /// landed — or `None` while no button is down at all.
     ///
-    /// Some messages cannot be cleared by dismissing them — a camera still
-    /// warming up goes on warming up — so without this latch the window would
-    /// reopen on the very next frame and could never be put away. A message
-    /// that CHANGES no longer matches the latch, so genuinely new news opens a
-    /// window again. See `dialogs::show_notice`.
-    notice_dismissed: Option<String>,
+    /// **A box that appears unbidden must never be able to take a gesture
+    /// already under way.** `dialog_blocks_pointer` used to answer this from
+    /// hover alone, and the mixer's whole input pass sits behind it — the pass
+    /// that owns the fader's RELEASE. So a notification arriving over the
+    /// pointer mid-drag hid the release from the only code that reads it: the
+    /// button came up, nothing saw it, and the fader went on following the
+    /// mouse across the desk with nothing held down. The rule that fixes it is
+    /// the one the drumpad already keeps against the piano roll — a drag that
+    /// started outside finishes outside, and only a press that BEGINS on the
+    /// layer belongs to it.
+    ///
+    /// **Three states and not two, because the RELEASE is the frame that
+    /// matters.** A bool would have to be read as "is the overlay holding
+    /// this gesture", and by the frame the button comes up there is no button
+    /// down to ask about — the answer would fall back to hover and swallow
+    /// exactly the release this exists to protect. So the gesture's owner is
+    /// remembered from its press until the end of the frame that ends it, and
+    /// only when there is genuinely no gesture (`None`) does hover decide
+    /// anything. See `track_overlay_grab`.
+    pressed_on: Option<PressLanded>,
     /// The effect panel a right-click on a knob opened, if any.
     ///
     /// One at a time, like `dialog`: three panels at once over a band this
@@ -1995,6 +2025,24 @@ fn plugin_display_name(path: &str) -> &str {
         .trim_end_matches(".VST3")
 }
 
+/// Where the press that started the gesture in flight landed.
+///
+/// **Two answers, and the point of it is that they are decided ONCE.** The
+/// transient layers over the desk — a notification box, the inline export
+/// window — can appear over a pointer that is already busy, so "is the pointer
+/// on one of them" is the wrong question to ask every frame: the honest one is
+/// "did this gesture begin on one", asked when the button went down and
+/// remembered until it comes up. See `TangentApp::pressed_on`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PressLanded {
+    /// On a notification box or the inline export window: the layer's gesture,
+    /// including its release.
+    OnOverlay,
+    /// Anywhere else — the desk, a band, a view. The layer may cover the
+    /// pointer later and still has no claim on it.
+    Below,
+}
+
 /// A mixer control being dragged. The band's [`Grab`], for the other surface.
 #[derive(Clone, Copy)]
 struct MixerGrab {
@@ -2335,7 +2383,7 @@ impl TangentApp {
             // sensible absence.
             notify_face: egui::Color32::from_rgb(0xE3, 0xD9, 0xBD),
             notify_boxes: Vec::new(),
-            notice_dismissed: None,
+            pressed_on: None,
             mixer_open: false,
             mixer_scroll_px: 0.0,
             arr_lane_scroll: 0,
@@ -18875,13 +18923,80 @@ impl TangentApp {
     /// it answers false there — which is the honest answer, not a special
     /// case.
     fn dialog_blocks_pointer(&self, ctx: &egui::Context) -> bool {
-        if dialogs::pointer_over_export(ctx) || self.pointer_over_notification(ctx) {
+        if self.overlay_owns_pointer(ctx) {
             return true;
         }
         match &self.dialog {
             None => false,
             Some(d) if d.is_modal() => true,
             Some(_) => dialogs::pointer_over_dialog(ctx),
+        }
+    }
+
+    /// Whether one of the two TRANSIENT layers over the desk owns the pointer
+    /// this frame — a notification box, or the inline export window.
+    ///
+    /// **Owning a gesture and covering a point are different questions, and
+    /// answering the second for the first stranded a drag.** These two layers
+    /// are the ones that can appear over a pointer that is already busy: a
+    /// notification arrives when it arrives, and inline the export window
+    /// reveals itself a frame after the render starts. Both were tested by
+    /// HOVER, and the mixer's whole input pass — including the release that
+    /// ends a fader drag — stands behind this answer. So a message landing
+    /// under the hand mid-drag hid the button coming up from the only code
+    /// that reads it, and the fader went on tracking the mouse with nothing
+    /// held down, until the next press somewhere else.
+    ///
+    /// A gesture belongs to whoever it STARTED on, which is the rule the
+    /// drumpad already keeps against the piano roll and the arrangement. So:
+    /// a press that begins on one of these layers is the layer's for its whole
+    /// life (`overlay_grab`, which outlasts the pointer wandering off the
+    /// box); a gesture that began anywhere else is not the layer's however
+    /// completely it now covers the pointer; and with no button down at all
+    /// the hover test is the right one, because the next press has not been
+    /// aimed yet and whatever is on top should get it.
+    fn overlay_owns_pointer(&self, ctx: &egui::Context) -> bool {
+        match self.pressed_on {
+            // A gesture is under way and its press already decided this. It
+            // holds wherever the hand has wandered to since, and it holds on
+            // the frame the button comes up, which is the one that would
+            // otherwise be lost.
+            Some(landed) => landed == PressLanded::OnOverlay,
+            // Nothing in flight. The next press has not been aimed yet, so
+            // whatever is on top of the pointer should get it.
+            None => dialogs::pointer_over_export(ctx) || self.pointer_over_notification(ctx),
+        }
+    }
+
+    /// Decide, on the frame of the press, whose gesture this is.
+    ///
+    /// Runs at the top of `paint`, before any input pass reads the pointer,
+    /// because `overlay_owns_pointer` is asked from inside those passes and
+    /// the answer has to be settled by then. Only a PRESS moves it: the frames
+    /// in between keep whatever the press decided, and `paint` clears it once
+    /// the button is up — at the END of the frame, so the release still counts
+    /// as part of the gesture it is ending.
+    ///
+    /// The rectangles are the LAST pass's, which is the same bargain
+    /// `pointer_over_notification` and `dialogs::pointer_over_dialog` make and
+    /// for the same reason: these layers are drawn after the input is read. It
+    /// errs the safe way. A press on the very first frame a box exists goes to
+    /// the desk — one frame of a message not yet being clickable — rather than
+    /// the desk losing a press to a box that was not on screen when it was
+    /// aimed.
+    fn track_overlay_grab(&mut self, ctx: &egui::Context) {
+        // Only the press that STARTS a gesture decides it. A second button
+        // going down mid-drag is not a new gesture and must not change hands
+        // — `pressed_on` is cleared at the end of the frame the last button
+        // comes up, so `None` here is exactly "nothing is in flight".
+        if self.pressed_on.is_none() && ctx.input(|i| i.pointer.any_pressed()) {
+            self.pressed_on = Some(
+                if dialogs::pointer_over_export(ctx) || self.pointer_over_notification(ctx) {
+                    PressLanded::OnOverlay
+                } else {
+                    PressLanded::Below
+                },
+            );
         }
     }
 
@@ -18899,6 +19014,10 @@ impl TangentApp {
     /// Answered from the LAST pass's rectangles, because these handlers run
     /// before the column is drawn — the same bargain
     /// `dialogs::pointer_over_dialog` makes with the layer rect.
+    ///
+    /// **Covering a point, and nothing more.** Whether the column may act on
+    /// that is `overlay_owns_pointer`'s question, because a box that lands
+    /// over a hand already dragging something must not take the gesture.
     fn pointer_over_notification(&self, ctx: &egui::Context) -> bool {
         if self.notify_boxes.is_empty() {
             return false;
@@ -19182,6 +19301,28 @@ impl TangentApp {
     /// failure be news again.
     pub fn notify_lower(&mut self, key: &str) {
         self.messages.lower(key);
+    }
+
+    /// The same condition, said because the USER just asked to be told.
+    ///
+    /// **`notify_raise` is for a caller that will ask again next frame, and
+    /// not every caller is one.** A condition re-checked per frame can afford
+    /// to be refused — it is already saying so on the next frame, and that is
+    /// what lets a dismissal stick. A condition asked about by a MENU ROW is
+    /// refused exactly once and then never asked again, so the refusal is not
+    /// "already covered", it is the app doing nothing at all when somebody
+    /// pressed something: dismiss "No MIDI input ports found", choose MIDI
+    /// Input from the menu an hour later, and there was no message, no picker
+    /// and no answer, for the rest of the session.
+    ///
+    /// So every EVENT-driven caller comes through here instead — see
+    /// `notify::Notifications::insist`, which forgets the mute and takes a
+    /// slot rather than waiting for one. Which door a call wants is decided
+    /// by the CALLER's shape and not by the message: the same
+    /// `MIDI_IN_KEY` condition would still use `notify_raise` if something
+    /// were watching the port list every frame.
+    pub fn notify_insist(&mut self, key: &str, kind: crate::notify::Kind, text: impl Into<String>) {
+        self.messages.insist(key, kind, text);
     }
 
     /// The queue, for a test that wants to read what was said.
@@ -19942,6 +20083,7 @@ impl TangentApp {
             input_channels: self.audio_setup.as_ref().map_or(0, |s| s.input_channels()),
             alias: self.settings.input_alias.clone(),
             output_path,
+            take_summary: self.settings.show_take_summary,
         });
     }
 
@@ -20081,8 +20223,22 @@ impl TangentApp {
 
     /// Take a pending "put that message away" request.
     ///
-    /// The host owns the message, so the host is what clears it. See
-    /// `Hit::DismissMessage`.
+    /// The host owns the message, so the host is what clears it.
+    ///
+    /// **Both of its producers are gone, and that is not an oversight.** The ×
+    /// on the band's status row went when the status row did; the notice
+    /// window's Close went with `dialogs::show_notice`. What replaced them is
+    /// better than a flag: a message the app raises against a condition is
+    /// MUTED when the user clicks it away (`notify::Notifications::dismiss`),
+    /// and every later raise of that key stays quiet until the condition
+    /// genuinely clears. "Put that away" is now answered where the message is
+    /// drawn, by the queue that drew it, without the host having to be told.
+    ///
+    /// It is kept because the host still calls it and because the host lane —
+    /// which owns the chain that used to feed the notice — is moving those
+    /// messages to `notify_raise` in the same wave. Whether anything on that
+    /// side still needs to hear about a dismissal is that lane's call to make;
+    /// removing the method here would only have broken its build.
     pub fn take_dismiss_message(&mut self) -> bool {
         std::mem::take(&mut self.dismiss_message)
     }
@@ -22375,7 +22531,15 @@ impl TangentApp {
                     // against a key so that asking again once a keyboard is
                     // plugged in takes the message down rather than leaving a
                     // stale one standing.
-                    self.notify_raise(
+                    //
+                    // **INSISTED, because this row is a press.** A raise is
+                    // refused while the message is muted, which is right for
+                    // a per-frame re-check and silence for a menu: having
+                    // dismissed this once, choosing MIDI Input again did
+                    // nothing at all — no message, no picker — and went on
+                    // doing nothing for the rest of the session. The user
+                    // asking a second time is owed the answer a second time.
+                    self.notify_insist(
                         MIDI_IN_KEY,
                         crate::notify::Kind::Error,
                         "No MIDI input ports found. Keytoggle mode still \
@@ -23972,9 +24136,14 @@ impl TangentApp {
                     // and a success takes it down — rather than a box that has
                     // to be clicked away and then says nothing about whether
                     // the next attempt worked.
+                    //
+                    // Insisted for the same reason the menu row is: this is a
+                    // button being pressed, not a condition being re-checked,
+                    // so a dismissal of the last failure must not turn the
+                    // next press into silence. See `notify_insist`.
                     match src.connect(&name, self.midi_tx.clone()) {
                         Ok(()) => self.notify_lower(MIDI_PORT_KEY),
-                        Err(e) => self.notify_raise(
+                        Err(e) => self.notify_insist(
                             MIDI_PORT_KEY,
                             crate::notify::Kind::Error,
                             format!(
@@ -25013,6 +25182,11 @@ impl TangentApp {
         }
         self.alt_down = ctx.input(|i| i.modifiers.alt);
         self.menu_ate_press = false;
+        // **Whose gesture is this?** Settled before anything reads the
+        // pointer, because every input pass below asks
+        // `dialog_blocks_pointer` and that answer now depends on where the
+        // press LANDED rather than on where the pointer happens to be.
+        self.track_overlay_grab(&ctx);
 
         // **The Welcome card waits for the splash.** It is a separate OS
         // window and the splash is a layer inside this one, so the layer
@@ -27939,25 +28113,24 @@ impl TangentApp {
                 self.confetti_at = None;
             }
         }
-        // **The band's message, as a window.** The status line along the foot
-        // of the record band is gone; this is where those messages went. The
-        // notice keeps its own surface, so it neither closes the dialog above
-        // nor is closed by it.
-        let msg = self.recorder.message.clone();
-        if msg.is_some() && msg != self.notice_dismissed {
-            if let Some(text) = msg.as_deref() {
-                if dialogs::show_notice(&ctx, placement, text) {
-                    self.notice_dismissed = msg.clone();
-                    // The host owns the errors behind the message, and this is
-                    // what puts them away — the same path the old × used.
-                    self.dismiss_message = true;
-                }
-            }
-        }
-        if msg.is_none() {
-            // Nothing to say, so nothing to remember having said.
-            self.notice_dismissed = None;
-        }
+        // **The band's message no longer opens a window here, and there is
+        // nothing left on this side to draw it.**
+        //
+        // It was `dialogs::show_notice`: a decorated child viewport titled
+        // "Tangent", with an OK button, for every sentence the recorder had —
+        // a camera warming up, a device gone, an export receipt. That is the
+        // exact shape the owner asked to be rid of, and it was the busiest of
+        // them; it also had to be latched against reopening (`notice_dismissed`)
+        // because a condition that is still true goes on being true, which is
+        // the problem `notify::Notifications::raise` solves properly and a
+        // window with an OK button cannot.
+        //
+        // Everything the app SAYS goes to the notification column at the end
+        // of this function instead. The host lane owns the chain that used to
+        // feed the window — `RecorderState::message` — and routes it through
+        // `notify`/`notify_raise` on its own side; nothing here reads that
+        // field any more. `take_dismiss_message` stays as the host's door for
+        // exactly the reason written on it.
         // The two answers that need a context to carry out: putting the font
         // back, and putting it back again. See `pending_reset`.
         if let Some(scope) = self.pending_reset.take() {
@@ -28056,6 +28229,19 @@ impl TangentApp {
         // this runs every frame and there are never more than five of them.
         self.notify_boxes.clear();
         self.notify_boxes.extend(shown.boxes.iter().map(|b| b.rect));
+
+        // **The gesture ends with the button, and not a frame before it.**
+        // Cleared HERE rather than where it is set, because the frame the
+        // button comes up is still part of the gesture — in both directions.
+        // A box's own click fires on the RELEASE (egui's `Sense::CLICK`), so
+        // the desk underneath has to stay out for that frame or one press
+        // would both dismiss a message and do something below it; and a
+        // fader's release has to reach the mixer for that same frame, which is
+        // the whole fault this field exists for. By the next frame the hand is
+        // free and hover decides again.
+        if !ctx.input(|i| i.pointer.any_down()) {
+            self.pressed_on = None;
+        }
 
         // **Refresh-locked while a gesture is in flight; 50 ms otherwise.**
         //
@@ -34583,6 +34769,170 @@ mod tests {
             worst,
             crate::notify::MAX_ROWS - 1,
             "the longest notice takes {worst} rows, not the four measured here"
+        );
+    }
+
+    /// **A message that lands under the hand must not strand the drag it
+    /// landed on.**
+    ///
+    /// The mixer's whole input pass sits behind `dialog_blocks_pointer`, and
+    /// that pass owns the fader's RELEASE. While the gate answered from HOVER
+    /// alone, a notification arriving over the pointer mid-drag hid the button
+    /// coming up from the only code that reads it: `mixer_grab` survived, and
+    /// the fader went on following the mouse across the desk with nothing held
+    /// down until the next press somewhere else. A transient box appears
+    /// unbidden; a gesture already under way is not its to take.
+    ///
+    /// Driven through real pointer EVENTS rather than by poking the app's
+    /// state, because the fault is entirely in which pass sees which frame —
+    /// a test that called the handlers directly would have passed throughout.
+    #[test]
+    fn a_notification_landing_on_a_drag_does_not_strand_the_fader() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.keytoggle_enabled = false;
+        pointer_frame(&ctx, &mut app, Vec::new());
+        app.mixer_open = true;
+        pointer_frame(&ctx, &mut app, Vec::new());
+        let rect = app.mixer_rect.expect("the mixer did not open");
+
+        // The first strip's fader, found where it was actually drawn.
+        let (fader_at, hit) = {
+            let view = app.mixer_view();
+            let l = crate::mixer_panel::Layout::new(rect, &view);
+            let f = l.strips[0].fader;
+            assert!(f.is_positive(), "the first strip was drawn with no fader");
+            let at = f.center();
+            let hit = crate::mixer_panel::hit_test(rect, &view, at)
+                .expect("nothing at all is at the fader's centre");
+            (at, hit)
+        };
+        assert!(
+            matches!(hit, crate::mixer_panel::Hit::Fader(_)),
+            "the probe landed on {hit:?}, not a fader"
+        );
+        // Half way up, so there is room to move and to see it stop.
+        app.apply_mixer_hit(hit, 0.5);
+
+        // The hand goes down on the fader and starts to pull.
+        press(&ctx, &mut app, fader_at);
+        assert!(app.mixer_grab.is_some(), "the press did not grab the fader");
+        let start = app.mixer_value(hit);
+        move_to(&ctx, &mut app, Pos2::new(fader_at.x, fader_at.y - 12.0));
+        let pulled = app.mixer_value(hit);
+        assert!(
+            pulled > start,
+            "the fader did not follow the hand at all: {start} -> {pulled}"
+        );
+
+        // ...and a message arrives, unbidden, in the corner the hand is about
+        // to cross. One frame to draw it, so the next one's pointer test can
+        // see where it landed — the same one-frame bargain every layer here
+        // makes.
+        app.notify(crate::notify::Kind::Info, "Exported to ~/Music");
+        move_to(&ctx, &mut app, Pos2::new(fader_at.x, fader_at.y - 13.0));
+        let box_rect = *app
+            .notify_boxes
+            .first()
+            .expect("the message drew no box to land under the hand");
+        let under = box_rect.center();
+        assert!(
+            !rect.contains(under),
+            "the notification is inside the mixer, so this proves nothing"
+        );
+        // Read AFTER the frame that drew the box, so what follows measures the
+        // crossing itself and not the step before it.
+        let before_crossing = app.mixer_value(hit);
+
+        // The hand carries on to where the box now is. The fader is dragged by
+        // how far the hand has MOVED, so it goes on moving even though the
+        // pointer has left the strip — that is the mixer's own contract.
+        move_to(&ctx, &mut app, under);
+        assert!(
+            app.notify_boxes.iter().any(|r| r.contains(under)),
+            "the hand is not over the message; this test proves nothing"
+        );
+        let crossed = app.mixer_value(hit);
+        assert!(
+            crossed > before_crossing,
+            "the fader stopped following the moment the message appeared: \
+             {before_crossing} -> {crossed}"
+        );
+
+        // And the button comes up ON the box.
+        pointer_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos: under,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(
+            app.mixer_grab.is_none(),
+            "the message swallowed the release and the fader is still held"
+        );
+
+        // Which is the whole point: with nothing held, the hand can go
+        // anywhere and the fader stays where it was left.
+        let left_at = app.mixer_value(hit);
+        move_to(&ctx, &mut app, Pos2::new(fader_at.x, fader_at.y + 60.0));
+        move_to(&ctx, &mut app, fader_at);
+        assert!(
+            (app.mixer_value(hit) - left_at).abs() < 1.0e-6,
+            "the fader went on tracking the mouse with the button up: \
+             {left_at} -> {}",
+            app.mixer_value(hit)
+        );
+    }
+
+    /// **A press that BEGINS on a message is still the message's.**
+    ///
+    /// The other half of the rule above, and the one that must not be lost
+    /// while fixing it: the box is a layer over the desk, and the handlers
+    /// that read `i.pointer` straight off the input see through every layer
+    /// there has ever been. Without this, one click both takes a message down
+    /// and does whatever was underneath it.
+    #[test]
+    fn a_press_that_starts_on_a_message_belongs_to_the_message() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        app.settings.keytoggle_enabled = false;
+        pointer_frame(&ctx, &mut app, Vec::new());
+        app.mixer_open = true;
+        app.notify(crate::notify::Kind::Info, "Exported to ~/Music");
+        // One frame to draw the column, one for the pointer test to see it.
+        pointer_frame(&ctx, &mut app, Vec::new());
+        let box_rect = *app.notify_boxes.first().expect("no box was drawn");
+        let on_box = box_rect.center();
+        assert!(!app.dialog_blocks_pointer(&ctx), "nothing is under the pointer yet");
+
+        // Down on the box: the desk stands down for the whole gesture, the
+        // release included, and lets go once the hand is free.
+        press(&ctx, &mut app, on_box);
+        assert!(
+            app.dialog_blocks_pointer(&ctx),
+            "a press on a message fell through to the desk"
+        );
+        move_to(&ctx, &mut app, Pos2::new(on_box.x + 400.0, on_box.y + 300.0));
+        assert!(
+            app.dialog_blocks_pointer(&ctx),
+            "the gesture changed hands the moment it left the box"
+        );
+        pointer_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos: Pos2::new(on_box.x + 400.0, on_box.y + 300.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        pointer_frame(&ctx, &mut app, Vec::new());
+        assert!(
+            !app.dialog_blocks_pointer(&ctx),
+            "the desk never got the pointer back"
         );
     }
 
