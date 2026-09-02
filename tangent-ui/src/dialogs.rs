@@ -2361,7 +2361,12 @@ pub const DRUMPAD_NAME: &str = "Tangent Drums";
 /// the same reason — every layer between the picker and the saved session
 /// carries it as a path and none of them has to learn what it is.
 pub const KEYS_PATH: &str = "@tangent-keys";
-pub const KEYS_NAME: &str = "Tangent Keys";
+/// **The DISPLAY name only.** The preset folder is spelled separately, in
+/// `desktop::preset_subfolder`, and deliberately still reads "Tangent Keys":
+/// a saved preset lives at a path, and renaming the drawer would hide every
+/// preset anybody has already written. The parenthetical is a label on the
+/// instrument, not a change of identity.
+pub const KEYS_NAME: &str = "Tangent Keys (Experimental)";
 
 /// How many patches the modelled keyboard ships, and what they are called.
 ///
@@ -13198,3 +13203,4 @@ at: None,
         );
     }
 }
+
