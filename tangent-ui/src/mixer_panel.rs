@@ -366,7 +366,7 @@ impl Hit {
 /// [`PALETTE_COLUMNS`] is what makes the grid read as hues rather than as
 /// twenty-seven swatches: reading down a column is one tone, across a row is
 /// one colour.
-pub const STRIP_COLORS: [(u8, u8, u8); 674] = [
+pub const STRIP_COLORS: [(u8, u8, u8); 708] = [
     (0x00, 0x00, 0x00), // the desk's own wood — replaced at draw time
     (0x36, 0x33, 0x30), // slate
     (0x56, 0x51, 0x4D), // stone
@@ -528,6 +528,15 @@ pub const STRIP_COLORS: [(u8, u8, u8); 674] = [
     // their masters sit after the last run rather than in the 300 block,
     // because that block was full the day it shipped and indices already
     // live in saved desks. Designed and gated by scripts/palgen.py --dark.
+    //
+    // **Carbon is RETIRED** (2026-09-02, the owner: "a worse version of
+    // Studio") and its four blocks — this run, master 367, ext 498..505,
+    // ext2 650..657 — stay exactly where they are. Every index here was
+    // written into somebody's desk the moment a track was painted, so a
+    // retired run is table history the way the eight abstract palettes
+    // are: reachable by a saved colour, offered by no menu. Out of
+    // `PALETTES`, in the table, still verified byte for byte by
+    // scripts/palgen.py --check.
     // Carbon: channels 316..331, click 332
     (0x38, 0x19, 0x11), (0x48, 0x34, 0x15), (0x4d, 0x4b, 0x17), (0x49, 0x62, 0x1e),
     (0x5a, 0x28, 0x1b), (0x5f, 0x45, 0x1d), (0x5f, 0x5d, 0x1d), (0x1c, 0x25, 0x0b),
@@ -670,6 +679,25 @@ pub const STRIP_COLORS: [(u8, u8, u8); 674] = [
     // Phosphor ext2: channels 25..32 at 666..673
     (0x17, 0x26, 0x0c), (0x33, 0x3a, 0x12), (0x1a, 0x54, 0x25), (0x6a, 0x5a, 0x1f),
     (0x26, 0x3d, 0x15), (0x44, 0x4e, 0x18), (0x23, 0x67, 0x31), (0x28, 0x22, 0x0c),
+    // ── Silverface, APPENDED (the rule): the twentieth run, and the first
+    // appended WHOLE — channels, click, master and both extensions in one
+    // block — because every earlier block was full the day it shipped.
+    // The Dual Showman's faceplate on the desk: steel-blue, aluminum,
+    // Fender turquoise, one red lineage, the jewel lamp as the master.
+    // Designed and gated by scripts/palgen.py --silverface.
+    // Silverface: channels 674..689, click 690
+    (0x10, 0x23, 0x38), (0x3c, 0x37, 0x2d), (0x17, 0x51, 0x58), (0x94, 0x42, 0x35),
+    (0x19, 0x38, 0x5b), (0x50, 0x49, 0x3c), (0x1c, 0x64, 0x6b), (0x3c, 0x16, 0x10),
+    (0x22, 0x4b, 0x7a), (0x63, 0x5a, 0x49), (0x0b, 0x25, 0x28), (0x60, 0x23, 0x19),
+    (0x2a, 0x5c, 0x96), (0x25, 0x22, 0x1b), (0x11, 0x3d, 0x41), (0x7f, 0x30, 0x24),
+    (0x4e, 0x52, 0x61),
+    (0xb3, 0x1b, 0x25), // 691  Silverface
+    // Silverface ext: channels 17..24 at 692..699
+    (0x19, 0x2b, 0x58), (0x45, 0x41, 0x33), (0x1d, 0x5a, 0x70), (0x92, 0x4a, 0x2c),
+    (0x23, 0x3e, 0x7d), (0x57, 0x53, 0x41), (0x21, 0x66, 0x7e), (0x49, 0x23, 0x13),
+    // Silverface ext2: channels 25..32 at 700..707
+    (0x21, 0x57, 0x77), (0x6a, 0x5b, 0x4f), (0x0d, 0x33, 0x31), (0x76, 0x24, 0x26),
+    (0x26, 0x63, 0x87), (0x34, 0x2c, 0x26), (0x13, 0x48, 0x45), (0x8e, 0x36, 0x39),
 ];
 
 /// How much of [`STRIP_COLORS`] a person can point at.
@@ -757,7 +785,11 @@ impl Palette {
 /// and gives each theme its own.
 ///
 /// The ORDER is the index `palette_choice` saves, so it matches `factory()`
-/// and must not be shuffled.
+/// and must not be shuffled. Retiring a theme is the one thing that moves
+/// it: Carbon left by NAME, its rows stayed in [`STRIP_COLORS`], and the two
+/// after it shifted up one here — so a `palette_choice` saved while Carbon
+/// was 16 lands one palette over, which the owner weighed against a
+/// migration and declined.
 pub const PALETTES: [Palette; 19] = [
     Palette { name: "Default", base: 28, master_at: 300, ext: 370, ext2: 522 },
     Palette { name: "Valentine", base: 45, master_at: 301, ext: 378, ext2: 530 },
@@ -775,9 +807,9 @@ pub const PALETTES: [Palette; 19] = [
     Palette { name: "Copper", base: 249, master_at: 313, ext: 474, ext2: 626 },
     Palette { name: "Dusk", base: 266, master_at: 314, ext: 482, ext2: 634 },
     Palette { name: "Iris", base: 283, master_at: 315, ext: 490, ext2: 642 },
-    Palette { name: "Carbon", base: 316, master_at: 367, ext: 498, ext2: 650 },
     Palette { name: "Nocturne", base: 333, master_at: 368, ext: 506, ext2: 658 },
     Palette { name: "Phosphor", base: 350, master_at: 369, ext: 514, ext2: 666 },
+    Palette { name: "Silverface", base: 674, master_at: 691, ext: 692, ext2: 700 },
 ];
 
 /// The drum bus's colour everywhere: dark violet, no palette uses it, so
