@@ -347,7 +347,7 @@ fn report_partials(patch: Patch) {
             // fundamental — the growl products sit ON the series.
             Patch::Wurli200 | Patch::Wurli140 => {
                 let drop = 1.0 - 0.06 * ((60.0_f32 - 33.0) / 40.0).clamp(0.0, 1.0);
-                let r = [1.0, 2.0, 3.0, 5.6 * drop, 14.6 * drop];
+                let r = [1.0, 2.0, 3.0, 4.4 * drop, 14.6 * drop];
                 f0 * r.get(n - 1).copied().unwrap_or(n as f32)
             }
         }

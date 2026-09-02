@@ -464,12 +464,30 @@ impl PianoVoice {
         let (p, gain) = design_loss(w1, w2, rho1, rho2);
 
         // Dispersion, as a cascade of first-order all-passes. Each one adds a
-        // delay that shrinks with frequency; the coefficient below is the
-        // standard closed-form fit against B, and four sections is what fits
-        // the budget. Fewer sections still stretches the low partials, which
-        // is the audible part; what is lost is accuracy at the top, where the
-        // ear is measuring beats and not pitch.
-        let disp_a = -(1.0 - (b * 1400.0).min(0.92)).sqrt() * 0.92;
+        // delay that shrinks with frequency, and how much extra delay the low
+        // partials get over the high ones is the stretch. Designed in DELAY
+        // rather than in the coefficient: the per-section delay at DC that
+        // delivers the sqrt(1 + B n^2) sharpening scales as sqrt(B) times the
+        // period — stiffer wire needs more, higher notes need less of the
+        // loop given over to it — and the constant is tuned on the bench so
+        // the signed-off C4 default keeps its partials to the cent.
+        //
+        // The previous map here was INVERTED against B — it fed the sqrt with
+        // (1 - b·k), so a stiffer string got a weaker all-pass: the STRETCH
+        // knob worked backwards, the concert grand's softer wire came out
+        // MORE metallic than the jazz one's, and the clav (which borrows this
+        // loop with half the piano's B) landed a long-ringing upper series a
+        // quarter tone sharp — a bell it never had. Caught by the bench, not
+        // by ear-in-passing: knob 0 measured n6 at +154 cents, knob 1 at +2.
+        //
+        // Two caps on the per-section delay: 19 samples where |a| would pass
+        // 0.9 and stop being trustworthy f32 feedback arithmetic, and 14% of
+        // the loop so the shortest treble strings keep enough line to stay in
+        // tune. The floor of one sample is the coefficient's zero — a
+        // first-order all-pass at a = 0 IS one sample of plain delay.
+        let disp_tau = (1.8625 * b.sqrt() * total)
+            .clamp(1.0, (0.14 * total).min(19.0).max(1.0));
+        let disp_a = (1.0 - disp_tau) / (1.0 + disp_tau);
         for s in &mut self.strings {
             for d in &mut s.disp {
                 d.a = disp_a;

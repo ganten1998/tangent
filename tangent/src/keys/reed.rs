@@ -40,9 +40,15 @@ const DAMP_SECS: f32 = 0.050;
 pub struct WurliBase {
     /// Scale on the pickup's asymmetry — how eager the growl is.
     pub growl: f32,
-    /// A floor under it: the tube instrument is never entirely clean, even
-    /// feathered. Zero for the transistor one.
-    pub growl_floor: f32,
+    /// The tube stage's own dirt, and it is NOT a floor under the growl
+    /// coefficient: the growl is displacement-squared, so any floor on its
+    /// coefficient still vanishes at a feather — the bench measured the
+    /// "never entirely clean" instrument dead clean at velocity 8. What a
+    /// warm output stage actually does is favour one half of the wave by a
+    /// fixed FRACTION whatever the level, so this scales an `|x|` term whose
+    /// second harmonic holds a constant ratio to the fundamental all the way
+    /// down. Zero for the transistor one.
+    pub haze: f32,
     /// The amp's top, one pole.
     pub tone_hz: f32,
     /// Scale on the hammer knock.
@@ -54,16 +60,19 @@ impl WurliBase {
     /// on, then the bark arrives all at once. Bright for a reed.
     pub const TWO_HUNDRED: WurliBase = WurliBase {
         growl: 1.0,
-        growl_floor: 0.0,
+        haze: 0.0,
         tone_hz: 9_000.0,
         thump: 1.0,
     };
     /// The earlier tube instrument: darker, warmer, never quite clean —
     /// there is a little even-harmonic haze on every note, and the growl
-    /// comes up like a dimmer rather than a switch.
+    /// comes up like a dimmer rather than a switch. 1.15, not the 1.5 it
+    /// wore when the growl curve was politer: against the hotter curve
+    /// below, 1.5 pinned the whole top half of the keyboard's dynamics at
+    /// the asymmetry clamp and the dimmer became a switch.
     pub const ONE_FORTY: WurliBase = WurliBase {
-        growl: 1.5,
-        growl_floor: 0.20,
+        growl: 1.15,
+        haze: 0.06,
         tone_hz: 6_200.0,
         thump: 1.2,
     };
@@ -76,6 +85,8 @@ pub struct WurliVoice {
     /// The pickup's asymmetry this note, set at the strike: knob, base and
     /// swing folded to one coefficient on the square term.
     asym: f32,
+    /// The tube stage's standing lopsidedness — see `WurliBase::haze`.
+    haze: f32,
     /// Compensation so the growl changes the SHAPE, not the loudness.
     comp: f32,
     /// DC blocker: a squared term has a mean, and the mean must not reach
@@ -99,6 +110,7 @@ impl WurliVoice {
             rate: sample_rate,
             modes: [Mode::default(); MODES],
             asym: 0.0,
+            haze: 0.0,
             comp: 1.0,
             dc_x1: 0.0,
             dc_y1: 0.0,
@@ -128,32 +140,47 @@ impl WurliVoice {
         // the solder blob that tunes the reed drags both DOWN, further in
         // the bass where the blob is biggest. They are colour, not chord:
         // the plate reads displacement near the tip and barely sees them.
+        // 4.4, not the textbook-adjacent 5.6 this shipped with: a heavy
+        // solder drop pulls the first overtone well under half the bar's
+        // ideal, and 5.6 times the fundamental is — measured, not guessed —
+        // within half a semitone of where the TINE instrument parks its
+        // bell. One partial in the wrong register was enough to read the
+        // reed piano as a quiet Rhodes; the overtone belongs lower, quieter,
+        // and gone before the sustain starts.
         let drop = 1.0 - 0.06 * ((key - 33.0) / 40.0).clamp(0.0, 1.0);
-        let over1 = 5.6 * drop;
+        let over1 = 4.4 * drop;
         let over2 = 14.6 * drop;
 
         // Decay: a reed outlasts a tine's bell but not its fundamental —
-        // there is no tonebar here to bank energy in.
-        let t60_f = (6.5 * (-(key - 33.0) / 40.0).exp()).clamp(0.7, 8.0) * k.decay;
+        // there is no tonebar here to bank energy in, which is also why 5.0
+        // and not the tine's tonebar-fed nine-plus.
+        let t60_f = (5.0 * (-(key - 33.0) / 40.0).exp()).clamp(0.7, 8.0) * k.decay;
         let t60_f = t60_f.clamp(0.1, 30.0);
 
         // Contact: felt over a wooden hammer, on a sprung key — shorter and
-        // harder than the tine's neoprene. VOICING is the felt's wear.
+        // harder than the tine's neoprene. VOICING is the felt's wear, and
+        // `hard` is its other face: packed felt does not just shorten the
+        // contact, it knocks louder against the reed and throws it further
+        // through the gap, so the knob reaches the attack and the growl
+        // rather than only the two bar overtones nobody could hear move.
         let felt = 1.28_f32.powf(1.0 - 2.0 * k.voicing.clamp(0.0, 1.0));
+        let hard = 1.0 / felt;
         let contact = (1.6 - 1.1 * v.powf(0.7)) * 0.001 * felt;
         let fc = 1.0 / contact;
         let roll = |f: f32| 1.0 / (1.0 + (f / fc) * (f / fc)).sqrt();
 
         // The REED knob is how much of the bar's own metal reaches the
         // plate: 0 is a sine in a box, 2 is a reed with its clank showing.
-        let w1 = 0.05 * k.reed * roll(f0 * over1) / roll(f0).max(1e-9);
+        let w1 = 0.035 * k.reed * roll(f0 * over1) / roll(f0).max(1e-9);
         let w2 = 0.012 * k.reed * roll(f0 * over2) / roll(f0).max(1e-9);
 
         // **The knock.** A wurli's attack has a woody tick the tine never
         // had — hammer meeting reed meets key meeting rail. Two fixed
         // partials, gone in thirty milliseconds, scaled by velocity harder
-        // than the tone is.
-        let knock = base.thump * k.thump * 0.10 * v.powf(1.6);
+        // than the tone is. 0.25 puts the knock about thirty decibels under
+        // the tone at forte — the bench found the old 0.10 sitting at minus
+        // forty-five, an attack you could only see on a plot.
+        let knock = base.thump * k.thump * 0.25 * v.powf(1.6) * hard * hard;
 
         self.seed ^= self.seed << 13;
         self.seed ^= self.seed >> 17;
@@ -164,25 +191,32 @@ impl WurliVoice {
         let norm = 1.0 / (1.0 + w1 + w2);
         let amp = swing * norm * jitter;
 
+        // The overtone rings a tenth of the fundamental's life, not a
+        // quarter: it is attack colour, and the old 0.22 left it singing
+        // into the sustain where it read as a chime.
         self.modes[0].kick(f0, t60_f, self.rate, amp);
-        self.modes[1].kick(f0 * over1, t60_f * 0.22, self.rate, amp * w1);
+        self.modes[1].kick(f0 * over1, t60_f * 0.09, self.rate, amp * w1);
         self.modes[2].kick(f0 * over2, t60_f * 0.10, self.rate, amp * w2);
         self.modes[3].kick(165.0, 0.035, self.rate, knock);
         self.modes[4].kick(610.0, 0.014, self.rate, knock * 0.5);
 
         // **The growl coefficient.** The square term's size against the
         // linear one, from how far this note will swing through the gap.
-        // The floor is the tube instrument's standing haze; the knob and
-        // velocity bring the rest. The compensation divides the level the
-        // asymmetry would otherwise add, so GROWL turns dirt up, not volume.
-        // The 2.2 is calibrated on the bench: with it, the second harmonic
-        // rides from under -70 dB feathered to the high -teens flat out,
-        // which is a reed amp doing what reed amps are loved for. Without
-        // it the growl topped out near -32 dB - a polite instrument, and
-        // polite is the one thing this must never be.
-        let u = swing * REED_SWING;
-        self.asym = (base.growl_floor + base.growl * k.growl * u * 2.2)
-            .clamp(0.0, 1.6);
+        // The compensation divides the level the asymmetry would otherwise
+        // add, so GROWL turns dirt up, not volume.
+        //
+        // Sub-linear in the swing — 0.7, tuned on the bench — because the
+        // plate's field is at its most curved near the rest position, so the
+        // FIRST millimetres of extra swing buy the most extra lopsidedness.
+        // Linear-in-swing was the previous curve, and it kept the growl a
+        // fortissimo-only party trick: at mezzo-forte the second harmonic
+        // sat below -37 dB and the reed was out-Rhodesing the Rhodes. This
+        // curve puts it near -28 dB at mezzo, -18 leaned on, -11 flat out —
+        // arriving with the player's weight, which is the instrument.
+        // `hard` rides in as well: packed felt throws the reed further.
+        let u = (swing * hard.powf(0.7)).powf(0.7) * REED_SWING;
+        self.asym = (base.growl * k.growl * u * 4.5).clamp(0.0, 2.0);
+        self.haze = base.haze;
         // 0.45, not a smaller figure: the bench's forte comp chords on the
         // tube instrument put 24 samples into the ceiling at 0.35.
         self.comp = 1.0 / (1.0 + 0.45 * self.asym);
@@ -241,8 +275,13 @@ impl WurliVoice {
         // Because `disp` decays with the note, the dirt fades with it —
         // a chord's tail cleans itself up, which is exactly what the real
         // amp does and no post-effect can.
+        // The `|disp|` term is the tube stage: a fixed favouring of one half
+        // of the wave, so its second harmonic keeps a constant RATIO to the
+        // note however softly it is played — the 140's standing haze. The DC
+        // it carries (a rectified wave has a mean) dies in the blocker below.
         let u = (disp * REED_SWING).clamp(-0.9, 0.9);
-        let shaped = disp * (1.0 + self.asym * u + 0.30 * self.asym * u * u);
+        let shaped = disp * (1.0 + self.asym * u + 0.30 * self.asym * u * u)
+            + self.haze * disp.abs();
 
         // The squared term's mean walks with the envelope; block it.
         let dc = shaped - self.dc_x1 + 0.9995 * self.dc_y1;

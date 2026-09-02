@@ -134,6 +134,14 @@ pub struct EpVoice {
     /// harder gets DIRTIER rather than simply enormous. Fixed at the strike,
     /// because the swing the note is going to reach is known then.
     pk_comp: f32,
+    /// How far a unit of tine displacement swings toward the magnet — the
+    /// stock `PICKUP_SWING` scaled by the BARK knob, stashed at the strike.
+    /// It has to be a field: the first build scaled only `pk_comp` and left
+    /// the tick reading the bare constant, which made BARK an inverse volume
+    /// knob — the compensation for a nonlinearity that never changed — and
+    /// at the top of its travel a fortissimo came out QUIETER than a
+    /// mezzo-forte while adding no dirt at all.
+    pk_swing: f32,
     damp: f32,
     damp_to: f32,
     /// The damper's time constant in seconds, set at strike time from the
@@ -161,6 +169,7 @@ impl EpVoice {
             modes: [Mode::default(); MODES],
             bar: Mode::default(),
             pk_comp: 1.0,
+            pk_swing: PICKUP_SWING,
             damp: 1.0,
             damp_to: 1.0,
             damp_secs: DAMP_SECS,
@@ -201,7 +210,12 @@ impl EpVoice {
         let f0 = 440.0 * 2.0_f32.powf((f32::from(pitch) - 69.0) / 12.0);
         let v = velocity.clamp(0.0, 1.0);
         let k = f32::from(pitch);
-        let felt = 1.3_f32.powf(1.0 - 2.0 * voicing.clamp(0.0, 1.0));
+        // The tip's compound, worn soft to fresh hard, as a scale on the
+        // contact time. The 1.9 span is measured, not felt-out: at the old
+        // 1.3 the bell moved under 3 dB across the knob's whole travel,
+        // because the contact rolloff only starts biting the bell partial
+        // when the width can actually double. 0.5 still lands on exactly 1.
+        let felt = 1.9_f32.powf(1.0 - 2.0 * voicing.clamp(0.0, 1.0));
 
         // **The bell partial's position moves with the key.** On a real
         // instrument the tine gets shorter and its clamp stiffer as you go up,
@@ -221,8 +235,15 @@ impl EpVoice {
         // it did not, a long-decay setting would leave the chime ringing at
         // the same length while everything under it grew, which is a bell,
         // not a Rhodes.
+        // 1.05 base with the ceiling at 1.2: the earlier 0.75/0.9 pair left
+        // the chime at a third of a second in the middle of the keyboard,
+        // which reads as a tick riding the note rather than a bell over it —
+        // the reed piano's lone bar overtone was outliving it, and the two
+        // instruments were trading characters. A chime that hangs on for
+        // half a second is still gone twenty times faster than the
+        // fundamental, which is the ratio the sound IS.
         let t60_bell =
-            ((0.75 * (-(k - 28.0) / 46.0).exp()).clamp(0.14, 0.9) * knobs.decay).clamp(0.03, 4.0);
+            ((1.05 * (-(k - 28.0) / 46.0).exp()).clamp(0.2, 1.2) * knobs.decay).clamp(0.03, 4.0);
 
         // **Velocity, mechanism one: contact time.** A hard strike is short and
         // therefore wide-band, so far more of the energy lands in the high
@@ -241,7 +262,17 @@ impl EpVoice {
         // reason this instrument can whisper and shout.
         // BELL scales that weight: 0 is a tine with no chime at all, 2 is a
         // glass bell over the note.
-        let bell_w = (0.045 + 0.95 * v.powf(2.0)) * knobs.bell;
+        // The 0.16 floor is what keeps the promise above honest at the soft
+        // end: at the old 0.045, the contact rolloff and the chime's own
+        // decay stacked up to fifty-six decibels under the fundamental by the
+        // bench's measure — not a soft bell, no bell — and a feathered Rhodes
+        // note is supposed to be almost nothing but glass. The floor cannot
+        // buy the whole distance back (a 2 ms contact genuinely has little
+        // to give a 1.5 kHz mode — that part is physics, not voicing); this
+        // lands pianissimo in the high minus-thirties re the fundamental,
+        // which is a bell you hear, from a bench column that used to say
+        // there was none.
+        let bell_w = (0.16 + 0.89 * v.powf(2.0)) * knobs.bell;
 
         let ratios = [1.0, 2.0, 3.0, bell, bell * 1.62, bell * 2.71];
         let weights = [1.0, 0.20, 0.09, bell_w, bell_w * 0.34, bell_w * 0.11];
@@ -295,11 +326,18 @@ impl EpVoice {
         // the tine does. Two near-unison partials beat at their difference
         // frequency, and that slow swell is why a held Rhodes note sounds
         // alive rather than sustained.
+        // The TONEBAR knob is this mode, weight and ring together: 0 is a
+        // tine screwed to dead wood — no beat, and the note dies at the
+        // tine's own rate — and 2 is a bar that outlasts the tine by half
+        // again and swells against it. 1 is the instrument as tuned. (The
+        // knob spent one release wired to the PIANO's soundboard send, which
+        // the electric instruments hand a hard zero: a placebo. This is the
+        // real bar.)
         self.bar.kick(
             f0 * 1.0018,
-            t60_f * 1.45,
+            t60_f * (1.0 + 0.45 * knobs.body),
             self.rate,
-            amps[0] * scale * swing * 0.42,
+            amps[0] * scale * swing * 0.42 * knobs.body,
         );
 
         // How close to the magnet this note is going to swing, and therefore
@@ -309,8 +347,11 @@ impl EpVoice {
         // loudness stays a function of how hard it was hit.
         // BARK is how far the tine swings against the magnet, which IS the
         // pickup's nonlinearity: turning it up is leaning on the pickup, not
-        // a distortion after the fact.
-        let u_max = (swing * PICKUP_SWING * knobs.bark).clamp(0.0, PICKUP_LIMIT);
+        // a distortion after the fact. The scaled swing is STASHED for the
+        // tick — the compensation below and the transfer it compensates must
+        // read the same number, or the knob turns into a volume control.
+        self.pk_swing = PICKUP_SWING * knobs.bark;
+        let u_max = (swing * self.pk_swing).clamp(0.0, PICKUP_LIMIT);
         let gm = 1.0 - u_max;
         self.pk_comp = gm * gm * gm;
 
@@ -377,7 +418,10 @@ impl EpVoice {
         // The clamp is not cosmetic. A real tine cannot reach the magnet; the
         // arithmetic can, and one sample at the pole is an infinity that lives
         // in the output for the rest of the session.
-        let u = (disp * PICKUP_SWING).clamp(-PICKUP_LIMIT, PICKUP_LIMIT);
+        // `pk_swing`, not the bare constant: the BARK knob moved the gap at
+        // the strike, and reading the constant here while compensating for
+        // the knob there is exactly the bug that made BARK a volume knob.
+        let u = (disp * self.pk_swing).clamp(-PICKUP_LIMIT, PICKUP_LIMIT);
         let g = 1.0 - u;
         let out = disp * self.pk_comp / (g * g * g);
 

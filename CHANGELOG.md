@@ -212,6 +212,50 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
 
 ### Fixed
 
+- **Tangent Keys: every knob audited against the bench, and the ones that
+  lied fixed.** All sixty-four knobs across the eight sounds were traced
+  from panel to physics and measured; six were wired wrong and two did
+  nothing, and the two worst timbre defects both fell out of one line:
+
+  *The pianos' STRETCH turned backwards* - the dispersion filter was
+  inverted against string stiffness, so knob zero was the stiffest wire on
+  the panel and Piano 2's softer concert wire came out MORE metallic than
+  Piano 1, not less. The map is redesigned in delay terms (and the shipped
+  default is preserved to the cent at middle C); the knob now sweeps from
+  near-harmonic to honky-tonk the way its label says, the bass finally
+  gets the stretch big strings actually have, and Piano 2 has the sweeter
+  treble it always claimed. *The same inversion was the clav's mystery
+  bell*: its thin wire turned into a huge coefficient that parked a
+  long-ringing upper series up to 122 cents sharp - an enharmonic chime on
+  the one instrument whose brightness should be all combs and harmonics.
+  Its partials now sit within a few cents of the stretched series at every
+  velocity, and a test pins them there.
+
+  *The tine piano's BARK was an inverse volume knob* - the tick read the
+  stock pickup gap while the compensation read the knob, so turning it up
+  made fortissimo QUIETER than mezzo-forte and added no dirt at all. It
+  now leans the tine into the magnet for real: waveform asymmetry 0.15 to
+  0.76 across the travel at full velocity, loudness flat within a decibel.
+  *The TONEBAR did nothing on either tine patch* (it was wired to the
+  pianos' soundboard, which the electric instruments hand a hard zero);
+  it now weighs and rings the actual bar - the sustain and the slow beat.
+  *The Suitcase TREMOLO retuned the chime nine semitones* through a
+  leftover mapping while it throbbed; the two are now separate, and the
+  suitcase's bell finally matches the Mk.1's. *The reed piano had traded
+  characters with the Rhodes* - almost pure sine at normal touch, its one
+  overtone parked in the tine's bell register: the growl now arrives with
+  the player's weight (second harmonic -29 dB at mezzo to -12 flat out,
+  measured), the hammer knock is audible, the bar overtone moved low and
+  short, and the 140 keeps a standing even-harmonic haze so it is never
+  entirely clean even feathered - while the Mk.1 got its glassy bell back
+  at a whisper. The quiet knobs got real travel too: the pianos'
+  SOUNDBOARD opens to an audible wash (the centre is unchanged), the clav
+  TONE is a proper two-pole rocker reaching down to 600 Hz, and the tine
+  and reed VOICING now move the attack by whole decibels instead of
+  fractions. Two new bench tests pin the clav to its harmonic series and
+  the reed and tine to their opposite signatures, so the mechanisms can
+  never converge again.
+
 - **A project's folders now belong to the project.** The folder layout -
   which channel is a group, which sit inside it, which are collapsed - was
   kept only in the shared settings file, never in the project document. So
