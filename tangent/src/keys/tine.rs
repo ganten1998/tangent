@@ -109,6 +109,112 @@ impl Mode {
         self.y1 = amp * r * w.sin();
     }
 
+    /// `kick`, for a mode that may already be ringing: the strike is ADDED
+    /// to the motion, which is what a hammer does to a bar that is still
+    /// moving. It does not stop it and start over.
+    ///
+    /// **The recursion is linear, so the sum has an exact state.** Two
+    /// strikes on one mode are two sequences added, and a fresh sequence's
+    /// state is `(y2 = 0, y1 = seed)`, so with the coefficients unchanged the
+    /// superposition is `y1 += seed` with `y2` untouched — the same output
+    /// as running both modes side by side and summing, to the bit. When the
+    /// coefficients DO change under a ringing mode (a knob moved between two
+    /// strikes of one note) the new pair is installed and the seed added
+    /// anyway: the output stays continuous, because the state is whatever
+    /// it was and the next sample follows from it, but it is no longer the
+    /// exact sum of two strikes. There is no physical answer to a tine whose
+    /// stiffness changed mid-ring either. A silent mode takes the plain
+    /// `kick` path, so a first strike from silence is `kick` to the bit.
+    ///
+    /// This replaces `kick` at every strike, and here is why: `kick`
+    /// re-seeded a ringing mode — `y1` and `y2` set to the first two samples
+    /// of a NEW sinusoid — which is a step from wherever the old one was to
+    /// wherever the new one starts. Loudest under the pedal, because that is
+    /// when the old one is still loud; the owner heard it as a pop on every
+    /// consecutive strike.
+    pub(super) fn kick_add(&mut self, freq: f32, t60: f32, rate: f32, amp: f32) {
+        if self.silent() {
+            self.kick(freq, t60, rate, amp);
+            return;
+        }
+        if freq <= 0.0 || freq >= rate * 0.47 || amp == 0.0 {
+            // Nothing to add. A strike that puts no energy into a partial
+            // does not silence the partial that was already there.
+            return;
+        }
+        let w = std::f32::consts::TAU * freq / rate;
+        let r = 10.0_f32
+            .powf(-3.0 / (t60.max(0.01) * rate))
+            .clamp(0.0, 0.999_99);
+        self.b1 = 2.0 * r * w.cos();
+        self.b2 = -(r * r);
+        self.y1 += amp * r * w.sin();
+    }
+
+    pub(super) fn silent(&self) -> bool {
+        self.y1 == 0.0 && self.y2 == 0.0
+    }
+
+    /// The amplitude this mode is ringing at now, read off its two-sample
+    /// state: for `A sin(w n + phi)`, `A^2 sin^2 w = y1^2 + y2^2 - 2 y1 y2
+    /// cos w`, and `cos w` is `b1 / 2r` — everything the mode already
+    /// carries, nothing stored for the purpose. The strike's energy cap
+    /// asks this of the fundamental. Zero for a silent or degenerate mode.
+    pub(super) fn amplitude(&self) -> f32 {
+        let r = (-self.b2).max(0.0).sqrt();
+        if r <= 1.0e-6 {
+            return 0.0;
+        }
+        let c = (self.b1 / (2.0 * r)).clamp(-1.0, 1.0);
+        let s2 = 1.0 - c * c;
+        if s2 <= 1.0e-8 {
+            return 0.0;
+        }
+        let a2 = self.y1 * self.y1 + self.y2 * self.y2 - 2.0 * self.y1 * self.y2 * c;
+        (a2.max(0.0) / s2).sqrt()
+    }
+
+    /// Scale the motion. What a damper has taken out of the metal, made
+    /// real in the mode — see `EpVoice::strike_full` for why a landing
+    /// strike needs that.
+    pub(super) fn scale(&mut self, g: f32) {
+        self.y1 *= g;
+        self.y2 *= g;
+    }
+
+    /// How much of a `kick_add` of `amp` this ringing mode may take before
+    /// its amplitude passes `cap`, as a fraction of the seed, 0 to 1.
+    ///
+    /// **Solved on the state, not guessed from a level.** With `s` added to
+    /// `y1`, the squared amplitude is a parabola in `s`: `Q(s) = Q0 + 2 s b
+    /// + s^2` with `b = y1 - y2 cos w`. The sign of `b` is the phase of the
+    /// motion against the hammer, so a hammer pushing against the motion
+    /// LOWERS `Q` and is never limited — it is taking energy out, which is
+    /// what a real hammer does to a tine coming at it — while a hammer
+    /// pushing with the motion is allowed up to the larger of the cap and
+    /// what was already there. The result is a bound with no step in it: a
+    /// tine at the cap, struck in phase, is simply not pushed further.
+    pub(super) fn seed_within(&self, freq: f32, rate: f32, amp: f32, cap: f32) -> f32 {
+        if self.silent() || amp <= 0.0 || cap <= 0.0 {
+            return 1.0;
+        }
+        let w = std::f32::consts::TAU * freq / rate;
+        let (sw, cw) = w.sin_cos();
+        let r = (-self.b2).max(0.0).sqrt();
+        if sw <= 1.0e-6 || r <= 1.0e-6 {
+            return 1.0;
+        }
+        let s = amp * r * sw;
+        let q0 = self.y1 * self.y1 + self.y2 * self.y2 - 2.0 * self.y1 * self.y2 * cw;
+        let b = self.y1 - self.y2 * cw;
+        let bound = q0.max(cap * cap * sw * sw);
+        if q0 + 2.0 * s * b + s * s <= bound {
+            return 1.0;
+        }
+        let s_hi = -b + (b * b - q0 + bound).max(0.0).sqrt();
+        (s_hi / s).clamp(0.0, 1.0)
+    }
+
     pub(super) fn tick(&mut self) -> f32 {
         let y = self.b1 * self.y1 + self.b2 * self.y2;
         let y = if y.is_finite() { y } else { 0.0 };
@@ -142,6 +248,16 @@ pub struct EpVoice {
     /// at the top of its travel a fortissimo came out QUIETER than a
     /// mezzo-forte while adding no dirt at all.
     pk_swing: f32,
+    /// Where `pk_comp` and `pk_swing` are heading, and how fast. Both are
+    /// gains on the output, and a strike landing on a ringing tine changes
+    /// both (compensation follows velocity; the gap follows the BARK knob)
+    /// — so what was ringing would step by the ratio, which is the pop this
+    /// module was rebuilt to remove. They glide over a few milliseconds
+    /// instead. A fresh strike sets current and target together and the
+    /// glide is a no-op to the bit.
+    pk_comp_to: f32,
+    pk_swing_to: f32,
+    pk_slew: f32,
     damp: f32,
     damp_to: f32,
     /// The damper's time constant in seconds, set at strike time from the
@@ -170,6 +286,12 @@ impl EpVoice {
             bar: Mode::default(),
             pk_comp: 1.0,
             pk_swing: PICKUP_SWING,
+            pk_comp_to: 1.0,
+            pk_swing_to: PICKUP_SWING,
+            // Five milliseconds: under the shortest contact, over any one
+            // cycle of the note, so the glide is neither an attack nor a
+            // wobble.
+            pk_slew: 1.0 - (-1.0 / (0.005 * sample_rate.max(8_000.0))).exp(),
             damp: 1.0,
             damp_to: 1.0,
             damp_secs: DAMP_SECS,
@@ -313,12 +435,60 @@ impl EpVoice {
         self.seed ^= self.seed << 5;
         let jitter = 1.0 + ((self.seed >> 8) as f32 / 16_777_216.0 - 0.5) * 0.03;
 
+        // **A hammer landing on a tine that is still moving ADDS to the
+        // motion.** It does not stop the metal and start it again — that
+        // was this function's old behaviour, a re-seed of every mode, and
+        // the step from the old motion to the new seed was the pop the owner
+        // heard on every consecutive strike, worst under the pedal because
+        // that is when the old motion is still loud. Now a strike on a
+        // ringing voice is a superposition: `Mode::kick_add`, plus the two
+        // things the linear sum cannot do on its own, below.
+        let landing = !self.done;
+        if landing && self.damp < 1.0 {
+            // The damper's take, made real. `damp` is a gain on the OUTPUT,
+            // not a loss in the metal, so a note mid-release still holds
+            // its undamped swing behind a fading gain; putting the gain back
+            // to one for the new strike would reveal all of it at once. Fold
+            // it into the motion first — this is what the pad had actually
+            // taken out of the tine — and then the pad is off the metal.
+            // The pickup is not linear, so the fold is exact only where the
+            // tine is far from the magnet; a hard-barking note restruck in
+            // the tens of milliseconds after its key came up, with no pedal,
+            // carries a residual step of a fraction of its fading level.
+            for m in &mut self.modes {
+                m.scale(self.damp);
+            }
+            self.bar.scale(self.damp);
+            self.pickup_lp *= self.damp;
+        }
+
+        // **The energy cap, on the modes that keep energy.** Superposition
+        // stacks: eight strikes at sixty milliseconds, landing in phase,
+        // would throw the tine several times further than one hammer can,
+        // and into the magnet. A real hammer cannot do that — it cannot
+        // overtake a tine already moving faster than it is — so the seed
+        // for the fundamental, its two harmonics and the bar is limited to
+        // what brings the mode to `cap`: a little over this strike's own
+        // full throw from rest. The limit is solved exactly on the mode's
+        // state (a hammer pushing AGAINST the motion is not limited at all,
+        // it is taking energy out), so nothing steps. The bell family is
+        // left alone: attack colour, gone twenty times faster than the
+        // note, and the articulation of a restrike is made of it.
+        let full = amps[0] * scale * swing * jitter;
+        let cap = full * 1.25;
+        let allowed = if landing {
+            self.modes[0].seed_within(f0 * ratios[0], self.rate, full, cap)
+        } else {
+            1.0
+        };
+
         for i in 0..MODES {
-            self.modes[i].kick(
+            let held = if i < 3 { allowed } else { 1.0 };
+            self.modes[i].kick_add(
                 f0 * ratios[i],
                 t60s[i],
                 self.rate,
-                amps[i] * scale * swing * jitter,
+                amps[i] * scale * swing * jitter * held,
             );
         }
 
@@ -333,11 +503,11 @@ impl EpVoice {
         // knob spent one release wired to the PIANO's soundboard send, which
         // the electric instruments hand a hard zero: a placebo. This is the
         // real bar.)
-        self.bar.kick(
+        self.bar.kick_add(
             f0 * 1.0018,
             t60_f * (1.0 + 0.45 * knobs.body),
             self.rate,
-            amps[0] * scale * swing * 0.42 * knobs.body,
+            amps[0] * scale * swing * 0.42 * knobs.body * allowed,
         );
 
         // How close to the magnet this note is going to swing, and therefore
@@ -350,16 +520,42 @@ impl EpVoice {
         // a distortion after the fact. The scaled swing is STASHED for the
         // tick — the compensation below and the transfer it compensates must
         // read the same number, or the knob turns into a volume control.
-        self.pk_swing = PICKUP_SWING * knobs.bark;
-        let u_max = (swing * self.pk_swing).clamp(0.0, PICKUP_LIMIT);
+        // On a landing strike both become TARGETS the tick glides to: they
+        // are gains on what is already ringing, and a gain that steps is a
+        // pop. Fresh from silence they are set outright, as they always were.
+        self.pk_swing_to = PICKUP_SWING * knobs.bark;
+        let u_max = (swing * self.pk_swing_to).clamp(0.0, PICKUP_LIMIT);
         let gm = 1.0 - u_max;
-        self.pk_comp = gm * gm * gm;
+        self.pk_comp_to = gm * gm * gm;
+        if !landing {
+            self.pk_swing = self.pk_swing_to;
+            self.pk_comp = self.pk_comp_to;
+        }
 
         self.damp = 1.0;
         self.damp_to = 1.0;
         self.damp_secs = (DAMP_SECS * knobs.release).clamp(0.004, 1.5);
-        self.env = swing;
+        // The follower keeps whichever is louder: it is the stealing
+        // policy's view of the voice, and a soft strike on a loud note has
+        // not made the note soft.
+        self.env = if landing { self.env.max(swing) } else { swing };
         self.done = false;
+    }
+
+    /// Silence now: every state cleared, `finished` true. What the frame
+    /// wants from a voice it has moved out of the pool and faded, so that
+    /// the next strike on it is a first strike from silence exactly.
+    pub fn silence(&mut self) {
+        for m in &mut self.modes {
+            m.clear();
+        }
+        self.bar.clear();
+        self.thump.clear();
+        self.pickup_lp = 0.0;
+        self.damp = 1.0;
+        self.damp_to = 1.0;
+        self.env = 0.0;
+        self.done = true;
     }
 
     pub fn release(&mut self, pedal: bool) {
@@ -421,6 +617,10 @@ impl EpVoice {
         // `pk_swing`, not the bare constant: the BARK knob moved the gap at
         // the strike, and reading the constant here while compensating for
         // the knob there is exactly the bug that made BARK a volume knob.
+        // Both glide to where the last strike put them; from silence they
+        // are already there and these two lines add exactly zero.
+        self.pk_comp += (self.pk_comp_to - self.pk_comp) * self.pk_slew;
+        self.pk_swing += (self.pk_swing_to - self.pk_swing) * self.pk_slew;
         let u = (disp * self.pk_swing).clamp(-PICKUP_LIMIT, PICKUP_LIMIT);
         let g = 1.0 - u;
         let out = disp * self.pk_comp / (g * g * g);

@@ -89,6 +89,15 @@ pub struct WurliVoice {
     haze: f32,
     /// Compensation so the growl changes the SHAPE, not the loudness.
     comp: f32,
+    /// Where `asym` and `comp` are heading, and how fast. Both act on what
+    /// is already ringing — `comp` is a plain gain on it, `asym` reshapes
+    /// it — and both follow velocity, so a strike landing on a ringing
+    /// reed at a different velocity would step the residue by their ratio.
+    /// They glide over a few milliseconds instead; from silence they are
+    /// set outright and the glide adds exactly zero.
+    asym_to: f32,
+    comp_to: f32,
+    slew: f32,
     /// DC blocker: a squared term has a mean, and the mean must not reach
     /// the bus as a per-note thud of offset.
     dc_x1: f32,
@@ -112,6 +121,9 @@ impl WurliVoice {
             asym: 0.0,
             haze: 0.0,
             comp: 1.0,
+            asym_to: 0.0,
+            comp_to: 1.0,
+            slew: 1.0 - (-1.0 / (0.005 * sample_rate.max(8_000.0))).exp(),
             dc_x1: 0.0,
             dc_y1: 0.0,
             tone_z: 0.0,
@@ -191,14 +203,39 @@ impl WurliVoice {
         let norm = 1.0 / (1.0 + w1 + w2);
         let amp = swing * norm * jitter;
 
+        // **A hammer landing on a reed that is still moving adds to the
+        // motion** — the same rule, for the same pop, as the tine's; see
+        // `EpVoice::strike_full` for the argument, and `Mode::kick_add` for
+        // the arithmetic. The damper's take is folded into the metal first
+        // (the plate is nonlinear, so the fold is exact only for a reed
+        // well inside the gap), and the fundamental — the one mode that
+        // keeps energy — is capped at a little over this strike's own throw
+        // so rapid repeats cannot stack it through the plate. The overtones
+        // and the knock are attack colour, gone in tens of milliseconds,
+        // and take the whole seed.
+        let landing = !self.done;
+        if landing && self.damp < 1.0 {
+            for m in &mut self.modes {
+                m.scale(self.damp);
+            }
+            self.dc_x1 *= self.damp;
+            self.dc_y1 *= self.damp;
+            self.tone_z *= self.damp;
+        }
+        let allowed = if landing {
+            self.modes[0].seed_within(f0, self.rate, amp, amp * 1.25)
+        } else {
+            1.0
+        };
+
         // The overtone rings a tenth of the fundamental's life, not a
         // quarter: it is attack colour, and the old 0.22 left it singing
         // into the sustain where it read as a chime.
-        self.modes[0].kick(f0, t60_f, self.rate, amp);
-        self.modes[1].kick(f0 * over1, t60_f * 0.09, self.rate, amp * w1);
-        self.modes[2].kick(f0 * over2, t60_f * 0.10, self.rate, amp * w2);
-        self.modes[3].kick(165.0, 0.035, self.rate, knock);
-        self.modes[4].kick(610.0, 0.014, self.rate, knock * 0.5);
+        self.modes[0].kick_add(f0, t60_f, self.rate, amp * allowed);
+        self.modes[1].kick_add(f0 * over1, t60_f * 0.09, self.rate, amp * w1);
+        self.modes[2].kick_add(f0 * over2, t60_f * 0.10, self.rate, amp * w2);
+        self.modes[3].kick_add(165.0, 0.035, self.rate, knock);
+        self.modes[4].kick_add(610.0, 0.014, self.rate, knock * 0.5);
 
         // **The growl coefficient.** The square term's size against the
         // linear one, from how far this note will swing through the gap.
@@ -215,21 +252,44 @@ impl WurliVoice {
         // arriving with the player's weight, which is the instrument.
         // `hard` rides in as well: packed felt throws the reed further.
         let u = (swing * hard.powf(0.7)).powf(0.7) * REED_SWING;
-        self.asym = (base.growl * k.growl * u * 4.5).clamp(0.0, 2.0);
+        self.asym_to = (base.growl * k.growl * u * 4.5).clamp(0.0, 2.0);
         self.haze = base.haze;
         // 0.45, not a smaller figure: the bench's forte comp chords on the
         // tube instrument put 24 samples into the ceiling at 0.35.
-        self.comp = 1.0 / (1.0 + 0.45 * self.asym);
+        self.comp_to = 1.0 / (1.0 + 0.45 * self.asym_to);
+        if !landing {
+            self.asym = self.asym_to;
+            self.comp = self.comp_to;
+        }
 
         let corner = base.tone_hz.min(self.rate * 0.45);
         self.tone_a = 1.0 - (-std::f32::consts::TAU * corner / self.rate).exp();
-        self.tone_z = 0.0;
+        if !landing {
+            // The amp's one pole holds the last sample of what was ringing;
+            // on a landing strike that is the signal, not a stale state.
+            self.tone_z = 0.0;
+        }
 
         self.damp = 1.0;
         self.damp_to = 1.0;
         self.damp_secs = (DAMP_SECS * k.release).clamp(0.004, 1.5);
-        self.env = swing;
+        self.env = if landing { self.env.max(swing) } else { swing };
         self.done = false;
+    }
+
+    /// Silence now: every state cleared, `finished` true — the voice a
+    /// first strike can land on as if from `new`. See `EpVoice::silence`.
+    pub fn silence(&mut self) {
+        for m in &mut self.modes {
+            m.clear();
+        }
+        self.dc_x1 = 0.0;
+        self.dc_y1 = 0.0;
+        self.tone_z = 0.0;
+        self.damp = 1.0;
+        self.damp_to = 1.0;
+        self.env = 0.0;
+        self.done = true;
     }
 
     pub fn release(&mut self, pedal: bool) {
@@ -279,6 +339,10 @@ impl WurliVoice {
         // of the wave, so its second harmonic keeps a constant RATIO to the
         // note however softly it is played — the 140's standing haze. The DC
         // it carries (a rectified wave has a mean) dies in the blocker below.
+        // The growl and its compensation glide to where the last strike put
+        // them; from silence they are already there and this adds zero.
+        self.asym += (self.asym_to - self.asym) * self.slew;
+        self.comp += (self.comp_to - self.comp) * self.slew;
         let u = (disp * REED_SWING).clamp(-0.9, 0.9);
         let shaped = disp * (1.0 + self.asym * u + 0.30 * self.asym * u * u)
             + self.haze * disp.abs();

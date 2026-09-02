@@ -91,6 +91,10 @@ struct Knock {
 }
 
 impl Knock {
+    /// Throw the action. Lands on whatever the last throw left ringing —
+    /// the same superposition as `tine::Mode::kick_add`, for the same
+    /// reason: re-seeding a mode that is still moving is a step. A silent
+    /// mode is seeded exactly as it always was.
     fn kick(&mut self, rate: f32, amp: f32) {
         // The case thud and the shank tap. Fixed frequencies, fast decays:
         // by 50 ms this is gone and the string owns the note.
@@ -102,8 +106,12 @@ impl Knock {
             let r = 10.0_f32.powf(-3.0 / (T60[i] * rate)).clamp(0.0, 0.999_9);
             self.b1[i] = 2.0 * r * w.cos();
             self.b2[i] = -(r * r);
-            self.y2[i] = 0.0;
-            self.y1[i] = amp * MIX[i] * r * w.sin();
+            let seed = amp * MIX[i] * r * w.sin();
+            if self.y1[i] == 0.0 && self.y2[i] == 0.0 {
+                self.y1[i] = seed;
+            } else {
+                self.y1[i] += seed;
+            }
         }
     }
 
@@ -205,6 +213,22 @@ impl Str {
         for d in &mut self.disp {
             d.x1 = 0.0;
             d.y1 = 0.0;
+        }
+    }
+
+    /// Scale everything circulating — the line and the filters' memory —
+    /// by `g`. What the damper had taken out of the string, made real in
+    /// the string: see `PianoVoice::strike_full`. Four thousand multiplies,
+    /// which is what `clear` costs in writes, at a strike and never in the
+    /// tick.
+    pub(super) fn scale(&mut self, g: f32) {
+        for v in &mut self.buf {
+            *v *= g;
+        }
+        self.loss.z *= g;
+        for d in &mut self.disp {
+            d.x1 *= g;
+            d.y1 *= g;
         }
     }
 
@@ -310,6 +334,16 @@ pub(super) fn design_loss(w1: f32, w2: f32, rho1: f32, rho2: f32) -> (f32, f32) 
     (p, g.min(0.999_9))
 }
 
+/// What a strike decides about the loop before it touches a string. See
+/// `PianoVoice::design`.
+struct Design {
+    len: [f32; UNISON],
+    gain: [f32; UNISON],
+    loss_a: f32,
+    disp_a: f32,
+    strike: usize,
+}
+
 /// One key of the piano.
 pub struct PianoVoice {
     rate: f32,
@@ -407,11 +441,37 @@ impl PianoVoice {
         self.strike_full(pitch, velocity, &k, &PianoBase::JAZZ);
     }
 
-    fn strike_full(&mut self, pitch: u8, velocity: f32, knobs: &PianoKnobs, base: &PianoBase) {
+    /// Whether a strike of `pitch` with these knobs would land on the loop
+    /// that is ringing now, rather than have to replace it. The frame asks
+    /// this before a restrike so that the rare case — a knob moved the
+    /// string's length under a note still sounding — can be retired
+    /// through a fade instead of being cut. See `strike_full`.
+    pub fn lands(&self, pitch: u8, knobs: &PianoKnobs, base: &PianoBase) -> bool {
+        !self.done && self.fits(&self.design(pitch, knobs, base))
+    }
+
+    /// The design of `d` is the loop already ringing, to within a sample of
+    /// delay per string. A strike may land on such a loop: its filters can
+    /// be re-coefficiented under the circulating wave without a step, and a
+    /// read tap that moves by less than a sample moves the output by less
+    /// than one sample's worth of the wave's own slope. A tap that moved
+    /// further would jump to a different part of the wave, which is a pitch
+    /// change mid-ring, which is a pop.
+    fn fits(&self, d: &Design) -> bool {
+        self.strings
+            .iter()
+            .zip(&d.len)
+            .all(|(s, &len)| (s.len - len).abs() <= 1.0)
+    }
+
+    /// Everything a strike decides about the LOOP — length, gain, loss,
+    /// dispersion, strike position — for this pitch, these knobs and this
+    /// base. Split from the strike itself so a restrike can ask `fits`
+    /// before it touches anything. Pure: reads the rate, writes nothing.
+    fn design(&self, pitch: u8, knobs: &PianoKnobs, base: &PianoBase) -> Design {
         // `k` is the MIDI key number a few lines down and has been since this
         // file was written; the knobs are `knobs`.
         let spread = knobs.unison;
-        let voicing = knobs.voicing;
         let f0 = 440.0 * 2.0_f32.powf((f32::from(pitch) - 69.0) / 12.0);
         let total = (self.rate / f0).clamp(4.0, (MAX_DELAY - 4) as f32);
 
@@ -488,12 +548,6 @@ impl PianoVoice {
         let disp_tau = (1.8625 * b.sqrt() * total)
             .clamp(1.0, (0.14 * total).min(19.0).max(1.0));
         let disp_a = (1.0 - disp_tau) / (1.0 + disp_tau);
-        for s in &mut self.strings {
-            for d in &mut s.disp {
-                d.a = disp_a;
-            }
-            s.loss.a = 1.0 - p;
-        }
         // The loop must be SHORTENED by the delay the filters already
         // contribute, or every note plays flat — the single most common bug
         // in a waveguide, and it worsens as pitch rises because the filters'
@@ -516,11 +570,12 @@ impl PianoVoice {
         // out. Scaling the per-pass magnitude by rho1^(1/m - 1) scales that
         // string's whole t60 curve by m without touching its spectrum shape.
         const PAIR_T60: [f32; UNISON] = [1.0, 0.84, 0.74];
-        for (i, s) in self.strings.iter_mut().enumerate() {
+        let mut len = [0.0_f32; UNISON];
+        let mut gains = [0.0_f32; UNISON];
+        for i in 0..UNISON {
             let det = 2.0_f32.powf(CENTS[i] * spread / 1200.0);
-            s.len = (total / det - phase_delay).max(4.0);
-            s.gain = (gain * rho1.powf(1.0 / PAIR_T60[i] - 1.0)).min(0.999_9);
-            s.clear();
+            len[i] = (total / det - phase_delay).max(4.0);
+            gains[i] = (gain * rho1.powf(1.0 / PAIR_T60[i] - 1.0)).min(0.999_9);
         }
 
         // Strike position: an eighth of the way along through the mid
@@ -532,7 +587,60 @@ impl PianoVoice {
         // truncation drags the notch a third of the way toward n9, leaving
         // n8 dented instead of gone.
         let ratio = if k < 84.0 { 8.0 } else { 7.0 };
-        self.strike = ((total / ratio).round() as usize).clamp(1, MAX_DELAY - 2);
+        let strike = ((total / ratio).round() as usize).clamp(1, MAX_DELAY - 2);
+
+        Design {
+            len,
+            gain: gains,
+            loss_a: 1.0 - p,
+            disp_a,
+            strike,
+        }
+    }
+
+    fn strike_full(&mut self, pitch: u8, velocity: f32, knobs: &PianoKnobs, base: &PianoBase) {
+        let voicing = knobs.voicing;
+        let k = f32::from(pitch);
+        let d = self.design(pitch, knobs, base);
+
+        // **A hammer landing on a string that is still moving adds to the
+        // motion.** It does not stop the wire and start again — that was
+        // this function's old behaviour, `clear` on every string of a
+        // ringing loop, and the step from the circulating wave to zero was
+        // the pop the owner heard on every consecutive strike, worst under
+        // the pedal because that is when the wave is still loud. Now a
+        // strike on a ringing loop of the same design lands on it: the
+        // filters take their new coefficients under the wave, the hammer
+        // pours in through `excite` and `tick`, which already ADD, and the
+        // wave keeps circulating. A loop of a different design — another
+        // pitch, or a knob that moved the length — cannot be landed on, and
+        // is cleared as before; the frame keeps that case from ever being
+        // audible by retiring such a voice through a fade first.
+        let landing = !self.done && self.fits(&d);
+        if landing && self.damp < 1.0 {
+            // The damper's take, made real. `damp` is a gain on the OUTPUT,
+            // not a loss in the loop, so a note mid-release still holds its
+            // undamped wave behind a fading gain, and putting the gain back
+            // to one for the new hammer would reveal all of it at once.
+            // Scale the wave by what the felt had actually taken, and then
+            // the felt is off the string. Exact, because everything from
+            // the loop to the bus is linear.
+            for s in &mut self.strings {
+                s.scale(self.damp);
+            }
+        }
+        for (i, s) in self.strings.iter_mut().enumerate() {
+            for ap in &mut s.disp {
+                ap.a = d.disp_a;
+            }
+            s.loss.a = d.loss_a;
+            s.len = d.len[i];
+            s.gain = d.gain[i];
+            if !landing {
+                s.clear();
+            }
+        }
+        self.strike = d.strike;
 
         // **The hammer: a Gaussian force pulse, and the shape is most of the
         // instrument.** Two shapes failed on the bench before this one. The
@@ -574,6 +682,10 @@ impl PianoVoice {
         let sigma_s = (sigma_ms * 0.001 * self.rate).max(1.0);
         // Truncated at 3.5 sigma each side, where the curve is 53 dB down;
         // the tap pair cancels the step that remains.
+        // One pulse generator, so a strike inside the previous strike's
+        // contact — under two milliseconds, which is a switch bounce and
+        // not a hand — cuts that pulse short. The pair stays balanced
+        // sample by sample, so what is cut is a little energy, not a step.
         let half = 3.5 * sigma_s;
         self.pulse = (2.0 * half) as u32;
         // Exact incremental Gaussian: g(n) = exp(-(n-half)^2 / (2 sigma^2))
@@ -597,8 +709,27 @@ impl PianoVoice {
         self.damp = 1.0;
         self.damp_to = 1.0;
         self.damp_secs = (DAMP_SECS * knobs.release).clamp(0.004, 1.5);
-        self.env = self.pulse_amp;
+        // The follower keeps whichever is louder: it is the stealing
+        // policy's view of the voice, and a soft strike on a loud note has
+        // not made the note soft.
+        self.env = if landing { self.env.max(self.pulse_amp) } else { self.pulse_amp };
         self.done = false;
+    }
+
+    /// Silence now: every state cleared, `finished` true — the voice a
+    /// first strike can land on as if from `new`. The frame calls this on a
+    /// voice it has moved out of the pool and faded; the clearing happens
+    /// there, once per retired voice, instead of at every strike.
+    pub fn silence(&mut self) {
+        for s in &mut self.strings {
+            s.clear();
+        }
+        self.knock.clear();
+        self.pulse = 0;
+        self.damp = 1.0;
+        self.damp_to = 1.0;
+        self.env = 0.0;
+        self.done = true;
     }
 
     pub fn release(&mut self, pedal: bool) {

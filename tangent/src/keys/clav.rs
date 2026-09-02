@@ -72,8 +72,23 @@ pub struct ClavVoice {
     spit_g: f32,
     spit_r: f32,
     spit_rstep: f32,
+    /// The SNAP knob as read at the strike, kept apart from `spit_amp` —
+    /// which is the spit IN FLIGHT — so a strike landing on a string still
+    /// spitting from its last release does not retune the spit halfway.
+    snap: f32,
     env: f32,
     done: bool,
+}
+
+/// What a strike decides about the loop and the pickup before it touches
+/// the string. See `ClavVoice::design`.
+struct Design {
+    len: f32,
+    gain: f32,
+    loss_a: f32,
+    disp_a: f32,
+    strike_at: usize,
+    comb_d: usize,
 }
 
 impl ClavVoice {
@@ -102,16 +117,33 @@ impl ClavVoice {
             spit_g: 0.0,
             spit_r: 0.0,
             spit_rstep: 0.0,
+            snap: 0.0,
             env: 0.0,
             done: true,
         }
     }
 
-    pub fn strike_knobs(&mut self, pitch: u8, velocity: f32, k: &ClavKnobs) {
+    /// Whether a strike of `pitch` with these knobs would land on the
+    /// string ringing now rather than have to replace it — the same
+    /// question as `PianoVoice::lands`, with one more condition: the pickup
+    /// comb's tap. Moving that tap under a ringing string jumps the comb
+    /// term by up to the whole raw signal, so a PICKUP knob moved between
+    /// two strikes of one held note is the rare case the frame retires
+    /// through a fade instead.
+    pub fn lands(&self, pitch: u8, knobs: &ClavKnobs) -> bool {
+        !self.done && self.fits(&self.design(pitch, knobs))
+    }
+
+    fn fits(&self, d: &Design) -> bool {
+        (self.string.len - d.len).abs() <= 1.0 && self.comb_d == d.comb_d
+    }
+
+    /// Everything a strike decides about the loop and the comb, for this
+    /// pitch and these knobs. Pure: reads the rate, writes nothing.
+    fn design(&self, pitch: u8, k: &ClavKnobs) -> Design {
         let f0 = 440.0 * 2.0_f32.powf((f32::from(pitch) - 69.0) / 12.0);
         let total = (self.rate / f0).clamp(4.0, 4000.0);
         let key = f32::from(pitch);
-        let v = velocity.clamp(0.0, 1.0);
 
         // Thin plain-steel wire, short scale: stiffer for its pitch than a
         // grand's tenor but without the grand's wound bass, so one gentle
@@ -147,20 +179,63 @@ impl ClavVoice {
         let disp_tau = (1.8625 * b.sqrt() * total)
             .clamp(1.0, (0.14 * total).min(19.0).max(1.0));
         let disp_a = (1.0 - disp_tau) / (1.0 + disp_tau);
-        for d in &mut self.string.disp {
-            d.a = disp_a;
-        }
-        self.string.loss.a = 1.0 - p;
-        self.string.gain = gain;
         let phase_delay = loop_phase_delay(w1, p, disp_a);
-        self.string.len = (total - phase_delay).max(4.0);
-        self.string.clear();
+        let len = (total - phase_delay).max(4.0);
 
         // The tangent lands close to the anvil end — a tenth of the string,
         // a touch nearer in the treble — which is why even the strike is
         // toppy before the pickup has said anything.
         let ratio = if key < 76.0 { 10.0 } else { 9.0 };
-        self.strike_at = ((total / ratio).round() as usize).clamp(1, 4000);
+        let strike_at = ((total / ratio).round() as usize).clamp(1, 4000);
+
+        // **The pickup.** Its distance from the bridge, as a fraction of the
+        // string, sets the comb: close is glassy (notches high and out of
+        // the way), far is hollow (the low harmonics start folding). The
+        // knob's travel covers the C/D rockers and everything between.
+        let frac = 0.06 + 0.30 * k.pickup.clamp(0.0, 1.0);
+        let comb_d = ((total * frac).round() as usize).clamp(1, COMB_MAX - 1);
+
+        Design {
+            len,
+            gain,
+            loss_a: 1.0 - p,
+            disp_a,
+            strike_at,
+            comb_d,
+        }
+    }
+
+    pub fn strike_knobs(&mut self, pitch: u8, velocity: f32, k: &ClavKnobs) {
+        let v = velocity.clamp(0.0, 1.0);
+        let d = self.design(pitch, k);
+
+        // **A tangent landing on a string that is still moving adds to the
+        // motion** — the piano's rule, borrowed with the loop; see
+        // `PianoVoice::strike_full` for the argument. The comb and the tone
+        // rockers are part of the signal path and keep their memory; only a
+        // string of another design is cleared, and the frame keeps that
+        // from being audible.
+        let landing = !self.done && self.fits(&d);
+        if landing && self.damp < 1.0 {
+            // The yarn's take so far, made real in the string, the comb and
+            // the rockers — all linear, so exactly.
+            self.string.scale(self.damp);
+            for c in &mut self.comb {
+                *c *= self.damp;
+            }
+            self.tone_z *= self.damp;
+            self.tone_z2 *= self.damp;
+        }
+        for ap in &mut self.string.disp {
+            ap.a = d.disp_a;
+        }
+        self.string.loss.a = d.loss_a;
+        self.string.gain = d.gain;
+        self.string.len = d.len;
+        self.strike_at = d.strike_at;
+        if !landing {
+            self.string.clear();
+        }
 
         // Rubber on steel: contact a fraction of the piano's felt. VOICING
         // is the tip's compound, worn soft to fresh hard; velocity shortens
@@ -176,15 +251,12 @@ impl ClavVoice {
         self.pulse_rstep = (-1.0 / (sigma_s * sigma_s)).exp();
         self.pulse_amp = 0.30 * v.powf(1.3);
 
-        // **The pickup.** Its distance from the bridge, as a fraction of the
-        // string, sets the comb: close is glassy (notches high and out of
-        // the way), far is hollow (the low harmonics start folding). The
-        // knob's travel covers the C/D rockers and everything between.
-        let frac = 0.06 + 0.30 * k.pickup.clamp(0.0, 1.0);
-        self.comb_d = ((total * frac).round() as usize).clamp(1, COMB_MAX - 1);
+        self.comb_d = d.comb_d;
         self.comb_g = 0.92;
-        self.comb.fill(0.0);
-        self.comb_at = 0;
+        if !landing {
+            self.comb.fill(0.0);
+            self.comb_at = 0;
+        }
 
         // The tone rockers: brilliant leaves the wire alone, soft is the
         // mellow switch pair down. 8010 Hz is precisely where the old
@@ -195,16 +267,39 @@ impl ClavVoice {
         // over by 2 kHz — and an effectively-open 19 kHz at the top.
         let corner = 8_010.0 * 2.0_f32.powf((k.tone.clamp(0.0, 1.0) - 0.75) * 5.0);
         self.tone_a = 1.0 - (-std::f32::consts::TAU * corner / self.rate).exp();
-        self.tone_z = 0.0;
-        self.tone_z2 = 0.0;
+        if !landing {
+            self.tone_z = 0.0;
+            self.tone_z2 = 0.0;
+        }
 
         self.damp = 1.0;
         self.damp_to = 1.0;
         self.damp_secs = (CHOKE_SECS * k.release).clamp(0.003, 0.25);
-        self.spit = 0;
-        self.spit_amp = k.snap;
-        self.env = self.pulse_amp;
+        if !landing {
+            self.spit = 0;
+        }
+        self.snap = k.snap;
+        // The follower keeps whichever is louder: it is the stealing
+        // policy's view of the voice, and a soft strike on a loud note has
+        // not made the note soft.
+        self.env = if landing { self.env.max(self.pulse_amp) } else { self.pulse_amp };
         self.done = false;
+    }
+
+    /// Silence now: every state cleared, `finished` true — the voice a
+    /// first strike can land on as if from `new`. See `PianoVoice::silence`.
+    pub fn silence(&mut self) {
+        self.string.clear();
+        self.comb.fill(0.0);
+        self.comb_at = 0;
+        self.tone_z = 0.0;
+        self.tone_z2 = 0.0;
+        self.pulse = 0;
+        self.spit = 0;
+        self.damp = 1.0;
+        self.damp_to = 1.0;
+        self.env = 0.0;
+        self.done = true;
     }
 
     /// The tangent lifts. The yarn chokes the string AND the string spits —
@@ -224,7 +319,7 @@ impl ClavVoice {
         self.spit_rstep = (-1.0 / (sigma_s * sigma_s)).exp();
         // Scaled by how loudly the string was still going: lifting off a
         // dead note is silent, lifting mid-bark clacks.
-        self.spit_amp = self.spit_amp * self.env * 1.6;
+        self.spit_amp = self.snap * self.env * 1.6;
     }
 
     pub fn damp(&mut self) {
