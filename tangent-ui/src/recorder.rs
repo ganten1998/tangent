@@ -1782,6 +1782,15 @@ pub enum RecorderRequest {
     PreviewFile(std::path::PathBuf),
     /// Silence the preview — the explorer closed.
     PreviewStop,
+    /// **Turn one knob on a built-in insert, live.** `strip` is the SEAT and
+    /// `slot` the bay — the same addressing `OpenInsertEditor` carries, so a
+    /// sender converts through `seat_bay` exactly once, on its side. `id` is
+    /// the unit's own stable param id and `value` normalised 0..=1; the host
+    /// forwards to `Engine::set_insert_param`, which writes the durable
+    /// ledger and rides the lock-free ring to the audio thread. The sender
+    /// mirrors optimistically (`TangentApp::set_insert_param`), so a face
+    /// never waits a frame to see its own drag.
+    SetInsertParam { strip: usize, slot: usize, id: u32, value: f32 },
 }
 
 /// How hard an auditioned note is struck.
