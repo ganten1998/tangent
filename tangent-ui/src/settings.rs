@@ -793,6 +793,11 @@ pub struct Settings {
     /// Where an export lands when the export dialog does not name a folder.
     /// Absent means [`Settings::media_root`]'s `Exports`.
     pub export_dir: Option<String>,
+    /// Where saved PRESETS live — the built-in effects', the Keys patches',
+    /// the drum kits'. Absent means [`Settings::media_root`]'s `Presets`.
+    /// Its own key for the same reason `project_dir` is: presets are small
+    /// documents somebody may want on a different disk from their video.
+    pub preset_dir: Option<String>,
     /// Whether this file has been through the move to `Documents/Tangent
     /// Media`.
     ///
@@ -1558,6 +1563,7 @@ impl Default for Settings {
             record_dir: None,
             project_dir: None,
             export_dir: None,
+            preset_dir: None,
             media_root_v20: false,
             reader_mode_v20: false,
             master_mono: false,
@@ -2980,6 +2986,9 @@ impl Settings {
         if let Some(v) = map.shift_remove("record_export") {
             s.record_export = crate::recorder::ExportSpec::from_value(&v);
         }
+        // The presets' own folder — read at the END, like it is written at
+        // the end, because it joined after every key above it.
+        take_opt_str(&mut map, "preset_dir", &mut s.preset_dir);
 
         // Whatever is left, in the order the FILE had it.
         //
@@ -4194,6 +4203,12 @@ impl Settings {
             "strip_keys_params8".into(),
             Value::Array(self.strip_keys_params.iter().map(|&p| Value::from(p)).collect()),
         );
+        // The preset folder override, written only when somebody chose one —
+        // the same only-when-chosen rule `project_dir` follows, and at the
+        // END because it is additive.
+        if let Some(v) = self.preset_dir.as_ref().filter(|v| !v.is_empty()) {
+            map.insert("preset_dir".into(), Value::String(v.clone()));
+        }
         for (k, v) in &self.extra {
             map.insert(k.clone(), v.clone());
         }
@@ -4712,14 +4727,28 @@ impl Settings {
         Self::chosen(&self.export_dir).unwrap_or_else(|| self.media_root().join("Exports"))
     }
 
-    /// **The three folders Tangent keeps things in**, in the order the cog
-    /// card lists them: takes, projects, exports.
+    /// Where saved PRESETS live: built-in effect settings, Keys patches,
+    /// drum kits. One home with a subfolder per unit — the subfolders are
+    /// made lazily on the first save, not here and not at launch, so an
+    /// install that never saved a preset carries an empty `Presets` and
+    /// nothing else.
+    pub fn preset_root(&self) -> PathBuf {
+        Self::chosen(&self.preset_dir).unwrap_or_else(|| self.media_root().join("Presets"))
+    }
+
+    /// **The four folders Tangent keeps things in**, in the order the cog
+    /// card lists them: takes, projects, exports, presets.
     ///
-    /// Named in one place because the host creates them at launch and three
-    /// SHOW buttons open them, and a fourth caller that forgot one of the
-    /// three is exactly how the buttons came to open onto nothing.
-    pub fn media_roots(&self) -> [PathBuf; 3] {
-        [self.record_root(), self.project_root(), self.export_root()]
+    /// Named in one place because the host creates them at launch and the
+    /// SHOW buttons open them, and a caller that forgot one of them is
+    /// exactly how the buttons came to open onto nothing.
+    pub fn media_roots(&self) -> [PathBuf; 4] {
+        [
+            self.record_root(),
+            self.project_root(),
+            self.export_root(),
+            self.preset_root(),
+        ]
     }
 
     /// Everything Tangent writes for a person, under one roof.
@@ -5135,14 +5164,15 @@ pub fn clamp_to_monitor(
 #[cfg(test)]
 mod tests {
 
-    /// **Three kinds of thing, three folders, one roof.**
+    /// **Four kinds of thing, four folders, one roof.**
     ///
     /// Takes used to go to the platform's VIDEO folder, projects to a
     /// subfolder of that, and exports beside whichever project made them —
     /// so choosing where takes went silently moved the documents too, and
-    /// there was no answer at all to "where are my exports".
+    /// there was no answer at all to "where are my exports". Presets joined
+    /// as the fourth: the recipes people keep, beside the work they made.
     #[test]
-    fn the_three_media_folders_are_separate_and_default_under_documents() {
+    fn the_four_media_folders_are_separate_and_default_under_documents() {
         let s = super::Settings::default();
         let root = s.media_root();
         assert!(
@@ -5153,10 +5183,45 @@ mod tests {
         assert_eq!(s.record_root(), root.join("Takes"));
         assert_eq!(s.project_root(), root.join("Projects"));
         assert_eq!(s.export_root(), root.join("Exports"));
-        // All three are DIFFERENT places, which is the whole point.
-        assert_ne!(s.record_root(), s.project_root());
-        assert_ne!(s.project_root(), s.export_root());
-        assert_ne!(s.record_root(), s.export_root());
+        assert_eq!(s.preset_root(), root.join("Presets"));
+        // All four are DIFFERENT places, which is the whole point.
+        let roots = s.media_roots();
+        for (i, a) in roots.iter().enumerate() {
+            for b in &roots[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+    }
+
+    /// The preset folder override is its own key, survives a round trip, and
+    /// sits at the END of the file's own keys — new keys never land in the
+    /// middle, where they would reorder everybody's file on the next save.
+    #[test]
+    fn the_preset_folder_override_round_trips_at_the_end_of_the_map() {
+        let mut s = super::Settings::default();
+        // Absent until chosen, so an untouched file keeps its shape.
+        assert!(!s.to_map().contains_key("preset_dir"));
+        s.preset_dir = Some("/tmp/my-presets".to_owned());
+        let map = s.to_map();
+        assert_eq!(
+            map.keys().last().map(String::as_str),
+            Some("preset_dir"),
+            "preset_dir is not the last of our own keys"
+        );
+        let back = super::Settings::from_map(map);
+        assert_eq!(back.preset_dir.as_deref(), Some("/tmp/my-presets"));
+        assert_eq!(
+            back.preset_root(),
+            std::path::PathBuf::from("/tmp/my-presets")
+        );
+        // And an empty string is not a choice, exactly as for the other
+        // three folders.
+        let mut blank = super::Settings::default();
+        blank.preset_dir = Some("   ".to_owned());
+        assert_eq!(
+            blank.preset_root(),
+            blank.media_root().join("Presets")
+        );
     }
 
     /// Each folder is chosen on its own, and choosing one moves nothing else.

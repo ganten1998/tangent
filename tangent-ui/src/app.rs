@@ -970,6 +970,13 @@ pub struct TangentApp {
     /// Patch names of the cartridge the host has loaded, for the picker. The
     /// app never reads a `.syx`: this is pushed in after the host parses one.
     cartridge: crate::ports::CartridgeInfo,
+    /// The host's scan of each unit's preset folder, keyed by unit identity
+    /// ("@tangent-eq", "keys:2"). Pushed like the cartridge above; the app
+    /// never opens the folder itself.
+    preset_rows: std::collections::HashMap<String, Vec<crate::ports::PresetRow>>,
+    /// A preset the host has read back for a face to apply, latched until
+    /// [`TangentApp::take_preset_loaded`] drains it.
+    preset_loaded: Option<crate::ports::PresetLoaded>,
     /// The host has been asked to look for plugins again.
     plugin_rescan: bool,
     /// A folder the app has asked the host to show in the file manager.
@@ -2327,6 +2334,8 @@ impl TangentApp {
             lcd_drag: None,
             input_width: 0,
             cartridge: crate::ports::CartridgeInfo::default(),
+            preset_rows: std::collections::HashMap::new(),
+            preset_loaded: None,
             plugin_rescan: false,
             reveal_request: None,
             export_override: None,
@@ -6309,15 +6318,17 @@ impl TangentApp {
     }
 
     /// The folders the user has added, for the host's scanner.
-    /// **The three media folders, made real.** For the host to call once at
+    /// **The four media folders, made real.** For the host to call once at
     /// launch.
     ///
-    /// Takes, Projects and Exports under `Documents/Tangent Media` are
-    /// RESOLVED rather than stored, and until now nothing created them: they
-    /// appeared when the first take was written, the first project saved, the
-    /// first export run. Every SHOW button on the cog card therefore did
-    /// nothing at all on a fresh install, and "Save As" opened a panel at a
-    /// folder that was not there.
+    /// Takes, Projects, Exports and Presets under `Documents/Tangent Media`
+    /// are RESOLVED rather than stored, and until now nothing created them:
+    /// they appeared when the first take was written, the first project
+    /// saved, the first export run. Every SHOW button on the cog card
+    /// therefore did nothing at all on a fresh install, and "Save As" opened
+    /// a panel at a folder that was not there. (Only the ROOTS: the per-unit
+    /// preset subfolders are made lazily on the first save, so `Presets`
+    /// does not open on a crowd of empty drawers.)
     ///
     /// **Not in `Settings::load` and not in `TangentApp::new`**, which is why
     /// it is a method the host calls rather than something that happens on
@@ -17690,11 +17701,18 @@ impl TangentApp {
     }
 
     /// Ask for a kit file to load onto the showing lane.
+    ///
+    /// Both extensions, forever: new saves wear `.kit`, but every `.tgkit`
+    /// ever written keeps loading — `KitPreset::from_bytes` sniffs the
+    /// magic, so the name is a filter here and nothing more.
     fn load_kit_preset(&mut self) {
         self.file_request = Some(crate::ports::FileRequest {
             start_at: None,
             title: "Load Kit".to_owned(),
-            extensions: vec![crate::drumpad::PRESET_EXT.to_owned()],
+            extensions: vec![
+                crate::drumpad::PRESET_EXT.to_owned(),
+                crate::drumpad::PRESET_EXT_OLD.to_owned(),
+            ],
             extension_label: "Tangent kit".to_owned(),
             purpose: crate::ports::FilePurpose::KitPreset,
             multi: false,
@@ -19027,6 +19045,40 @@ impl TangentApp {
         filter.clear();
     }
 
+    // ── presets ─────────────────────────────────────────────────────────────
+    //
+    // The app's half of the preset road. Same firewall as the cartridge
+    // above: the host scans `Presets/<unit's folder>/` and pushes rows of
+    // plain data; a panel reads them here, asks for save/load/delete through
+    // `RecorderRequest`, and a finished load lands back through
+    // `set_preset_loaded` for the panel to drain.
+
+    /// The host's scan of one unit's preset folder — names and paths, keyed
+    /// by the unit's identity ("@tangent-eq", "keys:2"). Replaces whatever
+    /// was held for that unit; every save, load and delete re-pushes, so
+    /// what a panel shows is what the disk holds.
+    pub fn set_preset_rows(&mut self, unit: String, rows: Vec<crate::ports::PresetRow>) {
+        self.preset_rows.insert(unit, rows);
+    }
+
+    /// What the host last found for `unit`. Empty until it has pushed.
+    pub fn preset_rows(&self, unit: &str) -> &[crate::ports::PresetRow] {
+        self.preset_rows.get(unit).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// A preset the host has read back, for whichever face asked to apply.
+    /// Latched, not applied here: which knobs a symbol moves is the face's
+    /// business, and this crate's only job is to carry the answer across.
+    pub fn set_preset_loaded(&mut self, loaded: crate::ports::PresetLoaded) {
+        self.preset_loaded = Some(loaded);
+    }
+
+    /// Drain the loaded preset, once. The panel that asked calls this on its
+    /// next frame; anything else finding `None` is the ordinary case.
+    pub fn take_preset_loaded(&mut self) -> Option<crate::ports::PresetLoaded> {
+        self.preset_loaded.take()
+    }
+
     /// Show what is in a bay: a VST3's own editor, or the built-in's patches.
     ///
     /// **The built-in has no window to open.** Same gesture either way, and it
@@ -19863,6 +19915,10 @@ impl TangentApp {
                 self.ask_for_a_media_folder(crate::ports::DirPurpose::ExportRoot);
             }
             Hit::RevealExportFolder => self.reveal_folder(self.settings.export_root(), true),
+            Hit::ChoosePresetFolder => {
+                self.ask_for_a_media_folder(crate::ports::DirPurpose::PresetRoot);
+            }
+            Hit::RevealPresetFolder => self.reveal_folder(self.settings.preset_root(), true),
             Hit::ToggleOpenWhenDone => {
                 self.settings.record_open_when_done = !self.settings.record_open_when_done;
                 self.save_settings();
@@ -20163,6 +20219,12 @@ impl TangentApp {
     /// Where an EXPORT lands when the dialog does not name a folder.
     pub fn export_root(&self) -> std::path::PathBuf {
         self.settings.export_root()
+    }
+
+    /// Where saved PRESETS live, resolved. The host scans and writes under
+    /// it; this crate only names it.
+    pub fn preset_root(&self) -> std::path::PathBuf {
+        self.settings.preset_root()
     }
 
     /// The typed take name, if any.
@@ -20610,6 +20672,12 @@ impl TangentApp {
     /// `set_export_dir`, which writes the spec.
     pub fn set_export_root(&mut self, dir: std::path::PathBuf) {
         self.settings.export_dir = Some(dir.to_string_lossy().into_owned());
+        self.save_settings();
+    }
+
+    /// Where PRESETS live from now on.
+    pub fn set_preset_dir(&mut self, dir: std::path::PathBuf) {
+        self.settings.preset_dir = Some(dir.to_string_lossy().into_owned());
         self.save_settings();
     }
 
@@ -21110,6 +21178,10 @@ impl TangentApp {
             P::ExportRoot => (
                 self.settings.export_root(),
                 "Where should Tangent put your exports?",
+            ),
+            P::PresetRoot => (
+                self.settings.preset_root(),
+                "Where should Tangent keep your presets?",
             ),
             _ => {
                 if !self.caps.capture_devices {
@@ -29188,14 +29260,14 @@ mod tests {
         );
     }
 
-    /// **The three media folders exist after the host asks for them**, and
+    /// **The four media folders exist after the host asks for them**, and
     /// the SHOW buttons therefore have somewhere to open.
     ///
     /// On a fresh install nothing created them: they appeared when the first
     /// take, project or export was written, and until then every SHOW button
     /// on the cog card silently did nothing.
     #[test]
-    fn the_host_can_make_the_three_media_folders() {
+    fn the_host_can_make_the_four_media_folders() {
         let root = std::env::temp_dir().join(format!(
             "tangent-media-roots-{}-{:?}",
             std::process::id(),
@@ -29206,10 +29278,11 @@ mod tests {
         settings.record_dir = Some(root.join("t").to_string_lossy().into_owned());
         settings.project_dir = Some(root.join("p").to_string_lossy().into_owned());
         settings.export_dir = Some(root.join("e").to_string_lossy().into_owned());
+        settings.preset_dir = Some(root.join("s").to_string_lossy().into_owned());
         let (_, app) = headless_with(Caps::DESKTOP, settings);
 
         let roots = app.settings.media_roots();
-        assert_eq!(roots.len(), 3, "the three folders are not all named");
+        assert_eq!(roots.len(), 4, "the four folders are not all named");
         for r in &roots {
             assert!(!r.exists(), "{} was there before anything made it", r.display());
         }
@@ -29223,6 +29296,42 @@ mod tests {
             assert!(r.is_dir(), "{} did not survive a second launch", r.display());
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The preset road's app half is plain data, keyed by unit.** The host
+    /// pushes rows per unit and each push REPLACES that unit's list — a
+    /// rescan is the list — while a loaded preset is latched for exactly one
+    /// drain, like every other answer that crosses the firewall.
+    #[test]
+    fn preset_rows_and_a_loaded_preset_cross_the_firewall_as_plain_data() {
+        let (_, mut app) = headless(Caps::DESKTOP);
+        assert!(app.preset_rows("@tangent-eq").is_empty());
+        app.set_preset_rows(
+            "@tangent-eq".to_owned(),
+            vec![crate::ports::PresetRow {
+                name: "Warm".to_owned(),
+                path: "/somewhere/Warm.tangentpreset".to_owned(),
+            }],
+        );
+        assert_eq!(app.preset_rows("@tangent-eq").len(), 1);
+        assert!(
+            app.preset_rows("keys:0").is_empty(),
+            "one unit's rows leaked onto another"
+        );
+        app.set_preset_rows("@tangent-eq".to_owned(), Vec::new());
+        assert!(
+            app.preset_rows("@tangent-eq").is_empty(),
+            "a rescan accumulated instead of replacing"
+        );
+
+        let loaded = crate::ports::PresetLoaded {
+            unit: "keys:0".to_owned(),
+            name: "Glassy".to_owned(),
+            values: vec![("bell".to_owned(), 0.9)],
+        };
+        app.set_preset_loaded(loaded.clone());
+        assert_eq!(app.take_preset_loaded(), Some(loaded));
+        assert_eq!(app.take_preset_loaded(), None, "a load answers once");
     }
 
     /// **What was picked is what somebody wants to look at now.** Choosing a
@@ -29306,7 +29415,9 @@ mod tests {
             },
             ..Default::default()
         };
-        let kit_file = root.join("Snare Room.tgkit");
+        // `.kit` now: `KitPreset::save` forces the NEW extension onto
+        // whatever the panel answered.
+        let kit_file = root.join("Snare Room.kit");
         app.write_kit_preset(&kit_file);
         assert!(kit_file.is_file(), "no kit file was written");
 
