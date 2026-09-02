@@ -25,6 +25,9 @@ pub mod host;
 pub mod keys;
 pub mod menu;
 pub mod midi_event;
+/// The app's important messages, said in the corner of the window rather than
+/// in a child window that has to win a z-order fight to be seen.
+pub mod notify;
 pub mod piano;
 pub mod ports;
 pub mod preset;
