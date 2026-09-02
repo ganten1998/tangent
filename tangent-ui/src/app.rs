@@ -252,6 +252,31 @@ const ARR_LANES_FULL: usize = 10;
 /// longer than this. Size alone cannot tell the two apart, only timing can.
 const WM_GRACE: Duration = Duration::from_millis(600);
 
+/// **The conditions the app raises against, named once.**
+///
+/// A `notify_raise` key is the identity of a CONDITION, not of a message: the
+/// caller says the same key every time the thing is still true and says it
+/// with different words when the words change, and the queue answers "already
+/// said" from the key alone. Two callers that spelled the same condition
+/// differently would be two messages about one fault, and one that misspelt a
+/// `lower` would leave a message on screen that nothing could take down — so
+/// they are constants, and the raise and the lower read the same one.
+///
+/// **Both of these are re-checked when the user ASKS, and that is deliberate.**
+/// Enumerating MIDI hardware is not a per-frame act — the same bargain
+/// `Dialog::AudioSetup` makes about audio devices — so nothing here polls. The
+/// doors that can end either condition are the menu action that lists the
+/// ports, the connection attempt that succeeds, `App::set_ports` when the host
+/// swaps the source out from under both, and the user's own click. A message
+/// that stands until somebody looks again is the honest shape for a fault
+/// nothing is watching for.
+///
+/// There is no MIDI input port at all.
+const MIDI_IN_KEY: &str = "midi-in-missing";
+
+/// A named MIDI port would not open. Lowered by the next one that does.
+const MIDI_PORT_KEY: &str = "midi-port-failed";
+
 /// What is sounding, and why (spec §10 semantics).
 ///
 /// Pulled out of `TangentApp` so it can be TESTED: the rules here have four
@@ -1093,6 +1118,29 @@ pub struct TangentApp {
     vu_needle: [f32; 4],
     /// When the needles were last advanced, in egui's clock.
     vu_at: f64,
+    /// **Everything the app has to SAY**, as opposed to ask.
+    ///
+    /// The one queue behind `notify`, `notify_raise` and `notify_lower`, drawn
+    /// in the top-left corner of the window at the end of every frame. It
+    /// replaced four dialogs that answered no question and stopped everything
+    /// while they waited to be found — see the note where `Dialog::Confirm`
+    /// now begins.
+    messages: crate::notify::Notifications,
+    /// What the notification column is landing ON this frame.
+    ///
+    /// **Resolved during the paint, used after it.** The card is derived from
+    /// the face under it and that face is not one thing — the record band in
+    /// the ordinary view, the desk's strip or the arrangement's lane field in
+    /// a DAW view, the keyboard's own ground where a letterboxed window shows
+    /// it — so it has to be answered where the band rectangles are, and they
+    /// only exist inside `paint`. See `notify::probe`.
+    notify_face: egui::Color32,
+    /// Where the notification boxes landed on the last pass, newest first.
+    ///
+    /// The pointer test for the handlers that read `i.pointer` directly — see
+    /// where it is filled, at the end of `paint`, for why it has to be last
+    /// frame's geometry and why it is the boxes and not their union.
+    notify_boxes: Vec<Rect>,
     /// The band message the notice window was last CLOSED on.
     ///
     /// Some messages cannot be cleared by dismissing them — a camera still
@@ -2280,6 +2328,13 @@ impl TangentApp {
             fx_choice: None,
             vu_needle: [0.0; 4],
             vu_at: 0.0,
+            messages: crate::notify::Notifications::new(),
+            // Until the first paint has said what is actually under the
+            // corner. Nothing is drawn before then, so this is never the face
+            // a card is dressed for; it is here because a `Color32` has no
+            // sensible absence.
+            notify_face: egui::Color32::from_rgb(0xE3, 0xD9, 0xBD),
+            notify_boxes: Vec::new(),
             notice_dismissed: None,
             mixer_open: false,
             mixer_scroll_px: 0.0,
@@ -2556,6 +2611,12 @@ impl TangentApp {
 
     pub fn set_ports(&mut self, ports: Option<Box<dyn MidiPorts>>) {
         self.ports = ports;
+        // **A new port source knows nothing about the old one's troubles.**
+        // Both MIDI conditions are statements about the source that was here a
+        // moment ago, so they are lowered rather than left standing — which
+        // also forgets any dismissal, so the next real failure is news again.
+        self.notify_lower(MIDI_IN_KEY);
+        self.notify_lower(MIDI_PORT_KEY);
     }
 
     /// Attach the thing that enumerates audio inputs.
@@ -6797,21 +6858,37 @@ impl TangentApp {
         self.browsed_dir.take()
     }
 
-    /// Report what a take produced. See `Dialog::TakeSummary`.
+    /// Report what a take produced.
     ///
-    /// **A problem is always shown**, whatever the tick says; suppression is
-    /// for the ordinary "recorded 2:14 of audio + MIDI" line. And it never
-    /// replaces a dialog that is already open — a summary landing on top of
-    /// the picker somebody is using would be the report interrupting the work.
+    /// **A problem is always shown**, whatever the setting says; suppression is
+    /// for the ordinary "Recorded 2:14 of audio + MIDI to take-0412" line. A
+    /// problem — the disk filled, the take is silent — is not a message
+    /// anybody meant to stop seeing.
+    ///
+    /// **It was a modal box and is now a notification.** That retires two
+    /// things with it. The first is the guard that refused to report while any
+    /// dialog was open: a summary landing on top of the picker somebody was
+    /// using would have been the report interrupting the work, and a corner
+    /// box that covers nothing and takes no focus interrupts nothing — so the
+    /// report is no longer thrown away for arriving at a busy moment, which is
+    /// exactly when a take is likeliest to be finishing. The second is the
+    /// "Don't show this again" tick, which lived on the box; the setting it
+    /// wrote is still read here and still honoured, and
+    /// `DialogAction::SetShowTakeSummary` is still the one way to write it.
+    ///
+    /// The kind carries the difference the old dialog put in its title bar: a
+    /// problem is an `Error`, an ordinary take is a `Success`, because it is a
+    /// receipt for the thing the app exists to do.
     pub fn report_take(&mut self, message: String, problem: bool) {
-        if self.dialog.is_some() || (!problem && !self.settings.show_take_summary) {
+        if !problem && !self.settings.show_take_summary {
             return;
         }
-        self.dialog = Some(dialogs::Dialog::TakeSummary {
-            message,
-            problem,
-            dont_show: false,
-        });
+        let kind = if problem {
+            crate::notify::Kind::Error
+        } else {
+            crate::notify::Kind::Success
+        };
+        self.notify(kind, message);
     }
 
     /// The backing track, as the host decoded it.
@@ -8858,11 +8935,21 @@ impl TangentApp {
             }
             LoadOutcome::Damaged => match quarantine_damaged(doc) {
                 Some(kept) => {
+                    // **Cut to fit the corner, not to save breath.** This one
+                    // was written for a modal window and ran to just over two
+                    // hundred characters; a notification grows to five rows
+                    // and then elides, and what fell off the end was the
+                    // sentence saying the recordings had survived. Everything
+                    // load-bearing is kept — what failed, where the bytes
+                    // went, what opened instead — and the reassurance is said
+                    // in three words rather than nine. It is the only one of
+                    // the four startup notices that needed cutting; see
+                    // `the_startup_notices_all_fit_the_box`, which measures
+                    // them all.
                     self.set_startup_notice(format!(
-                        "This project's document could not be read. The damaged \
-                         file is kept untouched as {} — nothing here will write \
-                         to it. The project opened empty; the takes in media/ \
-                         are unaffected.",
+                        "This project's document could not be read. It is kept \
+                         untouched as {}, and the project opened empty. Your \
+                         takes are unaffected.",
                         kept.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
                     ));
                     (Arrangement::default(), doc.to_path_buf())
@@ -11288,17 +11375,22 @@ impl TangentApp {
             .cloned()
             .collect();
         if picked.len() < 2 {
-            self.report_take(
-                "Select two or more MIDI clips on one track to glue.".to_owned(),
-                false,
+            // **Not `report_take`.** These refusals went through the take
+            // report because it was once the only way to say anything at all,
+            // which meant they wore its title bar, and — worse — were
+            // switched off by the setting that suppresses the after-a-take
+            // receipt. A refusal to glue is neither a take nor a success.
+            self.notify(
+                crate::notify::Kind::Info,
+                "Select two or more MIDI clips on one track to glue.",
             );
             return;
         }
         let lane = picked[0].lane;
         if picked.iter().any(|c| c.lane != lane) {
-            self.report_take(
-                "Glue works on one track at a time.".to_owned(),
-                false,
+            self.notify(
+                crate::notify::Kind::Info,
+                "Glue works on one track at a time.",
             );
             return;
         }
@@ -11391,9 +11483,9 @@ impl TangentApp {
                 .any(|c| c.id == *id && c.kind == crate::arrangement::ClipKind::Audio)
         });
         if ids.is_empty() {
-            self.report_take(
-                "Nothing to normalise - select an audio clip first.".to_owned(),
-                false,
+            self.notify(
+                crate::notify::Kind::Info,
+                "Nothing to normalise - select an audio clip first.",
             );
             return;
         }
@@ -18768,12 +18860,51 @@ impl TangentApp {
     /// from the desk is a press that landed ON it — egui shields its own
     /// widgets, but the handlers that read `i.pointer` directly would see
     /// straight through the layer to the mixer beneath.
+    ///
+    /// **And the EXPORT window, which is not a dialog and was therefore not
+    /// answered for at all.** It is a surface over the desk on the inline
+    /// path exactly as a plugin dialog is, and `shell::surface` makes it
+    /// swallow what lands on it at egui's own hit test — which shields every
+    /// widget in the app and none of the handlers that read `i.pointer`
+    /// straight off the input. So in the plugin a press in the middle of the
+    /// render's waveform sounded a piano note through it. The render lane
+    /// fixed the window's own click handling and could not reach this
+    /// function; `dialogs::pointer_over_export` is the same question about
+    /// the same kind of layer, and it belongs in the same answer. On the
+    /// desktop it is a window of its own whose presses never arrive here, so
+    /// it answers false there — which is the honest answer, not a special
+    /// case.
     fn dialog_blocks_pointer(&self, ctx: &egui::Context) -> bool {
+        if dialogs::pointer_over_export(ctx) || self.pointer_over_notification(ctx) {
+            return true;
+        }
         match &self.dialog {
             None => false,
             Some(d) if d.is_modal() => true,
             Some(_) => dialogs::pointer_over_dialog(ctx),
         }
+    }
+
+    /// Whether the pointer is on one of the notification boxes.
+    ///
+    /// **The dismiss click is the message's, and only the message's.** A box
+    /// is a layer that owns its own rectangle, so egui's own widgets are
+    /// shielded from it — but the app has a handful of handlers that read
+    /// `i.pointer` off the raw input and see through any layer, and without
+    /// this one click would both take a message down and sound a note under
+    /// it. The gaps between the boxes are deliberately not covered: a press
+    /// aimed through one of them belongs to the desk, which is why the column
+    /// is drawn as one layer per box in the first place.
+    ///
+    /// Answered from the LAST pass's rectangles, because these handlers run
+    /// before the column is drawn — the same bargain
+    /// `dialogs::pointer_over_dialog` makes with the layer rect.
+    fn pointer_over_notification(&self, ctx: &egui::Context) -> bool {
+        if self.notify_boxes.is_empty() {
+            return false;
+        }
+        ctx.pointer_interact_pos()
+            .is_some_and(|p| self.notify_boxes.iter().any(|r| r.contains(p)))
     }
 
     /// Whether the open dialog owns the KEYBOARD this frame.
@@ -19018,16 +19149,76 @@ impl TangentApp {
         self.settings.borderless_mode
     }
 
+    // ── what the app says ──────────────────────────────────────────────────
+    //
+    // Three doors and no more. Everything in the app that used to open a box
+    // with one OK button in it comes through here instead; the queue and the
+    // drawing are `crate::notify`'s, and the host lane calls these rather than
+    // declaring anything of its own.
+
+    /// Raise a message in the top-left corner. The one door for anything the
+    /// app wants to SAY (as opposed to ASK).
+    ///
+    /// Terminal: it happened, it is over, it appears and ages out in the four
+    /// or five seconds the owner asked for, and a click takes it down sooner.
+    /// A caller that is re-checking a CONDITION every frame wants
+    /// [`Self::notify_raise`] instead — see `notify::Notifications::push` for
+    /// what this door will and will not promise such a caller.
+    pub fn notify(&mut self, kind: crate::notify::Kind, text: impl Into<String>) {
+        self.messages.push(kind, text);
+    }
+
+    /// A condition that is true until it stops being true. Re-raising an
+    /// already-standing key does nothing; a user dismissal sticks.
+    ///
+    /// `key` is a code-authored name for the condition, not for the words: the
+    /// text may change while the condition holds ("Scanning plugins... 40 of
+    /// 112") and the message stays the one message.
+    pub fn notify_raise(&mut self, key: &str, kind: crate::notify::Kind, text: impl Into<String>) {
+        self.messages.raise(key, kind, text);
+    }
+
+    /// The condition has cleared: take its message down, and let the next
+    /// failure be news again.
+    pub fn notify_lower(&mut self, key: &str) {
+        self.messages.lower(key);
+    }
+
+    /// The queue, for a test that wants to read what was said.
+    #[cfg(test)]
+    fn said(&self) -> &crate::notify::Notifications {
+        &self.messages
+    }
+
     /// **Say something once, at startup, that the owner must not miss.**
     ///
     /// Its first caller is the plugin guard: a bay that has been emptied
     /// because its plugin killed the app is a bay the owner would otherwise
     /// refill with the same plugin.
+    ///
+    /// **It was a dialog and is now a notification**, with everything that
+    /// implies: it no longer takes the focus off the window somebody just
+    /// launched, and it no longer has to be found and clicked before the app
+    /// will respond. It is an `Error` rather than an `Info` because every one
+    /// of its four bodies is about something that went wrong — a plugin that
+    /// crashed the app, a document that would not read, a session that opened
+    /// empty — and an error is the kind that gets the longest life and the
+    /// stripe that says to read it.
+    ///
+    /// **All four fit the box, and one of them had to be cut to.** A
+    /// notification grows to `notify::MAX_ROWS` and then elides with an
+    /// ellipsis; the quarantine notice ran to just over two hundred characters
+    /// and lost its last sentence, which was the one saying the recordings had
+    /// survived. It is shorter now, at `read_for_adoption`. The longest of the
+    /// four takes four of the five rows — a line of slack and no more — and
+    /// the plugin crash notice, which is the one that must not be cut, stays
+    /// inside that even with a forty-character plugin name in it.
+    ///
+    /// `the_startup_notices_all_fit_the_box` measures that rather than
+    /// asserting it, because the number of rows a sentence takes is a fact
+    /// about the font and the column width and would otherwise be a hope.
     pub fn set_startup_notice(&mut self, body: String) {
-        self.dialog = Some(dialogs::Dialog::Notice {
-            title: "Tangent".to_owned(),
-            body,
-        });
+        self.notify(crate::notify::Kind::Error, body);
     }
 
     /// **The drawable size the host should restore**, taken once.
@@ -19174,14 +19365,15 @@ impl TangentApp {
             // spare row to BE the folder, and a shortcut that silently does
             // nothing here is worse than one that does nothing visibly —
             // this fn's own doc said so while the refusal stayed mute.
-            if self.dialog.is_none() {
-                self.dialog = Some(dialogs::Dialog::Notice {
-                    title: "Tangent".to_owned(),
-                    body: "No free channel to hold the folder: all 16 rows \
-                           are in use. Remove a track to make room."
-                        .to_owned(),
-                });
-            }
+            //
+            // The "only if no dialog is open" guard went with the box: a
+            // notification does not displace anything, so a refusal is no
+            // longer silently thrown away for arriving while a picker is up.
+            self.notify(
+                crate::notify::Kind::Error,
+                "No free channel to hold the folder: all 16 rows are in use. \
+                 Remove a track to make room.",
+            );
             return false;
         };
         // The permutation: everything in order, with the spare lifted out
@@ -19242,6 +19434,44 @@ impl TangentApp {
     /// everything; see `confetti::draw`.
     fn start_confetti(&mut self) {
         self.confetti_at = Some(std::time::Instant::now());
+    }
+
+    /// **What is painted under `at`**, for anything that has to be dressed for
+    /// the surface it lands on rather than picking a colour and hoping.
+    ///
+    /// Only three rectangles can answer differently, and they are exactly the
+    /// three that own the top of the window at one time or another: the record
+    /// band, which sits above everything in both views; the desk, when it has
+    /// taken the room under the band; and the timeline, when it has. Everything
+    /// else — the theory band, the piano, the neck, and the letterbox margin a
+    /// window at the wrong aspect shows — is painted on the theme's own ground,
+    /// which is one colour and is what `piano::themed_bg` answers. That is why
+    /// this is four cases and not eight.
+    ///
+    /// The rectangles are the ones the last paint worked out, so this is only
+    /// meaningful after a frame has been drawn — which is the same contract
+    /// `last_band` and `last_drawn` already have.
+    fn face_under(&self, at: Pos2) -> egui::Color32 {
+        if self.last_band.contains(at) {
+            return recorder_panel::palette(&self.settings).bg;
+        }
+        if self.mixer_rect.is_some_and(|r| r.contains(at)) {
+            // The strip face, which is what the mixer's own `ink` resolves and
+            // what `panel_face` exists to be the single answer to.
+            return self.panel_face();
+        }
+        if self.arrangement_rect.is_some_and(|r| r.contains(at)) {
+            // The lane field, from the arrangement's own derivation — and note
+            // that the timeline has a light/dark switch of its OWN (`arr_dark`)
+            // and reads the theme's plain roles, so this is not the app's
+            // `dark_mode` and must not become it.
+            return crate::arrangement_panel::lane_field(
+                self.settings.fx_strip_color.to_color32(),
+                self.settings.meter_bg_color.to_color32(),
+                self.settings.arr_dark,
+            );
+        }
+        crate::piano::themed_bg(&self.settings)
     }
 
     /// The desk's own face for the mode the app is in — what every floating
@@ -22134,15 +22364,30 @@ impl TangentApp {
                 let Some(src) = self.ports.as_ref() else {
                     return;
                 };
-                let ports = src.list();
-                self.dialog = Some(if ports.is_empty() {
-                    Dialog::NoMidiInput
-                } else {
-                    Dialog::MidiPicker {
-                        ports,
-                        selected: None,
-                        current: src.current(),
-                    }
+                // Both readings taken before anything borrows `self` mutably:
+                // the port source is behind a shared borrow and raising a
+                // message is a mutable one.
+                let (ports, current) = (src.list(), src.current());
+                if ports.is_empty() {
+                    // **A CONDITION, not an event.** There either are MIDI
+                    // input ports or there are not, and the box that used to
+                    // say so was a modal question with an OK button. Raised
+                    // against a key so that asking again once a keyboard is
+                    // plugged in takes the message down rather than leaving a
+                    // stale one standing.
+                    self.notify_raise(
+                        MIDI_IN_KEY,
+                        crate::notify::Kind::Error,
+                        "No MIDI input ports found. Keytoggle mode still \
+                         works - turn it on in the context menu.",
+                    );
+                    return;
+                }
+                self.notify_lower(MIDI_IN_KEY);
+                self.dialog = Some(Dialog::MidiPicker {
+                    ports,
+                    selected: None,
+                    current,
                 });
             }
             MenuAction::PickColor(target) => {
@@ -23290,12 +23535,12 @@ impl TangentApp {
                     self.refresh_route_labels();
                     self.save_settings();
                 } else if self.settings.routes.0.len() >= crate::routing::MAX_ROUTES {
-                    self.report_take(
+                    self.notify(
+                        crate::notify::Kind::Error,
                         format!(
                             "The routing table is full at {} routes. Remove one to add another.",
                             crate::routing::MAX_ROUTES
                         ),
-                        false,
                     );
                 }
                 // Back to the two kinds, so adding several routes in a row is
@@ -23722,8 +23967,21 @@ impl TangentApp {
             }
             DialogAction::ConnectPort(name) => {
                 if let Some(src) = self.ports.as_mut() {
-                    if let Err(e) = src.connect(&name, self.midi_tx.clone()) {
-                        self.dialog = Some(Dialog::MidiError { message: e });
+                    // **A CONDITION, like the empty port list beside it.** The
+                    // port is either open or it is not, so a failure STANDS
+                    // and a success takes it down — rather than a box that has
+                    // to be clicked away and then says nothing about whether
+                    // the next attempt worked.
+                    match src.connect(&name, self.midi_tx.clone()) {
+                        Ok(()) => self.notify_lower(MIDI_PORT_KEY),
+                        Err(e) => self.notify_raise(
+                            MIDI_PORT_KEY,
+                            crate::notify::Kind::Error,
+                            format!(
+                                "Could not open the MIDI port \u{201c}{name}\u{201d}: {e}. \
+                                 Keytoggle mode still works."
+                            ),
+                        ),
                     }
                 }
             }
@@ -25779,6 +26037,11 @@ impl TangentApp {
         let recorder_rect_for_hit: Option<Rect> =
             (recorder_h > 0.0).then(|| band_at(0.0, recorder_h));
         self.last_band = recorder_rect_for_hit.unwrap_or(Rect::NOTHING);
+        // **What the notification column will land on**, decided here because
+        // this is where the bands' rectangles are and nowhere else has them.
+        // See the field's own doc, and `notify::probe` for why the point comes
+        // from the module that paints rather than from a 10 written twice.
+        self.notify_face = self.face_under(crate::notify::probe(pane));
         if recorder_rect_for_hit.is_none() {
             // A band that is not on screen cannot hold a focused field. Without
             // this, hiding the Recorder with R mid-edit leaves the field open
@@ -27743,6 +28006,56 @@ impl TangentApp {
             dialogs::show_export_progress(&ctx, &p, placement);
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
+
+        // **The messages, last of all.** Everything the app has to SAY goes in
+        // the top-left corner of the window it is already looking at, and it
+        // goes there AFTER every panel, dialog and window above has been laid
+        // out — a notification is the shortest-lived surface in the app and it
+        // is drawn on `Order::Foreground`, so being last is what puts it over
+        // the desk without it having to win a z-order fight against anything.
+        //
+        // `content_rect` and not `last_drawn`: the column belongs to the
+        // WINDOW's corner, not to the letterboxed picture inside it, which is
+        // why `face_under` has to answer for the ground as well as the bands.
+        let shown = crate::notify::show(
+            &ctx,
+            ctx.content_rect(),
+            &mut self.messages,
+            self.notify_face,
+        );
+        if shown.wants_repaint {
+            // The module deliberately does not ask for this itself — an
+            // overlay that quietly pins the app at the display's refresh rate
+            // is a battery cost nobody can trace back to a message that left
+            // four seconds ago. So the ask is here, where it can be seen, and
+            // only while something is actually moving.
+            ctx.request_repaint();
+        }
+        // `shown.dismissed` carries the clicked message WHOLE, on the one frame
+        // it can still be had, for a caller that wants to keep the part an
+        // elided box did not show. Nothing here wants it: every message the app
+        // raises today fits inside the box — `the_startup_notices_all_fit_the_box`
+        // is what holds the longest of them to that — so there is nothing being
+        // thrown away. A message long enough to be cut is the thing that would
+        // make this worth reading.
+        // **Where the boxes landed, kept for the NEXT frame's pointer test.**
+        //
+        // The click that takes a message down must not also do something to
+        // the desk. The Areas own their own rectangles, so every egui widget
+        // is already shielded — but the handlers that read `i.pointer`
+        // straight off the input (the piano's note press, the band's hit test)
+        // see through every layer there has ever been, and they run near the
+        // TOP of this function while the column is drawn at the bottom of it.
+        // So they are answered from the last pass's geometry, which is exactly
+        // what `dialogs::pointer_over_dialog` does with the layer rect for the
+        // same reason. The rects one at a time and never their union: the gaps
+        // between the boxes belong to whatever is under the column, and that
+        // is the whole reason the column is four layers.
+        //
+        // Extended into the same allocation rather than collected, because
+        // this runs every frame and there are never more than five of them.
+        self.notify_boxes.clear();
+        self.notify_boxes.extend(shown.boxes.iter().map(|b| b.rect));
 
         // **Refresh-locked while a gesture is in flight; 50 ms otherwise.**
         //
@@ -30456,7 +30769,17 @@ mod tests {
             Some(garbage.as_slice()),
             "the damaged bytes were not kept verbatim"
         );
-        assert!(app.dialog.is_some(), "nobody was told");
+        // Said in the corner rather than in a box that has to be found and
+        // clicked before the app will answer at all — and said as an ERROR,
+        // which is what a document that would not read is.
+        let said = app.said().notes();
+        assert_eq!(said.len(), 1, "nobody was told");
+        assert_eq!(said[0].kind, crate::notify::Kind::Error);
+        assert!(
+            said[0].text.contains("damaged"),
+            "the notice does not name the kept file: {}",
+            said[0].text
+        );
         assert!(app.arrangement.clips.is_empty());
 
         // The save writes a fresh document at the path; the quarantine
@@ -33952,39 +34275,56 @@ mod tests {
 
     /// **A take's report can be turned off, and a problem cannot.**
     ///
-    /// The tick is for the ordinary "recorded 2:14 of audio + MIDI" line. A
+    /// The setting is for the ordinary "recorded 2:14 of audio + MIDI" line. A
     /// take that hit a problem says so however many times it has been
     /// dismissed: "the disk filled" and "the audio is silent" are not messages
     /// anybody meant to stop seeing.
+    ///
+    /// It is a NOTIFICATION now rather than a box with an OK button, which
+    /// changes two things this test has to hold. The kind carries what the
+    /// title bar used to: an ordinary take is a receipt and a problem is an
+    /// error. And the report no longer throws itself away for arriving while
+    /// something else is open — a corner box covers nothing and takes no
+    /// focus, so the old "never on top of a dialog" guard was protecting the
+    /// user from a message that cannot interrupt them, at the cost of losing
+    /// the report exactly when a take is likeliest to finish.
     #[test]
     fn a_take_report_is_suppressable_and_a_problem_is_not() {
         let (_, mut app) = headless_with_fx(Caps::DESKTOP);
         assert!(app.settings.show_take_summary, "reports ship off");
 
         app.report_take("Recorded 2:14".to_owned(), false);
-        assert!(
-            matches!(app.dialog, Some(dialogs::Dialog::TakeSummary { .. })),
-            "an ordinary report did not appear"
-        );
-        // Ticking the box is what turns it off.
-        app.apply_dialog_action(dialogs::DialogAction::SetShowTakeSummary(false));
-        app.dialog = None;
-        assert!(!app.settings.show_take_summary);
+        let said = app.said().notes();
+        assert_eq!(said.len(), 1, "an ordinary report did not appear");
+        assert_eq!(said[0].text, "Recorded 2:14");
+        assert_eq!(said[0].kind, crate::notify::Kind::Success, "a take is a receipt");
+        assert!(app.dialog.is_none(), "the report opened a window");
+        app.messages.clear();
 
+        // The setting is what turns it off. Its tick went with the box; this
+        // action is the one door left to it.
+        app.apply_dialog_action(dialogs::DialogAction::SetShowTakeSummary(false));
+        assert!(!app.settings.show_take_summary);
         app.report_take("Recorded 2:14".to_owned(), false);
-        assert!(app.dialog.is_none(), "it came back after being turned off");
+        assert!(
+            app.said().is_empty(),
+            "it came back after being turned off"
+        );
 
         // The problem ignores it.
         app.report_take("No space left on device".to_owned(), true);
-        let Some(dialogs::Dialog::TakeSummary { problem, .. }) = &app.dialog else {
-            panic!("a problem was suppressed")
-        };
-        assert!(*problem);
-        app.dialog = None;
+        let said = app.said().notes();
+        assert_eq!(said.len(), 1, "a problem was suppressed");
+        assert_eq!(
+            said[0].kind,
+            crate::notify::Kind::Error,
+            "a problem is not a receipt"
+        );
+        app.messages.clear();
 
-        // **And it never lands on top of a dialog already open.** A report
-        // arriving over the picker somebody is using is the report
-        // interrupting the work.
+        // **And it lands whatever else is open**, because it interrupts
+        // nothing: the picker stays exactly as it was and the report is still
+        // said.
         app.settings.show_take_summary = true;
         app.open_browser(
             "x".to_owned(),
@@ -33995,7 +34335,393 @@ mod tests {
         app.report_take("Recorded 0:30".to_owned(), false);
         assert!(
             matches!(app.dialog, Some(dialogs::Dialog::FileBrowser { .. })),
-            "the report replaced an open dialog"
+            "the report displaced an open dialog"
+        );
+        assert_eq!(
+            app.said().notes().first().map(|n| n.text.as_str()),
+            Some("Recorded 0:30"),
+            "the report was thrown away for arriving at a busy moment"
+        );
+    }
+
+    /// **The card is derived from the face it lands on, and that face is not
+    /// one thing.**
+    ///
+    /// `notify` sweeps four faces because four surfaces can be under the
+    /// window's top-left corner, and a card dressed for the wrong one is
+    /// invisible on the right one. This is the app's half of that: which of
+    /// the four the corner is actually over, in each view.
+    ///
+    /// The pure answer first, because a rectangle can be put where a test
+    /// wants it; then a real frame, because a function that is right and never
+    /// called is the same as one that is wrong.
+    #[test]
+    fn a_notification_is_dressed_for_the_view_it_lands_in() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        let window = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 900.0));
+        let at = crate::notify::probe(window);
+        let full = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 700.0));
+
+        // Nothing over the corner: the theme's own ground, which is what the
+        // theory band, the piano, the neck and the letterbox margin round a
+        // window at the wrong aspect are all painted on.
+        app.last_band = Rect::NOTHING;
+        app.mixer_rect = None;
+        app.arrangement_rect = None;
+        let ground = crate::piano::themed_bg(&app.settings);
+        assert_eq!(app.face_under(at), ground);
+
+        // The record band owns the top of the window whenever it is showing —
+        // in BOTH views, because it deliberately does not move when the view
+        // changes.
+        app.last_band = Rect::from_min_size(Pos2::ZERO, Vec2::new(1300.0, 200.0));
+        app.mixer_rect = Some(full);
+        let band = recorder_panel::palette(&app.settings).bg;
+        assert_eq!(app.face_under(at), band, "the desk won over the band above it");
+
+        // Band hidden, desk open: the strip face.
+        app.last_band = Rect::NOTHING;
+        assert_eq!(app.face_under(at), app.panel_face());
+
+        // Band hidden, timeline open: the lane FIELD — from the arrangement's
+        // own derivation, and with the timeline's own light/dark switch, which
+        // is not the app's.
+        app.mixer_rect = None;
+        app.arrangement_rect = Some(full);
+        let field = crate::arrangement_panel::lane_field(
+            app.settings.fx_strip_color.to_color32(),
+            app.settings.meter_bg_color.to_color32(),
+            app.settings.arr_dark,
+        );
+        assert_eq!(app.face_under(at), field);
+        assert_ne!(
+            app.settings.arr_dark, app.settings.dark_mode,
+            "the fixture no longer separates the timeline's switch from the app's"
+        );
+
+        // Four faces and not one repeated: a test that could not tell them
+        // apart would pass with `face_under` returning a constant.
+        let faces = [ground, band, app.panel_face(), field];
+        for (i, a) in faces.iter().enumerate() {
+            for b in &faces[i + 1..] {
+                assert_ne!(a, b, "two of the four faces are the same colour");
+            }
+        }
+
+        // ── and now for real, one view at a time ────────────────────────────
+        //
+        // A function that is right and never called is the same as one that is
+        // wrong, so each of the four comes out of an actual frame.
+        app.notify(crate::notify::Kind::Info, "hello");
+
+        // The theory view is aspect-locked and CENTRED, so a window taller
+        // than the stack shows the theme's ground down both edges — and the
+        // corner is in it. This is not a contrivance: it is what a plugin
+        // editor somebody has dragged taller looks like, and it is exactly why
+        // the ground is one of the four faces rather than three.
+        app.mixer_open = false;
+        app.arrangement_open = false;
+        pointer_frame(&ctx, &mut app, Vec::new());
+        assert!(app.last_band.top() > 1.0, "the fixture is not letterboxed");
+        assert_eq!(
+            app.notify_face, ground,
+            "the corner was dressed for a band it is nowhere near"
+        );
+
+        // A DAW view fills the window from its own top-left, so the record
+        // band really is under the corner there.
+        app.arrangement_open = true;
+        pointer_frame(&ctx, &mut app, Vec::new());
+        assert!(app.arrangement_rect.is_some(), "the timeline was not drawn");
+        assert_eq!(app.notify_face, band, "the band above the timeline was missed");
+
+        // Hide the band and the timeline itself is under the corner.
+        app.settings.show_recorder = false;
+        pointer_frame(&ctx, &mut app, Vec::new());
+        assert_eq!(
+            app.notify_face, field,
+            "the corner was dressed for a band that is not on screen"
+        );
+
+        // And the desk, on its own turn of the same cycle.
+        app.arrangement_open = false;
+        app.mixer_open = true;
+        pointer_frame(&ctx, &mut app, Vec::new());
+        assert!(app.mixer_rect.is_some(), "the desk was not drawn");
+        assert_eq!(app.notify_face, app.panel_face());
+    }
+
+    /// **A message says its piece and leaves the app alone.**
+    ///
+    /// Driven at the event level, because "it does not freeze the desk" is a
+    /// claim about what the pointer reaches and not about arithmetic. The
+    /// four dialogs this replaced were `is_modal`, which meant every press
+    /// anywhere in the main window was dropped for as long as one stood —
+    /// including the press somebody would have used to get on with their take.
+    #[test]
+    fn a_retired_message_is_a_notification_and_does_not_freeze_the_desk() {
+        let (ctx, mut app) = headless_with_band(Caps::DESKTOP);
+        // The startup notice: the one that used to be `Dialog::Notice`.
+        app.set_startup_notice("Pianoteq crashed Tangent while loading.".to_owned());
+        assert!(app.dialog.is_none(), "a notice opened a window");
+        pointer_frame(&ctx, &mut app, Vec::new());
+        assert_eq!(app.notify_boxes.len(), 1, "the message was never drawn");
+        let box_rect = app.notify_boxes[0];
+
+        // A knob well away from the column still answers the hand. This is the
+        // whole of the complaint against the modal box: the desk went dead.
+        let knob = knob_cell(&app, recorder_panel::Hit::SetTempo(0.0)).center();
+        assert!(!box_rect.contains(knob), "the probe is under the message");
+        press(&ctx, &mut app, knob);
+        assert!(
+            app.grabbed
+                .is_some_and(|g| g.hit.is_same_control(recorder_panel::Hit::SetTempo(0.0))),
+            "a message on screen stopped the desk answering the pointer"
+        );
+        release(&ctx, &mut app, knob);
+
+        // And the message is still there, un-dismissed: reaching past it is
+        // not the same as clicking it.
+        assert_eq!(app.said().len(), 1, "using the desk took the message down");
+
+        // The dismiss click lands on the box and nowhere else. `press` moves
+        // the pointer there first, which is what fills the gate for this
+        // frame.
+        let on_box = box_rect.center();
+        press(&ctx, &mut app, on_box);
+        assert!(
+            app.dialog_blocks_pointer(&ctx),
+            "a press on a message would have fallen through to the desk"
+        );
+        release(&ctx, &mut app, on_box);
+        assert!(app.said().is_empty(), "the click did not take the message down");
+        // Nothing on screen: the desk owns the pointer again, everywhere.
+        pointer_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(on_box)]);
+        assert!(app.notify_boxes.is_empty());
+        assert!(!app.dialog_blocks_pointer(&ctx));
+    }
+
+    /// **Every startup notice fits the box, measured rather than assumed.**
+    ///
+    /// A notification grows to five rows and then elides with an ellipsis, and
+    /// the whole point of moving these off a modal window was that they are
+    /// still readable where they land. The longest of the four is the plugin
+    /// crash notice, which is the one that matters most: a bay that is
+    /// silently empty is a bay the owner refills with the same plugin.
+    ///
+    /// The bodies are copied here from where they are composed —
+    /// `read_for_adoption` in this file, and the plugin guard in
+    /// `desktop::TangentDesktop::new` — the same hand-copy `slope_choice`
+    /// makes for the same reason: this crate cannot reach the binary, and a
+    /// wording change that overflowed the box would otherwise be found by
+    /// nobody.
+    #[test]
+    fn the_startup_notices_all_fit_the_box() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        crate::fonts::apply_text_styles(&ctx);
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 620.0));
+        let bodies = [
+            "Pianoteq 8 crashed Tangent while loading, so it has been taken \
+             out of its slot. Its settings are kept; load it again to retry.",
+            "project.tangent existed but held nothing, so this project opened \
+             empty. If that file was a song, its bytes were already gone.",
+            "This project's document could not be read. It is kept untouched \
+             as project.tangent.damaged, and the project opened empty. Your \
+             takes are unaffected.",
+            "This project's document could not be read, or moved aside. It has \
+             not been touched. A fresh project at project-2 opened instead.",
+        ];
+        // **The crash notice with a plugin name at the long end of real.**
+        // It is the one that must not be cut — a bay that is silently empty is
+        // a bay the owner refills with the same plugin — and its length is not
+        // ours: the name comes off disk. Forty characters is longer than any
+        // VST3 on the owner's machine.
+        let long_name = format!(
+            "{} crashed Tangent while loading, so it has been taken out of its \
+             slot. Its settings are kept; load it again to retry.",
+            "SomeVendor Super Analog Emulation 3000 X"
+        );
+        let bodies: Vec<&str> = bodies.iter().copied().chain([long_name.as_str()]).collect();
+        let mut worst = 0usize;
+        for body in bodies {
+            let mut app = TangentApp::new(&ctx, Settings::default(), Caps::DESKTOP);
+            app.set_startup_notice(body.to_owned());
+            let st = crate::notify::Style::of(crate::piano::themed_bg(&app.settings));
+            let mut placed = None;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| {
+                    let p = ctx.layer_painter(egui::LayerId::new(
+                        egui::Order::Foreground,
+                        egui::Id::new("startup-notice-measure"),
+                    ));
+                    placed = crate::notify::draw(&p, screen, app.said(), &st)
+                        .boxes
+                        .first()
+                        .copied();
+                },
+            );
+            let placed = placed.expect("the notice was not drawn at all");
+            assert!(
+                !placed.elided,
+                "a startup notice is cut off at {} rows ({} characters): {body}",
+                placed.rows,
+                body.chars().count()
+            );
+            assert_eq!(placed.kind, crate::notify::Kind::Error);
+            worst = worst.max(placed.rows);
+        }
+        // Room to spare, and exactly how much: the longest of the four takes
+        // four of the five rows, so a wording change has one line of slack and
+        // no more. Asserted as an equality rather than an inequality because
+        // "it still fits" is worth less than "it fits with this much left".
+        assert_eq!(
+            worst,
+            crate::notify::MAX_ROWS - 1,
+            "the longest notice takes {worst} rows, not the four measured here"
+        );
+    }
+
+    /// **The two MIDI messages are CONDITIONS, and behave like conditions.**
+    ///
+    /// "No MIDI input ports found" and "that port would not open" were modal
+    /// boxes with OK buttons, which is the wrong shape twice over: asking
+    /// again while the fault held opened a second box, and clicking OK said
+    /// nothing about whether the thing was still true. A condition is said
+    /// once, stands while it holds, and goes when it stops holding — which
+    /// here means when a list comes back with something in it, when a port
+    /// opens, or when the host swaps the source out from under both.
+    #[test]
+    fn the_midi_messages_stand_while_they_are_true_and_go_when_they_are_not() {
+        struct Ports {
+            available: Vec<String>,
+        }
+        impl crate::ports::MidiPorts for Ports {
+            fn list(&self) -> Vec<String> {
+                self.available.clone()
+            }
+            fn connect(
+                &mut self,
+                name: &str,
+                _tx: std::sync::mpsc::Sender<crate::midi_event::MidiEvent>,
+            ) -> Result<(), String> {
+                if self.available.iter().any(|n| n == name) {
+                    Ok(())
+                } else {
+                    Err("the device is not there any more".to_owned())
+                }
+            }
+            fn current(&self) -> Option<String> {
+                None
+            }
+        }
+        let (ctx, mut app) = headless(Caps::DESKTOP);
+        app.dialog = None;
+        app.set_ports(Some(Box::new(Ports {
+            available: Vec::new(),
+        })));
+
+        // Nothing plugged in. Asking five times says it once, and never opens
+        // a window.
+        for _ in 0..5 {
+            app.apply_menu_action(&ctx, MenuAction::SelectMidiInput);
+        }
+        assert_eq!(app.said().len(), 1, "asking again stacked another message");
+        assert!(app.dialog.is_none(), "the refusal opened a picker");
+        assert!(app.said().is_raised(MIDI_IN_KEY));
+        let standing = app.said().notes()[0].clone();
+        assert!(standing.is_standing(), "a condition was given a clock");
+        assert_eq!(standing.kind, crate::notify::Kind::Error);
+
+        // A keyboard is plugged in and the user asks again: the message goes
+        // and the picker opens.
+        app.set_ports(Some(Box::new(Ports {
+            available: vec!["Keystation".to_owned()],
+        })));
+        assert!(!app.said().is_raised(MIDI_IN_KEY), "swapping the source left it standing");
+        app.apply_menu_action(&ctx, MenuAction::SelectMidiInput);
+        assert!(matches!(app.dialog, Some(Dialog::MidiPicker { .. })));
+        // A lowered message LEAVES rather than blinking out, so it is still in
+        // the queue for the half-second its tail takes — on its way out, which
+        // is what "went" means here.
+        assert!(
+            app.said().notes().iter().all(crate::notify::Note::leaving),
+            "the picker opened with a complaint standing beside it"
+        );
+
+        // A port that will not open is the other condition, and it stands the
+        // same way.
+        app.apply_dialog_action(dialogs::DialogAction::ConnectPort("Gone".to_owned()));
+        assert!(app.said().is_raised(MIDI_PORT_KEY));
+        // By KEY, not by position: the message the picker just lowered is
+        // still in the queue finishing its tail, and it is the older of the
+        // two.
+        let standing_now = |app: &TangentApp| {
+            app.said()
+                .notes()
+                .iter()
+                .find(|n| n.key() == Some(MIDI_PORT_KEY))
+                .cloned()
+                .expect("nothing was raised against the port")
+        };
+        let failed = standing_now(&app);
+        assert!(
+            failed.text.contains("Gone"),
+            "the message does not name the port: {}",
+            failed.text
+        );
+        assert!(failed.is_standing());
+        // Asking again while it is still broken changes the words, not the
+        // number of messages.
+        app.apply_dialog_action(dialogs::DialogAction::ConnectPort("Gone Too".to_owned()));
+        let again = standing_now(&app);
+        assert_eq!(again.id, failed.id, "a second attempt minted a second message");
+        assert!(again.text.contains("Gone Too"), "the words did not follow: {}", again.text);
+
+        // And the one that opens takes it down.
+        app.apply_dialog_action(dialogs::DialogAction::ConnectPort("Keystation".to_owned()));
+        assert!(!app.said().is_raised(MIDI_PORT_KEY), "a working port left the failure up");
+    }
+
+    /// **A press on the export window does not reach the desk under it.**
+    ///
+    /// Inline — the plugin path — the render's waveform is a layer over the
+    /// canvas, and `shell::surface` makes it swallow what lands on it at
+    /// egui's own hit test. That shields every widget in the app and none of
+    /// the handlers that read `i.pointer` straight off the input, so a click
+    /// in the middle of the waveform sounded a piano note through it.
+    /// `dialog_blocks_pointer` is the gate those handlers share and it only
+    /// ever answered about a `Dialog`, which an export deliberately is not.
+    #[test]
+    fn a_press_on_the_inline_export_window_does_not_reach_the_desk() {
+        let (ctx, mut app) = headless_with_band(Caps::PLUGIN);
+        app.set_export_progress(Some(crate::ports::ExportProgress {
+            fraction: 0.4,
+            label: "Rendering".to_owned(),
+            peaks: vec![(0.5, -0.5); 64],
+        }));
+        // Two frames: the first draws the window, the second is the one whose
+        // pointer test can see the layer the first left behind.
+        pointer_frame(&ctx, &mut app, Vec::new());
+        let over = dialogs::inline_export_rect(&ctx).expect("the export window was not drawn");
+        assert!(app.dialog.is_none(), "this test is about a window that is not a dialog");
+        pointer_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(over.center())]);
+        assert!(
+            app.dialog_blocks_pointer(&ctx),
+            "a press on the waveform falls through to the desk"
+        );
+        // And off it, the desk is the desk: this is a report, not a question,
+        // and it must not freeze anything it is not covering.
+        let away = Pos2::new(over.left() * 0.5, over.bottom() + 40.0);
+        assert!(!over.contains(away), "the probe is still on the window");
+        pointer_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(away)]);
+        assert!(
+            !app.dialog_blocks_pointer(&ctx),
+            "the render froze the whole canvas"
         );
     }
 
@@ -34259,10 +34985,16 @@ mod tests {
         // people press twice and then give up on.
         app.arr_multi.clear();
         app.arr_selected = Some(midi);
-        app.dialog = None;
+        app.messages.clear();
         app.arr_normalize_selection();
         assert!(app.take_recorder_request().is_none());
-        assert!(app.dialog.is_some(), "it went quiet on an empty selection");
+        // In the corner, and as guidance rather than as a receipt: it used to
+        // go through `report_take`, which made it a "Take" with a green stripe
+        // and — worse — switched it off along with the after-a-take report.
+        let said = app.said().notes();
+        assert_eq!(said.len(), 1, "it went quiet on an empty selection");
+        assert_eq!(said[0].kind, crate::notify::Kind::Info);
+        assert!(said[0].text.contains("audio clip"), "{}", said[0].text);
 
         // The host's answer lands on the clip and marks it for the engine.
         app.set_clip_gain(audio, 2.5);
@@ -39469,16 +40201,18 @@ mod folder_tests {
                 "a refused folder still marked channel {ch}"
             );
         }
-        // And the refusal SPEAKS — a silent no on a full desk was the bug.
-        match &full.dialog {
-            Some(dialogs::Dialog::Notice { body, .. }) => {
-                assert!(
-                    body.contains("free channel"),
-                    "the refusal does not say what is missing: {body}"
-                );
-            }
-            _ => panic!("a full desk refused without saying why"),
-        }
+        // And the refusal SPEAKS — a silent no on a full desk was the bug. In
+        // the corner now rather than in a modal box, and an error rather than
+        // a notice, because it is a refusal of something the user asked for.
+        let said = full.said().notes();
+        assert_eq!(said.len(), 1, "a full desk refused without saying why");
+        assert!(
+            said[0].text.contains("free channel"),
+            "the refusal does not say what is missing: {}",
+            said[0].text
+        );
+        assert_eq!(said[0].kind, crate::notify::Kind::Error);
+        assert!(full.dialog.is_none(), "the refusal opened a window");
     }
 
     #[test]

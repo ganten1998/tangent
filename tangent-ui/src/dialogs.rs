@@ -236,25 +236,26 @@ pub enum Dialog {
         /// than an empty folder.
         error: String,
     },
-    /// What a take produced, after it is written.
-    ///
-    /// **A popup rather than a line in the band.** It used to sit in the
-    /// status strip, where it competed with live errors, stayed up until
-    /// something else replaced it, and — being one line in a narrow strip —
-    /// was routinely the first thing to be shrunk to illegibility. It is the
-    /// report on the thing the whole app exists to do; it can have a box.
-    ///
-    /// The tick suppresses the ORDINARY ones only. A take that hit a problem
-    /// still says so however many times this has been dismissed: "the disk
-    /// filled" is not a message anybody meant to stop seeing.
-    TakeSummary {
-        message: String,
-        /// True when the take had a real problem, which is what makes it
-        /// unsuppressable.
-        problem: bool,
-        /// The tick's live state, committed when the box is closed.
-        dont_show: bool,
-    },
+    // **`TakeSummary` is gone, and so are `Notice`, `MidiError` and
+    // `NoMidiInput`.**
+    //
+    // Four dialogs that asked nothing. Each opened a child viewport, took the
+    // focus, froze the desk through `is_modal`, and waited to be found and
+    // clicked — for "Recorded 2:14 of audio + MIDI to take-0412", for "no MIDI
+    // ports were found", for a plugin that had been taken out of its slot. The
+    // owner's ruling was to remove every system dialog that is not a question,
+    // and those four were the whole of that list: what they said now goes to
+    // `App::notify`, which puts it in the corner of the window the user is
+    // already looking at for four or five seconds, dismissable with a click and
+    // gone on its own if it is not.
+    //
+    // The two MIDI ones went to `notify_raise` rather than `notify`, because
+    // neither is an event: a port is either failed or it is not, and a message
+    // about it has to be able to stand while that is true and go when it stops
+    // being true.
+    //
+    // What did NOT go is `LearnResult` — see its own doc for why one of these
+    // is genuinely a report and not a message.
     /// **A yes/no in front of something that cannot be taken back.**
     ///
     /// One dialog rather than one per action, and the app's first: before
@@ -300,19 +301,6 @@ pub enum Dialog {
         /// opens; the plugins' are not.
         open_groups: Vec<String>,
     },
-    NoMidiInput,
-    /// **Something happened that the owner has to be told about**, with
-    /// nothing to decide.
-    ///
-    /// Distinct from `Confirm`, which asks a question and whose buttons carry
-    /// consequences. This one exists because the first thing it had to say —
-    /// that a plugin killed the app and has been taken out of its slot — is
-    /// useless on stderr, and a bay that is silently empty is a bay the owner
-    /// fills with the same plugin again.
-    Notice {
-        title: String,
-        body: String,
-    },
     /// **Unsaved work is about to be lost.**
     ///
     /// New, Open and Quit all raise this and all carry on afterwards. It
@@ -329,9 +317,6 @@ pub enum Dialog {
         what: String,
         /// The project's own name, so the question names the thing at risk.
         name: String,
-    },
-    MidiError {
-        message: String,
     },
     About,
     /// **Setup.** What the audio path is doing, and everything that changes it.
@@ -497,6 +482,29 @@ pub enum Dialog {
         selected: Option<usize>,
     },
     /// Plain themed report of what a correction achieved.
+    ///
+    /// **The one OK-only box that stayed, and the reason is its length.**
+    /// Every other dialog that asked nothing — the take summary, the startup
+    /// notice, the two MIDI ones — became a notification in the corner. This
+    /// one did not, and the decision was made against the actual text rather
+    /// than in principle.
+    ///
+    /// A notification's box grows to `notify::MAX_ROWS` and then elides with
+    /// an ellipsis. All but one of the bodies `App::train_and_report` and
+    /// `App::open_correct_dialog` compose run to six authored lines or more —
+    /// several to nine — and they wrap far past five at the column's 300
+    /// points, so a notification would show the opening and hide the rest. The
+    /// hidden part is the part that matters: these messages exist to explain
+    /// why the thing the user just asked for did NOT happen, and almost every
+    /// one of them ENDS by naming the command that would have worked ("use
+    /// \"Teach Chord Name...\" to pin it instead"). A four-second box cut off
+    /// before the answer is worse than no box, because it looks like it said
+    /// something.
+    ///
+    /// So this one is genuinely a REPORT and not a message, and a report is
+    /// what a dialog is for. It is still the only one: the test
+    /// `every_ok_only_dialog_is_gone_except_the_one_report` names it and
+    /// nothing else.
     LearnResult {
         title: &'static str,
         message: String,
@@ -620,13 +628,9 @@ impl Dialog {
             | Dialog::MidiPicker { .. }
             | Dialog::DevicePicker { .. }
             | Dialog::FileBrowser { .. }
-            | Dialog::TakeSummary { .. }
             | Dialog::Confirm { .. }
             | Dialog::Automation { .. }
-            | Dialog::NoMidiInput
-            | Dialog::Notice { .. }
             | Dialog::SaveChanges { .. }
-            | Dialog::MidiError { .. }
             | Dialog::About
             | Dialog::AudioSetup { .. }
             | Dialog::InputChannels { .. }
@@ -905,6 +909,14 @@ pub enum DialogAction {
         host: String,
     },
     /// Persist the take summary's "don't show again" choice.
+    ///
+    /// **Kept although its tick is gone**, because the CHOICE is not. The tick
+    /// lived on the take summary, which was a modal box with one OK
+    /// button and is a notification now; the setting behind it is still read
+    /// on every take and still obeyed, so this is the one remaining way to
+    /// write it and removing it would strand somebody who had already turned
+    /// the report off. Where the switch should live instead is the owner's
+    /// call — see `Settings::show_take_summary`.
     SetShowTakeSummary(bool),
     /// Frames per audio callback, or `None` for the device's own default.
     /// Applies to both streams and reopens them.
@@ -3482,9 +3494,21 @@ pub fn pointer_over_dialog(ctx: &egui::Context) -> bool {
 /// is a window of its own and its presses never reach the main window at
 /// all, so this is false there, which is the honest answer.
 pub fn pointer_over_export(ctx: &egui::Context) -> bool {
-    crate::shell::inline_rect(ctx, EXPORT_ID)
+    inline_export_rect(ctx)
         .zip(ctx.pointer_interact_pos())
         .is_some_and(|(r, p)| r.contains(p))
+}
+
+/// Where the export window was drawn IN THE CANVAS last pass, or `None` on the
+/// desktop, where it is a window of its own.
+///
+/// **The one place that knows the export window's id**, which is why this is
+/// public rather than the id being. The app has to be able to ask about this
+/// window — see `App::dialog_blocks_pointer` — and a caller that reached for
+/// `shell::inline_rect` with an id of its own spelling would go on answering
+/// `None` for ever the day this one changed.
+pub fn inline_export_rect(ctx: &egui::Context) -> Option<Rect> {
+    crate::shell::inline_rect(ctx, EXPORT_ID)
 }
 
 /// Whether the dialog was drawn IN THE CANVAS last pass, sharing the main
@@ -3792,14 +3816,14 @@ fn export_geometry(ctx: &egui::Context, placement: Placement) -> (Vec2, Option<P
 ///    stays behind it, and a dialog opened from the menu paints OVER it and
 ///    can be used — including its dropdowns and its hover text, which is
 ///    what keeps a question in the band its own popups are drawn in.
-/// 7a. **The raw-pointer hole, if it is still open.** Inline, `shell`
-///    swallows what lands on a surface at egui's hit test, which covers
-///    every widget and the main background's own response. The handlers that
-///    read `i.pointer` directly — the piano's note press, the recorder
-///    band's hit test — are gated by `App::dialog_blocks_pointer`, which
-///    answers only about a `Dialog`. Until that also asks
-///    [`pointer_over_export`], a click on the waveform can still sound a
-///    note in the plugin. Press the middle of the window and listen.
+/// 7a. **The raw-pointer hole, now closed.** Inline, `shell` swallows what
+///    lands on a surface at egui's hit test, which covers every widget and
+///    the main background's own response. The handlers that read `i.pointer`
+///    directly — the piano's note press, the recorder band's hit test — are
+///    gated by `App::dialog_blocks_pointer`, which used to answer only about
+///    a `Dialog`, so a click on the waveform sounded a note in the plugin.
+///    That function now asks [`pointer_over_export`] first. Press the middle
+///    of the window and listen: nothing.
 /// 8. **A native file panel beats everything.** Start an export, then open
 ///    any "Save as…" — the OS panel is in front of the export window, which
 ///    is what `on_top: false` is for.
@@ -4563,52 +4587,6 @@ pub fn show(
                                     result.close = true;
                                 }
                                 if ui.button("Cancel").clicked() {
-                                    result.close = true;
-                                }
-                            });
-                        });
-                },
-            )
-        }
-
-        Dialog::TakeSummary {
-            message,
-            problem,
-            dont_show,
-        } => {
-            let problem = *problem;
-            let stock = stock_style(ctx);
-            show_dialog_viewport(
-                ctx,
-                placement,
-                if problem { "Take - problem" } else { "Take" },
-                Vec2::new(460.0, 210.0),
-                Vec2::new(320.0, 150.0),
-                |ui, result| {
-                    *ui.style_mut() = stock.clone();
-                    let bg = ui.style().visuals.window_fill;
-                    ui.painter().rect_filled(ui.max_rect(), 0.0, bg);
-                    egui::Frame::NONE
-                        .inner_margin(egui::Margin::same(12))
-                        .show(ui, |ui| {
-                            ui.label(message.as_str());
-                            ui.add_space(10.0);
-                            // Not offered on a problem: see the type's doc.
-                            if !problem {
-                                // Committed on the TICK — the Welcome
-                                // dialog's own pattern. Committing only
-                                // under OK meant Esc and the title-bar X
-                                // threw the ticked state away: the summary
-                                // came back after the next take and the
-                                // checkbox read as broken.
-                                if ui.checkbox(dont_show, "Don't show this again").changed() {
-                                    action =
-                                        Some(DialogAction::SetShowTakeSummary(!*dont_show));
-                                }
-                                ui.add_space(6.0);
-                            }
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui.button("OK").clicked() {
                                     result.close = true;
                                 }
                             });
@@ -5878,35 +5856,6 @@ pub fn show(
             )
         }
 
-        Dialog::NoMidiInput => {
-            let stock = stock_style(ctx);
-            show_dialog_viewport(
-                ctx,
-                placement,
-                "No MIDI Input",
-                Vec2::new(420.0, 170.0),
-                Vec2::new(320.0, 140.0),
-                |ui, result| {
-                    *ui.style_mut() = stock.clone();
-                    let bg = ui.style().visuals.window_fill;
-                    ui.painter().rect_filled(ui.max_rect(), 0.0, bg);
-                    egui::Frame::NONE
-                        .inner_margin(egui::Margin::same(12))
-                        .show(ui, |ui| {
-                            ui.label(
-                                "No MIDI input ports found!\n\nYou can still use keytoggle mode by enabling it in the context menu.",
-                            );
-                            ui.add_space((ui.available_height() - 30.0).max(0.0));
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui.button("OK").clicked() {
-                                    result.close = true;
-                                }
-                            });
-                        });
-                },
-            )
-        }
-
         Dialog::SaveChanges { what, name } => {
             let stock = stock_style(ctx);
             let what = what.clone();
@@ -5983,64 +5932,6 @@ pub fn show(
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if ui.button("...").clicked() {
                                     action = Some(DialogAction::AcceptCheat);
-                                    result.close = true;
-                                }
-                            });
-                        });
-                },
-            )
-        }
-
-        Dialog::Notice { title, body } => {
-            let stock = stock_style(ctx);
-            let title = title.clone();
-            let body = body.clone();
-            show_dialog_viewport(
-                ctx,
-                placement,
-                &title,
-                Vec2::new(440.0, 190.0),
-                Vec2::new(340.0, 150.0),
-                |ui, result| {
-                    *ui.style_mut() = stock.clone();
-                    let bg = ui.style().visuals.window_fill;
-                    ui.painter().rect_filled(ui.max_rect(), 0.0, bg);
-                    egui::Frame::NONE
-                        .inner_margin(egui::Margin::same(12))
-                        .show(ui, |ui| {
-                            ui.label(body.as_str());
-                            ui.add_space((ui.available_height() - 30.0).max(0.0));
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui.button("OK").clicked() {
-                                    result.close = true;
-                                }
-                            });
-                        });
-                },
-            )
-        }
-
-        Dialog::MidiError { message } => {
-            let stock = stock_style(ctx);
-            let text =
-                format!("Error opening MIDI port:\n{message}\n\nYou can still use keytoggle mode.");
-            show_dialog_viewport(
-                ctx,
-                placement,
-                "MIDI Error",
-                Vec2::new(420.0, 170.0),
-                Vec2::new(320.0, 140.0),
-                |ui, result| {
-                    *ui.style_mut() = stock.clone();
-                    let bg = ui.style().visuals.window_fill;
-                    ui.painter().rect_filled(ui.max_rect(), 0.0, bg);
-                    egui::Frame::NONE
-                        .inner_margin(egui::Margin::same(12))
-                        .show(ui, |ui| {
-                            ui.label(text.as_str());
-                            ui.add_space((ui.available_height() - 30.0).max(0.0));
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui.button("OK").clicked() {
                                     result.close = true;
                                 }
                             });
@@ -12454,9 +12345,14 @@ at: None,
             Some(egui::WindowLevel::AlwaysOnTop),
             "the render did not float"
         );
-        // A question opens. `NoMidiInput` is a question — `Dialog::is_modal`
+        // A question opens. `SaveChanges` is a question — `Dialog::is_modal`
         // says so — and the app drops every main-window event while it is up.
-        let mut asking = Some(Dialog::NoMidiInput);
+        // (It used to be `NoMidiInput`, which was never a question at all: it
+        // had one OK button, and it is a notification now.)
+        let mut asking = Some(Dialog::SaveChanges {
+            what: "quitting".to_owned(),
+            name: "Song".to_owned(),
+        });
         assert!(
             asking.as_ref().is_some_and(Dialog::is_modal),
             "this test is no longer about a question"
@@ -12732,18 +12628,11 @@ at: None,
             ("About", Dialog::About),
             ("Cheated", Dialog::Cheated),
             ("CheatFun", Dialog::CheatFun),
-            ("NoMidiInput", Dialog::NoMidiInput),
             (
-                "Notice",
-                Dialog::Notice {
-                    title: "Tangent".to_owned(),
-                    body: String::new(),
-                },
-            ),
-            (
-                "MidiError",
-                Dialog::MidiError {
-                    message: String::new(),
+                "SaveChanges",
+                Dialog::SaveChanges {
+                    what: "quitting".to_owned(),
+                    name: "Song".to_owned(),
                 },
             ),
             (
@@ -12754,6 +12643,52 @@ at: None,
         for (name, d) in &questions {
             assert!(d.is_modal(), "{name} is a question and must wait for its answer");
         }
+    }
+
+    /// **Every dialog that asked nothing is gone, and exactly one report is
+    /// not.**
+    ///
+    /// The owner's ruling was to remove every system dialog except the ones
+    /// that genuinely ask something — a folder chooser, a destructive
+    /// confirmation, an unsaved-changes prompt. Four variants were the whole
+    /// of the list that did not: `TakeSummary`, `Notice`, `MidiError` and
+    /// `NoMidiInput`, each a child viewport with one OK button in it that
+    /// froze the desk until it was found and clicked. What they said now goes
+    /// through `App::notify` and `App::notify_raise`.
+    ///
+    /// **Read out of the source, which is the only way to assert an absence.**
+    /// A test cannot name a variant that does not exist without failing to
+    /// compile, so it cannot say "this is gone" by mentioning it — the string
+    /// is what is left. The `Dialog::` prefix is joined on deliberately:
+    /// "Notice" alone appears in half a dozen unrelated comments, and a test
+    /// that fails on prose is a test people delete. Joined at RUN time rather
+    /// than written out, because this file includes ITSELF — a needle spelled
+    /// in full here would find its own literal and fail where nothing is
+    /// wrong.
+    ///
+    /// `LearnResult` is the deliberate exception and is asserted PRESENT, so
+    /// that "we kept one" stays a decision somebody made rather than something
+    /// that was missed. Its own doc carries the reasoning.
+    #[test]
+    fn every_ok_only_dialog_is_gone_except_the_one_report() {
+        const SRC: &str = include_str!("dialogs.rs");
+        let named = |v: &str| SRC.contains(&format!("Dialog::{v}"));
+        for retired in ["TakeSummary", "Notice", "MidiError", "NoMidiInput"] {
+            assert!(
+                !named(retired),
+                "Dialog::{retired} is back; a message with one OK button is a notification"
+            );
+        }
+        // And the scan is a real one: run against variants that ARE here it
+        // has to find them, or this test would pass on a typo.
+        assert!(named("LearnResult") && named("Confirm") && named("SaveChanges"));
+        // The report that stayed still works, and is still modal: it is a
+        // thing to read, and reading it is what the box is for.
+        let report = Dialog::LearnResult {
+            title: "Chord Learning",
+            message: "Learned. This voicing now reads Cmaj7.".to_owned(),
+        };
+        assert!(report.is_modal());
     }
 
     /// **The classification is the only switch.** A plugin dialog goes
