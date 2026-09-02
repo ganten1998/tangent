@@ -464,6 +464,54 @@ mod tests {
         assert!(bad.is_empty(), "note names unreadable:\n  {}", bad.join("\n  "));
     }
 
+    /// **The keyboard must not collapse into its own ground in dark mode.**
+    ///
+    /// Dark mode SWAPS the keys (`idle_colors`): the naturals take the
+    /// sharps' colour, which is why on every theme they equal the theory
+    /// ground (`themed_bg`, the sharps' near-black), so the SHARPS — the
+    /// inverted naturals — are what carry the keyboard. On the sixteen light
+    /// themes the sharps invert to a bright ivory and stand 9–15:1 clear of
+    /// the ground. The three dark-designed themes shipped naming only
+    /// `dark.background`, so their already-dark `white_key` became a
+    /// near-black sharp and BOTH idle key colours fell onto the ground at
+    /// ~1.1:1: the whole piano band read as one flat mask, only in dark mode.
+    /// The note-name sweep above never caught it, because dark-on-dark keys
+    /// still take a legible ink — it took a screenshot. This is the test that
+    /// screenshot is worth.
+    ///
+    /// The floor is the codebase's 2:1-ish "this large object is visible on
+    /// its ground" reading rather than the 3:1 large-object bar, because on a
+    /// 0x05–0x0d ground a key light enough for 3:1 crosses into the dead zone
+    /// where its own note name stops clearing 4.5:1 (the sweep above). At
+    /// least one idle key must clear the ground, and the two key colours must
+    /// differ enough to tell one key from the next.
+    #[test]
+    fn every_theme_keeps_a_legible_keyboard_in_dark_mode() {
+        use crate::recorder_panel::contrast_ratio;
+        let mut bad: Vec<String> = Vec::new();
+        for theme in crate::theme::factory() {
+            let mut s = Settings::default();
+            theme.apply(&mut s);
+            s.dark_mode = true;
+            let (naturals, sharps) = idle_colors(&s);
+            let ground = themed_bg(&s);
+            let shows =
+                contrast_ratio(naturals, ground).max(contrast_ratio(sharps, ground));
+            let distinct = contrast_ratio(naturals, sharps);
+            if shows < 2.0 || distinct < 1.25 {
+                bad.push(format!(
+                    "{}: keyboard {shows:.2}:1 on its ground, keys {distinct:.2}:1 apart",
+                    theme.name
+                ));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "the keyboard collapses into its ground in dark mode:\n  {}",
+            bad.join("\n  ")
+        );
+    }
+
     #[test]
     fn there_are_52_white_and_36_black_keys() {
         let whites = (NOTE_START..=NOTE_END).filter(|&n| is_white(n)).count();
