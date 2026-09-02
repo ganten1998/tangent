@@ -2174,6 +2174,27 @@ struct Shared {
     /// `// TODO: Notify the user of this.` and dropped it. Between those two
     /// answers is this counter.
     xruns: AtomicU64,
+
+    // ── the insert tap ──────────────────────────────────────────────────────
+    /// **Where the ONE insert tap is aimed**, packed by [`pack_tap`]: the
+    /// rack seat and bay whose audio the open plugin face wants — the EQ's
+    /// analyzer, the imager's vectorscope. Zero is disarmed, and disarmed is
+    /// the whole cost: `run_rack` loads this once per call and gets on with
+    /// its block.
+    ///
+    /// One word and not two atomics, for the reason `pack_route` gives: the
+    /// audio thread must never read a seat from one aim and a bay from
+    /// another.
+    insert_tap_route: AtomicU64,
+    /// The tap ring's write end and its interleave scratch, installed once
+    /// at engine build — see [`InsertTapLane`]. **In `Shared`, unlike the
+    /// scope's producer**, because the push happens inside `run_rack`, which
+    /// nine callers reach with disjoint field borrows; threading one more
+    /// `&mut` through all of them buys nothing but merge conflicts. A mutex
+    /// the audio thread only ever `try_lock`s, on the `pending_voices`
+    /// precedent — and this one is uncontended by construction: after the
+    /// build, no other thread takes it.
+    insert_tap: Mutex<Option<InsertTapLane>>,
 }
 
 impl Shared {
@@ -2303,6 +2324,8 @@ impl Shared {
             callbacks: AtomicU64::new(0),
             xruns: AtomicU64::new(0),
             swaps: AtomicU64::new(0),
+            insert_tap_route: AtomicU64::new(0),
+            insert_tap: Mutex::new(None),
         }
     }
 
@@ -3067,8 +3090,21 @@ fn run_rack(
     shared: &Shared,
     seat: usize,
 ) {
+    // **The insert tap, aimed or not.** One relaxed load per rack call is
+    // the entire disarmed cost; the seat comparison folds the armed-elsewhere
+    // case into the same early-out. See `Shared::insert_tap_route`.
+    let tap_bay = match unpack_tap(shared.insert_tap_route.load(Ordering::Relaxed)) {
+        Some((s, b)) if s == seat => Some(b),
+        _ => None,
+    };
     for (bay, slot) in rack.slots.iter_mut().enumerate() {
         let Some(p) = slot.0.as_mut() else {
+            // **An armed EMPTY bay taps what the bay WOULD see** — the
+            // pre-bay signal — which is what an analyzer should be showing
+            // while somebody is still choosing what to load here.
+            if tap_bay == Some(bay) {
+                push_insert_tap(shared, planar, frames);
+            }
             continue;
         };
         let bay_params = params.get(bay).copied().unwrap_or(&[]);
@@ -3097,7 +3133,11 @@ fn run_rack(
             // A refused block leaves the audio ALONE rather than replacing it
             // with whatever was in the output buffers: a faulted insert is a
             // channel that stops being processed, not one that starts making
-            // noise.
+            // noise. The tap follows the same rule — it shows what flows on,
+            // rather than freezing on the last block the bay managed.
+            if tap_bay == Some(bay) {
+                push_insert_tap(shared, planar, frames);
+            }
             continue;
         }
         // **After the block, and only for an effect.** Before it the port
@@ -3135,6 +3175,14 @@ fn run_rack(
                 continue;
             };
             dst[..frames].copy_from_slice(&src[..frames]);
+        }
+        // **The armed bay's POST audio, read after the copy-back** — `planar`
+        // is the one buffer that holds what actually leaves this bay,
+        // whatever width games the backend played above. A voice's bay taps
+        // its rendered output by the same line, which is exactly what an
+        // analyzer on an instrument should show.
+        if tap_bay == Some(bay) {
+            push_insert_tap(shared, planar, frames);
         }
     }
 }
@@ -7994,6 +8042,66 @@ fn unpack_route(w: u32) -> Option<(usize, usize, bool, bool)> {
     ))
 }
 
+// ── the insert tap's machinery ──────────────────────────────────────────────
+
+/// The insert tap's audio-thread half: the ring's write end, and the scratch
+/// the armed bay's planar pair is interleaved into before the push.
+///
+/// Owned by `Shared` behind a mutex rather than by the `Renderer` like the
+/// scope's — see the field's own note for why. The scratch lives here so the
+/// push allocates nothing: it is bought once, one block long, at engine
+/// build.
+#[derive(Debug)]
+struct InsertTapLane {
+    tx: Producer<f32>,
+    scratch: Vec<f32>,
+}
+
+/// Pack the tap's aim into one word the audio thread can read atomically —
+/// the `pack_route` idiom. The seat gets 32 bits because the seat space runs
+/// past two thousand (a rack per pad of every channel); the bay gets 8, and
+/// bit 63 marks the word armed so "seat 0, bay 0" is expressible.
+fn pack_tap(seat: usize, bay: usize) -> u64 {
+    (seat as u64 & 0xffff_ffff) | ((bay as u64 & 0xff) << 32) | (1 << 63)
+}
+
+/// The inverse of [`pack_tap`]. `None` for a disarmed tap.
+fn unpack_tap(w: u64) -> Option<(usize, usize)> {
+    if w & (1 << 63) == 0 {
+        return None;
+    }
+    Some(((w & 0xffff_ffff) as usize, ((w >> 32) & 0xff) as usize))
+}
+
+/// Interleave the first two planar channels and push them into the tap's
+/// ring. A mono rack doubles its one channel, exactly as the scope tap does.
+///
+/// Reached only when `run_rack` has already matched the armed seat and bay,
+/// so nothing here is on the disarmed path. The `try_lock` is the
+/// `pending_voices` bargain — a block that cannot take it is dropped, never
+/// waited for — and a FULL ring drops in whole frames, never blocks and
+/// never splits a pair: the tap is a picture, and a half-pushed frame would
+/// swap left and right for the rest of the session.
+fn push_insert_tap(shared: &Shared, planar: &[Vec<f32>], frames: usize) {
+    let Ok(mut guard) = shared.insert_tap.try_lock() else {
+        return;
+    };
+    let Some(lane) = guard.as_mut() else {
+        return;
+    };
+    let n = frames.min(lane.scratch.len() / TAP_CHANNELS);
+    for f in 0..n {
+        let l = planar.first().and_then(|b| b.get(f)).copied().unwrap_or(0.0);
+        let r = planar.get(1).and_then(|b| b.get(f)).copied().unwrap_or(l);
+        lane.scratch[f * TAP_CHANNELS] = l;
+        lane.scratch[f * TAP_CHANNELS + 1] = r;
+    }
+    // Whole frames only — the stem tap's own clamp, for the same reason.
+    let room = (lane.tx.slots() / TAP_CHANNELS) * TAP_CHANNELS;
+    let take = (n * TAP_CHANNELS).min(room);
+    let _ = lane.tx.push_entire_slice(&lane.scratch[..take]);
+}
+
 /// The monitor engine: one output stream, [`SLOTS`] optional instruments layered
 /// on top of each other, one metronome.
 ///
@@ -8089,6 +8197,10 @@ pub struct Engine {
     cap_rx: Vec<Consumer<f32>>,
     stem_rx: Consumer<f32>,
     scope_rx: Consumer<f32>,
+    /// The INSERT tap ring's read end; the write end lives in `Shared` —
+    /// see [`InsertTapLane`]. Drained by the host only while a face has the
+    /// tap armed.
+    insert_tap_rx: Consumer<f32>,
     /// The ReaStream send ring's read end, handed to the sender thread once per
     /// engine when streaming is switched on. `None` after it has been taken.
     reastream_rx: Option<Consumer<f32>>,
@@ -8540,6 +8652,18 @@ impl Engine {
         let (stem_tx, stem_rx) = RingBuffer::<f32>::new(rate as usize * CHANNELS * 2 * 4);
         // The scope's third of a second of stereo.
         let (scope_tx, scope_rx) = RingBuffer::<f32>::new(1 << 15);
+        // The INSERT tap: the scope's own third of a second, which is >= 2x
+        // the largest block per the capture-ring law. The producer goes into
+        // `Shared` — the push happens inside `run_rack` — and the consumer
+        // stays here for `drain_insert_tap`. Installed before the renderer is
+        // built, so the callback can never see the mutex mid-write.
+        let (insert_tap_tx, insert_tap_rx) = RingBuffer::<f32>::new(1 << 15);
+        if let Ok(mut lane) = shared.insert_tap.lock() {
+            *lane = Some(InsertTapLane {
+                tx: insert_tap_tx,
+                scratch: vec![0.0; MAX_BLOCK as usize * TAP_CHANNELS],
+            });
+        }
         // The ReaStream send ring, the same generous third of a second so the
         // sender thread's scheduling jitter never starves or overruns it.
         let (reastream_tx, reastream_rx) = RingBuffer::<f32>::new(1 << 15);
@@ -8754,6 +8878,7 @@ impl Engine {
             cap_rx,
             stem_rx,
             scope_rx,
+            insert_tap_rx,
             reastream_rx: Some(reastream_rx),
             inserts_loaded: (0..RACK_SEATS).map(|_| std::array::from_fn(|_| None)).collect(),
             tap: Some(RecorderTap {
@@ -10720,6 +10845,32 @@ impl Engine {
     /// interleaved stereo, the speakers' mix without the click.
     pub fn drain_scope(&mut self, out: &mut Vec<f32>) {
         while let Ok(v) = self.scope_rx.pop() {
+            out.push(v);
+        }
+    }
+
+    /// Aim the ONE insert tap at a rack seat's bay — `Some((seat, bay))` in
+    /// the engine's own terms, the ones `load_insert` speaks — or disarm it
+    /// with `None`. Only one plugin face is ever open, so one tap is the
+    /// whole need; the last aim wins.
+    ///
+    /// A wild seat or bay is stored and simply never matches anything, which
+    /// is the no-op the house rule asks for. Whatever the OLD aim left in
+    /// the ring is drained away here, so the first frames served at the new
+    /// bay are the new bay's — one in-flight block from the audio thread can
+    /// still land after this, which one UI frame of drain absorbs unseen.
+    pub fn set_insert_tap(&mut self, at: Option<(usize, usize)>) {
+        let word = at.map_or(0, |(seat, bay)| pack_tap(seat, bay));
+        self.shared.insert_tap_route.store(word, Ordering::Relaxed);
+        while self.insert_tap_rx.pop().is_ok() {}
+    }
+
+    /// Everything the insert tap delivered since the last frame —
+    /// interleaved stereo, POST the armed bay, or the bay's own input when
+    /// the armed bay is empty. Drained by the host only while a face has
+    /// the tap armed; disarmed, it always answers nothing.
+    pub fn drain_insert_tap(&mut self, out: &mut Vec<f32>) {
+        while let Ok(v) = self.insert_tap_rx.pop() {
             out.push(v);
         }
     }
@@ -14731,6 +14882,185 @@ mod tests {
             e.builtin_insert(seat, 0).unwrap().1,
             values.as_slice(),
             "the reload lost the moved knobs"
+        );
+    }
+
+    /// The drum fixture with the INSERT tap in play. `arm` aims the tap in
+    /// ENGINE terms; `trim_bay` seats a trim in that bay of the MASTER's
+    /// rack at `trim_gain` of its travel (0.5 is unity, 1.0 is +24 dB),
+    /// settled there from state so nothing glides. Returns what the tap
+    /// delivered and what the mix played over the same four blocks of one
+    /// drum hit — the warm-up's tapped silence is drained away first, so
+    /// the returned stream is the hit's alone.
+    fn tap_fixture(
+        arm: Option<(usize, usize)>,
+        trim_bay: Option<usize>,
+        trim_gain: f32,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        e.set_pad_kit(5, test_kit(&[0], 4_800, 0.5));
+        e.set_channel_gain(5, 0.05);
+        e.set_drum_strips(1 << 5);
+        if let Some(bay) = trim_bay {
+            let spec = crate::builtin_fx::spec_for(crate::builtin_fx::TRIM_PATH).unwrap();
+            let state = crate::builtin_fx::state_text(spec, &[trim_gain]).into_bytes();
+            e.load_insert(
+                tangent_ui::recorder::MASTER_SEAT,
+                bay,
+                Some(Path::new(crate::builtin_fx::TRIM_PATH)),
+                Some(&state),
+            )
+            .expect("the built-in loads")
+            .expect("the bay reports a tenant");
+        }
+        e.set_insert_tap(arm);
+        e.set_rolling(false);
+        let mut out = vec![0.0f32; 1024 * 2];
+        for _ in 0..4 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+        }
+        // The warm-up blocks tapped silence; the claims are about the hit.
+        let mut discard = Vec::new();
+        e.drain_insert_tap(&mut discard);
+        e.set_midi_clips(vec![PlacedMidi {
+            strip: 5,
+            start: 0,
+            len: 48_000,
+            notes: Arc::new(vec![ClipNote { at: 0, dur: 2_400, key: PAD_BASE, vel: 100 }]),
+        }]);
+        e.set_transport(1, 0);
+        e.set_rolling(true);
+        let mut mix = Vec::new();
+        for _ in 0..4 {
+            out.fill(0.0);
+            e.render_offline(&mut out);
+            mix.extend_from_slice(&out);
+        }
+        let mut tap = Vec::new();
+        e.drain_insert_tap(&mut tap);
+        (tap, mix)
+    }
+
+    /// **The tap hears the bay it is armed on, AFTER that bay's effect.**
+    ///
+    /// Measured as a ratio between two runs whose only difference is which
+    /// side of the trim the armed bay sits on: with the +24 dB trim IN the
+    /// armed bay the tap must carry the lift, and with the trim one bay
+    /// downstream it must not — so a tap that read pre-bay in both runs, or
+    /// post-rack in both, measures 1.0 and fails.
+    #[test]
+    fn the_insert_tap_hears_the_armed_bay_after_its_effect() {
+        let seat = tangent_ui::recorder::MASTER_SEAT;
+        let (post, _) = tap_fixture(Some((seat, 0)), Some(0), 1.0);
+        let (pre, _) = tap_fixture(Some((seat, 0)), Some(1), 1.0);
+        let peak = |v: &[f32]| v.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        let (post_pk, pre_pk) = (peak(&post), peak(&pre));
+        assert!(pre_pk > 0.001, "the fixture tapped no sound at all: {pre_pk}");
+        assert!(post.len() % TAP_CHANNELS == 0, "a torn frame: {}", post.len());
+        assert!(post.iter().all(|s| s.is_finite()));
+        let want = 10f32.powf(24.0 / 20.0);
+        assert!(
+            (post_pk / pre_pk - want).abs() < want * 0.01,
+            "the armed bay's tap measured {:.3}x its input, not the trim's {want:.3}x",
+            post_pk / pre_pk
+        );
+    }
+
+    /// **An armed EMPTY bay taps what the bay would see** — bit-for-bit what
+    /// a tenant at exact unity would have passed through it, which is the
+    /// picture an analyzer should show while somebody is still choosing an
+    /// EQ. The downstream +24 dB trim in the second run proves the empty-bay
+    /// read really is PRE-bay: none of that lift may reach the tap.
+    #[test]
+    fn an_insert_tap_on_an_empty_bay_hears_what_the_bay_would_see() {
+        let seat = tangent_ui::recorder::MASTER_SEAT;
+        // Unity tenant in the armed bay: the tap is the bay's input, exactly.
+        let (through, _) = tap_fixture(Some((seat, 0)), Some(0), 0.5);
+        // Armed bay EMPTY, loud trim in the NEXT bay: the same input.
+        let (empty, _) = tap_fixture(Some((seat, 0)), Some(1), 1.0);
+        assert!(
+            through.iter().any(|s| s.abs() > 0.001),
+            "the fixture tapped no sound at all"
+        );
+        assert_eq!(through.len(), empty.len(), "the two runs tapped different spans");
+        for (i, (a, b)) in through.iter().zip(&empty).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "sample {i}: {a} through a unity tenant, {b} past the empty bay"
+            );
+        }
+    }
+
+    /// **Disarmed, the tap is nothing at all**: the drain answers empty, and
+    /// the mix is bit-for-bit the mix — an observer that can be heard is a
+    /// bug in an audio path, and "bit-for-bit" is the only claim about cost
+    /// an offline render can actually measure.
+    #[test]
+    fn a_disarmed_insert_tap_drains_empty_and_the_mix_never_knows_the_difference() {
+        let seat = tangent_ui::recorder::MASTER_SEAT;
+        let (tap_armed, mix_armed) = tap_fixture(Some((seat, 0)), Some(0), 1.0);
+        let (tap_off, mix_off) = tap_fixture(None, Some(0), 1.0);
+        assert!(!tap_armed.is_empty(), "the armed control tapped nothing");
+        assert!(tap_off.is_empty(), "a disarmed tap delivered {} samples", tap_off.len());
+        assert_eq!(mix_armed.len(), mix_off.len());
+        for (i, (a, b)) in mix_armed.iter().zip(&mix_off).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "sample {i}: the mix played {a} armed and {b} disarmed"
+            );
+        }
+    }
+
+    /// **A full tap ring drops whole frames and recovers.** Nobody draining
+    /// for a huge render must cost exactly the audio that did not fit — never
+    /// a block, never half a stereo pair (which would swap left and right
+    /// for the rest of the session), and never the ring itself: the next
+    /// drained frame after a catch-up is live audio again.
+    #[test]
+    fn a_full_insert_tap_ring_drops_whole_frames_and_recovers() {
+        let seat = tangent_ui::recorder::MASTER_SEAT;
+        let mut e = Engine::offline(48_000, Timebase::new()).expect("offline");
+        e.set_pad_kit(5, test_kit(&[0], 4_800, 0.5));
+        e.set_channel_gain(5, 0.05);
+        e.set_drum_strips(1 << 5);
+        e.load_insert(
+            tangent_ui::recorder::MASTER_SEAT,
+            0,
+            Some(Path::new(crate::builtin_fx::TRIM_PATH)),
+            None,
+        )
+        .expect("load")
+        .expect("loaded");
+        e.set_insert_tap(Some((seat, 0)));
+        // One huge render, no draining: 40k frames is two and a half times
+        // the ring. `render_offline` chunks it exactly as a device callback
+        // would, so every block after the ring fills is a dropped block.
+        let mut out = vec![0.0f32; 40_000 * 2];
+        e.render_offline(&mut out);
+        let mut tap = Vec::new();
+        e.drain_insert_tap(&mut tap);
+        assert!(tap.len() <= 1 << 15, "the ring overfilled: {}", tap.len());
+        assert!(
+            tap.len() >= (1 << 15) - MAX_BLOCK as usize * TAP_CHANNELS,
+            "the ring stopped early: {}",
+            tap.len()
+        );
+        assert_eq!(tap.len() % TAP_CHANNELS, 0, "a torn frame survived the overflow");
+        assert!(tap.iter().all(|s| s.is_finite() && s.abs() <= 2.0));
+        // And the ring is a ring, not a casualty: drained, it fills again.
+        out.truncate(1024 * 2);
+        out.fill(0.0);
+        e.render_offline(&mut out);
+        tap.clear();
+        e.drain_insert_tap(&mut tap);
+        assert_eq!(
+            tap.len(),
+            1024 * TAP_CHANNELS,
+            "after the catch-up the tap did not resume: {}",
+            tap.len()
         );
     }
 
