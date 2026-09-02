@@ -545,6 +545,16 @@ pub struct DesktopApp {
     /// arithmetic and the reason for it live.
     #[cfg(feature = "recorder")]
     insert_batch: Counted,
+    /// The insert bay the last frame put on the cover, and this frame loads.
+    ///
+    /// The chunked walk's half of the two-phase sequence [`Chore`] keeps for
+    /// the blocking jobs: a bay is NAMED on the frame that paints and
+    /// CONSTRUCTED on the frame after, so the plugin the frozen frame names is
+    /// the plugin whose constructor is running. Re-checked before it is acted
+    /// on — a frame is long enough for the desk to change its mind about a
+    /// bay.
+    #[cfg(feature = "recorder")]
+    insert_announced: Option<usize>,
     /// The MIDI port to open once the window is up: `Some(Some(name))` from
     /// `-p`, `Some(None)` for the priority chain, `None` once it has run.
     /// See where it is taken for why it is not done in the constructor.
@@ -2971,48 +2981,21 @@ impl DesktopApp {
         #[cfg(feature = "recorder")]
         self.publish_device_outs();
         // Scanning reads directories, so it belongs out here with the other
-        // things the UI is not allowed to do — and it runs AFTER the folder
-        // picker above, so a folder added this frame is in the list this frame
-        // rather than one frame later.
+        // things the UI is not allowed to do — and it is asked for AFTER the
+        // folder picker above, so a folder added this frame is in the list
+        // this frame rather than one frame later.
+        //
+        // **And it is a BLOCK, so it is announced and run on the frame
+        // after.** A rescan walks every VST3 root on the machine — the two
+        // system directories, the user's own, and whatever folders have been
+        // added — opening each bundle far enough to read its factory. On a
+        // spinning disk, a network volume, or a library of three hundred
+        // plugins that is seconds of a window that has stopped answering,
+        // started by a menu row that then appears to have done nothing. The
+        // extra frame costs the scan nothing: the folder list is the same one
+        // next frame.
         if self.app.take_plugin_rescan() {
-            let extra = self.app.plugin_folders();
-            let report = tangent_host::scan::discover_reported(&extra);
-            // One line per root on stderr — visible from a console launch —
-            // and one honest sentence in the band. A rescan that found 0
-            // was pixel-identical to one that never ran, and the Windows
-            // tester could not tell which they had.
-            for (root, fate) in &report.roots {
-                match fate {
-                    Ok(n) => eprintln!("vst3 scan: {} -> {n}", root.display()),
-                    Err(e) => eprintln!("vst3 scan: {} -> {e}", root.display()),
-                }
-            }
-            let mut note = format!("scan: {} VST3 found", report.found.len());
-            if let Some(stale) = report.retired_seen.first() {
-                // The retired plugin is CLEANUP, not a plugin — say where it
-                // is and that the installers remove it now, so the user is
-                // never left wondering why another DAW still lists it.
-                note = format!(
-                    "{note}. A retired Tangent plugin is still at {} - Tangent \
-                     no longer ships or loads it; reinstalling Tangent (or \
-                     deleting the bundle) removes it.",
-                    stale.display()
-                );
-            }
-            if report.found.is_empty() && report.vst2_seen > 0 {
-                // **No false trail to a VST3 that does not exist.** This used to
-                // send people to "ReaPlugs' VST3 build in Common Files\VST3" —
-                // there is no such build. ReaPlugs (ReaStream included) ships
-                // VST2 only, and Tangent hosts VST3. Say the true thing.
-                note = format!(
-                    "scan: 0 VST3 found. {} .dll files seen are VST2, which \
-                     Tangent does not host (it loads VST3 only).",
-                    report.vst2_seen
-                );
-            }
-            self.app.notify(Kind::Info, note);
-            self.app
-                .set_plugin_list(crate::plugin_catalog_from(report.found));
+            self.announce(ctx, "Scanning plugins", None, Chore::RescanPlugins);
         }
         // **The user's effect, across the effects bus.**
         //
@@ -3157,58 +3140,29 @@ impl DesktopApp {
             }
         }
         let inserts = tangent_ui::recorder::INSERTS;
-        // One walk, two answers — the next bay and the size of the wait.
-        // See `insert_walk`, which is where the reasoning lives.
-        let (next, outstanding) = insert_walk(
-            self.recorder.inserts_loaded.len(),
-            |i| {
-                self.app.insert(i / inserts, i % inserts)
-                    != self.recorder.inserts_loaded[i].as_deref()
-            },
-            |i| self.app.insert(i / inserts, i % inserts).is_some(),
-        );
-        // **Nothing can load without an engine**, so a desk waiting for a
-        // device is not waiting for plugins — the same exclusion
-        // `inserts_pending` makes for the splash, and for the same reason. A
-        // cover that said "Loading plugins" over a closed band would be
-        // naming work that is not happening.
-        let outstanding = if self.recorder.engine.is_some() {
-            outstanding
-        } else {
-            0
+        let mismatched = |app: &TangentApp, loaded: &[Option<String>], i: usize| {
+            app.insert(i / inserts, i % inserts) != loaded[i].as_deref()
         };
-        if outstanding == 0 {
-            // **The last bay lands as "8 of 8", not as "7 of 8".** The
-            // reading is taken from what is still outstanding, so the frame
-            // the work finishes on is the only one that can say it finished
-            // — and a meter whose final state is one short of full is a meter
-            // that looks like it gave up.
-            if !self.insert_batch.idle() && self.busied == Busied::Inserts {
-                let progress = self.insert_batch.saw(0).progress();
-                if let Some(busy) = self.busy.as_mut() {
-                    busy.detail = None;
-                    busy.progress = Some(progress);
-                }
-            }
-            self.insert_batch = Counted::default();
-            self.busy_chunk_done(Busied::Inserts);
-        } else {
-            self.insert_batch = self.insert_batch.saw(outstanding);
-            let progress = self.insert_batch.progress();
-            let name = next
-                .and_then(|i| self.app.insert(i / inserts, i % inserts))
-                .map(leaf_of);
-            if let Some(busy) = self.busy_chunk(Busied::Inserts, "Loading plugins") {
-                busy.detail = name;
-                busy.progress = Some(progress);
-            }
-            // A bay a frame only advances if frames arrive, and between the
-            // splash lifting and the user moving the mouse nothing else is
-            // asking for one. Asked only while real plugins are outstanding,
-            // so the long empty flush above does not spin the window.
-            ctx.request_repaint();
-        }
-        if let Some(i) = next {
+        // **The bay this frame loads is the bay the LAST frame announced.**
+        //
+        // `busy.rs`'s law, which `announce`/`run_chore` keep for the blocking
+        // jobs and this walk did not: an overlay is painted at the bottom of
+        // a frame and the block happens inside the next one, so a driver that
+        // picks a bay, writes its name on the cover and constructs the plugin
+        // all in one pass has written the name to nobody. What was on screen
+        // for the whole of the wait was the frame BEFORE — the one that named
+        // the previous bay, or, on the first bay of a batch, no cover at all.
+        // So the choice and the work are a frame apart now, and the name
+        // under the hatch is the plugin whose constructor is actually
+        // running.
+        //
+        // Re-checked rather than trusted: a frame went by, and the desk may
+        // have changed its mind about that bay in it.
+        let due = self
+            .insert_announced
+            .take()
+            .filter(|&i| mismatched(&self.app, &self.recorder.inserts_loaded, i));
+        if let Some(i) = due {
             let want = self.app.insert(i / inserts, i % inserts).map(str::to_owned);
             self.recorder.inserts_loaded[i] = want.clone();
             // **THE DEFAULT PEDALBOARD.** The amp landing in a CHANNEL bay
@@ -3306,6 +3260,83 @@ impl DesktopApp {
                 }
             }
         }
+
+        // One walk, two answers — the bay to announce and the size of the
+        // wait. See `insert_walk`, which is where the reasoning lives. Taken
+        // AFTER the load above, so what it counts is what is left.
+        let (next, outstanding) = insert_walk(self.recorder.inserts_loaded.len(), |i| {
+            mismatched(&self.app, &self.recorder.inserts_loaded, i)
+        });
+        // **Nothing can load without an engine**, so a desk waiting for a
+        // device is not waiting for plugins — the same exclusion
+        // `inserts_pending` makes for the splash, and for the same reason. A
+        // cover that said "Loading plugins" over a closed band would be
+        // naming work that is not happening.
+        let outstanding = if self.recorder.engine.is_some() {
+            outstanding
+        } else {
+            0
+        };
+        if outstanding == 0 {
+            // **The last bay lands as "8 of 8", not as "7 of 8".** The
+            // reading is taken from what is still outstanding, so the frame
+            // the work finishes on is the only one that can say it finished
+            // — and a meter whose final state is one short of full is a meter
+            // that looks like it gave up.
+            if !self.insert_batch.idle() && self.busied == Busied::Inserts {
+                let progress = self.insert_batch.saw(0).progress();
+                if let Some(busy) = self.busy.as_mut() {
+                    busy.detail = None;
+                    busy.progress = Some(progress);
+                }
+            }
+            self.insert_batch = Counted::default();
+            self.busy_chunk_done(Busied::Inserts);
+        } else {
+            self.insert_batch = self.insert_batch.saw(outstanding);
+            let progress = self.insert_batch.progress();
+            let name = next
+                .and_then(|i| self.app.insert(i / inserts, i % inserts))
+                .map(leaf_of);
+            if let Some(busy) = self.busy_chunk(Busied::Inserts, "Loading plugins") {
+                busy.detail = name;
+                busy.progress = Some(progress);
+                // **A batch decides its own delay from its SIZE**, which is
+                // the rule `busy.rs` states in as many words: "eight tracks
+                // announce, one does not".
+                //
+                // `busy_chunk` builds a `deferred` overlay, and the delay is
+                // exactly right for the case it was written for — a plugin
+                // picked from a menu, one bay, usually over inside the delay,
+                // and a cover that flashed for it would be worse than none.
+                // It is wrong for the other case. A project opening has a
+                // dozen bays to fill at up to five seconds each, and holding
+                // the cover back for the first of them means the FIRST plugin
+                // — the one whose constructor is about to take the window away
+                // — is the one plugin of the batch nobody is told about.
+                //
+                // So the moment there is more than one bay outstanding the
+                // delay goes, the cover is due on this frame, and the bay
+                // announced above is constructed on the next one with the
+                // cover already painted. Asked while it is still unpainted, so
+                // it also catches the batch GROWING: an amp landing in a bay
+                // seeds seven pedals, and a load that started out looking like
+                // one bay is not one any more.
+                if outstanding > 1 && !busy.on_screen() {
+                    busy.delay = std::time::Duration::ZERO;
+                }
+            }
+            // A bay a frame only advances if frames arrive, and between the
+            // splash lifting and the user moving the mouse nothing else is
+            // asking for one. Asked only while there is work outstanding, so
+            // a settled desk does not spin the window.
+            ctx.request_repaint();
+        }
+        // The announcement itself: whatever the cover now says it is about to
+        // do is what the next frame does. Held whether or not the overlay was
+        // free to take the words — a bay that goes uncovered because the
+        // decode warm-up owns the cover this second still has to be loaded.
+        self.insert_announced = next;
 
         // **The document's clips, whenever an edit touched them.** The app
         // marks; this decodes, pushes the engine's schedule, and rebuilds
@@ -4587,6 +4618,35 @@ impl DesktopApp {
         self.app.native_panel_closed();
         self.restore_fullscreen(ctx);
         let Some(file) = file else { return };
+        // **Duplicate Project As is a whole-folder copy, and it is covered.**
+        //
+        // This is the row the menu calls "Duplicate Project As..." and every
+        // other app calls Save As. `save_project_as` copies the document AND
+        // `media/` — every take in the session, which is the one thing in this
+        // app that is measured in gigabytes — and it does it inside one call
+        // on this thread. A session with an afternoon of takes in it is tens
+        // of seconds of a window that has stopped answering, started from a
+        // save panel that has just closed, so there is not even a dialog left
+        // on screen to explain it.
+        //
+        // The other two purposes are not announced and do not need to be: a
+        // Template goes out as a `ProjectRequest` and is covered where every
+        // project request is (`take_project_request`), and a kit preset is one
+        // small file written with `serde`.
+        //
+        // **The meter is a HATCH, and that is the honest reading.** The copy
+        // is `TangentApp`'s, one call, with no way to report from inside it —
+        // and this crate must not walk the folder itself to invent a total it
+        // cannot then advance. See `busy::Progress::Indeterminate`: a block
+        // cannot report and must not pretend to.
+        if request.purpose == tangent_ui::ports::SavePurpose::ProjectCopy {
+            let name = file
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .filter(|n| !n.is_empty());
+            self.announce(ctx, "Duplicating project", name, Chore::SaveCopy(file));
+            return;
+        }
         self.app.finish_save_choice(request.purpose, &file);
     }
 
@@ -5508,21 +5568,55 @@ impl DesktopApp {
             }
             n += 1;
         };
+        // **Whose file is `export/{name}` — and is it written yet?**
+        //
+        // Two roads reach here and they mean different things by this copy.
+        // The Export Track and Export Stems menu rows ask for exactly this
+        // file and nothing else, so the copy below IS the export and the
+        // receipt belongs to it. The Export DIALOG asks for a file of its own,
+        // under a name, a folder and a format the user chose, and this copy is
+        // only the staging step it is made from.
+        //
+        // Told apart here rather than not at all, because it used to speak for
+        // both: the `Ok` arm lowered the standing "Exporting…" and pushed
+        // "exported  export/track.wav" — an internal staging path nobody asked
+        // for and cannot find from the dialog they filled in — and it did it
+        // BEFORE the delivery below had written a single byte of the file they
+        // did ask for. A receipt is a promise that the thing is on disk; this
+        // one was neither about the right file nor true yet.
+        //
+        // So the delivery is taken FIRST, and while there is one standing the
+        // staging copy says nothing: the message that ends this pass is the
+        // delivery's own, pushed after its files exist.
+        let mut delivery = self.recorder.pending_delivery.take();
         match std::fs::copy(&wav, export_dir.join(&name)) {
-            Ok(_) => {
+            Ok(_) if delivery.is_none() => {
                 self.app.notify_lower(EXPORT_RUNNING);
                 self.app
                     .notify(Kind::Success, format!("exported  export/{name}"));
             }
+            Ok(_) => {}
             Err(e) => {
-                self.app.notify_lower(EXPORT_RUNNING);
                 self.app.notify(Kind::Error, format!("export failed: {e}"));
+                match delivery.as_mut() {
+                    // The dialog's master is a COPY of the file that just
+                    // failed to appear, so there is no master to deliver.
+                    // Its stems are written straight from the take and are
+                    // still worth delivering, so only the master is dropped
+                    // — and the standing message stays up until the delivery
+                    // reports on what is left.
+                    Some(spec) => spec.master = false,
+                    None => {
+                        self.app.notify_lower(EXPORT_RUNNING);
+                        return;
+                    }
+                }
             }
         }
         // A realtime EXPORT-dialog pass: deliver into the chosen folder in
         // the chosen shapes. The engine's rate rules a realtime pass; the
         // spec's rate only steers the offline one.
-        if let Some(mut spec) = self.recorder.pending_delivery.take() {
+        if let Some(mut spec) = delivery {
             spec.rate = self
                 .recorder
                 .engine
@@ -5772,7 +5866,18 @@ impl DesktopApp {
             }
         }
         // ── every configured rack seat, saved state included ──
+        //
+        // **A batch reports ONCE.** This used to push a notification from
+        // inside the loop, one per seat that refused — and a plugin that will
+        // not load in an offline engine is usually a plugin that will not load
+        // anywhere, so the failure is rarely lonely. The column holds four
+        // messages: a handful of these evicted the "Exporting…" that was
+        // raised moments earlier, so the desk went quiet about the thing that
+        // was actually happening in order to say the same sentence four times.
+        // So the refusals are collected and said in one line, which is also
+        // the only shape that can name HOW MANY there were.
         let inserts = tangent_ui::recorder::INSERTS;
+        let mut refused: Vec<String> = Vec::new();
         for i in 0..(crate::instrument::RACK_SEATS * inserts) {
             let seat = i / inserts;
             let bay = i % inserts;
@@ -5788,9 +5893,20 @@ impl DesktopApp {
                 Some(std::path::Path::new(path)),
                 state.as_deref(),
             ) {
-                self.app
-                    .notify(Kind::Error, format!("export: a rack refused to load: {err}"));
+                refused.push(format!("{} ({err})", leaf_of(path)));
             }
+        }
+        if let Some(first) = refused.first() {
+            // The first one by name, because one name is worth more than four
+            // — and the count, because "and 3 more" is what says the mix is
+            // missing more than the one thing the reader can see.
+            let note = match refused.len() {
+                1 => format!("export: a rack refused to load: {first}"),
+                n => format!(
+                    "export: {n} racks refused to load, starting with {first}"
+                ),
+            };
+            self.app.notify(Kind::Error, note);
         }
         // ── the clips, decoded at the EXPORT rate with a cache of their
         // own, so the live engine's cache never learns a wrong-rate clip ──
@@ -6152,6 +6268,57 @@ impl DesktopApp {
         }
     }
 
+    /// Walk every VST3 root and rebuild the plugin list, with the
+    /// announcement already on the screen.
+    ///
+    /// Nothing here can report: `discover_reported` is one call that returns
+    /// when the whole walk is done, so the cover is a hatch and not a meter —
+    /// which is what [`tangent_ui::busy::Progress::Indeterminate`] is for.
+    /// What the overlay buys is that the frozen frame underneath the window
+    /// server's wheel says "Scanning plugins" instead of showing a desk that
+    /// has stopped.
+    #[cfg(feature = "recorder")]
+    fn rescan_plugins(&mut self) {
+        let extra = self.app.plugin_folders();
+        let report = tangent_host::scan::discover_reported(&extra);
+        // One line per root on stderr — visible from a console launch —
+        // and one honest sentence in the band. A rescan that found 0
+        // was pixel-identical to one that never ran, and the Windows
+        // tester could not tell which they had.
+        for (root, fate) in &report.roots {
+            match fate {
+                Ok(n) => eprintln!("vst3 scan: {} -> {n}", root.display()),
+                Err(e) => eprintln!("vst3 scan: {} -> {e}", root.display()),
+            }
+        }
+        let mut note = format!("scan: {} VST3 found", report.found.len());
+        if let Some(stale) = report.retired_seen.first() {
+            // The retired plugin is CLEANUP, not a plugin — say where it
+            // is and that the installers remove it now, so the user is
+            // never left wondering why another DAW still lists it.
+            note = format!(
+                "{note}. A retired Tangent plugin is still at {} - Tangent \
+                 no longer ships or loads it; reinstalling Tangent (or \
+                 deleting the bundle) removes it.",
+                stale.display()
+            );
+        }
+        if report.found.is_empty() && report.vst2_seen > 0 {
+            // **No false trail to a VST3 that does not exist.** This used to
+            // send people to "ReaPlugs' VST3 build in Common Files\VST3" —
+            // there is no such build. ReaPlugs (ReaStream included) ships
+            // VST2 only, and Tangent hosts VST3. Say the true thing.
+            note = format!(
+                "scan: 0 VST3 found. {} .dll files seen are VST2, which \
+                 Tangent does not host (it loads VST3 only).",
+                report.vst2_seen
+            );
+        }
+        self.app.notify(Kind::Info, note);
+        self.app
+            .set_plugin_list(crate::plugin_catalog_from(report.found));
+    }
+
     /// The template shelf: `<record_root>/Projects/Templates`.
     fn templates_dir(&self) -> std::path::PathBuf {
         self.app.project_root().join("Templates")
@@ -6166,6 +6333,21 @@ impl DesktopApp {
     /// rack into a fresh offline engine at five seconds an instrument. Even
     /// Save is a `getState` per loaded plugin. So the request is held for one
     /// frame — see `announce` and the law it obeys — and run from the chore.
+    ///
+    /// **Every one of them is a HATCH and not a meter, and that is the
+    /// honest reading rather than an omission.** The export setup in
+    /// particular looks countable — it is a loop over rack seats, and eight
+    /// instruments at five seconds each is a wait worth measuring — but it is
+    /// one blocking call from this frame's point of view, and a number
+    /// painted on the frame BEFORE it starts can only ever read the value it
+    /// had when nothing had happened yet. It would sit at "0 of 8" for forty
+    /// seconds and then vanish, which is a meter that has failed rather than
+    /// one that is honest about not knowing. `busy.rs` states the rule and
+    /// `Progress::Indeterminate` is what obeys it: "a block cannot report and
+    /// must not pretend to". A count here would need the setup itself broken
+    /// into a seat a frame, the way the insert loader and the decode warm-up
+    /// already are — which is a real change to the export, not a change to
+    /// what its cover says.
     fn take_project_request(&mut self, ctx: &egui::Context) {
         let Some(req) = self.app.take_project_request() else {
             return;
@@ -6506,9 +6688,6 @@ impl DesktopApp {
         }
     }
 
-    /// Make the insert reconcile revisit EVERY bay — load, reload with new
-    /// state, or unload, one per frame as it always works. The sentinel can
-    /// never equal a real path or an empty bay, so every slot mismatches.
     /// The reload sentinel on the bays of the rows a permutation MOVED.
     ///
     /// `order[new] = old`, so a row with `order[n] == n` is a row whose
@@ -6526,9 +6705,38 @@ impl DesktopApp {
         }
     }
 
+    /// Make the insert reconcile revisit every bay that HOLDS something, or
+    /// is about to — load, reload with new state, or unload, one per frame as
+    /// it always works. The sentinel can never equal a real path or an empty
+    /// bay, so every slot it lands on mismatches.
+    ///
+    /// **A bay that is empty on both sides is skipped, and that is the whole
+    /// of it.** This used to mark the entire seat space, all thirteen
+    /// thousand of it, of which a full session uses a couple of dozen. The
+    /// reconcile then spent one frame per bay finding out there was nothing
+    /// there — minutes of them, with the window pinned at the refresh rate by
+    /// the repaint the loader asks for while work is outstanding, and the
+    /// meter reading "0 of 8" the whole way because it counted the eight bays
+    /// that hold a plugin while the loader walked the thirteen thousand that
+    /// do not. Two answers on two different clocks, and this is where they
+    /// came apart.
+    ///
+    /// `reload_slots_for_loaded` reached the same conclusion for the
+    /// permutation half and states the reasoning: "a bay that is EMPTY on
+    /// both sides of the move has no plugin and no state and nothing to do,
+    /// and marking it makes the reconcile spend a frame finding that out".
+    /// The same is true of a session switch, and the invariant that makes it
+    /// safe is the one every engine teardown maintains: `inserts_loaded` is
+    /// set to all-`None` whenever the engine goes, so a `None` here really
+    /// does mean the engine's slot is empty and there is nothing to unload.
     fn force_insert_reload(&mut self) {
-        for slot in &mut self.recorder.inserts_loaded {
-            *slot = Some("\u{1f}reload".to_owned());
+        let bays = tangent_ui::recorder::INSERTS;
+        for i in 0..self.recorder.inserts_loaded.len() {
+            let wanted = self.app.insert(i / bays, i % bays).is_some();
+            let held = self.recorder.inserts_loaded[i].is_some();
+            if bay_needs_reload(wanted, held) {
+                self.recorder.inserts_loaded[i] = Some("\u{1f}reload".to_owned());
+            }
         }
     }
 
@@ -7960,22 +8168,50 @@ impl DesktopApp {
         // wait for. Closing is instant, so making the user watch a frame of
         // "starting the camera…" in order to turn one OFF would be silly.
         if wanted.is_some() && !self.recorder.camera_opening {
-            self.recorder.camera_opening = true;
-            // **And it says so on the cover now, not only in the band's
-            // line.** `open_camera` blocks for 1.9 to 3.9 seconds on an
-            // external webcam — long past the point where the window server
-            // paints its wheel over a desk that looks half-drawn. This is the
-            // precedent the whole two-phase sequence was taken from, so it
-            // needs no chore: the bool below IS the announcement, and the
-            // overlay is raised beside it.
-            if let Some(busy) = self.busy_chunk(Busied::Camera, "Starting the camera") {
-                busy.detail = wanted.clone();
-                busy.progress = Some(tangent_ui::busy::Progress::Indeterminate);
-                // A device, not a chunked walk: it must be up before the call
-                // and cannot wait out a delay it will never be asked about
-                // again. See `Busy::deferred`, which says why.
-                busy.delay = std::time::Duration::ZERO;
+            // **The cover is TAKEN, not asked for.** `open_camera` blocks for
+            // 1.9 to 3.9 seconds on an external webcam — long past the point
+            // where the window server paints its wheel over a desk that looks
+            // half-drawn. This is the precedent the whole two-phase sequence
+            // was taken from, so it needs no chore: the bool below IS the
+            // announcement, and the overlay is raised beside it.
+            //
+            // It used to ask through `busy_chunk`, which refuses when the
+            // overlay belongs to somebody else — and on the ONE edge that
+            // matters it always does. Opening the band runs `open_audio_path`
+            // and then this, in that order, and `open_audio_path` announces
+            // unconditionally: so the camera's cover was refused every single
+            // time, the camera opened anyway on the frame after, and what was
+            // frozen on screen for those four seconds was the audio engine's
+            // announcement, naming work that had already finished. A cover
+            // that is up for the wrong operation is worse than no cover: it is
+            // the app saying something untrue with a straight face.
+            //
+            // `busy_chunk`'s refusal is right for a driver that comes back
+            // between items and can afford to go uncovered for a few hundred
+            // milliseconds. This is a BLOCK, and a block cannot: the only
+            // frame it could ever be announced on is this one. So it takes the
+            // overlay the way `announce` does, for the same reason `announce`
+            // does.
+            //
+            // The one thing it must not take is an announcement that is still
+            // OWED a frame — that would drop somebody else's blocking call on
+            // the floor. There is always a next frame to try again on, and the
+            // owed chore runs at the top of it.
+            if self.chore.is_some() {
+                ctx.request_repaint();
+                return;
             }
+            self.recorder.camera_opening = true;
+            let mut busy = tangent_ui::busy::Busy::new("Starting the camera");
+            busy.detail = wanted.clone();
+            // A device, not a chunked walk: it must be up before the call and
+            // cannot wait out a delay it will never be asked about again. See
+            // `Busy::deferred`, which says why — and `Busy::new` is the
+            // constructor that carries no delay at all.
+            busy.progress = Some(tangent_ui::busy::Progress::Indeterminate);
+            self.busy = Some(busy);
+            self.busied = Busied::Camera;
+            self.busy_done = false;
             ctx.request_repaint();
             return;
         }
@@ -9443,6 +9679,8 @@ impl DesktopApp {
             #[cfg(feature = "recorder")]
             insert_batch: Counted::default(),
             #[cfg(feature = "recorder")]
+            insert_announced: None,
+            #[cfg(feature = "recorder")]
             cartridge: None,
             #[cfg(feature = "recorder")]
             cartridges: std::collections::HashMap::new(),
@@ -9725,17 +9963,9 @@ impl eframe::App for DesktopApp {
             self.reader_seen = true;
             self.app.set_screen_reader(true);
         }
-        // **A covered desk takes no clicks**, which is the other duty
-        // `busy.rs` hands the host. During a CHUNKED operation frames really
-        // do arrive and a press really would land on whatever is under the
-        // pointer — a fader, a clip, the very menu row that started the load
-        // — while the window says it is busy. Read from what `draw` answered
-        // last frame rather than from `busy.is_some()`: the overlay that has
-        // not appeared yet (its delay is unspent, or the cap has released it)
-        // is covering nothing and must swallow nothing.
-        if self.busy_up {
-            ctx.input_mut(|i| i.events.clear());
-        }
+        // **A covered desk takes no clicks, and the swallowing happens at
+        // the door** — see [`DesktopApp::raw_input_hook`], which is the only
+        // place in the frame where it can be made to work.
         if self.painted_once {
             self.app.frame(ctx);
         }
@@ -9824,6 +10054,50 @@ impl eframe::App for DesktopApp {
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         TangentApp::CLEAR_COLOR
+    }
+
+    /// **A covered desk takes no input**, which is the other duty `busy.rs`
+    /// hands the host.
+    ///
+    /// During a CHUNKED operation frames really do arrive, so a press really
+    /// would land on whatever is under the pointer — a fader, a clip, the
+    /// very menu row that started the load — while the window says it is
+    /// busy. The overlay itself cannot stop it: `paint_busy` draws through a
+    /// bare `layer_painter`, which allocates no widget, so egui has nothing
+    /// on that layer to hit-test against and every click falls straight
+    /// through to the desk.
+    ///
+    /// **This is a HOOK and not a line in `update` because of WHEN egui
+    /// decides what was clicked.** `Context::begin_pass` builds the whole
+    /// answer before the app is called: the pointer state, the hit test
+    /// against last pass's widget rects, and the interaction snapshot that
+    /// `Response::clicked` reads. Clearing `InputState::events` from inside
+    /// `update` — which is what this used to do — comes after all three are
+    /// already made, so it swallowed the keyboard (which is read from the
+    /// event list, at the widget) and nothing else: the fader still moved.
+    /// eframe calls this immediately before `begin_pass`, which is the last
+    /// moment a gesture can be taken away from egui rather than from the
+    /// widget that already won it.
+    ///
+    /// A DROP list rather than a keep list, so a future egui event that is
+    /// not a gesture — a screenshot coming back, the window gaining focus —
+    /// keeps arriving by default. Those two are not input and the app's own
+    /// bookkeeping wants them whatever is on screen.
+    ///
+    /// Read from what `draw` answered last frame rather than from
+    /// `busy.is_some()`: an overlay that has not appeared yet (its delay is
+    /// unspent, or the cap has released it) is covering nothing and must
+    /// swallow nothing. The splash is deliberately NOT included — it covers
+    /// the frames before the app is usable, and eating the events of a
+    /// window that is not yet accepting them buys nothing.
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        // The overlay is painted over the main window's own screen rect, so
+        // it covers that viewport and no other: a child viewport the app has
+        // open is not underneath it and keeps its input.
+        if !self.busy_up || raw_input.viewport_id != egui::ViewportId::ROOT {
+            return;
+        }
+        raw_input.events.retain(|e| !is_gesture(e));
     }
 
     /// A take still running when the window is closed is FINISHED, not
@@ -10493,72 +10767,6 @@ impl DesktopApp {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// MERGE-ME: the messages door, until the UI lane's own lands
-// ───────────────────────────────────────────────────────────────────────────
-//
-// **DELETE THIS WHOLE SECTION** the moment `TangentApp` carries its own
-// inherent `notify`, `notify_raise` and `notify_lower`. Nothing else has to
-// change when it goes: an inherent method wins over a trait one in Rust's
-// resolution, so every `self.app.notify(...)` below starts reaching the real
-// notification column the instant the real door exists, and this becomes
-// dead code rather than a conflict.
-//
-// **Why it exists at all.** The two halves of this work were built in
-// parallel lanes against one written contract: the GUI crate owns and
-// declares the three doors, the host only calls them, and neither lane may
-// edit the other's files. So the host lane can name the doors — the contract
-// fixes their spelling — but cannot yet reach them, and a lane that does not
-// compile cannot be tested.
-//
-// **It deliberately does not paint anything.** The obvious stopgap — put the
-// text back in the band's one-line notice slot — would keep the two faults
-// this work exists to remove: a receipt for a finished export competing with
-// a live device error in a strip that holds one sentence, and a floating
-// notice window that reveals one frame after the export's own progress window
-// and is therefore ordered on top of the waveform somebody is watching. So
-// the messages go to the log until the real column lands, and the slot they
-// used to fight over is gone.
-
-/// The three doors, spelled as the contract spells them.
-#[cfg(feature = "recorder")]
-trait Messages {
-    /// Raise a message in the top-left corner. The one door for anything the
-    /// app wants to SAY (as opposed to ASK).
-    fn notify(&mut self, kind: Kind, text: impl Into<String>);
-    /// A condition that is true until it stops being true. Re-raising an
-    /// already-standing key does nothing; a user dismissal sticks.
-    fn notify_raise(&mut self, key: &str, kind: Kind, text: impl Into<String>);
-    fn notify_lower(&mut self, key: &str);
-}
-
-#[cfg(feature = "recorder")]
-thread_local! {
-    /// The conditions standing, so re-raising one says nothing twice — the
-    /// half of `notify_raise` a plain push would lose, and the half a caller
-    /// here can get wrong (the export raises from two places). One window,
-    /// one UI thread, so a thread-local rather than a lock.
-    static RAISED: std::cell::RefCell<std::collections::BTreeSet<String>> =
-        std::cell::RefCell::new(std::collections::BTreeSet::new());
-}
-
-#[cfg(feature = "recorder")]
-impl Messages for TangentApp {
-    fn notify(&mut self, kind: Kind, text: impl Into<String>) {
-        log::info!("{}: {}", kind.spoken(), text.into());
-    }
-
-    fn notify_raise(&mut self, key: &str, kind: Kind, text: impl Into<String>) {
-        if RAISED.with(|r| r.borrow_mut().insert(key.to_owned())) {
-            log::info!("{} [{key}]: {}", kind.spoken(), text.into());
-        }
-    }
-
-    fn notify_lower(&mut self, key: &str) {
-        RAISED.with(|r| r.borrow_mut().remove(key));
-    }
-}
-
-// ───────────────────────────────────────────────────────────────────────────
 // The busy overlay
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -10624,6 +10832,12 @@ enum Chore {
     /// The offline render is finished: close the files and run the format
     /// pass. See `tick_offline_bounce`.
     WriteExport,
+    /// Walk every VST3 root again. One `read_dir` per root and one bundle
+    /// opened per plugin found, all of it on this thread.
+    RescanPlugins,
+    /// Duplicate Project As: the whole session folder, `media/` included,
+    /// copied to the answered path and then opened. See `take_save_panel`.
+    SaveCopy(std::path::PathBuf),
     /// The realtime pass landed: copy it out, run the format pass, say where.
     FinishBounce {
         folder: String,
@@ -10651,6 +10865,54 @@ enum Warm {
 /// contract's `notify_raise`.
 #[cfg(feature = "recorder")]
 const EXPORT_RUNNING: &str = "export-running";
+
+/// Whether a reload has anything to do in a bay: something is in it, or
+/// something is coming to it.
+///
+/// One line, and it is the line the meter's honesty rests on. Everything the
+/// insert loader reports — "3 of 9", the cover appearing at all, the frames it
+/// spends — is counted from the bays a reload MARKED, so marking a bay that is
+/// empty on both sides puts a frame of work into the count that does no work.
+/// A full seat space is thirteen thousand bays and a busy session uses a
+/// couple of dozen of them; marking the lot is how "0 of 8" came to sit on
+/// screen for minutes while the loader walked empties.
+///
+/// `reload_slots_for_loaded` reached the same rule from the permutation side
+/// and states it the same way: two empties trading places is nothing
+/// happening.
+#[cfg(feature = "recorder")]
+fn bay_needs_reload(wanted: bool, held: bool) -> bool {
+    wanted || held
+}
+
+/// Whether an event is a GESTURE — something a person did to the window with
+/// a hand — as opposed to a fact the window is being told.
+///
+/// The half of [`DesktopApp::raw_input_hook`] worth testing, split out so a
+/// test can state the rule without an event loop. A drop list rather than a
+/// keep list on purpose: everything named here is somebody reaching for the
+/// desk, and anything egui adds later that is not — a screenshot coming back,
+/// focus arriving — goes on being delivered while the cover is up, because the
+/// app's bookkeeping wants it and no user is being lied to by it.
+fn is_gesture(e: &egui::Event) -> bool {
+    matches!(
+        e,
+        egui::Event::Key { .. }
+            | egui::Event::Text(_)
+            | egui::Event::Paste(_)
+            | egui::Event::Copy
+            | egui::Event::Cut
+            | egui::Event::Ime(_)
+            | egui::Event::PointerMoved(_)
+            | egui::Event::MouseMoved(_)
+            | egui::Event::PointerButton { .. }
+            | egui::Event::PointerGone
+            | egui::Event::Touch { .. }
+            | egui::Event::MouseWheel { .. }
+            | egui::Event::Zoom(_)
+            | egui::Event::Rotate(_)
+    )
+}
 
 /// Whether an announced job may be run this frame.
 ///
@@ -10718,28 +10980,27 @@ impl Counted {
 }
 
 /// One frame of the insert loader's walk: which bay to load next, and how
-/// many bays that hold a PLUGIN are still outstanding.
+/// many bays are still outstanding.
 ///
-/// **Two closures rather than the tables themselves.** The real tables are
-/// thirteen thousand entries long and live on two different objects — what
-/// the desk wants is the app's, what the engine has is the host's — so
-/// handing them over would mean building a copy every frame of the most
-/// repeated loop in the app. The rule under test is which INDEX comes back
-/// and what the meter reads, and that rule is the same whatever answers the
-/// two questions.
+/// **A closure rather than the table itself.** The real tables are thirteen
+/// thousand entries long and live on two different objects — what the desk
+/// wants is the app's, what the engine has is the host's — so handing them
+/// over would mean building a copy every frame of the most repeated loop in
+/// the app. The rule under test is which INDEX comes back and what the meter
+/// reads, and that rule is the same whatever answers the question.
 ///
-/// **Only the filled bays are counted.** A reload marks the whole seat space,
-/// of which all but a handful are empty, and the loader then flushes those
-/// one a frame for minutes afterwards costing nothing and doing nothing.
-/// Counting them would put "3 of 13167" in front of somebody who is waiting
-/// for eight plugins, and would hold the cover up long after the wait was
-/// over.
+/// **One predicate, so the two answers are on one clock.** This used to ask
+/// twice: `next` was the first MISMATCHED bay and the count was of the
+/// mismatched bays that held a PLUGIN, on the reasoning that "3 of 13167" is
+/// no use to somebody waiting for eight plugins. The goal was right and the
+/// arithmetic was not — a reload marked the whole seat space, so the loader
+/// spent thousands of frames flushing empty bays while the count sat at zero,
+/// and the reading only moved when the walk happened to reach one of the
+/// eight. The fix belongs upstream, in what gets MARKED: `force_insert_reload`
+/// no longer marks a bay that is empty on both sides, so every bay this walk
+/// finds is a bay with work in it and the count is the number of frames left.
 #[cfg(feature = "recorder")]
-fn insert_walk(
-    len: usize,
-    mismatch: impl Fn(usize) -> bool,
-    filled: impl Fn(usize) -> bool,
-) -> (Option<usize>, usize) {
+fn insert_walk(len: usize, mismatch: impl Fn(usize) -> bool) -> (Option<usize>, usize) {
     let mut next: Option<usize> = None;
     let mut outstanding = 0usize;
     for i in 0..len {
@@ -10749,9 +11010,7 @@ fn insert_walk(
         if next.is_none() {
             next = Some(i);
         }
-        if filled(i) {
-            outstanding += 1;
-        }
+        outstanding += 1;
     }
     (next, outstanding)
 }
@@ -10856,6 +11115,10 @@ impl DesktopApp {
                 }
             }
             Chore::WriteExport => self.write_export(),
+            Chore::RescanPlugins => self.rescan_plugins(),
+            Chore::SaveCopy(path) => self
+                .app
+                .finish_save_choice(tangent_ui::ports::SavePurpose::ProjectCopy, &path),
             Chore::FinishBounce {
                 folder,
                 problem,
@@ -11127,30 +11390,49 @@ mod tests {
         assert_eq!((grown.done, grown.total), (2, 15));
     }
 
-    /// **The loader takes the first gap and counts only the FULL bays.**
+    /// **The bay it walks to next and the number it counts are the same
+    /// question, asked once.**
     ///
-    /// A reload marks the whole seat space, so the walk starts among
-    /// thousands of empty bays that flush for nothing. The next index has to
-    /// be the first mismatch whatever is in it — that is what makes the flush
-    /// finish — while the meter's "n" counts only the bays that will cost
-    /// somebody a wait.
+    /// The fault this replaces: the walk answered from two predicates, `next`
+    /// from every mismatched bay and `outstanding` from the mismatched bays
+    /// that held a plugin. A reload marked the whole seat space, so the
+    /// loader spent thousands of frames flushing empties while the reading
+    /// sat at "0 of 8" — two answers on two different clocks. One predicate
+    /// cannot come apart, and `force_insert_reload` is where the empties stop
+    /// being marked at all.
     #[test]
-    fn the_loader_takes_the_first_gap_and_counts_only_the_full_bays() {
-        // Bays 0..40 all mismatch; three of them hold a plugin.
-        let filled = [7usize, 19, 33];
-        let (next, outstanding) = super::insert_walk(
-            40,
-            |_| true,
-            |i| filled.contains(&i),
+    fn the_walk_counts_exactly_the_bays_it_will_visit() {
+        // Three bays to do, scattered through a seat space of forty.
+        let work = [7usize, 19, 33];
+        let (next, outstanding) = super::insert_walk(40, |i| work.contains(&i));
+        assert_eq!(next, Some(7), "the walk starts at the first bay with work");
+        assert_eq!(
+            outstanding,
+            work.len(),
+            "the count is the frames of work left, not a subset of it"
         );
-        assert_eq!(next, Some(0), "the flush starts at the first gap");
-        assert_eq!(outstanding, 3, "empty bays are not a wait");
         // Settled: nothing mismatches, so there is nothing to say.
-        let (next, outstanding) = super::insert_walk(40, |_| false, |_| true);
-        assert_eq!((next, outstanding), (None, 0));
-        // And a lone plugin high up is still found.
-        let (next, outstanding) = super::insert_walk(40, |i| i == 33, |_| true);
-        assert_eq!((next, outstanding), (Some(33), 1));
+        assert_eq!(super::insert_walk(40, |_| false), (None, 0));
+        // And a lone bay high up is still found.
+        assert_eq!(super::insert_walk(40, |i| i == 33), (Some(33), 1));
+        // The clocks agree all the way down: walking the list one bay a frame
+        // takes exactly `outstanding` frames and the reading reaches full.
+        let mut left: Vec<usize> = work.to_vec();
+        let mut count = super::Counted::default();
+        let mut frames = 0;
+        loop {
+            let (next, outstanding) = super::insert_walk(40, |i| left.contains(&i));
+            count = count.saw(outstanding);
+            let Some(i) = next else { break };
+            left.retain(|&b| b != i);
+            frames += 1;
+        }
+        assert_eq!(frames, work.len(), "a bay a frame, and no empty frames");
+        assert_eq!(
+            (count.done, count.total),
+            (work.len(), work.len()),
+            "the meter reached full on the frame the work did"
+        );
     }
 
     /// **Every message leaves through the notify door.**
