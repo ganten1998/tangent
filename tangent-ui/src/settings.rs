@@ -2787,8 +2787,31 @@ impl Settings {
                 }
             }
         }
-        // The rack itself, last, so it wins over the two it replaced.
+        // The rack itself, last, so it wins over the two it replaced. TWO
+        // keys, because the keyboard grew from two sounds to eight and the
+        // flat index bakes the sound count into every element's position:
+        // reading an old stride-2 array by plain zip would land strip 1's
+        // knobs in strip 0's new sounds and shear every strip after it.
+        // The original key keeps its original meaning — patches 0 and 1 at
+        // the old stride, re-indexed into the wider rack — and the full
+        // rack rides `strip_keys_params8`, read after so it wins where
+        // both exist.
         if let Some(Value::Array(v)) = map.shift_remove("strip_keys_params") {
+            // Frozen at that era's shape, per the migration rule: two
+            // sounds, eight knobs, whatever the live constants become.
+            const OLD_PATCHES: usize = 2;
+            const OLD_KNOBS: usize = 8;
+            for (i, x) in v.iter().enumerate() {
+                let knob = i % OLD_KNOBS;
+                let patch = (i / OLD_KNOBS) % OLD_PATCHES;
+                let ch = i / (OLD_KNOBS * OLD_PATCHES);
+                let at = crate::dialogs::keys_param_index(ch, patch, knob);
+                if let Some(slot) = s.strip_keys_params.get_mut(at) {
+                    *slot = x.as_f64().unwrap_or(0.5).clamp(0.0, 1.0);
+                }
+            }
+        }
+        if let Some(Value::Array(v)) = map.shift_remove("strip_keys_params8") {
             for (dst, x) in s.strip_keys_params.iter_mut().zip(v) {
                 *dst = x.as_f64().unwrap_or(0.5).clamp(0.0, 1.0);
             }
@@ -4144,6 +4167,31 @@ impl Settings {
         );
         map.insert(
             "strip_keys_params".into(),
+            // The two sounds this key has ALWAYS meant, at its original
+            // stride: a build from before the keyboard grew reads its own
+            // file shape and nothing shears. The full rack is the last
+            // known key below.
+            Value::Array({
+                let mut old = Vec::with_capacity(crate::recorder::CHANNELS * 16);
+                for ch in 0..crate::recorder::CHANNELS {
+                    for patch in 0..2 {
+                        for knob in 0..crate::dialogs::KEYS_PARAMS {
+                            let at =
+                                crate::dialogs::keys_param_index(ch, patch, knob);
+                            old.push(Value::from(
+                                self.strip_keys_params
+                                    .get(at)
+                                    .copied()
+                                    .unwrap_or(0.5),
+                            ));
+                        }
+                    }
+                }
+                old
+            }),
+        );
+        map.insert(
+            "strip_keys_params8".into(),
             Value::Array(self.strip_keys_params.iter().map(|&p| Value::from(p)).collect()),
         );
         for (k, v) in &self.extra {
@@ -6601,6 +6649,51 @@ mod tests {
         let out = serde_json::to_string(&Value::Object(s.to_map())).unwrap();
         assert!(out.contains("Nashville High Strung"));
         assert!(out.contains("\"fretboard_capo\":40"));
+    }
+
+    /// **The keyboard's rack survives growing from two sounds to eight.**
+    /// The flat array bakes the sound count into every element's position,
+    /// so a stride-2 era file read by plain zip would shear strip 1's knobs
+    /// into strip 0's new sounds. The legacy key re-indexes into the wider
+    /// rack; the full rack rides its own key; and the writer keeps the
+    /// legacy key at its ORIGINAL stride so a build from that era reads its
+    /// own file shape untouched.
+    #[test]
+    fn an_old_keys_rack_lands_in_the_right_sounds() {
+        let n = crate::recorder::CHANNELS;
+        // A stride-2 era array: strip 1, sound 1 (the EP), knob 3 marked.
+        let mut old = vec![0.5f64; n * 2 * 8];
+        old[(2 + 1) * 8 + 3] = 0.91;
+        let mut map = Map::new();
+        map.insert("strip_keys_params".into(), serde_json::json!(old));
+        let s = Settings::from_map(map);
+        let at = crate::dialogs::keys_param_index(1, 1, 3);
+        assert!(
+            (s.strip_keys_params[at] - 0.91).abs() < 1e-9,
+            "the mark sheared away from its strip and sound"
+        );
+        // A new sound's untouched knob sits at its own default, not at a
+        // sheared neighbour's value: the clav's Pickup ships at 0.35.
+        let clav_pickup = crate::dialogs::keys_param_index(1, 4, 3);
+        // f32 spec defaults widen inexactly; the tolerance is the same 1e-6
+        // the cross-crate pinning test uses.
+        assert!(
+            (s.strip_keys_params[clav_pickup] - 0.35).abs() < 1e-6,
+            "a new sound inherited an old strip's knob"
+        );
+        // Round trip: the full rack comes back exactly, and the legacy key
+        // still carries the two old sounds at the old stride.
+        let m = s.to_map();
+        let back = Settings::from_map(m.clone());
+        assert_eq!(back.strip_keys_params, s.strip_keys_params);
+        let legacy = m["strip_keys_params"].as_array().expect("legacy key");
+        assert_eq!(legacy.len(), n * 16, "the legacy key changed shape");
+        assert!(
+            (legacy[(2 + 1) * 8 + 3].as_f64().unwrap() - 0.91).abs() < 1e-9,
+            "an old build would not find the knob where it left it"
+        );
+        let full = m["strip_keys_params8"].as_array().expect("full rack key");
+        assert_eq!(full.len(), n * crate::dialogs::KEYS_PATCHES * 8);
     }
 
     #[test]

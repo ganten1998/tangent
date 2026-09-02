@@ -77,7 +77,7 @@ use super::EpKnobs;
 /// product of a filter's response. The whole velocity design depends on being
 /// able to say exactly how loud the bell is relative to the fundamental.
 #[derive(Clone, Copy, Default)]
-struct Mode {
+pub(super) struct Mode {
     y1: f32,
     y2: f32,
     /// 2 * r * cos(w)
@@ -91,7 +91,7 @@ impl Mode {
     ///
     /// The seed values are the first two samples of `amp * r^n * sin(w n)`;
     /// the recursion generates every sample after that exactly.
-    fn kick(&mut self, freq: f32, t60: f32, rate: f32, amp: f32) {
+    pub(super) fn kick(&mut self, freq: f32, t60: f32, rate: f32, amp: f32) {
         if freq <= 0.0 || freq >= rate * 0.47 || amp == 0.0 {
             self.b1 = 0.0;
             self.b2 = 0.0;
@@ -109,7 +109,7 @@ impl Mode {
         self.y1 = amp * r * w.sin();
     }
 
-    fn tick(&mut self) -> f32 {
+    pub(super) fn tick(&mut self) -> f32 {
         let y = self.b1 * self.y1 + self.b2 * self.y2;
         let y = if y.is_finite() { y } else { 0.0 };
         self.y2 = self.y1;
@@ -117,7 +117,7 @@ impl Mode {
         y
     }
 
-    fn clear(&mut self) {
+    pub(super) fn clear(&mut self) {
         self.y1 = 0.0;
         self.y2 = 0.0;
     }
@@ -143,6 +143,15 @@ pub struct EpVoice {
     done: bool,
     /// Random sign per strike, so repeated notes are not bit-identical.
     seed: u32,
+    /// The damper pad landing: a soft dud that plays when the key is let go.
+    /// The tick's comment always promised it; this is the promise kept.
+    thump: Mode,
+    /// The passive pickup and cable: a gentle top rolloff, one pole. A real
+    /// harp's coil into a real lead has nothing left above the bell, and the
+    /// raw modal sum was the one place this instrument still sounded like
+    /// arithmetic.
+    pickup_lp: f32,
+    pickup_a: f32,
 }
 
 impl EpVoice {
@@ -158,6 +167,13 @@ impl EpVoice {
             env: 0.0,
             done: true,
             seed: 0x9E37_79B9,
+            thump: Mode::default(),
+            pickup_lp: 0.0,
+            // Corner near 7.5 kHz: high enough to leave every bell partial
+            // alone, low enough to shave the synthetic edge off the top.
+            pickup_a: 1.0 - (-std::f32::consts::TAU * 7_500.0
+                / sample_rate.max(8_000.0))
+                .exp(),
         }
     }
 
@@ -307,12 +323,24 @@ impl EpVoice {
 
     pub fn release(&mut self, pedal: bool) {
         if !pedal {
+            self.land_damper();
             self.damp_to = 0.0;
         }
     }
 
     pub fn damp(&mut self) {
+        self.land_damper();
         self.damp_to = 0.0;
+    }
+
+    /// The pad lands. Scaled by how loudly the tine was still swinging: a
+    /// note that has already died gets no thump, because the pad has nothing
+    /// to catch.
+    fn land_damper(&mut self) {
+        if self.done || self.damp_to == 0.0 {
+            return;
+        }
+        self.thump.kick(88.0, 0.045, self.rate, self.env * 0.35);
     }
 
     pub fn finished(&self) -> bool {
@@ -364,7 +392,11 @@ impl EpVoice {
         // note four decibels INTO the ceiling. An instrument that clips its
         // own output on an ordinary voicing is broken; the channel fader is
         // downstream and cannot undo it.
-        let out = out * self.damp * 0.45;
+        // The pickup's own rolloff, then the damper's thump OUTSIDE the
+        // damp fade — the pad landing is the damper, it cannot be silenced
+        // by it.
+        self.pickup_lp += self.pickup_a * (out - self.pickup_lp);
+        let out = (self.pickup_lp * self.damp + self.thump.tick()) * 0.45;
         let out = if out.is_finite() { out.clamp(-4.0, 4.0) } else { 0.0 };
 
         let a = out.abs();
@@ -375,6 +407,8 @@ impl EpVoice {
                 m.clear();
             }
             self.bar.clear();
+            self.thump.clear();
+            self.pickup_lp = 0.0;
         }
         out
     }

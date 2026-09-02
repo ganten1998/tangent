@@ -1979,13 +1979,24 @@ pub const KEYS_NAME: &str = "Tangent Keys";
 /// see the audio crate. The engine's `keys::Patch::ALL` is the same list in the
 /// same order; the index is the contract between them, which is why the
 /// settings key stores a number.
-pub const KEYS_PATCHES: usize = 2;
+pub const KEYS_PATCHES: usize = 8;
+/// APPENDED, never reordered: the first two indices were in settings files
+/// for months before the other six existed, and the index IS the contract.
 pub const KEYS_PATCH_NAMES: [(&str, &str); KEYS_PATCHES] = [
     ("Piano 1", "jazz grand, voiced for solo playing"),
     (
         "EP Mk.1",
         "tine electric piano, dry - light is bell, hard is bark",
     ),
+    ("Piano 2", "concert grand: longer ring, sweeter top, wider swing"),
+    (
+        "EP Suitcase",
+        "the same tines through their own amp - the stereo throb",
+    ),
+    ("Clav", "struck-and-held strings, a sliding pickup, taken dry"),
+    ("Clav Wah", "the same strings through a filter that chases your touch"),
+    ("Reed 200", "reed piano, transistor amp: hollow soft, growling hard"),
+    ("Reed 140", "the tube reed piano: darker, and never entirely clean"),
 ];
 
 /// How many knobs a keyboard sound exposes, and what they are.
@@ -2027,6 +2038,74 @@ pub const KEYS_PARAM_SPECS: [[(&str, &str, f32); KEYS_PARAMS]; KEYS_PATCHES] = [
         ("Chime", "where the bell partial sits above the note", 0.5),
         ("Release", "how fast the damper stops the tine", 0.5),
         ("Tonebar", "the metal the tine is bolted to", 0.5),
+    ],
+    [
+        ("Voicing", "hammer felt: needled soft to lacquered bright", 0.5),
+        ("Width", "how far bass and treble sit apart", 1.0 / 1.5),
+        ("Decay", "how long a struck string rings", 0.5),
+        (
+            "Brilliance",
+            "how long the upper partials outlast the fundamental",
+            0.5,
+        ),
+        (
+            "Unison",
+            "detune between the strings of a course: the beating",
+            0.5,
+        ),
+        ("Stretch", "string stiffness, which pulls the partials sharp", 0.5),
+        ("Release", "how fast the damper stops a string", 0.5),
+        ("Soundboard", "the body under everything, and the pedalled wash", 0.5),
+    ],
+    [
+        ("Voicing", "hammer tip: soft to hard against the tine", 0.5),
+        ("Width", "how far bass and treble sit apart", 1.0 / 1.5),
+        ("Decay", "how long the tine rings", 0.5),
+        ("Bell", "the glassy chime on the attack", 0.5),
+        ("Bark", "how hard the tine leans on the pickup", 0.5),
+        ("Tremolo", "the stereo throb of the twin speakers", 0.45),
+        ("Release", "how fast the damper stops the tine", 0.5),
+        ("Tonebar", "the metal the tine is bolted to", 0.5),
+    ],
+    [
+        ("Voicing", "tangent tip: worn soft to fresh hard", 0.5),
+        ("Width", "how far bass and treble sit apart", 1.0 / 1.5),
+        ("Decay", "how long a held string rings", 0.5),
+        ("Pickup", "where the coil sits under the string", 0.35),
+        ("Tone", "the filter rockers, folded to one sweep", 0.75),
+        ("Snap", "the spit of the string when the key lifts", 0.5),
+        ("Release", "how fast the yarn chokes the string", 0.5),
+        ("Mute", "the sliding damper pad: funk at the top", 0.0),
+    ],
+    [
+        ("Voicing", "tangent tip: worn soft to fresh hard", 0.5),
+        ("Width", "how far bass and treble sit apart", 1.0 / 1.5),
+        ("Decay", "how long a held string rings", 0.5),
+        ("Pickup", "where the coil sits under the string", 0.35),
+        ("Wah", "how hard the filter chases your touch", 0.55),
+        ("Snap", "the spit of the string when the key lifts", 0.5),
+        ("Release", "how fast the yarn chokes the string", 0.5),
+        ("Mute", "the sliding damper pad: funk at the top", 0.0),
+    ],
+    [
+        ("Voicing", "hammer felt: worn soft to packed hard", 0.5),
+        ("Width", "how far bass and treble sit apart", 1.0 / 1.5),
+        ("Decay", "how long the reed rings", 0.5),
+        ("Reed", "how much of the bar's own metal speaks", 0.5),
+        ("Growl", "how hard the reed leans into the plate", 0.5),
+        ("Tremolo", "the amp's throb", 0.4),
+        ("Release", "how fast the damper stops the reed", 0.5),
+        ("Thump", "the hammer's knock against the reed", 0.5),
+    ],
+    [
+        ("Voicing", "hammer felt: worn soft to packed hard", 0.5),
+        ("Width", "how far bass and treble sit apart", 1.0 / 1.5),
+        ("Decay", "how long the reed rings", 0.5),
+        ("Reed", "how much of the bar's own metal speaks", 0.5),
+        ("Growl", "how hard the reed leans into the plate", 0.62),
+        ("Tremolo", "the amp's throb", 0.0),
+        ("Release", "how fast the damper stops the reed", 0.5),
+        ("Thump", "the hammer's knock against the reed", 0.5),
     ],
 ];
 
@@ -2483,7 +2562,7 @@ impl Dialog {
             PluginEntry {
                 path: KEYS_PATH.to_owned(),
                 name: KEYS_NAME.to_owned(),
-                vendor: "built in, modelled piano and electric piano".to_owned(),
+                vendor: "built in, eight modelled keyboards".to_owned(),
             },
         );
         let selected = current
@@ -3523,57 +3602,77 @@ pub fn show(
                     egui::Frame::NONE
                         .inner_margin(egui::Margin::same(PLUGIN_MARGIN))
                         .show(ui, |ui| {
-                            for (i, (name, about)) in KEYS_PATCH_NAMES.iter().enumerate() {
-                                let resp = ui.allocate_response(
-                                    egui::vec2(ui.available_width(), 42.0),
-                                    egui::Sense::click(),
+                            // **Two columns, names only, the story on
+                            // hover.** Full-width rows with a line of prose
+                            // each were right for two sounds and would eat
+                            // the whole panel at eight: the grid is for
+                            // CHOOSING, and the chosen sound's own line is
+                            // printed under it so the prose is never more
+                            // than one glance away.
+                            let cols = 2usize;
+                            let rows = KEYS_PATCH_NAMES.len().div_ceil(cols);
+                            for row in 0..rows {
+                                ui.horizontal(|ui| {
+                                    let w = (ui.available_width() - 6.0) / cols as f32;
+                                    for col in 0..cols {
+                                        let i = row * cols + col;
+                                        let Some((name, about)) =
+                                            KEYS_PATCH_NAMES.get(i)
+                                        else {
+                                            continue;
+                                        };
+                                        let resp = ui.allocate_response(
+                                            egui::vec2(w, 28.0),
+                                            egui::Sense::click(),
+                                        );
+                                        let ground = if i == chosen {
+                                            Some(p.raised)
+                                        } else if resp.hovered() {
+                                            Some(p.hover)
+                                        } else {
+                                            None
+                                        };
+                                        if let Some(g) = ground {
+                                            ui.painter().rect_filled(resp.rect, 3.0, g);
+                                        }
+                                        ui.painter().text(
+                                            resp.rect.left_center() + egui::vec2(9.0, 0.0),
+                                            egui::Align2::LEFT_CENTER,
+                                            *name,
+                                            bold(12.0),
+                                            p.ink,
+                                        );
+                                        let resp = resp.on_hover_text(*about);
+                                        if resp.clicked() {
+                                            // **The cell lights up NOW.** Firing
+                                            // the action and leaving `selected`
+                                            // alone is what made choosing a sound
+                                            // look like it had done nothing until
+                                            // the window was reopened: the panel
+                                            // is drawn from its own state. The
+                                            // app re-seeds the knobs behind this,
+                                            // because the rack belongs to the
+                                            // sound.
+                                            *selected = i;
+                                            action = Some(
+                                                DialogAction::ChooseKeysPatch { slot, index: i },
+                                            );
+                                            // Choosing does not close the panel:
+                                            // the knobs below are half of why it
+                                            // is open.
+                                            result.close = false;
+                                        }
+                                    }
+                                });
+                                ui.add_space(4.0);
+                            }
+                            // The chosen sound's line, in full.
+                            if let Some((_, about)) = KEYS_PATCH_NAMES.get(chosen) {
+                                ui.label(
+                                    RichText::new(*about)
+                                        .font(FontId::new(10.0, fonts::courier_bold()))
+                                        .color(p.faint),
                                 );
-                                let ground = if i == chosen {
-                                    Some(p.raised)
-                                } else if resp.hovered() {
-                                    Some(p.hover)
-                                } else {
-                                    None
-                                };
-                                if let Some(g) = ground {
-                                    ui.painter().rect_filled(resp.rect, 3.0, g);
-                                }
-                                let at = resp.rect.min + egui::vec2(9.0, 6.0);
-                                ui.painter().text(
-                                    at,
-                                    egui::Align2::LEFT_TOP,
-                                    *name,
-                                    bold(13.0),
-                                    p.ink,
-                                );
-                                ui.painter().text(
-                                    at + egui::vec2(0.0, 18.0),
-                                    egui::Align2::LEFT_TOP,
-                                    *about,
-                                    FontId::new(10.0, fonts::courier_bold()),
-                                    p.faint,
-                                );
-                                if resp.clicked() {
-                                    // **The row lights up NOW.** Firing the
-                                    // action and leaving `selected` alone is
-                                    // what made choosing a sound look like it
-                                    // had done nothing until the window was
-                                    // shut and opened again: the panel is
-                                    // drawn from its own state, so its own
-                                    // state is what has to move. The app
-                                    // re-seeds the knobs behind this, because
-                                    // the rack belongs to the sound.
-                                    *selected = i;
-                                    action =
-                                        Some(DialogAction::ChooseKeysPatch { slot, index: i });
-                                    // Choosing a sound does not close the
-                                    // panel any more: the knobs below are
-                                    // half of why it is open, and hearing a
-                                    // sound then reaching for the felt is
-                                    // one visit, not two.
-                                    result.close = false;
-                                }
-                                ui.add_space(5.0);
                             }
                             ui.add_space(6.0);
 
@@ -6471,17 +6570,28 @@ pub fn show(
                                                 // working in that view had no
                                                 // way to turn a route down.
                                                 let mut g = *gain;
-                                                if ui
-                                                    .add(
-                                                        egui::Slider::new(&mut g, 0.0..=1.0)
-                                                            .show_value(false),
-                                                    )
-                                                    .changed()
-                                                {
+                                                let resp = ui.add(
+                                                    egui::Slider::new(&mut g, 0.0..=1.0)
+                                                        .show_value(false),
+                                                );
+                                                // Double-click puts it back to
+                                                // unity — the keys knobs'
+                                                // exemplar, on the one slider
+                                                // that had no way home.
+                                                if resp.double_clicked() {
+                                                    g = 1.0;
+                                                    action = Some(
+                                                        DialogAction::SetRouteGain(*at, g),
+                                                    );
+                                                } else if resp.changed() {
                                                     action = Some(
                                                         DialogAction::SetRouteGain(*at, g),
                                                     );
                                                 }
+                                                let resp = resp.on_hover_text(
+                                                    "double-click to reset",
+                                                );
+                                                let _ = resp;
                                                 ui.label(
                                                     RichText::new(format!(
                                                         "{:>3.0}%",

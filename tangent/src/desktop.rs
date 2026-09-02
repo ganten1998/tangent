@@ -8781,8 +8781,49 @@ mod tests {
         assert!((ep.release - 1.0).abs() < 1.0e-5, "release {}", ep.release);
         assert!((ep.body - 1.0).abs() < 1.0e-5, "body {}", ep.body);
 
+        // The clav: pickup and tone are raw positions the voice reads as
+        // shipped (0.35 under the string, rockers at 0.75); everything
+        // multiplicative lands on 1.0 and the mute pad ships lifted.
+        let clav = crate::keys::ClavKnobs::from_params(&crate::keys::Patch::Clav.defaults());
+        assert!((clav.decay - 1.0).abs() < 1.0e-5, "decay {}", clav.decay);
+        assert!((clav.pickup - 0.35).abs() < 1.0e-5, "pickup {}", clav.pickup);
+        assert!((clav.tone - 0.75).abs() < 1.0e-5, "tone {}", clav.tone);
+        assert!((clav.snap - 1.0).abs() < 1.0e-5, "snap {}", clav.snap);
+        assert!((clav.release - 1.0).abs() < 1.0e-5, "release {}", clav.release);
+        assert!(clav.mute.abs() < 1.0e-5, "mute {}", clav.mute);
+        // The wah patch holds the rockers at the shipped setting whatever
+        // knob 4 says: the pedal owns the filtering.
+        let wah = crate::keys::ClavKnobs::from_params_wah(
+            &crate::keys::Patch::ClavWah.defaults(),
+        );
+        assert!((wah.tone - 0.75).abs() < 1.0e-5, "wah tone {}", wah.tone);
+
+        // The reed pianos: multiplicative knobs through 1.0 on the 200; the
+        // 140 ships with its growl leaning (0.62 of a 0..2 map) and its
+        // tremolo off — those two defaults ARE the difference between the
+        // transistor and the tube instrument, so they are pinned.
+        let wur =
+            crate::keys::WurliKnobs::from_params(&crate::keys::Patch::Wurli200.defaults());
+        assert!((wur.decay - 1.0).abs() < 1.0e-5, "decay {}", wur.decay);
+        assert!((wur.reed - 1.0).abs() < 1.0e-5, "reed {}", wur.reed);
+        assert!((wur.growl - 1.0).abs() < 1.0e-5, "growl {}", wur.growl);
+        assert!((wur.release - 1.0).abs() < 1.0e-5, "release {}", wur.release);
+        assert!((wur.thump - 1.0).abs() < 1.0e-5, "thump {}", wur.thump);
+        let tube =
+            crate::keys::WurliKnobs::from_params(&crate::keys::Patch::Wurli140.defaults());
+        assert!((tube.growl - 1.24).abs() < 1.0e-5, "tube growl {}", tube.growl);
+        assert!(
+            (crate::keys::Patch::Wurli140.defaults()[5]).abs() < 1.0e-5,
+            "the tube instrument's tremolo ships off"
+        );
+
         // And WIDTH's default is the stock seating, which is 1.0 of a knob
-        // that runs to 1.5 — the one default that is not the middle.
+        // that runs to 1.5 — the one default that is not the middle. True
+        // of every patch, because WIDTH means the same thing on all eight.
+        for &patch in &crate::keys::Patch::ALL {
+            let w = patch.defaults()[crate::keys::P_WIDTH];
+            assert!((w * 1.5 - 1.0).abs() < 1.0e-5, "{patch:?} width {w}");
+        }
         let mut keys = crate::keys::Keys::new(48_000.0);
         keys.reset_params();
         let w = keys.params()[crate::keys::P_WIDTH];

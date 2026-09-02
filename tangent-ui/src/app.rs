@@ -5528,6 +5528,26 @@ impl TangentApp {
                 return;
             }
             if pointer_released {
+                // **Double-click puts the row back.** Read at RELEASE,
+                // because egui's flag fires on the second release — the
+                // same landmine every grab in this file steps around. Both
+                // presses of the double have already jumped the value to
+                // the pointer; removing the key now is what lands the
+                // gesture on the default, by the same rule the RESET
+                // button leans on: a parameter absent from the settings is
+                // a parameter at its default, which is the HOST's number,
+                // never a UI constant. `fx_drag` names the row and only a
+                // slider row ever arms it, so the stepped rows and the
+                // panel chrome cannot reset by accident.
+                if let Some(key) = self.fx_drag {
+                    let double = ui.input(|i| {
+                        i.pointer.button_double_clicked(egui::PointerButton::Primary)
+                    });
+                    if double {
+                        self.settings.effect_params.shift_remove(key);
+                        self.save_settings();
+                    }
+                }
                 self.fx_drag = None;
             }
         }

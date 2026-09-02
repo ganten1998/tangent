@@ -22,6 +22,109 @@
 
 use super::{Patch, PianoKnobs};
 
+/// What separates one grand from another before any knob moves: the base
+/// numbers `strike_full` voices itself around. The knobs multiply THESE, and
+/// 0.5 on every knob lands exactly here — so two patches sharing this
+/// mechanism are two instruments with their own bench signatures, not two
+/// presets of one.
+#[derive(Clone, Copy)]
+pub struct PianoBase {
+    /// Multiplier on the whole t60 curve. A nine-footer's bass wire really
+    /// does ring longer than a seven-footer's.
+    pub t60: f32,
+    /// The reference partial's t60 share at BRILLIANCE centre — how long the
+    /// top of the series outlasts its own fundamental.
+    pub brill: f32,
+    /// Multiplier on the hammer's contact width: above 1 is softer felt.
+    pub felt: f32,
+    /// Multiplier on the measured inharmonicity schedule. Longer strings are
+    /// less stiff FOR THEIR PITCH, which is most of why a big grand's treble
+    /// sounds sweeter than a baby's.
+    pub stiff: f32,
+    /// The hammer-contact width curve, in ms: the soft end, and how much of
+    /// it full velocity takes away. Together they are the dynamic RANGE of
+    /// the tone, where `felt` is only its centre.
+    pub sigma_lo: f32,
+    pub sigma_span: f32,
+    /// The action's knock — hammer shank, key bed, case — as a level scale.
+    pub knock: f32,
+}
+
+impl PianoBase {
+    /// The instrument the bench signed off first: mid-forward, woody,
+    /// voiced for a trio room. Every field 1.0-shaped so `strike_knobs`
+    /// through this base is bit-identical to the pre-base build.
+    pub const JAZZ: PianoBase = PianoBase {
+        t60: 1.0,
+        brill: 0.28,
+        felt: 1.0,
+        stiff: 1.0,
+        sigma_lo: 0.31,
+        sigma_span: 0.17,
+        knock: 1.0,
+    };
+    /// The concert instrument: longer wire, longer ring, a hair less
+    /// stiffness for the pitch, a wider dynamic sweep from the same felt,
+    /// and a quieter action — a hall instrument regulated for projection
+    /// rather than for a microphone two feet over the hammers.
+    pub const CONCERT: PianoBase = PianoBase {
+        t60: 1.35,
+        brill: 0.31,
+        felt: 0.94,
+        stiff: 0.85,
+        sigma_lo: 0.33,
+        sigma_span: 0.21,
+        knock: 0.75,
+    };
+}
+
+/// The knock: what the ACTION puts into the case the instant the hammer
+/// throws. It does not track the note — it is the same wood every time —
+/// which is exactly why it reads as a piano being played rather than a tone
+/// starting. Two fixed low modes, dead in a few tens of milliseconds.
+#[derive(Clone, Copy, Default)]
+struct Knock {
+    y1: [f32; 2],
+    y2: [f32; 2],
+    b1: [f32; 2],
+    b2: [f32; 2],
+}
+
+impl Knock {
+    fn kick(&mut self, rate: f32, amp: f32) {
+        // The case thud and the shank tap. Fixed frequencies, fast decays:
+        // by 50 ms this is gone and the string owns the note.
+        const FREQ: [f32; 2] = [96.0, 218.0];
+        const T60: [f32; 2] = [0.055, 0.030];
+        const MIX: [f32; 2] = [1.0, 0.45];
+        for i in 0..2 {
+            let w = std::f32::consts::TAU * FREQ[i] / rate;
+            let r = 10.0_f32.powf(-3.0 / (T60[i] * rate)).clamp(0.0, 0.999_9);
+            self.b1[i] = 2.0 * r * w.cos();
+            self.b2[i] = -(r * r);
+            self.y2[i] = 0.0;
+            self.y1[i] = amp * MIX[i] * r * w.sin();
+        }
+    }
+
+    fn tick(&mut self) -> f32 {
+        let mut out = 0.0;
+        for i in 0..2 {
+            let y = self.b1[i] * self.y1[i] + self.b2[i] * self.y2[i];
+            let y = if y.is_finite() { y } else { 0.0 };
+            self.y2[i] = self.y1[i];
+            self.y1[i] = y;
+            out += y;
+        }
+        out
+    }
+
+    fn clear(&mut self) {
+        self.y1 = [0.0; 2];
+        self.y2 = [0.0; 2];
+    }
+}
+
 /// Longest delay any string needs: A0 at 27.5 Hz, at 96 kHz, with room for the
 /// fractional part and the tuning correction. Fixed and allocated once, so no
 /// note can ever cause an allocation.
@@ -39,13 +142,13 @@ const UNISON: usize = 3;
 
 /// A one-pole lowpass, which is the loss in the loop.
 #[derive(Clone, Copy, Default)]
-struct Lp {
-    z: f32,
-    a: f32,
+pub(super) struct Lp {
+    pub(super) z: f32,
+    pub(super) a: f32,
 }
 
 impl Lp {
-    fn tick(&mut self, x: f32) -> f32 {
+    pub(super) fn tick(&mut self, x: f32) -> f32 {
         self.z += self.a * (x - self.z);
         self.z
     }
@@ -54,14 +157,14 @@ impl Lp {
 /// A first-order all-pass. Cascade them and you have dispersion: a frequency
 /// dependent delay, which is stiffness.
 #[derive(Clone, Copy, Default)]
-struct Ap {
-    a: f32,
-    x1: f32,
-    y1: f32,
+pub(super) struct Ap {
+    pub(super) a: f32,
+    pub(super) x1: f32,
+    pub(super) y1: f32,
 }
 
 impl Ap {
-    fn tick(&mut self, x: f32) -> f32 {
+    pub(super) fn tick(&mut self, x: f32) -> f32 {
         let y = self.a * (x - self.y1) + self.x1;
         self.x1 = x;
         self.y1 = y;
@@ -69,20 +172,23 @@ impl Ap {
     }
 }
 
-/// One string of a unison.
-struct Str {
+/// One string of a unison — and, `pub(super)`, one string of anything
+/// else strung on a bridge: the clav borrows this whole loop rather than
+/// growing its own, because a struck-and-held string is a struck-and-held
+/// string whichever cabinet it lives in.
+pub(super) struct Str {
     buf: [f32; MAX_DELAY],
     write: usize,
     /// Delay in samples, fractional.
-    len: f32,
-    loss: Lp,
-    disp: [Ap; 4],
+    pub(super) len: f32,
+    pub(super) loss: Lp,
+    pub(super) disp: [Ap; 4],
     /// Loop gain, just under one.
-    gain: f32,
+    pub(super) gain: f32,
 }
 
 impl Str {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Str {
             buf: [0.0; MAX_DELAY],
             write: 0,
@@ -93,7 +199,7 @@ impl Str {
         }
     }
 
-    fn clear(&mut self) {
+    pub(super) fn clear(&mut self) {
         self.buf.fill(0.0);
         self.loss = Lp { z: 0.0, a: self.loss.a };
         for d in &mut self.disp {
@@ -103,7 +209,7 @@ impl Str {
     }
 
     /// Read the delay line `d` samples back, linearly interpolated.
-    fn read(&self, d: f32) -> f32 {
+    pub(super) fn read(&self, d: f32) -> f32 {
         let d = d.clamp(1.0, (MAX_DELAY - 2) as f32);
         let i = d.floor();
         let frac = d - i;
@@ -122,7 +228,7 @@ impl Str {
     /// negative tap: a one-sided blob — waveform asymmetry 1.000 at low
     /// velocity on the bench, a thump for a soft note, and no strike comb
     /// anywhere because the comb IS the pair.
-    fn tick(&mut self, inject: f32) -> f32 {
+    pub(super) fn tick(&mut self, inject: f32) -> f32 {
         let out = self.read(self.len);
         let mut v = self.loss.tick(out) * self.gain;
         for d in &mut self.disp {
@@ -143,7 +249,7 @@ impl Str {
     /// Put energy in `at` samples behind the write head — the hammer pair's
     /// far tap. Adds, never assigns: the slot already holds circulating
     /// string, and a hammer lands ON a string, it does not replace it.
-    fn excite(&mut self, at: usize, v: f32) {
+    pub(super) fn excite(&mut self, at: usize, v: f32) {
         let i = (self.write + MAX_DELAY - at.min(MAX_DELAY - 1)) % MAX_DELAY;
         self.buf[i] += v;
     }
@@ -159,7 +265,7 @@ impl Str {
 /// design below changes its pole. Evaluating the actual phase at the actual
 /// frequency keeps "0 cents at the fundamental" true by construction rather
 /// than by luck.
-fn loop_phase_delay(w: f32, p: f32, ap: f32) -> f32 {
+pub(super) fn loop_phase_delay(w: f32, p: f32, ap: f32) -> f32 {
     let (sw, cw) = w.sin_cos();
     // One-pole H = g(1-p)/(1 - p e^{-jw}): real numerator, so the phase is
     // minus the denominator's argument.
@@ -187,7 +293,7 @@ fn loop_phase_delay(w: f32, p: f32, ap: f32) -> f32 {
 /// the one-pole's magnitude falls monotonically with frequency, so every
 /// partial's t60 decreases strictly with n — the property the whole fix was
 /// for — without being individually placed.
-fn design_loss(w1: f32, w2: f32, rho1: f32, rho2: f32) -> (f32, f32) {
+pub(super) fn design_loss(w1: f32, w2: f32, rho1: f32, rho2: f32) -> (f32, f32) {
     let (c1, c2) = (w1.cos(), w2.cos());
     let r = (rho1 / rho2) * (rho1 / rho2);
     let q = (c2 - r * c1) / (1.0 - r);
@@ -229,6 +335,8 @@ pub struct PianoVoice {
     /// A peak follower, for the stealing policy and for `finished`.
     env: f32,
     done: bool,
+    /// The action's thud, running alongside the strings.
+    knock: Knock,
 }
 
 impl PianoVoice {
@@ -247,11 +355,12 @@ impl PianoVoice {
             damp_secs: DAMP_SECS,
             env: 0.0,
             done: true,
+            knock: Knock::default(),
         }
     }
 
     pub fn strike(&mut self, pitch: u8, velocity: f32) {
-        self.strike_full(pitch, velocity, &PianoKnobs::default());
+        self.strike_full(pitch, velocity, &PianoKnobs::default(), &PianoBase::JAZZ);
     }
 
     /// `strike` with the panel's VOICING knob: 0 mellow, 1 bright, 0.5 the
@@ -259,12 +368,25 @@ impl PianoVoice {
     pub fn strike_voiced(&mut self, pitch: u8, velocity: f32, voicing: f32) {
         let mut k = PianoKnobs::default();
         k.voicing = voicing;
-        self.strike_full(pitch, velocity, &k);
+        self.strike_full(pitch, velocity, &k, &PianoBase::JAZZ);
     }
 
     /// `strike` with the whole panel: every knob this mechanism answers to.
     pub fn strike_knobs(&mut self, pitch: u8, velocity: f32, k: &PianoKnobs) {
-        self.strike_full(pitch, velocity, k);
+        self.strike_full(pitch, velocity, k, &PianoBase::JAZZ);
+    }
+
+    /// `strike_knobs` on a chosen base — the patch's instrument rather than
+    /// the shipped jazz grand. Through `PianoBase::JAZZ` this is
+    /// `strike_knobs` exactly.
+    pub fn strike_based(
+        &mut self,
+        pitch: u8,
+        velocity: f32,
+        k: &PianoKnobs,
+        base: &PianoBase,
+    ) {
+        self.strike_full(pitch, velocity, k, base);
     }
 
     /// `strike`, with the unison detune scaled: 1.0 is the instrument, 0.0
@@ -282,10 +404,10 @@ impl PianoVoice {
     pub fn strike_spread(&mut self, pitch: u8, velocity: f32, spread: f32) {
         let mut k = PianoKnobs::default();
         k.unison = spread;
-        self.strike_full(pitch, velocity, &k);
+        self.strike_full(pitch, velocity, &k, &PianoBase::JAZZ);
     }
 
-    fn strike_full(&mut self, pitch: u8, velocity: f32, knobs: &PianoKnobs) {
+    fn strike_full(&mut self, pitch: u8, velocity: f32, knobs: &PianoKnobs, base: &PianoBase) {
         // `k` is the MIDI key number a few lines down and has been since this
         // file was written; the knobs are `knobs`.
         let spread = knobs.unison;
@@ -310,7 +432,7 @@ impl PianoVoice {
         // shape across the keyboard is the grand's, and the knob says how
         // stiff this instrument's wire is. Clamped where the all-pass fit
         // stops being a fit.
-        let b = (b * knobs.stretch).clamp(1.0e-6, 8.0e-3);
+        let b = (b * knobs.stretch * base.stiff).clamp(1.0e-6, 8.0e-3);
 
         // Decay, as two designed numbers instead of one guessed coefficient.
         // The fundamental's t60 runs from ~18 s at A0 down to about a second
@@ -327,9 +449,12 @@ impl PianoVoice {
         // this instrument rings. BRILLIANCE is the reference partial's share
         // of that — the tuned 0.28 at centre.
         let t60_f = (18.0 * (-(k - 21.0) / 30.0).exp()).clamp(1.0, 18.0);
-        let t60_f = (t60_f * knobs.decay).clamp(0.12, 60.0);
+        let t60_f = (t60_f * knobs.decay * base.t60).clamp(0.12, 60.0);
         let f_hi = (6.0 * f0).min(0.40 * self.rate);
-        let t60_h = (t60_f * knobs.brilliance).max(0.05).min(t60_f);
+        // The knob carries the JAZZ centre baked in by `from_params`; the
+        // base re-centres it without moving the knob's travel.
+        let brill = knobs.brilliance * (base.brill / PianoBase::JAZZ.brill);
+        let t60_h = (t60_f * brill.clamp(0.05, 0.9)).max(0.05).min(t60_f);
         let w1 = std::f32::consts::TAU * f0 / self.rate;
         let w2 = std::f32::consts::TAU * f_hi / self.rate;
         // Per-pass magnitudes: the loop is traversed f0 times a second, so
@@ -364,10 +489,19 @@ impl PianoVoice {
         // wanders instead of sitting still. Only the delay LINE detunes; the
         // filters' phase delay is common to all three.
         const CENTS: [f32; UNISON] = [0.0, 0.9, -1.1];
+        // **The double decay.** A real unison's strings do not die together:
+        // the coupled motion sheds energy into the bridge fast at first, and
+        // what survives is the slow anti-phase tail — the prompt sound and
+        // the aftersound. Uncoupled strings cannot do the physics, but giving
+        // the off-strings shorter lives makes the SUM do the same thing: the
+        // ensemble drops quickly while all three speak, then rides string one
+        // out. Scaling the per-pass magnitude by rho1^(1/m - 1) scales that
+        // string's whole t60 curve by m without touching its spectrum shape.
+        const PAIR_T60: [f32; UNISON] = [1.0, 0.84, 0.74];
         for (i, s) in self.strings.iter_mut().enumerate() {
             let det = 2.0_f32.powf(CENTS[i] * spread / 1200.0);
             s.len = (total / det - phase_delay).max(4.0);
-            s.gain = gain;
+            s.gain = (gain * rho1.powf(1.0 / PAIR_T60[i] - 1.0)).min(0.999_9);
             s.clear();
         }
 
@@ -417,8 +551,8 @@ impl PianoVoice {
         // mellow to 0.74x at full bright. The exponent form makes 0.5 land
         // on 1.0 EXACTLY, so the shipped default is the bench tuning to the
         // last bit and the knob cannot drift it.
-        let felt = 1.35_f32.powf(1.0 - 2.0 * voicing.clamp(0.0, 1.0));
-        let sigma_ms = (0.31 - 0.17 * v.powf(0.85)) * felt;
+        let felt = 1.35_f32.powf(1.0 - 2.0 * voicing.clamp(0.0, 1.0)) * base.felt;
+        let sigma_ms = (base.sigma_lo - base.sigma_span * v.powf(0.85)) * felt;
         let sigma_s = (sigma_ms * 0.001 * self.rate).max(1.0);
         // Truncated at 3.5 sigma each side, where the curve is 53 dB down;
         // the tap pair cancels the step that remains.
@@ -437,6 +571,11 @@ impl PianoVoice {
         // a decibel, and at 0.35 they peak 3 dB under it with the single-key
         // ceiling near -8 dBFS.
         self.pulse_amp = 0.35 * v.powf(1.35);
+        // The knock scales harder than the tone: leaning into a key is what
+        // makes the action audible, and a feathered note carries almost none.
+        // Heavier down the keyboard, where the hammers and the drop are big.
+        let bass = 1.0 + ((60.0 - k).max(0.0) / 60.0) * 0.8;
+        self.knock.kick(self.rate, base.knock * bass * 0.012 * v.powf(1.9));
         self.damp = 1.0;
         self.damp_to = 1.0;
         self.damp_secs = (DAMP_SECS * knobs.release).clamp(0.004, 1.5);
@@ -497,7 +636,9 @@ impl PianoVoice {
         // milliseconds to stop a string and a hard cut sounds like an edit.
         let coeff = 1.0 - (-1.0 / (self.damp_secs * self.rate)).exp();
         self.damp += (self.damp_to - self.damp) * coeff;
-        let out = sum * self.damp;
+        // The knock rides OUTSIDE the damper: wood does not care whether the
+        // dampers are down, and a staccato note keeps its thud.
+        let out = sum * self.damp + self.knock.tick();
 
         let a = out.abs();
         self.env += (a - self.env) * if a > self.env { 0.4 } else { 0.0006 };
@@ -506,6 +647,7 @@ impl PianoVoice {
             for s in &mut self.strings {
                 s.clear();
             }
+            self.knock.clear();
         }
         out
     }
@@ -572,10 +714,11 @@ impl Body {
 
     /// Drive the board and take its two outputs.
     pub fn tick(&mut self, drive: f32) -> (f32, f32) {
-        // The electric piano has no soundboard. Its pickup is electromagnetic
-        // and its body does nothing — which is exactly why a Rhodes taken dry
-        // is so dry.
-        if matches!(self.patch, Patch::EpMk1) {
+        // Only the pianos have a board. The electric instruments' pickups
+        // are electromagnetic or capacitive and their cases do nothing —
+        // which is exactly why a Rhodes taken dry is so dry, and why the
+        // clav and the reed piano get their character from an amp instead.
+        if !matches!(self.patch, Patch::Piano1 | Patch::Piano2) {
             return (0.0, 0.0);
         }
         // Sympathetic strings only answer when the dampers are off.

@@ -5,7 +5,8 @@
 //! measurable about a second after it is typed, which is the only way anyone
 //! has ever tuned an instrument model.
 //!
-//!   cargo run --release -- <piano|ep> <performance> <out.wav>
+//!   cargo run --release -- <patch> <performance> <out.wav>
+//!   patches: piano piano2 ep suitcase clav clavwah wurli wurli140
 
 // Relative to THIS FILE, which is how `#[path]` resolves: the bench lives
 // in tools/keysrig and reaches over to the one true copy of the DSP.
@@ -141,6 +142,17 @@ fn render(patch: Patch, score: &Score) -> (Vec<f32>, std::time::Duration) {
 
     let mut synth = Keys::new(RATE);
     synth.set_patch(patch);
+    // KEYSRIG_PARAMS="5=1.0,0=0.2" turns knobs without a UI: the bench's
+    // whole point is measuring what a knob does before anyone hears it.
+    if let Ok(spec) = std::env::var("KEYSRIG_PARAMS") {
+        for part in spec.split(',') {
+            if let Some((i, v)) = part.split_once('=') {
+                if let (Ok(i), Ok(v)) = (i.trim().parse::<usize>(), v.trim().parse::<f32>()) {
+                    synth.set_param(i, v);
+                }
+            }
+        }
+    }
 
     let total = ((score.len_secs() * RATE) as usize / BLOCK + 1) * BLOCK;
     let mut out = vec![0.0_f32; total * 2];
@@ -174,11 +186,28 @@ fn render(patch: Patch, score: &Score) -> (Vec<f32>, std::time::Duration) {
 /// ensemble's envelope is sculpted 15 dB either way by the unison's beat
 /// geometry (run `piano track` to watch it), which is the instrument being
 /// alive, not the loss design — and the t60 column exists to check the
-/// design. See `strike_spread` in string.rs.
-fn solo_string(pitch: u8, vel: f32, secs: f32) -> Vec<f32> {
+/// design. See `strike_spread` in string.rs. The base picks WHICH grand.
+fn solo_string(pitch: u8, vel: f32, secs: f32, base: &keys::string::PianoBase) -> Vec<f32> {
     let mut v = keys::string::PianoVoice::new(RATE);
-    v.strike_spread(pitch, vel, 0.0);
+    let mut k = keys::PianoKnobs::default();
+    k.unison = 0.0;
+    v.strike_based(pitch, vel, &k, base);
     (0..(secs * RATE) as usize).map(|_| v.tick()).collect()
+}
+
+/// The label, the inharmonicity scale, and the piano base (where one
+/// applies) for every patch the bench knows.
+fn patch_label(patch: Patch) -> &'static str {
+    match patch {
+        Patch::Piano1 => "Piano 1",
+        Patch::Piano2 => "Piano 2",
+        Patch::EpMk1 => "EP Mk.1",
+        Patch::EpSuitcase => "EP Suitcase",
+        Patch::Clav => "Clav",
+        Patch::ClavWah => "Clav Wah",
+        Patch::Wurli200 => "Wurli 200",
+        Patch::Wurli140 => "Wurli 140",
+    }
 }
 
 /// The strongest magnitude within 5% of `around` — how every partial probe
@@ -210,10 +239,7 @@ fn report_velocity(patch: Patch) {
     let (out, cpu) = render(patch, &score);
     println!(
         "\n  {} - velocity response on E4, 12 strikes",
-        match patch {
-            Patch::Piano1 => "Piano 1",
-            Patch::EpMk1 => "EP Mk.1",
-        }
+        patch_label(patch)
     );
     println!("  vel   peak dB   bell/f0    HF dB    asym");
     println!("  ---   -------   -------   ------   -----");
@@ -221,16 +247,27 @@ fn report_velocity(patch: Patch) {
     // Where the brightness lives, per mechanism: the bell partial on the tine,
     // the upper half of the series on the string.
     let bright: Vec<f32> = match patch {
-        Patch::EpMk1 => {
+        Patch::EpMk1 | Patch::EpSuitcase => {
             let b = (6.6_f32 - 0.030 * (64.0 - 28.0)).clamp(3.6, 6.8);
             vec![f0 * b, f0 * b * 1.62, f0 * b * 2.71]
         }
-        Patch::Piano1 => {
-            let bb = 2.0e-4 * 2.0_f32.powf((64.0 - 48.0) / 22.0);
+        Patch::Piano1 | Patch::Piano2 => {
+            let scale = if matches!(patch, Patch::Piano2) { 0.85 } else { 1.0 };
+            let bb = scale * 2.0e-4 * 2.0_f32.powf((64.0 - 48.0) / 22.0);
             (5..=10)
                 .map(|n| n as f32 * f0 * (1.0 + bb * (n * n) as f32).sqrt())
                 .collect()
         }
+        Patch::Clav | Patch::ClavWah => {
+            let bb = 1.2e-4 * 2.0_f32.powf((64.0 - 52.0) / 26.0);
+            (4..=10)
+                .map(|n| n as f32 * f0 * (1.0 + bb * (n * n) as f32).sqrt())
+                .collect()
+        }
+        // For the reed piano the brightness IS the growl: the plate's
+        // second and third harmonics, absent feathered, arriving with
+        // force. The bar's own overtones are colour, not the story.
+        Patch::Wurli200 | Patch::Wurli140 => vec![f0 * 2.0, f0 * 3.0],
     };
     let mut first_hf = 0.0_f32;
     for i in 0..12 {
@@ -289,27 +326,48 @@ fn report_partials(patch: Patch) {
     let bell = (6.6_f32 - 0.030 * (60.0 - 28.0)).clamp(3.6, 6.8);
     let ideal_of = |n: usize| -> f32 {
         match patch {
-            Patch::Piano1 => {
-                // B for C4 on the schedule in string.rs.
-                let b = 2.0e-4 * 2.0_f32.powf((60.0 - 48.0) / 22.0);
+            Patch::Piano1 | Patch::Piano2 => {
+                // B for C4 on the schedule in string.rs, scaled per base.
+                let scale = if matches!(patch, Patch::Piano2) { 0.85 } else { 1.0 };
+                let b = scale * 2.0e-4 * 2.0_f32.powf((60.0 - 48.0) / 22.0);
                 let n = n as f32;
                 n * f0 * (1.0 + b * n * n).sqrt()
             }
-            Patch::EpMk1 => {
+            Patch::EpMk1 | Patch::EpSuitcase => {
                 let r = [1.0, 2.0, 3.0, bell, bell * 1.62, bell * 2.71];
+                f0 * r.get(n - 1).copied().unwrap_or(n as f32)
+            }
+            Patch::Clav | Patch::ClavWah => {
+                let b = 1.2e-4 * 2.0_f32.powf((60.0 - 52.0) / 26.0);
+                let n = n as f32;
+                n * f0 * (1.0 + b * n * n).sqrt()
+            }
+            // The reed's bar modes, solder-dropped as reed.rs computes
+            // them at C4, then the plate's own harmonics of the
+            // fundamental — the growl products sit ON the series.
+            Patch::Wurli200 | Patch::Wurli140 => {
+                let drop = 1.0 - 0.06 * ((60.0_f32 - 33.0) / 40.0).clamp(0.0, 1.0);
+                let r = [1.0, 2.0, 3.0, 5.6 * drop, 14.6 * drop];
                 f0 * r.get(n - 1).copied().unwrap_or(n as f32)
             }
         }
     };
     let count = match patch {
-        Patch::Piano1 => 10,
-        Patch::EpMk1 => 6,
+        Patch::Piano1 | Patch::Piano2 => 10,
+        Patch::EpMk1 | Patch::EpSuitcase => 6,
+        Patch::Clav | Patch::ClavWah => 10,
+        Patch::Wurli200 | Patch::Wurli140 => 5,
     };
     // t60 source: one string, one strike, no unison, no body — the decay
     // DESIGN, cleanly. Everything else in the table is the full instrument.
     let solo = match patch {
-        Patch::Piano1 => solo_string(60, 90.0 / 127.0, 5.8),
-        Patch::EpMk1 => window(&out, 0.02, 5.8),
+        Patch::Piano1 => {
+            solo_string(60, 90.0 / 127.0, 5.8, &keys::string::PianoBase::JAZZ)
+        }
+        Patch::Piano2 => {
+            solo_string(60, 90.0 / 127.0, 5.8, &keys::string::PianoBase::CONCERT)
+        }
+        _ => window(&out, 0.02, 5.8),
     };
     println!("\n  partials of C4 (f0 = {f0:.2} Hz)");
     println!("  n     ideal Hz   found Hz   cents   level dB    t60");
@@ -352,7 +410,7 @@ fn report_partials(patch: Patch) {
     // the strike position and the 9th and 10th decay in well under a second,
     // so a 2 s window integrates them into the floor. Measure the attack
     // instead, so "not found" above can be told apart from "never injected".
-    if matches!(patch, Patch::Piano1) {
+    if matches!(patch, Patch::Piano1 | Patch::Piano2) {
         let atk = window(&out, 0.02, 0.30);
         let rel = analyze::goertzel_hann(&atk, f0, RATE).max(1e-12);
         print!("  attack, first 300 ms, dB re f0:");
@@ -368,6 +426,12 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let patch = match args.get(1).map(String::as_str) {
         Some("ep") => Patch::EpMk1,
+        Some("suitcase") => Patch::EpSuitcase,
+        Some("piano2") => Patch::Piano2,
+        Some("clav") => Patch::Clav,
+        Some("clavwah") => Patch::ClavWah,
+        Some("wurli") => Patch::Wurli200,
+        Some("wurli140") => Patch::Wurli140,
         _ => Patch::Piano1,
     };
     let perf = args.get(2).cloned().unwrap_or_else(|| "single".into());
