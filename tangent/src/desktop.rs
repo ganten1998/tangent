@@ -6119,6 +6119,16 @@ impl DesktopApp {
 
     /// Copy the live plugin-state sidecars INTO the project, so the folder
     /// carries its instruments' knobs as well as their names.
+    ///
+    /// A full mirror and not "copy what is occupied": the project's shelf has
+    /// to LOSE the sidecar of a seat whose plugin was removed since the last
+    /// save, or opening that project again hands the file to whatever sits
+    /// there next. [`mirror_sidecars`] is where the whole of that reasoning
+    /// lives, in both directions.
+    ///
+    /// EVERY seat, too - the master's second rack and the folder-extra seats
+    /// were both invisible to the old STRIPS+1+DRUM_PADS bound, so a project
+    /// carried neither. See the seat-space doc in recorder.rs.
     fn copy_states_to_project(&self) {
         let Some(dir) = self.project_state_dir() else {
             return;
@@ -6131,20 +6141,7 @@ impl DesktopApp {
             return;
         }
         let _ = std::fs::create_dir_all(&dir);
-        // EVERY seat - the master's second rack and the folder-extra seats
-        // were both invisible to the old STRIPS+1+DRUM_PADS bound, so a
-        // project carried neither. See the seat-space doc in recorder.rs.
-        for strip in 0..tangent_ui::recorder::TOTAL_SEATS {
-            for bay in 0..tangent_ui::recorder::INSERTS {
-                let global = insert_state_path(strip, bay);
-                let mine = dir.join(format!("insert-state-{strip}-{bay}.bin"));
-                if global.is_file() {
-                    let _ = std::fs::copy(&global, &mine);
-                } else {
-                    let _ = std::fs::remove_file(&mine);
-                }
-            }
-        }
+        mirror_sidecars(&global_state_dir(), &dir);
     }
 
     /// Bring a project's plugin states OUT to the live sidecars. A bay the
@@ -6159,18 +6156,13 @@ impl DesktopApp {
 
     /// The same copy, from ANY shelf - the template's, at launch and New,
     /// where the session has no folder yet and must not grow one.
+    ///
+    /// A shelf that does not exist is not nothing: it mirrors an EMPTY shelf,
+    /// which clears every live sidecar. That is the behaviour New depends on -
+    /// a template with no `state/` folder is a session that starts with every
+    /// plugin at its defaults.
     fn copy_states_from_shelf(&self, dir: &std::path::Path) {
-        for strip in 0..tangent_ui::recorder::TOTAL_SEATS {
-            for bay in 0..tangent_ui::recorder::INSERTS {
-                let global = insert_state_path(strip, bay);
-                let mine = dir.join(format!("insert-state-{strip}-{bay}.bin"));
-                if mine.is_file() {
-                    let _ = std::fs::copy(&mine, &global);
-                } else {
-                    let _ = std::fs::remove_file(&global);
-                }
-            }
-        }
+        mirror_sidecars(dir, &global_state_dir());
     }
 
     /// **Clear the Untitled litter** - every stray scratch that provably
@@ -7893,7 +7885,7 @@ fn permute_insert_states_in(dir: Option<std::path::PathBuf>, order: &[usize]) {
     let Some(dir) = dir else {
         return;
     };
-    let name = |strip: usize, bay: usize| dir.join(format!("insert-state-{strip}-{bay}.bin"));
+    let name = |strip: usize, bay: usize| dir.join(sidecar_name(strip, bay));
     let bays = tangent_ui::recorder::INSERTS;
     // **Only the rows that MOVED.** A row whose files are already where they
     // belong is read and written back byte for byte otherwise, and a plugin
@@ -7942,11 +7934,115 @@ fn permute_insert_states_in(dir: Option<std::path::PathBuf>, order: &[usize]) {
 }
 
 fn insert_state_path(strip: usize, bay: usize) -> std::path::PathBuf {
-    let dir = Settings::path()
+    global_state_dir().join(sidecar_name(strip, bay))
+}
+
+/// The LIVE sidecar shelf: the config folder beside `settings.json`, where a
+/// plugin's knobs sit while the app is running.
+fn global_state_dir() -> std::path::PathBuf {
+    Settings::path()
         .parent()
         .map(std::path::Path::to_path_buf)
-        .unwrap_or_default();
-    dir.join(format!("insert-state-{strip}-{bay}.bin"))
+        .unwrap_or_default()
+}
+
+/// What a sidecar's name begins with. Spelled once and read back by
+/// [`sidecar_seat_bay`]: a writer and a reader that disagree about the
+/// spelling would mirror nothing at all and say nothing about it.
+const SIDECAR_PREFIX: &str = "insert-state-";
+
+/// What one seat's sidecar is called.
+fn sidecar_name(strip: usize, bay: usize) -> String {
+    format!("{SIDECAR_PREFIX}{strip}-{bay}.bin")
+}
+
+/// The `(seat, bay)` a filename names, or `None` for anything that is not one
+/// of ours — the settings file lives in the same folder.
+///
+/// Bounded by TODAY's seat space on purpose. The per-seat walk this replaced
+/// looped `0..TOTAL_SEATS` by `0..INSERTS`, so a file named for a seat only a
+/// bigger build ever had was neither copied nor deleted, and that is what
+/// makes a downgrade survivable: the space has grown four times and each
+/// shuffle renames into the numbers of its own era. The name must round-trip
+/// exactly, so nothing but a name this build would itself write is acted on.
+fn sidecar_seat_bay(name: &str) -> Option<(usize, usize)> {
+    let (seat, bay) = name.strip_prefix(SIDECAR_PREFIX)?.strip_suffix(".bin")?.split_once('-')?;
+    let (seat, bay) = (seat.parse().ok()?, bay.parse().ok()?);
+    (seat < tangent_ui::recorder::TOTAL_SEATS
+        && bay < tangent_ui::recorder::INSERTS
+        && sidecar_name(seat, bay) == name)
+        .then_some((seat, bay))
+}
+
+/// Which seats a shelf actually holds a sidecar for: ONE directory read.
+fn shelf_sidecars(dir: &std::path::Path) -> std::collections::BTreeSet<(usize, usize)> {
+    sidecar_fs_call();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return std::collections::BTreeSet::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name();
+            let seat = sidecar_seat_bay(name.to_str()?)?;
+            // `is_file` and not the dirent's own type, because the walk this
+            // replaced asked `Path::is_file` and that follows a symlink.
+            sidecar_fs_call();
+            dir.join(&name).is_file().then_some(seat)
+        })
+        .collect()
+}
+
+/// Counted so the shelf walk's cost is a NUMBER rather than a thing to reason
+/// about — `sidecar_walk_probe` prints it and
+/// `a_two_seat_project_does_not_walk_the_whole_seat_space` asserts on it.
+/// Empty outside tests.
+#[cfg(test)]
+static SIDECAR_FS_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[inline]
+fn sidecar_fs_call() {
+    #[cfg(test)]
+    SIDECAR_FS_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// **Mirror one shelf of insert-state sidecars onto another.** Every state
+/// `from` holds lands in `to`; every state `to` holds that `from` does not is
+/// REMOVED, because a stale sidecar is the last session's reverb tail arriving
+/// in this session's fresh plugin.
+///
+/// **Two directory reads, not `INSERT_SPACE` stats.** This asked the seat
+/// space — all 13,167 seat/bay pairs of it — whether each had a file, and
+/// then asked the filesystem to delete the four thousand-odd it did not, on
+/// both shelves, twice per project open: 52,668 filesystem calls to move the
+/// two files a session actually has. Measured at 35ms a mirror on a local
+/// disk in `what_the_shelf_walk_costs_at_project_open`, and a project folder
+/// is very often the one place a person keeps in Dropbox, where every one of
+/// those calls is a round trip through a file provider.
+///
+/// **Occupancy is the wrong key, and in BOTH directions.** `Drop for Engine`
+/// skips the empty seats because an empty seat has no instance to retire, and
+/// the temptation here is to copy that. It does not hold: the seat that
+/// matters most to a mirror is the one that has just BECOME empty, whose
+/// sidecar is still sitting in the destination and must be deleted — going
+/// out to a project (a plugin removed since the last save) exactly as much as
+/// coming back in (a project whose bay is empty must clear the live sidecar
+/// the last session left). What the walk is really asking is which sidecars
+/// EXIST, and the shelf itself answers that in one read.
+fn mirror_sidecars(from: &std::path::Path, to: &std::path::Path) {
+    // BOTH read before either is written, so the second read is of the shelf
+    // as it arrived rather than of the copies just made — the same answer
+    // either way, but only one of the two is obvious a year from now.
+    let (src, dst) = (shelf_sidecars(from), shelf_sidecars(to));
+    for &(seat, bay) in &src {
+        let name = sidecar_name(seat, bay);
+        sidecar_fs_call();
+        let _ = std::fs::copy(from.join(&name), to.join(&name));
+    }
+    for &(seat, bay) in dst.difference(&src) {
+        sidecar_fs_call();
+        let _ = std::fs::remove_file(to.join(sidecar_name(seat, bay)));
+    }
 }
 
 /// The preset drawer drum KITS live in, under `Presets/`. Kits keep their
@@ -10734,5 +10830,387 @@ mod tests {
         );
         assert!(rows.iter().all(|r| (r.seconds - 0.5).abs() < 0.01));
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// What a project open pays the filesystem
+// ───────────────────────────────────────────────────────────────────────────
+
+#[cfg(all(test, feature = "recorder"))]
+mod sidecar_walk_probe {
+    use super::*;
+    use tangent_ui::recorder::{INSERTS, INSERT_SPACE, TOTAL_SEATS};
+
+    /// **`IVORY_SETTINGS_PATH` and `SIDECAR_FS_CALLS` are both process-global,
+    /// and tests are not.** Same reason and same shape as `SETTINGS_PATH_ENV`
+    /// in `settings.rs`: cargo runs these on parallel threads in ONE process,
+    /// so a count read here would otherwise include another test's walk, and a
+    /// settings path set here would be taken away under it.
+    static SIDECAR_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A throwaway folder. `IVORY_PROBE_DIR` moves it onto whatever volume the
+    /// question is about — the shelf that matters is a PROJECT folder, and a
+    /// project folder is very often the one place a person keeps in Dropbox,
+    /// where a stat is a round trip through a file provider rather than a hit
+    /// in the local disk's cache.
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let root = std::env::var_os("IVORY_PROBE_DIR")
+            .map_or_else(std::env::temp_dir, std::path::PathBuf::from);
+        let dir = root.join(format!(
+            "tangent-sidecar-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        dir
+    }
+
+    /// A shelf with two seats occupied — one at the bottom of the seat space
+    /// and one at the very top, so a walk that merely stops early cannot pass
+    /// for a walk that never started.
+    fn two_seat_shelf(dir: &std::path::Path) -> [(usize, usize); 2] {
+        let seats = [(0usize, 0usize), (TOTAL_SEATS - 1, INSERTS - 1)];
+        for (seat, bay) in seats {
+            std::fs::write(dir.join(sidecar_name(seat, bay)), b"knobs").expect("seed");
+        }
+        seats
+    }
+
+    fn fs_calls<T>(f: impl FnOnce() -> T) -> (T, usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let before = SIDECAR_FS_CALLS.load(Relaxed);
+        let out = f();
+        (out, SIDECAR_FS_CALLS.load(Relaxed) - before)
+    }
+
+    /// **A two-seat session must not pay for four thousand empty ones.**
+    ///
+    /// Opening a project mirrors the shelf twice — the outgoing session's
+    /// states out to its folder, the incoming one's back in — and the per-seat
+    /// walk charged two filesystem calls for every one of `INSERT_SPACE`'s
+    /// seat/bay pairs whether or not anything had ever sat there. On a Dropbox
+    /// or network volume that is the difference between an open and a freeze,
+    /// which is why the bound is asserted rather than admired.
+    #[test]
+    fn a_two_seat_project_does_not_walk_the_whole_seat_space() {
+        let _lock = SIDECAR_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let from = scratch("bound-from");
+        let to = scratch("bound-to");
+        let seats = two_seat_shelf(&from);
+
+        let ((), calls) = fs_calls(|| mirror_sidecars(&from, &to));
+
+        // The work itself still happened.
+        for (seat, bay) in seats {
+            assert!(
+                to.join(sidecar_name(seat, bay)).is_file(),
+                "seat {seat} bay {bay} did not arrive"
+            );
+        }
+        // Generous on purpose: the point is the ORDER of magnitude, not a
+        // number that has to be edited whenever a directory read grows an
+        // extra stat. What must never come back is a cost that scales with
+        // the seat space.
+        assert!(
+            calls < 64,
+            "a two-seat mirror made {calls} filesystem calls; the per-seat walk \
+             made {} and that is the thing this stops",
+            INSERT_SPACE * 2
+        );
+        let _ = std::fs::remove_dir_all(&from);
+        let _ = std::fs::remove_dir_all(&to);
+    }
+
+    /// **The correctness the shortcut must not buy its speed with.**
+    ///
+    /// A seat that HELD a plugin last save and is empty now still has a
+    /// sidecar sitting in the destination shelf, and it has to go: left there
+    /// it is handed to whatever lands in that seat next, which is the "last
+    /// session's reverb tail in this session's fresh plugin" the mirror exists
+    /// to prevent. "Skip the empty seats" is exactly the shortcut that would
+    /// break this, in BOTH directions — hence keying on what the two shelves
+    /// actually hold rather than on what the desk says is occupied.
+    #[test]
+    fn a_seat_that_became_empty_loses_its_sidecar() {
+        let _lock = SIDECAR_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let from = scratch("stale-from");
+        let to = scratch("stale-to");
+        two_seat_shelf(&from);
+        // The destination remembers a seat the source has since given up,
+        // and one it still holds with different bytes.
+        let gone = to.join(sidecar_name(7, 1));
+        std::fs::write(&gone, b"last week's reverb").expect("seed");
+        std::fs::write(to.join(sidecar_name(0, 0)), b"stale").expect("seed");
+
+        mirror_sidecars(&from, &to);
+
+        assert!(!gone.exists(), "a sidecar for a now-empty seat survived");
+        assert_eq!(
+            std::fs::read(to.join(sidecar_name(0, 0))).expect("read"),
+            b"knobs",
+            "an occupied seat's sidecar was not overwritten"
+        );
+        let _ = std::fs::remove_dir_all(&from);
+        let _ = std::fs::remove_dir_all(&to);
+    }
+
+    /// **A sidecar from outside today's seat space is left exactly alone.**
+    ///
+    /// The per-seat walk was bounded by `TOTAL_SEATS`/`INSERTS`, so a file
+    /// named for a seat only a bigger build ever had was neither copied nor
+    /// deleted. That is what makes a downgrade survivable — the seat space has
+    /// grown four times and each shuffle renames into the numbers of its own
+    /// era — so the bound is behaviour, not an accident of the loop. The
+    /// settings file shares this folder, which is the other reason a shelf
+    /// read cannot simply take everything it finds.
+    #[test]
+    fn a_sidecar_from_another_era_is_neither_copied_nor_deleted() {
+        let _lock = SIDECAR_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let from = scratch("era-from");
+        let to = scratch("era-to");
+        two_seat_shelf(&from);
+        let far_out = sidecar_name(TOTAL_SEATS + 9, 0);
+        let too_many_bays = sidecar_name(0, INSERTS + 1);
+        std::fs::write(from.join(&far_out), b"tomorrow").expect("seed");
+        std::fs::write(to.join(&too_many_bays), b"yesterday").expect("seed");
+        std::fs::write(to.join("settings.json"), b"{}").expect("seed");
+
+        mirror_sidecars(&from, &to);
+
+        assert!(!to.join(&far_out).exists(), "an out-of-range seat was copied");
+        assert!(
+            to.join(&too_many_bays).exists(),
+            "an out-of-range bay's sidecar was deleted"
+        );
+        assert!(to.join("settings.json").exists(), "the settings file was eaten");
+        let _ = std::fs::remove_dir_all(&from);
+        let _ = std::fs::remove_dir_all(&to);
+    }
+
+    /// **The mirror as it was, kept as the yardstick.** A shelf walk that asks
+    /// the SEAT SPACE which seats have files, rather than asking the shelf.
+    /// Deliberately frozen: it is the shape the numbers in `mirror_sidecars`'s
+    /// doc were measured against, and it is here so the comparison can be
+    /// re-run on any machine and any volume instead of taken on trust.
+    fn per_seat_mirror(from: &std::path::Path, to: &std::path::Path) {
+        for strip in 0..TOTAL_SEATS {
+            for bay in 0..INSERTS {
+                let src = from.join(sidecar_name(strip, bay));
+                let dst = to.join(sidecar_name(strip, bay));
+                sidecar_fs_call();
+                sidecar_fs_call();
+                if src.is_file() {
+                    let _ = std::fs::copy(&src, &dst);
+                } else {
+                    let _ = std::fs::remove_file(&dst);
+                }
+            }
+        }
+    }
+
+    /// Throwaway probe: what does one shelf mirror cost, in filesystem calls
+    /// and in wall clock, on a session with two plugins in it — the walk as it
+    /// was against the walk as it is? Ignored by default; run with `--ignored
+    /// --nocapture`.
+    ///
+    /// A LOCAL disk, so these are the floor. The shelf that moves is a project
+    /// folder, and a project folder is very often the one place a person keeps
+    /// in Dropbox, where each of those calls is a round trip through a file
+    /// provider.
+    #[test]
+    #[ignore]
+    fn what_the_shelf_walk_costs_at_project_open() {
+        let _lock = SIDECAR_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let from = scratch("probe-from");
+        let to = scratch("probe-to");
+        two_seat_shelf(&from);
+        // A warm pass each, so neither number is a cold directory cache.
+        per_seat_mirror(&from, &to);
+        mirror_sidecars(&from, &to);
+
+        let t = std::time::Instant::now();
+        let ((), was_calls) = fs_calls(|| per_seat_mirror(&from, &to));
+        let was = t.elapsed();
+        let t = std::time::Instant::now();
+        let ((), calls) = fs_calls(|| mirror_sidecars(&from, &to));
+        let one = t.elapsed();
+        println!(
+            "{TOTAL_SEATS} seats x {INSERTS} bays = {INSERT_SPACE} seat/bays, 2 occupied\n  \
+             per-seat walk = {was_calls} filesystem calls, {was:?} ({:.1}% of a 16.6ms frame)\n  \
+             shelf read    = {calls} filesystem calls, {one:?} ({:.1}% of a 16.6ms frame)\n  \
+             a project open runs two mirrors: {was_calls_2} calls / {:?} before, \
+             {calls_2} calls / {:?} after",
+            was.as_secs_f64() / 0.0166 * 100.0,
+            one.as_secs_f64() / 0.0166 * 100.0,
+            was * 2,
+            one * 2,
+            was_calls_2 = was_calls * 2,
+            calls_2 = calls * 2,
+        );
+        let _ = std::fs::remove_dir_all(&from);
+        let _ = std::fs::remove_dir_all(&to);
+    }
+
+    /// Throwaway probe: the per-frame insert reconcile scans every seat/bay
+    /// looking for the one that changed. What does the scan cost when nothing
+    /// has? Ignored by default; run with `--ignored --nocapture`.
+    ///
+    /// **Answered, and the answer was "leave it alone".** 13,167 seat/bays is
+    /// a long walk and it happens every frame, but it is a `Vec` index and an
+    /// `Option` compare: 6-17µs on an M-series mac in the RELEASE profile —
+    /// under a tenth of one percent of a frame — against 220-380µs in the
+    /// debug profile this suite otherwise runs in, which is the trap. A
+    /// generation counter or a dirty set would buy that tenth of a percent for
+    /// a second copy of the truth about which bay holds what, which is the
+    /// kind of trade that goes wrong quietly. Measure before believing
+    /// otherwise, and measure in `--release`.
+    ///
+    /// A replica rather than the real call, for the reason
+    /// `a_restarted_engine_is_told_the_tempo_map_again` gives: `DesktopApp`
+    /// owns devices, a window and an engine and cannot be built in a test.
+    /// The two arrays and the comparison are the reconcile's, copied.
+    #[test]
+    #[ignore]
+    fn what_the_insert_reconcile_scans_every_frame() {
+        let mut wanted: Vec<String> = vec![String::new(); INSERT_SPACE];
+        let mut loaded: Vec<Option<String>> = vec![None; INSERT_SPACE];
+        // A plausible desk: eight channels with an effect in bay 0, the
+        // master with two, all of them already loaded — the settled state,
+        // which is the state the app is in for all but a handful of frames.
+        for i in [0usize, 3, 6, 9, 12, 15, 18, 21, 105, 106] {
+            wanted[i] = "/plugins/thing.vst3".to_owned();
+            loaded[i] = Some("/plugins/thing.vst3".to_owned());
+        }
+        let want_at = |i: usize| -> Option<String> {
+            wanted
+                .get(i)
+                .map(String::as_str)
+                .filter(|p| !p.is_empty())
+                .map(str::to_owned)
+        };
+        let t = std::time::Instant::now();
+        let n = 60;
+        let mut hits = 0usize;
+        for _ in 0..n {
+            hits += usize::from((0..loaded.len()).any(|i| want_at(i) != loaded[i]));
+        }
+        let per = t.elapsed() / n;
+        println!(
+            "reconcile scan over {INSERT_SPACE} seat/bays, settled ({hits} mismatches) = {per:?} \
+             per frame, {:.2}% of a 16.6ms frame",
+            per.as_secs_f64() / 0.0166 * 100.0
+        );
+    }
+
+    /// **The one-launch shuffles are gated, and the gate is the only way in.**
+    ///
+    /// The survey said the v20 walk runs at every launch. It does not: each
+    /// `shift_insert_states_for_*` sits inside `if me.app.take_*()`, the take
+    /// is a `mem::take` of a flag `Settings` raises only while parsing a file
+    /// from the era before the shift, and `settings.rs` already pins that a
+    /// file of today's era does not raise it. A source scan, because the
+    /// shuffles run inside `DesktopApp::new` and that cannot be built in a
+    /// test — the precedent is `a_restarted_engine_is_told_the_tempo_map_again`
+    /// above. What it stops is somebody "simplifying" the call out of its `if`
+    /// and handing every launch six thousand `exists()` calls.
+    #[test]
+    fn every_one_launch_shuffle_is_reached_only_through_its_own_taken_flag() {
+        let whole = include_str!("desktop.rs");
+        // Everything above this module, because the table below spells the
+        // call sites out and would otherwise find itself.
+        let src = &whole[..whole.find("mod sidecar_walk_probe").expect("this module")];
+        for (call, gate) in [
+            ("shift_insert_states_for_v13();", "take_desk_state_shift()"),
+            ("shift_insert_states_for_v14();", "take_desk_state_shift_v14()"),
+            ("shift_insert_states_for_v18();", "take_pad_state_shift_v18()"),
+            ("shift_insert_states_for_v19();", "take_desk_state_shift_v19()"),
+            ("shift_insert_states_for_v20();", "take_desk_state_shift_v20()"),
+        ] {
+            let at = src.find(call).unwrap_or_else(|| panic!("{call} is gone"));
+            // Exactly one call site, or the gate below only covers one of them.
+            assert!(
+                !src[at + call.len()..].contains(call),
+                "{call} is called twice; the gate only covers the first"
+            );
+            let before = &src[at.saturating_sub(200)..at];
+            assert!(
+                before.contains(&format!("if me.app.{gate} {{")),
+                "{call} is not immediately inside `if me.app.{gate}`, so its \
+                 walk across the whole seat space runs on every launch"
+            );
+        }
+    }
+
+    /// **A project written before the seat space grew still loads.** The v20
+    /// shuffle steps every sidecar at or above the old channel block up by the
+    /// growth, and the whole point is that the plugin whose knobs are in it
+    /// finds them again at its new seat.
+    #[test]
+    fn the_v20_shuffle_lands_a_sixteen_channel_sidecar_at_its_new_seat() {
+        let _lock = SIDECAR_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("v20");
+        let path = dir.join("settings.json");
+        // SAFETY: `SIDECAR_ENV` above is what makes this single-threaded.
+        unsafe { std::env::set_var("IVORY_SETTINGS_PATH", &path) };
+
+        let grow = tangent_ui::recorder::CHANNELS - 16;
+        // The sixteen-channel era's master (19), its first pad (20), and the
+        // last seat that era had (2068).
+        let movers = [(19usize, 0usize), (20, 2), (2068, 1)];
+        for (seat, bay) in movers {
+            std::fs::write(insert_state_path(seat, bay), format!("{seat}-{bay}")).expect("seed");
+        }
+        std::fs::write(insert_state_path(3, 0), b"stays").expect("seed");
+
+        shift_insert_states_for_v20();
+
+        for (seat, bay) in movers {
+            assert!(
+                !insert_state_path(seat, bay).exists(),
+                "seat {seat} bay {bay} was left behind at its old number"
+            );
+            assert_eq!(
+                std::fs::read(insert_state_path(seat + grow, bay)).expect("moved"),
+                format!("{seat}-{bay}").into_bytes(),
+                "seat {seat} bay {bay} did not arrive at {}",
+                seat + grow
+            );
+        }
+        assert_eq!(
+            std::fs::read(insert_state_path(3, 0)).expect("stayed"),
+            b"stays",
+            "a seat below the old channel block was moved"
+        );
+        // SAFETY: still under `SIDECAR_ENV`.
+        unsafe { std::env::remove_var("IVORY_SETTINGS_PATH") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Throwaway probe: what the one-launch v20 shuffle costs WHEN IT RUNS,
+    /// which is once ever. Ignored by default; run with `--ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore]
+    fn what_the_one_launch_shuffle_costs() {
+        let _lock = SIDECAR_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("v20-probe");
+        let path = dir.join("settings.json");
+        // SAFETY: `SIDECAR_ENV` above is what makes this single-threaded.
+        unsafe { std::env::set_var("IVORY_SETTINGS_PATH", &path) };
+        let t = std::time::Instant::now();
+        shift_insert_states_for_v20();
+        let one = t.elapsed();
+        // SAFETY: still under `SIDECAR_ENV`.
+        unsafe { std::env::remove_var("IVORY_SETTINGS_PATH") };
+        println!(
+            "v20 shuffle over an empty shelf = {} exists() calls, {one:?}\n  \
+             gated: it runs on the ONE launch that crosses the shift, and \
+             `every_one_launch_shuffle_is_reached_only_through_its_own_taken_flag` \
+             is what keeps it that way",
+            3 * (2069 - 16)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
