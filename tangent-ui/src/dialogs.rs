@@ -3417,6 +3417,17 @@ fn show_dialog_viewport(
         takes_focus: true,
         raise: placement.raise,
         modal: !plugin,
+        // **A question comes forward over everything of ours, including the
+        // render window.** `handle_main_interaction` drops every event on the
+        // main window while a modal dialog is open, so a question that ends
+        // up underneath something is an app frozen with nothing on screen
+        // saying why. A plugin window asks nothing and is left on the
+        // ordinary rung, where the export window may hold it down.
+        tier: if plugin {
+            crate::shell::SurfaceTier::Ordinary
+        } else {
+            crate::shell::SurfaceTier::Asking
+        },
         // Down for as long as the OS's own panel is up. See `on_top`.
         on_top: !placement.native_panel_up,
         // Without this a tiling WM (i3, sway) TILES the dialog — it opens as
@@ -3456,6 +3467,22 @@ fn show_dialog_viewport(
 /// presses never reach the main window's input at all.
 pub fn pointer_over_dialog(ctx: &egui::Context) -> bool {
     crate::shell::inline_rect(ctx, DIALOG_ID)
+        .zip(ctx.pointer_interact_pos())
+        .is_some_and(|(r, p)| r.contains(p))
+}
+
+/// The same question about the EXPORT window, which is not a dialog and so
+/// is not covered by [`pointer_over_dialog`].
+///
+/// `shell::surface` makes every inline surface swallow what lands on it, so
+/// every widget in the app is already shielded. This is the other half, for
+/// the handlers that read `i.pointer` straight off the input and see through
+/// any layer there has ever been — the piano's own note press is one, and
+/// the recorder band's hit test is another. On the desktop the export window
+/// is a window of its own and its presses never reach the main window at
+/// all, so this is false there, which is the honest answer.
+pub fn pointer_over_export(ctx: &egui::Context) -> bool {
+    crate::shell::inline_rect(ctx, EXPORT_ID)
         .zip(ctx.pointer_interact_pos())
         .is_some_and(|(r, p)| r.contains(p))
 }
@@ -3536,21 +3563,15 @@ const EXPORT_MAX: Vec2 = Vec2::new(1200.0, 620.0);
 ///
 /// `monitor` is whatever [`Placement`] was handed: the screen on the
 /// desktop, the plugin editor's own canvas inline, and the same share is
-/// the right answer to both. With nothing known it falls back to the floor,
-/// because a guess about a screen that has never been measured is worse
-/// than the smallest size the layout is designed for.
+/// the right answer to both.
+///
+/// The rule itself is [`crate::shell::share_of_screen`] and lives there
+/// rather than here: a share of the display with a floor, a ceiling and a
+/// last clamp inside the screen is what every window of this app wants, and
+/// it was written out twice before anybody noticed. This function is now
+/// only the export window's four numbers.
 pub fn export_window_size(monitor: Option<Vec2>) -> Vec2 {
-    let Some(m) = monitor.filter(|m| m.x > 0.0 && m.y > 0.0) else {
-        return EXPORT_MIN;
-    };
-    let want = Vec2::new(
-        (m.x * EXPORT_SHARE.x).clamp(EXPORT_MIN.x, EXPORT_MAX.x),
-        (m.y * EXPORT_SHARE.y).clamp(EXPORT_MIN.y, EXPORT_MAX.y),
-    );
-    // The floor can outgrow a small display, and a window bigger than the
-    // screen it opens on is the bug the 5.0 demo session found in the main
-    // window. Same clamp, same reason.
-    crate::settings::clamp_size_to_monitor(want, Some(m))
+    crate::shell::share_of_screen(monitor, EXPORT_SHARE, EXPORT_MIN, EXPORT_MAX)
 }
 
 /// The smallest the window may be dragged to, which is the floor — except
@@ -3603,6 +3624,15 @@ impl ExportLayout {
 /// goes to the waveform, and the label and the bar stay the size a label
 /// and a bar should be. Each part is floored at nothing so a window
 /// squeezed under its own minimum degrades instead of inverting.
+///
+/// **What that is worth, in points.** The wave was a hard-coded 96 in a 520
+/// by 210 window. It is 222 at [`EXPORT_MIN`], 242 on a 1280 by 800 laptop,
+/// 482 on the owner's 2560 by 1400 reference display, and 542 at
+/// [`EXPORT_MAX`] — which needs 1550 points of screen height, so 542 is the
+/// CEILING's number and not the reference display's. The commit that shipped
+/// this window quoted 542 for the reference display, which is where those
+/// two got crossed; `the_export_window_is_a_share_of_the_screen_between_a_
+/// floor_and_a_ceiling` now asserts all four.
 pub fn export_layout(rect: Rect) -> ExportLayout {
     let inner = rect.shrink(EXPORT_PAD);
     let w = inner.width().max(0.0);
@@ -3628,44 +3658,34 @@ pub fn export_layout(rect: Rect) -> ExportLayout {
 ///
 /// `#E83A4E` has a relative luminance of 0.207 — inside the 0.12–0.22 dead
 /// zone this app has learned about from a screenshot seven times, the band
-/// where neither ink wins. Measured across the nineteen themes it comes out
-/// under 3:1 on five of the thirty-eight dressings and as low as 2.43:1 on
-/// Sandstone's pale well: a red line on a cream ground that the eye has to
-/// hunt for. That was survivable while the wave was 96 points tall in the
-/// corner of a small window. It is not now that the wave IS the window.
+/// where neither ink wins. The sweep dresses nineteen factory themes in two
+/// modes against the two faces this window can read, which is seventy-six
+/// dressings, and the shipped red comes out under 3:1 on SEVEN of them: as
+/// low as 2.43:1 on Sandstone dark's pale well, and short on Default,
+/// Centennial and Porcelain too. A red line on a cream ground that the eye
+/// has to hunt for. That was survivable while the wave was 96 points tall in
+/// the corner of a small window. It is not now that the wave IS the window.
 ///
-/// So the red is walked toward whichever ink the well can carry until it
-/// clears 3:1 — the non-text floor, because this is a one-point MARKER and
-/// not a word, and dragging a line this thin to 4.5:1 would take the red
-/// out of the red. In practice the walk moves nothing on thirty-three of
-/// the thirty-eight and lands on `#C93546` at its furthest, so the playhead
-/// stays plainly red and is findable everywhere. Measured on the well,
-/// never assumed from the role: the surface is what decides.
+/// So the red is moved off the well by the house helper every other surface
+/// here uses, at the NON-TEXT floor of 3:1 — this is a one-point marker and
+/// not a word, and dragging a line this thin to 4.5:1 would take the red out
+/// of the red. Hand-rolling the walk was the mistake the first draft made:
+/// [`crate::recorder_panel::distinct_surface_at`] is the same rule, already
+/// measured on the surface rather than guessed from a role, and it is what
+/// keeps this line honest when the palette moves under it.
+///
+/// In practice it leaves sixty-nine of the seventy-six dressings on the
+/// shipped red untouched, and at its furthest lands on `#C43142`, so the
+/// playhead is plainly red everywhere and findable everywhere.
 fn playhead_ink(well: Color32) -> Color32 {
     const RED: Color32 = Color32::from_rgb(0xE8, 0x3A, 0x4E);
+    /// The non-text floor: a marker, not a word.
     const FLOOR: f32 = 3.0;
-    // The well is the panel ground moved AWAY from its ink, so this ink
-    // clears 4.5:1 on it by construction and the walk always converges.
-    let toward = if crate::recorder_panel::wants_light_ink(well) {
-        crate::recorder_panel::INK_LIGHT
-    } else {
-        crate::recorder_panel::INK_DARK
-    };
-    let mut out = RED;
-    let mut t = 0.0_f32;
-    while crate::recorder_panel::contrast_ratio(out, well) < FLOOR && t < 1.0 {
-        t += 0.05;
-        let lerp = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t) as u8;
-        out = Color32::from_rgb(
-            lerp(RED.r(), toward.r()),
-            lerp(RED.g(), toward.g()),
-            lerp(RED.b(), toward.b()),
-        );
-    }
-    out
+    crate::recorder_panel::distinct_surface_at(RED, well, FLOOR)
 }
 
-/// **Where the export window opens — decided once, then left alone.**
+/// **Where the export window opens, and how big — decided once, then left
+/// alone.**
 ///
 /// [`Placement::position_for`] is recomputed from the parent's rect every
 /// frame, and a `pos` that changes is a `ViewportCommand::OuterPosition`:
@@ -3674,19 +3694,33 @@ fn playhead_ink(well: Color32) -> Color32 {
 /// the length of a render, which is exactly long enough to want it
 /// somewhere else.
 ///
-/// So the answer is taken on the frame it opens and held until it closes —
-/// and dropped when it does, by the same one-pass liveness `shell::surface`
-/// uses, so the next export centres again rather than reopening wherever
-/// the last one was left.
-fn export_pos(ctx: &egui::Context, placement: Placement, size: Vec2) -> Option<Pos2> {
-    let id = egui::Id::new((EXPORT_ID, "pos"));
+/// **The size is frozen with it, and that is not tidiness.** A position is
+/// only a position FOR a size — `position_for` centres one inside the other
+/// — so freezing half of a pair computed together is how a window ends up
+/// off-centre. Drag this window to a second display mid-render, or let the
+/// host report a different monitor, and the size would change under a
+/// position that was worked out for the old one. They are taken together on
+/// the frame it opens and held together until it closes.
+///
+/// Dropped when it does close, by the same one-pass liveness
+/// `shell::surface` uses, so the next export centres again at the size of
+/// whatever screen it is started on rather than reopening where and how the
+/// last one was left.
+fn export_geometry(ctx: &egui::Context, placement: Placement) -> (Vec2, Option<Pos2>) {
+    let id = egui::Id::new((EXPORT_ID, "geometry"));
     let pass = ctx.cumulative_pass_nr();
     let held = ctx
-        .memory(|m| m.data.get_temp::<(u64, Option<Pos2>)>(id))
-        .filter(|(p, _)| pass.saturating_sub(*p) <= 1);
-    let pos = held.map_or_else(|| placement.position_for(size), |(_, p)| p);
-    ctx.memory_mut(|m| m.data.insert_temp(id, (pass, pos)));
-    pos
+        .memory(|m| m.data.get_temp::<(u64, Vec2, Option<Pos2>)>(id))
+        .filter(|(p, _, _)| pass.saturating_sub(*p) <= 1);
+    let (size, pos) = held.map_or_else(
+        || {
+            let size = export_window_size(placement.monitor);
+            (size, placement.position_for(size))
+        },
+        |(_, size, pos)| (size, pos),
+    );
+    ctx.memory_mut(|m| m.data.insert_temp(id, (pass, size, pos)));
+    (size, pos)
 }
 
 /// The export window: a wave that draws itself while the render walks the
@@ -3698,11 +3732,77 @@ fn export_pos(ctx: &egui::Context, placement: Placement, size: Vec2) -> Option<P
 /// an export is the one thing in this app that can run long enough for a
 /// person to wonder whether it is running at all.
 ///
-/// **And nothing of this app's may cover it while it is up**
-/// ([`crate::shell::SurfaceTier::Uncovered`]). It was losing the reveal race
-/// to every sibling — see [`EXPORT_ID`] for why it was losing it worse than
-/// anything else — and a progress window you cannot see is a progress window
-/// that does not exist.
+/// **Nothing of this app's that merely ANNOUNCES may cover it while it is
+/// up** ([`crate::shell::SurfaceTier::Uncovered`]). It was losing the reveal
+/// race to every sibling — see [`EXPORT_ID`] for why it was losing it worse
+/// than anything else — and a progress window you cannot see is a progress
+/// window that does not exist.
+///
+/// **A QUESTION still comes forward, and must.** A modal dialog opened
+/// mid-render sits in front of this window, because the app drops every
+/// main-window event while one is open: a question held down under the
+/// waveform would be an invisible question with the app frozen behind it,
+/// which is worse than the covering. See [`crate::shell::SurfaceTier`].
+///
+/// **What that costs the band's notice, said plainly.** A message raised
+/// during a render — a camera warming up, a device gone — is an
+/// announcement, so it loses, and the two windows are both centred on the
+/// main window with this one the bigger: on the desktop it is behind this
+/// window and in practice entirely hidden by it. It is not dismissed and it
+/// is not destroyed. `show_notice` is called from the message the recorder
+/// is still holding, it takes no focus and hears no Escape while it is
+/// behind, and `App::notice_dismissed` only latches when somebody actually
+/// presses Close — so the notice is still there, still saying the same
+/// thing, the moment the render ends and this window goes. A message that
+/// arrives and is gone again before the export finishes is the one case
+/// nobody sees, and that is a message the recorder itself withdrew.
+///
+/// # Checking the z-order by hand
+///
+/// None of this can be proved by a unit test: a window manager has the last
+/// word and nothing headless may ask it. The tests below prove the app asks
+/// for the right levels; the following is what the answers look like on a
+/// screen, and it is the list to walk before shipping a change to
+/// [`crate::shell::SurfaceTier`].
+///
+/// 1. **The render is the biggest thing on the screen.** Start an export of
+///    something a minute or two long. The window opens centred, in front of
+///    the desk, with the waveform drawing itself left to right.
+/// 2. **Drag it aside.** It stays where it is put, for the whole render, and
+///    does not walk back to the middle when the main window is moved.
+/// 3. **An announcement loses.** With the render running, do something that
+///    raises the band's notice (starting the camera is the easy one). The
+///    notice does NOT come out in front of the waveform. End the render:
+///    the notice is still there, unchanged, and its Close button works.
+/// 4. **A question wins.** With the render still running, open Setup from
+///    the menu. Setup comes to the FRONT of the export window. Click in it,
+///    type in it, change a device: it responds. The waveform is still
+///    drawing where the two do not overlap.
+/// 5. **A question that got lost comes back.** With Setup open and the
+///    render running, click the main window. The desk does not respond (it
+///    is waiting on Setup) and Setup comes forward again rather than the
+///    click going nowhere.
+/// 6. **Close Setup.** The export window is back in front of everything
+///    within a frame or two, still drawing.
+/// 7. **The plugin path.** Open the suite plugin in a host, start an export
+///    from it, and check the same things in the canvas: the window is drawn
+///    over the piano and the recorder band, the canvas behind it is NOT
+///    dimmed (it is reporting, not asking), a click on the window's face
+///    does not operate a control underneath it, a message raised mid-render
+///    stays behind it, and a dialog opened from the menu paints OVER it and
+///    can be used — including its dropdowns and its hover text, which is
+///    what keeps a question in the band its own popups are drawn in.
+/// 7a. **The raw-pointer hole, if it is still open.** Inline, `shell`
+///    swallows what lands on a surface at egui's hit test, which covers
+///    every widget and the main background's own response. The handlers that
+///    read `i.pointer` directly — the piano's note press, the recorder
+///    band's hit test — are gated by `App::dialog_blocks_pointer`, which
+///    answers only about a `Dialog`. Until that also asks
+///    [`pointer_over_export`], a click on the waveform can still sound a
+///    note in the plugin. Press the middle of the window and listen.
+/// 8. **A native file panel beats everything.** Start an export, then open
+///    any "Save as…" — the OS panel is in front of the export window, which
+///    is what `on_top: false` is for.
 pub fn show_export_progress(
     ctx: &egui::Context,
     p: &crate::ports::ExportProgress,
@@ -3716,13 +3816,14 @@ pub fn show_export_progress(
     let t = theme(live_face(ctx));
     let bold = |size: f32| FontId::new(size, fonts::courier_bold());
     let inline = !placement.caps.child_windows;
-    let size = export_window_size(placement.monitor);
+    // Size and position together, and frozen together. See `export_geometry`.
+    let (size, pos) = export_geometry(ctx, placement);
     let spec = crate::shell::SurfaceSpec {
         id: EXPORT_ID,
         title: "Exporting",
         size,
         min_size: export_min_size(size),
-        pos: export_pos(ctx, placement, size),
+        pos,
         decorated: true,
         resizable: true,
         // It comes forward when it opens, because it opens the instant the
@@ -3734,10 +3835,17 @@ pub fn show_export_progress(
         // decides modality from `chrome` and therefore made it modal inline
         // — a plugin canvas greyed out behind a window that was reporting,
         // not asking.
+        //
+        // Not modal is not the same as transparent to a press: `shell`
+        // swallows what lands on any inline surface whether or not it dims,
+        // which is where the scrim's one useful job went. See the allocation
+        // in `shell::surface`'s inline path.
         modal: false,
         // Down for as long as the OS's own panel is up, like every other
         // surface here. See `SurfaceSpec::on_top`.
         on_top: !placement.native_panel_up,
+        // Watched, not asking: it outranks every announcement of ours and
+        // stands down for a question. See `SurfaceTier`.
         tier: crate::shell::SurfaceTier::Uncovered,
         // A tiling WM would otherwise TILE it into the layout, which for a
         // window whose only job is to be looked at is the same failure as
@@ -3769,10 +3877,12 @@ pub fn show_export_progress(
         // ── the wave ──────────────────────────────────────────────────────
         let wave = painter.with_clip_rect(l.wave);
         wave.rect_filled(l.wave, 2.0, t.field_bg);
-        // **A hairline round the well**, because on three of the nineteen
-        // themes the well and the window's ground are within 1.1:1 of each
-        // other (Porcelain light, Phosphor dark, Silverface dark) and the
-        // waveform was floating in a rectangle with no findable edge. The
+        // **A hairline round the well**, because on three of the seventy-six
+        // dressings the well and the window's ground are within 1.1:1 of
+        // each other (Porcelain light, Phosphor dark and Silverface dark,
+        // each on the strip face) and the waveform was floating in a
+        // rectangle with no findable edge. Another twelve sit under 1.15:1,
+        // so this is not one theme being awkward. The
         // surface cannot move — it is the ground the wave is measured
         // against — so the box gets a line instead, in the theme's own edge
         // shade. See `every_theme_dresses_the_export_window`.
@@ -3853,6 +3963,21 @@ pub fn show_export_progress(
 /// what is behind it, and does not block a thing. It also does not steal the
 /// dialog slot: a notice arriving while the export window is open leaves the
 /// export window exactly where it was.
+///
+/// **And it LOSES to the export window, on purpose.** A notice announces; a
+/// render is being watched; the ladder in [`crate::shell::SurfaceTier`] says
+/// the announcement goes underneath. Both windows are centred on the main
+/// window and this one is the smaller, so during a render it is not merely
+/// behind but in practice completely hidden — which is the honest cost of
+/// the rule and is written down here so nobody has to rediscover it from a
+/// screenshot.
+///
+/// It is not lost, though. Nothing here dismisses it: the text comes from
+/// the message the recorder is still holding, `takes_focus: false` means it
+/// never hears the Escape that would close it, and the caller only latches
+/// `notice_dismissed` when Close is actually pressed. So the notice is still
+/// on screen, still saying the same thing, the moment the render ends and
+/// the export window goes.
 pub fn show_notice(ctx: &egui::Context, placement: Placement, text: &str) -> bool {
     let inline = !placement.caps.child_windows;
     let size = Vec2::new(460.0, 168.0);
@@ -11822,6 +11947,37 @@ at: None,
             last = size;
         }
 
+        // **The numbers the commit and the docs quote, pinned.**
+        //
+        // The commit that shipped this window said "96 to 542 on the 2560 by
+        // 1400 reference display", and 542 is the wave at the CEILING — a
+        // 620-point window, which needs 1550 points of screen height and the
+        // reference display has 1400. The real answer there is 482. Written
+        // down as assertions because prose about arithmetic drifts and
+        // arithmetic does not.
+        let wave_at = |mon: Vec2| {
+            let size = export_window_size(Some(mon));
+            export_layout(Rect::from_min_size(Pos2::ZERO, size)).wave.height()
+        };
+        for (name, mon, want) in [
+            ("a 13-inch laptop", Vec2::new(1280.0, 800.0), 242.0_f32),
+            ("the reference display", Vec2::new(2560.0, 1400.0), 482.0),
+            ("a 5K", Vec2::new(2560.0, 1440.0), 498.0),
+            ("a 6K XDR, at the ceiling", Vec2::new(3008.0, 1692.0), 542.0),
+        ] {
+            let got = wave_at(mon);
+            assert!(
+                (got - want).abs() < 0.5,
+                "{name}: the wave is {got:.0} points, not the {want:.0} the docs claim"
+            );
+        }
+        // 542 is the ceiling's wave and nothing beats it, however big the
+        // display — which is the half of that claim worth keeping.
+        assert!(
+            (wave_at(Vec2::new(7680.0, 4320.0)) - 542.0).abs() < 0.5,
+            "the ceiling stopped capping the wave"
+        );
+
         // Both limits have to actually BITE somewhere, or they are decoration
         // and the next change to the share will sail past them unnoticed.
         assert_eq!(
@@ -11960,6 +12116,15 @@ at: None,
     /// The zero line is deliberately absent: it is `t.text` at a quarter
     /// alpha, a guide rather than ink, and measuring a translucent colour as
     /// though it were opaque would be measuring the wrong thing.
+    ///
+    /// **Seventy-six dressings, not thirty-eight.** Nineteen factory themes,
+    /// two modes each, and TWO faces this window can be handed — the desk's
+    /// strip and the band's ground, because it reads whichever one `show`
+    /// remembered. The first draft of this test counted the faces and then
+    /// wrote thirty-eight in its own prose, which is how the commit that
+    /// shipped it under-reported the playhead's failures by half. The counts
+    /// are asserted below rather than described, so the prose cannot drift
+    /// from them again.
     #[test]
     fn every_theme_dresses_the_export_window() {
         use crate::recorder_panel::contrast_ratio;
@@ -11971,6 +12136,8 @@ at: None,
         );
         let mut bad: Vec<String> = Vec::new();
         let mut swept = 0;
+        let mut moved = 0;
+        let mut wells: Vec<Color32> = Vec::new();
         let mut reds = std::collections::HashSet::new();
         for theme in &themes {
             for dark in [false, true] {
@@ -12026,11 +12193,23 @@ at: None,
                     // word. See `playhead_ink`.
                     check("the playhead on the well", contrast_ratio(head, t.field_bg), 3.0);
                     reds.insert((head.r(), head.g(), head.b()));
+                    if head != Color32::from_rgb(0xE8, 0x3A, 0x4E) {
+                        moved += 1;
+                    }
+                    wells.push(t.field_bg);
                     swept += 1;
                 }
             }
         }
-        assert!(swept >= 19 * 2 * 2, "the sweep covered {swept} dressings");
+        // Nineteen themes, two modes, two faces. Named as the product it is
+        // so a face added to the list moves the number rather than the
+        // comment about it.
+        assert_eq!(
+            swept,
+            themes.len() * 2 * 2,
+            "the sweep covered {swept} dressings, not one per theme per mode per face"
+        );
+        assert_eq!(swept, 76, "the sweep is no longer seventy-six dressings");
         assert!(
             bad.is_empty(),
             "the export window is unreadable:\n  {}",
@@ -12039,8 +12218,8 @@ at: None,
         // **And it is still a RED playhead.** A walk that ran to the end
         // would leave the marker as the body ink, and nobody would ever see
         // a playhead again — so every answer has to read as red, and the
-        // shipped red itself has to survive untouched on the themes that can
-        // carry it (it does on thirty-three of the thirty-eight).
+        // shipped red itself has to survive untouched on the dressings that
+        // can carry it (it does on sixty-nine of the seventy-six).
         assert!(
             reds.contains(&(0xE8, 0x3A, 0x4E)),
             "the walk moved the playhead on every theme; it is no longer the \
@@ -12050,6 +12229,30 @@ at: None,
             assert!(
                 *r > *g + 40 && *r > *b + 20,
                 "the playhead came out #{r:02X}{g:02X}{b:02X}, which is not red"
+            );
+        }
+        // **The exact count, because the doc quotes it.** Seven of the
+        // seventy-six need the move and sixty-nine do not. A palette change
+        // that moves this number is not a bug — it is a fact the prose above
+        // `playhead_ink` is claiming, and this is what makes the two argue.
+        assert_eq!(
+            moved, 7,
+            "the shipped red now needs moving on {moved} of {swept} dressings, \
+             not the seven `playhead_ink` says"
+        );
+        // And it IS the house helper, not a walk of its own. `distinct_
+        // surface_at` is the rule every other surface here is measured with;
+        // hand-rolling a second one is how two surfaces end up disagreeing
+        // about the same well.
+        for well in wells {
+            assert_eq!(
+                playhead_ink(well),
+                crate::recorder_panel::distinct_surface_at(
+                    Color32::from_rgb(0xE8, 0x3A, 0x4E),
+                    well,
+                    3.0
+                ),
+                "the playhead stopped using the house helper on {well:?}"
             );
         }
     }
@@ -12116,6 +12319,320 @@ at: None,
             !fills.contains(&theme_of(FALLBACK_FACE).bg),
             "ivory is still painted somewhere in the export window"
         );
+    }
+
+    /// **The window's size and its position are frozen TOGETHER.**
+    ///
+    /// A position is only a position for a size: `position_for` centres one
+    /// inside the other. Freezing the position alone — which the first draft
+    /// did — leaves the window off-centre the moment the size would have
+    /// changed under it, which is a monitor change or a host reporting a
+    /// different canvas mid-render. And both have to be let go when the
+    /// export ends, or the next one opens where and how the last one did.
+    #[test]
+    fn the_export_windows_size_and_place_are_frozen_together_and_let_go_together() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0));
+        let at = |monitor: Vec2| Placement {
+            at: None,
+            native_panel_up: false,
+            raise: false,
+            parent: Some(Rect::from_min_size(Pos2::new(100.0, 60.0), Vec2::new(900.0, 600.0))),
+            monitor: Some(monitor),
+            caps: crate::host::Caps::DESKTOP,
+            chrome: None,
+        };
+        let big = Vec2::new(2560.0, 1400.0);
+        let small = Vec2::new(1280.0, 800.0);
+        // The two displays really do want different sizes, or this test
+        // proves nothing.
+        assert_ne!(export_window_size(Some(big)), export_window_size(Some(small)));
+
+        let mut first = None;
+        let run = |monitor: Vec2, out: &mut Option<(Vec2, Option<Pos2>)>| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| *out = Some(export_geometry(ctx, at(monitor))),
+            );
+        };
+        run(big, &mut first);
+        let (size, pos) = first.expect("the first frame answered nothing");
+        assert_eq!(size, export_window_size(Some(big)));
+        assert_eq!(pos, at(big).position_for(size), "it did not open where it was placed");
+
+        // The monitor changes under a live render. NEITHER moves: the pair
+        // was worked out together and is held together.
+        for _ in 0..4 {
+            let mut got = None;
+            run(small, &mut got);
+            assert_eq!(
+                got,
+                Some((size, pos)),
+                "the frozen window followed the monitor"
+            );
+        }
+        // Skip two passes — the export ended — and the next one opens fresh,
+        // at the size and place of the screen it is started on.
+        for _ in 0..3 {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |_ctx| {},
+            );
+        }
+        let mut again = None;
+        run(small, &mut again);
+        let (size2, pos2) = again.expect("the next export answered nothing");
+        assert_eq!(size2, export_window_size(Some(small)), "it reopened at the old size");
+        assert_eq!(pos2, at(small).position_for(size2), "it reopened in the old place");
+    }
+
+    /// **A real modal dialog opened mid-render comes out in front of it, on
+    /// the desktop path.**
+    ///
+    /// `shell.rs` proves the ladder on synthetic specs; this proves the two
+    /// windows the ladder was WRITTEN for are actually on the right rungs —
+    /// that `show_dialog_viewport` marks a question as one and the export
+    /// window does not accidentally outrank it. It runs the frame the app
+    /// runs, in the app's order: the dialog first, the export window after.
+    ///
+    /// The level read back is the one `shell::surface` last handed the host,
+    /// which is the only per-surface answer available headlessly — every
+    /// viewport command in a test run lands on the one root output with no
+    /// name on it. It is not a claim about where a window manager put the
+    /// windows; that is what the by-hand list on `show_export_progress` is
+    /// for.
+    #[test]
+    fn a_question_opened_during_a_render_outranks_it() {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        fonts::apply_text_styles(&ctx);
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0));
+        let placement = Placement {
+            at: None,
+            native_panel_up: false,
+            raise: false,
+            parent: None,
+            monitor: Some(screen.size()),
+            caps: crate::host::Caps::DESKTOP,
+            chrome: None,
+        };
+        let p = crate::ports::ExportProgress {
+            fraction: 0.5,
+            label: "Rendering".to_owned(),
+            peaks: vec![(-0.5, 0.5); 32],
+        };
+        let level = |id: &str| {
+            ctx.memory(|m| {
+                m.data
+                    .get_temp::<egui::WindowLevel>(egui::Id::new((id, "surface-level")))
+            })
+        };
+        let frame = |dialog: &mut Option<Dialog>| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| {
+                    show(ctx, dialog, Color32::from_rgb(0x6B, 0x71, 0x3E), placement);
+                    show_export_progress(ctx, &p, placement);
+                },
+            );
+        };
+        // The render on its own: it floats.
+        let mut none = None;
+        frame(&mut none);
+        frame(&mut none);
+        assert_eq!(
+            level(EXPORT_ID),
+            Some(egui::WindowLevel::AlwaysOnTop),
+            "the render did not float"
+        );
+        // A question opens. `NoMidiInput` is a question — `Dialog::is_modal`
+        // says so — and the app drops every main-window event while it is up.
+        let mut asking = Some(Dialog::NoMidiInput);
+        assert!(
+            asking.as_ref().is_some_and(Dialog::is_modal),
+            "this test is no longer about a question"
+        );
+        for pass in 0..3 {
+            frame(&mut asking);
+            assert!(asking.is_some(), "the dialog closed itself on pass {pass}");
+            assert_eq!(
+                level(DIALOG_ID),
+                Some(egui::WindowLevel::AlwaysOnTop),
+                "pass {pass}: the question did not float"
+            );
+            assert_eq!(
+                level(EXPORT_ID),
+                Some(egui::WindowLevel::Normal),
+                "pass {pass}: the render stayed on top of a question"
+            );
+        }
+        // The question is answered. The render comes back up on its own —
+        // three frames, the settle `shell::standing_claim` documents.
+        for _ in 0..3 {
+            frame(&mut none);
+        }
+        assert_eq!(
+            level(EXPORT_ID),
+            Some(egui::WindowLevel::AlwaysOnTop),
+            "the render never recovered from the question"
+        );
+    }
+
+    /// **A message raised mid-render loses, and is not lost.**
+    ///
+    /// Under the ladder a notice is an announcement and the render outranks
+    /// it, so during an export the notice window is behind — and since both
+    /// are centred on the same parent and this one is the smaller, behind
+    /// means hidden. That is the honest cost of the rule and it is written
+    /// down on `show_notice`.
+    ///
+    /// What must NOT happen is the notice going away. Nothing here dismisses
+    /// it: it takes no focus so it never hears an Escape, it is redrawn from
+    /// the message the recorder is still holding, and it reports "closed"
+    /// only when its own Close is pressed. So it is still there, unchanged,
+    /// when the render ends — which is what this runs enough frames to say.
+    #[test]
+    fn a_message_raised_during_a_render_is_covered_and_not_destroyed() {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        fonts::apply_text_styles(&ctx);
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0));
+        let placement = Placement {
+            at: None,
+            native_panel_up: false,
+            raise: false,
+            parent: None,
+            monitor: Some(screen.size()),
+            caps: crate::host::Caps::PLUGIN,
+            chrome: None,
+        };
+        let p = crate::ports::ExportProgress {
+            fraction: 0.25,
+            label: "Rendering".to_owned(),
+            peaks: vec![(-0.3, 0.3); 8],
+        };
+        let text = "Starting the camera - this can take a few seconds";
+        // Ten frames of a render with a message up, in the order `App::
+        // update` draws them: the message first, the export window after.
+        let mut closed_ever = false;
+        let mut top = None;
+        for _ in 0..10 {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| {
+                    closed_ever |= show_notice(ctx, placement, text);
+                    show_export_progress(ctx, &p, placement);
+                    top = ctx.layer_id_at(screen.center());
+                },
+            );
+        }
+        assert!(
+            !closed_ever,
+            "the notice reported itself closed while it was merely covered —              the message would have been dismissed with nobody asked"
+        );
+        assert_eq!(
+            top.map(|l| l.id),
+            Some(egui::Id::new(EXPORT_ID)),
+            "the message came out in front of the render after all"
+        );
+        // The render ends. The message is still drawn, still not closed, and
+        // now it is the thing on top — it was never destroyed, only covered.
+        for _ in 0..3 {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| {
+                    closed_ever |= show_notice(ctx, placement, text);
+                    top = ctx.layer_id_at(screen.center());
+                },
+            );
+        }
+        assert!(!closed_ever, "the notice closed itself when the render ended");
+        assert_eq!(
+            top.map(|l| l.id),
+            Some(egui::Id::new(NOTICE_ID)),
+            "the message did not come back when the render ended"
+        );
+    }
+
+    /// **A press on the export window is the export window's.**
+    ///
+    /// Inline the window is a layer over the piano and the recorder band,
+    /// and the app's raw-pointer handlers read `i.pointer` straight off the
+    /// input — no layer has ever shielded those, the modal scrim included.
+    /// They ask [`crate::shell::inline_rect`] where a surface is instead,
+    /// and this is the export window's half of that question. On the desktop
+    /// the window has a pointer stream of its own and the answer is false,
+    /// which is the honest answer and not a gap.
+    #[test]
+    fn a_pointer_on_the_inline_export_window_reads_as_on_it() {
+        let ctx = egui::Context::default();
+        fonts::install(&ctx, fonts::FontChoice::default(), None);
+        fonts::apply_text_styles(&ctx);
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 620.0));
+        let placement = Placement {
+            at: None,
+            native_panel_up: false,
+            raise: false,
+            parent: None,
+            monitor: Some(screen.size()),
+            caps: crate::host::Caps::PLUGIN,
+            chrome: None,
+        };
+        let p = crate::ports::ExportProgress {
+            fraction: 0.5,
+            label: "Rendering".to_owned(),
+            peaks: vec![(-0.4, 0.4); 16],
+        };
+        let mut over_middle = false;
+        let mut over_corner = false;
+        // Three passes: the rect is recorded at the end of a pass and read
+        // on the next, and the pointer has to be delivered with the input.
+        for i in 0..3 {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events: vec![egui::Event::PointerMoved(screen.center())],
+                    ..Default::default()
+                },
+                |ctx| {
+                    show_export_progress(ctx, &p, placement);
+                    if i > 0 {
+                        over_middle = pointer_over_export(ctx);
+                    }
+                },
+            );
+        }
+        assert!(over_middle, "a press in the middle of the window read as off it");
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![egui::Event::PointerMoved(screen.min + Vec2::splat(2.0))],
+                ..Default::default()
+            },
+            |ctx| {
+                show_export_progress(ctx, &p, placement);
+                over_corner = pointer_over_export(ctx);
+            },
+        );
+        assert!(!over_corner, "a press in the canvas corner read as on the window");
+        // And it is not the dialog: the export window must never take the
+        // one dialog slot, which is what `EXPORT_ID` exists for.
+        assert!(!dialog_drawn_inline(&ctx), "the export window took the dialog slot");
     }
 
     /// **The wizard's choices resolve to exactly what its actions will
