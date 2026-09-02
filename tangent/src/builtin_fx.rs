@@ -194,17 +194,23 @@ const DENOISE_FACE_PARAMS: &[ParamSpec] = &[
     ParamSpec { id: 5, symbol: "lookahead", name: "Lookahead", units: "", default: 1.0, steps: 2 },
 ];
 
-/// One knob per `units::amp::AmpParams` field, panel order. Defaults are the
-/// kernel's shipped warm-and-clean sound.
+/// One knob per panel control of `units::amp`. Ids 0..4 are the top strip
+/// (bright, volume, tone stack), 5..8 the vibrato group. Defaults are
+/// `AmpParams::default()` verbatim — warm and clean — except the VIB
+/// switch, which is the wrapper's own (the kernel spells "off" as depth 0;
+/// a panel wants a switch that remembers the intensity it will come back
+/// at, so the switch is a face parameter and the wrapper computes the
+/// depth). A test holds the two tables together.
 const AMP_FACE_PARAMS: &[ParamSpec] = &[
     ParamSpec { id: 0, symbol: "bright", name: "Bright", units: "", default: 0.0, steps: 2 },
-    ParamSpec { id: 1, symbol: "volume", name: "Volume", units: "%", default: 0.7, steps: 0 },
-    ParamSpec { id: 2, symbol: "treble", name: "Treble", units: "%", default: 0.5, steps: 0 },
-    ParamSpec { id: 3, symbol: "middle", name: "Middle", units: "%", default: 0.5, steps: 0 },
-    ParamSpec { id: 4, symbol: "bass", name: "Bass", units: "%", default: 0.5, steps: 0 },
-    ParamSpec { id: 5, symbol: "vib_speed", name: "Vib Speed", units: "Hz", default: 0.35, steps: 0 },
-    ParamSpec { id: 6, symbol: "vib_depth", name: "Vib Depth", units: "%", default: 0.0, steps: 0 },
-    ParamSpec { id: 7, symbol: "vib_stereo", name: "Vib Stereo", units: "%", default: 0.0, steps: 0 },
+    ParamSpec { id: 1, symbol: "volume", name: "Volume", units: "", default: 0.7, steps: 0 },
+    ParamSpec { id: 2, symbol: "treble", name: "Treble", units: "", default: 0.5, steps: 0 },
+    ParamSpec { id: 3, symbol: "middle", name: "Middle", units: "", default: 0.5, steps: 0 },
+    ParamSpec { id: 4, symbol: "bass", name: "Bass", units: "", default: 0.5, steps: 0 },
+    ParamSpec { id: 5, symbol: "vib_on", name: "Vibrato", units: "", default: 0.0, steps: 2 },
+    ParamSpec { id: 6, symbol: "vib_speed", name: "Speed", units: "Hz", default: 0.35, steps: 0 },
+    ParamSpec { id: 7, symbol: "vib_depth", name: "Intensity", units: "%", default: 0.0, steps: 0 },
+    ParamSpec { id: 8, symbol: "vib_stereo", name: "Stereo", units: "%", default: 0.0, steps: 0 },
 ];
 
 /// One knob per `units::drive::DriveParams` field: the pedal as it leaves
@@ -1341,9 +1347,21 @@ impl DenoiseUnit {
 
 // ── Tangent Amp, seated ─────────────────────────────────────────────────────
 
+/// The amp kernel behind its panel table.
+///
+/// The one wrinkle is the VIB switch: the kernel spells "vibrato off" as
+/// depth zero, but a panel switch that zeroed the intensity knob would
+/// forget where the player had it. So the switch and the intensity are two
+/// face parameters, both persisted, and the kernel's depth is their product
+/// — computed here, in the only place both are known.
 pub struct AmpUnit {
     kernel: crate::units::amp::Amp,
     params: crate::units::amp::AmpParams,
+    /// The VIB switch's own state; see the struct doc.
+    vib_on: bool,
+    /// Where the Intensity knob stands, kept apart from the depth the
+    /// kernel sees so the switch can come back to it.
+    intensity: f32,
     scratch: Vec<f32>,
 }
 
@@ -1352,6 +1370,8 @@ impl AmpUnit {
         Self {
             kernel: crate::units::amp::Amp::new(sample_rate),
             params: crate::units::amp::AmpParams::default(),
+            vib_on: false,
+            intensity: 0.0,
             scratch: vec![0.0; SCRATCH_FRAMES * 2],
         }
     }
@@ -1367,10 +1387,12 @@ impl AmpUnit {
             2 => self.params.treble = v,
             3 => self.params.middle = v,
             4 => self.params.bass = v,
-            5 => self.params.vib_speed = v,
-            6 => self.params.vib_depth = v,
+            5 => self.vib_on = v >= 0.5,
+            6 => self.params.vib_speed = v,
+            7 => self.intensity = v,
             _ => self.params.vib_stereo = v,
         }
+        self.params.vib_depth = if self.vib_on { self.intensity } else { 0.0 };
     }
 
     fn process(&mut self, input: &[Vec<f32>], frames: usize, out: &mut [Vec<f32>]) {
@@ -1990,9 +2012,13 @@ mod tests {
         ]) {
             assert_eq!(spec.default, want, "{} drifted from DenoiseParams::default", spec.symbol);
         }
+        // The amp's table is nine knobs to the kernel's eight: VIB is a
+        // panel SWITCH the wrapper folds into vib_depth (off = depth 0),
+        // so the switch and the intensity both rest at zero by design and
+        // the remaining rows pin straight to the kernel's defaults.
         let a = crate::units::amp::AmpParams::default();
         for (spec, want) in AMP_FACE_PARAMS.iter().zip([
-            a.bright, a.volume, a.treble, a.middle, a.bass, a.vib_speed, a.vib_depth,
+            a.bright, a.volume, a.treble, a.middle, a.bass, 0.0, a.vib_speed, 0.0,
             a.vib_stereo,
         ]) {
             assert_eq!(spec.default, want, "{} drifted from AmpParams::default", spec.symbol);

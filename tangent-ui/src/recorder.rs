@@ -739,10 +739,52 @@ pub const fn folder_extra_seat(ch: usize) -> usize {
     FOLDER_EXTRA_SEATS + ch
 }
 
+/// How many pedal seats each channel owns for the amp's pedalboard.
+///
+/// Seven, the owner's board: comp, wah, drive, chorus, trem, echo, plate —
+/// enough for the classic order with nothing doubled. A constant rather
+/// than a growable count because the seat space is append-only: growing it
+/// later is a new block after whatever is last by then, never a renumber
+/// of these.
+pub const AMP_PEDALS: usize = 7;
+
+/// **Where the amp-pedal seats begin** - seven appended seats per channel,
+/// the pedalboard the amp wears when it sits in a channel bay. Appended
+/// after the folder-extra block, for the reason `MASTER_EXTRA_SEAT`
+/// records: an appended seat changes no index anybody has already written
+/// down, the settings reader re-pads `strip_inserts` to the grown
+/// `INSERT_SPACE`, and the state sidecars are named by seat index going
+/// forward.
+///
+/// A pedal seat is an ordinary rack - VST3s are legal tenants - that the
+/// engine runs IN ORDER over the amp's input, before the amp's own bay.
+/// Only a CHANNEL's amp gets them: an amp on the master, a bus or a
+/// folder's extra rack plays bare in v1.
+pub const AMP_PEDAL_SEATS: usize = FOLDER_EXTRA_SEATS + CHANNELS;
+
+/// Channel `ch`'s pedal `pedal` seat. One function, same reason as
+/// `pad_rack_index`: a call site that recomputes this edits somebody
+/// else's plugin.
+pub const fn amp_pedal_seat(ch: usize, pedal: usize) -> usize {
+    AMP_PEDAL_SEATS + ch * AMP_PEDALS + pedal
+}
+
+/// The inverse: which channel's which pedal a seat is, or `None` for a
+/// seat outside the pedal block. What lets a reorder carry a picker aimed
+/// at a pedal without the call site re-deriving the block's shape.
+pub fn amp_pedal_of(seat: usize) -> Option<(usize, usize)> {
+    if seat < AMP_PEDAL_SEATS {
+        return None;
+    }
+    let at = seat - AMP_PEDAL_SEATS;
+    let ch = at / AMP_PEDALS;
+    (ch < CHANNELS).then_some((ch, at % AMP_PEDALS))
+}
+
 /// Every rack seat: strips, master, the first pad block, the master's
-/// extra, a pad block for each channel after the first, and a folder-extra
-/// seat per channel.
-pub const TOTAL_SEATS: usize = FOLDER_EXTRA_SEATS + CHANNELS;
+/// extra, a pad block for each channel after the first, a folder-extra
+/// seat per channel, and seven pedal seats per channel.
+pub const TOTAL_SEATS: usize = AMP_PEDAL_SEATS + CHANNELS * AMP_PEDALS;
 
 /// **The channel permutation lifted onto the WHOLE seat space.** Channel
 /// rows move, each folder-extra seat follows its channel, and every other
@@ -755,6 +797,12 @@ pub fn seat_order(order: &[usize]) -> Vec<usize> {
         if new < CHANNELS && *old < CHANNELS {
             full[new] = *old;
             full[folder_extra_seat(new)] = folder_extra_seat(*old);
+            // The pedalboard travels with its channel too, exactly as the
+            // folder-extra seat does: a reorder that left the pedals behind
+            // would hand one channel's board to whoever took its row.
+            for pedal in 0..AMP_PEDALS {
+                full[amp_pedal_seat(new, pedal)] = amp_pedal_seat(*old, pedal);
+            }
         } else if new != *old {
             // A SEAT-space entry - the drumpad's pad-FX swap permutes pad
             // seats directly - passes through untouched. Dropping these to
@@ -3452,9 +3500,9 @@ mod tests {
     #[test]
     fn a_folders_six_slots_have_their_own_appended_seats() {
         use super::{
-            bays_of, folder_extra_seat, pad_rack_index, seat_bay, seat_order, Strip, CHANNELS,
-            DRUM_PADS, INSERTS, INSERT_SPACE, MASTER_EXTRA_SEAT, MASTER_SEAT, STRIPS,
-            TOTAL_SEATS,
+            amp_pedal_of, amp_pedal_seat, bays_of, folder_extra_seat, pad_rack_index, seat_bay,
+            seat_order, Strip, AMP_PEDALS, CHANNELS, DRUM_PADS, INSERTS, INSERT_SPACE,
+            MASTER_EXTRA_SEAT, MASTER_SEAT, STRIPS, TOTAL_SEATS,
         };
         // The counts: a folder wears six, a plain channel three, the click
         // never folds, and the master keeps its six either way.
@@ -3494,15 +3542,35 @@ mod tests {
                 "folder seat for channel {ch} collides"
             );
         }
+        for ch in 0..CHANNELS {
+            for pedal in 0..AMP_PEDALS {
+                assert!(
+                    seen.insert(amp_pedal_seat(ch, pedal)),
+                    "pedal seat {pedal} of channel {ch} collides"
+                );
+                // And the inverse names the same seat, both ways.
+                assert_eq!(amp_pedal_of(amp_pedal_seat(ch, pedal)), Some((ch, pedal)));
+            }
+        }
+        assert_eq!(amp_pedal_of(0), None);
+        assert_eq!(amp_pedal_of(folder_extra_seat(CHANNELS - 1)), None);
+        assert_eq!(amp_pedal_of(TOTAL_SEATS), None, "a seat past the block answered");
         assert!(seen.iter().all(|s| *s < TOTAL_SEATS), "a seat past the end");
         let (seat, bay) = seat_bay(CHANNELS - 1, INSERTS * 2 - 1);
         assert!(
             seat * INSERTS + bay < INSERT_SPACE,
             "the last folder bay is past the end of the insert space"
         );
+        // The last pedal bay of the last channel fits the insert space too.
+        assert!(
+            amp_pedal_seat(CHANNELS - 1, AMP_PEDALS - 1) * INSERTS + (INSERTS - 1)
+                < INSERT_SPACE,
+            "the last pedal bay is past the end of the insert space"
+        );
 
-        // **seat_order carries the extra seat with its channel** and moves
-        // nothing else - four moved rows for one swap, identity elsewhere.
+        // **seat_order carries the extra seat AND the pedalboard with its
+        // channel** and moves nothing else - two channel rows, two folder
+        // seats and two boards of seven for one swap, identity elsewhere.
         let mut order: Vec<usize> = (0..CHANNELS).collect();
         order.swap(2, 5);
         let full = seat_order(&order);
@@ -3511,12 +3579,16 @@ mod tests {
         assert_eq!(full[5], 2);
         assert_eq!(full[folder_extra_seat(2)], folder_extra_seat(5));
         assert_eq!(full[folder_extra_seat(5)], folder_extra_seat(2));
+        for pedal in 0..AMP_PEDALS {
+            assert_eq!(full[amp_pedal_seat(2, pedal)], amp_pedal_seat(5, pedal));
+            assert_eq!(full[amp_pedal_seat(5, pedal)], amp_pedal_seat(2, pedal));
+        }
         assert_eq!(full[MASTER_SEAT], MASTER_SEAT);
         assert_eq!(full[MASTER_EXTRA_SEAT], MASTER_EXTRA_SEAT);
         assert_eq!(
             (0..TOTAL_SEATS).filter(|i| full[*i] != *i).count(),
-            4,
-            "the swap moved more than its own four rows"
+            4 + 2 * AMP_PEDALS,
+            "the swap moved more than its own rows"
         );
 
         // And a SEAT-space permutation - the pad-FX swap's shape - passes

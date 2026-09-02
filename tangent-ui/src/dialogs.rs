@@ -919,6 +919,12 @@ pub enum DialogAction {
     /// per-frame publish owns the `seat_bay` translation, so the edge
     /// survives every seat renumbering the desk migrations perform.
     SetInsertKeySource { strip: usize, slot: usize, from: Option<usize> },
+    /// The amp face's pedal chip: open the insert picker over pedal
+    /// `pedal` of the channel whose bay the face sits on. `strip`/`slot`
+    /// are the face's own DESK terms; the app resolves the channel through
+    /// `seat_bay` and the pedal through `amp_pedal_seat`, on its side of
+    /// the wall. Appended at the END, per this enum's law.
+    OpenPedalPicker { strip: usize, slot: usize, pedal: usize },
 }
 
 // ── the custom tuning editor ────────────────────────────────────────────────
@@ -3673,6 +3679,7 @@ pub fn show(
             let (title, about) =
                 crate::faces::suite_unit(&unit).unwrap_or(("Tangent", ""));
             let size = match unit.as_str() {
+                "@tangent-amp" => Vec2::new(540.0, 360.0),
                 "@tangent-eq" => Vec2::new(470.0, 470.0),
                 "@tangent-imager" => Vec2::new(340.0, 480.0),
                 "@tangent-comp" => Vec2::new(400.0, 430.0),
@@ -3714,6 +3721,9 @@ pub fn show(
                                             unit: unit.clone(),
                                             path,
                                         }
+                                    }
+                                    crate::faces::FaceAction::OpenPedal { pedal } => {
+                                        DialogAction::OpenPedalPicker { strip, slot, pedal }
                                     }
                                 });
                             }
