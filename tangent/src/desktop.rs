@@ -6083,7 +6083,10 @@ impl DesktopApp {
                 if !discarding_current {
                     self.save_plugin_states();
                     self.copy_states_to_project();
-                    if self.app.project_dirty() {
+                    // **The EXACT question**, not the title bar's cheap one:
+                    // a wrong "clean" here walks away from the outgoing
+                    // session without writing it. See `project_dirty`.
+                    if self.app.project_dirty_exact() {
                         self.app.save_project_doc();
                     }
                 }
@@ -6236,7 +6239,9 @@ impl DesktopApp {
         // "Untitled N" per New, forever.
         self.save_plugin_states();
         self.copy_states_to_project();
-        if self.app.project_dirty() {
+        // **The EXACT question** — the outgoing session is about to be
+        // replaced, and a wrong "clean" loses it. See `project_dirty`.
+        if self.app.project_dirty_exact() {
             self.app.save_project_doc();
         }
         self.app.open_project(doc);
@@ -9038,9 +9043,12 @@ impl eframe::App for DesktopApp {
         self.app.set_host_gesture(facts.gesture);
         self.app.set_os_aspect_lock(facts.os_aspect_lock);
         // **The title bar knows the session.** Composed in one place
-        // (`crate::window_title`) and sent only on change; project_dirty is
-        // a comparison of two serialisations, cheap at frame rate but not
-        // worth a viewport command when nothing moved.
+        // (`crate::window_title`) and sent only on change. This is the one
+        // call site `project_dirty`'s cheap fingerprint exists for: asked
+        // every frame, and a wrong answer costs an asterisk, not a session.
+        // It used to serialise the whole document here: 2.9 ms on a
+        // 128-clip project in a release build, a sixth of every frame spent
+        // deciding whether to draw an asterisk.
         {
             let want =
                 crate::window_title(&self.app.project_name(), self.app.project_dirty());
