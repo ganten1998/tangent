@@ -182,18 +182,45 @@ impl Mode {
         self.y2 *= g;
     }
 
-    /// How much of a `kick_add` of `amp` this ringing mode may take before
-    /// its amplitude passes `cap`, as a fraction of the seed, 0 to 1.
+    /// The most of a ringing mode ONE landing hammer may take out of it, as
+    /// a fraction of the amplitude it found there.
+    ///
+    /// **A tip is not a damper.** The seed is an instantaneous impulse, and
+    /// an impulse landing exactly against the motion cancels it outright —
+    /// arithmetic a felt or neoprene tip cannot do, because it is in contact
+    /// for a couple of milliseconds, which around middle C is most of a
+    /// period: it meets the metal coming at it, is pushed back, and
+    /// re-contacts on the way out. What it can do is bleed the mode. HALF
+    /// ITS ENERGY is the most any one landing takes, which is this factor on
+    /// the amplitude — and half is generous, not stingy: it is the whole of
+    /// what the contact could couple if it were perfectly timed against the
+    /// motion.
+    ///
+    /// Without this the ENERGY CAP made the cancellation worse rather than
+    /// better. Pinning a repeated note's fundamental at `cap` — a little
+    /// over one strike's own throw — parks it on the knife edge where the
+    /// next seed, which is one strike's own throw, very nearly annihilates
+    /// it: the bench measured a repeated Rhodes note alternating fourteen
+    /// decibels up and down, a note that vanishes every other strike, which
+    /// is exactly as wrong as the step the cap was added to prevent.
+    const LANDING_FLOOR: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
+    /// How much of a `kick_add` of `amp` this ringing mode may take while
+    /// staying between `LANDING_FLOOR` of the amplitude it has now and
+    /// `cap`, as a fraction of the seed, 0 to 1.
     ///
     /// **Solved on the state, not guessed from a level.** With `s` added to
     /// `y1`, the squared amplitude is a parabola in `s`: `Q(s) = Q0 + 2 s b
     /// + s^2` with `b = y1 - y2 cos w`. The sign of `b` is the phase of the
-    /// motion against the hammer, so a hammer pushing against the motion
-    /// LOWERS `Q` and is never limited — it is taking energy out, which is
-    /// what a real hammer does to a tine coming at it — while a hammer
-    /// pushing with the motion is allowed up to the larger of the cap and
-    /// what was already there. The result is a bound with no step in it: a
-    /// tine at the cap, struck in phase, is simply not pushed further.
+    /// motion against the hammer: a hammer pushing WITH the motion raises
+    /// `Q` and is allowed up to the larger of the cap and what was already
+    /// there, and a hammer pushing AGAINST it lowers `Q` — it is taking
+    /// energy out, which is what a real hammer does to a tine coming at it
+    /// — until it reaches the floor above, at which point the tip has given
+    /// what it has. Both bounds are solved for the seed that lands exactly
+    /// on them, so neither steps: a tine at the cap struck in phase is
+    /// simply not pushed further, and a tine struck dead against its motion
+    /// is quietened rather than switched off.
     pub(super) fn seed_within(&self, freq: f32, rate: f32, amp: f32, cap: f32) -> f32 {
         if self.silent() || amp <= 0.0 || cap <= 0.0 {
             return 1.0;
@@ -208,11 +235,28 @@ impl Mode {
         let q0 = self.y1 * self.y1 + self.y2 * self.y2 - 2.0 * self.y1 * self.y2 * cw;
         let b = self.y1 - self.y2 * cw;
         let bound = q0.max(cap * cap * sw * sw);
-        if q0 + 2.0 * s * b + s * s <= bound {
-            return 1.0;
+        let floor = q0 * Self::LANDING_FLOOR * Self::LANDING_FLOOR;
+        // Only the seed the strike actually asks for is judged, not the road
+        // it took to get there: a hammer big enough to carry the mode THROUGH
+        // the cancellation and out the far side is a hammer that landed, and
+        // clamping it because the parabola dipped on the way would gut every
+        // hard strike on a nearly-dead note.
+        let q = q0 + 2.0 * s * b + s * s;
+        if q > bound {
+            let s_hi = -b + (b * b - q0 + bound).max(0.0).sqrt();
+            return (s_hi / s).clamp(0.0, 1.0);
         }
-        let s_hi = -b + (b * b - q0 + bound).max(0.0).sqrt();
-        (s_hi / s).clamp(0.0, 1.0)
+        if q < floor {
+            // The floor bites on the way DOWN, so it is the SMALLER root —
+            // the last seed still above it. Reachable only with `b < 0`, a
+            // hammer against the motion, which is the only way `q` can be
+            // under `q0` at all. Both sides of the clamped band land on
+            // `floor` exactly, so the amplitude this returns is continuous
+            // in the strike: no velocity has a cliff on either side of it.
+            let s_lo = -b - (b * b - q0 + floor).max(0.0).sqrt();
+            return (s_lo / s).clamp(0.0, 1.0);
+        }
+        1.0
     }
 
     pub(super) fn tick(&mut self) -> f32 {

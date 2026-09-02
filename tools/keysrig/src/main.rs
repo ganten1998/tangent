@@ -946,10 +946,186 @@ fn probe(which: &str) {
     }
 }
 
+/// Print, for every strike of the rapid repeat, what the level did across
+/// the event and what each of the first three partials did with it.
+///
+/// **The dip needs a different instrument from the edge.** `over` answers
+/// "did something step"; a dip answers "did something go away", and the two
+/// have opposite cures — so this prints the millisecond-by-millisecond level
+/// either side of each onset AND the magnitude of the fundamental, its
+/// octave and its twelfth before and after, because a fundamental that
+/// halves while the octave grows is superposition landing out of phase, and
+/// every partial dropping at once is a gain that moved.
+fn probe_rapid(which: &str) {
+    const PITCH: u8 = 60;
+    const VEL: u8 = 102;
+    let Some((label, make)) = rigs().into_iter().find(|(l, _)| l.starts_with(which)) else {
+        eprintln!("no rig starts with {which}");
+        return;
+    };
+    let mut ev = vec![(0usize, Ev::Pedal(true))];
+    let mut onsets = Vec::new();
+    for k in 0..8 {
+        let t = at(k as f32 * 0.060);
+        onsets.push(t);
+        ev.push((t, Ev::On(PITCH, VEL)));
+        ev.push((at(k as f32 * 0.060 + 0.030), Ev::Off(PITCH)));
+    }
+    let mut rig = make();
+    let x = run(rig.as_mut(), &ev, (1.0 * RATE) as usize);
+    let (f, _) = fresh(make.as_ref(), PITCH, VEL, 1.0);
+    let f0 = 440.0 * 2.0_f32.powf((f32::from(PITCH) - 69.0) / 12.0);
+    println!("{label}: rapid x8, level in 1 ms steps around each onset, then partials");
+    for (k, &o) in onsets.iter().enumerate().skip(1) {
+        let e = edge(&x, o, &f);
+        print!("  #{k} over {:+5.1} {:+5.1}  ", e.over_d1, e.over_d2);
+        for j in -4_isize..16 {
+            let a = (o as isize + j * ms(1.0) as isize).max(0) as usize;
+            print!("{:+5.0}", analyze::db(rms_in(&x, a, a + ms(1.0))));
+        }
+        let win = ms(20.0);
+        let before = &x[o.saturating_sub(win)..o];
+        let after = &x[o..(o + win).min(x.len())];
+        print!("   |");
+        for n in [1.0_f32, 2.0, 3.0] {
+            let b = analyze::goertzel_hann(before, f0 * n, RATE);
+            let a = analyze::goertzel_hann(after, f0 * n, RATE);
+            print!(" {:+5.1}", analyze::db(a / b.max(1e-12)));
+        }
+        println!();
+    }
+    // **What each strike ADDED, against what the same strike adds from
+    // silence.** The bed is the run stopped one strike short, so the
+    // difference is that strike's own contribution through whatever the amp
+    // pass was doing at the time. A mechanism that superposes gives a ratio
+    // of one. A mechanism that steps gives a d2 ratio far above its d1
+    // ratio, because a step is broadband and a gain is not; a state-dependent
+    // gain downstream — a pickup leaned on, a wah wide open — moves BOTH by
+    // the same factor, which is how to tell the two apart.
+    println!("  strike  d1 diff/fresh   d2 diff/fresh   (equal ratios = a gain, not a step)");
+    for k in 1..8 {
+        let cut = |upto: usize| {
+            let mut e = vec![(0usize, Ev::Pedal(true))];
+            for j in 0..upto {
+                e.push((onsets[j], Ev::On(PITCH, VEL)));
+                e.push((at(j as f32 * 0.060 + 0.030), Ev::Off(PITCH)));
+            }
+            let mut r = make();
+            run(r.as_mut(), &e, onsets[k] + ms(25.0))
+        };
+        let bed = cut(k);
+        let with = cut(k + 1);
+        let diff: Vec<f32> = with.iter().zip(&bed).map(|(a, b)| a - b).collect();
+        let (a, b) = (onsets[k] - ms(2.0), onsets[k] + ms(20.0));
+        println!(
+            "    #{k}    {:8.2}        {:8.2}",
+            d1(&diff, a, b) / f.d1,
+            d2(&diff, a, b) / f.d2,
+        );
+    }
+    // Where the worst second difference of the whole run actually sits, and
+    // the samples around it: an `over` that is not at the onset is not the
+    // strike's edge at all.
+    let mut worst = (0.0_f32, 0usize);
+    for n in 2..x.len() {
+        let d = (x[n] - 2.0 * x[n - 1] + x[n - 2]).abs();
+        if d > worst.0 {
+            worst = (d, n);
+        }
+    }
+    let (_, fr) = fresh(make.as_ref(), PITCH, VEL, 1.0);
+    let mut wf = (0.0_f32, 0usize);
+    for n in 2..fr.len() {
+        let d = (fr[n] - 2.0 * fr[n - 1] + fr[n - 2]).abs();
+        if d > wf.0 {
+            wf = (d, n);
+        }
+    }
+    println!(
+        "  worst d2 {:.6} at frame {} ({:+.1} ms from onset {}); fresh worst {:.6} at {:.1} ms",
+        worst.0,
+        worst.1,
+        (worst.1 as f32 - onsets.iter().rev().find(|&&o| o <= worst.1).copied().unwrap_or(0) as f32)
+            / RATE
+            * 1000.0,
+        onsets.iter().rev().find(|&&o| o <= worst.1).copied().unwrap_or(0),
+        wf.0,
+        wf.1 as f32 / RATE * 1000.0,
+    );
+    for n in worst.1.saturating_sub(6)..(worst.1 + 6).min(x.len()) {
+        println!("    {:>7}  {:+.7}", n, x[n]);
+    }
+}
+
+/// The steal, sample by sample: the pool full, one voice buried and faded,
+/// and a pitch the pool does not hold arriving on the slot it vacated. The
+/// bed here is the same performance with the newcomer left out, so the
+/// difference is exactly what the new note added through whatever the amp
+/// pass was doing at that moment.
+fn probe_steal(which: &str) {
+    const VEL: u8 = 102;
+    let Some((label, make)) = rigs().into_iter().find(|(l, _)| l.starts_with(which)) else {
+        eprintln!("no rig starts with {which}");
+        return;
+    };
+    let is_dx7 = label.starts_with("DX7");
+    let pool = if is_dx7 { dx7::synth::VOICES } else { keys::VOICES };
+    let onset = at(0.5);
+    let mut base = vec![(0usize, Ev::Pedal(true))];
+    for i in 0..pool {
+        base.push((0, Ev::On(24 + i as u8, VEL)));
+    }
+    base.push((at(0.1), Ev::Off(30)));
+    let mut with = base.clone();
+    with.push((onset, Ev::On(100, VEL)));
+    let mut rig = make();
+    let bed = run(rig.as_mut(), &base, (0.6 * RATE) as usize);
+    let mut rig = make();
+    let st = run(rig.as_mut(), &with, (0.6 * RATE) as usize);
+    let (_, fr) = fresh(make.as_ref(), 100, VEL, 0.1);
+    println!("{label} steal: n   bed        steal      diff       fresh");
+    for n in onset.saturating_sub(3)..onset + 40 {
+        let f = if n >= onset { fr[n - onset] } else { 0.0 };
+        println!(
+            "  {:>4}  {:+.6}  {:+.6}  {:+.6}  {:+.6}",
+            n as isize - onset as isize,
+            bed[n],
+            st[n],
+            st[n] - bed[n],
+            f
+        );
+    }
+    println!(
+        "  bed d1 {:.5} d2 {:.5} | diff d1 {:.5} d2 {:.5} | fresh d1 {:.5} d2 {:.5}",
+        d1(&bed, onset - ms(2.0), onset + ms(20.0)),
+        d2(&bed, onset - ms(2.0), onset + ms(20.0)),
+        d1(
+            &st.iter().zip(&bed).map(|(a, b)| a - b).collect::<Vec<_>>(),
+            onset - ms(2.0),
+            onset + ms(20.0)
+        ),
+        d2(
+            &st.iter().zip(&bed).map(|(a, b)| a - b).collect::<Vec<_>>(),
+            onset - ms(2.0),
+            onset + ms(20.0)
+        ),
+        d1(&fr, 0, fr.len()),
+        d2(&fr, 0, fr.len()),
+    );
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if let (Some("probe"), Some(which)) = (args.get(1).map(String::as_str), args.get(2)) {
         probe(which);
+        return;
+    }
+    if let (Some("steal"), Some(which)) = (args.get(1).map(String::as_str), args.get(2)) {
+        probe_steal(which);
+        return;
+    }
+    if let (Some("rapid"), Some(which)) = (args.get(1).map(String::as_str), args.get(2)) {
+        probe_rapid(which);
         return;
     }
     match args.get(1).map(String::as_str) {
