@@ -71,6 +71,43 @@
 //! [`IPlugFrame::resizeView`](vst3::Steinberg::IPlugFrameTrait::resizeView) is
 //! how Pianoteq asks for a different size when you switch instrument layout or
 //! change its zoom, and ignoring it leaves a plugin drawing outside its window.
+//!
+//! # In front until closed, but never holding the keyboard hostage
+//!
+//! An editor is a window onto an instrument the user keeps *playing* through the
+//! rest of Tangent. So it must stay in front — reach for the mixer, the keys
+//! tab, an arrange dial, and the plugin's window has to still be there, not sunk
+//! behind the main window the click just raised — **without** taking the
+//! keyboard with it. Those pull in opposite directions and the resolution is the
+//! same on all three platforms: raise the editor to a floating z-order that
+//! sits above ordinary windows, and leave its *key* status alone.
+//!
+//! Staying in front is a stacking property, not a focus one. A window one level
+//! up stays drawn over the main window no matter which of the two is key, so a
+//! single click into Tangent's own window makes that window key (they are the
+//! same app — there is no click-to-focus penalty to pay first) and the dial
+//! under the cursor moves, while the editor keeps floating above, un-clicked and
+//! un-closed. Click the editor and it becomes key again, so the plugin's own
+//! text fields and shortcuts keep working. Neither window ever locks the other
+//! out; the only thing that closes the editor is closing it.
+//!
+//! What that floating level is *not* is modal. It sits below modal panels and
+//! the menu bar (`NSFloatingWindowLevel`, not `NSModalPanelWindowLevel`), so a
+//! save sheet or a right-click menu still comes up over it. macOS spells this
+//! with an `NSWindow` level, Windows with `HWND_TOPMOST` set `SWP_NOACTIVATE`
+//! (topmost is the z-order; no-activate is the promise not to steal focus while
+//! setting it), and X11 with the EWMH `_NET_WM_STATE_ABOVE` hint, which a
+//! compliant window manager honours and a bare one ignores — best-effort, and
+//! documented as such per platform.
+//!
+//! **A parent/child window relationship was the other candidate and is not used:
+//! nothing hands this code the main window to be a child *of*.** `open_handle`
+//! takes a controller handle and a title, no parent — reaching for the app's
+//! main window from inside here to adopt the editor into it would couple every
+//! editor to whatever happened to be frontmost (including another open editor),
+//! and closing a parent orders its children out from under a caller that still
+//! believes its window is up. A floating level needs no parent, keeps two open
+//! editors independent, and is undone by nothing but teardown.
 
 use std::cell::Cell;
 use std::time::Duration;
@@ -414,8 +451,9 @@ mod mac {
     use objc2::rc::{autoreleasepool, Retained};
     use objc2::{define_class, DefinedClass, MainThreadMarker, MainThreadOnly};
     use objc2_app_kit::{
-        NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSEventMask, NSView,
-        NSWindow, NSWindowDelegate, NSWindowStyleMask,
+        NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSEventMask,
+        NSFloatingWindowLevel, NSView, NSWindow, NSWindowDelegate, NSWindowLevel,
+        NSWindowStyleMask,
     };
     use objc2_foundation::{
         NSDate, NSDefaultRunLoopMode, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect,
@@ -435,6 +473,22 @@ mod mac {
     /// and to be resized by the plugin's own `resizeView`, which is what a
     /// plugin that would not answer `getSize` is likely to do anyway.
     const FALLBACK_SIZE: (i32, i32) = (800, 600);
+
+    /// The z-order an editor window sits at: above ordinary windows, below modal
+    /// panels and the menu bar.
+    ///
+    /// `NSFloatingWindowLevel` and deliberately not `NSModalPanelWindowLevel`.
+    /// Floating is what keeps the editor drawn over Tangent's main window while
+    /// the user works the mixer or the keys tab — a stacking fact that does not
+    /// touch key status, so the main window still takes a single click and the
+    /// plugin still becomes key when *it* is clicked (see the module docs).
+    /// Modal level would sit over save sheets and right-click menus too, which
+    /// is a different and wrong promise. A function rather than a `const`
+    /// because the AppKit level names are `static`s, not `const`s; the test at
+    /// the foot of this module reads the same one this sets.
+    fn editor_window_level() -> NSWindowLevel {
+        NSFloatingWindowLevel
+    }
 
     /// The two facts the delegate and the frame publish and [`Window`] reads.
     ///
@@ -647,6 +701,12 @@ mod mac {
             // for, discharged on the very next line after it.
             unsafe { window.setReleasedWhenClosed(false) };
             window.setTitle(&NSString::from_str(title));
+            // Float above the main window and stay there until closed, without
+            // becoming modal or holding key status — the whole of the module's
+            // "in front until closed" section, in one call. Set before the
+            // window is ever ordered on screen so it never flickers up at the
+            // normal level first.
+            window.setLevel(editor_window_level());
 
             // Our own NSView rather than the window's automatic content view:
             // the plugin puts its view inside this one and `removed()` has to
@@ -824,6 +884,34 @@ mod mac {
         app.finishLaunching();
         app.activate();
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::editor_window_level;
+        use objc2_app_kit::{NSModalPanelWindowLevel, NSNormalWindowLevel};
+
+        /// The floating level is the single fact the "in front until closed"
+        /// promise rests on, and it has two edges. Above normal is what keeps
+        /// the editor drawn over the main window while the user works the rest
+        /// of Tangent; below modal is what keeps a save sheet or a right-click
+        /// menu able to come up over the editor rather than under it. A
+        /// headless test can check exactly this — it is a comparison of window
+        /// levels, no window server needed — while whether a *single* click
+        /// returns focus to the main window is a thing only eyes on the running
+        /// app can confirm; the report says so.
+        #[test]
+        fn an_editor_floats_above_the_main_window_yet_below_modal_panels() {
+            assert!(
+                editor_window_level() > NSNormalWindowLevel,
+                "an editor at or below the normal level sinks behind the main \
+                 window the moment that window is clicked"
+            );
+            assert!(
+                editor_window_level() < NSModalPanelWindowLevel,
+                "an editor at modal level would sit over save sheets and menus"
+            );
+        }
+    }
 }
 
 /// Make this process one whose windows can appear and take focus.
@@ -878,8 +966,9 @@ mod win {
         AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
         GetWindowLongPtrW, LoadCursorW, PeekMessageW, RegisterClassW, SetForegroundWindow,
         SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, CW_USEDEFAULT,
-        GWLP_USERDATA, IDC_ARROW, PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_SHOW,
-        WM_CLOSE, WNDCLASSW, WS_CAPTION, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
+        GWLP_USERDATA, HWND_TOPMOST, IDC_ARROW, PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SWP_NOZORDER, SW_SHOW, WM_CLOSE, WNDCLASSW, WS_CAPTION, WS_MINIMIZEBOX, WS_OVERLAPPED,
+        WS_SYSMENU,
     };
 
     use super::EditorError;
@@ -956,6 +1045,29 @@ mod win {
         }
         // SAFETY: the default handler, with the arguments as given.
         unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+    }
+
+    /// Raise the editor into the topmost band and keep it there — Windows'
+    /// spelling of "in front until closed" (see the module docs).
+    ///
+    /// `HWND_TOPMOST` is the z-order; `SWP_NOACTIVATE` is the half that matters
+    /// as much — it moves the window without activating it, so keeping the
+    /// editor in front never yanks focus off whatever the user was doing. Size
+    /// and position are left untouched (`SWP_NOMOVE | SWP_NOSIZE`); this call
+    /// says one thing, which is "topmost".
+    fn keep_on_top(hwnd: HWND) {
+        // SAFETY: a live window this module owns; all-flags call with no buffers.
+        unsafe {
+            SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
     }
 
     /// The host's `IPlugFrame`: how the plugin asks for a different size.
@@ -1132,6 +1244,7 @@ mod win {
                 ShowWindow(hwnd, SW_SHOW);
                 SetForegroundWindow(hwnd);
             }
+            keep_on_top(hwnd);
             Ok(Self {
                 view,
                 frame,
@@ -1151,6 +1264,7 @@ mod win {
                 ShowWindow(self.hwnd, SW_SHOW);
                 SetForegroundWindow(self.hwnd);
             }
+            keep_on_top(self.hwnd);
         }
 
         pub(super) fn size(&self) -> (i32, i32) {
@@ -1562,6 +1676,8 @@ mod x11 {
             let wm_delete = atom(b"WM_DELETE_WINDOW")?;
             let net_wm_name = atom(b"_NET_WM_NAME")?;
             let utf8 = atom(b"UTF8_STRING")?;
+            let net_wm_state = atom(b"_NET_WM_STATE")?;
+            let net_wm_state_above = atom(b"_NET_WM_STATE_ABOVE")?;
             let _ = conn.change_property32(
                 PropMode::REPLACE,
                 window,
@@ -1578,6 +1694,21 @@ mod x11 {
             );
             let _ =
                 conn.change_property8(PropMode::REPLACE, window, net_wm_name, utf8, title.as_bytes());
+            // "In front until closed", X11's best-effort spelling: the EWMH
+            // above-state, set as a property before the window is mapped so a
+            // compliant window manager brings it up already on top. This is a
+            // hint, not a guarantee — a bare WM with no EWMH support ignores it
+            // and the window opens as an ordinary one, which is the honest
+            // limit of what X11 offers without a parent to be transient for
+            // (see the module docs). `focus`'s one-shot restack stays as the
+            // fallback raise.
+            let _ = conn.change_property32(
+                PropMode::REPLACE,
+                window,
+                net_wm_state,
+                AtomEnum::ATOM,
+                &[net_wm_state_above],
+            );
             // min = max is what "the user cannot resize it" is spelled as in
             // ICCCM; the plugin's own path goes through `resizeView`, which
             // moves both.
