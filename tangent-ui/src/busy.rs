@@ -24,20 +24,85 @@
 //! load one bay per frame, a decode reports per file — and never the thing
 //! carrying the message.
 //!
-//! **The mark is one triangle of the lattice, not the wordmark.** Reusing
-//! `splash::draw` was the first thought and it is the wrong drawing twice
-//! over: it fills its rect with the app's own opaque black and inks itself in
-//! two fixed colours, because a splash is up before anybody has seen the
-//! theme — neither is true here — and it needs some two hundred points of
-//! width before it will draw at all. Factoring the lattice out of it would
-//! mean editing `splash.rs`, and the launch path is not something to disturb
-//! for a decoration. So this draws the smallest honest crop of the same
-//! lattice, in the card's own measured ink. It is also the right SIZE of
-//! statement: the seven-letter wordmark means "the app is starting", and
-//! repeating it mid-session would say something that is not true.
+//! # The two-phase sequence, which is the whole mechanism
 //!
-//! A pure painter over a given rect, like every other band in this crate. No
-//! viewport, no window, nothing the plugin build cannot do.
+//! **The caller announces on one frame and acts on the next, and nothing here
+//! is driven by a wall clock.** That follows straight from the law above: a
+//! synchronous stall produces no frames, so a clock started at the moment the
+//! overlay was created has advanced by exactly one frame interval when the
+//! block begins and by the whole of the stall when it ends. An overlay that
+//! decided whether to appear by asking that clock would decide it at a moment
+//! when the answer is always "not yet", and would then be asked again only
+//! after the operation it was drawn for was over. So the gate is
+//! [`Busy::on_screen`], which is stamped by [`Busy::draw`] itself and means
+//! what it says: the overlay has been painted, so the frame carrying it has
+//! gone out, so the blocking call may now be made.
+//!
+//! ```ignore
+//! // Frame N — announce. Nothing blocking happens on this pass.
+//! self.busy = Some(Busy::new("Loading project").with_detail(name));
+//! ctx.request_repaint();
+//!
+//! // Frame N+1, at the top — the announcement is on screen, so act.
+//! if self.busy.as_ref().is_some_and(Busy::on_screen) {
+//!     self.open_project(&path);          // the block, in front of the user
+//!     self.busy_done = true;
+//! }
+//!
+//! // Every frame, at the BOTTOM, after the desk has drawn itself.
+//! if let Some(busy) = &mut self.busy {
+//!     let up = busy.draw(&painter, ctx.screen_rect(), face, time);
+//!     self.app.set_busy_up(up);          // the host's own flag; see below
+//!     if self.busy_done && busy.may_close() {
+//!         self.busy = None;
+//!     } else {
+//!         ctx.request_repaint();         // nothing else is asking for frames
+//!     }
+//! }
+//! ```
+//!
+//! `reconcile_camera` in `desktop.rs` is the same handshake for the same
+//! reason — "announce first, act next frame", around an `open_camera` that
+//! blocks for up to four seconds — and `painted_once` there is the first-frame
+//! form of it. This is that pattern with a picture attached.
+//!
+//! **It is a picture, and the host owns everything else.** It paints; it does
+//! not consume input, and with a [`Painter`] it could not. Two duties come
+//! with using it, both the host's:
+//!
+//! * Tell the app it is covered, the way `set_splash_up` does, so nothing
+//!   underneath opens a dialog or takes a click while a cover is up.
+//!   [`Busy::draw`] returns whether it painted precisely so there is a value
+//!   to hand over.
+//! * Swallow the frame's input for a CHUNKED operation, where frames really do
+//!   arrive and clicks really do land on the desk underneath an overlay that
+//!   says the app is busy. During a single block there is no input to swallow
+//!   and a different hazard instead: the clicks queue in the window server and
+//!   are delivered when the thread comes back, at whatever is under the
+//!   pointer by then.
+//!
+//! **And it has a way out.** [`MAX_SILENT`] is the cap `splash.rs` carries as
+//! `SPLASH_MAX`, for the reason stated there: a thing that never answers is
+//! exactly the case where nobody may be left staring at a cover with no way
+//! through. It is measured on silence rather than on total time, so a render
+//! counting up may take all afternoon and a constructor that has said nothing
+//! for twenty seconds gives the desk back.
+//!
+//! **And it does not stop the beachball.** Past roughly two seconds without a
+//! run loop the macOS window server declares the process unresponsive and
+//! paints the spinning wheel over whatever is there, this overlay included.
+//! Nothing drawn from the blocked thread can prevent that, because the thread
+//! that would draw it is the one that is gone. What this buys is that the
+//! frozen frame underneath the wheel SAYS what is happening instead of being a
+//! half-drawn desk. The only real fixes for a long block are the two that keep
+//! frames coming — chunk the work so a slice runs per frame, or move it to a
+//! worker and report from the UI thread — and both of those turn the overlay
+//! into what it is best at, which is the case where it can actually animate.
+//!
+//! A pure painter over a given rect, like every other band in this crate: the
+//! only state it keeps is when it was first painted and when it last had
+//! something new to say, both stamped by its own [`Busy::draw`]. No viewport,
+//! no window, nothing the plugin build cannot do.
 
 use crate::face::fit_mono;
 use crate::fonts;
@@ -116,15 +181,40 @@ impl Progress {
 /// and vanishes inside two frames is a glitch, not a loading screen. Shorter
 /// than the splash's figure on purpose — this one interrupts somebody
 /// mid-gesture and the desk it covers is already drawn behind it, so it has
-/// less to justify and should be gone sooner.
+/// less to justify and should be gone sooner. Counted from the frame it was
+/// PAINTED on and not from the one it was created on, which are the same frame
+/// for a known block and are not for a [`Busy::deferred`] one.
 pub const MIN_VISIBLE: Duration = Duration::from_millis(400);
 
 /// How long [`Busy::deferred`] waits before showing itself at all.
 ///
-/// The other half of the flicker problem: an operation that turns out to be
-/// instant should never draw an overlay, not even for the minimum above. Under
-/// this long nobody perceives a wait, so nobody needs telling about one.
+/// The other half of the flicker problem, and it is only meaningful for an
+/// operation that keeps painting: under this long nobody perceives a wait, so
+/// nobody needs telling about one. **A delay cannot help a single blocking
+/// call** — see the law at the top of the module and the note on
+/// [`Busy::deferred`] — so this is a chunked operation's setting alone.
 pub const SHOW_AFTER: Duration = Duration::from_millis(120);
+
+/// How long an overlay may sit there with nothing new to say before it gives
+/// the desk back.
+///
+/// `splash.rs` carries the same idea as `SPLASH_MAX` and states the reason
+/// better than this could: "the cap is the important half — a device that
+/// never answers is exactly the case where the user must not be left staring
+/// at a wordmark with no way through". Measured here on SILENCE rather than on
+/// total time, because unlike a launch these operations are not all short: an
+/// offline render that is counting up is answering and may honestly take all
+/// afternoon, while a plugin constructor that has said nothing for twenty
+/// seconds is not coming back. What counts as speaking is a changed `progress`
+/// or `detail`, noticed by [`Busy::draw`] rather than reported by the caller —
+/// an overlay with neither can never speak, so for that one the cap runs from
+/// the first paint, which is right: a static cover IS the case this guards.
+///
+/// **It is only an escape for the operations that can still paint.** A single
+/// block that never returns takes the whole app with it and no overlay can
+/// outlive the thread that draws it — the other half of why the honest answer
+/// to a long block is a worker.
+pub const MAX_SILENT: Duration = Duration::from_secs(20);
 
 /// One thing the app is waiting on, and the timing that keeps it from
 /// flickering.
@@ -133,17 +223,25 @@ pub const SHOW_AFTER: Duration = Duration::from_millis(120);
 ///
 /// * [`Busy::new`] — the caller KNOWS it is about to block, and blocks in one
 ///   go: opening a project, instantiating a plugin, decoding an import,
-///   starting an offline render. Nothing can be measured after the fact
-///   because nothing runs after the fact, so it goes up on the frame BEFORE
-///   the call and the delay is zero.
-/// * [`Busy::deferred`] — usually instant, occasionally not: pasting tracks,
-///   duplicating a lane, an edit that rebuilds a clip's peaks. Most of the
-///   time the operation finishes inside [`SHOW_AFTER`] and the overlay is
-///   never painted at all, which is better than any overlay could be.
+///   starting an offline render. It goes up on the frame BEFORE the call, and
+///   [`Busy::on_screen`] is what says that frame has happened.
+/// * [`Busy::deferred`] — an operation that comes back between chunks and is
+///   usually over before anybody notices: an export rendering a slice per
+///   frame, the insert loader taking a bay per frame, a multi-file decode.
+///   Frames arrive, so the wall clock genuinely advances, so a delay can
+///   genuinely hide the short ones.
+///
+/// There is deliberately no third constructor for "might be slow, one blocking
+/// call", because there cannot be one: the only frame on which such an overlay
+/// could be painted is the frame before the call, which is before anybody
+/// knows whether it will be slow. A caller in that position decides from what
+/// it is about to do — eight tracks announce, one does not — and a caller that
+/// cannot decide should chunk the work instead.
 ///
 /// The fields are public so a chunked operation can rewrite its `detail` and
-/// `progress` each frame without rebuilding the struct; `started` is not,
-/// because the timing below is only honest if it is stamped once.
+/// `progress` each frame without rebuilding the struct; the stamps are not,
+/// because the timing below is only honest if they are made by the paint
+/// itself.
 #[derive(Clone, Debug)]
 pub struct Busy {
     /// What is happening, in the user's words: "Loading project", "Loading
@@ -157,15 +255,29 @@ pub struct Busy {
     /// moment, where even a hatch would be noise. Everything else should say
     /// [`Progress::Indeterminate`] rather than nothing.
     pub progress: Option<Progress>,
-    /// How long to wait before appearing. Zero for a known block.
+    /// How long to wait before appearing. Zero for a known block, which is the
+    /// only honest figure there. See [`SHOW_AFTER`].
     pub delay: Duration,
     /// How long to stay once it has appeared. See [`MIN_VISIBLE`].
     pub min_visible: Duration,
+    /// How long it may stay silent before it leaves. See [`MAX_SILENT`].
+    pub cap: Duration,
     started: Instant,
+    /// When [`Busy::draw`] first painted it, which is the only moment anybody
+    /// can say it was on screen.
+    shown: Option<Instant>,
+    /// When it last said something new, and what that was — the cap measures
+    /// the gap since.
+    spoke_at: Option<Instant>,
+    spoke_progress: Option<Progress>,
+    spoke_detail: Option<String>,
 }
 
 impl Busy {
     /// An overlay for a stall the caller already knows it is about to cause.
+    ///
+    /// Announce it, paint it, and make the blocking call on the next frame,
+    /// once [`Busy::on_screen`] says the announcement is really up.
     pub fn new(label: impl Into<String>) -> Self {
         Busy {
             label: label.into(),
@@ -173,12 +285,23 @@ impl Busy {
             progress: None,
             delay: Duration::ZERO,
             min_visible: MIN_VISIBLE,
+            cap: MAX_SILENT,
             started: Instant::now(),
+            shown: None,
+            spoke_at: None,
+            spoke_progress: None,
+            spoke_detail: None,
         }
     }
 
-    /// An overlay that appears only if the operation is still going after
-    /// [`SHOW_AFTER`].
+    /// An overlay for a CHUNKED operation, which appears only if the operation
+    /// is still going after [`SHOW_AFTER`].
+    ///
+    /// **Not for a single blocking call**, which is the one thing a delay
+    /// cannot survive: the clock it is measured against stops for the whole of
+    /// the block, so the overlay would be asked "are you due yet?" once, one
+    /// frame after being made, and next asked after the operation was already
+    /// over. Use [`Busy::new`] there and pay the frame.
     pub fn deferred(label: impl Into<String>) -> Self {
         Busy {
             delay: SHOW_AFTER,
@@ -206,14 +329,54 @@ impl Busy {
         self
     }
 
-    /// How long since the operation began.
+    pub fn with_cap(mut self, cap: Duration) -> Self {
+        self.cap = cap;
+        self
+    }
+
+    /// How long since the operation was announced.
+    ///
+    /// Fine for a log line and for a chunked operation's own arithmetic. It is
+    /// NOT what decides whether the overlay is up: see the module's law.
     pub fn elapsed(&self) -> Duration {
         self.started.elapsed()
     }
 
-    /// Whether to paint it this frame.
+    /// **Is the announcement actually on the screen?**
+    ///
+    /// The gate of the two-phase sequence, and the one thing a caller with a
+    /// blocking call has to wait for.
+    ///
+    /// It goes true the moment [`Busy::draw`] paints, which is why WHERE the
+    /// two are called from matters: `draw` belongs at the bottom of the frame,
+    /// after the desk, and this belongs at the top of the next one. eframe
+    /// presents when `update` returns, so a caller that keeps that order is
+    /// asking about a frame that really has reached the screen — the same
+    /// reasoning `painted_once` in `desktop.rs` is built on. Asking further
+    /// down the SAME frame it was painted in would answer yes about pixels
+    /// nobody has seen yet.
+    ///
+    /// A chunked caller does not gate its work on this; it does a slice every
+    /// frame and lets the overlay appear when it is due.
+    pub fn on_screen(&self) -> bool {
+        self.shown.is_some()
+    }
+
+    /// How long it has been on screen, or `None` if it never has.
+    pub fn shown_for(&self) -> Option<Duration> {
+        self.shown.map(|t| t.elapsed())
+    }
+
+    /// How long since it last had something new to say, or `None` if it has
+    /// never been painted.
+    pub fn silent_for(&self) -> Option<Duration> {
+        self.spoke_at.map(|t| t.elapsed())
+    }
+
+    /// Whether to paint it this frame. [`Busy::draw`] asks this itself, so a
+    /// caller only needs it to decide something else.
     pub fn is_visible(&self) -> bool {
-        visible_after(self.elapsed(), self.delay)
+        visible_at(self.elapsed(), self.silent_for(), self.delay, self.cap)
     }
 
     /// Whether an overlay whose work has FINISHED may be dropped now.
@@ -221,25 +384,45 @@ impl Busy {
     /// Ask this only once the operation is done; while it is still running the
     /// overlay stays up regardless of any of this.
     pub fn may_close(&self) -> bool {
-        may_close_after(self.elapsed(), self.delay, self.min_visible)
+        may_close_after(self.shown_for(), self.min_visible)
     }
 }
 
-/// Whether an overlay is on screen this far into its operation.
-pub fn visible_after(elapsed: Duration, delay: Duration) -> bool {
-    elapsed >= delay
+/// Whether an overlay is on screen, given how long ago it was announced and
+/// how long it has been silent.
+///
+/// Two gates and they answer different questions. The delay is the flicker
+/// guard for a chunked operation and is measured from the announcement,
+/// because that is when the work started. The cap is the escape and is
+/// measured from the last thing the overlay had to say, because that is the
+/// last evidence anything is still happening — `None` means it has never been
+/// painted, so there is nothing to have gone quiet.
+pub fn visible_at(
+    elapsed: Duration,
+    silent_for: Option<Duration>,
+    delay: Duration,
+    cap: Duration,
+) -> bool {
+    elapsed >= delay && !capped_after(silent_for, cap)
+}
+
+/// Whether an overlay that last spoke `silent_for` ago has outstayed its
+/// welcome. See [`MAX_SILENT`].
+pub fn capped_after(silent_for: Option<Duration>, cap: Duration) -> bool {
+    silent_for.is_some_and(|quiet| quiet >= cap)
 }
 
 /// Whether a finished overlay may be taken down.
 ///
 /// Two ways out, and they are not the same one. Either it never appeared — the
-/// work beat the delay, which is the case the delay exists for — or it
-/// appeared and has served its minimum. The arithmetic is in WALL TIME and not
-/// in frames on purpose: during the block there ARE no frames, and an overlay
-/// that owed the screen a count of paints it could never make would still be
-/// sitting there after the app came back.
-pub fn may_close_after(elapsed: Duration, delay: Duration, min_visible: Duration) -> bool {
-    elapsed < delay || elapsed >= delay.saturating_add(min_visible)
+/// work beat the delay, which is the case the delay exists for, and an overlay
+/// nobody saw owes the screen nothing — or it appeared and has served its
+/// minimum from the frame it appeared ON. Counting from the paint rather than
+/// from the announcement is what makes the minimum mean what it says: a
+/// deferred overlay that went up 120 ms late would otherwise owe 120 ms less
+/// than one that went up at once.
+pub fn may_close_after(shown_for: Option<Duration>, min_visible: Duration) -> bool {
+    shown_for.is_none_or(|up| up >= min_visible)
 }
 
 // ── the dress ───────────────────────────────────────────────────────────────
@@ -269,6 +452,20 @@ const CARD_FLOOR: f32 = 1.6;
 /// as a bar at 100%. Where the well cannot recede, `distinct_surface_at` lifts
 /// it instead.
 const TRACK_FLOOR: f32 = 1.35;
+/// And how far the fill has to stand off that track, so the meter's two halves
+/// are told apart at a glance. WCAG's figure for a graphical object, which is
+/// what a bar is.
+const FILL_FLOOR: f32 = 3.0;
+/// How far the lattice's LINES have to stand off the card.
+///
+/// Lower than the ink's floor on purpose — they are a rule and not a word, and
+/// the drawing wants them quieter than the nodes they join — but a floor all
+/// the same. This was the one colour in the module picked by arithmetic
+/// (`ink.gamma_multiply(0.45)`), which is not even the arithmetic it looked
+/// like: `gamma_multiply` scales a PREMULTIPLIED colour, so what it returns is
+/// a translucent ink whose measured luminance is not the luminance of anything
+/// that ends up on screen. Measured on the card like everything else now.
+const LATTICE_FLOOR: f32 = 2.0;
 
 /// Everything the overlay is made of, derived from the desk's own face.
 ///
@@ -292,6 +489,10 @@ pub struct Dress {
     /// The detail line: quieter by weight, still held to reading contrast.
     pub faint: Color32,
     pub edge: Color32,
+    /// The lattice's lines. The nodes are drawn in `ink`; these are the app's
+    /// own hairline, so the mark is one drawing at two weights rather than a
+    /// shape with an alpha on it. See [`LATTICE_FLOOR`].
+    pub lattice: Color32,
     /// The meter's well, and the fill that runs along it.
     pub track: Color32,
     pub fill: Color32,
@@ -322,6 +523,10 @@ impl Dress {
             ink: s.ink,
             faint: s.faint,
             edge: s.edge,
+            // The hairline `surface_of` already derives — ink stepped toward
+            // the ground — held to its own floor in case a face ever puts it
+            // too close to the card to see.
+            lattice: distinct_surface_at(s.edge, card, LATTICE_FLOOR),
             track,
             // **The fill is ink, not a colour of its own.** A progress bar is
             // a reading and this app draws its readings in ink; a fifth
@@ -329,7 +534,7 @@ impl Dress {
             // meter green and the channel palette would be one too many. It
             // still goes through the measurement, because the track it runs
             // along is a surface like any other.
-            fill: distinct_surface_at(s.ink, track, 3.0),
+            fill: distinct_surface_at(s.ink, track, FILL_FLOOR),
         }
     }
 }
@@ -552,17 +757,56 @@ const HATCH_PERIOD: f64 = 1.6;
 /// The hatch's spacing, in points.
 const HATCH_STEP: f32 = 9.0;
 
-/// Draw the overlay over `rect`, on a desk whose face is `face`.
-///
-/// `time` is the host's running clock in seconds (`ctx.input(|i| i.time)`) and
-/// drives the only motion here. **Nothing depends on it being fresh**: the
-/// hatch is correct at every phase, so a frozen frame — which is exactly what
-/// a blocking operation leaves on the screen — is a correct drawing and not a
-/// stopped animation.
-pub fn draw(painter: &Painter, rect: Rect, face: Color32, busy: &Busy, time: f64) {
-    if !rect.is_positive() {
-        return;
+impl Busy {
+    /// Draw the overlay over `rect`, on a desk whose face is `face`, and say
+    /// whether anything was painted.
+    ///
+    /// **The visibility gate is in HERE and not at the call site**, because a
+    /// gate a caller has to remember is a gate that gets copied without it —
+    /// an overlay that paints unconditionally never hides, and the delay,
+    /// the cap and every word about flicker above become decoration. Ask it
+    /// every frame and let it decide.
+    ///
+    /// The answer is what the host hands to its own "something is covering the
+    /// desk" flag — `set_splash_up`'s shape — because this paints and does
+    /// nothing else; see the module doc on what the host still owes.
+    ///
+    /// It takes `&mut self` for the two stamps nothing else can make honestly:
+    /// the first paint, which is what [`Busy::on_screen`] answers with, and the
+    /// last time `progress` or `detail` changed, which is what [`MAX_SILENT`]
+    /// measures its silence from. Both are facts about the PAINT, so the paint
+    /// is what records them.
+    ///
+    /// `time` is the host's running clock in seconds (`ctx.input(|i| i.time)`)
+    /// and drives the only motion here. **Nothing depends on it being fresh**:
+    /// the hatch is correct at every phase, so a frozen frame — which is
+    /// exactly what a blocking operation leaves on the screen — is a correct
+    /// drawing and not a stopped animation.
+    pub fn draw(&mut self, painter: &Painter, rect: Rect, face: Color32, time: f64) -> bool {
+        if !rect.is_positive() || !self.is_visible() {
+            return false;
+        }
+        let now = Instant::now();
+        if self.shown.is_none() {
+            self.shown = Some(now);
+            self.spoke_at = Some(now);
+            self.spoke_progress = self.progress;
+            self.spoke_detail.clone_from(&self.detail);
+        } else if self.progress != self.spoke_progress || self.detail != self.spoke_detail {
+            // Something new on screen is the only evidence available that the
+            // operation is still alive, and it is evidence the caller cannot
+            // forge by accident: it has to have changed what it is showing.
+            self.spoke_progress = self.progress;
+            self.spoke_detail.clone_from(&self.detail);
+            self.spoke_at = Some(now);
+        }
+        paint(painter, rect, face, self, time);
+        true
     }
+}
+
+/// The drawing itself, once the decision to draw has been made.
+fn paint(painter: &Painter, rect: Rect, face: Color32, busy: &Busy, time: f64) {
     let d = Dress::of(face);
     let p = painter.with_clip_rect(rect);
     p.rect_filled(rect, 0.0, d.scrim);
@@ -579,7 +823,7 @@ pub fn draw(painter: &Painter, rect: Rect, face: Color32, busy: &Busy, time: f64
     );
 
     if let Some(mark) = l.mark {
-        draw_mark(&p, mark, d.ink);
+        draw_mark(&p, mark, d.ink, d.lattice);
     }
 
     let label_font = FontId::new(14.0, fonts::courier_bold());
@@ -610,7 +854,11 @@ pub fn draw(painter: &Painter, rect: Rect, face: Color32, busy: &Busy, time: f64
 /// Three nodes and the lines out of all six lattice directions, with the ones
 /// that lead nowhere running off the edge — the crop that makes it read as a
 /// piece of an infinite lattice rather than as a triangle somebody drew.
-fn draw_mark(painter: &Painter, rect: Rect, ink: Color32) {
+///
+/// Two inks, both measured on the card: `ink` for the nodes, `lattice` for the
+/// lines, which is the app's own hairline and therefore a weight the theme
+/// already decided rather than a number picked here.
+fn draw_mark(painter: &Painter, rect: Rect, ink: Color32, lattice: Color32) {
     if !rect.is_positive() {
         return;
     }
@@ -638,7 +886,7 @@ fn draw_mark(painter: &Painter, rect: Rect, ink: Color32) {
         Vec2::new(-a * 0.5, -h),
     ];
     let p = painter.with_clip_rect(rect);
-    let line = Stroke::new(1.0_f32, ink.gamma_multiply(0.45));
+    let line = Stroke::new(1.0_f32, lattice);
     for from in nodes {
         for dir in dirs {
             let to = from + dir;
@@ -709,6 +957,17 @@ fn draw_meter(painter: &Painter, l: &Layout, bar: Rect, d: &Dress, progress: Pro
 /// outside and have no length. Cut by MEASURING rather than by counting
 /// characters, because the card's width is what they have to fit inside and a
 /// character count is only a guess at that.
+///
+/// **Measured by halving, not by growing.** Adding one character at a time
+/// laid out the string once per character kept, and this runs twice a frame on
+/// the screen that is up because the machine is already struggling. A prefix of
+/// a no-wrap line never gets narrower as it gets longer, so the fit is
+/// monotonic and the same answer comes out of a halving search in
+/// `log2(chars)` probes — seven for an eighty character path instead of the
+/// forty-odd it used to take. The answer is the same one either way: the
+/// LONGEST prefix that still fits with the ellipsis on the end. The bounds walk
+/// char boundaries, so a multi-byte name is never sliced through the middle of
+/// a character.
 fn cut(painter: &Painter, width: f32, text: &str, font: &FontId) -> String {
     let measure = |t: &str| {
         painter
@@ -719,15 +978,33 @@ fn cut(painter: &Painter, width: f32, text: &str, font: &FontId) -> String {
     if measure(text) <= width {
         return text.to_owned();
     }
-    let mut out = String::new();
-    for ch in text.chars() {
-        out.push(ch);
-        if measure(&format!("{out}\u{2026}")) > width {
-            out.pop();
-            break;
+    // Where every character ENDS, so `ends[k - 1]` is the length of the first
+    // `k` characters and `k == 0` is the empty prefix.
+    let ends: Vec<usize> = text
+        .char_indices()
+        .skip(1)
+        .map(|(i, _)| i)
+        .chain(std::iter::once(text.len()))
+        .collect();
+    let with_ellipsis = |k: usize| {
+        let cut_at = if k == 0 { 0 } else { ends[k - 1] };
+        format!("{}\u{2026}", &text[..cut_at])
+    };
+    // `lo` fits, `hi` does not: the whole string is already too wide and an
+    // ellipsis only makes it wider, so `hi` starts out true by the test above.
+    // `lo` starts at the ellipsis alone, which is kept even when it does not
+    // fit — a row too narrow for one glyph has nothing better to show, and the
+    // painter clips it.
+    let (mut lo, mut hi) = (0_usize, ends.len());
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if measure(&with_ellipsis(mid)) <= width {
+            lo = mid;
+        } else {
+            hi = mid;
         }
     }
-    format!("{out}\u{2026}")
+    with_ellipsis(lo)
 }
 
 #[cfg(test)]
@@ -741,6 +1018,18 @@ mod tests {
         let ctx = egui::Context::default();
         fonts::install(&ctx, fonts::FontChoice::default(), None);
         ctx
+    }
+
+    /// One frame, drawn and presented, answering what `draw` answered — the
+    /// smallest form of the host's own loop.
+    fn paint_once(ctx: &egui::Context, busy: &mut Busy, rect: Rect) -> bool {
+        let mut painted = false;
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                painted = busy.draw(ui.painter(), rect, FACE, 0.0);
+            });
+        });
+        painted
     }
 
     /// It must draw at every size a window can be, including the degenerate
@@ -772,7 +1061,7 @@ mod tests {
                 let _ = ctx.run(Default::default(), |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
                         for t in [0.0_f64, 0.4, 12.7] {
-                            draw(ui.painter(), r, FACE, &busy, t);
+                            busy.draw(ui.painter(), r, FACE, t);
                         }
                     });
                 });
@@ -924,48 +1213,163 @@ mod tests {
         }
     }
 
-    /// **The two timings, and the flicker each one forbids.**
+    /// **The three timings, and what each one forbids.**
     ///
     /// Pure arithmetic on purpose: the wiring cannot be asked to sleep, and
-    /// this is the whole of what stops a 30 ms paste from strobing the screen.
+    /// this is the whole of what stops a 30 ms paste from strobing the screen,
+    /// what keeps a deferred overlay off the screen for an operation that
+    /// beats it, and what gives the desk back when nothing ever answers.
     #[test]
     fn the_delay_and_the_minimum_forbid_a_flicker() {
         let ms = Duration::from_millis;
-        let (d, m) = (SHOW_AFTER, MIN_VISIBLE);
+        let (d, m, cap) = (SHOW_AFTER, MIN_VISIBLE, MAX_SILENT);
+        let due = |elapsed, silent| visible_at(elapsed, silent, d, cap);
 
         // Nothing is painted before the delay is up.
-        assert!(!visible_after(ms(0), d));
-        assert!(!visible_after(ms(119), d));
-        assert!(visible_after(ms(120), d));
-        // Work that beat the delay closes at once: it was never on screen, so
-        // it owes the screen nothing.
-        assert!(may_close_after(ms(0), d, m));
-        assert!(may_close_after(ms(119), d, m));
-        // Work that finished just after it appeared owes the full minimum from
-        // the moment it appeared — not from the moment it started.
-        assert!(!may_close_after(ms(120), d, m));
-        assert!(!may_close_after(ms(519), d, m));
-        assert!(may_close_after(ms(520), d, m));
-        // A zero delay is up on the first painted frame and still owes the
-        // minimum from that frame.
-        assert!(visible_after(Duration::ZERO, Duration::ZERO));
-        assert!(!may_close_after(ms(399), Duration::ZERO, m));
-        assert!(may_close_after(m, Duration::ZERO, m));
+        assert!(!due(ms(0), None));
+        assert!(!due(ms(119), None));
+        assert!(due(ms(120), None));
+        // Work that never appeared closes at once: it owes the screen nothing.
+        assert!(may_close_after(None, m));
+        // Work that appeared owes the full minimum FROM THE PAINT, not from
+        // the moment it was announced — the two differ by the delay.
+        assert!(!may_close_after(Some(ms(0)), m));
+        assert!(!may_close_after(Some(ms(399)), m));
+        assert!(may_close_after(Some(m), m));
         // A minimum of zero is a legal thing to ask for and closes at once.
-        assert!(may_close_after(ms(0), Duration::ZERO, Duration::ZERO));
+        assert!(may_close_after(Some(ms(0)), Duration::ZERO));
 
-        // The two constructors carry the two settings, and nothing else.
+        // **The cap, measured on silence.** An overlay that has never been
+        // painted has not gone quiet; one that has been talking is answering;
+        // one that has said nothing for the cap is not coming back, and the
+        // desk goes back to whoever is sitting in front of it.
+        assert!(!capped_after(None, cap));
+        assert!(!capped_after(Some(cap - ms(1)), cap));
+        assert!(capped_after(Some(cap), cap));
+        assert!(due(Duration::from_secs(600), Some(ms(80))));
+        assert!(!due(Duration::from_secs(600), Some(cap)));
+
+        // The two constructors carry their settings, and nothing else.
         let now = Busy::new("Loading project");
         assert_eq!(now.delay, Duration::ZERO);
         assert_eq!(now.min_visible, MIN_VISIBLE);
+        assert_eq!(now.cap, MAX_SILENT);
         assert!(now.is_visible(), "a known block is up on the next frame");
-        let later = Busy::deferred("Pasting 8 tracks");
+        assert!(!now.on_screen(), "and not before it has been painted");
+        let later = Busy::deferred("Exporting");
         assert_eq!(later.delay, SHOW_AFTER);
         assert_eq!(later.min_visible, MIN_VISIBLE);
-        assert_eq!(later.label, "Pasting 8 tracks");
+        assert_eq!(later.label, "Exporting");
+        assert!(!later.is_visible(), "a deferred overlay waits out its delay");
+        let tuned = Busy::new("x")
+            .with_delay(ms(50))
+            .with_min_visible(ms(60))
+            .with_cap(Duration::from_secs(600));
+        assert_eq!((tuned.delay, tuned.min_visible, tuned.cap), (ms(50), ms(60), Duration::from_secs(600)));
+    }
+
+    /// **The handshake: painted first, blocked second.**
+    ///
+    /// The law the module is built on, as a test. A caller with one blocking
+    /// call announces on frame N and acts on frame N+1, and the only honest
+    /// signal that frame N happened is that the overlay was PAINTED — a wall
+    /// clock cannot say so, because during the block there is no clock being
+    /// read. `desktop.rs` keeps the same handshake around `open_camera` and
+    /// the same first-frame gate in `painted_once`.
+    #[test]
+    fn the_block_waits_for_the_frame_that_announces_it() {
+        let ctx = ctx();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+
+        let mut busy = Busy::new("Loading project");
+        assert!(!busy.on_screen(), "nothing has been painted, so nothing may block");
+        assert!(busy.shown_for().is_none() && busy.silent_for().is_none());
+        assert!(paint_once(&ctx, &mut busy, rect), "a known block paints at once");
+        assert!(busy.on_screen(), "the announcement is up; now the block may run");
+        assert!(
+            !busy.may_close(),
+            "an operation that turned out to be instant still owes its minimum"
+        );
+
+        // A deferred overlay is not due, paints nothing, says nothing was
+        // painted, and — never having been seen — closes the moment its work
+        // is done.
+        let mut later = Busy::deferred("Exporting");
+        assert!(!paint_once(&ctx, &mut later, rect));
+        assert!(!later.on_screen());
+        assert!(later.may_close());
+    }
+
+    /// **An overlay that is not due paints NOTHING.**
+    ///
+    /// The gate lives inside `draw` rather than at the call site, so this
+    /// counts the shapes that reach the screen rather than trusting the
+    /// return value: a caller that copied a snippet without a guard would
+    /// otherwise get an overlay that never hides, and every word about
+    /// flicker in this module would be decoration.
+    #[test]
+    fn an_overlay_that_is_not_due_paints_nothing() {
+        let ctx = ctx();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let shapes = |busy: Option<&mut Busy>| {
+            let mut busy = busy;
+            ctx.run(Default::default(), |ctx| {
+                let p = ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    egui::Id::new("busy-under-test"),
+                ));
+                if let Some(b) = busy.as_deref_mut() {
+                    b.draw(&p, rect, FACE, 0.0);
+                }
+            })
+            .shapes
+            .len()
+        };
+        let bare = shapes(None);
+        let mut not_due = Busy::deferred("Pasting 8 tracks");
         assert_eq!(
-            Busy::new("x").with_delay(ms(50)).with_min_visible(ms(60)).delay,
-            ms(50)
+            shapes(Some(&mut not_due)),
+            bare,
+            "an overlay before its delay put shapes on the screen"
+        );
+        let mut capped = Busy::new("Loading Serum").with_cap(Duration::ZERO);
+        assert!(paint_once(&ctx, &mut capped, rect), "the first paint is what starts the clock");
+        assert_eq!(
+            shapes(Some(&mut capped)),
+            bare,
+            "a capped overlay went on owning the screen"
+        );
+        let mut due = Busy::new("Loading project");
+        assert!(shapes(Some(&mut due)) > bare, "a due overlay drew nothing");
+    }
+
+    /// **Speaking is what resets the cap, and only speaking.**
+    ///
+    /// A changed count or a changed file name is evidence the operation is
+    /// alive; repainting the same frame is not, or the cap would never fire on
+    /// the exact case it exists for — an overlay frozen at "3 of 12" forever.
+    #[test]
+    fn an_overlay_that_keeps_talking_is_never_capped() {
+        let ctx = ctx();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let mut busy = Busy::new("Decoding").with_progress(Progress::Steps { done: 0, total: 9 });
+        assert!(paint_once(&ctx, &mut busy, rect));
+        assert_eq!(busy.spoke_progress, Some(Progress::Steps { done: 0, total: 9 }));
+        let first = busy.spoke_at.expect("the first paint stamps it");
+
+        busy.progress = Some(Progress::Steps { done: 1, total: 9 });
+        busy.detail = Some("hat 3.wav".to_owned());
+        assert!(paint_once(&ctx, &mut busy, rect));
+        let spoke = busy.spoke_at.expect("news moves the stamp");
+        assert!(spoke >= first);
+        assert_eq!(busy.spoke_progress, Some(Progress::Steps { done: 1, total: 9 }));
+        assert_eq!(busy.spoke_detail.as_deref(), Some("hat 3.wav"));
+
+        assert!(paint_once(&ctx, &mut busy, rect));
+        assert_eq!(
+            busy.spoke_at,
+            Some(spoke),
+            "repainting the same thing counted as saying something"
         );
     }
 
@@ -973,7 +1377,12 @@ mod tests {
     /// can be handed** — the desk's strip and the band's ground. The label ink
     /// and the detail ink measured on the CARD they land on, the meter's fill
     /// on its own track, the card told apart from the dimmed desk, and the
-    /// dimming itself measured against the desk it dims. The pattern
+    /// dimming itself measured against the desk it dims.
+    ///
+    /// **Every floor here is the module's OWN constant**, not a rounder number
+    /// underneath it. A sweep that asserts 1.1 where the code promises 1.35
+    /// passes while two thirds of the promise has already been lost, which is
+    /// the sort of green that costs a screenshot to discover. The pattern
     /// `face::every_theme_dresses_a_face` and `shell::every_theme_dresses_the_chrome`
     /// set, for the same reason: every one of the colour bugs this app has
     /// shipped was found by a screenshot, and this is the screenshot as a test.
@@ -1018,15 +1427,18 @@ mod tests {
                     };
                     check("the label on the card", contrast_ratio(d.ink, d.card), 4.5);
                     check("the detail on the card", contrast_ratio(d.faint, d.card), 4.5);
-                    check("the fill on the track", contrast_ratio(d.fill, d.track), 3.0);
-                    check("the track on the card", contrast_ratio(d.track, d.card), 1.1);
+                    check("the fill on the track", contrast_ratio(d.fill, d.track), FILL_FLOOR);
+                    check("the track on the card", contrast_ratio(d.track, d.card), TRACK_FLOOR);
                     check("the card's edge", contrast_ratio(d.edge, d.card), 1.6);
+                    // The lattice's LINES, which used to be the one colour
+                    // here picked by arithmetic instead of measured.
+                    check("the lattice on the card", contrast_ratio(d.lattice, d.card), LATTICE_FLOOR);
                     // The card must stand off the desk it is floating over —
                     // the DIMMED desk, which is what is actually behind it.
-                    check("the card on the dimmed desk", contrast_ratio(d.card, d.veiled), 1.5);
+                    check("the card on the dimmed desk", contrast_ratio(d.card, d.veiled), CARD_FLOOR);
                     // And the dimming has to be a dimming. This is the one
                     // that a black scrim silently fails on every dark theme.
-                    check("the scrim over the desk", contrast_ratio(d.veiled, face), 2.15);
+                    check("the scrim over the desk", contrast_ratio(d.veiled, face), SCRIM_TARGET);
                     // Translucent, always: the work stays visible under it.
                     if d.scrim.a() == 0 || d.scrim.a() == 255 {
                         bad.push(format!(
@@ -1107,7 +1519,17 @@ mod tests {
                     width(&widest, &font) <= read.width() + 0.5,
                     "the widest reading overflows its column"
                 );
-                draw(p, rect, FACE, &busy, 0.0);
+                // **The cut is the LONGEST prefix that fits**, which is
+                // the property the halving search has to keep and the one a
+                // broken bound would quietly lose: one more character must
+                // overflow. Asserted rather than assumed, because the cheap
+                // wrong answer here looks exactly like the right one.
+                let kept = cut_label.trim_end_matches('\u{2026}');
+                let next = busy.label[kept.len()..].chars().next().expect("it was cut");
+                assert!(
+                    width(&format!("{kept}{next}\u{2026}"), &label_font) > l.label.width(),
+                    "the label was cut shorter than it had to be"
+                );
             });
         });
     }
