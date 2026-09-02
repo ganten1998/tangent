@@ -78,7 +78,6 @@ pub enum FaceAction {
     Set { id: u32, value: f32 },
     SavePreset { name: String },
     LoadPreset { path: String },
-    DeletePreset { path: String },
 }
 
 fn param(face: &BuiltinFace, id: u32) -> Option<&BuiltinFaceParam> {
@@ -560,8 +559,10 @@ mod tests {
         assert!(there > -12.0, "the tone read {there} dB");
         let far = held[grid_at(8_000.0)];
         assert!(far < there - 30.0, "8 kHz read {far} dB against {there}");
-        // And it falls once the input stops arriving.
+        // And it falls once the input stops arriving — silence pushes the
+        // tone out of the window, and the hold decays instead of repainting.
         let before = there;
+        ring.tick(&vec![0.0f32; 4096 * 2]);
         for _ in 0..10 {
             analyzer_tick(&ring, &mut held, 0.1);
         }

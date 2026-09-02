@@ -1220,6 +1220,10 @@ pub struct Settings {
     /// them into one flag would mean un-collapsing a folder to stop it being
     /// one. Meaningless on a track that is not a folder, and harmless there.
     pub strip_folder_shut: Vec<bool>,
+    /// Whether the plugin picker's house folder has made its one automatic
+    /// introduction. False on a fresh (or wiped) settings file, which is
+    /// exactly when the introduction should happen again.
+    pub labs_folder_seen: bool,
     /// The tempo lane is showing above the tracks. OFF out of the box: a
     /// song at one tempo has nothing to put in it, and the row would cost a
     /// track's worth of height to say so.
@@ -1682,6 +1686,7 @@ impl Default for Settings {
             strip_is_folder: vec![false; crate::recorder::CHANNELS],
             strip_in_folder: vec![false; crate::recorder::CHANNELS],
             strip_folder_shut: vec![false; crate::recorder::CHANNELS],
+            labs_folder_seen: false,
             // 1/4 out of the box, both grids — the owner's default.
             arr_grid_exp: -2,
             arr_header_w: 0.0,
@@ -2821,6 +2826,9 @@ impl Settings {
             for (dst, x) in s.strip_keys_params.iter_mut().zip(v) {
                 *dst = x.as_f64().unwrap_or(0.5).clamp(0.0, 1.0);
             }
+        }
+        if let Some(Value::Bool(b)) = map.shift_remove("labs_folder_seen") {
+            s.labs_folder_seen = b;
         }
         // Gains are sanitised HERE rather than at the point of use, unlike the
         // tuning and the capo, because a NaN or a negative multiplied into an

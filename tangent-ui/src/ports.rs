@@ -808,6 +808,13 @@ pub struct BuiltinFaceParam {
     pub units: String,
     /// Where the knob rests, normalised.
     pub default: f32,
+    /// What the value READS as right now, printed by the unit's own
+    /// mapping on the host side — the one place the number is turned into
+    /// words, so the face and the sound can never disagree. Lags a drag by
+    /// one push, which is a frame.
+    pub reading: String,
+    /// A stepped parameter's positions in order, empty when continuous.
+    pub choices: Vec<String>,
     /// 0 continuous, 2 a toggle, otherwise the number of steps.
     pub steps: i32,
     /// Where the knob stands now, normalised — the host's ledger reading,
@@ -824,6 +831,11 @@ pub struct BuiltinFaceParam {
 /// an empty `path` clears the entry: the bay unloaded or holds a plugin.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct BuiltinFace {
+    /// The EQ's magnitude response over the face kit's own log grid
+    /// (`face::CURVE_POINTS` from `CURVE_LO_HZ` to `CURVE_HI_HZ`), in dB —
+    /// computed with the audio path's math on the host side. Empty for
+    /// units without a curve.
+    pub curve_db: Vec<f32>,
     pub strip: usize,
     pub slot: usize,
     /// The unit's sentinel path (`"@tangent-comp"`), which is what routes a

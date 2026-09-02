@@ -549,6 +549,14 @@ pub enum Dialog {
         /// decide which controls can still do anything.
         had_camera: bool,
     },
+    /// A suite unit's face: the kit-drawn panel over one insert bay,
+    /// refreshed by the app each frame with pushed data. `strip`/`slot`
+    /// are DESK terms.
+    InsertFace {
+        strip: usize,
+        slot: usize,
+        live: Box<crate::faces::FaceLive>,
+    },
 }
 
 /// Snapshot of learned-re-ranker state for display.
@@ -880,6 +888,15 @@ pub enum DialogAction {
     NewProjectDiscarding,
     /// Start a new project and leave the unsaved one where it is.
     NewProjectKeeping,
+    // ── the suite faces ─────────────────────────────────────────────────
+    /// One knob on a built-in insert, in DESK terms — the app converts to
+    /// the seat once, on its side of the wall.
+    SetInsertParam { strip: usize, slot: usize, id: u32, value: f32 },
+    /// Save the face's current values under a name; the app reads its own
+    /// mirror for the values, so the action stays a wish, not a payload.
+    FaceSavePreset { strip: usize, slot: usize, name: String },
+    /// Load a preset file into whatever the open face controls.
+    FaceLoadPreset { unit: String, path: String },
 }
 
 // ── the custom tuning editor ────────────────────────────────────────────────
@@ -2416,6 +2433,12 @@ fn plugin_choice<'a>(
 /// The folder a scanned plugin files under. One rule, used by the
 /// builder (to pre-open the loaded plugin's folder) and the draw (to
 /// interleave the headings), so the two cannot disagree.
+/// The house's own folder in the picker — the owner's pending LLC, worn
+/// as the vendor every built-in files under. Always sorted first, dressed
+/// in the cluster's own colour, and opened FOR the user exactly once: the
+/// first picker they ever see shows what ships before what they bought.
+pub const LABS_VENDOR: &str = "Tangent Labs";
+
 fn plugin_folder(entry: &PluginEntry) -> &str {
     if entry.vendor.trim().is_empty() {
         "Other"
@@ -2430,14 +2453,11 @@ fn plugin_row(entry: &PluginEntry, current: Option<&str>) -> String {
     } else {
         ' '
     };
-    let builtin = is_builtin(&entry.path);
-    if !builtin || entry.vendor.trim().is_empty() {
-        // The vendor is the FOLDER heading now, not a suffix on every row
-        // under it — the owner's ruling.
-        format!("{mark} {}", entry.name)
-    } else {
-        format!("{mark} {}   ({})", entry.name, entry.vendor)
-    }
+    // The vendor is the FOLDER heading, never a row suffix — true for the
+    // house shelf too, now that the built-ins live under their own heading
+    // instead of standing bare above the sort.
+    let _ = &entry.vendor;
+    format!("{mark} {}", entry.name)
 }
 
 /// Where VST3s live on this platform, said out loud when none were found.
@@ -2507,6 +2527,7 @@ impl Dialog {
     pub fn plugin_picker(
         bundles: &[(PathBuf, Option<String>, Option<String>)],
         current: Option<String>,
+        labs_open: bool,
     ) -> Dialog {
         let mut plugins: Vec<PluginEntry> = bundles
             .iter()
@@ -2534,47 +2555,49 @@ impl Dialog {
         // where somebody who has never installed a VST3 should find something
         // rather than an empty list. Inserted after the sort so it stays at the
         // top rather than landing under T.
-        plugins.insert(
-            0,
-            PluginEntry {
-                path: BUILTIN_PATH.to_owned(),
-                name: BUILTIN_NAME.to_owned(),
-                vendor: "built in, six-operator FM".to_owned(),
-            },
-        );
-        // And the drumpad right under it: the kit is the other instrument
-        // every install carries.
-        plugins.insert(
-            1,
-            PluginEntry {
-                path: DRUMPAD_PATH.to_owned(),
-                name: DRUMPAD_NAME.to_owned(),
-                vendor: "built in, sixteen-pad sampler".to_owned(),
-            },
-        );
-        // The modelled keyboard, third. The description says what it is
-        // modelled on and the NAME does not, which is the same split every
-        // built-in effect has made since the phaser: naming somebody else's
-        // instrument in the product name is a claim, and saying what a model
-        // was built from is a fact about the model. See LICENSING.md.
-        plugins.insert(
-            2,
-            PluginEntry {
-                path: KEYS_PATH.to_owned(),
-                name: KEYS_NAME.to_owned(),
-                vendor: "built in, eight modelled keyboards".to_owned(),
-            },
-        );
+        // **The house's shelf, above the sort.** Everything that ships in
+        // the box files under one vendor folder — the instruments first,
+        // then the suite — so somebody who has never installed a VST3 finds
+        // a full rack rather than an empty list, and somebody with ninety
+        // plugins finds ours exactly once, at the top, closed.
+        for (at, (path, name)) in [
+            (0, (BUILTIN_PATH, BUILTIN_NAME)),
+            (1, (DRUMPAD_PATH, DRUMPAD_NAME)),
+            (2, (KEYS_PATH, KEYS_NAME)),
+        ] {
+            plugins.insert(
+                at,
+                PluginEntry {
+                    path: path.to_owned(),
+                    name: name.to_owned(),
+                    vendor: LABS_VENDOR.to_owned(),
+                },
+            );
+        }
+        for (i, (path, name, _)) in crate::faces::SUITE_UNITS.iter().enumerate() {
+            plugins.insert(
+                3 + i,
+                PluginEntry {
+                    path: (*path).to_owned(),
+                    name: (*name).to_owned(),
+                    vendor: LABS_VENDOR.to_owned(),
+                },
+            );
+        }
         let selected = current
             .as_deref()
             .and_then(|c| plugins.iter().position(|p| p.path == c));
         // Every folder closed at open — except the loaded plugin's, so the
-        // preselected, marked row has somewhere to be seen.
-        let open_folders = selected
+        // preselected, marked row has somewhere to be seen; and the house
+        // folder on the very first visit, so the beginner's first picker
+        // is not a wall of shut drawers.
+        let mut open_folders: Vec<String> = selected
             .and_then(|i| plugins.get(i))
-            .filter(|e| !is_builtin(&e.path))
             .map(|e| vec![plugin_folder(e).to_owned()])
             .unwrap_or_default();
+        if labs_open && !open_folders.iter().any(|f| f == LABS_VENDOR) {
+            open_folders.push(LABS_VENDOR.to_owned());
+        }
         Dialog::PluginPicker {
             plugins,
             selected,
@@ -2934,6 +2957,32 @@ const LCD_ID: &str = "dialog-lcd";
 
 pub fn remember_lcd(ctx: &egui::Context, lcd: Color32, lcd_face: Color32) {
     ctx.memory_mut(|m| m.data.insert_temp(egui::Id::new(LCD_ID), (lcd, lcd_face)));
+}
+
+/// The house folder's ink: the cluster's digit colour, held legible on the
+/// dialog's ground by the same walk every face tier takes — distinct where
+/// the theme allows it, readable everywhere, never a colour the eye must
+/// squint at to be sold something.
+fn labs_ink(ctx: &egui::Context, bg: Color32, fallback: Color32) -> Color32 {
+    let (lcd, _) = live_lcd(ctx);
+    let mut c = lcd;
+    let mut t = 0.0f32;
+    while crate::recorder_panel::contrast_ratio(c, bg) < 4.5 && t < 1.0 {
+        t += 0.1;
+        let lerp = |a: u8, b: u8| {
+            (f32::from(a) + (f32::from(b) - f32::from(a)) * t) as u8
+        };
+        c = Color32::from_rgb(
+            lerp(lcd.r(), fallback.r()),
+            lerp(lcd.g(), fallback.g()),
+            lerp(lcd.b(), fallback.b()),
+        );
+    }
+    if crate::recorder_panel::contrast_ratio(c, bg) < 4.5 {
+        fallback
+    } else {
+        c
+    }
 }
 
 /// The pair last remembered; the shipped tape-green on near-black when the
@@ -3592,6 +3641,64 @@ pub fn show(
             )
         }
 
+        Dialog::InsertFace { strip, slot, live } => {
+            let p = crate::recorder_panel::surface_of(face);
+            let (lcd, lcd_glass) = live_lcd(ctx);
+            let st = crate::face::FaceStyle::new(face, lcd, lcd_glass);
+            let strip = *strip;
+            let slot = *slot;
+            let unit = live.face.path.clone();
+            let (title, about) =
+                crate::faces::suite_unit(&unit).unwrap_or(("Tangent", ""));
+            let size = match unit.as_str() {
+                "@tangent-eq" => Vec2::new(470.0, 470.0),
+                "@tangent-imager" => Vec2::new(340.0, 480.0),
+                "@tangent-comp" => Vec2::new(400.0, 430.0),
+                _ => Vec2::new(400.0, 360.0),
+            };
+            show_dialog_viewport(
+                ctx,
+                placement,
+                title,
+                size,
+                Vec2::new(320.0, 300.0),
+                |ui, _result| {
+                    apply_theme(ui.style_mut(), &theme(face));
+                    ui.painter().rect_filled(ui.max_rect(), 0.0, p.bg);
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin::same(PLUGIN_MARGIN))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(about)
+                                    .font(FontId::new(10.0, fonts::courier_bold()))
+                                    .color(p.faint),
+                            );
+                            ui.add_space(4.0);
+                            if let Some(act) = crate::faces::draw(ui, &st, live) {
+                                action = Some(match act {
+                                    crate::faces::FaceAction::Set { id, value } => {
+                                        DialogAction::SetInsertParam {
+                                            strip,
+                                            slot,
+                                            id,
+                                            value,
+                                        }
+                                    }
+                                    crate::faces::FaceAction::SavePreset { name } => {
+                                        DialogAction::FaceSavePreset { strip, slot, name }
+                                    }
+                                    crate::faces::FaceAction::LoadPreset { path } => {
+                                        DialogAction::FaceLoadPreset {
+                                            unit: unit.clone(),
+                                            path,
+                                        }
+                                    }
+                                });
+                            }
+                        });
+                },
+            )
+        }
         Dialog::KeysPatch {
             slot,
             selected,
@@ -4470,15 +4577,22 @@ pub fn show(
                                         // overrides the collapse: a search
                                         // that found things inside closed
                                         // folders must not read as a search
-                                        // that found nothing. The built-ins
-                                        // stand above every folder.
-                                        let builtin = is_builtin(&entry.path);
-                                        if !builtin {
+                                        // that found nothing. The house's
+                                        // folder is a folder like the rest —
+                                        // first by sort, and dressed in the
+                                        // cluster's own colour so the eye
+                                        // finds it before it reads anything.
+                                        {
                                             let folder = plugin_folder(entry).to_owned();
                                             if seen_folder.as_deref() != Some(folder.as_str()) {
                                                 folder_open = filtering
                                                     || open_folders.contains(&folder);
                                                 ui.add_space(5.0);
+                                                let ink = if folder == LABS_VENDOR {
+                                                    labs_ink(ctx, t.bg, faint)
+                                                } else {
+                                                    faint
+                                                };
                                                 let head = ui.selectable_label(
                                                     false,
                                                     RichText::new(format!(
@@ -4490,7 +4604,7 @@ pub fn show(
                                                         }
                                                     ))
                                                     .font(bold(11.0))
-                                                    .color(faint),
+                                                    .color(ink),
                                                 );
                                                 if head.clicked() {
                                                     if let Some(at) = open_folders
@@ -10017,7 +10131,7 @@ at: None,
             vst3_locations()
         );
 
-        let mut dialog = Some(Dialog::plugin_picker(&[], None));
+        let mut dialog = Some(Dialog::plugin_picker(&[], None, false));
         let (painted, action) = run_picker(&mut dialog);
         assert!(action.is_none(), "an empty picker loaded something");
         assert!(
@@ -10054,7 +10168,7 @@ at: None,
         .collect();
         let loaded = "/Users/x/Library/Audio/Plug-Ins/VST3/Pianoteq 8.vst3".to_owned();
 
-        let opened = Dialog::plugin_picker(&bundles, Some(loaded.clone()));
+        let opened = Dialog::plugin_picker(&bundles, Some(loaded.clone()), false);
         match &opened {
             Dialog::PluginPicker {
                 plugins,
@@ -10066,13 +10180,18 @@ at: None,
             } => {
                 assert_eq!(
                     plugins.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
-                    // The built-in leads, above the sort: it is what a fresh
-                    // install plays, and the one entry somebody with no VST3s
-                    // installed can still choose.
+                    // The house shelf leads, above the sort — instruments
+                    // then the suite, the order the folder shows them — and
+                    // it is what a fresh install can still choose with no
+                    // VST3s on disk.
                     [
                         BUILTIN_NAME,
                         DRUMPAD_NAME,
                         KEYS_NAME,
+                        "Tangent EQ",
+                        "Tangent Imager",
+                        "Tangent Tape",
+                        "Tangent Comp",
                         "analog lab v",
                         "Pianoteq 8",
                         "Vital"
@@ -10089,27 +10208,22 @@ at: None,
                     .iter()
                     .filter(|p| !is_builtin(&p.path))
                     .all(|p| p.vendor.is_empty()));
-                // Four, not one: the built-ins took the first three rows.
-                assert_eq!(*selected, Some(4), "it did not open on what is loaded");
+                // Eight, not one: the house shelf took the first seven rows.
+                assert_eq!(*selected, Some(8), "it did not open on what is loaded");
                 assert_eq!(current.as_deref(), Some(loaded.as_str()));
                 assert!(filter.is_empty() && *focus);
                 assert!(
-                    plugin_row(&plugins[4], Some(&loaded)).starts_with('\u{2022}'),
+                    plugin_row(&plugins[8], Some(&loaded)).starts_with('\u{2022}'),
                     "the loaded plugin is not marked"
                 );
                 assert!(
                     plugin_row(&plugins[3], Some(&loaded)).starts_with(' '),
                     "a plugin that is not loaded was marked as if it were"
                 );
-                // A blank vendor leaves no empty brackets behind; a known one
-                // is shown, which is the only reason the field exists.
-                assert_eq!(plugin_row(&plugins[5], None), "  Vital");
-                // And the built-in describes itself, which is the one row that
-                // can: nothing was opened to find out.
-                assert_eq!(
-                    plugin_row(&plugins[0], None),
-                    format!("  {BUILTIN_NAME}   (built in, six-operator FM)")
-                );
+                // Every row is bare — the folder heading carries the vendor,
+                // the house shelf's included.
+                assert_eq!(plugin_row(&plugins[9], None), "  Vital");
+                assert_eq!(plugin_row(&plugins[0], None), format!("  {BUILTIN_NAME}"));
                 // The vendor is a FOLDER heading now, never a row suffix —
                 // the owner's ruling. A scanned plugin's row is bare.
                 assert_eq!(
@@ -10175,6 +10289,7 @@ at: None,
                 (PathBuf::from(&loaded), None, None),
             ],
             Some(loaded.clone()),
+            false,
         ));
 
         let mut action = None;

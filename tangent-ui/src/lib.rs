@@ -13,6 +13,7 @@ pub mod automation;
 pub mod chord_strip;
 pub mod dialogs;
 pub mod face;
+pub mod faces;
 /// The drumpad's document: the kit, saved beside the arrangement.
 pub mod drumpad;
 /// The drumpad: sixteen sample pads in a popup that floats over any view.

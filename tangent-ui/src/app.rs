@@ -19169,11 +19169,31 @@ impl TangentApp {
             Some(dialogs::DRUMPAD_PATH) => self.open_drumpad_for(strip),
             // The modelled keyboard's face is its two patches.
             Some(dialogs::KEYS_PATH) => self.open_keys_picker(strip),
+            // A suite unit's face is the kit-drawn panel.
+            Some(path) if crate::faces::suite_unit(path).is_some() => {
+                self.open_unit_face(strip, bay);
+            }
             Some(_) => {
                 self.request_recorder(recorder::RecorderRequest::OpenInsertEditor(strip, bay));
             }
             None => self.open_insert_picker(strip, bay),
         }
+    }
+
+    /// Open a suite unit's face over a bay, and aim the engine's tap at it
+    /// — the analyzer and the goniometer read the tap, and arming it is
+    /// also the host's cue to scan and push the unit's preset shelf.
+    fn open_unit_face(&mut self, strip: usize, slot: usize) {
+        self.dialog = Some(dialogs::Dialog::InsertFace {
+            strip,
+            slot,
+            live: Box::default(),
+        });
+        self.request_recorder(recorder::RecorderRequest::SetInsertTap {
+            strip,
+            slot,
+            on: true,
+        });
     }
 
     /// Whether THIS bay's editor should open now that its plugin has loaded.
@@ -20777,9 +20797,18 @@ impl TangentApp {
             return;
         }
         self.picker_insert = Some((strip, slot));
+        // The house folder opens itself exactly once — the first picker a
+        // person ever sees — then remembers it has made its introduction.
+        // A settings wipe forgets, which is the intended re-introduction.
+        let first_visit = !self.settings.labs_folder_seen;
+        if first_visit {
+            self.settings.labs_folder_seen = true;
+            self.save_settings_soon();
+        }
         self.dialog = Some(Dialog::plugin_picker(
             &self.plugin_list,
             self.insert(strip, slot).map(str::to_owned),
+            first_visit,
         ));
     }
 
@@ -22402,6 +22431,29 @@ impl TangentApp {
     /// script.
     pub fn apply_dialog_action(&mut self, action: DialogAction) {
         match action {
+            DialogAction::SetInsertParam { strip, slot, id, value } => {
+                let (seat, bay) = recorder::seat_bay(strip, slot);
+                self.set_insert_param(seat, bay, id, value);
+            }
+            DialogAction::FaceSavePreset { strip, slot, name } => {
+                let (seat, bay) = recorder::seat_bay(strip, slot);
+                if let Some(face) = self.builtin_face(seat, bay) {
+                    let unit = face.path.clone();
+                    let values: Vec<(String, f64)> = face
+                        .params
+                        .iter()
+                        .map(|p| (p.symbol.clone(), f64::from(p.value)))
+                        .collect();
+                    self.request_recorder(recorder::RecorderRequest::SavePreset {
+                        unit,
+                        name,
+                        values,
+                    });
+                }
+            }
+            DialogAction::FaceLoadPreset { unit, path } => {
+                self.request_recorder(recorder::RecorderRequest::LoadPreset { unit, path });
+            }
             DialogAction::AcceptCheat => {
                 // The "...": for the keyless this is the unlock, real from
                 // here on - supporter in every right, thanked as Cheater
@@ -22870,6 +22922,13 @@ impl TangentApp {
                         Some(dialogs::BUILTIN_PATH) => self.open_patch_picker(strip),
                         Some(dialogs::DRUMPAD_PATH) => self.open_drumpad_for(strip),
                         Some(dialogs::KEYS_PATH) => self.open_keys_picker(strip),
+                        // A freshly picked suite unit opens its face at
+                        // once: it loads instantly, so there is no window
+                        // to wait for and no reason to make the hand knock
+                        // twice.
+                        Some(p) if crate::faces::suite_unit(p).is_some() => {
+                            self.open_unit_face(strip, at);
+                        }
                         Some(_) => self.open_insert_on_load = Some((strip, at)),
                         None => {}
                     }
@@ -26835,6 +26894,83 @@ impl TangentApp {
             },
             monitor: self.surface_frame().1,
         };
+        // **The suite faces are LIVE.** Refresh the open one's picture from
+        // the pushed data and the tap ring before it draws; land a loaded
+        // preset on it as a run of ordinary knob asks; and remember which
+        // bay it watched, so closing it can take the tap down.
+        if let Some(loaded) = self.take_preset_loaded() {
+            if let Some(dialogs::Dialog::InsertFace { strip, slot, .. }) = self.dialog {
+                let (seat, bay) = recorder::seat_bay(strip, slot);
+                let asks: Vec<(u32, f32)> = self
+                    .builtin_face(seat, bay)
+                    .map(|f| {
+                        loaded
+                            .values
+                            .iter()
+                            .filter_map(|(sym, v)| {
+                                f.params
+                                    .iter()
+                                    .find(|p| &p.symbol == sym)
+                                    .map(|p| (p.id, *v as f32))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for (id, v) in asks {
+                    self.set_insert_param(seat, bay, id, v);
+                }
+            }
+        }
+        let face_watch = match self.dialog {
+            Some(dialogs::Dialog::InsertFace { strip, slot, .. }) => Some((strip, slot)),
+            _ => None,
+        };
+        // Take-and-put-back ONLY when it is a face: an unconditional
+        // `take()` here would quietly destroy every other dialog each frame.
+        let is_face = matches!(self.dialog, Some(dialogs::Dialog::InsertFace { .. }));
+        if is_face {
+            let Some(dialogs::Dialog::InsertFace { strip, slot, mut live }) =
+                self.dialog.take()
+            else {
+                unreachable!("matched a face one line up");
+            };
+            let (seat, bay) = recorder::seat_bay(strip, slot);
+            if let Some(f) = self.builtin_face(seat, bay) {
+                // The push is the truth; the optimistic mirror already rode
+                // it, so this is a copy, never a fight.
+                live.face = f.clone();
+            }
+            live.gr_db = self.insert_gr(seat, bay);
+            live.preset_rows = self.preset_rows(&live.face.path).to_vec();
+            match live.face.path.as_str() {
+                "@tangent-eq" => {
+                    let dt = ctx.input(|i| i.stable_dt);
+                    crate::faces::analyzer_tick(&self.tapring, &mut live.analyzer_db, dt);
+                }
+                "@tangent-imager" => {
+                    let n = self.tapring.frames().min(1024);
+                    live.scope.clear();
+                    let mut peak = 0.0f32;
+                    for i in (0..n).rev() {
+                        let [l, r] = self.tapring.stereo_back(i);
+                        peak = peak.max(l.abs()).max(r.abs());
+                        live.scope.push((l, r));
+                    }
+                    // Normalised into the circle with a little headroom;
+                    // silence holds the last gain rather than zooming into
+                    // noise.
+                    if peak > 1.0e-3 {
+                        live.scope_gain = (0.9 / peak).min(30.0);
+                    }
+                    live.correlation = self.tapring.correlation();
+                }
+                _ => {}
+            }
+            self.dialog = Some(dialogs::Dialog::InsertFace { strip, slot, live });
+            // The meters breathe even when the hand is still.
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        }
+
         if let Some(action) =
             {
                 // Read BEFORE the dialog is borrowed mutably.
@@ -26850,6 +26986,16 @@ impl TangentApp {
             }
         {
             self.apply_dialog_action(action);
+        }
+        // The face closed this frame: take the tap down with it.
+        if let Some((strip, slot)) = face_watch {
+            if !matches!(self.dialog, Some(dialogs::Dialog::InsertFace { .. })) {
+                self.request_recorder(recorder::RecorderRequest::SetInsertTap {
+                    strip,
+                    slot,
+                    on: false,
+                });
+            }
         }
         // **The party, over everything.** A dim veil and the rainbow, drawn
         // on the Foreground layer so it covers the whole canvas (and sits
