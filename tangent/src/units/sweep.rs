@@ -95,6 +95,26 @@ pub const TAIL_FADE_S: f64 = 0.010;
 /// noise; cutting 3 dB shy keeps the last audible tail and drops the hiss.
 pub const TAIL_MARGIN_DB: f64 = 3.0;
 
+/// The furthest under an IR's own peak [`recovered_floor_db`] will ever put
+/// the truncation threshold, in dB.
+///
+/// A deconvolution has enormous processing gain — a fifteen-second sweep
+/// concentrates its whole energy into one impulse — so a clean capture's
+/// recovered noise floor can sit 140 dB or more below the peak, and a
+/// threshold derived from it refuses to cut at all: the IR comes back the
+/// length of the whole capture window, seconds of inaudible nothing that
+/// the convolver then pays for in partitions every block, forever. Measured
+/// on a −3 dBFS synthetic capture through a −96 dBFS loop, the uncapped
+/// threshold produced a twenty-six-second IR of a three-second plate.
+///
+/// 80 dB, for two reasons that happen to agree. It is past the point where
+/// any playback gain lifts a tail back into hearing. And it is about as deep
+/// as [`deconvolve_by_reference`] can actually reach: the Kirkeby
+/// regularization's own ringing settles around 82 dB under the recovered
+/// peak, so a threshold set below that is a threshold no window ever
+/// crosses.
+pub const TAIL_RANGE_MAX_DB: f64 = 80.0;
+
 /// How far below the peak a sample still counts as part of the direct
 /// impulse when hunting for its foot. −40 dB: below the pre-ringing a
 /// bandpassed Dirac carries, above any capture's noise floor.
@@ -515,9 +535,63 @@ pub fn noise_floor_db(silence: &[f32]) -> f32 {
     (10.0 * ms.max(1e-30).log10()) as f32
 }
 
+/// **Where a recovered IR stops being signal, in the IR's OWN scale.**
+///
+/// [`noise_floor_db`] reads the RECORDING, in dBFS at the converter. A
+/// deconvolution is a division, and it lands the recovered IR in a
+/// completely different scale — nothing about the recording's dBFS survives
+/// it. Handing that number straight to [`truncate_at_floor`] compares a
+/// level against a yardstick from another measurement, and the resulting cut
+/// means nothing.
+///
+/// It was doing exactly that, and here is the arithmetic that says so.
+/// A −3 dBFS capture of a three-second plate through a −96 dBFS loop
+/// deconvolves to an IR whose peak is −44 dB in its own units. The threshold
+/// applied was −96 + 3 = −93, so the cut landed 49 dB under the IR's peak
+/// rather than at its noise — and because the classic route's scale tracks
+/// the send level one-for-one, dropping the send to −20 dBFS moved the IR's
+/// peak to −61 dB and moved the cut with it, to 0.75 s. The same plate, the
+/// same loop, the same noise: half the tail, thrown away by a threshold that
+/// had drifted 17 dB relative to the thing it was cutting. That is the
+/// short-IR report, and it is a units bug, not a truncator bug.
+///
+/// The honest translation needs no model of the deconvolution at all. What
+/// the capture could resolve is its own signal-to-noise ratio —
+/// `capture_peak_db − capture_floor_db` — and that ratio is a RATIO, so it
+/// survives any scaling the deconvolution applies. Put the threshold that
+/// far under the recovered IR's own peak and the cut sits where the capture
+/// stopped knowing anything, whatever scale the IR arrived in.
+///
+/// **Deliberately conservative.** The sweep's processing gain pushes the
+/// recovered noise floor tens of dB BELOW this line (it is why the same
+/// −96 dBFS loop leaves a recovered tail still falling at −140 dB), so this
+/// keeps less than the measurement strictly supports and never keeps noise.
+/// Capped at [`TAIL_RANGE_MAX_DB`] for the reason given there.
+///
+/// Peaks arrive as linear magnitudes because that is what the callers
+/// already have; a peak of zero (silence either side) answers −200, the
+/// house reading for "no signal", which no window can fall to and which
+/// therefore leaves the IR uncut.
+pub fn recovered_floor_db(ir_peak: f32, capture_peak: f32, capture_floor_db: f32) -> f32 {
+    if !(ir_peak > 0.0 && capture_peak > 0.0) || !capture_floor_db.is_finite() {
+        return -200.0;
+    }
+    let ir_peak_db = 20.0 * f64::from(ir_peak).log10();
+    let capture_peak_db = 20.0 * f64::from(capture_peak).log10();
+    let snr = (capture_peak_db - f64::from(capture_floor_db)).clamp(0.0, TAIL_RANGE_MAX_DB);
+    (ir_peak_db - snr) as f32
+}
+
 /// Truncate the tail where its sliding level ([`TAIL_WINDOW_S`]) sinks to
 /// within [`TAIL_MARGIN_DB`] of `floor_db`, then fade the last
 /// [`TAIL_FADE_S`] of what remains with a half-cosine.
+///
+/// **`floor_db` is in `ir`'s OWN scale**, not the recording's. This function
+/// compares a level it computes from these very samples against the number
+/// it is handed, so the two have to be the same kind of number — pass a
+/// recording's dBFS floor and the cut is arbitrary. [`recovered_floor_db`]
+/// exists to make that translation and carries the measurements that show
+/// what the mistake costs.
 ///
 /// The direct impulse is sacred: the cut is clamped so the fade begins
 /// strictly AFTER the peak sample, and when the floor is so high (or the IR
@@ -871,6 +945,83 @@ mod tests {
         assert!(short.len() >= 101, "a high floor ate the direct impulse");
         assert_eq!(short[100], 1.0, "a high floor scaled the direct impulse");
     }
+
+    /// **The truncation threshold follows the IR's own scale, not the
+    /// recording's.** This is the arithmetic behind the short-IR report.
+    ///
+    /// The same tail, in two scales 20 dB apart, is the same tail: the
+    /// threshold has to move with it, so that the CUT lands in the same
+    /// place. What the wizard was doing instead — handing the recording's
+    /// dBFS floor straight to `truncate_at_floor` — is pinned here too, as
+    /// the thing that moves when it must not.
+    #[test]
+    fn the_truncation_threshold_travels_with_the_irs_own_scale() {
+        // A capture that peaked at −6 dBFS over a −86 dBFS loop: 80 dB of
+        // measurement, whatever scale the deconvolution then lands in.
+        let capture_peak = 10.0f32.powf(-6.0 / 20.0);
+        let floor_db = -86.0f32;
+        let loud = recovered_floor_db(1.0, capture_peak, floor_db);
+        let quiet = recovered_floor_db(0.1, capture_peak, floor_db);
+        assert!(
+            (loud - (-80.0)).abs() < 0.01,
+            "80 dB under a unit-peak IR is {loud}, not -80"
+        );
+        assert!(
+            (quiet - loud - (-20.0)).abs() < 0.01,
+            "an IR 20 dB quieter got a threshold {} dB away, not 20",
+            quiet - loud
+        );
+
+        // And the cut it produces is the SAME cut. One decaying tail, built
+        // once and scaled by a tenth: both truncate at the same sample.
+        let sr = 48_000.0f64;
+        let len = (2.0 * sr) as usize;
+        let mut seed = 7u64;
+        let mut ir = vec![0.0f32; len];
+        ir[0] = 1.0;
+        for i in 1..len {
+            let t = i as f64 / sr;
+            ir[i] = (f64::from(lcg(&mut seed)) * 0.5 * (-t / 0.15).exp()) as f32;
+        }
+        let mut a = ir.clone();
+        let mut b: Vec<f32> = ir.iter().map(|v| v * 0.1).collect();
+        let a_peak = a.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let b_peak = b.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        truncate_at_floor(&mut a, recovered_floor_db(a_peak, capture_peak, floor_db), sr);
+        truncate_at_floor(&mut b, recovered_floor_db(b_peak, capture_peak, floor_db), sr);
+        assert!(a.len() < len, "the tail was never cut at all");
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "the same tail in two scales cut in two different places"
+        );
+
+        // The old road, for the record: the RECORDING's floor against both
+        // scales cuts them in different places, which is the bug.
+        let mut a2 = ir.clone();
+        let mut b2: Vec<f32> = ir.iter().map(|v| v * 0.1).collect();
+        truncate_at_floor(&mut a2, floor_db, sr);
+        truncate_at_floor(&mut b2, floor_db, sr);
+        assert_ne!(
+            a2.len(),
+            b2.len(),
+            "the mismatched comparison was supposed to be scale-dependent"
+        );
+
+        // A capture with no headroom at all cannot be trusted anywhere, and
+        // a silent one answers the house's "no signal" reading rather than
+        // a number a threshold could act on.
+        assert!(recovered_floor_db(1.0, capture_peak, -6.0) >= -0.01);
+        assert!(recovered_floor_db(0.0, capture_peak, floor_db) <= -199.0);
+        // Past the cap the threshold stops descending, or no window ever
+        // crosses it and the whole capture window ships as an "IR".
+        let pristine = recovered_floor_db(1.0, capture_peak, -200.0);
+        assert!(
+            (pristine + TAIL_RANGE_MAX_DB as f32).abs() < 0.01,
+            "a noiseless loop asked for {pristine} dB of range"
+        );
+    }
+
 
     /// **The inverse filter alone pulls the sweep to a bandpassed click**:
     /// convolving the sweep with its classic inverse concentrates the

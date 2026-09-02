@@ -896,6 +896,14 @@ pub struct IrOutcome {
     pub thd3_db: f32,
     /// Whether a loop-only reference pass divided out the interface.
     pub has_reference: bool,
+    /// How hot the capture actually ran, dBFS peak at the converter.
+    /// Appended at the END, this struct's law.
+    pub capture_peak_db: f32,
+    /// How far the capture sat above the loop's own floor, dB — the
+    /// signal-to-noise ratio the pass achieved, and therefore how far under
+    /// its own peak the recovered IR is still telling the truth. A short IR
+    /// is nearly always a small number here, which is why it is shown.
+    pub tail_range_db: f32,
 }
 
 /// The wizard's live picture, pushed by the host once per frame while the
