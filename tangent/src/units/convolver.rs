@@ -15,6 +15,22 @@
 //! Only bins 0..=512 are kept and accumulated — the input is real, the
 //! spectrum Hermitian, so the mirror half is reconstruction, not work.
 //!
+//! **The partition SIZE is fixed; the partition COUNT is not.** Nothing here
+//! caps IR length — `Engine::build` sizes every buffer from the IR it is
+//! handed — and the capture road's own ceiling is the silence recorded after
+//! the sweep, at most twenty seconds. That is 1875 partitions, and
+//! `the_longest_ir_the_wizard_can_produce_is_not_beyond_the_kernel` runs it,
+//! because "the IR came back too short" is a question that arrives here
+//! first and the answer is that it was never this.
+//!
+//! **Which makes twenty seconds a ceiling somebody has to hold, and it is
+//! not held here.** This kernel would cheerfully build 28,000 partitions for
+//! a five-minute file and bill the audio callback for them every block,
+//! forever, because nothing in a convolver knows what a reasonable impulse
+//! response is. The road that loads somebody else's IR is where the length
+//! is judged, before a bay is ever pointed at a file:
+//! `desktop::IR_LOAD_MAX_S`, which names this measurement as its reason.
+//!
 //! The partition is FIXED at 512 to match the engine's MAX_BLOCK chunking,
 //! and the engine's variable chunk sizes are absorbed by internal staging:
 //! input collects until a partition is full, output drains from a FIFO
@@ -723,6 +739,75 @@ mod tests {
             }
         }
     }
+
+    /// **The partition COUNT is not a ceiling**, and the longest IR the
+    /// wizard can hand over proves it.
+    ///
+    /// Asked directly, because "the IR is too short" pointed here first: the
+    /// partition SIZE is fixed at 512 to match the engine's chunking, and it
+    /// would be easy to read that as a fixed number of partitions too. There
+    /// is no such number. `Engine::build` sizes everything from the IR it is
+    /// given, so the only ceiling is what the machine will run — and the
+    /// capture road's own ceiling is the post-sweep silence, at most 20 s
+    /// from the wizard's tail row.
+    ///
+    /// Twenty seconds at 48 k is 1875 partitions, three times the six-second
+    /// case next door. The realtime assertion is release-only for the same
+    /// reason it is there: debug bounds checks are not the shipping speed.
+    #[test]
+    fn the_longest_ir_the_wizard_can_produce_is_not_beyond_the_kernel() {
+        let ir_len: usize = 20 * 48_000;
+        assert_eq!(
+            ir_len.div_ceil(CONV_PARTITION),
+            1875,
+            "the partition arithmetic moved"
+        );
+        let mut seed = 99u64;
+        let make = |seed: &mut u64| -> Vec<f32> {
+            (0..ir_len)
+                .map(|i| {
+                    let t = i as f32 / 48_000.0;
+                    lcg(seed) * 0.02 * (-t / 4.0).exp()
+                })
+                .collect()
+        };
+        let irs = [make(&mut seed), make(&mut seed)];
+        let mut c = Convolver::new(SR);
+        assert!(c.set_ir(&irs, IrLayout::Stereo), "a 20 s IR was refused");
+        assert_eq!(c.latency(), CONV_PARTITION as u32, "a long IR moved the latency");
+
+        let seconds = 4.0f64;
+        let frames = (seconds * 48_000.0) as usize;
+        let mut buf = noise(frames, 11);
+        let before = c.footprint();
+        let p = ConvolverParams::default();
+        let start = std::time::Instant::now();
+        let mut pos = 0;
+        while pos < frames {
+            let n = 480.min(frames - pos);
+            c.process(&mut buf[pos * 2..], n, 2, &p);
+            pos += n;
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        assert_eq!(
+            c.footprint(),
+            before,
+            "process grew a buffer somewhere - the allocation contract is broken"
+        );
+        assert!(
+            buf.iter().all(|s| s.is_finite()),
+            "a twenty-second IR produced a non-finite sample"
+        );
+        let factor = seconds / elapsed;
+        println!("convolver: 20 s IR over 4 s of audio = {factor:.1}x realtime");
+        #[cfg(not(debug_assertions))]
+        assert!(
+            factor > 2.0,
+            "only {factor:.1}x realtime in release for the longest IR the \
+             wizard can hand over"
+        );
+    }
+
 
     /// **A six-second IR processes ten seconds of audio without allocating
     /// and well under realtime.** Capacities are byte-identical before and

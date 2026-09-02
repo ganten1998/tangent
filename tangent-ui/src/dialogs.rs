@@ -702,10 +702,36 @@ pub struct IrWizardState {
     pub live: crate::ports::IrLive,
     /// The Save field.
     pub name: String,
-    /// Retry was pressed: the OLD result still rides the live push until a
-    /// new pass replaces it, and without this latch the auto-advance would
-    /// bounce the wizard straight back to the result page every frame.
-    pub retried: bool,
+    /// **A pass fired from THIS wizard is in flight, and the capture id the
+    /// live picture carried when it was fired.** The only thing that may
+    /// pull the wizard to its result page.
+    ///
+    /// The host keeps the last finished capture on `IrLive` until a new pass
+    /// replaces it, deliberately — closing the wizard mid-thought must not
+    /// cost somebody the pass they already took. But the wizard is rebuilt
+    /// from `Default` every time it opens and then handed that same live
+    /// picture, so a SECOND run arrived at the sweep page already carrying
+    /// the FIRST run's result, and the auto-advance fired the instant the
+    /// page was reached: stage 3 flashed past and the wizard showed the old
+    /// capture as if it were new. That is "it skips stage 3 if the wizard is
+    /// used again in succession", and the latch is half the fix — a result
+    /// only moves the wizard if the wizard is the one that asked for it.
+    ///
+    /// The other half is the NUMBER, and it is why this is not a bool.
+    /// "The wizard asked" is not the same as "the pass ran": the host's
+    /// `start_ir_capture` gives up before it starts anything when no engine
+    /// is running or the sweep cannot be generated, and a bool latch left
+    /// the wizard armed and waiting over a `result` that still held the
+    /// PREVIOUS capture — which it then showed, and would have SAVED under
+    /// the new name. So what is remembered is `crate::ports::IrLive`'s
+    /// capture id AT THE MOMENT OF ASKING, and the advance waits for that
+    /// number to move. A failed arm never moves it, so a stale result can
+    /// no longer be mistaken for the one being waited on.
+    ///
+    /// It replaces the older `retried` flag, which said the same thing
+    /// inside out (and only for the Retry button, which is why re-entry was
+    /// never covered).
+    pub armed: Option<u64>,
 }
 
 /// The offered sweep lengths, seconds. 15 is the default (Farina's own
@@ -727,7 +753,7 @@ impl Default for IrWizardState {
             tail_s: 10.0,
             live: crate::ports::IrLive::default(),
             name: String::new(),
-            retried: false,
+            armed: None,
         }
     }
 }
@@ -748,6 +774,77 @@ impl IrWizardState {
             .get(self.sweep_choice)
             .copied()
             .unwrap_or(15.0)
+    }
+
+    /// **Back to the sweep page for another capture, loop and levels
+    /// intact.** "Record another IR" and Retry are the same move: the jacks,
+    /// the send level, the sweep length, the tail and any held loop-only
+    /// reference all stay exactly as they were staged, and only the two
+    /// things that belong to ONE capture are cleared.
+    ///
+    /// The name goes because carrying it forward is how the second capture
+    /// silently overwrites the first — the field would still say
+    /// "Holmes Plate" and Save would still be one click. The latch goes
+    /// because the result still on the live push belongs to the pass just
+    /// finished, and leaving it set would bounce this page straight back to
+    /// the result the moment it was reached.
+    pub fn record_another(&mut self) {
+        self.stage = IrStage::Sweep;
+        self.armed = None;
+        self.name.clear();
+    }
+
+    /// **Fire a capture through the unit: the pass whose result may move
+    /// this wizard on.** The sweep page's Capture button, and nothing else,
+    /// calls this.
+    ///
+    /// The name field is cleared with it: a second capture must not arrive
+    /// on the result page already named after the first one, one click from
+    /// writing over it.
+    ///
+    /// A METHOD rather than two lines at the button, because
+    /// [`Self::settle_from_live`] is the other end of the same latch and a
+    /// test that cannot press an egui button has to be able to arm the way
+    /// the button arms. Two spellings of one rule is how the rule drifts.
+    pub fn arm_capture(&mut self) {
+        self.armed = Some(self.live.capture_id);
+        self.name.clear();
+    }
+
+    /// **Fire the loop-only reference pass**, which produces no result to
+    /// show and therefore does NOT arm the advance: the wizard stays on the
+    /// sweep page waiting for the pass through the unit.
+    pub fn arm_reference(&mut self) {
+        self.armed = None;
+    }
+
+    /// **A finished capture pulls the wizard to its result page** — the
+    /// deconvolution ran on the host and pushed the outcome; nobody should
+    /// have to click "next" to see what they just measured.
+    ///
+    /// Three things have to be true, and each of them is a bug that was
+    /// reported. The wizard has to be ON the sweep page, or an auto-advance
+    /// would drag somebody off the page they walked back to. It has to have
+    /// ARMED the pass itself, or a reopened wizard advances on the previous
+    /// run's held result. And the host's capture id has to have MOVED past
+    /// the one this wizard saw when it armed, or an arm the host refused —
+    /// no engine, no sweep — leaves the wizard advancing onto the previous
+    /// capture and offering to save it under the new name.
+    ///
+    /// `show` calls exactly this, and so does its test. Lifting it out of
+    /// the frame is the whole point: an auto-advance written once inside an
+    /// egui closure can only be tested by a copy of itself, and a copy
+    /// proves nothing — revert this body to the broken predicate and the
+    /// test that drives it goes red, which is the only reason to trust it.
+    pub fn settle_from_live(&mut self) {
+        let Some(asked_at) = self.armed else { return };
+        if self.stage == IrStage::Sweep
+            && self.live.result.is_some()
+            && self.live.capture_id != asked_at
+        {
+            self.stage = IrStage::Result;
+            self.armed = None;
+        }
     }
 }
 
@@ -1138,6 +1235,8 @@ pub enum DialogAction {
     IrSave { name: String },
     /// The IR face picked an impulse off the shelf; desk terms, the app
     /// converts and asks the host to rebind the bay.
+    ///
+    /// **[`IR_BROWSE`] in `path` means "ask me instead".** See there.
     SetInsertIr { strip: usize, slot: usize, path: String },
     /// The theme key was pressed inside a plugin window. On the desktop
     /// that window has its own input and the main window never sees the
@@ -1145,6 +1244,34 @@ pub enum DialogAction {
     /// would from its own keymap. Appended at the END, the law.
     CycleTheme,
 }
+
+/// **The `path` that means "raise the file chooser for this bay" rather
+/// than "load this file".**
+///
+/// [`DialogAction::SetInsertIr`] carries a path from the IR face's shelf to
+/// the host. The face's NAME FIELD needs the same road but with the path
+/// still unknown — the OS panel has to be raised on the host's thread,
+/// outside an egui frame, which is where every other chooser in this app is
+/// raised from — and a new action would need an arm in `app.rs`, which this
+/// lane does not own.
+///
+/// So the ask rides the path field as a sentinel, the idiom the insert
+/// reload already uses (`"\u{1f}reload"` in `desktop.rs`): a leading unit
+/// separator cannot begin a real filesystem path, and the host tests for
+/// this exact string before treating the value as a file. `desktop.rs`
+/// answers it by raising the chooser and, on an answer, rebinding the bay
+/// through the same code an ordinary path takes.
+///
+/// **The ask is PARKED, never answered in the frame that made it.** The
+/// face closes itself as it asks (below), but a closed viewport is not a
+/// gone window: eframe destroys it a frame later, and the OS's panel is
+/// parented to the MAIN window, so a panel raised now opens underneath a
+/// face that is still on screen and still always-on-top — the app's own
+/// "Save As loads below the menu" bug, wearing a different hat.
+/// `desktop::take_ir_browse` therefore holds the request for the same
+/// settle every other picker in that file takes, and comes out of
+/// fullscreen first on the window managers that need it.
+pub const IR_BROWSE: &str = "\u{1f}browse";
 
 // ── the custom tuning editor ────────────────────────────────────────────────
 //
@@ -4079,6 +4206,26 @@ fn draw_ir_io(ui: &mut egui::Ui, t: &DialogTheme, s: &mut IrWizardState) {
     );
 }
 
+/// The send levels the wizard offers, dBFS, quietest first.
+///
+/// **This row is the whole fix for "the levels section is limited at around
+/// −20 dBFS and that readout is just hitting a wall".** There was no row: the
+/// only send levels the wizard could produce were −18 and −12, the two
+/// alignment tones the references use, and −18 dBFS of sine reads −21 dBFS
+/// RMS on the return meter. Turn the box up all you like — the number the
+/// meter shows is the number the wizard SENT, and it could not be raised.
+///
+/// The send level is not a cosmetic choice. It is the ONE lever this loop
+/// has: the sweep goes out at exactly this level, so it sets the capture's
+/// signal-to-noise ratio, and the recovered IR is honest to about that many
+/// dB under its own peak and no further (`sweep::recovered_floor_db`). Every
+/// dB of send that a box can take without distorting is a dB of tail.
+///
+/// −18 and −12 keep their place because they are the alignment convention;
+/// the rest exist because a hardware output stage that will not clip until
+/// −3 dBFS should be allowed to run there.
+pub const IR_SEND_CHOICES: [f32; 6] = [-24.0, -18.0, -12.0, -9.0, -6.0, -3.0];
+
 fn draw_ir_level(
     ui: &mut egui::Ui,
     t: &DialogTheme,
@@ -4088,37 +4235,76 @@ fn draw_ir_level(
     let bold = |size: f32| FontId::new(size, fonts::courier_bold());
     ui.label(
         RichText::new(
-            "Play the alignment tone and set the unit's input level. \
-             Start at -18 dBFS, then confirm at -12.",
+            "Set the unit's input level with the tone, then drive the loop as \
+             hard as the box takes without distorting. The SWEEP goes out at \
+             this same level, and every dB of it is a dB of tail.",
         )
         .font(bold(10.5))
         .color(t.text),
     );
     ui.add_space(8.0);
+    // The send level, as a row of choices — the sweep page's own idiom, and
+    // the reason it exists is in `IR_SEND_CHOICES`.
     ui.horizontal(|ui| {
-        for level in [-18.0f32, -12.0] {
-            let here = s.tone_on && (s.level_db - level).abs() < 0.5;
-            let label = if here {
-                format!("tone {level:.0} dBFS ■")
+        ui.label(RichText::new("SEND").font(bold(11.0)).color(t.text));
+        let mut moved = false;
+        for &level in IR_SEND_CHOICES.iter() {
+            let here = (s.level_db - level).abs() < 0.5;
+            let label = if (level + 18.0).abs() < 0.5 || (level + 12.0).abs() < 0.5 {
+                // The two alignment levels wear a mark, so the convention is
+                // still legible in a row that is now six wide.
+                format!("{level:.0}\u{2217}")
             } else {
-                format!("tone {level:.0} dBFS")
+                format!("{level:.0}")
             };
             if ui
-                .add(Button::new(RichText::new(label).font(bold(11.0)).color(t.text)))
+                .selectable_label(here, RichText::new(label).font(bold(11.0)))
                 .clicked()
+                && !here
             {
-                // Press the sounding level to stop; press the other to move.
-                s.tone_on = !here;
                 s.level_db = level;
-                *action = Some(DialogAction::IrTone {
-                    on: s.tone_on,
-                    out: s.out_pair(),
-                    inp: s.in_pair(),
-                    level_db: s.level_db,
-                });
+                moved = true;
             }
         }
+        ui.label(RichText::new("dBFS").font(bold(10.0)).color(t.faint));
+        // A level chosen while the tone sounds re-emits it at once — one
+        // action per click, so nothing churns the engine's job slot.
+        if moved && s.tone_on {
+            *action = Some(DialogAction::IrTone {
+                on: true,
+                out: s.out_pair(),
+                inp: s.in_pair(),
+                level_db: s.level_db,
+            });
+        }
     });
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new("\u{2217} the two alignment levels the references use")
+            .font(bold(9.0))
+            .color(t.faint),
+    );
+    ui.add_space(6.0);
+    if ui
+        .add(Button::new(
+            RichText::new(if s.tone_on {
+                "Stop the tone \u{25a0}"
+            } else {
+                "Play the 1 kHz tone"
+            })
+            .font(bold(11.0))
+            .color(t.text),
+        ))
+        .clicked()
+    {
+        s.tone_on = !s.tone_on;
+        *action = Some(DialogAction::IrTone {
+            on: s.tone_on,
+            out: s.out_pair(),
+            inp: s.in_pair(),
+            level_db: s.level_db,
+        });
+    }
     ui.add_space(10.0);
     // The return meter: a bar on the field ground, RMS as the fill, peak as
     // a tick, −60..0 dBFS. Drawn, not a widget, because it is a readout.
@@ -4144,20 +4330,43 @@ fn draw_ir_level(
             Stroke::new(2.0, t.text),
         );
     }
+    // Where the headroom runs out, so "how much further can I push this" is
+    // a distance on the bar rather than an arithmetic problem.
+    let gx = rect.left() + rect.width() * frac(-6.0);
+    ui.painter().line_segment(
+        [Pos2::new(gx, rect.top()), Pos2::new(gx, rect.bottom())],
+        Stroke::new(1.0, t.faint),
+    );
     ui.add_space(4.0);
+    // **PEAK first.** Staging a loop is a peak job — the question is how
+    // close to clipping the hottest sample runs — and the RMS of a sine sits
+    // 3 dB under its peak by arithmetic, which is what made a −18 dBFS tone
+    // read "−21" and look like a wall. Both numbers are here; only one of
+    // them is the one to set levels by, and it now says so.
     let reading = if peak <= -200.0 {
         "return: silence".to_owned()
     } else {
-        format!("return: {rms:.1} dBFS rms   {peak:.1} peak")
+        format!(
+            "return: {peak:.1} dBFS peak  ({:.1} dB of headroom)   {rms:.1} rms",
+            -peak
+        )
     };
     ui.label(RichText::new(reading).font(bold(10.5)).color(t.text));
     // The warnings, in the order they matter.
     let warn = if peak > -0.5 {
-        Some("CLIPPING - bring the unit's output (or this tone) down.")
+        Some("CLIPPING - bring the unit's output (or the send) down.")
     } else if peak > -6.0 {
         Some("Under 6 dB of headroom - the sweep will hit harder than this tone.")
     } else if s.tone_on && peak <= -200.0 {
         Some("Nothing is coming back - check the loop's cables and the unit's bypass.")
+    } else if s.tone_on && peak < -30.0 {
+        // The case the owner hit from the other side: a quiet return is a
+        // quiet capture is a short IR, and nothing else in this wizard says
+        // so until the tail comes back stubbed.
+        Some(
+            "Very quiet - raise the SEND, or the unit's own output. A return \
+             this low costs tail, not just level.",
+        )
     } else {
         None
     };
@@ -4168,9 +4377,10 @@ fn draw_ir_level(
     ui.add_space(8.0);
     ui.label(
         RichText::new(
-            "Aim the return around -12 dBFS. Hardware often keeps less \
-             headroom on its wet path than its dry one, so set levels by \
-             the box's own meters, below its clip.",
+            "Aim the return peak between -12 and -6 dBFS. Hardware often keeps \
+             less headroom on its wet path than its dry one, so set levels by \
+             the box's own meters, below its clip - then take the loudest send \
+             that stays clean.",
         )
         .font(bold(9.5))
         .color(t.faint),
@@ -4211,12 +4421,20 @@ fn draw_ir_sweep(
                 s.tail_s = secs;
             }
         }
-        ui.label(
-            RichText::new("at least the decay you expect")
-                .font(bold(9.5))
-                .color(t.faint),
-        );
     });
+    // **The tail is a hard ceiling on the IR, not a suggestion.** The
+    // response to the sweep's last sample is only observed for as long as
+    // the recording ran on afterwards, so nothing past this window was ever
+    // measured and `process_ir_capture` cuts there. Said here because it is
+    // the one setting on this page that can silently shorten a capture.
+    ui.label(
+        RichText::new(
+            "The tail is the longest IR this pass can produce - the decay \
+             after it was never recorded. Pick at least the decay you expect.",
+        )
+        .font(bold(9.5))
+        .color(t.faint),
+    );
     ui.add_space(10.0);
     // The optional exact route: capture the LOOP alone once, and every
     // later pass divides by it — interface, converters and latency cancel.
@@ -4239,7 +4457,9 @@ fn draw_ir_sweep(
             )
             .clicked()
     {
-        s.retried = false;
+        // A reference pass produces no result to show, so it does NOT arm
+        // the advance — the wizard stays here waiting for the DUT pass.
+        s.arm_reference();
         *action = Some(DialogAction::IrCapture {
             out: s.out_pair(),
             inp: s.in_pair(),
@@ -4259,7 +4479,11 @@ fn draw_ir_sweep(
             ))
             .clicked()
     {
-        s.retried = false;
+        // THIS is the pass whose result may move the wizard on, and what
+        // arming means — the latch, the capture id it is waiting to see
+        // move, the cleared name — is `arm_capture`'s, so the button and
+        // the test arm through one body.
+        s.arm_capture();
         *action = Some(DialogAction::IrCapture {
             out: s.out_pair(),
             inp: s.in_pair(),
@@ -4355,14 +4579,44 @@ fn draw_ir_result(
     } else {
         "inverse-filter route"
     };
+    // Both lengths, and they are different questions: how long the file is,
+    // and how much of it is decay. A capture of a box with pre-delay carries
+    // that delay at the front, and calling the whole length "the tail" would
+    // overstate it.
     ui.label(
         RichText::new(format!(
-            "{:.2} s captured   {:.2} s above the floor ({:.0} dBFS)   {route}",
-            r.seconds, r.usable_s, r.noise_floor_db
+            "{:.2} s long   {:.2} s after the peak   {route}",
+            r.seconds, r.usable_s
         ))
         .font(bold(10.5))
         .color(t.text),
     );
+    // **How the capture ran, next to how long it came out.** The truncation
+    // keeps the tail down to about `tail_range_db` under the IR's own peak
+    // and no further, because that is where the capture stopped knowing
+    // anything (`sweep::recovered_floor_db`). So when an IR comes back
+    // shorter than the box sounds, these two numbers are the answer — the
+    // send was low, or the loop is noisy — and printing the length alone is
+    // what left "why is my plate 0.6 seconds" unanswerable.
+    ui.label(
+        RichText::new(format!(
+            "captured at {:.1} dBFS peak over a {:.0} dBFS floor \u{2014} \
+             {:.0} dB of usable range",
+            r.capture_peak_db, r.noise_floor_db, r.tail_range_db
+        ))
+        .font(bold(10.0))
+        .color(t.faint),
+    );
+    if r.tail_range_db < 55.0 {
+        ui.label(
+            RichText::new(
+                "A quiet capture is a short tail. Go back to LEVELS, raise the \
+                 SEND (or the unit's output), and record another.",
+            )
+            .font(bold(10.0))
+            .color(t.text),
+        );
+    }
     // The sweep's free distortion probe. −200 means the window fell off the
     // buffer, which a short capture can do; say nothing rather than a lie.
     if r.thd2_db > -200.0 {
@@ -4674,7 +4928,7 @@ pub fn show(
                 title,
                 size,
                 Vec2::new(320.0, 300.0),
-                |ui, _result| {
+                |ui, result| {
                     apply_theme(ui.style_mut(), &theme(face));
                     ui.painter().rect_filled(ui.max_rect(), 0.0, p.bg);
                     egui::Frame::NONE
@@ -4713,6 +4967,39 @@ pub fn show(
                                     }
                                     crate::faces::FaceAction::PickIr { path } => {
                                         DialogAction::SetInsertIr { strip, slot, path }
+                                    }
+                                    crate::faces::FaceAction::BrowseIr => {
+                                        // **The face window goes down with
+                                        // the ask.** The OS's panel is
+                                        // parented to the MAIN window and
+                                        // this face is a floating child, so
+                                        // leaving it up opens the chooser
+                                        // UNDERNEATH it — the app's own
+                                        // "load sysex opens behind the
+                                        // instrument window" bug, which
+                                        // reads as a button that does
+                                        // nothing. `app.rs` has the lever
+                                        // that puts dialogs down for a
+                                        // panel (`native_panel_up`) and
+                                        // this lane does not own that file,
+                                        // so the face closes instead: the
+                                        // chooser is unmistakably in front,
+                                        // and the bay reopens on a click.
+                                        //
+                                        // Closing it is not enough on its
+                                        // own, and saying so here because
+                                        // this line looks like it is: the
+                                        // viewport is torn down a frame
+                                        // AFTER it stops being drawn, so
+                                        // the host holds the ask for that
+                                        // long before it raises anything.
+                                        // See `IR_BROWSE`.
+                                        result.close = true;
+                                        DialogAction::SetInsertIr {
+                                            strip,
+                                            slot,
+                                            path: IR_BROWSE.to_owned(),
+                                        }
                                     }
                                 });
                             }
@@ -7976,12 +8263,13 @@ pub fn show(
             let (lcd, lcd_glass_c) = live_lcd(ctx);
             let st = crate::face::FaceStyle::new(face, lcd, lcd_glass_c);
             let s: &mut IrWizardState = state.as_mut();
-            // A finished capture pulls the wizard to its result page — the
-            // deconvolution ran on the host and pushed the outcome; nobody
-            // should have to click "next" to see what they just measured.
-            if s.live.result.is_some() && s.stage == IrStage::Sweep && !s.retried {
-                s.stage = IrStage::Result;
-            }
+            // The auto-advance onto the result page. One line here because
+            // the rule itself lives on the state
+            // (`IrWizardState::settle_from_live`) where a test can drive the
+            // very same code: a predicate written out inside this closure
+            // can only be pinned by a copy of itself, and a copy goes on
+            // passing after the original has been broken.
+            s.settle_from_live();
             show_dialog_viewport(
                 ctx,
                 placement,
@@ -8087,14 +8375,29 @@ pub fn show(
                                         {
                                             result.close = true;
                                         }
+                                        // **Record another IR**, not
+                                        // "Retry". It is the same move —
+                                        // back to the sweep page with the
+                                        // loop and the levels still staged
+                                        // — but the word matters: this is
+                                        // the button somebody capturing a
+                                        // box's whole program list presses
+                                        // forty times, and calling it Retry
+                                        // says the last one went wrong.
+                                        // `record_another` clears the name
+                                        // and the latch; nothing else.
                                         if ui
                                             .add(Button::new(
-                                                RichText::new("Retry").color(t.text),
+                                                RichText::new("Record another IR")
+                                                    .color(t.text),
                                             ))
+                                            .on_hover_text(
+                                                "back to the sweep with this loop and \
+                                                 these levels — capture, save, repeat",
+                                            )
                                             .clicked()
                                         {
-                                            s.stage = IrStage::Sweep;
-                                            s.retried = true;
+                                            s.record_another();
                                         }
                                     }
                                 }
@@ -12483,6 +12786,213 @@ at: None,
         assert!((fresh.tail_s - 10.0).abs() < 0.01);
         assert!((fresh.sweep_s() - 15.0).abs() < 0.01);
     }
+
+    /// **The wizard walks the same four stages on its second run as on its
+    /// first, and "Record another IR" is a loop you can stay in.**
+    ///
+    /// The report: "the wizard if followed through end to end including a
+    /// plugin save at the end, skips stage 3 if the wizard is used again in
+    /// succession". It did, and this is the mechanism. The host keeps the
+    /// last finished capture on `IrLive` across a close and reopen — on
+    /// purpose, so closing the wizard mid-thought costs nobody their pass —
+    /// and a reopened wizard is a fresh `Default` handed that same live
+    /// picture. The auto-advance asked only "is there a result and am I on
+    /// the sweep page", so the moment the second run reached stage 3 it
+    /// jumped to stage 4 and showed the FIRST run's IR.
+    ///
+    /// `armed` is the fix and this is its pin: a result only moves the
+    /// wizard if the wizard is the one that asked for it, AND the host's
+    /// capture id has moved since it asked.
+    ///
+    /// **The walk is driven through the production methods, not a copy of
+    /// them.** A headless test cannot press an egui button, so the
+    /// temptation is to restate `show`'s predicate here and drive that — and
+    /// the first version of this test did exactly that, which is worth
+    /// nothing: break `IrWizardState::settle_from_live` back to the version
+    /// that skipped stage 3 and a test carrying its own copy goes on
+    /// passing. `settle_from_live`, `arm_capture` and `arm_reference` are
+    /// methods for this reason, and every stage move below goes through
+    /// them. Only the HOST's half is written out here, and it is written as
+    /// `desktop::start_ir_capture` and `ir_tick` do it.
+    #[test]
+    fn the_wizard_walks_the_same_stages_on_every_run_and_record_another_loops() {
+        // The host's half, and only the host's half. A pass that reaches the
+        // engine counts the capture id up and clears the result; the worker
+        // lands the outcome some frames later.
+        fn host_started(s: &mut IrWizardState) {
+            s.live.capture_id += 1;
+            s.live.result = None;
+        }
+        fn host_finished(s: &mut IrWizardState) {
+            s.live.result = Some(crate::ports::IrOutcome {
+                seconds: 2.4,
+                ..Default::default()
+            });
+        }
+
+        let walk = |s: &mut IrWizardState| -> Vec<IrStage> {
+            let mut seen = vec![s.stage];
+            s.settle_from_live();
+            s.stage = IrStage::Level;
+            seen.push(s.stage);
+            s.settle_from_live();
+            s.stage = IrStage::Sweep;
+            seen.push(s.stage);
+            // Reaching the sweep page must NOT move on by itself.
+            s.settle_from_live();
+            assert_eq!(
+                s.stage,
+                IrStage::Sweep,
+                "the sweep page was skipped before anything was armed"
+            );
+            s.arm_capture();
+            s.settle_from_live();
+            assert_eq!(s.stage, IrStage::Sweep, "armed is not captured");
+            host_started(s);
+            s.settle_from_live();
+            assert_eq!(s.stage, IrStage::Sweep, "the wizard advanced with no result");
+            host_finished(s);
+            s.settle_from_live();
+            seen.push(s.stage);
+            seen
+        };
+
+        // Run one, end to end, including naming and saving.
+        let mut first = IrWizardState::default();
+        let run1 = walk(&mut first);
+        assert_eq!(
+            run1,
+            vec![IrStage::Io, IrStage::Level, IrStage::Sweep, IrStage::Result]
+        );
+        first.name = "Holmes Plate".to_owned();
+
+        // Done, then opened again: a fresh state, handed the host's live
+        // picture — which still carries run one's result. This is the exact
+        // shape that skipped stage 3.
+        let carried = first.live.clone();
+        assert!(
+            carried.result.is_some(),
+            "the host was supposed to still be holding the finished capture"
+        );
+        let mut second = IrWizardState::default();
+        second.live = carried;
+        let run2 = walk(&mut second);
+        assert_eq!(run2, run1, "the second run did not walk the same stages");
+        assert!(
+            second.name.is_empty(),
+            "the second capture arrived carrying the name {:?}",
+            second.name
+        );
+
+        // And "Record another IR" from the result page is the same loop
+        // without leaving the wizard: back to the sweep, loop and levels
+        // still staged, name and latch cleared.
+        second.name = "Room A".to_owned();
+        second.out_sel = 3;
+        second.in_sel = 1;
+        second.level_db = -6.0;
+        second.sweep_choice = 2;
+        second.tail_s = 20.0;
+        second.record_another();
+        assert_eq!(second.stage, IrStage::Sweep);
+        assert!(second.armed.is_none());
+        assert!(second.name.is_empty(), "the next capture inherited a name");
+        assert_eq!((second.out_sel, second.in_sel), (3, 1), "the loop was lost");
+        assert!((second.level_db + 6.0).abs() < 0.01, "the level was lost");
+        assert!((second.sweep_s() - 50.0).abs() < 0.01, "the sweep was lost");
+        assert!((second.tail_s - 20.0).abs() < 0.01, "the tail was lost");
+        // Sitting on the sweep page with the previous result still pushed
+        // must not bounce back to it.
+        second.settle_from_live();
+        assert_eq!(
+            second.stage,
+            IrStage::Sweep,
+            "record-another bounced straight back to the old result"
+        );
+
+        // **An arm the host REFUSED must not advance onto the last IR.**
+        //
+        // `start_ir_capture` gives up before it starts anything when no
+        // engine is running or the sweep will not generate, and the result
+        // on the live push is deliberately sticky, so the wizard sat armed
+        // over the PREVIOUS capture and showed it — one click from saving
+        // somebody else's measurement under this name. The refused pass
+        // never moves the capture id, so the advance never fires.
+        let stale = second.live.result.clone();
+        assert!(stale.is_some(), "the host is supposed to still hold the last one");
+        second.arm_capture();
+        for _ in 0..10 {
+            second.settle_from_live();
+        }
+        assert_eq!(
+            second.stage,
+            IrStage::Sweep,
+            "a capture the host refused advanced the wizard onto the previous IR"
+        );
+
+        // Arm again, this time with the host actually starting: the loop
+        // closes — capture, result, capture, result.
+        second.arm_capture();
+        host_started(&mut second);
+        second.settle_from_live();
+        assert_eq!(second.stage, IrStage::Sweep);
+        host_finished(&mut second);
+        second.settle_from_live();
+        assert_eq!(second.stage, IrStage::Result, "the loop did not come round");
+
+        // And the reference pass, which produces nothing to show, disarms:
+        // it must not leave the wizard primed to jump when the DUT pass's
+        // result lands somewhere else entirely.
+        second.record_another();
+        second.arm_reference();
+        host_started(&mut second);
+        host_finished(&mut second);
+        second.settle_from_live();
+        assert_eq!(
+            second.stage,
+            IrStage::Sweep,
+            "a loop-only reference pass moved the wizard on"
+        );
+    }
+
+    /// **Every send level the wizard offers is one the engine will honour,
+    /// and the row spans a range worth having.**
+    ///
+    /// The report: "the 2/4 levels section seems to be limited at around
+    /// -20 dBFS, so that readout is just hitting a wall". There were two
+    /// send levels, −18 and −12, and −18 dBFS of sine reads −21 dBFS RMS —
+    /// so the meter showed a number that could not be raised. The send level
+    /// is the capture's whole signal-to-noise budget (see
+    /// `sweep::recovered_floor_db`), so this pins that the row still holds
+    /// the two alignment levels AND reaches somewhere useful.
+    #[test]
+    fn the_send_levels_span_a_usable_range_and_keep_the_alignment_pair() {
+        assert!(
+            IR_SEND_CHOICES.windows(2).all(|w| w[0] < w[1]),
+            "the send row is not in order"
+        );
+        for &v in IR_SEND_CHOICES.iter() {
+            // `Engine::start_ir_tone` clamps to [−80, 0] and
+            // `start_ir_capture` to [−60, 0]: every offered level has to
+            // survive both unchanged, or the row lies about what it sends.
+            assert!((-60.0..=0.0).contains(&v), "{v} dBFS will be clamped");
+        }
+        assert!(
+            IR_SEND_CHOICES.contains(&-18.0) && IR_SEND_CHOICES.contains(&-12.0),
+            "the two alignment levels the references use are gone"
+        );
+        let top = IR_SEND_CHOICES.last().copied().unwrap_or(-60.0);
+        assert!(
+            top >= -6.0,
+            "the hottest send is {top} dBFS - still a wall for a box that \
+             will not clip until -3"
+        );
+        // The default is still the recipe's first alignment level, and it is
+        // one of the offered choices rather than a value nothing can select.
+        let fresh = IrWizardState::default();
+        assert!(IR_SEND_CHOICES.contains(&fresh.level_db));
+    }
+
 
     // ── modality ────────────────────────────────────────────────────────────
 
