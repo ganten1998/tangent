@@ -17,7 +17,8 @@
 //! the root panel should be.
 
 use crate::host::Caps;
-use egui::{Color32, Pos2, Rect, Vec2};
+use crate::recorder_panel::{legible_surface, surface_of};
+use egui::{Align2, Color32, FontId, Pos2, Rect, Stroke, StrokeKind, Vec2};
 
 /// Run `add` against a `Ui` covering the whole of `ctx`'s viewport.
 pub fn viewport_ui<R>(ctx: &egui::Context, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
@@ -25,6 +26,231 @@ pub fn viewport_ui<R>(ctx: &egui::Context, add: impl FnOnce(&mut egui::Ui) -> R)
         .frame(egui::Frame::NONE)
         .show(ctx, add)
         .inner
+}
+
+// ── the in-house window dress ───────────────────────────────────────────────
+
+/// The dress of a window this app draws its own bar on: the suite faces,
+/// the Keys panel, and the pickers they open.
+///
+/// **Why the app draws these itself.** They are the windows a person works
+/// IN while the desk stays live behind them, and an OS title bar is the one
+/// thing on screen the theme cannot reach — nineteen themes on the desk and
+/// one grey Aqua strip over every face. A bar of our own follows the theme
+/// on the same frame the desk does, is the same bar on every platform, and
+/// is the same bar in the plugin build's canvas, where there is no OS bar
+/// to borrow at all.
+///
+/// Three colours, each MEASURED. The bar is the body's raised shade made
+/// able to carry ink of its own (`legible_surface`); the ink is what
+/// `surface_of` puts on THAT ground — never the body's ink handed down,
+/// which is the way this app has learned the same lesson from a screenshot
+/// seven times; the edge is the body's ink, so the window separates from
+/// whatever it is floating over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Chrome {
+    pub bar: Color32,
+    pub ink: Color32,
+    pub edge: Color32,
+}
+
+impl Chrome {
+    /// Dress for a window whose body is `face`.
+    pub fn of(face: Color32) -> Chrome {
+        let body = surface_of(face);
+        let bar = legible_surface(body.raised);
+        Chrome {
+            bar,
+            ink: surface_of(bar).ink,
+            edge: body.ink,
+        }
+    }
+}
+
+/// The bar's height. Twenty-four points: a 12-point title with air above
+/// and below, and a close cross whose square is a target a hand finds the
+/// first time rather than the third.
+pub const CHROME_BAR_H: f32 = 24.0;
+/// The resize grip's square, in the bottom-right corner.
+pub const CHROME_GRIP: f32 = 14.0;
+
+/// Where the chrome's parts are. ONE function for both paths and every
+/// test, so the cross that is drawn is the cross that is hit.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ChromeLayout {
+    pub bar: Rect,
+    /// Where the title is written: the drag rect less a little air.
+    pub title: Rect,
+    /// The close cross's target: a full-height square at the bar's right.
+    pub close: Rect,
+    /// A press here moves the window. The bar WITHOUT the close square —
+    /// the two must not overlap, or a press on the cross starts a drag that
+    /// swallows the click.
+    pub drag: Rect,
+    /// The resize grip, only when the window can be resized.
+    pub grip: Option<Rect>,
+    /// What is left for the body.
+    pub body: Rect,
+}
+
+pub fn chrome_layout(rect: Rect, resizable: bool) -> ChromeLayout {
+    let h = CHROME_BAR_H.min(rect.height());
+    let bar = Rect::from_min_size(rect.min, Vec2::new(rect.width(), h));
+    let close = Rect::from_min_size(
+        Pos2::new((bar.right() - h).max(bar.left()), bar.top()),
+        Vec2::splat(h),
+    );
+    let drag = Rect::from_min_max(bar.min, Pos2::new(close.left(), bar.bottom()));
+    let title = Rect::from_min_max(
+        Pos2::new(drag.left() + 8.0, drag.top()),
+        Pos2::new((drag.right() - 4.0).max(drag.left() + 8.0), drag.bottom()),
+    );
+    let body = Rect::from_min_max(Pos2::new(rect.left(), bar.bottom()), rect.max);
+    let grip = resizable.then(|| {
+        Rect::from_min_size(rect.max - Vec2::splat(CHROME_GRIP), Vec2::splat(CHROME_GRIP))
+    });
+    ChromeLayout {
+        bar,
+        title,
+        close,
+        drag,
+        grip,
+        body,
+    }
+}
+
+/// What the bar saw this frame. The caller decides what a move MEANS — an
+/// OS drag on the desktop, a shift of the layer inline — because that is
+/// the one thing the two paths cannot share.
+#[derive(Clone, Copy, Default, Debug)]
+struct ChromeGesture {
+    close: bool,
+    cycle_theme: bool,
+    /// The primary button went down on the drag rect this frame.
+    grab: bool,
+    /// How far a held bar moved this frame.
+    moved: Vec2,
+}
+
+/// The bar, the title, the cross — and what the hand did to them.
+fn draw_chrome_bar(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    title: &str,
+    l: &ChromeLayout,
+    c: Chrome,
+) -> ChromeGesture {
+    let mut g = ChromeGesture::default();
+    // Interactions before paint, so a hover shows on the frame it happens.
+    let close = ui.interact(l.close, id.with("close"), egui::Sense::click());
+    // `drag`, not `click_and_drag`: a widget that senses only a drag starts
+    // it on the press, with no threshold to cross first, which is what makes
+    // an inline layer follow the hand from the first point it moves.
+    let drag = ui.interact(l.drag, id.with("drag"), egui::Sense::drag());
+    let painter = ui.painter().with_clip_rect(l.bar);
+    painter.rect_filled(l.bar, 0.0, c.bar);
+    painter.with_clip_rect(l.title).text(
+        l.title.left_center(),
+        Align2::LEFT_CENTER,
+        title,
+        FontId::new(12.0, crate::fonts::courier_bold()),
+        c.ink,
+    );
+    if close.hovered() {
+        painter.rect_filled(l.close, 0.0, c.ink.gamma_multiply(0.22));
+    }
+    let x = l.close.shrink(l.close.height() * 0.34);
+    let w = if close.hovered() { 2.0_f32 } else { 1.5_f32 };
+    painter.line_segment([x.left_top(), x.right_bottom()], Stroke::new(w, c.ink));
+    painter.line_segment([x.right_top(), x.left_bottom()], Stroke::new(w, c.ink));
+    g.close = close.clicked();
+    // **The PRESS, not the drag threshold.** A window that only starts to
+    // follow the hand after it has travelled a few points feels stuck to
+    // the desk; the popouts learned this and they go on the press too.
+    g.grab = ui.input(|i| {
+        i.pointer.primary_pressed()
+            && i.pointer.interact_pos().is_some_and(|p| l.drag.contains(p))
+    });
+    // Not on the frame the drag STARTS: a drag that begins on the press
+    // reports that frame's whole pointer motion as its first delta, and
+    // that motion is the hand arriving at the bar, not moving it.
+    if drag.dragged_by(egui::PointerButton::Primary) && !drag.drag_started() {
+        g.moved = drag.drag_delta();
+    }
+    // **The theme key, exactly as the main window reads it** — the keymap
+    // is the one table, so the bar does not grow a second idea of what T
+    // means. Not while a field in this window is being typed into: "t" in
+    // the picker's filter is a letter, and the main window has the same
+    // rule under `text_entry_active`.
+    g.cycle_theme = !ui.ctx().wants_keyboard_input()
+        && crate::keys::pressed(ui.ctx(), crate::keys::Gates::default())
+            == Some(crate::keys::KeyAction::CycleTheme);
+    g
+}
+
+/// The hairline round the window and the grip in its corner, painted AFTER
+/// the body so the body's own ground fill cannot cover them. Returns how
+/// far a held grip moved this frame.
+fn draw_chrome_edge(ui: &mut egui::Ui, id: egui::Id, rect: Rect, l: &ChromeLayout, c: Chrome) -> Vec2 {
+    let mut resized = Vec2::ZERO;
+    let painter = ui.painter().with_clip_rect(rect);
+    painter.rect_stroke(rect, 0.0, Stroke::new(1.0_f32, c.edge), StrokeKind::Inside);
+    if let Some(grip) = l.grip {
+        let r = ui.interact(grip, id.with("grip"), egui::Sense::drag());
+        // The start frame's delta is the hand arriving, as on the bar.
+        if r.dragged_by(egui::PointerButton::Primary) && !r.drag_started() {
+            resized = r.drag_delta();
+        }
+        if r.hovered() || r.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+        }
+        // Three diagonal hairlines: the grip every desk app draws, in the
+        // edge's own ink so it reads as part of the frame.
+        for k in [4.0_f32, 8.0, 12.0] {
+            painter.line_segment(
+                [
+                    Pos2::new(grip.right() - k, grip.bottom() - 1.0),
+                    Pos2::new(grip.right() - 1.0, grip.bottom() - k),
+                ],
+                Stroke::new(1.0_f32, c.edge),
+            );
+        }
+    }
+    resized
+}
+
+/// What an inline window remembers between frames: how far its bar has
+/// been dragged and what size the grip left it at.
+///
+/// Dropped the moment the surface is not drawn for a pass — which is how
+/// a window that closed and a different one that opened under the same id
+/// come up centred and at their own size, exactly as the desktop's fresh
+/// OS window does.
+#[derive(Clone, Copy, Default)]
+struct InlineChromeState {
+    last_pass: u64,
+    moved: Vec2,
+    size: Option<Vec2>,
+}
+
+fn inline_rect_id(id: &str) -> egui::Id {
+    egui::Id::new((id, "inline-rect"))
+}
+
+/// Where an inline surface was drawn on the last pass, if it was.
+///
+/// **For the app's raw-pointer handlers, which egui's layers cannot
+/// shield.** A widget under a layer is protected by egui's own hit test,
+/// but half of this app reads `i.pointer` directly, and a non-modal dialog
+/// drawn in the canvas would otherwise hand every press on its face to the
+/// mixer underneath it. On the desktop the dialog is another window with a
+/// pointer stream of its own and nothing is ever stored, so `None` is the
+/// honest answer there too.
+pub fn inline_rect(ctx: &egui::Context, id: &str) -> Option<Rect> {
+    let pass = ctx.cumulative_pass_nr();
+    ctx.memory(|m| m.data.get_temp::<(u64, Rect)>(inline_rect_id(id)))
+        .filter(|(last, _)| pass.saturating_sub(*last) <= 1)
+        .map(|(_, r)| r)
 }
 
 /// A pane that is an OS window on the desktop and a floating layer in a plugin.
@@ -84,6 +310,10 @@ pub struct SurfaceSpec<'a> {
     /// ignores all input waiting on it, i.e. the app appears frozen. `Dialog`
     /// and `PopupMenu` windows are floated by every WM that reads the hint.
     pub window_type: Option<egui::X11WindowType>,
+    /// A bar of our own instead of the OS's — see [`Chrome`]. `Some` makes
+    /// the desktop window borderless and draws the same bar on both paths,
+    /// so they cannot drift; `None` is every surface that was here before.
+    pub chrome: Option<Chrome>,
 }
 
 impl Default for SurfaceSpec<'_> {
@@ -102,6 +332,7 @@ impl Default for SurfaceSpec<'_> {
             raise: false,
             order: egui::Order::Foreground,
             window_type: None,
+            chrome: None,
         }
     }
 }
@@ -131,6 +362,10 @@ pub struct SurfaceReport {
     /// window never gets it back, so "nothing of mine is focused" can be true
     /// while the user's pointer is sitting in the middle of the menu.
     pub pointer_over: Option<bool>,
+    /// The theme key was pressed with this surface's bar up. Only a
+    /// [`Chrome`] surface ever says so: it is the one whose input the main
+    /// window cannot see, so somebody has to carry the key back.
+    pub cycle_theme: bool,
 }
 
 fn viewport_id(id: &str) -> egui::ViewportId {
@@ -158,6 +393,15 @@ pub fn surface(
 ) -> SurfaceReport {
     let mut report = SurfaceReport::default();
     let mut body_wants_close = false;
+    let chrome_id = egui::Id::new((spec.id, "chrome"));
+    // **`size` is the BODY's size.** Every caller designed its panel to the
+    // points it asked for; a bar of ours on top must be added to the
+    // window, not taken out of the panel — taken out, every plugin window
+    // came up a bar short, clipped on the desktop and scrolling inline.
+    let outer = |s: Vec2| match spec.chrome {
+        Some(_) => s + Vec2::new(0.0, CHROME_BAR_H),
+        None => s,
+    };
 
     if caps.child_windows {
         // **Born hidden, revealed on the second pass.**
@@ -196,7 +440,8 @@ pub fn surface(
         }
         let mut builder = egui::ViewportBuilder::default()
             .with_title(spec.title)
-            .with_decorations(spec.decorated)
+            // A bar of ours under the OS's would be two title bars.
+            .with_decorations(spec.decorated && spec.chrome.is_none())
             .with_resizable(spec.resizable)
             .with_window_level(if spec.on_top {
                 egui::WindowLevel::AlwaysOnTop
@@ -205,10 +450,10 @@ pub fn surface(
             })
             .with_active(spec.takes_focus)
             .with_visible(existing)
-            .with_inner_size(spec.size)
-            .with_min_inner_size(spec.min_size);
+            .with_inner_size(outer(spec.size))
+            .with_min_inner_size(outer(spec.min_size));
         if !spec.resizable {
-            builder = builder.with_max_inner_size(spec.size);
+            builder = builder.with_max_inner_size(outer(spec.size));
         }
         if let Some(p) = spec.pos {
             builder = builder.with_position(p);
@@ -262,7 +507,36 @@ pub fn surface(
                 if (revealing && spec.takes_focus) || spec.raise {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
-                add(ui, &mut body_wants_close);
+                let Some(c) = spec.chrome else {
+                    add(ui, &mut body_wants_close);
+                    return;
+                };
+                let frame = ui.max_rect();
+                let l = chrome_layout(frame, spec.resizable);
+                let g = draw_chrome_bar(ui, chrome_id, spec.title, &l, c);
+                report.close |= g.close;
+                report.cycle_theme |= g.cycle_theme;
+                if g.grab {
+                    // **The OS moves the window, from the press.** A
+                    // borderless window has no bar its manager knows about,
+                    // so the bar we drew has to say "this is one" — the same
+                    // `StartDrag` the popouts send from their own press.
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+                let mut body = ui.new_child(egui::UiBuilder::new().max_rect(l.body));
+                body.set_clip_rect(l.body.intersect(ui.clip_rect()));
+                add(&mut body, &mut body_wants_close);
+                let resized = draw_chrome_edge(ui, chrome_id, frame, &l, c);
+                if resized != Vec2::ZERO {
+                    // **Resized by asking for a size, not with `BeginResize`.**
+                    // winit's macOS backend answers `drag_resize_window` with
+                    // `NotSupported` (0.30, `window_delegate.rs`), so on the
+                    // platform this ships to first a grip built on it would
+                    // do nothing at all. A size request is honoured by every
+                    // backend, and the grip is only ever asking for one.
+                    let want = (frame.size() + resized).max(outer(spec.min_size));
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::InnerSize(want));
+                }
             });
         });
         report.close |= body_wants_close;
@@ -273,28 +547,44 @@ pub fn surface(
     // An Area needs only a Context, so this works identically in a host-owned
     // window with no window manager anywhere in sight.
     let screen = ctx.content_rect();
+    // What the bar and the grip did to this layer on earlier frames — only
+    // a chrome surface has either, so only a chrome surface remembers.
+    let pass = ctx.cumulative_pass_nr();
+    let state_id = egui::Id::new((spec.id, "inline-chrome"));
+    let mut state = spec.chrome.map(|_| {
+        ctx.memory(|m| m.data.get_temp::<InlineChromeState>(state_id))
+            .filter(|s| pass.saturating_sub(s.last_pass) <= 1)
+            .unwrap_or_default()
+    });
+    let asked = state.and_then(|s| s.size).unwrap_or(outer(spec.size));
+    let least = outer(spec.min_size);
     let size = Vec2::new(
-        spec.size
+        asked
             .x
             .min(screen.width() * 0.94)
-            .max(spec.min_size.x.min(screen.width())),
-        spec.size
+            .max(least.x.min(screen.width())),
+        asked
             .y
             .min(screen.height() * 0.94)
-            .max(spec.min_size.y.min(screen.height())),
+            .max(least.y.min(screen.height())),
     );
+    // Clamped rather than trusted: a right-click near the bottom of a short
+    // editor would otherwise put the menu mostly off the canvas, and unlike
+    // a window there is no desktop for it to hang over. A dragged bar is
+    // held to the same rule, for the same reason.
+    let clamp_in = |p: Pos2| {
+        Pos2::new(
+            p.x.clamp(screen.min.x, (screen.max.x - size.x).max(screen.min.x)),
+            p.y.clamp(screen.min.y, (screen.max.y - size.y).max(screen.min.y)),
+        )
+    };
     let rect = match spec.pos {
-        // Clamped rather than trusted: a right-click near the bottom of a short
-        // editor would otherwise put the menu mostly off the canvas, and unlike
-        // a window there is no desktop for it to hang over.
-        Some(p) => {
-            let min = Pos2::new(
-                p.x.clamp(screen.min.x, (screen.max.x - size.x).max(screen.min.x)),
-                p.y.clamp(screen.min.y, (screen.max.y - size.y).max(screen.min.y)),
-            );
-            Rect::from_min_size(min, size)
-        }
+        Some(p) => Rect::from_min_size(clamp_in(p), size),
         None => Rect::from_center_size(screen.center(), size),
+    };
+    let rect = match state {
+        Some(s) => Rect::from_min_size(clamp_in(rect.min + s.moved), size),
+        None => rect,
     };
 
     if spec.modal {
@@ -321,7 +611,8 @@ pub fn surface(
                 if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                     report.close = true;
                 }
-                // SCROLL rather than clip when the body does not fit.
+                // The body, into whatever rect is its own. SCROLL rather than
+                // clip when it does not fit.
                 //
                 // Every body here paints absolutely into `max_rect`, so handing
                 // it a rect smaller than it asked for does not make it smaller
@@ -332,22 +623,58 @@ pub fn surface(
                 //
                 // On the desktop, and inline whenever the surface fits, this
                 // branch is not taken and not one pixel moves.
-                if spec.size.y > rect.height() + 0.5 || spec.size.x > rect.width() + 0.5 {
-                    egui::ScrollArea::both()
-                        .auto_shrink([false; 2])
-                        .show(ui, |ui| {
-                            let natural = Rect::from_min_size(ui.max_rect().min, spec.size);
-                            let mut inner = ui.new_child(egui::UiBuilder::new().max_rect(natural));
-                            add(&mut inner, &mut body_wants_close);
-                            // Claim the full height so the scrollbar knows how
-                            // far there is to go.
-                            ui.allocate_rect(natural, egui::Sense::hover());
-                        });
-                } else {
-                    add(ui, &mut body_wants_close);
+                let mut body = |ui: &mut egui::Ui| {
+                    let room = ui.max_rect();
+                    if spec.size.y > room.height() + 0.5 || spec.size.x > room.width() + 0.5 {
+                        egui::ScrollArea::both()
+                            .auto_shrink([false; 2])
+                            .show(ui, |ui| {
+                                let natural = Rect::from_min_size(ui.max_rect().min, spec.size);
+                                let mut inner =
+                                    ui.new_child(egui::UiBuilder::new().max_rect(natural));
+                                add(&mut inner, &mut body_wants_close);
+                                // Claim the full height so the scrollbar knows
+                                // how far there is to go.
+                                ui.allocate_rect(natural, egui::Sense::hover());
+                            });
+                    } else {
+                        add(ui, &mut body_wants_close);
+                    }
+                };
+                let Some(c) = spec.chrome else {
+                    // Handed exactly its rect, as it always was.
+                    body(ui);
+                    return;
+                };
+                // The same bar the desktop window wears, on the same layout;
+                // here a move is the layer's to make and a resize is a
+                // remembered size, because there is no window manager to ask.
+                let l = chrome_layout(rect, spec.resizable);
+                let g = draw_chrome_bar(ui, chrome_id, spec.title, &l, c);
+                report.close |= g.close;
+                report.cycle_theme |= g.cycle_theme;
+                if let Some(s) = state.as_mut() {
+                    s.moved += g.moved;
+                }
+                let mut inner = ui.new_child(egui::UiBuilder::new().max_rect(l.body));
+                inner.set_clip_rect(l.body);
+                body(&mut inner);
+                let resized = draw_chrome_edge(ui, chrome_id, rect, &l, c);
+                if let Some(s) = state.as_mut() {
+                    if resized != Vec2::ZERO {
+                        s.size = Some((size + resized).max(least));
+                    }
                 }
             });
         });
+    if let Some(mut s) = state {
+        s.last_pass = pass;
+        ctx.memory_mut(|m| m.data.insert_temp(state_id, s));
+    }
+    // Every inline surface, chrome or not: the app's raw-pointer handlers
+    // ask `inline_rect` where a dialog sits, and the answer has to be there
+    // on the pass after it was drawn.
+    ctx.memory_mut(|m| m.data.insert_temp(inline_rect_id(spec.id), (pass, rect)));
 
     report.pressed_outside = ctx.input(|i| i.pointer.any_pressed())
         && ctx.pointer_interact_pos().is_none_or(|p| !rect.contains(p));
@@ -582,5 +909,218 @@ mod tests {
             },
         );
         assert!(report.close, "the body asked to close and was ignored");
+    }
+
+    // ── the in-house chrome ─────────────────────────────────────────────────
+
+    /// **One layout, every part.** The bar, the cross, the drag rect, the
+    /// grip and the body all come from `chrome_layout`, so what is drawn is
+    /// what is hit — and the cross and the drag rect never overlap, because
+    /// a press on the cross that also started a drag would swallow the
+    /// click.
+    #[test]
+    fn the_chrome_parts_come_from_one_layout() {
+        let rect = Rect::from_min_size(Pos2::new(40.0, 30.0), Vec2::new(400.0, 300.0));
+        let l = chrome_layout(rect, true);
+        // The bar spans the top at its one height.
+        assert!((l.bar.height() - CHROME_BAR_H).abs() < 0.5, "bar {:?}", l.bar);
+        assert_eq!(l.bar.min, rect.min);
+        assert!((l.bar.width() - rect.width()).abs() < 0.5);
+        // The cross is a full-height square at the bar's right end.
+        assert!((l.close.width() - l.close.height()).abs() < 0.5, "close {:?}", l.close);
+        assert!((l.close.height() - l.bar.height()).abs() < 0.5);
+        assert!((l.close.right() - rect.right()).abs() < 0.5);
+        assert!(l.bar.contains_rect(l.close));
+        // The drag rect is the rest of the bar, sharing nothing with the cross.
+        assert!(l.bar.contains_rect(l.drag));
+        assert!(
+            l.drag.right() <= l.close.left() + 0.01,
+            "the drag rect {:?} runs under the cross {:?}",
+            l.drag,
+            l.close
+        );
+        assert!(l.drag.contains_rect(l.title), "the title leaves the drag rect");
+        // The grip sits in the bottom-right corner, over the body.
+        let grip = l.grip.expect("a resizable window has a grip");
+        assert!((grip.max - rect.max).length() < 0.5, "grip {grip:?}");
+        assert!((grip.width() - CHROME_GRIP).abs() < 0.5);
+        assert!(l.body.contains_rect(grip));
+        // The body is everything under the bar.
+        assert!((l.body.top() - l.bar.bottom()).abs() < 0.5);
+        assert_eq!(l.body.max, rect.max);
+        assert!((l.body.left() - rect.left()).abs() < 0.5);
+        // Not resizable: no grip, same everything else.
+        let fixed = chrome_layout(rect, false);
+        assert!(fixed.grip.is_none());
+        assert_eq!(fixed.bar, l.bar);
+        assert_eq!(fixed.body, l.body);
+        // Every part is inside the window.
+        for r in [l.bar, l.title, l.close, l.drag, grip, l.body] {
+            assert!(rect.expand(0.01).contains_rect(r), "{r:?} escapes {rect:?}");
+        }
+    }
+
+    /// **The bar is readable on every theme, in both modes, or the build
+    /// fails.** The sweep `face.rs` runs, on the chrome: the title ink
+    /// measured on the bar it is written on, the edge on the body, and the
+    /// bar told apart from the body it tops — on BOTH faces a dialog can be
+    /// handed, the desk's strip and the band's ground.
+    #[test]
+    fn every_theme_dresses_the_chrome() {
+        use crate::recorder_panel::contrast_ratio;
+        let themes = crate::theme::factory();
+        assert!(
+            themes.len() >= 19,
+            "the sweep expects the nineteen factory themes, found {}",
+            themes.len()
+        );
+        let mut bad: Vec<String> = Vec::new();
+        let mut swept = 0;
+        for theme in &themes {
+            for dark in [false, true] {
+                let mut set = crate::settings::Settings::default();
+                theme.apply(&mut set);
+                set.dark_mode = dark;
+                // The desk's face, exactly as `TangentApp::panel_face` resolves it.
+                let strip = if dark {
+                    set.dark_role("fx_strip").map_or_else(
+                        || crate::mixer_panel::shade_face(set.fx_strip_color.to_color32(), 0.88),
+                        |c| c.to_color32(),
+                    )
+                } else {
+                    set.fx_strip_color.to_color32()
+                };
+                let band = crate::recorder_panel::palette(&set).bg;
+                let mode = if dark { "dark" } else { "light" };
+                for (which, face) in [("strip", strip), ("band", band)] {
+                    let c = Chrome::of(face);
+                    let body = legible_surface(face);
+                    let mut check = |what: &str, r: f32, floor: f32| {
+                        if r < floor {
+                            bad.push(format!("{} {mode} ({which}): {what} {r:.2}:1", theme.name));
+                        }
+                    };
+                    check("title ink on the bar", contrast_ratio(c.ink, c.bar), 4.5);
+                    check("the edge on the body", contrast_ratio(c.edge, body), 4.5);
+                    check("the bar against the body", contrast_ratio(c.bar, body), 1.1);
+                    swept += 1;
+                }
+            }
+        }
+        assert!(swept >= 19 * 2 * 2, "the sweep covered {swept} dressings");
+        assert!(
+            bad.is_empty(),
+            "the chrome is unreadable:\n  {}",
+            bad.join("\n  ")
+        );
+    }
+
+    /// The bar's controls do what they show: the body sits under the bar,
+    /// the theme key is carried back, a drag on the bar moves the window, a
+    /// drag on the grip resizes it, and the cross closes it. Inline, which
+    /// is the one path a test can move a window on; the desktop path shares
+    /// every function but the last line of each gesture.
+    #[test]
+    fn the_chrome_moves_resizes_cycles_and_closes() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, crate::fonts::FontChoice::default(), None);
+        crate::fonts::apply_text_styles(&ctx);
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let at = Pos2::new(100.0, 100.0);
+        let size = Vec2::new(300.0, 200.0);
+        let spec = SurfaceSpec {
+            id: "test-chrome",
+            title: "Tangent Comp",
+            size,
+            min_size: Vec2::new(200.0, 100.0),
+            pos: Some(at),
+            resizable: true,
+            chrome: Some(Chrome::of(Color32::from_rgb(0xE3, 0xD9, 0xBD))),
+            ..Default::default()
+        };
+        let body_rect = std::cell::Cell::new(Rect::NOTHING);
+        let mut run = |events: Vec<egui::Event>| -> SurfaceReport {
+            let mut report = SurfaceReport::default();
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    report = surface(ctx, Caps::PLUGIN, &spec, &mut |ui, _| {
+                        body_rect.set(ui.max_rect());
+                    });
+                },
+            );
+            report
+        };
+        let press = |p: Pos2, down: bool| egui::Event::PointerButton {
+            pos: p,
+            button: egui::PointerButton::Primary,
+            pressed: down,
+            modifiers: egui::Modifiers::NONE,
+        };
+
+        // The body is handed EXACTLY the size it asked for, under the bar:
+        // the bar is added to the window, not taken out of the panel.
+        run(vec![]);
+        let outer = size + Vec2::new(0.0, CHROME_BAR_H);
+        let l = chrome_layout(Rect::from_min_size(at, outer), true);
+        assert!(
+            (body_rect.get().min - l.body.min).length() < 0.5
+                && (body_rect.get().size() - size).length() < 0.5,
+            "the body was given {:?}, not its own {size:?} under the bar {:?}",
+            body_rect.get(),
+            l.body
+        );
+
+        // T comes back as a theme cycle, and closes nothing.
+        let r = run(vec![egui::Event::Key {
+            key: egui::Key::T,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        assert!(r.cycle_theme, "the theme key was not carried back");
+        assert!(!r.close, "the theme key closed the window");
+
+        // A drag on the bar moves the window by what the hand moved.
+        let grab = l.drag.center();
+        let by = Vec2::new(50.0, 30.0);
+        run(vec![egui::Event::PointerMoved(grab), press(grab, true)]);
+        run(vec![egui::Event::PointerMoved(grab + by)]);
+        run(vec![egui::Event::PointerMoved(grab + by), press(grab + by, false)]);
+        run(vec![]);
+        let moved = Rect::from_min_size(at + by, outer);
+        assert!(
+            (body_rect.get().min - chrome_layout(moved, true).body.min).length() < 1.0,
+            "the bar was dragged by {by:?} and the body went to {:?}",
+            body_rect.get()
+        );
+
+        // A drag on the grip grows it.
+        let l = chrome_layout(moved, true);
+        let grip = l.grip.expect("resizable").center();
+        let grow = Vec2::new(40.0, 20.0);
+        run(vec![egui::Event::PointerMoved(grip), press(grip, true)]);
+        run(vec![egui::Event::PointerMoved(grip + grow)]);
+        run(vec![egui::Event::PointerMoved(grip + grow), press(grip + grow, false)]);
+        run(vec![]);
+        assert!(
+            (body_rect.get().width() - l.body.width() - grow.x).abs() < 1.0
+                && (body_rect.get().height() - l.body.height() - grow.y).abs() < 1.0,
+            "the grip was pulled by {grow:?} and the body became {:?} from {:?}",
+            body_rect.get(),
+            l.body
+        );
+
+        // The cross closes it. Press on one frame, release on the next, as a hand does.
+        let l = chrome_layout(Rect::from_min_size(moved.min, outer + grow), true);
+        let x = l.close.center();
+        run(vec![egui::Event::PointerMoved(x), press(x, true)]);
+        let r = run(vec![egui::Event::PointerMoved(x), press(x, false)]);
+        assert!(r.close, "the cross did not close the window");
     }
 }
