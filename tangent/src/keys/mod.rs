@@ -30,6 +30,8 @@
 //! callback. `render` allocates nothing, locks nothing, and calls into no
 //! system service. See `crate::instrument` for who calls it and when.
 
+pub mod clav;
+pub mod reed;
 pub mod string;
 pub mod tine;
 
@@ -58,6 +60,44 @@ pub enum Patch {
     /// A tine electric piano, dry — no amplifier, no tremolo, no chorus.
     /// Bell-like when it is played lightly, and it barks when it is not.
     EpMk1,
+    /// The concert instrument: longer wire, longer ring, sweeter treble,
+    /// wider dynamics, quieter action. The hall grand to Piano 1's club one.
+    Piano2,
+    /// The same tine piano through its own amplifier: the stereo throb of
+    /// the twin speakers, and a preamp that rounds the top a little.
+    EpSuitcase,
+    /// A struck-and-held string with a sliding pickup: the funk machine,
+    /// taken dry. See the `clav` module for what a tangent is.
+    Clav,
+    /// The same instrument through an envelope filter that chases your
+    /// touch — the pedal it spent the seventies plugged into.
+    ClavWah,
+    /// A reed piano, transistor era: hollow when feathered, growling when
+    /// leaned on, with the amp's own tremolo.
+    Wurli200,
+    /// The earlier tube reed piano: darker, never entirely clean, and the
+    /// growl comes up like a dimmer rather than a switch.
+    Wurli140,
+}
+
+/// Which physics answers a patch — the four mechanisms behind eight sounds.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Family {
+    Piano,
+    Ep,
+    Clav,
+    Wurli,
+}
+
+impl Patch {
+    fn family(self) -> Family {
+        match self {
+            Patch::Piano1 | Patch::Piano2 => Family::Piano,
+            Patch::EpMk1 | Patch::EpSuitcase => Family::Ep,
+            Patch::Clav | Patch::ClavWah => Family::Clav,
+            Patch::Wurli200 | Patch::Wurli140 => Family::Wurli,
+        }
+    }
 }
 
 impl Patch {
@@ -75,7 +115,18 @@ impl Patch {
     /// there: the picker, the settings clamp and the strip label all need
     /// them, none of those can see this crate, and two copies of a display
     /// string are two things that can disagree.
-    pub const ALL: [Patch; 2] = [Patch::Piano1, Patch::EpMk1];
+    /// APPENDED, never reordered: the first two indices were written into
+    /// settings files for months before the other six existed.
+    pub const ALL: [Patch; 8] = [
+        Patch::Piano1,
+        Patch::EpMk1,
+        Patch::Piano2,
+        Patch::EpSuitcase,
+        Patch::Clav,
+        Patch::ClavWah,
+        Patch::Wurli200,
+        Patch::Wurli140,
+    ];
 
     /// The knobs this sound answers to, in the order the panel draws them.
     ///
@@ -90,8 +141,13 @@ impl Patch {
     /// reorder, and never reuse a retired slot for something else.
     pub const fn params(self) -> &'static [ParamSpec] {
         match self {
-            Patch::Piano1 => &PIANO_PARAMS,
+            Patch::Piano1 | Patch::Piano2 => &PIANO_PARAMS,
             Patch::EpMk1 => &EP_PARAMS,
+            Patch::EpSuitcase => &EP_SUITCASE_PARAMS,
+            Patch::Clav => &CLAV_PARAMS,
+            Patch::ClavWah => &CLAV_WAH_PARAMS,
+            Patch::Wurli200 => &WURLI_PARAMS,
+            Patch::Wurli140 => &WURLI140_PARAMS,
         }
     }
 
@@ -232,6 +288,228 @@ const EP_PARAMS: [ParamSpec; MAX_PARAMS] = [
     },
 ];
 
+/// The suitcase wears the dry instrument's rack with one seat changed: the
+/// CHIME slot becomes the TREMOLO, because the amp's throb is the reason to
+/// choose this patch and a knob you cannot reach is not a knob.
+const EP_SUITCASE_PARAMS: [ParamSpec; MAX_PARAMS] = [
+    ParamSpec {
+        name: "Voicing",
+        about: "hammer tip: soft to hard against the tine",
+        default: 0.5,
+    },
+    ParamSpec {
+        name: "Width",
+        about: "how far bass and treble sit apart",
+        default: WIDTH_DEFAULT,
+    },
+    ParamSpec {
+        name: "Decay",
+        about: "how long the tine rings",
+        default: 0.5,
+    },
+    ParamSpec {
+        name: "Bell",
+        about: "the glassy chime on the attack",
+        default: 0.5,
+    },
+    ParamSpec {
+        name: "Bark",
+        about: "how hard the tine leans on the pickup",
+        default: 0.5,
+    },
+    ParamSpec {
+        name: "Tremolo",
+        about: "the stereo throb of the twin speakers",
+        default: 0.45,
+    },
+    ParamSpec {
+        name: "Release",
+        about: "how fast the damper stops the tine",
+        default: 0.5,
+    },
+    ParamSpec {
+        name: "Tonebar",
+        about: "the metal the tine is bolted to",
+        default: 0.5,
+    },
+];
+
+const CLAV_PARAMS: [ParamSpec; MAX_PARAMS] = [
+    ParamSpec {
+        name: "Voicing",
+        about: "tangent tip: worn soft to fresh hard",
+        default: 0.5,
+    },
+    ParamSpec {
+        name: "Width",
+        about: "how far bass and treble sit apart",
+        default: WIDTH_DEFAULT,
+    },
+    ParamSpec {
+        name: "Decay",
+        about: "how long a held string rings",
+        default: 0.5,
+    },
+    ParamSpec {
+        name: "Pickup",
+        about: "where the coil sits under the string",
+        default: 0.35,
+    },
+    ParamSpec {
+        name: "Tone",
+        about: "the filter rockers, folded to one sweep",
+        default: 0.75,
+    },
+    ParamSpec {
+        name: "Snap",
+        about: "the spit of the string when the key lifts",
+        default: 0.5,
+    },
+    ParamSpec {
+        name: "Release",
+        about: "how fast the yarn chokes the string",
+        default: 0.5,
+    },
+    ParamSpec {
+        name: "Mute",
+        about: "the sliding damper pad: funk at the top",
+        default: 0.0,
+    },
+];
+
+/// The wah patch trades the TONE rocker for the pedal's one knob — a static
+/// filter under a moving one is a fight the moving one always wins.
+const CLAV_WAH_PARAMS: [ParamSpec; MAX_PARAMS] = [
+    ParamSpec {
+        name: "Voicing",
+        about: "tangent tip: worn soft to fresh hard",
+        default: 0.5,
+    },
+    ParamSpec {
+        name: "Width",
+        about: "how far bass and treble sit apart",
+        default: WIDTH_DEFAULT,
+    },
+    ParamSpec {
+        name: "Decay",
+        about: "how long a held string rings",
+        default: 0.5,
+    },
+    ParamSpec {
+        name: "Pickup",
+        about: "where the coil sits under the string",
+        default: 0.35,
+    },
+    ParamSpec {
+        name: "Wah",
+        about: "how hard the filter chases your touch",
+        default: 0.55,
+    },
+    ParamSpec {
+        name: "Snap",
+        about: "the spit of the string when the key lifts",
+        default: 0.5,
+    },
+    ParamSpec {
+        name: "Release",
+        about: "how fast the yarn chokes the string",
+        default: 0.5,
+    },
+    ParamSpec {
+        name: "Mute",
+        about: "the sliding damper pad: funk at the top",
+        default: 0.0,
+    },
+];
+
+const WURLI_PARAMS: [ParamSpec; MAX_PARAMS] = [
+    ParamSpec {
+        name: "Voicing",
+        about: "hammer felt: worn soft to packed hard",
+        default: 0.5,
+    },
+    ParamSpec {
+        name: "Width",
+        about: "how far bass and treble sit apart",
+        default: WIDTH_DEFAULT,
+    },
+    ParamSpec {
+        name: "Decay",
+        about: "how long the reed rings",
+        default: 0.5,
+    },
+    ParamSpec {
+        name: "Reed",
+        about: "how much of the bar's own metal speaks",
+        default: 0.5,
+    },
+    ParamSpec {
+        name: "Growl",
+        about: "how hard the reed leans into the plate",
+        default: 0.5,
+    },
+    ParamSpec {
+        name: "Tremolo",
+        about: "the amp's throb",
+        default: 0.4,
+    },
+    ParamSpec {
+        name: "Release",
+        about: "how fast the damper stops the reed",
+        default: 0.5,
+    },
+    ParamSpec {
+        name: "Thump",
+        about: "the hammer's knock against the reed",
+        default: 0.5,
+    },
+];
+
+/// The tube instrument ships dirtier and stiller: growl up, tremolo off —
+/// the 140's trem was a service-menu afterthought and nobody used it.
+const WURLI140_PARAMS: [ParamSpec; MAX_PARAMS] = [
+    ParamSpec {
+        name: "Voicing",
+        about: "hammer felt: worn soft to packed hard",
+        default: 0.5,
+    },
+    ParamSpec {
+        name: "Width",
+        about: "how far bass and treble sit apart",
+        default: WIDTH_DEFAULT,
+    },
+    ParamSpec {
+        name: "Decay",
+        about: "how long the reed rings",
+        default: 0.5,
+    },
+    ParamSpec {
+        name: "Reed",
+        about: "how much of the bar's own metal speaks",
+        default: 0.5,
+    },
+    ParamSpec {
+        name: "Growl",
+        about: "how hard the reed leans into the plate",
+        default: 0.62,
+    },
+    ParamSpec {
+        name: "Tremolo",
+        about: "the amp's throb",
+        default: 0.0,
+    },
+    ParamSpec {
+        name: "Release",
+        about: "how fast the damper stops the reed",
+        default: 0.5,
+    },
+    ParamSpec {
+        name: "Thump",
+        about: "the hammer's knock against the reed",
+        default: 0.5,
+    },
+];
+
 /// A knob mapped so that **0.5 is exactly the instrument the bench signed
 /// off**: every curve below passes through its own tuned constant at the
 /// centre, so a strip that has never been touched, a strip reset to defaults
@@ -321,6 +599,92 @@ impl Default for EpKnobs {
     }
 }
 
+/// The clav's knobs in the units `ClavVoice` uses.
+#[derive(Clone, Copy)]
+pub struct ClavKnobs {
+    /// 0 worn soft, 1 fresh hard.
+    pub voicing: f32,
+    /// Multiplier on the string's t60.
+    pub decay: f32,
+    /// The coil's position, 0 tight to the bridge, 1 out under the middle.
+    pub pickup: f32,
+    /// The rockers, 0 soft to 1 brilliant.
+    pub tone: f32,
+    /// Scale on the release spit.
+    pub snap: f32,
+    /// Multiplier on the yarn's choke time.
+    pub release: f32,
+    /// The damper slider, 0 free to 1 pressed.
+    pub mute: f32,
+}
+
+impl ClavKnobs {
+    /// The dry patch: TONE lives at index 4.
+    pub fn from_params(p: &[f32; MAX_PARAMS]) -> Self {
+        ClavKnobs {
+            voicing: p[P_VOICING].clamp(0.0, 1.0),
+            decay: bipolar(p[2], 1.4),
+            pickup: p[3].clamp(0.0, 1.0),
+            tone: p[4].clamp(0.0, 1.0),
+            snap: (p[5] * 2.0).clamp(0.0, 2.0),
+            release: bipolar(p[6], 1.7),
+            mute: p[7].clamp(0.0, 1.0),
+        }
+    }
+
+    /// The wah patch: index 4 belongs to the pedal, so the rockers hold at
+    /// their shipped setting — the pedal is doing the filtering.
+    pub fn from_params_wah(p: &[f32; MAX_PARAMS]) -> Self {
+        let mut k = Self::from_params(p);
+        k.tone = 0.75;
+        k
+    }
+}
+
+impl Default for ClavKnobs {
+    fn default() -> Self {
+        Self::from_params(&Patch::Clav.defaults())
+    }
+}
+
+/// The reed piano's knobs in the units `WurliVoice` uses. TREMOLO is absent
+/// on purpose: it belongs to the AMP, one per instrument, and the frame
+/// reads it straight off the store each block.
+#[derive(Clone, Copy)]
+pub struct WurliKnobs {
+    /// 0 worn soft, 1 packed hard.
+    pub voicing: f32,
+    /// Multiplier on the reed's t60.
+    pub decay: f32,
+    /// Scale on the bar overtones' weight.
+    pub reed: f32,
+    /// Scale on the plate's asymmetry.
+    pub growl: f32,
+    /// Multiplier on the damper's time constant.
+    pub release: f32,
+    /// Scale on the hammer knock.
+    pub thump: f32,
+}
+
+impl WurliKnobs {
+    pub fn from_params(p: &[f32; MAX_PARAMS]) -> Self {
+        WurliKnobs {
+            voicing: p[P_VOICING].clamp(0.0, 1.0),
+            decay: bipolar(p[2], 1.4),
+            reed: (p[3] * 2.0).clamp(0.0, 2.0),
+            growl: (p[4] * 2.0).clamp(0.0, 2.0),
+            release: bipolar(p[6], 1.7),
+            thump: (p[7] * 2.0).clamp(0.0, 2.0),
+        }
+    }
+}
+
+impl Default for WurliKnobs {
+    fn default() -> Self {
+        Self::from_params(&Patch::Wurli200.defaults())
+    }
+}
+
 /// One key, sounding.
 ///
 /// **Both mechanisms, always, in every voice.** The obvious build has a
@@ -339,9 +703,12 @@ impl Default for EpKnobs {
 struct Mechanism {
     piano: string::PianoVoice,
     ep: tine::EpVoice,
-    /// Which of the two is speaking. Not `Patch`, because this is asked once
-    /// per voice per sample and a bool is the whole question.
-    is_ep: bool,
+    clav: clav::ClavVoice,
+    wurli: reed::WurliVoice,
+    /// Which mechanism is speaking, and which base it wears. The FAMILY is
+    /// asked once per voice per sample; the patch only at the strike.
+    family: Family,
+    patch: Patch,
 }
 
 impl Mechanism {
@@ -349,69 +716,113 @@ impl Mechanism {
         Mechanism {
             piano: string::PianoVoice::new(rate),
             ep: tine::EpVoice::new(rate),
-            is_ep: false,
+            clav: clav::ClavVoice::new(rate),
+            wurli: reed::WurliVoice::new(rate),
+            family: Family::Piano,
+            patch: Patch::Piano1,
         }
     }
 
-    /// Become the other instrument. Silences both, because a tine ringing on
-    /// under a piano would be the previous patch leaking into the new one.
+    /// Become another instrument. Silences all four, because a tine ringing
+    /// on under a piano would be the previous patch leaking into the new one.
     fn set_kind(&mut self, patch: Patch) {
-        self.is_ep = matches!(patch, Patch::EpMk1);
+        self.family = patch.family();
+        self.patch = patch;
         self.piano.damp();
         self.ep.damp();
+        self.clav.damp();
+        self.wurli.damp();
     }
 
     /// Strike, with **the whole knob store** rather than one number: each
     /// mechanism maps the shared 0..1 values into its own units, because
     /// knob 4 is an unison on one instrument and a pickup on the other.
     fn strike(&mut self, pitch: u8, velocity: f32, params: &[f32; MAX_PARAMS]) {
-        if self.is_ep {
-            self.ep.strike_knobs(pitch, velocity, &EpKnobs::from_params(params));
-        } else {
-            self.piano
-                .strike_knobs(pitch, velocity, &PianoKnobs::from_params(params));
+        match self.patch {
+            Patch::Piano1 => self.piano.strike_based(
+                pitch,
+                velocity,
+                &PianoKnobs::from_params(params),
+                &string::PianoBase::JAZZ,
+            ),
+            Patch::Piano2 => self.piano.strike_based(
+                pitch,
+                velocity,
+                &PianoKnobs::from_params(params),
+                &string::PianoBase::CONCERT,
+            ),
+            Patch::EpMk1 | Patch::EpSuitcase => {
+                self.ep
+                    .strike_knobs(pitch, velocity, &EpKnobs::from_params(params));
+            }
+            Patch::Clav => {
+                self.clav
+                    .strike_knobs(pitch, velocity, &ClavKnobs::from_params(params));
+            }
+            Patch::ClavWah => self.clav.strike_knobs(
+                pitch,
+                velocity,
+                &ClavKnobs::from_params_wah(params),
+            ),
+            Patch::Wurli200 => self.wurli.strike_knobs(
+                pitch,
+                velocity,
+                &WurliKnobs::from_params(params),
+                &reed::WurliBase::TWO_HUNDRED,
+            ),
+            Patch::Wurli140 => self.wurli.strike_knobs(
+                pitch,
+                velocity,
+                &WurliKnobs::from_params(params),
+                &reed::WurliBase::ONE_FORTY,
+            ),
         }
     }
 
     fn release(&mut self, pedal: bool) {
-        if self.is_ep {
-            self.ep.release(pedal);
-        } else {
-            self.piano.release(pedal);
+        match self.family {
+            Family::Piano => self.piano.release(pedal),
+            Family::Ep => self.ep.release(pedal),
+            Family::Clav => self.clav.release(pedal),
+            Family::Wurli => self.wurli.release(pedal),
         }
     }
 
     fn damp(&mut self) {
-        if self.is_ep {
-            self.ep.damp();
-        } else {
-            self.piano.damp();
+        match self.family {
+            Family::Piano => self.piano.damp(),
+            Family::Ep => self.ep.damp(),
+            Family::Clav => self.clav.damp(),
+            Family::Wurli => self.wurli.damp(),
         }
     }
 
     fn finished(&self) -> bool {
-        if self.is_ep {
-            self.ep.finished()
-        } else {
-            self.piano.finished()
+        match self.family {
+            Family::Piano => self.piano.finished(),
+            Family::Ep => self.ep.finished(),
+            Family::Clav => self.clav.finished(),
+            Family::Wurli => self.wurli.finished(),
         }
     }
 
     /// This voice's loudness right now, for the stealing policy. Cheap: it is
     /// a running envelope the voice already keeps, not a measurement.
     fn level(&self) -> f32 {
-        if self.is_ep {
-            self.ep.level()
-        } else {
-            self.piano.level()
+        match self.family {
+            Family::Piano => self.piano.level(),
+            Family::Ep => self.ep.level(),
+            Family::Clav => self.clav.level(),
+            Family::Wurli => self.wurli.level(),
         }
     }
 
     fn tick(&mut self) -> f32 {
-        if self.is_ep {
-            self.ep.tick()
-        } else {
-            self.piano.tick()
+        match self.family {
+            Family::Piano => self.piano.tick(),
+            Family::Ep => self.ep.tick(),
+            Family::Clav => self.clav.tick(),
+            Family::Wurli => self.wurli.tick(),
         }
     }
 }
@@ -459,6 +870,15 @@ pub struct Keys {
     /// strings that answers a pedalled note. One per instrument, not one per
     /// voice, because in the real thing there is one soundboard.
     body: string::Body,
+    /// The AMP side of the patches that have one — per instrument, not per
+    /// voice, because the suitcase has one pair of speakers and the reed
+    /// piano one output stage however many keys are down. A shared LFO
+    /// phase for the tremolos; a follower and a state-variable filter, one
+    /// per channel, for the wah.
+    trem_phase: f32,
+    wah_env: f32,
+    wah_low: [f32; 2],
+    wah_band: [f32; 2],
 }
 
 impl Keys {
@@ -475,6 +895,10 @@ impl Keys {
             sounding: 0,
             strikes: 0,
             body: string::Body::new(rate),
+            trem_phase: 0.0,
+            wah_env: 0.0,
+            wah_low: [0.0; 2],
+            wah_band: [0.0; 2],
         };
         keys.fill_pool();
         keys
@@ -517,6 +941,10 @@ impl Keys {
         }
         self.sounding = 0;
         self.body.set_patch(patch);
+        self.trem_phase = 0.0;
+        self.wah_env = 0.0;
+        self.wah_low = [0.0; 2];
+        self.wah_band = [0.0; 2];
         // **The knobs belong to the SOUND.** A piano's Unison is an electric
         // piano's Bark at the same index, so carrying the numbers across
         // would apply one instrument's settings to another's mechanism. The
@@ -705,6 +1133,22 @@ impl Keys {
         // Once per block, not per sample: the knob cannot move inside a
         // block, and the mapping is a multiply the loop should not repeat.
         let body_amt = (self.params[P_BODY] * 2.0).clamp(0.0, 2.0);
+        // The amp side, block-constant. The tremolo and wah knobs are read
+        // HERE rather than at the strike, because an amp's knobs act on
+        // whatever is already ringing — turn the throb up under a held
+        // chord and the chord throbs, which is what the real switch does.
+        let patch = self.patch;
+        let (trem_depth, trem_hz) = match patch {
+            Patch::EpSuitcase => ((self.params[5] * 0.85).clamp(0.0, 0.85), 5.0),
+            Patch::Wurli200 | Patch::Wurli140 => {
+                (self.params[5].clamp(0.0, 1.0), 5.5)
+            }
+            _ => (0.0, 0.0),
+        };
+        let trem_inc = std::f32::consts::TAU * trem_hz / self.rate;
+        let wah_sens = self.params[4].clamp(0.0, 1.0);
+        let wah_atk = 1.0 - (-1.0 / (0.003 * self.rate)).exp();
+        let wah_rel = 1.0 - (-1.0 / (0.140 * self.rate)).exp();
         for f in 0..n {
             let mut left = 0.0_f32;
             let mut right = 0.0_f32;
@@ -730,6 +1174,73 @@ impl Keys {
             let (bl, br) = self.body.tick(drive);
             left += bl * body_amt;
             right += br * body_amt;
+            // **The amp pass.** What the cabinet does to the sum that the
+            // mechanism cannot do to a voice.
+            match patch {
+                Patch::EpSuitcase => {
+                    // The stereo vibrato: the two speakers trade the signal,
+                    // equal-power, unity at rest. The one effect every
+                    // suitcase record is wearing. Normalised by the loud
+                    // side's own peak: equal POWER swings the PEAK up by
+                    // root two at full throw, and the bench caught the dry
+                    // instrument's forte chords — already voiced to the
+                    // ceiling — clipping the moment the throb was on. The
+                    // scale is 1.0 at rest, so depth zero IS the dry patch.
+                    self.trem_phase = (self.trem_phase + trem_inc)
+                        % std::f32::consts::TAU;
+                    let pan = trem_depth * self.trem_phase.sin();
+                    let a = std::f32::consts::FRAC_PI_4 * (1.0 + pan);
+                    let peak = std::f32::consts::SQRT_2
+                        * (std::f32::consts::FRAC_PI_4 * (1.0 + trem_depth)).sin();
+                    let norm = std::f32::consts::SQRT_2 / peak.max(1.0);
+                    left *= a.cos() * norm;
+                    right *= a.sin() * norm;
+                }
+                Patch::Wurli200 | Patch::Wurli140 => {
+                    // The reed amp's tremolo throbs LEVEL, in mono — one
+                    // output stage, both channels together.
+                    self.trem_phase = (self.trem_phase + trem_inc)
+                        % std::f32::consts::TAU;
+                    let g = 1.0
+                        - trem_depth * 0.30 * (1.0 + self.trem_phase.sin());
+                    left *= g;
+                    right *= g;
+                }
+                Patch::ClavWah => {
+                    // The touch filter: a follower rides the playing and
+                    // drags a resonant sweep up with it. Fast up, slow down
+                    // - the QUACK is the asymmetry.
+                    let lvl = (left.abs() + right.abs()) * 0.5;
+                    let coeff = if lvl > self.wah_env { wah_atk } else { wah_rel };
+                    self.wah_env += (lvl - self.wah_env) * coeff;
+                    let drive = (self.wah_env * 5.5).clamp(0.0, 1.0);
+                    let oct = 1.0 + 2.6 * wah_sens;
+                    let fc = (240.0 * 2.0_f32.powf(oct * drive))
+                        .clamp(180.0, 4_800.0);
+                    let fcoef = (2.0
+                        * (std::f32::consts::PI * fc / self.rate).sin())
+                    .clamp(0.0, 0.7);
+                    for (c, x) in [left, right].into_iter().enumerate() {
+                        self.wah_low[c] += fcoef * self.wah_band[c];
+                        let high = x - self.wah_low[c] - 0.40 * self.wah_band[c];
+                        self.wah_band[c] += fcoef * high;
+                        if !self.wah_low[c].is_finite()
+                            || !self.wah_band[c].is_finite()
+                        {
+                            self.wah_low[c] = 0.0;
+                            self.wah_band[c] = 0.0;
+                        }
+                        let wet = self.wah_band[c] * 1.15
+                            + self.wah_low[c] * 0.30;
+                        if c == 0 {
+                            left = wet;
+                        } else {
+                            right = wet;
+                        }
+                    }
+                }
+                _ => {}
+            }
             let base = f * channels;
             if channels == 1 {
                 out[base] += (left + right) * 0.5;
@@ -774,4 +1285,128 @@ fn pan_gains(pan: f32) -> (f32, f32) {
     let p = (pan.clamp(-1.0, 1.0) + 1.0) * 0.5;
     let a = std::f32::consts::FRAC_PI_2 * p;
     (a.cos() * std::f32::consts::SQRT_2, a.sin() * std::f32::consts::SQRT_2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Strike a handful of keys at mixed velocities and roll the block loop
+    /// the way the engine does. The shape every per-patch test shares.
+    fn play(patch: Patch, secs: f32, tweak: &[(usize, f32)]) -> Vec<f32> {
+        let mut k = Keys::new(48_000.0);
+        k.set_patch(patch);
+        for (i, v) in tweak {
+            k.set_param(*i, *v);
+        }
+        for (n, vel) in [(36u8, 0.9), (48, 0.5), (60, 0.75), (64, 0.3), (79, 1.0)] {
+            k.note_on(n, vel);
+        }
+        let frames = (secs * 48_000.0) as usize;
+        let mut out = vec![0.0f32; frames * 2];
+        let mut at = 0;
+        while at < frames {
+            let n = 128.min(frames - at);
+            k.render(&mut out[at * 2..(at + n) * 2], n, 2);
+            if at > frames / 2 {
+                k.note_off(60);
+            }
+            at += n;
+        }
+        out
+    }
+
+    /// **The append-only pin.** The first two indices were written into
+    /// settings files before the other six existed; a reorder silently
+    /// loads the wrong instrument into every old session.
+    #[test]
+    fn the_first_two_patch_indices_are_forever() {
+        assert_eq!(Patch::ALL[0], Patch::Piano1);
+        assert_eq!(Patch::ALL[1], Patch::EpMk1);
+        assert_eq!(Patch::ALL.len(), 8);
+    }
+
+    /// Every patch speaks, stays finite, and stays inside the headroom its
+    /// mechanisms promise — at rest AND with its amp-side knobs pinned to
+    /// the top, which is where a runaway filter or tremolo would show.
+    #[test]
+    fn every_patch_renders_bounded_and_audible() {
+        for &patch in &Patch::ALL {
+            for tweak in [&[][..], &[(4, 1.0), (5, 1.0)][..]] {
+                let out = play(patch, 2.0, tweak);
+                let mut peak = 0.0f32;
+                let mut energy = 0.0f64;
+                for s in &out {
+                    assert!(s.is_finite(), "{patch:?} went non-finite");
+                    peak = peak.max(s.abs());
+                    energy += f64::from(*s) * f64::from(*s);
+                }
+                assert!(peak < 4.0, "{patch:?} peaked at {peak}");
+                let rms = (energy / out.len() as f64).sqrt();
+                assert!(rms > 1.0e-4, "{patch:?} rendered near-silence, rms {rms}");
+            }
+        }
+    }
+
+    /// A patch change may not carry the old instrument's ringing into the
+    /// new one: the flip damps everything, and what remains after a couple
+    /// of blocks is the damper fade dying, not a note.
+    #[test]
+    fn a_patch_change_silences_what_was_ringing() {
+        let mut k = Keys::new(48_000.0);
+        k.note_on(48, 1.0);
+        let mut buf = vec![0.0f32; 4096 * 2];
+        k.render(&mut buf, 4096, 2);
+        k.set_patch(Patch::Clav);
+        // A quarter second of nothing played on the new patch.
+        let mut peak = 0.0f32;
+        for _ in 0..94 {
+            buf[..256].fill(0.0);
+            k.render(&mut buf[..256], 128, 2);
+            peak = peak.max(buf[..256].iter().fold(0.0f32, |a, s| a.max(s.abs())));
+        }
+        assert!(peak < 1.0e-3, "the old patch leaked through at {peak}");
+    }
+
+    /// Defaults are the ParamSpec table, verbatim, for every patch — the
+    /// panel's Initialise, the untouched strip and the bench agree by
+    /// construction, and this keeps it that way.
+    #[test]
+    fn defaults_are_the_spec_table_for_every_patch() {
+        for &patch in &Patch::ALL {
+            let d = patch.defaults();
+            for (i, spec) in patch.params().iter().enumerate() {
+                assert_eq!(d[i], spec.default, "{patch:?} knob {i} ({})", spec.name);
+            }
+        }
+    }
+
+    /// The two tremolos and the wah live on the SUM, so they must engage
+    /// without a strike-time knob read: turn the knob mid-note and the
+    /// held sound changes. Rendering the suitcase with tremolo hard on and
+    /// hard off must produce audibly different left channels.
+    #[test]
+    fn the_amp_knobs_act_on_a_note_already_ringing() {
+        let render_with = |depth: f32| -> Vec<f32> {
+            let mut k = Keys::new(48_000.0);
+            k.set_patch(Patch::EpSuitcase);
+            k.note_on(60, 0.8);
+            k.set_param(5, depth);
+            let mut out = vec![0.0f32; 48_000 * 2];
+            let mut at = 0;
+            while at < 48_000 {
+                k.render(&mut out[at * 2..(at + 128) * 2], 128, 2);
+                at += 128;
+            }
+            out
+        };
+        let still = render_with(0.0);
+        let throb = render_with(1.0);
+        let diff: f64 = still
+            .iter()
+            .zip(&throb)
+            .map(|(a, b)| f64::from((a - b).abs()))
+            .sum();
+        assert!(diff > 1.0, "the tremolo knob did nothing to a held note");
+    }
 }
