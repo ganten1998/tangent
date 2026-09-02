@@ -222,6 +222,86 @@ pub const UNITS: &[UnitSpec] = &[
 /// know — which the loader reports rather than swallows, because a session
 /// from a NEWER build naming a unit this one lacks deserves a sentence, not a
 /// silently empty bay.
+/// The value as the face should PRINT it — the kernel's own mapping
+/// constants turned into the band's reading formats, in one place, so the
+/// panel and the sound can never quote two different numbers for one knob.
+/// The formatters are the face kit's; this crate links the UI crate, so
+/// reuse is free and the firewall is untouched (data flows outward only).
+pub fn describe(path: &str, id: u32, value: f32) -> String {
+    use tangent_ui::face::{fmt_db, fmt_hz, fmt_ms, fmt_pct};
+    let v = value.clamp(0.0, 1.0);
+    let lerp = |r: (f32, f32)| r.0 + (r.1 - r.0) * v;
+    let sweep = |r: (f32, f32)| r.0 * (r.1 / r.0).powf(v);
+    match (path, id) {
+        (TRIM_PATH, 0) => fmt_db(lerp((TRIM_DB.0 as f32, TRIM_DB.1 as f32))),
+        (EQ_PATH, id) => {
+            use crate::units::eq::{NodeKind, EQ_FREQ_HZ, EQ_GAIN_DB, EQ_Q};
+            match id % EQ_KNOBS_PER_NODE {
+                0 => (if v >= 0.5 { "in" } else { "out" }).to_owned(),
+                1 => {
+                    let last = (NodeKind::ALL.len() - 1) as f32;
+                    let at = ((v * last).round() as usize).min(NodeKind::ALL.len() - 1);
+                    NodeKind::ALL[at].label().to_owned()
+                }
+                2 => fmt_hz(sweep(EQ_FREQ_HZ)),
+                3 => fmt_db((v * 2.0 - 1.0) * EQ_GAIN_DB),
+                _ => format!("Q {:.2}", sweep(EQ_Q)),
+            }
+        }
+        (IMAGER_PATH, 0) => {
+            // The side gain doubles at the top of the travel, so the knob
+            // reads 0..200% with unity at noon.
+            use crate::units::imager::WIDTH_GAIN;
+            fmt_pct(lerp(WIDTH_GAIN))
+        }
+        (IMAGER_PATH, 1) => fmt_pct(v),
+        (IMAGER_PATH, 2) => {
+            use crate::units::imager::MONO_BELOW_HZ;
+            if v <= 0.0 {
+                "off".to_owned()
+            } else {
+                fmt_hz(sweep(MONO_BELOW_HZ))
+            }
+        }
+        (COMP_PATH, id) => {
+            use crate::units::comp::*;
+            match id {
+                0 => fmt_db(lerp(COMP_THRESHOLD_DB)),
+                1 => format!("{:.1}:1", COMP_RATIO_MAX.powf(v)),
+                2 => fmt_ms(sweep(COMP_ATTACK_MS)),
+                3 => fmt_ms(sweep(COMP_RELEASE_MS)),
+                4 => fmt_db(lerp(COMP_MAKEUP_DB)),
+                5 => fmt_pct(v),
+                _ => {
+                    if v <= 0.0 {
+                        "off".to_owned()
+                    } else {
+                        fmt_hz(sweep(COMP_KEY_HPF_HZ))
+                    }
+                }
+            }
+        }
+        // The tape speaks in percent on purpose: its knobs are character,
+        // not calibration, and a fake decibel is worse than an honest one.
+        _ => fmt_pct(v),
+    }
+}
+
+/// A stepped parameter's positions, in step order, for the face's cycling
+/// row. Continuous parameters answer empty.
+pub fn choices(path: &str, id: u32) -> Vec<String> {
+    match (path, id) {
+        (EQ_PATH, id) if id % EQ_KNOBS_PER_NODE == 0 => {
+            vec!["out".to_owned(), "in".to_owned()]
+        }
+        (EQ_PATH, id) if id % EQ_KNOBS_PER_NODE == 1 => crate::units::eq::NodeKind::ALL
+            .iter()
+            .map(|k| k.label().to_owned())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 pub fn spec_for(path: &str) -> Option<&'static UnitSpec> {
     UNITS.iter().find(|u| u.path == path)
 }

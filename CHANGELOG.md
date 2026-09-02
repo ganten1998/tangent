@@ -116,6 +116,44 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   and back finds the instrument as it was left; sessions from before the
   new sounds open with their two pianos exactly where they were.
 
+- **The plugin suite: four effects of Tangent's own.** Load them from the
+  picker onto any channel, folder, bus or the master, as many instances as
+  there are bays, exactly like a VST3 - state in the project, knobs
+  automatable, each with a panel drawn in the timecode cluster's own glass:
+
+  *Tangent EQ* - a visual equalizer, natural phase by design: the bell and
+  shelf curves are matched to their analog prototypes instead of cramping
+  at the top of the hearing range, and the display draws the response with
+  THE SAME math the audio runs, over a live spectrum analyzer. Three bands;
+  tap a handle to walk its filter shape, drag it where you want it, turn
+  the wheel to narrow it, double-click to add or remove.
+
+  *Tangent Imager* - a full-circle vectorscope and a correlation meter over
+  three controls: width, an ensemble made of velvet noise that widens
+  WITHOUT touching the mid - fold to mono and your track is still there -
+  and a mono floor that keeps the lows centred.
+
+  *Tangent Tape* - the record-and-repro path of a quarter-inch machine at
+  its one speed: the head bump, the top rolling off, the subs tucked away,
+  saturation that rounds attacks spectrally the way tape actually does
+  (not a compressor wearing a costume), wow and flutter with a real
+  transport's drift, and shaped hiss. Six knobs, no bells.
+
+  *Tangent Comp* - dials, a gain-reduction needle on the glass, and nothing
+  to hide behind. Threshold, ratio, attack, release, makeup, mix, and a
+  key high-pass ready for the side-chain routing to come.
+
+  All four live in **Tangent Labs**, the house's own folder in the picker -
+  first in the list, wearing the cluster's colour, and opened FOR you
+  exactly once, the first time you ever reach for a plugin slot.
+
+- **Presets, for every one of them.** A Presets folder under Tangent Media
+  with a shelf per unit; save under a name from inside any panel, load from
+  the same row, and share a sound by sharing the file. Drum kits join in:
+  the single-file kit with every sample inside it now saves as `.kit`
+  (old `.tgkit` files open forever), and the kit dialog starts at its own
+  shelf.
+
 - **Every slider now knows its way home.** Double-click was already how a
   band knob, a mixer fader, a drum knob and a keyboard knob reset; the
   effect panels' parameter rows and the routing dialog's level were the

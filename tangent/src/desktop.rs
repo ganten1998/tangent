@@ -1250,9 +1250,53 @@ fn push_builtin_faces(
                         units: p.units.to_owned(),
                         default: p.default,
                         steps: p.steps,
+                        reading: crate::builtin_fx::describe(spec.path, p.id, *v),
+                        choices: crate::builtin_fx::choices(spec.path, p.id),
                         value: *v,
                     })
                     .collect(),
+                // The EQ's picture, drawn by the audio path's own math on
+                // the UI's own grid — the two crates share the constants,
+                // so the curve the face paints IS the response the block
+                // loop runs.
+                curve_db: if spec.path == crate::builtin_fx::EQ_PATH {
+                    let mut eq = crate::units::eq::EqParams::default();
+                    for (i, node) in eq.nodes.iter_mut().enumerate() {
+                        let base = i as u32 * 5;
+                        let at = |k: u32| values.get((base + k) as usize).copied().unwrap_or(0.5);
+                        // A node past the face's three has no values at all;
+                        // absent must read as OFF, not as the toggle's noon.
+                        node.on = values
+                            .get(base as usize)
+                            .is_some_and(|v| *v >= 0.5);
+                        let last = (crate::units::eq::NodeKind::ALL.len() - 1) as f32;
+                        let k = ((at(1) * last).round() as usize)
+                            .min(crate::units::eq::NodeKind::ALL.len() - 1);
+                        node.kind = crate::units::eq::NodeKind::ALL[k];
+                        node.freq = at(2);
+                        node.gain = at(3);
+                        node.q = at(4);
+                    }
+                    let lo = tangent_ui::face::CURVE_LO_HZ;
+                    let hi = tangent_ui::face::CURVE_HI_HZ;
+                    let n = tangent_ui::face::CURVE_POINTS;
+                    let freqs: Vec<f32> = (0..n)
+                        .map(|i| lo * (hi / lo).powf(i as f32 / (n - 1) as f32))
+                        .collect();
+                    let live: Vec<crate::units::eq::Node> = eq
+                        .nodes
+                        .iter()
+                        .filter(|p| p.on)
+                        .map(|p| p.node())
+                        .collect();
+                    crate::units::eq::response_db(
+                        &live,
+                        &freqs,
+                        engine.output().sample_rate as f32,
+                    )
+                } else {
+                    Vec::new()
+                },
             },
             None => tangent_ui::ports::BuiltinFace {
                 strip,
@@ -3519,6 +3563,18 @@ impl DesktopApp {
                     self.insert_tap_at = on.then_some(at);
                     if let Some(e) = self.recorder.engine.as_mut() {
                         e.set_insert_tap(self.insert_tap_at);
+                    }
+                    // Arming is also "a face just opened here": its preset
+                    // shelf rides along, so the panel's list is filled by
+                    // the time the eye reaches it.
+                    if on {
+                        if let Some(unit) = self
+                            .app
+                            .insert(strip, slot)
+                            .map(str::to_owned)
+                        {
+                            self.push_preset_rows(&unit);
+                        }
                     }
                 }
                 // ── presets ─────────────────────────────────────────────
@@ -9213,6 +9269,41 @@ mod tests {
     /// identical sound. A knob whose default multiplies by something other
     /// than one is a silent retune of both patches.
     #[test]
+    /// **The suite's two tables are one list.** The UI's `SUITE_UNITS`
+    /// routes faces and fills the picker; the engine's `UNITS` seats the
+    /// sound. A path in one and not the other is a face over an empty bay
+    /// or a bay no picker can reach — both silent, both fatal to the whole
+    /// idea, so the build refuses instead.
+    #[test]
+    fn the_suite_faces_and_the_suite_units_are_the_same_list() {
+        for (path, name, about) in tangent_ui::faces::SUITE_UNITS {
+            let spec = crate::builtin_fx::spec_for(path)
+                .unwrap_or_else(|| panic!("{path} has a face and no unit"));
+            assert_eq!(spec.class, name, "{path}: the chip and the face disagree");
+            assert!(!about.is_empty());
+            // The trademark rule, same as every effect since the phaser:
+            // the NAME is ours; hardware lives in descriptions only.
+            for word in ["Tascam", "Fender", "Rhodes", "Wurlitzer", "Studer", "Ampex"] {
+                assert!(
+                    !name.contains(word),
+                    "{name} wears somebody else's name"
+                );
+            }
+        }
+        // And every registered effect unit that is not the hidden trim has
+        // a face to open.
+        for unit in crate::builtin_fx::UNITS {
+            if unit.path == crate::builtin_fx::TRIM_PATH {
+                continue;
+            }
+            assert!(
+                tangent_ui::faces::suite_unit(unit.path).is_some(),
+                "{} is seatable and faceless",
+                unit.path
+            );
+        }
+    }
+
     fn an_initialised_sound_is_the_bench_tuning() {
         let piano = crate::keys::PianoKnobs::from_params(&crate::keys::Patch::Piano1.defaults());
         assert!((piano.decay - 1.0).abs() < 1.0e-5, "decay {}", piano.decay);
