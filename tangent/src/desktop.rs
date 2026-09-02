@@ -1148,6 +1148,28 @@ fn effect_defaults() -> tangent_ui::ports::EffectDefaults {
     }
 }
 
+/// Whether a bay's sentinel names one of the three built-in INSTRUMENTS,
+/// which the engine renders by mask in `mix_channels` and whose bay is
+/// therefore handed nothing.
+///
+/// **Narrower than `dialogs::is_builtin` on purpose, and the difference is
+/// the whole built-in-effects road.** Every `@` path used to be filtered out
+/// of the engine here, which was right while the instruments were the only
+/// sentinels. Effect sentinels (`@tangent-trim`, and the `FX_UNITS` eight
+/// when they arrive) go the OTHER way: `load_insert` seats them in the rack
+/// as ordinary tenants, so the filter must name the instruments rather than
+/// the prefix — a new effect sentinel then reaches the engine with no edit
+/// here, and a new instrument sentinel is a deliberate line.
+#[cfg(feature = "recorder")]
+fn is_instrument_sentinel(path: &str) -> bool {
+    matches!(
+        path,
+        tangent_ui::dialogs::BUILTIN_PATH
+            | tangent_ui::dialogs::DRUMPAD_PATH
+            | tangent_ui::dialogs::KEYS_PATH
+    )
+}
+
 /// **Read one strip's three bays and hand the app what they can automate.**
 ///
 /// A free function because it is called from two arms of the same match and
@@ -2865,13 +2887,15 @@ impl DesktopApp {
             let want = want_at(i);
             self.recorder.inserts_loaded[i] = want.clone();
             if let Some(e) = self.recorder.engine.as_mut() {
-                // **The built-in is not a bundle.** Its sentinel path rides in
-                // the bay like any plugin's — that is what lets it be picked,
-                // saved and named by the same code — but the ENGINE renders it
-                // in `mix_channels`, not in the rack, so the bay itself is
-                // handed nothing. See `sync_instrument_lanes`, driven by the
-                // masks the per-frame walk pushes.
-                let engine_want = want.as_deref().filter(|p| !tangent_ui::dialogs::is_builtin(p));
+                // **A built-in INSTRUMENT is not a bundle.** Its sentinel
+                // path rides in the bay like any plugin's — that is what lets
+                // it be picked, saved and named by the same code — but the
+                // ENGINE renders it in `mix_channels`, not in the rack, so
+                // the bay itself is handed nothing. See
+                // `sync_instrument_lanes`, driven by the masks the per-frame
+                // walk pushes. A built-in EFFECT sentinel passes through: the
+                // engine seats those in the rack. See `is_instrument_sentinel`.
+                let engine_want = want.as_deref().filter(|p| !is_instrument_sentinel(p));
                 let path = engine_want.map(std::path::Path::new);
                 // **With the bay's saved preset, when one belongs to this
                 // plugin.** The same bargain the instrument slots have had for
@@ -4783,7 +4807,9 @@ impl DesktopApp {
             let seat = i / inserts;
             let bay = i % inserts;
             let want = self.app.insert(seat, bay).map(str::to_owned);
-            let engine_want = want.as_deref().filter(|p| !tangent_ui::dialogs::is_builtin(p));
+            // Instrument sentinels only — effect sentinels load into the
+            // export engine's racks exactly as they do the live one's.
+            let engine_want = want.as_deref().filter(|p| !is_instrument_sentinel(p));
             let Some(path) = engine_want else { continue };
             let state = saved_insert_state(seat, bay, path);
             if let Err(err) = e.load_insert(
@@ -5966,7 +5992,12 @@ impl DesktopApp {
                 .inserts_loaded
                 .get(i)
                 .and_then(|b| b.clone())
-                .filter(|b| !b.starts_with('\u{1f}') && !b.starts_with('@'))
+                // The reload marker and the instrument sentinels have no
+                // state to ask for; a built-in EFFECT bay answers from its
+                // ledger like any LV2 bay and must not be skipped here, or
+                // its knobs die at relaunch — the exact disease the sidecars
+                // cure.
+                .filter(|b| !b.starts_with('\u{1f}') && !is_instrument_sentinel(b))
             else {
                 continue;
             };

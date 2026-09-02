@@ -49,6 +49,10 @@ mod effects;
 /// piecemeal inside. Ungated: pure std, nothing a Minimal build lacks.
 #[allow(dead_code)]
 mod units;
+/// Tangent's own effects as ordinary insert-bay tenants — the `@tangent-*`
+/// effect sentinels the engine seats in a rack rather than rendering by mask.
+#[cfg(feature = "recorder")]
+mod builtin_fx;
 /// Loudness to BS.1770-4, for the ladder beside the master. Inside
 /// `recorder` because the only thing that feeds it is the engine's output.
 #[cfg(feature = "recorder")]
