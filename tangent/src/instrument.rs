@@ -10721,7 +10721,9 @@ impl Engine {
     /// worst a racing chunk can do is feed one block of the OLD table or of
     /// silence — and a key only modulates a detector, it moves no audio, so
     /// one such block is a meter flicker and not a wrong sample.
-    pub fn set_insert_keys(&mut self, keys: &[(usize, usize, usize)]) {
+    // `&self`, like `set_routes`: the whole write is interior atomics, and
+    // the publish path holds the engine by shared reference.
+    pub fn set_insert_keys(&self, keys: &[(usize, usize, usize)]) {
         self.shared.insert_key_n.store(0, Ordering::Release);
         for cell in self.shared.insert_key.iter() {
             cell.store(0, Ordering::Relaxed);

@@ -147,6 +147,19 @@ Versions 1.x are the original Python/Qt app; 2.x is the Rust rewrite.
   first in the list, wearing the cluster's colour, and opened FOR you
   exactly once, the first time you ever reach for a plugin slot.
 
+- **Sidechain, done properly.** Route any track into a compressor's key
+  input: the bay's right-click menu grows a SIDECHAIN... row on Tangent
+  Comp and on any VST3 that reports a key input, opening a picker of your
+  channels (folders included - a whole group can duck a bed). The key is
+  the source's finished mix of the previous engine block - uniformly, for
+  every source, which buys the property that matters: REORDERING TRACKS
+  NEVER CHANGES THE MIX. A pinned test proves a key from above and a key
+  from below squeeze identically, another proves the exact one-block
+  arrival, and mutual keys (A ducks B while B ducks A) are legal and
+  bounded - it is how broadcast beds breathe. Keyed bays wear a small dot
+  on their chip; edges live in the project's own terms, so they survive
+  track reorders and die with deleted tracks.
+
 - **Presets, for every one of them.** A Presets folder under Tangent Media
   with a shelf per unit; save under a name from inside any panel, load from
   the same row, and share a sound by sharing the file. Drum kits join in:

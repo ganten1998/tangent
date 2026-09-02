@@ -10,20 +10,16 @@
 //! collide in this file.
 
 pub mod amp;
-pub mod comp;
-pub mod denoise;
-pub mod drive;
-pub mod convolver;
-pub mod eq;
-pub mod imager;
-pub mod sweep;
-pub mod tape;
-pub mod trem;
 pub mod chorus;
 pub mod comp;
+pub mod convolver;
+pub mod denoise;
+pub mod drive;
 pub mod echo;
 pub mod eq;
 pub mod imager;
 pub mod plate;
+pub mod sweep;
 pub mod tape;
+pub mod trem;
 pub mod wah;
