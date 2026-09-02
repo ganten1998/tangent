@@ -3,13 +3,24 @@
 //!
 //! # The one guarantee everything here is built on
 //!
-//! **The mid channel is never touched by any parameter.** Every control acts
-//! on the side signal only, and the output is rebuilt as `L = M + S'`,
-//! `R = M - S'` — so the mono fold `(L + R) / 2` returns exactly the `M` that
-//! went in, as an arithmetic identity rather than a calibration. A widener
-//! that survives the mono fold of a phone speaker, a club PA or a broadcast
-//! chain is the whole product; the tests pin it at every corner of the
-//! parameter space.
+//! **Nothing but a scalar ever happens to the mid.** Every control acts on
+//! the side signal only, and the output is rebuilt as `L = g·(M + S')`,
+//! `R = g·(M - S')` — so the mono fold `(L + R) / 2` returns `g·M`, the `M`
+//! that went in and not one sample of anything else, as an arithmetic
+//! identity rather than a calibration. No comb, no cancellation, no phase
+//! damage: whatever the knobs did, folding this unit down cannot find a hole
+//! in the mix. A widener that survives the mono fold of a phone speaker, a
+//! club PA or a broadcast chain is the whole product; the tests pin it at
+//! every corner of the parameter space.
+//!
+//! `g` is [`ensemble_trim`], and it is exactly one at every setting except an
+//! open ensemble, which is why the shipped default is still a bit-exact wire.
+//! See that function for why an ensemble cannot be free. The important thing about it is that it is COMMON: the stereo
+//! pair and the mono fold get the same number, so the relationship between
+//! what a stereo listener hears and what a mono listener hears is exactly
+//! what the arithmetic makes it, and no trim could ever change that. What the
+//! trim chooses is only where the pair sits on a meter, and the answer an
+//! insert has to give is "where it was".
 //!
 //! # The three controls
 //!
@@ -174,9 +185,46 @@ const VELVET_SEED: u32 = 0x1DEA_5EED;
 /// to be, and it is the wrong law now: there is no crossfade left to keep
 /// constant, and it overshoots the correlation it should be reading by 0.17
 /// in the middle of the travel.
+///
+/// # An ensemble is not free, and [`ensemble_trim`] is the bill
+///
+/// The crossfade this replaced held the level constant by construction —
+/// `cos² + sin² = 1` — and adding instead of crossfading threw that away
+/// along with the fault it was hiding. Measured on a mono programme at
+/// −6 dBFS, an unpaid ensemble at full travel arrived +3.0 dB louder in RMS
+/// and +10.3 dB in peak: a knob nobody could A/B, on a unit whose entire job
+/// is to be A/B'd. Decorrelated energy added to a signal ADDS, in power, and
+/// the arithmetic says by exactly how much.
 #[inline]
-fn ensemble_law(e: f32) -> f32 {
+pub fn ensemble_law(e: f32) -> f32 {
     (e / (2.0 - e)).sqrt()
+}
+
+/// The output trim that pays for the manufactured side, given
+/// [`ensemble_law`]'s gain.
+///
+/// `M` and the velvet's copy of `M` are decorrelated, so their powers add and
+/// nothing else does: a channel that held `M²` now holds `M²·(1 + k²)`, and
+/// `1/√(1 + k²)` is the whole of the correction — exact for RMS, not a
+/// calibration, not a measurement, and not a taper anybody had to choose.
+///
+/// **Why it is applied to the reconstruction and not to the side alone.** It
+/// cannot be applied to the side alone: the level arrived with the side and
+/// the mid TOGETHER, and no gain on the side by itself can take it out
+/// without also taking out the width the dial was turned for. So the mid pays
+/// its share, which costs the module's guarantee nothing — see the header:
+/// the fold still returns the mid and nothing but the mid, at the same trim
+/// the stereo pair got. It cannot change the mono penalty either, which is
+/// `1/√(1 + k²)` of the stereo level whether this function exists or not; all
+/// it moves is which of the two sits still while the knob turns, and for an
+/// insert that has to be the stereo pair.
+///
+/// [`ensemble_law`] does not change: a common scalar on both channels
+/// cancels out of the correlation reading top and bottom, so the dial is
+/// still linear in the meter the panel prints.
+#[inline]
+pub fn ensemble_trim(k: f32) -> f32 {
+    1.0 / (1.0 + k * k).sqrt()
 }
 
 /// One sparse-FIR tap: where to read, and the signed, envelope-weighted gain.
@@ -245,7 +293,13 @@ fn flush(x: f32) -> f32 {
 /// The kernel's unit energy is what makes the top of the dial mean something:
 /// a decorrelated copy of the mid, at the mid's own power, is a correlation of
 /// exactly zero. Nothing about the mono fold changes on the way — the output
-/// is still `M ± S'` — so the widest setting is still free to fold.
+/// is still `M ± S'`, times the one trim both channels get — so the widest
+/// setting is still free to fold.
+///
+/// What the manufactured side is NOT free of is level: decorrelated energy
+/// added to a channel adds, in power, and [`ensemble_trim`] takes it back
+/// out. The dial is a character control on a meter that does not move, which
+/// is what it always claimed to be and for one commit was not.
 ///
 /// # Order of operations
 ///
@@ -308,8 +362,11 @@ impl Imager {
             gains[m] = signs[m] * env;
             energy += env * env;
         }
-        // Unit energy, so a broadband side leaves the convolution as loud as
-        // it entered and the ensemble dial changes character, not level.
+        // Unit energy, so a broadband mid leaves the convolution as loud as
+        // it entered. That is what makes the top of the dial mean "a
+        // decorrelated copy of the mid at the mid's own power" — it is NOT
+        // what keeps the level constant, which is [`ensemble_trim`]'s job and
+        // was for a while nobody's.
         let norm = 1.0 / energy.sqrt();
 
         let mut taps = [VelvetTap {
@@ -365,6 +422,9 @@ impl Imager {
 
         let wet_on = p.ensemble >= OFF;
         let wet_g = if wet_on { ensemble_law(p.ensemble) } else { 0.0 };
+        // What the manufactured side costs, taken back out. Exactly one when
+        // the ensemble is shut, so the shipped null is still bit for bit.
+        let out_g = ensemble_trim(wet_g);
 
         // The corner steps from "off" straight to 60 Hz, and that is fine: a
         // 60 Hz first-order fold is the smallest move this dial can make.
@@ -404,6 +464,8 @@ impl Imager {
                 // Added, not crossfaded: whatever image the record arrived
                 // with is the one the mix already approved, and a widener
                 // that swaps it for a synthetic one is a different unit.
+                // Adding is also what costs the level the crossfade used to
+                // hold for free; [`ensemble_trim`] pays for it below.
                 side = s + wet_g * velvet;
             }
             if fold_on {
@@ -416,9 +478,11 @@ impl Imager {
             side *= s_gain;
 
             // The reconstruction that IS the guarantee: M appears in both
-            // channels untouched, so the fold hands it straight back.
-            f[0] = m + side;
-            f[1] = m - side;
+            // channels, alone, so the fold hands back the mid and nothing
+            // else. Both channels take the same trim, which is why the fold
+            // still cannot find anything in there that is not the mid.
+            f[0] = (m + side) * out_g;
+            f[1] = (m - side) * out_g;
 
             self.at += 1;
             if self.at == cap {
@@ -595,10 +659,21 @@ mod tests {
     }
 
     /// **The flagship claim.** Whatever the three knobs do, the mono fold of
-    /// the output is the mono fold of the input — at every corner of the
-    /// parameter cube, on random program.
+    /// the output is the mid that went in — times the one output trim both
+    /// channels got, and times nothing else. At every corner of the parameter
+    /// cube, on random program, sample by sample.
+    ///
+    /// The claim is sharper than "the fold does not move", which is what this
+    /// asked before [`ensemble_trim`] existed and which an ensemble that
+    /// changes the level cannot honour anyway. A fold that came back at a
+    /// different LEVEL would be a knob nobody could A/B; a fold that came back
+    /// as a different SIGNAL would be a comb, a cancellation, a hole in
+    /// somebody's mix on a phone speaker — and it is that second thing this
+    /// unit exists to make impossible. So the trim is predicted from the
+    /// parameters, divided back out, and what is left has to match the input
+    /// mid to the bit. Only a scalar can survive that.
     #[test]
-    fn the_mono_fold_never_moves_whatever_the_knobs_do() {
+    fn the_mono_fold_is_the_mid_it_was_given_and_a_trim_this_test_predicts() {
         const FRAMES: usize = 4_096;
         let corners = [0.0_f32, 0.5, 1.0];
         for width in corners {
@@ -608,6 +683,15 @@ mod tests {
                         width,
                         ensemble,
                         mono_below,
+                    };
+                    // The trim the kernel will apply, from the published
+                    // laws rather than from the kernel's own arithmetic —
+                    // a test that asked the code what it did would agree
+                    // with any answer it gave.
+                    let expect = if ensemble >= OFF {
+                        ensemble_trim(ensemble_law(ensemble))
+                    } else {
+                        1.0
                     };
                     let mut im = Imager::new(SR);
                     // Two blocks, so the second runs on a warm velvet ring.
@@ -619,12 +703,13 @@ mod tests {
                         let worst = mid_in
                             .iter()
                             .zip(&mid_out)
-                            .map(|(a, b)| (a - b).abs())
+                            .map(|(a, b)| (a * expect - b).abs())
                             .fold(0.0_f32, f32::max);
                         assert!(
                             worst < 1.0e-4,
                             "width {width} ensemble {ensemble} mono_below {mono_below} \
-                             moved the mid by {worst}"
+                             left {worst} in the fold that is not the mid times \
+                             {expect}"
                         );
                     }
                 }
@@ -1096,6 +1181,97 @@ mod tests {
             assert!(
                 (corr - want_corr).abs() < 1.0e-3,
                 "width {width} read {corr:.4}, not {want_corr}"
+            );
+        }
+    }
+
+    /// **The ensemble is a character control, and here is the meter that has
+    /// to sit still while it turns.**
+    ///
+    /// It did not. Replacing the equal-power crossfade with a plain addition
+    /// fixed a real fault — the crossfade threw away the image the mix
+    /// arrived with — and threw away the one thing the crossfade was FOR:
+    /// `cos² + sin² = 1` had been holding the level for free, and the comment
+    /// promising that it still did outlived the code that did it. Measured on
+    /// a mono programme at −6 dBFS, an unpaid ensemble at full travel arrived
+    /// +3.0 dB in RMS and +10.3 dB in peak.
+    ///
+    /// [`ensemble_trim`] pays the bill, and what it can and cannot buy back
+    /// is worth stating exactly, because the difference is arithmetic rather
+    /// than taste:
+    ///
+    /// - **RMS, on the mono programme this control exists for: exact.** The
+    ///   manufactured side is decorrelated from the mid, so their powers add
+    ///   and nothing else does, and `1/√(1 + k²)` is the whole of it. The bar
+    ///   below is a twentieth of a decibel and the measurement is three
+    ///   thousandths.
+    /// - **RMS on any other programme: never louder, and by a bounded
+    ///   amount quieter.** A record that already had a side of its own pays
+    ///   the mono trim on side energy it did not need to manufacture; at the
+    ///   extreme — two independent noises, correlation zero before the unit
+    ///   is even reached — that is 1.24 dB, on the programme an ensemble has
+    ///   the least to offer. The law errs quiet on purpose: an insert that
+    ///   can only ever hand back less is one a mastering chain can leave in.
+    /// - **Peak: within about a decibel and a half, and not exactly.** No
+    ///   widener can hold a peak the way it holds an RMS. Two independent
+    ///   signals summed are peakier than either — a bounded programme meets a
+    ///   velvet copy with Gaussian tails and the sum has the tails — so the
+    ///   trim that is exact in power leaves crest behind. On programme with
+    ///   the crest factor of music it is 1.2 dB; on synthetic uniform noise,
+    ///   which is flatter-topped than anything a microphone ever made, it is
+    ///   7.3. What matters is that it is now the CREST that moved and not the
+    ///   level, and that neither is the ten decibels it was.
+    #[test]
+    fn the_ensemble_holds_its_level_across_the_whole_travel() {
+        const FRAMES: usize = 96_000;
+        const SKIP: usize = 4_800 * 2;
+        let db = |r: f64| 20.0 * r.log10();
+
+        // A mono programme with the crest factor of a real one: twelve
+        // uniforms summed is close enough to Gaussian that its peak
+        // statistics stop being an artefact of the generator.
+        let mut seed = 0x51DE_0003_u32;
+        let mono: Vec<f32> = (0..FRAMES)
+            .map(|_| (0..12).map(|_| rand(&mut seed)).sum::<f32>() * (1.0 / 3.464))
+            .collect();
+        let mid_only: Vec<f32> = mono.iter().flat_map(|v| [*v, *v]).collect();
+
+        // And a record that arrived fully decorrelated, which is the worst
+        // case for a trim solved on the mono one.
+        let (mut a, mut b) = (0x0BAD_0001_u32, 0x0BAD_0002_u32);
+        let already_wide: Vec<f32> = (0..FRAMES)
+            .flat_map(|_| [0.8 * rand(&mut a), 0.8 * rand(&mut b)])
+            .collect();
+
+        for step in 0..=10 {
+            let e = step as f32 / 10.0;
+            let p = ImagerParams {
+                ensemble: e,
+                ..ImagerParams::default()
+            };
+
+            let mut out = mid_only.clone();
+            Imager::new(SR).process(&mut out, FRAMES, 2, &p);
+            let d_rms = db(rms(&out[SKIP..]) / rms(&mid_only[SKIP..]));
+            let d_peak = db(f64::from(peak(&out[SKIP..])) / f64::from(peak(&mid_only[SKIP..])));
+            assert!(
+                d_rms.abs() < 0.05,
+                "ensemble {e} moved a mono programme by {d_rms:.3} dB of RMS — \
+                 the trim is not paying for what the addition costs"
+            );
+            assert!(
+                d_peak.abs() < 1.5,
+                "ensemble {e} moved a mono programme by {d_peak:.3} dB of PEAK"
+            );
+
+            let mut out = already_wide.clone();
+            Imager::new(SR).process(&mut out, FRAMES, 2, &p);
+            let d_rms = db(rms(&out[SKIP..]) / rms(&already_wide[SKIP..]));
+            assert!(
+                (-1.4..=0.001).contains(&d_rms),
+                "ensemble {e} moved an already-wide programme by {d_rms:.3} dB \
+                 — the trim may only ever hand back less, and never by more \
+                 than the mono law's own worst case"
             );
         }
     }
