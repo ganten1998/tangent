@@ -9,7 +9,10 @@
 //! line per unit, and only that line, so two units landing at once never
 //! collide in this file.
 
+pub mod amp;
 pub mod comp;
+pub mod drive;
 pub mod eq;
 pub mod imager;
 pub mod tape;
+pub mod trem;
